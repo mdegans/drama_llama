@@ -1,0 +1,215 @@
+:root {
+  --bg-dark: #242423;
+  --bg-light: #333533;
+  --fg-light: #e8eddf;
+  --callout: rgb(255, 255, 102);
+  --callout-dark: #101010;
+}
+
+* {
+  font-size: 14px;
+}
+
+html,
+body,
+main {
+  background-color: var(--bg-dark);
+  color: #fff;
+  font-family: "Inter", Arial, Helvetica, sans-serif, "Noto Color Emoji";
+  font-weight: 400;
+  text-shadow: rgb(77, 81, 86) 0px 0px 0px;
+  height: 100%;
+}
+
+main {
+  display: flex;
+}
+
+button:hover:not(.active) {
+  filter: brightness(1.15);
+  cursor: pointer;
+}
+
+#sidebar {
+  flex: 3 30%;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  background-color: var(--bg-light);
+}
+
+#sidebar button {
+  height: 40px;
+  margin-bottom: 1px;
+  background: var(--bg-light);
+  color: #fff;
+  overflow: hidden;
+}
+
+#sidebar button.active {
+  background: var(--bg-dark);
+  color: var(--callout);
+  font-weight: bold;
+  box-shadow: 0px 2px 2px rgba(0, 0, 0, 0.9);
+  z-index: 10;
+}
+
+#content {
+  flex: 7 100%;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.piece {
+  white-space: pre-wrap;
+  color: var(--bg-dark);
+}
+
+#generation {
+  padding: 10px 20px;
+  flex: 1;
+}
+
+.scores {
+  padding: 5px 5px;
+  flex: 1;
+}
+
+form#request {
+  bottom: 0;
+  position: sticky;
+  flex: 0 0 auto;
+  width: 100%;
+}
+
+form {
+  display: flex;
+  border-top: 2px solid #242424;
+}
+
+form * {
+  height: 40px;
+  background: var(--fg-light);
+  color: var(--bg-dark);
+}
+
+input {
+  padding: 0 10px;
+}
+
+input:focus {
+  outline: 0;
+  filter: brightness(1.05);
+}
+
+input#username {
+  text-align: right;
+  flex: 1 25%;
+  width: 25%;
+  border-right: 1px solid #303030;
+}
+
+input#request_text {
+  flex: 10 100%;
+}
+
+form button {
+  padding: 0 10px;
+}
+
+#sidebar #new-room {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: row;
+}
+
+#status {
+  padding: 5px 10px;
+  text-align: center;
+  font-size: 12px;
+}
+
+#status.pending::before {
+  content: "status: connected";
+}
+
+#status.pending {
+  background-color: yellow;
+  color: #000;
+}
+
+#status.connected::before {
+  content: "status: connected";
+}
+
+#status.connected {
+  background-color: orange;
+  color: #fff;
+}
+
+#status.disconnected::before {
+  content: "status: disconnected";
+}
+
+#status.disconnected {
+  background-color: red;
+  color: #fff;
+}
+
+#status.ready::before {
+  content: "status: ready";
+}
+
+#status.ready {
+  background-color: green;
+  color: #fff;
+}
+
+#status.busy::before {
+  content: "status: generating...";
+}
+
+#status.busy {
+  background-color: blue;
+  color: #fff;
+}
+
+#status.error::before {
+  content: "status: error";
+}
+
+#status.error {
+  background-color: red;
+  color: #fff;
+}
+
+#status.reconnecting::before {
+  content: "status: reconnecting";
+}
+
+#status.reconnecting {
+  background-color: red;
+  color: #fff;
+}
+
+#status.shutdown::before {
+  content: "status: shutdown";
+}
+
+#status.shutdown {
+  background-color: red;
+  color: #fff;
+}
+
+/* Thank you, Bing Copilot for this help here. */
+.progress {
+  width: 100%; /* Set the desired width for the progress container */
+}
+
+.progress_bar {
+  width: 0%; /* Set the initial width for the progress bar */
+  background-color: #4caf50; /* Set the color for the progress bar */
+  text-align: center; /* Center the progress text (optional) */
+  color: #ffffff; /* Text color (optional) */
+}

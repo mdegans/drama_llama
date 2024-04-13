@@ -1,0 +1,18 @@
+# The characters in this story are real. The transcript is real until the end,
+# where generative text takes over.
+human = "Charlie Rose"
+agent = "Fred Rogers"
+
+# The context should be a plausible backstory for the generative text, such as
+# an interview that actually took place. This will be used as a part of a system
+# prompt to frame the generative text.
+setting = "A 1996 PBS interview of Fred Rogers by Charlie Rose."
+
+# The transcript should be a real conversation, or at least the agent's role
+# should be actual words spoken by the entity who the agent will play. It
+# doesn't take much to bootstrap the generative text with a well-known
+# character. The bigger mouth, the better.
+transcript = [
+    { role = "human", text = "Welcome to my program." },
+    { role = "agent", text = "And welcome to our neighborhood, Charlie." },
+]

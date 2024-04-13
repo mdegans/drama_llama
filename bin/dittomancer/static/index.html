@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Chat with Charlie! Powered by Meta's Llama 2!</title>
+    <link rel="stylesheet" href="/reset.css" />
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/script.js" charset="utf-8" defer></script>
+  </head>
+
+  <body>
+    <main>
+      <div id="sidebar">
+        <div id="status" class="pending"></div>
+      </div>
+
+      <div id="content">
+        <div id="messages">
+          <template id="message">
+            <div class="message">
+              <span class="role"></span>
+              <span class="text"></span>
+            </div>
+          </template>
+        </div>
+
+        <form id="new-message">
+          <input
+            type="text"
+            name="message"
+            id="message"
+            autocomplete="off"
+            placeholder="Can you tell me a little more about..."
+            autofocus
+          />
+          <button type="submit" id="send">Send</button>
+        </form>
+      </div>
+    </main>
+  </body>
+</html>

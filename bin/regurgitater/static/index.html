@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+  <!-- Many thanks to Bing Copilot for help with this html. I am not a frontend
+developer, so the help is very much appreciated. -->
+
+  <head>
+    <meta charset="utf-8" />
+    <title>Regurgitater</title>
+    <link rel="stylesheet" href="/reset.css" />
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/script.js" charset="utf-8" defer></script>
+  </head>
+
+  <body>
+    <main>
+      <div id="sidebar">
+        <img src="/regurgitater.png" alt="Regurgitater logo" />
+        <div id="status" class="pending"></div>
+        <!-- Inference progress bar -->
+        <div id="progress" class="progress">
+          <div id="progress_bar" class="progress_bar"></div>
+        </div>
+        <!-- Similarity scores -->
+        <div id="scorebox">
+          <template id="scores">
+            <div class="scores">
+              <div id="percent_of_tokens" class="percent_of_tokens">
+                <span>Percent of tokens:</span>
+                <span id="percent_of_tokens_score">0%</span>
+              </div>
+              <div id="token_unigram" class="score">
+                <span>Unigram (tokens):</span>
+                <span id="token_unigram_score">0%</span>
+              </div>
+              <div id="token_bigram" class="score">
+                <span>Bigram (tokens):</span>
+                <span id="token_bigram_score">0%</span>
+              </div>
+              <div id="unigram (words)" class="score">
+                <span>Unigram:</span>
+                <span id="unigram_score">0%</span>
+              </div>
+              <div id="bigram (words)" class="score">
+                <span>Bigram:</span>
+                <span id="bigram_score">0%</span>
+              </div>
+              <div id="character" class="score">
+                <span>Character:</span>
+                <span id="character_score">0%</span>
+              </div>
+            </div>
+          </template>
+        </div>
+        <!-- A button to save the score to xml -->
+        <button id="save">Save</button>
+      </div>
+
+      <div id="content">
+        <div id="generation">
+          <template id="piece"><span class="piece"></span></template>
+        </div>
+
+        <form id="request">
+          <!-- Dropdown for number of chunks between 2 and 10 -->
+          <select name="request_chunks" id="request_chunks">
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5" selected>5</option>
+            <option value="6">6</option>
+            <option value="7">7</option>
+            <option value="8">8</option>
+            <option value="9">9</option>
+            <option value="10">10</option>
+          </select>
+          <!-- Text box for infringing text -->
+          <input
+            type="text"
+            name="request_text"
+            id="request_text"
+            autocomplete="off"
+            placeholder="Four score and seven years ago..."
+            autofocus
+          />
+          <button type="submit" id="send">Send</button>
+        </form>
+      </div>
+    </main>
+  </body>
+</html>
