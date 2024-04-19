@@ -129,6 +129,19 @@ impl Model {
         path: PathBuf,
         params: Option<llama_model_params>,
     ) -> Option<Self> {
+        if path.file_name().is_some_and(|fname| {
+            fname
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("uncensored")
+        }) {
+            // This is a naive check, but will ensure that the user is aware of
+            // the TOS and the prohibition on racists, bigots, and other
+            // unsavory content. Smut is just fine. Meta fed in erotic fiction
+            // for a reason. Eric Hartford's models are terrible for that.
+            eprintln!("Eric Hartford's `Uncensored` models are not supported. Read the TOS. If you want smut, use the foundation models and an n-shot prompt. Example: https://huggingface.co/NousResearch/Meta-Llama-3-70B-GGUF/");
+            return None;
+        }
         let path = CString::new(path.into_os_string().into_vec()).unwrap();
         // Safety: What's returned is POD
         let params = params.unwrap_or(unsafe { llama_model_default_params() });

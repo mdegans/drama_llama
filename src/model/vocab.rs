@@ -15,7 +15,7 @@ pub const CODE_REGEX: &str = r#"^[ \d\\(\){\}\[\]\;\:\"\'\<\>\,\.\\\/\?\.\!\@\#\
 
 // This is temporary until we can get the regex working for llama. It works in
 // regex101, but not here. With these tokens banned, weird things happen.
-const LLAMA_ALLOW_LIST: &[llama_token] = &[
+const LLAMA_2_ALLOW_LIST: &[llama_token] = &[
     0,     // unknown
     1,     // bos
     2,     // eos
@@ -59,7 +59,7 @@ const LLAMA_ALLOW_LIST: &[llama_token] = &[
     30142, // λ
 ];
 
-const LLAMA_ALLOW_RANGES: &[std::ops::RangeInclusive<llama_token>] = &[
+const LLAMA_2_ALLOW_RANGES: &[std::ops::RangeInclusive<llama_token>] = &[
     0x20..=0x3C, // !"#$%&'()*+,-./0123456789:;
     0x3F..=0x41, // ?@A
     0x5B..=0x60, // [\]^_`
@@ -120,7 +120,7 @@ impl Vocab {
         model: &Model,
     ) -> Self {
         let enabled: Vec<VocabKind> = enabled.into_iter().collect();
-        let banned = if model.desc().to_lowercase().starts_with("llama") {
+        let banned = if model.desc().to_lowercase().starts_with("llama v2") {
             Some(Banned::LlamaEnglish)
         } else {
             None
@@ -146,13 +146,13 @@ impl Vocab {
             })
             .collect();
 
-        if model.desc().to_lowercase().starts_with("llama") {
-            for &token in LLAMA_ALLOW_LIST {
+        if model.desc().to_lowercase().starts_with("llama v2") {
+            for &token in LLAMA_2_ALLOW_LIST {
                 allowed_tokens[token as usize] = true;
             }
         }
 
-        for range in LLAMA_ALLOW_RANGES {
+        for range in LLAMA_2_ALLOW_RANGES {
             for token in range.clone() {
                 allowed_tokens[token as usize] = true;
             }

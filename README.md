@@ -4,6 +4,7 @@
 
 ## Supported Features
 
+- LLaMA 3 Support, including stop criteria.
 - Iterators yielding tokens and pieces.
 - Stop criteria at regex, token sequence, and/or string sequence.
 - Metal support. CUDA may be enabled with the `cuda` and `cuda_f16` features.
@@ -21,7 +22,6 @@
 
 ## Roadmap
 
-- [ ] LLama3 support. Coming soon after [`llama.cpp`] itself supports it.
 - [ ] Tiktoken as the tokenizer instead of llama.cpp.
 - [ ] Reworked, functional, public, candidate API
 - [ ] Candidate iterator with fine-grained control over sampling
