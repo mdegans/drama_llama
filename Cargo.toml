@@ -1,9 +1,10 @@
 [package]
 name = "drama_llama"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A library for language modeling and text generation."
 license-file = "LICENSE.md"
+repository = "https://github.com/mdegans/drama_llama"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
