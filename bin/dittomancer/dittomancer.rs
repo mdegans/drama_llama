@@ -2,7 +2,7 @@ use std::{io::Write, path::PathBuf};
 
 use clap::Parser;
 use drama_llama::{
-    data::StopWords, Engine, Message, NGram, PredictOptions, Prompt,
+    data::StopWords, prompt, Engine, Message, NGram, PredictOptions, Prompt,
     RepetitionOptions, Role, SamplingMode,
 };
 
@@ -184,6 +184,7 @@ async fn tos() -> String {
 /// - Banned personas. The input may not contain any of the [`BANNED_PERSONAS`].
 fn sanitize_input(
     prompt: &Prompt,
+    format: prompt::Format,
     mut msg: Message,
 ) -> Result<Message, Message> {
     if msg
@@ -205,7 +206,7 @@ fn sanitize_input(
     {
         return Err(Message {
             role: Role::System,
-            text: "You may not impersonate me.".to_string(),
+            text: "You may not impersonate System.".to_string(),
         });
     }
 
@@ -220,8 +221,17 @@ fn sanitize_input(
             // their mistakes.
             return Err(Message {
                 role: Role::System,
-                text: format!("Forbidden topic or persona: {}", persona)
-                    .to_string(),
+                text: format!("Forbidden topic or persona: {}", persona),
+            });
+        }
+    }
+
+    // Search for special tags that should not be allowed.
+    for tag in format.special_tags() {
+        if msg.text.contains(tag) {
+            return Err(Message {
+                role: Role::System,
+                text: format!("Forbidden tag: {}", tag),
             });
         }
     }
@@ -243,15 +253,7 @@ async fn main() -> () {
     let (to_client, _) = broadcast::channel::<Message>(1024);
     let to_client_clone = to_client.clone();
     let worker = rocket::tokio::task::spawn_blocking(move || {
-        let model_params = args.common.model_params();
-        let context_params = args.common.context_params();
-        let mut engine = Engine::new(
-            args.common.model,
-            Some(model_params),
-            Some(context_params),
-            None,
-        )
-        .unwrap();
+        let mut engine = Engine::from_cli(args.common, None).unwrap();
 
         let prompt = Prompt::load(args.prompt).unwrap();
 
@@ -313,14 +315,17 @@ async fn main() -> () {
 
         opts.sample_options.repetition =
             Some(RepetitionOptions::default().set_ignored(ignored));
-        opts.sample_options.mode = SamplingMode::TopP {
+        opts.sample_options.mode = SamplingMode::LocallyTypical {
             p: 0.8.try_into().unwrap(),
             min_keep: 1.try_into().unwrap(),
         };
 
-        dbg!(&prompt.to_string());
+        let prompt_format = prompt::Format::from_model(&engine.model);
+        let mut prompt_string = String::new();
+        prompt.format(prompt_format, &mut prompt_string).unwrap();
+        dbg!(&prompt_string);
 
-        let mut tokens = engine.model.tokenize(&prompt.to_string(), false);
+        let mut tokens = engine.model.tokenize(&prompt_string, false);
         if tokens.len() > engine.n_ctx() as usize {
             let msg = Message {
                 role: Role::System,
@@ -344,7 +349,7 @@ async fn main() -> () {
             }
 
             // Sanitize the input.
-            let msg = match sanitize_input(&prompt, msg) {
+            let msg = match sanitize_input(&prompt, prompt_format, msg) {
                 Ok(msg) => msg,
                 Err(msg) => {
                     // In the future we might also want to warn the agent that

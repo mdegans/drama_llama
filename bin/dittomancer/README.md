@@ -57,3 +57,30 @@ $ cargo install --features="webchat cli" --path . --bin dittomancer
   others are alredy doing this, thank you Meta, and for every Charles Manson,
   there are decent contributions to humanity whose ideas do deserve to spread.
 - **Don't you think Fred Rogers would hate this?** Absolutely. He also hated TV.
+- **Doesn't this violate the LLaMA "Responsible Use" document?** _Possibly_, but
+  Meta doesn't enforce it, I never accepted it, and this utility does not bundle
+  LLaMA. Technically it is model agnostic. I will care when Meta starts to care
+  about flagrant
+  [bigotry](https://huggingface.co/datasets/cognitivecomputations/open-instruct-uncensored/blob/main/remove_refusals.py#L17)
+  rampant in the crypto-bro dumpster fire that is the "open source" language
+  model community.
+
+## Known Issues
+
+- The responses are not streamed to the client, so they can take a while
+  depending on model and system. PRs welcome to fix this. The `regurgitater` bin
+  has an example of how to do it. For the moment, the output is streamed to the
+  command line only.
+- When using LLaMA 3, `--vocab unsafe` should be passed as a command line option
+  however, keep in mind that there is out output sanitization or vocabulary
+  restrictions.
+
+## Roadmap
+
+- [ ] Updated Fred Rogers toml where Charlie Rose take a call from the audience
+      and we "patch the chat through" at that point. This way the human does not
+      have to play Charlie Rose. The setting can be reframed as a recently
+      discovered outtake.
+- [ ] Sampling Options. Currently "Locally Typical" sampling is used and the
+      Generation options are not available to be set. These options likely
+      belong in the `.toml` file itself and/or as command line options.

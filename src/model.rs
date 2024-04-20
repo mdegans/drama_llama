@@ -1,5 +1,5 @@
 use derive_more::From;
-use llama_cpp_sys::{
+use llama_cpp_sys_3::{
     ggml_tensor, llama_add_bos_token, llama_add_eos_token,
     llama_chat_apply_template, llama_chat_message, llama_free_model,
     llama_get_model_tensor, llama_load_model_from_file, llama_model,
@@ -129,6 +129,19 @@ impl Model {
         path: PathBuf,
         params: Option<llama_model_params>,
     ) -> Option<Self> {
+        if path.file_name().is_some_and(|fname| {
+            fname
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("uncensored")
+        }) {
+            // This is a naive check, but will ensure that the user is aware of
+            // the TOS and the prohibition on racists, bigots, and other
+            // unsavory content. Smut is just fine. Meta fed in erotic fiction
+            // for a reason. Eric Hartford's models are terrible for that.
+            eprintln!("Eric Hartford's `Uncensored` models are not supported. Read the TOS. If you want smut, use the foundation models and an n-shot prompt. Example: https://huggingface.co/NousResearch/Meta-Llama-3-70B-GGUF/");
+            return None;
+        }
         let path = CString::new(path.into_os_string().into_vec()).unwrap();
         // Safety: What's returned is POD
         let params = params.unwrap_or(unsafe { llama_model_default_params() });
@@ -346,7 +359,7 @@ impl Model {
                     buf.len(),
                 );
                 if required < 0 {
-                    panic!("snprintf encoding error.");
+                    continue;
                 }
                 if buf.len() != required as usize {
                     buf.resize(required as usize, 0);
@@ -395,7 +408,7 @@ impl Model {
                 );
 
                 if required < 0 {
-                    panic!("snprintf encoding error.")
+                    return None;
                 }
 
                 if buf.len() != required as usize {
@@ -423,7 +436,7 @@ impl Model {
                 };
 
                 if written < 0 {
-                    panic!("snprintf encoding error.")
+                    return None;
                 }
                 if buf.len() != written as usize {
                     buf.resize(written as usize, 0);
@@ -743,7 +756,7 @@ impl Drop for Model {
 
 #[cfg(test)]
 mod tests {
-    use llama_cpp_sys::llama_vocab_type_LLAMA_VOCAB_TYPE_SPM;
+    use llama_cpp_sys_3::llama_vocab_type_LLAMA_VOCAB_TYPE_SPM;
 
     use super::*;
 
@@ -752,6 +765,8 @@ mod tests {
         use std::path::PathBuf;
 
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // This should be a properly converted llama 2 model or this test will
+        // fail.
         path.push("models/model.gguf");
 
         let model = Model::from_file(path, None).unwrap();

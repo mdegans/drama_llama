@@ -1,4 +1,4 @@
-use llama_cpp_sys::llama_token;
+use llama_cpp_sys_3::llama_token;
 
 use crate::Model;
 

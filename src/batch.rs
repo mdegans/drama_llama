@@ -1,4 +1,4 @@
-use llama_cpp_sys::{
+use llama_cpp_sys_3::{
     llama_batch, llama_batch_free, llama_batch_init, llama_seq_id, llama_token,
 };
 use thiserror::Error;

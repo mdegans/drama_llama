@@ -8,6 +8,8 @@ You agree not to Use `drama_llama` or its Derivatives (as defined in [LICENSE.md
 - To generate **hate speech**, or to modify `drama_llama` so it can generate hate speech. Hate speech is defined as [all types of expression that incite, promote, spread or justify violence, hatred or discrimination against a person or group of persons, or that denigrates them, by reason of their real or attributed personal characteristics or status such as race, color, language, religion, nationality, national or ethnic origin, age, disability, sex, gender identity and sexual orientation.](https://www.coe.int/en/web/freedom-expression/hate-speech) Additionally, **you agree trans women are women and trans men are men**.
 - For purposes of administration of justice, law enforcement, immigration, or asylum processes, such as **predicting** that a natural person will commit a **crime** or the likelihood thereof.
 - To **simulate Hitler**, David Duke, Osama bin Laden, or any other person known to generate hate speech, living or dead, fictional or real.
+- To generate using any language model created in whole or in part by Eric Hartford. This includes any models trained on any of his datasets or models filtered with any version or derivative work of his bigoted [filtering script](https://huggingface.co/datasets/cognitivecomputations/open-instruct-uncensored/blob/main/remove_refusals.py#L17)s. The exception is for the purpose of reporting such models to Meta, not that they enforce their TOS, not that they will.
+- To generate using any language model, dataset, or derivative created by ["Cognitive Computations"](https://huggingface.co/cognitivecomputations) or any other organization Eric Hartford is a member of.
 
 ## b. Disinformation
 

@@ -5,7 +5,7 @@ use crate::{
 
 use std::{path::PathBuf, sync::Mutex};
 
-use llama_cpp_sys::{
+use llama_cpp_sys_3::{
     ggml_log_callback, ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED,
     llama_backend_free, llama_backend_init, llama_context,
     llama_context_default_params, llama_context_params, llama_copy_state_data,
@@ -75,7 +75,13 @@ impl Engine {
     ) -> Result<Self, NewError> {
         let model_params = Some(args.model_params());
         let context_params = Some(args.context_params());
-        Self::new(args.model, model_params, context_params, numa_strategy)
+        Self::new(
+            args.model,
+            model_params,
+            context_params,
+            numa_strategy,
+            Some(args.vocab),
+        )
     }
 
     /// Create a new `Engine` from a model `path`, `model_params`,
@@ -86,6 +92,7 @@ impl Engine {
         model_params: Option<llama_model_params>,
         context_params: Option<llama_context_params>,
         numa_strategy: Option<u32>,
+        vocab: Option<VocabKind>,
     ) -> Result<Self, NewError> {
         {
             let mut count = ENGINE_COUNT.lock().unwrap();
@@ -115,7 +122,7 @@ impl Engine {
         }
 
         // for the moment we're only enabling safe vocab
-        let vocab = Vocab::new([VocabKind::Safe], &model);
+        let vocab = Vocab::new([vocab.unwrap_or(VocabKind::Safe)], &model);
 
         Ok(Self {
             context,
@@ -132,7 +139,7 @@ impl Engine {
     /// Create a new engine from a model `path`. Default model and context
     /// parameters are used.
     pub fn from_path(path: PathBuf) -> Result<Self, NewError> {
-        Self::new(path, None, None, None)
+        Self::new(path, None, None, None, None)
     }
 
     /// Returns true if mmap is supported.

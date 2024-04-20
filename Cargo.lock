@@ -407,7 +407,7 @@ dependencies = [
  "clap",
  "derive_more",
  "dirs",
- "llama-cpp-sys",
+ "llama-cpp-sys-3",
  "markdown",
  "num",
  "partial_sort",
@@ -776,9 +776,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01cda141df6706de531b6c46c3a33ecca755538219bd484262fa09410c13539c"
 
 [[package]]
-name = "llama-cpp-sys"
+name = "llama-cpp-sys-3"
 version = "0.5.0"
-source = "git+https://github.com/mdegans/llama-cpp-sys.git?branch=llama-cpp-update#670c9ea586147b1f5d52cf729ab607323e7d66ab"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f14b4676cce4d3f88a99f5cf6f06b27b34ef5ff03b6f0040c6cbd137661a29e"
 dependencies = [
  "bindgen",
  "cmake",

@@ -1,5 +1,10 @@
 use std::fmt::{Display, Formatter};
 
+mod format;
+pub use format::Format;
+
+use crate::Model;
+
 /// Yet another stab at a prompt struct. The intended use case is for chat. This
 /// takes inspiration from the OpenAI API, but is not intended to be compatible
 /// with it.
@@ -19,10 +24,10 @@ pub struct Prompt {
     #[cfg_attr(feature = "serde", field(validate = len(..4096), default = None))]
     pub setting: Option<String>,
     /// Agent's name, e.g. "Mr. Rogers" or "GPT-5".
-    #[cfg_attr(feature = "serde", field(validate = len(..64), default = "Assistant"))]
+    #[cfg_attr(feature = "serde", field(validate = len(..64), default = "assistant"))]
     pub agent: String,
     /// Human's name, e.g. "Alice" or "Bob".
-    #[cfg_attr(feature = "serde", field(validate = len(..64), default = "Human"))]
+    #[cfg_attr(feature = "serde", field(validate = len(..64), default = "user"))]
     pub human: String,
     /// System's name, e.g. "System", "Narrator", or "God". Should imply
     /// authority to the Agent -- not necessarily to the Human.
@@ -41,31 +46,51 @@ impl Prompt {
             toml::from_str(&std::fs::read_to_string(path)?).unwrap();
         Ok(prompt)
     }
+
+    /// Format the prompt in a specific format. This does not add a BOS token so
+    /// if this is desired, it must be prepended or [`Format::for_model`] must
+    /// be used instead.
+    pub fn format<F>(&self, format: Format, f: &mut F) -> std::fmt::Result
+    where
+        F: std::fmt::Write,
+    {
+        format.format_prompt(self, None, f)
+    }
+
+    /// Format the prompt for a specific model. This adds a BOS token if the
+    /// model requires it. If this is unknown, a BOS token will not be added.
+    /// This is the recommended method for formatting a prompt.
+    pub fn format_for_model<F>(
+        &self,
+        model: &Model,
+        f: &mut F,
+    ) -> std::fmt::Result
+    where
+        F: std::fmt::Write,
+    {
+        let format = Format::from_model(model);
+        format.format_prompt(self, Some(model), f)
+    }
+
+    /// Format the agent's prefix. This should be called after a format method
+    /// in order to append the agent's prefix to the prompt which in turn forces
+    /// the model to generate a response from the agent's perspective.
+    pub fn format_agent_prefix<F>(
+        &self,
+        format: Format,
+        f: &mut F,
+    ) -> std::fmt::Result
+    where
+        F: std::fmt::Write,
+    {
+        format.format_agent_prefix(f, self)
+    }
 }
 
 impl Display for Prompt {
-    // TODO: Right now this formats foundation models. For tuned models, the
-    // prompt should be formatted differently.
+    // By default we format for foundation/unknown models.
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        if let Some(setting) = &self.setting {
-            write!(f, "# Context\n{}\n\n", setting)?;
-        }
-
-        write!(f, "# Transcript\n")?;
-        for message in &self.transcript {
-            write!(
-                f,
-                "{}: {}\n",
-                match message.role {
-                    Role::Human => &self.human,
-                    Role::Agent => &self.agent,
-                    Role::System => self.system.as_deref().unwrap_or("System"),
-                },
-                message.text
-            )?;
-        }
-
-        Ok(())
+        Format::Unknown.format_prompt(self, None, f)
     }
 }
 

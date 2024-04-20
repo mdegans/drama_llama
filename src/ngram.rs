@@ -1,5 +1,5 @@
 use core::slice;
-use llama_cpp_sys::llama_token;
+use llama_cpp_sys_3::llama_token;
 use std::{collections::HashMap, ops::Index};
 use tinyvec::ArrayVec;
 

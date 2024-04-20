@@ -6,7 +6,7 @@ use crate::{
     Candidates, Probability,
 };
 
-use llama_cpp_sys::{llama_token, llama_token_data};
+use llama_cpp_sys_3::{llama_token, llama_token_data};
 use xorshift::Rng;
 
 use std::{

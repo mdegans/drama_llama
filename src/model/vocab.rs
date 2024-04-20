@@ -1,6 +1,6 @@
 //! Vocabulary constraints.
 
-use llama_cpp_sys::llama_token;
+use llama_cpp_sys_3::llama_token;
 use regex::Regex;
 
 use crate::{data::banned::Banned, model::token_to_piece_ref, Model, NGram};
@@ -15,7 +15,7 @@ pub const CODE_REGEX: &str = r#"^[ \d\\(\){\}\[\]\;\:\"\'\<\>\,\.\\\/\?\.\!\@\#\
 
 // This is temporary until we can get the regex working for llama. It works in
 // regex101, but not here. With these tokens banned, weird things happen.
-const LLAMA_ALLOW_LIST: &[llama_token] = &[
+const LLAMA_2_ALLOW_LIST: &[llama_token] = &[
     0,     // unknown
     1,     // bos
     2,     // eos
@@ -59,13 +59,14 @@ const LLAMA_ALLOW_LIST: &[llama_token] = &[
     30142, // λ
 ];
 
-const LLAMA_ALLOW_RANGES: &[std::ops::RangeInclusive<llama_token>] = &[
+const LLAMA_2_ALLOW_RANGES: &[std::ops::RangeInclusive<llama_token>] = &[
     0x20..=0x3C, // !"#$%&'()*+,-./0123456789:;
     0x3F..=0x41, // ?@A
     0x5B..=0x60, // [\]^_`
     0x7B..=0x7E, // {|}~
 ];
 
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VocabKind {
     /// All tokens and control characters are allowed. This is not recommended,
@@ -89,6 +90,19 @@ pub enum VocabKind {
     // Because 4chan got GPT-4 to generate the N word by getting it to "run"
     // code concatenating individual letters, we have to ban this.
     Code,
+}
+
+// derive_more::Display is failing, so we're implementing it manually.
+#[cfg(feature = "cli")]
+impl std::fmt::Display for VocabKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            VocabKind::Unsafe => write!(f, "unsafe"),
+            VocabKind::Safe => write!(f, "safe"),
+            VocabKind::Letters => write!(f, "letters"),
+            VocabKind::Code => write!(f, "code"),
+        }
+    }
 }
 
 impl Into<Regex> for VocabKind {
@@ -120,7 +134,7 @@ impl Vocab {
         model: &Model,
     ) -> Self {
         let enabled: Vec<VocabKind> = enabled.into_iter().collect();
-        let banned = if model.desc().to_lowercase().starts_with("llama") {
+        let banned = if model.desc().to_lowercase().starts_with("llama v2") {
             Some(Banned::LlamaEnglish)
         } else {
             None
@@ -146,17 +160,20 @@ impl Vocab {
             })
             .collect();
 
-        if model.desc().to_lowercase().starts_with("llama") {
-            for &token in LLAMA_ALLOW_LIST {
+        if model.desc().to_lowercase().starts_with("llama v2") {
+            for &token in LLAMA_2_ALLOW_LIST {
                 allowed_tokens[token as usize] = true;
+            }
+
+            for range in LLAMA_2_ALLOW_RANGES {
+                for token in range.clone() {
+                    allowed_tokens[token as usize] = true;
+                }
             }
         }
 
-        for range in LLAMA_ALLOW_RANGES {
-            for token in range.clone() {
-                allowed_tokens[token as usize] = true;
-            }
-        }
+        // TODO: Fix regex, or add LLAMA_3 allow list. As it is now, generation
+        // is potato without "Unsafe" vocab because the regex is too strict.
 
         Self {
             allowed_tokens,
@@ -205,7 +222,7 @@ impl Vocab {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llama_cpp_sys::llama_token;
+    use llama_cpp_sys_3::llama_token;
     use rayon::prelude::*;
     use std::{
         collections::{BTreeSet, HashSet},

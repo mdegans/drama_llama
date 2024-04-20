@@ -413,6 +413,8 @@ async fn main() {
         .await
         .unwrap();
 
+    // We need to manually drop the rocket before joining the thread or the
+    // sender will never be dropped and the worker will never finish.
     drop(rocket);
     worker.await.unwrap();
 }

@@ -1,6 +1,6 @@
 use std::num::{NonZeroU128, NonZeroUsize};
 
-use llama_cpp_sys::llama_token;
+use llama_cpp_sys_3::llama_token;
 use xorshift::SeedableRng;
 
 use crate::{

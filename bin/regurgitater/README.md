@@ -16,3 +16,9 @@ $ cargo run --features="webchat cli stats" --bin regurgitater -- --model ~/model
 - **Are you aware the name is spelled wrong?** Yes. It's funny because tater ha ha.
 - **Did you paint the vomiting llama?** No. That was Bing Copilot and Dall-E 3.
 ````
+
+## Known Issues
+
+- When using LLaMA 3, `--vocab unsafe` should be passed as a command line option
+  however, keep in mind that there is out output sanitization or vocabulary
+  restrictions.

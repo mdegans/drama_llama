@@ -21,7 +21,7 @@ use std::{
 
 use partial_sort::PartialSort;
 
-use llama_cpp_sys::{llama_token, llama_token_data, llama_token_data_array};
+use llama_cpp_sys_3::{llama_token, llama_token_data, llama_token_data_array};
 
 use crate::{
     model::Vocab,

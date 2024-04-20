@@ -17,7 +17,7 @@ pub(crate) use batch::Batch;
 mod candidates;
 pub(crate) use candidates::Candidates;
 
-mod prompt;
+pub mod prompt;
 pub use prompt::{Message, Prompt, Role};
 
 mod model;
