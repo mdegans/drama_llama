@@ -6,16 +6,15 @@ The tool works by, for a given text, submitting the beginning of the text as con
 
 ## Usage
 
-````bash
+```bash
 $ cargo run --features="webchat cli stats" --bin regurgitater -- --model ~/models/llama/70b/llama-2-70b.Q6_K.gguf
-```cd ~
+```
 
 ## Faq
 
 - **What is greedy sampling?** When you submit some tokens to a language model, you get back a probability distribution of all possible tokens for the one next token. Greedy sampling always picks the most likely token from this list (as opposed to, for example, throwing some digital dice and choosing from the top k most probable tokens).
 - **Are you aware the name is spelled wrong?** Yes. It's funny because tater ha ha.
 - **Did you paint the vomiting llama?** No. That was Bing Copilot and Dall-E 3.
-````
 
 ## Known Issues
 

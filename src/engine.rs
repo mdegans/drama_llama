@@ -458,7 +458,7 @@ mod tests {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("models/model.gguf");
         for i in 0..1000 {
-            let engine = Engine::new(path.clone(), None, None, None);
+            let engine = Engine::new(path.clone(), None, None, None, None);
             if engine.is_err() {
                 println!(
                     "Failed to create engine after {} iterations because: {}",
