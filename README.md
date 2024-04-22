@@ -1,5 +1,7 @@
 # `drama_llama`
 
+![llama with drama mask logo](logo.svg)
+
 `drama_llama` is yet another Rust wrapper for [`llama.cpp`]. It is a work in progress and not intended for production use. The API _will_ change.
 
 For examples, see the `bin` folder. There are two example binaries.
@@ -49,3 +51,11 @@ For examples, see the `bin` folder. There are two example binaries.
   launches, the model should already be cached by the OS.
 
 [`llama.cpp`]: https://github.com/ggerganov/llama.cpp
+
+## Generative AI Disclosure
+
+- Generative, AI, specifically Microsoft's Bing Copilot, GitHub Copilot, and
+  Dall-E 3 were used for portions of this project. See inline comments for
+  sections where generative AI was used. Completion was also used for getters,
+  setters, and some tests. Logos were generated with Dall-E and post processed
+  in Inkscape.
