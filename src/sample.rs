@@ -9,10 +9,7 @@ use crate::{
 use llama_cpp_sys_3::{llama_token, llama_token_data};
 use xorshift::Rng;
 
-use std::{
-    borrow::Cow,
-    num::{NonZeroU8, NonZeroUsize},
-};
+use std::num::{NonZeroU8, NonZeroUsize};
 
 #[cfg_attr(
     feature = "serde",
@@ -42,82 +39,257 @@ impl SampleOptions {
 )]
 #[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Debug, PartialEq, Default)]
+// TODO: add `min_keep` and `mad_keep` to all the sampling modes since it's
+// doable and it would be nice to have a more consistent API.
 pub enum SamplingMode {
-    /// Greedy sampling. The most likely next token is always chosen.
-    /// Probability is always 0.0 since it is not calculated.
+    /// Greedy sampling. The most likely next token is always chosen. Not very
+    /// useful unless you want to regurgitate the training data.
     #[default]
     Greedy,
-    /// Top-p sampling. Returns the top tokens whose cumulative probability is
-    /// less than or equal to `p`.
+    /// Top-p sampling. A token is chosen from the top tokens whose cumulative
+    /// probability is greater than or equal to `p`.
     TopP {
-        /// The top tokens whose cumulative probability exceeds `p` are kept.
+        /// Reasonable values are between 0.9 and 0.95. Higher means more
+        /// diversity, but potentially less coherent.
         p: Probability<f64>,
         /// Minimum number of candidates to keep per token.
         min_keep: NonZeroUsize,
     },
-    /// Top-k sampling. Returns the top `k` most likely tokens. If `k` is
-    /// greater than the number of candidates, all candidates are returned.
+    /// A token is chosen from the top `k` tokens. This is not very good.
+    /// Reasonable values are between 30 and 40.
     TopK {
         /// The top `k` tokens are kept.
         k: NonZeroUsize,
     },
-    /// Min-p sampling. Returns the tokens whose logits are greater than or
-    /// equal to the minimum logit required to select `min_keep` tokens with
-    /// probability `p`. None is returned if no tokens can be selected.
+    /// Min-p sampling. `p` sets the minimum probability to keep a token. Below
+    /// that the tail is cut off. `p` is scaled by the top token's probability
+    /// to balance diversity and quality.
+    ///
+    /// It is described in detail in the following pull request:
+    /// https://github.com/ggerganov/llama.cpp/pull/3841
     MinP {
-        /// The minimum probability to keep a token.
+        /// The minimum probability to keep a token. This is scaled by the top
+        /// token's probability. Reasonable values are 0.05 to 0.3. Higher means
+        /// less diversity.
         p: Probability<f32>,
         min_keep: NonZeroUsize,
     },
-    /// Tail free sampling. Returns the tokens whose second derivatives are
-    /// greater than or equal to `z`.
+    /// Tail free sampling.
+    ///
+    /// "TFS first converts logits output by a model into probabilities using
+    /// the softmax function before sorting them in descending order. It then
+    /// calculates the first and second derivatives. As the tokens are discrete,
+    /// this can be found with subtraction. The magnitude of each second
+    /// derivative is then taken and normalized so that they sum to 1. Finally,
+    /// a threshold z is used to determine what part of the cumulative
+    /// distribution of the second derivative weights to define the “tail” of
+    /// the distribution to be at."
+    ///
+    /// https://www.trentonbricken.com/Tail-Free-Sampling/.
     TailFree {
-        /// The minimum probability to keep a token.
+        /// Reasonable values are between 0.25 and 0.75. The higher, the more
+        /// diverse the output, but also potentially less coherent.
+        // TODO(mdegans): verify this is correct, read the article. From the
+        // figures, it seems correct, but the colors are hard to distinguish
+        // (for me).
         z: Probability<f32>,
         /// Minimum number of candidates to keep per token.
         min_keep: NonZeroUsize,
     },
     /// Locally typical sampling.
+    ///
+    /// "First, we compute the conditional entropy, which is an O(|V|)
+    /// operation. Second, we sort words by their absolute distance from H(pb(·|
+    /// Y <t = y<t)), which can be done in O(|V| log |V|) time with standard
+    /// sorting algorithms. Finally, we greedily take words from this list until
+    /// their cumulative probability exceeds the threshold `p` , which again
+    /// takes O(|V|) time. Thus, creating our altered distribution has time
+    /// complexity O(|V| log |V|)."
+    ///
+    /// https://arxiv.org/pdf/2202.00666.pdf
     LocallyTypical {
-        /// Probability
+        /// Probability. Reasonable values are between 0.2 and 0.95. For story
+        /// generation, lower is better. For summarization, higher is better.
         p: Probability<f32>,
         /// Minimum number of candidates to keep per token.
         min_keep: NonZeroUsize,
     },
     /// Mirostat sampling.
+    ///
+    /// "a neural text decoding algorithm that directly controls the perplexity
+    /// of the generated text over a wide range of text length. Notably, for
+    /// longer texts and certain ranges of input parameters, top-k and top-p
+    /// sampling fall into boredom and confusion traps which cause low-quality
+    /// texts; Mirostat avoids both traps."
+    ///
+    /// https://arxiv.org/pdf/2007.14966.pdf
     Mirostat {
-        /// Tau
+        /// Tau. Target entropy. A good value is 3.0 according to this paper:
+        /// https://arxiv.org/pdf/2202.00666.pdf
+        ///
+        /// `llama.cpp` uses a default of 5.0.
         tau: f32,
-        /// Eta
+        /// Eta. Learning rate. A good value is 0.1.
         eta: f32,
-        /// M
-        m: NonZeroUsize,
-        /// Mu
-        mu: f32,
+        /// Maximum number of candidates to keep. In the original paper and code
+        /// the default is 100 and the name is `m`.
+        max_keep: Option<NonZeroUsize>,
     },
     /// Mirostat V.2 sampling.
+    ///
+    /// "Here we provide an alternate algorithm for perplexity control, Alg. 2,
+    /// which does not depend on the distribution of the underlying LM. In this
+    /// sense, Alg. 2 controls perplexity in more general sequential generative
+    /// models than Alg. 1 where the underlying distribution may not be Zipfian.
+    /// In our work, we choose Alg. 1 since it has only an additional constant
+    /// time complexity compared to top-k sampling. Whereas Alg. 2 has
+    /// additional time complexity that depends on target cross-entropy rate and
+    /// vocabulary size, which may vary with different LMs."
+    ///
+    /// # Note:
+    /// * The bit about time complexity is not relevant to this implementation
+    ///   since we truncate the candidates to a fixed size like v1.
+    ///
+    /// https://arxiv.org/pdf/2007.14966.pdf
     MirostatV2 {
-        /// Tau
+        /// Tau. Target entropy. A good value is 3.0 according to the paper and
+        /// HF's experiments in https://arxiv.org/pdf/2202.00666.pdf
+        ///
+        /// `llama.cpp` uses a default of 5.0.
         tau: f32,
-        /// Eta
+        /// Eta. Learning rate. A good value is 0.1.
         eta: f32,
-        /// Mu
-        mu: f32,
+        /// Maximum number of candidates to keep. Defaults to 100. The original
+        /// implementation does not support this. If identical behavior is
+        /// desired, set this to the vocabulary size.
+        max_keep: Option<NonZeroUsize>,
     },
-    /// Split P sampling.
+    /// Split P sampling. This cuts the tail off where the difference between
+    /// adjacent probabilities is greatest, where the slope is steepest.
     SplitP {
         /// Minimum number of candidates to keep.
         min_keep: NonZeroUsize,
         /// Maximum number of candidates to keep.
         max_keep: Option<NonZeroUsize>,
     },
-    /// Split L sampling.
+    /// Split L sampling. This cuts the tail off where the difference between
+    /// adjacent logits is greatest, where the slope is steepest.
     SplitL {
         /// Minimum number of candidates to keep.
         min_keep: NonZeroUsize,
         /// Maximum number of candidates to keep.
         max_keep: Option<NonZeroUsize>,
     },
+}
+
+impl SamplingMode {
+    /// Default top-p sampling: p = 0.9 with no minimum keep.
+    pub const fn top_p() -> Self {
+        Self::TopP {
+            p: Probability { p: 0.9 },
+            // Verbosity because const unwrap is not stable for no good reason.
+            // the code is literally this for Option<T>:
+            min_keep: match NonZeroUsize::new(1) {
+                Some(min_keep) => min_keep,
+                None => panic!("NonZeroUsize::new(1) failed"),
+            },
+        }
+    }
+
+    /// Default top-k sampling: k = 35.
+    pub const fn top_k() -> Self {
+        Self::TopK {
+            k: match NonZeroUsize::new(35) {
+                Some(k) => k,
+                None => panic!("NonZeroUsize::new(35) failed"),
+            },
+        }
+    }
+
+    /// Default min-p sampling: p = 0.05 with no minimum keep.
+    pub const fn min_p() -> Self {
+        Self::MinP {
+            p: Probability { p: 0.05 },
+            min_keep: match NonZeroUsize::new(1) {
+                Some(min_keep) => min_keep,
+                None => panic!("NonZeroUsize::new(1) failed"),
+            },
+        }
+    }
+
+    /// Default tail free sampling: z = 0.5 with no minimum keep.
+    pub const fn tail_free() -> Self {
+        Self::TailFree {
+            z: Probability { p: 0.5 },
+            min_keep: match NonZeroUsize::new(1) {
+                Some(min_keep) => min_keep,
+                None => panic!("NonZeroUsize::new(1) failed"),
+            },
+        }
+    }
+
+    /// Default locally typical sampling: p = 0.5 with no minimum keep.
+    pub const fn locally_typical() -> Self {
+        Self::LocallyTypical {
+            p: Probability { p: 0.5 },
+            min_keep: match NonZeroUsize::new(1) {
+                Some(min_keep) => min_keep,
+                None => panic!("NonZeroUsize::new(1) failed"),
+            },
+        }
+    }
+
+    /// Default mirostat sampling: tau = 3.0, eta = 0.1, max_keep = 100.
+    pub const fn mirostat() -> Self {
+        Self::Mirostat {
+            tau: 3.0,
+            eta: 0.1,
+            max_keep: match NonZeroUsize::new(100) {
+                Some(max_keep) => Some(max_keep),
+                None => panic!("NonZeroUsize::new(100) failed"),
+            },
+        }
+    }
+
+    /// Default mirostat v2 sampling: tau = 3.0, eta = 0.1, max_keep = 100.
+    pub const fn mirostat_v2() -> Self {
+        Self::MirostatV2 {
+            tau: 3.0,
+            eta: 0.1,
+            max_keep: match NonZeroUsize::new(100) {
+                Some(max_keep) => Some(max_keep),
+                None => panic!("NonZeroUsize::new(100) failed"),
+            },
+        }
+    }
+
+    /// Default split p sampling: min_keep = 1, max_keep = 50.
+    pub const fn split_p() -> Self {
+        Self::SplitP {
+            min_keep: match NonZeroUsize::new(1) {
+                Some(min_keep) => min_keep,
+                None => panic!("NonZeroUsize::new(1) failed"),
+            },
+            max_keep: match NonZeroUsize::new(50) {
+                Some(max_keep) => Some(max_keep),
+                None => panic!("NonZeroUsize::new(50) failed"),
+            },
+        }
+    }
+
+    /// Default split l sampling: min_keep = 1, max_keep = 50.
+    pub const fn split_l() -> Self {
+        Self::SplitL {
+            min_keep: match NonZeroUsize::new(1) {
+                Some(min_keep) => min_keep,
+                None => panic!("NonZeroUsize::new(1) failed"),
+            },
+            max_keep: match NonZeroUsize::new(50) {
+                Some(max_keep) => Some(max_keep),
+                None => panic!("NonZeroUsize::new(50) failed"),
+            },
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, derive_more::From)]
@@ -297,14 +469,13 @@ fn ngram_is_ignored(ngram: NGram, ignored: &[NGram]) -> bool {
 /// This is mostly a translation of the C++ code in `llama.cpp` with support for
 /// n-grams. [`NGramStats`] is used to store the n-gram statistics.
 pub fn apply_sample_repetition_ngram(
-    candidates: &mut Candidates,
+    candidates: Candidates,
     tokens: &[llama_token],
     opts: &RepetitionOptions,
     freq_map: &mut NGramStats,
-) -> Result<(), RepetitionError> {
-    candidates.sort(Sorted::ById {
-        k: candidates.len(),
-    });
+) -> Result<Candidates, RepetitionError> {
+    let k = candidates.len();
+    let mut candidates = candidates.sort(Sorted::ById { k });
 
     let RepetitionOptions {
         ignored,
@@ -360,13 +531,13 @@ pub fn apply_sample_repetition_ngram(
         // TODO: we added as weight member to the NGramData but it is unused. We
         // can use the weighted probability to penalize the n-gram in addition
         // to the count.
-        let count = freq_map.add(ngram, candidates).count();
+        let data = freq_map.add(ngram, &candidates);
 
         let candidate = &mut candidates.data[penalized_token];
 
         // The logic here is copied from the c++ code in llama.cpp.. which was
         // broken. It was fixed in the c++ so we fix it here. It looked wrong.
-        if count > penalty_max_count {
+        if data.count() > penalty_max_count {
             // dbg!(count, &ngram, &candidate);
             if candidate.logit <= 0.0 {
                 candidate.logit *= penalty_repeat.powf(ngram.len() as f32);
@@ -375,25 +546,24 @@ pub fn apply_sample_repetition_ngram(
             }
         }
 
-        candidate.logit -=
-            (count as f32) * penalty_freq + (count as f32) * penalty_present;
+        candidate.logit -= (data.count() as f32) * penalty_freq
+            + (data.count() as f32) * penalty_present;
 
         // We penalize longer ngrams more. Because we work backwards, this will
         // penalize the first token in the ngram the most.
         penalty_repeat *= penalty_repeat;
+
+        // We have modified the logit values, so we need to reapply softmax.
+        candidates.softmax_applied_to = None;
     }
 
-    // We have modified the logit values, so we need to reapply softmax.
-    candidates.arr.sorted = false;
-    candidates.softmax_applied_to = None;
-
-    Ok(())
+    Ok(candidates)
 }
 
 /// Sample a token from the candidates.
 pub(crate) fn sample_token(
     tokens: &[llama_token],
-    candidates: &mut Candidates,
+    mut candidates: Candidates,
     vocab: &Vocab,
     opts: &SampleOptions,
     freq_map: &mut NGramStats,
@@ -429,6 +599,7 @@ pub(crate) fn sample_token(
                         // And the ngram is banned, ban the token
                         // TODO: we could also remove the previous tokens from
                         // the tokens but that doesn't suit our current design.
+                        // FIXME: it does now but there is still work to do.
                         token.logit = min_logit;
                     }
                 }
@@ -440,79 +611,52 @@ pub(crate) fn sample_token(
     // softmax and sorts the candidates by logit where the most likely token is
     // first.
     if let Some(repetition) = &opts.repetition {
-        apply_sample_repetition_ngram(
+        candidates = apply_sample_repetition_ngram(
             candidates, tokens, repetition, freq_map,
         )?;
     }
 
-    let filtered: Cow<'_, [llama_token_data]> = match opts.mode {
+    let filtered: Candidates = match opts.mode {
         SamplingMode::Greedy => return Ok(candidates.sample_token_greedy().id),
-        SamplingMode::TopP { p, min_keep } => {
-            candidates.top_p(p, min_keep).into()
-        }
-        SamplingMode::TopK { k } => candidates.top_k(k).into(),
+        SamplingMode::TopP { p, min_keep } => candidates.top_p(p, min_keep),
+        SamplingMode::TopK { k } => candidates.top_k(k),
         SamplingMode::MinP { p, min_keep } => candidates.min_p(p, min_keep),
         SamplingMode::TailFree { z, min_keep } => {
-            candidates.tail_free(z, min_keep).into()
+            candidates.tail_free(z, min_keep)
         }
         SamplingMode::LocallyTypical { p, min_keep } => {
-            candidates.locally_typical(p, min_keep).into()
+            candidates.locally_typical(p, min_keep)
         }
-        SamplingMode::Mirostat {
-            tau,
-            eta,
-            m,
-            mu: initial_mu,
-        } => {
-            let mu = mu.get_or_insert(initial_mu);
-            return Ok(candidates.mirostat(rng, tau, eta, m, mu));
+        SamplingMode::Mirostat { tau, eta, max_keep } => {
+            return Ok(candidates.mirostat(rng, tau, eta, max_keep, mu));
         }
-        SamplingMode::MirostatV2 {
-            tau,
-            eta,
-            mu: initial_mu,
-        } => {
-            let mu = mu.get_or_insert(initial_mu);
-            return Ok(candidates.mirostat_v2(rng, tau, eta, mu));
+        SamplingMode::MirostatV2 { tau, eta, max_keep } => {
+            return Ok(candidates.mirostat_v2(rng, tau, eta, max_keep, mu));
         }
         SamplingMode::SplitP { min_keep, max_keep } => {
-            candidates.split_p(min_keep, max_keep).into()
+            candidates.split_p(min_keep, max_keep)
         }
         SamplingMode::SplitL { min_keep, max_keep } => {
-            candidates.split_l(min_keep, max_keep).into()
+            candidates.split_l(min_keep, max_keep)
         }
     };
 
-    let mut filtered = filtered.to_vec();
-
-    // Check that the filtered candidates are sorted by logit
-    debug_assert!(filtered.windows(2).all(|w| w[0].logit >= w[1].logit));
-
-    Ok(predict_token(rng, &mut filtered).id)
+    Ok(predict_token(rng, filtered.softmax(None)).id)
 }
 
-/// Apply the softmax function to the remaining candidates and choose one based
-/// on weighted probabilities.
+/// Apply the softmax function to the remaining candidates and choose one using
+/// the probabilities and the supplied rng.
+// TODO: better name
 pub(crate) fn predict_token(
     rng: &mut xorshift::Xoroshiro128,
-    tokens: &mut [llama_token_data],
+    tokens: Candidates,
 ) -> llama_token_data {
-    // Recalculate probabilities
-    let max_logit = tokens.first().unwrap().logit;
-    let cum_prob = tokens.iter_mut().fold(0.0, |sum, token| {
-        token.p = (token.logit - max_logit).exp();
-        sum + token.p
-    });
-    for token in tokens.iter_mut() {
-        token.p /= cum_prob;
-    }
+    let candidates = tokens.softmax(None);
 
     // Pick a token based on the probabilities
     let val = rng.gen_range(0.0, 1.0);
     let mut cum_prob = 0.0;
-    for token in tokens.iter() {
-        debug_assert!(token.p >= 0.0);
-        debug_assert!(token.p <= 1.0);
+    for token in candidates.iter() {
         cum_prob += token.p;
         if val < cum_prob {
             return *token;
@@ -520,5 +664,5 @@ pub(crate) fn predict_token(
     }
 
     // This can happen because of floating point errors
-    *tokens.last().unwrap()
+    *candidates.data.last().unwrap()
 }

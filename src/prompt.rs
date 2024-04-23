@@ -68,7 +68,7 @@ impl Prompt {
     where
         F: std::fmt::Write,
     {
-        let format = Format::from_model(model);
+        let format = Format::from_model(model).unwrap_or(Format::Unknown);
         format.format_prompt(self, Some(model), f)
     }
 

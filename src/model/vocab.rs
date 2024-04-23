@@ -8,8 +8,7 @@ use crate::{data::banned::Banned, model::token_to_piece_ref, Model, NGram};
 // TODO: These regex aren't great. They're just a starting point. They have
 // issues requiring the allow list below. We need to improve them so they work
 // for all models.
-pub const SAFE_REGEX: &str =
-    r#"^[ a-zA-Z▁\(\)\.\?!\"\'\-_]{2,32}|a{1}|\n{1,3}|\t{1,3}| {1,16}$"#;
+pub const SAFE_REGEX: &str = r#"^[▁ a-zA-Z]{2,32}|[ ▁\(\)\.\?!\"\'\-_]{1,32}|[aAI]{1}|\n{1,3}|\t{1,3}| {1,16}$"#;
 pub const LETTERS_REGEX: &str = r#"^[a-zA-Z]{1}$"#;
 pub const CODE_REGEX: &str = r#"^[ \d\\(\){\}\[\]\;\:\"\'\<\>\,\.\\\/\?\.\!\@\#\$\%\^\&\=\`\~]{1,32}|\w{2,32}$"#;
 
@@ -126,6 +125,8 @@ pub struct Vocab {
     /// would generate a banned word. Letters are not included since the number
     /// of permutations is too high.
     banned: Option<Banned>,
+    /// Longest token length. This is used to optimize search for stop strings.
+    longest_token: usize,
 }
 
 impl Vocab {
@@ -142,6 +143,7 @@ impl Vocab {
         if enabled.contains(&VocabKind::Unsafe) {
             return Self {
                 allowed_tokens: vec![true; model.n_vocab() as usize],
+                longest_token: model.max_token_len(),
                 banned,
             };
         }
@@ -177,6 +179,7 @@ impl Vocab {
 
         Self {
             allowed_tokens,
+            longest_token: model.max_token_len(),
             banned,
         }
     }
@@ -199,6 +202,13 @@ impl Vocab {
         } else {
             false
         }
+    }
+
+    /// Piece length of the longest token.
+    ///
+    /// Time complexity: O(1).
+    pub fn max_token_len(&self) -> usize {
+        self.longest_token
     }
 
     /// Allowed tokens.

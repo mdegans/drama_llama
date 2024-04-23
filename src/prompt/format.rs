@@ -1,8 +1,6 @@
-use std::{borrow::Cow, fmt::Formatter};
-
 use llama_cpp_sys_3::llama_token;
 
-use crate::{prompt::format, Message, Model, Prompt, Role};
+use crate::{Message, Model, Prompt, Role};
 
 pub mod llama2 {
     pub const BOS: &str = "<s>";
@@ -59,21 +57,50 @@ pub enum Format {
 }
 
 impl Format {
-    pub fn from_model(model: &Model) -> Self {
-        match model.get_meta("general.name").as_ref().map(|s| s.as_str()) {
-            Some("LLaMA") => Self::LLaMA,
-            Some("LLaMA v2") => Self::LLaMA2,
-            Some("LLaMA v2 Chat") => Self::LLaMA2Chat,
-            // The current ggml conversion of llama3 has ".." as the model name,
-            // but that is likely an error. I am testing with this model:
-            // https://huggingface.co/NousResearch/Meta-Llama-3-70B-GGUF As soon
-            // as a better conversion is available, I will update this. Other
-            // heuristics may be needed to determine the model type.
-            Some("LLaMA v3") => Self::LLaMA3,
-            Some("LLaMA v3 Chat") => Self::LLaMA3Chat,
-            // TODO: download Vicuna and check the model name, also check the
-            // chat models above.
-            _ => Self::Unknown,
+    pub fn from_model(model: &Model) -> Option<Self> {
+        let found =
+            match model.get_meta("general.name").as_ref().map(|s| s.as_str()) {
+                Some("LLaMA") => Some(Self::LLaMA),
+                Some("LLaMA v2") => Some(Self::LLaMA2),
+                Some("LLaMA v2 Chat") => Some(Self::LLaMA2Chat),
+                // The current ggml conversion of llama3 has ".." as the model name,
+                // but that is likely an error. I am testing with this model:
+                // https://huggingface.co/NousResearch/Meta-Llama-3-70B-GGUF As soon
+                // as a better conversion is available, I will update this. Other
+                // heuristics may be needed to determine the model type.
+                Some("LLaMA v3") => Some(Self::LLaMA3),
+                Some("LLaMA v3 Chat") => Some(Self::LLaMA3Chat),
+                // TODO: download Vicuna and check the model name, also check the
+                // chat models above.
+                _ => None,
+            };
+
+        if found.is_some() {
+            return found;
+        }
+
+        // We'll use some heuristics to determine the model type. TODO: this
+        // is a bit fragile and may need to be updated.
+        let vocab_size =
+            model.get_meta("llama.vocab_size").unwrap_or("0".to_owned());
+        let feed_forward_len = model
+            .get_meta("llama.feed_forward_length")
+            .unwrap_or("0".to_owned());
+        let head_count = model
+            .get_meta("llama.attention.head_count_kv")
+            .unwrap_or("0".to_owned());
+        let bos = model.bos();
+        let eos = model.eos();
+
+        match (
+            vocab_size.as_str(),
+            feed_forward_len.as_str(),
+            head_count.as_str(),
+            bos,
+            eos,
+        ) {
+            ("128256", "28672", "8", 128000, 128001) => Some(Self::LLaMA3),
+            _ => None,
         }
     }
 

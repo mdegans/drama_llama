@@ -233,6 +233,18 @@ impl Model {
         unsafe { llama_token_suffix(self.inner) }
     }
 
+    /// Calculate the longest token length. Useful for optimizing searches.
+    ///
+    /// Time complexity is O(k) where k is the vocab size.
+    pub fn max_token_len(&self) -> usize {
+        let mut max_len = 0;
+        for i in 0..self.n_vocab() {
+            max_len = max_len.max(self.token_to_text(i).len());
+        }
+
+        max_len
+    }
+
     /// Return whether BOS token is enabled.
     ///
     /// Returns None if unknown.

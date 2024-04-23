@@ -1,9 +1,10 @@
 use crate::{
     model::{Vocab, VocabKind},
-    Batch, Model, PredictOptions, Predictor,
+    predictor::{CandidatePredictor, PiecePredictor, TokenPredictor},
+    Batch, Model, PredictOptions,
 };
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Mutex};
 
 use llama_cpp_sys_3::{
     ggml_log_callback, ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED,
@@ -410,19 +411,70 @@ impl Engine {
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 
-    /// Return an iterator that predicts a sequence of tokens until the end of
-    /// the sequence is reached.
+    /// Return an iterator that yields candidates for the next token in a
+    /// sequence until `n` tokens have been predicted or the end of context is
+    /// reached.
     ///
-    /// The `tokens` argument is a mutable reference to a vector of tokens. This
-    /// is because the predictor will modify the tokens in place. Predicted
-    /// tokens will be appended.
-    pub fn predict<'a, 'b>(
+    /// # Note
+    /// * The [`record_choice`] method must be called on the returned iterator
+    ///   to record the choice made by the user (or iteration will end).
+    /// * The tokens given will be available as the `tokens` field of the
+    ///   iterator. For convenience, when finished, the [`CandidatePredictor`]
+    ///   can be converted back `into` the tokens, including any choices made.
+    ///
+    /// [`record_choice`]: crate::predictor::CandidatePredictor::record_choice
+    pub fn predict_candidates<'a>(
         &'a mut self,
-        tokens: &'b mut Vec<llama_token>,
-        options: PredictOptions,
-    ) -> Predictor<'a, 'b> {
+        tokens: Vec<llama_token>,
+        n: NonZeroUsize,
+    ) -> CandidatePredictor<'a> {
+        // TODO: We technically do not need to clear the cache here. If we keep
+        // track of sequence ids, we can clear the cache when the sequence id
+        // is no longer in use. This would be more efficient, but requires more
+        // bookkeeping.
         self.kv_cache_clear();
-        Predictor::new(self, tokens, options)
+        CandidatePredictor::new(self, tokens, n)
+    }
+
+    /// Return an iterator that predicts a sequence of tokens until `options.n`
+    /// tokens have been predicted, the end of context is reached, or stop
+    /// conditions are met.
+    ///
+    /// # Note
+    /// * The tokens given will be available as the `tokens` field of the
+    ///   iterator. For convenience, when finished, the [`TokenPredictor`] can
+    ///   be converted back `into` the tokens, including any predicted.
+    pub fn predict_tokens<'a>(
+        &'a mut self,
+        tokens: Vec<llama_token>,
+        options: PredictOptions,
+    ) -> TokenPredictor<'a> {
+        self.kv_cache_clear();
+        TokenPredictor::new(self, tokens, options)
+    }
+
+    /// Return an iterator that predicts a sequence of pieces until `options.n`
+    /// tokens have been predicted, the end of context is reached, or stop
+    /// conditions are met.
+    ///
+    /// # Note
+    /// * The last piece is not truncated, however the `text` field of the
+    ///   predictor will be truncated to a stop string if one is provided and
+    ///   found at the end of the text. In this case it may be desirable to use
+    ///   a `while let` loop rather than a `for` loop since a for loop will
+    ///   consume the iterator.
+    /// * The tokens given will be available as the `tokens` field of the
+    ///   iterator. For convenience, when finished, the [`PiecePredictor`] can
+    ///   be converted back `into` the tokens, including any predicted. It can
+    ///   also be converted into the predicted text. See the [`PiecePredictor`]
+    ///   for additional conversion and collection methods.
+    pub fn predict_pieces<'a>(
+        &'a mut self,
+        tokens: Vec<llama_token>,
+        options: PredictOptions,
+    ) -> PiecePredictor<'a> {
+        self.kv_cache_clear();
+        PiecePredictor::new(self, tokens, options)
     }
 }
 

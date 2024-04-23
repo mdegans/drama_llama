@@ -1,22 +1,8 @@
 //! Candidate token container and sampling methods.
-//!
-//! This is not publicly exposed because we plan to refactor the Candidate API
-//! to be more functional and less imperative. The idea originally was to avoid
-//! unnecessary copying of data, but it's not clear that this is a good idea
-//! because in most cases the data is copied anyway.
-//!
-//! In the future, almost all sampling methods will take self by value and
-//! return a truncated set of candidates. This will make the API more functional
-//! and allow chaining of methods. It will also make it easier to reason about
-//! the code and avoid bugs. It will also make it easier to implement a new
-//! iterator yielding candidates, rather than the final token. Exposing this
-//! will give users much more flexibility in how they use the library and how to
-//! sample tokens.
 
 use std::{
-    borrow::Cow,
     num::{NonZeroUsize, TryFromIntError},
-    ops::Index,
+    ops::{Deref, Index},
 };
 
 use partial_sort::PartialSort;
@@ -29,18 +15,21 @@ use crate::{
     sample::{predict_token, SampleError},
     Probability, RepetitionOptions, SampleOptions,
 };
-
 /// Sort state of the candidates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Sorted {
     /// The candidates may or may not be sorted.
     Unknown,
-    /// The candidates are sorted because there is only one candidate left.
+    /// The candidates are sorted because there is only one candidate left. In
+    /// this case they are sorted by id, logit, and probability.
     One,
     /// The candidates are sorted until index `k` by id.
     ById { k: NonZeroUsize },
     /// The candidates are sorted until index `k` in order of most likely to
-    /// least likely. This also means the candidates are sorted by probability.
+    /// least likely. This also means the candidates are sorted by probability,
+    /// although probabilities may not yet be calculated.
+    ///
+    /// See [`Candidates::softmax`] for calculating probabilities.
     ByLogit { k: NonZeroUsize },
 }
 
@@ -71,62 +60,155 @@ impl Sorted {
     }
 }
 
+pub struct TokenDataArray<'a> {
+    arr: llama_token_data_array,
+    candidates: &'a mut Candidates,
+}
+
+impl TokenDataArray<'_> {
+    /// Get the number of candidates in the array.
+    pub fn len(&self) -> NonZeroUsize {
+        self.candidates.len().min(self.arr.size.try_into().unwrap())
+    }
+
+    /// Get a slice of the candidates in the array.
+    ///
+    /// # Panics
+    /// * If the arr.size has been modified to be out of bounds.
+    pub fn as_slice(&self) -> &[llama_token_data] {
+        assert!(self.arr.size == self.len().get());
+        unsafe { std::slice::from_raw_parts(self.arr.data, self.len().get()) }
+    }
+
+    /// Get a mutable slice of the candidates in the array.
+    pub fn as_mut_slice(&mut self) -> &mut [llama_token_data] {
+        self.arr.size = self.len().get();
+        self.candidates.sort_state = Sorted::Unknown;
+        self.candidates.softmax_applied_to = None;
+        unsafe {
+            std::slice::from_raw_parts_mut(self.arr.data, self.len().get())
+        }
+    }
+
+    /// Get the inner `llama_token_data_array` as a reference.
+    ///
+    /// # Panics
+    /// * If the arr.size has been modified to be out of bounds.
+    pub fn as_ref(&self) -> &llama_token_data_array {
+        assert!(self.arr.size == self.len().get());
+        &self.arr
+    }
+
+    /// Get the inner `llama_token_data_array` as a mutable reference.
+    ///
+    /// # Safety
+    /// * The `arr.size` is guaranteed to be valid as long as the Candidates
+    ///   struct is not modified.
+    /// * The Candidates struct must outlive the pointer in the array since
+    ///   it points to the candidate data.
+    /// * If `arr.size` is shrunk, the Candidates struct must be truncated to
+    ///   the new size. Growing the candidates is not allowed and will cause
+    ///   a panic or truncation on the next access.
+    pub fn as_mut(&mut self) -> &mut llama_token_data_array {
+        self.arr.size = self.len().get();
+        self.candidates.sort_state = Sorted::Unknown;
+        self.candidates.softmax_applied_to = None;
+        &mut self.arr
+    }
+
+    /// Convert into the inner `llama_token_data_array`.
+    ///
+    /// # Safety
+    /// * The `arr.size` is guaranteed to be valid as long as the Candidates
+    ///   struct is not modified.
+    /// * The Candidates struct must outlive the array.
+    /// * Prefer methods that hold a reference to the Candidates struct.
+    /// * If `arr.size` is shrunk, the Candidates struct must be truncated to
+    ///   the new size. Growing the candidates is not allowed and will cause
+    ///   a panic or truncation on the next access.
+    pub fn into_inner(mut self) -> llama_token_data_array {
+        self.arr.size = self.len().get();
+        self.candidates.sort_state = Sorted::Unknown;
+        self.candidates.softmax_applied_to = None;
+        self.arr
+    }
+
+    /// Get a pointer to the inner [`llama_token_data_array`]. Provided for
+    /// compatability with [`llama_cpp_sys`] and friends.
+    ///
+    /// # Panics
+    /// * If the arr.size has been modified to be out of bounds.
+    ///
+    ///
+    /// # Safety
+    /// * The `arr.size` is guaranteed to be valid as long as the Candidates
+    ///   struct is not modified.
+    /// * The Candidates struct and self must outlive the pointer in the array.
+    /// * Prefer methods that hold a reference to the Candidates struct.
+    pub fn as_ptr(&self) -> *const llama_token_data_array {
+        assert!(self.arr.size == self.len().get());
+        &self.arr
+    }
+
+    /// Get a mutable pointer to the inner [`llama_token_data_array`]. Provided
+    /// for compatability with [`llama_cpp_sys`] and friends.
+    ///
+    /// # Safety
+    /// * The `arr.size` is guaranteed to be valid as long as the Candidates
+    ///   struct is not modified.
+    /// * The Candidates struct and self must outlive the pointer in the array.
+    /// * Prefer methods that hold a reference to the Candidates struct.
+    /// * If `arr.size` is shrunk, the Candidates struct must be truncated to
+    ///   the new size. Growing the candidates is not allowed and will cause
+    ///   a panic or truncation on the next access.
+    pub fn as_mut_ptr(&mut self) -> *mut llama_token_data_array {
+        self.arr.size = self.len().get();
+        self.candidates.sort_state = Sorted::Unknown;
+        self.candidates.softmax_applied_to = None;
+        &mut self.arr
+    }
+}
+
+impl Deref for TokenDataArray<'_> {
+    type Target = llama_token_data_array;
+
+    fn deref(&self) -> &Self::Target {
+        &self.arr
+    }
+}
+
 /// A container for candidate tokens.
 ///
-/// It is guaranteed that:
-/// * The number of candidates is at least 1 and at most `i32::MAX`.
+/// It is guaranteed, when not using unsafe methods, that:
+/// * The number of candidates is **at least 1** and at most `i32::MAX`.
 pub struct Candidates {
-    /// A llama.cpp array of candidate tokens. This contains a pointer to the
-    /// data in `data`, the size of the array, and a boolean indicating whether
-    /// the array is sorted entirely by logit.
-    pub(crate) arr: llama_token_data_array,
-    /// In the initial state, or unsorted state, `sorted_until` is None. When
-    /// it is not None, it is guaranteed to be non-zero and less than or equal
-    /// to self.len()
+    /// Cached state of whether the candidates are sorted, by what, and to what
+    /// index. This is used to avoid unnecessary sorting.
     pub(crate) sort_state: Sorted,
-    /// A cached state of whether the softmax has been applied. This is set
-    /// to the index of the last candidate that was softmaxed. If the softmax
-    /// has not been applied, this is set to None.
+    /// A cached state whether, and to what index, the softmax has been applied.
+    /// This does not guarantee that the candidates are sorted by logit.
     pub(crate) softmax_applied_to: Option<NonZeroUsize>,
-    /// It is guaranteed that `data.len() == arr.size` and `data.as_mut_ptr() ==
-    /// arr.data`. It is also guaranteed that `data.len() <= i32::MAX` and there
-    /// is at least one candidate `llama_token_data`.
-    // This must always be last because it is dropped last, and it has to
-    // outlive `arr` because `arr` contains raw pointers to the data in `data`.
+    /// The actual candidate tokens.
     pub(crate) data: Vec<llama_token_data>,
 }
 
-// Safety: Candidates is Send because the only field that contains a raw pointer
-// is `arr` and it is guaranteed that the data it points to is owned by the
-// Candidates struct. The data is never moved or dropped while the raw pointer
-// is still alive. All other fields are Send.
-unsafe impl Send for Candidates {}
-// Candidates is not Sync because of data races that could occur if the data is
-// modified from multiple threads. We would need to add locking to make it Sync.
-
-#[derive(Debug, thiserror::Error)]
-pub enum CandidatesNewError<N> {
-    #[error("Could not convert `{0}` to i32.")]
-    OutOfRange(N),
+#[derive(Debug, thiserror::Error, derive_more::From)]
+pub enum CandidatesNewError {
+    #[error("Could not convert vocabulary size to i32 because: `{0}`.")]
+    OutOfRange(TryFromIntError),
     #[error("Number of candidates must be > 0. Got `{0}`.")]
     NotEnoughCandidates(i32),
 }
 
 impl Candidates {
     /// Create a new Candidates container with a given vocabulary size. The IDs
-    /// of the candidates will be in the range [0, n_vocab]).
-    // TODO: Custom type for the input. An i32 that is always supposed to be
-    // positive is the way it's wr>itten in the c++ api, so we're stuck with it
-    // for now... But we can make an immutable wrapper around it that is
-    // guaranteed to always be positive.
-    pub fn new<N>(n_vocab: N) -> Result<Self, CandidatesNewError<N>>
+    /// of the candidates will be in the range [0, n_vocab].
+    pub fn new<N>(n_vocab: N) -> Result<Self, CandidatesNewError>
     where
         N: TryInto<i32, Error = TryFromIntError> + Copy,
     {
         // check upper bound
-        let n_vocab: i32 = n_vocab
-            .try_into()
-            .map_err(|_| CandidatesNewError::OutOfRange(n_vocab))?;
+        let n_vocab: i32 = n_vocab.try_into()?;
         // check lower bound
         if n_vocab < 1 {
             return Err(CandidatesNewError::NotEnoughCandidates(n_vocab));
@@ -138,22 +220,15 @@ impl Candidates {
     // This is private because we don't want to expose the ability to create a
     // Candidates container with a negative number of candidates because it is
     // used as an array index in the c++ api (and ours) which could lead to
-    // memory unsafety. It is checked on debug automatically, but not on
-    // release.
+    // memory unsafety.
     fn from_i32(n_vocab: i32) -> Self {
-        let mut data: Vec<llama_token_data> = (0_i32..n_vocab)
+        let data: Vec<llama_token_data> = (0_i32..n_vocab)
             .map(|id| llama_token_data {
                 id,
                 logit: 0.0,
                 p: 0.0,
             })
             .collect();
-
-        let arr = llama_token_data_array {
-            size: data.len(),
-            data: data.as_mut_ptr(),
-            sorted: false,
-        };
 
         let sort_state = if data.len() == 1 {
             // Special case.
@@ -168,7 +243,6 @@ impl Candidates {
 
         Self {
             data,
-            arr,
             sort_state,
             softmax_applied_to: None,
         }
@@ -179,20 +253,14 @@ impl Candidates {
     /// Time complexity is O(n) where n is the number of candidates because the
     /// candidates are checked for sorting. See
     /// [`Candidates::from_vec_unchecked`] for a version that does not check if
-    /// the candidates are sorted.
+    /// the candidates are sorted. Partial sort is not checked (yet).
     ///
     /// # Panics
     /// * If `data` is empty.
     /// * If the IDs in `data` are not contiguous from 0 to n-1.
     // TODO: Make fallible and return a Result.
-    pub fn from_vec(mut data: Vec<llama_token_data>) -> Self {
+    pub fn from_vec(data: Vec<llama_token_data>) -> Self {
         assert!(!data.is_empty());
-
-        let mut arr = llama_token_data_array {
-            size: data.len(),
-            data: data.as_mut_ptr(),
-            sorted: false,
-        };
 
         let sort_state = if data.len() == 1 {
             // Special case.
@@ -202,6 +270,7 @@ impl Candidates {
             let mut by_id = true;
             let mut id_seen: Vec<bool> = vec![false; data.len()];
 
+            // TODO: Check for partial sort.
             *id_seen.get_mut(data[0].id as usize).unwrap() = true;
             for pair in data.windows(2) {
                 if *id_seen.get(pair[1].id as usize).unwrap() {
@@ -223,7 +292,6 @@ impl Candidates {
                     k: data.len().try_into().unwrap(),
                 }
             } else if by_logit {
-                arr.sorted = true;
                 Sorted::ByLogit {
                     k: data.len().try_into().unwrap(),
                 }
@@ -234,153 +302,195 @@ impl Candidates {
 
         Self {
             data,
-            arr,
             sort_state,
+            softmax_applied_to: None,
+        }
+    }
+
+    /// Convert from an iterable of logit values. The IDs are assigned in order
+    /// of the logit values starting from 0.
+    ///
+    /// # Panics
+    /// * If the iterator is empty.
+    pub fn from_logits<T>(it: T) -> Self
+    where
+        T: IntoIterator<Item = f32>,
+    {
+        Self::from_iter(
+            (0..)
+                .zip(it.into_iter())
+                .map(|(id, logit)| llama_token_data { id, logit, p: 0.0 }),
+        )
+    }
+
+    /// Create a new Candidates container from a [`Vec`] without checking if the
+    /// candidates are sorted.
+    ///
+    /// The sort state is set to [`Sorted::Unknown`] and the softmax applied to
+    /// is set to None.
+    // This is const because Vec has const constructors and there is no reason
+    // not to make it const. As of writing, the const constructors only allow
+    // empty Vecs, but this may change in the future since C++ has constexpr
+    // constructors for std::vector since C++20. By the time Rust has it,
+    // Vec::len will probably also be const and this will be able to be checked
+    // at compile time. Creating a const container of candidates may be useful
+    // for intializing const candidate masks or other uses.
+    pub const fn from_vec_unchecked(data: Vec<llama_token_data>) -> Self {
+        Self {
+            data,
+            sort_state: Sorted::Unknown,
             softmax_applied_to: None,
         }
     }
 
     /// Create a new Candidates container from a [`Vec`] without checking if the
-    /// candidates are sorted. This is unsafe because ids are used to index into
-    /// the candidates and if they are out of bounds, it could lead to memory
-    /// unsafety in release mode.
+    /// candidates are sorted. This is safe, but if the candidates are not
+    /// really sorted or softmaxed, it will break things. It will not, however,
+    /// cause memory unsafety.
+    pub const fn from_vec_unchecked_full(
+        data: Vec<llama_token_data>,
+        sort_state: Sorted,
+        softmax_applied_to: Option<NonZeroUsize>,
+    ) -> Self {
+        Self {
+            data,
+            sort_state,
+            softmax_applied_to,
+        }
+    }
+
+    /// Convert into `llama_token_data_array`, leaking self.
     ///
-    /// Time complexity is O(1).
+    /// This is the most efficient way to pass the candidates to the C API since
+    /// when the struct is recreated, the sort state is respected. For a
+    /// slightly safer way to pass the candidates to the C API, see
+    /// [`Candidates::as_token_data_array`] and the [`TokenDataArray`] wrapper.
     ///
     /// # Safety
-    /// * The IDs in `data` must be contiguous from 0 to n-1. If they are
-    ///   duplicated, this could lead to unsound behavior. If they are out of
-    ///   bounds, this could lead to memory unsafety.
-    pub unsafe fn from_vec_unchecked(mut data: Vec<llama_token_data>) -> Self {
-        let arr = llama_token_data_array {
-            size: data.len(),
-            data: data.as_mut_ptr(),
-            sorted: false,
-        };
+    /// * This **leaks** the inner data so it must be converted back into a
+    ///   Candidates struct using [`Candidates::from_llama_token_data_array`]
+    ///   **or there will be a memory leak**. [`Vec::from_raw_parts`] can also
+    ///   be used to take ownership of the data.
+    pub fn into_llama_token_data_array(mut self) -> llama_token_data_array {
+        let size = self.len().get();
+        let data = self.data.as_mut_ptr();
+        let sorted =
+            self.is_sorted().by_logit().is_some_and(|n| n.get() == size);
+        std::mem::forget(self);
+        llama_token_data_array { size, data, sorted }
+    }
 
-        let sort_state = if data.len() == 1 {
-            // Special case.
-            Sorted::One
-        } else {
-            Sorted::Unknown
-        };
+    /// Create a Candidates container from `llama_token_data_array`. This will
+    /// *take ownership* of the array and free it when the Candidates struct is
+    /// dropped.
+    ///
+    /// If `arr.sorted` is true, the candidates are assumed to be sorted by
+    /// logit entirely. This is not checked on release builds, but it is on
+    /// debug builds at O(n) time complexity.
+    ///
+    /// If the softmax state is known, it should be passed in to avoid repeated
+    /// unnecessary softmax calculations.
+    ///
+    /// # Panics
+    /// * In debug builds, if the candidates are not sorted by logit.
+    /// * If the array's data is null.
+    /// * If the array's size is 0.
+    ///
+    /// # Safety
+    /// * The array must have been created by
+    ///   [`Candidates::into_llama_token_data_array`] or by using the global
+    ///   allocator. If `arr.data` was allocated by another allocator, this
+    ///   method should not be used.
+    /// * (a copy of the) array must not be used after calling this method.
+    /// * `arr.size` must be within the bounds of `arr.data`.
+    /// * If the array's data is owned by another struct, dropping the
+    ///   Candidates struct will cause a double free.
+    pub unsafe fn from_llama_token_data_array(
+        arr: llama_token_data_array,
+        softmax_applied_to: Option<NonZeroUsize>,
+    ) -> Self {
+        assert!(!arr.data.is_null());
+        let data = Vec::from_raw_parts(arr.data, arr.size, arr.size);
+
+        if arr.sorted {
+            debug_assert!(data.windows(2).all(|w| w[0].logit >= w[1].logit));
+        }
 
         Self {
             data,
-            arr,
-            sort_state,
-            softmax_applied_to: None,
+            sort_state: if arr.sorted {
+                Sorted::ByLogit {
+                    k: arr.size.try_into().unwrap(),
+                }
+            } else {
+                Sorted::Unknown
+            },
+            softmax_applied_to,
         }
     }
 
-    /// Capacity of the container.
-    pub fn capacity(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Returns the number of candidates.
+    /// Returns the number of candidates. This is guaranteed to be at least 1
+    /// and at most the vocabulary size the candidates were created with.
     pub fn len(&self) -> NonZeroUsize {
-        self.arr.size.min(self.data.len()).try_into().unwrap()
+        self.data.len().try_into().unwrap()
     }
 
-    /// Get the [`Sorted`] state of the candidates.
-    pub fn is_sorted(&self) -> Sorted {
+    /// Returns `Some(token)` if there is only one candidate.
+    pub fn is_one(&self) -> Option<llama_token> {
+        if self.len().get() == 1 {
+            Some(self.data[0].id)
+        } else {
+            None
+        }
+    }
+
+    /// Get the [`Sorted`] state of the candidates. This can be use to check
+    /// whether the candidates are sorted, by what, and to what index.
+    ///
+    /// ```rust
+    /// # use std::num::NonZeroUsize;
+    /// use drama_llama::{Candidates, Sorted};
+    ///
+    /// let k = NonZeroUsize::new(10).unwrap();
+    /// let candidates = Candidates::new(k.get()).unwrap();
+    /// assert!(candidates.is_sorted().by_id().is_some_and(|n| n == k));
+    /// assert_eq!(candidates.is_sorted(), Sorted::ById { k });
+    /// ```
+    pub const fn is_sorted(&self) -> Sorted {
         self.sort_state
     }
 
-    /// Get a slice of sorted candidates. If k is out of upper bounds, all
-    /// candidates will be returned.
+    /// Truncate the candidates to a new length. If the new length is greater
+    /// than the current length, this does nothing.
     ///
-    /// If [`SortState::Unknown`] is requested, an empty slice is returned. If
-    /// [`SortState::One`] is requested, the first candidate is returned if
-    /// there is only one candidate, otherwise an empty slice is returned.
-    ///
-    /// In general, it does not make sense to request the two above states, but
-    /// it is allowed.
-    ///
-    /// If candidates are not yet sorted, sorting is performed on the k elements
-    /// which can be up to O(n log n) time complexity in the worst case. If the
-    /// candidates are already sorted to at least `k`, this method's time
-    /// complexity is O(1).
-    pub fn sorted(&mut self, desired: Sorted) -> &[llama_token_data] {
-        let k = match desired {
-            Sorted::ById { k } => k.get(),
-            Sorted::ByLogit { k } => k.get(),
-            Sorted::Unknown | Sorted::One => {
-                panic!("Invalid state requested: {desired:?}")
-            }
-        }
-        .min(self.data.len());
-
-        self.sort(desired);
-
-        &self.data[0..k]
-    }
-
-    /// Get a slice of sorted candidates. If k is out of upper bounds, all
-    /// candidates will be returned. K cannot be zero.
-    ///
-    /// The returned slice is guaranteed to be non-empty because a class
-    /// invariant is that the number of candidates is at least 1.
-    ///
-    /// If candidates are not yet sorted, sorting is performed on the k elements
-    /// which can be up to O(n log n) time complexity in the worst case. If the
-    /// candidates are already sorted to at least `k`, this method's time
-    /// complexity is O(1).
-    ///
-    /// # Safety
-    /// This method is unsafe because it returns a mutable view of the data. It
-    /// is the caller's responsibility to ensure that the ids are contiguous
-    /// from 0 to n-1.
-    ///
-    /// # Note:
-    /// Because this returns a mutable view of the data, this method invalidates
-    /// cached [`Sorted`] states and softmax state. The next time one of the
-    /// methods requiring these states is called, they will be recalculated.
-    pub unsafe fn sorted_mut(
-        &mut self,
-        desired: Sorted,
-    ) -> &mut [llama_token_data] {
-        self.sort(desired);
-
-        let k = match self.sort_state {
-            Sorted::ById { k } => k.get(),
-            Sorted::ByLogit { k } => k.get(),
-            Sorted::Unknown | Sorted::One => {
-                panic!("Invalid state requested: {desired:?}")
-            }
-        }
-        .min(self.data.len());
-
-        // We have to invalidate the sort immediately after sorting, because we
-        // are returning a mutable reference to the data. It's likely that the
-        // user will want to change the logits of the candidates, and we can't
-        // guarantee that the sort will be valid after that.
-        self.arr.sorted = false;
-        self.sort_state = Sorted::Unknown;
-        self.softmax_applied_to = None;
-
-        &mut self.data[0..k]
+    /// Note that this does not change the allocated capacity of the candidates.
+    pub fn truncate(mut self, new_len: NonZeroUsize) -> Self {
+        self.data.truncate(self.len().min(new_len).get());
+        self
     }
 
     /// Sort the candidates by the desired [`Sorted`] state. If the state is
-    /// already fulfilled, this method does nothing.
+    /// already fulfilled this method does nothing. If [`Sorted::Unknown`] is
+    /// requested, the sort state is reset to [`Sorted::Unknown`]. Generally,
+    /// this doens't make sense to request, but it is allowed.
+    ///
+    /// **Truncates to `k.`**
+    ///
+    /// Time complexity is O(n log k) where n is the number of candidates and k
+    /// is the number of candidates to sort to (partial sort). If the candidates
+    /// are already sorted to at least k elements, the time complexity is O(1).
     ///
     /// # Panics
-    /// * If SortState::One is requested and there is more than one candidate.
-    ///   In general it doesn't make sense to request this state, but it is
-    ///   allowed.
+    /// * If SortState::One is requested and there is more than one candidate
+    ///   because it would be impossible to know what to sort by in order to
+    ///   satisfy the request.
     // It's this way because without it the method would have to return a Result
     // (since none of the other states change the number of candidates) and this
     // way it's more ergonomic.
-    pub fn sort(&mut self, desired: Sorted) {
-        // Todo: We could avoid sorting entirely with a cached associative
-        // array. This would be a tradeoff between memory and time complexity.
-        // As it is this isn't terrible because we cache repeated calls.
+    pub fn sort(mut self, desired: Sorted) -> Self {
         if self.len().get() == 1 {
             self.sort_state = Sorted::One;
-            self.arr.sorted = true;
-            return;
+            return self;
         }
 
         self.sort_state = match desired {
@@ -390,7 +500,8 @@ impl Candidates {
                 if let Some(cached_k) = self.sort_state.by_id() {
                     if cached_k >= k {
                         // Enough candidates are already sorted by id.
-                        return;
+                        self.sort_state = desired;
+                        return self.truncate(k);
                     }
                 }
 
@@ -403,17 +514,10 @@ impl Candidates {
             Sorted::ByLogit { k } => {
                 let k = k.min(self.len());
 
-                if self.arr.sorted {
-                    // All the candidates are already sorted by logit. This is
-                    // what the underlying library considers `arr.sorted` to
-                    // mean and what we use by convention since we expose the
-                    // same data structure for use in the underlying library.
-                    return;
-                }
-
                 if let Some(cached_k) = self.sort_state.by_logit() {
                     if cached_k.get() >= k.get() {
-                        return;
+                        self.sort_state = desired;
+                        return self.truncate(k);
                     }
                 }
 
@@ -421,215 +525,219 @@ impl Candidates {
                     b.logit.partial_cmp(&a.logit).unwrap()
                 });
 
-                if k == self.len() {
-                    self.arr.sorted = true;
-                }
-
                 Sorted::ByLogit { k }
             }
-            Sorted::Unknown => return,
+            // This doesn't make sense to request, but it's allowed becuase in
+            // some cases (for example unchecked construction) it may be useful.
+            Sorted::Unknown => Sorted::Unknown,
             Sorted::One => {
                 if self.len().get() != 1 {
                     panic!("Invalid sort state requested: {desired:?} because there is more than one candidate.");
                 }
-                self.arr.sorted = true;
                 Sorted::One
             }
         };
+
+        let k = match self.sort_state {
+            Sorted::ById { k } => k,
+            Sorted::ByLogit { k } => k,
+            _ => unreachable!(),
+        };
+
+        if self.len().get() == 1 {
+            self.sort_state = Sorted::One;
+        }
+
+        self.truncate(k)
     }
 
-    /// Returns a slice of the candidates.
+    /// Returns a slice of the candidates as [`llama_token_data`].
     pub fn as_slice(&self) -> &[llama_token_data] {
         &self.data[0..self.len().get()]
     }
 
-    /// Returns a mutable slice of the candidates.
+    /// Returns a mutable slice of the candidates as [`llama_token_data`].
+    ///
+    /// Invalidates cached:
+    /// * Sort state
+    /// * Softmax state
     pub fn as_mut_slice(&mut self) -> &mut [llama_token_data] {
         let len = self.len().get();
+        self.sort_state = Sorted::Unknown;
+        self.softmax_applied_to = None;
         &mut self.data[0..len]
     }
 
-    /// Get a `llama_token_data_array` referencing the internal data.
-    pub fn as_llama_token_data_array(&mut self) -> &llama_token_data_array {
-        assert_eq!(self.arr.data, self.data.as_mut_ptr());
-        self.arr.size = self.len().get();
-        &self.arr
-    }
-
-    /// Get a mutable `llama_token_data_array` referencing the internal data.
+    /// Get a [`TokenDataArray`] referencing the internal data. It provides
+    /// methods for working with the candidates using the C API.
     ///
-    /// Changing the size of the returned array is allowed. If it is out of
-    /// range it will be truncated. Sorting the array and changing the member
-    /// values is allowed.
-    ///
-    /// Changing the sort state is allowed. Methods that require a sorted state
-    /// by logit will respect the new sort state. If the array is not really
-    /// sorted by logit, this may lead to unexpected results, but not memory
-    /// unsafety.
-    ///
-    /// Changing the pointers is not recommended at all. There isn't a good
-    /// reason to do this **will lead to a panic** on next access.
-    ///
-    /// # Panics
-    /// * if the `.data` pointer is changed to anything other than
-    ///   `self.data.as_mut_ptr()` which isn't public.
-    pub fn as_mut_llama_token_data_array(
-        &mut self,
-    ) -> &mut llama_token_data_array {
-        assert_eq!(self.arr.data, self.data.as_mut_ptr());
-        self.arr.size = self.len().get();
-        &mut self.arr
+    /// If a method is called that modifies the candidates, the internal sort
+    /// state and softmax state will be invalidated automatically.
+    pub fn as_token_data_array<'a>(&'a mut self) -> TokenDataArray<'a> {
+        TokenDataArray {
+            arr: llama_token_data_array {
+                data: self.data.as_mut_ptr(),
+                sorted: self
+                    .is_sorted()
+                    .by_logit()
+                    .is_some_and(|n| n == self.len()),
+                size: self.len().get(),
+            },
+            candidates: self,
+        }
     }
 
     /// Sample the most likely candidate from the candidates.
     ///
     /// If the candidates are already sorted by logit this method's time
     /// complexity is O(1). Otherwise, it is O(n).
-    pub fn sample_token_greedy(&self) -> llama_token_data {
+    pub fn sample_token_greedy(self) -> llama_token_data {
         if self.is_sorted().by_logit().is_some() || self.len().get() == 1 {
             // We are sorted by at least one candidate.
             *self.as_slice().first().unwrap()
         } else {
+            // Unsorted implementation, find the max logit.
             *self
                 .as_slice()
                 .iter()
                 .max_by(|a, b| a.logit.partial_cmp(&b.logit).unwrap())
+                // This can never panic because a class invariant is that there
+                // is at least one candidiate.
                 .unwrap()
         }
     }
 
-    /// Sorts candidate tokens by their logits in descending order and calculate
-    /// probabilities for top `k` candidates. Native Rust implementation.
+    /// Sorts candidate tokens by their logits to k in descending order and
+    /// calculate probabilities for top `k` candidates. **Truncates to `k`.**
     ///
     /// If `k` is greater than the number of candidates or `k` is `None`, all
     /// candidates are softmaxed.
     ///
-    /// Time complexity is O(k log k) in cases where the candidates are not
+    /// Time complexity is O(n log k) in cases where the candidates are not
     /// already sorted up to at least k elements by logit. Otherwise, it is
     /// O(k). In cases where the candidates are already softmaxed to k elements,
     /// the time complexity is O(1).
     ///
     /// # Note
     /// * This is a translation of `llama_sample_softmax`.
-    /// * Summation of exp(logit) is calculated in f64 for precision.
-    pub fn apply_softmax(&mut self, k: Option<NonZeroUsize>) {
-        if let Some(cached_k) = self.softmax_applied_to {
-            match k {
-                // If the softmax has already been applied to the same number of
-                // candidates, we don't need to do it again.
-                Some(k) => {
-                    if k.min(self.len()) == cached_k {
-                        return;
-                    }
-                }
-                None => {
-                    if cached_k == self.len() {
-                        return;
-                    }
-                }
-            };
-        }
-
+    /// * Summation of exp(logit) is calculated in f64 for precision. This
+    ///   likely doesn't matter, but with many small values, it could.
+    pub fn softmax(self, k: Option<NonZeroUsize>) -> Self {
         let k = k.map(|k| k.min(self.len())).unwrap_or(self.len());
 
-        self.sort(Sorted::ByLogit { k });
+        if let Some(cached_k) = self.softmax_applied_to {
+            if k == cached_k {
+                // We may be softmaxed to k, but unsorted. Since we state that
+                // this function sorts to k, we need to sort to k. This is a
+                // no-op if we are already sorted to at least k.
+                return self.sort(Sorted::ByLogit { k });
+            }
+        }
+
+        let mut new = self.sort(Sorted::ByLogit { k }).truncate(k);
 
         // Unwrap can never panic because a class invariant is that there is
         // at least one candidiate.
-        let max_logit = self.data[..k.get()].first().unwrap().logit;
-        let cum_sum: f64 =
-            self.data[..k.get()].iter_mut().fold(0.0, |sum, token| {
-                token.p = (token.logit - max_logit).exp();
-                sum + token.p as f64
-            });
+        let max_logit = new.data.first().unwrap().logit;
+        let cum_sum: f64 = new.iter_mut().fold(0.0, |sum, token| {
+            token.p = (token.logit - max_logit).exp();
+            sum + token.p as f64
+        });
         let cum_sum: f32 = cum_sum as f32;
-        for token in &mut self.data[..k.get()] {
+        for token in &mut new.data {
             token.p /= cum_sum as f32;
         }
 
         // We're not changing the logits so we don't need to sort again.
-        debug_assert!(self.data[..k.get()]
-            .windows(2)
-            .all(|pair| pair[0].p >= pair[1].p));
-        self.softmax_applied_to = Some(k);
+
+        new.softmax_applied_to = Some(k);
+
+        new
     }
 
     /// Top-k sampling. Returns the top `k` most likely tokens. If `k` is
     /// greater than the number of candidates, all candidates are returned.
     ///
-    /// Time complexity is O(k log k) if the candidates are not already sorted
+    /// Time complexity is O(n log k) if the candidates are not already sorted
     /// by logit to at least `k` elements. Otherwise, it is O(1).
     ///
     /// # Note
     /// * This method will sort the candidates by logit to at least `k` elements
-    ///   if they are not already sorted to at least `k`.
-    pub fn top_k(&mut self, k: NonZeroUsize) -> &[llama_token_data] {
-        self.sorted(Sorted::ByLogit { k })
+    ///   if they are not already sorted to at least `k`. This is equivalent to
+    ///   calling `sort(Sorted::ByLogit { k })`.
+    pub fn top_k(self, k: NonZeroUsize) -> Self {
+        self.sort(Sorted::ByLogit { k })
     }
 
-    /// Top-p sampling. Returns the top tokens whose cumulative probability is
-    /// less than or equal to `p`.
+    /// Top-p sampling (nucleus). Returns the top tokens whose cumulative
+    /// probability is less than or equal to `p`.
     ///
-    /// It is guaranteed that at least `min_keep` tokens are returned even if no
-    /// candidates fulfill the condition *however* in the case where the number
-    /// of candidates is less than `min_keep`, all candidates are returned to a
-    /// minimum of 1.
+    /// It is guaranteed at least one token is selected.
+    ///
+    /// https://arxiv.org/abs/1904.09751
     ///
     /// Time complexity is O(n) where softmax has already been applied.
     /// Otherwise, it is O(n log n).
     ///
     /// # Note
-    /// * This method will sort the candidates if they are not already sorted.
+    /// * This method will sort the candidates by logit if they are not already.
     /// * This method will apply the softmax if it has not been applied yet.
-    pub fn top_p(
-        &mut self,
-        p: Probability<f64>,
-        min_keep: NonZeroUsize,
-    ) -> &[llama_token_data] {
-        let min_keep = min_keep.min(self.len()).get();
+    pub fn top_p(self, p: Probability<f64>, min_keep: NonZeroUsize) -> Self {
+        if self.data.len() == 1 {
+            return self;
+        }
+
+        let min_keep = min_keep.min(self.len());
         let mut sum: f64 = 0.0;
         let max_p: f64 = p.into_f();
 
-        self.apply_softmax(None);
+        let new = self.softmax(None);
 
-        for (i, data) in self.data.iter_mut().enumerate() {
+        for (i, data) in new.iter().enumerate() {
             sum += data.p as f64;
-            if sum >= max_p && i >= min_keep {
-                return &self.data[..i];
+            if sum >= max_p && i >= min_keep.get() {
+                return new.truncate(i.try_into().unwrap());
             }
         }
 
-        &self.data[..min_keep]
+        new
     }
 
-    /// Min-p sampling. Returns the tokens whose logits are greater than or
-    /// equal to the minimum logit required to select `min_keep` tokens with
-    /// probability `p`. None is returned if no tokens can be selected.
+    /// Min-p sampling.
+    ///
+    /// As described in: https://github.com/ggerganov/llama.cpp/pull/3841
+    ///
+    /// It is guaranteed at least one token is selected.
     ///
     /// If the candidates are already sorted, this method's complexity is O(n).
     /// Otherwise, it is O(n log n).
     ///
     /// # Note
-    /// * This is a translation of `llama_sample_min_p`, however it does not
-    ///   reduce the number of candidates in self.data, rather returning a slice
-    ///   or vector of the selected tokens (as needed).
+    /// * This is a translation of `llama_sample_min_p`.
     /// * This *may* sort the candidates by logit if they are not already
     ///   sorted.
     pub fn min_p(
-        &mut self,
+        self,
         p: Probability<f32>,
-        min_keep: NonZeroUsize,
-    ) -> Cow<'_, [llama_token_data]> {
+        mut min_keep: NonZeroUsize,
+    ) -> Self {
         if self.data.is_empty() {
             unreachable!("Class invariant violated: There must be at least one candidate.")
         }
+        if self.data.len() == 1 {
+            return self;
+        }
+
+        min_keep = min_keep.min(self.len());
 
         let p: f32 = p.into_f();
 
-        // If the candidates are not sorted, use the unsorted implementation
-        if !self.arr.sorted {
-            let mut max_logit: f32 = f32::MIN;
+        // TODO: This has just been refactored so it should be checked against
+        // the original implementation.
 
+        // If the candidates are not sorted, use the unsorted implementation
+        if !self.is_sorted().by_logit().is_some_and(|k| k == self.len()) {
+            let mut max_logit: f32 = f32::MAX;
             for candidate in self.data.iter() {
                 max_logit = max_logit.max(candidate.logit);
             }
@@ -643,18 +751,21 @@ impl Candidates {
                 .collect();
 
             if filtered_tokens.len() >= min_keep.get() {
-                return Cow::Owned(filtered_tokens);
+                return Self::from_vec_unchecked(filtered_tokens);
             }
         }
 
-        self.sort(Sorted::ByLogit { k: self.len() });
+        let k = self.len();
+        let new = self.sort(Sorted::ByLogit { k });
 
-        let min_logit = self.data.first().unwrap().logit + p.ln();
+        // min logit for p_i >= p * p_max
+        let min_logit = new.data.first().unwrap().logit + p.ln();
 
         // skip 1 because the first token is always selected
-        for (i, token) in self.data.iter().enumerate().skip(1) {
+        for (i, token) in new.iter().enumerate().skip(1) {
             if token.logit < min_logit && i >= min_keep.get() {
-                Some(Cow::Borrowed(&self.data[..i]));
+                // This can never panic because we just skipped the first token.
+                return new.truncate(i.try_into().unwrap());
             }
         }
 
@@ -663,8 +774,9 @@ impl Candidates {
         )
     }
 
-    /// Tail free sampling. Returns the tokens whose second derivatives are
-    /// greater than or equal to `z`.
+    /// Tail free sampling.
+    ///
+    /// https://www.trentonbricken.com/Tail-Free-Sampling/
     ///
     /// Time complexity is O(n) where softmax has already been applied to n.
     /// Otherwise, it is O(n log n).
@@ -673,20 +785,22 @@ impl Candidates {
     /// * This is a translation of `llama_sample_tail_free`.
     /// * This method may apply the softmax if it has not been applied yet.
     pub fn tail_free(
-        &mut self,
+        self,
         z: Probability<f32>,
-        min_keep: NonZeroUsize,
-    ) -> &[llama_token_data] {
+        mut min_keep: NonZeroUsize,
+    ) -> Self {
         if self.data.len() <= 2 {
-            return &self.data;
+            return self;
         }
+
+        min_keep = min_keep.min(self.len());
 
         let z = z.into_f();
 
-        self.apply_softmax(None);
+        let new = self.softmax(None);
 
         // Compute the first and second derivatives
-        let first_derivatives: Vec<f32> = self
+        let first_derivatives: Vec<f32> = new
             .data
             .windows(2)
             .map(|pair| pair[0].p - pair[1].p)
@@ -716,91 +830,110 @@ impl Candidates {
         for (i, value) in second_derivatives.iter().enumerate() {
             sum += f64::from(*value);
             if sum > f64::from(z) && i >= min_keep.get() {
-                return &self.data[..i];
+                return new.truncate(i.try_into().unwrap());
             }
         }
 
-        &self.data
+        new
     }
 
     /// Locally typical sampling.
+    ///
+    /// https://arxiv.org/abs/2202.00666
     ///
     /// Time complexity is O(n) where softmax has already been applied to n.
     /// Otherwise, it is O(n log n).
     ///
     /// # Note
     /// * This is a translation of `llama_sample_typical`.
-    /// * This method may apply the softmax if it has not been applied yet.
-    ///
-    /// As described in: https://arxiv.org/abs/2202.00666
+    /// * This method will apply the softmax if it has not been applied yet.
     pub fn locally_typical(
-        &mut self,
+        self,
         p: Probability<f32>,
         min_keep: NonZeroUsize,
-    ) -> Vec<llama_token_data> {
+    ) -> Self {
         if self.data.is_empty() {
             unreachable!("Class invariant violated: There must be at least one candidate.")
         }
+        if self.data.len() == 1 {
+            return self;
+        }
 
-        let min_keep: usize = min_keep.get();
+        let min_keep: usize = min_keep.min(self.len()).get();
 
-        self.apply_softmax(None);
+        let new = self.softmax(None);
 
-        let entropy: f64 = self.data.iter().fold(0.0, |sum, token| {
+        let entropy: f64 = new.iter().fold(0.0, |sum, token| {
             sum - f64::from(token.p) * f64::from(token.p).ln()
         });
 
         // Compute the absolute difference between negative log probability and
         // entropy for each candidate
-        let shifted_scores: Vec<f64> = self
-            .data
+        let shifted_scores: Vec<f64> = new
             .iter()
             .map(|token| (f64::from(token.p).ln() - entropy).abs())
             .collect();
 
         // Sort tokens based on the shifted scores and their corresponding
         // indices
-        let mut indices: Vec<usize> = (0..self.data.len()).collect();
+        let mut indices: Vec<usize> = (0..new.data.len()).collect();
         indices.sort_by(|&a, &b| {
             shifted_scores[a].partial_cmp(&shifted_scores[b]).unwrap()
         });
 
         // Compute the cumulative sum of the probabilities of the sorted tokens
         let mut sum: f64 = 0.0;
-        let mut last_idx: usize = indices.len();
+        let mut new_len: usize = indices.len();
         for (i, index) in indices.iter().enumerate() {
-            sum += f64::from(self.data[*index].p);
+            sum += f64::from(new.data[*index].p);
             if sum >= f64::from(p.into_f()) && i >= min_keep - 1 {
-                last_idx = i + 1;
+                new_len = i + 1;
                 break;
             }
         }
 
         indices
             .iter()
-            .take(last_idx)
-            .map(|&index| self.data[index])
+            .take(new_len)
+            .map(|&index| new.data[index])
             .collect()
     }
 
     /// Mirostat sampling.
     ///
-    /// Time complexity is O(m) where softmax has already been applied to n.
-    /// Otherwise, it is O(n log n).
+    /// Time complexity is O(**max_keep**) where softmax has already been
+    /// applied to n. Otherwise, it is O(n log n).
     ///
-    /// This is a translation of `llama_sample_token_mirostat`.
+    /// # Note
+    /// * This is a translation of `llama_sample_token_mirostat`.
+    /// * The public API will likely change since this sampling method is
+    ///   very different from the others and doesn't return a Candidate
+    ///   container.
     pub fn mirostat(
-        &mut self,
+        self,
         rng: &mut xorshift::Xoroshiro128,
         tau: f32,
         eta: f32,
-        m: NonZeroUsize,
-        mu: &mut f32,
+        max_keep: Option<NonZeroUsize>,
+        opt_mu: &mut Option<f32>,
     ) -> llama_token {
-        self.apply_softmax(None);
+        if self.data.is_empty() {
+            unreachable!("Class invariant violated: There must be at least one candidate.")
+        }
+        if self.data.len() == 1 {
+            return self.data[0].id;
+        }
 
-        if self.len() == NonZeroUsize::new(1).unwrap() {
-            return self[0].id;
+        let new = self.softmax(None);
+        let m = max_keep
+            .unwrap_or(NonZeroUsize::new(100).unwrap())
+            .min(new.len())
+            .get();
+        // mu is initialized to 2 * tau if not provided
+        let mu = opt_mu.unwrap_or(2.0 * tau);
+
+        if new.len() == NonZeroUsize::new(1).unwrap() {
+            return new[0].id;
         }
 
         let x: llama_token_data;
@@ -811,9 +944,9 @@ impl Candidates {
         let mut b_i;
         let mut sum_ti_bi = 0.0;
         let mut sum_ti_sq = 0.0;
-        for i in 0..self.len().min(m).get() {
+        for i in 0..m {
             t_i = ((i + 2) as f32 / (i + 1) as f32).ln();
-            b_i = (self[i].p / self[i + 1].p).ln();
+            b_i = (new[i].p / new[i + 1].p).ln();
             sum_ti_bi += t_i * b_i;
             sum_ti_sq += t_i * b_i;
         }
@@ -821,14 +954,16 @@ impl Candidates {
 
         // Compute k from the estimated s_hat and target suprise value
         let epsilon_hat = s_hat - 1.0;
-        let k: f32 = ((epsilon_hat * (*mu * *mu))
-            / (1.0 - (-epsilon_hat).powf(self.capacity() as f32)))
+        let k: f32 = ((epsilon_hat * (mu * mu))
+            / (1.0 - (-epsilon_hat).powf(new.len().get() as f32)))
         .powf(1.0 / s_hat);
         let k: NonZeroUsize = (k as usize).try_into().unwrap();
 
         // Sample the next word X using top-k sampling
-        let mut sample = self.top_k(k).to_vec();
-        x = predict_token(rng, &mut sample);
+        // TODO: in the future we may return the candidates here to give more
+        // control over how a token is chosen and to make the Candidate API more
+        // consistent.
+        x = predict_token(rng, new.top_k(k));
 
         // Compute error as the difference between observed suprise and target
         // surprise value
@@ -836,38 +971,54 @@ impl Candidates {
         let e = observed_surprise - tau;
 
         // Update mu using the learning rate and error
-        *mu = *mu - eta * e;
+        *opt_mu = Some(mu - eta * e);
 
         x.id
     }
 
     /// Mirostat V.2 sampling.
     ///
-    /// Time complexity is O(n) where softmax has already been applied to n.
-    /// Otherwise, it is O(n log n).
+    /// Time complexity is O(**max_keep**) where softmax has already been
+    /// applied to n. Otherwise, it is O(n log n).
     ///
-    /// This is a translation of `llama_sample_token_mirostat_v2`
+    /// # Note
+    /// * This is a translation of `llama_sample_token_mirostat_v2` but differs
+    /// slightly in that `max_keep` is supported. If the original behavior is
+    /// desired, set `max_keep` to `self.len()`. The defualt is 100 like v1 with
+    /// the rationale that more than 100 candidates is likely to be too many.
     pub fn mirostat_v2(
-        &mut self,
+        self,
         rng: &mut xorshift::Xoroshiro128,
         tau: f32,
         eta: f32,
-        mu: &mut f32,
+        max_keep: Option<NonZeroUsize>,
+        opt_mu: &mut Option<f32>,
     ) -> llama_token {
-        self.apply_softmax(None);
-
+        if self.data.is_empty() {
+            unreachable!("Class invariant violated: There must be at least one candidate.")
+        }
+        if self.data.len() == 1 {
+            return self.data[0].id;
+        }
+        let new = self.softmax(None);
+        // mu is initialized to 2 * tau if not provided
+        let mu = opt_mu.unwrap_or(2.0 * tau);
+        let m = max_keep
+            .unwrap_or(NonZeroUsize::new(100).unwrap())
+            .min(new.len())
+            .get();
         let x: llama_token_data;
 
         // Truncate the words with surprise values greater than mu
-        let mut end: usize = self.len().get();
-        for (i, candidate) in self.iter().enumerate() {
-            if candidate.p.log2() > *mu {
-                end = i.max(1);
+        let mut end: usize = new.len().get();
+        for (i, candidate) in new.data[..m].iter().enumerate().skip(1) {
+            if candidate.p.log2() > mu {
+                end = i;
                 break;
             }
         }
 
-        x = predict_token(rng, &mut self.data[..end]);
+        x = predict_token(rng, new.truncate(end.try_into().unwrap()));
 
         // Compute error as the difference between observed surprise and target
         // surprise value
@@ -875,7 +1026,7 @@ impl Candidates {
         let e = observed_surprise - tau;
 
         // Update mu using the learning rate and error
-        *mu = *mu - eta * e;
+        *opt_mu = Some(mu - eta * e);
 
         x.id
     }
@@ -885,27 +1036,27 @@ impl Candidates {
     /// Time complexity is O(n) where softmax has already been applied to n.
     /// Otherwise, it is O(n log n).
     pub fn apply_entropy(
-        &mut self,
+        self,
         min_temp: f64,
         max_temp: f64,
         exp_val: f64,
-    ) {
+    ) -> Self {
         if min_temp < 0.0
             || max_temp < 0.0
             || min_temp > max_temp
             || self.data.len() <= 1
         {
-            return;
+            return self;
         }
 
         // Calculate maximum possible entropy
-        let max_entropy: f64 = -(1.0 / self.data.len() as f64).ln();
+        let max_entropy: f64 = -(1.0 / self.len().get() as f64).ln();
 
-        self.apply_softmax(None);
+        let mut new = self.softmax(None);
 
         // Calculate entropy of the softmax probabilities
         let mut entropy: f64 = 0.0;
-        for token in self.data.iter() {
+        for token in new.iter() {
             // ensure no log(0)
             if token.p > 0.0 {
                 entropy -= f64::from(token.p) * f64::from(token.p).ln();
@@ -921,39 +1072,60 @@ impl Candidates {
             min_temp + (max_temp - min_temp) * normalized_entropy.powf(exp_val);
 
         // Apply the temperature to the logits
-        for token in self.data.iter_mut() {
+        for token in new.data.iter_mut() {
             token.logit /= dyn_temp as f32;
         }
 
         // What we did above doesn't change the order of the candidates, so we
         // don't need to sort again.
-        debug_assert!(self
+        debug_assert!(new
             .data
             .windows(2)
             .all(|pair| pair[0].logit >= pair[1].logit));
+
+        new
     }
 
-    /// Split P sampling. Sort the candidates by probability and returns the top
-    /// tokens split at the point where the difference between probabilities is
-    /// greatest.
+    /// Split P sampling. Softmax to `max_keep` and return the top tokens split
+    /// at the point where the difference between probabilities is greatest.
     ///
     /// Time complexity is O(max_keep) where softmax has already been applied to
     /// max_keep. Otherwise, it is O(max_keep log max_keep). `max_keep` defaults
     /// to the number of candidates.
     ///
+    /// It is guaranteed that at least one token is selected.
+    ///
     /// # Panics
     /// * if `min_keep` is greater than `max_keep`.
+    ///
+    /// # Note
+    /// * This applies the softmax to `max_keep` if it has not been applied yet.
+    // Note: I wrote this after observing the point where candidates are split
+    // most of the time. This is my own method and not a part of `llama.cpp`.
+    // Likewise `split_l` is also my own method. The name is inspired by split
+    // pea soup and subject to change.
+    //
+    // I don't know how this will perform in practice. It's just an idea based
+    // on observation and intuition. This is similar to nucleus sampling but
+    // instead of using probability mass, it uses a difference in probability
+    // (or logit) to split the candidates. - mdegans
     pub fn split_p(
-        &mut self,
+        self,
         min_keep: NonZeroUsize,
         max_keep: Option<NonZeroUsize>,
-    ) -> &[llama_token_data] {
-        self.apply_softmax(max_keep);
+    ) -> Self {
+        if self.data.is_empty() {
+            unreachable!("Class invariant violated: There must be at least one candidate.")
+        }
+        if self.data.len() == 1 {
+            return self;
+        }
+        let new = self.softmax(max_keep);
 
-        let min_keep = min_keep.min(self.len()).get();
+        let min_keep = min_keep.min(new.len()).get();
         let max_keep = max_keep
-            .map(|k| k.min(self.len()))
-            .unwrap_or(self.len())
+            .map(|k| k.min(new.len()))
+            .unwrap_or(new.len())
             .get();
 
         assert!(
@@ -963,7 +1135,7 @@ impl Candidates {
 
         let mut max_diff = 0.0;
         let mut split_idx = 0;
-        for (i, pair) in self.data[..max_keep].windows(2).enumerate() {
+        for (i, pair) in new.data[..max_keep].windows(2).enumerate() {
             let diff = (pair[0].p - pair[1].p).abs();
             if diff > max_diff {
                 max_diff = diff;
@@ -971,27 +1143,38 @@ impl Candidates {
             }
         }
 
-        &self.data[..split_idx.max(min_keep)]
+        new.truncate(split_idx.max(min_keep).try_into().unwrap())
     }
 
-    /// Split L sampling. Sort the candidates by logit and returns the top
-    /// tokens split at the point where the difference between logits is
+    /// Split L sampling. Sort the candidates by logit to `max_keep` and return
+    /// the top tokens split at the point where the difference between logits is
     /// greatest.
     ///
-    /// Time complexity is O(max_keep) where softmax has already been applied to
-    /// max_keep. Otherwise, it is O(max_keep log max_keep). `max_keep` defaults
-    /// to the number of candidates.
+    /// Time complexity is O(max_keep). `max_keep` defaults to the number of
+    /// candidates.
+    ///
+    /// It is guaranteed that at least one token is selected.
     ///
     /// # Panics
     /// * if `min_keep` is greater than `max_keep`.
+    // I wrote this after `split_p` and it's based on the same idea, but since
+    // the relationship between logit and probability is not linear, it's not
+    // guaranteed to return the same results, or even good results... but it is
+    // probably faster than most other methods. - mdegans
     pub fn split_l(
-        &mut self,
+        self,
         min_keep: NonZeroUsize,
         max_keep: Option<NonZeroUsize>,
-    ) -> &[llama_token_data] {
+    ) -> Self {
+        if self.data.is_empty() {
+            unreachable!("Class invariant violated: There must be at least one candidate.")
+        }
+        if self.data.len() == 1 {
+            return self;
+        }
         let max_keep =
             max_keep.map(|k| k.min(self.len())).unwrap_or(self.len());
-        self.sort(Sorted::ByLogit { k: max_keep });
+        let new = self.sort(Sorted::ByLogit { k: max_keep });
 
         let min_keep = min_keep.get();
         let max_keep = max_keep.get();
@@ -1003,7 +1186,7 @@ impl Candidates {
 
         let mut max_diff = 0.0;
         let mut split_idx = 0;
-        for (i, pair) in self.data[..max_keep].windows(2).enumerate() {
+        for (i, pair) in new.data[..max_keep].windows(2).enumerate() {
             let diff = (pair[0].logit - pair[1].logit).abs();
             if diff > max_diff {
                 max_diff = diff;
@@ -1011,12 +1194,12 @@ impl Candidates {
             }
         }
 
-        &self.data[..split_idx.max(min_keep)]
+        new.truncate(split_idx.max(min_keep).try_into().unwrap())
     }
 
     /// Sample a token from the candidates using [`SampleOptions`].
     pub fn sample_token(
-        &mut self,
+        self,
         tokens: &[llama_token],
         vocab: &Vocab,
         opts: &SampleOptions,
@@ -1041,11 +1224,11 @@ impl Candidates {
     /// # Panics
     /// todo
     pub fn penalize_repetition(
-        &mut self,
+        self,
         tokens: &[llama_token],
         opts: &RepetitionOptions,
         freq_map: &mut NGramStats,
-    ) -> Result<(), crate::sample::RepetitionError> {
+    ) -> Result<Candidates, crate::sample::RepetitionError> {
         crate::sample::apply_sample_repetition_ngram(
             self, tokens, opts, freq_map,
         )
@@ -1056,10 +1239,21 @@ impl Candidates {
         self.data.iter()
     }
 
-    /// Iterates over the candidates mutably. This does not change the sort
-    /// state, so it's private.
-    pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<llama_token_data> {
+    /// Iterates over the candidates mutably. This invalidates the sort state
+    /// and softmax state.
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<llama_token_data> {
+        self.sort_state = Sorted::Unknown;
+        self.softmax_applied_to = None;
         self.data.iter_mut()
+    }
+
+    /// Convert from an iterator without checking class invariants.
+    pub fn from_iter_unchecked<T>(it: T) -> Self
+    where
+        T: IntoIterator<Item = llama_token_data>,
+    {
+        let data: Vec<llama_token_data> = it.into_iter().collect();
+        Self::from_vec_unchecked(data)
     }
 }
 
@@ -1068,6 +1262,12 @@ impl Index<usize> for Candidates {
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.data[index]
+    }
+}
+
+impl FromIterator<llama_token_data> for Candidates {
+    fn from_iter<T: IntoIterator<Item = llama_token_data>>(iter: T) -> Self {
+        Self::from_vec(iter.into_iter().collect())
     }
 }
 
@@ -1081,7 +1281,6 @@ mod tests {
         let candidates = Candidates::new(n.get()).unwrap();
         assert_eq!(candidates.data.len(), n.get());
         assert_eq!(candidates.len(), n);
-        assert_eq!(candidates.capacity(), n.get());
         assert_eq!(Some(n.try_into().unwrap()), candidates.is_sorted().by_id());
 
         for i in 0..n.get() {
@@ -1162,10 +1361,10 @@ mod tests {
 
         candidates.data.reverse();
 
-        let sorted = candidates.sorted(Sorted::ByLogit {
+        let sorted = candidates.sort(Sorted::ByLogit {
             k: NonZeroUsize::new(3).unwrap(),
         });
-        assert_eq!(sorted.len(), 3);
+        assert_eq!(sorted.len(), NonZeroUsize::new(3).unwrap());
 
         assert_eq!(sorted[0].logit, -0.1);
         assert_eq!(sorted[1].logit, -0.2);
@@ -1196,7 +1395,7 @@ mod tests {
             c.data[n - i].logit = -(i as f32 / n as f32) + 0.5;
         }
 
-        c.apply_softmax(None);
+        let c = c.softmax(None);
 
         // Check sort is by logit
         assert_eq!(
@@ -1238,7 +1437,7 @@ mod tests {
         }
 
         let tokens = c.top_p(p, 1.try_into().unwrap());
-        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens.len(), NonZeroUsize::new(3).unwrap());
         assert_approx_eq!(tokens[0].logit, 0.4, 1e-5);
         assert_approx_eq!(tokens[1].logit, 0.3, 1e-5);
         assert_approx_eq!(tokens[2].logit, 0.2, 1e-5);
@@ -1257,7 +1456,7 @@ mod tests {
         }
 
         let tokens = c.min_p(0.8.try_into().unwrap(), 1.try_into().unwrap());
-        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens.len(), NonZeroUsize::new(3).unwrap());
 
         assert_eq!(tokens[0].logit, -0.1);
         assert_eq!(tokens[1].logit, -0.2);
@@ -1275,7 +1474,7 @@ mod tests {
 
         let tokens =
             c.locally_typical(0.5.try_into().unwrap(), 1.try_into().unwrap());
-        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens.len(), NonZeroUsize::new(4).unwrap());
 
         assert_eq!(tokens[0].logit, -0.1);
         assert_eq!(tokens[1].logit, -0.2);
@@ -1296,7 +1495,7 @@ mod tests {
         }
 
         let tokens = c.split_p(1.try_into().unwrap(), None);
-        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens.len(), NonZeroUsize::new(5).unwrap());
         assert_approx_eq!(tokens[0].p, 0.10499584, 1e-5);
         assert_approx_eq!(tokens[4].p, 0.10499584, 1e-5);
     }
@@ -1314,7 +1513,7 @@ mod tests {
         }
 
         let tokens = c.split_l(1.try_into().unwrap(), None);
-        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens.len(), NonZeroUsize::new(5).unwrap());
         assert_eq!(tokens[0].logit, -0.1);
         assert_eq!(tokens[4].logit, -0.1);
     }
