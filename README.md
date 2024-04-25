@@ -29,6 +29,11 @@ For examples, see the `bin` folder. There are two example binaries.
 
 ## Roadmap
 
+- [x] Candidate iterator with fine-grained control over sampling
+- [ ] Examples for new Candidate API.
+- [ ] Support for chaining sampling methods using `SampleOptions`. `mode` will
+      become `modes` and applied one after another until only a single
+      Candidate token remains.
 - [ ] Common command line options for sampling. Currently this is not exposed.
 - [ ] API closer to Ollama. Potentially support for something like `Modelfile`.
 - [ ] Logging (non-blocking) and benchmark support.
@@ -36,7 +41,6 @@ For examples, see the `bin` folder. There are two example binaries.
 - [ ] Web server. Tokenization in the browser.
 - [ ] Tiktoken as the tokenizer for some models instead of llama.cpp's internal one.
 - [ ] Reworked, functional, public, candidate API
-- [ ] Candidate iterator with fine-grained control over sampling
 - [ ] Grammar constraints (maybe or maybe not [`llama.cpp`] style)
 - [ ] Async streams, better parallelism with automatic batch scheduling
 - [ ] Backends other than [`llama.cpp`] (eg. [MLC](https://github.com/twiceyuan/mlc-llm-llama2), [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [Ollama](https://github.com/pepperoni21/ollama-rs))

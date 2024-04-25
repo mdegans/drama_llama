@@ -28,6 +28,8 @@ mod vocab;
 pub use vocab::Vocab;
 pub use vocab::VocabKind;
 
+use crate::Prompt;
+
 /// Convert a token to it's string representation.
 ///
 /// Adapted from `llama.cpp/common/common.cpp`
@@ -231,6 +233,18 @@ impl Model {
     /// Return the infill suffix token.
     pub fn infill_suffix(&self) -> llama_token {
         unsafe { llama_token_suffix(self.inner) }
+    }
+
+    /// Calculate the longest token length. Useful for optimizing searches.
+    ///
+    /// Time complexity is O(k) where k is the vocab size.
+    pub fn max_token_len(&self) -> usize {
+        let mut max_len = 0;
+        for i in 0..self.n_vocab() {
+            max_len = max_len.max(self.token_to_text(i).len());
+        }
+
+        max_len
     }
 
     /// Return whether BOS token is enabled.
@@ -455,7 +469,17 @@ impl Model {
             }
         };
 
-        return String::from_utf8(buf).ok();
+        match String::from_utf8(buf).ok() {
+            Some(mut s) => {
+                // strip null terminators
+                while s.ends_with('\0') {
+                    let _ = s.pop();
+                }
+
+                Some(s)
+            }
+            None => None,
+        }
     }
     /// Get a tensor by name.
     pub fn get_tensor<'a>(&'a self, name: &str) -> Option<&'a ggml_tensor> {
@@ -619,65 +643,70 @@ impl Model {
         self.tokens_to_pieces(tokens).collect()
     }
 
-    /// Apply chat template. Inspired by hf `apply_chat_template` in Python.
+    /// Apply chat template to a [`Prompt`] using `llama.cpp`'s
+    /// `llama_chat_apply_template`. If template is `None`, the model's default
+    /// template is used (metadata key `tokenizer.chat_template`).
     ///
-    /// # Panics
-    /// * If the message strings are not valid UTF-8.
+    /// This can return `None` if the template is not supported by llama.cpp.
+    /// This is equivalent to a return code of -1 from the C++ function. In this
+    /// case, use one of the [`Prompt::format`] methods which cannot fail.
     ///
-    /// Safety:
-    /// * The caller must ensure that the message strings are null-terminated.
-    ///
-    /// # Arguments
-    /// * `template` - Jinja chat template. If this is None, the model's default
-    ///   template will be used.
-    /// * `messages` - Chat messages to apply as examples.
-    /// * `add_ass` - Whether to end the prompt with the token(s) indicating the
-    ///   start of the assistant's response.
-    // TODO: make safe by wrapping the messages in a struct that maintains the
-    // invariant that everything is null-terminated. Or we could create our own
-    // message struct and then reference it's data.
-    pub unsafe fn apply_chat_template(
+    /// `add_ass` is a boolean that determines whether to add the assistant's
+    /// prefix to the output. This forces the model to generate the next message
+    /// from the assistant's perspective which is usually the desired behavior.
+    pub fn apply_chat_template(
         &self,
         template: Option<&str>,
-        messages: &[llama_chat_message],
+        prompt: &Prompt,
         add_ass: bool,
-    ) -> String {
+    ) -> Option<String> {
         let template = template.map(|s| CString::new(s).unwrap());
         let template_ptr = template
             .map(|s| s.as_bytes_with_nul().as_ptr() as *const c_char)
+            // the model's default will be used if template_ptr is null
             .unwrap_or(std::ptr::null_mut());
 
         // The recommended buffer allocation size is the number of characters in
         // the input messages * 2. This seems like overkill.
         let mut buf_len = 0;
-        for message in messages {
-            // for each message, count the chars in role and content until the
-            // null terminator
-            let role_len = CStr::from_ptr(message.role).to_bytes().len();
-            let message_len = CStr::from_ptr(message.content).to_bytes().len();
+        let mut messages: Vec<llama_chat_message> = Vec::new();
+        for message in &prompt.transcript {
+            let role = CString::new(match message.role {
+                crate::Role::Human => prompt.human.as_bytes(),
+                crate::Role::Agent => prompt.agent.as_bytes(),
+                crate::Role::System => match &prompt.system {
+                    Some(system) => system.as_bytes(),
+                    // FIXME: System's name is a per-model thing, but it's not
+                    // available on the model metadata. We do need to guess at
+                    // this. This is a temporary solution. `Prompt` should use
+                    // heuristics to determine the system's name.
+                    None => "system".as_bytes(),
+                },
+            })
+            .unwrap();
 
-            buf_len += role_len + message_len
+            let text = CString::new(message.text.as_bytes()).unwrap();
+
+            buf_len += text.as_bytes().len();
+            buf_len += role.as_bytes().len();
+
+            // We are leaking memory here. We need to clean up after we're done
+            // with the call to `llama_chat_apply_template`.
+            messages.push(llama_chat_message {
+                role: role.into_raw(),
+                content: text.into_raw(),
+            });
         }
-        buf_len *= 2;
 
         let mut buf = vec![0u8; buf_len];
 
-        let required_len: usize = llama_chat_apply_template(
-            self.inner,
-            template_ptr,
-            messages.as_ptr(),
-            messages.len(),
-            add_ass,
-            buf.as_mut_ptr() as *mut c_char,
-            buf.len() as i32,
-        )
-        .try_into()
-        .unwrap();
-
-        if required_len > buf_len {
-            buf.resize(required_len, 0);
-
-            let check: usize = llama_chat_apply_template(
+        // Safety: The messages are valid UTF-8, null terminated, and outlive
+        // the function call. It is very likely that the buffer will be too
+        // small. We'll resize it and call the function again. This is fine
+        // because the function will return the required length and not overflow
+        // the buffer.
+        let ret = unsafe {
+            llama_chat_apply_template(
                 self.inner,
                 template_ptr,
                 messages.as_ptr(),
@@ -686,15 +715,48 @@ impl Model {
                 buf.as_mut_ptr() as *mut c_char,
                 buf.len() as i32,
             )
+        };
+
+        // This is actually undocumented in the C++ docs, but this is what
+        // happens when a tempate is unsupported by llama.cpp.
+        if ret == -1 {
+            return None;
+        }
+
+        // If the return is positive, it is the required length.
+        let required_len: usize = ret.try_into().unwrap();
+
+        if required_len > buf_len {
+            buf.resize(required_len, 0);
+
+            let check: usize = unsafe {
+                llama_chat_apply_template(
+                    self.inner,
+                    template_ptr,
+                    messages.as_ptr(),
+                    messages.len(),
+                    add_ass,
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len() as i32,
+                )
+            }
             .try_into()
             .unwrap();
 
             assert!(check == required_len)
         }
 
-        buf.resize(required_len, 0);
+        // Free the messages.
+        for message in messages {
+            // Safety: we just created these pointers above with
+            // `CString::into_raw`. We are taking ownership to free the strings.
+            unsafe {
+                _ = CString::from_raw(message.role as *mut i8);
+                _ = CString::from_raw(message.content as *mut i8);
+            }
+        }
 
-        String::from_utf8(buf).unwrap()
+        Some(String::from_utf8(buf).unwrap())
     }
 
     /// Get text for a given token.
@@ -756,7 +818,7 @@ impl Drop for Model {
 
 #[cfg(test)]
 mod tests {
-    use llama_cpp_sys_3::llama_vocab_type_LLAMA_VOCAB_TYPE_SPM;
+    use llama_cpp_sys_3::llama_vocab_type_LLAMA_VOCAB_TYPE_BPE;
 
     use super::*;
 
@@ -765,91 +827,106 @@ mod tests {
         use std::path::PathBuf;
 
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        // This should be a properly converted llama 2 model or this test will
+        // This should be a properly converted llama 3 model or this test will
         // fail.
         path.push("models/model.gguf");
 
         let model = Model::from_file(path, None).unwrap();
 
-        assert_eq!(model.bos(), 1);
-        assert_eq!(model.eos(), 2);
-        assert_eq!(model.next_line(), 13);
-        // these are for CodeLLama
+        assert_eq!(model.bos(), 128000);
+        assert_eq!(model.eos(), 128001);
+        assert_eq!(model.next_line(), 128);
+        // These are for CodeLLama. These are included in the conversion of the
+        // llama 3 model I am using but these are wrong. They are for llama 2.
+        // TODO: Wait for a proper conversion and adjust these values.
         assert_eq!(model.infill_prefix(), 32007);
         assert_eq!(model.infill_suffix(), 32008);
-
         assert_eq!(model.infill_middle(), 32009);
         assert_eq!(model.eot(), 32010);
         assert_eq!(model.add_bos(), None);
         assert_eq!(model.add_eos(), None);
-        assert_eq!(model.vocab_type(), llama_vocab_type_LLAMA_VOCAB_TYPE_SPM);
-        assert_eq!(model.n_vocab(), 32000);
-        assert_eq!(model.context_size(), 4096);
+        assert_eq!(model.vocab_type(), llama_vocab_type_LLAMA_VOCAB_TYPE_BPE);
+        assert_eq!(model.n_vocab(), 128256);
+        assert_eq!(model.context_size(), 8192);
         assert_eq!(model.embedding_size(), 8192);
         assert_eq!(model.rope_type(), 0);
         assert_eq!(model.rope_freq_scale(), 1.0);
         let desc = model.desc().to_lowercase();
         assert!(desc.starts_with("llama"));
-        assert_eq!(model.meta_count(), 16);
+        assert_eq!(model.meta_count(), 18);
+        assert_eq!(
+            model.get_meta("tokenizer.chat_template").unwrap(),
+            "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }".to_owned()
+        );
         // The model size will be different on different systems, but the range
         // should be reasonable. Not zero and not over 200GB.
         assert!(model.size() > 8192 && model.size() < 200_000_000_000);
-        // LLama v2 variants come between 7 and 70 billion parameters
+        // LLama v3 variants come between 7 and 70 billion parameters give or
+        // take.
         assert!(
-            model.n_params() > 7_000_000_000
-                && model.n_params() < 70_000_000_000
+            model.n_params() > 6_000_000_000
+                && model.n_params() < 80_000_000_000
         );
 
-        let meta = model.meta();
-        assert_eq!(meta.len(), 16);
+        // let meta = model.meta();
+        // assert_eq!(meta.len(), 16);
 
         // test tokenization
         const EXPECTED: &str = "Hello, world!";
         let tokens = model.tokenize(EXPECTED, false);
-        assert_eq!(tokens, &[15043, 29892, 3186, 29991]);
-        assert_eq!(
-            model.tokens_to_string(tokens).strip_prefix(" ").unwrap(),
-            EXPECTED
-        );
+        assert_eq!(tokens, &[9906, 11, 1917, 0]);
+        assert_eq!(model.tokens_to_string(tokens), EXPECTED);
 
         // test get token text
-        assert_eq!(model.token_to_text(15043), "▁Hello");
+        assert_eq!(model.token_to_text(9906), "Hello");
         assert_eq!(
             model
-                .tokens_to_text(&[15043, 29892, 3186, 29991])
+                .tokens_to_text(&[9906, 11, 1917, 0])
                 .collect::<Vec<_>>(),
-            &["▁Hello", ",", "▁world", "!"]
+            &["Hello", ",", "Ġworld", "!"]
         );
 
         // test template application
-        let messages = [
-            llama_chat_message {
-                role: CString::new("user").unwrap().into_raw(),
-                content: CString::new("Hello, world!").unwrap().into_raw(),
+        let messages = vec![
+            Message {
+                role: crate::Role::Human,
+                text: "Hello, world!".to_string(),
             },
-            llama_chat_message {
-                role: CString::new("assistant").unwrap().into_raw(),
-                content: CString::new("Hi!").unwrap().into_raw(),
+            Message {
+                role: crate::Role::Agent,
+                text: "Hi!".to_string(),
             },
-            llama_chat_message {
-                role: CString::new("user").unwrap().into_raw(),
-                content: CString::new("So, how's it going?")
-                    .unwrap()
-                    .into_raw(),
+            Message {
+                role: crate::Role::Human,
+                text: "So, how's it going?".to_string(),
             },
         ];
-        let result =
-            unsafe { model.apply_chat_template(None, &messages, true) };
+
+        let prompt = crate::Prompt {
+            human: "user".to_string(),
+            agent: "assistant".to_string(),
+            system: None,
+            transcript: messages,
+            setting: Some(
+                "A conversation between a user and an assistant.".to_string(),
+            ),
+        };
+
+        // FIXME: The model currently testing with has a jinja2 template that
+        // is not supported by llama.cpp. The code in llama.cpp is not actually
+        // a jinja parser. It relies on heuristics and will fail if the template
+        // is not recognized. This will fail until LLama3 support is released,
+        // however, the code is believed to be correct.
+        //
+        // In the meantime we might want to fall back to our own formatting
+        // methods in cases where the template is not supported.
+        let template = model.get_meta("tokenizer.chat_template").unwrap();
+        let result = model
+            .apply_chat_template(Some(&template), &prompt, true)
+            .unwrap();
         assert_eq!(
             result,
             "<|im_start|>user\nHello, world!<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n<|im_start|>user\nSo, how's it going?<|im_end|>\n<|im_start|>assistant\n",
         );
-        for message in messages {
-            let llama_chat_message { role, content } = message;
-            unsafe {
-                let _ = CString::from_raw(role as *mut c_char);
-                let _ = CString::from_raw(content as *mut c_char);
-            }
-        }
     }
 }

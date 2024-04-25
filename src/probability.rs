@@ -16,7 +16,7 @@ where
 #[derive(Debug, PartialEq, PartialOrd, Eq, Ord, Clone, Copy, Hash)]
 #[repr(transparent)]
 pub struct Probability<F> {
-    p: F,
+    pub(crate) p: F,
 }
 impl<F> Probability<F> {
     pub fn from_f(p: F) -> Result<Self, InvalidProbability<F>>

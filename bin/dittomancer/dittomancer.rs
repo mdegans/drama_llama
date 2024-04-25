@@ -281,7 +281,7 @@ async fn main() -> () {
         }
 
         let mut opts = PredictOptions::default()
-            .add_model_eos(&engine.model)
+            .add_model_stops(&engine.model)
             .add_stop_sequence(vec![13])
             // We should stop at the username prompt.
             .add_stop(&format!("\n{}:", prompt.human), &engine.model);

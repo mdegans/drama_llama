@@ -3,7 +3,7 @@ use llama_cpp_sys_3::llama_token;
 use std::{collections::HashMap, ops::Index};
 use tinyvec::ArrayVec;
 
-use crate::{candidates::Sorted, utils::cold, Candidates};
+use crate::{utils::cold, Candidates};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NGramNewError {
@@ -205,21 +205,23 @@ impl NGramStats {
     /// # Note
     /// * This function applies softmax to the candidates if it hasn't been
     ///   applied already.
-    /// * This function sorts the candidates by id.
+    ///
+    /// # Panics
+    /// * If the candidates are not sorted by id.
     pub fn add(
         &mut self,
         key: NGram,
-        candidates: &mut Candidates,
+        candidates: &Candidates,
     ) -> &mut NGramData {
         // This only applies softmax if it hasn't been applied already, like on
         // the first call.
-        candidates.apply_softmax(None);
 
         // This doesn't invalidate the softmax state, and is not applied to the
         // candidates if it has already been applied.
-        candidates.sort(Sorted::ById {
-            k: candidates.len(),
-        });
+        assert!(candidates
+            .is_sorted()
+            .by_id()
+            .is_some_and(|k| k == candidates.len()));
 
         self.ngram_count += 1;
         self.token_count += key.len();
@@ -314,6 +316,8 @@ impl Into<HashMap<NGram, NGramData>> for NGramStats {
 
 #[cfg(test)]
 mod tests {
+    use crate::Sorted;
+
     use super::*;
 
     #[test]
@@ -383,11 +387,12 @@ mod tests {
             c.data[i].id = i as llama_token;
             c.data[i].logit = -(i as f32 / n as f32);
         }
-        c.apply_softmax(None);
-        c.sort(Sorted::ById { k: c.len() });
+        let c = c.softmax(None);
+        let k = c.len();
+        let c = c.sort(Sorted::ById { k });
 
-        let data = stats.add(a, &mut c);
-        assert_eq!(data.count(), 1);
+        let count = stats.add(a, &c).count;
+        assert_eq!(count, 1);
         assert_eq!(stats.total_ngram_count(), 1);
         assert_eq!(stats.total_token_count(), 7);
         assert_approx_eq!(stats.avg_ngram_length(), 7.0, 1e-6);
@@ -403,8 +408,8 @@ mod tests {
             1e-6
         );
 
-        let data = stats.add(b, &mut c);
-        assert_eq!(data.count(), 1);
+        let count = stats.add(b, &c).count;
+        assert_eq!(count, 1);
         assert_eq!(stats.total_ngram_count(), 2);
         assert_eq!(stats.total_token_count(), 12);
         let expected_cum_prob: f64 = c.iter().take(5).map(|t| t.p as f64).sum();
@@ -415,7 +420,7 @@ mod tests {
         );
         assert_approx_eq!(stats.avg_ngram_length(), 6.0, 1e-6);
 
-        let count = stats.add(b, &mut c).count();
+        let count = stats.add(b, &c).count;
         assert_eq!(count, 2);
         assert_eq!(stats.total_ngram_count(), 3);
         assert_eq!(stats.total_token_count(), 17);
@@ -440,8 +445,8 @@ mod tests {
         assert_eq!(stats.total_token_count(), 7);
         assert_approx_eq!(stats.avg_ngram_length(), 7.0, 1e-6);
 
-        let _ = stats.add(b, &mut c);
-        let count = stats.add(b, &mut c).count();
+        let _ = stats.add(b, &c);
+        let count = stats.add(b, &c).count;
         let expected_cum_prob: f64 = c.iter().take(5).map(|t| t.p as f64).sum();
         assert_eq!(count, 2);
         assert_eq!(stats.total_ngram_count(), 3);
