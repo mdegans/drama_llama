@@ -154,7 +154,7 @@ impl Format {
                         llama3::EOT
                     )?;
                 }
-                // Logic is borrowed fro:
+                // Logic is borrowed from:
                 // https://github.com/meta-llama/llama/blob/main/llama/generation.py
                 Format::LLaMA2Chat => {
                     assert!(
