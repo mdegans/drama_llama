@@ -7,7 +7,7 @@ The tool works by, for a given text, submitting the beginning of the text as con
 ## Usage
 
 ```bash
-$ cargo run --features="webchat cli stats" --bin regurgitater -- --model ~/models/llama/70b/llama-2-70b.Q6_K.gguf
+$ cargo run --features="webchat cli stats" --bin regurgitater -- --model models/model.gguf
 ```
 
 ## Faq

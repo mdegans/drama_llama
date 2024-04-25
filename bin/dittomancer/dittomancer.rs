@@ -1,6 +1,7 @@
 use std::{io::Write, path::PathBuf};
 
 use clap::Parser;
+use drama_llama::prompt::Format;
 use drama_llama::{
     data::StopWords, prompt, Engine, Message, NGram, PredictOptions, Prompt,
     RepetitionOptions, Role, SamplingMode,
@@ -280,11 +281,17 @@ async fn main() -> () {
             }
         }
 
+        let prompt_format = prompt::Format::from_model(&engine.model)
+            .unwrap_or(Format::Unknown);
+        let mut prompt_string = String::new();
+        prompt.format(prompt_format, &mut prompt_string).unwrap();
+        dbg!(&prompt_string);
+
         let mut opts = PredictOptions::default()
-            .add_model_eos(&engine.model)
-            .add_stop_sequence(vec![13])
-            // We should stop at the username prompt.
-            .add_stop(&format!("\n{}:", prompt.human), &engine.model);
+            // We stop at any of the model's stop tokens.
+            .add_model_stops(&engine.model)
+            // As well as the username prompt for the human.
+            .add_stop(prompt.human_prefix(prompt_format));
 
         // Ignore common English stopwords for the repetition penalty.
         let mut ignored: Vec<NGram> = if args.ignore_stopwords {
@@ -315,15 +322,10 @@ async fn main() -> () {
 
         opts.sample_options.repetition =
             Some(RepetitionOptions::default().set_ignored(ignored));
-        opts.sample_options.mode = SamplingMode::LocallyTypical {
+        opts.sample_options.modes = vec![SamplingMode::LocallyTypical {
             p: 0.8.try_into().unwrap(),
             min_keep: 1.try_into().unwrap(),
-        };
-
-        let prompt_format = prompt::Format::from_model(&engine.model);
-        let mut prompt_string = String::new();
-        prompt.format(prompt_format, &mut prompt_string).unwrap();
-        dbg!(&prompt_string);
+        }];
 
         let mut tokens = engine.model.tokenize(&prompt_string, false);
         if tokens.len() > engine.n_ctx() as usize {
@@ -371,19 +373,31 @@ async fn main() -> () {
             // generating a response.
             to_client.send(msg).ok();
 
-            let predictor = engine.predict(&mut tokens, opts.clone());
+            let mut predictor = engine.predict_pieces(tokens, opts.clone());
 
-            // TODO: Remove this debug output, stream the tokens to the client,
-            // and detokenize at the client.
-            let generated = predictor.filter_map(|p| {
+            while let Some(_) = predictor.next() {
                 if from_client.is_closed() {
-                    None
-                } else {
-                    Some(p.piece)
+                    return;
                 }
-            });
+            }
 
-            let mut text: String = generated.collect();
+            // The predictor automatically collects, since this is required for
+            // prediction and stop criteria. When we're done, we can extract the
+            // tokens and text. The predictor can, of course, also yield pieces
+            // directly for use with Rust's iterator methods.
+            let (mut generated, mut text) = predictor.into_tokens_and_text();
+
+            // This is a bit ackward, but avoids reallocation of the tokens
+            // since they are moved into the predictor when `predict_pieces` is
+            // called and get them back with `into_tokens_and_text`. Since we
+            // need to bind the tokens to the `tokens` variable but can't do so
+            // directly, we call them `generated` and swap with `tokens` and
+            // this works. If we use `tokens` Rust complains about a move
+            // earlier in the loop since `let` binds a new variable.
+            tokens = generated;
+
+            // TODO: Find a prettier solution to the above. The API is flexible
+            // enough that we can probably find a better way to do this.
 
             if let Some(text) =
                 text.strip_suffix(&format!("\n{}:", &prompt.human))

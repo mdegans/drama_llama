@@ -1,3 +1,7 @@
+// TODO: Importing everything from the submodules is fine for small crates, but
+// this is getting crowded. When we go to version 0.2.0, we should consider
+// making modules public.
+
 #[cfg(feature = "cli")]
 pub mod cli;
 
@@ -15,7 +19,7 @@ mod batch;
 pub(crate) use batch::Batch;
 
 mod candidates;
-pub(crate) use candidates::Candidates;
+pub use candidates::{Candidates, Sorted, TokenDataArray};
 
 pub mod prompt;
 pub use prompt::{Message, Prompt, Role};
@@ -30,7 +34,9 @@ mod engine;
 pub use engine::Engine;
 
 mod predictor;
-pub use predictor::{PredictOptions, Predicted, Predictor};
+pub use predictor::{
+    CandidatePredictor, PredictOptions, Predicted, Predictor, TokenPredictor,
+};
 
 mod probability;
 pub use probability::{InvalidProbability, Probability};

@@ -60,6 +60,18 @@ impl Prompt {
     /// Format the prompt for a specific model. This adds a BOS token if the
     /// model requires it. If this is unknown, a BOS token will not be added.
     /// This is the recommended method for formatting a prompt.
+    ///
+    /// This will first attempt to use native formatting for the model. If a
+    /// format would be unknown, it will attempt to apply a chat template using
+    /// the model's metadata and `llama.cpp`. If *that* fails, it will use the
+    /// [`Format::Unknown`] format.
+    ///
+    /// This does not add the assistant's prefix to the prompt. If this is
+    /// desired, [`format_agent_prefix`] should be called after this method or
+    /// [`Model::apply_chat_template`] should be used instead with the `add_ass`
+    /// parameter set to `true`.
+    ///
+    /// [`format_agent_prefix`]: Self::format_agent_prefix
     pub fn format_for_model<F>(
         &self,
         model: &Model,
@@ -68,7 +80,13 @@ impl Prompt {
     where
         F: std::fmt::Write,
     {
-        let format = Format::from_model(model);
+        let format = match Format::from_model(model) {
+            Some(format) => format,
+            None => match model.apply_chat_template(None, self, false) {
+                Some(string) => return f.write_str(&string),
+                None => Format::Unknown,
+            },
+        };
         format.format_prompt(self, Some(model), f)
     }
 
@@ -84,6 +102,39 @@ impl Prompt {
         F: std::fmt::Write,
     {
         format.format_agent_prefix(f, self)
+    }
+
+    /// Get the agent's prefix. This a convenience method that creates a new
+    /// string and formats it with [`format_agent_prefix`].
+    ///
+    /// [`format_agent_prefix`]: Self::format_agent_prefix
+    pub fn agent_prefix(&self, format: Format) -> String {
+        let mut s = String::new();
+        self.format_agent_prefix(format, &mut s).unwrap();
+        s
+    }
+
+    /// Format the human's prefix. This can be used to format stop criteria so
+    /// that the model knows when to stop generating text.
+    pub fn format_human_prefix<F>(
+        &self,
+        format: Format,
+        f: &mut F,
+    ) -> std::fmt::Result
+    where
+        F: std::fmt::Write,
+    {
+        format.format_human_prefix(f, self)
+    }
+
+    /// Get the human's prefix. This a convenience method that creates a new
+    /// string and formats it with [`format_human_prefix`].
+    ///
+    /// [`format_human_prefix`]: Self::format_human_prefix
+    pub fn human_prefix(&self, format: Format) -> String {
+        let mut s = String::new();
+        self.format_human_prefix(format, &mut s).unwrap();
+        s
     }
 }
 

@@ -92,6 +92,11 @@ impl Batch {
         self.batch.n_tokens as usize
     }
 
+    /// Returns true if batch is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// The size of each embedding.
     pub const fn embd_len(&self) -> usize {
         self.embd_len

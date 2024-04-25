@@ -31,7 +31,7 @@ use rocket::{
 
 use stringmetrics::jaccard;
 
-use drama_llama::{cli::Args, Engine, PredictOptions, VocabKind};
+use drama_llama::{cli::Args, Engine, PredictOptions, Predicted, VocabKind};
 
 #[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, rocket::UriDisplayQuery))]
@@ -168,8 +168,8 @@ pub async fn tos() -> String {
 
 #[rocket::main]
 async fn main() {
-    use drama_llama::{Predicted, SampleOptions};
-    use llama_cpp_sys::llama_token;
+    use drama_llama::SampleOptions;
+    use llama_cpp_sys_3::llama_token;
     use rocket::{
         fs::{relative, FileServer},
         routes,
@@ -354,7 +354,7 @@ async fn main() {
                     (engine.n_ctx() as usize - chunk.len()).try_into().unwrap();
 
                 for Predicted { token, piece } in
-                    engine.predict(&mut chunk, opts.clone())
+                    engine.predict(chunk, opts.clone())
                 {
                     if from_client.is_closed() {
                         break 'outer;
