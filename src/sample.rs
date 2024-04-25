@@ -6,7 +6,7 @@ use crate::{
     Candidates, Probability,
 };
 
-use llama_cpp_sys_3::{llama_token, llama_token_data};
+use llama_cpp_sys_3::llama_token;
 use xorshift::Rng;
 
 use std::num::{NonZeroU8, NonZeroUsize};
@@ -19,7 +19,17 @@ use std::num::{NonZeroU8, NonZeroUsize};
 /// Options for [`sample`].
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct SampleOptions {
-    pub mode: SamplingMode,
+    /// Sampling modes to apply in order. Greedy, Mirostat, and MirostatV2 are
+    /// guaranteed to return a single token, so they should be the last mode.
+    // TODO: There may be a way to refactor mirostat and mirostat v2 to return
+    // candidates instead of a single token. Issue is they rely on a suprise
+    // value that is calculated in the function after the token is chosen, so
+    // this would have to occur at the beginning of the function, but not on the
+    // first call. It's doable, but it's a bit of a pain. It may be worth it.
+    pub modes: Vec<SamplingMode>,
+    /// Repetition penalty options. If this is `None`, no repetition penalty is
+    /// applied. This is applied before the sampling modes, so it may be used
+    /// with any of them, including greedy.
     pub repetition: Option<RepetitionOptions>,
 }
 
@@ -27,7 +37,7 @@ impl SampleOptions {
     /// Greedy sampling. No repetition penalty.
     pub fn greedy() -> Self {
         Self {
-            mode: SamplingMode::Greedy,
+            modes: vec![SamplingMode::Greedy],
             repetition: None,
         }
     }
@@ -616,53 +626,71 @@ pub(crate) fn sample_token(
         )?;
     }
 
-    let filtered: Candidates = match opts.mode {
-        SamplingMode::Greedy => return Ok(candidates.sample_token_greedy().id),
-        SamplingMode::TopP { p, min_keep } => candidates.top_p(p, min_keep),
-        SamplingMode::TopK { k } => candidates.top_k(k),
-        SamplingMode::MinP { p, min_keep } => candidates.min_p(p, min_keep),
-        SamplingMode::TailFree { z, min_keep } => {
-            candidates.tail_free(z, min_keep)
-        }
-        SamplingMode::LocallyTypical { p, min_keep } => {
-            candidates.locally_typical(p, min_keep)
-        }
-        SamplingMode::Mirostat { tau, eta, max_keep } => {
-            return Ok(candidates.mirostat(rng, tau, eta, max_keep, mu));
-        }
-        SamplingMode::MirostatV2 { tau, eta, max_keep } => {
-            return Ok(candidates.mirostat_v2(rng, tau, eta, max_keep, mu));
-        }
-        SamplingMode::SplitP { min_keep, max_keep } => {
-            candidates.split_p(min_keep, max_keep)
-        }
-        SamplingMode::SplitL { min_keep, max_keep } => {
-            candidates.split_l(min_keep, max_keep)
-        }
-    };
+    // Fold candidates, applying the sampling modes in order.
+    let filtered =
+        opts.modes
+            .iter()
+            .cloned()
+            .fold(candidates, |candidates, mode| match mode {
+                SamplingMode::Greedy => candidates.sample_token_greedy(),
+                SamplingMode::TopP { p, min_keep } => {
+                    candidates.top_p(p, min_keep)
+                }
+                SamplingMode::TopK { k } => candidates.top_k(k),
+                SamplingMode::MinP { p, min_keep } => {
+                    candidates.min_p(p, min_keep)
+                }
+                SamplingMode::TailFree { z, min_keep } => {
+                    candidates.tail_free(z, min_keep)
+                }
+                SamplingMode::LocallyTypical { p, min_keep } => {
+                    candidates.locally_typical(p, min_keep)
+                }
+                SamplingMode::Mirostat { tau, eta, max_keep } => {
+                    candidates.mirostat(rng, tau, eta, max_keep, mu)
+                }
+                SamplingMode::MirostatV2 { tau, eta, max_keep } => {
+                    candidates.mirostat_v2(rng, tau, eta, max_keep, mu)
+                }
+                SamplingMode::SplitP { min_keep, max_keep } => {
+                    candidates.split_p(min_keep, max_keep)
+                }
+                SamplingMode::SplitL { min_keep, max_keep } => {
+                    candidates.split_l(min_keep, max_keep)
+                }
+            });
 
-    Ok(predict_token(rng, filtered.softmax(None)).id)
+    Ok(choose_candidate(rng, filtered.softmax(None))
+        .is_one()
+        .unwrap()
+        .id)
 }
 
-/// Apply the softmax function to the remaining candidates and choose one using
-/// the probabilities and the supplied rng.
+/// Apply the softmax function to the remaining candidates and select a single
+/// candidate. This function is guaranteed to leave the candidates with only
+/// one token.
 // TODO: better name
-pub(crate) fn predict_token(
+pub(crate) fn choose_candidate(
     rng: &mut xorshift::Xoroshiro128,
-    tokens: Candidates,
-) -> llama_token_data {
-    let candidates = tokens.softmax(None);
+    candidates: Candidates,
+) -> Candidates {
+    if candidates.len().get() == 1 {
+        return candidates;
+    }
+
+    let candidates = candidates.softmax(None);
 
     // Pick a token based on the probabilities
     let val = rng.gen_range(0.0, 1.0);
     let mut cum_prob = 0.0;
-    for token in candidates.iter() {
+    for (i, token) in candidates.iter().enumerate() {
         cum_prob += token.p;
-        if val < cum_prob {
-            return *token;
+        if cum_prob > val {
+            return candidates.select(i);
         }
     }
 
     // This can happen because of floating point errors
-    *candidates.data.last().unwrap()
+    let last = candidates.len().get() - 1;
+    candidates.select(last)
 }
