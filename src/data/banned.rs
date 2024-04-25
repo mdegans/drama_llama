@@ -1,3 +1,8 @@
+// FIXME: Llama3 has 128k tokens as oppose to llama's 32k, so token bigrams for
+// all possible pairs containing offensive terms are now unfeasible. String
+// based blocking is the only way to go, so this module will have to be
+// rethought.
+
 use llama_cpp_sys_3::llama_token;
 
 use crate::NGram;

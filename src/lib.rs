@@ -28,14 +28,15 @@ mod model;
 pub use model::{llama_quantize, Model, Vocab, VocabKind};
 
 mod ngram;
-pub use ngram::{NGram, NGramStats};
+pub use ngram::{NGram, NGramData, NGramStats};
 
 mod engine;
 pub use engine::Engine;
 
 mod predictor;
 pub use predictor::{
-    CandidatePredictor, PredictOptions, Predicted, Predictor, TokenPredictor,
+    CandidatePredictor, PiecePredictor, PredictOptions, Predicted, Predictor,
+    TokenPredictor,
 };
 
 mod probability;

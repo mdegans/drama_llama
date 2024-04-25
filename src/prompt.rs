@@ -48,8 +48,8 @@ impl Prompt {
     }
 
     /// Format the prompt in a specific format. This does not add a BOS token so
-    /// if this is desired, it must be prepended or [`Format::for_model`] must
-    /// be used instead.
+    /// if this is desired, it must be prepended or [`Prompt::format_for_model`]
+    /// must be used instead.
     pub fn format<F>(&self, format: Format, f: &mut F) -> std::fmt::Result
     where
         F: std::fmt::Write,
@@ -58,13 +58,13 @@ impl Prompt {
     }
 
     /// Format the prompt for a specific model. This adds a BOS token if the
-    /// model requires it. If this is unknown, a BOS token will not be added.
-    /// This is the recommended method for formatting a prompt.
+    /// model requires it. If this is unknown, a BOS token will **not** be
+    /// added. This is the recommended method for formatting a prompt.
     ///
     /// This will first attempt to use native formatting for the model. If a
-    /// format would be unknown, it will attempt to apply a chat template using
+    /// format would be [`Unknown`], it will attempt to apply a chat template using
     /// the model's metadata and `llama.cpp`. If *that* fails, it will use the
-    /// [`Format::Unknown`] format.
+    /// [`Unknown`] format as a last resort, formatting for foundation models.
     ///
     /// This does not add the assistant's prefix to the prompt. If this is
     /// desired, [`format_agent_prefix`] should be called after this method or
@@ -72,6 +72,7 @@ impl Prompt {
     /// parameter set to `true`.
     ///
     /// [`format_agent_prefix`]: Self::format_agent_prefix
+    /// [`Unknown`]: Format::Unknown
     pub fn format_for_model<F>(
         &self,
         model: &Model,

@@ -99,11 +99,13 @@ impl PredictOptions {
     };
 
     /// Add any stop tokens from the model. If there is an associated
-    /// [`prompt::Format`], the stop tokens will be added. *Otherwise*, the EOS
-    /// from [`Model::eos`] will be added (not both).
+    /// [`Format`], the stop tokens will be added. *Otherwise*, the EOS from
+    /// [`Model::eos`] will be added (not both).
     ///
     /// To force the inclusion of the EOS token, use [`add_stop_sequence`] with
     /// [`Model::eos`].
+    ///
+    /// [`add_stop_sequence`]: Self::add_stop_sequence
     pub fn add_model_stops(mut self, model: &Model) -> Self {
         if let Some(format) = Format::from_model(model) {
             self = self.add_stop_format(format);

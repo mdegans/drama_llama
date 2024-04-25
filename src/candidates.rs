@@ -134,7 +134,7 @@ impl TokenDataArray<'_> {
     }
 
     /// Get a pointer to the inner [`llama_token_data_array`]. Provided for
-    /// compatability with [`llama_cpp_sys`] and friends.
+    /// compatability with [`llama_cpp_sys_3`] and friends.
     ///
     /// # Panics
     /// * If the arr.size has been modified to be out of bounds.
@@ -151,7 +151,7 @@ impl TokenDataArray<'_> {
     }
 
     /// Get a mutable pointer to the inner [`llama_token_data_array`]. Provided
-    /// for compatability with [`llama_cpp_sys`] and friends.
+    /// for compatability with [`llama_cpp_sys_3`] and friends.
     ///
     /// # Safety
     /// * The `arr.size` is guaranteed to be valid as long as the Candidates
@@ -682,7 +682,7 @@ impl Candidates {
     ///
     /// It is guaranteed at least one token is selected.
     ///
-    /// https://arxiv.org/abs/1904.09751
+    /// <https://arxiv.org/abs/1904.09751>
     ///
     /// Time complexity is O(n) where softmax has already been applied.
     /// Otherwise, it is O(n log n).
@@ -713,7 +713,7 @@ impl Candidates {
 
     /// Min-p sampling.
     ///
-    /// As described in: https://github.com/ggerganov/llama.cpp/pull/3841
+    /// As described in: <https://github.com/ggerganov/llama.cpp/pull/3841>
     ///
     /// It is guaranteed at least one token is selected.
     ///
@@ -784,7 +784,7 @@ impl Candidates {
 
     /// Tail free sampling.
     ///
-    /// https://www.trentonbricken.com/Tail-Free-Sampling/
+    /// <https://www.trentonbricken.com/Tail-Free-Sampling/>
     ///
     /// Time complexity is O(n) where softmax has already been applied to n.
     /// Otherwise, it is O(n log n).
@@ -847,7 +847,7 @@ impl Candidates {
 
     /// Locally typical sampling.
     ///
-    /// https://arxiv.org/abs/2202.00666
+    /// <https://arxiv.org/abs/2202.00666>
     ///
     /// Time complexity is O(n) where softmax has already been applied to n.
     /// Otherwise, it is O(n log n).
@@ -1213,17 +1213,17 @@ impl Candidates {
         )
     }
 
-    /// This is a translation of `llama_sample_repetition_penalties`. It can be
-    /// used in that mode or with n-grams. See [SampleRepetionOptions] for
-    /// details.
+    /// Apply repetition penalties to the candidates. This code is inspired by
+    /// [`llama_sample_repetition_penalties`] but supports n-grams and an
+    /// [`NGramStats`] object to keep track of n-gram frequencies as well as
+    /// other stats like the number of tokens processed.
     ///
     /// # Note
     /// * This method may apply the softmax if it has not been applied yet.
     /// * This method may sort the candidates if they are not already sorted.
     /// * This method may change the logits of the candidates.
     ///
-    /// # Panics
-    /// todo
+    /// [`llama_sample_repetition_penalties`]: llama_cpp_sys_3::llama_sample_repetition_penalties
     pub fn penalize_repetition(
         self,
         tokens: &[llama_token],

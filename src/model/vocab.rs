@@ -5,9 +5,7 @@ use regex::Regex;
 
 use crate::{data::banned::Banned, model::token_to_piece_ref, Model, NGram};
 
-// TODO: These regex aren't great. They're just a starting point. They have
-// issues requiring the allow list below. We need to improve them so they work
-// for all models.
+/// A very imperfect regex for safe tokens. This could use some improvement.
 pub const SAFE_REGEX: &str = r#"^[▁ a-zA-Z]{2,32}|[ ▁\(\)\.\?!\"\'\-_]{1,32}|[aAI]{1}|\n{1,3}|\t{1,3}| {1,16}$"#;
 pub const LETTERS_REGEX: &str = r#"^[a-zA-Z]{1}$"#;
 pub const CODE_REGEX: &str = r#"^[ \d\\(\){\}\[\]\;\:\"\'\<\>\,\.\\\/\?\.\!\@\#\$\%\^\&\=\`\~]{1,32}|\w{2,32}$"#;
@@ -72,10 +70,13 @@ pub enum VocabKind {
     /// especially if the output is going to be used in a web context. Banned
     /// n-grams are still enforced.
     Unsafe,
-    /// The [`Safe`] vocabulary. Words, word fragments, punctuation, and the
-    /// letter "a" are allowed. This is the default vocabulary.
+    /// Words, word fragments, punctuation, and the letter "a" are allowed. This
+    /// is the default vocabulary. The idea is to prohibit generation of
+    /// arbitrary sequences which could bypass filters, as well as code which
+    /// could cause security issues.
     ///
-    /// [`SAFE_REGEX`] is used to validate the tokens.
+    /// That being said *this is not yet validated* to be very safe, so care
+    /// should be taken especially for web contexts.
     Safe,
     /// Letters only. Allowing this will allow generation of any sequence, but
     /// only one letter at a time. This is unsafe and should not be used unless
