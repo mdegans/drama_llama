@@ -470,6 +470,11 @@ impl<'engine> PiecePredictor<'engine> {
         let (tokens, text) = self.into_tokens_and_text();
         (pieces, tokens, text)
     }
+
+    /// Get the last token that was predicted.
+    pub fn last_token(&self) -> Option<llama_token> {
+        self.inner.inner.tokens.last().copied()
+    }
 }
 
 impl<'engine> Iterator for PiecePredictor<'engine> {
@@ -572,7 +577,7 @@ mod tests {
         // ownership issues). For an example of how to use it in a wrapper to
         // make your use more ergonomic, see the TokenPredictor struct.
         while let Some(candidates) = predictor.next() {
-            let token = candidates.sample_token_greedy();
+            let token = candidates.sample_token_greedy().is_one().unwrap();
 
             // This must be called or iteration will end.
             if predictor.record_choice(token.id).is_err() {

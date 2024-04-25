@@ -9,10 +9,10 @@ intent.
 
 - Read `fred_rogers.toml` for an example of how to use the tool and create your
   own `.toml` file to your needs.
-- You will need a foundational language model in the `.gguf` format [such as
-  LLaMA 2](https://huggingface.co/TheBloke/Llama-2-70B-GGUF). Instruct models
-  will likely not work well for this purpose, however in the future other models
-  may be supported.
+- You will need a `.gguf` format model [such as
+  LLaMA 2](https://huggingface.co/TheBloke/Llama-2-70B-GGUF). Foundation models
+  (not tuned) will likely work better for this purpose unless the were
+  specifically tuned on the character in question.
 - Read the root [`TERMS_OF_USE.md`](../../TERMS_OF_USE.md). You must agree with
   the terms to use this tool.
 
@@ -21,7 +21,7 @@ intent.
 From the crate root, run:
 
 ```bash
-$ cargo run --features="webchat cli" --bin dittomancer -- --model ~/models/llama/70b/llama-2-70b.Q6_K.gguf --prompt bin/dittomancer/fred_rogers.toml
+$ cargo run --features="webchat cli" --bin dittomancer -- --model models/model.gguf --prompt bin/dittomancer/fred_rogers.toml
 ```
 
 Finally, go to the link shown on a line like
