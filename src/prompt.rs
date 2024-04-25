@@ -70,7 +70,7 @@ impl Prompt {
     /// desired, [`format_agent_prefix`] should be called after this method or
     /// [`Model::apply_chat_template`] should be used instead with the `add_ass`
     /// parameter set to `true`.
-    /// 
+    ///
     /// [`format_agent_prefix`]: Self::format_agent_prefix
     pub fn format_for_model<F>(
         &self,
@@ -102,6 +102,39 @@ impl Prompt {
         F: std::fmt::Write,
     {
         format.format_agent_prefix(f, self)
+    }
+
+    /// Get the agent's prefix. This a convenience method that creates a new
+    /// string and formats it with [`format_agent_prefix`].
+    ///
+    /// [`format_agent_prefix`]: Self::format_agent_prefix
+    pub fn agent_prefix(&self, format: Format) -> String {
+        let mut s = String::new();
+        self.format_agent_prefix(format, &mut s).unwrap();
+        s
+    }
+
+    /// Format the human's prefix. This can be used to format stop criteria so
+    /// that the model knows when to stop generating text.
+    pub fn format_human_prefix<F>(
+        &self,
+        format: Format,
+        f: &mut F,
+    ) -> std::fmt::Result
+    where
+        F: std::fmt::Write,
+    {
+        format.format_human_prefix(f, self)
+    }
+
+    /// Get the human's prefix. This a convenience method that creates a new
+    /// string and formats it with [`format_human_prefix`].
+    ///
+    /// [`format_human_prefix`]: Self::format_human_prefix
+    pub fn human_prefix(&self, format: Format) -> String {
+        let mut s = String::new();
+        self.format_human_prefix(format, &mut s).unwrap();
+        s
     }
 }
 

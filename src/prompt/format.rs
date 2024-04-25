@@ -294,6 +294,41 @@ impl Format {
         Ok(())
     }
 
+    /// Format the human's partial response. This can be used for stop criteria.
+    pub fn format_human_prefix<F>(
+        &self,
+        f: &mut F,
+        prompt: &Prompt,
+    ) -> std::fmt::Result
+    where
+        F: std::fmt::Write,
+    {
+        match self {
+            Format::Unknown
+            | Format::LLaMA
+            | Format::LLaMA2
+            | Format::LLaMA3 => {
+                f.write_str("\n")?;
+                f.write_str(&prompt.human)?;
+                f.write_str(":")?;
+            }
+            Format::LLaMA2Chat => {
+                f.write_str("\n")?;
+                f.write_str(&prompt.human)?;
+                f.write_str(":")?;
+            }
+            Format::LLaMA3Chat => {
+                f.write_str(llama3::B_HEADER)?;
+                f.write_str(&prompt.human)?;
+                f.write_str(llama3::E_HEADER)?;
+                f.write_str("\n\n")?;
+            }
+            Format::Vicuna => todo!(),
+        }
+
+        Ok(())
+    }
+
     pub fn format_prompt<F>(
         &self,
         prompt: &Prompt,

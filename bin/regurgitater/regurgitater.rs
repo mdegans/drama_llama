@@ -168,8 +168,8 @@ pub async fn tos() -> String {
 
 #[rocket::main]
 async fn main() {
-    use drama_llama::{Predicted, SampleOptions};
-    use llama_cpp_sys::llama_token;
+    use drama_llama::SampleOptions;
+    use llama_cpp_sys_3::llama_token;
     use rocket::{
         fs::{relative, FileServer},
         routes,
@@ -353,9 +353,8 @@ async fn main() {
                 opts.n =
                     (engine.n_ctx() as usize - chunk.len()).try_into().unwrap();
 
-                for Predicted { token, piece } in
-                    engine.predict(&mut chunk, opts.clone())
-                {
+                let mut predictor = engine.predict_pieces(chunk, opts.clone());
+                while let Some(piece) = predictor.next() {
                     if from_client.is_closed() {
                         break 'outer;
                     }
@@ -367,7 +366,7 @@ async fn main() {
                         })
                         .ok();
 
-                    completion.push(token);
+                    completion.push(predictor.last_token().unwrap());
 
                     // We only compare sequences of equal length, until the
                     // completion is the same length as the ground truth.

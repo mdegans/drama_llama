@@ -12,7 +12,7 @@ use llama_cpp_sys_3::{llama_token, llama_token_data, llama_token_data_array};
 use crate::{
     model::Vocab,
     ngram::NGramStats,
-    sample::{predict_token, SampleError},
+    sample::{choose_candidate, SampleError},
     Probability, RepetitionOptions, SampleOptions,
 };
 /// Sort state of the candidates.
@@ -435,10 +435,10 @@ impl Candidates {
         self.data.len().try_into().unwrap()
     }
 
-    /// Returns `Some(token)` if there is only one candidate.
-    pub fn is_one(&self) -> Option<llama_token> {
+    /// Returns `Some(llama_token_data)` if there is only one candidate.
+    pub fn is_one(&self) -> Option<llama_token_data> {
         if self.len().get() == 1 {
-            Some(self.data[0].id)
+            Some(self.data[0])
         } else {
             None
         }
@@ -466,6 +466,15 @@ impl Candidates {
     /// Note that this does not change the allocated capacity of the candidates.
     pub fn truncate(mut self, new_len: NonZeroUsize) -> Self {
         self.data.truncate(self.len().min(new_len).get());
+        self
+    }
+
+    /// Select a candidate by index, throwing out the rest, leaving only the
+    /// selected candidate in self.
+    pub fn select(mut self, index: usize) -> Self {
+        self.data = vec![self[index]];
+        self.sort_state = Sorted::One;
+        self.softmax_applied_to = None;
         self
     }
 
@@ -587,23 +596,22 @@ impl Candidates {
         }
     }
 
-    /// Sample the most likely candidate from the candidates.
+    /// Sample the most likely candidate from the candidates. This is guaranteed
+    /// to return a single candidate. [`Candidates::is_one`] can be used to get
+    /// and unwrap the candidate without risk of panic.
     ///
     /// If the candidates are already sorted by logit this method's time
     /// complexity is O(1). Otherwise, it is O(n).
-    pub fn sample_token_greedy(self) -> llama_token_data {
+    pub fn sample_token_greedy(self) -> Candidates {
         if self.is_sorted().by_logit().is_some() || self.len().get() == 1 {
             // We are sorted by at least one candidate.
-            *self.as_slice().first().unwrap()
+            self.truncate(NonZeroUsize::new(1).unwrap())
         } else {
-            // Unsorted implementation, find the max logit.
-            *self
-                .as_slice()
-                .iter()
-                .max_by(|a, b| a.logit.partial_cmp(&b.logit).unwrap())
-                // This can never panic because a class invariant is that there
-                // is at least one candidiate.
-                .unwrap()
+            // Unsorted implementation, find the max logit. Since this is a
+            // partial sort, the complexity is O(n).
+            self.sort(Sorted::ByLogit {
+                k: NonZeroUsize::new(1).unwrap(),
+            })
         }
     }
 
@@ -899,7 +907,7 @@ impl Candidates {
             .collect()
     }
 
-    /// Mirostat sampling.
+    /// Mirostat sampling. Guaranteed to return a single candidate.
     ///
     /// Time complexity is O(**max_keep**) where softmax has already been
     /// applied to n. Otherwise, it is O(n log n).
@@ -916,12 +924,12 @@ impl Candidates {
         eta: f32,
         max_keep: Option<NonZeroUsize>,
         opt_mu: &mut Option<f32>,
-    ) -> llama_token {
+    ) -> Candidates {
         if self.data.is_empty() {
             unreachable!("Class invariant violated: There must be at least one candidate.")
         }
         if self.data.len() == 1 {
-            return self.data[0].id;
+            return self;
         }
 
         let new = self.softmax(None);
@@ -931,12 +939,6 @@ impl Candidates {
             .get();
         // mu is initialized to 2 * tau if not provided
         let mu = opt_mu.unwrap_or(2.0 * tau);
-
-        if new.len() == NonZeroUsize::new(1).unwrap() {
-            return new[0].id;
-        }
-
-        let x: llama_token_data;
 
         // Estimate s_hat using the most probable m tokens
         let s_hat;
@@ -963,20 +965,20 @@ impl Candidates {
         // TODO: in the future we may return the candidates here to give more
         // control over how a token is chosen and to make the Candidate API more
         // consistent.
-        x = predict_token(rng, new.top_k(k));
+        let new = choose_candidate(rng, new.top_k(k));
 
         // Compute error as the difference between observed suprise and target
         // surprise value
-        let observed_surprise = -(x.p.log2());
+        let observed_surprise = -(new.is_one().unwrap().p.log2());
         let e = observed_surprise - tau;
 
         // Update mu using the learning rate and error
         *opt_mu = Some(mu - eta * e);
 
-        x.id
+        new
     }
 
-    /// Mirostat V.2 sampling.
+    /// Mirostat V.2 sampling. Guaranteed to return a single Candidate.
     ///
     /// Time complexity is O(**max_keep**) where softmax has already been
     /// applied to n. Otherwise, it is O(n log n).
@@ -993,12 +995,12 @@ impl Candidates {
         eta: f32,
         max_keep: Option<NonZeroUsize>,
         opt_mu: &mut Option<f32>,
-    ) -> llama_token {
+    ) -> Candidates {
         if self.data.is_empty() {
             unreachable!("Class invariant violated: There must be at least one candidate.")
         }
         if self.data.len() == 1 {
-            return self.data[0].id;
+            return self;
         }
         let new = self.softmax(None);
         // mu is initialized to 2 * tau if not provided
@@ -1007,10 +1009,9 @@ impl Candidates {
             .unwrap_or(NonZeroUsize::new(100).unwrap())
             .min(new.len())
             .get();
-        let x: llama_token_data;
 
         // Truncate the words with surprise values greater than mu
-        let mut end: usize = new.len().get();
+        let mut end: usize = m;
         for (i, candidate) in new.data[..m].iter().enumerate().skip(1) {
             if candidate.p.log2() > mu {
                 end = i;
@@ -1018,17 +1019,17 @@ impl Candidates {
             }
         }
 
-        x = predict_token(rng, new.truncate(end.try_into().unwrap()));
+        let new = choose_candidate(rng, new.truncate(end.try_into().unwrap()));
 
         // Compute error as the difference between observed surprise and target
         // surprise value
-        let observed_surprise = -(x.p.log2());
+        let observed_surprise = -(new.is_one().unwrap().p.log2());
         let e = observed_surprise - tau;
 
         // Update mu using the learning rate and error
         *opt_mu = Some(mu - eta * e);
 
-        x.id
+        new
     }
 
     /// Entropy sampling.
@@ -1423,7 +1424,7 @@ mod tests {
         }
 
         let token = c.sample_token_greedy();
-        assert_eq!(token.id, 0);
+        assert_eq!(token.is_one().unwrap().id, 0);
     }
 
     #[test]
