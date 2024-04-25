@@ -19,7 +19,7 @@ mod batch;
 pub(crate) use batch::Batch;
 
 mod candidates;
-pub use candidates::{Candidates, Sorted};
+pub use candidates::{Candidates, Sorted, TokenDataArray};
 
 pub mod prompt;
 pub use prompt::{Message, Prompt, Role};

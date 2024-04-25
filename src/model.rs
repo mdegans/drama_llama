@@ -28,7 +28,7 @@ mod vocab;
 pub use vocab::Vocab;
 pub use vocab::VocabKind;
 
-use crate::{Message, Prompt};
+use crate::Prompt;
 
 /// Convert a token to it's string representation.
 ///
