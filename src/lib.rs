@@ -34,7 +34,9 @@ mod engine;
 pub use engine::Engine;
 
 mod predictor;
-pub use predictor::{CandidatePredictor, PredictOptions, TokenPredictor};
+pub use predictor::{
+    CandidatePredictor, PredictOptions, Predicted, Predictor, TokenPredictor,
+};
 
 mod probability;
 pub use probability::{InvalidProbability, Probability};

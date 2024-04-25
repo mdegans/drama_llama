@@ -31,7 +31,7 @@ use rocket::{
 
 use stringmetrics::jaccard;
 
-use drama_llama::{cli::Args, Engine, PredictOptions, VocabKind};
+use drama_llama::{cli::Args, Engine, PredictOptions, Predicted, VocabKind};
 
 #[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, rocket::UriDisplayQuery))]
@@ -353,8 +353,9 @@ async fn main() {
                 opts.n =
                     (engine.n_ctx() as usize - chunk.len()).try_into().unwrap();
 
-                let mut predictor = engine.predict_pieces(chunk, opts.clone());
-                while let Some(piece) = predictor.next() {
+                for Predicted { token, piece } in
+                    engine.predict(chunk, opts.clone())
+                {
                     if from_client.is_closed() {
                         break 'outer;
                     }
@@ -366,7 +367,7 @@ async fn main() {
                         })
                         .ok();
 
-                    completion.push(predictor.last_token().unwrap());
+                    completion.push(token);
 
                     // We only compare sequences of equal length, until the
                     // completion is the same length as the ground truth.

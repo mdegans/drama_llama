@@ -1,7 +1,7 @@
 use crate::{
     model::{Vocab, VocabKind},
     predictor::{CandidatePredictor, PiecePredictor, TokenPredictor},
-    Batch, Model, PredictOptions,
+    Batch, Model, PredictOptions, Predictor,
 };
 
 use std::{num::NonZeroUsize, path::PathBuf, sync::Mutex};
@@ -475,6 +475,22 @@ impl Engine {
     ) -> PiecePredictor<'a> {
         self.kv_cache_clear();
         PiecePredictor::new(self, tokens, options)
+    }
+
+    /// Return an iterator that predicts both token sand peices until `
+    /// tokens have been predicted, the end of context is reached, or stop
+    /// conditions are met.
+    ///
+    /// # Note
+    /// * The tokens and generated text are available from the
+    ///   [`Predictor::into_tokens_and_text`] method.
+    pub fn predict<'a>(
+        &'a mut self,
+        tokens: Vec<llama_token>,
+        options: PredictOptions,
+    ) -> Predictor<'a> {
+        self.kv_cache_clear();
+        Predictor::new(self, tokens, options)
     }
 }
 

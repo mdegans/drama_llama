@@ -523,6 +523,52 @@ impl<'engine> Into<Vec<llama_token>> for PiecePredictor<'engine> {
     }
 }
 
+/// Contains a token and the associated piece. This is a convenience struct to
+/// avoid ackward iterator usage when both the token and piece are needed.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
+pub struct Predicted {
+    pub token: llama_token,
+    pub piece: String,
+}
+
+pub struct Predictor<'engine> {
+    inner: PiecePredictor<'engine>,
+}
+
+impl<'engine> Predictor<'engine> {
+    pub fn new(
+        engine: &'engine mut Engine,
+        tokens: Vec<llama_token>,
+        options: PredictOptions,
+    ) -> Self {
+        let piece_predictor = PiecePredictor::new(engine, tokens, options);
+
+        Self {
+            inner: piece_predictor,
+        }
+    }
+
+    /// Convert into the tokens and text that have been predicted so far.
+    pub fn into_tokens_and_text(self) -> (Vec<llama_token>, String) {
+        self.inner.into_tokens_and_text()
+    }
+}
+
+impl Iterator for Predictor<'_> {
+    type Item = Predicted;
+
+    fn next(&mut self) -> Option<Predicted> {
+        let piece = self.inner.next()?;
+        let token = self.inner.last_token().unwrap();
+        Some(Predicted { token, piece })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use llama_cpp_sys_3::llama_token;
