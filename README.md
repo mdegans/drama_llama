@@ -43,6 +43,7 @@ For examples, see the `bin` folder. There are two example binaries.
 - [ ] Reworked, functional, public, candidate API
 - [ ] Grammar constraints (maybe or maybe not [`llama.cpp`] style)
 - [ ] Async streams, better parallelism with automatic batch scheduling
+- [ ] Better cache management. `llama.cpp` does not seem to manage a longest prefix cache automatically, so one will have to be written.
 - [ ] Backends other than [`llama.cpp`] (eg. [MLC](https://github.com/twiceyuan/mlc-llm-llama2), [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [Ollama](https://github.com/pepperoni21/ollama-rs))
 
 ## Known issues

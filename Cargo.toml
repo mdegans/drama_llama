@@ -1,6 +1,6 @@
 [package]
 name = "drama_llama"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "A library for language modeling and text generation."
 license-file = "LICENSE.md"
@@ -48,3 +48,8 @@ required-features = ["webchat", "cli"]
 name = "regurgitater"
 path = "bin/regurgitater/regurgitater.rs"
 required-features = ["webchat", "cli", "stats"]
+
+[package.metadata.docs.rs]
+# `cuda` will break the build on platforms without it, and it doesn't change the
+# docs anyway.
+features = ["webchat", "cli", "stats", "toml", "serde"]
