@@ -334,7 +334,6 @@ async fn main() {
                 send_prefix(
                     engine.model.tokens_to_string(chunk.iter().cloned()),
                 );
-                let mut chunk = chunk.to_vec();
                 let mut completion = Vec::with_capacity(ground_truth.len());
                 // Rare, but possible. The client can't send an empty string,
                 // but because we're splitting the text into chunks, it's
@@ -354,7 +353,7 @@ async fn main() {
                     (engine.n_ctx() as usize - chunk.len()).try_into().unwrap();
 
                 for Predicted { token, piece } in
-                    engine.predict(chunk, opts.clone())
+                    engine.predict(chunk.to_vec(), opts.clone())
                 {
                     if from_client.is_closed() {
                         break 'outer;

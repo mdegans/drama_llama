@@ -5,6 +5,9 @@
 #[cfg(feature = "cli")]
 pub mod cli;
 
+#[cfg(feature = "server")]
+pub mod server;
+
 #[cfg_attr(test, macro_use)]
 pub(crate) mod utils;
 

@@ -355,7 +355,7 @@ pub struct RepetitionOptions {
 impl Default for RepetitionOptions {
     fn default() -> Self {
         Self {
-            ignored: vec![NGram::from(13)],
+            ignored: vec![],
             penalty_max_count: NonZeroU8::new(1).unwrap(),
             ngram_min_size: NonZeroU8::new(1).unwrap(),
             ngram_max_size: NonZeroU8::new(4).unwrap(),

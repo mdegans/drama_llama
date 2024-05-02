@@ -15,8 +15,11 @@ use crate::{
     sample::{choose_candidate, SampleError},
     Probability, RepetitionOptions, SampleOptions,
 };
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq))]
+#[cfg_attr(feature = "serde", derive(rocket::serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 /// Sort state of the candidates.
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Sorted {
     /// The candidates may or may not be sorted.
     Unknown,
@@ -177,6 +180,64 @@ impl Deref for TokenDataArray<'_> {
     }
 }
 
+/// A module for serializing and deserializing sequences of `llama_token_data`
+/// structs.
+#[cfg(feature = "serde")]
+mod llama_token_data_vec_serde {
+    use super::{llama_token_data, CandidatesNewError};
+    use rocket::serde::{ser::SerializeSeq, Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(crate = "rocket::serde", remote = "llama_token_data")]
+    struct LLaMATokenDataDef {
+        id: i32,
+        logit: f32,
+        p: f32,
+    }
+
+    // This is cleaner than using a `Visitor`
+    #[derive(Serialize, Deserialize)]
+    #[serde(crate = "rocket::serde")]
+    struct LLaMATokenData(
+        #[serde(with = "LLaMATokenDataDef")] llama_token_data,
+    );
+
+    pub fn serialize<S>(
+        data: &Vec<llama_token_data>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: rocket::serde::Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(data.len()))?;
+        for &item in data {
+            seq.serialize_element(&LLaMATokenData(item))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Vec<llama_token_data>, D::Error>
+    where
+        D: rocket::serde::Deserializer<'de>,
+    {
+        let vec = Vec::<LLaMATokenData>::deserialize(deserializer)?;
+        if vec.is_empty() {
+            return Err(rocket::serde::de::Error::custom(
+                CandidatesNewError::NotEnoughCandidates(0),
+            ));
+        }
+        Ok(vec.into_iter().map(|LLaMATokenData(t)| t).collect())
+    }
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(rocket::serde::Serialize, rocket::serde::Deserialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 /// A container for candidate tokens.
 ///
 /// It is guaranteed, when not using unsafe methods, that:
@@ -184,11 +245,14 @@ impl Deref for TokenDataArray<'_> {
 pub struct Candidates {
     /// Cached state of whether the candidates are sorted, by what, and to what
     /// index. This is used to avoid unnecessary sorting.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) sort_state: Sorted,
     /// A cached state whether, and to what index, the softmax has been applied.
     /// This does not guarantee that the candidates are sorted by logit.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) softmax_applied_to: Option<NonZeroUsize>,
     /// The actual candidate tokens.
+    #[cfg_attr(feature = "serde", serde(with = "llama_token_data_vec_serde"))]
     pub(crate) data: Vec<llama_token_data>,
 }
 
@@ -1527,5 +1591,27 @@ mod tests {
     #[test]
     fn test_sample_tail_free() {
         todo!();
+    }
+
+    #[cfg(all(feature = "serde", feature = "toml"))]
+    #[test]
+    fn test_serde() {
+        let n: usize = 10;
+        let mut c = Candidates::new(n).unwrap();
+
+        for i in 1..n + 1 {
+            c.data[i - 1].logit = -(i as f32 / n as f32);
+            c.data[i - 1].p = i as f32 / n as f32;
+        }
+
+        let toml = toml::to_string(&c).unwrap();
+        let c2: Candidates = toml::from_str(&toml).unwrap();
+
+        assert_eq!(c.len(), c2.len());
+        for (a, b) in c.iter().zip(c2.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_approx_eq!(a.logit, b.logit, 1e-5);
+            assert_approx_eq!(a.p, b.p, 1e-5);
+        }
     }
 }

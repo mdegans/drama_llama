@@ -18,6 +18,7 @@ pub struct Args {
     #[arg(short, long, default_value_t = 1024)]
     pub context: u32,
     /// Disable on-by-default GPU acceleration
+    // TODO: make this an Option<u8> to allow for multiple GPUs.
     #[arg(short, long, default_value_t = false)]
     pub no_gpu: bool,
     /// Vocabulary

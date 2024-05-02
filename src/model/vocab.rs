@@ -64,6 +64,12 @@ const LLAMA_2_ALLOW_RANGES: &[std::ops::RangeInclusive<llama_token>] = &[
 ];
 
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(
+    feature = "serde",
+    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+)]
+#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VocabKind {
     /// All tokens and control characters are allowed. This is not recommended,

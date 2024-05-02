@@ -820,6 +820,8 @@ impl Drop for Model {
 mod tests {
     use llama_cpp_sys_3::llama_vocab_type_LLAMA_VOCAB_TYPE_BPE;
 
+    use crate::Message;
+
     use super::*;
 
     #[test]

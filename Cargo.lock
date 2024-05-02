@@ -408,6 +408,7 @@ dependencies = [
  "derive_more",
  "dirs",
  "llama-cpp-sys-3",
+ "log",
  "markdown",
  "num",
  "partial_sort",
