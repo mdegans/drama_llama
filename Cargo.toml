@@ -49,6 +49,13 @@ name = "regurgitater"
 path = "bin/regurgitater/regurgitater.rs"
 required-features = ["webchat", "cli", "stats"]
 
+
+[[bin]]
+name = "weave"
+path = "bin/weave/weave.rs"
+required-features = ["webchat", "cli"]
+
+
 [package.metadata.docs.rs]
 # `cuda` will break the build on platforms without it, and it doesn't change the
 # docs anyway.

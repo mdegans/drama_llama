@@ -30,7 +30,7 @@ For examples, see the `bin` folder. There are two example binaries.
 ## Roadmap
 
 - [x] Candidate iterator with fine-grained control over sampling
-- [ ] Examples for new Candidate API.
+- [x] Examples for new Candidate API.
 - [x] Support for chaining sampling methods using `SampleOptions`. `mode` will
       become `modes` and applied one after another until only a single
       Candidate token remains.
