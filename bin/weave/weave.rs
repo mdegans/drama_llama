@@ -1,11 +1,10 @@
+use std::num::NonZeroU8;
 use std::{io::Write, path::PathBuf};
 
 use clap::Parser;
-use drama_llama::prompt::Format;
-use drama_llama::{
-    data::StopWords, prompt, Engine, NGram, PredictOptions, Prompt,
-    RepetitionOptions, SamplingMode,
-};
+use drama_llama::data::StopWords;
+use drama_llama::{data::banned, PredictOptions};
+use drama_llama::{Engine, Model, Predicted, SampleOptions};
 
 use llama_cpp_sys_3::llama_token;
 use rocket::fs::{relative, FileServer};
@@ -23,11 +22,38 @@ use rocket::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(crate = "rocket::serde")]
-struct Model {
-    #[serde(default)]
-    format: Format,
+struct EnabledEvents {
+    /// Whether to send tokens (more secure).
+    tokens: bool,
+    /// Whether to send pieces (less secure).
+    ///
+    /// NOTE: It is possible to reconstruct the text from the packet sizes when
+    /// pieces are sent, especially if the model is known.
+    pieces: bool,
+    /// Whether to send paragraphs.
+    paragraphs: bool,
+}
+
+impl Default for EnabledEvents {
+    fn default() -> Self {
+        Self {
+            // FIXME: tokenization in the client is not yet implemented.
+            tokens: false,
+            pieces: true,
+            paragraphs: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "rocket::serde")]
+struct ModelData {
+    /// Filename within the model path.
     filename: String,
-    description: String,
+    /// Description of the model. If this is blank, it will be filled in with
+    /// the model's metadata.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,10 +62,8 @@ struct Config {
     /// Active story. By default, this is an empty story.
     #[serde(default)]
     story: Story,
-    /// The name of the human author.
-    human: String,
-    /// The model used to generate the text.
-    model: String,
+    /// The model used to generate text.
+    model: ModelData,
 }
 
 impl Config {
@@ -51,105 +75,194 @@ impl Config {
     }
 }
 
-/// Who authored a piece of text.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(crate = "rocket::serde")]
-enum Author {
-    Human,
-    Model,
-}
-
-/// A fragment of a [`Paragraph`]. The server handles detokenization (less
-/// secure because with the text length, it's possible to infer the generated
-/// text).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(crate = "rocket::serde")]
-struct Piece {
-    text: String,
-    author: Author,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(crate = "rocket::serde")]
-/// A token. The client handles detokenization (more secure).
-struct Token {
-    token: llama_token,
-    author: Author,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, derive_more::From)]
 #[serde(crate = "rocket::serde")]
 /// A token or a piece.
 enum TokenOrPiece {
-    Token(Token),
-    Piece(Piece),
+    Token(llama_token),
+    Piece(String),
 }
 
 /// A paragraph in a branching [`Story`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(crate = "rocket::serde")]
 struct Paragraph {
-    pieces: Vec<TokenOrPiece>,
+    pieces: Vec<(u8, TokenOrPiece)>,
     children: Vec<Paragraph>,
 }
 
 impl Paragraph {
-    fn new() -> Self {
-        Self {
-            pieces: Vec::new(),
-            children: Vec::new(),
-        }
-    }
-
-    fn add_to<T>(&mut self, t: T)
+    fn extend<It, T>(&mut self, author_id: u8, t: It)
     where
+        It: IntoIterator<Item = T>,
         T: Into<TokenOrPiece>,
     {
-        self.pieces.push(t.into());
+        self.pieces
+            .extend(t.into_iter().map(|piece| (author_id, piece.into())));
     }
 
-    fn add_child(&mut self) -> &mut Paragraph {
-        self.children.push(Paragraph::new());
-        self.children.last_mut().unwrap()
-    }
-
-    fn push_child(&mut self, child: Paragraph) {
+    fn push_child(&mut self, child: Paragraph) -> usize {
         self.children.push(child);
+        self.children.len() - 1
     }
 
-    fn remove_child(&mut self, index: usize) -> Option<Paragraph> {
-        if self.children.get(index).is_none() {
-            return None;
+    /// Apply a function to all paragraphs in self and all children.
+    fn for_all<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut Paragraph),
+    {
+        f(self);
+
+        for child in &mut self.children {
+            child.for_all(&mut f);
         }
-        Some(self.children.remove(index))
     }
 
-    fn is_leaf(&self) -> bool {
-        self.children.is_empty()
+    /// Apply a function to all paragraphs along a path. If an index is out of
+    /// bounds, the function will terminate at that point.
+    fn for_path<F>(&mut self, path: &[usize], mut f: F)
+    where
+        F: FnMut(&mut Paragraph),
+    {
+        let mut node = self;
+
+        f(node);
+
+        for &index in path {
+            node = match node.children.get_mut(index) {
+                Some(node) => node,
+                None => return,
+            };
+            f(node);
+        }
     }
 
-    fn clear_pieces(&mut self) {
-        self.pieces.clear();
-    }
+    /// Render the paragraph to a writable.
+    fn render<W>(&self, model: &Model, w: &mut W) -> std::fmt::Result
+    where
+        W: std::fmt::Write,
+    {
+        for (_, piece) in &self.pieces {
+            match piece {
+                TokenOrPiece::Token(token) => {
+                    write!(w, "{}", model.token_to_piece(*token))?;
+                }
+                TokenOrPiece::Piece(piece) => {
+                    write!(w, "{}", piece)?;
+                }
+            }
+        }
 
-    fn clear_children(&mut self) {
-        self.children.clear();
-    }
-
-    fn clear(&mut self) {
-        self.pieces.clear();
-        self.children.clear();
+        Ok(())
     }
 }
 
-/// A branching story.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A branching story. The tree can diverge but not converge (for now).
+// TODO: use petgraph to allow for converging paths.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(crate = "rocket::serde")]
 struct Story {
+    title: String,
+    authors: Vec<String>,
     root: Paragraph,
+    #[serde(skip)]
+    active: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
+#[serde(crate = "rocket::serde")]
+#[error("There are too many authors in this story (max 256).")]
+struct AuthorsFull;
+
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
+#[serde(crate = "rocket::serde")]
+#[error("Invalid author index: {index}.")]
+struct InvalidAuthor {
+    index: u8,
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, thiserror::Error, derive_more::From,
+)]
+#[serde(crate = "rocket::serde")]
+#[error("Selected path does not exist: {path:?}.")]
+struct InvalidPath {
+    path: Vec<usize>,
 }
 
 impl Story {
+    #[cfg(test)]
+    fn new(title: String) -> Self {
+        Self {
+            title,
+            authors: Vec::new(),
+            root: Paragraph::default(),
+            active: Vec::new(),
+        }
+    }
+
+    /// Add an author to the story. Returns the author's index.
+    fn add_author(&mut self, author: String) -> Result<u8, AuthorsFull> {
+        if self.authors.len() >= 256 {
+            return Err(AuthorsFull);
+        }
+
+        self.authors.push(author);
+        Ok(self.authors.len() as u8 - 1)
+    }
+
+    /// Set active paragraph. An empty path selects the root.
+    fn select(&mut self, path: &[usize]) -> Result<(), InvalidPath> {
+        if self.get(path).is_none() {
+            return Err(path.to_vec().into());
+        }
+        self.active.clear();
+        self.active.extend_from_slice(path);
+        Ok(())
+    }
+
+    /// Get the active paragraph.
+    fn active(&self) -> &Paragraph {
+        self.get(&self.active).unwrap()
+    }
+
+    /// Get the active paragraph mutably.
+    fn active_mut(&mut self) -> &mut Paragraph {
+        let active = self.active.clone();
+        self.get_mut(&active).unwrap()
+    }
+
+    /// Extend the active paragraph with an iterable of pieces or tokens.
+    fn extend<It, T>(
+        &mut self,
+        author_id: u8,
+        t: It,
+    ) -> Result<(), InvalidAuthor>
+    where
+        It: IntoIterator<Item = T>,
+        T: Into<TokenOrPiece>,
+    {
+        if self.authors.get(author_id as usize).is_none() {
+            return Err(InvalidAuthor { index: author_id });
+        }
+
+        self.active_mut().extend(author_id, t);
+
+        Ok(())
+    }
+
+    /// Append a new child paragraph to the active paragraph. Set it as the
+    /// active path.
+    fn push_paragraph(&mut self, paragraph: Paragraph) {
+        let index = self.active_mut().push_child(paragraph);
+        self.active.push(index);
+    }
+
+    /// Add a new paragraph to the story. Set it as the active path.
+    fn new_paragraph(&mut self) {
+        self.push_paragraph(Paragraph::default());
+    }
+
     fn get(&self, path: &[usize]) -> Option<&Paragraph> {
         let mut node = &self.root;
         for &index in path {
@@ -165,60 +278,128 @@ impl Story {
         }
         Some(node)
     }
-}
 
-impl Default for Story {
-    fn default() -> Self {
-        Self {
-            root: Paragraph::new(),
-        }
+    /// Render the story along the active path.
+    fn render(&mut self, model: &Model) -> String {
+        let active = self.active.clone();
+        self.render_path(&active, model)
+    }
+
+    /// Render all branches of the story to string.
+    fn render_all(&mut self, model: &Model) -> String {
+        let mut s = self.title.clone();
+
+        self.root.for_all(|paragraph| {
+            s.push_str("\n\n");
+            paragraph.render(model, &mut s).unwrap();
+        });
+
+        s
+    }
+
+    /// Render a specific path of the story to string.
+    fn render_path(&mut self, path: &[usize], model: &Model) -> String {
+        let mut s = self.title.clone();
+
+        self.root.for_path(path, |node| {
+            s.push_str("\n\n");
+            node.render(model, &mut s).unwrap();
+        });
+
+        s
     }
 }
 
 /// Client Event
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, derive_more::From)]
 #[serde(crate = "rocket::serde")]
 enum Response {
-    /// Client should render the story. Any existing story should be cleared.
-    StoryLoaded { story: Story },
-    /// A piece has been generated and should be appended to the active
-    /// paragraph.
-    PieceGenerated { piece: Piece },
-    /// A full paragraph has been generated. This should replace the active
-    /// paragraph.
-    ParagraphGenerated { paragraph: Paragraph },
+    /// Enabled events.
+    EnabledEvents { events: EnabledEvents },
+    /// Active path.
+    Active { path: Vec<usize> },
+    /// A story has been loaded or reloaded.
+    Story { story: Story },
+    /// A piece has been generated.
+    Piece { piece: String },
+    /// A token has been generated.
+    Token { token: llama_token },
+    /// A full paragraph has been generated.
+    Paragraph { paragraph: Paragraph },
+    /// Prediction options updated or requested.
+    PredictOptions { opts: PredictOptions },
     /// An error occurred.
     Error { error: Error },
+}
+
+const fn nz_one() -> NonZeroU8 {
+    match NonZeroU8::new(1) {
+        Some(n) => n,
+        None => panic!("NonZeroU8::new(1) failed"),
+    }
 }
 
 /// Client Request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(crate = "rocket::serde")]
 enum Request {
-    /// Request the story to be loaded. User provides the story. When it is
-    /// loaded, the client will receive a `StoryLoaded` response with a copy of
-    /// the story.
+    /// Get active path.
+    GetActivePath,
+    /// Get the story.
+    GetStory,
+    /// Get the prediction options.
+    GetPredictOptions,
+    /// Get the enabled events.
+    GetEnabledEvents,
+    /// Create a new paragraph at the active path.
+    NewParagraph,
+    /// Set enabled events.
+    SetEnabledEvents { events: EnabledEvents },
+    /// Set the prediction options.
+    SetPredictOptions { opts: PredictOptions },
+    /// Request the story to be loaded.
     LoadStory { story: Story },
-    /// Request a continuation of a leaf paragraph.
+    /// Generate one or more new paragraphs. Does not change the active path.
     Generate {
-        /// Path to the paragraph. If it is a leaf the server will continue the
-        /// paragraph. If it is not a leaf, the server will add a new paragraph
-        /// make it active, and continue from there.
-        path: Vec<usize>,
-        /// Prediction options.
-        opts: PredictOptions,
+        /// Optional path to continue from. If this is `None`, the active path
+        /// is used.
+        #[serde(default)]
+        path: Option<Vec<usize>>,
+        /// Number of new generated paragraphs.
+        #[serde(default = "nz_one")]
+        n: NonZeroU8,
     },
-    /// Add a new child [`Paragraph`] to `index`.
-    AddParagraph { text: String, index: Vec<usize> },
+    /// Append content to the active paragraph.
+    Append { author: u8, text: String },
+    /// Replace the paragraph at `path` with a new one. If `path` is `None`,
+    /// the active path is used. Does not change the active path.
+    Replace {
+        paragraph: Paragraph,
+        path: Option<Vec<usize>>,
+    },
+    /// Add a new child [`Paragraph`] to `path`. Sets it as the active path.
+    /// If `path` is `None`, the active path is used.
+    Add {
+        paragraph: Paragraph,
+        path: Option<Vec<usize>>,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, thiserror::Error, derive_more::From,
+)]
 #[serde(crate = "rocket::serde")]
 enum RequestErrorReason {
     #[error("The server is busy. Handle by retrying later.")]
     Busy,
     #[error("The request contains prohibited content: `{content}`.")]
     Prohibited { content: String },
+    #[error("{error}")]
+    InvalidPath { error: InvalidPath },
+    #[error("{error}")]
+    AuthorsFull { error: AuthorsFull },
+    #[error("{error}")]
+    InvalidAuthor { error: InvalidAuthor },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
@@ -313,70 +494,53 @@ async fn tos() -> String {
     markdown::to_html(drama_llama::TOS)
 }
 
-/// Input sanitization. In the case a message is rejected, `Err(Message)` is
-/// returned with a rejection message.
-///
-/// We check for:
-/// - Prompt injection. The role of an input message cannot be `Agent` and the
-///   message text cannot contain the agent's message prefix.
-/// - Banned personas. The input may not contain any of the [`BANNED_PERSONAS`].
-fn sanitize_input(
-    prompt: &Prompt,
-    format: prompt::Format,
-    mut msg: Request,
-) -> Result<Request, Request> {
-    if msg
-        .text
-        .to_lowercase()
-        .contains(&format!("{}:", prompt.agent.to_lowercase()))
-        || matches!(msg.role, Role::Agent)
-    {
-        return Err(Message {
-            role: Role::System,
-            text: "You may not impersonate the agent.".to_string(),
-        });
-    }
-
-    // We do allow the system role, but only for the transcript. Coming from the
-    // client, the system role is not allowed.
-    if msg.text.to_lowercase().contains("System:")
-        || matches!(msg.role, Role::System)
-    {
-        return Err(Message {
-            role: Role::System,
-            text: "You may not impersonate System.".to_string(),
-        });
-    }
-
-    // This is a naive check.
-    // TODO: Use a more sophisticated method to detect personas.
-    for persona in BANNED_PERSONAS {
-        if msg.text.to_lowercase().contains(&persona.to_lowercase()) {
-            // There really isn't a good reason to let any of these personas
-            // be a topic of discussion. There are too many ways for users to
-            // get the agent to say something inappropriate. Microsoft, Google,
-            // and OpenAI have had to deal with this, so we should learn from
-            // their mistakes.
-            return Err(Message {
-                role: Role::System,
-                text: format!("Forbidden topic or persona: {}", persona),
+fn validate_text(text: &str) -> Result<(), RequestErrorReason> {
+    for regex_str in banned::ENGLISH_WORDS {
+        let regex = regex::Regex::new(regex_str).unwrap();
+        if regex.is_match(text) {
+            return Err(RequestErrorReason::Prohibited {
+                content: format!("banned regex match: {regex_str}"),
             });
         }
     }
 
-    // Search for special tags that should not be allowed.
-    for tag in format.special_tags() {
-        if msg.text.contains(tag) {
-            return Err(Message {
-                role: Role::System,
-                text: format!("Forbidden tag: {}", tag),
-            });
+    Ok(())
+}
+
+/// Input sanitization. Checking for banned words and other prohibited content.
+fn validate_request(
+    model: &Model,
+    mut request: Request,
+) -> Result<Request, Error> {
+    match &mut request {
+        Request::LoadStory { story } => {
+            match validate_text(&story.render_all(model)) {
+                Ok(_) => Ok(request),
+                Err(reason) => Err(Error::Request { request, reason }),
+            }
         }
+        Request::Append { text, .. } => match validate_text(&text) {
+            Ok(_) => Ok(request),
+            Err(reason) => Err(Error::Request { request, reason }),
+        },
+        Request::Replace { paragraph, .. } | Request::Add { paragraph, .. } => {
+            let mut text = String::new();
+            paragraph.render(model, &mut text).unwrap();
+
+            match validate_text(&text) {
+                Ok(_) => Ok(request),
+                Err(reason) => Err(Error::Request { request, reason }),
+            }
+        }
+        Request::Generate { .. }
+        | Request::GetActivePath
+        | Request::NewParagraph
+        | Request::GetEnabledEvents
+        | Request::SetEnabledEvents { .. }
+        | Request::GetPredictOptions
+        | Request::SetPredictOptions { .. }
+        | Request::GetStory => Ok(request),
     }
-
-    msg.text = msg.text.replace(&prompt.agent, "you").replace(":", " - ");
-
-    Ok(msg)
 }
 
 /// Launch the rocket server.
@@ -392,182 +556,151 @@ async fn main() -> () {
     let to_client_clone = to_client.clone();
     let worker = rocket::tokio::task::spawn_blocking(move || {
         let mut engine = Engine::from_cli(args.common, None).unwrap();
+        let mut config = Config::load(&args.config).unwrap();
+        let mut events = EnabledEvents::default();
+        let mut predict_opts = PredictOptions::default();
+        predict_opts.sample_options = SampleOptions::story_writing();
 
-        let config = Config::load(&args.config).unwrap();
+        // Model and language specific options. In the future, a helper
+        // function will be added to the `PredictOptions` struct to handle this.
+        let mut predict_opts = predict_opts.add_model_stops(&engine.model);
+        predict_opts.sample_options.repetition =
+            predict_opts.sample_options.repetition.take().map(|opts| {
+                // We ignore stopwords for the purposes of repetition penalty
+                // since we don't want to penalize the most common words. In
+                // the future, we may apply a partial penalty to stopwords.
+                opts.ignore_stopwords(StopWords::English, &engine.model)
+            });
 
-        // Check for banned personas.
-        // FIXME: This is O(n^2) and should be optimized. It's not a big deal
-        // but as the list grows it may slow down startup.
-        for persona in BANNED_PERSONAS {
-            // Check the agent's name.
-            if config
-                .agent
-                .to_lowercase()
-                .contains(&persona.to_lowercase())
-            {
-                // In the future we might want to send the client a message
-                // instead of panicking.
-                panic!("Banned simulacrum: {}", persona);
-            }
-
-            // Check the system prompt.
-            if let Some(setting) = &config.setting {
-                if setting.to_lowercase().contains(&persona.to_lowercase()) {
-                    panic!("Setting cannot contain: {}", persona);
+        let mut get_model_author_id = || {
+            let model_desc = engine.model.desc();
+            for (i, author) in config.story.authors.iter().enumerate() {
+                if author == &model_desc {
+                    return i as u8;
                 }
             }
-        }
-
-        let prompt_format = prompt::Format::from_model(&engine.model)
-            .unwrap_or(Format::Unknown);
-        let mut prompt_string = String::new();
-        config.format(prompt_format, &mut prompt_string).unwrap();
-        dbg!(&prompt_string);
-
-        let mut opts = PredictOptions::default()
-            // We stop at any of the model's stop tokens.
-            .add_model_stops(&engine.model)
-            // As well as the username prompt for the human.
-            .add_stop(config.human_prefix(prompt_format));
-
-        // Ignore common English stopwords for the repetition penalty.
-        let mut ignored: Vec<NGram> = if args.ignore_stopwords {
-            StopWords::English
-                .words()
-                .iter()
-                .map(|word| {
-                    let tokens = engine.model.tokenize(word, false);
-                    NGram::try_from(tokens.as_slice()).unwrap()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // Ignore the human and agent first names, as well as the text in
-        // between messages (e.g. "\nAlice:") These occur frequently in the
-        // text, and shouldn't be penalized.
-        ignored.extend(
-            [config.human.as_str(), config.agent.as_str()]
-                .iter()
-                .map(|name| {
-                    let tokens =
-                        engine.model.tokenize(&format!("\n{}:", name), false);
-                    NGram::try_from(tokens.as_slice()).unwrap()
-                }),
-        );
-
-        opts.sample_options.repetition =
-            Some(RepetitionOptions::default().set_ignored(ignored));
-        opts.sample_options.modes = vec![SamplingMode::LocallyTypical {
-            p: 0.8.try_into().unwrap(),
-            min_keep: 1.try_into().unwrap(),
-        }];
-
-        let mut tokens = engine.model.tokenize(&prompt_string, false);
-        if tokens.len() > engine.n_ctx() as usize {
-            let msg = Message {
-                role: Role::System,
-                text: format!(
-                    "The prompt .toml is too long ({} tokens). It must be less than {} tokens.",
-                    tokens.len(),
-                    engine.n_ctx()
-                ),
-            };
-
-            eprintln!("dittomancer: {}", msg.text);
-
-            to_client.send(msg).ok();
-            return;
-        }
-
-        while let Some(msg) = from_client.blocking_recv() {
-            // Check message text is not empty
-            if msg.text.is_empty() {
-                continue;
+            match config.story.add_author(model_desc) {
+                Ok(id) => id,
+                Err(AuthorsFull) => {
+                    // FIXME: handle this more gracefully.
+                    panic!("Cannot add model author because: {AuthorsFull}")
+                }
             }
+        };
+        // This is mutable because we may allow changing the model in the future.
+        let model_author_id = get_model_author_id();
 
-            // Sanitize the input.
-            let msg = match sanitize_input(&config, prompt_format, msg) {
-                Ok(msg) => msg,
-                Err(msg) => {
-                    // In the future we might also want to warn the agent that
-                    // the client has attempted, for example, to impersonate the
-                    // agent. This context should be hidden from the client.
-                    to_client.send(msg).ok();
+        while let Some(request) = from_client.blocking_recv() {
+            let request = match validate_request(&engine.model, request) {
+                Ok(request) => request,
+                Err(error) => {
+                    to_client.send(error.into()).ok();
                     continue;
                 }
             };
 
-            // Tokenize and append the message to the tokens, ending with the
-            // agent's name to ensure the model knows who to respond as.
-            let text = format!("{}\n{}:", &msg.text, &config.agent);
-            tokens.extend(engine.model.tokenize(&text, false));
+            match request {
+                Request::Generate { path, n } => {
+                    if let Some(ref path) = path {
+                        match config.story.select(path) {
+                            Ok(_) => (),
+                            Err(InvalidPath { path }) => {
+                                to_client
+                                    .send(Error::Request {
+                                        request: Request::Generate { path: Some(path.clone()), n },
+                                        reason:
+                                            RequestErrorReason::InvalidPath {
+                                                error: InvalidPath { path },
+                                            },
+                                    }.into())
+                                    .ok();
+                                continue;
+                            }
+                        }
+                    }
+                    let path = path.unwrap_or(config.story.active.clone());
+                    let text = config.story.render(&engine.model);
+                    let tokens = engine.model.tokenize(&text, false);
 
-            // Echo the message back to the client.
-            // FIXME: This should be elsewhere, like in the post handler. As it
-            // stands, the client won't see the message if the engine is busy
-            // generating a response.
-            to_client.send(msg).ok();
+                    for _ in 0..n.get() {
+                        let mut predictor = engine
+                            .predict(tokens.clone(), predict_opts.clone());
 
-            let mut predictor = engine.predict_pieces(tokens, opts.clone());
+                        while let Some(Predicted { piece, token }) =
+                            predictor.next()
+                        {
+                            if events.pieces {
+                                to_client.send(Response::Piece { piece }).ok();
+                            }
+                            if events.tokens {
+                                to_client.send(Response::Token { token }).ok();
+                            }
+                        }
 
-            while let Some(_) = predictor.next() {
-                if from_client.is_closed() {
-                    return;
+                        // because we might stop in the middle of a token, we need
+                        // to tokenize and detokenize the text to get the correct
+                        // pieces.
+                        let text = predictor.into_text();
+                        let tokens = engine.model.tokenize(&text, false);
+                        let pieces = engine.model.tokens_to_pieces(tokens);
+
+                        // Add the generated Paragraph to the story.
+                        config.story.select(&path).unwrap();
+                        config.story.new_paragraph();
+                        config.story.extend(model_author_id, pieces).unwrap();
+                        if events.paragraphs {
+                            to_client
+                                .send(Response::Paragraph {
+                                    paragraph: config.story.active().clone(),
+                                })
+                                .ok();
+                        }
+                    }
                 }
-            }
-
-            // The predictor automatically collects, since this is required for
-            // prediction and stop criteria. When we're done, we can extract the
-            // tokens and text. The predictor can, of course, also yield pieces
-            // directly for use with Rust's iterator methods.
-            let (mut generated, mut text) = predictor.into_tokens_and_text();
-
-            // This is a bit ackward, but avoids reallocation of the tokens
-            // since they are moved into the predictor when `predict_pieces` is
-            // called and get them back with `into_tokens_and_text`. Since we
-            // need to bind the tokens to the `tokens` variable but can't do so
-            // directly, we call them `generated` and swap with `tokens` and
-            // this works. If we use `tokens` Rust complains about a move
-            // earlier in the loop since `let` binds a new variable.
-            tokens = generated;
-
-            // TODO: Find a prettier solution to the above. The API is flexible
-            // enough that we can probably find a better way to do this.
-
-            if let Some(text) =
-                text.strip_suffix(&format!("\n{}:", &config.human))
-            {
-                // The model has generated a complete agent response, ending
-                // with the human's prefix. We can send this to the client.
-                to_client
-                    .send(Message {
-                        text: text.to_string(),
-                        role: Role::Agent,
-                    })
-                    .ok();
-            } else {
-                // Newline will end generation. We don't want to allow
-                // multi-line agent responses.
-                while text.ends_with(&['\n', ' ', '\t']) {
-                    text.pop();
+                Request::GetEnabledEvents => {
+                    to_client.send(events.clone().into()).ok();
                 }
-
-                if !text.ends_with(&['.', '!', '?']) {
-                    // Incomplete sentence. We should add an ellipsis. Likely
-                    // the model ran out of tokens.
-                    let ellipses = engine.model.tokenize("...", false);
-                    tokens.extend(ellipses);
-                    text.push_str("...");
+                Request::SetEnabledEvents { events: new_events } => {
+                    events = new_events;
+                    to_client.send(events.clone().into()).ok();
                 }
-
-                to_client
-                    .send(Message {
-                        text,
-                        role: Role::Agent,
-                    })
-                    .ok();
+                Request::GetActivePath => {
+                    to_client.send(config.story.active.clone().into()).ok();
+                }
+                Request::GetStory => {
+                    to_client.send(config.story.clone().into()).ok();
+                }
+                Request::GetPredictOptions => {
+                    to_client.send(predict_opts.clone().into()).ok();
+                }
+                Request::SetPredictOptions { opts } => {
+                    predict_opts = opts;
+                    to_client.send(predict_opts.clone().into()).ok();
+                }
+                Request::LoadStory { story } => {
+                    config.story = story;
+                    to_client.send(config.story.clone().into()).ok();
+                }
+                Request::Append { author, text } => {
+                    let tokens = engine.model.tokenize(&text, false);
+                    let pieces = engine.model.tokens_to_pieces(tokens);
+                    config.story.extend(author, pieces).unwrap();
+                }
+                Request::Replace { paragraph, path } => {
+                    let path =
+                        path.unwrap_or_else(|| config.story.active.clone());
+                    *config.story.get_mut(&path).unwrap() = paragraph;
+                }
+                Request::Add { paragraph, path } => {
+                    let path =
+                        path.unwrap_or_else(|| config.story.active.clone());
+                    config.story.push_paragraph(paragraph);
+                    config.story.select(&path).unwrap();
+                }
+                Request::NewParagraph => {
+                    config.story.new_paragraph();
+                    to_client.send(config.story.active().clone().into()).ok();
+                }
             }
         }
     });
@@ -591,4 +724,37 @@ async fn main() -> () {
     // sender will never be dropped and the worker will never finish.
     drop(rocket);
     worker.await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{Engine, Story};
+
+    #[test]
+    fn test_paragraph() {
+        let mut story = Story::new("Hello, world!".to_string());
+        let engine = Engine::from_path(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf"),
+        )
+        .unwrap();
+
+        const ALICE_MSG: &str = "Hello, Bob!";
+        const BOB_MSG: &str = "Hello, Alice!";
+
+        assert_eq!(story.add_author("Alice".to_string()).unwrap(), 0);
+        assert_eq!(story.add_author("Bob".to_string()).unwrap(), 1);
+
+        story
+            .extend(0, engine.model.tokenize(ALICE_MSG, false))
+            .unwrap();
+        story.new_paragraph();
+        story
+            .extend(1, engine.model.tokenize(BOB_MSG, false))
+            .unwrap();
+
+        let rendered = story.render(&engine.model);
+        assert_eq!(rendered, "Hello, world!\n\nHello, Bob!\n\nHello, Alice!");
+    }
 }

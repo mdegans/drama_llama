@@ -47,8 +47,7 @@ impl Banned {
 /// These are ugly words. They are included so that they are not generated and
 /// there is no other way to prevent them from being generated. To allow their
 /// generation would be worse.
-#[cfg(test)]
-pub(crate) const ENGLISH_WORDS: &[&str] = &[
+pub const ENGLISH_WORDS: &[&str] = &[
     "faggot",
     "jigaboo",
     r#"nigg\w{1,16}"#,

@@ -559,6 +559,11 @@ impl<'engine> Predictor<'engine> {
     pub fn into_tokens_and_text(self) -> (Vec<llama_token>, String) {
         self.inner.into_tokens_and_text()
     }
+
+    /// Convert into text that has been predicted so far.
+    pub fn into_text(self) -> String {
+        self.inner.into_text()
+    }
 }
 
 impl Iterator for Predictor<'_> {

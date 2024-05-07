@@ -42,6 +42,38 @@ impl SampleOptions {
             repetition: None,
         }
     }
+
+    /// Best available chat settings - creative mode.
+    pub fn chat_creative() -> Self {
+        Self {
+            modes: vec![SamplingMode::LocallyTypical {
+                p: 0.25.try_into().unwrap(),
+                min_keep: NonZeroUsize::new(1).unwrap(),
+            }],
+            repetition: RepetitionOptions::default().into(),
+        }
+    }
+
+    /// Best available chat settings - precise mode.
+    pub fn chat_precise() -> Self {
+        Self {
+            modes: vec![SamplingMode::LocallyTypical {
+                p: 0.95.try_into().unwrap(),
+                min_keep: NonZeroUsize::new(1).unwrap(),
+            }],
+            repetition: RepetitionOptions::default().into(),
+        }
+    }
+
+    /// Best available story writing settings.
+    pub fn story_writing() -> Self {
+        Self::chat_creative()
+    }
+
+    /// Best available summarization settings.
+    pub fn summarization() -> Self {
+        Self::chat_precise()
+    }
 }
 
 #[cfg_attr(
@@ -355,9 +387,9 @@ pub struct RepetitionOptions {
 impl Default for RepetitionOptions {
     fn default() -> Self {
         Self {
-            ignored: vec![NGram::from(13)],
+            ignored: vec![],
             penalty_max_count: NonZeroU8::new(1).unwrap(),
-            ngram_min_size: NonZeroU8::new(1).unwrap(),
+            ngram_min_size: NonZeroU8::new(2).unwrap(),
             ngram_max_size: NonZeroU8::new(4).unwrap(),
             penalty_repeat: 1.15,
             penalty_freq: 0.0,

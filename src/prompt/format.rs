@@ -26,7 +26,7 @@ pub mod llama3 {
 }
 
 /// [`Format`] for a [`Prompt`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[cfg_attr(test, derive(PartialEq))]
 #[cfg_attr(all(test, feature = "webchat"), derive(rocket::UriDisplayQuery))]
 #[cfg_attr(
@@ -41,6 +41,7 @@ pub mod llama3 {
 )]
 pub enum Format {
     /// Unknown model. We will attempt to get the format from the model.
+    #[default]
     Unknown,
     /// LLaMA foundation model.
     LLaMA,
@@ -99,6 +100,7 @@ impl Format {
             bos,
             eos,
         ) {
+            // This is because some llama3 models on HF have bad metadata
             ("128256", "28672", "8", 128000, 128001) => Some(Self::LLaMA3),
             _ => None,
         }
