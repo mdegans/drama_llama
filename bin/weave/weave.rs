@@ -607,7 +607,10 @@ async fn main() -> () {
                             Err(InvalidPath { path }) => {
                                 to_client
                                     .send(Error::Request {
-                                        request: Request::Generate { path: Some(path.clone()), n },
+                                        request: Request::Generate {
+                                            path: Some(path.clone()),
+                                            n,
+                                        },
                                         reason:
                                             RequestErrorReason::InvalidPath {
                                                 error: InvalidPath { path },
@@ -637,9 +640,9 @@ async fn main() -> () {
                             }
                         }
 
-                        // because we might stop in the middle of a token, we need
-                        // to tokenize and detokenize the text to get the correct
-                        // pieces.
+                        // because we might stop in the middle of a token, we
+                        // need to tokenize and detokenize the text to get the
+                        // correct pieces.
                         let text = predictor.into_text();
                         let tokens = engine.model.tokenize(&text, false);
                         let pieces = engine.model.tokens_to_pieces(tokens);
