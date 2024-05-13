@@ -38,6 +38,8 @@ pub enum NewError {
     Context,
 }
 
+static_assertions::assert_impl_all!(NewError: Send, Sync);
+
 /// Possible errors when calling [`Engine::decode`].
 #[derive(Error, Debug)]
 pub enum DecodeError {
@@ -46,6 +48,8 @@ pub enum DecodeError {
     #[error("`llama_decode` returned an error code: {code}")]
     ErrorCode { code: i32 },
 }
+
+static_assertions::assert_impl_all!(DecodeError: Send, Sync);
 
 /// An `Engine` encompasses everything needed to run inferences. It contains the
 /// model and the context. It is the main entry point for running inferences.

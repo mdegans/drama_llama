@@ -56,14 +56,12 @@ pub struct PredictOptions {
     /// Random seed. If this is `Some`, the prediction will be deterministic.
     /// Otherwise the seed will be based on the current time.
     pub seed: Option<NonZeroU128>,
-    /// Stop sequences. When any of these are reached, the prediction will stop.
-    // FIXME: Tokens won't match, but this is fixable. For now we can use
-    // strings, but we have to detokenize each token.
+    /// Stop sequences by token. When any of these are reached, the prediction
+    /// will stop.
     pub stop_sequences: Vec<Vec<llama_token>>,
     /// Stop sequences by string. When any of these are reached, the prediction
-    /// will stop. This is a temporary solution until we can fix the token
-    /// matching.
-    pub(crate) stop_strings: Vec<String>,
+    /// will stop.
+    pub stop_strings: Vec<String>,
     /// Regex stop sequences. When any of these are reached, the prediction will
     /// stop.
     #[cfg_attr(
@@ -93,7 +91,7 @@ impl Default for PredictOptions {
 }
 
 impl PredictOptions {
-    const DEFAULT_SEED: NonZeroU128 = match NonZeroU128::new(1337) {
+    pub const DEFAULT_SEED: NonZeroU128 = match NonZeroU128::new(1337) {
         Some(seed) => seed,
         None => panic!("Bad seed."),
     };

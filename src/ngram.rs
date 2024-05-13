@@ -13,6 +13,8 @@ pub enum NGramNewError {
     TooManyTokens,
 }
 
+static_assertions::assert_impl_all!(NGramNewError: Send, Sync);
+
 /// An immutable N-gram of tokens.
 ///
 /// # Note
@@ -28,6 +30,8 @@ pub enum NGramNewError {
 pub struct NGram {
     data: ArrayVec<[llama_token; Self::CAPACITY]>,
 }
+
+static_assertions::assert_impl_all!(NGram: Send, Sync);
 
 impl NGram {
     pub const CAPACITY: usize = 7;

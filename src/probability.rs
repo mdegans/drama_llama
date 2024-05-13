@@ -1,5 +1,6 @@
 #[cfg(feature = "serde")]
 use rocket::serde::Deserialize;
+use static_assertions::assert_impl_all;
 
 /// Error for invalid probability values.
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -10,6 +11,9 @@ where
 {
     p: F,
 }
+
+assert_impl_all!(InvalidProbability<f32>: Send, Sync);
+assert_impl_all!(InvalidProbability<f64>: Send, Sync);
 
 /// A [`Probability`] is a wrapper around a floating point number that
 /// represents a probability. It is guaranteed to be between 0.0 and 1.0.
