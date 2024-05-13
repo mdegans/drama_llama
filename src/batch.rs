@@ -36,6 +36,8 @@ pub enum AddError {
     InvalidPosition,
 }
 
+static_assertions::assert_impl_all!(AddError: Send, Sync);
+
 impl Batch {
     /// Create a new [`Batch`] with the given `capacity` for tokens or
     /// embeddings. If `embd_len` is zero, the `tokens` accessor will be

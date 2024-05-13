@@ -12,7 +12,7 @@ For examples, see the `bin` folder. There are two example binaries.
 ## Supported Features
 
 - LLaMA 3 Support.
-- Iterators yielding tokens and pieces.
+- Iterators yielding candidates, tokens and pieces.
 - Stop criteria at regex, token sequence, and/or string sequence.
 - Metal support. CUDA may be enabled with the `cuda` and `cuda_f16` features.
 - Rust-native sampling code. All sampling methods from llama.cpp have been translated.
@@ -43,6 +43,7 @@ For examples, see the `bin` folder. There are two example binaries.
 - [ ] Reworked, functional, public, candidate API
 - [ ] Grammar constraints (maybe or maybe not [`llama.cpp`] style)
 - [ ] Async streams, better parallelism with automatic batch scheduling
+- [ ] Better cache management. `llama.cpp` does not seem to manage a longest prefix cache automatically, so one will have to be written.
 - [ ] Backends other than [`llama.cpp`] (eg. [MLC](https://github.com/twiceyuan/mlc-llm-llama2), [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [Ollama](https://github.com/pepperoni21/ollama-rs))
 
 ## Known issues
@@ -53,6 +54,10 @@ For examples, see the `bin` folder. There are two example binaries.
 - The model doesn't load until genration starts, so there can be a long pause
   on first generation. However because `mmap` is used, on subsequent process
   launches, the model should already be cached by the OS.
+- Documentation is broken on `docs.rs` because `llama.cpp`'s CMakeLists.txt
+  generates code, and writing to the filesystem is not supported. For the moment
+  use `cargo doc --open` instead. Others have fixed this by patching
+  `llama.cpp` in their bindings, but I'm not sure I want to do that for now.
 
 [`llama.cpp`]: https://github.com/ggerganov/llama.cpp
 

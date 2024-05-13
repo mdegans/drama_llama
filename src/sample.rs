@@ -16,7 +16,8 @@ use std::num::{NonZeroU8, NonZeroUsize};
     derive(rocket::serde::Deserialize, rocket::serde::Serialize)
 )]
 #[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
-/// Options for [`sample`].
+/// Options determining how raw logits are turned into a token. This is used by
+/// [`Candidates::sample_token`] and associated functions.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct SampleOptions {
     /// Sampling modes to apply in order. Greedy, Mirostat, and MirostatV2 are
@@ -76,7 +77,7 @@ pub enum SamplingMode {
     /// to balance diversity and quality.
     ///
     /// It is described in detail in the following pull request:
-    /// https://github.com/ggerganov/llama.cpp/pull/3841
+    /// <https://github.com/ggerganov/llama.cpp/pull/3841>
     MinP {
         /// The minimum probability to keep a token. This is scaled by the top
         /// token's probability. Reasonable values are 0.05 to 0.3. Higher means
@@ -95,7 +96,7 @@ pub enum SamplingMode {
     /// distribution of the second derivative weights to define the “tail” of
     /// the distribution to be at."
     ///
-    /// https://www.trentonbricken.com/Tail-Free-Sampling/.
+    /// <https://www.trentonbricken.com/Tail-Free-Sampling/.>
     TailFree {
         /// Reasonable values are between 0.25 and 0.75. The higher, the more
         /// diverse the output, but also potentially less coherent.
@@ -116,7 +117,7 @@ pub enum SamplingMode {
     /// takes O(|V|) time. Thus, creating our altered distribution has time
     /// complexity O(|V| log |V|)."
     ///
-    /// https://arxiv.org/pdf/2202.00666.pdf
+    /// <https://arxiv.org/pdf/2202.00666.pdf>
     LocallyTypical {
         /// Probability. Reasonable values are between 0.2 and 0.95. For story
         /// generation, lower is better. For summarization, higher is better.
@@ -132,10 +133,10 @@ pub enum SamplingMode {
     /// sampling fall into boredom and confusion traps which cause low-quality
     /// texts; Mirostat avoids both traps."
     ///
-    /// https://arxiv.org/pdf/2007.14966.pdf
+    /// <https://arxiv.org/pdf/2007.14966.pdf>
     Mirostat {
         /// Tau. Target entropy. A good value is 3.0 according to this paper:
-        /// https://arxiv.org/pdf/2202.00666.pdf
+        /// <https://arxiv.org/pdf/2202.00666.pdf>
         ///
         /// `llama.cpp` uses a default of 5.0.
         tau: f32,
@@ -160,10 +161,10 @@ pub enum SamplingMode {
     /// * The bit about time complexity is not relevant to this implementation
     ///   since we truncate the candidates to a fixed size like v1.
     ///
-    /// https://arxiv.org/pdf/2007.14966.pdf
+    /// <https://arxiv.org/pdf/2007.14966.pdf>
     MirostatV2 {
         /// Tau. Target entropy. A good value is 3.0 according to the paper and
-        /// HF's experiments in https://arxiv.org/pdf/2202.00666.pdf
+        /// HF's experiments in <https://arxiv.org/pdf/2202.00666.pdf>
         ///
         /// `llama.cpp` uses a default of 5.0.
         tau: f32,
@@ -308,6 +309,8 @@ pub enum SampleError {
     RepetitionError { err: RepetitionError },
 }
 
+static_assertions::assert_impl_all!(SampleError: Send, Sync);
+
 #[cfg_attr(
     feature = "serde",
     derive(rocket::serde::Deserialize, rocket::serde::Serialize)
@@ -401,6 +404,9 @@ impl RepetitionOptions {
 
     /// Extend the list of ignored ngrams. Input can be any iterable of any type
     /// that can be converted into an [`NGram`].
+    ///
+    /// # Deprecation:
+    /// In the future, to be more consistent, this will take and return `self`.
     pub fn extend_ignored<It, Ng>(&mut self, ignored: It)
     where
         It: IntoIterator<Item = Ng>,
@@ -410,12 +416,16 @@ impl RepetitionOptions {
         self.ignored.sort();
     }
 
-    /// Add a token to the list of ignored tokens.
+    /// Add a token to the list of ignored tokens. that can be converted into an
+    /// [`NGram`].
     ///
-    /// # Notes:
-    /// * The time complexity of this addition is O(n log n), so prefer to use
-    /// [`set_ignored`] or [`extend_ignored`] if you have multiple tokens to
-    /// add.
+    /// Prefer using [`extend_ignored`] or [`set_ignored`] for multiple tokens.
+    ///
+    /// # Deprecation:
+    /// In the future, to be more consistent, this will take and return `self`.
+    ///
+    /// [`extend_ignored`]: Self::extend_ignored
+    /// [`set_ignored`]: Self::set_ignored
     pub fn add_ignored<I>(&mut self, ngram: I)
     where
         I: Into<NGram>,
@@ -464,6 +474,8 @@ pub enum RepetitionError {
         penalize_ngram_index: u8,
     },
 }
+
+static_assertions::assert_impl_all!(RepetitionError: Send, Sync);
 
 fn ngram_is_ignored(ngram: NGram, ignored: &[NGram]) -> bool {
     if ignored.len() > 64 {

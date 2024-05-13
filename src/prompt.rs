@@ -21,20 +21,20 @@ pub struct Prompt {
     /// Setting, as in set and setting. This is the context in which the
     /// interaction takes place. It may be a location, a time, a situation, or
     /// any other context that may be relevant. The composition of a universe.
-    #[cfg_attr(feature = "serde", field(validate = len(..4096), default = None))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..4096), default = None))]
     pub setting: Option<String>,
     /// Agent's name, e.g. "Mr. Rogers" or "GPT-5".
-    #[cfg_attr(feature = "serde", field(validate = len(..64), default = "assistant"))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..64), default = "assistant"))]
     pub agent: String,
     /// Human's name, e.g. "Alice" or "Bob".
-    #[cfg_attr(feature = "serde", field(validate = len(..64), default = "user"))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..64), default = "user"))]
     pub human: String,
     /// System's name, e.g. "System", "Narrator", or "God". Should imply
     /// authority to the Agent -- not necessarily to the Human.
-    #[cfg_attr(feature = "serde", field(validate = len(..64), default = None))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..64), default = None))]
     pub system: Option<String>,
     /// Messages in the chat transcript. There must be at least two messages.
-    #[cfg_attr(feature = "serde", field(validate = len(2..512)))]
+    #[cfg_attr(feature = "webchat", field(validate = len(2..512)))]
     pub transcript: Vec<Message>,
 }
 
@@ -48,8 +48,8 @@ impl Prompt {
     }
 
     /// Format the prompt in a specific format. This does not add a BOS token so
-    /// if this is desired, it must be prepended or [`Format::for_model`] must
-    /// be used instead.
+    /// if this is desired, it must be prepended or [`Prompt::format_for_model`]
+    /// must be used instead.
     pub fn format<F>(&self, format: Format, f: &mut F) -> std::fmt::Result
     where
         F: std::fmt::Write,
@@ -58,13 +58,13 @@ impl Prompt {
     }
 
     /// Format the prompt for a specific model. This adds a BOS token if the
-    /// model requires it. If this is unknown, a BOS token will not be added.
-    /// This is the recommended method for formatting a prompt.
+    /// model requires it. If this is unknown, a BOS token will **not** be
+    /// added. This is the recommended method for formatting a prompt.
     ///
     /// This will first attempt to use native formatting for the model. If a
-    /// format would be unknown, it will attempt to apply a chat template using
+    /// format would be [`Unknown`], it will attempt to apply a chat template using
     /// the model's metadata and `llama.cpp`. If *that* fails, it will use the
-    /// [`Format::Unknown`] format.
+    /// [`Unknown`] format as a last resort, formatting for foundation models.
     ///
     /// This does not add the assistant's prefix to the prompt. If this is
     /// desired, [`format_agent_prefix`] should be called after this method or
@@ -72,6 +72,7 @@ impl Prompt {
     /// parameter set to `true`.
     ///
     /// [`format_agent_prefix`]: Self::format_agent_prefix
+    /// [`Unknown`]: Format::Unknown
     pub fn format_for_model<F>(
         &self,
         model: &Model,
@@ -157,7 +158,7 @@ impl Display for Prompt {
 #[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 pub struct Message {
     pub role: Role,
-    #[cfg_attr(feature = "serde", field(validate = len(..4096)))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..4096)))]
     pub text: String,
 }
 
