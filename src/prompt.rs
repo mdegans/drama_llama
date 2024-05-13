@@ -21,20 +21,20 @@ pub struct Prompt {
     /// Setting, as in set and setting. This is the context in which the
     /// interaction takes place. It may be a location, a time, a situation, or
     /// any other context that may be relevant. The composition of a universe.
-    #[cfg_attr(feature = "serde", field(validate = len(..4096), default = None))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..4096), default = None))]
     pub setting: Option<String>,
     /// Agent's name, e.g. "Mr. Rogers" or "GPT-5".
-    #[cfg_attr(feature = "serde", field(validate = len(..64), default = "assistant"))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..64), default = "assistant"))]
     pub agent: String,
     /// Human's name, e.g. "Alice" or "Bob".
-    #[cfg_attr(feature = "serde", field(validate = len(..64), default = "user"))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..64), default = "user"))]
     pub human: String,
     /// System's name, e.g. "System", "Narrator", or "God". Should imply
     /// authority to the Agent -- not necessarily to the Human.
-    #[cfg_attr(feature = "serde", field(validate = len(..64), default = None))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..64), default = None))]
     pub system: Option<String>,
     /// Messages in the chat transcript. There must be at least two messages.
-    #[cfg_attr(feature = "serde", field(validate = len(2..512)))]
+    #[cfg_attr(feature = "webchat", field(validate = len(2..512)))]
     pub transcript: Vec<Message>,
 }
 
@@ -158,7 +158,7 @@ impl Display for Prompt {
 #[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 pub struct Message {
     pub role: Role,
-    #[cfg_attr(feature = "serde", field(validate = len(..4096)))]
+    #[cfg_attr(feature = "webchat", field(validate = len(..4096)))]
     pub text: String,
 }
 
