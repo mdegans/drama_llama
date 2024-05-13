@@ -192,6 +192,8 @@ pub struct Candidates {
     pub(crate) data: Vec<llama_token_data>,
 }
 
+static_assertions::assert_impl_all!(Candidates: Send, Sync);
+
 #[derive(Debug, thiserror::Error, derive_more::From)]
 pub enum CandidatesNewError {
     #[error("Could not convert vocabulary size to i32 because: `{0}`.")]
@@ -199,6 +201,8 @@ pub enum CandidatesNewError {
     #[error("Number of candidates must be > 0. Got `{0}`.")]
     NotEnoughCandidates(i32),
 }
+
+static_assertions::assert_impl_all!(CandidatesNewError: Send, Sync);
 
 impl Candidates {
     /// Create a new Candidates container with a given vocabulary size. The IDs

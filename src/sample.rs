@@ -309,6 +309,8 @@ pub enum SampleError {
     RepetitionError { err: RepetitionError },
 }
 
+static_assertions::assert_impl_all!(SampleError: Send, Sync);
+
 #[cfg_attr(
     feature = "serde",
     derive(rocket::serde::Deserialize, rocket::serde::Serialize)
@@ -472,6 +474,8 @@ pub enum RepetitionError {
         penalize_ngram_index: u8,
     },
 }
+
+static_assertions::assert_impl_all!(RepetitionError: Send, Sync);
 
 fn ngram_is_ignored(ngram: NGram, ignored: &[NGram]) -> bool {
     if ignored.len() > 64 {
