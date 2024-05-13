@@ -91,7 +91,7 @@ impl Default for PredictOptions {
 }
 
 impl PredictOptions {
-    const DEFAULT_SEED: NonZeroU128 = match NonZeroU128::new(1337) {
+    pub const DEFAULT_SEED: NonZeroU128 = match NonZeroU128::new(1337) {
         Some(seed) => seed,
         None => panic!("Bad seed."),
     };
