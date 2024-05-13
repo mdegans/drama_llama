@@ -381,8 +381,10 @@ impl<'engine> Iterator for TokenPredictor<'engine> {
             self.max_stop_len + self.inner.engine.vocab.max_token_len(),
         );
         for s in self.options.stop_strings.iter() {
-            if self.text[end..].contains(s) {
-                return None;
+            if let Some(slice) = self.text.get(end..) {
+                if slice.contains(s) {
+                    return None;
+                }
             }
         }
         for regex in self.options.regex_stop_sequences.iter() {
