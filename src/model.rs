@@ -122,7 +122,7 @@ pub enum MetaKey<'a> {
 impl Model {
     // TODO: make compile-time configurable(?)
     /// If unspecified, prefix the BOS token to a tokenized sequence.
-    pub const DEFAULT_ADD_BOS: bool = false;
+    pub const DEFAULT_ADD_BOS: bool = true;
     /// If unspecified, append the EOS token to a tokenized sequence.
     pub const DEFAULT_ADD_EOS: bool = false;
 
