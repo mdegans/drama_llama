@@ -40,7 +40,7 @@ fn token_to_piece(token: llama_token, model: &Model) -> String {
     let mut buf = vec![0; 8];
     token_to_piece_ref(token, model, &mut buf);
 
-    String::from_utf8(buf).unwrap()
+    String::from_utf8(buf).unwrap_or("[Invalid UTF-8]".to_string())
 }
 
 /// Same as `token_to_piece`, but allows reusable buffers.
@@ -122,7 +122,7 @@ pub enum MetaKey<'a> {
 impl Model {
     // TODO: make compile-time configurable(?)
     /// If unspecified, prefix the BOS token to a tokenized sequence.
-    pub const DEFAULT_ADD_BOS: bool = false;
+    pub const DEFAULT_ADD_BOS: bool = true;
     /// If unspecified, append the EOS token to a tokenized sequence.
     pub const DEFAULT_ADD_EOS: bool = false;
 
@@ -387,7 +387,7 @@ impl Model {
                 } else {
                     buf.resize(required as usize, 0);
                 }
-                String::from_utf8(buf).unwrap()
+                String::from_utf8(buf).unwrap_or("[Invalid UTF-8]".to_string())
             };
 
             if let Some(val) = self.get_meta(i) {
@@ -756,7 +756,7 @@ impl Model {
             }
         }
 
-        Some(String::from_utf8(buf).unwrap())
+        Some(String::from_utf8(buf).unwrap_or("[Invalid UTF-8]".to_string()))
     }
 
     /// Get text for a given token.
