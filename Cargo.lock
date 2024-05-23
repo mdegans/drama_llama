@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "drama_llama"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "clap",
  "derive_more",
@@ -795,9 +795,9 @@ checksum = "78b3ae25bc7c8c38cec158d1f2757ee79e9b3740fbc7ccf0e59e4b08d793fa89"
 
 [[package]]
 name = "llama-cpp-sys-3"
-version = "0.5.2"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac2f334b6bf11884251c8d1c6fa682a383535cc99dba54db9e7e9d42e567924f"
+checksum = "f485864f63b6d75892d93862cdb01e634773b46e9a4f36f6992fb5901f703aa3"
 dependencies = [
  "bindgen",
  "cmake",

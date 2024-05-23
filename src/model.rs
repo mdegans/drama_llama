@@ -58,7 +58,6 @@ pub(crate) fn token_to_piece_ref(
             token,
             buf.as_mut_ptr() as *mut i8,
             buf.len().try_into().unwrap(),
-            true,
         )
     };
 
@@ -71,7 +70,6 @@ pub(crate) fn token_to_piece_ref(
                 token,
                 buf.as_mut_ptr() as *mut i8,
                 buf.len().try_into().unwrap(),
-                true,
             )
         };
 
