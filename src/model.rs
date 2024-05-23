@@ -58,6 +58,7 @@ pub(crate) fn token_to_piece_ref(
             token,
             buf.as_mut_ptr() as *mut i8,
             buf.len().try_into().unwrap(),
+            true,
         )
     };
 
@@ -70,6 +71,7 @@ pub(crate) fn token_to_piece_ref(
                 token,
                 buf.as_mut_ptr() as *mut i8,
                 buf.len().try_into().unwrap(),
+                true,
             )
         };
 
@@ -553,7 +555,7 @@ impl Model {
         // guaranteed to be enough, but it will probably be enough in most
         // cases.
         let mut n_tokens: i32 = (input.as_bytes().len()
-            + if self.add_bos().is_some_and(|v| v) {
+            + if self.add_bos().unwrap_or(Model::DEFAULT_ADD_BOS) {
                 1
             } else {
                 0
@@ -819,6 +821,8 @@ impl Drop for Model {
 #[cfg(test)]
 mod tests {
     use llama_cpp_sys_3::llama_vocab_type_LLAMA_VOCAB_TYPE_BPE;
+
+    use crate::Message;
 
     use super::*;
 

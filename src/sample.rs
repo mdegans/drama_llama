@@ -18,7 +18,7 @@ use std::num::{NonZeroU8, NonZeroUsize};
 #[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 /// Options determining how raw logits are turned into a token. This is used by
 /// [`Candidates::sample_token`] and associated functions.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SampleOptions {
     /// Sampling modes to apply in order. Greedy, Mirostat, and MirostatV2 are
     /// guaranteed to return a single token, so they should be the last mode.
@@ -44,18 +44,26 @@ impl SampleOptions {
     }
 }
 
+impl Default for SampleOptions {
+    fn default() -> Self {
+        Self {
+            modes: vec![SamplingMode::locally_typical()],
+            repetition: RepetitionOptions::default().into(),
+        }
+    }
+}
+
 #[cfg_attr(
     feature = "serde",
     derive(rocket::serde::Deserialize, rocket::serde::Serialize)
 )]
 #[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 // TODO: add `min_keep` and `mad_keep` to all the sampling modes since it's
 // doable and it would be nice to have a more consistent API.
 pub enum SamplingMode {
     /// Greedy sampling. The most likely next token is always chosen. Not very
     /// useful unless you want to regurgitate the training data.
-    #[default]
     Greedy,
     /// Top-p sampling. A token is chosen from the top tokens whose cumulative
     /// probability is greater than or equal to `p`.
@@ -300,6 +308,12 @@ impl SamplingMode {
                 None => panic!("NonZeroUsize::new(50) failed"),
             },
         }
+    }
+}
+
+impl Default for SamplingMode {
+    fn default() -> Self {
+        Self::locally_typical()
     }
 }
 

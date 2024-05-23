@@ -96,6 +96,14 @@ impl PredictOptions {
         None => panic!("Bad seed."),
     };
 
+    /// Shortcut for greedy sampling/
+    pub fn greedy() -> Self {
+        Self {
+            sample_options: SampleOptions::greedy(),
+            ..Self::default()
+        }
+    }
+
     /// Add any stop tokens from the model. If there is an associated
     /// [`Format`], the stop tokens will be added. *Otherwise*, the EOS from
     /// [`Model::eos`] will be added (not both).
@@ -575,10 +583,20 @@ impl Iterator for Predictor<'_> {
 mod tests {
     use llama_cpp_sys_3::llama_token;
 
-    use crate::{Engine, PredictOptions};
+    use crate::{Engine, PredictOptions, RepetitionOptions, SampleOptions};
     use std::{num::NonZeroUsize, path::PathBuf};
 
     const PROMPT: &str = "The quick brown fox jumps over the lazy dog.";
+
+    #[test]
+    fn test_default_options() {
+        let opts = PredictOptions::default();
+        assert_eq!(opts.sample_options, SampleOptions::default());
+        assert_eq!(
+            opts.sample_options.repetition,
+            Some(RepetitionOptions::default())
+        );
+    }
 
     #[test]
     #[ignore = "long running"]
@@ -590,10 +608,10 @@ mod tests {
         .unwrap();
 
         let tokenized = engine.model.tokenize(PROMPT, false);
-        let prefix = tokenized[..5].to_vec();
-        let expected = tokenized[5..].to_vec();
+        let prefix = tokenized[..6].to_vec();
+        let expected = tokenized[6..].to_vec();
 
-        let mut opts = PredictOptions::default().add_stop(".".to_owned());
+        let mut opts = PredictOptions::greedy().add_stop(".".to_owned());
         opts.n = NonZeroUsize::new(2 + expected.len()).unwrap();
 
         let actual: Vec<llama_token> =
@@ -613,8 +631,8 @@ mod tests {
         .unwrap();
 
         let tokenized = engine.model.tokenize(PROMPT, false);
-        let prefix = tokenized[..5].to_vec();
-        let expected_completion = &tokenized[5..];
+        let prefix = tokenized[..6].to_vec();
+        let expected_completion = &tokenized[6..];
 
         let mut predictor =
             engine.predict_candidates(prefix, 6.try_into().unwrap());
@@ -653,13 +671,13 @@ mod tests {
         .unwrap();
 
         let tokenized = engine.model.tokenize(PROMPT, false);
-        let prefix = tokenized[..5].to_vec();
-        let expected: Vec<String> = tokenized[5..]
+        let prefix = tokenized[..6].to_vec();
+        let expected: Vec<String> = tokenized[6..]
             .iter()
             .map(|&t| engine.model.token_to_piece(t))
             .collect();
 
-        let mut opts = PredictOptions::default().add_stop(".".to_owned());
+        let mut opts = PredictOptions::greedy().add_stop(".".to_owned());
         opts.n = NonZeroUsize::new(2 + expected.len()).unwrap();
 
         let actual: Vec<String> = engine.predict_pieces(prefix, opts).collect();
