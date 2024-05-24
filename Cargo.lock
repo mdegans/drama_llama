@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "drama_llama"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "clap",
  "derive_more",

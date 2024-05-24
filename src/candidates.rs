@@ -876,10 +876,13 @@ impl Candidates {
             .iter()
             .map(|token| {
                 if token.p != 0.0 {
-                    (f64::from(token.p).ln() - entropy).abs()
+                    (f64::from(token.p).ln() - entropy)
+                        .abs()
+                        .min(f64::MAX)
+                        .max(f64::MIN)
                 } else {
                     // If p is 0, the entropy is 0 and the score is infinity.
-                    f64::INFINITY
+                    f64::MAX
                 }
             })
             .collect();
