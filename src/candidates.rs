@@ -272,15 +272,8 @@ impl Candidates {
         } else {
             let mut by_logit = true;
             let mut by_id = true;
-            let mut id_seen: Vec<bool> = vec![false; data.len()];
 
-            // TODO: Check for partial sort.
-            *id_seen.get_mut(data[0].id as usize).unwrap() = true;
             for pair in data.windows(2) {
-                if *id_seen.get(pair[1].id as usize).unwrap() {
-                    panic!("Duplicate ID: {}", pair[1].id);
-                }
-                *id_seen.get_mut(pair[1].id as usize).unwrap() = true;
                 if by_id && pair[0].id > pair[1].id {
                     by_id = false;
                 }
@@ -288,8 +281,6 @@ impl Candidates {
                     by_logit = false;
                 }
             }
-
-            assert!(id_seen.iter().all(|&b| b));
 
             if by_id {
                 Sorted::ById {
