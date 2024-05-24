@@ -874,11 +874,18 @@ impl Candidates {
         // entropy for each candidate
         let shifted_scores: Vec<f64> = new
             .iter()
-            .map(|token| (f64::from(token.p).ln() - entropy).abs())
+            .map(|token| {
+                if token.p != 0.0 {
+                    (f64::from(token.p).ln() - entropy).abs()
+                } else {
+                    // If p is 0, the entropy is 0 and the score is infinity.
+                    f64::INFINITY
+                }
+            })
             .collect();
 
         // Sort tokens based on the shifted scores and their corresponding
-        // indices
+        // indices.
         let mut indices: Vec<usize> = (0..new.data.len()).collect();
         indices.sort_by(|&a, &b| {
             shifted_scores[a].partial_cmp(&shifted_scores[b]).unwrap()
