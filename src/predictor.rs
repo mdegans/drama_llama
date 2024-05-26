@@ -597,12 +597,26 @@ impl<'engine> Iterator for PiecePredictor<'engine> {
                 // string at the end of the loop. If we don't truncate the text,
                 // anything that follows the stop string will be included in the
                 // text.
+                let mut end = self.inner.inner.tokens.len().saturating_sub(
+                    self.inner.max_stop_len
+                        + self.inner.inner.engine.vocab.max_token_len(),
+                );
+
                 for s in self.inner.options.stop_strings.iter() {
-                    if self.inner.text.ends_with(s) {
-                        self.inner
-                            .text
-                            .truncate(self.inner.text.len() - s.len());
-                        return None;
+                    // It's possible at this point that `end` does not lie on a
+                    // character boundary, so we move backwards until we find a
+                    // character boundary.
+                    while !self.inner.text.is_char_boundary(end) {
+                        if end == 0 {
+                            break;
+                        }
+                        end -= 1;
+                    }
+
+                    if let Some(idx) = self.inner.text[end..].find(s) {
+                        self.inner.text.truncate(
+                            (end + idx + s.len()).min(self.inner.text.len()),
+                        );
                     }
                 }
 
