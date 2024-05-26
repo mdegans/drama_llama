@@ -13,7 +13,7 @@ use crate::{
     model::Vocab,
     ngram::NGramStats,
     sample::{choose_candidate, SampleError},
-    Probability, RepetitionOptions, SampleOptions,
+    Model, Probability, RepetitionOptions, SampleOptions,
 };
 /// Sort state of the candidates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1208,13 +1208,14 @@ impl Candidates {
         self,
         tokens: &[llama_token],
         vocab: &Vocab,
-        opts: &SampleOptions,
+        opts: &mut SampleOptions,
         freq_map: &mut NGramStats,
         rng: &mut xorshift::Xoroshiro128,
         mu: &mut Option<f32>,
+        model: &Model,
     ) -> Result<llama_token, SampleError> {
         crate::sample::sample_token(
-            tokens, self, vocab, opts, freq_map, rng, mu,
+            tokens, self, vocab, opts, freq_map, rng, mu, model,
         )
     }
 
@@ -1232,11 +1233,12 @@ impl Candidates {
     pub fn penalize_repetition(
         self,
         tokens: &[llama_token],
-        opts: &RepetitionOptions,
+        opts: &mut RepetitionOptions,
         freq_map: &mut NGramStats,
+        model: &Model,
     ) -> Result<Candidates, crate::sample::RepetitionError> {
         crate::sample::apply_sample_repetition_ngram(
-            self, tokens, opts, freq_map,
+            self, tokens, opts, freq_map, model,
         )
     }
 

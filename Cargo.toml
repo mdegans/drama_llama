@@ -1,6 +1,6 @@
 [package]
 name = "drama_llama"
-version = "0.3.9"
+version = "0.4.0"
 edition = "2021"
 description = "A library for language modeling and text generation."
 license-file = "LICENSE.md"
@@ -27,7 +27,14 @@ rocket = { version = "0.5", optional = true, features = ["json"] }
 clap = { version = "4.5", optional = true, features = ["derive"] }
 stringmetrics = { version = "2.2.2", optional = true }
 toml = { version = "0.8", optional = true }
+serde_json = { version = "1.0", optional = true }
 dirs = { version = "5.0.1", optional = true }
+egui = { version = "0.27", optional = true }
+eframe = { version = "0.27", optional = true }
+egui_file = { version = "0.17.0", optional = true }
+egui_extras = { version = "0.27", optional = true, features = ["all_loaders"] }
+image = { version = "0.25", optional = true, features = ["png"] }
+
 
 [features]
 webchat = ["dep:rocket", "toml", "dep:dirs", "dep:markdown", "serde"]
@@ -38,6 +45,13 @@ serde = ["dep:rocket", "tinyvec/serde"]
 stats = ["dep:stringmetrics"]
 cuda = ["llama-cpp-sys-3/cuda"]
 cuda_f16 = ["llama-cpp-sys-3/cuda_f16"]
+egui = [
+    "dep:egui",
+    "dep:eframe",
+    "dep:egui_file",
+    "dep:egui_extras",
+    "dep:image",
+]
 
 [[bin]]
 name = "dittomancer"
@@ -49,7 +63,12 @@ name = "regurgitater"
 path = "bin/regurgitater/regurgitater.rs"
 required-features = ["webchat", "cli", "stats"]
 
+[[bin]]
+name = "settings_tool"
+path = "bin/settings_tool/settings_tool.rs"
+required-features = ["egui", "serde", "serde_json"]
+
 [package.metadata.docs.rs]
 # `cuda` will break the build on platforms without it, and it doesn't change the
 # docs anyway.
-features = ["webchat", "cli", "stats", "toml", "serde"]
+features = ["webchat", "cli", "stats", "toml", "serde", "egui"]

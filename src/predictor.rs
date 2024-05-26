@@ -119,6 +119,10 @@ impl PredictOptions {
             // eos is already included if a stop format is found.
             self = self.add_stop_sequence(vec![model.eos()]);
 
+            // For the purpose of repetition, we should ignore the EOS token. In
+            // The case of some models, the EOS token does not indicate the end
+            // of generation, just the end of the current response. If penalty
+            // is applied, generation might not ever stop.
             if let Some(opts) = &mut self.sample_options.repetition {
                 opts.ignored.push(model.eos().into());
             }
@@ -167,6 +171,98 @@ impl PredictOptions {
         self.regex_stop_sequences.push(regex);
 
         self
+    }
+
+    /// Draw [`egui::Ui`] for the options.
+    #[cfg(feature = "egui")]
+    pub fn draw(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let resp = egui::CollapsingHeader::new("Predict Options")
+            .default_open(true)
+            .show(ui, |ui| self.draw_inner(ui));
+
+        let header_response = resp
+            .header_response
+            .on_hover_text_at_pointer("Options for `drama_llama` prediction.");
+
+        resp.body_response.unwrap_or(header_response)
+    }
+
+    /// Draw [`egui::Ui`] for the options, but without the
+    /// [`egui::CollapsingHeader`].
+    #[cfg(feature = "egui")]
+    pub fn draw_inner(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        egui_extras::install_image_loaders(ui.ctx());
+
+        let mut resp = ui.label("Number of tokens to predict");
+        let mut n = self.n.get();
+        resp |= ui.add(
+            egui::DragValue::new(&mut n)
+                .speed(1.0)
+                .clamp_range(1..=usize::MAX as usize),
+        );
+        // The max is because it's possible to drag the value to 0 even
+        // though it's supposed to clamp. This may be a bug in egui or
+        // I am holding it wrong - mdegans
+        self.n = NonZeroUsize::new(n.max(1)).unwrap();
+
+        resp |= ui.label("Random seed");
+        let mut is_random = self.seed.is_none();
+        resp |= ui.horizontal(|ui| {
+                    ui.checkbox(&mut is_random, "Random")
+                        .on_hover_text_at_pointer("If checked, the seed will be based on the current time. This is recommended unless you want deterministic results. Note that truly deterministic results are not guaranteed, especially across platforms.");
+                    if !is_random {
+                        // This isn't good, but egui doesn't support u128 yet.
+                        let mut seed = self.seed.map(|s| s.get()).unwrap_or(1337) as usize;
+                        ui.add(
+                            egui::DragValue::new(&mut seed)
+                                .speed(1.0)
+                                .clamp_range(1..=usize::MAX),
+                        );
+                        self.seed = NonZeroU128::new(seed.max(1) as u128);
+                    } else {
+                        self.seed = None;
+                    }
+                }).response;
+
+        if !self.stop_sequences.is_empty() {
+            resp |= ui.label("Stop token sequences").on_hover_text_at_pointer("Note that these are not currently directly editable via the UI, however the JSON storage for egui does support editing this. A UI will be added in the future.");
+            resp |= ui
+                .vertical(|ui| {
+                    for sequence in self.stop_sequences.iter() {
+                        ui.label(format!("{:?}", sequence));
+                    }
+                })
+                .response;
+        }
+
+        // FIXME: there is necessarily a way to do this in egui, but I
+        // can't find it right now. This is a temporary solution.
+        if !self.stop_strings.is_empty() {
+            resp |= ui.label("Stop strings").on_hover_text_at_pointer("When any of these strings are found in the text, the prediction will stop. Note that `egui` escapes special characters, so you may need to edit the JSON directly to add a string with special characters. This will be fixed in the future.");
+            resp |= ui
+                .horizontal(|ui| {
+                    for string in self.stop_strings.iter() {
+                        ui.label(string);
+                    }
+                })
+                .response;
+        }
+
+        if !self.regex_stop_sequences.is_empty() {
+            resp |= ui.label("Regex stop sequences").on_hover_text_at_pointer("When any of these regexes match the text, the prediction will stop. Note that `egui` escapes special characters, so you may need to edit the JSON directly to add a regex with special characters. This will be fixed in the future.");
+            resp |= ui
+                .horizontal(|ui| {
+                    ui.label("Regexes");
+                    for regex in self.regex_stop_sequences.iter() {
+                        ui.label(regex.as_str());
+                    }
+                })
+                .response;
+        }
+
+        resp |= self.sample_options.draw(ui);
+
+        resp
     }
 }
 /// An iterator that predicts a sequence of tokens until the end of the sequence
@@ -407,10 +503,11 @@ impl<'engine> Iterator for TokenPredictor<'engine> {
             .sample_token(
                 &self.inner.tokens,
                 &self.inner.engine.vocab,
-                &self.options.sample_options,
+                &mut self.options.sample_options,
                 &mut self.ngram_stats,
                 &mut self.rng,
                 &mut self.mu,
+                &self.inner.engine.model,
             )
             .unwrap();
 
