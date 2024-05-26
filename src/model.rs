@@ -840,12 +840,9 @@ mod tests {
         assert_eq!(model.bos(), 128000);
         assert_eq!(model.eos(), 128001);
         assert_eq!(model.next_line(), 128);
-        // These are for CodeLLama. These are included in the conversion of the
-        // llama 3 model I am using but these are wrong. They are for llama 2.
-        // TODO: Wait for a proper conversion and adjust these values.
-        assert_eq!(model.infill_prefix(), 32007);
-        assert_eq!(model.infill_suffix(), 32008);
-        assert_eq!(model.infill_middle(), 32009);
+        assert_eq!(model.infill_prefix(), -1);
+        assert_eq!(model.infill_suffix(), -1);
+        assert_eq!(model.infill_middle(), -1);
         assert_eq!(model.eot(), 32010);
         assert_eq!(model.add_bos(), None);
         assert_eq!(model.add_eos(), None);
