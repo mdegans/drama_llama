@@ -867,6 +867,10 @@ impl RepetitionOptions {
             // the input. We can use &mut function argument for this since we
             // don't have a place on this struct to store it. We could also
             // serde(skip) it.
+
+            if let Some(i) = to_remove {
+                self.ignored.remove(i);
+            }
         }
 
         // Penalty max count
