@@ -174,11 +174,19 @@ impl PredictOptions {
     }
 
     /// Draw [`egui::Ui`] for the options.
+    ///
+    /// `max_context_size` caps the ui widget for the number of tokens to
+    /// predict. It should be set to the maximum context size of the model
+    /// minus the number of tokens in the prompt.
     #[cfg(feature = "egui")]
-    pub fn draw(&mut self, ui: &mut egui::Ui) -> egui::Response {
+    pub fn draw(
+        &mut self,
+        ui: &mut egui::Ui,
+        max_context_size: usize,
+    ) -> egui::Response {
         let resp = egui::CollapsingHeader::new("Predict Options")
             .default_open(true)
-            .show(ui, |ui| self.draw_inner(ui));
+            .show(ui, |ui| self.draw_inner(ui, max_context_size));
 
         let header_response = resp
             .header_response
@@ -189,8 +197,16 @@ impl PredictOptions {
 
     /// Draw [`egui::Ui`] for the options, but without the
     /// [`egui::CollapsingHeader`].
+    ///
+    /// `max_context_size` caps the ui widget for the number of tokens to
+    /// predict. It should be set to the maximum context size of the model
+    /// minus the number of tokens in the prompt.
     #[cfg(feature = "egui")]
-    pub fn draw_inner(&mut self, ui: &mut egui::Ui) -> egui::Response {
+    pub fn draw_inner(
+        &mut self,
+        ui: &mut egui::Ui,
+        max_context_size: usize,
+    ) -> egui::Response {
         egui_extras::install_image_loaders(ui.ctx());
 
         let mut resp = ui.label("Number of tokens to predict");
@@ -198,7 +214,7 @@ impl PredictOptions {
         resp |= ui.add(
             egui::DragValue::new(&mut n)
                 .speed(1.0)
-                .clamp_range(1..=usize::MAX as usize),
+                .clamp_range(1..=max_context_size),
         );
         // The max is because it's possible to drag the value to 0 even
         // though it's supposed to clamp. This may be a bug in egui or
