@@ -325,19 +325,19 @@ impl Model {
         let mut buf: Vec<u8> = vec![0; 8];
         // Safety: The buffer is properly aligned and has the correct length.
         // The string will be null-terminated.
-        let written = unsafe {
+        let required = unsafe {
             llama_model_desc(
                 self.inner,
                 buf.as_mut_ptr() as *mut c_char,
                 buf.len(),
             )
-        };
+        } + 1;
 
-        if written < 0 {
-            panic!("snprintf encoding error.");
+        if required < 1 {
+            panic!("Error reading model description.");
         } else {
-            if written as usize > buf.len() {
-                buf.resize(written as usize, 0);
+            if required as usize > buf.len() {
+                buf.resize(required as usize, 0);
                 let check = unsafe {
                     llama_model_desc(
                         self.inner,
@@ -345,9 +345,10 @@ impl Model {
                         buf.len(),
                     )
                 };
-                assert_eq!(written, check);
+                assert_eq!(required, check + 1);
+                buf.truncate(required as usize - 1);
             } else {
-                buf.resize(written as usize, 0);
+                buf.resize(required as usize - 1, 0);
             }
 
             // This could fail if the model has junk in the description. It's
@@ -373,7 +374,7 @@ impl Model {
                     i,
                     buf.as_mut_ptr() as *mut c_char,
                     buf.len(),
-                );
+                ) + 1;
                 if required < 0 {
                     continue;
                 }
@@ -385,9 +386,10 @@ impl Model {
                         buf.as_mut_ptr() as *mut c_char,
                         buf.len(),
                     );
-                    assert_eq!(required, check);
+                    assert_eq!(required, check + 1);
+                    buf.truncate(required as usize - 1);
                 } else {
-                    buf.resize(required as usize, 0);
+                    buf.resize(required as usize - 1, 0);
                 }
                 String::from_utf8(buf).unwrap_or("[Invalid UTF-8]".to_string())
             };
@@ -421,9 +423,9 @@ impl Model {
                     i,
                     buf.as_mut_ptr() as *mut c_char,
                     buf.len(),
-                );
+                ) + 1;
 
-                if required < 0 {
+                if required < 1 {
                     return None;
                 }
 
@@ -435,27 +437,31 @@ impl Model {
                         buf.as_mut_ptr() as *mut c_char,
                         buf.len(),
                     );
-                    assert_eq!(required, check);
+                    assert_eq!(required, check + 1);
+                    // Because the buffer is null-terminated, we need to remove
+                    // the null terminator or it will be included in the string
+                    // which will cause a panic.
+                    buf.truncate(required as usize - 1);
                 } else {
-                    buf.resize(required as usize, 0);
+                    buf.resize(required as usize - 1, 0);
                 }
             },
             MetaKey::String(s) => {
                 let key = CString::new(s).unwrap();
-                let written = unsafe {
+                let required = unsafe {
                     llama_model_meta_val_str(
                         self.inner,
                         key.as_c_str().as_ptr(),
                         buf.as_mut_ptr() as *mut c_char,
                         buf.len(),
                     )
-                };
+                } + 1;
 
-                if written < 0 {
+                if required < 1 {
                     return None;
                 }
-                if buf.len() != written as usize {
-                    buf.resize(written as usize, 0);
+                if buf.len() != required as usize {
+                    buf.resize(required as usize, 0);
                     let check = unsafe {
                         llama_model_meta_val_str(
                             self.inner,
@@ -464,24 +470,15 @@ impl Model {
                             buf.len(),
                         )
                     };
-                    assert_eq!(written, check);
+                    assert_eq!(required, check + 1);
+                    buf.truncate(required as usize - 1);
                 } else {
-                    buf.resize(written as usize, 0);
+                    buf.resize(required as usize - 1, 0);
                 }
             }
         };
 
-        match String::from_utf8(buf).ok() {
-            Some(mut s) => {
-                // strip null terminators
-                while s.ends_with('\0') {
-                    let _ = s.pop();
-                }
-
-                Some(s)
-            }
-            None => None,
-        }
+        String::from_utf8(buf).ok()
     }
     /// Get a tensor by name.
     pub fn get_tensor<'a>(&'a self, name: &str) -> Option<&'a ggml_tensor> {
@@ -929,5 +926,33 @@ mod tests {
             result,
             "<|im_start|>user\nHello, world!<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n<|im_start|>user\nSo, how's it going?<|im_end|>\n<|im_start|>assistant\n",
         );
+    }
+
+    #[test]
+    fn test_metadata() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // This should be a properly converted llama 3 model or this test will
+        // fail.
+        path.push("models/model.gguf");
+
+        let model = Model::from_file(path, None).unwrap();
+        let meta = model.meta();
+        for (key, val) in meta.iter() {
+            println!("{}: {}", key, val);
+        }
+        println!("{:#?}", meta);
+    }
+
+    #[test]
+    fn test_model_desc() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // This should be a properly converted llama 3 model or this test will
+        // fail.
+        path.push("models/model.gguf");
+
+        let model = Model::from_file(path, None).unwrap();
+        let desc = model.desc();
+        assert!(desc.starts_with("llama"));
+        assert!(!desc.ends_with("\0"));
     }
 }
