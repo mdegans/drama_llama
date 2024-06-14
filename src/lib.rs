@@ -31,7 +31,7 @@ mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};
 
 mod engine;
-pub use engine::Engine;
+pub use engine::{Engine, NewError};
 
 mod predictor;
 pub use predictor::{
