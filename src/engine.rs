@@ -107,8 +107,8 @@ impl Engine {
                 unsafe {
                     llama_backend_init();
                     llama_numa_init(numa_strategy.unwrap_or(
-                        ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED,
-                    ));
+                        ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED.try_into().unwrap(),
+                    ).try_into().unwrap());
                 }
             }
         }
