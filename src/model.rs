@@ -19,7 +19,6 @@ use std::{
     collections::BTreeMap,
     ffi::{c_char, CStr, CString},
     num::{NonZeroI32, NonZeroU32},
-    os::unix::ffi::OsStringExt,
     path::PathBuf,
 };
 
@@ -81,14 +80,33 @@ pub(crate) fn token_to_piece_ref(
     }
 }
 
+/// Convert a PathBuf to a CString
+#[cfg(linux)]
+fn path_to_cstring(path: PathBuf) -> CString {
+    use os::unix::ffi::OsStringExt;
+    CString::new(in_file.into_os_string().into_vec()).unwrap()
+}
+
+/// Windows version. ChatGPT 4o should get the credit for writing this.
+#[cfg(windows)]
+fn path_to_cstring(path: PathBuf) -> CString {
+    use std::os::windows::ffi::OsStrExt;
+
+    let os_str: &std::ffi::OsStr = path.as_os_str();
+    let wide: Vec<u16> = os_str.encode_wide().collect();
+    let narrow: Vec<u8> = wide.iter().flat_map(|&w| w.to_le_bytes()).collect();
+    CString::new(narrow).unwrap()
+}
+
 /// Quantize a Llama model.
 pub fn llama_quantize(
     in_file: PathBuf,
     out_file: PathBuf,
     params: Option<llama_model_quantize_params>,
 ) -> Result<(), NonZeroU32> {
-    let in_file = CString::new(in_file.into_os_string().into_vec()).unwrap();
-    let out_file = CString::new(out_file.into_os_string().into_vec()).unwrap();
+    let in_file = path_to_cstring(in_file);
+    let out_file = path_to_cstring(out_file);
+
     // Safety: this returns POD
     let params =
         params.unwrap_or(unsafe { llama_model_quantize_default_params() });
@@ -146,7 +164,7 @@ impl Model {
             eprintln!("Eric Hartford's `Uncensored` models are not supported. Read the TOS. If you want smut, use the foundation models and an n-shot prompt. Example: https://huggingface.co/NousResearch/Meta-Llama-3-70B-GGUF/");
             return None;
         }
-        let path = CString::new(path.into_os_string().into_vec()).unwrap();
+        let path = path_to_cstring(path);
         // Safety: What's returned is POD
         let params = params.unwrap_or(unsafe { llama_model_default_params() });
         // Safety: The model is owned by the caller. We free it in the `Drop`
@@ -516,11 +534,9 @@ impl Model {
         hq_model: Option<PathBuf>,
         n_threads: i32,
     ) -> Result<(), NonZeroI32> {
-        let lora = CString::new(lora.into_os_string().into_vec()).unwrap();
+        let lora = path_to_cstring(lora);
         let hq_model = match hq_model {
-            Some(hq) => {
-                Some(CString::new(hq.into_os_string().into_vec()).unwrap())
-            }
+            Some(hq) => Some(path_to_cstring(hq)),
             None => None,
         };
 
@@ -954,5 +970,12 @@ mod tests {
         let desc = model.desc();
         assert!(desc.starts_with("llama"));
         assert!(!desc.ends_with("\0"));
+    }
+
+    #[test]
+    fn test_path_to_cstring() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cs = path_to_cstring(path.clone());
+        assert_eq!(path.display().to_string(), cs.to_str().unwrap().to_owned());
     }
 }
