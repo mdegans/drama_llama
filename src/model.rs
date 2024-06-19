@@ -81,21 +81,9 @@ pub(crate) fn token_to_piece_ref(
 }
 
 /// Convert a PathBuf to a CString
-#[cfg(not(windows))]
 fn path_to_cstring(path: PathBuf) -> CString {
-    use std::os::unix::ffi::OsStringExt;
-    CString::new(path.into_os_string().into_vec()).unwrap()
-}
-
-/// Windows version. ChatGPT 4o should get the credit for writing this.
-#[cfg(windows)]
-fn path_to_cstring(path: PathBuf) -> CString {
-    use std::os::windows::ffi::OsStrExt;
-
     let os_str: &std::ffi::OsStr = path.as_os_str();
-    let wide: Vec<u16> = os_str.encode_wide().collect();
-    let narrow: Vec<u8> = wide.iter().flat_map(|&w| w.to_le_bytes()).collect();
-    CString::new(narrow).unwrap()
+    CString::new(os_str.as_encoded_bytes()).unwrap()
 }
 
 /// Quantize a Llama model.
