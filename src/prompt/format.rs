@@ -339,7 +339,7 @@ impl Format {
         F: std::fmt::Write,
     {
         if let Some(model) = model {
-            if model.add_bos().unwrap_or(Model::DEFAULT_ADD_BOS) {
+            if model.add_bos() {
                 f.write_str(&model.token_to_piece(model.bos()))?;
             }
         }

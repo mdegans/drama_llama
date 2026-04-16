@@ -344,6 +344,7 @@ impl<'engine> CandidatePredictor<'engine> {
     ) -> Result<(), AddError> {
         self.batch.add_token(token, self.n_cur, None, true)?;
         self.tokens.push(token);
+        self.n_cur += 1;
 
         Ok(())
     }
@@ -378,7 +379,9 @@ impl<'engine> Iterator for CandidatePredictor<'engine> {
 
         batch.clear();
 
-        self.n_cur += 1;
+        // n_cur is incremented here so that record_choice (called by the
+        // consumer between next() calls) places the token at the correct
+        // consecutive position in the sequence.
         self.n_decode += 1;
 
         Some(candidates)

@@ -9,7 +9,7 @@ repository = "https://github.com/mdegans/drama_llama"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-llama-cpp-sys-3 = "0.5"
+llama-cpp-sys-3 = "0.6"
 
 derive_more = "0.99.17"
 num = "0.4"

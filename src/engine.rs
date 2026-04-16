@@ -9,18 +9,16 @@ use std::{num::NonZeroUsize, path::PathBuf, sync::Mutex};
 use llama_cpp_sys_3::{
     ggml_log_callback, ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED,
     llama_backend_free, llama_backend_init, llama_context,
-    llama_context_default_params, llama_context_params, llama_copy_state_data,
-    llama_decode, llama_free, llama_get_embeddings_ith,
-    llama_get_kv_cache_token_count, llama_get_kv_cache_used_cells,
-    llama_get_logits_ith, llama_get_state_size, llama_get_timings,
-    llama_kv_cache_clear, llama_kv_cache_defrag, llama_kv_cache_seq_add,
-    llama_kv_cache_seq_cp, llama_kv_cache_seq_div, llama_kv_cache_seq_keep,
-    llama_kv_cache_seq_pos_max, llama_kv_cache_seq_rm, llama_kv_cache_update,
-    llama_log_set, llama_model_params, llama_n_batch, llama_n_ctx,
-    llama_new_context_with_model, llama_numa_init, llama_pos,
-    llama_reset_timings, llama_seq_id, llama_set_n_threads, llama_set_rng_seed,
-    llama_set_state_data, llama_supports_gpu_offload, llama_supports_mlock,
-    llama_supports_mmap, llama_timings, llama_token,
+    llama_context_default_params, llama_context_params, llama_decode,
+    llama_free, llama_get_embeddings_ith, llama_get_logits_ith,
+    llama_get_memory, llama_log_set, llama_memory_clear, llama_memory_seq_add,
+    llama_memory_seq_cp, llama_memory_seq_div, llama_memory_seq_keep,
+    llama_memory_seq_pos_max, llama_memory_seq_rm, llama_model_params,
+    llama_n_batch, llama_n_ctx, llama_new_context_with_model, llama_numa_init,
+    llama_perf_context, llama_perf_context_data, llama_perf_context_reset,
+    llama_pos, llama_seq_id, llama_set_n_threads, llama_state_get_data,
+    llama_state_get_size, llama_state_set_data, llama_supports_gpu_offload,
+    llama_supports_mlock, llama_supports_mmap, llama_token,
 };
 
 use thiserror::Error;
@@ -53,14 +51,6 @@ static_assertions::assert_impl_all!(DecodeError: Send, Sync);
 
 /// An `Engine` encompasses everything needed to run inferences. It contains the
 /// model and the context. It is the main entry point for running inferences.
-///
-/// # Note:
-/// There can only be one `Engine` per process at a time. This may change in the
-/// future.
-// TODO: It's possible to swap models with llama.cpp. We could add a method to
-// set the model for the context. That being said, there is a lot of other
-// global state in llama.cpp, so it wouldn't be easy or straightforward to do
-// so.
 #[derive(Debug)]
 pub struct Engine {
     /// The llama.cpp context.
@@ -162,11 +152,6 @@ impl Engine {
         unsafe { llama_supports_gpu_offload() }
     }
 
-    /// Set the rng seed.
-    pub fn set_rng_seed(&self, seed: u32) {
-        unsafe { llama_set_rng_seed(self.context, seed) };
-    }
-
     /// Get a raw pointer to the underlying llama.cpp context.
     pub fn context_ptr(&self) -> *const llama_context {
         // Safety:
@@ -191,23 +176,24 @@ impl Engine {
         unsafe { llama_n_batch(self.context) }
     }
 
-    /// Get the size of the global state (rng, logits, embedding, and kv_cache).
+    /// Get the size of the global state (logits, embedding, and memory).
     pub fn state_size(&self) -> usize {
-        unsafe { llama_get_state_size(self.context) as usize }
+        unsafe { llama_state_get_size(self.context) }
     }
 
-    /// Get the llama.cpp global state (rng, logits, embedding, and kv_cache).
+    /// Get the llama.cpp global state (logits, embedding, and memory).
     pub fn get_state(&self) -> Vec<u8> {
         let len = self.state_size();
-        let mut buf = Vec::with_capacity(len);
-        let copied =
-            unsafe { llama_copy_state_data(self.context, buf.as_mut_ptr()) };
+        let mut buf = vec![0u8; len];
+        let copied = unsafe {
+            llama_state_get_data(self.context, buf.as_mut_ptr(), len)
+        };
         assert_eq!(copied, len);
 
         buf
     }
 
-    /// Set the llama.cpp global state (rng, logits, embedding, and kv_cache).
+    /// Set the llama.cpp global state (logits, embedding, and memory).
     ///
     /// # Panics
     /// * If the length of `state` is not equal to [`Engine::state_size`].
@@ -215,19 +201,20 @@ impl Engine {
         let len = self.state_size();
         assert_eq!(state.len(), len);
 
-        let copied =
-            unsafe { llama_set_state_data(self.context, state.as_ptr()) };
+        let copied = unsafe {
+            llama_state_set_data(self.context, state.as_ptr(), len)
+        };
         assert_eq!(copied, len);
     }
 
     /// Performance information
-    pub fn get_timings(&self) -> llama_timings {
-        unsafe { llama_get_timings(self.context) }
+    pub fn get_timings(&self) -> llama_perf_context_data {
+        unsafe { llama_perf_context(self.context) }
     }
 
     /// Reset performance information
-    pub fn reset_timings(&self) {
-        unsafe { llama_reset_timings(self.context) };
+    pub fn reset_timings(&mut self) {
+        unsafe { llama_perf_context_reset(self.context) };
     }
 
     /// Set callback for all future logging.
@@ -244,108 +231,82 @@ impl Engine {
         }
     }
 
-    /// The number of tokens in the KV cache. (slow, use only for debugging)
-    pub fn kv_cache_token_count(&self) -> i32 {
-        unsafe { llama_get_kv_cache_token_count(self.context) }
+    /// Clear the memory (KV cache).
+    pub fn memory_clear(&self) {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_clear(mem, true) }
     }
 
-    /// The number of use KV cells.
-    pub fn kv_cache_used_cells(&self) -> i32 {
-        unsafe { llama_get_kv_cache_used_cells(self.context) }
-    }
-
-    /// Clear the KV cache.
-    pub fn kv_cache_clear(&self) {
-        unsafe { llama_kv_cache_clear(self.context) }
-    }
-
-    /// Removes all tokens from the KV cache that belong to the specified
+    /// Removes all tokens from memory that belong to the specified
     /// sequence and have positions in [p0, p1)
     /// seq_id < 0 : match any sequence
     /// p0 < 0     : [0,  p1]
     /// p1 < 0     : [p0, inf)
-    pub fn kv_cache_seq_rm(
+    pub fn memory_seq_rm(
         &self,
         seq_id: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
     ) -> bool {
-        unsafe { llama_kv_cache_seq_rm(self.context, seq_id, p0, p1) }
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_rm(mem, seq_id, p0, p1) }
     }
 
-    /// Copy all tokens that belong to the specified sequence in the KV cache to
+    /// Copy all tokens that belong to the specified sequence in memory to
     /// another sequence.
-    /// Note that this does not allocate extra KV cache memory - it simply
-    /// assigns the tokens to the new sequence
     /// p0 < 0 : [0,  p1]
     /// p1 < 0 : [p0, inf)
-    pub fn kv_cache_seq_cp(
+    pub fn memory_seq_cp(
         &self,
         src: llama_seq_id,
         dst: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
     ) {
-        unsafe { llama_kv_cache_seq_cp(self.context, src, dst, p0, p1) }
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_cp(mem, src, dst, p0, p1) }
     }
 
-    /// Removes all tokens that do not belong to the specified sequence from the
-    /// KV cache.
-    pub fn kv_cache_seq_keep(&self, seq_id: llama_seq_id) {
-        unsafe { llama_kv_cache_seq_keep(self.context, seq_id) }
+    /// Removes all tokens that do not belong to the specified sequence.
+    pub fn memory_seq_keep(&self, seq_id: llama_seq_id) {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_keep(mem, seq_id) }
     }
 
     /// Adds relative position "delta" to all tokens that belong to the
     /// specified sequence and have positions in [p0, p1)
-    /// If the KV cache is RoPEd, the KV data is updated accordingly:
-    ///   - lazily on next llama_decode()
-    ///   - explicitly with llama_kv_cache_update()
     /// p0 < 0 : [0,  p1]
     /// p1 < 0 : [p0, inf)
-    pub fn kv_cache_seq_add(
+    pub fn memory_seq_add(
         &self,
         seq_id: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
         delta: llama_pos,
     ) {
-        unsafe { llama_kv_cache_seq_add(self.context, seq_id, p0, p1, delta) }
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_add(mem, seq_id, p0, p1, delta) }
     }
 
     /// Integer division of the positions by factor of `d > 1`
-    /// If the KV cache is RoPEd, the KV data is updated accordingly:
-    ///   - lazily on next llama_decode()
-    ///   - explicitly with llama_kv_cache_update()
     /// p0 < 0 : [0,  p1]
     /// p1 < 0 : [p0, inf)
-    pub fn kv_cache_seq_div(
+    pub fn memory_seq_div(
         &self,
         seq_id: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
         d: i32,
     ) {
-        unsafe { llama_kv_cache_seq_div(self.context, seq_id, p0, p1, d) }
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_div(mem, seq_id, p0, p1, d) }
     }
 
-    /// Returns the largest position present in the KV cache for the specified
+    /// Returns the largest position present in memory for the specified
     /// sequence.
-    pub fn kv_cache_seq_pos_max(&self, seq_id: llama_seq_id) -> llama_pos {
-        unsafe { llama_kv_cache_seq_pos_max(self.context, seq_id) }
-    }
-
-    /// Defragment the KV cache.
-    ///
-    /// This will be applied:
-    ///   - lazily on next llama_decode()
-    ///   - explicitly with llama_kv_cache_update()
-    pub fn kv_cache_defrag(&self) {
-        unsafe { llama_kv_cache_defrag(self.context) }
-    }
-
-    /// Update the KV cache (such as K-shifts, defragmentation, etc.)
-    pub fn kv_cache_update(&self) {
-        unsafe { llama_kv_cache_update(self.context) }
+    pub fn memory_seq_pos_max(&self, seq_id: llama_seq_id) -> llama_pos {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_pos_max(mem, seq_id) }
     }
 
     /// Decode
@@ -360,7 +321,7 @@ impl Engine {
     }
 
     /// Set the number of threads used for generation and batch processing.
-    pub fn set_n_threads(&mut self, n_gen: u32, n_batch: u32) {
+    pub fn set_n_threads(&mut self, n_gen: i32, n_batch: i32) {
         unsafe { llama_set_n_threads(self.context, n_gen, n_batch) }
     }
 
@@ -436,7 +397,7 @@ impl Engine {
         // track of sequence ids, we can clear the cache when the sequence id
         // is no longer in use. This would be more efficient, but requires more
         // bookkeeping.
-        self.kv_cache_clear();
+        self.memory_clear();
         CandidatePredictor::new(self, tokens, n)
     }
 
@@ -453,7 +414,7 @@ impl Engine {
         tokens: Vec<llama_token>,
         options: PredictOptions,
     ) -> TokenPredictor<'a> {
-        self.kv_cache_clear();
+        self.memory_clear();
         TokenPredictor::new(self, tokens, options)
     }
 
@@ -477,7 +438,7 @@ impl Engine {
         tokens: Vec<llama_token>,
         options: PredictOptions,
     ) -> PiecePredictor<'a> {
-        self.kv_cache_clear();
+        self.memory_clear();
         PiecePredictor::new(self, tokens, options)
     }
 
@@ -493,7 +454,7 @@ impl Engine {
         tokens: Vec<llama_token>,
         options: PredictOptions,
     ) -> Predictor<'a> {
-        self.kv_cache_clear();
+        self.memory_clear();
         Predictor::new(self, tokens, options)
     }
 }
