@@ -510,7 +510,7 @@ impl Candidates {
                 }
 
                 self.data.partial_sort(k.get(), |a, b| {
-                    b.id.partial_cmp(&a.id).unwrap()
+                    a.id.partial_cmp(&b.id).unwrap()
                 });
 
                 Sorted::ById { k }

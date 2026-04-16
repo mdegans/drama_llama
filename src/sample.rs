@@ -1002,8 +1002,14 @@ fn ngram_is_ignored(ngram: NGram, ignored: &[NGram]) -> bool {
 
 /// Apply repetition penalties to the candidates.
 ///
-/// This is mostly a translation of the C++ code in `llama.cpp` with support for
-/// n-grams. [`NGramStats`] is used to store the n-gram statistics.
+/// Two-phase approach: first, count trailing n-grams to update the frequency
+/// map. Then, iterate over all tracked n-grams and penalize the last
+/// non-ignored token in each one. This ensures all previously-seen tokens get
+/// penalized, not just the most recently generated one.
+///
+/// Originally inspired by `llama.cpp`'s repetition penalties, extended with
+/// n-gram support. Rewritten by Claude (Anthropic) to fix a design issue where
+/// penalties were only applied to the trailing token.
 pub fn apply_sample_repetition_ngram(
     candidates: Candidates,
     tokens: &[llama_token],
@@ -1012,6 +1018,7 @@ pub fn apply_sample_repetition_ngram(
     model: &crate::Model,
 ) -> Result<Candidates, RepetitionError> {
     let k = candidates.len();
+    let n_vocab = k.get();
     let mut candidates = candidates.sort(Sorted::ById { k });
 
     let RepetitionOptions {
@@ -1022,11 +1029,7 @@ pub fn apply_sample_repetition_ngram(
         penalty_freq,
         penalty_max_count,
         penalty_present,
-        // NOTE: This makes a copy of the value, so we can modify it. It doesn't
-        // mutate the value on the struct. RepetitionOptions does need to be
-        // mutable, but only for the stopwords and there might be a better way
-        // to handle that.
-        mut penalty_repeat,
+        penalty_repeat,
     } = opts;
 
     // Add ignored stopwords to the ignored ngrams if they are not already
@@ -1056,21 +1059,34 @@ pub fn apply_sample_repetition_ngram(
         .unwrap();
     let penalty_max_count: usize = penalty_max_count.get().into();
 
-    // Iterate over possible n-grams at the end of the tokens in order of
-    // smallest to largest. Larger n-grams are more penalized than smaller.
+    // Phase 1: Count trailing n-grams to update the frequency map with newly
+    // generated tokens.
     for slice in (ngram_min_size..=ngram_max_size)
         .filter_map(|n| tokens.len().checked_sub(n).and_then(|start| tokens.get(start..)))
     {
         let ngram = NGram::try_from(slice).unwrap();
-
-        // If either the ngram or the penalized token is ignored, skip the ngram
         if ngram_is_ignored(ngram, &ignored) {
             continue;
         }
+        freq_map.add(ngram, &candidates);
+    }
 
-        // Search from the end of the slice for a token that is not ignored.
+    // Phase 2: Apply penalties based on ALL tracked n-grams in the frequency
+    // map. For each n-gram that has been seen more than penalty_max_count
+    // times, penalize the last non-ignored token in the n-gram. This ensures
+    // that tokens which have appeared frequently anywhere in the context get
+    // their logits reduced, not just the most recently generated token.
+    //
+    // The penalty scales with n-gram size: larger n-grams get a stronger
+    // multiplicative penalty (penalty_repeat is squared per size level).
+    for (ngram, data) in freq_map.iter() {
+        if ngram_is_ignored(*ngram, &ignored) {
+            continue;
+        }
+
+        // Find the last non-ignored token in the n-gram to penalize.
         let mut penalized_token = None;
-        for &token in slice.iter().rev() {
+        for &token in ngram.as_slice().iter().rev() {
             if ngram_is_ignored(token.into(), &ignored) {
                 continue;
             }
@@ -1078,40 +1094,32 @@ pub fn apply_sample_repetition_ngram(
             break;
         }
         let penalized_token = match penalized_token {
-            Some(token) => token as usize,
-            // If there are no tokens that are not ignored, skip the ngram.
-            None => continue,
+            Some(token) if (token as usize) < n_vocab => token as usize,
+            _ => continue,
         };
-
-        // This counts the ngram and gets mutable data about it.
-        // TODO: we added as weight member to the NGramData but it is unused. We
-        // can use the weighted probability to penalize the n-gram in addition
-        // to the count.
-        let data = freq_map.add(ngram, &candidates);
 
         let candidate = &mut candidates.data[penalized_token];
 
-        // The logic here is copied from the c++ code in llama.cpp.. which was
-        // broken. It was fixed in the c++ so we fix it here. It looked wrong.
+        // Multiplicative penalty: scales with n-gram size. Only fires when
+        // count exceeds max_count.
         if data.count() > penalty_max_count {
-            // dbg!(count, &ngram, &candidate);
+            // Escalate penalty by n-gram size: unigrams get base penalty,
+            // bigrams get penalty^2, etc.
+            let scaled_penalty = penalty_repeat.powf(ngram.len() as f32);
             if candidate.logit <= 0.0 {
-                candidate.logit *= penalty_repeat.powf(ngram.len() as f32);
+                candidate.logit *= scaled_penalty;
             } else {
-                candidate.logit /= penalty_repeat;
+                candidate.logit /= scaled_penalty;
             }
         }
 
+        // Additive penalties: frequency scales with count, presence is binary.
         candidate.logit -=
             (data.count() as f32) * *penalty_freq + *penalty_present;
-
-        // We penalize longer ngrams more. Because we work backwards, this will
-        // penalize the first token in the ngram the most.
-        penalty_repeat *= penalty_repeat;
-
-        // We have modified the logit values, so we need to reapply softmax.
-        candidates.softmax_applied_to = None;
     }
+
+    // We have modified logit values.
+    candidates.softmax_applied_to = None;
 
     Ok(candidates)
 }
