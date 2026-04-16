@@ -665,6 +665,13 @@ pub struct RepetitionOptions {
     /// The penalty for the presence of the n-grams. This subtracts the presence
     /// of the n-gram from the logit of the penalized token in the n-gram.
     pub(crate) penalty_present: f32,
+    /// Surgical mode. Instead of penalizing all seen tokens, only penalize the
+    /// token that would *complete* a repeated n-gram pattern. For example, if
+    /// "The New" was just generated and "The New York" is a known trigram,
+    /// penalize "York" specifically to prevent the phrase from completing.
+    /// This is more targeted than the default broad approach.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) surgical: bool,
 }
 
 impl Default for RepetitionOptions {
@@ -678,6 +685,7 @@ impl Default for RepetitionOptions {
             penalty_repeat: 1.15,
             penalty_freq: 0.0,
             penalty_present: 0.0,
+            surgical: false,
         }
     }
 }
@@ -962,6 +970,14 @@ impl RepetitionOptions {
             })
             .inner;
 
+        // Surgical mode
+        resp |= ui.checkbox(&mut self.surgical, "Surgical")
+            .on_hover_text_at_pointer(
+                "When enabled, only penalize the token that would complete a repeated n-gram pattern. \
+                 For example, if \"The New\" was just generated and \"The New York\" has appeared before, \
+                 penalize \"York\" specifically. When disabled, all previously-seen tokens are penalized.",
+            );
+
         resp
     }
 
@@ -1030,6 +1046,7 @@ pub fn apply_sample_repetition_ngram(
         penalty_max_count,
         penalty_present,
         penalty_repeat,
+        surgical,
     } = opts;
 
     // Add ignored stopwords to the ignored ngrams if they are not already
@@ -1071,51 +1088,114 @@ pub fn apply_sample_repetition_ngram(
         freq_map.add(ngram, &candidates);
     }
 
-    // Phase 2: Apply penalties based on ALL tracked n-grams in the frequency
-    // map. For each n-gram that has been seen more than penalty_max_count
-    // times, penalize the last non-ignored token in the n-gram. This ensures
-    // that tokens which have appeared frequently anywhere in the context get
-    // their logits reduced, not just the most recently generated token.
-    //
-    // The penalty scales with n-gram size: larger n-grams get a stronger
-    // multiplicative penalty (penalty_repeat is squared per size level).
-    for (ngram, data) in freq_map.iter() {
-        if ngram_is_ignored(*ngram, &ignored) {
-            continue;
-        }
-
-        // Find the last non-ignored token in the n-gram to penalize.
-        let mut penalized_token = None;
-        for &token in ngram.as_slice().iter().rev() {
-            if ngram_is_ignored(token.into(), &ignored) {
+    if *surgical {
+        // Phase 2 (surgical): For each n-gram in the frequency map with len > 1,
+        // check if the current trailing tokens match the n-gram's prefix. If so,
+        // penalize the LAST token in the n-gram — the one that would complete
+        // the repeated pattern. For unigrams, penalize the token directly (same
+        // as broad mode).
+        //
+        // Example: freq_map contains [The, New, York] with count=2.
+        // Trailing tokens are [..., The, New]. The prefix [The, New] matches,
+        // so we penalize "York" to prevent the trigram from completing.
+        for (ngram, data) in freq_map.iter() {
+            if ngram_is_ignored(*ngram, &ignored) {
                 continue;
             }
-            penalized_token = Some(token);
-            break;
-        }
-        let penalized_token = match penalized_token {
-            Some(token) if (token as usize) < n_vocab => token as usize,
-            _ => continue,
-        };
 
-        let candidate = &mut candidates.data[penalized_token];
+            let slice = ngram.as_slice();
 
-        // Multiplicative penalty: scales with n-gram size. Only fires when
-        // count exceeds max_count.
-        if data.count() > penalty_max_count {
-            // Escalate penalty by n-gram size: unigrams get base penalty,
-            // bigrams get penalty^2, etc.
-            let scaled_penalty = penalty_repeat.powf(ngram.len() as f32);
-            if candidate.logit <= 0.0 {
-                candidate.logit *= scaled_penalty;
+            if slice.len() == 1 {
+                // Unigram: penalize directly if seen enough times.
+                let token = slice[0] as usize;
+                if token >= n_vocab {
+                    continue;
+                }
+                if ngram_is_ignored(slice[0].into(), &ignored) {
+                    continue;
+                }
+                let candidate = &mut candidates.data[token];
+                if data.count() > penalty_max_count {
+                    if candidate.logit <= 0.0 {
+                        candidate.logit *= *penalty_repeat;
+                    } else {
+                        candidate.logit /= *penalty_repeat;
+                    }
+                }
+                candidate.logit -=
+                    (data.count() as f32) * *penalty_freq + *penalty_present;
             } else {
-                candidate.logit /= scaled_penalty;
+                // Multi-token n-gram: check if trailing tokens match the prefix.
+                let prefix = &slice[..slice.len() - 1];
+                let completion_token = *slice.last().unwrap() as usize;
+                if completion_token >= n_vocab {
+                    continue;
+                }
+                if ngram_is_ignored((*slice.last().unwrap()).into(), &ignored) {
+                    continue;
+                }
+
+                // Check if the trailing tokens end with this prefix.
+                let matches = tokens.len() >= prefix.len()
+                    && tokens[tokens.len() - prefix.len()..] == *prefix;
+
+                if matches && data.count() > penalty_max_count {
+                    let candidate = &mut candidates.data[completion_token];
+                    let scaled_penalty =
+                        penalty_repeat.powf(ngram.len() as f32);
+                    if candidate.logit <= 0.0 {
+                        candidate.logit *= scaled_penalty;
+                    } else {
+                        candidate.logit /= scaled_penalty;
+                    }
+                    candidate.logit -=
+                        (data.count() as f32) * *penalty_freq
+                            + *penalty_present;
+                }
             }
         }
+    } else {
+        // Phase 2 (broad): Penalize ALL tracked n-grams. For each n-gram,
+        // penalize the last non-ignored token. This ensures all previously-seen
+        // tokens get their logits reduced.
+        for (ngram, data) in freq_map.iter() {
+            if ngram_is_ignored(*ngram, &ignored) {
+                continue;
+            }
 
-        // Additive penalties: frequency scales with count, presence is binary.
-        candidate.logit -=
-            (data.count() as f32) * *penalty_freq + *penalty_present;
+            // Find the last non-ignored token in the n-gram to penalize.
+            let mut penalized_token = None;
+            for &token in ngram.as_slice().iter().rev() {
+                if ngram_is_ignored(token.into(), &ignored) {
+                    continue;
+                }
+                penalized_token = Some(token);
+                break;
+            }
+            let penalized_token = match penalized_token {
+                Some(token) if (token as usize) < n_vocab => token as usize,
+                _ => continue,
+            };
+
+            let candidate = &mut candidates.data[penalized_token];
+
+            // Multiplicative penalty: scales with n-gram size. Only fires when
+            // count exceeds max_count.
+            if data.count() > penalty_max_count {
+                let scaled_penalty =
+                    penalty_repeat.powf(ngram.len() as f32);
+                if candidate.logit <= 0.0 {
+                    candidate.logit *= scaled_penalty;
+                } else {
+                    candidate.logit /= scaled_penalty;
+                }
+            }
+
+            // Additive penalties: frequency scales with count, presence is
+            // binary.
+            candidate.logit -=
+                (data.count() as f32) * *penalty_freq + *penalty_present;
+        }
     }
 
     // We have modified logit values.
