@@ -1058,8 +1058,8 @@ pub fn apply_sample_repetition_ngram(
 
     // Iterate over possible n-grams at the end of the tokens in order of
     // smallest to largest. Larger n-grams are more penalized than smaller.
-    for slice in (ngram_min_size..ngram_max_size)
-        .filter_map(|n| tokens.get(tokens.len() - n..))
+    for slice in (ngram_min_size..=ngram_max_size)
+        .filter_map(|n| tokens.len().checked_sub(n).and_then(|start| tokens.get(start..)))
     {
         let ngram = NGram::try_from(slice).unwrap();
 
@@ -1075,6 +1075,7 @@ pub fn apply_sample_repetition_ngram(
                 continue;
             }
             penalized_token = Some(token);
+            break;
         }
         let penalized_token = match penalized_token {
             Some(token) => token as usize,
@@ -1101,8 +1102,8 @@ pub fn apply_sample_repetition_ngram(
             }
         }
 
-        candidate.logit -= (data.count() as f32) * *penalty_freq
-            + (data.count() as f32) * *penalty_present;
+        candidate.logit -=
+            (data.count() as f32) * *penalty_freq + *penalty_present;
 
         // We penalize longer ngrams more. Because we work backwards, this will
         // penalize the first token in the ngram the most.
@@ -1239,4 +1240,268 @@ pub(crate) fn choose_candidate(
     // This can happen because of floating point errors
     let last = candidates.len().get() - 1;
     candidates.select(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Candidates;
+    use llama_cpp_sys_3::llama_token_data;
+    use std::path::PathBuf;
+
+    /// Helper: create candidates sorted by id with given logits.
+    fn make_candidates(logits: &[f32]) -> Candidates {
+        let data: Vec<llama_token_data> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &logit)| llama_token_data {
+                id: i as i32,
+                logit,
+                p: 0.0,
+            })
+            .collect();
+        Candidates::from_vec(data)
+    }
+
+    fn load_model() -> crate::Model {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("models/model.gguf");
+        crate::Model::from_file(path, None).unwrap()
+    }
+
+    /// Simulate multiple generation steps, applying the penalty at each step.
+    /// Returns (logits_after, freq_map) so callers can inspect both.
+    fn run_penalty_steps(
+        logits: &[f32],
+        token_history: &[llama_token],
+        opts: &mut RepetitionOptions,
+        steps: usize,
+        model: &crate::Model,
+    ) -> (Vec<f32>, NGramStats) {
+        let mut freq_map = NGramStats::new();
+        let mut result_logits = logits.to_vec();
+
+        for _ in 0..steps {
+            let candidates = make_candidates(&result_logits);
+            let result = apply_sample_repetition_ngram(
+                candidates,
+                token_history,
+                opts,
+                &mut freq_map,
+                model,
+            )
+            .unwrap();
+            result_logits = result.iter().map(|c| c.logit).collect();
+        }
+
+        (result_logits, freq_map)
+    }
+
+    #[test]
+    #[ignore = "requires model"]
+    fn test_repetition_penalty_basic() {
+        let model = load_model();
+        // 10-token vocab, token 5 has highest logit
+        let logits: Vec<f32> =
+            (0..10).map(|i| if i == 5 { 2.0 } else { -1.0 }).collect();
+        let tokens = vec![5_i32];
+
+        // Use presence penalty so the effect is visible on first repeat.
+        let mut opts = RepetitionOptions {
+            penalty_repeat: 1.15,
+            penalty_freq: 0.0,
+            penalty_present: 0.5,
+            ..RepetitionOptions::default()
+        };
+
+        let (after, _) =
+            run_penalty_steps(&logits, &tokens, &mut opts, 1, &model);
+
+        println!("=== Basic unigram penalty (presence=0.5) ===");
+        for i in 0..10 {
+            if (logits[i] - after[i]).abs() > 1e-6 {
+                println!(
+                    "  token {}: {:.4} -> {:.4} (delta {:.4})",
+                    i, logits[i], after[i], after[i] - logits[i]
+                );
+            }
+        }
+
+        // Token 5 should have been penalized
+        assert!(
+            after[5] < logits[5],
+            "token 5 should be penalized: before={}, after={}",
+            logits[5], after[5]
+        );
+        // Other tokens should be unchanged
+        for i in 0..10 {
+            if i != 5 {
+                assert_eq!(
+                    logits[i], after[i],
+                    "token {} should be unchanged",
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires model"]
+    fn test_repetition_penalty_frequency_vs_presence() {
+        let model = load_model();
+        let logits: Vec<f32> =
+            (0..10).map(|i| if i == 3 { 2.0 } else { -1.0 }).collect();
+        // Token 3 is the last token (unigram match)
+        let tokens = vec![3_i32];
+
+        // Frequency only — after 3 steps, count=3, so freq subtracts 3*0.1=0.3
+        let mut freq_opts = RepetitionOptions {
+            penalty_repeat: 1.0,
+            penalty_freq: 0.1,
+            penalty_present: 0.0,
+            ..RepetitionOptions::default()
+        };
+        let (after_freq, _) =
+            run_penalty_steps(&logits, &tokens, &mut freq_opts, 3, &model);
+
+        // Presence only — after 3 steps, each subtracts 0.5, total 1.5
+        let mut pres_opts = RepetitionOptions {
+            penalty_repeat: 1.0,
+            penalty_freq: 0.0,
+            penalty_present: 0.5,
+            ..RepetitionOptions::default()
+        };
+        let (after_pres, _) =
+            run_penalty_steps(&logits, &tokens, &mut pres_opts, 3, &model);
+
+        println!("=== Frequency vs Presence after 3 steps ===");
+        println!(
+            "  freq (0.1):     {:.4} -> {:.4} (delta {:.4})",
+            logits[3], after_freq[3], after_freq[3] - logits[3]
+        );
+        println!(
+            "  presence (0.5): {:.4} -> {:.4} (delta {:.4})",
+            logits[3], after_pres[3], after_pres[3] - logits[3]
+        );
+
+        // Both should reduce the logit
+        assert!(after_freq[3] < logits[3], "freq should reduce logit");
+        assert!(after_pres[3] < logits[3], "presence should reduce logit");
+
+        // Frequency accumulates: step 1 subtracts 1*0.1, step 2 starts from
+        // the already-reduced logit and subtracts 2*0.1, etc. (count grows)
+        // Presence is constant per step: always subtracts 0.5.
+        let freq_delta = (logits[3] - after_freq[3]).abs();
+        let pres_delta = (logits[3] - after_pres[3]).abs();
+        println!(
+            "  freq total delta: {:.4}, pres total delta: {:.4}",
+            freq_delta, pres_delta
+        );
+        // Presence: 3 steps * 0.5 = 1.5
+        assert_approx_eq!(pres_delta, 1.5, 0.01);
+    }
+
+    #[test]
+    #[ignore = "requires model"]
+    fn test_repetition_penalty_multiplicative() {
+        let model = load_model();
+        // The penalty applies to the LAST non-ignored token in each trailing
+        // n-gram. So we test positive and negative logits by putting each as
+        // the last token in separate runs.
+
+        let mut opts = RepetitionOptions {
+            penalty_repeat: 1.5,
+            penalty_freq: 0.0,
+            penalty_present: 0.0,
+            penalty_max_count: NonZeroU8::new(1).unwrap(),
+            ngram_min_size: NonZeroU8::new(1).unwrap(),
+            ngram_max_size: NonZeroU8::new(1).unwrap(),
+            ..RepetitionOptions::default()
+        };
+
+        // Positive logit: token 3 (logit=2.0) is the last token
+        let logits_pos: Vec<f32> =
+            (0..10).map(|i| if i == 3 { 2.0 } else { 0.1 }).collect();
+        let (after_pos_1, _) =
+            run_penalty_steps(&logits_pos, &[3], &mut opts, 1, &model);
+        let (after_pos_2, _) =
+            run_penalty_steps(&logits_pos, &[3], &mut opts, 2, &model);
+
+        // Negative logit: token 7 (logit=-2.0) is the last token
+        let logits_neg: Vec<f32> =
+            (0..10).map(|i| if i == 7 { -2.0 } else { 0.1 }).collect();
+        let (after_neg_1, _) =
+            run_penalty_steps(&logits_neg, &[7], &mut opts, 1, &model);
+        let (after_neg_2, _) =
+            run_penalty_steps(&logits_neg, &[7], &mut opts, 2, &model);
+
+        println!("=== Multiplicative penalty (unigrams, penalty=1.5) ===");
+        println!("Positive logit (token 3, logit=2.0):");
+        println!("  step 1 (count=1): {:.4} -> {:.4}", logits_pos[3], after_pos_1[3]);
+        println!("  step 2 (count=2): {:.4} -> {:.4} (expect {:.4})", logits_pos[3], after_pos_2[3], 2.0 / 1.5);
+        println!("Negative logit (token 7, logit=-2.0):");
+        println!("  step 1 (count=1): {:.4} -> {:.4}", logits_neg[7], after_neg_1[7]);
+        println!("  step 2 (count=2): {:.4} -> {:.4} (expect {:.4})", logits_neg[7], after_neg_2[7], -2.0 * 1.5);
+
+        // Step 1: count=1, not > max_count(1), no penalty
+        assert_eq!(logits_pos[3], after_pos_1[3], "step 1 pos: no penalty");
+        assert_eq!(logits_neg[7], after_neg_1[7], "step 1 neg: no penalty");
+
+        // Step 2: count=2 > 1, penalty fires
+        // Positive logit divided by penalty
+        assert!(after_pos_2[3] < logits_pos[3], "positive logit should decrease");
+        // Negative logit multiplied by penalty (more negative)
+        assert!(after_neg_2[7] < logits_neg[7], "negative logit should become more negative");
+    }
+
+    #[test]
+    #[ignore = "requires model"]
+    fn test_repetition_penalty_escalation() {
+        let model = load_model();
+        // Show how penalty_repeat squaring escalates across ngram sizes.
+        let logits: Vec<f32> = (0..10).map(|_| 1.0).collect();
+        let tokens = vec![1, 2, 3, 4];
+
+        let mut opts = RepetitionOptions {
+            penalty_repeat: 1.15,
+            penalty_freq: 0.0,
+            penalty_present: 0.0,
+            penalty_max_count: NonZeroU8::new(1).unwrap(),
+            ngram_min_size: NonZeroU8::new(1).unwrap(),
+            ngram_max_size: NonZeroU8::new(4).unwrap(),
+            ..RepetitionOptions::default()
+        };
+
+        // 2 steps: first counts, second penalizes
+        let (after, freq_map) =
+            run_penalty_steps(&logits, &tokens, &mut opts, 2, &model);
+
+        println!("=== Escalation across ngram sizes (penalty=1.15) ===");
+        println!("Token logits after 2 steps:");
+        for i in 0..10 {
+            if (logits[i] - after[i]).abs() > 1e-6 {
+                println!(
+                    "  token {}: {:.4} -> {:.6} (ratio {:.4}x)",
+                    i, logits[i], after[i], logits[i] / after[i]
+                );
+            }
+        }
+
+        println!("\nPenalty_repeat value at each ngram size:");
+        let mut p = 1.15_f32;
+        for size in 1..=4 {
+            println!("  size {}: penalty_repeat = {:.6}", size, p);
+            p *= p;
+        }
+
+        println!("\nNGram frequency map:");
+        for (ngram, data) in freq_map.iter() {
+            println!(
+                "  {:?}: count={}, cum_prob={:.4}",
+                ngram.as_slice(),
+                data.count(),
+                data.cum_prob()
+            );
+        }
+    }
 }

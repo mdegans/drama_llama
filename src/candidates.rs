@@ -643,7 +643,7 @@ impl Candidates {
         // Unwrap can never panic because a class invariant is that there is
         // at least one candidiate.
         let max_logit = new.data.first().unwrap().logit;
-        let cum_sum: f64 = new.iter_mut().fold(0.0, |sum, token| {
+        let cum_sum: f64 = new.data.iter_mut().fold(0.0, |sum, token| {
             token.p = (token.logit - max_logit).exp();
             sum + token.p as f64
         });
@@ -773,9 +773,8 @@ impl Candidates {
             }
         }
 
-        unreachable!(
-            "Class invariant violated: There must be at least one candidate."
-        )
+        // All tokens passed the min_logit filter (e.g. all logits are equal).
+        new
     }
 
     /// Tail free sampling.
@@ -952,11 +951,11 @@ impl Candidates {
         let mut b_i;
         let mut sum_ti_bi = 0.0;
         let mut sum_ti_sq = 0.0;
-        for i in 0..m {
+        for i in 0..m - 1 {
             t_i = ((i + 2) as f32 / (i + 1) as f32).ln();
             b_i = (new[i].p / new[i + 1].p).ln();
             sum_ti_bi += t_i * b_i;
-            sum_ti_sq += t_i * b_i;
+            sum_ti_sq += t_i * t_i;
         }
         s_hat = sum_ti_bi / sum_ti_sq;
 
@@ -1019,7 +1018,7 @@ impl Candidates {
         // Truncate the words with surprise values greater than mu
         let mut end: usize = m;
         for (i, candidate) in new.data[..m].iter().enumerate().skip(1) {
-            if candidate.p.log2() > mu {
+            if -candidate.p.log2() > mu {
                 end = i;
                 break;
             }
