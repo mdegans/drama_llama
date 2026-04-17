@@ -28,6 +28,10 @@ pub use prompt::{Block, Content, Message, Prompt, Role, Tool, ToolChoice};
 mod chat_template;
 pub use chat_template::{ChatTemplate, ChatTemplateError, RenderOptions};
 
+/// Re-export of [`minijinja`] for callers who need to construct
+/// [`minijinja::value::Value`]s for [`RenderOptions::with_extra`].
+pub use minijinja;
+
 mod tool_choice;
 pub use tool_choice::{
     build_grammar_source_for_debug, grammar_for_prompt,

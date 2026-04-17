@@ -23,9 +23,9 @@ use std::{num::NonZeroUsize, path::PathBuf};
 
 use clap::Parser;
 use drama_llama::{
-    grammar_for_prompt, silence_logs, ChatTemplate, Content, Engine,
-    PredictOptions, Prompt, RenderOptions, Role, SampleOptions, SamplingMode,
-    Tool, ToolChoice, ToolChoiceOptions,
+    grammar_for_prompt, minijinja::Value as JinjaValue, silence_logs,
+    ChatTemplate, Content, Engine, PredictOptions, Prompt, RenderOptions, Role,
+    SampleOptions, SamplingMode, Tool, ToolChoice, ToolChoiceOptions,
 };
 use serde_json::json;
 
@@ -129,20 +129,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         name: "count_letters".into(),
     });
 
-    let rendered = tmpl.render_with(
-        &prompt,
-        &RenderOptions::default().with_generation_prompt(true),
-    )?;
+    // Turn on cogito's thinking mode via the template's `enable_thinking`
+    // variable. The template injects an instruction into the system
+    // prompt that unlocks the model's reasoning pass, which pairs well
+    // with `allow_thought` on the grammar side.
+    let render_opts = RenderOptions::default()
+        .with_generation_prompt(true)
+        .with_extra("enable_thinking", JinjaValue::from(true));
+    let rendered = tmpl.render_with(&prompt, &render_opts)?;
     if args.verbose {
         println!("=== rendered prompt (turn 1) ===\n{rendered}\n===");
     }
 
     // Force BOTH the outer tool-call shape AND the tool's input_schema.
-    // Cogito / Qwen / most non-Llama templates use `"arguments"` rather
-    // than Llama 3.1's `"parameters"`.
+    // Cogito / Qwen / Hermes templates want tool calls wrapped in
+    // `<tool_call>…</tool_call>` and use `"arguments"` rather than
+    // Llama 3.1's bare `{"name": ..., "parameters": ...}`.
+    //
+    // `allow_thought` lets the model emit a `<think>…</think>` preamble
+    // before the JSON — useful for reasoning models that need to work
+    // out which argument goes where before committing.
     let opts = ToolChoiceOptions {
         strict_schema: true,
         arguments_field: "arguments",
+        wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
+        allow_thought: true,
         ..ToolChoiceOptions::default()
     };
     if args.verbose {
@@ -212,7 +223,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let rendered2 = tmpl.render_with(
         &prompt,
-        &RenderOptions::default().with_generation_prompt(true),
+        &RenderOptions::default()
+            .with_generation_prompt(true)
+            .with_extra("enable_thinking", JinjaValue::from(true)),
     )?;
     if args.verbose {
         println!("=== rendered prompt (turn 2) ===\n{rendered2}\n===");
