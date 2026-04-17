@@ -23,9 +23,9 @@ use std::{num::NonZeroUsize, path::PathBuf};
 
 use clap::Parser;
 use drama_llama::{
-    grammar_for_prompt, ChatTemplate, Content, Engine, PredictOptions, Prompt,
-    RenderOptions, Role, SampleOptions, SamplingMode, Tool, ToolChoice,
-    ToolChoiceOptions,
+    grammar_for_prompt, silence_logs, ChatTemplate, Content, Engine,
+    PredictOptions, Prompt, RenderOptions, Role, SampleOptions, SamplingMode,
+    Tool, ToolChoice, ToolChoiceOptions,
 };
 use serde_json::json;
 
@@ -46,6 +46,10 @@ struct Args {
     /// Print the raw rendered prompts at each turn.
     #[arg(long)]
     verbose: bool,
+    /// Leave llama.cpp + ggml log spew enabled (they're silenced by
+    /// default for readability).
+    #[arg(long)]
+    loud: bool,
 }
 
 /// The actual tool. Counts occurrences of `letter` in `string`,
@@ -81,6 +85,11 @@ fn slice_json_object(s: &str) -> Option<&str> {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if !args.loud {
+        // Hush llama.cpp + ggml before any context is created so even
+        // model-load chatter stays quiet.
+        silence_logs();
+    }
     let model_path = args.model.unwrap_or_else(|| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
     });

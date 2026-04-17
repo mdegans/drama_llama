@@ -7,18 +7,19 @@ use crate::{
 use std::{num::NonZeroUsize, path::PathBuf, sync::Mutex};
 
 use llama_cpp_sys_3::{
-    ggml_log_callback, ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED,
-    llama_backend_free, llama_backend_init, llama_context,
-    llama_context_default_params, llama_context_params, llama_decode,
-    llama_free, llama_get_embeddings_ith, llama_get_logits_ith,
-    llama_get_memory, llama_log_set, llama_memory_clear, llama_memory_seq_add,
-    llama_memory_seq_cp, llama_memory_seq_div, llama_memory_seq_keep,
-    llama_memory_seq_pos_max, llama_memory_seq_rm, llama_model_params,
-    llama_n_batch, llama_n_ctx, llama_new_context_with_model, llama_numa_init,
-    llama_perf_context, llama_perf_context_data, llama_perf_context_reset,
-    llama_pos, llama_seq_id, llama_set_n_threads, llama_state_get_data,
-    llama_state_get_size, llama_state_set_data, llama_supports_gpu_offload,
-    llama_supports_mlock, llama_supports_mmap, llama_token,
+    ggml_log_callback, ggml_log_level, ggml_log_set,
+    ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED, llama_backend_free,
+    llama_backend_init, llama_context, llama_context_default_params,
+    llama_context_params, llama_decode, llama_free, llama_get_embeddings_ith,
+    llama_get_logits_ith, llama_get_memory, llama_log_set, llama_memory_clear,
+    llama_memory_seq_add, llama_memory_seq_cp, llama_memory_seq_div,
+    llama_memory_seq_keep, llama_memory_seq_pos_max, llama_memory_seq_rm,
+    llama_model_params, llama_n_batch, llama_n_ctx,
+    llama_new_context_with_model, llama_numa_init, llama_perf_context,
+    llama_perf_context_data, llama_perf_context_reset, llama_pos, llama_seq_id,
+    llama_set_n_threads, llama_state_get_data, llama_state_get_size,
+    llama_state_set_data, llama_supports_gpu_offload, llama_supports_mlock,
+    llama_supports_mmap, llama_token,
 };
 
 use thiserror::Error;
@@ -26,6 +27,39 @@ use thiserror::Error;
 /// Global engine count. When this drops to 0, the llama backend is freed in
 /// the last [`Engine`]'s `Drop` implementation.
 static ENGINE_COUNT: Mutex<usize> = Mutex::new(0);
+
+/// Silence `llama.cpp` + `ggml` log output.
+///
+/// Installs a no-op callback on both loggers. llama.cpp and ggml maintain
+/// separate log sinks — Metal pipeline compile chatter comes from the ggml
+/// side, model-load prose from the llama side — so both need to be hushed
+/// for quiet generation.
+///
+/// Idempotent. Safe to call before or after creating an [`Engine`]. Call
+/// [`restore_default_logs`] to undo.
+pub fn silence_logs() {
+    unsafe {
+        llama_log_set(Some(discard_log), std::ptr::null_mut());
+        ggml_log_set(Some(discard_log), std::ptr::null_mut());
+    }
+}
+
+/// Restore default (stderr) logging. Inverse of [`silence_logs`].
+pub fn restore_default_logs() {
+    unsafe {
+        llama_log_set(None, std::ptr::null_mut());
+        ggml_log_set(None, std::ptr::null_mut());
+    }
+}
+
+/// No-op log callback used by [`silence_logs`]. Matches the
+/// `ggml_log_callback` / `llama_log_set` C signature.
+unsafe extern "C" fn discard_log(
+    _level: ggml_log_level,
+    _msg: *const std::os::raw::c_char,
+    _user_data: *mut std::ffi::c_void,
+) {
+}
 
 /// Possible errors when creating a new [`Engine`].
 #[derive(Error, Debug)]
@@ -223,7 +257,8 @@ impl Engine {
         unsafe { llama_perf_context_reset(self.context) };
     }
 
-    /// Set callback for all future logging.
+    /// Set the llama.cpp log callback. Does NOT touch the ggml logger —
+    /// use [`silence_logs`] to hush both at once.
     pub fn set_log_callback(
         &mut self,
         callback: ggml_log_callback,
@@ -235,6 +270,19 @@ impl Engine {
                 callback_data.unwrap_or(std::ptr::null_mut()),
             );
         }
+    }
+
+    /// Silence both llama.cpp and ggml log output for the remainder of
+    /// this process. Convenience wrapper around [`silence_logs`] that
+    /// returns `self` for chaining on construction, e.g.:
+    ///
+    /// ```no_run
+    /// # use drama_llama::Engine;
+    /// let engine = Engine::from_path("models/model.gguf").unwrap().quiet();
+    /// ```
+    pub fn quiet(self) -> Self {
+        silence_logs();
+        self
     }
 
     /// Clear the memory (KV cache).

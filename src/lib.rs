@@ -41,7 +41,7 @@ mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};
 
 mod engine;
-pub use engine::{Engine, NewError};
+pub use engine::{restore_default_logs, silence_logs, Engine, NewError};
 
 mod predictor;
 pub use predictor::{
