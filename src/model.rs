@@ -2,17 +2,16 @@ use derive_more::From;
 use llama_cpp_sys_3::{
     llama_chat_apply_template, llama_chat_message, llama_model,
     llama_model_default_params, llama_model_desc, llama_model_free,
-    llama_model_load_from_file, llama_model_meta_count,
+    llama_model_get_vocab, llama_model_load_from_file, llama_model_meta_count,
     llama_model_meta_key_by_index, llama_model_meta_val_str,
     llama_model_meta_val_str_by_index, llama_model_n_ctx_train,
     llama_model_n_embd, llama_model_n_params, llama_model_params,
     llama_model_quantize, llama_model_quantize_default_params,
     llama_model_quantize_params, llama_model_rope_freq_scale_train,
-    llama_model_rope_type, llama_model_size, llama_model_get_vocab,
-    llama_token, llama_token_to_piece, llama_tokenize, llama_vocab,
-    llama_vocab_bos, llama_vocab_eos, llama_vocab_eot,
-    llama_vocab_fim_mid, llama_vocab_fim_pre, llama_vocab_fim_suf,
-    llama_vocab_get_add_bos, llama_vocab_get_add_eos,
+    llama_model_rope_type, llama_model_size, llama_token, llama_token_to_piece,
+    llama_tokenize, llama_vocab, llama_vocab_bos, llama_vocab_eos,
+    llama_vocab_eot, llama_vocab_fim_mid, llama_vocab_fim_pre,
+    llama_vocab_fim_suf, llama_vocab_get_add_bos, llama_vocab_get_add_eos,
     llama_vocab_get_score, llama_vocab_get_text, llama_vocab_n_tokens,
     llama_vocab_nl, llama_vocab_type,
 };
@@ -164,7 +163,10 @@ impl Model {
             None
         } else {
             let vocab = unsafe { llama_model_get_vocab(model) };
-            Some(Self { inner: model, vocab })
+            Some(Self {
+                inner: model,
+                vocab,
+            })
         }
     }
 
@@ -805,7 +807,10 @@ mod tests {
             let text = model.token_to_text(t);
             text.contains("Hello") || text.contains("hello")
         });
-        assert!(any_hello, "No token in the tokenized 'Hello' contains the expected text");
+        assert!(
+            any_hello,
+            "No token in the tokenized 'Hello' contains the expected text"
+        );
 
         // test template application
         let messages = vec![

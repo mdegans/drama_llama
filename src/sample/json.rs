@@ -65,10 +65,7 @@ impl JsonState {
     ///
     /// [`finalize`]: Self::finalize
     pub fn is_complete(&self) -> bool {
-        matches!(
-            self.stack.as_slice(),
-            [Frame::Root { seen_value: true }]
-        )
+        matches!(self.stack.as_slice(), [Frame::Root { seen_value: true }])
     }
 
     /// Current parse stack depth. Useful for UI status.
@@ -148,7 +145,8 @@ impl JsonState {
                             }
                             if b == b'"' {
                                 *state = ObjState::AwaitingColon;
-                                self.stack.push(Frame::String(StringState::Normal));
+                                self.stack
+                                    .push(Frame::String(StringState::Normal));
                                 return Ok(());
                             }
                         }
@@ -158,7 +156,8 @@ impl JsonState {
                             }
                             if b == b'"' {
                                 *state = ObjState::AwaitingColon;
-                                self.stack.push(Frame::String(StringState::Normal));
+                                self.stack
+                                    .push(Frame::String(StringState::Normal));
                                 return Ok(());
                             }
                         }
@@ -193,40 +192,38 @@ impl JsonState {
                     }
                     return Err(JsonError::UnexpectedByte(b));
                 }
-                Frame::Array(state) => {
-                    match state {
-                        ArrState::EmptyOrAwaitingValue => {
-                            if is_ws(b) {
-                                return Ok(());
-                            }
-                            if b == b']' {
-                                self.stack.pop();
-                                return self.on_value_complete();
-                            }
-                            return self.start_value(b);
+                Frame::Array(state) => match state {
+                    ArrState::EmptyOrAwaitingValue => {
+                        if is_ws(b) {
+                            return Ok(());
                         }
-                        ArrState::AwaitingValue => {
-                            if is_ws(b) {
-                                return Ok(());
-                            }
-                            return self.start_value(b);
+                        if b == b']' {
+                            self.stack.pop();
+                            return self.on_value_complete();
                         }
-                        ArrState::AwaitingCommaOrClose => {
-                            if is_ws(b) {
-                                return Ok(());
-                            }
-                            if b == b',' {
-                                *state = ArrState::AwaitingValue;
-                                return Ok(());
-                            }
-                            if b == b']' {
-                                self.stack.pop();
-                                return self.on_value_complete();
-                            }
-                            return Err(JsonError::UnexpectedByte(b));
-                        }
+                        return self.start_value(b);
                     }
-                }
+                    ArrState::AwaitingValue => {
+                        if is_ws(b) {
+                            return Ok(());
+                        }
+                        return self.start_value(b);
+                    }
+                    ArrState::AwaitingCommaOrClose => {
+                        if is_ws(b) {
+                            return Ok(());
+                        }
+                        if b == b',' {
+                            *state = ArrState::AwaitingValue;
+                            return Ok(());
+                        }
+                        if b == b']' {
+                            self.stack.pop();
+                            return self.on_value_complete();
+                        }
+                        return Err(JsonError::UnexpectedByte(b));
+                    }
+                },
                 Frame::String(state) => {
                     let next = match state {
                         StringState::Normal => match b {
@@ -241,8 +238,8 @@ impl JsonState {
                             _ => Some(StringState::Normal),
                         },
                         StringState::AfterEscape => match b {
-                            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n'
-                            | b'r' | b't' => Some(StringState::Normal),
+                            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r'
+                            | b't' => Some(StringState::Normal),
                             b'u' => Some(StringState::Hex(0)),
                             _ => return Err(JsonError::UnexpectedByte(b)),
                         },
@@ -301,9 +298,18 @@ impl JsonState {
             b'{' => Frame::Object(ObjState::EmptyOrAwaitingKey),
             b'[' => Frame::Array(ArrState::EmptyOrAwaitingValue),
             b'"' => Frame::String(StringState::Normal),
-            b't' => Frame::Literal { kind: LitKind::True, idx: 1 },
-            b'f' => Frame::Literal { kind: LitKind::False, idx: 1 },
-            b'n' => Frame::Literal { kind: LitKind::Null, idx: 1 },
+            b't' => Frame::Literal {
+                kind: LitKind::True,
+                idx: 1,
+            },
+            b'f' => Frame::Literal {
+                kind: LitKind::False,
+                idx: 1,
+            },
+            b'n' => Frame::Literal {
+                kind: LitKind::Null,
+                idx: 1,
+            },
             b'-' => Frame::Number(NumState::SeenMinus),
             b'0' => Frame::Number(NumState::SeenZero),
             b'1'..=b'9' => Frame::Number(NumState::SeenInt),
@@ -334,8 +340,7 @@ impl JsonState {
                 _ => return Err(JsonError::Internal),
             },
             Frame::Array(state) => match state {
-                ArrState::EmptyOrAwaitingValue
-                | ArrState::AwaitingValue => {
+                ArrState::EmptyOrAwaitingValue | ArrState::AwaitingValue => {
                     *state = ArrState::AwaitingCommaOrClose;
                 }
                 _ => return Err(JsonError::Internal),
@@ -355,14 +360,19 @@ impl JsonState {
 #[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Debug, PartialEq)]
 enum Frame {
-    Root { seen_value: bool },
+    Root {
+        seen_value: bool,
+    },
     Object(ObjState),
     Array(ArrState),
     String(StringState),
     Number(NumState),
     /// Matching a fixed literal (`true`, `false`, `null`). `idx` is the
     /// byte offset of the next expected byte within the literal.
-    Literal { kind: LitKind, idx: u8 },
+    Literal {
+        kind: LitKind,
+        idx: u8,
+    },
 }
 
 #[cfg_attr(
@@ -542,7 +552,8 @@ pub(crate) fn json_filter(
     model: &Model,
 ) -> Candidates {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    let mut kept: Vec<llama_token_data> = Vec::with_capacity(candidates.len().get());
+    let mut kept: Vec<llama_token_data> =
+        Vec::with_capacity(candidates.len().get());
     for cand in candidates.as_slice() {
         buf.clear();
         token_to_piece_ref(cand.id, model, &mut buf);
@@ -650,8 +661,21 @@ mod tests {
     #[test]
     fn numbers_accept() {
         for s in &[
-            "0", "1", "-1", "123", "-123", "0.5", "-0.5", "1.5", "1e10",
-            "1E10", "1e+10", "1e-10", "-1.5e+10", "0.0", "1234567890",
+            "0",
+            "1",
+            "-1",
+            "123",
+            "-123",
+            "0.5",
+            "-0.5",
+            "1.5",
+            "1e10",
+            "1E10",
+            "1e+10",
+            "1e-10",
+            "-1.5e+10",
+            "0.0",
+            "1234567890",
         ] {
             assert!(accepts_complete(s), "should accept {s}");
         }
@@ -754,12 +778,7 @@ mod tests {
     #[test]
     fn whitespace_permitted() {
         // Leading and internal whitespace is RFC-valid and permitted.
-        for s in &[
-            "  true",
-            "\t\nfalse",
-            r#"  { "a" : 1 }"#,
-            "\n[ 1 , 2 ]",
-        ] {
+        for s in &["  true", "\t\nfalse", r#"  { "a" : 1 }"#, "\n[ 1 , 2 ]"] {
             assert!(accepts_complete(s), "should accept {s}");
         }
     }
@@ -923,13 +942,11 @@ mod tests {
     #[test]
     #[ignore = "requires model"]
     fn json_integration_character_sheet() {
-        use crate::{
-            Engine, PredictOptions, SampleOptions, SamplingMode,
-        };
+        use crate::{Engine, PredictOptions, SampleOptions, SamplingMode};
         use std::{num::NonZeroUsize, path::PathBuf};
 
-        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("models/model.gguf");
+        let model_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
         let mut engine = Engine::from_path(model_path).unwrap();
 
         // Ask for a JSON character sheet. We use a minimalist system-style
@@ -951,10 +968,7 @@ mod tests {
         // JSON first so invalid tokens are pruned before locally-typical
         // sampling picks among what remains.
         opts.sample_options = SampleOptions {
-            modes: vec![
-                SamplingMode::json(),
-                SamplingMode::locally_typical(),
-            ],
+            modes: vec![SamplingMode::json(), SamplingMode::locally_typical()],
             ..SampleOptions::default()
         };
 
@@ -970,20 +984,17 @@ mod tests {
         // The stop machinery includes the stop sequence in the output, so
         // the EOS piece (e.g. `<|eot_id|>` for Llama 3.1) trails the JSON
         // document. Strip it before parsing.
-        let trimmed = output
-            .trim_end_matches(eos_piece.as_str())
-            .trim_end();
+        let trimmed = output.trim_end_matches(eos_piece.as_str()).trim_end();
 
         // Must parse as valid JSON of any shape.
         let parsed: rocket::serde::json::Value =
-            rocket::serde::json::from_str(trimmed)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "output must be valid JSON (constraint guarantees \
+            rocket::serde::json::from_str(trimmed).unwrap_or_else(|e| {
+                panic!(
+                    "output must be valid JSON (constraint guarantees \
                          this). parse error: {e}\noutput: {output:?}\n\
                          trimmed: {trimmed:?}"
-                    )
-                });
+                )
+            });
 
         // Log what we got. We intentionally do not assert schema: the
         // constraint is syntactic, not semantic.

@@ -372,7 +372,12 @@ impl Candidates {
         let sorted =
             self.is_sorted().by_logit().is_some_and(|n| n.get() == size);
         std::mem::forget(self);
-        llama_token_data_array { size, data, sorted, selected: -1 }
+        llama_token_data_array {
+            size,
+            data,
+            sorted,
+            selected: -1,
+        }
     }
 
     /// Create a Candidates container from `llama_token_data_array`. This will

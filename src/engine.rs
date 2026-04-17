@@ -96,9 +96,16 @@ impl Engine {
             if *count == 1 {
                 unsafe {
                     llama_backend_init();
-                    llama_numa_init(numa_strategy.unwrap_or(
-                        ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED.try_into().unwrap(),
-                    ).try_into().unwrap());
+                    llama_numa_init(
+                        numa_strategy
+                            .unwrap_or(
+                                ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED
+                                    .try_into()
+                                    .unwrap(),
+                            )
+                            .try_into()
+                            .unwrap(),
+                    );
                 }
             }
         }
@@ -201,9 +208,8 @@ impl Engine {
         let len = self.state_size();
         assert_eq!(state.len(), len);
 
-        let copied = unsafe {
-            llama_state_set_data(self.context, state.as_ptr(), len)
-        };
+        let copied =
+            unsafe { llama_state_set_data(self.context, state.as_ptr(), len) };
         assert_eq!(copied, len);
     }
 

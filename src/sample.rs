@@ -1,8 +1,4 @@
-use crate::{
-    model::Vocab,
-    ngram::NGramStats,
-    Candidates, Probability,
-};
+use crate::{model::Vocab, ngram::NGramStats, Candidates, Probability};
 
 use llama_cpp_sys_3::llama_token;
 use xorshift::Rng;
@@ -409,7 +405,6 @@ pub enum SamplingMode {
     ///
     /// [`PredictOptions::stop_sequences`]: crate::PredictOptions::stop_sequences
     /// [`PredictOptions::add_model_stops`]: crate::PredictOptions::add_model_stops
-    /// [`TokenPredictor`]: crate::TokenPredictor
     Json(
         #[cfg_attr(
             feature = "serde",
@@ -764,37 +759,89 @@ impl PartialEq for SamplingMode {
         match (self, other) {
             (Self::Greedy, Self::Greedy) => true,
             (
-                Self::TopP { p: p1, min_keep: k1 },
-                Self::TopP { p: p2, min_keep: k2 },
+                Self::TopP {
+                    p: p1,
+                    min_keep: k1,
+                },
+                Self::TopP {
+                    p: p2,
+                    min_keep: k2,
+                },
             ) => p1 == p2 && k1 == k2,
             (Self::TopK { k: k1 }, Self::TopK { k: k2 }) => k1 == k2,
             (
-                Self::MinP { p: p1, min_keep: k1 },
-                Self::MinP { p: p2, min_keep: k2 },
+                Self::MinP {
+                    p: p1,
+                    min_keep: k1,
+                },
+                Self::MinP {
+                    p: p2,
+                    min_keep: k2,
+                },
             ) => p1 == p2 && k1 == k2,
             (
-                Self::TailFree { z: z1, min_keep: k1 },
-                Self::TailFree { z: z2, min_keep: k2 },
+                Self::TailFree {
+                    z: z1,
+                    min_keep: k1,
+                },
+                Self::TailFree {
+                    z: z2,
+                    min_keep: k2,
+                },
             ) => z1 == z2 && k1 == k2,
             (
-                Self::LocallyTypical { p: p1, min_keep: k1 },
-                Self::LocallyTypical { p: p2, min_keep: k2 },
+                Self::LocallyTypical {
+                    p: p1,
+                    min_keep: k1,
+                },
+                Self::LocallyTypical {
+                    p: p2,
+                    min_keep: k2,
+                },
             ) => p1 == p2 && k1 == k2,
             (
-                Self::Mirostat { tau: t1, eta: e1, max_keep: m1 },
-                Self::Mirostat { tau: t2, eta: e2, max_keep: m2 },
+                Self::Mirostat {
+                    tau: t1,
+                    eta: e1,
+                    max_keep: m1,
+                },
+                Self::Mirostat {
+                    tau: t2,
+                    eta: e2,
+                    max_keep: m2,
+                },
             ) => t1 == t2 && e1 == e2 && m1 == m2,
             (
-                Self::MirostatV2 { tau: t1, eta: e1, max_keep: m1 },
-                Self::MirostatV2 { tau: t2, eta: e2, max_keep: m2 },
+                Self::MirostatV2 {
+                    tau: t1,
+                    eta: e1,
+                    max_keep: m1,
+                },
+                Self::MirostatV2 {
+                    tau: t2,
+                    eta: e2,
+                    max_keep: m2,
+                },
             ) => t1 == t2 && e1 == e2 && m1 == m2,
             (
-                Self::SplitP { min_keep: a1, max_keep: b1 },
-                Self::SplitP { min_keep: a2, max_keep: b2 },
+                Self::SplitP {
+                    min_keep: a1,
+                    max_keep: b1,
+                },
+                Self::SplitP {
+                    min_keep: a2,
+                    max_keep: b2,
+                },
             ) => a1 == a2 && b1 == b2,
             (
-                Self::SplitL { min_keep: a1, max_keep: b1 },
-                Self::SplitL { min_keep: a2, max_keep: b2 },
+                Self::SplitL {
+                    min_keep: a1,
+                    max_keep: b1,
+                },
+                Self::SplitL {
+                    min_keep: a2,
+                    max_keep: b2,
+                },
             ) => a1 == a2 && b1 == b2,
             // Two `Json` variants compare equal if they share the same Arc
             // (identity) OR if their locked states are structurally equal. A
@@ -820,7 +867,6 @@ pub enum SampleError {
 }
 
 static_assertions::assert_impl_all!(SampleError: Send, Sync);
-
 
 /// Sample a token from the candidates.
 pub(crate) fn sample_token(
@@ -970,4 +1016,3 @@ pub(crate) fn choose_candidate(
     let last = candidates.len().get() - 1;
     candidates.select(last)
 }
-

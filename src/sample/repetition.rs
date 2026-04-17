@@ -475,9 +475,12 @@ pub fn apply_sample_repetition_ngram(
 
     // Phase 1: Count trailing n-grams to update the frequency map with newly
     // generated tokens.
-    for slice in (ngram_min_size..=ngram_max_size)
-        .filter_map(|n| tokens.len().checked_sub(n).and_then(|start| tokens.get(start..)))
-    {
+    for slice in (ngram_min_size..=ngram_max_size).filter_map(|n| {
+        tokens
+            .len()
+            .checked_sub(n)
+            .and_then(|start| tokens.get(start..))
+    }) {
         let ngram = NGram::try_from(slice).unwrap();
         if ngram_is_ignored(ngram, &ignored) {
             continue;
@@ -545,9 +548,8 @@ pub fn apply_sample_repetition_ngram(
                     } else {
                         candidate.logit /= scaled_penalty;
                     }
-                    candidate.logit -=
-                        (data.count() as f32) * *penalty_freq
-                            + *penalty_present;
+                    candidate.logit -= (data.count() as f32) * *penalty_freq
+                        + *penalty_present;
                 }
             }
         }
@@ -579,8 +581,7 @@ pub fn apply_sample_repetition_ngram(
             // Multiplicative penalty: scales with n-gram size. Only fires when
             // count exceeds max_count.
             if data.count() > penalty_max_count {
-                let scaled_penalty =
-                    penalty_repeat.powf(ngram.len() as f32);
+                let scaled_penalty = penalty_repeat.powf(ngram.len() as f32);
                 if candidate.logit <= 0.0 {
                     candidate.logit *= scaled_penalty;
                 } else {
@@ -681,7 +682,10 @@ mod tests {
             if (logits[i] - after[i]).abs() > 1e-6 {
                 println!(
                     "  token {}: {:.4} -> {:.4} (delta {:.4})",
-                    i, logits[i], after[i], after[i] - logits[i]
+                    i,
+                    logits[i],
+                    after[i],
+                    after[i] - logits[i]
                 );
             }
         }
@@ -690,7 +694,8 @@ mod tests {
         assert!(
             after[5] < logits[5],
             "token 5 should be penalized: before={}, after={}",
-            logits[5], after[5]
+            logits[5],
+            after[5]
         );
         // Other tokens should be unchanged
         for i in 0..10 {
@@ -736,11 +741,15 @@ mod tests {
         println!("=== Frequency vs Presence after 3 steps ===");
         println!(
             "  freq (0.1):     {:.4} -> {:.4} (delta {:.4})",
-            logits[3], after_freq[3], after_freq[3] - logits[3]
+            logits[3],
+            after_freq[3],
+            after_freq[3] - logits[3]
         );
         println!(
             "  presence (0.5): {:.4} -> {:.4} (delta {:.4})",
-            logits[3], after_pres[3], after_pres[3] - logits[3]
+            logits[3],
+            after_pres[3],
+            after_pres[3] - logits[3]
         );
 
         // Both should reduce the logit
@@ -796,11 +805,27 @@ mod tests {
 
         println!("=== Multiplicative penalty (unigrams, penalty=1.5) ===");
         println!("Positive logit (token 3, logit=2.0):");
-        println!("  step 1 (count=1): {:.4} -> {:.4}", logits_pos[3], after_pos_1[3]);
-        println!("  step 2 (count=2): {:.4} -> {:.4} (expect {:.4})", logits_pos[3], after_pos_2[3], 2.0 / 1.5);
+        println!(
+            "  step 1 (count=1): {:.4} -> {:.4}",
+            logits_pos[3], after_pos_1[3]
+        );
+        println!(
+            "  step 2 (count=2): {:.4} -> {:.4} (expect {:.4})",
+            logits_pos[3],
+            after_pos_2[3],
+            2.0 / 1.5
+        );
         println!("Negative logit (token 7, logit=-2.0):");
-        println!("  step 1 (count=1): {:.4} -> {:.4}", logits_neg[7], after_neg_1[7]);
-        println!("  step 2 (count=2): {:.4} -> {:.4} (expect {:.4})", logits_neg[7], after_neg_2[7], -2.0 * 1.5);
+        println!(
+            "  step 1 (count=1): {:.4} -> {:.4}",
+            logits_neg[7], after_neg_1[7]
+        );
+        println!(
+            "  step 2 (count=2): {:.4} -> {:.4} (expect {:.4})",
+            logits_neg[7],
+            after_neg_2[7],
+            -2.0 * 1.5
+        );
 
         // Step 1: count=1, not > max_count(1), no penalty
         assert_eq!(logits_pos[3], after_pos_1[3], "step 1 pos: no penalty");
@@ -808,9 +833,15 @@ mod tests {
 
         // Step 2: count=2 > 1, penalty fires
         // Positive logit divided by penalty
-        assert!(after_pos_2[3] < logits_pos[3], "positive logit should decrease");
+        assert!(
+            after_pos_2[3] < logits_pos[3],
+            "positive logit should decrease"
+        );
         // Negative logit multiplied by penalty (more negative)
-        assert!(after_neg_2[7] < logits_neg[7], "negative logit should become more negative");
+        assert!(
+            after_neg_2[7] < logits_neg[7],
+            "negative logit should become more negative"
+        );
     }
 
     #[test]
@@ -841,7 +872,10 @@ mod tests {
             if (logits[i] - after[i]).abs() > 1e-6 {
                 println!(
                     "  token {}: {:.4} -> {:.6} (ratio {:.4}x)",
-                    i, logits[i], after[i], logits[i] / after[i]
+                    i,
+                    logits[i],
+                    after[i],
+                    logits[i] / after[i]
                 );
             }
         }
