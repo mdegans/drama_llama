@@ -156,7 +156,7 @@ impl ChatTemplate {
         opts: &RenderOptions<'_>,
     ) -> Result<String, ChatTemplateError> {
         let messages = build_messages(prompt);
-        let tools_value = match prompt.tools.as_ref() {
+        let tools_value = match prompt.functions.as_ref() {
             Some(ts) if !ts.is_empty() => JinjaValue::from_serialize(ts),
             _ => JinjaValue::from(()), // renders as None / null
         };
@@ -569,11 +569,14 @@ mod tests {
 {% endif %}"#;
 
     fn simple_prompt() -> Prompt<'static> {
-        Prompt::new()
-            .with_system("You are helpful.")
-            .push_user("Hi!")
-            .push_assistant("Hello!")
-            .push_user("What is 2+2?")
+        Prompt::default()
+            .set_system("You are helpful.")
+            .add_message((Role::User, "Hi!"))
+            .unwrap()
+            .add_message((Role::Assistant, "Hello!"))
+            .unwrap()
+            .add_message((Role::User, "What is 2+2?"))
+            .unwrap()
     }
 
     fn tmpl() -> ChatTemplate {
@@ -612,7 +615,7 @@ mod tests {
 
     #[test]
     fn omits_system_when_none() {
-        let p = Prompt::new().push_user("hi");
+        let p = Prompt::default().add_message((Role::User, "hi")).unwrap();
         let out = tmpl().render(&p, false).unwrap();
         assert!(!out.contains("<|start_header_id|>system"));
         assert!(out.contains(
@@ -636,7 +639,8 @@ mod tests {
                 role: Role::Assistant,
                 content,
             }],
-            tools: None,
+            functions: None,
+            ..Default::default()
         };
         let out = tmpl().render(&p, false).unwrap();
         assert!(out.contains("<think>I should be concise.</think>Hello!"));
@@ -646,7 +650,7 @@ mod tests {
     fn raise_exception_surfaces_as_error() {
         let src = r#"{{ raise_exception("boom") }}"#.to_owned();
         let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
-        let err = t.render(&Prompt::new(), false).unwrap_err();
+        let err = t.render(&Prompt::default(), false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("boom"), "error must surface message: {msg}");
     }
@@ -655,7 +659,7 @@ mod tests {
     fn strftime_now_renders_current_year() {
         let src = r#"{{ strftime_now("%Y-%m-%d") }}"#.to_owned();
         let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
-        let out = t.render(&Prompt::new(), false).unwrap();
+        let out = t.render(&Prompt::default(), false).unwrap();
         // Loose assertion: must look like YYYY-MM-DD with current millennium.
         assert!(out.starts_with("20"), "expected 20YY-MM-DD, got {out}");
         assert_eq!(out.len(), 10);
@@ -672,7 +676,8 @@ mod tests {
                     Block::text("world"),
                 ]),
             }],
-            tools: None,
+            functions: None,
+            ..Default::default()
         };
         let out = tmpl().render(&p, false).unwrap();
         assert!(out.contains("Hello world"));
@@ -748,7 +753,8 @@ mod tests {
                     "What's the weather in Paris?",
                 )),
             }],
-            tools: Some(vec![tool]),
+            functions: Some(vec![tool]),
+            ..Default::default()
         };
 
         let opts = RenderOptions::default()
@@ -810,7 +816,8 @@ mod tests {
                     content: Content::MultiPart(vec![Block::ToolUse { call }]),
                 },
             ],
-            tools: None,
+            functions: None,
+            ..Default::default()
         };
 
         let out = tmpl.render(&prompt, false).unwrap();

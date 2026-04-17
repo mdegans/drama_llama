@@ -23,14 +23,15 @@ mod candidates;
 pub use candidates::{Candidates, Sorted, TokenDataArray};
 
 pub mod prompt;
-pub use prompt::{Block, Content, Message, Prompt, Role, Tool};
+pub use prompt::{Block, Content, Message, Prompt, Role, Tool, ToolChoice};
 
 mod chat_template;
 pub use chat_template::{ChatTemplate, ChatTemplateError, RenderOptions};
 
 mod tool_choice;
 pub use tool_choice::{
-    grammar_for_tool_choice, ToolChoice, ToolChoiceError, ToolChoiceOptions,
+    build_grammar_source_for_debug, grammar_for_prompt,
+    grammar_for_tool_choice, ToolChoiceError, ToolChoiceOptions,
 };
 
 mod model;

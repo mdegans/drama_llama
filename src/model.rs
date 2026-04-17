@@ -689,11 +689,14 @@ mod tests {
         );
 
         // test template application via Jinja
-        let prompt = Prompt::new()
-            .with_system("A conversation between a user and an assistant.")
-            .push_user("Hello, world!")
-            .push_assistant("Hi!")
-            .push_user("So, how's it going?");
+        let prompt = Prompt::default()
+            .set_system("A conversation between a user and an assistant.")
+            .add_message((crate::Role::User, "Hello, world!"))
+            .unwrap()
+            .add_message((crate::Role::Assistant, "Hi!"))
+            .unwrap()
+            .add_message((crate::Role::User, "So, how's it going?"))
+            .unwrap();
 
         let tmpl = ChatTemplate::from_model(&model).unwrap();
         let result = tmpl.render(&prompt, true).unwrap();

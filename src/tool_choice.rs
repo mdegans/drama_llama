@@ -39,9 +39,7 @@
 
 use std::fmt::Write;
 
-use crate::{GrammarError, SamplingMode, Tool};
-
-pub use misanthropic::tool::Choice as ToolChoice;
+use crate::{GrammarError, Prompt, SamplingMode, Tool, ToolChoice};
 
 /// Options for [`grammar_for_tool_choice`].
 #[derive(Clone, Debug)]
@@ -54,6 +52,24 @@ pub struct ToolChoiceOptions {
     /// `"parameters"`. Anthropic / OpenAI function-calling use
     /// `"arguments"`.
     pub arguments_field: &'static str,
+    /// If `true`, constrain `parameters` to match the called tool's
+    /// `input_schema` rather than accepting any JSON object.
+    ///
+    /// The schema-to-grammar translator covers the common case:
+    /// objects with string / integer / number / boolean / null typed
+    /// fields, plus string / integer / number enums. All fields are
+    /// required (matches the typical `required: [...]` Anthropic
+    /// shape). Unsupported schema features fall back to "any JSON
+    /// value". Keep this in mind for complex nested schemas — a model
+    /// can still emit a structurally valid but semantically wrong
+    /// call.
+    ///
+    /// [`ToolChoice::Any`] with `strict_schema = true` is currently
+    /// unsupported (the grammar would have to union across every
+    /// tool's parameter object); setting both yields
+    /// [`ToolChoiceError::AnyWithStrictSchema`]. Stick to
+    /// [`ToolChoice::Method`] when you need schema enforcement.
+    pub strict_schema: bool,
 }
 
 impl Default for ToolChoiceOptions {
@@ -61,6 +77,7 @@ impl Default for ToolChoiceOptions {
         Self {
             allow_thought: false,
             arguments_field: "parameters",
+            strict_schema: false,
         }
     }
 }
@@ -79,33 +96,77 @@ pub fn grammar_for_tool_choice(
     tools: &[Tool<'_>],
     opts: &ToolChoiceOptions,
 ) -> Result<Option<SamplingMode>, ToolChoiceError> {
-    let names: Vec<&str> = match choice {
+    // Resolve which tools the grammar is allowed to pick from, and
+    // optionally the single tool whose schema we enforce.
+    let (names, schema_tool): (Vec<&str>, Option<&Tool<'_>>) = match choice {
         ToolChoice::Auto => return Ok(None),
         ToolChoice::Any => {
             if tools.is_empty() {
                 return Err(ToolChoiceError::NoTools);
             }
-            tools.iter().map(|t| t.name.as_ref()).collect()
+            if opts.strict_schema {
+                return Err(ToolChoiceError::AnyWithStrictSchema);
+            }
+            (tools.iter().map(|t| t.name.as_ref()).collect(), None)
         }
         ToolChoice::Method { name } => {
-            if !tools.iter().any(|t| t.name.as_ref() == name.as_str()) {
+            let Some(tool) =
+                tools.iter().find(|t| t.name.as_ref() == name.as_str())
+            else {
                 return Err(ToolChoiceError::UnknownTool(name.clone()));
-            }
-            vec![name.as_str()]
+            };
+            (vec![tool.name.as_ref()], Some(tool))
         }
     };
 
-    let source = build_grammar_source(&names, opts);
+    let source = build_grammar_source(&names, schema_tool, opts);
     let mode = SamplingMode::grammar(&source)?;
     Ok(Some(mode))
 }
 
+/// Derive the tool-choice grammar directly from a [`Prompt`]. Reads
+/// `prompt.tool_choice` and `prompt.functions`; returns `Ok(None)` when
+/// the prompt imposes no constraint (no `tool_choice`, `Auto`, or no
+/// advertised tools).
+///
+/// Shorthand for the common case: the same `Prompt` that drives
+/// [`ChatTemplate::render`] also drives the sampling constraint.
+///
+/// [`ChatTemplate::render`]: crate::ChatTemplate::render
+pub fn grammar_for_prompt(
+    prompt: &Prompt<'_>,
+    opts: &ToolChoiceOptions,
+) -> Result<Option<SamplingMode>, ToolChoiceError> {
+    let Some(choice) = prompt.tool_choice.as_ref() else {
+        return Ok(None);
+    };
+    let tools: &[Tool<'_>] = prompt.functions.as_deref().unwrap_or(&[]);
+    grammar_for_tool_choice(choice, tools, opts)
+}
+
+/// Debug-only accessor for the compiled GBNF text. Kept public so the
+/// `strawberry` example can `--verbose` the grammar; callers generally
+/// don't need this.
+#[doc(hidden)]
+pub fn build_grammar_source_for_debug(
+    names: &[&str],
+    schema_tool: Option<&Tool<'_>>,
+    opts: &ToolChoiceOptions,
+) -> String {
+    build_grammar_source(names, schema_tool, opts)
+}
+
 /// Emit the GBNF source text for a tool-choice constraint.
+///
+/// When `schema_tool` is `Some` and [`ToolChoiceOptions::strict_schema`]
+/// is true, the `parameters` value is constrained to the tool's
+/// `input_schema`. Otherwise the arguments accept any JSON object.
 ///
 /// Kept pub(crate) + exposed through tests so the generated grammar can
 /// be inspected directly without constructing a full [`SamplingMode`].
 pub(crate) fn build_grammar_source(
     names: &[&str],
+    schema_tool: Option<&Tool<'_>>,
     opts: &ToolChoiceOptions,
 ) -> String {
     let mut src = String::with_capacity(1024);
@@ -125,13 +186,20 @@ pub(crate) fn build_grammar_source(
         let _ = writeln!(src, r#"root ::= ws call"#);
     }
 
-    // The tool call: `{"name": <chosen>, "<args>": <json_object>}`.
-    // Whitespace is permissive between tokens but not inside the
-    // keyword literals.
+    // Pick the rule name for the arguments value: `object` for the
+    // permissive case, `args` for schema-constrained.
+    let args_rule = if opts.strict_schema && schema_tool.is_some() {
+        "args"
+    } else {
+        "object"
+    };
+
+    // The tool call: `{"name": <chosen>, "<args>": <args_rule>}`.
     let _ = writeln!(
         src,
-        r#"call ::= "{{" ws "\"name\"" ws ":" ws name_choice ws "," ws "\"{arg}\"" ws ":" ws object ws "}}""#,
-        arg = opts.arguments_field
+        r#"call ::= "{{" ws "\"name\"" ws ":" ws name_choice ws "," ws "\"{arg}\"" ws ":" ws {args_rule} ws "}}""#,
+        arg = opts.arguments_field,
+        args_rule = args_rule,
     );
 
     // Alternation over the allowed function names, each quoted.
@@ -140,16 +208,168 @@ pub(crate) fn build_grammar_source(
         if i > 0 {
             alt.push_str(" | ");
         }
-        // Escape any `"` in the name, defensively.
         let escaped = n.replace('"', r#"\""#);
         write!(alt, r#""\"{escaped}\"""#).unwrap();
     }
     let _ = writeln!(src, r#"name_choice ::= {alt}"#);
 
+    // If strict schema is on, emit the `args` rule derived from the
+    // tool's input_schema. Otherwise fall through to the permissive
+    // JSON grammar below (which defines `object`).
+    if opts.strict_schema {
+        if let Some(tool) = schema_tool {
+            schema_to_gbnf(&tool.schema, "args", &mut src);
+        }
+    }
+
     // Standard JSON grammar — RFC 8259-ish, enough for tool arguments.
     src.push_str(JSON_GRAMMAR);
 
     src
+}
+
+/// Emit GBNF rules that constrain a JSON value to `schema`. The
+/// top-level rule will be named `rule_name`; anonymous helpers get
+/// names like `{rule_name}__<n>`.
+///
+/// Supports the subset of JSON Schema common in tool schemas:
+///
+/// * `type: object` with `properties` + `required`. Required fields
+///   are emitted in their schema order; optional fields are ignored
+///   (the generated object MUST have exactly the required set).
+/// * `type: string | integer | number | boolean | null`.
+/// * `enum` (string / integer / number) → alternation of literals.
+///
+/// Anything else falls back to a reference to `value` (the permissive
+/// JSON value rule defined by [`JSON_GRAMMAR`]).
+fn schema_to_gbnf(
+    schema: &serde_json::Value,
+    rule_name: &str,
+    out: &mut String,
+) {
+    let mut counter: usize = 0;
+    emit_schema_rule(schema, rule_name, out, &mut counter);
+}
+
+fn emit_schema_rule(
+    schema: &serde_json::Value,
+    rule_name: &str,
+    out: &mut String,
+    counter: &mut usize,
+) {
+    // Enum → alternation of JSON-encoded literals.
+    if let Some(variants) = schema.get("enum").and_then(|v| v.as_array()) {
+        let mut alt = String::new();
+        for (i, v) in variants.iter().enumerate() {
+            if i > 0 {
+                alt.push_str(" | ");
+            }
+            // JSON-encode then escape for GBNF string literal.
+            let s = serde_json::to_string(v).unwrap_or_else(|_| "null".into());
+            let gbnf = s.replace('\\', r#"\\"#).replace('"', r#"\""#);
+            let _ = write!(alt, r#""{gbnf}""#);
+        }
+        let _ = writeln!(out, "{rule_name} ::= {alt}");
+        return;
+    }
+
+    match schema.get("type").and_then(|v| v.as_str()) {
+        Some("object") => emit_object_rule(schema, rule_name, out, counter),
+        Some("string") => {
+            let _ = writeln!(out, "{rule_name} ::= string");
+        }
+        Some("integer") => {
+            // JSON grammar's `number` also permits decimals; reject
+            // those for integer fields by forbidding `.` / `e`.
+            let _ = writeln!(out, "{rule_name} ::= int_only");
+            let _ = writeln!(out, "int_only ::= int");
+        }
+        Some("number") => {
+            let _ = writeln!(out, "{rule_name} ::= number");
+        }
+        Some("boolean") => {
+            let _ = writeln!(out, r#"{rule_name} ::= "true" | "false""#);
+        }
+        Some("null") => {
+            let _ = writeln!(out, r#"{rule_name} ::= "null""#);
+        }
+        Some("array") => {
+            // Items constraint: if `items` is a schema, constrain each
+            // element. Otherwise fall back to `value`.
+            let items_rule = if let Some(items) = schema.get("items") {
+                *counter += 1;
+                let name = format!("{rule_name}__item_{c}", c = *counter);
+                emit_schema_rule(items, &name, out, counter);
+                name
+            } else {
+                "value".to_string()
+            };
+            let _ = writeln!(
+                out,
+                r#"{rule_name} ::= "[" ws ( {items_rule} ( ws "," ws {items_rule} )* )? ws "]""#
+            );
+        }
+        _ => {
+            // Unknown / unsupported — accept any JSON value.
+            let _ = writeln!(out, "{rule_name} ::= value");
+        }
+    }
+}
+
+fn emit_object_rule(
+    schema: &serde_json::Value,
+    rule_name: &str,
+    out: &mut String,
+    counter: &mut usize,
+) {
+    let props = schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let required: Vec<String> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if required.is_empty() {
+        // Nothing to pin — accept any object.
+        let _ = writeln!(out, "{rule_name} ::= object");
+        return;
+    }
+
+    // Emit child rules for each required field's schema.
+    let mut field_rules: Vec<(String, String)> = Vec::new();
+    for name in &required {
+        let Some(prop_schema) = props.get(name) else {
+            // Required but no schema — accept any value.
+            field_rules.push((name.clone(), "value".to_string()));
+            continue;
+        };
+        *counter += 1;
+        let child_rule = format!("{rule_name}__{c}", c = *counter);
+        emit_schema_rule(prop_schema, &child_rule, out, counter);
+        field_rules.push((name.clone(), child_rule));
+    }
+
+    // Emit the object rule as a fixed-order sequence. A more flexible
+    // implementation would permit any permutation; fixed-order is
+    // simpler and the model learns the order from the grammar.
+    let mut body = String::from("\"{\" ws");
+    for (i, (field_name, child_rule)) in field_rules.iter().enumerate() {
+        if i > 0 {
+            body.push_str(r#" ws "," ws"#);
+        }
+        let escaped = field_name.replace('\\', r#"\\"#).replace('"', r#"\""#);
+        let _ = write!(body, r#" "\"{escaped}\"" ws ":" ws {child_rule}"#);
+    }
+    body.push_str(" ws \"}\"");
+    let _ = writeln!(out, "{rule_name} ::= {body}");
 }
 
 /// Shared JSON value grammar appended to every tool-choice GBNF.
@@ -182,6 +402,11 @@ pub enum ToolChoiceError {
     NoTools,
     #[error("tool_choice picked unknown tool `{0}`")]
     UnknownTool(String),
+    #[error(
+        "ToolChoice::Any + strict_schema is not supported; use Method when \
+         schema enforcement is required"
+    )]
+    AnyWithStrictSchema,
     #[error("compiled grammar is invalid: {0}")]
     Grammar(#[from] GrammarError),
 }
@@ -251,6 +476,7 @@ mod tests {
     fn method_grammar_accepts_forced_call() {
         let src = build_grammar_source(
             &["get_weather"],
+            None,
             &ToolChoiceOptions::default(),
         );
         assert!(accepts(
@@ -266,8 +492,11 @@ mod tests {
 
     #[test]
     fn any_grammar_accepts_any_listed_name() {
-        let src =
-            build_grammar_source(&["a", "b"], &ToolChoiceOptions::default());
+        let src = build_grammar_source(
+            &["a", "b"],
+            None,
+            &ToolChoiceOptions::default(),
+        );
         assert!(accepts(&src, r#"{"name": "a", "parameters": {}}"#));
         assert!(accepts(&src, r#"{"name": "b", "parameters": {}}"#));
         assert!(!accepts(&src, r#"{"name": "c", "parameters": {}}"#));
@@ -279,7 +508,7 @@ mod tests {
             arguments_field: "arguments",
             ..ToolChoiceOptions::default()
         };
-        let src = build_grammar_source(&["x"], &opts);
+        let src = build_grammar_source(&["x"], None, &opts);
         assert!(accepts(&src, r#"{"name": "x", "arguments": {}}"#));
         // With `arguments`, `parameters` is rejected.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {}}"#));
@@ -291,7 +520,7 @@ mod tests {
             allow_thought: true,
             ..ToolChoiceOptions::default()
         };
-        let src = build_grammar_source(&["x"], &opts);
+        let src = build_grammar_source(&["x"], None, &opts);
         // No thought.
         assert!(accepts(&src, r#"{"name": "x", "parameters": {}}"#));
         // With thought.
@@ -303,7 +532,8 @@ mod tests {
 
     #[test]
     fn deeply_nested_arguments_accepted() {
-        let src = build_grammar_source(&["x"], &ToolChoiceOptions::default());
+        let src =
+            build_grammar_source(&["x"], None, &ToolChoiceOptions::default());
         assert!(accepts(
             &src,
             r#"{"name": "x", "parameters": {"a": {"b": [1, 2, {"c": "d"}]}}}"#
@@ -311,8 +541,67 @@ mod tests {
     }
 
     #[test]
+    fn strict_schema_pins_field_names_and_types() {
+        let schema_tool = Tool {
+            name: Cow::Borrowed("count_letters"),
+            description: Cow::Borrowed(""),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "letter": {"type": "string"},
+                    "string": {"type": "string"}
+                },
+                "required": ["letter", "string"]
+            }),
+            cache_control: None,
+        };
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src =
+            build_grammar_source(&["count_letters"], Some(&schema_tool), &opts);
+        // Correct shape accepted.
+        assert!(accepts(
+            &src,
+            r#"{"name": "count_letters", "parameters": {"letter": "r", "string": "strawberry"}}"#
+        ));
+        // Hallucinated field names rejected.
+        assert!(!accepts(
+            &src,
+            r#"{"name": "count_letters", "parameters": {"chr": "r", "str": "strawberry"}}"#
+        ));
+        // Missing required field rejected.
+        assert!(!accepts(
+            &src,
+            r#"{"name": "count_letters", "parameters": {"letter": "r"}}"#
+        ));
+        // Wrong type for required field rejected.
+        assert!(!accepts(
+            &src,
+            r#"{"name": "count_letters", "parameters": {"letter": 1, "string": "x"}}"#
+        ));
+    }
+
+    #[test]
+    fn any_plus_strict_schema_errors() {
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let err = grammar_for_tool_choice(
+            &ToolChoice::Any,
+            &[tool("a"), tool("b")],
+            &opts,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolChoiceError::AnyWithStrictSchema));
+    }
+
+    #[test]
     fn malformed_arguments_rejected() {
-        let src = build_grammar_source(&["x"], &ToolChoiceOptions::default());
+        let src =
+            build_grammar_source(&["x"], None, &ToolChoiceOptions::default());
         // Trailing comma is invalid JSON.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {"a": 1,}}"#));
         // Single-quoted string is invalid JSON.
@@ -347,7 +636,8 @@ mod tests {
                     "What's the weather in Paris? Call the tool.",
                 )),
             }],
-            tools: Some(vec![weather.clone()]),
+            functions: Some(vec![weather.clone()]),
+            ..Default::default()
         };
         let rendered = tmpl
             .render_with(

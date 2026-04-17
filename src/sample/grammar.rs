@@ -739,12 +739,47 @@ impl GrammarState {
     /// Commit `bytes` to the matcher. Call after sampling selects a token.
     ///
     /// Partial UTF-8 at the end of `bytes` is buffered for the next call —
-    /// llama tokens can split multi-byte codepoints.
+    /// llama tokens can split multi-byte codepoints. If the pending
+    /// prefix cannot possibly complete into any codepoint the current
+    /// grammar state would accept, this returns an error so the filter
+    /// rejects the token. Without this check, byte-fallback tokens
+    /// (e.g. `<0xC3>`) can wedge an ASCII-only grammar into a dead
+    /// state where every subsequent candidate fails UTF-8 validation.
     pub fn advance_bytes(&mut self, bytes: &[u8]) -> Result<(), GrammarError> {
         for &b in bytes {
             self.feed_byte(b)?;
         }
+        if !self.pending.is_empty() && !self.pending_can_still_match() {
+            return Err(GrammarError::InvalidUtf8);
+        }
         Ok(())
+    }
+
+    /// True if the pending UTF-8 prefix could still complete into a
+    /// codepoint that at least one active stack would accept. Returns
+    /// true conservatively (over-approximates) — a `true` result does
+    /// not guarantee a match, only that one is plausible.
+    fn pending_can_still_match(&self) -> bool {
+        let (lo, hi) = match pending_codepoint_range(self.pending.as_slice()) {
+            Some(range) => range,
+            // Pending already invalid; advance_bytes would have erred.
+            None => return false,
+        };
+        for stack in &self.stacks {
+            let Some(pos) = stack.last() else {
+                continue;
+            };
+            let atoms = &self.grammar.rules[pos.rule_idx as usize].alts
+                [pos.alt_idx as usize];
+            let Some(Atom::CharSet(cs)) = atoms.get(pos.atom_idx as usize)
+            else {
+                continue;
+            };
+            if charset_intersects(cs, lo, hi) {
+                return true;
+            }
+        }
+        false
     }
 
     fn feed_byte(&mut self, b: u8) -> Result<(), GrammarError> {
@@ -771,10 +806,15 @@ impl GrammarState {
             };
             let atoms = &self.grammar.rules[pos.rule_idx as usize].alts
                 [pos.alt_idx as usize];
-            let atom = &atoms[pos.atom_idx as usize];
+            let Some(atom) = atoms.get(pos.atom_idx as usize) else {
+                continue;
+            };
             let Atom::CharSet(cs) = atom else {
-                // Expansion should leave only CharSet tops; this is a bug.
-                return Err(GrammarError::Internal);
+                // Expansion should leave only CharSet tops. If a
+                // RuleRef slips through (e.g. budget exhaustion on a
+                // deep grammar), skip that stack — aborting the whole
+                // consume would poison the entire candidate set.
+                continue;
             };
             if cs.contains(cp) {
                 let mut advanced = stack;
@@ -855,10 +895,150 @@ enum Utf8Decode {
     Invalid,
 }
 
+/// Compute the inclusive codepoint range that a partial UTF-8 prefix
+/// could still complete into, respecting UTF-8 validity constraints
+/// (no overlong encodings, no surrogates, no codepoints > U+10FFFF).
+/// Returns `None` when no valid completion exists.
+fn pending_codepoint_range(pending: &[u8]) -> Option<(u32, u32)> {
+    let b0 = *pending.first()?;
+    if b0 & 0x80 == 0 {
+        return Some((b0 as u32, b0 as u32));
+    }
+    if b0 & 0xE0 == 0xC0 {
+        if b0 < 0xC2 {
+            return None; // overlong 2-byte
+        }
+        let hi5 = (b0 & 0x1F) as u32;
+        if pending.len() == 1 {
+            let lo = hi5 << 6;
+            return Some((lo.max(0x80), lo | 0x3F));
+        }
+        let c1 = pending[1];
+        if c1 & 0xC0 != 0x80 {
+            return None;
+        }
+        let cp = (hi5 << 6) | (c1 & 0x3F) as u32;
+        Some((cp, cp))
+    } else if b0 & 0xF0 == 0xE0 {
+        let hi4 = (b0 & 0x0F) as u32;
+        let base = hi4 << 12;
+        // E0 requires second byte >= 0xA0 to avoid overlong (U+0080..U+07FF
+        // are 2-byte). ED requires second byte <= 0x9F to avoid surrogates
+        // (U+D800..U+DFFF).
+        let (c1_min, c1_max): (u8, u8) = match b0 {
+            0xE0 => (0xA0, 0xBF),
+            0xED => (0x80, 0x9F),
+            _ => (0x80, 0xBF),
+        };
+        match pending.len() {
+            1 => {
+                let lo = base | ((c1_min & 0x3F) as u32) << 6;
+                let hi = base | ((c1_max & 0x3F) as u32) << 6 | 0x3F;
+                Some((lo, hi))
+            }
+            2 => {
+                let c1 = pending[1];
+                if c1 < c1_min || c1 > c1_max {
+                    return None;
+                }
+                let mid = base | ((c1 & 0x3F) as u32) << 6;
+                Some((mid, mid | 0x3F))
+            }
+            _ => {
+                let c1 = pending[1];
+                let c2 = pending[2];
+                if c1 < c1_min || c1 > c1_max || c2 & 0xC0 != 0x80 {
+                    return None;
+                }
+                let cp = base | ((c1 & 0x3F) as u32) << 6 | (c2 & 0x3F) as u32;
+                Some((cp, cp))
+            }
+        }
+    } else if b0 & 0xF8 == 0xF0 {
+        if b0 > 0xF4 {
+            return None;
+        }
+        let hi3 = (b0 & 0x07) as u32;
+        let base = hi3 << 18;
+        // F0 requires second byte >= 0x90 (U+10000 minimum). F4 requires
+        // second byte <= 0x8F (U+10FFFF maximum).
+        let (c1_min, c1_max): (u8, u8) = match b0 {
+            0xF0 => (0x90, 0xBF),
+            0xF4 => (0x80, 0x8F),
+            _ => (0x80, 0xBF),
+        };
+        match pending.len() {
+            1 => {
+                let lo = base | ((c1_min & 0x3F) as u32) << 12;
+                let hi = base | ((c1_max & 0x3F) as u32) << 12 | 0x0FFF;
+                Some((lo, hi))
+            }
+            2 => {
+                let c1 = pending[1];
+                if c1 < c1_min || c1 > c1_max {
+                    return None;
+                }
+                let mid = base | ((c1 & 0x3F) as u32) << 12;
+                Some((mid, mid | 0x0FFF))
+            }
+            3 => {
+                let c1 = pending[1];
+                let c2 = pending[2];
+                if c1 < c1_min || c1 > c1_max || c2 & 0xC0 != 0x80 {
+                    return None;
+                }
+                let inner = base
+                    | ((c1 & 0x3F) as u32) << 12
+                    | ((c2 & 0x3F) as u32) << 6;
+                Some((inner, inner | 0x3F))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// True if `cs` accepts at least one codepoint in `[lo, hi]`.
+fn charset_intersects(cs: &CharSet, lo: u32, hi: u32) -> bool {
+    if cs.negated {
+        // Negated accepts codepoints NOT in any range. If the query
+        // [lo, hi] is not fully covered by union(ranges), there's a gap
+        // that the negated set accepts.
+        let mut cursor = lo;
+        for &(r_lo, r_hi) in &cs.ranges {
+            if r_hi < cursor {
+                continue;
+            }
+            if r_lo > hi {
+                break;
+            }
+            if r_lo > cursor {
+                return true;
+            }
+            cursor = r_hi.saturating_add(1);
+            if cursor > hi {
+                return false;
+            }
+        }
+        cursor <= hi
+    } else {
+        cs.ranges
+            .iter()
+            .any(|&(r_lo, r_hi)| r_hi >= lo && r_lo <= hi)
+    }
+}
+
 /// Decode a buffer as UTF-8. Returns:
 /// * `Complete(cp)` if `buf` is exactly one codepoint.
 /// * `Incomplete` if `buf` is a valid prefix of a multi-byte codepoint.
-/// * `Invalid` otherwise.
+/// * `Invalid` otherwise — including lead bytes that are NEVER valid
+///   (`0xC0`, `0xC1`, `0xF5..=0xFF`) or always-overlong encodings. This
+///   matters in practice: llama tokenizers include byte-fallback tokens
+///   for every individual byte (0x00..=0xFF), so the model can emit e.g.
+///   the single byte `0xC1` even while generating ASCII text. Without
+///   this check, we'd buffer that byte as an "incomplete" 2-byte lead
+///   forever and every subsequent candidate would fail to decode.
 fn decode_utf8(buf: &[u8]) -> Utf8Decode {
     if buf.is_empty() {
         return Utf8Decode::Incomplete;
@@ -867,16 +1047,26 @@ fn decode_utf8(buf: &[u8]) -> Utf8Decode {
     let expected = if b0 & 0x80 == 0 {
         1
     } else if b0 & 0xE0 == 0xC0 {
+        // 0xC0 and 0xC1 are always overlong (they encode ASCII with an
+        // extra byte), so they're illegal UTF-8 leads.
+        if b0 < 0xC2 {
+            return Utf8Decode::Invalid;
+        }
         2
     } else if b0 & 0xF0 == 0xE0 {
         3
     } else if b0 & 0xF8 == 0xF0 {
+        // 4-byte leads only run up to 0xF4 (codepoint 0x10FFFF);
+        // 0xF5..=0xF7 would encode beyond the Unicode space.
+        if b0 > 0xF4 {
+            return Utf8Decode::Invalid;
+        }
         4
     } else {
+        // 10xxxxxx (continuation byte at lead position) or 0xF8..=0xFF.
         return Utf8Decode::Invalid;
     };
     if buf.len() < expected {
-        // Validate continuation bytes we have so far.
         for &b in &buf[1..] {
             if b & 0xC0 != 0x80 {
                 return Utf8Decode::Invalid;
@@ -1138,6 +1328,46 @@ mod tests {
         let g = r#"root ::= [ア-ン]+"#;
         assert!(accepts_complete(g, "アイウエオ"));
         assert!(!accepts_complete(g, "abc"));
+    }
+
+    /// Regression: byte-fallback tokens whose single byte is an invalid
+    /// or grammar-incompatible UTF-8 lead used to wedge pending forever,
+    /// rejecting every subsequent candidate.
+    #[test]
+    fn rejects_lead_byte_incompatible_with_ascii_grammar() {
+        let grammar = Arc::new(parse_ok(r#"root ::= "abc""#));
+        let state = GrammarState::new(grammar);
+        // 0xC1 is ALWAYS invalid UTF-8 (overlong lead) — must reject.
+        assert!(
+            !state.accepts_bytes(&[0xC1]),
+            "overlong lead 0xC1 must be rejected"
+        );
+        // 0xC3 is a valid 2-byte lead but encodes U+00C0..U+00FF, none
+        // of which match an ASCII-only grammar. Must reject.
+        assert!(
+            !state.accepts_bytes(&[0xC3]),
+            "non-ASCII lead must be rejected when grammar is ASCII-only"
+        );
+        // 0xF0 as a lone byte could start a 4-byte codepoint U+10000+,
+        // still no ASCII match.
+        assert!(
+            !state.accepts_bytes(&[0xF0]),
+            "4-byte lead must be rejected when grammar is ASCII-only"
+        );
+    }
+
+    /// Non-ASCII grammars still accept split multi-byte tokens.
+    #[test]
+    fn accepts_split_multibyte_for_matching_grammar() {
+        let grammar = Arc::new(parse_ok(r#"root ::= "é""#));
+        let mut state = GrammarState::new(grammar);
+        let bytes = "é".as_bytes();
+        assert_eq!(bytes, &[0xC3, 0xA9]);
+        // Feed byte-by-byte (simulating a split-token scenario).
+        assert!(state.accepts_bytes(&bytes[..1]));
+        state.advance_bytes(&bytes[..1]).unwrap();
+        state.advance_bytes(&bytes[1..]).unwrap();
+        assert!(state.is_complete());
     }
 
     #[test]

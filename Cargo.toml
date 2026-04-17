@@ -43,11 +43,6 @@ image = { version = "0.25", optional = true, features = ["png"] }
 
 [features]
 webchat = ["dep:rocket", "toml", "dep:dirs", "dep:markdown", "serde"]
-# Gate for the legacy dittomancer binary. It was built around the old
-# Role::{Human,Agent,System} / Message { role, text } shape and needs a
-# port to the misanthropic-based types + Jinja chat templates. Not built
-# by default.
-dittomancer-legacy = []
 toml = ["dep:toml"]
 cli = ["dep:clap"]
 # we use rocket's serde support
@@ -63,10 +58,9 @@ egui = [
     "dep:image",
 ]
 
-[[bin]]
-name = "dittomancer"
-path = "bin/dittomancer/dittomancer.rs"
-required-features = ["webchat", "cli", "dittomancer-legacy"]
+[[example]]
+name = "strawberry"
+required-features = ["cli"]
 
 [[bin]]
 name = "regurgitater"
