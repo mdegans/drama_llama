@@ -23,7 +23,10 @@ mod candidates;
 pub use candidates::{Candidates, Sorted, TokenDataArray};
 
 pub mod prompt;
-pub use prompt::{Message, Prompt, Role};
+pub use prompt::{Block, Content, Message, Prompt, Role};
+
+mod chat_template;
+pub use chat_template::{ChatTemplate, ChatTemplateError};
 
 mod model;
 pub use model::{llama_quantize, Model, Vocab, VocabKind};

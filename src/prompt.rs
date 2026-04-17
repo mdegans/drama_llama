@@ -1,186 +1,102 @@
-use std::fmt::{Display, Formatter};
+//! Chat prompt primitives, re-exported from [`misanthropic`].
+//!
+//! drama_llama uses Anthropic-style message primitives as the source of
+//! truth for chat transcripts: [`Message`] / [`Content`] / [`Block`] /
+//! [`Role`]. They handle text, thinking, images, and tool-use/result blocks
+//! — the same shape downstream apps use when talking to the Anthropic API
+//! or to an OpenAI-compatible endpoint. drama_llama itself currently
+//! renders only text and thought blocks through chat templates (see
+//! [`crate::ChatTemplate`]); other blocks can be added as the surrounding
+//! infra needs them.
+//!
+//! # Why not OpenAI shape?
+//!
+//! The Anthropic shape is strictly more expressive: messages can carry
+//! multi-part content with discriminated blocks (including signed thought
+//! blocks), which OpenAI messages can't natively. Converting
+//! Anthropic-shape → OpenAI-shape is trivial; the reverse is lossy.
+//!
+//! [`misanthropic`]: https://github.com/mdegans/misanthropic
 
-mod format;
-pub use format::Format;
+use std::borrow::Cow;
 
-use crate::Model;
+pub use misanthropic::prompt::message::{Block, Content, Message, Role};
 
-/// Yet another stab at a prompt struct. The intended use case is for chat. This
-/// takes inspiration from the OpenAI API, but is not intended to be compatible
-/// with it.
-#[derive(Debug, Clone)]
-#[cfg_attr(test, derive(PartialEq))]
-#[cfg_attr(all(test, feature = "webchat"), derive(rocket::UriDisplayQuery))]
-#[cfg_attr(
-    feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
-)]
-#[cfg_attr(feature = "webchat", derive(rocket::form::FromForm))]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
-pub struct Prompt {
-    /// Setting, as in set and setting. This is the context in which the
-    /// interaction takes place. It may be a location, a time, a situation, or
-    /// any other context that may be relevant. The composition of a universe.
-    #[cfg_attr(feature = "webchat", field(validate = len(..4096), default = None))]
-    pub setting: Option<String>,
-    /// Agent's name, e.g. "Mr. Rogers" or "GPT-5".
-    #[cfg_attr(feature = "webchat", field(validate = len(..64), default = "assistant"))]
-    pub agent: String,
-    /// Human's name, e.g. "Alice" or "Bob".
-    #[cfg_attr(feature = "webchat", field(validate = len(..64), default = "user"))]
-    pub human: String,
-    /// System's name, e.g. "System", "Narrator", or "God". Should imply
-    /// authority to the Agent -- not necessarily to the Human.
-    #[cfg_attr(feature = "webchat", field(validate = len(..64), default = None))]
-    pub system: Option<String>,
-    /// Messages in the chat transcript. There must be at least two messages.
-    #[cfg_attr(feature = "webchat", field(validate = len(2..512)))]
-    pub transcript: Vec<Message>,
+/// A chat prompt: an optional system prompt plus a message transcript.
+///
+/// This is drama_llama's thin wrapper around misanthropic's message
+/// primitives. It intentionally omits the request-level fields of
+/// [`misanthropic::Prompt`] (model id, max_tokens, temperature, etc.) —
+/// those are either carried by [`crate::PredictOptions`] or irrelevant to
+/// a local inference engine.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Prompt<'a> {
+    /// System prompt. May be `None`, a single text blob, or a multi-part
+    /// content block (for models that support structured system prompts).
+    pub system: Option<Content<'a>>,
+    /// Chat transcript. User/Assistant messages in chronological order.
+    /// A typical live turn ends with a user message and the template is
+    /// asked to append an empty assistant header (see
+    /// [`ChatTemplate::render`]).
+    ///
+    /// [`ChatTemplate::render`]: crate::ChatTemplate::render
+    pub messages: Vec<Message<'a>>,
 }
 
-impl Prompt {
-    /// Load from a TOML file.
-    #[cfg(feature = "toml")]
-    pub fn load(path: std::path::PathBuf) -> std::io::Result<Self> {
-        let prompt: Prompt =
-            toml::from_str(&std::fs::read_to_string(path)?).unwrap();
-        Ok(prompt)
+impl<'a> Prompt<'a> {
+    /// Build an empty prompt.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Format the prompt in a specific format. This does not add a BOS token so
-    /// if this is desired, it must be prepended or [`Prompt::format_for_model`]
-    /// must be used instead.
-    pub fn format<F>(&self, format: Format, f: &mut F) -> std::fmt::Result
+    /// Set the system prompt from any text-like value.
+    pub fn with_system<S>(mut self, system: S) -> Self
     where
-        F: std::fmt::Write,
+        S: Into<Cow<'a, str>>,
     {
-        format.format_prompt(self, None, f)
+        self.system = Some(Content::SinglePart(system.into()));
+        self
     }
 
-    /// Format the prompt for a specific model. This adds a BOS token if the
-    /// model requires it. If this is unknown, a BOS token will **not** be
-    /// added. This is the recommended method for formatting a prompt.
-    ///
-    /// This will first attempt to use native formatting for the model. If a
-    /// format would be [`Unknown`], it will attempt to apply a chat template using
-    /// the model's metadata and `llama.cpp`. If *that* fails, it will use the
-    /// [`Unknown`] format as a last resort, formatting for foundation models.
-    ///
-    /// This does not add the assistant's prefix to the prompt. If this is
-    /// desired, [`format_agent_prefix`] should be called after this method or
-    /// [`Model::apply_chat_template`] should be used instead with the `add_ass`
-    /// parameter set to `true`.
-    ///
-    /// [`format_agent_prefix`]: Self::format_agent_prefix
-    /// [`Unknown`]: Format::Unknown
-    pub fn format_for_model<F>(
-        &self,
-        model: &Model,
-        f: &mut F,
-    ) -> std::fmt::Result
+    /// Append a user message with single-part text content.
+    pub fn push_user<S>(mut self, text: S) -> Self
     where
-        F: std::fmt::Write,
+        S: Into<Cow<'a, str>>,
     {
-        let format = match Format::from_model(model) {
-            Some(format) => format,
-            None => match model.apply_chat_template(None, self, false) {
-                Some(string) => return f.write_str(&string),
-                None => Format::Unknown,
-            },
-        };
-        format.format_prompt(self, Some(model), f)
+        self.messages.push(Message {
+            role: Role::User,
+            content: Content::SinglePart(text.into()),
+        });
+        self
     }
 
-    /// Format the agent's prefix. This should be called after a format method
-    /// in order to append the agent's prefix to the prompt which in turn forces
-    /// the model to generate a response from the agent's perspective.
-    pub fn format_agent_prefix<F>(
-        &self,
-        format: Format,
-        f: &mut F,
-    ) -> std::fmt::Result
+    /// Append an assistant message with single-part text content.
+    pub fn push_assistant<S>(mut self, text: S) -> Self
     where
-        F: std::fmt::Write,
+        S: Into<Cow<'a, str>>,
     {
-        format.format_agent_prefix(f, self)
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: Content::SinglePart(text.into()),
+        });
+        self
     }
 
-    /// Get the agent's prefix. This a convenience method that creates a new
-    /// string and formats it with [`format_agent_prefix`].
-    ///
-    /// [`format_agent_prefix`]: Self::format_agent_prefix
-    pub fn agent_prefix(&self, format: Format) -> String {
-        let mut s = String::new();
-        self.format_agent_prefix(format, &mut s).unwrap();
-        s
+    /// Append an already-constructed message.
+    pub fn push_message(mut self, message: Message<'a>) -> Self {
+        self.messages.push(message);
+        self
     }
 
-    /// Format the human's prefix. This can be used to format stop criteria so
-    /// that the model knows when to stop generating text.
-    pub fn format_human_prefix<F>(
-        &self,
-        format: Format,
-        f: &mut F,
-    ) -> std::fmt::Result
-    where
-        F: std::fmt::Write,
-    {
-        format.format_human_prefix(f, self)
+    /// Convert to a `'static` lifetime by cloning all borrowed data.
+    pub fn into_static(self) -> Prompt<'static> {
+        Prompt {
+            system: self.system.map(|c| c.into_static()),
+            messages: self
+                .messages
+                .into_iter()
+                .map(|m| m.into_static())
+                .collect(),
+        }
     }
-
-    /// Get the human's prefix. This a convenience method that creates a new
-    /// string and formats it with [`format_human_prefix`].
-    ///
-    /// [`format_human_prefix`]: Self::format_human_prefix
-    pub fn human_prefix(&self, format: Format) -> String {
-        let mut s = String::new();
-        self.format_human_prefix(format, &mut s).unwrap();
-        s
-    }
-}
-
-impl Display for Prompt {
-    // By default we format for foundation/unknown models.
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        Format::Unknown.format_prompt(self, None, f)
-    }
-}
-
-/// A message in a chat transcript.
-#[derive(Debug, Clone)]
-#[cfg_attr(test, derive(PartialEq))]
-#[cfg_attr(all(test, feature = "webchat"), derive(rocket::UriDisplayQuery))]
-#[cfg_attr(
-    feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
-)]
-#[cfg_attr(feature = "webchat", derive(rocket::form::FromForm))]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
-pub struct Message {
-    pub role: Role,
-    #[cfg_attr(feature = "webchat", field(validate = len(..4096)))]
-    pub text: String,
-}
-
-/// A [`Role`] is the participant's role in a chat transcript. This is similar
-/// to the OpenAI API's role.
-#[derive(Debug, Clone)]
-#[cfg_attr(test, derive(PartialEq))]
-#[cfg_attr(all(test, feature = "webchat"), derive(rocket::UriDisplayQuery))]
-#[cfg_attr(
-    feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
-)]
-#[cfg_attr(feature = "webchat", derive(rocket::form::FromFormField))]
-#[cfg_attr(
-    feature = "serde",
-    serde(crate = "rocket::serde"),
-    serde(rename_all = "snake_case")
-)]
-pub enum Role {
-    Human,
-    Agent,
-    /// Superuser role. This is some authority figure that constrains the
-    /// Agent's behavior. It may be a system, a narrator, or a god.
-    System,
 }

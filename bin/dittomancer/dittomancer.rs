@@ -1,3 +1,31 @@
+// NOTE: this binary is gated behind the `dittomancer-legacy` feature and is
+// currently broken. It was written against the pre-misanthropic Prompt /
+// Message / Role shape (with a `setting` field, Role::{Human,Agent,System},
+// and a custom hand-rolled Format enum). The library moved to:
+//
+//   * `Prompt { system, messages }`                  (misanthropic-shaped)
+//   * `Message { role, content }` with Role::{User,Assistant}
+//   * `Content::SinglePart | Content::MultiPart(Vec<Block>)`
+//   * `ChatTemplate` (Jinja-based; templates come from GGUF metadata)
+//
+// Porting checklist when you come back to this binary:
+//
+//   1. Define a Rocket-form-friendly `WireMessage { role, text }` wrapper
+//      struct and convert to/from `drama_llama::Message` at the edges.
+//      (misanthropic's Message is not Rocket-derive-friendly.)
+//   2. Replace the `Format` usage with `ChatTemplate::from_model(&model)`
+//      and `tmpl.render(&prompt, true)`.
+//   3. Drop the `setting` field. It maps to `prompt.system` now. Persona
+//      goes into `Prompt::with_system(...)`.
+//   4. Role::System announcements become a `Block::text(...)` pushed into
+//      a user or assistant message, or a no-op system-side log.
+//   5. The sanitize() rules should check `msg.role != Role::Assistant`
+//      (no more `Role::Agent`).
+//
+// Until the port, `cargo build` skips this binary.
+
+#![cfg(feature = "dittomancer-legacy")]
+
 use std::{io::Write, path::PathBuf};
 
 use clap::Parser;

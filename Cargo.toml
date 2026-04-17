@@ -21,6 +21,11 @@ thiserror = "1.0"
 tinyvec = "1.6"
 xorshift = "0.1"
 rayon = "1.10.0"
+minijinja = { version = "2.5", features = ["loader"] }
+minijinja-contrib = { version = "2.5", features = ["pycompat"] }
+misanthropic = { git = "https://github.com/mdegans/misanthropic.git", branch = "dev", default-features = false, features = [
+    "partial-eq",
+] }
 
 markdown = { version = "=1.0.0-alpha.16", optional = true }
 rocket = { version = "0.5", optional = true, features = ["json"] }
@@ -38,6 +43,11 @@ image = { version = "0.25", optional = true, features = ["png"] }
 
 [features]
 webchat = ["dep:rocket", "toml", "dep:dirs", "dep:markdown", "serde"]
+# Gate for the legacy dittomancer binary. It was built around the old
+# Role::{Human,Agent,System} / Message { role, text } shape and needs a
+# port to the misanthropic-based types + Jinja chat templates. Not built
+# by default.
+dittomancer-legacy = []
 toml = ["dep:toml"]
 cli = ["dep:clap"]
 # we use rocket's serde support
@@ -56,7 +66,7 @@ egui = [
 [[bin]]
 name = "dittomancer"
 path = "bin/dittomancer/dittomancer.rs"
-required-features = ["webchat", "cli"]
+required-features = ["webchat", "cli", "dittomancer-legacy"]
 
 [[bin]]
 name = "regurgitater"

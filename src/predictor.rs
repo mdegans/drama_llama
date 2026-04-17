@@ -4,8 +4,8 @@ use llama_cpp_sys_3::llama_token;
 use xorshift::{SeedableRng, Xoroshiro128};
 
 use crate::{
-    batch::AddError, ngram::NGramStats, prompt::Format, sample::SampleOptions,
-    Batch, Candidates, Engine, Model, NGram,
+    batch::AddError, ngram::NGramStats, sample::SampleOptions, Batch,
+    Candidates, Engine, Model, NGram,
 };
 
 #[cfg(feature = "serde")]
@@ -104,46 +104,26 @@ impl PredictOptions {
         }
     }
 
-    /// Add any stop tokens from the model. If there is an associated
-    /// [`Format`], the stop tokens will be added. *Otherwise*, the EOS from
-    /// [`Model::eos`] will be added (not both).
+    /// Add the model's end-of-sequence and end-of-turn tokens as stop
+    /// sequences.
     ///
-    /// To force the inclusion of the EOS token, use [`add_stop_sequence`] with
-    /// [`Model::eos`].
-    ///
-    /// [`add_stop_sequence`]: Self::add_stop_sequence
+    /// Both EOS and EOT are added when they're distinct so chat-tuned
+    /// models that emit `<|eot_id|>` between turns terminate cleanly.
+    /// Repetition penalty ignores these — otherwise a strong penalty can
+    /// keep the model from ever closing a turn.
     pub fn add_model_stops(mut self, model: &Model) -> Self {
-        if let Some(format) = Format::from_model(model) {
-            self = self.add_stop_format(format);
-        } else {
-            // eos is already included if a stop format is found.
-            self = self.add_stop_sequence(vec![model.eos()]);
-
-            // For the purpose of repetition, we should ignore the EOS token. In
-            // The case of some models, the EOS token does not indicate the end
-            // of generation, just the end of the current response. If penalty
-            // is applied, generation might not ever stop.
+        let eos = model.eos();
+        self.stop_sequences.push(vec![eos]);
+        if let Some(opts) = &mut self.sample_options.repetition {
+            opts.ignored.push(eos.into());
+        }
+        let eot = model.eot();
+        if eot != eos && eot >= 0 {
+            self.stop_sequences.push(vec![eot]);
             if let Some(opts) = &mut self.sample_options.repetition {
-                opts.ignored.push(model.eos().into());
+                opts.ignored.push(eot.into());
             }
         }
-
-        self
-    }
-
-    /// Add stop sequences for a given [`prompt::Format`]
-    ///
-    /// [`prompt::Format`]: crate::prompt::Format
-    pub fn add_stop_format(mut self, format: Format) -> Self {
-        if let Some(stop_tokens) = format.stop_tokens() {
-            for &stop_token in stop_tokens {
-                self.stop_sequences.push(vec![stop_token]);
-                if let Some(opts) = &mut self.sample_options.repetition {
-                    opts.ignored.push(stop_token.into());
-                }
-            }
-        }
-
         self
     }
 
