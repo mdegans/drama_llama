@@ -364,21 +364,51 @@ pub enum SamplingMode {
         max_keep: Option<NonZeroUsize>,
     },
     /// JSON-constrained sampling. Rejects any candidate whose bytes would
-    /// produce invalid JSON. On grammar violation (no valid candidate), this
-    /// mode forces a single EOS candidate which causes [`TokenPredictor`] to
-    /// terminate — treat this as a hard stop, not graceful continuation.
+    /// produce invalid JSON.
     ///
-    /// The [`JsonState`] is wrapped in `Arc<Mutex<…>>` so that cloning
-    /// `SampleOptions` keeps the parser state shared across clones (which is
-    /// the usual want — one parser per generation). To start a fresh
-    /// generation, either drop and rebuild the mode, or call
-    /// [`JsonState::reset`] through the mutex.
+    /// # Termination
+    ///
+    /// On zero valid candidates, this mode forces a single EOS candidate.
+    /// Two cases trigger this:
+    ///
+    /// * **Success** — the document has been closed; the strict post-complete
+    ///   rule rejects all further bytes (including whitespace, so the model
+    ///   can't burn its token budget on trailing ws). The parser is
+    ///   **auto-reset** before returning EOS, so the next generation on the
+    ///   same mode instance starts fresh.
+    /// * **Grammar violation** — the parser is mid-parse but no candidate
+    ///   token extends it. State is preserved for inspection.
+    ///
+    /// **For generation to actually stop**, EOS must be in
+    /// [`PredictOptions::stop_sequences`]. Use
+    /// [`PredictOptions::add_model_stops`] (or add EOS explicitly) —
+    /// otherwise the predictor will keep sampling past EOS and the
+    /// auto-reset will let the model emit another JSON document.
+    ///
+    /// # State sharing
+    ///
+    /// [`JsonState`] is wrapped in `Arc<Mutex<…>>` so cloning
+    /// `SampleOptions` keeps the parser state shared across clones (one
+    /// parser per generation). To start a fresh generation manually, either
+    /// rebuild the mode or call [`JsonState::reset`] through the mutex. The
+    /// auto-reset on success-termination covers the common case.
+    ///
+    /// # Placement
     ///
     /// Place early in the chain: it prunes the candidate set before top-p /
-    /// top-k / mirostat run over it. Under `serde`, the parse state is
-    /// serialized — reloading mid-generation will resume with the parser
-    /// aligned to the already-emitted tokens.
+    /// top-k / mirostat run over it. Leading whitespace before the opening
+    /// `{`/`[`/etc. is accepted (models often emit a newline after the
+    /// prompt's trailing colon); trailing whitespace after the document
+    /// closes is rejected (see Termination above).
     ///
+    /// # Serde
+    ///
+    /// Under `serde`, the parse state is serialized — reloading
+    /// mid-generation will resume with the parser aligned to the
+    /// already-emitted tokens.
+    ///
+    /// [`PredictOptions::stop_sequences`]: crate::PredictOptions::stop_sequences
+    /// [`PredictOptions::add_model_stops`]: crate::PredictOptions::add_model_stops
     /// [`TokenPredictor`]: crate::TokenPredictor
     Json(
         #[cfg_attr(
@@ -890,12 +920,12 @@ pub(crate) fn sample_token(
                     // while advancing the parser — the state is unknown,
                     // so silently emitting non-JSON would violate the
                     // `SamplingMode::Json` contract. Fail fast instead.
-                    let locked = state.lock().expect(
+                    let mut locked = state.lock().expect(
                         "SamplingMode::Json mutex poisoned; parser state \
                          is unrecoverable. Rebuild the mode with \
                          SamplingMode::json() and retry.",
                     );
-                    json::json_filter(candidates, &locked, model)
+                    json::json_filter(candidates, &mut locked, model)
                 }
             });
 

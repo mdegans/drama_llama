@@ -123,9 +123,12 @@ impl JsonState {
             match top {
                 Frame::Root { seen_value } => {
                     if *seen_value {
-                        if is_ws(b) {
-                            return Ok(());
-                        }
+                        // Strict: once the document is complete, reject ALL
+                        // further bytes (including whitespace). Trailing
+                        // whitespace is RFC-valid but would let the model
+                        // fill its token budget with no useful output. The
+                        // empty candidate set triggers the force-EOS path,
+                        // which terminates generation.
                         return Err(JsonError::UnexpectedByte(b));
                     }
                     if is_ws(b) {
@@ -522,12 +525,20 @@ static_assertions::assert_impl_all!(JsonState: Send, Sync);
 /// Filter candidates to only those whose token bytes extend the current JSON
 /// parse state.
 ///
-/// On grammar violation (zero valid candidates), returns a single-token
-/// [`Candidates`] containing EOS. The caller's stop-sequence machinery will
-/// then terminate generation.
+/// On zero valid candidates, returns a single-token [`Candidates`] containing
+/// EOS. Two cases trigger this:
+///
+/// * **Success termination**: the document is complete and the strict
+///   post-complete rule (no trailing bytes) rejected every token. The
+///   parser is reset so the next generation on the same mode instance
+///   starts fresh. Generation terminates via the EOS stop-sequence.
+/// * **Grammar violation**: the parser is mid-parse but no candidate token
+///   can extend it. The state is preserved for debugging; the caller can
+///   inspect the stack depth via [`JsonState::stack_depth`]. Generation
+///   still terminates via EOS.
 pub(crate) fn json_filter(
     candidates: Candidates,
-    state: &JsonState,
+    state: &mut JsonState,
     model: &Model,
 ) -> Candidates {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
@@ -541,6 +552,13 @@ pub(crate) fn json_filter(
     }
 
     if kept.is_empty() {
+        // Distinguish success termination from grammar violation. On
+        // success, reset so the next generation starts fresh without the
+        // caller having to remember. On violation, leave state intact for
+        // the caller to inspect.
+        if state.is_complete() {
+            state.reset();
+        }
         let eos = llama_token_data {
             id: model.eos(),
             logit: 0.0,
@@ -735,13 +753,28 @@ mod tests {
 
     #[test]
     fn whitespace_permitted() {
+        // Leading and internal whitespace is RFC-valid and permitted.
         for s in &[
-            "  true  ",
-            "\t\nfalse\r\n",
-            r#"  { "a" : 1 }  "#,
-            "\n[ 1 , 2 ]\n",
+            "  true",
+            "\t\nfalse",
+            r#"  { "a" : 1 }"#,
+            "\n[ 1 , 2 ]",
         ] {
             assert!(accepts_complete(s), "should accept {s}");
+        }
+    }
+
+    #[test]
+    fn trailing_whitespace_strict() {
+        // Strict post-complete rule: once the document closes, even
+        // whitespace is rejected. This forces the force-EOS path in
+        // `json_filter`, ending generation instead of burning tokens on
+        // meaningless trailing whitespace.
+        for s in &["true ", "false\n", "{} ", "[]\t"] {
+            assert!(
+                !accepts_complete(s),
+                "should reject trailing whitespace in {s}"
+            );
         }
     }
 
@@ -777,12 +810,13 @@ mod tests {
 
     #[test]
     fn no_trailing_garbage() {
-        // Complete doc, then attempt another value.
+        // Complete doc, then anything at all is rejected (strict mode).
         let mut s = JsonState::new();
         feed_all(&mut s, "true").unwrap();
-        // Whitespace OK.
-        assert!(accepts(&s, "   "));
-        // Another value not OK.
+        // Whitespace no longer OK — strict post-complete.
+        assert!(!accepts(&s, " "));
+        assert!(!accepts(&s, "\n"));
+        // Another value of course not OK.
         assert!(!accepts(&s, "false"));
     }
 
@@ -822,6 +856,16 @@ mod tests {
         s.reset();
         feed_all(&mut s, "[]").unwrap();
         assert!(s.is_complete());
+    }
+
+    #[test]
+    fn leading_whitespace_accepted() {
+        // Models often emit a newline or space after the prompt's trailing
+        // colon before the first `{`. This is RFC-compliant and should
+        // not be rejected.
+        for s in &["   {}", "\n\n[]", "\t\"hi\"", "\r\n42"] {
+            assert!(accepts_complete(s), "should accept {s}");
+        }
     }
 
     #[test]
@@ -898,7 +942,11 @@ mod tests {
 
         let tokens = engine.model.tokenize(PROMPT, false);
 
-        let mut opts = PredictOptions::default();
+        // EOS must be registered as a stop for the force-EOS path to
+        // actually terminate generation. Otherwise the auto-reset on
+        // success-termination would allow the model to emit another valid
+        // JSON document right after the first one.
+        let mut opts = PredictOptions::default().add_model_stops(&engine.model);
         opts.n = NonZeroUsize::new(256).unwrap();
         // JSON first so invalid tokens are pruned before locally-typical
         // sampling picks among what remains.
@@ -910,18 +958,30 @@ mod tests {
             ..SampleOptions::default()
         };
 
+        // Capture EOS piece before we start predicting — `predict_pieces`
+        // borrows the engine mutably.
+        let eos_piece = engine.model.token_to_piece(engine.model.eos());
+
         let predictor = engine.predict_pieces(tokens, opts);
         let output: String = predictor.collect();
 
         println!("=== Generated JSON ===\n{output}\n======================");
 
+        // The stop machinery includes the stop sequence in the output, so
+        // the EOS piece (e.g. `<|eot_id|>` for Llama 3.1) trails the JSON
+        // document. Strip it before parsing.
+        let trimmed = output
+            .trim_end_matches(eos_piece.as_str())
+            .trim_end();
+
         // Must parse as valid JSON of any shape.
         let parsed: rocket::serde::json::Value =
-            rocket::serde::json::from_str(output.trim())
+            rocket::serde::json::from_str(trimmed)
                 .unwrap_or_else(|e| {
                     panic!(
                         "output must be valid JSON (constraint guarantees \
-                         this). parse error: {e}\noutput: {output:?}"
+                         this). parse error: {e}\noutput: {output:?}\n\
+                         trimmed: {trimmed:?}"
                     )
                 });
 
