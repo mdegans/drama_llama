@@ -8,10 +8,26 @@
 //!
 //! # Scope
 //!
-//! drama_llama currently renders [`Block::Text`] and [`Block::Thought`] —
-//! the primary building blocks. Images, tool-use, and tool-result blocks
-//! flatten to empty strings (a placeholder until the surrounding
-//! infrastructure needs them).
+//! drama_llama renders [`Block::Text`], [`Block::Thought`],
+//! [`Block::ToolUse`], and [`Block::ToolResult`] blocks. Tool calls emit
+//! as `{role, content, tool_calls: [{id, function: {name, arguments}}]}`
+//! messages; tool results emit as standalone `{role: "tool", ...}`
+//! messages between user turns. Images and redacted-thought blocks are
+//! skipped until the surrounding infrastructure needs them.
+//!
+//! Tool definitions come from [`Prompt::tools`] and surface in the
+//! template as the `tools` variable. Llama 3.1 / Mistral / Qwen all
+//! JSON-serialize tools via the `tojson` filter, which is enabled here
+//! via `minijinja`'s `json` feature.
+//!
+//! # Extras
+//!
+//! [`RenderOptions`] lets callers push additional template variables
+//! (e.g. `tools_in_user_message`, `builtin_tools`, `custom_tools`). It
+//! also carries an optional `date_string`; if omitted, drama_llama
+//! defaults to today's UTC date in HF's `%d %b %Y` format so templates
+//! that unconditionally concatenate `"Today Date: " + date_string` do
+//! not blow up.
 //!
 //! # Dialect compatibility
 //!
@@ -27,7 +43,7 @@
 //! [`Block::Text`]: crate::Block
 //! [`Block::Thought`]: crate::Block
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use minijinja::{value::Value as JinjaValue, Environment, Error as JinjaError};
 
@@ -108,29 +124,131 @@ impl ChatTemplate {
         &self.eos_token
     }
 
-    /// Render a [`Prompt`].
+    /// Render a [`Prompt`] with default options.
     ///
     /// `add_generation_prompt` controls whether the template appends an
     /// empty assistant header so the model generates the next turn. Set
     /// this to `true` for live chat, `false` when tokenizing a stored
-    /// transcript.
+    /// transcript. Shorthand for
+    /// [`ChatTemplate::render_with`] with defaults.
     pub fn render(
         &self,
         prompt: &Prompt<'_>,
         add_generation_prompt: bool,
     ) -> Result<String, ChatTemplateError> {
+        self.render_with(
+            prompt,
+            &RenderOptions {
+                add_generation_prompt,
+                ..RenderOptions::default()
+            },
+        )
+    }
+
+    /// Render a [`Prompt`] with explicit [`RenderOptions`].
+    ///
+    /// Use this when the template needs template-specific variables
+    /// beyond `messages` / `tools` / `bos_token` — for example Llama 3.1's
+    /// `date_string`, `tools_in_user_message`, or `builtin_tools`.
+    pub fn render_with(
+        &self,
+        prompt: &Prompt<'_>,
+        opts: &RenderOptions<'_>,
+    ) -> Result<String, ChatTemplateError> {
         let messages = build_messages(prompt);
-        let ctx = minijinja::context! {
+        let tools_value = match prompt.tools.as_ref() {
+            Some(ts) if !ts.is_empty() => JinjaValue::from_serialize(ts),
+            _ => JinjaValue::from(()), // renders as None / null
+        };
+        // Default `date_string` to today in HF's "%d %b %Y" format when
+        // the caller didn't supply one. The template unconditionally
+        // concatenates `"Today Date: " + date_string + ...`, so passing
+        // `none` would blow up with a string-plus-none type error.
+        let date_string = opts
+            .date_string
+            .as_deref()
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| {
+                format_strftime_subset("%d %b %Y", current_unix_secs())
+            });
+        let base_ctx = minijinja::context! {
             bos_token => &self.bos_token,
             eos_token => &self.eos_token,
             messages => messages,
-            add_generation_prompt => add_generation_prompt,
+            tools => tools_value,
+            add_generation_prompt => opts.add_generation_prompt,
+            date_string => date_string,
+        };
+        // Merge caller-supplied extras on top of the base context.
+        let ctx = if opts.extras.is_empty() {
+            base_ctx
+        } else {
+            let mut extras: BTreeMap<String, JinjaValue> = BTreeMap::new();
+            for (k, v) in &opts.extras {
+                extras.insert(k.clone(), v.clone());
+            }
+            minijinja::context!(
+                ..base_ctx,
+                ..JinjaValue::from_serialize(&extras)
+            )
         };
         let tmpl = self
             .env
             .get_template(self.template_name)
             .map_err(ChatTemplateError::from_jinja)?;
         tmpl.render(ctx).map_err(ChatTemplateError::from_jinja)
+    }
+}
+
+/// Options passed to [`ChatTemplate::render_with`].
+///
+/// Variables that are universal to HuggingFace-style templates
+/// (`messages`, `tools`, `bos_token`, `eos_token`,
+/// `add_generation_prompt`) are sourced from [`Prompt`] and the
+/// [`ChatTemplate`] itself. Everything else — template-specific flags
+/// like Llama 3.1's `tools_in_user_message`, date overrides, or
+/// `builtin_tools` — goes through [`extras`](Self::extras).
+#[derive(Clone, Debug, Default)]
+pub struct RenderOptions<'a> {
+    /// Ask the template to append an empty assistant header so the model
+    /// generates the next turn. True for live chat, false for
+    /// tokenizing a stored transcript.
+    pub add_generation_prompt: bool,
+    /// Current date string (e.g. `"17 Apr 2026"`). Llama 3.1's template
+    /// reads `date_string` when stamping a system-message header. If
+    /// `None`, the template's default (static fallback) is used.
+    pub date_string: Option<Cow<'a, str>>,
+    /// Template-specific extra variables. Keys become top-level names in
+    /// the Jinja context. Values are arbitrary Serialize-able data.
+    pub extras: Vec<(String, JinjaValue)>,
+}
+
+impl<'a> RenderOptions<'a> {
+    /// Builder: set `add_generation_prompt`.
+    pub fn with_generation_prompt(mut self, yes: bool) -> Self {
+        self.add_generation_prompt = yes;
+        self
+    }
+
+    /// Builder: set `date_string`.
+    pub fn with_date<S>(mut self, date: S) -> Self
+    where
+        S: Into<Cow<'a, str>>,
+    {
+        self.date_string = Some(date.into());
+        self
+    }
+
+    /// Builder: add an arbitrary `(key, value)` pair to the Jinja
+    /// context. Useful for `tools_in_user_message`, `builtin_tools`,
+    /// etc. Construct the value via
+    /// [`minijinja::Value::from_serialize`] or one of its constructors.
+    pub fn with_extra<K>(mut self, key: K, value: JinjaValue) -> Self
+    where
+        K: Into<String>,
+    {
+        self.extras.push((key.into(), value));
+        self
     }
 }
 
@@ -143,61 +261,164 @@ impl ChatTemplate {
 /// If `prompt.system` is set we synthesize a leading `system` message —
 /// that matches the HF/Llama convention of carrying the system prompt as
 /// the first message in the transcript.
+///
+/// Tool-calling messages are emitted in the shape HF templates expect:
+///
+/// * An assistant message with at least one [`Block::ToolUse`] becomes
+///   `{role: "assistant", tool_calls: [{function: {name, arguments}}]}`.
+///   Any accompanying text/thought is dropped — templates like
+///   Llama 3.1's render tool calls in a branch that doesn't emit
+///   `content`.
+/// * A user message containing [`Block::ToolResult`] blocks is split:
+///   each tool result emits a separate `{role: "tool", content: ...}`
+///   message. Any remaining text in the same user turn follows as a
+///   normal user message.
 fn build_messages(prompt: &Prompt<'_>) -> Vec<JinjaValue> {
     let mut out: Vec<JinjaValue> =
         Vec::with_capacity(prompt.messages.len() + 1);
     if let Some(system) = prompt.system.as_ref() {
-        out.push(message_value("system", flatten_content(system)));
+        out.push(text_message("system", flatten_text(system)));
     }
     for m in &prompt.messages {
         let role = match m.role {
             Role::User => "user",
             Role::Assistant => "assistant",
         };
-        out.push(message_value(role, flatten_content(&m.content)));
+        append_message(&mut out, role, &m.content);
     }
     out
 }
 
-fn message_value(role: &str, content: String) -> JinjaValue {
+/// Emit one or more Jinja messages for a single misanthropic Message.
+fn append_message(
+    out: &mut Vec<JinjaValue>,
+    role: &str,
+    content: &Content<'_>,
+) {
+    let blocks: Vec<&Block<'_>> = match content {
+        Content::SinglePart(text) => {
+            out.push(text_message(role, text.to_string()));
+            return;
+        }
+        Content::MultiPart(blocks) => blocks.iter().collect(),
+    };
+
+    // User turn: split ToolResult blocks into their own "tool" messages,
+    // collect remaining text/thought into a trailing user message.
+    if role == "user" {
+        let mut residual = String::new();
+        for b in &blocks {
+            match b {
+                Block::ToolResult { result } => {
+                    let content = flatten_text(&result.content);
+                    out.push(tool_result_message(&result.tool_use_id, content));
+                }
+                other => append_block_text(&mut residual, other),
+            }
+        }
+        if !residual.is_empty() {
+            out.push(text_message(role, residual));
+        }
+        return;
+    }
+
+    // Assistant turn: if any ToolUse, emit a tool-calling message. For a
+    // single-call convention (what Llama 3.1 and Anthropic both use),
+    // take the first ToolUse. Any surrounding thought is preserved as
+    // content so templates that support <think>…</think> get signal.
+    if let Some(call) = blocks.iter().find_map(|b| match b {
+        Block::ToolUse { call } => Some(call),
+        _ => None,
+    }) {
+        let mut residual = String::new();
+        for b in &blocks {
+            if matches!(b, Block::ToolUse { .. }) {
+                continue;
+            }
+            append_block_text(&mut residual, b);
+        }
+        out.push(tool_call_message(role, &residual, call));
+        return;
+    }
+
+    // No tool blocks — plain flattening.
+    let mut flat = String::new();
+    for b in &blocks {
+        append_block_text(&mut flat, b);
+    }
+    out.push(text_message(role, flat));
+}
+
+fn text_message(role: &str, content: String) -> JinjaValue {
     minijinja::context! {
         role => role,
         content => content,
     }
 }
 
-/// Flatten [`Content`] to a single string.
+/// Assistant message with a single `tool_calls` entry. Shape:
+/// `{role, content, tool_calls: [{id, function: {name, arguments}}]}`.
 ///
-/// drama_llama currently supports text + thought; other block types
-/// render as empty. When a downstream caller needs multimodal or tool
-/// rendering, this is the extension point.
-fn flatten_content(content: &Content<'_>) -> String {
+/// Llama 3.1's template reads `.function.name` and `.function.arguments`
+/// off each entry. OpenAI-style templates also look at `.id`, so we
+/// include it. We intentionally omit the `type` field — templates that
+/// need it default to `"function"`.
+fn tool_call_message(
+    role: &str,
+    content: &str,
+    call: &crate::prompt::ToolUse<'_>,
+) -> JinjaValue {
+    let tool_call = minijinja::context! {
+        id => call.id.as_ref(),
+        function => minijinja::context! {
+            name => call.name.as_ref(),
+            arguments => JinjaValue::from_serialize(&call.input),
+        },
+    };
+    minijinja::context! {
+        role => role,
+        content => content,
+        tool_calls => vec![tool_call],
+    }
+}
+
+/// Tool-result message. Shape: `{role: "tool", tool_call_id, content}`.
+/// `tool_call_id` matches what HF / OpenAI templates read; Llama 3.1's
+/// template ignores it, but it's cheap to include.
+fn tool_result_message(tool_use_id: &str, content: String) -> JinjaValue {
+    minijinja::context! {
+        role => "tool",
+        tool_call_id => tool_use_id,
+        content => content,
+    }
+}
+
+/// Flatten any [`Content`] to a single string using [`append_block_text`]
+/// for each part.
+fn flatten_text(content: &Content<'_>) -> String {
     match content {
         Content::SinglePart(text) => text.to_string(),
         Content::MultiPart(blocks) => {
             let mut out = String::new();
             for b in blocks {
-                append_block(&mut out, b);
+                append_block_text(&mut out, b);
             }
             out
         }
     }
 }
 
-fn append_block(out: &mut String, block: &Block<'_>) {
+/// Append a single block's user-visible text to `out`. Tool-use and
+/// tool-result blocks are handled at the message level (see
+/// [`append_message`]); here they contribute nothing.
+fn append_block_text(out: &mut String, block: &Block<'_>) {
     match block {
         Block::Text { text, .. } => out.push_str(text),
         Block::Thought { thought, .. } => {
-            // Render thought blocks as a `<think>…</think>` wrapper. This
-            // matches the convention most chat templates with thinking
-            // support use; models without thinking ignore the tags.
             out.push_str("<think>");
             out.push_str(thought);
             out.push_str("</think>");
         }
-        // Placeholders: these require per-model rendering decisions. For
-        // now drama_llama skips them rather than guessing at the wire
-        // format the template expects.
         Block::RedactedThought { .. }
         | Block::Image { .. }
         | Block::ToolUse { .. }
@@ -222,14 +443,14 @@ fn raise_exception(msg: Cow<'_, str>) -> Result<JinjaValue, JinjaError> {
 /// `time` crate's strftime-style format string. Enough for templates that
 /// stamp `"%d %b %Y"` or `"%Y-%m-%d"`.
 fn strftime_now(fmt: Cow<'_, str>) -> String {
-    // We only depend on std here; format via a small handwritten mapping
-    // of the common specifiers HF templates actually use. If a template
-    // needs something else, we'll add it when it shows up.
-    let now = std::time::SystemTime::now()
+    format_strftime_subset(&fmt, current_unix_secs())
+}
+
+fn current_unix_secs() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
-    format_strftime_subset(&fmt, now)
+        .as_secs() as i64
 }
 
 /// Handle the specifiers HF chat templates actually use: `%Y`, `%m`, `%d`,
@@ -415,6 +636,7 @@ mod tests {
                 role: Role::Assistant,
                 content,
             }],
+            tools: None,
         };
         let out = tmpl().render(&p, false).unwrap();
         assert!(out.contains("<think>I should be concise.</think>Hello!"));
@@ -450,6 +672,7 @@ mod tests {
                     Block::text("world"),
                 ]),
             }],
+            tools: None,
         };
         let out = tmpl().render(&p, false).unwrap();
         assert!(out.contains("Hello world"));
@@ -481,6 +704,127 @@ mod tests {
         assert!(
             out.contains("assistant"),
             "rendered prompt missing assistant header"
+        );
+    }
+
+    /// Exercise the tools branch of the real Llama 3.1 template: pass a
+    /// single function definition, render, and assert the rendered
+    /// prompt includes the function name, schema, date, and ipython
+    /// environment header.
+    #[test]
+    #[ignore = "requires model"]
+    fn chat_template_renders_tools_against_real_model() {
+        use crate::{Engine, Tool};
+        use serde_json::json;
+        use std::{borrow::Cow, path::PathBuf};
+
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let engine = Engine::from_path(path).unwrap();
+        let tmpl = ChatTemplate::from_model(&engine.model).unwrap();
+
+        let tool = Tool {
+            name: Cow::Borrowed("get_weather"),
+            description: Cow::Borrowed(
+                "Look up the current weather in a city.",
+            ),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"}
+                },
+                "required": ["city"]
+            }),
+            cache_control: None,
+        };
+
+        let prompt = Prompt {
+            system: Some(Content::SinglePart(Cow::Borrowed(
+                "You are helpful.",
+            ))),
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::SinglePart(Cow::Borrowed(
+                    "What's the weather in Paris?",
+                )),
+            }],
+            tools: Some(vec![tool]),
+        };
+
+        let opts = RenderOptions::default()
+            .with_generation_prompt(true)
+            .with_date("17 Apr 2026");
+        let out = tmpl.render_with(&prompt, &opts).unwrap();
+
+        assert!(
+            out.contains("get_weather"),
+            "tools branch must mention function name. output:\n{out}"
+        );
+        assert!(
+            out.contains("\"city\""),
+            "schema should appear in rendered output. output:\n{out}"
+        );
+        assert!(
+            out.contains("17 Apr 2026"),
+            "date_string should appear when provided. output:\n{out}"
+        );
+        assert!(
+            out.contains("Environment: ipython"),
+            "system header should include ipython env when tools present"
+        );
+    }
+
+    /// Render an assistant tool-call turn, confirming the template
+    /// emits Llama 3.1's JSON tool-call format.
+    #[test]
+    #[ignore = "requires model"]
+    fn chat_template_renders_assistant_tool_call_against_real_model() {
+        use crate::prompt::ToolUse;
+        use crate::Engine;
+        use serde_json::json;
+        use std::{borrow::Cow, path::PathBuf};
+
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let engine = Engine::from_path(path).unwrap();
+        let tmpl = ChatTemplate::from_model(&engine.model).unwrap();
+
+        let call = ToolUse {
+            id: Cow::Borrowed("call_1"),
+            name: Cow::Borrowed("get_weather"),
+            input: json!({"city": "Paris"}),
+            cache_control: None,
+        };
+
+        let prompt = Prompt {
+            system: None,
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: Content::SinglePart(Cow::Borrowed(
+                        "Call get_weather for Paris.",
+                    )),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: Content::MultiPart(vec![Block::ToolUse { call }]),
+                },
+            ],
+            tools: None,
+        };
+
+        let out = tmpl.render(&prompt, false).unwrap();
+        assert!(
+            out.contains("\"name\": \"get_weather\""),
+            "tool-call branch must include function name. output:\n{out}"
+        );
+        assert!(
+            out.contains("\"parameters\""),
+            "tool-call branch must include parameters. output:\n{out}"
+        );
+        assert!(
+            out.contains("\"city\""),
+            "arguments should appear in rendered output. output:\n{out}"
         );
     }
 }

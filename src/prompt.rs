@@ -21,6 +21,7 @@
 use std::borrow::Cow;
 
 pub use misanthropic::prompt::message::{Block, Content, Message, Role};
+pub use misanthropic::tool::{Method as Tool, Use as ToolUse};
 
 /// A chat prompt: an optional system prompt plus a message transcript.
 ///
@@ -41,6 +42,11 @@ pub struct Prompt<'a> {
     ///
     /// [`ChatTemplate::render`]: crate::ChatTemplate::render
     pub messages: Vec<Message<'a>>,
+    /// Function/tool definitions to advertise to the model. Templates
+    /// that support tool calling (Llama 3.1, Qwen, etc.) JSON-serialize
+    /// these into the rendered prompt. `None` means "don't mention
+    /// tools" — equivalent to the template's `tools is none` branch.
+    pub tools: Option<Vec<Tool<'a>>>,
 }
 
 impl<'a> Prompt<'a> {
@@ -88,6 +94,12 @@ impl<'a> Prompt<'a> {
         self
     }
 
+    /// Attach a tool/function definition. Repeat to add more.
+    pub fn push_tool(mut self, tool: Tool<'a>) -> Self {
+        self.tools.get_or_insert_with(Vec::new).push(tool);
+        self
+    }
+
     /// Convert to a `'static` lifetime by cloning all borrowed data.
     pub fn into_static(self) -> Prompt<'static> {
         Prompt {
@@ -97,6 +109,19 @@ impl<'a> Prompt<'a> {
                 .into_iter()
                 .map(|m| m.into_static())
                 .collect(),
+            tools: self.tools.map(|ts| {
+                ts.into_iter().map(|t| tool_into_static(t)).collect()
+            }),
         }
+    }
+}
+
+/// Shift a [`Tool`] to `'static` by cloning its Cow fields.
+fn tool_into_static(tool: Tool<'_>) -> Tool<'static> {
+    Tool {
+        name: Cow::Owned(tool.name.into_owned()),
+        description: Cow::Owned(tool.description.into_owned()),
+        schema: tool.schema,
+        cache_control: tool.cache_control,
     }
 }
