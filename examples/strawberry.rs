@@ -137,12 +137,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("=== rendered prompt (turn 1) ===\n{rendered}\n===");
     }
 
-    // Force BOTH the outer tool-call shape AND the tool's input_schema:
-    // without strict_schema the grammar lets the model pick any JSON for
-    // `parameters`, which is how Llama 3.1 8B likes to invent fun field
-    // names like "chr" and "str".
+    // Force BOTH the outer tool-call shape AND the tool's input_schema.
+    // Cogito / Qwen / most non-Llama templates use `"arguments"` rather
+    // than Llama 3.1's `"parameters"`.
     let opts = ToolChoiceOptions {
         strict_schema: true,
+        arguments_field: "arguments",
         ..ToolChoiceOptions::default()
     };
     if args.verbose {
@@ -178,7 +178,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if name != "count_letters" {
         return Err(format!("unexpected tool: {name}").into());
     }
-    let params = &call["parameters"];
+    // Match the arguments_field we forced in the grammar.
+    let params = &call["arguments"];
     let letter = params["letter"]
         .as_str()
         .and_then(|s| s.chars().next())
