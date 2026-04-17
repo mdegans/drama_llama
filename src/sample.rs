@@ -6,9 +6,11 @@ use xorshift::Rng;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+mod grammar;
 mod json;
 mod repetition;
 
+pub use grammar::{Grammar, GrammarError, GrammarState};
 pub use json::{JsonError, JsonState};
 pub use repetition::{
     apply_sample_repetition_ngram, RepetitionError, RepetitionOptions,
@@ -50,6 +52,42 @@ where
     use rocket::serde::Deserialize;
     let state = JsonState::deserialize(deserializer)?;
     Ok(Arc::new(Mutex::new(state)))
+}
+
+/// Serialize a `SamplingMode::Grammar` by writing out the GBNF source
+/// text only. The matcher's mid-parse position is NOT serialized — on
+/// deserialize a fresh matcher is constructed from the source. This
+/// mirrors how the Json variant reconstructs its `Arc<Mutex<…>>` wrapping
+/// but accepts that grammar position info is lost across reload.
+#[cfg(feature = "serde")]
+fn serialize_grammar<S>(
+    arc: &Arc<Mutex<GrammarState>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: rocket::serde::Serializer,
+{
+    use rocket::serde::Serialize;
+    let source = match arc.lock() {
+        Ok(guard) => guard.grammar().source().to_owned(),
+        Err(poisoned) => poisoned.into_inner().grammar().source().to_owned(),
+    };
+    source.serialize(serializer)
+}
+
+/// Deserialize a `SamplingMode::Grammar` by re-parsing the GBNF source
+/// text and constructing a fresh matcher.
+#[cfg(feature = "serde")]
+fn deserialize_grammar<'de, D>(
+    deserializer: D,
+) -> Result<Arc<Mutex<GrammarState>>, D::Error>
+where
+    D: rocket::serde::Deserializer<'de>,
+{
+    use rocket::serde::{de::Error, Deserialize};
+    let source = String::deserialize(deserializer)?;
+    let grammar = Grammar::parse(&source).map_err(D::Error::custom)?;
+    Ok(Arc::new(Mutex::new(GrammarState::new(Arc::new(grammar)))))
 }
 
 #[cfg(feature = "egui")]
@@ -158,6 +196,22 @@ impl SampleOptions {
                             .clicked()
                         {
                             self.modes.push(json_sample);
+                        }
+                        // Grammar is the same story. We seed with a
+                        // permissive placeholder (`root ::= .+`); the
+                        // caller is expected to swap in a real grammar
+                        // via `SamplingMode::grammar_from_file`.
+                        let grammar_sample =
+                            SamplingMode::grammar("root ::= .+").expect(
+                                "placeholder grammar `root ::= .+` must \
+                                 parse",
+                            );
+                        if ui
+                            .selectable_label(false, grammar_sample.name())
+                            .on_hover_text_at_pointer(grammar_sample.help())
+                            .clicked()
+                        {
+                            self.modes.push(grammar_sample);
                         }
                     });
             });
@@ -415,6 +469,49 @@ pub enum SamplingMode {
         )]
         Arc<Mutex<JsonState>>,
     ),
+    /// GBNF-constrained sampling. Rejects any candidate whose bytes would
+    /// violate the grammar.
+    ///
+    /// # Termination
+    ///
+    /// Same as [`SamplingMode::Json`]: on zero valid candidates the filter
+    /// forces a single EOS candidate. Two cases trigger this:
+    ///
+    /// * **Success** — the grammar has reached an accept state; all further
+    ///   tokens are rejected. The matcher is **auto-reset** before
+    ///   returning EOS, so the next generation on the same mode instance
+    ///   starts fresh.
+    /// * **Grammar violation** — the matcher is mid-parse but no candidate
+    ///   token extends it. State is preserved for inspection.
+    ///
+    /// **For generation to actually stop**, EOS must be in
+    /// [`PredictOptions::stop_sequences`]. Use
+    /// [`PredictOptions::add_model_stops`] — otherwise the auto-reset will
+    /// let the model emit another document after EOS.
+    ///
+    /// # Construction
+    ///
+    /// Use [`SamplingMode::grammar`] to parse GBNF source, or
+    /// [`SamplingMode::grammar_from_file`] to load a `.gbnf` file.
+    ///
+    /// # Serde
+    ///
+    /// Under `serde`, only the GBNF source text is serialized. On
+    /// deserialize the source is re-parsed and the matcher starts fresh —
+    /// mid-parse position is NOT preserved across reload.
+    ///
+    /// [`PredictOptions::stop_sequences`]: crate::PredictOptions::stop_sequences
+    /// [`PredictOptions::add_model_stops`]: crate::PredictOptions::add_model_stops
+    Grammar(
+        #[cfg_attr(
+            feature = "serde",
+            serde(
+                serialize_with = "serialize_grammar",
+                deserialize_with = "deserialize_grammar"
+            )
+        )]
+        Arc<Mutex<GrammarState>>,
+    ),
 }
 
 impl SamplingMode {
@@ -439,6 +536,26 @@ impl SamplingMode {
         Self::Json(Arc::new(Mutex::new(JsonState::new())))
     }
 
+    /// Construct a GBNF-constrained sampling mode from a GBNF source
+    /// string. Returns the parse error if the grammar is malformed.
+    pub fn grammar(source: &str) -> Result<Self, GrammarError> {
+        let grammar = Arc::new(Grammar::parse(source)?);
+        Ok(Self::Grammar(Arc::new(Mutex::new(GrammarState::new(
+            grammar,
+        )))))
+    }
+
+    /// Construct a GBNF-constrained sampling mode by loading a `.gbnf`
+    /// file from disk. Returns an I/O or parse error on failure.
+    pub fn grammar_from_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, GrammarError> {
+        let grammar = Arc::new(Grammar::from_file(path)?);
+        Ok(Self::Grammar(Arc::new(Mutex::new(GrammarState::new(
+            grammar,
+        )))))
+    }
+
     /// The name of the sampling mode.
     pub fn name(&self) -> &'static str {
         match self {
@@ -453,6 +570,7 @@ impl SamplingMode {
             Self::SplitP { .. } => "Split P",
             Self::SplitL { .. } => "Split L",
             Self::Json(_) => "JSON",
+            Self::Grammar(_) => "Grammar",
         }
     }
 
@@ -470,6 +588,7 @@ impl SamplingMode {
             Self::SplitP { .. } => "Cuts off the tail where the difference between adjacent probabilities is greatest.",
             Self::SplitL { .. } => "Cuts off the tail where the difference between adjacent logits is greatest.",
             Self::Json(_) => "Constrains generation to valid JSON. Place early in the chain so it prunes candidates before top-p/top-k. On grammar violation, forces EOS and terminates.",
+            Self::Grammar(_) => "Constrains generation to a GBNF grammar. Place early in the chain so it prunes candidates before top-p/top-k. On grammar violation, forces EOS and terminates.",
         }
     }
 
@@ -728,6 +847,38 @@ impl SamplingMode {
                 }
                 resp
             }
+            Self::Grammar(state) => {
+                let (complete, depth, rule_count) = match state.lock() {
+                    Ok(s) => (
+                        s.is_complete(),
+                        s.stack_depth(),
+                        s.grammar().rule_count(),
+                    ),
+                    Err(_) => (false, 0, 0),
+                };
+                let status = if complete {
+                    format!("Grammar: complete ({rule_count} rules)")
+                } else {
+                    format!(
+                        "Grammar: in progress ({depth} active, {rule_count} rules)"
+                    )
+                };
+                let resp = ui.label(status).on_hover_text_at_pointer(
+                    "GBNF grammar constraint. Filters candidates to those that extend the grammar. On violation, forces EOS.",
+                );
+                if ui
+                    .button("Reset matcher")
+                    .on_hover_text_at_pointer(
+                        "Restart the matcher at the root rule.",
+                    )
+                    .clicked()
+                {
+                    if let Ok(mut s) = state.lock() {
+                        s.reset();
+                    }
+                }
+                resp
+            }
         }
     }
 
@@ -855,6 +1006,15 @@ impl PartialEq for SamplingMode {
                     _ => false,
                 }
             }
+            (Self::Grammar(a), Self::Grammar(b)) => {
+                if Arc::ptr_eq(a, b) {
+                    return true;
+                }
+                match (a.lock(), b.lock()) {
+                    (Ok(a), Ok(b)) => *a == *b,
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
@@ -973,6 +1133,14 @@ pub(crate) fn sample_token(
                     );
                     json::json_filter(candidates, &mut locked, model)
                 }
+                SamplingMode::Grammar(state) => {
+                    let mut locked = state.lock().expect(
+                        "SamplingMode::Grammar mutex poisoned; matcher \
+                         state is unrecoverable. Rebuild the mode with \
+                         SamplingMode::grammar(...) and retry.",
+                    );
+                    grammar::grammar_filter(candidates, &mut locked, model)
+                }
             });
 
     let chosen = choose_candidate(rng, filtered.softmax(None))
@@ -980,10 +1148,11 @@ pub(crate) fn sample_token(
         .unwrap()
         .id;
 
-    // Post-selection: advance every JSON parser in the chain by the chosen
-    // token. Multiple grammar constraints in the chain all observe the same
-    // chosen token and advance in lockstep.
+    // Post-selection: advance every JSON and grammar parser in the chain
+    // by the chosen token. Multiple grammar constraints in the chain all
+    // observe the same chosen token and advance in lockstep.
     json::advance_all(&opts.modes, chosen, model);
+    grammar::advance_all(&opts.modes, chosen, model);
 
     Ok(chosen)
 }
