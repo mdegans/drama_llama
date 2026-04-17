@@ -12,7 +12,8 @@ pub mod data;
 
 mod sample;
 pub use sample::{
-    RepetitionError, RepetitionOptions, SampleOptions, SamplingMode,
+    JsonError, JsonState, RepetitionError, RepetitionOptions, SampleOptions,
+    SamplingMode,
 };
 
 mod batch;
