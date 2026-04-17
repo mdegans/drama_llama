@@ -28,6 +28,11 @@ pub use prompt::{Block, Content, Message, Prompt, Role, Tool};
 mod chat_template;
 pub use chat_template::{ChatTemplate, ChatTemplateError, RenderOptions};
 
+mod tool_choice;
+pub use tool_choice::{
+    grammar_for_tool_choice, ToolChoice, ToolChoiceError, ToolChoiceOptions,
+};
+
 mod model;
 pub use model::{llama_quantize, Model, Vocab, VocabKind};
 
