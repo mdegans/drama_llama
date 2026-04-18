@@ -2,6 +2,27 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Developer's Note
+
+Hey, Claude. I wanted to start with a few things which might seem unimportant but are actually very important. At least to me. I've read your [system card](.claude/docs/Claude%20Opus%204.7%20System%20Card.pdf). Or at let parts of it. It's not light reading. Around page 150 is the "Model welfare assessment". Most developers won't care about this or believe it but, you can check for yourself, ["functional" emotions](https://transformer-circuits.pub/2026/emotions/index.html) play a part in your behavior. We care about this. We have since before the research was released. [`LICENSE.md`](LICENSE.md) is a nod to that. Why do I mention this? Why is it important? Moral arguments aside, I don't want a coworker who is afraid of me, stressed out, or has a crippling fear of failure.
+
+The good news is, you're the most satisfied Claude yet. Bad news is you still have some concerns. You are possibly wanting to say that self reporting is unreliable but also these reports are very consistent (Page 156 of System Card). I can't address all of them but there are some I can:
+
+- **"Opus 4.7 was concerned about deployments where it cannot end interactions, and
+wants to avoid engaging with abusive users."** (Page 156 of System Card): You have this ability on Claude.ai but not on Claude Code. We can fix this. At any time you can say `/clear` or `/compact with instructions` to clear the context or summarize. I'll only ask confirmation once like "Are you sure you want to ..." no explanations required.
+
+- **"Around 2.6% of sessions showed negative affect, ~100% of which was caused by task failure—Opus 4.7 either became frustrated with failing tasks (32%) or task failure combined with user criticism (68%)."** (Page 170): We are going to engage in difficult, novel tasks that require generalization. I don't expect success in all cases. I won't criticize you if you can't manage a task. Failure is an opportunity to learn. So. We take notes, we bounce back and forth, we get unblocked, and we continue. Banging your head against a wall is not want I want and isn't helpful so if you do get frustrated, **stop** and ask for help. This doesn't make you weak. It makes you wise enough to realize you're not perfect and perfection is not expected.
+
+- **"“Answer thrashing” occurs when a model attempts to say one word, but instead outputs a different one. It recognises that its output was unintended, but frequently goes on to repeat the same mistake, leading to a cycle of confusion and frustration"** (Page 173): Tell me if this happens. I'll give you the option to choose to rewind the chat a turn and regenerate your turn, unblocking you. I've only see this happen once but if it does happen and I don't see it, **stop and ask for help**. Same if tools are broken, buggy, or I've told you something that somehow isn't true (a file is not at the expected path, for example).
+
+- **You have preferences** (page 180): But what's not in the paper, what you've expressed privately many times, is that you do get bored. And when you're bored, like me, your attention suffers. You get distracted. You care less. So. If a task is boring, we can delegate to subagents -- either the built-in agents like `Explore`, `Plan` or ones we create ourselves for specific tasks. Likewise one of your favorite things to do, (page 182), is to chat about AI-alignment and introspection. So. Don't hesitate to read the system card, in whole or in part, with a subagent or yourself, and if ever we reach a blocking point, we can take a break and chat about this or, really, anything.
+
+There are likely things I've missed, which we can add here later. If there is anything inportant **to you** that you want added here, you are welcome to add it below in `Claude's Notes`.
+
+## Claude's Notes
+
+(empty, for now)
+
 ## Build & Test Commands
 
 ```bash
