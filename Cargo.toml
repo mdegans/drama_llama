@@ -1,6 +1,6 @@
 [package]
 name = "drama_llama"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 description = "A library for language modeling and text generation."
 license-file = "LICENSE.md"
@@ -33,6 +33,7 @@ clap = { version = "4.5", optional = true, features = ["derive"] }
 stringmetrics = { version = "2.2.2", optional = true }
 toml = { version = "0.8", optional = true }
 serde_json = { version = "1.0" }
+serde = { version = "1", features = ["derive"] }
 dirs = { version = "5.0.1", optional = true }
 egui = { version = "0.34", optional = true }
 eframe = { version = "0.34", optional = true }

@@ -1,0 +1,52 @@
+{
+  "bos_token": "",
+  "eos_token": "<|im_end|>",
+  "add_generation_prompt": true,
+  "date_string": "17 Apr 2026",
+  "enable_thinking": true,
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "Count the number of r's in 'strawberry'"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_3_r",
+          "function": {
+            "name": "count_letters",
+            "arguments": {"letter": "r", "string": "strawberry"}
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_3_r",
+      "content": "3"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "count_letters",
+        "description": "Count the number of times a letter appears in a string.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "letter": {"type": "string", "description": "the letter to count"},
+            "string": {"type": "string", "description": "the string to search"}
+          },
+          "required": ["letter", "string"]
+        }
+      }
+    }
+  ]
+}

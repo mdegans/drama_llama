@@ -1,0 +1,29 @@
+<|im_start|>system
+Enable deep thinking subroutine.
+
+You are a helpful assistant.
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"function":{"description":"Count the number of times a letter appears in a string.","name":"count_letters","parameters":{"properties":{"letter":{"description":"the letter to count","type":"string"},"string":{"description":"the string to search","type":"string"}},"required":["letter","string"],"type":"object"}},"type":"function"}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+<|im_start|>user
+Count the number of r's in 'strawberry'<|im_end|>
+<|im_start|>assistant
+<tool_call>
+{"name": "count_letters", "arguments": {"letter":"r","string":"strawberry"}}
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+3
+</tool_response><|im_end|>
+<|im_start|>assistant

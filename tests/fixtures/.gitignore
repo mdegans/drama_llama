@@ -1,0 +1,3 @@
+# Python venv created by uv run --script cache
+.venv/
+__pycache__/

@@ -1,0 +1,34 @@
+{
+  "bos_token": "",
+  "eos_token": "<|im_end|>",
+  "add_generation_prompt": true,
+  "date_string": "17 Apr 2026",
+  "enable_thinking": true,
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant. You cannot count letters in a word reliably on your own because you see in tokens, not letters. Use the `count_letters` tool when asked to count characters."
+    },
+    {
+      "role": "user",
+      "content": "Count the number of r's in 'strawberry'"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "count_letters",
+        "description": "Count the number of times a letter appears in a string.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "letter": {"type": "string", "description": "the letter to count"},
+            "string": {"type": "string", "description": "the string to search"}
+          },
+          "required": ["letter", "string"]
+        }
+      }
+    }
+  ]
+}

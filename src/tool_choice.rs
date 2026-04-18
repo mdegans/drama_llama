@@ -193,7 +193,12 @@ pub(crate) fn build_grammar_source(
         let _ = writeln!(src, "root ::= thought? ws {wrapped_call}");
         let _ = writeln!(src, r#"thought ::= "<think>" think_body "</think>""#);
         let _ = writeln!(src, r#"think_body ::= think_char*"#);
-        let _ = writeln!(src, r#"think_char ::= [^<]"#);
+        // Allow `<` inside a thought as long as the next char isn't the
+        // start of the closing tag (`</think>`). Keeps natural math /
+        // comparison text like `if x < 5` from force-EOSing the model.
+        // GBNF has no negative lookahead, so we split into two alts:
+        // any non-`<` byte, OR a `<` followed by a non-`/` byte.
+        let _ = writeln!(src, r#"think_char ::= [^<] | "<" [^/]"#);
     } else {
         let _ = writeln!(src, "root ::= ws {wrapped_call}");
     }
@@ -227,13 +232,19 @@ pub(crate) fn build_grammar_source(
     );
 
     // Alternation over the allowed function names, each quoted.
+    // Pipeline: `serde_json::to_string(&name)` produces a JSON string
+    // literal with JSON escapes applied (handles control chars, `\`,
+    // `"`, non-ASCII). We then GBNF-escape that literal so it can be
+    // embedded inside a GBNF `"..."` terminal without breaking the
+    // grammar parser.
     let mut alt = String::new();
     for (i, n) in names.iter().enumerate() {
         if i > 0 {
             alt.push_str(" | ");
         }
-        let escaped = n.replace('"', r#"\""#);
-        write!(alt, r#""\"{escaped}\"""#).unwrap();
+        let json_lit = serde_json::to_string(n).unwrap();
+        let gbnf_lit = escape_for_gbnf_string(&json_lit);
+        write!(alt, r#""{gbnf_lit}""#).unwrap();
     }
     let _ = writeln!(src, r#"name_choice ::= {alt}"#);
 
@@ -305,10 +316,13 @@ fn emit_schema_rule(
             if i > 0 {
                 alt.push_str(" | ");
             }
-            // JSON-encode then escape for GBNF string literal.
-            let s = serde_json::to_string(v).unwrap_or_else(|_| "null".into());
-            let gbnf = s.replace('\\', r#"\\"#).replace('"', r#"\""#);
-            let _ = write!(alt, r#""{gbnf}""#);
+            // serde_json produces the JSON literal with proper escapes,
+            // then we GBNF-escape that string so it embeds cleanly in a
+            // GBNF `"..."` terminal.
+            let json_lit =
+                serde_json::to_string(v).unwrap_or_else(|_| "null".into());
+            let gbnf_lit = escape_for_gbnf_string(&json_lit);
+            let _ = write!(alt, r#""{gbnf_lit}""#);
         }
         let _ = writeln!(out, "{rule_name} ::= {alt}");
         return;
@@ -321,9 +335,9 @@ fn emit_schema_rule(
         }
         Some("integer") => {
             // JSON grammar's `number` also permits decimals; reject
-            // those for integer fields by forbidding `.` / `e`.
-            let _ = writeln!(out, "{rule_name} ::= int_only");
-            let _ = writeln!(out, "int_only ::= int");
+            // those for integer fields by referencing `int` directly
+            // (defined in JSON_GRAMMAR, no frac/exp trailer).
+            let _ = writeln!(out, "{rule_name} ::= int");
         }
         Some("number") => {
             let _ = writeln!(out, "{rule_name} ::= number");
@@ -406,8 +420,12 @@ fn emit_object_rule(
         if i > 0 {
             body.push_str(r#" ws "," ws"#);
         }
-        let escaped = field_name.replace('\\', r#"\\"#).replace('"', r#"\""#);
-        let _ = write!(body, r#" "\"{escaped}\"" ws ":" ws {child_rule}"#);
+        // Same pipeline as `name_choice`: JSON-encode the field name
+        // (handles control chars / `\` / `"`), then GBNF-escape the
+        // resulting literal so it embeds cleanly in a GBNF terminal.
+        let json_lit = serde_json::to_string(field_name).unwrap();
+        let gbnf_lit = escape_for_gbnf_string(&json_lit);
+        let _ = write!(body, r#" "{gbnf_lit}" ws ":" ws {child_rule}"#);
     }
     body.push_str(" ws \"}\"");
     let _ = writeln!(out, "{rule_name} ::= {body}");
@@ -647,6 +665,451 @@ mod tests {
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {"a": 1,}}"#));
         // Single-quoted string is invalid JSON.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {'a': 1}}"#));
+    }
+
+    // ======================================================================
+    // Regression locks for bugs fixed in Phase 0.5.1
+    // ======================================================================
+
+    /// Regression lock for the `int_only ::= int` duplicate-rule bug.
+    /// Before the fix, any schema with ≥2 integer fields failed to
+    /// compile at `Grammar::parse` as a duplicate-rule syntax error.
+    #[test]
+    fn strict_schema_two_integer_fields_compiles() {
+        let schema_tool = Tool {
+            name: Cow::Borrowed("two_ints"),
+            description: Cow::Borrowed(""),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"}
+                },
+                "required": ["x", "y"]
+            }),
+            cache_control: None,
+        };
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        // Compilation must succeed — the previous bug errored here.
+        let result = grammar_for_tool_choice(
+            &ToolChoice::Method {
+                name: "two_ints".into(),
+            },
+            &[schema_tool.clone()],
+            &opts,
+        );
+        assert!(
+            result.is_ok(),
+            "two-integer schema must compile, got {:?}",
+            result.err()
+        );
+        // And the grammar must still accept valid inputs and reject
+        // decimals.
+        let src =
+            build_grammar_source(&["two_ints"], Some(&schema_tool), &opts);
+        assert!(accepts(
+            &src,
+            r#"{"name": "two_ints", "parameters": {"x": 1, "y": 2}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "two_ints", "parameters": {"x": 1.5, "y": 2}}"#
+        ));
+    }
+
+    /// Regression lock for `think_char ::= [^<]`. Before the fix, a
+    /// thought containing `<` (e.g. `if x < 5`) would force-EOS.
+    #[test]
+    fn thought_body_with_lt_inside_accepted() {
+        let opts = ToolChoiceOptions {
+            allow_thought: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["x"], None, &opts);
+        assert!(accepts(
+            &src,
+            "<think>if x < 5 then call x</think>\n{\"name\": \"x\", \"parameters\": {}}"
+        ));
+    }
+
+    /// Regression lock for the hand-rolled escape path. A tool name
+    /// containing JSON-escapable characters must embed through the
+    /// grammar without blowing up the GBNF parser.
+    #[test]
+    fn tool_name_with_special_chars_embeds_safely() {
+        // A tool name with a backslash and a quote.
+        let weird = "evil\\\"name";
+        let src =
+            build_grammar_source(&[weird], None, &ToolChoiceOptions::default());
+        // Grammar compiles.
+        assert!(
+            Grammar::parse(&src).is_ok(),
+            "grammar failed to parse for weird name:\n{src}"
+        );
+        // And it accepts the properly JSON-escaped tool call.
+        let json_name = serde_json::to_string(weird).unwrap();
+        let input = format!(r#"{{"name": {json_name}, "parameters": {{}}}}"#);
+        assert!(accepts(&src, &input));
+    }
+
+    // ======================================================================
+    // wrap_tags gap-fill (previously ZERO tests — cogito production path)
+    // ======================================================================
+
+    #[test]
+    fn wrap_tags_accepts_tagged_envelope() {
+        let opts = ToolChoiceOptions {
+            wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["x"], None, &opts);
+        assert!(accepts(
+            &src,
+            "<tool_call>\n{\"name\": \"x\", \"parameters\": {}}\n</tool_call>"
+        ));
+    }
+
+    #[test]
+    fn wrap_tags_rejects_bare_json() {
+        let opts = ToolChoiceOptions {
+            wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["x"], None, &opts);
+        // With wrap_tags on, bare JSON without the envelope must be
+        // rejected.
+        assert!(!accepts(&src, r#"{"name": "x", "parameters": {}}"#));
+    }
+
+    #[test]
+    fn wrap_tags_rejects_mismatched_tags() {
+        let opts = ToolChoiceOptions {
+            wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["x"], None, &opts);
+        // Wrong close tag.
+        assert!(!accepts(
+            &src,
+            "<tool_call>\n{\"name\": \"x\", \"parameters\": {}}\n</wrong>"
+        ));
+        // Missing close.
+        assert!(!accepts(
+            &src,
+            "<tool_call>\n{\"name\": \"x\", \"parameters\": {}}"
+        ));
+    }
+
+    #[test]
+    fn wrap_tags_plus_thought_composition() {
+        // The cogito:14b production triple: thought preamble + tagged
+        // envelope.
+        let opts = ToolChoiceOptions {
+            allow_thought: true,
+            wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["x"], None, &opts);
+        assert!(accepts(
+            &src,
+            "<think>plan the call</think>\n<tool_call>\n{\"name\": \"x\", \"parameters\": {}}\n</tool_call>"
+        ));
+        // Thought alone (no call) must still be rejected — the call
+        // is required.
+        assert!(!accepts(&src, "<think>just thinking</think>"));
+    }
+
+    // ======================================================================
+    // allow_thought edge cases
+    // ======================================================================
+
+    #[test]
+    fn thought_unclosed_rejected() {
+        let opts = ToolChoiceOptions {
+            allow_thought: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["x"], None, &opts);
+        assert!(!accepts(
+            &src,
+            r#"<think>never closed {"name": "x", "parameters": {}}"#
+        ));
+    }
+
+    #[test]
+    fn thought_after_json_rejected() {
+        let opts = ToolChoiceOptions {
+            allow_thought: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["x"], None, &opts);
+        // Thought after the JSON is not in the grammar.
+        assert!(!accepts(
+            &src,
+            r#"{"name": "x", "parameters": {}}<think>too late</think>"#
+        ));
+    }
+
+    #[test]
+    fn empty_thought_accepted() {
+        let opts = ToolChoiceOptions {
+            allow_thought: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["x"], None, &opts);
+        assert!(accepts(
+            &src,
+            r#"<think></think>{"name": "x", "parameters": {}}"#
+        ));
+    }
+
+    // ======================================================================
+    // strict_schema per-primitive-type coverage
+    // ======================================================================
+
+    fn single_required_schema(
+        field: &str,
+        prop: serde_json::Value,
+    ) -> Tool<'static> {
+        Tool {
+            name: Cow::Borrowed("fn"),
+            description: Cow::Borrowed(""),
+            schema: json!({
+                "type": "object",
+                "properties": { field: prop },
+                "required": [field]
+            }),
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn strict_schema_integer_rejects_decimals_and_exponents() {
+        let t = single_required_schema("n", json!({"type": "integer"}));
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": -7}}"#));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"n": 1.5}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"n": 1e10}}"#
+        ));
+    }
+
+    #[test]
+    fn strict_schema_number_accepts_decimals_and_exponents() {
+        let t = single_required_schema("n", json!({"type": "number"}));
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 1.5}}"#));
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"n": -0.5e3}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"n": "x"}}"#
+        ));
+    }
+
+    #[test]
+    fn strict_schema_boolean_forces_true_false() {
+        let t = single_required_schema("b", json!({"type": "boolean"}));
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"b": true}}"#
+        ));
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"b": false}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"b": "true"}}"#
+        ));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"b": 1}}"#));
+    }
+
+    #[test]
+    fn strict_schema_null_forces_null() {
+        let t = single_required_schema("z", json!({"type": "null"}));
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"z": null}}"#
+        ));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"z": 0}}"#));
+    }
+
+    #[test]
+    fn strict_schema_string_enum_variants() {
+        let t = single_required_schema(
+            "color",
+            json!({"type": "string", "enum": ["red", "green", "blue"]}),
+        );
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"color": "red"}}"#
+        ));
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"color": "blue"}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"color": "yellow"}}"#
+        ));
+    }
+
+    #[test]
+    fn strict_schema_integer_enum_variants() {
+        let t = single_required_schema(
+            "level",
+            json!({"type": "integer", "enum": [1, 2, 3]}),
+        );
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"level": 1}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"level": 4}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"level": "1"}}"#
+        ));
+    }
+
+    #[test]
+    fn strict_schema_array_of_strings() {
+        let t = single_required_schema(
+            "tags",
+            json!({"type": "array", "items": {"type": "string"}}),
+        );
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"tags": ["a", "b"]}}"#
+        ));
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"tags": []}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"tags": [1, 2]}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"tags": "a"}}"#
+        ));
+    }
+
+    #[test]
+    fn strict_schema_nested_object() {
+        let t = Tool {
+            name: Cow::Borrowed("fn"),
+            description: Cow::Borrowed(""),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "loc": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"}
+                        },
+                        "required": ["x", "y"]
+                    }
+                },
+                "required": ["loc"]
+            }),
+            cache_control: None,
+        };
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..ToolChoiceOptions::default()
+        };
+        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        assert!(accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"loc": {"x": 1, "y": 2}}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"loc": {"x": 1}}}"#
+        ));
+        assert!(!accepts(
+            &src,
+            r#"{"name": "fn", "parameters": {"loc": "origin"}}"#
+        ));
+    }
+
+    // ======================================================================
+    // grammar_for_prompt early-return paths
+    // ======================================================================
+
+    #[test]
+    fn grammar_for_prompt_no_tool_choice_returns_none() {
+        use crate::Prompt;
+        let prompt = Prompt {
+            tool_choice: None,
+            ..Default::default()
+        };
+        let got =
+            grammar_for_prompt(&prompt, &ToolChoiceOptions::default()).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn grammar_for_prompt_auto_returns_none() {
+        use crate::Prompt;
+        let prompt = Prompt {
+            tool_choice: Some(ToolChoice::Auto),
+            functions: Some(vec![tool("x")]),
+            ..Default::default()
+        };
+        let got =
+            grammar_for_prompt(&prompt, &ToolChoiceOptions::default()).unwrap();
+        assert!(got.is_none());
     }
 
     /// End-to-end: force Llama 3.1 to make a specific tool call. The

@@ -10,10 +10,14 @@ use llama_cpp_sys_3::{
     ggml_log_callback, ggml_log_level, ggml_log_set,
     ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED, llama_backend_free,
     llama_backend_init, llama_context, llama_context_default_params,
-    llama_context_params, llama_decode, llama_free, llama_get_embeddings_ith,
-    llama_get_logits_ith, llama_get_memory, llama_log_set, llama_memory_clear,
-    llama_memory_seq_add, llama_memory_seq_cp, llama_memory_seq_div,
-    llama_memory_seq_keep, llama_memory_seq_pos_max, llama_memory_seq_rm,
+    llama_context_params, llama_decode,
+    llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_AUTO,
+    llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED,
+    llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED, llama_free,
+    llama_get_embeddings_ith, llama_get_logits_ith, llama_get_memory,
+    llama_log_set, llama_memory_clear, llama_memory_seq_add,
+    llama_memory_seq_cp, llama_memory_seq_div, llama_memory_seq_keep,
+    llama_memory_seq_pos_max, llama_memory_seq_rm, llama_model_default_params,
     llama_model_params, llama_n_batch, llama_n_ctx,
     llama_new_context_with_model, llama_numa_init, llama_perf_context,
     llama_perf_context_data, llama_perf_context_reset, llama_pos, llama_seq_id,
@@ -82,6 +86,43 @@ pub enum DecodeError {
 }
 
 static_assertions::assert_impl_all!(DecodeError: Send, Sync);
+
+/// Flash Attention policy for a new [`Engine`] context.
+///
+/// llama.cpp's default is [`Self::Auto`] — it enables Flash Attention
+/// when the active backend supports it (typical on Metal, CUDA, Vulkan).
+/// [`Self::Disabled`] is useful as a diagnostic: FA uses a fused softmax
+/// kernel that can produce slightly different logits than the non-FA
+/// attention path on close-race token distributions, and toggling it off
+/// rules that out as a source of divergence against other runners
+/// (notably ollama's Go-native `--ollama-engine`, which does not use
+/// llama.cpp's FA kernel at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashAttention {
+    /// Let llama.cpp decide based on backend capabilities (default).
+    Auto,
+    /// Force-disable Flash Attention. Slower but numerically closer to
+    /// the un-fused softmax path in other runners.
+    Disabled,
+    /// Force-enable. Errors at context creation if the backend doesn't
+    /// support it.
+    Enabled,
+}
+
+impl FlashAttention {
+    /// Map to the raw llama.cpp enum value.
+    fn as_raw(self) -> llama_cpp_sys_3::llama_flash_attn_type {
+        match self {
+            Self::Auto => llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_AUTO,
+            Self::Disabled => {
+                llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED
+            }
+            Self::Enabled => {
+                llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED
+            }
+        }
+    }
+}
 
 /// An `Engine` encompasses everything needed to run inferences. It contains the
 /// model and the context. It is the main entry point for running inferences.
@@ -176,6 +217,45 @@ impl Engine {
     /// parameters are used.
     pub fn from_path(path: PathBuf) -> Result<Self, NewError> {
         Self::new(path, None, None, None, None)
+    }
+
+    /// Create a new engine from a model `path` forcing CPU-only
+    /// inference (zero GPU layers).
+    ///
+    /// Diagnostic escape hatch: CPU kernels are standardized across
+    /// ggml implementations where Metal/CUDA/Vulkan kernels are not;
+    /// forcing CPU rules out GPU-kernel divergence as the cause of
+    /// output differences against other runners.
+    ///
+    /// Expect this to be dramatically slower than the default
+    /// (GPU-offloaded) path — useful for one-off verification, not
+    /// production inference.
+    pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, NewError> {
+        let mut mp = unsafe { llama_model_default_params() };
+        mp.n_gpu_layers = 0;
+        Self::new(path, Some(mp), None, None, None)
+    }
+
+    /// Create a new engine from a model `path` with an explicit Flash
+    /// Attention policy.
+    ///
+    /// Diagnostic hatch: when debugging output divergence between llama.cpp
+    /// and ollama's engine (or any other GGML-based runner), forcing FA off
+    /// isolates whether the Flash Attention softmax path is producing
+    /// different logits on close-race token distributions. ollama's Go-
+    /// native runner (`--ollama-engine`) uses a different attention
+    /// implementation entirely; comparing against it with FA on vs off in
+    /// llama.cpp can pin the numerical divergence to the softmax kernel.
+    ///
+    /// The default (via [`Self::from_path`]) is [`FlashAttention::Auto`] —
+    /// llama.cpp picks based on the backend's capabilities.
+    pub fn from_path_with_flash_attention(
+        path: PathBuf,
+        fa: FlashAttention,
+    ) -> Result<Self, NewError> {
+        let mut cp = unsafe { llama_context_default_params() };
+        cp.flash_attn_type = fa.as_raw();
+        Self::new(path, None, Some(cp), None, None)
     }
 
     /// Returns true if mmap is supported.

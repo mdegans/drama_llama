@@ -23,7 +23,10 @@ mod candidates;
 pub use candidates::{Candidates, Sorted, TokenDataArray};
 
 pub mod prompt;
-pub use prompt::{Block, Content, Message, Prompt, Role, Tool, ToolChoice};
+pub use prompt::{
+    AssistantMessage, Block, Content, Message, Prompt, Role, Tool, ToolChoice,
+    UserMessage,
+};
 
 mod chat_template;
 pub use chat_template::{ChatTemplate, ChatTemplateError, RenderOptions};
@@ -45,12 +48,20 @@ mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};
 
 mod engine;
-pub use engine::{restore_default_logs, silence_logs, Engine, NewError};
+pub use engine::{
+    restore_default_logs, silence_logs, Engine, FlashAttention, NewError,
+};
 
 mod predictor;
 pub use predictor::{
     CandidatePredictor, PiecePredictor, PredictOptions, Predicted, Predictor,
     TokenPredictor,
+};
+
+mod session;
+pub use session::{
+    parse_completion, BlockParser, BlockStream, Session, SessionError,
+    TokenTrace, TopKEntry,
 };
 
 mod probability;

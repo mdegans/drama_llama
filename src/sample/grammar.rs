@@ -1480,6 +1480,115 @@ mod tests {
         assert!(!accepts_complete(g, "anb"));
     }
 
+    // ======================================================================
+    // UTF-8 boundary regression tests (Phase 0.5.2 gap-fill)
+    // ======================================================================
+
+    /// Surrogate range U+D800..=U+DFFF encodes as `0xED 0xA0..=0xBF
+    /// 0x80..=0xBF` in strict UTF-8. Those codepoints are invalid UTF-8
+    /// and must be rejected even when the grammar permits any
+    /// codepoint.
+    #[test]
+    fn rejects_surrogate_byte_sequence() {
+        let g = r#"root ::= char+
+char ::= [\x00-\x7F] | [\x80-\xFF]"#;
+        let grammar = Arc::new(Grammar::parse(g).unwrap());
+        let mut state = GrammarState::new(grammar);
+        // 0xED 0xA0 0x80 = U+D800 (high surrogate)
+        assert!(state.advance_bytes(&[0xED, 0xA0, 0x80]).is_err());
+    }
+
+    /// Codepoints above U+10FFFF are not valid Unicode and must be
+    /// rejected. `0xF4 0x90 0x80 0x80` would decode as U+110000.
+    #[test]
+    fn rejects_codepoint_above_max_unicode() {
+        let g = r#"root ::= char+
+char ::= [\x00-\x7F] | [\x80-\xFF]"#;
+        let grammar = Arc::new(Grammar::parse(g).unwrap());
+        let mut state = GrammarState::new(grammar);
+        assert!(state.advance_bytes(&[0xF4, 0x90, 0x80, 0x80]).is_err());
+    }
+
+    /// A lone continuation byte (`0x80..=0xBF` without a lead) is not
+    /// valid UTF-8.
+    #[test]
+    fn rejects_lone_continuation_byte() {
+        let g = r#"root ::= char+
+char ::= [\x00-\x7F] | [\x80-\xFF]"#;
+        let grammar = Arc::new(Grammar::parse(g).unwrap());
+        let mut state = GrammarState::new(grammar);
+        assert!(state.advance_bytes(&[0x80]).is_err());
+    }
+
+    /// Legacy 5/6-byte leads (`0xF8..=0xFF`) were valid in early UTF-8
+    /// drafts but aren't part of the 2003+ spec. Reject them.
+    #[test]
+    fn rejects_legacy_long_utf8_leads() {
+        let g = r#"root ::= char+
+char ::= [\x00-\x7F] | [\x80-\xFF]"#;
+        for lead in [0xF8u8, 0xFC, 0xFE, 0xFF] {
+            let grammar = Arc::new(Grammar::parse(g).unwrap());
+            let mut state = GrammarState::new(grammar);
+            assert!(
+                state.advance_bytes(&[lead]).is_err(),
+                "lead 0x{lead:02X} should be rejected"
+            );
+        }
+    }
+
+    // ======================================================================
+    // GBNF parser error paths (Phase 0.5.2 gap-fill)
+    // ======================================================================
+
+    #[test]
+    fn duplicate_rule_definition_rejected() {
+        // Two definitions of `root` — parser must flag.
+        let g = "root ::= \"a\"\nroot ::= \"b\"";
+        assert!(Grammar::parse(g).is_err());
+    }
+
+    #[test]
+    fn char_class_unterminated_rejected() {
+        assert!(Grammar::parse("root ::= [abc").is_err());
+    }
+
+    #[test]
+    fn char_class_inverted_range_rejected() {
+        // `[z-a]` is an inverted range, parser must error.
+        assert!(Grammar::parse("root ::= [z-a]").is_err());
+    }
+
+    #[test]
+    fn char_class_trailing_dash_accepted_as_literal() {
+        // `[a-zA-Z0-9-]` — the trailing `-` is a literal dash, not a
+        // partial range.
+        let g = r#"root ::= [a-zA-Z0-9-]+"#;
+        assert!(accepts_complete(g, "abc-123"));
+        assert!(accepts_complete(g, "-"));
+    }
+
+    #[test]
+    fn right_recursion_accepts() {
+        // Right-recursive: root ::= "a" root | "b".
+        let g = r#"root ::= "a" root | "b""#;
+        assert!(accepts_complete(g, "b"));
+        assert!(accepts_complete(g, "ab"));
+        assert!(accepts_complete(g, "aaab"));
+    }
+
+    #[test]
+    fn is_complete_false_mid_match() {
+        // Parsing "a" against `root ::= "abc"` must leave is_complete
+        // false — the grammar expects more.
+        let g = r#"root ::= "abc""#;
+        let grammar = Arc::new(Grammar::parse(g).unwrap());
+        let mut state = GrammarState::new(grammar);
+        state.advance_bytes(b"a").unwrap();
+        assert!(!state.is_complete(), "mid-match should not be complete");
+        state.advance_bytes(b"bc").unwrap();
+        assert!(state.is_complete(), "full match should be complete");
+    }
+
     /// End-to-end integration test: run a real model with a GBNF that
     /// forces a specific tool-call shape.
     #[cfg(feature = "serde")]

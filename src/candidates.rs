@@ -1384,6 +1384,108 @@ mod tests {
         assert_eq!(sorted[2].logit, -0.3);
     }
 
+    // Greedy sampling in production is
+    // `sort(Sorted::ByLogit { k: 1 })` + truncate. If these tests
+    // fail, greedy sampling can pick a non-argmax token — the exact
+    // symptom we're hunting in strawberry (cogito picks `letter='a'`
+    // where ollama's trace says `'r'` is peaked by ~12 log-probs).
+
+    #[test]
+    fn sort_by_logit_finds_argmax_in_middle() {
+        // Argmax NOT at position 0 — the case that breaks first if
+        // sort has an off-by-one or cmp-direction bug.
+        let logits =
+            vec![-5.0, -4.0, -3.0, -2.0, -1.0, 0.0, -1.5, -2.5, -3.5, -4.5];
+        let c = Candidates::from_logits(logits);
+        let sorted = c.sort(Sorted::ByLogit {
+            k: NonZeroUsize::new(1).unwrap(),
+        });
+        assert_eq!(sorted.len().get(), 1);
+        assert_eq!(sorted[0].id, 5);
+        assert_eq!(sorted[0].logit, 0.0);
+    }
+
+    #[test]
+    fn sort_by_logit_argmax_at_last_position() {
+        let n: usize = 100;
+        let mut logits = vec![-1000.0; n];
+        logits[n - 1] = 0.0;
+        let c = Candidates::from_logits(logits);
+        let sorted = c.sort(Sorted::ByLogit {
+            k: NonZeroUsize::new(1).unwrap(),
+        });
+        assert_eq!(sorted[0].id, (n - 1) as i32);
+        assert_eq!(sorted[0].logit, 0.0);
+    }
+
+    #[test]
+    fn sort_by_logit_realistic_strawberry_logprobs() {
+        // Shape mirrors ollama's strawberry trace at the letter
+        // position: one clear peak, everything else 10+ log-probs
+        // behind. If sort can't pick out the obvious winner here,
+        // it definitely can't in production.
+        let logits = vec![
+            -10.54,  // 'R'
+            -11.52,  // 's'
+            -0.0001, // 'r' — argmax
+            -12.19,  // 'a'
+            -10.61,  // ' "\\'
+            -9.98,   // '","'
+            -14.80,  // ' ":'
+        ];
+        let c = Candidates::from_logits(logits);
+        let sorted = c.sort(Sorted::ByLogit {
+            k: NonZeroUsize::new(3).unwrap(),
+        });
+        assert_eq!(sorted[0].id, 2, "argmax must be the -0.0001 peak");
+        assert_eq!(sorted[1].id, 5);
+        assert_eq!(sorted[2].id, 0);
+    }
+
+    #[test]
+    fn sort_by_logit_large_vocab_buried_argmax() {
+        // Vocab-scale sort with argmax buried at a non-trivial
+        // index. Cogito's n_vocab is ~151k; if there's a
+        // scale-dependent bug in partial_sort's handling it
+        // surfaces here but not in the toy cases above.
+        let n: usize = 151_668;
+        let argmax_idx: usize = 100_000;
+        let mut logits = vec![-50.0; n];
+        // Non-trivial noise so the sort can't degenerate into a
+        // trivial linear scan.
+        for (i, l) in logits.iter_mut().enumerate() {
+            if i % 7 == 0 {
+                *l = -40.0;
+            }
+            if i % 13 == 0 {
+                *l = -30.0;
+            }
+        }
+        logits[argmax_idx] = 0.0;
+        let c = Candidates::from_logits(logits);
+        let sorted = c.sort(Sorted::ByLogit {
+            k: NonZeroUsize::new(1).unwrap(),
+        });
+        assert_eq!(sorted[0].id, argmax_idx as i32);
+        assert_eq!(sorted[0].logit, 0.0);
+    }
+
+    #[test]
+    fn greedy_matches_sort_k1() {
+        // Parity: sample_token_greedy should pick the same token as
+        // sort(ByLogit { k: 1 }). Greedy is the production path in
+        // strawberry; if these ever diverge, the diagnostic equates
+        // two different things.
+        let logits = vec![-12.3, -0.001, -10.5, -8.1, -15.0, -2.4];
+        let via_sort =
+            Candidates::from_logits(logits.clone()).sort(Sorted::ByLogit {
+                k: NonZeroUsize::new(1).unwrap(),
+            });
+        let via_greedy = Candidates::from_logits(logits).sample_token_greedy();
+        assert_eq!(via_sort[0].id, 1);
+        assert_eq!(via_greedy.is_one().unwrap().id, 1);
+    }
+
     #[test]
     fn test_iter() {
         let n: usize = 10;

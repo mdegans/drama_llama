@@ -924,6 +924,50 @@ mod tests {
         assert!(b.is_complete());
     }
 
+    // ======================================================================
+    // Phase 0.5.2 gap-fill: non-ASCII, surrogate hex escapes, number edges
+    // ======================================================================
+
+    /// Byte-level JSON strings accept any non-control byte between the
+    /// delimiting quotes, including multi-byte UTF-8 like `café`. This
+    /// documents the lenient behavior: `JsonState` works on byte
+    /// sequences, not validated Unicode codepoints, which matches how
+    /// llama.cpp tokens stream through.
+    #[test]
+    fn non_ascii_string_bytes_accepted() {
+        let mut s = JsonState::new();
+        feed_all(&mut s, "\"caf\u{00E9}\"").unwrap();
+        s.finalize().unwrap();
+        assert!(s.is_complete());
+    }
+
+    /// `\uD83D\uDE00` is a UTF-16 surrogate pair for U+1F600. JSON
+    /// requires pairs to be well-formed; we tolerate either half
+    /// in isolation (the downstream `serde_json` parser validates).
+    /// Documents the permissive behavior.
+    #[test]
+    fn surrogate_pair_hex_escapes_tolerated() {
+        let mut s = JsonState::new();
+        feed_all(&mut s, r#""\uD83D\uDE00""#).unwrap();
+        s.finalize().unwrap();
+        assert!(s.is_complete());
+    }
+
+    /// Spec-compliant but easy-to-miss number edge cases.
+    #[test]
+    fn number_edge_cases() {
+        for lit in ["-0", "-0.0", "0e0", "0e-0", "0.0", "1e10", "-1.5e+3"] {
+            let mut s = JsonState::new();
+            feed_all(&mut s, lit).unwrap_or_else(|e| {
+                panic!("literal {lit:?} failed to feed: {e:?}")
+            });
+            s.finalize().unwrap_or_else(|e| {
+                panic!("literal {lit:?} failed to finalize: {e:?}")
+            });
+            assert!(s.is_complete(), "{lit:?} should be complete");
+        }
+    }
+
     /// End-to-end integration test: prompt a real model to emit a JSON
     /// character sheet with `SamplingMode::Json` in the chain, then assert
     /// the output parses as valid JSON.

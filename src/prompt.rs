@@ -29,7 +29,9 @@
 //! [`PredictOptions`]: crate::PredictOptions
 //! [`SampleOptions`]: crate::SampleOptions
 
-pub use misanthropic::prompt::message::{Block, Content, Message, Role};
+pub use misanthropic::prompt::message::{
+    AssistantMessage, Block, Content, Message, Role, UserMessage,
+};
 pub use misanthropic::tool::{
     Choice as ToolChoice, Method as Tool, Result as ToolResult, Use as ToolUse,
 };

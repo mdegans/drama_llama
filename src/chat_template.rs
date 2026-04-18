@@ -47,7 +47,35 @@ use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use minijinja::{value::Value as JinjaValue, Environment, Error as JinjaError};
 
-use crate::{Block, Content, Model, Prompt, Role};
+use crate::{prompt::Tool, Block, Content, Model, Prompt, Role};
+
+/// Render a [`Tool`] as the OpenAI wire envelope cogito / Qwen /
+/// Hermes-family chat templates expect.
+///
+/// These templates do `{{ tool | tojson }}` and feed the resulting
+/// JSON straight to the model. The training data — produced by
+/// ollama's Go runtime — always takes the shape
+/// `{"type": "function", "function": {"name": ..., "description":
+/// ..., "parameters": ...}}`. misanthropic's [`tool::Method`]
+/// serializes in Anthropic shape (`input_schema` rather than
+/// `parameters`, no wire envelope), so we adapt through this
+/// function before handing off to minijinja.
+///
+/// Key order within the JSON object is irrelevant for the model
+/// (minijinja alphabetizes on output anyway); the structural shape
+/// and field names are what matter.
+///
+/// [`tool::Method`]: misanthropic::tool::Method
+fn tool_wire_value(tool: &Tool<'_>) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": tool.name.as_ref(),
+            "description": tool.description.as_ref(),
+            "parameters": &tool.schema,
+        }
+    })
+}
 
 /// A compiled chat template tied to a specific model's tokens.
 ///
@@ -157,7 +185,11 @@ impl ChatTemplate {
     ) -> Result<String, ChatTemplateError> {
         let messages = build_messages(prompt);
         let tools_value = match prompt.functions.as_ref() {
-            Some(ts) if !ts.is_empty() => JinjaValue::from_serialize(ts),
+            Some(ts) if !ts.is_empty() => {
+                let wire: Vec<serde_json::Value> =
+                    ts.iter().map(tool_wire_value).collect();
+                JinjaValue::from_serialize(&wire)
+            }
             _ => JinjaValue::from(()), // renders as None / null
         };
         // Default `date_string` to today in HF's "%d %b %Y" format when
@@ -833,5 +865,177 @@ mod tests {
             out.contains("\"city\""),
             "arguments should appear in rendered output. output:\n{out}"
         );
+    }
+
+    /// Diagnostic: read a file from
+    /// `DRAMA_LLAMA_TOKENIZE_FILE` and print (count, first 20 ids, last 20
+    /// ids) of drama_llama's tokenization. Lets us compare against
+    /// ollama's token count on the same bytes to confirm tokenizer
+    /// parity. Run with
+    /// `DRAMA_LLAMA_TOKENIZE_FILE=/tmp/dl_turn2.txt cargo test
+    /// dump_tokenize -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "diagnostic helper"]
+    fn dump_tokenize() {
+        use crate::Engine;
+        use std::path::PathBuf;
+        let Some(file) = std::env::var_os("DRAMA_LLAMA_TOKENIZE_FILE") else {
+            panic!("set DRAMA_LLAMA_TOKENIZE_FILE to the input path");
+        };
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let engine = Engine::from_path(path).unwrap();
+        let tokens_nospec = engine.model.tokenize(&text, false);
+        let tokens_spec = engine.model.tokenize(&text, true);
+        println!("parse_special=false: {} tokens", tokens_nospec.len());
+        println!("parse_special=true:  {} tokens", tokens_spec.len());
+        let head_spec: Vec<_> = tokens_spec.iter().take(20).collect();
+        println!("(spec) first 20: {head_spec:?}");
+    }
+
+    /// One-off dump: render the strawberry turn-1 Prompt through our
+    /// ChatTemplate and write the bytes to
+    /// `DRAMA_LLAMA_DUMP_OUTPUT`. For diffing against the Python
+    /// jinja2 cross-check renderer.
+    #[test]
+    #[ignore = "fixture helper"]
+    fn dump_strawberry_turn_1_output() {
+        use crate::{Engine, Tool};
+        use serde_json::json;
+        use std::{borrow::Cow, path::PathBuf};
+        let Some(dest) = std::env::var_os("DRAMA_LLAMA_DUMP_OUTPUT") else {
+            panic!("set DRAMA_LLAMA_DUMP_OUTPUT to the output path");
+        };
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let engine = Engine::from_path(path).unwrap();
+        let tmpl = ChatTemplate::from_model(&engine.model).unwrap();
+
+        let tool = Tool {
+            name: Cow::Borrowed("count_letters"),
+            description: Cow::Borrowed(
+                "Count the number of times a letter appears in a string.",
+            ),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "letter": {"type": "string", "description": "the letter to count"},
+                    "string": {"type": "string", "description": "the string to search"}
+                },
+                "required": ["letter", "string"]
+            }),
+            cache_control: None,
+        };
+        let prompt = Prompt {
+            system: Some(Content::SinglePart(Cow::Borrowed(
+                "You are a helpful assistant. You cannot count letters in a \
+                 word reliably on your own because you see in tokens, not \
+                 letters. Use the `count_letters` tool when asked to count \
+                 characters.",
+            ))),
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::SinglePart(Cow::Borrowed(
+                    "Count the number of r's in 'strawberry'",
+                )),
+            }],
+            functions: Some(vec![tool]),
+            ..Default::default()
+        };
+        let opts = RenderOptions::default()
+            .with_generation_prompt(true)
+            .with_date("17 Apr 2026")
+            .with_extra("enable_thinking", JinjaValue::from(true));
+        let out = tmpl.render_with(&prompt, &opts).unwrap();
+        std::fs::write(&dest, &out)
+            .unwrap_or_else(|e| panic!("write {dest:?}: {e}"));
+        println!("wrote {} bytes to {:?}", out.len(), dest);
+    }
+
+    /// One-off dump helper: write the GGUF's embedded
+    /// `tokenizer.chat_template` out to the path in
+    /// `DRAMA_LLAMA_DUMP_TEMPLATE` so we can commit it as a pinned
+    /// fixture. Run with
+    /// `DRAMA_LLAMA_DUMP_TEMPLATE=tests/fixtures/cogito_14b_template.jinja \
+    /// cargo test dump_template_fixture -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "fixture helper"]
+    fn dump_template_fixture() {
+        use crate::Engine;
+        use std::path::PathBuf;
+        let Some(dest) = std::env::var_os("DRAMA_LLAMA_DUMP_TEMPLATE") else {
+            panic!("set DRAMA_LLAMA_DUMP_TEMPLATE to the output path");
+        };
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let engine = Engine::from_path(path).unwrap();
+        let source = engine
+            .model
+            .get_meta("tokenizer.chat_template")
+            .expect("model has no tokenizer.chat_template");
+        std::fs::write(&dest, &source)
+            .unwrap_or_else(|e| panic!("write {dest:?}: {e}"));
+        println!("wrote {} bytes to {:?}", source.len(), dest);
+    }
+
+    /// Pin the shape of the rendered `tools` variable: OpenAI wire
+    /// envelope (`type: "function"`, nested `function` object) with
+    /// `parameters` rather than Anthropic's `input_schema`.
+    ///
+    /// Regression lock for the tool-shape bug: cogito / Qwen / Hermes
+    /// templates do `{{ tool | tojson }}` and the model was trained on
+    /// ollama's runtime output. Emitting bare `{name, description,
+    /// input_schema}` caused three cogito sizes to consistently swap
+    /// tool-call arguments.
+    #[test]
+    fn tools_rendered_as_openai_wire_envelope() {
+        use serde_json::json;
+        use std::borrow::Cow;
+        let tool = crate::Tool {
+            name: Cow::Borrowed("count_letters"),
+            description: Cow::Borrowed("Count letters in a string."),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "letter": {"type": "string"},
+                    "string": {"type": "string"}
+                },
+                "required": ["letter", "string"]
+            }),
+            cache_control: None,
+        };
+        let src =
+            r#"{%- for t in tools %}{{ t | tojson }}{% endfor %}"#.to_owned();
+        let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
+        let prompt = Prompt {
+            functions: Some(vec![tool]),
+            ..Default::default()
+        };
+        let out = t.render(&prompt, false).unwrap();
+
+        // Must contain the wire envelope.
+        assert!(
+            out.contains("\"type\":\"function\""),
+            "expected wire envelope `type: function`. got:\n{out}"
+        );
+        assert!(
+            out.contains("\"function\":{"),
+            "expected nested `function` object. got:\n{out}"
+        );
+        // Field name must be `parameters`, NOT Anthropic's `input_schema`.
+        assert!(
+            out.contains("\"parameters\":"),
+            "expected `parameters` field. got:\n{out}"
+        );
+        assert!(
+            !out.contains("\"input_schema\""),
+            "Anthropic-shape `input_schema` must not leak. got:\n{out}"
+        );
+        // Tool name and schema content must survive.
+        assert!(out.contains("\"name\":\"count_letters\""));
+        assert!(out.contains("\"letter\""));
+        assert!(out.contains("\"string\""));
     }
 }

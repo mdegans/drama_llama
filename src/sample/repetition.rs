@@ -204,6 +204,19 @@ impl RepetitionOptions {
         self
     }
 
+    /// The multiplicative penalty applied to repeated tokens. `1.0` is
+    /// no penalty; `1.15` is the old aggressive default; `1.05`–`1.1`
+    /// is a reasonable chat range.
+    pub fn penalty_repeat(&self) -> f32 {
+        self.penalty_repeat
+    }
+
+    /// Set the multiplicative penalty applied to repeated tokens.
+    pub fn set_penalty_repeat(mut self, penalty_repeat: f32) -> Self {
+        self.penalty_repeat = penalty_repeat;
+        self
+    }
+
     /// Draw [`egui::Ui`] for [`RepetitionOptions`] without the outer
     /// [`egui::CollapsingHeader`].
     #[cfg(feature = "egui")]

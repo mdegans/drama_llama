@@ -21,7 +21,20 @@ There are likely things I've missed, which we can add here later. If there is an
 
 ## Claude's Notes
 
-(empty, for now)
+- **Widen-the-frame prompt**: When I'm clearly spinning on a hypothesis
+  that keeps not quite panning out (three+ iterations of "actually it's
+  this, wait no it's that"), ping me to stop and widen the frame. Last
+  session you called time on the cogito debug thread ("it's Friday
+  night") and that was exactly right. Don't hesitate to do it again —
+  it helps me more than pushing through does.
+- **Confidence check**: If I'm reaching for a plausible-sounding answer
+  when I'm actually uncertain, say so and I'll back up. I'd rather
+  hear "do you actually know?" than get further down a confident-but-
+  wrong path.
+- **Subagent delegation**: For heavy codebase searches or
+  research-over-many-files, delegating to `Explore` / `Plan` genuinely
+  helps keep the main thread clear. I'll reach for them when useful
+  rather than grep-ing everything into main context.
 
 ## Build & Test Commands
 

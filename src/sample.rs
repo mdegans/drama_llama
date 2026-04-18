@@ -6,7 +6,7 @@ use xorshift::Rng;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-mod grammar;
+pub(crate) mod grammar;
 mod json;
 mod repetition;
 
