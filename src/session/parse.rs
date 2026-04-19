@@ -1,3 +1,8 @@
+// FIXME: Right now Cogito model tags are hardcoded which is probably not what
+// we want. The tags can likely be extracted from the gguf metadata although
+// possibly also not because we'd have to programmatically know what tags are
+// thinking, which are tools, etc. We may end up just having to add a lot more
+// consts below.
 //! Streaming parser: raw model bytes → [`Block`]s.
 //!
 //! The parser is a small state machine over three fixed literal tags:
@@ -52,10 +57,27 @@ const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
+const ALL_TAGS: &[&str] = &[THINK_OPEN, THINK_CLOSE, TOOL_OPEN, TOOL_CLOSE];
+const OPEN_TAGS: &[&str] = &[THINK_OPEN, TOOL_OPEN];
+const CLOSE_TAGS: &[&str] = &[THINK_CLOSE, TOOL_CLOSE];
+
+const fn max_strlen(arr: &[&str]) -> usize {
+    let mut max = 0;
+    let mut i = 0;
+    while i < arr.len() {
+        if arr[i].len() > max {
+            max = arr[i].len()
+        }
+        i += 1
+    }
+    max
+}
 
 /// Longest open tag — we only need to hold back this much at the tail
 /// of the buffer when looking for a partial tag match.
-const MAX_OPEN_TAG_LEN: usize = 11; // "<tool_call>"
+// FIXME: These are unused but they probably should be. Worth investigating.
+const MAX_OPEN_TAG_LEN: usize = max_strlen(OPEN_TAGS);
+const MAX_CLOSE_TAG_LEN: usize = max_strlen(CLOSE_TAGS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -118,7 +140,7 @@ impl BlockParser {
                 }
             };
             if !remainder.is_empty() {
-                out.push(text_block(remainder));
+                out.push(remainder.into());
             }
         }
         out
@@ -169,7 +191,7 @@ impl BlockParser {
         };
         if let Some((pos, tag)) = next {
             if pos > 0 {
-                out.push(text_block(self.buffer[..pos].to_owned()));
+                out.push(self.buffer[..pos].to_owned().into());
             }
             let open_len = match tag {
                 Tag::Think => THINK_OPEN.len(),
@@ -188,7 +210,7 @@ impl BlockParser {
         let emit_end = self.buffer.len() - hold;
         if emit_end > 0 {
             let emitted: String = self.buffer.drain(..emit_end).collect();
-            out.push(text_block(emitted));
+            out.push(emitted.into());
         }
         false
     }
@@ -223,7 +245,7 @@ impl BlockParser {
                 // back to Text with the full tagged literal so nothing
                 // is silently dropped. Session-level logic decides
                 // whether to treat this as GrammarViolation.
-                out.push(text_block(format!("{TOOL_OPEN}{body}{TOOL_CLOSE}")));
+                out.push(format!("{TOOL_OPEN}{body}{TOOL_CLOSE}").into());
             }
         }
         self.state = State::Prose;
@@ -249,13 +271,6 @@ pub fn parse_completion(output: &str) -> Vec<Block<'static>> {
     let mut out = p.push(output);
     out.extend(p.finish());
     out
-}
-
-fn text_block(text: String) -> Block<'static> {
-    Block::Text {
-        text: CowStr::from(text),
-        cache_control: None,
-    }
 }
 
 /// Longest prefix of any open tag present at the end of `buf`. Used
