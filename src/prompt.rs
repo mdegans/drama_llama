@@ -47,3 +47,4 @@ pub type Tool = misanthropic::tool::Method<'static>;
 pub type ToolResult = misanthropic::tool::Result<'static>;
 pub type ToolUse = misanthropic::tool::Use<'static>;
 pub type Prompt = misanthropic::Prompt<'static>;
+pub type CachedPrompt = misanthropic::prompt::cached::CachedPrompt<'static>;

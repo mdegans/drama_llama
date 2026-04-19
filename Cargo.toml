@@ -40,6 +40,7 @@ eframe = { version = "0.34", optional = true }
 egui_file = { version = "0.26", optional = true }
 egui_extras = { version = "0.34", optional = true, features = ["all_loaders"] }
 image = { version = "0.25", optional = true, features = ["png"] }
+rustyline = { version = "14", optional = true }
 
 
 [features]
@@ -57,10 +58,15 @@ egui = [
     "dep:egui_extras",
     "dep:image",
 ]
+repl = ["dep:rustyline", "cli"]
 
 [[example]]
 name = "strawberry"
 required-features = ["cli"]
+
+[[example]]
+name = "chat_repl"
+required-features = ["repl"]
 
 [[bin]]
 name = "regurgitater"

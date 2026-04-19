@@ -24,8 +24,8 @@ pub use candidates::{Candidates, Sorted, TokenDataArray};
 
 pub mod prompt;
 pub use prompt::{
-    AssistantMessage, Block, Content, Message, Prompt, Role, Tool, ToolChoice,
-    UserMessage,
+    AssistantMessage, Block, CachedPrompt, Content, Message, Prompt, Role,
+    Tool, ToolChoice, UserMessage,
 };
 
 mod chat_template;
