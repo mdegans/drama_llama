@@ -18,6 +18,5 @@ $ cargo run --features="webchat cli stats" --bin regurgitater -- --model models/
 
 ## Known Issues
 
-- When using LLaMA 3, `--vocab unsafe` should be passed as a command line option
-  however, keep in mind that there is out output sanitization or vocabulary
-  restrictions.
+- There is no output sanitization or vocabulary restriction — any content
+  filtering is the caller's responsibility.

@@ -48,9 +48,6 @@ For examples, see the `bin` folder. There are two example binaries.
 
 ## Known issues
 
-- With LLaMA 3, safe vocabulary is not working yet so `--vocab unsafe` must be
-  passed as a command line argument or `VocabKind::Unsafe` used for an `Engine`
-  constructor.
 - The model doesn't load until genration starts, so there can be a long pause
   on first generation. However because `mmap` is used, on subsequent process
   launches, the model should already be cached by the OS.

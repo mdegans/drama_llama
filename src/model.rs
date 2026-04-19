@@ -21,11 +21,6 @@ use std::{
     path::PathBuf,
 };
 
-mod vocab;
-
-pub use vocab::Vocab;
-pub use vocab::VocabKind;
-
 /// Convert a token to it's string representation.
 ///
 /// Adapted from `llama.cpp/common/common.cpp`
@@ -120,6 +115,10 @@ pub struct Model {
     /// The vocabulary associated with this model. This pointer is valid for the
     /// lifetime of the model and does not need to be freed separately.
     pub(crate) vocab: *const llama_vocab,
+    /// Cached longest-token length. The predictor calls this per generated
+    /// token (stop-string windowing), and the naive compute is O(vocab), so
+    /// we memoize the first call.
+    max_token_len: std::sync::OnceLock<usize>,
 }
 
 #[derive(Debug, From)]
@@ -163,6 +162,7 @@ impl Model {
             Some(Self {
                 inner: model,
                 vocab,
+                max_token_len: std::sync::OnceLock::new(),
             })
         }
     }
@@ -178,7 +178,11 @@ impl Model {
             None
         } else {
             let vocab = llama_model_get_vocab(ptr);
-            Some(Self { inner: ptr, vocab })
+            Some(Self {
+                inner: ptr,
+                vocab,
+                max_token_len: std::sync::OnceLock::new(),
+            })
         }
     }
 
@@ -243,16 +247,18 @@ impl Model {
         unsafe { llama_vocab_fim_suf(self.vocab) }
     }
 
-    /// Calculate the longest token length. Useful for optimizing searches.
-    ///
-    /// Time complexity is O(k) where k is the vocab size.
+    /// Longest token length in this model's vocabulary. Memoized — first
+    /// call is O(k) where k is the vocab size; subsequent calls are O(1).
+    /// The predictor hits this per generated token for stop-string
+    /// windowing, so the cache matters.
     pub fn max_token_len(&self) -> usize {
-        let mut max_len = 0;
-        for i in 0..self.n_vocab() {
-            max_len = max_len.max(self.token_to_text(i).len());
-        }
-
-        max_len
+        *self.max_token_len.get_or_init(|| {
+            let mut max_len = 0;
+            for i in 0..self.n_vocab() {
+                max_len = max_len.max(self.token_to_text(i).len());
+            }
+            max_len
+        })
     }
 
     /// Return whether BOS token should be added.

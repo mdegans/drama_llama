@@ -480,7 +480,7 @@ impl<'engine> Iterator for TokenPredictor<'engine> {
         // check the entire text because context lengths are getting long and
         // users might use many stop strings.
         let end = self.inner.tokens.len().saturating_sub(
-            self.max_stop_len + self.inner.engine.vocab.max_token_len(),
+            self.max_stop_len + self.inner.engine.model.max_token_len(),
         );
         for s in self.options.stop_strings.iter() {
             if let Some(slice) = self.text.get(end..) {
@@ -500,7 +500,6 @@ impl<'engine> Iterator for TokenPredictor<'engine> {
         let next_token = candidates
             .sample_token(
                 &self.inner.tokens,
-                &self.inner.engine.vocab,
                 &mut self.options.sample_options,
                 &mut self.ngram_stats,
                 &mut self.rng,
@@ -597,7 +596,7 @@ impl<'engine> Iterator for PiecePredictor<'engine> {
                 // text.
                 let mut end = self.inner.inner.tokens.len().saturating_sub(
                     self.inner.max_stop_len
-                        + self.inner.inner.engine.vocab.max_token_len(),
+                        + self.inner.inner.engine.model.max_token_len(),
                 );
 
                 for s in self.inner.options.stop_strings.iter() {

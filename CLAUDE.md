@@ -92,15 +92,13 @@ cargo doc --open --features "webchat,cli,stats,toml,serde,egui"
 
 ### Content Filtering
 
-**`Vocab`** (`model/vocab.rs`) — Token allowlist + banned n-gram enforcement. `VocabKind` controls what tokens are permitted (Safe/Unsafe/Letters/Code). This is a content-safety mechanism, not the llama.cpp vocabulary type. Banned bigrams are hardcoded in `data/banned.rs`.
-
-**`NGram`** (`ngram.rs`) — Fixed-capacity token n-gram backed by `TinyVec`. Used for repetition penalties and content filtering. `NGramStats` tracks frequencies.
+**`NGram`** (`ngram.rs`) — Fixed-capacity token n-gram backed by `TinyVec`. Used for repetition penalties. `NGramStats` tracks frequencies.
 
 ### Style
 
 - "Code is poetry. Make it pretty." Use `rustfmt`.
 - The Eric Hartford uncensored model check in `Model::from_file` is intentional — keep it.
-- The vocab filtering system is intentionally opinionated — preserve it even though it's model-dependent.
+- Vocab / VocabKind were removed in 0.7. Content filtering belongs in the consuming app, not in the library. If tempted to add token-ban logic back, don't.
 
 ## Key Design Decisions
 

@@ -168,28 +168,8 @@ impl Session {
 
     /// Wrap an already-constructed [`Engine`]. Useful when the engine
     /// was built via [`Engine::new`] with custom context parameters.
-    ///
-    /// # Vocab default
-    ///
-    /// [`Session`] overrides the wrapped engine's vocab to
-    /// [`VocabKind::Unsafe`]. Structured-output use cases (chat +
-    /// tool calling) are already content-gated by the prompt and
-    /// the grammar compiled from [`ToolChoice`], so layering
-    /// [`Engine`]'s default [`VocabKind::Safe`] allow-list on top
-    /// is pure downside: it flattens the logit of every
-    /// single-letter token except `"a"` to `min_logit` inside
-    /// `sample_token`, which silently makes tool args like
-    /// `{"letter": "r"}` unsamplable. If a caller wants Safe back
-    /// (e.g. a freeform `complete_text` with no grammar), they can
-    /// call `Session::engine_mut().set_vocab(VocabKind::Safe)`
-    /// after construction.
-    ///
-    /// [`ToolChoice`]: crate::ToolChoice
-    /// [`VocabKind::Unsafe`]: crate::VocabKind::Unsafe
-    /// [`VocabKind::Safe`]: crate::VocabKind::Safe
-    pub fn from_engine(mut engine: Engine) -> Result<Self, SessionError> {
+    pub fn from_engine(engine: Engine) -> Result<Self, SessionError> {
         let template = ChatTemplate::from_model(&engine.model)?;
-        engine.set_vocab(crate::VocabKind::Unsafe);
         Ok(Self {
             engine,
             template,

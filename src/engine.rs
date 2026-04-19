@@ -1,5 +1,4 @@
 use crate::{
-    model::{Vocab, VocabKind},
     predictor::{CandidatePredictor, PiecePredictor, TokenPredictor},
     Batch, Model, PredictOptions, Predictor,
 };
@@ -132,8 +131,6 @@ pub struct Engine {
     pub(crate) context: *mut llama_context,
     /// The llama.cpp model.
     pub model: Model,
-    /// Vocabulary
-    pub(crate) vocab: Vocab,
 }
 
 impl Engine {
@@ -145,13 +142,7 @@ impl Engine {
     ) -> Result<Self, NewError> {
         let model_params = Some(args.model_params());
         let context_params = Some(args.context_params());
-        Self::new(
-            args.model,
-            model_params,
-            context_params,
-            numa_strategy,
-            Some(args.vocab),
-        )
+        Self::new(args.model, model_params, context_params, numa_strategy)
     }
 
     /// Create a new `Engine` from a model `path`, `model_params`,
@@ -162,7 +153,6 @@ impl Engine {
         model_params: Option<llama_model_params>,
         context_params: Option<llama_context_params>,
         numa_strategy: Option<u32>,
-        vocab: Option<VocabKind>,
     ) -> Result<Self, NewError> {
         {
             let mut count = ENGINE_COUNT.lock().unwrap();
@@ -198,25 +188,13 @@ impl Engine {
             return Err(NewError::Context);
         }
 
-        // for the moment we're only enabling safe vocab
-        let vocab = Vocab::new([vocab.unwrap_or(VocabKind::Safe)], &model);
-
-        Ok(Self {
-            context,
-            model,
-            vocab,
-        })
-    }
-
-    /// Set Vocab
-    pub fn set_vocab(&mut self, vocab: VocabKind) {
-        self.vocab = Vocab::new([vocab], &self.model);
+        Ok(Self { context, model })
     }
 
     /// Create a new engine from a model `path`. Default model and context
     /// parameters are used.
     pub fn from_path(path: PathBuf) -> Result<Self, NewError> {
-        Self::new(path, None, None, None, None)
+        Self::new(path, None, None, None)
     }
 
     /// Create a new engine from a model `path` forcing CPU-only
@@ -233,7 +211,7 @@ impl Engine {
     pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, NewError> {
         let mut mp = unsafe { llama_model_default_params() };
         mp.n_gpu_layers = 0;
-        Self::new(path, Some(mp), None, None, None)
+        Self::new(path, Some(mp), None, None)
     }
 
     /// Create a new engine from a model `path` with an explicit Flash
@@ -255,7 +233,7 @@ impl Engine {
     ) -> Result<Self, NewError> {
         let mut cp = unsafe { llama_context_default_params() };
         cp.flash_attn_type = fa.as_raw();
-        Self::new(path, None, Some(cp), None, None)
+        Self::new(path, None, Some(cp), None)
     }
 
     /// Returns true if mmap is supported.
@@ -625,7 +603,7 @@ mod tests {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("models/model.gguf");
         for i in 0..1000 {
-            let engine = Engine::new(path.clone(), None, None, None, None);
+            let engine = Engine::new(path.clone(), None, None, None);
             if engine.is_err() {
                 println!(
                     "Failed to create engine after {} iterations because: {}",

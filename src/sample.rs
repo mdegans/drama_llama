@@ -1,4 +1,4 @@
-use crate::{model::Vocab, ngram::NGramStats, Candidates, Probability};
+use crate::{ngram::NGramStats, Candidates, Probability};
 
 use llama_cpp_sys_3::llama_token;
 use xorshift::Rng;
@@ -1030,50 +1030,12 @@ static_assertions::assert_impl_all!(SampleError: Send, Sync);
 pub(crate) fn sample_token(
     tokens: &[llama_token],
     mut candidates: Candidates,
-    vocab: &Vocab,
     opts: &mut SampleOptions,
     freq_map: &mut NGramStats,
     rng: &mut xorshift::Xoroshiro128,
     mu: &mut Option<f32>,
     model: &crate::Model,
 ) -> Result<llama_token, SampleError> {
-    // Ban tokens and ngrams from the candidates.
-    let min_logit = if candidates
-        .is_sorted()
-        .by_logit()
-        .is_some_and(|until| until == candidates.len())
-    {
-        candidates.data.last().unwrap().logit
-    } else {
-        candidates
-            .data
-            .iter()
-            .min_by(|a, b| a.logit.partial_cmp(&b.logit).unwrap())
-            .unwrap()
-            .logit
-    };
-    for (token, allowed) in candidates.iter_mut().zip(vocab.allowed_tokens()) {
-        if !allowed {
-            // The individual token is banned
-            token.logit = min_logit;
-        } else {
-            if let Some(banned) = vocab.banned() {
-                // There are some banned ngrams
-                if let Some(&last_token) = tokens.last() {
-                    // and there is a previous token
-                    let ngram = [last_token, token.id];
-                    if banned.as_slice().binary_search(&ngram).is_ok() {
-                        // And the ngram is banned, ban the token
-                        // TODO: we could also remove the previous tokens from
-                        // the tokens but that doesn't suit our current design.
-                        // FIXME: it does now but there is still work to do.
-                        token.logit = min_logit;
-                    }
-                }
-            }
-        }
-    }
-
     // Apply any repetition penalties to the candidates. This also applies the
     // softmax and sorts the candidates by logit where the most likely token is
     // first.

@@ -31,7 +31,7 @@ use rocket::{
 
 use stringmetrics::jaccard;
 
-use drama_llama::{cli::Args, Engine, PredictOptions, Predicted, VocabKind};
+use drama_llama::{cli::Args, Engine, PredictOptions, Predicted};
 
 #[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, rocket::UriDisplayQuery))]
@@ -199,10 +199,6 @@ async fn main() {
                 return;
             }
         };
-
-        // This is a temporary measure because forbidding some tokens can break
-        // regurgitation in some cases. This is a known issue and will be fixed.
-        engine.set_vocab(VocabKind::Unsafe);
 
         let mut opts = PredictOptions::default();
         opts.sample_options = SampleOptions::greedy();

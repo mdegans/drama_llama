@@ -10,7 +10,6 @@ use partial_sort::PartialSort;
 use llama_cpp_sys_3::{llama_token, llama_token_data, llama_token_data_array};
 
 use crate::{
-    model::Vocab,
     ngram::NGramStats,
     sample::{choose_candidate, SampleError},
     Model, Probability, RepetitionOptions, SampleOptions,
@@ -1212,7 +1211,6 @@ impl Candidates {
     pub fn sample_token(
         self,
         tokens: &[llama_token],
-        vocab: &Vocab,
         opts: &mut SampleOptions,
         freq_map: &mut NGramStats,
         rng: &mut xorshift::Xoroshiro128,
@@ -1220,7 +1218,7 @@ impl Candidates {
         model: &Model,
     ) -> Result<llama_token, SampleError> {
         crate::sample::sample_token(
-            tokens, self, vocab, opts, freq_map, rng, mu, model,
+            tokens, self, opts, freq_map, rng, mu, model,
         )
     }
 

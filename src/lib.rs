@@ -42,7 +42,7 @@ pub use tool_choice::{
 };
 
 mod model;
-pub use model::{llama_quantize, Model, Vocab, VocabKind};
+pub use model::{llama_quantize, Model};
 
 mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};

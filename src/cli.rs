@@ -7,8 +7,6 @@ use llama_cpp_sys_3::{
     llama_model_default_params, llama_model_params,
 };
 
-use crate::VocabKind;
-
 #[derive(Debug, Parser)]
 pub struct Args {
     /// Path to the model
@@ -20,9 +18,6 @@ pub struct Args {
     /// Disable on-by-default GPU acceleration
     #[arg(short, long, default_value_t = false)]
     pub no_gpu: bool,
-    /// Vocabulary
-    #[arg(short, long, default_value_t = VocabKind::Safe)]
-    pub vocab: VocabKind,
 }
 
 impl Args {
