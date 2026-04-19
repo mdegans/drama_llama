@@ -112,7 +112,7 @@ impl BlockParser {
 
     /// Feed a chunk of bytes. Returns every [`Block`] that could be
     /// fully resolved from the accumulated buffer.
-    pub fn push(&mut self, bytes: &str) -> Vec<Block<'static>> {
+    pub fn push(&mut self, bytes: &str) -> Vec<Block> {
         self.buffer.push_str(bytes);
         self.drain()
     }
@@ -124,7 +124,7 @@ impl BlockParser {
     ///   [`Block::Text`] wrapping the opening tag + body so the raw
     ///   completion text is preserved and the caller can decide
     ///   how to handle the truncation.
-    pub fn finish(mut self) -> Vec<Block<'static>> {
+    pub fn finish(mut self) -> Vec<Block> {
         let mut out = self.drain();
 
         if !self.buffer.is_empty() {
@@ -152,7 +152,7 @@ impl BlockParser {
         self.state == State::Prose && self.buffer.is_empty()
     }
 
-    fn drain(&mut self) -> Vec<Block<'static>> {
+    fn drain(&mut self) -> Vec<Block> {
         let mut out = Vec::new();
         loop {
             match self.state {
@@ -179,7 +179,7 @@ impl BlockParser {
     /// In `Prose`, advance to the next opening tag. Return `true` if
     /// the loop should keep draining (state changed), `false` if
     /// nothing more can be done with the current buffer.
-    fn advance_prose(&mut self, out: &mut Vec<Block<'static>>) -> bool {
+    fn advance_prose(&mut self, out: &mut Vec<Block>) -> bool {
         let think = self.buffer.find(THINK_OPEN);
         let tool = self.buffer.find(TOOL_OPEN);
         let next = match (think, tool) {
@@ -215,7 +215,7 @@ impl BlockParser {
         false
     }
 
-    fn advance_in_think(&mut self, out: &mut Vec<Block<'static>>) -> bool {
+    fn advance_in_think(&mut self, out: &mut Vec<Block>) -> bool {
         let Some(close_at) = self.buffer.find(THINK_CLOSE) else {
             return false;
         };
@@ -229,7 +229,7 @@ impl BlockParser {
         true
     }
 
-    fn advance_in_tool_call(&mut self, out: &mut Vec<Block<'static>>) -> bool {
+    fn advance_in_tool_call(&mut self, out: &mut Vec<Block>) -> bool {
         let Some(close_at) = self.buffer.find(TOOL_CLOSE) else {
             return false;
         };
@@ -266,7 +266,7 @@ enum Tag {
 }
 
 /// Non-streaming shortcut. Feeds the whole `output` and drains.
-pub fn parse_completion(output: &str) -> Vec<Block<'static>> {
+pub fn parse_completion(output: &str) -> Vec<Block> {
     let mut p = BlockParser::new();
     let mut out = p.push(output);
     out.extend(p.finish());
@@ -306,7 +306,7 @@ struct ToolCallWire {
 fn parse_tool_call_body(
     body: &str,
     synth_id: usize,
-) -> Result<ToolUse<'static>, serde_json::Error> {
+) -> Result<ToolUse, serde_json::Error> {
     let wire: ToolCallWire = serde_json::from_str(body)?;
     Ok(ToolUse {
         id: Cow::Owned(format!("call_{synth_id}_{}", wire.name)),
@@ -323,21 +323,21 @@ fn parse_tool_call_body(
 mod tests {
     use super::*;
 
-    fn text_content<'a>(block: &'a Block<'a>) -> &'a str {
+    fn text_content(block: &Block) -> &str {
         match block {
             Block::Text { text, .. } => text,
             _ => panic!("expected Text, got {block:?}"),
         }
     }
 
-    fn thought_content<'a>(block: &'a Block<'a>) -> &'a str {
+    fn thought_content(block: &Block) -> &str {
         match block {
             Block::Thought { thought, .. } => thought,
             _ => panic!("expected Thought, got {block:?}"),
         }
     }
 
-    fn tool_use<'a>(block: &'a Block<'a>) -> &'a ToolUse<'a> {
+    fn tool_use(block: &Block) -> &ToolUse {
         match block {
             Block::ToolUse { call } => call,
             _ => panic!("expected ToolUse, got {block:?}"),

@@ -66,7 +66,7 @@ use crate::{prompt::Tool, Block, Content, Model, Prompt, Role};
 /// and field names are what matter.
 ///
 /// [`tool::Method`]: misanthropic::tool::Method
-fn tool_wire_value(tool: &Tool<'_>) -> serde_json::Value {
+fn tool_wire_value(tool: &Tool) -> serde_json::Value {
     serde_json::json!({
         "type": "function",
         "function": {
@@ -161,7 +161,7 @@ impl ChatTemplate {
     /// [`ChatTemplate::render_with`] with defaults.
     pub fn render(
         &self,
-        prompt: &Prompt<'_>,
+        prompt: &Prompt,
         add_generation_prompt: bool,
     ) -> Result<String, ChatTemplateError> {
         self.render_with(
@@ -180,7 +180,7 @@ impl ChatTemplate {
     /// `date_string`, `tools_in_user_message`, or `builtin_tools`.
     pub fn render_with(
         &self,
-        prompt: &Prompt<'_>,
+        prompt: &Prompt,
         opts: &RenderOptions<'_>,
     ) -> Result<String, ChatTemplateError> {
         let messages = build_messages(prompt);
@@ -305,7 +305,7 @@ impl<'a> RenderOptions<'a> {
 ///   each tool result emits a separate `{role: "tool", content: ...}`
 ///   message. Any remaining text in the same user turn follows as a
 ///   normal user message.
-fn build_messages(prompt: &Prompt<'_>) -> Vec<JinjaValue> {
+fn build_messages(prompt: &Prompt) -> Vec<JinjaValue> {
     let mut out: Vec<JinjaValue> =
         Vec::with_capacity(prompt.messages.len() + 1);
     if let Some(system) = prompt.system.as_ref() {
@@ -322,12 +322,8 @@ fn build_messages(prompt: &Prompt<'_>) -> Vec<JinjaValue> {
 }
 
 /// Emit one or more Jinja messages for a single misanthropic Message.
-fn append_message(
-    out: &mut Vec<JinjaValue>,
-    role: &str,
-    content: &Content<'_>,
-) {
-    let blocks: Vec<&Block<'_>> = match content {
+fn append_message(out: &mut Vec<JinjaValue>, role: &str, content: &Content) {
+    let blocks: Vec<&Block> = match content {
         Content::SinglePart(text) => {
             out.push(text_message(role, text.to_string()));
             return;
@@ -398,7 +394,7 @@ fn text_message(role: &str, content: String) -> JinjaValue {
 fn tool_call_message(
     role: &str,
     content: &str,
-    call: &crate::prompt::ToolUse<'_>,
+    call: &crate::prompt::ToolUse,
 ) -> JinjaValue {
     let tool_call = minijinja::context! {
         id => call.id.as_ref(),
@@ -427,7 +423,7 @@ fn tool_result_message(tool_use_id: &str, content: String) -> JinjaValue {
 
 /// Flatten any [`Content`] to a single string using [`append_block_text`]
 /// for each part.
-fn flatten_text(content: &Content<'_>) -> String {
+fn flatten_text(content: &Content) -> String {
     match content {
         Content::SinglePart(text) => text.to_string(),
         Content::MultiPart(blocks) => {
@@ -443,7 +439,7 @@ fn flatten_text(content: &Content<'_>) -> String {
 /// Append a single block's user-visible text to `out`. Tool-use and
 /// tool-result blocks are handled at the message level (see
 /// [`append_message`]); here they contribute nothing.
-fn append_block_text(out: &mut String, block: &Block<'_>) {
+fn append_block_text(out: &mut String, block: &Block) {
     match block {
         Block::Text { text, .. } => out.push_str(text),
         Block::Thought { thought, .. } => {
@@ -600,7 +596,7 @@ mod tests {
 
 {% endif %}"#;
 
-    fn simple_prompt() -> Prompt<'static> {
+    fn simple_prompt() -> Prompt {
         Prompt::default()
             .set_system("You are helpful.")
             .add_message((Role::User, "Hi!"))

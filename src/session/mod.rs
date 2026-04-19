@@ -324,7 +324,7 @@ impl Session {
     /// [`Message`]: crate::prompt::AssistantMessage
     pub fn complete_text(
         &mut self,
-        prompt: &Prompt<'_>,
+        prompt: &Prompt,
     ) -> Result<String, SessionError> {
         let rendered = self.template.render_with(prompt, &self.render_opts)?;
 
@@ -379,7 +379,7 @@ impl Session {
     /// see whatever partial output the model produced.
     pub fn complete_stream<'s>(
         &'s mut self,
-        prompt: &Prompt<'_>,
+        prompt: &Prompt,
     ) -> Result<BlockStream<'s>, SessionError> {
         let rendered = self.template.render_with(prompt, &self.render_opts)?;
         let grammar = grammar_for_prompt(prompt, &self.tool_choice_opts)?;
@@ -424,8 +424,8 @@ impl Session {
     /// [`ToolChoice`]: crate::ToolChoice
     pub fn complete_blocks(
         &mut self,
-        prompt: &Prompt<'_>,
-    ) -> Result<Vec<crate::Block<'static>>, SessionError> {
+        prompt: &Prompt,
+    ) -> Result<Vec<crate::Block>, SessionError> {
         use crate::ToolChoice;
         let forced_tool_call = matches!(
             prompt.tool_choice,
@@ -473,7 +473,7 @@ impl Session {
     /// [`ToolChoice`]: crate::ToolChoice
     pub fn top_k_trace(
         &mut self,
-        prompt: &Prompt<'_>,
+        prompt: &Prompt,
         k: usize,
     ) -> Result<Vec<TokenTrace>, SessionError> {
         use crate::sample::grammar as grammar_mod;
@@ -558,8 +558,8 @@ impl Session {
     /// [`Content::MultiPart`]: crate::Content::MultiPart
     pub fn complete(
         &mut self,
-        prompt: &Prompt<'_>,
-    ) -> Result<crate::AssistantMessage<'static>, SessionError> {
+        prompt: &Prompt,
+    ) -> Result<crate::AssistantMessage, SessionError> {
         let blocks = self.complete_blocks(prompt)?;
         Ok(blocks.into_iter().collect())
     }
@@ -575,7 +575,7 @@ impl Session {
 pub struct BlockStream<'engine> {
     predictor: crate::PiecePredictor<'engine>,
     parser: BlockParser,
-    pending: std::collections::VecDeque<crate::Block<'static>>,
+    pending: std::collections::VecDeque<crate::Block>,
     /// EOS piece text — we filter it out of the stream since it's a
     /// sentinel, not content the caller wants to see.
     eos_piece: String,
@@ -583,7 +583,7 @@ pub struct BlockStream<'engine> {
 }
 
 impl<'engine> Iterator for BlockStream<'engine> {
-    type Item = crate::Block<'static>;
+    type Item = crate::Block;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {

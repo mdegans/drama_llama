@@ -179,7 +179,7 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
     );
 }
 
-fn strawberry_turn_1_prompt() -> Prompt<'static> {
+fn strawberry_turn_1_prompt() -> Prompt {
     let tool = Tool {
         name: Cow::Borrowed("count_letters"),
         description: Cow::Borrowed(
@@ -246,10 +246,10 @@ fn complete_returns_message_with_tool_use() {
     let assistant = session.complete(&prompt).expect("complete");
     println!("=== complete message ===\n{assistant:#?}\n===");
 
-    let msg: Message<'static> = assistant.into();
+    let msg: Message = assistant.into();
     assert_eq!(msg.role, Role::Assistant);
     // Must contain a ToolUse block.
-    let blocks: Vec<&Block<'_>> = match &msg.content {
+    let blocks: Vec<&Block> = match &msg.content {
         Content::MultiPart(b) => b.iter().collect(),
         Content::SinglePart(_) => {
             panic!("expected MultiPart with ToolUse, got SinglePart")
@@ -329,7 +329,7 @@ fn complete_text_round_trips_through_parse_and_render() {
     // Parse the same bytes into blocks → AssistantMessage.
     let blocks = parse_completion(&raw);
     assert!(!blocks.is_empty(), "parser dropped the output: {raw:?}");
-    let assistant: AssistantMessage<'static> = blocks.into_iter().collect();
+    let assistant: AssistantMessage = blocks.into_iter().collect();
 
     // Build a follow-up prompt with the assistant turn appended, and
     // render both versions via the same template that drove

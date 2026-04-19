@@ -204,7 +204,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_max_tokens(NonZeroUsize::new(256).unwrap());
 
-    let mut prompt: Prompt<'static> = Prompt::default()
+    let mut prompt: Prompt = Prompt::default()
         .set_system(
             "You are a helpful assistant. You cannot count letters in a word \
              reliably on your own because you see in tokens, not letters. \
@@ -330,9 +330,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Find the first `ToolUse` block inside an assistant message,
 /// regardless of whether the content is SinglePart or MultiPart.
-fn first_tool_use<'a>(
-    assistant: &'a drama_llama::AssistantMessage<'a>,
-) -> Option<&'a ToolUse<'a>> {
+fn first_tool_use(
+    assistant: &drama_llama::AssistantMessage,
+) -> Option<&ToolUse> {
     match assistant.content() {
         Content::SinglePart(_) => None,
         Content::MultiPart(blocks) => blocks.iter().find_map(|b| match b {

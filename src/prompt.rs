@@ -29,10 +29,21 @@
 //! [`PredictOptions`]: crate::PredictOptions
 //! [`SampleOptions`]: crate::SampleOptions
 
-pub use misanthropic::prompt::message::{
-    AssistantMessage, Block, Content, Message, Role, UserMessage,
-};
-pub use misanthropic::tool::{
-    Choice as ToolChoice, Method as Tool, Result as ToolResult, Use as ToolUse,
-};
-pub use misanthropic::Prompt;
+// Types with a lifetime parameter are aliased to `'static` so the rest of
+// the crate doesn't have to thread `<'_>` through every signature. The
+// underlying misanthropic types still carry `Cow<'a, _>` fields — we just
+// commit to owned data at the drama_llama boundary. If you genuinely need
+// a borrowed variant, reach for the fully-qualified misanthropic path.
+pub use misanthropic::prompt::message::Role;
+pub use misanthropic::tool::Choice as ToolChoice;
+
+pub type AssistantMessage =
+    misanthropic::prompt::message::AssistantMessage<'static>;
+pub type Block = misanthropic::prompt::message::Block<'static>;
+pub type Content = misanthropic::prompt::message::Content<'static>;
+pub type Message = misanthropic::prompt::message::Message<'static>;
+pub type UserMessage = misanthropic::prompt::message::UserMessage<'static>;
+pub type Tool = misanthropic::tool::Method<'static>;
+pub type ToolResult = misanthropic::tool::Result<'static>;
+pub type ToolUse = misanthropic::tool::Use<'static>;
+pub type Prompt = misanthropic::Prompt<'static>;

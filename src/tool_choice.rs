@@ -105,12 +105,12 @@ impl Default for ToolChoiceOptions {
 /// GBNF fails to compile.
 pub fn grammar_for_tool_choice(
     choice: &ToolChoice,
-    tools: &[Tool<'_>],
+    tools: &[Tool],
     opts: &ToolChoiceOptions,
 ) -> Result<Option<SamplingMode>, ToolChoiceError> {
     // Resolve which tools the grammar is allowed to pick from, and
     // optionally the single tool whose schema we enforce.
-    let (names, schema_tool): (Vec<&str>, Option<&Tool<'_>>) = match choice {
+    let (names, schema_tool): (Vec<&str>, Option<&Tool>) = match choice {
         ToolChoice::Auto => return Ok(None),
         ToolChoice::Any => {
             if tools.is_empty() {
@@ -146,13 +146,13 @@ pub fn grammar_for_tool_choice(
 ///
 /// [`ChatTemplate::render`]: crate::ChatTemplate::render
 pub fn grammar_for_prompt(
-    prompt: &Prompt<'_>,
+    prompt: &Prompt,
     opts: &ToolChoiceOptions,
 ) -> Result<Option<SamplingMode>, ToolChoiceError> {
     let Some(choice) = prompt.tool_choice.as_ref() else {
         return Ok(None);
     };
-    let tools: &[Tool<'_>] = prompt.functions.as_deref().unwrap_or(&[]);
+    let tools: &[Tool] = prompt.functions.as_deref().unwrap_or(&[]);
     grammar_for_tool_choice(choice, tools, opts)
 }
 
@@ -162,7 +162,7 @@ pub fn grammar_for_prompt(
 #[doc(hidden)]
 pub fn build_grammar_source_for_debug(
     names: &[&str],
-    schema_tool: Option<&Tool<'_>>,
+    schema_tool: Option<&Tool>,
     opts: &ToolChoiceOptions,
 ) -> String {
     build_grammar_source(names, schema_tool, opts)
@@ -178,7 +178,7 @@ pub fn build_grammar_source_for_debug(
 /// be inspected directly without constructing a full [`SamplingMode`].
 pub(crate) fn build_grammar_source(
     names: &[&str],
-    schema_tool: Option<&Tool<'_>>,
+    schema_tool: Option<&Tool>,
     opts: &ToolChoiceOptions,
 ) -> String {
     let mut src = String::with_capacity(1024);
@@ -479,7 +479,7 @@ mod tests {
     use serde_json::json;
     use std::{borrow::Cow, sync::Arc};
 
-    fn tool(name: &'static str) -> Tool<'static> {
+    fn tool(name: &'static str) -> Tool {
         Tool {
             name: Cow::Borrowed(name),
             description: Cow::Borrowed(""),
@@ -870,10 +870,7 @@ mod tests {
     // strict_schema per-primitive-type coverage
     // ======================================================================
 
-    fn single_required_schema(
-        field: &str,
-        prop: serde_json::Value,
-    ) -> Tool<'static> {
+    fn single_required_schema(field: &str, prop: serde_json::Value) -> Tool {
         Tool {
             name: Cow::Borrowed("fn"),
             description: Cow::Borrowed(""),
