@@ -33,8 +33,8 @@ use clap::Parser;
 use drama_llama::{
     minijinja::Value as JinjaValue,
     prompt::{ToolResult, ToolUse},
-    Block, Content, FlashAttention, Prompt, RenderOptions, RepetitionOptions,
-    Role, SamplingMode, Session, Tool, ToolChoice, ToolChoiceOptions,
+    Block, Content, FlashAttention, Prompt, RenderOptions, Role, SamplingMode,
+    Session, Tool, ToolChoice, ToolChoiceOptions,
 };
 use serde_json::json;
 
