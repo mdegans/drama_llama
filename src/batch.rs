@@ -32,7 +32,7 @@ pub enum AddError {
     ExpectedEmbedding,
     #[error("An embedding was supplied, but thet batch was created with embd_len == 0. Call `add_token` instead.")]
     ExpectedToken,
-    #[error("Invalid token position.")]
+    #[error("Token position overflows i32.")]
     InvalidPosition,
 }
 
@@ -257,7 +257,11 @@ impl Batch {
     ) -> Result<(), AddError> {
         let i = self.len();
 
-        if pos >= self.capacity() {
+        // `pos` is the sequence position in the KV cache, not a batch
+        // slot — it can be arbitrarily large (e.g. 100k+ into a long
+        // conversation). The only real ceiling is llama.cpp's `int32_t`
+        // storage for position.
+        if pos > i32::MAX as usize {
             return Err(AddError::InvalidPosition);
         }
 
@@ -393,11 +397,29 @@ mod tests {
                 batch.add_token(16, 15, None, true),
                 Err(AddError::Full)
             );
-            // The position is invalid
-            assert_eq!(
-                batch.add_token(16, 16, None, true),
-                Err(AddError::InvalidPosition)
-            );
         }
+    }
+
+    /// Positions are KV-cache coordinates, not batch slot indices — a
+    /// tiny batch must still accept tokens at large positions.
+    #[test]
+    fn test_add_token_large_position() {
+        let mut batch = Batch::new(4, 0, 1).unwrap();
+
+        assert_eq!(batch.add_token(7, 100_000, None, true), Ok(()));
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.pos_mut()[0], 100_000_i32);
+    }
+
+    /// `pos` is stored as `int32_t` on the C side, so values that
+    /// overflow `i32` are the only positions we actually reject.
+    #[test]
+    fn test_add_token_position_overflows_i32() {
+        let mut batch = Batch::new(4, 0, 1).unwrap();
+
+        assert_eq!(
+            batch.add_token(7, i32::MAX as usize + 1, None, true),
+            Err(AddError::InvalidPosition)
+        );
     }
 }

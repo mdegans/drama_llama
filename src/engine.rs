@@ -457,12 +457,7 @@ impl Engine {
             return Ok(());
         }
 
-        // `Batch::add_token` rejects `pos >= capacity`, so size capacity
-        // to cover the highest position we'll write. A bit wasteful when
-        // `start_pos` is large — flagged for possible Phase 1.5 cleanup
-        // in the Batch layer.
-        let capacity = start_pos + tokens.len();
-        let mut batch = Batch::new(capacity, 0, 1)
+        let mut batch = Batch::new(tokens.len(), 0, 1)
             .expect("prefill batch allocation failed");
 
         let seq_ids = [seq_id];

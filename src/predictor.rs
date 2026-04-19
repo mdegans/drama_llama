@@ -352,12 +352,8 @@ impl<'engine> CandidatePredictor<'engine> {
         );
 
         // Batch here holds only tokens sampled after generation starts
-        // (record_choice appends 1 per step). We still size capacity to
-        // cover the maximum position we might write, because
-        // `Batch::add_token` rejects `pos >= capacity`.
-        let batch_capacity = (n.get() + n_cur_after_prefill)
-            .min(engine.n_ctx() as usize);
-        let batch = Batch::new(batch_capacity, 0, 1)
+        // — `record_choice` appends one per step, at most `n` steps.
+        let batch = Batch::new(n.get(), 0, 1)
             .expect("resuming batch allocation failed");
 
         Self {
