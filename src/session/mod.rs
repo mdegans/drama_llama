@@ -2,11 +2,13 @@
 //! inference.
 //!
 //! [`Session`] is to local inference what [`misanthropic::Client::message`] is
-//! to the Anthropic API: given a [`Prompt`], get back a [`Message`] (or, while
-//! Phase 1 ships, raw bytes via [`Session::complete_text`]). The caller builds
-//! their [`Prompt`] with misanthropic's normal builders and lets `Session`
-//! handle rendering, grammar enforcement, sampling, and (in later phases) block
-//! parsing.
+//! to the Anthropic API: given a [`Prompt`], get back a
+//! [`response::Message`](misanthropic::response::Message) via
+//! [`Session::complete_response`], typed [`Block`]s via
+//! [`Session::complete_blocks`], or raw bytes via [`Session::complete_text`].
+//! The caller builds their [`Prompt`] with misanthropic's normal builders and
+//! lets `Session` handle rendering, grammar enforcement, sampling, streaming
+//! block parsing, and — opt-in — prefix-cache reuse across calls.
 //!
 //! ```no_run
 //! use drama_llama::{Prompt, Session};
@@ -28,28 +30,61 @@
 //!   each call. [`Session::with_sampling`] only replaces the user portion — it
 //!   can't override the grammar.
 //! * Tokenizes, runs the predictor, collects the result.
+//! * Streams or batches [`Block`]s via [`Session::complete_stream`] /
+//!   [`Session::complete_blocks`]; returns a full
+//!   [`response::Message`](misanthropic::response::Message) via
+//!   [`Session::complete_response`].
+//! * Optionally reuses KV state across calls when the caller opts in via
+//!   [`Session::with_prefix_cache`] (see below).
 //!
-//! # What it doesn't (yet)
+//! # Prefix caching
 //!
-//! * **Phase 2**: streaming block parser — `<think>`/`<tool_call>` scanning
-//!   plus serde-typed tool-call JSON.
-//! * **Phase 3**: [`Session::complete`] returning a
-//!   [`misanthropic::prompt::Message`], [`Session::complete_blocks`] returning
-//!   `Vec<Block>`, and a byte-for-byte round-trip invariant test: re-rendering
-//!   `complete()`'s output through the template must reproduce
-//!   `complete_text()`'s bytes exactly.
+//! Local inference has no "cache creation" cost in the Anthropic sense — the
+//! whole prompt is decoded on every call anyway — but it *does* pay a linear
+//! prefill cost in tokens. When successive calls share a long prefix (system
+//! + tools + early turns), re-prefilling those positions wastes work. The
+//! opt-in prefix cache keeps the KV state from the previous call around and,
+//! on the next call, computes the longest common prefix of `new_tokens` and
+//! `prev_tokens`, clipped to the nearest `cache_control` breakpoint declared
+//! in the prompt, and resumes generation from that position via
+//! [`Engine::predict_pieces_resuming`].
+//!
+//! The contract:
+//!
+//! * **Opt-in.** Default is off — existing callers are unaffected. Enable
+//!   with [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
+//! * **Breakpoint-driven.** The cache only honors positions the caller
+//!   explicitly marked with a `cache_control` on a [`Block`], [`Tool`], or
+//!   [`tool::Use`](misanthropic::tool::Use) / [`tool::Result`](misanthropic::tool::Result).
+//!   Without breakpoints, every call is a full re-prefill.
+//! * **Single sequence.** All prefill/decode uses `seq_id = 0`. Parallel
+//!   conversation threads need one [`Session`] each.
+//! * **Thread swap = clear.** When swapping conversation threads or reloading
+//!   system/tools outside the `cache_control` contract, call
+//!   [`Session::clear_prefix_cache`] to zero both the cache metadata and the
+//!   KV state. The library can't detect semantic-level context swaps on its
+//!   own.
+//!
+//! Usage statistics matching the Anthropic API shape are tracked on every
+//! `complete_*` call: see [`Session::last_usage`] and
+//! [`Session::total_usage`].
 //!
 //! [`misanthropic::Client::message`]:
 //!     https://docs.rs/misanthropic/latest/misanthropic/struct.Client.html#method.message
 //! [`ToolChoice`]: crate::ToolChoice
+//! [`Block`]: crate::Block
+//! [`Tool`]: crate::Tool
 
 use std::{num::NonZeroUsize, path::PathBuf};
 
+use llama_cpp_sys_3::llama_token;
+use misanthropic::response::Usage;
+
 use crate::{
-    engine::NewError, grammar_for_prompt, silence_logs, ChatTemplate,
-    ChatTemplateError, Engine, PredictOptions, Prompt, RenderOptions,
-    RepetitionOptions, SampleOptions, SamplingMode, ToolChoiceError,
-    ToolChoiceOptions,
+    chat_template::tokenize_with_breakpoints, engine::NewError,
+    grammar_for_prompt, silence_logs, ChatTemplate, ChatTemplateError, Engine,
+    PredictOptions, Prompt, RenderOptions, RepetitionOptions, SampleOptions,
+    SamplingMode, ToolChoiceError, ToolChoiceOptions,
 };
 
 mod parse;
@@ -88,6 +123,89 @@ pub enum SessionError {
 /// Default maximum tokens per [`Session::complete_text`] call. Users
 /// override via [`Session::with_max_tokens`].
 const DEFAULT_MAX_TOKENS: usize = 1024;
+
+/// Per-session prefix-cache state.
+///
+/// Tracks the full prompt tokens from the last cache-participating
+/// `complete_*` call, the indices within those tokens where
+/// `cache_control` breakpoints landed (sorted ascending), and the
+/// number of tokens actually reused on the last call. Generation
+/// tokens are **not** stored — they're overwritten on the next call
+/// whose prompt extends past the reused prefix.
+///
+/// Private to the session module; callers interact through
+/// [`Session::with_prefix_cache`] / [`Session::clear_prefix_cache`] /
+/// [`Session::last_usage`].
+struct PrefixCache {
+    /// Full prompt tokens from the last cache-participating call.
+    /// Generation tokens are NOT stored here.
+    prev_tokens: Vec<llama_token>,
+    /// Token indices in `prev_tokens` where `cache_control`
+    /// breakpoints landed. Sorted ascending.
+    prev_breakpoints: Vec<usize>,
+    /// Tokens reused in the last call. `0` = full re-prefill.
+    last_reused_tokens: usize,
+}
+
+impl PrefixCache {
+    /// Fresh, empty cache.
+    fn new() -> Self {
+        Self {
+            prev_tokens: Vec::new(),
+            prev_breakpoints: Vec::new(),
+            last_reused_tokens: 0,
+        }
+    }
+
+    /// Zero every field. Called from [`Session::clear_prefix_cache`].
+    fn reset(&mut self) {
+        self.prev_tokens.clear();
+        self.prev_breakpoints.clear();
+        self.last_reused_tokens = 0;
+    }
+}
+
+/// Length of the longest prefix shared between `a` and `b`, in tokens.
+///
+/// Pure function, no model, no KV state — tested directly in
+/// `tests::test_longest_common_prefix_len`.
+fn longest_common_prefix_len(a: &[llama_token], b: &[llama_token]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// Cache-reuse length for a call.
+///
+/// Given the previously-cached `prev_tokens`, the newly-rendered
+/// `new_tokens`, and the new call's breakpoint token indices
+/// (sorted ascending), compute `L_hit`: the largest breakpoint index
+/// that is
+///
+/// 1. less than or equal to the common-prefix length of the two
+///    token streams, with one token of BPE-boundary safety (to avoid
+///    reusing a position whose successor might tokenize differently);
+///    and
+/// 2. strictly greater than zero (we only reuse at breakpoints).
+///
+/// Returns `0` when no breakpoint is eligible — the caller should
+/// treat that as a full re-prefill. Pure function, tested directly.
+fn compute_l_hit(
+    prev_tokens: &[llama_token],
+    new_tokens: &[llama_token],
+    new_breakpoints: &[usize],
+) -> usize {
+    let lcp = longest_common_prefix_len(prev_tokens, new_tokens);
+    // BPE-boundary safety: back off by one token so a breakpoint
+    // falling exactly at the prefix end can't reuse a position whose
+    // successor might re-tokenize differently once more context is
+    // added.
+    let safe = if lcp == 0 { 0 } else { lcp - 1 };
+    new_breakpoints
+        .iter()
+        .rev()
+        .find(|&&bp| bp <= safe && bp > 0)
+        .copied()
+        .unwrap_or(0)
+}
 
 /// One generated-position entry in a [`Session::top_k_trace`] dump.
 ///
@@ -138,6 +256,18 @@ pub struct Session {
     /// can opt in via [`Session::with_repetition`].
     repetition: Option<RepetitionOptions>,
     max_tokens: NonZeroUsize,
+    /// Prefix-cache state. `Some` iff the caller opted in via
+    /// [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
+    /// `None` means every call is a full re-prefill (the pre-0.7
+    /// behavior).
+    prefix_cache: Option<PrefixCache>,
+    /// [`Usage`] from the most recent `complete_*` call. Zeroed on
+    /// construction; overwritten on every call.
+    last_usage: Usage,
+    /// Cumulative [`Usage`] across every `complete_*` call on this
+    /// `Session`. Zeroed on construction; never reset except by
+    /// dropping and rebuilding the `Session`.
+    total_usage: Usage,
 }
 
 impl Session {
@@ -178,6 +308,9 @@ impl Session {
             sample_modes: vec![SamplingMode::locally_typical()],
             repetition: None,
             max_tokens: NonZeroUsize::new(DEFAULT_MAX_TOKENS).unwrap(),
+            prefix_cache: None,
+            last_usage: Usage::default(),
+            total_usage: Usage::default(),
         })
     }
 
@@ -261,6 +394,73 @@ impl Session {
         self
     }
 
+    /// Enable (or disable) prefix-cache reuse across `complete_*`
+    /// calls.
+    ///
+    /// Default is disabled — existing callers are unaffected unless
+    /// they opt in. When enabled, `Session` honors `cache_control`
+    /// breakpoints on [`Block`](crate::Block)s,
+    /// [`tool::Method`](misanthropic::tool::Method)s,
+    /// [`tool::Result`](misanthropic::tool::Result)s, and
+    /// [`tool::Use`](misanthropic::tool::Use)s, resuming generation
+    /// from the longest prefix shared with the previous call (clipped
+    /// to the nearest declared breakpoint).
+    ///
+    /// Enabling when already enabled is a no-op; disabling clears any
+    /// cached prefix metadata AND the KV cache (delegates to
+    /// [`Self::clear_prefix_cache`]).
+    pub fn with_prefix_cache(mut self, on: bool) -> Self {
+        if on {
+            if self.prefix_cache.is_none() {
+                self.prefix_cache = Some(PrefixCache::new());
+            }
+        } else if self.prefix_cache.is_some() {
+            self.clear_prefix_cache();
+            self.prefix_cache = None;
+        }
+        self
+    }
+
+    /// Clear both the cached prefix metadata AND the KV cache.
+    ///
+    /// Call when swapping conversation threads or reloading
+    /// system/tools outside the `cache_control` contract — the
+    /// library can't detect semantic-level context swaps on its own,
+    /// and silently reusing stale KV state across unrelated
+    /// conversations would produce incoherent output.
+    ///
+    /// No-op on the KV side if the prefix cache is disabled, but
+    /// still safe to call.
+    pub fn clear_prefix_cache(&mut self) {
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            cache.reset();
+        }
+        self.engine.memory_clear();
+    }
+
+    /// The [`Usage`] from the most recent `complete_*` call. Zeroed
+    /// at [`Session`] construction; overwritten on every call.
+    ///
+    /// For local inference, `cache_creation_input_tokens` is always
+    /// `Some(0)` — there's no asymmetric creation-vs-read cost like
+    /// the Anthropic API has. `cache_read_input_tokens` is the number
+    /// of prompt tokens reused from the previous call's KV state, or
+    /// `Some(0)` when caching is disabled or the call missed.
+    pub fn last_usage(&self) -> &Usage {
+        &self.last_usage
+    }
+
+    /// Cumulative [`Usage`] across every `complete_*` call on this
+    /// [`Session`]. Zeroed at construction; never reset except by
+    /// dropping and rebuilding the `Session`. Follows misanthropic's
+    /// [`Usage: AddAssign<Usage>`][aa] convention — cache counters
+    /// saturate to `Some(total)` once any call produces a value.
+    ///
+    /// [aa]: misanthropic::response::Usage
+    pub fn total_usage(&self) -> &Usage {
+        &self.total_usage
+    }
+
     /// Borrow the underlying [`Engine`] — useful when the caller needs raw
     /// predictor access for something `Session` doesn't expose yet (e.g. custom
     /// stop-sequence management).
@@ -330,19 +530,160 @@ impl Session {
         Ok((tokens, modes))
     }
 
+    /// Cache-aware superset of [`Self::prepare_call`]: renders the
+    /// prompt **with** cache breakpoints, tokenizes both the full
+    /// render and each partial via
+    /// [`tokenize_with_breakpoints`](crate::chat_template::tokenize_with_breakpoints),
+    /// and returns the full token stream, the breakpoint token
+    /// indices (sorted ascending), and the sampling-mode chain.
+    ///
+    /// When the caller has not enabled prefix caching
+    /// ([`Self::with_prefix_cache(false)`](Self::with_prefix_cache)),
+    /// this function skips the partial-render + tokenize passes and
+    /// returns an empty breakpoint list — breakpoints are never
+    /// consulted in that mode anyway, so computing them is wasted
+    /// work.
+    fn prepare_call_cached(
+        &mut self,
+        prompt: &Prompt,
+        include_user_sampling: bool,
+    ) -> Result<
+        (Vec<llama_token>, Vec<usize>, Vec<SamplingMode>),
+        SessionError,
+    > {
+        let (tokens, breakpoints) = if self.prefix_cache.is_some() {
+            let rendered = self
+                .template
+                .render_with_breakpoints(prompt, &self.render_opts)?;
+            tokenize_with_breakpoints(&self.engine.model, &rendered)
+        } else {
+            // Fast path: single render + tokenize, no partials.
+            let rendered =
+                self.template.render_with(prompt, &self.render_opts)?;
+            (self.engine.model.tokenize(&rendered, true), Vec::new())
+        };
+
+        let grammar = grammar_for_prompt(prompt, &self.tool_choice_opts)?;
+        let modes: Vec<SamplingMode> = if include_user_sampling {
+            grammar
+                .into_iter()
+                .chain(self.sample_modes.iter().cloned())
+                .collect()
+        } else {
+            grammar.into_iter().collect()
+        };
+        Ok((tokens, breakpoints, modes))
+    }
+
+    /// Prefix-cache KV-state setup shared by every batch `complete_*`
+    /// entry point.
+    ///
+    /// Given the newly-tokenized prompt and its breakpoint indices,
+    /// computes `L_hit` (tokens reusable from the previous call's KV
+    /// state), narrows the KV cache to `[0, L_hit)` via
+    /// [`Engine::memory_seq_rm`] (or clears it entirely on miss), and
+    /// returns the suffix of `new_tokens` the predictor must decode
+    /// plus the reuse length. The caller still owns whether / when to
+    /// update `self.prefix_cache` — batch callers do it *after*
+    /// success; streaming callers do it *before* the predictor borrow.
+    ///
+    /// This function touches the KV cache but nothing else on `self`
+    /// beyond the engine.
+    fn kv_setup_for_call(
+        &mut self,
+        new_tokens: &[llama_token],
+        new_breakpoints: &[usize],
+    ) -> (Vec<llama_token>, usize) {
+        let l_hit = match self.prefix_cache.as_ref() {
+            Some(cache) if !cache.prev_tokens.is_empty() => {
+                compute_l_hit(
+                    &cache.prev_tokens,
+                    new_tokens,
+                    new_breakpoints,
+                )
+            }
+            _ => 0,
+        };
+        if l_hit > 0 {
+            // Narrow the KV cache to the reused prefix. Anything past
+            // `l_hit` on seq 0 (old generation + old suffix) is dropped
+            // so the resuming prefill can write the new suffix into
+            // fresh positions.
+            self.engine.memory_seq_rm(0, l_hit as i32, -1);
+        } else {
+            // Full re-prefill: wipe everything.
+            self.engine.memory_clear();
+        }
+        let suffix = new_tokens[l_hit..].to_vec();
+        (suffix, l_hit)
+    }
+
+    /// Build a [`Usage`] for one `complete_*` call. `Option` fields
+    /// are always populated — locally we know both cache counters
+    /// exactly, so recording them explicitly (even as `Some(0)`) is
+    /// more informative than `None` and keeps
+    /// [`Usage::AddAssign`](std::ops::AddAssign) behavior well-
+    /// defined across calls.
+    fn make_usage(
+        prompt_tokens: usize,
+        cache_read: usize,
+        output_tokens: usize,
+    ) -> Usage {
+        Usage {
+            input_tokens: prompt_tokens as u64,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(cache_read as u64),
+            output_tokens: output_tokens as u64,
+        }
+    }
+
+    /// After a batch call succeeds, update [`self.prefix_cache`] to
+    /// describe the current KV state: full prompt tokens, breakpoint
+    /// indices, and actual reuse length. No-op when caching is off.
+    fn record_cache_hit(
+        &mut self,
+        new_tokens: Vec<llama_token>,
+        new_breakpoints: Vec<usize>,
+        l_hit: usize,
+    ) {
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            cache.prev_tokens = new_tokens;
+            cache.prev_breakpoints = new_breakpoints;
+            cache.last_reused_tokens = l_hit;
+        }
+    }
+
+    /// After a batch call fails, invalidate [`self.prefix_cache`] and
+    /// wipe the KV state — partial decodes may have left the cache
+    /// inconsistent with `prev_tokens`.
+    fn record_cache_miss_on_error(&mut self) {
+        self.engine.memory_clear();
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            cache.reset();
+        }
+    }
+
+    /// Record usage for the current call onto [`self.last_usage`]
+    /// (overwrite) and [`self.total_usage`] (accumulate).
+    fn record_usage(&mut self, usage: Usage) {
+        self.last_usage = usage;
+        self.total_usage += usage;
+    }
+
     /// Debug escape hatch. Renders the prompt → tokenizes → runs the
     /// predictor → concatenates pieces into a `String`.
     ///
     /// # What this method is for
     ///
-    /// Verifying the round-trip invariant: once [`Session::complete`] lands in
-    /// Phase 3, a `Message` produced by `complete(&prompt)` must re-render
-    /// through [`ChatTemplate`] to exactly the bytes this method returns for
-    /// the same `prompt`. That's the "complete and complete_text are two views
-    /// of the same bytes" contract.
+    /// Verifying the round-trip invariant: a [`response::Message`][rm]
+    /// produced by [`Self::complete_response`] must re-render through
+    /// [`ChatTemplate`] to exactly the bytes this method returns for
+    /// the same `prompt`. That's the "complete* and complete_text are
+    /// two views of the same bytes" contract.
     ///
-    /// Beyond testing, prefer [`Session::complete`] (Phase 3) which returns a
-    /// parsed [`AssistantMessage`] with typed blocks.
+    /// Beyond testing, prefer [`Self::complete_response`] (returns a
+    /// full [`response::Message`][rm] with usage + stop reason) or
+    /// [`Self::complete`] (returns a typed [`AssistantMessage`]).
     ///
     /// # Grammar
     ///
@@ -352,12 +693,23 @@ impl Session {
     /// whenever `prompt.tool_choice` is `Some(Method | Any)` and the tool list
     /// is non-empty.
     ///
-    /// [`Message`]: crate::prompt::AssistantMessage
+    /// # Prefix caching
+    ///
+    /// Participates in prefix-cache reuse when
+    /// [`Self::with_prefix_cache`] is enabled — no opt-out. Callers
+    /// that need bit-exact repeat output across calls should use
+    /// greedy sampling, as today.
+    ///
+    /// [rm]: misanthropic::response::Message
     pub fn complete_text(
         &mut self,
         prompt: &Prompt,
     ) -> Result<String, SessionError> {
-        let (tokens, modes) = self.prepare_call(prompt, true)?;
+        let (tokens, breakpoints, modes) =
+            self.prepare_call_cached(prompt, true)?;
+        let prompt_tokens = tokens.len();
+
+        let (suffix, l_hit) = self.kv_setup_for_call(&tokens, &breakpoints);
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
@@ -367,10 +719,33 @@ impl Session {
             repetition: self.repetition.clone(),
         };
 
-        let text: String =
-            self.engine.predict_pieces(tokens, predict_opts).collect();
+        // Count pieces as we consume them — one piece equals one
+        // generated token before any post-hoc stop-string trimming
+        // the predictor does.
+        let mut generated_count: usize = 0;
+        let mut text = String::new();
+        let mut predictor = if l_hit > 0 {
+            self.engine
+                .predict_pieces_resuming(suffix, l_hit, 0, predict_opts)
+        } else {
+            self.engine.predict_pieces(suffix, predict_opts)
+        };
+        while let Some(piece) = predictor.next() {
+            generated_count += 1;
+            text.push_str(&piece);
+        }
+        // Drop the predictor so it releases the engine borrow — we
+        // need `&self.engine` for `trim_eos` below.
+        drop(predictor);
 
-        Ok(trim_eos(&text, &self.engine).to_string())
+        let trimmed = trim_eos(&text, &self.engine).to_string();
+
+        self.record_cache_hit(tokens, breakpoints, l_hit);
+        let usage =
+            Self::make_usage(prompt_tokens, l_hit, generated_count);
+        self.record_usage(usage);
+
+        Ok(trimmed)
     }
 
     /// Stream [`Block`]s as they're generated.
@@ -384,6 +759,24 @@ impl Session {
     /// The returned iterator borrows `self` — only one stream can be live at a
     /// time. Drop it before calling another `complete_*`.
     ///
+    /// # Prefix caching
+    ///
+    /// Participates in prefix-cache reuse when enabled. Cache
+    /// metadata (prev_tokens, prev_breakpoints, reused count) is
+    /// updated **before** the predictor borrow — iterating or
+    /// dropping the returned [`BlockStream`] does not mutate cache
+    /// state. That's correct: `prev_tokens` describes *prompt* KV,
+    /// and the next call's
+    /// [`kv_setup_for_call`](Session::kv_setup_for_call) truncates any
+    /// generation tokens that leaked past the reused prefix.
+    ///
+    /// Output-token count is not known until the stream is consumed,
+    /// so [`Self::last_usage`]'s `output_tokens` is set to 0 for
+    /// streaming calls. Input counts (`input_tokens`,
+    /// `cache_read_input_tokens`) are accurate. Callers who need an
+    /// output count should count pieces themselves or use a batch
+    /// entry point.
+    ///
     /// # Errors
     ///
     /// Iteration itself doesn't produce per-item errors; all setup failures
@@ -394,7 +787,21 @@ impl Session {
         &'s mut self,
         prompt: &Prompt,
     ) -> Result<BlockStream<'s>, SessionError> {
-        let (tokens, modes) = self.prepare_call(prompt, true)?;
+        let (tokens, breakpoints, modes) =
+            self.prepare_call_cached(prompt, true)?;
+        let prompt_tokens = tokens.len();
+
+        let (suffix, l_hit) = self.kv_setup_for_call(&tokens, &breakpoints);
+
+        // Streaming: the cache must be updated BEFORE the predictor
+        // borrows `&mut self.engine`, because the returned stream
+        // holds that borrow for the lifetime of iteration. Usage
+        // follows the same ordering — output count stays 0 because we
+        // can't count pieces from here.
+        self.record_cache_hit(tokens, breakpoints, l_hit);
+        let usage = Self::make_usage(prompt_tokens, l_hit, 0);
+        self.record_usage(usage);
+
         let eos_piece =
             self.engine.model.token_to_piece(self.engine.model.eos());
 
@@ -406,13 +813,139 @@ impl Session {
             repetition: self.repetition.clone(),
         };
 
-        let predictor = self.engine.predict_pieces(tokens, predict_opts);
+        let predictor = if l_hit > 0 {
+            self.engine.predict_pieces_resuming(
+                suffix,
+                l_hit,
+                0,
+                predict_opts,
+            )
+        } else {
+            self.engine.predict_pieces(suffix, predict_opts)
+        };
         Ok(BlockStream {
             predictor,
             parser: BlockParser::new(),
             pending: std::collections::VecDeque::new(),
             eos_piece,
             drained: false,
+        })
+    }
+
+    /// Run a batch call end-to-end: cache setup, prediction, cache
+    /// bookkeeping, usage accounting, stop-reason inference. The
+    /// single source of truth for [`Self::complete_blocks`],
+    /// [`Self::complete`], and [`Self::complete_response`].
+    ///
+    /// Returns a [`CallOutcome`] with everything a caller could
+    /// reasonably need to build an API-shaped response. On error,
+    /// invalidates the prefix cache AND the KV cache — partial
+    /// decodes may have left them inconsistent.
+    fn run_call(
+        &mut self,
+        prompt: &Prompt,
+    ) -> Result<CallOutcome, SessionError> {
+        use crate::ToolChoice;
+        let forced_tool_call = matches!(
+            prompt.tool_choice,
+            Some(ToolChoice::Method { .. }) | Some(ToolChoice::Any)
+        );
+
+        let (tokens, breakpoints, modes) =
+            self.prepare_call_cached(prompt, true)?;
+        let prompt_tokens = tokens.len();
+
+        let (suffix, l_hit) = self.kv_setup_for_call(&tokens, &breakpoints);
+
+        let eos_piece =
+            self.engine.model.token_to_piece(self.engine.model.eos());
+
+        let mut predict_opts =
+            PredictOptions::default().add_model_stops(&self.engine.model);
+        predict_opts.n = self.max_tokens;
+        predict_opts.sample_options = SampleOptions {
+            modes,
+            repetition: self.repetition.clone(),
+        };
+
+        // Collect generated pieces + count tokens inline. We also
+        // track the concatenated raw-text buffer so stop-sequence
+        // matching can inspect it post-hoc.
+        let mut generated_count: usize = 0;
+        let mut raw_text = String::new();
+        let mut blocks: Vec<crate::Block> = Vec::new();
+        let mut parser = BlockParser::new();
+
+        let predictor = if l_hit > 0 {
+            self.engine.predict_pieces_resuming(
+                suffix,
+                l_hit,
+                0,
+                predict_opts,
+            )
+        } else {
+            self.engine.predict_pieces(suffix, predict_opts)
+        };
+
+        for piece in predictor {
+            if piece == eos_piece || piece == "[Invalid UTF-8]" {
+                continue;
+            }
+            generated_count += 1;
+            raw_text.push_str(&piece);
+            let emitted = parser.push(&piece);
+            blocks.extend(emitted);
+        }
+        blocks.extend(parser.finish());
+
+        // Cache + usage bookkeeping, then grammar-violation check.
+        // Check last so a violation still records the work that was
+        // done — usage numbers are correct either way.
+        self.record_cache_hit(tokens, breakpoints, l_hit);
+        let usage = Self::make_usage(prompt_tokens, l_hit, generated_count);
+        self.record_usage(usage);
+
+        if forced_tool_call
+            && !blocks
+                .iter()
+                .any(|b| matches!(b, crate::Block::ToolUse { .. }))
+        {
+            let partial = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    crate::Block::Text { text, .. } => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            // Grammar violation is a call failure — invalidate cache
+            // + KV to avoid stale reuse next call.
+            self.record_cache_miss_on_error();
+            return Err(SessionError::GrammarViolation {
+                partial_output: partial,
+            });
+        }
+
+        let (stop_reason, stop_sequence) = infer_stop_reason(
+            &blocks,
+            &raw_text,
+            generated_count,
+            self.max_tokens,
+            prompt.stop_sequences.as_deref(),
+        );
+
+        // `raw_text` was consumed by stop-sequence inference; not
+        // exported. Drop explicitly so the allocation is released
+        // before the outcome is handed back to the caller.
+        drop(raw_text);
+
+        Ok(CallOutcome {
+            blocks,
+            prompt_tokens,
+            cache_read_tokens: l_hit,
+            generated_tokens: generated_count,
+            stop_reason,
+            stop_sequence,
         })
     }
 
@@ -431,30 +964,7 @@ impl Session {
         &mut self,
         prompt: &Prompt,
     ) -> Result<Vec<crate::Block>, SessionError> {
-        use crate::ToolChoice;
-        let forced_tool_call = matches!(
-            prompt.tool_choice,
-            Some(ToolChoice::Method { .. }) | Some(ToolChoice::Any)
-        );
-        let blocks: Vec<_> = self.complete_stream(prompt)?.collect();
-        if forced_tool_call
-            && !blocks
-                .iter()
-                .any(|b| matches!(b, crate::Block::ToolUse { .. }))
-        {
-            let partial = blocks
-                .iter()
-                .filter_map(|b| match b {
-                    crate::Block::Text { text, .. } => Some(text.as_ref()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            return Err(SessionError::GrammarViolation {
-                partial_output: partial,
-            });
-        }
-        Ok(blocks)
+        Ok(self.run_call(prompt)?.blocks)
     }
 
     /// Greedy-driven diagnostic: render the prompt, decode it, then
@@ -475,6 +985,14 @@ impl Session {
     /// to localize wrong-argmax bugs to either our decode pipeline or upstream
     /// llama.cpp.
     ///
+    /// # Prefix cache interaction
+    ///
+    /// Invalidates any prefix-cache state (calls
+    /// [`Self::clear_prefix_cache`] internally) because the underlying
+    /// [`Engine::predict_candidates`] path unconditionally clears the
+    /// KV cache. Without this invalidation, a subsequent cached call
+    /// would read stale `prev_tokens` metadata against a wiped KV.
+    ///
     /// [`ToolChoice`]: crate::ToolChoice
     pub fn top_k_trace(
         &mut self,
@@ -484,6 +1002,7 @@ impl Session {
         use crate::sample::grammar as grammar_mod;
         use crate::Sorted;
 
+        self.clear_prefix_cache();
         let (tokens, modes) = self.prepare_call(prompt, false)?;
 
         let k_nz = NonZeroUsize::new(k.max(1)).unwrap();
@@ -564,6 +1083,143 @@ impl Session {
         let blocks = self.complete_blocks(prompt)?;
         Ok(blocks.into_iter().collect())
     }
+
+    /// Batch-complete returning a full
+    /// [`response::Message`][rm] with content, usage, stop reason,
+    /// and stop sequence populated.
+    ///
+    /// This is the shape downstream consumers (agent reactors,
+    /// observability tooling, anything that mirrors the Anthropic
+    /// Messages API response) want, so it gets a dedicated method
+    /// rather than forcing callers to manually stitch together the
+    /// outputs of [`Self::complete`] and [`Self::last_usage`].
+    ///
+    /// The existing [`Self::complete`] / [`Self::complete_blocks`] /
+    /// [`Self::complete_text`] methods remain as shape-narrowed views
+    /// of the same work; all four share [`Self::run_call`] under the
+    /// hood.
+    ///
+    /// # Field filling
+    ///
+    /// * `id`: empty string — local inference has no stable
+    ///   request-id concept.
+    /// * `model`: [`model::Id::Custom`][cu] wrapping the result of
+    ///   [`Model::desc`](crate::Model::desc).
+    /// * `content`: [`AssistantMessage`] via
+    ///   [`FromIterator<Block>`](std::iter::FromIterator).
+    /// * `stop_reason`: inferred by [`infer_stop_reason`] — see its
+    ///   docs for the mapping.
+    /// * `stop_sequence`: the matched sequence when
+    ///   `stop_reason == StopSequence`, else `None`.
+    /// * `usage`: same shape as [`Self::last_usage`].
+    ///
+    /// [rm]: misanthropic::response::Message
+    /// [cu]: misanthropic::model::Id::Custom
+    pub fn complete_response(
+        &mut self,
+        prompt: &Prompt,
+    ) -> Result<misanthropic::response::Message<'static>, SessionError> {
+        let outcome = self.run_call(prompt)?;
+        let content: crate::AssistantMessage =
+            outcome.blocks.into_iter().collect();
+        let usage = Self::make_usage(
+            outcome.prompt_tokens,
+            outcome.cache_read_tokens,
+            outcome.generated_tokens,
+        );
+        Ok(misanthropic::response::Message {
+            id: std::borrow::Cow::Borrowed(""),
+            inner: content,
+            model: misanthropic::model::Id::Custom(
+                std::borrow::Cow::Owned(self.engine.model.desc()),
+            ),
+            stop_reason: outcome.stop_reason,
+            stop_sequence: outcome
+                .stop_sequence
+                .map(std::borrow::Cow::Owned),
+            usage,
+        })
+    }
+}
+
+/// Everything [`Session::run_call`] produces about one batch call —
+/// shared by [`Session::complete_blocks`] / [`Session::complete`] /
+/// [`Session::complete_response`] so each can project out the shape
+/// it wants without duplicating the run itself.
+struct CallOutcome {
+    /// Parsed blocks from the completion.
+    blocks: Vec<crate::Block>,
+    /// Full prompt token length — input for the
+    /// [`Usage`](misanthropic::response::Usage) `input_tokens` field.
+    prompt_tokens: usize,
+    /// Tokens reused from the prefix cache (0 on miss).
+    cache_read_tokens: usize,
+    /// Tokens emitted by the predictor (pre-trim, pre-stop-string
+    /// truncation). This is the count the model actually generated.
+    generated_tokens: usize,
+    /// Inferred [`StopReason`](misanthropic::response::StopReason),
+    /// or `None` if ambiguous.
+    stop_reason: Option<misanthropic::response::StopReason>,
+    /// The exact stop string that matched, if any. Populated only
+    /// when `stop_reason == Some(StopSequence)`.
+    stop_sequence: Option<String>,
+}
+
+/// Infer a [`StopReason`](misanthropic::response::StopReason) from a
+/// completed batch call.
+///
+/// Priority (highest first):
+///
+/// 1. `ToolUse` — any [`Block::ToolUse`](crate::Block::ToolUse) in
+///    the block stream. Anthropic-style: tool calls terminate the
+///    assistant turn.
+/// 2. `StopSequence` — `raw_text` ends with one of
+///    `prompt.stop_sequences`. The matched sequence is returned as
+///    the second tuple element.
+/// 3. `MaxTokens` — `generated_tokens == max_tokens.get()`.
+/// 4. `EndTurn` — the last block is a [`Block::Text`](crate::Block::Text)
+///    (i.e. we successfully closed out on prose, not mid-tag).
+/// 5. `None` — ambiguous; the caller can log or surface as `null` in
+///    API wire output.
+///
+/// The check order prefers semantic signals (tool use, stop
+/// sequence) over mechanical ones (token limit) so tool-call-forced
+/// flows and caller-supplied stop strings are never mis-labeled as
+/// `MaxTokens`.
+fn infer_stop_reason(
+    blocks: &[crate::Block],
+    raw_text: &str,
+    generated_tokens: usize,
+    max_tokens: NonZeroUsize,
+    stop_sequences: Option<&[std::borrow::Cow<'static, str>]>,
+) -> (Option<misanthropic::response::StopReason>, Option<String>) {
+    use misanthropic::response::StopReason;
+
+    if blocks.iter().any(|b| matches!(b, crate::Block::ToolUse { .. })) {
+        return (Some(StopReason::ToolUse), None);
+    }
+
+    if let Some(stops) = stop_sequences {
+        for s in stops {
+            if !s.is_empty() && raw_text.ends_with(s.as_ref()) {
+                return (
+                    Some(StopReason::StopSequence),
+                    Some(s.to_string()),
+                );
+            }
+        }
+    }
+
+    if generated_tokens >= max_tokens.get() {
+        return (Some(StopReason::MaxTokens), None);
+    }
+
+    match blocks.last() {
+        Some(crate::Block::Text { .. }) | Some(crate::Block::Thought { .. }) => {
+            (Some(StopReason::EndTurn), None)
+        }
+        _ => (None, None),
+    }
 }
 
 /// Streaming [`Iterator`] over [`crate::Block`]s, produced by
@@ -625,4 +1281,411 @@ fn trim_eos<'a>(text: &'a str, engine: &Engine) -> &'a str {
     text.trim_end_matches(eos_piece.as_str())
         .trim_end_matches("[Invalid UTF-8]")
         .trim_end()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------
+    // Pure-Rust helper tests — no model, no KV, no #[ignore].
+    // -----------------------------------------------------------------
+
+    /// `longest_common_prefix_len` covers the edge shapes we rely on:
+    /// empty inputs, identical inputs, one-token-different,
+    /// one-shorter, and totally-disjoint. Token ids are arbitrary
+    /// `i32`s — the function doesn't care about the vocab.
+    #[test]
+    fn test_longest_common_prefix_len() {
+        assert_eq!(longest_common_prefix_len(&[], &[]), 0);
+        assert_eq!(longest_common_prefix_len(&[1, 2, 3], &[]), 0);
+        assert_eq!(longest_common_prefix_len(&[], &[1, 2, 3]), 0);
+        assert_eq!(
+            longest_common_prefix_len(&[1, 2, 3], &[1, 2, 3]),
+            3,
+            "identical",
+        );
+        assert_eq!(
+            longest_common_prefix_len(&[1, 2, 3, 4], &[1, 2, 3, 9]),
+            3,
+            "one-different",
+        );
+        assert_eq!(
+            longest_common_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]),
+            3,
+            "one-shorter",
+        );
+        assert_eq!(
+            longest_common_prefix_len(&[1, 2, 3], &[9, 8, 7]),
+            0,
+            "disjoint",
+        );
+    }
+
+    /// No breakpoints → no eligible reuse point → `L_hit == 0`,
+    /// even when the common prefix is long.
+    #[test]
+    fn test_l_hit_computation_no_breakpoints() {
+        let prev: Vec<llama_token> = (0..20).collect();
+        let new_: Vec<llama_token> = (0..10).chain(100..110).collect();
+        assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
+        assert_eq!(compute_l_hit(&prev, &new_, &[]), 0);
+    }
+
+    /// With breakpoints at [5, 8, 12] and a common prefix of 10, the
+    /// BPE-safe cap is `10 - 1 = 9`. The largest breakpoint ≤ 9 is
+    /// `8`, so `L_hit == 8`.
+    #[test]
+    fn test_l_hit_computation_with_breakpoint() {
+        let prev: Vec<llama_token> = (0..20).collect();
+        let new_: Vec<llama_token> = (0..10).chain(100..110).collect();
+        let breakpoints = vec![5, 8, 12];
+        assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 8);
+    }
+
+    /// Common prefix of 5 with a breakpoint exactly at 5: BPE-safe cap
+    /// is 4, nothing ≤ 4 is in the breakpoint list, so `L_hit == 0`.
+    /// This guards against the one-token-boundary trap where
+    /// resuming exactly at the prefix end is unsafe.
+    #[test]
+    fn test_l_hit_computation_bpe_backoff() {
+        let prev: Vec<llama_token> = (0..10).collect();
+        let new_: Vec<llama_token> =
+            (0..5).chain(200..205).chain(300..305).collect();
+        let breakpoints = vec![5];
+        assert_eq!(longest_common_prefix_len(&prev, &new_), 5);
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 0);
+    }
+
+    /// When the common prefix is zero, `L_hit` must also be zero,
+    /// regardless of breakpoint placement.
+    #[test]
+    fn test_l_hit_zero_common_prefix() {
+        let prev = vec![10, 20, 30];
+        let new_ = vec![40, 50, 60];
+        let breakpoints = vec![1, 2, 3];
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 0);
+    }
+
+    /// Empty previous tokens — first call against a cold cache —
+    /// always lands at `L_hit == 0`.
+    #[test]
+    fn test_l_hit_empty_prev() {
+        let prev: Vec<llama_token> = Vec::new();
+        let new_: Vec<llama_token> = vec![1, 2, 3, 4, 5];
+        let breakpoints = vec![1, 3];
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 0);
+    }
+
+    /// `PrefixCache::new()` starts with every field zeroed, and
+    /// `reset()` returns a populated cache to that state. This is the
+    /// invariant `Session::clear_prefix_cache` relies on.
+    #[test]
+    fn test_prefix_cache_reset_zeroes_state() {
+        let mut cache = PrefixCache::new();
+        assert!(cache.prev_tokens.is_empty());
+        assert!(cache.prev_breakpoints.is_empty());
+        assert_eq!(cache.last_reused_tokens, 0);
+
+        cache.prev_tokens = vec![1, 2, 3];
+        cache.prev_breakpoints = vec![1, 2];
+        cache.last_reused_tokens = 2;
+
+        cache.reset();
+        assert!(cache.prev_tokens.is_empty());
+        assert!(cache.prev_breakpoints.is_empty());
+        assert_eq!(cache.last_reused_tokens, 0);
+    }
+
+    /// Stop-reason inference: tool use wins over everything. When a
+    /// `ToolUse` block is present, the stop reason must be `ToolUse`
+    /// even if `generated_tokens == max_tokens` or a stop sequence
+    /// technically matches — semantics beat bookkeeping.
+    #[test]
+    fn test_infer_stop_reason_tool_use_wins() {
+        use misanthropic::response::StopReason;
+        use misanthropic::tool::Use;
+        let blocks = vec![
+            crate::Block::Text {
+                text: "ok".into(),
+                cache_control: None,
+            },
+            crate::Block::ToolUse {
+                call: Use {
+                    id: "id".into(),
+                    name: "t".into(),
+                    input: serde_json::json!({}),
+                    cache_control: None,
+                },
+            },
+        ];
+        let max = NonZeroUsize::new(8).unwrap();
+        let (reason, seq) = infer_stop_reason(&blocks, "ok", 8, max, None);
+        assert_eq!(reason, Some(StopReason::ToolUse));
+        assert_eq!(seq, None);
+    }
+
+    /// Stop sequence matching — the matched string is returned as the
+    /// tuple's second element and the reason is `StopSequence`.
+    #[test]
+    fn test_infer_stop_reason_stop_sequence() {
+        use misanthropic::response::StopReason;
+        let blocks = vec![crate::Block::Text {
+            text: "hello STOP".into(),
+            cache_control: None,
+        }];
+        let stops = vec![std::borrow::Cow::Borrowed("STOP")];
+        let max = NonZeroUsize::new(128).unwrap();
+        let (reason, seq) =
+            infer_stop_reason(&blocks, "hello STOP", 3, max, Some(&stops));
+        assert_eq!(reason, Some(StopReason::StopSequence));
+        assert_eq!(seq.as_deref(), Some("STOP"));
+    }
+
+    /// Hitting `max_tokens` without a tool call and without a stop
+    /// match reports `MaxTokens`.
+    #[test]
+    fn test_infer_stop_reason_max_tokens() {
+        use misanthropic::response::StopReason;
+        let blocks = vec![crate::Block::Text {
+            text: "truncated".into(),
+            cache_control: None,
+        }];
+        let max = NonZeroUsize::new(16).unwrap();
+        let (reason, seq) =
+            infer_stop_reason(&blocks, "truncated", 16, max, None);
+        assert_eq!(reason, Some(StopReason::MaxTokens));
+        assert_eq!(seq, None);
+    }
+
+    /// Clean text-block finish with room to spare → `EndTurn`.
+    #[test]
+    fn test_infer_stop_reason_end_turn() {
+        use misanthropic::response::StopReason;
+        let blocks = vec![crate::Block::Text {
+            text: "done.".into(),
+            cache_control: None,
+        }];
+        let max = NonZeroUsize::new(64).unwrap();
+        let (reason, _) = infer_stop_reason(&blocks, "done.", 5, max, None);
+        assert_eq!(reason, Some(StopReason::EndTurn));
+    }
+
+    /// Default [`Usage`] is the all-zero shape [`Session`] starts
+    /// with. This guards against accidentally changing misanthropic's
+    /// `Usage: Default` convention out from under us.
+    #[test]
+    fn test_usage_default_is_zero() {
+        let u = Usage::default();
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.cache_creation_input_tokens, None);
+        assert_eq!(u.cache_read_input_tokens, None);
+    }
+
+    /// `make_usage` is the function both batch + streaming paths use
+    /// to stamp [`Usage`] values. It must always populate both cache
+    /// counters (even at zero) so `Usage::AddAssign` accumulates
+    /// them across calls instead of hitting the `None.or(Some(rhs))`
+    /// first-value edge case.
+    #[test]
+    fn test_make_usage_populates_cache_counters() {
+        let u = Session::make_usage(100, 42, 10);
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.cache_read_input_tokens, Some(42));
+        assert_eq!(u.cache_creation_input_tokens, Some(0));
+        assert_eq!(u.output_tokens, 10);
+    }
+
+    // -----------------------------------------------------------------
+    // Session builder tests — require a model to construct `Session`,
+    // so they live behind #[ignore] like every other session-level
+    // test in the crate.
+    // -----------------------------------------------------------------
+
+    fn model_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models/model.gguf")
+    }
+
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_with_prefix_cache_default_off() {
+        let session = Session::from_path(model_path()).unwrap().quiet();
+        assert!(
+            session.prefix_cache.is_none(),
+            "default Session must have prefix cache disabled",
+        );
+        let on = session.with_prefix_cache(true);
+        assert!(on.prefix_cache.is_some());
+    }
+
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_last_and_total_usage_zero_initially() {
+        let session = Session::from_path(model_path()).unwrap().quiet();
+        assert_eq!(session.last_usage(), &Usage::default());
+        assert_eq!(session.total_usage(), &Usage::default());
+    }
+
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_clear_prefix_cache_zeroes_state() {
+        let mut session = Session::from_path(model_path())
+            .unwrap()
+            .quiet()
+            .with_prefix_cache(true);
+        // Force some "used" state so we know clear actually zeros.
+        if let Some(cache) = session.prefix_cache.as_mut() {
+            cache.prev_tokens = vec![1, 2, 3];
+            cache.prev_breakpoints = vec![1, 2];
+            cache.last_reused_tokens = 2;
+        }
+        session.clear_prefix_cache();
+        let cache = session
+            .prefix_cache
+            .as_ref()
+            .expect("clear does not drop the cache, only zeros it");
+        assert!(cache.prev_tokens.is_empty());
+        assert!(cache.prev_breakpoints.is_empty());
+        assert_eq!(cache.last_reused_tokens, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end prefix-cache integration tests. All `#[ignore]` —
+    // require models/model.gguf and wall-clock time.
+    // -----------------------------------------------------------------
+
+    /// Build a [`Prompt`] with system + tools + one cached user
+    /// message, producing at least one cache breakpoint.
+    fn cached_prompt(user_msg: &'static str) -> Prompt {
+        use misanthropic::prompt::message::{
+            Block as MBlock, CacheControl, Content as MContent,
+        };
+        use std::borrow::Cow;
+        let user_block = MBlock::Text {
+            text: Cow::Borrowed(user_msg),
+            cache_control: Some(CacheControl::Ephemeral {
+                ttl: None,
+            }),
+        };
+        Prompt {
+            system: Some(MContent::SinglePart(Cow::Borrowed(
+                "You are a helpful assistant. Keep replies short.",
+            ))),
+            messages: vec![crate::Message {
+                role: crate::Role::User,
+                content: MContent::MultiPart(vec![user_block]),
+            }],
+            ..Prompt::default()
+        }
+    }
+
+    /// Two back-to-back [`Session::complete_response`] calls on the
+    /// exact same cached prompt must produce a cache hit on the
+    /// second call (`usage.cache_read_input_tokens > 0`).
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_cache_hit_on_identical_prompts() {
+        let mut session = Session::from_path(model_path())
+            .unwrap()
+            .quiet()
+            .with_prefix_cache(true)
+            .with_sampling(std::iter::empty());
+        let prompt = cached_prompt("Pick a number 1-10.");
+
+        let first = session.complete_response(&prompt).unwrap();
+        assert_eq!(
+            first.usage.cache_read_input_tokens,
+            Some(0),
+            "first call has nothing to read",
+        );
+
+        let second = session.complete_response(&prompt).unwrap();
+        let read = second.usage.cache_read_input_tokens.unwrap_or(0);
+        assert!(
+            read > 0,
+            "second identical call must hit the cache; got read={read}",
+        );
+    }
+
+    /// Two prompts with identical system + tools but diverging last
+    /// user messages: second call must reuse at least the
+    /// system-boundary worth of tokens.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_cache_hit_on_shared_system_diverging_last_message() {
+        let mut session = Session::from_path(model_path())
+            .unwrap()
+            .quiet()
+            .with_prefix_cache(true)
+            .with_sampling(std::iter::empty());
+
+        let first_prompt = cached_prompt("Say 'A'.");
+        let second_prompt = cached_prompt("Say 'B'.");
+
+        let _ = session.complete_response(&first_prompt).unwrap();
+        let second = session.complete_response(&second_prompt).unwrap();
+        let read = second.usage.cache_read_input_tokens.unwrap_or(0);
+        assert!(
+            read > 0,
+            "shared-system call must reuse the system boundary; got {read}",
+        );
+    }
+
+    /// Prompt with no `cache_control` markers: second call has
+    /// nothing to reuse, so `cache_read_input_tokens == 0`.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_cache_miss_no_breakpoints() {
+        use misanthropic::prompt::message::Content as MContent;
+        use std::borrow::Cow;
+        let mut session = Session::from_path(model_path())
+            .unwrap()
+            .quiet()
+            .with_prefix_cache(true)
+            .with_sampling(std::iter::empty());
+        let prompt = Prompt {
+            system: Some(MContent::SinglePart(Cow::Borrowed(
+                "You are a helpful assistant.",
+            ))),
+            messages: vec![crate::Message {
+                role: crate::Role::User,
+                content: MContent::SinglePart(Cow::Borrowed("Hello.")),
+            }],
+            ..Prompt::default()
+        };
+
+        let _ = session.complete_response(&prompt).unwrap();
+        let second = session.complete_response(&prompt).unwrap();
+        assert_eq!(
+            second.usage.cache_read_input_tokens,
+            Some(0),
+            "no breakpoints = no reuse",
+        );
+    }
+
+    /// [`Session::clear_prefix_cache`] must invalidate the cache so
+    /// the next call misses even if the prompt is identical to the
+    /// one that populated the cache.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_clear_invalidates_cache() {
+        let mut session = Session::from_path(model_path())
+            .unwrap()
+            .quiet()
+            .with_prefix_cache(true)
+            .with_sampling(std::iter::empty());
+        let prompt = cached_prompt("Count to 3.");
+
+        let _ = session.complete_response(&prompt).unwrap();
+        session.clear_prefix_cache();
+        let after = session.complete_response(&prompt).unwrap();
+        assert_eq!(
+            after.usage.cache_read_input_tokens,
+            Some(0),
+            "post-clear call must miss",
+        );
+    }
 }
