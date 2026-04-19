@@ -897,6 +897,13 @@ impl Session {
             blocks.extend(emitted);
         }
         blocks.extend(parser.finish());
+        // The parser emits one block per resolved prose chunk for
+        // streaming friendliness. For batch callers (complete_blocks /
+        // complete / complete_response), collapse adjacent same-kind
+        // prose so `[Text, Text, Text]` becomes `[Text]` — semantically
+        // identical, and lets the `FromIterator<Block>` path flatten
+        // single-Text outputs into Content::SinglePart.
+        let blocks = merge_adjacent_prose(blocks);
 
         // Cache + usage bookkeeping, then grammar-violation check.
         // Check last so a violation still records the work that was
@@ -1186,6 +1193,44 @@ struct CallOutcome {
 /// sequence) over mechanical ones (token limit) so tool-call-forced
 /// flows and caller-supplied stop strings are never mis-labeled as
 /// `MaxTokens`.
+/// Collapse runs of adjacent same-kind prose blocks. The streaming
+/// [`BlockParser`] emits one [`Block::Text`] per resolved prose chunk
+/// and one [`Block::Thought`] per tagged chunk for streaming
+/// friendliness; batch callers want those coalesced before the
+/// [`FromIterator<Block>`] flattening path decides
+/// [`Content::SinglePart`] vs [`Content::MultiPart`].
+///
+/// Tool-use and tool-result blocks are discrete units and pass through
+/// unchanged, as do any other non-prose variants.
+///
+/// [`Content::SinglePart`]: crate::Content::SinglePart
+/// [`Content::MultiPart`]: crate::Content::MultiPart
+fn merge_adjacent_prose(
+    blocks: Vec<crate::Block>,
+) -> Vec<crate::Block> {
+    use crate::Block;
+    use std::borrow::Cow;
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        match (out.last_mut(), block) {
+            (
+                Some(Block::Text { text: prev, .. }),
+                Block::Text { text: new, .. },
+            ) => {
+                *prev = Cow::Owned(format!("{prev}{new}"));
+            }
+            (
+                Some(Block::Thought { thought: prev, .. }),
+                Block::Thought { thought: new, .. },
+            ) => {
+                *prev = Cow::Owned(format!("{prev}{new}"));
+            }
+            (_, block) => out.push(block),
+        }
+    }
+    out
+}
+
 fn infer_stop_reason(
     blocks: &[crate::Block],
     raw_text: &str,

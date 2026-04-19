@@ -87,9 +87,10 @@ fn print_assistant(m: &AssistantMessage) {
         Content::MultiPart(blocks) => {
             for block in blocks {
                 if let Block::Text { text, .. } = block {
-                    println!("{text}");
+                    print!("{text}");
                 }
             }
+            println!();
         }
     }
 }
