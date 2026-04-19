@@ -45,6 +45,7 @@
 
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
+use llama_cpp_sys_3::llama_token;
 use minijinja::{value::Value as JinjaValue, Environment, Error as JinjaError};
 use serde::Serialize;
 
@@ -227,6 +228,63 @@ impl ChatTemplate {
             .map_err(ChatTemplateError::from_jinja)?;
         tmpl.render(ctx).map_err(ChatTemplateError::from_jinja)
     }
+
+    /// Render the prompt plus one partial render per `cache_control`
+    /// breakpoint.
+    ///
+    /// Use this when a caller — e.g. [`Session`] — needs to know where
+    /// in the tokenized output the caller's cache breakpoints land so a
+    /// later call can compute cache-reuse boundaries in tokens. See
+    /// [`RenderedWithBreakpoints`] for the returned shape.
+    ///
+    /// Partial renders force `add_generation_prompt = false` regardless
+    /// of what the caller set on `opts` — only the full render honors
+    /// the caller's preference. If `prompt` carries no cache markers,
+    /// the returned `partial_texts` is empty and the full render is
+    /// equivalent to [`render_with`](Self::render_with).
+    ///
+    /// [`Session`]: crate::Session
+    pub fn render_with_breakpoints(
+        &self,
+        prompt: &Prompt,
+        opts: &RenderOptions,
+    ) -> Result<RenderedWithBreakpoints, ChatTemplateError> {
+        let text = self.render_with(prompt, opts)?;
+        let breakpoints = collect_breakpoints(prompt);
+        let mut partial_texts = Vec::with_capacity(breakpoints.len());
+        for bp in breakpoints {
+            partial_texts.push(render_partial(self, prompt, opts, bp)?);
+        }
+        Ok(RenderedWithBreakpoints { text, partial_texts })
+    }
+}
+
+/// Rendered prompt plus one partial render per `cache_control`
+/// breakpoint.
+///
+/// Used by [`Session`] (Phase 3 of prompt caching) to compute which
+/// prefix of the new prompt's token stream matches a previously-cached
+/// state. Each partial is rendered with `add_generation_prompt=false`;
+/// each should tokenize to a strict prefix of [`text`](Self::text) for
+/// any well-behaved chat template.
+///
+/// `partial_texts` is ordered canonically by how much of the prompt is
+/// included: [`AfterTools`], then [`AfterSystem`], then
+/// [`AfterMessage(0)`], [`AfterMessage(1)`], … Only breakpoints that
+/// actually exist in the prompt appear.
+///
+/// [`Session`]: crate::Session
+/// [`AfterTools`]: Breakpoint::AfterTools
+/// [`AfterSystem`]: Breakpoint::AfterSystem
+/// [`AfterMessage(0)`]: Breakpoint::AfterMessage
+/// [`AfterMessage(1)`]: Breakpoint::AfterMessage
+#[derive(Clone, Debug)]
+pub struct RenderedWithBreakpoints {
+    /// Full render — equivalent to
+    /// [`ChatTemplate::render_with`]'s output.
+    pub text: String,
+    /// One partial render per breakpoint, in canonical order.
+    pub partial_texts: Vec<String>,
 }
 
 /// Options passed to [`ChatTemplate::render_with`].
@@ -280,6 +338,183 @@ impl RenderOptions {
         self.extras.push((key.into(), JinjaValue::from_serialize(&value)));
         self
     }
+}
+
+// ===========================================================================
+// Cache-breakpoint discovery
+// ===========================================================================
+
+/// A position in a [`Prompt`] where the caller placed a
+/// `cache_control` marker.
+///
+/// Ordered chronologically in the rendered output: [`AfterTools`] (if
+/// any tool is cached) comes before [`AfterSystem`] (if any system
+/// block is cached), which comes before [`AfterMessage(i)`], and
+/// later messages come after earlier ones. This matches the order
+/// of the partial-render truncations — each covers strictly more of
+/// the prompt than the previous — which is what gives us the
+/// tokens-are-a-prefix property downstream.
+///
+/// Which variant a particular template renders "first" in bytes is
+/// template-specific (Llama 3.1 renders tools inside the system
+/// header; cogito renders them between system and user). We don't
+/// care: we always truncate by prompt structure (tools, system,
+/// messages), and the partial is a prefix of the full if and only if
+/// the template is well-behaved. For templates where a coarse-
+/// grained tools-only render isn't a byte-prefix (because the tool
+/// list's closing `]` lands differently), we silently drop that
+/// breakpoint at tokenization time.
+///
+/// [`AfterTools`]: Breakpoint::AfterTools
+/// [`AfterSystem`]: Breakpoint::AfterSystem
+/// [`AfterMessage(i)`]: Breakpoint::AfterMessage
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Breakpoint {
+    /// After the tools section — any cache marker on any
+    /// [`tool::Method`](misanthropic::tool::Method) in
+    /// [`Prompt::functions`] produces this, regardless of which
+    /// specific method was marked. Coarse by design: per-tool
+    /// partial rendering would not produce a byte-prefix of the full
+    /// render (the closing `]` of the tools JSON array lands
+    /// differently).
+    AfterTools,
+    /// After the system section — any cache marker on any block in
+    /// [`Prompt::system`] produces this. Coarse by design for the
+    /// same reason as [`AfterTools`].
+    AfterSystem,
+    /// After message index `i`, inclusive. Emitted iff
+    /// `prompt.messages[i]`'s content has at least one block with
+    /// `cache_control` set (via [`Block::is_cached`]). This is the
+    /// fine-grained case that matters for the Agora reactor workload
+    /// — N agents sharing a system + tools + early messages,
+    /// diverging only in the last turn.
+    ///
+    /// [`Block::is_cached`]: misanthropic::prompt::message::Block::is_cached
+    AfterMessage(usize),
+}
+
+/// Walk `prompt` and return the ordered list of cache breakpoints it
+/// declares. See [`Breakpoint`] for the ordering rule and granularity.
+fn collect_breakpoints(prompt: &Prompt) -> Vec<Breakpoint> {
+    let mut out = Vec::new();
+
+    let tools_cached = prompt
+        .functions
+        .as_ref()
+        .is_some_and(|fns| fns.iter().any(|m| m.cache_control.is_some()));
+    if tools_cached {
+        out.push(Breakpoint::AfterTools);
+    }
+
+    let system_cached = prompt
+        .system
+        .as_ref()
+        .is_some_and(|c| content_has_cache(c));
+    if system_cached {
+        out.push(Breakpoint::AfterSystem);
+    }
+
+    for (i, m) in prompt.messages.iter().enumerate() {
+        if content_has_cache(&m.content) {
+            out.push(Breakpoint::AfterMessage(i));
+        }
+    }
+
+    out
+}
+
+/// Does any block inside `content` carry a `cache_control` marker?
+///
+/// [`Content::has_cache`] on misanthropic only reports `true` for
+/// [`Content::MultiPart`] — `SinglePart` has no per-block
+/// `cache_control` field to set, so this is equivalent. We spell it
+/// out locally to keep the intent obvious at the call site.
+///
+/// [`Content::has_cache`]: misanthropic::prompt::message::Content::has_cache
+/// [`Content::MultiPart`]: crate::Content::MultiPart
+fn content_has_cache(content: &Content) -> bool {
+    match content {
+        Content::SinglePart(_) => false,
+        Content::MultiPart(blocks) => blocks.iter().any(|b| b.is_cached()),
+    }
+}
+
+/// Render `prompt` truncated at `up_to` with
+/// `add_generation_prompt=false`. Used as the breakpoint-discovery
+/// partial render; does not mutate `prompt` (clones a truncated view).
+fn render_partial(
+    template: &ChatTemplate,
+    prompt: &Prompt,
+    opts: &RenderOptions,
+    up_to: Breakpoint,
+) -> Result<String, ChatTemplateError> {
+    let truncated = match up_to {
+        Breakpoint::AfterTools => Prompt {
+            functions: prompt.functions.clone(),
+            system: None,
+            messages: Vec::new(),
+            ..Prompt::default()
+        },
+        Breakpoint::AfterSystem => Prompt {
+            functions: prompt.functions.clone(),
+            system: prompt.system.clone(),
+            messages: Vec::new(),
+            ..Prompt::default()
+        },
+        Breakpoint::AfterMessage(i) => Prompt {
+            functions: prompt.functions.clone(),
+            system: prompt.system.clone(),
+            messages: prompt.messages[..=i].to_vec(),
+            ..Prompt::default()
+        },
+    };
+    let partial_opts = opts.clone().with_generation_prompt(false);
+    template.render_with(&truncated, &partial_opts)
+}
+
+/// Tokenize the full render and each partial in `rendered`, returning
+/// the full token stream plus the sorted, deduplicated breakpoint
+/// token indices.
+///
+/// Each partial's tokens MUST be a prefix of the full's tokens —
+/// that's what makes a breakpoint useful for KV-cache reuse. If a
+/// partial's tokens are not a prefix (unexpected template weirdness,
+/// e.g. a non-prefix-safe truncation point), the breakpoint is
+/// silently dropped from the returned indices. We fail open to
+/// uncached behavior for that call rather than erroring, so cache
+/// oddities degrade performance rather than correctness.
+///
+/// Tokenizes with `parse_special=true` so chat markers
+/// (`<|im_start|>`, `<|eot_id|>`, …) resolve to their single
+/// special-token IDs — the same convention [`Session::prepare_call`]
+/// uses.
+///
+/// Phase 3 (Session integration) will wire this in; external callers
+/// don't need it yet, hence `pub(crate)`.
+///
+/// [`Session::prepare_call`]: crate::Session
+pub(crate) fn tokenize_with_breakpoints(
+    model: &Model,
+    rendered: &RenderedWithBreakpoints,
+) -> (Vec<llama_token>, Vec<usize>) {
+    let full_tokens = model.tokenize(&rendered.text, true);
+    let mut indices: Vec<usize> =
+        Vec::with_capacity(rendered.partial_texts.len());
+    for partial in &rendered.partial_texts {
+        let partial_tokens = model.tokenize(partial, true);
+        if partial_tokens.len() <= full_tokens.len()
+            && full_tokens[..partial_tokens.len()] == partial_tokens[..]
+        {
+            indices.push(partial_tokens.len());
+        } else {
+            // Fail-open: drop the breakpoint. Logging is deliberately
+            // omitted — drama_llama doesn't wire a tracing crate, and
+            // a silent drop is the documented behavior.
+        }
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    (full_tokens, indices)
 }
 
 // ===========================================================================
@@ -1031,5 +1266,236 @@ mod tests {
         assert!(out.contains("\"name\":\"count_letters\""));
         assert!(out.contains("\"letter\""));
         assert!(out.contains("\"string\""));
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 2: cache_control breakpoint discovery + partial rendering
+    // ----------------------------------------------------------------
+
+    use misanthropic::prompt::message::CacheControl;
+    use serde_json::json;
+    use std::borrow::Cow;
+
+    /// A tool with no cache marker.
+    fn tool_plain(name: &'static str) -> Tool {
+        Tool {
+            name: Cow::Borrowed(name),
+            description: Cow::Borrowed("tool"),
+            schema: json!({"type": "object", "properties": {}}),
+            cache_control: None,
+        }
+    }
+
+    /// A tool marked with an ephemeral cache breakpoint.
+    fn tool_cached(name: &'static str) -> Tool {
+        Tool {
+            name: Cow::Borrowed(name),
+            description: Cow::Borrowed("tool"),
+            schema: json!({"type": "object", "properties": {}}),
+            cache_control: Some(CacheControl::ephemeral()),
+        }
+    }
+
+    /// Make a `Role::User` message whose content is a single Text
+    /// block with an ephemeral cache breakpoint attached.
+    fn cached_user_msg(text: &'static str) -> Message {
+        Message {
+            role: Role::User,
+            content: Content::MultiPart(vec![Block::Text {
+                text: Cow::Borrowed(text),
+                cache_control: Some(CacheControl::ephemeral()),
+            }]),
+        }
+    }
+
+    #[test]
+    fn test_collect_breakpoints_empty() {
+        let prompt = simple_prompt();
+        assert_eq!(collect_breakpoints(&prompt), Vec::<Breakpoint>::new());
+    }
+
+    #[test]
+    fn test_collect_breakpoints_tools_only() {
+        let prompt = Prompt {
+            functions: Some(vec![tool_cached("cached_tool")]),
+            ..Prompt::default()
+        };
+        assert_eq!(collect_breakpoints(&prompt), vec![Breakpoint::AfterTools]);
+    }
+
+    #[test]
+    fn test_collect_breakpoints_all_levels() {
+        // Tool marker + system marker + cache on messages[0] and
+        // messages[2]. messages[1] is uncached — verifies the emitted
+        // message indices match the actually-cached ones.
+        let system = Content::MultiPart(vec![Block::Text {
+            text: Cow::Borrowed("You are helpful."),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]);
+        let prompt = Prompt {
+            functions: Some(vec![tool_plain("a"), tool_cached("b")]),
+            system: Some(system),
+            messages: vec![
+                cached_user_msg("first"),
+                Message {
+                    role: Role::Assistant,
+                    content: Content::SinglePart(Cow::Borrowed("reply")),
+                },
+                cached_user_msg("third"),
+            ],
+            ..Prompt::default()
+        };
+        assert_eq!(
+            collect_breakpoints(&prompt),
+            vec![
+                Breakpoint::AfterTools,
+                Breakpoint::AfterSystem,
+                Breakpoint::AfterMessage(0),
+                Breakpoint::AfterMessage(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_render_partial_after_system() {
+        // Truncated prompt at AfterSystem should render with an empty
+        // messages list; the rendered bytes must match what
+        // `render_with` produces on the same prompt with messages
+        // cleared and `add_generation_prompt=false`.
+        let prompt = Prompt {
+            system: Some(Content::SinglePart(Cow::Borrowed("Sys."))),
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::SinglePart(Cow::Borrowed("q")),
+            }],
+            ..Prompt::default()
+        };
+        let opts =
+            RenderOptions::default().with_generation_prompt(true);
+        let partial =
+            render_partial(&tmpl(), &prompt, &opts, Breakpoint::AfterSystem)
+                .unwrap();
+
+        let reference = Prompt {
+            system: prompt.system.clone(),
+            messages: vec![],
+            ..Prompt::default()
+        };
+        let expected = tmpl()
+            .render_with(
+                &reference,
+                &RenderOptions::default().with_generation_prompt(false),
+            )
+            .unwrap();
+        assert_eq!(partial, expected);
+    }
+
+    #[test]
+    fn test_render_with_breakpoints_no_cache_control() {
+        let out = tmpl()
+            .render_with_breakpoints(
+                &simple_prompt(),
+                &RenderOptions::default().with_generation_prompt(true),
+            )
+            .unwrap();
+        assert!(out.partial_texts.is_empty());
+        assert!(out.text.starts_with("<|begin_of_text|>"));
+    }
+
+    #[test]
+    fn test_render_with_breakpoints_generation_prompt_forced_false() {
+        // Prompt with a mid-conversation cache breakpoint and the
+        // caller asking for add_generation_prompt=true. The full
+        // render must honor it; each partial must not.
+        let prompt = Prompt {
+            system: Some(Content::SinglePart(Cow::Borrowed("sys"))),
+            messages: vec![
+                cached_user_msg("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: Content::SinglePart(Cow::Borrowed("hello")),
+                },
+            ],
+            ..Prompt::default()
+        };
+        let out = tmpl()
+            .render_with_breakpoints(
+                &prompt,
+                &RenderOptions::default().with_generation_prompt(true),
+            )
+            .unwrap();
+        const GEN: &str =
+            "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        assert!(
+            out.text.ends_with(GEN),
+            "full render must end with generation prompt: {:?}",
+            out.text
+        );
+        assert_eq!(
+            out.partial_texts.len(),
+            1,
+            "one cache marker → one partial"
+        );
+        for (i, p) in out.partial_texts.iter().enumerate() {
+            assert!(
+                !p.ends_with(GEN),
+                "partial {i} must not end with generation prompt: {p:?}"
+            );
+        }
+    }
+
+    /// Model-backed round-trip: render a prompt with a mid-
+    /// conversation cache breakpoint, tokenize full + partial, and
+    /// assert the partial's tokens are a proper prefix of the full's
+    /// — i.e. the breakpoint index in the returned list equals the
+    /// partial's token length, and the full's first `idx` tokens
+    /// equal the partial's tokens.
+    #[test]
+    #[ignore = "requires model"]
+    fn test_tokenize_with_breakpoints_prefix_property() {
+        use crate::Engine;
+        use std::path::PathBuf;
+
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let engine = Engine::from_path(path).unwrap();
+        let t = ChatTemplate::from_model(&engine.model).unwrap();
+
+        let prompt = Prompt {
+            system: Some(Content::SinglePart(Cow::Borrowed(
+                "You are helpful.",
+            ))),
+            messages: vec![
+                cached_user_msg("Who am I?"),
+                Message {
+                    role: Role::Assistant,
+                    content: Content::SinglePart(Cow::Borrowed("A human.")),
+                },
+                Message {
+                    role: Role::User,
+                    content: Content::SinglePart(Cow::Borrowed(
+                        "What next?",
+                    )),
+                },
+            ],
+            ..Prompt::default()
+        };
+
+        let opts =
+            RenderOptions::default().with_generation_prompt(true);
+        let rendered = t.render_with_breakpoints(&prompt, &opts).unwrap();
+        assert_eq!(rendered.partial_texts.len(), 1);
+
+        let (full_tokens, indices) =
+            tokenize_with_breakpoints(&engine.model, &rendered);
+        assert_eq!(indices.len(), 1, "exactly one breakpoint expected");
+        let idx = indices[0];
+        assert!(idx <= full_tokens.len());
+
+        // The partial's tokens equal the full's tokens up to `idx`.
+        let partial_tokens =
+            engine.model.tokenize(&rendered.partial_texts[0], true);
+        assert_eq!(partial_tokens.len(), idx);
+        assert_eq!(&full_tokens[..idx], partial_tokens.as_slice());
     }
 }
