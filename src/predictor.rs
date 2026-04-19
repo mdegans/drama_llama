@@ -13,15 +13,15 @@ fn deserialize_regex_vec<'de, D>(
     deserializer: D,
 ) -> Result<Vec<regex::Regex>, D::Error>
 where
-    D: rocket::serde::Deserializer<'de>,
+    D: serde::Deserializer<'de>,
 {
-    use rocket::serde::de::Deserialize;
+    use serde::de::Deserialize;
 
     let strings = Vec::<String>::deserialize(deserializer)?;
     strings
         .into_iter()
         .map(|s| {
-            regex::Regex::new(&s).map_err(rocket::serde::de::Error::custom)
+            regex::Regex::new(&s).map_err(serde::de::Error::custom)
         })
         .collect()
 }
@@ -32,9 +32,9 @@ fn serialize_regex_vec<S>(
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
-    S: rocket::serde::Serializer,
+    S: serde::Serializer,
 {
-    use rocket::serde::ser::SerializeSeq;
+    use serde::ser::SerializeSeq;
 
     let mut seq = serializer.serialize_seq(Some(regexes.len()))?;
     for regex in regexes {
@@ -47,9 +47,8 @@ where
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 pub struct PredictOptions {
     /// Maximum number of tokens to predict.
     pub n: NonZeroUsize,
@@ -643,9 +642,8 @@ impl<'engine> Into<Vec<llama_token>> for PiecePredictor<'engine> {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 pub struct Predicted {
     pub token: llama_token,
     pub piece: String,

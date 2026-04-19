@@ -31,9 +31,8 @@ use crate::{model::token_to_piece_ref, Candidates, Model};
 /// `accepts_bytes` relies on cloning for speculative simulation.
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct JsonState {
     stack: Vec<Frame>,
@@ -355,9 +354,8 @@ impl JsonState {
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Debug, PartialEq)]
 enum Frame {
     Root {
@@ -377,9 +375,8 @@ enum Frame {
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum LitKind {
     True,
@@ -399,9 +396,8 @@ impl LitKind {
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ObjState {
     EmptyOrAwaitingKey,
@@ -413,9 +409,8 @@ enum ObjState {
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ArrState {
     EmptyOrAwaitingValue,
@@ -425,9 +420,8 @@ enum ArrState {
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum StringState {
     Normal,
@@ -438,9 +432,8 @@ enum StringState {
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum NumState {
     SeenMinus,
@@ -898,18 +891,18 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn serde_round_trip_idle() {
-        use rocket::serde::json::to_string;
+        use serde_json::to_string;
         let s = JsonState::new();
         let encoded = to_string(&s).unwrap();
         let decoded: JsonState =
-            rocket::serde::json::from_str(&encoded).unwrap();
+            serde_json::from_str(&encoded).unwrap();
         assert_eq!(s, decoded);
     }
 
     #[cfg(feature = "serde")]
     #[test]
     fn serde_round_trip_mid_parse() {
-        use rocket::serde::json::{from_str, to_string};
+        use serde_json::{from_str, to_string};
         let mut s = JsonState::new();
         feed_all(&mut s, "{\"a\":[1,2").unwrap();
         let encoded = to_string(&s).unwrap();
@@ -1031,8 +1024,8 @@ mod tests {
         let trimmed = output.trim_end_matches(eos_piece.as_str()).trim_end();
 
         // Must parse as valid JSON of any shape.
-        let parsed: rocket::serde::json::Value =
-            rocket::serde::json::from_str(trimmed).unwrap_or_else(|e| {
+        let parsed: serde_json::Value =
+            serde_json::from_str(trimmed).unwrap_or_else(|e| {
                 panic!(
                     "output must be valid JSON (constraint guarantees \
                          this). parse error: {e}\noutput: {output:?}\n\

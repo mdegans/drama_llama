@@ -22,9 +22,8 @@ static_assertions::assert_impl_all!(NGramNewError: Send, Sync);
 /// * The capacity of the Ngram is fixed to [`NGram::CAPACITY`].
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Ord)]
 #[repr(transparent)]
 pub struct NGram {
@@ -111,9 +110,8 @@ impl Index<usize> for NGram {
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 /// Metadata about an Ngram.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct NGramData {
@@ -183,9 +181,8 @@ impl NGramData {
 /// * The total number of [`NGram`]s that have been added.
 /// * The total number of tokens that have been added.
 /// * [`NGramData`] for each [`NGram`] including count, cum_prob, and weight.
-#[cfg_attr(feature = "serde", derive(rocket::serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 // TODO: Implement Deserialize
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Debug)]
 pub struct NGramStats {
     data: HashMap<NGram, NGramData>,

@@ -19,9 +19,8 @@ use super::DELETE_ICON;
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 /// Options for `apply_sample_repetition_penalties`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepetitionOptions {

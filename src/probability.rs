@@ -1,5 +1,5 @@
 #[cfg(feature = "serde")]
-use rocket::serde::Deserialize;
+use serde::Deserialize;
 use static_assertions::assert_impl_all;
 
 /// Error for invalid probability values.
@@ -68,21 +68,21 @@ where
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: rocket::serde::Deserializer<'de>,
+        D: serde::Deserializer<'de>,
     {
         let p = F::deserialize(deserializer)?;
-        Probability::from_f(p).map_err(|e| rocket::serde::de::Error::custom(e))
+        Probability::from_f(p).map_err(|e| serde::de::Error::custom(e))
     }
 }
 
 #[cfg(feature = "serde")]
-impl<F> rocket::serde::Serialize for Probability<F>
+impl<F> serde::Serialize for Probability<F>
 where
-    F: rocket::serde::Serialize,
+    F: serde::Serialize,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: rocket::serde::Serializer,
+        S: serde::Serializer,
     {
         self.p.serialize(serializer)
     }

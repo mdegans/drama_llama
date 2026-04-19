@@ -27,9 +27,9 @@ fn serialize_json_state<S>(
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
-    S: rocket::serde::Serializer,
+    S: serde::Serializer,
 {
-    use rocket::serde::Serialize;
+    use serde::Serialize;
     // If the mutex is poisoned, fall back to a fresh state. This keeps
     // serialization from panicking in degraded conditions; the cost is that
     // the serialized snapshot will be "fresh" instead of the actual state.
@@ -47,9 +47,9 @@ fn deserialize_json_state<'de, D>(
     deserializer: D,
 ) -> Result<Arc<Mutex<JsonState>>, D::Error>
 where
-    D: rocket::serde::Deserializer<'de>,
+    D: serde::Deserializer<'de>,
 {
-    use rocket::serde::Deserialize;
+    use serde::Deserialize;
     let state = JsonState::deserialize(deserializer)?;
     Ok(Arc::new(Mutex::new(state)))
 }
@@ -65,9 +65,9 @@ fn serialize_grammar<S>(
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
-    S: rocket::serde::Serializer,
+    S: serde::Serializer,
 {
-    use rocket::serde::Serialize;
+    use serde::Serialize;
     let source = match arc.lock() {
         Ok(guard) => guard.grammar().source().to_owned(),
         Err(poisoned) => poisoned.into_inner().grammar().source().to_owned(),
@@ -82,9 +82,9 @@ fn deserialize_grammar<'de, D>(
     deserializer: D,
 ) -> Result<Arc<Mutex<GrammarState>>, D::Error>
 where
-    D: rocket::serde::Deserializer<'de>,
+    D: serde::Deserializer<'de>,
 {
-    use rocket::serde::{de::Error, Deserialize};
+    use serde::{de::Error, Deserialize};
     let source = String::deserialize(deserializer)?;
     let grammar = Grammar::parse(&source).map_err(D::Error::custom)?;
     Ok(Arc::new(Mutex::new(GrammarState::new(Arc::new(grammar)))))
@@ -96,9 +96,8 @@ pub(crate) const DELETE_ICON: egui::ImageSource<'static> =
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 /// Options determining how raw logits are turned into a token. This is used by
 /// [`Candidates::sample_token`] and associated functions.
 #[derive(Clone, Debug, PartialEq)]
@@ -269,9 +268,8 @@ impl Default for SampleOptions {
 
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Debug)]
 // TODO: add `min_keep` and `mad_keep` to all the sampling modes since it's
 // doable and it would be nice to have a more consistent API.

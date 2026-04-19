@@ -1,7 +1,7 @@
 /// A simple tool to test the settings GUI. It can be used to generate a TOML
 /// representation of the settings but is mostly just a testbed for the GUI.
 use drama_llama::PredictOptions;
-use rocket::serde::Serialize;
+use serde::Serialize;
 
 #[derive(Clone, Copy, PartialEq, Default)]
 enum Mode {

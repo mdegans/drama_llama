@@ -46,8 +46,7 @@ image = { version = "0.25", optional = true, features = ["png"] }
 webchat = ["dep:rocket", "toml", "dep:dirs", "dep:markdown", "serde"]
 toml = ["dep:toml"]
 cli = ["dep:clap"]
-# we use rocket's serde support
-serde = ["dep:rocket", "tinyvec/serde"]
+serde = ["tinyvec/serde"]
 stats = ["dep:stringmetrics"]
 cuda = ["llama-cpp-sys-3/cuda"]
 cuda_f16 = ["llama-cpp-sys-3/cuda_f16"]

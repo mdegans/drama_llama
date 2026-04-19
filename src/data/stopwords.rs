@@ -6,9 +6,8 @@ use crate::Model;
 /// ignore certain tokens for the purposes of repetition detection, etc.
 #[cfg_attr(
     feature = "serde",
-    derive(rocket::serde::Deserialize, rocket::serde::Serialize)
+    derive(serde::Deserialize, serde::Serialize)
 )]
-#[cfg_attr(feature = "serde", serde(crate = "rocket::serde"))]
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub enum StopWords {
     // NOTE: If you add a new language here, add it to ALL and sort this list
