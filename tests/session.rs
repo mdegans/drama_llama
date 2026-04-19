@@ -341,10 +341,7 @@ fn complete_text_round_trips_through_parse_and_render() {
 
     let render_opts = RenderOptions::default()
         .with_generation_prompt(true)
-        .with_extra(
-            "enable_thinking",
-            drama_llama::minijinja::Value::from(true),
-        );
+        .with_extra("enable_thinking", true);
     let rendered_original = session
         .template()
         .render_with(&prompt, &render_opts)
@@ -355,10 +352,7 @@ fn complete_text_round_trips_through_parse_and_render() {
             &follow_up,
             &RenderOptions::default()
                 .with_generation_prompt(false)
-                .with_extra(
-                    "enable_thinking",
-                    drama_llama::minijinja::Value::from(true),
-                ),
+                .with_extra("enable_thinking", true),
         )
         .expect("render follow_up");
 

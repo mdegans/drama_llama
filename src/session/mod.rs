@@ -126,7 +126,7 @@ pub struct Session {
     engine: Engine,
     template: ChatTemplate,
     tool_choice_opts: ToolChoiceOptions,
-    render_opts: RenderOptions<'static>,
+    render_opts: RenderOptions,
     /// User's sampling chain WITHOUT any grammar. Grammar is prepended
     /// transiently inside `complete_*`. Defaults to
     /// `[SamplingMode::locally_typical()]`.
@@ -251,7 +251,7 @@ impl Session {
     /// Override the defaults used when rendering the prompt through the chat
     /// template. The generation-prompt flag is forced to `true` regardless —
     /// `Session` is always rendering for live inference, never archival.
-    pub fn with_render_opts(mut self, opts: RenderOptions<'static>) -> Self {
+    pub fn with_render_opts(mut self, opts: RenderOptions) -> Self {
         self.render_opts = opts.with_generation_prompt(true);
         self
     }
@@ -299,6 +299,57 @@ impl Session {
         &self.template
     }
 
+    /// Shared setup for every `complete_*` entry point: render the
+    /// prompt through the chat template, tokenize with
+    /// `parse_special=true` (so `<|im_start|>` etc. resolve to their
+    /// single special-token IDs), and build the effective sampling
+    /// chain — grammar from [`Prompt::tool_choice`] prepended,
+    /// optionally followed by [`Self::with_sampling`]'s user filters.
+    ///
+    /// `include_user_sampling = true` for production calls
+    /// ([`Self::complete_text`] / [`Self::complete_stream`]).
+    /// `include_user_sampling = false` for diagnostic calls
+    /// ([`Self::top_k_trace`]) that want the raw grammar-filtered
+    /// candidate distribution without user-filter shaping.
+    ///
+    /// Returns the token ids and the [`SamplingMode`] chain; callers
+    /// wire them into whatever predictor / `PredictOptions` shape they
+    /// need.
+    ///
+    /// [`Prompt::tool_choice`]: crate::Prompt
+    fn prepare_call(
+        &mut self,
+        prompt: &Prompt,
+        include_user_sampling: bool,
+    ) -> Result<
+        (Vec<llama_cpp_sys_3::llama_token>, Vec<SamplingMode>),
+        SessionError,
+    > {
+        let rendered = self.template.render_with(prompt, &self.render_opts)?;
+        // parse_special=true: the rendered prompt contains chat markers
+        // (`<|im_start|>`, `<|im_end|>`, etc.) that must tokenize to
+        // their single special-token IDs, not to the individual ASCII
+        // characters. Passing false causes `<|im_start|>` to tokenize
+        // as 6 tokens instead of 1, producing a completely different
+        // input for the model — diagnosed as the cause of cogito's
+        // wrong-letter + loop behavior in strawberry.
+        let tokens = self.engine.model.tokenize(&rendered, true);
+
+        // Grammar (if any) is prepended so it runs first and narrows
+        // candidates down to grammar-legal tokens before user filters
+        // further shape the distribution.
+        let grammar = grammar_for_prompt(prompt, &self.tool_choice_opts)?;
+        let modes: Vec<SamplingMode> = if include_user_sampling {
+            grammar
+                .into_iter()
+                .chain(self.sample_modes.iter().cloned())
+                .collect()
+        } else {
+            grammar.into_iter().collect()
+        };
+        Ok((tokens, modes))
+    }
+
     /// Debug escape hatch. Renders the prompt → tokenizes → runs the
     /// predictor → concatenates pieces into a `String`.
     ///
@@ -326,29 +377,11 @@ impl Session {
         &mut self,
         prompt: &Prompt,
     ) -> Result<String, SessionError> {
-        let rendered = self.template.render_with(prompt, &self.render_opts)?;
-
-        // parse_special=true: the rendered prompt contains chat markers
-        // (`<|im_start|>`, `<|im_end|>`, etc.) that must tokenize to their
-        // single special-token IDs, not to the individual ASCII characters.
-        // Passing false here causes `<|im_start|>` to tokenize as 6 tokens
-        // instead of 1, producing a completely different input for the model —
-        // diagnosed as the cause of cogito's wrong-letter + loop behavior in
-        // strawberry.
-        let tokens = self.engine.model.tokenize(&rendered, true);
+        let (tokens, modes) = self.prepare_call(prompt, true)?;
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.max_tokens;
-
-        // Build the effective sampling chain. Grammar (if any) is prepended so
-        // it runs first and narrows candidates down to grammar-legal tokens
-        // before user filters further shape the distribution.
-        let grammar = grammar_for_prompt(prompt, &self.tool_choice_opts)?;
-        let modes: Vec<SamplingMode> = grammar
-            .into_iter()
-            .chain(self.sample_modes.iter().cloned())
-            .collect();
         predict_opts.sample_options = SampleOptions {
             modes,
             repetition: self.repetition.clone(),
@@ -381,21 +414,13 @@ impl Session {
         &'s mut self,
         prompt: &Prompt,
     ) -> Result<BlockStream<'s>, SessionError> {
-        let rendered = self.template.render_with(prompt, &self.render_opts)?;
-        let grammar = grammar_for_prompt(prompt, &self.tool_choice_opts)?;
-        // parse_special=true — see `complete_text` for why this
-        // matters for chat-template input.
-        let tokens = self.engine.model.tokenize(&rendered, true);
+        let (tokens, modes) = self.prepare_call(prompt, true)?;
         let eos_piece =
             self.engine.model.token_to_piece(self.engine.model.eos());
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.max_tokens;
-        let modes: Vec<SamplingMode> = grammar
-            .into_iter()
-            .chain(self.sample_modes.iter().cloned())
-            .collect();
         predict_opts.sample_options = SampleOptions {
             modes,
             repetition: self.repetition.clone(),
@@ -479,11 +504,7 @@ impl Session {
         use crate::sample::grammar as grammar_mod;
         use crate::Sorted;
 
-        let rendered = self.template.render_with(prompt, &self.render_opts)?;
-        let tokens = self.engine.model.tokenize(&rendered, true);
-
-        let grammar = grammar_for_prompt(prompt, &self.tool_choice_opts)?;
-        let modes: Vec<SamplingMode> = grammar.into_iter().collect();
+        let (tokens, modes) = self.prepare_call(prompt, false)?;
 
         let k_nz = NonZeroUsize::new(k.max(1)).unwrap();
         let eos = self.engine.model.eos();

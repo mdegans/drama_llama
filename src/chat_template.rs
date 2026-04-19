@@ -46,6 +46,7 @@
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use minijinja::{value::Value as JinjaValue, Environment, Error as JinjaError};
+use serde::Serialize;
 
 use crate::{prompt::Tool, Block, Content, Model, Prompt, Role};
 
@@ -181,7 +182,7 @@ impl ChatTemplate {
     pub fn render_with(
         &self,
         prompt: &Prompt,
-        opts: &RenderOptions<'_>,
+        opts: &RenderOptions,
     ) -> Result<String, ChatTemplateError> {
         let messages = build_messages(prompt);
         let tools_value = match prompt.functions.as_ref() {
@@ -196,13 +197,9 @@ impl ChatTemplate {
         // the caller didn't supply one. The template unconditionally
         // concatenates `"Today Date: " + date_string + ...`, so passing
         // `none` would blow up with a string-plus-none type error.
-        let date_string = opts
-            .date_string
-            .as_deref()
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| {
-                format_strftime_subset("%d %b %Y", current_unix_secs())
-            });
+        let date_string = opts.date_string.clone().unwrap_or_else(|| {
+            format_strftime_subset("%d %b %Y", current_unix_secs())
+        });
         let base_ctx = minijinja::context! {
             bos_token => &self.bos_token,
             eos_token => &self.eos_token,
@@ -241,7 +238,7 @@ impl ChatTemplate {
 /// like Llama 3.1's `tools_in_user_message`, date overrides, or
 /// `builtin_tools` — goes through [`extras`](Self::extras).
 #[derive(Clone, Debug, Default)]
-pub struct RenderOptions<'a> {
+pub struct RenderOptions {
     /// Ask the template to append an empty assistant header so the model
     /// generates the next turn. True for live chat, false for
     /// tokenizing a stored transcript.
@@ -249,13 +246,13 @@ pub struct RenderOptions<'a> {
     /// Current date string (e.g. `"17 Apr 2026"`). Llama 3.1's template
     /// reads `date_string` when stamping a system-message header. If
     /// `None`, the template's default (static fallback) is used.
-    pub date_string: Option<Cow<'a, str>>,
+    pub date_string: Option<String>,
     /// Template-specific extra variables. Keys become top-level names in
     /// the Jinja context. Values are arbitrary Serialize-able data.
     pub extras: Vec<(String, JinjaValue)>,
 }
 
-impl<'a> RenderOptions<'a> {
+impl RenderOptions {
     /// Builder: set `add_generation_prompt`.
     pub fn with_generation_prompt(mut self, yes: bool) -> Self {
         self.add_generation_prompt = yes;
@@ -265,7 +262,7 @@ impl<'a> RenderOptions<'a> {
     /// Builder: set `date_string`.
     pub fn with_date<S>(mut self, date: S) -> Self
     where
-        S: Into<Cow<'a, str>>,
+        S: Into<String>,
     {
         self.date_string = Some(date.into());
         self
@@ -273,13 +270,14 @@ impl<'a> RenderOptions<'a> {
 
     /// Builder: add an arbitrary `(key, value)` pair to the Jinja
     /// context. Useful for `tools_in_user_message`, `builtin_tools`,
-    /// etc. Construct the value via
-    /// [`minijinja::Value::from_serialize`] or one of its constructors.
-    pub fn with_extra<K>(mut self, key: K, value: JinjaValue) -> Self
+    /// etc. Any [`serde::Serialize`] value works — numbers, strings,
+    /// booleans, structs, `serde_json::Value`, etc.
+    pub fn with_extra<K, V>(mut self, key: K, value: V) -> Self
     where
         K: Into<String>,
+        V: Serialize,
     {
-        self.extras.push((key.into(), value));
+        self.extras.push((key.into(), JinjaValue::from_serialize(&value)));
         self
     }
 }
@@ -943,7 +941,7 @@ mod tests {
         let opts = RenderOptions::default()
             .with_generation_prompt(true)
             .with_date("17 Apr 2026")
-            .with_extra("enable_thinking", JinjaValue::from(true));
+            .with_extra("enable_thinking", true);
         let out = tmpl.render_with(&prompt, &opts).unwrap();
         std::fs::write(&dest, &out)
             .unwrap_or_else(|e| panic!("write {dest:?}: {e}"));

@@ -27,8 +27,7 @@
 use std::{borrow::Cow, path::PathBuf};
 
 use drama_llama::{
-    minijinja::Value as JinjaValue, ChatTemplate, Content, Message, Prompt,
-    RenderOptions, Role, Tool,
+    ChatTemplate, Content, Message, Prompt, RenderOptions, Role, Tool,
 };
 use serde_json::json;
 
@@ -95,7 +94,7 @@ fn shape_03_strawberry_turn_1_matches_fixture() {
     let opts = RenderOptions::default()
         .with_generation_prompt(true)
         .with_date("17 Apr 2026")
-        .with_extra("enable_thinking", JinjaValue::from(true));
+        .with_extra("enable_thinking", true);
 
     let actual = load_template().render_with(&prompt, &opts).expect("render");
     let expected = load_expected("03_strawberry_turn_1");
@@ -171,7 +170,7 @@ fn shape_04_strawberry_turn_2_matches_fixture() {
     let opts = RenderOptions::default()
         .with_generation_prompt(true)
         .with_date("17 Apr 2026")
-        .with_extra("enable_thinking", JinjaValue::from(true));
+        .with_extra("enable_thinking", true);
 
     let actual = load_template().render_with(&prompt, &opts).expect("render");
     let expected = load_expected("04_strawberry_turn_2");

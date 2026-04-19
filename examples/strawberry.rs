@@ -31,7 +31,6 @@ use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
 
 use clap::Parser;
 use drama_llama::{
-    minijinja::Value as JinjaValue,
     prompt::{ToolResult, ToolUse},
     Block, Content, FlashAttention, Prompt, RenderOptions, Role, SamplingMode,
     Session, Tool, ToolChoice, ToolChoiceOptions,
@@ -200,7 +199,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // with `allow_thought` on the grammar side.
             RenderOptions::default()
                 .with_generation_prompt(true)
-                .with_extra("enable_thinking", JinjaValue::from(true)),
+                .with_extra("enable_thinking", true),
         )
         .with_max_tokens(NonZeroUsize::new(256).unwrap());
 
@@ -225,7 +224,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &prompt,
                 &RenderOptions::default()
                     .with_generation_prompt(true)
-                    .with_extra("enable_thinking", JinjaValue::from(true)),
+                    .with_extra("enable_thinking", true),
             )
             .expect("render turn1");
         std::fs::write(&path, &rendered)?;
