@@ -275,6 +275,12 @@ pub struct CandidatePredictor<'engine> {
     pub n_decode: usize,
     /// The number of tokens to generate
     pub n: NonZeroUsize,
+    /// When `Some`, logits for the first yielded candidates have already
+    /// been computed by an out-of-band prefill (see
+    /// [`Engine::prefill`] / [`CandidatePredictor::new_resuming`]). The
+    /// stored index is passed to [`Engine::logits`] on the first
+    /// `next()` call, and no decode is performed for that step.
+    first_logits_idx: Option<usize>,
 }
 
 impl<'engine> CandidatePredictor<'engine> {
@@ -311,6 +317,57 @@ impl<'engine> CandidatePredictor<'engine> {
             n_cur,
             n_decode: 0,
             n,
+            first_logits_idx: None,
+        }
+    }
+
+    /// Create a `CandidatePredictor` that resumes generation from a KV
+    /// cache already populated by [`Engine::prefill`].
+    ///
+    /// Unlike [`Self::new`], this does **not** build a prompt batch or
+    /// decode the tokens — the caller is expected to have just called
+    /// `engine.prefill(suffix, start_pos, seq_id)` where
+    /// `suffix.len() == suffix_len` and
+    /// `start_pos + suffix_len == tokens.len()`. The first `next()`
+    /// yields candidates read directly from the prefill's logits (index
+    /// `suffix_len - 1`); subsequent steps follow the usual decode-loop.
+    ///
+    /// `tokens` should be the full token sequence (prefix + suffix) so
+    /// stop-sequence, repetition, and n-gram bookkeeping upstream see
+    /// the same context the model saw.
+    ///
+    /// # Panics
+    /// * If `suffix_len` is zero.
+    /// * If `n_cur_after_prefill > engine.n_ctx()`.
+    pub fn new_resuming(
+        engine: &'engine mut Engine,
+        tokens: Vec<llama_token>,
+        n_cur_after_prefill: usize,
+        suffix_len: usize,
+        n: NonZeroUsize,
+    ) -> Self {
+        assert!(
+            suffix_len > 0,
+            "new_resuming requires a non-empty prefill suffix",
+        );
+
+        // Batch here holds only tokens sampled after generation starts
+        // (record_choice appends 1 per step). We still size capacity to
+        // cover the maximum position we might write, because
+        // `Batch::add_token` rejects `pos >= capacity`.
+        let batch_capacity = (n.get() + n_cur_after_prefill)
+            .min(engine.n_ctx() as usize);
+        let batch = Batch::new(batch_capacity, 0, 1)
+            .expect("resuming batch allocation failed");
+
+        Self {
+            tokens,
+            engine,
+            batch,
+            n_cur: n_cur_after_prefill,
+            n_decode: 0,
+            n,
+            first_logits_idx: Some(suffix_len - 1),
         }
     }
 
@@ -337,6 +394,16 @@ impl<'engine> Iterator for CandidatePredictor<'engine> {
             || self.n_cur >= self.engine.n_ctx() as usize
         {
             return None;
+        }
+
+        // Resuming path: logits for the first step were computed by an
+        // earlier `Engine::prefill` call. Read them directly instead of
+        // decoding the (empty) batch.
+        if let Some(idx) = self.first_logits_idx.take() {
+            let logits = self.engine.logits(idx);
+            let candidates = Candidates::from_logits(logits.iter().cloned());
+            self.n_decode += 1;
+            return Some(candidates);
         }
 
         let batch = &mut self.batch;
@@ -388,8 +455,64 @@ impl<'engine> TokenPredictor<'engine> {
     pub fn new(
         engine: &'engine mut Engine,
         tokens: Vec<llama_token>,
-        mut options: PredictOptions,
+        options: PredictOptions,
     ) -> Self {
+        let (rng, ngram_stats, options, max_stop_len) =
+            Self::prepare(engine, &tokens, options);
+        let inner = CandidatePredictor::new(engine, tokens, options.n);
+        Self {
+            rng,
+            ngram_stats,
+            options,
+            text: String::new(),
+            max_stop_len,
+            mu: None,
+            inner,
+        }
+    }
+
+    /// Create a `TokenPredictor` that resumes generation from a KV cache
+    /// already populated by [`Engine::prefill`].
+    ///
+    /// See [`CandidatePredictor::new_resuming`] for KV-state semantics.
+    /// `tokens` is the full sequence (prefix + suffix); `suffix_len` is
+    /// the number of tokens just prefilled; `n_cur_after_prefill` is
+    /// `start_pos + suffix_len`.
+    pub fn new_resuming(
+        engine: &'engine mut Engine,
+        tokens: Vec<llama_token>,
+        n_cur_after_prefill: usize,
+        suffix_len: usize,
+        options: PredictOptions,
+    ) -> Self {
+        let (rng, ngram_stats, options, max_stop_len) =
+            Self::prepare(engine, &tokens, options);
+        let inner = CandidatePredictor::new_resuming(
+            engine,
+            tokens,
+            n_cur_after_prefill,
+            suffix_len,
+            options.n,
+        );
+        Self {
+            rng,
+            ngram_stats,
+            options,
+            text: String::new(),
+            max_stop_len,
+            mu: None,
+            inner,
+        }
+    }
+
+    /// Shared setup for [`Self::new`] and [`Self::new_resuming`]: seed
+    /// normalization, RNG construction, n-gram stats seeding, and the
+    /// max stop-sequence length.
+    fn prepare(
+        engine: &Engine,
+        tokens: &[llama_token],
+        mut options: PredictOptions,
+    ) -> (Xoroshiro128, NGramStats, PredictOptions, usize) {
         // convert seed from a u128 to [u64; 2] to seed the rng
         let seed = match options.seed {
             Some(seed) => seed,
@@ -445,16 +568,7 @@ impl<'engine> TokenPredictor<'engine> {
             .max()
             .unwrap_or(0);
 
-        let inner = CandidatePredictor::new(engine, tokens, options.n);
-        Self {
-            rng: Xoroshiro128::from_seed(&seed),
-            ngram_stats,
-            options,
-            text: String::new(),
-            max_stop_len,
-            mu: None,
-            inner,
-        }
+        (Xoroshiro128::from_seed(&seed), ngram_stats, options, max_stop_len)
     }
 }
 
@@ -532,6 +646,30 @@ impl<'engine> PiecePredictor<'engine> {
         options: PredictOptions,
     ) -> Self {
         let token_predictor = TokenPredictor::new(engine, tokens, options);
+
+        Self {
+            inner: token_predictor,
+        }
+    }
+
+    /// Create a `PiecePredictor` that resumes generation from a KV
+    /// cache already populated by [`Engine::prefill`].
+    ///
+    /// See [`CandidatePredictor::new_resuming`] for KV-state semantics.
+    pub fn new_resuming(
+        engine: &'engine mut Engine,
+        tokens: Vec<llama_token>,
+        n_cur_after_prefill: usize,
+        suffix_len: usize,
+        options: PredictOptions,
+    ) -> Self {
+        let token_predictor = TokenPredictor::new_resuming(
+            engine,
+            tokens,
+            n_cur_after_prefill,
+            suffix_len,
+            options,
+        );
 
         Self {
             inner: token_predictor,

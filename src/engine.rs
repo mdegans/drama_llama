@@ -432,6 +432,50 @@ impl Engine {
         }
     }
 
+    /// Decode `tokens` into the KV cache at positions
+    /// `[start_pos, start_pos + tokens.len())` for `seq_id`.
+    ///
+    /// This is a resumable prefill primitive: it does **not** clear the KV
+    /// cache. The caller owns the KV state and must guarantee those
+    /// positions are free for `seq_id` (typically by having just
+    /// established a common prefix of length `start_pos`, or by calling
+    /// [`Engine::memory_seq_rm`] / [`Engine::memory_clear`] first).
+    ///
+    /// Only the final token has logits enabled — this matches the
+    /// bulk-prefill done by `predict_*` before sampling starts, so the
+    /// next sampling step can read logits from index `tokens.len() - 1`.
+    ///
+    /// Returns `Ok(())` on success or the same errors as
+    /// [`Engine::decode`]. An empty `tokens` slice is a no-op.
+    pub fn prefill(
+        &self,
+        tokens: &[llama_token],
+        start_pos: usize,
+        seq_id: llama_seq_id,
+    ) -> Result<(), DecodeError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+
+        // `Batch::add_token` rejects `pos >= capacity`, so size capacity
+        // to cover the highest position we'll write. A bit wasteful when
+        // `start_pos` is large — flagged for possible Phase 1.5 cleanup
+        // in the Batch layer.
+        let capacity = start_pos + tokens.len();
+        let mut batch = Batch::new(capacity, 0, 1)
+            .expect("prefill batch allocation failed");
+
+        let seq_ids = [seq_id];
+        let last = tokens.len() - 1;
+        for (i, &token) in tokens.iter().enumerate() {
+            batch
+                .add_token(token, start_pos + i, Some(&seq_ids), i == last)
+                .expect("prefill add_token failed (should be unreachable)");
+        }
+
+        self.decode(&batch)
+    }
+
     /// Set the number of threads used for generation and batch processing.
     pub fn set_n_threads(&mut self, n_gen: i32, n_batch: i32) {
         unsafe { llama_set_n_threads(self.context, n_gen, n_batch) }
@@ -569,6 +613,94 @@ impl Engine {
         self.memory_clear();
         Predictor::new(self, tokens, options)
     }
+
+    /// Resume candidate prediction from a KV cache the caller has
+    /// already populated for positions `[0, start_pos)` on `seq_id`.
+    ///
+    /// `tokens` is the **suffix**: it's decoded into the KV at
+    /// `[start_pos, start_pos + tokens.len())` via [`Engine::prefill`],
+    /// then candidate yielding begins from the last prefilled position.
+    /// The KV cache is **not** cleared; the caller owns prefix
+    /// placement.
+    ///
+    /// # Panics
+    /// * If `tokens` is empty — there's nothing to resume from.
+    pub fn predict_candidates_resuming<'a>(
+        &'a mut self,
+        tokens: Vec<llama_token>,
+        start_pos: usize,
+        seq_id: llama_seq_id,
+        n: NonZeroUsize,
+    ) -> CandidatePredictor<'a> {
+        assert!(
+            !tokens.is_empty(),
+            "predict_candidates_resuming requires non-empty tokens",
+        );
+        self.prefill(&tokens, start_pos, seq_id)
+            .expect("prefill failed in predict_candidates_resuming");
+        let suffix_len = tokens.len();
+        let n_cur = start_pos + suffix_len;
+        CandidatePredictor::new_resuming(self, tokens, n_cur, suffix_len, n)
+    }
+
+    /// Resume token prediction from a KV cache the caller has already
+    /// populated for positions `[0, start_pos)` on `seq_id`.
+    ///
+    /// See [`Engine::predict_candidates_resuming`] for KV-state
+    /// semantics.
+    ///
+    /// # Panics
+    /// * If `tokens` is empty — there's nothing to resume from.
+    pub fn predict_tokens_resuming<'a>(
+        &'a mut self,
+        tokens: Vec<llama_token>,
+        start_pos: usize,
+        seq_id: llama_seq_id,
+        options: PredictOptions,
+    ) -> TokenPredictor<'a> {
+        assert!(
+            !tokens.is_empty(),
+            "predict_tokens_resuming requires non-empty tokens",
+        );
+        self.prefill(&tokens, start_pos, seq_id)
+            .expect("prefill failed in predict_tokens_resuming");
+        let suffix_len = tokens.len();
+        let n_cur = start_pos + suffix_len;
+        TokenPredictor::new_resuming(self, tokens, n_cur, suffix_len, options)
+    }
+
+    /// Resume piece prediction from a KV cache the caller has already
+    /// populated for positions `[0, start_pos)` on `seq_id`.
+    ///
+    /// `tokens` is the **suffix**: it's decoded into the KV at
+    /// `[start_pos, start_pos + tokens.len())` via [`Engine::prefill`],
+    /// then piece yielding begins from the last prefilled position. The
+    /// KV cache is **not** cleared; the caller owns prefix placement.
+    ///
+    /// With greedy sampling, the emitted stream equals
+    /// [`Engine::predict_pieces`]'s output on the concatenation of the
+    /// already-decoded prefix and `tokens` (see the
+    /// `test_predict_pieces_resuming_matches` integration test).
+    ///
+    /// # Panics
+    /// * If `tokens` is empty — there's nothing to resume from.
+    pub fn predict_pieces_resuming<'a>(
+        &'a mut self,
+        tokens: Vec<llama_token>,
+        start_pos: usize,
+        seq_id: llama_seq_id,
+        options: PredictOptions,
+    ) -> PiecePredictor<'a> {
+        assert!(
+            !tokens.is_empty(),
+            "predict_pieces_resuming requires non-empty tokens",
+        );
+        self.prefill(&tokens, start_pos, seq_id)
+            .expect("prefill failed in predict_pieces_resuming");
+        let suffix_len = tokens.len();
+        let n_cur = start_pos + suffix_len;
+        PiecePredictor::new_resuming(self, tokens, n_cur, suffix_len, options)
+    }
 }
 
 impl Drop for Engine {
@@ -612,5 +744,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    /// The resuming prediction path (prefill + `predict_pieces_resuming`)
+    /// must produce the same token stream as the fresh path
+    /// (`predict_pieces`) under greedy sampling. Any deviation means
+    /// the KV cache was not correctly populated by `prefill`, or that
+    /// `CandidatePredictor::new_resuming` read from the wrong logits
+    /// index.
+    fn test_predict_pieces_resuming_matches() {
+        use std::path::PathBuf;
+        const PROMPT: &str = "The quick brown fox jumps over the lazy dog.";
+        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models/model.gguf");
+
+        // --- A: fresh path ---
+        let mut engine_a = Engine::from_path(model_path.clone()).unwrap();
+        let tokens_a = engine_a.model.tokenize(PROMPT, true);
+        assert!(tokens_a.len() >= 4, "prompt tokenization too short");
+        let k = tokens_a.len() / 2;
+
+        let mut opts =
+            crate::PredictOptions::greedy().add_stop(".".to_owned());
+        opts.n = std::num::NonZeroUsize::new(16).unwrap();
+
+        let fresh: Vec<String> =
+            engine_a.predict_pieces(tokens_a.clone(), opts.clone()).collect();
+
+        drop(engine_a);
+
+        // --- B: resuming path on a fresh engine ---
+        let mut engine_b = Engine::from_path(model_path).unwrap();
+        let tokens_b = engine_b.model.tokenize(PROMPT, true);
+        assert_eq!(tokens_a, tokens_b, "tokenization drift between engines");
+
+        let (prefix, suffix) = tokens_b.split_at(k);
+
+        // Prime the KV cache with the prefix (no logits needed — we
+        // only want KV state here). `prefill` places `prefix` at
+        // positions `[0, k)` on seq 0, with logits enabled on the last
+        // prefix token only. That's fine — we discard those logits and
+        // immediately overwrite them via the second prefill inside
+        // `predict_pieces_resuming`.
+        engine_b.memory_clear();
+        engine_b
+            .prefill(prefix, 0, 0)
+            .expect("priming prefill failed");
+
+        let resumed: Vec<String> = engine_b
+            .predict_pieces_resuming(suffix.to_vec(), k, 0, opts)
+            .collect();
+
+        assert_eq!(
+            fresh, resumed,
+            "resuming path diverged from fresh path under greedy sampling",
+        );
     }
 }
