@@ -5,7 +5,7 @@
 
 use crate::{
     candidates::Sorted,
-    data::stopwords::StopWords,
+    data::{ignore_category::IgnoreCategory, StopWords},
     ngram::{NGram, NGramStats},
     Candidates,
 };
@@ -21,9 +21,9 @@ use super::DELETE_ICON;
 /// Options for `apply_sample_repetition_penalties`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepetitionOptions {
-    /// Stopwords to ignore, by language. These are never penalized.
+    /// Sets of tokens to ignore, by language. These are never penalized.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub(crate) ignored_stopwords: Vec<StopWords>,
+    pub(crate) ignored_categories: Vec<IgnoreCategory>,
     /// [`NGram`]s to ignore. These are never penalized.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) ignored: Vec<NGram>,
@@ -78,7 +78,7 @@ pub struct RepetitionOptions {
 impl Default for RepetitionOptions {
     fn default() -> Self {
         Self {
-            ignored_stopwords: vec![],
+            ignored_categories: vec![],
             ignored: vec![],
             penalty_max_count: NonZeroU8::new(1).unwrap(),
             ngram_min_size: NonZeroU8::new(1).unwrap(),
@@ -92,26 +92,53 @@ impl Default for RepetitionOptions {
 }
 
 impl RepetitionOptions {
-    /// Stopwords to ignore (by language). These are never penalized.
-    pub fn ignored_stopwords(&self) -> &[StopWords] {
-        &self.ignored_stopwords
+    /// [`IgnoreCategory`]s of tokens. These are never penalized.
+    pub fn ignored_categories(&self) -> &[IgnoreCategory] {
+        &self.ignored_categories
     }
 
-    /// Set the stopwords to ignore. These are never penalized.
-    pub fn set_ignored_stopwords(
+    /// Use [`RepetitionOptions::ignored_categories`] instead
+    #[allow(deprecated)]
+    #[deprecated]
+    pub fn ignored_stopwords(&self) -> &[StopWords] {
+        self.ignored_categories()
+    }
+
+    /// Set [`IgnoreCategory`]s to ignore. These are never penalized.
+    pub fn set_ignored_categories(
         mut self,
-        ignored_stopwords: Vec<StopWords>,
+        ignored_categories: Vec<IgnoreCategory>,
     ) -> Self {
-        self.ignored_stopwords = ignored_stopwords;
+        self.ignored_categories = ignored_categories;
         self
     }
 
-    /// Extend the list of ignored stopwords.
-    pub fn extend_ignored_stopwords<It>(&mut self, ignored_stopwords: It)
+    /// Use [`RepetitionOptions::set_ignored_categories`] instead
+    #[allow(deprecated)]
+    #[deprecated]
+    pub fn set_ignored_stopwords(
+        self,
+        ignored_stopwords: Vec<StopWords>,
+    ) -> Self {
+        self.set_ignored_categories(ignored_stopwords)
+    }
+
+    /// Extend the list of [`IgnoreCategory`]
+    pub fn extend_ignored_categories<It>(&mut self, ignored_categories: It)
+    where
+        It: IntoIterator<Item = IgnoreCategory>,
+    {
+        self.ignored_categories.extend(ignored_categories);
+    }
+
+    /// Use [`RepetitionOptions::extend_ignored_categories`] instead
+    #[allow(deprecated)]
+    #[deprecated]
+    pub fn extend_stopwords<It>(&mut self, stopwords: It)
     where
         It: IntoIterator<Item = StopWords>,
     {
-        self.ignored_stopwords.extend(ignored_stopwords);
+        self.ignored_categories.extend(stopwords);
     }
 
     /// Tokens to ignore. These tokens are never penalized.
@@ -179,14 +206,14 @@ impl RepetitionOptions {
         self.ignored.sort();
     }
 
-    /// Ignore [`StopWords`]. This should not be confused with stop sequences.
-    /// These are commonly used words that are often ignored in text generation.
-    pub fn ignore_stopwords(
+    /// Ignore [`IgnoreCategory`]s. These are commonly used tokens that are
+    /// often ignored in text generation.
+    pub fn ignore_categories(
         mut self,
-        stopwords: StopWords,
+        ignore_categories: IgnoreCategory,
         model: &crate::Model,
     ) -> Self {
-        self.extend_ignored(stopwords.into_tokens(model));
+        self.extend_ignored(ignore_categories.into_tokens(model));
         self
     }
 
@@ -228,18 +255,18 @@ impl RepetitionOptions {
         // FIXME: for internationalization, we should put all the strings in a
         // separate file and use gettext or similar. There may be something
         // better from the Rust ecosystem, but I'm not aware of it.
-        const STOPWORD_HELP: &str = "Stopwords are common words that are often ignored in NLP tasks. They shouldn't be confused with stop sequences, which are used to terminate generation. These options allow you to ignore stopwords for the purpose of penalizing repetition. The idea is to allow a higher repetition penalty without penalizing common words. This is experimental.";
+        const IGNORE_CATEGORY_HELP: &str = "Common tokens that are often ignored in NLP tasks. These options allow you to ignore sets of tokens for the purpose of penalizing repetition. The idea is to allow a higher repetition penalty without penalizing common words. This is experimental.";
 
-        // Ignored Stopwords
-        if !self.ignored_stopwords.is_empty() {
-            ui.label("Stopwords ignored for:")
-                .on_hover_text_at_pointer(STOPWORD_HELP);
+        // IgnoreCategories
+        if !self.ignored_categories.is_empty() {
+            ui.label("Token categories ignored for:")
+                .on_hover_text_at_pointer(IGNORE_CATEGORY_HELP);
             let mut to_remove = None;
-            for (i, language) in self.ignored_stopwords.iter().enumerate() {
+            for (i, language) in self.ignored_categories.iter().enumerate() {
                 ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::image(DELETE_ICON))
-                        .on_hover_text_at_pointer("Remove this language from the list of ignored stopwords.")
+                        .on_hover_text_at_pointer("Remove this language from the list of ignored token sets.")
                         .clicked() {
                         to_remove = Some(i);
                     };
@@ -247,27 +274,27 @@ impl RepetitionOptions {
                 });
             }
             if let Some(i) = to_remove {
-                self.ignored_stopwords.remove(i);
+                self.ignored_categories.remove(i);
             }
         }
-        if self.ignored_stopwords.len() < StopWords::ALL.len() {
-            egui::ComboBox::from_label("to ignore stopwords for")
+        if self.ignored_categories.len() < IgnoreCategory::ALL.len() {
+            egui::ComboBox::from_label("to ignore token categories for")
                 .selected_text("Select a language...")
                 .show_ui(ui, |ui| {
-                    for language in StopWords::ALL {
-                        if !self.ignored_stopwords.contains(&language) {
+                    for language in IgnoreCategory::ALL {
+                        if !self.ignored_categories.contains(&language) {
                             if ui
                                 .selectable_label(false, language.as_str())
                                 .clicked()
                             {
-                                self.ignored_stopwords.push(language);
-                                self.ignored_stopwords.sort();
+                                self.ignored_categories.push(language);
+                                self.ignored_categories.sort();
                             }
                         }
                     }
                 })
                 .response
-                .on_hover_text_at_pointer(STOPWORD_HELP);
+                .on_hover_text_at_pointer(IGNORE_CATEGORY_HELP);
         }
 
         // Ignored ngrams
@@ -485,7 +512,7 @@ pub fn apply_sample_repetition_ngram(
     let mut candidates = candidates.sort(Sorted::ById { k });
 
     let RepetitionOptions {
-        ignored_stopwords,
+        ignored_categories,
         ignored,
         ngram_max_size,
         ngram_min_size,
@@ -496,10 +523,10 @@ pub fn apply_sample_repetition_ngram(
         surgical,
     } = opts;
 
-    // Add ignored stopwords to the ignored ngrams if they are not already
-    // there.
-    while let Some(stopwords) = ignored_stopwords.pop() {
-        let newly_ignored = stopwords.into_tokens(model);
+    // Add ignored categories of tokens to the ignored ngrams if they are not
+    // already there.
+    while let Some(cats) = ignored_categories.pop() {
+        let newly_ignored = cats.into_tokens(model);
         ignored.sort();
         for token in newly_ignored {
             let ngram = NGram::from(token);
@@ -550,9 +577,9 @@ pub fn apply_sample_repetition_ngram(
         //   tokens end in [The]        -> k=1, penalize "New"  (prevent continuation)
         //   tokens end in [The, New]   -> k=2, penalize "York" (prevent completion)
         //
-        // Stopwords are case-sensitive via tokenization: lowercase "the" is in
-        // the ignored set, uppercase "The" is not — so proper-noun phrases get
-        // blocked at their entry point.
+        // TokenCategory are case-sensitive via tokenization: lowercase "the" is
+        // in the ignored set, uppercase "The" is not — so proper-noun phrases
+        // get blocked at their entry point.
         for (ngram, data) in freq_map.iter() {
             if ngram_is_ignored(*ngram, &ignored) {
                 continue;

@@ -2,29 +2,33 @@ use llama_cpp_sys_3::llama_token;
 
 use crate::Model;
 
-/// A list of very common words for various languages. These can be used to
-/// ignore certain tokens for the purposes of repetition detection, etc.
+/// Common sequences to ignore (for repetition penalty, etc.)
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
-pub enum StopWords {
+pub enum IgnoreCategory {
     // NOTE: If you add a new language here, add it to ALL and sort this list
     // and ALL in alphabetical order.
     // TODO: static assert all this.
+    /// English stopwords (very common words that should not be penalized)
     English,
 }
 
-impl StopWords {
-    pub const ALL: [StopWords; 1] = [StopWords::English];
+/// Use [`IgnoreCategory`] instead
+#[deprecated]
+pub type StopWords = IgnoreCategory;
+
+impl IgnoreCategory {
+    pub const ALL: [IgnoreCategory; 1] = [IgnoreCategory::English];
 
     pub const fn as_str(&self) -> &'static str {
         match self {
-            StopWords::English => "English",
+            IgnoreCategory::English => "English",
         }
     }
 
     pub const fn words(&self) -> &'static [&'static str] {
         match self {
-            StopWords::English => ENGLISH,
+            IgnoreCategory::English => ENGLISH,
         }
     }
 
