@@ -255,7 +255,10 @@ impl ChatTemplate {
         for bp in breakpoints {
             partial_texts.push(render_partial(self, prompt, opts, bp)?);
         }
-        Ok(RenderedWithBreakpoints { text, partial_texts })
+        Ok(RenderedWithBreakpoints {
+            text,
+            partial_texts,
+        })
     }
 }
 
@@ -335,7 +338,8 @@ impl RenderOptions {
         K: Into<String>,
         V: Serialize,
     {
-        self.extras.push((key.into(), JinjaValue::from_serialize(&value)));
+        self.extras
+            .push((key.into(), JinjaValue::from_serialize(&value)));
         self
     }
 }
@@ -406,10 +410,8 @@ fn collect_breakpoints(prompt: &Prompt) -> Vec<Breakpoint> {
         out.push(Breakpoint::AfterTools);
     }
 
-    let system_cached = prompt
-        .system
-        .as_ref()
-        .is_some_and(|c| content_has_cache(c));
+    let system_cached =
+        prompt.system.as_ref().is_some_and(|c| content_has_cache(c));
     if system_cached {
         out.push(Breakpoint::AfterSystem);
     }
@@ -1370,8 +1372,7 @@ mod tests {
             }],
             ..Prompt::default()
         };
-        let opts =
-            RenderOptions::default().with_generation_prompt(true);
+        let opts = RenderOptions::default().with_generation_prompt(true);
         let partial =
             render_partial(&tmpl(), &prompt, &opts, Breakpoint::AfterSystem)
                 .unwrap();
@@ -1424,8 +1425,7 @@ mod tests {
                 &RenderOptions::default().with_generation_prompt(true),
             )
             .unwrap();
-        const GEN: &str =
-            "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        const GEN: &str = "<|start_header_id|>assistant<|end_header_id|>\n\n";
         assert!(
             out.text.ends_with(GEN),
             "full render must end with generation prompt: {:?}",
@@ -1473,16 +1473,13 @@ mod tests {
                 },
                 Message {
                     role: Role::User,
-                    content: Content::SinglePart(Cow::Borrowed(
-                        "What next?",
-                    )),
+                    content: Content::SinglePart(Cow::Borrowed("What next?")),
                 },
             ],
             ..Prompt::default()
         };
 
-        let opts =
-            RenderOptions::default().with_generation_prompt(true);
+        let opts = RenderOptions::default().with_generation_prompt(true);
         let rendered = t.render_with_breakpoints(&prompt, &opts).unwrap();
         assert_eq!(rendered.partial_texts.len(), 1);
 

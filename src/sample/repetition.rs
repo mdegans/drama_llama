@@ -17,10 +17,7 @@ use std::num::NonZeroU8;
 #[cfg(feature = "egui")]
 use super::DELETE_ICON;
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 /// Options for `apply_sample_repetition_penalties`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepetitionOptions {

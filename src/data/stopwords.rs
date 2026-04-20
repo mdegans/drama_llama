@@ -4,10 +4,7 @@ use crate::Model;
 
 /// A list of very common words for various languages. These can be used to
 /// ignore certain tokens for the purposes of repetition detection, etc.
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub enum StopWords {
     // NOTE: If you add a new language here, add it to ALL and sort this list

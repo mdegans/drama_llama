@@ -752,8 +752,8 @@ mod tests {
     fn test_predict_pieces_resuming_matches() {
         use std::path::PathBuf;
         const PROMPT: &str = "The quick brown fox jumps over the lazy dog.";
-        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("models/model.gguf");
+        let model_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
 
         // --- A: fresh path ---
         let mut engine_a = Engine::from_path(model_path.clone()).unwrap();
@@ -761,12 +761,12 @@ mod tests {
         assert!(tokens_a.len() >= 4, "prompt tokenization too short");
         let k = tokens_a.len() / 2;
 
-        let mut opts =
-            crate::PredictOptions::greedy().add_stop(".".to_owned());
+        let mut opts = crate::PredictOptions::greedy().add_stop(".".to_owned());
         opts.n = std::num::NonZeroUsize::new(16).unwrap();
 
-        let fresh: Vec<String> =
-            engine_a.predict_pieces(tokens_a.clone(), opts.clone()).collect();
+        let fresh: Vec<String> = engine_a
+            .predict_pieces(tokens_a.clone(), opts.clone())
+            .collect();
 
         drop(engine_a);
 

@@ -20,10 +20,7 @@ static_assertions::assert_impl_all!(NGramNewError: Send, Sync);
 /// # Note
 /// * The minimum length of an Ngram is 1 (a unigram).
 /// * The capacity of the Ngram is fixed to [`NGram::CAPACITY`].
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Ord)]
 #[repr(transparent)]
 pub struct NGram {
@@ -108,10 +105,7 @@ impl Index<usize> for NGram {
     }
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 /// Metadata about an Ngram.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct NGramData {

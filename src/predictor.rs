@@ -20,9 +20,7 @@ where
     let strings = Vec::<String>::deserialize(deserializer)?;
     strings
         .into_iter()
-        .map(|s| {
-            regex::Regex::new(&s).map_err(serde::de::Error::custom)
-        })
+        .map(|s| regex::Regex::new(&s).map_err(serde::de::Error::custom))
         .collect()
 }
 
@@ -45,10 +43,7 @@ where
 
 /// Options for prediction.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PredictOptions {
     /// Maximum number of tokens to predict.
     pub n: NonZeroUsize,
@@ -564,7 +559,12 @@ impl<'engine> TokenPredictor<'engine> {
             .max()
             .unwrap_or(0);
 
-        (Xoroshiro128::from_seed(&seed), ngram_stats, options, max_stop_len)
+        (
+            Xoroshiro128::from_seed(&seed),
+            ngram_stats,
+            options,
+            max_stop_len,
+        )
     }
 }
 
@@ -773,10 +773,7 @@ impl<'engine> Into<Vec<llama_token>> for PiecePredictor<'engine> {
 /// Contains a token and the associated piece. This is a convenience struct to
 /// avoid ackward iterator usage when both the token and piece are needed.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Predicted {
     pub token: llama_token,
     pub piece: String,

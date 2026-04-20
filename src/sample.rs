@@ -94,10 +94,7 @@ where
 pub(crate) const DELETE_ICON: egui::ImageSource<'static> =
     egui::include_image!("../assets/ui/images/delete.png");
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 /// Options determining how raw logits are turned into a token. This is used by
 /// [`Candidates::sample_token`] and associated functions.
 #[derive(Clone, Debug, PartialEq)]
@@ -266,10 +263,7 @@ impl Default for SampleOptions {
     }
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug)]
 // TODO: add `min_keep` and `mad_keep` to all the sampling modes since it's
 // doable and it would be nice to have a more consistent API.

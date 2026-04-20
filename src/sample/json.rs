@@ -29,10 +29,7 @@ use crate::{model::token_to_piece_ref, Candidates, Model};
 ///
 /// Clone cost is proportional to stack depth (single-digit for typical JSON).
 /// `accepts_bytes` relies on cloning for speculative simulation.
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct JsonState {
     stack: Vec<Frame>,
@@ -352,10 +349,7 @@ impl JsonState {
     }
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, PartialEq)]
 enum Frame {
     Root {
@@ -373,10 +367,7 @@ enum Frame {
     },
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum LitKind {
     True,
@@ -394,10 +385,7 @@ impl LitKind {
     }
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ObjState {
     EmptyOrAwaitingKey,
@@ -407,10 +395,7 @@ enum ObjState {
     AwaitingCommaOrClose,
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ArrState {
     EmptyOrAwaitingValue,
@@ -418,10 +403,7 @@ enum ArrState {
     AwaitingCommaOrClose,
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum StringState {
     Normal,
@@ -430,10 +412,7 @@ enum StringState {
     Hex(u8),
 }
 
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum NumState {
     SeenMinus,
@@ -894,8 +873,7 @@ mod tests {
         use serde_json::to_string;
         let s = JsonState::new();
         let encoded = to_string(&s).unwrap();
-        let decoded: JsonState =
-            serde_json::from_str(&encoded).unwrap();
+        let decoded: JsonState = serde_json::from_str(&encoded).unwrap();
         assert_eq!(s, decoded);
     }
 
@@ -1024,8 +1002,8 @@ mod tests {
         let trimmed = output.trim_end_matches(eos_piece.as_str()).trim_end();
 
         // Must parse as valid JSON of any shape.
-        let parsed: serde_json::Value =
-            serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        let parsed: serde_json::Value = serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| {
                 panic!(
                     "output must be valid JSON (constraint guarantees \
                          this). parse error: {e}\noutput: {output:?}\n\
