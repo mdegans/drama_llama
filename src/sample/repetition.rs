@@ -13,7 +13,7 @@ use crate::{
 
 use llama_cpp_sys_3::llama_token;
 
-use std::num::NonZeroU8;
+use std::{collections::BTreeSet, num::NonZeroU8};
 
 #[cfg(feature = "egui")]
 use super::DELETE_ICON;
@@ -24,10 +24,10 @@ use super::DELETE_ICON;
 pub struct RepetitionOptions {
     /// Sets of tokens to ignore, by language. These are never penalized.
     #[cfg_attr(feature = "serde", serde(default, alias = "ignored_stopwords"))]
-    pub(crate) ignored_categories: Vec<IgnoreCategory>,
+    pub(crate) ignored_categories: BTreeSet<IgnoreCategory>,
     /// [`NGram`]s to ignore. These are never penalized.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub(crate) ignored: Vec<NGram>,
+    pub(crate) ignored: BTreeSet<NGram>,
     // TODO: Add this back in when we have a way to prune the ngram stats. We
     // will likely have to add `last_seen` to the `NGramData` struct. However
     // this will make the code O(n) instead of O(1) for each token, which is as
@@ -84,8 +84,8 @@ impl Default for RepetitionOptions {
             // repetition penalty on `.` biases the model toward longer
             // sentences / run-ons. Users can override by calling
             // `set_ignored_categories(vec![])`.
-            ignored_categories: vec![IgnoreCategory::Punctuation],
-            ignored: vec![],
+            ignored_categories: BTreeSet::from([IgnoreCategory::Punctuation]),
+            ignored: BTreeSet::new(),
             penalty_max_count: NonZeroU8::new(1).unwrap(),
             ngram_min_size: NonZeroU8::new(1).unwrap(),
             ngram_max_size: NonZeroU8::new(4).unwrap(),
@@ -99,33 +99,33 @@ impl Default for RepetitionOptions {
 
 impl RepetitionOptions {
     /// [`IgnoreCategory`]s of tokens. These are never penalized.
-    pub fn ignored_categories(&self) -> &[IgnoreCategory] {
+    pub fn ignored_categories(&self) -> &BTreeSet<IgnoreCategory> {
         &self.ignored_categories
     }
 
     /// Use [`RepetitionOptions::ignored_categories`] instead.
     #[allow(deprecated)]
     #[deprecated(since = "0.7.0", note = "renamed to `ignored_categories`")]
-    pub fn ignored_stopwords(&self) -> &[StopWords] {
+    pub fn ignored_stopwords(&self) -> &BTreeSet<StopWords> {
         self.ignored_categories()
     }
 
     /// Set [`IgnoreCategory`]s to ignore. These are never penalized.
-    pub fn set_ignored_categories(
-        mut self,
-        ignored_categories: Vec<IgnoreCategory>,
-    ) -> Self {
-        self.ignored_categories = ignored_categories;
+    pub fn set_ignored_categories<It>(mut self, ignored_categories: It) -> Self
+    where
+        It: IntoIterator<Item = IgnoreCategory>,
+    {
+        self.ignored_categories = ignored_categories.into_iter().collect();
         self
     }
 
     /// Use [`RepetitionOptions::set_ignored_categories`] instead.
     #[allow(deprecated)]
     #[deprecated(since = "0.7.0", note = "renamed to `set_ignored_categories`")]
-    pub fn set_ignored_stopwords(
-        self,
-        ignored_stopwords: Vec<StopWords>,
-    ) -> Self {
+    pub fn set_ignored_stopwords<It>(self, ignored_stopwords: It) -> Self
+    where
+        It: IntoIterator<Item = StopWords>,
+    {
         self.set_ignored_categories(ignored_stopwords)
     }
 
@@ -150,20 +150,19 @@ impl RepetitionOptions {
         self.extend_ignored_categories(stopwords);
     }
 
-    /// Tokens to ignore. These tokens are never penalized.
+    /// Ngrams to ignore. These are never penalized.
     ///
     /// # Notes:
     /// * any tokens in [`PredictOptions::stop_sequences`], including EOS, are
     /// automatically ignored.
-    /// * The returned slice is guaranteed to be sorted.
     ///
     /// [`PredictOptions::stop_sequences`]: crate::PredictOptions::stop_sequences
-    pub fn ignored(&self) -> &[NGram] {
+    pub fn ignored(&self) -> &BTreeSet<NGram> {
         &self.ignored
     }
 
-    /// Ngrams to ignore. These ngrams are never penalized. The input can be any
-    /// iterable of any type that can be converted into an ngram.
+    /// Set the set of ignored ngrams. These are never penalized. The input can
+    /// be any iterable of any type that can be converted into an [`NGram`].
     ///
     /// # Notes:
     /// * any tokens in [`PredictOptions::stop_sequences`], including EOS, are
@@ -175,16 +174,13 @@ impl RepetitionOptions {
         It: IntoIterator<Item = Ng>,
         Ng: Into<NGram>,
     {
-        // If the type is the same, the compiler will optimize this to a no-op,
-        // at least hopefully, since we can reason about it and compiler
-        // developers are smart.
         self.ignored = ignored.into_iter().map(|t| t.into()).collect();
-        self.ignored.sort();
         self
     }
 
-    /// Extend the list of ignored ngrams. Input can be any iterable of any type
-    /// that can be converted into an [`NGram`].
+    /// Extend the set of ignored ngrams. Input can be any iterable of any type
+    /// that can be converted into an [`NGram`]. Duplicates are silently
+    /// dropped by the underlying [`BTreeSet`].
     ///
     /// # Deprecation:
     /// In the future, to be more consistent, this will take and return `self`.
@@ -194,11 +190,10 @@ impl RepetitionOptions {
         Ng: Into<NGram>,
     {
         self.ignored.extend(ignored.into_iter().map(|t| t.into()));
-        self.ignored.sort();
     }
 
-    /// Add a token to the list of ignored tokens. that can be converted into an
-    /// [`NGram`].
+    /// Add a token to the set of ignored tokens. The input can be anything
+    /// convertible into an [`NGram`].
     ///
     /// Prefer using [`extend_ignored`] or [`set_ignored`] for multiple tokens.
     ///
@@ -211,8 +206,7 @@ impl RepetitionOptions {
     where
         I: Into<NGram>,
     {
-        self.ignored.push(ngram.into());
-        self.ignored.sort();
+        self.ignored.insert(ngram.into());
     }
 
     /// Ignore [`IgnoreCategory`]s. These are commonly used tokens that are
@@ -281,34 +275,33 @@ impl RepetitionOptions {
         if !self.ignored_categories.is_empty() {
             ui.label("Token categories ignored for:")
                 .on_hover_text_at_pointer(IGNORE_CATEGORY_HELP);
-            let mut to_remove = None;
-            for (i, language) in self.ignored_categories.iter().enumerate() {
+            let mut to_remove: Option<IgnoreCategory> = None;
+            for category in self.ignored_categories.iter() {
                 ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::image(DELETE_ICON))
-                        .on_hover_text_at_pointer("Remove this language from the list of ignored token sets.")
+                        .on_hover_text_at_pointer("Remove this category from the list of ignored token sets.")
                         .clicked() {
-                        to_remove = Some(i);
+                        to_remove = Some(*category);
                     };
-                    ui.label(language.as_str())
+                    ui.label(category.as_str())
                 });
             }
-            if let Some(i) = to_remove {
-                self.ignored_categories.remove(i);
+            if let Some(category) = to_remove {
+                self.ignored_categories.remove(&category);
             }
         }
         if self.ignored_categories.len() < IgnoreCategory::ALL.len() {
             egui::ComboBox::from_label("to ignore token categories for")
-                .selected_text("Select a language...")
+                .selected_text("Select a category...")
                 .show_ui(ui, |ui| {
-                    for language in IgnoreCategory::ALL {
-                        if !self.ignored_categories.contains(&language) {
+                    for category in IgnoreCategory::ALL {
+                        if !self.ignored_categories.contains(&category) {
                             if ui
-                                .selectable_label(false, language.as_str())
+                                .selectable_label(false, category.as_str())
                                 .clicked()
                             {
-                                self.ignored_categories.push(language);
-                                self.ignored_categories.sort();
+                                self.ignored_categories.insert(category);
                             }
                         }
                     }
@@ -320,14 +313,14 @@ impl RepetitionOptions {
         // Ignored ngrams
         if !self.ignored.is_empty() {
             ui.label("Ignored NGrams").on_hover_text_at_pointer("These ngrams are never penalized. Common words can be put here to prevent them from being penalized. This is experimental.");
-            let mut to_remove = None;
-            for (i, ngram) in self.ignored.iter().enumerate() {
+            let mut to_remove: Option<NGram> = None;
+            for ngram in self.ignored.iter() {
                 ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::image(DELETE_ICON))
                         .on_hover_text_at_pointer("Remove this ngram from the list of ignored ngrams.")
                         .clicked() {
-                        to_remove = Some(i);
+                        to_remove = Some(*ngram);
                     };
                     ui.label(format!("{:?}", ngram))
                 });
@@ -337,8 +330,8 @@ impl RepetitionOptions {
             // don't have a place on this struct to store it. We could also
             // serde(skip) it.
 
-            if let Some(i) = to_remove {
-                self.ignored.remove(i);
+            if let Some(ngram) = to_remove {
+                self.ignored.remove(&ngram);
             }
         }
 
@@ -468,13 +461,8 @@ pub enum RepetitionError {
 
 static_assertions::assert_impl_all!(RepetitionError: Send, Sync);
 
-fn ngram_is_ignored(ngram: NGram, ignored: &[NGram]) -> bool {
-    if ignored.len() > 64 {
-        // binary search is faster for large lists
-        ignored.binary_search(&ngram).is_ok()
-    } else {
-        ignored.contains(&ngram)
-    }
+fn ngram_is_ignored(ngram: NGram, ignored: &BTreeSet<NGram>) -> bool {
+    ignored.contains(&ngram)
 }
 
 /// Pick the token to penalize for surgical mode.
@@ -491,7 +479,7 @@ fn ngram_is_ignored(ngram: NGram, ignored: &[NGram]) -> bool {
 fn surgical_target(
     ngram: &NGram,
     tokens: &[llama_token],
-    ignored: &[NGram],
+    ignored: &BTreeSet<NGram>,
 ) -> Option<llama_token> {
     let slice = ngram.as_slice();
     let max_k = slice.len().saturating_sub(1);
@@ -543,16 +531,11 @@ pub fn apply_sample_repetition_ngram(
         surgical,
     } = opts;
 
-    // Add ignored categories of tokens to the ignored ngrams if they are not
-    // already there.
-    while let Some(cats) = ignored_categories.pop() {
-        let newly_ignored = cats.into_tokens(model);
-        ignored.sort();
-        for token in newly_ignored {
-            let ngram = NGram::from(token);
-            if !ngram_is_ignored(ngram, ignored) {
-                ignored.push(ngram);
-            }
+    // Drain ignored categories into the ignored set. BTreeSet::insert
+    // silently handles duplicates; no manual dedup check needed.
+    while let Some(cats) = ignored_categories.pop_first() {
+        for token in cats.into_tokens(model) {
+            ignored.insert(NGram::from(token));
         }
     }
 
@@ -976,6 +959,10 @@ mod tests {
         NGram::try_from(tokens).unwrap()
     }
 
+    fn ignored_of(tokens: &[llama_token]) -> BTreeSet<NGram> {
+        tokens.iter().map(|&t| NGram::from(t)).collect()
+    }
+
     /// k=0: no prefix re-emitted yet — penalize the first token of the
     /// n-gram. This blocks proper-noun repetitions like "The New York Times"
     /// at entry, before "The" is even selected.
@@ -983,7 +970,7 @@ mod tests {
     fn surgical_target_k0_penalizes_first_token() {
         let ng = ngram(&[10, 20, 30]);
         let tokens = &[99, 88, 77];
-        assert_eq!(surgical_target(&ng, tokens, &[]), Some(10));
+        assert_eq!(surgical_target(&ng, tokens, &BTreeSet::new()), Some(10));
     }
 
     /// k=1: first token re-emitted — penalize the next continuation to
@@ -992,7 +979,7 @@ mod tests {
     fn surgical_target_k1_penalizes_second_token() {
         let ng = ngram(&[10, 20, 30]);
         let tokens = &[99, 10];
-        assert_eq!(surgical_target(&ng, tokens, &[]), Some(20));
+        assert_eq!(surgical_target(&ng, tokens, &BTreeSet::new()), Some(20));
     }
 
     /// k=n-1: full prefix re-emitted — penalize the final completion token.
@@ -1000,7 +987,7 @@ mod tests {
     fn surgical_target_k_full_penalizes_completion() {
         let ng = ngram(&[10, 20, 30]);
         let tokens = &[10, 20];
-        assert_eq!(surgical_target(&ng, tokens, &[]), Some(30));
+        assert_eq!(surgical_target(&ng, tokens, &BTreeSet::new()), Some(30));
     }
 
     /// Longest prefix match wins when the history happens to match multiple
@@ -1010,7 +997,7 @@ mod tests {
     fn surgical_target_picks_longest_prefix_match() {
         let ng = ngram(&[10, 10, 30]);
         let tokens = &[10, 10];
-        assert_eq!(surgical_target(&ng, tokens, &[]), Some(30));
+        assert_eq!(surgical_target(&ng, tokens, &BTreeSet::new()), Some(30));
     }
 
     /// If the target token is in the ignored set, return None — do NOT
@@ -1020,7 +1007,7 @@ mod tests {
     #[test]
     fn surgical_target_skips_entirely_when_target_ignored() {
         let ng = ngram(&[10, 20, 30]);
-        let ignored = vec![NGram::from(10_i32)];
+        let ignored = ignored_of(&[10]);
         let tokens: &[llama_token] = &[];
         assert_eq!(surgical_target(&ng, tokens, &ignored), None);
     }
@@ -1029,7 +1016,7 @@ mod tests {
     #[test]
     fn surgical_target_ignored_continuation_skips() {
         let ng = ngram(&[10, 20, 30]);
-        let ignored = vec![NGram::from(20_i32)];
+        let ignored = ignored_of(&[20]);
         let tokens = &[10];
         assert_eq!(surgical_target(&ng, tokens, &ignored), None);
     }
@@ -1039,8 +1026,8 @@ mod tests {
     fn surgical_target_unigram() {
         let ng = ngram(&[42]);
         let tokens = &[99];
-        assert_eq!(surgical_target(&ng, tokens, &[]), Some(42));
-        let ignored = vec![NGram::from(42_i32)];
+        assert_eq!(surgical_target(&ng, tokens, &BTreeSet::new()), Some(42));
+        let ignored = ignored_of(&[42]);
         assert_eq!(surgical_target(&ng, tokens, &ignored), None);
     }
 
@@ -1048,12 +1035,13 @@ mod tests {
     #[test]
     fn surgical_target_short_history() {
         let ng = ngram(&[10, 20, 30]);
+        let empty = BTreeSet::new();
         // Empty history: only k=0 is possible.
-        assert_eq!(surgical_target(&ng, &[], &[]), Some(10));
+        assert_eq!(surgical_target(&ng, &[], &empty), Some(10));
         // History of length 1 that doesn't match prefix[0]: k=0.
-        assert_eq!(surgical_target(&ng, &[99], &[]), Some(10));
+        assert_eq!(surgical_target(&ng, &[99], &empty), Some(10));
         // History of length 1 matching prefix[0]: k=1.
-        assert_eq!(surgical_target(&ng, &[10], &[]), Some(20));
+        assert_eq!(surgical_target(&ng, &[10], &empty), Some(20));
     }
 
     /// A prefix match that doesn't reach the end of history: not a match.
@@ -1063,6 +1051,6 @@ mod tests {
         let ng = ngram(&[10, 20, 30]);
         // [10, 20] appears earlier, but history ends in [99]: k=0.
         let tokens = &[10, 20, 99];
-        assert_eq!(surgical_target(&ng, tokens, &[]), Some(10));
+        assert_eq!(surgical_target(&ng, tokens, &BTreeSet::new()), Some(10));
     }
 }

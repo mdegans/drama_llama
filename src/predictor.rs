@@ -109,13 +109,13 @@ impl PredictOptions {
         let eos = model.eos();
         self.stop_sequences.push(vec![eos]);
         if let Some(opts) = &mut self.sample_options.repetition {
-            opts.ignored.push(eos.into());
+            opts.ignored.insert(eos.into());
         }
         let eot = model.eot();
         if eot != eos && eot >= 0 {
             self.stop_sequences.push(vec![eot]);
             if let Some(opts) = &mut self.sample_options.repetition {
-                opts.ignored.push(eot.into());
+                opts.ignored.insert(eot.into());
             }
         }
         self
