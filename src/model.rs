@@ -8,11 +8,13 @@ use llama_cpp_sys_3::{
     llama_model_params, llama_model_quantize,
     llama_model_quantize_default_params, llama_model_quantize_params,
     llama_model_rope_freq_scale_train, llama_model_rope_type, llama_model_size,
-    llama_token, llama_token_to_piece, llama_tokenize, llama_vocab,
-    llama_vocab_bos, llama_vocab_eos, llama_vocab_eot, llama_vocab_fim_mid,
-    llama_vocab_fim_pre, llama_vocab_fim_suf, llama_vocab_get_add_bos,
-    llama_vocab_get_add_eos, llama_vocab_get_score, llama_vocab_get_text,
-    llama_vocab_n_tokens, llama_vocab_nl, llama_vocab_type,
+    llama_token, llama_token_attr_LLAMA_TOKEN_ATTR_CONTROL,
+    llama_token_attr_LLAMA_TOKEN_ATTR_USER_DEFINED, llama_token_get_attr,
+    llama_token_to_piece, llama_tokenize, llama_vocab, llama_vocab_bos,
+    llama_vocab_eos, llama_vocab_eot, llama_vocab_fim_mid, llama_vocab_fim_pre,
+    llama_vocab_fim_suf, llama_vocab_get_add_bos, llama_vocab_get_add_eos,
+    llama_vocab_get_score, llama_vocab_get_text, llama_vocab_n_tokens,
+    llama_vocab_nl, llama_vocab_type,
 };
 use std::{
     collections::BTreeMap,
@@ -245,6 +247,29 @@ impl Model {
     /// Return the infill suffix token.
     pub fn infill_suffix(&self) -> llama_token {
         unsafe { llama_vocab_fim_suf(self.vocab) }
+    }
+
+    /// Collect every token with the `CONTROL` or `USER_DEFINED` attribute
+    /// set — i.e. the full set of chat-template and structural specials
+    /// (`<|eot_id|>`, `<|start_header_id|>`, `<|python_tag|>`, `<|eom_id|>`,
+    /// BOS/EOS/EOT, tool-call markers, …). Callers can feed this into
+    /// [`RepetitionOptions::extend_ignored`] so a repetition penalty never
+    /// suppresses the tokens the template needs to close a turn.
+    ///
+    /// O(vocab_size); intended to be called once at session setup, not
+    /// per-token.
+    ///
+    /// [`RepetitionOptions::extend_ignored`]: crate::RepetitionOptions::extend_ignored
+    pub fn special_tokens(&self) -> Vec<llama_token> {
+        let n = self.n_vocab();
+        let mask = llama_token_attr_LLAMA_TOKEN_ATTR_CONTROL
+            | llama_token_attr_LLAMA_TOKEN_ATTR_USER_DEFINED;
+        (0..n)
+            .filter(|&t| {
+                let attr = unsafe { llama_token_get_attr(self.vocab, t) };
+                (attr & mask) != 0
+            })
+            .collect()
     }
 
     /// Longest token length in this model's vocabulary. Memoized — first

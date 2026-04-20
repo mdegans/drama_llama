@@ -308,16 +308,14 @@ impl Session {
     /// Opt in for story generation, poetry, or anywhere loop-
     /// prevention matters. See [`RepetitionOptions`] for parameters.
     ///
-    /// The model's EOS (and EOT, when distinct) are added to
-    /// `opts.ignored` before storing — a strong repetition penalty
-    /// on those would prevent the model from ever closing a turn.
+    /// The full set of model special tokens (EOS, EOT, BOS,
+    /// chat-template markers like `<|start_header_id|>` /
+    /// `<|eot_id|>`, tool-call markers like `<|python_tag|>`) is
+    /// added to `opts.ignored` before storing — a strong repetition
+    /// penalty on those would prevent the model from ever closing a
+    /// turn or emitting a valid tool call.
     pub fn with_repetition(mut self, mut opts: RepetitionOptions) -> Self {
-        let eos = self.engine.model.eos();
-        opts.extend_ignored([eos]);
-        let eot = self.engine.model.eot();
-        if eot != eos && eot >= 0 {
-            opts.extend_ignored([eot]);
-        }
+        opts.extend_ignored(self.engine.model.special_tokens());
         self.repetition = Some(opts);
         self
     }
@@ -1549,18 +1547,21 @@ mod tests {
         assert_eq!(session.total_usage(), &Usage::default());
     }
 
-    /// `with_repetition` must plumb EOS (and EOT, when distinct) into
-    /// `opts.ignored` so a strong repetition penalty never prevents
-    /// the model from closing a turn. Regression guard for the bug
-    /// where Session built `PredictOptions` *before* assigning
+    /// `with_repetition` must plumb every special token (CONTROL +
+    /// USER_DEFINED) into `opts.ignored` so a strong repetition
+    /// penalty never suppresses chat-template or tool-call markers
+    /// the model needs to close a turn. Regression guard for the
+    /// bug where Session built `PredictOptions` *before* assigning
     /// repetition, so `add_model_stops`'s ignored-list injection
-    /// silently no-op'd.
+    /// silently no-op'd (and for the earlier EOS/EOT-only fix that
+    /// missed modern chat templates).
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
-    fn test_with_repetition_adds_eos_eot_to_ignored() {
+    fn test_with_repetition_adds_special_tokens_to_ignored() {
         let session = Session::from_path(model_path()).unwrap().quiet();
         let eos = session.engine.model.eos();
         let eot = session.engine.model.eot();
+        let specials = session.engine.model.special_tokens();
 
         let with_rep = session.with_repetition(RepetitionOptions::default());
         let rep = with_rep.repetition.as_ref().expect("repetition set");
@@ -1568,18 +1569,28 @@ mod tests {
 
         assert!(
             ignored.contains(&crate::NGram::from(eos)),
-            "EOS ({}) must be in ignored: got {:?}",
+            "EOS ({}) must be in ignored",
             eos,
-            ignored
         );
         if eot != eos && eot >= 0 {
             assert!(
                 ignored.contains(&crate::NGram::from(eot)),
-                "EOT ({}) must be in ignored when distinct: got {:?}",
+                "EOT ({}) must be in ignored when distinct",
                 eot,
-                ignored
             );
         }
+        for &t in &specials {
+            assert!(
+                ignored.contains(&crate::NGram::from(t)),
+                "special token {} must be in ignored",
+                t,
+            );
+        }
+        // Modern chat-tuned models have several specials beyond EOS/EOT
+        // (start_header, end_header, eot_id, eom_id, python_tag, ...).
+        // Sanity check that the sweep isn't silently returning only a
+        // couple — actual count varies by model.
+        println!("special_tokens count = {}", specials.len());
     }
 
     #[test]
