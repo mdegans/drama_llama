@@ -43,31 +43,30 @@
 //! whole prompt is decoded on every call anyway — but it *does* pay a linear
 //! prefill cost in tokens. When successive calls share a long prefix (system
 //! + tools + early turns), re-prefilling those positions wastes work. The
-//! opt-in prefix cache keeps the KV state from the previous call around and,
-//! on the next call, computes the longest common prefix of `new_tokens` and
-//! `prev_tokens`, clipped to the nearest `cache_control` breakpoint declared
-//! in the prompt, and resumes generation from that position via
+//! opt-in prefix cache keeps the KV state from the previous call around and, on
+//! the next call, computes the longest common prefix of `new_tokens` and
+//! `prev_tokens`, clipped to the nearest `cache_control` breakpoint declared in
+//! the prompt, and resumes generation from that position via
 //! [`Engine::predict_pieces_resuming`].
 //!
 //! The contract:
 //!
-//! * **Opt-in.** Default is off — existing callers are unaffected. Enable
-//!   with [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
+//! * **Opt-in.** Default is off — existing callers are unaffected. Enable with
+//!   [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
 //! * **Breakpoint-driven.** The cache only honors positions the caller
 //!   explicitly marked with a `cache_control` on a [`Block`], [`Tool`], or
-//!   [`tool::Use`](misanthropic::tool::Use) / [`tool::Result`](misanthropic::tool::Result).
-//!   Without breakpoints, every call is a full re-prefill.
+//!   [`tool::Use`](misanthropic::tool::Use) /
+//!   [`tool::Result`](misanthropic::tool::Result). Without breakpoints, every
+//!   call is a full re-prefill.
 //! * **Single sequence.** All prefill/decode uses `seq_id = 0`. Parallel
 //!   conversation threads need one [`Session`] each.
 //! * **Thread swap = clear.** When swapping conversation threads or reloading
 //!   system/tools outside the `cache_control` contract, call
-//!   [`Session::clear_prefix_cache`] to zero both the cache metadata and the
-//!   KV state. The library can't detect semantic-level context swaps on its
-//!   own.
+//!   [`Session::clear_prefix_cache`] to zero both the cache metadata and the KV
+//!   state. The library can't detect semantic-level context swaps on its own.
 //!
 //! Usage statistics matching the Anthropic API shape are tracked on every
-//! `complete_*` call: see [`Session::last_usage`] and
-//! [`Session::total_usage`].
+//! `complete_*` call: see [`Session::last_usage`] and [`Session::total_usage`].
 //!
 //! [`misanthropic::Client::message`]:
 //!     https://docs.rs/misanthropic/latest/misanthropic/struct.Client.html#method.message
@@ -120,28 +119,27 @@ pub enum SessionError {
     },
 }
 
-/// Default maximum tokens per [`Session::complete_text`] call. Users
-/// override via [`Session::with_max_tokens`].
+/// Default maximum tokens per [`Session::complete_text`] call. Users override
+/// via [`Session::with_max_tokens`].
 const DEFAULT_MAX_TOKENS: usize = 1024;
 
 /// Per-session prefix-cache state.
 ///
-/// Tracks the full prompt tokens from the last cache-participating
-/// `complete_*` call, the indices within those tokens where
-/// `cache_control` breakpoints landed (sorted ascending), and the
-/// number of tokens actually reused on the last call. Generation
-/// tokens are **not** stored — they're overwritten on the next call
-/// whose prompt extends past the reused prefix.
+/// Tracks the full prompt tokens from the last cache-participating `complete_*`
+/// call, the indices within those tokens where `cache_control` breakpoints
+/// landed (sorted ascending), and the number of tokens actually reused on the
+/// last call. Generation tokens are **not** stored — they're overwritten on the
+/// next call whose prompt extends past the reused prefix.
 ///
 /// Private to the session module; callers interact through
 /// [`Session::with_prefix_cache`] / [`Session::clear_prefix_cache`] /
 /// [`Session::last_usage`].
 struct PrefixCache {
-    /// Full prompt tokens from the last cache-participating call.
-    /// Generation tokens are NOT stored here.
+    /// Full prompt tokens from the last cache-participating call. Generation
+    /// tokens are NOT stored here.
     prev_tokens: Vec<llama_token>,
-    /// Token indices in `prev_tokens` where `cache_control`
-    /// breakpoints landed. Sorted ascending.
+    /// Token indices in `prev_tokens` where `cache_control` breakpoints landed.
+    /// Sorted ascending.
     prev_breakpoints: Vec<usize>,
     /// Tokens reused in the last call. `0` = full re-prefill.
     last_reused_tokens: usize,
@@ -158,7 +156,7 @@ impl PrefixCache {
     }
 
     /// Zero every field. Called from [`Session::clear_prefix_cache`].
-    fn reset(&mut self) {
+    fn clear(&mut self) {
         self.prev_tokens.clear();
         self.prev_breakpoints.clear();
         self.last_reused_tokens = 0;
@@ -166,38 +164,32 @@ impl PrefixCache {
 }
 
 /// Length of the longest prefix shared between `a` and `b`, in tokens.
-///
-/// Pure function, no model, no KV state — tested directly in
-/// `tests::test_longest_common_prefix_len`.
 fn longest_common_prefix_len(a: &[llama_token], b: &[llama_token]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 /// Cache-reuse length for a call.
 ///
-/// Given the previously-cached `prev_tokens`, the newly-rendered
-/// `new_tokens`, and the new call's breakpoint token indices
-/// (sorted ascending), compute `L_hit`: the largest breakpoint index
-/// that is
+/// Given the previously-cached `prev_tokens`, the newly-rendered `new_tokens`,
+/// and the new call's breakpoint token indices (sorted ascending), compute
+/// `L_hit`: the largest breakpoint index that is
 ///
-/// 1. less than or equal to the common-prefix length of the two
-///    token streams, with one token of BPE-boundary safety (to avoid
-///    reusing a position whose successor might tokenize differently);
-///    and
+/// 1. less than or equal to the common-prefix length of the two token streams,
+///    with one token of BPE-boundary safety (to avoid reusing a position whose
+///    successor might tokenize differently); and
 /// 2. strictly greater than zero (we only reuse at breakpoints).
 ///
-/// Returns `0` when no breakpoint is eligible — the caller should
-/// treat that as a full re-prefill. Pure function, tested directly.
+/// Returns `0` when no breakpoint is eligible — the caller should treat that as
+/// a full re-prefill. Pure function, tested directly.
 fn compute_l_hit(
     prev_tokens: &[llama_token],
     new_tokens: &[llama_token],
     new_breakpoints: &[usize],
 ) -> usize {
     let lcp = longest_common_prefix_len(prev_tokens, new_tokens);
-    // BPE-boundary safety: back off by one token so a breakpoint
-    // falling exactly at the prefix end can't reuse a position whose
-    // successor might re-tokenize differently once more context is
-    // added.
+    // BPE-boundary safety: back off by one token so a breakpoint falling
+    // exactly at the prefix end can't reuse a position whose successor might
+    // re-tokenize differently once more context is added.
     let safe = if lcp == 0 { 0 } else { lcp - 1 };
     new_breakpoints
         .iter()
@@ -232,14 +224,8 @@ pub struct TopKEntry {
     pub piece: String,
 }
 
-/// Chat-style inference session: owns an [`Engine`] + [`ChatTemplate`]
-/// plus the builder-configured defaults for each `complete_*` call.
-//
-// Cloning is cheap for everything except the [`Engine`] — which isn't
-// [`Clone`] — so [`Session`] isn't either. Create one per model load;
-// call `complete_*` many times.
-//
-// NOTE(mdegans): I'm actually fine using Arc for `engine`.
+/// Chat-style inference session: owns an [`Engine`] + [`ChatTemplate`] plus the
+/// builder-configured defaults for each `complete_*` call.
 pub struct Session {
     engine: Engine,
     template: ChatTemplate,
@@ -433,7 +419,7 @@ impl Session {
     /// still safe to call.
     pub fn clear_prefix_cache(&mut self) {
         if let Some(cache) = self.prefix_cache.as_mut() {
-            cache.reset();
+            cache.clear();
         }
         self.engine.memory_clear();
     }
@@ -653,7 +639,7 @@ impl Session {
     fn record_cache_miss_on_error(&mut self) {
         self.engine.memory_clear();
         if let Some(cache) = self.prefix_cache.as_mut() {
-            cache.reset();
+            cache.clear();
         }
     }
 
@@ -1416,7 +1402,7 @@ mod tests {
         cache.prev_breakpoints = vec![1, 2];
         cache.last_reused_tokens = 2;
 
-        cache.reset();
+        cache.clear();
         assert!(cache.prev_tokens.is_empty());
         assert!(cache.prev_breakpoints.is_empty());
         assert_eq!(cache.last_reused_tokens, 0);
