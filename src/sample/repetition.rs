@@ -22,7 +22,7 @@ use super::DELETE_ICON;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepetitionOptions {
     /// Sets of tokens to ignore, by language. These are never penalized.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(feature = "serde", serde(default, alias = "ignored_stopwords"))]
     pub(crate) ignored_categories: Vec<IgnoreCategory>,
     /// [`NGram`]s to ignore. These are never penalized.
     #[cfg_attr(feature = "serde", serde(default))]
