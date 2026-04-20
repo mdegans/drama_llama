@@ -547,10 +547,8 @@ impl Session {
         &mut self,
         prompt: &Prompt,
         include_user_sampling: bool,
-    ) -> Result<
-        (Vec<llama_token>, Vec<usize>, Vec<SamplingMode>),
-        SessionError,
-    > {
+    ) -> Result<(Vec<llama_token>, Vec<usize>, Vec<SamplingMode>), SessionError>
+    {
         let (tokens, breakpoints) = if self.prefix_cache.is_some() {
             let rendered = self
                 .template
@@ -596,11 +594,7 @@ impl Session {
     ) -> (Vec<llama_token>, usize) {
         let l_hit = match self.prefix_cache.as_ref() {
             Some(cache) if !cache.prev_tokens.is_empty() => {
-                compute_l_hit(
-                    &cache.prev_tokens,
-                    new_tokens,
-                    new_breakpoints,
-                )
+                compute_l_hit(&cache.prev_tokens, new_tokens, new_breakpoints)
             }
             _ => 0,
         };
@@ -741,8 +735,7 @@ impl Session {
         let trimmed = trim_eos(&text, &self.engine).to_string();
 
         self.record_cache_hit(tokens, breakpoints, l_hit);
-        let usage =
-            Self::make_usage(prompt_tokens, l_hit, generated_count);
+        let usage = Self::make_usage(prompt_tokens, l_hit, generated_count);
         self.record_usage(usage);
 
         Ok(trimmed)
@@ -814,12 +807,8 @@ impl Session {
         };
 
         let predictor = if l_hit > 0 {
-            self.engine.predict_pieces_resuming(
-                suffix,
-                l_hit,
-                0,
-                predict_opts,
-            )
+            self.engine
+                .predict_pieces_resuming(suffix, l_hit, 0, predict_opts)
         } else {
             self.engine.predict_pieces(suffix, predict_opts)
         };
@@ -877,12 +866,8 @@ impl Session {
         let mut parser = BlockParser::new();
 
         let predictor = if l_hit > 0 {
-            self.engine.predict_pieces_resuming(
-                suffix,
-                l_hit,
-                0,
-                predict_opts,
-            )
+            self.engine
+                .predict_pieces_resuming(suffix, l_hit, 0, predict_opts)
         } else {
             self.engine.predict_pieces(suffix, predict_opts)
         };
@@ -1108,8 +1093,7 @@ impl Session {
     ///
     /// # Field filling
     ///
-    /// * `id`: empty string — local inference has no stable
-    ///   request-id concept.
+    /// * `id`: new UUID v4
     /// * `model`: [`model::Id::Custom`][cu] wrapping the result of
     ///   [`Model::desc`](crate::Model::desc).
     /// * `content`: [`AssistantMessage`] via
@@ -1127,7 +1111,7 @@ impl Session {
         prompt: &Prompt,
     ) -> Result<misanthropic::response::Message<'static>, SessionError> {
         let outcome = self.run_call(prompt)?;
-        let content: crate::AssistantMessage =
+        let inner: crate::AssistantMessage =
             outcome.blocks.into_iter().collect();
         let usage = Self::make_usage(
             outcome.prompt_tokens,
@@ -1135,15 +1119,11 @@ impl Session {
             outcome.generated_tokens,
         );
         Ok(misanthropic::response::Message {
-            id: std::borrow::Cow::Borrowed(""),
-            inner: content,
-            model: misanthropic::model::Id::Custom(
-                std::borrow::Cow::Owned(self.engine.model.desc()),
-            ),
+            id: std::borrow::Cow::Owned(uuid::Uuid::new_v4().to_string()),
+            inner,
+            model: self.engine.model.desc().into(),
             stop_reason: outcome.stop_reason,
-            stop_sequence: outcome
-                .stop_sequence
-                .map(std::borrow::Cow::Owned),
+            stop_sequence: outcome.stop_sequence.map(std::borrow::Cow::Owned),
             usage,
         })
     }
@@ -1205,9 +1185,7 @@ struct CallOutcome {
 ///
 /// [`Content::SinglePart`]: crate::Content::SinglePart
 /// [`Content::MultiPart`]: crate::Content::MultiPart
-fn merge_adjacent_prose(
-    blocks: Vec<crate::Block>,
-) -> Vec<crate::Block> {
+fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
     use crate::Block;
     use std::borrow::Cow;
     let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
@@ -1240,17 +1218,17 @@ fn infer_stop_reason(
 ) -> (Option<misanthropic::response::StopReason>, Option<String>) {
     use misanthropic::response::StopReason;
 
-    if blocks.iter().any(|b| matches!(b, crate::Block::ToolUse { .. })) {
+    if blocks
+        .iter()
+        .any(|b| matches!(b, crate::Block::ToolUse { .. }))
+    {
         return (Some(StopReason::ToolUse), None);
     }
 
     if let Some(stops) = stop_sequences {
         for s in stops {
             if !s.is_empty() && raw_text.ends_with(s.as_ref()) {
-                return (
-                    Some(StopReason::StopSequence),
-                    Some(s.to_string()),
-                );
+                return (Some(StopReason::StopSequence), Some(s.to_string()));
             }
         }
     }
@@ -1260,7 +1238,8 @@ fn infer_stop_reason(
     }
 
     match blocks.last() {
-        Some(crate::Block::Text { .. }) | Some(crate::Block::Thought { .. }) => {
+        Some(crate::Block::Text { .. })
+        | Some(crate::Block::Thought { .. }) => {
             (Some(StopReason::EndTurn), None)
         }
         _ => (None, None),
@@ -1611,9 +1590,7 @@ mod tests {
         use std::borrow::Cow;
         let user_block = MBlock::Text {
             text: Cow::Borrowed(user_msg),
-            cache_control: Some(CacheControl::Ephemeral {
-                ttl: None,
-            }),
+            cache_control: Some(CacheControl::Ephemeral { ttl: None }),
         };
         Prompt {
             system: Some(MContent::SinglePart(Cow::Borrowed(

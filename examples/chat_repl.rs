@@ -36,8 +36,8 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let n = NonZeroUsize::new(args.max_tokens)
-        .ok_or("--max-tokens must be > 0")?;
+    let n =
+        NonZeroUsize::new(args.max_tokens).ok_or("--max-tokens must be > 0")?;
 
     let mut session = Session::from_path(args.model)?
         .quiet()
@@ -48,9 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // adds a 5-minute breakpoint on the last cacheable block (the
     // system here), so turn 1 establishes the cache and turn 2+ read
     // from it.
-    let mut prompt = CachedPrompt::cached(Prompt::default().set_system(
-        "You are a helpful assistant. Keep replies concise.",
-    ));
+    let mut prompt = CachedPrompt::cached(
+        Prompt::default()
+            .set_system("You are a helpful assistant. Keep replies concise."),
+    );
 
     let mut rl = DefaultEditor::new()?;
     println!("chat_repl — prefix cache on. Ctrl-D or Ctrl-C to exit.");
@@ -67,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prompt.push_message(UserMessage::from(line))?;
 
         let response = session.complete_response(&prompt)?;
-        print_assistant(&response.inner);
+        println!("{}", response.inner.content);
         print_usage(&response.usage);
 
         prompt.push_message(response.inner)?;
@@ -79,20 +80,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print_totals(session.total_usage());
     Ok(())
-}
-
-fn print_assistant(m: &AssistantMessage) {
-    match m.content() {
-        Content::SinglePart(text) => println!("{text}"),
-        Content::MultiPart(blocks) => {
-            for block in blocks {
-                if let Block::Text { text, .. } = block {
-                    print!("{text}");
-                }
-            }
-            println!();
-        }
-    }
 }
 
 fn print_usage(u: &misanthropic::response::Usage) {
