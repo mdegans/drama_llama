@@ -3,6 +3,7 @@
 //! Extracted from `sample.rs` in the JSON-grammar refactor; semantics
 //! unchanged.
 
+#[allow(deprecated)]
 use crate::{
     candidates::Sorted,
     data::{ignore_category::IgnoreCategory, StopWords},
@@ -78,7 +79,12 @@ pub struct RepetitionOptions {
 impl Default for RepetitionOptions {
     fn default() -> Self {
         Self {
-            ignored_categories: vec![],
+            // Punctuation is default-on: prose punctuation (`.`, `,`,
+            // `;`, `:`, `!`, `?`) has no lexical variety, so accumulating
+            // repetition penalty on `.` biases the model toward longer
+            // sentences / run-ons. Users can override by calling
+            // `set_ignored_categories(vec![])`.
+            ignored_categories: vec![IgnoreCategory::Punctuation],
             ignored: vec![],
             penalty_max_count: NonZeroU8::new(1).unwrap(),
             ngram_min_size: NonZeroU8::new(1).unwrap(),
@@ -97,9 +103,9 @@ impl RepetitionOptions {
         &self.ignored_categories
     }
 
-    /// Use [`RepetitionOptions::ignored_categories`] instead
+    /// Use [`RepetitionOptions::ignored_categories`] instead.
     #[allow(deprecated)]
-    #[deprecated]
+    #[deprecated(since = "0.7.0", note = "renamed to `ignored_categories`")]
     pub fn ignored_stopwords(&self) -> &[StopWords] {
         self.ignored_categories()
     }
@@ -113,9 +119,9 @@ impl RepetitionOptions {
         self
     }
 
-    /// Use [`RepetitionOptions::set_ignored_categories`] instead
+    /// Use [`RepetitionOptions::set_ignored_categories`] instead.
     #[allow(deprecated)]
-    #[deprecated]
+    #[deprecated(since = "0.7.0", note = "renamed to `set_ignored_categories`")]
     pub fn set_ignored_stopwords(
         self,
         ignored_stopwords: Vec<StopWords>,
@@ -131,14 +137,17 @@ impl RepetitionOptions {
         self.ignored_categories.extend(ignored_categories);
     }
 
-    /// Use [`RepetitionOptions::extend_ignored_categories`] instead
+    /// Use [`RepetitionOptions::extend_ignored_categories`] instead.
     #[allow(deprecated)]
-    #[deprecated]
-    pub fn extend_stopwords<It>(&mut self, stopwords: It)
+    #[deprecated(
+        since = "0.7.0",
+        note = "renamed to `extend_ignored_categories`"
+    )]
+    pub fn extend_ignored_stopwords<It>(&mut self, stopwords: It)
     where
         It: IntoIterator<Item = StopWords>,
     {
-        self.ignored_categories.extend(stopwords);
+        self.extend_ignored_categories(stopwords);
     }
 
     /// Tokens to ignore. These tokens are never penalized.
@@ -215,6 +224,17 @@ impl RepetitionOptions {
     ) -> Self {
         self.extend_ignored(ignore_categories.into_tokens(model));
         self
+    }
+
+    /// Use [`RepetitionOptions::ignore_categories`] instead.
+    #[allow(deprecated)]
+    #[deprecated(since = "0.7.0", note = "renamed to `ignore_categories`")]
+    pub fn ignore_stopwords(
+        self,
+        stopwords: StopWords,
+        model: &crate::Model,
+    ) -> Self {
+        self.ignore_categories(stopwords, model)
     }
 
     // TODO: ngram penality options

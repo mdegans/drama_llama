@@ -1547,6 +1547,27 @@ mod tests {
         assert_eq!(session.total_usage(), &Usage::default());
     }
 
+    /// `RepetitionOptions::default()` includes `IgnoreCategory::Punctuation`
+    /// so prose punctuation (`.`, `,`, etc.) is never penalized — penalty
+    /// accumulating on `.` biases toward run-on sentences. After
+    /// `Session::with_repetition(default)`, the category must still be
+    /// in `ignored_categories` so the drain inside
+    /// `apply_sample_repetition_ngram` materializes the punctuation
+    /// tokens into `ignored` on first sample call.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_default_repetition_ignores_punctuation_category() {
+        let session = Session::from_path(model_path()).unwrap().quiet();
+        let with_rep = session.with_repetition(RepetitionOptions::default());
+        let rep = with_rep.repetition.as_ref().expect("repetition set");
+        assert!(
+            rep.ignored_categories()
+                .contains(&crate::IgnoreCategory::Punctuation),
+            "default must include Punctuation category, got {:?}",
+            rep.ignored_categories(),
+        );
+    }
+
     /// `with_repetition` must plumb every special token (CONTROL +
     /// USER_DEFINED) into `opts.ignored` so a strong repetition
     /// penalty never suppresses chat-template or tool-call markers

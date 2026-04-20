@@ -9,6 +9,8 @@ pub mod cli;
 pub(crate) mod utils;
 
 pub mod data;
+#[allow(deprecated)]
+pub use data::{IgnoreCategory, StopWords};
 
 mod sample;
 pub use sample::{
