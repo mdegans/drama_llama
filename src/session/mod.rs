@@ -307,7 +307,17 @@ impl Session {
     ///
     /// Opt in for story generation, poetry, or anywhere loop-
     /// prevention matters. See [`RepetitionOptions`] for parameters.
-    pub fn with_repetition(mut self, opts: RepetitionOptions) -> Self {
+    ///
+    /// The model's EOS (and EOT, when distinct) are added to
+    /// `opts.ignored` before storing — a strong repetition penalty
+    /// on those would prevent the model from ever closing a turn.
+    pub fn with_repetition(mut self, mut opts: RepetitionOptions) -> Self {
+        let eos = self.engine.model.eos();
+        opts.extend_ignored([eos]);
+        let eot = self.engine.model.eot();
+        if eot != eos && eot >= 0 {
+            opts.extend_ignored([eot]);
+        }
         self.repetition = Some(opts);
         self
     }
@@ -1537,6 +1547,39 @@ mod tests {
         let session = Session::from_path(model_path()).unwrap().quiet();
         assert_eq!(session.last_usage(), &Usage::default());
         assert_eq!(session.total_usage(), &Usage::default());
+    }
+
+    /// `with_repetition` must plumb EOS (and EOT, when distinct) into
+    /// `opts.ignored` so a strong repetition penalty never prevents
+    /// the model from closing a turn. Regression guard for the bug
+    /// where Session built `PredictOptions` *before* assigning
+    /// repetition, so `add_model_stops`'s ignored-list injection
+    /// silently no-op'd.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_with_repetition_adds_eos_eot_to_ignored() {
+        let session = Session::from_path(model_path()).unwrap().quiet();
+        let eos = session.engine.model.eos();
+        let eot = session.engine.model.eot();
+
+        let with_rep = session.with_repetition(RepetitionOptions::default());
+        let rep = with_rep.repetition.as_ref().expect("repetition set");
+        let ignored = rep.ignored();
+
+        assert!(
+            ignored.contains(&crate::NGram::from(eos)),
+            "EOS ({}) must be in ignored: got {:?}",
+            eos,
+            ignored
+        );
+        if eot != eos && eot >= 0 {
+            assert!(
+                ignored.contains(&crate::NGram::from(eot)),
+                "EOT ({}) must be in ignored when distinct: got {:?}",
+                eot,
+                ignored
+            );
+        }
     }
 
     #[test]

@@ -83,9 +83,9 @@ impl Default for RepetitionOptions {
             penalty_max_count: NonZeroU8::new(1).unwrap(),
             ngram_min_size: NonZeroU8::new(1).unwrap(),
             ngram_max_size: NonZeroU8::new(4).unwrap(),
-            penalty_repeat: 1.15,
-            penalty_freq: 0.0,
-            penalty_present: 0.0,
+            penalty_repeat: 1.06,
+            penalty_freq: 0.1,
+            penalty_present: 0.1,
             surgical: false,
         }
     }
