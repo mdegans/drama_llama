@@ -58,11 +58,19 @@ pub struct RepetitionOptions {
     /// The penalty for the presence of the n-grams. This subtracts the presence
     /// of the n-gram from the logit of the penalized token in the n-gram.
     pub(crate) penalty_present: f32,
-    /// Surgical mode. Instead of penalizing all seen tokens, only penalize the
-    /// token that would *complete* a repeated n-gram pattern. For example, if
-    /// "The New" was just generated and "The New York" is a known trigram,
-    /// penalize "York" specifically to prevent the phrase from completing.
-    /// This is more targeted than the default broad approach.
+    /// Surgical mode. For each repeating n-gram, penalize the earliest token
+    /// that would extend the match in the trailing history. If no prefix has
+    /// been re-emitted yet, this is the first token of the n-gram — blocking
+    /// the phrase at its entry point rather than only at its completion. If
+    /// that target token is in the ignored set, the n-gram is skipped
+    /// entirely (we do not fall through to the next token, which would
+    /// produce odd partial completions).
+    ///
+    /// Example: with `[The, New, York]` as a known repeating trigram, this
+    /// penalizes "The" before the phrase starts, "New" if "The" was just
+    /// emitted, or "York" if "The New" was just emitted. Lowercase stopwords
+    /// like "the" are skipped via the ignored set; uppercase "The" is not,
+    /// so proper-noun repetition is blocked at the first token.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) surgical: bool,
 }
@@ -422,6 +430,39 @@ fn ngram_is_ignored(ngram: NGram, ignored: &[NGram]) -> bool {
     }
 }
 
+/// Pick the token to penalize for surgical mode.
+///
+/// Finds the longest `k` in `[0, ngram.len() - 1]` such that `tokens` ends
+/// with `ngram[..k]` — i.e. how much of the n-gram has already been re-emitted.
+/// Returns `ngram[k]`: the next token that would extend the match (or the
+/// first token, if no prefix has been emitted yet).
+///
+/// Returns `None` when `ngram[k]` is in `ignored`. We deliberately do not
+/// advance to `ngram[k+1]` in that case — penalizing a later token produces
+/// odd partial completions, e.g. ignoring the lowercase "the" stopword in
+/// `[the, cat, sat]` and penalizing "cat" allows "the <other> sat".
+fn surgical_target(
+    ngram: &NGram,
+    tokens: &[llama_token],
+    ignored: &[NGram],
+) -> Option<llama_token> {
+    let slice = ngram.as_slice();
+    let max_k = slice.len().saturating_sub(1);
+    let mut best_k = 0;
+    for k in (1..=max_k).rev() {
+        if tokens.len() >= k && tokens[tokens.len() - k..] == slice[..k] {
+            best_k = k;
+            break;
+        }
+    }
+    let target = slice[best_k];
+    if ngram_is_ignored(target.into(), ignored) {
+        None
+    } else {
+        Some(target)
+    }
+}
+
 /// Apply repetition penalties to the candidates.
 ///
 /// Two-phase approach: first, count trailing n-grams to update the frequency
@@ -498,69 +539,44 @@ pub fn apply_sample_repetition_ngram(
     }
 
     if *surgical {
-        // Phase 2 (surgical): For each n-gram in the frequency map with len > 1,
-        // check if the current trailing tokens match the n-gram's prefix. If so,
-        // penalize the LAST token in the n-gram — the one that would complete
-        // the repeated pattern. For unigrams, penalize the token directly (same
-        // as broad mode).
+        // Phase 2 (surgical): For each repeating n-gram, penalize the earliest
+        // token that would extend the match — slice[k], where k is the longest
+        // prefix already re-emitted in the trailing history. With k=0 (no
+        // prefix re-emitted) we penalize the first token to prevent the phrase
+        // from starting; with k>0 we penalize the next continuation.
         //
         // Example: freq_map contains [The, New, York] with count=2.
-        // Trailing tokens are [..., The, New]. The prefix [The, New] matches,
-        // so we penalize "York" to prevent the trigram from completing.
+        //   tokens end in []           -> k=0, penalize "The"  (prevent start)
+        //   tokens end in [The]        -> k=1, penalize "New"  (prevent continuation)
+        //   tokens end in [The, New]   -> k=2, penalize "York" (prevent completion)
+        //
+        // Stopwords are case-sensitive via tokenization: lowercase "the" is in
+        // the ignored set, uppercase "The" is not — so proper-noun phrases get
+        // blocked at their entry point.
         for (ngram, data) in freq_map.iter() {
             if ngram_is_ignored(*ngram, &ignored) {
                 continue;
             }
-
-            let slice = ngram.as_slice();
-
-            if slice.len() == 1 {
-                // Unigram: penalize directly if seen enough times.
-                let token = slice[0] as usize;
-                if token >= n_vocab {
-                    continue;
-                }
-                if ngram_is_ignored(slice[0].into(), &ignored) {
-                    continue;
-                }
-                let candidate = &mut candidates.data[token];
-                if data.count() > penalty_max_count {
-                    if candidate.logit <= 0.0 {
-                        candidate.logit *= *penalty_repeat;
-                    } else {
-                        candidate.logit /= *penalty_repeat;
-                    }
-                }
-                candidate.logit -=
-                    (data.count() as f32) * *penalty_freq + *penalty_present;
-            } else {
-                // Multi-token n-gram: check if trailing tokens match the prefix.
-                let prefix = &slice[..slice.len() - 1];
-                let completion_token = *slice.last().unwrap() as usize;
-                if completion_token >= n_vocab {
-                    continue;
-                }
-                if ngram_is_ignored((*slice.last().unwrap()).into(), &ignored) {
-                    continue;
-                }
-
-                // Check if the trailing tokens end with this prefix.
-                let matches = tokens.len() >= prefix.len()
-                    && tokens[tokens.len() - prefix.len()..] == *prefix;
-
-                if matches && data.count() > penalty_max_count {
-                    let candidate = &mut candidates.data[completion_token];
-                    let scaled_penalty =
-                        penalty_repeat.powf(ngram.len() as f32);
-                    if candidate.logit <= 0.0 {
-                        candidate.logit *= scaled_penalty;
-                    } else {
-                        candidate.logit /= scaled_penalty;
-                    }
-                    candidate.logit -= (data.count() as f32) * *penalty_freq
-                        + *penalty_present;
-                }
+            if data.count() <= penalty_max_count {
+                continue;
             }
+            let target = match surgical_target(ngram, tokens, &ignored) {
+                Some(t) => t as usize,
+                None => continue,
+            };
+            if target >= n_vocab {
+                continue;
+            }
+
+            let candidate = &mut candidates.data[target];
+            let scaled_penalty = penalty_repeat.powf(ngram.len() as f32);
+            if candidate.logit <= 0.0 {
+                candidate.logit *= scaled_penalty;
+            } else {
+                candidate.logit /= scaled_penalty;
+            }
+            candidate.logit -=
+                (data.count() as f32) * *penalty_freq + *penalty_present;
         }
     } else {
         // Phase 2 (broad): Penalize ALL tracked n-grams. For each n-gram,
@@ -905,5 +921,101 @@ mod tests {
                 data.cum_prob()
             );
         }
+    }
+
+    // --- surgical_target tests (no model required) -----------------------
+
+    fn ngram(tokens: &[llama_token]) -> NGram {
+        NGram::try_from(tokens).unwrap()
+    }
+
+    /// k=0: no prefix re-emitted yet — penalize the first token of the
+    /// n-gram. This blocks proper-noun repetitions like "The New York Times"
+    /// at entry, before "The" is even selected.
+    #[test]
+    fn surgical_target_k0_penalizes_first_token() {
+        let ng = ngram(&[10, 20, 30]);
+        let tokens = &[99, 88, 77];
+        assert_eq!(surgical_target(&ng, tokens, &[]), Some(10));
+    }
+
+    /// k=1: first token re-emitted — penalize the next continuation to
+    /// prevent the phrase from growing past its first token.
+    #[test]
+    fn surgical_target_k1_penalizes_second_token() {
+        let ng = ngram(&[10, 20, 30]);
+        let tokens = &[99, 10];
+        assert_eq!(surgical_target(&ng, tokens, &[]), Some(20));
+    }
+
+    /// k=n-1: full prefix re-emitted — penalize the final completion token.
+    #[test]
+    fn surgical_target_k_full_penalizes_completion() {
+        let ng = ngram(&[10, 20, 30]);
+        let tokens = &[10, 20];
+        assert_eq!(surgical_target(&ng, tokens, &[]), Some(30));
+    }
+
+    /// Longest prefix match wins when the history happens to match multiple
+    /// prefix lengths (here the history ends in [10, 10], both k=1 and k=2
+    /// for an n-gram of [10, 10, 30]).
+    #[test]
+    fn surgical_target_picks_longest_prefix_match() {
+        let ng = ngram(&[10, 10, 30]);
+        let tokens = &[10, 10];
+        assert_eq!(surgical_target(&ng, tokens, &[]), Some(30));
+    }
+
+    /// If the target token is in the ignored set, return None — do NOT
+    /// fall through to slice[k+1]. That fall-through was rejected because
+    /// it produces odd partial completions (e.g. "The New Potato" when the
+    /// lowercase "the" stopword is skipped).
+    #[test]
+    fn surgical_target_skips_entirely_when_target_ignored() {
+        let ng = ngram(&[10, 20, 30]);
+        let ignored = vec![NGram::from(10_i32)];
+        let tokens: &[llama_token] = &[];
+        assert_eq!(surgical_target(&ng, tokens, &ignored), None);
+    }
+
+    /// Ignored check applies at whichever k is selected, not only k=0.
+    #[test]
+    fn surgical_target_ignored_continuation_skips() {
+        let ng = ngram(&[10, 20, 30]);
+        let ignored = vec![NGram::from(20_i32)];
+        let tokens = &[10];
+        assert_eq!(surgical_target(&ng, tokens, &ignored), None);
+    }
+
+    /// Unigram: always k=0, target is the only token.
+    #[test]
+    fn surgical_target_unigram() {
+        let ng = ngram(&[42]);
+        let tokens = &[99];
+        assert_eq!(surgical_target(&ng, tokens, &[]), Some(42));
+        let ignored = vec![NGram::from(42_i32)];
+        assert_eq!(surgical_target(&ng, tokens, &ignored), None);
+    }
+
+    /// History shorter than the prefix shouldn't panic or over-match.
+    #[test]
+    fn surgical_target_short_history() {
+        let ng = ngram(&[10, 20, 30]);
+        // Empty history: only k=0 is possible.
+        assert_eq!(surgical_target(&ng, &[], &[]), Some(10));
+        // History of length 1 that doesn't match prefix[0]: k=0.
+        assert_eq!(surgical_target(&ng, &[99], &[]), Some(10));
+        // History of length 1 matching prefix[0]: k=1.
+        assert_eq!(surgical_target(&ng, &[10], &[]), Some(20));
+    }
+
+    /// A prefix match that doesn't reach the end of history: not a match.
+    /// (We only look at the trailing suffix, not arbitrary substrings.)
+    #[test]
+    fn surgical_target_only_trailing_suffix_counts() {
+        let ng = ngram(&[10, 20, 30]);
+        // [10, 20] appears earlier, but history ends in [99]: k=0.
+        let tokens = &[10, 20, 99];
+        assert_eq!(surgical_target(&ng, tokens, &[]), Some(10));
     }
 }
