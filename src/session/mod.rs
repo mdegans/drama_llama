@@ -81,7 +81,8 @@ use misanthropic::response::Usage;
 
 use crate::{
     chat_template::tokenize_with_breakpoints, engine::NewError,
-    grammar_for_prompt, silence_logs, ChatTemplate, ChatTemplateError, Engine,
+    grammar_for_prompt, output_config, silence_logs, ChatTemplate,
+    ChatTemplateError, Engine, OutputConfigError, OutputConfigOptions,
     PredictOptions, Prompt, RenderOptions, RepetitionOptions, SampleOptions,
     SamplingMode, ToolChoiceError, ToolChoiceOptions,
 };
@@ -105,6 +106,12 @@ pub enum SessionError {
     /// [`ToolChoice`]: crate::ToolChoice
     #[error("tool choice: {0}")]
     ToolChoice(#[from] ToolChoiceError),
+    /// [`OutputConfig`] couldn't be compiled into a grammar — the schema is
+    /// malformed or uses an unsupported `OutputFormat` variant.
+    ///
+    /// [`OutputConfig`]: misanthropic::prompt::output::OutputConfig
+    #[error("output config: {0}")]
+    OutputConfig(#[from] OutputConfigError),
     /// Grammar-forced generation ended without producing a parseable tool call.
     /// Usually means the model was truncated by `max_tokens` before closing the
     /// `</tool_call>` tag, or (less commonly) the grammar itself has a gap that
@@ -230,6 +237,7 @@ pub struct Session {
     engine: Engine,
     template: ChatTemplate,
     tool_choice_opts: ToolChoiceOptions,
+    output_config_opts: OutputConfigOptions,
     render_opts: RenderOptions,
     /// User's sampling chain WITHOUT any grammar. Grammar is prepended
     /// transiently inside `complete_*`. Defaults to
@@ -290,6 +298,7 @@ impl Session {
             engine,
             template,
             tool_choice_opts: ToolChoiceOptions::default(),
+            output_config_opts: OutputConfigOptions::default(),
             render_opts: RenderOptions::default().with_generation_prompt(true),
             sample_modes: vec![SamplingMode::locally_typical()],
             repetition: None,
@@ -352,6 +361,24 @@ impl Session {
     /// [`ToolChoice`]: crate::ToolChoice
     pub fn with_tool_choice_opts(mut self, opts: ToolChoiceOptions) -> Self {
         self.tool_choice_opts = opts;
+        self
+    }
+
+    /// Override the defaults used when compiling
+    /// [`Prompt::output_config`] into a grammar — today just whether an
+    /// optional `<think>...</think>` block is permitted before the
+    /// JSON body. Defaults are `allow_thought: true`, which is usually
+    /// what you want for reasoning-capable models.
+    ///
+    /// Unlike [`Self::with_tool_choice_opts`], this only matters when
+    /// the prompt has `output_config` set; it's otherwise a no-op.
+    ///
+    /// [`Prompt::output_config`]: misanthropic::Prompt::output_config
+    pub fn with_output_config_opts(
+        mut self,
+        opts: OutputConfigOptions,
+    ) -> Self {
+        self.output_config_opts = opts;
         self
     }
 
@@ -512,7 +539,11 @@ impl Session {
         // Grammar (if any) is prepended so it runs first and narrows
         // candidates down to grammar-legal tokens before user filters
         // further shape the distribution.
-        let grammar = grammar_for_prompt(prompt, &self.tool_choice_opts)?;
+        let grammar = resolve_grammar(
+            prompt,
+            &self.tool_choice_opts,
+            &self.output_config_opts,
+        )?;
         let modes: Vec<SamplingMode> = if include_user_sampling {
             grammar
                 .into_iter()
@@ -555,7 +586,11 @@ impl Session {
             (self.engine.model.tokenize(&rendered, true), Vec::new())
         };
 
-        let grammar = grammar_for_prompt(prompt, &self.tool_choice_opts)?;
+        let grammar = resolve_grammar(
+            prompt,
+            &self.tool_choice_opts,
+            &self.output_config_opts,
+        )?;
         let modes: Vec<SamplingMode> = if include_user_sampling {
             grammar
                 .into_iter()
@@ -1123,6 +1158,35 @@ impl Session {
     }
 }
 
+/// Resolve the single grammar (if any) that should constrain
+/// generation for `prompt`. Priority:
+///
+/// 1. `prompt.tool_choice` (when set and not `Auto`) — compiled via
+///    [`grammar_for_prompt`] with `tool_choice_opts`.
+/// 2. `prompt.output_config` — compiled via
+///    [`output_config::grammar_for_prompt`] with `output_config_opts`.
+/// 3. `None` — generation is unconstrained.
+///
+/// Tool-choice wins when both are set: tool schemas *are* structured
+/// output, and the model can only commit to one terminal shape per
+/// turn. Lifted out of [`Session`] so the priority rule is testable
+/// without instantiating an engine.
+fn resolve_grammar(
+    prompt: &Prompt,
+    tool_choice_opts: &ToolChoiceOptions,
+    output_config_opts: &OutputConfigOptions,
+) -> Result<Option<SamplingMode>, SessionError> {
+    if let Some(g) = grammar_for_prompt(prompt, tool_choice_opts)? {
+        return Ok(Some(g));
+    }
+    if let Some(g) =
+        output_config::grammar_for_prompt(prompt, output_config_opts)?
+    {
+        return Ok(Some(g));
+    }
+    Ok(None)
+}
+
 /// Everything [`Session::run_call`] produces about one batch call —
 /// shared by [`Session::complete_blocks`] / [`Session::complete`] /
 /// [`Session::complete_response`] so each can project out the shape
@@ -1394,6 +1458,90 @@ mod tests {
         let new_: Vec<llama_token> = vec![1, 2, 3, 4, 5];
         let breakpoints = vec![1, 3];
         assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 0);
+    }
+
+    /// No tool_choice and no output_config → no grammar constraint.
+    #[test]
+    fn test_resolve_grammar_none_when_neither_set() {
+        let prompt = Prompt::default();
+        let got = resolve_grammar(
+            &prompt,
+            &ToolChoiceOptions::default(),
+            &OutputConfigOptions::default(),
+        )
+        .expect("resolve");
+        assert!(got.is_none());
+    }
+
+    /// Only output_config is set → output-config grammar is used.
+    /// Verify by sniffing the compiled GBNF source for the
+    /// `output_schema` rule name the output_config builder emits.
+    #[test]
+    fn test_resolve_grammar_output_config_when_no_tool_choice() {
+        let prompt = Prompt::default().json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }));
+        let got = resolve_grammar(
+            &prompt,
+            &ToolChoiceOptions::default(),
+            &OutputConfigOptions::default(),
+        )
+        .expect("resolve");
+        let SamplingMode::Grammar(state) = got.expect("some mode") else {
+            panic!("expected Grammar variant");
+        };
+        let source = state.lock().unwrap().grammar().source().to_string();
+        assert!(
+            source.contains("output_schema"),
+            "expected output_config grammar, got: {source}"
+        );
+    }
+
+    /// Both tool_choice and output_config set → tool_choice wins.
+    /// Verify by sniffing for tool_choice's `name_choice` rule (which
+    /// output_config never emits).
+    #[test]
+    fn test_resolve_grammar_tool_choice_wins_over_output_config() {
+        use std::borrow::Cow;
+        let tool = crate::Tool {
+            name: Cow::Borrowed("foo"),
+            description: Cow::Borrowed(""),
+            schema: serde_json::json!({"type": "object"}),
+            cache_control: None,
+            strict: None,
+        };
+        let prompt = Prompt {
+            functions: Some(vec![tool]),
+            tool_choice: Some(crate::ToolChoice::Method {
+                name: "foo".into(),
+            }),
+            ..Prompt::default()
+        }
+        .json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }));
+        let got = resolve_grammar(
+            &prompt,
+            &ToolChoiceOptions::default(),
+            &OutputConfigOptions::default(),
+        )
+        .expect("resolve");
+        let SamplingMode::Grammar(state) = got.expect("some mode") else {
+            panic!("expected Grammar variant");
+        };
+        let source = state.lock().unwrap().grammar().source().to_string();
+        assert!(
+            source.contains("name_choice"),
+            "expected tool_choice grammar, got: {source}"
+        );
+        assert!(
+            !source.contains("output_schema"),
+            "tool_choice grammar must not leak output_config rules, got: {source}"
+        );
     }
 
     /// `PrefixCache::new()` starts with every field zeroed, and
