@@ -45,6 +45,11 @@ pub use tool_choice::{
     grammar_for_tool_choice, ToolChoiceError, ToolChoiceOptions,
 };
 
+pub mod output_config;
+pub use output_config::{
+    grammar_for_output_config, OutputConfigError, OutputConfigOptions,
+};
+
 mod model;
 pub use model::{llama_quantize, Model};
 
