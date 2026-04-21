@@ -44,6 +44,7 @@ egui_file = { version = "0.26", optional = true }
 egui_extras = { version = "0.34", optional = true, features = ["all_loaders"] }
 image = { version = "0.25", optional = true, features = ["png"] }
 rustyline = { version = "14", optional = true }
+schemars = { version = "1", optional = true }
 
 
 [features]
@@ -63,6 +64,9 @@ egui = [
 ]
 repl = ["dep:rustyline", "cli"]
 axum = ["dep:axum", "tokio/full"]
+# Enable typed structured-output helpers: `Prompt::structured_output::<T>()`,
+# `OutputConfig::for_type::<T>()`. Requires `schemars` for schema derivation.
+json-schema = ["dep:schemars", "misanthropic/json-schema"]
 
 [[example]]
 name = "strawberry"
@@ -90,4 +94,4 @@ required-features = ["axum", "cli"]
 [package.metadata.docs.rs]
 # `cuda` will break the build on platforms without it, and it doesn't change the
 # docs anyway.
-features = ["webchat", "cli", "stats", "toml", "serde", "egui"]
+features = ["webchat", "cli", "stats", "toml", "serde", "egui", "json-schema"]
