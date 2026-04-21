@@ -19,14 +19,15 @@
 //! * `type: string | integer | number | boolean | null` → the
 //!   corresponding JSON grammar rule.
 //! * `enum` (any JSON value) → alternation of literals.
+//! * `const: <value>` → exactly the JSON-encoded literal.
 //! * `anyOf` → alternation of sub-schemas.
 //! * `$ref: "#/$defs/<Name>"` → inlines the referenced definition
 //!   from the root schema's `$defs` table.
 //!
-//! Anything else (e.g. `allOf`, `const`, regex `pattern`, numeric
-//! ranges) falls through to the permissive `value` rule, which
-//! accepts any JSON. Callers lose strictness in those spots but
-//! generation does not fail.
+//! Anything else (e.g. `allOf`, regex `pattern`, numeric ranges)
+//! falls through to the permissive `value` rule, which accepts any
+//! JSON. Callers lose strictness in those spots but generation does
+//! not fail.
 
 use std::fmt::Write;
 
@@ -102,6 +103,22 @@ fn emit_schema_rule(
             let _ = write!(alt, r#""{gbnf_lit}""#);
         }
         let _ = writeln!(out, "{rule_name} ::= {alt}");
+        return;
+    }
+
+    // `const: <value>` → exactly the JSON-encoded literal. Schemars
+    // emits this for unit-enum variants with per-variant descriptions
+    // (inside an `anyOf`), which is the Confidence-enum shape
+    // drama_llama's whodunit test depends on. Without this branch,
+    // per-variant `{const: "Low", description: "..."}` subschemas hit
+    // the `_ => value` fallthrough and every variant compiles to
+    // "accept any JSON value" — the grammar provides no constraint at
+    // all for the enum field.
+    if let Some(v) = schema.get("const") {
+        let json_lit =
+            serde_json::to_string(v).unwrap_or_else(|_| "null".into());
+        let gbnf_lit = escape_for_gbnf_string(&json_lit);
+        let _ = writeln!(out, r#"{rule_name} ::= "{gbnf_lit}""#);
         return;
     }
 
@@ -338,6 +355,30 @@ mod tests {
         assert!(accepts(&src, r#""Low""#));
         assert!(accepts(&src, r#""High""#));
         assert!(!accepts(&src, r#""Medium""#));
+    }
+
+    /// Schemars emits unit-enum variants with doc comments as
+    /// `anyOf: [{const: "A", description: "..."}, ...]`. The grammar
+    /// must reject values outside the const set, even though each
+    /// subschema has no `type` field. Regression for the "Definite"
+    /// confidence leak that broke the whodunit example.
+    #[test]
+    fn compiles_any_of_const_variants_from_schemars() {
+        let schema = json!({
+            "anyOf": [
+                {"const": "Low", "description": "thin evidence"},
+                {"const": "Medium", "description": "plausible"},
+                {"const": "High", "description": "airtight"},
+            ]
+        });
+        let mut rules = String::new();
+        schema_to_gbnf(&schema, "conf", &mut rules);
+        let src = wrap_with_root("conf", rules);
+        assert!(accepts(&src, r#""Low""#));
+        assert!(accepts(&src, r#""Medium""#));
+        assert!(accepts(&src, r#""High""#));
+        assert!(!accepts(&src, r#""Definite""#));
+        assert!(!accepts(&src, r#""low""#)); // case-sensitive
     }
 
     #[test]
