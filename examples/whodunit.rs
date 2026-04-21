@@ -78,13 +78,23 @@ glass after the butler's safe sip) AND means (possession of the \
 specific poison used). Identify that suspect.";
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let no_grammar = args.iter().any(|a| a == "--no-grammar");
+    let path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("models/model.gguf"));
     if !path.exists() {
         eprintln!("model not found at {path:?}");
         std::process::exit(2);
+    }
+    if no_grammar {
+        eprintln!(
+            "[setup] --no-grammar: sampling will run with default modes; \
+             output is unconstrained and JSON parsing will be skipped"
+        );
     }
 
     let mut session = Session::from_path_with_n_ctx(path, 8192)
@@ -130,9 +140,13 @@ fn main() {
     let mut predict_opts = PredictOptions::default()
         .add_model_stops(&session.engine().model);
     predict_opts.n = NonZeroUsize::new(4096).unwrap();
-    predict_opts.sample_options = SampleOptions {
-        modes: vec![grammar],
-        repetition: None,
+    predict_opts.sample_options = if no_grammar {
+        SampleOptions::default()
+    } else {
+        SampleOptions {
+            modes: vec![grammar],
+            repetition: None,
+        }
     };
 
     // Drive the piece predictor directly so we see every token as it's
@@ -167,6 +181,12 @@ fn main() {
         "\n\n[done] {n_pieces} pieces in {elapsed:.1}s ({:.1} tok/s)",
         n_pieces as f32 / elapsed.max(0.001),
     );
+
+    if no_grammar {
+        // Unconstrained output isn't expected to parse as CaseFile —
+        // the tok/s reading is the whole point of this mode.
+        return;
+    }
 
     // Trim the trailing EOS piece if present — keeps the raw text
     // JSON-parseable.
