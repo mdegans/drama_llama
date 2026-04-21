@@ -133,6 +133,8 @@ pub struct Engine {
     pub model: Model,
 }
 
+unsafe impl Send for Engine {}
+
 impl Engine {
     /// Create a new `Engine` from common command line arguments.
     #[cfg(feature = "cli")]

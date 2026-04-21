@@ -18,7 +18,7 @@ use llama_cpp_sys_3::{
 };
 use std::{
     collections::BTreeMap,
-    ffi::{c_char, CStr, CString},
+    ffi::{c_char, CStr, CString, OsStr, OsString},
     num::NonZeroU32,
     path::PathBuf,
 };
@@ -117,11 +117,15 @@ pub struct Model {
     /// The vocabulary associated with this model. This pointer is valid for the
     /// lifetime of the model and does not need to be freed separately.
     pub(crate) vocab: *const llama_vocab,
+    /// Model basename
+    pub(crate) file_name: Option<OsString>,
     /// Cached longest-token length. The predictor calls this per generated
     /// token (stop-string windowing), and the naive compute is O(vocab), so
     /// we memoize the first call.
     max_token_len: std::sync::OnceLock<usize>,
 }
+
+unsafe impl Send for Model {}
 
 #[derive(Debug, From)]
 pub enum MetaKey<'a> {
@@ -148,6 +152,8 @@ impl Model {
             eprintln!("Eric Hartford's `Uncensored` models are not supported. Read the TOS. If you want smut, use the foundation models and an n-shot prompt. Example: https://huggingface.co/NousResearch/Meta-Llama-3-70B-GGUF/");
             return None;
         }
+
+        let file_name = path.file_name()?.to_owned();
         let path = path_to_cstring(path);
         // Safety: What's returned is POD
         let params = params.unwrap_or(unsafe { llama_model_default_params() });
@@ -164,6 +170,7 @@ impl Model {
             Some(Self {
                 inner: model,
                 vocab,
+                file_name: Some(file_name),
                 max_token_len: std::sync::OnceLock::new(),
             })
         }
@@ -183,9 +190,17 @@ impl Model {
             Some(Self {
                 inner: ptr,
                 vocab,
+                file_name: None,
                 max_token_len: std::sync::OnceLock::new(),
             })
         }
+    }
+
+    /// Return the base filename if the `Model` was loaded [`from_file`]
+    ///
+    /// [`from_file`]: Model::from_file
+    pub fn file_name<'a>(&'a self) -> Option<&'a OsStr> {
+        self.file_name.as_deref()
     }
 
     /// Unwrap the model and return the raw pointer.

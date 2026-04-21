@@ -37,14 +37,25 @@
 pub use misanthropic::prompt::message::Role;
 pub use misanthropic::tool::Choice as ToolChoice;
 
-pub type AssistantMessage =
-    misanthropic::prompt::message::AssistantMessage<'static>;
-pub type Block = misanthropic::prompt::message::Block<'static>;
-pub type Content = misanthropic::prompt::message::Content<'static>;
+// Prompt types. Prefer CachedPrompt for append-only flow (cache friendly).
+pub type Prompt = misanthropic::Prompt<'static>;
+pub type CachedPrompt = misanthropic::prompt::cached::CachedPrompt<'static>;
+
+// Typed messages, useful for avoiding turn order errors
+pub type AssistantMessage = misanthropic::prompt::AssistantMessage<'static>;
+pub type UserMessage = misanthropic::prompt::UserMessage<'static>;
+
+// Message and content
 pub type Message = misanthropic::prompt::message::Message<'static>;
-pub type UserMessage = misanthropic::prompt::message::UserMessage<'static>;
+pub type Content = misanthropic::prompt::message::Content<'static>;
+pub type Block = misanthropic::prompt::message::Block<'static>;
+
+// Tool stuff
 pub type Tool = misanthropic::tool::Method<'static>;
 pub type ToolResult = misanthropic::tool::Result<'static>;
 pub type ToolUse = misanthropic::tool::Use<'static>;
-pub type Prompt = misanthropic::Prompt<'static>;
-pub type CachedPrompt = misanthropic::prompt::cached::CachedPrompt<'static>;
+
+// Api types and Usage stats
+pub type MessageResponse = misanthropic::response::Message<'static>;
+pub type AnthropicError = misanthropic::client::AnthropicError;
+pub type Usage = misanthropic::response::Usage;
