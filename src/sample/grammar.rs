@@ -35,11 +35,18 @@
 
 use llama_cpp_sys_3::{llama_token, llama_token_data};
 use rayon::prelude::*;
-use tinyvec::ArrayVec;
+use tinyvec::{ArrayVec, TinyVec};
 
 use std::sync::Arc;
 
 use crate::{model::token_to_piece_ref, Candidates, Model};
+
+/// Inline-capacity of a single stack in the NFA simulation. Most grammars
+/// keep call stacks under 4 deep; 8 covers nested alternation / repetition
+/// without spilling to the heap.
+const STACK_INLINE: usize = 8;
+
+type Stack = TinyVec<[Position; STACK_INLINE]>;
 
 // ===========================================================================
 // Compiled grammar
@@ -661,19 +668,37 @@ fn is_name_char(c: char) -> bool {
 
 /// Position within the element stream: which alt of which rule, and how
 /// far through it.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Position {
     rule_idx: u32,
     alt_idx: u32,
     atom_idx: u32,
 }
 
+/// Matcher state *without* the grammar reference.
+///
+/// Holds only the mutable simulation bits (active stacks + pending UTF-8
+/// buffer). Splitting this out of [`GrammarState`] lets the hot filter
+/// loop clone matcher state without bumping the `Arc<Grammar>`
+/// refcount per candidate — 150k atomic ops per decode step was a real
+/// cost in profiles.
+///
+/// Each element of `stacks` is a call stack: the innermost frame is the
+/// rule currently being walked; popping returns to the caller. Multiple
+/// stacks coexist because GBNF rules branch on alternation. `Stack` is a
+/// [`TinyVec`] so typical-depth stacks stay inline (no per-clone heap
+/// allocation).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StackState {
+    stacks: Vec<Stack>,
+    pending: ArrayVec<[u8; 4]>,
+}
+
 /// Active matching state for a [`Grammar`].
 ///
-/// The matcher is an NFA-like simulation over the compiled rules. Each
-/// element of `stacks` is a call stack: the innermost frame is the rule
-/// currently being walked; popping returns to the caller. Multiple stacks
-/// coexist because GBNF rules branch on alternation.
+/// Thin wrapper: owns the `Arc<Grammar>` plus the mutable [`StackState`].
+/// All matcher methods delegate into [`StackState`] with a borrowed
+/// `&Grammar`. See [`StackState`] for why.
 ///
 /// Clone cost is proportional to `stacks.len() * avg_stack_depth`, which is
 /// small for practical grammars. `accepts_bytes` relies on cloning for
@@ -681,48 +706,30 @@ struct Position {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrammarState {
     grammar: Arc<Grammar>,
-    stacks: Vec<Vec<Position>>,
-    pending: ArrayVec<[u8; 4]>,
+    inner: StackState,
 }
 
 impl GrammarState {
     /// Construct a fresh matcher rooted at the grammar's `root` rule.
     pub fn new(grammar: Arc<Grammar>) -> Self {
-        let mut state = Self {
-            grammar,
-            stacks: Vec::new(),
-            pending: ArrayVec::new(),
-        };
-        state.reset();
-        state
+        let inner = StackState::new_rooted(&grammar);
+        Self { grammar, inner }
     }
 
     /// Reset to the fresh starting state.
     pub fn reset(&mut self) {
-        self.pending.clear();
-        let root = self.grammar.root as u32;
-        let root_rule = &self.grammar.rules[self.grammar.root];
-        self.stacks = (0..root_rule.alts.len())
-            .map(|alt_idx| {
-                vec![Position {
-                    rule_idx: root,
-                    alt_idx: alt_idx as u32,
-                    atom_idx: 0,
-                }]
-            })
-            .collect();
-        self.expand();
+        self.inner.reset(&self.grammar);
     }
 
     /// True iff the matcher has reached an accepting state AND no partial
     /// UTF-8 codepoint is buffered.
     pub fn is_complete(&self) -> bool {
-        self.pending.is_empty() && self.stacks.iter().any(|s| s.is_empty())
+        self.inner.is_complete()
     }
 
     /// Current number of active stacks. Useful for UI status / debugging.
     pub fn stack_depth(&self) -> usize {
-        self.stacks.len()
+        self.inner.stacks.len()
     }
 
     /// Borrow the underlying grammar.
@@ -733,44 +740,100 @@ impl GrammarState {
     /// True iff feeding `bytes` would succeed from the current state. Does
     /// not mutate `self`.
     pub fn accepts_bytes(&self, bytes: &[u8]) -> bool {
-        let mut clone = self.clone();
-        clone.advance_bytes(bytes).is_ok()
+        self.inner.accepts_bytes(&self.grammar, bytes)
+    }
+
+    /// 256-bit bitmap indexed by byte value: bit `b` is set iff feeding
+    /// byte `b` next could plausibly extend the match into a codepoint
+    /// accepted by at least one active stack. See
+    /// [`StackState::first_byte_bitmap`] for details.
+    pub(crate) fn first_byte_bitmap(&self) -> [u64; 4] {
+        self.inner.first_byte_bitmap(&self.grammar)
     }
 
     /// Commit `bytes` to the matcher. Call after sampling selects a token.
-    ///
-    /// Partial UTF-8 at the end of `bytes` is buffered for the next call —
-    /// llama tokens can split multi-byte codepoints. If the pending
-    /// prefix cannot possibly complete into any codepoint the current
-    /// grammar state would accept, this returns an error so the filter
-    /// rejects the token. Without this check, byte-fallback tokens
-    /// (e.g. `<0xC3>`) can wedge an ASCII-only grammar into a dead
-    /// state where every subsequent candidate fails UTF-8 validation.
     pub fn advance_bytes(&mut self, bytes: &[u8]) -> Result<(), GrammarError> {
-        for &b in bytes {
-            self.feed_byte(b)?;
-        }
-        if !self.pending.is_empty() && !self.pending_can_still_match() {
-            return Err(GrammarError::InvalidUtf8);
-        }
-        Ok(())
+        self.inner.advance_bytes(&self.grammar, bytes)
+    }
+}
+
+impl StackState {
+    /// Fresh state rooted at `grammar.root`.
+    fn new_rooted(grammar: &Grammar) -> Self {
+        let mut state = Self {
+            stacks: Vec::new(),
+            pending: ArrayVec::new(),
+        };
+        state.reset(grammar);
+        state
     }
 
-    /// True if the pending UTF-8 prefix could still complete into a
-    /// codepoint that at least one active stack would accept. Returns
-    /// true conservatively (over-approximates) — a `true` result does
-    /// not guarantee a match, only that one is plausible.
-    fn pending_can_still_match(&self) -> bool {
-        let (lo, hi) = match pending_codepoint_range(self.pending.as_slice()) {
-            Some(range) => range,
-            // Pending already invalid; advance_bytes would have erred.
-            None => return false,
-        };
+    fn reset(&mut self, grammar: &Grammar) {
+        self.pending.clear();
+        let root = grammar.root as u32;
+        let root_rule = &grammar.rules[grammar.root];
+        self.stacks = (0..root_rule.alts.len())
+            .map(|alt_idx| {
+                let mut s: Stack = TinyVec::new();
+                s.push(Position {
+                    rule_idx: root,
+                    alt_idx: alt_idx as u32,
+                    atom_idx: 0,
+                });
+                s
+            })
+            .collect();
+        self.expand(grammar);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.pending.is_empty() && self.stacks.iter().any(|s| s.is_empty())
+    }
+
+    /// True iff feeding `bytes` would succeed from the current state.
+    /// Clones only the matcher state — the `Arc<Grammar>` is not touched.
+    fn accepts_bytes(&self, grammar: &Grammar, bytes: &[u8]) -> bool {
+        let mut scratch = self.clone();
+        scratch.advance_bytes(grammar, bytes).is_ok()
+    }
+
+    /// Conservative 256-bit bitmap of which first byte values could plausibly
+    /// extend the match from the current state. Set bit ⇒ "maybe accepted"
+    /// (still needs full `accepts_bytes` confirmation); cleared bit ⇒
+    /// "definitely rejected". See [`grammar_filter`] for how it's used.
+    pub(crate) fn first_byte_bitmap(&self, grammar: &Grammar) -> [u64; 4] {
+        let mut bitmap = [0u64; 4];
+        let pending_len = self.pending.len();
+        if pending_len >= 4 {
+            return bitmap;
+        }
+        let mut hyp: [u8; 4] = [0; 4];
+        hyp[..pending_len].copy_from_slice(self.pending.as_slice());
+        for b in 0u8..=0xFFu8 {
+            hyp[pending_len] = b;
+            let Some((lo, hi)) =
+                pending_codepoint_range(&hyp[..pending_len + 1])
+            else {
+                continue;
+            };
+            if self.any_stack_top_intersects(grammar, lo, hi) {
+                bitmap[(b as usize) >> 6] |= 1u64 << (b & 63);
+            }
+        }
+        bitmap
+    }
+
+    fn any_stack_top_intersects(
+        &self,
+        grammar: &Grammar,
+        lo: u32,
+        hi: u32,
+    ) -> bool {
         for stack in &self.stacks {
             let Some(pos) = stack.last() else {
                 continue;
             };
-            let atoms = &self.grammar.rules[pos.rule_idx as usize].alts
+            let atoms = &grammar.rules[pos.rule_idx as usize].alts
                 [pos.alt_idx as usize];
             let Some(Atom::CharSet(cs)) = atoms.get(pos.atom_idx as usize)
             else {
@@ -783,38 +846,62 @@ impl GrammarState {
         false
     }
 
-    fn feed_byte(&mut self, b: u8) -> Result<(), GrammarError> {
+    fn advance_bytes(
+        &mut self,
+        grammar: &Grammar,
+        bytes: &[u8],
+    ) -> Result<(), GrammarError> {
+        for &b in bytes {
+            self.feed_byte(grammar, b)?;
+        }
+        if !self.pending.is_empty()
+            && !self.pending_can_still_match(grammar)
+        {
+            return Err(GrammarError::InvalidUtf8);
+        }
+        Ok(())
+    }
+
+    fn pending_can_still_match(&self, grammar: &Grammar) -> bool {
+        let (lo, hi) = match pending_codepoint_range(self.pending.as_slice()) {
+            Some(range) => range,
+            None => return false,
+        };
+        self.any_stack_top_intersects(grammar, lo, hi)
+    }
+
+    fn feed_byte(
+        &mut self,
+        grammar: &Grammar,
+        b: u8,
+    ) -> Result<(), GrammarError> {
         self.pending.push(b);
         match decode_utf8(self.pending.as_slice()) {
             Utf8Decode::Complete(cp) => {
                 self.pending.clear();
-                self.consume(cp)
+                self.consume(grammar, cp)
             }
             Utf8Decode::Incomplete => Ok(()),
             Utf8Decode::Invalid => Err(GrammarError::InvalidUtf8),
         }
     }
 
-    /// Consume a single codepoint: keep only stacks whose top CharSet
-    /// accepts it, then re-expand.
-    fn consume(&mut self, cp: u32) -> Result<(), GrammarError> {
-        let mut next: Vec<Vec<Position>> = Vec::new();
+    fn consume(
+        &mut self,
+        grammar: &Grammar,
+        cp: u32,
+    ) -> Result<(), GrammarError> {
+        let mut next: Vec<Stack> = Vec::with_capacity(self.stacks.len());
         for stack in self.stacks.drain(..) {
             let Some(pos) = stack.last() else {
-                // Already accepting; a fresh codepoint here would require
-                // re-starting at root. Grammar-completion is strict: reject.
                 continue;
             };
-            let atoms = &self.grammar.rules[pos.rule_idx as usize].alts
+            let atoms = &grammar.rules[pos.rule_idx as usize].alts
                 [pos.alt_idx as usize];
             let Some(atom) = atoms.get(pos.atom_idx as usize) else {
                 continue;
             };
             let Atom::CharSet(cs) = atom else {
-                // Expansion should leave only CharSet tops. If a
-                // RuleRef slips through (e.g. budget exhaustion on a
-                // deep grammar), skip that stack — aborting the whole
-                // consume would poison the entire candidate set.
                 continue;
             };
             if cs.contains(cp) {
@@ -825,7 +912,7 @@ impl GrammarState {
             }
         }
         self.stacks = next;
-        self.expand();
+        self.expand(grammar);
         if self.stacks.is_empty() {
             return Err(GrammarError::NoMatch(cp));
         }
@@ -834,9 +921,26 @@ impl GrammarState {
 
     /// Walk all epsilon transitions until every stack is either empty
     /// (accepting) or has a CharSet at the top.
-    fn expand(&mut self) {
-        let mut queue: Vec<Vec<Position>> = std::mem::take(&mut self.stacks);
-        let mut result: Vec<Vec<Position>> = Vec::new();
+    fn expand(&mut self, grammar: &Grammar) {
+        // Fast path: every stack is already at a CharSet yield point (no
+        // alt-complete pops to resolve, no RuleRef to open). No allocation,
+        // no dedup needed — the incoming stacks were already deduped by
+        // the prior expand call.
+        let all_yield = self.stacks.iter().all(|stack| {
+            let Some(pos) = stack.last() else {
+                // Accepted stacks count as already at a yield point.
+                return true;
+            };
+            let atoms = &grammar.rules[pos.rule_idx as usize].alts
+                [pos.alt_idx as usize];
+            matches!(atoms.get(pos.atom_idx as usize), Some(Atom::CharSet(_)))
+        });
+        if all_yield {
+            return;
+        }
+
+        let mut queue: Vec<Stack> = std::mem::take(&mut self.stacks);
+        let mut result: Vec<Stack> = Vec::with_capacity(queue.len());
         // Bound iterations to guard against pathological left-recursive
         // grammars. 4096 * initial stack count is ample for sane GBNF.
         let budget = 4096usize.saturating_mul(queue.len().max(1));
@@ -848,11 +952,9 @@ impl GrammarState {
                 result.push(stack);
                 continue;
             };
-            let alts = &self.grammar.rules[pos.rule_idx as usize].alts;
+            let alts = &grammar.rules[pos.rule_idx as usize].alts;
             let alt = &alts[pos.alt_idx as usize];
             if pos.atom_idx as usize == alt.len() {
-                // Alt complete: pop the frame. If the caller exists,
-                // advance its atom pointer past the just-completed RuleRef.
                 stack.pop();
                 if let Some(caller) = stack.last_mut() {
                     caller.atom_idx += 1;
@@ -865,21 +967,37 @@ impl GrammarState {
                     result.push(stack);
                 }
                 Atom::RuleRef(r) => {
-                    let sub_alts = &self.grammar.rules[*r].alts;
+                    // Tail-call optimization: if this RuleRef is the
+                    // last atom of the enclosing alt, replace the
+                    // current frame with the sub-rule's frame instead
+                    // of pushing. Semantically identical — when the
+                    // sub-rule completes, it pops back to the original
+                    // caller either way — but keeps right-recursive
+                    // rules like `.+ ::= . | . _anon` bounded in depth.
+                    // Without TCO, every consumed codepoint grows a
+                    // stack by one frame.
+                    let is_tail = pos.atom_idx as usize + 1 == alt.len();
+                    let sub_alts = &grammar.rules[*r].alts;
                     for (a_idx, _) in sub_alts.iter().enumerate() {
-                        let mut branched = stack.clone();
-                        branched.push(Position {
+                        let new_pos = Position {
                             rule_idx: *r as u32,
                             alt_idx: a_idx as u32,
                             atom_idx: 0,
-                        });
+                        };
+                        let mut branched = stack.clone();
+                        if is_tail {
+                            *branched.last_mut().unwrap() = new_pos;
+                        } else {
+                            branched.push(new_pos);
+                        }
                         queue.push(branched);
                     }
                 }
             }
         }
         // Dedupe: identical stacks are redundant work. The NFA simulation
-        // can otherwise explode on deeply nested alternations.
+        // can otherwise explode on deeply nested alternations. stdlib's
+        // sort short-circuits on len < 2.
         result.sort();
         result.dedup();
         self.stacks = result;
@@ -1132,20 +1250,37 @@ pub(crate) fn grammar_filter(
     state: &mut GrammarState,
     model: &Model,
 ) -> Candidates {
-    // Each candidate check is independent: clone the grammar state,
+    // Each candidate check is independent: clone the matcher state,
     // try to advance it by the token's bytes, keep the token iff the
     // clone survives. Fan out across rayon's global pool so 150k-vocab
     // models don't bottleneck on a single core. `GrammarState` is
     // auto-Sync (pure data behind an Arc), `Model` is Sync by manual
     // impl (post-load data is immutable — see src/model.rs).
-    let state_ref: &GrammarState = state;
+    //
+    // The first-byte bitmap is a cheap O(1)/candidate prefilter that
+    // rejects candidates whose first byte can't extend the match. See
+    // [`StackState::first_byte_bitmap`] for the invariant.
+    //
+    // We borrow `&state.grammar` once outside the parallel loop so
+    // per-candidate scratch clones stay inside `StackState` and never
+    // bump the `Arc<Grammar>` refcount (profiles showed that atomic
+    // traffic was a real cost).
+    let bitmap = state.first_byte_bitmap();
+    let grammar: &Grammar = &state.grammar;
+    let inner: &StackState = &state.inner;
     let kept: Vec<llama_token_data> = candidates
         .as_slice()
         .par_iter()
         .filter_map(|cand| {
             let mut buf: Vec<u8> = Vec::with_capacity(32);
             token_to_piece_ref(cand.id, model, &mut buf);
-            state_ref.accepts_bytes(&buf).then_some(*cand)
+            if let Some(&first) = buf.first() {
+                if bitmap[(first as usize) >> 6] & (1u64 << (first & 63)) == 0
+                {
+                    return None;
+                }
+            }
+            inner.accepts_bytes(grammar, &buf).then_some(*cand)
         })
         .collect();
 
@@ -1645,5 +1780,144 @@ char ::= [\x00-\x7F] | [\x80-\xFF]"#;
             trimmed.starts_with(r#"{"name":"get_weather","arguments":{"city":""#),
             "output must start with the forced tool-call prefix. output: {output:?}"
         );
+    }
+
+    // ======================================================================
+    // First-byte bitmap prefilter
+    // ======================================================================
+
+    fn bit_is_set(bitmap: &[u64; 4], b: u8) -> bool {
+        bitmap[(b as usize) >> 6] & (1u64 << (b & 63)) != 0
+    }
+
+    fn bitmap_popcount(bitmap: &[u64; 4]) -> u32 {
+        bitmap.iter().map(|w| w.count_ones()).sum()
+    }
+
+    /// A literal grammar admits exactly one first byte at the start.
+    #[test]
+    fn bitmap_literal_single_byte() {
+        let grammar = Arc::new(parse_ok(r#"root ::= "hello""#));
+        let state = GrammarState::new(grammar);
+        let bm = state.first_byte_bitmap();
+        assert_eq!(bitmap_popcount(&bm), 1);
+        assert!(bit_is_set(&bm, b'h'));
+        assert!(!bit_is_set(&bm, b'H'));
+        assert!(!bit_is_set(&bm, b'\0'));
+    }
+
+    /// A char class admits every byte in its range and nothing else.
+    #[test]
+    fn bitmap_ascii_char_class() {
+        let grammar = Arc::new(parse_ok(r#"root ::= [a-c]+"#));
+        let state = GrammarState::new(grammar);
+        let bm = state.first_byte_bitmap();
+        assert_eq!(bitmap_popcount(&bm), 3);
+        for b in b'a'..=b'c' {
+            assert!(bit_is_set(&bm, b), "byte {b:#x} should be set");
+        }
+        assert!(!bit_is_set(&bm, b'd'));
+        assert!(!bit_is_set(&bm, b'A'));
+    }
+
+    /// Alternation unions the per-branch bitmaps.
+    #[test]
+    fn bitmap_alternation_union() {
+        let grammar = Arc::new(parse_ok(r#"root ::= "yes" | "no""#));
+        let state = GrammarState::new(grammar);
+        let bm = state.first_byte_bitmap();
+        assert!(bit_is_set(&bm, b'y'));
+        assert!(bit_is_set(&bm, b'n'));
+        assert_eq!(bitmap_popcount(&bm), 2);
+    }
+
+    /// Never-valid UTF-8 leads (overlong 2-byte leads, out-of-range 4-byte
+    /// leads, continuation bytes in lead position) must never be set.
+    #[test]
+    fn bitmap_excludes_invalid_utf8_leads() {
+        let grammar = Arc::new(parse_ok(r#"root ::= .+"#));
+        let state = GrammarState::new(grammar);
+        let bm = state.first_byte_bitmap();
+        for b in [0xC0u8, 0xC1, 0xF5, 0xF6, 0xF7, 0xF8, 0xFE, 0xFF] {
+            assert!(!bit_is_set(&bm, b), "invalid lead {b:#x} was set");
+        }
+        for b in 0x80u8..=0xBFu8 {
+            assert!(!bit_is_set(&bm, b), "continuation {b:#x} was set");
+        }
+    }
+
+    /// An accepting state (literal already consumed) rejects all further
+    /// codepoints — the bitmap must be entirely zero.
+    #[test]
+    fn bitmap_accepting_state_is_empty() {
+        let grammar = Arc::new(parse_ok(r#"root ::= "hi""#));
+        let mut state = GrammarState::new(grammar);
+        state.advance_bytes(b"hi").unwrap();
+        assert!(state.is_complete());
+        let bm = state.first_byte_bitmap();
+        assert_eq!(bitmap_popcount(&bm), 0);
+    }
+
+    /// With a pending UTF-8 lead buffered, only the continuation bytes
+    /// that would complete the codepoint into an accepted range are set.
+    #[test]
+    fn bitmap_with_pending_restricts_to_valid_continuations() {
+        // "é" = 0xC3 0xA9. Feeding just 0xC3 leaves pending = [0xC3].
+        let grammar = Arc::new(parse_ok(r#"root ::= "é""#));
+        let mut state = GrammarState::new(grammar);
+        state.advance_bytes(&[0xC3]).unwrap();
+        let bm = state.first_byte_bitmap();
+        // Exactly one continuation byte completes the codepoint.
+        assert!(bit_is_set(&bm, 0xA9));
+        // Anything else — including other continuations — must be clear.
+        for b in 0x80u8..=0xBFu8 {
+            if b != 0xA9 {
+                assert!(!bit_is_set(&bm, b), "{b:#x} wrongly set");
+            }
+        }
+        // And ASCII bytes certainly can't extend a 2-byte lead.
+        for b in 0u8..=0x7Fu8 {
+            assert!(!bit_is_set(&bm, b));
+        }
+    }
+
+    /// Every byte whose bit is cleared must cause `accepts_bytes` to
+    /// return false — that's the prefilter's soundness invariant.
+    #[test]
+    fn bitmap_soundness_matches_accepts_bytes() {
+        for src in [
+            r#"root ::= "foo""#,
+            r#"root ::= [a-zA-Z]+"#,
+            r#"root ::= [^ \n]+"#,
+            r#"root ::= "{" [a-z]+ ":" [0-9]+ "}""#,
+        ] {
+            let grammar = Arc::new(parse_ok(src));
+            let state = GrammarState::new(grammar);
+            let bm = state.first_byte_bitmap();
+            for b in 0u8..=0xFFu8 {
+                if !bit_is_set(&bm, b) {
+                    assert!(
+                        !state.accepts_bytes(&[b]),
+                        "grammar {src:?} rejected byte {b:#x} via bitmap but \
+                         accepts_bytes permitted it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A Japanese-range grammar expects multi-byte leads only — the ASCII
+    /// half of the bitmap must be empty, and the Hiragana leads must be
+    /// set.
+    #[test]
+    fn bitmap_multibyte_grammar() {
+        let grammar = Arc::new(parse_ok(r#"root ::= [ぁ-ん]+"#));
+        let state = GrammarState::new(grammar);
+        let bm = state.first_byte_bitmap();
+        for b in 0u8..=0x7Fu8 {
+            assert!(!bit_is_set(&bm, b));
+        }
+        // Hiragana U+3041..U+3093 all start with 3-byte lead 0xE3.
+        assert!(bit_is_set(&bm, 0xE3));
     }
 }

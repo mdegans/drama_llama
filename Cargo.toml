@@ -19,7 +19,7 @@ rand = { version = "0.9" }
 regex = "1.10"
 static_assertions = "1.1.0"
 thiserror = "1.0"
-tinyvec = "1.6"
+tinyvec = { version = "1.6", features = ["alloc"] }
 xorshift = "0.1"
 rayon = "1.10.0"
 minijinja = { version = "2.5", features = ["loader", "json"] }
