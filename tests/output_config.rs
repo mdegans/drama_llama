@@ -91,13 +91,15 @@ considered all three suspects in <think>...</think>.";
 #[test]
 #[ignore = "requires model"]
 fn whodunit_verdict() {
-    let mut session = Session::from_path(model_path())
+    // Default n_ctx (512) truncates long before the thought block
+    // finishes. Bump to 8192 so scenario + thinking + verdict fit.
+    let mut session = Session::from_path_with_n_ctx(model_path(), 8192)
         .expect("session load")
         .quiet()
         .with_render_opts(
             RenderOptions::default().with_extra("enable_thinking", true),
         )
-        .with_max_tokens(NonZeroUsize::new(2048).unwrap());
+        .with_max_tokens(NonZeroUsize::new(4096).unwrap());
 
     let prompt = Prompt::default()
         .structured_output::<CaseFile>()

@@ -86,13 +86,15 @@ fn main() {
         std::process::exit(2);
     }
 
-    let mut session = Session::from_path(path)
+    // Default n_ctx (512) truncates long before the thought block
+    // finishes. Bump to 8192.
+    let mut session = Session::from_path_with_n_ctx(path, 8192)
         .expect("session load")
         .quiet()
         .with_render_opts(
             RenderOptions::default().with_extra("enable_thinking", true),
         )
-        .with_max_tokens(NonZeroUsize::new(2048).unwrap());
+        .with_max_tokens(NonZeroUsize::new(4096).unwrap());
 
     let prompt = Prompt::default()
         .structured_output::<CaseFile>()

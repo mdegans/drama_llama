@@ -283,6 +283,22 @@ impl Session {
         Self::from_engine(engine)
     }
 
+    /// Load a model from disk with an explicit KV context size.
+    ///
+    /// [`Self::from_path`] inherits llama.cpp's default `n_ctx = 512`,
+    /// which truncates chat and structured-output workloads well
+    /// before they finish. Use this builder when the prompt plus the
+    /// generation cap ([`Self::with_max_tokens`]) can exceed 512
+    /// tokens — which is almost always for reasoning-capable models.
+    /// Typical values: 4096 – 16384.
+    pub fn from_path_with_n_ctx(
+        path: PathBuf,
+        n_ctx: u32,
+    ) -> Result<Self, SessionError> {
+        let engine = Engine::from_path_with_n_ctx(path, n_ctx)?;
+        Self::from_engine(engine)
+    }
+
     /// Load a model CPU-only (zero GPU layers). Diagnostic path for
     /// isolating GPU-kernel divergence.
     pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, SessionError> {
@@ -410,6 +426,13 @@ impl Session {
     }
 
     /// Set the maximum tokens generated per `complete_*` call.
+    ///
+    /// This is a *generation* cap, independent of the engine's KV
+    /// context size (`n_ctx`). If the prompt plus `n` exceeds the
+    /// engine's configured `n_ctx`, generation truncates at the KV
+    /// cache boundary regardless of this value — reached via
+    /// [`Self::from_path_with_n_ctx`] or by constructing an [`Engine`]
+    /// directly.
     pub fn with_max_tokens(mut self, n: NonZeroUsize) -> Self {
         self.max_tokens = n;
         self

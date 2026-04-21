@@ -238,6 +238,28 @@ impl Engine {
         Self::new(path, None, Some(cp), None)
     }
 
+    /// Create a new engine from a model `path` with an explicit KV
+    /// context size. Also bumps `n_batch` / `n_ubatch` so the engine
+    /// can accept full prefills of that size.
+    ///
+    /// llama.cpp's `llama_context_default_params()` sets `n_ctx = 512`,
+    /// which is far too small for real chat or structured-output
+    /// workloads — a single long system prompt plus a reasoning-capable
+    /// model's `<think>` block can easily exceed that before the JSON
+    /// body even starts. Use this builder when you know your workload
+    /// needs more headroom. Typical chat values: 4096 – 16384. Per-cell
+    /// KV memory grows linearly, so don't pick 32k "just in case".
+    pub fn from_path_with_n_ctx(
+        path: PathBuf,
+        n_ctx: u32,
+    ) -> Result<Self, NewError> {
+        let mut cp = unsafe { llama_context_default_params() };
+        cp.n_ctx = n_ctx;
+        cp.n_batch = n_ctx;
+        cp.n_ubatch = cp.n_ubatch.min(n_ctx);
+        Self::new(path, None, Some(cp), None)
+    }
+
     /// Returns true if mmap is supported.
     pub fn supports_mmap() -> bool {
         unsafe { llama_supports_mmap() }
