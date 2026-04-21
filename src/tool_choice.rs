@@ -39,6 +39,9 @@
 
 use std::fmt::Write;
 
+use crate::grammar_compile::{
+    emit_thought_rules, escape_for_gbnf_string, schema_to_gbnf, JSON_GRAMMAR,
+};
 use crate::{GrammarError, Prompt, SamplingMode, Tool, ToolChoice};
 
 /// Options for [`grammar_for_tool_choice`].
@@ -191,14 +194,7 @@ pub(crate) fn build_grammar_source(
     };
     if opts.allow_thought {
         let _ = writeln!(src, "root ::= thought? ws {wrapped_call}");
-        let _ = writeln!(src, r#"thought ::= "<think>" think_body "</think>""#);
-        let _ = writeln!(src, r#"think_body ::= think_char*"#);
-        // Allow `<` inside a thought as long as the next char isn't the
-        // start of the closing tag (`</think>`). Keeps natural math /
-        // comparison text like `if x < 5` from force-EOSing the model.
-        // GBNF has no negative lookahead, so we split into two alts:
-        // any non-`<` byte, OR a `<` followed by a non-`/` byte.
-        let _ = writeln!(src, r#"think_char ::= [^<] | "<" [^/]"#);
+        emit_thought_rules(&mut src);
     } else {
         let _ = writeln!(src, "root ::= ws {wrapped_call}");
     }
@@ -262,197 +258,6 @@ pub(crate) fn build_grammar_source(
 
     src
 }
-
-/// Escape a Rust string so it can be embedded inside a GBNF `"..."`
-/// literal. Handles the escapes our GBNF lexer recognizes.
-fn escape_for_gbnf_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str(r"\\"),
-            '"' => out.push_str(r#"\""#),
-            '\n' => out.push_str(r"\n"),
-            '\r' => out.push_str(r"\r"),
-            '\t' => out.push_str(r"\t"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Emit GBNF rules that constrain a JSON value to `schema`. The
-/// top-level rule will be named `rule_name`; anonymous helpers get
-/// names like `{rule_name}__<n>`.
-///
-/// Supports the subset of JSON Schema common in tool schemas:
-///
-/// * `type: object` with `properties` + `required`. Required fields
-///   are emitted in their schema order; optional fields are ignored
-///   (the generated object MUST have exactly the required set).
-/// * `type: string | integer | number | boolean | null`.
-/// * `enum` (string / integer / number) → alternation of literals.
-///
-/// Anything else falls back to a reference to `value` (the permissive
-/// JSON value rule defined by [`JSON_GRAMMAR`]).
-fn schema_to_gbnf(
-    schema: &serde_json::Value,
-    rule_name: &str,
-    out: &mut String,
-) {
-    let mut counter: usize = 0;
-    emit_schema_rule(schema, rule_name, out, &mut counter);
-}
-
-fn emit_schema_rule(
-    schema: &serde_json::Value,
-    rule_name: &str,
-    out: &mut String,
-    counter: &mut usize,
-) {
-    // Enum → alternation of JSON-encoded literals.
-    if let Some(variants) = schema.get("enum").and_then(|v| v.as_array()) {
-        let mut alt = String::new();
-        for (i, v) in variants.iter().enumerate() {
-            if i > 0 {
-                alt.push_str(" | ");
-            }
-            // serde_json produces the JSON literal with proper escapes,
-            // then we GBNF-escape that string so it embeds cleanly in a
-            // GBNF `"..."` terminal.
-            let json_lit =
-                serde_json::to_string(v).unwrap_or_else(|_| "null".into());
-            let gbnf_lit = escape_for_gbnf_string(&json_lit);
-            let _ = write!(alt, r#""{gbnf_lit}""#);
-        }
-        let _ = writeln!(out, "{rule_name} ::= {alt}");
-        return;
-    }
-
-    match schema.get("type").and_then(|v| v.as_str()) {
-        Some("object") => emit_object_rule(schema, rule_name, out, counter),
-        Some("string") => {
-            let _ = writeln!(out, "{rule_name} ::= string");
-        }
-        Some("integer") => {
-            // JSON grammar's `number` also permits decimals; reject
-            // those for integer fields by referencing `int` directly
-            // (defined in JSON_GRAMMAR, no frac/exp trailer).
-            let _ = writeln!(out, "{rule_name} ::= int");
-        }
-        Some("number") => {
-            let _ = writeln!(out, "{rule_name} ::= number");
-        }
-        Some("boolean") => {
-            let _ = writeln!(out, r#"{rule_name} ::= "true" | "false""#);
-        }
-        Some("null") => {
-            let _ = writeln!(out, r#"{rule_name} ::= "null""#);
-        }
-        Some("array") => {
-            // Items constraint: if `items` is a schema, constrain each
-            // element. Otherwise fall back to `value`.
-            let items_rule = if let Some(items) = schema.get("items") {
-                *counter += 1;
-                let name = format!("{rule_name}__item_{c}", c = *counter);
-                emit_schema_rule(items, &name, out, counter);
-                name
-            } else {
-                "value".to_string()
-            };
-            let _ = writeln!(
-                out,
-                r#"{rule_name} ::= "[" ws ( {items_rule} ( ws "," ws {items_rule} )* )? ws "]""#
-            );
-        }
-        _ => {
-            // Unknown / unsupported — accept any JSON value.
-            let _ = writeln!(out, "{rule_name} ::= value");
-        }
-    }
-}
-
-fn emit_object_rule(
-    schema: &serde_json::Value,
-    rule_name: &str,
-    out: &mut String,
-    counter: &mut usize,
-) {
-    let props = schema
-        .get("properties")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    let required: Vec<String> = schema
-        .get("required")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if required.is_empty() {
-        // Nothing to pin — accept any object.
-        let _ = writeln!(out, "{rule_name} ::= object");
-        return;
-    }
-
-    // Emit child rules for each required field's schema.
-    let mut field_rules: Vec<(String, String)> = Vec::new();
-    for name in &required {
-        let Some(prop_schema) = props.get(name) else {
-            // Required but no schema — accept any value.
-            field_rules.push((name.clone(), "value".to_string()));
-            continue;
-        };
-        *counter += 1;
-        let child_rule = format!("{rule_name}__{c}", c = *counter);
-        emit_schema_rule(prop_schema, &child_rule, out, counter);
-        field_rules.push((name.clone(), child_rule));
-    }
-
-    // Emit the object rule as a fixed-order sequence. A more flexible
-    // implementation would permit any permutation; fixed-order is
-    // simpler and the model learns the order from the grammar.
-    let mut body = String::from("\"{\" ws");
-    for (i, (field_name, child_rule)) in field_rules.iter().enumerate() {
-        if i > 0 {
-            body.push_str(r#" ws "," ws"#);
-        }
-        // Same pipeline as `name_choice`: JSON-encode the field name
-        // (handles control chars / `\` / `"`), then GBNF-escape the
-        // resulting literal so it embeds cleanly in a GBNF terminal.
-        let json_lit = serde_json::to_string(field_name).unwrap();
-        let gbnf_lit = escape_for_gbnf_string(&json_lit);
-        let _ = write!(body, r#" "{gbnf_lit}" ws ":" ws {child_rule}"#);
-    }
-    body.push_str(" ws \"}\"");
-    let _ = writeln!(out, "{rule_name} ::= {body}");
-}
-
-/// Shared JSON value grammar appended to every tool-choice GBNF.
-///
-/// Handles object / array / string / number / literal, with permissive
-/// intra-structure whitespace. Not strict about number formatting edge
-/// cases (e.g. `01` is rejected as JSON would); good enough for tool
-/// arguments, which downstream parsers will validate.
-const JSON_GRAMMAR: &str = r#"
-value ::= object | array | string | number | "true" | "false" | "null"
-object ::= "{" ws ( member ( ws "," ws member )* )? ws "}"
-member ::= string ws ":" ws value
-array ::= "[" ws ( value ( ws "," ws value )* )? ws "]"
-string ::= "\"" char* "\""
-char ::= unescaped | escape
-unescaped ::= [^"\\] | [\x20-\x21] | [\x23-\x5B] | [\x5D-\x7F]
-escape ::= "\\" ( ["\\/bfnrt] | "u" hex hex hex hex )
-hex ::= [0-9a-fA-F]
-number ::= int frac? exp?
-int ::= "-"? ( "0" | [1-9] [0-9]* )
-frac ::= "." [0-9]+
-exp ::= [eE] [+\-]? [0-9]+
-ws ::= [ \t\n\r]*
-"#;
 
 /// Errors from [`grammar_for_tool_choice`].
 #[derive(Debug, thiserror::Error)]

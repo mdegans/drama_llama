@@ -37,6 +37,8 @@ pub use chat_template::{ChatTemplate, ChatTemplateError, RenderOptions};
 /// [`minijinja::value::Value`]s for [`RenderOptions::with_extra`].
 pub use minijinja;
 
+pub(crate) mod grammar_compile;
+
 mod tool_choice;
 pub use tool_choice::{
     build_grammar_source_for_debug, grammar_for_prompt,
