@@ -76,6 +76,10 @@ required-features = ["cli"]
 name = "chat_repl"
 required-features = ["repl"]
 
+[[example]]
+name = "whodunit"
+required-features = ["json-schema"]
+
 [[bin]]
 name = "regurgitater"
 path = "bin/regurgitater/regurgitater.rs"
