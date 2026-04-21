@@ -485,6 +485,7 @@ mod tests {
             description: Cow::Borrowed(""),
             schema: json!({"type": "object"}),
             cache_control: None,
+            strict: None,
         }
     }
 
@@ -613,6 +614,7 @@ mod tests {
                 "required": ["letter", "string"]
             }),
             cache_control: None,
+            strict: None,
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,
@@ -688,6 +690,7 @@ mod tests {
                 "required": ["x", "y"]
             }),
             cache_control: None,
+            strict: None,
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,
@@ -880,6 +883,7 @@ mod tests {
                 "required": [field]
             }),
             cache_control: None,
+            strict: None,
         }
     }
 
@@ -1060,6 +1064,7 @@ mod tests {
                 "required": ["loc"]
             }),
             cache_control: None,
+            strict: None,
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,

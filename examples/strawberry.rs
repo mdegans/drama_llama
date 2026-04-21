@@ -114,6 +114,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "required": ["letter", "string"]
         }),
         cache_control: None,
+        strict: None,
     };
 
     let load_session = |path: PathBuf| -> Result<Session, _> {
@@ -158,6 +159,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "required": ["letter", "string"]
                 }),
                 cache_control: None,
+                strict: None,
             })
             .add_message((Role::User, args.prompt.clone()))?;
         let out = session.complete_text(&prompt)?;

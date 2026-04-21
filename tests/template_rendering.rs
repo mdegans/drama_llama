@@ -74,6 +74,7 @@ fn shape_03_strawberry_turn_1_matches_fixture() {
             "required": ["letter", "string"]
         }),
         cache_control: None,
+        strict: None,
     };
     let prompt = Prompt {
         system: Some(Content::SinglePart(Cow::Borrowed(
@@ -128,6 +129,7 @@ fn shape_04_strawberry_turn_2_matches_fixture() {
             "required": ["letter", "string"]
         }),
         cache_control: None,
+        strict: None,
     };
     let call_id = "call_3_r";
     let prompt = Prompt {

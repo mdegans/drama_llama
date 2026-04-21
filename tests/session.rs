@@ -40,6 +40,7 @@ fn complete_text_strawberry_turn_2() {
             "required": ["letter", "string"]
         }),
         cache_control: None,
+        strict: None,
     };
     let call_id = "call_3_r";
     let prompt = Prompt {
@@ -133,6 +134,7 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
             "required": ["letter", "string"]
         }),
         cache_control: None,
+        strict: None,
     };
     let prompt = Prompt {
         system: Some(Content::SinglePart(Cow::Borrowed(
@@ -194,6 +196,7 @@ fn strawberry_turn_1_prompt() -> Prompt {
             "required": ["letter", "string"]
         }),
         cache_control: None,
+        strict: None,
     };
     Prompt {
         // Match the strawberry example's system prompt — short ones

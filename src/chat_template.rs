@@ -1004,6 +1004,7 @@ mod tests {
                 "required": ["city"]
             }),
             cache_control: None,
+            strict: None,
         };
 
         let prompt = Prompt {
@@ -1158,6 +1159,7 @@ mod tests {
                 "required": ["letter", "string"]
             }),
             cache_control: None,
+            strict: None,
         };
         let prompt = Prompt {
             system: Some(Content::SinglePart(Cow::Borrowed(
@@ -1236,6 +1238,7 @@ mod tests {
                 "required": ["letter", "string"]
             }),
             cache_control: None,
+            strict: None,
         };
         let src =
             r#"{%- for t in tools %}{{ t | tojson }}{% endfor %}"#.to_owned();
@@ -1285,6 +1288,7 @@ mod tests {
             description: Cow::Borrowed("tool"),
             schema: json!({"type": "object", "properties": {}}),
             cache_control: None,
+            strict: None,
         }
     }
 
@@ -1295,6 +1299,7 @@ mod tests {
             description: Cow::Borrowed("tool"),
             schema: json!({"type": "object", "properties": {}}),
             cache_control: Some(CacheControl::ephemeral()),
+            strict: None,
         }
     }
 
