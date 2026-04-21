@@ -127,6 +127,23 @@ pub struct Model {
 
 unsafe impl Send for Model {}
 
+// SAFETY:
+// `Model` holds a raw `*mut llama_model`. llama.cpp's model data is
+// immutable after `llama_load_model_from_file` returns — weights,
+// vocab tables, and metadata are allocated once and read-only
+// thereafter. All `&Model` call sites in this crate only invoke
+// vocab-read APIs (`llama_token_to_piece`, `llama_n_vocab`, metadata
+// getters, etc.), which llama.cpp documents as safe to call
+// concurrently against a `const llama_model*`. Mutating operations
+// (tokenization of *batches* into a context, decoding) target the
+// separately-owned `*mut llama_context`, not the model.
+//
+// The borrow checker ensures nothing drops or re-assigns the model
+// while `&Model` references are alive, so the "immutable after load"
+// invariant holds for every shared reference. Adding any method that
+// mutates llama_model state would invalidate this impl.
+unsafe impl Sync for Model {}
+
 #[derive(Debug, From)]
 pub enum MetaKey<'a> {
     Int(i32),

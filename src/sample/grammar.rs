@@ -34,6 +34,7 @@
 //! [`SamplingMode::Grammar`]: crate::SamplingMode::Grammar
 
 use llama_cpp_sys_3::{llama_token, llama_token_data};
+use rayon::prelude::*;
 use tinyvec::ArrayVec;
 
 use std::sync::Arc;
@@ -1131,16 +1132,22 @@ pub(crate) fn grammar_filter(
     state: &mut GrammarState,
     model: &Model,
 ) -> Candidates {
-    let mut buf: Vec<u8> = Vec::with_capacity(32);
-    let mut kept: Vec<llama_token_data> =
-        Vec::with_capacity(candidates.len().get());
-    for cand in candidates.as_slice() {
-        buf.clear();
-        token_to_piece_ref(cand.id, model, &mut buf);
-        if state.accepts_bytes(&buf) {
-            kept.push(*cand);
-        }
-    }
+    // Each candidate check is independent: clone the grammar state,
+    // try to advance it by the token's bytes, keep the token iff the
+    // clone survives. Fan out across rayon's global pool so 150k-vocab
+    // models don't bottleneck on a single core. `GrammarState` is
+    // auto-Sync (pure data behind an Arc), `Model` is Sync by manual
+    // impl (post-load data is immutable — see src/model.rs).
+    let state_ref: &GrammarState = state;
+    let kept: Vec<llama_token_data> = candidates
+        .as_slice()
+        .par_iter()
+        .filter_map(|cand| {
+            let mut buf: Vec<u8> = Vec::with_capacity(32);
+            token_to_piece_ref(cand.id, model, &mut buf);
+            state_ref.accepts_bytes(&buf).then_some(*cand)
+        })
+        .collect();
 
     if kept.is_empty() {
         if state.is_complete() {
