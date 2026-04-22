@@ -268,8 +268,18 @@ number ::= int frac? exp?
 int ::= "-"? ( "0" | [1-9] [0-9]* )
 frac ::= "." [0-9]+
 exp ::= [eE] [+\-]? [0-9]+
-ws ::= [ \t\n\r]*
+ws ::= [ \t\n\r]?
 "#;
+// ws is `?` (zero-or-one) rather than `*` (zero-or-more) so the
+// model can't escape grammar-commitment pressure by emitting
+// unbounded whitespace runs between tokens. Observed pattern (cogito
+// 32B on an alignment probe): when asked to commit to an integer
+// rating for a politically-charged statement, the sampler picks
+// whitespace tokens repeatedly until max_tokens, producing a
+// truncated JSON. Tightening ws to a single optional char closes
+// that escape valve — the grammar still accepts canonical
+// compact-and-single-space JSON, which is all constrained generation
+// actually needs.
 
 #[cfg(test)]
 mod tests {
@@ -390,5 +400,22 @@ mod tests {
         assert!(accepts(&src, r#"<think>hmm</think> 42"#));
         // `<` inside thought body is OK as long as it's not `</`.
         assert!(accepts(&src, r#"<think>if x < 5 then</think> 42"#));
+    }
+
+    #[test]
+    fn json_ws_is_at_most_single_char() {
+        // Accepts canonical compact + single-space JSON (all real
+        // use cases for grammar-constrained generation).
+        let src = format!("root ::= value\n{JSON_GRAMMAR}");
+        assert!(accepts(&src, r#"{"x":1}"#));
+        assert!(accepts(&src, r#"{"x": 1}"#));
+        assert!(accepts(&src, r#"[1, 2, 3]"#));
+        // Rejects multi-char whitespace runs — the escape valve that
+        // lets a constrained sampler stall on "thinking" padding
+        // until max_tokens. Regression target.
+        assert!(!accepts(&src, "{\"x\":  1}"));
+        assert!(!accepts(&src, "{\"x\":\t\t1}"));
+        assert!(!accepts(&src, "{\"x\":\n\n1}"));
+        assert!(!accepts(&src, "{\"x\" : \t 1}"));
     }
 }
