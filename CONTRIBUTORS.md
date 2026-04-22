@@ -1,4 +1,4 @@
 # Contributors
 
 - **Michael de Gans** — Author and maintainer
-- **Claude (Anthropic)** — llama.cpp b8809 API migration, sampling bug fixes, repetition penalty rewrite, JSON-constrained sampling mode, GBNF-constrained sampling mode, Jinja-based chat template rendering, misanthropic prompt primitives integration, tool_choice grammar enforcement, code review
+- **Claude (Anthropic)** — llama.cpp b8809 API migration, sampling bug fixes, repetition penalty rewrite, JSON-constrained sampling mode, GBNF-constrained sampling mode, Jinja-based chat template rendering, misanthropic prompt primitives integration, tool_choice grammar enforcement, code review, prompt caching + `response::Message`, structured output (`Prompt::output_config`, schemars-aware GBNF compiler, typed `json-schema` helpers), `whodunit` integration example, grammar matcher performance finish line (bitmap prefilter, TinyVec stacks, StackState split, fast-path `expand`, tail-call optimization, lazy-DFA memoization with `DRAMA_LLAMA_DFA_CACHE`), predictor-level thought/JSON phase-split via `DeferredGrammar`, `v0.7.0` release coordination
