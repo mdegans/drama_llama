@@ -427,6 +427,14 @@ impl Session {
 
     /// Set the maximum tokens generated per `complete_*` call.
     ///
+    /// This is a *defensive* generation cap. Every `Prompt` carries its
+    /// own [`Prompt::max_tokens`] (Anthropic-API required field,
+    /// `NonZeroU32`), and the effective cap for any call is
+    /// `min(prompt.max_tokens, self.max_tokens)` — per-request wins when
+    /// it's smaller, Session's cap clips it when the request asks for
+    /// more than this Session is willing to emit. Set this high (or to
+    /// the model's `n_ctx`) if you want Prompt's value to always win.
+    ///
     /// This is a *generation* cap, independent of the engine's KV
     /// context size (`n_ctx`). If the prompt plus `n` exceeds the
     /// engine's configured `n_ctx`, generation truncates at the KV
@@ -436,6 +444,18 @@ impl Session {
     pub fn with_max_tokens(mut self, n: NonZeroUsize) -> Self {
         self.max_tokens = n;
         self
+    }
+
+    /// Effective generation cap for a single call: the minimum of
+    /// `prompt.max_tokens` (per-request, Anthropic-API-required) and
+    /// `self.max_tokens` (Session-level defensive ceiling).
+    ///
+    /// Both inputs are `NonZero`, so the minimum is also `NonZero`.
+    fn effective_max_tokens(&self, prompt: &Prompt) -> NonZeroUsize {
+        let req = prompt.max_tokens.get() as usize;
+        let cap = self.max_tokens.get();
+        NonZeroUsize::new(req.min(cap))
+            .expect("min of two NonZero values is NonZero")
     }
 
     /// Enable (or disable) prefix-cache reuse across `complete_*`
@@ -780,7 +800,7 @@ impl Session {
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
-        predict_opts.n = self.max_tokens;
+        predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.sample_options = SampleOptions {
             modes,
             repetition: self.repetition.clone(),
@@ -874,7 +894,7 @@ impl Session {
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
-        predict_opts.n = self.max_tokens;
+        predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.sample_options = SampleOptions {
             modes,
             repetition: self.repetition.clone(),
@@ -926,7 +946,7 @@ impl Session {
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
-        predict_opts.n = self.max_tokens;
+        predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.sample_options = SampleOptions {
             modes,
             repetition: self.repetition.clone(),
@@ -998,7 +1018,7 @@ impl Session {
             &blocks,
             &raw_text,
             generated_count,
-            self.max_tokens,
+            self.effective_max_tokens(prompt),
             prompt.stop_sequences.as_deref(),
         );
 
@@ -1081,8 +1101,9 @@ impl Session {
         let k_nz = NonZeroUsize::new(k.max(1)).unwrap();
         let eos = self.engine.model.eos();
 
-        let mut predictor =
-            self.engine.predict_candidates(tokens, self.max_tokens);
+        let mut predictor = self
+            .engine
+            .predict_candidates(tokens, self.effective_max_tokens(prompt));
         let mut trace: Vec<TokenTrace> = Vec::new();
         let mut position: usize = 0;
 
