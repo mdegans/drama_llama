@@ -152,6 +152,17 @@ pub fn grammar_for_prompt(
 /// Phase-split-aware equivalent of [`grammar_for_prompt`]. Returns the
 /// compiled output config (either unified grammar or deferred) when
 /// `prompt.output_config` is set.
+///
+/// `phase_split` is auto-disabled for this call when the prompt has
+/// no thinking enabled (`prompt.thinking.is_none()`). Phase-split is
+/// a performance optimization that defers the JSON grammar until
+/// `</think>` appears in the output — with thinking off, `</think>`
+/// never appears, so the deferred grammar would never activate and
+/// the model would generate unconstrained free text. Auto-disabling
+/// here gives callers the correct behavior (structured output works
+/// regardless of whether thinking is on) without needing to know the
+/// phase-split knob exists. Session-level `output_config_opts` is
+/// still honored when thinking IS enabled.
 pub fn compile_prompt_output_config(
     prompt: &Prompt,
     opts: &OutputConfigOptions,
@@ -159,7 +170,15 @@ pub fn compile_prompt_output_config(
     let Some(config) = prompt.output_config.as_ref() else {
         return Ok(None);
     };
-    Ok(Some(compile_output_config(config, opts)?))
+    let effective = if prompt.thinking.is_none() {
+        OutputConfigOptions {
+            phase_split: false,
+            ..opts.clone()
+        }
+    } else {
+        opts.clone()
+    };
+    Ok(Some(compile_output_config(config, &effective)?))
 }
 
 /// Emit the GBNF source text for an output-config constraint. Kept
@@ -338,6 +357,60 @@ mod tests {
         };
         let source = state.lock().unwrap().grammar().source().to_string();
         assert!(source.contains("think_body"));
+    }
+
+    #[test]
+    fn compile_prompt_single_when_thinking_disabled() {
+        // With `phase_split: true` (the default) but no thinking on
+        // the prompt, `compile_prompt_output_config` auto-disables
+        // phase_split — otherwise the deferred JSON grammar would
+        // wait forever for `</think>` and the model would produce
+        // unconstrained output.
+        let prompt = Prompt::default().json_schema(json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }));
+        assert!(prompt.thinking.is_none(), "precondition");
+        let compiled =
+            compile_prompt_output_config(&prompt, &OutputConfigOptions::default())
+                .expect("compile")
+                .expect("output_config set");
+        assert!(
+            matches!(
+                compiled,
+                CompiledOutputConfig::Single(SamplingMode::Grammar(_))
+            ),
+            "expected Single variant when thinking is disabled on prompt"
+        );
+    }
+
+    #[test]
+    fn compile_prompt_deferred_when_thinking_enabled() {
+        // When thinking IS enabled on the prompt, Session-level
+        // phase_split=true is honored and the grammar is deferred.
+        use misanthropic::prompt::thinking::{Kind, Thinking};
+        use std::num::NonZeroU32;
+        let prompt = Prompt::default()
+            .json_schema(json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+            }))
+            .thinking(Thinking {
+                budget_tokens: NonZeroU32::new(1024).unwrap(),
+                kind: Kind::Enabled,
+            });
+        assert!(prompt.thinking.is_some(), "precondition");
+        let compiled =
+            compile_prompt_output_config(&prompt, &OutputConfigOptions::default())
+                .expect("compile")
+                .expect("output_config set");
+        assert!(
+            matches!(compiled, CompiledOutputConfig::Deferred(_)),
+            "expected Deferred variant when thinking is enabled and \
+             phase_split is on"
+        );
     }
 
     #[test]
