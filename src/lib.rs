@@ -14,8 +14,9 @@ pub use data::{IgnoreCategory, StopWords};
 
 mod sample;
 pub use sample::{
-    Grammar, GrammarError, GrammarState, JsonError, JsonState, RepetitionError,
-    RepetitionOptions, SampleOptions, SamplingMode,
+    grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
+    Grammar, GrammarError, GrammarState, GrammarStats, JsonError, JsonState,
+    RepetitionError, RepetitionOptions, SampleOptions, SamplingMode,
 };
 
 mod batch;

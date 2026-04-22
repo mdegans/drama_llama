@@ -10,7 +10,10 @@ pub(crate) mod grammar;
 mod json;
 mod repetition;
 
-pub use grammar::{Grammar, GrammarError, GrammarState};
+pub use grammar::{
+    grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
+    Grammar, GrammarError, GrammarState, GrammarStats,
+};
 pub use json::{JsonError, JsonState};
 pub use repetition::{
     apply_sample_repetition_ngram, RepetitionError, RepetitionOptions,

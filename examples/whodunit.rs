@@ -22,8 +22,9 @@ use std::{
 };
 
 use drama_llama::{
-    output_config, parse_completion, Block, PredictOptions, Prompt,
-    RenderOptions, Role, SampleOptions, Session,
+    grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
+    output_config, parse_completion, Block, GrammarStats, PredictOptions,
+    Prompt, RenderOptions, Role, SampleOptions, Session,
 };
 use misanthropic::prompt::message::Content;
 
@@ -163,24 +164,100 @@ fn main() {
         .model
         .token_to_piece(session.engine().model.eos());
 
+    let stats_on = grammar_stats_enabled();
+    if stats_on {
+        grammar_stats_reset();
+        eprintln!(
+            "[setup] DRAMA_LLAMA_GRAMMAR_STATS active — phase-split stats \
+             will be printed at the end"
+        );
+    }
+
     let start = Instant::now();
     let predictor =
         session.engine_mut().predict_pieces(tokens, predict_opts);
 
     let mut full = String::new();
     let mut n_pieces = 0usize;
+    // Phase transition: we treat everything until `</think>` is seen in the
+    // accumulated text as phase 1 (thought block, grammar is `.+`), and
+    // everything after as phase 2 (structured JSON). The split is what
+    // directly sizes the thought/JSON phase-split optimization.
+    let mut thought_done = false;
+    let mut phase1_pieces = 0usize;
+    let mut phase1_end: Option<Instant> = None;
+    let mut phase1_stats: Option<GrammarStats> = None;
     for piece in predictor {
         n_pieces += 1;
         // Flush each piece so stderr isn't block-buffered when piped.
         eprint!("{piece}");
         let _ = std::io::stderr().flush();
         full.push_str(&piece);
+        if !thought_done {
+            phase1_pieces += 1;
+            if full.contains("</think>") {
+                thought_done = true;
+                phase1_end = Some(Instant::now());
+                if stats_on {
+                    phase1_stats = Some(grammar_stats_snapshot());
+                }
+            }
+        }
     }
     let elapsed = start.elapsed().as_secs_f32();
     eprintln!(
         "\n\n[done] {n_pieces} pieces in {elapsed:.1}s ({:.1} tok/s)",
         n_pieces as f32 / elapsed.max(0.001),
     );
+
+    // Per-phase wall clock + tok/s.
+    match phase1_end {
+        Some(end) => {
+            let p1 = end.duration_since(start).as_secs_f32();
+            let p2 = elapsed - p1;
+            let p2_pieces = n_pieces - phase1_pieces;
+            eprintln!(
+                "[phase1 thought ] {phase1_pieces} pieces in {p1:.2}s \
+                 ({:.1} tok/s)",
+                phase1_pieces as f32 / p1.max(0.001),
+            );
+            eprintln!(
+                "[phase2 json    ] {p2_pieces} pieces in {p2:.2}s \
+                 ({:.1} tok/s)",
+                p2_pieces as f32 / p2.max(0.001),
+            );
+        }
+        None => {
+            eprintln!("[phase1 thought ] never observed </think>; single-phase run");
+        }
+    }
+
+    if stats_on {
+        let total = grammar_stats_snapshot();
+        let p1 = phase1_stats.clone().unwrap_or_default();
+        let p2 = GrammarStats {
+            calls: total.calls - p1.calls,
+            candidates_in: total.candidates_in - p1.candidates_in,
+            candidates_bitmap_pass: total.candidates_bitmap_pass
+                - p1.candidates_bitmap_pass,
+            candidates_final_pass: total.candidates_final_pass
+                - p1.candidates_final_pass,
+            stacks_in_sum: total.stacks_in_sum - p1.stacks_in_sum,
+            // max is not a difference; phase2's max is a lower bound of
+            // the cumulative max, but we can't recover its true max
+            // without per-phase reset. Report the cumulative instead.
+            stacks_in_max: total.stacks_in_max,
+            depth_max_sum: total.depth_max_sum - p1.depth_max_sum,
+            depth_max_max: total.depth_max_max,
+            filter_us_sum: total.filter_us_sum - p1.filter_us_sum,
+            filter_us_max: total.filter_us_max,
+        };
+        if phase1_stats.is_some() {
+            print_stats("phase1 thought", &p1);
+            print_stats("phase2 json   ", &p2);
+        }
+        print_stats("cumulative    ", &total);
+    }
 
     if no_grammar {
         // Unconstrained output isn't expected to parse as CaseFile —
@@ -220,4 +297,46 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn print_stats(label: &str, s: &GrammarStats) {
+    if s.calls == 0 {
+        eprintln!("[{label}] no filter calls");
+        return;
+    }
+    let calls_f = s.calls as f64;
+    let bitmap_survival = if s.candidates_in > 0 {
+        100.0 * s.candidates_bitmap_pass as f64 / s.candidates_in as f64
+    } else {
+        0.0
+    };
+    let final_survival = if s.candidates_bitmap_pass > 0 {
+        100.0 * s.candidates_final_pass as f64
+            / s.candidates_bitmap_pass as f64
+    } else {
+        0.0
+    };
+    let avg_stacks = s.stacks_in_sum as f64 / calls_f;
+    let avg_depth = s.depth_max_sum as f64 / calls_f;
+    let avg_us = s.filter_us_sum as f64 / calls_f;
+    let total_ms = s.filter_us_sum as f64 / 1000.0;
+    eprintln!(
+        "[{label}] calls={:>4} cand_in={:>8} bitmap_pass={:>7} ({:>5.2}%) \
+         final_pass={:>6} (of bitmap {:>5.2}%) | stacks avg={:>4.1} max={:>3} \
+         | depth avg={:>4.1} max={:>3} | filter avg={:>6.1}us max={:>6}us \
+         total={:>6.1}ms",
+        s.calls,
+        s.candidates_in,
+        s.candidates_bitmap_pass,
+        bitmap_survival,
+        s.candidates_final_pass,
+        final_survival,
+        avg_stacks,
+        s.stacks_in_max,
+        avg_depth,
+        s.depth_max_max,
+        avg_us,
+        s.filter_us_max,
+        total_ms,
+    );
 }

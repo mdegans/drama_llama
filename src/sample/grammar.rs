@@ -37,7 +37,9 @@ use llama_cpp_sys_3::{llama_token, llama_token_data};
 use rayon::prelude::*;
 use tinyvec::{ArrayVec, TinyVec};
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::{model::token_to_piece_ref, Candidates, Model};
 
@@ -1232,6 +1234,157 @@ static_assertions::assert_impl_all!(Grammar: Send, Sync);
 static_assertions::assert_impl_all!(GrammarState: Send, Sync);
 
 // ===========================================================================
+// Runtime-gated filter-call statistics (opt in via env var)
+// ===========================================================================
+
+/// Cumulative statistics about [`grammar_filter`] calls since process start
+/// (or since the last [`grammar_stats_reset`]).
+///
+/// Collection is gated on the `DRAMA_LLAMA_GRAMMAR_STATS` environment
+/// variable (set to any non-empty, non-`0` value). When disabled — the
+/// default — the filter's hot path adds no atomics and pays zero cost.
+///
+/// Sums (e.g. `stacks_in_sum`) are provided so callers can compute averages
+/// without the static holding floats; divide by `calls` for the mean.
+#[derive(Clone, Debug, Default)]
+pub struct GrammarStats {
+    /// Number of [`grammar_filter`] calls recorded.
+    pub calls: u64,
+    /// Sum of the input `Candidates` length across calls.
+    pub candidates_in: u64,
+    /// Count of candidates that survived the first-byte bitmap prefilter.
+    pub candidates_bitmap_pass: u64,
+    /// Count of candidates that also survived the full `accepts_bytes`
+    /// check — i.e. the kept set.
+    pub candidates_final_pass: u64,
+    /// Sum over calls of `state.inner.stacks.len()` at filter entry.
+    pub stacks_in_sum: u64,
+    /// Maximum across calls of `state.inner.stacks.len()` at filter entry.
+    pub stacks_in_max: u64,
+    /// Sum over calls of `max(stack.len())` at filter entry.
+    pub depth_max_sum: u64,
+    /// Maximum across calls of `max(stack.len())` at filter entry.
+    pub depth_max_max: u64,
+    /// Sum over calls of wall-clock time spent in the filter, microseconds.
+    pub filter_us_sum: u64,
+    /// Maximum across calls of wall-clock time, microseconds.
+    pub filter_us_max: u64,
+}
+
+struct StatsInner {
+    calls: AtomicU64,
+    candidates_in: AtomicU64,
+    candidates_bitmap_pass: AtomicU64,
+    candidates_final_pass: AtomicU64,
+    stacks_in_sum: AtomicU64,
+    stacks_in_max: AtomicU64,
+    depth_max_sum: AtomicU64,
+    depth_max_max: AtomicU64,
+    filter_us_sum: AtomicU64,
+    filter_us_max: AtomicU64,
+}
+
+static STATS: StatsInner = StatsInner {
+    calls: AtomicU64::new(0),
+    candidates_in: AtomicU64::new(0),
+    candidates_bitmap_pass: AtomicU64::new(0),
+    candidates_final_pass: AtomicU64::new(0),
+    stacks_in_sum: AtomicU64::new(0),
+    stacks_in_max: AtomicU64::new(0),
+    depth_max_sum: AtomicU64::new(0),
+    depth_max_max: AtomicU64::new(0),
+    filter_us_sum: AtomicU64::new(0),
+    filter_us_max: AtomicU64::new(0),
+};
+
+static STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Whether `DRAMA_LLAMA_GRAMMAR_STATS` was set to a truthy value when first
+/// checked. Cached — subsequent env var changes are ignored.
+pub fn grammar_stats_enabled() -> bool {
+    *STATS_ENABLED.get_or_init(|| {
+        std::env::var_os("DRAMA_LLAMA_GRAMMAR_STATS")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+fn atomic_fetch_max(target: &AtomicU64, val: u64) {
+    let mut cur = target.load(Ordering::Relaxed);
+    while val > cur {
+        match target.compare_exchange_weak(
+            cur,
+            val,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+/// Snapshot cumulative [`grammar_filter`] statistics. Returns zeros when
+/// collection is disabled.
+pub fn grammar_stats_snapshot() -> GrammarStats {
+    GrammarStats {
+        calls: STATS.calls.load(Ordering::Relaxed),
+        candidates_in: STATS.candidates_in.load(Ordering::Relaxed),
+        candidates_bitmap_pass: STATS
+            .candidates_bitmap_pass
+            .load(Ordering::Relaxed),
+        candidates_final_pass: STATS
+            .candidates_final_pass
+            .load(Ordering::Relaxed),
+        stacks_in_sum: STATS.stacks_in_sum.load(Ordering::Relaxed),
+        stacks_in_max: STATS.stacks_in_max.load(Ordering::Relaxed),
+        depth_max_sum: STATS.depth_max_sum.load(Ordering::Relaxed),
+        depth_max_max: STATS.depth_max_max.load(Ordering::Relaxed),
+        filter_us_sum: STATS.filter_us_sum.load(Ordering::Relaxed),
+        filter_us_max: STATS.filter_us_max.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset cumulative statistics. Useful to measure a single phase of
+/// generation in isolation.
+pub fn grammar_stats_reset() {
+    STATS.calls.store(0, Ordering::Relaxed);
+    STATS.candidates_in.store(0, Ordering::Relaxed);
+    STATS.candidates_bitmap_pass.store(0, Ordering::Relaxed);
+    STATS.candidates_final_pass.store(0, Ordering::Relaxed);
+    STATS.stacks_in_sum.store(0, Ordering::Relaxed);
+    STATS.stacks_in_max.store(0, Ordering::Relaxed);
+    STATS.depth_max_sum.store(0, Ordering::Relaxed);
+    STATS.depth_max_max.store(0, Ordering::Relaxed);
+    STATS.filter_us_sum.store(0, Ordering::Relaxed);
+    STATS.filter_us_max.store(0, Ordering::Relaxed);
+}
+
+fn record_stats(
+    candidates_in: u64,
+    bitmap_pass: u64,
+    final_pass: u64,
+    stacks_in: u64,
+    depth_max: u64,
+    elapsed_us: u64,
+) {
+    STATS.calls.fetch_add(1, Ordering::Relaxed);
+    STATS.candidates_in.fetch_add(candidates_in, Ordering::Relaxed);
+    STATS
+        .candidates_bitmap_pass
+        .fetch_add(bitmap_pass, Ordering::Relaxed);
+    STATS
+        .candidates_final_pass
+        .fetch_add(final_pass, Ordering::Relaxed);
+    STATS.stacks_in_sum.fetch_add(stacks_in, Ordering::Relaxed);
+    atomic_fetch_max(&STATS.stacks_in_max, stacks_in);
+    STATS.depth_max_sum.fetch_add(depth_max, Ordering::Relaxed);
+    atomic_fetch_max(&STATS.depth_max_max, depth_max);
+    STATS.filter_us_sum.fetch_add(elapsed_us, Ordering::Relaxed);
+    atomic_fetch_max(&STATS.filter_us_max, elapsed_us);
+}
+
+// ===========================================================================
 // Filter + advance plumbing (mirror of json::json_filter / advance_all)
 // ===========================================================================
 
@@ -1265,25 +1418,60 @@ pub(crate) fn grammar_filter(
     // per-candidate scratch clones stay inside `StackState` and never
     // bump the `Arc<Grammar>` refcount (profiles showed that atomic
     // traffic was a real cost).
+    let stats_on = grammar_stats_enabled();
+    let t0 = stats_on.then(Instant::now);
+    let candidates_in = candidates.as_slice().len() as u64;
+
     let bitmap = state.first_byte_bitmap();
     let grammar: &Grammar = &state.grammar;
     let inner: &StackState = &state.inner;
-    let kept: Vec<llama_token_data> = candidates
+
+    #[derive(Default)]
+    struct Acc {
+        kept: Vec<llama_token_data>,
+        bitmap_pass: u64,
+    }
+
+    let acc = candidates
         .as_slice()
         .par_iter()
-        .filter_map(|cand| {
+        .fold(Acc::default, |mut a, cand| {
             let mut buf: Vec<u8> = Vec::with_capacity(32);
             token_to_piece_ref(cand.id, model, &mut buf);
             if let Some(&first) = buf.first() {
                 if bitmap[(first as usize) >> 6] & (1u64 << (first & 63)) == 0
                 {
-                    return None;
+                    return a;
                 }
             }
-            inner.accepts_bytes(grammar, &buf).then_some(*cand)
+            a.bitmap_pass += 1;
+            if inner.accepts_bytes(grammar, &buf) {
+                a.kept.push(*cand);
+            }
+            a
         })
-        .collect();
+        .reduce(Acc::default, |mut a, b| {
+            a.kept.extend(b.kept);
+            a.bitmap_pass += b.bitmap_pass;
+            a
+        });
 
+    if let Some(t0) = t0 {
+        let elapsed_us = t0.elapsed().as_micros() as u64;
+        let stacks_in = inner.stacks.len() as u64;
+        let depth_max =
+            inner.stacks.iter().map(|s| s.len()).max().unwrap_or(0) as u64;
+        record_stats(
+            candidates_in,
+            acc.bitmap_pass,
+            acc.kept.len() as u64,
+            stacks_in,
+            depth_max,
+            elapsed_us,
+        );
+    }
+
+    let kept = acc.kept;
     if kept.is_empty() {
         if state.is_complete() {
             state.reset();
