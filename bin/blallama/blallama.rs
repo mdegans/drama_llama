@@ -22,6 +22,7 @@ struct Args {
     /// Path containing model files
     model_path: PathBuf,
     /// Port to use
+    #[arg(long, default_value_t = 11435)]
     port: u16,
 }
 
