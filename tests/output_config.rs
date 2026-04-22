@@ -17,7 +17,7 @@
 //! thought-prefix behavior rather than a vanity demo.
 #![cfg(feature = "json-schema")]
 
-use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
+use std::{num::NonZeroUsize, path::PathBuf};
 
 use drama_llama::{Block, Content, Prompt, RenderOptions, Role, Session};
 
@@ -61,32 +61,26 @@ struct CaseFile {
 }
 
 const SCENARIO: &str = "\
-Scenario: Sir Harold was found dead in his locked study at 11 PM. \
-The door key was still inside, in the lock. The window was wide open.
+Scenario: Sir Harold was found dead in his study at 11 PM, poisoned.
 
-Suspects and known facts:
-- BUTLER (Mr. Finch): served Sir Harold a nightcap at 9 PM. He was \
-  owed six months' wages and had been threatened with dismissal.
-- NIECE (Lady Elsie): the sole heir to the estate. A footman saw her \
-  entering the rose garden outside the study window at 10:45 PM.
-- BUSINESS PARTNER (Mr. Crane): arrived at the mansion at 11:15 PM, \
-  AFTER the body was discovered. No known motive.
+Suspects and verified facts:
+- BUTLER (Mr. Finch): disliked Sir Harold. Served the nightcap at 9 PM, \
+  but as a precaution (Sir Harold was paranoid) he took a sip from the \
+  same glass in front of the house physician. He is alive and unharmed, \
+  so the glass was not yet poisoned when it left his hands.
+- NIECE (Lady Elsie): stood to inherit if Sir Harold died. She attended \
+  the village charity gala from 8 PM to midnight; twenty named guests \
+  place her there continuously. She cannot have been at the mansion.
+- BUSINESS PARTNER (Mr. Crane): Sir Harold's ledger, found open on the \
+  desk, showed Mr. Crane had been embezzling for two years and Sir \
+  Harold intended to report him in the morning. Mr. Crane has a copy of \
+  the study key (Sir Harold gave him one years ago). Two staff saw him \
+  alone in the study from 10:30 to 10:50 PM. The poison is one Mr. \
+  Crane keeps for his prize rose bushes.
 
-Evidence found at the scene:
-1. The study door was locked from inside; only Sir Harold's key was on it.
-2. The window faces the rose garden. Fresh footprints in the mulch \
-   match a woman's boot.
-3. Sir Harold was poisoned. Toxicology says the poison was in the \
-   nightcap glass.
-4. A half-finished letter was on the desk: Sir Harold was going to \
-   disinherit the niece in the morning.
-5. Mr. Finch prepared the nightcap personally, but the glass sat on \
-   the sideboard for an hour before Sir Harold drank it.
-
-Weigh motive AND opportunity for all three suspects. Consider whether \
-the butler was framed (someone else could reach the glass during the \
-hour it sat unattended). Do not commit to a verdict until you have \
-considered all three suspects in <think>...</think>.";
+All three had a motive. Only one had both opportunity (access to the \
+glass after the butler's safe sip) AND means (possession of the \
+specific poison used). Identify that suspect.";
 
 #[test]
 #[ignore = "requires model"]
@@ -103,12 +97,14 @@ fn whodunit_verdict() {
 
     let prompt = Prompt::default()
         .structured_output::<CaseFile>()
-        .set_system(Cow::Borrowed(
-            "You are a careful detective. Reason step by step inside \
-             <think>...</think>, weighing motive and opportunity for \
-             every suspect before committing. Then output a structured \
-             verdict as JSON matching the given schema.",
-        ))
+        .set_system(
+            "Enable deep thinking subroutine. You are a brief, \
+             decisive detective. Reason inside <think>...</think> in \
+             under 300 tokens: note which suspects are ruled out by \
+             their alibis, identify the one remaining with motive, \
+             means, and opportunity, then CLOSE the think tag. Output \
+             the structured verdict as JSON matching the given schema.",
+        )
         .add_message((Role::User, Content::text(SCENARIO)))
         .expect("add_message");
 
