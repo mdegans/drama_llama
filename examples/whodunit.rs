@@ -251,6 +251,14 @@ fn main() {
             depth_max_max: total.depth_max_max,
             filter_us_sum: total.filter_us_sum - p1.filter_us_sum,
             filter_us_max: total.filter_us_max,
+            // DFA cache stats are "last-observed" style (not cumulative
+            // across the whole phase), so the difference isn't meaningful.
+            // Report cumulative for phase 2 too.
+            dfa_states: total.dfa_states,
+            dfa_transition_hits: total.dfa_transition_hits,
+            dfa_transition_misses: total.dfa_transition_misses,
+            dfa_bitmap_hits: total.dfa_bitmap_hits,
+            dfa_bitmap_misses: total.dfa_bitmap_misses,
         };
         if phase1_stats.is_some() {
             print_stats("phase1 thought", &p1);
@@ -339,4 +347,29 @@ fn print_stats(label: &str, s: &GrammarStats) {
         s.filter_us_max,
         total_ms,
     );
+    let dfa_tx_total = s.dfa_transition_hits + s.dfa_transition_misses;
+    let dfa_bm_total = s.dfa_bitmap_hits + s.dfa_bitmap_misses;
+    if dfa_tx_total > 0 || dfa_bm_total > 0 {
+        let tx_hit_rate = if dfa_tx_total > 0 {
+            100.0 * s.dfa_transition_hits as f64 / dfa_tx_total as f64
+        } else {
+            0.0
+        };
+        let bm_hit_rate = if dfa_bm_total > 0 {
+            100.0 * s.dfa_bitmap_hits as f64 / dfa_bm_total as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[{label}] dfa states={:>6} tx hits/misses={}/{} ({:>5.2}% hit) \
+             bitmap hits/misses={}/{} ({:>5.2}% hit)",
+            s.dfa_states,
+            s.dfa_transition_hits,
+            s.dfa_transition_misses,
+            tx_hit_rate,
+            s.dfa_bitmap_hits,
+            s.dfa_bitmap_misses,
+            bm_hit_rate,
+        );
+    }
 }

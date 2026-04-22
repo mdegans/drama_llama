@@ -22,6 +22,8 @@ thiserror = "1.0"
 tinyvec = { version = "1.6", features = ["alloc"] }
 xorshift = "0.1"
 rayon = "1.10.0"
+dashmap = "6"
+rustc-hash = "2"
 minijinja = { version = "2.5", features = ["loader", "json"] }
 minijinja-contrib = { version = "2.5", features = ["pycompat"] }
 misanthropic = { git = "https://github.com/mdegans/misanthropic.git", branch = "dev", default-features = false, features = [

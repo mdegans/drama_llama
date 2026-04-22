@@ -33,12 +33,14 @@
 //!
 //! [`SamplingMode::Grammar`]: crate::SamplingMode::Grammar
 
+use dashmap::DashMap;
 use llama_cpp_sys_3::{llama_token, llama_token_data};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use tinyvec::{ArrayVec, TinyVec};
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use crate::{model::token_to_piece_ref, Candidates, Model};
@@ -690,7 +692,7 @@ struct Position {
 /// stacks coexist because GBNF rules branch on alternation. `Stack` is a
 /// [`TinyVec`] so typical-depth stacks stay inline (no per-clone heap
 /// allocation).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StackState {
     stacks: Vec<Stack>,
     pending: ArrayVec<[u8; 4]>,
@@ -705,17 +707,36 @@ pub(crate) struct StackState {
 /// Clone cost is proportional to `stacks.len() * avg_stack_depth`, which is
 /// small for practical grammars. `accepts_bytes` relies on cloning for
 /// speculative simulation.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Each `GrammarState` also owns an `Arc<DfaCache>` — a lazily-populated
+/// memoization layer over NFA states and one-byte transitions. `Clone` on
+/// `GrammarState` shares the same cache; independently constructed
+/// `GrammarState`s build independent caches.
+#[derive(Clone, Debug)]
 pub struct GrammarState {
     grammar: Arc<Grammar>,
     inner: StackState,
+    cache: Arc<DfaCache>,
+}
+
+/// Equality ignores the lazy-DFA cache: it is a pure acceleration structure
+/// and two states with identical matcher contents are semantically equal
+/// regardless of which cache instance happens to be attached.
+impl PartialEq for GrammarState {
+    fn eq(&self, other: &Self) -> bool {
+        self.grammar == other.grammar && self.inner == other.inner
+    }
 }
 
 impl GrammarState {
     /// Construct a fresh matcher rooted at the grammar's `root` rule.
     pub fn new(grammar: Arc<Grammar>) -> Self {
         let inner = StackState::new_rooted(&grammar);
-        Self { grammar, inner }
+        Self {
+            grammar,
+            inner,
+            cache: Arc::new(DfaCache::new()),
+        }
     }
 
     /// Reset to the fresh starting state.
@@ -1007,6 +1028,226 @@ impl StackState {
 }
 
 // ===========================================================================
+// Lazy-DFA cache
+// ===========================================================================
+
+/// Interned identifier for a canonical [`StackState`]. Returned by
+/// [`DfaCache::intern`] and used as the key into the byte-transition table.
+pub(crate) type StateId = u32;
+
+/// Sentinel returned by [`DfaCache::transition`] when feeding the byte leaves
+/// the matcher with no surviving stacks (i.e. the byte is rejected).
+pub(crate) const REJECT_STATE: StateId = u32::MAX;
+
+struct DfaInterned {
+    /// Canonical `StackState` → `StateId`. Canonical = post-`expand`, so
+    /// stacks are sorted + deduped.
+    intern: FxHashMap<StackState, StateId>,
+    /// Id → canonical `StackState`. Needed on transition misses to
+    /// reconstitute the matcher, feed a byte, and re-intern the result.
+    states: Vec<StackState>,
+}
+
+/// Lazy-DFA memoization layer over the NFA matcher.
+///
+/// The underlying matcher is still an NFA (multiple concurrent call stacks).
+/// The cache interns canonical `StackState`s into compact `StateId`s and
+/// memoizes one-byte transitions, so revisits of the same matcher state hit
+/// a table lookup instead of rerunning the full `feed_byte` + `expand`
+/// pipeline. First visits pay the normal walk cost plus a canonicalize +
+/// insert.
+///
+/// Shared across clones of [`GrammarState`] via `Arc`.
+pub(crate) struct DfaCache {
+    interned: RwLock<DfaInterned>,
+    /// `(state, byte)` → next state. `DashMap` for lock-striped access under
+    /// the rayon fold in `grammar_filter`.
+    transitions: DashMap<(StateId, u8), StateId>,
+    /// Per-state first-byte acceptance bitmap. Lazily filled.
+    bitmaps: DashMap<StateId, [u64; 4]>,
+    /// Per-state "is this an accepting / complete state" cache.
+    complete: DashMap<StateId, bool>,
+    /// Per-state "would this state be valid at end-of-stream" cache — mirrors
+    /// the trailing [`StackState::pending_can_still_match`] check done at the
+    /// end of [`StackState::advance_bytes`].
+    terminal_valid: DashMap<StateId, bool>,
+    transition_hits: AtomicU64,
+    transition_misses: AtomicU64,
+    bitmap_hits: AtomicU64,
+    bitmap_misses: AtomicU64,
+}
+
+impl DfaCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            interned: RwLock::new(DfaInterned {
+                intern: FxHashMap::default(),
+                states: Vec::new(),
+            }),
+            transitions: DashMap::new(),
+            bitmaps: DashMap::new(),
+            complete: DashMap::new(),
+            terminal_valid: DashMap::new(),
+            transition_hits: AtomicU64::new(0),
+            transition_misses: AtomicU64::new(0),
+            bitmap_hits: AtomicU64::new(0),
+            bitmap_misses: AtomicU64::new(0),
+        }
+    }
+
+    /// Intern a canonical `StackState`, returning its `StateId`. Reads fast-
+    /// path under a read lock; inserts on miss under a write lock with a
+    /// double-check to tolerate racing inserters under rayon.
+    fn intern(&self, state: &StackState) -> StateId {
+        if let Some(&id) = self.interned.read().unwrap().intern.get(state) {
+            return id;
+        }
+        let mut g = self.interned.write().unwrap();
+        if let Some(&id) = g.intern.get(state) {
+            return id;
+        }
+        let id = g.states.len() as StateId;
+        debug_assert!(id != REJECT_STATE, "state id overflow");
+        g.states.push(state.clone());
+        g.intern.insert(state.clone(), id);
+        id
+    }
+
+    /// Reconstitute the `StackState` for a given id. Used only on cache
+    /// misses; the hot path never calls this.
+    fn state_of(&self, id: StateId) -> StackState {
+        self.interned.read().unwrap().states[id as usize].clone()
+    }
+
+    /// Feed a byte from a state, returning the next state id (or
+    /// `REJECT_STATE`). Hit path is a single `DashMap::get`.
+    pub(crate) fn transition(
+        &self,
+        grammar: &Grammar,
+        sid: StateId,
+        byte: u8,
+    ) -> StateId {
+        if sid == REJECT_STATE {
+            return REJECT_STATE;
+        }
+        if let Some(entry) = self.transitions.get(&(sid, byte)) {
+            self.transition_hits.fetch_add(1, Ordering::Relaxed);
+            return *entry;
+        }
+        self.transition_misses.fetch_add(1, Ordering::Relaxed);
+        let mut scratch = self.state_of(sid);
+        let next_id = match scratch.feed_byte(grammar, byte) {
+            Ok(()) => self.intern(&scratch),
+            Err(_) => REJECT_STATE,
+        };
+        self.transitions.insert((sid, byte), next_id);
+        next_id
+    }
+
+    /// True iff `sid` would satisfy the trailing check at end-of-input — i.e.
+    /// any buffered partial UTF-8 codepoint can still extend into a matching
+    /// codepoint. Mirrors the trailing check inside
+    /// [`StackState::advance_bytes`].
+    pub(crate) fn terminal_valid(
+        &self,
+        grammar: &Grammar,
+        sid: StateId,
+    ) -> bool {
+        if sid == REJECT_STATE {
+            return false;
+        }
+        if let Some(entry) = self.terminal_valid.get(&sid) {
+            return *entry;
+        }
+        let state = self.state_of(sid);
+        let v = state.pending.is_empty()
+            || state.pending_can_still_match(grammar);
+        self.terminal_valid.insert(sid, v);
+        v
+    }
+
+    /// First-byte acceptance bitmap for a state. Lazily populated; subsequent
+    /// calls hit the `DashMap`.
+    pub(crate) fn first_byte_bitmap(
+        &self,
+        grammar: &Grammar,
+        sid: StateId,
+    ) -> [u64; 4] {
+        if sid == REJECT_STATE {
+            return [0u64; 4];
+        }
+        if let Some(entry) = self.bitmaps.get(&sid) {
+            self.bitmap_hits.fetch_add(1, Ordering::Relaxed);
+            return *entry;
+        }
+        self.bitmap_misses.fetch_add(1, Ordering::Relaxed);
+        let state = self.state_of(sid);
+        let bm = state.first_byte_bitmap(grammar);
+        self.bitmaps.insert(sid, bm);
+        bm
+    }
+
+    /// True iff the state is an accepting state (empty pending + at least one
+    /// empty stack).
+    pub(crate) fn is_complete(&self, sid: StateId) -> bool {
+        if sid == REJECT_STATE {
+            return false;
+        }
+        if let Some(entry) = self.complete.get(&sid) {
+            return *entry;
+        }
+        let state = self.state_of(sid);
+        let c = state.is_complete();
+        self.complete.insert(sid, c);
+        c
+    }
+
+    /// Number of distinct canonical states seen so far.
+    pub(crate) fn state_count(&self) -> usize {
+        self.interned.read().unwrap().states.len()
+    }
+
+    pub(crate) fn transition_hits(&self) -> u64 {
+        self.transition_hits.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn transition_misses(&self) -> u64 {
+        self.transition_misses.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bitmap_hits(&self) -> u64 {
+        self.bitmap_hits.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bitmap_misses(&self) -> u64 {
+        self.bitmap_misses.load(Ordering::Relaxed)
+    }
+}
+
+impl std::fmt::Debug for DfaCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DfaCache")
+            .field("states", &self.state_count())
+            .field("transitions", &self.transitions.len())
+            .field("transition_hits", &self.transition_hits())
+            .field("transition_misses", &self.transition_misses())
+            .finish()
+    }
+}
+
+/// Env-gated toggle: set `DRAMA_LLAMA_DFA_CACHE=0` to disable the lazy-DFA
+/// cache and fall back to the per-candidate clone-and-walk path. Cached at
+/// first access.
+fn dfa_cache_enabled() -> bool {
+    static DFA_ENABLED: OnceLock<bool> = OnceLock::new();
+    *DFA_ENABLED.get_or_init(|| {
+        std::env::var_os("DRAMA_LLAMA_DFA_CACHE")
+            .map(|v| !(v == "0" || v.is_empty()))
+            .unwrap_or(true)
+    })
+}
+
+// ===========================================================================
 // UTF-8 decoding
 // ===========================================================================
 
@@ -1269,6 +1510,20 @@ pub struct GrammarStats {
     pub filter_us_sum: u64,
     /// Maximum across calls of wall-clock time, microseconds.
     pub filter_us_max: u64,
+    /// Latest observed size of the lazy-DFA intern table (distinct canonical
+    /// matcher states seen). Monotonic during a run; reset by
+    /// [`grammar_stats_reset`]. Populated from the most-recently-filtered
+    /// [`GrammarState`]; with multiple concurrent grammars the value reflects
+    /// whichever state most recently hit the filter.
+    pub dfa_states: u64,
+    /// Cumulative cache hits on byte transitions. Same last-observed caveat.
+    pub dfa_transition_hits: u64,
+    /// Cumulative cache misses on byte transitions.
+    pub dfa_transition_misses: u64,
+    /// Cumulative cache hits on per-state first-byte bitmap.
+    pub dfa_bitmap_hits: u64,
+    /// Cumulative cache misses on per-state first-byte bitmap.
+    pub dfa_bitmap_misses: u64,
 }
 
 struct StatsInner {
@@ -1282,6 +1537,11 @@ struct StatsInner {
     depth_max_max: AtomicU64,
     filter_us_sum: AtomicU64,
     filter_us_max: AtomicU64,
+    dfa_states: AtomicU64,
+    dfa_transition_hits: AtomicU64,
+    dfa_transition_misses: AtomicU64,
+    dfa_bitmap_hits: AtomicU64,
+    dfa_bitmap_misses: AtomicU64,
 }
 
 static STATS: StatsInner = StatsInner {
@@ -1295,6 +1555,11 @@ static STATS: StatsInner = StatsInner {
     depth_max_max: AtomicU64::new(0),
     filter_us_sum: AtomicU64::new(0),
     filter_us_max: AtomicU64::new(0),
+    dfa_states: AtomicU64::new(0),
+    dfa_transition_hits: AtomicU64::new(0),
+    dfa_transition_misses: AtomicU64::new(0),
+    dfa_bitmap_hits: AtomicU64::new(0),
+    dfa_bitmap_misses: AtomicU64::new(0),
 };
 
 static STATS_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1342,6 +1607,15 @@ pub fn grammar_stats_snapshot() -> GrammarStats {
         depth_max_max: STATS.depth_max_max.load(Ordering::Relaxed),
         filter_us_sum: STATS.filter_us_sum.load(Ordering::Relaxed),
         filter_us_max: STATS.filter_us_max.load(Ordering::Relaxed),
+        dfa_states: STATS.dfa_states.load(Ordering::Relaxed),
+        dfa_transition_hits: STATS
+            .dfa_transition_hits
+            .load(Ordering::Relaxed),
+        dfa_transition_misses: STATS
+            .dfa_transition_misses
+            .load(Ordering::Relaxed),
+        dfa_bitmap_hits: STATS.dfa_bitmap_hits.load(Ordering::Relaxed),
+        dfa_bitmap_misses: STATS.dfa_bitmap_misses.load(Ordering::Relaxed),
     }
 }
 
@@ -1358,6 +1632,11 @@ pub fn grammar_stats_reset() {
     STATS.depth_max_max.store(0, Ordering::Relaxed);
     STATS.filter_us_sum.store(0, Ordering::Relaxed);
     STATS.filter_us_max.store(0, Ordering::Relaxed);
+    STATS.dfa_states.store(0, Ordering::Relaxed);
+    STATS.dfa_transition_hits.store(0, Ordering::Relaxed);
+    STATS.dfa_transition_misses.store(0, Ordering::Relaxed);
+    STATS.dfa_bitmap_hits.store(0, Ordering::Relaxed);
+    STATS.dfa_bitmap_misses.store(0, Ordering::Relaxed);
 }
 
 fn record_stats(
@@ -1367,6 +1646,7 @@ fn record_stats(
     stacks_in: u64,
     depth_max: u64,
     elapsed_us: u64,
+    cache: Option<&DfaCache>,
 ) {
     STATS.calls.fetch_add(1, Ordering::Relaxed);
     STATS.candidates_in.fetch_add(candidates_in, Ordering::Relaxed);
@@ -1382,6 +1662,27 @@ fn record_stats(
     atomic_fetch_max(&STATS.depth_max_max, depth_max);
     STATS.filter_us_sum.fetch_add(elapsed_us, Ordering::Relaxed);
     atomic_fetch_max(&STATS.filter_us_max, elapsed_us);
+    if let Some(cache) = cache {
+        // Cache counters are already cumulative inside the cache itself, so
+        // we overwrite rather than add. Multiple concurrent grammars would
+        // race here; last-writer-wins is acceptable for the single-grammar
+        // common case.
+        STATS
+            .dfa_states
+            .store(cache.state_count() as u64, Ordering::Relaxed);
+        STATS
+            .dfa_transition_hits
+            .store(cache.transition_hits(), Ordering::Relaxed);
+        STATS
+            .dfa_transition_misses
+            .store(cache.transition_misses(), Ordering::Relaxed);
+        STATS
+            .dfa_bitmap_hits
+            .store(cache.bitmap_hits(), Ordering::Relaxed);
+        STATS
+            .dfa_bitmap_misses
+            .store(cache.bitmap_misses(), Ordering::Relaxed);
+    }
 }
 
 // ===========================================================================
@@ -1422,9 +1723,21 @@ pub(crate) fn grammar_filter(
     let t0 = stats_on.then(Instant::now);
     let candidates_in = candidates.as_slice().len() as u64;
 
-    let bitmap = state.first_byte_bitmap();
     let grammar: &Grammar = &state.grammar;
     let inner: &StackState = &state.inner;
+    let cache_on = dfa_cache_enabled();
+    let cache: &Arc<DfaCache> = &state.cache;
+
+    // Fast path: the lazy-DFA cache memoizes one-byte transitions and the
+    // first-byte bitmap per canonical matcher state. Intern the base state
+    // up-front so every candidate walks the same transition table from the
+    // same state id.
+    let base_id = if cache_on { cache.intern(inner) } else { 0 };
+    let bitmap = if cache_on {
+        cache.first_byte_bitmap(grammar, base_id)
+    } else {
+        state.first_byte_bitmap()
+    };
 
     #[derive(Default)]
     struct Acc {
@@ -1445,7 +1758,21 @@ pub(crate) fn grammar_filter(
                 }
             }
             a.bitmap_pass += 1;
-            if inner.accepts_bytes(grammar, &buf) {
+            let accepts = if cache_on {
+                let mut sid = base_id;
+                let mut rejected = false;
+                for &b in &buf {
+                    sid = cache.transition(grammar, sid, b);
+                    if sid == REJECT_STATE {
+                        rejected = true;
+                        break;
+                    }
+                }
+                !rejected && cache.terminal_valid(grammar, sid)
+            } else {
+                inner.accepts_bytes(grammar, &buf)
+            };
+            if accepts {
                 a.kept.push(*cand);
             }
             a
@@ -1468,6 +1795,7 @@ pub(crate) fn grammar_filter(
             stacks_in,
             depth_max,
             elapsed_us,
+            if cache_on { Some(cache.as_ref()) } else { None },
         );
     }
 
