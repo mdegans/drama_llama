@@ -81,6 +81,7 @@ specific poison used). Identify that suspect.";
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let no_grammar = args.iter().any(|a| a == "--no-grammar");
+    let phase_split = args.iter().any(|a| a == "--phase-split");
     let path = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -95,6 +96,12 @@ fn main() {
         eprintln!(
             "[setup] --no-grammar: sampling will run with default modes; \
              output is unconstrained and JSON parsing will be skipped"
+        );
+    }
+    if phase_split {
+        eprintln!(
+            "[setup] --phase-split: grammar stays suspended until </think> \
+             fires; JSON phase activates the deferred grammar on promotion"
         );
     }
 
@@ -130,13 +137,31 @@ fn main() {
     let tokens = session.engine().model.tokenize(&rendered, true);
     eprintln!("[setup] rendered {} tokens", tokens.len());
 
-    // Compile the output_config grammar directly.
-    let grammar = output_config::grammar_for_prompt(
-        &prompt,
-        &output_config::OutputConfigOptions::default(),
-    )
-    .expect("grammar compile")
-    .expect("output_config set");
+    // Compile the output_config grammar. With --phase-split we resolve
+    // through `compile_prompt_output_config` to get the deferred shape;
+    // otherwise keep the legacy unified-grammar path.
+    let opts = output_config::OutputConfigOptions {
+        allow_thought: true,
+        phase_split,
+    };
+    let (grammar_mode, deferred) = if phase_split {
+        match output_config::compile_prompt_output_config(&prompt, &opts)
+            .expect("grammar compile")
+            .expect("output_config set")
+        {
+            drama_llama::CompiledOutputConfig::Single(g) => (Some(g), None),
+            drama_llama::CompiledOutputConfig::Deferred(d) => (None, Some(d)),
+        }
+    } else {
+        (
+            Some(
+                output_config::grammar_for_prompt(&prompt, &opts)
+                    .expect("grammar compile")
+                    .expect("output_config set"),
+            ),
+            None,
+        )
+    };
 
     let mut predict_opts = PredictOptions::default()
         .add_model_stops(&session.engine().model);
@@ -145,8 +170,9 @@ fn main() {
         SampleOptions::default()
     } else {
         SampleOptions {
-            modes: vec![grammar],
+            modes: grammar_mode.into_iter().collect(),
             repetition: None,
+            deferred_grammar: deferred,
         }
     };
 

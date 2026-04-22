@@ -15,8 +15,9 @@ pub use data::{IgnoreCategory, StopWords};
 mod sample;
 pub use sample::{
     grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
-    Grammar, GrammarError, GrammarState, GrammarStats, JsonError, JsonState,
-    RepetitionError, RepetitionOptions, SampleOptions, SamplingMode,
+    DeferredGrammar, Grammar, GrammarError, GrammarState, GrammarStats,
+    JsonError, JsonState, RepetitionError, RepetitionOptions, SampleOptions,
+    SamplingMode,
 };
 
 mod batch;
@@ -48,7 +49,9 @@ pub use tool_choice::{
 
 pub mod output_config;
 pub use output_config::{
-    grammar_for_output_config, OutputConfigError, OutputConfigOptions,
+    compile_output_config, compile_prompt_output_config,
+    grammar_for_output_config, CompiledOutputConfig, OutputConfigError,
+    OutputConfigOptions,
 };
 
 mod model;

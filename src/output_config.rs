@@ -32,7 +32,12 @@ use std::fmt::Write;
 use misanthropic::prompt::output::{OutputConfig, OutputFormat};
 
 use crate::grammar_compile::{emit_thought_rules, schema_to_gbnf, JSON_GRAMMAR};
-use crate::{GrammarError, Prompt, SamplingMode};
+use crate::{DeferredGrammar, GrammarError, Prompt, SamplingMode};
+
+/// Byte sequence that triggers deferred-grammar promotion when
+/// [`OutputConfigOptions::phase_split`] is on. Matches the closing tag of
+/// the thought preamble emitted by reasoning models.
+pub const THINK_CLOSE_TRIGGER: &[u8] = b"</think>";
 
 /// Options for [`grammar_for_output_config`].
 #[derive(Clone, Debug)]
@@ -43,19 +48,56 @@ pub struct OutputConfigOptions {
     /// structured-output callers usually want the reasoning preserved
     /// as a [`Block::Thought`](crate::Block) on the assistant message.
     pub allow_thought: bool,
+    /// When `true` *and* `allow_thought` is also `true`, compile the
+    /// grammar as a JSON-only body and return a [`DeferredGrammar`]
+    /// triggered by `</think>` instead of a single unified grammar. The
+    /// caller (typically `TokenPredictor`) runs unconstrained during the
+    /// thought preamble and only activates the JSON grammar once the
+    /// trigger fires — which restores pure-inference tok/s during the
+    /// otherwise-permissive `<think>` body. Defaults to `true`; flip off
+    /// to keep the old unified-grammar behaviour (useful for callers that
+    /// need the matcher to also guard the thought structure itself).
+    pub phase_split: bool,
 }
 
 impl Default for OutputConfigOptions {
     fn default() -> Self {
         Self {
             allow_thought: true,
+            phase_split: true,
+        }
+    }
+}
+
+/// Output of [`compile_output_config`] — either a single unified grammar
+/// (run it from the start) or a thought/JSON phase-split pair (run
+/// unconstrained until the trigger, then promote the JSON grammar).
+#[derive(Clone, Debug)]
+pub enum CompiledOutputConfig {
+    /// Standard single-grammar shape. Push this into `SampleOptions::modes`.
+    Single(SamplingMode),
+    /// Phase-split shape. Install into `SampleOptions::deferred_grammar`
+    /// and let `TokenPredictor` promote it when the trigger is emitted.
+    Deferred(DeferredGrammar),
+}
+
+impl CompiledOutputConfig {
+    /// Flatten to a single `SamplingMode` by discarding the deferred
+    /// wrapper. Callers that haven't been updated to handle the deferred
+    /// path can use this to stay on the legacy code path.
+    pub fn into_grammar(self) -> SamplingMode {
+        match self {
+            Self::Single(g) => g,
+            Self::Deferred(d) => d.grammar,
         }
     }
 }
 
 /// Build a [`SamplingMode::Grammar`] that constrains the model's
 /// response to match `config`'s JSON Schema, optionally preceded by a
-/// `<think>...</think>` block.
+/// `<think>...</think>` block. Ignores [`OutputConfigOptions::phase_split`]
+/// — always emits the unified grammar. Use [`compile_output_config`] for
+/// the phase-split path.
 pub fn grammar_for_output_config(
     config: &OutputConfig,
     opts: &OutputConfigOptions,
@@ -68,8 +110,35 @@ pub fn grammar_for_output_config(
     Ok(SamplingMode::grammar(&source)?)
 }
 
+/// Compile an [`OutputConfig`] into a [`CompiledOutputConfig`] that either
+/// holds a single unified grammar or a `</think>`-triggered
+/// [`DeferredGrammar`], depending on `opts.phase_split` and
+/// `opts.allow_thought`. Phase-split applies only when both are `true`.
+pub fn compile_output_config(
+    config: &OutputConfig,
+    opts: &OutputConfigOptions,
+) -> Result<CompiledOutputConfig, OutputConfigError> {
+    let schema = match &config.format {
+        OutputFormat::JsonSchema(f) => &f.schema,
+        _ => return Err(OutputConfigError::UnsupportedFormat),
+    };
+    if opts.phase_split && opts.allow_thought {
+        let source = build_json_only_grammar_source(schema);
+        let grammar = SamplingMode::grammar(&source)?;
+        Ok(CompiledOutputConfig::Deferred(DeferredGrammar {
+            grammar,
+            activate_after: THINK_CLOSE_TRIGGER.to_vec(),
+        }))
+    } else {
+        let source = build_grammar_source(schema, opts);
+        Ok(CompiledOutputConfig::Single(SamplingMode::grammar(&source)?))
+    }
+}
+
 /// Derive the output-config grammar directly from a [`Prompt`]. Reads
-/// `prompt.output_config`; returns `Ok(None)` when unset.
+/// `prompt.output_config`; returns `Ok(None)` when unset. Legacy entry
+/// point — ignores `phase_split`. Use [`compile_prompt_output_config`] for
+/// the phase-split-aware shape.
 pub fn grammar_for_prompt(
     prompt: &Prompt,
     opts: &OutputConfigOptions,
@@ -78,6 +147,19 @@ pub fn grammar_for_prompt(
         return Ok(None);
     };
     Ok(Some(grammar_for_output_config(config, opts)?))
+}
+
+/// Phase-split-aware equivalent of [`grammar_for_prompt`]. Returns the
+/// compiled output config (either unified grammar or deferred) when
+/// `prompt.output_config` is set.
+pub fn compile_prompt_output_config(
+    prompt: &Prompt,
+    opts: &OutputConfigOptions,
+) -> Result<Option<CompiledOutputConfig>, OutputConfigError> {
+    let Some(config) = prompt.output_config.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(compile_output_config(config, opts)?))
 }
 
 /// Emit the GBNF source text for an output-config constraint. Kept
@@ -95,6 +177,20 @@ pub(crate) fn build_grammar_source(
         let _ = writeln!(src, "root ::= ws output_schema");
     }
 
+    schema_to_gbnf(schema, "output_schema", &mut src);
+    src.push_str(JSON_GRAMMAR);
+    src
+}
+
+/// Emit the JSON-only grammar used by the deferred / phase-split path.
+/// Root starts at the JSON body (leading whitespace tolerated); thought
+/// rules are omitted entirely because `TokenPredictor` doesn't run the
+/// matcher during the thought preamble.
+pub(crate) fn build_json_only_grammar_source(
+    schema: &serde_json::Value,
+) -> String {
+    let mut src = String::with_capacity(512);
+    let _ = writeln!(src, "root ::= ws output_schema");
     schema_to_gbnf(schema, "output_schema", &mut src);
     src.push_str(JSON_GRAMMAR);
     src
@@ -167,6 +263,7 @@ mod tests {
             &config.format_schema(),
             &OutputConfigOptions {
                 allow_thought: false,
+                phase_split: false,
             },
         );
         assert!(accepts(&src, r#"{"x":1}"#));
@@ -191,6 +288,75 @@ mod tests {
         let mode = grammar_for_prompt(&prompt, &OutputConfigOptions::default())
             .expect("compile");
         assert!(mode.is_some());
+    }
+
+    #[test]
+    fn compile_output_config_defers_when_phase_split_and_allow_thought() {
+        let config = cfg(json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }));
+        let compiled =
+            compile_output_config(&config, &OutputConfigOptions::default())
+                .expect("compile");
+        let CompiledOutputConfig::Deferred(deferred) = compiled else {
+            panic!("expected Deferred variant on default options");
+        };
+        assert_eq!(deferred.activate_after.as_slice(), b"</think>");
+        // JSON-only grammar accepts bare JSON…
+        let SamplingMode::Grammar(state) = deferred.grammar else {
+            panic!("deferred grammar must be SamplingMode::Grammar");
+        };
+        let source = state.lock().unwrap().grammar().source().to_string();
+        assert!(source.contains("output_schema"));
+        assert!(
+            !source.contains("think_body"),
+            "phase-split grammar must omit thought rules: {source}"
+        );
+        // …and indeed parses bare JSON as a sanity check.
+        assert!(accepts(&source, r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn compile_output_config_single_when_phase_split_off() {
+        let config = cfg(json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }));
+        let opts = OutputConfigOptions {
+            allow_thought: true,
+            phase_split: false,
+        };
+        let compiled =
+            compile_output_config(&config, &opts).expect("compile");
+        let CompiledOutputConfig::Single(SamplingMode::Grammar(state)) =
+            compiled
+        else {
+            panic!("expected Single(Grammar) variant");
+        };
+        let source = state.lock().unwrap().grammar().source().to_string();
+        assert!(source.contains("think_body"));
+    }
+
+    #[test]
+    fn compile_output_config_single_when_allow_thought_off() {
+        let config = cfg(json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }));
+        let opts = OutputConfigOptions {
+            allow_thought: false,
+            phase_split: true, // ignored since allow_thought is off
+        };
+        let compiled =
+            compile_output_config(&config, &opts).expect("compile");
+        assert!(matches!(
+            compiled,
+            CompiledOutputConfig::Single(SamplingMode::Grammar(_))
+        ));
     }
 
     /// Small helper so the tests above don't each re-extract the

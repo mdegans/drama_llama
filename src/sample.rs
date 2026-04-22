@@ -114,6 +114,38 @@ pub struct SampleOptions {
     /// applied. This is applied before the sampling modes, so it may be used
     /// with any of them, including greedy.
     pub repetition: Option<RepetitionOptions>,
+    /// Optional grammar that stays dormant until a byte sequence appears in
+    /// the predictor's output, then gets promoted into `modes`. Used to skip
+    /// grammar filtering during free-form preambles like `<think>…</think>`
+    /// and only activate it for the structured portion that follows. Not
+    /// serialized — treat as per-run wiring. See [`DeferredGrammar`].
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub deferred_grammar: Option<DeferredGrammar>,
+}
+
+/// A grammar that starts suspended and activates once a specific byte
+/// sequence appears in the predictor's generated text. Promotion is driven
+/// by `TokenPredictor`: when the trigger is found in the accumulated output,
+/// the grammar moves into `SampleOptions::modes` and any bytes emitted after
+/// the trigger are fed into its state so the matcher lines up with the
+/// model's byte position.
+///
+/// Typical use: reactor / structured-output workloads where the model emits
+/// `<think>…</think>` then JSON. The JSON grammar is the deferred one;
+/// `activate_after` is `b"</think>"`. During thought the grammar filter is
+/// skipped entirely, restoring pure-inference tok/s. See
+/// `src/output_config.rs` for the compiler that builds one from an
+/// `OutputConfig`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeferredGrammar {
+    /// The grammar to promote. Must be a `SamplingMode::Grammar(_)`;
+    /// promotion panics otherwise. A fresh `GrammarState` is expected here
+    /// — promoted grammars begin matching from root.
+    pub grammar: SamplingMode,
+    /// Byte sequence whose appearance in the predictor's accumulated text
+    /// triggers promotion. Matched anywhere in the trailing window (same
+    /// sizing as stop-strings), not just at the exact text end.
+    pub activate_after: Vec<u8>,
 }
 
 impl SampleOptions {
@@ -122,6 +154,7 @@ impl SampleOptions {
         Self {
             modes: vec![SamplingMode::Greedy],
             repetition: None,
+            deferred_grammar: None,
         }
     }
 
@@ -262,6 +295,7 @@ impl Default for SampleOptions {
         Self {
             modes: vec![SamplingMode::locally_typical()],
             repetition: RepetitionOptions::default().into(),
+            deferred_grammar: None,
         }
     }
 }

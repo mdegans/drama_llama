@@ -621,10 +621,73 @@ impl<'engine> Iterator for TokenPredictor<'engine> {
         let piece = self.inner.engine.model.token_to_piece(next_token);
         self.text.push_str(&piece);
 
+        // Deferred-grammar promotion: if the accumulated text now contains
+        // the trigger bytes, move the grammar into `modes` and feed any
+        // post-trigger tail bytes to its state so the matcher lines up with
+        // the model. A matcher-level rejection on the tail collapses the
+        // iterator — the caller sees generation end rather than an ungated
+        // JSON phase. See `DeferredGrammar`.
+        if let Some(trigger_end) = self
+            .options
+            .sample_options
+            .deferred_grammar
+            .as_ref()
+            .and_then(|d| {
+                find_deferred_trigger_end(
+                    self.text.as_bytes(),
+                    &d.activate_after,
+                    self.max_stop_len
+                        + self.inner.engine.model.max_token_len(),
+                )
+            })
+        {
+            let promoted = self
+                .options
+                .sample_options
+                .deferred_grammar
+                .take()
+                .expect("deferred_grammar presence checked above");
+            let tail = &self.text.as_bytes()[trigger_end..];
+            if !tail.is_empty() {
+                if let crate::SamplingMode::Grammar(state_arc) =
+                    &promoted.grammar
+                {
+                    let mut locked = state_arc.lock().expect(
+                        "deferred grammar mutex poisoned at promotion",
+                    );
+                    if locked.advance_bytes(tail).is_err() {
+                        return None;
+                    }
+                }
+            }
+            self.options.sample_options.modes.push(promoted.grammar);
+        }
+
         self.inner.record_choice(next_token).ok()?;
 
         Some(next_token)
     }
+}
+
+/// Window-bounded search: returns the byte offset one past the last byte of
+/// the first occurrence of `trigger` within the trailing `window` bytes of
+/// `haystack`. Mirrors the window sizing used for stop-strings so the
+/// per-step cost stays bounded even as `text` grows.
+fn find_deferred_trigger_end(
+    haystack: &[u8],
+    trigger: &[u8],
+    window: usize,
+) -> Option<usize> {
+    if trigger.is_empty() || trigger.len() > haystack.len() {
+        return None;
+    }
+    let search_start = haystack
+        .len()
+        .saturating_sub(window.saturating_add(trigger.len()));
+    haystack[search_start..]
+        .windows(trigger.len())
+        .position(|w| w == trigger)
+        .map(|rel| search_start + rel + trigger.len())
 }
 
 /// A predictor that predicts pieces of text.
@@ -916,5 +979,54 @@ mod tests {
         let actual: Vec<String> = engine.predict_pieces(prefix, opts).collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn find_deferred_trigger_end_at_end() {
+        let hay = b"hello <think>bla</think>";
+        let got = super::find_deferred_trigger_end(hay, b"</think>", 64);
+        assert_eq!(got, Some(hay.len()));
+    }
+
+    #[test]
+    fn find_deferred_trigger_end_mid_tail() {
+        let hay = b"<think>bla</think>\n  ";
+        let got = super::find_deferred_trigger_end(hay, b"</think>", 64);
+        assert_eq!(got, Some(b"<think>bla</think>".len()));
+    }
+
+    #[test]
+    fn find_deferred_trigger_end_none() {
+        let hay = b"<think>unclosed body still growing";
+        let got = super::find_deferred_trigger_end(hay, b"</think>", 64);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn find_deferred_trigger_end_empty_trigger_is_none() {
+        let hay = b"anything";
+        let got = super::find_deferred_trigger_end(hay, b"", 64);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn find_deferred_trigger_end_respects_window() {
+        // Place the trigger way before the tail window; should miss.
+        let mut hay = Vec::new();
+        hay.extend_from_slice(b"</think>");
+        hay.extend_from_slice(&vec![b'.'; 200]);
+        let got = super::find_deferred_trigger_end(&hay, b"</think>", 16);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn find_deferred_trigger_end_window_includes_trigger_boundary() {
+        // Trigger ends exactly at the start of the window — must still hit.
+        let mut hay = Vec::new();
+        hay.extend_from_slice(&vec![b'.'; 200]);
+        hay.extend_from_slice(b"</think>");
+        hay.extend_from_slice(&vec![b'x'; 8]);
+        let got = super::find_deferred_trigger_end(&hay, b"</think>", 16);
+        assert_eq!(got, Some(208));
     }
 }

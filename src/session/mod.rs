@@ -546,7 +546,11 @@ impl Session {
         prompt: &Prompt,
         include_user_sampling: bool,
     ) -> Result<
-        (Vec<llama_cpp_sys_3::llama_token>, Vec<SamplingMode>),
+        (
+            Vec<llama_cpp_sys_3::llama_token>,
+            Vec<SamplingMode>,
+            Option<crate::DeferredGrammar>,
+        ),
         SessionError,
     > {
         let rendered = self.template.render_with(prompt, &self.render_opts)?;
@@ -561,21 +565,27 @@ impl Session {
 
         // Grammar (if any) is prepended so it runs first and narrows
         // candidates down to grammar-legal tokens before user filters
-        // further shape the distribution.
-        let grammar = resolve_grammar(
+        // further shape the distribution. A deferred grammar is carried
+        // separately (not in `modes`) — it stays suspended until
+        // `TokenPredictor` sees its trigger in the output.
+        let (grammar_mode, deferred) = match resolve_grammar(
             prompt,
             &self.tool_choice_opts,
             &self.output_config_opts,
-        )?;
+        )? {
+            None => (None, None),
+            Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
+            Some(crate::CompiledOutputConfig::Deferred(d)) => (None, Some(d)),
+        };
         let modes: Vec<SamplingMode> = if include_user_sampling {
-            grammar
+            grammar_mode
                 .into_iter()
                 .chain(self.sample_modes.iter().cloned())
                 .collect()
         } else {
-            grammar.into_iter().collect()
+            grammar_mode.into_iter().collect()
         };
-        Ok((tokens, modes))
+        Ok((tokens, modes, deferred))
     }
 
     /// Cache-aware superset of [`Self::prepare_call`]: renders the
@@ -595,8 +605,15 @@ impl Session {
         &mut self,
         prompt: &Prompt,
         include_user_sampling: bool,
-    ) -> Result<(Vec<llama_token>, Vec<usize>, Vec<SamplingMode>), SessionError>
-    {
+    ) -> Result<
+        (
+            Vec<llama_token>,
+            Vec<usize>,
+            Vec<SamplingMode>,
+            Option<crate::DeferredGrammar>,
+        ),
+        SessionError,
+    > {
         let (tokens, breakpoints) = if self.prefix_cache.is_some() {
             let rendered = self
                 .template
@@ -609,20 +626,24 @@ impl Session {
             (self.engine.model.tokenize(&rendered, true), Vec::new())
         };
 
-        let grammar = resolve_grammar(
+        let (grammar_mode, deferred) = match resolve_grammar(
             prompt,
             &self.tool_choice_opts,
             &self.output_config_opts,
-        )?;
+        )? {
+            None => (None, None),
+            Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
+            Some(crate::CompiledOutputConfig::Deferred(d)) => (None, Some(d)),
+        };
         let modes: Vec<SamplingMode> = if include_user_sampling {
-            grammar
+            grammar_mode
                 .into_iter()
                 .chain(self.sample_modes.iter().cloned())
                 .collect()
         } else {
-            grammar.into_iter().collect()
+            grammar_mode.into_iter().collect()
         };
-        Ok((tokens, breakpoints, modes))
+        Ok((tokens, breakpoints, modes, deferred))
     }
 
     /// Prefix-cache KV-state setup shared by every batch `complete_*`
@@ -751,7 +772,7 @@ impl Session {
         &mut self,
         prompt: &Prompt,
     ) -> Result<String, SessionError> {
-        let (tokens, breakpoints, modes) =
+        let (tokens, breakpoints, modes, deferred_grammar) =
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
@@ -763,6 +784,7 @@ impl Session {
         predict_opts.sample_options = SampleOptions {
             modes,
             repetition: self.repetition.clone(),
+            deferred_grammar: deferred_grammar.clone(),
         };
 
         // Count pieces as we consume them — one piece equals one
@@ -832,7 +854,7 @@ impl Session {
         &'s mut self,
         prompt: &Prompt,
     ) -> Result<BlockStream<'s>, SessionError> {
-        let (tokens, breakpoints, modes) =
+        let (tokens, breakpoints, modes, deferred_grammar) =
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
@@ -856,6 +878,7 @@ impl Session {
         predict_opts.sample_options = SampleOptions {
             modes,
             repetition: self.repetition.clone(),
+            deferred_grammar: deferred_grammar.clone(),
         };
 
         let predictor = if l_hit > 0 {
@@ -892,7 +915,7 @@ impl Session {
             Some(ToolChoice::Method { .. }) | Some(ToolChoice::Any)
         );
 
-        let (tokens, breakpoints, modes) =
+        let (tokens, breakpoints, modes, deferred_grammar) =
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
@@ -907,6 +930,7 @@ impl Session {
         predict_opts.sample_options = SampleOptions {
             modes,
             repetition: self.repetition.clone(),
+            deferred_grammar: deferred_grammar.clone(),
         };
 
         // Collect generated pieces + count tokens inline. We also
@@ -1047,7 +1071,12 @@ impl Session {
         use crate::Sorted;
 
         self.clear_prefix_cache();
-        let (tokens, modes) = self.prepare_call(prompt, false)?;
+        // `top_k_trace` is diagnostic / offline — it iterates candidates
+        // directly without going through the predictor, so there is no one
+        // to drive deferred-grammar promotion. Drop the deferred grammar
+        // on the floor (matches legacy behaviour of ignoring output_config
+        // phase-split in this path).
+        let (tokens, modes, _deferred) = self.prepare_call(prompt, false)?;
 
         let k_nz = NonZeroUsize::new(k.max(1)).unwrap();
         let eos = self.engine.model.eos();
@@ -1185,9 +1214,12 @@ impl Session {
 /// generation for `prompt`. Priority:
 ///
 /// 1. `prompt.tool_choice` (when set and not `Auto`) — compiled via
-///    [`grammar_for_prompt`] with `tool_choice_opts`.
+///    [`grammar_for_prompt`] with `tool_choice_opts`. Always produces a
+///    unified `Single` grammar (tool-choice has no thought preamble today).
 /// 2. `prompt.output_config` — compiled via
-///    [`output_config::grammar_for_prompt`] with `output_config_opts`.
+///    [`output_config::compile_prompt_output_config`]; may return either a
+///    `Single` unified grammar or a `Deferred` phase-split grammar
+///    depending on `output_config_opts.phase_split`.
 /// 3. `None` — generation is unconstrained.
 ///
 /// Tool-choice wins when both are set: tool schemas *are* structured
@@ -1198,14 +1230,15 @@ fn resolve_grammar(
     prompt: &Prompt,
     tool_choice_opts: &ToolChoiceOptions,
     output_config_opts: &OutputConfigOptions,
-) -> Result<Option<SamplingMode>, SessionError> {
+) -> Result<Option<crate::CompiledOutputConfig>, SessionError> {
     if let Some(g) = grammar_for_prompt(prompt, tool_choice_opts)? {
-        return Ok(Some(g));
+        return Ok(Some(crate::CompiledOutputConfig::Single(g)));
     }
-    if let Some(g) =
-        output_config::grammar_for_prompt(prompt, output_config_opts)?
-    {
-        return Ok(Some(g));
+    if let Some(c) = output_config::compile_prompt_output_config(
+        prompt,
+        output_config_opts,
+    )? {
+        return Ok(Some(c));
     }
     Ok(None)
 }
@@ -1499,6 +1532,8 @@ mod tests {
     /// Only output_config is set → output-config grammar is used.
     /// Verify by sniffing the compiled GBNF source for the
     /// `output_schema` rule name the output_config builder emits.
+    /// Default `OutputConfigOptions` has `phase_split=true`, so the
+    /// resolved shape is `Deferred(..)` with `</think>` as the trigger.
     #[test]
     fn test_resolve_grammar_output_config_when_no_tool_choice() {
         let prompt = Prompt::default().json_schema(serde_json::json!({
@@ -1512,14 +1547,56 @@ mod tests {
             &OutputConfigOptions::default(),
         )
         .expect("resolve");
-        let SamplingMode::Grammar(state) = got.expect("some mode") else {
-            panic!("expected Grammar variant");
+        let crate::CompiledOutputConfig::Deferred(deferred) =
+            got.expect("some compiled config")
+        else {
+            panic!("expected Deferred variant (phase_split defaults on)");
+        };
+        assert_eq!(deferred.activate_after.as_slice(), b"</think>");
+        let SamplingMode::Grammar(state) = deferred.grammar else {
+            panic!("deferred.grammar must be SamplingMode::Grammar");
         };
         let source = state.lock().unwrap().grammar().source().to_string();
         assert!(
             source.contains("output_schema"),
             "expected output_config grammar, got: {source}"
         );
+        // Phase-split emits JSON-only grammar; thought rules are
+        // handled entirely at predictor level.
+        assert!(
+            !source.contains("think_body"),
+            "phase-split grammar must not contain thought rules, got: \
+             {source}"
+        );
+    }
+
+    /// Opt out of `phase_split` — the unified thought+JSON grammar comes
+    /// back under `Single`.
+    #[test]
+    fn test_resolve_grammar_output_config_single_when_phase_split_off() {
+        let prompt = Prompt::default().json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }));
+        let got = resolve_grammar(
+            &prompt,
+            &ToolChoiceOptions::default(),
+            &OutputConfigOptions {
+                allow_thought: true,
+                phase_split: false,
+            },
+        )
+        .expect("resolve");
+        let crate::CompiledOutputConfig::Single(SamplingMode::Grammar(
+            state,
+        )) = got.expect("some compiled config")
+        else {
+            panic!("expected Single(Grammar) variant");
+        };
+        let source = state.lock().unwrap().grammar().source().to_string();
+        assert!(source.contains("output_schema"));
+        assert!(source.contains("think_body"));
     }
 
     /// Both tool_choice and output_config set → tool_choice wins.
@@ -1553,8 +1630,11 @@ mod tests {
             &OutputConfigOptions::default(),
         )
         .expect("resolve");
-        let SamplingMode::Grammar(state) = got.expect("some mode") else {
-            panic!("expected Grammar variant");
+        let crate::CompiledOutputConfig::Single(SamplingMode::Grammar(
+            state,
+        )) = got.expect("some compiled config")
+        else {
+            panic!("expected Single(Grammar) variant for tool_choice");
         };
         let source = state.lock().unwrap().grammar().source().to_string();
         assert!(
