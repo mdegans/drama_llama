@@ -121,7 +121,7 @@ async fn route_messages(
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(AnthropicError::Unknown {
-                code: 500.try_into().unwrap(),
+                code: Some(500.try_into().unwrap()),
                 message: e.to_string(),
             }),
         )
@@ -133,7 +133,7 @@ async fn route_messages(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(AnthropicError::Unknown {
-                    code: 500.try_into().unwrap(),
+                    code: Some(500.try_into().unwrap()),
                     message: e.to_string(),
                 }),
             )
