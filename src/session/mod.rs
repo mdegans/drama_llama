@@ -1553,15 +1553,24 @@ mod tests {
     /// Only output_config is set → output-config grammar is used.
     /// Verify by sniffing the compiled GBNF source for the
     /// `output_schema` rule name the output_config builder emits.
-    /// Default `OutputConfigOptions` has `phase_split=true`, so the
-    /// resolved shape is `Deferred(..)` with `</think>` as the trigger.
+    /// Default `OutputConfigOptions` has `phase_split=true`; since
+    /// `compile_prompt_output_config` auto-disables phase_split when
+    /// `prompt.thinking.is_none()`, the prompt here opts into
+    /// thinking so the Deferred path is exercised.
     #[test]
     fn test_resolve_grammar_output_config_when_no_tool_choice() {
-        let prompt = Prompt::default().json_schema(serde_json::json!({
-            "type": "object",
-            "properties": {"x": {"type": "integer"}},
-            "required": ["x"],
-        }));
+        use misanthropic::prompt::thinking::{Kind, Thinking};
+        use std::num::NonZeroU32;
+        let prompt = Prompt::default()
+            .json_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"],
+            }))
+            .thinking(Thinking {
+                budget_tokens: NonZeroU32::new(1024).unwrap(),
+                kind: Kind::Enabled,
+            });
         let got = resolve_grammar(
             &prompt,
             &ToolChoiceOptions::default(),
