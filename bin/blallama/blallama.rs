@@ -176,7 +176,7 @@ async fn load_session(
         path = path.to_string_lossy().as_ref()
     );
     // `from_path` is blocking
-    spawn_blocking_or_bust(|| Session::from_path(path))
+    spawn_blocking_or_bust(|| Session::from_path_with_n_ctx(path, 65536))
         .await
         .map(|s| {
             s.with_repetition(
@@ -186,6 +186,8 @@ async fn load_session(
                     IgnoreCategory::Punctuation,
                 ]),
             )
+            .with_prefix_cache(true)
+            .with_max_tokens(8192.try_into().unwrap())
         })
         .map_err(|e| {
             (
