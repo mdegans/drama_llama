@@ -685,6 +685,59 @@ impl Drop for LlamaCppModel {
     }
 }
 
+// Transitional pass-through impl of the backend-agnostic `Model`
+// trait. Every method forwards directly to the inherent method of the
+// same name. Commit 4 threads `<M: Model>` generics through Session
+// and Predictor; until then this impl mainly exists so trait
+// signatures can be exercised against the concrete llama.cpp model.
+impl crate::backend::Model for LlamaCppModel {
+    type Error = std::convert::Infallible;
+
+    fn n_vocab(&self) -> i32 {
+        LlamaCppModel::n_vocab(self)
+    }
+
+    fn bos(&self) -> crate::Token {
+        LlamaCppModel::bos(self)
+    }
+
+    fn eos(&self) -> crate::Token {
+        LlamaCppModel::eos(self)
+    }
+
+    fn eot(&self) -> crate::Token {
+        LlamaCppModel::eot(self)
+    }
+
+    fn special_tokens(&self) -> Vec<crate::Token> {
+        LlamaCppModel::special_tokens(self)
+    }
+
+    fn max_token_len(&self) -> usize {
+        LlamaCppModel::max_token_len(self)
+    }
+
+    fn tokenize(&self, input: &str, special: bool) -> Vec<crate::Token> {
+        LlamaCppModel::tokenize(self, input, special)
+    }
+
+    fn token_to_piece(&self, token: crate::Token) -> String {
+        LlamaCppModel::token_to_piece(self, token)
+    }
+
+    fn context_size(&self) -> i32 {
+        LlamaCppModel::context_size(self)
+    }
+
+    fn chat_template_source(&self) -> Option<String> {
+        self.get_meta("tokenizer.chat_template")
+    }
+
+    fn get_meta(&self, key: &str) -> Option<String> {
+        LlamaCppModel::get_meta(self, key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use llama_cpp_sys_3::llama_vocab_type_LLAMA_VOCAB_TYPE_BPE;

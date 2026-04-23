@@ -20,8 +20,8 @@ pub use sample::{
     SamplingMode,
 };
 
-mod backend;
-pub use backend::{Token, TokenData};
+pub mod backend;
+pub use backend::{Decoder, Model, Token, TokenData};
 
 mod batch;
 pub(crate) use batch::Batch;

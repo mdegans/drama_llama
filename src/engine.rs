@@ -736,6 +736,75 @@ impl Drop for Engine {
     }
 }
 
+// Transitional pass-through impl of the backend-agnostic `Decoder`
+// trait. Forwards to existing `Engine` inherent methods. Commit 4
+// will extract a dedicated `LlamaCppDecoder` struct and move this
+// impl there; until then, having the impl on the current (unsplit)
+// Engine lets the trait signatures be exercised without structural
+// surgery.
+impl crate::backend::Decoder for Engine {
+    type Error = DecodeError;
+
+    fn prefill(
+        &mut self,
+        tokens: &[crate::Token],
+        start_pos: usize,
+        seq_id: i32,
+    ) -> Result<&[f32], Self::Error> {
+        Engine::prefill(self, tokens, start_pos, seq_id)?;
+        if tokens.is_empty() {
+            Ok(&[])
+        } else {
+            Ok(self.logits(tokens.len() - 1))
+        }
+    }
+
+    fn step(
+        &mut self,
+        token: crate::Token,
+        pos: usize,
+        seq_id: i32,
+    ) -> Result<&[f32], Self::Error> {
+        let mut batch = Batch::new(1, 0, 1)
+            .expect("step batch allocation failed");
+        let seq_ids = [seq_id];
+        batch
+            .add_token(token, pos, Some(&seq_ids), true)
+            .expect("step add_token failed (should be unreachable)");
+        self.decode(&batch)?;
+        Ok(self.logits(0))
+    }
+
+    fn n_ctx(&self) -> u32 {
+        Engine::n_ctx(self)
+    }
+
+    fn memory_clear(&mut self) {
+        Engine::memory_clear(self);
+    }
+
+    fn memory_seq_rm(
+        &mut self,
+        seq_id: i32,
+        p0: i32,
+        p1: i32,
+    ) -> bool {
+        Engine::memory_seq_rm(self, seq_id, p0, p1)
+    }
+
+    fn memory_seq_cp(&mut self, src: i32, dst: i32, p0: i32, p1: i32) {
+        Engine::memory_seq_cp(self, src, dst, p0, p1);
+    }
+
+    fn memory_seq_keep(&mut self, seq_id: i32) {
+        Engine::memory_seq_keep(self, seq_id);
+    }
+
+    fn memory_seq_pos_max(&mut self, seq_id: i32) -> i32 {
+        Engine::memory_seq_pos_max(self, seq_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
