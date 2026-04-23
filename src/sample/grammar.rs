@@ -34,8 +34,10 @@
 //! [`SamplingMode::Grammar`]: crate::SamplingMode::Grammar
 
 use dashmap::DashMap;
-use llama_cpp_sys_3::{llama_token, llama_token_data};
+use llama_cpp_sys_3::llama_token;
 use rayon::prelude::*;
+
+use crate::TokenData;
 use rustc_hash::FxHashMap;
 use tinyvec::{ArrayVec, TinyVec};
 
@@ -1741,7 +1743,7 @@ pub(crate) fn grammar_filter(
 
     #[derive(Default)]
     struct Acc {
-        kept: Vec<llama_token_data>,
+        kept: Vec<TokenData>,
         bitmap_pass: u64,
     }
 
@@ -1804,7 +1806,7 @@ pub(crate) fn grammar_filter(
         if state.is_complete() {
             state.reset();
         }
-        let eos = llama_token_data {
+        let eos = TokenData {
             id: model.eos(),
             logit: 0.0,
             p: 1.0,

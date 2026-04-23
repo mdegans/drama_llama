@@ -21,9 +21,9 @@
 //!
 //! [`SamplingMode::Json`]: crate::SamplingMode::Json
 
-use llama_cpp_sys_3::{llama_token, llama_token_data};
+use llama_cpp_sys_3::llama_token;
 
-use crate::{model::token_to_piece_ref, Candidates, Model};
+use crate::{model::token_to_piece_ref, Candidates, Model, TokenData};
 
 /// Pushdown-automaton state for JSON parsing at the byte level.
 ///
@@ -524,7 +524,7 @@ pub(crate) fn json_filter(
     model: &Model,
 ) -> Candidates {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    let mut kept: Vec<llama_token_data> =
+    let mut kept: Vec<TokenData> =
         Vec::with_capacity(candidates.len().get());
     for cand in candidates.as_slice() {
         buf.clear();
@@ -542,7 +542,7 @@ pub(crate) fn json_filter(
         if state.is_complete() {
             state.reset();
         }
-        let eos = llama_token_data {
+        let eos = TokenData {
             id: model.eos(),
             logit: 0.0,
             p: 1.0,

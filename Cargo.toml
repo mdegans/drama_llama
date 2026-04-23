@@ -52,13 +52,21 @@ schemars = { version = "1", optional = true }
 
 
 [features]
+default = ["llama-cpp"]
+# `llama-cpp` gates the llama.cpp-backed decode+model implementations.
+# In this commit it is a pure flag (the dep is still always compiled);
+# Commit 6 will make `llama-cpp-sys-3` optional and have this feature
+# actually forward to the dep. Leaving the definition here now lets us
+# start cfg-gating llama.cpp-specific code (`TokenDataArray`, etc.)
+# without churning Cargo.toml again.
+llama-cpp = []
 webchat = ["dep:rocket", "toml", "dep:dirs", "dep:markdown", "serde"]
 toml = ["dep:toml"]
 cli = ["dep:clap"]
 serde = ["tinyvec/serde"]
 stats = ["dep:stringmetrics"]
-cuda = ["llama-cpp-sys-3/cuda"]
-cuda_f16 = ["llama-cpp-sys-3/cuda_f16"]
+cuda = ["llama-cpp", "llama-cpp-sys-3/cuda"]
+cuda_f16 = ["llama-cpp", "llama-cpp-sys-3/cuda_f16"]
 egui = [
     "dep:egui",
     "dep:eframe",

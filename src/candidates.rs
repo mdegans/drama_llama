@@ -2,18 +2,22 @@
 
 use std::{
     num::{NonZeroUsize, TryFromIntError},
-    ops::{Deref, Index},
+    ops::Index,
 };
 
 use partial_sort::PartialSort;
 
-use llama_cpp_sys_3::{llama_token, llama_token_data, llama_token_data_array};
-
 use crate::{
     ngram::NGramStats,
     sample::{choose_candidate, SampleError},
-    Model, Probability, RepetitionOptions, SampleOptions,
+    Model, Probability, RepetitionOptions, SampleOptions, Token, TokenData,
 };
+
+#[cfg(feature = "llama-cpp")]
+use std::ops::Deref;
+#[cfg(feature = "llama-cpp")]
+use llama_cpp_sys_3::llama_token_data_array;
+
 /// Sort state of the candidates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Sorted {
@@ -59,11 +63,13 @@ impl Sorted {
     }
 }
 
+#[cfg(feature = "llama-cpp")]
 pub struct TokenDataArray<'a> {
     arr: llama_token_data_array,
     candidates: &'a mut Candidates,
 }
 
+#[cfg(feature = "llama-cpp")]
 impl TokenDataArray<'_> {
     /// Get the number of candidates in the array.
     pub fn len(&self) -> NonZeroUsize {
@@ -74,18 +80,26 @@ impl TokenDataArray<'_> {
     ///
     /// # Panics
     /// * If the arr.size has been modified to be out of bounds.
-    pub fn as_slice(&self) -> &[llama_token_data] {
+    pub fn as_slice(&self) -> &[TokenData] {
         assert!(self.arr.size == self.len().get());
-        unsafe { std::slice::from_raw_parts(self.arr.data, self.len().get()) }
+        unsafe {
+            std::slice::from_raw_parts(
+                self.arr.data as *const TokenData,
+                self.len().get(),
+            )
+        }
     }
 
     /// Get a mutable slice of the candidates in the array.
-    pub fn as_mut_slice(&mut self) -> &mut [llama_token_data] {
+    pub fn as_mut_slice(&mut self) -> &mut [TokenData] {
         self.arr.size = self.len().get();
         self.candidates.sort_state = Sorted::Unknown;
         self.candidates.softmax_applied_to = None;
         unsafe {
-            std::slice::from_raw_parts_mut(self.arr.data, self.len().get())
+            std::slice::from_raw_parts_mut(
+                self.arr.data as *mut TokenData,
+                self.len().get(),
+            )
         }
     }
 
@@ -168,6 +182,7 @@ impl TokenDataArray<'_> {
     }
 }
 
+#[cfg(feature = "llama-cpp")]
 impl Deref for TokenDataArray<'_> {
     type Target = llama_token_data_array;
 
@@ -188,7 +203,7 @@ pub struct Candidates {
     /// This does not guarantee that the candidates are sorted by logit.
     pub(crate) softmax_applied_to: Option<NonZeroUsize>,
     /// The actual candidate tokens.
-    pub(crate) data: Vec<llama_token_data>,
+    pub(crate) data: Vec<TokenData>,
 }
 
 static_assertions::assert_impl_all!(Candidates: Send, Sync);
@@ -225,8 +240,8 @@ impl Candidates {
     // used as an array index in the c++ api (and ours) which could lead to
     // memory unsafety.
     fn from_i32(n_vocab: i32) -> Self {
-        let data: Vec<llama_token_data> = (0_i32..n_vocab)
-            .map(|id| llama_token_data {
+        let data: Vec<TokenData> = (0_i32..n_vocab)
+            .map(|id| TokenData {
                 id,
                 logit: 0.0,
                 p: 0.0,
@@ -251,7 +266,7 @@ impl Candidates {
         }
     }
 
-    /// Create a new Candidates container from a Vec of `llama_token_data`.
+    /// Create a new Candidates container from a Vec of [`TokenData`].
     ///
     /// Time complexity is O(n) where n is the number of candidates because the
     /// candidates are checked for sorting. See
@@ -262,7 +277,7 @@ impl Candidates {
     /// * If `data` is empty.
     /// * If the IDs in `data` are not contiguous from 0 to n-1.
     // TODO: Make fallible and return a Result.
-    pub fn from_vec(data: Vec<llama_token_data>) -> Self {
+    pub fn from_vec(data: Vec<TokenData>) -> Self {
         assert!(!data.is_empty());
 
         let sort_state = if data.len() == 1 {
@@ -313,7 +328,7 @@ impl Candidates {
         Self::from_iter(
             (0..)
                 .zip(it.into_iter())
-                .map(|(id, logit)| llama_token_data { id, logit, p: 0.0 }),
+                .map(|(id, logit)| TokenData { id, logit, p: 0.0 }),
         )
     }
 
@@ -329,7 +344,7 @@ impl Candidates {
     // Vec::len will probably also be const and this will be able to be checked
     // at compile time. Creating a const container of candidates may be useful
     // for intializing const candidate masks or other uses.
-    pub const fn from_vec_unchecked(data: Vec<llama_token_data>) -> Self {
+    pub const fn from_vec_unchecked(data: Vec<TokenData>) -> Self {
         Self {
             data,
             sort_state: Sorted::Unknown,
@@ -342,7 +357,7 @@ impl Candidates {
     /// really sorted or softmaxed, it will break things. It will not, however,
     /// cause memory unsafety.
     pub const fn from_vec_unchecked_full(
-        data: Vec<llama_token_data>,
+        data: Vec<TokenData>,
         sort_state: Sorted,
         softmax_applied_to: Option<NonZeroUsize>,
     ) -> Self {
@@ -365,9 +380,10 @@ impl Candidates {
     ///   Candidates struct using [`Candidates::from_llama_token_data_array`]
     ///   **or there will be a memory leak**. [`Vec::from_raw_parts`] can also
     ///   be used to take ownership of the data.
+    #[cfg(feature = "llama-cpp")]
     pub fn into_llama_token_data_array(mut self) -> llama_token_data_array {
         let size = self.len().get();
-        let data = self.data.as_mut_ptr();
+        let data = self.data.as_mut_ptr() as *mut llama_cpp_sys_3::llama_token_data;
         let sorted =
             self.is_sorted().by_logit().is_some_and(|n| n.get() == size);
         std::mem::forget(self);
@@ -404,12 +420,17 @@ impl Candidates {
     /// * `arr.size` must be within the bounds of `arr.data`.
     /// * If the array's data is owned by another struct, dropping the
     ///   Candidates struct will cause a double free.
+    #[cfg(feature = "llama-cpp")]
     pub unsafe fn from_llama_token_data_array(
         arr: llama_token_data_array,
         softmax_applied_to: Option<NonZeroUsize>,
     ) -> Self {
         assert!(!arr.data.is_null());
-        let data = Vec::from_raw_parts(arr.data, arr.size, arr.size);
+        let data: Vec<TokenData> = Vec::from_raw_parts(
+            arr.data as *mut TokenData,
+            arr.size,
+            arr.size,
+        );
 
         if arr.sorted {
             debug_assert!(data.windows(2).all(|w| w[0].logit >= w[1].logit));
@@ -434,8 +455,8 @@ impl Candidates {
         self.data.len().try_into().unwrap()
     }
 
-    /// Returns `Some(llama_token_data)` if there is only one candidate.
-    pub fn is_one(&self) -> Option<llama_token_data> {
+    /// Returns `Some(TokenData)` if there is only one candidate.
+    pub fn is_one(&self) -> Option<TokenData> {
         if self.len().get() == 1 {
             Some(self.data[0])
         } else {
@@ -559,17 +580,17 @@ impl Candidates {
         self.truncate(k)
     }
 
-    /// Returns a slice of the candidates as [`llama_token_data`].
-    pub fn as_slice(&self) -> &[llama_token_data] {
+    /// Returns a slice of the candidates as [`TokenData`].
+    pub fn as_slice(&self) -> &[TokenData] {
         &self.data[0..self.len().get()]
     }
 
-    /// Returns a mutable slice of the candidates as [`llama_token_data`].
+    /// Returns a mutable slice of the candidates as [`TokenData`].
     ///
     /// Invalidates cached:
     /// * Sort state
     /// * Softmax state
-    pub fn as_mut_slice(&mut self) -> &mut [llama_token_data] {
+    pub fn as_mut_slice(&mut self) -> &mut [TokenData] {
         let len = self.len().get();
         self.sort_state = Sorted::Unknown;
         self.softmax_applied_to = None;
@@ -581,10 +602,12 @@ impl Candidates {
     ///
     /// If a method is called that modifies the candidates, the internal sort
     /// state and softmax state will be invalidated automatically.
+    #[cfg(feature = "llama-cpp")]
     pub fn as_token_data_array<'a>(&'a mut self) -> TokenDataArray<'a> {
         TokenDataArray {
             arr: llama_token_data_array {
-                data: self.data.as_mut_ptr(),
+                data: self.data.as_mut_ptr()
+                    as *mut llama_cpp_sys_3::llama_token_data,
                 sorted: self
                     .is_sorted()
                     .by_logit()
@@ -751,7 +774,7 @@ impl Candidates {
             }
 
             let min_logit = max_logit + p.ln();
-            let filtered_tokens: Vec<llama_token_data> = self
+            let filtered_tokens: Vec<TokenData> = self
                 .data
                 .iter()
                 .cloned()
@@ -1210,13 +1233,13 @@ impl Candidates {
     /// Sample a token from the candidates using [`SampleOptions`].
     pub fn sample_token(
         self,
-        tokens: &[llama_token],
+        tokens: &[Token],
         opts: &mut SampleOptions,
         freq_map: &mut NGramStats,
         rng: &mut xorshift::Xoroshiro128,
         mu: &mut Option<f32>,
         model: &Model,
-    ) -> Result<llama_token, SampleError> {
+    ) -> Result<Token, SampleError> {
         crate::sample::sample_token(
             tokens, self, opts, freq_map, rng, mu, model,
         )
@@ -1235,7 +1258,7 @@ impl Candidates {
     /// [`llama_sample_repetition_penalties`]: llama_cpp_sys_3::llama_sample_repetition_penalties
     pub fn penalize_repetition(
         self,
-        tokens: &[llama_token],
+        tokens: &[Token],
         opts: &mut RepetitionOptions,
         freq_map: &mut NGramStats,
         model: &Model,
@@ -1246,13 +1269,13 @@ impl Candidates {
     }
 
     /// Iterates over the candidates.
-    pub fn iter(&self) -> std::slice::Iter<llama_token_data> {
+    pub fn iter(&self) -> std::slice::Iter<TokenData> {
         self.data.iter()
     }
 
     /// Iterates over the candidates mutably. This invalidates the sort state
     /// and softmax state.
-    pub fn iter_mut(&mut self) -> std::slice::IterMut<llama_token_data> {
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<TokenData> {
         self.sort_state = Sorted::Unknown;
         self.softmax_applied_to = None;
         self.data.iter_mut()
@@ -1261,23 +1284,23 @@ impl Candidates {
     /// Convert from an iterator without checking class invariants.
     pub fn from_iter_unchecked<T>(it: T) -> Self
     where
-        T: IntoIterator<Item = llama_token_data>,
+        T: IntoIterator<Item = TokenData>,
     {
-        let data: Vec<llama_token_data> = it.into_iter().collect();
+        let data: Vec<TokenData> = it.into_iter().collect();
         Self::from_vec_unchecked(data)
     }
 }
 
 impl Index<usize> for Candidates {
-    type Output = llama_token_data;
+    type Output = TokenData;
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.data[index]
     }
 }
 
-impl FromIterator<llama_token_data> for Candidates {
-    fn from_iter<T: IntoIterator<Item = llama_token_data>>(iter: T) -> Self {
+impl FromIterator<TokenData> for Candidates {
+    fn from_iter<T: IntoIterator<Item = TokenData>>(iter: T) -> Self {
         Self::from_vec(iter.into_iter().collect())
     }
 }
@@ -1305,7 +1328,7 @@ mod tests {
     fn test_from_vec() {
         // Test with a vector sorted by id
         let v = (0..10)
-            .map(|i| llama_token_data {
+            .map(|i| TokenData {
                 id: i as i32,
                 logit: 0.0,
                 p: 0.0,
@@ -1319,7 +1342,7 @@ mod tests {
 
         // Test with a vector sorted by logit
         let v = (0..10)
-            .map(|i| llama_token_data {
+            .map(|i| TokenData {
                 id: 9 - i as i32,
                 logit: -(i as f32),
                 p: 0.0,
@@ -1333,7 +1356,7 @@ mod tests {
 
         // Test with a vector that is not sorted
         let v = (0..10)
-            .map(|i| llama_token_data {
+            .map(|i| TokenData {
                 id: 9 - i as i32,
                 logit: i as f32,
                 p: 0.0,

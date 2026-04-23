@@ -660,16 +660,15 @@ pub fn apply_sample_repetition_ngram(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Candidates;
-    use llama_cpp_sys_3::llama_token_data;
+    use crate::{Candidates, TokenData};
     use std::path::PathBuf;
 
     /// Helper: create candidates sorted by id with given logits.
     fn make_candidates(logits: &[f32]) -> Candidates {
-        let data: Vec<llama_token_data> = logits
+        let data: Vec<TokenData> = logits
             .iter()
             .enumerate()
-            .map(|(i, &logit)| llama_token_data {
+            .map(|(i, &logit)| TokenData {
                 id: i as i32,
                 logit,
                 p: 0.0,

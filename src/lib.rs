@@ -20,11 +20,16 @@ pub use sample::{
     SamplingMode,
 };
 
+mod backend;
+pub use backend::{Token, TokenData};
+
 mod batch;
 pub(crate) use batch::Batch;
 
 mod candidates;
-pub use candidates::{Candidates, Sorted, TokenDataArray};
+pub use candidates::{Candidates, Sorted};
+#[cfg(feature = "llama-cpp")]
+pub use candidates::TokenDataArray;
 
 pub mod prompt;
 pub use prompt::{
