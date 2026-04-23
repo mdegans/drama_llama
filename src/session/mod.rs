@@ -1,4 +1,4 @@
-//! High-level ergonomic wrapper around [`Engine`] for chat-style tool-using
+//! High-level ergonomic wrapper around [`LlamaCppEngine`] for chat-style tool-using
 //! inference.
 //!
 //! [`Session`] is to local inference what [`misanthropic::Client::message`] is
@@ -47,7 +47,7 @@
 //! the next call, computes the longest common prefix of `new_tokens` and
 //! `prev_tokens`, clipped to the nearest `cache_control` breakpoint declared in
 //! the prompt, and resumes generation from that position via
-//! [`Engine::predict_pieces_resuming`].
+//! [`LlamaCppEngine::predict_pieces_resuming`].
 //!
 //! The contract:
 //!
@@ -82,7 +82,7 @@ use misanthropic::response::Usage;
 use crate::{
     chat_template::tokenize_with_breakpoints, engine::NewError,
     grammar_for_prompt, output_config, silence_logs, ChatTemplate,
-    ChatTemplateError, Engine, OutputConfigError, OutputConfigOptions,
+    ChatTemplateError, LlamaCppEngine, OutputConfigError, OutputConfigOptions,
     PredictOptions, Prompt, RenderOptions, RepetitionOptions, SampleOptions,
     SamplingMode, ToolChoiceError, ToolChoiceOptions,
 };
@@ -95,7 +95,7 @@ pub use parse::{parse_completion, BlockParser};
 pub enum SessionError {
     /// LlamaCppModel load / llama.cpp init failure.
     #[error("engine setup: {0}")]
-    Engine(#[from] NewError),
+    LlamaCppEngine(#[from] NewError),
     /// The model has no embedded `tokenizer.chat_template`, or the template
     /// failed to compile.
     #[error("chat template: {0}")]
@@ -231,10 +231,10 @@ pub struct TopKEntry {
     pub piece: String,
 }
 
-/// Chat-style inference session: owns an [`Engine`] + [`ChatTemplate`] plus the
+/// Chat-style inference session: owns an [`LlamaCppEngine`] + [`ChatTemplate`] plus the
 /// builder-configured defaults for each `complete_*` call.
 pub struct Session {
-    engine: Engine,
+    engine: LlamaCppEngine,
     template: ChatTemplate,
     tool_choice_opts: ToolChoiceOptions,
     output_config_opts: OutputConfigOptions,
@@ -267,7 +267,7 @@ pub struct Session {
 impl Session {
     /// Load a model from disk and wire up the chat template.
     pub fn from_path(path: PathBuf) -> Result<Self, SessionError> {
-        let engine = Engine::from_path(path)?;
+        let engine = LlamaCppEngine::from_path(path)?;
         Self::from_engine(engine)
     }
 
@@ -279,7 +279,7 @@ impl Session {
         path: PathBuf,
         fa: crate::FlashAttention,
     ) -> Result<Self, SessionError> {
-        let engine = Engine::from_path_with_flash_attention(path, fa)?;
+        let engine = LlamaCppEngine::from_path_with_flash_attention(path, fa)?;
         Self::from_engine(engine)
     }
 
@@ -295,20 +295,20 @@ impl Session {
         path: PathBuf,
         n_ctx: u32,
     ) -> Result<Self, SessionError> {
-        let engine = Engine::from_path_with_n_ctx(path, n_ctx)?;
+        let engine = LlamaCppEngine::from_path_with_n_ctx(path, n_ctx)?;
         Self::from_engine(engine)
     }
 
     /// Load a model CPU-only (zero GPU layers). Diagnostic path for
     /// isolating GPU-kernel divergence.
     pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, SessionError> {
-        let engine = Engine::from_path_cpu_only(path)?;
+        let engine = LlamaCppEngine::from_path_cpu_only(path)?;
         Self::from_engine(engine)
     }
 
-    /// Wrap an already-constructed [`Engine`]. Useful when the engine
-    /// was built via [`Engine::new`] with custom context parameters.
-    pub fn from_engine(engine: Engine) -> Result<Self, SessionError> {
+    /// Wrap an already-constructed [`LlamaCppEngine`]. Useful when the engine
+    /// was built via [`LlamaCppEngine::new`] with custom context parameters.
+    pub fn from_engine(engine: LlamaCppEngine) -> Result<Self, SessionError> {
         let template = ChatTemplate::from_model(&engine.model)?;
         Ok(Self {
             engine,
@@ -439,7 +439,7 @@ impl Session {
     /// context size (`n_ctx`). If the prompt plus `n` exceeds the
     /// engine's configured `n_ctx`, generation truncates at the KV
     /// cache boundary regardless of this value — reached via
-    /// [`Self::from_path_with_n_ctx`] or by constructing an [`Engine`]
+    /// [`Self::from_path_with_n_ctx`] or by constructing an [`LlamaCppEngine`]
     /// directly.
     pub fn with_max_tokens(mut self, n: NonZeroUsize) -> Self {
         self.max_tokens = n;
@@ -525,16 +525,16 @@ impl Session {
         &self.total_usage
     }
 
-    /// Borrow the underlying [`Engine`] — useful when the caller needs raw
+    /// Borrow the underlying [`LlamaCppEngine`] — useful when the caller needs raw
     /// predictor access for something `Session` doesn't expose yet (e.g. custom
     /// stop-sequence management).
-    pub fn engine(&self) -> &Engine {
+    pub fn engine(&self) -> &LlamaCppEngine {
         &self.engine
     }
 
-    /// Mutable borrow of the underlying [`Engine`]. Handy for KV-cache
+    /// Mutable borrow of the underlying [`LlamaCppEngine`]. Handy for KV-cache
     /// manipulation across turns.
-    pub fn engine_mut(&mut self) -> &mut Engine {
+    pub fn engine_mut(&mut self) -> &mut LlamaCppEngine {
         &mut self.engine
     }
 
@@ -672,7 +672,7 @@ impl Session {
     /// Given the newly-tokenized prompt and its breakpoint indices,
     /// computes `L_hit` (tokens reusable from the previous call's KV
     /// state), narrows the KV cache to `[0, L_hit)` via
-    /// [`Engine::memory_seq_rm`] (or clears it entirely on miss), and
+    /// [`LlamaCppEngine::memory_seq_rm`] (or clears it entirely on miss), and
     /// returns the suffix of `new_tokens` the predictor must decode
     /// plus the reuse length. The caller still owns whether / when to
     /// update `self.prefix_cache` — batch callers do it *after*
@@ -1077,7 +1077,7 @@ impl Session {
     ///
     /// Invalidates any prefix-cache state (calls
     /// [`Self::clear_prefix_cache`] internally) because the underlying
-    /// [`Engine::predict_candidates`] path unconditionally clears the
+    /// [`LlamaCppEngine::predict_candidates`] path unconditionally clears the
     /// KV cache. Without this invalidation, a subsequent cached call
     /// would read stale `prev_tokens` metadata against a wiped KV.
     ///
@@ -1146,9 +1146,7 @@ impl Session {
             }
 
             grammar_mod::advance_all(&modes, chosen, &predictor.engine.model);
-            if predictor.record_choice(chosen).is_err() {
-                break;
-            }
+            predictor.record_choice(chosen);
         }
 
         Ok(trace)
@@ -1389,7 +1387,11 @@ fn infer_stop_reason(
 /// stream end — those are artifacts of token-to-string conversion, not model
 /// output.
 pub struct BlockStream<'engine> {
-    predictor: crate::PiecePredictor<'engine>,
+    predictor: crate::PiecePredictor<
+        'engine,
+        crate::LlamaCppDecoder,
+        crate::LlamaCppModel,
+    >,
     parser: BlockParser,
     pending: std::collections::VecDeque<crate::Block>,
     /// EOS piece text — we filter it out of the stream since it's a
@@ -1435,7 +1437,7 @@ impl<'engine> Iterator for BlockStream<'engine> {
 /// Strip trailing EOS piece and the `[Invalid UTF-8]` marker predictors emit
 /// for byte-fallback tokens at stream end. Matches what
 /// `examples/strawberry.rs` does by hand today.
-fn trim_eos<'a>(text: &'a str, engine: &Engine) -> &'a str {
+fn trim_eos<'a>(text: &'a str, engine: &LlamaCppEngine) -> &'a str {
     let eos_piece = engine.model.token_to_piece(engine.model.eos());
     text.trim_end_matches(eos_piece.as_str())
         .trim_end_matches("[Invalid UTF-8]")

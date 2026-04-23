@@ -1,11 +1,12 @@
 use std::num::{NonZeroU128, NonZeroUsize};
 
-use llama_cpp_sys_3::llama_token;
 use xorshift::{SeedableRng, Xoroshiro128};
 
 use crate::{
-    batch::AddError, ngram::NGramStats, sample::SampleOptions, Batch,
-    Candidates, Engine, LlamaCppModel, NGram,
+    backend::{Decoder, Model},
+    ngram::NGramStats,
+    sample::SampleOptions,
+    Candidates, Engine, LlamaCppModel, NGram, Token,
 };
 
 #[cfg(feature = "serde")]
@@ -52,7 +53,7 @@ pub struct PredictOptions {
     pub seed: Option<NonZeroU128>,
     /// Stop sequences by token. When any of these are reached, the prediction
     /// will stop.
-    pub stop_sequences: Vec<Vec<llama_token>>,
+    pub stop_sequences: Vec<Vec<Token>>,
     /// Stop sequences by string. When any of these are reached, the prediction
     /// will stop.
     pub stop_strings: Vec<String>,
@@ -124,7 +125,7 @@ impl PredictOptions {
     /// Add a stop sequence of tokens. If the [`Predictor`] reaches any of these
     /// sequences, it will stop predicting. The stop sequence will be included
     /// in the tokens.
-    pub fn add_stop_sequence(mut self, sequence: Vec<llama_token>) -> Self {
+    pub fn add_stop_sequence(mut self, sequence: Vec<Token>) -> Self {
         self.stop_sequences.push(sequence);
 
         self
@@ -255,183 +256,158 @@ impl PredictOptions {
         resp
     }
 }
-/// An iterator that predicts a sequence of tokens until the end of the sequence
-/// is reached.
-pub struct CandidatePredictor<'engine> {
+
+/// An iterator that predicts a sequence of candidate distributions.
+///
+/// Generic over the decoder `D` and model `M`. Construction (`new` or
+/// `new_resuming`) runs the initial prefill via [`Decoder::prefill`];
+/// subsequent steps use [`Decoder::step`] after each
+/// [`CandidatePredictor::record_choice`].
+pub struct CandidatePredictor<'engine, D: Decoder, M: Model> {
     /// The inference engine.
-    pub engine: &'engine mut Engine,
-    /// The tokens to predict.
-    pub tokens: Vec<llama_token>,
-    /// The batch of tokens.
-    pub batch: Batch,
-    /// The current index in the batch.
+    pub engine: &'engine mut Engine<D, M>,
+    /// The tokens seen so far (prompt + any recorded choices).
+    pub tokens: Vec<Token>,
+    /// First-step candidates captured from the initial prefill —
+    /// yielded on the first `next()` call, then taken.
+    first_candidates: Option<Candidates>,
+    /// Token that [`Self::record_choice`] stashed and `next()` will
+    /// decode via [`Decoder::step`]. `None` means "no choice recorded
+    /// since last yield" — in that state, iteration stops.
+    pending_advance: Option<Token>,
+    /// Next position to decode at. After prefill, equals
+    /// `start_pos + prompt.len()`; each successful step bumps it by 1.
     pub n_cur: usize,
     /// The number of tokens that have been decoded.
     pub n_decode: usize,
-    /// The number of tokens to generate
+    /// The number of tokens to generate.
     pub n: NonZeroUsize,
-    /// When `Some`, logits for the first yielded candidates have already
-    /// been computed by an out-of-band prefill (see
-    /// [`Engine::prefill`] / [`CandidatePredictor::new_resuming`]). The
-    /// stored index is passed to [`Engine::logits`] on the first
-    /// `next()` call, and no decode is performed for that step.
-    first_logits_idx: Option<usize>,
 }
 
-impl<'engine> CandidatePredictor<'engine> {
+impl<'engine, D: Decoder, M: Model> CandidatePredictor<'engine, D, M> {
     /// Create a new `CandidatePredictor` that predicts `n` [`Candidates`]
-    /// containers.
-    ///
-    /// # Panics
-    /// * If the model's n_vocab is not between 1 and i32::MAX.
+    /// containers. Clears the KV cache and prefills `tokens` starting
+    /// at position 0 on sequence 0.
     pub fn new(
-        engine: &'engine mut Engine,
-        tokens: Vec<llama_token>,
+        engine: &'engine mut Engine<D, M>,
+        tokens: Vec<Token>,
         n: NonZeroUsize,
     ) -> Self {
-        // FIXME: We don't need a batch this large. We can do the first decode
-        // here and then use the batch size of 1 from then on. This is
-        // especially true now that the c++ api has async decoding and the
-        // decode is not blocking. It's also possible the engine could allow
-        // multiple predictions at once and batch them together, but that would
-        // require a lot of work.
-        // NOTE: There is work going on right now in llama.cpp to rework the
-        // batch system to be more efficient. This will likely change in the
-        // future.
-        let batch_capacity =
-            (n.get() + tokens.len()).min(engine.n_ctx() as usize);
-        let batch = Batch::from_tokens(batch_capacity, &tokens).unwrap();
-        let n_cur = batch.batch.n_tokens as usize;
-
-        // TODO: async decode was just added to the c++ api. We should start the
-        // decode here and lazily get the logits as we need them.
+        engine.decoder.memory_clear();
+        let first_candidates = {
+            let logits = engine
+                .decoder
+                .prefill(&tokens, 0, 0)
+                .expect("prefill failed in CandidatePredictor::new");
+            Candidates::from_logits(logits.iter().cloned())
+        };
+        let n_cur = tokens.len();
         Self {
             tokens,
             engine,
-            batch,
+            first_candidates: Some(first_candidates),
+            pending_advance: None,
             n_cur,
             n_decode: 0,
             n,
-            first_logits_idx: None,
         }
     }
 
     /// Create a `CandidatePredictor` that resumes generation from a KV
-    /// cache already populated by [`Engine::prefill`].
+    /// cache the caller has already populated for positions
+    /// `[0, start_pos)` on `seq_id`.
     ///
-    /// Unlike [`Self::new`], this does **not** build a prompt batch or
-    /// decode the tokens — the caller is expected to have just called
-    /// `engine.prefill(suffix, start_pos, seq_id)` where
-    /// `suffix.len() == suffix_len` and
-    /// `start_pos + suffix_len == tokens.len()`. The first `next()`
-    /// yields candidates read directly from the prefill's logits (index
-    /// `suffix_len - 1`); subsequent steps follow the usual decode-loop.
-    ///
-    /// `tokens` should be the full token sequence (prefix + suffix) so
-    /// stop-sequence, repetition, and n-gram bookkeeping upstream see
-    /// the same context the model saw.
+    /// `tokens` is the suffix: positions `[start_pos, start_pos +
+    /// tokens.len())` are prefilled here. The first `next()` yields
+    /// candidates from those prefill logits; subsequent steps follow
+    /// the usual decode loop.
     ///
     /// # Panics
-    /// * If `suffix_len` is zero.
-    /// * If `n_cur_after_prefill > engine.n_ctx()`.
+    /// * If `tokens` is empty — there's nothing to resume from.
     pub fn new_resuming(
-        engine: &'engine mut Engine,
-        tokens: Vec<llama_token>,
-        n_cur_after_prefill: usize,
-        suffix_len: usize,
+        engine: &'engine mut Engine<D, M>,
+        tokens: Vec<Token>,
+        start_pos: usize,
+        seq_id: i32,
         n: NonZeroUsize,
     ) -> Self {
         assert!(
-            suffix_len > 0,
-            "new_resuming requires a non-empty prefill suffix",
+            !tokens.is_empty(),
+            "CandidatePredictor::new_resuming requires non-empty tokens",
         );
-
-        // Batch here holds only tokens sampled after generation starts
-        // — `record_choice` appends one per step, at most `n` steps.
-        let batch = Batch::new(n.get(), 0, 1)
-            .expect("resuming batch allocation failed");
-
+        let first_candidates = {
+            let logits = engine
+                .decoder
+                .prefill(&tokens, start_pos, seq_id)
+                .expect("prefill failed in CandidatePredictor::new_resuming");
+            Candidates::from_logits(logits.iter().cloned())
+        };
+        let n_cur = start_pos + tokens.len();
         Self {
             tokens,
             engine,
-            batch,
-            n_cur: n_cur_after_prefill,
+            first_candidates: Some(first_candidates),
+            pending_advance: None,
+            n_cur,
             n_decode: 0,
             n,
-            first_logits_idx: Some(suffix_len - 1),
         }
     }
 
-    /// Record the choice of a token. This adds the token to the batch and
-    /// tokens. If it's not possible (because the batch is too small. etc.) an
-    /// error is returned.
-    pub fn record_choice(
-        &mut self,
-        token: llama_token,
-    ) -> Result<(), AddError> {
-        self.batch.add_token(token, self.n_cur, None, true)?;
+    /// Record the choice of a token. The token is pushed to `tokens`
+    /// and stashed as the next step's input; the actual decode runs
+    /// lazily on the next `next()` call. If `record_choice` is not
+    /// called between two `next()` calls, iteration ends (no pending
+    /// advance means nothing to decode).
+    pub fn record_choice(&mut self, token: Token) {
         self.tokens.push(token);
-        self.n_cur += 1;
-
-        Ok(())
+        self.pending_advance = Some(token);
     }
 }
 
-impl<'engine> Iterator for CandidatePredictor<'engine> {
+impl<'engine, D: Decoder, M: Model> Iterator
+    for CandidatePredictor<'engine, D, M>
+{
     type Item = Candidates;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.n_decode == self.n.get()
-            || self.n_cur >= self.engine.n_ctx() as usize
+            || self.n_cur >= self.engine.decoder.n_ctx() as usize
         {
             return None;
         }
 
-        // Resuming path: logits for the first step were computed by an
-        // earlier `Engine::prefill` call. Read them directly instead of
-        // decoding the (empty) batch.
-        if let Some(idx) = self.first_logits_idx.take() {
-            let logits = self.engine.logits(idx);
-            let candidates = Candidates::from_logits(logits.iter().cloned());
+        // First yield: logits from the constructor's prefill.
+        if let Some(candidates) = self.first_candidates.take() {
             self.n_decode += 1;
             return Some(candidates);
         }
 
-        let batch = &mut self.batch;
-
-        // If the batch is empty, we will stop prediction because if we call
-        // decode with an empty batch, it will return an error.
-        if batch.is_empty() {
-            return None;
-        }
-
-        // Decode the next token
-        self.engine.decode(batch).unwrap();
-
-        // Get the logits for the next token
-        let logits = self.engine.logits(batch.len() - 1);
-
-        // Create or fill existing candidates from the logits
+        // Subsequent yields: decode the token recorded via
+        // `record_choice`. No recorded token → nothing to advance,
+        // iteration stops.
+        let token = self.pending_advance.take()?;
+        let logits = self
+            .engine
+            .decoder
+            .step(token, self.n_cur, 0)
+            .expect("decoder.step failed");
         let candidates = Candidates::from_logits(logits.iter().cloned());
-
-        batch.clear();
-
-        // n_cur is incremented here so that record_choice (called by the
-        // consumer between next() calls) places the token at the correct
-        // consecutive position in the sequence.
+        self.n_cur += 1;
         self.n_decode += 1;
-
         Some(candidates)
     }
 }
 
-impl<'engine> Into<Vec<llama_token>> for CandidatePredictor<'engine> {
-    fn into(self) -> Vec<llama_token> {
-        self.tokens
+impl<'engine, D: Decoder, M: Model> From<CandidatePredictor<'engine, D, M>>
+    for Vec<Token>
+{
+    fn from(predictor: CandidatePredictor<'engine, D, M>) -> Self {
+        predictor.tokens
     }
 }
 
-pub struct TokenPredictor<'engine> {
+pub struct TokenPredictor<'engine, D: Decoder, M: Model> {
     rng: Xoroshiro128,
     ngram_stats: NGramStats,
     options: PredictOptions,
@@ -439,13 +415,13 @@ pub struct TokenPredictor<'engine> {
     pub(crate) max_stop_len: usize,
     /// Mu value for Mirostat sampling
     mu: Option<f32>,
-    pub(crate) inner: CandidatePredictor<'engine>,
+    pub(crate) inner: CandidatePredictor<'engine, D, M>,
 }
 
-impl<'engine> TokenPredictor<'engine> {
+impl<'engine, D: Decoder, M: Model> TokenPredictor<'engine, D, M> {
     pub fn new(
-        engine: &'engine mut Engine,
-        tokens: Vec<llama_token>,
+        engine: &'engine mut Engine<D, M>,
+        tokens: Vec<Token>,
         options: PredictOptions,
     ) -> Self {
         let (rng, ngram_stats, options, max_stop_len) =
@@ -462,28 +438,19 @@ impl<'engine> TokenPredictor<'engine> {
         }
     }
 
-    /// Create a `TokenPredictor` that resumes generation from a KV cache
-    /// already populated by [`Engine::prefill`].
-    ///
-    /// See [`CandidatePredictor::new_resuming`] for KV-state semantics.
-    /// `tokens` is the full sequence (prefix + suffix); `suffix_len` is
-    /// the number of tokens just prefilled; `n_cur_after_prefill` is
-    /// `start_pos + suffix_len`.
+    /// Create a `TokenPredictor` that resumes generation from a
+    /// pre-populated KV cache.
     pub fn new_resuming(
-        engine: &'engine mut Engine,
-        tokens: Vec<llama_token>,
-        n_cur_after_prefill: usize,
-        suffix_len: usize,
+        engine: &'engine mut Engine<D, M>,
+        tokens: Vec<Token>,
+        start_pos: usize,
+        seq_id: i32,
         options: PredictOptions,
     ) -> Self {
         let (rng, ngram_stats, options, max_stop_len) =
             Self::prepare(engine, &tokens, options);
         let inner = CandidatePredictor::new_resuming(
-            engine,
-            tokens,
-            n_cur_after_prefill,
-            suffix_len,
-            options.n,
+            engine, tokens, start_pos, seq_id, options.n,
         );
         Self {
             rng,
@@ -500,8 +467,8 @@ impl<'engine> TokenPredictor<'engine> {
     /// normalization, RNG construction, n-gram stats seeding, and the
     /// max stop-sequence length.
     fn prepare(
-        engine: &Engine,
-        tokens: &[llama_token],
+        engine: &Engine<D, M>,
+        tokens: &[Token],
         mut options: PredictOptions,
     ) -> (Xoroshiro128, NGramStats, PredictOptions, usize) {
         // convert seed from a u128 to [u64; 2] to seed the rng
@@ -568,14 +535,23 @@ impl<'engine> TokenPredictor<'engine> {
     }
 }
 
-impl Into<Vec<llama_token>> for TokenPredictor<'_> {
-    fn into(self) -> Vec<llama_token> {
-        self.inner.into()
+impl<'engine, D: Decoder, M: Model> From<TokenPredictor<'engine, D, M>>
+    for Vec<Token>
+{
+    fn from(predictor: TokenPredictor<'engine, D, M>) -> Self {
+        predictor.inner.into()
     }
 }
 
-impl<'engine> Iterator for TokenPredictor<'engine> {
-    type Item = llama_token;
+// The sampling loop currently hardcodes `&LlamaCppModel` — sample_token,
+// token_to_piece, max_token_len are methods on the concrete type. A
+// future commit will route these through the `Model` trait so
+// TokenPredictor is fully backend-agnostic. For now, restrict the impl
+// to M = LlamaCppModel so existing sampling code keeps working.
+impl<'engine, D: Decoder> Iterator
+    for TokenPredictor<'engine, D, LlamaCppModel>
+{
+    type Item = Token;
 
     fn next(&mut self) -> Option<Self::Item> {
         let decoded_tokens =
@@ -663,7 +639,7 @@ impl<'engine> Iterator for TokenPredictor<'engine> {
             self.options.sample_options.modes.push(promoted.grammar);
         }
 
-        self.inner.record_choice(next_token).ok()?;
+        self.inner.record_choice(next_token);
 
         Some(next_token)
     }
@@ -694,49 +670,37 @@ fn find_deferred_trigger_end(
 ///
 /// If the predictor stops predicting because of a stop sequence, the text will
 /// be truncated at the stop sequence.
-pub struct PiecePredictor<'engine> {
-    inner: TokenPredictor<'engine>,
+pub struct PiecePredictor<'engine, D: Decoder, M: Model> {
+    inner: TokenPredictor<'engine, D, M>,
 }
 
-impl<'engine> PiecePredictor<'engine> {
+impl<'engine, D: Decoder, M: Model> PiecePredictor<'engine, D, M> {
     pub fn new(
-        engine: &'engine mut Engine,
-        tokens: Vec<llama_token>,
+        engine: &'engine mut Engine<D, M>,
+        tokens: Vec<Token>,
         options: PredictOptions,
     ) -> Self {
         let token_predictor = TokenPredictor::new(engine, tokens, options);
-
-        Self {
-            inner: token_predictor,
-        }
+        Self { inner: token_predictor }
     }
 
-    /// Create a `PiecePredictor` that resumes generation from a KV
-    /// cache already populated by [`Engine::prefill`].
-    ///
-    /// See [`CandidatePredictor::new_resuming`] for KV-state semantics.
+    /// Create a `PiecePredictor` that resumes generation from a
+    /// pre-populated KV cache.
     pub fn new_resuming(
-        engine: &'engine mut Engine,
-        tokens: Vec<llama_token>,
-        n_cur_after_prefill: usize,
-        suffix_len: usize,
+        engine: &'engine mut Engine<D, M>,
+        tokens: Vec<Token>,
+        start_pos: usize,
+        seq_id: i32,
         options: PredictOptions,
     ) -> Self {
         let token_predictor = TokenPredictor::new_resuming(
-            engine,
-            tokens,
-            n_cur_after_prefill,
-            suffix_len,
-            options,
+            engine, tokens, start_pos, seq_id, options,
         );
-
-        Self {
-            inner: token_predictor,
-        }
+        Self { inner: token_predictor }
     }
 
     /// Convert into the tokens and text that have been predicted so far.
-    pub fn into_tokens_and_text(self) -> (Vec<llama_token>, String) {
+    pub fn into_tokens_and_text(self) -> (Vec<Token>, String) {
         let token_predictor = self.inner;
         (token_predictor.inner.tokens, token_predictor.text)
     }
@@ -746,6 +710,13 @@ impl<'engine> PiecePredictor<'engine> {
         self.inner.text
     }
 
+    /// Get the last token that was predicted.
+    pub fn last_token(&self) -> Option<Token> {
+        self.inner.inner.tokens.last().copied()
+    }
+}
+
+impl<'engine, D: Decoder> PiecePredictor<'engine, D, LlamaCppModel> {
     /// Predict and collect all the pieces, truncating at stop sequences.
     pub fn collect_text(mut self) -> String {
         while let Some(_) = self.next() {}
@@ -753,7 +724,7 @@ impl<'engine> PiecePredictor<'engine> {
     }
 
     /// Predict and collect the tokens and text, truncating at stop sequences.
-    pub fn collect_tokens_and_text(mut self) -> (Vec<llama_token>, String) {
+    pub fn collect_tokens_and_text(mut self) -> (Vec<Token>, String) {
         while let Some(_) = self.next() {}
         self.into_tokens_and_text()
     }
@@ -762,7 +733,7 @@ impl<'engine> PiecePredictor<'engine> {
     /// sequences.
     pub fn collect_pieces_tokens_text(
         mut self,
-    ) -> (Vec<String>, Vec<llama_token>, String) {
+    ) -> (Vec<String>, Vec<Token>, String) {
         let mut pieces = Vec::new();
         // We can't collect because it consumes the predictor.
         while let Some(piece) = self.next() {
@@ -771,14 +742,11 @@ impl<'engine> PiecePredictor<'engine> {
         let (tokens, text) = self.into_tokens_and_text();
         (pieces, tokens, text)
     }
-
-    /// Get the last token that was predicted.
-    pub fn last_token(&self) -> Option<llama_token> {
-        self.inner.inner.tokens.last().copied()
-    }
 }
 
-impl<'engine> Iterator for PiecePredictor<'engine> {
+impl<'engine, D: Decoder> Iterator
+    for PiecePredictor<'engine, D, LlamaCppModel>
+{
     type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -822,14 +790,19 @@ impl<'engine> Iterator for PiecePredictor<'engine> {
     }
 }
 
-impl<'engine> Into<String> for PiecePredictor<'engine> {
-    fn into(self) -> String {
-        self.into_text()
+impl<'engine, D: Decoder, M: Model> From<PiecePredictor<'engine, D, M>>
+    for String
+{
+    fn from(predictor: PiecePredictor<'engine, D, M>) -> Self {
+        predictor.into_text()
     }
 }
-impl<'engine> Into<Vec<llama_token>> for PiecePredictor<'engine> {
-    fn into(self) -> Vec<llama_token> {
-        self.inner.inner.tokens
+
+impl<'engine, D: Decoder, M: Model> From<PiecePredictor<'engine, D, M>>
+    for Vec<Token>
+{
+    fn from(predictor: PiecePredictor<'engine, D, M>) -> Self {
+        predictor.inner.inner.tokens
     }
 }
 
@@ -838,34 +811,31 @@ impl<'engine> Into<Vec<llama_token>> for PiecePredictor<'engine> {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Predicted {
-    pub token: llama_token,
+    pub token: Token,
     pub piece: String,
 }
 
-pub struct Predictor<'engine> {
-    inner: PiecePredictor<'engine>,
+pub struct Predictor<'engine, D: Decoder, M: Model> {
+    inner: PiecePredictor<'engine, D, M>,
 }
 
-impl<'engine> Predictor<'engine> {
+impl<'engine, D: Decoder, M: Model> Predictor<'engine, D, M> {
     pub fn new(
-        engine: &'engine mut Engine,
-        tokens: Vec<llama_token>,
+        engine: &'engine mut Engine<D, M>,
+        tokens: Vec<Token>,
         options: PredictOptions,
     ) -> Self {
         let piece_predictor = PiecePredictor::new(engine, tokens, options);
-
-        Self {
-            inner: piece_predictor,
-        }
+        Self { inner: piece_predictor }
     }
 
     /// Convert into the tokens and text that have been predicted so far.
-    pub fn into_tokens_and_text(self) -> (Vec<llama_token>, String) {
+    pub fn into_tokens_and_text(self) -> (Vec<Token>, String) {
         self.inner.into_tokens_and_text()
     }
 }
 
-impl Iterator for Predictor<'_> {
+impl<'engine, D: Decoder> Iterator for Predictor<'engine, D, LlamaCppModel> {
     type Item = Predicted;
 
     fn next(&mut self) -> Option<Predicted> {
@@ -877,9 +847,7 @@ impl Iterator for Predictor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use llama_cpp_sys_3::llama_token;
-
-    use crate::{Engine, PredictOptions, RepetitionOptions, SampleOptions};
+    use crate::{LlamaCppEngine, PredictOptions, RepetitionOptions, SampleOptions, Token};
     use std::{num::NonZeroUsize, path::PathBuf};
 
     const PROMPT: &str = "The quick brown fox jumps over the lazy dog.";
@@ -898,7 +866,7 @@ mod tests {
     #[ignore = "long running"]
     /// Test prediction with greedy sampling and a well-known sequence.
     fn test_token_predictor() {
-        let mut engine = Engine::from_path(
+        let mut engine = LlamaCppEngine::from_path(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf"),
         )
         .unwrap();
@@ -910,18 +878,17 @@ mod tests {
         let mut opts = PredictOptions::greedy().add_stop(".".to_owned());
         opts.n = NonZeroUsize::new(2 + expected.len()).unwrap();
 
-        let actual: Vec<llama_token> =
+        let actual: Vec<Token> =
             engine.predict_tokens(prefix, opts).collect();
 
         assert_eq!(actual, expected);
     }
 
     #[test]
-    // #[ignore = "long running"]
     /// Test candidate prediction with greedy sampling and a well-known sequence.
     #[ignore = "long running"]
     fn test_candidate_predictor() {
-        let mut engine = Engine::from_path(
+        let mut engine = LlamaCppEngine::from_path(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf"),
         )
         .unwrap();
@@ -942,9 +909,7 @@ mod tests {
             let token = candidates.sample_token_greedy().is_one().unwrap();
 
             // This must be called or iteration will end.
-            if predictor.record_choice(token.id).is_err() {
-                break;
-            }
+            predictor.record_choice(token.id);
 
             // This is for the test only. In a real application, you would
             // probably want to use the PredictOptions to stop the prediction.
@@ -957,11 +922,10 @@ mod tests {
     }
 
     #[test]
-    // #[ignore = "long running"]
     /// Test candidate prediction with greedy sampling and a well-known sequence.
     #[ignore = "long running"]
     fn test_piece_predictor() {
-        let mut engine = Engine::from_path(
+        let mut engine = LlamaCppEngine::from_path(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf"),
         )
         .unwrap();

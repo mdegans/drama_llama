@@ -1,6 +1,7 @@
 use crate::{
+    backend::{Decoder, Model},
     predictor::{CandidatePredictor, PiecePredictor, TokenPredictor},
-    Batch, LlamaCppModel, PredictOptions, Predictor,
+    Batch, LlamaCppModel, PredictOptions, Predictor, Token,
 };
 
 use std::{num::NonZeroUsize, path::PathBuf, sync::Mutex};
@@ -64,7 +65,7 @@ unsafe extern "C" fn discard_log(
 ) {
 }
 
-/// Possible errors when creating a new [`Engine`].
+/// Possible errors when creating a new [`Engine`] or [`LlamaCppDecoder`].
 #[derive(Error, Debug)]
 pub enum NewError {
     #[error("Could not load model from file: {path}")]
@@ -86,22 +87,19 @@ pub enum DecodeError {
 
 static_assertions::assert_impl_all!(DecodeError: Send, Sync);
 
-/// Flash Attention policy for a new [`Engine`] context.
+/// Flash Attention policy for a new [`LlamaCppEngine`] context.
 ///
 /// llama.cpp's default is [`Self::Auto`] — it enables Flash Attention
 /// when the active backend supports it (typical on Metal, CUDA, Vulkan).
 /// [`Self::Disabled`] is useful as a diagnostic: FA uses a fused softmax
 /// kernel that can produce slightly different logits than the non-FA
 /// attention path on close-race token distributions, and toggling it off
-/// rules that out as a source of divergence against other runners
-/// (notably ollama's Go-native `--ollama-engine`, which does not use
-/// llama.cpp's FA kernel at all).
+/// rules that out as a source of divergence against other runners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashAttention {
     /// Let llama.cpp decide based on backend capabilities (default).
     Auto,
-    /// Force-disable Flash Attention. Slower but numerically closer to
-    /// the un-fused softmax path in other runners.
+    /// Force-disable Flash Attention.
     Disabled,
     /// Force-enable. Errors at context creation if the backend doesn't
     /// support it.
@@ -126,16 +124,12 @@ impl FlashAttention {
 /// llama.cpp-backed decoder: owns a `llama_context`, manages the KV
 /// cache, runs decode passes, and exposes logits / embeddings.
 ///
-/// This is the concrete implementor of [`crate::backend::Decoder`] for
-/// the llama.cpp backend. Construction is driven by [`Engine::new`]
-/// (which loads the [`LlamaCppModel`] first, then hands it here). The
-/// backend-lifecycle global (`ENGINE_COUNT`) is maintained here so
-/// creating/destroying decoders naturally drives `llama_backend_init`
-/// / `llama_backend_free`.
-///
-/// `n_vocab` and `embedding_size` are cached at construction so the
-/// decoder can return correctly-sized logit / embedding slices without
-/// holding a reference to the [`LlamaCppModel`] that produced it.
+/// Implements [`crate::backend::Decoder`]. `LlamaCppDecoder::new`
+/// handles backend lifecycle (`llama_backend_init` + `llama_numa_init`
+/// on the first-ever decoder; `llama_backend_free` on the last
+/// dropped). `n_vocab` and `embedding_size` are cached at construction
+/// so the decoder can produce correctly-sized slices without holding a
+/// reference to the [`LlamaCppModel`] that produced it.
 #[derive(Debug)]
 pub struct LlamaCppDecoder {
     pub(crate) context: *mut llama_context,
@@ -149,19 +143,51 @@ pub struct LlamaCppDecoder {
 unsafe impl Send for LlamaCppDecoder {}
 
 impl LlamaCppDecoder {
-    /// Create a decoder bound to `model` with the given context
-    /// params. Backend lifecycle (`llama_backend_init` /
-    /// `llama_backend_free`) is managed by [`Engine`] rather than
-    /// here — a standalone decoder created without an Engine must
-    /// handle that itself.
+    /// Create a decoder bound to `model` with the given context params.
+    ///
+    /// Handles the llama.cpp backend lifecycle: on the first-ever
+    /// decoder (`ENGINE_COUNT` transitions 0→1) runs
+    /// `llama_backend_init` + `llama_numa_init`. Subsequent decoders
+    /// just increment the count.
+    ///
+    /// If context creation fails, the count is rolled back (and the
+    /// backend torn down if we were the first). The caller can
+    /// retry without double-init.
     pub fn new(
         model: &mut LlamaCppModel,
         context_params: llama_context_params,
+        numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
+        {
+            let mut count = ENGINE_COUNT.lock().unwrap();
+            *count += 1;
+            if *count == 1 {
+                unsafe {
+                    llama_backend_init();
+                    llama_numa_init(
+                        numa_strategy
+                            .unwrap_or(
+                                ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED
+                                    .try_into()
+                                    .unwrap(),
+                            )
+                            .try_into()
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+
         let context = unsafe {
             llama_new_context_with_model(model.as_ptr_mut(), context_params)
         };
         if context.is_null() {
+            // Roll back the count we just reserved.
+            let mut count = ENGINE_COUNT.lock().unwrap();
+            *count -= 1;
+            if *count == 0 {
+                unsafe { llama_backend_free() };
+            }
             return Err(NewError::Context);
         }
 
@@ -256,8 +282,7 @@ impl LlamaCppDecoder {
         }
     }
 
-    /// Set the number of threads used for generation and batch
-    /// processing.
+    /// Set the number of threads used for generation and batch processing.
     pub fn set_n_threads(&mut self, n_gen: i32, n_batch: i32) {
         unsafe { llama_set_n_threads(self.context, n_gen, n_batch) }
     }
@@ -343,9 +368,9 @@ impl LlamaCppDecoder {
     /// Resumable prefill primitive: does **not** clear the KV cache.
     /// Caller owns KV placement. Only the final token has logits
     /// enabled. Empty `tokens` is a no-op.
-    pub fn prefill(
+    pub fn prefill_inherent(
         &self,
-        tokens: &[llama_token],
+        tokens: &[Token],
         start_pos: usize,
         seq_id: llama_seq_id,
     ) -> Result<(), DecodeError> {
@@ -394,23 +419,30 @@ impl LlamaCppDecoder {
     }
 }
 
-// No Drop impl for LlamaCppDecoder: [`Engine`] handles `llama_free`
-// and the backend-lifecycle countdown so the free order (context
-// first, then backend, then model) stays correct.
+impl Drop for LlamaCppDecoder {
+    fn drop(&mut self) {
+        unsafe { llama_free(self.context) };
+        let mut count = ENGINE_COUNT.lock().unwrap();
+        *count -= 1;
+        if *count == 0 {
+            unsafe { llama_backend_free() };
+        }
+    }
+}
 
-// llama.cpp-backed `Decoder` trait impl. `step` allocates a 1-slot
-// `Batch` each call; `prefill` reuses the inherent method and reads
-// logits for the last prefilled token.
-impl crate::backend::Decoder for LlamaCppDecoder {
+// llama.cpp-backed [`Decoder`] trait impl. `step` allocates a 1-slot
+// `Batch` each call; `prefill` wraps the inherent `prefill_inherent`
+// and reads `logits(tokens.len() - 1)`.
+impl Decoder for LlamaCppDecoder {
     type Error = DecodeError;
 
     fn prefill(
         &mut self,
-        tokens: &[crate::Token],
+        tokens: &[Token],
         start_pos: usize,
         seq_id: i32,
     ) -> Result<&[f32], Self::Error> {
-        LlamaCppDecoder::prefill(self, tokens, start_pos, seq_id)?;
+        LlamaCppDecoder::prefill_inherent(self, tokens, start_pos, seq_id)?;
         if tokens.is_empty() {
             Ok(&[])
         } else {
@@ -420,7 +452,7 @@ impl crate::backend::Decoder for LlamaCppDecoder {
 
     fn step(
         &mut self,
-        token: crate::Token,
+        token: Token,
         pos: usize,
         seq_id: i32,
     ) -> Result<&[f32], Self::Error> {
@@ -465,23 +497,149 @@ impl crate::backend::Decoder for LlamaCppDecoder {
 }
 
 /// An `Engine` encompasses everything needed to run inferences. It
-/// bundles a [`LlamaCppDecoder`] (context + KV cache) with a
-/// [`LlamaCppModel`] (weights + tokenizer). It is the main entry point
-/// for running inferences.
+/// bundles a [`Decoder`] (context + KV cache) with a [`Model`]
+/// (weights + tokenizer). Generic over both; use the
+/// [`LlamaCppEngine`] type alias for the common llama.cpp-backed pair.
 ///
-/// The `decoder` field is declared before `model` so that on drop the
-/// context is freed before the model — llama.cpp requires this order.
+/// Field declaration order (`decoder` before `model`) matters for
+/// Drop: Rust drops fields in declaration order, so the decoder's
+/// context is freed — and the backend teared down if it was the last
+/// decoder — before the model is freed. This matches llama.cpp's
+/// expected ordering.
 #[derive(Debug)]
-pub struct Engine {
-    pub(crate) decoder: LlamaCppDecoder,
-    /// The llama.cpp model. Public so callers (e.g. Session) can
-    /// tokenize, look up special tokens, and render chat templates
-    /// without going through `Engine` forwarding methods.
-    pub model: LlamaCppModel,
+pub struct Engine<D: Decoder, M: Model> {
+    pub(crate) decoder: D,
+    /// The model. Public so callers (e.g. Session) can tokenize, look
+    /// up special tokens, and render chat templates without going
+    /// through Engine forwarding methods.
+    pub model: M,
 }
 
-impl Engine {
-    /// Create a new `Engine` from common command line arguments.
+unsafe impl<D: Decoder + Send, M: Model + Send> Send for Engine<D, M> {}
+
+impl<D: Decoder, M: Model> Engine<D, M> {
+    /// Context length (tokens).
+    pub fn n_ctx(&self) -> u32 {
+        self.decoder.n_ctx()
+    }
+
+    /// Clear the KV cache.
+    pub fn memory_clear(&mut self) {
+        self.decoder.memory_clear()
+    }
+
+    /// Remove KV entries for `seq_id` in position range `[p0, p1)`.
+    pub fn memory_seq_rm(
+        &mut self,
+        seq_id: i32,
+        p0: i32,
+        p1: i32,
+    ) -> bool {
+        self.decoder.memory_seq_rm(seq_id, p0, p1)
+    }
+
+    /// Copy KV entries between sequences in `[p0, p1)`.
+    pub fn memory_seq_cp(&mut self, src: i32, dst: i32, p0: i32, p1: i32) {
+        self.decoder.memory_seq_cp(src, dst, p0, p1)
+    }
+
+    /// Keep only `seq_id`'s entries, drop all others.
+    pub fn memory_seq_keep(&mut self, seq_id: i32) {
+        self.decoder.memory_seq_keep(seq_id)
+    }
+
+    /// Largest position present in KV for `seq_id`.
+    pub fn memory_seq_pos_max(&mut self, seq_id: i32) -> i32 {
+        self.decoder.memory_seq_pos_max(seq_id)
+    }
+
+    /// Iterator that yields [`crate::Candidates`] until `n` tokens
+    /// have been produced or the end of context is reached. KV cache
+    /// is cleared before starting.
+    pub fn predict_candidates<'a>(
+        &'a mut self,
+        tokens: Vec<Token>,
+        n: NonZeroUsize,
+    ) -> CandidatePredictor<'a, D, M> {
+        CandidatePredictor::new(self, tokens, n)
+    }
+
+    /// Iterator that predicts a sequence of tokens.
+    pub fn predict_tokens<'a>(
+        &'a mut self,
+        tokens: Vec<Token>,
+        options: PredictOptions,
+    ) -> TokenPredictor<'a, D, M> {
+        TokenPredictor::new(self, tokens, options)
+    }
+
+    /// Iterator that predicts a sequence of pieces (strings).
+    pub fn predict_pieces<'a>(
+        &'a mut self,
+        tokens: Vec<Token>,
+        options: PredictOptions,
+    ) -> PiecePredictor<'a, D, M> {
+        PiecePredictor::new(self, tokens, options)
+    }
+
+    /// Iterator that predicts both tokens and pieces.
+    pub fn predict<'a>(
+        &'a mut self,
+        tokens: Vec<Token>,
+        options: PredictOptions,
+    ) -> Predictor<'a, D, M> {
+        Predictor::new(self, tokens, options)
+    }
+
+    /// Resume candidate prediction from a KV cache the caller has
+    /// already populated for positions `[0, start_pos)` on `seq_id`.
+    /// The Predictor internally prefills `tokens` at those positions
+    /// and begins sampling from the last prefilled position.
+    pub fn predict_candidates_resuming<'a>(
+        &'a mut self,
+        tokens: Vec<Token>,
+        start_pos: usize,
+        seq_id: i32,
+        n: NonZeroUsize,
+    ) -> CandidatePredictor<'a, D, M> {
+        CandidatePredictor::new_resuming(self, tokens, start_pos, seq_id, n)
+    }
+
+    /// Resume token prediction from a pre-populated KV cache.
+    pub fn predict_tokens_resuming<'a>(
+        &'a mut self,
+        tokens: Vec<Token>,
+        start_pos: usize,
+        seq_id: i32,
+        options: PredictOptions,
+    ) -> TokenPredictor<'a, D, M> {
+        TokenPredictor::new_resuming(
+            self, tokens, start_pos, seq_id, options,
+        )
+    }
+
+    /// Resume piece prediction from a pre-populated KV cache.
+    pub fn predict_pieces_resuming<'a>(
+        &'a mut self,
+        tokens: Vec<Token>,
+        start_pos: usize,
+        seq_id: i32,
+        options: PredictOptions,
+    ) -> PiecePredictor<'a, D, M> {
+        PiecePredictor::new_resuming(
+            self, tokens, start_pos, seq_id, options,
+        )
+    }
+}
+
+/// Convenience alias for the llama.cpp-backed pair. Use
+/// `LlamaCppEngine::from_path(...)` etc. when you want the default
+/// backend without turbofish.
+pub type LlamaCppEngine = Engine<LlamaCppDecoder, LlamaCppModel>;
+
+impl LlamaCppEngine {
+    /// Create a new `LlamaCppEngine` from common command line
+    /// arguments.
     #[cfg(feature = "cli")]
     pub fn from_cli(
         args: crate::cli::Args,
@@ -492,86 +650,35 @@ impl Engine {
         Self::new(args.model, model_params, context_params, numa_strategy)
     }
 
-    /// Create a new `Engine` from a model `path`, `model_params`,
-    /// `context_params` and `numa_strategy`. The path is the only required
-    /// argument. The others are optional.
+    /// Create a new `LlamaCppEngine` from a model `path`, `model_params`,
+    /// `context_params` and `numa_strategy`. The path is the only
+    /// required argument.
     pub fn new(
         path: PathBuf,
         model_params: Option<llama_model_params>,
         context_params: Option<llama_context_params>,
         numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
-        // Backend lifecycle: the first-ever Engine brings up the
-        // llama.cpp backend + NUMA init. ENGINE_COUNT tracks live
-        // Engines; the last one dropped tears the backend down. Model
-        // load and context creation both require the backend to be
-        // initialized, so we do that up front.
-        {
-            let mut count = ENGINE_COUNT.lock().unwrap();
-            *count += 1;
-            if *count == 1 {
-                unsafe {
-                    llama_backend_init();
-                    llama_numa_init(
-                        numa_strategy
-                            .unwrap_or(
-                                ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED
-                                    .try_into()
-                                    .unwrap(),
-                            )
-                            .try_into()
-                            .unwrap(),
-                    );
-                }
-            }
-        }
-
         let mut model =
             match LlamaCppModel::from_file(path.clone(), model_params) {
-                Some(model) => model,
-                None => {
-                    // Roll back the count we reserved above.
-                    let mut count = ENGINE_COUNT.lock().unwrap();
-                    *count -= 1;
-                    if *count == 0 {
-                        unsafe { llama_backend_free() };
-                    }
-                    return Err(NewError::Model { path });
-                }
+                Some(m) => m,
+                None => return Err(NewError::Model { path }),
             };
         let context_params =
             context_params.unwrap_or(unsafe { llama_context_default_params() });
-        let decoder = match LlamaCppDecoder::new(&mut model, context_params) {
-            Ok(d) => d,
-            Err(e) => {
-                let mut count = ENGINE_COUNT.lock().unwrap();
-                *count -= 1;
-                if *count == 0 {
-                    unsafe { llama_backend_free() };
-                }
-                return Err(e);
-            }
-        };
+        let decoder =
+            LlamaCppDecoder::new(&mut model, context_params, numa_strategy)?;
         Ok(Self { decoder, model })
     }
 
-    /// Create a new engine from a model `path`. Default model and context
-    /// parameters are used.
+    /// Create a new engine from a model `path`. Default model and
+    /// context parameters are used.
     pub fn from_path(path: PathBuf) -> Result<Self, NewError> {
         Self::new(path, None, None, None)
     }
 
     /// Create a new engine from a model `path` forcing CPU-only
     /// inference (zero GPU layers).
-    ///
-    /// Diagnostic escape hatch: CPU kernels are standardized across
-    /// ggml implementations where Metal/CUDA/Vulkan kernels are not;
-    /// forcing CPU rules out GPU-kernel divergence as the cause of
-    /// output differences against other runners.
-    ///
-    /// Expect this to be dramatically slower than the default
-    /// (GPU-offloaded) path — useful for one-off verification, not
-    /// production inference.
     pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, NewError> {
         let mut mp = unsafe { llama_model_default_params() };
         mp.n_gpu_layers = 0;
@@ -580,17 +687,6 @@ impl Engine {
 
     /// Create a new engine from a model `path` with an explicit Flash
     /// Attention policy.
-    ///
-    /// Diagnostic hatch: when debugging output divergence between llama.cpp
-    /// and ollama's engine (or any other GGML-based runner), forcing FA off
-    /// isolates whether the Flash Attention softmax path is producing
-    /// different logits on close-race token distributions. ollama's Go-
-    /// native runner (`--ollama-engine`) uses a different attention
-    /// implementation entirely; comparing against it with FA on vs off in
-    /// llama.cpp can pin the numerical divergence to the softmax kernel.
-    ///
-    /// The default (via [`Self::from_path`]) is [`FlashAttention::Auto`] —
-    /// llama.cpp picks based on the backend's capabilities.
     pub fn from_path_with_flash_attention(
         path: PathBuf,
         fa: FlashAttention,
@@ -601,16 +697,7 @@ impl Engine {
     }
 
     /// Create a new engine from a model `path` with an explicit KV
-    /// context size. Also bumps `n_batch` / `n_ubatch` so the engine
-    /// can accept full prefills of that size.
-    ///
-    /// llama.cpp's `llama_context_default_params()` sets `n_ctx = 512`,
-    /// which is far too small for real chat or structured-output
-    /// workloads — a single long system prompt plus a reasoning-capable
-    /// model's `<think>` block can easily exceed that before the JSON
-    /// body even starts. Use this builder when you know your workload
-    /// needs more headroom. Typical chat values: 4096 – 16384. Per-cell
-    /// KV memory grows linearly, so don't pick 32k "just in case".
+    /// context size.
     pub fn from_path_with_n_ctx(
         path: PathBuf,
         n_ctx: u32,
@@ -647,44 +734,38 @@ impl Engine {
         self.decoder.context_ptr_mut()
     }
 
-    pub fn n_ctx(&self) -> u32 {
-        self.decoder.n_ctx()
-    }
-
+    /// Max batch size configured on this context.
     pub fn n_batch(&self) -> u32 {
         self.decoder.n_batch()
     }
 
-    /// Get the size of the global state (logits, embedding, and memory).
+    /// Size of the serialized global state (logits, embedding, memory).
     pub fn state_size(&self) -> usize {
         self.decoder.state_size()
     }
 
-    /// Get the llama.cpp global state (logits, embedding, and memory).
+    /// Get the llama.cpp global state.
     pub fn get_state(&self) -> Vec<u8> {
         self.decoder.get_state()
     }
 
-    /// Set the llama.cpp global state (logits, embedding, and memory).
-    ///
-    /// # Panics
-    /// * If the length of `state` is not equal to [`Engine::state_size`].
+    /// Set the llama.cpp global state.
     pub fn set_state(&mut self, state: &[u8]) {
         self.decoder.set_state(state)
     }
 
-    /// Performance information
+    /// Performance information.
     pub fn get_timings(&self) -> llama_perf_context_data {
         self.decoder.get_timings()
     }
 
-    /// Reset performance information
+    /// Reset performance information.
     pub fn reset_timings(&mut self) {
         self.decoder.reset_timings()
     }
 
-    /// Set the llama.cpp log callback. Does NOT touch the ggml logger —
-    /// use [`silence_logs`] to hush both at once.
+    /// Set the llama.cpp log callback. Does NOT touch the ggml logger
+    /// — use [`silence_logs`] to hush both at once.
     pub fn set_log_callback(
         &mut self,
         callback: ggml_log_callback,
@@ -698,80 +779,20 @@ impl Engine {
     /// returns `self` for chaining on construction, e.g.:
     ///
     /// ```no_run
-    /// # use drama_llama::Engine;
-    /// let engine = Engine::from_path("models/model.gguf").unwrap().quiet();
+    /// # use drama_llama::LlamaCppEngine;
+    /// let engine = LlamaCppEngine::from_path("models/model.gguf".into()).unwrap().quiet();
     /// ```
     pub fn quiet(self) -> Self {
         silence_logs();
         self
     }
 
-    /// Clear the memory (KV cache).
-    pub fn memory_clear(&self) {
-        self.decoder.memory_clear()
+    /// Set the number of threads used for generation and batch processing.
+    pub fn set_n_threads(&mut self, n_gen: i32, n_batch: i32) {
+        self.decoder.set_n_threads(n_gen, n_batch)
     }
 
-    /// Removes all tokens from memory that belong to the specified
-    /// sequence and have positions in [p0, p1)
-    /// seq_id < 0 : match any sequence
-    /// p0 < 0     : [0,  p1]
-    /// p1 < 0     : [p0, inf)
-    pub fn memory_seq_rm(
-        &self,
-        seq_id: llama_seq_id,
-        p0: llama_pos,
-        p1: llama_pos,
-    ) -> bool {
-        self.decoder.memory_seq_rm(seq_id, p0, p1)
-    }
-
-    /// Copy all tokens that belong to the specified sequence in memory to
-    /// another sequence.
-    pub fn memory_seq_cp(
-        &self,
-        src: llama_seq_id,
-        dst: llama_seq_id,
-        p0: llama_pos,
-        p1: llama_pos,
-    ) {
-        self.decoder.memory_seq_cp(src, dst, p0, p1)
-    }
-
-    /// Removes all tokens that do not belong to the specified sequence.
-    pub fn memory_seq_keep(&self, seq_id: llama_seq_id) {
-        self.decoder.memory_seq_keep(seq_id)
-    }
-
-    /// Adds relative position "delta" to all tokens that belong to the
-    /// specified sequence and have positions in [p0, p1).
-    pub fn memory_seq_add(
-        &self,
-        seq_id: llama_seq_id,
-        p0: llama_pos,
-        p1: llama_pos,
-        delta: llama_pos,
-    ) {
-        self.decoder.memory_seq_add(seq_id, p0, p1, delta)
-    }
-
-    /// Integer division of the positions by factor of `d > 1`.
-    pub fn memory_seq_div(
-        &self,
-        seq_id: llama_seq_id,
-        p0: llama_pos,
-        p1: llama_pos,
-        d: i32,
-    ) {
-        self.decoder.memory_seq_div(seq_id, p0, p1, d)
-    }
-
-    /// Returns the largest position present in memory for the specified
-    /// sequence.
-    pub fn memory_seq_pos_max(&self, seq_id: llama_seq_id) -> llama_pos {
-        self.decoder.memory_seq_pos_max(seq_id)
-    }
-
-    /// Decode
+    /// Run one batch through `llama_decode`.
     pub fn decode(&self, batch: &Batch) -> Result<(), DecodeError> {
         self.decoder.decode(batch)
     }
@@ -784,12 +805,7 @@ impl Engine {
         start_pos: usize,
         seq_id: llama_seq_id,
     ) -> Result<(), DecodeError> {
-        self.decoder.prefill(tokens, start_pos, seq_id)
-    }
-
-    /// Set the number of threads used for generation and batch processing.
-    pub fn set_n_threads(&mut self, n_gen: i32, n_batch: i32) {
-        self.decoder.set_n_threads(n_gen, n_batch)
+        self.decoder.prefill_inherent(tokens, start_pos, seq_id)
     }
 
     /// Get logits for the i'th token.
@@ -811,137 +827,6 @@ impl Engine {
     pub fn embeddings_mut(&mut self, i: i32) -> &mut [f32] {
         self.decoder.embeddings_mut(i)
     }
-
-    /// Return an iterator that yields candidates for the next token in a
-    /// sequence until `n` tokens have been predicted or the end of context is
-    /// reached.
-    ///
-    /// # Note
-    /// * The [`record_choice`] method must be called on the returned iterator
-    ///   to record the choice made by the user (or iteration will end).
-    /// * The tokens given will be available as the `tokens` field of the
-    ///   iterator. For convenience, when finished, the [`CandidatePredictor`]
-    ///   can be converted back `into` the tokens, including any choices made.
-    ///
-    /// [`record_choice`]: crate::predictor::CandidatePredictor::record_choice
-    pub fn predict_candidates<'a>(
-        &'a mut self,
-        tokens: Vec<llama_token>,
-        n: NonZeroUsize,
-    ) -> CandidatePredictor<'a> {
-        self.memory_clear();
-        CandidatePredictor::new(self, tokens, n)
-    }
-
-    /// Return an iterator that predicts a sequence of tokens until `options.n`
-    /// tokens have been predicted, the end of context is reached, or stop
-    /// conditions are met.
-    pub fn predict_tokens<'a>(
-        &'a mut self,
-        tokens: Vec<llama_token>,
-        options: PredictOptions,
-    ) -> TokenPredictor<'a> {
-        self.memory_clear();
-        TokenPredictor::new(self, tokens, options)
-    }
-
-    /// Return an iterator that predicts a sequence of pieces until `options.n`
-    /// tokens have been predicted, the end of context is reached, or stop
-    /// conditions are met.
-    pub fn predict_pieces<'a>(
-        &'a mut self,
-        tokens: Vec<llama_token>,
-        options: PredictOptions,
-    ) -> PiecePredictor<'a> {
-        self.memory_clear();
-        PiecePredictor::new(self, tokens, options)
-    }
-
-    /// Return an iterator that predicts both tokens and pieces.
-    pub fn predict<'a>(
-        &'a mut self,
-        tokens: Vec<llama_token>,
-        options: PredictOptions,
-    ) -> Predictor<'a> {
-        self.memory_clear();
-        Predictor::new(self, tokens, options)
-    }
-
-    /// Resume candidate prediction from a KV cache the caller has
-    /// already populated for positions `[0, start_pos)` on `seq_id`.
-    pub fn predict_candidates_resuming<'a>(
-        &'a mut self,
-        tokens: Vec<llama_token>,
-        start_pos: usize,
-        seq_id: llama_seq_id,
-        n: NonZeroUsize,
-    ) -> CandidatePredictor<'a> {
-        assert!(
-            !tokens.is_empty(),
-            "predict_candidates_resuming requires non-empty tokens",
-        );
-        self.prefill(&tokens, start_pos, seq_id)
-            .expect("prefill failed in predict_candidates_resuming");
-        let suffix_len = tokens.len();
-        let n_cur = start_pos + suffix_len;
-        CandidatePredictor::new_resuming(self, tokens, n_cur, suffix_len, n)
-    }
-
-    /// Resume token prediction from a KV cache the caller has already
-    /// populated for positions `[0, start_pos)` on `seq_id`.
-    pub fn predict_tokens_resuming<'a>(
-        &'a mut self,
-        tokens: Vec<llama_token>,
-        start_pos: usize,
-        seq_id: llama_seq_id,
-        options: PredictOptions,
-    ) -> TokenPredictor<'a> {
-        assert!(
-            !tokens.is_empty(),
-            "predict_tokens_resuming requires non-empty tokens",
-        );
-        self.prefill(&tokens, start_pos, seq_id)
-            .expect("prefill failed in predict_tokens_resuming");
-        let suffix_len = tokens.len();
-        let n_cur = start_pos + suffix_len;
-        TokenPredictor::new_resuming(self, tokens, n_cur, suffix_len, options)
-    }
-
-    /// Resume piece prediction from a KV cache the caller has already
-    /// populated for positions `[0, start_pos)` on `seq_id`.
-    pub fn predict_pieces_resuming<'a>(
-        &'a mut self,
-        tokens: Vec<llama_token>,
-        start_pos: usize,
-        seq_id: llama_seq_id,
-        options: PredictOptions,
-    ) -> PiecePredictor<'a> {
-        assert!(
-            !tokens.is_empty(),
-            "predict_pieces_resuming requires non-empty tokens",
-        );
-        self.prefill(&tokens, start_pos, seq_id)
-            .expect("prefill failed in predict_pieces_resuming");
-        let suffix_len = tokens.len();
-        let n_cur = start_pos + suffix_len;
-        PiecePredictor::new_resuming(self, tokens, n_cur, suffix_len, options)
-    }
-}
-
-impl Drop for Engine {
-    fn drop(&mut self) {
-        // Free the llama.cpp context before the model is dropped
-        // (model's own Drop calls llama_model_free). Fields declared
-        // in order `decoder, model` so the raw pointer in decoder is
-        // still valid here — we're running before the decoder's field
-        // drops.
-        unsafe { llama_free(self.decoder.context) };
-        let mut count = ENGINE_COUNT.lock().unwrap();
-        *count -= 1;
-        if *count == 0 {
-            unsafe { llama_backend_free() };
-        }
-    }
 }
 
 #[cfg(test)]
@@ -956,13 +841,11 @@ mod tests {
     // TODO: find a way to test for increased memory usage. The test also might
     // be better upstream in the bindings.
     fn construct_destruct_stress_test() {
-        // Thanks to Bing's Copilot for helping me quickly find how to reference
-        // the absolute path of the model file.
         use std::path::PathBuf;
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("models/model.gguf");
         for i in 0..1000 {
-            let engine = Engine::new(path.clone(), None, None, None);
+            let engine = LlamaCppEngine::new(path.clone(), None, None, None);
             if engine.is_err() {
                 println!(
                     "Failed to create engine after {} iterations because: {}",
@@ -977,10 +860,7 @@ mod tests {
     #[ignore = "long running, requires models/model.gguf"]
     /// The resuming prediction path (prefill + `predict_pieces_resuming`)
     /// must produce the same token stream as the fresh path
-    /// (`predict_pieces`) under greedy sampling. Any deviation means
-    /// the KV cache was not correctly populated by `prefill`, or that
-    /// `CandidatePredictor::new_resuming` read from the wrong logits
-    /// index.
+    /// (`predict_pieces`) under greedy sampling.
     fn test_predict_pieces_resuming_matches() {
         use std::path::PathBuf;
         const PROMPT: &str = "The quick brown fox jumps over the lazy dog.";
@@ -988,7 +868,7 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
 
         // --- A: fresh path ---
-        let mut engine_a = Engine::from_path(model_path.clone()).unwrap();
+        let mut engine_a = LlamaCppEngine::from_path(model_path.clone()).unwrap();
         let tokens_a = engine_a.model.tokenize(PROMPT, true);
         assert!(tokens_a.len() >= 4, "prompt tokenization too short");
         let k = tokens_a.len() / 2;
@@ -1003,18 +883,12 @@ mod tests {
         drop(engine_a);
 
         // --- B: resuming path on a fresh engine ---
-        let mut engine_b = Engine::from_path(model_path).unwrap();
+        let mut engine_b = LlamaCppEngine::from_path(model_path).unwrap();
         let tokens_b = engine_b.model.tokenize(PROMPT, true);
         assert_eq!(tokens_a, tokens_b, "tokenization drift between engines");
 
         let (prefix, suffix) = tokens_b.split_at(k);
 
-        // Prime the KV cache with the prefix (no logits needed — we
-        // only want KV state here). `prefill` places `prefix` at
-        // positions `[0, k)` on seq 0, with logits enabled on the last
-        // prefix token only. That's fine — we discard those logits and
-        // immediately overwrite them via the second prefill inside
-        // `predict_pieces_resuming`.
         engine_b.memory_clear();
         engine_b
             .prefill(prefix, 0, 0)
