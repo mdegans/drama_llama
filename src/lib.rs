@@ -60,7 +60,7 @@ pub use output_config::{
 };
 
 mod model;
-pub use model::{llama_quantize, Model};
+pub use model::{llama_quantize, LlamaCppModel};
 
 mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};

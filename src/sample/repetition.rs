@@ -214,7 +214,7 @@ impl RepetitionOptions {
     pub fn ignore_categories(
         mut self,
         ignore_categories: IgnoreCategory,
-        model: &crate::Model,
+        model: &crate::LlamaCppModel,
     ) -> Self {
         self.extend_ignored(ignore_categories.into_tokens(model));
         self
@@ -226,7 +226,7 @@ impl RepetitionOptions {
     pub fn ignore_stopwords(
         self,
         stopwords: StopWords,
-        model: &crate::Model,
+        model: &crate::LlamaCppModel,
     ) -> Self {
         self.ignore_categories(stopwords, model)
     }
@@ -513,7 +513,7 @@ pub fn apply_sample_repetition_ngram(
     tokens: &[llama_token],
     opts: &mut RepetitionOptions,
     freq_map: &mut NGramStats,
-    model: &crate::Model,
+    model: &crate::LlamaCppModel,
 ) -> Result<Candidates, RepetitionError> {
     let k = candidates.len();
     let n_vocab = k.get();
@@ -677,10 +677,10 @@ mod tests {
         Candidates::from_vec(data)
     }
 
-    fn load_model() -> crate::Model {
+    fn load_model() -> crate::LlamaCppModel {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("models/model.gguf");
-        crate::Model::from_file(path, None).unwrap()
+        crate::LlamaCppModel::from_file(path, None).unwrap()
     }
 
     /// Simulate multiple generation steps, applying the penalty at each step.
@@ -690,7 +690,7 @@ mod tests {
         token_history: &[llama_token],
         opts: &mut RepetitionOptions,
         steps: usize,
-        model: &crate::Model,
+        model: &crate::LlamaCppModel,
     ) -> (Vec<f32>, NGramStats) {
         let mut freq_map = NGramStats::new();
         let mut result_logits = logits.to_vec();

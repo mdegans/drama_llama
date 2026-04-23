@@ -199,7 +199,7 @@ pub(crate) fn build_grammar_source(
         let _ = writeln!(src, "root ::= ws {wrapped_call}");
     }
     if let Some((open, close)) = opts.wrap_tags {
-        // Model emits `<open>\n{…}\n</close>` in its trained format.
+        // LlamaCppModel emits `<open>\n{…}\n</close>` in its trained format.
         // We accept any whitespace around the JSON to tolerate minor
         // layout drift. The literal tag text is escaped to survive
         // being embedded in a GBNF string literal.

@@ -1,6 +1,6 @@
 use llama_cpp_sys_3::llama_token;
 
-use crate::Model;
+use crate::LlamaCppModel;
 
 /// Common sequences to ignore (for repetition penalty, etc.)
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -53,7 +53,7 @@ impl IgnoreCategory {
     /// Tokenizes `self` using the given `model``.
     pub fn into_tokens(
         self,
-        model: &Model,
+        model: &LlamaCppModel,
     ) -> impl Iterator<Item = llama_token> + '_ {
         self.words()
             .iter()

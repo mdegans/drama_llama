@@ -1,6 +1,6 @@
 use crate::{
     predictor::{CandidatePredictor, PiecePredictor, TokenPredictor},
-    Batch, Model, PredictOptions, Predictor,
+    Batch, LlamaCppModel, PredictOptions, Predictor,
 };
 
 use std::{num::NonZeroUsize, path::PathBuf, sync::Mutex};
@@ -130,7 +130,7 @@ pub struct Engine {
     /// The llama.cpp context.
     pub(crate) context: *mut llama_context,
     /// The llama.cpp model.
-    pub model: Model,
+    pub model: LlamaCppModel,
 }
 
 unsafe impl Send for Engine {}
@@ -177,7 +177,7 @@ impl Engine {
             }
         }
 
-        let mut model = match Model::from_file(path.clone(), model_params) {
+        let mut model = match LlamaCppModel::from_file(path.clone(), model_params) {
             Some(model) => model,
             None => return Err(NewError::Model { path }),
         };

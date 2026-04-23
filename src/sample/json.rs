@@ -23,7 +23,7 @@
 
 use llama_cpp_sys_3::llama_token;
 
-use crate::{model::token_to_piece_ref, Candidates, Model, TokenData};
+use crate::{model::token_to_piece_ref, Candidates, LlamaCppModel, TokenData};
 
 /// Pushdown-automaton state for JSON parsing at the byte level.
 ///
@@ -521,7 +521,7 @@ static_assertions::assert_impl_all!(JsonState: Send, Sync);
 pub(crate) fn json_filter(
     candidates: Candidates,
     state: &mut JsonState,
-    model: &Model,
+    model: &LlamaCppModel,
 ) -> Candidates {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
     let mut kept: Vec<TokenData> =
@@ -567,7 +567,7 @@ pub(crate) fn json_filter(
 pub(crate) fn advance_all(
     modes: &[crate::SamplingMode],
     token: llama_token,
-    model: &Model,
+    model: &LlamaCppModel,
 ) {
     use crate::SamplingMode;
     let mut buf: Vec<u8> = Vec::new();

@@ -49,7 +49,7 @@ use llama_cpp_sys_3::llama_token;
 use minijinja::{value::Value as JinjaValue, Environment, Error as JinjaError};
 use serde::Serialize;
 
-use crate::{prompt::Tool, Block, Content, Model, Prompt, Role};
+use crate::{prompt::Tool, Block, Content, LlamaCppModel, Prompt, Role};
 
 /// Render a [`Tool`] as the OpenAI wire envelope cogito / Qwen /
 /// Hermes-family chat templates expect.
@@ -112,7 +112,7 @@ impl ChatTemplate {
     ///
     /// Reads `tokenizer.chat_template` for the template source and
     /// renders BOS/EOS pieces from the model's token ids.
-    pub fn from_model(model: &Model) -> Result<Self, ChatTemplateError> {
+    pub fn from_model(model: &LlamaCppModel) -> Result<Self, ChatTemplateError> {
         let source = model
             .get_meta("tokenizer.chat_template")
             .ok_or(ChatTemplateError::NoTemplate)?;
@@ -496,7 +496,7 @@ fn render_partial(
 ///
 /// [`Session::prepare_call`]: crate::Session
 pub(crate) fn tokenize_with_breakpoints(
-    model: &Model,
+    model: &LlamaCppModel,
     rendered: &RenderedWithBreakpoints,
 ) -> (Vec<llama_token>, Vec<usize>) {
     let full_tokens = model.tokenize(&rendered.text, true);
@@ -1449,7 +1449,7 @@ mod tests {
         }
     }
 
-    /// Model-backed round-trip: render a prompt with a mid-
+    /// LlamaCppModel-backed round-trip: render a prompt with a mid-
     /// conversation cache breakpoint, tokenize full + partial, and
     /// assert the partial's tokens are a proper prefix of the full's
     /// — i.e. the breakpoint index in the returned list equals the

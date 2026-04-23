@@ -2,12 +2,12 @@
 //! Run with: `cargo run --example dump_template`
 use std::path::PathBuf;
 
-use drama_llama::Model;
+use drama_llama::LlamaCppModel;
 
 fn main() {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-    let model = Model::from_file(path, None).expect("load model");
+    let model = LlamaCppModel::from_file(path, None).expect("load model");
     let tmpl = model
         .get_meta("tokenizer.chat_template")
         .unwrap_or_else(|| String::from("(no tokenizer.chat_template)"));

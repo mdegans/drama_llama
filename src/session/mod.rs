@@ -93,7 +93,7 @@ pub use parse::{parse_completion, BlockParser};
 /// Errors from [`Session`].
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
-    /// Model load / llama.cpp init failure.
+    /// LlamaCppModel load / llama.cpp init failure.
     #[error("engine setup: {0}")]
     Engine(#[from] NewError),
     /// The model has no embedded `tokenizer.chat_template`, or the template
@@ -227,7 +227,7 @@ pub struct TopKEntry {
     pub token: llama_cpp_sys_3::llama_token,
     /// Raw logit from the model (pre-softmax).
     pub logit: f32,
-    /// Decoded string for this token (via `Model::token_to_piece`).
+    /// Decoded string for this token (via `LlamaCppModel::token_to_piece`).
     pub piece: String,
 }
 
@@ -1197,7 +1197,7 @@ impl Session {
     ///
     /// * `id`: new UUID v4
     /// * `model`: [`model::Id::Custom`][cu] wrapping the result of
-    ///   [`Model::desc`](crate::Model::desc).
+    ///   [`LlamaCppModel::desc`](crate::LlamaCppModel::desc).
     /// * `content`: [`AssistantMessage`] via
     ///   [`FromIterator<Block>`](std::iter::FromIterator).
     /// * `stop_reason`: inferred by [`infer_stop_reason`] — see its

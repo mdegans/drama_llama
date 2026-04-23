@@ -1065,7 +1065,7 @@ pub(crate) fn sample_token(
     freq_map: &mut NGramStats,
     rng: &mut xorshift::Xoroshiro128,
     mu: &mut Option<f32>,
-    model: &crate::Model,
+    model: &crate::LlamaCppModel,
 ) -> Result<llama_token, SampleError> {
     // Apply any repetition penalties to the candidates. This also applies the
     // softmax and sorts the candidates by logit where the most likely token is

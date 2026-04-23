@@ -29,7 +29,7 @@ use std::{
 ///
 /// # Panics
 /// * If the token's piece is not valid UTF-8.
-fn token_to_piece(token: llama_token, model: &Model) -> String {
+fn token_to_piece(token: llama_token, model: &LlamaCppModel) -> String {
     let mut buf = vec![0; 8];
     token_to_piece_ref(token, model, &mut buf);
 
@@ -39,7 +39,7 @@ fn token_to_piece(token: llama_token, model: &Model) -> String {
 /// Same as `token_to_piece`, but allows reusable buffers.
 pub(crate) fn token_to_piece_ref(
     token: llama_token,
-    model: &Model,
+    model: &LlamaCppModel,
     buf: &mut Vec<u8>,
 ) {
     // Safety: If the Vec isn't big enough, the function will return the number
@@ -112,12 +112,12 @@ pub fn llama_quantize(
 
 /// An ergonomic wrapper for a `llama.cpp` model.
 #[derive(Debug)]
-pub struct Model {
+pub struct LlamaCppModel {
     pub(crate) inner: *mut llama_model,
     /// The vocabulary associated with this model. This pointer is valid for the
     /// lifetime of the model and does not need to be freed separately.
     pub(crate) vocab: *const llama_vocab,
-    /// Model basename
+    /// LlamaCppModel basename
     pub(crate) file_name: Option<OsString>,
     /// Cached longest-token length. The predictor calls this per generated
     /// token (stop-string windowing), and the naive compute is O(vocab), so
@@ -125,13 +125,13 @@ pub struct Model {
     max_token_len: std::sync::OnceLock<usize>,
 }
 
-unsafe impl Send for Model {}
+unsafe impl Send for LlamaCppModel {}
 
 // SAFETY:
-// `Model` holds a raw `*mut llama_model`. llama.cpp's model data is
+// `LlamaCppModel` holds a raw `*mut llama_model`. llama.cpp's model data is
 // immutable after `llama_load_model_from_file` returns — weights,
 // vocab tables, and metadata are allocated once and read-only
-// thereafter. All `&Model` call sites in this crate only invoke
+// thereafter. All `&LlamaCppModel` call sites in this crate only invoke
 // vocab-read APIs (`llama_token_to_piece`, `llama_n_vocab`, metadata
 // getters, etc.), which llama.cpp documents as safe to call
 // concurrently against a `const llama_model*`. Mutating operations
@@ -139,10 +139,10 @@ unsafe impl Send for Model {}
 // separately-owned `*mut llama_context`, not the model.
 //
 // The borrow checker ensures nothing drops or re-assigns the model
-// while `&Model` references are alive, so the "immutable after load"
+// while `&LlamaCppModel` references are alive, so the "immutable after load"
 // invariant holds for every shared reference. Adding any method that
 // mutates llama_model state would invalidate this impl.
-unsafe impl Sync for Model {}
+unsafe impl Sync for LlamaCppModel {}
 
 #[derive(Debug, From)]
 pub enum MetaKey<'a> {
@@ -150,7 +150,7 @@ pub enum MetaKey<'a> {
     String(&'a str),
 }
 
-impl Model {
+impl LlamaCppModel {
     /// Load a model from a file.
     pub fn from_file(
         path: PathBuf,
@@ -213,9 +213,9 @@ impl Model {
         }
     }
 
-    /// Return the base filename if the `Model` was loaded [`from_file`]
+    /// Return the base filename if the `LlamaCppModel` was loaded [`from_file`]
     ///
-    /// [`from_file`]: Model::from_file
+    /// [`from_file`]: LlamaCppModel::from_file
     pub fn file_name<'a>(&'a self) -> Option<&'a OsStr> {
         self.file_name.as_deref()
     }
@@ -224,7 +224,7 @@ impl Model {
     ///
     /// # Safety
     /// The caller is responsible for freeing the model using `llama_free_model`
-    /// or `Model::from_raw` and then dropping it.
+    /// or `LlamaCppModel::from_raw` and then dropping it.
     pub fn into_raw(self) -> *mut llama_model {
         let ptr = self.inner;
         std::mem::forget(self);
@@ -679,7 +679,7 @@ impl Model {
     }
 }
 
-impl Drop for Model {
+impl Drop for LlamaCppModel {
     fn drop(&mut self) {
         unsafe { llama_model_free(self.inner) };
     }
@@ -702,7 +702,7 @@ mod tests {
         // fail.
         path.push("models/model.gguf");
 
-        let model = Model::from_file(path, None).unwrap();
+        let model = LlamaCppModel::from_file(path, None).unwrap();
 
         // These assertions are for Llama 3.1 8B Instruct
         assert_eq!(model.bos(), 128000);
@@ -775,7 +775,7 @@ mod tests {
         // fail.
         path.push("models/model.gguf");
 
-        let model = Model::from_file(path, None).unwrap();
+        let model = LlamaCppModel::from_file(path, None).unwrap();
         let meta = model.meta();
         for (key, val) in meta.iter() {
             println!("{}: {}", key, val);
@@ -790,7 +790,7 @@ mod tests {
         // fail.
         path.push("models/model.gguf");
 
-        let model = Model::from_file(path, None).unwrap();
+        let model = LlamaCppModel::from_file(path, None).unwrap();
         let desc = model.desc();
         assert!(desc.starts_with("llama"));
         assert!(!desc.ends_with("\0"));

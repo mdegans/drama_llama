@@ -92,7 +92,7 @@ enum State {
 pub struct BlockParser {
     buffer: String,
     state: State,
-    /// Synthetic ID counter. Model outputs like cogito's don't include
+    /// Synthetic ID counter. LlamaCppModel outputs like cogito's don't include
     /// an `id` with each tool call, but downstream tool-result
     /// correlation (in a follow-up `ToolResult` block) requires one.
     /// Seeding per-completion with a counter keeps IDs unique within

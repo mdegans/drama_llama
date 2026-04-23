@@ -10,7 +10,7 @@ use partial_sort::PartialSort;
 use crate::{
     ngram::NGramStats,
     sample::{choose_candidate, SampleError},
-    Model, Probability, RepetitionOptions, SampleOptions, Token, TokenData,
+    LlamaCppModel, Probability, RepetitionOptions, SampleOptions, Token, TokenData,
 };
 
 #[cfg(feature = "llama-cpp")]
@@ -1238,7 +1238,7 @@ impl Candidates {
         freq_map: &mut NGramStats,
         rng: &mut xorshift::Xoroshiro128,
         mu: &mut Option<f32>,
-        model: &Model,
+        model: &LlamaCppModel,
     ) -> Result<Token, SampleError> {
         crate::sample::sample_token(
             tokens, self, opts, freq_map, rng, mu, model,
@@ -1261,7 +1261,7 @@ impl Candidates {
         tokens: &[Token],
         opts: &mut RepetitionOptions,
         freq_map: &mut NGramStats,
-        model: &Model,
+        model: &LlamaCppModel,
     ) -> Result<Candidates, crate::sample::RepetitionError> {
         crate::sample::apply_sample_repetition_ngram(
             self, tokens, opts, freq_map, model,

@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use crate::{model::token_to_piece_ref, Candidates, Model};
+use crate::{model::token_to_piece_ref, Candidates, LlamaCppModel};
 
 /// Inline-capacity of a single stack in the NFA simulation. Most grammars
 /// keep call stacks under 4 deep; 8 covers nested alternation / repetition
@@ -1704,13 +1704,13 @@ fn record_stats(
 pub(crate) fn grammar_filter(
     candidates: Candidates,
     state: &mut GrammarState,
-    model: &Model,
+    model: &LlamaCppModel,
 ) -> Candidates {
     // Each candidate check is independent: clone the matcher state,
     // try to advance it by the token's bytes, keep the token iff the
     // clone survives. Fan out across rayon's global pool so 150k-vocab
     // models don't bottleneck on a single core. `GrammarState` is
-    // auto-Sync (pure data behind an Arc), `Model` is Sync by manual
+    // auto-Sync (pure data behind an Arc), `LlamaCppModel` is Sync by manual
     // impl (post-load data is immutable — see src/model.rs).
     //
     // The first-byte bitmap is a cheap O(1)/candidate prefilter that
@@ -1828,7 +1828,7 @@ pub(crate) fn grammar_filter(
 pub(crate) fn advance_all(
     modes: &[crate::SamplingMode],
     token: llama_token,
-    model: &Model,
+    model: &LlamaCppModel,
 ) {
     use crate::SamplingMode;
     let mut buf: Vec<u8> = Vec::new();

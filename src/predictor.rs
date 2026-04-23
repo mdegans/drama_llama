@@ -5,7 +5,7 @@ use xorshift::{SeedableRng, Xoroshiro128};
 
 use crate::{
     batch::AddError, ngram::NGramStats, sample::SampleOptions, Batch,
-    Candidates, Engine, Model, NGram,
+    Candidates, Engine, LlamaCppModel, NGram,
 };
 
 #[cfg(feature = "serde")]
@@ -105,7 +105,7 @@ impl PredictOptions {
     /// models that emit `<|eot_id|>` between turns terminate cleanly.
     /// Repetition penalty ignores these — otherwise a strong penalty can
     /// keep the model from ever closing a turn.
-    pub fn add_model_stops(mut self, model: &Model) -> Self {
+    pub fn add_model_stops(mut self, model: &LlamaCppModel) -> Self {
         let eos = model.eos();
         self.stop_sequences.push(vec![eos]);
         if let Some(opts) = &mut self.sample_options.repetition {
