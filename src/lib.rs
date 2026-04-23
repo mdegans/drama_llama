@@ -67,7 +67,8 @@ pub use ngram::{NGram, NGramData, NGramStats};
 
 mod engine;
 pub use engine::{
-    restore_default_logs, silence_logs, Engine, FlashAttention, NewError,
+    restore_default_logs, silence_logs, DecodeError, Engine, FlashAttention,
+    LlamaCppDecoder, NewError,
 };
 
 mod predictor;

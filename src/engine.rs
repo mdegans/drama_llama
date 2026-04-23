@@ -28,7 +28,7 @@ use llama_cpp_sys_3::{
 use thiserror::Error;
 
 /// Global engine count. When this drops to 0, the llama backend is freed in
-/// the last [`Engine`]'s `Drop` implementation.
+/// the last [`LlamaCppDecoder`]'s `Drop` implementation.
 static ENGINE_COUNT: Mutex<usize> = Mutex::new(0);
 
 /// Silence `llama.cpp` + `ggml` log output.
@@ -75,7 +75,7 @@ pub enum NewError {
 
 static_assertions::assert_impl_all!(NewError: Send, Sync);
 
-/// Possible errors when calling [`Engine::decode`].
+/// Possible errors when calling [`LlamaCppDecoder::decode`].
 #[derive(Error, Debug)]
 pub enum DecodeError {
     #[error("Could not find a KV slot for the Batch. Try reducing the size of the batch or increase the context size.")]
@@ -123,17 +123,362 @@ impl FlashAttention {
     }
 }
 
-/// An `Engine` encompasses everything needed to run inferences. It contains the
-/// model and the context. It is the main entry point for running inferences.
+/// llama.cpp-backed decoder: owns a `llama_context`, manages the KV
+/// cache, runs decode passes, and exposes logits / embeddings.
+///
+/// This is the concrete implementor of [`crate::backend::Decoder`] for
+/// the llama.cpp backend. Construction is driven by [`Engine::new`]
+/// (which loads the [`LlamaCppModel`] first, then hands it here). The
+/// backend-lifecycle global (`ENGINE_COUNT`) is maintained here so
+/// creating/destroying decoders naturally drives `llama_backend_init`
+/// / `llama_backend_free`.
+///
+/// `n_vocab` and `embedding_size` are cached at construction so the
+/// decoder can return correctly-sized logit / embedding slices without
+/// holding a reference to the [`LlamaCppModel`] that produced it.
 #[derive(Debug)]
-pub struct Engine {
-    /// The llama.cpp context.
+pub struct LlamaCppDecoder {
     pub(crate) context: *mut llama_context,
-    /// The llama.cpp model.
-    pub model: LlamaCppModel,
+    /// Cached vocab size from the source model — used to size logit slices.
+    n_vocab: usize,
+    /// Cached embedding dimension from the source model — used to size
+    /// embedding slices.
+    embedding_size: usize,
 }
 
-unsafe impl Send for Engine {}
+unsafe impl Send for LlamaCppDecoder {}
+
+impl LlamaCppDecoder {
+    /// Create a decoder bound to `model` with the given context
+    /// params. Backend lifecycle (`llama_backend_init` /
+    /// `llama_backend_free`) is managed by [`Engine`] rather than
+    /// here — a standalone decoder created without an Engine must
+    /// handle that itself.
+    pub fn new(
+        model: &mut LlamaCppModel,
+        context_params: llama_context_params,
+    ) -> Result<Self, NewError> {
+        let context = unsafe {
+            llama_new_context_with_model(model.as_ptr_mut(), context_params)
+        };
+        if context.is_null() {
+            return Err(NewError::Context);
+        }
+
+        Ok(Self {
+            context,
+            n_vocab: model.n_vocab() as usize,
+            embedding_size: model.embedding_size() as usize,
+        })
+    }
+
+    /// Raw pointer to the underlying llama.cpp context (const).
+    pub fn context_ptr(&self) -> *const llama_context {
+        self.context
+    }
+
+    /// Raw pointer to the underlying llama.cpp context (mut).
+    pub fn context_ptr_mut(&self) -> *mut llama_context {
+        self.context
+    }
+
+    /// Vocabulary size seen by this decoder (cached from model).
+    pub fn n_vocab(&self) -> usize {
+        self.n_vocab
+    }
+
+    /// Embedding dimension seen by this decoder (cached from model).
+    pub fn embedding_size(&self) -> usize {
+        self.embedding_size
+    }
+
+    /// Context window size (tokens).
+    pub fn n_ctx(&self) -> u32 {
+        unsafe { llama_n_ctx(self.context) }
+    }
+
+    /// Max batch size configured on this context.
+    pub fn n_batch(&self) -> u32 {
+        unsafe { llama_n_batch(self.context) }
+    }
+
+    /// Size of the serialized global state (logits, embedding, memory).
+    pub fn state_size(&self) -> usize {
+        unsafe { llama_state_get_size(self.context) }
+    }
+
+    /// Serialize the global state.
+    pub fn get_state(&self) -> Vec<u8> {
+        let len = self.state_size();
+        let mut buf = vec![0u8; len];
+        let copied = unsafe {
+            llama_state_get_data(self.context, buf.as_mut_ptr(), len)
+        };
+        assert_eq!(copied, len);
+        buf
+    }
+
+    /// Deserialize the global state.
+    ///
+    /// # Panics
+    /// * If the length of `state` is not equal to [`Self::state_size`].
+    pub fn set_state(&mut self, state: &[u8]) {
+        let len = self.state_size();
+        assert_eq!(state.len(), len);
+        let copied = unsafe {
+            llama_state_set_data(self.context, state.as_ptr(), len)
+        };
+        assert_eq!(copied, len);
+    }
+
+    /// Performance information.
+    pub fn get_timings(&self) -> llama_perf_context_data {
+        unsafe { llama_perf_context(self.context) }
+    }
+
+    /// Reset performance information.
+    pub fn reset_timings(&mut self) {
+        unsafe { llama_perf_context_reset(self.context) };
+    }
+
+    /// Set the llama.cpp log callback. Does NOT touch the ggml logger
+    /// — use [`silence_logs`] to hush both at once.
+    pub fn set_log_callback(
+        &mut self,
+        callback: ggml_log_callback,
+        callback_data: Option<*mut std::ffi::c_void>,
+    ) {
+        unsafe {
+            llama_log_set(
+                callback,
+                callback_data.unwrap_or(std::ptr::null_mut()),
+            );
+        }
+    }
+
+    /// Set the number of threads used for generation and batch
+    /// processing.
+    pub fn set_n_threads(&mut self, n_gen: i32, n_batch: i32) {
+        unsafe { llama_set_n_threads(self.context, n_gen, n_batch) }
+    }
+
+    /// Clear the KV cache.
+    pub fn memory_clear(&self) {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_clear(mem, true) }
+    }
+
+    /// Remove KV entries for `seq_id` in position range `[p0, p1)`.
+    pub fn memory_seq_rm(
+        &self,
+        seq_id: llama_seq_id,
+        p0: llama_pos,
+        p1: llama_pos,
+    ) -> bool {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_rm(mem, seq_id, p0, p1) }
+    }
+
+    /// Copy KV entries between sequences in `[p0, p1)`.
+    pub fn memory_seq_cp(
+        &self,
+        src: llama_seq_id,
+        dst: llama_seq_id,
+        p0: llama_pos,
+        p1: llama_pos,
+    ) {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_cp(mem, src, dst, p0, p1) }
+    }
+
+    /// Keep only `seq_id`'s entries, drop all others.
+    pub fn memory_seq_keep(&self, seq_id: llama_seq_id) {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_keep(mem, seq_id) }
+    }
+
+    /// Add `delta` to positions of `seq_id` in `[p0, p1)`.
+    pub fn memory_seq_add(
+        &self,
+        seq_id: llama_seq_id,
+        p0: llama_pos,
+        p1: llama_pos,
+        delta: llama_pos,
+    ) {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_add(mem, seq_id, p0, p1, delta) }
+    }
+
+    /// Integer-divide positions of `seq_id` in `[p0, p1)` by `d > 1`.
+    pub fn memory_seq_div(
+        &self,
+        seq_id: llama_seq_id,
+        p0: llama_pos,
+        p1: llama_pos,
+        d: i32,
+    ) {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_div(mem, seq_id, p0, p1, d) }
+    }
+
+    /// Largest position present in KV for `seq_id`.
+    pub fn memory_seq_pos_max(&self, seq_id: llama_seq_id) -> llama_pos {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_pos_max(mem, seq_id) }
+    }
+
+    /// Run one batch through `llama_decode`.
+    pub fn decode(&self, batch: &Batch) -> Result<(), DecodeError> {
+        let ret = unsafe { llama_decode(self.context, batch.batch) };
+        match ret {
+            0 => Ok(()),
+            1 => Err(DecodeError::NoKvSlot),
+            _ => Err(DecodeError::ErrorCode { code: ret }),
+        }
+    }
+
+    /// Decode `tokens` into the KV cache at positions
+    /// `[start_pos, start_pos + tokens.len())` for `seq_id`.
+    ///
+    /// Resumable prefill primitive: does **not** clear the KV cache.
+    /// Caller owns KV placement. Only the final token has logits
+    /// enabled. Empty `tokens` is a no-op.
+    pub fn prefill(
+        &self,
+        tokens: &[llama_token],
+        start_pos: usize,
+        seq_id: llama_seq_id,
+    ) -> Result<(), DecodeError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let mut batch = Batch::new(tokens.len(), 0, 1)
+            .expect("prefill batch allocation failed");
+        let seq_ids = [seq_id];
+        let last = tokens.len() - 1;
+        for (i, &token) in tokens.iter().enumerate() {
+            batch
+                .add_token(token, start_pos + i, Some(&seq_ids), i == last)
+                .expect("prefill add_token failed (should be unreachable)");
+        }
+        self.decode(&batch)
+    }
+
+    /// Get logits for the i'th token of the most recent decode.
+    ///
+    /// # Panics
+    /// - If the index is invalid (panics come from the C side).
+    pub fn logits(&self, i: usize) -> &[f32] {
+        let ptr = unsafe {
+            llama_get_logits_ith(self.context, i.try_into().unwrap())
+        };
+        unsafe { std::slice::from_raw_parts(ptr, self.n_vocab) }
+    }
+
+    /// Mutable logits for the i'th token.
+    pub fn logits_mut(&mut self, i: i32) -> &mut [f32] {
+        let ptr = unsafe { llama_get_logits_ith(self.context, i) };
+        unsafe { std::slice::from_raw_parts_mut(ptr, self.n_vocab) }
+    }
+
+    /// Get embeddings for the i'th sequence.
+    pub fn embeddings(&self, i: i32) -> &[f32] {
+        let ptr = unsafe { llama_get_embeddings_ith(self.context, i) };
+        unsafe { std::slice::from_raw_parts(ptr, self.embedding_size) }
+    }
+
+    /// Mutable embeddings for the i'th sequence.
+    pub fn embeddings_mut(&mut self, i: i32) -> &mut [f32] {
+        let ptr = unsafe { llama_get_embeddings_ith(self.context, i) };
+        unsafe { std::slice::from_raw_parts_mut(ptr, self.embedding_size) }
+    }
+}
+
+// No Drop impl for LlamaCppDecoder: [`Engine`] handles `llama_free`
+// and the backend-lifecycle countdown so the free order (context
+// first, then backend, then model) stays correct.
+
+// llama.cpp-backed `Decoder` trait impl. `step` allocates a 1-slot
+// `Batch` each call; `prefill` reuses the inherent method and reads
+// logits for the last prefilled token.
+impl crate::backend::Decoder for LlamaCppDecoder {
+    type Error = DecodeError;
+
+    fn prefill(
+        &mut self,
+        tokens: &[crate::Token],
+        start_pos: usize,
+        seq_id: i32,
+    ) -> Result<&[f32], Self::Error> {
+        LlamaCppDecoder::prefill(self, tokens, start_pos, seq_id)?;
+        if tokens.is_empty() {
+            Ok(&[])
+        } else {
+            Ok(self.logits(tokens.len() - 1))
+        }
+    }
+
+    fn step(
+        &mut self,
+        token: crate::Token,
+        pos: usize,
+        seq_id: i32,
+    ) -> Result<&[f32], Self::Error> {
+        let mut batch = Batch::new(1, 0, 1)
+            .expect("step batch allocation failed");
+        let seq_ids = [seq_id];
+        batch
+            .add_token(token, pos, Some(&seq_ids), true)
+            .expect("step add_token failed (should be unreachable)");
+        self.decode(&batch)?;
+        Ok(self.logits(0))
+    }
+
+    fn n_ctx(&self) -> u32 {
+        LlamaCppDecoder::n_ctx(self)
+    }
+
+    fn memory_clear(&mut self) {
+        LlamaCppDecoder::memory_clear(self);
+    }
+
+    fn memory_seq_rm(
+        &mut self,
+        seq_id: i32,
+        p0: i32,
+        p1: i32,
+    ) -> bool {
+        LlamaCppDecoder::memory_seq_rm(self, seq_id, p0, p1)
+    }
+
+    fn memory_seq_cp(&mut self, src: i32, dst: i32, p0: i32, p1: i32) {
+        LlamaCppDecoder::memory_seq_cp(self, src, dst, p0, p1);
+    }
+
+    fn memory_seq_keep(&mut self, seq_id: i32) {
+        LlamaCppDecoder::memory_seq_keep(self, seq_id);
+    }
+
+    fn memory_seq_pos_max(&mut self, seq_id: i32) -> i32 {
+        LlamaCppDecoder::memory_seq_pos_max(self, seq_id)
+    }
+}
+
+/// An `Engine` encompasses everything needed to run inferences. It
+/// bundles a [`LlamaCppDecoder`] (context + KV cache) with a
+/// [`LlamaCppModel`] (weights + tokenizer). It is the main entry point
+/// for running inferences.
+///
+/// The `decoder` field is declared before `model` so that on drop the
+/// context is freed before the model — llama.cpp requires this order.
+#[derive(Debug)]
+pub struct Engine {
+    pub(crate) decoder: LlamaCppDecoder,
+    /// The llama.cpp model. Public so callers (e.g. Session) can
+    /// tokenize, look up special tokens, and render chat templates
+    /// without going through `Engine` forwarding methods.
+    pub model: LlamaCppModel,
+}
 
 impl Engine {
     /// Create a new `Engine` from common command line arguments.
@@ -156,10 +501,14 @@ impl Engine {
         context_params: Option<llama_context_params>,
         numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
+        // Backend lifecycle: the first-ever Engine brings up the
+        // llama.cpp backend + NUMA init. ENGINE_COUNT tracks live
+        // Engines; the last one dropped tears the backend down. Model
+        // load and context creation both require the backend to be
+        // initialized, so we do that up front.
         {
             let mut count = ENGINE_COUNT.lock().unwrap();
             *count += 1;
-
             if *count == 1 {
                 unsafe {
                     llama_backend_init();
@@ -177,20 +526,33 @@ impl Engine {
             }
         }
 
-        let mut model = match LlamaCppModel::from_file(path.clone(), model_params) {
-            Some(model) => model,
-            None => return Err(NewError::Model { path }),
-        };
+        let mut model =
+            match LlamaCppModel::from_file(path.clone(), model_params) {
+                Some(model) => model,
+                None => {
+                    // Roll back the count we reserved above.
+                    let mut count = ENGINE_COUNT.lock().unwrap();
+                    *count -= 1;
+                    if *count == 0 {
+                        unsafe { llama_backend_free() };
+                    }
+                    return Err(NewError::Model { path });
+                }
+            };
         let context_params =
             context_params.unwrap_or(unsafe { llama_context_default_params() });
-        let context = unsafe {
-            llama_new_context_with_model(model.as_ptr_mut(), context_params)
+        let decoder = match LlamaCppDecoder::new(&mut model, context_params) {
+            Ok(d) => d,
+            Err(e) => {
+                let mut count = ENGINE_COUNT.lock().unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    unsafe { llama_backend_free() };
+                }
+                return Err(e);
+            }
         };
-        if context.is_null() {
-            return Err(NewError::Context);
-        }
-
-        Ok(Self { context, model })
+        Ok(Self { decoder, model })
     }
 
     /// Create a new engine from a model `path`. Default model and context
@@ -275,45 +637,32 @@ impl Engine {
         unsafe { llama_supports_gpu_offload() }
     }
 
-    /// Get a raw pointer to the underlying llama.cpp context.
+    /// Raw pointer to the underlying llama.cpp context (const).
     pub fn context_ptr(&self) -> *const llama_context {
-        // Safety:
-        // The same as for `model`.
-        self.context
+        self.decoder.context_ptr()
     }
 
-    /// Get a raw pointer to the underlying llama.cpp context.
+    /// Raw pointer to the underlying llama.cpp context (mut).
     pub fn context_ptr_mut(&self) -> *mut llama_context {
-        self.context
+        self.decoder.context_ptr_mut()
     }
 
-    // TODO: document, because it's not in llama.cpp
-    // Is it the number of contexts? Is it the number of tokens consumed?
-    // Sampled?
     pub fn n_ctx(&self) -> u32 {
-        unsafe { llama_n_ctx(self.context) }
+        self.decoder.n_ctx()
     }
 
-    // TODO: same as `n_ctx`
     pub fn n_batch(&self) -> u32 {
-        unsafe { llama_n_batch(self.context) }
+        self.decoder.n_batch()
     }
 
     /// Get the size of the global state (logits, embedding, and memory).
     pub fn state_size(&self) -> usize {
-        unsafe { llama_state_get_size(self.context) }
+        self.decoder.state_size()
     }
 
     /// Get the llama.cpp global state (logits, embedding, and memory).
     pub fn get_state(&self) -> Vec<u8> {
-        let len = self.state_size();
-        let mut buf = vec![0u8; len];
-        let copied = unsafe {
-            llama_state_get_data(self.context, buf.as_mut_ptr(), len)
-        };
-        assert_eq!(copied, len);
-
-        buf
+        self.decoder.get_state()
     }
 
     /// Set the llama.cpp global state (logits, embedding, and memory).
@@ -321,22 +670,17 @@ impl Engine {
     /// # Panics
     /// * If the length of `state` is not equal to [`Engine::state_size`].
     pub fn set_state(&mut self, state: &[u8]) {
-        let len = self.state_size();
-        assert_eq!(state.len(), len);
-
-        let copied =
-            unsafe { llama_state_set_data(self.context, state.as_ptr(), len) };
-        assert_eq!(copied, len);
+        self.decoder.set_state(state)
     }
 
     /// Performance information
     pub fn get_timings(&self) -> llama_perf_context_data {
-        unsafe { llama_perf_context(self.context) }
+        self.decoder.get_timings()
     }
 
     /// Reset performance information
     pub fn reset_timings(&mut self) {
-        unsafe { llama_perf_context_reset(self.context) };
+        self.decoder.reset_timings()
     }
 
     /// Set the llama.cpp log callback. Does NOT touch the ggml logger —
@@ -346,12 +690,7 @@ impl Engine {
         callback: ggml_log_callback,
         callback_data: Option<*mut std::ffi::c_void>,
     ) {
-        unsafe {
-            llama_log_set(
-                callback,
-                callback_data.unwrap_or(std::ptr::null_mut()),
-            );
-        }
+        self.decoder.set_log_callback(callback, callback_data)
     }
 
     /// Silence both llama.cpp and ggml log output for the remainder of
@@ -369,8 +708,7 @@ impl Engine {
 
     /// Clear the memory (KV cache).
     pub fn memory_clear(&self) {
-        let mem = unsafe { llama_get_memory(self.context) };
-        unsafe { llama_memory_clear(mem, true) }
+        self.decoder.memory_clear()
     }
 
     /// Removes all tokens from memory that belong to the specified
@@ -384,14 +722,11 @@ impl Engine {
         p0: llama_pos,
         p1: llama_pos,
     ) -> bool {
-        let mem = unsafe { llama_get_memory(self.context) };
-        unsafe { llama_memory_seq_rm(mem, seq_id, p0, p1) }
+        self.decoder.memory_seq_rm(seq_id, p0, p1)
     }
 
     /// Copy all tokens that belong to the specified sequence in memory to
     /// another sequence.
-    /// p0 < 0 : [0,  p1]
-    /// p1 < 0 : [p0, inf)
     pub fn memory_seq_cp(
         &self,
         src: llama_seq_id,
@@ -399,20 +734,16 @@ impl Engine {
         p0: llama_pos,
         p1: llama_pos,
     ) {
-        let mem = unsafe { llama_get_memory(self.context) };
-        unsafe { llama_memory_seq_cp(mem, src, dst, p0, p1) }
+        self.decoder.memory_seq_cp(src, dst, p0, p1)
     }
 
     /// Removes all tokens that do not belong to the specified sequence.
     pub fn memory_seq_keep(&self, seq_id: llama_seq_id) {
-        let mem = unsafe { llama_get_memory(self.context) };
-        unsafe { llama_memory_seq_keep(mem, seq_id) }
+        self.decoder.memory_seq_keep(seq_id)
     }
 
     /// Adds relative position "delta" to all tokens that belong to the
-    /// specified sequence and have positions in [p0, p1)
-    /// p0 < 0 : [0,  p1]
-    /// p1 < 0 : [p0, inf)
+    /// specified sequence and have positions in [p0, p1).
     pub fn memory_seq_add(
         &self,
         seq_id: llama_seq_id,
@@ -420,13 +751,10 @@ impl Engine {
         p1: llama_pos,
         delta: llama_pos,
     ) {
-        let mem = unsafe { llama_get_memory(self.context) };
-        unsafe { llama_memory_seq_add(mem, seq_id, p0, p1, delta) }
+        self.decoder.memory_seq_add(seq_id, p0, p1, delta)
     }
 
-    /// Integer division of the positions by factor of `d > 1`
-    /// p0 < 0 : [0,  p1]
-    /// p1 < 0 : [p0, inf)
+    /// Integer division of the positions by factor of `d > 1`.
     pub fn memory_seq_div(
         &self,
         seq_id: llama_seq_id,
@@ -434,121 +762,54 @@ impl Engine {
         p1: llama_pos,
         d: i32,
     ) {
-        let mem = unsafe { llama_get_memory(self.context) };
-        unsafe { llama_memory_seq_div(mem, seq_id, p0, p1, d) }
+        self.decoder.memory_seq_div(seq_id, p0, p1, d)
     }
 
     /// Returns the largest position present in memory for the specified
     /// sequence.
     pub fn memory_seq_pos_max(&self, seq_id: llama_seq_id) -> llama_pos {
-        let mem = unsafe { llama_get_memory(self.context) };
-        unsafe { llama_memory_seq_pos_max(mem, seq_id) }
+        self.decoder.memory_seq_pos_max(seq_id)
     }
 
     /// Decode
     pub fn decode(&self, batch: &Batch) -> Result<(), DecodeError> {
-        let ret = unsafe { llama_decode(self.context, batch.batch) };
-
-        match ret {
-            0 => Ok(()),
-            1 => Err(DecodeError::NoKvSlot),
-            _ => Err(DecodeError::ErrorCode { code: ret }),
-        }
+        self.decoder.decode(batch)
     }
 
     /// Decode `tokens` into the KV cache at positions
     /// `[start_pos, start_pos + tokens.len())` for `seq_id`.
-    ///
-    /// This is a resumable prefill primitive: it does **not** clear the KV
-    /// cache. The caller owns the KV state and must guarantee those
-    /// positions are free for `seq_id` (typically by having just
-    /// established a common prefix of length `start_pos`, or by calling
-    /// [`Engine::memory_seq_rm`] / [`Engine::memory_clear`] first).
-    ///
-    /// Only the final token has logits enabled — this matches the
-    /// bulk-prefill done by `predict_*` before sampling starts, so the
-    /// next sampling step can read logits from index `tokens.len() - 1`.
-    ///
-    /// Returns `Ok(())` on success or the same errors as
-    /// [`Engine::decode`]. An empty `tokens` slice is a no-op.
     pub fn prefill(
         &self,
         tokens: &[llama_token],
         start_pos: usize,
         seq_id: llama_seq_id,
     ) -> Result<(), DecodeError> {
-        if tokens.is_empty() {
-            return Ok(());
-        }
-
-        let mut batch = Batch::new(tokens.len(), 0, 1)
-            .expect("prefill batch allocation failed");
-
-        let seq_ids = [seq_id];
-        let last = tokens.len() - 1;
-        for (i, &token) in tokens.iter().enumerate() {
-            batch
-                .add_token(token, start_pos + i, Some(&seq_ids), i == last)
-                .expect("prefill add_token failed (should be unreachable)");
-        }
-
-        self.decode(&batch)
+        self.decoder.prefill(tokens, start_pos, seq_id)
     }
 
     /// Set the number of threads used for generation and batch processing.
     pub fn set_n_threads(&mut self, n_gen: i32, n_batch: i32) {
-        unsafe { llama_set_n_threads(self.context, n_gen, n_batch) }
+        self.decoder.set_n_threads(n_gen, n_batch)
     }
 
     /// Get logits for the i'th token.
-    ///
-    /// # Panics
-    /// - If the index is invalid. This comes from the c++ side.
-    /// - If the index exceedes i32::MAX. This is a limitation of the c++ API.
-    // TODO: This is a terrible API. The tokens are kept separate from the
-    // logits. So you have to keep track of the index in the batch and if you
-    // make a mistake, you'll get a panic. We may be able to make this better by
-    // accepting the batch as an argument as well as index.
     pub fn logits(&self, i: usize) -> &[f32] {
-        let len = self.model.n_vocab() as usize;
-        let ptr = unsafe {
-            llama_get_logits_ith(self.context, i.try_into().unwrap())
-        };
-
-        unsafe { std::slice::from_raw_parts(ptr, len) }
+        self.decoder.logits(i)
     }
 
-    /// Get logits for the i'th token.
-    ///
-    /// # Panics
-    /// - If the index is invalid. This comes from the c++ side.
+    /// Get mutable logits for the i'th token.
     pub fn logits_mut(&mut self, i: i32) -> &mut [f32] {
-        let len = self.model.n_vocab() as usize;
-        let ptr = unsafe { llama_get_logits_ith(self.context, i) };
-
-        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+        self.decoder.logits_mut(i)
     }
 
     /// Get embeddings for the i'th sequence.
-    ///
-    /// # Panics
-    /// - If the index is invalid. This comes from the c++ side.
     pub fn embeddings(&self, i: i32) -> &[f32] {
-        let len = self.model.embedding_size() as usize;
-        let ptr = unsafe { llama_get_embeddings_ith(self.context, i) };
-
-        unsafe { std::slice::from_raw_parts(ptr, len) }
+        self.decoder.embeddings(i)
     }
 
-    /// Get embeddings for the i'th sequence.
-    ///
-    /// # Panics
-    /// - If the index is invalid. This comes from the c++ side.
+    /// Get mutable embeddings for the i'th sequence.
     pub fn embeddings_mut(&mut self, i: i32) -> &mut [f32] {
-        let len = self.model.embedding_size() as usize;
-        let ptr = unsafe { llama_get_embeddings_ith(self.context, i) };
-
-        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+        self.decoder.embeddings_mut(i)
     }
 
     /// Return an iterator that yields candidates for the next token in a
@@ -568,10 +829,6 @@ impl Engine {
         tokens: Vec<llama_token>,
         n: NonZeroUsize,
     ) -> CandidatePredictor<'a> {
-        // TODO: We technically do not need to clear the cache here. If we keep
-        // track of sequence ids, we can clear the cache when the sequence id
-        // is no longer in use. This would be more efficient, but requires more
-        // bookkeeping.
         self.memory_clear();
         CandidatePredictor::new(self, tokens, n)
     }
@@ -579,11 +836,6 @@ impl Engine {
     /// Return an iterator that predicts a sequence of tokens until `options.n`
     /// tokens have been predicted, the end of context is reached, or stop
     /// conditions are met.
-    ///
-    /// # Note
-    /// * The tokens given will be available as the `tokens` field of the
-    ///   iterator. For convenience, when finished, the [`TokenPredictor`] can
-    ///   be converted back `into` the tokens, including any predicted.
     pub fn predict_tokens<'a>(
         &'a mut self,
         tokens: Vec<llama_token>,
@@ -596,18 +848,6 @@ impl Engine {
     /// Return an iterator that predicts a sequence of pieces until `options.n`
     /// tokens have been predicted, the end of context is reached, or stop
     /// conditions are met.
-    ///
-    /// # Note
-    /// * The last piece is not truncated, however the `text` field of the
-    ///   predictor will be truncated to a stop string if one is provided and
-    ///   found at the end of the text. In this case it may be desirable to use
-    ///   a `while let` loop rather than a `for` loop since a for loop will
-    ///   consume the iterator.
-    /// * The tokens given will be available as the `tokens` field of the
-    ///   iterator. For convenience, when finished, the [`PiecePredictor`] can
-    ///   be converted back `into` the tokens, including any predicted. It can
-    ///   also be converted into the predicted text. See the [`PiecePredictor`]
-    ///   for additional conversion and collection methods.
     pub fn predict_pieces<'a>(
         &'a mut self,
         tokens: Vec<llama_token>,
@@ -617,13 +857,7 @@ impl Engine {
         PiecePredictor::new(self, tokens, options)
     }
 
-    /// Return an iterator that predicts both token sand peices until `
-    /// tokens have been predicted, the end of context is reached, or stop
-    /// conditions are met.
-    ///
-    /// # Note
-    /// * The tokens and generated text are available from the
-    ///   [`Predictor::into_tokens_and_text`] method.
+    /// Return an iterator that predicts both tokens and pieces.
     pub fn predict<'a>(
         &'a mut self,
         tokens: Vec<llama_token>,
@@ -635,15 +869,6 @@ impl Engine {
 
     /// Resume candidate prediction from a KV cache the caller has
     /// already populated for positions `[0, start_pos)` on `seq_id`.
-    ///
-    /// `tokens` is the **suffix**: it's decoded into the KV at
-    /// `[start_pos, start_pos + tokens.len())` via [`Engine::prefill`],
-    /// then candidate yielding begins from the last prefilled position.
-    /// The KV cache is **not** cleared; the caller owns prefix
-    /// placement.
-    ///
-    /// # Panics
-    /// * If `tokens` is empty — there's nothing to resume from.
     pub fn predict_candidates_resuming<'a>(
         &'a mut self,
         tokens: Vec<llama_token>,
@@ -664,12 +889,6 @@ impl Engine {
 
     /// Resume token prediction from a KV cache the caller has already
     /// populated for positions `[0, start_pos)` on `seq_id`.
-    ///
-    /// See [`Engine::predict_candidates_resuming`] for KV-state
-    /// semantics.
-    ///
-    /// # Panics
-    /// * If `tokens` is empty — there's nothing to resume from.
     pub fn predict_tokens_resuming<'a>(
         &'a mut self,
         tokens: Vec<llama_token>,
@@ -690,19 +909,6 @@ impl Engine {
 
     /// Resume piece prediction from a KV cache the caller has already
     /// populated for positions `[0, start_pos)` on `seq_id`.
-    ///
-    /// `tokens` is the **suffix**: it's decoded into the KV at
-    /// `[start_pos, start_pos + tokens.len())` via [`Engine::prefill`],
-    /// then piece yielding begins from the last prefilled position. The
-    /// KV cache is **not** cleared; the caller owns prefix placement.
-    ///
-    /// With greedy sampling, the emitted stream equals
-    /// [`Engine::predict_pieces`]'s output on the concatenation of the
-    /// already-decoded prefix and `tokens` (see the
-    /// `test_predict_pieces_resuming_matches` integration test).
-    ///
-    /// # Panics
-    /// * If `tokens` is empty — there's nothing to resume from.
     pub fn predict_pieces_resuming<'a>(
         &'a mut self,
         tokens: Vec<llama_token>,
@@ -724,84 +930,17 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        unsafe {
-            llama_free(self.context);
-        }
-
+        // Free the llama.cpp context before the model is dropped
+        // (model's own Drop calls llama_model_free). Fields declared
+        // in order `decoder, model` so the raw pointer in decoder is
+        // still valid here — we're running before the decoder's field
+        // drops.
+        unsafe { llama_free(self.decoder.context) };
         let mut count = ENGINE_COUNT.lock().unwrap();
         *count -= 1;
         if *count == 0 {
             unsafe { llama_backend_free() };
         }
-    }
-}
-
-// Transitional pass-through impl of the backend-agnostic `Decoder`
-// trait. Forwards to existing `Engine` inherent methods. Commit 4
-// will extract a dedicated `LlamaCppDecoder` struct and move this
-// impl there; until then, having the impl on the current (unsplit)
-// Engine lets the trait signatures be exercised without structural
-// surgery.
-impl crate::backend::Decoder for Engine {
-    type Error = DecodeError;
-
-    fn prefill(
-        &mut self,
-        tokens: &[crate::Token],
-        start_pos: usize,
-        seq_id: i32,
-    ) -> Result<&[f32], Self::Error> {
-        Engine::prefill(self, tokens, start_pos, seq_id)?;
-        if tokens.is_empty() {
-            Ok(&[])
-        } else {
-            Ok(self.logits(tokens.len() - 1))
-        }
-    }
-
-    fn step(
-        &mut self,
-        token: crate::Token,
-        pos: usize,
-        seq_id: i32,
-    ) -> Result<&[f32], Self::Error> {
-        let mut batch = Batch::new(1, 0, 1)
-            .expect("step batch allocation failed");
-        let seq_ids = [seq_id];
-        batch
-            .add_token(token, pos, Some(&seq_ids), true)
-            .expect("step add_token failed (should be unreachable)");
-        self.decode(&batch)?;
-        Ok(self.logits(0))
-    }
-
-    fn n_ctx(&self) -> u32 {
-        Engine::n_ctx(self)
-    }
-
-    fn memory_clear(&mut self) {
-        Engine::memory_clear(self);
-    }
-
-    fn memory_seq_rm(
-        &mut self,
-        seq_id: i32,
-        p0: i32,
-        p1: i32,
-    ) -> bool {
-        Engine::memory_seq_rm(self, seq_id, p0, p1)
-    }
-
-    fn memory_seq_cp(&mut self, src: i32, dst: i32, p0: i32, p1: i32) {
-        Engine::memory_seq_cp(self, src, dst, p0, p1);
-    }
-
-    fn memory_seq_keep(&mut self, seq_id: i32) {
-        Engine::memory_seq_keep(self, seq_id);
-    }
-
-    fn memory_seq_pos_max(&mut self, seq_id: i32) -> i32 {
-        Engine::memory_seq_pos_max(self, seq_id)
     }
 }
 
