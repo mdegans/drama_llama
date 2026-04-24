@@ -8,12 +8,11 @@ use std::{
 use partial_sort::PartialSort;
 
 use crate::{
+    backend::Model,
     ngram::NGramStats,
     sample::{choose_candidate, SampleError},
     Probability, RepetitionOptions, SampleOptions, Token, TokenData,
 };
-#[cfg(feature = "llama-cpp")]
-use crate::LlamaCppModel;
 
 #[cfg(feature = "llama-cpp")]
 use std::ops::Deref;
@@ -1233,15 +1232,14 @@ impl Candidates {
     }
 
     /// Sample a token from the candidates using [`SampleOptions`].
-    #[cfg(feature = "llama-cpp")]
-    pub fn sample_token(
+    pub fn sample_token<M: Model + Sync>(
         self,
         tokens: &[Token],
         opts: &mut SampleOptions,
         freq_map: &mut NGramStats,
         rng: &mut xorshift::Xoroshiro128,
         mu: &mut Option<f32>,
-        model: &LlamaCppModel,
+        model: &M,
     ) -> Result<Token, SampleError> {
         crate::sample::sample_token(
             tokens, self, opts, freq_map, rng, mu, model,
@@ -1259,13 +1257,12 @@ impl Candidates {
     /// * This method may change the logits of the candidates.
     ///
     /// [`llama_sample_repetition_penalties`]: llama_cpp_sys_3::llama_sample_repetition_penalties
-    #[cfg(feature = "llama-cpp")]
-    pub fn penalize_repetition(
+    pub fn penalize_repetition<M: Model>(
         self,
         tokens: &[Token],
         opts: &mut RepetitionOptions,
         freq_map: &mut NGramStats,
-        model: &LlamaCppModel,
+        model: &M,
     ) -> Result<Candidates, crate::sample::RepetitionError> {
         crate::sample::apply_sample_repetition_ngram(
             self, tokens, opts, freq_map, model,

@@ -21,9 +21,7 @@
 //!
 //! [`SamplingMode::Json`]: crate::SamplingMode::Json
 
-use crate::{Candidates, Token, TokenData};
-#[cfg(feature = "llama-cpp")]
-use crate::{llama_cpp::model::token_to_piece_ref, LlamaCppModel};
+use crate::{backend::Model, Candidates, Token, TokenData};
 
 /// Pushdown-automaton state for JSON parsing at the byte level.
 ///
@@ -518,18 +516,17 @@ static_assertions::assert_impl_all!(JsonState: Send, Sync);
 ///   can extend it. The state is preserved for debugging; the caller can
 ///   inspect the stack depth via [`JsonState::stack_depth`]. Generation
 ///   still terminates via EOS.
-#[cfg(feature = "llama-cpp")]
-pub(crate) fn json_filter(
+pub(crate) fn json_filter<M: Model>(
     candidates: Candidates,
     state: &mut JsonState,
-    model: &LlamaCppModel,
+    model: &M,
 ) -> Candidates {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
     let mut kept: Vec<TokenData> =
         Vec::with_capacity(candidates.len().get());
     for cand in candidates.as_slice() {
         buf.clear();
-        token_to_piece_ref(cand.id, model, &mut buf);
+        model.token_to_piece_ref(cand.id, &mut buf);
         if state.accepts_bytes(&buf) {
             kept.push(*cand);
         }
@@ -565,11 +562,10 @@ pub(crate) fn json_filter(
 /// the [`SamplingMode::Json`] contract. Rebuild the mode and retry.
 ///
 /// [`SamplingMode::Json`]: crate::SamplingMode::Json
-#[cfg(feature = "llama-cpp")]
-pub(crate) fn advance_all(
+pub(crate) fn advance_all<M: Model>(
     modes: &[crate::SamplingMode],
     token: Token,
-    model: &LlamaCppModel,
+    model: &M,
 ) {
     use crate::SamplingMode;
     let mut buf: Vec<u8> = Vec::new();
@@ -577,7 +573,7 @@ pub(crate) fn advance_all(
     for mode in modes {
         if let SamplingMode::Json(state) = mode {
             if !computed {
-                token_to_piece_ref(token, model, &mut buf);
+                model.token_to_piece_ref(token, &mut buf);
                 computed = true;
             }
             let mut locked = state.lock().expect(

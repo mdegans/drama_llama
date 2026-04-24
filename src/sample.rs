@@ -14,9 +14,9 @@ pub use grammar::{
     Grammar, GrammarError, GrammarState, GrammarStats,
 };
 pub use json::{JsonError, JsonState};
-pub use repetition::{RepetitionError, RepetitionOptions};
-#[cfg(feature = "llama-cpp")]
-pub use repetition::apply_sample_repetition_ngram;
+pub use repetition::{
+    apply_sample_repetition_ngram, RepetitionError, RepetitionOptions,
+};
 
 /// Serialize a `SamplingMode::Json` parser state.
 ///
@@ -1057,15 +1057,14 @@ pub enum SampleError {
 static_assertions::assert_impl_all!(SampleError: Send, Sync);
 
 /// Sample a token from the candidates.
-#[cfg(feature = "llama-cpp")]
-pub(crate) fn sample_token(
+pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     tokens: &[Token],
     mut candidates: Candidates,
     opts: &mut SampleOptions,
     freq_map: &mut NGramStats,
     rng: &mut xorshift::Xoroshiro128,
     mu: &mut Option<f32>,
-    model: &crate::LlamaCppModel,
+    model: &M,
 ) -> Result<Token, SampleError> {
     // Apply any repetition penalties to the candidates. This also applies the
     // softmax and sorts the candidates by logit where the most likely token is

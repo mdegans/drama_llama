@@ -44,9 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use crate::Candidates;
-#[cfg(feature = "llama-cpp")]
-use crate::{llama_cpp::model::token_to_piece_ref, LlamaCppModel};
+use crate::{backend::Model, Candidates};
 
 /// Inline-capacity of a single stack in the NFA simulation. Most grammars
 /// keep call stacks under 4 deep; 8 covers nested alternation / repetition
@@ -1702,18 +1700,18 @@ fn record_stats(
 ///   generation starts fresh.
 /// * **Grammar violation**: no candidate token extends the match. State is
 ///   preserved for inspection via [`GrammarState::stack_depth`].
-#[cfg(feature = "llama-cpp")]
-pub(crate) fn grammar_filter(
+pub(crate) fn grammar_filter<M: Model + Sync>(
     candidates: Candidates,
     state: &mut GrammarState,
-    model: &LlamaCppModel,
+    model: &M,
 ) -> Candidates {
     // Each candidate check is independent: clone the matcher state,
     // try to advance it by the token's bytes, keep the token iff the
     // clone survives. Fan out across rayon's global pool so 150k-vocab
     // models don't bottleneck on a single core. `GrammarState` is
-    // auto-Sync (pure data behind an Arc), `LlamaCppModel` is Sync by manual
-    // impl (post-load data is immutable — see src/model.rs).
+    // auto-Sync (pure data behind an Arc); the `M: Sync` bound on this
+    // function ensures the model can be borrowed across the parallel
+    // fold.
     //
     // The first-byte bitmap is a cheap O(1)/candidate prefilter that
     // rejects candidates whose first byte can't extend the match. See
@@ -1754,7 +1752,7 @@ pub(crate) fn grammar_filter(
         .par_iter()
         .fold(Acc::default, |mut a, cand| {
             let mut buf: Vec<u8> = Vec::with_capacity(32);
-            token_to_piece_ref(cand.id, model, &mut buf);
+            model.token_to_piece_ref(cand.id, &mut buf);
             if let Some(&first) = buf.first() {
                 if bitmap[(first as usize) >> 6] & (1u64 << (first & 63)) == 0
                 {
@@ -1827,11 +1825,10 @@ pub(crate) fn grammar_filter(
 /// Panics if any grammar mutex is poisoned. A poisoned mutex means a
 /// previous panic left the matcher in an undefined state, and silently
 /// continuing would produce output that violates the grammar.
-#[cfg(feature = "llama-cpp")]
-pub(crate) fn advance_all(
+pub(crate) fn advance_all<M: Model>(
     modes: &[crate::SamplingMode],
     token: Token,
-    model: &LlamaCppModel,
+    model: &M,
 ) {
     use crate::SamplingMode;
     let mut buf: Vec<u8> = Vec::new();
@@ -1839,7 +1836,7 @@ pub(crate) fn advance_all(
     for mode in modes {
         if let SamplingMode::Grammar(state) = mode {
             if !computed {
-                token_to_piece_ref(token, model, &mut buf);
+                model.token_to_piece_ref(token, &mut buf);
                 computed = true;
             }
             let mut locked = state.lock().expect(

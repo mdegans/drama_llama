@@ -209,24 +209,22 @@ impl RepetitionOptions {
 
     /// Ignore [`IgnoreCategory`]s. These are commonly used tokens that are
     /// often ignored in text generation.
-    #[cfg(feature = "llama-cpp")]
-    pub fn ignore_categories(
+    pub fn ignore_categories<M: crate::backend::Model>(
         mut self,
         ignore_categories: IgnoreCategory,
-        model: &crate::LlamaCppModel,
+        model: &M,
     ) -> Self {
         self.extend_ignored(ignore_categories.into_tokens(model));
         self
     }
 
     /// Use [`RepetitionOptions::ignore_categories`] instead.
-    #[cfg(feature = "llama-cpp")]
     #[allow(deprecated)]
     #[deprecated(since = "0.7.0", note = "renamed to `ignore_categories`")]
-    pub fn ignore_stopwords(
+    pub fn ignore_stopwords<M: crate::backend::Model>(
         self,
         stopwords: StopWords,
-        model: &crate::LlamaCppModel,
+        model: &M,
     ) -> Self {
         self.ignore_categories(stopwords, model)
     }
@@ -508,13 +506,12 @@ fn surgical_target(
 /// Originally inspired by `llama.cpp`'s repetition penalties, extended with
 /// n-gram support. Rewritten by Claude (Anthropic) to fix a design issue where
 /// penalties were only applied to the trailing token.
-#[cfg(feature = "llama-cpp")]
-pub fn apply_sample_repetition_ngram(
+pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
     candidates: Candidates,
     tokens: &[Token],
     opts: &mut RepetitionOptions,
     freq_map: &mut NGramStats,
-    model: &crate::LlamaCppModel,
+    model: &M,
 ) -> Result<Candidates, RepetitionError> {
     let k = candidates.len();
     let n_vocab = k.get();
