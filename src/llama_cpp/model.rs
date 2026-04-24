@@ -37,7 +37,7 @@ fn token_to_piece(token: llama_token, model: &LlamaCppModel) -> String {
 }
 
 /// Same as `token_to_piece`, but allows reusable buffers.
-pub(crate) fn token_to_piece_ref(
+fn token_to_piece_ref(
     token: llama_token,
     model: &LlamaCppModel,
     buf: &mut Vec<u8>,
@@ -723,6 +723,10 @@ impl crate::backend::Model for LlamaCppModel {
 
     fn token_to_piece(&self, token: crate::Token) -> String {
         LlamaCppModel::token_to_piece(self, token)
+    }
+
+    fn token_to_piece_ref(&self, token: crate::Token, buf: &mut Vec<u8>) {
+        token_to_piece_ref(token, self, buf)
     }
 
     fn context_size(&self) -> i32 {

@@ -147,6 +147,15 @@ pub trait Model {
     /// Convert a single token to its UTF-8 piece (may be empty).
     fn token_to_piece(&self, token: Token) -> String;
 
+    /// Write the raw bytes for `token`'s piece into `buf`, resizing
+    /// `buf` to exactly the piece length. Hot-path variant of
+    /// [`Model::token_to_piece`] used by grammar / JSON filters:
+    /// avoids the UTF-8 validation round-trip through `String` and
+    /// lets the caller reuse a single byte buffer across a whole
+    /// candidate sweep. Bytes are not required to be valid UTF-8 on
+    /// their own (multi-byte characters can split across pieces).
+    fn token_to_piece_ref(&self, token: Token, buf: &mut Vec<u8>);
+
     /// Context length the model was trained with.
     fn context_size(&self) -> i32;
 
