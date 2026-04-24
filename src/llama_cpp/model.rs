@@ -746,55 +746,51 @@ mod tests {
 
     use super::*;
 
+    /// Smoke-test of model loading + introspection. Uses whatever
+    /// `models/model.gguf` points to; assertions are model-agnostic so
+    /// swapping the symlink (Llama → Qwen → Cogito) doesn't break the
+    /// test. Specific architectures used to have hard-coded vocab /
+    /// embedding / bos values — those belong in a model-specific
+    /// fixture test, not here.
     #[test]
     fn test_model() {
         use std::path::PathBuf;
 
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        // This should be a properly converted llama 3 model or this test will
-        // fail.
         path.push("models/model.gguf");
 
         let model = LlamaCppModel::from_file(path, None).unwrap();
 
-        // These assertions are for Llama 3.1 8B Instruct
-        assert_eq!(model.bos(), 128000);
-        assert_eq!(model.eos(), 128009); // eot_id for instruct models
-        assert_eq!(model.next_line(), 198);
+        // Architecture-agnostic invariants every loaded model must
+        // satisfy. BPE vocab is the common case (Llama, Qwen, Cogito,
+        // Mistral all use it); if a future test model is WordPiece /
+        // SPM this assertion will need widening.
         assert_eq!(model.vocab_type(), llama_vocab_type_LLAMA_VOCAB_TYPE_BPE);
-        assert_eq!(model.n_vocab(), 128256);
-        assert_eq!(model.context_size(), 131072);
-        assert_eq!(model.embedding_size(), 4096);
-        assert_eq!(model.rope_type(), 0);
+        assert!(model.n_vocab() > 0);
+        assert!(model.context_size() > 0);
+        assert!(model.embedding_size() > 0);
         assert_eq!(model.rope_freq_scale(), 1.0);
-        let desc = model.desc().to_lowercase();
-        assert!(desc.starts_with("llama"));
+        assert!(!model.desc().is_empty());
         assert!(model.meta_count() > 0);
-        // Chat template should exist
         assert!(model.get_meta("tokenizer.chat_template").is_some());
-        // The model size will be different on different systems, but the range
-        // should be reasonable. Not zero and not over 200GB.
         assert!(model.size() > 8192 && model.size() < 200_000_000_000);
         assert!(
             model.n_params() > 1_000_000_000
-                && model.n_params() < 80_000_000_000
+                && model.n_params() < 1_000_000_000_000
         );
 
-        // let meta = model.meta();
-        // assert_eq!(meta.len(), 16);
-
-        // test tokenization (roundtrip)
+        // Tokenization round-trip.
         const EXPECTED: &str = "Hello, world!";
         let tokens = model.tokenize(EXPECTED, false);
         assert!(!tokens.is_empty());
-        // The model adds BOS, so the string will contain the BOS piece.
         let text = model.tokens_to_string(tokens);
         assert!(text.ends_with(EXPECTED));
 
-        // test get token text (roundtrip via tokenize → token_to_text)
+        // Per-token text roundtrip: at least one tokenization of
+        // "Hello" must decode to a string containing "Hello" or
+        // "hello" (sub-word splits are fine).
         let hello_tokens = model.tokenize("Hello", false);
         assert!(!hello_tokens.is_empty());
-        // First token may be BOS, so check that at least one token contains "Hello"
         let any_hello = hello_tokens.iter().any(|&t| {
             let text = model.token_to_text(t);
             text.contains("Hello") || text.contains("hello")
@@ -804,7 +800,8 @@ mod tests {
             "No token in the tokenized 'Hello' contains the expected text"
         );
 
-        // test template application via Jinja
+        // Jinja chat-template render. Every chat-tuned model must be
+        // able to echo the user/assistant turns we feed it.
         let prompt = Prompt::default()
             .set_system("A conversation between a user and an assistant.")
             .add_message((crate::Role::User, "Hello, world!"))
@@ -824,8 +821,6 @@ mod tests {
     #[test]
     fn test_metadata() {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        // This should be a properly converted llama 3 model or this test will
-        // fail.
         path.push("models/model.gguf");
 
         let model = LlamaCppModel::from_file(path, None).unwrap();
@@ -839,13 +834,11 @@ mod tests {
     #[test]
     fn test_model_desc() {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        // This should be a properly converted llama 3 model or this test will
-        // fail.
         path.push("models/model.gguf");
 
         let model = LlamaCppModel::from_file(path, None).unwrap();
         let desc = model.desc();
-        assert!(desc.starts_with("llama"));
+        assert!(!desc.is_empty());
         assert!(!desc.ends_with("\0"));
     }
 
