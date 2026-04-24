@@ -149,6 +149,43 @@ llama.cpp's).
   all shape scalings (all already macro-driven and macros verified
   correct).
 
+- **Manifest tensor shapes for `self_attn` layer 3 (full-attn)
+  cross-check vs macros** (fresh verify):
+  A3B q_proj `[8192, 256]` = `[NUM_ATTN_HEADS(16) × HEAD_DIM(256) × 2,
+  HIDDEN_DIM(2048)/8]` ✓. k/v_proj `[512, 256]` =
+  `[NUM_KV_HEADS(2) × HEAD_DIM(256), HIDDEN_DIM/8]` ✓.
+  o_proj `[2048, 512]` = `[HIDDEN_DIM(2048), NUM_ATTN_HEADS × HEAD_DIM
+  / 8]` ✓. All per-layer attention weight shapes consistent with
+  moeflux's macros.
+
+- **`gated_delta_net_step` kernel**: hardcoded `128` throughout
+  (state_base/k_base/v_base stride) is shared between A3B and A17B
+  because `LINEAR_KEY_DIM = LINEAR_VALUE_DIM = 128` on both. The
+  `k_heads_per_v` constant is properly macro-driven
+  (`LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS`; A3B=2, A17B=4). State
+  and buffer allocations are macro-driven. Dispatch threadgroup
+  count is `LINEAR_NUM_V_HEADS` (A3B=32, A17B=64). **Ruled out.**
+
+- **`gated_rms_norm` kernel**: `value_dim` passed as constant, but
+  threadgroup scratch `partial[128]` is hardcoded to 128 — matches
+  `LINEAR_VALUE_DIM=128` on both variants. No A3B-specific bug.
+
+- **`moe_combine_residual` kernel**: expert-weight binding for
+  `k < K` is correct for A3B (K=8 fits MAX_K=8 exactly).
+  `params[8] = shared_gate_score` is correctly at slot 8, expert
+  weights at [0..7]. **Ruled out for A3B.**
+
+**Unrelated latent issue noticed this session (NOT the A3B bug, but
+worth logging):** `MAX_K=8` is hardcoded in moeflux (`infer.m:911`)
+and `actual_K = min(K, MAX_K) = 8` at `infer.m:5254`. **A17B's
+config specifies `num_experts_per_tok=10` but moeflux silently
+truncates to top-8.** A17B still produces canonical pangram output
+despite the truncation — robust enough that the bug is invisible
+for this prompt. If we ever want A17B to match MLX's logits
+properly, either bump MAX_K to 10 (costs 2× more expert output
+buffers) or document the divergence. For A3B (K=8) this is a
+no-op.
+
   *How we tested:* Added a `MOEFLUX_DIFF_8BIT` env-gated diagnostic
   to `gpu_flush_batch_results` (in `infer.m` after the memcpy loop).
   For each 8-bit spec, compute `cpu_dequant_matvec` against
