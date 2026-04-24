@@ -8,8 +8,6 @@ use crate::{
     sample::SampleOptions,
     Candidates, Engine, NGram, Token,
 };
-#[cfg(feature = "llama-cpp")]
-use crate::LlamaCppModel;
 
 #[cfg(feature = "serde")]
 fn deserialize_regex_vec<'de, D>(
@@ -108,8 +106,7 @@ impl PredictOptions {
     /// models that emit `<|eot_id|>` between turns terminate cleanly.
     /// Repetition penalty ignores these — otherwise a strong penalty can
     /// keep the model from ever closing a turn.
-    #[cfg(feature = "llama-cpp")]
-    pub fn add_model_stops(mut self, model: &LlamaCppModel) -> Self {
+    pub fn add_model_stops<M: Model>(mut self, model: &M) -> Self {
         let eos = model.eos();
         self.stop_sequences.push(vec![eos]);
         if let Some(opts) = &mut self.sample_options.repetition {
@@ -546,14 +543,11 @@ impl<'engine, D: Decoder, M: Model> From<TokenPredictor<'engine, D, M>>
     }
 }
 
-// The sampling loop currently hardcodes `&LlamaCppModel` — sample_token,
-// token_to_piece, max_token_len are methods on the concrete type. A
-// future commit will route these through the `Model` trait so
-// TokenPredictor is fully backend-agnostic. For now, restrict the impl
-// to M = LlamaCppModel so existing sampling code keeps working.
-#[cfg(feature = "llama-cpp")]
-impl<'engine, D: Decoder> Iterator
-    for TokenPredictor<'engine, D, LlamaCppModel>
+// `M: Sync` is required because the grammar filter fans candidate
+// validation out across rayon's pool and borrows the model across
+// threads.
+impl<'engine, D: Decoder, M: Model + Sync> Iterator
+    for TokenPredictor<'engine, D, M>
 {
     type Item = Token;
 
@@ -720,8 +714,7 @@ impl<'engine, D: Decoder, M: Model> PiecePredictor<'engine, D, M> {
     }
 }
 
-#[cfg(feature = "llama-cpp")]
-impl<'engine, D: Decoder> PiecePredictor<'engine, D, LlamaCppModel> {
+impl<'engine, D: Decoder, M: Model + Sync> PiecePredictor<'engine, D, M> {
     /// Predict and collect all the pieces, truncating at stop sequences.
     pub fn collect_text(mut self) -> String {
         while let Some(_) = self.next() {}
@@ -749,9 +742,8 @@ impl<'engine, D: Decoder> PiecePredictor<'engine, D, LlamaCppModel> {
     }
 }
 
-#[cfg(feature = "llama-cpp")]
-impl<'engine, D: Decoder> Iterator
-    for PiecePredictor<'engine, D, LlamaCppModel>
+impl<'engine, D: Decoder, M: Model + Sync> Iterator
+    for PiecePredictor<'engine, D, M>
 {
     type Item = String;
 
@@ -841,8 +833,9 @@ impl<'engine, D: Decoder, M: Model> Predictor<'engine, D, M> {
     }
 }
 
-#[cfg(feature = "llama-cpp")]
-impl<'engine, D: Decoder> Iterator for Predictor<'engine, D, LlamaCppModel> {
+impl<'engine, D: Decoder, M: Model + Sync> Iterator
+    for Predictor<'engine, D, M>
+{
     type Item = Predicted;
 
     fn next(&mut self) -> Option<Predicted> {
