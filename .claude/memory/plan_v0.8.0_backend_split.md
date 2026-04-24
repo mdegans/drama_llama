@@ -142,15 +142,69 @@ Exit criteria:
 Est: 2-4 hours if KV-seq_rm really is ~50 LOC. Plan-mode recommended
 for the tokenizer-routing decision.
 
-### Phase 4 — `FlashMoeDecoder` + `FlashMoeModel` via bindgen
+**Status (2026-04-24): LANDED** at `github.com/mdegans/moeflux`
+(private). Renamed from `flash-moe` → `moeflux`; Opus 4.6 /
+@danveloper / Opus 4.7 / @mdegans credited in CONTRIBUTORS.md.
+MIT license with AI-authored public-domain notice. Tokenizer
+routing decided: Rust-side via HuggingFace `tokenizers` crate in
+Phase 4; tokenizer.h kept in C until then.
+
+Seven commits on the fork:
+1. `moeflux: Fork initial — LICENSE, CONTRIBUTORS, README preamble`
+2. `NOTES: Orientation from 3b.1 reading of infer.m`
+3. `strip: Drop chat.m, linenoise, failed-experiment scripts` (−4068 LOC)
+4. `kv: Add state truncation helpers for KV + linear-attn layers`
+5. `api: Add mf_* extern "C" surface + libmoeflux.a target` (+460 LOC)
+6. `smoke: Add C smoke test + make smoke target`
+7. `state: Add mf_state_{size,save,load} for prefix-cache reuse (Option B)`
+
+C API shape (see `~/Projects/moeflux/metal_infer/moeflux.h`):
+- `mf_init_model`, `mf_free_model`
+- `mf_eval_prompt`, `mf_eval_token` — caller-allocated logit buffers,
+  no internal sampling
+- `mf_memory_clear`, `mf_memory_seq_rm`, `mf_memory_seq_pos_max`
+- `mf_n_vocab`, `mf_n_ctx`, `mf_eos`, `mf_model_name`
+- `mf_state_size`, `mf_state_save`, `mf_state_load` (Option B,
+  closes the "full re-prefill on truncation" gap for drama_llama's
+  prefix cache)
+
+Scout-vs-survey disagreement on chat.m settled: it's an HTTP/SSE
+client, not the reference inference loop. The reference per-token
+flow is `serve_loop()` at `infer.m:5965`. Our `mf_eval_token`
+mirrors its inner loop (embed → 60× fused_layer_forward →
+complete_deferred_experts → cpu_rms_norm → lm_head_forward).
+
+Linear-attention state handling: GPU buffers
+(`g_metal->buf_delta_state[i]` / `buf_conv_state[i]`) are
+authoritative on Metal path. Option B serializes these directly
+via `[contents]` unified-memory access.
+
+**Remaining for public release:**
+- Flip `mdegans/moeflux` to public (blocked on Mike's courtesy
+  note to @danveloper — draft in-progress at session end).
+- Publish `moeflux` crate to crates.io (Phase 4 concern — needs
+  the Rust wrapper first).
+
+**Actually tested:** build only. No smoke run yet — model download
+in progress on Mike's side. Real end-to-end validation is
+Phase 4's opening move.
+
+### Phase 4 — `MoefluxDecoder` + `MoefluxModel` via bindgen
+
+(Was `FlashMoeDecoder` in the original plan — renamed to match the
+`moeflux` fork identity.)
 
 Scope:
-- New crate `flash-moe-sys` (bindgen) sibling to `llama-cpp-sys-3`.
-- `FlashMoeDecoder` + `FlashMoeModel` impls in drama_llama under
-  `cfg(feature = "flash-moe")` + `cfg(target_os = "macos")`.
-- build.rs for Metal + Foundation framework linking.
+- Rust wrapper on top of `libmoeflux.a`. Per design decision in
+  Phase 3 chat: single `moeflux` Rust crate (not a `-sys` split),
+  shipping the C/Metal sources, using `build.rs` + bindgen against
+  `moeflux/metal_infer/moeflux.h`.
+- `MoefluxDecoder` + `MoefluxModel` impls in drama_llama under
+  `cfg(feature = "moeflux")` + `cfg(target_os = "macos")`.
+- Tokenization via HuggingFace `tokenizers` crate on the Rust side;
+  moeflux's C API receives token IDs, never text.
 - Handle flash-moe's model shape constants (fork-and-rebuild
-  initially; parameterize later).
+  initially; parameterize later — Phase 5 for Cogito 600B).
 - Smoke test: load a small MoE, generate a few tokens, compare shape
   of output against llama.cpp backend on the same model.
 
