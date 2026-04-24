@@ -80,9 +80,9 @@ use llama_cpp_sys_3::llama_token;
 use misanthropic::response::Usage;
 
 use crate::{
-    chat_template::tokenize_with_breakpoints, engine::NewError,
-    grammar_for_prompt, output_config, silence_logs, ChatTemplate,
-    ChatTemplateError, LlamaCppEngine, OutputConfigError, OutputConfigOptions,
+    chat_template::tokenize_with_breakpoints, grammar_for_prompt,
+    output_config, silence_logs, ChatTemplate, ChatTemplateError,
+    LlamaCppEngine, NewError, OutputConfigError, OutputConfigOptions,
     PredictOptions, Prompt, RenderOptions, RepetitionOptions, SampleOptions,
     SamplingMode, ToolChoiceError, ToolChoiceOptions,
 };

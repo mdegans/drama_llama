@@ -23,7 +23,7 @@
 
 use llama_cpp_sys_3::llama_token;
 
-use crate::{model::token_to_piece_ref, Candidates, LlamaCppModel, TokenData};
+use crate::{llama_cpp::model::token_to_piece_ref, Candidates, LlamaCppModel, TokenData};
 
 /// Pushdown-automaton state for JSON parsing at the byte level.
 ///

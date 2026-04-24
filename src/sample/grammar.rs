@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use crate::{model::token_to_piece_ref, Candidates, LlamaCppModel};
+use crate::{llama_cpp::model::token_to_piece_ref, Candidates, LlamaCppModel};
 
 /// Inline-capacity of a single stack in the NFA simulation. Most grammars
 /// keep call stacks under 4 deep; 8 covers nested alternation / repetition

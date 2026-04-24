@@ -59,17 +59,17 @@ pub use output_config::{
     OutputConfigOptions,
 };
 
-mod model;
-pub use model::{llama_quantize, LlamaCppModel};
+mod llama_cpp;
+pub use llama_cpp::{
+    llama_quantize, restore_default_logs, silence_logs, DecodeError,
+    FlashAttention, LlamaCppDecoder, LlamaCppEngine, LlamaCppModel, NewError,
+};
 
 mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};
 
 mod engine;
-pub use engine::{
-    restore_default_logs, silence_logs, DecodeError, Engine, FlashAttention,
-    LlamaCppDecoder, LlamaCppEngine, NewError,
-};
+pub use engine::Engine;
 
 mod predictor;
 pub use predictor::{
