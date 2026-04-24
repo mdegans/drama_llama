@@ -114,29 +114,91 @@ llama.cpp's).
   beyond A_log. I diffed all non-quantized tensors; they're BF16
   on both variants with parallel structure.
 
+**Additional rule-outs 2026-04-27 (don't re-test):**
+
+- **Metal 8-bit kernel numerically matches CPU 8-bit reference to
+  ~1e-5 on every one of the 80 8-bit dispatches per token (40 layers
+  × 2 tensors: `mlp.gate` + `shared_expert_gate`).** argmax matches
+  on all 80 dispatches; max_abs_diff stays in [0, 2.4e-5] across all
+  layers. So `dequant_matvec_8bit_v3` is effectively correct
+  (within fp32 ULP noise across ~2048 accumulations). The kernel is
+  not the bug.
+
+- **All A3B shape macros in `model_variant.h` match HF
+  `text_config` bit-for-bit** (fresh verify): `hidden_size=2048`,
+  `num_hidden_layers=40`, `num_attention_heads=16`,
+  `num_key_value_heads=2`, `head_dim=256`, `vocab_size=248320`,
+  `num_experts=256`, `num_experts_per_tok=8`,
+  `moe_intermediate_size=512`, `shared_expert_intermediate_size=512`,
+  `full_attention_interval=4`, `linear_num_value_heads=32`,
+  `linear_num_key_heads=16`, `linear_{key,value}_head_dim=128`,
+  `linear_conv_kernel_dim=4`, `partial_rotary_factor=0.25`,
+  `rms_norm_eps=1e-6`.
+
+- **RoPE params match A17B**: `rope_theta=10000000`,
+  `mrope_interleaved=True`, `mrope_section=[11, 11, 10]`,
+  `partial_rotary_factor=0.25`. Already ruled out last session; this
+  session re-verified.
+
+- **No inference-impacting config deltas A3B vs A17B**:
+  `tie_word_embeddings=False` on both (A3B declares explicitly,
+  A17B defaults). A17B-only `mlp_only_layers=[]` is empty (no
+  effect). A3B-only `output_router_logits` is a training flag.
+  A3B-only `bos_token_id`/`pad_token_id` affect tokenization
+  only, not forward pass. The remaining A3B/A17B differences are
+  all shape scalings (all already macro-driven and macros verified
+  correct).
+
+  *How we tested:* Added a `MOEFLUX_DIFF_8BIT` env-gated diagnostic
+  to `gpu_flush_batch_results` (in `infer.m` after the memcpy loop).
+  For each 8-bit spec, compute `cpu_dequant_matvec` against
+  `[buf_input contents]` and diff vs `s->out_cpu` (the just-flushed
+  Metal result). At flush time, `buf_input` still contains Enc 4's
+  rms_norm output — the exact input Metal's 8-bit dispatch consumed
+  during cmdbuf execution — so the comparison is sound. Reverted
+  after measuring; pattern is simple to re-add if needed.
+
+- **`MOEFLUX_FORCE_CPU_8BIT` env-var approach (make 8-bit specs
+  bypass Metal and compute on CPU in-place) does NOT work as a
+  single-call rewrite.** Inside `gpu_encode_batch_matvec`, at
+  encode time, `buf_input` is stale — the preceding `rms_norm_apply`
+  encode (Enc 4 in the fused-layer flow) hasn't executed yet, so
+  the CPU dequant sees old hidden state. Output looked suspiciously
+  coherent ("The quick brown fox is the slow fox. <EOS>") because
+  stale-input garbage happened to be plausible English, which almost
+  misled me. **Do not reach for this trick again** without
+  breaking the fused cmdbuf: you'd have to commit+wait before each
+  8-bit spec, which defeats the fused-path batching.
+
 **Still not tested** (order of decreasing likelihood):
 
-1. **Does the Metal 8-bit kernel numerically match the CPU 8-bit
-   path?** The numpy cross-check verified the CPU-style dequant
-   matches MLX; the Metal kernel *implements the same math* but
-   isn't independently tested against the same reference. A
-   one-token forced-CPU run would rule this in or out. Needs a
-   small surgical patch to make `gpu_encode_batch_matvec` skip
-   8-bit specs and have `fast_batch_matvec` handle them CPU-only
-   instead.
+1. **Qwen3.6-specific architectural detail we haven't surfaced.**
+   Remaining suspects: gated attention's scale factor, some detail
+   in delta-net's beta gating, shared-expert combine weights.
+   Rather than chase individually, the highest-signal next move is
+   to **numerically compare moeflux's layer-0 output (or attention
+   output) against MLX's layer-0 equivalent** on the same 4 prompt
+   tokens. If they match, attention is correct → bug is in MLP/MoE
+   post-attention. If they differ, localize within attention /
+   linear-attn / RoPE.
 
-2. **Qwen3.6-specific architectural detail we haven't surfaced.**
-   moeflux was built around A17B. A3B is same family but not
-   identical. The debug doc already ruled out shape constants,
-   embedding dequant, attention gate split, mRoPE config, layer-
-   type pattern, and 8-bit dequant. Remaining suspects: gated
-   attention's scale factor, some detail in delta-net's beta
-   gating, shared-expert combine weights.
+2. **Top-K + softmax post-gate logic.** Gate logits are correct
+   (we just ruled that out). But top-K selection (K=8 of 256) and
+   any per-expert scaling (softmax across top-K, renorm) is
+   A3B-same-as-A17B code. Worth a printf at layer 0: which 8
+   expert indices + weights does moeflux pick? MLX should pick the
+   same set to ~argmax precision.
 
-3. **Bug #4 from the debug doc** — the `gpu_linear_sentinel`
-   fallback read. Non-fused path, shouldn't be hit on normal A3B
-   runs. Worth confirming the fused path is actually the one
-   being used (easy printf at layer 0).
+3. **Bug #4 from the debug doc** — `gpu_linear_sentinel` fallback.
+   Should not be hit on fused-path A3B runs. A one-line `fprintf`
+   at the non-fused else branch at layer 0 would confirm.
+
+4. **Re-examine `model_variant.h` A3B macros one more time with
+   fresh eyes** — there's still some chance an off-by-2 or half-
+   size constant slipped past. Specifically, anything involving
+   `NUM_ATTN_HEADS`, `HEAD_DIM`, `LINEAR_NUM_V_HEADS`, or
+   `LINEAR_VALUE_DIM` that flows into attention math is worth a
+   paranoid cross-check against HF `text_config`.
 
 ## moeflux repo state
 
