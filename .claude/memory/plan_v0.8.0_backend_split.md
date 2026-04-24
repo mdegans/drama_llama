@@ -78,6 +78,18 @@ Exit criteria:
 
 Est: 1 focused day. Mostly mechanical after trait shapes are nailed.
 
+**Status (2026-04-24): LANDED.** Commits `a164c30` through `2fde122`
+on `v0.8.0`:
+- Token + TokenData (`backend.rs`)
+- Decoder + Model traits
+- LlamaCppDecoder extracted from Engine; LlamaCppModel renamed
+- Engine<D, M> generic; threaded through Predictor + Session
+- Files moved to `src/llama_cpp/{mod,decoder,engine,model}.rs`
+- `llama-cpp-sys-3` optional; `llama-cpp` feature forwards to dep;
+  `cli`/`webchat`/`axum` transitively imply it
+- `--no-default-features` drops the C dep and compiles the trait
+  layer (verified via `cargo tree`)
+
 ### Phase 2 — Regression harness
 
 Scope:
@@ -96,6 +108,15 @@ Exit criteria:
 
 Est: half a day. Informal markdown-driven; probably no Plan-mode
 needed unless scope grows.
+
+**Status (2026-04-24): LANDED** (commit `07c160f`). `tests/regression.rs`
+captures 4-token prompt + 32 greedy steps + top-20 logits at step 0 and
+step N on `LlamaCppEngine`. Golden at
+`tests/fixtures/regression/llama_cpp_baseline.json` (Qwen2 151665-vocab
+131072-ctx model, 4319 bytes). Compare with exact token match + 1e-2
+absolute tolerance on logits. Regenerate with
+`DRAMA_LLAMA_UPDATE_GOLDEN=1`. Two `todo!()` candidate tests
+(`test_apply_entropy`, `test_sample_tail_free`) also filled in.
 
 ### Phase 3 — flash-moe fork + C API
 
