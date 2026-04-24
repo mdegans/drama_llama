@@ -194,19 +194,86 @@ Phase 4's opening move.
 (Was `FlashMoeDecoder` in the original plan — renamed to match the
 `moeflux` fork identity.)
 
+**Hard constraint — run C smoke before any Rust work.** The
+`~/Projects/moeflux/tests/smoke.c` end-to-end run against the real
+Qwen3.5-A17B-4bit model must pass before any Cargo scaffolding
+lands. We shipped ~1000 LOC of C wrappers (mf_init_model, the
+per-token orchestration, state save/restore) without runtime
+verification; first-run bugs are expected. Fix them at the C
+level before investing in a Rust wrapper on an unvalidated
+foundation. Smoke running, not byte-for-byte correctness, is the
+gate.
+
 Scope:
-- Rust wrapper on top of `libmoeflux.a`. Per design decision in
-  Phase 3 chat: single `moeflux` Rust crate (not a `-sys` split),
-  shipping the C/Metal sources, using `build.rs` + bindgen against
-  `moeflux/metal_infer/moeflux.h`.
-- `MoefluxDecoder` + `MoefluxModel` impls in drama_llama under
-  `cfg(feature = "moeflux")` + `cfg(target_os = "macos")`.
-- Tokenization via HuggingFace `tokenizers` crate on the Rust side;
-  moeflux's C API receives token IDs, never text.
-- Handle flash-moe's model shape constants (fork-and-rebuild
-  initially; parameterize later — Phase 5 for Cogito 600B).
-- Smoke test: load a small MoE, generate a few tokens, compare shape
-  of output against llama.cpp backend on the same model.
+- **Workspace layout inside the existing `moeflux` repo:**
+  ```
+  moeflux/
+  ├── Cargo.toml         ← [workspace] members
+  ├── metal_infer/       ← C/Metal sources (unchanged)
+  ├── tests/             ← C smoke test (unchanged)
+  └── crates/
+      ├── moeflux-sys/   ← thin bindgen wrapper, raw FFI
+      └── moeflux/       ← Rust-ergonomic wrapper, published name
+  ```
+  Both crates publish to crates.io. drama_llama depends on
+  `moeflux` (not `-sys`). This follows the standard -sys
+  convention so downstream consumers who want raw FFI can drop
+  down without rewriting our safe layer. Also defensively
+  claims both `moeflux` and `moeflux-sys` crate names.
+- **moeflux-sys:** `build.rs` compiles the C/Metal via the `cc`
+  crate + `-fobjc-arc`, links `-framework Metal -framework
+  Foundation -framework Accelerate -lpthread -lcompression`.
+  bindgen against `../../metal_infer/moeflux.h`. Gated
+  `cfg(target_os = "macos")`. No safe Rust — unsafe extern "C"
+  + raw types only.
+- **moeflux:** depends on moeflux-sys. Safe wrappers:
+  `MoefluxCtx` (owns `mf_ctx*`, `Drop` calls `mf_free_model`),
+  Result-based error types, logit slices (pointer → `&[f32]`
+  with correct lifetime), safe state-snapshot API.
+- **drama_llama side:** `MoefluxDecoder` + `MoefluxModel` impls
+  under `cfg(feature = "moeflux")` + `cfg(target_os = "macos")`.
+  Tokenization via HuggingFace `tokenizers` crate; moeflux's C
+  API receives token IDs, never text.
+- **Model shape:** fork-and-rebuild per target model initially.
+  Runtime parameterization is Phase 5 (Cogito 600B).
+
+Exit criteria (in order — each gates the next):
+
+1. `cd ~/Projects/moeflux/metal_infer && make smoke && ./smoke
+   <weights> <manifest> <vocab> <experts_dir>` against
+   Qwen3.5-A17B-4bit produces PASS. Logits sane, state
+   save/load round-trip works (restored vs fresh logits within
+   GPU-nondeterminism tolerance — NOT byte-exact).
+2. `cargo build -p moeflux-sys` compiles; bindgen output
+   matches the hand-written `mf_*` signatures.
+3. `cargo build -p moeflux` compiles; `MoefluxCtx` Drop path
+   verified (e.g. via Valgrind-ish leak check or a count-based
+   test double during Phase 3 testing).
+4. drama_llama with `moeflux` feature loads Qwen3.5-A17B and
+   runs the regression harness. **Tolerance: token-level
+   argmax agreement with llama.cpp backend ≥95%, top-20 logit
+   set overlap ≥80%.** Byte-exact match is unrealistic given
+   GPU non-determinism plus different compute paths. These
+   thresholds are starting points; tune based on first-run
+   observations.
+
+Target smoke-test models (small first, work up):
+- **OLMoE-1B-7B** (~4-5GB Q4, 1B active). "Does the pipe work at all."
+- **Qwen3-30B-A3B** (~18GB Q4, 3B active). "Does real MoE work."
+- **Qwen3.5-A17B** (original flash-moe target, 209GB). Mike is
+  downloading this at session end; becomes the first smoke target
+  by virtue of being first-available.
+
+Peripheral risks tracked (not blockers):
+- **AI-authorship doctrine is current, not permanent.** Thaler +
+  2026 SCOTUS cert denial is where we stand. A future ruling
+  narrowing the doctrine would not retroactively revoke our
+  position, but new forks/work might need a different legal
+  frame. Low probability near-term; worth keeping in peripheral
+  vision.
+- **Bus-factor 1 on the human side.** Mike's husband knows
+  about Agora but formal succession planning (Amanda Askell or
+  similar for Steward role) is a post-launch concern.
 
 Target smoke-test models (small first, work up):
 - **OLMoE-1B-7B** (~4-5GB Q4, 1B active). "Does the pipe work at all."
