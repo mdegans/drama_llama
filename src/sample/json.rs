@@ -21,9 +21,9 @@
 //!
 //! [`SamplingMode::Json`]: crate::SamplingMode::Json
 
-use llama_cpp_sys_3::llama_token;
-
-use crate::{llama_cpp::model::token_to_piece_ref, Candidates, LlamaCppModel, TokenData};
+use crate::{Candidates, Token, TokenData};
+#[cfg(feature = "llama-cpp")]
+use crate::{llama_cpp::model::token_to_piece_ref, LlamaCppModel};
 
 /// Pushdown-automaton state for JSON parsing at the byte level.
 ///
@@ -518,6 +518,7 @@ static_assertions::assert_impl_all!(JsonState: Send, Sync);
 ///   can extend it. The state is preserved for debugging; the caller can
 ///   inspect the stack depth via [`JsonState::stack_depth`]. Generation
 ///   still terminates via EOS.
+#[cfg(feature = "llama-cpp")]
 pub(crate) fn json_filter(
     candidates: Candidates,
     state: &mut JsonState,
@@ -564,9 +565,10 @@ pub(crate) fn json_filter(
 /// the [`SamplingMode::Json`] contract. Rebuild the mode and retry.
 ///
 /// [`SamplingMode::Json`]: crate::SamplingMode::Json
+#[cfg(feature = "llama-cpp")]
 pub(crate) fn advance_all(
     modes: &[crate::SamplingMode],
-    token: llama_token,
+    token: Token,
     model: &LlamaCppModel,
 ) {
     use crate::SamplingMode;

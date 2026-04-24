@@ -922,6 +922,7 @@ mod tests {
     /// End-to-end: force Llama 3.1 to make a specific tool call. The
     /// grammar constraint should make the generated text parse as
     /// exactly the expected tool call shape.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "requires model"]
     fn tool_choice_forces_call_against_real_model() {

@@ -34,10 +34,9 @@
 //! [`SamplingMode::Grammar`]: crate::SamplingMode::Grammar
 
 use dashmap::DashMap;
-use llama_cpp_sys_3::llama_token;
 use rayon::prelude::*;
 
-use crate::TokenData;
+use crate::{Token, TokenData};
 use rustc_hash::FxHashMap;
 use tinyvec::{ArrayVec, TinyVec};
 
@@ -45,7 +44,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use crate::{llama_cpp::model::token_to_piece_ref, Candidates, LlamaCppModel};
+use crate::Candidates;
+#[cfg(feature = "llama-cpp")]
+use crate::{llama_cpp::model::token_to_piece_ref, LlamaCppModel};
 
 /// Inline-capacity of a single stack in the NFA simulation. Most grammars
 /// keep call stacks under 4 deep; 8 covers nested alternation / repetition
@@ -1701,6 +1702,7 @@ fn record_stats(
 ///   generation starts fresh.
 /// * **Grammar violation**: no candidate token extends the match. State is
 ///   preserved for inspection via [`GrammarState::stack_depth`].
+#[cfg(feature = "llama-cpp")]
 pub(crate) fn grammar_filter(
     candidates: Candidates,
     state: &mut GrammarState,
@@ -1825,9 +1827,10 @@ pub(crate) fn grammar_filter(
 /// Panics if any grammar mutex is poisoned. A poisoned mutex means a
 /// previous panic left the matcher in an undefined state, and silently
 /// continuing would produce output that violates the grammar.
+#[cfg(feature = "llama-cpp")]
 pub(crate) fn advance_all(
     modes: &[crate::SamplingMode],
-    token: llama_token,
+    token: Token,
     model: &LlamaCppModel,
 ) {
     use crate::SamplingMode;

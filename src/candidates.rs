@@ -10,8 +10,10 @@ use partial_sort::PartialSort;
 use crate::{
     ngram::NGramStats,
     sample::{choose_candidate, SampleError},
-    LlamaCppModel, Probability, RepetitionOptions, SampleOptions, Token, TokenData,
+    Probability, RepetitionOptions, SampleOptions, Token, TokenData,
 };
+#[cfg(feature = "llama-cpp")]
+use crate::LlamaCppModel;
 
 #[cfg(feature = "llama-cpp")]
 use std::ops::Deref;
@@ -1231,6 +1233,7 @@ impl Candidates {
     }
 
     /// Sample a token from the candidates using [`SampleOptions`].
+    #[cfg(feature = "llama-cpp")]
     pub fn sample_token(
         self,
         tokens: &[Token],
@@ -1256,6 +1259,7 @@ impl Candidates {
     /// * This method may change the logits of the candidates.
     ///
     /// [`llama_sample_repetition_penalties`]: llama_cpp_sys_3::llama_sample_repetition_penalties
+    #[cfg(feature = "llama-cpp")]
     pub fn penalize_repetition(
         self,
         tokens: &[Token],

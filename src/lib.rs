@@ -23,7 +23,9 @@ pub use sample::{
 pub mod backend;
 pub use backend::{Decoder, Model, Token, TokenData};
 
+#[cfg(feature = "llama-cpp")]
 mod batch;
+#[cfg(feature = "llama-cpp")]
 pub(crate) use batch::Batch;
 
 mod candidates;
@@ -37,11 +39,13 @@ pub use prompt::{
     Tool, ToolChoice, UserMessage,
 };
 
+#[cfg(feature = "llama-cpp")]
 mod chat_template;
+#[cfg(feature = "llama-cpp")]
 pub use chat_template::{ChatTemplate, ChatTemplateError, RenderOptions};
 
 /// Re-export of [`minijinja`] for callers who need to construct
-/// [`minijinja::value::Value`]s for [`RenderOptions::with_extra`].
+/// [`minijinja::value::Value`]s for `RenderOptions::with_extra`.
 pub use minijinja;
 
 pub(crate) mod grammar_compile;
@@ -59,7 +63,9 @@ pub use output_config::{
     OutputConfigOptions,
 };
 
+#[cfg(feature = "llama-cpp")]
 mod llama_cpp;
+#[cfg(feature = "llama-cpp")]
 pub use llama_cpp::{
     llama_quantize, restore_default_logs, silence_logs, DecodeError,
     FlashAttention, LlamaCppDecoder, LlamaCppEngine, LlamaCppModel, NewError,
@@ -77,7 +83,9 @@ pub use predictor::{
     TokenPredictor,
 };
 
+#[cfg(feature = "llama-cpp")]
 mod session;
+#[cfg(feature = "llama-cpp")]
 pub use session::{
     parse_completion, BlockParser, BlockStream, Session, SessionError,
     TokenTrace, TopKEntry,

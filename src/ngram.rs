@@ -1,9 +1,8 @@
 use core::slice;
-use llama_cpp_sys_3::llama_token;
 use std::{collections::HashMap, ops::Index};
 use tinyvec::ArrayVec;
 
-use crate::{utils::cold, Candidates};
+use crate::{utils::cold, Candidates, Token};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NGramNewError {
@@ -24,7 +23,7 @@ static_assertions::assert_impl_all!(NGramNewError: Send, Sync);
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Ord)]
 #[repr(transparent)]
 pub struct NGram {
-    data: ArrayVec<[llama_token; Self::CAPACITY]>,
+    data: ArrayVec<[Token; Self::CAPACITY]>,
 }
 
 static_assertions::assert_impl_all!(NGram: Send, Sync);
@@ -32,11 +31,11 @@ static_assertions::assert_impl_all!(NGram: Send, Sync);
 impl NGram {
     pub const CAPACITY: usize = 7;
 
-    /// Create an Ngram from a slice of [`llama_token`]. This can fail in cases
+    /// Create an Ngram from a slice of [`Token`]. This can fail in cases
     /// where there are either no tokens or `window.len()` >
     /// [`NGram::CAPACITY`].
     pub fn try_from_tokens(
-        window: &[llama_token],
+        window: &[Token],
     ) -> Result<Self, NGramNewError> {
         if window.is_empty() {
             cold(); // this branch is unlikely
@@ -62,12 +61,12 @@ impl NGram {
     }
 
     /// Iterate over the tokens in the Ngram.
-    pub fn iter(&self) -> slice::Iter<'_, llama_token> {
+    pub fn iter(&self) -> slice::Iter<'_, Token> {
         self.data.iter()
     }
 
     /// Get a slice of the tokens in the Ngram.
-    pub fn as_slice(&self) -> &[llama_token] {
+    pub fn as_slice(&self) -> &[Token] {
         self.data.as_slice()
     }
 
@@ -80,16 +79,16 @@ impl NGram {
     }
 }
 
-impl TryFrom<&[llama_token]> for NGram {
+impl TryFrom<&[Token]> for NGram {
     type Error = NGramNewError;
 
-    fn try_from(window: &[llama_token]) -> Result<Self, Self::Error> {
+    fn try_from(window: &[Token]) -> Result<Self, Self::Error> {
         Self::try_from_tokens(window)
     }
 }
 
-impl From<llama_token> for NGram {
-    fn from(token: llama_token) -> Self {
+impl From<Token> for NGram {
+    fn from(token: Token) -> Self {
         // Unwrap can never panic because the only two failure conditions for
         // construction are when the len is 0 or > CAPACITY. We are creating a
         // unigram.
@@ -98,7 +97,7 @@ impl From<llama_token> for NGram {
 }
 
 impl Index<usize> for NGram {
-    type Output = llama_token;
+    type Output = Token;
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.data[index]
@@ -379,7 +378,7 @@ mod tests {
 
         let mut c = Candidates::new(n).unwrap();
         for i in 0..n {
-            c.data[i].id = i as llama_token;
+            c.data[i].id = i as Token;
             c.data[i].logit = -(i as f32 / n as f32);
         }
         let c = c.softmax(None);

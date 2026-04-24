@@ -9,7 +9,7 @@ repository = "https://github.com/mdegans/drama_llama"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-llama-cpp-sys-3 = "0.7"
+llama-cpp-sys-3 = { version = "0.7", optional = true }
 
 derive_more = { version = "1", features = ["from"] }
 num = "0.4"
@@ -53,16 +53,24 @@ schemars = { version = "1", optional = true }
 
 [features]
 default = ["llama-cpp"]
-# `llama-cpp` gates the llama.cpp-backed decode+model implementations.
-# In this commit it is a pure flag (the dep is still always compiled);
-# Commit 6 will make `llama-cpp-sys-3` optional and have this feature
-# actually forward to the dep. Leaving the definition here now lets us
-# start cfg-gating llama.cpp-specific code (`TokenDataArray`, etc.)
-# without churning Cargo.toml again.
-llama-cpp = []
-webchat = ["dep:rocket", "toml", "dep:dirs", "dep:markdown", "serde"]
+# `llama-cpp` gates the llama.cpp-backed decoder + model implementations
+# and forwards to the (optional) `llama-cpp-sys-3` crate. With
+# `--no-default-features` the crate compiles down to the backend-agnostic
+# trait layer (Token, TokenData, Decoder, Model, Engine<D, M>,
+# Candidates' model-agnostic half, sampling options) with no C dep.
+llama-cpp = ["dep:llama-cpp-sys-3"]
+# Features below that need concrete llama.cpp types or the Session
+# wrapper transitively imply `llama-cpp`.
+webchat = [
+    "dep:rocket",
+    "toml",
+    "dep:dirs",
+    "dep:markdown",
+    "serde",
+    "llama-cpp",
+]
 toml = ["dep:toml"]
-cli = ["dep:clap"]
+cli = ["dep:clap", "llama-cpp"]
 serde = ["tinyvec/serde"]
 stats = ["dep:stringmetrics"]
 cuda = ["llama-cpp", "llama-cpp-sys-3/cuda"]
@@ -81,6 +89,7 @@ axum = [
     "tracing/async-await",
     "tracing-subscriber/json",
     "tracing-subscriber/env-filter",
+    "llama-cpp",
 ]
 # Enable typed structured-output helpers: `Prompt::structured_output::<T>()`,
 # `OutputConfig::for_type::<T>()`. Requires `schemars` for schema derivation.

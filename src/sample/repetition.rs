@@ -8,10 +8,8 @@ use crate::{
     candidates::Sorted,
     data::{ignore_category::IgnoreCategory, StopWords},
     ngram::{NGram, NGramStats},
-    Candidates,
+    Candidates, Token,
 };
-
-use llama_cpp_sys_3::llama_token;
 
 use std::{collections::BTreeSet, num::NonZeroU8};
 
@@ -211,6 +209,7 @@ impl RepetitionOptions {
 
     /// Ignore [`IgnoreCategory`]s. These are commonly used tokens that are
     /// often ignored in text generation.
+    #[cfg(feature = "llama-cpp")]
     pub fn ignore_categories(
         mut self,
         ignore_categories: IgnoreCategory,
@@ -221,6 +220,7 @@ impl RepetitionOptions {
     }
 
     /// Use [`RepetitionOptions::ignore_categories`] instead.
+    #[cfg(feature = "llama-cpp")]
     #[allow(deprecated)]
     #[deprecated(since = "0.7.0", note = "renamed to `ignore_categories`")]
     pub fn ignore_stopwords(
@@ -478,9 +478,9 @@ fn ngram_is_ignored(ngram: NGram, ignored: &BTreeSet<NGram>) -> bool {
 /// `[the, cat, sat]` and penalizing "cat" allows "the <other> sat".
 fn surgical_target(
     ngram: &NGram,
-    tokens: &[llama_token],
+    tokens: &[Token],
     ignored: &BTreeSet<NGram>,
-) -> Option<llama_token> {
+) -> Option<Token> {
     let slice = ngram.as_slice();
     let max_k = slice.len().saturating_sub(1);
     let mut best_k = 0;
@@ -508,9 +508,10 @@ fn surgical_target(
 /// Originally inspired by `llama.cpp`'s repetition penalties, extended with
 /// n-gram support. Rewritten by Claude (Anthropic) to fix a design issue where
 /// penalties were only applied to the trailing token.
+#[cfg(feature = "llama-cpp")]
 pub fn apply_sample_repetition_ngram(
     candidates: Candidates,
-    tokens: &[llama_token],
+    tokens: &[Token],
     opts: &mut RepetitionOptions,
     freq_map: &mut NGramStats,
     model: &crate::LlamaCppModel,
@@ -657,7 +658,7 @@ pub fn apply_sample_repetition_ngram(
     Ok(candidates)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "llama-cpp"))]
 mod tests {
     use super::*;
     use crate::{Candidates, TokenData};
@@ -687,7 +688,7 @@ mod tests {
     /// Returns (logits_after, freq_map) so callers can inspect both.
     fn run_penalty_steps(
         logits: &[f32],
-        token_history: &[llama_token],
+        token_history: &[Token],
         opts: &mut RepetitionOptions,
         steps: usize,
         model: &crate::LlamaCppModel,
@@ -954,11 +955,11 @@ mod tests {
 
     // --- surgical_target tests (no model required) -----------------------
 
-    fn ngram(tokens: &[llama_token]) -> NGram {
+    fn ngram(tokens: &[Token]) -> NGram {
         NGram::try_from(tokens).unwrap()
     }
 
-    fn ignored_of(tokens: &[llama_token]) -> BTreeSet<NGram> {
+    fn ignored_of(tokens: &[Token]) -> BTreeSet<NGram> {
         tokens.iter().map(|&t| NGram::from(t)).collect()
     }
 
@@ -1007,7 +1008,7 @@ mod tests {
     fn surgical_target_skips_entirely_when_target_ignored() {
         let ng = ngram(&[10, 20, 30]);
         let ignored = ignored_of(&[10]);
-        let tokens: &[llama_token] = &[];
+        let tokens: &[Token] = &[];
         assert_eq!(surgical_target(&ng, tokens, &ignored), None);
     }
 

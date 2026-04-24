@@ -6,8 +6,10 @@ use crate::{
     backend::{Decoder, Model},
     ngram::NGramStats,
     sample::SampleOptions,
-    Candidates, Engine, LlamaCppModel, NGram, Token,
+    Candidates, Engine, NGram, Token,
 };
+#[cfg(feature = "llama-cpp")]
+use crate::LlamaCppModel;
 
 #[cfg(feature = "serde")]
 fn deserialize_regex_vec<'de, D>(
@@ -106,6 +108,7 @@ impl PredictOptions {
     /// models that emit `<|eot_id|>` between turns terminate cleanly.
     /// Repetition penalty ignores these — otherwise a strong penalty can
     /// keep the model from ever closing a turn.
+    #[cfg(feature = "llama-cpp")]
     pub fn add_model_stops(mut self, model: &LlamaCppModel) -> Self {
         let eos = model.eos();
         self.stop_sequences.push(vec![eos]);
@@ -548,6 +551,7 @@ impl<'engine, D: Decoder, M: Model> From<TokenPredictor<'engine, D, M>>
 // future commit will route these through the `Model` trait so
 // TokenPredictor is fully backend-agnostic. For now, restrict the impl
 // to M = LlamaCppModel so existing sampling code keeps working.
+#[cfg(feature = "llama-cpp")]
 impl<'engine, D: Decoder> Iterator
     for TokenPredictor<'engine, D, LlamaCppModel>
 {
@@ -716,6 +720,7 @@ impl<'engine, D: Decoder, M: Model> PiecePredictor<'engine, D, M> {
     }
 }
 
+#[cfg(feature = "llama-cpp")]
 impl<'engine, D: Decoder> PiecePredictor<'engine, D, LlamaCppModel> {
     /// Predict and collect all the pieces, truncating at stop sequences.
     pub fn collect_text(mut self) -> String {
@@ -744,6 +749,7 @@ impl<'engine, D: Decoder> PiecePredictor<'engine, D, LlamaCppModel> {
     }
 }
 
+#[cfg(feature = "llama-cpp")]
 impl<'engine, D: Decoder> Iterator
     for PiecePredictor<'engine, D, LlamaCppModel>
 {
@@ -835,6 +841,7 @@ impl<'engine, D: Decoder, M: Model> Predictor<'engine, D, M> {
     }
 }
 
+#[cfg(feature = "llama-cpp")]
 impl<'engine, D: Decoder> Iterator for Predictor<'engine, D, LlamaCppModel> {
     type Item = Predicted;
 
@@ -845,7 +852,7 @@ impl<'engine, D: Decoder> Iterator for Predictor<'engine, D, LlamaCppModel> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "llama-cpp"))]
 mod tests {
     use crate::{LlamaCppEngine, PredictOptions, RepetitionOptions, SampleOptions, Token};
     use std::{num::NonZeroUsize, path::PathBuf};

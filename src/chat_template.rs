@@ -45,11 +45,10 @@
 
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
-use llama_cpp_sys_3::llama_token;
 use minijinja::{value::Value as JinjaValue, Environment, Error as JinjaError};
 use serde::Serialize;
 
-use crate::{prompt::Tool, Block, Content, LlamaCppModel, Prompt, Role};
+use crate::{prompt::Tool, Block, Content, LlamaCppModel, Prompt, Role, Token};
 
 /// Render a [`Tool`] as the OpenAI wire envelope cogito / Qwen /
 /// Hermes-family chat templates expect.
@@ -498,7 +497,7 @@ fn render_partial(
 pub(crate) fn tokenize_with_breakpoints(
     model: &LlamaCppModel,
     rendered: &RenderedWithBreakpoints,
-) -> (Vec<llama_token>, Vec<usize>) {
+) -> (Vec<Token>, Vec<usize>) {
     let full_tokens = model.tokenize(&rendered.text, true);
     let mut indices: Vec<usize> =
         Vec::with_capacity(rendered.partial_texts.len());

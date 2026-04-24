@@ -1,6 +1,5 @@
-use llama_cpp_sys_3::llama_token;
-
-use crate::LlamaCppModel;
+#[cfg(feature = "llama-cpp")]
+use crate::{LlamaCppModel, Token};
 
 /// Common sequences to ignore (for repetition penalty, etc.)
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -51,10 +50,11 @@ impl IgnoreCategory {
     }
 
     /// Tokenizes `self` using the given `model``.
+    #[cfg(feature = "llama-cpp")]
     pub fn into_tokens(
         self,
         model: &LlamaCppModel,
-    ) -> impl Iterator<Item = llama_token> + '_ {
+    ) -> impl Iterator<Item = Token> + '_ {
         self.words()
             .iter()
             // TODO: there is allocation here that can be avoided by turning the

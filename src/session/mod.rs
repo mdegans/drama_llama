@@ -76,7 +76,6 @@
 
 use std::{num::NonZeroUsize, path::PathBuf};
 
-use llama_cpp_sys_3::llama_token;
 use misanthropic::response::Usage;
 
 use crate::{
@@ -84,7 +83,7 @@ use crate::{
     output_config, silence_logs, ChatTemplate, ChatTemplateError,
     LlamaCppEngine, NewError, OutputConfigError, OutputConfigOptions,
     PredictOptions, Prompt, RenderOptions, RepetitionOptions, SampleOptions,
-    SamplingMode, ToolChoiceError, ToolChoiceOptions,
+    SamplingMode, Token, ToolChoiceError, ToolChoiceOptions,
 };
 
 mod parse;
@@ -144,7 +143,7 @@ const DEFAULT_MAX_TOKENS: usize = 1024;
 struct PrefixCache {
     /// Full prompt tokens from the last cache-participating call. Generation
     /// tokens are NOT stored here.
-    prev_tokens: Vec<llama_token>,
+    prev_tokens: Vec<Token>,
     /// Token indices in `prev_tokens` where `cache_control` breakpoints landed.
     /// Sorted ascending.
     prev_breakpoints: Vec<usize>,
@@ -171,7 +170,7 @@ impl PrefixCache {
 }
 
 /// Length of the longest prefix shared between `a` and `b`, in tokens.
-fn longest_common_prefix_len(a: &[llama_token], b: &[llama_token]) -> usize {
+fn longest_common_prefix_len(a: &[Token], b: &[Token]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
@@ -189,8 +188,8 @@ fn longest_common_prefix_len(a: &[llama_token], b: &[llama_token]) -> usize {
 /// Returns `0` when no breakpoint is eligible — the caller should treat that as
 /// a full re-prefill. Pure function, tested directly.
 fn compute_l_hit(
-    prev_tokens: &[llama_token],
-    new_tokens: &[llama_token],
+    prev_tokens: &[Token],
+    new_tokens: &[Token],
     new_breakpoints: &[usize],
 ) -> usize {
     let lcp = longest_common_prefix_len(prev_tokens, new_tokens);
@@ -224,7 +223,7 @@ pub struct TokenTrace {
 #[derive(Debug, Clone)]
 pub struct TopKEntry {
     /// Vocabulary id.
-    pub token: llama_cpp_sys_3::llama_token,
+    pub token: Token,
     /// Raw logit from the model (pre-softmax).
     pub logit: f32,
     /// Decoded string for this token (via `LlamaCppModel::token_to_piece`).
@@ -567,7 +566,7 @@ impl Session {
         include_user_sampling: bool,
     ) -> Result<
         (
-            Vec<llama_cpp_sys_3::llama_token>,
+            Vec<Token>,
             Vec<SamplingMode>,
             Option<crate::DeferredGrammar>,
         ),
@@ -627,7 +626,7 @@ impl Session {
         include_user_sampling: bool,
     ) -> Result<
         (
-            Vec<llama_token>,
+            Vec<Token>,
             Vec<usize>,
             Vec<SamplingMode>,
             Option<crate::DeferredGrammar>,
@@ -682,9 +681,9 @@ impl Session {
     /// beyond the engine.
     fn kv_setup_for_call(
         &mut self,
-        new_tokens: &[llama_token],
+        new_tokens: &[Token],
         new_breakpoints: &[usize],
-    ) -> (Vec<llama_token>, usize) {
+    ) -> (Vec<Token>, usize) {
         let l_hit = match self.prefix_cache.as_ref() {
             Some(cache) if !cache.prev_tokens.is_empty() => {
                 compute_l_hit(&cache.prev_tokens, new_tokens, new_breakpoints)
@@ -729,7 +728,7 @@ impl Session {
     /// indices, and actual reuse length. No-op when caching is off.
     fn record_cache_hit(
         &mut self,
-        new_tokens: Vec<llama_token>,
+        new_tokens: Vec<Token>,
         new_breakpoints: Vec<usize>,
         l_hit: usize,
     ) {
@@ -1487,8 +1486,8 @@ mod tests {
     /// even when the common prefix is long.
     #[test]
     fn test_l_hit_computation_no_breakpoints() {
-        let prev: Vec<llama_token> = (0..20).collect();
-        let new_: Vec<llama_token> = (0..10).chain(100..110).collect();
+        let prev: Vec<Token> = (0..20).collect();
+        let new_: Vec<Token> = (0..10).chain(100..110).collect();
         assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
         assert_eq!(compute_l_hit(&prev, &new_, &[]), 0);
     }
@@ -1498,8 +1497,8 @@ mod tests {
     /// `8`, so `L_hit == 8`.
     #[test]
     fn test_l_hit_computation_with_breakpoint() {
-        let prev: Vec<llama_token> = (0..20).collect();
-        let new_: Vec<llama_token> = (0..10).chain(100..110).collect();
+        let prev: Vec<Token> = (0..20).collect();
+        let new_: Vec<Token> = (0..10).chain(100..110).collect();
         let breakpoints = vec![5, 8, 12];
         assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
         assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 8);
@@ -1511,8 +1510,8 @@ mod tests {
     /// resuming exactly at the prefix end is unsafe.
     #[test]
     fn test_l_hit_computation_bpe_backoff() {
-        let prev: Vec<llama_token> = (0..10).collect();
-        let new_: Vec<llama_token> =
+        let prev: Vec<Token> = (0..10).collect();
+        let new_: Vec<Token> =
             (0..5).chain(200..205).chain(300..305).collect();
         let breakpoints = vec![5];
         assert_eq!(longest_common_prefix_len(&prev, &new_), 5);
@@ -1533,8 +1532,8 @@ mod tests {
     /// always lands at `L_hit == 0`.
     #[test]
     fn test_l_hit_empty_prev() {
-        let prev: Vec<llama_token> = Vec::new();
-        let new_: Vec<llama_token> = vec![1, 2, 3, 4, 5];
+        let prev: Vec<Token> = Vec::new();
+        let new_: Vec<Token> = vec![1, 2, 3, 4, 5];
         let breakpoints = vec![1, 3];
         assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 0);
     }
