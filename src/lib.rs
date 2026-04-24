@@ -71,6 +71,14 @@ pub use llama_cpp::{
     FlashAttention, LlamaCppDecoder, LlamaCppEngine, LlamaCppModel, NewError,
 };
 
+#[cfg(all(feature = "moeflux", target_os = "macos"))]
+pub mod moeflux;
+#[cfg(all(feature = "moeflux", target_os = "macos"))]
+pub use moeflux::{
+    MoefluxDecoder, MoefluxEngine, MoefluxError, MoefluxModel,
+    MoefluxModelError,
+};
+
 mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};
 

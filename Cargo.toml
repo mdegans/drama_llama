@@ -11,6 +11,13 @@ repository = "https://github.com/mdegans/drama_llama"
 [dependencies]
 llama-cpp-sys-3 = { version = "0.7", optional = true }
 
+# moeflux (Metal-backed streaming-MoE decoder) is path-dep'd while the
+# fork is private and pre-crates.io. macOS-only; drama_llama's own
+# `moeflux` feature wraps the platform gate so cross-platform builds
+# still work via `--no-default-features`.
+moeflux = { path = "../moeflux/crates/moeflux", optional = true }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+
 derive_more = { version = "1", features = ["from"] }
 num = "0.4"
 uuid = { version = "1", features = ["v4"] }
@@ -94,6 +101,15 @@ axum = [
 # Enable typed structured-output helpers: `Prompt::structured_output::<T>()`,
 # `OutputConfig::for_type::<T>()`. Requires `schemars` for schema derivation.
 json-schema = ["dep:schemars", "misanthropic/json-schema"]
+
+# `moeflux` gates the moeflux-backed Decoder + Model implementations.
+# Pulls in the safe `moeflux` wrapper (compiled C/Metal inside) and the
+# HuggingFace `tokenizers` crate for Rust-side tokenization. Exactly one
+# of `moeflux-model-*` must be enabled alongside — the shape is a
+# compile-time constant in moeflux's C side.
+moeflux = ["dep:moeflux", "dep:tokenizers"]
+moeflux-model-qwen3-5-a17b = ["moeflux", "moeflux/model-qwen3-5-a17b"]
+moeflux-model-qwen3-6-35b-a3b = ["moeflux", "moeflux/model-qwen3-6-35b-a3b"]
 
 [[example]]
 name = "strawberry"
