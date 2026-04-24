@@ -1,0 +1,289 @@
+{
+  "backend": "llama-cpp",
+  "model_meta": {
+    "n_vocab": 151665,
+    "architecture": "qwen2",
+    "context_size": 131072
+  },
+  "prompt": "The quick brown fox",
+  "prompt_tokens": [
+    785,
+    3974,
+    13876,
+    38835
+  ],
+  "n_steps": 32,
+  "top_k": 20,
+  "tokens": [
+    34208,
+    916,
+    279,
+    15678,
+    5562,
+    624,
+    785,
+    3974,
+    13876,
+    38835,
+    34208,
+    916,
+    279,
+    15678,
+    5562,
+    382,
+    785,
+    3974,
+    13876,
+    38835,
+    34208,
+    916,
+    279,
+    15678,
+    5562,
+    624,
+    785,
+    3974,
+    13876,
+    38835,
+    34208,
+    916
+  ],
+  "pieces": [
+    " jumps",
+    " over",
+    " the",
+    " lazy",
+    " dog",
+    ".\n",
+    "The",
+    " quick",
+    " brown",
+    " fox",
+    " jumps",
+    " over",
+    " the",
+    " lazy",
+    " dog",
+    ".\n\n",
+    "The",
+    " quick",
+    " brown",
+    " fox",
+    " jumps",
+    " over",
+    " the",
+    " lazy",
+    " dog",
+    ".\n",
+    "The",
+    " quick",
+    " brown",
+    " fox",
+    " jumps",
+    " over"
+  ],
+  "logits_step_0": [
+    {
+      "token": 34208,
+      "piece": " jumps",
+      "logit": 17.84579
+    },
+    {
+      "token": 26005,
+      "piece": " jumped",
+      "logit": 16.402853
+    },
+    {
+      "token": 198,
+      "piece": "\n",
+      "logit": 14.677507
+    },
+    {
+      "token": 374,
+      "piece": " is",
+      "logit": 13.334793
+    },
+    {
+      "token": 271,
+      "piece": "\n\n",
+      "logit": 13.176266
+    },
+    {
+      "token": 323,
+      "piece": " and",
+      "logit": 12.309123
+    },
+    {
+      "token": 320,
+      "piece": " (",
+      "logit": 12.094626
+    },
+    {
+      "token": 10613,
+      "piece": " ran",
+      "logit": 12.069906
+    },
+    {
+      "token": 1304,
+      "piece": " __",
+      "logit": 11.948284
+    },
+    {
+      "token": 2130,
+      "piece": "____",
+      "logit": 11.824567
+    },
+    {
+      "token": 698,
+      "piece": "\"\n",
+      "logit": 11.767701
+    },
+    {
+      "token": 646,
+      "piece": " can",
+      "logit": 11.766724
+    },
+    {
+      "token": 8473,
+      "piece": " runs",
+      "logit": 11.7449665
+    },
+    {
+      "token": 29812,
+      "piece": " ate",
+      "logit": 11.735066
+    },
+    {
+      "token": 11,
+      "piece": ",",
+      "logit": 11.630601
+    },
+    {
+      "token": 288,
+      "piece": "es",
+      "logit": 11.4666395
+    },
+    {
+      "token": 32671,
+      "piece": " ______",
+      "logit": 11.374804
+    },
+    {
+      "token": 702,
+      "piece": " has",
+      "logit": 11.250719
+    },
+    {
+      "token": 756,
+      "piece": "\",\n",
+      "logit": 11.151488
+    },
+    {
+      "token": 497,
+      "piece": "\",",
+      "logit": 11.134138
+    }
+  ],
+  "logits_step_n": [
+    {
+      "token": 916,
+      "piece": " over",
+      "logit": 23.839733
+    },
+    {
+      "token": 198,
+      "piece": "\n",
+      "logit": 14.07452
+    },
+    {
+      "token": 271,
+      "piece": "\n\n",
+      "logit": 13.878387
+    },
+    {
+      "token": 382,
+      "piece": ".\n\n",
+      "logit": 13.740999
+    },
+    {
+      "token": 624,
+      "piece": ".\n",
+      "logit": 13.62937
+    },
+    {
+      "token": 24550,
+      "piece": " ov",
+      "logit": 13.168814
+    },
+    {
+      "token": 13,
+      "piece": ".",
+      "logit": 13.0480585
+    },
+    {
+      "token": 576,
+      "piece": " The",
+      "logit": 12.818338
+    },
+    {
+      "token": 279,
+      "piece": " the",
+      "logit": 12.669659
+    },
+    {
+      "token": 715,
+      "piece": " \n",
+      "logit": 12.081686
+    },
+    {
+      "token": 297,
+      "piece": " o",
+      "logit": 12.066946
+    },
+    {
+      "token": 220,
+      "piece": " ",
+      "logit": 12.024174
+    },
+    {
+      "token": 1975,
+      "piece": "over",
+      "logit": 11.987543
+    },
+    {
+      "token": 35464,
+      "piece": " OVER",
+      "logit": 11.874843
+    },
+    {
+      "token": 4710,
+      "piece": " \n\n",
+      "logit": 11.511384
+    },
+    {
+      "token": 366,
+      "piece": " <",
+      "logit": 11.368036
+    },
+    {
+      "token": 320,
+      "piece": " (",
+      "logit": 11.266247
+    },
+    {
+      "token": 2146,
+      "piece": "...\n\n",
+      "logit": 11.141521
+    },
+    {
+      "token": 6065,
+      "piece": " Over",
+      "logit": 11.053875
+    },
+    {
+      "token": 0,
+      "piece": "!",
+      "logit": 10.972399
+    }
+  ]
+}

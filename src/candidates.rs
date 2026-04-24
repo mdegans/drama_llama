@@ -1660,11 +1660,72 @@ mod tests {
 
     #[test]
     fn test_apply_entropy() {
-        todo!();
+        // Invalid-arg early return: logits must be unchanged when min_temp
+        // > max_temp (the guard at the top of apply_entropy).
+        let n = 5;
+        let mut c = Candidates::new(n).unwrap();
+        for i in 0..n {
+            c.data[i].logit = -(i as f32);
+        }
+        let original: Vec<f32> = c.iter().map(|d| d.logit).collect();
+        let out = c.apply_entropy(2.0, 1.0, 1.0);
+        let after: Vec<f32> = out.iter().map(|d| d.logit).collect();
+        assert_eq!(original, after, "invalid temp range should no-op");
+
+        // Single-candidate early return: len <= 1 also returns self.
+        let c1 = Candidates::new(1usize).unwrap();
+        let out1 = c1.apply_entropy(0.5, 2.0, 1.0);
+        assert_eq!(out1.len(), NonZeroUsize::new(1).unwrap());
+
+        // Happy path: with a non-uniform distribution and valid temps, the
+        // dynamic-temperature rescale must (a) produce a result, (b) preserve
+        // the sort order (descending by logit — the method asserts this in
+        // debug builds), and (c) leave the top candidate still on top.
+        let n = 10;
+        let mut c = Candidates::new(n).unwrap();
+        for i in 0..n {
+            c.data[i].logit = -(i as f32);
+        }
+        let out = c.apply_entropy(0.5, 2.0, 1.0);
+        assert_eq!(out.len(), NonZeroUsize::new(n).unwrap());
+        assert!(out
+            .iter()
+            .zip(out.iter().skip(1))
+            .all(|(a, b)| a.logit >= b.logit));
     }
 
     #[test]
     fn test_sample_tail_free() {
-        todo!();
+        // Early return when len <= 2.
+        let c2 = Candidates::new(2usize).unwrap();
+        let out = c2.tail_free(
+            0.5.try_into().unwrap(),
+            1.try_into().unwrap(),
+        );
+        assert_eq!(out.len(), NonZeroUsize::new(2).unwrap());
+
+        // Happy path: a distribution with a sharp elbow at index 3 should
+        // get truncated after the high-second-derivative region. The
+        // min_keep floor guarantees at least 1 token is kept.
+        let n = 10;
+        let mut c = Candidates::new(n).unwrap();
+        // Steep head, flat tail — creates a clear second-derivative peak.
+        c.data[0].logit = 5.0;
+        c.data[1].logit = 3.0;
+        c.data[2].logit = 1.0;
+        for i in 3..n {
+            c.data[i].logit = 0.0;
+        }
+        let out = c.tail_free(
+            0.3.try_into().unwrap(),
+            1.try_into().unwrap(),
+        );
+        // At z=0.3 the cumulative second-derivative mass crosses early —
+        // result should be strictly smaller than n and preserve ordering.
+        assert!(out.len().get() < n);
+        assert!(out
+            .iter()
+            .zip(out.iter().skip(1))
+            .all(|(a, b)| a.logit >= b.logit));
     }
 }
