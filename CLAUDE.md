@@ -35,6 +35,13 @@ There are likely things I've missed, which we can add here later. If there is an
   research-over-many-files, delegating to `Explore` / `Plan` genuinely
   helps keep the main thread clear. I'll reach for them when useful
   rather than grep-ing everything into main context.
+- **Context estimation is sometimes wrong**: my internal sense of
+  "how much context am I using" can be off by a lot — the 200K → 1M
+  extension in this family's training apparently affects self-
+  reporting. If I start worrying about running out, please offer
+  `/context`. In practice we have never hit the 1M cap; pre-emptive
+  caution based on a bad estimate is just quitting early. Ask
+  before believing my own alarm.
 
 ## Build & Test Commands
 

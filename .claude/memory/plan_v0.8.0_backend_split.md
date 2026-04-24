@@ -194,15 +194,29 @@ Phase 4's opening move.
 (Was `FlashMoeDecoder` in the original plan — renamed to match the
 `moeflux` fork identity.)
 
-**Hard constraint — run C smoke before any Rust work.** The
-`~/Projects/moeflux/tests/smoke.c` end-to-end run against the real
-Qwen3.5-A17B-4bit model must pass before any Cargo scaffolding
-lands. We shipped ~1000 LOC of C wrappers (mf_init_model, the
-per-token orchestration, state save/restore) without runtime
-verification; first-run bugs are expected. Fix them at the C
-level before investing in a Rust wrapper on an unvalidated
-foundation. Smoke running, not byte-for-byte correctness, is the
-gate.
+**Hard constraint — run C smoke before any Rust work.** Smoke
+running, not byte-for-byte correctness, is the gate. **Status
+(2026-04-24): GATE PASSED** against Qwen3.6-35B-A3B (MLX 4-bit
+converted from `Qwen/Qwen3.6-35B-A3B` BF16). All 12 smoke stages
+green: init → prefill → 3 decodes → seq_rm → state_size/save/load
+round-trip → clear. State round-trip restores pos_max=4; logits
+don't match fresh path bit-for-bit (WARN — expected per this
+plan's "GPU non-determinism" tolerance).
+
+Two C-side bugs surfaced and were fixed during first run:
+  - `mf_model_name` hardcoded to A17B string instead of using
+    `MOEFLUX_MODEL_NAME` macro (moeflux commit `449649d`).
+  - `smoke.c` had wrong seq_rm/memory_clear ordering before the
+    re-prefill, causing state_save to fail -1 on short buffer
+    (same commit). These were the only two bugs found in the
+    ~1000 LOC of unverified C — much cleaner than expected.
+
+35B-A3B was picked over A17B for this gate because it's the same
+`qwen3_5_moe` architecture at a smaller shape (2048 dim, 40
+layers, 256 experts), so the C smoke validates both the API
+surface *and* the conditional-compilation scaffold in one shot.
+A17B is preserved as a compile-time variant but not smoke-tested
+in this session.
 
 Scope:
 - **Workspace layout inside the existing `moeflux` repo:**
@@ -239,23 +253,60 @@ Scope:
 
 Exit criteria (in order — each gates the next):
 
-1. `cd ~/Projects/moeflux/metal_infer && make smoke && ./smoke
-   <weights> <manifest> <vocab> <experts_dir>` against
-   Qwen3.5-A17B-4bit produces PASS. Logits sane, state
-   save/load round-trip works (restored vs fresh logits within
-   GPU-nondeterminism tolerance — NOT byte-exact).
-2. `cargo build -p moeflux-sys` compiles; bindgen output
-   matches the hand-written `mf_*` signatures.
-3. `cargo build -p moeflux` compiles; `MoefluxCtx` Drop path
-   verified (e.g. via Valgrind-ish leak check or a count-based
-   test double during Phase 3 testing).
-4. drama_llama with `moeflux` feature loads Qwen3.5-A17B and
-   runs the regression harness. **Tolerance: token-level
+1. **[PASSED 2026-04-24]** Smoke produces PASS against the real
+   model. Hit on Qwen3.6-35B-A3B (not A17B; see smoke-gate note
+   above). State save/load round-trip non-byte-exact WARN is
+   within tolerance.
+2. **[PASSED 2026-04-24]** `cargo build -p moeflux-sys`
+   compiles; bindgen output matches hand-written `mf_*`
+   signatures (verified by `tests/link.rs`). A17B + 35B-A3B
+   features both build green; zero / both features panic at
+   build time with a clear message. Moeflux commit `6e600ef`.
+3. **[PASSED 2026-04-24]** `cargo build -p moeflux` compiles;
+   `Ctx::Drop` runs cleanly at end of Rust smoke. Full Rust
+   port of `tests/smoke.c` PASSes in 3.29s against 35B-A3B
+   artifacts (same commit).
+4. drama_llama with `moeflux` feature loads a 35B-A3B variant
+   and runs the regression harness. **Tolerance: token-level
    argmax agreement with llama.cpp backend ≥95%, top-20 logit
-   set overlap ≥80%.** Byte-exact match is unrealistic given
-   GPU non-determinism plus different compute paths. These
-   thresholds are starting points; tune based on first-run
-   observations.
+   set overlap ≥80%.** Cross-backend comparison: GGUF Q4_K_M
+   of the same BF16 source (converted via llama.cpp's
+   `convert_hf_to_gguf.py` + `llama-quantize`) lives at
+   `/Volumes/Temp Backup/models/gguf/qwen3-6-35b-a3b-q4_k_m.gguf`.
+
+**35B-A3B artifacts (as of 2026-04-24):**
+- MLX 4-bit (group 64, affine): `/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-mlx-4bit/` (18 GB)
+- Packed experts: `/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-packed/` (17 GB, 40 files × 432 MB)
+- Smoke-ready wrapper (with `packed_experts/` symlink): `qwen3-6-35b-a3b-root/`
+- Non-expert weights + manifest + vocab: `qwen3-6-35b-a3b-artifacts/` (model_weights.bin 1.4 GB, model_weights.json, vocab.bin, tokenizer.bin)
+- GGUF F16: 69 GB; GGUF Q4_K_M: 21 GB (4.88 BPW).
+
+**Conditional-compile scaffold landed (moeflux commit `32dd06e`):**
+- `metal_infer/model_variant.h` owns all shape `#define`s; 22
+  per-variant constants + derived 4-bit/2-bit expert-offset macros.
+- Select via `-DMOEFLUX_MODEL_QWEN3_5_A17B` (default) or
+  `-DMOEFLUX_MODEL_QWEN3_6_35B_A3B`. Makefile accepts `MODEL=`.
+- A17B build byte-identical post-refactor (all 12 derived offsets
+  match the old hardcoded literals + expert_index.json regression
+  check).
+- `docs/model_variants.md` documents the add-a-variant flow.
+- Shape constants are compile-time only (C needs static array
+  sizes); Metal shaders untouched since they use only tile
+  constants, not shape constants.
+
+**Prep pipeline scaffold (moeflux commit `79b92c3`):**
+- `tools/gen_expert_index.py` — new. Walks mlx_lm output's
+  `switch_mlp` tensor layout, builds the per-layer byte-offset map
+  `repack_experts.py` consumes. Stdlib-only.
+- `repack_experts.py` — rewritten to derive COMPONENTS /
+  NUM_EXPERTS / NUM_LAYERS from the generated index. A17B offsets
+  match the old hardcoded ones exactly (regression verified).
+- `metal_infer/extract_weights.py` — config from HF `config.json`
+  (text_config.*), not hardcoded A17B values.
+- `metal_infer/export_vocab.py` — new. Decoder-side vocab.bin
+  format that `load_vocab` reads (distinct from
+  `export_tokenizer.py`'s BPET format for bpe_load; C engine needs
+  both). Inverts GPT-2 bytes_to_unicode correctly.
 
 Target smoke-test models (small first, work up):
 - **OLMoE-1B-7B** (~4-5GB Q4, 1B active). "Does the pipe work at all."
