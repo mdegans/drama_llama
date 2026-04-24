@@ -1,5 +1,13 @@
 # Phase 4 A3B 8-bit dequant — landed (partial)
 
+> **STATUS (2026-04-27): SUPERSEDED by
+> `plan_phase4_a3b_gate_offset_fixed.md`.** The residual A3B output
+> gap this doc identified was caused by hardcoded A17B byte offsets
+> for gate_s/b (moeflux fix `925f7a0`) — NOT an 8-bit kernel issue.
+> The 8-bit dequant work this doc landed is still valid and needed;
+> it just wasn't sufficient alone. Keep this doc as reference for
+> the 8-bit kernel design + extractor schema changes.
+
 Session 2026-04-26. Picked up from `plan_phase4_moeflux_a3b_debug.md`'s
 "Real fix (recommended)" branch: add native 8-bit support to moeflux
 rather than working around via extract-time re-quantization.

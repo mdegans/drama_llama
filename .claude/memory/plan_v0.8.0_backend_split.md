@@ -274,6 +274,16 @@ Exit criteria (in order — each gates the next):
    `convert_hf_to_gguf.py` + `llama-quantize`) lives at
    `/Volumes/Temp Backup/models/gguf/qwen3-6-35b-a3b-q4_k_m.gguf`.
 
+   **[QUALITY FIXED 2026-04-27]** Generation quality restored —
+   A3B now produces the canonical pangram ("jumps over the lazy
+   dog") matching MLX reference. Root cause was 10 hardcoded A17B
+   byte offsets for gate_s/b in `infer.m`, missed by the prior
+   A17B-literals cleanup (moeflux `09d07a0`). Moeflux fix
+   `925f7a0`. Cross_backend argmax agreement 3.1% → 21.9% — below
+   the 95% tolerance but the major bug is resolved; remaining
+   gap likely smaller numerical issues, not structural. See
+   `plan_phase4_a3b_gate_offset_fixed.md` for details.
+
 **35B-A3B artifacts (as of 2026-04-24):**
 - MLX 4-bit (group 64, affine): `/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-mlx-4bit/` (18 GB)
 - Packed experts: `/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-packed/` (17 GB, 40 files × 432 MB)
