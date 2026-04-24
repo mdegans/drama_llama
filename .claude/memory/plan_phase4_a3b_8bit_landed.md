@@ -98,25 +98,45 @@ Not the 8-bit gate dequant. Not A_log. Not a fundamental routing
 bug (output is coherent, top-10 token candidates overlap with
 llama.cpp's).
 
-Candidates for next session, in rough order of likelihood:
+**Additional rule-outs this session (don't re-test):**
 
-1. **Cumulative FP16/BF16 precision drift** across 40 layers. The
-   debug doc noted A3B has only 2048 HIDDEN_DIM (vs A17B's 4096),
-   which gives less numerical headroom per layer; moeflux's
-   `MTLMathModeFast` may cost us more on A3B than it does on A17B.
-   Try switching to `MTLMathModeSafe` as a one-line A-B test.
+- **`MTLMathModeSafe`** produces bit-identical output to
+  `MTLMathModeFast` on A3B for this prompt. So FP fast-math
+  reassociation across 40 layers is **not** the source of the
+  divergence. Reverted to Fast for performance.
+- **8-bit dispatch is actually happening.** A diagnostic counter
+  (temporarily added, then reverted) showed 80 dispatches per
+  token = 40 layers × 2 tensors (gate + seg) × 1 token via
+  `ctx->matvec_8bit_v3`. 100% hit rate; no silent 4-bit fallback.
+  First dispatch is in_dim=2048 out_dim=256 (routing gate) as
+  expected.
+- **No other dtype divergences** between A3B and A17B manifests
+  beyond A_log. I diffed all non-quantized tensors; they're BF16
+  on both variants with parallel structure.
+
+**Still not tested** (order of decreasing likelihood):
+
+1. **Does the Metal 8-bit kernel numerically match the CPU 8-bit
+   path?** The numpy cross-check verified the CPU-style dequant
+   matches MLX; the Metal kernel *implements the same math* but
+   isn't independently tested against the same reference. A
+   one-token forced-CPU run would rule this in or out. Needs a
+   small surgical patch to make `gpu_encode_batch_matvec` skip
+   8-bit specs and have `fast_batch_matvec` handle them CPU-only
+   instead.
 
 2. **Qwen3.6-specific architectural detail we haven't surfaced.**
    moeflux was built around A17B. A3B is same family but not
    identical. The debug doc already ruled out shape constants,
    embedding dequant, attention gate split, mRoPE config, layer-
-   type pattern, and 8-bit dequant. Gated attention's exact scale
-   factor? GPT-2 vs. something else in tokenizer bytes-to-unicode?
+   type pattern, and 8-bit dequant. Remaining suspects: gated
+   attention's scale factor, some detail in delta-net's beta
+   gating, shared-expert combine weights.
 
 3. **Bug #4 from the debug doc** — the `gpu_linear_sentinel`
    fallback read. Non-fused path, shouldn't be hit on normal A3B
-   runs. But worth confirming the fused path is actually the one
-   being used end-to-end (a printf at layer 0 would answer).
+   runs. Worth confirming the fused path is actually the one
+   being used (easy printf at layer 0).
 
 ## moeflux repo state
 
