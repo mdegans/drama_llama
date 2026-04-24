@@ -1,5 +1,17 @@
 # moeflux A3B debug — full findings
 
+> **STATUS (2026-04-26): SUPERSEDED for current state by
+> `plan_phase4_a3b_8bit_landed.md`.** Retained as a reference for:
+>   - Bug #4 (`gpu_linear_sentinel` non-fused fallback) — still open
+>   - The "Handy paths" section — still accurate
+>   - The "Key commands for next session" block — still works
+>   - MLX ground-truth invocation — still the right way to get it
+>
+> Bugs #1, #2, and #3 in this doc all have fixes landed upstream
+> (bug #1 commit `09d07a0`; bugs #2 and #3 commit `f47c0b3`). When
+> picking up, read `plan_phase4_a3b_8bit_landed.md` first; come
+> back here only for the bug-#4 details or the reference commands.
+
 Session 2026-04-25. Started at "A3B produces degenerate output on
 moeflux"; ended with bug categorized, partial workarounds proven, and
 clean upstream hygiene fixes landed. Enough to pick up the real fix
