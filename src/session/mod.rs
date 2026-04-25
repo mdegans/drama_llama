@@ -79,12 +79,18 @@ use std::{num::NonZeroUsize, path::PathBuf};
 use misanthropic::response::Usage;
 
 use crate::{
-    chat_template::tokenize_with_breakpoints, grammar_for_prompt,
-    output_config, silence_logs, ChatTemplate, ChatTemplateError,
-    LlamaCppEngine, NewError, OutputConfigError, OutputConfigOptions,
-    PredictOptions, Prompt, RenderOptions, RepetitionOptions, SampleOptions,
-    SamplingMode, Token, ToolChoiceError, ToolChoiceOptions,
+    backend::{Backend, Model}, chat_template::tokenize_with_breakpoints,
+    grammar_for_prompt, output_config, ChatTemplate, ChatTemplateError, Engine,
+    OutputConfigError, OutputConfigOptions, PredictOptions, Prompt,
+    RenderOptions, RepetitionOptions, SampleOptions, SamplingMode, Token,
+    ToolChoiceError, ToolChoiceOptions,
 };
+
+#[cfg(feature = "llama-cpp")]
+use crate::{silence_logs, LlamaCppBackend, NewError};
+
+#[cfg(all(feature = "moeflux", target_os = "macos"))]
+use crate::{moeflux::engine::MoefluxEngineError, MoefluxBackend};
 
 mod parse;
 pub use parse::{parse_completion, BlockParser};
@@ -92,9 +98,18 @@ pub use parse::{parse_completion, BlockParser};
 /// Errors from [`Session`].
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
-    /// LlamaCppModel load / llama.cpp init failure.
-    #[error("engine setup: {0}")]
+    /// llama.cpp engine setup failed (model load or context init).
+    /// Only emitted by `Session<LlamaCppBackend>::from_path*`
+    /// constructors.
+    #[cfg(feature = "llama-cpp")]
+    #[error("llama.cpp engine setup: {0}")]
     LlamaCppEngine(#[from] NewError),
+    /// Moeflux engine setup failed (artifact discovery, MLX parse, or
+    /// `mf_init_model`). Only emitted by
+    /// `Session<MoefluxBackend>::from_path`.
+    #[cfg(all(feature = "moeflux", target_os = "macos"))]
+    #[error("moeflux engine setup: {0}")]
+    MoefluxEngine(#[from] MoefluxEngineError),
     /// The model has no embedded `tokenizer.chat_template`, or the template
     /// failed to compile.
     #[error("chat template: {0}")]
@@ -230,10 +245,16 @@ pub struct TopKEntry {
     pub piece: String,
 }
 
-/// Chat-style inference session: owns an [`LlamaCppEngine`] + [`ChatTemplate`] plus the
-/// builder-configured defaults for each `complete_*` call.
-pub struct Session {
-    engine: LlamaCppEngine,
+/// Chat-style inference session: owns an [`Engine`] + [`ChatTemplate`]
+/// plus the builder-configured defaults for each `complete_*` call.
+///
+/// Generic over a [`Backend`] so the same chat-style surface drives
+/// either llama.cpp ([`LlamaCppBackend`]) or moeflux
+/// ([`MoefluxBackend`]). Backend-specific constructors
+/// (`Session::<B>::from_path*`) live in specialized impl blocks; the
+/// rest of the API is generic.
+pub struct Session<B: Backend> {
+    engine: Engine<B>,
     template: ChatTemplate,
     tool_choice_opts: ToolChoiceOptions,
     output_config_opts: OutputConfigOptions,
@@ -263,22 +284,26 @@ pub struct Session {
     total_usage: Usage,
 }
 
-impl Session {
+// llama.cpp-specific constructors. Available only when the
+// `llama-cpp` feature is enabled.
+#[cfg(feature = "llama-cpp")]
+impl Session<LlamaCppBackend> {
     /// Load a model from disk and wire up the chat template.
     pub fn from_path(path: PathBuf) -> Result<Self, SessionError> {
-        let engine = LlamaCppEngine::from_path(path)?;
+        let engine = crate::LlamaCppEngine::from_path(path)?;
         Self::from_engine(engine)
     }
 
     /// Load a model from disk with an explicit Flash Attention policy.
     ///
     /// Diagnostic escape hatch for output-divergence debugging — see
-    /// [`FlashAttention`] for the when and why.
+    /// [`FlashAttention`](crate::FlashAttention) for the when and why.
     pub fn from_path_with_flash_attention(
         path: PathBuf,
         fa: crate::FlashAttention,
     ) -> Result<Self, SessionError> {
-        let engine = LlamaCppEngine::from_path_with_flash_attention(path, fa)?;
+        let engine =
+            crate::LlamaCppEngine::from_path_with_flash_attention(path, fa)?;
         Self::from_engine(engine)
     }
 
@@ -294,20 +319,53 @@ impl Session {
         path: PathBuf,
         n_ctx: u32,
     ) -> Result<Self, SessionError> {
-        let engine = LlamaCppEngine::from_path_with_n_ctx(path, n_ctx)?;
+        let engine = crate::LlamaCppEngine::from_path_with_n_ctx(path, n_ctx)?;
         Self::from_engine(engine)
     }
 
     /// Load a model CPU-only (zero GPU layers). Diagnostic path for
     /// isolating GPU-kernel divergence.
     pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, SessionError> {
-        let engine = LlamaCppEngine::from_path_cpu_only(path)?;
+        let engine = crate::LlamaCppEngine::from_path_cpu_only(path)?;
         Self::from_engine(engine)
     }
 
-    /// Wrap an already-constructed [`LlamaCppEngine`]. Useful when the engine
-    /// was built via [`LlamaCppEngine::new`] with custom context parameters.
-    pub fn from_engine(engine: LlamaCppEngine) -> Result<Self, SessionError> {
+    /// Silence llama.cpp's log spew (model load progress, KV cache
+    /// setup, compute buffer sizing, etc.). Process-global effect —
+    /// calling it on any [`Session`] silences logs for every
+    /// subsequent inference in the process.
+    ///
+    /// llama.cpp-specific. The [`restore_default_logs`](crate::restore_default_logs)
+    /// free function flips the flag back.
+    pub fn quiet(self) -> Self {
+        silence_logs();
+        self
+    }
+}
+
+// Moeflux-specific constructor. Available only on macOS with the
+// `moeflux` feature enabled.
+#[cfg(all(feature = "moeflux", target_os = "macos"))]
+impl Session<MoefluxBackend> {
+    /// Load a moeflux model from a parent directory using the
+    /// drama_llama folder convention: `parent/mlx/`,
+    /// `parent/artifacts/`, `parent/root/` (the experts dir).
+    /// Defaults `experts_per_tok = 8`, `use_2bit = false` — the Qwen3
+    /// MoE 4-bit setup. Power users who need explicit paths or
+    /// non-default runtime params can construct a
+    /// [`crate::MoefluxEngine`] directly via `MoefluxEngine::from_paths`
+    /// and hand it to [`Self::from_engine`].
+    pub fn from_path(parent: PathBuf) -> Result<Self, SessionError> {
+        let engine = crate::MoefluxEngine::from_path(&parent)?;
+        Self::from_engine(engine)
+    }
+}
+
+impl<B: Backend> Session<B> {
+    /// Wrap an already-constructed [`Engine`]. Useful when the engine
+    /// was built with custom parameters (specific context size, GPU
+    /// layout, moeflux runtime knobs, ...).
+    pub fn from_engine(engine: Engine<B>) -> Result<Self, SessionError> {
         let template = ChatTemplate::from_model(&engine.model)?;
         Ok(Self {
             engine,
@@ -348,20 +406,6 @@ impl Session {
     /// state, equivalent to the default.
     pub fn without_repetition(mut self) -> Self {
         self.repetition = None;
-        self
-    }
-
-    /// Silence llama.cpp's log spew (model load progress, KV cache setup,
-    /// compute buffer sizing, etc.). This is a process-global effect — calling
-    /// it on any [`Session`] silences logs for every subsequent inference in
-    /// the process.
-    ///
-    /// Consumer of `Session`. The [`restore_default_logs`] free function flips
-    /// the flag back.
-    ///
-    /// [`restore_default_logs`]: crate::restore_default_logs
-    pub fn quiet(self) -> Self {
-        silence_logs();
         self
     }
 
@@ -524,16 +568,18 @@ impl Session {
         &self.total_usage
     }
 
-    /// Borrow the underlying [`LlamaCppEngine`] — useful when the caller needs raw
-    /// predictor access for something `Session` doesn't expose yet (e.g. custom
-    /// stop-sequence management).
-    pub fn engine(&self) -> &LlamaCppEngine {
+    /// Borrow the underlying [`Engine`] — useful when the caller needs
+    /// raw predictor access for something `Session` doesn't expose yet
+    /// (e.g. custom stop-sequence management). Concretely this returns
+    /// `&LlamaCppEngine` or `&MoefluxEngine` depending on `B`, since
+    /// those are type aliases for `Engine<...Backend>`.
+    pub fn engine(&self) -> &Engine<B> {
         &self.engine
     }
 
-    /// Mutable borrow of the underlying [`LlamaCppEngine`]. Handy for KV-cache
+    /// Mutable borrow of the underlying [`Engine`]. Handy for KV-cache
     /// manipulation across turns.
-    pub fn engine_mut(&mut self) -> &mut LlamaCppEngine {
+    pub fn engine_mut(&mut self) -> &mut Engine<B> {
         &mut self.engine
     }
 
@@ -872,7 +918,7 @@ impl Session {
     pub fn complete_stream<'s>(
         &'s mut self,
         prompt: &Prompt,
-    ) -> Result<BlockStream<'s>, SessionError> {
+    ) -> Result<BlockStream<'s, B>, SessionError> {
         let (tokens, breakpoints, modes, deferred_grammar) =
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
@@ -1220,7 +1266,12 @@ impl Session {
         Ok(misanthropic::response::Message {
             id: std::borrow::Cow::Owned(uuid::Uuid::new_v4().to_string()),
             inner,
-            model: self.engine.model.desc().into(),
+            model: self
+                .engine
+                .model
+                .display_name()
+                .unwrap_or_else(|| "unknown".to_string())
+                .into(),
             stop_reason: outcome.stop_reason,
             stop_sequence: outcome.stop_sequence.map(std::borrow::Cow::Owned),
             usage,
@@ -1385,8 +1436,8 @@ fn infer_stop_reason(
 /// Drops trailing EOS and `[Invalid UTF-8]` pieces the predictor emits at
 /// stream end — those are artifacts of token-to-string conversion, not model
 /// output.
-pub struct BlockStream<'engine> {
-    predictor: crate::PiecePredictor<'engine, crate::LlamaCppBackend>,
+pub struct BlockStream<'engine, B: Backend> {
+    predictor: crate::PiecePredictor<'engine, B>,
     parser: BlockParser,
     pending: std::collections::VecDeque<crate::Block>,
     /// EOS piece text — we filter it out of the stream since it's a
@@ -1395,7 +1446,7 @@ pub struct BlockStream<'engine> {
     drained: bool,
 }
 
-impl<'engine> Iterator for BlockStream<'engine> {
+impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
     type Item = crate::Block;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1432,7 +1483,7 @@ impl<'engine> Iterator for BlockStream<'engine> {
 /// Strip trailing EOS piece and the `[Invalid UTF-8]` marker predictors emit
 /// for byte-fallback tokens at stream end. Matches what
 /// `examples/strawberry.rs` does by hand today.
-fn trim_eos<'a>(text: &'a str, engine: &LlamaCppEngine) -> &'a str {
+fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
     let eos_piece = engine.model.token_to_piece(engine.model.eos());
     text.trim_end_matches(eos_piece.as_str())
         .trim_end_matches("[Invalid UTF-8]")
@@ -1787,7 +1838,7 @@ mod tests {
     /// first-value edge case.
     #[test]
     fn test_make_usage_populates_cache_counters() {
-        let u = Session::make_usage(100, 42, 10);
+        let u = Session::<crate::LlamaCppBackend>::make_usage(100, 42, 10);
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.cache_read_input_tokens, Some(42));
         assert_eq!(u.cache_creation_input_tokens, Some(0));

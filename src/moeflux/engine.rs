@@ -63,4 +63,40 @@ impl MoefluxEngine {
         )?;
         Ok(Self { decoder, model })
     }
+
+    /// Open a moeflux engine from a single parent directory using the
+    /// drama_llama folder convention:
+    ///
+    /// - `parent/mlx/` — MLX export (tokenizer, config, optional
+    ///   `chat_template.jinja`).
+    /// - `parent/artifacts/` — moeflux artifacts directory (contains
+    ///   `model_weights.bin`, `model_weights.json`, `vocab.bin`).
+    /// - `parent/root/` — the experts directory (contains
+    ///   `packed_experts/`).
+    ///
+    /// Defaults `experts_per_tok = 8`, `use_2bit = false` — the Qwen3
+    /// MoE 4-bit setup. Power users who need explicit paths or
+    /// non-default runtime params can use [`Self::from_paths`]
+    /// directly.
+    ///
+    /// This is the constructor `blallama` uses on the moeflux side so
+    /// `--model <path>` is symmetric with the llama.cpp path. The
+    /// convention is forward-looking — current on-disk artifacts use
+    /// flat sibling layout (`<stem>-mlx-4bit/`, `<stem>-artifacts/`,
+    /// `<stem>-root/`); migration via the moeflux conversion script
+    /// is tracked in `.claude/memory/`.
+    pub fn from_path(
+        parent: &Path,
+    ) -> Result<Self, MoefluxEngineError> {
+        let mlx_dir = parent.join("mlx");
+        let artifacts_dir = parent.join("artifacts");
+        let experts_dir = parent.join("root");
+        Self::from_paths(
+            &mlx_dir,
+            &artifacts_dir,
+            &experts_dir,
+            8,
+            false,
+        )
+    }
 }

@@ -90,9 +90,15 @@ pub use predictor::{
     TokenPredictor,
 };
 
-#[cfg(feature = "llama-cpp")]
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
 mod session;
-#[cfg(feature = "llama-cpp")]
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
 pub use session::{
     parse_completion, BlockParser, BlockStream, Session, SessionError,
     TokenTrace, TopKEntry,
