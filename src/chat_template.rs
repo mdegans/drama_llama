@@ -48,7 +48,9 @@ use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 use minijinja::{value::Value as JinjaValue, Environment, Error as JinjaError};
 use serde::Serialize;
 
-use crate::{prompt::Tool, Block, Content, LlamaCppModel, Prompt, Role, Token};
+use crate::{
+    backend::Model, prompt::Tool, Block, Content, Prompt, Role, Token,
+};
 
 /// Render a [`Tool`] as the OpenAI wire envelope cogito / Qwen /
 /// Hermes-family chat templates expect.
@@ -107,13 +109,15 @@ impl std::fmt::Debug for ChatTemplate {
 }
 
 impl ChatTemplate {
-    /// Load the chat template from a GGUF model.
+    /// Load the chat template from any [`Model`].
     ///
-    /// Reads `tokenizer.chat_template` for the template source and
-    /// renders BOS/EOS pieces from the model's token ids.
-    pub fn from_model(model: &LlamaCppModel) -> Result<Self, ChatTemplateError> {
+    /// Reads the template via [`Model::chat_template_source`]
+    /// (`tokenizer.chat_template` GGUF metadata for llama.cpp; the
+    /// bundled `chat_template.jinja` for moeflux) and renders BOS/EOS
+    /// pieces from the model's token ids.
+    pub fn from_model<M: Model>(model: &M) -> Result<Self, ChatTemplateError> {
         let source = model
-            .get_meta("tokenizer.chat_template")
+            .chat_template_source()
             .ok_or(ChatTemplateError::NoTemplate)?;
         let bos = model.token_to_piece(model.bos());
         let eos = model.token_to_piece(model.eos());
@@ -494,8 +498,8 @@ fn render_partial(
 /// don't need it yet, hence `pub(crate)`.
 ///
 /// [`Session::prepare_call`]: crate::Session
-pub(crate) fn tokenize_with_breakpoints(
-    model: &LlamaCppModel,
+pub(crate) fn tokenize_with_breakpoints<M: Model>(
+    model: &M,
     rendered: &RenderedWithBreakpoints,
 ) -> (Vec<Token>, Vec<usize>) {
     let full_tokens = model.tokenize(&rendered.text, true);

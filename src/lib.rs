@@ -39,9 +39,7 @@ pub use prompt::{
     Tool, ToolChoice, UserMessage,
 };
 
-#[cfg(feature = "llama-cpp")]
 mod chat_template;
-#[cfg(feature = "llama-cpp")]
 pub use chat_template::{ChatTemplate, ChatTemplateError, RenderOptions};
 
 /// Re-export of [`minijinja`] for callers who need to construct
