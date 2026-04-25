@@ -1386,11 +1386,7 @@ fn infer_stop_reason(
 /// stream end — those are artifacts of token-to-string conversion, not model
 /// output.
 pub struct BlockStream<'engine> {
-    predictor: crate::PiecePredictor<
-        'engine,
-        crate::LlamaCppDecoder,
-        crate::LlamaCppModel,
-    >,
+    predictor: crate::PiecePredictor<'engine, crate::LlamaCppBackend>,
     parser: BlockParser,
     pending: std::collections::VecDeque<crate::Block>,
     /// EOS piece text — we filter it out of the stream since it's a

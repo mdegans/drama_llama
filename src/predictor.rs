@@ -3,7 +3,7 @@ use std::num::{NonZeroU128, NonZeroUsize};
 use xorshift::{SeedableRng, Xoroshiro128};
 
 use crate::{
-    backend::{Decoder, Model},
+    backend::{Backend, Decoder, Model},
     ngram::NGramStats,
     sample::SampleOptions,
     Candidates, Engine, NGram, Token,
@@ -263,9 +263,9 @@ impl PredictOptions {
 /// `new_resuming`) runs the initial prefill via [`Decoder::prefill`];
 /// subsequent steps use [`Decoder::step`] after each
 /// [`CandidatePredictor::record_choice`].
-pub struct CandidatePredictor<'engine, D: Decoder, M: Model> {
+pub struct CandidatePredictor<'engine, B: Backend> {
     /// The inference engine.
-    pub engine: &'engine mut Engine<D, M>,
+    pub engine: &'engine mut Engine<B>,
     /// The tokens seen so far (prompt + any recorded choices).
     pub tokens: Vec<Token>,
     /// First-step candidates captured from the initial prefill —
@@ -284,12 +284,12 @@ pub struct CandidatePredictor<'engine, D: Decoder, M: Model> {
     pub n: NonZeroUsize,
 }
 
-impl<'engine, D: Decoder, M: Model> CandidatePredictor<'engine, D, M> {
+impl<'engine, B: Backend> CandidatePredictor<'engine, B> {
     /// Create a new `CandidatePredictor` that predicts `n` [`Candidates`]
     /// containers. Clears the KV cache and prefills `tokens` starting
     /// at position 0 on sequence 0.
     pub fn new(
-        engine: &'engine mut Engine<D, M>,
+        engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         n: NonZeroUsize,
     ) -> Self {
@@ -325,7 +325,7 @@ impl<'engine, D: Decoder, M: Model> CandidatePredictor<'engine, D, M> {
     /// # Panics
     /// * If `tokens` is empty — there's nothing to resume from.
     pub fn new_resuming(
-        engine: &'engine mut Engine<D, M>,
+        engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         start_pos: usize,
         seq_id: i32,
@@ -365,8 +365,8 @@ impl<'engine, D: Decoder, M: Model> CandidatePredictor<'engine, D, M> {
     }
 }
 
-impl<'engine, D: Decoder, M: Model> Iterator
-    for CandidatePredictor<'engine, D, M>
+impl<'engine, B: Backend> Iterator
+    for CandidatePredictor<'engine, B>
 {
     type Item = Candidates;
 
@@ -399,15 +399,15 @@ impl<'engine, D: Decoder, M: Model> Iterator
     }
 }
 
-impl<'engine, D: Decoder, M: Model> From<CandidatePredictor<'engine, D, M>>
+impl<'engine, B: Backend> From<CandidatePredictor<'engine, B>>
     for Vec<Token>
 {
-    fn from(predictor: CandidatePredictor<'engine, D, M>) -> Self {
+    fn from(predictor: CandidatePredictor<'engine, B>) -> Self {
         predictor.tokens
     }
 }
 
-pub struct TokenPredictor<'engine, D: Decoder, M: Model> {
+pub struct TokenPredictor<'engine, B: Backend> {
     rng: Xoroshiro128,
     ngram_stats: NGramStats,
     options: PredictOptions,
@@ -415,12 +415,12 @@ pub struct TokenPredictor<'engine, D: Decoder, M: Model> {
     pub(crate) max_stop_len: usize,
     /// Mu value for Mirostat sampling
     mu: Option<f32>,
-    pub(crate) inner: CandidatePredictor<'engine, D, M>,
+    pub(crate) inner: CandidatePredictor<'engine, B>,
 }
 
-impl<'engine, D: Decoder, M: Model> TokenPredictor<'engine, D, M> {
+impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     pub fn new(
-        engine: &'engine mut Engine<D, M>,
+        engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         options: PredictOptions,
     ) -> Self {
@@ -441,7 +441,7 @@ impl<'engine, D: Decoder, M: Model> TokenPredictor<'engine, D, M> {
     /// Create a `TokenPredictor` that resumes generation from a
     /// pre-populated KV cache.
     pub fn new_resuming(
-        engine: &'engine mut Engine<D, M>,
+        engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         start_pos: usize,
         seq_id: i32,
@@ -467,7 +467,7 @@ impl<'engine, D: Decoder, M: Model> TokenPredictor<'engine, D, M> {
     /// normalization, RNG construction, n-gram stats seeding, and the
     /// max stop-sequence length.
     fn prepare(
-        engine: &Engine<D, M>,
+        engine: &Engine<B>,
         tokens: &[Token],
         mut options: PredictOptions,
     ) -> (Xoroshiro128, NGramStats, PredictOptions, usize) {
@@ -535,19 +535,19 @@ impl<'engine, D: Decoder, M: Model> TokenPredictor<'engine, D, M> {
     }
 }
 
-impl<'engine, D: Decoder, M: Model> From<TokenPredictor<'engine, D, M>>
+impl<'engine, B: Backend> From<TokenPredictor<'engine, B>>
     for Vec<Token>
 {
-    fn from(predictor: TokenPredictor<'engine, D, M>) -> Self {
+    fn from(predictor: TokenPredictor<'engine, B>) -> Self {
         predictor.inner.into()
     }
 }
 
-// `M: Sync` is required because the grammar filter fans candidate
-// validation out across rayon's pool and borrows the model across
-// threads.
-impl<'engine, D: Decoder, M: Model + Sync> Iterator
-    for TokenPredictor<'engine, D, M>
+// `B::Model: Sync` is required because the grammar filter fans
+// candidate validation out across rayon's pool and borrows the model
+// across threads. Backend's bound on Model satisfies this implicitly.
+impl<'engine, B: Backend> Iterator
+    for TokenPredictor<'engine, B>
 {
     type Item = Token;
 
@@ -668,13 +668,13 @@ fn find_deferred_trigger_end(
 ///
 /// If the predictor stops predicting because of a stop sequence, the text will
 /// be truncated at the stop sequence.
-pub struct PiecePredictor<'engine, D: Decoder, M: Model> {
-    inner: TokenPredictor<'engine, D, M>,
+pub struct PiecePredictor<'engine, B: Backend> {
+    inner: TokenPredictor<'engine, B>,
 }
 
-impl<'engine, D: Decoder, M: Model> PiecePredictor<'engine, D, M> {
+impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     pub fn new(
-        engine: &'engine mut Engine<D, M>,
+        engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         options: PredictOptions,
     ) -> Self {
@@ -685,7 +685,7 @@ impl<'engine, D: Decoder, M: Model> PiecePredictor<'engine, D, M> {
     /// Create a `PiecePredictor` that resumes generation from a
     /// pre-populated KV cache.
     pub fn new_resuming(
-        engine: &'engine mut Engine<D, M>,
+        engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         start_pos: usize,
         seq_id: i32,
@@ -714,7 +714,7 @@ impl<'engine, D: Decoder, M: Model> PiecePredictor<'engine, D, M> {
     }
 }
 
-impl<'engine, D: Decoder, M: Model + Sync> PiecePredictor<'engine, D, M> {
+impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     /// Predict and collect all the pieces, truncating at stop sequences.
     pub fn collect_text(mut self) -> String {
         while let Some(_) = self.next() {}
@@ -742,8 +742,8 @@ impl<'engine, D: Decoder, M: Model + Sync> PiecePredictor<'engine, D, M> {
     }
 }
 
-impl<'engine, D: Decoder, M: Model + Sync> Iterator
-    for PiecePredictor<'engine, D, M>
+impl<'engine, B: Backend> Iterator
+    for PiecePredictor<'engine, B>
 {
     type Item = String;
 
@@ -788,18 +788,18 @@ impl<'engine, D: Decoder, M: Model + Sync> Iterator
     }
 }
 
-impl<'engine, D: Decoder, M: Model> From<PiecePredictor<'engine, D, M>>
+impl<'engine, B: Backend> From<PiecePredictor<'engine, B>>
     for String
 {
-    fn from(predictor: PiecePredictor<'engine, D, M>) -> Self {
+    fn from(predictor: PiecePredictor<'engine, B>) -> Self {
         predictor.into_text()
     }
 }
 
-impl<'engine, D: Decoder, M: Model> From<PiecePredictor<'engine, D, M>>
+impl<'engine, B: Backend> From<PiecePredictor<'engine, B>>
     for Vec<Token>
 {
-    fn from(predictor: PiecePredictor<'engine, D, M>) -> Self {
+    fn from(predictor: PiecePredictor<'engine, B>) -> Self {
         predictor.inner.inner.tokens
     }
 }
@@ -813,13 +813,13 @@ pub struct Predicted {
     pub piece: String,
 }
 
-pub struct Predictor<'engine, D: Decoder, M: Model> {
-    inner: PiecePredictor<'engine, D, M>,
+pub struct Predictor<'engine, B: Backend> {
+    inner: PiecePredictor<'engine, B>,
 }
 
-impl<'engine, D: Decoder, M: Model> Predictor<'engine, D, M> {
+impl<'engine, B: Backend> Predictor<'engine, B> {
     pub fn new(
-        engine: &'engine mut Engine<D, M>,
+        engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         options: PredictOptions,
     ) -> Self {
@@ -833,8 +833,8 @@ impl<'engine, D: Decoder, M: Model> Predictor<'engine, D, M> {
     }
 }
 
-impl<'engine, D: Decoder, M: Model + Sync> Iterator
-    for Predictor<'engine, D, M>
+impl<'engine, B: Backend> Iterator
+    for Predictor<'engine, B>
 {
     type Item = Predicted;
 

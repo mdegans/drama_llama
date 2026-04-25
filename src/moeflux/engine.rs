@@ -10,14 +10,15 @@ use crate::{
     moeflux::{
         decoder::{MoefluxDecoder, MoefluxError},
         model::{MoefluxModel, MoefluxModelError},
+        MoefluxBackend,
     },
     Engine,
 };
 
 /// Convenience alias for the moeflux-backed pair. Use
 /// `MoefluxEngine::from_paths(...)` when you want the moeflux backend
-/// without spelling out `Engine<MoefluxDecoder, MoefluxModel>`.
-pub type MoefluxEngine = Engine<MoefluxDecoder, MoefluxModel>;
+/// without spelling out `Engine<MoefluxBackend>`.
+pub type MoefluxEngine = Engine<MoefluxBackend>;
 
 /// Errors from [`MoefluxEngine::from_paths`]. Wraps both the
 /// model-side (HF tokenizer / config) and decoder-side (mf_init_model)

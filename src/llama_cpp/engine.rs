@@ -1,5 +1,8 @@
 use crate::{
-    llama_cpp::decoder::{silence_logs, FlashAttention, LlamaCppDecoder, NewError, DecodeError},
+    llama_cpp::{
+        decoder::{silence_logs, FlashAttention, LlamaCppDecoder, NewError, DecodeError},
+        LlamaCppBackend,
+    },
     Batch, Engine, LlamaCppModel,
 };
 
@@ -15,7 +18,7 @@ use llama_cpp_sys_3::{
 /// Convenience alias for the llama.cpp-backed pair. Use
 /// `LlamaCppEngine::from_path(...)` etc. when you want the default
 /// backend without turbofish.
-pub type LlamaCppEngine = Engine<LlamaCppDecoder, LlamaCppModel>;
+pub type LlamaCppEngine = Engine<LlamaCppBackend>;
 
 impl LlamaCppEngine {
     /// Create a new `LlamaCppEngine` from common command line
