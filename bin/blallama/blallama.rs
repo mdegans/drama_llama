@@ -461,19 +461,18 @@ fn configure_session<B: Backend>(s: Session<B>) -> Session<B> {
             ]),
         )
         .with_prefix_cache(true)
-        // Session-level generation cap. Not n_ctx — that's the KV
-        // context window, set per-backend at engine construction
-        // (llama.cpp: `from_path_with_n_ctx(_, 65536)`; moeflux:
-        // compile-time per model variant, exposed via
-        // `engine().n_ctx()`). We pin the session cap to the same
-        // 65536 ceiling so the prompt's `max_tokens` always wins
-        // unless it explicitly asks for more than 64K, which would
-        // exceed any current model's context anyway.
-        .with_max_tokens(65536.try_into().unwrap());
+        // Session-level generation cap. Distinct from `n_ctx` — that's
+        // the KV context window, set per-backend at engine
+        // construction (llama.cpp: `from_path_with_n_ctx(_, 65536)`;
+        // moeflux: compile-time per model variant, surfaced in the
+        // `session_ready` log below). 8K is the per-request gen
+        // ceiling; the prompt's `max_tokens` wins when smaller, this
+        // clips runaway requests.
+        .with_max_tokens(8192.try_into().unwrap());
     tracing::info!(
         event = "session_ready",
         n_ctx = configured.engine().n_ctx(),
-        session_max_tokens = 65536u32,
+        session_max_tokens = 8192u32,
         model = configured
             .engine()
             .model
