@@ -1,88 +1,93 @@
-# Qwen3.5-A17B long-form free-generation degradation
+# Qwen3 long-form generation degradation — diagnosed
 
-Captured 2026-04-25. Parked for next session — not blocking.
+Captured 2026-04-25, updated same day after diagnosis.
 
 ## Symptom
 
-On Qwen3.5-A17B via moeflux (blallama path), schema-constrained
-generation works correctly (probe ratings round-trip cleanly,
-v0.8.0 grammar/Deny fixes resolve the reserved-token loop).
-**Free-text generation degrades over a few hundred tokens.**
+`blallama --backend moeflux` against either Qwen3.5-A17B or
+Qwen3.6-35B-A3B produced degenerate output on free-text long-form
+generation. A17B → sentence-fragment loops with periods between
+every word (`Start. With. First. Sentence.`). A3B → either
+synonym/thesaurus chains (`Dash. Race. Chase. Pursue. Hunt.`) or
+meta-collapse to "Wait, no? No? No?" within ~80 tokens depending
+on the run. Both rode past natural EOS to the `max_tokens` cap.
+Schema-constrained generation was unaffected because the grammar
+masked the degeneration token-by-token.
 
-balerion's benchmark probe (1000-word essay):
-- Despite explicit instruction "do not output any planning,
-  outline, thinking process," model produces a "Thinking Process"
-  outline anyway — Qwen's training likely makes thinking-mode
-  sticky regardless of prompt phrasing.
-- Near the end of generation, output devolves into
-  single-word-per-period gibberish:
-  > `Start. With. First. Sentence.`
-  > `History. Of. Programming. Is. Inextricably. Linked. To.`
-- 288 output tokens / 168 words / `stop_reason: end_turn`.
-  Generation terminates "naturally" but the content is broken.
-- 1.68 tok/s wall clock (matches expected; not a perf issue).
+## Diagnosis
 
-## Hypotheses
+Bisected via standalone `metal_infer/infer` on the same A3B model
+weights. Standalone produced fully coherent prose at 17 tok/s with
+natural EOS at token 251. blallama path with chat template +
+sampler produced word-salad. Bug therefore lived in the wrapper
+layer, not in moeflux's compute path.
 
-Two non-exclusive candidates:
+Two real bugs in the wrapper layer were found and fixed; the second
+is the dominant cause:
 
-1. **moeflux upstream routing bug** — known unfixed issue where
-   wrong experts fire for some inputs. Schema-constrained outputs
-   are insulated because grammar rejects malformed bytes; free
-   generation has no such floor, so misrouted experts produce
-   syntactically-valid-but-semantically-broken text that
-   accumulates into word-salad. Fits the "deteriorates with
-   length" pattern (more tokens → more chances for misrouting).
-2. **Qwen training quirk — sticky thinking mode**. The model may
-   not honor "no thinking" instructions because thinking mode is
-   strongly conditioned in the chat-template structure. Less
-   likely to explain the word-salad terminal state, but plausibly
-   contributes to the thinking-preamble.
+### Bug 1 (secondary contributor): Qwen3 chat template forced thinking mode
 
-## How to disambiguate
+`ChatTemplate::render_with` never consulted `prompt.thinking`. The
+bundled Qwen3 `chat_template.jinja` defaults `enable_thinking` to
+the truthy branch when undefined, emitting `<think>\n` after
+`<|im_start|>assistant\n`. Result: every blallama request to a
+Qwen3 model started inside an open `<think>` block regardless of
+the request payload. ollama exhibits the same bug for the same
+reason. Fixed by deriving `enable_thinking = prompt.thinking.is_some()`
+in `render_with`, mirroring Anthropic's API semantics (`None` =
+disabled, `Some(_)` = enabled). Caller-set
+`with_extra("enable_thinking", _)` continues to win.
 
-When the moeflux upstream routing fix lands, re-run the same
-1000-word essay probe:
+### Bug 2 (dominant cause): RepetitionOptions defaults too aggressive
 
-- **If long-form generation improves** (coherent prose, no
-  thinking-mode preamble, no word-salad): routing bug was
-  primary cause. Schema-constrained-only success masked it
-  because grammar enforced byte-level coherence.
-- **If long-form is still degenerate**: model-level quirk
-  dominates; would need prompt-engineering or chat-template
-  tweaks (or a different reasoning model) to fix.
+`RepetitionOptions::default()` ships `penalty_max_count=1`,
+`ngram_min_size=1`, `penalty_repeat=1.06`. Mike's note: those
+values were sized for small downstream models in Weave, not the
+larger MoE models drama_llama now drives. With max_count=1, after
+the second use of any content token (e.g. "Lisp", "function",
+"programming") every subsequent occurrence is penalised; the model
+picks synonyms which also get penalised; eventually it walks a
+thesaurus chain or collapses into the punctuation-allowed fragment
+loop. Schema-constrained survives because grammar mask outranks
+the penalty.
 
-A side test that disambiguates earlier: run the same essay probe
-on the **GGUF Q4_K_M of Qwen3.6-35B-A3B via llama.cpp** (we have
-the artifact). Same model family, no moeflux routing involved.
-- Coherent essay → moeflux routing bug is the cause.
-- Same degeneration → model-level. (A3B is smaller so quality
-  baseline is lower, but the *failure mode* — thinking mode
-  stuck on, word-salad terminal — should differ between routing
-  bug vs training quirk.)
+Confirmed by adding a `--no-repetition-penalty` flag to blallama
+and re-running the A3B essay. Result: 900 tokens of fully coherent,
+factually accurate prose — same model, same chat template fix,
+only difference was the penalty disabled.
 
-## Why this isn't blocking
+## Fixes shipped
 
-- Schema-constrained generation (the actual Agora council
-  workload) works correctly. Probe → JSON ratings round-trip is
-  the load-bearing path.
-- Free-text generation isn't on the council's critical path.
-  Council members converse in structured tool-call shapes, not
-  long-form essays.
-- A17B is a backup tier for the council, not the primary. Cogito
-  600B / API Anthropic remain primary. A17B-as-backup is good
-  enough at "will it generate JSON correctly?" — which is what
-  matters for governance decisions.
+- drama_llama commit `623fa31` (v0.8.0): chat-template
+  enable_thinking derivation + tests/template_rendering coverage.
+- drama_llama commit `7b95910` then `04a6d97`: blallama
+  `--repetition-penalty` (off by default, opt-in for diagnosis);
+  `configure_session` no longer calls `with_repetition` unless the
+  flag is set.
+- moeflux fork commit `d013a0b`: `MAX_K` 8 → 16 (incidental
+  correctness fix found in passing — A17B at K=10 was silently
+  dropping 2 of 10 routed experts per layer per token because the
+  `actual_K = (K > MAX_K) ? MAX_K : K` clamp at infer.m:5364 was a
+  no-op for A3B but truncated A17B unconditionally; routing weights
+  had already been normalised over full K so the dispatched MoE
+  residual was also under-scaled). Not the dominant cause but a
+  real bug fixed alongside.
+
+## Open work
+
+- **Tune `RepetitionOptions::default()`** — bumping `penalty_max_count`
+  to ~5, `ngram_min_size` to 2 or 3, and dropping `penalty_repeat`
+  closer to 1.0 should produce prose-friendly defaults. Possibly
+  size-aware (different defaults for small vs large models).
+- **Coverage for the surrounding repetition-sampling code** — Mike
+  flagged it as "either it's the tuning or something fundamentally
+  broken in the repetition penalty code." More tests required
+  before re-trusting it on by default.
 
 ## Cross-references
 
-- `grammar_reserved_token_loop.md` — sibling issue (also Qwen3,
-  also grammar-related, but reserved-token loop is fixed and
-  ruled out moeflux routing as cause for *that* bug via A3B
-  cross-backend test). The fact that THIS bug (long-form
-  degradation) only manifests on A17B (which we can't run on
-  llama.cpp at all) means we don't have a clean cross-backend
-  ruling for it yet.
-- v0.8.0 plan — moeflux upstream routing bug is in flash-moe /
-  moeflux's open-issue list; will get attention from
-  danveloper / balerion eventually.
+- `grammar_reserved_token_loop.md` — sibling Qwen3-related issue
+  (separate root cause: empty-piece reserved tokens passing
+  byte-stream grammars; fixed in v0.8.0 via Deny mask).
+- moeflux fork `~/Projects/moeflux` commit log — `d013a0b` for the
+  MAX_K bump, `925f7a0` for the earlier A3B gate-offset fix.

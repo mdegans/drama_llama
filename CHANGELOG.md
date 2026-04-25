@@ -97,6 +97,18 @@ the Anthropic API as a dependency.
 
 ### Fixed
 
+- **Qwen3 chat-template thinking-mode forced on by default.**
+  `ChatTemplate::render_with` never consulted `prompt.thinking`,
+  leaving the Jinja `enable_thinking` variable undefined. Templates
+  that gate their `<think>` block on it (Qwen3 family) interpret
+  undefined as "thinking on" and emit `<think>\n` after
+  `<|im_start|>assistant\n`, forcing the model into thinking mode
+  regardless of caller intent. Now derived from
+  `prompt.thinking.is_some()` mirroring Anthropic's API semantics
+  (`thinking: None` = disabled, `Some(_)` = enabled). Caller-set
+  `RenderOptions::with_extra("enable_thinking", _)` continues to win
+  for explicit overrides. ollama exhibits the same bug for the same
+  reason. Coverage in `tests/template_rendering.rs`.
 - **Reserved-token loop on grammar-constrained generation.**
   Tokenizers like Qwen3.5/3.6 carve out a reserved tail of the
   vocab (~248088..248320 for Qwen3) for special-token slots, only
@@ -129,6 +141,27 @@ the Anthropic API as a dependency.
 
 ### Notes
 
+- **`blallama` no longer enables the repetition-penalty filter by
+  default.** Current `RepetitionOptions::default()` settings
+  (`penalty_max_count=1`, `ngram_min_size=1`, `penalty_repeat=1.06`)
+  were originally sized for small downstream models in Weave; on the
+  larger MoE models drama_llama now drives they over-penalise common
+  content tokens during long-form free-text generation and degrade
+  output to thesaurus chains or sentence-fragment loops. New
+  `--repetition-penalty` flag re-enables the filter for diagnosis.
+  Library defaults stay; tuning + broader test coverage tracked
+  separately.
+- **Upstream moeflux MAX_K bump.** moeflux fork commit `d013a0b`
+  raises `MAX_K` from 8 to 16 in `metal_infer/infer.m` (plus the
+  combine-shader binding shifts). Without it, A17B (`K=10`) silently
+  drops 2 of 10 routed experts per layer per token because the
+  `actual_K = (K > MAX_K) ? MAX_K : K` clamp at line 5364 was a
+  no-op for A3B (`K=8`) but truncated A17B unconditionally; the
+  corresponding routing-weight normalisation already happened over
+  the full K, so the dispatched MoE residual was also under-scaled.
+  Not the dominant cause of the long-form-degeneration symptom we
+  diagnosed (the repetition-penalty defaults above were), but a real
+  correctness bug fixed in passing.
 - Build matrix: `--no-default-features` (trait layer only),
   `--features llama-cpp,...` (default), `--features
   moeflux-model-qwen3-6-35b-a3b` (moeflux only on macOS), and both
