@@ -119,6 +119,21 @@ impl PredictOptions {
                 opts.ignored.insert(eot.into());
             }
         }
+        // Multi-EOS configs (e.g. Qwen3 declares `eos_token_id` as
+        // `[<|im_end|>, <|endoftext|>]`). Without these, the model
+        // can sit in a loop on the secondary variant after a
+        // grammar-constrained response closes — its decoded text is
+        // empty for HF-style tokenizers, so the loop runs invisibly
+        // until `max_tokens` hits.
+        for extra in model.extra_eos_tokens() {
+            if extra == eos || extra == eot || extra < 0 {
+                continue;
+            }
+            self.stop_sequences.push(vec![extra]);
+            if let Some(opts) = &mut self.sample_options.repetition {
+                opts.ignored.insert(extra.into());
+            }
+        }
         self
     }
 

@@ -60,6 +60,13 @@ pub struct MoefluxModel {
     /// Resolved end-of-turn token id. For Qwen3-family models this
     /// equals EOS (`<|im_end|>` doubles as eot).
     eot: Token,
+    /// Additional EOS-like token ids. Qwen3 declares
+    /// `eos_token_id: [<|im_end|>, <|endoftext|>]`; we keep the
+    /// chat-EOS as `eos` and stash the rest here so the predictor
+    /// adds them to its stop sequences. Without this, the model can
+    /// loop on the secondary variant after a grammar-constrained
+    /// response completes.
+    extra_eos: Vec<Token>,
     /// Lazy maximum decoded piece length across the vocabulary.
     /// Populated on first call to [`Self::max_token_len`].
     max_token_len: OnceLock<usize>,
@@ -114,6 +121,7 @@ impl MoefluxModel {
         let eos = resolve_eos(&config, &tokenizer_config, &tokenizer);
         let bos = resolve_bos(&config, &tokenizer_config, &tokenizer);
         let eot = eos;
+        let extra_eos = resolve_extra_eos(&config, eos);
 
         let name = mlx_dir
             .file_name()
@@ -126,6 +134,7 @@ impl MoefluxModel {
             eos,
             bos,
             eot,
+            extra_eos,
             max_token_len: OnceLock::new(),
             name,
         })
@@ -292,6 +301,10 @@ impl Model for MoefluxModel {
     fn display_name(&self) -> Option<String> {
         self.name.clone()
     }
+
+    fn extra_eos_tokens(&self) -> Vec<Token> {
+        self.extra_eos.clone()
+    }
 }
 
 /// Parse `eos_token_id` from config.json. Qwen3 emits an array
@@ -329,6 +342,27 @@ fn resolve_eos(
         }
     }
     -1
+}
+
+/// Collect every EOS-like token id beyond the primary `eos` from
+/// `config.json`. Qwen3 declares `eos_token_id: [<|im_end|>,
+/// <|endoftext|>]`; `resolve_eos` keeps the first (chat-EOS), and
+/// this returns the rest deduped + EOS-filtered. Returns an empty
+/// vec for single-EOS configs.
+fn resolve_extra_eos(config: &JsonValue, primary_eos: Token) -> Vec<Token> {
+    let Some(JsonValue::Array(arr)) = config.get("eos_token_id") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for v in arr {
+        let Some(id) = v.as_i64() else { continue };
+        let id = id as Token;
+        if id == primary_eos || id < 0 || out.contains(&id) {
+            continue;
+        }
+        out.push(id);
+    }
+    out
 }
 
 /// Parse `bos_token_id` from config.json or look up the `bos_token`

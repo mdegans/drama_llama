@@ -934,8 +934,21 @@ impl<B: Backend> Session<B> {
         let usage = Self::make_usage(prompt_tokens, l_hit, 0);
         self.record_usage(usage);
 
-        let eos_piece =
-            self.engine.model.token_to_piece(self.engine.model.eos());
+        let mut eos_pieces: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        eos_pieces.insert(
+            self.engine.model.token_to_piece(self.engine.model.eos()),
+        );
+        let eot_id = self.engine.model.eot();
+        if eot_id >= 0 {
+            eos_pieces.insert(self.engine.model.token_to_piece(eot_id));
+        }
+        for extra in self.engine.model.extra_eos_tokens() {
+            if extra >= 0 {
+                eos_pieces.insert(self.engine.model.token_to_piece(extra));
+            }
+        }
+        eos_pieces.remove("");
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
@@ -956,7 +969,7 @@ impl<B: Backend> Session<B> {
             predictor,
             parser: BlockParser::new(),
             pending: std::collections::VecDeque::new(),
-            eos_piece,
+            eos_pieces,
             drained: false,
         })
     }
@@ -986,8 +999,30 @@ impl<B: Backend> Session<B> {
 
         let (suffix, l_hit) = self.kv_setup_for_call(&tokens, &breakpoints);
 
-        let eos_piece =
-            self.engine.model.token_to_piece(self.engine.model.eos());
+        // Pieces we drop from the surfaced output: the primary EOS,
+        // the EOT (if distinct), every extra-EOS the model declares
+        // (e.g. Qwen3's `<|endoftext|>`), and the invalid-UTF-8
+        // sentinel. Pre-decode once so the inner loop is a hash
+        // lookup. Empty pieces are kept out of the set — empty is
+        // also what a stuck-on-secondary-EOS loop emits, but we'd
+        // rather rely on the new `extra_eos_tokens` plumbing in
+        // PredictOptions::add_model_stops to halt the loop cleanly
+        // than silently swallow every empty piece.
+        let mut eos_pieces: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        eos_pieces.insert(
+            self.engine.model.token_to_piece(self.engine.model.eos()),
+        );
+        let eot_id = self.engine.model.eot();
+        if eot_id >= 0 {
+            eos_pieces.insert(self.engine.model.token_to_piece(eot_id));
+        }
+        for extra in self.engine.model.extra_eos_tokens() {
+            if extra >= 0 {
+                eos_pieces.insert(self.engine.model.token_to_piece(extra));
+            }
+        }
+        eos_pieces.remove("");
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
@@ -1014,7 +1049,7 @@ impl<B: Backend> Session<B> {
         };
 
         for piece in predictor {
-            if piece == eos_piece || piece == "[Invalid UTF-8]" {
+            if eos_pieces.contains(&piece) || piece == "[Invalid UTF-8]" {
                 continue;
             }
             generated_count += 1;
@@ -1072,14 +1107,19 @@ impl<B: Backend> Session<B> {
         // Useful when generation hits `max_tokens` with valid
         // grammar-shaped output but the post-grammar tail is opaque
         // (whitespace? content?). Escape into Debug form so newlines
-        // and tabs are visible.
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(
-                event = "raw_generation",
-                generated_tokens = generated_count,
-                raw_text_bytes = raw_text.len(),
-                raw_text_debug = %format!("{:?}", raw_text),
-            );
+        // and tabs are visible. Gated on the `axum` feature (which
+        // pulls in tracing); the library doesn't otherwise depend on
+        // it.
+        #[cfg(feature = "axum")]
+        {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    event = "raw_generation",
+                    generated_tokens = generated_count,
+                    raw_text_bytes = raw_text.len(),
+                    raw_text_debug = %format!("{:?}", raw_text),
+                );
+            }
         }
 
         // `raw_text` was consumed by stop-sequence inference; not
@@ -1455,9 +1495,11 @@ pub struct BlockStream<'engine, B: Backend> {
     predictor: crate::PiecePredictor<'engine, B>,
     parser: BlockParser,
     pending: std::collections::VecDeque<crate::Block>,
-    /// EOS piece text — we filter it out of the stream since it's a
-    /// sentinel, not content the caller wants to see.
-    eos_piece: String,
+    /// EOS-like piece texts (primary EOS, EOT, every
+    /// `extra_eos_tokens` declared by the model) — filtered out of
+    /// the stream since they're sentinels, not content the caller
+    /// wants to see.
+    eos_pieces: std::collections::BTreeSet<String>,
     drained: bool,
 }
 
@@ -1476,7 +1518,7 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                 Some(piece) => {
                     // Skip the sentinel pieces — they aren't content.
                     // Everything else goes through the parser.
-                    if piece == self.eos_piece || piece == "[Invalid UTF-8]" {
+                    if self.eos_pieces.contains(&piece) || piece == "[Invalid UTF-8]" {
                         continue;
                     }
                     let blocks = self.parser.push(&piece);

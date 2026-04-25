@@ -167,6 +167,24 @@ pub trait Model {
     /// value as a string, or `None` if missing.
     fn get_meta(&self, key: &str) -> Option<String>;
 
+    /// Additional end-of-sequence-like tokens beyond [`Model::eos`]
+    /// and [`Model::eot`]. Some models declare more than one EOS in
+    /// their config — Qwen3, for instance, sets `eos_token_id` to
+    /// `[<|im_end|>, <|endoftext|>]` and the model treats either as
+    /// "I'm done." Without this hook, only the primary EOS would
+    /// stop generation, and the model can land in a loop emitting
+    /// the secondary variant (whose decoded text is empty for
+    /// HF-style tokenizers) until `max_tokens` hits.
+    ///
+    /// Default: empty. Backends with a single EOS need not override.
+    /// `PredictOptions::add_model_stops` consumes the result and
+    /// adds each as an additional stop sequence; Session's piece
+    /// filter also drops their decoded text from the surfaced
+    /// output.
+    fn extra_eos_tokens(&self) -> Vec<Token> {
+        Vec::new()
+    }
+
     /// Human-readable identifier for this loaded model. Used by
     /// servers (e.g. `blallama`) to populate the `model` field of API
     /// responses.
