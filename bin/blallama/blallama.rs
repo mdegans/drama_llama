@@ -35,14 +35,15 @@ struct Args {
     /// only that variant.
     #[arg(long, value_enum, default_value_t = default_backend_kind())]
     backend: BackendKind,
-    /// Skip the per-Session repetition-penalty filter. Default
-    /// `RepetitionOptions` use `penalty_max_count=1` and
-    /// `ngram_min_size=1`, which can over-penalise common content
-    /// tokens during long-form free-text generation; set this flag
-    /// to disable the filter and confirm whether it is the cause of
-    /// any observed degeneration.
+    /// Opt into the per-Session repetition-penalty filter. Off by
+    /// default — current `RepetitionOptions::default()` uses
+    /// `penalty_max_count=1` and `ngram_min_size=1`, which
+    /// over-penalises common content tokens during long-form
+    /// free-text generation and degrades output to thesaurus chains
+    /// or sentence-fragment loops. Re-enable for diagnosis once the
+    /// library defaults are tuned.
     #[arg(long, default_value_t = false)]
-    no_repetition_penalty: bool,
+    repetition_penalty: bool,
 }
 
 /// Inference backend selector. Variants are cfg-gated to whichever
@@ -261,7 +262,7 @@ mod llama_cpp_run {
                     load_session(
                         &state.args.model_path,
                         prompt.model.to_string(),
-                        state.args.no_repetition_penalty,
+                        state.args.repetition_penalty,
                     )
                     .await?
                 }
@@ -270,7 +271,7 @@ mod llama_cpp_run {
                 load_session(
                     &state.args.model_path,
                     prompt.model.to_string(),
-                    state.args.no_repetition_penalty,
+                    state.args.repetition_penalty,
                 )
                 .await?
             }
@@ -300,7 +301,7 @@ mod llama_cpp_run {
     async fn load_session(
         root: impl AsRef<Path>,
         model: String,
-        no_repetition_penalty: bool,
+        repetition_penalty: bool,
     ) -> Result<Session<LlamaCppBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -314,7 +315,7 @@ mod llama_cpp_run {
             Session::<LlamaCppBackend>::from_path_with_n_ctx(path, 65536)
         })
         .await
-        .map(|s| configure_session(s, no_repetition_penalty))
+        .map(|s| configure_session(s, repetition_penalty))
         .map_err(map_session_err)
     }
 }
@@ -409,7 +410,7 @@ mod moeflux_run {
                     load_session(
                         &state.args.model_path,
                         prompt.model.to_string(),
-                        state.args.no_repetition_penalty,
+                        state.args.repetition_penalty,
                     )
                     .await?
                 }
@@ -418,7 +419,7 @@ mod moeflux_run {
                 load_session(
                     &state.args.model_path,
                     prompt.model.to_string(),
-                    state.args.no_repetition_penalty,
+                    state.args.repetition_penalty,
                 )
                 .await?
             }
@@ -448,7 +449,7 @@ mod moeflux_run {
     async fn load_session(
         root: impl AsRef<Path>,
         model: String,
-        no_repetition_penalty: bool,
+        repetition_penalty: bool,
     ) -> Result<Session<MoefluxBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -462,7 +463,7 @@ mod moeflux_run {
             Session::<MoefluxBackend>::from_path(path)
         })
         .await
-        .map(|s| configure_session(s, no_repetition_penalty))
+        .map(|s| configure_session(s, repetition_penalty))
         .map_err(map_session_err)
     }
 }
@@ -473,11 +474,9 @@ mod moeflux_run {
 
 fn configure_session<B: Backend>(
     s: Session<B>,
-    no_repetition_penalty: bool,
+    repetition_penalty: bool,
 ) -> Session<B> {
-    let with_rep = if no_repetition_penalty {
-        s
-    } else {
+    let with_rep = if repetition_penalty {
         s.with_repetition(
             RepetitionOptions::default().set_ignored_categories([
                 IgnoreCategory::English,
@@ -485,6 +484,8 @@ fn configure_session<B: Backend>(
                 IgnoreCategory::Punctuation,
             ]),
         )
+    } else {
+        s
     };
     let configured = with_rep
         .with_prefix_cache(true)
