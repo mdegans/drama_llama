@@ -1041,14 +1041,28 @@ impl<B: Backend> Session<B> {
         let mut blocks: Vec<crate::Block> = Vec::new();
         let mut parser = BlockParser::new();
 
-        let predictor = if l_hit > 0 {
+        // When the diagnostic is on, also capture the (token_id,
+        // piece) pair for every emission. Empty pieces (the smoking
+        // gun for stuck-on-special-token loops) are otherwise
+        // invisible in the surfaced text.
+        #[cfg(feature = "axum")]
+        let collect_token_dump = tracing::enabled!(tracing::Level::DEBUG);
+        #[cfg(not(feature = "axum"))]
+        let collect_token_dump = false;
+        let mut token_dump: Vec<(Token, String)> = Vec::new();
+
+        let mut predictor = if l_hit > 0 {
             self.engine
                 .predict_pieces_resuming(suffix, l_hit, 0, predict_opts)
         } else {
             self.engine.predict_pieces(suffix, predict_opts)
         };
 
-        for piece in predictor {
+        while let Some(piece) = predictor.next() {
+            if collect_token_dump {
+                let token = predictor.last_token().unwrap_or(-1);
+                token_dump.push((token, piece.clone()));
+            }
             if eos_pieces.contains(&piece) || piece == "[Invalid UTF-8]" {
                 continue;
             }
@@ -1057,6 +1071,7 @@ impl<B: Backend> Session<B> {
             let emitted = parser.push(&piece);
             blocks.extend(emitted);
         }
+        drop(predictor);
         blocks.extend(parser.finish());
         // The parser emits one block per resolved prose chunk for
         // streaming friendliness. For batch callers (complete_blocks /
@@ -1102,24 +1117,47 @@ impl<B: Backend> Session<B> {
             prompt.stop_sequences.as_deref(),
         );
 
-        // Diagnostic dump of the unparsed text + per-piece breakdown.
+        // Diagnostic dump of the unparsed text + per-token breakdown.
         // Off by default; enable with `RUST_LOG=drama_llama::session=debug`.
         // Useful when generation hits `max_tokens` with valid
         // grammar-shaped output but the post-grammar tail is opaque
-        // (whitespace? content?). Escape into Debug form so newlines
-        // and tabs are visible. Gated on the `axum` feature (which
-        // pulls in tracing); the library doesn't otherwise depend on
-        // it.
+        // (whitespace? content? stuck-on-special-token?). Gated on
+        // the `axum` feature (which pulls in tracing); the library
+        // doesn't otherwise depend on it.
         #[cfg(feature = "axum")]
-        {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                tracing::debug!(
-                    event = "raw_generation",
-                    generated_tokens = generated_count,
-                    raw_text_bytes = raw_text.len(),
-                    raw_text_debug = %format!("{:?}", raw_text),
-                );
+        if collect_token_dump {
+            // Histogram by token id so a stuck loop is obvious.
+            let mut hist: std::collections::BTreeMap<Token, (usize, String)> =
+                std::collections::BTreeMap::new();
+            for (t, p) in &token_dump {
+                let entry = hist.entry(*t).or_insert((0, p.clone()));
+                entry.0 += 1;
             }
+            let mut hist_vec: Vec<(Token, usize, String)> = hist
+                .into_iter()
+                .map(|(t, (c, p))| (t, c, p))
+                .collect();
+            hist_vec.sort_by(|a, b| b.1.cmp(&a.1));
+            // First 16 token IDs (in emission order) and last 16 — the
+            // loop boundary is usually near the end.
+            let head: Vec<_> =
+                token_dump.iter().take(16).map(|(t, _)| *t).collect();
+            let tail: Vec<_> = token_dump
+                .iter()
+                .rev()
+                .take(16)
+                .map(|(t, _)| *t)
+                .collect();
+            tracing::debug!(
+                event = "raw_generation",
+                generated_tokens = generated_count,
+                raw_text_bytes = raw_text.len(),
+                raw_text_debug = %format!("{:?}", raw_text),
+                token_count = token_dump.len(),
+                token_histogram_top16 = %format!("{:?}", &hist_vec[..hist_vec.len().min(16)]),
+                token_head = %format!("{:?}", head),
+                token_tail = %format!("{:?}", tail),
+            );
         }
 
         // `raw_text` was consumed by stop-sequence inference; not
