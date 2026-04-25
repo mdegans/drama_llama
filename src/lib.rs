@@ -21,7 +21,7 @@ pub use sample::{
 };
 
 pub mod backend;
-pub use backend::{Decoder, Model, Token, TokenData};
+pub use backend::{Backend, Decoder, Model, Token, TokenData};
 
 #[cfg(feature = "llama-cpp")]
 mod batch;
@@ -68,15 +68,16 @@ mod llama_cpp;
 #[cfg(feature = "llama-cpp")]
 pub use llama_cpp::{
     llama_quantize, restore_default_logs, silence_logs, DecodeError,
-    FlashAttention, LlamaCppDecoder, LlamaCppEngine, LlamaCppModel, NewError,
+    FlashAttention, LlamaCppBackend, LlamaCppDecoder, LlamaCppEngine,
+    LlamaCppModel, NewError,
 };
 
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
 pub mod moeflux;
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
 pub use moeflux::{
-    MoefluxDecoder, MoefluxEngine, MoefluxError, MoefluxModel,
-    MoefluxModelError,
+    MoefluxBackend, MoefluxDecoder, MoefluxEngine, MoefluxError,
+    MoefluxModel, MoefluxModelError,
 };
 
 mod ngram;

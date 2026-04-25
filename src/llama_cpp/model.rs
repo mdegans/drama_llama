@@ -740,6 +740,12 @@ impl crate::backend::Model for LlamaCppModel {
     fn get_meta(&self, key: &str) -> Option<String> {
         LlamaCppModel::get_meta(self, key)
     }
+
+    fn display_name(&self) -> Option<String> {
+        self.file_name
+            .as_deref()
+            .map(|s| s.to_string_lossy().into_owned())
+    }
 }
 
 #[cfg(test)]

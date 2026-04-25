@@ -63,6 +63,10 @@ pub struct MoefluxModel {
     /// Lazy maximum decoded piece length across the vocabulary.
     /// Populated on first call to [`Self::max_token_len`].
     max_token_len: OnceLock<usize>,
+    /// Basename of the directory the model was loaded from (e.g.
+    /// `qwen3-6-35b-a3b-mlx-4bit`). Used by [`Model::display_name`]
+    /// for human-readable identification in API responses.
+    name: Option<String>,
 }
 
 unsafe impl Send for MoefluxModel {}
@@ -111,6 +115,10 @@ impl MoefluxModel {
         let bos = resolve_bos(&config, &tokenizer_config, &tokenizer);
         let eot = eos;
 
+        let name = mlx_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned());
+
         Ok(Self {
             tokenizer,
             config,
@@ -119,6 +127,7 @@ impl MoefluxModel {
             bos,
             eot,
             max_token_len: OnceLock::new(),
+            name,
         })
     }
 
@@ -267,6 +276,10 @@ impl Model for MoefluxModel {
             JsonValue::Null => "null".to_string(),
             other => other.to_string(),
         })
+    }
+
+    fn display_name(&self) -> Option<String> {
+        self.name.clone()
     }
 }
 

@@ -15,3 +15,16 @@ pub mod model;
 pub use decoder::{MoefluxDecoder, MoefluxError};
 pub use engine::MoefluxEngine;
 pub use model::{MoefluxModel, MoefluxModelError};
+
+/// Zero-sized [`crate::Backend`] tag for the moeflux backend. Use as
+/// the type parameter in `Engine<MoefluxBackend>` or
+/// `Session<MoefluxBackend>` (or via the `MoefluxEngine` alias) to
+/// monomorphize against the moeflux Metal decoder + HF tokenizer
+/// pair.
+#[derive(Debug, Clone, Copy)]
+pub struct MoefluxBackend;
+
+impl crate::backend::Backend for MoefluxBackend {
+    type Decoder = MoefluxDecoder;
+    type Model = MoefluxModel;
+}
