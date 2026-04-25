@@ -1,5 +1,45 @@
 # Future work: flash-moe decode backend for drama_llama
 
+> **STATUS (2026-04-27): historical-record / largely shipped.** This was
+> the north-star planning doc written before any code. The live state
+> now lives in `plan_v0.8.0_backend_split.md` and
+> `plan_phase4_a3b_gate_offset_fixed.md`. Quick map of what changed
+> from the plan in this doc:
+>
+> - **flash-moe → moeflux.** Forked, KV-seq_rm patch landed, C API
+>   exported (`mf_*` extern block), bindgen wrapper (`moeflux-sys`)
+>   and safe wrapper (`moeflux`) crates published in-repo.
+> - **`Decoder`/`Model` trait extraction landed** — drama_llama now has
+>   `MoefluxDecoder`/`MoefluxModel`/`MoefluxEngine` under
+>   `cfg(feature="moeflux", target_os="macos")`. `LlamaCppDecoder` /
+>   `LlamaCppEngine` is the parallel pair.
+> - **Phase 4 quality gate PASSED 2026-04-27** — A3B canonical pangram
+>   matches MLX (cosine 0.9990, top-20 20/20). Root cause of the
+>   pre-fix ~3% argmax agreement was 10 hardcoded A17B byte offsets
+>   missed by the prior literals cleanup; fixed in moeflux `925f7a0`.
+> - **MLX-regression test infra landed** at
+>   `moeflux/crates/moeflux/tests/mlx_regression.rs` with golden
+>   fixture for A3B; A17B golden deferred (210 GB MLX checkpoint
+>   needs ≥256 GB host RAM to load).
+>
+> What's still pending from this doc's work-items list:
+>
+> - **`Session` is still LlamaCppEngine-coupled** — `MoefluxSession`
+>   (or generic `Session<E: Engine>`) is the next-up task to make
+>   blallama (and other consumers above the trait layer) backend-
+>   agnostic. Tracking in the meta-plan as the live next step.
+> - **Cogito 600B bring-up** — still future. A3B Phase 4 was the gate
+>   that unblocks it. Fixture-generation host-RAM constraint applies
+>   (same 256 GB-class machine needed for the MLX-regression golden).
+> - **Probe-against-600B run** — depends on Cogito bring-up.
+>
+> Body below is preserved verbatim as scouting reference for anyone
+> learning the codebase or planning a fresh MoE-variant integration.
+> The "why this ordering matters" section in particular (KV-seq_rm
+> before trait extraction) remains the right ordering and is
+> reusable lore. Timing estimates were optimistic — actual was ~5 days
+> across 6 sessions, not 1-2 days.
+
 ## Context
 
 Agora's Council needs an independence path from the Anthropic API — see

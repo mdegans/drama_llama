@@ -284,6 +284,27 @@ Exit criteria (in order — each gates the next):
    gap likely smaller numerical issues, not structural. See
    `plan_phase4_a3b_gate_offset_fixed.md` for details.
 
+   **[MLX REGRESSION TEST LANDED 2026-04-27]** Per-variant golden-
+   logits fixture + Rust regression test at
+   `moeflux/crates/moeflux/tests/mlx_regression.rs`. Asserts
+   moeflux's top-20 logit overlap against MLX reference ≥95% +
+   exact argmax match on "The quick brown fox". A3B passes:
+   argmax 33075 (" jumps"), overlap 20/20, cosine 0.9990. A17B
+   golden NOT committed — its MLX 4-bit checkpoint is ~210 GB and
+   needs ≥256 GB host RAM to regenerate; test skips gracefully
+   when fixture missing. Same template transfers to Cogito 600B
+   in Phase 5 once weights are extracted on a suitable host. This
+   is the regression that would have caught the gate-offset bug
+   on first run. Generator: `metal_infer/tests/mlx_reference/generate_goldens.py`.
+
+   **[NEXT UP — MoefluxSession]** `Session` is still
+   `LlamaCppEngine`-coupled in `src/session/mod.rs:236`. Phase 4
+   close-out is making the chat-style API surface (used by
+   `blallama` for `/v1/messages` serving) backend-agnostic. Two
+   options on the table — parallel `MoefluxSession` mirroring
+   Session's shape, or generic `Session<E: Engine>`. Tracking via
+   a separate parallel session; this doc updated when it lands.
+
 **35B-A3B artifacts (as of 2026-04-24):**
 - MLX 4-bit (group 64, affine): `/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-mlx-4bit/` (18 GB)
 - Packed experts: `/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-packed/` (17 GB, 40 files × 432 MB)
