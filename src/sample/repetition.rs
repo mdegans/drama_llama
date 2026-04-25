@@ -950,6 +950,96 @@ mod tests {
         }
     }
 
+    /// Long-generation regression test: documents the
+    /// linear-additive-penalty growth that drives popular content tokens'
+    /// logits to swamp on long generation.
+    ///
+    /// `freq_map` is monotonic across calls (the parked TODO at the top
+    /// of the file). With `penalty_freq > 0`, the additive penalty for
+    /// a token grows linearly with how often its n-gram has been
+    /// observed — `(count as f32) * penalty_freq`. Over a few hundred
+    /// generation steps that term dominates the model's natural logit
+    /// gradient, the model can no longer pick the obvious next token,
+    /// and prose collapses into thesaurus chains or fragment loops.
+    ///
+    /// Mirrors production: each call gets fresh logits from the model
+    /// (we re-supply `make_candidates(&original_logits)`); only
+    /// `freq_map` is shared across calls. Then we measure the gap
+    /// between a popular token (trailing unigram every step) and an
+    /// otherwise-equal rare token. With `penalty_freq=0.1` the popular
+    /// token's logit ends ~20 below the rare one — a swing large enough
+    /// to evict the model's preferred choice from any reasonable
+    /// sampler.
+    ///
+    /// Currently `#[ignore]`'d because it documents a known structural
+    /// issue rather than asserting a fixed contract — un-ignore once
+    /// the freq_map gets pruning (sliding window or count-decay) or
+    /// the additive contribution is capped per the analysis in
+    /// `.claude/memory/qwen3_long_form_degradation.md`.
+    #[test]
+    #[ignore = "documents linear-additive growth bug; ungate after rep-penalty refactor"]
+    fn long_generation_does_not_swamp_popular_token_logit() {
+        let model = load_model();
+        // 1024-token vocab, all logits start at 1.0 each call.
+        // Production semantics: the model emits fresh logits per step,
+        // so we re-build candidates from the same baseline each
+        // iteration. Only `freq_map` persists across calls.
+        let n_vocab = 1024;
+        let popular: Token = 100;
+        let rare: Token = 200;
+        let baseline: Vec<f32> = (0..n_vocab).map(|_| 1.0).collect();
+        let tokens = vec![popular];
+
+        let mut opts = RepetitionOptions::default();
+        let mut freq_map = NGramStats::new();
+
+        let mut popular_logit = 0.0_f32;
+        let mut rare_logit = 0.0_f32;
+        for _ in 0..200 {
+            let candidates = make_candidates(&baseline);
+            let result = apply_sample_repetition_ngram(
+                candidates,
+                &tokens,
+                &mut opts,
+                &mut freq_map,
+                &model,
+            )
+            .unwrap();
+            popular_logit = result
+                .iter()
+                .find(|c| c.id == popular)
+                .map(|c| c.logit)
+                .unwrap();
+            rare_logit = result
+                .iter()
+                .find(|c| c.id == rare)
+                .map(|c| c.logit)
+                .unwrap();
+        }
+        let gap = rare_logit - popular_logit;
+
+        println!(
+            "After 200 steps: popular={popular_logit:.4}, \
+             rare={rare_logit:.4}, gap={gap:.4}"
+        );
+        if let Some((_, data)) = freq_map.iter().next() {
+            println!("Tracked unigram count: {}", data.count());
+        }
+
+        // Once the structural fix lands (sliding window or capped
+        // additive contribution) this gap should stay bounded. The
+        // model's natural logit gradient is on the order of a few
+        // logits between top candidates; anything more than ~5 means
+        // the penalty has overpowered the model.
+        assert!(
+            gap < 5.0,
+            "popular token's logit was driven {gap} below an \
+             otherwise-equal rare token after 200 generation steps; \
+             linear-additive penalty growth is dominating the model's \
+             logit gradient (see qwen3_long_form_degradation.md)"
+        );
+    }
+
     // --- surgical_target tests (no model required) -----------------------
 
     fn ngram(tokens: &[Token]) -> NGram {
