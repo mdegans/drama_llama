@@ -305,6 +305,52 @@ Exit criteria (in order — each gates the next):
    Session's shape, or generic `Session<E: Engine>`. Tracking via
    a separate parallel session; this doc updated when it lands.
 
+   **[LANDED 2026-04-25 — Session<B: Backend>]** Six commits on
+   `v0.8.0`:
+   - `f9c6548` backend trait + ZST tags + `Model::display_name`
+   - `47f74fa` `Engine<D, M>` → `Engine<B>`; Predictor family same
+     migration (atomic — Predictor stores `&'engine mut Engine<...>`)
+   - `bbc0e07` `ChatTemplate::from_model<M: Model>` and
+     `tokenize_with_breakpoints<M: Model>`; chat_template module
+     ungated from llama-cpp
+   - `a3d463f` `Session<B: Backend>` + `MoefluxEngine::from_path`
+     convention wrapper + `mod session` cfg gate flipped to
+     `any(llama-cpp, moeflux+macos)`
+   - `51bcfba` `blallama --backend` dispatch (parallel
+     `llama_cpp_run` / `moeflux_run` modules; `main()` matches and
+     dispatches once)
+   - this commit (memory + CHANGELOG)
+
+   `Backend` is a single-parameter trait with associated types:
+   `type Decoder: Decoder + Send; type Model: Model + Send + Sync`.
+   Send/Sync bounds baked in so consumers don't repeat where-clauses.
+   Sync only on Model (Iterator impls hand `&Model` to grammar /
+   sampling code that fans out across rayon); Decoder stays
+   Send-only because llama.cpp's `*mut llama_context` is internally
+   mutable.
+
+   No `AnyBackend` enum, no `enum_dispatch`. `blallama` dispatches
+   at `main()` based on `--backend`; both backend halves get
+   compile-time monomorphized. Trade-off accepted: ~2× binary size
+   when both features are enabled, in exchange for zero-cost calls
+   on the hot path. Disable a feature to drop a backend.
+
+   `MoefluxEngine::from_path(parent: &Path)` adopts a forward-
+   looking on-disk convention (`parent/{mlx,artifacts,root}/`) so
+   blallama's `ls`-discover-load flow works for both backends.
+   Existing artifacts on disk use a flat sibling layout; the
+   `from_paths` 5-arg constructor stays for callers (tests) that
+   still hit the flat layout. See
+   `.claude/memory/moeflux_disk_convention.md` for migration notes.
+
+   Build matrix verified: `--no-default-features` (trait layer
+   only), `--features llama-cpp,...` (default), `--features
+   moeflux-model-qwen3-6-35b-a3b` (moeflux only), and both
+   together. 213 library tests green; integration tests compile
+   and pass non-`#[ignore]` cases. Live blallama smoke against
+   real models is Mike's manual verification (needs the disk move
+   for the moeflux side per the convention doc).
+
 **35B-A3B artifacts (as of 2026-04-24):**
 - MLX 4-bit (group 64, affine): `/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-mlx-4bit/` (18 GB)
 - Packed experts: `/Volumes/Temp Backup/models/moeflux/qwen3-6-35b-a3b-packed/` (17 GB, 40 files × 432 MB)

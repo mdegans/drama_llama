@@ -4,6 +4,94 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — Unreleased
+
+Backend split. The chat-style API (`Session`), the engine layer
+(`Engine`), the Predictor family, and the binary (`blallama`) are
+all generic over a single `Backend` parameter. drama_llama can now
+drive either llama.cpp or moeflux's Metal MoE runtime through the
+same surface. Runs Cogito-class MoE models on Apple Silicon without
+the Anthropic API as a dependency.
+
+### Added
+
+- **`backend::Backend` trait** bundling `type Decoder: Decoder + Send`
+  and `type Model: Model + Send + Sync` as a single generic
+  parameter. Compile-time monomorphization, no `dyn` indirection on
+  the hot path. ZST tag impls: `LlamaCppBackend`, `MoefluxBackend`.
+- **`Model::display_name(&self) -> Option<String>`** on the trait.
+  Both backends populate (GGUF basename / MLX-export dir basename).
+  Used by `Session::complete_response` for the `model` field of
+  responses, and by `blallama` for model-name matching.
+- **`MoefluxEngine::from_path(parent: &Path)`** — convention-based
+  wrapper around `from_paths`. Expects `parent/{mlx,artifacts,root}/`
+  with sane runtime defaults (`experts_per_tok = 8`, `use_2bit =
+  false`). Symmetric with `LlamaCppEngine::from_path` so binaries
+  can take a single `--model <path>` arg for either backend. The
+  5-arg `from_paths` stays for callers needing explicit paths or
+  non-default runtime params.
+- **`blallama --backend {llama-cpp|moeflux}`** flag with cfg-gated
+  variants. `main()` dispatches once at startup; each backend half
+  monomorphizes independently. llama-cpp build accepts only
+  `llama-cpp`; moeflux build accepts only `moeflux`; combined build
+  accepts both.
+
+### Changed
+
+- **`Engine<D, M>` → `Engine<B: Backend>`.** Type aliases preserve
+  the public names: `LlamaCppEngine = Engine<LlamaCppBackend>`,
+  `MoefluxEngine = Engine<MoefluxBackend>`. Inherent-method blocks
+  on the aliases (state ser/de, log callbacks, `from_path*`, etc.)
+  unchanged.
+- **Predictor family migrate the same way.** `CandidatePredictor`,
+  `TokenPredictor`, `PiecePredictor`, `Predictor` all become
+  `<'engine, B>` instead of `<'engine, D, M>`. Iterator-impl `M:
+  Sync` bound collapses into Backend's trait-level requirement.
+- **`Session<B: Backend>`.** Generic chat-style API. Backend-
+  specific constructors (`Session::<LlamaCppBackend>::from_path*`
+  with `quiet`; `Session::<MoefluxBackend>::from_path`) live in
+  cfg-gated impl blocks. Generic methods (`from_engine`,
+  `with_*`, `complete_*`, `engine`, `engine_mut`) live in
+  `impl<B: Backend>`.
+- **`ChatTemplate::from_model<M: Model>`** and
+  `tokenize_with_breakpoints<M: Model>` generalize over the trait.
+  `mod chat_template` is no longer gated on `feature = "llama-cpp"`.
+- **`mod session` cfg gate** flips from `feature = "llama-cpp"` to
+  `any(feature = "llama-cpp", all(feature = "moeflux", target_os
+  = "macos"))`.
+- **`unsafe impl Send for Engine`** dropped — auto-derive picks it
+  up from `B::Decoder: Send` + `B::Model: Send` baked into the
+  Backend trait.
+
+### Migration
+
+- Most callers see no change: `LlamaCppEngine`, `LlamaCppModel`,
+  `MoefluxEngine`, etc., are preserved as type aliases / re-exports.
+- Callers that explicitly spelled out generic parameters
+  (`Engine<LlamaCppDecoder, LlamaCppModel>`) should switch to
+  `Engine<LlamaCppBackend>` or just `LlamaCppEngine`.
+- `Session` is now `Session<LlamaCppBackend>` (or `Session<MoefluxBackend>`).
+  If you stored `Session` in a struct field, parameterize the field.
+- `Session::engine()` returns `&Engine<B>` (was `&LlamaCppEngine`).
+  For a `Session<LlamaCppBackend>` that's the same type — calls
+  unchanged. For ergonomic surface unchanged uses, prefer
+  `session.engine().model.display_name()` over the now-llama-cpp-
+  only `session.engine().model.file_name()`.
+
+### Notes
+
+- Build matrix: `--no-default-features` (trait layer only),
+  `--features llama-cpp,...` (default), `--features
+  moeflux-model-qwen3-6-35b-a3b` (moeflux only on macOS), and both
+  enabled together. All four combinations build clean.
+- Send/Sync trade-offs: `B::Decoder` is required Send (not Sync) —
+  `*mut llama_context` is internally mutable. `B::Model` is Send +
+  Sync (Iterator impls hand `&Model` to grammar / sampling code
+  that fans out across rayon).
+- See `.claude/memory/moeflux_disk_convention.md` for the
+  forward-looking on-disk layout `MoefluxEngine::from_path`
+  expects, and the migration story for current artifacts.
+
 ## [0.7.0] — 2026-04-22
 
 Major release. Prompt caching, structured output, grammar-perf finish
