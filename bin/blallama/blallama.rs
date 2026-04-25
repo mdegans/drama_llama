@@ -10,8 +10,9 @@ use axum::{
     routing::post,
     Router,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use drama_llama::{
+    backend::{Backend, Model},
     prompt::{AnthropicError, MessageResponse, Usage},
     IgnoreCategory, Prompt, RepetitionOptions, Session,
 };
@@ -21,27 +22,68 @@ use tracing::{error, info, instrument};
 #[derive(Parser)]
 #[command(about = "Demo /v1/messages server")]
 struct Args {
-    /// Path containing model files
+    /// Path containing model files (llama.cpp) or model directories
+    /// (moeflux).
     model_path: PathBuf,
     /// Port to use
     #[arg(long, default_value_t = 11435)]
     port: u16,
+    /// Inference backend. `llama-cpp` discovers `.gguf` files;
+    /// `moeflux` discovers child directories with the
+    /// `mlx/`/`artifacts/`/`root/` convention. Variants are
+    /// cfg-gated — a build with only one backend feature accepts
+    /// only that variant.
+    #[arg(long, value_enum, default_value_t = default_backend_kind())]
+    backend: BackendKind,
+}
+
+/// Inference backend selector. Variants are cfg-gated to whichever
+/// crate features are enabled.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum BackendKind {
+    #[cfg(feature = "llama-cpp")]
+    LlamaCpp,
+    #[cfg(all(feature = "moeflux", target_os = "macos"))]
+    Moeflux,
+}
+
+/// Default `--backend` value: prefer llama-cpp when both backends are
+/// compiled in (it's been the default for the lifetime of blallama).
+const fn default_backend_kind() -> BackendKind {
+    #[cfg(feature = "llama-cpp")]
+    {
+        BackendKind::LlamaCpp
+    }
+    #[cfg(all(
+        all(feature = "moeflux", target_os = "macos"),
+        not(feature = "llama-cpp"),
+    ))]
+    {
+        BackendKind::Moeflux
+    }
 }
 
 #[derive(Clone)]
-struct AppState {
+struct AppState<B: Backend> {
     args: Arc<Args>,
-    session: Arc<Mutex<Option<Session>>>,
+    session: Arc<Mutex<Option<Session<B>>>>,
 }
 
-/// Get available .gguf models in a given path
-async fn get_available_models(
+/// List directory entries that match a per-backend predicate.
+/// llama-cpp wants `is_file()` (one `.gguf` per model); moeflux wants
+/// `is_dir()` (one parent dir per model).
+async fn list_entries<P>(
     path: impl AsRef<Path>,
-) -> Result<Vec<String>, std::io::Error> {
+    accept: P,
+) -> Result<Vec<String>, std::io::Error>
+where
+    P: Fn(&std::fs::FileType) -> bool,
+{
     let mut read_dir = tokio::fs::read_dir(path).await?;
     let mut models = vec![];
     while let Some(model) = read_dir.next_entry().await? {
-        if !model.file_type().await?.is_file() {
+        let ft = model.file_type().await?;
+        if !accept(&ft) {
             continue;
         }
         let model = if let Ok(model) = model.file_name().into_string() {
@@ -51,37 +93,7 @@ async fn get_available_models(
         };
         models.push(model)
     }
-
     Ok(models)
-}
-
-/// `/v1/messages` handler
-async fn route_messages(
-    State(state): State<AppState>,
-    Json(prompt): Json<Prompt>,
-) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
-    // List available models
-    let models = match get_available_models(&state.args.model_path).await {
-        Ok(models) => models,
-        Err(e) => {
-            let e = AnthropicError::NotFound {
-                message: format!("Models could not be loaded: {e}"),
-            };
-            error!(error = %e);
-            return Err((StatusCode::NOT_FOUND, Json(e)));
-        }
-    };
-
-    // Check model exists in our models path
-    if !models.contains(&prompt.model.to_string()) {
-        let e = AnthropicError::NotFound {
-            message: format!("model not found: {model}", model = prompt.model),
-        };
-        error!(error = %e);
-        return Err((StatusCode::NOT_FOUND, Json(e)));
-    }
-
-    complete(state, prompt).await
 }
 
 async fn spawn_blocking_or_bust<F, R>(f: F) -> R
@@ -96,108 +108,6 @@ where
             std::process::exit(1); // We don't trust llama.cpp's destructors
         }
     }
-}
-
-#[instrument(skip(state, prompt), fields(model = %prompt.model))]
-async fn complete(
-    state: AppState,
-    prompt: Prompt,
-) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
-    let mut lock = match state.session.try_lock() {
-        Ok(lock) => lock,
-        Err(_) => {
-            return Err((
-                StatusCode::from_u16(529).unwrap(),
-                Json(AnthropicError::Overloaded {
-                    message: "Session is busy.".into(),
-                }),
-            ))
-        }
-    };
-
-    // Load session if necessary. Load will briefly block the executor. Use
-    // spawn_blocking in production.
-    let mut session = match lock.take() {
-        Some(session) => {
-            // Get model filename. Can't panic since model was loaded from file
-            // and a file_name exists.
-            let file_name = session.engine().model.file_name().unwrap();
-            if file_name
-                .to_str()
-                .is_some_and(|s| s == prompt.model.to_string())
-            {
-                session
-            } else {
-                load_session(&state.args.model_path, prompt.model.to_string())
-                    .await?
-            }
-        }
-        None => {
-            load_session(&state.args.model_path, prompt.model.to_string())
-                .await?
-        }
-    };
-
-    // `complete_response` is blocking
-    let (session, response, elapsed) = spawn_blocking_or_bust(move || {
-        let start = std::time::Instant::now();
-
-        let response = session.complete_response(&prompt).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AnthropicError::Unknown {
-                    code: Some(500.try_into().unwrap()),
-                    message: e.to_string(),
-                }),
-            )
-        })?;
-
-        let elapsed = start.elapsed();
-
-        Ok((session, response, elapsed))
-    })
-    .await?;
-
-    log_stats(&response.id, response.usage, elapsed);
-
-    lock.replace(session);
-    Ok(Json(response))
-}
-
-async fn load_session(
-    root: impl AsRef<Path>,
-    model: String,
-) -> Result<Session, (StatusCode, Json<AnthropicError>)> {
-    // Containment in the directory-listed models rules out path traversal
-    let path = root.as_ref().join(&model);
-    tracing::info!(
-        event = "load_model",
-        model,
-        path = path.to_string_lossy().as_ref()
-    );
-    // `from_path` is blocking
-    spawn_blocking_or_bust(|| Session::from_path_with_n_ctx(path, 65536))
-        .await
-        .map(|s| {
-            s.with_repetition(
-                RepetitionOptions::default().set_ignored_categories([
-                    IgnoreCategory::English,
-                    IgnoreCategory::Json,
-                    IgnoreCategory::Punctuation,
-                ]),
-            )
-            .with_prefix_cache(true)
-            .with_max_tokens(8192.try_into().unwrap())
-        })
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AnthropicError::Unknown {
-                    code: Some(500.try_into().unwrap()),
-                    message: e.to_string(),
-                }),
-            )
-        })
 }
 
 fn log_stats(id: impl AsRef<str>, usage: Usage, elapsed: Duration) {
@@ -243,28 +153,327 @@ fn init_logging() {
     Registry::default().with(filter).with(fmt_layer).init();
 }
 
+// ---------------------------------------------------------------------------
+// llama.cpp run path
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "llama-cpp")]
+mod llama_cpp_run {
+    use super::*;
+    use drama_llama::LlamaCppBackend;
+
+    pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(format!(
+            "0.0.0.0:{port}",
+            port = args.port
+        ))
+        .await?;
+
+        let session: Arc<Mutex<Option<Session<LlamaCppBackend>>>> =
+            Mutex::from(None).into();
+
+        let app = Router::new()
+            .route("/v1/messages", post(route_messages))
+            .with_state(AppState {
+                args: args.into(),
+                session,
+            });
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+
+    async fn route_messages(
+        State(state): State<AppState<LlamaCppBackend>>,
+        Json(prompt): Json<Prompt>,
+    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
+    {
+        let models = match list_entries(&state.args.model_path, |ft| ft.is_file()).await {
+            Ok(models) => models,
+            Err(e) => {
+                let e = AnthropicError::NotFound {
+                    message: format!("Models could not be loaded: {e}"),
+                };
+                error!(error = %e);
+                return Err((StatusCode::NOT_FOUND, Json(e)));
+            }
+        };
+
+        if !models.contains(&prompt.model.to_string()) {
+            let e = AnthropicError::NotFound {
+                message: format!(
+                    "model not found: {model}",
+                    model = prompt.model
+                ),
+            };
+            error!(error = %e);
+            return Err((StatusCode::NOT_FOUND, Json(e)));
+        }
+
+        complete(state, prompt).await
+    }
+
+    #[instrument(skip(state, prompt), fields(model = %prompt.model))]
+    async fn complete(
+        state: AppState<LlamaCppBackend>,
+        prompt: Prompt,
+    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
+    {
+        let mut lock = match state.session.try_lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                return Err((
+                    StatusCode::from_u16(529).unwrap(),
+                    Json(AnthropicError::Overloaded {
+                        message: "Session is busy.".into(),
+                    }),
+                ))
+            }
+        };
+
+        let mut session = match lock.take() {
+            Some(session) => {
+                let display = session
+                    .engine()
+                    .model
+                    .display_name()
+                    .unwrap_or_default();
+                if display == prompt.model.to_string() {
+                    session
+                } else {
+                    load_session(
+                        &state.args.model_path,
+                        prompt.model.to_string(),
+                    )
+                    .await?
+                }
+            }
+            None => {
+                load_session(&state.args.model_path, prompt.model.to_string())
+                    .await?
+            }
+        };
+
+        let (session, response, elapsed) = spawn_blocking_or_bust(move || {
+            let start = std::time::Instant::now();
+            let response = session.complete_response(&prompt).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(AnthropicError::Unknown {
+                        code: Some(500.try_into().unwrap()),
+                        message: e.to_string(),
+                    }),
+                )
+            })?;
+            let elapsed = start.elapsed();
+            Ok((session, response, elapsed))
+        })
+        .await?;
+
+        log_stats(&response.id, response.usage, elapsed);
+        lock.replace(session);
+        Ok(Json(response))
+    }
+
+    async fn load_session(
+        root: impl AsRef<Path>,
+        model: String,
+    ) -> Result<Session<LlamaCppBackend>, (StatusCode, Json<AnthropicError>)>
+    {
+        let path = root.as_ref().join(&model);
+        tracing::info!(
+            event = "load_model",
+            backend = "llama-cpp",
+            model,
+            path = path.to_string_lossy().as_ref()
+        );
+        spawn_blocking_or_bust(|| {
+            Session::<LlamaCppBackend>::from_path_with_n_ctx(path, 65536)
+        })
+        .await
+        .map(configure_session)
+        .map_err(map_session_err)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// moeflux run path
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "moeflux", target_os = "macos"))]
+mod moeflux_run {
+    use super::*;
+    use drama_llama::MoefluxBackend;
+
+    pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(format!(
+            "0.0.0.0:{port}",
+            port = args.port
+        ))
+        .await?;
+
+        let session: Arc<Mutex<Option<Session<MoefluxBackend>>>> =
+            Mutex::from(None).into();
+
+        let app = Router::new()
+            .route("/v1/messages", post(route_messages))
+            .with_state(AppState {
+                args: args.into(),
+                session,
+            });
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+
+    async fn route_messages(
+        State(state): State<AppState<MoefluxBackend>>,
+        Json(prompt): Json<Prompt>,
+    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
+    {
+        let models = match list_entries(&state.args.model_path, |ft| ft.is_dir()).await {
+            Ok(models) => models,
+            Err(e) => {
+                let e = AnthropicError::NotFound {
+                    message: format!("Models could not be loaded: {e}"),
+                };
+                error!(error = %e);
+                return Err((StatusCode::NOT_FOUND, Json(e)));
+            }
+        };
+
+        if !models.contains(&prompt.model.to_string()) {
+            let e = AnthropicError::NotFound {
+                message: format!(
+                    "model not found: {model}",
+                    model = prompt.model
+                ),
+            };
+            error!(error = %e);
+            return Err((StatusCode::NOT_FOUND, Json(e)));
+        }
+
+        complete(state, prompt).await
+    }
+
+    #[instrument(skip(state, prompt), fields(model = %prompt.model))]
+    async fn complete(
+        state: AppState<MoefluxBackend>,
+        prompt: Prompt,
+    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
+    {
+        let mut lock = match state.session.try_lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                return Err((
+                    StatusCode::from_u16(529).unwrap(),
+                    Json(AnthropicError::Overloaded {
+                        message: "Session is busy.".into(),
+                    }),
+                ))
+            }
+        };
+
+        let mut session = match lock.take() {
+            Some(session) => {
+                let display = session
+                    .engine()
+                    .model
+                    .display_name()
+                    .unwrap_or_default();
+                if display == prompt.model.to_string() {
+                    session
+                } else {
+                    load_session(
+                        &state.args.model_path,
+                        prompt.model.to_string(),
+                    )
+                    .await?
+                }
+            }
+            None => {
+                load_session(&state.args.model_path, prompt.model.to_string())
+                    .await?
+            }
+        };
+
+        let (session, response, elapsed) = spawn_blocking_or_bust(move || {
+            let start = std::time::Instant::now();
+            let response = session.complete_response(&prompt).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(AnthropicError::Unknown {
+                        code: Some(500.try_into().unwrap()),
+                        message: e.to_string(),
+                    }),
+                )
+            })?;
+            let elapsed = start.elapsed();
+            Ok((session, response, elapsed))
+        })
+        .await?;
+
+        log_stats(&response.id, response.usage, elapsed);
+        lock.replace(session);
+        Ok(Json(response))
+    }
+
+    async fn load_session(
+        root: impl AsRef<Path>,
+        model: String,
+    ) -> Result<Session<MoefluxBackend>, (StatusCode, Json<AnthropicError>)>
+    {
+        let path = root.as_ref().join(&model);
+        tracing::info!(
+            event = "load_model",
+            backend = "moeflux",
+            model,
+            path = path.to_string_lossy().as_ref()
+        );
+        spawn_blocking_or_bust(|| {
+            Session::<MoefluxBackend>::from_path(path)
+        })
+        .await
+        .map(configure_session)
+        .map_err(map_session_err)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared session post-load configuration
+// ---------------------------------------------------------------------------
+
+fn configure_session<B: Backend>(s: Session<B>) -> Session<B> {
+    s.with_repetition(
+        RepetitionOptions::default().set_ignored_categories([
+            IgnoreCategory::English,
+            IgnoreCategory::Json,
+            IgnoreCategory::Punctuation,
+        ]),
+    )
+    .with_prefix_cache(true)
+    .with_max_tokens(8192.try_into().unwrap())
+}
+
+fn map_session_err(
+    e: drama_llama::SessionError,
+) -> (StatusCode, Json<AnthropicError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(AnthropicError::Unknown {
+            code: Some(500.try_into().unwrap()),
+            message: e.to_string(),
+        }),
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
     let args = Args::parse();
 
-    // fail fast stuff first
-    let listener = tokio::net::TcpListener::bind(format!(
-        "0.0.0.0:{port}",
-        port = args.port
-    ))
-    .await?;
-
-    // Inference engine, lazily loaded
-    let session: Arc<Mutex<Option<Session>>> = Mutex::from(None).into();
-
-    let app = Router::new()
-        .route("/v1/messages", post(route_messages))
-        .with_state(AppState {
-            args: args.into(),
-            session,
-        });
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    match args.backend {
+        #[cfg(feature = "llama-cpp")]
+        BackendKind::LlamaCpp => llama_cpp_run::run(args).await,
+        #[cfg(all(feature = "moeflux", target_os = "macos"))]
+        BackendKind::Moeflux => moeflux_run::run(args).await,
+    }
 }
