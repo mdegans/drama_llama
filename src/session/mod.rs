@@ -1060,6 +1060,29 @@ impl<B: Backend> Session<B> {
         }
         eos_pieces.remove("");
 
+        // Capture grammar / json mode handles BEFORE moving `modes`
+        // into the predictor. Each `SamplingMode::Grammar` /
+        // `::Json` wraps an `Arc<Mutex<State>>`, so cloning the
+        // SamplingMode shares the underlying state — once the
+        // matcher accepts mid-fold, our captured handles see it.
+        // Includes any deferred grammar which may activate
+        // mid-generation (its state lives in the same Arc); without
+        // capturing here we'd miss the post-`</think>` JSON
+        // matcher's completion.
+        let mut grammar_handles: Vec<SamplingMode> = modes
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    SamplingMode::Grammar(_) | SamplingMode::Json(_)
+                )
+            })
+            .cloned()
+            .collect();
+        if let Some(dg) = &deferred_grammar {
+            grammar_handles.push(dg.grammar.clone());
+        }
+
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
@@ -1106,6 +1129,19 @@ impl<B: Backend> Session<B> {
             raw_text.push_str(&piece);
             let emitted = parser.push(&piece);
             blocks.extend(emitted);
+
+            // Break early if any active grammar / json matcher has
+            // reached its accept state. Avoids burning extra decode
+            // steps waiting for EOS once the structured output is
+            // complete; also defends against post-grammar drift if
+            // the model wants to keep generating (the Deny mask
+            // catches reserved tokens, but a properly-misbehaving
+            // model could still emit non-empty-piece junk that
+            // grammars won't see). One-shot: as soon as ANY
+            // captured matcher is_complete, halt.
+            if any_grammar_complete(&grammar_handles) {
+                break;
+            }
         }
         drop(predictor);
         blocks.extend(parser.finish());
@@ -1614,6 +1650,24 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
 /// Strip trailing EOS piece and the `[Invalid UTF-8]` marker predictors emit
 /// for byte-fallback tokens at stream end. Matches what
 /// `examples/strawberry.rs` does by hand today.
+/// True iff any [`SamplingMode::Grammar`] / [`SamplingMode::Json`] in
+/// `modes` has reached its accept state. Acquires each mode's mutex
+/// once. A poisoned mutex is treated as "not complete" rather than
+/// panicking — a poisoned matcher means a prior parse error and is
+/// already a degraded state; we'd rather let normal stop machinery
+/// catch up than crash the session.
+fn any_grammar_complete(modes: &[SamplingMode]) -> bool {
+    modes.iter().any(|m| match m {
+        SamplingMode::Grammar(state) => {
+            state.lock().map(|s| s.is_complete()).unwrap_or(false)
+        }
+        SamplingMode::Json(state) => {
+            state.lock().map(|s| s.is_complete()).unwrap_or(false)
+        }
+        _ => false,
+    })
+}
+
 /// Detect the model's reserved / empty-piece vocab tail by scanning
 /// from the highest token id downward. Returns the half-open range
 /// `[lowest_empty, n_vocab)` if such a tail exists, `None`
