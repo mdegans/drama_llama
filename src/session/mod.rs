@@ -1067,6 +1067,21 @@ impl<B: Backend> Session<B> {
             prompt.stop_sequences.as_deref(),
         );
 
+        // Diagnostic dump of the unparsed text + per-piece breakdown.
+        // Off by default; enable with `RUST_LOG=drama_llama::session=debug`.
+        // Useful when generation hits `max_tokens` with valid
+        // grammar-shaped output but the post-grammar tail is opaque
+        // (whitespace? content?). Escape into Debug form so newlines
+        // and tabs are visible.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                event = "raw_generation",
+                generated_tokens = generated_count,
+                raw_text_bytes = raw_text.len(),
+                raw_text_debug = %format!("{:?}", raw_text),
+            );
+        }
+
         // `raw_text` was consumed by stop-sequence inference; not
         // exported. Drop explicitly so the allocation is released
         // before the outcome is handed back to the caller.
