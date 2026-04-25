@@ -204,13 +204,33 @@ impl ChatTemplate {
         let date_string = opts.date_string.clone().unwrap_or_else(|| {
             format_strftime_subset("%d %b %Y", current_unix_secs())
         });
-        let base_ctx = minijinja::context! {
-            bos_token => &self.bos_token,
-            eos_token => &self.eos_token,
-            messages => messages,
-            tools => tools_value,
-            add_generation_prompt => opts.add_generation_prompt,
-            date_string => date_string,
+        // Derive `enable_thinking` from `prompt.thinking` so templates
+        // that gate their `<think>` block on this variable (Qwen3 family,
+        // among others) honour Anthropic's semantics: `thinking: None`
+        // means thinking disabled, `Some(_)` means enabled. Caller-set
+        // `extras.with_extra("enable_thinking", _)` always wins, so we
+        // only add the derived value when the caller hasn't.
+        let extras_has_thinking =
+            opts.extras.iter().any(|(k, _)| k == "enable_thinking");
+        let base_ctx = if extras_has_thinking {
+            minijinja::context! {
+                bos_token => &self.bos_token,
+                eos_token => &self.eos_token,
+                messages => messages,
+                tools => tools_value,
+                add_generation_prompt => opts.add_generation_prompt,
+                date_string => date_string,
+            }
+        } else {
+            minijinja::context! {
+                bos_token => &self.bos_token,
+                eos_token => &self.eos_token,
+                messages => messages,
+                tools => tools_value,
+                add_generation_prompt => opts.add_generation_prompt,
+                date_string => date_string,
+                enable_thinking => prompt.thinking.is_some(),
+            }
         };
         // Merge caller-supplied extras on top of the base context.
         let ctx = if opts.extras.is_empty() {

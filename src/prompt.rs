@@ -18,6 +18,7 @@
 //! | `functions`        | [`ChatTemplate`] (tools) + tool_choice   |
 //! | `tool_choice`      | [`grammar_for_prompt`] grammar compiler  |
 //! | `stop_sequences`   | callers wire into [`PredictOptions`]     |
+//! | `thinking`         | [`ChatTemplate`] — drives `enable_thinking` extra |
 //!
 //! Request-level fields (`model` id, `max_tokens`, `temperature`,
 //! `stream`, `top_k`, `top_p`, `metadata`) are ignored locally — use

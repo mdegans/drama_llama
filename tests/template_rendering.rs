@@ -217,3 +217,79 @@ fn all_shapes_match_python_jinja2() {
         );
     }
 }
+
+/// `prompt.thinking` drives the `enable_thinking` Jinja variable in
+/// templates that gate a `<think>` block on it (Qwen3 family).
+/// Anthropic semantics: `None` → disabled, `Some(_)` → enabled.
+/// Caller's `with_extra("enable_thinking", _)` wins over the derived
+/// value so opt-out and explicit-override paths both work.
+#[test]
+fn enable_thinking_derives_from_prompt_thinking() {
+    use misanthropic::prompt::thinking::{Kind, Thinking};
+    use std::num::NonZeroU32;
+
+    // Tiny template that echoes whatever value `enable_thinking` ends
+    // up bound to in the Jinja context. Independent of any model
+    // template — we're testing the wiring, not a downstream template.
+    let tmpl = ChatTemplate::from_source(
+        "thinking={{ enable_thinking }}".to_string(),
+        String::new(),
+        String::new(),
+    )
+    .expect("template compiles");
+
+    let user_msg = Message {
+        role: Role::User,
+        content: Content::SinglePart(Cow::Borrowed("hi")),
+    };
+
+    // 1. thinking=None (default) → enable_thinking=false
+    let prompt_off = Prompt {
+        messages: vec![user_msg.clone()],
+        ..Default::default()
+    };
+    assert_eq!(
+        tmpl.render_with(&prompt_off, &RenderOptions::default())
+            .expect("render"),
+        "thinking=false",
+        "prompt.thinking=None must render as enable_thinking=false"
+    );
+
+    // 2. thinking=Some(...) → enable_thinking=true
+    let prompt_on = Prompt {
+        messages: vec![user_msg.clone()],
+        thinking: Some(Thinking {
+            budget_tokens: NonZeroU32::new(1024).unwrap(),
+            kind: Kind::Enabled,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        tmpl.render_with(&prompt_on, &RenderOptions::default())
+            .expect("render"),
+        "thinking=true",
+        "prompt.thinking=Some(_) must render as enable_thinking=true"
+    );
+
+    // 3. Caller-set extra wins — None + extras=true → true.
+    assert_eq!(
+        tmpl.render_with(
+            &prompt_off,
+            &RenderOptions::default().with_extra("enable_thinking", true)
+        )
+        .expect("render"),
+        "thinking=true",
+        "explicit with_extra=true must override derived false"
+    );
+
+    // 4. Caller-set extra wins — Some + extras=false → false.
+    assert_eq!(
+        tmpl.render_with(
+            &prompt_on,
+            &RenderOptions::default().with_extra("enable_thinking", false)
+        )
+        .expect("render"),
+        "thinking=false",
+        "explicit with_extra=false must override derived true"
+    );
+}
