@@ -15,6 +15,29 @@ the Anthropic API as a dependency.
 
 ### Added
 
+- **`SamplingMode::Deny { range: Range<Token> }`** — sample-time
+  mask for forbidden token-id ranges. Constructor:
+  `SamplingMode::deny_range(r)`. Filters candidates whose id falls
+  in the range out of the set before any downstream mode runs;
+  falls back to a single EOS if the range eats every candidate.
+  Primary use case: tokenizer reserved/unused vocab tails (Qwen3:
+  ~248088..248320). `Session` automatically prepends a Deny mode
+  computed once at construction by scanning from the highest vocab
+  id downward — empty-piece tokens trivially pass byte-stream
+  grammar filters and would otherwise let the model land in a loop
+  scattering reserved tokens after a structured response closes.
+  See `.claude/memory/grammar_reserved_token_loop.md` for the
+  full analysis.
+- **`Model::extra_eos_tokens()`** — trait method exposing
+  additional EOS-like token ids beyond `eos` and `eot`. Default
+  empty; `MoefluxModel` overrides to expose the tail of the
+  `eos_token_id` config array (Qwen3 declares `[<|im_end|>,
+  <|endoftext|>]`; without this hook, `<|endoftext|>` would never
+  reach `add_model_stops`).
+- **`Model::display_name()`** — human-readable identifier for
+  loaded models. `LlamaCppModel` returns the GGUF basename;
+  `MoefluxModel` returns the parent dir's basename (overridden
+  by `MoefluxEngine::from_path` to match the discovery-dir name).
 - **`backend::Backend` trait** bundling `type Decoder: Decoder + Send`
   and `type Model: Model + Send + Sync` as a single generic
   parameter. Compile-time monomorphization, no `dyn` indirection on
@@ -38,6 +61,15 @@ the Anthropic API as a dependency.
 
 ### Changed
 
+- **`Session::run_call` now breaks generation on grammar accept**.
+  When any active `SamplingMode::Grammar` / `SamplingMode::Json`
+  matcher reaches its accept state, the call halts immediately
+  instead of continuing to wait for EOS. Belt-and-suspenders with
+  the Deny mask: Deny prevents reserved tokens from being sampled;
+  break-on-accept terminates cleanly the moment the structured
+  output is satisfied. Includes deferred-grammar phase-split paths
+  (post-`</think>` JSON matchers terminate the same way once their
+  root rule completes).
 - **`Engine<D, M>` → `Engine<B: Backend>`.** Type aliases preserve
   the public names: `LlamaCppEngine = Engine<LlamaCppBackend>`,
   `MoefluxEngine = Engine<MoefluxBackend>`. Inherent-method blocks
@@ -62,6 +94,23 @@ the Anthropic API as a dependency.
 - **`unsafe impl Send for Engine`** dropped — auto-derive picks it
   up from `B::Decoder: Send` + `B::Model: Send` baked into the
   Backend trait.
+
+### Fixed
+
+- **Reserved-token loop on grammar-constrained generation.**
+  Tokenizers like Qwen3.5/3.6 carve out a reserved tail of the
+  vocab (~248088..248320 for Qwen3) for special-token slots, only
+  some of which have registered text content; the rest decode to
+  empty strings. Empty-piece tokens contribute zero bytes to a
+  byte-stream-driven grammar's matcher and are trivially accepted
+  regardless of state, while EOS (`<|im_end|>`) decodes to
+  non-empty text the grammar rejects. Result: post-JSON, the model
+  could land in a loop scattering reserved tokens until
+  `max_tokens` exhausted. Cross-backend testing (A3B on llama.cpp
+  vs moeflux) confirms the issue lives at the model/grammar
+  layer, not in either backend's decode path. Fixed via the
+  `SamplingMode::Deny` mask + `Model::extra_eos_tokens` plumbing
+  + grammar-accept-state break described above.
 
 ### Migration
 
