@@ -141,6 +141,17 @@ impl MoefluxModel {
     pub fn config(&self) -> &JsonValue {
         &self.config
     }
+
+    /// Override the name returned by [`Model::display_name`]. By
+    /// default `from_mlx_dir` captures the MLX directory's basename
+    /// (e.g. `Qwen3.5-397B-A17B-4bit`). Callers using the parent-dir
+    /// convention via [`crate::MoefluxEngine::from_path`] override
+    /// to the parent's basename so server discovery dirs (where
+    /// `mlx/` is just a fixed sub-name) round-trip cleanly through
+    /// the API's `model` field.
+    pub fn set_name(&mut self, name: String) {
+        self.name = Some(name);
+    }
 }
 
 /// Tokenize via the HF pipeline. Errors from the tokenizer indicate

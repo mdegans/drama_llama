@@ -91,12 +91,25 @@ impl MoefluxEngine {
         let mlx_dir = parent.join("mlx");
         let artifacts_dir = parent.join("artifacts");
         let experts_dir = parent.join("root");
-        Self::from_paths(
+        let mut engine = Self::from_paths(
             &mlx_dir,
             &artifacts_dir,
             &experts_dir,
             8,
             false,
-        )
+        )?;
+        // Override the model's display name to the parent dir's
+        // basename — that's what blallama-style discovery flows
+        // address the model by, and what they expect to see echoed
+        // back in the `/v1/messages` response. Without this the
+        // name would be the MLX dir's basename (e.g.
+        // `Qwen3.5-397B-A17B-4bit`), which doesn't match the
+        // discovery-dir entry name (`qwen3-5-a17b`).
+        if let Some(name) =
+            parent.file_name().map(|s| s.to_string_lossy().into_owned())
+        {
+            engine.model.set_name(name);
+        }
+        Ok(engine)
     }
 }
