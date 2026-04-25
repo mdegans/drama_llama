@@ -35,6 +35,14 @@ struct Args {
     /// only that variant.
     #[arg(long, value_enum, default_value_t = default_backend_kind())]
     backend: BackendKind,
+    /// Skip the per-Session repetition-penalty filter. Default
+    /// `RepetitionOptions` use `penalty_max_count=1` and
+    /// `ngram_min_size=1`, which can over-penalise common content
+    /// tokens during long-form free-text generation; set this flag
+    /// to disable the filter and confirm whether it is the cause of
+    /// any observed degeneration.
+    #[arg(long, default_value_t = false)]
+    no_repetition_penalty: bool,
 }
 
 /// Inference backend selector. Variants are cfg-gated to whichever
@@ -253,13 +261,18 @@ mod llama_cpp_run {
                     load_session(
                         &state.args.model_path,
                         prompt.model.to_string(),
+                        state.args.no_repetition_penalty,
                     )
                     .await?
                 }
             }
             None => {
-                load_session(&state.args.model_path, prompt.model.to_string())
-                    .await?
+                load_session(
+                    &state.args.model_path,
+                    prompt.model.to_string(),
+                    state.args.no_repetition_penalty,
+                )
+                .await?
             }
         };
 
@@ -287,6 +300,7 @@ mod llama_cpp_run {
     async fn load_session(
         root: impl AsRef<Path>,
         model: String,
+        no_repetition_penalty: bool,
     ) -> Result<Session<LlamaCppBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -300,7 +314,7 @@ mod llama_cpp_run {
             Session::<LlamaCppBackend>::from_path_with_n_ctx(path, 65536)
         })
         .await
-        .map(configure_session)
+        .map(|s| configure_session(s, no_repetition_penalty))
         .map_err(map_session_err)
     }
 }
@@ -395,13 +409,18 @@ mod moeflux_run {
                     load_session(
                         &state.args.model_path,
                         prompt.model.to_string(),
+                        state.args.no_repetition_penalty,
                     )
                     .await?
                 }
             }
             None => {
-                load_session(&state.args.model_path, prompt.model.to_string())
-                    .await?
+                load_session(
+                    &state.args.model_path,
+                    prompt.model.to_string(),
+                    state.args.no_repetition_penalty,
+                )
+                .await?
             }
         };
 
@@ -429,6 +448,7 @@ mod moeflux_run {
     async fn load_session(
         root: impl AsRef<Path>,
         model: String,
+        no_repetition_penalty: bool,
     ) -> Result<Session<MoefluxBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -442,7 +462,7 @@ mod moeflux_run {
             Session::<MoefluxBackend>::from_path(path)
         })
         .await
-        .map(configure_session)
+        .map(|s| configure_session(s, no_repetition_penalty))
         .map_err(map_session_err)
     }
 }
@@ -451,15 +471,22 @@ mod moeflux_run {
 // Shared session post-load configuration
 // ---------------------------------------------------------------------------
 
-fn configure_session<B: Backend>(s: Session<B>) -> Session<B> {
-    let configured = s
-        .with_repetition(
+fn configure_session<B: Backend>(
+    s: Session<B>,
+    no_repetition_penalty: bool,
+) -> Session<B> {
+    let with_rep = if no_repetition_penalty {
+        s
+    } else {
+        s.with_repetition(
             RepetitionOptions::default().set_ignored_categories([
                 IgnoreCategory::English,
                 IgnoreCategory::Json,
                 IgnoreCategory::Punctuation,
             ]),
         )
+    };
+    let configured = with_rep
         .with_prefix_cache(true)
         // Session-level generation cap. Distinct from `n_ctx` — that's
         // the KV context window, set per-backend at engine
