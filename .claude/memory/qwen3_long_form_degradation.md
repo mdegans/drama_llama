@@ -79,10 +79,30 @@ only difference was the penalty disabled.
   to ~5, `ngram_min_size` to 2 or 3, and dropping `penalty_repeat`
   closer to 1.0 should produce prose-friendly defaults. Possibly
   size-aware (different defaults for small vs large models).
+
+  **Design constraint from Mike**: the aggressive defaults were
+  originally fighting a Mistral-family failure mode in Weave —
+  Mistral agents with persistent state tend to write memory
+  bullet points whose first token(s) are *identical* across many
+  bullets ("- The user wants…", "- The user wants…", "- The user
+  wants…"). The `ngram_min_size=1` + `penalty_max_count=1` combo
+  attacks that anchor before it locks in. Naively relaxing the
+  defaults risks regressing the bullet-anchor failure mode.
+  Possible directions: enable `surgical` mode (which targets the
+  *entry token* of a repeating n-gram and skips ignored tokens
+  entirely, blocking phrase entry without per-token punishment),
+  keep `ngram_min_size` low but raise `penalty_max_count`
+  substantially (allow brief repetition, only attack persistent
+  loops), or — since this is fundamentally a per-model behaviour
+  — adopt model-family aware defaults. Mike's view: probably even
+  too high for Mistral itself.
+
 - **Coverage for the surrounding repetition-sampling code** — Mike
   flagged it as "either it's the tuning or something fundamentally
   broken in the repetition penalty code." More tests required
-  before re-trusting it on by default.
+  before re-trusting it on by default. Should include the Mistral
+  bullet-anchor scenario as a regression case once the new defaults
+  are picked.
 
 ## Cross-references
 
