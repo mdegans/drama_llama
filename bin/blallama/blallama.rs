@@ -69,24 +69,34 @@ struct AppState<B: Backend> {
     session: Arc<Mutex<Option<Session<B>>>>,
 }
 
-/// List directory entries that match a per-backend predicate.
-/// llama-cpp wants `is_file()` (one `.gguf` per model); moeflux wants
-/// `is_dir()` (one parent dir per model).
+/// List directory entries whose followed-symlink metadata satisfies
+/// `accept`. llama-cpp wants `is_file()` (one `.gguf` per model);
+/// moeflux wants `is_dir()` (one parent dir per model).
+///
+/// Uses `metadata()` (which follows symlinks) rather than
+/// `file_type()` (which reports the entry as `symlink` without
+/// chasing it). Mike's test layout symlinks `mlx` / `artifacts` /
+/// `root` into a single moeflux model dir, and the dir itself can
+/// be a symlink — both forms must enumerate.
 async fn list_entries<P>(
     path: impl AsRef<Path>,
     accept: P,
 ) -> Result<Vec<String>, std::io::Error>
 where
-    P: Fn(&std::fs::FileType) -> bool,
+    P: Fn(&std::fs::Metadata) -> bool,
 {
     let mut read_dir = tokio::fs::read_dir(path).await?;
     let mut models = vec![];
-    while let Some(model) = read_dir.next_entry().await? {
-        let ft = model.file_type().await?;
-        if !accept(&ft) {
+    while let Some(entry) = read_dir.next_entry().await? {
+        // metadata() follows symlinks; symlink_metadata() would not.
+        // Skip entries whose target is missing or unreadable.
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !accept(&meta) {
             continue;
         }
-        let model = if let Ok(model) = model.file_name().into_string() {
+        let model = if let Ok(model) = entry.file_name().into_string() {
             model
         } else {
             continue;
@@ -187,7 +197,7 @@ mod llama_cpp_run {
         Json(prompt): Json<Prompt>,
     ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
     {
-        let models = match list_entries(&state.args.model_path, |ft| ft.is_file()).await {
+        let models = match list_entries(&state.args.model_path, |m| m.is_file()).await {
             Ok(models) => models,
             Err(e) => {
                 let e = AnthropicError::NotFound {
@@ -329,7 +339,7 @@ mod moeflux_run {
         Json(prompt): Json<Prompt>,
     ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
     {
-        let models = match list_entries(&state.args.model_path, |ft| ft.is_dir()).await {
+        let models = match list_entries(&state.args.model_path, |m| m.is_dir()).await {
             Ok(models) => models,
             Err(e) => {
                 let e = AnthropicError::NotFound {
