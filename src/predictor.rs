@@ -134,33 +134,34 @@ impl PredictOptions {
                 opts.ignored.insert(extra.into());
             }
         }
-        // Reserved / unused special-token slots. Tokenizers like
-        // Qwen3 carve out a tail of the vocab (e.g. 248000-248320)
-        // for special tokens, only some of which have actual text
-        // content — the rest decode to empty strings. Empty-piece
-        // tokens contribute zero bytes to a grammar's byte stream,
-        // so any GBNF / JSON grammar trivially accepts them; once a
-        // structured response completes and the grammar is in an
-        // accept state, the model can sample from this reserved
-        // pool and emit a scatter of empty-piece tokens until
-        // `max_tokens` runs out. Adding each as a single-token stop
-        // halts that loop on the first emission. Tool-call markers
-        // (`<|tool_call|>`, etc.) decode to non-empty text and are
-        // unaffected.
-        let bos = model.bos();
-        for special in model.special_tokens() {
-            if special == eos
-                || special == eot
-                || special == bos
-                || special < 0
-            {
+        // Reserved / unused vocab slots that decode to empty strings
+        // are NOT handled here — the histogram diagnostic showed they
+        // sit outside `special_tokens()` (which only enumerates named
+        // entries from `added_tokens_decoder`), so a scan of
+        // `special_tokens()` misses them. Session caches a full-vocab
+        // scan once at init and adds those tokens directly to
+        // `stop_sequences`; see `Session::reserved_vocab`. (Future
+        // cleanup: convert to a `SamplingMode::Deny` mask so the
+        // tokens are masked out of the candidate set up-front rather
+        // than caught after emission.)
+        self
+    }
+
+    /// Push every token in `tokens` as its own single-token stop
+    /// sequence and add to the repetition-ignored set. Used by
+    /// [`Session`] to splice in the cached reserved-vocab list once
+    /// `add_model_stops` has set the eos/eot anchors.
+    pub fn add_token_stops<I>(mut self, tokens: I) -> Self
+    where
+        I: IntoIterator<Item = Token>,
+    {
+        for t in tokens {
+            if t < 0 {
                 continue;
             }
-            if model.token_to_piece(special).is_empty() {
-                self.stop_sequences.push(vec![special]);
-                if let Some(opts) = &mut self.sample_options.repetition {
-                    opts.ignored.insert(special.into());
-                }
+            self.stop_sequences.push(vec![t]);
+            if let Some(opts) = &mut self.sample_options.repetition {
+                opts.ignored.insert(t.into());
             }
         }
         self

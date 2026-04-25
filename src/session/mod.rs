@@ -282,6 +282,16 @@ pub struct Session<B: Backend> {
     /// `Session`. Zeroed on construction; never reset except by
     /// dropping and rebuilding the `Session`.
     total_usage: Usage,
+    /// Vocab token ids that decode to empty strings (excluding
+    /// bos/eos/eot/extra_eos). Computed once at construction by
+    /// scanning the full vocab. Spliced into every call's
+    /// `stop_sequences` so the predictor halts the moment one is
+    /// emitted — without this, grammars accept them trivially
+    /// (empty pieces contribute zero bytes) and the model can
+    /// scatter them across the post-grammar tail until `max_tokens`
+    /// runs out. See the v0.8 Qwen3 diagnostic for the original
+    /// observation.
+    reserved_vocab: Vec<Token>,
 }
 
 // llama.cpp-specific constructors. Available only when the
@@ -367,6 +377,7 @@ impl<B: Backend> Session<B> {
     /// layout, moeflux runtime knobs, ...).
     pub fn from_engine(engine: Engine<B>) -> Result<Self, SessionError> {
         let template = ChatTemplate::from_model(&engine.model)?;
+        let reserved_vocab = compute_reserved_vocab(&engine.model);
         Ok(Self {
             engine,
             template,
@@ -379,6 +390,7 @@ impl<B: Backend> Session<B> {
             prefix_cache: None,
             last_usage: Usage::default(),
             total_usage: Usage::default(),
+            reserved_vocab,
         })
     }
 
@@ -843,8 +855,9 @@ impl<B: Backend> Session<B> {
 
         let (suffix, l_hit) = self.kv_setup_for_call(&tokens, &breakpoints);
 
-        let mut predict_opts =
-            PredictOptions::default().add_model_stops(&self.engine.model);
+        let mut predict_opts = PredictOptions::default()
+            .add_model_stops(&self.engine.model)
+            .add_token_stops(self.reserved_vocab.iter().copied());
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.sample_options = SampleOptions {
             modes,
@@ -950,8 +963,9 @@ impl<B: Backend> Session<B> {
         }
         eos_pieces.remove("");
 
-        let mut predict_opts =
-            PredictOptions::default().add_model_stops(&self.engine.model);
+        let mut predict_opts = PredictOptions::default()
+            .add_model_stops(&self.engine.model)
+            .add_token_stops(self.reserved_vocab.iter().copied());
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.sample_options = SampleOptions {
             modes,
@@ -1024,8 +1038,9 @@ impl<B: Backend> Session<B> {
         }
         eos_pieces.remove("");
 
-        let mut predict_opts =
-            PredictOptions::default().add_model_stops(&self.engine.model);
+        let mut predict_opts = PredictOptions::default()
+            .add_model_stops(&self.engine.model)
+            .add_token_stops(self.reserved_vocab.iter().copied());
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.sample_options = SampleOptions {
             modes,
@@ -1578,6 +1593,43 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
 /// Strip trailing EOS piece and the `[Invalid UTF-8]` marker predictors emit
 /// for byte-fallback tokens at stream end. Matches what
 /// `examples/strawberry.rs` does by hand today.
+/// Walk the full vocab once and collect every token id whose
+/// decoded piece is empty, excluding the model's primary
+/// EOS/EOT/BOS and any additional EOS-like tokens it declares.
+///
+/// This is the slow path (one `token_to_piece` call per vocab id —
+/// ~250k for Qwen3-class vocabs, hundreds of milliseconds). Run
+/// once per [`Session`] at construction; the result is reused on
+/// every subsequent call.
+///
+/// Why we need this: GBNF / JSON grammars constrain a candidate's
+/// byte stream, but empty-piece tokens contribute zero bytes and
+/// are trivially accepted. After a structured response completes,
+/// the model can scatter these reserved/unused vocab slots until
+/// `max_tokens` runs out (observed live on Qwen3.5-A17B emitting
+/// ~480 such tokens after a 7-token JSON answer).
+/// `Model::special_tokens()` only enumerates *named* entries from
+/// `added_tokens_decoder`; the reserved tail of the vocab isn't
+/// listed there, so this scan is the source of truth.
+fn compute_reserved_vocab<M: Model>(model: &M) -> Vec<Token> {
+    let bos = model.bos();
+    let eos = model.eos();
+    let eot = model.eot();
+    let extras: std::collections::BTreeSet<Token> =
+        model.extra_eos_tokens().into_iter().collect();
+    let n = model.n_vocab();
+    let mut out = Vec::new();
+    for id in 0..n {
+        if id == bos || id == eos || id == eot || extras.contains(&id) {
+            continue;
+        }
+        if model.token_to_piece(id).is_empty() {
+            out.push(id);
+        }
+    }
+    out
+}
+
 fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
     let eos_piece = engine.model.token_to_piece(engine.model.eos());
     text.trim_end_matches(eos_piece.as_str())
