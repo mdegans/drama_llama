@@ -134,16 +134,11 @@ impl PredictOptions {
                 opts.ignored.insert(extra.into());
             }
         }
-        // Reserved / unused vocab slots that decode to empty strings
-        // are NOT handled here — the histogram diagnostic showed they
-        // sit outside `special_tokens()` (which only enumerates named
-        // entries from `added_tokens_decoder`), so a scan of
-        // `special_tokens()` misses them. Session caches a full-vocab
-        // scan once at init and adds those tokens directly to
-        // `stop_sequences`; see `Session::reserved_vocab`. (Future
-        // cleanup: convert to a `SamplingMode::Deny` mask so the
-        // tokens are masked out of the candidate set up-front rather
-        // than caught after emission.)
+        // Reserved / unused vocab slots (decode to empty strings,
+        // sit outside `special_tokens()`) are NOT handled here —
+        // they're masked at sample time via `SamplingMode::Deny`
+        // prepended by `Session::prepare_call`, so they never
+        // reach the candidate set in the first place.
         self
     }
 

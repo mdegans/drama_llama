@@ -540,6 +540,34 @@ pub enum SamplingMode {
         )]
         Arc<Mutex<GrammarState>>,
     ),
+    /// Forbid every token id in `range` from sampling. Logits for
+    /// matching candidates are dropped before downstream modes run.
+    ///
+    /// Primary use case: tokenizer reserved/unused vocab tail
+    /// (Qwen3.5: 248000..248320). Such slots decode to empty
+    /// strings — they contribute zero bytes to a grammar's byte
+    /// stream and so are trivially accepted by GBNF / JSON
+    /// constraints, even when the structured response has already
+    /// completed. Without this mask, the model can land in a loop
+    /// scattering reserved tokens until `max_tokens` runs out (the
+    /// grammar's "all-candidates-rejected → force EOS" fallback
+    /// never fires because empty-piece tokens keep the candidate
+    /// set non-empty). With the mask, the grammar sees a candidate
+    /// set without empty-piece tokens, rejects every byte-emitting
+    /// candidate after the structure closes, and the EOS fallback
+    /// triggers naturally.
+    ///
+    /// # Placement
+    ///
+    /// Place at the **start** of the chain so the deny applies
+    /// before grammar, top-p, etc. reason about the candidate set.
+    /// `Session` prepends a Deny mode from the model's reserved
+    /// vocab range automatically; callers building chains by hand
+    /// should mirror that.
+    Deny {
+        /// Half-open range `[start, end)` of token ids to forbid.
+        range: std::ops::Range<Token>,
+    },
 }
 
 impl SamplingMode {
@@ -557,6 +585,13 @@ impl SamplingMode {
         Self::split_p(),
         Self::split_l(),
     ];
+
+    /// Construct a [`SamplingMode::Deny`] from a token-id range.
+    /// Convenience wrapper so callers don't need to spell out the
+    /// struct field syntax.
+    pub fn deny_range(range: std::ops::Range<Token>) -> Self {
+        Self::Deny { range }
+    }
 
     /// Construct a fresh JSON-constrained sampling mode at the root of a
     /// document.
@@ -599,6 +634,7 @@ impl SamplingMode {
             Self::SplitL { .. } => "Split L",
             Self::Json(_) => "JSON",
             Self::Grammar(_) => "Grammar",
+            Self::Deny { .. } => "Deny",
         }
     }
 
@@ -617,6 +653,7 @@ impl SamplingMode {
             Self::SplitL { .. } => "Cuts off the tail where the difference between adjacent logits is greatest.",
             Self::Json(_) => "Constrains generation to valid JSON. Place early in the chain so it prunes candidates before top-p/top-k. On grammar violation, forces EOS and terminates.",
             Self::Grammar(_) => "Constrains generation to a GBNF grammar. Place early in the chain so it prunes candidates before top-p/top-k. On grammar violation, forces EOS and terminates.",
+            Self::Deny { .. } => "Forbids every candidate whose token id falls in `range`. Place at the start of the chain — typically used for the model's reserved/empty-piece vocab tail.",
         }
     }
 
@@ -907,6 +944,17 @@ impl SamplingMode {
                 }
                 resp
             }
+            Self::Deny { range } => {
+                ui.label(format!(
+                    "Deny: {}..{} ({} ids)",
+                    range.start,
+                    range.end,
+                    (range.end - range.start).max(0)
+                ))
+                .on_hover_text_at_pointer(
+                    "Forbids every candidate whose token id falls in this range. Typically used for the model's reserved/empty-piece vocab tail.",
+                )
+            }
         }
     }
 
@@ -1130,6 +1178,25 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                          SamplingMode::grammar(...) and retry.",
                     );
                     grammar::grammar_filter(candidates, &mut locked, model)
+                }
+                SamplingMode::Deny { range } => {
+                    let kept: Vec<crate::TokenData> = candidates
+                        .as_slice()
+                        .iter()
+                        .filter(|td| !range.contains(&td.id))
+                        .copied()
+                        .collect();
+                    if kept.is_empty() {
+                        // Vacuously denied. Force EOS so the predictor's
+                        // stop machinery can halt generation.
+                        Candidates::from_vec(vec![crate::TokenData {
+                            id: model.eos(),
+                            logit: 0.0,
+                            p: 0.0,
+                        }])
+                    } else {
+                        Candidates::from_vec_unchecked(kept)
+                    }
                 }
             });
 

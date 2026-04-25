@@ -282,16 +282,16 @@ pub struct Session<B: Backend> {
     /// `Session`. Zeroed on construction; never reset except by
     /// dropping and rebuilding the `Session`.
     total_usage: Usage,
-    /// Vocab token ids that decode to empty strings (excluding
-    /// bos/eos/eot/extra_eos). Computed once at construction by
-    /// scanning the full vocab. Spliced into every call's
-    /// `stop_sequences` so the predictor halts the moment one is
-    /// emitted — without this, grammars accept them trivially
-    /// (empty pieces contribute zero bytes) and the model can
-    /// scatter them across the post-grammar tail until `max_tokens`
-    /// runs out. See the v0.8 Qwen3 diagnostic for the original
-    /// observation.
-    reserved_vocab: Vec<Token>,
+    /// Half-open range of token ids covering the model's reserved /
+    /// empty-piece vocab tail (e.g. Qwen3.5: `248088..248320`).
+    /// Computed once at construction by scanning from the highest
+    /// vocab id downward until a sustained run of content tokens is
+    /// hit. Prepended to every call's sampling chain as a
+    /// [`SamplingMode::Deny`] so reserved tokens are stripped from
+    /// the candidate set before grammar / sampling reason about it.
+    /// `None` means no reserved tail was detected (model has
+    /// content tokens at the top of the vocab).
+    reserved_range: Option<std::ops::Range<Token>>,
 }
 
 // llama.cpp-specific constructors. Available only when the
@@ -377,7 +377,7 @@ impl<B: Backend> Session<B> {
     /// layout, moeflux runtime knobs, ...).
     pub fn from_engine(engine: Engine<B>) -> Result<Self, SessionError> {
         let template = ChatTemplate::from_model(&engine.model)?;
-        let reserved_vocab = compute_reserved_vocab(&engine.model);
+        let reserved_range = compute_reserved_range(&engine.model);
         Ok(Self {
             engine,
             template,
@@ -390,7 +390,7 @@ impl<B: Backend> Session<B> {
             prefix_cache: None,
             last_usage: Usage::default(),
             total_usage: Usage::default(),
-            reserved_vocab,
+            reserved_range,
         })
     }
 
@@ -654,13 +654,25 @@ impl<B: Backend> Session<B> {
             Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
             Some(crate::CompiledOutputConfig::Deferred(d)) => (None, Some(d)),
         };
+        // Deny mask for the reserved vocab tail (e.g. Qwen3:
+        // 248088..248320). Goes first so grammar / sampling never
+        // see those tokens. Without this, empty-piece reserved
+        // tokens slip past byte-stream-based grammar checks (zero
+        // bytes are trivially accepted) and the model can land in
+        // a post-grammar loop until `max_tokens` runs out.
+        let deny_mode =
+            self.reserved_range.clone().map(SamplingMode::deny_range);
         let modes: Vec<SamplingMode> = if include_user_sampling {
-            grammar_mode
+            deny_mode
                 .into_iter()
+                .chain(grammar_mode.into_iter())
                 .chain(self.sample_modes.iter().cloned())
                 .collect()
         } else {
-            grammar_mode.into_iter().collect()
+            deny_mode
+                .into_iter()
+                .chain(grammar_mode.into_iter())
+                .collect()
         };
         Ok((tokens, modes, deferred))
     }
@@ -712,13 +724,25 @@ impl<B: Backend> Session<B> {
             Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
             Some(crate::CompiledOutputConfig::Deferred(d)) => (None, Some(d)),
         };
+        // Deny mask for the reserved vocab tail (e.g. Qwen3:
+        // 248088..248320). Goes first so grammar / sampling never
+        // see those tokens. Without this, empty-piece reserved
+        // tokens slip past byte-stream-based grammar checks (zero
+        // bytes are trivially accepted) and the model can land in
+        // a post-grammar loop until `max_tokens` runs out.
+        let deny_mode =
+            self.reserved_range.clone().map(SamplingMode::deny_range);
         let modes: Vec<SamplingMode> = if include_user_sampling {
-            grammar_mode
+            deny_mode
                 .into_iter()
+                .chain(grammar_mode.into_iter())
                 .chain(self.sample_modes.iter().cloned())
                 .collect()
         } else {
-            grammar_mode.into_iter().collect()
+            deny_mode
+                .into_iter()
+                .chain(grammar_mode.into_iter())
+                .collect()
         };
         Ok((tokens, breakpoints, modes, deferred))
     }
@@ -855,9 +879,8 @@ impl<B: Backend> Session<B> {
 
         let (suffix, l_hit) = self.kv_setup_for_call(&tokens, &breakpoints);
 
-        let mut predict_opts = PredictOptions::default()
-            .add_model_stops(&self.engine.model)
-            .add_token_stops(self.reserved_vocab.iter().copied());
+        let mut predict_opts =
+            PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.sample_options = SampleOptions {
             modes,
@@ -963,9 +986,8 @@ impl<B: Backend> Session<B> {
         }
         eos_pieces.remove("");
 
-        let mut predict_opts = PredictOptions::default()
-            .add_model_stops(&self.engine.model)
-            .add_token_stops(self.reserved_vocab.iter().copied());
+        let mut predict_opts =
+            PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.sample_options = SampleOptions {
             modes,
@@ -1038,9 +1060,8 @@ impl<B: Backend> Session<B> {
         }
         eos_pieces.remove("");
 
-        let mut predict_opts = PredictOptions::default()
-            .add_model_stops(&self.engine.model)
-            .add_token_stops(self.reserved_vocab.iter().copied());
+        let mut predict_opts =
+            PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.sample_options = SampleOptions {
             modes,
@@ -1593,41 +1614,62 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
 /// Strip trailing EOS piece and the `[Invalid UTF-8]` marker predictors emit
 /// for byte-fallback tokens at stream end. Matches what
 /// `examples/strawberry.rs` does by hand today.
-/// Walk the full vocab once and collect every token id whose
-/// decoded piece is empty, excluding the model's primary
-/// EOS/EOT/BOS and any additional EOS-like tokens it declares.
-///
-/// This is the slow path (one `token_to_piece` call per vocab id —
-/// ~250k for Qwen3-class vocabs, hundreds of milliseconds). Run
-/// once per [`Session`] at construction; the result is reused on
-/// every subsequent call.
+/// Detect the model's reserved / empty-piece vocab tail by scanning
+/// from the highest token id downward. Returns the half-open range
+/// `[lowest_empty, n_vocab)` if such a tail exists, `None`
+/// otherwise.
 ///
 /// Why we need this: GBNF / JSON grammars constrain a candidate's
 /// byte stream, but empty-piece tokens contribute zero bytes and
 /// are trivially accepted. After a structured response completes,
-/// the model can scatter these reserved/unused vocab slots until
+/// the model can scatter reserved/unused vocab slots until
 /// `max_tokens` runs out (observed live on Qwen3.5-A17B emitting
 /// ~480 such tokens after a 7-token JSON answer).
 /// `Model::special_tokens()` only enumerates *named* entries from
 /// `added_tokens_decoder`; the reserved tail of the vocab isn't
-/// listed there, so this scan is the source of truth.
-fn compute_reserved_vocab<M: Model>(model: &M) -> Vec<Token> {
+/// listed there.
+///
+/// This scan is bounded — it stops after [`RESERVED_SCAN_TOLERANCE`]
+/// consecutive content tokens, so a typical 200-300 token tail
+/// costs ~300 `token_to_piece` calls, not the full vocab. For
+/// models without a reserved tail (high-id tokens have content),
+/// the scan terminates after `TOLERANCE` ids and returns `None`.
+fn compute_reserved_range<M: Model>(
+    model: &M,
+) -> Option<std::ops::Range<Token>> {
+    /// Scan terminates when this many consecutive non-empty,
+    /// non-special tokens are seen (counting downward from the
+    /// vocab tail). Picks "real content" boundary robustly — single
+    /// stray non-empty tokens within the reserved range don't
+    /// short-circuit the scan.
+    const TOLERANCE: usize = 64;
+
     let bos = model.bos();
     let eos = model.eos();
     let eot = model.eot();
     let extras: std::collections::BTreeSet<Token> =
         model.extra_eos_tokens().into_iter().collect();
     let n = model.n_vocab();
-    let mut out = Vec::new();
-    for id in 0..n {
+    let mut lowest_empty: Option<Token> = None;
+    let mut consecutive_content: usize = 0;
+
+    for id in (0..n).rev() {
         if id == bos || id == eos || id == eot || extras.contains(&id) {
+            // Skip EOS-class anchors — neither boundary signal nor
+            // reserved-range members.
             continue;
         }
         if model.token_to_piece(id).is_empty() {
-            out.push(id);
+            lowest_empty = Some(id);
+            consecutive_content = 0;
+        } else {
+            consecutive_content += 1;
+            if consecutive_content >= TOLERANCE {
+                break;
+            }
         }
     }
-    out
+    lowest_empty.map(|min| min..n)
 }
 
 fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
