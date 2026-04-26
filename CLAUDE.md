@@ -43,6 +43,39 @@ There are likely things I've missed, which we can add here later. If there is an
   caution based on a bad estimate is just quitting early. Ask
   before believing my own alarm.
 
+## In-repo memory (read these when starting a session)
+
+Durable context lives in [`.claude/memory/`](.claude/memory/) —
+versioned, no auto-pruning, visible to collaborators. Key entries
+for the current arc:
+
+- [`riir_moeflux_strategy.md`](.claude/memory/riir_moeflux_strategy.md)
+  — the active RIIR plan: differential port of moeflux, branch
+  `riir` in `~/Projects/moeflux`, no Arc, `metal-rs`. Phase 0/1a/2
+  landed; Phase 3 (forward pass bottom-up) is next.
+- [`blallama_session_state_pollution.md`](.claude/memory/blallama_session_state_pollution.md)
+  — bisect findings that motivated the RIIR. `memory_clear` is
+  also lossy in C (not just `memory_seq_rm`), original argmax-only
+  tests were false-greens.
+- [`provider_trust_discipline.md`](.claude/memory/provider_trust_discipline.md)
+  — methodology for probe / baseline captures.
+  `provider_source × capture_date × wrapper_version × sampler_settings`
+  is the unit of comparability. Forward-looking; informs the
+  callback-on-Engine probe-mode hook when it lands.
+- [`moeflux_disk_convention.md`](.claude/memory/moeflux_disk_convention.md)
+  — `parent/{mlx,artifacts,root}/` layout for `MoefluxEngine::from_path`.
+
+Older but still load-bearing:
+
+- [`plan_v0.8.0_backend_split.md`](.claude/memory/plan_v0.8.0_backend_split.md)
+  — Phase 1–4 history of the `Session<B: Backend>` landing.
+- [`qwen3_long_form_degradation.md`](.claude/memory/qwen3_long_form_degradation.md)
+  — diagnosis trace; rep-penalty was the dominant cause.
+- [`grammar_reserved_token_loop.md`](.claude/memory/grammar_reserved_token_loop.md)
+  — Qwen3 reserved-token-mask fix.
+- [`future_work_*.md`](.claude/memory/) — block predictor, flash-moe
+  backend, grammar speculation, Rust audit. Things to come back to.
+
 ## Build & Test Commands
 
 ```bash
