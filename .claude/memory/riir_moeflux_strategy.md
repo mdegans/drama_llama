@@ -103,13 +103,45 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 |--------|--------|-------------|-------|
 | embedding | 2026-04-26 (4216e2f) | bit-exact, 8 tok × 2048 elem | First per-kernel hook; CPU 4-bit dequant. |
 | RMSNorm (CPU) | 2026-04-26 (a7866cc) | bit-exact, 4 tok × 3 norms × 2048 elem | model.norm + layer-0 input_layernorm + post_attention_layernorm. Reduction-order-matched. |
+| RoPE | 2026-04-26 (250f5e8) | ULP-bounded ≤128 (observed 34 max), 5 positions × q+k | First non-bit-exact kernel. See "Tolerance regimes" below. |
 | RMSNorm (Metal) | — | — | Cosine/Jaccard tolerance — fast_math + Metal reduction order diverge. |
-| RoPE | — | — | Next. partial-rotary, head_dim/4 channels, ROPE_THETA=1e7. |
-| full attention | — | — | |
+| full attention | — | — | Next. |
 | linear attention | — | — | |
 | MoE router | — | — | |
 | MoE dispatch | — | — | |
 | LM head | — | — | Symmetric to embedding (4-bit dequant matvec). |
+
+## Tolerance regimes (set by RoPE slice)
+
+Three diff signals, picked per kernel based on what compiler choices
+will and won't preserve:
+
+- **Bit-exact** (per-element `to_bits` equality): only for kernels
+  that are pure integer arithmetic + sequential f32 reduction +
+  bf16-as-shift. Embedding and CPU RMSNorm sit here.
+- **ULP-bounded** (per-element `ulp_diff` ≤ N, N small): kernels
+  involving trig or other libm-precision calls. Catches porting
+  bugs (which produce thousands of ULPs / NaN / sign flips) without
+  chasing two different compiler-choice artifacts:
+  1. Apple clang `-O3` auto-vectorizes scalar `cosf` / `sinf` via
+     Apple's libm vector variants. Rust extern-`"C"` calls don't.
+  2. Apple clang `-ffp-contract=on` (default) fuses `a*b ± c*d`
+     into FMA instructions. Rust plain `*` / `-` don't.
+  Even with extern libm bindings on the Rust side, those two
+  compiler choices produce ≤ ~30 ULPs of drift on RoPE — bounded
+  per call, not growing unboundedly with position. RoPE uses
+  `MAX_ULP_DRIFT = 128`; this is the working budget for trig
+  kernels.
+- **Cosine / Jaccard floors** (vector-level similarity): for
+  Metal kernels and full-pipeline checkpoints, where MoE atomic-op
+  nondeterminism stacks. Helpers + thresholds already in
+  `diff_oracle.rs`. Reserved for layer-boundary checkpoints, not
+  per-element kernel diffs.
+
+The `mul_add` retrofit on the rotation step would shrink RoPE's
+drift (matches clang's likely FMA pattern) but doesn't change the
+methodology; left as a future micro-optimization if any consumer
+benefits from tighter agreement.
 
 **Diff-oracle hook pattern**: each kernel gets a `mf_<kernel>` accessor
 in `moeflux.h` that exposes the static C primitive. `RsCtx::open`
