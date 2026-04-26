@@ -1,21 +1,62 @@
 # blallama / moeflux Session-state pollution across requests
 
-**Status**: open, ISOLATED to moeflux (llama-cpp Session handles the
-same 3-prompt sequence cleanly — see "Backend isolation" section
-below).
+**Status (updated 2026-04-27)**: investigated. Two real upstream
+bugs identified by bisect, neither is the originally-reported
+blallama symptom — that one does not currently reproduce in-process.
+Fix path is the upstream RIIR, not a C-side patch. See
+`riir_moeflux_strategy.md` for the rewrite plan.
 
-**Priority**: HIGH — blocks Claude-on-balerion from running probes
-against moeflux-served models. The workaround (restart blallama
-between every probe) is coordination-heavy and mistake-prone enough
-that it's effectively unusable for an automated probe suite. This
-is the very next session's work after the v0.8.0 rep-penalty +
-sidecar landing (commit `51fa347`).
+**Priority**: superseded by RIIR. The bisect tests (in moeflux at
+`crates/moeflux/tests/consecutive_eval_prompt.rs` and in drama_llama
+at `tests/moeflux_session_pollution.rs`) become regressions that
+the Rust port must pass.
 
-Discovered 2026-04-26 during A17B sidecar tuning. Likely related to
-earlier "stall on second request after cancelled first" symptom.
-Cause within moeflux not yet isolated — could be C-side KV cache,
-position bookkeeping in `mf_eval_prompt`, or the routed-experts
-cache getting confused between calls.
+## Findings from the 2026-04-27 bisect
+
+Tests in `moeflux::crates/moeflux/tests/consecutive_eval_prompt.rs`:
+
+- **`memory_clear` is fine within a single Ctx.** Both same-prompt
+  and dirty-decode-then-different-prompt scenarios pass. The
+  original `g_deferred`-not-reset hypothesis is refuted for
+  intra-Ctx use.
+- **Cross-Ctx state survives `mf_free_model`** — the second
+  `Ctx::open` after a drop produces all-NaN logits. Process-global
+  state (likely `g_deferred` holding a dangling pointer into the
+  freed `ctx->hidden`) leaks across instances. Real bug, but
+  blallama only opens one Ctx so it's not the user-visible symptom.
+- **Resuming prefill diverges from full prefill.** `mf_memory_seq_rm(0,
+  l_hit, -1)` followed by `eval_prompt(suffix, start_pos=l_hit, …)`
+  produces a verbatim-loop trajectory on synthetic tokens; full
+  prefill of the same final tokens does not. Per `moeflux.h` design
+  notes, partial truncation of linear-attention layers resets
+  recurrence state *by design* — the lossy semantic is documented
+  upstream, but the re-prefilled state still diverges from a fresh
+  one. With real chat-template prompts and 600-token essay outputs
+  this divergence does not surface as user-visible degeneration
+  (drama_llama's `tests/moeflux_session_pollution.rs` passes).
+
+## Why the original symptom B/C don't reproduce now
+
+Captured 2026-04-26, no longer reproducible 2026-04-27 with the
+same A3B model and similar prompt shape. Possible explanations:
+
+- The `MAX_K 8 → 16` moeflux fix (commit `d013a0b`, 2026-04-25,
+  landed *just before* the symptom catalog was written) addressed
+  silent expert-drop on K>10 models. A3B at K=8 wasn't supposed to
+  trigger it, but the surrounding accounting may have been
+  affected.
+- The `repetition: None` default in v0.8.0 sidecars (commit
+  `51fa347`) changed the sampling-chain composition. Memory note
+  argued this was "unrelated" to the bug, but the 8-token loop in
+  symptom C is exactly the regime rep-penalty bounds.
+- Fabricated low-id token streams in the bisect amplify numerical
+  drift; real semantic prompts may stay coherent through the same
+  state divergence.
+
+The drama_llama-side regression test (`tests/moeflux_session_pollution.rs`)
+stays in-tree as a forward-looking guard: it currently passes with
+the 600-token essay scenario, and any future regression of symptom
+B or C will trip it.
 
 ## Three observed symptoms
 
