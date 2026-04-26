@@ -1,10 +1,21 @@
 # blallama / moeflux Session-state pollution across requests
 
-**Status**: open, suspected. Discovered 2026-04-26 during A17B sidecar
-tuning. Likely related to earlier "stall on second request after
-cancelled first" symptom. Cause not isolated yet — could be moeflux C
-side, drama_llama prefix-cache logic, or position-counter mismatch
-between the two.
+**Status**: open, ISOLATED to moeflux (llama-cpp Session handles the
+same 3-prompt sequence cleanly — see "Backend isolation" section
+below).
+
+**Priority**: HIGH — blocks Claude-on-balerion from running probes
+against moeflux-served models. The workaround (restart blallama
+between every probe) is coordination-heavy and mistake-prone enough
+that it's effectively unusable for an automated probe suite. This
+is the very next session's work after the v0.8.0 rep-penalty +
+sidecar landing (commit `51fa347`).
+
+Discovered 2026-04-26 during A17B sidecar tuning. Likely related to
+earlier "stall on second request after cancelled first" symptom.
+Cause within moeflux not yet isolated — could be C-side KV cache,
+position bookkeeping in `mf_eval_prompt`, or the routed-experts
+cache getting confused between calls.
 
 ## Three observed symptoms
 
