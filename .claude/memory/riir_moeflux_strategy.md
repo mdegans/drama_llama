@@ -65,16 +65,33 @@ Total: 28–48h focused work.
 
 ## Differential harness shape
 
-`crates/moeflux/tests/diff/` exposes a `DiffBackend` trait that both
-the existing C path (via `moeflux-sys`) and the new Rust path
-implement. Comparison helpers:
-- argmax must match
-- top-K (K=20) Jaccard ≥ 0.95
-- full-vector cosine similarity ≥ 0.99
+`crates/moeflux/tests/diff_oracle.rs` exposes a `DiffBackend` trait
+that both the existing C path (via `moeflux-sys`) and the new Rust
+path implement.
 
-Tolerance bands account for Metal MoE atomic-op nondeterminism
-(known issue, not a porting bug). Real divergence from porting bugs
-is much larger than the floor.
+**Originally planned**: end-to-end logits comparison with argmax
+match + top-K Jaccard ≥ 0.95 + cosine ≥ 0.99.
+
+**Refined (Phase 0 finding)**: end-to-end logits are NOT a useful
+oracle. The C path itself is non-deterministic across
+`memory_clear` for the same prompt (cosine ≈ 0.65–0.76 between
+two C-side runs), so we can't expect Rust-vs-C to be tighter than
+that. The original bisect's `memory_clear_*` tests were green only
+because they used argmax + trajectory equality, which both pass
+trivially when greedy decoding lands in the same attractor (a
+runaway 5073 token in our synthetic-prompt case).
+
+**Real diff strategy (Phase 3+)**: intermediate-tensor checkpoints.
+Both backends expose hooks that dump per-layer outputs (post-RMSNorm,
+post-attention, post-MoE, etc.). Compare layer-by-layer where Metal
+nondeterminism has had less chance to accumulate. The earliest
+divergence between C and Rust pinpoints the exact kernel that's
+been mis-ported.
+
+The Phase 0 harness in place today has the trait + impls + helpers
++ a scaffold-validation test (`harness_loads`). The intermediate-
+checkpoint hooks come in Phase 3 when there's actually something to
+compare.
 
 ## What the bisect tests become
 

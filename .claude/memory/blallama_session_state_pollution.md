@@ -15,10 +15,22 @@ the Rust port must pass.
 
 Tests in `moeflux::crates/moeflux/tests/consecutive_eval_prompt.rs`:
 
-- **`memory_clear` is fine within a single Ctx.** Both same-prompt
-  and dirty-decode-then-different-prompt scenarios pass. The
-  original `g_deferred`-not-reset hypothesis is refuted for
-  intra-Ctx use.
+- ~~**`memory_clear` is fine within a single Ctx.**~~ **Update 2026-04-27 (Phase 0 of RIIR setup):** the original bisect's
+  `memory_clear_resets_for_same_prompt` and
+  `memory_clear_after_dirty_decode_resets_for_different_prompt` tests
+  passed only because they used coarse metrics (argmax equality +
+  trajectory equality on greedy-decode). Stricter comparison via
+  the diff oracle (cosine sim + top-20 Jaccard on prefill logits)
+  reveals that two `eval_prompt` calls of the same prompt on one Ctx
+  with `memory_clear` between produce logit vectors with
+  cosine ≈ 0.65–0.76 and Jaccard ≈ 0.10–0.18. The trajectory match
+  works only because greedy decoding lands in the same attractor
+  regardless of starting state (e.g. `[…, 5073, 5073, 5073, …]`
+  with 12 consecutive 5073s). So `memory_clear` is **also** lossy /
+  non-deterministic, just below the resolution of the original
+  argmax-equality assertion. Direct consequence: the Rust port
+  cannot use end-to-end logits vs C as a diff oracle (Phase 3+
+  will need intermediate-tensor checkpoints).
 - **Cross-Ctx state survives `mf_free_model`** — the second
   `Ctx::open` after a drop produces all-NaN logits. Process-global
   state (likely `g_deferred` holding a dangling pointer into the
