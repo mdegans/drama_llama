@@ -81,6 +81,13 @@ pub use moeflux::{
 mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};
 
+#[cfg(feature = "toml")]
+pub mod sidecar;
+#[cfg(feature = "toml")]
+pub use sidecar::{
+    load_sample_options, write_default_sample_options, SidecarError,
+};
+
 mod engine;
 pub use engine::Engine;
 

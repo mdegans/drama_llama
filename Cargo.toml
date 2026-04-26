@@ -76,7 +76,10 @@ webchat = [
     "serde",
     "llama-cpp",
 ]
-toml = ["dep:toml"]
+# `toml` enables per-model sampling sidecar I/O via the `sidecar`
+# module. Pulls in `serde` because the sidecar round-trips
+# `SampleOptions` through serde-derived impls.
+toml = ["dep:toml", "serde"]
 cli = ["dep:clap", "llama-cpp"]
 serde = ["tinyvec/serde"]
 stats = ["dep:stringmetrics"]
@@ -136,7 +139,7 @@ required-features = ["egui", "serde", "serde_json"]
 [[bin]]
 name = "blallama"
 path = "bin/blallama/blallama.rs"
-required-features = ["axum", "cli"]
+required-features = ["axum", "cli", "toml"]
 
 [package.metadata.docs.rs]
 # `cuda` will break the build on platforms without it, and it doesn't change the

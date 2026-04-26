@@ -259,16 +259,26 @@ pub struct Session<B: Backend> {
     tool_choice_opts: ToolChoiceOptions,
     output_config_opts: OutputConfigOptions,
     render_opts: RenderOptions,
-    /// User's sampling chain WITHOUT any grammar. Grammar is prepended
-    /// transiently inside `complete_*`. Defaults to
-    /// `[SamplingMode::locally_typical()]`.
-    sample_modes: Vec<SamplingMode>,
-    /// Optional repetition penalty. Defaults to `None`: chat-style use wants
-    /// the model to be able to repeat natural short tokens (words, punctuation,
-    /// digits that appeared in the context — especially important for
-    /// tool-result follow-ups where the answer IS the digit). Story generation
-    /// can opt in via [`Session::with_repetition`].
-    repetition: Option<RepetitionOptions>,
+    /// User's sampling configuration: the post-grammar sampling-mode
+    /// chain plus the optional repetition penalty. Grammar (and the
+    /// reserved-token Deny mask) are prepended transiently inside
+    /// `complete_*` and are *not* stored here — those are runtime-only.
+    /// Defaults to `[SamplingMode::locally_typical()]` with
+    /// `repetition: None`: chat-style use wants the model to be able
+    /// to repeat natural short tokens (words, punctuation, digits that
+    /// appeared in the context — especially important for tool-result
+    /// follow-ups where the answer IS the digit). Story generation,
+    /// poetry, etc. opt in via per-model sidecar TOML or
+    /// [`Session::with_repetition`].
+    sample_options: SampleOptions,
+    /// RNG seed forwarded to every `predict_*` call. `None` =
+    /// time-based seed (each call diverges); `Some(n)` = deterministic
+    /// across runs given the same prompt and model. Default is
+    /// [`PredictOptions::DEFAULT_SEED`] so behavior matches pre-0.8
+    /// Sessions; override via [`Session::with_seed`] for tuning
+    /// iteration where you want differences to come from config
+    /// changes rather than RNG noise.
+    seed: Option<std::num::NonZeroU128>,
     max_tokens: NonZeroUsize,
     /// Prefix-cache state. `Some` iff the caller opted in via
     /// [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
@@ -294,27 +304,84 @@ pub struct Session<B: Backend> {
     reserved_range: Option<std::ops::Range<Token>>,
 }
 
+/// Apply the per-model sampling sidecar at `sidecar_path` to
+/// `session`, if any. Best-effort: missing file → write defaults so the
+/// user has a starting point; parse error → warn to stderr and keep
+/// the session as-is. Returns the session in every case so the caller
+/// can chain.
+///
+/// No-op when the `toml` feature is disabled.
+fn apply_sidecar<B: Backend>(
+    session: Session<B>,
+    #[allow(unused_variables)] sidecar_path: &std::path::Path,
+) -> Session<B> {
+    #[cfg(feature = "toml")]
+    {
+        match crate::sidecar::load_sample_options(sidecar_path) {
+            Ok(Some(opts)) => session.with_sample_options(opts),
+            Ok(None) => {
+                if let Err(e) =
+                    crate::sidecar::write_default_sample_options(sidecar_path)
+                {
+                    eprintln!(
+                        "drama_llama: could not write default sampling \
+                         sidecar at {sidecar_path:?}: {e}"
+                    );
+                }
+                session
+            }
+            Err(e) => {
+                eprintln!(
+                    "drama_llama: could not load sampling sidecar at \
+                     {sidecar_path:?}: {e}; using crate defaults"
+                );
+                session
+            }
+        }
+    }
+    #[cfg(not(feature = "toml"))]
+    {
+        session
+    }
+}
+
+/// Sidecar path convention for llama-cpp models: sibling
+/// `<model>.sampling.toml` next to the `.gguf` file.
+#[cfg(feature = "llama-cpp")]
+fn llama_cpp_sidecar_path(model_path: &std::path::Path) -> std::path::PathBuf {
+    model_path.with_extension("sampling.toml")
+}
+
 // llama.cpp-specific constructors. Available only when the
 // `llama-cpp` feature is enabled.
 #[cfg(feature = "llama-cpp")]
 impl Session<LlamaCppBackend> {
     /// Load a model from disk and wire up the chat template.
+    ///
+    /// Looks for a sampling sidecar at
+    /// `<model>.sampling.toml` (sibling of the `.gguf`) and applies it
+    /// via [`Self::with_sample_options`]. If none exists, writes the
+    /// default so the user has a starting point to edit. Requires the
+    /// `toml` feature; without it, sidecars are ignored.
     pub fn from_path(path: PathBuf) -> Result<Self, SessionError> {
+        let sidecar = llama_cpp_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path(path)?;
-        Self::from_engine(engine)
+        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
     }
 
     /// Load a model from disk with an explicit Flash Attention policy.
     ///
     /// Diagnostic escape hatch for output-divergence debugging — see
     /// [`FlashAttention`](crate::FlashAttention) for the when and why.
+    /// Sidecar handling matches [`Self::from_path`].
     pub fn from_path_with_flash_attention(
         path: PathBuf,
         fa: crate::FlashAttention,
     ) -> Result<Self, SessionError> {
+        let sidecar = llama_cpp_sidecar_path(&path);
         let engine =
             crate::LlamaCppEngine::from_path_with_flash_attention(path, fa)?;
-        Self::from_engine(engine)
+        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
     }
 
     /// Load a model from disk with an explicit KV context size.
@@ -324,20 +391,24 @@ impl Session<LlamaCppBackend> {
     /// before they finish. Use this builder when the prompt plus the
     /// generation cap ([`Self::with_max_tokens`]) can exceed 512
     /// tokens — which is almost always for reasoning-capable models.
-    /// Typical values: 4096 – 16384.
+    /// Typical values: 4096 – 16384. Sidecar handling matches
+    /// [`Self::from_path`].
     pub fn from_path_with_n_ctx(
         path: PathBuf,
         n_ctx: u32,
     ) -> Result<Self, SessionError> {
+        let sidecar = llama_cpp_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path_with_n_ctx(path, n_ctx)?;
-        Self::from_engine(engine)
+        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
     }
 
     /// Load a model CPU-only (zero GPU layers). Diagnostic path for
-    /// isolating GPU-kernel divergence.
+    /// isolating GPU-kernel divergence. Sidecar handling matches
+    /// [`Self::from_path`].
     pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, SessionError> {
+        let sidecar = llama_cpp_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path_cpu_only(path)?;
-        Self::from_engine(engine)
+        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
     }
 
     /// Silence llama.cpp's log spew (model load progress, KV cache
@@ -365,9 +436,17 @@ impl Session<MoefluxBackend> {
     /// non-default runtime params can construct a
     /// [`crate::MoefluxEngine`] directly via `MoefluxEngine::from_paths`
     /// and hand it to [`Self::from_engine`].
+    ///
+    /// Looks for a sampling sidecar at `parent/sampling.toml` —
+    /// alongside the `mlx`/`artifacts`/`root` symlinks, *not* inside
+    /// any of them — and applies it via [`Self::with_sample_options`].
+    /// If none exists, writes the default so the user has a starting
+    /// point to edit. Requires the `toml` feature; without it,
+    /// sidecars are ignored.
     pub fn from_path(parent: PathBuf) -> Result<Self, SessionError> {
+        let sidecar = parent.join("sampling.toml");
         let engine = crate::MoefluxEngine::from_path(&parent)?;
-        Self::from_engine(engine)
+        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
     }
 }
 
@@ -384,8 +463,8 @@ impl<B: Backend> Session<B> {
             tool_choice_opts: ToolChoiceOptions::default(),
             output_config_opts: OutputConfigOptions::default(),
             render_opts: RenderOptions::default().with_generation_prompt(true),
-            sample_modes: vec![SamplingMode::locally_typical()],
-            repetition: None,
+            sample_options: SampleOptions::default(),
+            seed: Some(crate::PredictOptions::DEFAULT_SEED),
             max_tokens: NonZeroUsize::new(DEFAULT_MAX_TOKENS).unwrap(),
             prefix_cache: None,
             last_usage: Usage::default(),
@@ -410,14 +489,49 @@ impl<B: Backend> Session<B> {
     /// turn or emitting a valid tool call.
     pub fn with_repetition(mut self, mut opts: RepetitionOptions) -> Self {
         opts.extend_ignored(self.engine.model.special_tokens());
-        self.repetition = Some(opts);
+        self.sample_options.repetition = Some(opts);
         self
     }
 
     /// Clear any repetition penalty — the explicit "no penalty"
     /// state, equivalent to the default.
     pub fn without_repetition(mut self) -> Self {
-        self.repetition = None;
+        self.sample_options.repetition = None;
+        self
+    }
+
+    /// Set the RNG seed forwarded to every `predict_*` call.
+    ///
+    /// `None` = time-based seed (each call diverges, the historical
+    /// default for one-shot generation). `Some(n)` = deterministic
+    /// across runs given the same prompt. For tuning iteration —
+    /// changing rep-penalty knobs and seeing what the change actually
+    /// did rather than guessing across stochastic divergence — set a
+    /// fixed seed.
+    pub fn with_seed(mut self, seed: Option<std::num::NonZeroU128>) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// Replace the entire sampling configuration ([`SampleOptions`]) —
+    /// post-grammar sampling-mode chain *and* repetition penalty *and*
+    /// any deferred grammar — wholesale. This is the wholesale entry
+    /// point used by per-model TOML sidecar loading
+    /// ([`crate::sidecar::load_sample_options`]); per-field tweaks via
+    /// [`Self::with_sampling`] / [`Self::with_repetition`] /
+    /// [`Self::without_repetition`] still work and override one piece
+    /// at a time.
+    ///
+    /// Special-token ignoring is applied automatically when
+    /// `opts.repetition` is `Some(_)`, matching
+    /// [`Self::with_repetition`]. Without it a strong rep penalty
+    /// would prevent the model from emitting EOS / chat-template
+    /// markers / tool-call markers and stall every turn.
+    pub fn with_sample_options(mut self, mut opts: SampleOptions) -> Self {
+        if let Some(rep) = opts.repetition.as_mut() {
+            rep.extend_ignored(self.engine.model.special_tokens());
+        }
+        self.sample_options = opts;
         self
     }
 
@@ -476,7 +590,7 @@ impl<B: Backend> Session<B> {
     where
         I: IntoIterator<Item = SamplingMode>,
     {
-        self.sample_modes = modes.into_iter().collect();
+        self.sample_options.modes = modes.into_iter().collect();
         self
     }
 
@@ -666,7 +780,7 @@ impl<B: Backend> Session<B> {
             deny_mode
                 .into_iter()
                 .chain(grammar_mode.into_iter())
-                .chain(self.sample_modes.iter().cloned())
+                .chain(self.sample_options.modes.iter().cloned())
                 .collect()
         } else {
             deny_mode
@@ -736,7 +850,7 @@ impl<B: Backend> Session<B> {
             deny_mode
                 .into_iter()
                 .chain(grammar_mode.into_iter())
-                .chain(self.sample_modes.iter().cloned())
+                .chain(self.sample_options.modes.iter().cloned())
                 .collect()
         } else {
             deny_mode
@@ -857,7 +971,7 @@ impl<B: Backend> Session<B> {
     ///
     /// Grammar is prepended per-call: if [`grammar_for_prompt`] returns
     /// `Some(grammar)`, the effective sampling chain is `[grammar,
-    /// ...self.sample_modes.iter().cloned()]`. This happens automatically
+    /// ...self.sample_options.modes.iter().cloned()]`. This happens automatically
     /// whenever `prompt.tool_choice` is `Some(Method | Any)` and the tool list
     /// is non-empty.
     ///
@@ -882,9 +996,10 @@ impl<B: Backend> Session<B> {
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
+        predict_opts.seed = self.seed;
         predict_opts.sample_options = SampleOptions {
             modes,
-            repetition: self.repetition.clone(),
+            repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
         };
 
@@ -989,9 +1104,10 @@ impl<B: Backend> Session<B> {
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
+        predict_opts.seed = self.seed;
         predict_opts.sample_options = SampleOptions {
             modes,
-            repetition: self.repetition.clone(),
+            repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
         };
 
@@ -1086,9 +1202,10 @@ impl<B: Backend> Session<B> {
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
+        predict_opts.seed = self.seed;
         predict_opts.sample_options = SampleOptions {
             modes,
-            repetition: self.repetition.clone(),
+            repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
         };
 
@@ -2131,7 +2248,11 @@ mod tests {
     fn test_default_repetition_ignores_punctuation_category() {
         let session = Session::from_path(model_path()).unwrap().quiet();
         let with_rep = session.with_repetition(RepetitionOptions::default());
-        let rep = with_rep.repetition.as_ref().expect("repetition set");
+        let rep = with_rep
+            .sample_options
+            .repetition
+            .as_ref()
+            .expect("repetition set");
         assert!(
             rep.ignored_categories()
                 .contains(&crate::IgnoreCategory::Punctuation),
@@ -2157,7 +2278,11 @@ mod tests {
         let specials = session.engine.model.special_tokens();
 
         let with_rep = session.with_repetition(RepetitionOptions::default());
-        let rep = with_rep.repetition.as_ref().expect("repetition set");
+        let rep = with_rep
+            .sample_options
+            .repetition
+            .as_ref()
+            .expect("repetition set");
         let ignored = rep.ignored();
 
         assert!(

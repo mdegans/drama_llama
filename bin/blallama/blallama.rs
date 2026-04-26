@@ -14,8 +14,9 @@ use clap::{Parser, ValueEnum};
 use drama_llama::{
     backend::{Backend, Model},
     prompt::{AnthropicError, MessageResponse, Usage},
-    IgnoreCategory, Prompt, RepetitionOptions, Session,
+    Prompt, Session,
 };
+use std::num::NonZeroU128;
 use tokio::{sync::Mutex, task::spawn_blocking};
 use tracing::{error, info, instrument};
 
@@ -35,15 +36,23 @@ struct Args {
     /// only that variant.
     #[arg(long, value_enum, default_value_t = default_backend_kind())]
     backend: BackendKind,
-    /// Opt into the per-Session repetition-penalty filter. Off by
-    /// default — current `RepetitionOptions::default()` uses
-    /// `penalty_max_count=1` and `ngram_min_size=1`, which
-    /// over-penalises common content tokens during long-form
-    /// free-text generation and degrades output to thesaurus chains
-    /// or sentence-fragment loops. Re-enable for diagnosis once the
-    /// library defaults are tuned.
+    /// Force the repetition-penalty filter OFF, even when the
+    /// per-model sampling sidecar enables it. Useful for probes,
+    /// canary runs, and any diagnostic where you want to see the
+    /// model's raw logit gradient with no penalty applied. Without
+    /// this flag, sampling configuration comes from
+    /// `<model>.sampling.toml` (gguf) or `parent/sampling.toml`
+    /// (moeflux) — `Session::from_path*` writes a default sidecar on
+    /// first load.
     #[arg(long, default_value_t = false)]
-    repetition_penalty: bool,
+    no_penalty: bool,
+    /// Optional fixed RNG seed forwarded to every prediction. Useful
+    /// for tuning iteration: same prompt + same seed = same output,
+    /// so a sidecar tweak shows up as a deliberate divergence rather
+    /// than a stochastic one. Omit to use the crate default
+    /// (`PredictOptions::DEFAULT_SEED`).
+    #[arg(long)]
+    seed: Option<u128>,
 }
 
 /// Inference backend selector. Variants are cfg-gated to whichever
@@ -262,7 +271,8 @@ mod llama_cpp_run {
                     load_session(
                         &state.args.model_path,
                         prompt.model.to_string(),
-                        state.args.repetition_penalty,
+                        state.args.no_penalty,
+                        state.args.seed,
                     )
                     .await?
                 }
@@ -271,7 +281,8 @@ mod llama_cpp_run {
                 load_session(
                     &state.args.model_path,
                     prompt.model.to_string(),
-                    state.args.repetition_penalty,
+                    state.args.no_penalty,
+                    state.args.seed,
                 )
                 .await?
             }
@@ -301,7 +312,8 @@ mod llama_cpp_run {
     async fn load_session(
         root: impl AsRef<Path>,
         model: String,
-        repetition_penalty: bool,
+        no_penalty: bool,
+        seed: Option<u128>,
     ) -> Result<Session<LlamaCppBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -315,7 +327,7 @@ mod llama_cpp_run {
             Session::<LlamaCppBackend>::from_path_with_n_ctx(path, 65536)
         })
         .await
-        .map(|s| configure_session(s, repetition_penalty))
+        .map(|s| configure_session(s, no_penalty, seed))
         .map_err(map_session_err)
     }
 }
@@ -410,7 +422,8 @@ mod moeflux_run {
                     load_session(
                         &state.args.model_path,
                         prompt.model.to_string(),
-                        state.args.repetition_penalty,
+                        state.args.no_penalty,
+                        state.args.seed,
                     )
                     .await?
                 }
@@ -419,7 +432,8 @@ mod moeflux_run {
                 load_session(
                     &state.args.model_path,
                     prompt.model.to_string(),
-                    state.args.repetition_penalty,
+                    state.args.no_penalty,
+                    state.args.seed,
                 )
                 .await?
             }
@@ -449,7 +463,8 @@ mod moeflux_run {
     async fn load_session(
         root: impl AsRef<Path>,
         model: String,
-        repetition_penalty: bool,
+        no_penalty: bool,
+        seed: Option<u128>,
     ) -> Result<Session<MoefluxBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -463,7 +478,7 @@ mod moeflux_run {
             Session::<MoefluxBackend>::from_path(path)
         })
         .await
-        .map(|s| configure_session(s, repetition_penalty))
+        .map(|s| configure_session(s, no_penalty, seed))
         .map_err(map_session_err)
     }
 }
@@ -474,20 +489,22 @@ mod moeflux_run {
 
 fn configure_session<B: Backend>(
     s: Session<B>,
-    repetition_penalty: bool,
+    no_penalty: bool,
+    seed: Option<u128>,
 ) -> Session<B> {
-    let with_rep = if repetition_penalty {
-        s.with_repetition(
-            RepetitionOptions::default().set_ignored_categories([
-                IgnoreCategory::English,
-                IgnoreCategory::Json,
-                IgnoreCategory::Punctuation,
-            ]),
-        )
+    // Sampling configuration is loaded from the per-model sidecar
+    // (`<model>.sampling.toml` for gguf, `parent/sampling.toml` for
+    // moeflux) inside `Session::from_path*`. `--no-penalty` overrides
+    // the sidecar to force repetition penalty OFF — for probes,
+    // canary runs, or any "what does this model do with no penalty"
+    // diagnostic.
+    let with_penalty = if no_penalty {
+        s.without_repetition()
     } else {
         s
     };
-    let configured = with_rep
+    let configured = with_penalty
+        .with_seed(seed.and_then(NonZeroU128::new))
         .with_prefix_cache(true)
         // Session-level generation cap. Distinct from `n_ctx` — that's
         // the KV context window, set per-backend at engine
@@ -501,6 +518,8 @@ fn configure_session<B: Backend>(
         event = "session_ready",
         n_ctx = configured.engine().n_ctx(),
         session_max_tokens = 8192u32,
+        no_penalty,
+        seed = seed.map(|n| n as u64),
         model = configured
             .engine()
             .model

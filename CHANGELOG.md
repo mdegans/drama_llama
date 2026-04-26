@@ -58,6 +58,52 @@ the Anthropic API as a dependency.
   monomorphizes independently. llama-cpp build accepts only
   `llama-cpp`; moeflux build accepts only `moeflux`; combined build
   accepts both.
+- **`drama_llama::sidecar` module** (gated on `feature = "toml"`):
+  per-model sampling-config TOML files colocated with the model on
+  disk. `Session::from_path*` looks for the sidecar, applies it via
+  `with_sample_options`, and writes a default if none exists so
+  there's a starting point to edit.
+  - **GGUF (llama-cpp)**: sibling `<model>.sampling.toml` next to
+    the `.gguf`.
+  - **Moeflux**: `parent/sampling.toml` alongside the
+    `mlx`/`artifacts`/`root` symlinks.
+  - Reset = `rm <sidecar>`; tweak = edit it.
+  - `Json`/`Grammar`/`Deny` modes are excluded from sidecars on
+    purpose — those are runtime per-request constraints, not
+    per-model defaults.
+- **`Session::with_sample_options(SampleOptions)`** — wholesale
+  setter used by sidecar loading. Sets the post-grammar sampling
+  chain, repetition penalty, and any deferred grammar in one shot.
+  Auto-extends `repetition.ignored` with the model's special
+  tokens (matches `with_repetition` semantics) so a strong rep
+  penalty can never lock out EOS / chat-template markers.
+- **`Session::with_seed(Option<NonZeroU128>)`** — fixed RNG seed
+  forwarded to every `predict_*` call. Makes tuning iteration
+  meaningful: same prompt + same seed = same output, so a
+  sidecar tweak shows up as a deliberate change rather than
+  stochastic noise.
+- **`RepetitionOptions::window_size: NonZeroU32`** (default 256)
+  and **`RepetitionOptions::decay: f32`** (default 0.95).
+  Together they bound the repetition-penalty additive contribution.
+  Effective per-n-gram count is now
+  `Σ decay^(current_step - position)` over occurrences inside the
+  last `window_size` generation steps; bounded above by
+  `1 / (1 - decay)`. Pre-fix the additive `count * penalty_freq`
+  term grew linearly with generation length and dominated the
+  model's natural logit gradient on long generations (~20 logits
+  below baseline at 200 steps, ~60 at 600). With the fix the gap
+  saturates once the window fills and stays put. See
+  `.claude/memory/qwen3_long_form_degradation.md` for the analysis.
+- **`NGramStats::evict_outside_window(current_step, window_size)`**
+  and **`NGramData::windowed_decayed_count(current_step, decay)`** —
+  the primitives backing the windowed-decay penalty path. Maintains
+  the `count == positions.len()` invariant on each entry.
+- **`blallama --no-penalty`** — force repetition penalty OFF, even
+  when the per-model sidecar enables it. For probes, canary runs,
+  and any "what does this model do with no penalty" diagnostic.
+- **`blallama --seed <u128>`** — fixed RNG seed forwarded to every
+  prediction. For tuning iteration where you want sidecar changes
+  to show up as deliberate divergences rather than stochastic ones.
 
 ### Changed
 
@@ -123,6 +169,32 @@ the Anthropic API as a dependency.
   layer, not in either backend's decode path. Fixed via the
   `SamplingMode::Deny` mask + `Model::extra_eos_tokens` plumbing
   + grammar-accept-state break described above.
+- **Repetition-penalty additive growth on long generations.**
+  The additive `count * penalty_freq + penalty_present` term grew
+  unboundedly with generation length because `NGramStats` was a
+  monotonic frequency map with no eviction. Past ~200 steps the
+  additive contribution dominated the model's natural logit
+  gradient and content prose collapsed into thesaurus chains or
+  fragment loops (the dominant cause of the Qwen3 long-form
+  degradation arc). Fixed by replacing the lifetime count with a
+  windowed-decay structure: each n-gram tracks the positions of
+  its occurrences inside the last `RepetitionOptions::window_size`
+  generation steps; the effective count fed to the penalty math
+  is `Σ decay^(current_step - position)`, bounded above by
+  `1 / (1 - decay)`. With defaults (window=256, decay=0.95) the
+  effective count saturates near 20 regardless of how long
+  generation runs. `Session::with_repetition` and the per-model
+  sampling sidecar are the supported paths to opt in.
+  `SampleOptions::default()` ships with `repetition: None` to
+  match the historical Session behavior and protect probes from
+  silently inheriting a default penalty.
+
+### Removed
+
+- **`blallama --repetition-penalty`** (the v0.7.x band-aid opt-in
+  flag). Sampling configuration now comes from the per-model
+  sidecar; for force-off probe runs use the new `--no-penalty`
+  flag, which overrides the sidecar.
 
 ### Migration
 

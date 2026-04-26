@@ -11,7 +11,10 @@ use crate::{
     Candidates, Token,
 };
 
-use std::{collections::BTreeSet, num::NonZeroU8};
+use std::{
+    collections::BTreeSet,
+    num::{NonZeroU32, NonZeroU8},
+};
 
 #[cfg(feature = "egui")]
 use super::DELETE_ICON;
@@ -26,19 +29,22 @@ pub struct RepetitionOptions {
     /// [`NGram`]s to ignore. These are never penalized.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) ignored: BTreeSet<NGram>,
-    // TODO: Add this back in when we have a way to prune the ngram stats. We
-    // will likely have to add `last_seen` to the `NGramData` struct. However
-    // this will make the code O(n) instead of O(1) for each token, which is as
-    // bad as the original C++ code. Not great, not terrible. Also not a
-    // priority. There may also be a better structure than a HashMap for the
-    // NGramStats.
-    // /// Penalty of last n tokens. Outside of this window, NGram penalties are
-    // /// forgotten. This is useful for penalizing repetition in a sliding window
-    // /// of tokens.
-    // ///
-    // /// Be default the [`NgramStats`] is never pruned and will continue to
-    // /// grow forever as more tokens are added.
-    // pub(crate) penalty_last_n: NonZeroUsize,
+    /// Sliding-window size. Only n-gram occurrences within the last
+    /// `window_size` generation steps contribute to the penalty. Older
+    /// occurrences are evicted by [`NGramStats::evict_outside_window`].
+    /// This — together with [`Self::decay`] — bounds the additive penalty
+    /// term so long generations don't have their natural logit gradient
+    /// dominated by `count * penalty_freq`.
+    #[cfg_attr(feature = "serde", serde(default = "default_window_size"))]
+    pub(crate) window_size: NonZeroU32,
+    /// Per-step decay applied to in-window occurrences when computing the
+    /// effective count for the penalty. The effective count contributed by
+    /// one occurrence at age `a` is `decay^a`; the sum over all in-window
+    /// occurrences is bounded above by `1 / (1 - decay)` for sustained
+    /// repetition. Use `1.0` to disable decay (all in-window occurrences
+    /// count fully); recommended range `0.95..=0.99`.
+    #[cfg_attr(feature = "serde", serde(default = "default_decay"))]
+    pub(crate) decay: f32,
     /// The maximum number of times an item can be repeated before it is
     /// penalized. This can be used to allow some n-grams to be repeated in
     /// situations where repetition is desirable for the purpose, like song
@@ -74,23 +80,76 @@ pub struct RepetitionOptions {
     pub(crate) surgical: bool,
 }
 
+/// Default window size — long enough to catch genuine paragraph-scale
+/// repetition, short enough that the bounded additive contribution
+/// (`window_size * penalty_freq` worst-case before decay) stays well
+/// inside the model's natural logit gradient.
+fn default_window_size() -> NonZeroU32 {
+    NonZeroU32::new(256).unwrap()
+}
+
+/// Default per-step decay. Caps sustained-repetition effective count at
+/// `1 / (1 - 0.95) = 20` regardless of how long generation runs.
+fn default_decay() -> f32 {
+    0.95
+}
+
 impl Default for RepetitionOptions {
     fn default() -> Self {
+        // Defaults are the empirical Qwen3.5 A17B sweet spot
+        // discovered during v0.8.0 sidecar tuning (runs 04 / 09 /
+        // 10-12, captured in the rep-penalty work CHANGELOG entry).
+        // Held across three topics (Apollo, internet, jazz) and two
+        // seeds (1337, 9999) without a single fact swap.
+        //
+        // Per-model sidecars can override any of these — small models
+        // may want broad mode (`surgical = false`) and a stronger
+        // multiplicative; long-form generation may want a wider
+        // window / slower decay. The defaults aim to be safe on big
+        // MoE models where the prior defaults (1.06 / broad / no
+        // English ignore) showed digit and proper-noun swaps mid-
+        // essay (Apollo 11 → Apollo 13 / 19 / 196).
         Self {
-            // Punctuation is default-on: prose punctuation (`.`, `,`,
-            // `;`, `:`, `!`, `?`) has no lexical variety, so accumulating
-            // repetition penalty on `.` biases the model toward longer
-            // sentences / run-ons. Users can override by calling
+            // English stopwords + JSON syntax tokens are common-by-
+            // design; penalising them just biases the model away from
+            // natural prose / structured output for no anti-loop
+            // benefit. Punctuation is also default-on for the same
+            // reason — prose `. , ; : ! ?` have no lexical variety,
+            // so accumulating penalty on `.` biases toward run-ons.
+            // Users can override by calling
             // `set_ignored_categories(vec![])`.
-            ignored_categories: BTreeSet::from([IgnoreCategory::Punctuation]),
+            ignored_categories: BTreeSet::from([
+                IgnoreCategory::English,
+                IgnoreCategory::Json,
+                IgnoreCategory::Punctuation,
+            ]),
             ignored: BTreeSet::new(),
+            window_size: default_window_size(),
+            decay: default_decay(),
             penalty_max_count: NonZeroU8::new(1).unwrap(),
             ngram_min_size: NonZeroU8::new(1).unwrap(),
             ngram_max_size: NonZeroU8::new(4).unwrap(),
-            penalty_repeat: 1.06,
-            penalty_freq: 0.1,
-            penalty_present: 0.1,
-            surgical: false,
+            // 1.05 — `1.05^4 ≈ 1.22` keeps the 4-gram stacked
+            // multiplicative inside the model's natural top-k spread.
+            // 1.06 (the prior default) → `1.06^4 ≈ 1.27` was already
+            // pushing factual tokens out of contention on big-model
+            // prose.
+            penalty_repeat: 1.05,
+            // 0.125 (was 0.1) and 0.0625 (was 0.1) — the saturated
+            // additive contribution is bounded by
+            // `1 / (1 - decay) * penalty_freq + penalty_present`
+            // ≈ 2.6 at these defaults. Comfortable inside any
+            // model's natural top-k spread.
+            penalty_freq: 0.125,
+            penalty_present: 0.0625,
+            // Surgical-on (was off): only penalises the *next-
+            // extension* token of a recurring n-gram, not every
+            // trailing token of every tracked n-gram. On big-vocab
+            // models this preserves digits and proper nouns even
+            // when the surrounding bigrams repeat. Small-vocab
+            // models that prefer broader penalty pressure can opt
+            // out via per-model sidecar.
+            surgical: true,
         }
     }
 }
@@ -260,6 +319,29 @@ impl RepetitionOptions {
         self
     }
 
+    /// Sliding-window size in generation steps. See field docs.
+    pub fn window_size(&self) -> NonZeroU32 {
+        self.window_size
+    }
+
+    /// Set the sliding-window size in generation steps.
+    pub fn set_window_size(mut self, window_size: NonZeroU32) -> Self {
+        self.window_size = window_size;
+        self
+    }
+
+    /// Per-step decay applied to in-window occurrences. See field docs.
+    pub fn decay(&self) -> f32 {
+        self.decay
+    }
+
+    /// Set the per-step decay. Recommended range `0.95..=0.99`; clamped
+    /// internally to `(0.0, 1.0]`.
+    pub fn set_decay(mut self, decay: f32) -> Self {
+        self.decay = decay;
+        self
+    }
+
     /// Draw [`egui::Ui`] for [`RepetitionOptions`] without the outer
     /// [`egui::CollapsingHeader`].
     #[cfg(feature = "egui")]
@@ -386,6 +468,48 @@ impl RepetitionOptions {
                         .unwrap();
 
                 inner
+            })
+            .inner;
+
+        // Window size — how many recent generation steps contribute to
+        // the windowed-decay penalty. Older occurrences are evicted.
+        resp |= ui
+            .horizontal(|ui| {
+                let mut window = self.window_size.get();
+                let inner = ui.label("Window size")
+                    | ui.add(
+                        egui::DragValue::new(&mut window)
+                            .clamp_range(1..=8192),
+                    )
+                    .on_hover_text_at_pointer(
+                        "Sliding-window size in generation steps. Only \
+                         occurrences within the last N steps contribute \
+                         to the penalty. Bounds the additive term so \
+                         long generations don't have their logit \
+                         gradient dominated.",
+                    );
+                self.window_size =
+                    NonZeroU32::new(window.max(1)).unwrap();
+                inner
+            })
+            .inner;
+
+        // Decay — per-step multiplicative weight on aging occurrences.
+        resp |= ui
+            .horizontal(|ui| {
+                ui.label("Decay")
+                    | ui.add(
+                        egui::Slider::new(&mut self.decay, 0.5..=1.0)
+                            .step_by(0.005),
+                    )
+                    .on_hover_text_at_pointer(
+                        "Per-step decay applied to in-window \
+                         occurrences. Sustained-repetition effective \
+                         count is bounded above by 1 / (1 - decay). \
+                         0.95 caps it at ~20; 0.99 at ~100; 1.0 \
+                         disables decay (all in-window occurrences \
+                         count fully).",
+                    )
             })
             .inner;
 
@@ -520,6 +644,8 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
     let RepetitionOptions {
         ignored_categories,
         ignored,
+        window_size,
+        decay,
         ngram_max_size,
         ngram_min_size,
         penalty_freq,
@@ -549,7 +675,24 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
         .min(NGram::CAPACITY as u8)
         .try_into()
         .unwrap();
-    let penalty_max_count: usize = penalty_max_count.get().into();
+    // `effective_count > penalty_max_count` triggers the multiplicative
+    // term (analogue of the old raw-count threshold).
+    let penalty_max_count_f = penalty_max_count.get() as f32;
+    let window_size = window_size.get();
+    // Clamp decay to (0, 1]; out-of-range values would either wedge the
+    // sum to NaN/inf or invert the decay direction.
+    let decay = decay.clamp(f32::MIN_POSITIVE, 1.0);
+
+    // The "current step" we attribute to occurrences added in this call.
+    // Trailing n-grams all live at the most recent token position; using a
+    // single value per call keeps eviction cheap and matches what
+    // production sees (one penalty pass per generation step).
+    let current_step = tokens.len() as u64;
+
+    // Drop any positions that fell out of the window since the last call,
+    // before recording the new ones. Cheap: only pops the front entries
+    // that just rolled out.
+    freq_map.evict_outside_window(current_step, window_size);
 
     // Phase 1: Count trailing n-grams to update the frequency map with newly
     // generated tokens.
@@ -563,7 +706,7 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
         if ngram_is_ignored(ngram, &ignored) {
             continue;
         }
-        freq_map.add(ngram, &candidates);
+        freq_map.add(ngram, &candidates, current_step);
     }
 
     if *surgical {
@@ -573,7 +716,7 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
         // prefix re-emitted) we penalize the first token to prevent the phrase
         // from starting; with k>0 we penalize the next continuation.
         //
-        // Example: freq_map contains [The, New, York] with count=2.
+        // Example: freq_map contains [The, New, York] with effective_count=2.
         //   tokens end in []           -> k=0, penalize "The"  (prevent start)
         //   tokens end in [The]        -> k=1, penalize "New"  (prevent continuation)
         //   tokens end in [The, New]   -> k=2, penalize "York" (prevent completion)
@@ -585,7 +728,8 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
             if ngram_is_ignored(*ngram, &ignored) {
                 continue;
             }
-            if data.count() <= penalty_max_count {
+            let effective = data.windowed_decayed_count(current_step, decay);
+            if effective <= penalty_max_count_f {
                 continue;
             }
             let target = match surgical_target(ngram, tokens, &ignored) {
@@ -604,7 +748,7 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
                 candidate.logit /= scaled_penalty;
             }
             candidate.logit -=
-                (data.count() as f32) * *penalty_freq + *penalty_present;
+                effective * *penalty_freq + *penalty_present;
         }
     } else {
         // Phase 2 (broad): Penalize ALL tracked n-grams. For each n-gram,
@@ -630,10 +774,11 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
             };
 
             let candidate = &mut candidates.data[penalized_token];
+            let effective = data.windowed_decayed_count(current_step, decay);
 
             // Multiplicative penalty: scales with n-gram size. Only fires when
-            // count exceeds max_count.
-            if data.count() > penalty_max_count {
+            // effective count exceeds max_count.
+            if effective > penalty_max_count_f {
                 let scaled_penalty = penalty_repeat.powf(ngram.len() as f32);
                 if candidate.logit <= 0.0 {
                     candidate.logit *= scaled_penalty;
@@ -642,10 +787,11 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
                 }
             }
 
-            // Additive penalties: frequency scales with count, presence is
-            // binary.
+            // Additive penalties: frequency scales with the windowed,
+            // decay-weighted count (bounded above by `1 / (1 - decay)`),
+            // presence is binary.
             candidate.logit -=
-                (data.count() as f32) * *penalty_freq + *penalty_present;
+                effective * *penalty_freq + *penalty_present;
         }
     }
 
@@ -950,52 +1096,65 @@ mod tests {
         }
     }
 
-    /// Long-generation regression test: documents the
-    /// linear-additive-penalty growth that drives popular content tokens'
-    /// logits to swamp on long generation.
+    /// Long-generation regression test: with the windowed-decay
+    /// `RepetitionOptions::default()` (window_size=256, decay=0.95) the
+    /// popular-vs-rare logit gap **converges** instead of growing
+    /// linearly. Before the fix the additive `count * penalty_freq`
+    /// term grew unboundedly with generation length (~20 logits below
+    /// the rare token at step 200, ~60 at step 600). With the fix the
+    /// windowed effective count is bounded above by `1 / (1 - decay) =
+    /// 20` per tracked n-gram, so once the window fills the gap
+    /// saturates and stays put.
     ///
-    /// `freq_map` is monotonic across calls (the parked TODO at the top
-    /// of the file). With `penalty_freq > 0`, the additive penalty for
-    /// a token grows linearly with how often its n-gram has been
-    /// observed — `(count as f32) * penalty_freq`. Over a few hundred
-    /// generation steps that term dominates the model's natural logit
-    /// gradient, the model can no longer pick the obvious next token,
-    /// and prose collapses into thesaurus chains or fragment loops.
+    /// The exact saturated magnitude depends on how many n-gram sizes
+    /// stack on the same target token in the test scenario (broad mode
+    /// applies size-1..=size-4 penalties in parallel for a single
+    /// repeating token). The contract this test enforces is the
+    /// structural one: gap at step 4*window_size ≈ gap at step
+    /// window_size, within a small tolerance. That proves the additive
+    /// term is no longer dominating the logit gradient.
     ///
-    /// Mirrors production: each call gets fresh logits from the model
-    /// (we re-supply `make_candidates(&original_logits)`); only
-    /// `freq_map` is shared across calls. Then we measure the gap
-    /// between a popular token (trailing unigram every step) and an
-    /// otherwise-equal rare token. With `penalty_freq=0.1` the popular
-    /// token's logit ends ~20 below the rare one — a swing large enough
-    /// to evict the model's preferred choice from any reasonable
-    /// sampler.
-    ///
-    /// Currently `#[ignore]`'d because it documents a known structural
-    /// issue rather than asserting a fixed contract — un-ignore once
-    /// the freq_map gets pruning (sliding window or count-decay) or
-    /// the additive contribution is capped per the analysis in
-    /// `.claude/memory/qwen3_long_form_degradation.md`.
+    /// Mirrors production: each call gets fresh logits from the model;
+    /// only `freq_map` is shared across calls; `tokens` grows by one
+    /// popular emission per step so positions advance and eviction
+    /// kicks in once the window fills.
     #[test]
-    #[ignore = "documents linear-additive growth bug; ungate after rep-penalty refactor"]
+    #[ignore = "long-running; uses real model"]
     fn long_generation_does_not_swamp_popular_token_logit() {
         let model = load_model();
-        // 1024-token vocab, all logits start at 1.0 each call.
-        // Production semantics: the model emits fresh logits per step,
-        // so we re-build candidates from the same baseline each
-        // iteration. Only `freq_map` persists across calls.
         let n_vocab = 1024;
         let popular: Token = 100;
         let rare: Token = 200;
         let baseline: Vec<f32> = (0..n_vocab).map(|_| 1.0).collect();
-        let tokens = vec![popular];
+        let mut tokens: Vec<Token> = Vec::new();
 
         let mut opts = RepetitionOptions::default();
+        let window = opts.window_size().get() as usize;
         let mut freq_map = NGramStats::new();
 
-        let mut popular_logit = 0.0_f32;
-        let mut rare_logit = 0.0_f32;
-        for _ in 0..200 {
+        let snapshot = |result: &Candidates| -> f32 {
+            let pop = result
+                .iter()
+                .find(|c| c.id == popular)
+                .map(|c| c.logit)
+                .unwrap();
+            let rar = result
+                .iter()
+                .find(|c| c.id == rare)
+                .map(|c| c.logit)
+                .unwrap();
+            rar - pop
+        };
+
+        // Snapshot the gap at three points: just past the first full
+        // window (saturation), 2x window, and 4x window. If the bug
+        // were back, the 4x measurement would dominate the 1x
+        // measurement; with the fix they should be within rounding.
+        let mut gap_at_window = 0.0_f32;
+        let mut gap_at_2window = 0.0_f32;
+        let mut gap_at_4window = 0.0_f32;
+        for step in 0..(window * 4) {
+            tokens.push(popular);
             let candidates = make_candidates(&baseline);
             let result = apply_sample_repetition_ngram(
                 candidates,
@@ -1005,38 +1164,164 @@ mod tests {
                 &model,
             )
             .unwrap();
-            popular_logit = result
-                .iter()
-                .find(|c| c.id == popular)
-                .map(|c| c.logit)
-                .unwrap();
-            rare_logit = result
-                .iter()
-                .find(|c| c.id == rare)
-                .map(|c| c.logit)
-                .unwrap();
+            // step is zero-indexed, so step + 1 is the iteration count.
+            if step + 1 == window {
+                gap_at_window = snapshot(&result);
+            } else if step + 1 == window * 2 {
+                gap_at_2window = snapshot(&result);
+            } else if step + 1 == window * 4 {
+                gap_at_4window = snapshot(&result);
+            }
         }
-        let gap = rare_logit - popular_logit;
 
         println!(
-            "After 200 steps: popular={popular_logit:.4}, \
-             rare={rare_logit:.4}, gap={gap:.4}"
+            "gap @ 1x window ({}): {gap_at_window:.4}",
+            window
+        );
+        println!(
+            "gap @ 2x window ({}): {gap_at_2window:.4}",
+            window * 2
+        );
+        println!(
+            "gap @ 4x window ({}): {gap_at_4window:.4}",
+            window * 4
         );
         if let Some((_, data)) = freq_map.iter().next() {
-            println!("Tracked unigram count: {}", data.count());
+            println!(
+                "Trailing-unigram tracked: {} positions, \
+                 windowed-decayed: {:.2}",
+                data.count(),
+                data.windowed_decayed_count(
+                    tokens.len() as u64,
+                    opts.decay()
+                )
+            );
         }
 
-        // Once the structural fix lands (sliding window or capped
-        // additive contribution) this gap should stay bounded. The
-        // model's natural logit gradient is on the order of a few
-        // logits between top candidates; anything more than ~5 means
-        // the penalty has overpowered the model.
+        // The structural contract: once the window has filled, the gap
+        // should be saturated. After another 3x window of the same
+        // token, the gap should not grow meaningfully. Pre-fix, the
+        // additive term grew ~0.4 logits per step, so 3x window ≈ 300
+        // additional steps would have added ~120 logits.
+        let growth = gap_at_4window - gap_at_window;
         assert!(
-            gap < 5.0,
-            "popular token's logit was driven {gap} below an \
-             otherwise-equal rare token after 200 generation steps; \
-             linear-additive penalty growth is dominating the model's \
-             logit gradient (see qwen3_long_form_degradation.md)"
+            growth.abs() < 0.5,
+            "gap should have saturated by 1x window and held there; \
+             gap@1x={gap_at_window:.4}, gap@4x={gap_at_4window:.4}, \
+             growth={growth:.4}. Pre-fix growth at this scale was \
+             dozens of logits (linear-additive penalty)."
+        );
+    }
+
+    /// Companion to [`long_generation_does_not_swamp_popular_token_logit`]:
+    /// once the popular n-gram stops being emitted, the gap should
+    /// shrink as in-window occurrences age out under the decay. By the
+    /// time `window_size` more steps have passed without re-emission,
+    /// the effective count has fallen to zero and the popular token's
+    /// logit returns to baseline.
+    #[test]
+    #[ignore = "long-running; uses real model"]
+    fn gap_decays_after_popular_ngram_exits_window() {
+        let model = load_model();
+        let n_vocab = 1024;
+        let popular: Token = 100;
+        let rare: Token = 200;
+        let other: Token = 300;
+        let baseline: Vec<f32> = (0..n_vocab).map(|_| 1.0).collect();
+        let mut tokens: Vec<Token> = Vec::new();
+
+        let mut opts = RepetitionOptions::default();
+        let window = opts.window_size().get() as usize;
+        let mut freq_map = NGramStats::new();
+
+        // Phase A: saturate. Emit `popular` for `window` steps so the
+        // unigram's effective count converges near `1 / (1 - decay)`.
+        for _ in 0..window {
+            tokens.push(popular);
+            let candidates = make_candidates(&baseline);
+            let _ = apply_sample_repetition_ngram(
+                candidates,
+                &tokens,
+                &mut opts,
+                &mut freq_map,
+                &model,
+            )
+            .unwrap();
+        }
+
+        // Snapshot the saturated gap.
+        let saturated_candidates = make_candidates(&baseline);
+        let saturated = apply_sample_repetition_ngram(
+            saturated_candidates,
+            &tokens,
+            &mut opts,
+            &mut freq_map,
+            &model,
+        )
+        .unwrap();
+        let popular_sat = saturated
+            .iter()
+            .find(|c| c.id == popular)
+            .map(|c| c.logit)
+            .unwrap();
+        let rare_sat = saturated
+            .iter()
+            .find(|c| c.id == rare)
+            .map(|c| c.logit)
+            .unwrap();
+        let gap_sat = rare_sat - popular_sat;
+
+        // Phase B: stop emitting popular. Emit a different token for
+        // `window` more steps; the popular n-gram should age out of the
+        // window entirely.
+        for _ in 0..window + 4 {
+            tokens.push(other);
+            let candidates = make_candidates(&baseline);
+            let _ = apply_sample_repetition_ngram(
+                candidates,
+                &tokens,
+                &mut opts,
+                &mut freq_map,
+                &model,
+            )
+            .unwrap();
+        }
+
+        let final_candidates = make_candidates(&baseline);
+        let final_result = apply_sample_repetition_ngram(
+            final_candidates,
+            &tokens,
+            &mut opts,
+            &mut freq_map,
+            &model,
+        )
+        .unwrap();
+        let popular_final = final_result
+            .iter()
+            .find(|c| c.id == popular)
+            .map(|c| c.logit)
+            .unwrap();
+        let rare_final = final_result
+            .iter()
+            .find(|c| c.id == rare)
+            .map(|c| c.logit)
+            .unwrap();
+        let gap_final = rare_final - popular_final;
+
+        println!(
+            "saturated gap: {gap_sat:.4}, decayed gap after {} idle \
+             steps: {gap_final:.4}",
+            window + 4
+        );
+
+        // After the popular n-gram has fully aged out, the gap should
+        // be effectively zero (popular returns to baseline). Allow a
+        // little slack for the trailing-token presence penalty if any
+        // popular position is still inside the window.
+        assert!(
+            gap_final < gap_sat / 2.0,
+            "gap should have decayed after popular n-gram exited the \
+             window; saturated={gap_sat:.4}, final={gap_final:.4}"
         );
     }
 

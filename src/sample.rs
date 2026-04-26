@@ -293,7 +293,12 @@ impl Default for SampleOptions {
     fn default() -> Self {
         Self {
             modes: vec![SamplingMode::locally_typical()],
-            repetition: RepetitionOptions::default().into(),
+            // Off by default. Big-model prose gets degraded by the
+            // shipped repetition defaults (see qwen3 long-form
+            // degradation arc); per-model sidecars opt in explicitly
+            // when wanted. Matches `Session::from_engine`'s
+            // pre-sidecar default.
+            repetition: None,
             deferred_grammar: None,
         }
     }

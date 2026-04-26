@@ -1,5 +1,8 @@
 use core::slice;
-use std::{collections::HashMap, ops::Index};
+use std::{
+    collections::{HashMap, VecDeque},
+    ops::Index,
+};
 use tinyvec::ArrayVec;
 
 use crate::{utils::cold, Candidates, Token};
@@ -106,11 +109,21 @@ impl Index<usize> for NGram {
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 /// Metadata about an Ngram.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+///
+/// Invariant: `count == positions.len()`. Both grow on
+/// [`NGramStats::add`] and shrink on
+/// [`NGramStats::evict_outside_window`], [`NGramStats::remove_one`],
+/// or [`NGramStats::remove_every`].
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NGramData {
-    /// How many times the associated [`NGram`] has been added to the
-    /// [`NGramStats`]
+    /// Currently-tracked occurrences of the associated [`NGram`].
+    /// Equals `positions.len()`.
     count: usize,
+    /// Absolute generation step of each currently-tracked occurrence,
+    /// in insertion order. Used by windowed-decay penalty math.
+    /// Skipped from serde — runtime state, not persisted config.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    positions: VecDeque<u64>,
     /// The sum of the probabilities of the individual tokens in the Ngram.
     cum_prob: f64,
     /// Weight of the Ngram. This can be used for anything.
@@ -132,6 +145,30 @@ impl NGramData {
 
     pub const fn weight(&self) -> f64 {
         self.weight
+    }
+
+    /// Sum of `decay^(current_step - position)` over every currently-tracked
+    /// occurrence. Bounded above by `1 / (1 - decay)` for sustained
+    /// repetition with `decay < 1.0` — the structural fix that keeps the
+    /// repetition-penalty additive term from diverging on long generations.
+    ///
+    /// For windowed semantics, call
+    /// [`NGramStats::evict_outside_window`] beforehand so older positions
+    /// have already been dropped.
+    pub fn windowed_decayed_count(
+        &self,
+        current_step: u64,
+        decay: f32,
+    ) -> f32 {
+        self.positions
+            .iter()
+            .map(|&p| {
+                let age = current_step.saturating_sub(p);
+                // i32::MAX is comfortably more than any reasonable window;
+                // huge ages decay to ~0 anyway.
+                decay.powi(age.min(i32::MAX as u64) as i32)
+            })
+            .sum()
     }
 
     /// Add (or subtract) a weight from this Ngram.
@@ -193,8 +230,14 @@ impl NGramStats {
         }
     }
 
-    /// Add an [`NGram`] to self, updating the [`NGramData`]'s count and
-    /// cum_prob. Returns a mutable reference to the updated [`NGramData`].
+    /// Add an [`NGram`] observed at `current_step`, updating the
+    /// [`NGramData`]'s count, position queue, and cum_prob. Returns a
+    /// mutable reference to the updated [`NGramData`].
+    ///
+    /// `current_step` is the absolute generation step at which the
+    /// occurrence happened; it feeds windowed-decay penalty math via
+    /// [`NGramData::windowed_decayed_count`] and
+    /// [`NGramStats::evict_outside_window`].
     ///
     /// # Note
     /// * This function applies softmax to the candidates if it hasn't been
@@ -206,6 +249,7 @@ impl NGramStats {
         &mut self,
         key: NGram,
         candidates: &Candidates,
+        current_step: u64,
     ) -> &mut NGramData {
         // This only applies softmax if it hasn't been applied already, like on
         // the first call.
@@ -222,6 +266,7 @@ impl NGramStats {
 
         let entry = self.data.entry(key).or_insert(NGramData::default());
         entry.count += 1;
+        entry.positions.push_back(current_step);
         // Accumulated probability of the NGram
         let cum_prob: f64 = key
             .iter()
@@ -231,6 +276,46 @@ impl NGramStats {
         entry.cum_prob += cum_prob;
 
         entry
+    }
+
+    /// Drop every recorded position older than
+    /// `current_step - window_size` from every tracked n-gram. Entries
+    /// whose position queue empties are removed entirely. Maintains the
+    /// `count == positions.len()` invariant on each remaining entry and
+    /// keeps `total_ngram_count` / `total_token_count` consistent with
+    /// the eviction.
+    ///
+    /// Cheap when the window holds steady — each call only pops the few
+    /// front positions that just rolled out, not the full queue. Pair
+    /// with [`NGramData::windowed_decayed_count`] for the bounded-additive
+    /// penalty path.
+    pub fn evict_outside_window(
+        &mut self,
+        current_step: u64,
+        window_size: u32,
+    ) {
+        let cutoff = current_step.saturating_sub(window_size as u64);
+        let stats_ngram_count = &mut self.ngram_count;
+        let stats_token_count = &mut self.token_count;
+
+        self.data.retain(|ngram, data| {
+            while let Some(&front) = data.positions.front() {
+                if front < cutoff {
+                    data.positions.pop_front();
+                    // Match remove_one's accounting: subtract the average
+                    // contribution per occurrence so cum_prob / count stays
+                    // sensible.
+                    let avg_cp = data.cum_prob / data.count.max(1) as f64;
+                    data.cum_prob -= avg_cp;
+                    data.count -= 1;
+                    *stats_ngram_count -= 1;
+                    *stats_token_count -= ngram.len();
+                } else {
+                    break;
+                }
+            }
+            !data.positions.is_empty()
+        });
     }
 
     /// Get data about an Ngram.
@@ -248,11 +333,14 @@ impl NGramStats {
 
             data.cum_prob -= data.avg_cum_prob();
             data.count -= 1;
+            // Pop the oldest recorded position to keep
+            // `count == positions.len()`.
+            data.positions.pop_front();
 
             if data.count == 0 {
                 self.data.remove(key)
             } else {
-                Some(*data)
+                Some(data.clone())
             }
         } else {
             None
@@ -385,7 +473,7 @@ mod tests {
         let k = c.len();
         let c = c.sort(Sorted::ById { k });
 
-        let count = stats.add(a, &c).count;
+        let count = stats.add(a, &c, 0).count;
         assert_eq!(count, 1);
         assert_eq!(stats.total_ngram_count(), 1);
         assert_eq!(stats.total_token_count(), 7);
@@ -402,7 +490,7 @@ mod tests {
             1e-6
         );
 
-        let count = stats.add(b, &c).count;
+        let count = stats.add(b, &c, 0).count;
         assert_eq!(count, 1);
         assert_eq!(stats.total_ngram_count(), 2);
         assert_eq!(stats.total_token_count(), 12);
@@ -414,7 +502,7 @@ mod tests {
         );
         assert_approx_eq!(stats.avg_ngram_length(), 6.0, 1e-6);
 
-        let count = stats.add(b, &c).count;
+        let count = stats.add(b, &c, 0).count;
         assert_eq!(count, 2);
         assert_eq!(stats.total_ngram_count(), 3);
         assert_eq!(stats.total_token_count(), 17);
@@ -439,8 +527,8 @@ mod tests {
         assert_eq!(stats.total_token_count(), 7);
         assert_approx_eq!(stats.avg_ngram_length(), 7.0, 1e-6);
 
-        let _ = stats.add(b, &c);
-        let count = stats.add(b, &c).count;
+        let _ = stats.add(b, &c, 0);
+        let count = stats.add(b, &c, 0).count;
         let expected_cum_prob: f64 = c.iter().take(5).map(|t| t.p as f64).sum();
         assert_eq!(count, 2);
         assert_eq!(stats.total_ngram_count(), 3);
@@ -470,5 +558,60 @@ mod tests {
             1e-6
         );
         assert_approx_eq!(stats.avg_ngram_length(), 6.0, 1e-6);
+    }
+
+    /// Cover the `count == positions.len()` invariant under the
+    /// windowed-decay path (`add` records position, `evict_outside_window`
+    /// drops old positions, `remove_one` decrements both).
+    #[test]
+    fn ngram_stats_windowed_decay_invariants() {
+        let n: usize = 8;
+        let mut stats = NGramStats::new();
+        let g = NGram::from(7 as Token);
+
+        let mut c = Candidates::new(n).unwrap();
+        for i in 0..n {
+            c.data[i].id = i as Token;
+            c.data[i].logit = 1.0;
+        }
+        let c = c.softmax(None);
+        let k = c.len();
+        let c = c.sort(Sorted::ById { k });
+
+        // Add the same unigram at three different generation steps.
+        stats.add(g, &c, 10);
+        stats.add(g, &c, 20);
+        stats.add(g, &c, 30);
+        assert_eq!(stats.get(&g).unwrap().count(), 3);
+
+        // Effective count at step 30 with decay 1.0 (no decay) is just
+        // the number of in-window occurrences.
+        let eff = stats.get(&g).unwrap().windowed_decayed_count(30, 1.0);
+        assert_approx_eq!(eff, 3.0, 1e-6);
+
+        // With decay 0.9 and ages [20, 10, 0], effective count is
+        // 0.9^20 + 0.9^10 + 1.0.
+        let expected = 0.9_f32.powi(20) + 0.9_f32.powi(10) + 1.0;
+        let eff = stats.get(&g).unwrap().windowed_decayed_count(30, 0.9);
+        assert_approx_eq!(eff, expected, 1e-5);
+
+        // Evict positions older than `current_step - window_size`.
+        // window=15 at step 30 keeps positions >= 15, so [20, 30] stay
+        // and [10] is dropped.
+        stats.evict_outside_window(30, 15);
+        let data = stats.get(&g).unwrap();
+        assert_eq!(
+            data.count(),
+            2,
+            "count should match remaining positions"
+        );
+        assert_eq!(stats.total_ngram_count(), 2);
+        assert_eq!(stats.total_token_count(), 2);
+
+        // Far-future eviction empties the entry entirely.
+        stats.evict_outside_window(1_000_000, 100);
+        assert!(stats.get(&g).is_none());
+        assert_eq!(stats.total_ngram_count(), 0);
+        assert_eq!(stats.total_token_count(), 0);
     }
 }

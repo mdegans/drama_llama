@@ -546,15 +546,25 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         // have that here, although we could calculate them from the tokens.
         let candidates =
             Candidates::new(engine.model.n_vocab() as usize).unwrap();
-        // Init ngram stats
+        // Init ngram stats. Each n-gram occurrence is recorded at the
+        // absolute position of its trailing token in the prompt, so the
+        // windowed-decay penalty math (RepetitionOptions.window_size +
+        // decay) sees prompt occurrences at their true distance from the
+        // current generation step.
         if let Some(opts) = &mut options.sample_options.repetition {
-            for win in tokens.windows(opts.ngram_max_size.get().into()) {
+            let max_size = opts.ngram_max_size.get() as usize;
+            for (win_idx, win) in
+                tokens.windows(max_size).enumerate()
+            {
+                // Last token of the window sits at absolute index
+                // `win_idx + max_size - 1`.
+                let trailing_pos = (win_idx + max_size - 1) as u64;
                 for slice in (opts.ngram_min_size.get()
                     ..opts.ngram_max_size.get())
                     .filter_map(|n| win.get((win.len() - n as usize)..))
                 {
                     let ngram = NGram::try_from_tokens(slice).unwrap();
-                    let _ = ngram_stats.add(ngram, &candidates);
+                    let _ = ngram_stats.add(ngram, &candidates, trailing_pos);
                 }
             }
         }
@@ -896,10 +906,14 @@ mod tests {
     fn test_default_options() {
         let opts = PredictOptions::default();
         assert_eq!(opts.sample_options, SampleOptions::default());
-        assert_eq!(
-            opts.sample_options.repetition,
-            Some(RepetitionOptions::default())
-        );
+        // SampleOptions::default() ships with `repetition: None` so
+        // probes and one-off generation paths don't get the
+        // RepetitionOptions defaults applied silently. Per-model
+        // sidecars opt in explicitly.
+        assert_eq!(opts.sample_options.repetition, None);
+        // RepetitionOptions::default() itself is still the canonical
+        // "if you opt in, here's the starting point" config.
+        let _ = RepetitionOptions::default();
     }
 
     #[test]
