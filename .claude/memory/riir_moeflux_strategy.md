@@ -102,8 +102,9 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | Kernel | Landed | Diff signal | Notes |
 |--------|--------|-------------|-------|
 | embedding | 2026-04-26 (4216e2f) | bit-exact, 8 tok × 2048 elem | First per-kernel hook; CPU 4-bit dequant. |
-| RMSNorm | — | — | Next. CPU + Metal paths both exist in C. |
-| RoPE | — | — | |
+| RMSNorm (CPU) | 2026-04-26 (a7866cc) | bit-exact, 4 tok × 3 norms × 2048 elem | model.norm + layer-0 input_layernorm + post_attention_layernorm. Reduction-order-matched. |
+| RMSNorm (Metal) | — | — | Cosine/Jaccard tolerance — fast_math + Metal reduction order diverge. |
+| RoPE | — | — | Next. partial-rotary, head_dim/4 channels, ROPE_THETA=1e7. |
 | full attention | — | — | |
 | linear attention | — | — | |
 | MoE router | — | — | |
