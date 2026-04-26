@@ -93,6 +93,34 @@ The Phase 0 harness in place today has the trait + impls + helpers
 checkpoint hooks come in Phase 3 when there's actually something to
 compare.
 
+## Phase 3 progress (in-flight)
+
+Bottom-up kernel ports, diff-tested per kernel against the C path.
+Each landed kernel is bit-exact (deterministic CPU work) or within
+the cosine/Jaccard floors (Metal nondeterminism territory).
+
+| Kernel | Landed | Diff signal | Notes |
+|--------|--------|-------------|-------|
+| embedding | 2026-04-26 (4216e2f) | bit-exact, 8 tok × 2048 elem | First per-kernel hook; CPU 4-bit dequant. |
+| RMSNorm | — | — | Next. CPU + Metal paths both exist in C. |
+| RoPE | — | — | |
+| full attention | — | — | |
+| linear attention | — | — | |
+| MoE router | — | — | |
+| MoE dispatch | — | — | |
+| LM head | — | — | Symmetric to embedding (4-bit dequant matvec). |
+
+**Diff-oracle hook pattern**: each kernel gets a `mf_<kernel>` accessor
+in `moeflux.h` that exposes the static C primitive. `RsCtx::open`
+populates only the state the landed kernels need — `WeightFile`
+today, `MetalBackend` + per-layer state as needed. Tests in
+`crates/moeflux/tests/diff_oracle.rs`.
+
+**RsCtx incremental init**: `open` no longer panics — it loads the
+`WeightFile`. Methods that need unported kernels still `todo!()`
+with a phase tag in the panic message. Each kernel landing flips
+0..N methods to real impls.
+
 ## What the bisect tests become
 
 - `consecutive_eval_prompt.rs` (in moeflux): keep as-is during
