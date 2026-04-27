@@ -136,35 +136,36 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | 4c | linear-attn fused_layer_forward | 2026-04-27 (`f44fc9c`) | cosine=1.0000000 max_abs_diff=4.1e-8 (effectively bit-exact) | Full GPU production path through linear-attn layers via `metal-rs` encoders. Six new modules: `mtl_weight_buf` (wraps mmap as MTLBuffer), `layer_weight_cache` (per-Ctx tensor offsets, fixes the 4b cross-Ctx bug class on the Rust side), `gpu_matvec` (4/8-bit dequant matvec encoder), `gpu_linear_attn` (5 linear-attn kernels), `linear_attn_forward` (composer + ~63 MB persistent buffer set on A3B). One-line defensive fix in C `mf_free_model` (reset `layer_cache_built=0`) lets the diff suite run end-to-end without cross-Ctx pollution; full Phase 7 cleanup still pending. K=experts_per_tok was the load-bearing bug — the Rust port had hardcoded `VARIANT.num_experts_per_tok` (architectural max, 8 for A3B) instead of using the runtime arg (4 in the test); finding it required wiring an `*_intermediates` diff hook and walking the per-stage diffs until the routing checkpoint flagged different top-K. The diagnostic infra stays in tree as a 4d debugging tool. |
 | 4d-pre | extract `post_attention_tail` (refactor) | 2026-04-27 (`621e134`) | 4c stays green | `LinearAttnBuffers` → `LayerForwardBuffers` (+ 3 new fields for full-attn projection outputs: `q_proj_out`/`k_out`/`v_out`). `LinearAttnForwardError` → `LayerForwardError`. Both old names kept as `pub type` aliases. `linear_attn_layer_forward` shrinks to input rms_norm + CMD1 (projections + 5 fused linear-attn kernels) and hands off to `post_attention_tail` (CMD2 + CMD3 + MoE) via an `OProj` adapter that names the right o_proj weights/in_dim. Sets up 4d to add `full_attn_layer_forward` calling the same tail. |
 | 4d | full-attn fused_layer_forward | 2026-04-27 (`44879b2`) | cosine=1.0000000 max_abs_diff=3.576e-7 max_abs_out=2.772 rel=1.290e-7 | New module `full_attn_forward.rs`. Pipeline: CPU input rms_norm + 3-matvec CMD1 (q/k/v) + per-head split into q+gate + per-head Q/K rms_norm + RoPE + KV append (host) + CPU SDPA + stage attn_out into `batch_out[6]` + `post_attention_tail`. `RsCtx::layer_forward_dump` now branches on `(layer_idx + 1) % full_attn_interval == 0` and dispatches the right forward / extracts the right `LayerState` variant. GPU attention fast path (`gpu_attn_fuse`, gated on `kv_len >= 32`) and GPU KV-cache mirror buffers are out of scope — FIXMEs in place; the dump-hook test at pos=0 never engages either. Per-stage drift composition predicted; observed even better than predicted thanks to RoPE + SDPA hitting kv_len=1 trivial cases. |
-| 4e | deferred-expert state machine (was 9d) | — | end-to-end via 4f | `g_deferred` → field on `RsCtx`. FIXME for the cross-Ctx NaN bug. |
-| 4f | mf_step_internal + eval_prompt/eval_token | — | end-to-end logits cosine/Jaccard | Wires the per-layer forward into the public eval API. Good slice to land the `LayerKind`-tagged `LayerWeightCache` enum + dispatch-from-Variant predicate (see "Future-arch openings" below). |
+| 4e | deferred-expert state machine (was 9d) | 2026-04-27 (`be80c56`) | bit-exact — cosine=1.0000000 max_abs_diff=0.0 across HIDDEN_DIM on both new tests | Smallest standalone version per the strategy doc's "Suggested next-session order". `DeferredState` struct on `RsCtx` (`Option<DeferredState>` field; `Some` ↔ C `g_deferred.active=1`); three methods `begin_deferred_experts` / `complete_deferred_experts` / `discard_deferred_experts`. The synchronous `gpu_batched_experts_forward` is now a thin wrapper around a new `gpu_batched_experts_encode` helper; the deferred path uses the same encode helper, commits async, stashes the owned cmdbuf. C side: matching `mf_begin` / `mf_complete` / `mf_discard` FFI hooks; static `oracle_batched_experts_encode` shared between sync + deferred. Cross-Ctx NaN bug **structurally absent** in the Rust port — `complete_deferred_experts` writes through caller-supplied `&mut [f32]`, never a stored raw pointer; documented as `NOTE(riir-bugfix):` not FIXME, since a single-Ctx diff test cannot distinguish faithful-with-bug from faithful-without-bug and the bug only manifests across two `Ctx`s. Out of scope (4f): `gpu_combined=false` CPU-combine path; fast/slow split in `fused_layer_forward`; rewiring `post_attention_tail` to call `begin` instead of the synchronous variant. Two new diff tests (`deferred_experts_begin_complete_close_c_vs_rust` + `deferred_experts_discard_clears_state_c_vs_rust`) bit-exact; full diff suite 24/24 green in 228s. |
+| 4f | mf_step_internal + eval_prompt/eval_token | — | end-to-end logits cosine/Jaccard | Wires the per-layer forward into the public eval API. Good slice to land the `LayerKind`-tagged `LayerWeightCache` enum + dispatch-from-Variant predicate (see "Future-arch openings" below). Also rewires `post_attention_tail` from synchronous `gpu_batched_experts_forward` to the 4e begin/complete pair, ports the `gpu_combined=false` CPU-combine path, and adds the fast/slow split branching from `fused_layer_forward` — those were intentionally deferred from 4e to keep the standalone slice small. |
 | 4g | state_save / state_load | — | byte-identical snapshots | Last Phase 4 slice; the state-snapshot binary format. |
 
 ## Suggested next-session order
 
 Phase 4 per-layer numerical correctness is **done** as of 2026-04-27
-(4d). The two layer-forward dump tests both green at cosine ≈ 1.0
-vs C; full diff oracle suite (22 tests) passes end-to-end when not
-hitting the documented cross-Ctx pollution hang (intermittent — see
-below). Remaining Phase 4:
+(4d); the deferred-experts state primitive landed alongside
+(4e, `be80c56`). All 24 diff oracle tests green at cosine ≥ 0.9999
+(20 of 24 actually bit-exact — see the per-slice signal column).
+Remaining Phase 4:
 
-- **4e (deferred-experts state machine, was 9d)** — `g_deferred` →
-  field on `RsCtx`. The cross-Ctx NaN bug source; faithful port +
-  FIXME for the Phase 7 typed-`memory_seq_rm` fix. The diff oracle
-  pattern doesn't naturally exercise async sequencing, so the
-  testing only really makes sense when integrated into 4f's
-  end-to-end forward pass. Smallest standalone version (if you want
-  to land it before 4f): add a `DeferredState` struct on `RsCtx`
-  mirroring the C `g_deferred` fields; add a "begin-deferred" variant
-  of `gpu_batched_experts_forward` that commits without waiting; add
-  a "complete-deferred" call that waits + reads back. Paired diff
-  test: call begin then complete on both sides, compare final hidden.
 - **4f (`mf_step_internal` + `eval_prompt` / `eval_token`)** — wires
-  the per-layer forwards into the public eval API. Also the natural
+  the per-layer forwards into the public eval API. Now *also* the
+  natural slice to do the begin/complete rewiring of
+  `post_attention_tail`: today it still calls the synchronous
+  `gpu_batched_experts_forward`; switching to
+  `RsCtx::begin_deferred_experts` is a few-line change once a
+  multi-layer loop exists to overlap layer N's CMD3 with layer N+1's
+  CMD1. Other intentionally-deferred 4e items that land here too:
+  the `gpu_combined=false` CPU-combine path
+  (`infer.m:4106..4129` — per-expert readback + `cpu_vec_madd` +
+  sigmoid gate + final combine), and the fast/slow split branching
+  from `fused_layer_forward` (`infer.m:4341..4612`). Both are
+  meaningless in 4e's standalone shape (no "previous layer"); both
+  are mandatory once a multi-layer loop exists. Also the natural
   slice to land the `LayerKind`-tagged `LayerWeightCache` enum +
   `Variant.layer_kind(i)` predicate (see "Future-arch openings"
-  section below) — both are cheap during this slice and load-bearing
-  for the eventual DeepSeek port.
+  section below) — both cheap during this slice and load-bearing for
+  the eventual DeepSeek port.
 - **4g (`state_save` / `state_load`)** — last Phase 4 slice; the
   state-snapshot binary format. End-to-end via byte-identical
   snapshot diff against C.
