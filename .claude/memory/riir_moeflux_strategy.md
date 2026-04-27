@@ -123,8 +123,8 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | MoE dispatch — 9b batched K-expert + combine | 2026-04-27 (slice 9b) | bit-exact — cosine=1.000000, max_abs_diff=0.0 across HIDDEN_DIM with K=4 experts | Persistent `MoeBuffers` (16 slots × {data, gate, up, act, out} + h_mid + shared_out + moe_hidden + 18-float combine_params) lazily allocated on `RsCtx` via `metal_and_moe_mut`. ~28 MB total on A3B. Hook stages K expert blobs, runs `gpu_encode_experts_batched` (2K encoders) + `moe_combine_residual` in one cmdbuf, reads back. Combine kernel pattern: `hidden = h_mid + Σ weights[k] × expert_out[k] + sigmoid(gate) × shared_out`. Output magnitude was meaningful (8.22e-4, not near-zero) so the bit-exact result is real — second hypothesis disproved: `moe_combine_residual` is ALSO atomic-op-free; per-thread reads K expert buffers and computes its own sequential sum. The cosine/Jaccard regime I reserved for "where atomic ops stack" doesn't materialize in this kernel either. Genuinely-nondeterministic territory probably starts in 9e (the `rms_norm_sum_sq` threadgroup reduction) or 9c (async pread + cache eviction ordering). |
 | RMSNorm (Metal) | — | — | Cosine/Jaccard tolerance — fast_math + Metal reduction order diverge. |
 | MoE dispatch — 9c expert I/O subsystem | 2026-04-27 (slice 9c) | byte-exact across 6 (layer, expert) probes covering full-attn / linear-attn / first-block / last-block; 1.77 MB per blob | `ExpertFiles` RAII struct on `RsCtx` opens `experts_dir/packed_experts/layer_NN.bin` for every layer eagerly at `RsCtx::open`. Missing files leave the slot at `None` per the C tolerance semantics. `read_expert(layer, expert, out)` uses `std::os::unix::fs::FileExt::read_at` (i.e. `pread64`) at `expert_idx * EXPERT_SIZE`. Async pread thread pool, mmap, LRU caches, malloc-cache, LZ4 decompression all stay out of scope (slice 9f if needed). C-side hook `mf_load_expert_bytes` calls `pread(ctx->layer_fds[i], ...)` directly — same syscall both sides. Byte-equality is exactly what we'd expect; the test is a sanity guard against indexing bugs (wrong subdir, wrong offset arithmetic, wrong file-naming format) rather than numerical concerns. |
-| MoE dispatch — 9d deferred experts state | — | — | `g_deferred` → `Ctx`-owned struct. Cross-Ctx NaN bug source — faithful port keeps the lossy semantic but lifetime-binds it; FIXME for the typed `CannotTruncateLinear` Phase 7 fix. |
-| MoE dispatch — 9e GPU combine fast-path | — | — | Optional `gpu_combined` path that fuses combine+residual+norm in CMD3, skipping CPU readback. Performance-critical for production decode. |
+| MoE dispatch — 9d deferred experts state | — | — | `g_deferred` → `Ctx`-owned struct. Cross-Ctx NaN bug source — faithful port keeps the lossy semantic but lifetime-binds it; FIXME for the typed `CannotTruncateLinear` Phase 7 fix. Best landed alongside Phase 4 integration since the diff oracle pattern doesn't naturally exercise async sequencing. |
+| MoE dispatch — 9e GPU rms_norm fused | 2026-04-27 (slice 9e) | bit-exact — cosine=1.000000, max_abs_diff=0.0 across HIDDEN_DIM (max_abs_out=4.737, real magnitude) | `rms_norm_sum_sq` + `rms_norm_apply_bf16` chained in one cmdbuf. **First kernel under diff using threadgroup-shared memory across SIMD groups** (256 threads → simd_sum → 32-element threadgroup-shared array → second-stage simd_sum → 1 scalar). Per-call scratch buffer alloc on both sides; no dependency on the production CMD3 fast-path's deferred state machine. C+Rust hooks take bf16 weight bytes directly so the test doesn't depend on tensor-name lookup. Real `model.norm.weight` bytes used (read via `WeightFile::tensor_bytes`). The threadgroup-shared reduction also lands bit-exact. |
 | MoE dispatch — 9f LZ4 + 2-bit + caches | — | — | Exotic quantization paths + the LRU/malloc expert caches. May be deferable to Phase 7 if the basic path is enough for cutover (unlikely — caches matter for tok/s). |
 
 ## Suggested next-session order
@@ -164,6 +164,36 @@ NOT being fixed during the port (per the bug-fix policy above);
 the Rust port replicates the C reset-to-empty semantic and the
 typed `Result<(), CannotTruncateLinear>` lands as a Phase 7
 post-cutover slice.
+
+## Empirical finding: GPU kernels are bit-exact per-PSO
+
+Through 2026-04-27, every GPU kernel landed in slices 9a / 9b / 9e
+(`dequant_matvec_4bit_v3`, `swiglu_fused`, `moe_combine_residual`,
+`rms_norm_sum_sq`, `rms_norm_apply_bf16`) is **bit-exact** between
+two `MTLComputePipelineState` instances built from the same source
+in the same process on the same device. This includes kernels using:
+
+- SIMD-group operations (`simd_sum`)
+- Threadgroup-shared memory writes/reads behind
+  `threadgroup_barrier(mem_threadgroup)`
+- Multi-buffer K-expert weighted accumulation
+  (`moe_combine_residual`'s per-thread `Σ_k weights[k] *
+  expert_out_k[tid]`)
+
+The cosine/Jaccard tolerance regime that the strategy doc reserved
+for "Metal kernels" has not engaged anywhere. It applies to:
+
+- Kernels using true atomic ops (`atomic_*` — moeflux's kernels
+  don't use these)
+- Different shader sources (e.g. `fast_math` toggle producing
+  divergent codegen — not the case here)
+- Cross-device or cross-driver-version comparisons (out of scope)
+
+Diff tests still set `cosine ≥ 0.9999` / `rel ≤ 1e-3` floors as
+defensible placeholders. Tightening to bit-exact is a future
+defensive option — would catch sub-1e-3 porting drift but bets on
+Metal's per-PSO determinism being stable across driver updates.
+Current floors trivially pass; raising them is a Phase 7 polish.
 
 ## Tolerance regimes (set by RoPE slice)
 
