@@ -36,6 +36,21 @@ Tests in `moeflux::crates/moeflux/tests/consecutive_eval_prompt.rs`:
   state (likely `g_deferred` holding a dangling pointer into the
   freed `ctx->hidden`) leaks across instances. Real bug, but
   blallama only opens one Ctx so it's not the user-visible symptom.
+- **Third cross-Ctx state offender: `layer_cache` (added
+  2026-04-27 during RIIR Phase 4b).** Discovered while landing
+  `mf_layer_forward_dump`. `infer.m` keeps a process-global
+  `LayerWeightCache layer_cache[NUM_LAYERS]` and a
+  `static int layer_cache_built = 0;` flag. The first
+  `fused_layer_forward` call from any Ctx populates the cache from
+  *that* Ctx's `WeightFile` and flips the flag to 1; freeing the
+  Ctx doesn't clear it. The second Ctx in the same process never
+  rebuilds the cache, so its forward reads through pointers into
+  the first Ctx's freed mmap region — typically zeroed by the OS,
+  making the forward an effective no-op (`hidden_out == hidden_in`).
+  Same class as `g_deferred`; the Phase 7 fix moves both into
+  Ctx-owned state. The 4b sanity test stays permissive (finite-only)
+  because of this; the real numerical signal lands in 4c via the
+  Rust-vs-C diff.
 - **Resuming prefill diverges from full prefill.** `mf_memory_seq_rm(0,
   l_hit, -1)` followed by `eval_prompt(suffix, start_pos=l_hit, …)`
   produces a verbatim-loop trajectory on synthetic tokens; full

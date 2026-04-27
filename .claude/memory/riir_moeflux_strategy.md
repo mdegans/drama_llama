@@ -68,7 +68,7 @@ Out (stays as-is):
 | 4 | Top-level: `eval_prompt`, `eval_token`, `memory_*`, `state_save`/`load` | 4–8h |
 | 5 | API stabilization, drama_llama full test run | 2–4h |
 | 6 | Cutover: delete C, move shaders, squash | 1–2h |
-| 7 | Post-cutover (separate PRs): typed `memory_seq_rm`, multi-Ctx, runtime variant dispatch, expanded coverage | 4–8h |
+| 7 | Post-cutover (separate PRs): typed `memory_seq_rm`, multi-Ctx (now: `g_deferred` + `layer_cache` together), runtime variant dispatch, expanded coverage | 4–8h |
 
 Total: 28–48h focused work.
 
@@ -126,6 +126,18 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | MoE dispatch — 9d deferred experts state | — | — | `g_deferred` → `Ctx`-owned struct. Cross-Ctx NaN bug source — faithful port keeps the lossy semantic but lifetime-binds it; FIXME for the typed `CannotTruncateLinear` Phase 7 fix. Best landed alongside Phase 4 integration since the diff oracle pattern doesn't naturally exercise async sequencing. |
 | MoE dispatch — 9e GPU rms_norm fused | 2026-04-27 (slice 9e) | bit-exact — cosine=1.000000, max_abs_diff=0.0 across HIDDEN_DIM (max_abs_out=4.737, real magnitude) | `rms_norm_sum_sq` + `rms_norm_apply_bf16` chained in one cmdbuf. **First kernel under diff using threadgroup-shared memory across SIMD groups** (256 threads → simd_sum → 32-element threadgroup-shared array → second-stage simd_sum → 1 scalar). Per-call scratch buffer alloc on both sides; no dependency on the production CMD3 fast-path's deferred state machine. C+Rust hooks take bf16 weight bytes directly so the test doesn't depend on tensor-name lookup. Real `model.norm.weight` bytes used (read via `WeightFile::tensor_bytes`). The threadgroup-shared reduction also lands bit-exact. |
 | MoE dispatch — 9f LZ4 + 2-bit + caches | — | — | Exotic quantization paths + the LRU/malloc expert caches. May be deferable to Phase 7 if the basic path is enough for cutover (unlikely — caches matter for tok/s). |
+
+## Phase 4 progress (in-flight, 2026-04-27)
+
+| # | Slice | Landed | Diff signal | Notes |
+|---|-------|--------|-------------|-------|
+| 4a | state structs + memory ops | 2026-04-27 (`9a1d60d`) | structural pos_max equivalence on empty state | KvCache + LinearAttnState + LayerState in `riir::state`, allocated per-layer in `RsCtx::open` (~40 GB lazy-committed virtual address space for KV on A3B; matches C `calloc`). Faithful port of the lossy partial-linear truncation; FIXME for the typed `Result<(), CannotTruncateLinear>` Phase 7 fix. |
+| 4b | layer-output dump hook | 2026-04-27 | C-side sanity (finite output) | `mf_layer_forward_dump(ctx, layer_idx, pos, hidden_in, hidden_out)` brackets `fused_layer_forward` with `discard_deferred_experts` / `complete_deferred_experts` so `g_deferred.active` is 0 on entry and exit. `RsCtx::layer_forward_dump` stub'd for 4c/4d. The first non-kernel hook to call into the production forward path — surfaced a third cross-Ctx state-pollution bug (the file-scope `layer_cache` weight-pointer cache); see the Phase 7 list. |
+| 4c | linear-attn fused_layer_forward | — | layer-boundary cosine ≥ 0.9999 / max_abs_diff ≤ 1e-3 | First Rust port of the production layer dispatch. Composes already-tested kernels. |
+| 4d | full-attn fused_layer_forward | — | same | Adds RoPE + KV append + SDPA on top of the linear-attn shape. |
+| 4e | deferred-expert state machine (old 9d) | — | end-to-end via 4f | `g_deferred` → field on `RsCtx`. FIXME for the cross-Ctx NaN bug. |
+| 4f | mf_step_internal + eval_prompt/eval_token | — | end-to-end logits cosine/Jaccard | Wires the per-layer forward into the public eval API. |
+| 4g | state_save / state_load | — | byte-identical snapshots | Last Phase 4 slice; the state-snapshot binary format. |
 
 ## Suggested next-session order
 
