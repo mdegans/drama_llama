@@ -35,9 +35,18 @@ Out (stays as-is):
 - **Compile-time variant selection** kept 1:1 during the port (the
   existing `MOEFLUX_MODEL_*` Cargo features) so differential tests
   are apples-to-apples. Runtime-variant rearchitecture is post-port.
-- **Don't translate bugs.** Where C has a clear bug, fix in place
-  during the port. Where unsure, leave a `// FIXME(riir):` with the
-  original `infer.m:LINE` reference.
+- **Bit-for-bit faithful port first; fix bugs as separate commits.**
+  When the C path has a known bug or surprising semantic, port it
+  faithfully so the diff tests stay load-bearing — a failing diff
+  unambiguously means a porting error. Leave a `// FIXME(riir):`
+  pinned to `infer.m:LINE` describing the bug, and queue the fix as
+  a Phase 7 (post-cutover) commit. Fixing while porting is asking
+  for trouble: a failing diff could be either a porting mistake or
+  an intentional fix, and you can't tell which without re-reading
+  the patch. The bisect findings (cross-Ctx NaN, partial-truncate
+  divergence) are exactly this shape — they get faithful ports plus
+  FIXMEs, and the typed `Result<(), CannotTruncateLinear>` lands as
+  a separate post-cutover slice.
 - **No new build systems.** `cargo build`, `cargo test`. Shader
   compile goes through `build.rs` or runtime `MTLLibrary::with_source`.
 
@@ -108,8 +117,9 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | SDPA core | 2026-04-27 (7d3963a) | cosine = 1.000000, max_abs_diff ≤ 1.5e-8 across kv_len ∈ {1, 8, 64, 512} | Q·K^T scores + softmax + V weighted sum + sigmoid gate. ULP-bounded territory (2× expf per output element). kv_len=1 is bit-exact (softmax(s)=1 skips expf). Cosine ≥ 0.9999 + max_abs_diff ≤ 1e-3 × max_abs_out floors. |
 | LM head (CPU) | 2026-04-27 (slice 6) | bit-exact, 248320 logits × 2 inputs (synth + real-derived hidden) | 4-bit dequant matvec, full vocabulary projection. Required `mul_add` to match clang's FMA contraction (`acc += (val*scale+bias)*x[i]` fuses into 2 fmadd on AArch64 at `-O3` with default `-ffp-contract=on`). Without `mul_add`: cosine still 1.0 but ~3.5e-7 relative drift from unfused multiply-then-add — the same FMA gap rope.rs noted. New diff hook bypasses `fast_dequant_matvec`'s GPU dispatch via direct `cpu_dequant_matvec` call. |
 | MoE router | 2026-04-27 (slice 7) | bit-exact, max_ulp=0 across 2 score patterns (clear-winner + mild-spread) | softmax → top-K (selection-sort slot order) → normalize, on NUM_EXPERTS=256 logits. Predicted ULP-bounded (libm `expf`); turned out bit-exact because clang doesn't auto-vectorize the softmax loop (sequential `sum +=` reduction blocks `vexpf` substitution). Rust scalar `f32::exp()` and clang scalar `expf` produce identical bytes. New `mf_moe_router_cpu` C hook composes `cpu_softmax` + `cpu_topk` + `cpu_normalize_weights`. |
+| linear-attn primitives (8a) | 2026-04-27 (slice 8a) | bit-exact, max_ulp=0 across all three sub-kernels | Three small CPU helpers from `linear_attention_forward`: `rms_norm_bare` (no weight; LINEAR_KEY_DIM=128), `conv1d_step` (depthwise 1D conv + SiLU; LINEAR_CONV_DIM=8192 channels × CONV_KERNEL_SIZE=4 — used `mul_add` proactively at FMA sites per the LM head finding), and `rms_norm_gated` (RMSNorm × SiLU × weight; LINEAR_VALUE_DIM=128). All three use the layer-0 real `linear_attn.*` weight tensors. Predicted: bare bit-exact, conv ULP-bounded (SiLU `expf`), gated ULP-bounded (SiLU `expf`). Landed: all three bit-exact — same pattern as MoE router, scalar `expf` in element-wise loops with no shared cross-iter dependency stays scalar on both sides. |
 | RMSNorm (Metal) | — | — | Cosine/Jaccard tolerance — fast_math + Metal reduction order diverge. |
-| linear attention | — | — | GatedDeltaNet — biggest remaining. C path has documented partial-truncate divergence (bisect finding #3); the Rust port should fix the silent-lossy semantic via typed `Result<(), CannotTruncateLinear>`. |
+| linear-attn recurrence (8b) | — | — | The novel part of GatedDeltaNet: per-v-head `state *= g; kv_mem = sum(state * k); delta = (v - kv_mem) * beta_gate; state += outer(delta, k); out = sum(state * q)`. Has libm `expf`/`logf`/`softplus`/`sigmoid` for per-head decay/beta, plus a 4D-shaped state update with FMA contractions. Use `mul_add` proactively. C path has the documented partial-truncate semantic (bisect finding #3); port faithfully with `// FIXME(riir):` note pointing at the typed-Result fix in Phase 7. |
 | MoE dispatch | — | — | GPU-heavy expert-forward orchestration. Probably last; depends on Metal infrastructure. |
 
 ## Suggested next-session order
