@@ -118,17 +118,28 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | LM head (CPU) | 2026-04-27 (slice 6) | bit-exact, 248320 logits × 2 inputs (synth + real-derived hidden) | 4-bit dequant matvec, full vocabulary projection. Required `mul_add` to match clang's FMA contraction (`acc += (val*scale+bias)*x[i]` fuses into 2 fmadd on AArch64 at `-O3` with default `-ffp-contract=on`). Without `mul_add`: cosine still 1.0 but ~3.5e-7 relative drift from unfused multiply-then-add — the same FMA gap rope.rs noted. New diff hook bypasses `fast_dequant_matvec`'s GPU dispatch via direct `cpu_dequant_matvec` call. |
 | MoE router | 2026-04-27 (slice 7) | bit-exact, max_ulp=0 across 2 score patterns (clear-winner + mild-spread) | softmax → top-K (selection-sort slot order) → normalize, on NUM_EXPERTS=256 logits. Predicted ULP-bounded (libm `expf`); turned out bit-exact because clang doesn't auto-vectorize the softmax loop (sequential `sum +=` reduction blocks `vexpf` substitution). Rust scalar `f32::exp()` and clang scalar `expf` produce identical bytes. New `mf_moe_router_cpu` C hook composes `cpu_softmax` + `cpu_topk` + `cpu_normalize_weights`. |
 | linear-attn primitives (8a) | 2026-04-27 (slice 8a) | bit-exact, max_ulp=0 across all three sub-kernels | Three small CPU helpers from `linear_attention_forward`: `rms_norm_bare` (no weight; LINEAR_KEY_DIM=128), `conv1d_step` (depthwise 1D conv + SiLU; LINEAR_CONV_DIM=8192 channels × CONV_KERNEL_SIZE=4 — used `mul_add` proactively at FMA sites per the LM head finding), and `rms_norm_gated` (RMSNorm × SiLU × weight; LINEAR_VALUE_DIM=128). All three use the layer-0 real `linear_attn.*` weight tensors. Predicted: bare bit-exact, conv ULP-bounded (SiLU `expf`), gated ULP-bounded (SiLU `expf`). Landed: all three bit-exact — same pattern as MoE router, scalar `expf` in element-wise loops with no shared cross-iter dependency stays scalar on both sides. |
+| linear-attn recurrence (8b) | 2026-04-27 (slice 8b) | state bit-exact (0/524288); out_values ULP-bounded max_ulp=12, max_abs_diff=1.9e-6 / max_abs_out=8.6 (~2.2e-7 relative) | Per-v-head decay → kv_mem → delta → state update → output. Standalone `cpu_gated_delta_recurrence` C helper (parallel to the inline production loop, not refactored from it) keeps prod codegen unchanged while exposing the test surface. All FMA contraction sites use `mul_add` per LM head findings. State mutations land bit-exact (element-wise updates, no cross-iter dependency). The per-head output read-out `sum += S[ki] * q[ki]` lands ULP-bounded — same dot-product-reduction-vectorization gap as SDPA, where clang's NEON horizontal-sum reorders the reduction tree vs Rust's strictly sequential mul_add chain. Curious that `kv_mem` reduction (same loop shape) stays bit-exact — probably because its result feeds the inner state-update loop and clang prefers scalar there to keep the FP register pipelined. |
 | RMSNorm (Metal) | — | — | Cosine/Jaccard tolerance — fast_math + Metal reduction order diverge. |
-| linear-attn recurrence (8b) | — | — | The novel part of GatedDeltaNet: per-v-head `state *= g; kv_mem = sum(state * k); delta = (v - kv_mem) * beta_gate; state += outer(delta, k); out = sum(state * q)`. Has libm `expf`/`logf`/`softplus`/`sigmoid` for per-head decay/beta, plus a 4D-shaped state update with FMA contractions. Use `mul_add` proactively. C path has the documented partial-truncate semantic (bisect finding #3); port faithfully with `// FIXME(riir):` note pointing at the typed-Result fix in Phase 7. |
 | MoE dispatch | — | — | GPU-heavy expert-forward orchestration. Probably last; depends on Metal infrastructure. |
 
 ## Suggested next-session order
 
-linear attention → MoE dispatch. Linear attention is the hard one (bisect's
-silent-truncate bug gets fixed in passing via typed
-`Result<(), CannotTruncateLinear>`); MoE dispatch is the GPU-orchestration
-finish. After both, Phase 3 closes and Phase 4 (top-level forward pass)
-opens.
+MoE dispatch is the only remaining Phase 3 kernel. GPU-heavy expert-
+forward orchestration; depends on the Metal infrastructure that
+landed in Phase 2. Cosine/Jaccard tolerance regime expected (Metal
+atomic-op nondeterminism).
+
+After MoE dispatch, Phase 3 closes (8 kernels landed: embedding,
+RMSNorm CPU+per-head, RoPE, SDPA, LM head, MoE router, linear-attn
+primitives + recurrence, MoE dispatch) and Phase 4 (top-level
+forward-pass orchestration: `eval_prompt`, `eval_token`, `memory_*`,
+state save/load) opens.
+
+Bisect's silent-truncate bug for partial linear-attn truncation is
+NOT being fixed during the port (per the bug-fix policy above);
+the Rust port replicates the C reset-to-empty semantic and the
+typed `Result<(), CannotTruncateLinear>` lands as a Phase 7
+post-cutover slice.
 
 ## Tolerance regimes (set by RoPE slice)
 
