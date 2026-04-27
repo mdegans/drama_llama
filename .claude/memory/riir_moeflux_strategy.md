@@ -134,51 +134,69 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | 4a | state structs + memory ops | 2026-04-27 (`9a1d60d`) | structural pos_max equivalence on empty state | KvCache + LinearAttnState + LayerState in `riir::state`, allocated per-layer in `RsCtx::open` (~40 GB lazy-committed virtual address space for KV on A3B; matches C `calloc`). Faithful port of the lossy partial-linear truncation; FIXME for the typed `Result<(), CannotTruncateLinear>` Phase 7 fix. |
 | 4b | layer-output dump hook | 2026-04-27 | C-side sanity (finite output) | `mf_layer_forward_dump(ctx, layer_idx, pos, hidden_in, hidden_out)` brackets `fused_layer_forward` with `discard_deferred_experts` / `complete_deferred_experts` so `g_deferred.active` is 0 on entry and exit. `RsCtx::layer_forward_dump` stub'd for 4c/4d. The first non-kernel hook to call into the production forward path — surfaced a third cross-Ctx state-pollution bug (the file-scope `layer_cache` weight-pointer cache); see the Phase 7 list. |
 | 4c | linear-attn fused_layer_forward | 2026-04-27 (`f44fc9c`) | cosine=1.0000000 max_abs_diff=4.1e-8 (effectively bit-exact) | Full GPU production path through linear-attn layers via `metal-rs` encoders. Six new modules: `mtl_weight_buf` (wraps mmap as MTLBuffer), `layer_weight_cache` (per-Ctx tensor offsets, fixes the 4b cross-Ctx bug class on the Rust side), `gpu_matvec` (4/8-bit dequant matvec encoder), `gpu_linear_attn` (5 linear-attn kernels), `linear_attn_forward` (composer + ~63 MB persistent buffer set on A3B). One-line defensive fix in C `mf_free_model` (reset `layer_cache_built=0`) lets the diff suite run end-to-end without cross-Ctx pollution; full Phase 7 cleanup still pending. K=experts_per_tok was the load-bearing bug — the Rust port had hardcoded `VARIANT.num_experts_per_tok` (architectural max, 8 for A3B) instead of using the runtime arg (4 in the test); finding it required wiring an `*_intermediates` diff hook and walking the per-stage diffs until the routing checkpoint flagged different top-K. The diagnostic infra stays in tree as a 4d debugging tool. |
-| 4d | full-attn fused_layer_forward | — | same | Adds RoPE + KV append + SDPA on top of the linear-attn shape. |
-| 4e | deferred-expert state machine (old 9d) | — | end-to-end via 4f | `g_deferred` → field on `RsCtx`. FIXME for the cross-Ctx NaN bug. |
-| 4f | mf_step_internal + eval_prompt/eval_token | — | end-to-end logits cosine/Jaccard | Wires the per-layer forward into the public eval API. |
+| 4d-pre | extract `post_attention_tail` (refactor) | 2026-04-27 (`621e134`) | 4c stays green | `LinearAttnBuffers` → `LayerForwardBuffers` (+ 3 new fields for full-attn projection outputs: `q_proj_out`/`k_out`/`v_out`). `LinearAttnForwardError` → `LayerForwardError`. Both old names kept as `pub type` aliases. `linear_attn_layer_forward` shrinks to input rms_norm + CMD1 (projections + 5 fused linear-attn kernels) and hands off to `post_attention_tail` (CMD2 + CMD3 + MoE) via an `OProj` adapter that names the right o_proj weights/in_dim. Sets up 4d to add `full_attn_layer_forward` calling the same tail. |
+| 4d | full-attn fused_layer_forward | 2026-04-27 (`44879b2`) | cosine=1.0000000 max_abs_diff=3.576e-7 max_abs_out=2.772 rel=1.290e-7 | New module `full_attn_forward.rs`. Pipeline: CPU input rms_norm + 3-matvec CMD1 (q/k/v) + per-head split into q+gate + per-head Q/K rms_norm + RoPE + KV append (host) + CPU SDPA + stage attn_out into `batch_out[6]` + `post_attention_tail`. `RsCtx::layer_forward_dump` now branches on `(layer_idx + 1) % full_attn_interval == 0` and dispatches the right forward / extracts the right `LayerState` variant. GPU attention fast path (`gpu_attn_fuse`, gated on `kv_len >= 32`) and GPU KV-cache mirror buffers are out of scope — FIXMEs in place; the dump-hook test at pos=0 never engages either. Per-stage drift composition predicted; observed even better than predicted thanks to RoPE + SDPA hitting kv_len=1 trivial cases. |
+| 4e | deferred-expert state machine (was 9d) | — | end-to-end via 4f | `g_deferred` → field on `RsCtx`. FIXME for the cross-Ctx NaN bug. |
+| 4f | mf_step_internal + eval_prompt/eval_token | — | end-to-end logits cosine/Jaccard | Wires the per-layer forward into the public eval API. Good slice to land the `LayerKind`-tagged `LayerWeightCache` enum + dispatch-from-Variant predicate (see "Future-arch openings" below). |
 | 4g | state_save / state_load | — | byte-identical snapshots | Last Phase 4 slice; the state-snapshot binary format. |
 
 ## Suggested next-session order
 
-Phase 3 numerical-correctness work is essentially done as of
-2026-04-27. **4/6 MoE-dispatch sub-slices landed** (9a / 9b / 9c /
-9e), all bit/byte-exact. 18/18 diff oracle tests green. Remaining:
+Phase 4 per-layer numerical correctness is **done** as of 2026-04-27
+(4d). The two layer-forward dump tests both green at cosine ≈ 1.0
+vs C; full diff oracle suite (22 tests) passes end-to-end when not
+hitting the documented cross-Ctx pollution hang (intermittent — see
+below). Remaining Phase 4:
 
-- **9d (deferred experts state machine)** — `g_deferred` →
-  `Ctx`-owned struct. The cross-Ctx NaN bug source; faithful port +
-  FIXME for the Phase 7 typed-`memory_seq_rm` fix. *Best landed
-  alongside Phase 4* — the diff oracle pattern doesn't naturally
-  exercise async sequencing, so the testing only really makes sense
-  when there's an end-to-end forward pass to integrate it into.
-- **9f (LZ4 + 2-bit + expert caches)** — performance + coverage
-  work, not a numerical-correctness slice. Per-blob LZ4
-  decompression, the LRU Metal-buffer cache, the malloc cache, the
-  2-bit quantization pipeline. *Deferable to Phase 7* unless a
-  benchmark on real prompts shows the basic path tops out below the
-  17.6 tok/s grammar-path target.
+- **4e (deferred-experts state machine, was 9d)** — `g_deferred` →
+  field on `RsCtx`. The cross-Ctx NaN bug source; faithful port +
+  FIXME for the Phase 7 typed-`memory_seq_rm` fix. The diff oracle
+  pattern doesn't naturally exercise async sequencing, so the
+  testing only really makes sense when integrated into 4f's
+  end-to-end forward pass. Smallest standalone version (if you want
+  to land it before 4f): add a `DeferredState` struct on `RsCtx`
+  mirroring the C `g_deferred` fields; add a "begin-deferred" variant
+  of `gpu_batched_experts_forward` that commits without waiting; add
+  a "complete-deferred" call that waits + reads back. Paired diff
+  test: call begin then complete on both sides, compare final hidden.
+- **4f (`mf_step_internal` + `eval_prompt` / `eval_token`)** — wires
+  the per-layer forwards into the public eval API. Also the natural
+  slice to land the `LayerKind`-tagged `LayerWeightCache` enum +
+  `Variant.layer_kind(i)` predicate (see "Future-arch openings"
+  section below) — both are cheap during this slice and load-bearing
+  for the eventual DeepSeek port.
+- **4g (`state_save` / `state_load`)** — last Phase 4 slice; the
+  state-snapshot binary format. End-to-end via byte-identical
+  snapshot diff against C.
 
-Implication: **Phase 3 can effectively be declared closed** with 4
-sub-slices instead of 6. Phase 4 (top-level forward-pass
-orchestration: `eval_prompt`, `eval_token`, `memory_*`, state
-save/load) opens next session, with 9d folded in as one of the
-Phase 4 integration tasks and 9f deferred until a real benchmark
-motivates it.
+Then Phase 5 (API stabilization + drama_llama full test run), Phase 6
+(cutover), Phase 7 (typed `memory_seq_rm`, multi-Ctx including
+`g_deferred` + `layer_cache` together, runtime variant dispatch,
+expanded coverage).
 
-If a future session prefers to land 9d in isolation first (before
-Phase 4), the smallest version is: add a `DeferredState` struct on
-`RsCtx` mirroring the C `g_deferred` fields; add a "begin-deferred"
-variant of `gpu_batched_experts_forward` that commits without
-waiting; add a "complete-deferred" call that waits + reads back.
-Diff: a paired test that calls begin then complete on both sides
-and compares the final hidden state. The hard part is the diff
-shape, not the code.
+**Cross-Ctx pollution as a Phase 7 reproducer:** the diff oracle suite
+is now a useful (intermittent) reproducer for the cross-Ctx state-
+pollution bug class. First run on 2026-04-27 hung in
+`mf_layer_forward_dump → [_MTLCommandBuffer waitUntilCompleted] →
+pthread_cond_wait` after ~25 min serial test execution; second run
+finished cleanly in 176.6s. Classic non-determinism — depends on OS
+page reclamation timing, GPU scheduling, allocator state. The 4c
+`mf_free_model` defensive `layer_cache_built=0` reset covers the
+common case but doesn't address `g_deferred` cross-Ctx fully. Phase
+7 lifetime-binds both into Ctx-owned state, and the bug class becomes
+uncompilable. Until then, "test hangs once in N runs" is the expected
+shape; the suite is not deterministically broken.
 
 Bisect's silent-truncate bug for partial linear-attn truncation is
 NOT being fixed during the port (per the bug-fix policy above);
 the Rust port replicates the C reset-to-empty semantic and the
 typed `Result<(), CannotTruncateLinear>` lands as a Phase 7
 post-cutover slice.
+
+9f (LZ4 + 2-bit + expert caches) — performance + coverage work, not
+a numerical-correctness slice. Deferable to Phase 7 unless a
+benchmark on real prompts shows the basic path tops out below the
+17.6 tok/s grammar-path target.
 
 ## Empirical finding: GPU kernels are bit-exact per-PSO
 
@@ -281,3 +299,47 @@ with a phase tag in the panic message. Each kernel landing flips
   `Result<(), CannotTruncateLinear>`. Callers must explicitly
   handle the case where linear-attn state can't be unwound — the
   silent-lossy behavior of the C API becomes a typed error.
+
+## Future-arch openings (informal — not a plan)
+
+Captured 2026-04-27 during 4d. Mike's decided multi-model is a
+post-RIIR effort, target architecture #2 is **Cogito-V2 671B
+(DeepSeek-V3 base)** — needed for the Council's emergency
+deliberation path. Cogito-V2-70B (Llama base) is the easier port
+but distillation tax kills it for the high-stakes reasoning use
+case; not worth doing as a stepping stone.
+
+Two small choices to make during 4f's `eval_prompt` integration that
+keep the DeepSeek port from being uglier than it needs to be — both
+land at no extra cost during the work that's happening anyway:
+
+- **`LayerWeightCache` → `LayerKind`-tagged enum.** Today the struct
+  has `linear_attn.*` and `self_attn.*` tensor slots side-by-side,
+  unused half left `None`. Works for two layer types from the same
+  family. For MLA's `kv_a_proj_with_mqa` / `kv_b_proj` /
+  `q_a_proj` / `q_b_proj` (plus the rotary-vs-nope split), the
+  "every-tensor-slot-on-every-layer" shape gets ugly. Same pattern
+  as `LayerState::{LinearAttn, FullAttn}` — turn it into
+  `LayerWeightCache::{LinearAttn(LinearAttnW), FullAttn(FullAttnW)}`
+  ahead of needing the third `Mla(MlaW)` variant.
+- **Layer-kind dispatch from `Variant`, not `(layer_idx + 1) %
+  full_attn_interval == 0`.** The modulo predicate is qwen3-family-
+  specific; DeepSeek-V3's first 3 layers are dense FFN, the rest are
+  MoE+MLA, no modulo describes that. When 4f writes the per-layer
+  loop, look the kind up via `VARIANT.layer_kind(layer_idx)` (or
+  similar). Trivial today; load-bearing once a second arch lands.
+
+Other DeepSeek-specific things that *do* need real work later
+(estimate 2–4 weeks for a focused port):
+
+- New attention pipeline (MLA: KV down/up projections, rotary on a
+  partial head split, materialized K/V matmul + standard SDPA).
+- New router (group-limited top-K of K experts within top-K_groups
+  groups; sigmoid not softmax for gate scoring).
+- New shaders for MLA (different head_dim layout from qwen3's 256).
+- Dense FFN dispatcher for the first N layers (no MoE).
+
+Kernels that survive verbatim: RMSNorm (CPU + GPU), `dequant_matvec`
+flavors, SwiGLU, the MoE base infrastructure. The `post_attention_tail`
+in `linear_attn_forward.rs` is largely reusable too — DeepSeek's
+post-attn shape is similar (residual + post-attn-norm + MoE).

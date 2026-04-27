@@ -51,6 +51,19 @@ Tests in `moeflux::crates/moeflux/tests/consecutive_eval_prompt.rs`:
   Ctx-owned state. The 4b sanity test stays permissive (finite-only)
   because of this; the real numerical signal lands in 4c via the
   Rust-vs-C diff.
+- **Whole-suite intermittent hang (added 2026-04-27 during RIIR
+  Phase 4d).** Running the full `cargo test --test diff_oracle --
+  --ignored` suite (22 tests, each opening 2 backends — 44 Ctx
+  opens total in one process) intermittently hangs in
+  `mf_layer_forward_dump → [_MTLCommandBuffer waitUntilCompleted] →
+  pthread_cond_wait`. First post-4d run hung after ~25 min CPU time
+  on one of the layer-forward tests. Second run finished cleanly in
+  176.6s with all 22 green. The 4c `mf_free_model` defensive
+  `layer_cache_built=0` reset addresses the common per-pair case
+  but doesn't fully cover `g_deferred` accumulating across
+  consecutive Ctxs. Useful (intermittent) reproducer for the Phase
+  7 typed-`memory_seq_rm` + Ctx-owned-state work; "hangs once in
+  N runs" is the expected shape, not a fresh regression.
 - **Resuming prefill diverges from full prefill.** `mf_memory_seq_rm(0,
   l_hit, -1)` followed by `eval_prompt(suffix, start_pos=l_hit, …)`
   produces a verbatim-loop trajectory on synthetic tokens; full
