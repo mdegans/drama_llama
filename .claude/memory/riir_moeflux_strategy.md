@@ -104,12 +104,21 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | embedding | 2026-04-26 (4216e2f) | bit-exact, 8 tok × 2048 elem | First per-kernel hook; CPU 4-bit dequant. |
 | RMSNorm (CPU) | 2026-04-26 (a7866cc) | bit-exact, 4 tok × 3 norms × 2048 elem | model.norm + layer-0 input_layernorm + post_attention_layernorm. Reduction-order-matched. |
 | RoPE | 2026-04-26 (250f5e8) | ULP-bounded ≤128 (observed 34 max), 5 positions × q+k | First non-bit-exact kernel. See "Tolerance regimes" below. |
+| RMSNorm per-head (CPU) | 2026-04-27 (5adabc5) | bit-exact, Q (16×256) + K (2×256) at first FA layer | Per-head Q/K norm extracted from full_attention_forward. Same arithmetic shape as whole-vector RMSNorm. |
+| SDPA core | 2026-04-27 (7d3963a) | cosine = 1.000000, max_abs_diff ≤ 1.5e-8 across kv_len ∈ {1, 8, 64, 512} | Q·K^T scores + softmax + V weighted sum + sigmoid gate. ULP-bounded territory (2× expf per output element). kv_len=1 is bit-exact (softmax(s)=1 skips expf). Cosine ≥ 0.9999 + max_abs_diff ≤ 1e-3 × max_abs_out floors. |
 | RMSNorm (Metal) | — | — | Cosine/Jaccard tolerance — fast_math + Metal reduction order diverge. |
-| full attention | — | — | Next. |
-| linear attention | — | — | |
-| MoE router | — | — | |
-| MoE dispatch | — | — | |
-| LM head | — | — | Symmetric to embedding (4-bit dequant matvec). |
+| linear attention | — | — | GatedDeltaNet — biggest remaining. C path has documented partial-truncate divergence (bisect finding #3); the Rust port should fix the silent-lossy semantic via typed `Result<(), CannotTruncateLinear>`. |
+| MoE router | — | — | Small: top-K + softmax + normalize on NUM_EXPERTS-long score vector. ULP-bounded (softmax). |
+| MoE dispatch | — | — | GPU-heavy expert-forward orchestration. Probably last; depends on Metal infrastructure. |
+| LM head | — | — | Symmetric to embedding (4-bit dequant matvec). Bit-exact territory. |
+
+## Suggested next-session order
+
+LM head → MoE router → linear attention → MoE dispatch. Two small
+kernels to warm up (bit-exact and ULP-bounded respectively), then the
+hard linear-attention port (where the bisect's silent-truncate bug
+gets fixed in passing), then the GPU-orchestration finish. After all
+five, Phase 3 closes and Phase 4 (top-level forward pass) opens.
 
 ## Tolerance regimes (set by RoPE slice)
 
