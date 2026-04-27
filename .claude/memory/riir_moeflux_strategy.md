@@ -107,18 +107,18 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | RMSNorm per-head (CPU) | 2026-04-27 (5adabc5) | bit-exact, Q (16×256) + K (2×256) at first FA layer | Per-head Q/K norm extracted from full_attention_forward. Same arithmetic shape as whole-vector RMSNorm. |
 | SDPA core | 2026-04-27 (7d3963a) | cosine = 1.000000, max_abs_diff ≤ 1.5e-8 across kv_len ∈ {1, 8, 64, 512} | Q·K^T scores + softmax + V weighted sum + sigmoid gate. ULP-bounded territory (2× expf per output element). kv_len=1 is bit-exact (softmax(s)=1 skips expf). Cosine ≥ 0.9999 + max_abs_diff ≤ 1e-3 × max_abs_out floors. |
 | LM head (CPU) | 2026-04-27 (slice 6) | bit-exact, 248320 logits × 2 inputs (synth + real-derived hidden) | 4-bit dequant matvec, full vocabulary projection. Required `mul_add` to match clang's FMA contraction (`acc += (val*scale+bias)*x[i]` fuses into 2 fmadd on AArch64 at `-O3` with default `-ffp-contract=on`). Without `mul_add`: cosine still 1.0 but ~3.5e-7 relative drift from unfused multiply-then-add — the same FMA gap rope.rs noted. New diff hook bypasses `fast_dequant_matvec`'s GPU dispatch via direct `cpu_dequant_matvec` call. |
+| MoE router | 2026-04-27 (slice 7) | bit-exact, max_ulp=0 across 2 score patterns (clear-winner + mild-spread) | softmax → top-K (selection-sort slot order) → normalize, on NUM_EXPERTS=256 logits. Predicted ULP-bounded (libm `expf`); turned out bit-exact because clang doesn't auto-vectorize the softmax loop (sequential `sum +=` reduction blocks `vexpf` substitution). Rust scalar `f32::exp()` and clang scalar `expf` produce identical bytes. New `mf_moe_router_cpu` C hook composes `cpu_softmax` + `cpu_topk` + `cpu_normalize_weights`. |
 | RMSNorm (Metal) | — | — | Cosine/Jaccard tolerance — fast_math + Metal reduction order diverge. |
 | linear attention | — | — | GatedDeltaNet — biggest remaining. C path has documented partial-truncate divergence (bisect finding #3); the Rust port should fix the silent-lossy semantic via typed `Result<(), CannotTruncateLinear>`. |
-| MoE router | — | — | Small: top-K + softmax + normalize on NUM_EXPERTS-long score vector. ULP-bounded (softmax). |
 | MoE dispatch | — | — | GPU-heavy expert-forward orchestration. Probably last; depends on Metal infrastructure. |
 
 ## Suggested next-session order
 
-MoE router → linear attention → MoE dispatch. Small ULP-bounded warm-up
-on the router, then the hard linear-attention port (where the bisect's
-silent-truncate bug gets fixed in passing), then the GPU-orchestration
-finish. After all three, Phase 3 closes and Phase 4 (top-level forward
-pass) opens.
+linear attention → MoE dispatch. Linear attention is the hard one (bisect's
+silent-truncate bug gets fixed in passing via typed
+`Result<(), CannotTruncateLinear>`); MoE dispatch is the GPU-orchestration
+finish. After both, Phase 3 closes and Phase 4 (top-level forward pass)
+opens.
 
 ## Tolerance regimes (set by RoPE slice)
 
