@@ -110,7 +110,10 @@ json-schema = ["dep:schemars", "misanthropic/json-schema"]
 # HuggingFace `tokenizers` crate for Rust-side tokenization. Exactly one
 # of `moeflux-model-*` must be enabled alongside — the shape is a
 # compile-time constant in moeflux's C side.
-moeflux = ["dep:moeflux", "dep:tokenizers"]
+# During Phase 5 of the moeflux RIIR (riir branch), `riir-port` is
+# enabled so `moeflux::Ctx`/`Error` resolve to the Rust port. Phase 6
+# cutover deletes the C side and the feature flag goes with it.
+moeflux = ["dep:moeflux", "dep:tokenizers", "moeflux/riir-port"]
 moeflux-model-qwen3-5-a17b = ["moeflux", "moeflux/model-qwen3-5-a17b"]
 moeflux-model-qwen3-6-35b-a3b = ["moeflux", "moeflux/model-qwen3-6-35b-a3b"]
 
