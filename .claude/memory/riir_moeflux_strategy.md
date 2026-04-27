@@ -146,27 +146,67 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | 4f-perf | fast/slow split (post-correctness) | — | bit-exact vs slow-path | Deferred from 4f per the plan. GPU-side CMD3 combine + chain into next layer's CMD1 input via `should_gpu_combine` (mirrors `infer.m:5668..5673`). ~50ms/token expected (~0.83ms/layer × 60). Bit-exactness vs slow path verifies correctness — same arithmetic, different scheduling. |
 | 4g | state_save / state_load | 2026-04-27 (`037f74c`) | byte-identical state_size; round-trip max_abs_diff=0; bidirectional wire compat cosine 1.0000000 | New `state_snapshot.rs` module ports `mf_state_save` / `mf_state_load` / `mf_state_size` (infer.m:8485..8700). Wire format: 8×u32 header (magic 'MFLX' + version + 6 shape constants) then per-layer body (full-attn = i32 len + K + V; linear-attn = conv_state + ssm_state). GPU recurrence read back from / written into `linear_buffers.{conv_state,delta_state}` (Metal canonical store). state_load is two-pass: header + per-layer-length preflight before mutation. Drains pending deferred dispatch (moeflux.h:481 contract). RsCtx methods are thin wrappers. Four diff tests: state_size match, Rust↔Rust round-trip (bit-exact), Rust→C wire compat (cosine 1.0000000 max_abs_diff 2.575e-5), C→Rust wire compat (cosine 1.0000000 max_abs_diff 2.718e-5). 66 MB snapshot at 4-token prefill on A3B (mostly the 45-layer GatedDeltaNet ssm_state, fixed-size). Unlocks the disk-cache use case Mike flagged: agent runner saving common-and-expensive prefixes (system+tools) across process restarts. |
 
+## Phase 5 progress (2026-04-27)
+
+Phase 5 = API stabilization + drama_llama integration + perf parity
+to the C path. Slices land here, not under Phase 4.
+
+| # | Slice | Landed | Notes |
+|---|-------|--------|-------|
+| 5a | public Ctx/Error → Rust port under `riir-port` | 2026-04-27 (moeflux `ee27663` + drama_llama `7fced10`) | `mod imp` promoted to `pub mod imp` so the diff oracle can pin-import the C path. `RsError` gains `StateBufferTooSmall { have, need }` for parity with `imp::Error`. drama_llama's `moeflux` feature now propagates `moeflux/riir-port`. drama_llama lib `cargo check` clean against the Rust impl. drama_llama tests have 33 pre-existing E0034/E0107/E0277/E0282/E0599 errors (verified pre-existing via stash-and-check); those are 5b territory. |
+| 5d-1 | GPU LM head | 2026-04-27 (moeflux `68b4964`) | Profile-driven. The 2026-04-27 samply trace of the riir production path showed `lm_head_cpu` at 59% self-time per token. New `gpu_lm_head.rs` routes the 2048×248320 4-bit dequant matvec through the existing `dequant_matvec_4bit_v3` pipeline (one Metal dispatch, ~31040 threadgroups × 256 threads). Persistent shared-storage input + logits buffers on `RsCtx`, lazy-init via `ensure_linear_resources`. End-to-end diff tests stay green; blallama A3B essay perf jumps 1.24 → 4.90 tok/s cold, 1.25 → 4.58 tok/s warm (3.7-4×). |
+
+## blallama perf log (A3B, M2 Max)
+
+| Configuration | Cold (512 tok) | Warm (~138 tok) | Notes |
+|---|---|---|---|
+| C path (baseline) | 10.13 tok/s | 8.70 tok/s | reference; `moeflux` feature with `riir-port` off |
+| riir before 5d-1 | 1.24 | 1.25 | CPU lm_head dominated |
+| riir after 5d-1 | 4.90 | 4.58 | GPU lm_head; ~half the gap to C closed |
+
+Re-profile after 5d-1 (samply, 26s of generation):
+- `__psynch_cvwait` 41.7% — *good*: GPU is the wait, not the work
+- `pread` 30.6% — streaming-experts disk reads; same on C path
+- `partial_sort` 9.6% — drama_llama sampling; same on C path
+- `_platform_memmove` 9.3% — per-layer host↔GPU staging churn
+- `__bzero` 3.6% — scratch allocator
+- `sdpa_cpu` 0.9% — confirms full-attn SDPA is genuinely cheap
+- `rms_norm_cpu` 0.1% — tiny
+
+The remaining gap to C is dominantly host↔GPU staging cost, NOT
+specific kernels left on CPU. Two natural next slices:
+
 ## Suggested next-session order
+
+- **5d-2 (4f-perf, fast/slow split)** — deferred from 4f-3. C path
+  fast path (infer.m:5668..5764): when the previous layer's CMD3
+  includes `moe_combine_residual` + `rms_norm_sum_sq` + `rms_norm_apply_bf16`
+  (gated by `should_gpu_combine` predicate — true for layers
+  0..NUM_LAYERS-2), the next layer skips deferred-wait + finalize
+  + input_norm entirely; CMD1 reads `buf_input` (already normalized
+  on GPU). Riir's slice 4f-3 deferred state machine has the right
+  shape; this slice extends `DeferredMode::Gpu` to optionally chain
+  C2+C3 and adapts `complete_deferred_experts_into` to recognize
+  the chained state. Conservative ROI estimate ~10-15% (4.6 → ~5.3
+  tok/s). Bit-exact vs slow-path; `eval_token_matches_c_single_step`
+  is the regression guard.
+- **Command-buffer batching** — the bigger latent win: today riir
+  commits + waits twice per layer (CMD1, CMD2) plus once for
+  deferred K-experts. C may submit fewer cmdbufs per layer. Each
+  commit+wait pair has ~0.1-0.5ms GPU↔CPU sync overhead; at 80
+  syncs/token × 0.3ms = 24ms/token. Worth measuring before
+  attempting.
+- **9f (LZ4 + 2-bit + expert caches)** — pread is 30.6% of CPU.
+  C path also pays this so it doesn't close the riir-vs-C gap, but
+  an LRU expert cache would lift the absolute throughput on both
+  sides. Probably do this as a Phase 6/7 unification.
 
 Phase 4 numerical correctness is **fully done** as of 2026-04-27.
 Slice 4f-1 through 4f-6 (commits `fd63c0a` → `ceaa3ba`) wired the
 public eval API; slice 4g (`037f74c`) added wire-compatible state
 snapshots. Full diff oracle suite **32/32 green in 345s**.
-Remaining Phase 4:
 
-- **4f-perf (fast/slow split)** — deferred from 4f-3 per the plan.
-  Today every layer takes the slow path (CPU input rms_norm at top
-  of next layer's forward). 4f-perf adds C's `gpu_combine = true`
-  with the rms_norm chain (so CMD3 produces a normalized result
-  ready for next layer's CMD1) plus the `should_gpu_combine`
-  predicate that gates per-layer. ~50ms/token expected speedup.
-  Pure perf; correctness verified by bit-exact vs slow-path (same
-  arithmetic, different scheduling). Wait until drama_llama
-  integration provides empirical tok/s numbers — if we're already
-  hitting the 17.6 tok/s target, this can wait further.
-
-Then Phase 5 (API stabilization + drama_llama full test run), Phase 6
-(cutover), Phase 7 (post-cutover; see list below).
+Then Phase 6 (cutover), Phase 7 (post-cutover; see list below).
 
 ## Phase 7 follow-ups (post-cutover)
 
