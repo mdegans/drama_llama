@@ -144,15 +144,15 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | 4f-5 | step_internal + eval_prompt + eval_token | 2026-04-27 (`0267bda`) | preserves layer-forward cosine 1.0 | Replaces `todo!()` stubs at mod.rs:723..741. `step_internal(token, pos, logits_out: Option<&mut [f32]>)` mirrors C `mf_step_internal` shape: embed → per-layer loop with drain-then-forward → final drain (or discard) → CPU `model.norm` rms_norm → CPU `lm_head_cpu` → write logits. `gpu_combine = true` for every layer (preserves 4f-3 default; slice 4f-perf gates per-layer). Field-disjoint borrow pattern same as `layer_forward_dump_inner`. Empty `tokens.len()` returns `Ok(())`. |
 | 4f-6 | end-to-end eval_prompt / eval_token diff | 2026-04-27 (`ceaa3ba`) | `eval_token`: argmax c=17 rs=17 cosine=1.0000000 max_abs_diff=2.670e-5 rel=1.958e-6 jaccard=1.0000; `eval_prompt(8tok)`: argmax c=198 rs=198 cosine=1.0000000 max_abs_diff=2.241e-5 rel=1.703e-6 jaccard=1.0000 | Two end-to-end tests against C. Fresh-Ctx-per-side (sidesteps the file-level "memory_clear non-determinism" warning — that's intra-Ctx). Floors set at cosine ≥ 0.9999; both pass with substantial margin. Confirms slice 9 per-PSO bit-exactness composes end-to-end across 40 layers + final RMSNorm + LM head. Full diff oracle suite 28/28 green in 273.6s. |
 | 4f-perf | fast/slow split (post-correctness) | — | bit-exact vs slow-path | Deferred from 4f per the plan. GPU-side CMD3 combine + chain into next layer's CMD1 input via `should_gpu_combine` (mirrors `infer.m:5668..5673`). ~50ms/token expected (~0.83ms/layer × 60). Bit-exactness vs slow path verifies correctness — same arithmetic, different scheduling. |
-| 4g | state_save / state_load | — | byte-identical snapshots | Last Phase 4 slice; the state-snapshot binary format. |
+| 4g | state_save / state_load | 2026-04-27 (`037f74c`) | byte-identical state_size; round-trip max_abs_diff=0; bidirectional wire compat cosine 1.0000000 | New `state_snapshot.rs` module ports `mf_state_save` / `mf_state_load` / `mf_state_size` (infer.m:8485..8700). Wire format: 8×u32 header (magic 'MFLX' + version + 6 shape constants) then per-layer body (full-attn = i32 len + K + V; linear-attn = conv_state + ssm_state). GPU recurrence read back from / written into `linear_buffers.{conv_state,delta_state}` (Metal canonical store). state_load is two-pass: header + per-layer-length preflight before mutation. Drains pending deferred dispatch (moeflux.h:481 contract). RsCtx methods are thin wrappers. Four diff tests: state_size match, Rust↔Rust round-trip (bit-exact), Rust→C wire compat (cosine 1.0000000 max_abs_diff 2.575e-5), C→Rust wire compat (cosine 1.0000000 max_abs_diff 2.718e-5). 66 MB snapshot at 4-token prefill on A3B (mostly the 45-layer GatedDeltaNet ssm_state, fixed-size). Unlocks the disk-cache use case Mike flagged: agent runner saving common-and-expensive prefixes (system+tools) across process restarts. |
 
 ## Suggested next-session order
 
-Phase 4 numerical correctness is **fully done** as of 2026-04-27 —
-slice 4f-1 through 4f-6 landed (commits `fd63c0a` through `ceaa3ba`).
-Full diff oracle suite **28/28 green in 273.6s**, including end-to-
-end `eval_token` and `eval_prompt(8 tok)` tests at cosine 1.0000000
-+ argmax match + top-20 Jaccard 1.0. Remaining Phase 4:
+Phase 4 numerical correctness is **fully done** as of 2026-04-27.
+Slice 4f-1 through 4f-6 (commits `fd63c0a` → `ceaa3ba`) wired the
+public eval API; slice 4g (`037f74c`) added wire-compatible state
+snapshots. Full diff oracle suite **32/32 green in 345s**.
+Remaining Phase 4:
 
 - **4f-perf (fast/slow split)** — deferred from 4f-3 per the plan.
   Today every layer takes the slow path (CPU input rms_norm at top
@@ -161,10 +161,9 @@ end `eval_token` and `eval_prompt(8 tok)` tests at cosine 1.0000000
   ready for next layer's CMD1) plus the `should_gpu_combine`
   predicate that gates per-layer. ~50ms/token expected speedup.
   Pure perf; correctness verified by bit-exact vs slow-path (same
-  arithmetic, different scheduling).
-- **4g (`state_save` / `state_load`)** — last Phase 4 slice; the
-  state-snapshot binary format. End-to-end via byte-identical
-  snapshot diff against C.
+  arithmetic, different scheduling). Wait until drama_llama
+  integration provides empirical tok/s numbers — if we're already
+  hitting the 17.6 tok/s target, this can wait further.
 
 Then Phase 5 (API stabilization + drama_llama full test run), Phase 6
 (cutover), Phase 7 (typed `memory_seq_rm`, multi-Ctx including
