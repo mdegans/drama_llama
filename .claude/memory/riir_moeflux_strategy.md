@@ -106,19 +106,19 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | RoPE | 2026-04-26 (250f5e8) | ULP-bounded ≤128 (observed 34 max), 5 positions × q+k | First non-bit-exact kernel. See "Tolerance regimes" below. |
 | RMSNorm per-head (CPU) | 2026-04-27 (5adabc5) | bit-exact, Q (16×256) + K (2×256) at first FA layer | Per-head Q/K norm extracted from full_attention_forward. Same arithmetic shape as whole-vector RMSNorm. |
 | SDPA core | 2026-04-27 (7d3963a) | cosine = 1.000000, max_abs_diff ≤ 1.5e-8 across kv_len ∈ {1, 8, 64, 512} | Q·K^T scores + softmax + V weighted sum + sigmoid gate. ULP-bounded territory (2× expf per output element). kv_len=1 is bit-exact (softmax(s)=1 skips expf). Cosine ≥ 0.9999 + max_abs_diff ≤ 1e-3 × max_abs_out floors. |
+| LM head (CPU) | 2026-04-27 (slice 6) | bit-exact, 248320 logits × 2 inputs (synth + real-derived hidden) | 4-bit dequant matvec, full vocabulary projection. Required `mul_add` to match clang's FMA contraction (`acc += (val*scale+bias)*x[i]` fuses into 2 fmadd on AArch64 at `-O3` with default `-ffp-contract=on`). Without `mul_add`: cosine still 1.0 but ~3.5e-7 relative drift from unfused multiply-then-add — the same FMA gap rope.rs noted. New diff hook bypasses `fast_dequant_matvec`'s GPU dispatch via direct `cpu_dequant_matvec` call. |
 | RMSNorm (Metal) | — | — | Cosine/Jaccard tolerance — fast_math + Metal reduction order diverge. |
 | linear attention | — | — | GatedDeltaNet — biggest remaining. C path has documented partial-truncate divergence (bisect finding #3); the Rust port should fix the silent-lossy semantic via typed `Result<(), CannotTruncateLinear>`. |
 | MoE router | — | — | Small: top-K + softmax + normalize on NUM_EXPERTS-long score vector. ULP-bounded (softmax). |
 | MoE dispatch | — | — | GPU-heavy expert-forward orchestration. Probably last; depends on Metal infrastructure. |
-| LM head | — | — | Symmetric to embedding (4-bit dequant matvec). Bit-exact territory. |
 
 ## Suggested next-session order
 
-LM head → MoE router → linear attention → MoE dispatch. Two small
-kernels to warm up (bit-exact and ULP-bounded respectively), then the
-hard linear-attention port (where the bisect's silent-truncate bug
-gets fixed in passing), then the GPU-orchestration finish. After all
-five, Phase 3 closes and Phase 4 (top-level forward pass) opens.
+MoE router → linear attention → MoE dispatch. Small ULP-bounded warm-up
+on the router, then the hard linear-attention port (where the bisect's
+silent-truncate bug gets fixed in passing), then the GPU-orchestration
+finish. After all three, Phase 3 closes and Phase 4 (top-level forward
+pass) opens.
 
 ## Tolerance regimes (set by RoPE slice)
 
@@ -151,6 +151,15 @@ The `mul_add` retrofit on the rotation step would shrink RoPE's
 drift (matches clang's likely FMA pattern) but doesn't change the
 methodology; left as a future micro-optimization if any consumer
 benefits from tighter agreement.
+
+**Empirical confirmation (slice 6, LM head)**: matching clang's FMA
+contraction on the Rust side via `mul_add` did move the matvec from
+"1.0 cosine + 3.5e-7 relative drift" to fully bit-exact across
+248320 vocabulary logits. So the FMA hypothesis isn't speculation —
+it's the load-bearing reason a literal port of `acc += a*b + c`
+patterns drifts on AArch64 release builds. Worth applying
+proactively in future kernels where the inner loop has the
+`acc + T*x` shape (linear attention will have plenty of these).
 
 **Diff-oracle hook pattern**: each kernel gets a `mf_<kernel>` accessor
 in `moeflux.h` that exposes the static C primitive. `RsCtx::open`
