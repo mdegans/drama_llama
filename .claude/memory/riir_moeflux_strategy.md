@@ -166,9 +166,41 @@ Remaining Phase 4:
   hitting the 17.6 tok/s target, this can wait further.
 
 Then Phase 5 (API stabilization + drama_llama full test run), Phase 6
-(cutover), Phase 7 (typed `memory_seq_rm`, multi-Ctx including
-`g_deferred` + `layer_cache` together, runtime variant dispatch,
-expanded coverage).
+(cutover), Phase 7 (post-cutover; see list below).
+
+## Phase 7 follow-ups (post-cutover)
+
+These are tracked here so they don't get lost. Once the C is gone
+and we're the only consumer, we can break wire compat freely.
+
+- **Typed `memory_seq_rm`** — return `Result<(),
+  CannotTruncateLinear>` instead of silently resetting linear-attn
+  layers to empty. Bisect's silent-truncate finding made this the
+  motivating Phase 7 item.
+- **Ctx-owned `g_deferred` + `layer_cache`** — already structurally
+  fixed in the Rust port (`RsCtx::deferred` field, per-Ctx
+  `layer_caches`). Phase 7 deletes the C-side equivalents and
+  removes the cross-Ctx hang reproducer.
+- **Runtime variant dispatch** — replace the `cfg(feature = "model-
+  ...")` `VARIANT` const with a runtime config (drama_llama
+  `project_moeflux_runtime_variant.md`). Touches every place that
+  reads `VARIANT`.
+- **Snapshot format simplification** (added 2026-04-27 after Mike
+  flagged that the C-driven format has redundant fields):
+  - Drop `linear_conv_bytes` / `linear_ssm_bytes` from the header
+    (derivable from the other shape constants; only present
+    because C lacks const-fn arithmetic in headers). Collapse to
+    magic + version + shape-hash u64.
+  - Replace per-full-attn-layer `i32 len` prefix with a single
+    `u32 len` at the top — moeflux is single-stream so all KV
+    caches share the same length per snapshot. Body becomes flat.
+  - bf16 K/V — halves the KV portion. Already what's stored on
+    the GPU side per slice 9; currently we round-trip through f32
+    for the host snapshot. f32 on the host is wasted bytes.
+- **Expanded coverage** — 9f (LZ4 + 2-bit + expert caches) is the
+  next code-path to bring under diff. Performance + coverage work,
+  not a numerical-correctness slice; deferable until a benchmark
+  shows it's load-bearing.
 
 **Cross-Ctx pollution as a Phase 7 reproducer:** the diff oracle suite
 is now a useful (intermittent) reproducer for the cross-Ctx state-
