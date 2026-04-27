@@ -157,6 +157,8 @@ to the C path. Slices land here, not under Phase 4.
 | 5d-1 | GPU LM head | 2026-04-27 (moeflux `68b4964`) | Profile-driven. The 2026-04-27 samply trace of the riir production path showed `lm_head_cpu` at 59% self-time per token. New `gpu_lm_head.rs` routes the 2048×248320 4-bit dequant matvec through the existing `dequant_matvec_4bit_v3` pipeline (one Metal dispatch, ~31040 threadgroups × 256 threads). Persistent shared-storage input + logits buffers on `RsCtx`, lazy-init via `ensure_linear_resources`. End-to-end diff tests stay green; blallama A3B essay perf jumps 1.24 → 4.90 tok/s cold, 1.25 → 4.58 tok/s warm (3.7-4×). |
 | 5d-2 | GPU input rms_norm | 2026-04-27 (moeflux `9153d95`) | Replaces per-layer CPU `rms_norm_cpu` + 4 host↔GPU memcopies with 2-dispatch GPU prelude inside CMD1 of both `linear_attn_layer_forward` and `full_attn_layer_forward`. `buffers.input` is now read-only within the layer and serves both as rms_norm source and (later) as residual source for `encode_residual_add`. Reusable `gpu_norm::encode_rms_norm_bf16_into` + `RmsNormBf16Pipelines` so the helper is shareable for future chained-CMD3 work. Diff tests pass at the existing tight floors. **Perf-neutral** (cold 4.90 → 4.81, warm 4.58 → 4.54): we were already GPU-bound (cvwait 41.7%); moving CPU work that ran during GPU wait windows just turns CPU samples into wait samples. Code is correct, cleaner, GPU-first. |
 | 5d-3 | fuse post-attn + shared-FFN cmdbuf | 2026-04-27 (moeflux `8655396`) | Collapses CMD2 + CMD3a + CMD3a-b commit+wait sequence into one cmdbuf. Replaces the CPU shared-FFN swiglu (was at `infer.m:2977 cpu_swiglu`) with GPU `swiglu_fused`. Net: 4 → 2 commit+waits per layer (matches C `cmd_fused` shape minus the K-expert deferred which is still async). Kernel `swiglu_fused` is bit-exact per-PSO (slice 9a); drift against C's CPU swiglu stays well within `cosine ≥ 0.9999`. New helper `encode_swiglu_buf` for `&Buffer` (vs `MtlBuffer<f32>` in expert_forward.rs). Diff tests green at tight 4e-8 floors. **+3-5% perf** (cold 4.81 → 5.04, warm 4.54 → 4.67) — fewer than expected because per-sync overhead is ~0.1-0.3ms not 1ms. |
+| 5d-4 | GPU-buf inputs to K-expert dispatch | 2026-04-27 (moeflux `a27388b`) | Eliminates the 3 × HIDDEN_DIM GPU↔host readbacks at the tail of `post_attention_tail` and the matching host→GPU memcpys inside `gpu_batched_experts_encode`. Production fast path passes `LayerForwardBuffers.{normed, h_mid, shared_out}` directly. New `gpu_batched_experts_encode_buf` + `_begin_buf`. Encoder helpers `encode_matvec_into` / `encode_swiglu_into_buf` now take `&BufferRef`. **+2-5%** (cold 5.04 → 5.16, warm 4.67 → 4.88) — modest because the eliminated memcopies overlapped GPU work. |
+| 5d-5 | pread experts directly into shared-storage | 2026-04-27 (moeflux `de47fa3`) | The 5d-4 re-profile showed `memmove` STILL at 9.9% — the elephant was the `expert_data: Vec<u8>` of K × EXPERT_SIZE that production allocated and copied per layer (~7 MB / layer). New `MoeBuffers::data_slot_mut(slot)` lets production `pread` directly into shared-storage. New `gpu_batched_experts_encode_pre_staged` skips the K-blob memcpy. Slot reuse is sound: every dispatch is waited at the top of the next layer. The 5d-4 `_buf` stepping stones removed. **+8-10%** (cold 5.16 → 5.58, warm 4.88 → 5.38) — second-biggest win after 5d-1. |
 
 ## blallama perf log (A3B, M2 Max)
 
@@ -167,6 +169,8 @@ to the C path. Slices land here, not under Phase 4.
 | riir after 5d-1 | 4.90 | 4.58 | GPU lm_head; ~half the gap to C closed |
 | riir after 5d-2 | 4.81 | 4.54 | GPU input rms_norm; perf-neutral but GPU-first refactor |
 | riir after 5d-3 | 5.04 | 4.67 | post-attn + shared-FFN cmdbuf merge; +3-5% |
+| riir after 5d-4 | 5.16 | 4.88 | GPU-buf K-expert inputs; +2-5% |
+| riir after 5d-5 | 5.58 | 5.38 | pread direct into shared-storage; +8-10% |
 
 Re-profile after 5d-1 (samply, 26s of generation):
 - `__psynch_cvwait` 41.7% — *good*: GPU is the wait, not the work
@@ -182,42 +186,57 @@ specific kernels left on CPU. Two natural next slices:
 
 ## Suggested next-session order
 
-- **post_attention_tail GPU↔host transfers** — three readbacks at
-  the tail of `post_attention_tail` (linear_attn_forward.rs:861-864:
-  `h_mid_host`, `shared_out_host`, `normed_host`) are CPU memcopies
-  of HIDDEN_DIM×3 = 24 KB / layer × 40 = 960 KB / token. Combined
-  with the matching encode-time copy_from_slice into MoeBuffers in
-  `gpu_batched_experts_encode` (`expert_forward.rs:509-511`),
-  that's nearly 2 MB / token of CPU↔GPU dance for inputs that are
-  already GPU-resident. A version of `gpu_batched_experts_encode`
-  that takes GPU buffer refs (or uses `MTLBlitCommandEncoder` for
-  GPU-to-GPU copies) eliminates this. Estimated 5-10% (cvwait was
-  41.7% of CPU time at 5d-1; this attacks the host-resident half
-  of that). Diff coverage: `eval_token_matches_c_single_step` +
-  the deferred-experts diff tests.
+- **5d-6: async / parallel pread (BIG one)** — Mike's CPU 60 / GPU
+  20 observation at 5d-4 (Activity Monitor) turned out to be the
+  load-bearing architectural gap. **Reference: C path runs
+  approximately 40% GPU use on A3B / 60% on A17B**, so even C
+  isn't saturating GPU here — but riir at ~20% GPU is half of C's
+  already-low utilization. C path (per `metal_infer/infer.m:23,
+  39, 991-992`) runs the K-expert disk reads in **4 parallel
+  pthreads** on a **double-buffered** set ("set A" feeds GPU
+  compute while "set B" is being prefetched in the background).
+  The pread cost (30% of CPU samples ≈ 70 ms / token at our
+  current rate) is hidden under GPU compute. In riir today preads
+  are sequential and on the critical path. Implementing this:
+  - Add a second `data_b: [MtlBuffer<u8>; MAX_K]` set on
+    `MoeBuffers` with a "current" index alternating per layer.
+  - Spawn (or thread-pool) a worker that preads layer N+1's
+    experts into the alternate set while layer N's K-expert
+    dispatch is in flight on the active set. Need to fan the K
+    reads across 4 pthreads — `std::thread::scope` or `rayon`.
+  - Layer N+1's expert indices are known after CMD3a's gate-logits
+    matvec completes (mid-layer). Question: does C overlap the
+    pread with CMD3b (its OWN K-expert dispatch on set A) or only
+    with cross-layer compute? Worth reading `infer.m` carefully
+    before designing the riir version. Read `g_pread_pool` /
+    `InferPreadTask` setup at `infer.m:154+` and the consumer
+    sites at `pread` callouts.
+  - Estimated ROI: the pread time becomes free (overlapped under
+    GPU compute), so wall-clock drops by ~30%. **5.4 → ~7-8 tok/s**
+    expected, possibly more if it also lets the GPU saturate.
+  - Diff coverage: existing `eval_token` end-to-end diff still
+    holds (deterministic dispatch order across both backends).
+    Add a regression test for the slot-reuse race window.
 - **GPU full-attn fast path** — `gpu_attn_fuse` (kv_len ≥ 32) was
   cut from slice 4d's scope. Today every full-attn layer's SDPA
   runs on CPU (10 layers / token at growing kv_len). Profile shows
   `sdpa_cpu` at only 0.9% even at 100-token kv_len, so the SDPA
   arithmetic isn't expensive — but the surrounding work IS:
   per-head Q/K rms_norm + RoPE + KV append all run host-side, with
-  matching readbacks of `q_proj_out` + `k_out` + `v_out` (full_attn
-  _forward.rs:234-236). Porting the pipeline to GPU eliminates these
-  per-layer host transfers. Bigger surgery — needs GPU KV-cache
-  mirror buffers + the 3 `attn_*_batched` kernels wired up.
+  matching readbacks of `q_proj_out` + `k_out` + `v_out`. Porting
+  to GPU eliminates these per-layer host transfers. Bigger surgery
+  — needs GPU KV-cache mirror buffers + the 3 `attn_*_batched`
+  kernels wired up. Probably second-biggest remaining lever.
 - **Chained CMD3 → next layer normed (the original 4f-perf)** —
   C path infer.m:5668-5764: CMD3 emits `moe_combine_residual` +
   `rms_norm_sum_sq` + `rms_norm_apply_bf16` so the next layer's
   input is GPU-resident pre-normalized. In riir today
   `complete_deferred_experts_into` does a GPU→host→GPU dance to
-  hand off between layers (`mod.rs:937-942`); chaining makes it a
-  no-op and the next layer's CMD1 reads from GPU directly. Slice
-  5d-2 already structurally enabled this (input rms_norm now reads
-  buffers.input) — the next half is making CMD3 write to
-  buffers.normed instead of through a host bounce. Estimated ~5%.
+  hand off between layers; chaining makes it a no-op. Slice 5d-2
+  already structurally enabled this (input rms_norm reads
+  buffers.input directly). Estimated ~5%.
 - **9f (LZ4 + 2-bit + expert caches)** — pread is 30.6% of CPU.
-  C path also pays this so it doesn't close the riir-vs-C gap, but
-  an LRU expert cache would lift the absolute throughput on both
+  An LRU expert cache would lift absolute throughput on both
   sides. Probably do this as a Phase 6/7 unification.
 
 Phase 4 numerical correctness is **fully done** as of 2026-04-27.
