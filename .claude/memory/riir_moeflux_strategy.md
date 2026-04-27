@@ -137,35 +137,31 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | 4d-pre | extract `post_attention_tail` (refactor) | 2026-04-27 (`621e134`) | 4c stays green | `LinearAttnBuffers` → `LayerForwardBuffers` (+ 3 new fields for full-attn projection outputs: `q_proj_out`/`k_out`/`v_out`). `LinearAttnForwardError` → `LayerForwardError`. Both old names kept as `pub type` aliases. `linear_attn_layer_forward` shrinks to input rms_norm + CMD1 (projections + 5 fused linear-attn kernels) and hands off to `post_attention_tail` (CMD2 + CMD3 + MoE) via an `OProj` adapter that names the right o_proj weights/in_dim. Sets up 4d to add `full_attn_layer_forward` calling the same tail. |
 | 4d | full-attn fused_layer_forward | 2026-04-27 (`44879b2`) | cosine=1.0000000 max_abs_diff=3.576e-7 max_abs_out=2.772 rel=1.290e-7 | New module `full_attn_forward.rs`. Pipeline: CPU input rms_norm + 3-matvec CMD1 (q/k/v) + per-head split into q+gate + per-head Q/K rms_norm + RoPE + KV append (host) + CPU SDPA + stage attn_out into `batch_out[6]` + `post_attention_tail`. `RsCtx::layer_forward_dump` now branches on `(layer_idx + 1) % full_attn_interval == 0` and dispatches the right forward / extracts the right `LayerState` variant. GPU attention fast path (`gpu_attn_fuse`, gated on `kv_len >= 32`) and GPU KV-cache mirror buffers are out of scope — FIXMEs in place; the dump-hook test at pos=0 never engages either. Per-stage drift composition predicted; observed even better than predicted thanks to RoPE + SDPA hitting kv_len=1 trivial cases. |
 | 4e | deferred-expert state machine (was 9d) | 2026-04-27 (`be80c56`) | bit-exact — cosine=1.0000000 max_abs_diff=0.0 across HIDDEN_DIM on both new tests | Smallest standalone version per the strategy doc's "Suggested next-session order". `DeferredState` struct on `RsCtx` (`Option<DeferredState>` field; `Some` ↔ C `g_deferred.active=1`); three methods `begin_deferred_experts` / `complete_deferred_experts` / `discard_deferred_experts`. The synchronous `gpu_batched_experts_forward` is now a thin wrapper around a new `gpu_batched_experts_encode` helper; the deferred path uses the same encode helper, commits async, stashes the owned cmdbuf. C side: matching `mf_begin` / `mf_complete` / `mf_discard` FFI hooks; static `oracle_batched_experts_encode` shared between sync + deferred. Cross-Ctx NaN bug **structurally absent** in the Rust port — `complete_deferred_experts` writes through caller-supplied `&mut [f32]`, never a stored raw pointer; documented as `NOTE(riir-bugfix):` not FIXME, since a single-Ctx diff test cannot distinguish faithful-with-bug from faithful-without-bug and the bug only manifests across two `Ctx`s. Out of scope (4f): `gpu_combined=false` CPU-combine path; fast/slow split in `fused_layer_forward`; rewiring `post_attention_tail` to call `begin` instead of the synchronous variant. Two new diff tests (`deferred_experts_begin_complete_close_c_vs_rust` + `deferred_experts_discard_clears_state_c_vs_rust`) bit-exact; full diff suite 24/24 green in 228s. |
-| 4f | mf_step_internal + eval_prompt/eval_token | — | end-to-end logits cosine/Jaccard | Wires the per-layer forward into the public eval API. Good slice to land the `LayerKind`-tagged `LayerWeightCache` enum + dispatch-from-Variant predicate (see "Future-arch openings" below). Also rewires `post_attention_tail` from synchronous `gpu_batched_experts_forward` to the 4e begin/complete pair, ports the `gpu_combined=false` CPU-combine path, and adds the fast/slow split branching from `fused_layer_forward` — those were intentionally deferred from 4e to keep the standalone slice small. |
+| 4f-1 | Variant::layer_kind + LayerKind enum | 2026-04-27 (`fd63c0a`) | refactor; existing tests stay green | Replaces inline `(layer_idx + 1) % full_attn_interval == 0` modulo with `Variant::layer_kind(i) -> LayerKind { LinearAttn, FullAttn }`. Five callsites updated. New unit test asserts kind sequence agrees with legacy modulo for every layer in active variant. Trivial today; load-bearing for DeepSeek-V3 (first N dense, rest MoE+MLA). |
+| 4f-2 | LayerWeightCache nested-attn refactor | 2026-04-27 (`d496b05`) | refactor; existing tests stay green | Splits flat `Option<u64>` struct into `LayerWeightCache { input_layernorm_w: u64, post_attention_layernorm_w: u64, attn: LayerAttnW, gate: GateW, shared: SharedExpertW }` where `LayerAttnW` is a tagged enum `{ LinearAttn(LinearAttnW), FullAttn(FullAttnW) }`. `build()` errors via `MtlWeightBufError::MissingTensor` at build-time; `~60 LOC` of `require()` ladder in `post_attention_tail` + per-layer-forward goes away. Strategy doc's flat-enum proposal overruled because `post_attention_tail` extraction (4d-pre) made common/attn separation cleaner. |
+| 4f-3 | post_attention_tail rewired through deferred experts | 2026-04-27 (`fca7fab`) | layer-forward diff stays at cosine 1.0; new back-to-back parity test bit-identical | Replaces synchronous `gpu_batched_experts_forward` with `gpu_batched_experts_begin` (slice 4e). Three free functions in `deferred.rs` (`gpu_batched_experts_begin`, `complete_deferred_experts_into`, `discard_deferred_experts_in`) take disjoint borrows; `RsCtx` methods are thin wrappers. `post_attention_tail` signature gains `deferred: &mut Option<DeferredState>`. `RsCtx::layer_forward_dump` brackets pre-call with `discard_*` (defensive) and drains post-call into `linear_buffers.input` (reconstitutes synchronous single-step contract). **Unrelated bug fixed:** `RsCtx::memory_clear` was only resetting host-side `LayerState`, not GPU-side linear-attn recurrence. C side stores recurrence host-resident and pushes to GPU each call (host alone suffices). Rust port treats GPU as canonical (kernels mutate in place). Without GPU reset, back-to-back forwards after `memory_clear` see stale recurrence. New test `layer_forward_dump_back_to_back_no_deferred_leak` asserts bit-identical outputs across 5 iterations with `memory_clear` between. |
+| 4f-4 | CPU-combine path (`gpu_combined=false`) | 2026-04-27 (`13d7b35`) | new `cpu_combine_path_matches_c` cosine 1.0000000 max_abs_diff 4.098e-8 | Ports C's `gpu_combine = 0` finalize (infer.m:4106..4129). New `cpu_ops` module (`cpu_vec_madd` + `cpu_sigmoid_scalar`, FMA via `mul_add`). `DeferredMode { Gpu, Cpu { h_mid, shared_out, expert_weights, shared_gate_score } }` enum on `DeferredState`. `gpu_batched_experts_encode/begin` accept `gpu_combine: bool`; `complete_deferred_experts_into` matches mode and runs CPU-combine when `Cpu`. New `RsCtx::layer_forward_dump_with_gpu_combine` test entry. Production callers all pass `true` — CPU branch reached only via the test. Slice 4f-perf will plumb the C-mirrored `should_gpu_combine` predicate. |
+| 4f-5 | step_internal + eval_prompt + eval_token | 2026-04-27 (`0267bda`) | preserves layer-forward cosine 1.0 | Replaces `todo!()` stubs at mod.rs:723..741. `step_internal(token, pos, logits_out: Option<&mut [f32]>)` mirrors C `mf_step_internal` shape: embed → per-layer loop with drain-then-forward → final drain (or discard) → CPU `model.norm` rms_norm → CPU `lm_head_cpu` → write logits. `gpu_combine = true` for every layer (preserves 4f-3 default; slice 4f-perf gates per-layer). Field-disjoint borrow pattern same as `layer_forward_dump_inner`. Empty `tokens.len()` returns `Ok(())`. |
+| 4f-6 | end-to-end eval_prompt / eval_token diff | 2026-04-27 (`ceaa3ba`) | `eval_token`: argmax c=17 rs=17 cosine=1.0000000 max_abs_diff=2.670e-5 rel=1.958e-6 jaccard=1.0000; `eval_prompt(8tok)`: argmax c=198 rs=198 cosine=1.0000000 max_abs_diff=2.241e-5 rel=1.703e-6 jaccard=1.0000 | Two end-to-end tests against C. Fresh-Ctx-per-side (sidesteps the file-level "memory_clear non-determinism" warning — that's intra-Ctx). Floors set at cosine ≥ 0.9999; both pass with substantial margin. Confirms slice 9 per-PSO bit-exactness composes end-to-end across 40 layers + final RMSNorm + LM head. Full diff oracle suite 28/28 green in 273.6s. |
+| 4f-perf | fast/slow split (post-correctness) | — | bit-exact vs slow-path | Deferred from 4f per the plan. GPU-side CMD3 combine + chain into next layer's CMD1 input via `should_gpu_combine` (mirrors `infer.m:5668..5673`). ~50ms/token expected (~0.83ms/layer × 60). Bit-exactness vs slow path verifies correctness — same arithmetic, different scheduling. |
 | 4g | state_save / state_load | — | byte-identical snapshots | Last Phase 4 slice; the state-snapshot binary format. |
 
 ## Suggested next-session order
 
-Phase 4 per-layer numerical correctness is **done** as of 2026-04-27
-(4d); the deferred-experts state primitive landed alongside
-(4e, `be80c56`). All 24 diff oracle tests green at cosine ≥ 0.9999
-(20 of 24 actually bit-exact — see the per-slice signal column).
-Remaining Phase 4:
+Phase 4 numerical correctness is **fully done** as of 2026-04-27 —
+slice 4f-1 through 4f-6 landed (commits `fd63c0a` through `ceaa3ba`).
+Full diff oracle suite **28/28 green in 273.6s**, including end-to-
+end `eval_token` and `eval_prompt(8 tok)` tests at cosine 1.0000000
++ argmax match + top-20 Jaccard 1.0. Remaining Phase 4:
 
-- **4f (`mf_step_internal` + `eval_prompt` / `eval_token`)** — wires
-  the per-layer forwards into the public eval API. Now *also* the
-  natural slice to do the begin/complete rewiring of
-  `post_attention_tail`: today it still calls the synchronous
-  `gpu_batched_experts_forward`; switching to
-  `RsCtx::begin_deferred_experts` is a few-line change once a
-  multi-layer loop exists to overlap layer N's CMD3 with layer N+1's
-  CMD1. Other intentionally-deferred 4e items that land here too:
-  the `gpu_combined=false` CPU-combine path
-  (`infer.m:4106..4129` — per-expert readback + `cpu_vec_madd` +
-  sigmoid gate + final combine), and the fast/slow split branching
-  from `fused_layer_forward` (`infer.m:4341..4612`). Both are
-  meaningless in 4e's standalone shape (no "previous layer"); both
-  are mandatory once a multi-layer loop exists. Also the natural
-  slice to land the `LayerKind`-tagged `LayerWeightCache` enum +
-  `Variant.layer_kind(i)` predicate (see "Future-arch openings"
-  section below) — both cheap during this slice and load-bearing for
-  the eventual DeepSeek port.
+- **4f-perf (fast/slow split)** — deferred from 4f-3 per the plan.
+  Today every layer takes the slow path (CPU input rms_norm at top
+  of next layer's forward). 4f-perf adds C's `gpu_combine = true`
+  with the rms_norm chain (so CMD3 produces a normalized result
+  ready for next layer's CMD1) plus the `should_gpu_combine`
+  predicate that gates per-layer. ~50ms/token expected speedup.
+  Pure perf; correctness verified by bit-exact vs slow-path (same
+  arithmetic, different scheduling).
 - **4g (`state_save` / `state_load`)** — last Phase 4 slice; the
   state-snapshot binary format. End-to-end via byte-identical
   snapshot diff against C.
