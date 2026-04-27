@@ -119,9 +119,9 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 | MoE router | 2026-04-27 (slice 7) | bit-exact, max_ulp=0 across 2 score patterns (clear-winner + mild-spread) | softmax → top-K (selection-sort slot order) → normalize, on NUM_EXPERTS=256 logits. Predicted ULP-bounded (libm `expf`); turned out bit-exact because clang doesn't auto-vectorize the softmax loop (sequential `sum +=` reduction blocks `vexpf` substitution). Rust scalar `f32::exp()` and clang scalar `expf` produce identical bytes. New `mf_moe_router_cpu` C hook composes `cpu_softmax` + `cpu_topk` + `cpu_normalize_weights`. |
 | linear-attn primitives (8a) | 2026-04-27 (slice 8a) | bit-exact, max_ulp=0 across all three sub-kernels | Three small CPU helpers from `linear_attention_forward`: `rms_norm_bare` (no weight; LINEAR_KEY_DIM=128), `conv1d_step` (depthwise 1D conv + SiLU; LINEAR_CONV_DIM=8192 channels × CONV_KERNEL_SIZE=4 — used `mul_add` proactively at FMA sites per the LM head finding), and `rms_norm_gated` (RMSNorm × SiLU × weight; LINEAR_VALUE_DIM=128). All three use the layer-0 real `linear_attn.*` weight tensors. Predicted: bare bit-exact, conv ULP-bounded (SiLU `expf`), gated ULP-bounded (SiLU `expf`). Landed: all three bit-exact — same pattern as MoE router, scalar `expf` in element-wise loops with no shared cross-iter dependency stays scalar on both sides. |
 | linear-attn recurrence (8b) | 2026-04-27 (slice 8b) | state bit-exact (0/524288); out_values ULP-bounded max_ulp=12, max_abs_diff=1.9e-6 / max_abs_out=8.6 (~2.2e-7 relative) | Per-v-head decay → kv_mem → delta → state update → output. Standalone `cpu_gated_delta_recurrence` C helper (parallel to the inline production loop, not refactored from it) keeps prod codegen unchanged while exposing the test surface. All FMA contraction sites use `mul_add` per LM head findings. State mutations land bit-exact (element-wise updates, no cross-iter dependency). The per-head output read-out `sum += S[ki] * q[ki]` lands ULP-bounded — same dot-product-reduction-vectorization gap as SDPA, where clang's NEON horizontal-sum reorders the reduction tree vs Rust's strictly sequential mul_add chain. Curious that `kv_mem` reduction (same loop shape) stays bit-exact — probably because its result feeds the inner state-update loop and clang prefers scalar there to keep the FP register pipelined. |
-| MoE dispatch — 9a single-expert GPU FFN | 2026-04-27 (slice 9a) | bit-exact — cosine=1.000000, max_abs_diff=0.0 across HIDDEN_DIM | First GPU kernel under diff. Four dispatches per call: gate matvec (`dequant_matvec_4bit_v3`) → up matvec → `swiglu_fused` → down matvec, all in one MTLCommandBuffer. Fresh `MtlBuffer` allocation per call (persistent buffers come in 9b). Lazy `MetalBackend` on `RsCtx`. C-side hook `mf_gpu_expert_forward` wraps the existing internal `gpu_expert_forward(MetalCtx*)` — passes `g_metal`, not the `mf_ctx` (file-scope MetalCtx owns the pipelines + buffers). Diff harness uses synthetic 4-bit blob (PRNG nibbles + BF16 0x3C00 scales / 0 biases) — same bytes both sides. Empirical surprise: the cosine/Jaccard regime I reserved for "Metal kernels" was not needed here — `simd_sum` reductions are deterministic per pipeline-state object, atomic ops live downstream in the K-expert combine path (slice 9b). The cosine ≥ 0.9999 / rel ≤ 1e-3 floors stay in the test as defensible placeholders; 9b will probably actually need them. 4-bit only; FIXME-noted for 2-bit at Phase 7. |
+| MoE dispatch — 9a single-expert GPU FFN | 2026-04-27 (slice 9a) | bit-exact — cosine=1.000000, max_abs_diff=0.0 across HIDDEN_DIM | First GPU kernel under diff. Four dispatches per call: gate matvec (`dequant_matvec_4bit_v3`) → up matvec → `swiglu_fused` → down matvec, all in one MTLCommandBuffer. Fresh `MtlBuffer` allocation per call (persistent buffers come in 9b). Lazy `MetalBackend` on `RsCtx`. C-side hook `mf_gpu_expert_forward` wraps the existing internal `gpu_expert_forward(MetalCtx*)` — passes `g_metal`, not the `mf_ctx` (file-scope MetalCtx owns the pipelines + buffers). Diff harness uses synthetic 4-bit blob (PRNG nibbles + BF16 0x3C00 scales / 0 biases) — same bytes both sides. Empirical surprise: the cosine/Jaccard regime I reserved for "Metal kernels" was not needed here — `simd_sum` reductions are deterministic per pipeline-state object, atomic ops live downstream (which I'd assumed was 9b). 4-bit only; FIXME-noted for 2-bit at Phase 7. |
+| MoE dispatch — 9b batched K-expert + combine | 2026-04-27 (slice 9b) | bit-exact — cosine=1.000000, max_abs_diff=0.0 across HIDDEN_DIM with K=4 experts | Persistent `MoeBuffers` (16 slots × {data, gate, up, act, out} + h_mid + shared_out + moe_hidden + 18-float combine_params) lazily allocated on `RsCtx` via `metal_and_moe_mut`. ~28 MB total on A3B. Hook stages K expert blobs, runs `gpu_encode_experts_batched` (2K encoders) + `moe_combine_residual` in one cmdbuf, reads back. Combine kernel pattern: `hidden = h_mid + Σ weights[k] × expert_out[k] + sigmoid(gate) × shared_out`. Output magnitude was meaningful (8.22e-4, not near-zero) so the bit-exact result is real — second hypothesis disproved: `moe_combine_residual` is ALSO atomic-op-free; per-thread reads K expert buffers and computes its own sequential sum. The cosine/Jaccard regime I reserved for "where atomic ops stack" doesn't materialize in this kernel either. Genuinely-nondeterministic territory probably starts in 9e (the `rms_norm_sum_sq` threadgroup reduction) or 9c (async pread + cache eviction ordering). |
 | RMSNorm (Metal) | — | — | Cosine/Jaccard tolerance — fast_math + Metal reduction order diverge. |
-| MoE dispatch — 9b batched K-expert + combine | — | — | Persistent multi-expert buffer slots on `RsCtx`. `weighted_sum` + `moe_combine_residual` combine kernel — atomic ops for K-expert weighted sum, this is where cosine/Jaccard floors actually start mattering. |
 | MoE dispatch — 9c expert I/O subsystem | — | — | pread thread pool + plain mmap path. No LZ4, no caches, no 2-bit. Couples the Rust port to actual `packed_experts/layer_*.bin` files. |
 | MoE dispatch — 9d deferred experts state | — | — | `g_deferred` → `Ctx`-owned struct. Cross-Ctx NaN bug source — faithful port keeps the lossy semantic but lifetime-binds it; FIXME for the typed `CannotTruncateLinear` Phase 7 fix. |
 | MoE dispatch — 9e GPU combine fast-path | — | — | Optional `gpu_combined` path that fuses combine+residual+norm in CMD3, skipping CPU readback. Performance-critical for production decode. |
@@ -132,11 +132,28 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 MoE dispatch is being sliced 9a → 9f because it's structurally bigger
 than any prior slice (GPU dispatch + expert I/O + cache + deferred
 state + LZ4/2-bit modes; hosted code in `infer.m` lines 1808–5776
-plus 3222–3740). 9a (single-expert GPU FFN forward) landed bit-exact
-on 2026-04-27 — proving the Metal infrastructure + diff hook pattern
-generalizes to GPU kernels. Next session: slice 9b (batched K-expert
-dispatch + `moe_combine_residual` weighted sum). That's where the
-cosine/Jaccard tolerance regime first starts earning its keep.
+plus 3222–3740). Both 9a and 9b landed bit-exact on 2026-04-27 —
+the cosine/Jaccard tolerance regime hasn't engaged yet because every
+GPU kernel touched so far happens to be atomic-op-free
+(`dequant_matvec_4bit_v3`, `swiglu_fused`, `moe_combine_residual` all
+do per-thread sequential work, no cross-thread reductions).
+
+Next session candidates:
+
+- **9c (expert I/O subsystem)** — pread thread pool + plain mmap. No
+  numerical question; couples to actual `packed_experts/layer_*.bin`
+  files. Mostly mechanical port.
+- **9d (deferred experts state)** — `g_deferred` → `Ctx`-owned. The
+  cross-Ctx NaN bug source. Faithful port; FIXME for the typed
+  Phase 7 fix.
+- **9e (GPU combine fast-path)** — `rms_norm_sum_sq` is the
+  first-since-9a kernel that has a threadgroup-shared reduction. May
+  finally produce the cosine/Jaccard regime where the floors matter.
+
+I'd argue 9c → 9d → 9e in that order: 9c unblocks real-weight tests
+(currently the diff path uses synth bytes only); 9d is the smallest
+slice and lands the bug fix in shape; 9e is the only one with
+genuine numerical risk so it benefits from the rest being settled.
 
 After all six MoE-dispatch sub-slices, Phase 3 closes and Phase 4
 (top-level forward-pass orchestration: `eval_prompt`, `eval_token`,
