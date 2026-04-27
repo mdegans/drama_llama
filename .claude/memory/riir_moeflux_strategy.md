@@ -129,35 +129,38 @@ the cosine/Jaccard floors (Metal nondeterminism territory).
 
 ## Suggested next-session order
 
-MoE dispatch is being sliced 9a → 9f because it's structurally bigger
-than any prior slice (GPU dispatch + expert I/O + cache + deferred
-state + LZ4/2-bit modes; hosted code in `infer.m` lines 1808–5776
-plus 3222–3740). Both 9a and 9b landed bit-exact on 2026-04-27 —
-the cosine/Jaccard tolerance regime hasn't engaged yet because every
-GPU kernel touched so far happens to be atomic-op-free
-(`dequant_matvec_4bit_v3`, `swiglu_fused`, `moe_combine_residual` all
-do per-thread sequential work, no cross-thread reductions).
+Phase 3 numerical-correctness work is essentially done as of
+2026-04-27. **4/6 MoE-dispatch sub-slices landed** (9a / 9b / 9c /
+9e), all bit/byte-exact. 18/18 diff oracle tests green. Remaining:
 
-Next session candidates:
+- **9d (deferred experts state machine)** — `g_deferred` →
+  `Ctx`-owned struct. The cross-Ctx NaN bug source; faithful port +
+  FIXME for the Phase 7 typed-`memory_seq_rm` fix. *Best landed
+  alongside Phase 4* — the diff oracle pattern doesn't naturally
+  exercise async sequencing, so the testing only really makes sense
+  when there's an end-to-end forward pass to integrate it into.
+- **9f (LZ4 + 2-bit + expert caches)** — performance + coverage
+  work, not a numerical-correctness slice. Per-blob LZ4
+  decompression, the LRU Metal-buffer cache, the malloc cache, the
+  2-bit quantization pipeline. *Deferable to Phase 7* unless a
+  benchmark on real prompts shows the basic path tops out below the
+  17.6 tok/s grammar-path target.
 
-- **9c (expert I/O subsystem)** — pread thread pool + plain mmap. No
-  numerical question; couples to actual `packed_experts/layer_*.bin`
-  files. Mostly mechanical port.
-- **9d (deferred experts state)** — `g_deferred` → `Ctx`-owned. The
-  cross-Ctx NaN bug source. Faithful port; FIXME for the typed
-  Phase 7 fix.
-- **9e (GPU combine fast-path)** — `rms_norm_sum_sq` is the
-  first-since-9a kernel that has a threadgroup-shared reduction. May
-  finally produce the cosine/Jaccard regime where the floors matter.
+Implication: **Phase 3 can effectively be declared closed** with 4
+sub-slices instead of 6. Phase 4 (top-level forward-pass
+orchestration: `eval_prompt`, `eval_token`, `memory_*`, state
+save/load) opens next session, with 9d folded in as one of the
+Phase 4 integration tasks and 9f deferred until a real benchmark
+motivates it.
 
-I'd argue 9c → 9d → 9e in that order: 9c unblocks real-weight tests
-(currently the diff path uses synth bytes only); 9d is the smallest
-slice and lands the bug fix in shape; 9e is the only one with
-genuine numerical risk so it benefits from the rest being settled.
-
-After all six MoE-dispatch sub-slices, Phase 3 closes and Phase 4
-(top-level forward-pass orchestration: `eval_prompt`, `eval_token`,
-`memory_*`, state save/load) opens.
+If a future session prefers to land 9d in isolation first (before
+Phase 4), the smallest version is: add a `DeferredState` struct on
+`RsCtx` mirroring the C `g_deferred` fields; add a "begin-deferred"
+variant of `gpu_batched_experts_forward` that commits without
+waiting; add a "complete-deferred" call that waits + reads back.
+Diff: a paired test that calls begin then complete on both sides
+and compares the final hidden state. The hard part is the diff
+shape, not the code.
 
 Bisect's silent-truncate bug for partial linear-attn truncation is
 NOT being fixed during the port (per the bug-fix policy above);
