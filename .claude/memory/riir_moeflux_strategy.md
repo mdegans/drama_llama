@@ -159,6 +159,8 @@ to the C path. Slices land here, not under Phase 4.
 | 5d-3 | fuse post-attn + shared-FFN cmdbuf | 2026-04-27 (moeflux `8655396`) | Collapses CMD2 + CMD3a + CMD3a-b commit+wait sequence into one cmdbuf. Replaces the CPU shared-FFN swiglu (was at `infer.m:2977 cpu_swiglu`) with GPU `swiglu_fused`. Net: 4 → 2 commit+waits per layer (matches C `cmd_fused` shape minus the K-expert deferred which is still async). Kernel `swiglu_fused` is bit-exact per-PSO (slice 9a); drift against C's CPU swiglu stays well within `cosine ≥ 0.9999`. New helper `encode_swiglu_buf` for `&Buffer` (vs `MtlBuffer<f32>` in expert_forward.rs). Diff tests green at tight 4e-8 floors. **+3-5% perf** (cold 4.81 → 5.04, warm 4.54 → 4.67) — fewer than expected because per-sync overhead is ~0.1-0.3ms not 1ms. |
 | 5d-4 | GPU-buf inputs to K-expert dispatch | 2026-04-27 (moeflux `a27388b`) | Eliminates the 3 × HIDDEN_DIM GPU↔host readbacks at the tail of `post_attention_tail` and the matching host→GPU memcpys inside `gpu_batched_experts_encode`. Production fast path passes `LayerForwardBuffers.{normed, h_mid, shared_out}` directly. New `gpu_batched_experts_encode_buf` + `_begin_buf`. Encoder helpers `encode_matvec_into` / `encode_swiglu_into_buf` now take `&BufferRef`. **+2-5%** (cold 5.04 → 5.16, warm 4.67 → 4.88) — modest because the eliminated memcopies overlapped GPU work. |
 | 5d-5 | pread experts directly into shared-storage | 2026-04-27 (moeflux `de47fa3`) | The 5d-4 re-profile showed `memmove` STILL at 9.9% — the elephant was the `expert_data: Vec<u8>` of K × EXPERT_SIZE that production allocated and copied per layer (~7 MB / layer). New `MoeBuffers::data_slot_mut(slot)` lets production `pread` directly into shared-storage. New `gpu_batched_experts_encode_pre_staged` skips the K-blob memcpy. Slot reuse is sound: every dispatch is waited at the top of the next layer. The 5d-4 `_buf` stepping stones removed. **+8-10%** (cold 5.16 → 5.58, warm 4.88 → 5.38) — second-biggest win after 5d-1. |
+| 5d-6a | parallel K-expert pread (rayon, 8 threads) | 2026-04-28 (moeflux `7d46728`) | Replaces the serial `for slot in 0..k { read_expert }` loop in `post_attention_tail` with `par_iter_mut` over `MoeBuffers::data_slots_mut_array() -> [&mut [u8]; MAX_K]`. New `RsCtx.io_pool: rayon::ThreadPool` (8 workers, named `moeflux-io-N`, eagerly built in `RsCtx::open`). `ExpertFiles::read_expert(&self, ...)` is concurrent-safe (pread64, no shared offset). 2 MB DMA-alignment probe lands as `eprintln!` warning — Apple's `metal::Device::new_buffer` returns 16 KB-aligned `StorageModeShared` buffers, NOT 2 MB; warning fires. `posix_memalign + new_buffer_with_bytes_no_copy` fallback deferred (probe alone tells us if it's worth doing). Bench pending; will land in 5d-6b commit context. Diff oracle 32/32 sequential. |
+| 5d-6b | speculative prefetch + two-set MoE data | 2026-04-28 (moeflux `f9d8ff3`) | Asymmetric two-set: `data_synced` (sync-pread / miss target) + `data_prefetch` (async-prefetch / hit target). New `riir::prefetch` module: `PrefetchState`, `SlotSource { Synced, Prefetched }`, `DataPrefetchPtr`/`ExpertFilesPtr` (usize-stored to bypass closure-capture `!Send` propagation from `NonNull`), `wait_for/dispatch/record_actual/predict_for/invalidate_all/drain` API. Prediction = "last token's same-layer K indices" (same as C). Encoder API gains `data_set_per_slot: &[SlotSource; MAX_K]` parameter for per-slot Synced vs Prefetched binding. Prefetch fires at the TOP of each layer's iteration in `step_internal`, AFTER the drain of layer N-1's deferred GPU dispatch — load-bearing ordering: firing earlier (at end of N-1's post_attention_tail, parallel to C) raced N-1's in-flight GPU read of `data_prefetch[slot]` against the prefetch's writes; caught initial regression at cosine 0.94 on `state_round_trip_rust`. `memory_clear` / `state_save` / `state_load` / `layer_forward_dump_inner` / `Drop` all drain. Three new diff tests: `prefetch_hit_miss_equivalence_rust` (drift_max=0, cosine=1.0), `memory_clear_cancels_prefetch_no_leak`, `slot_reuse_race_regression_rust`. Diff oracle 35/35 sequential, 306s. Bench pending. |
 
 ## blallama perf log (A3B, M2 Max)
 
@@ -171,6 +173,8 @@ to the C path. Slices land here, not under Phase 4.
 | riir after 5d-3 | 5.04 | 4.67 | post-attn + shared-FFN cmdbuf merge; +3-5% |
 | riir after 5d-4 | 5.16 | 4.88 | GPU-buf K-expert inputs; +2-5% |
 | riir after 5d-5 | 5.58 | 5.38 | pread direct into shared-storage; +8-10% |
+| riir after 5d-6a | TBD | TBD | parallel K-expert pread (rayon, 8 threads); bench pending — Mike runs blallama A3B essay |
+| riir after 5d-6b | TBD | TBD | speculative prefetch + two-set MoE data; bench pending |
 
 Re-profile after 5d-1 (samply, 26s of generation):
 - `__psynch_cvwait` 41.7% — *good*: GPU is the wait, not the work
@@ -186,37 +190,12 @@ specific kernels left on CPU. Two natural next slices:
 
 ## Suggested next-session order
 
-- **5d-6: async / parallel pread (BIG one)** — Mike's CPU 60 / GPU
-  20 observation at 5d-4 (Activity Monitor) turned out to be the
-  load-bearing architectural gap. **Reference: C path runs
-  approximately 40% GPU use on A3B / 60% on A17B**, so even C
-  isn't saturating GPU here — but riir at ~20% GPU is half of C's
-  already-low utilization. C path (per `metal_infer/infer.m:23,
-  39, 991-992`) runs the K-expert disk reads in **4 parallel
-  pthreads** on a **double-buffered** set ("set A" feeds GPU
-  compute while "set B" is being prefetched in the background).
-  The pread cost (30% of CPU samples ≈ 70 ms / token at our
-  current rate) is hidden under GPU compute. In riir today preads
-  are sequential and on the critical path. Implementing this:
-  - Add a second `data_b: [MtlBuffer<u8>; MAX_K]` set on
-    `MoeBuffers` with a "current" index alternating per layer.
-  - Spawn (or thread-pool) a worker that preads layer N+1's
-    experts into the alternate set while layer N's K-expert
-    dispatch is in flight on the active set. Need to fan the K
-    reads across 4 pthreads — `std::thread::scope` or `rayon`.
-  - Layer N+1's expert indices are known after CMD3a's gate-logits
-    matvec completes (mid-layer). Question: does C overlap the
-    pread with CMD3b (its OWN K-expert dispatch on set A) or only
-    with cross-layer compute? Worth reading `infer.m` carefully
-    before designing the riir version. Read `g_pread_pool` /
-    `InferPreadTask` setup at `infer.m:154+` and the consumer
-    sites at `pread` callouts.
-  - Estimated ROI: the pread time becomes free (overlapped under
-    GPU compute), so wall-clock drops by ~30%. **5.4 → ~7-8 tok/s**
-    expected, possibly more if it also lets the GPU saturate.
-  - Diff coverage: existing `eval_token` end-to-end diff still
-    holds (deterministic dispatch order across both backends).
-    Add a regression test for the slot-reuse race window.
+- **Bench 5d-6a + 5d-6b** — landed 2026-04-28; perf delta TBD.
+  Mike runs blallama A3B essay manually; capture cold/warm tok/s
+  and update the perf log + the 5d-6a/5d-6b rows in the Phase 5
+  table. Also worth checking Activity Monitor's CPU/GPU split —
+  goal was C's 40% GPU on A3B; if we got there, the architectural
+  story is complete and we're wins-only from here.
 - **GPU full-attn fast path** — `gpu_attn_fuse` (kv_len ≥ 32) was
   cut from slice 4d's scope. Today every full-attn layer's SDPA
   runs on CPU (10 layers / token at growing kv_len). Profile shows
