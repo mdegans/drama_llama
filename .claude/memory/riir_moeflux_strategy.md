@@ -161,6 +161,8 @@ to the C path. Slices land here, not under Phase 4.
 | 5d-5 | pread experts directly into shared-storage | 2026-04-27 (moeflux `de47fa3`) | The 5d-4 re-profile showed `memmove` STILL at 9.9% — the elephant was the `expert_data: Vec<u8>` of K × EXPERT_SIZE that production allocated and copied per layer (~7 MB / layer). New `MoeBuffers::data_slot_mut(slot)` lets production `pread` directly into shared-storage. New `gpu_batched_experts_encode_pre_staged` skips the K-blob memcpy. Slot reuse is sound: every dispatch is waited at the top of the next layer. The 5d-4 `_buf` stepping stones removed. **+8-10%** (cold 5.16 → 5.58, warm 4.88 → 5.38) — second-biggest win after 5d-1. |
 | 5d-6a | parallel K-expert pread (rayon, 8 threads) | 2026-04-28 (moeflux `7d46728`) | Replaces the serial `for slot in 0..k { read_expert }` loop in `post_attention_tail` with `par_iter_mut` over `MoeBuffers::data_slots_mut_array() -> [&mut [u8]; MAX_K]`. New `RsCtx.io_pool: rayon::ThreadPool` (8 workers, named `moeflux-io-N`, eagerly built in `RsCtx::open`). `ExpertFiles::read_expert(&self, ...)` is concurrent-safe (pread64, no shared offset). 2 MB DMA-alignment probe lands as `eprintln!` warning — Apple's `metal::Device::new_buffer` returns 16 KB-aligned `StorageModeShared` buffers, NOT 2 MB; warning fires. `posix_memalign + new_buffer_with_bytes_no_copy` fallback deferred (probe alone tells us if it's worth doing). Bench pending; will land in 5d-6b commit context. Diff oracle 32/32 sequential. |
 | 5d-6b | speculative prefetch + two-set MoE data | 2026-04-28 (moeflux `f9d8ff3`) | Asymmetric two-set: `data_synced` (sync-pread / miss target) + `data_prefetch` (async-prefetch / hit target). New `riir::prefetch` module: `PrefetchState`, `SlotSource { Synced, Prefetched }`, `DataPrefetchPtr`/`ExpertFilesPtr` (usize-stored to bypass closure-capture `!Send` propagation from `NonNull`), `wait_for/dispatch/record_actual/predict_for/invalidate_all/drain` API. Prediction = "last token's same-layer K indices" (same as C). Encoder API gains `data_set_per_slot: &[SlotSource; MAX_K]` parameter for per-slot Synced vs Prefetched binding. Prefetch fires at the TOP of each layer's iteration in `step_internal`, AFTER the drain of layer N-1's deferred GPU dispatch — load-bearing ordering: firing earlier (at end of N-1's post_attention_tail, parallel to C) raced N-1's in-flight GPU read of `data_prefetch[slot]` against the prefetch's writes; caught initial regression at cosine 0.94 on `state_round_trip_rust`. `memory_clear` / `state_save` / `state_load` / `layer_forward_dump_inner` / `Drop` all drain. Three new diff tests: `prefetch_hit_miss_equivalence_rust` (drift_max=0, cosine=1.0), `memory_clear_cancels_prefetch_no_leak`, `slot_reuse_race_regression_rust`. Diff oracle 35/35 sequential, 306s. Bench pending. |
+| 5d-7a | GPU full-attn kernels under per-kernel diff | 2026-04-28 (moeflux `5f34d8f`) | bit-exact / cosine ≥ 0.9999 — slice-9 floor | Lands the 4 kernels of `gpu_attn_fuse` (`infer.m:5051..5163`) under per-kernel diff coverage ahead of the production wire-up. New `gpu_attn` module mirrors `gpu_norm`'s shape: `GpuAttnPipelines` cache + 4 `encode_*_into` helpers (consumed by 5d-7b) + 4 freestanding synchronous oracle entry points (`gpu_attn_scores_batched` / `gpu_attn_softmax_batched` / `gpu_attn_values_batched` / `gpu_sigmoid_gate`). Test-only oracle hooks `mf_attn_*` in `metal_infer/moeflux.h` duplicate the production encoder logic with fresh per-call buffers — production `gpu_attn_fuse` is untouched. Stride-tight (`seq_stride = seq_len`) so test buffer matches hook output 1:1. `RsCtx` + `Ctx` + `DiffBackend` trait + impls all gain matching wrappers. 4 new diff tests at the slice-9 floor (cosine ≥ 0.9999, rel ≤ 1e-3); `sigmoid_gate` asserts bit-exact (no reductions, no atomics — pure per-thread elementwise). Production decode path unchanged. |
+| 5d-7b | GPU full-attention production wire-up | 2026-04-28 (moeflux `5cfb521`) | full diff suite 40/40 in 394s; new GPU-path dump at kv_len=33 cosine ≥ 0.9999 / rel ≤ 1e-3 | Routes `kv_len ∈ [32, GPU_KV_SEQ)` through GPU SDPA encoded into the same CMD2 cmdbuf as o_proj + residual + post-attn rms_norm — zero additional commit-waits. `LayerForwardBuffers` grows per-full-attn KV mirrors (`gpu_kv_k[NUM_FULL_ATTN_LAYERS]` / `gpu_kv_v[NUM_FULL_ATTN_LAYERS]`, ~16.8 MB each on A3B × 15 layers × 2 ≈ 503 MB) plus shared scratch (`gpu_attn_q` / `gpu_attn_scores` / `gpu_attn_out` / `gpu_attn_gate`). `full_attn_layer_forward` memcpys host k/v into the GPU mirror at `cache_pos` after the canonical host-KV append (mirrors C `infer.m:4796..4802`), then chooses CPU SDPA vs GPU SDPA on the gate predicate `kv_len >= 32 && kv_len < GPU_KV_SEQ` (matches C `infer.m:5054`). When GPU active, q + q_gate are staged into `gpu_attn_q` / `gpu_attn_gate` and `Option<GpuAttnEncodeArgs>` threads through `post_attention_tail`, which encodes the 4 attn kernels at the head of CMD2 and reroutes o_proj input from `batch_out[6]` → `gpu_attn_out` (eliminates the final `attn_out` host stage). Below the gate, the existing CPU `sdpa_cpu` path is preserved verbatim. `state_load` mirrors restored host KV into GPU buffers per full-attn layer (mirrors C `infer.m:6570..6577`); `state_save` unchanged — host KV stays canonical, wire format preserved bit-identical to the 4g-locked format. `memory_clear` adds `reset_gpu_attn_kv_mirrors()` alongside `reset_recurrence`. New end-to-end test `layer_forward_dump_close_c_vs_rust_full_attn_gpu_path` confirms GPU SDPA matches C bit-equally at kv_len=33 (same floor as the kv_len=1 sibling). `eval_token` / `eval_prompt` end-to-end tests (which cross the gate at multi-token prompts) stay green at the existing tight floors. **Bench pending Mike's manual run**; estimate range from the plan was 7.53 → 8.0–8.5 warm tok/s (5–13%). |
 
 ## blallama perf log (A3B, M2 Max)
 
@@ -189,22 +191,14 @@ specific kernels left on CPU. Two natural next slices:
 
 ## Suggested next-session order
 
-- **Bench 5d-6a + 5d-6b** — landed 2026-04-28; perf delta TBD.
+- **Bench 5d-7a + 5d-7b** — landed 2026-04-28; perf delta TBD.
   Mike runs blallama A3B essay manually; capture cold/warm tok/s
-  and update the perf log + the 5d-6a/5d-6b rows in the Phase 5
-  table. Also worth checking Activity Monitor's CPU/GPU split —
-  goal was C's 40% GPU on A3B; if we got there, the architectural
-  story is complete and we're wins-only from here.
-- **GPU full-attn fast path** — `gpu_attn_fuse` (kv_len ≥ 32) was
-  cut from slice 4d's scope. Today every full-attn layer's SDPA
-  runs on CPU (10 layers / token at growing kv_len). Profile shows
-  `sdpa_cpu` at only 0.9% even at 100-token kv_len, so the SDPA
-  arithmetic isn't expensive — but the surrounding work IS:
-  per-head Q/K rms_norm + RoPE + KV append all run host-side, with
-  matching readbacks of `q_proj_out` + `k_out` + `v_out`. Porting
-  to GPU eliminates these per-layer host transfers. Bigger surgery
-  — needs GPU KV-cache mirror buffers + the 3 `attn_*_batched`
-  kernels wired up. Probably second-biggest remaining lever.
+  and update the perf log + the 5d-7a/5d-7b rows in the Phase 5
+  table. The plan's framing (CMD2-fold, not host-transfer-
+  elimination) is also worth bias-checking once numbers land —
+  if 5d-7b is flat, the framing was wrong and chained CMD3 (next
+  bullet) becomes the next candidate. Also worth checking
+  Activity Monitor's CPU/GPU split toward C's ~40% GPU on A3B.
 - **Chained CMD3 → next layer normed (the original 4f-perf)** —
   C path infer.m:5668-5764: CMD3 emits `moe_combine_residual` +
   `rms_norm_sum_sq` + `rms_norm_apply_bf16` so the next layer's
@@ -213,6 +207,12 @@ specific kernels left on CPU. Two natural next slices:
   hand off between layers; chaining makes it a no-op. Slice 5d-2
   already structurally enabled this (input rms_norm reads
   buffers.input directly). Estimated ~5%.
+- **GPU per-head Q/K rms_norm + RoPE** — out of scope for 5d-7
+  per the C path's shape (C also keeps these on CPU, mirroring
+  the same memcpy back to GPU buffers). Future GPU norm/RoPE
+  fusion is the strategy doc's "eliminate per-layer host
+  transfers" claim — bigger surgery. Worth revisiting once the
+  CMD3 chain lands and we have a clearer picture of what's left.
 - **9f (LZ4 + 2-bit + expert caches)** — pread is 30.6% of CPU.
   An LRU expert cache would lift absolute throughput on both
   sides. Probably do this as a Phase 6/7 unification.
