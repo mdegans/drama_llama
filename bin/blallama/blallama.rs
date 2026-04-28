@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use drama_llama::{
     backend::{Backend, Model},
     prompt::{AnthropicError, MessageResponse, Usage},
-    Prompt, Session,
+    ProbeCtx, ProbeHook, Prompt, Session,
 };
 use std::num::NonZeroU128;
 use tokio::{sync::Mutex, task::spawn_blocking};
@@ -53,6 +53,13 @@ struct Args {
     /// (`PredictOptions::DEFAULT_SEED`).
     #[arg(long)]
     seed: Option<u128>,
+    /// Append per-token probe records to this JSONL file. First line
+    /// per session is `{"event":"session_start","model":"<name>"}`;
+    /// subsequent lines are `{"event":"token","token":N,"n_cur":M,
+    /// "ts_ms":T}`. `ts_ms` is relative to the moment the hook was
+    /// installed on the session. Omit to disable probe recording.
+    #[arg(long)]
+    probe_out: Option<PathBuf>,
 }
 
 /// Inference backend selector. Variants are cfg-gated to whichever
@@ -84,6 +91,11 @@ const fn default_backend_kind() -> BackendKind {
 #[derive(Clone)]
 struct AppState<B: Backend> {
     args: Arc<Args>,
+    /// Sender into the probe-writer task. `None` if `--probe-out`
+    /// wasn't given. Cloned per-session in `configure_session` so each
+    /// installed [`JsonlProbeRecorder`] has its own handle; all clones
+    /// feed the same consumer task / output file.
+    probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
     session: Arc<Mutex<Option<Session<B>>>>,
 }
 
@@ -190,7 +202,10 @@ mod llama_cpp_run {
     use super::*;
     use drama_llama::LlamaCppBackend;
 
-    pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(
+        args: Args,
+        probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(format!(
             "0.0.0.0:{port}",
             port = args.port
@@ -204,6 +219,7 @@ mod llama_cpp_run {
             .route("/v1/messages", post(route_messages))
             .with_state(AppState {
                 args: args.into(),
+                probe_tx,
                 session,
             });
         axum::serve(listener, app).await?;
@@ -273,6 +289,7 @@ mod llama_cpp_run {
                         prompt.model.to_string(),
                         state.args.no_penalty,
                         state.args.seed,
+                        state.probe_tx.clone(),
                     )
                     .await?
                 }
@@ -283,6 +300,7 @@ mod llama_cpp_run {
                     prompt.model.to_string(),
                     state.args.no_penalty,
                     state.args.seed,
+                    state.probe_tx.clone(),
                 )
                 .await?
             }
@@ -314,6 +332,7 @@ mod llama_cpp_run {
         model: String,
         no_penalty: bool,
         seed: Option<u128>,
+        probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
     ) -> Result<Session<LlamaCppBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -327,7 +346,7 @@ mod llama_cpp_run {
             Session::<LlamaCppBackend>::from_path_with_n_ctx(path, 65536)
         })
         .await
-        .map(|s| configure_session(s, no_penalty, seed))
+        .map(|s| configure_session(s, no_penalty, seed, probe_tx))
         .map_err(map_session_err)
     }
 }
@@ -341,7 +360,10 @@ mod moeflux_run {
     use super::*;
     use drama_llama::MoefluxBackend;
 
-    pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(
+        args: Args,
+        probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(format!(
             "0.0.0.0:{port}",
             port = args.port
@@ -355,6 +377,7 @@ mod moeflux_run {
             .route("/v1/messages", post(route_messages))
             .with_state(AppState {
                 args: args.into(),
+                probe_tx,
                 session,
             });
         axum::serve(listener, app).await?;
@@ -424,6 +447,7 @@ mod moeflux_run {
                         prompt.model.to_string(),
                         state.args.no_penalty,
                         state.args.seed,
+                        state.probe_tx.clone(),
                     )
                     .await?
                 }
@@ -434,6 +458,7 @@ mod moeflux_run {
                     prompt.model.to_string(),
                     state.args.no_penalty,
                     state.args.seed,
+                    state.probe_tx.clone(),
                 )
                 .await?
             }
@@ -465,6 +490,7 @@ mod moeflux_run {
         model: String,
         no_penalty: bool,
         seed: Option<u128>,
+        probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
     ) -> Result<Session<MoefluxBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -478,7 +504,7 @@ mod moeflux_run {
             Session::<MoefluxBackend>::from_path(path)
         })
         .await
-        .map(|s| configure_session(s, no_penalty, seed))
+        .map(|s| configure_session(s, no_penalty, seed, probe_tx))
         .map_err(map_session_err)
     }
 }
@@ -491,6 +517,7 @@ fn configure_session<B: Backend>(
     s: Session<B>,
     no_penalty: bool,
     seed: Option<u128>,
+    probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
 ) -> Session<B> {
     // Sampling configuration is loaded from the per-model sidecar
     // (`<model>.sampling.toml` for gguf, `parent/sampling.toml` for
@@ -503,7 +530,7 @@ fn configure_session<B: Backend>(
     } else {
         s
     };
-    let configured = with_penalty
+    let mut configured = with_penalty
         .with_seed(seed.and_then(NonZeroU128::new))
         .with_prefix_cache(true)
         // Session-level generation cap. Distinct from `n_ctx` — that's
@@ -514,6 +541,18 @@ fn configure_session<B: Backend>(
         // ceiling; the prompt's `max_tokens` wins when smaller, this
         // clips runaway requests.
         .with_max_tokens(8192.try_into().unwrap());
+    if let Some(tx) = probe_tx {
+        let model_name = configured
+            .engine()
+            .model
+            .display_name()
+            .unwrap_or_default();
+        let recorder = JsonlProbeRecorder::install(tx, model_name.as_str());
+        configured
+            .engine_mut()
+            .set_probe_hook(Some(Box::new(recorder)));
+        tracing::info!(event = "probe_hook_installed", model = model_name.as_str());
+    }
     tracing::info!(
         event = "session_ready",
         n_ctx = configured.engine().n_ctx(),
@@ -528,6 +567,118 @@ fn configure_session<B: Backend>(
             .as_str(),
     );
     configured
+}
+
+// ---------------------------------------------------------------------------
+// JSONL probe recorder — per-session ProbeHook decoupled from disk via
+// an unbounded mpsc; a single tokio task drains and writes.
+// ---------------------------------------------------------------------------
+
+/// Records flowing from `ProbeHook::on_token` (and one synthetic
+/// `SessionStart` per recorder install) into the writer task.
+#[derive(Debug)]
+enum ProbeMsg {
+    SessionStart { model: String },
+    Token { token: i32, n_cur: usize, ts_ms: u64 },
+}
+
+/// Spawn a single JSONL writer task draining `rx` to `path` (append).
+/// Each message becomes one line. The task exits when every Sender
+/// is dropped (channel closes); on exit it flushes the BufWriter.
+/// Returns the Sender (Cloneable for per-session installs).
+///
+/// Buffer is bounded so a stalled disk doesn't grow the channel
+/// without bound; see `JsonlProbeRecorder::on_token` for drop-on-full
+/// semantics. 4096 records ≈ 120 KB of in-flight state, plenty for
+/// any realistic decode rate (≤ ~50 tok/s on Apple Silicon).
+const PROBE_CHANNEL_DEPTH: usize = 4096;
+
+async fn spawn_probe_writer(
+    path: PathBuf,
+) -> std::io::Result<tokio::sync::mpsc::Sender<ProbeMsg>> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<ProbeMsg>(PROBE_CHANNEL_DEPTH);
+
+    tokio::spawn(async move {
+        let mut writer = tokio::io::BufWriter::new(file);
+        while let Some(msg) = rx.recv().await {
+            let line = match msg {
+                ProbeMsg::SessionStart { model } => {
+                    format!(
+                        r#"{{"event":"session_start","model":{}}}"#,
+                        serde_json::to_string(&model).unwrap_or_default(),
+                    )
+                }
+                ProbeMsg::Token { token, n_cur, ts_ms } => format!(
+                    r#"{{"event":"token","token":{token},"n_cur":{n_cur},"ts_ms":{ts_ms}}}"#,
+                ),
+            };
+            if let Err(e) = writer.write_all(line.as_bytes()).await {
+                tracing::warn!(event = "probe_write_failed", error = %e);
+                continue;
+            }
+            if let Err(e) = writer.write_all(b"\n").await {
+                tracing::warn!(event = "probe_write_failed", error = %e);
+            }
+        }
+        // Channel closed (all senders dropped). Flush anything still
+        // in the BufWriter before exiting.
+        let _ = writer.flush().await;
+    });
+
+    Ok(tx)
+}
+
+/// Per-session [`ProbeHook`]. Sends each token to the shared writer
+/// task via the bounded-pressure unbounded mpsc — `on_token` returns
+/// in nanoseconds, so disk I/O never blocks the prediction loop.
+struct JsonlProbeRecorder {
+    tx: tokio::sync::mpsc::Sender<ProbeMsg>,
+    session_start: std::time::Instant,
+}
+
+impl JsonlProbeRecorder {
+    fn install(
+        tx: tokio::sync::mpsc::Sender<ProbeMsg>,
+        model_name: &str,
+    ) -> Self {
+        // Best-effort: a session_start lost to a stalled disk is
+        // surprising but not catastrophic. The token records that
+        // follow carry their own model context via the file's
+        // append-only ordering.
+        let _ = tx.try_send(ProbeMsg::SessionStart {
+            model: model_name.to_owned(),
+        });
+        Self {
+            tx,
+            session_start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl ProbeHook for JsonlProbeRecorder {
+    fn on_token(&mut self, ctx: ProbeCtx<'_>) {
+        let ts_ms = self.session_start.elapsed().as_millis() as u64;
+        // Non-blocking send. Failure modes:
+        // - `Full(_)`: writer task is behind (slow / stalled disk).
+        //   Drop the record rather than block decode; a flat-line in
+        //   the probe log is the disk-stall signal.
+        // - `Closed(_)`: writer task exited (panicked or finished).
+        //   Same treatment — failing predictions because the probe
+        //   sink died would be worse than a missing record.
+        let _ = self.tx.try_send(ProbeMsg::Token {
+            token: ctx.token,
+            n_cur: ctx.n_cur,
+            ts_ms,
+        });
+    }
 }
 
 fn map_session_err(
@@ -547,10 +698,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
     let args = Args::parse();
 
+    // If --probe-out is set, spin up the writer task before any
+    // session loads so per-session installs always have a Sender to
+    // clone. Failure to open the file is a startup error — the user
+    // asked for probe records and we can't deliver them.
+    let probe_tx = if let Some(path) = args.probe_out.clone() {
+        Some(spawn_probe_writer(path).await?)
+    } else {
+        None
+    };
+
     match args.backend {
         #[cfg(feature = "llama-cpp")]
-        BackendKind::LlamaCpp => llama_cpp_run::run(args).await,
+        BackendKind::LlamaCpp => llama_cpp_run::run(args, probe_tx).await,
         #[cfg(all(feature = "moeflux", target_os = "macos"))]
-        BackendKind::Moeflux => moeflux_run::run(args).await,
+        BackendKind::Moeflux => moeflux_run::run(args, probe_tx).await,
     }
 }
