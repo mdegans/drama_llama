@@ -1,4 +1,7 @@
-use crate::{backend::Decoder, Batch, LlamaCppModel, Token};
+use crate::{
+    backend::{Decoder, MemoryRmError},
+    Batch, LlamaCppModel, Token,
+};
 
 use std::{path::PathBuf, sync::Mutex};
 
@@ -487,5 +490,24 @@ impl Decoder for LlamaCppDecoder {
 
     fn memory_seq_pos_max(&mut self, seq_id: i32) -> i32 {
         LlamaCppDecoder::memory_seq_pos_max(self, seq_id)
+    }
+
+    /// llama.cpp preserves recurrent state per-cell, so arbitrary-
+    /// position truncate is already lossless. No snapshot needed.
+    fn checkpoint_pos(&mut self, _seq_id: i32, _pos: i32) {}
+
+    /// Maps to `llama_kv_cache_seq_rm(seq_id, pos, -1)`. Returns
+    /// `BackendUnsupported` only when the underlying call returns
+    /// false (invalid seq_id, which Session never passes).
+    fn restore_to(
+        &mut self,
+        seq_id: i32,
+        pos: i32,
+    ) -> Result<(), MemoryRmError> {
+        if LlamaCppDecoder::memory_seq_rm(self, seq_id, pos, -1) {
+            Ok(())
+        } else {
+            Err(MemoryRmError::BackendUnsupported { pos })
+        }
     }
 }

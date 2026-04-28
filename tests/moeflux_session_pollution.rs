@@ -12,12 +12,14 @@
 //!   completions (or repeated within one). Caught by the cross-output
 //!   substring check.
 //!
-//! The bug lives in moeflux: per `consecutive_eval_prompt.rs` in the
-//! moeflux crate, `mf_memory_seq_rm` partial-truncate does not reset
-//! linear-attention layer state. drama_llama's `Session` calls
-//! `memory_seq_rm(0, l_hit, -1)` + `eval_prompt(suffix, l_hit)` on
-//! every cached call, hitting the bug. This test stays red until the
-//! upstream fix lands; once green, it locks in the contract.
+//! The bug lived in moeflux: `mf_memory_seq_rm` partial-truncate
+//! reset linear-attention layer state to zeros, losing the recurrence
+//! across cache reuse. Phase 7 (this branch) replaces the
+//! `memory_seq_rm` cache path with snapshot/restore at breakpoint
+//! boundaries — `Session::kv_setup_and_chunk_prefill` checkpoints
+//! after each cache-breakpoint chunk during prefill and rewinds via
+//! `Engine::restore_to` on partial hit. Tests in this file should
+//! pass post-fix.
 //!
 //! `#[ignore]`'d — needs the moeflux artifacts mounted. Run with:
 //!
@@ -186,4 +188,105 @@ fn three_consecutive_completions_do_not_degenerate() {
     }
 
     eprintln!("[pollution] PASS — three consecutive completions stayed clean");
+}
+
+/// Phase 7 correctness assertion: with prefix cache enabled, a
+/// multi-turn chat must produce the SAME output a fresh-session
+/// run produces for the equivalent prompt. The cache path is only
+/// permitted to skip work, never to change outputs.
+///
+/// Procedure:
+/// 1. Open Session A with `with_prefix_cache(true)`. Run turn 1
+///    (system + user1) — primes the cache.
+/// 2. On A, run turn 2 (system + user1 + assistant1 + user2). This
+///    exercises partial-hit on `[system + user1]`, restores to that
+///    breakpoint, and chunked-prefills the new tail. Capture output.
+/// 3. Open a fresh Session B with `with_prefix_cache(false)`. Run
+///    turn 2 directly (no prior cache). Capture output.
+/// 4. Assert outputs match exactly.
+///
+/// Pre-Phase-7 this test would have failed: the lossy partial
+/// truncate would corrupt session A's recurrent state, and turn 2's
+/// generation would diverge from B's fresh-session ground truth.
+#[test]
+#[ignore = "long running; needs moeflux artifacts"]
+fn partial_hit_output_matches_fresh_session() {
+    use drama_llama::Block;
+    use misanthropic::prompt::message::CacheControl;
+
+    fn cached_user(text: &'static str) -> Message {
+        Message {
+            role: Role::User,
+            content: Content::MultiPart(vec![Block::Text {
+                text: Cow::Borrowed(text),
+                cache_control: Some(CacheControl::ephemeral()),
+            }]),
+        }
+    }
+
+    let system_text =
+        "You are a concise assistant. Answer in one short paragraph.";
+    let user1_text =
+        "Tell me one interesting historical fact about the year 1969.";
+    let assistant1_text =
+        "Apollo 11 landed on the Moon on July 20, 1969.";
+    let user2_text =
+        "Now tell me one interesting historical fact about the year 1989.";
+
+    let turn1 = Prompt {
+        system: Some(Content::MultiPart(vec![Block::Text {
+            text: Cow::Borrowed(system_text),
+            cache_control: Some(CacheControl::ephemeral()),
+        }])),
+        messages: vec![cached_user(user1_text)],
+        ..Prompt::default()
+    };
+
+    let turn2 = Prompt {
+        system: Some(Content::MultiPart(vec![Block::Text {
+            text: Cow::Borrowed(system_text),
+            cache_control: Some(CacheControl::ephemeral()),
+        }])),
+        messages: vec![
+            cached_user(user1_text),
+            Message {
+                role: Role::Assistant,
+                content: Content::SinglePart(Cow::Borrowed(assistant1_text)),
+            },
+            cached_user(user2_text),
+        ],
+        ..Prompt::default()
+    };
+
+    // Cached run: A primes cache with turn1, then runs turn2 hitting
+    // the partial-hit code path.
+    let mut session_a = build_session();
+    let _warm = session_a
+        .complete_text(&turn1)
+        .expect("complete_text turn1 (cached session)");
+    let cached_turn2 = session_a
+        .complete_text(&turn2)
+        .expect("complete_text turn2 (cached session)");
+
+    // Fresh ground-truth run: B has no cache, runs turn2 directly.
+    let mut session_b = build_session().with_prefix_cache(false);
+    let fresh_turn2 = session_b
+        .complete_text(&turn2)
+        .expect("complete_text turn2 (fresh session)");
+
+    eprintln!(
+        "[partial-hit] cached_turn2 ({} chars) first 80: {}",
+        cached_turn2.len(),
+        cached_turn2.chars().take(80).collect::<String>(),
+    );
+    eprintln!(
+        "[partial-hit] fresh_turn2 ({} chars) first 80: {}",
+        fresh_turn2.len(),
+        fresh_turn2.chars().take(80).collect::<String>(),
+    );
+
+    assert_eq!(
+        cached_turn2, fresh_turn2,
+        "partial-hit output diverged from fresh-session ground truth",
+    );
 }

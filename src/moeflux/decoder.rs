@@ -3,10 +3,13 @@
 
 use std::path::Path;
 
-use moeflux::{Ctx, Error as MfError};
+use moeflux::{CheckpointError, Ctx, Error as MfError};
 use thiserror::Error;
 
-use crate::{backend::Decoder, Token};
+use crate::{
+    backend::{Decoder, MemoryRmError},
+    Token,
+};
 
 /// Errors from the moeflux decoder path.
 #[derive(Debug, Error)]
@@ -188,5 +191,38 @@ impl Decoder for MoefluxDecoder {
 
     fn memory_seq_pos_max(&mut self, seq_id: i32) -> i32 {
         self.ctx.memory_seq_pos_max(seq_id)
+    }
+
+    /// Forwards to [`Ctx::checkpoint_pos`]. moeflux's recurrence is
+    /// GPU-resident and folds full history; the snapshot reads it
+    /// back via the existing `state_save` wire format. The trait
+    /// surface is infallible — `state_save` errors only if linear
+    /// buffers aren't initialized, which can't happen here because
+    /// drama_llama's Session always prefills before checkpointing.
+    /// We surface that contract violation as a panic.
+    fn checkpoint_pos(&mut self, _seq_id: i32, pos: i32) {
+        self.ctx
+            .checkpoint_pos(pos)
+            .expect("checkpoint_pos before first prefill (Session bug)");
+    }
+
+    fn restore_to(
+        &mut self,
+        _seq_id: i32,
+        pos: i32,
+    ) -> Result<(), MemoryRmError> {
+        match self.ctx.restore_to(pos) {
+            Ok(()) => Ok(()),
+            Err(CheckpointError::NoCheckpoint { pos }) => {
+                Err(MemoryRmError::NoCheckpoint { pos })
+            }
+            // A reload error from a buffer we wrote ourselves with
+            // `state_save` is a moeflux-internal bug; surface as
+            // BackendUnsupported so Session falls back gracefully
+            // rather than crashing.
+            Err(CheckpointError::Snapshot(_)) => {
+                Err(MemoryRmError::BackendUnsupported { pos })
+            }
+        }
     }
 }

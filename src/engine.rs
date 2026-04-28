@@ -7,7 +7,7 @@
 //! The `Engine<B>` type here only knows trait methods.
 
 use crate::{
-    backend::{Backend, Decoder},
+    backend::{Backend, Decoder, MemoryRmError},
     predictor::{CandidatePredictor, PiecePredictor, TokenPredictor},
     PredictOptions, Predictor, ProbeHook, Token,
 };
@@ -99,6 +99,45 @@ self.decoder.memory_seq_keep(seq_id)
     /// Largest position present in KV for `seq_id`.
     pub fn memory_seq_pos_max(&mut self, seq_id: i32) -> i32 {
 self.decoder.memory_seq_pos_max(seq_id)
+    }
+
+    /// Snapshot decoder state at sequence position `pos`. See
+    /// [`Decoder::checkpoint_pos`] — backends like moeflux capture
+    /// recurrent state for later lossless rewind; backends with
+    /// per-cell preserved state (llama.cpp) no-op.
+    pub fn checkpoint_pos(&mut self, seq_id: i32, pos: i32) {
+        self.decoder.checkpoint_pos(seq_id, pos);
+    }
+
+    /// Rewind decoder state to a previously-snapshotted position.
+    /// See [`Decoder::restore_to`] — `Err(NoCheckpoint)` signals the
+    /// caller should fall back to `memory_clear` + full re-prefill.
+    pub fn restore_to(
+        &mut self,
+        seq_id: i32,
+        pos: i32,
+    ) -> Result<(), MemoryRmError> {
+        self.decoder.restore_to(seq_id, pos)
+    }
+
+    /// Prefill `tokens` at positions `[start_pos, start_pos +
+    /// tokens.len())` on `seq_id`. Does not clear the KV cache.
+    /// Thin forward over [`Decoder::prefill`] — used by the
+    /// chunked-prefill path in `Session` so each cache-breakpoint
+    /// chunk can be flushed before its [`Engine::checkpoint_pos`]
+    /// call. Returns `Ok(())` on a non-empty slice; an empty slice
+    /// is a no-op.
+    pub fn prefill_chunk(
+        &mut self,
+        tokens: &[Token],
+        start_pos: usize,
+        seq_id: i32,
+    ) -> Result<(), <B::Decoder as Decoder>::Error> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        self.decoder.prefill(tokens, start_pos, seq_id)?;
+        Ok(())
     }
 
     /// Iterator that yields [`crate::Candidates`] until `n` tokens

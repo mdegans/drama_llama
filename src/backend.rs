@@ -100,6 +100,54 @@ pub trait Decoder {
     /// Return the largest position present in the KV cache for
     /// `seq_id`, or a negative value if the sequence is empty.
     fn memory_seq_pos_max(&mut self, seq_id: i32) -> i32;
+
+    /// Snapshot the current decoder state at sequence position `pos`.
+    /// Subsequent [`Decoder::restore_to`] with the same `(seq_id,
+    /// pos)` rewinds to exactly this state — enabling lossless
+    /// breakpoint rewinds for backends (like moeflux) whose
+    /// recurrent state cannot be unwound by position alone.
+    ///
+    /// Backends that already preserve recurrent state per-position
+    /// (e.g. llama.cpp) implement this as a no-op.
+    fn checkpoint_pos(&mut self, seq_id: i32, pos: i32);
+
+    /// Restore decoder state to a previously-snapshotted position.
+    /// On success, KV state matches what was current immediately
+    /// after the [`Decoder::checkpoint_pos`] call at `(seq_id, pos)`,
+    /// and all snapshots stored at positions `> pos` are dropped
+    /// (their futures are now invalid).
+    ///
+    /// Backends without per-pos snapshots may implement this by
+    /// truncating their KV cache directly (llama.cpp does this — its
+    /// recurrent state is preserved per-cell, so a truncate is
+    /// already lossless).
+    ///
+    /// Returns [`MemoryRmError::NoCheckpoint`] when no snapshot
+    /// exists at exactly `pos` (caller should fall back to
+    /// `memory_clear` + full reprefill), or
+    /// [`MemoryRmError::BackendUnsupported`] when the backend cannot
+    /// honor the request at all.
+    fn restore_to(
+        &mut self,
+        seq_id: i32,
+        pos: i32,
+    ) -> Result<(), MemoryRmError>;
+}
+
+/// Errors from [`Decoder::restore_to`]. Surfaced by the
+/// prefix-cache machinery in `Session` so it can fall back to a full
+/// re-prefill when a snapshot is missing.
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryRmError {
+    /// No snapshot at the requested position. Caller should
+    /// `memory_clear` and full-reprefill.
+    #[error("no checkpoint stored at position {pos}")]
+    NoCheckpoint { pos: i32 },
+    /// The backend cannot honor a rewind to this position at all
+    /// (invalid seq_id, unsupported semantics, etc.). Treated the
+    /// same as `NoCheckpoint` by the cache fallback path.
+    #[error("backend cannot restore to position {pos}")]
+    BackendUnsupported { pos: i32 },
 }
 
 /// Model backend: tokenization, vocab introspection, chat-template

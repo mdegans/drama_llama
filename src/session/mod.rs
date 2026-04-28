@@ -138,6 +138,11 @@ pub enum SessionError {
         /// debugging.
         partial_output: String,
     },
+    /// A backend prefill failed during the chunked prefix-cache
+    /// setup. Wraps the backend's stringified error to keep
+    /// `SessionError` backend-agnostic.
+    #[error("prefill: {0}")]
+    Decode(String),
 }
 
 /// Default maximum tokens per [`Session::complete_text`] call. Users override
@@ -861,43 +866,113 @@ impl<B: Backend> Session<B> {
         Ok((tokens, breakpoints, modes, deferred))
     }
 
-    /// Prefix-cache KV-state setup shared by every batch `complete_*`
-    /// entry point.
+    /// Prefix-cache KV-state setup + chunked prefill shared by every
+    /// batch `complete_*` entry point.
     ///
     /// Given the newly-tokenized prompt and its breakpoint indices,
     /// computes `L_hit` (tokens reusable from the previous call's KV
-    /// state), narrows the KV cache to `[0, L_hit)` via
-    /// [`LlamaCppEngine::memory_seq_rm`] (or clears it entirely on miss), and
-    /// returns the suffix of `new_tokens` the predictor must decode
-    /// plus the reuse length. The caller still owns whether / when to
-    /// update `self.prefix_cache` — batch callers do it *after*
-    /// success; streaming callers do it *before* the predictor borrow.
+    /// state), restores the KV cache + recurrent state to position
+    /// `L_hit` via [`Engine::restore_to`] (lossless on supported
+    /// backends — see [`Decoder::restore_to`]), then prefills each
+    /// `(prev_bp, next_bp)` chunk and snapshots state at `next_bp`
+    /// via [`Engine::checkpoint_pos`] so the next turn can rewind
+    /// there without recomputation.
+    ///
+    /// On `Err(NoCheckpoint)` from `restore_to` (snapshot lost to
+    /// LRU eviction or never created), falls back to a full
+    /// `memory_clear` + re-prefill from position 0.
+    ///
+    /// Returns:
+    /// * `suffix` — the tokens past the last breakpoint, to be
+    ///   passed to `predict_pieces_resuming` along with `prefill_start`.
+    /// * `cache_read` — number of input tokens served from the
+    ///   restored snapshot (zero when full miss / fallback).
+    /// * `prefill_start` — position from which the predictor's
+    ///   prefill resumes; equals the last breakpoint at which we
+    ///   already prefilled + checkpointed within this call (or
+    ///   `cache_read` when no breakpoints lie between `cache_read`
+    ///   and the un-breakpointed tail).
+    ///
+    /// **Empty-suffix guard.** If `compute_l_hit` returns
+    /// `new_tokens.len()` (a perfect-prefix match), `cache_read` is
+    /// backed off to the next-smaller breakpoint so the predictor
+    /// always sees at least one token. Breakpoints that land at
+    /// exactly `new_tokens.len()` are excluded from the chunked
+    /// prefill for the same reason — we only checkpoint at
+    /// breakpoints strictly inside the prompt body.
     ///
     /// This function touches the KV cache but nothing else on `self`
     /// beyond the engine.
-    fn kv_setup_for_call(
+    fn kv_setup_and_chunk_prefill(
         &mut self,
         new_tokens: &[Token],
         new_breakpoints: &[usize],
-    ) -> (Vec<Token>, usize) {
-        let l_hit = match self.prefix_cache.as_ref() {
+    ) -> Result<(Vec<Token>, usize, usize), SessionError> {
+        let l_hit_raw = match self.prefix_cache.as_ref() {
             Some(cache) if !cache.prev_tokens.is_empty() => {
                 compute_l_hit(&cache.prev_tokens, new_tokens, new_breakpoints)
             }
             _ => 0,
         };
-        if l_hit > 0 {
-            // Narrow the KV cache to the reused prefix. Anything past
-            // `l_hit` on seq 0 (old generation + old suffix) is dropped
-            // so the resuming prefill can write the new suffix into
-            // fresh positions.
-            self.engine.memory_seq_rm(0, l_hit as i32, -1);
+
+        // Empty-suffix guard: if the cache covers the entire new
+        // prompt, the predictor would receive an empty token slice
+        // (panic on construction). Back off to the next-smaller
+        // breakpoint so at least one token survives for the predictor.
+        let cache_read = if l_hit_raw == new_tokens.len() {
+            new_breakpoints
+                .iter()
+                .rev()
+                .find(|&&bp| bp < l_hit_raw && bp > 0)
+                .copied()
+                .unwrap_or(0)
         } else {
-            // Full re-prefill: wipe everything.
+            l_hit_raw
+        };
+
+        // Restore (or full-clear on no-cache / fallback path).
+        let mut effective_cache_read = cache_read;
+        if cache_read > 0 {
+            match self.engine.restore_to(0, cache_read as i32) {
+                Ok(()) => {}
+                Err(_e) => {
+                    #[cfg(feature = "axum")]
+                    tracing::debug!(
+                        cache_read,
+                        error = %_e,
+                        "checkpoint missing; falling back to full reprefill",
+                    );
+                    self.engine.memory_clear();
+                    effective_cache_read = 0;
+                }
+            }
+        } else {
             self.engine.memory_clear();
         }
-        let suffix = new_tokens[l_hit..].to_vec();
-        (suffix, l_hit)
+
+        // Chunked prefill at every breakpoint strictly between
+        // `effective_cache_read` and `new_tokens.len()`. Each chunk
+        // gets a checkpoint so the next turn can rewind to that
+        // boundary lossless.
+        let mut prefill_start = effective_cache_read;
+        for &bp in new_breakpoints.iter().filter(|&&bp| {
+            bp > effective_cache_read && bp < new_tokens.len()
+        }) {
+            if bp > prefill_start {
+                self.engine
+                    .prefill_chunk(
+                        &new_tokens[prefill_start..bp],
+                        prefill_start,
+                        0,
+                    )
+                    .map_err(|e| SessionError::Decode(format!("{e}")))?;
+                self.engine.checkpoint_pos(0, bp as i32);
+            }
+            prefill_start = bp;
+        }
+
+        let suffix = new_tokens[prefill_start..].to_vec();
+        Ok((suffix, effective_cache_read, prefill_start))
     }
 
     /// Build a [`Usage`] for one `complete_*` call. `Option` fields
@@ -991,7 +1066,8 @@ impl<B: Backend> Session<B> {
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
-        let (suffix, l_hit) = self.kv_setup_for_call(&tokens, &breakpoints);
+        let (suffix, cache_read, prefill_start) =
+            self.kv_setup_and_chunk_prefill(&tokens, &breakpoints)?;
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
@@ -1008,9 +1084,13 @@ impl<B: Backend> Session<B> {
         // the predictor does.
         let mut generated_count: usize = 0;
         let mut text = String::new();
-        let mut predictor = if l_hit > 0 {
-            self.engine
-                .predict_pieces_resuming(suffix, l_hit, 0, predict_opts)
+        let mut predictor = if prefill_start > 0 {
+            self.engine.predict_pieces_resuming(
+                suffix,
+                prefill_start,
+                0,
+                predict_opts,
+            )
         } else {
             self.engine.predict_pieces(suffix, predict_opts)
         };
@@ -1024,8 +1104,9 @@ impl<B: Backend> Session<B> {
 
         let trimmed = trim_eos(&text, &self.engine).to_string();
 
-        self.record_cache_hit(tokens, breakpoints, l_hit);
-        let usage = Self::make_usage(prompt_tokens, l_hit, generated_count);
+        self.record_cache_hit(tokens, breakpoints, cache_read);
+        let usage =
+            Self::make_usage(prompt_tokens, cache_read, generated_count);
         self.record_usage(usage);
 
         Ok(trimmed)
@@ -1074,15 +1155,16 @@ impl<B: Backend> Session<B> {
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
-        let (suffix, l_hit) = self.kv_setup_for_call(&tokens, &breakpoints);
+        let (suffix, cache_read, prefill_start) =
+            self.kv_setup_and_chunk_prefill(&tokens, &breakpoints)?;
 
         // Streaming: the cache must be updated BEFORE the predictor
         // borrows `&mut self.engine`, because the returned stream
         // holds that borrow for the lifetime of iteration. Usage
         // follows the same ordering — output count stays 0 because we
         // can't count pieces from here.
-        self.record_cache_hit(tokens, breakpoints, l_hit);
-        let usage = Self::make_usage(prompt_tokens, l_hit, 0);
+        self.record_cache_hit(tokens, breakpoints, cache_read);
+        let usage = Self::make_usage(prompt_tokens, cache_read, 0);
         self.record_usage(usage);
 
         let mut eos_pieces: std::collections::BTreeSet<String> =
@@ -1111,9 +1193,13 @@ impl<B: Backend> Session<B> {
             deferred_grammar: deferred_grammar.clone(),
         };
 
-        let predictor = if l_hit > 0 {
-            self.engine
-                .predict_pieces_resuming(suffix, l_hit, 0, predict_opts)
+        let predictor = if prefill_start > 0 {
+            self.engine.predict_pieces_resuming(
+                suffix,
+                prefill_start,
+                0,
+                predict_opts,
+            )
         } else {
             self.engine.predict_pieces(suffix, predict_opts)
         };
@@ -1149,7 +1235,8 @@ impl<B: Backend> Session<B> {
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
-        let (suffix, l_hit) = self.kv_setup_for_call(&tokens, &breakpoints);
+        let (suffix, cache_read, prefill_start) =
+            self.kv_setup_and_chunk_prefill(&tokens, &breakpoints)?;
 
         // Pieces we drop from the surfaced output: the primary EOS,
         // the EOT (if distinct), every extra-EOS the model declares
@@ -1227,9 +1314,13 @@ impl<B: Backend> Session<B> {
         let collect_token_dump = false;
         let mut token_dump: Vec<(Token, String)> = Vec::new();
 
-        let mut predictor = if l_hit > 0 {
-            self.engine
-                .predict_pieces_resuming(suffix, l_hit, 0, predict_opts)
+        let mut predictor = if prefill_start > 0 {
+            self.engine.predict_pieces_resuming(
+                suffix,
+                prefill_start,
+                0,
+                predict_opts,
+            )
         } else {
             self.engine.predict_pieces(suffix, predict_opts)
         };
@@ -1273,8 +1364,9 @@ impl<B: Backend> Session<B> {
         // Cache + usage bookkeeping, then grammar-violation check.
         // Check last so a violation still records the work that was
         // done — usage numbers are correct either way.
-        self.record_cache_hit(tokens, breakpoints, l_hit);
-        let usage = Self::make_usage(prompt_tokens, l_hit, generated_count);
+        self.record_cache_hit(tokens, breakpoints, cache_read);
+        let usage =
+            Self::make_usage(prompt_tokens, cache_read, generated_count);
         self.record_usage(usage);
 
         if forced_tool_call
@@ -1357,7 +1449,7 @@ impl<B: Backend> Session<B> {
         Ok(CallOutcome {
             blocks,
             prompt_tokens,
-            cache_read_tokens: l_hit,
+            cache_read_tokens: cache_read,
             generated_tokens: generated_count,
             stop_reason,
             stop_sequence,
