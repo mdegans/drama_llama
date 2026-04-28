@@ -61,7 +61,11 @@ impl MoefluxEngine {
             experts_per_tok,
             use_2bit,
         )?;
-        Ok(Self { decoder, model })
+        Ok(Self {
+            decoder,
+            model,
+            probe_hook: None,
+        })
     }
 
     /// Open a moeflux engine from a single parent directory using the

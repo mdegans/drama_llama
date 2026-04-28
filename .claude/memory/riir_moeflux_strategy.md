@@ -67,8 +67,8 @@ Out (stays as-is):
 | 3 | Forward pass bottom-up: embedding, RMSNorm, RoPE, full attn, linear attn, MoE router, MoE dispatch, LM head — diff-tested per kernel | 8–16h |
 | 4 | Top-level: `eval_prompt`, `eval_token`, `memory_*`, `state_save`/`load` | 4–8h |
 | 5 | API stabilization, drama_llama full test run | 2–4h |
-| 6 | Cutover: delete C, move shaders, squash | 1–2h |
-| 7 | Post-cutover (separate PRs): typed `memory_seq_rm`, multi-Ctx (now: `g_deferred` + `layer_cache` together), runtime variant dispatch, expanded coverage | 4–8h |
+| 6 | Cutover: gate C behind `diff-oracle` cargo feature, move shaders to `crates/moeflux/shaders/` (`include_str!`-embedded), delete `metal_infer/main.m`, squash riir | 1–2h |
+| 7 | Post-cutover (separate PRs): typed `memory_seq_rm`, multi-Ctx (now: `g_deferred` + `layer_cache` together), runtime variant dispatch, expanded coverage, parallel-`Ctx` benchmarking for the Council | 4–8h |
 
 Total: 28–48h focused work.
 
@@ -193,6 +193,18 @@ The remaining gap to C is dominantly host↔GPU staging cost, NOT
 specific kernels left on CPU. Two natural next slices:
 
 ## Suggested next-session order
+
+**Pivot 2026-04-28** (post-5d-9): the single-session-perf hunt
+effectively concluded at 5d-9. Remaining `__psynch_cvwait` is
+inherent serialization between K-expert dispatch and the next
+layer's input, and may not be reducible further without
+restructuring the GPU pipeline more aggressively than the diff-
+oracle floor allows. The downstream Council use case benefits more
+from running multiple `Ctx`s in parallel (estimated 0.6–0.9× per
+Ctx when 2 share the GPU; aggregate 1.2–1.8× over 1 Ctx) than from
+squeezing the last few % out of single-session decode. The
+"single-session next lever" candidates below are kept for context
+but should not be picked up unless a specific consumer needs them.
 
 - **Chained CMD3 → next layer normed (the original 4f-perf)** —
   C path infer.m:5668-5764: CMD3 emits `moe_combine_residual` +

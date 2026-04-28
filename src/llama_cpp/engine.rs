@@ -51,7 +51,11 @@ impl LlamaCppEngine {
             context_params.unwrap_or(unsafe { llama_context_default_params() });
         let decoder =
             LlamaCppDecoder::new(&mut model, context_params, numa_strategy)?;
-        Ok(Self { decoder, model })
+        Ok(Self {
+            decoder,
+            model,
+            probe_hook: None,
+        })
     }
 
     /// Create a new engine from a model `path`. Default model and

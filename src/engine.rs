@@ -9,7 +9,7 @@
 use crate::{
     backend::{Backend, Decoder},
     predictor::{CandidatePredictor, PiecePredictor, TokenPredictor},
-    PredictOptions, Predictor, Token,
+    PredictOptions, Predictor, ProbeHook, Token,
 };
 
 use std::num::NonZeroUsize;
@@ -29,16 +29,43 @@ use std::num::NonZeroUsize;
 /// `Engine<B>` is `Send` whenever `B::Decoder` and `B::Model` are —
 /// which they are by `Backend`'s associated-type bounds. No manual
 /// unsafe impl needed; auto-derive does the right thing.
-#[derive(Debug)]
 pub struct Engine<B: Backend> {
     pub(crate) decoder: B::Decoder,
     /// The model. Public so callers (e.g. Session) can tokenize, look
     /// up special tokens, and render chat templates without going
     /// through Engine forwarding methods.
     pub model: B::Model,
+    /// Optional per-token probe-mode hook. See [`crate::ProbeHook`]
+    /// and [`Self::set_probe_hook`].
+    pub(crate) probe_hook: Option<Box<dyn ProbeHook>>,
+}
+
+impl<B: Backend> std::fmt::Debug for Engine<B>
+where
+    B::Decoder: std::fmt::Debug,
+    B::Model: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("decoder", &self.decoder)
+            .field("model", &self.model)
+            .field("probe_hook", &self.probe_hook.as_ref().map(|_| "Box<dyn ProbeHook>"))
+            .finish()
+    }
 }
 
 impl<B: Backend> Engine<B> {
+    /// Install (or remove) a per-token probe-mode hook. The hook is
+    /// invoked synchronously inside [`crate::TokenPredictor`]'s
+    /// iterator after each token is sampled; see [`crate::ProbeHook`]
+    /// for the contract. Pass `None` to clear an installed hook.
+    pub fn set_probe_hook(
+        &mut self,
+        hook: Option<Box<dyn ProbeHook>>,
+    ) {
+        self.probe_hook = hook;
+    }
+
     /// Context length (tokens).
     pub fn n_ctx(&self) -> u32 {
 self.decoder.n_ctx()

@@ -91,6 +91,9 @@ pub use sidecar::{
 mod engine;
 pub use engine::Engine;
 
+mod probe;
+pub use probe::{ProbeCtx, ProbeHook};
+
 mod predictor;
 pub use predictor::{
     CandidatePredictor, PiecePredictor, PredictOptions, Predicted, Predictor,

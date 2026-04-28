@@ -687,6 +687,14 @@ impl<'engine, B: Backend> Iterator
             self.options.sample_options.modes.push(promoted.grammar);
         }
 
+        if let Some(hook) = self.inner.engine.probe_hook.as_mut() {
+            hook.on_token(crate::ProbeCtx {
+                token: next_token,
+                n_cur: self.inner.n_cur,
+                sample_options: &self.options.sample_options,
+            });
+        }
+
         self.inner.record_choice(next_token);
 
         Some(next_token)
