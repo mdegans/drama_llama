@@ -176,6 +176,7 @@ to the C path. Slices land here, not under Phase 4.
 | riir after 5d-4 | 5.16 | 4.88 | GPU-buf K-expert inputs; +2-5% |
 | riir after 5d-5 | 5.58 | 5.38 | pread direct into shared-storage; +8-10% |
 | riir after 5d-6 (a + b combined) | 6.75 | 7.53 | parallel pread + speculative prefetch + two-set MoE data; **cold +21%, warm +40%** vs 5d-5; warm essentially lands in the plan's 7-9 tok/s parity target band (C path warm = 8.70). Three Apollo/internet/jazz essays @ 512 max_tokens, M2 Max, --seed 42; cold = 1st run on fresh server, warm = 2nd / 3rd on same Session (7.53 / 7.06 tok/s respectively, avg 7.30). Bench landed 2026-04-28 at end of 5d-6 session; not split per-slice because the two changes were too entangled to A/B cleanly. |
+| riir after 5d-7 (a + b combined) | 7.45 | 7.36 | Apollo essay × 3 same-prompt sequential @ 512 max_tokens, M2 Max, --seed 42; cold = 1st on fresh server (OS page cache warm from prior session — not strictly cold), warm = avg of runs 2+3 on same Session (7.30 / 7.42, very low variance). **Warm essentially flat vs 5d-6** (7.36 vs 7.53, within noise). The architectural signal is good: Activity Monitor shows GPU at ~50% (up from ~40% on C, confirming GPU SDPA fast path is firing), CPU at ~180% (similar to C), per-token kernel work overlapping cleanly. The plan's CMD2-fold-frees-CPU framing didn't translate into tok/s because the CPU was already busy on per-head Q/K rms_norm + RoPE + memcpys, not just SDPA — we lifted GPU utilization but didn't reduce critical-path wall time. Slice is **correctness-only on warm**; next perf lever per the plan's bias check is chained CMD3 → next-layer normed (≈5%, the original 4f-perf). |
 
 Re-profile after 5d-1 (samply, 26s of generation):
 - `__psynch_cvwait` 41.7% — *good*: GPU is the wait, not the work
@@ -191,14 +192,6 @@ specific kernels left on CPU. Two natural next slices:
 
 ## Suggested next-session order
 
-- **Bench 5d-7a + 5d-7b** — landed 2026-04-28; perf delta TBD.
-  Mike runs blallama A3B essay manually; capture cold/warm tok/s
-  and update the perf log + the 5d-7a/5d-7b rows in the Phase 5
-  table. The plan's framing (CMD2-fold, not host-transfer-
-  elimination) is also worth bias-checking once numbers land —
-  if 5d-7b is flat, the framing was wrong and chained CMD3 (next
-  bullet) becomes the next candidate. Also worth checking
-  Activity Monitor's CPU/GPU split toward C's ~40% GPU on A3B.
 - **Chained CMD3 → next layer normed (the original 4f-perf)** —
   C path infer.m:5668-5764: CMD3 emits `moe_combine_residual` +
   `rms_norm_sum_sq` + `rms_norm_apply_bf16` so the next layer's
@@ -206,13 +199,22 @@ specific kernels left on CPU. Two natural next slices:
   `complete_deferred_experts_into` does a GPU→host→GPU dance to
   hand off between layers; chaining makes it a no-op. Slice 5d-2
   already structurally enabled this (input rms_norm reads
-  buffers.input directly). Estimated ~5%.
+  buffers.input directly). Estimated ~5%. **Promoted to first
+  candidate** after 5d-7 came in flat on warm — the plan's
+  CMD2-fold framing was wrong: GPU lifted to ~50% (was ~40% on
+  C) but didn't reduce critical-path wall time because the CPU
+  was already busy on per-head norm + RoPE + memcpys, not just
+  SDPA. The win we paid for is real (GPU SDPA fast path bit-
+  matches C and fires on the right gate), it just doesn't
+  convert to tok/s on its own.
 - **GPU per-head Q/K rms_norm + RoPE** — out of scope for 5d-7
   per the C path's shape (C also keeps these on CPU, mirroring
   the same memcpy back to GPU buffers). Future GPU norm/RoPE
   fusion is the strategy doc's "eliminate per-layer host
-  transfers" claim — bigger surgery. Worth revisiting once the
-  CMD3 chain lands and we have a clearer picture of what's left.
+  transfers" claim — bigger surgery. **More attractive after
+  5d-7**: GPU has headroom (50% util), CPU is what's actually on
+  the critical path. Probably the second-biggest remaining lever
+  after the CMD3 chain.
 - **9f (LZ4 + 2-bit + expert caches)** — pread is 30.6% of CPU.
   An LRU expert cache would lift absolute throughput on both
   sides. Probably do this as a Phase 6/7 unification.
