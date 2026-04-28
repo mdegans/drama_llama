@@ -15,9 +15,7 @@ llama-cpp-sys-3 = { version = "0.7", optional = true }
 # own `moeflux` feature wraps the platform gate so cross-platform builds
 # still work via `--no-default-features`. Pinned to an exact pre-release
 # version since the API is unstable until 0.1.0 final.
-# Path-dep during Phase 7 development. Switch back to `version = "=0.1.0-pre.2"`
-# (or the published successor) before any drama_llama publish.
-moeflux = { path = "../moeflux/crates/moeflux", optional = true }
+moeflux = { version = "=0.1.0-pre.2", optional = true }
 tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
 
 derive_more = { version = "1", features = ["from"] }
