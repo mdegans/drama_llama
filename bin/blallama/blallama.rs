@@ -306,24 +306,31 @@ mod llama_cpp_run {
             }
         };
 
-        let (session, response, elapsed) = spawn_blocking_or_bust(move || {
-            let start = std::time::Instant::now();
-            let response = session.complete_response(&prompt).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(AnthropicError::Unknown {
-                        code: Some(500.try_into().unwrap()),
-                        message: e.to_string(),
-                    }),
-                )
-            })?;
-            let elapsed = start.elapsed();
-            Ok((session, response, elapsed))
-        })
-        .await?;
+        // Closure returns the session in *both* arms so it can be
+        // restored to the lock — otherwise a `complete_response` error
+        // drops it and the next request reloads from disk. See
+        // `is_reusable_after` for the reuse-vs-reload classification.
+        let (session, result, elapsed) =
+            spawn_blocking_or_bust(move || {
+                let start = std::time::Instant::now();
+                let result = session.complete_response(&prompt);
+                (session, result, start.elapsed())
+            })
+            .await;
+        match &result {
+            Ok(_) => {
+                lock.replace(session);
+            }
+            Err(e) if is_reusable_after(e) => {
+                lock.replace(session);
+            }
+            Err(_) => {
+                // Drop session; next request will reload.
+            }
+        }
 
+        let response = result.map_err(map_session_err)?;
         log_stats(&response.id, response.usage, elapsed);
-        lock.replace(session);
         Ok(Json(response))
     }
 
@@ -464,24 +471,29 @@ mod moeflux_run {
             }
         };
 
-        let (session, response, elapsed) = spawn_blocking_or_bust(move || {
-            let start = std::time::Instant::now();
-            let response = session.complete_response(&prompt).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(AnthropicError::Unknown {
-                        code: Some(500.try_into().unwrap()),
-                        message: e.to_string(),
-                    }),
-                )
-            })?;
-            let elapsed = start.elapsed();
-            Ok((session, response, elapsed))
-        })
-        .await?;
+        // See llama-cpp variant + `is_reusable_after` doc-comment for
+        // the reuse-vs-reload rationale.
+        let (session, result, elapsed) =
+            spawn_blocking_or_bust(move || {
+                let start = std::time::Instant::now();
+                let result = session.complete_response(&prompt);
+                (session, result, start.elapsed())
+            })
+            .await;
+        match &result {
+            Ok(_) => {
+                lock.replace(session);
+            }
+            Err(e) if is_reusable_after(e) => {
+                lock.replace(session);
+            }
+            Err(_) => {
+                // Drop session; next request will reload.
+            }
+        }
 
+        let response = result.map_err(map_session_err)?;
         log_stats(&response.id, response.usage, elapsed);
-        lock.replace(session);
         Ok(Json(response))
     }
 
@@ -691,6 +703,40 @@ fn map_session_err(
             message: e.to_string(),
         }),
     )
+}
+
+/// Decide whether a session is safe to reuse after `complete_response`
+/// returned this error variant. Reusable variants return the session
+/// to the lock so the next request can hit the prefix cache; non-
+/// reusable variants drop the session, forcing a reload — the
+/// pre-Phase-7 default that was applied unconditionally.
+///
+/// Default for unknown variants (added in future SessionError
+/// expansions) is **non-reusable**: erring on the side of correctness
+/// over the perf cost of a reload. New variants must be explicitly
+/// classified once their state implications are understood.
+fn is_reusable_after(err: &drama_llama::SessionError) -> bool {
+    use drama_llama::SessionError as E;
+    match err {
+        // Render / grammar-compile errors fire before any decode work
+        // touches the engine. State is untouched — safe to reuse.
+        E::ChatTemplate(_) | E::ToolChoice(_) | E::OutputConfig(_) => true,
+        // run_call invalidates its own prefix cache on grammar
+        // violation, so the session is internally consistent.
+        E::GrammarViolation { .. } => true,
+        // Backend prefill error (Phase 7's `SessionError::Decode`).
+        // Engine state may be dirty — but Session's
+        // kv_setup_and_chunk_prefill on the next call will memory_clear
+        // or restore_to a known-good snapshot, recovering before any
+        // generation runs. Reusable.
+        E::Decode(_) => true,
+        // Engine setup errors can't fire post-load (session is already
+        // built); if they ever do, drop and reload.
+        #[cfg(feature = "llama-cpp")]
+        E::LlamaCppEngine(_) => false,
+        #[cfg(all(feature = "moeflux", target_os = "macos"))]
+        E::MoefluxEngine(_) => false,
+    }
 }
 
 #[tokio::main]
