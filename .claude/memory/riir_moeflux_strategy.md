@@ -173,8 +173,7 @@ to the C path. Slices land here, not under Phase 4.
 | riir after 5d-3 | 5.04 | 4.67 | post-attn + shared-FFN cmdbuf merge; +3-5% |
 | riir after 5d-4 | 5.16 | 4.88 | GPU-buf K-expert inputs; +2-5% |
 | riir after 5d-5 | 5.58 | 5.38 | pread direct into shared-storage; +8-10% |
-| riir after 5d-6a | TBD | TBD | parallel K-expert pread (rayon, 8 threads); bench pending — Mike runs blallama A3B essay |
-| riir after 5d-6b | TBD | TBD | speculative prefetch + two-set MoE data; bench pending |
+| riir after 5d-6 (a + b combined) | 6.75 | 7.53 | parallel pread + speculative prefetch + two-set MoE data; **cold +21%, warm +40%** vs 5d-5; warm essentially lands in the plan's 7-9 tok/s parity target band (C path warm = 8.70). Three Apollo/internet/jazz essays @ 512 max_tokens, M2 Max, --seed 42; cold = 1st run on fresh server, warm = 2nd / 3rd on same Session (7.53 / 7.06 tok/s respectively, avg 7.30). Bench landed 2026-04-28 at end of 5d-6 session; not split per-slice because the two changes were too entangled to A/B cleanly. |
 
 Re-profile after 5d-1 (samply, 26s of generation):
 - `__psynch_cvwait` 41.7% — *good*: GPU is the wait, not the work
