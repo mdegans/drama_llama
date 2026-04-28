@@ -266,6 +266,15 @@ impl ChatTemplate {
     /// the returned `partial_texts` is empty and the full render is
     /// equivalent to [`render_with`](Self::render_with).
     ///
+    /// **Fail-open on partial errors.** If the full prompt renders
+    /// cleanly but a partial (e.g. the `AfterSystem` breakpoint's
+    /// "system-only, no user message" prompt) hits a template
+    /// `raise_exception` — Qwen3's "No user query found in messages."
+    /// is the canonical case — that breakpoint is silently dropped
+    /// from `partial_texts` rather than failing the whole call. The
+    /// caller loses cache reuse at that boundary; correctness is
+    /// preserved.
+    ///
     /// [`Session`]: crate::Session
     pub fn render_with_breakpoints(
         &self,
@@ -276,7 +285,16 @@ impl ChatTemplate {
         let breakpoints = collect_breakpoints(prompt);
         let mut partial_texts = Vec::with_capacity(breakpoints.len());
         for bp in breakpoints {
-            partial_texts.push(render_partial(self, prompt, opts, bp)?);
+            match render_partial(self, prompt, opts, bp) {
+                Ok(s) => partial_texts.push(s),
+                Err(_) => {
+                    // Drop this breakpoint — same fail-open posture
+                    // tokenize_with_breakpoints uses for non-prefix-
+                    // safe partials. A breakpoint we can't render
+                    // can't be tokenized either, so the
+                    // partial_texts slot is unrecoverable.
+                }
+            }
         }
         Ok(RenderedWithBreakpoints {
             text,
