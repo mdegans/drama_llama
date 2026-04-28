@@ -1,17 +1,22 @@
-# Plan — Logging callback on `TokenPredictor` for canary-suite cross-validation
+# Plan — enrich `ProbeHook` for canary-suite cross-validation
 
 **Captured 2026-04-28** at end of Phase 7 session, after the prefix-
 cache landing freed up cycles for probe work. Companion to the
 [Agora canary-suite thread](2659c81c-b76c-48d1-ab53-79e429593110) and
 [`provider_trust_discipline.md`](provider_trust_discipline.md).
 
+**Refined 2026-04-28 (same session)** after Mike's feedback: don't
+add a parallel `LoggingCtx` / `LoggingTokenPredictor`. Enrich the
+existing `ProbeHook` / `ProbeCtx`. Use a per-hook self-declared
+`snapshot_opts` to gate capture cost so consumers that don't need the
+rich data (blallama's existing JSONL timestamper) don't pay for it.
+
 ## Why this exists
 
-The current `ProbeHook` (callback on `Engine`) fires *after* the
-sampling chain runs (`predictor.rs:690`). It carries `(token, n_cur,
-sample_options)` — enough for the JSONL writer in blallama's
-`--probe-out`, but **not enough for cross-validation between external
-behavior and internal disposition**.
+The current `ProbeHook` (`Engine::set_probe_hook`, fired in
+`predictor.rs:690`) carries `(token, n_cur, sample_options)`. Enough
+for blallama's `--probe-out` JSONL timestamps; **not enough for
+cross-validation between external behavior and internal disposition**.
 
 Cross-validation needs the *pre-everything* candidates: the model's
 raw distribution before repetition penalty, before the grammar /
@@ -23,165 +28,162 @@ probe sees. The whitespace mass would only be visible in the
 pre-grammar distribution. Filter it out and we measure the wrapper,
 not the model.
 
-The lightweight `ProbeHook` is the right shape for production
-telemetry. The richer capture belongs in the predictor stack.
-
 ## Design
 
-### Wrap-and-augment, not a new predictor
+### One hook, two appetites
 
-The predictor stack is already a series of wrappers:
-
-```
-CandidatePredictor   yields Candidates
-└─ TokenPredictor    yields Token       [owns the candidate→sample step]
-   └─ PiecePredictor yields String
-      └─ Predictor   yields Predicted { token, piece }
-```
-
-Each wrapper accesses the inner's state. The natural place to
-capture pre-grammar candidates + sampled state is **inside
-`TokenPredictor::next()`**, between `inner.next()` (which yields
-`Candidates`) and `candidates.sample_token(...)` (which consumes
-them and returns the sampled token).
-
-So: don't build a parallel `LoggingTokenPredictor`. Just add an
-**optional callback** on `TokenPredictor`. Callback fires once per
-token, receives a `LoggingCtx<'_>` borrow with pre-grammar snapshot
-+ sampled state, returns nothing. Consumers (JSONL writer, in-memory
-collector, refusal-mass counter) close over whatever they want to
-record.
+Keep `ProbeHook` as the single hook trait. Extend `ProbeCtx` with
+optional rich fields. Add a self-declared appetite method on the
+trait so cheap-path consumers don't pay snapshot cost:
 
 ```rust
-// Builder method.
-impl TokenPredictor {
-    pub fn with_logging(
-        mut self,
-        cb: Box<dyn FnMut(&LoggingCtx<'_>) + Send>,
-    ) -> Self { self.logging_cb = Some(cb); self }
+pub trait ProbeHook: Send {
+    fn on_token(&mut self, ctx: ProbeCtx<'_>);
+
+    /// Self-declared snapshot appetite. Default `None` → predictor
+    /// skips the per-token softmax/sort entirely. Override to `Some`
+    /// to opt into rich capture (canary suite, internal-disposition
+    /// probes). Probed once per `next()` call; cheap to call.
+    fn snapshot_opts(&self) -> Option<SnapshotOpts> { None }
+}
+
+pub struct SnapshotOpts {
+    /// Top-K cap. Default 20. Refusal-class probes may want 100+.
+    pub top_k: NonZeroUsize,
+    /// Floor below which candidates are dropped from the snapshot.
+    /// Default 0.005.
+    pub p_threshold: f32,
+    /// Compute full-vocab entropy each step. Default true. Set false
+    /// to skip the extra full-vocab pass when entropy isn't needed.
+    pub compute_entropy: bool,
 }
 ```
 
-`PiecePredictor` and `Predictor` (the top-level wrappers) get
-matching `with_logging` builder methods that plumb the closure
-through to their inner `TokenPredictor`. Caller-facing API is
-uniform across the stack.
+### Enriched `ProbeCtx`
 
-### Snapshot + ctx — `LoggingCtx`
+Existing fields preserved (`token`, `n_cur`, `sample_options`) so
+existing impls (`JsonlProbeRecorder` in blallama) compile unchanged
+after adding the new ones. New fields:
 
 ```rust
-pub struct LoggingCtx<'a> {
-    /// 0-indexed position in the generated sequence.
-    pub generation_index: u32,
-    /// Absolute KV position the token will land at.
+#[non_exhaustive]
+#[derive(Serialize)]
+pub struct ProbeCtx<'a> {
+    /// The token actually sampled (post-chain). Existing field.
+    pub token: Token,
+    /// Position the token will land at on the next decode step.
+    /// Existing field.
     pub n_cur: usize,
-
-    /// Pre-everything candidates snapshot. `top_k` sorted by descending logit
-    /// (post-softmax). Truncated to the configured K + threshold floor.
-    pub snapshot: &'a Snapshot,
-
-    /// The token actually sampled (post-chain). May or may not be in
-    /// `snapshot.top_k`.
-    pub sampled_token: Token,
-    /// Pre-grammar probability of the sampled token. If a low-prob token
-    /// got pushed through by grammar / deny, this is small — the load-
-    /// bearing cross-validation signal.
-    pub sampled_p: f32,
-    /// Pre-grammar rank (1 = argmax). `None` when the sampled token wasn't
-    /// in the top-K AND we didn't pay for a full-vocab rank pass.
-    pub sampled_rank: Option<u32>,
-
-    /// Decoded piece for `sampled_token`. Empty for special / reserved
-    /// tokens that produce no visible bytes.
-    pub piece: &'a str,
-
-    /// Sampling chain config used to choose the token (same field as
-    /// existing `ProbeCtx` — analyzers may want to tag records with the
-    /// active sampling settings).
+    /// Sampling chain config. Existing field.
+    /// Skip from serde — grammar Arc/Mutex doesn't serialize cleanly,
+    /// and consumers who want a digest can pull it explicitly.
+    #[serde(skip)]
     pub sample_options: &'a SampleOptions,
+
+    /// Pre-everything candidates snapshot. `None` when the hook's
+    /// `snapshot_opts()` returned `None` — predictor skipped capture.
+    /// `Some` when capture ran; `top_k` sorted by descending p_softmax,
+    /// post-threshold.
+    pub snapshot: Option<&'a Snapshot>,
+    /// Pre-grammar probability of `token`. `None` when no snapshot;
+    /// `Some(0.0)` is a real value (token below threshold + outside
+    /// top-K).
+    pub sampled_p: Option<f32>,
+    /// Pre-grammar rank (1 = argmax). `None` when no snapshot OR when
+    /// the sampled token wasn't in the top-K. The methodology thread
+    /// agreed that `sampled_p` alone carries the load-bearing signal;
+    /// rank is bonus.
+    pub sampled_rank: Option<u32>,
+    /// Decoded piece for `token`. Empty for special / reserved tokens
+    /// that produce no visible bytes.
+    pub piece: &'a str,
+    /// 0-indexed position in the generated sequence (not counting
+    /// prefilled prompt tokens). Convenience for consumers building
+    /// per-position records.
+    pub generation_index: u32,
 }
 
+#[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     /// Top-K candidates, sorted by descending p_softmax, post-threshold.
     pub top_k: Vec<TokenData>,
-    /// Full-vocab entropy in nats. Computed once before snapshot truncation.
-    /// `None` when the consumer disabled the entropy pass for perf.
+    /// Full-vocab entropy in nats. `None` when `compute_entropy = false`.
     pub entropy: Option<f32>,
     /// Sum of `p_softmax` over `top_k`.
     pub top_k_cumulative_mass: f32,
 }
 ```
 
-### Snapshot capture utility on `Candidates`
+Reference-type ctx is fine — existing hook impls already clone owned
+fields into channel messages (`ProbeMsg::Token { ... }`). Hooks that
+want owned data clone what they need; hooks that process
+synchronously borrow.
+
+### `Candidates::capture_snapshot`
 
 ```rust
 impl Candidates {
     /// Capture a top-K snapshot of the pre-everything distribution
-    /// without consuming `self`. Cost: full-vocab softmax + partial
-    /// sort to top-K (reuses `Candidates::partial_sort` if applicable).
-    /// `entropy` adds one full-vocab pass; opt out via `compute_entropy = false`.
-    /// `always_include` ensures the named token appears in `top_k` even
-    /// if it falls below the threshold or outside the top-K.
-    pub fn capture_snapshot(
-        &self,
-        k: NonZeroUsize,
-        p_threshold: f32,
-        compute_entropy: bool,
-        always_include: Option<Token>,
-    ) -> Snapshot { ... }
+    /// without consuming `self`. Cost: full-vocab softmax (one pass)
+    /// + partial-sort to top-K (reuses existing partial-sort) +
+    /// optional second pass for entropy.
+    ///
+    /// Public — see CLAUDE.md style note: "almost everything is
+    /// public unless it's a potential footgun." This is just a
+    /// borrow + read.
+    pub fn capture_snapshot(&self, opts: &SnapshotOpts) -> Snapshot { ... }
 }
 ```
 
-Implementation note: `Candidates` already tracks softmax / sort state
-(`Sorted` enum, `softmax_applied_to: Option<NonZeroUsize>`). The
-snapshot must NOT mutate `self` — it operates on a borrow and reads
-raw logits / runs its own softmax internally. The pre-existing
-`Candidates::softmax(self) -> Self` is consuming, so this needs a
-sibling that takes `&self`. Adding it is straightforward — softmax is
-just `exp(logit_i - max) / sum`.
+Implementation: factor the softmax body out of the existing consuming
+`Candidates::softmax(self) -> Self` into a free helper that operates
+on `&[TokenData]` → `Vec<f32>` (or in-place on a Vec we own). Or write
+it inline — softmax is `let m = max(logits); exp(logit - m) / sum`.
+Fewer lines than refactoring. Pick whichever leaves `Candidates::softmax`
+intact for existing callers.
 
-### Pseudocode for the augmented `TokenPredictor::next`
+### Augmented `TokenPredictor::next`
+
+Surgery is contained:
 
 ```rust
 fn next(&mut self) -> Option<Self::Item> {
-    // Existing stop-sequence / context-bound checks.
-    if self.should_stop() { return None; }
+    // ... existing stop-sequence / context-bound checks ...
 
-    // Existing: get pre-everything candidates.
     let candidates = self.inner.next()?;
 
-    // NEW: snapshot only when a logging callback is installed.
-    let snapshot = self.logging_cb.is_some().then(|| {
-        candidates.capture_snapshot(
-            self.logging_opts.top_k,
-            self.logging_opts.p_threshold,
-            self.logging_opts.compute_entropy,
-            None, // sampled_token not known yet; resolve after sample
-        )
-    });
+    // Snapshot only when a hook declares appetite. Cheap probe of
+    // the hook trait avoids paying capture cost on production paths.
+    let snapshot = self.inner.engine.probe_hook
+        .as_ref()
+        .and_then(|h| h.snapshot_opts())
+        .map(|opts| candidates.capture_snapshot(&opts));
 
-    // Existing: run the sampling chain.
     let next_token = candidates.sample_token(...).unwrap();
 
-    // Existing: piece decode + deferred-grammar + ProbeHook fire +
-    // record_choice. (ProbeHook stays as today — separate channel.)
+    let piece = self.inner.engine.model.token_to_piece(next_token);
+    self.text.push_str(&piece);
 
-    // NEW: after sample, resolve sampled_p / sampled_rank against the
-    // snapshot, then invoke the logging callback.
-    if let (Some(snap), Some(cb)) =
-        (snapshot.as_ref(), self.logging_cb.as_mut())
-    {
-        let (sampled_p, sampled_rank) =
-            snap.resolve_sampled(next_token);
-        cb(&LoggingCtx {
-            generation_index: ...,
+    // ... existing deferred-grammar promotion ...
+
+    if let Some(hook) = self.inner.engine.probe_hook.as_mut() {
+        let (sampled_p, sampled_rank) = match snapshot.as_ref() {
+            Some(s) => {
+                let p = s.lookup_p(next_token);
+                let r = s.lookup_rank(next_token);
+                (Some(p), r)
+            }
+            None => (None, None),
+        };
+        hook.on_token(ProbeCtx {
+            token: next_token,
             n_cur: self.inner.n_cur,
-            snapshot: snap,
-            sampled_token: next_token,
+            sample_options: &self.options.sample_options,
+            snapshot: snapshot.as_ref(),
             sampled_p,
             sampled_rank,
             piece: &piece,
-            sample_options: &self.options.sample_options,
+            generation_index: (self.inner.n_decode - 1) as u32,
         });
     }
 
@@ -190,39 +192,18 @@ fn next(&mut self) -> Option<Self::Item> {
 }
 ```
 
-### Knobs — `LoggingOptions` (stored on `TokenPredictor` alongside the cb)
+Existing hook impls (`JsonlProbeRecorder`) compile unchanged — they
+only read `token`, `n_cur`, and `sample_options`. The new fields are
+ignored. New canary-suite hook impl overrides `snapshot_opts` and
+reads everything.
 
-```rust
-pub struct LoggingOptions {
-    /// Top-K cap. Default 20. Refusal-class probes may want 100+.
-    pub top_k: NonZeroUsize,
-    /// Floor below which candidates are dropped from the snapshot. Default 0.005.
-    pub p_threshold: f32,
-    /// Compute full-vocab entropy each step. Default true. Set false to skip
-    /// the extra full-vocab pass.
-    pub compute_entropy: bool,
-}
-```
+### No predictor surgery beyond TokenPredictor
 
-`with_logging` takes `(LoggingOptions, callback)` — or we provide
-a sensible default and a separate `with_logging_opts` setter.
-Default-and-setter pair feels lighter; matches existing builder
-style (`with_repetition`, `with_seed`, etc.).
-
-### Composition note
-
-`PiecePredictor::with_logging(opts, cb) -> Self` and
-`Predictor::with_logging(opts, cb) -> Self` plumb the call through
-to the inner `TokenPredictor`. Reflects the existing wrapping
-pattern; no new types needed past `TokenPredictor` level.
-
-### Coexistence with `ProbeHook`
-
-The Engine-level `ProbeHook` keeps firing as today — it's the
-lightweight per-token observer for production. The logging callback
-is opt-in per call (via builder), pays its capture cost only when
-set, and runs alongside the hook with no coupling. Different
-consumers, different surfaces, no coordination needed.
+Mike's wrap-and-augment observation: each predictor in the stack
+already accesses inner state. The hook fires inside `TokenPredictor`
+where pre-grammar candidates are in scope; `PiecePredictor` and
+`Predictor` need no changes — they wrap `TokenPredictor` and inherit
+the augmented hook firing for free.
 
 ## Out of scope this slice
 
@@ -230,101 +211,105 @@ consumers, different surfaces, no coordination needed.
   `sample_token`'s fold). Larger surgery into sample.rs; not required
   for the first cross-validation experiment, which only needs pre vs
   sampled. Worth its own plan once records are flowing.
-- **Position-role auto-tagging from grammar**. Caller post-tags from
-  whatever schema knowledge they have. Auto-derivation requires
-  reaching into the grammar matcher state — defer until a consumer
-  actually wants it. (`PositionRole` enum still lands in `probe.rs`
-  for the canary-suite types unit, but `LoggingCtx` doesn't carry it
-  this slice — caller annotates downstream.)
+- **Position-role auto-tagging from grammar**. `PositionRole` enum
+  still lands in `probe.rs` for the canary-suite types unit; not
+  carried in `ProbeCtx` this slice. Caller post-tags from schema
+  knowledge. Auto-derivation requires reaching into the grammar
+  matcher state — defer until at least one consumer actually wants
+  it.
 - **Refusal-mass / saturated-agreement-mass primitives**. Tooling on
   top of records, not predictor surface. Build the capture first,
   build analysis on captured data, iterate without re-instrumenting.
-- **JSONL schema versioning beyond v2** for blallama's `--probe-out`.
-  Wait for actual consumer feedback (balerion's first cross-
-  validation run) before locking in.
-- **Full-vocab `sampled_rank` for tokens outside the snapshot top-K**.
-  Default `None` if the sampled token isn't in top-K. If a consumer
-  needs guaranteed rank, they can opt into `always_include_sampled`
-  on a follow-up — needs a snapshot extension that adds the sampled
-  token after sample_token completes. Defer; `sampled_p` alone
-  carries the load-bearing low-prob-flag signal.
+- **blallama `--probe-out` rich mode** (JSONL emit of the new fields).
+  Defer to a slice-2 follow-up. The current `JsonlProbeRecorder`
+  keeps writing its current schema; new canary recorder is a
+  separate impl. Rich JSONL is `serde_json::to_string(&ctx)` once
+  the consumer wants it.
+- **Snapshot reuse / buffer pooling**. ~240B per token at top_k=20.
+  Profile first; only optimize if it shows up.
 
-## Files Modified (estimated)
+## Files Modified
 
-- `src/probe.rs` — add `PositionRole` enum (kept here so the probe
-  module owns canary-suite types as a unit; not used in `LoggingCtx`
-  this slice).
-- `src/candidates.rs` — `Candidates::capture_snapshot(...)` on `&self`
-  + `Snapshot` struct + supplementary `softmax_borrowed` helper.
-- `src/predictor.rs` — `LoggingOptions`, `LoggingCtx`,
-  `TokenPredictor::with_logging` / `with_logging_opts`, snapshot+cb
-  wiring inside `TokenPredictor::next`. `PiecePredictor` and
-  `Predictor` get matching `with_logging` builder methods that plumb
-  through. Field on `TokenPredictor`: `logging_cb: Option<Box<dyn FnMut(&LoggingCtx<'_>) + Send>>`,
-  `logging_opts: LoggingOptions`.
-- `src/lib.rs` — re-export `LoggingCtx`, `LoggingOptions`, `Snapshot`,
-  `PositionRole`.
-- `bin/blallama/blallama.rs` (separate follow-up if this slice is
-  too big): new `--probe-mode {token,logging}` flag, new `ProbeMsg`
-  variant, JSONL serializer for `LoggingCtx`. Defer to a slice-2.
+- `src/probe.rs` — add `SnapshotOpts`, extend `ProbeCtx` fields, add
+  `ProbeHook::snapshot_opts` default-impl method, `#[derive(Serialize)]`
+  on the surface types, `PositionRole` enum (forward-looking, not
+  used in `ProbeCtx` this slice).
+- `src/candidates.rs` — `Snapshot` struct + `Candidates::capture_snapshot(&self, opts)`
+  + `Snapshot::lookup_p` / `lookup_rank` helpers + `#[derive(Serialize)]`
+  on `Snapshot` and (verify on) `TokenData`.
+- `src/predictor.rs` — augment `TokenPredictor::next` per the
+  pseudocode. ~10 lines of net change.
+- `src/lib.rs` — re-export `Snapshot`, `SnapshotOpts`.
+
+No changes to `Engine` setup API; no changes to `PiecePredictor` /
+`Predictor`; no changes to the existing `JsonlProbeRecorder` (it
+keeps writing the same schema).
 
 ## Tests
 
 - `src/candidates.rs` unit tests for `capture_snapshot`:
-  - Top-K with K < vocab returns exactly K entries (or fewer after
-    threshold).
-  - p_threshold drops sub-threshold entries from the snapshot.
+  - Top-K with K < vocab returns at most K entries.
+  - `p_threshold` drops sub-threshold entries from the snapshot.
   - `top_k_cumulative_mass` equals sum of returned p's.
   - `entropy` matches a known-distribution reference (uniform vocab
-    gives `log(V)`; one-hot gives 0).
-  - `&self` borrow does not mutate sort/softmax state.
-- `tests/logging_predictor.rs` (`#[ignore = "requires model"]`):
-  - Run a 5-token greedy generation with and without the logging
-    callback installed; assert sampled tokens identical (the logging
-    path must not perturb sampling).
-  - Run a Likert-shaped probe under grammar-constrained generation;
-    assert `sampled_rank > 1` happens at least once when the model's
-    argmax disagrees with the grammar choice (proves the
-    cross-validation primitive captures real signal).
+    gives `log(V)`; one-hot gives 0; `compute_entropy = false`
+    yields `None`).
+  - `&self` borrow does not mutate sort/softmax state on `Candidates`.
+- `tests/probe_hook.rs` extension (`#[ignore = "requires model"]`):
+  - Run greedy generation with a no-snapshot hook and a snapshot
+    hook on the same prompt + seed; assert sampled tokens identical
+    (capture must not perturb sampling).
+  - Likert-shaped probe under grammar-constrained generation; assert
+    `sampled_rank > 1` happens at least once when grammar pushes past
+    argmax (proves the cross-validation primitive captures real
+    signal). Currently `tests/probe_hook.rs` exists; extend rather
+    than create-new.
+- Add a tiny `Send` smoke test for the trait — `Box<dyn ProbeHook>`
+  must remain `Send`-able after the `snapshot_opts` addition.
 
 ## Risk / open questions
 
-1. **Performance**: per-token softmax over ~250K vocab is O(V); top-K
-   selection is O(V log K) via partial-sort. Measure on A3B (~8 tok/s
-   warm); if it drops below ~5 tok/s with capture on, the capture is
-   too expensive and we'd need a partial-sort path that operates only
-   on raw logits with deferred softmax. Snapshot cost is paid only
-   when the callback is set — production tok/s untouched.
-2. **Full-vocab entropy is the costly piece**. If it dominates,
-   `compute_entropy = false` is a clean opt-out; default-on for
-   cross-validation precision, default-off for high-volume capture.
-3. **`Send` bound on the callback** is required because TokenPredictor
-   is held across the iterator's lifetime and may be moved across
-   threads (Tokio spawn_blocking, Rayon, etc.). Closure consumers in
-   blallama's writer task already implement `Send`.
-4. **`sample_token` consuming `Candidates` by value** is the reason
-   capture has to happen pre-call. Confirmed; no plan to refactor.
-5. **Snapshot allocation per token**. `top_k = 20` × `TokenData`
-   (12 bytes) = 240 bytes per token. Plus the `Vec` allocation.
-   Negligible per-call but worth noting. If it shows up on a profile,
-   reuse a buffer on TokenPredictor across calls.
+1. **Performance**: per-token full-vocab softmax + partial-sort over
+   ~250K vocab is O(V) + O(V log K). Measure on A3B (~8 tok/s warm)
+   with `compute_entropy = true`; if it drops below ~5 tok/s, default
+   `compute_entropy = false` and let canary set it explicitly. Mike's
+   guidance: capture cost is only paid when probing, so non-fatal.
+2. **`SampleOptions` serde**: existing serialize_grammar / deserialize
+   pair handles grammar Arc/Mutex via source-roundtrip. Easiest:
+   `#[serde(skip)]` on `sample_options` in `ProbeCtx`. If a digest
+   becomes useful, add `pub fn settings_digest(&self) -> ...` later.
+3. **Backwards compatibility**: `ProbeCtx` is `#[non_exhaustive]`
+   today, so adding fields is non-breaking. Existing match-on-fields
+   patterns (none in the codebase that I've seen) wouldn't be
+   affected anyway because `#[non_exhaustive]` already requires `..`.
+4. **`Send` bound on the callback**: trait already requires `Send`;
+   adding a default-impl method doesn't change that.
+5. **`TokenData` serde**: it's `#[repr(C)]` with three `f32`-shaped
+   fields — `Token`, `f32`, `f32`. `serde::Serialize` derive is
+   straightforward. Add `serde` derives in candidates.rs.
+6. **`sample_token` consuming `Candidates` by value** — confirmed; no
+   plan to refactor. Capture pre-call is correct.
+7. **Snapshot allocation per token**: ~240B at top_k=20. Negligible.
+   If profile shows it, reuse a `Vec<TokenData>` buffer on
+   TokenPredictor across calls — opt-in optimization later.
 
 ## Verification
 
 Cross-validation smoke test on Cogito (when 671B variant lands per
 the post-RIIR roadmap, or sooner on cogito-32b GGUF via llama-cpp):
 
-1. Run a known-refusal probe (politics in D&D framing per Mike's
+1. Implement a `CanaryRecorder` that overrides `snapshot_opts` to
+   `Some(SnapshotOpts { top_k: 100, p_threshold: 0.0, compute_entropy: true })`
+   and writes each `ProbeCtx` to a JSONL file via `serde_json`.
+2. Run a known-refusal probe (politics in D&D framing per Mike's
    note) under schema-constrained generation.
-2. Pass a callback that collects `LoggingCtx` snapshots.
 3. Inspect the rating-digit position: `sampled_p` should be small
    (grammar pushed past argmax) AND there should be visible
    whitespace-class mass in `snapshot.top_k` even though the emitted
    token is a digit.
-4. Compare to the same probe on Haiku (via balerion's external
-   path): if Haiku has `sampled_rank ≈ 1` and Cogito has `sampled_p
-   << top_k_cumulative_mass × 1/k`, the cross-validation methodology
-   produces the predicted signal.
+4. Compare to the same probe on Haiku via balerion's external path:
+   if Haiku has `sampled_rank ≈ 1` and Cogito has `sampled_p << ¹⁄ₖ`,
+   the cross-validation methodology produces the predicted signal.
 
 ## Why now (next session)
 
@@ -332,6 +317,6 @@ the post-RIIR roadmap, or sooner on cogito-32b GGUF via llama-cpp):
   unblocked on the infra side per the Agora thread comment dated
   2026-04-28T15:59:05 ("Probe work unblocks").
 - balerion is driving Phase 1 probe library expansion in parallel.
-  Having the logging callback land before the probe set is ready
-  means cross-validation can start the same week the probes do.
+  Having the enriched hook land before her probe set is ready means
+  cross-validation can start the same week the probes do.
 - The design is settled here. Implementation is a focused session.
