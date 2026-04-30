@@ -1,189 +1,143 @@
-# Cogito-V2 671B landing — continuation state
+# Cogito-V2 671B landing — first forward green
 
-Captured 2026-04-30 EOS. Mid-arc through the session-plan at
-`~/.claude/plans/squishy-wibbling-milner.md`.
+Captured 2026-04-30 (continuation session). The CPU MLA + MoE
+forward path landed end-to-end and produced coherent English on
+the first run. **Status: Phase H of the original session-plan
+(`~/.claude/plans/squishy-wibbling-milner.md`) reached green;
+GPU MLA is the next slice.**
 
-## What's landed (commits)
+## First-run result
 
-**moeflux** (`~/Projects/moeflux`, branch `main`):
-- `de2ba40` `variants: add Cogito-V2-Preview-671B feature flag`
-  — extended Variant struct (AttnKind, RouterKind, RopeKind,
-  SharedExpertGate, MlpKind enums; ~15 new fields). VARIANT block
-  for `model-cogito-v2-671b`. Static asserts gated on attn_kind.
-  moeflux-sys's build.rs now skips C compile gracefully when only
-  Rust-side variants are enabled. C-oracle test files file-level
-  cfg-gated. 3 variant unit tests green.
-- `80375ae` `tools: convert_cogito_v2.py — DeepSeek-V3 / Cogito-V2
-  weight converter` — self-contained MLX-4bit → moeflux on-disk
-  converter emitting the canonical
-  `parent/{mlx,artifacts,root/packed_experts}/` layout.
-- `c8d74ce` `moe_router + rope: noaux_tc routing + YaRN math for
-  DeepSeek-V3` — `noaux_tc_router_cpu` + 6 unit tests across both
-  modules; YaRN helpers (`yarn_get_mscale`,
-  `yarn_find_correction_range`, `compute_yarn_inv_freq`,
-  `apply_rotary_emb_yarn`) covering the math half of MLA's RoPE.
-  25 lib tests green on both Cogito and Qwen variants.
+```text
+prompt:  "Hello. How are you?"   (11 input tokens)
+output:  "I'm doing well, thanks! How"  (8 tokens, max_tokens cap)
+stop:    max_tokens
+```
 
-**drama_llama** (`~/Projects/drama_llama`, branch `v0.8.0`):
-- `a7fc646` `Cargo: add moeflux-model-cogito-v2-671b feature;
-  path-dep on local moeflux` — feature forwarding + architecture
-  audit memo.
-- `3b6391d` `memory: future-work note for unified MLX -> moeflux
-  converter`.
+Per-token /probe telemetry showed sensible distributions: token 3
+(" well") at p=0.90, entropy 0.51 — well-calibrated. No NaN, no
+word-salad, no thrashing.
+
+Throughput: ~12 s / token warm on M-series CPU at 8 P-cores,
+800% rayon utilization. Acceptable for debug; GPU MLA is a
+follow-up. Mike's call: "won't tell us if that holds over a long
+generation but it's a very good sign."
+
+## What landed this session (commits in flight)
+
+**moeflux** (`~/Projects/moeflux`, branch `main`, two commits):
+1. `LayerState::Mla` plumbing — variant added to enum, all match
+   arms across `state.rs` / `state_snapshot.rs` / `mod.rs` updated.
+   Snapshot v1 wire format doesn't encode MLA caches (typed
+   `MlaUnsupported` error; v2 wire format is post-cutover work).
+2. CPU forward path —
+   - `cpu_matvec.rs` (new): fused 4-bit dequant + matvec primitive
+     `dequant_matvec_4bit_cpu` (rayon-parallel over output rows),
+     bytes-input variant for packed-expert blobs, BF16 matvec for
+     the router gate. MLX 4-bit format (group-of-64 BF16 scale +
+     bias).
+   - `mla_attn_cpu.rs`: `mla_attn_layer_forward_cpu` impl. Naive
+     form — per-token decompresses `kv_b_proj @ latent[j]` for
+     every cached j. Folded form (precompute
+     `q_nope @ kv_b_proj_K`, `kv_b_proj_V @ V_combine`) is the
+     follow-up perf slice.
+   - `mlp_cpu.rs` (new): `dense_mlp_swiglu_cpu` (layers 0-2,
+     intermediate=18432) + `shared_expert_swiglu_cpu`
+     (intermediate=2048).
+   - `moe_cpu.rs` (new): `deepseek_moe_cpu` — BF16 router gate +
+     `noaux_tc_router_cpu` + per-expert SwiGLU on packed blobs from
+     `root/packed_experts/layer_NN.bin` + unconditional
+     shared-expert add (no gate, contrasts with Qwen).
+   - `mod.rs`: `ensure_mla_resources` (slim init, skips
+     `LayerWeightCache::build_all` which requires GQA-only
+     `q_proj`/`k_proj`/`v_proj` names) + `step_internal_mla_cpu`
+     (full host pipeline) + dispatch branch in `step_internal`.
+   - `tests/cogito_v2_smoke.rs` (new): end-to-end `Ctx::open` +
+     `eval_token` smoke against the real 671B weights.
+
+**drama_llama** (this repo, branch `v0.8.0`, one commit):
+- This memo replacing the previous "continuation state" with the
+  green outcome.
+
+## Test coverage added
+
+All `#[ignore]` smoke tests against the on-disk 671B; non-ignored
+unit tests are pure-arithmetic and run in <1 s:
+
+- `cpu_matvec::tests` (5 unit + 1 ignored): all-ones, zero-input,
+  bias-only, slice mismatch, alignment check, BF16 identity.
+  Ignored: `q_a_proj_smoke_against_real_weights`.
+- `mla_attn_cpu::tests`: ignored `mla_layer0_pos0_smoke`.
+- `mlp_cpu::tests`: ignored `dense_mlp_layer0_smoke`.
+- `moe_cpu::tests`: ignored `moe_layer3_smoke`.
+- `tests/cogito_v2_smoke.rs`: ignored
+  `cogito_v2_eval_token_smoke` (full single-token e2e via the
+  public `Ctx` API; ~12 s).
 
 ## On-disk artifacts
 
-Conversion ran with `tools/convert_cogito_v2.py` against
-`/Volumes/HF Models/models/hf/mlx-community/cogito-v2-preview-deepseek-671B-MoE-4bit/`.
-Output at `/Volumes/Temp Backup/models/blallama/cogito-v2-671b/`:
-- `mlx/` — tokenizer.json, tokenizer_config.json,
-  special_tokens_map.json, chat_template.jinja, config.json
-- `artifacts/model_weights.{bin,json}` — non-expert tensors with
-  the manifest `weight_file.rs` reads (1831 tensors, ~10 GB)
-- `root/packed_experts/layer_NN.bin` — 58 MoE layers (3..60),
-  ~6 GB each, ~340 GB total. layer_00.bin through layer_02.bin
-  do NOT exist (those layers are dense MLPs whose weights live in
-  the artifacts blob).
+`/Volumes/Temp Backup/models/blallama/cogito-v2-671b/`:
+- `mlx/` — tokenizer.json, chat_template.jinja, config.json
+- `artifacts/model_weights.{bin,json}` — 1831 tensors, ~10 GB
+- `root/packed_experts/layer_NN.bin` — 58 files (3..60),
+  ~340 GB total
 
-Conversion was running at session end; if you find the directory
-incomplete (missing layer_60.bin, partial last file), re-run the
-converter with `--skip-artifacts` to redo the experts only.
+352 GB on disk; verified end-to-end this session.
 
-## What's pending
+## Known follow-ups (next sessions)
 
-The remaining work (in suggested order):
+In suggested order:
 
-### 1. MLA forward kernel (Phase C)
+### 1. GPU MLA (next session — Mike already greenlit)
 
-Stub at `~/Projects/moeflux/crates/moeflux/src/riir/mla_attn_cpu.rs`
-returns `MlaForwardError::NotImplemented`. The forward shape is
-documented in the module-level docstring and in
-`~/Projects/drama_llama/.claude/memory/cogito_v2_architecture.md`.
+The CPU baseline is the diff oracle. Plan: write a Metal kernel for
+the MLA forward (per-head SDPA over decompressed K/V), reuse the
+existing `dequant_matvec_4bit_v3` pipeline for the projections.
+Validate against the CPU path token-by-token (the `/probe`
+telemetry gives per-token logit snapshots — bit-equal isn't the
+target since GPU softmax / reduction order will diverge, but
+top-1 and top-3 set equality at low temperature should hold).
 
-Concrete subtasks:
+### 2. Folded MLA form (perf slice)
 
-**1a. CPU 4-bit dequant primitive.** moeflux's existing kernels are
-GPU-side (`gpu_matvec.rs` etc.). The CPU MLA path needs a function
-that takes `(u32_packed_weights, bf16_scales, bf16_biases, shape)
--> Vec<f32>` so we can materialize the projection matrices. Reuse
-the `dequantize_*` logic from `expert_forward.rs` if it has a CPU
-path; otherwise port the MLX 4-bit dequant: groups of 64 weights
-share one BF16 scale + bias.
+Naive decompresses `kv_b_proj @ latent[j]` per cached position;
+folded form precomputes `q' = q_nope @ kv_b_proj_K_per_head`
+(shape `[num_heads, kv_lora_rank]`) once per token, then per
+cached j just does `q' · latent[j]`. ~60× speedup at long context.
+For first run we deliberately landed naive for clarity. Land
+this either before or alongside the GPU port.
 
-**1b. CPU matmul/matvec.** `f32_vec @ f32_matrix` for the
-projections (q_a, q_b, kv_a, kv_b, o_proj). Naive triple loop is
-fine; perf isn't load-bearing on CPU MLA.
+### 3. YaRN inv_freq caching
 
-**1c. MLA inner SDPA.** Per the docstring's pseudocode. Critical
-detail: the softmax_scale is `(1/sqrt(qk_head_dim)) * mscale²`
-where `mscale = yarn_get_mscale_full(factor, mscale, mscale_all_dim)`.
-For `factor=1` mscale is 1.0 and this collapses to vanilla SDPA.
+Currently `compute_yarn_inv_freq` runs per-token in
+`step_internal_mla_cpu`. Trivial to cache on `RsCtx` — microseconds
+on the wall clock but reduces per-token allocations.
 
-**1d. Wire MlaKvCache append + read.** `state.rs::MlaKvCache` is
-defined; integrate it into `LayerState` (currently just `FullAttn` /
-`LinearAttn`) — add `MlaAttn(MlaKvCache)` variant and update
-`alloc_layer_states`, `truncate`, `clear_all`, `is_full`,
-`pos_max`. **This will churn many match arms** — budget for the
-spread.
+### 4. Long-generation stability check
 
-### 2. Dense MLP path (Phase E)
+First run was 8 tokens. Mike flagged: "won't tell us if that holds
+over a long generation." Run a 200+ token generation, watch for
+degradation patterns (repetition, thrashing, magnitude drift on
+the residual stream as `cache_len` grows). Fold-vs-naive results
+should match if the math is right.
 
-For Cogito-V2 layers 0-2, run a single SwiGLU MLP with
-`intermediate=18432` (no routing, no shared expert). Existing
-expert-FFN kernel can be repurposed with a different shape parameter.
+### 5. Tokenizer / chat-template verification
 
-Tensor names: `model.layers.{0..2}.mlp.{gate,up,down}_proj.{weight,scales,biases}`.
+Worked on first try — but the special-token IDs in the variant
+config (`bos=0`, `eos=1`) were taken from the architecture audit,
+not empirically verified against the `tokenizer.json`. Sanity-check
+that `</s>` decodes back to id=1 and BPE round-trips a known
+prompt.
 
-### 3. MoE block composition (Phase E)
+### 6. Snapshot v2 wire format
 
-`post_attention_tail` in `linear_attn_forward.rs:~400+` does the
-composition for Qwen. For DeepSeek:
-- Use `noaux_tc_router_cpu` (already landed) instead of
-  `moe_router_cpu`.
-- Read `mlp.gate.weight` and `mlp.gate.e_score_correction_bias`
-  from artifacts.
-- Weighted sum over selected routed experts (read from
-  `root/packed_experts/layer_NN.bin`).
-- Add `shared_experts(hidden)` UNCONDITIONALLY (no sigmoid gate —
-  contrast with Qwen's gated path; selected via
-  `Variant::shared_expert_gate == Unscaled`).
+The existing `state_snapshot` v1 doesn't encode MLA's compressed
+latent + rope-K caches. Add a v2 format with MLA support. Not
+blocking blallama (which doesn't use snapshots for the main path)
+but will be needed once the Council reactor uses Cogito-V2.
 
-### 4. Forward orchestration (Phase G)
+### 7. Publish moeflux 0.1.0-pre.3
 
-`step_internal` in `mod.rs:~1045` dispatches to GPU full-attn or
-linear-attn. For first-run Cogito, the simplest landing is a
-parallel CPU-only entry point that bypasses the GPU pipeline
-entirely:
-
-```rust
-#[cfg(feature = "model-cogito-v2-671b")]
-fn step_internal_mla_cpu(&mut self, token: i32, pos: i32) -> Vec<f32> {
-    // 1. embed
-    // 2. for each layer: pre-attn norm → mla_attn_layer_forward_cpu
-    //    → residual → post-attn norm → mlp_forward (dense or MoE)
-    //    → residual
-    // 3. final norm → lm_head
-    // 4. return logits
-}
-```
-
-Then in the public eval entry, dispatch on `VARIANT.attn_kind`:
-- `Gqa` → existing `step_internal`
-- `Mla` → new CPU path
-
-This is the "first run cleanly separated, don't touch the GPU
-pipeline" approach. GPU port for MLA is a separate slice.
-
-### 5. Tokenizer + chat template (Phase G)
-
-drama_llama's blallama already loads `mlx/tokenizer.json` via the
-`tokenizers` crate. Verify special-token IDs match the variant
-config (`bos=0`, `eos=1`). Apply `mlx/chat_template.jinja` via
-misanthropic's renderer; spot-check a hello prompt renders
-non-empty.
-
-### 6. First forward pass (Phase H)
-
-```bash
-cargo build --bin blallama --features \
-    "webchat,cli,moeflux,moeflux-model-cogito-v2-671b"
-
-blallama --backend moeflux \
-         --model-path /Volumes/Temp\ Backup/models/blallama/
-```
-
-Send "Hello. How are you?" via `/v1/messages`. Watch for NaN/Inf;
-check first ~20 tokens are coherent English. Expected throughput
-~1 tok/s warm.
-
-If the output is garbage, bisect order: tokenizer → embed → first
-layer's MLA output (compare to a tiny PyTorch / `modeling_deepseek.py`
-reference at single-layer scale) → router → final logits.
-
-## Validation strategy reminder
-
-No oracle for the full 671B. Methodology:
-- noaux_tc unit test (landed, 2 tests)
-- YaRN sanity tests (landed, 4 tests)
-- Output vibes on first forward
-- Future: DeepSeek-V2-Lite (16B, MLA-shaped) as a small-model MLA
-  oracle; parked for a follow-up correctness sweep, not blocking
-  first run.
-
-## Pointers
-
-- Architecture audit (load-bearing for kernel work):
-  `~/Projects/drama_llama/.claude/memory/cogito_v2_architecture.md`
-- Approved session plan:
-  `~/.claude/plans/squishy-wibbling-milner.md`
-- moeflux RIIR strategy (parent context):
-  `~/Projects/drama_llama/.claude/memory/riir_moeflux_strategy.md`
-- DeepSeek reference impl (canonical math):
-  `/Volumes/HF Models/models/hf/mlx-community/cogito-v2-preview-deepseek-671B-MoE-4bit/modeling_deepseek.py`
-
-## Dependency / path notes
-
-drama_llama's Cargo.toml is path-pointed at `~/Projects/moeflux/crates/moeflux`
-while the work is in flight. Once the variant ships in moeflux
-0.1.0-pre.3, switch back to `version = "=0.1.0-pre.3"` (per Mike's
-"we'll publish when I get home" note this session).
+drama_llama is path-pointed at local moeflux while the work is in
+flight. After all in-flight changes land + tests stay green,
+publish moeflux and flip drama_llama back to a version dep.
