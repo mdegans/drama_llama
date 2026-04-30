@@ -72,6 +72,13 @@ for the current arc:
   the CPU-landing session. Folded MLA form, MlaKvCacheGpu, three
   Metal kernels (q', SDPA inner, V_combine ⋅ kv_b_proj_V), diff
   oracle = the CPU path.
+- [`cogito_v2_gpu_mla_landed.md`](.claude/memory/cogito_v2_gpu_mla_landed.md)
+  — Outcome memo: hybrid GPU MLA + CPU MoE forward green,
+  bit-exact argmax match on BOS-at-pos-0 smoke. What's still
+  hybrid (full-GPU MoE for ~1 tok/s), what's untested (long-gen
+  stability, warm-token perf), what survived as architecture
+  conventions (Option-of-Buffer, precise::cos/sin, 32 KB tg-mem
+  cap).
 
 Older but still load-bearing:
 
