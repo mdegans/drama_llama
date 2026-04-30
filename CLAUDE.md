@@ -64,6 +64,14 @@ for the current arc:
   callback-on-Engine probe-mode hook when it lands.
 - [`moeflux_disk_convention.md`](.claude/memory/moeflux_disk_convention.md)
   — `parent/{mlx,artifacts,root}/` layout for `MoefluxEngine::from_path`.
+- [`cogito_v2_landing_state.md`](.claude/memory/cogito_v2_landing_state.md)
+  — Cogito-V2 671B CPU MLA + MoE forward green; first-run produced
+  coherent English. Next slice is GPU MLA.
+- [`cogito_v2_gpu_mla_plan.md`](.claude/memory/cogito_v2_gpu_mla_plan.md)
+  — Plan-of-record for the GPU MLA port, drafted at the close of
+  the CPU-landing session. Folded MLA form, MlaKvCacheGpu, three
+  Metal kernels (q', SDPA inner, V_combine ⋅ kv_b_proj_V), diff
+  oracle = the CPU path.
 
 Older but still load-bearing:
 
