@@ -411,3 +411,34 @@ fn complete_text_round_trips_through_parse_and_render() {
         }
     }
 }
+
+/// `complete_response_id` threads the caller-supplied UUID through to
+/// `Message::id`. Used by blallama to correlate the sync response with
+/// the per-token probe stream — both sides need to share the same id.
+#[test]
+#[ignore = "requires model"]
+fn complete_response_id_uses_supplied_uuid() {
+    let prompt = Prompt {
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::SinglePart(Cow::Borrowed("Say hi.")),
+        }],
+        ..Default::default()
+    };
+
+    let mut session = Session::from_path(model_path())
+        .expect("session load")
+        .quiet()
+        .with_max_tokens(NonZeroUsize::new(4).unwrap());
+
+    let id = uuid::Uuid::from_u128(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
+    let response = session
+        .complete_response_id(&prompt, id)
+        .expect("complete_response_id");
+
+    assert_eq!(
+        response.id.as_ref(),
+        id.to_string(),
+        "response.id must match the supplied UUID",
+    );
+}

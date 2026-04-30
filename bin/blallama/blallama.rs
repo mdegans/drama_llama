@@ -14,9 +14,9 @@ use clap::{Parser, ValueEnum};
 use drama_llama::{
     backend::{Backend, Model},
     prompt::{AnthropicError, MessageResponse, Usage},
-    ProbeCtx, ProbeHook, Prompt, Session,
+    ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
 };
-use std::num::NonZeroU128;
+use std::num::{NonZeroU128, NonZeroUsize};
 use tokio::{sync::Mutex, task::spawn_blocking};
 use tracing::{error, info, instrument};
 
@@ -53,13 +53,27 @@ struct Args {
     /// (`PredictOptions::DEFAULT_SEED`).
     #[arg(long)]
     seed: Option<u128>,
-    /// Append per-token probe records to this JSONL file. First line
-    /// per session is `{"event":"session_start","model":"<name>"}`;
-    /// subsequent lines are `{"event":"token","token":N,"n_cur":M,
-    /// "ts_ms":T}`. `ts_ms` is relative to the moment the hook was
-    /// installed on the session. Omit to disable probe recording.
+    /// Append per-token probe records to this JSONL file. One
+    /// `{"event":"session_start", ...}` line per `/v1/messages` request,
+    /// then one `{"event":"token", "token":N, "n_cur":M, "ts_ms":T}`
+    /// line per yielded token, then nothing (the writer task drains
+    /// silently as long as the channel sender lives). `ts_ms` is
+    /// relative to the moment the recorder was installed for that
+    /// request. Omit to disable JSONL recording.
+    ///
+    /// Composes with `--probe-stream`: both recorders see every token
+    /// once via a `FanOutHook`.
     #[arg(long)]
-    probe_out: Option<PathBuf>,
+    record_json: Option<PathBuf>,
+    /// Mount the `/probe` SSE endpoint and install a per-request
+    /// streaming recorder. Consumers connect once with `GET /probe`
+    /// and receive `session_start` / `token` / `session_end` events
+    /// for every request the server handles, tagged by the request's
+    /// UUID (also returned as `Message::id` on the sync response).
+    /// Late connectors miss early events; convention is to open
+    /// `/probe` before sending `/v1/messages`.
+    #[arg(long, default_value_t = false)]
+    probe_stream: bool,
 }
 
 /// Inference backend selector. Variants are cfg-gated to whichever
@@ -91,11 +105,17 @@ const fn default_backend_kind() -> BackendKind {
 #[derive(Clone)]
 struct AppState<B: Backend> {
     args: Arc<Args>,
-    /// Sender into the probe-writer task. `None` if `--probe-out`
-    /// wasn't given. Cloned per-session in `configure_session` so each
-    /// installed [`JsonlProbeRecorder`] has its own handle; all clones
-    /// feed the same consumer task / output file.
-    probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+    /// Sender into the JSONL writer task. `None` if `--record-json`
+    /// wasn't given. Cloned per-request when installing the
+    /// [`JsonlProbeRecorder`]; all clones feed the same writer task /
+    /// output file.
+    record_json_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+    /// Streaming-probe broadcast bus. `None` if `--probe-stream`
+    /// wasn't given. Cloned per-request into a [`StreamingProbeRecorder`]
+    /// and (separately) subscribed by the `/probe` SSE handler. The
+    /// same bus carries `SessionStart` / `SessionEnd` events emitted
+    /// directly from the request handler around the generation call.
+    probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
     session: Arc<Mutex<Option<Session<B>>>>,
 }
 
@@ -204,7 +224,8 @@ mod llama_cpp_run {
 
     pub async fn run(
         args: Args,
-        probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+        record_json_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+        probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(format!(
             "0.0.0.0:{port}",
@@ -215,13 +236,20 @@ mod llama_cpp_run {
         let session: Arc<Mutex<Option<Session<LlamaCppBackend>>>> =
             Mutex::from(None).into();
 
-        let app = Router::new()
-            .route("/v1/messages", post(route_messages))
-            .with_state(AppState {
-                args: args.into(),
-                probe_tx,
-                session,
-            });
+        let mut app =
+            Router::new().route("/v1/messages", post(route_messages));
+        if probe_bus.is_some() {
+            app = app.route(
+                "/probe",
+                axum::routing::get(route_probe_stream::<LlamaCppBackend>),
+            );
+        }
+        let app = app.with_state(AppState {
+            args: args.into(),
+            record_json_tx,
+            probe_bus,
+            session,
+        });
         axum::serve(listener, app).await?;
         Ok(())
     }
@@ -289,7 +317,6 @@ mod llama_cpp_run {
                         prompt.model.to_string(),
                         state.args.no_penalty,
                         state.args.seed,
-                        state.probe_tx.clone(),
                     )
                     .await?
                 }
@@ -300,11 +327,33 @@ mod llama_cpp_run {
                     prompt.model.to_string(),
                     state.args.no_penalty,
                     state.args.seed,
-                    state.probe_tx.clone(),
                 )
                 .await?
             }
         };
+
+        // Per-request UUID — same id ends up on `Message.id` and on
+        // every `StreamProbeMsg` emitted while this request runs.
+        let id = uuid::Uuid::new_v4();
+        install_per_request_hooks(
+            &mut session,
+            state.record_json_tx.as_ref(),
+            state.probe_bus.as_ref(),
+            id,
+        );
+
+        // Emit SessionStart on the bus before generation. SendError
+        // means zero subscribers; harmless, ignored. The model name
+        // here is the request's `prompt.model` (the user-facing name)
+        // rather than the engine's display_name (the GGUF internal
+        // name); both are recoverable from the JSONL ts_ms ordering
+        // if needed.
+        if let Some(bus) = &state.probe_bus {
+            let _ = bus.send(StreamProbeMsg::SessionStart {
+                id,
+                model: prompt.model.to_string(),
+            });
+        }
 
         // Closure returns the session in *both* arms so it can be
         // restored to the lock — otherwise a `complete_response` error
@@ -313,10 +362,17 @@ mod llama_cpp_run {
         let (session, result, elapsed) =
             spawn_blocking_or_bust(move || {
                 let start = std::time::Instant::now();
-                let result = session.complete_response(&prompt);
+                let result = session.complete_response_id(&prompt, id);
                 (session, result, start.elapsed())
             })
             .await;
+
+        // SessionEnd fires regardless of generation success — the
+        // probe stream is a flight recorder, not a control channel.
+        if let Some(bus) = &state.probe_bus {
+            let _ = bus.send(StreamProbeMsg::SessionEnd { id });
+        }
+
         match &result {
             Ok(_) => {
                 lock.replace(session);
@@ -339,7 +395,6 @@ mod llama_cpp_run {
         model: String,
         no_penalty: bool,
         seed: Option<u128>,
-        probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
     ) -> Result<Session<LlamaCppBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -353,7 +408,7 @@ mod llama_cpp_run {
             Session::<LlamaCppBackend>::from_path_with_n_ctx(path, 65536)
         })
         .await
-        .map(|s| configure_session(s, no_penalty, seed, probe_tx))
+        .map(|s| configure_session(s, no_penalty, seed))
         .map_err(map_session_err)
     }
 }
@@ -369,7 +424,8 @@ mod moeflux_run {
 
     pub async fn run(
         args: Args,
-        probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+        record_json_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+        probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(format!(
             "0.0.0.0:{port}",
@@ -380,13 +436,20 @@ mod moeflux_run {
         let session: Arc<Mutex<Option<Session<MoefluxBackend>>>> =
             Mutex::from(None).into();
 
-        let app = Router::new()
-            .route("/v1/messages", post(route_messages))
-            .with_state(AppState {
-                args: args.into(),
-                probe_tx,
-                session,
-            });
+        let mut app =
+            Router::new().route("/v1/messages", post(route_messages));
+        if probe_bus.is_some() {
+            app = app.route(
+                "/probe",
+                axum::routing::get(route_probe_stream::<MoefluxBackend>),
+            );
+        }
+        let app = app.with_state(AppState {
+            args: args.into(),
+            record_json_tx,
+            probe_bus,
+            session,
+        });
         axum::serve(listener, app).await?;
         Ok(())
     }
@@ -454,7 +517,6 @@ mod moeflux_run {
                         prompt.model.to_string(),
                         state.args.no_penalty,
                         state.args.seed,
-                        state.probe_tx.clone(),
                     )
                     .await?
                 }
@@ -465,21 +527,40 @@ mod moeflux_run {
                     prompt.model.to_string(),
                     state.args.no_penalty,
                     state.args.seed,
-                    state.probe_tx.clone(),
                 )
                 .await?
             }
         };
+
+        // Per-request UUID — see llama-cpp variant for full rationale.
+        let id = uuid::Uuid::new_v4();
+        install_per_request_hooks(
+            &mut session,
+            state.record_json_tx.as_ref(),
+            state.probe_bus.as_ref(),
+            id,
+        );
+
+        if let Some(bus) = &state.probe_bus {
+            let _ = bus.send(StreamProbeMsg::SessionStart {
+                id,
+                model: prompt.model.to_string(),
+            });
+        }
 
         // See llama-cpp variant + `is_reusable_after` doc-comment for
         // the reuse-vs-reload rationale.
         let (session, result, elapsed) =
             spawn_blocking_or_bust(move || {
                 let start = std::time::Instant::now();
-                let result = session.complete_response(&prompt);
+                let result = session.complete_response_id(&prompt, id);
                 (session, result, start.elapsed())
             })
             .await;
+
+        if let Some(bus) = &state.probe_bus {
+            let _ = bus.send(StreamProbeMsg::SessionEnd { id });
+        }
         match &result {
             Ok(_) => {
                 lock.replace(session);
@@ -502,7 +583,6 @@ mod moeflux_run {
         model: String,
         no_penalty: bool,
         seed: Option<u128>,
-        probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
     ) -> Result<Session<MoefluxBackend>, (StatusCode, Json<AnthropicError>)>
     {
         let path = root.as_ref().join(&model);
@@ -516,7 +596,7 @@ mod moeflux_run {
             Session::<MoefluxBackend>::from_path(path)
         })
         .await
-        .map(|s| configure_session(s, no_penalty, seed, probe_tx))
+        .map(|s| configure_session(s, no_penalty, seed))
         .map_err(map_session_err)
     }
 }
@@ -529,7 +609,6 @@ fn configure_session<B: Backend>(
     s: Session<B>,
     no_penalty: bool,
     seed: Option<u128>,
-    probe_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
 ) -> Session<B> {
     // Sampling configuration is loaded from the per-model sidecar
     // (`<model>.sampling.toml` for gguf, `parent/sampling.toml` for
@@ -542,7 +621,7 @@ fn configure_session<B: Backend>(
     } else {
         s
     };
-    let mut configured = with_penalty
+    let configured = with_penalty
         .with_seed(seed.and_then(NonZeroU128::new))
         .with_prefix_cache(true)
         // Session-level generation cap. Distinct from `n_ctx` — that's
@@ -553,18 +632,10 @@ fn configure_session<B: Backend>(
         // ceiling; the prompt's `max_tokens` wins when smaller, this
         // clips runaway requests.
         .with_max_tokens(8192.try_into().unwrap());
-    if let Some(tx) = probe_tx {
-        let model_name = configured
-            .engine()
-            .model
-            .display_name()
-            .unwrap_or_default();
-        let recorder = JsonlProbeRecorder::install(tx, model_name.as_str());
-        configured
-            .engine_mut()
-            .set_probe_hook(Some(Box::new(recorder)));
-        tracing::info!(event = "probe_hook_installed", model = model_name.as_str());
-    }
+    // ProbeHook installation moved to per-request handlers — each
+    // /v1/messages request gets a fresh hook bound to its UUID, so the
+    // hook can fan out to JSONL, the broadcast bus, or both, with a
+    // recorder lifetime that exactly matches the request.
     tracing::info!(
         event = "session_ready",
         n_ctx = configured.engine().n_ctx(),
@@ -579,6 +650,52 @@ fn configure_session<B: Backend>(
             .as_str(),
     );
     configured
+}
+
+/// Default `SnapshotOpts` for the streaming recorder. top_k=100 +
+/// p_threshold=0 + entropy=true is the cross-validation suite's
+/// working set: refusal-class probes need tail-token visibility
+/// (high top_k, no threshold) and entropy is cheap when probes are
+/// infrequent. Override via `Args` if/when finer control is needed.
+fn default_stream_opts() -> SnapshotOpts {
+    SnapshotOpts {
+        top_k: NonZeroUsize::new(100).unwrap(),
+        p_threshold: 0.0,
+        compute_entropy: true,
+    }
+}
+
+/// Build and install the per-request `FanOutHook` on `session`'s
+/// engine. Returns `true` when at least one recorder was installed (so
+/// the caller can emit `StreamProbeMsg::SessionStart` / `SessionEnd`
+/// only when there's a streaming consumer to receive them).
+fn install_per_request_hooks<B: Backend>(
+    session: &mut Session<B>,
+    record_json_tx: Option<&tokio::sync::mpsc::Sender<ProbeMsg>>,
+    probe_bus: Option<&tokio::sync::broadcast::Sender<StreamProbeMsg>>,
+    id: uuid::Uuid,
+) {
+    let mut hooks: Vec<Box<dyn ProbeHook>> = Vec::new();
+    if let Some(tx) = record_json_tx {
+        let model_name = session.engine().model.display_name().unwrap_or_default();
+        hooks.push(Box::new(JsonlProbeRecorder::install(
+            tx.clone(),
+            model_name.as_str(),
+        )));
+    }
+    if let Some(bus) = probe_bus {
+        hooks.push(Box::new(StreamingProbeRecorder {
+            bus: bus.clone(),
+            id,
+            opts: default_stream_opts(),
+        }));
+    }
+    let hook: Option<Box<dyn ProbeHook>> = match hooks.len() {
+        0 => None,
+        1 => Some(hooks.pop().unwrap()),
+        _ => Some(Box::new(FanOutHook { hooks })),
+    };
+    session.engine_mut().set_probe_hook(hook);
 }
 
 // ---------------------------------------------------------------------------
@@ -619,7 +736,12 @@ async fn spawn_probe_writer(
         tokio::sync::mpsc::channel::<ProbeMsg>(PROBE_CHANNEL_DEPTH);
 
     tokio::spawn(async move {
-        let mut writer = tokio::io::BufWriter::new(file);
+        // Unbuffered writes. Per-line BufWriter would batch better but
+        // its flush only runs when all Senders drop; under SIGKILL or
+        // crash that flush never runs and the user sees an empty file.
+        // Probe write rate caps at ~50 tok/s so the per-line syscall
+        // cost is negligible — correctness over throughput.
+        let mut file = file;
         while let Some(msg) = rx.recv().await {
             let line = match msg {
                 ProbeMsg::SessionStart { model } => {
@@ -632,17 +754,14 @@ async fn spawn_probe_writer(
                     r#"{{"event":"token","token":{token},"n_cur":{n_cur},"ts_ms":{ts_ms}}}"#,
                 ),
             };
-            if let Err(e) = writer.write_all(line.as_bytes()).await {
+            if let Err(e) = file.write_all(line.as_bytes()).await {
                 tracing::warn!(event = "probe_write_failed", error = %e);
                 continue;
             }
-            if let Err(e) = writer.write_all(b"\n").await {
+            if let Err(e) = file.write_all(b"\n").await {
                 tracing::warn!(event = "probe_write_failed", error = %e);
             }
         }
-        // Channel closed (all senders dropped). Flush anything still
-        // in the BufWriter before exiting.
-        let _ = writer.flush().await;
     });
 
     Ok(tx)
@@ -691,6 +810,172 @@ impl ProbeHook for JsonlProbeRecorder {
             ts_ms,
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming probe — broadcast bus + per-request recorder
+//
+// Fired only when `--probe-stream` is set. Consumers connect once to
+// `GET /probe` and receive `StreamProbeMsg` events for every request the
+// server handles, tagged by request UUID. The same UUID is returned on
+// the sync `/v1/messages` response as `Message::id`, so consumers join
+// the two by id.
+// ---------------------------------------------------------------------------
+
+/// Wire schema for the `/probe` SSE channel. Serializes to one of:
+/// `{"event":"session_start","id":"…","model":"…"}`,
+/// `{"event":"token","id":"…","ctx":{ … full ProbeCtx … }}`,
+/// `{"event":"session_end","id":"…"}`.
+///
+/// `ctx` is the `ProbeCtx` rendered via `serde_json::to_value` —
+/// `sample_options` is `#[serde(skip)]` (grammar Arc/Mutex doesn't
+/// serialize cleanly); `snapshot` is the rich top-K + entropy view
+/// from slice-1.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum StreamProbeMsg {
+    SessionStart { id: uuid::Uuid, model: String },
+    Token { id: uuid::Uuid, ctx: serde_json::Value },
+    SessionEnd { id: uuid::Uuid },
+}
+
+/// Capacity of the broadcast channel. Tokens cap at ~50 tok/s on Apple
+/// Silicon; 1024 absorbs ~20s of decode at full rate before a slow
+/// consumer starts dropping. `Lagged` is observed at the SSE handler
+/// boundary and logged at `warn`.
+const PROBE_BROADCAST_CAPACITY: usize = 1024;
+
+/// Per-request streaming probe recorder. Fires `serde_json::to_value(&ctx)`
+/// per token and pushes a [`StreamProbeMsg::Token`] onto the bus.
+///
+/// `Sender::send` returns `Err` only when there are zero subscribers —
+/// silently ignored, since "no consumers means no observers" is fine.
+struct StreamingProbeRecorder {
+    bus: tokio::sync::broadcast::Sender<StreamProbeMsg>,
+    id: uuid::Uuid,
+    opts: SnapshotOpts,
+}
+
+impl ProbeHook for StreamingProbeRecorder {
+    fn on_token(&mut self, ctx: ProbeCtx<'_>) {
+        // serde_json::to_value goes via the Serialize impl on ProbeCtx —
+        // owns the result, which the broadcast bus then clones once
+        // per receiver. Less code than deriving Clone on Snapshot etc.
+        let value = match serde_json::to_value(&ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(event = "probe_stream_serialize_failed", error = %e);
+                return;
+            }
+        };
+        let _ = self.bus.send(StreamProbeMsg::Token {
+            id: self.id,
+            ctx: value,
+        });
+    }
+
+    fn snapshot_opts(&self) -> Option<SnapshotOpts> {
+        Some(self.opts.clone())
+    }
+}
+
+/// Composes multiple [`ProbeHook`] implementations behind a single
+/// `Box<dyn ProbeHook>`. `Engine::set_probe_hook` accepts only one;
+/// when `--record-json` and `--probe-stream` are both set, this fans
+/// `on_token` to both inner recorders and aggregates `snapshot_opts`
+/// so capture cost is paid once.
+struct FanOutHook {
+    hooks: Vec<Box<dyn ProbeHook>>,
+}
+
+impl ProbeHook for FanOutHook {
+    fn on_token(&mut self, ctx: ProbeCtx<'_>) {
+        // ProbeCtx is `#[non_exhaustive]` — can't struct-literal it
+        // from a downstream crate. It's also `Copy`, so we just copy
+        // the whole bag of borrows once per inner hook.
+        for hook in self.hooks.iter_mut() {
+            hook.on_token(ctx);
+        }
+    }
+
+    fn snapshot_opts(&self) -> Option<SnapshotOpts> {
+        // Aggregate: if any inner hook wants a snapshot, capture once
+        // with the union of opts (max top_k, min p_threshold,
+        // entropy-OR). Capture cost is paid once; cheap recorders see
+        // the populated `ctx.snapshot` and ignore it.
+        let mut acc: Option<SnapshotOpts> = None;
+        for hook in self.hooks.iter() {
+            if let Some(opts) = hook.snapshot_opts() {
+                acc = Some(match acc {
+                    None => opts,
+                    Some(prev) => SnapshotOpts {
+                        top_k: prev.top_k.max(opts.top_k),
+                        p_threshold: prev.p_threshold.min(opts.p_threshold),
+                        compute_entropy: prev.compute_entropy
+                            || opts.compute_entropy,
+                    },
+                });
+            }
+        }
+        acc
+    }
+}
+
+/// `/probe` SSE handler. Subscribes a fresh receiver on the
+/// broadcast bus and emits each [`StreamProbeMsg`] as one
+/// `text/event-stream` event. Generic over the backend so both
+/// `llama_cpp_run` and `moeflux_run` can mount the same handler.
+///
+/// Behavior:
+/// - **No bus** (server started without `--probe-stream`): return 404.
+///   The route is also gated at mount time, but defensive against
+///   anyone managing to hit the path through some other path.
+/// - **Lagged receiver** (slow consumer falls behind the broadcast
+///   ring): log at `warn` and continue. The consumer skips the
+///   missed events; the stream stays open.
+/// - **Channel closed** (sender dropped — only happens at server
+///   shutdown): the stream ends naturally.
+async fn route_probe_stream<B: Backend>(
+    axum::extract::State(state): axum::extract::State<AppState<B>>,
+) -> Result<
+    axum::response::Sse<
+        impl futures_util::Stream<
+            Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+        >,
+    >,
+    StatusCode,
+>
+where
+    AppState<B>: Clone,
+{
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::StreamExt as _;
+    use tokio_stream::wrappers::{
+        errors::BroadcastStreamRecvError, BroadcastStream,
+    };
+
+    let bus = state.probe_bus.ok_or(StatusCode::NOT_FOUND)?;
+    let rx = bus.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|res| async move {
+        match res {
+            Ok(msg) => match Event::default().json_data(&msg) {
+                Ok(ev) => Some(Ok(ev)),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "probe_stream_serialize_failed",
+                        error = %e,
+                    );
+                    None
+                }
+            },
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                tracing::warn!(event = "probe_stream_lagged", missed = n);
+                None
+            }
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 fn map_session_err(
@@ -744,20 +1029,151 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
     let args = Args::parse();
 
-    // If --probe-out is set, spin up the writer task before any
-    // session loads so per-session installs always have a Sender to
-    // clone. Failure to open the file is a startup error — the user
-    // asked for probe records and we can't deliver them.
-    let probe_tx = if let Some(path) = args.probe_out.clone() {
+    // If --record-json is set, spin up the JSONL writer task before
+    // any request handles so per-request installs always have a
+    // Sender to clone. Failure to open the file is a startup error —
+    // the user asked for probe records and we can't deliver them.
+    let record_json_tx = if let Some(path) = args.record_json.clone() {
         Some(spawn_probe_writer(path).await?)
+    } else {
+        None
+    };
+
+    // If --probe-stream is set, build the broadcast bus shared by all
+    // request handlers (per-request `StreamingProbeRecorder` clones
+    // the Sender) and the /probe SSE handler (calls `subscribe()` on
+    // each consumer connect).
+    let probe_bus = if args.probe_stream {
+        Some(tokio::sync::broadcast::channel::<StreamProbeMsg>(
+            PROBE_BROADCAST_CAPACITY,
+        ).0)
     } else {
         None
     };
 
     match args.backend {
         #[cfg(feature = "llama-cpp")]
-        BackendKind::LlamaCpp => llama_cpp_run::run(args, probe_tx).await,
+        BackendKind::LlamaCpp => {
+            llama_cpp_run::run(args, record_json_tx, probe_bus).await
+        }
         #[cfg(all(feature = "moeflux", target_os = "macos"))]
-        BackendKind::Moeflux => moeflux_run::run(args, probe_tx).await,
+        BackendKind::Moeflux => {
+            moeflux_run::run(args, record_json_tx, probe_bus).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `StreamProbeMsg` wire format check — SessionStart / Token /
+    /// SessionEnd serialize to the schema documented on the type. The
+    /// /probe consumer relies on the `event` discriminator + the `id`
+    /// field shape; this catches accidental shape changes.
+    #[test]
+    fn stream_probe_msg_wire_format() {
+        let id = uuid::Uuid::from_u128(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
+        let id_str = id.to_string();
+
+        let start = serde_json::to_value(&StreamProbeMsg::SessionStart {
+            id,
+            model: "test-model".to_string(),
+        })
+        .unwrap();
+        assert_eq!(start["event"], "session_start");
+        assert_eq!(start["id"], id_str);
+        assert_eq!(start["model"], "test-model");
+
+        let token = serde_json::to_value(&StreamProbeMsg::Token {
+            id,
+            ctx: serde_json::json!({"token": 42, "n_cur": 7}),
+        })
+        .unwrap();
+        assert_eq!(token["event"], "token");
+        assert_eq!(token["id"], id_str);
+        assert_eq!(token["ctx"]["token"], 42);
+
+        let end = serde_json::to_value(&StreamProbeMsg::SessionEnd { id }).unwrap();
+        assert_eq!(end["event"], "session_end");
+        assert_eq!(end["id"], id_str);
+    }
+
+    /// Test-only hook that declares a fixed `SnapshotOpts`. Used to
+    /// exercise `FanOutHook::snapshot_opts` aggregation without needing
+    /// a real `ProbeCtx` (which is non-exhaustive and can't be
+    /// struct-literal-constructed outside the defining crate).
+    struct OptsHook(Option<SnapshotOpts>);
+    impl ProbeHook for OptsHook {
+        fn on_token(&mut self, _ctx: ProbeCtx<'_>) {}
+        fn snapshot_opts(&self) -> Option<SnapshotOpts> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn fan_out_aggregates_snapshot_opts() {
+        // No inner hook wants snapshot → None.
+        let mut fan = FanOutHook { hooks: Vec::new() };
+        fan.hooks.push(Box::new(OptsHook(None)));
+        fan.hooks.push(Box::new(OptsHook(None)));
+        assert!(fan.snapshot_opts().is_none(), "all-None inner ⇒ None");
+
+        // One inner hook wants snapshot → that hook's opts pass through.
+        let opts_a = SnapshotOpts {
+            top_k: NonZeroUsize::new(20).unwrap(),
+            p_threshold: 0.005,
+            compute_entropy: false,
+        };
+        let mut fan = FanOutHook { hooks: Vec::new() };
+        fan.hooks.push(Box::new(OptsHook(None)));
+        fan.hooks.push(Box::new(OptsHook(Some(opts_a.clone()))));
+        let agg = fan.snapshot_opts().expect("at least one Some");
+        assert_eq!(agg.top_k, opts_a.top_k);
+        assert_eq!(agg.p_threshold, opts_a.p_threshold);
+        assert_eq!(agg.compute_entropy, opts_a.compute_entropy);
+
+        // Two inner hooks want snapshot → max top_k, min p_threshold,
+        // entropy-OR.
+        let opts_b = SnapshotOpts {
+            top_k: NonZeroUsize::new(100).unwrap(),
+            p_threshold: 0.0,
+            compute_entropy: true,
+        };
+        let mut fan = FanOutHook { hooks: Vec::new() };
+        fan.hooks.push(Box::new(OptsHook(Some(opts_a.clone()))));
+        fan.hooks.push(Box::new(OptsHook(Some(opts_b.clone()))));
+        let agg = fan.snapshot_opts().expect("at least one Some");
+        assert_eq!(agg.top_k, opts_b.top_k, "max(20, 100) = 100");
+        assert_eq!(agg.p_threshold, 0.0, "min(0.005, 0.0) = 0.0");
+        assert!(agg.compute_entropy, "false || true = true");
+    }
+
+    /// `StreamingProbeRecorder` declares the snapshot appetite it was
+    /// configured with. Trivial but catches accidental hardcoding /
+    /// override of the `opts` field.
+    #[test]
+    fn streaming_recorder_advertises_its_opts() {
+        let (bus, _rx) =
+            tokio::sync::broadcast::channel::<StreamProbeMsg>(4);
+        let id = uuid::Uuid::from_u128(0xDEADBEEF_DEADBEEF_DEADBEEF_DEADBEEFu128);
+        let opts = SnapshotOpts {
+            top_k: NonZeroUsize::new(50).unwrap(),
+            p_threshold: 0.001,
+            compute_entropy: false,
+        };
+        let recorder = StreamingProbeRecorder {
+            bus,
+            id,
+            opts: opts.clone(),
+        };
+        let advertised = recorder.snapshot_opts().expect("Some");
+        assert_eq!(advertised.top_k, opts.top_k);
+        assert_eq!(advertised.p_threshold, opts.p_threshold);
+        assert_eq!(advertised.compute_entropy, opts.compute_entropy);
     }
 }

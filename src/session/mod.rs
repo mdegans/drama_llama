@@ -1629,6 +1629,20 @@ impl<B: Backend> Session<B> {
         &mut self,
         prompt: &Prompt,
     ) -> Result<misanthropic::response::Message<'static>, SessionError> {
+        self.complete_response_id(prompt, uuid::Uuid::new_v4())
+    }
+
+    /// Like [`Self::complete_response`] but accepts a caller-supplied
+    /// [`uuid::Uuid`] for the response's `Message::id`. The same id can
+    /// then be used by the caller to correlate this generation with
+    /// out-of-band probe streams (e.g. blallama's `/probe` SSE channel),
+    /// since per-token [`crate::ProbeHook`] records can carry the same
+    /// id.
+    pub fn complete_response_id(
+        &mut self,
+        prompt: &Prompt,
+        id: uuid::Uuid,
+    ) -> Result<misanthropic::response::Message<'static>, SessionError> {
         let outcome = self.run_call(prompt)?;
         let inner: crate::AssistantMessage =
             outcome.blocks.into_iter().collect();
@@ -1638,7 +1652,7 @@ impl<B: Backend> Session<B> {
             outcome.generated_tokens,
         );
         Ok(misanthropic::response::Message {
-            id: std::borrow::Cow::Owned(uuid::Uuid::new_v4().to_string()),
+            id: std::borrow::Cow::Owned(id.to_string()),
             inner,
             model: self
                 .engine

@@ -2,3 +2,4 @@
 models/*.gguf
 /Cargo.lock
 .claude/scheduled_tasks.lock
+model.sampling.toml
