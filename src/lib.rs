@@ -29,7 +29,7 @@ mod batch;
 pub(crate) use batch::Batch;
 
 mod candidates;
-pub use candidates::{Candidates, Sorted};
+pub use candidates::{Candidates, Snapshot, SnapshotOpts, Sorted};
 #[cfg(feature = "llama-cpp")]
 pub use candidates::TokenDataArray;
 

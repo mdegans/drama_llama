@@ -631,6 +631,17 @@ impl<'engine, B: Backend> Iterator
 
         let candidates = self.inner.next()?;
 
+        // Snapshot only when an installed hook declares appetite. Cheap
+        // probe of the trait method (default `None`) keeps the
+        // production path free of per-token softmax/sort cost.
+        let snapshot = self
+            .inner
+            .engine
+            .probe_hook
+            .as_ref()
+            .and_then(|h| h.snapshot_opts())
+            .map(|opts| candidates.capture_snapshot(&opts));
+
         let next_token = candidates
             .sample_token(
                 &self.inner.tokens,
@@ -692,6 +703,9 @@ impl<'engine, B: Backend> Iterator
                 token: next_token,
                 n_cur: self.inner.n_cur,
                 sample_options: &self.options.sample_options,
+                snapshot: snapshot.as_ref(),
+                piece: &piece,
+                generation_index: (self.inner.n_decode - 1) as u32,
             });
         }
 

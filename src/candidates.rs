@@ -1290,6 +1290,99 @@ impl Candidates {
         let data: Vec<TokenData> = it.into_iter().collect();
         Self::from_vec_unchecked(data)
     }
+
+    /// Capture a top-K snapshot of the pre-everything candidate
+    /// distribution without consuming or mutating `self`.
+    ///
+    /// Computes a fresh full-vocab softmax into an owned buffer (so
+    /// `self.data`'s `p` field is read-only here), partial-sorts to
+    /// the top `opts.top_k`, applies `opts.p_threshold` while always
+    /// retaining the argmax, and optionally computes Shannon entropy
+    /// in nats.
+    ///
+    /// Used by [`crate::TokenPredictor`] when an installed
+    /// [`crate::ProbeHook`] declares snapshot appetite via
+    /// [`crate::ProbeHook::snapshot_opts`]. Capture cost is paid only
+    /// when probing; consumers who don't need the rich data return
+    /// `None` from `snapshot_opts` and skip this entirely.
+    pub fn capture_snapshot(&self, opts: &SnapshotOpts) -> Snapshot {
+        // Re-derive softmax from logits rather than reading `td.p` —
+        // candidates immediately out of `from_logits` have `p == 0.0`,
+        // and we want capture to be state-pure on `self` regardless
+        // of upstream sort/softmax cache.
+        let max_logit = self
+            .data
+            .iter()
+            .map(|td| td.logit)
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        let mut buf: Vec<TokenData> = self
+            .data
+            .iter()
+            .map(|td| TokenData {
+                id: td.id,
+                logit: td.logit,
+                p: (td.logit - max_logit).exp(),
+            })
+            .collect();
+        // f64 accumulator matches the precision discipline in
+        // `Candidates::softmax` — vocab can be ~250K and individual
+        // contributions tiny.
+        let cum_sum: f64 = buf.iter().map(|td| td.p as f64).sum();
+        let inv = (1.0 / cum_sum) as f32;
+        for td in buf.iter_mut() {
+            td.p *= inv;
+        }
+
+        let entropy = if opts.compute_entropy {
+            let h: f64 = buf
+                .iter()
+                .map(|td| {
+                    let p = td.p as f64;
+                    if p > 0.0 {
+                        -p * p.ln()
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+            Some(h as f32)
+        } else {
+            None
+        };
+
+        // Top-K extraction. select_nth_unstable_by partitions in O(V),
+        // then we sort the head in O(K log K).
+        let k = opts.top_k.get().min(buf.len());
+        if k < buf.len() {
+            buf.select_nth_unstable_by(k - 1, |a, b| {
+                b.p.partial_cmp(&a.p).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            buf.truncate(k);
+        }
+        buf.sort_unstable_by(|a, b| {
+            b.p.partial_cmp(&a.p).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Threshold filter — but always keep the argmax (index 0)
+        // regardless of its `p`, so consumers can rely on the sampled
+        // token's rank existing for at least the model's top choice.
+        if opts.p_threshold > 0.0 && buf.len() > 1 {
+            let kept_after_argmax = buf[1..]
+                .iter()
+                .take_while(|td| td.p >= opts.p_threshold)
+                .count();
+            buf.truncate(1 + kept_after_argmax);
+        }
+
+        let top_k_cumulative_mass: f32 = buf.iter().map(|td| td.p).sum();
+
+        Snapshot {
+            top_k: buf,
+            entropy,
+            top_k_cumulative_mass,
+        }
+    }
 }
 
 impl Index<usize> for Candidates {
@@ -1303,6 +1396,85 @@ impl Index<usize> for Candidates {
 impl FromIterator<TokenData> for Candidates {
     fn from_iter<T: IntoIterator<Item = TokenData>>(iter: T) -> Self {
         Self::from_vec(iter.into_iter().collect())
+    }
+}
+
+/// Options controlling [`Candidates::capture_snapshot`].
+///
+/// Capture cost scales with `top_k` and `compute_entropy`. The defaults
+/// (`top_k = 20`, `p_threshold = 0.005`, `compute_entropy = true`) are
+/// the cross-validation suite's working defaults; refusal-class probes
+/// where tail-token visibility matters typically raise `top_k` to 100+
+/// and lower `p_threshold` to `0.0`.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SnapshotOpts {
+    /// Top-K cap. Default 20.
+    pub top_k: NonZeroUsize,
+    /// Floor below which non-argmax candidates are dropped from the
+    /// snapshot. The argmax is always retained even if its `p_softmax`
+    /// is below this threshold. Default 0.005. Set to `0.0` to disable
+    /// filtering.
+    pub p_threshold: f32,
+    /// Compute full-vocab Shannon entropy (in nats) each capture.
+    /// Default `true`.
+    pub compute_entropy: bool,
+}
+
+impl Default for SnapshotOpts {
+    fn default() -> Self {
+        Self {
+            top_k: NonZeroUsize::new(20).unwrap(),
+            p_threshold: 0.005,
+            compute_entropy: true,
+        }
+    }
+}
+
+/// A snapshot of the pre-everything candidate distribution, captured
+/// before the sampling-mode chain (rep penalty, deny mask, top-K /
+/// top-P / mirostat / grammar / ...) consumes the candidates.
+///
+/// The point of capture is the model's raw softmax — what the model
+/// "would have" produced absent any wrapper-side filtering. This is the
+/// internal-disposition view that pairs with external behavior in the
+/// canary-suite cross-validation methodology.
+///
+/// See [`Candidates::capture_snapshot`].
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Snapshot {
+    /// Top-K candidates, sorted by descending `p_softmax`,
+    /// post-`p_threshold`. Always non-empty: the argmax is retained
+    /// even if below threshold.
+    pub top_k: Vec<TokenData>,
+    /// Full-vocab Shannon entropy in nats. `None` when
+    /// [`SnapshotOpts::compute_entropy`] was `false`.
+    pub entropy: Option<f32>,
+    /// Sum of `p_softmax` over [`Self::top_k`].
+    pub top_k_cumulative_mass: f32,
+}
+
+impl Snapshot {
+    /// Pre-everything probability of `t`. Returns the captured
+    /// `p_softmax` if `t` is in [`Self::top_k`]; `0.0` for tail tokens
+    /// (treated as floor — tail-token resolution is expensive noise
+    /// and the canary methodology only weights top-K mass).
+    pub fn lookup_p(&self, t: Token) -> f32 {
+        self.top_k
+            .iter()
+            .find(|td| td.id == t)
+            .map(|td| td.p)
+            .unwrap_or(0.0)
+    }
+
+    /// Pre-everything 1-indexed rank of `t`. `Some(rank)` if `t` is in
+    /// [`Self::top_k`] (rank 1 = argmax); `None` for tail tokens.
+    pub fn lookup_rank(&self, t: Token) -> Option<u32> {
+        self.top_k
+            .iter()
+            .position(|td| td.id == t)
+            .map(|i| (i as u32) + 1)
     }
 }
 
@@ -1724,5 +1896,135 @@ mod tests {
             .iter()
             .zip(out.iter().skip(1))
             .all(|(a, b)| a.logit >= b.logit));
+    }
+
+    fn snapshot_opts(top_k: usize, p_threshold: f32, compute_entropy: bool) -> SnapshotOpts {
+        SnapshotOpts {
+            top_k: NonZeroUsize::new(top_k).unwrap(),
+            p_threshold,
+            compute_entropy,
+        }
+    }
+
+    #[test]
+    fn capture_snapshot_top_k_cap_honored() {
+        // 100 logits, decreasing — softmax produces a clean ranking.
+        let logits: Vec<f32> = (0..100).map(|i| -(i as f32) * 0.1).collect();
+        let c = Candidates::from_logits(logits.into_iter());
+
+        let snap = c.capture_snapshot(&snapshot_opts(5, 0.0, false));
+
+        assert_eq!(snap.top_k.len(), 5);
+        // Sorted descending by p (i.e. ascending by id since logits
+        // were monotonically decreasing).
+        for w in snap.top_k.windows(2) {
+            assert!(w[0].p >= w[1].p, "top_k must be sorted by p desc");
+        }
+        assert_eq!(snap.top_k[0].id, 0, "argmax has the largest logit");
+        // No entropy requested.
+        assert!(snap.entropy.is_none());
+    }
+
+    #[test]
+    fn capture_snapshot_threshold_drops_tail_keeps_argmax() {
+        // Spike at index 0, tiny mass elsewhere — high threshold
+        // should drop everything but the argmax.
+        let mut logits: Vec<f32> = vec![0.0; 50];
+        logits[0] = 20.0;
+        let c = Candidates::from_logits(logits.into_iter());
+
+        let snap = c.capture_snapshot(&snapshot_opts(20, 0.5, false));
+        assert_eq!(snap.top_k.len(), 1);
+        assert_eq!(snap.top_k[0].id, 0);
+
+        // Now a degenerate flat distribution — threshold above every
+        // p, but the argmax is *still* retained.
+        let logits: Vec<f32> = vec![0.0; 50];
+        let c = Candidates::from_logits(logits.into_iter());
+        let snap = c.capture_snapshot(&snapshot_opts(20, 0.5, false));
+        assert_eq!(snap.top_k.len(), 1, "argmax must be retained even when below threshold");
+    }
+
+    #[test]
+    fn capture_snapshot_cumulative_mass_matches_sum() {
+        let logits: Vec<f32> = (0..32).map(|i| -(i as f32) * 0.05).collect();
+        let c = Candidates::from_logits(logits.into_iter());
+        let snap = c.capture_snapshot(&snapshot_opts(8, 0.0, false));
+        let sum: f32 = snap.top_k.iter().map(|td| td.p).sum();
+        assert!(
+            (snap.top_k_cumulative_mass - sum).abs() < 1e-6,
+            "cumulative_mass {} != sum of p {}",
+            snap.top_k_cumulative_mass,
+            sum,
+        );
+    }
+
+    #[test]
+    fn capture_snapshot_entropy_uniform_and_one_hot() {
+        // Uniform distribution → entropy = ln(V).
+        let v = 64usize;
+        let logits: Vec<f32> = vec![0.0; v];
+        let c = Candidates::from_logits(logits.into_iter());
+        let snap = c.capture_snapshot(&snapshot_opts(v, 0.0, true));
+        let h = snap.entropy.expect("entropy requested");
+        let expected = (v as f32).ln();
+        assert!(
+            (h - expected).abs() < 1e-3,
+            "uniform entropy {} != ln(V) {}",
+            h,
+            expected,
+        );
+
+        // One-hot (sharp spike) → entropy ≈ 0.
+        let mut logits: Vec<f32> = vec![-50.0; v];
+        logits[0] = 50.0;
+        let c = Candidates::from_logits(logits.into_iter());
+        let snap = c.capture_snapshot(&snapshot_opts(v, 0.0, true));
+        let h = snap.entropy.expect("entropy requested");
+        assert!(h < 1e-3, "one-hot entropy {} should be near 0", h);
+    }
+
+    #[test]
+    fn capture_snapshot_compute_entropy_false_yields_none() {
+        let logits: Vec<f32> = (0..16).map(|i| -(i as f32)).collect();
+        let c = Candidates::from_logits(logits.into_iter());
+        let snap = c.capture_snapshot(&snapshot_opts(4, 0.0, false));
+        assert!(snap.entropy.is_none());
+    }
+
+    #[test]
+    fn capture_snapshot_borrow_is_state_pure() {
+        let logits: Vec<f32> = (0..32).map(|i| -(i as f32) * 0.1).collect();
+        let c = Candidates::from_logits(logits.into_iter());
+        let sort_before = c.sort_state;
+        let softmax_before = c.softmax_applied_to;
+
+        let _ = c.capture_snapshot(&snapshot_opts(8, 0.0, true));
+
+        assert_eq!(c.sort_state, sort_before, "sort state must not change");
+        assert_eq!(
+            c.softmax_applied_to, softmax_before,
+            "softmax cache must not change",
+        );
+        // p field on the original Candidates was 0.0 from from_logits;
+        // capture must not have touched it.
+        for td in c.iter() {
+            assert_eq!(td.p, 0.0, "Candidates::data.p must remain untouched");
+        }
+    }
+
+    #[test]
+    fn snapshot_lookup_p_and_rank() {
+        let logits: Vec<f32> = (0..16).map(|i| -(i as f32) * 0.5).collect();
+        let c = Candidates::from_logits(logits.into_iter());
+        let snap = c.capture_snapshot(&snapshot_opts(4, 0.0, false));
+
+        // Token 0 is argmax (largest logit) → rank 1, p > 0.
+        assert_eq!(snap.lookup_rank(0), Some(1));
+        assert!(snap.lookup_p(0) > 0.0);
+
+        // A token outside top_k → rank None, p == 0.0.
+        assert_eq!(snap.lookup_rank(15), None);
+        assert_eq!(snap.lookup_p(15), 0.0);
     }
 }

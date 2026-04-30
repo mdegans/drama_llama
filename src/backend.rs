@@ -23,6 +23,7 @@ pub type Token = i32;
 /// sound.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TokenData {
     pub id: Token,
     pub logit: f32,

@@ -11,6 +11,38 @@ existing `ProbeHook` / `ProbeCtx`. Use a per-hook self-declared
 `snapshot_opts` to gate capture cost so consumers that don't need the
 rich data (blallama's existing JSONL timestamper) don't pay for it.
 
+**Landed 2026-04-29.** As-built diverged from the plan in two small ways:
+
+- **`sampled_p` and `sampled_rank` are NOT fields on `ProbeCtx`.** Mike
+  spotted the redundancy mid-implementation: both are pure derivatives
+  of `(snapshot, token)`, and `snapshot` already carries enough to
+  recover them. Consumers call `ctx.snapshot.map(|s| s.lookup_p(ctx.token))`
+  / `s.lookup_rank(ctx.token)` lazily. Saves two fields on `ProbeCtx`
+  and removes a "two ways to know the same thing" smell. Methods stay
+  on `Snapshot` as planned.
+- **The `sampled_rank > 1 under grammar` integration test was skipped.**
+  Reliably forcing rank > 1 against an arbitrary test model is flaky
+  (depends on model-specific argmax for the test prompt). The lookup
+  primitive itself is covered by `snapshot_lookup_p_and_rank` unit test
+  in `candidates.rs`. The cross-validation methodology test belongs on
+  a real probe model (Cogito) per the verification section, not as a
+  unit-test fixture.
+
+Everything else landed as designed:
+`SnapshotOpts` (top_k=20 / threshold=0.005 / entropy=true defaults),
+`Snapshot { top_k, entropy, top_k_cumulative_mass }`,
+`Candidates::capture_snapshot(&self, &SnapshotOpts) -> Snapshot` (state-pure),
+`ProbeHook::snapshot_opts(&self) -> Option<SnapshotOpts>` (default `None`),
+always-keep-argmax discipline on threshold filter,
+`#[serde(skip)]` on `sample_options`,
+no `PositionRole` enum (deferred until a consumer needs it),
+no `CandidatePredictor` instrumentation (Session goes through TokenPredictor),
+no blallama changes (its `JsonlProbeRecorder` only reads token+n_cur).
+
+7 unit tests + 2 new ignored integration tests + 1 Send smoke. All green
+post-landing including the existing CountingHook tests. Approved plan
+file: `~/.claude/plans/generic-scribbling-meadow.md`.
+
 ## Why this exists
 
 The current `ProbeHook` (`Engine::set_probe_hook`, fired in
