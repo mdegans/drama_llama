@@ -124,10 +124,19 @@ parallel-read code path entirely, the prefetch state machine, the
 2 MB-alignment DMA warnings, and the K × 24 MB memcpy per MoE
 layer per token.
 
-Why it's not in the current code: the architecture was inherited
-from the C path's `pread`-based design (pre-UMA assumption, plus
-the 2 MB-aligned DMA fast path). On unified memory there's no
-reason to copy at all.
+**Historical context (Mike, end of 2026-04-30 session)**: the C
+side this was ported from used `mmap` directly — moeflux's
+`pread`-based `ExpertFiles` is a **regression introduced during
+the RIIR**, not the original design. Claude 4.6's load-bearing
+insight when porting `flash-moe` was "trust the kernel's page
+cache; app-level LRU hurts performance" — the C path reads expert
+pages on-demand, lets the kernel decide what stays resident across
+tokens / processes, and mmap'd pages are GPU-accessible directly
+on UMA. This phase restores that design intent. The K-serial-pread
+problem the parallel-read change targeted today is treating a
+symptom of a cause (we shouldn't be copying at all). Reading
+`MEMORY.md` reference: "trust the kernel page cache" is a durable
+project principle; this phase aligns moeflux with it.
 
 1. **Mmap per-layer expert files** in `ExpertFiles`. Replace the
    `pread`-based `read_expert` with a `tensor_view(layer_idx,
