@@ -79,6 +79,12 @@ for the current arc:
   stability, warm-token perf), what survived as architecture
   conventions (Option-of-Buffer, precise::cos/sin, 32 KB tg-mem
   cap).
+- [`cogito_v2_full_gpu_plan.md`](.claude/memory/cogito_v2_full_gpu_plan.md)
+  — Plan-of-record for next session: full-GPU forward (dense MLP
+  GPU + GPU MoE with `_unscaled` shared-expert tail + deferred-ring
+  integration). Six phases with concrete file pointers and CPU
+  oracle as diff target throughout. Snapshot v2 (MLA-aware wire
+  format) parallelizable, blocks Council prompt caching.
 
 Older but still load-bearing:
 
