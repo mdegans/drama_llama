@@ -113,6 +113,49 @@ The router gate is `[256, hidden_dim]` BF16, NOT 4-bit. New PSO needed.
 host readback of 256 scores is itself a bottleneck — unlikely, but
 verify.
 
+### Phase 2.5 — Mmap-backed experts (zero-copy via UMA) (~45 min)
+
+**Expected impact**: eliminates the per-token K-expert copy from
+the kernel page cache into `MoeBuffers.data_synced`/`data_prefetch`.
+On Apple Silicon UMA, mmap'd file pages are directly GPU-readable
+via `MTLBuffer.new_with_bytes_no_copy` — the same pattern
+`MtlWeightBuf` already uses for `model_weights.bin`. Removes the
+parallel-read code path entirely, the prefetch state machine, the
+2 MB-alignment DMA warnings, and the K × 24 MB memcpy per MoE
+layer per token.
+
+Why it's not in the current code: the architecture was inherited
+from the C path's `pread`-based design (pre-UMA assumption, plus
+the 2 MB-aligned DMA fast path). On unified memory there's no
+reason to copy at all.
+
+1. **Mmap per-layer expert files** in `ExpertFiles`. Replace the
+   `pread`-based `read_expert` with a `tensor_view(layer_idx,
+   expert_idx) -> (&Buffer, usize)` returning the layer's mmap-
+   backed Metal buffer + the byte offset for that expert.
+2. **Add `MtlExpertBuf` per layer** (sibling of `MtlWeightBuf`) —
+   wraps each `Mmap` as one Metal buffer via
+   `device.new_buffer_with_bytes_no_copy`.
+3. **Modify `gpu_batched_experts_encode_pre_staged`** to accept
+   per-slot `(&Buffer, usize_offset)` pairs instead of indexing
+   into `MoeBuffers.data_*`. Existing kernel binding (one expert
+   blob per slot, with offsets) already supports this — just
+   change which buffer is bound.
+4. **Delete `MoeBuffers.data_synced` and `data_prefetch`** —
+   freed memory (~28 MB × 3 sets × MAX_K = ~1.3 GB of redundant
+   shared-storage Metal allocations); free the parallel-read
+   rayon code in `cogito_moe_gpu.rs`; free `PrefetchState`'s
+   prediction logic for MoE (the linear-attn path can keep its own
+   if needed, but for Cogito it goes away).
+5. Validate: `cogito_moe_gpu` test still cosine ≥ 0.9999.
+
+Caveats: assumes per-layer expert layout is contiguous in one file
+(verify via `ExpertFiles` docs); first touch of a cold expert page
+still hits SSD (one-time cost identical to the current path's
+first pread); long-running processes accumulate `MAX_LAYERS × 256
+× expert_size_4bit` ≈ 340 GB of mmap virtual reservations, all
+demand-paged.
+
 ### Phase 3 — KV cache lazy paging (~30 min)
 
 **Expected impact**: eliminates the 23s cold-init storm; doesn't
