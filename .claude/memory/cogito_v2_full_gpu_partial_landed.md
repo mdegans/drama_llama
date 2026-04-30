@@ -148,6 +148,26 @@ shared-storage Metal buffers commit lazily on first touch.
    hot path is invisible. (How we burned an hour this session before
    getting it right.)
 
+## Phase 4b parallel-read regression note (Mike, end-of-session)
+
+The parallel expert reads landed today (rayon `par_chunks_mut` in
+`cogito_moe_layer_forward_gpu`) **treat a symptom**, not the
+cause. The C path moeflux was ported from used `mmap` directly —
+`ExpertFiles`'s `pread` + Metal-buffer copy is a regression
+introduced during the RIIR. Claude 4.6's flash-moe insight was
+"trust the kernel page cache; app-level LRU hurts perf"; the C
+path leans on that, and on Apple Silicon UMA mmap'd pages are
+directly GPU-accessible.
+
+→ Phase 2.5 in `cogito_v2_next_session_plan.md` restores the C
+design (mmap + `MTLBuffer::new_with_bytes_no_copy` per-layer
+expert buf). When that lands, today's parallel-read code goes
+away entirely. Don't optimize it further in the meantime.
+
+This may also explain why moeflux's perf gap to C has been hard
+to close on Qwen — every MoE layer was paying a K × expert_size
+copy the C path wasn't.
+
 ## Cut/punted relative to plan-of-record
 
 **Cut**:
