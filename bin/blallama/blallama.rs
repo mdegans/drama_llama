@@ -191,19 +191,27 @@ fn log_stats(id: impl AsRef<str>, usage: Usage, elapsed: Duration) {
 }
 
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
-fn log_moeflux_prefetch(id: impl AsRef<str>, hits: u64, misses: u64) {
-    let total = hits + misses;
-    let hit_rate = if total > 0 {
-        hits as f64 / total as f64
-    } else {
-        0.0
+fn log_moeflux_prefetch(
+    id: impl AsRef<str>,
+    stats: drama_llama::moeflux::PrefetchStats,
+) {
+    let rate = |h: u64, m: u64| -> f64 {
+        let t = h + m;
+        if t > 0 {
+            h as f64 / t as f64
+        } else {
+            0.0
+        }
     };
     info!(
         event = "moeflux_prefetch",
         id = id.as_ref(),
-        hits,
-        misses,
-        hit_rate,
+        prefill_hits = stats.prefill_hits,
+        prefill_misses = stats.prefill_misses,
+        prefill_hit_rate = rate(stats.prefill_hits, stats.prefill_misses),
+        decode_hits = stats.decode_hits,
+        decode_misses = stats.decode_misses,
+        decode_hit_rate = rate(stats.decode_hits, stats.decode_misses),
     );
 }
 
@@ -598,7 +606,7 @@ mod moeflux_run {
 
         let response = result.map_err(map_session_err)?;
         log_stats(&response.id, response.usage, elapsed);
-        log_moeflux_prefetch(&response.id, prefetch_stats.0, prefetch_stats.1);
+        log_moeflux_prefetch(&response.id, prefetch_stats);
         Ok(Json(response))
     }
 

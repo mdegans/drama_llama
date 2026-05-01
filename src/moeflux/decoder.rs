@@ -46,6 +46,21 @@ impl From<MfError> for MoefluxError {
     }
 }
 
+/// Per-phase prefetch counters. The underlying moeflux `PrefetchState`
+/// counter is a single (hits, misses) tuple covering both prefill and
+/// decode; we split here by snapshotting the moeflux counter before
+/// and after each [`Decoder::prefill`] / [`Decoder::step`] call so
+/// blallama can log the steady-state decode hit rate separately from
+/// prefill (which often has very different token-to-token expert
+/// stability).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PrefetchStats {
+    pub prefill_hits: u64,
+    pub prefill_misses: u64,
+    pub decode_hits: u64,
+    pub decode_misses: u64,
+}
+
 /// moeflux-backed decoder. Owns a [`moeflux::Ctx`] and a scratch
 /// `Vec<f32>` sized to the model's vocab — `mf_eval_*` writes into a
 /// caller-supplied buffer, but [`Decoder::prefill`] and
@@ -61,6 +76,8 @@ pub struct MoefluxDecoder {
     /// never resized. `Decoder::prefill` / `Decoder::step` return
     /// `&self.logits[..]`.
     logits: Vec<f32>,
+    /// Per-phase prefetch counters. See [`PrefetchStats`].
+    prefetch_stats: PrefetchStats,
 }
 
 impl MoefluxDecoder {
@@ -94,6 +111,7 @@ impl MoefluxDecoder {
         Ok(Self {
             ctx,
             logits: vec![0.0f32; n_vocab],
+            prefetch_stats: PrefetchStats::default(),
         })
     }
 
@@ -128,13 +146,17 @@ impl MoefluxDecoder {
         &mut self.ctx
     }
 
-    /// Forwards [`Ctx::prefetch_stats`].
-    pub fn prefetch_stats(&self) -> (u64, u64) {
-        self.ctx.prefetch_stats()
+    /// Per-phase prefetch counters accumulated since the last
+    /// [`Self::reset_prefetch_stats`].
+    pub fn prefetch_stats(&self) -> PrefetchStats {
+        self.prefetch_stats
     }
 
-    /// Forwards [`Ctx::reset_prefetch_stats`].
-    pub fn reset_prefetch_stats(&self) {
+    /// Zero the per-phase counters AND the underlying moeflux counter
+    /// so the snapshot deltas in [`Decoder::prefill`] / [`Decoder::step`]
+    /// start from zero.
+    pub fn reset_prefetch_stats(&mut self) {
+        self.prefetch_stats = PrefetchStats::default();
         self.ctx.reset_prefetch_stats();
     }
 }
@@ -151,8 +173,14 @@ impl Decoder for MoefluxDecoder {
         if tokens.is_empty() {
             return Ok(&[]);
         }
-        self.ctx
-            .eval_prompt(tokens, start_pos, seq_id, &mut self.logits)?;
+        let (h0, m0) = self.ctx.prefetch_stats();
+        let result = self
+            .ctx
+            .eval_prompt(tokens, start_pos, seq_id, &mut self.logits);
+        let (h1, m1) = self.ctx.prefetch_stats();
+        self.prefetch_stats.prefill_hits += h1.saturating_sub(h0);
+        self.prefetch_stats.prefill_misses += m1.saturating_sub(m0);
+        result?;
         Ok(&self.logits[..])
     }
 
@@ -162,7 +190,13 @@ impl Decoder for MoefluxDecoder {
         pos: usize,
         seq_id: i32,
     ) -> Result<&[f32], Self::Error> {
-        self.ctx.eval_token(token, pos, seq_id, &mut self.logits)?;
+        let (h0, m0) = self.ctx.prefetch_stats();
+        let result =
+            self.ctx.eval_token(token, pos, seq_id, &mut self.logits);
+        let (h1, m1) = self.ctx.prefetch_stats();
+        self.prefetch_stats.decode_hits += h1.saturating_sub(h0);
+        self.prefetch_stats.decode_misses += m1.saturating_sub(m0);
+        result?;
         Ok(&self.logits[..])
     }
 

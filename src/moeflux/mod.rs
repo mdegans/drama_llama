@@ -12,7 +12,7 @@ pub mod decoder;
 pub mod engine;
 pub mod model;
 
-pub use decoder::{MoefluxDecoder, MoefluxError};
+pub use decoder::{MoefluxDecoder, MoefluxError, PrefetchStats};
 pub use engine::MoefluxEngine;
 pub use model::{MoefluxModel, MoefluxModelError};
 
