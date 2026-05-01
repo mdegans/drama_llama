@@ -453,6 +453,19 @@ impl Session<MoefluxBackend> {
         let engine = crate::MoefluxEngine::from_path(&parent)?;
         Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
     }
+
+    /// Accumulated `(hits, misses)` for moeflux's speculative
+    /// expert prefetch. Pair with [`Self::reset_prefetch_stats`] to
+    /// scope the counters to a single request. See
+    /// [`crate::MoefluxDecoder::prefetch_stats`].
+    pub fn prefetch_stats(&self) -> (u64, u64) {
+        self.engine.decoder.prefetch_stats()
+    }
+
+    /// Zero the moeflux prefetch counters.
+    pub fn reset_prefetch_stats(&self) {
+        self.engine.decoder.reset_prefetch_stats();
+    }
 }
 
 impl<B: Backend> Session<B> {

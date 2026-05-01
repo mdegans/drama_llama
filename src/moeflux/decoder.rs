@@ -127,6 +127,16 @@ impl MoefluxDecoder {
     pub fn ctx_mut(&mut self) -> &mut Ctx {
         &mut self.ctx
     }
+
+    /// Forwards [`Ctx::prefetch_stats`].
+    pub fn prefetch_stats(&self) -> (u64, u64) {
+        self.ctx.prefetch_stats()
+    }
+
+    /// Forwards [`Ctx::reset_prefetch_stats`].
+    pub fn reset_prefetch_stats(&self) {
+        self.ctx.reset_prefetch_stats();
+    }
 }
 
 impl Decoder for MoefluxDecoder {

@@ -3,3 +3,5 @@ models/*.gguf
 /Cargo.lock
 .claude/scheduled_tasks.lock
 model.sampling.toml
+/profile.py
+/__pycache__/

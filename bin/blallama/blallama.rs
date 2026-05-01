@@ -190,6 +190,23 @@ fn log_stats(id: impl AsRef<str>, usage: Usage, elapsed: Duration) {
     );
 }
 
+#[cfg(all(feature = "moeflux", target_os = "macos"))]
+fn log_moeflux_prefetch(id: impl AsRef<str>, hits: u64, misses: u64) {
+    let total = hits + misses;
+    let hit_rate = if total > 0 {
+        hits as f64 / total as f64
+    } else {
+        0.0
+    };
+    info!(
+        event = "moeflux_prefetch",
+        id = id.as_ref(),
+        hits,
+        misses,
+        hit_rate,
+    );
+}
+
 // Credit To Claude Opus 4.7 for this
 fn init_logging() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
@@ -548,6 +565,11 @@ mod moeflux_run {
             });
         }
 
+        // Scope prefetch counters to this request — moeflux's
+        // PrefetchState accumulates over the lifetime of RsCtx, so a
+        // fresh request needs a reset to read out a per-request rate.
+        session.reset_prefetch_stats();
+
         // See llama-cpp variant + `is_reusable_after` doc-comment for
         // the reuse-vs-reload rationale.
         let (session, result, elapsed) =
@@ -557,6 +579,7 @@ mod moeflux_run {
                 (session, result, start.elapsed())
             })
             .await;
+        let prefetch_stats = session.prefetch_stats();
 
         if let Some(bus) = &state.probe_bus {
             let _ = bus.send(StreamProbeMsg::SessionEnd { id });
@@ -575,6 +598,7 @@ mod moeflux_run {
 
         let response = result.map_err(map_session_err)?;
         log_stats(&response.id, response.usage, elapsed);
+        log_moeflux_prefetch(&response.id, prefetch_stats.0, prefetch_stats.1);
         Ok(Json(response))
     }
 
