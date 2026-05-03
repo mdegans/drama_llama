@@ -7,7 +7,7 @@ use std::{
 use axum::{
     extract::{Json, State},
     http::StatusCode,
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use clap::{Parser, ValueEnum};
@@ -261,8 +261,9 @@ mod llama_cpp_run {
         let session: Arc<Mutex<Option<Session<LlamaCppBackend>>>> =
             Mutex::from(None).into();
 
-        let mut app =
-            Router::new().route("/v1/messages", post(route_messages));
+        let mut app = Router::new()
+            .route("/v1/messages", post(route_messages))
+            .route("/api/tags", get(route_tags));
         if probe_bus.is_some() {
             app = app.route(
                 "/probe",
@@ -277,6 +278,34 @@ mod llama_cpp_run {
         });
         axum::serve(listener, app).await?;
         Ok(())
+    }
+
+    async fn route_tags(
+        State(state): State<AppState<LlamaCppBackend>>,
+    ) -> Json<serde_json::Value> {
+        let names = list_entries(&state.args.model_path, |m| m.is_file())
+            .await
+            .unwrap_or_default();
+        let models: Vec<_> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "model": name,
+                    "modified_at": "1970-01-01T00:00:00.000000000Z",
+                    "size": 0,
+                    "digest": "",
+                    "details": {
+                        "format": "gguf",
+                        "family": "",
+                        "families": [],
+                        "parameter_size": "",
+                        "quantization_level": ""
+                    }
+                })
+            })
+            .collect();
+        Json(serde_json::json!({ "models": models }))
     }
 
     async fn route_messages(
@@ -461,8 +490,9 @@ mod moeflux_run {
         let session: Arc<Mutex<Option<Session<MoefluxBackend>>>> =
             Mutex::from(None).into();
 
-        let mut app =
-            Router::new().route("/v1/messages", post(route_messages));
+        let mut app = Router::new()
+            .route("/v1/messages", post(route_messages))
+            .route("/api/tags", get(route_tags));
         if probe_bus.is_some() {
             app = app.route(
                 "/probe",
@@ -477,6 +507,34 @@ mod moeflux_run {
         });
         axum::serve(listener, app).await?;
         Ok(())
+    }
+
+    async fn route_tags(
+        State(state): State<AppState<MoefluxBackend>>,
+    ) -> Json<serde_json::Value> {
+        let names = list_entries(&state.args.model_path, |m| m.is_dir())
+            .await
+            .unwrap_or_default();
+        let models: Vec<_> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "model": name,
+                    "modified_at": "1970-01-01T00:00:00.000000000Z",
+                    "size": 0,
+                    "digest": "",
+                    "details": {
+                        "format": "gguf",
+                        "family": "",
+                        "families": [],
+                        "parameter_size": "",
+                        "quantization_level": ""
+                    }
+                })
+            })
+            .collect();
+        Json(serde_json::json!({ "models": models }))
     }
 
     async fn route_messages(
