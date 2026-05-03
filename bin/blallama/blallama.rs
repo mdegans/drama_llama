@@ -54,15 +54,20 @@ struct Args {
     #[arg(long)]
     seed: Option<u128>,
     /// Append per-token probe records to this JSONL file. One
-    /// `{"event":"session_start", ...}` line per `/v1/messages` request,
-    /// then one `{"event":"token", "token":N, "n_cur":M, "ts_ms":T}`
-    /// line per yielded token, then nothing (the writer task drains
-    /// silently as long as the channel sender lives). `ts_ms` is
-    /// relative to the moment the recorder was installed for that
-    /// request. Omit to disable JSONL recording.
+    /// `{"event":"session_start","model":"…"}` line per `/v1/messages`
+    /// request, then one `{"event":"probe_ctx","ts_ms":T,"ctx":{…}}`
+    /// line per yielded token — where `ctx` is the full serialized
+    /// `ProbeCtx` (same schema as the `ctx` field on `--probe-stream`
+    /// `token` events: sampled token, `n_cur`, `snapshot` top-K +
+    /// entropy when available, etc.). `ts_ms` is relative to the moment
+    /// the recorder was installed for that request. Omit to disable
+    /// JSONL recording.
     ///
     /// Composes with `--probe-stream`: both recorders see every token
-    /// once via a `FanOutHook`.
+    /// once via a `FanOutHook`. The JSONL recorder requests the same
+    /// snapshot budget as the streaming recorder (`top_k=100`,
+    /// `p_threshold=0`, `compute_entropy=true`); when both are active
+    /// the snapshot is captured once and shared.
     #[arg(long)]
     record_json: Option<PathBuf>,
     /// Mount the `/probe` SSE endpoint and install a per-request
@@ -109,7 +114,7 @@ struct AppState<B: Backend> {
     /// wasn't given. Cloned per-request when installing the
     /// [`JsonlProbeRecorder`]; all clones feed the same writer task /
     /// output file.
-    record_json_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+    record_json_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// Streaming-probe broadcast bus. `None` if `--probe-stream`
     /// wasn't given. Cloned per-request into a [`StreamingProbeRecorder`]
     /// and (separately) subscribed by the `/probe` SSE handler. The
@@ -249,7 +254,7 @@ mod llama_cpp_run {
 
     pub async fn run(
         args: Args,
-        record_json_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+        record_json_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(format!(
@@ -478,7 +483,7 @@ mod moeflux_run {
 
     pub async fn run(
         args: Args,
-        record_json_tx: Option<tokio::sync::mpsc::Sender<ProbeMsg>>,
+        record_json_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(format!(
@@ -761,7 +766,7 @@ fn default_stream_opts() -> SnapshotOpts {
 /// only when there's a streaming consumer to receive them).
 fn install_per_request_hooks<B: Backend>(
     session: &mut Session<B>,
-    record_json_tx: Option<&tokio::sync::mpsc::Sender<ProbeMsg>>,
+    record_json_tx: Option<&tokio::sync::mpsc::Sender<serde_json::Value>>,
     probe_bus: Option<&tokio::sync::broadcast::Sender<StreamProbeMsg>>,
     id: uuid::Uuid,
 ) {
@@ -771,6 +776,7 @@ fn install_per_request_hooks<B: Backend>(
         hooks.push(Box::new(JsonlProbeRecorder::install(
             tx.clone(),
             model_name.as_str(),
+            default_stream_opts(),
         )));
     }
     if let Some(bus) = probe_bus {
@@ -793,13 +799,6 @@ fn install_per_request_hooks<B: Backend>(
 // an unbounded mpsc; a single tokio task drains and writes.
 // ---------------------------------------------------------------------------
 
-/// Records flowing from `ProbeHook::on_token` (and one synthetic
-/// `SessionStart` per recorder install) into the writer task.
-#[derive(Debug)]
-enum ProbeMsg {
-    SessionStart { model: String },
-    Token { token: i32, n_cur: usize, ts_ms: u64 },
-}
 
 /// Spawn a single JSONL writer task draining `rx` to `path` (append).
 /// Each message becomes one line. The task exits when every Sender
@@ -814,7 +813,7 @@ const PROBE_CHANNEL_DEPTH: usize = 4096;
 
 async fn spawn_probe_writer(
     path: PathBuf,
-) -> std::io::Result<tokio::sync::mpsc::Sender<ProbeMsg>> {
+) -> std::io::Result<tokio::sync::mpsc::Sender<serde_json::Value>> {
     use tokio::io::AsyncWriteExt as _;
 
     let file = tokio::fs::OpenOptions::new()
@@ -823,7 +822,7 @@ async fn spawn_probe_writer(
         .open(&path)
         .await?;
     let (tx, mut rx) =
-        tokio::sync::mpsc::channel::<ProbeMsg>(PROBE_CHANNEL_DEPTH);
+        tokio::sync::mpsc::channel::<serde_json::Value>(PROBE_CHANNEL_DEPTH);
 
     tokio::spawn(async move {
         // Unbuffered writes. Per-line BufWriter would batch better but
@@ -832,17 +831,13 @@ async fn spawn_probe_writer(
         // Probe write rate caps at ~50 tok/s so the per-line syscall
         // cost is negligible — correctness over throughput.
         let mut file = file;
-        while let Some(msg) = rx.recv().await {
-            let line = match msg {
-                ProbeMsg::SessionStart { model } => {
-                    format!(
-                        r#"{{"event":"session_start","model":{}}}"#,
-                        serde_json::to_string(&model).unwrap_or_default(),
-                    )
+        while let Some(value) = rx.recv().await {
+            let line = match serde_json::to_string(&value) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(event = "probe_write_failed", error = %e);
+                    continue;
                 }
-                ProbeMsg::Token { token, n_cur, ts_ms } => format!(
-                    r#"{{"event":"token","token":{token},"n_cur":{n_cur},"ts_ms":{ts_ms}}}"#,
-                ),
             };
             if let Err(e) = file.write_all(line.as_bytes()).await {
                 tracing::warn!(event = "probe_write_failed", error = %e);
@@ -858,28 +853,32 @@ async fn spawn_probe_writer(
 }
 
 /// Per-session [`ProbeHook`]. Sends each token to the shared writer
-/// task via the bounded-pressure unbounded mpsc — `on_token` returns
-/// in nanoseconds, so disk I/O never blocks the prediction loop.
+/// task via the bounded mpsc — `on_token` returns in nanoseconds, so
+/// disk I/O never blocks the prediction loop.
 struct JsonlProbeRecorder {
-    tx: tokio::sync::mpsc::Sender<ProbeMsg>,
+    tx: tokio::sync::mpsc::Sender<serde_json::Value>,
     session_start: std::time::Instant,
+    opts: SnapshotOpts,
 }
 
 impl JsonlProbeRecorder {
     fn install(
-        tx: tokio::sync::mpsc::Sender<ProbeMsg>,
+        tx: tokio::sync::mpsc::Sender<serde_json::Value>,
         model_name: &str,
+        opts: SnapshotOpts,
     ) -> Self {
         // Best-effort: a session_start lost to a stalled disk is
         // surprising but not catastrophic. The token records that
         // follow carry their own model context via the file's
         // append-only ordering.
-        let _ = tx.try_send(ProbeMsg::SessionStart {
-            model: model_name.to_owned(),
-        });
+        let _ = tx.try_send(serde_json::json!({
+            "event": "session_start",
+            "model": model_name,
+        }));
         Self {
             tx,
             session_start: std::time::Instant::now(),
+            opts,
         }
     }
 }
@@ -887,6 +886,13 @@ impl JsonlProbeRecorder {
 impl ProbeHook for JsonlProbeRecorder {
     fn on_token(&mut self, ctx: ProbeCtx<'_>) {
         let ts_ms = self.session_start.elapsed().as_millis() as u64;
+        let ctx_value = match serde_json::to_value(&ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(event = "probe_write_serialize_failed", error = %e);
+                return;
+            }
+        };
         // Non-blocking send. Failure modes:
         // - `Full(_)`: writer task is behind (slow / stalled disk).
         //   Drop the record rather than block decode; a flat-line in
@@ -894,11 +900,15 @@ impl ProbeHook for JsonlProbeRecorder {
         // - `Closed(_)`: writer task exited (panicked or finished).
         //   Same treatment — failing predictions because the probe
         //   sink died would be worse than a missing record.
-        let _ = self.tx.try_send(ProbeMsg::Token {
-            token: ctx.token,
-            n_cur: ctx.n_cur,
-            ts_ms,
-        });
+        let _ = self.tx.try_send(serde_json::json!({
+            "event": "probe_ctx",
+            "ts_ms": ts_ms,
+            "ctx": ctx_value,
+        }));
+    }
+
+    fn snapshot_opts(&self) -> Option<SnapshotOpts> {
+        Some(self.opts.clone())
     }
 }
 
