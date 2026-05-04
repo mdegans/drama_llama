@@ -269,4 +269,27 @@ impl Decoder for MoefluxDecoder {
             }
         }
     }
+
+    /// Forwards to [`Ctx::forget_pos`]: removes the entry at `pos`
+    /// from `Ctx`'s `checkpoints` map and `checkpoint_order` LRU
+    /// without touching any other snapshot.
+    ///
+    /// `Session` calls this in two paths: tip replacement
+    /// (`record_cache_hit` evicting the previous tip) and orphan
+    /// pruning in `kv_setup_and_chunk_prefill` (forgetting prior
+    /// breakpoints that are no longer set in the current call). Both
+    /// are essential — without them, the LRU eventually evicts the
+    /// system+tools snapshot, the most valuable cross-agent anchor.
+    ///
+    /// Idempotent: returns `Ok(())` even when no entry exists at
+    /// `pos`, since both eviction paths may legitimately call this on
+    /// positions already pruned by `restore_to`'s forward-drop.
+    fn forget_pos(
+        &mut self,
+        _seq_id: i32,
+        pos: i32,
+    ) -> Result<(), MemoryRmError> {
+        self.ctx.forget_pos(pos);
+        Ok(())
+    }
 }

@@ -120,6 +120,18 @@ self.decoder.memory_seq_pos_max(seq_id)
         self.decoder.restore_to(seq_id, pos)
     }
 
+    /// Drop a single named snapshot at `(seq_id, pos)`. See
+    /// [`Decoder::forget_pos`] — used by `Session`'s prefix-cache
+    /// to release orphaned snapshots (replaced tips, no-longer-set
+    /// breakpoints) without touching other state.
+    pub fn forget_pos(
+        &mut self,
+        seq_id: i32,
+        pos: i32,
+    ) -> Result<(), MemoryRmError> {
+        self.decoder.forget_pos(seq_id, pos)
+    }
+
     /// Prefill `tokens` at positions `[start_pos, start_pos +
     /// tokens.len())` on `seq_id`. Does not clear the KV cache.
     /// Thin forward over [`Decoder::prefill`] — used by the

@@ -510,4 +510,15 @@ impl Decoder for LlamaCppDecoder {
             Err(MemoryRmError::BackendUnsupported { pos })
         }
     }
+
+    /// llama.cpp has no per-position snapshots to free — recurrent
+    /// state is preserved per-cell, so `checkpoint_pos` is a no-op
+    /// and there's nothing for `forget_pos` to release either.
+    fn forget_pos(
+        &mut self,
+        _seq_id: i32,
+        _pos: i32,
+    ) -> Result<(), MemoryRmError> {
+        Ok(())
+    }
 }

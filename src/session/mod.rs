@@ -151,24 +151,56 @@ const DEFAULT_MAX_TOKENS: usize = 1024;
 
 /// Per-session prefix-cache state.
 ///
-/// Tracks the full prompt tokens from the last cache-participating `complete_*`
-/// call, the indices within those tokens where `cache_control` breakpoints
-/// landed (sorted ascending), and the number of tokens actually reused on the
-/// last call. Generation tokens are **not** stored — they're overwritten on the
-/// next call whose prompt extends past the reused prefix.
+/// Tracks the previous call's prompt **plus generated content** tokens, the
+/// indices within those tokens where `cache_control` breakpoints landed (sorted
+/// ascending), the number of tokens actually reused on the last call, and an
+/// internal post-generation tip breakpoint maintained by `Session` itself
+/// (not visible to API callers — see [`Self::internal_tip`]).
 ///
 /// Private to the session module; callers interact through
 /// [`Session::with_prefix_cache`] / [`Session::clear_prefix_cache`] /
 /// [`Session::last_usage`].
 struct PrefixCache {
-    /// Full prompt tokens from the last cache-participating call. Generation
-    /// tokens are NOT stored here.
+    /// Previous call's prompt tokens with the generated assistant content
+    /// appended. Includes the assistant content because that content is in
+    /// the engine's KV cache (see the predictor-stop coupling note at
+    /// [`Self::internal_tip`]) and we want the next call's
+    /// [`compute_l_hit`] LCP walk to extend through it.
+    ///
+    /// Does NOT include the EOS / assistant-close token: the predictor's
+    /// stop-sequence check in [`crate::predictor::TokenPredictor::next`]
+    /// fires before [`crate::predictor::CandidatePredictor::next`] would
+    /// have called `decoder.step` on the EOS, so the EOS lands in the
+    /// predictor's `tokens` vec but never in KV. We mirror that: our
+    /// `prev_tokens` matches what the engine's KV cache actually holds.
     prev_tokens: Vec<Token>,
     /// Token indices in `prev_tokens` where `cache_control` breakpoints landed.
     /// Sorted ascending.
     prev_breakpoints: Vec<usize>,
     /// Tokens reused in the last call. `0` = full re-prefill.
     last_reused_tokens: usize,
+    /// Internal post-generation tip — set by `record_cache_hit` after a
+    /// successful completion when prefix caching is on. Consulted by
+    /// [`compute_l_hit`] as one more eligible breakpoint candidate
+    /// alongside `new_breakpoints`. Separate from `prev_breakpoints` so
+    /// it never gets serialized into `cache_control` markers and never
+    /// counts against the Anthropic 4-slot budget.
+    ///
+    /// Placed at `prev_tokens.len() - 1` (one back from the KV head, for
+    /// `compute_l_hit`'s `lcp-1` BPE-safety margin) so the next call's
+    /// LCP — which extends exactly to `prev_tokens.len()` when its
+    /// tokenization adds one more token (typically the chat template's
+    /// assistant-close marker) — leaves the tip eligible.
+    ///
+    /// **Predictor-stop coupling:** this design hinges on the
+    /// `TokenPredictor` stop-sequence check (`predictor.rs:608`) firing
+    /// before `decoder.step` commits the previously-recorded EOS. If a
+    /// future predictor refactor commits every recorded token before
+    /// the next stop check, `prev_tokens` (which we set to the engine's
+    /// KV state, EOS-free) will desync from `inner.tokens` and silently
+    /// corrupt the next call's restore. Update both ends together if
+    /// you change predictor stop semantics.
+    internal_tip: Option<usize>,
 }
 
 impl PrefixCache {
@@ -178,6 +210,7 @@ impl PrefixCache {
             prev_tokens: Vec::new(),
             prev_breakpoints: Vec::new(),
             last_reused_tokens: 0,
+            internal_tip: None,
         }
     }
 
@@ -186,6 +219,7 @@ impl PrefixCache {
         self.prev_tokens.clear();
         self.prev_breakpoints.clear();
         self.last_reused_tokens = 0;
+        self.internal_tip = None;
     }
 }
 
@@ -197,32 +231,43 @@ fn longest_common_prefix_len(a: &[Token], b: &[Token]) -> usize {
 /// Cache-reuse length for a call.
 ///
 /// Given the previously-cached `prev_tokens`, the newly-rendered `new_tokens`,
-/// and the new call's breakpoint token indices (sorted ascending), compute
-/// `L_hit`: the largest breakpoint index that is
+/// the new call's breakpoint token indices (sorted ascending), and an optional
+/// `internal_tip` from the prior generation's post-content position, compute
+/// `L_hit`: the largest position that is
 ///
 /// 1. less than or equal to the common-prefix length of the two token streams,
 ///    with one token of BPE-boundary safety (to avoid reusing a position whose
 ///    successor might tokenize differently); and
 /// 2. strictly greater than zero (we only reuse at breakpoints).
 ///
-/// Returns `0` when no breakpoint is eligible — the caller should treat that as
+/// Both `new_breakpoints` and `internal_tip` are eligible candidates. The
+/// `internal_tip` is `Session`'s private post-generation cache anchor —
+/// independent of user-facing `cache_control` markers, so it doesn't count
+/// against the Anthropic 4-slot budget. See [`PrefixCache::internal_tip`].
+///
+/// Returns `0` when no candidate is eligible — the caller should treat that as
 /// a full re-prefill. Pure function, tested directly.
 fn compute_l_hit(
     prev_tokens: &[Token],
     new_tokens: &[Token],
     new_breakpoints: &[usize],
+    internal_tip: Option<usize>,
 ) -> usize {
     let lcp = longest_common_prefix_len(prev_tokens, new_tokens);
     // BPE-boundary safety: back off by one token so a breakpoint falling
     // exactly at the prefix end can't reuse a position whose successor might
     // re-tokenize differently once more context is added.
     let safe = if lcp == 0 { 0 } else { lcp - 1 };
-    new_breakpoints
+    let user_best = new_breakpoints
         .iter()
         .rev()
         .find(|&&bp| bp <= safe && bp > 0)
         .copied()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let tip_best = internal_tip
+        .filter(|&t| t <= safe && t > 0)
+        .unwrap_or(0);
+    user_best.max(tip_best)
 }
 
 /// One generated-position entry in a [`Session::top_k_trace`] dump.
@@ -922,9 +967,12 @@ impl<B: Backend> Session<B> {
         new_breakpoints: &[usize],
     ) -> Result<(Vec<Token>, usize, usize), SessionError> {
         let l_hit_raw = match self.prefix_cache.as_ref() {
-            Some(cache) if !cache.prev_tokens.is_empty() => {
-                compute_l_hit(&cache.prev_tokens, new_tokens, new_breakpoints)
-            }
+            Some(cache) if !cache.prev_tokens.is_empty() => compute_l_hit(
+                &cache.prev_tokens,
+                new_tokens,
+                new_breakpoints,
+                cache.internal_tip,
+            ),
             _ => 0,
         };
 
@@ -961,6 +1009,41 @@ impl<B: Backend> Session<B> {
             }
         } else {
             self.engine.memory_clear();
+        }
+
+        // Orphan pruning: free snapshots from the previous call's
+        // breakpoints that aren't still set in this call's
+        // breakpoints (and aren't the internal tip, and aren't
+        // pos=0 which moeflux protects). `restore_to` already
+        // dropped snapshots > effective_cache_read; this handles the
+        // ones at positions ≤ effective_cache_read that survived.
+        //
+        // Without this, breakpoints sliding through misanthropic's
+        // `cache_windowed` pruning leave orphan snapshots in the
+        // engine's LRU. Eventually the LRU evicts the system+tools
+        // anchor — the most valuable cross-agent prefix — because
+        // the orphans are newer than it. Explicit eviction here
+        // protects the anchor.
+        if effective_cache_read > 0 {
+            if let Some(cache) = self.prefix_cache.as_ref() {
+                let new_bp_set: std::collections::HashSet<usize> =
+                    new_breakpoints.iter().copied().collect();
+                let tip = cache.internal_tip;
+                let orphans: Vec<usize> = cache
+                    .prev_breakpoints
+                    .iter()
+                    .copied()
+                    .filter(|&old_bp| {
+                        old_bp > 0
+                            && old_bp <= effective_cache_read
+                            && !new_bp_set.contains(&old_bp)
+                            && Some(old_bp) != tip
+                    })
+                    .collect();
+                for old_bp in orphans {
+                    let _ = self.engine.forget_pos(0, old_bp as i32);
+                }
+            }
         }
 
         // Chunked prefill at every breakpoint strictly between
@@ -1008,18 +1091,62 @@ impl<B: Backend> Session<B> {
     }
 
     /// After a batch call succeeds, update [`self.prefix_cache`] to
-    /// describe the current KV state: full prompt tokens, breakpoint
-    /// indices, and actual reuse length. No-op when caching is off.
+    /// describe the current KV state: full prompt tokens **plus
+    /// generated content** (`new_tokens` is the engine's exact KV
+    /// content, EOS-free per the predictor-stop coupling), breakpoint
+    /// indices, actual reuse length, and the optional internal tip.
+    ///
+    /// When `internal_tip` is `Some(new)` and the previous tip was a
+    /// different position not also a current breakpoint, the previous
+    /// tip's snapshot is freed via [`Engine::forget_pos`] — without
+    /// this, tip snapshots accumulate one per call in moeflux's LRU.
+    ///
+    /// No-op when caching is off.
     fn record_cache_hit(
         &mut self,
         new_tokens: Vec<Token>,
         new_breakpoints: Vec<usize>,
         l_hit: usize,
+        internal_tip: Option<usize>,
     ) {
+        // Capture the old tip BEFORE overwriting — needed for the
+        // explicit-eviction fast path so the engine can free the prior
+        // snapshot. The "not in new_breakpoints" guard preserves any
+        // tip position that happens to coincide with a current user
+        // breakpoint (rare, but possible — chunked-prefill snapshots
+        // share the same engine.checkpoint_pos slot, so freeing one
+        // would lose the other).
+        let old_tip = self
+            .prefix_cache
+            .as_ref()
+            .and_then(|c| c.internal_tip);
         if let Some(cache) = self.prefix_cache.as_mut() {
             cache.prev_tokens = new_tokens;
             cache.prev_breakpoints = new_breakpoints;
             cache.last_reused_tokens = l_hit;
+            cache.internal_tip = internal_tip;
+        }
+        if let (Some(old), Some(new)) = (old_tip, internal_tip) {
+            if old != new
+                && !self
+                    .prefix_cache
+                    .as_ref()
+                    .map(|c| c.prev_breakpoints.contains(&old))
+                    .unwrap_or(false)
+            {
+                let _ = self.engine.forget_pos(0, old as i32);
+            }
+        } else if let Some(old) = old_tip {
+            // New tip is None (e.g., streaming path that skips the
+            // tip extension). Free the stale tip snapshot.
+            if !self
+                .prefix_cache
+                .as_ref()
+                .map(|c| c.prev_breakpoints.contains(&old))
+                .unwrap_or(false)
+            {
+                let _ = self.engine.forget_pos(0, old as i32);
+            }
         }
     }
 
@@ -1094,9 +1221,15 @@ impl<B: Backend> Session<B> {
 
         // Count pieces as we consume them — one piece equals one
         // generated token before any post-hoc stop-string trimming
-        // the predictor does.
+        // the predictor does. When prefix caching is on, also capture
+        // generated token IDs so we can extend `prev_tokens` past the
+        // prompt for the next call's `compute_l_hit` walk; see
+        // [`PrefixCache::internal_tip`] for the design.
         let mut generated_count: usize = 0;
         let mut text = String::new();
+        let cache_on = self.prefix_cache.is_some();
+        let mut generated_tokens: Vec<Token> =
+            if cache_on { Vec::new() } else { Vec::new() };
         let mut predictor = if prefill_start > 0 {
             self.engine.predict_pieces_resuming(
                 suffix,
@@ -1108,6 +1241,12 @@ impl<B: Backend> Session<B> {
             self.engine.predict_pieces(suffix, predict_opts)
         };
         while let Some(piece) = predictor.next() {
+            if cache_on {
+                let token = predictor.last_token().unwrap_or(-1);
+                if token >= 0 {
+                    generated_tokens.push(token);
+                }
+            }
             generated_count += 1;
             text.push_str(&piece);
         }
@@ -1117,12 +1256,88 @@ impl<B: Backend> Session<B> {
 
         let trimmed = trim_eos(&text, &self.engine).to_string();
 
-        self.record_cache_hit(tokens, breakpoints, cache_read);
+        // Auto-tip: extend `prev_tokens` past the prompt with the
+        // generated content **including the recorded-but-uncommitted
+        // EOS / close-marker token** (predictor-stop coupling — see
+        // [`PrefixCache::internal_tip`]). When stop fired on a stop
+        // sequence (the common case), `generated_tokens` has one
+        // more token than KV; that extra token is the close marker
+        // the chat template will re-render in the next call. The
+        // tip lands at `kv_len`, the checkpoint at `kv_len`, and
+        // the next call's LCP can extend to `kv_len + 1` so the tip
+        // qualifies under the `lcp-1` BPE-safety check.
+        let (extended_prev, internal_tip, head_for_checkpoint) =
+            self.compute_tip_extension(tokens, prompt_tokens, generated_tokens);
+        if let Some(head) = head_for_checkpoint {
+            self.engine.checkpoint_pos(0, head as i32);
+        }
+
+        self.record_cache_hit(extended_prev, breakpoints, cache_read, internal_tip);
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
         self.record_usage(usage);
 
         Ok(trimmed)
+    }
+
+    /// Build the extended `prev_tokens`, the internal tip position,
+    /// and the engine head position to checkpoint at after a
+    /// successful generation. Shared between `complete_text` and
+    /// `run_call`.
+    ///
+    /// **Behavior depends on which stop condition fired**, queried
+    /// via [`Engine::memory_seq_pos_max`]:
+    ///
+    /// - **Stop sequence (common case).** Predictor recorded the EOS
+    ///   in its `tokens` vec but `decoder.step` was never called on
+    ///   it — KV head sits at `prompt + content_count`,
+    ///   `generated_tokens` length is `content_count + 1`. The extra
+    ///   token IS the close marker the next call's chat template
+    ///   re-renders. Tip lands at `kv_len`, checkpoint at `kv_len`.
+    ///   Next call's LCP can reach `kv_len + 1`, safe = `kv_len`,
+    ///   tip eligible.
+    ///
+    /// - **Max-tokens stop.** Every recorded token was committed —
+    ///   `generated_tokens.len() == kv_len - prompt_len`. We have no
+    ///   extra token to extend `prev_tokens` past KV. Skip the tip
+    ///   (no eligible position past `kv_len - 1` without a snapshot
+    ///   there). Returns the same `prev_tokens` shape and `None` for
+    ///   the tip — fall back to the existing breakpoint-only path.
+    ///
+    /// - **Cache off / empty engine.** Return prompt as-is, no tip.
+    fn compute_tip_extension(
+        &mut self,
+        prompt_tokens: Vec<Token>,
+        prompt_len: usize,
+        generated_tokens: Vec<Token>,
+    ) -> (Vec<Token>, Option<usize>, Option<usize>) {
+        if self.prefix_cache.is_none() {
+            return (prompt_tokens, None, None);
+        }
+        let kv_max = self.engine.memory_seq_pos_max(0);
+        if kv_max < 0 {
+            return (prompt_tokens, None, None);
+        }
+        let kv_len = (kv_max as usize) + 1;
+        let kv_generated_count = kv_len.saturating_sub(prompt_len);
+
+        let mut extended = prompt_tokens;
+        extended.extend_from_slice(&generated_tokens);
+
+        // Stop-sequence case: generated_tokens has one extra token
+        // (the recorded-but-uncommitted close marker). Tip and
+        // checkpoint both at kv_len. The "extra" token is what makes
+        // the next call's LCP exceed kv_len so the tip qualifies.
+        if generated_tokens.len() == kv_generated_count + 1 && kv_len >= 1 {
+            return (extended, Some(kv_len), Some(kv_len));
+        }
+        // Max-tokens / grammar-complete case: every token committed,
+        // no spare. No tip extension possible — fall through to the
+        // breakpoint-only path. Truncate extended to KV length so it
+        // matches engine state exactly (avoids any future LCP walk
+        // running off the end of KV).
+        extended.truncate(kv_len);
+        (extended, None, None)
     }
 
     /// Stream [`Block`]s as they're generated.
@@ -1176,7 +1391,15 @@ impl<B: Backend> Session<B> {
         // holds that borrow for the lifetime of iteration. Usage
         // follows the same ordering — output count stays 0 because we
         // can't count pieces from here.
-        self.record_cache_hit(tokens, breakpoints, cache_read);
+        //
+        // Auto-tip is **out of scope for the streaming path** for now:
+        // `compute_tip_extension` would need to fire after the stream
+        // drops, which would require a stream-completion callback.
+        // Streaming callers in our workload don't reuse the session
+        // for further turns, so passing `None` for the tip is fine —
+        // the breakpoint-only path still works exactly as before.
+        // (See plan: streaming tip extension is a v2 follow-up.)
+        self.record_cache_hit(tokens, breakpoints, cache_read, None);
         let usage = Self::make_usage(prompt_tokens, cache_read, 0);
         self.record_usage(usage);
 
@@ -1327,6 +1550,13 @@ impl<B: Backend> Session<B> {
         let collect_token_dump = false;
         let mut token_dump: Vec<(Token, String)> = Vec::new();
 
+        // When prefix caching is on, capture every recorded token ID
+        // (no EOS filter — we want the recorded-but-uncommitted EOS
+        // for the auto-tip extension; see `compute_tip_extension`).
+        let cache_on = self.prefix_cache.is_some();
+        let mut generated_tokens: Vec<Token> =
+            if cache_on { Vec::new() } else { Vec::new() };
+
         let mut predictor = if prefill_start > 0 {
             self.engine.predict_pieces_resuming(
                 suffix,
@@ -1342,6 +1572,12 @@ impl<B: Backend> Session<B> {
             if collect_token_dump {
                 let token = predictor.last_token().unwrap_or(-1);
                 token_dump.push((token, piece.clone()));
+            }
+            if cache_on {
+                let token = predictor.last_token().unwrap_or(-1);
+                if token >= 0 {
+                    generated_tokens.push(token);
+                }
             }
             if eos_pieces.contains(&piece) || piece == "[Invalid UTF-8]" {
                 continue;
@@ -1374,10 +1610,20 @@ impl<B: Backend> Session<B> {
         // single-Text outputs into Content::SinglePart.
         let blocks = merge_adjacent_prose(blocks);
 
+        // Auto-tip: extend `prev_tokens` past the prompt with the
+        // generated content (and the recorded-but-uncommitted close
+        // marker, when present). See `compute_tip_extension` for the
+        // stop-condition handling.
+        let (extended_prev, internal_tip, head_for_checkpoint) =
+            self.compute_tip_extension(tokens, prompt_tokens, generated_tokens);
+        if let Some(head) = head_for_checkpoint {
+            self.engine.checkpoint_pos(0, head as i32);
+        }
+
         // Cache + usage bookkeeping, then grammar-violation check.
         // Check last so a violation still records the work that was
         // done — usage numbers are correct either way.
-        self.record_cache_hit(tokens, breakpoints, cache_read);
+        self.record_cache_hit(extended_prev, breakpoints, cache_read, internal_tip);
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
         self.record_usage(usage);
@@ -2008,14 +2254,14 @@ mod tests {
         );
     }
 
-    /// No breakpoints → no eligible reuse point → `L_hit == 0`,
-    /// even when the common prefix is long.
+    /// No breakpoints and no internal tip → no eligible reuse point
+    /// → `L_hit == 0`, even when the common prefix is long.
     #[test]
     fn test_l_hit_computation_no_breakpoints() {
         let prev: Vec<Token> = (0..20).collect();
         let new_: Vec<Token> = (0..10).chain(100..110).collect();
         assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
-        assert_eq!(compute_l_hit(&prev, &new_, &[]), 0);
+        assert_eq!(compute_l_hit(&prev, &new_, &[], None), 0);
     }
 
     /// With breakpoints at [5, 8, 12] and a common prefix of 10, the
@@ -2027,7 +2273,7 @@ mod tests {
         let new_: Vec<Token> = (0..10).chain(100..110).collect();
         let breakpoints = vec![5, 8, 12];
         assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 8);
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), 8);
     }
 
     /// Common prefix of 5 with a breakpoint exactly at 5: BPE-safe cap
@@ -2041,7 +2287,7 @@ mod tests {
             (0..5).chain(200..205).chain(300..305).collect();
         let breakpoints = vec![5];
         assert_eq!(longest_common_prefix_len(&prev, &new_), 5);
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 0);
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), 0);
     }
 
     /// When the common prefix is zero, `L_hit` must also be zero,
@@ -2051,7 +2297,7 @@ mod tests {
         let prev = vec![10, 20, 30];
         let new_ = vec![40, 50, 60];
         let breakpoints = vec![1, 2, 3];
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 0);
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), 0);
     }
 
     /// Empty previous tokens — first call against a cold cache —
@@ -2061,7 +2307,74 @@ mod tests {
         let prev: Vec<Token> = Vec::new();
         let new_: Vec<Token> = vec![1, 2, 3, 4, 5];
         let breakpoints = vec![1, 3];
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints), 0);
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), 0);
+    }
+
+    /// Internal tip eligible: tip at `lcp - 1` (the BPE-safe boundary)
+    /// with no user breakpoints → tip wins, returns `tip` value.
+    /// This is the common-case "always-append" hit.
+    #[test]
+    fn test_l_hit_internal_tip_eligible() {
+        // prev_tokens = prompt(0..5) + asst_content(5..8). The next call
+        // appends the chat template's assistant-close marker (here `99`)
+        // and a fresh user message. LCP = 8 (matches through asst_content),
+        // safe = 7. Tip placed at 7 (= prev_tokens.len() - 1) is eligible.
+        let prev: Vec<Token> = (0..8).collect();
+        let new_: Vec<Token> = (0..8).chain([99, 50, 51, 52]).collect();
+        assert_eq!(longest_common_prefix_len(&prev, &new_), 8);
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(7)), 7);
+    }
+
+    /// Internal tip blocked by a short LCP: tip at 7 but LCP is only
+    /// 3, safe is 2 → tip > safe, ineligible, returns 0.
+    /// Failure-mode safety net — strictly never worse than today.
+    #[test]
+    fn test_l_hit_internal_tip_blocked_by_lcp() {
+        let prev: Vec<Token> = (0..8).collect();
+        let new_: Vec<Token> = vec![0, 1, 2, 99, 99, 99, 99, 99];
+        assert_eq!(longest_common_prefix_len(&prev, &new_), 3);
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(7)), 0);
+    }
+
+    /// Tip and a larger user breakpoint both eligible → user breakpoint
+    /// wins (we always pick the largest eligible position).
+    #[test]
+    fn test_l_hit_internal_tip_loses_to_larger_user_bp() {
+        let prev: Vec<Token> = (0..10).collect();
+        let new_: Vec<Token> = (0..10).chain([99, 50]).collect();
+        let breakpoints = vec![8];
+        // LCP = 10, safe = 9. Tip at 4 eligible (≤9). User BP at 8 also
+        // eligible. Largest wins: 8.
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, Some(4)), 8);
+    }
+
+    /// Tip exactly at `lcp - 1` is eligible (BPE-safety boundary,
+    /// `bp <= safe` is inclusive).
+    #[test]
+    fn test_l_hit_internal_tip_at_safe_boundary() {
+        let prev: Vec<Token> = (0..5).collect();
+        let new_: Vec<Token> = (0..5).chain([99, 50]).collect();
+        // LCP = 5, safe = 4. Tip at 4 (= safe) eligible.
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(4)), 4);
+    }
+
+    /// Tip exactly at `lcp` is ineligible (one past safe).
+    /// Regression guard: don't relax the BPE-safety check accidentally.
+    #[test]
+    fn test_l_hit_internal_tip_one_past_safe() {
+        let prev: Vec<Token> = (0..5).collect();
+        let new_: Vec<Token> = (0..5).chain([99, 50]).collect();
+        // LCP = 5, safe = 4. Tip at 5 (= lcp, > safe) ineligible.
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(5)), 0);
+    }
+
+    /// Tip at zero is rejected (we only reuse at positions > 0,
+    /// matching the existing breakpoint constraint).
+    #[test]
+    fn test_l_hit_internal_tip_zero_rejected() {
+        let prev: Vec<Token> = (0..5).collect();
+        let new_: Vec<Token> = (0..5).chain([99]).collect();
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(0)), 0);
     }
 
     /// No tool_choice and no output_config → no grammar constraint.

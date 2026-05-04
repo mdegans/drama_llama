@@ -133,6 +133,33 @@ pub trait Decoder {
         seq_id: i32,
         pos: i32,
     ) -> Result<(), MemoryRmError>;
+
+    /// Drop the snapshot stored at `(seq_id, pos)` without otherwise
+    /// disturbing decoder state.
+    ///
+    /// `Session`'s prefix-cache uses this to free orphaned snapshots —
+    /// the previous "internal tip" set by an earlier `complete_*` call
+    /// that is being replaced by a fresher tip, or breakpoints from a
+    /// prior call's prompt that are no longer set in the current call.
+    /// Without this, snapshots accumulate in backends that maintain a
+    /// bounded LRU (moeflux), eventually evicting the system+tools
+    /// anchor — the most valuable cross-session prefix.
+    ///
+    /// **No default impl: forces every backend to make an explicit
+    /// choice.** Backends with per-cell recurrent state (llama.cpp)
+    /// implement this as a no-op; backends with explicit per-pos
+    /// snapshots (moeflux) drop the entry from the snapshot map.
+    ///
+    /// Returns `Ok(())` even if no snapshot exists at `pos`
+    /// (idempotent — `Session` may forget the same position twice
+    /// across the eviction trigger paths). Returns
+    /// [`MemoryRmError::BackendUnsupported`] only when the backend
+    /// fundamentally cannot honor a single-snapshot delete at all.
+    fn forget_pos(
+        &mut self,
+        seq_id: i32,
+        pos: i32,
+    ) -> Result<(), MemoryRmError>;
 }
 
 /// Errors from [`Decoder::restore_to`]. Surfaced by the

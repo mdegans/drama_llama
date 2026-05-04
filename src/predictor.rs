@@ -605,6 +605,20 @@ impl<'engine, B: Backend> Iterator
         let decoded_tokens =
             &self.inner.tokens[self.inner.tokens.len() - self.inner.n_decode..];
 
+        // NOTE (auto-tip dependency): this stop-sequence check fires
+        // BEFORE `inner.next()` would call `decoder.step` on the
+        // previously-recorded EOS, so the EOS lands in `inner.tokens`
+        // but never in the engine's KV cache. `Session`'s prefix-cache
+        // auto-tip (see `session/mod.rs::compute_tip_extension` and
+        // `PrefixCache::internal_tip`) relies on this exact behavior:
+        // `prev_tokens` is set to the engine's KV state (EOS-free)
+        // while the recorded-but-uncommitted EOS in `inner.tokens` is
+        // what makes the next call's LCP extend one token past KV,
+        // letting the tip qualify under `compute_l_hit`'s lcp-1
+        // safety. If you change this stop-check ordering — e.g.,
+        // commit every recorded token before the next stop check —
+        // update `Session::compute_tip_extension` in lockstep or the
+        // tip will desync from KV and silently corrupt restores.
         for sequence in self.options.stop_sequences.iter() {
             if decoded_tokens.ends_with(sequence) {
                 return None;
