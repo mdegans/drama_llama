@@ -532,11 +532,14 @@ fn render_partial(
 /// special-token IDs — the same convention [`Session::prepare_call`]
 /// uses.
 ///
-/// Phase 3 (Session integration) will wire this in; external callers
-/// don't need it yet, hence `pub(crate)`.
+/// Used internally by [`Session::prepare_call_cached`] for the
+/// prefix-cache lookup, and exposed publicly so callers can build
+/// inspection / diagnostic tools that reproduce exactly the same
+/// tokenization the cache machinery sees (see
+/// `examples/inspect_prompt.rs`).
 ///
 /// [`Session::prepare_call`]: crate::Session
-pub(crate) fn tokenize_with_breakpoints<M: Model>(
+pub fn tokenize_with_breakpoints<M: Model>(
     model: &M,
     rendered: &RenderedWithBreakpoints,
 ) -> (Vec<Token>, Vec<usize>) {
