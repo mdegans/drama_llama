@@ -405,9 +405,7 @@ impl<'engine, B: Backend> CandidatePredictor<'engine, B> {
     }
 }
 
-impl<'engine, B: Backend> Iterator
-    for CandidatePredictor<'engine, B>
-{
+impl<'engine, B: Backend> Iterator for CandidatePredictor<'engine, B> {
     type Item = Candidates;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -439,9 +437,7 @@ impl<'engine, B: Backend> Iterator
     }
 }
 
-impl<'engine, B: Backend> From<CandidatePredictor<'engine, B>>
-    for Vec<Token>
-{
+impl<'engine, B: Backend> From<CandidatePredictor<'engine, B>> for Vec<Token> {
     fn from(predictor: CandidatePredictor<'engine, B>) -> Self {
         predictor.tokens
     }
@@ -553,9 +549,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         // current generation step.
         if let Some(opts) = &mut options.sample_options.repetition {
             let max_size = opts.ngram_max_size.get() as usize;
-            for (win_idx, win) in
-                tokens.windows(max_size).enumerate()
-            {
+            for (win_idx, win) in tokens.windows(max_size).enumerate() {
                 // Last token of the window sits at absolute index
                 // `win_idx + max_size - 1`.
                 let trailing_pos = (win_idx + max_size - 1) as u64;
@@ -585,9 +579,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     }
 }
 
-impl<'engine, B: Backend> From<TokenPredictor<'engine, B>>
-    for Vec<Token>
-{
+impl<'engine, B: Backend> From<TokenPredictor<'engine, B>> for Vec<Token> {
     fn from(predictor: TokenPredictor<'engine, B>) -> Self {
         predictor.inner.into()
     }
@@ -596,9 +588,7 @@ impl<'engine, B: Backend> From<TokenPredictor<'engine, B>>
 // `B::Model: Sync` is required because the grammar filter fans
 // candidate validation out across rayon's pool and borrows the model
 // across threads. Backend's bound on Model satisfies this implicitly.
-impl<'engine, B: Backend> Iterator
-    for TokenPredictor<'engine, B>
-{
+impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
     type Item = Token;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -685,8 +675,7 @@ impl<'engine, B: Backend> Iterator
                 find_deferred_trigger_end(
                     self.text.as_bytes(),
                     &d.activate_after,
-                    self.max_stop_len
-                        + self.inner.engine.model.max_token_len(),
+                    self.max_stop_len + self.inner.engine.model.max_token_len(),
                 )
             })
         {
@@ -701,9 +690,9 @@ impl<'engine, B: Backend> Iterator
                 if let crate::SamplingMode::Grammar(state_arc) =
                     &promoted.grammar
                 {
-                    let mut locked = state_arc.lock().expect(
-                        "deferred grammar mutex poisoned at promotion",
-                    );
+                    let mut locked = state_arc
+                        .lock()
+                        .expect("deferred grammar mutex poisoned at promotion");
                     if locked.advance_bytes(tail).is_err() {
                         return None;
                     }
@@ -765,7 +754,9 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
         options: PredictOptions,
     ) -> Self {
         let token_predictor = TokenPredictor::new(engine, tokens, options);
-        Self { inner: token_predictor }
+        Self {
+            inner: token_predictor,
+        }
     }
 
     /// Create a `PiecePredictor` that resumes generation from a
@@ -780,7 +771,9 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
         let token_predictor = TokenPredictor::new_resuming(
             engine, tokens, start_pos, seq_id, options,
         );
-        Self { inner: token_predictor }
+        Self {
+            inner: token_predictor,
+        }
     }
 
     /// Convert into the tokens and text that have been predicted so far.
@@ -828,9 +821,7 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     }
 }
 
-impl<'engine, B: Backend> Iterator
-    for PiecePredictor<'engine, B>
-{
+impl<'engine, B: Backend> Iterator for PiecePredictor<'engine, B> {
     type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -874,17 +865,13 @@ impl<'engine, B: Backend> Iterator
     }
 }
 
-impl<'engine, B: Backend> From<PiecePredictor<'engine, B>>
-    for String
-{
+impl<'engine, B: Backend> From<PiecePredictor<'engine, B>> for String {
     fn from(predictor: PiecePredictor<'engine, B>) -> Self {
         predictor.into_text()
     }
 }
 
-impl<'engine, B: Backend> From<PiecePredictor<'engine, B>>
-    for Vec<Token>
-{
+impl<'engine, B: Backend> From<PiecePredictor<'engine, B>> for Vec<Token> {
     fn from(predictor: PiecePredictor<'engine, B>) -> Self {
         predictor.inner.inner.tokens
     }
@@ -910,7 +897,9 @@ impl<'engine, B: Backend> Predictor<'engine, B> {
         options: PredictOptions,
     ) -> Self {
         let piece_predictor = PiecePredictor::new(engine, tokens, options);
-        Self { inner: piece_predictor }
+        Self {
+            inner: piece_predictor,
+        }
     }
 
     /// Convert into the tokens and text that have been predicted so far.
@@ -919,9 +908,7 @@ impl<'engine, B: Backend> Predictor<'engine, B> {
     }
 }
 
-impl<'engine, B: Backend> Iterator
-    for Predictor<'engine, B>
-{
+impl<'engine, B: Backend> Iterator for Predictor<'engine, B> {
     type Item = Predicted;
 
     fn next(&mut self) -> Option<Predicted> {
@@ -933,7 +920,9 @@ impl<'engine, B: Backend> Iterator
 
 #[cfg(all(test, feature = "llama-cpp"))]
 mod tests {
-    use crate::{LlamaCppEngine, PredictOptions, RepetitionOptions, SampleOptions, Token};
+    use crate::{
+        LlamaCppEngine, PredictOptions, RepetitionOptions, SampleOptions, Token,
+    };
     use std::{num::NonZeroUsize, path::PathBuf};
 
     const PROMPT: &str = "The quick brown fox jumps over the lazy dog.";
@@ -968,8 +957,7 @@ mod tests {
         let mut opts = PredictOptions::greedy().add_stop(".".to_owned());
         opts.n = NonZeroUsize::new(2 + expected.len()).unwrap();
 
-        let actual: Vec<Token> =
-            engine.predict_tokens(prefix, opts).collect();
+        let actual: Vec<Token> = engine.predict_tokens(prefix, opts).collect();
 
         assert_eq!(actual, expected);
     }

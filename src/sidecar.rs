@@ -113,9 +113,7 @@ pub fn load_sample_options(
 /// returned `Ok(None)`.
 ///
 /// [`Session::from_path*`]: crate::Session::from_path
-pub fn write_default_sample_options(
-    path: &Path,
-) -> Result<(), SidecarError> {
+pub fn write_default_sample_options(path: &Path) -> Result<(), SidecarError> {
     let opts = SampleOptions::default();
     let body = toml::to_string_pretty(&opts)?;
     let header = "# drama_llama per-model sampling sidecar.\n\
@@ -183,10 +181,8 @@ mod tests {
     /// Test-local tempfile dir that doesn't depend on the `tempfile`
     /// crate (which isn't in the dev-dependencies list).
     fn tempfile_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "drama_llama_sidecar_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("drama_llama_sidecar_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

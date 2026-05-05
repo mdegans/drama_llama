@@ -15,9 +15,9 @@ use crate::{
 };
 
 #[cfg(feature = "llama-cpp")]
-use std::ops::Deref;
-#[cfg(feature = "llama-cpp")]
 use llama_cpp_sys_3::llama_token_data_array;
+#[cfg(feature = "llama-cpp")]
+use std::ops::Deref;
 
 /// Sort state of the candidates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -327,9 +327,11 @@ impl Candidates {
         T: IntoIterator<Item = f32>,
     {
         Self::from_iter(
-            (0..)
-                .zip(it.into_iter())
-                .map(|(id, logit)| TokenData { id, logit, p: 0.0 }),
+            (0..).zip(it.into_iter()).map(|(id, logit)| TokenData {
+                id,
+                logit,
+                p: 0.0,
+            }),
         )
     }
 
@@ -384,7 +386,8 @@ impl Candidates {
     #[cfg(feature = "llama-cpp")]
     pub fn into_llama_token_data_array(mut self) -> llama_token_data_array {
         let size = self.len().get();
-        let data = self.data.as_mut_ptr() as *mut llama_cpp_sys_3::llama_token_data;
+        let data =
+            self.data.as_mut_ptr() as *mut llama_cpp_sys_3::llama_token_data;
         let sorted =
             self.is_sorted().by_logit().is_some_and(|n| n.get() == size);
         std::mem::forget(self);
@@ -427,11 +430,8 @@ impl Candidates {
         softmax_applied_to: Option<NonZeroUsize>,
     ) -> Self {
         assert!(!arr.data.is_null());
-        let data: Vec<TokenData> = Vec::from_raw_parts(
-            arr.data as *mut TokenData,
-            arr.size,
-            arr.size,
-        );
+        let data: Vec<TokenData> =
+            Vec::from_raw_parts(arr.data as *mut TokenData, arr.size, arr.size);
 
         if arr.sorted {
             debug_assert!(data.windows(2).all(|w| w[0].logit >= w[1].logit));
@@ -1867,10 +1867,7 @@ mod tests {
     fn test_sample_tail_free() {
         // Early return when len <= 2.
         let c2 = Candidates::new(2usize).unwrap();
-        let out = c2.tail_free(
-            0.5.try_into().unwrap(),
-            1.try_into().unwrap(),
-        );
+        let out = c2.tail_free(0.5.try_into().unwrap(), 1.try_into().unwrap());
         assert_eq!(out.len(), NonZeroUsize::new(2).unwrap());
 
         // Happy path: a distribution with a sharp elbow at index 3 should
@@ -1885,10 +1882,7 @@ mod tests {
         for i in 3..n {
             c.data[i].logit = 0.0;
         }
-        let out = c.tail_free(
-            0.3.try_into().unwrap(),
-            1.try_into().unwrap(),
-        );
+        let out = c.tail_free(0.3.try_into().unwrap(), 1.try_into().unwrap());
         // At z=0.3 the cumulative second-derivative mass crosses early —
         // result should be strictly smaller than n and preserve ordering.
         assert!(out.len().get() < n);
@@ -1898,7 +1892,11 @@ mod tests {
             .all(|(a, b)| a.logit >= b.logit));
     }
 
-    fn snapshot_opts(top_k: usize, p_threshold: f32, compute_entropy: bool) -> SnapshotOpts {
+    fn snapshot_opts(
+        top_k: usize,
+        p_threshold: f32,
+        compute_entropy: bool,
+    ) -> SnapshotOpts {
         SnapshotOpts {
             top_k: NonZeroUsize::new(top_k).unwrap(),
             p_threshold,
@@ -1942,7 +1940,11 @@ mod tests {
         let logits: Vec<f32> = vec![0.0; 50];
         let c = Candidates::from_logits(logits.into_iter());
         let snap = c.capture_snapshot(&snapshot_opts(20, 0.5, false));
-        assert_eq!(snap.top_k.len(), 1, "argmax must be retained even when below threshold");
+        assert_eq!(
+            snap.top_k.len(),
+            1,
+            "argmax must be retained even when below threshold"
+        );
     }
 
     #[test]

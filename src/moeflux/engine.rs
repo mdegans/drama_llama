@@ -89,19 +89,12 @@ impl MoefluxEngine {
     /// flat sibling layout (`<stem>-mlx-4bit/`, `<stem>-artifacts/`,
     /// `<stem>-root/`); migration via the moeflux conversion script
     /// is tracked in `.claude/memory/`.
-    pub fn from_path(
-        parent: &Path,
-    ) -> Result<Self, MoefluxEngineError> {
+    pub fn from_path(parent: &Path) -> Result<Self, MoefluxEngineError> {
         let mlx_dir = parent.join("mlx");
         let artifacts_dir = parent.join("artifacts");
         let experts_dir = parent.join("root");
-        let mut engine = Self::from_paths(
-            &mlx_dir,
-            &artifacts_dir,
-            &experts_dir,
-            8,
-            false,
-        )?;
+        let mut engine =
+            Self::from_paths(&mlx_dir, &artifacts_dir, &experts_dir, 8, false)?;
         // Override the model's display name to the parent dir's
         // basename — that's what blallama-style discovery flows
         // address the model by, and what they expect to see echoed

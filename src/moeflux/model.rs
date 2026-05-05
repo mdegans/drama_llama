@@ -92,9 +92,7 @@ impl MoefluxModel {
     /// Optional:
     /// - `chat_template.jinja` — preferred chat template source.
     ///   Falls back to `tokenizer_config.chat_template` if absent.
-    pub fn from_mlx_dir(
-        mlx_dir: &Path,
-    ) -> Result<Self, MoefluxModelError> {
+    pub fn from_mlx_dir(mlx_dir: &Path) -> Result<Self, MoefluxModelError> {
         let tokenizer_path = mlx_dir.join("tokenizer.json");
         if !tokenizer_path.exists() {
             return Err(MoefluxModelError::MissingArtifact("tokenizer.json"));
@@ -109,14 +107,15 @@ impl MoefluxModel {
                 |_| MoefluxModelError::MissingArtifact("tokenizer_config.json"),
             )?;
 
-        let chat_template =
-            read_optional_text(&mlx_dir.join("chat_template.jinja"))
-                .or_else(|| {
-                    tokenizer_config
-                        .get("chat_template")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned)
-                });
+        let chat_template = read_optional_text(
+            &mlx_dir.join("chat_template.jinja"),
+        )
+        .or_else(|| {
+            tokenizer_config
+                .get("chat_template")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
 
         let eos = resolve_eos(&config, &tokenizer_config, &tokenizer);
         let bos = resolve_bos(&config, &tokenizer_config, &tokenizer);
@@ -175,11 +174,7 @@ fn encode_to_tokens(
     let encoding = tokenizer
         .encode(input, add_special_tokens)
         .expect("tokenizer::encode failed — malformed input?");
-    encoding
-        .get_ids()
-        .iter()
-        .map(|&id| id as Token)
-        .collect()
+    encoding.get_ids().iter().map(|&id| id as Token).collect()
 }
 
 impl Model for MoefluxModel {
@@ -200,9 +195,7 @@ impl Model for MoefluxModel {
                     .and_then(|tc| config_i64(tc, "vocab_size"))
             })
             .map(|v| v as i32)
-            .unwrap_or_else(|| {
-                self.tokenizer.get_vocab_size(true) as i32
-            })
+            .unwrap_or_else(|| self.tokenizer.get_vocab_size(true) as i32)
     }
 
     fn bos(&self) -> Token {
@@ -232,8 +225,7 @@ impl Model for MoefluxModel {
             let n = self.n_vocab();
             let mut max_len = 0usize;
             for id in 0..n {
-                let Some(piece) = self.tokenizer.id_to_token(id as u32)
-                else {
+                let Some(piece) = self.tokenizer.id_to_token(id as u32) else {
                     continue;
                 };
                 max_len = max_len.max(piece.len());
@@ -324,18 +316,15 @@ fn resolve_eos(
                 }
             }
             JsonValue::Array(arr) => {
-                if let Some(first) =
-                    arr.iter().find_map(|v| v.as_i64())
-                {
+                if let Some(first) = arr.iter().find_map(|v| v.as_i64()) {
                     return first as Token;
                 }
             }
             _ => {}
         }
     }
-    if let Some(tok) = tokenizer_config
-        .get("eos_token")
-        .and_then(|v| v.as_str())
+    if let Some(tok) =
+        tokenizer_config.get("eos_token").and_then(|v| v.as_str())
     {
         if let Some(id) = tokenizer.token_to_id(tok) {
             return id as Token;
@@ -376,9 +365,8 @@ fn resolve_bos(
     if let Some(n) = config.get("bos_token_id").and_then(|v| v.as_i64()) {
         return n as Token;
     }
-    if let Some(tok) = tokenizer_config
-        .get("bos_token")
-        .and_then(|v| v.as_str())
+    if let Some(tok) =
+        tokenizer_config.get("bos_token").and_then(|v| v.as_str())
     {
         if let Some(id) = tokenizer.token_to_id(tok) {
             return id as Token;

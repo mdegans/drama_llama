@@ -15,11 +15,11 @@ use llama_cpp_sys_3::{
     llama_get_embeddings_ith, llama_get_logits_ith, llama_get_memory,
     llama_log_set, llama_memory_clear, llama_memory_seq_add,
     llama_memory_seq_cp, llama_memory_seq_div, llama_memory_seq_keep,
-    llama_memory_seq_pos_max, llama_memory_seq_rm,
-    llama_n_batch, llama_n_ctx, llama_new_context_with_model, llama_numa_init,
-    llama_perf_context, llama_perf_context_data, llama_perf_context_reset,
-    llama_pos, llama_seq_id, llama_set_n_threads, llama_state_get_data,
-    llama_state_get_size, llama_state_set_data,
+    llama_memory_seq_pos_max, llama_memory_seq_rm, llama_n_batch, llama_n_ctx,
+    llama_new_context_with_model, llama_numa_init, llama_perf_context,
+    llama_perf_context_data, llama_perf_context_reset, llama_pos, llama_seq_id,
+    llama_set_n_threads, llama_state_get_data, llama_state_get_size,
+    llama_state_set_data,
 };
 
 use thiserror::Error;
@@ -248,9 +248,8 @@ impl LlamaCppDecoder {
     pub fn set_state(&mut self, state: &[u8]) {
         let len = self.state_size();
         assert_eq!(state.len(), len);
-        let copied = unsafe {
-            llama_state_set_data(self.context, state.as_ptr(), len)
-        };
+        let copied =
+            unsafe { llama_state_set_data(self.context, state.as_ptr(), len) };
         assert_eq!(copied, len);
     }
 
@@ -453,8 +452,8 @@ impl Decoder for LlamaCppDecoder {
         pos: usize,
         seq_id: i32,
     ) -> Result<&[f32], Self::Error> {
-        let mut batch = Batch::new(1, 0, 1)
-            .expect("step batch allocation failed");
+        let mut batch =
+            Batch::new(1, 0, 1).expect("step batch allocation failed");
         let seq_ids = [seq_id];
         batch
             .add_token(token, pos, Some(&seq_ids), true)
@@ -471,12 +470,7 @@ impl Decoder for LlamaCppDecoder {
         LlamaCppDecoder::memory_clear(self);
     }
 
-    fn memory_seq_rm(
-        &mut self,
-        seq_id: i32,
-        p0: i32,
-        p1: i32,
-    ) -> bool {
+    fn memory_seq_rm(&mut self, seq_id: i32, p0: i32, p1: i32) -> bool {
         LlamaCppDecoder::memory_seq_rm(self, seq_id, p0, p1)
     }
 

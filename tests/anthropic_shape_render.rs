@@ -27,12 +27,8 @@ fn template_path() -> PathBuf {
 fn load_template() -> ChatTemplate {
     let source = std::fs::read_to_string(template_path())
         .expect("Qwen3 chat_template.jinja missing");
-    ChatTemplate::from_source(
-        source,
-        String::new(),
-        "<|im_end|>".to_string(),
-    )
-    .expect("template compiles")
+    ChatTemplate::from_source(source, String::new(), "<|im_end|>".to_string())
+        .expect("template compiles")
 }
 
 fn opts() -> RenderOptions {
@@ -127,8 +123,7 @@ fn deserialize_and_render_anthropic_shape() {
         ]
     });
 
-    let prompt: Prompt =
-        serde_json::from_value(body).expect("deserialize ok");
+    let prompt: Prompt = serde_json::from_value(body).expect("deserialize ok");
     eprintln!(
         "=== deserialized prompt ===\nsystem: {:#?}\nmessages: {:#?}\n=== end ===",
         prompt.system, prompt.messages,
@@ -171,10 +166,7 @@ fn render_with_breakpoints_survives_after_system_breakpoint() {
         .render_with_breakpoints(&prompt, &opts())
         .expect("render_with_breakpoints must succeed even when AfterSystem partial fails");
     eprintln!("=== full ===\n{}\n=== end ===", rendered.text);
-    eprintln!(
-        "=== {} partials ===",
-        rendered.partial_texts.len()
-    );
+    eprintln!("=== {} partials ===", rendered.partial_texts.len());
     for (i, p) in rendered.partial_texts.iter().enumerate() {
         eprintln!("--- partial {i} ---\n{p}");
     }

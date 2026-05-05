@@ -40,9 +40,7 @@ fn probe_hook_fires_once_per_yielded_token() {
     )
     .unwrap();
 
-    engine.set_probe_hook(Some(Box::new(CountingHook {
-        log: log.clone(),
-    })));
+    engine.set_probe_hook(Some(Box::new(CountingHook { log: log.clone() })));
 
     let prompt_tokens = engine.model.tokenize(PROMPT, false);
     let prompt_len = prompt_tokens.len();
@@ -50,7 +48,8 @@ fn probe_hook_fires_once_per_yielded_token() {
     let mut opts = PredictOptions::greedy();
     opts.n = NonZeroUsize::new(N_STEPS).unwrap();
 
-    let yielded: Vec<Token> = engine.predict_tokens(prompt_tokens, opts).collect();
+    let yielded: Vec<Token> =
+        engine.predict_tokens(prompt_tokens, opts).collect();
 
     let recorded = log.lock().unwrap().clone();
 
@@ -64,13 +63,17 @@ fn probe_hook_fires_once_per_yielded_token() {
     );
 
     // Tokens recorded by the hook match the iterator's yields.
-    let recorded_tokens: Vec<Token> = recorded.iter().map(|&(t, _)| t).collect();
+    let recorded_tokens: Vec<Token> =
+        recorded.iter().map(|&(t, _)| t).collect();
     assert_eq!(recorded_tokens, yielded);
 
     // n_cur is monotonically increasing and starts at the prefill end.
     let positions: Vec<usize> = recorded.iter().map(|&(_, p)| p).collect();
     for window in positions.windows(2) {
-        assert!(window[1] > window[0], "positions must be strictly increasing: {positions:?}");
+        assert!(
+            window[1] > window[0],
+            "positions must be strictly increasing: {positions:?}"
+        );
     }
     assert_eq!(
         positions[0], prompt_len,
@@ -88,9 +91,7 @@ fn probe_hook_can_be_cleared() {
     )
     .unwrap();
 
-    engine.set_probe_hook(Some(Box::new(CountingHook {
-        log: log.clone(),
-    })));
+    engine.set_probe_hook(Some(Box::new(CountingHook { log: log.clone() })));
     engine.set_probe_hook(None);
 
     let prompt_tokens = engine.model.tokenize(PROMPT, false);

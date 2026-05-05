@@ -85,12 +85,7 @@ pub trait Decoder {
     /// Remove KV entries for `seq_id` in position range `[p0, p1)`.
     /// `p0 < 0` means from 0; `p1 < 0` means to the end. `seq_id < 0`
     /// matches any sequence. Returns `true` on success.
-    fn memory_seq_rm(
-        &mut self,
-        seq_id: i32,
-        p0: i32,
-        p1: i32,
-    ) -> bool;
+    fn memory_seq_rm(&mut self, seq_id: i32, p0: i32, p1: i32) -> bool;
 
     /// Copy KV entries from `src` seq to `dst` seq in `[p0, p1)`.
     fn memory_seq_cp(&mut self, src: i32, dst: i32, p0: i32, p1: i32);

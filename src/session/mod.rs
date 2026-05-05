@@ -79,7 +79,8 @@ use std::{num::NonZeroUsize, path::PathBuf};
 use misanthropic::response::Usage;
 
 use crate::{
-    backend::{Backend, Model}, chat_template::tokenize_with_breakpoints,
+    backend::{Backend, Model},
+    chat_template::tokenize_with_breakpoints,
     grammar_for_prompt, output_config, ChatTemplate, ChatTemplateError, Engine,
     OutputConfigError, OutputConfigOptions, PredictOptions, Prompt,
     RenderOptions, RepetitionOptions, SampleOptions, SamplingMode, Token,
@@ -264,9 +265,7 @@ fn compute_l_hit(
         .find(|&&bp| bp <= safe && bp > 0)
         .copied()
         .unwrap_or(0);
-    let tip_best = internal_tip
-        .filter(|&t| t <= safe && t > 0)
-        .unwrap_or(0);
+    let tip_best = internal_tip.filter(|&t| t <= safe && t > 0).unwrap_or(0);
     user_best.max(tip_best)
 }
 
@@ -1051,9 +1050,10 @@ impl<B: Backend> Session<B> {
         // gets a checkpoint so the next turn can rewind to that
         // boundary lossless.
         let mut prefill_start = effective_cache_read;
-        for &bp in new_breakpoints.iter().filter(|&&bp| {
-            bp > effective_cache_read && bp < new_tokens.len()
-        }) {
+        for &bp in new_breakpoints
+            .iter()
+            .filter(|&&bp| bp > effective_cache_read && bp < new_tokens.len())
+        {
             if bp > prefill_start {
                 self.engine
                     .prefill_chunk(
@@ -1116,10 +1116,7 @@ impl<B: Backend> Session<B> {
         // breakpoint (rare, but possible — chunked-prefill snapshots
         // share the same engine.checkpoint_pos slot, so freeing one
         // would lose the other).
-        let old_tip = self
-            .prefix_cache
-            .as_ref()
-            .and_then(|c| c.internal_tip);
+        let old_tip = self.prefix_cache.as_ref().and_then(|c| c.internal_tip);
         if let Some(cache) = self.prefix_cache.as_mut() {
             cache.prev_tokens = new_tokens;
             cache.prev_breakpoints = new_breakpoints;
@@ -1272,7 +1269,12 @@ impl<B: Backend> Session<B> {
             self.engine.checkpoint_pos(0, head as i32);
         }
 
-        self.record_cache_hit(extended_prev, breakpoints, cache_read, internal_tip);
+        self.record_cache_hit(
+            extended_prev,
+            breakpoints,
+            cache_read,
+            internal_tip,
+        );
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
         self.record_usage(usage);
@@ -1405,9 +1407,8 @@ impl<B: Backend> Session<B> {
 
         let mut eos_pieces: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
-        eos_pieces.insert(
-            self.engine.model.token_to_piece(self.engine.model.eos()),
-        );
+        eos_pieces
+            .insert(self.engine.model.token_to_piece(self.engine.model.eos()));
         let eot_id = self.engine.model.eot();
         if eot_id >= 0 {
             eos_pieces.insert(self.engine.model.token_to_piece(eot_id));
@@ -1485,9 +1486,8 @@ impl<B: Backend> Session<B> {
         // than silently swallow every empty piece.
         let mut eos_pieces: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
-        eos_pieces.insert(
-            self.engine.model.token_to_piece(self.engine.model.eos()),
-        );
+        eos_pieces
+            .insert(self.engine.model.token_to_piece(self.engine.model.eos()));
         let eot_id = self.engine.model.eot();
         if eot_id >= 0 {
             eos_pieces.insert(self.engine.model.token_to_piece(eot_id));
@@ -1511,10 +1511,7 @@ impl<B: Backend> Session<B> {
         let mut grammar_handles: Vec<SamplingMode> = modes
             .iter()
             .filter(|m| {
-                matches!(
-                    m,
-                    SamplingMode::Grammar(_) | SamplingMode::Json(_)
-                )
+                matches!(m, SamplingMode::Grammar(_) | SamplingMode::Json(_))
             })
             .cloned()
             .collect();
@@ -1623,7 +1620,12 @@ impl<B: Backend> Session<B> {
         // Cache + usage bookkeeping, then grammar-violation check.
         // Check last so a violation still records the work that was
         // done — usage numbers are correct either way.
-        self.record_cache_hit(extended_prev, breakpoints, cache_read, internal_tip);
+        self.record_cache_hit(
+            extended_prev,
+            breakpoints,
+            cache_read,
+            internal_tip,
+        );
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
         self.record_usage(usage);
@@ -1673,21 +1675,15 @@ impl<B: Backend> Session<B> {
                 let entry = hist.entry(*t).or_insert((0, p.clone()));
                 entry.0 += 1;
             }
-            let mut hist_vec: Vec<(Token, usize, String)> = hist
-                .into_iter()
-                .map(|(t, (c, p))| (t, c, p))
-                .collect();
+            let mut hist_vec: Vec<(Token, usize, String)> =
+                hist.into_iter().map(|(t, (c, p))| (t, c, p)).collect();
             hist_vec.sort_by(|a, b| b.1.cmp(&a.1));
             // First 16 token IDs (in emission order) and last 16 — the
             // loop boundary is usually near the end.
             let head: Vec<_> =
                 token_dump.iter().take(16).map(|(t, _)| *t).collect();
-            let tail: Vec<_> = token_dump
-                .iter()
-                .rev()
-                .take(16)
-                .map(|(t, _)| *t)
-                .collect();
+            let tail: Vec<_> =
+                token_dump.iter().rev().take(16).map(|(t, _)| *t).collect();
             tracing::debug!(
                 event = "raw_generation",
                 generated_tokens = generated_count,
@@ -1950,10 +1946,9 @@ fn resolve_grammar(
     if let Some(g) = grammar_for_prompt(prompt, tool_choice_opts)? {
         return Ok(Some(crate::CompiledOutputConfig::Single(g)));
     }
-    if let Some(c) = output_config::compile_prompt_output_config(
-        prompt,
-        output_config_opts,
-    )? {
+    if let Some(c) =
+        output_config::compile_prompt_output_config(prompt, output_config_opts)?
+    {
         return Ok(Some(c));
     }
     Ok(None)
@@ -2110,7 +2105,9 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                 Some(piece) => {
                     // Skip the sentinel pieces — they aren't content.
                     // Everything else goes through the parser.
-                    if self.eos_pieces.contains(&piece) || piece == "[Invalid UTF-8]" {
+                    if self.eos_pieces.contains(&piece)
+                        || piece == "[Invalid UTF-8]"
+                    {
                         continue;
                     }
                     let blocks = self.parser.push(&piece);
@@ -2283,8 +2280,7 @@ mod tests {
     #[test]
     fn test_l_hit_computation_bpe_backoff() {
         let prev: Vec<Token> = (0..10).collect();
-        let new_: Vec<Token> =
-            (0..5).chain(200..205).chain(300..305).collect();
+        let new_: Vec<Token> = (0..5).chain(200..205).chain(300..305).collect();
         let breakpoints = vec![5];
         assert_eq!(longest_common_prefix_len(&prev, &new_), 5);
         assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), 0);
@@ -2458,9 +2454,8 @@ mod tests {
             },
         )
         .expect("resolve");
-        let crate::CompiledOutputConfig::Single(SamplingMode::Grammar(
-            state,
-        )) = got.expect("some compiled config")
+        let crate::CompiledOutputConfig::Single(SamplingMode::Grammar(state)) =
+            got.expect("some compiled config")
         else {
             panic!("expected Single(Grammar) variant");
         };
@@ -2484,9 +2479,7 @@ mod tests {
         };
         let prompt = Prompt {
             functions: Some(vec![tool]),
-            tool_choice: Some(crate::ToolChoice::Method {
-                name: "foo".into(),
-            }),
+            tool_choice: Some(crate::ToolChoice::Method { name: "foo".into() }),
             ..Prompt::default()
         }
         .json_schema(serde_json::json!({
@@ -2500,9 +2493,8 @@ mod tests {
             &OutputConfigOptions::default(),
         )
         .expect("resolve");
-        let crate::CompiledOutputConfig::Single(SamplingMode::Grammar(
-            state,
-        )) = got.expect("some compiled config")
+        let crate::CompiledOutputConfig::Single(SamplingMode::Grammar(state)) =
+            got.expect("some compiled config")
         else {
             panic!("expected Single(Grammar) variant for tool_choice");
         };

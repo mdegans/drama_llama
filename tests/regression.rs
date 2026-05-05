@@ -103,7 +103,8 @@ fn partial_top_k(candidates: &Candidates, k: usize) -> Vec<TokenData> {
 }
 
 fn capture() -> Golden {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
     let mut engine = LlamaCppEngine::from_path(path).unwrap().quiet();
 
     let prompt_tokens = engine.model.tokenize(PROMPT, true);
@@ -151,8 +152,10 @@ fn capture() -> Golden {
             .collect()
     };
 
-    let logits_step_0 = topk_to_entries(step_0_raw.expect("step 0 never captured"));
-    let logits_step_n = topk_to_entries(step_n_raw.expect("step N never captured"));
+    let logits_step_0 =
+        topk_to_entries(step_0_raw.expect("step 0 never captured"));
+    let logits_step_n =
+        topk_to_entries(step_n_raw.expect("step N never captured"));
     let pieces: Vec<String> = tokens
         .iter()
         .map(|&t| engine.model.token_to_piece(t))
@@ -239,10 +242,7 @@ fn regression_llama_cpp_baseline() {
         current.prompt_tokens, golden.prompt_tokens,
         "prompt tokenization drifted"
     );
-    assert_eq!(
-        current.tokens, golden.tokens,
-        "greedy token stream drifted"
-    );
+    assert_eq!(current.tokens, golden.tokens, "greedy token stream drifted");
     assert_eq!(current.pieces, golden.pieces, "decoded pieces drifted");
     assert_topk_close(
         "logits_step_0",

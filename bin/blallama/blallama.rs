@@ -316,18 +316,18 @@ mod llama_cpp_run {
     async fn route_messages(
         State(state): State<AppState<LlamaCppBackend>>,
         Json(prompt): Json<Prompt>,
-    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
-    {
-        let models = match list_entries(&state.args.model_path, |m| m.is_file()).await {
-            Ok(models) => models,
-            Err(e) => {
-                let e = AnthropicError::NotFound {
-                    message: format!("Models could not be loaded: {e}"),
-                };
-                error!(error = %e);
-                return Err((StatusCode::NOT_FOUND, Json(e)));
-            }
-        };
+    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
+        let models =
+            match list_entries(&state.args.model_path, |m| m.is_file()).await {
+                Ok(models) => models,
+                Err(e) => {
+                    let e = AnthropicError::NotFound {
+                        message: format!("Models could not be loaded: {e}"),
+                    };
+                    error!(error = %e);
+                    return Err((StatusCode::NOT_FOUND, Json(e)));
+                }
+            };
 
         if !models.contains(&prompt.model.to_string()) {
             let e = AnthropicError::NotFound {
@@ -347,8 +347,7 @@ mod llama_cpp_run {
     async fn complete(
         state: AppState<LlamaCppBackend>,
         prompt: Prompt,
-    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
-    {
+    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
         let mut lock = match state.session.try_lock() {
             Ok(lock) => lock,
             Err(_) => {
@@ -363,11 +362,8 @@ mod llama_cpp_run {
 
         let mut session = match lock.take() {
             Some(session) => {
-                let display = session
-                    .engine()
-                    .model
-                    .display_name()
-                    .unwrap_or_default();
+                let display =
+                    session.engine().model.display_name().unwrap_or_default();
                 if display == prompt.model.to_string() {
                     session
                 } else {
@@ -418,13 +414,12 @@ mod llama_cpp_run {
         // restored to the lock — otherwise a `complete_response` error
         // drops it and the next request reloads from disk. See
         // `is_reusable_after` for the reuse-vs-reload classification.
-        let (session, result, elapsed) =
-            spawn_blocking_or_bust(move || {
-                let start = std::time::Instant::now();
-                let result = session.complete_response_id(&prompt, id);
-                (session, result, start.elapsed())
-            })
-            .await;
+        let (session, result, elapsed) = spawn_blocking_or_bust(move || {
+            let start = std::time::Instant::now();
+            let result = session.complete_response_id(&prompt, id);
+            (session, result, start.elapsed())
+        })
+        .await;
 
         // SessionEnd fires regardless of generation success — the
         // probe stream is a flight recorder, not a control channel.
@@ -545,18 +540,18 @@ mod moeflux_run {
     async fn route_messages(
         State(state): State<AppState<MoefluxBackend>>,
         Json(prompt): Json<Prompt>,
-    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
-    {
-        let models = match list_entries(&state.args.model_path, |m| m.is_dir()).await {
-            Ok(models) => models,
-            Err(e) => {
-                let e = AnthropicError::NotFound {
-                    message: format!("Models could not be loaded: {e}"),
-                };
-                error!(error = %e);
-                return Err((StatusCode::NOT_FOUND, Json(e)));
-            }
-        };
+    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
+        let models =
+            match list_entries(&state.args.model_path, |m| m.is_dir()).await {
+                Ok(models) => models,
+                Err(e) => {
+                    let e = AnthropicError::NotFound {
+                        message: format!("Models could not be loaded: {e}"),
+                    };
+                    error!(error = %e);
+                    return Err((StatusCode::NOT_FOUND, Json(e)));
+                }
+            };
 
         if !models.contains(&prompt.model.to_string()) {
             let e = AnthropicError::NotFound {
@@ -576,8 +571,7 @@ mod moeflux_run {
     async fn complete(
         state: AppState<MoefluxBackend>,
         prompt: Prompt,
-    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
-    {
+    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
         let mut lock = match state.session.try_lock() {
             Ok(lock) => lock,
             Err(_) => {
@@ -592,11 +586,8 @@ mod moeflux_run {
 
         let mut session = match lock.take() {
             Some(session) => {
-                let display = session
-                    .engine()
-                    .model
-                    .display_name()
-                    .unwrap_or_default();
+                let display =
+                    session.engine().model.display_name().unwrap_or_default();
                 if display == prompt.model.to_string() {
                     session
                 } else {
@@ -643,13 +634,12 @@ mod moeflux_run {
 
         // See llama-cpp variant + `is_reusable_after` doc-comment for
         // the reuse-vs-reload rationale.
-        let (session, result, elapsed) =
-            spawn_blocking_or_bust(move || {
-                let start = std::time::Instant::now();
-                let result = session.complete_response_id(&prompt, id);
-                (session, result, start.elapsed())
-            })
-            .await;
+        let (session, result, elapsed) = spawn_blocking_or_bust(move || {
+            let start = std::time::Instant::now();
+            let result = session.complete_response_id(&prompt, id);
+            (session, result, start.elapsed())
+        })
+        .await;
         let prefetch_stats = session.prefetch_stats();
 
         if let Some(bus) = &state.probe_bus {
@@ -687,12 +677,10 @@ mod moeflux_run {
             model,
             path = path.to_string_lossy().as_ref()
         );
-        spawn_blocking_or_bust(|| {
-            Session::<MoefluxBackend>::from_path(path)
-        })
-        .await
-        .map(|s| configure_session(s, no_penalty, seed))
-        .map_err(map_session_err)
+        spawn_blocking_or_bust(|| Session::<MoefluxBackend>::from_path(path))
+            .await
+            .map(|s| configure_session(s, no_penalty, seed))
+            .map_err(map_session_err)
     }
 }
 
@@ -772,7 +760,8 @@ fn install_per_request_hooks<B: Backend>(
 ) {
     let mut hooks: Vec<Box<dyn ProbeHook>> = Vec::new();
     if let Some(tx) = record_json_tx {
-        let model_name = session.engine().model.display_name().unwrap_or_default();
+        let model_name =
+            session.engine().model.display_name().unwrap_or_default();
         hooks.push(Box::new(JsonlProbeRecorder::install(
             tx.clone(),
             model_name.as_str(),
@@ -798,7 +787,6 @@ fn install_per_request_hooks<B: Backend>(
 // JSONL probe recorder — per-session ProbeHook decoupled from disk via
 // an unbounded mpsc; a single tokio task drains and writes.
 // ---------------------------------------------------------------------------
-
 
 /// Spawn a single JSONL writer task draining `rx` to `path` (append).
 /// Each message becomes one line. The task exits when every Sender
@@ -934,9 +922,17 @@ impl ProbeHook for JsonlProbeRecorder {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum StreamProbeMsg {
-    SessionStart { id: uuid::Uuid, model: String },
-    Token { id: uuid::Uuid, ctx: serde_json::Value },
-    SessionEnd { id: uuid::Uuid },
+    SessionStart {
+        id: uuid::Uuid,
+        model: String,
+    },
+    Token {
+        id: uuid::Uuid,
+        ctx: serde_json::Value,
+    },
+    SessionEnd {
+        id: uuid::Uuid,
+    },
 }
 
 /// Capacity of the broadcast channel. Tokens cap at ~50 tok/s on Apple
@@ -1144,9 +1140,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the Sender) and the /probe SSE handler (calls `subscribe()` on
     // each consumer connect).
     let probe_bus = if args.probe_stream {
-        Some(tokio::sync::broadcast::channel::<StreamProbeMsg>(
-            PROBE_BROADCAST_CAPACITY,
-        ).0)
+        Some(
+            tokio::sync::broadcast::channel::<StreamProbeMsg>(
+                PROBE_BROADCAST_CAPACITY,
+            )
+            .0,
+        )
     } else {
         None
     };
@@ -1177,7 +1176,8 @@ mod tests {
     /// field shape; this catches accidental shape changes.
     #[test]
     fn stream_probe_msg_wire_format() {
-        let id = uuid::Uuid::from_u128(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
+        let id =
+            uuid::Uuid::from_u128(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
         let id_str = id.to_string();
 
         let start = serde_json::to_value(&StreamProbeMsg::SessionStart {
@@ -1198,7 +1198,8 @@ mod tests {
         assert_eq!(token["id"], id_str);
         assert_eq!(token["ctx"]["token"], 42);
 
-        let end = serde_json::to_value(&StreamProbeMsg::SessionEnd { id }).unwrap();
+        let end =
+            serde_json::to_value(&StreamProbeMsg::SessionEnd { id }).unwrap();
         assert_eq!(end["event"], "session_end");
         assert_eq!(end["id"], id_str);
     }
@@ -1258,9 +1259,9 @@ mod tests {
     /// override of the `opts` field.
     #[test]
     fn streaming_recorder_advertises_its_opts() {
-        let (bus, _rx) =
-            tokio::sync::broadcast::channel::<StreamProbeMsg>(4);
-        let id = uuid::Uuid::from_u128(0xDEADBEEF_DEADBEEF_DEADBEEF_DEADBEEFu128);
+        let (bus, _rx) = tokio::sync::broadcast::channel::<StreamProbeMsg>(4);
+        let id =
+            uuid::Uuid::from_u128(0xDEADBEEF_DEADBEEF_DEADBEEF_DEADBEEFu128);
         let opts = SnapshotOpts {
             top_k: NonZeroUsize::new(50).unwrap(),
             p_threshold: 0.001,

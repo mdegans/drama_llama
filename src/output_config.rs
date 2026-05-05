@@ -31,7 +31,9 @@ use std::fmt::Write;
 
 use misanthropic::prompt::output::{OutputConfig, OutputFormat};
 
-use crate::grammar_compile::{emit_thought_rules, schema_to_gbnf, JSON_GRAMMAR};
+use crate::grammar_compile::{
+    emit_thought_rules, schema_to_gbnf, JSON_GRAMMAR,
+};
 use crate::{DeferredGrammar, GrammarError, Prompt, SamplingMode};
 
 /// Byte sequence that triggers deferred-grammar promotion when
@@ -131,7 +133,9 @@ pub fn compile_output_config(
         }))
     } else {
         let source = build_grammar_source(schema, opts);
-        Ok(CompiledOutputConfig::Single(SamplingMode::grammar(&source)?))
+        Ok(CompiledOutputConfig::Single(SamplingMode::grammar(
+            &source,
+        )?))
     }
 }
 
@@ -348,8 +352,7 @@ mod tests {
             allow_thought: true,
             phase_split: false,
         };
-        let compiled =
-            compile_output_config(&config, &opts).expect("compile");
+        let compiled = compile_output_config(&config, &opts).expect("compile");
         let CompiledOutputConfig::Single(SamplingMode::Grammar(state)) =
             compiled
         else {
@@ -372,10 +375,12 @@ mod tests {
             "required": ["ok"],
         }));
         assert!(prompt.thinking.is_none(), "precondition");
-        let compiled =
-            compile_prompt_output_config(&prompt, &OutputConfigOptions::default())
-                .expect("compile")
-                .expect("output_config set");
+        let compiled = compile_prompt_output_config(
+            &prompt,
+            &OutputConfigOptions::default(),
+        )
+        .expect("compile")
+        .expect("output_config set");
         assert!(
             matches!(
                 compiled,
@@ -402,10 +407,12 @@ mod tests {
                 kind: Kind::Enabled,
             });
         assert!(prompt.thinking.is_some(), "precondition");
-        let compiled =
-            compile_prompt_output_config(&prompt, &OutputConfigOptions::default())
-                .expect("compile")
-                .expect("output_config set");
+        let compiled = compile_prompt_output_config(
+            &prompt,
+            &OutputConfigOptions::default(),
+        )
+        .expect("compile")
+        .expect("output_config set");
         assert!(
             matches!(compiled, CompiledOutputConfig::Deferred(_)),
             "expected Deferred variant when thinking is enabled and \
@@ -424,8 +431,7 @@ mod tests {
             allow_thought: false,
             phase_split: true, // ignored since allow_thought is off
         };
-        let compiled =
-            compile_output_config(&config, &opts).expect("compile");
+        let compiled = compile_output_config(&config, &opts).expect("compile");
         assert!(matches!(
             compiled,
             CompiledOutputConfig::Single(SamplingMode::Grammar(_))

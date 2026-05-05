@@ -37,9 +37,7 @@ impl NGram {
     /// Create an Ngram from a slice of [`Token`]. This can fail in cases
     /// where there are either no tokens or `window.len()` >
     /// [`NGram::CAPACITY`].
-    pub fn try_from_tokens(
-        window: &[Token],
-    ) -> Result<Self, NGramNewError> {
+    pub fn try_from_tokens(window: &[Token]) -> Result<Self, NGramNewError> {
         if window.is_empty() {
             cold(); // this branch is unlikely
             return Err(NGramNewError::NotEnoughTokens);
@@ -155,11 +153,7 @@ impl NGramData {
     /// For windowed semantics, call
     /// [`NGramStats::evict_outside_window`] beforehand so older positions
     /// have already been dropped.
-    pub fn windowed_decayed_count(
-        &self,
-        current_step: u64,
-        decay: f32,
-    ) -> f32 {
+    pub fn windowed_decayed_count(&self, current_step: u64, decay: f32) -> f32 {
         self.positions
             .iter()
             .map(|&p| {
@@ -600,11 +594,7 @@ mod tests {
         // and [10] is dropped.
         stats.evict_outside_window(30, 15);
         let data = stats.get(&g).unwrap();
-        assert_eq!(
-            data.count(),
-            2,
-            "count should match remaining positions"
-        );
+        assert_eq!(data.count(), 2, "count should match remaining positions");
         assert_eq!(stats.total_ngram_count(), 2);
         assert_eq!(stats.total_token_count(), 2);
 

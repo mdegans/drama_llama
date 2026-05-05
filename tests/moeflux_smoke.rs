@@ -70,8 +70,10 @@ fn moeflux_loads_and_predicts() {
     let tokens = engine.model.tokenize(prompt, false);
     eprintln!("tokenized {prompt:?} -> {tokens:?}");
     assert!(!tokens.is_empty());
-    let detok: String =
-        tokens.iter().map(|&t| engine.model.token_to_piece(t)).collect();
+    let detok: String = tokens
+        .iter()
+        .map(|&t| engine.model.token_to_piece(t))
+        .collect();
     assert!(
         detok.contains("quick brown fox"),
         "detokenized text should contain the input substring (got {detok:?})"

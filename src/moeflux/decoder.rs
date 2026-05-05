@@ -174,9 +174,9 @@ impl Decoder for MoefluxDecoder {
             return Ok(&[]);
         }
         let (h0, m0) = self.ctx.prefetch_stats();
-        let result = self
-            .ctx
-            .eval_prompt(tokens, start_pos, seq_id, &mut self.logits);
+        let result =
+            self.ctx
+                .eval_prompt(tokens, start_pos, seq_id, &mut self.logits);
         let (h1, m1) = self.ctx.prefetch_stats();
         self.prefetch_stats.prefill_hits += h1.saturating_sub(h0);
         self.prefetch_stats.prefill_misses += m1.saturating_sub(m0);
@@ -191,8 +191,7 @@ impl Decoder for MoefluxDecoder {
         seq_id: i32,
     ) -> Result<&[f32], Self::Error> {
         let (h0, m0) = self.ctx.prefetch_stats();
-        let result =
-            self.ctx.eval_token(token, pos, seq_id, &mut self.logits);
+        let result = self.ctx.eval_token(token, pos, seq_id, &mut self.logits);
         let (h1, m1) = self.ctx.prefetch_stats();
         self.prefetch_stats.decode_hits += h1.saturating_sub(h0);
         self.prefetch_stats.decode_misses += m1.saturating_sub(m0);
@@ -210,12 +209,7 @@ impl Decoder for MoefluxDecoder {
         self.ctx.memory_clear();
     }
 
-    fn memory_seq_rm(
-        &mut self,
-        seq_id: i32,
-        p0: i32,
-        p1: i32,
-    ) -> bool {
+    fn memory_seq_rm(&mut self, seq_id: i32, p0: i32, p1: i32) -> bool {
         self.ctx.memory_seq_rm(seq_id, p0, p1)
     }
 

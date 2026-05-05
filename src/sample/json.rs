@@ -522,8 +522,7 @@ pub(crate) fn json_filter<M: Model>(
     model: &M,
 ) -> Candidates {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    let mut kept: Vec<TokenData> =
-        Vec::with_capacity(candidates.len().get());
+    let mut kept: Vec<TokenData> = Vec::with_capacity(candidates.len().get());
     for cand in candidates.as_slice() {
         buf.clear();
         model.token_to_piece_ref(cand.id, &mut buf);

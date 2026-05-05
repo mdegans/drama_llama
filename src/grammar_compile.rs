@@ -82,7 +82,11 @@ fn emit_schema_rule(
             // permissive value to avoid an unrepresentable grammar.
             let _ = writeln!(out, "{rule_name} ::= value");
         } else {
-            let _ = writeln!(out, "{rule_name} ::= {alts}", alts = sub_names.join(" | "));
+            let _ = writeln!(
+                out,
+                "{rule_name} ::= {alts}",
+                alts = sub_names.join(" | ")
+            );
         }
         return;
     }
@@ -294,7 +298,9 @@ mod tests {
     fn accepts(source: &str, input: &str) -> bool {
         let grammar = match Grammar::parse(source) {
             Ok(g) => g,
-            Err(e) => panic!("grammar failed to parse: {e}\n--- source ---\n{source}"),
+            Err(e) => {
+                panic!("grammar failed to parse: {e}\n--- source ---\n{source}")
+            }
         };
         let mut state = GrammarState::new(Arc::new(grammar));
         if state.advance_bytes(input.as_bytes()).is_err() {

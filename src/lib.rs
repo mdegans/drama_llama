@@ -29,9 +29,9 @@ mod batch;
 pub(crate) use batch::Batch;
 
 mod candidates;
-pub use candidates::{Candidates, Snapshot, SnapshotOpts, Sorted};
 #[cfg(feature = "llama-cpp")]
 pub use candidates::TokenDataArray;
+pub use candidates::{Candidates, Snapshot, SnapshotOpts, Sorted};
 
 pub mod prompt;
 pub use prompt::{
@@ -74,8 +74,8 @@ pub use llama_cpp::{
 pub mod moeflux;
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
 pub use moeflux::{
-    MoefluxBackend, MoefluxDecoder, MoefluxEngine, MoefluxError,
-    MoefluxModel, MoefluxModelError,
+    MoefluxBackend, MoefluxDecoder, MoefluxEngine, MoefluxError, MoefluxModel,
+    MoefluxModelError,
 };
 
 mod ngram;

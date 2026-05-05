@@ -1,6 +1,9 @@
 use crate::{
     llama_cpp::{
-        decoder::{silence_logs, FlashAttention, LlamaCppDecoder, NewError, DecodeError},
+        decoder::{
+            silence_logs, DecodeError, FlashAttention, LlamaCppDecoder,
+            NewError,
+        },
         LlamaCppBackend,
     },
     Batch, Engine, LlamaCppModel,
@@ -255,7 +258,8 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
 
         // --- A: fresh path ---
-        let mut engine_a = LlamaCppEngine::from_path(model_path.clone()).unwrap();
+        let mut engine_a =
+            LlamaCppEngine::from_path(model_path.clone()).unwrap();
         let tokens_a = engine_a.model.tokenize(PROMPT, true);
         assert!(tokens_a.len() >= 4, "prompt tokenization too short");
         let k = tokens_a.len() / 2;

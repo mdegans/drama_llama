@@ -878,9 +878,7 @@ impl StackState {
         for &b in bytes {
             self.feed_byte(grammar, b)?;
         }
-        if !self.pending.is_empty()
-            && !self.pending_can_still_match(grammar)
-        {
+        if !self.pending.is_empty() && !self.pending_can_still_match(grammar) {
             return Err(GrammarError::InvalidUtf8);
         }
         Ok(())
@@ -1161,8 +1159,8 @@ impl DfaCache {
             return *entry;
         }
         let state = self.state_of(sid);
-        let v = state.pending.is_empty()
-            || state.pending_can_still_match(grammar);
+        let v =
+            state.pending.is_empty() || state.pending_can_still_match(grammar);
         self.terminal_valid.insert(sid, v);
         v
     }
@@ -1609,9 +1607,7 @@ pub fn grammar_stats_snapshot() -> GrammarStats {
         filter_us_sum: STATS.filter_us_sum.load(Ordering::Relaxed),
         filter_us_max: STATS.filter_us_max.load(Ordering::Relaxed),
         dfa_states: STATS.dfa_states.load(Ordering::Relaxed),
-        dfa_transition_hits: STATS
-            .dfa_transition_hits
-            .load(Ordering::Relaxed),
+        dfa_transition_hits: STATS.dfa_transition_hits.load(Ordering::Relaxed),
         dfa_transition_misses: STATS
             .dfa_transition_misses
             .load(Ordering::Relaxed),
@@ -1650,7 +1646,9 @@ fn record_stats(
     cache: Option<&DfaCache>,
 ) {
     STATS.calls.fetch_add(1, Ordering::Relaxed);
-    STATS.candidates_in.fetch_add(candidates_in, Ordering::Relaxed);
+    STATS
+        .candidates_in
+        .fetch_add(candidates_in, Ordering::Relaxed);
     STATS
         .candidates_bitmap_pass
         .fetch_add(bitmap_pass, Ordering::Relaxed);
@@ -1754,8 +1752,7 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
             let mut buf: Vec<u8> = Vec::with_capacity(32);
             model.token_to_piece_ref(cand.id, &mut buf);
             if let Some(&first) = buf.first() {
-                if bitmap[(first as usize) >> 6] & (1u64 << (first & 63)) == 0
-                {
+                if bitmap[(first as usize) >> 6] & (1u64 << (first & 63)) == 0 {
                     return a;
                 }
             }

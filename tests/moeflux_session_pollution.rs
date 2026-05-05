@@ -35,9 +35,7 @@ use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use drama_llama::{
-    Content, MoefluxEngine, Message, Prompt, Role, Session,
-};
+use drama_llama::{Content, Message, MoefluxEngine, Prompt, Role, Session};
 
 fn env_path(var: &str, default: &str) -> PathBuf {
     PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
@@ -110,10 +108,7 @@ fn share_long_substring(a: &str, b: &str, window: usize) -> bool {
     let b_bytes = b.as_bytes();
     for i in 0..=a_bytes.len() - window {
         let needle = &a_bytes[i..i + window];
-        if b_bytes
-            .windows(window)
-            .any(|w: &[u8]| w == needle)
-        {
+        if b_bytes.windows(window).any(|w: &[u8]| w == needle) {
             return true;
         }
     }
@@ -177,7 +172,11 @@ fn three_consecutive_completions_do_not_degenerate() {
     for i in 0..outputs.len() {
         for j in (i + 1)..outputs.len() {
             assert!(
-                !share_long_substring(&outputs[i], &outputs[j], VERBATIM_WINDOW),
+                !share_long_substring(
+                    &outputs[i],
+                    &outputs[j],
+                    VERBATIM_WINDOW
+                ),
                 "completions #{i} and #{j} share a {VERBATIM_WINDOW}-char \
                  verbatim substring; likely symptom C (state pollution).\n\
                  #{i}: {:?}\n#{j}: {:?}",
@@ -228,8 +227,7 @@ fn partial_hit_output_matches_fresh_session() {
         "You are a concise assistant. Answer in one short paragraph.";
     let user1_text =
         "Tell me one interesting historical fact about the year 1969.";
-    let assistant1_text =
-        "Apollo 11 landed on the Moon on July 20, 1969.";
+    let assistant1_text = "Apollo 11 landed on the Moon on July 20, 1969.";
     let user2_text =
         "Now tell me one interesting historical fact about the year 1989.";
 

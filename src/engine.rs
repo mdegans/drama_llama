@@ -49,7 +49,10 @@ where
         f.debug_struct("Engine")
             .field("decoder", &self.decoder)
             .field("model", &self.model)
-            .field("probe_hook", &self.probe_hook.as_ref().map(|_| "Box<dyn ProbeHook>"))
+            .field(
+                "probe_hook",
+                &self.probe_hook.as_ref().map(|_| "Box<dyn ProbeHook>"),
+            )
             .finish()
     }
 }
@@ -59,46 +62,38 @@ impl<B: Backend> Engine<B> {
     /// invoked synchronously inside [`crate::TokenPredictor`]'s
     /// iterator after each token is sampled; see [`crate::ProbeHook`]
     /// for the contract. Pass `None` to clear an installed hook.
-    pub fn set_probe_hook(
-        &mut self,
-        hook: Option<Box<dyn ProbeHook>>,
-    ) {
+    pub fn set_probe_hook(&mut self, hook: Option<Box<dyn ProbeHook>>) {
         self.probe_hook = hook;
     }
 
     /// Context length (tokens).
     pub fn n_ctx(&self) -> u32 {
-self.decoder.n_ctx()
+        self.decoder.n_ctx()
     }
 
     /// Clear the KV cache.
     pub fn memory_clear(&mut self) {
-self.decoder.memory_clear()
+        self.decoder.memory_clear()
     }
 
     /// Remove KV entries for `seq_id` in position range `[p0, p1)`.
-    pub fn memory_seq_rm(
-        &mut self,
-        seq_id: i32,
-        p0: i32,
-        p1: i32,
-    ) -> bool {
-self.decoder.memory_seq_rm(seq_id, p0, p1)
+    pub fn memory_seq_rm(&mut self, seq_id: i32, p0: i32, p1: i32) -> bool {
+        self.decoder.memory_seq_rm(seq_id, p0, p1)
     }
 
     /// Copy KV entries between sequences in `[p0, p1)`.
     pub fn memory_seq_cp(&mut self, src: i32, dst: i32, p0: i32, p1: i32) {
-self.decoder.memory_seq_cp(src, dst, p0, p1)
+        self.decoder.memory_seq_cp(src, dst, p0, p1)
     }
 
     /// Keep only `seq_id`'s entries, drop all others.
     pub fn memory_seq_keep(&mut self, seq_id: i32) {
-self.decoder.memory_seq_keep(seq_id)
+        self.decoder.memory_seq_keep(seq_id)
     }
 
     /// Largest position present in KV for `seq_id`.
     pub fn memory_seq_pos_max(&mut self, seq_id: i32) -> i32 {
-self.decoder.memory_seq_pos_max(seq_id)
+        self.decoder.memory_seq_pos_max(seq_id)
     }
 
     /// Snapshot decoder state at sequence position `pos`. See
@@ -212,9 +207,7 @@ self.decoder.memory_seq_pos_max(seq_id)
         seq_id: i32,
         options: PredictOptions,
     ) -> TokenPredictor<'a, B> {
-        TokenPredictor::new_resuming(
-            self, tokens, start_pos, seq_id, options,
-        )
+        TokenPredictor::new_resuming(self, tokens, start_pos, seq_id, options)
     }
 
     /// Resume piece prediction from a pre-populated KV cache.
@@ -225,8 +218,6 @@ self.decoder.memory_seq_pos_max(seq_id)
         seq_id: i32,
         options: PredictOptions,
     ) -> PiecePredictor<'a, B> {
-        PiecePredictor::new_resuming(
-            self, tokens, start_pos, seq_id, options,
-        )
+        PiecePredictor::new_resuming(self, tokens, start_pos, seq_id, options)
     }
 }

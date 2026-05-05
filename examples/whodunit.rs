@@ -14,12 +14,7 @@
 //!
 //! Defaults to `$PWD/models/model.gguf` if no path is given.
 
-use std::{
-    io::Write,
-    num::NonZeroUsize,
-    path::PathBuf,
-    time::Instant,
-};
+use std::{io::Write, num::NonZeroUsize, path::PathBuf, time::Instant};
 
 use drama_llama::{
     grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
@@ -163,8 +158,8 @@ fn main() {
         )
     };
 
-    let mut predict_opts = PredictOptions::default()
-        .add_model_stops(&session.engine().model);
+    let mut predict_opts =
+        PredictOptions::default().add_model_stops(&session.engine().model);
     predict_opts.n = NonZeroUsize::new(4096).unwrap();
     predict_opts.sample_options = if no_grammar {
         SampleOptions::default()
@@ -200,8 +195,7 @@ fn main() {
     }
 
     let start = Instant::now();
-    let predictor =
-        session.engine_mut().predict_pieces(tokens, predict_opts);
+    let predictor = session.engine_mut().predict_pieces(tokens, predict_opts);
 
     let mut full = String::new();
     let mut n_pieces = 0usize;
@@ -254,7 +248,9 @@ fn main() {
             );
         }
         None => {
-            eprintln!("[phase1 thought ] never observed </think>; single-phase run");
+            eprintln!(
+                "[phase1 thought ] never observed </think>; single-phase run"
+            );
         }
     }
 
@@ -345,8 +341,7 @@ fn print_stats(label: &str, s: &GrammarStats) {
         0.0
     };
     let final_survival = if s.candidates_bitmap_pass > 0 {
-        100.0 * s.candidates_final_pass as f64
-            / s.candidates_bitmap_pass as f64
+        100.0 * s.candidates_final_pass as f64 / s.candidates_bitmap_pass as f64
     } else {
         0.0
     };

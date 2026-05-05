@@ -478,8 +478,7 @@ impl RepetitionOptions {
                 let mut window = self.window_size.get();
                 let inner = ui.label("Window size")
                     | ui.add(
-                        egui::DragValue::new(&mut window)
-                            .clamp_range(1..=8192),
+                        egui::DragValue::new(&mut window).clamp_range(1..=8192),
                     )
                     .on_hover_text_at_pointer(
                         "Sliding-window size in generation steps. Only \
@@ -488,8 +487,7 @@ impl RepetitionOptions {
                          long generations don't have their logit \
                          gradient dominated.",
                     );
-                self.window_size =
-                    NonZeroU32::new(window.max(1)).unwrap();
+                self.window_size = NonZeroU32::new(window.max(1)).unwrap();
                 inner
             })
             .inner;
@@ -747,8 +745,7 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
             } else {
                 candidate.logit /= scaled_penalty;
             }
-            candidate.logit -=
-                effective * *penalty_freq + *penalty_present;
+            candidate.logit -= effective * *penalty_freq + *penalty_present;
         }
     } else {
         // Phase 2 (broad): Penalize ALL tracked n-grams. For each n-gram,
@@ -790,8 +787,7 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
             // Additive penalties: frequency scales with the windowed,
             // decay-weighted count (bounded above by `1 / (1 - decay)`),
             // presence is binary.
-            candidate.logit -=
-                effective * *penalty_freq + *penalty_present;
+            candidate.logit -= effective * *penalty_freq + *penalty_present;
         }
     }
 
@@ -1174,27 +1170,15 @@ mod tests {
             }
         }
 
-        println!(
-            "gap @ 1x window ({}): {gap_at_window:.4}",
-            window
-        );
-        println!(
-            "gap @ 2x window ({}): {gap_at_2window:.4}",
-            window * 2
-        );
-        println!(
-            "gap @ 4x window ({}): {gap_at_4window:.4}",
-            window * 4
-        );
+        println!("gap @ 1x window ({}): {gap_at_window:.4}", window);
+        println!("gap @ 2x window ({}): {gap_at_2window:.4}", window * 2);
+        println!("gap @ 4x window ({}): {gap_at_4window:.4}", window * 4);
         if let Some((_, data)) = freq_map.iter().next() {
             println!(
                 "Trailing-unigram tracked: {} positions, \
                  windowed-decayed: {:.2}",
                 data.count(),
-                data.windowed_decayed_count(
-                    tokens.len() as u64,
-                    opts.decay()
-                )
+                data.windowed_decayed_count(tokens.len() as u64, opts.decay())
             );
         }
 
