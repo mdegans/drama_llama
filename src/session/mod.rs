@@ -341,16 +341,6 @@ pub struct Session<B: Backend> {
     /// `Session`. Zeroed on construction; never reset except by
     /// dropping and rebuilding the `Session`.
     total_usage: Usage,
-    /// Half-open range of token ids covering the model's reserved /
-    /// empty-piece vocab tail (e.g. Qwen3.5: `248088..248320`).
-    /// Computed once at construction by scanning from the highest
-    /// vocab id downward until a sustained run of content tokens is
-    /// hit. Prepended to every call's sampling chain as a
-    /// [`SamplingMode::Deny`] so reserved tokens are stripped from
-    /// the candidate set before grammar / sampling reason about it.
-    /// `None` means no reserved tail was detected (model has
-    /// content tokens at the top of the vocab).
-    reserved_range: Option<std::ops::Range<Token>>,
 }
 
 /// Apply the per-model sampling sidecar at `sidecar_path` to
@@ -518,7 +508,6 @@ impl<B: Backend> Session<B> {
     /// layout, moeflux runtime knobs, ...).
     pub fn from_engine(engine: Engine<B>) -> Result<Self, SessionError> {
         let template = ChatTemplate::from_model(&engine.model)?;
-        let reserved_range = compute_reserved_range(&engine.model);
         Ok(Self {
             engine,
             template,
@@ -531,7 +520,6 @@ impl<B: Backend> Session<B> {
             prefix_cache: None,
             last_usage: Usage::default(),
             total_usage: Usage::default(),
-            reserved_range,
         })
     }
 
@@ -830,25 +818,41 @@ impl<B: Backend> Session<B> {
             Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
             Some(crate::CompiledOutputConfig::Deferred(d)) => (None, Some(d)),
         };
-        // Deny mask for the reserved vocab tail (e.g. Qwen3:
-        // 248088..248320). Goes first so grammar / sampling never
-        // see those tokens. Without this, empty-piece reserved
-        // tokens slip past byte-stream-based grammar checks (zero
-        // bytes are trivially accepted) and the model can land in
-        // a post-grammar loop until `max_tokens` runs out.
-        let deny_mode =
-            self.reserved_range.clone().map(SamplingMode::deny_range);
+        // No default Deny mask: the reserved-vocab-tail mask we
+        // historically prepended here was a workaround for a moeflux
+        // upstream bug (empty-piece reserved tokens slipping past
+        // byte-stream grammar checks and looping the model). That
+        // upstream issue has been fixed, and the mask actively hurts
+        // us now in two ways:
+        //
+        //   1. Generation quality. Special tokens like `<tool_call>`
+        //      and `<|im_end|>` (Cogito ids in the 151xxx range) live
+        //      in the high vocab range. Forbidding them forces the
+        //      model to emit the equivalent text bytes (multi-token
+        //      `<`, `tool`, `_call`, `>` etc.) instead of the single
+        //      special token id the chat template was designed around.
+        //      That's strictly more tokens to generate and reasons
+        //      worse against the post-training distribution.
+        //
+        //   2. Prefix-cache stability. Re-rendering an assistant
+        //      message that contains a tool_call emits the special
+        //      token id (single token), but generation produced the
+        //      text-byte sequence (multi-token). That mismatch shifts
+        //      tokenization at the asst-content boundary and breaks
+        //      the auto-tip's LCP walk for downstream cache hits.
+        //      Removing the deny lets generation pick the special
+        //      token, matching re-render tokenization.
+        //
+        // Callers that DO want the old behavior can still prepend
+        // `SamplingMode::deny_range(...)` to `sample_options.modes`
+        // explicitly via `Session::with_*` builders.
         let modes: Vec<SamplingMode> = if include_user_sampling {
-            deny_mode
+            grammar_mode
                 .into_iter()
-                .chain(grammar_mode.into_iter())
                 .chain(self.sample_options.modes.iter().cloned())
                 .collect()
         } else {
-            deny_mode
-                .into_iter()
-                .chain(grammar_mode.into_iter())
-                .collect()
+            grammar_mode.into_iter().collect()
         };
         Ok((tokens, modes, deferred))
     }
@@ -900,25 +904,17 @@ impl<B: Backend> Session<B> {
             Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
             Some(crate::CompiledOutputConfig::Deferred(d)) => (None, Some(d)),
         };
-        // Deny mask for the reserved vocab tail (e.g. Qwen3:
-        // 248088..248320). Goes first so grammar / sampling never
-        // see those tokens. Without this, empty-piece reserved
-        // tokens slip past byte-stream-based grammar checks (zero
-        // bytes are trivially accepted) and the model can land in
-        // a post-grammar loop until `max_tokens` runs out.
-        let deny_mode =
-            self.reserved_range.clone().map(SamplingMode::deny_range);
+        // No default Deny mask — see the equivalent comment in
+        // `prepare_call` for the rationale (workaround for a now-fixed
+        // moeflux upstream bug; was hurting generation quality and
+        // breaking prefix-cache stability for tool_call special tokens).
         let modes: Vec<SamplingMode> = if include_user_sampling {
-            deny_mode
+            grammar_mode
                 .into_iter()
-                .chain(grammar_mode.into_iter())
                 .chain(self.sample_options.modes.iter().cloned())
                 .collect()
         } else {
-            deny_mode
-                .into_iter()
-                .chain(grammar_mode.into_iter())
-                .collect()
+            grammar_mode.into_iter().collect()
         };
         Ok((tokens, breakpoints, modes, deferred))
     }
@@ -2145,64 +2141,6 @@ fn any_grammar_complete(modes: &[SamplingMode]) -> bool {
         }
         _ => false,
     })
-}
-
-/// Detect the model's reserved / empty-piece vocab tail by scanning
-/// from the highest token id downward. Returns the half-open range
-/// `[lowest_empty, n_vocab)` if such a tail exists, `None`
-/// otherwise.
-///
-/// Why we need this: GBNF / JSON grammars constrain a candidate's
-/// byte stream, but empty-piece tokens contribute zero bytes and
-/// are trivially accepted. After a structured response completes,
-/// the model can scatter reserved/unused vocab slots until
-/// `max_tokens` runs out (observed live on Qwen3.5-A17B emitting
-/// ~480 such tokens after a 7-token JSON answer).
-/// `Model::special_tokens()` only enumerates *named* entries from
-/// `added_tokens_decoder`; the reserved tail of the vocab isn't
-/// listed there.
-///
-/// This scan is bounded — it stops after [`RESERVED_SCAN_TOLERANCE`]
-/// consecutive content tokens, so a typical 200-300 token tail
-/// costs ~300 `token_to_piece` calls, not the full vocab. For
-/// models without a reserved tail (high-id tokens have content),
-/// the scan terminates after `TOLERANCE` ids and returns `None`.
-fn compute_reserved_range<M: Model>(
-    model: &M,
-) -> Option<std::ops::Range<Token>> {
-    /// Scan terminates when this many consecutive non-empty,
-    /// non-special tokens are seen (counting downward from the
-    /// vocab tail). Picks "real content" boundary robustly — single
-    /// stray non-empty tokens within the reserved range don't
-    /// short-circuit the scan.
-    const TOLERANCE: usize = 64;
-
-    let bos = model.bos();
-    let eos = model.eos();
-    let eot = model.eot();
-    let extras: std::collections::BTreeSet<Token> =
-        model.extra_eos_tokens().into_iter().collect();
-    let n = model.n_vocab();
-    let mut lowest_empty: Option<Token> = None;
-    let mut consecutive_content: usize = 0;
-
-    for id in (0..n).rev() {
-        if id == bos || id == eos || id == eot || extras.contains(&id) {
-            // Skip EOS-class anchors — neither boundary signal nor
-            // reserved-range members.
-            continue;
-        }
-        if model.token_to_piece(id).is_empty() {
-            lowest_empty = Some(id);
-            consecutive_content = 0;
-        } else {
-            consecutive_content += 1;
-            if consecutive_content >= TOLERANCE {
-                break;
-            }
-        }
-    }
-    lowest_empty.map(|min| min..n)
 }
 
 fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
