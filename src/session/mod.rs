@@ -966,12 +966,57 @@ impl<B: Backend> Session<B> {
         new_breakpoints: &[usize],
     ) -> Result<(Vec<Token>, usize, usize), SessionError> {
         let l_hit_raw = match self.prefix_cache.as_ref() {
-            Some(cache) if !cache.prev_tokens.is_empty() => compute_l_hit(
-                &cache.prev_tokens,
-                new_tokens,
-                new_breakpoints,
-                cache.internal_tip,
-            ),
+            Some(cache) if !cache.prev_tokens.is_empty() => {
+                let picked = compute_l_hit(
+                    &cache.prev_tokens,
+                    new_tokens,
+                    new_breakpoints,
+                    cache.internal_tip,
+                );
+                // Diagnostic: when the auto-tip is set but didn't win,
+                // log enough state to attribute the loss. The case worth
+                // attention is `tip > safe` — the LCP cut off shorter
+                // than `prev_tokens` length, almost always a BPE
+                // re-tokenization mismatch in the assistant content.
+                // `prev_at_lcp` and `new_at_lcp` point at the first
+                // divergent token; comparing them tells us whether it's
+                // a single-token shift or a wholesale re-render
+                // (thoughts stripped, JSON re-serialized, etc.).
+                #[cfg(feature = "axum")]
+                if let Some(tip) = cache.internal_tip {
+                    let lcp = longest_common_prefix_len(
+                        &cache.prev_tokens,
+                        new_tokens,
+                    );
+                    let safe = lcp.saturating_sub(1);
+                    if tip > safe && tip > picked {
+                        let prev_len = cache.prev_tokens.len();
+                        let new_len = new_tokens.len();
+                        let prev_at_lcp = cache
+                            .prev_tokens
+                            .get(lcp)
+                            .copied()
+                            .unwrap_or(-1);
+                        let new_at_lcp = new_tokens
+                            .get(lcp)
+                            .copied()
+                            .unwrap_or(-1);
+                        tracing::debug!(
+                            tip,
+                            lcp,
+                            safe,
+                            picked,
+                            prev_len,
+                            new_len,
+                            prev_at_lcp,
+                            new_at_lcp,
+                            "auto-tip ineligible: tip past safe (LCP shorter than expected — \
+                             likely re-tokenization mismatch in asst content)",
+                        );
+                    }
+                }
+                picked
+            }
             _ => 0,
         };
 
