@@ -80,7 +80,6 @@ use misanthropic::response::Usage;
 
 use crate::{
     backend::{Backend, Model},
-    chat_template::tokenize_with_breakpoints,
     grammar_for_prompt, output_config, ChatTemplate, ChatTemplateError, Engine,
     OutputConfigError, OutputConfigOptions, PredictOptions, Prompt,
     RenderOptions, RepetitionOptions, SampleOptions, SamplingMode, Token,
@@ -202,6 +201,24 @@ struct PrefixCache {
     /// corrupt the next call's restore. Update both ends together if
     /// you change predictor stop semantics.
     internal_tip: Option<usize>,
+    /// SHA-256 of the canonical chat-template render (i.e. the
+    /// `partial_text`) at each breakpoint, parallel to
+    /// [`Self::prev_breakpoints`] (same indexing). Used by
+    /// [`compute_l_hit`]'s hash-keyed lookup to recognize a prefix
+    /// across calls even when the byte-level rendering would diverge
+    /// (e.g. cogito-style permissive JSON whitespace re-rendered through
+    /// `serde_json::to_string` on `Block::ToolUse.input`). The render
+    /// is independent of `cache_control` markers — those are metadata,
+    /// not rendered content — so hashes stay stable as breakpoints
+    /// move with `cache_windowed`.
+    prev_breakpoint_hashes: Vec<[u8; 32]>,
+    /// SHA-256 of the canonical chat-template render up to the
+    /// auto-tip position (end of just-generated assistant content).
+    /// `None` until the first generation completes. Computed by
+    /// re-rendering the conversation with the parsed assistant block
+    /// appended, taking the partial render at that synthesized
+    /// breakpoint, and hashing.
+    prev_tip_hash: Option<[u8; 32]>,
 }
 
 impl PrefixCache {
@@ -212,6 +229,8 @@ impl PrefixCache {
             prev_breakpoints: Vec::new(),
             last_reused_tokens: 0,
             internal_tip: None,
+            prev_breakpoint_hashes: Vec::new(),
+            prev_tip_hash: None,
         }
     }
 
@@ -221,12 +240,70 @@ impl PrefixCache {
         self.prev_breakpoints.clear();
         self.last_reused_tokens = 0;
         self.internal_tip = None;
+        self.prev_breakpoint_hashes.clear();
+        self.prev_tip_hash = None;
     }
 }
 
 /// Length of the longest prefix shared between `a` and `b`, in tokens.
 fn longest_common_prefix_len(a: &[Token], b: &[Token]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// SHA-256 of the canonical chat-template render at a single
+/// breakpoint. Caller passes a `partial_text` from
+/// [`crate::chat_template::RenderedWithBreakpoints`].
+///
+/// Used as the cache key for hash-keyed prefix-reuse on `PrefixCache`:
+/// two calls whose source data agrees up to a given breakpoint produce
+/// identical `partial_text`s (the chat-template render is deterministic
+/// given source and excludes `cache_control` metadata), so the same
+/// hash. The `prev_tokens` stored against this hash come from the
+/// model's original emission and may not be a bytewise-identical
+/// tokenization of the same `partial_text` — a single-token BPE drift
+/// at the JSON-whitespace boundary is acceptable; cogito's permissive
+/// grammar means the model is whitespace-tolerant and the existing
+/// `lcp-1` safety margin in [`compute_l_hit`] handles it.
+fn hash_partial_text(text: &str) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Hash-keyed L_hit lookup. Returns the largest cached token position
+/// (over breakpoint hashes paired with `prev_breakpoints`, plus the
+/// auto-tip hash paired with `internal_tip`) whose stored hash also
+/// appears in `new_breakpoint_hashes`. Returns 0 when no hash matches.
+///
+/// `cap` bounds the result — typically `new_tokens.len()` — so we
+/// never claim to reuse more tokens than the new request has.
+///
+/// Pure function; lifted out of `kv_setup_and_chunk_prefill` so its
+/// "longest match wins, capped at new_tokens.len()" contract is
+/// directly testable without an engine.
+fn hash_keyed_l_hit(
+    prev_breakpoints: &[usize],
+    prev_breakpoint_hashes: &[[u8; 32]],
+    internal_tip: Option<usize>,
+    prev_tip_hash: Option<[u8; 32]>,
+    new_breakpoint_hashes: &[[u8; 32]],
+    cap: usize,
+) -> usize {
+    let new_set: std::collections::HashSet<&[u8; 32]> =
+        new_breakpoint_hashes.iter().collect();
+    let mut picked: usize = 0;
+    for (pos, h) in prev_breakpoints.iter().zip(prev_breakpoint_hashes.iter()) {
+        if *pos <= cap && *pos > picked && new_set.contains(h) {
+            picked = *pos;
+        }
+    }
+    if let (Some(tip), Some(tip_h)) = (internal_tip, prev_tip_hash.as_ref()) {
+        if tip <= cap && tip > picked && new_set.contains(tip_h) {
+            picked = tip;
+        }
+    }
+    picked
 }
 
 /// Cache-reuse length for a call.
@@ -876,19 +953,56 @@ impl<B: Backend> Session<B> {
             Vec<usize>,
             Vec<SamplingMode>,
             Option<crate::DeferredGrammar>,
+            Vec<[u8; 32]>,
         ),
         SessionError,
     > {
-        let (tokens, breakpoints) = if self.prefix_cache.is_some() {
+        let (tokens, breakpoints, partial_hashes) = if self
+            .prefix_cache
+            .is_some()
+        {
             let rendered = self
                 .template
                 .render_with_breakpoints(prompt, &self.render_opts)?;
-            tokenize_with_breakpoints(&self.engine.model, &rendered)
+            // Inlines `tokenize_with_breakpoints` so we can keep
+            // the SHA-256 of each surviving partial paired with
+            // its token index. The shared helper only returns
+            // indices and applies sort+dedup, which would lose
+            // the partial→hash mapping.
+            let full_tokens = self.engine.model.tokenize(&rendered.text, true);
+            let mut pairs: Vec<(usize, [u8; 32])> =
+                Vec::with_capacity(rendered.partial_texts.len());
+            for partial in &rendered.partial_texts {
+                let partial_tokens = self.engine.model.tokenize(partial, true);
+                // Same fail-open contract as
+                // `chat_template::tokenize_with_breakpoints`:
+                // drop the breakpoint silently if the partial
+                // doesn't form a prefix of the full render.
+                if partial_tokens.len() <= full_tokens.len()
+                    && full_tokens[..partial_tokens.len()] == partial_tokens[..]
+                {
+                    pairs.push((
+                        partial_tokens.len(),
+                        hash_partial_text(partial),
+                    ));
+                }
+            }
+            pairs.sort_by_key(|(idx, _)| *idx);
+            pairs.dedup_by_key(|(idx, _)| *idx);
+            let breakpoints: Vec<usize> =
+                pairs.iter().map(|(idx, _)| *idx).collect();
+            let hashes: Vec<[u8; 32]> =
+                pairs.into_iter().map(|(_, h)| h).collect();
+            (full_tokens, breakpoints, hashes)
         } else {
             // Fast path: single render + tokenize, no partials.
             let rendered =
                 self.template.render_with(prompt, &self.render_opts)?;
-            (self.engine.model.tokenize(&rendered, true), Vec::new())
+            (
+                self.engine.model.tokenize(&rendered, true),
+                Vec::new(),
+                Vec::new(),
+            )
         };
 
         let (grammar_mode, deferred) = match resolve_grammar(
@@ -920,7 +1034,7 @@ impl<B: Backend> Session<B> {
                 .chain(grammar_mode.into_iter())
                 .collect()
         };
-        Ok((tokens, breakpoints, modes, deferred))
+        Ok((tokens, breakpoints, modes, deferred, partial_hashes))
     }
 
     /// Prefix-cache KV-state setup + chunked prefill shared by every
@@ -964,44 +1078,76 @@ impl<B: Backend> Session<B> {
         &mut self,
         new_tokens: &[Token],
         new_breakpoints: &[usize],
+        new_breakpoint_hashes: &[[u8; 32]],
     ) -> Result<(Vec<Token>, usize, usize), SessionError> {
         let l_hit_raw = match self.prefix_cache.as_ref() {
             Some(cache) if !cache.prev_tokens.is_empty() => {
-                let picked = compute_l_hit(
-                    &cache.prev_tokens,
-                    new_tokens,
-                    new_breakpoints,
+                // Hash-keyed fast path: if any cached breakpoint or
+                // the auto-tip hash matches a hash from the new
+                // request's partial renders, jump straight to the
+                // largest matching cached token position. Sidesteps
+                // `compute_l_hit`'s LCP — useful when the byte-level
+                // tokenization of an assistant block diverges between
+                // the model's original emission (in `prev_tokens`)
+                // and the canonical chat-template re-render (the
+                // partial_text the new request hashes).
+                let hash_picked = hash_keyed_l_hit(
+                    &cache.prev_breakpoints,
+                    &cache.prev_breakpoint_hashes,
                     cache.internal_tip,
+                    cache.prev_tip_hash,
+                    new_breakpoint_hashes,
+                    new_tokens.len(),
                 );
-                // Diagnostic: when the auto-tip is set but didn't win,
-                // log enough state to attribute the loss. The case worth
-                // attention is `tip > safe` — the LCP cut off shorter
-                // than `prev_tokens` length, almost always a BPE
-                // re-tokenization mismatch in the assistant content.
-                // `prev_at_lcp` and `new_at_lcp` point at the first
-                // divergent token; comparing them tells us whether it's
-                // a single-token shift or a wholesale re-render
-                // (thoughts stripped, JSON re-serialized, etc.).
-                #[cfg(feature = "axum")]
-                if let Some(tip) = cache.internal_tip {
-                    let lcp = longest_common_prefix_len(
+                if hash_picked > 0 {
+                    #[cfg(feature = "axum")]
+                    tracing::debug!(
+                        hash_picked,
+                        prev_len = cache.prev_tokens.len(),
+                        new_len = new_tokens.len(),
+                        "hash-keyed prefix-reuse: cached position matched by SHA-256 of partial render",
+                    );
+                    // Use the hash-matched position directly. Skip the
+                    // LCP path below — we trust the hash equality
+                    // (canonical chat-template render produced the
+                    // same bytes for the cached prefix), accepting
+                    // the BPE-drift caveat at the splice for
+                    // permissive-grammar emissions like cogito.
+                    hash_picked
+                } else {
+                    let picked = compute_l_hit(
                         &cache.prev_tokens,
                         new_tokens,
+                        new_breakpoints,
+                        cache.internal_tip,
                     );
-                    let safe = lcp.saturating_sub(1);
-                    if tip > safe && tip > picked {
-                        let prev_len = cache.prev_tokens.len();
-                        let new_len = new_tokens.len();
-                        let prev_at_lcp = cache
-                            .prev_tokens
-                            .get(lcp)
-                            .copied()
-                            .unwrap_or(-1);
-                        let new_at_lcp = new_tokens
-                            .get(lcp)
-                            .copied()
-                            .unwrap_or(-1);
-                        tracing::debug!(
+                    // Diagnostic: when the auto-tip is set but didn't win,
+                    // log enough state to attribute the loss. The case worth
+                    // attention is `tip > safe` — the LCP cut off shorter
+                    // than `prev_tokens` length, almost always a BPE
+                    // re-tokenization mismatch in the assistant content.
+                    // `prev_at_lcp` and `new_at_lcp` point at the first
+                    // divergent token; comparing them tells us whether it's
+                    // a single-token shift or a wholesale re-render
+                    // (thoughts stripped, JSON re-serialized, etc.).
+                    #[cfg(feature = "axum")]
+                    if let Some(tip) = cache.internal_tip {
+                        let lcp = longest_common_prefix_len(
+                            &cache.prev_tokens,
+                            new_tokens,
+                        );
+                        let safe = lcp.saturating_sub(1);
+                        if tip > safe && tip > picked {
+                            let prev_len = cache.prev_tokens.len();
+                            let new_len = new_tokens.len();
+                            let prev_at_lcp = cache
+                                .prev_tokens
+                                .get(lcp)
+                                .copied()
+                                .unwrap_or(-1);
+                            let new_at_lcp =
+                                new_tokens.get(lcp).copied().unwrap_or(-1);
+                            tracing::debug!(
                             tip,
                             lcp,
                             safe,
@@ -1013,9 +1159,10 @@ impl<B: Backend> Session<B> {
                             "auto-tip ineligible: tip past safe (LCP shorter than expected — \
                              likely re-tokenization mismatch in asst content)",
                         );
+                        }
                     }
+                    picked
                 }
-                picked
             }
             _ => 0,
         };
@@ -1135,6 +1282,31 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    /// SHA-256 of the canonical chat-template render of `prompt` with
+    /// the just-generated assistant `blocks` appended as an additional
+    /// message turn, rendered with `add_generation_prompt = false`. The
+    /// resulting bytes are exactly what a subsequent request's
+    /// `partial_text` would produce when the client places a
+    /// `cache_control` marker on (or just past) that assistant message
+    /// — making this hash the cache key for the auto-tip.
+    ///
+    /// Errors propagate from `ChatTemplate::render_with`; callers
+    /// should treat the hash as best-effort and fall back to no tip
+    /// hash on error.
+    fn compute_tip_hash(
+        &self,
+        prompt: &Prompt,
+        blocks: &[crate::Block],
+    ) -> Result<[u8; 32], SessionError> {
+        let mut extended = prompt.clone().into_static();
+        let asst: misanthropic::prompt::message::AssistantMessage<'static> =
+            blocks.iter().cloned().collect();
+        extended.messages.push(asst.into());
+        let opts = self.render_opts.clone().with_generation_prompt(false);
+        let rendered = self.template.render_with(&extended, &opts)?;
+        Ok(hash_partial_text(&rendered))
+    }
+
     /// After a batch call succeeds, update [`self.prefix_cache`] to
     /// describe the current KV state: full prompt tokens **plus
     /// generated content** (`new_tokens` is the engine's exact KV
@@ -1146,6 +1318,12 @@ impl<B: Backend> Session<B> {
     /// tip's snapshot is freed via [`Engine::forget_pos`] — without
     /// this, tip snapshots accumulate one per call in moeflux's LRU.
     ///
+    /// `new_breakpoint_hashes` parallels `new_breakpoints` (same
+    /// indexing) and stores SHA-256 of each surviving partial render;
+    /// `tip_hash` stores the same for the auto-tip position. Both are
+    /// consulted by [`compute_l_hit`]'s hash-keyed fast path on
+    /// subsequent calls.
+    ///
     /// No-op when caching is off.
     fn record_cache_hit(
         &mut self,
@@ -1153,6 +1331,8 @@ impl<B: Backend> Session<B> {
         new_breakpoints: Vec<usize>,
         l_hit: usize,
         internal_tip: Option<usize>,
+        new_breakpoint_hashes: Vec<[u8; 32]>,
+        tip_hash: Option<[u8; 32]>,
     ) {
         // Capture the old tip BEFORE overwriting — needed for the
         // explicit-eviction fast path so the engine can free the prior
@@ -1167,6 +1347,8 @@ impl<B: Backend> Session<B> {
             cache.prev_breakpoints = new_breakpoints;
             cache.last_reused_tokens = l_hit;
             cache.internal_tip = internal_tip;
+            cache.prev_breakpoint_hashes = new_breakpoint_hashes;
+            cache.prev_tip_hash = tip_hash;
         }
         if let (Some(old), Some(new)) = (old_tip, internal_tip) {
             if old != new
@@ -1244,12 +1426,16 @@ impl<B: Backend> Session<B> {
         &mut self,
         prompt: &Prompt,
     ) -> Result<String, SessionError> {
-        let (tokens, breakpoints, modes, deferred_grammar) =
+        let (tokens, breakpoints, modes, deferred_grammar, partial_hashes) =
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
-        let (suffix, cache_read, prefill_start) =
-            self.kv_setup_and_chunk_prefill(&tokens, &breakpoints)?;
+        let (suffix, cache_read, prefill_start) = self
+            .kv_setup_and_chunk_prefill(
+                &tokens,
+                &breakpoints,
+                &partial_hashes,
+            )?;
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
@@ -1314,11 +1500,17 @@ impl<B: Backend> Session<B> {
             self.engine.checkpoint_pos(0, head as i32);
         }
 
+        // `complete_text` doesn't parse blocks, so we have no
+        // structured assistant content to canonical-render for the tip
+        // hash. Pass `None`; the breakpoint hash side-table still
+        // covers the explicit cache_control markers.
         self.record_cache_hit(
             extended_prev,
             breakpoints,
             cache_read,
             internal_tip,
+            partial_hashes,
+            None,
         );
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
@@ -1426,12 +1618,16 @@ impl<B: Backend> Session<B> {
         &'s mut self,
         prompt: &Prompt,
     ) -> Result<BlockStream<'s, B>, SessionError> {
-        let (tokens, breakpoints, modes, deferred_grammar) =
+        let (tokens, breakpoints, modes, deferred_grammar, partial_hashes) =
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
-        let (suffix, cache_read, prefill_start) =
-            self.kv_setup_and_chunk_prefill(&tokens, &breakpoints)?;
+        let (suffix, cache_read, prefill_start) = self
+            .kv_setup_and_chunk_prefill(
+                &tokens,
+                &breakpoints,
+                &partial_hashes,
+            )?;
 
         // Streaming: the cache must be updated BEFORE the predictor
         // borrows `&mut self.engine`, because the returned stream
@@ -1446,7 +1642,18 @@ impl<B: Backend> Session<B> {
         // for further turns, so passing `None` for the tip is fine —
         // the breakpoint-only path still works exactly as before.
         // (See plan: streaming tip extension is a v2 follow-up.)
-        self.record_cache_hit(tokens, breakpoints, cache_read, None);
+        // Streaming path: no parsed assistant content available at
+        // setup time, and tip extension itself is a v2 follow-up
+        // (see comment above). Pass `None` for tip_hash; breakpoint
+        // hash side-table still covers explicit cache_control markers.
+        self.record_cache_hit(
+            tokens,
+            breakpoints,
+            cache_read,
+            None,
+            partial_hashes,
+            None,
+        );
         let usage = Self::make_usage(prompt_tokens, cache_read, 0);
         self.record_usage(usage);
 
@@ -1513,12 +1720,16 @@ impl<B: Backend> Session<B> {
             Some(ToolChoice::Method { .. }) | Some(ToolChoice::Any)
         );
 
-        let (tokens, breakpoints, modes, deferred_grammar) =
+        let (tokens, breakpoints, modes, deferred_grammar, partial_hashes) =
             self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
-        let (suffix, cache_read, prefill_start) =
-            self.kv_setup_and_chunk_prefill(&tokens, &breakpoints)?;
+        let (suffix, cache_read, prefill_start) = self
+            .kv_setup_and_chunk_prefill(
+                &tokens,
+                &breakpoints,
+                &partial_hashes,
+            )?;
 
         // Pieces we drop from the surfaced output: the primary EOS,
         // the EOT (if distinct), every extra-EOS the model declares
@@ -1662,6 +1873,26 @@ impl<B: Backend> Session<B> {
             self.engine.checkpoint_pos(0, head as i32);
         }
 
+        // Compute the auto-tip hash from the parsed assistant blocks
+        // — `run_call` is the only completion path with parsed
+        // structure available at save-time, so this is where the tip
+        // entry of the hash side-table actually gets populated. Best-
+        // effort: a render error logs and falls back to no tip hash
+        // (cache still works, just without the auto-tip side-table
+        // entry).
+        let blocks_owned: Vec<crate::Block> =
+            blocks.iter().cloned().map(|b| b.into_static()).collect();
+        let tip_hash = match self.compute_tip_hash(prompt, &blocks_owned) {
+            Ok(h) => Some(h),
+            Err(_e) => {
+                #[cfg(feature = "axum")]
+                tracing::debug!(
+                    "compute_tip_hash failed; tip hash side-table entry skipped"
+                );
+                None
+            }
+        };
+
         // Cache + usage bookkeeping, then grammar-violation check.
         // Check last so a violation still records the work that was
         // done — usage numbers are correct either way.
@@ -1670,6 +1901,8 @@ impl<B: Backend> Session<B> {
             breakpoints,
             cache_read,
             internal_tip,
+            partial_hashes,
+            tip_hash,
         );
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
@@ -2936,5 +3169,179 @@ mod tests {
             Some(0),
             "post-clear call must miss",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Hash-keyed prefix-reuse tests — pure-Rust, no model.
+    // -----------------------------------------------------------------
+
+    /// `hash_partial_text` is deterministic: same input bytes always
+    /// produce the same SHA-256 digest.
+    #[test]
+    fn test_hash_partial_text_determinism() {
+        let s = "<|im_start|>user\nhello\n<|im_end|>\n";
+        let a = hash_partial_text(s);
+        let b = hash_partial_text(s);
+        assert_eq!(a, b);
+    }
+
+    /// Different content → different hash. Guards against the
+    /// degenerate-hash failure mode (e.g. constant-output stub).
+    #[test]
+    fn test_hash_partial_text_diverges_on_content() {
+        let a = hash_partial_text("<tool_call>{\"id\": \"x\"}</tool_call>");
+        let b = hash_partial_text("<tool_call>{\"id\":\"x\"}</tool_call>");
+        // Whitespace difference is exactly the bug the chat-template
+        // canonical-render hash is *meant* to bypass at a higher
+        // level, but at this layer the function must distinguish
+        // distinct byte strings.
+        assert_ne!(a, b);
+    }
+
+    /// Single matching breakpoint hash → returns its position.
+    #[test]
+    fn test_hash_keyed_l_hit_single_breakpoint_match() {
+        let h_a = hash_partial_text("aaa");
+        let h_b = hash_partial_text("bbb");
+        let prev_breakpoints = vec![100usize];
+        let prev_hashes = vec![h_a];
+        // New request has hash matching cached breakpoint.
+        let new_hashes = vec![h_a];
+        assert_eq!(
+            hash_keyed_l_hit(
+                &prev_breakpoints,
+                &prev_hashes,
+                None,
+                None,
+                &new_hashes,
+                500,
+            ),
+            100
+        );
+        // Different hash → no match.
+        let new_hashes_no_match = vec![h_b];
+        assert_eq!(
+            hash_keyed_l_hit(
+                &prev_breakpoints,
+                &prev_hashes,
+                None,
+                None,
+                &new_hashes_no_match,
+                500,
+            ),
+            0
+        );
+    }
+
+    /// With matches at positions 100 and 200, the lookup picks 200
+    /// (largest matching cached position).
+    #[test]
+    fn test_hash_keyed_l_hit_picks_longest_match() {
+        let h_a = hash_partial_text("aaa");
+        let h_b = hash_partial_text("bbb");
+        let h_c = hash_partial_text("ccc");
+        let prev_breakpoints = vec![100, 200, 300];
+        let prev_hashes = vec![h_a, h_b, h_c];
+        // New request matches 100 and 200 only (not 300).
+        let new_hashes = vec![h_a, h_b];
+        assert_eq!(
+            hash_keyed_l_hit(
+                &prev_breakpoints,
+                &prev_hashes,
+                None,
+                None,
+                &new_hashes,
+                500,
+            ),
+            200,
+            "should pick the largest matching cached position",
+        );
+    }
+
+    /// Tip hash beats breakpoint hashes when its position is larger
+    /// and matches.
+    #[test]
+    fn test_hash_keyed_l_hit_tip_beats_breakpoint() {
+        let h_bp = hash_partial_text("aaa");
+        let h_tip = hash_partial_text("bbb");
+        let prev_breakpoints = vec![100];
+        let prev_hashes = vec![h_bp];
+        let new_hashes = vec![h_bp, h_tip];
+        // Tip at 250 with matching hash should win over bp at 100.
+        assert_eq!(
+            hash_keyed_l_hit(
+                &prev_breakpoints,
+                &prev_hashes,
+                Some(250),
+                Some(h_tip),
+                &new_hashes,
+                500,
+            ),
+            250,
+        );
+    }
+
+    /// `cap` argument bounds the result — a cached position > cap is
+    /// rejected even if the hash matches. Protects against claiming
+    /// to reuse more tokens than the new request has.
+    #[test]
+    fn test_hash_keyed_l_hit_cap_bound() {
+        let h = hash_partial_text("aaa");
+        let prev_breakpoints = vec![100, 800];
+        let prev_hashes = vec![h, h];
+        let new_hashes = vec![h];
+        // Cap at 500 → 800 rejected, falls back to 100.
+        assert_eq!(
+            hash_keyed_l_hit(
+                &prev_breakpoints,
+                &prev_hashes,
+                None,
+                None,
+                &new_hashes,
+                500,
+            ),
+            100,
+        );
+    }
+
+    /// No match at all → returns 0.
+    #[test]
+    fn test_hash_keyed_l_hit_no_match() {
+        let h_a = hash_partial_text("aaa");
+        let h_b = hash_partial_text("bbb");
+        let prev_breakpoints = vec![100, 200];
+        let prev_hashes = vec![h_a, h_a];
+        let new_hashes = vec![h_b];
+        assert_eq!(
+            hash_keyed_l_hit(
+                &prev_breakpoints,
+                &prev_hashes,
+                Some(300),
+                Some(h_b),
+                &new_hashes,
+                500,
+            ),
+            300,
+            "tip with matching hash should still win even when bps miss",
+        );
+        assert_eq!(
+            hash_keyed_l_hit(
+                &prev_breakpoints,
+                &prev_hashes,
+                Some(300),
+                Some(h_a),
+                &new_hashes,
+                500,
+            ),
+            0,
+            "no hashes match → 0",
+        );
+    }
+
+    /// Empty side-table → 0, regardless of new hashes.
+    #[test]
+    fn test_hash_keyed_l_hit_empty_side_table() {
+        let h = hash_partial_text("aaa");
+        assert_eq!(hash_keyed_l_hit(&[], &[], None, None, &[h], 500), 0);
     }
 }
