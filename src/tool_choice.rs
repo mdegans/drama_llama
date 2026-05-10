@@ -89,9 +89,14 @@ pub struct ToolChoiceOptions {
 impl Default for ToolChoiceOptions {
     fn default() -> Self {
         Self {
-            allow_thought: false,
-            arguments_field: "parameters",
-            wrap_tags: None,
+            // Cogito / Qwen / Hermes / DeepSeek-V3 / OpenAI-fn-call
+            // shape. The historical Llama-3.1 default
+            // (`parameters`, no wrap, no thought) is now the minority
+            // case; consumers driving Llama-3.1 should set those
+            // explicitly via [`Session::with_tool_choice_opts`].
+            allow_thought: true,
+            arguments_field: "arguments",
+            wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
             strict_schema: false,
         }
     }
