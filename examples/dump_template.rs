@@ -1,12 +1,17 @@
-//! Dump the chat template + key metadata for the symlinked model.
-//! Run with: `cargo run --example dump_template`
+//! Dump the chat template + key metadata for a GGUF model.
+//!
+//! ```bash
+//! cargo run --example dump_template                     # models/model.gguf
+//! cargo run --example dump_template -- /path/to/x.gguf  # explicit path
+//! ```
 use std::path::PathBuf;
 
 use drama_llama::LlamaCppModel;
 
 fn main() {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+    let path = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf"),
+    );
     let model = LlamaCppModel::from_file(path, None).expect("load model");
     let tmpl = model
         .get_meta("tokenizer.chat_template")
