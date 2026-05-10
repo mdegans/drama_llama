@@ -1799,6 +1799,14 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
     }
 
     let kept = acc.kept;
+    #[cfg(feature = "axum")]
+    tracing::debug!(
+        target: "drama_llama::sample::grammar",
+        candidates_in = candidates_in,
+        bitmap_pass = acc.bitmap_pass,
+        kept = kept.len(),
+        "grammar_filter",
+    );
     if kept.is_empty() {
         if state.is_complete() {
             state.reset();

@@ -1770,6 +1770,14 @@ impl<B: Backend> Session<B> {
         if let Some(dg) = &deferred_grammar {
             grammar_handles.push(dg.grammar.clone());
         }
+        #[cfg(feature = "axum")]
+        tracing::debug!(
+            target: "drama_llama::session",
+            n_modes = modes.len(),
+            n_grammar_handles = grammar_handles.len(),
+            has_deferred = deferred_grammar.is_some(),
+            "run_call: modes prepared",
+        );
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
@@ -2217,14 +2225,50 @@ fn resolve_grammar(
     tool_choice_opts: &ToolChoiceOptions,
     output_config_opts: &OutputConfigOptions,
 ) -> Result<Option<crate::CompiledOutputConfig>, SessionError> {
+    #[cfg(feature = "axum")]
+    {
+        let tc_kind = match prompt.tool_choice.as_ref() {
+            None => "None",
+            Some(crate::ToolChoice::Auto) => "Auto",
+            Some(crate::ToolChoice::Any) => "Any",
+            Some(crate::ToolChoice::Method { .. }) => "Method",
+        };
+        let n_tools = prompt.functions.as_deref().map(|f| f.len()).unwrap_or(0);
+        tracing::debug!(
+            target: "drama_llama::session",
+            tool_choice = tc_kind,
+            n_tools,
+            "resolve_grammar: input",
+        );
+    }
     if let Some(g) = grammar_for_prompt(prompt, tool_choice_opts)? {
+        #[cfg(feature = "axum")]
+        tracing::debug!(
+            target: "drama_llama::session",
+            kind = "tool_choice",
+            "resolve_grammar: returning Single(g)",
+        );
         return Ok(Some(crate::CompiledOutputConfig::Single(g)));
     }
     if let Some(c) =
         output_config::compile_prompt_output_config(prompt, output_config_opts)?
     {
+        #[cfg(feature = "axum")]
+        tracing::debug!(
+            target: "drama_llama::session",
+            kind = match &c {
+                crate::CompiledOutputConfig::Single(_) => "output_config_single",
+                crate::CompiledOutputConfig::Deferred(_) => "output_config_deferred",
+            },
+            "resolve_grammar: returning output_config",
+        );
         return Ok(Some(c));
     }
+    #[cfg(feature = "axum")]
+    tracing::debug!(
+        target: "drama_llama::session",
+        "resolve_grammar: returning None (no grammar applied)",
+    );
     Ok(None)
 }
 
