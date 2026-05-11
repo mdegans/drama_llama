@@ -2725,8 +2725,8 @@ mod tests {
     }
 
     /// Both tool_choice and output_config set → tool_choice wins.
-    /// Verify by sniffing for tool_choice's `name_choice` rule (which
-    /// output_config never emits).
+    /// Verify by sniffing for tool_choice's per-tool `call_0` rule
+    /// (which output_config never emits).
     #[test]
     fn test_resolve_grammar_tool_choice_wins_over_output_config() {
         use std::borrow::Cow;
@@ -2760,7 +2760,7 @@ mod tests {
         };
         let source = state.lock().unwrap().grammar().source().to_string();
         assert!(
-            source.contains("name_choice"),
+            source.contains("call_0"),
             "expected tool_choice grammar, got: {source}"
         );
         assert!(

@@ -265,7 +265,7 @@ member ::= string ws ":" ws value
 array ::= "[" ws ( value ( ws "," ws value )* )? ws "]"
 string ::= "\"" char* "\""
 char ::= unescaped | escape
-unescaped ::= [^"\\] | [\x20-\x21] | [\x23-\x5B] | [\x5D-\x7F]
+unescaped ::= [^"\\\x00-\x1F]
 escape ::= "\\" ( ["\\/bfnrt] | "u" hex hex hex hex )
 hex ::= [0-9a-fA-F]
 number ::= int frac? exp?
@@ -423,5 +423,34 @@ mod tests {
         assert!(!accepts(&src, "{\"x\":\t\t1}"));
         assert!(!accepts(&src, "{\"x\":\n\n1}"));
         assert!(!accepts(&src, "{\"x\" : \t 1}"));
+    }
+
+    #[test]
+    fn json_string_rejects_raw_control_chars() {
+        // RFC 8259 §7: raw control characters (U+0000–U+001F) inside a
+        // string are forbidden — they must be escaped (\n, \t, \uXXXX).
+        // Pre-fix the `unescaped` rule had `[^"\\]` as a first
+        // alternative, which accepted raw control bytes; downstream
+        // serde_json::from_str then rejected them with "Invalid control
+        // character". Regression target for that failure mode.
+        let src = format!("root ::= string\n{JSON_GRAMMAR}");
+        assert!(!accepts(&src, "\"foo\nbar\""));
+        assert!(!accepts(&src, "\"foo\tbar\""));
+        assert!(!accepts(&src, "\"foo\rbar\""));
+        assert!(!accepts(&src, "\"\x01\""));
+        // Escaped forms still accepted.
+        assert!(accepts(&src, r#""foo\nbar""#));
+        assert!(accepts(&src, r#""foo\tbar""#));
+        assert!(accepts(&src, r#""foo\rbar""#));
+    }
+
+    #[test]
+    fn json_string_accepts_multibyte_utf8() {
+        // The negated-set form must still admit non-ASCII codepoints
+        // (Cogito tool args carry CJK / emoji routinely). Belt-and-
+        // braces against future tightening that loses UTF-8 support.
+        let src = format!("root ::= string\n{JSON_GRAMMAR}");
+        assert!(accepts(&src, "\"你好\""));
+        assert!(accepts(&src, "\"🍓\""));
     }
 }

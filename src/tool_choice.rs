@@ -66,8 +66,8 @@ pub struct ToolChoiceOptions {
     /// Qwen-style templates. Leave as `None` for Llama 3.1-style raw
     /// JSON.
     pub wrap_tags: Option<(&'static str, &'static str)>,
-    /// If `true`, constrain `parameters` to match the called tool's
-    /// `input_schema` rather than accepting any JSON object.
+    /// If `true`, constrain the arguments object to match the called
+    /// tool's `input_schema` rather than accepting any JSON object.
     ///
     /// The schema-to-grammar translator covers the common case:
     /// objects with string / integer / number / boolean / null typed
@@ -78,11 +78,17 @@ pub struct ToolChoiceOptions {
     /// can still emit a structurally valid but semantically wrong
     /// call.
     ///
-    /// [`ToolChoice::Any`] with `strict_schema = true` is currently
-    /// unsupported (the grammar would have to union across every
-    /// tool's parameter object); setting both yields
-    /// [`ToolChoiceError::AnyWithStrictSchema`]. Stick to
-    /// [`ToolChoice::Method`] when you need schema enforcement.
+    /// Works for both [`ToolChoice::Method`] and [`ToolChoice::Any`].
+    /// Under `Any`, the grammar emits one `call_<i>` alternative per
+    /// advertised tool, each pinning the literal name to that tool's
+    /// schema-derived args rule — so the chosen name and the args
+    /// shape stay coupled.
+    ///
+    /// Defaults to `true`. This diverges from the Anthropic API's
+    /// default (no schema enforcement on tool calls), but here it
+    /// pays for itself: without it, well-trained models still drop
+    /// required fields under sampling pressure (observed: Cogito
+    /// emitting `{"comment": "…"}` when `reply_to` was required).
     pub strict_schema: bool,
 }
 
@@ -97,7 +103,7 @@ impl Default for ToolChoiceOptions {
             allow_thought: true,
             arguments_field: "arguments",
             wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-            strict_schema: false,
+            strict_schema: true,
         }
     }
 }
@@ -116,18 +122,17 @@ pub fn grammar_for_tool_choice(
     tools: &[Tool],
     opts: &ToolChoiceOptions,
 ) -> Result<Option<SamplingMode>, ToolChoiceError> {
-    // Resolve which tools the grammar is allowed to pick from, and
-    // optionally the single tool whose schema we enforce.
-    let (names, schema_tool): (Vec<&str>, Option<&Tool>) = match choice {
+    // Resolve which tools the grammar is allowed to pick from. For
+    // `Any` that's all advertised tools; for `Method` it's a singleton.
+    // `strict_schema` works in both cases — each tool's schema rides
+    // along with its name in a per-tool `call_<i>` alternative.
+    let chosen: Vec<&Tool> = match choice {
         ToolChoice::Auto => return Ok(None),
         ToolChoice::Any => {
             if tools.is_empty() {
                 return Err(ToolChoiceError::NoTools);
             }
-            if opts.strict_schema {
-                return Err(ToolChoiceError::AnyWithStrictSchema);
-            }
-            (tools.iter().map(|t| t.name.as_ref()).collect(), None)
+            tools.iter().collect()
         }
         ToolChoice::Method { name } => {
             let Some(tool) =
@@ -135,11 +140,11 @@ pub fn grammar_for_tool_choice(
             else {
                 return Err(ToolChoiceError::UnknownTool(name.clone()));
             };
-            (vec![tool.name.as_ref()], Some(tool))
+            vec![tool]
         }
     };
 
-    let source = build_grammar_source(&names, schema_tool, opts);
+    let source = build_grammar_source(&chosen, opts);
     let mode = SamplingMode::grammar(&source)?;
     Ok(Some(mode))
 }
@@ -169,24 +174,27 @@ pub fn grammar_for_prompt(
 /// don't need this.
 #[doc(hidden)]
 pub fn build_grammar_source_for_debug(
-    names: &[&str],
-    schema_tool: Option<&Tool>,
+    tools: &[&Tool],
     opts: &ToolChoiceOptions,
 ) -> String {
-    build_grammar_source(names, schema_tool, opts)
+    build_grammar_source(tools, opts)
 }
 
 /// Emit the GBNF source text for a tool-choice constraint.
 ///
-/// When `schema_tool` is `Some` and [`ToolChoiceOptions::strict_schema`]
-/// is true, the `parameters` value is constrained to the tool's
-/// `input_schema`. Otherwise the arguments accept any JSON object.
+/// Each tool in `tools` becomes one `call_<i>` alternative under the
+/// outer `call` rule, pinning the literal `name` to that tool. When
+/// [`ToolChoiceOptions::strict_schema`] is true, each `call_<i>`
+/// references its own `args_<i>` rule derived from the tool's
+/// `input_schema`; otherwise all alternatives share the permissive
+/// `object` rule from [`JSON_GRAMMAR`]. Per-tool alternatives are what
+/// let `strict_schema` work under [`ToolChoice::Any`] — name and args
+/// shape stay coupled.
 ///
 /// Kept pub(crate) + exposed through tests so the generated grammar can
 /// be inspected directly without constructing a full [`SamplingMode`].
 pub(crate) fn build_grammar_source(
-    names: &[&str],
-    schema_tool: Option<&Tool>,
+    tools: &[&Tool],
     opts: &ToolChoiceOptions,
 ) -> String {
     let mut src = String::with_capacity(1024);
@@ -216,45 +224,47 @@ pub(crate) fn build_grammar_source(
         );
     }
 
-    // Pick the rule name for the arguments value: `object` for the
-    // permissive case, `args` for schema-constrained.
-    let args_rule = if opts.strict_schema && schema_tool.is_some() {
-        "args"
-    } else {
-        "object"
-    };
-
-    // The tool call: `{"name": <chosen>, "<args>": <args_rule>}`.
-    let _ = writeln!(
-        src,
-        r#"call ::= "{{" ws "\"name\"" ws ":" ws name_choice ws "," ws "\"{arg}\"" ws ":" ws {args_rule} ws "}}""#,
-        arg = opts.arguments_field,
-        args_rule = args_rule,
-    );
-
-    // Alternation over the allowed function names, each quoted.
-    // Pipeline: `serde_json::to_string(&name)` produces a JSON string
-    // literal with JSON escapes applied (handles control chars, `\`,
-    // `"`, non-ASCII). We then GBNF-escape that literal so it can be
-    // embedded inside a GBNF `"..."` terminal without breaking the
-    // grammar parser.
-    let mut alt = String::new();
-    for (i, n) in names.iter().enumerate() {
+    // Outer call wraps the JSON braces; per-tool alternatives carry the
+    // name + args body.
+    let mut alts = String::new();
+    for i in 0..tools.len() {
         if i > 0 {
-            alt.push_str(" | ");
+            alts.push_str(" | ");
         }
-        let json_lit = serde_json::to_string(n).unwrap();
-        let gbnf_lit = escape_for_gbnf_string(&json_lit);
-        write!(alt, r#""{gbnf_lit}""#).unwrap();
+        let _ = write!(alts, "call_{i}");
     }
-    let _ = writeln!(src, r#"name_choice ::= {alt}"#);
+    let _ = writeln!(src, r#"call ::= "{{" ws ( {alts} ) ws "}}""#);
 
-    // If strict schema is on, emit the `args` rule derived from the
-    // tool's input_schema. Otherwise fall through to the permissive
-    // JSON grammar below (which defines `object`).
+    // Pipeline for embedded JSON literals: `serde_json::to_string`
+    // produces a JSON string literal with JSON escapes (handles control
+    // chars, `\`, `"`, non-ASCII). We then GBNF-escape that literal so
+    // it survives being embedded inside a GBNF `"..."` terminal.
+    let arg_field_lit = {
+        let json_lit = serde_json::to_string(opts.arguments_field).unwrap();
+        escape_for_gbnf_string(&json_lit)
+    };
+    for (i, tool) in tools.iter().enumerate() {
+        let name_lit = {
+            let json_lit = serde_json::to_string(tool.name.as_ref()).unwrap();
+            escape_for_gbnf_string(&json_lit)
+        };
+        let args_rule: String = if opts.strict_schema {
+            format!("args_{i}")
+        } else {
+            "object".into()
+        };
+        let _ = writeln!(
+            src,
+            r#"call_{i} ::= "\"name\"" ws ":" ws "{name_lit}" ws "," ws "{arg_field_lit}" ws ":" ws {args_rule}"#,
+        );
+    }
+
+    // Schema-derived args rules, one per tool. Skipped when strict
+    // schema is off — `object` from JSON_GRAMMAR covers the permissive
+    // case.
     if opts.strict_schema {
-        if let Some(tool) = schema_tool {
-            schema_to_gbnf(&tool.schema, "args", &mut src);
+        for (i, tool) in tools.iter().enumerate() {
+            schema_to_gbnf(&tool.schema, &format!("args_{i}"), &mut src);
         }
     }
 
@@ -271,11 +281,6 @@ pub enum ToolChoiceError {
     NoTools,
     #[error("tool_choice picked unknown tool `{0}`")]
     UnknownTool(String),
-    #[error(
-        "ToolChoice::Any + strict_schema is not supported; use Method when \
-         schema enforcement is required"
-    )]
-    AnyWithStrictSchema,
     #[error("compiled grammar is invalid: {0}")]
     Grammar(#[from] GrammarError),
 }
@@ -296,6 +301,20 @@ mod tests {
             schema: json!({"type": "object"}),
             cache_control: None,
             strict: None,
+        }
+    }
+
+    /// Legacy Llama-3.1 tool-call shape (`parameters`, no envelope, no
+    /// thought, no schema enforcement). The crate-wide
+    /// `ToolChoiceOptions::default()` now targets the Cogito/Qwen
+    /// envelope shape; tests that assert against bare JSON pin the
+    /// older shape locally so they don't drift with the default.
+    fn bare_opts() -> ToolChoiceOptions {
+        ToolChoiceOptions {
+            allow_thought: false,
+            arguments_field: "parameters",
+            wrap_tags: None,
+            strict_schema: false,
         }
     }
 
@@ -344,11 +363,8 @@ mod tests {
 
     #[test]
     fn method_grammar_accepts_forced_call() {
-        let src = build_grammar_source(
-            &["get_weather"],
-            None,
-            &ToolChoiceOptions::default(),
-        );
+        let t = tool("get_weather");
+        let src = build_grammar_source(&[&t], &bare_opts());
         assert!(accepts(
             &src,
             r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#
@@ -362,11 +378,9 @@ mod tests {
 
     #[test]
     fn any_grammar_accepts_any_listed_name() {
-        let src = build_grammar_source(
-            &["a", "b"],
-            None,
-            &ToolChoiceOptions::default(),
-        );
+        let a = tool("a");
+        let b = tool("b");
+        let src = build_grammar_source(&[&a, &b], &bare_opts());
         assert!(accepts(&src, r#"{"name": "a", "parameters": {}}"#));
         assert!(accepts(&src, r#"{"name": "b", "parameters": {}}"#));
         assert!(!accepts(&src, r#"{"name": "c", "parameters": {}}"#));
@@ -376,9 +390,10 @@ mod tests {
     fn arguments_field_is_configurable() {
         let opts = ToolChoiceOptions {
             arguments_field: "arguments",
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(&src, r#"{"name": "x", "arguments": {}}"#));
         // With `arguments`, `parameters` is rejected.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {}}"#));
@@ -388,9 +403,10 @@ mod tests {
     fn thought_preamble_optional() {
         let opts = ToolChoiceOptions {
             allow_thought: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         // No thought.
         assert!(accepts(&src, r#"{"name": "x", "parameters": {}}"#));
         // With thought.
@@ -402,8 +418,8 @@ mod tests {
 
     #[test]
     fn deeply_nested_arguments_accepted() {
-        let src =
-            build_grammar_source(&["x"], None, &ToolChoiceOptions::default());
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &bare_opts());
         assert!(accepts(
             &src,
             r#"{"name": "x", "parameters": {"a": {"b": [1, 2, {"c": "d"}]}}}"#
@@ -428,10 +444,9 @@ mod tests {
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src =
-            build_grammar_source(&["count_letters"], Some(&schema_tool), &opts);
+        let src = build_grammar_source(&[&schema_tool], &opts);
         // Correct shape accepted.
         assert!(accepts(
             &src,
@@ -454,25 +469,64 @@ mod tests {
         ));
     }
 
+    /// `ToolChoice::Any` with `strict_schema = true`: the grammar must
+    /// emit per-tool alternatives so each name is paired with its own
+    /// schema-derived args rule. A name from tool A cannot ride along
+    /// with tool B's args shape (or vice versa).
     #[test]
-    fn any_plus_strict_schema_errors() {
+    fn any_plus_strict_schema_couples_name_to_args() {
+        let tool_a = Tool {
+            name: Cow::Borrowed("a"),
+            description: Cow::Borrowed(""),
+            schema: json!({
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"]
+            }),
+            cache_control: None,
+            strict: None,
+        };
+        let tool_b = Tool {
+            name: Cow::Borrowed("b"),
+            description: Cow::Borrowed(""),
+            schema: json!({
+                "type": "object",
+                "properties": {"y": {"type": "string"}},
+                "required": ["y"]
+            }),
+            cache_control: None,
+            strict: None,
+        };
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let err = grammar_for_tool_choice(
-            &ToolChoice::Any,
-            &[tool("a"), tool("b")],
-            &opts,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ToolChoiceError::AnyWithStrictSchema));
+        let src = build_grammar_source(&[&tool_a, &tool_b], &opts);
+
+        // Each tool's name accepts its own args.
+        assert!(accepts(&src, r#"{"name": "a", "parameters": {"x": 1}}"#));
+        assert!(accepts(&src, r#"{"name": "b", "parameters": {"y": "hi"}}"#));
+        // Cross-pairing rejected: name a + b's args, or name b + a's
+        // args — these are exactly the failure mode the per-tool
+        // alternatives prevent.
+        assert!(!accepts(
+            &src,
+            r#"{"name": "a", "parameters": {"y": "hi"}}"#
+        ));
+        assert!(!accepts(&src, r#"{"name": "b", "parameters": {"x": 1}}"#));
+        // Unknown name rejected.
+        assert!(!accepts(&src, r#"{"name": "c", "parameters": {"x": 1}}"#));
+        // grammar_for_tool_choice path (with default opts) also
+        // succeeds — no AnyWithStrictSchema error.
+        let res =
+            grammar_for_tool_choice(&ToolChoice::Any, &[tool_a, tool_b], &opts);
+        assert!(res.is_ok(), "Any+strict_schema must compile, got {res:?}");
     }
 
     #[test]
     fn malformed_arguments_rejected() {
-        let src =
-            build_grammar_source(&["x"], None, &ToolChoiceOptions::default());
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &bare_opts());
         // Trailing comma is invalid JSON.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {"a": 1,}}"#));
         // Single-quoted string is invalid JSON.
@@ -504,7 +558,7 @@ mod tests {
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
         // Compilation must succeed — the previous bug errored here.
         let result = grammar_for_tool_choice(
@@ -521,8 +575,7 @@ mod tests {
         );
         // And the grammar must still accept valid inputs and reject
         // decimals.
-        let src =
-            build_grammar_source(&["two_ints"], Some(&schema_tool), &opts);
+        let src = build_grammar_source(&[&schema_tool], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "two_ints", "parameters": {"x": 1, "y": 2}}"#
@@ -539,9 +592,10 @@ mod tests {
     fn thought_body_with_lt_inside_accepted() {
         let opts = ToolChoiceOptions {
             allow_thought: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             "<think>if x < 5 then call x</think>\n{\"name\": \"x\", \"parameters\": {}}"
@@ -554,16 +608,22 @@ mod tests {
     #[test]
     fn tool_name_with_special_chars_embeds_safely() {
         // A tool name with a backslash and a quote.
-        let weird = "evil\\\"name";
-        let src =
-            build_grammar_source(&[weird], None, &ToolChoiceOptions::default());
+        let weird_tool = Tool {
+            name: Cow::Borrowed("evil\\\"name"),
+            description: Cow::Borrowed(""),
+            schema: json!({"type": "object"}),
+            cache_control: None,
+            strict: None,
+        };
+        let src = build_grammar_source(&[&weird_tool], &bare_opts());
         // Grammar compiles.
         assert!(
             Grammar::parse(&src).is_ok(),
             "grammar failed to parse for weird name:\n{src}"
         );
         // And it accepts the properly JSON-escaped tool call.
-        let json_name = serde_json::to_string(weird).unwrap();
+        let json_name =
+            serde_json::to_string(weird_tool.name.as_ref()).unwrap();
         let input = format!(r#"{{"name": {json_name}, "parameters": {{}}}}"#);
         assert!(accepts(&src, &input));
     }
@@ -576,9 +636,10 @@ mod tests {
     fn wrap_tags_accepts_tagged_envelope() {
         let opts = ToolChoiceOptions {
             wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             "<tool_call>\n{\"name\": \"x\", \"parameters\": {}}\n</tool_call>"
@@ -589,9 +650,10 @@ mod tests {
     fn wrap_tags_rejects_bare_json() {
         let opts = ToolChoiceOptions {
             wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         // With wrap_tags on, bare JSON without the envelope must be
         // rejected.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {}}"#));
@@ -601,9 +663,10 @@ mod tests {
     fn wrap_tags_rejects_mismatched_tags() {
         let opts = ToolChoiceOptions {
             wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         // Wrong close tag.
         assert!(!accepts(
             &src,
@@ -623,9 +686,10 @@ mod tests {
         let opts = ToolChoiceOptions {
             allow_thought: true,
             wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             "<think>plan the call</think>\n<tool_call>\n{\"name\": \"x\", \"parameters\": {}}\n</tool_call>"
@@ -643,9 +707,10 @@ mod tests {
     fn thought_unclosed_rejected() {
         let opts = ToolChoiceOptions {
             allow_thought: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         assert!(!accepts(
             &src,
             r#"<think>never closed {"name": "x", "parameters": {}}"#
@@ -656,9 +721,10 @@ mod tests {
     fn thought_after_json_rejected() {
         let opts = ToolChoiceOptions {
             allow_thought: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         // Thought after the JSON is not in the grammar.
         assert!(!accepts(
             &src,
@@ -670,9 +736,10 @@ mod tests {
     fn empty_thought_accepted() {
         let opts = ToolChoiceOptions {
             allow_thought: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["x"], None, &opts);
+        let t = tool("x");
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"<think></think>{"name": "x", "parameters": {}}"#
@@ -702,9 +769,9 @@ mod tests {
         let t = single_required_schema("n", json!({"type": "integer"}));
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
         assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": -7}}"#));
         assert!(!accepts(
@@ -722,9 +789,9 @@ mod tests {
         let t = single_required_schema("n", json!({"type": "number"}));
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
         assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 1.5}}"#));
         assert!(accepts(
@@ -742,9 +809,9 @@ mod tests {
         let t = single_required_schema("b", json!({"type": "boolean"}));
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"b": true}}"#
@@ -765,9 +832,9 @@ mod tests {
         let t = single_required_schema("z", json!({"type": "null"}));
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"z": null}}"#
@@ -783,9 +850,9 @@ mod tests {
         );
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"color": "red"}}"#
@@ -808,9 +875,9 @@ mod tests {
         );
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"level": 1}}"#
@@ -833,9 +900,9 @@ mod tests {
         );
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"tags": ["a", "b"]}}"#
@@ -878,9 +945,9 @@ mod tests {
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,
-            ..ToolChoiceOptions::default()
+            ..bare_opts()
         };
-        let src = build_grammar_source(&["fn"], Some(&t), &opts);
+        let src = build_grammar_source(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"loc": {"x": 1, "y": 2}}}"#
