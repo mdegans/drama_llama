@@ -127,8 +127,22 @@ moeflux-model-qwen3-6-35b-a3b = ["moeflux", "moeflux/model-qwen3-6-35b-a3b"]
 # expert-paging machinery.
 moeflux-model-cogito-v2-671b = ["moeflux", "moeflux/model-cogito-v2-671b"]
 
+[dev-dependencies]
+# Oracle for the in-tree fuzzer (`examples/grammar_fuzz.rs`): validates
+# `serde_json::Value`s against a JSON Schema so we can detect Class 3
+# bugs (grammar rejects, schema accepts). Dev-only — never linked into
+# library or binary builds.
+jsonschema = { version = "0.30", default-features = false }
+
 [[example]]
 name = "strawberry"
+required-features = ["cli"]
+
+# Differential fuzzer over the schema → grammar → JSON pipeline.
+# Pure mode runs CPU-only; model mode also needs llama-cpp. `cli` pulls
+# both clap and llama-cpp via the existing `cli` feature definition.
+[[example]]
+name = "grammar_fuzz"
 required-features = ["cli"]
 
 [[example]]

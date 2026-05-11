@@ -6,3 +6,4 @@ model.sampling.toml
 /profile.py
 /bench.py
 /__pycache__/
+/fuzz-corpus/

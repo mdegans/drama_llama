@@ -47,6 +47,8 @@ pub use chat_template::{ChatTemplate, ChatTemplateError, RenderOptions};
 pub use minijinja;
 
 pub(crate) mod grammar_compile;
+#[doc(hidden)]
+pub use grammar_compile::{schema_to_gbnf, JSON_GRAMMAR};
 
 mod tool_choice;
 pub use tool_choice::{

@@ -143,7 +143,19 @@ struct GrammarBuilder<'a> {
     name_to_idx: std::collections::HashMap<String, usize>,
     rules: Vec<Rule>,
     anon_counter: usize,
+    /// Current depth of recursive `parse_alternates` / `parse_atom`
+    /// calls. Bounded by [`PARSER_RECURSION_LIMIT`] to prevent
+    /// stack-overflow crashes on pathological inputs (deeply-nested
+    /// `(((...)))` groups). Surfaced by the in-tree fuzzer.
+    parse_depth: usize,
 }
+
+/// Hard cap on `parse_atom` ↔ `parse_alternates` recursion. Generous
+/// enough that any realistic grammar (incl. JSON-Schema-derived ones
+/// from the deepest objects we'd see in practice) parses fine, but
+/// small enough that 8 MB default stacks never approach the guard
+/// page on a clean compile path.
+const PARSER_RECURSION_LIMIT: usize = 256;
 
 impl<'a> GrammarBuilder<'a> {
     fn new(src: &'a str) -> Self {
@@ -153,6 +165,7 @@ impl<'a> GrammarBuilder<'a> {
             name_to_idx: std::collections::HashMap::new(),
             rules: Vec::new(),
             anon_counter: 0,
+            parse_depth: 0,
         }
     }
 
@@ -279,16 +292,31 @@ impl<'a> GrammarBuilder<'a> {
 
     /// Parse one or more `|`-separated sequences.
     fn parse_alternates(&mut self) -> Result<Vec<Vec<Atom>>, GrammarError> {
-        let mut alts = vec![self.parse_sequence()?];
-        loop {
-            self.skip_trivia();
-            if !self.eat('|') {
-                break;
-            }
-            self.skip_trivia();
-            alts.push(self.parse_sequence()?);
+        // Recursion guard: `parse_alternates` calls `parse_sequence`
+        // which calls `parse_atom`, and `parse_atom` recurses back here
+        // for `(...)` groups. Bound the chain so a pathological
+        // `(((...)))` source can't blow the stack.
+        if self.parse_depth >= PARSER_RECURSION_LIMIT {
+            return Err(GrammarError::RecursionLimit {
+                pos: self.cursor,
+                limit: PARSER_RECURSION_LIMIT,
+            });
         }
-        Ok(alts)
+        self.parse_depth += 1;
+        let result = (|| {
+            let mut alts = vec![self.parse_sequence()?];
+            loop {
+                self.skip_trivia();
+                if !self.eat('|') {
+                    break;
+                }
+                self.skip_trivia();
+                alts.push(self.parse_sequence()?);
+            }
+            Ok::<_, GrammarError>(alts)
+        })();
+        self.parse_depth -= 1;
+        result
     }
 
     /// Parse a sequence of atoms (terminated by `|`, `)`, or end-of-rule).
@@ -771,7 +799,12 @@ impl GrammarState {
     /// byte `b` next could plausibly extend the match into a codepoint
     /// accepted by at least one active stack. See
     /// [`StackState::first_byte_bitmap`] for details.
-    pub(crate) fn first_byte_bitmap(&self) -> [u64; 4] {
+    ///
+    /// Conservative: a set bit means "maybe accepted" and still needs
+    /// [`accepts_bytes`] confirmation; a cleared bit is a definite
+    /// rejection. Fuzzers use this to enumerate plausible next bytes
+    /// without paying for 256 full clone-and-advance probes.
+    pub fn first_byte_bitmap(&self) -> [u64; 4] {
         self.inner.first_byte_bitmap(&self.grammar)
     }
 
@@ -897,6 +930,17 @@ impl StackState {
         grammar: &Grammar,
         b: u8,
     ) -> Result<(), GrammarError> {
+        // `pending` is a fixed-capacity 4-byte buffer. If the previous
+        // call left it full (e.g. an `Invalid` result on the 4th byte
+        // returned without clearing), pushing here would panic. Defend
+        // against stale state by clearing on a full buffer — a 5th
+        // pending byte is structurally impossible in any valid UTF-8
+        // codepoint, so resetting and treating `b` as a fresh start is
+        // semantically equivalent to "previous incomplete sequence was
+        // garbage." Surfaced by the in-tree fuzzer.
+        if self.pending.len() == self.pending.capacity() {
+            self.pending.clear();
+        }
         self.pending.push(b);
         match decode_utf8(self.pending.as_slice()) {
             Utf8Decode::Complete(cp) => {
@@ -904,7 +948,13 @@ impl StackState {
                 self.consume(grammar, cp)
             }
             Utf8Decode::Incomplete => Ok(()),
-            Utf8Decode::Invalid => Err(GrammarError::InvalidUtf8),
+            Utf8Decode::Invalid => {
+                // Clear so the next call starts fresh — see comment
+                // above; without this, a follow-up `feed_byte` on the
+                // same state panics.
+                self.pending.clear();
+                Err(GrammarError::InvalidUtf8)
+            }
         }
     }
 
@@ -1460,6 +1510,12 @@ pub enum GrammarError {
     InvalidUtf8,
     #[error("codepoint U+{0:04X} does not extend the grammar")]
     NoMatch(u32),
+    #[error(
+        "GBNF parser recursion exceeded {limit} levels at byte {pos} \
+         (deeply-nested groups / alternations); likely a malicious or \
+         pathological input"
+    )]
+    RecursionLimit { pos: usize, limit: usize },
     #[error("I/O error reading `{path}`: {err}")]
     Io {
         path: std::path::PathBuf,
@@ -2060,6 +2116,105 @@ mod tests {
             # footer comment
         "#;
         assert!(accepts_complete(g, "hi"));
+    }
+
+    /// `feed_byte` used to leave `pending` at full capacity (4) on the
+    /// `Invalid` UTF-8 path; the next call would then push to a full
+    /// `ArrayVec<[u8; 4]>` and panic. Surfaced by the in-tree fuzzer
+    /// (`examples/grammar_fuzz.rs`) within seconds. Regression target:
+    /// after an `InvalidUtf8` Err from a 4-byte overlong sequence, a
+    /// follow-up `advance_bytes` must return cleanly (Err or Ok), not
+    /// panic.
+    #[test]
+    fn feed_byte_recovers_after_invalid_utf8_at_capacity() {
+        let grammar = Arc::new(parse_ok(r#"root ::= [\x80-\xFF]"#));
+        let mut state = GrammarState::new(grammar);
+        // 0xF0 0x80 0x80 0x80 is overlong U+0000 (the smallest 4-byte
+        // codepoint should be U+10000); from_utf8 rejects it. The 4th
+        // byte triggers Invalid.
+        let _ = state.advance_bytes(&[0xF0, 0x80, 0x80, 0x80]);
+        // What we care about: the next call doesn't panic. Result
+        // can be either Ok or Err — pre-fix it was an unwrappable
+        // capacity-overflow panic.
+        let _ = state.advance_bytes(&[0x41]);
+    }
+
+    /// The fuzzer found that array-of-integers grammars crashed the
+    /// matcher with an uncatchable stack overflow. The trigger isn't
+    /// long input alone — it's repeated `first_byte_bitmap` calls on
+    /// states with many active stacks (the bitmap interrogates every
+    /// stack top against every byte 0..256, and certain inner states
+    /// of the array+int grammar have stack counts that grow without
+    /// bound across walker iterations).
+    ///
+    /// Regression target: 4096 bitmap-driven walker iterations on the
+    /// array-of-integers grammar must complete cleanly.
+    #[test]
+    fn array_of_integers_walker_does_not_overflow() {
+        let src = r#"root ::= args
+args__item_1 ::= int
+args ::= "[" ws ( args__item_1 ( ws "," ws args__item_1 )* )? ws "]"
+
+value ::= object | array | string | number | "true" | "false" | "null"
+object ::= "{" ws ( member ( ws "," ws member )* )? ws "}"
+member ::= string ws ":" ws value
+array ::= "[" ws ( value ( ws "," ws value )* )? ws "]"
+string ::= "\"" char* "\""
+char ::= unescaped | escape
+unescaped ::= [^"\\\x00-\x1F]
+escape ::= "\\" ( ["\\/bfnrt] | "u" hex hex hex hex )
+hex ::= [0-9a-fA-F]
+number ::= int frac? exp?
+int ::= "-"? ( "0" | [1-9] [0-9]* )
+frac ::= "." [0-9]+
+exp ::= [eE] [+\-]? [0-9]+
+ws ::= [ \t\n\r]?
+"#;
+        let g = Arc::new(parse_ok(src));
+        let mut state = GrammarState::new(g);
+        // Walker pattern: at each step, ask for the bitmap, pick any
+        // accepted byte, advance. The fuzzer's loop, distilled.
+        for _ in 0..4096 {
+            let bitmap = state.first_byte_bitmap();
+            let mut chosen: Option<u8> = None;
+            'outer: for w in 0..2usize {
+                for b in 0..64u8 {
+                    if (bitmap[w] >> b) & 1 == 1 {
+                        let byte = (w as u8) * 64 + b;
+                        if state.accepts_bytes(&[byte]) {
+                            chosen = Some(byte);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            let Some(byte) = chosen else { break };
+            state.advance_bytes(&[byte]).unwrap();
+        }
+    }
+
+    /// `parse_atom` recurses into `parse_alternates` for `(...)`
+    /// groups; deeply-nested `((((...))))` sources used to blow the
+    /// thread stack with no possible recovery. Surfaced by the in-tree
+    /// fuzzer. Regression target: such sources now bail with
+    /// `RecursionLimit`, not a `fatal runtime error: stack overflow`.
+    #[test]
+    fn parser_caps_recursion_at_deep_nested_groups() {
+        let mut src = String::from("root ::= ");
+        for _ in 0..2048 {
+            src.push('(');
+        }
+        src.push('"');
+        src.push('x');
+        src.push('"');
+        for _ in 0..2048 {
+            src.push(')');
+        }
+        let err = Grammar::parse(&src).unwrap_err();
+        assert!(
+            matches!(err, GrammarError::RecursionLimit { .. }),
+            "expected RecursionLimit, got {err:?}"
+        );
     }
 
     #[test]

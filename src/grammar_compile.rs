@@ -39,11 +39,15 @@ use serde_json::Value;
 /// get unique child names derived from it. If `schema` carries a
 /// `$defs` map at its root, `$ref` entries of the form
 /// `#/$defs/<Name>` are resolved inline.
-pub(crate) fn schema_to_gbnf(
-    schema: &Value,
-    rule_name: &str,
-    out: &mut String,
-) {
+///
+/// Exposed as `#[doc(hidden)] pub` (re-exported at the crate root)
+/// so the in-tree fuzzer can compile schemas directly without going
+/// through the tool-choice wrapper rules. Not part of the stable
+/// surface — callers outside the fuzzer should use
+/// [`grammar_for_tool_choice`](crate::grammar_for_tool_choice) or
+/// [`output_config::grammar_for_output_config`](crate::output_config::grammar_for_output_config).
+#[doc(hidden)]
+pub fn schema_to_gbnf(schema: &Value, rule_name: &str, out: &mut String) {
     let defs = schema.get("$defs").and_then(|v| v.as_object());
     let mut counter: usize = 0;
     emit_schema_rule(schema, rule_name, out, &mut counter, defs);
@@ -258,7 +262,12 @@ pub(crate) fn escape_for_gbnf_string(s: &str) -> String {
 /// intra-structure whitespace. Not strict about number formatting edge
 /// cases (e.g. `01` is rejected as JSON would); good enough for
 /// downstream deserializers to validate.
-pub(crate) const JSON_GRAMMAR: &str = r#"
+/// Standard JSON grammar appended to every schema-derived GBNF.
+///
+/// Exposed as `#[doc(hidden)] pub` for the fuzzer (paired with
+/// [`schema_to_gbnf`]). Not part of the stable surface.
+#[doc(hidden)]
+pub const JSON_GRAMMAR: &str = r#"
 value ::= object | array | string | number | "true" | "false" | "null"
 object ::= "{" ws ( member ( ws "," ws member )* )? ws "}"
 member ::= string ws ":" ws value
