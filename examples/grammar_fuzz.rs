@@ -195,7 +195,40 @@ fn gen_primitive(rng: &mut SmallRng) -> Value {
         .choose(rng)
         .copied()
         .unwrap();
-    json!({ "type": t })
+    let mut schema = serde_json::Map::new();
+    schema.insert("type".into(), Value::String(t.into()));
+    // Sprinkle "validator-only" constraints — `schema_to_gbnf` doesn't
+    // model these today, so it falls through to the permissive rule
+    // for the type. Any time the grammar emits something the
+    // jsonschema validator rejects, we get a Class 3 finding pinned to
+    // exactly which constraint isn't enforced. Coverage is ~10% per
+    // constraint so most cases remain plain primitives.
+    match t {
+        "string" if rng.random_bool(0.10) => {
+            schema.insert("minLength".into(), json!(rng.random_range(1..=8)));
+        }
+        "string" if rng.random_bool(0.10) => {
+            schema.insert("maxLength".into(), json!(rng.random_range(1..=8)));
+        }
+        "string" if rng.random_bool(0.05) => {
+            // Tiny pattern set so the validator side is predictable —
+            // we're testing whether the GRAMMAR enforces the pattern,
+            // which it currently does not.
+            let p = ["^[a-z]+$", "^[0-9]{3}$", "^[A-Z]{2}_"]
+                .choose(rng)
+                .copied()
+                .unwrap();
+            schema.insert("pattern".into(), Value::String(p.into()));
+        }
+        "integer" | "number" if rng.random_bool(0.10) => {
+            schema.insert("minimum".into(), json!(rng.random_range(0..=10)));
+        }
+        "integer" | "number" if rng.random_bool(0.10) => {
+            schema.insert("maximum".into(), json!(rng.random_range(10..=100)));
+        }
+        _ => {}
+    }
+    Value::Object(schema)
 }
 
 fn gen_enum(rng: &mut SmallRng) -> Value {
@@ -825,26 +858,53 @@ fn signature_hash(f: &Finding) -> u64 {
 /// | `-391 was expected` | `was expected` (const mismatch) |
 /// | `null is not valid under any of the schemas listed in the 'anyOf' keyword` | `is not valid under any of the schemas listed in the 'anyOf' keyword` |
 /// | `"foo" is a required property` | `is a required property` |
+/// | `"abc" does not match "<pattern>"` | `does not match "<pattern>"` |
+/// | `7 is greater than the maximum of N` | `is greater than the maximum of <N>` |
+/// | `2 is less than the minimum of N` | `is less than the minimum of <N>` |
 fn validator_error_stem(err: &str) -> String {
-    // Find the first " is " or " was " — the boundary between value
-    // and constraint description in every error shape we've observed.
-    for sep in [" is ", " was "] {
+    // Find the first " is ", " was ", or " does " — the boundary
+    // between value and constraint description in every error shape
+    // we've observed.
+    for sep in [" is ", " was ", " does "] {
         if let Some(idx) = err.find(sep) {
             let tail = &err[idx + 1..];
-            // For `is not one of [...]`, the bracketed enum members
-            // also vary per-case; strip the contents so two enums of
-            // the same arity collapse.
-            let collapsed = strip_bracketed(tail);
-            return collapsed.chars().take(96).collect();
+            // Collapse value-bearing payloads so two errors that
+            // differ only in their interpolated values share a
+            // signature. Numeric bounds payloads ("of N") get
+            // collapsed too.
+            let collapsed = collapse_value_payloads(tail);
+            // Singular/plural normalization: "1 character" and "5
+            // characters" collapse to the same stem.
+            let normalized = collapsed.replace("characters", "character");
+            return normalized.chars().take(96).collect();
         }
     }
     err.chars().take(96).collect()
 }
 
-/// Replace `[...]` and `'...'` payloads with placeholders so two
-/// errors that differ only in the listed enum members or the named
-/// keyword collapse to the same signature.
-fn strip_bracketed(s: &str) -> String {
+/// Consume a sign/decimal/exponent number from a `Peekable<Chars>`,
+/// discarding the matched chars. Used by `collapse_value_payloads` to
+/// skip past numeric tails when collapsing them.
+fn consume_numeric(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    while let Some(&peek) = chars.peek() {
+        if peek.is_ascii_digit()
+            || peek == '-'
+            || peek == '+'
+            || peek == '.'
+            || peek == 'e'
+            || peek == 'E'
+        {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Replace `[...]`, `'...'`, and `of <number>` payloads with
+/// placeholders so two errors that differ only in their interpolated
+/// values collapse to the same signature.
+fn collapse_value_payloads(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -861,6 +921,38 @@ fn strip_bracketed(s: &str) -> String {
                 if c2 == '\'' {
                     break;
                 }
+            }
+        } else if c == 'o'
+            && out.ends_with(' ')
+            && chars.clone().take(2).collect::<String>() == "f "
+        {
+            // " of <number>" → " of <…>". Numeric-bounds errors
+            // ("greater than the maximum of 34") would otherwise
+            // fragment per the bound value.
+            out.push('o');
+            chars.next(); // 'f'
+            out.push_str("f <…>");
+            chars.next(); // ' '
+            consume_numeric(&mut chars);
+        } else if c.is_ascii_digit() && out.ends_with(' ') {
+            // " <digits> character[s]" → " <…> character[s]". minLength/
+            // maxLength errors ("is shorter than 5 characters") would
+            // otherwise fragment per the bound value.
+            let mut peek_chars = chars.clone();
+            // Skip past trailing digits.
+            while peek_chars.peek().is_some_and(|p| p.is_ascii_digit()) {
+                peek_chars.next();
+            }
+            // If the next bytes are " character" we're in the bound
+            // pattern; collapse and skip past the digits.
+            let lookahead: String = peek_chars.clone().take(11).collect();
+            if lookahead.starts_with(" character") {
+                out.push_str("<…>");
+                while chars.peek().is_some_and(|p| p.is_ascii_digit()) {
+                    chars.next();
+                }
+            } else {
+                out.push(c);
             }
         } else {
             out.push(c);
