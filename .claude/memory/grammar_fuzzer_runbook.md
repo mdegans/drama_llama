@@ -109,13 +109,15 @@ upstream when there's time.
 * **Model mode** — the `model` subcommand is stubbed. Intended
   shape: prompt the loaded GGUF for a JSON Schema, run that through
   the same differential. GPU-bound, composes with `pure`.
-* **Schema generator coverage** — the generator produces the subset
-  `schema_to_gbnf` understands (object/array/primitives + enum/
-  const/anyOf/$ref). It does NOT yet produce `additionalProperties`,
-  `minLength`/`maxLength`/`pattern`, numeric `minimum`/`maximum`,
-  `allOf`, or `oneOf`. Adding any of these to the generator may
-  surface new Class 3 categories where the grammar over-relaxes.
-  Worth doing when adding any of those features to `schema_to_gbnf`.
+* **Schema generator coverage matches what we enforce.** Generator
+  produces `object`/`array`/`primitives` + `enum`/`const`/`anyOf`/
+  `$ref` — exactly the subset `schema_to_gbnf` enforces. We
+  intentionally don't generate `minLength`/`maxLength`/`pattern`/
+  `minimum`/`maximum`/`multipleOf`/`oneOf`/`allOf` because we
+  intentionally don't *enforce* them; see
+  `.claude/memory/schema_constraint_keywords_decision.md`. If a
+  future feature add expands what `schema_to_gbnf` supports, expand
+  the generator alongside it to keep coverage honest.
 * **Schema-shape dedup is coarse** — `schema_shape` only fingerprints
   the top-level type. Two genuinely different bugs sharing the same
   shape can collide. Currently fine because the corpus is empty;

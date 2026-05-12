@@ -39,6 +39,29 @@
 //! falls through to the permissive `value` rule, which accepts any
 //! JSON. Callers lose strictness in those spots but generation does
 //! not fail.
+//!
+//! # What's intentionally NOT supported
+//!
+//! `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`,
+//! `multipleOf`, `oneOf`, and `allOf` are deliberately ignored. This
+//! matches what Anthropic's own SDKs do (Python / TypeScript / Ruby /
+//! PHP all strip these keywords before sending the schema and reword
+//! them into the field's `description`). Grammar-level enforcement of
+//! value-bound constraints replaces the model's *reasoning about
+//! value* with structural padding that *looks* valid:
+//!
+//! * `pattern: "^[A-Z]{2}_\d{4}$"` → model emits `"AB_0000"`. Pattern
+//!   satisfied, semantics empty.
+//! * `minLength: 5` on a 3-char answer → model emits `"yesyy"` to
+//!   pad. Garbage that passes validation.
+//! * `maximum: 10` when model wanted 100 → emits `10`. Off by 10×.
+//! * `oneOf` has been observed to break Anthropic's structured
+//!   generation entirely — model forced to emit `null`.
+//!
+//! Document constraints in the field's `description` instead;
+//! validate post-generation in the tool runtime. See
+//! `.claude/memory/schema_constraint_keywords_decision.md` for the
+//! full reasoning. Don't add support without revisiting that memo.
 
 use std::fmt::Write;
 

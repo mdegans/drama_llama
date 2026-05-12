@@ -195,41 +195,18 @@ fn gen_primitive(rng: &mut SmallRng) -> Value {
         .choose(rng)
         .copied()
         .unwrap();
-    let mut schema = serde_json::Map::new();
-    schema.insert("type".into(), Value::String(t.into()));
-    // Sprinkle "validator-only" constraints — `schema_to_gbnf` doesn't
-    // model these today, so it falls through to the permissive rule
-    // for the type. Any time the grammar emits something the
-    // jsonschema validator rejects, we get a Class 3 finding pinned to
-    // exactly which constraint isn't enforced. Coverage is ~10% per
-    // constraint so most cases remain plain primitives.
-    match t {
-        "string" if rng.random_bool(0.10) => {
-            schema.insert("minLength".into(), json!(rng.random_range(1..=8)));
-        }
-        "string" if rng.random_bool(0.10) => {
-            schema.insert("maxLength".into(), json!(rng.random_range(1..=8)));
-        }
-        "string" if rng.random_bool(0.05) => {
-            // Tiny pattern set so the validator side is predictable —
-            // we're testing whether the GRAMMAR enforces the pattern,
-            // which it currently does not.
-            let p = ["^[a-z]+$", "^[0-9]{3}$", "^[A-Z]{2}_"]
-                .choose(rng)
-                .copied()
-                .unwrap();
-            schema.insert("pattern".into(), Value::String(p.into()));
-        }
-        "integer" | "number" if rng.random_bool(0.10) => {
-            schema.insert("minimum".into(), json!(rng.random_range(0..=10)));
-        }
-        "integer" | "number" if rng.random_bool(0.10) => {
-            schema.insert("maximum".into(), json!(rng.random_range(10..=100)));
-        }
-        _ => {}
-    }
-    Value::Object(schema)
+    json!({ "type": t })
 }
+
+// `minLength` / `maxLength` / `pattern` / `minimum` / `maximum` are
+// intentionally NOT generated. drama_llama deliberately doesn't
+// enforce them at the grammar level (deceptive padding/truncation
+// failure modes — see
+// `.claude/memory/schema_constraint_keywords_decision.md`).
+// Generating them would just produce "expected non-finding" noise in
+// the corpus. The dedup machinery in `validator_error_stem` already
+// understands the relevant error shapes if we ever reverse the
+// decision and add a generator branch back.
 
 fn gen_enum(rng: &mut SmallRng) -> Value {
     // Mix safe + adversarial enum variants — tries to bait the
