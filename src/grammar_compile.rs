@@ -275,14 +275,33 @@ array ::= "[" ws ( value ( ws "," ws value )* )? ws "]"
 string ::= "\"" char* "\""
 char ::= unescaped | escape
 unescaped ::= [^"\\\x00-\x1F]
-escape ::= "\\" ( ["\\/bfnrt] | "u" hex hex hex hex )
+escape ::= "\\" ( ["\\/bfnrt] | "u" non_surrogate_hex4 | "u" high_surrogate "\\u" low_surrogate )
+non_surrogate_hex4 ::= [0-9a-cA-C] hex hex hex | [dD] [0-7] hex hex | [e-fE-F] hex hex hex
+high_surrogate ::= [dD] [89aAbB] hex hex
+low_surrogate ::= [dD] [c-fC-F] hex hex
 hex ::= [0-9a-fA-F]
 number ::= int frac? exp?
 int ::= "-"? ( "0" | [1-9] [0-9]* )
 frac ::= "." [0-9]+
-exp ::= [eE] [+\-]? [0-9]+
+exp ::= [eE] [+\-]? [0-9] [0-9]?
 ws ::= [ \t\n\r]?
 "#;
+// `exp` allows 1-2 exponent digits (vs the original `[0-9]+`) so a
+// grammar-emitted number is guaranteed to fit in `f64`'s ±E308 range.
+// 1e99 is the largest representable; in practice tool-arg numbers
+// almost never use scientific notation at all, so capping at 2 digits
+// is the right tradeoff. Without this cap, the fuzzer trivially emits
+// things like `5E481` that the grammar accepts but
+// `serde_json::from_slice` rejects with "number out of range" —
+// generation force-EOSes downstream.
+//
+// `escape`'s `\u` branch is split into a non-surrogate code-unit and
+// a paired high+low surrogate alternative. The original
+// `"u" hex hex hex hex` admitted lone surrogates (`\uD800` with no
+// low pair) and surrogate prefixes followed by string-close, both of
+// which serde_json rejects per RFC 8259 §7. The split lets all valid
+// JSON escapes through while excluding the malformed shapes.
+//
 // ws is `?` (zero-or-one) rather than `*` (zero-or-more) so the
 // model can't escape grammar-commitment pressure by emitting
 // unbounded whitespace runs between tokens. Observed pattern (cogito
@@ -461,5 +480,62 @@ mod tests {
         let src = format!("root ::= string\n{JSON_GRAMMAR}");
         assert!(accepts(&src, "\"你好\""));
         assert!(accepts(&src, "\"🍓\""));
+    }
+
+    /// Surfaced by the differential fuzzer (2026-05-12). The original
+    /// `exp ::= [eE] [+\-]? [0-9]+` admitted unbounded exponent
+    /// magnitude, so the grammar accepted numbers like `5E481` that
+    /// `serde_json::from_slice` rejects with "number out of range"
+    /// (overflows `f64`'s ±E308). Cap is 1-2 exponent digits — well
+    /// inside `f64` range, covers any realistic tool-arg number.
+    #[test]
+    fn json_number_exp_capped_to_fit_f64() {
+        let src = format!("root ::= value\n{JSON_GRAMMAR}");
+        // 1-2 digit exponents accepted.
+        assert!(accepts(&src, "1e0"));
+        assert!(accepts(&src, "1e3"));
+        assert!(accepts(&src, "1.5E99"));
+        assert!(accepts(&src, "-2.5e-99"));
+        // 3+ digit exponents rejected (the bug class — could overflow
+        // f64). Trades the legitimate 1e100..1e308 range for safety;
+        // tool args essentially never use exponents that large.
+        assert!(!accepts(&src, "1E308"));
+        assert!(!accepts(&src, "1E1234"));
+        assert!(!accepts(&src, "5E481"));
+    }
+
+    /// Surfaced by the differential fuzzer (2026-05-12). The original
+    /// `escape ::= "\\" ( ["\\/bfnrt] | "u" hex hex hex hex )` admitted
+    /// lone high surrogates (`\uD800`) and surrogate prefixes followed
+    /// by string-close, both of which RFC 8259 §7 / `serde_json`
+    /// reject. Replaced with a non-surrogate alternative plus a
+    /// paired-surrogate alternative.
+    #[test]
+    fn json_escape_rejects_lone_surrogates() {
+        let src = format!("root ::= value\n{JSON_GRAMMAR}");
+        // Non-surrogate \u escapes still accepted.
+        assert!(accepts(&src, r#""A""#)); // 'A'
+        assert!(accepts(&src, r#""é""#)); // 'é'
+        assert!(accepts(&src, r#""中""#)); // '中'
+                                           // Surrogate range D800-DFFF rejected as a lone code unit.
+        assert!(!accepts(&src, r#""\uD800""#));
+        assert!(!accepts(&src, r#""\uDBFF""#));
+        assert!(!accepts(&src, r#""\uDC00""#));
+        assert!(!accepts(&src, r#""\uDFFF""#));
+        // Lowercase hex of a surrogate also rejected.
+        assert!(!accepts(&src, r#""\udabc""#));
+        // Just-below and just-above surrogate range still accepted.
+        assert!(accepts(&src, r#""퟿""#));
+        assert!(accepts(&src, r#""""#));
+        // Properly paired surrogates accepted (encodes U+10000+,
+        // i.e. astral-plane codepoints like emoji).
+        assert!(accepts(&src, r#""🍓""#)); // 🍓
+        assert!(accepts(&src, r#""𝄞""#)); // 𝄞
+                                          // Half-pair (high without low) rejected — the bug class.
+        assert!(!accepts(&src, r#""\uD83C""#));
+        // High surrogate followed by something other than \u low
+        // surrogate is rejected.
+        assert!(!accepts(&src, r#""\uD83Cx""#));
+        assert!(!accepts(&src, r#""\uD83CA""#));
     }
 }

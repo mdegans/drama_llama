@@ -786,11 +786,14 @@ fn signature_hash(f: &Finding) -> u64 {
             ..
         } => {
             // jsonschema errors are like "<value> is not of type
-            // \"integer\"" — the value varies, the rest is the bug.
-            // Bucket by the *first* error's keyword/type stem.
-            let stem: String = validation_errors
+            // \"integer\"" — the value varies wildly per case but the
+            // *bug* is the keyword + target. Strip the leading value
+            // before hashing so `5 is not of type "integer"` and
+            // `false is not of type "integer"` collapse to one
+            // signature.
+            let stem = validation_errors
                 .first()
-                .map(|s| s.chars().take(96).collect())
+                .map(|s| validator_error_stem(s))
                 .unwrap_or_default();
             stem.hash(&mut h);
             schema_shape(schema).hash(&mut h);
@@ -809,6 +812,61 @@ fn signature_hash(f: &Finding) -> u64 {
         }
     }
     h.finish()
+}
+
+/// Extract the *keyword tail* from a `jsonschema` validator error.
+/// Errors take a few stable shapes; we want the part that names the
+/// constraint, not the value that violated it:
+///
+/// | Raw error | Returned stem |
+/// |---|---|
+/// | `5 is not of type "integer"` | `is not of type "integer"` |
+/// | `8 is not one of ["a","b"]` | `is not one of [...]` |
+/// | `-391 was expected` | `was expected` (const mismatch) |
+/// | `null is not valid under any of the schemas listed in the 'anyOf' keyword` | `is not valid under any of the schemas listed in the 'anyOf' keyword` |
+/// | `"foo" is a required property` | `is a required property` |
+fn validator_error_stem(err: &str) -> String {
+    // Find the first " is " or " was " — the boundary between value
+    // and constraint description in every error shape we've observed.
+    for sep in [" is ", " was "] {
+        if let Some(idx) = err.find(sep) {
+            let tail = &err[idx + 1..];
+            // For `is not one of [...]`, the bracketed enum members
+            // also vary per-case; strip the contents so two enums of
+            // the same arity collapse.
+            let collapsed = strip_bracketed(tail);
+            return collapsed.chars().take(96).collect();
+        }
+    }
+    err.chars().take(96).collect()
+}
+
+/// Replace `[...]` and `'...'` payloads with placeholders so two
+/// errors that differ only in the listed enum members or the named
+/// keyword collapse to the same signature.
+fn strip_bracketed(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            out.push_str("[…]");
+            for c2 in chars.by_ref() {
+                if c2 == ']' {
+                    break;
+                }
+            }
+        } else if c == '\'' {
+            out.push_str("'…'");
+            for c2 in chars.by_ref() {
+                if c2 == '\'' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Coarse fingerprint of a schema's structure. Trades collision risk
