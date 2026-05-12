@@ -57,48 +57,67 @@ reproduces.
 * `--seed N` — deterministic. Same seed + same code = same case
   sequence per thread (each thread offsets the seed by its tid).
 
-## Known bug classes already found
+## Bugs found and fixed via this fuzzer
 
-* **Class 2 — number out of range**: `JSON_GRAMMAR`'s `exp` rule has
-  no exponent-magnitude cap, so the grammar admits `5E1234` etc.
-  serde uses `f64` and rejects. Fix: tighten `exp ::= [eE] [+\-]?
-  [0-9] [0-9]?` (1-2 digits) or convert to a custom rule that bounds
-  the magnitude.
-* **Class 3 — optional-property gap**: `schema_to_gbnf` drops
-  properties not in `required:`, so an object schema with
-  `{"properties": {"x": {"const": 5}}}` (no `required`) compiles to
-  the permissive `object` rule. `jsonschema` still enforces `const`
-  on present fields. Documented behavior, but it's a real
-  expressiveness gap — fix would be to emit per-property
-  alternatives even when not required.
+All four landed in commits `a665fd3` → `8a53725` (2026-05-11 to
+2026-05-12). The fuzzer runs clean afterwards: 5 min / 19.7M cases /
+6 threads → zero findings. Listed in approximate find-order so the
+catalogue doubles as a record of what kinds of bugs the differential
+oracle catches.
 
-## Bugs already fixed via fuzzer findings (2026-05-11)
+* **`unescaped` rule admitted raw control bytes** — Class 2 (the
+  original Agora-side report). Fix in `src/grammar_compile.rs`:
+  `unescaped ::= [^"\\\x00-\x1F]` (tighten to RFC 8259 §7).
+* **`feed_byte` `pending`-clear** — Class 4. `tinyvec::ArrayVec`
+  capacity overflow when an Invalid 4-byte UTF-8 result didn't
+  clear the buffer; next push panicked. Fix in
+  `src/sample/grammar.rs::feed_byte` (clear on Invalid + on stale
+  full-buffer entry).
+* **GBNF parser unbounded recursion** — Class 4. `parse_atom` ↔
+  `parse_alternates` on `(((...)))` blew the stack uncatchably.
+  Capped at `PARSER_RECURSION_LIMIT = 256`; new
+  `GrammarError::RecursionLimit` discriminant.
+* **`exp` rule unbounded magnitude** — Class 2. Allowed `5E481`
+  etc. that overflow `f64`. Capped at 1-2 exponent digits.
+* **`escape` rule admitted lone surrogates** — Class 2. `\uD800`
+  without a paired low surrogate; `\uD83C` followed by string-close
+  ("unexpected end of hex escape"). Split `\u` branch into
+  non-surrogate alternative + paired-surrogate alternative.
+* **Optional-property typing not enforced** — Class 3 (dominant).
+  `schema_to_gbnf` dropped properties not in `required:`, so the
+  grammar allowed any value (or no value) for typed optionals.
+  Closed via Option A: required first, optionals after, each
+  optional wrapped in `( ws "," ws ... )?` with its declared type.
 
-* **`feed_byte` `pending`-clear**: Invalid 4-byte UTF-8 left
-  `pending` at capacity; next push panicked on the full ArrayVec.
-  Fixed in `src/sample/grammar.rs` (`feed_byte`).
-* **GBNF parser unbounded recursion**: `parse_atom` ↔
-  `parse_alternates` recursion on `(((...)))` blew the stack.
-  Capped at `PARSER_RECURSION_LIMIT = 256` returning the new
-  `GrammarError::RecursionLimit`.
-
-Regression tests for both live in `src/sample/grammar.rs` under
-`feed_byte_recovers_after_invalid_utf8_at_capacity` and
-`parser_caps_recursion_at_deep_nested_groups`.
+llama.cpp's `json.gbnf` shares two of these bugs (no surrogate
+validation in `\u`; no integer-mantissa length cap). Worth filing
+upstream when there's time.
 
 ## Limitations / future work
 
 * **Multi-byte UTF-8 not exercised** — the walker is restricted to
   ASCII (`bitmap_to_bytes` only iterates words 0-1 of the 256-bit
   bitmap). Walking multibyte paths needs a UTF-8-aware walker that
-  picks first-byte+continuations atomically.
-* **Crash isolation** — uncatchable stack overflows still crash the
-  whole process. If the matcher acquires a new pathological case, a
-  `while true; do ... ; done` shell loop around the binary (or
-  fork-per-case in the fuzzer) is the recovery mechanism.
+  picks first-byte+continuations atomically. Until then, the
+  surrogate-paired emission rule we just added is exercised only by
+  the lib-side regression tests, not the fuzzer.
+* **Crash isolation** — uncatchable stack overflows from the matcher
+  still crash the process; we caught the obvious sources but
+  pathological inputs may still find new ones. A `while true; do
+  ... ; done` shell loop around the binary (or fork-per-case in the
+  fuzzer) is the recovery mechanism.
 * **Model mode** — the `model` subcommand is stubbed. Intended
   shape: prompt the loaded GGUF for a JSON Schema, run that through
   the same differential. GPU-bound, composes with `pure`.
-* **Better Class 3 dedup** — current `schema_shape` only fingerprints
+* **Schema generator coverage** — the generator produces the subset
+  `schema_to_gbnf` understands (object/array/primitives + enum/
+  const/anyOf/$ref). It does NOT yet produce `additionalProperties`,
+  `minLength`/`maxLength`/`pattern`, numeric `minimum`/`maximum`,
+  `allOf`, or `oneOf`. Adding any of these to the generator may
+  surface new Class 3 categories where the grammar over-relaxes.
+  Worth doing when adding any of those features to `schema_to_gbnf`.
+* **Schema-shape dedup is coarse** — `schema_shape` only fingerprints
   the top-level type. Two genuinely different bugs sharing the same
-  schema shape can collide. Acceptable noise tradeoff for now.
+  shape can collide. Currently fine because the corpus is empty;
+  revisit if the corpus starts fragmenting again post some future
+  feature add.
