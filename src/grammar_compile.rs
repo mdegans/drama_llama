@@ -13,8 +13,19 @@
 //! the Anthropic-supported JSON Schema subset after
 //! [`misanthropic::prompt::output::sanitize_for_anthropic`]:
 //!
-//! * `type: object` with `properties` + `required` → fixed-order
-//!   object with the required fields. Optional fields are dropped.
+//! * `type: object` with `properties` (+ optional `required`) →
+//!   required fields first (in `required:`-array order), then
+//!   optional fields each wrapped in `( ws "," ws ... )?` so they
+//!   may be omitted but must match the declared type when present.
+//!   The all-optional case (no `required`) emits N "chain"
+//!   alternatives so all 2^N inclusion patterns are reachable.
+//!
+//!   The required-first / optional-after layout matches Anthropic's
+//!   structured-outputs documentation ("properties in objects
+//!   maintain their defined ordering from your schema, with one
+//!   important caveat: required properties appear first, followed by
+//!   optional properties"), so a model emitting in that canonical
+//!   order will not force-EOS against this grammar.
 //! * `type: array` with `items` → array of the item schema.
 //! * `type: string | integer | number | boolean | null` → the
 //!   corresponding JSON grammar rule.
@@ -185,7 +196,7 @@ fn emit_object_rule(
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
-    let required: Vec<String> = schema
+    let required_vec: Vec<String> = schema
         .get("required")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -194,32 +205,100 @@ fn emit_object_rule(
                 .collect()
         })
         .unwrap_or_default();
+    let required_set: std::collections::HashSet<&String> =
+        required_vec.iter().collect();
 
-    if required.is_empty() {
+    // Empty `properties` (and therefore no slots) → permissive object.
+    if props.is_empty() && required_vec.is_empty() {
         let _ = writeln!(out, "{rule_name} ::= object");
         return;
     }
 
-    let mut field_rules: Vec<(String, String)> = Vec::new();
-    for name in &required {
-        let Some(prop_schema) = props.get(name) else {
-            field_rules.push((name.clone(), "value".to_string()));
+    // Layout: required first (in `required:`-array order), then
+    // optionals. This matches Anthropic's documented tool-call
+    // convention (optionals trailing), and lets the leading-comma
+    // logic stay simple — every required slot anchors the chain, so
+    // each optional gets a self-contained `( ws "," ws ... )?` slot.
+    //
+    // Trade: declaration order from `properties` is not preserved for
+    // required props (we use `required:`-array order instead). In
+    // practice the two are aligned in real schemas and serde_json's
+    // default Map iterator is alphabetical anyway, so neither order
+    // is "the schema author's intent" with high confidence.
+    let mut required_slots: Vec<(String, String)> = Vec::new();
+    for name in &required_vec {
+        *counter += 1;
+        let child_rule = format!("{rule_name}__{c}", c = *counter);
+        if let Some(prop_schema) = props.get(name) {
+            emit_schema_rule(prop_schema, &child_rule, out, counter, defs);
+            required_slots.push((name.clone(), child_rule));
+        } else {
+            // Required prop absent from `properties` — rare but legal;
+            // permissive `value` is the safest fallback.
+            required_slots.push((name.clone(), "value".to_string()));
+        }
+    }
+    let mut optional_slots: Vec<(String, String)> = Vec::new();
+    for (name, prop_schema) in props.iter() {
+        if required_set.contains(name) {
             continue;
-        };
+        }
         *counter += 1;
         let child_rule = format!("{rule_name}__{c}", c = *counter);
         emit_schema_rule(prop_schema, &child_rule, out, counter, defs);
-        field_rules.push((name.clone(), child_rule));
+        optional_slots.push((name.clone(), child_rule));
     }
 
+    if required_slots.is_empty() {
+        // All-optional case. Emit chain alternatives so all 2^N
+        // include/skip combinations are reachable: for each starting
+        // position K, emit prop[K] followed by `(",", prop[K+1])?` ...
+        // `(",", prop[N-1])?`. The outer wrapping is
+        // `(chain_0 | chain_1 | ... | chain_{N-1})?` so the
+        // empty-object case is also matched.
+        let n = optional_slots.len();
+        let mut chain_names: Vec<String> = Vec::with_capacity(n);
+        for k in 0..n {
+            let chain_name = format!("{rule_name}__chain_{k}");
+            let mut tail = String::new();
+            for (i, (name, child)) in optional_slots.iter().enumerate().skip(k)
+            {
+                let lit = escape_for_gbnf_string(
+                    &serde_json::to_string(name).unwrap(),
+                );
+                if i == k {
+                    let _ = write!(&mut tail, r#""{lit}" ws ":" ws {child}"#);
+                } else {
+                    let _ = write!(
+                        &mut tail,
+                        r#" ( ws "," ws "{lit}" ws ":" ws {child} )?"#
+                    );
+                }
+            }
+            let _ = writeln!(out, "{chain_name} ::= {tail}");
+            chain_names.push(chain_name);
+        }
+        let alts = chain_names.join(" | ");
+        let _ = writeln!(out, r#"{rule_name} ::= "{{" ws ( {alts} )? ws "}}""#);
+        return;
+    }
+
+    // Mixed required + (zero or more) optional. Required first, then
+    // optionals each as `( ws "," ws "<name>" ws ":" ws <typed> )?`.
     let mut body = String::from("\"{\" ws");
-    for (i, (field_name, child_rule)) in field_rules.iter().enumerate() {
+    for (i, (field_name, child_rule)) in required_slots.iter().enumerate() {
         if i > 0 {
             body.push_str(r#" ws "," ws"#);
         }
-        let json_lit = serde_json::to_string(field_name).unwrap();
-        let gbnf_lit = escape_for_gbnf_string(&json_lit);
-        let _ = write!(body, r#" "{gbnf_lit}" ws ":" ws {child_rule}"#);
+        let lit =
+            escape_for_gbnf_string(&serde_json::to_string(field_name).unwrap());
+        let _ = write!(body, r#" "{lit}" ws ":" ws {child_rule}"#);
+    }
+    for (field_name, child_rule) in optional_slots.iter() {
+        let lit =
+            escape_for_gbnf_string(&serde_json::to_string(field_name).unwrap());
+        let _ =
+            write!(body, r#" ( ws "," ws "{lit}" ws ":" ws {child_rule} )?"#);
     }
     body.push_str(" ws \"}\"");
     let _ = writeln!(out, "{rule_name} ::= {body}");
@@ -502,6 +581,93 @@ mod tests {
         assert!(!accepts(&src, "1E308"));
         assert!(!accepts(&src, "1E1234"));
         assert!(!accepts(&src, "5E481"));
+    }
+
+    /// Option A landing (2026-05-12): optional properties are now
+    /// type-enforced when present. Mixed required+optional schema:
+    /// the optional must match its declared type if included, and is
+    /// omittable. Wrong type for the optional rejects.
+    #[test]
+    fn optional_property_type_enforced_when_present() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "verbose": {"type": "boolean"}
+            },
+            "required": ["name"]
+        });
+        let mut rules = String::new();
+        schema_to_gbnf(&schema, "obj", &mut rules);
+        let src = wrap_with_root("obj", rules);
+        // Required-only — optional omitted.
+        assert!(accepts(&src, r#"{"name":"x"}"#));
+        // Required + optional with correct type.
+        assert!(accepts(&src, r#"{"name":"x","verbose":true}"#));
+        assert!(accepts(&src, r#"{"name":"x","verbose":false}"#));
+        // Required + optional with WRONG type — the bug class
+        // we're closing.
+        assert!(!accepts(&src, r#"{"name":"x","verbose":1}"#));
+        assert!(!accepts(&src, r#"{"name":"x","verbose":"yes"}"#));
+        // Missing required still rejected.
+        assert!(!accepts(&src, r#"{"verbose":true}"#));
+        assert!(!accepts(&src, "{}"));
+    }
+
+    /// All-optional schema: every 2^N inclusion combination must be
+    /// reachable, including the empty object. Wrong types rejected
+    /// when present.
+    #[test]
+    fn all_optional_object_permits_every_subset() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "boolean"}
+            }
+        });
+        let mut rules = String::new();
+        schema_to_gbnf(&schema, "obj", &mut rules);
+        let src = wrap_with_root("obj", rules);
+        // All four combinations of include/skip — empty, a, b, both.
+        assert!(accepts(&src, "{}"));
+        assert!(accepts(&src, r#"{"a":1}"#));
+        assert!(accepts(&src, r#"{"b":true}"#));
+        assert!(accepts(&src, r#"{"a":1,"b":true}"#));
+        // Wrong type rejected.
+        assert!(!accepts(&src, r#"{"a":"oops"}"#));
+        assert!(!accepts(&src, r#"{"b":1}"#));
+        // Order not relevant when both required-first/optional-after
+        // collapse to all-optional — but reverse order isn't supported
+        // (chains follow declaration / alphabetical iteration). Don't
+        // assert on `{"b":true,"a":1}` — that's a known limitation
+        // documented in the module header.
+    }
+
+    /// `default:`-bearing optional behaves the same as any other
+    /// optional. The grammar lets the model pick either alternative
+    /// (or omit) — it doesn't pre-judge which value the model
+    /// "should" emit when it includes the field. This preserves
+    /// neutral behavior for both omit-defaulting and explicit-
+    /// defaulting model training styles.
+    #[test]
+    fn optional_with_default_keeps_full_value_alternation() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "verbose": {"type": "boolean", "default": false}
+            },
+            "required": ["action"]
+        });
+        let mut rules = String::new();
+        schema_to_gbnf(&schema, "obj", &mut rules);
+        let src = wrap_with_root("obj", rules);
+        // Both true and false accepted when included.
+        assert!(accepts(&src, r#"{"action":"go","verbose":true}"#));
+        assert!(accepts(&src, r#"{"action":"go","verbose":false}"#));
+        // Omission still allowed.
+        assert!(accepts(&src, r#"{"action":"go"}"#));
     }
 
     /// Surfaced by the differential fuzzer (2026-05-12). The original
