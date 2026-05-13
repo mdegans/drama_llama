@@ -1,5 +1,10 @@
 # Qwen cmdbuf consolidation plan (next session)
 
+> **Status (2026-05-13)**: Phase 0 + Phase 2 landed in moeflux
+> `d5d7676`. Measured +22% prefill rate on a3b (126.6 → 103.8s,
+> ~4σ confidence). Phases 3, 4, 5 below are still forward-looking.
+> Outcome memo: [`qwen_cmdbuf_consolidation_landed.md`](qwen_cmdbuf_consolidation_landed.md).
+
 Plan-of-record for the next moeflux optimization session, drafted at
 the close of the prefetch-set-based-matching session
 (2026-05-01). Pulls from the cogito-v2 session 2 architectural
