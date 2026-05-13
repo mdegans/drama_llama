@@ -7,4 +7,4 @@ model.sampling.toml
 /bench.py
 /prefill_prompt.txt
 /__pycache__/
-/fuzz-corpus/
+/fuzz-corpus//prefill_prompt_long.txt
