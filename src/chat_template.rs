@@ -45,7 +45,10 @@
 
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
-use minijinja::{value::Value as JinjaValue, Environment, Error as JinjaError};
+use minijinja::{
+    value::Value as JinjaValue, Environment, Error as JinjaError,
+    UndefinedBehavior,
+};
 use serde::Serialize;
 
 use crate::{
@@ -90,6 +93,23 @@ pub struct ChatTemplate {
     /// Shared `Environment` so clones are cheap. Environments are
     /// thread-safe but clone-by-Arc so we don't reparse on each clone.
     env: Arc<Environment<'static>>,
+    /// Sibling of [`Self::env`] with `raise_exception` rebound to a
+    /// no-op (returns the empty string) so partial renders for
+    /// cache-breakpoint hashing don't fail on templates that gate the
+    /// full render on invariants the truncated prompt doesn't satisfy.
+    ///
+    /// The canonical case is Qwen3's `No user query found in messages.`
+    /// raise, which fires whenever the messages list contains no
+    /// non-tool-response user-role message — exactly the state
+    /// [`render_partial`] produces for [`Breakpoint::AfterTools`] and
+    /// [`Breakpoint::AfterSystem`] (both truncate `messages` to empty).
+    /// Without permissive rendering those partials get dropped silently
+    /// from `partial_texts`, taking the front-of-prompt cache anchor
+    /// with them.
+    ///
+    /// Used exclusively by [`render_partial`]. Full renders go through
+    /// [`Self::env`] and continue to surface raises as errors.
+    env_permissive: Arc<Environment<'static>>,
     /// Name under which `env` registered the template. Always "chat".
     template_name: &'static str,
     /// BOS piece (e.g. `<|begin_of_text|>` for Llama 3.1). Passed to the
@@ -137,10 +157,30 @@ impl ChatTemplate {
         );
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
-        env.add_template_owned("chat", source)
+        env.add_template_owned("chat", source.clone())
             .map_err(ChatTemplateError::from_jinja)?;
+
+        let mut env_permissive = Environment::new();
+        env_permissive.set_unknown_method_callback(
+            minijinja_contrib::pycompat::unknown_method_callback,
+        );
+        // Chainable: `messages[0].role` on `messages = []` returns
+        // undefined instead of erroring. Required because suppressing
+        // `raise_exception` alone leaves Qwen3's tools branch to access
+        // `messages[0]` unconditionally after the suppressed raise — the
+        // template assumes the raise halts rendering, which the strict
+        // env honors but the permissive env can't without dropping
+        // breakpoint coverage we explicitly want to keep.
+        env_permissive.set_undefined_behavior(UndefinedBehavior::Chainable);
+        env_permissive.add_function("raise_exception", raise_exception_noop);
+        env_permissive.add_function("strftime_now", strftime_now);
+        env_permissive
+            .add_template_owned("chat", source)
+            .map_err(ChatTemplateError::from_jinja)?;
+
         Ok(Self {
             env: Arc::new(env),
+            env_permissive: Arc::new(env_permissive),
             template_name: "chat",
             bos_token,
             eos_token,
@@ -185,6 +225,18 @@ impl ChatTemplate {
     /// `date_string`, `tools_in_user_message`, or `builtin_tools`.
     pub fn render_with(
         &self,
+        prompt: &Prompt,
+        opts: &RenderOptions,
+    ) -> Result<String, ChatTemplateError> {
+        self.render_with_env(&self.env, prompt, opts)
+    }
+
+    /// Shared render path. `env` selects strict vs. permissive raise
+    /// handling — full renders pass [`Self::env`]; partial renders for
+    /// cache-breakpoint hashing pass [`Self::env_permissive`].
+    fn render_with_env(
+        &self,
+        env: &Environment<'static>,
         prompt: &Prompt,
         opts: &RenderOptions,
     ) -> Result<String, ChatTemplateError> {
@@ -245,8 +297,7 @@ impl ChatTemplate {
                 ..JinjaValue::from_serialize(&extras)
             )
         };
-        let tmpl = self
-            .env
+        let tmpl = env
             .get_template(self.template_name)
             .map_err(ChatTemplateError::from_jinja)?;
         tmpl.render(ctx).map_err(ChatTemplateError::from_jinja)
@@ -287,12 +338,23 @@ impl ChatTemplate {
         for bp in breakpoints {
             match render_partial(self, prompt, opts, bp) {
                 Ok(s) => partial_texts.push(s),
-                Err(_) => {
+                Err(_e) => {
                     // Drop this breakpoint — same fail-open posture
                     // tokenize_with_breakpoints uses for non-prefix-
                     // safe partials. A breakpoint we can't render
                     // can't be tokenized either, so the
-                    // partial_texts slot is unrecoverable.
+                    // partial_texts slot is unrecoverable. Warn at
+                    // default level — losing a breakpoint silently
+                    // is a cache-correctness signal, not a debug
+                    // nicety.
+                    #[cfg(feature = "axum")]
+                    tracing::warn!(
+                        target: "drama_llama::chat_template",
+                        breakpoint = ?bp,
+                        error = %_e,
+                        "partial render failed; breakpoint dropped from \
+                         partial_texts (cache reuse lost at this position)",
+                    );
                 }
             }
         }
@@ -494,7 +556,16 @@ fn render_partial(
     let truncated = match up_to {
         Breakpoint::AfterTools => Prompt {
             functions: prompt.functions.clone(),
-            system: None,
+            // Carry the system content too. Every modern template
+            // (Qwen3, Llama 3.1, Hermes, Cogito) coalesces tools into
+            // the system block, so a "tools-only, no system" truncation
+            // has no byte-level analogue in the full render — and
+            // worse, it leaves Qwen3's permissive-env render walking
+            // `messages[::-1]` over an empty list, which minijinja
+            // panics on. Including the system content keeps the
+            // truncation a real prefix of the full render on those
+            // templates and dodges the panic.
+            system: prompt.system.clone(),
             messages: Vec::new(),
             ..Prompt::default()
         },
@@ -512,7 +583,11 @@ fn render_partial(
         },
     };
     let partial_opts = opts.clone().with_generation_prompt(false);
-    template.render_with(&truncated, &partial_opts)
+    template.render_with_env(
+        &template.env_permissive,
+        &truncated,
+        &partial_opts,
+    )
 }
 
 /// Tokenize the full render and each partial in `rendered`, returning
@@ -746,6 +821,30 @@ fn raise_exception(msg: Cow<'_, str>) -> Result<JinjaValue, JinjaError> {
     ))
 }
 
+/// Permissive counterpart to [`raise_exception`] for partial renders.
+///
+/// Drops the raise on the floor (returns an empty string) so a template
+/// that gates the full render on invariants violated by a truncated
+/// prompt still produces a usable byte sequence for cache-breakpoint
+/// hashing. Wired into [`ChatTemplate::env_permissive`] in place of
+/// [`raise_exception`]; full renders continue to surface raises as
+/// errors via [`ChatTemplate::env`].
+///
+/// Suppressed messages are logged at `debug` so they remain auditable
+/// when chasing template-specific cache regressions (the partial-render
+/// warn at the [`ChatTemplate::render_with_breakpoints`] call site
+/// fires on render errors, not on suppressed raises — those are by
+/// construction invisible there).
+fn raise_exception_noop(_msg: Cow<'_, str>) -> String {
+    #[cfg(feature = "axum")]
+    tracing::debug!(
+        target: "drama_llama::chat_template",
+        suppressed = %_msg,
+        "raise_exception suppressed in permissive env (partial render)",
+    );
+    String::new()
+}
+
 /// Minimal `strftime_now` that returns current UTC time formatted via the
 /// `time` crate's strftime-style format string. Enough for templates that
 /// stamp `"%d %b %Y"` or `"%Y-%m-%d"`.
@@ -874,6 +973,75 @@ mod tests {
 {{ m['content'] }}<|eot_id|>{% endfor %}{% if add_generation_prompt %}<|start_header_id|>assistant<|end_header_id|>
 
 {% endif %}"#;
+
+    /// Minimal Qwen3-shape template that reproduces the two raises which
+    /// motivate [`ChatTemplate::env_permissive`]:
+    ///
+    /// 1. `{% if not messages %}{{ raise_exception('No messages provided.') }}{% endif %}`
+    ///    — fires on [`Breakpoint::AfterTools`] where `messages` is empty.
+    /// 2. The `multi_step_tool` walk: scans `messages[::-1]` for a
+    ///    user-role message whose content isn't a `<tool_response>...`
+    ///    wrapper, raises `No user query found in messages.` if none
+    ///    found. Fires on [`Breakpoint::AfterSystem`] where the only
+    ///    message present is the synthesized system message.
+    ///
+    /// Trimmed from the real Qwen3.6-35B-A3B `tokenizer.chat_template`
+    /// to keep the test data readable; the two raise sites are
+    /// byte-for-byte the same Jinja as upstream so the permissive-env
+    /// behavior is exercised by the same code paths the production
+    /// template hits.
+    const QWEN3_LIKE: &str = r#"{%- if not messages -%}
+{{- raise_exception('No messages provided.') -}}
+{%- endif -%}
+{%- if tools and tools is iterable and tools is not mapping -%}
+<|im_start|>system
+# Tools
+{% for tool in tools %}{{ tool | tojson }}
+{% endfor -%}
+{%- if messages[0].role == 'system' -%}
+
+{{ messages[0].content }}
+{%- endif -%}
+<|im_end|>
+{%- else -%}
+{%- if messages[0].role == 'system' -%}
+<|im_start|>system
+{{ messages[0].content }}<|im_end|>
+{%- endif -%}
+{%- endif -%}
+{%- set ns = namespace(multi_step_tool=true) -%}
+{%- for message in messages[::-1] -%}
+{%- if ns.multi_step_tool and message.role == "user" -%}
+{%- set content = message.content | trim -%}
+{%- if not (content.startswith('<tool_response>') and content.endswith('</tool_response>')) -%}
+{%- set ns.multi_step_tool = false -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if ns.multi_step_tool -%}
+{{- raise_exception('No user query found in messages.') -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message.role == "user" -%}
+<|im_start|>user
+{{ message.content }}<|im_end|>
+{%- elif message.role == "assistant" -%}
+<|im_start|>assistant
+{{ message.content }}<|im_end|>
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+<|im_start|>assistant
+{%- endif -%}"#;
+
+    fn qwen3_like_tmpl() -> ChatTemplate {
+        ChatTemplate::from_source(
+            QWEN3_LIKE.to_owned(),
+            "".to_owned(),
+            "".to_owned(),
+        )
+        .expect("Qwen3-like template should compile")
+    }
 
     fn simple_prompt() -> Prompt {
         Prompt::default()
@@ -1491,6 +1659,145 @@ mod tests {
                 "partial {i} must not end with generation prompt: {p:?}"
             );
         }
+    }
+
+    /// Qwen3-family templates raise `No user query found in messages.`
+    /// whenever `messages` contains no non-tool-response user-role
+    /// entry — exactly the state [`render_partial`] produces for
+    /// [`Breakpoint::AfterSystem`] (truncates `messages` to empty).
+    /// Before the permissive-env split, this raise silently dropped the
+    /// AfterSystem partial from `partial_texts`, killing the front-of-
+    /// prompt cache anchor on every call. Permissive env rebinds
+    /// `raise_exception` to return an empty string so the partial
+    /// renders the system header bytes that the cache key needs.
+    #[test]
+    fn test_render_partial_after_system_qwen3_like_permissive_succeeds() {
+        let prompt = Prompt {
+            system: Some(Content::SinglePart(Cow::Borrowed("You are agent."))),
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::SinglePart(Cow::Borrowed("hi")),
+            }],
+            ..Prompt::default()
+        };
+        let opts = RenderOptions::default().with_generation_prompt(true);
+        let partial = render_partial(
+            &qwen3_like_tmpl(),
+            &prompt,
+            &opts,
+            Breakpoint::AfterSystem,
+        )
+        .expect(
+            "permissive env must let AfterSystem render even when the \
+             template raises on the empty-messages state",
+        );
+        assert!(
+            partial.contains("You are agent."),
+            "AfterSystem partial must carry the system bytes; got: {partial:?}"
+        );
+        assert!(
+            partial.contains("<|im_start|>system"),
+            "AfterSystem partial must contain the system header; got: \
+             {partial:?}"
+        );
+        // Forced add_generation_prompt=false on partials.
+        assert!(
+            !partial.contains("<|im_start|>assistant"),
+            "partial must not emit the generation prompt; got: {partial:?}"
+        );
+    }
+
+    /// Same idea for `Breakpoint::AfterTools`: `render_partial` truncates
+    /// both `system` and `messages` to empty, hitting both Qwen3 raises
+    /// (`No messages provided.` and `No user query found in messages.`).
+    /// Permissive env must drop both, leaving the tools-embedded system
+    /// header as the rendered bytes.
+    #[test]
+    fn test_render_partial_after_tools_qwen3_like_permissive_succeeds() {
+        let prompt = Prompt {
+            functions: Some(vec![tool_cached("ping")]),
+            system: Some(Content::SinglePart(Cow::Borrowed("sys"))),
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::SinglePart(Cow::Borrowed("q")),
+            }],
+            ..Prompt::default()
+        };
+        let opts = RenderOptions::default().with_generation_prompt(true);
+        let partial = render_partial(
+            &qwen3_like_tmpl(),
+            &prompt,
+            &opts,
+            Breakpoint::AfterTools,
+        )
+        .expect(
+            "permissive env must let AfterTools render even when the \
+             template raises on the empty-messages state",
+        );
+        assert!(
+            partial.contains("# Tools"),
+            "AfterTools partial must contain the tools section; got: \
+             {partial:?}"
+        );
+        assert!(
+            partial.contains("\"name\":\"ping\""),
+            "AfterTools partial must carry the tool definition; got: \
+             {partial:?}"
+        );
+    }
+
+    /// End-to-end through `render_with_breakpoints`: a Qwen3-shape
+    /// prompt with `cache_control` on the system content must surface a
+    /// non-empty `partial_texts` entry. The pre-permissive behavior
+    /// silently dropped this and returned `partial_texts.is_empty()`.
+    #[test]
+    fn test_render_with_breakpoints_after_system_survives_on_qwen3_like() {
+        let system = Content::MultiPart(vec![Block::Text {
+            text: Cow::Borrowed("You are agent."),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]);
+        let prompt = Prompt {
+            system: Some(system),
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::SinglePart(Cow::Borrowed("hi")),
+            }],
+            ..Prompt::default()
+        };
+        let out = qwen3_like_tmpl()
+            .render_with_breakpoints(
+                &prompt,
+                &RenderOptions::default().with_generation_prompt(true),
+            )
+            .expect("full render must succeed on a well-formed Qwen3 prompt");
+        assert_eq!(
+            out.partial_texts.len(),
+            1,
+            "AfterSystem breakpoint must survive partial rendering"
+        );
+        assert!(out.partial_texts[0].contains("You are agent."));
+    }
+
+    /// Strict env (full render) must continue to surface raises as
+    /// errors after the permissive split — the permissive behavior is
+    /// scoped to partial renders only.
+    #[test]
+    fn test_full_render_strict_env_still_raises_on_qwen3_like() {
+        // Bare system, no user message at all. The full render walks
+        // multi_step_tool, finds no user message, raises. Strict env
+        // must propagate that as an error.
+        let prompt = Prompt {
+            system: Some(Content::SinglePart(Cow::Borrowed("sys"))),
+            ..Prompt::default()
+        };
+        let err = qwen3_like_tmpl()
+            .render(&prompt, true)
+            .expect_err("full render must surface the raise");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No user query") || msg.contains("No messages"),
+            "error must carry the raised message; got: {msg}"
+        );
     }
 
     /// LlamaCppModel-backed round-trip: render a prompt with a mid-
