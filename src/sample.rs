@@ -38,7 +38,18 @@ where
     // Better than taking down the serializer.
     match arc.lock() {
         Ok(guard) => guard.serialize(serializer),
-        Err(_) => JsonState::new().serialize(serializer),
+        Err(_poison) => {
+            // Poison means a holder panicked mid-mutation. Rare and
+            // diagnostic-worthy — log at warn so it doesn't disappear
+            // into a fresh-state snapshot silently.
+            #[cfg(feature = "axum")]
+            tracing::warn!(
+                target: "drama_llama::sample",
+                "JsonState mutex poisoned during serialization; \
+                 serializing a fresh state in its place",
+            );
+            JsonState::new().serialize(serializer)
+        }
     }
 }
 

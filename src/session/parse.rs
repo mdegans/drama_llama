@@ -240,11 +240,19 @@ impl BlockParser {
                 self.next_id += 1;
                 out.push(Block::ToolUse { call });
             }
-            Err(_) => {
+            Err(_e) => {
                 // Malformed JSON inside a well-framed tool_call — fall
                 // back to Text with the full tagged literal so nothing
                 // is silently dropped. Session-level logic decides
                 // whether to treat this as GrammarViolation.
+                #[cfg(feature = "axum")]
+                tracing::debug!(
+                    target: "drama_llama::session::parse",
+                    error = %_e,
+                    body_len = body.len(),
+                    "tool_call body failed JSON parse; falling back to Text \
+                     (session may treat as GrammarViolation)",
+                );
                 out.push(format!("{TOOL_OPEN}{body}{TOOL_CLOSE}").into());
             }
         }

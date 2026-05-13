@@ -1228,7 +1228,22 @@ impl<B: Backend> Session<B> {
                     })
                     .collect();
                 for old_bp in orphans {
-                    let _ = self.engine.forget_pos(0, old_bp as i32);
+                    if let Err(_e) = self.engine.forget_pos(0, old_bp as i32)
+                    {
+                        // Best-effort orphan reclamation — failure here
+                        // means the backend didn't have a snapshot at
+                        // `old_bp` (already evicted by LRU, never
+                        // checkpointed, etc.). Not a correctness bug;
+                        // logged at debug so spikes show up in tracing.
+                        #[cfg(feature = "axum")]
+                        tracing::debug!(
+                            target: "drama_llama::session",
+                            pos = old_bp,
+                            error = %_e,
+                            "forget_pos failed on orphaned breakpoint \
+                             snapshot; ignoring",
+                        );
+                    }
                 }
             }
         }
@@ -1354,7 +1369,15 @@ impl<B: Backend> Session<B> {
                     .map(|c| c.prev_breakpoints.contains(&old))
                     .unwrap_or(false)
             {
-                let _ = self.engine.forget_pos(0, old as i32);
+                if let Err(_e) = self.engine.forget_pos(0, old as i32) {
+                    #[cfg(feature = "axum")]
+                    tracing::debug!(
+                        target: "drama_llama::session",
+                        pos = old,
+                        error = %_e,
+                        "forget_pos failed on displaced auto-tip; ignoring",
+                    );
+                }
             }
         } else if let Some(old) = old_tip {
             // New tip is None (e.g., streaming path that skips the
@@ -1365,7 +1388,15 @@ impl<B: Backend> Session<B> {
                 .map(|c| c.prev_breakpoints.contains(&old))
                 .unwrap_or(false)
             {
-                let _ = self.engine.forget_pos(0, old as i32);
+                if let Err(_e) = self.engine.forget_pos(0, old as i32) {
+                    #[cfg(feature = "axum")]
+                    tracing::debug!(
+                        target: "drama_llama::session",
+                        pos = old,
+                        error = %_e,
+                        "forget_pos failed on stale auto-tip; ignoring",
+                    );
+                }
             }
         }
     }
