@@ -11,25 +11,40 @@ to llama.cpp's ~1.02 s on the 992-prefill workload.
 Session 6's precursor batching took the 26× gap to 16× directional;
 this session aims for **≤3×** (target band 200-500 tok/s on 992).
 
-## State entering session 7
+## State entering session 7 (updated after S7-1a)
 
-After session 6, both `batched_full_attn_layer_forward` and
-`batched_linear_attn_layer_forward` are fully batched at the
-kernel level — no per-token loops. But each phase still does its
-own `commit_and_wait_labeled` internally:
+After session 6's S7-1a fusion, the intra-layer commit count is
+already reduced:
 
-```
-batched_X_layer_forward(metal, ...):
-  Phase 1a (input rms_norm)              commit_and_wait
-  Phase 1b (Q/K/V projections)           commit_and_wait
-  Phase 1c (SDPA or linear-attn)         commit_and_wait (× tiles)
-  Phase 1d (o_proj)                      commit_and_wait
-  Phase 3c (post-attn + routing GPU)     commit_and_wait
-  Phase 3d (shared FFN)                  commit_and_wait
-  Phase 3e (MoE permute-fuse + combine)  commit_and_wait
-```
+**`batched_full_attn_layer_forward`**: 4 commits/layer.
+1. Fused 1a+1b (input rms_norm + Q/K/V proj).
+2. Phase 2 SDPA.
+3. Fused 3b+3c (O proj + post-attn + router).
+4. Fused 3d+3e (shared FFN + MoE permute-fuse).
 
-Per layer: ~5–7 commits. Per chunk: ~280.
+The 3 boundaries between these are forced by CPU host-bounces:
+q/k norm + RoPE + KV append, sigmoid_gate, bucket build.
+
+**`batched_linear_attn_layer_forward`**: 2 commits/layer.
+1. Fused 1a+1b+1c+1d+1e (entire pre-MoE chain — all GPU-deps).
+2. Fused 1f+1g (shared FFN + MoE permute-fuse).
+
+Total commits per chunk on Qwen3.6-A3B: 10 full-attn layers × 4 +
+30 linear-attn layers × 2 = 100 commits. Down from session-5's
+~640k, and from S6-pre-S7-1a's ~280.
+
+Remaining wins from S7 phases:
+- **Cross-layer hidden_in/hidden_out hoist**: today's chunk
+  orchestrator passes hidden via host vectors between layers.
+  Hoisting to GPU buffers would let two consecutive layers
+  share the same cmdbuf, halving the remaining commits.
+- **GPU q/k norm + RoPE + KV append**: the full-attn host bounce
+  in Phase 1b→2. New Metal kernels + KV cache append kernel.
+  Would let full_attn match linear_attn's 2 commits/layer.
+- **GPU sigmoid_gate**: trivial element-wise kernel; eliminates
+  the Phase 2→1d host bounce.
+- **GPU bucket build (B1 from parent plan)**: eliminates the
+  3c→3d host bounce. Most ambitious.
 
 llama.cpp does ~1–2 commits per chunk via dispatch_apply across
 `n_cb` worker threads.
@@ -83,7 +98,30 @@ Cmdbuf B (per chunk):
 **Total commits per chunk: 2** (down from ~280). This is the
 session-7 target shape.
 
-## Phases
+## Phases (S7-1a landed in session 6)
+
+### S7-1a: intra-layer fusion (DONE)
+Shipped in `6628eaf` end of session 6 — both layer-forwards
+collapsed to their minimal commit counts given the existing CPU
+host-bounces (full_attn 4/layer; linear_attn 2/layer).
+
+### S7-1b (NEW): GPU q/k norm + RoPE + KV append
+Move the per-token Phase 1b→2 CPU work to GPU. Existing kernels:
+`rms_norm_qk` (already used by linear-attn), `apply_rotary_emb`
+needs a Metal version. KV cache append also needs a kernel.
+
+Diff target: per-token CPU outputs (`q_host`, `k_host` post-norm
++ RoPE, KV cache rows). Cosine 0.9999 vs CPU oracle.
+
+After S7-1b: full_attn can fuse Phase 1b + Phase 2, eliminating
+one more commit/layer. Estimated +20-30% on full_attn-heavy
+workloads (which is rare — only 10/40 layers are full_attn).
+
+### S7-1c (NEW): GPU sigmoid_gate
+Element-wise: `out[t,i] = (1 / (1 + exp(-q_gate[t,i]))) * attn[t,i]`.
+Trivial kernel. Eliminates the Phase 2→3b host bounce in full_attn.
+
+After S7-1c: full_attn becomes 2 commits/layer like linear_attn.
 
 ### S7-1: Convert per-phase encoders to no-commit encoders
 

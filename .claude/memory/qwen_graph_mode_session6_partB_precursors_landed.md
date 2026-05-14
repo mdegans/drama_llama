@@ -1,10 +1,12 @@
-# Session 6 Part B — precursor batching landed (B-0a/b/c/d + B-4 implicit)
+# Session 6 Part B — precursor batching + S7-1a intra-layer fusion landed
 
 **Date:** 2026-05-14 (same session as Part A)
 **Commits (moeflux/main):**
 - `ae55527` — Part A (GPU MoE router)
 - `2255505` — B-0a/b/d: batched rms_norm + residual_add kernels + input rms_norm refactor
 - `fbe7d7e` — B-0c: batched post-attn residual_norm_route in both batched paths
+- `6628eaf` — S7-1a: intra-layer commit fusion (full_attn 7→4 commits/layer, linear_attn 7→2 commits/layer)
+- `6976c5e` — S7-2: GPU combine + cross-layer GPU hidden double-buffer (architectural; no perf delta on saturated GPU but eliminates inter-layer host bounce)
 
 **Entry:** [`qwen_graph_mode_session6_partB_plan.md`](qwen_graph_mode_session6_partB_plan.md)
 **Sibling:** [`qwen_graph_mode_session6_partA_landed.md`](qwen_graph_mode_session6_partA_landed.md)
@@ -100,21 +102,34 @@ Synthetic kernel tests:
 
 ## Directional bench (warm machine, no reboot)
 
-`prefill_prompt.txt` 992 tokens, n=1, uptime 23:55 (well-warm):
+n=1, uptime 23:55–23:58 (well-warm), three measurement points:
 
-| Metric | Pre-session | This session | Speedup |
-|---|---:|---:|---:|
-| Prefill tok/s | 36.8 | **60.76** | **1.65×** |
+| Workload | Pre-session | After B-0c | After S7-1a | After S7-2 | Cum speedup | llama.cpp | Gap |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 992 prefill | 36.8 | 60.76 | 75.01 | **74.66** | **2.03×** | 970 | **13×** |
+| 16k prefill | 27.1 | 42.59 | 42.66 | (not re-run) | **1.57×** | 857 | **20×** |
 
-Not apples-to-apples vs the proper reboot-disciplined baseline
-(`feedback_bench_discipline.md`), but the delta is well outside
-the ±5 tok/s variance band — the move is real. Long-prompt bench
-result captured in the [session memo footer](#long-prompt-result).
+S7-2 (GPU combine + cross-layer GPU hidden buffers) was perf-
+neutral within noise — Mike's GPU-saturation observation during
+the 16k bench post-S7-1a explains why. With GPU saturated,
+removing host bounces is architectural cleanup, not a wall-clock
+lever. The remaining gap is GPU-throughput-bound (kernel
+efficiency), not commit-overhead-bound.
 
-llama.cpp baseline on 992: 970 tok/s. Gap closed from **26×** to
-**16×**. The remaining gap is the orchestrator-level commit
-churn (~5–7 commits/layer × 40 layers ≈ 280 commits/chunk
-still) — Phase B-3 / B-5 territory.
+Three measurement points show the wins compounded:
+- B-0a/b/c/d batched the kernels (1.65× on 992).
+- S7-1a fused intra-layer commits down from 7/layer to 4 (full-attn,
+  10 layers) and 7/layer to 2 (linear-attn, 30 layers).
+  Marginal additional win on 992 (1.24×), but expected to scale
+  better at larger N where commit churn is a larger relative cost.
+
+Gap to llama.cpp narrowed from 26× → 13× on 992. Remaining commit
+churn is now ~100 commits/chunk (full_attn 4/layer × 10 + linear_attn
+2/layer × 30) down from ~280 pre-S7-1a and ~640k pre-S6. The
+remaining gap is mostly orchestrator-level (cross-layer
+hidden_in/out host bounces between layers) and full-attn's three
+forced CPU host-bounces (q/k norm + RoPE + KV append, sigmoid_gate,
+bucket build). Session-7 plan still applies.
 
 ## What's left for Phase B
 
@@ -201,6 +216,17 @@ The 1.65× directional win on the small workload is a strong signal
 that the graph-mode work will land the rest of the gap. Next
 session is the orchestrator refactor.
 
-## Long-prompt result
+## Long-prompt result detail
 
-(to be filled in once bench finishes)
+`prefill_prompt_long.txt` 73,472 chars → 15,692 input tokens, n=1,
+seed=42, warm machine (uptime 23:56), single iter:
+
+```
+prefill_tok/s ≈ 42.59  elapsed = 368.46 s  in = 15692  out = 1
+```
+
+vs pre-session baseline of 27.1 tok/s on the same workload —
+**1.57× directional**. Same machine state class as the 992 bench
+(uptime 23:55–56, no reboot between). Both runs single-iter
+because the n=3 run-to-run variance band on this machine is ~±5
+tok/s and the observed delta is well outside that.
