@@ -1,10 +1,13 @@
-# Session 7+ plan — `Graph<'a>` and the rest of the way
+# Session 7 plan — the general-shape graph compiler, ship it
 
 **Entry:** [`qwen_graph_mode_session6_partB_precursors_landed.md`](qwen_graph_mode_session6_partB_precursors_landed.md)
 **Parent plan:** [`qwen_graph_mode_session6_plan.md`](qwen_graph_mode_session6_plan.md)
 **GPU-saturation diagnostic:** [`qwen_prefill_gpu_saturation_signal.md`](qwen_prefill_gpu_saturation_signal.md)
+**Insulation rationale:** [`project_llama_cpp_insulation`](../../../../.claude/projects/-Users-mdegans-Projects-drama-llama/memory/project_llama_cpp_insulation.md)
 
-**Direction (Mike, 2026-05-14, after S7-2 landed):**
+## Direction
+
+**Mike, 2026-05-14, after S7-2 landed:**
 
 > I'd like to begin next session with `Graph<'a>` and take us the
 > rest of the way, no matter what it takes. […] I'd like to take
@@ -14,12 +17,7 @@
 > it's not just removing the commits, although I'm not convinced
 > that won't help at least a little.
 
-**Mandate:** the load-bearing goal is *backend portability*, not
-prefill tok/s. The commit reduction is a corollary of getting the
-shape right. Multi-session OK. One step at a time.
-
-**Scope discipline (Mike, 2026-05-14, immediately after the
-above):**
+**Then, immediately after, on scope:**
 
 > I'm not arguing we re-implement GGML and all the kernels for
 > all the backends — just what we need for the models we need on
@@ -27,391 +25,509 @@ above):**
 > as fast as llama.cpp is, it's not super stable and the public
 > api changes a lot.
 
-Two consequences:
+**Then, after I drafted a multi-session closure-Vec plan:**
 
-1. **No general-purpose graph compiler.** Don't generalise the
-   op set beyond what the actual models call. Today: Qwen3-A3B
-   (GQA + linear-attn) and Cogito-V2 (MLA). The op vocabulary is
-   *bounded by these*: rms_norm (per-token + per-head + gated),
-   matvec (4-bit / 8-bit / bf16, single + n_tokens), residual_add,
-   swiglu, sdpa (causal-tiled + per-token), conv1d_step, the
-   linear-attn recurrent kernels, moe_router, moe permute-fuse,
-   moe combine. Maybe ~20 op kinds total. The eventual enum-Op
-   variant set is small.
+> Actually, I'd argue we build the general shape of the graph
+> compiler. We've done harder in a session.
 
-2. **llama.cpp's API churn is a real motivator, not just future
-   backend portability.** Insulating our forward pass from
-   llama.cpp behind the Graph layer reduces our exposure to their
-   upstream changes. We already maintain `llama-cpp-sys` against
-   their moving target; the Graph layer means our high-level
-   model code doesn't have to track GGML changes the same way.
-   This is a present-tense maintenance win, not just future-
-   tense portability.
+**Locked direction:** session 7 ships the general-shape graph
+compiler — typed-op enum, buffer pool, backend trait, inspection
+— not the closure-Vec stepping stone. Single session. Done right.
+The op vocabulary stays model-driven (~20 variants); the
+*infrastructure* is fully general.
 
-## Why `Graph<'a>` is the right scaffolding
+## Why typed-op over closure-Vec, decided up front
 
-Three properties we want:
+Closures hide their shape from the type system — you can't ask a
+closure "what op are you, what buffers do you read/write?"
+without re-encoding that information separately. Building closures
+first then refactoring to typed Ops eats the design twice. Going
+straight to typed Ops means:
 
-1. **Backend portability.** Today every encoder is hard-coded to
-   `metal::CommandBufferRef`. To swap to CoreML's MPSGraph or a
-   future CUDA backend, we need a *layer of indirection* between
-   "what the model does" (RMS norm, matvec, SDPA, …) and "how the
-   backend encodes it." Closures aren't the final answer for that
-   (they can't be introspected for lowering), but they're the
-   right stepping stone — once we have actual API contact with a
-   second backend, we refactor closures → typed-enum `Op`
-   variants. The eventual enum gets `encode_metal`, `encode_coreml`,
-   `encode_cuda` impls.
+1. **Inspection works day one.** `Graph::dump()` prints a real
+   IR. Debugging diff-vs-llama.cpp becomes pattern-match.
+2. **Backend trait is real.** A second backend means writing
+   `Op::encode_coreml(&self, …)` for each variant — no refactor
+   of producer code.
+3. **Buffer lifetime / aliasing analysis becomes possible** later
+   without restructuring producers. Not landing in this session,
+   but the shape supports it.
+4. **One fewer migration.** Mike has been clear: do it right
+   once.
 
-2. **Parallel encoding.** llama.cpp uses `dispatch_apply(n_cb,
-   queue, encode_async)` — splits the graph across worker threads,
-   each encoding a slice of the dispatch list into its own cmdbuf
-   in parallel. Apple Silicon sweet spot is `n_cb=1..2`, but this
-   is the last 30% of the gap to llama.cpp. The closure-Vec is the
-   natural partitioning seam — split `nodes[..]` into `n_cb`
-   slices, encode each on a rayon thread.
+The trade-off is more upfront design surface in this session.
+That's fine — session 6 shipped 5 commits + bench + 4 memos in
+one sitting. Capacity is there.
 
-3. **Commit reduction.** Currently ~100 commits/chunk
-   (full_attn 4/layer × 10 + linear_attn 2/layer × 30). With the
-   inter-layer host bounce eliminated (S7-2 already landed), the
-   *only* remaining commit barriers inside one chunk are CPU
-   host-bounces:
-   - Phase 1b → Phase 2 in full_attn (q/k norm + RoPE + KV append).
-   - Phase 2 → Phase 1d in full_attn (sigmoid_gate).
-   - Phase 3c → Phase 3d in both paths (routing readback + bucket
-     build).
+## Architectural sketch
 
-   Move those to GPU (or accept them as split points that produce
-   2 cmdbufs/chunk total) and we land at llama.cpp's commit shape.
-
-   Mike's caveat — *"I'm not convinced that won't help at least a
-   little"* — is right to flag. Even though GPU is saturated
-   *within* each cmdbuf, removing per-layer commits would let layer
-   N+1's pre-MoE encode start before layer N's MoE commits,
-   tightening cross-layer GPU pipelining. The win is probably
-   modest but real.
-
-## The `Graph<'a>` API design
+### Core types (new module: `crates/moeflux/src/riir/graph.rs`)
 
 ```rust
-/// A pending compute graph. Each node captures its arguments by
-/// reference (via the `'a` lifetime) and writes Metal encoders into
-/// the cmdbuf when `encode_into` runs.
-///
-/// Today: closure-based. Tomorrow (after CoreML/CUDA contact):
-/// closures → typed-enum `Op` variants. The label parameter
-/// survives both shapes.
-pub struct Graph<'a> {
-    nodes: Vec<Node<'a>>,
+/// Identifier into the per-Graph buffer pool. Backend-agnostic;
+/// the pool maps it to a concrete buffer at encode time.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct BufId(pub u32);
+
+/// Identifier into the per-Graph constants pool (small u32/f32
+/// scalars referenced by ops — dim, eps, bits, etc.).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ConstId(pub u32);
+
+/// Reference to a weight tensor by (offset, dtype-tag) tuple. The
+/// weight file is a single MtlWeightBuf shared across the chunk;
+/// only offsets change per op.
+#[derive(Copy, Clone, Debug)]
+pub struct WeightRef {
+    pub w_off: u64,
+    pub s_off: u64,
+    pub b_off: u64,
+    pub bits: u32,
 }
 
-struct Node<'a> {
-    label: &'static str,
-    encode: Box<dyn FnOnce(&CommandBufferRef) + Send + 'a>,
-}
-
-impl<'a> Graph<'a> {
-    pub fn new() -> Self { Self { nodes: vec![] } }
-    pub fn with_capacity(cap: usize) -> Self {
-        Self { nodes: Vec::with_capacity(cap) }
-    }
-
-    pub fn push<F>(&mut self, label: &'static str, encode: F)
-    where F: FnOnce(&CommandBufferRef) + Send + 'a {
-        self.nodes.push(Node { label, encode: Box::new(encode) });
-    }
-
-    /// Total dispatch count — useful for picking n_cb in the
-    /// parallel-encode variant.
-    pub fn len(&self) -> usize { self.nodes.len() }
-    pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
-
-    /// Encode every node into `cmdbuf` in order. Single-threaded.
-    pub fn encode_into(self, cmdbuf: &CommandBufferRef) {
-        for node in self.nodes {
-            (node.encode)(cmdbuf);
-        }
-    }
-
-    /// Encode into `n_cb` cmdbufs in parallel via rayon. Each
-    /// thread takes a contiguous slice of `nodes`. Cmdbufs are
-    /// enqueued in order on `queue` — Metal serialises execution
-    /// order to encode order on the same queue, so the data
-    /// dependency between slices is honoured without explicit
-    /// MTLEvent sync (caller verifies this assumption).
-    ///
-    /// Returns the last cmdbuf so the caller can `commit_and_wait`
-    /// or chain further work.
-    pub fn encode_partitioned<'b>(
-        self, queue: &'b CommandQueue, n_cb: usize,
-    ) -> &'b CommandBufferRef { … }
-
-    /// Debug helper: print all node labels in order. Useful for
-    /// diffing two builds of the same graph.
-    pub fn labels(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.nodes.iter().map(|n| n.label)
-    }
-}
-```
-
-**File:** new `crates/moeflux/src/riir/graph.rs`.
-
-**The label parameter is load-bearing for the future.** It's the
-identity that survives the eventual enum-Op refactor (`Op::Matvec
-{ label: "qkv_proj", … }`), and the inspection seam for graph
-dumping / debugging across backends.
-
-## Migration phases
-
-Each phase is a checkpoint. Canary 9/9 must pass at each before
-moving on. Mike: *"one step at a time."*
-
-### S7-α: Land `Graph<'a>`, no callers
-
-Just write `graph.rs`. No production callsite. Unit tests in the
-module showing:
-- `push` then `encode_into` orders correctly.
-- `encode_partitioned` with `n_cb=2` correctly splits across two
-  cmdbufs and enqueues in order.
-
-This is the foundation. Tiny commit. Verifies the abstraction
-compiles cleanly with the borrow checker (the `'a` lifetime + the
-`FnOnce + Send` bound is the load-bearing constraint — closures
-need to capture by reference, not move, so per-layer-cache
-references can outlive the Graph build).
-
-### S7-β: Convert each `encode_*_into` to be `Graph`-compatible
-
-The existing `encode_X_into(cmdbuf, ...)` helpers already take
-`&CommandBufferRef`. To convert: wrap each call as a closure
-pushed into a Graph instead of called directly. Mechanical refactor
-inside each batched layer-forward.
-
-```rust
-// Before:
-super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
-    cmdbuf, &rms_n_pipe, hidden_in_buf, wf_buf.buffer(),
-    layer_cache.input_layernorm_w, normed_buf.buffer(),
-    hidden_dim as u32, n_tokens as u32, RMS_NORM_EPS,
-);
-
-// After:
-let rms_n_pipe = rms_n_pipe.clone();  // closure capture
-let wf_buf_ref = wf_buf.buffer().clone();  // metal::Buffer is refcounted
-let normed_buf_ref = normed_buf.buffer().clone();
-graph.push("input_rms_norm", move |cmdbuf| {
-    super::gpu_norm::encode_rms_norm_bf16_fused_n_tokens(
-        cmdbuf, &rms_n_pipe, hidden_in_buf, wf_buf_ref,
-        layer_cache.input_layernorm_w, normed_buf_ref,
-        hidden_dim as u32, n_tokens as u32, RMS_NORM_EPS,
-    );
-});
-```
-
-Tricky bit: `metal::Buffer` is an `NSObject`-backed reference-
-counted handle — cloning it is cheap (Objective-C `retain`). But
-the pipeline state objects we get via `.clone()` on the cached
-PSO are also cheap. The `'a` lifetime on Graph means closures can
-borrow references to the layer-cache, wf_buf, etc. without owning
-them — what doesn't satisfy `+ 'a` is anything bound to a tighter
-scope.
-
-Encode happens via `Graph::encode_into(cmdbuf)` once everything is
-queued up — keeps the same commit boundaries as today initially,
-then S7-γ tightens them.
-
-Effort: 30+ encoders touched. Tedious but mechanical.
-
-**Verification gate:** canary 9/9 after this phase, identical
-commits/chunk count as pre-S7-β. Pure refactor.
-
-### S7-γ: Collapse cmdbuf boundaries
-
-With every dispatch flowing through a Graph, the orchestrator can
-sequence multiple Graphs into one cmdbuf:
-
-```rust
-// Today: each batched_X_layer_forward calls Graph::encode_into +
-// commit_and_wait internally per phase.
-
-// After γ:
-let mut chunk_graph_a = Graph::with_capacity(40 * 8);  // pre-MoE
-for layer in 0..40 {
-    encode_pre_moe_phases(&mut chunk_graph_a, layer, …);
-}
-let cmdbuf_a = queue.new_command_buffer();
-chunk_graph_a.encode_into(cmdbuf_a);
-cmdbuf_a.commit();
-cmdbuf_a.wait_until_completed();
-
-// CPU: read all 40 layers' routing, bucket-build per layer.
-
-let mut chunk_graph_b = Graph::with_capacity(40 * 6);  // MoE + final
-for layer in 0..40 {
-    encode_moe_phases(&mut chunk_graph_b, layer, buckets[layer], …);
-}
-encode_final_norm_and_lm_head(&mut chunk_graph_b, …);
-let cmdbuf_b = queue.new_command_buffer();
-chunk_graph_b.encode_into(cmdbuf_b);
-cmdbuf_b.commit();
-cmdbuf_b.wait_until_completed();
-```
-
-**Total commits per chunk: 2** (down from current ~100).
-
-**Two prerequisites for this phase:**
-
-1. **GPU q/k norm + RoPE + KV append** (full-attn only). Existing
-   kernels: `rms_norm_qk` already used by linear-attn. RoPE: needs
-   a Metal kernel (`encode_yarn_rope_apply` exists for MLA but
-   doesn't fit the GQA shape — verify). KV cache append: a new
-   kernel that copies `k_host`, `v_host` into the cache rows.
-   Roughly 3 small kernels.
-
-2. **GPU sigmoid_gate** (full-attn only). Trivial element-wise
-   kernel; eliminates the Phase 2→3b host bounce.
-
-Without (1)+(2), full-attn still has 3 inter-phase host bounces
-inside one layer; (γ) only fuses the pre-MoE chain for linear-attn
-fully. That's still a useful checkpoint (linear-attn is 30/40
-layers); ship it, then do (1)+(2) as follow-up phases.
-
-**Verification gate:** canary 9/9 + benchmark. This is where we
-might see the *modest perf bump* Mike anticipated, even on GPU-
-saturated workloads — cross-layer pipelining opens up.
-
-### S7-δ: GPU q/k norm + RoPE + KV append (full-attn)
-
-Three small kernels:
-
-- `rms_norm_per_head_n_tokens` — already have per-head shape for
-  linear-attn; needs an n_tokens variant.
-- `rope_apply_n_tokens` — yarn-aware (read pos from a per-token
-  buffer or constant).
-- `kv_cache_append_n_tokens` — copies (k, v) from contiguous per-
-  token buffers into the cache at `kv_start..kv_start+n`.
-
-After δ, full-attn's Phase 1b→Phase 2 boundary is GPU-only.
-
-### S7-ε: GPU sigmoid_gate (full-attn)
-
-```metal
-kernel void sigmoid_gate_n_tokens(
-    device float* attn_out  [[buffer(0)]],
-    device const float* q_gate [[buffer(1)]],
-    constant uint& total [[buffer(2)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= total) return;
-    attn_out[tid] = (1.0f / (1.0f + exp(-q_gate[tid]))) * attn_out[tid];
-}
-```
-
-Trivial. After ε, full-attn has just one inter-phase host bounce
-(routing readback) — same as linear-attn. Full-attn graph collapses
-into the pre-MoE chunk_graph.
-
-### S7-ζ: Parallel cmdbuf encoding
-
-`Graph::encode_partitioned(queue, n_cb=2)` over `chunk_graph_a`.
-Each rayon thread encodes a slice. Cmdbufs enqueued in order,
-single commit_and_wait at the end. Apple's empirical sweet spot
-on M-series is `n_cb=1..2`.
-
-Risk: cross-cmdbuf dependency. The first cmdbuf's writes need to
-be visible to the second cmdbuf's reads. Metal's documented
-behaviour is *enqueue order = execution order on the same queue*,
-so this should hold without explicit `MTLEvent` — but verify on a
-small fixture before trusting it on the full graph.
-
-**Verification gate:** canary 9/9 + bench. Apple's docs suggest
-~1.3-1.5× over single-threaded encode at this scale.
-
-### S7-η: B1 (GPU bucket build)
-
-Optional. The routing readback after pre-MoE forces the
-chunk_graph_a / chunk_graph_b split. If we move
-`build_expert_buckets` to GPU (a parallel-scan + scatter kernel),
-the split goes away — we get **1 commit per chunk**.
-
-But (a) the buckets are small (8192 × 8 × 8B = 524 KB), the
-readback is sub-millisecond, and (b) the bucket-build kernel is
-non-trivial. Defer until profile shows the readback is the new
-pole — same logic the parent plan applied.
-
-## Forward look: enum-Op for the second backend
-
-When we get API contact with CoreML or CUDA, the closure-Vec
-graph refactors to:
-
-```rust
+/// The op set. Bounded by the models we run (Qwen3-A3B GQA +
+/// linear-attn + Cogito-V2 MLA). ~20 variants. Each carries
+/// everything it needs to encode — no captured `&` references.
 pub enum Op {
-    RmsNorm { label: &'static str, input: BufId, weight: BufId, output: BufId, eps: f32 },
-    Matvec { label: &'static str, w: WeightId, input: BufId, output: BufId, n_tokens: u32, in_dim: u32, out_dim: u32, bits: u32 },
-    Sdpa { … },
-    MoePermuteFuse { … },
-    // …
+    /// Input or post-attn RMS norm, n_tokens batched, bf16 weight.
+    RmsNormBf16NTokens {
+        label: &'static str,
+        x: BufId,
+        weight_off: u64,   // offset into the shared MtlWeightBuf
+        out: BufId,
+        dim: u32,
+        n_tokens: u32,
+        eps: f32,
+    },
+
+    /// Per-head Q/K RMS norm (linear-attn + future full-attn GPU
+    /// q/k norm). Operates in-place on `x`.
+    RmsNormQk { label: &'static str, x: BufId, n_heads: u32, head_dim: u32 },
+
+    /// Residual add over [n_tokens, dim].
+    ResidualAddNTokens { label: &'static str, a: BufId, b: BufId, out: BufId, n_tokens: u32, dim: u32 },
+
+    /// Quantized matvec over n_tokens. 4-bit or 8-bit selected by
+    /// weight.bits.
+    MatvecNTokens {
+        label: &'static str,
+        weight: WeightRef,
+        input: BufId,
+        input_off: u64,
+        output: BufId,
+        output_off: u64,
+        in_dim: u32,
+        out_dim: u32,
+        n_tokens: u32,
+    },
+
+    /// SwiGLU element-wise: out = silu(gate) * up.
+    SwigluFusedBatched { label: &'static str, gate: BufId, up: BufId, out: BufId, total: u32 },
+
+    /// Batched tiled causal SDPA.
+    SdpaCausalTiled { label: &'static str, q: BufId, k: BufId, v: BufId, attn_out: BufId,
+                      running_max: BufId, running_denom: BufId, v_partial: BufId,
+                      n_tokens: u32, num_heads: u32, heads_per_kv: u32, head_dim: u32,
+                      kv_dim: u32, kv_start: u32, kv_len_total: u32, softmax_scale: f32 },
+
+    /// MoE softmax + selection-sort top-K (the GPU router).
+    MoeSoftmaxTopK { label: &'static str, logits: BufId, indices_out: BufId, weights_out: BufId, n_tokens: u32, n_experts: u32, k: u32 },
+    MoeNormalizeWeights { label: &'static str, weights: BufId, n_tokens: u32, k: u32 },
+
+    /// MoE permute-fuse — the bucket-driven path. Buckets are
+    /// pre-built on CPU and uploaded as part of the Op's fields.
+    MoeBatchedPermuteFuse {
+        label: &'static str,
+        expert_refs: Vec<(BufId, u64)>,  // per-bucket (blob, offset)
+        bucket_input: BufId, bucket_gate: BufId, bucket_up: BufId,
+        bucket_act: BufId, bucket_out: BufId,
+        bucket_token_idx: BufId, bucket_weights: BufId,
+        out_sum: BufId,
+        buckets: ExpertBuckets,  // existing struct
+    },
+
+    /// MoE combine + residual.
+    MoeCombineResidualNTokens {
+        label: &'static str,
+        h_mid: BufId, moe_sum: BufId, shared_out: BufId,
+        shared_gate: BufId, hidden_out: BufId,
+        n_tokens: u32, dim: u32,
+    },
+
+    /// Linear-attn recurrent kernels (looped over N tokens).
+    Conv1dStep      { … },
+    ComputeDecayBeta { … },
+    DeltaNetStep    { … },
+    GatedRmsNorm    { … },
+
+    /// MLA path (cogito-v2). Not all wired in session 7 — the
+    /// GQA path is the priority. Reserve the variant slots.
+    MlaQPrime4Bit { … },
+    MlaSdpaTileAccumulate { … },
+    MlaSdpaTileFinalize { … },
+
+    /// Final norm + lm_head for chunk-end logits.
+    LmHead { label: &'static str, hidden: BufId, last_token_row: u32, logits_out: BufId },
 }
 
+/// The buffer pool. Keyed by BufId, values are owned metal::Buffer
+/// (refcounted Objective-C handles — cheap to clone).
+pub struct BufferPool {
+    buffers: Vec<metal::Buffer>,
+}
+
+impl BufferPool {
+    pub fn new() -> Self { Self { buffers: vec![] } }
+    pub fn register(&mut self, buf: metal::Buffer) -> BufId {
+        let id = BufId(self.buffers.len() as u32);
+        self.buffers.push(buf);
+        id
+    }
+    pub fn get(&self, id: BufId) -> &metal::Buffer { &self.buffers[id.0 as usize] }
+}
+
+/// The graph itself. Ops are appended in dispatch order. Backend
+/// owns the cmdbuf and decides how to slice / commit / parallelise.
 pub struct Graph {
-    ops: Vec<Op>,
+    pub ops: Vec<Op>,
+    pub pool: BufferPool,
+}
+
+impl Graph {
+    pub fn new() -> Self { Self { ops: vec![], pool: BufferPool::new() } }
+    pub fn push(&mut self, op: Op) { self.ops.push(op); }
+    pub fn register_buf(&mut self, buf: metal::Buffer) -> BufId {
+        self.pool.register(buf)
+    }
+    pub fn labels(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.ops.iter().map(|op| op.label())
+    }
+    pub fn dump(&self) -> String { … }  // for debugging
 }
 
 impl Op {
-    fn encode_metal(&self, cmdbuf: &CommandBufferRef, ctx: &MetalCtx) { … }
-    fn encode_coreml(&self, graph: &MPSGraph, ctx: &CoreMLCtx) { … }
-    fn encode_cuda(&self, stream: &CudaStream, ctx: &CudaCtx) { … }
+    pub fn label(&self) -> &'static str { … }
+}
+
+/// Backend trait. Per-op encoding lives in the impl.
+pub trait Backend {
+    fn encode_op(&mut self, op: &Op, pool: &BufferPool, cmdbuf: &metal::CommandBufferRef);
+    fn encode_graph_into(&mut self, graph: &Graph, cmdbuf: &metal::CommandBufferRef) {
+        for op in &graph.ops {
+            self.encode_op(op, &graph.pool, cmdbuf);
+        }
+    }
+}
+
+pub struct MetalBackendCtx<'a> {
+    pub metal: &'a mut MetalBackend,
+    pub wf_buf: &'a MtlWeightBuf,
+    // Cached pipeline states fetched once per chunk.
+    pub matvec_pipes: MatvecPipelines,
+    pub rms_n_pipe: RmsNormBf16FusedNTokensPipeline,
+    pub router_pipes: MoeRouterPipelines,
+    pub residual_add_n_pso: ComputePipelineState,
+    pub combine_pso: ComputePipelineState,
+    pub swiglu_pso: ComputePipelineState,
+    pub sdpa_pipes: BatchedSdpaPipelines,
+    // … the other PSOs the model needs.
+}
+
+impl<'a> Backend for MetalBackendCtx<'a> {
+    fn encode_op(&mut self, op: &Op, pool: &BufferPool, cmdbuf: &metal::CommandBufferRef) {
+        match op {
+            Op::RmsNormBf16NTokens { x, weight_off, out, dim, n_tokens, eps, .. } => {
+                encode_rms_norm_bf16_fused_n_tokens(
+                    cmdbuf, &self.rms_n_pipe,
+                    pool.get(*x), self.wf_buf.buffer(), *weight_off,
+                    pool.get(*out), *dim, *n_tokens, *eps,
+                );
+            }
+            Op::MatvecNTokens { weight, input, input_off, output, output_off, in_dim, out_dim, n_tokens, .. } => {
+                encode_matvec_n_tokens(
+                    cmdbuf, &self.matvec_pipes,
+                    self.wf_buf.buffer(),
+                    weight.w_off, weight.s_off, weight.b_off,
+                    pool.get(*input), *input_off,
+                    pool.get(*output), *output_off,
+                    *in_dim, *out_dim, *n_tokens, weight.bits,
+                );
+            }
+            // … each variant calls the existing `encode_X_into` helper.
+        }
+    }
 }
 ```
 
-The `BufId` / `WeightId` types are backend-agnostic handles into
-a buffer pool. The dispatch shape stays the same — the encoding
-side splits per backend.
+### Producer side: layer-forward becomes graph-builder
 
-We're not building this yet. We're building the closure-Vec graph
-that will refactor cleanly *into* this shape. The closure-Vec
-phase is the "shape verification" phase — once we have the
-dispatch list in Vec form, lowering to typed Ops is a search-and-
-replace plus some buffer ID plumbing.
+`batched_full_attn_layer_forward` and
+`batched_linear_attn_layer_forward` change from "imperatively
+encode into cmdbuf" to "push Ops into Graph." Function signature
+changes from taking buffer refs to taking BufIds:
 
-**Bounded op set.** The enum will have ~20 variants, sized to the
-models we actually run (Qwen3-A3B GQA + linear-attn, Cogito-V2
-MLA). Not a general-purpose graph compiler. Each variant maps to
-a small kernel set per backend — for CoreML, most variants
-will lower to MPSGraph primitive ops; for CUDA (if we get there),
-to cuBLAS/CUTLASS calls or hand-written kernels. The scope stays
-*model-driven*, not framework-driven.
+```rust
+pub(super) fn batched_linear_attn_layer_forward(
+    graph: &mut Graph,
+    wf: &WeightFile,
+    layer_cache: &LayerWeightCache,
+    layer_idx: usize,
+    n_tokens: usize,
+    k_active: usize,
+    expert_files: &ExpertFiles,
+    hidden_in_id: BufId,
+    hidden_out_id: BufId,
+    // … etc, no more direct buffer args
+) -> Result<(), LayerForwardError> {
+    // Register intermediates with the pool, push Ops, return.
+    let normed_id = graph.register_buf(MtlBuffer::with_len(…).into_buffer());
+    graph.push(Op::RmsNormBf16NTokens {
+        label: "input_rms_norm",
+        x: hidden_in_id,
+        weight_off: layer_cache.input_layernorm_w,
+        out: normed_id,
+        dim: hidden_dim as u32,
+        n_tokens: n_tokens as u32,
+        eps: RMS_NORM_EPS,
+    });
+    // … 1b, 1c, 1d, 1e, 1f, 1g, combine — all push Ops.
+}
+```
 
-Critical: the closure capture pattern in S7-β should not capture
-anything that *couldn't* be represented as a typed enum field. If
-a closure captures a complex `&'a SomeStruct`, that's a signal we
-need a typed BufId/WeightId shape sooner rather than later.
+The orchestrator builds the full graph across all 40 layers, then
+hands it to the backend, which encodes into cmdbufs and commits:
 
-## Estimated session count
+```rust
+fn step_internal_batched_gqa(&mut self, tokens: &[i32], …) {
+    let mut graph = Graph::new();
+    let hidden_a = graph.register_buf(…initial embeddings…);
+    let mut hidden_b = graph.register_buf(…empty…);
+    let mut in_id = hidden_a;
+    let mut out_id = hidden_b;
 
-This is multi-session. Mike: *"no matter what it takes."* Rough
-sketch:
+    for layer in 0..40 {
+        batched_X_layer_forward(&mut graph, …, in_id, out_id, …);
+        std::mem::swap(&mut in_id, &mut out_id);
+    }
 
-- **Session 7:** S7-α + S7-β. Graph<'a> lands + every encoder
-  threaded through it. No perf change, large diff. Canary green.
-- **Session 8:** S7-γ (the collapse) for linear-attn path. Bench:
-  expect modest win on prefill (5-15%?) from cross-layer GPU
-  pipelining.
-- **Session 9:** S7-δ (full-attn GPU ops) + S7-ε (sigmoid_gate).
-  Full-attn joins the chunk_graph. Bench.
-- **Session 10:** S7-ζ (parallel encoding). Bench.
-- **Session 11+:** S7-η or kernel-efficiency work (FlashAttention-
-  style SDPA, persistent chunk buffers), informed by post-ζ
-  profile.
+    // (Optional) graph.dump() for debugging.
 
-Mike's reframe — "architectural cleanliness over tok/s" — means
-landing S7-α/β cleanly even if perf doesn't move. The win is the
-*shape*. Once shape is right, the dispatch optimisations and
-eventual backend port follow cheaply.
+    let mut backend_ctx = MetalBackendCtx::new(metal, wf_buf, …);
+    let cmdbuf = queue.new_command_buffer();
+    backend_ctx.encode_graph_into(&graph, cmdbuf);
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
 
-## Verification protocol (unchanged from session 6)
+    // Final norm + lm_head reads `in_id`'s last token row.
+}
+```
 
-Canary battery after each phase:
+**Open design question for session 7:** the routing readback + CPU
+bucket build still happens *mid-graph* in the current shape. Two
+options:
+
+(A) **Two-phase graph.** Build a pre-MoE graph, encode + commit
+    + wait, read back routing, CPU bucket build, build a MoE
+    graph that uses the buckets, encode + commit. Two cmdbufs
+    per chunk.
+
+(B) **Backend interrupt.** The backend's `encode_graph_into`
+    learns to detect a `RoutingReadbackBarrier` Op and split
+    cmdbufs there. Same effect but the producer side stays as
+    one Graph build.
+
+Recommend **(A)** for session 7 — cleanest. (B) can come later
+once we have GPU bucket build (S7-η).
+
+### What ships in session 7
+
+Minimum bar for the session to "succeed":
+
+1. `graph.rs` exists with `BufId`, `BufferPool`, `Op` enum (~20
+   variants), `Graph`, `Backend` trait.
+2. `MetalBackendCtx` implements `Backend` for every Op variant
+   the GQA path needs — each variant's encode is a one-line call
+   to the existing `encode_X_into` helper.
+3. Both `batched_*_layer_forward` rewritten as Graph builders
+   (no more direct cmdbuf encoding inside).
+4. `step_internal_batched_gqa` rewritten to build → encode →
+   commit (two cmdbufs: pre-MoE and MoE).
+5. **Canary 9/9 cosine = 1.0.**
+6. `Graph::dump()` works — useful for the next session's debug
+   work.
+
+Stretch goals (nice if they fit, fine to defer):
+
+7. GPU q/k norm + RoPE + KV append + sigmoid_gate kernels — gets
+   full-attn fully into the pre-MoE graph.
+8. Parallel encode via rayon / dispatch_apply equivalent.
+
+## Order of operations
+
+Build bottom-up. Each step is a checkpoint with canary.
+
+### S7-1: Op enum + BufferPool + Graph type (no Backend yet)
+
+Just the types. Write enough variants for the GQA path
+(RmsNormBf16NTokens, RmsNormQk, ResidualAddNTokens, MatvecNTokens,
+SwigluFusedBatched, SdpaCausalTiled, MoeSoftmaxTopK,
+MoeNormalizeWeights, MoeBatchedPermuteFuse, MoeCombineResidualNTokens,
+Conv1dStep, ComputeDecayBeta, DeltaNetStep, GatedRmsNorm, LmHead).
+
+Unit tests:
+- Round-trip: push N Ops, iterate `graph.ops`, recover labels.
+- `dump()` prints sensibly.
+- `BufferPool::register` returns sequential IDs.
+
+**Checkpoint:** compiles, unit tests green.
+
+### S7-2: `Backend` trait + `MetalBackendCtx`
+
+`encode_op` match arms call the existing helpers. Heavy but
+mechanical.
+
+Unit test (synthetic): build a tiny graph (one RmsNorm + one
+Matvec), run it through the backend on synthetic buffers, verify
+output matches a direct call.
+
+**Checkpoint:** unit tests green.
+
+### S7-3: Rewrite `batched_linear_attn_layer_forward` as graph
+builder
+
+Linear-attn first because it's the simpler shape (no q/k norm /
+RoPE / sigmoid_gate complications). Builds Ops for 1a-1e
+(pre-MoE) and 1f-1g + combine (MoE).
+
+The MoE half stays in a *separate* Graph that the orchestrator
+builds *after* the routing readback.
+
+**Checkpoint:** canary 9/9 with linear-attn path going through
+Graph + Backend. Full-attn still uses the old imperative path.
+
+This is the highest-risk step. The function signature change
+ripples to the orchestrator. Plan to spend the largest chunk of
+session 7 here.
+
+### S7-4: Rewrite `batched_full_attn_layer_forward` same way
+
+Full-attn has the q/k norm + RoPE + KV append + sigmoid_gate CPU
+host bounces. Two options:
+
+(a) **Keep the host bounces inline** — the layer-forward Graph
+    builder *runs* the CPU steps as it goes (push Op, do CPU
+    work, push next Op). Graph still builds linearly; the
+    cmdbuf gets split at the host-bounce points by the
+    Backend. Equivalent to today's commit shape but with the
+    Op-typed dispatch.
+
+(b) **GPU port** q/k norm + RoPE + KV append + sigmoid_gate
+    first. Eliminates the bounces. New kernels (S7-δ/ε from
+    the earlier plan draft).
+
+Recommend **(a) first** — session 7 is about shape. (b) becomes
+session 8 (GPU port of the 3-4 small full-attn-specific kernels).
+
+**Checkpoint:** canary 9/9 with both paths through Graph.
+
+### S7-5: Refactor `step_internal_batched_gqa`
+
+Two-phase graph: pre-MoE → commit → readback routing → CPU
+bucket-build → MoE+combine → commit.
+
+This is where commits drop from ~100/chunk to ~2/chunk for
+linear-attn layers, ~5/chunk for full-attn (because of host
+bounces — until S7-δ/ε).
+
+**Checkpoint:** canary 9/9 + warm bench. Expect modest perf bump
+from cross-layer pipelining.
+
+### S7-6: Graph::dump() polish + commit
+
+Make `dump()` produce something useful for diffing builds. Probably
+just one line per op with label + key arg summary. Commit the
+session's work as a single coherent diff (or several smaller
+commits per checkpoint above).
+
+### S7-7 (if time): GPU full-attn ops (S7-δ/ε from earlier draft)
+
+`rms_norm_per_head_n_tokens` + `rope_apply_n_tokens` +
+`kv_cache_append_n_tokens` + `sigmoid_gate_n_tokens`. Each ~30
+lines of Metal. Full-attn collapses into the pre-MoE graph.
+
+### S7-8 (stretch): Parallel encode
+
+`Backend::encode_graph_partitioned(graph, queue, n_cb=2)`.
+Cmdbufs enqueued in order, single commit_and_wait at the end.
+
+## Bounded op vocabulary (locked)
+
+Stay model-driven. Today's needs:
+
+**Qwen3-A3B (GQA + linear-attn):**
+- RmsNormBf16NTokens, RmsNormQk, ResidualAddNTokens
+- MatvecNTokens (4-bit/8-bit)
+- SwigluFusedBatched, SdpaCausalTiled
+- MoeSoftmaxTopK, MoeNormalizeWeights
+- MoeBatchedPermuteFuse, MoeCombineResidualNTokens
+- Conv1dStep, ComputeDecayBeta, DeltaNetStep, GatedRmsNorm
+- (full-attn S7-7): RmsNormPerHeadNTokens, RopeApplyNTokens,
+  KvCacheAppendNTokens, SigmoidGateNTokens
+- LmHead
+
+**Cogito-V2 (MLA):**
+- MlaQPrime4Bit, MlaSdpaTileAccumulate, MlaSdpaTileFinalize
+- NoauxTcRouter (DeepSeek-V3 routing — reuses MoeSoftmaxTopK +
+  group-mask + scale, may need an extra variant)
+
+That's ~22 ops. Each variant maps to one Metal kernel that already
+exists or will exist by session-7 close. No general-purpose op
+fusion, no shape inference, no constant folding — just the
+*dispatch list*.
+
+## What is *not* in scope this session
+
+- **CoreML or CUDA backend impl.** The Backend trait is ready;
+  no second impl yet.
+- **In-place buffer reuse / lifetime analysis.** Each Op gets
+  distinct BufIds; the pool grows monotonically. Later pass once
+  profile shows allocation churn.
+- **GPU bucket build** (S7-η). Still requires the chunk_a / chunk_b
+  split.
+- **MLA path full conversion.** Stays on tokenwise oracle for now;
+  reserve the variant slots in the Op enum but don't wire callers.
+
+## Risks
+
+- **Op enum fields explosion.** Some ops have a lot of args (SDPA,
+  MoeBatchedPermuteFuse). If a variant ends up with 20+ fields,
+  consider grouping into a sub-struct (`SdpaCausalTiledArgs`). Not
+  a refactor blocker.
+- **Buffer pool growth.** Each layer allocates ~15 intermediates.
+  40 layers × 15 = 600 BufIds per chunk. Vec<metal::Buffer>
+  storage is fine; cmdbuf encoding indirection through pool.get()
+  is a Vec index — sub-nanosecond.
+- **Ownership of the metal::Buffer in the pool.** The pool owns
+  them. Layers register and return BufIds; the orchestrator drops
+  the whole Graph at chunk end, releasing all buffers. Need to
+  verify this doesn't conflict with persistent state (KV cache —
+  that's owned by `LayerState`, not registered in the pool).
+- **Test surface change.** The synthetic diff tests in
+  `batched_diff_oracle.rs` call the old `encode_X_into` helpers
+  directly. They keep working as kernel-level diff tests. The
+  full-forward canaries in `diff_oracle.rs` exercise the new
+  Graph path.
+- **No half-states allowed.** If session-7 ships partial (e.g.
+  linear-attn through Graph but full-attn still imperative), the
+  orchestrator has to dispatch differently. That's fine
+  temporarily but not durably. Commit boundaries: S7-3 (linear-
+  attn graph) and S7-4 (full-attn graph) are landed together if
+  possible, or behind a feature flag if not.
+
+## Verification protocol
+
+Canary battery after each checkpoint. Bench at session close
+(post-reboot per `feedback_bench_discipline.md`).
 
 ```bash
 cd ~/Projects/moeflux
@@ -422,62 +538,44 @@ cargo test --release -p moeflux --features model-qwen3-6-35b-a3b \
   state_load_rust_from_c_save eval_prompt_matches_c_multi_token \
   eval_prompt_chunked_matches_eval_prompt_whole_prompt \
   prompt_cache_start_pos_nonzero_matches diag_b2_eval_prompt_chunk_1
+
+cd ~/Projects/drama_llama
+./bench.py --model a3b --prompt-file prefill_prompt.txt --max-tokens 1 -n 3
+./bench.py --model a3b --prompt-file prefill_prompt_long.txt --max-tokens 1 -n 3
 ```
 
-Bench post-reboot per `feedback_bench_discipline.md`. The session-6
-warm-machine bench (75 tok/s on 992) gives the directional baseline.
+Pre-session-7 baseline (warm, n=1):
+- 992 prefill: 74.66 tok/s (S7-2 post)
+- 16k prefill: 42.66 tok/s (S7-1a post; S7-2 not re-benched on 16k)
+
+Target post-session-7:
+- **Canary 9/9 cosine = 1.0** (load-bearing — the perf number is
+  secondary).
+- 992 prefill: any movement is gravy. Mike's hypothesis is
+  modest improvement from cross-layer pipelining. Could be flat;
+  the architectural win is the point.
+
+## Forward look (post-session 7)
+
+- **Session 8:** S7-7 (GPU full-attn ops) + S7-8 (parallel encode).
+- **Session 9+:** GPU bucket build (S7-η) if profile flags
+  readback as the new pole. Otherwise kernel-efficiency work
+  (FlashAttention SDPA, persistent chunk buffers).
+- **Session N (later):** when CoreML/CUDA contact happens, add a
+  second `Backend` impl. The producer side doesn't change at all
+  — that's the entire point.
 
 ## Files where context lives
 
-- This memo: `qwen_graph_mode_session7_plan.md`.
+- This memo (rewritten 2026-05-14 to lock the general-shape
+  decision): `qwen_graph_mode_session7_plan.md`.
 - Session-6 outcome: `qwen_graph_mode_session6_partB_precursors_landed.md`.
 - GPU saturation observation: `qwen_prefill_gpu_saturation_signal.md`.
+- llama.cpp insulation motivation: `project_llama_cpp_insulation`
+  (in auto-memory, not in-repo).
 - llama.cpp reference (read at session start):
-  - `~/Projects/llama-cpp-sys/external/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:438..550`
-    — `dispatch_apply(n_cb, encode_async)`.
   - `~/Projects/llama-cpp-sys/external/llama.cpp/src/llama-graph.cpp:1305..1700`
-    — `build_moe_ffn` shape.
-
-## Risks
-
-- **Closure capture vs `+ 'a`**. Some encoders take many references
-  (layer_cache, wf_buf, pipelines). Closures will capture either by
-  reference (cheap, lifetime-bound) or by clone (slightly more work
-  but no lifetime constraint). Pattern: clone refcounted handles
-  (metal::Buffer, ComputePipelineState are Obj-C refcounted, cheap
-  to clone), borrow Rust-side structs by reference.
-- **Cmdbuf size limits**. 40 layers × 8 phases ≈ 320 dispatches in
-  one cmdbuf. llama.cpp encodes more without trouble. Watch for
-  "command buffer too large" errors but unlikely.
-- **`MTLEvent` for parallel encode**. Apple docs say enqueue order
-  = execution order on the same queue, but verify on a small
-  fixture. If cross-cmdbuf data dependency needs explicit MTLEvent
-  sync, the closure-Vec abstraction needs an event-aware encode
-  path.
-- **Refactor footprint**. S7-β touches every batched encoder. Big
-  diff, mostly mechanical. Use `Graph::labels()` to verify the
-  dispatch sequence is unchanged before/after — that's the cheap
-  regression check before canary.
-
-## Out of scope for session 7
-
-- **GPU bucket build (S7-η)**: only if profile flags the readback.
-- **Enum-Op refactor**: waits for second-backend API contact.
-- **MLA path** (cogito-v2): graph-mode applies only to the GQA
-  path. MLA stays on tokenwise oracle.
-- **Kernel efficiency** (FlashAttention SDPA, persistent chunk
-  buffers): post-ζ once the shape is right.
-
-## Carry-overs explicitly preserved
-
-The session-6 plan called out commit shape, host bounces, GPU
-saturation as facts. All still hold:
-
-- ~100 commits/chunk today.
-- 3 forced host bounces per full_attn layer; 1 per linear_attn.
-- GPU saturated within each cmdbuf — see
-  [`qwen_prefill_gpu_saturation_signal.md`](qwen_prefill_gpu_saturation_signal.md).
-
-Open with `profile.py` if curious, but the *primary* session-7
-work is `Graph<'a>` + S7-β refactor — orthogonal to whatever the
-new pole turns out to be.
+    — `build_moe_ffn` reference for MoE routing shape.
+  - `~/Projects/llama-cpp-sys/external/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:438..550`
+    — Metal scheduler / dispatch_apply pattern for session 8's
+    parallel encode work.
