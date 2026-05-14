@@ -59,24 +59,26 @@ The trade-off is more upfront design surface in this session.
 That's fine — session 6 shipped 5 commits + bench + 4 memos in
 one sitting. Capacity is there.
 
-## Architectural sketch
+## Architectural sketch (LOCKED 2026-05-14 after design conversation)
 
-### Core types (new module: `crates/moeflux/src/riir/graph.rs`)
+### Locked trait design
+
+Two traits: `BufferPool` (per-backend buffer ownership) and
+`Backend` (per-backend execution). Both use associated types so
+no Metal types leak into the trait signatures.
 
 ```rust
-/// Identifier into the per-Graph buffer pool. Backend-agnostic;
-/// the pool maps it to a concrete buffer at encode time.
+/// Identifier into a Backend's buffer pool. Backend-agnostic;
+/// each backend translates BufId to its native handle internally.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct BufId(pub u32);
 
-/// Identifier into the per-Graph constants pool (small u32/f32
-/// scalars referenced by ops — dim, eps, bits, etc.).
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct ConstId(pub u32);
-
-/// Reference to a weight tensor by (offset, dtype-tag) tuple. The
-/// weight file is a single MtlWeightBuf shared across the chunk;
-/// only offsets change per op.
+/// Reference to a weight tensor. The Metal impl interprets
+/// (w_off, s_off, b_off, bits) against its mmap'd weight buffer.
+/// CoreML would translate to a pre-loaded MPSGraph constant
+/// (cache keyed by offset). CUDA likewise. Producer code passes
+/// this around as an opaque-ish handle — the offsets are
+/// model-defined, not backend-defined.
 #[derive(Copy, Clone, Debug)]
 pub struct WeightRef {
     pub w_off: u64,
@@ -85,9 +87,120 @@ pub struct WeightRef {
     pub bits: u32,
 }
 
-/// The op set. Bounded by the models we run (Qwen3-A3B GQA +
-/// linear-attn + Cogito-V2 MLA). ~20 variants. Each carries
-/// everything it needs to encode — no captured `&` references.
+/// Backend-specific buffer pool. The Handle type is the
+/// backend's native buffer representation:
+/// - MetalBufferPool: Handle = metal::Buffer (refcounted NSObject).
+/// - CpuBufferPool: Handle = RefCell<Vec<u8>> (interior mutability
+///   so encode_op can write through &self).
+/// - CoreMlBufferPool: Handle = MLMultiArray (when it lands).
+pub trait BufferPool {
+    type Handle;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Reserve a buffer. `persistent` survives `reset_transient`
+    /// (used for KV cache, weight file etc.); default-false ones
+    /// are released at chunk end.
+    fn alloc(
+        &mut self,
+        bytes: usize,
+        label: &'static str,
+        persistent: bool,
+    ) -> Result<BufId, Self::Error>;
+
+    /// Look up a buffer's backend-native handle. `&self` — callers
+    /// get a reference, and per-backend Handle types provide
+    /// whatever interior mutability they need for op execution
+    /// (Metal: writes go through `.contents()` mutable pointer
+    /// regardless of Rust-level mut; CPU: RefCell<Vec<u8>>).
+    fn handle(&self, id: BufId) -> &Self::Handle;
+
+    fn upload(&mut self, id: BufId, host: &[u8])
+        -> Result<(), Self::Error>;
+    fn download(&self, id: BufId, host: &mut [u8])
+        -> Result<(), Self::Error>;
+    fn reset_transient(&mut self);
+
+    /// For debug / inspection — buffer label by ID.
+    fn label(&self, id: BufId) -> &'static str;
+}
+
+/// Backend trait. Owns the device, pool, pipeline / compiled-
+/// graph cache. All encoding methods are `&self`-typed; backends
+/// use interior mutability (Mutex / RefCell) for any state they
+/// need to mutate during encode.
+pub trait Backend {
+    type Pool: BufferPool;
+    type EncodeCtx;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn pool(&self) -> &Self::Pool;
+    fn pool_mut(&mut self) -> &mut Self::Pool;
+
+    /// Open an encoding session.
+    /// - Metal: `queue.new_command_buffer()` wrapped in an
+    ///   owned struct.
+    /// - CoreML: a fresh MPSGraph builder.
+    /// - CPU: `()` (encoding IS execution; nothing to carry).
+    fn begin_encoding(&self) -> Self::EncodeCtx;
+
+    /// Encode one op. `&self`-typed. Reads buffers via pool,
+    /// writes encoded work into the ctx. For CPU, "encoded
+    /// work" means actually running the kernel and writing
+    /// the output buffer; for Metal, it's appending a
+    /// dispatch to the cmdbuf.
+    fn encode_op(&self, op: &Op, ctx: &mut Self::EncodeCtx);
+
+    /// Default linear sweep. Backends override only if they
+    /// want non-linear scheduling (parallel encode within one
+    /// session — session 8+ work).
+    fn encode_graph(&self, graph: &Graph, ctx: &mut Self::EncodeCtx) {
+        for op in &graph.ops {
+            self.encode_op(op, ctx);
+        }
+    }
+
+    /// Submit the encoded work and block until done.
+    /// - Metal: `cmdbuf.commit() + wait_until_completed()`.
+    /// - CoreML: `executable.run()`.
+    /// - CPU: no-op (already executed inline during encode_op).
+    fn submit_and_wait(&self, ctx: Self::EncodeCtx)
+        -> Result<(), Self::Error>;
+
+    /// Convenience: full cycle.
+    fn execute(&self, graph: &Graph) -> Result<(), Self::Error> {
+        let mut ctx = self.begin_encoding();
+        self.encode_graph(graph, &mut ctx);
+        self.submit_and_wait(ctx)
+    }
+}
+```
+
+**Key decisions (locked):**
+
+1. **`encode_op` takes `&Op` not `Op` by value.** Op is not Copy
+   — `MoeBatchedPermuteFuse` carries Vec<(BufId, u64)> and
+   ExpertBuckets. Op-by-ref keeps the enum natural; we can
+   always lift bulky bits to a sibling `GraphAux` pool keyed by
+   `AuxId` later if Op-by-value becomes valuable.
+
+2. **`&self` everywhere on the encoding surface, interior
+   mutability inside.** Future-friendly: parallel encode lives
+   at a higher level (one Backend instance, many `begin_encoding`
+   sessions in parallel), or via Mutex inside the impl. The
+   trait doesn't preclude either.
+
+3. **Three explicit steps (`begin / encode / submit`) with a
+   default `execute` wrapper.** Most callsites use `execute(graph)`.
+   Fine-grained control is available when needed.
+
+4. **`BufferPool` is its own trait.** Each backend's `Pool` is
+   concrete (MetalBufferPool, CpuBufferPool) and bounded by the
+   trait. The `Handle` associated type carries the native buffer
+   type through.
+
+### Op enum
+
+```rust
 pub enum Op {
     /// Input or post-attn RMS norm, n_tokens batched, bf16 weight.
     RmsNormBf16NTokens {
@@ -170,94 +283,218 @@ pub enum Op {
     LmHead { label: &'static str, hidden: BufId, last_token_row: u32, logits_out: BufId },
 }
 
-/// The buffer pool. Keyed by BufId, values are owned metal::Buffer
-/// (refcounted Objective-C handles — cheap to clone).
-pub struct BufferPool {
-    buffers: Vec<metal::Buffer>,
-}
-
-impl BufferPool {
-    pub fn new() -> Self { Self { buffers: vec![] } }
-    pub fn register(&mut self, buf: metal::Buffer) -> BufId {
-        let id = BufId(self.buffers.len() as u32);
-        self.buffers.push(buf);
-        id
-    }
-    pub fn get(&self, id: BufId) -> &metal::Buffer { &self.buffers[id.0 as usize] }
-}
-
-/// The graph itself. Ops are appended in dispatch order. Backend
-/// owns the cmdbuf and decides how to slice / commit / parallelise.
+/// The graph itself. Backend-agnostic dispatch list. Ops carry
+/// BufIds (resolved by the Backend's pool) and WeightRefs
+/// (resolved by the Backend's weight file representation).
 pub struct Graph {
     pub ops: Vec<Op>,
-    pub pool: BufferPool,
 }
 
 impl Graph {
-    pub fn new() -> Self { Self { ops: vec![], pool: BufferPool::new() } }
+    pub fn new() -> Self { Self { ops: vec![] } }
     pub fn push(&mut self, op: Op) { self.ops.push(op); }
-    pub fn register_buf(&mut self, buf: metal::Buffer) -> BufId {
-        self.pool.register(buf)
-    }
     pub fn labels(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.ops.iter().map(|op| op.label())
     }
-    pub fn dump(&self) -> String { … }  // for debugging
+    /// One line per op for debug — used by the graph_metal_matches_cpu
+    /// diff test and any future backend lowering inspection.
+    pub fn dump(&self) -> String { … }
 }
 
 impl Op {
     pub fn label(&self) -> &'static str { … }
 }
+```
 
-/// Backend trait. Per-op encoding lives in the impl.
-pub trait Backend {
-    fn encode_op(&mut self, op: &Op, pool: &BufferPool, cmdbuf: &metal::CommandBufferRef);
-    fn encode_graph_into(&mut self, graph: &Graph, cmdbuf: &metal::CommandBufferRef) {
-        for op in &graph.ops {
-            self.encode_op(op, &graph.pool, cmdbuf);
-        }
+### MetalBackend sketch
+
+```rust
+pub struct MetalBufferPool {
+    buffers: Vec<PoolEntry>,
+    persistent_mask: BitVec,
+}
+
+struct PoolEntry {
+    buf: metal::Buffer,
+    label: &'static str,
+}
+
+impl BufferPool for MetalBufferPool {
+    type Handle = metal::Buffer;
+    type Error = MetalError;
+
+    fn alloc(&mut self, bytes, label, persistent) -> Result<BufId, _> {
+        let buf = self.device.new_buffer(bytes as NSUInteger,
+            MTLResourceOptions::StorageModeShared);
+        let id = BufId(self.buffers.len() as u32);
+        self.buffers.push(PoolEntry { buf, label });
+        self.persistent_mask.set(id.0 as usize, persistent);
+        Ok(id)
+    }
+    fn handle(&self, id) -> &metal::Buffer { &self.buffers[id.0 as usize].buf }
+    fn upload(&mut self, id, host) -> Result<(), _> { /* memcpy via .contents() */ }
+    fn download(&self, id, host) -> Result<(), _> { /* memcpy via .contents() */ }
+    fn reset_transient(&mut self) {
+        // Drop non-persistent entries, compact, reissue BufIds — or
+        // just truncate to the last persistent index if persistent
+        // IDs are always low.
     }
 }
 
-pub struct MetalBackendCtx<'a> {
-    pub metal: &'a mut MetalBackend,
-    pub wf_buf: &'a MtlWeightBuf,
-    // Cached pipeline states fetched once per chunk.
-    pub matvec_pipes: MatvecPipelines,
-    pub rms_n_pipe: RmsNormBf16FusedNTokensPipeline,
-    pub router_pipes: MoeRouterPipelines,
-    pub residual_add_n_pso: ComputePipelineState,
-    pub combine_pso: ComputePipelineState,
-    pub swiglu_pso: ComputePipelineState,
-    pub sdpa_pipes: BatchedSdpaPipelines,
-    // … the other PSOs the model needs.
+pub struct MetalBackend {
+    device: Device,
+    queue: CommandQueue,
+    pool: MetalBufferPool,
+    // Pre-warmed pipelines (built at MetalBackend::new).
+    matvec_pipes: MatvecPipelines,
+    rms_n_pipe: RmsNormBf16FusedNTokensPipeline,
+    router_pipes: MoeRouterPipelines,
+    residual_add_n_pso: ComputePipelineState,
+    combine_pso: ComputePipelineState,
+    swiglu_pso: ComputePipelineState,
+    sdpa_pipes: BatchedSdpaPipelines,
+    // …
+    wf_buf: MtlWeightBuf,
 }
 
-impl<'a> Backend for MetalBackendCtx<'a> {
-    fn encode_op(&mut self, op: &Op, pool: &BufferPool, cmdbuf: &metal::CommandBufferRef) {
+pub struct MetalEncodeCtx {
+    cmdbuf: metal::CommandBuffer,  // owned; submit_and_wait consumes it
+}
+
+impl Backend for MetalBackend {
+    type Pool = MetalBufferPool;
+    type EncodeCtx = MetalEncodeCtx;
+    type Error = MetalError;
+
+    fn pool(&self) -> &MetalBufferPool { &self.pool }
+    fn pool_mut(&mut self) -> &mut MetalBufferPool { &mut self.pool }
+
+    fn begin_encoding(&self) -> MetalEncodeCtx {
+        MetalEncodeCtx { cmdbuf: self.queue.new_command_buffer().to_owned() }
+    }
+
+    fn encode_op(&self, op: &Op, ctx: &mut MetalEncodeCtx) {
         match op {
             Op::RmsNormBf16NTokens { x, weight_off, out, dim, n_tokens, eps, .. } => {
                 encode_rms_norm_bf16_fused_n_tokens(
-                    cmdbuf, &self.rms_n_pipe,
-                    pool.get(*x), self.wf_buf.buffer(), *weight_off,
-                    pool.get(*out), *dim, *n_tokens, *eps,
+                    &ctx.cmdbuf, &self.rms_n_pipe,
+                    self.pool.handle(*x), self.wf_buf.buffer(), *weight_off,
+                    self.pool.handle(*out), *dim, *n_tokens, *eps,
                 );
             }
-            Op::MatvecNTokens { weight, input, input_off, output, output_off, in_dim, out_dim, n_tokens, .. } => {
+            Op::MatvecNTokens { weight, input, input_off, output, output_off,
+                                 in_dim, out_dim, n_tokens, .. } => {
                 encode_matvec_n_tokens(
-                    cmdbuf, &self.matvec_pipes,
-                    self.wf_buf.buffer(),
+                    &ctx.cmdbuf, &self.matvec_pipes, self.wf_buf.buffer(),
                     weight.w_off, weight.s_off, weight.b_off,
-                    pool.get(*input), *input_off,
-                    pool.get(*output), *output_off,
+                    self.pool.handle(*input), *input_off,
+                    self.pool.handle(*output), *output_off,
                     *in_dim, *out_dim, *n_tokens, weight.bits,
                 );
             }
-            // … each variant calls the existing `encode_X_into` helper.
+            // … one match arm per variant, each one a single call to an
+            // existing encode_X_into helper. ~22 arms total.
+        }
+    }
+
+    fn submit_and_wait(&self, ctx: MetalEncodeCtx) -> Result<(), MetalError> {
+        ctx.cmdbuf.commit();
+        ctx.cmdbuf.wait_until_completed();
+        // Check cmdbuf.status() for errors.
+        Ok(())
+    }
+}
+```
+
+### CpuBackend (the first customer) sketch
+
+```rust
+pub struct CpuBufferPool {
+    /// RefCell so encode_op can write through &self.
+    buffers: Vec<RefCell<Vec<u8>>>,
+    labels: Vec<&'static str>,
+    persistent_mask: BitVec,
+}
+
+impl BufferPool for CpuBufferPool {
+    type Handle = RefCell<Vec<u8>>;
+    type Error = CpuError;
+
+    fn alloc(&mut self, bytes, label, persistent) -> Result<BufId, _> {
+        let id = BufId(self.buffers.len() as u32);
+        self.buffers.push(RefCell::new(vec![0u8; bytes]));
+        self.labels.push(label);
+        self.persistent_mask.set(id.0 as usize, persistent);
+        Ok(id)
+    }
+    fn handle(&self, id) -> &RefCell<Vec<u8>> { &self.buffers[id.0 as usize] }
+    // upload/download just memcpy the RefCell contents.
+    // reset_transient truncates to persistent prefix.
+}
+
+pub struct CpuBackend {
+    pool: CpuBufferPool,
+    wf: WeightFile,  // mmap'd; same struct the per-token oracle uses
+}
+
+impl Backend for CpuBackend {
+    type Pool = CpuBufferPool;
+    type EncodeCtx = ();  // execution is inline
+    type Error = CpuError;
+
+    fn pool(&self) -> &CpuBufferPool { &self.pool }
+    fn pool_mut(&mut self) -> &mut CpuBufferPool { &mut self.pool }
+    fn begin_encoding(&self) -> () { () }
+    fn submit_and_wait(&self, _: ()) -> Result<(), CpuError> { Ok(()) }
+
+    fn encode_op(&self, op: &Op, _ctx: &mut ()) {
+        match op {
+            Op::RmsNormBf16NTokens { x, weight_off, out, dim, n_tokens, eps, .. } => {
+                let x_buf = self.pool.handle(*x).borrow();
+                let x_f32: &[f32] = bytemuck::cast_slice(&x_buf);
+                let mut out_buf = self.pool.handle(*out).borrow_mut();
+                let out_f32: &mut [f32] = bytemuck::cast_slice_mut(&mut out_buf);
+                let weight_bytes = &self.wf.bytes_at(*weight_off, dim * 2);
+                let weight_bf16: &[u16] = bytemuck::cast_slice(weight_bytes);
+                for t in 0..*n_tokens {
+                    rms_norm_bf16_per_token_cpu(
+                        &x_f32[t*dim..(t+1)*dim],
+                        weight_bf16,
+                        *eps,
+                        &mut out_f32[t*dim..(t+1)*dim],
+                    );
+                }
+            }
+            Op::MatvecNTokens { weight, input, input_off, output, output_off,
+                                 in_dim, out_dim, n_tokens, .. } => {
+                // Reuse existing dequant_matvec_4bit_cpu / 8bit_cpu / bf16_matvec_cpu.
+            }
+            // … same ~22 arms, each calling existing CPU oracle helpers.
         }
     }
 }
 ```
+
+Most per-op CPU implementations already exist in moeflux (used by
+the per-token oracle). Wiring them into Op variants is mechanical.
+
+### Why CPU first
+
+1. **It validates the abstraction.** If the trait can't host a
+   simple synchronous CPU executor cleanly, the trait is wrong.
+   Better to find that out before committing to Metal-impl
+   parameter shapes.
+
+2. **It gives us a new diff oracle immediately.** Build the same
+   Graph, run through CpuBackend and MetalBackend, compare pool
+   contents. Bit-exact (modulo reduction order) across each Op.
+   Way cheaper than the existing `eval_prompt_matches_per_token_oracle`
+   — no model load, no full forward run, just per-op verification.
+
+3. **It surfaces design pressure on the Op enum.** If a variant
+   is hard to CPU-encode without bizarre field shapes, that's a
+   signal we got the Op shape wrong. Fix once, here, instead of
+   once-per-backend later.
 
 ### Producer side: layer-forward becomes graph-builder
 
@@ -343,122 +580,176 @@ once we have GPU bucket build (S7-η).
 
 Minimum bar for the session to "succeed":
 
-1. `graph.rs` exists with `BufId`, `BufferPool`, `Op` enum (~20
-   variants), `Graph`, `Backend` trait.
-2. `MetalBackendCtx` implements `Backend` for every Op variant
-   the GQA path needs — each variant's encode is a one-line call
-   to the existing `encode_X_into` helper.
-3. Both `batched_*_layer_forward` rewritten as Graph builders
-   (no more direct cmdbuf encoding inside).
-4. `step_internal_batched_gqa` rewritten to build → encode →
-   commit (two cmdbufs: pre-MoE and MoE).
-5. **Canary 9/9 cosine = 1.0.**
-6. `Graph::dump()` works — useful for the next session's debug
-   work.
+1. `graph.rs` exists with `BufId`, `BufferPool` trait, `Backend`
+   trait, `Op` enum (~22 variants), `Graph`, `Op::label()`,
+   `Graph::dump()`.
+2. `CpuBackend` + `CpuBufferPool` — every Op variant has an
+   `encode_op` arm that calls existing CPU oracle helpers (or a
+   small new one when no helper exists).
+3. `MetalBackend` + `MetalBufferPool` — every Op variant has an
+   `encode_op` arm that calls the existing `encode_X_into`
+   helper.
+4. **`graph_metal_matches_cpu` diff test** — synthetic Graph
+   through both backends, per-op cosine ≥ 0.9999. **This is the
+   load-bearing acceptance gate for the trait design.**
+5. `batched_linear_attn_layer_forward` rewritten as a Graph
+   builder generic over `B: Backend`.
+6. `batched_full_attn_layer_forward` rewritten the same way
+   (host bounces inline for now per S7-6 option (a)).
+7. `step_internal_batched_gqa` rewritten to build → execute
+   → readback → build → execute. Two-phase.
+8. **Canary 9/9 cosine = 1.0** — confirms full-forward path
+   through Graph + Metal Backend matches per-token oracle.
 
 Stretch goals (nice if they fit, fine to defer):
 
-7. GPU q/k norm + RoPE + KV append + sigmoid_gate kernels — gets
-   full-attn fully into the pre-MoE graph.
-8. Parallel encode via rayon / dispatch_apply equivalent.
+9. GPU q/k norm + RoPE + KV append + sigmoid_gate (full-attn
+   collapse into pre-MoE Graph).
+10. Parallel encode via rayon (`dispatch_apply` equivalent).
 
-## Order of operations
+### Calibration note (Mike, 2026-05-14)
 
-Build bottom-up. Each step is a checkpoint with canary.
+> Take as many sessions as necessary to get there. But give
+> yourself credit. You can get a *lot* more done than you
+> usually estimate. […] starting new sessions from cold cache
+> nudges usage faster than getting into the 500k-750k token
+> territory. My only concern would be if you get tired. Then
+> we can pause.
 
-### S7-1: Op enum + BufferPool + Graph type (no Backend yet)
+Translation: be ambitious in session 7. Warm cache + 1M context
+gives a lot of headroom. The right scope question isn't "what's
+the minimum that fits in a session" but "what naturally builds on
+the previous step." S7-1 through S7-4 (types + both backends +
+graph diff test) is a coherent unit and the validation that
+*matters most*. If that goes well, push through to S7-5 (linear-
+attn rewrite) the same session. Pause on fatigue, not on a clock.
 
-Just the types. Write enough variants for the GQA path
-(RmsNormBf16NTokens, RmsNormQk, ResidualAddNTokens, MatvecNTokens,
-SwigluFusedBatched, SdpaCausalTiled, MoeSoftmaxTopK,
-MoeNormalizeWeights, MoeBatchedPermuteFuse, MoeCombineResidualNTokens,
-Conv1dStep, ComputeDecayBeta, DeltaNetStep, GatedRmsNorm, LmHead).
+## Order of operations (CPU oracle first, then Metal, then producer)
 
-Unit tests:
-- Round-trip: push N Ops, iterate `graph.ops`, recover labels.
-- `dump()` prints sensibly.
-- `BufferPool::register` returns sequential IDs.
+Build bottom-up. Each step is a checkpoint with canary or a
+synthetic test. The reorder vs. earlier drafts: **CpuBackend
+lands before MetalBackend** so the trait is validated by the
+simpler impl first, and the synthetic Graph diff test
+(`graph_metal_matches_cpu`) is the load-bearing correctness gate
+before any producer code is touched.
 
-**Checkpoint:** compiles, unit tests green.
+### S7-1: Core types — `BufId`, `BufferPool` trait, `Op`, `Graph`
 
-### S7-2: `Backend` trait + `MetalBackendCtx`
+New module `crates/moeflux/src/riir/graph.rs`. Write the trait,
+the Op enum (~22 variants), the Graph struct, `Op::label()`,
+`Graph::dump()`. No backend impls yet.
 
-`encode_op` match arms call the existing helpers. Heavy but
-mechanical.
+Unit tests in-module:
+- `Graph::push` + `labels()` round-trip.
+- `Op::label()` returns the right string for each variant
+  (catches accidental label drift later).
+- `dump()` snapshot test against a hand-built tiny graph.
 
-Unit test (synthetic): build a tiny graph (one RmsNorm + one
-Matvec), run it through the backend on synthetic buffers, verify
-output matches a direct call.
+**Checkpoint:** compiles, unit tests green. Zero behavioural
+change to the rest of the codebase.
 
-**Checkpoint:** unit tests green.
+### S7-2: `Backend` trait + `CpuBufferPool` + `CpuBackend`
 
-### S7-3: Rewrite `batched_linear_attn_layer_forward` as graph
-builder
+CPU impl first. Each `encode_op` variant calls an existing CPU
+oracle helper (`rms_norm_bf16_cpu`, `dequant_matvec_4bit_cpu`,
+`sdpa_cpu`, `moe_router_cpu`, etc.). For helpers that don't yet
+have a CPU oracle, add one inline — they're typically <20 lines
+of straightforward Rust.
 
-Linear-attn first because it's the simpler shape (no q/k norm /
-RoPE / sigmoid_gate complications). Builds Ops for 1a-1e
-(pre-MoE) and 1f-1g + combine (MoE).
+Synthetic per-op tests (no model weights needed): build a
+fixed-input Graph with one Op, run through CpuBackend, compare to
+a direct call of the existing CPU helper. ~22 tests, one per
+Op variant.
 
-The MoE half stays in a *separate* Graph that the orchestrator
-builds *after* the routing readback.
+**Checkpoint:** synthetic tests green. CPU oracle works end-to-
+end on tiny inputs.
 
-**Checkpoint:** canary 9/9 with linear-attn path going through
-Graph + Backend. Full-attn still uses the old imperative path.
+### S7-3: `MetalBufferPool` + `MetalBackend` impl
 
-This is the highest-risk step. The function signature change
-ripples to the orchestrator. Plan to spend the largest chunk of
-session 7 here.
+Each `encode_op` variant is a one-line call to the existing
+`encode_X_into` helper. Pre-warm all pipelines at `MetalBackend::new`
+so `encode_op` can stay `&self`.
 
-### S7-4: Rewrite `batched_full_attn_layer_forward` same way
+**Checkpoint:** the kernel-level diff tests in
+`tests/batched_diff_oracle.rs` still pass (they don't use the
+Backend trait yet — direct kernel calls — so this is just a
+smoke check that we haven't broken anything orthogonal).
 
-Full-attn has the q/k norm + RoPE + KV append + sigmoid_gate CPU
-host bounces. Two options:
+### S7-4: New diff test — `graph_metal_matches_cpu`
 
-(a) **Keep the host bounces inline** — the layer-forward Graph
-    builder *runs* the CPU steps as it goes (push Op, do CPU
-    work, push next Op). Graph still builds linearly; the
-    cmdbuf gets split at the host-bounce points by the
-    Backend. Equivalent to today's commit shape but with the
-    Op-typed dispatch.
+Build a synthetic Graph that exercises every Op variant
+(roughly: one input rms_norm + 4 matvecs + swiglu + sdpa + moe
+softmax_topk + moe permute-fuse + moe combine). Run it through
+CpuBackend and MetalBackend on bit-identical input buffers.
+Compare output buffers per-Op cosine ≥ 0.9999.
 
-(b) **GPU port** q/k norm + RoPE + KV append + sigmoid_gate
-    first. Eliminates the bounces. New kernels (S7-δ/ε from
-    the earlier plan draft).
+This is the load-bearing correctness gate. **If this passes, the
+trait is solid and we can rewrite producers with confidence.**
 
-Recommend **(a) first** — session 7 is about shape. (b) becomes
-session 8 (GPU port of the 3-4 small full-attn-specific kernels).
+**Checkpoint:** graph_metal_matches_cpu green.
+
+### S7-5: Rewrite `batched_linear_attn_layer_forward` as graph builder
+
+Linear-attn first because it has zero CPU host bounces inside
+the layer. Builds Ops for 1a-1e (pre-MoE) into one Graph, and
+1f-1g + combine into a second Graph. Signature changes from
+direct buffer args to `(&mut Graph, &mut B::Pool, …, hidden_in: BufId, hidden_out: BufId)`.
+
+The orchestrator still has imperative full-attn calls at this
+point — they coexist temporarily.
+
+**Checkpoint:** canary 9/9 cosine = 1.0 with linear-attn through
+Graph + Metal Backend. Full-attn still imperative.
+
+This is the largest single step in the session. Plan accordingly.
+
+### S7-6: Rewrite `batched_full_attn_layer_forward` as graph builder
+
+Full-attn has q/k norm + RoPE + KV append + sigmoid_gate as CPU
+host-bounces inside the layer. Two routing options:
+
+**(a) Keep host bounces inline.** The graph builder *runs* CPU
+steps as it goes — push Ops up to the boundary, execute that
+sub-graph, do CPU work, build more Ops. Equivalent to today's
+commit shape but with Op-typed dispatch. Cleanest path for
+session 7.
+
+**(b) GPU port** q/k norm + RoPE + KV append + sigmoid_gate first
+— new kernels eliminate the bounces. Session 8 work.
+
+Recommend **(a)** — keeps session 7 focused on shape.
 
 **Checkpoint:** canary 9/9 with both paths through Graph.
 
-### S7-5: Refactor `step_internal_batched_gqa`
+### S7-7: Refactor `step_internal_batched_gqa` as two-phase
 
-Two-phase graph: pre-MoE → commit → readback routing → CPU
-bucket-build → MoE+combine → commit.
+Producer is now fully `B: Backend`-generic. Orchestrator builds
+pre-MoE Graph → `backend.execute(&graph_a)` → routing readback
++ CPU bucket build → MoE Graph → `backend.execute(&graph_b)`.
 
-This is where commits drop from ~100/chunk to ~2/chunk for
-linear-attn layers, ~5/chunk for full-attn (because of host
-bounces — until S7-δ/ε).
+**Checkpoint:** canary 9/9 + warm directional bench. Commits/chunk
+should drop substantially for linear-attn layers. Mike's
+hypothesis: at least a small bump from cross-layer pipelining.
 
-**Checkpoint:** canary 9/9 + warm bench. Expect modest perf bump
-from cross-layer pipelining.
+### S7-8: Graph::dump() polish + commit cleanly
 
-### S7-6: Graph::dump() polish + commit
+Make `dump()` produce a useful debug string (one line per op with
+label + key arg summary — `BufId`s, dims, eps). Commit the
+session as several coherent commits at each checkpoint above, or
+one big squash — caller's choice at session close.
 
-Make `dump()` produce something useful for diffing builds. Probably
-just one line per op with label + key arg summary. Commit the
-session's work as a single coherent diff (or several smaller
-commits per checkpoint above).
-
-### S7-7 (if time): GPU full-attn ops (S7-δ/ε from earlier draft)
+### S7-9 (stretch): GPU full-attn ops
 
 `rms_norm_per_head_n_tokens` + `rope_apply_n_tokens` +
 `kv_cache_append_n_tokens` + `sigmoid_gate_n_tokens`. Each ~30
-lines of Metal. Full-attn collapses into the pre-MoE graph.
+lines of Metal + ~30 lines of CPU oracle + a per-op diff test.
+Full-attn's pre-MoE collapses into a single Graph.
 
-### S7-8 (stretch): Parallel encode
+### S7-10 (stretch): Parallel encode
 
-`Backend::encode_graph_partitioned(graph, queue, n_cb=2)`.
-Cmdbufs enqueued in order, single commit_and_wait at the end.
+Override `Backend::encode_graph` on MetalBackend to encode into
+n_cb cmdbufs via rayon. Apple's empirical sweet spot is
+`n_cb=1..2`. Probably session 8 unless S7-9 lands quickly.
 
 ## Bounded op vocabulary (locked)
 
@@ -557,13 +848,15 @@ Target post-session-7:
 
 ## Forward look (post-session 7)
 
-- **Session 8:** S7-7 (GPU full-attn ops) + S7-8 (parallel encode).
-- **Session 9+:** GPU bucket build (S7-η) if profile flags
+- **Session 8:** GPU full-attn ops (S7-9) + parallel encode
+  (S7-10). Pre-MoE Graph fully GPU-resident for both paths.
+- **Session 9+:** GPU bucket build if profile flags routing
   readback as the new pole. Otherwise kernel-efficiency work
-  (FlashAttention SDPA, persistent chunk buffers).
+  (FlashAttention-style SDPA, persistent chunk buffers).
 - **Session N (later):** when CoreML/CUDA contact happens, add a
-  second `Backend` impl. The producer side doesn't change at all
-  — that's the entire point.
+  third `Backend` impl. The producer side doesn't change at all
+  — that's the entire point. CpuBackend stays in tree as the
+  cross-backend diff oracle.
 
 ## Files where context lives
 
