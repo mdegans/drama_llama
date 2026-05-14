@@ -18,6 +18,36 @@
 prefill tok/s. The commit reduction is a corollary of getting the
 shape right. Multi-session OK. One step at a time.
 
+**Scope discipline (Mike, 2026-05-14, immediately after the
+above):**
+
+> I'm not arguing we re-implement GGML and all the kernels for
+> all the backends — just what we need for the models we need on
+> the backends we're using. Reason for at least some of this is,
+> as fast as llama.cpp is, it's not super stable and the public
+> api changes a lot.
+
+Two consequences:
+
+1. **No general-purpose graph compiler.** Don't generalise the
+   op set beyond what the actual models call. Today: Qwen3-A3B
+   (GQA + linear-attn) and Cogito-V2 (MLA). The op vocabulary is
+   *bounded by these*: rms_norm (per-token + per-head + gated),
+   matvec (4-bit / 8-bit / bf16, single + n_tokens), residual_add,
+   swiglu, sdpa (causal-tiled + per-token), conv1d_step, the
+   linear-attn recurrent kernels, moe_router, moe permute-fuse,
+   moe combine. Maybe ~20 op kinds total. The eventual enum-Op
+   variant set is small.
+
+2. **llama.cpp's API churn is a real motivator, not just future
+   backend portability.** Insulating our forward pass from
+   llama.cpp behind the Graph layer reduces our exposure to their
+   upstream changes. We already maintain `llama-cpp-sys` against
+   their moving target; the Graph layer means our high-level
+   model code doesn't have to track GGML changes the same way.
+   This is a present-tense maintenance win, not just future-
+   tense portability.
+
 ## Why `Graph<'a>` is the right scaffolding
 
 Three properties we want:
@@ -343,6 +373,14 @@ that will refactor cleanly *into* this shape. The closure-Vec
 phase is the "shape verification" phase — once we have the
 dispatch list in Vec form, lowering to typed Ops is a search-and-
 replace plus some buffer ID plumbing.
+
+**Bounded op set.** The enum will have ~20 variants, sized to the
+models we actually run (Qwen3-A3B GQA + linear-attn, Cogito-V2
+MLA). Not a general-purpose graph compiler. Each variant maps to
+a small kernel set per backend — for CoreML, most variants
+will lower to MPSGraph primitive ops; for CUDA (if we get there),
+to cuBLAS/CUTLASS calls or hand-written kernels. The scope stays
+*model-driven*, not framework-driven.
 
 Critical: the closure capture pattern in S7-β should not capture
 anything that *couldn't* be represented as a typed enum field. If
