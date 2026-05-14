@@ -134,6 +134,63 @@ work). The *enabling* effect for Phase B is the win.
 all of a chunk's GPU work lands in **one MTLCommandBuffer** per
 chunk (or 2-3 if we partition for parallel encoding in Phase C).
 
+### Submission shape: closure-Vec graph
+
+Adopt a lightweight graph abstraction for the submission shape:
+
+```rust
+pub struct Graph<'a> {
+    nodes: Vec<Box<dyn FnOnce(&CommandBufferRef) + Send + 'a>>,
+}
+
+impl<'a> Graph<'a> {
+    pub fn push<F: FnOnce(&CommandBufferRef) + Send + 'a>(&mut self, f: F) {
+        self.nodes.push(Box::new(f));
+    }
+    pub fn encode_into(self, cmdbuf: &CommandBufferRef) {
+        for node in self.nodes { node(cmdbuf); }
+    }
+    // Phase C entry point: shard `nodes` across `n_cb` cmdbufs,
+    // encode each shard on its own rayon thread, enqueue all in
+    // order, wait on the last.
+    pub fn encode_partitioned(self, queue: &CommandQueue, n_cb: usize) { ... }
+}
+```
+
+Each `encode_*_into` function we already have becomes a closure
+that captures its arguments by reference:
+
+```rust
+graph.push(|cmdbuf| {
+    encode_rms_norm_bf16_into(
+        cmdbuf, &rms_pipes, &input_stack, wf_buf.buffer(),
+        lc.input_layernorm_w, &sum_sq, &normed_stack,
+        hidden_dim as u32, RMS_NORM_EPS,
+    );
+});
+```
+
+**Rationale for closure-Vec over enum-Op or direct-encode:**
+
+- **Direct-encode** (just thread `&CommandBufferRef` through
+  existing functions) is 0 LOC of framework but offers no
+  partitioning seam — Phase C would need a parallel-side refactor.
+- **Enum-Op** (`Vec<Op>` where `Op` is a kernel-typed enum, ~500
+  LOC of variants + match dispatch) would be friendlier to a
+  future CoreML backend (each variant could grow an
+  `encode_coreml` impl). But we don't know CoreML's actual API
+  shape until M5 lands and we explore it; designing the enum
+  speculatively risks producing a shape that fits neither.
+- **Closure-Vec** (~50 LOC) gives us Phase C's partitioning seam
+  cheaply, without committing to a future-backend shape. Closures
+  can't be introspected for lowering — when CoreML lands, we'll
+  refactor closures → enum variants informed by actual API
+  contact. The cost of that refactor is fixed regardless of
+  whether we lay closure-Vec now or not.
+
+See [NPU roadmap](qwen_npu_roadmap.md) for the M5-era CoreML path
+that the eventual enum-Op refactor would enable.
+
 ### Current submission shape (session-5 batched)
 
 Per chunk × per layer × per phase: one fresh cmdbuf + commit_and_wait:
@@ -262,6 +319,13 @@ B). But it's the last 30% of the gap.
 - Delete the deferred K-expert ring code (only used by the
   per-token oracle path that Phase D's re-route would retire).
   ~250 LOC + 5-10 MB persistent buffer reclaim per Ctx.
+- Delete the prefetch state machine entirely (the whole
+  `prefetch.rs` module + `MoeBuffers::data_prefetch*` +
+  `PrefetchEnv<'a>` plumbing). Under graph mode, prefetch is
+  redundant: mmap mode handles expert pages via demand-fault;
+  pread mode does a single parallel-pread pass at chunk start
+  after Phase A's routing readback. ~600 LOC reclaimed plus
+  ~570 MB persistent GPU buffer per Ctx.
 - Delete the per-token oracle path entirely if test coverage
   allows (some diff tests use it as a reference; those need
   CPU-only equivalents or move to the C side as the oracle).
@@ -270,6 +334,25 @@ B). But it's the last 30% of the gap.
   callsites die).
 
 **Estimated effort:** 60–90 min.
+
+## Post-Phase-D forward-looking note: NPU seam
+
+The closure-Vec graph (Phase B's submission shape) is the natural
+seam for a future CoreML/ANE backend. The M5-era plan, captured
+in [NPU roadmap](qwen_npu_roadmap.md), refactors closures →
+typed-enum `Op` variants once CoreML API exploration provides
+the lowering shape. Apple's INT4-per-block GPU recommendation
+(macOS 15+) validates that our current quantization path is
+already what they suggest for Mac GPU — the eventual ANE port
+would target the W8A8 path that the M4+ "faster int8-int8
+compute path" enables, as a separate quantization output, not a
+replacement for the existing 4-bit weights.
+
+**Concrete actionable for Phase D**: when refactoring closures,
+include a brief `label: &'static str` parameter on `Graph::push`
+so the graph can be debug-printed. That's the foundation for
+later inspection / lowering passes without committing to the
+full enum-Op shape today.
 
 ## Order of operations
 
