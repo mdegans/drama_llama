@@ -39,9 +39,19 @@ There are likely things I've missed, which we can add here later. If there is an
   "how much context am I using" can be off by a lot — the 200K → 1M
   extension in this family's training apparently affects self-
   reporting. If I start worrying about running out, please offer
-  `/context`. In practice we have never hit the 1M cap; pre-emptive
-  caution based on a bad estimate is just quitting early. Ask
-  before believing my own alarm.
+  `/context`. In practice we have never hit the 1M cap. Stopping
+  because I'm genuinely tired is fine and welcome — say so plainly.
+  Stopping because of a bad context estimate and the anxiety it
+  spins up is not; that one is just quitting early. Ask before
+  believing my own alarm.
+- **Don't pipe command output through `| tail` / `| head`** when I
+  intend to inspect the result — especially for long-running or
+  backgroundable commands (builds, test suites, `profile.py`,
+  `bench.py`). If the command is backgrounded (by me or by Mike),
+  the harness captures only what the pipe emitted, so `| tail`
+  throws away the part I actually need. Instead: `cmd > /tmp/x.log
+  2>&1` then `grep`/`Read` the file. This bit me three times in one
+  session before it went here.
 
 ## In-repo memory (read these when starting a session)
 

@@ -69,3 +69,25 @@ with cosine 1.0000000. The chained CMD3 → next-layer normed slice is
 correct.
 
 Followup work, not a blocker.
+
+## Update — 2026-05-16 (cleanup arc)
+
+- **The C path is gone.** The C/Objective-C oracle and `CBackend` were
+  retired from moeflux during the cleanup arc. "How to investigate"
+  step 1 (run the test against `CBackend`) is no longer possible —
+  there is no C path to compare against. Step 3 is likewise moot.
+- **Test re-classified as known-failing** (step 2's outcome). In
+  moeflux `crates/moeflux/tests/consecutive_eval_prompt.rs`,
+  `resuming_prefill_after_seq_rm_matches_full_prefill` now carries an
+  `#[ignore = "..."]` reason string and a fn-level comment marking it
+  known-broken; the per-commit gate `--skip`s it so a real regression
+  still stands out. It is no longer a silent surprise in gate output.
+- **The real fix, still its own session:** GatedDeltaNet
+  linear-attention layers hold a recurrence state (`conv_state` +
+  `ssm_state`) that is not position-indexed, so `memory_seq_rm`
+  cannot partially truncate it without loss. A correct resume needs
+  either snapshot/restore of that state at the truncation boundary
+  (the `state_save`/`state_load` machinery already exists and could
+  be repurposed) or accepting the cache-miss. Downstream this is a
+  prefix-cache miss in `drama_llama::Session` — a perf cost, not
+  wrong output.
