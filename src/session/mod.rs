@@ -577,6 +577,19 @@ impl Session<MoefluxBackend> {
     pub fn reset_prefetch_stats(&mut self) {
         self.engine.decoder.reset_prefetch_stats();
     }
+
+    /// Zero the moeflux per-label cmdbuf timing stats — call before a
+    /// measured prefill. See [`crate::MoefluxDecoder::reset_cmdbuf_stats`].
+    pub fn reset_cmdbuf_stats(&self) {
+        self.engine.decoder.reset_cmdbuf_stats();
+    }
+
+    /// Log the moeflux per-label cmdbuf timing breakdown. Most useful
+    /// under `MOEFLUX_PROFILE_PER_OP`. See
+    /// [`crate::MoefluxDecoder::log_cmdbuf_stats`].
+    pub fn log_cmdbuf_stats(&self) {
+        self.engine.decoder.log_cmdbuf_stats();
+    }
 }
 
 impl<B: Backend> Session<B> {

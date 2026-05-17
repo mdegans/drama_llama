@@ -159,6 +159,44 @@ impl MoefluxDecoder {
         self.prefetch_stats = PrefetchStats::default();
         self.ctx.reset_prefetch_stats();
     }
+
+    /// Zero the moeflux per-label cmdbuf timing stats — call before a
+    /// measured prefill so the breakdown is scoped to it.
+    pub fn reset_cmdbuf_stats(&self) {
+        self.ctx.reset_cmdbuf_stats();
+    }
+
+    /// Log the moeflux per-label cmdbuf timing breakdown, rows sorted
+    /// by total CPU wait descending (dominant work first). Most useful
+    /// under `MOEFLUX_PROFILE_PER_OP`, where each [`Op`] commits as its
+    /// own labeled cmdbuf so the labels are per-Op. A no-op when no
+    /// labeled commit has run.
+    pub fn log_cmdbuf_stats(&self) {
+        let mut stats = self.ctx.cmdbuf_stats();
+        if stats.is_empty() {
+            return;
+        }
+        stats.sort_by(|a, b| b.1.cpu_wait_ns.cmp(&a.1.cpu_wait_ns));
+        let total_ns: u64 = stats.iter().map(|(_, s)| s.cpu_wait_ns).sum();
+        tracing::info!(
+            event = "moeflux_cmdbuf_stats",
+            labels = stats.len(),
+            total_ms = total_ns as f64 / 1e6,
+        );
+        for (label, s) in &stats {
+            tracing::info!(
+                event = "moeflux_cmdbuf_op",
+                label,
+                count = s.count,
+                wait_ms = s.cpu_wait_ns as f64 / 1e6,
+                pct = if total_ns > 0 {
+                    100.0 * s.cpu_wait_ns as f64 / total_ns as f64
+                } else {
+                    0.0
+                },
+            );
+        }
+    }
 }
 
 impl Decoder for MoefluxDecoder {

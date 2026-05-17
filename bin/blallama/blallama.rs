@@ -632,6 +632,14 @@ mod moeflux_run {
         // fresh request needs a reset to read out a per-request rate.
         session.reset_prefetch_stats();
 
+        // Per-Op cmdbuf timing breakdown, gated on the same env that
+        // makes moeflux commit each Op as its own labeled cmdbuf.
+        let profile_per_op =
+            std::env::var_os("MOEFLUX_PROFILE_PER_OP").is_some();
+        if profile_per_op {
+            session.reset_cmdbuf_stats();
+        }
+
         // See llama-cpp variant + `is_reusable_after` doc-comment for
         // the reuse-vs-reload rationale.
         let (session, result, elapsed) = spawn_blocking_or_bust(move || {
@@ -641,6 +649,9 @@ mod moeflux_run {
         })
         .await;
         let prefetch_stats = session.prefetch_stats();
+        if profile_per_op {
+            session.log_cmdbuf_stats();
+        }
 
         if let Some(bus) = &state.probe_bus {
             let _ = bus.send(StreamProbeMsg::SessionEnd { id });
