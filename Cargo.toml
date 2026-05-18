@@ -118,7 +118,7 @@ json-schema = ["dep:schemars", "misanthropic/json-schema"]
 # and the HuggingFace `tokenizers` crate for Rust-side tokenization.
 # Exactly one of `moeflux-model-*` must be enabled alongside — moeflux
 # is compile-time variant-selected.
-moeflux = ["dep:moeflux", "dep:tokenizers"]
+moeflux = ["dep:moeflux", "dep:tokenizers", "dep:tracing"]
 moeflux-model-qwen3-5-a17b = ["moeflux", "moeflux/model-qwen3-5-a17b"]
 moeflux-model-qwen3-6-35b-a3b = ["moeflux", "moeflux/model-qwen3-6-35b-a3b"]
 # Cogito-V2-Preview-671B (DeepSeek-V3 architecture). MLA attention,

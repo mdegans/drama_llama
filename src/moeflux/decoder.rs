@@ -31,6 +31,13 @@ pub enum MoefluxError {
     /// buffer, or underlying FFI error).
     #[error("moeflux: state save/load failed")]
     StateFailed,
+    /// The moeflux library was built for a different model than the
+    /// weights it was pointed at (`moeflux-model-*` feature
+    /// mismatch). The string carries moeflux's descriptive
+    /// diagnostic, including the rebuild remedy. Surfaced cleanly at
+    /// open time rather than as an opaque prefill panic.
+    #[error("{0}")]
+    ModelMismatch(String),
 }
 
 impl From<MfError> for MoefluxError {
@@ -41,6 +48,11 @@ impl From<MfError> for MoefluxError {
             MfError::EvalFailed => Self::EvalFailed,
             MfError::StateFailed | MfError::StateBufferTooSmall { .. } => {
                 Self::StateFailed
+            }
+            MfError::ModelMismatch { expected, detail } => {
+                Self::ModelMismatch(format!(
+                    "moeflux: binary built for {expected} — {detail}"
+                ))
             }
         }
     }
