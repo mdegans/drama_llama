@@ -6,16 +6,15 @@ use crate::{
 use std::{path::PathBuf, sync::Mutex};
 
 use llama_cpp_sys_3::{
-    ggml_log_callback, ggml_log_level, ggml_log_set,
     ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED, llama_backend_free,
     llama_backend_init, llama_context, llama_context_params, llama_decode,
     llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_AUTO,
     llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED,
     llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED, llama_free,
     llama_get_embeddings_ith, llama_get_logits_ith, llama_get_memory,
-    llama_log_set, llama_memory_clear, llama_memory_seq_add,
-    llama_memory_seq_cp, llama_memory_seq_div, llama_memory_seq_keep,
-    llama_memory_seq_pos_max, llama_memory_seq_rm, llama_n_batch, llama_n_ctx,
+    llama_memory_clear, llama_memory_seq_add, llama_memory_seq_cp,
+    llama_memory_seq_div, llama_memory_seq_keep, llama_memory_seq_pos_max,
+    llama_memory_seq_rm, llama_n_batch, llama_n_ctx,
     llama_new_context_with_model, llama_numa_init, llama_perf_context,
     llama_perf_context_data, llama_perf_context_reset, llama_pos, llama_seq_id,
     llama_set_n_threads, llama_state_get_data, llama_state_get_size,
@@ -27,39 +26,6 @@ use thiserror::Error;
 /// Global engine count. When this drops to 0, the llama backend is freed in
 /// the last [`LlamaCppDecoder`]'s `Drop` implementation.
 pub(super) static ENGINE_COUNT: Mutex<usize> = Mutex::new(0);
-
-/// Silence `llama.cpp` + `ggml` log output.
-///
-/// Installs a no-op callback on both loggers. llama.cpp and ggml maintain
-/// separate log sinks — Metal pipeline compile chatter comes from the ggml
-/// side, model-load prose from the llama side — so both need to be hushed
-/// for quiet generation.
-///
-/// Idempotent. Safe to call before or after creating an
-/// [`crate::Engine`]. Call [`restore_default_logs`] to undo.
-pub fn silence_logs() {
-    unsafe {
-        llama_log_set(Some(discard_log), std::ptr::null_mut());
-        ggml_log_set(Some(discard_log), std::ptr::null_mut());
-    }
-}
-
-/// Restore default (stderr) logging. Inverse of [`silence_logs`].
-pub fn restore_default_logs() {
-    unsafe {
-        llama_log_set(None, std::ptr::null_mut());
-        ggml_log_set(None, std::ptr::null_mut());
-    }
-}
-
-/// No-op log callback used by [`silence_logs`]. Matches the
-/// `ggml_log_callback` / `llama_log_set` C signature.
-unsafe extern "C" fn discard_log(
-    _level: ggml_log_level,
-    _msg: *const std::os::raw::c_char,
-    _user_data: *mut std::ffi::c_void,
-) {
-}
 
 /// Possible errors when creating a new [`crate::Engine`] or
 /// [`LlamaCppDecoder`].
@@ -261,21 +227,6 @@ impl LlamaCppDecoder {
     /// Reset performance information.
     pub fn reset_timings(&mut self) {
         unsafe { llama_perf_context_reset(self.context) };
-    }
-
-    /// Set the llama.cpp log callback. Does NOT touch the ggml logger
-    /// — use [`silence_logs`] to hush both at once.
-    pub fn set_log_callback(
-        &mut self,
-        callback: ggml_log_callback,
-        callback_data: Option<*mut std::ffi::c_void>,
-    ) {
-        unsafe {
-            llama_log_set(
-                callback,
-                callback_data.unwrap_or(std::ptr::null_mut()),
-            );
-        }
     }
 
     /// Set the number of threads used for generation and batch processing.

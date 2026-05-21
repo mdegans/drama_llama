@@ -9,10 +9,7 @@ pub mod decoder;
 pub mod engine;
 pub mod model;
 
-pub use decoder::{
-    restore_default_logs, silence_logs, DecodeError, FlashAttention,
-    LlamaCppDecoder, NewError,
-};
+pub use decoder::{DecodeError, FlashAttention, LlamaCppDecoder, NewError};
 pub use engine::LlamaCppEngine;
 pub use model::{llama_quantize, LlamaCppModel};
 

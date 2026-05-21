@@ -67,9 +67,16 @@ pub use output_config::{
 mod llama_cpp;
 #[cfg(feature = "llama-cpp")]
 pub use llama_cpp::{
-    llama_quantize, restore_default_logs, silence_logs, DecodeError,
-    FlashAttention, LlamaCppBackend, LlamaCppDecoder, LlamaCppEngine,
-    LlamaCppModel, NewError,
+    llama_quantize, DecodeError, FlashAttention, LlamaCppBackend,
+    LlamaCppDecoder, LlamaCppEngine, LlamaCppModel, NewError,
+};
+
+#[cfg(feature = "llama-cpp")]
+pub mod log;
+#[cfg(feature = "llama-cpp")]
+pub use log::{
+    clear_log_callback, restore_default_logs, set_log_callback, silence_logs,
+    LogLevel,
 };
 
 #[cfg(all(feature = "moeflux", target_os = "macos"))]

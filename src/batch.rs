@@ -161,6 +161,11 @@ impl Batch {
             if (i as usize) >= self.len() {
                 None
             } else {
+                // SAFETY: `batch.embd` is a `capacity * embd_len` f32
+                // buffer owned by llama.cpp; `i < self.len() <=
+                // capacity()` is checked above, so the
+                // `i * embd_len`..`(i+1) * embd_len` window is in
+                // bounds.
                 Some(unsafe {
                     std::slice::from_raw_parts(
                         self.batch.embd.add(i * self.embd_len()),
@@ -183,6 +188,8 @@ impl Batch {
             if (i as usize) >= self.len() {
                 None
             } else {
+                // SAFETY: see [`Self::embd`]; `&mut self` plus the
+                // bounds check makes the window unique-and-in-bounds.
                 Some(unsafe {
                     std::slice::from_raw_parts_mut(
                         self.batch.embd.add(i * self.embd_len()),
@@ -278,6 +285,12 @@ impl Batch {
         self.tokens_mut().unwrap()[i] = token;
         self.pos_mut()[i] = pos as i32;
 
+        // SAFETY: `batch.seq_id` is a length-`capacity` array of
+        // `*mut llama_seq_id` allocated by `llama_batch_init`, and
+        // each `seq_id[k]` row points to a length-`n_seq_max` buffer.
+        // `self.len()` was just incremented to `i + 1`, and the
+        // capacity check above ensures `i < capacity()`. `&mut self`
+        // gives us unique access to both arrays.
         let sequences = unsafe {
             std::slice::from_raw_parts_mut(self.batch.seq_id, self.len())
         };
@@ -296,10 +309,6 @@ impl Batch {
                 // than i32::MAX
                 self.n_seq_mut()[i] = seq_ids.len().try_into().unwrap();
 
-                // Safety: This is safe because we control construction of the
-                // batch and we know that the sequence ids are valid for the
-                // lifetime of the batch. We also know that len is valid because
-                // the only way it changes is through our accessor methods.
                 sequence[..seq_ids.len()].copy_from_slice(seq_ids);
                 sequence[seq_ids.len()..].fill(0);
             }

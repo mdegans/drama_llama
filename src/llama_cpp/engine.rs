@@ -1,21 +1,21 @@
 use crate::{
     llama_cpp::{
         decoder::{
-            silence_logs, DecodeError, FlashAttention, LlamaCppDecoder,
-            NewError,
+            DecodeError, FlashAttention, LlamaCppDecoder, NewError,
         },
         LlamaCppBackend,
     },
+    log::silence_logs,
     Batch, Engine, LlamaCppModel,
 };
 
 use std::path::PathBuf;
 
 use llama_cpp_sys_3::{
-    ggml_log_callback, llama_context, llama_context_default_params,
-    llama_context_params, llama_model_default_params, llama_model_params,
-    llama_perf_context_data, llama_seq_id, llama_supports_gpu_offload,
-    llama_supports_mlock, llama_supports_mmap, llama_token,
+    llama_context, llama_context_default_params, llama_context_params,
+    llama_model_default_params, llama_model_params, llama_perf_context_data,
+    llama_seq_id, llama_supports_gpu_offload, llama_supports_mlock,
+    llama_supports_mmap, llama_token,
 };
 
 /// Convenience alias for the llama.cpp-backed pair. Use
@@ -154,19 +154,10 @@ impl LlamaCppEngine {
         self.decoder.reset_timings()
     }
 
-    /// Set the llama.cpp log callback. Does NOT touch the ggml logger
-    /// — use [`silence_logs`] to hush both at once.
-    pub fn set_log_callback(
-        &mut self,
-        callback: ggml_log_callback,
-        callback_data: Option<*mut std::ffi::c_void>,
-    ) {
-        self.decoder.set_log_callback(callback, callback_data)
-    }
-
     /// Silence both llama.cpp and ggml log output for the remainder of
-    /// this process. Convenience wrapper around [`silence_logs`] that
-    /// returns `self` for chaining on construction, e.g.:
+    /// this process. Convenience wrapper around
+    /// [`crate::log::silence_logs`] that returns `self` for chaining on
+    /// construction, e.g.:
     ///
     /// ```no_run
     /// # use drama_llama::LlamaCppEngine;
