@@ -168,6 +168,16 @@ name = "blallama"
 path = "bin/blallama/blallama.rs"
 required-features = ["axum", "cli", "toml"]
 
+# Coherence-test worker for the moeflux engine — spawned by
+# `tests/moeflux_coherence.rs` once per `(prompt_id, MOEFLUX_MOE_GATHER_ID)`
+# pair. Greedy-decodes 30 steps and emits per-step top-50 logits on
+# stdout as JSONL. Bin (not example) so the orchestrator test can
+# discover it via `env!("CARGO_BIN_EXE_moeflux_coherence_decode")`.
+[[bin]]
+name = "moeflux_coherence_decode"
+path = "bin/moeflux_coherence_decode.rs"
+required-features = ["moeflux-model-qwen3-6-35b-a3b"]
+
 [package.metadata.docs.rs]
 # `cuda` will break the build on platforms without it, and it doesn't change the
 # docs anyway.
