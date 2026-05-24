@@ -74,27 +74,21 @@ for the current arc:
   callback-on-Engine probe-mode hook when it lands.
 - [`moeflux_disk_convention.md`](.claude/memory/moeflux_disk_convention.md)
   — `parent/{mlx,artifacts,root}/` layout for `MoefluxEngine::from_path`.
+- [`cogito_v2_architecture.md`](.claude/memory/cogito_v2_architecture.md)
+  — DeepSeek-V3 arch reference: MLA dims, noaux_tc routing,
+  YaRN math, tensor names, on-disk targets. Durable kernel-work
+  reference for when the Cogito-V2 arc resumes.
 - [`cogito_v2_landing_state.md`](.claude/memory/cogito_v2_landing_state.md)
   — Cogito-V2 671B CPU MLA + MoE forward green; first-run produced
-  coherent English. Next slice is GPU MLA.
-- [`cogito_v2_gpu_mla_plan.md`](.claude/memory/cogito_v2_gpu_mla_plan.md)
-  — Plan-of-record for the GPU MLA port, drafted at the close of
-  the CPU-landing session. Folded MLA form, MlaKvCacheGpu, three
-  Metal kernels (q', SDPA inner, V_combine ⋅ kv_b_proj_V), diff
-  oracle = the CPU path.
-- [`cogito_v2_gpu_mla_landed.md`](.claude/memory/cogito_v2_gpu_mla_landed.md)
-  — Outcome memo: hybrid GPU MLA + CPU MoE forward green,
-  bit-exact argmax match on BOS-at-pos-0 smoke. What's still
-  hybrid (full-GPU MoE for ~1 tok/s), what's untested (long-gen
-  stability, warm-token perf), what survived as architecture
-  conventions (Option-of-Buffer, precise::cos/sin, 32 KB tg-mem
-  cap).
-- [`cogito_v2_full_gpu_plan.md`](.claude/memory/cogito_v2_full_gpu_plan.md)
-  — Plan-of-record for next session: full-GPU forward (dense MLP
-  GPU + GPU MoE with `_unscaled` shared-expert tail + deferred-ring
-  integration). Six phases with concrete file pointers and CPU
-  oracle as diff target throughout. Snapshot v2 (MLA-aware wire
-  format) parallelizable, blocks Council prompt caching.
+  coherent English. GPU MLA + full-GPU shipped in subsequent
+  sessions (paused since 2026-04-30 — moeflux Qwen3 perf work
+  took priority).
+
+The live arc has moved to **moeflux** — see
+`~/Projects/moeflux/.claude/memory/` for prefill / kernel /
+hardening session memos (most recent: `prefill_residency_set_landed.md`,
+`moeflux_hardening_session_c_landed.md`, `kernel_arc_session13_landed.md`,
+`qwen_graph_mode_session12_landed.md`).
 
 Older but still load-bearing:
 
@@ -104,8 +98,9 @@ Older but still load-bearing:
   — diagnosis trace; rep-penalty was the dominant cause.
 - [`grammar_reserved_token_loop.md`](.claude/memory/grammar_reserved_token_loop.md)
   — Qwen3 reserved-token-mask fix.
-- [`future_work_*.md`](.claude/memory/) — block predictor, flash-moe
-  backend, grammar speculation, Rust audit. Things to come back to.
+- [`future_work_*.md`](.claude/memory/) — block predictor, grammar
+  speculation, Rust audit, prefill progress callback, others.
+  Things to come back to.
 
 ## Build & Test Commands
 

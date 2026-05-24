@@ -8,3 +8,4 @@ model.sampling.toml
 /prefill_prompt.txt
 /__pycache__/
 /fuzz-corpus//prefill_prompt_long.txt
+screenshots/
