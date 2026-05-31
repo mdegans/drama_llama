@@ -11,3 +11,4 @@ model.sampling.toml
 /prefill_prompt_long.txt
 screenshots/
 .claude/docs/*.pdf
+.DS_Store
