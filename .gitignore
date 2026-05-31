@@ -9,3 +9,4 @@ model.sampling.toml
 /__pycache__/
 /fuzz-corpus//prefill_prompt_long.txt
 screenshots/
+.claude/docs/*.pdf
