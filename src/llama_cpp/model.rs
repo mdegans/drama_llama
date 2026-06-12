@@ -30,6 +30,14 @@ use std::{
 /// # Panics
 /// * If the token's piece is not valid UTF-8.
 fn token_to_piece(token: llama_token, model: &LlamaCppModel) -> String {
+    // Out-of-range ids (notably LLAMA_TOKEN_NULL = -1, returned by
+    // vocab accessors like `eot()` when the model lacks the token)
+    // make llama.cpp throw a C++ exception, which aborts the process
+    // at the FFI boundary. Guard here so every piece-conversion
+    // caller is covered. Observed with gemma-4 (no EOT token).
+    if token < 0 || token >= model.n_vocab() {
+        return format!("[invalid token {token}]");
+    }
     let mut buf = vec![0; 8];
     token_to_piece_ref(token, model, &mut buf);
 
