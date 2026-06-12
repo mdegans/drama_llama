@@ -141,16 +141,13 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
         round1_cache_read.unwrap_or(0),
     );
 
-    // Find the tool_use block in the response — needed for round 2's
+    // The response's tool_use (if any) — needed for round 2's
     // re-rendering. If the model produced text only, synthesize a
     // dummy ToolUse so we still exercise the hash-cache code path.
-    let blocks_round1: Vec<Block> = round1_resp.inner.content.0.clone();
-    let mut tool_use = blocks_round1
-        .into_iter()
-        .find_map(|b| match b {
-            Block::ToolUse { call } => Some(call),
-            _ => None,
-        })
+    let mut tool_use = round1_resp
+        .inner
+        .tool_use()
+        .cloned()
         .unwrap_or_else(|| ToolUse {
             id: Cow::Borrowed("synthetic_call_1"),
             name: Cow::Borrowed("count_letters"),
