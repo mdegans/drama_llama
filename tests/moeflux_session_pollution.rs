@@ -241,7 +241,8 @@ fn partial_hit_output_matches_fresh_session() {
 
     // Cached run: A primes cache with turn1, then runs turn2 hitting
     // the partial-hit code path.
-    let mut session_a = build_session();
+    let mut session_a =
+        build_session().with_sampling([drama_llama::SamplingMode::Greedy]);
     let _warm = session_a
         .complete_text(&turn1)
         .expect("complete_text turn1 (cached session)");
@@ -250,7 +251,9 @@ fn partial_hit_output_matches_fresh_session() {
         .expect("complete_text turn2 (cached session)");
 
     // Fresh ground-truth run: B has no cache, runs turn2 directly.
-    let mut session_b = build_session().with_prefix_cache(false);
+    let mut session_b = build_session()
+        .with_prefix_cache(false)
+        .with_sampling([drama_llama::SamplingMode::Greedy]);
     let fresh_turn2 = session_b
         .complete_text(&turn2)
         .expect("complete_text turn2 (fresh session)");
