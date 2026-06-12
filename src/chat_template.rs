@@ -1147,8 +1147,12 @@ mod tests {
         assert!(out.contains("Hello world"));
     }
 
-    /// End-to-end: render with the real Llama 3.1 chat template from the
-    /// test model and feed the result into the engine.
+    /// End-to-end: render with the real chat template embedded in
+    /// `models/model.gguf` and sanity-check the output. Assertions are
+    /// template-agnostic: templates differ on whether BOS appears in
+    /// the rendered text (Llama 3.1 emits it; Qwen's ChatML does not),
+    /// but every chat template must render the message contents and an
+    /// assistant generation header.
     #[test]
     #[ignore = "requires model"]
     fn chat_template_from_real_model() {
@@ -1163,11 +1167,13 @@ mod tests {
         let out = tmpl
             .render(&simple_prompt(), true)
             .expect("real template should render");
-        // The Llama 3.1 template always emits the BOS piece, so we know
-        // the BOS string will appear in the output.
         assert!(
-            out.contains(tmpl.bos_token()),
-            "rendered prompt should contain BOS: {out}"
+            out.contains("You are helpful."),
+            "rendered prompt should contain the system text: {out}"
+        );
+        assert!(
+            out.contains("Hi!"),
+            "rendered prompt should contain the user text: {out}"
         );
         // And it should end with the assistant generation header.
         assert!(
@@ -1176,10 +1182,12 @@ mod tests {
         );
     }
 
-    /// Exercise the tools branch of the real Llama 3.1 template: pass a
-    /// single function definition, render, and assert the rendered
-    /// prompt includes the function name, schema, date, and ipython
-    /// environment header.
+    /// Exercise the tools branch of the real template in
+    /// `models/model.gguf`: pass a single function definition, render,
+    /// and assert the rendered prompt includes the function name and
+    /// schema. Date and ipython-header checks only apply when the
+    /// template itself supports them (Llama 3.1 does; Qwen's ChatML
+    /// has neither).
     #[test]
     #[ignore = "requires model"]
     fn chat_template_renders_tools_against_real_model() {
@@ -1233,18 +1241,29 @@ mod tests {
             out.contains("\"city\""),
             "schema should appear in rendered output. output:\n{out}"
         );
-        assert!(
-            out.contains("17 Apr 2026"),
-            "date_string should appear when provided. output:\n{out}"
-        );
-        assert!(
-            out.contains("Environment: ipython"),
-            "system header should include ipython env when tools present"
-        );
+        // Only templates that consume these variables can be expected
+        // to render them.
+        let source = engine
+            .model
+            .get_meta("tokenizer.chat_template")
+            .expect("model has no tokenizer.chat_template");
+        if source.contains("date_string") {
+            assert!(
+                out.contains("17 Apr 2026"),
+                "date_string should appear when provided. output:\n{out}"
+            );
+        }
+        if source.contains("ipython") {
+            assert!(
+                out.contains("Environment: ipython"),
+                "system header should include ipython env when tools present"
+            );
+        }
     }
 
     /// Render an assistant tool-call turn, confirming the template
-    /// emits Llama 3.1's JSON tool-call format.
+    /// emits a JSON tool-call shape (Llama 3.1 uses `"parameters"`,
+    /// Qwen/OpenAI-wire templates use `"arguments"`).
     #[test]
     #[ignore = "requires model"]
     fn chat_template_renders_assistant_tool_call_against_real_model() {
@@ -1288,8 +1307,8 @@ mod tests {
             "tool-call branch must include function name. output:\n{out}"
         );
         assert!(
-            out.contains("\"parameters\""),
-            "tool-call branch must include parameters. output:\n{out}"
+            out.contains("\"parameters\"") || out.contains("\"arguments\""),
+            "tool-call branch must include the call arguments. output:\n{out}"
         );
         assert!(
             out.contains("\"city\""),

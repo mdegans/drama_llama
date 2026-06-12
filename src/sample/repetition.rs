@@ -477,16 +477,14 @@ impl RepetitionOptions {
             .horizontal(|ui| {
                 let mut window = self.window_size.get();
                 let inner = ui.label("Window size")
-                    | ui.add(
-                        egui::DragValue::new(&mut window).range(1..=8192),
-                    )
-                    .on_hover_text_at_pointer(
-                        "Sliding-window size in generation steps. Only \
+                    | ui.add(egui::DragValue::new(&mut window).range(1..=8192))
+                        .on_hover_text_at_pointer(
+                            "Sliding-window size in generation steps. Only \
                          occurrences within the last N steps contribute \
                          to the penalty. Bounds the additive term so \
                          long generations don't have their logit \
                          gradient dominated.",
-                    );
+                        );
                 self.window_size = NonZeroU32::new(window.max(1)).unwrap();
                 inner
             })
@@ -861,15 +859,24 @@ mod tests {
         let tokens = vec![5_i32];
 
         // Use presence penalty so the effect is visible on first repeat.
+        // Empty ignore set: the vocab here is synthetic (ids 0..10), and
+        // the default categories resolve against the *real* model's
+        // tokenizer — whether id 5 collides with a stopword is an
+        // accident of which model.gguf is linked.
         let mut opts = RepetitionOptions {
             penalty_repeat: 1.15,
             penalty_freq: 0.0,
             penalty_present: 0.5,
+            ignored_categories: BTreeSet::new(),
             ..RepetitionOptions::default()
         };
 
+        // Two steps: `penalty_max_count` defaults to 1, meaning the
+        // penalty deliberately fires from the *second* sighting of an
+        // n-gram (the v0.8.0 anti-fact-swap tuning). One step leaves
+        // the logit untouched by design.
         let (after, _) =
-            run_penalty_steps(&logits, &tokens, &mut opts, 1, &model);
+            run_penalty_steps(&logits, &tokens, &mut opts, 2, &model);
 
         println!("=== Basic unigram penalty (presence=0.5) ===");
         for i in 0..10 {
@@ -913,10 +920,12 @@ mod tests {
         let tokens = vec![3_i32];
 
         // Frequency only — after 3 steps, count=3, so freq subtracts 3*0.1=0.3
+        // Empty ignore set: synthetic vocab; see test_repetition_penalty_basic.
         let mut freq_opts = RepetitionOptions {
             penalty_repeat: 1.0,
             penalty_freq: 0.1,
             penalty_present: 0.0,
+            ignored_categories: BTreeSet::new(),
             ..RepetitionOptions::default()
         };
         let (after_freq, _) =
@@ -927,6 +936,7 @@ mod tests {
             penalty_repeat: 1.0,
             penalty_freq: 0.0,
             penalty_present: 0.5,
+            ignored_categories: BTreeSet::new(),
             ..RepetitionOptions::default()
         };
         let (after_pres, _) =
@@ -950,17 +960,18 @@ mod tests {
         assert!(after_freq[3] < logits[3], "freq should reduce logit");
         assert!(after_pres[3] < logits[3], "presence should reduce logit");
 
-        // Frequency accumulates: step 1 subtracts 1*0.1, step 2 starts from
-        // the already-reduced logit and subtracts 2*0.1, etc. (count grows)
-        // Presence is constant per step: always subtracts 0.5.
+        // `penalty_max_count` defaults to 1, so step 1 (count=1) is
+        // exempt and the penalty fires on steps 2 and 3 only.
+        // Frequency scales with the count when it fires: 2*0.1 + 3*0.1.
+        // Presence is constant per firing step: 2 * 0.5.
         let freq_delta = (logits[3] - after_freq[3]).abs();
         let pres_delta = (logits[3] - after_pres[3]).abs();
         println!(
             "  freq total delta: {:.4}, pres total delta: {:.4}",
             freq_delta, pres_delta
         );
-        // Presence: 3 steps * 0.5 = 1.5
-        assert_approx_eq!(pres_delta, 1.5, 0.01);
+        assert_approx_eq!(freq_delta, 0.5, 0.01);
+        assert_approx_eq!(pres_delta, 1.0, 0.01);
     }
 
     #[test]

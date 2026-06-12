@@ -1019,7 +1019,7 @@ mod tests {
         assert!(got.is_none());
     }
 
-    /// End-to-end: force Llama 3.1 to make a specific tool call. The
+    /// End-to-end: force the model to make a specific tool call. The
     /// grammar constraint should make the generated text parse as
     /// exactly the expected tool call shape.
     #[cfg(feature = "llama-cpp")]
@@ -1119,9 +1119,13 @@ mod tests {
             Some("get_weather"),
             "forced output must have name == get_weather. output: {output:?}"
         );
+        // The grammar forces whatever field name the options configure
+        // (default is "arguments" since the OpenAI-wire default landed);
+        // assert against that, not a hardcoded name.
+        let field = ToolChoiceOptions::default().arguments_field;
         assert!(
-            value.get("parameters").is_some(),
-            "forced output must have a `parameters` field. output: {output:?}"
+            value.get(&*field).is_some(),
+            "forced output must have a `{field}` field. output: {output:?}"
         );
     }
 }

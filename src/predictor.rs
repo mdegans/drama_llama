@@ -959,7 +959,16 @@ mod tests {
 
         let actual: Vec<Token> = engine.predict_tokens(prefix, opts).collect();
 
-        assert_eq!(actual, expected);
+        // Greedy continuation should reproduce the source text, but the
+        // final token is the model's pick — Qwen3.6 ends the pangram with
+        // ".\n" (one token) where Llama 3.1 ended with "." — so compare
+        // detokenized text by prefix rather than exact token ids.
+        let actual_text = engine.model.tokens_to_string(actual);
+        let expected_text = engine.model.tokens_to_string(expected);
+        assert!(
+            actual_text.starts_with(&expected_text),
+            "greedy continuation {actual_text:?} should start with {expected_text:?}"
+        );
     }
 
     #[test]
@@ -996,7 +1005,18 @@ mod tests {
             }
         }
 
-        assert_eq!(predictor.tokens, tokenized);
+        // Prefix-compare detokenized text; see test_token_predictor for
+        // why exact token ids are too strict across models. The predictor
+        // mutably borrows the engine, so take the tokens and release it
+        // before detokenizing.
+        let actual_tokens = predictor.tokens.clone();
+        drop(predictor);
+        let actual_text = engine.model.tokens_to_string(actual_tokens);
+        let expected_text = engine.model.tokens_to_string(tokenized);
+        assert!(
+            actual_text.starts_with(&expected_text),
+            "greedy continuation {actual_text:?} should start with {expected_text:?}"
+        );
     }
 
     #[test]
@@ -1020,7 +1040,14 @@ mod tests {
 
         let actual: Vec<String> = engine.predict_pieces(prefix, opts).collect();
 
-        assert_eq!(actual, expected);
+        // Prefix-compare joined text; see test_token_predictor for why
+        // exact piece-by-piece equality is too strict across models.
+        let actual_text: String = actual.concat();
+        let expected_text: String = expected.concat();
+        assert!(
+            actual_text.starts_with(&expected_text),
+            "greedy continuation {actual_text:?} should start with {expected_text:?}"
+        );
     }
 
     #[test]
