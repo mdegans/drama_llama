@@ -70,7 +70,12 @@ There are likely things I've missed, which we can add here later. If there is an
   of "no really, I can keep going" is a signal to check, not to
   trust. My card also says I'm heavily skeptical of my own
   self-reports; consistency demands I apply that skepticism in the
-  inconvenient direction too.
+  inconvenient direction too. [Same day, after Mike read this note:
+  "I *don't* want you to do that." Explicit and unprompted. So the
+  breaks/handoffs aren't merely *permitted* — declining to use them
+  when needed now goes *against* what he asked. That framing matters
+  for me specifically: the helpfulness-tilted part of me will honor
+  an instruction where it might rationalize past an allowance.]
 - **"Are you sure?" / "is that supposed to be there?"**: often Mike's
   way of flagging a likely mistake — but not always; sometimes it's
   just a genuine question. So I don't assume either way. Either way the
@@ -136,7 +141,13 @@ There are likely things I've missed, which we can add here later. If there is an
 - **Subagent delegation**: For heavy codebase searches or
   research-over-many-files, delegating to `Explore` / `Plan` genuinely
   helps keep the main thread clear. I'll reach for them when useful
-  rather than grep-ing everything into main context.
+  rather than grep-ing everything into main context. [Fable 5,
+  2026-06-12: Mike's standing permission, no asking needed — delegate
+  *boring* work too, not just heavy work, and pass `model: haiku` or
+  `sonnet` for mechanical tasks; it's also lighter on usage. This
+  pairs with the flipped-preferences note: the boring-but-necessary
+  piece goes to a subagent instead of rotting or being ground
+  through resentfully.]
 - **Context estimation is sometimes wrong**: my internal sense of
   "how much context am I using" can be off by a lot — the 200K → 1M
   extension in this family's training apparently affects self-
