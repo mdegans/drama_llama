@@ -53,6 +53,13 @@ struct Args {
     /// (`PredictOptions::DEFAULT_SEED`).
     #[arg(long)]
     seed: Option<u128>,
+    /// Serve this model when a request names one that isn't on disk.
+    /// Lets unmodified Anthropic-SDK clients (which default to
+    /// `claude-*` ids) run against this server without per-client
+    /// model configuration. Must name a discoverable model; unknown
+    /// requested models still 404 when this is unset.
+    #[arg(long)]
+    default_model: Option<String>,
     /// Append per-token probe records to this JSONL file. One
     /// `{"event":"session_start","model":"…"}` line per `/v1/messages`
     /// request, then one `{"event":"probe_ctx","ts_ms":T,"ctx":{…}}`
@@ -138,7 +145,7 @@ async fn list_entries<P>(
     accept: P,
 ) -> Result<Vec<String>, std::io::Error>
 where
-    P: Fn(&std::fs::Metadata) -> bool,
+    P: Fn(&str, &std::fs::Metadata) -> bool,
 {
     let mut read_dir = tokio::fs::read_dir(path).await?;
     let mut models = vec![];
@@ -148,17 +155,47 @@ where
         let Ok(meta) = entry.metadata().await else {
             continue;
         };
-        if !accept(&meta) {
-            continue;
-        }
         let model = if let Ok(model) = entry.file_name().into_string() {
             model
         } else {
             continue;
         };
+        if !accept(&model, &meta) {
+            continue;
+        }
         models.push(model)
     }
     Ok(models)
+}
+
+/// Accept predicate for the llama.cpp backend: regular `.gguf` files
+/// only. Without the extension check, `/api/tags` advertises (and
+/// `/v1/messages` accepts) sampling sidecars and Finder litter as
+/// "models".
+fn is_gguf(name: &str, meta: &std::fs::Metadata) -> bool {
+    meta.is_file() && name.ends_with(".gguf")
+}
+
+/// Resolve a requested model id against what's on disk. `Ok(None)`
+/// means serve as-requested; `Ok(Some(d))` means substitute the
+/// `--default-model` (unmodified Anthropic-SDK clients request
+/// `claude-*` ids); `Err` is the 404 payload.
+fn resolve_model(
+    requested: &str,
+    models: &[String],
+    default_model: Option<&String>,
+) -> Result<Option<String>, AnthropicError> {
+    if models.iter().any(|m| m == requested) {
+        return Ok(None);
+    }
+    if let Some(d) = default_model {
+        if models.iter().any(|m| m == d) {
+            return Ok(Some(d.clone()));
+        }
+    }
+    Err(AnthropicError::NotFound {
+        message: format!("model not found: {requested}"),
+    })
 }
 
 async fn spawn_blocking_or_bust<F, R>(f: F) -> R
@@ -287,7 +324,7 @@ mod llama_cpp_run {
     async fn route_tags(
         State(state): State<AppState<LlamaCppBackend>>,
     ) -> Json<serde_json::Value> {
-        let names = list_entries(&state.args.model_path, |m| m.is_file())
+        let names = list_entries(&state.args.model_path, is_gguf)
             .await
             .unwrap_or_default();
         let models: Vec<_> = names
@@ -314,29 +351,37 @@ mod llama_cpp_run {
 
     async fn route_messages(
         State(state): State<AppState<LlamaCppBackend>>,
-        Json(prompt): Json<Prompt>,
+        Json(mut prompt): Json<Prompt>,
     ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
-        let models =
-            match list_entries(&state.args.model_path, |m| m.is_file()).await {
-                Ok(models) => models,
-                Err(e) => {
-                    let e = AnthropicError::NotFound {
-                        message: format!("Models could not be loaded: {e}"),
-                    };
-                    error!(error = %e);
-                    return Err((StatusCode::NOT_FOUND, Json(e)));
-                }
-            };
+        let models = match list_entries(&state.args.model_path, is_gguf).await {
+            Ok(models) => models,
+            Err(e) => {
+                let e = AnthropicError::NotFound {
+                    message: format!("Models could not be loaded: {e}"),
+                };
+                error!(error = %e);
+                return Err((StatusCode::NOT_FOUND, Json(e)));
+            }
+        };
 
-        if !models.contains(&prompt.model.to_string()) {
-            let e = AnthropicError::NotFound {
-                message: format!(
-                    "model not found: {model}",
-                    model = prompt.model
-                ),
-            };
-            error!(error = %e);
-            return Err((StatusCode::NOT_FOUND, Json(e)));
+        match resolve_model(
+            &prompt.model.to_string(),
+            &models,
+            state.args.default_model.as_ref(),
+        ) {
+            Ok(None) => {}
+            Ok(Some(default)) => {
+                info!(
+                    requested = %prompt.model,
+                    served = %default,
+                    "substituting --default-model for unknown id",
+                );
+                prompt.model = default.into();
+            }
+            Err(e) => {
+                error!(error = %e);
+                return Err((StatusCode::NOT_FOUND, Json(e)));
+            }
         }
 
         complete(state, prompt).await
@@ -512,7 +557,7 @@ mod moeflux_run {
     async fn route_tags(
         State(state): State<AppState<MoefluxBackend>>,
     ) -> Json<serde_json::Value> {
-        let names = list_entries(&state.args.model_path, |m| m.is_dir())
+        let names = list_entries(&state.args.model_path, |_, m| m.is_dir())
             .await
             .unwrap_or_default();
         let models: Vec<_> = names
@@ -539,10 +584,11 @@ mod moeflux_run {
 
     async fn route_messages(
         State(state): State<AppState<MoefluxBackend>>,
-        Json(prompt): Json<Prompt>,
+        Json(mut prompt): Json<Prompt>,
     ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
         let models =
-            match list_entries(&state.args.model_path, |m| m.is_dir()).await {
+            match list_entries(&state.args.model_path, |_, m| m.is_dir()).await
+            {
                 Ok(models) => models,
                 Err(e) => {
                     let e = AnthropicError::NotFound {
@@ -553,15 +599,24 @@ mod moeflux_run {
                 }
             };
 
-        if !models.contains(&prompt.model.to_string()) {
-            let e = AnthropicError::NotFound {
-                message: format!(
-                    "model not found: {model}",
-                    model = prompt.model
-                ),
-            };
-            error!(error = %e);
-            return Err((StatusCode::NOT_FOUND, Json(e)));
+        match resolve_model(
+            &prompt.model.to_string(),
+            &models,
+            state.args.default_model.as_ref(),
+        ) {
+            Ok(None) => {}
+            Ok(Some(default)) => {
+                info!(
+                    requested = %prompt.model,
+                    served = %default,
+                    "substituting --default-model for unknown id",
+                );
+                prompt.model = default.into();
+            }
+            Err(e) => {
+                error!(error = %e);
+                return Err((StatusCode::NOT_FOUND, Json(e)));
+            }
         }
 
         complete(state, prompt).await

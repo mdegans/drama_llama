@@ -80,7 +80,25 @@ cargo run --release --bin blallama --features "axum,cli,toml" -- \
 # endpoints: POST /v1/messages, GET /api/tags, GET /probe (SSE)
 ```
 
-## Misanthropic examples as blallama harness
+## Misanthropic examples as blallama harness — VERIFIED 2026-06-12
+
+Working procedure (all five non-streaming examples ran green against
+blallama; strawberry's "Tool was not called" is the unforced-dialect
+gap, see `future_work_qwen_xml_tool_call_parse.md`):
+
+```bash
+# Server (note --default-model so claude-* ids resolve):
+./target/release/blallama ~/models/gguf --port 11435 \
+    --default-model Qwen3.6-35B-A3B-UD-Q4_K_S.gguf
+
+# Examples (in ~/Projects/misanthropic):
+export MISANTHROPIC_BASE_URL=http://localhost:11435
+export ANTHROPIC_API_KEY=$(python3 -c "print('x'*108)")  # dummy
+# neologism & strawberry read the key from STDIN, not env — pipe it:
+python3 -c "print('x'*108)" | ./target/debug/examples/neologism
+```
+
+
 
 The examples (in `~/Projects/misanthropic/misanthropic/examples/`)
 construct `Client::new(key)` against the production URL — **no
