@@ -1241,8 +1241,7 @@ impl<B: Backend> Session<B> {
                     })
                     .collect();
                 for old_bp in orphans {
-                    if let Err(_e) = self.engine.forget_pos(0, old_bp as i32)
-                    {
+                    if let Err(_e) = self.engine.forget_pos(0, old_bp as i32) {
                         // Best-effort orphan reclamation — failure here
                         // means the backend didn't have a snapshot at
                         // `old_bp` (already evicted by LRU, never
@@ -3097,26 +3096,22 @@ mod tests {
     // require models/model.gguf and wall-clock time.
     // -----------------------------------------------------------------
 
-    /// Build a [`Prompt`] with system + tools + one cached user
-    /// message, producing at least one cache breakpoint.
+    /// Build a [`Prompt`] with a cached system block and one cached
+    /// user message — the standard Anthropic shape (mark the shared
+    /// system so it survives diverging turns, mark the latest turn
+    /// for same-conversation reuse). Produces an `AfterSystem` and an
+    /// `AfterMessage(0)` breakpoint. Breakpoints exist *only* where
+    /// `cache_control` markers are; without the system marker there
+    /// is nothing at the system boundary to reuse. Each
+    /// [`Prompt::cache`] call marks the last cacheable block at that
+    /// point in the chain.
     fn cached_prompt(user_msg: &'static str) -> Prompt {
-        use misanthropic::prompt::message::{
-            Block as MBlock, CacheControl, Content as MContent,
-        };
-        use std::borrow::Cow;
-        let user_block = MBlock::Text {
-            text: Cow::Borrowed(user_msg),
-            cache_control: Some(CacheControl::Ephemeral { ttl: None }),
-            citations: None,
-        };
-        Prompt {
-            system: Some(MContent::text("You are a helpful assistant. Keep replies short.")),
-            messages: vec![crate::Message {
-                role: crate::Role::User,
-                content: MContent(vec![user_block]),
-            }],
-            ..Prompt::default()
-        }
+        Prompt::default()
+            .system("You are a helpful assistant. Keep replies short.")
+            .cache()
+            .add_message((crate::Role::User, user_msg))
+            .unwrap()
+            .cache()
     }
 
     /// Two back-to-back [`Session::complete_response`] calls on the
