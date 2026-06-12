@@ -30,6 +30,28 @@ whole job.
       file list, doc build zero-warnings.
 - [ ] Then: `cargo publish` on Mike's go, tag.
 
+## Status 2026-06-12 evening (mid-session)
+
+- 1a + full serial ignored sweep (1b3): **green** — 277 lib tests +
+  all integration suites, after fixing 14 stale/parallelism failures
+  (see commits db42d1f, 7092a98, dbf5751, e3c9277, 0b28469).
+- moeflux+llama-cpp combo bitrot fixed (`LlamaCppSession` alias,
+  misanthropic-alpha.2 port of moeflux_session_pollution) — 707af24.
+- moeflux smoke + three_consecutive: green.
+- **`partial_hit_output_matches_fresh_session`: RED, real bug, in
+  moeflux not drama_llama.** Batched prefill never populates the
+  gpu_kv mirrors that oracle decode's GPU SDPA reads at kv_len ≥ 32 —
+  fresh sessions decode against a zeroed prompt region on full-attn
+  layers. Checkpoint/restore exonerated. Full chain + acceptance
+  tests: moeflux f63352f,
+  `~/Projects/moeflux/.claude/memory/gpu_kv_mirror_not_populated_by_batched_prefill.md`.
+- moeflux_coherence + cross_backend deferred: results are moot until
+  the mirror fix (moeflux pre.4); a17b run likewise.
+- Recommendation: publish decision is unaffected on the llama-cpp
+  side (default features fully green). moeflux feature ships pinned
+  to pre.3 which already has the bug; fix lands as pre.4 + a
+  drama_llama 0.8.1 pin bump.
+
 ## Process notes
 
 - Model runs from Mike's terminal, not the Bash tool
