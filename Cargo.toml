@@ -133,9 +133,16 @@ moeflux-model-cogito-v2-671b = ["moeflux", "moeflux/model-cogito-v2-671b"]
 # library or binary builds.
 jsonschema = { version = "0.30", default-features = false }
 
+# `doc-scrape-examples = true` opts each example into rustdoc's
+# example-scraping pass (see `cargo-args` under
+# `[package.metadata.docs.rs]` below) so docs.rs shows real call sites
+# next to the items they exercise. Note: once any example opts in,
+# unflagged ones are excluded — keep the flag on every example whose
+# required features are in the docs.rs feature list.
 [[example]]
 name = "strawberry"
 required-features = ["cli"]
+doc-scrape-examples = true
 
 # Differential fuzzer over the schema → grammar → JSON pipeline.
 # Pure mode runs CPU-only; model mode also needs llama-cpp. `cli` pulls
@@ -143,14 +150,21 @@ required-features = ["cli"]
 [[example]]
 name = "grammar_fuzz"
 required-features = ["cli"]
+doc-scrape-examples = true
 
 [[example]]
 name = "chat_repl"
 required-features = ["repl"]
+doc-scrape-examples = true
 
 [[example]]
 name = "whodunit"
 required-features = ["json-schema"]
+doc-scrape-examples = true
+
+[[example]]
+name = "inspect_prompt"
+doc-scrape-examples = true
 
 [[bin]]
 name = "regurgitater"
@@ -179,5 +193,18 @@ required-features = ["moeflux-model-qwen3-6-35b-a3b"]
 
 [package.metadata.docs.rs]
 # `cuda` will break the build on platforms without it, and it doesn't change the
-# docs anyway.
-features = ["webchat", "cli", "stats", "toml", "serde", "egui", "json-schema"]
+# docs anyway. `repl` is included so chat_repl participates in example
+# scraping.
+features = [
+    "webchat",
+    "cli",
+    "stats",
+    "toml",
+    "serde",
+    "egui",
+    "json-schema",
+    "repl",
+]
+# Scrape the examples above into the rendered docs (nightly-only
+# rustdoc feature; docs.rs builds on nightly).
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
