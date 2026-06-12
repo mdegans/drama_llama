@@ -145,7 +145,7 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
     // re-rendering. If the model produced text only, synthesize a
     // dummy ToolUse so we still exercise the hash-cache code path.
     let blocks_round1: Vec<Block> = round1_resp.inner.content.0.clone();
-    let tool_use = blocks_round1
+    let mut tool_use = blocks_round1
         .into_iter()
         .find_map(|b| match b {
             Block::ToolUse { call } => Some(call),
@@ -158,6 +158,13 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
             cache_control: None,
             caller: None,
         });
+    // Mark the assistant turn: the auto-tip hash matches a subsequent
+    // request's partial render only where a breakpoint exists, and
+    // breakpoints exist only at cache_control markers (see
+    // `Session::compute_tip_hash` — "places a marker on (or just past)
+    // that assistant message"). The marker is metadata, not rendered
+    // content, so it doesn't perturb the hash itself.
+    tool_use.cache_control = Some(CacheControl::ephemeral());
 
     // Round 2: extend the conversation; cache_read should jump from
     // ~prefix-only (system+tools+first_user_msg) to ~all-of-round-1
