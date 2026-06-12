@@ -253,10 +253,8 @@ impl ChatTemplate {
         let tools_value = if custom_tools.is_empty() {
             JinjaValue::from(()) // renders as None / null
         } else {
-            let wire: Vec<serde_json::Value> = custom_tools
-                .iter()
-                .map(|t| tool_wire_value(t))
-                .collect();
+            let wire: Vec<serde_json::Value> =
+                custom_tools.iter().map(|t| tool_wire_value(t)).collect();
             JinjaValue::from_serialize(&wire)
         };
         // Default `date_string` to today in HF's "%d %b %Y" format when
@@ -1312,7 +1310,10 @@ mod tests {
         use crate::Engine;
         use std::path::PathBuf;
         let Some(file) = std::env::var_os("DRAMA_LLAMA_TOKENIZE_FILE") else {
-            panic!("set DRAMA_LLAMA_TOKENIZE_FILE to the input path");
+            // Helper, not a test: skip cleanly in `--include-ignored`
+            // sweeps instead of polluting them with a failure.
+            eprintln!("skipped: set DRAMA_LLAMA_TOKENIZE_FILE to the input path to use this helper");
+            return;
         };
         let text = std::fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("read {file:?}: {e}"));
@@ -1338,7 +1339,10 @@ mod tests {
         use serde_json::json;
         use std::{borrow::Cow, path::PathBuf};
         let Some(dest) = std::env::var_os("DRAMA_LLAMA_DUMP_OUTPUT") else {
-            panic!("set DRAMA_LLAMA_DUMP_OUTPUT to the output path");
+            // Helper, not a test: skip cleanly in `--include-ignored`
+            // sweeps instead of polluting them with a failure.
+            eprintln!("skipped: set DRAMA_LLAMA_DUMP_OUTPUT to the output path to use this helper");
+            return;
         };
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
@@ -1364,13 +1368,17 @@ mod tests {
             allowed_callers: None,
         };
         let prompt = Prompt {
-            system: Some(Content::text("You are a helpful assistant. You cannot count letters in a \
+            system: Some(Content::text(
+                "You are a helpful assistant. You cannot count letters in a \
                  word reliably on your own because you see in tokens, not \
                  letters. Use the `count_letters` tool when asked to count \
-                 characters.")),
+                 characters.",
+            )),
             messages: vec![Message {
                 role: Role::User,
-                content: Content::text("Count the number of r's in 'strawberry'"),
+                content: Content::text(
+                    "Count the number of r's in 'strawberry'",
+                ),
             }],
             tools: Some(vec![tool.into()]),
             ..Default::default()
@@ -1397,7 +1405,10 @@ mod tests {
         use crate::Engine;
         use std::path::PathBuf;
         let Some(dest) = std::env::var_os("DRAMA_LLAMA_DUMP_TEMPLATE") else {
-            panic!("set DRAMA_LLAMA_DUMP_TEMPLATE to the output path");
+            // Helper, not a test: skip cleanly in `--include-ignored`
+            // sweeps instead of polluting them with a failure.
+            eprintln!("skipped: set DRAMA_LLAMA_DUMP_TEMPLATE to the output path to use this helper");
+            return;
         };
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
