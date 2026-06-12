@@ -81,6 +81,16 @@ glass after the butler's safe sip) AND means (possession of the \
 specific poison used). Identify that suspect.";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Debugging aid: built with `--features json-schema,axum`, the
+    // library's tracing instrumentation (grammar resolution, per-token
+    // grammar filter counts) is compiled in — surface it with e.g.
+    // `RUST_LOG=drama_llama::session=debug`.
+    #[cfg(feature = "axum")]
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
     let path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
@@ -100,14 +110,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .add_message((Role::User, SCENARIO))?;
 
-    // Stream blocks as they parse; hold onto the JSON text block.
+    // Stream blocks as they parse. Thought blocks buffer until their
+    // closing tag, but prose streams *incrementally* — one `Block::Text`
+    // per decoded piece — so the JSON body must be accumulated, not
+    // taken from the last Text block. (The batch methods merge adjacent
+    // prose for you; the stream deliberately does not.)
     let mut json_text: Option<String> = None;
     for block in session.complete_stream(&prompt)? {
         match block {
             Block::Thought { thought, .. } => {
                 eprintln!("--- thought ---\n{thought}\n");
             }
-            Block::Text { text, .. } => json_text = Some(text.into()),
+            Block::Text { text, .. } => {
+                json_text.get_or_insert_with(String::new).push_str(&text)
+            }
             _ => {}
         }
     }

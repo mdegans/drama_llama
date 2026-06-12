@@ -1635,6 +1635,14 @@ impl<B: Backend> Session<B> {
     /// closing tag arrives. Malformed JSON inside a well-framed tool_call falls
     /// back to a `Block::Text` (see [`BlockParser`] for the parser contract).
     ///
+    /// **Prose arrives fragmented.** A run of prose yields one
+    /// `Block::Text` per decoded piece, not one merged block — that's
+    /// what makes the stream incremental. Callers that want the full
+    /// prose body (e.g. a structured-output JSON payload) must
+    /// concatenate adjacent `Text` blocks themselves, or use a batch
+    /// entry point ([`Self::complete_blocks`] and friends), which
+    /// merge adjacent prose before returning.
+    ///
     /// The returned iterator borrows `self` — only one stream can be live at a
     /// time. Drop it before calling another `complete_*`.
     ///
@@ -2444,6 +2452,13 @@ fn infer_stop_reason(
 /// Streaming [`Iterator`] over [`crate::Block`]s, produced by
 /// [`Session::complete_stream`]. Yields each block as soon as its closing tag
 /// (or tag-prefix ambiguity resolution) arrives.
+///
+/// Prose is **not** merged: a run of plain text yields one [`Block::Text`]
+/// per decoded piece. Concatenate adjacent `Text` yields if you need the
+/// whole body as one string (the batch `complete_*` methods do this for
+/// you via `merge_adjacent_prose`).
+///
+/// [`Block::Text`]: crate::Block::Text
 ///
 /// Drops trailing EOS and `[Invalid UTF-8]` pieces the predictor emits at
 /// stream end — those are artifacts of token-to-string conversion, not model
