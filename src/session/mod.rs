@@ -376,7 +376,7 @@ pub struct TopKEntry {
 ///
 /// Generic over a [`Backend`] so the same chat-style surface drives
 /// either llama.cpp ([`LlamaCppBackend`]) or moeflux
-/// ([`MoefluxBackend`]). Backend-specific constructors
+/// (`MoefluxBackend`). Backend-specific constructors
 /// (`Session::<B>::from_path*`) live in specialized impl blocks; the
 /// rest of the API is generic.
 pub struct Session<B: Backend> {
@@ -748,8 +748,8 @@ impl<B: Backend> Session<B> {
     /// context size (`n_ctx`). If the prompt plus `n` exceeds the
     /// engine's configured `n_ctx`, generation truncates at the KV
     /// cache boundary regardless of this value — reached via
-    /// [`Self::from_path_with_n_ctx`] or by constructing an [`LlamaCppEngine`]
-    /// directly.
+    /// [`Self::from_path_with_n_ctx`] or by constructing an
+    /// [`LlamaCppEngine`](crate::LlamaCppEngine) directly.
     pub fn with_max_tokens(mut self, n: NonZeroUsize) -> Self {
         self.max_tokens = n;
         self
@@ -1451,7 +1451,8 @@ impl<B: Backend> Session<B> {
     ///
     /// Beyond testing, prefer [`Self::complete_response`] (returns a
     /// full [`response::Message`][rm] with usage + stop reason) or
-    /// [`Self::complete`] (returns a typed [`AssistantMessage`]).
+    /// [`Self::complete`] (returns a typed
+    /// [`AssistantMessage`](crate::AssistantMessage)).
     ///
     /// # Grammar
     ///
@@ -1626,7 +1627,7 @@ impl<B: Backend> Session<B> {
         (extended, None, None)
     }
 
-    /// Stream [`Block`]s as they're generated.
+    /// Stream [`Block`](crate::Block)s as they're generated.
     ///
     /// Each iterator yield is one fully-resolved block. Prose is flushed as
     /// soon as enough bytes arrive to disambiguate it from a tag prefix;
@@ -1645,7 +1646,7 @@ impl<B: Backend> Session<B> {
     /// dropping the returned [`BlockStream`] does not mutate cache
     /// state. That's correct: `prev_tokens` describes *prompt* KV,
     /// and the next call's
-    /// [`kv_setup_for_call`](Session::kv_setup_for_call) truncates any
+    /// `kv_setup_and_chunk_prefill` truncates any
     /// generation tokens that leaked past the reused prefix.
     ///
     /// Output-token count is not known until the stream is consumed,
@@ -2050,7 +2051,8 @@ impl<B: Backend> Session<B> {
     ///
     /// Returns [`SessionError::GrammarViolation`] when the prompt's
     /// [`ToolChoice`] is `Method | Any` (grammar-forced) but the resulting
-    /// block stream contains no [`Block::ToolUse`] — e.g. the model was
+    /// block stream contains no [`Block::ToolUse`](crate::Block::ToolUse) —
+    /// e.g. the model was
     /// truncated by `max_tokens` before closing the `</tool_call>` tag.
     ///
     /// [`ToolChoice`]: crate::ToolChoice
@@ -2083,7 +2085,7 @@ impl<B: Backend> Session<B> {
     ///
     /// Invalidates any prefix-cache state (calls
     /// [`Self::clear_prefix_cache`] internally) because the underlying
-    /// [`LlamaCppEngine::predict_candidates`] path unconditionally clears the
+    /// `LlamaCppEngine::predict_candidates` path unconditionally clears the
     /// KV cache. Without this invalidation, a subsequent cached call
     /// would read stale `prev_tokens` metadata against a wiped KV.
     ///
@@ -2160,8 +2162,8 @@ impl<B: Backend> Session<B> {
 
     /// Batch variant returning a role-typed [`AssistantMessage`][am]. Routed
     /// through misanthropic's [`AssistantMessage: FromIterator<Block>`][am-fi]
-    /// so single- block outputs flatten to [`Content::SinglePart`] and multi-
-    /// block outputs stay [`Content::MultiPart`] — the crate-level convention,
+    /// so single- block outputs flatten to `Content::SinglePart` and multi-
+    /// block outputs stay `Content::MultiPart` — the crate-level convention,
     /// not one we reinvent here.
     ///
     /// Returning [`AssistantMessage`][am] rather than the bare [`Message`][m]
@@ -2172,8 +2174,6 @@ impl<B: Backend> Session<B> {
     /// [am]: misanthropic::prompt::message::AssistantMessage
     /// [am-fi]: misanthropic::prompt::message::AssistantMessage
     /// [m]: crate::Message
-    /// [`Content::SinglePart`]: crate::Content::SinglePart
-    /// [`Content::MultiPart`]: crate::Content::MultiPart
     pub fn complete(
         &mut self,
         prompt: &Prompt,
@@ -2194,24 +2194,22 @@ impl<B: Backend> Session<B> {
     ///
     /// The existing [`Self::complete`] / [`Self::complete_blocks`] /
     /// [`Self::complete_text`] methods remain as shape-narrowed views
-    /// of the same work; all four share [`Self::run_call`] under the
-    /// hood.
+    /// of the same work; all four share `run_call` under the hood.
     ///
     /// # Field filling
     ///
     /// * `id`: new UUID v4
-    /// * `model`: [`model::Id::Custom`][cu] wrapping the result of
+    /// * `model`: `model::Id::Custom` wrapping the result of
     ///   [`LlamaCppModel::desc`](crate::LlamaCppModel::desc).
-    /// * `content`: [`AssistantMessage`] via
+    /// * `content`: [`AssistantMessage`](crate::AssistantMessage) via
     ///   [`FromIterator<Block>`](std::iter::FromIterator).
-    /// * `stop_reason`: inferred by [`infer_stop_reason`] — see its
+    /// * `stop_reason`: inferred by `infer_stop_reason` — see its
     ///   docs for the mapping.
     /// * `stop_sequence`: the matched sequence when
     ///   `stop_reason == StopSequence`, else `None`.
     /// * `usage`: same shape as [`Self::last_usage`].
     ///
     /// [rm]: misanthropic::response::Message
-    /// [cu]: misanthropic::model::Id::Custom
     pub fn complete_response(
         &mut self,
         prompt: &Prompt,

@@ -21,8 +21,9 @@
 //!
 //! Everything in [`SampleOptions`] that is `Serialize` /
 //! `Deserialize`:
-//! - `modes` — the sampling-mode chain ([`SamplingMode::TopP`],
-//!   [`SamplingMode::Mirostat`], etc.)
+//! - `modes` — the sampling-mode chain
+//!   ([`SamplingMode::TopP`](crate::SamplingMode::TopP),
+//!   [`SamplingMode::Mirostat`](crate::SamplingMode::Mirostat), etc.)
 //! - `repetition` — `Some(RepetitionOptions)` to enable, `None` to
 //!   disable.
 //!

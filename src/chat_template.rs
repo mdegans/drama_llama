@@ -316,10 +316,10 @@ impl ChatTemplate {
     /// Render the prompt plus one partial render per `cache_control`
     /// breakpoint.
     ///
-    /// Use this when a caller — e.g. [`Session`] — needs to know where
+    /// Use this when a caller — e.g. `Session` — needs to know where
     /// in the tokenized output the caller's cache breakpoints land so a
     /// later call can compute cache-reuse boundaries in tokens. See
-    /// [`RenderedWithBreakpoints`] for the returned shape.
+    /// `RenderedWithBreakpoints` for the returned shape.
     ///
     /// Partial renders force `add_generation_prompt = false` regardless
     /// of what the caller set on `opts` — only the full render honors
@@ -603,10 +603,10 @@ fn render_partial(
 ///
 /// Tokenizes with `parse_special=true` so chat markers
 /// (`<|im_start|>`, `<|eot_id|>`, …) resolve to their single
-/// special-token IDs — the same convention [`Session::prepare_call`]
+/// special-token IDs — the same convention `Session::prepare_call`
 /// uses.
 ///
-/// Used internally by [`Session::prepare_call_cached`] for the
+/// Used internally by `Session::prepare_call_cached` for the
 /// prefix-cache lookup, and exposed publicly so callers can build
 /// inspection / diagnostic tools that reproduce exactly the same
 /// tokenization the cache machinery sees (see

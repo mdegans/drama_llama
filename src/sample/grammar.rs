@@ -729,9 +729,9 @@ pub(crate) struct StackState {
 
 /// Active matching state for a [`Grammar`].
 ///
-/// Thin wrapper: owns the `Arc<Grammar>` plus the mutable [`StackState`].
-/// All matcher methods delegate into [`StackState`] with a borrowed
-/// `&Grammar`. See [`StackState`] for why.
+/// Thin wrapper: owns the `Arc<Grammar>` plus the mutable `StackState`.
+/// All matcher methods delegate into `StackState` with a borrowed
+/// `&Grammar`. See `StackState` for why.
 ///
 /// Clone cost is proportional to `stacks.len() * avg_stack_depth`, which is
 /// small for practical grammars. `accepts_bytes` relies on cloning for
@@ -798,10 +798,10 @@ impl GrammarState {
     /// 256-bit bitmap indexed by byte value: bit `b` is set iff feeding
     /// byte `b` next could plausibly extend the match into a codepoint
     /// accepted by at least one active stack. See
-    /// [`StackState::first_byte_bitmap`] for details.
+    /// `StackState::first_byte_bitmap` for details.
     ///
     /// Conservative: a set bit means "maybe accepted" and still needs
-    /// [`accepts_bytes`] confirmation; a cleared bit is a definite
+    /// [`Self::accepts_bytes`] confirmation; a cleared bit is a definite
     /// rejection. Fuzzers use this to enumerate plausible next bytes
     /// without paying for 256 full clone-and-advance probes.
     pub fn first_byte_bitmap(&self) -> [u64; 4] {
@@ -1539,7 +1539,7 @@ static_assertions::assert_impl_all!(GrammarState: Send, Sync);
 // Runtime-gated filter-call statistics (opt in via env var)
 // ===========================================================================
 
-/// Cumulative statistics about [`grammar_filter`] calls since process start
+/// Cumulative statistics about `grammar_filter` calls since process start
 /// (or since the last [`grammar_stats_reset`]).
 ///
 /// Collection is gated on the `DRAMA_LLAMA_GRAMMAR_STATS` environment
@@ -1550,7 +1550,7 @@ static_assertions::assert_impl_all!(GrammarState: Send, Sync);
 /// without the static holding floats; divide by `calls` for the mean.
 #[derive(Clone, Debug, Default)]
 pub struct GrammarStats {
-    /// Number of [`grammar_filter`] calls recorded.
+    /// Number of `grammar_filter` calls recorded.
     pub calls: u64,
     /// Sum of the input `Candidates` length across calls.
     pub candidates_in: u64,
@@ -1650,7 +1650,7 @@ fn atomic_fetch_max(target: &AtomicU64, val: u64) {
     }
 }
 
-/// Snapshot cumulative [`grammar_filter`] statistics. Returns zeros when
+/// Snapshot cumulative `grammar_filter` statistics. Returns zeros when
 /// collection is disabled.
 pub fn grammar_stats_snapshot() -> GrammarStats {
     GrammarStats {

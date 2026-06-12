@@ -17,8 +17,8 @@ use std::num::NonZeroUsize;
 /// An `Engine` encompasses everything needed to run inferences. It
 /// bundles a [`crate::Decoder`] (context + KV cache) with a
 /// [`crate::Model`] (weights + tokenizer) via a single [`Backend`]
-/// parameter. Use the [`crate::LlamaCppEngine`] /
-/// [`crate::MoefluxEngine`] type aliases for the common backends.
+/// parameter. Use the `LlamaCppEngine` / `MoefluxEngine` type aliases
+/// (feature-gated) for the common backends.
 ///
 /// Field declaration order (`decoder` before `model`) matters for
 /// Drop: Rust drops fields in declaration order, so the decoder's

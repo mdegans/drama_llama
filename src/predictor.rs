@@ -144,7 +144,7 @@ impl PredictOptions {
 
     /// Push every token in `tokens` as its own single-token stop
     /// sequence and add to the repetition-ignored set. Used by
-    /// [`Session`] to splice in the cached reserved-vocab list once
+    /// `Session` to splice in the cached reserved-vocab list once
     /// `add_model_stops` has set the eos/eot anchors.
     pub fn add_token_stops<I>(mut self, tokens: I) -> Self
     where

@@ -2,7 +2,7 @@
 //!
 //! Reads [`OutputConfig`] from a [`Prompt`] and emits a GBNF that
 //! forces the model's response to match the configured JSON Schema.
-//! Mirrors the [`tool_choice`](crate::tool_choice) module's shape —
+//! Mirrors the `tool_choice` module's shape —
 //! same schema compiler, same optional `<think>...</think>` preamble,
 //! different wrapper rule.
 //!

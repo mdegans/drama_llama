@@ -1168,16 +1168,14 @@ impl Candidates {
     }
 
     /// Apply repetition penalties to the candidates. This code is inspired by
-    /// [`llama_sample_repetition_penalties`] but supports n-grams and an
-    /// [`NGramStats`] object to keep track of n-gram frequencies as well as
-    /// other stats like the number of tokens processed.
+    /// llama.cpp's `llama_sample_repetition_penalties` but supports n-grams
+    /// and an [`NGramStats`] object to keep track of n-gram frequencies as
+    /// well as other stats like the number of tokens processed.
     ///
     /// # Note
     /// * This method may apply the softmax if it has not been applied yet.
     /// * This method may sort the candidates if they are not already sorted.
     /// * This method may change the logits of the candidates.
-    ///
-    /// [`llama_sample_repetition_penalties`]: llama_cpp_sys_3::llama_sample_repetition_penalties
     pub fn penalize_repetition<M: Model>(
         self,
         tokens: &[Token],
