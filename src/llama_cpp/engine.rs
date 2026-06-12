@@ -215,25 +215,25 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "long running"]
-    /// Test engine can be constructed and destructed many times. Because there
-    /// is global state in llama.cpp, this is a stress test to ensure that there
-    /// are no resource leaks. It's not comprehensive, but it's something.
+    #[ignore = "long running, requires models/model.gguf"]
+    /// Engine can be constructed and destructed repeatedly. llama.cpp has
+    /// global state (`backend_init`/`backend_free` refcounted by
+    /// `ENGINE_COUNT`), so cycling the full lifecycle catches gross init/free
+    /// bugs. Ten iterations is enough to exercise the first/last-engine
+    /// transitions; it can't catch slow leaks (the original 1000-iteration
+    /// version couldn't either — it never asserted — and each construction
+    /// offloads the whole model, so 1000 was an overnight run for nothing).
     // TODO: find a way to test for increased memory usage. The test also might
     // be better upstream in the bindings.
     fn construct_destruct_stress_test() {
         use std::path::PathBuf;
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("models/model.gguf");
-        for i in 0..1000 {
-            let engine = LlamaCppEngine::new(path.clone(), None, None, None);
-            if engine.is_err() {
-                println!(
-                    "Failed to create engine after {} iterations because: {}",
-                    i,
-                    engine.unwrap_err()
-                );
-            }
+        for i in 0..10 {
+            LlamaCppEngine::new(path.clone(), None, None, None)
+                .unwrap_or_else(|e| {
+                    panic!("engine construction failed on iteration {i}: {e}")
+                });
         }
     }
 
