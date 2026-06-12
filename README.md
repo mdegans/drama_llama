@@ -69,7 +69,9 @@ For examples, see the `bin` folder. There are two example binaries.
   on this project and co-authors commits where it contributed. `git log`
   is the authoritative record — grep for `Co-Authored-By: Claude` — and
   [`CONTRIBUTORS.md`](CONTRIBUTORS.md) summarizes the surface areas. As
-  of v0.7.0 those include the llama.cpp API migration, the sampling-mode
+  of v0.8.0 those include the llama.cpp API migration, the sampling-mode
   suite (JSON, GBNF, tool-choice, structured output), the Jinja chat-
-  template renderer, the prompt-caching layer, and the grammar matcher
-  performance finish line (lazy-DFA cache + thought/JSON phase-split).
+  template renderer, the prompt-caching layer, the grammar matcher
+  performance finish line (lazy-DFA cache + thought/JSON phase-split),
+  and the `Backend` split that lets the same `Session`/`Engine` surface
+  drive either llama.cpp or moeflux's Metal MoE runtime.

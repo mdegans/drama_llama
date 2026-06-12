@@ -5,6 +5,16 @@ edition = "2021"
 description = "A library for language modeling and text generation."
 license-file = "LICENSE.md"
 repository = "https://github.com/mdegans/drama_llama"
+# Keep session memory, agent instructions, and (especially) the
+# detect-infringement corpus out of the published crate. The corpus
+# contains copyrighted text used locally for testing; it must not be
+# redistributed via crates.io. Nothing in src/ references it.
+exclude = [
+    ".claude/",
+    "CLAUDE.md",
+    "tests/data/",
+    "**/.DS_Store",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
