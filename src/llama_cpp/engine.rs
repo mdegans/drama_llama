@@ -214,27 +214,67 @@ impl LlamaCppEngine {
 mod tests {
     use super::*;
 
+    /// Resident set size of this process in bytes (via `ps`, so KiB
+    /// granularity). On Apple Silicon, Metal buffers are unified-memory
+    /// mappings inside the process, so leaked model weights or contexts
+    /// show up here. Coarse, but a leaked engine is hundreds of MB to
+    /// GBs per iteration — loud enough for a coarse check.
+    #[cfg(unix)]
+    fn rss_bytes() -> u64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps failed");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .expect("unparsable rss")
+            * 1024
+    }
+
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
-    /// Engine can be constructed and destructed repeatedly. llama.cpp has
-    /// global state (`backend_init`/`backend_free` refcounted by
-    /// `ENGINE_COUNT`), so cycling the full lifecycle catches gross init/free
-    /// bugs. Ten iterations is enough to exercise the first/last-engine
-    /// transitions; it can't catch slow leaks (the original 1000-iteration
-    /// version couldn't either — it never asserted — and each construction
-    /// offloads the whole model, so 1000 was an overnight run for nothing).
-    // TODO: find a way to test for increased memory usage. The test also might
-    // be better upstream in the bindings.
+    /// Engine can be constructed and destructed repeatedly without leaking.
+    /// llama.cpp has global state (`backend_init`/`backend_free` refcounted
+    /// by `ENGINE_COUNT`), so cycling the full lifecycle catches gross
+    /// init/free bugs. The leak check replaces the original version's
+    /// 1000-iteration watch-Activity-Monitor protocol: baseline RSS after
+    /// the first cycle (global init + page-cache warmup land there), then
+    /// assert the remaining cycles don't accumulate. A real per-iteration
+    /// leak (model, context, or KV cache) is ≥ hundreds of MB × 9, far
+    /// over the threshold; the threshold is generous because allocator
+    /// and Metal-driver caches genuinely retain some memory.
     fn construct_destruct_stress_test() {
         use std::path::PathBuf;
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("models/model.gguf");
-        for i in 0..10 {
-            LlamaCppEngine::new(path.clone(), None, None, None)
-                .unwrap_or_else(|e| {
-                    panic!("engine construction failed on iteration {i}: {e}")
-                });
+
+        let construct = |i: usize| {
+            drop(
+                LlamaCppEngine::new(path.clone(), None, None, None)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "engine construction failed on iteration {i}: {e}"
+                        )
+                    }),
+            );
+        };
+
+        construct(0);
+        let baseline = rss_bytes();
+        for i in 1..10 {
+            construct(i);
         }
+        let grown = rss_bytes().saturating_sub(baseline);
+
+        const LIMIT: u64 = 2 << 30; // 2 GiB
+        assert!(
+            grown < LIMIT,
+            "RSS grew {} MiB over 9 construct/destruct cycles (limit {} MiB) \
+             — per-iteration leak?",
+            grown >> 20,
+            LIMIT >> 20,
+        );
     }
 
     #[test]
