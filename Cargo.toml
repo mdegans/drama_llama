@@ -163,7 +163,7 @@ required-features = ["webchat", "cli", "stats"]
 [[bin]]
 name = "settings_tool"
 path = "bin/settings_tool/settings_tool.rs"
-required-features = ["egui", "serde", "serde_json"]
+required-features = ["egui", "serde"]
 
 [[bin]]
 name = "blallama"

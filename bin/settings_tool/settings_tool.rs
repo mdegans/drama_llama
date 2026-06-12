@@ -44,13 +44,19 @@ struct App {
     pub mode: Mode,
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::SidePanel::left("settings")
-            .default_width(400.0)
-            .show(ctx, |ui| self.options.draw(ui));
+/// Cap for the n-tokens drag widget. There's no model loaded here to
+/// derive a real context size from, so use a generous testbed value.
+const MAX_CONTEXT_SIZE: usize = 131072;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::left("settings")
+            .default_size(400.0)
+            .show_inside(ui, |ui| {
+                self.options.draw(ui, MAX_CONTEXT_SIZE)
+            });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ComboBox::from_label("Format")
                 .selected_text(self.mode.as_str())
                 .show_ui(ui, |ui| {
@@ -77,7 +83,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "`drama_llama` Settings Tool",
         eframe::NativeOptions::default(),
-        Box::new(|_| Box::new(App::default())),
+        Box::new(|_| Ok(Box::new(App::default()))),
     )?;
 
     Ok(())

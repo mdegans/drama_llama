@@ -1238,6 +1238,12 @@ impl DfaCache {
 
     /// True iff the state is an accepting state (empty pending + at least one
     /// empty stack).
+    ///
+    /// Currently unused: `GrammarState::is_complete` answers completeness
+    /// off the NFA `StackState` directly, even when the DFA cache is
+    /// active. Kept as the DFA-side mirror (with its `complete` memo
+    /// above) for when the completeness check moves behind the cache.
+    #[allow(dead_code)]
     pub(crate) fn is_complete(&self, sid: StateId) -> bool {
         if sid == REJECT_STATE {
             return false;

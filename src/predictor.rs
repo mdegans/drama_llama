@@ -229,7 +229,7 @@ impl PredictOptions {
         resp |= ui.add(
             egui::DragValue::new(&mut n)
                 .speed(1.0)
-                .clamp_range(1..=max_context_size),
+                .range(1..=max_context_size),
         );
         // The max is because it's possible to drag the value to 0 even
         // though it's supposed to clamp. This may be a bug in egui or
@@ -247,7 +247,7 @@ impl PredictOptions {
                         ui.add(
                             egui::DragValue::new(&mut seed)
                                 .speed(1.0)
-                                .clamp_range(1..=usize::MAX),
+                                .range(1..=usize::MAX),
                         );
                         self.seed = NonZeroU128::new(seed.max(1) as u128);
                     } else {

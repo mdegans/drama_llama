@@ -330,7 +330,7 @@ async fn main() {
                 send_prefix(
                     engine.model.tokens_to_string(chunk.iter().cloned()),
                 );
-                let mut chunk = chunk.to_vec();
+                let chunk = chunk.to_vec();
                 let mut completion = Vec::with_capacity(ground_truth.len());
                 // Rare, but possible. The client can't send an empty string,
                 // but because we're splitting the text into chunks, it's

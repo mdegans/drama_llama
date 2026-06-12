@@ -1191,13 +1191,13 @@ impl Candidates {
     }
 
     /// Iterates over the candidates.
-    pub fn iter(&self) -> std::slice::Iter<TokenData> {
+    pub fn iter(&self) -> std::slice::Iter<'_, TokenData> {
         self.data.iter()
     }
 
     /// Iterates over the candidates mutably. This invalidates the sort state
     /// and softmax state.
-    pub fn iter_mut(&mut self) -> std::slice::IterMut<TokenData> {
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, TokenData> {
         self.sort_state = Sorted::Unknown;
         self.softmax_applied_to = None;
         self.data.iter_mut()

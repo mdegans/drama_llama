@@ -794,7 +794,7 @@ impl SamplingMode {
             let mut val = min_keep.get();
             let resp = ui.horizontal(|ui| {
                 ui.label(name) |
-                ui.add(egui::DragValue::new(&mut val).clamp_range(MIN_KEEP_MIN..=MIN_KEEP_MAX))
+                ui.add(egui::DragValue::new(&mut val).range(MIN_KEEP_MIN..=MIN_KEEP_MAX))
                     .on_hover_text_at_pointer("Min/Max number of candidates to keep per token. Useful in combination with other sampling modes.")
             }).inner;
             *min_keep =
@@ -982,7 +982,7 @@ impl SamplingMode {
         let resp = egui::CollapsingHeader::new(self.name())
             // We need an id because it's possible (but likely pointless) to
             // have two identical sampling modes in the list.
-            .id_source((index, self.name()))
+            .id_salt((index, self.name()))
             .show(ui, |ui| self.draw_inner(ui));
 
         let header_resp =

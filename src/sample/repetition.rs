@@ -419,7 +419,7 @@ impl RepetitionOptions {
         let mut resp = ui.horizontal(|ui| {
             let mut max_count = self.penalty_max_count.get();
             let inner = ui.label("Penalty Max Count") |
-            ui.add(egui::DragValue::new(&mut max_count).clamp_range(1..=255))
+            ui.add(egui::DragValue::new(&mut max_count).range(1..=255))
                 .on_hover_text_at_pointer("The maximum number of times an item can be repeated before it is penalized.");
 
             self.penalty_max_count = NonZeroU8::new(max_count.clamp(1, 255)).unwrap();
@@ -436,7 +436,7 @@ impl RepetitionOptions {
                 let inner = ui.label("Ngram Min Size")
                     | ui.add(
                         egui::DragValue::new(&mut min_size)
-                            .clamp_range(1..=NGram::CAPACITY as u8),
+                            .range(1..=NGram::CAPACITY as u8),
                     )
                     .on_hover_text_at_pointer(
                         "The minimum size of the n-gram to penalize (in tokens).",
@@ -457,7 +457,7 @@ impl RepetitionOptions {
                 let inner = ui.label("Ngram Max Size")
                     | ui.add(
                         egui::DragValue::new(&mut max_size)
-                            .clamp_range(1..=NGram::CAPACITY as u8),
+                            .range(1..=NGram::CAPACITY as u8),
                     )
                     .on_hover_text_at_pointer(
                         "The maximum size of the n-gram to penalize (in tokens).",
@@ -478,7 +478,7 @@ impl RepetitionOptions {
                 let mut window = self.window_size.get();
                 let inner = ui.label("Window size")
                     | ui.add(
-                        egui::DragValue::new(&mut window).clamp_range(1..=8192),
+                        egui::DragValue::new(&mut window).range(1..=8192),
                     )
                     .on_hover_text_at_pointer(
                         "Sliding-window size in generation steps. Only \
