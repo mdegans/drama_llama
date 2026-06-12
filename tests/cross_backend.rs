@@ -35,7 +35,7 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use drama_llama::backend::{Decoder, Model};
+use drama_llama::backend::{Backend, Model};
 use drama_llama::{
     Candidates, Engine, LlamaCppEngine, MoefluxEngine, Token, TokenData,
 };
@@ -94,16 +94,12 @@ fn partial_top_k(candidates: &Candidates, k: usize) -> Vec<TokenData> {
     buf
 }
 
-/// Generic capture loop: works for any `Engine<D, M>`. Tokenization
+/// Generic capture loop: works for any `Engine<B>`. Tokenization
 /// uses `add_special=false` so both backends see identical prompt
 /// tokens (BOS handling differs — moeflux's HF tokenizer would prefix
 /// nothing for Qwen, llama.cpp's gguf might add BOS). The returned
 /// trajectory is each backend's own greedy continuation.
-fn capture<D, M>(engine: &mut Engine<D, M>) -> Capture
-where
-    D: Decoder,
-    M: Model + Sync,
-{
+fn capture<B: Backend>(engine: &mut Engine<B>) -> Capture {
     let prompt_tokens = engine.model.tokenize(PROMPT, false);
     let n_vocab = engine.model.n_vocab();
 
