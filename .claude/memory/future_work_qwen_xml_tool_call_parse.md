@@ -1,7 +1,7 @@
 # Future work: parse Qwen3.6 XML-parameter tool calls (unforced path)
 
 Found 2026-06-12 during v0.8.0 validation (misanthropic-examples-vs-
-blallama harness). Candidate GitHub issue — not yet filed.
+blallama harness). Filed as drama_llama#27.
 
 When tools are advertised but `tool_choice` is unset (no grammar
 forcing), Qwen3.6-35B-A3B emits its template-native call format:
