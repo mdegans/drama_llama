@@ -109,8 +109,9 @@ axum = [
 # Enable typed structured-output helpers: `Prompt::structured_output::<T>()`,
 # `OutputConfig::for_type::<T>()`. Requires `schemars` for schema derivation.
 # (misanthropic ≥1.0.0-alpha.2 ships schema support unconditionally, so
-# this only gates our own schemars-derived helpers now.)
-json-schema = ["dep:schemars"]
+# on the misanthropic side this only enables the #[tool]/ToolArgs
+# derive macros; dep:schemars gates our own schemars-derived helpers.)
+json-schema = ["dep:schemars", "misanthropic/derive"]
 
 # `moeflux` gates the moeflux-backed Decoder + Model implementations.
 # Pulls in the safe `moeflux` wrapper (pure-Rust port + Metal kernels)
@@ -132,6 +133,9 @@ moeflux-model-cogito-v2-671b = ["moeflux", "moeflux/model-cogito-v2-671b"]
 # bugs (grammar rejects, schema accepts). Dev-only — never linked into
 # library or binary builds.
 jsonschema = { version = "0.30", default-features = false }
+# Minimal executor for examples that drive misanthropic's async `Tool`
+# trait (`#[tool]` macro dispatch) against the synchronous Session.
+tokio = { version = "1", features = ["rt", "macros"] }
 
 # `doc-scrape-examples = true` opts each example into rustdoc's
 # example-scraping pass (see `cargo-args` under
@@ -141,7 +145,7 @@ jsonschema = { version = "0.30", default-features = false }
 # required features are in the docs.rs feature list.
 [[example]]
 name = "strawberry"
-required-features = ["cli"]
+required-features = ["cli", "json-schema"]
 doc-scrape-examples = true
 
 # Differential fuzzer over the schema → grammar → JSON pipeline.
