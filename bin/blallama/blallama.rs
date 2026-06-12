@@ -176,12 +176,11 @@ where
 }
 
 fn log_stats(id: impl AsRef<str>, usage: Usage, elapsed: Duration) {
-    let Usage {
-        input_tokens,
-        cache_creation_input_tokens,
-        cache_read_input_tokens,
-        output_tokens,
-    } = usage;
+    // `Usage` derefs to `TokenCounts`, where the counts now live.
+    let input_tokens = usage.input_tokens;
+    let cache_creation_input_tokens = usage.cache_creation_input_tokens;
+    let cache_read_input_tokens = usage.cache_read_input_tokens;
+    let output_tokens = usage.output_tokens;
 
     info!(
         event = "stats",
@@ -355,6 +354,7 @@ mod llama_cpp_run {
                     StatusCode::from_u16(529).unwrap(),
                     Json(AnthropicError::Overloaded {
                         message: "Session is busy.".into(),
+                        retry_after: None,
                     }),
                 ))
             }
@@ -440,7 +440,7 @@ mod llama_cpp_run {
         }
 
         let response = result.map_err(map_session_err)?;
-        log_stats(&response.id, response.usage, elapsed);
+        log_stats(&response.id, response.usage.clone(), elapsed);
         Ok(Json(response))
     }
 
@@ -579,6 +579,7 @@ mod moeflux_run {
                     StatusCode::from_u16(529).unwrap(),
                     Json(AnthropicError::Overloaded {
                         message: "Session is busy.".into(),
+                        retry_after: None,
                     }),
                 ))
             }
@@ -669,7 +670,7 @@ mod moeflux_run {
         }
 
         let response = result.map_err(map_session_err)?;
-        log_stats(&response.id, response.usage, elapsed);
+        log_stats(&response.id, response.usage.clone(), elapsed);
         log_moeflux_prefetch(&response.id, prefetch_stats);
         Ok(Json(response))
     }

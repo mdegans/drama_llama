@@ -40,7 +40,9 @@ pub use prompt::{
 };
 
 mod chat_template;
-pub use chat_template::{ChatTemplate, ChatTemplateError, RenderOptions};
+pub use chat_template::{
+    tokenize_with_breakpoints, ChatTemplate, ChatTemplateError, RenderOptions,
+};
 
 /// Re-export of [`minijinja`] for callers who need to construct
 /// [`minijinja::value::Value`]s for `RenderOptions::with_extra`.

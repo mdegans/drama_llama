@@ -23,8 +23,8 @@
 use std::path::PathBuf;
 
 use drama_llama::{
-    chat_template::{ChatTemplate, RenderOptions, tokenize_with_breakpoints},
-    LlamaCppModel, Token,
+    tokenize_with_breakpoints, ChatTemplate, LlamaCppModel, RenderOptions,
+    Token,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -136,16 +136,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn peek_first_text(content: &misanthropic::prompt::message::Content) -> Option<String> {
-    use misanthropic::prompt::message::{Block, Content};
-    match content {
-        Content::SinglePart(s) => Some(s.to_string()),
-        Content::MultiPart(blocks) => {
-            for b in blocks {
-                if let Block::Text { text, .. } = b {
-                    return Some(text.to_string());
-                }
-            }
-            None
+    use misanthropic::prompt::message::Block;
+    for b in &content.0 {
+        if let Block::Text { text, .. } = b {
+            return Some(text.to_string());
         }
     }
+    None
 }

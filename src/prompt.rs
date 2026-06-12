@@ -15,7 +15,7 @@
 //! |--------------------|------------------------------------------|
 //! | `system`           | [`ChatTemplate`] rendering               |
 //! | `messages`         | [`ChatTemplate`] rendering               |
-//! | `functions`        | [`ChatTemplate`] (tools) + tool_choice   |
+//! | `tools`            | [`ChatTemplate`] (tools) + tool_choice   |
 //! | `tool_choice`      | [`grammar_for_prompt`] grammar compiler  |
 //! | `stop_sequences`   | callers wire into [`PredictOptions`]     |
 //! | `thinking`         | [`ChatTemplate`] — drives `enable_thinking` extra |
@@ -30,33 +30,31 @@
 //! [`PredictOptions`]: crate::PredictOptions
 //! [`SampleOptions`]: crate::SampleOptions
 
-// Types with a lifetime parameter are aliased to `'static` so the rest of
-// the crate doesn't have to thread `<'_>` through every signature. The
-// underlying misanthropic types still carry `Cow<'a, _>` fields — we just
-// commit to owned data at the drama_llama boundary. If you genuinely need
-// a borrowed variant, reach for the fully-qualified misanthropic path.
+// misanthropic ≥1.0.0-alpha.2 dropped the pervasive `'a` lifetime from
+// its public API — everything is owned (`Cow<'static, _>`) now, so these
+// are plain re-exports rather than `<'static>`-pinning aliases.
 pub use misanthropic::prompt::message::Role;
 pub use misanthropic::tool::Choice as ToolChoice;
 
 // Prompt types. Prefer CachedPrompt for append-only flow (cache friendly).
-pub type Prompt = misanthropic::Prompt<'static>;
-pub type CachedPrompt = misanthropic::prompt::cached::CachedPrompt<'static>;
+pub use misanthropic::prompt::cached::CachedPrompt;
+pub use misanthropic::Prompt;
 
 // Typed messages, useful for avoiding turn order errors
-pub type AssistantMessage = misanthropic::prompt::AssistantMessage<'static>;
-pub type UserMessage = misanthropic::prompt::UserMessage<'static>;
+pub use misanthropic::prompt::{AssistantMessage, UserMessage};
 
 // Message and content
-pub type Message = misanthropic::prompt::message::Message<'static>;
-pub type Content = misanthropic::prompt::message::Content<'static>;
-pub type Block = misanthropic::prompt::message::Block<'static>;
+pub use misanthropic::prompt::message::{Block, Content, Message};
 
-// Tool stuff
-pub type Tool = misanthropic::tool::Method<'static>;
-pub type ToolResult = misanthropic::tool::Result<'static>;
-pub type ToolUse = misanthropic::tool::Use<'static>;
+// Tool stuff. `Tool` is the *custom* (client-executed) definition — the
+// only kind drama_llama can enforce a grammar for. `Prompt::tools` holds
+// `MethodDef`s, which may also be server tools; see `grammar_for_prompt`
+// for the narrowing.
+pub type Tool = misanthropic::tool::CustomMethodDef;
+pub type ToolResult = misanthropic::tool::Result;
+pub type ToolUse = misanthropic::tool::Use;
 
 // Api types and Usage stats
-pub type MessageResponse = misanthropic::response::Message<'static>;
-pub type AnthropicError = misanthropic::client::AnthropicError;
-pub type Usage = misanthropic::response::Usage;
+pub type MessageResponse = misanthropic::response::Message;
+pub use misanthropic::client::AnthropicError;
+pub use misanthropic::response::Usage;

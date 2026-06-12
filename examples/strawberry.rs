@@ -32,8 +32,8 @@ use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
 use clap::Parser;
 use drama_llama::{
     prompt::{ToolResult, ToolUse},
-    Block, Content, FlashAttention, Prompt, RenderOptions, Role, SamplingMode,
-    Session, Tool, ToolChoice, ToolChoiceOptions,
+    Block, Content, FlashAttention, LlamaCppBackend, Prompt, RenderOptions,
+    Role, SamplingMode, Session, Tool, ToolChoice, ToolChoiceOptions,
 };
 use serde_json::json;
 
@@ -115,9 +115,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }),
         cache_control: None,
         strict: None,
+        defer_loading: None,
+        allowed_callers: None,
     };
 
-    let load_session = |path: PathBuf| -> Result<Session, _> {
+    let load_session = |path: PathBuf| -> Result<Session<LlamaCppBackend>, _> {
         if args.cpu {
             Session::from_path_cpu_only(path)
         } else if args.fa_off {
@@ -139,7 +141,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .without_repetition()
             .with_max_tokens(NonZeroUsize::new(256).unwrap());
         let prompt = Prompt::default()
-            .set_system(
+            .system(
                 "You are a helpful assistant. You cannot count letters in a \
                  word reliably on your own because you see in tokens, not \
                  letters. Use the `count_letters` tool when asked to count \
@@ -160,6 +162,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }),
                 cache_control: None,
                 strict: None,
+                defer_loading: None,
+                allowed_callers: None,
             })
             .add_message((Role::User, args.prompt.clone()))?;
         let out = session.complete_text(&prompt)?;
@@ -206,16 +210,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_tokens(NonZeroUsize::new(256).unwrap());
 
     let mut prompt: Prompt = Prompt::default()
-        .set_system(
+        .system(
             "You are a helpful assistant. You cannot count letters in a word \
              reliably on your own because you see in tokens, not letters. \
              Use the `count_letters` tool when asked to count characters.",
         )
         .add_tool(count_letters_tool)
         .add_message((Role::User, args.prompt.clone()))?;
-    prompt.tool_choice = Some(ToolChoice::Method {
-        name: "count_letters".into(),
-    });
+    prompt.tool_choice = Some(ToolChoice::method("count_letters"));
 
     // Diagnostic: dump the turn-1 rendered prompt so we can feed it
     // raw into ollama and compare logits.
@@ -284,7 +286,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     prompt.push_message(assistant)?;
     prompt.push_message(ToolResult {
         tool_use_id: Cow::Owned(call_id),
-        content: Content::SinglePart(count.to_string().into()),
+        content: Content::text(count.to_string()),
         is_error: false,
         cache_control: None,
     })?;
@@ -334,13 +336,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn first_tool_use(
     assistant: &drama_llama::AssistantMessage,
 ) -> Option<&ToolUse> {
-    match assistant.content() {
-        Content::SinglePart(_) => None,
-        Content::MultiPart(blocks) => blocks.iter().find_map(|b| match b {
-            Block::ToolUse { call } => Some(call),
-            _ => None,
-        }),
-    }
+    assistant.content.0.iter().find_map(|b| match b {
+        Block::ToolUse { call } => Some(call),
+        _ => None,
+    })
 }
 
 fn main() {

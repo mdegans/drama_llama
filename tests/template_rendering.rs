@@ -75,21 +75,19 @@ fn shape_03_strawberry_turn_1_matches_fixture() {
         }),
         cache_control: None,
         strict: None,
+        defer_loading: None,
+        allowed_callers: None,
     };
     let prompt = Prompt {
-        system: Some(Content::SinglePart(Cow::Borrowed(
-            "You are a helpful assistant. You cannot count letters in a \
+        system: Some(Content::text("You are a helpful assistant. You cannot count letters in a \
              word reliably on your own because you see in tokens, not \
              letters. Use the `count_letters` tool when asked to count \
-             characters.",
-        ))),
+             characters.")),
         messages: vec![Message {
             role: Role::User,
-            content: Content::SinglePart(Cow::Borrowed(
-                "Count the number of r's in 'strawberry'",
-            )),
+            content: Content::text("Count the number of r's in 'strawberry'"),
         }],
-        functions: Some(vec![tool]),
+        tools: Some(vec![tool.into()]),
         ..Default::default()
     };
     let opts = RenderOptions::default()
@@ -130,43 +128,42 @@ fn shape_04_strawberry_turn_2_matches_fixture() {
         }),
         cache_control: None,
         strict: None,
+        defer_loading: None,
+        allowed_callers: None,
     };
     let call_id = "call_3_r";
     let prompt = Prompt {
-        system: Some(Content::SinglePart(Cow::Borrowed(
-            "You are a helpful assistant.",
-        ))),
+        system: Some(Content::text("You are a helpful assistant.")),
         messages: vec![
             Message {
                 role: Role::User,
-                content: Content::SinglePart(Cow::Borrowed(
-                    "Count the number of r's in 'strawberry'",
-                )),
+                content: Content::text("Count the number of r's in 'strawberry'"),
             },
             Message {
                 role: Role::Assistant,
-                content: Content::MultiPart(vec![Block::ToolUse {
+                content: Content(vec![Block::ToolUse {
                     call: ToolUse {
                         id: Cow::Borrowed(call_id),
                         name: Cow::Borrowed("count_letters"),
                         input: json!({"letter": "r", "string": "strawberry"}),
                         cache_control: None,
+                        caller: None,
                     },
                 }]),
             },
             Message {
                 role: Role::User,
-                content: Content::MultiPart(vec![Block::ToolResult {
+                content: Content(vec![Block::ToolResult {
                     result: ToolResult {
                         tool_use_id: Cow::Borrowed(call_id),
-                        content: Content::SinglePart(Cow::Borrowed("3")),
+                        content: Content::text("3"),
                         is_error: false,
                         cache_control: None,
                     },
                 }]),
             },
         ],
-        functions: Some(vec![tool]),
+        tools: Some(vec![tool.into()]),
         ..Default::default()
     };
     let opts = RenderOptions::default()
@@ -225,7 +222,7 @@ fn all_shapes_match_python_jinja2() {
 /// value so opt-out and explicit-override paths both work.
 #[test]
 fn enable_thinking_derives_from_prompt_thinking() {
-    use misanthropic::prompt::thinking::{Kind, Thinking};
+    use misanthropic::prompt::thinking::Thinking;
     use std::num::NonZeroU32;
 
     // Tiny template that echoes whatever value `enable_thinking` ends
@@ -240,7 +237,7 @@ fn enable_thinking_derives_from_prompt_thinking() {
 
     let user_msg = Message {
         role: Role::User,
-        content: Content::SinglePart(Cow::Borrowed("hi")),
+        content: Content::text("hi"),
     };
 
     // 1. thinking=None (default) → enable_thinking=false
@@ -258,9 +255,9 @@ fn enable_thinking_derives_from_prompt_thinking() {
     // 2. thinking=Some(...) → enable_thinking=true
     let prompt_on = Prompt {
         messages: vec![user_msg.clone()],
-        thinking: Some(Thinking {
+        thinking: Some(Thinking::Enabled {
             budget_tokens: NonZeroU32::new(1024).unwrap(),
-            kind: Kind::Enabled,
+            display: None,
         }),
         ..Default::default()
     };

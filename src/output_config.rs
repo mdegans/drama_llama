@@ -105,7 +105,7 @@ pub fn grammar_for_output_config(
     opts: &OutputConfigOptions,
 ) -> Result<SamplingMode, OutputConfigError> {
     let schema = match &config.format {
-        OutputFormat::JsonSchema(f) => &f.schema,
+        Some(OutputFormat::JsonSchema(f)) => &f.schema,
         _ => return Err(OutputConfigError::UnsupportedFormat),
     };
     let source = build_grammar_source(schema, opts);
@@ -121,7 +121,7 @@ pub fn compile_output_config(
     opts: &OutputConfigOptions,
 ) -> Result<CompiledOutputConfig, OutputConfigError> {
     let schema = match &config.format {
-        OutputFormat::JsonSchema(f) => &f.schema,
+        Some(OutputFormat::JsonSchema(f)) => &f.schema,
         _ => return Err(OutputConfigError::UnsupportedFormat),
     };
     if opts.phase_split && opts.allow_thought {
@@ -394,7 +394,7 @@ mod tests {
     fn compile_prompt_deferred_when_thinking_enabled() {
         // When thinking IS enabled on the prompt, Session-level
         // phase_split=true is honored and the grammar is deferred.
-        use misanthropic::prompt::thinking::{Kind, Thinking};
+        use misanthropic::prompt::thinking::Thinking;
         use std::num::NonZeroU32;
         let prompt = Prompt::default()
             .json_schema(json!({
@@ -402,9 +402,9 @@ mod tests {
                 "properties": {"ok": {"type": "boolean"}},
                 "required": ["ok"],
             }))
-            .thinking(Thinking {
+            .thinking(Thinking::Enabled {
                 budget_tokens: NonZeroU32::new(1024).unwrap(),
-                kind: Kind::Enabled,
+                display: None,
             });
         assert!(prompt.thinking.is_some(), "precondition");
         let compiled = compile_prompt_output_config(
@@ -447,7 +447,7 @@ mod tests {
     impl OutputConfigSchemaExt for OutputConfig {
         fn format_schema(&self) -> serde_json::Value {
             match &self.format {
-                OutputFormat::JsonSchema(f) => f.schema.clone(),
+                Some(OutputFormat::JsonSchema(f)) => f.schema.clone(),
                 _ => serde_json::Value::Null,
             }
         }

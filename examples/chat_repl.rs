@@ -18,10 +18,7 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use clap::Parser;
-use drama_llama::{
-    AssistantMessage, Block, CachedPrompt, Content, Prompt, Session,
-    UserMessage,
-};
+use drama_llama::{CachedPrompt, Prompt, Session, UserMessage};
 use rustyline::{error::ReadlineError, DefaultEditor};
 
 #[derive(Parser, Debug)]
@@ -50,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // from it.
     let mut prompt = CachedPrompt::cached(
         Prompt::default()
-            .set_system("You are a helpful assistant. Keep replies concise."),
+            .system("You are a helpful assistant. Keep replies concise."),
     );
 
     let mut rl = DefaultEditor::new()?;

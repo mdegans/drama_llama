@@ -1299,10 +1299,14 @@ impl<B: Backend> Session<B> {
         output_tokens: usize,
     ) -> Usage {
         Usage {
-            input_tokens: prompt_tokens as u64,
-            cache_creation_input_tokens: Some(0),
-            cache_read_input_tokens: Some(cache_read as u64),
-            output_tokens: output_tokens as u64,
+            counts: misanthropic::response::TokenCounts {
+                input_tokens: prompt_tokens as u64,
+                cache_creation_input_tokens: Some(0),
+                cache_read_input_tokens: Some(cache_read as u64),
+                output_tokens: output_tokens as u64,
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
 
@@ -1322,8 +1326,8 @@ impl<B: Backend> Session<B> {
         prompt: &Prompt,
         blocks: &[crate::Block],
     ) -> Result<[u8; 32], SessionError> {
-        let mut extended = prompt.clone().into_static();
-        let asst: misanthropic::prompt::message::AssistantMessage<'static> =
+        let mut extended = prompt.clone();
+        let asst: misanthropic::prompt::message::AssistantMessage =
             blocks.iter().cloned().collect();
         extended.messages.push(asst.into());
         let opts = self.render_opts.clone().with_generation_prompt(false);
@@ -1427,8 +1431,11 @@ impl<B: Backend> Session<B> {
     /// Record usage for the current call onto [`self.last_usage`]
     /// (overwrite) and [`self.total_usage`] (accumulate).
     fn record_usage(&mut self, usage: Usage) {
+        // `Usage` lost `Copy` in misanthropic 1.0.0-alpha.2 (it carries
+        // service-tier strings now); the numeric half stays `Copy` as
+        // `TokenCounts`.
+        self.total_usage += usage.clone();
         self.last_usage = usage;
-        self.total_usage += usage;
     }
 
     /// Debug escape hatch. Renders the prompt → tokenizes → runs the
@@ -1757,7 +1764,7 @@ impl<B: Backend> Session<B> {
         use crate::ToolChoice;
         let forced_tool_call = matches!(
             prompt.tool_choice,
-            Some(ToolChoice::Method { .. }) | Some(ToolChoice::Any)
+            Some(ToolChoice::Method { .. }) | Some(ToolChoice::Any { .. })
         );
 
         let (tokens, breakpoints, modes, deferred_grammar, partial_hashes) =
@@ -1928,8 +1935,7 @@ impl<B: Backend> Session<B> {
         // effort: a render error logs and falls back to no tip hash
         // (cache still works, just without the auto-tip side-table
         // entry).
-        let blocks_owned: Vec<crate::Block> =
-            blocks.iter().cloned().map(|b| b.into_static()).collect();
+        let blocks_owned: Vec<crate::Block> = blocks.to_vec();
         let tip_hash = match self.compute_tip_hash(prompt, &blocks_owned) {
             Ok(h) => Some(h),
             Err(_e) => {
@@ -2209,7 +2215,7 @@ impl<B: Backend> Session<B> {
     pub fn complete_response(
         &mut self,
         prompt: &Prompt,
-    ) -> Result<misanthropic::response::Message<'static>, SessionError> {
+    ) -> Result<misanthropic::response::Message, SessionError> {
         self.complete_response_id(prompt, uuid::Uuid::new_v4())
     }
 
@@ -2223,7 +2229,7 @@ impl<B: Backend> Session<B> {
         &mut self,
         prompt: &Prompt,
         id: uuid::Uuid,
-    ) -> Result<misanthropic::response::Message<'static>, SessionError> {
+    ) -> Result<misanthropic::response::Message, SessionError> {
         let outcome = self.run_call(prompt)?;
         let inner: crate::AssistantMessage =
             outcome.blocks.into_iter().collect();
@@ -2234,6 +2240,7 @@ impl<B: Backend> Session<B> {
         );
         Ok(misanthropic::response::Message {
             id: std::borrow::Cow::Owned(id.to_string()),
+            kind: None,
             inner,
             model: self
                 .engine
@@ -2243,7 +2250,9 @@ impl<B: Backend> Session<B> {
                 .into(),
             stop_reason: outcome.stop_reason,
             stop_sequence: outcome.stop_sequence.map(std::borrow::Cow::Owned),
+            stop_details: None,
             usage,
+            container: None,
         })
     }
 }
@@ -2273,11 +2282,12 @@ fn resolve_grammar(
     {
         let tc_kind = match prompt.tool_choice.as_ref() {
             None => "None",
-            Some(crate::ToolChoice::Auto) => "Auto",
-            Some(crate::ToolChoice::Any) => "Any",
+            Some(crate::ToolChoice::Auto { .. }) => "Auto",
+            Some(crate::ToolChoice::Any { .. }) => "Any",
             Some(crate::ToolChoice::Method { .. }) => "Method",
+            Some(crate::ToolChoice::None) => "None",
         };
-        let n_tools = prompt.functions.as_deref().map(|f| f.len()).unwrap_or(0);
+        let n_tools = prompt.tools.as_deref().map(|f| f.len()).unwrap_or(0);
         tracing::debug!(
             target: "drama_llama::session",
             tool_choice = tc_kind,
@@ -2699,7 +2709,7 @@ mod tests {
     /// thinking so the Deferred path is exercised.
     #[test]
     fn test_resolve_grammar_output_config_when_no_tool_choice() {
-        use misanthropic::prompt::thinking::{Kind, Thinking};
+        use misanthropic::prompt::thinking::Thinking;
         use std::num::NonZeroU32;
         let prompt = Prompt::default()
             .json_schema(serde_json::json!({
@@ -2707,9 +2717,9 @@ mod tests {
                 "properties": {"x": {"type": "integer"}},
                 "required": ["x"],
             }))
-            .thinking(Thinking {
+            .thinking(Thinking::Enabled {
                 budget_tokens: NonZeroU32::new(1024).unwrap(),
-                kind: Kind::Enabled,
+                display: None,
             });
         let got = resolve_grammar(
             &prompt,
@@ -2780,10 +2790,12 @@ mod tests {
             schema: serde_json::json!({"type": "object"}),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
         let prompt = Prompt {
-            functions: Some(vec![tool]),
-            tool_choice: Some(crate::ToolChoice::Method { name: "foo".into() }),
+            tools: Some(vec![tool.into()]),
+            tool_choice: Some(crate::ToolChoice::method("foo")),
             ..Prompt::default()
         }
         .json_schema(serde_json::json!({
@@ -2845,6 +2857,7 @@ mod tests {
             crate::Block::Text {
                 text: "ok".into(),
                 cache_control: None,
+                citations: None,
             },
             crate::Block::ToolUse {
                 call: Use {
@@ -2852,6 +2865,7 @@ mod tests {
                     name: "t".into(),
                     input: serde_json::json!({}),
                     cache_control: None,
+                    caller: None,
                 },
             },
         ];
@@ -2869,6 +2883,7 @@ mod tests {
         let blocks = vec![crate::Block::Text {
             text: "hello STOP".into(),
             cache_control: None,
+            citations: None,
         }];
         let stops = vec![std::borrow::Cow::Borrowed("STOP")];
         let max = NonZeroUsize::new(128).unwrap();
@@ -2886,6 +2901,7 @@ mod tests {
         let blocks = vec![crate::Block::Text {
             text: "truncated".into(),
             cache_control: None,
+            citations: None,
         }];
         let max = NonZeroUsize::new(16).unwrap();
         let (reason, seq) =
@@ -2901,6 +2917,7 @@ mod tests {
         let blocks = vec![crate::Block::Text {
             text: "done.".into(),
             cache_control: None,
+            citations: None,
         }];
         let max = NonZeroUsize::new(64).unwrap();
         let (reason, _) = infer_stop_reason(&blocks, "done.", 5, max, None);
@@ -3077,14 +3094,13 @@ mod tests {
         let user_block = MBlock::Text {
             text: Cow::Borrowed(user_msg),
             cache_control: Some(CacheControl::Ephemeral { ttl: None }),
+            citations: None,
         };
         Prompt {
-            system: Some(MContent::SinglePart(Cow::Borrowed(
-                "You are a helpful assistant. Keep replies short.",
-            ))),
+            system: Some(MContent::text("You are a helpful assistant. Keep replies short.")),
             messages: vec![crate::Message {
                 role: crate::Role::User,
-                content: MContent::MultiPart(vec![user_block]),
+                content: MContent(vec![user_block]),
             }],
             ..Prompt::default()
         }
@@ -3148,19 +3164,16 @@ mod tests {
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_miss_no_breakpoints() {
         use misanthropic::prompt::message::Content as MContent;
-        use std::borrow::Cow;
         let mut session = Session::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
             .with_sampling(std::iter::empty());
         let prompt = Prompt {
-            system: Some(MContent::SinglePart(Cow::Borrowed(
-                "You are a helpful assistant.",
-            ))),
+            system: Some(MContent::text("You are a helpful assistant.")),
             messages: vec![crate::Message {
                 role: crate::Role::User,
-                content: MContent::SinglePart(Cow::Borrowed("Hello.")),
+                content: MContent::text("Hello."),
             }],
             ..Prompt::default()
         };

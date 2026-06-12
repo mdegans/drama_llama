@@ -106,7 +106,7 @@ fn main() {
 
     let prompt = Prompt::default()
         .structured_output::<CaseFile>()
-        .set_system(
+        .system(
             "Enable deep thinking subroutine. You are a brief, \
              decisive detective. Reason inside <think>...</think> in \
              under 300 tokens: note which suspects are ruled out by \

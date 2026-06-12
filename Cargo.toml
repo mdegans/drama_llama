@@ -37,7 +37,7 @@ rustc-hash = "2"
 sha2 = "0.10"
 minijinja = { version = "2.5", features = ["loader", "json"] }
 minijinja-contrib = { version = "2.5", features = ["pycompat"] }
-misanthropic = { git = "https://github.com/mdegans/misanthropic.git", branch = "dev", default-features = false, features = [
+misanthropic = { version = "1.0.0-alpha.2", default-features = false, features = [
     "partial-eq",
 ] }
 
@@ -111,7 +111,9 @@ axum = [
 ]
 # Enable typed structured-output helpers: `Prompt::structured_output::<T>()`,
 # `OutputConfig::for_type::<T>()`. Requires `schemars` for schema derivation.
-json-schema = ["dep:schemars", "misanthropic/json-schema"]
+# (misanthropic ≥1.0.0-alpha.2 ships schema support unconditionally, so
+# this only gates our own schemars-derived helpers now.)
+json-schema = ["dep:schemars"]
 
 # `moeflux` gates the moeflux-backed Decoder + Model implementations.
 # Pulls in the safe `moeflux` wrapper (pure-Rust port + Metal kernels)

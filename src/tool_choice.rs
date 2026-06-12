@@ -127,14 +127,18 @@ pub fn grammar_for_tool_choice(
     // `strict_schema` works in both cases — each tool's schema rides
     // along with its name in a per-tool `call_<i>` alternative.
     let chosen: Vec<&Tool> = match choice {
-        ToolChoice::Auto => return Ok(None),
-        ToolChoice::Any => {
+        // `None` forbids tool calls outright, so like `Auto` there is no
+        // call shape to enforce. (Suppressing calls via grammar would
+        // mean predicting every non-tool-call string — not a grammar's
+        // job. The template simply doesn't advertise the tools.)
+        ToolChoice::Auto { .. } | ToolChoice::None => return Ok(None),
+        ToolChoice::Any { .. } => {
             if tools.is_empty() {
                 return Err(ToolChoiceError::NoTools);
             }
             tools.iter().collect()
         }
-        ToolChoice::Method { name } => {
+        ToolChoice::Method { name, .. } => {
             let Some(tool) =
                 tools.iter().find(|t| t.name.as_ref() == name.as_str())
             else {
@@ -150,7 +154,7 @@ pub fn grammar_for_tool_choice(
 }
 
 /// Derive the tool-choice grammar directly from a [`Prompt`]. Reads
-/// `prompt.tool_choice` and `prompt.functions`; returns `Ok(None)` when
+/// `prompt.tool_choice` and `prompt.tools`; returns `Ok(None)` when
 /// the prompt imposes no constraint (no `tool_choice`, `Auto`, or no
 /// advertised tools).
 ///
@@ -165,8 +169,17 @@ pub fn grammar_for_prompt(
     let Some(choice) = prompt.tool_choice.as_ref() else {
         return Ok(None);
     };
-    let tools: &[Tool] = prompt.functions.as_deref().unwrap_or(&[]);
-    grammar_for_tool_choice(choice, tools, opts)
+    // `Prompt::tools` may mix custom and server tool definitions. Only
+    // custom defs carry a schema we can compile; server tools execute
+    // on Anthropic's side and can't occur in local inference anyway.
+    let tools: Vec<Tool> = prompt
+        .tools
+        .iter()
+        .flatten()
+        .filter_map(|def| def.as_method())
+        .cloned()
+        .collect();
+    grammar_for_tool_choice(choice, &tools, opts)
 }
 
 /// Debug-only accessor for the compiled GBNF text. Kept public so the
@@ -301,6 +314,8 @@ mod tests {
             schema: json!({"type": "object"}),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         }
     }
 
@@ -327,7 +342,7 @@ mod tests {
     #[test]
     fn auto_returns_none() {
         let got = grammar_for_tool_choice(
-            &ToolChoice::Auto,
+            &ToolChoice::auto(),
             &[],
             &ToolChoiceOptions::default(),
         )
@@ -338,7 +353,7 @@ mod tests {
     #[test]
     fn any_rejects_empty_tool_list() {
         let err = grammar_for_tool_choice(
-            &ToolChoice::Any,
+            &ToolChoice::any(),
             &[],
             &ToolChoiceOptions::default(),
         )
@@ -349,9 +364,7 @@ mod tests {
     #[test]
     fn method_rejects_unknown_name() {
         let err = grammar_for_tool_choice(
-            &ToolChoice::Method {
-                name: "missing".into(),
-            },
+            &ToolChoice::method("missing"),
             &[tool("get_weather")],
             &ToolChoiceOptions::default(),
         )
@@ -441,6 +454,8 @@ mod tests {
             }),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,
@@ -485,6 +500,8 @@ mod tests {
             }),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
         let tool_b = Tool {
             name: Cow::Borrowed("b"),
@@ -496,6 +513,8 @@ mod tests {
             }),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,
@@ -518,8 +537,11 @@ mod tests {
         assert!(!accepts(&src, r#"{"name": "c", "parameters": {"x": 1}}"#));
         // grammar_for_tool_choice path (with default opts) also
         // succeeds — no AnyWithStrictSchema error.
-        let res =
-            grammar_for_tool_choice(&ToolChoice::Any, &[tool_a, tool_b], &opts);
+        let res = grammar_for_tool_choice(
+            &ToolChoice::any(),
+            &[tool_a, tool_b],
+            &opts,
+        );
         assert!(res.is_ok(), "Any+strict_schema must compile, got {res:?}");
     }
 
@@ -555,6 +577,8 @@ mod tests {
             }),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,
@@ -562,9 +586,7 @@ mod tests {
         };
         // Compilation must succeed — the previous bug errored here.
         let result = grammar_for_tool_choice(
-            &ToolChoice::Method {
-                name: "two_ints".into(),
-            },
+            &ToolChoice::method("two_ints"),
             &[schema_tool.clone()],
             &opts,
         );
@@ -614,6 +636,8 @@ mod tests {
             schema: json!({"type": "object"}),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
         let src = build_grammar_source(&[&weird_tool], &bare_opts());
         // Grammar compiles.
@@ -761,6 +785,8 @@ mod tests {
             }),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         }
     }
 
@@ -942,6 +968,8 @@ mod tests {
             }),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
         let opts = ToolChoiceOptions {
             strict_schema: true,
@@ -982,8 +1010,8 @@ mod tests {
     fn grammar_for_prompt_auto_returns_none() {
         use crate::Prompt;
         let prompt = Prompt {
-            tool_choice: Some(ToolChoice::Auto),
-            functions: Some(vec![tool("x")]),
+            tool_choice: Some(ToolChoice::auto()),
+            tools: Some(vec![tool("x").into()]),
             ..Default::default()
         };
         let got =
@@ -1011,16 +1039,14 @@ mod tests {
 
         let weather = tool("get_weather");
         let prompt = Prompt {
-            system: Some(Content::SinglePart(Cow::Borrowed(
-                "You are a helpful assistant.",
-            ))),
+            system: Some(Content::text("You are a helpful assistant.")),
             messages: vec![Message {
                 role: Role::User,
-                content: Content::SinglePart(Cow::Borrowed(
+                content: Content::text(
                     "What's the weather in Paris? Call the tool.",
-                )),
+                ),
             }],
-            functions: Some(vec![weather.clone()]),
+            tools: Some(vec![weather.clone().into()]),
             ..Default::default()
         };
         let rendered = tmpl
@@ -1031,9 +1057,7 @@ mod tests {
             .unwrap();
 
         // Build a tool-choice grammar that forces the get_weather call.
-        let choice = ToolChoice::Method {
-            name: "get_weather".into(),
-        };
+        let choice = ToolChoice::method("get_weather");
         let tools = [weather];
         let forced = grammar_for_tool_choice(
             &choice,

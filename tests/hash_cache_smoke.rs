@@ -59,22 +59,23 @@ fn build_round1() -> (Prompt, Tool) {
         }),
         cache_control: None,
         strict: None,
+        defer_loading: None,
+        allowed_callers: None,
     };
 
     let prompt = Prompt {
-        system: Some(Content::SinglePart(Cow::Borrowed(
-            "You are a helpful assistant. Use the provided tool when answering.",
-        ))),
+        system: Some(Content::text("You are a helpful assistant. Use the provided tool when answering.")),
         messages: vec![Message {
             role: Role::User,
-            content: Content::MultiPart(vec![Block::Text {
+            content: Content(vec![Block::Text {
                 text: Cow::Borrowed(
                     "Count the number of r's in 'strawberry'.",
                 ),
                 cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
             }]),
         }],
-        functions: Some(vec![tool.clone()]),
+        tools: Some(vec![tool.clone().into()]),
         ..Prompt::default()
     };
 
@@ -90,20 +91,18 @@ fn build_round2(
     result_text: &str,
 ) -> Prompt {
     let call_id = tool_use.id.clone();
-    let mut prompt = base_prompt.clone().into_static();
+    let mut prompt = base_prompt.clone();
     prompt.messages.push(Message {
         role: Role::Assistant,
-        content: Content::MultiPart(vec![Block::ToolUse { call: tool_use }]),
+        content: Content(vec![Block::ToolUse { call: tool_use }]),
     });
     prompt.messages.push(Message {
         role: Role::User,
-        content: Content::MultiPart(vec![
+        content: Content(vec![
             Block::ToolResult {
                 result: ToolResult {
                     tool_use_id: call_id,
-                    content: Content::SinglePart(Cow::Owned(
-                        result_text.to_string(),
-                    )),
+                    content: Content::text(result_text.to_string()),
                     is_error: false,
                     cache_control: None,
                 },
@@ -111,6 +110,7 @@ fn build_round2(
             Block::Text {
                 text: Cow::Borrowed("Thanks. Now spell that word backwards."),
                 cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
             },
         ]),
     });
@@ -144,8 +144,7 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
     // Find the tool_use block in the response — needed for round 2's
     // re-rendering. If the model produced text only, synthesize a
     // dummy ToolUse so we still exercise the hash-cache code path.
-    let blocks_round1: Vec<Block> =
-        round1_resp.inner.content().clone().into_iter().collect();
+    let blocks_round1: Vec<Block> = round1_resp.inner.content.0.clone();
     let tool_use = blocks_round1
         .into_iter()
         .find_map(|b| match b {
@@ -157,6 +156,7 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
             name: Cow::Borrowed("count_letters"),
             input: json!({"letter": "r", "string": "strawberry"}),
             cache_control: None,
+            caller: None,
         });
 
     // Round 2: extend the conversation; cache_read should jump from

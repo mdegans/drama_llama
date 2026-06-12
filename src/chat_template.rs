@@ -241,13 +241,23 @@ impl ChatTemplate {
         opts: &RenderOptions,
     ) -> Result<String, ChatTemplateError> {
         let messages = build_messages(prompt);
-        let tools_value = match prompt.functions.as_ref() {
-            Some(ts) if !ts.is_empty() => {
-                let wire: Vec<serde_json::Value> =
-                    ts.iter().map(tool_wire_value).collect();
-                JinjaValue::from_serialize(&wire)
-            }
-            _ => JinjaValue::from(()), // renders as None / null
+        // Only custom (client-executed) tool defs render into the
+        // template; server tools execute on Anthropic's side and their
+        // schemas aren't even visible to us.
+        let custom_tools: Vec<&crate::Tool> = prompt
+            .tools
+            .iter()
+            .flatten()
+            .filter_map(|def| def.as_method())
+            .collect();
+        let tools_value = if custom_tools.is_empty() {
+            JinjaValue::from(()) // renders as None / null
+        } else {
+            let wire: Vec<serde_json::Value> = custom_tools
+                .iter()
+                .map(|t| tool_wire_value(t))
+                .collect();
+            JinjaValue::from_serialize(&wire)
         };
         // Default `date_string` to today in HF's "%d %b %Y" format when
         // the caller didn't supply one. The template unconditionally
@@ -506,9 +516,9 @@ fn collect_breakpoints(prompt: &Prompt) -> Vec<Breakpoint> {
     let mut out = Vec::new();
 
     let tools_cached = prompt
-        .functions
+        .tools
         .as_ref()
-        .is_some_and(|fns| fns.iter().any(|m| m.cache_control.is_some()));
+        .is_some_and(|defs| defs.iter().any(|m| m.is_cached()));
     if tools_cached {
         out.push(Breakpoint::AfterTools);
     }
@@ -529,19 +539,8 @@ fn collect_breakpoints(prompt: &Prompt) -> Vec<Breakpoint> {
 }
 
 /// Does any block inside `content` carry a `cache_control` marker?
-///
-/// [`Content::has_cache`] on misanthropic only reports `true` for
-/// [`Content::MultiPart`] — `SinglePart` has no per-block
-/// `cache_control` field to set, so this is equivalent. We spell it
-/// out locally to keep the intent obvious at the call site.
-///
-/// [`Content::has_cache`]: misanthropic::prompt::message::Content::has_cache
-/// [`Content::MultiPart`]: crate::Content::MultiPart
 fn content_has_cache(content: &Content) -> bool {
-    match content {
-        Content::SinglePart(_) => false,
-        Content::MultiPart(blocks) => blocks.iter().any(|b| b.is_cached()),
-    }
+    content.0.iter().any(|b| b.is_cached())
 }
 
 /// Render `prompt` truncated at `up_to` with
@@ -555,7 +554,7 @@ fn render_partial(
 ) -> Result<String, ChatTemplateError> {
     let truncated = match up_to {
         Breakpoint::AfterTools => Prompt {
-            functions: prompt.functions.clone(),
+            tools: prompt.tools.clone(),
             // Carry the system content too. Every modern template
             // (Qwen3, Llama 3.1, Hermes, Cogito) coalesces tools into
             // the system block, so a "tools-only, no system" truncation
@@ -570,13 +569,13 @@ fn render_partial(
             ..Prompt::default()
         },
         Breakpoint::AfterSystem => Prompt {
-            functions: prompt.functions.clone(),
+            tools: prompt.tools.clone(),
             system: prompt.system.clone(),
             messages: Vec::new(),
             ..Prompt::default()
         },
         Breakpoint::AfterMessage(i) => Prompt {
-            functions: prompt.functions.clone(),
+            tools: prompt.tools.clone(),
             system: prompt.system.clone(),
             messages: prompt.messages[..=i].to_vec(),
             ..Prompt::default()
@@ -669,6 +668,9 @@ fn build_messages(prompt: &Prompt) -> Vec<JinjaValue> {
         let role = match m.role {
             Role::User => "user",
             Role::Assistant => "assistant",
+            // Mid-conversation system turns (misanthropic ≥alpha.2).
+            // HF templates broadly accept repeated system messages.
+            Role::System => "system",
         };
         append_message(&mut out, role, &m.content);
     }
@@ -677,13 +679,7 @@ fn build_messages(prompt: &Prompt) -> Vec<JinjaValue> {
 
 /// Emit one or more Jinja messages for a single misanthropic Message.
 fn append_message(out: &mut Vec<JinjaValue>, role: &str, content: &Content) {
-    let blocks: Vec<&Block> = match content {
-        Content::SinglePart(text) => {
-            out.push(text_message(role, text.to_string()));
-            return;
-        }
-        Content::MultiPart(blocks) => blocks.iter().collect(),
-    };
+    let blocks: Vec<&Block> = content.0.iter().collect();
 
     // User turn: split ToolResult blocks into their own "tool" messages,
     // collect remaining text/thought into a trailing user message.
@@ -778,16 +774,11 @@ fn tool_result_message(tool_use_id: &str, content: String) -> JinjaValue {
 /// Flatten any [`Content`] to a single string using [`append_block_text`]
 /// for each part.
 fn flatten_text(content: &Content) -> String {
-    match content {
-        Content::SinglePart(text) => text.to_string(),
-        Content::MultiPart(blocks) => {
-            let mut out = String::new();
-            for b in blocks {
-                append_block_text(&mut out, b);
-            }
-            out
-        }
+    let mut out = String::new();
+    for b in &content.0 {
+        append_block_text(&mut out, b);
     }
+    out
 }
 
 /// Append a single block's user-visible text to `out`. Tool-use and
@@ -801,10 +792,10 @@ fn append_block_text(out: &mut String, block: &Block) {
             out.push_str(thought);
             out.push_str("</think>");
         }
-        Block::RedactedThought { .. }
-        | Block::Image { .. }
-        | Block::ToolUse { .. }
-        | Block::ToolResult { .. } => {}
+        // Tool-use / tool-result blocks are handled at the message
+        // level; redacted thoughts, images, documents, and the server-
+        // tool block family contribute no template-visible text.
+        _ => {}
     }
 }
 
@@ -1045,7 +1036,7 @@ mod tests {
 
     fn simple_prompt() -> Prompt {
         Prompt::default()
-            .set_system("You are helpful.")
+            .system("You are helpful.")
             .add_message((Role::User, "Hi!"))
             .unwrap()
             .add_message((Role::Assistant, "Hello!"))
@@ -1100,7 +1091,7 @@ mod tests {
 
     #[test]
     fn thought_block_wraps_with_think_tags() {
-        let mut content = Content::MultiPart(vec![
+        let mut content = Content(vec![
             Block::Thought {
                 thought: "I should be concise.".into(),
                 signature: "sig".into(),
@@ -1114,7 +1105,7 @@ mod tests {
                 role: Role::Assistant,
                 content,
             }],
-            functions: None,
+            tools: None,
             ..Default::default()
         };
         let out = tmpl().render(&p, false).unwrap();
@@ -1146,12 +1137,12 @@ mod tests {
             system: None,
             messages: vec![Message {
                 role: Role::User,
-                content: Content::MultiPart(vec![
+                content: Content(vec![
                     Block::text("Hello "),
                     Block::text("world"),
                 ]),
             }],
-            functions: None,
+            tools: None,
             ..Default::default()
         };
         let out = tmpl().render(&p, false).unwrap();
@@ -1217,19 +1208,17 @@ mod tests {
             }),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
 
         let prompt = Prompt {
-            system: Some(Content::SinglePart(Cow::Borrowed(
-                "You are helpful.",
-            ))),
+            system: Some(Content::text("You are helpful.")),
             messages: vec![Message {
                 role: Role::User,
-                content: Content::SinglePart(Cow::Borrowed(
-                    "What's the weather in Paris?",
-                )),
+                content: Content::text("What's the weather in Paris?"),
             }],
-            functions: Some(vec![tool]),
+            tools: Some(vec![tool.into()]),
             ..Default::default()
         };
 
@@ -1276,6 +1265,7 @@ mod tests {
             name: Cow::Borrowed("get_weather"),
             input: json!({"city": "Paris"}),
             cache_control: None,
+            caller: None,
         };
 
         let prompt = Prompt {
@@ -1283,16 +1273,14 @@ mod tests {
             messages: vec![
                 Message {
                     role: Role::User,
-                    content: Content::SinglePart(Cow::Borrowed(
-                        "Call get_weather for Paris.",
-                    )),
+                    content: Content::text("Call get_weather for Paris."),
                 },
                 Message {
                     role: Role::Assistant,
-                    content: Content::MultiPart(vec![Block::ToolUse { call }]),
+                    content: Content(vec![Block::ToolUse { call }]),
                 },
             ],
-            functions: None,
+            tools: None,
             ..Default::default()
         };
 
@@ -1372,21 +1360,19 @@ mod tests {
             }),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
         let prompt = Prompt {
-            system: Some(Content::SinglePart(Cow::Borrowed(
-                "You are a helpful assistant. You cannot count letters in a \
+            system: Some(Content::text("You are a helpful assistant. You cannot count letters in a \
                  word reliably on your own because you see in tokens, not \
                  letters. Use the `count_letters` tool when asked to count \
-                 characters.",
-            ))),
+                 characters.")),
             messages: vec![Message {
                 role: Role::User,
-                content: Content::SinglePart(Cow::Borrowed(
-                    "Count the number of r's in 'strawberry'",
-                )),
+                content: Content::text("Count the number of r's in 'strawberry'"),
             }],
-            functions: Some(vec![tool]),
+            tools: Some(vec![tool.into()]),
             ..Default::default()
         };
         let opts = RenderOptions::default()
@@ -1451,12 +1437,14 @@ mod tests {
             }),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         };
         let src =
             r#"{%- for t in tools %}{{ t | tojson }}{% endfor %}"#.to_owned();
         let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
         let prompt = Prompt {
-            functions: Some(vec![tool]),
+            tools: Some(vec![tool.into()]),
             ..Default::default()
         };
         let out = t.render(&prompt, false).unwrap();
@@ -1501,6 +1489,8 @@ mod tests {
             schema: json!({"type": "object", "properties": {}}),
             cache_control: None,
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         }
     }
 
@@ -1512,6 +1502,8 @@ mod tests {
             schema: json!({"type": "object", "properties": {}}),
             cache_control: Some(CacheControl::ephemeral()),
             strict: None,
+            defer_loading: None,
+            allowed_callers: None,
         }
     }
 
@@ -1520,9 +1512,10 @@ mod tests {
     fn cached_user_msg(text: &'static str) -> Message {
         Message {
             role: Role::User,
-            content: Content::MultiPart(vec![Block::Text {
+            content: Content(vec![Block::Text {
                 text: Cow::Borrowed(text),
                 cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
             }]),
         }
     }
@@ -1536,7 +1529,7 @@ mod tests {
     #[test]
     fn test_collect_breakpoints_tools_only() {
         let prompt = Prompt {
-            functions: Some(vec![tool_cached("cached_tool")]),
+            tools: Some(vec![tool_cached("cached_tool").into()]),
             ..Prompt::default()
         };
         assert_eq!(collect_breakpoints(&prompt), vec![Breakpoint::AfterTools]);
@@ -1547,18 +1540,19 @@ mod tests {
         // Tool marker + system marker + cache on messages[0] and
         // messages[2]. messages[1] is uncached — verifies the emitted
         // message indices match the actually-cached ones.
-        let system = Content::MultiPart(vec![Block::Text {
+        let system = Content(vec![Block::Text {
             text: Cow::Borrowed("You are helpful."),
             cache_control: Some(CacheControl::ephemeral()),
+            citations: None,
         }]);
         let prompt = Prompt {
-            functions: Some(vec![tool_plain("a"), tool_cached("b")]),
+            tools: Some(vec![tool_plain("a").into(), tool_cached("b").into()]),
             system: Some(system),
             messages: vec![
                 cached_user_msg("first"),
                 Message {
                     role: Role::Assistant,
-                    content: Content::SinglePart(Cow::Borrowed("reply")),
+                    content: Content::text("reply"),
                 },
                 cached_user_msg("third"),
             ],
@@ -1582,10 +1576,10 @@ mod tests {
         // `render_with` produces on the same prompt with messages
         // cleared and `add_generation_prompt=false`.
         let prompt = Prompt {
-            system: Some(Content::SinglePart(Cow::Borrowed("Sys."))),
+            system: Some(Content::text("Sys.")),
             messages: vec![Message {
                 role: Role::User,
-                content: Content::SinglePart(Cow::Borrowed("q")),
+                content: Content::text("q"),
             }],
             ..Prompt::default()
         };
@@ -1626,12 +1620,12 @@ mod tests {
         // caller asking for add_generation_prompt=true. The full
         // render must honor it; each partial must not.
         let prompt = Prompt {
-            system: Some(Content::SinglePart(Cow::Borrowed("sys"))),
+            system: Some(Content::text("sys")),
             messages: vec![
                 cached_user_msg("hi"),
                 Message {
                     role: Role::Assistant,
-                    content: Content::SinglePart(Cow::Borrowed("hello")),
+                    content: Content::text("hello"),
                 },
             ],
             ..Prompt::default()
@@ -1673,10 +1667,10 @@ mod tests {
     #[test]
     fn test_render_partial_after_system_qwen3_like_permissive_succeeds() {
         let prompt = Prompt {
-            system: Some(Content::SinglePart(Cow::Borrowed("You are agent."))),
+            system: Some(Content::text("You are agent.")),
             messages: vec![Message {
                 role: Role::User,
-                content: Content::SinglePart(Cow::Borrowed("hi")),
+                content: Content::text("hi"),
             }],
             ..Prompt::default()
         };
@@ -1715,11 +1709,11 @@ mod tests {
     #[test]
     fn test_render_partial_after_tools_qwen3_like_permissive_succeeds() {
         let prompt = Prompt {
-            functions: Some(vec![tool_cached("ping")]),
-            system: Some(Content::SinglePart(Cow::Borrowed("sys"))),
+            tools: Some(vec![tool_cached("ping").into()]),
+            system: Some(Content::text("sys")),
             messages: vec![Message {
                 role: Role::User,
-                content: Content::SinglePart(Cow::Borrowed("q")),
+                content: Content::text("q"),
             }],
             ..Prompt::default()
         };
@@ -1752,15 +1746,16 @@ mod tests {
     /// silently dropped this and returned `partial_texts.is_empty()`.
     #[test]
     fn test_render_with_breakpoints_after_system_survives_on_qwen3_like() {
-        let system = Content::MultiPart(vec![Block::Text {
+        let system = Content(vec![Block::Text {
             text: Cow::Borrowed("You are agent."),
             cache_control: Some(CacheControl::ephemeral()),
+            citations: None,
         }]);
         let prompt = Prompt {
             system: Some(system),
             messages: vec![Message {
                 role: Role::User,
-                content: Content::SinglePart(Cow::Borrowed("hi")),
+                content: Content::text("hi"),
             }],
             ..Prompt::default()
         };
@@ -1787,7 +1782,7 @@ mod tests {
         // multi_step_tool, finds no user message, raises. Strict env
         // must propagate that as an error.
         let prompt = Prompt {
-            system: Some(Content::SinglePart(Cow::Borrowed("sys"))),
+            system: Some(Content::text("sys")),
             ..Prompt::default()
         };
         let err = qwen3_like_tmpl()
@@ -1818,18 +1813,16 @@ mod tests {
         let t = ChatTemplate::from_model(&engine.model).unwrap();
 
         let prompt = Prompt {
-            system: Some(Content::SinglePart(Cow::Borrowed(
-                "You are helpful.",
-            ))),
+            system: Some(Content::text("You are helpful.")),
             messages: vec![
                 cached_user_msg("Who am I?"),
                 Message {
                     role: Role::Assistant,
-                    content: Content::SinglePart(Cow::Borrowed("A human.")),
+                    content: Content::text("A human."),
                 },
                 Message {
                     role: Role::User,
-                    content: Content::SinglePart(Cow::Borrowed("What next?")),
+                    content: Content::text("What next?"),
                 },
             ],
             ..Prompt::default()

@@ -97,7 +97,7 @@ fn whodunit_verdict() {
 
     let prompt = Prompt::default()
         .structured_output::<CaseFile>()
-        .set_system(
+        .system(
             "Enable deep thinking subroutine. You are a brief, \
              decisive detective. Reason inside <think>...</think> in \
              under 300 tokens: note which suspects are ruled out by \
@@ -114,15 +114,7 @@ fn whodunit_verdict() {
 
     // (1) Response is multipart and contains at least one non-empty
     // Thought block — the model reasoned before committing.
-    let blocks = match &response.inner.content {
-        Content::SinglePart(_) => {
-            panic!(
-                "expected multipart response with thought + text blocks, \
-                 got SinglePart"
-            );
-        }
-        Content::MultiPart(blocks) => blocks,
-    };
+    let blocks = &response.inner.content.0;
     let has_thought = blocks.iter().any(|b| {
         matches!(b, Block::Thought { thought, .. } if !thought.trim().is_empty())
     });

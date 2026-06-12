@@ -43,12 +43,10 @@ fn opts() -> RenderOptions {
 fn singlepart_system_renders() {
     let t = load_template();
     let prompt = Prompt {
-        system: Some(Content::SinglePart(Cow::Borrowed(
-            "You are a concise assistant.",
-        ))),
+        system: Some(Content::text("You are a concise assistant.")),
         messages: vec![Message {
             role: Role::User,
-            content: Content::SinglePart(Cow::Borrowed("Hello")),
+            content: Content::text("Hello"),
         }],
         ..Prompt::default()
     };
@@ -63,15 +61,17 @@ fn singlepart_system_renders() {
 fn multipart_system_with_cache_control_renders() {
     let t = load_template();
     let prompt = Prompt {
-        system: Some(Content::MultiPart(vec![Block::Text {
+        system: Some(Content(vec![Block::Text {
             text: Cow::Borrowed("You are a concise assistant."),
             cache_control: Some(CacheControl::ephemeral()),
+            citations: None,
         }])),
         messages: vec![Message {
             role: Role::User,
-            content: Content::MultiPart(vec![Block::Text {
+            content: Content(vec![Block::Text {
                 text: Cow::Borrowed("Hello"),
                 cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
             }]),
         }],
         ..Prompt::default()
@@ -149,15 +149,17 @@ fn deserialize_and_render_anthropic_shape() {
 fn render_with_breakpoints_survives_after_system_breakpoint() {
     let t = load_template();
     let prompt = Prompt {
-        system: Some(Content::MultiPart(vec![Block::Text {
+        system: Some(Content(vec![Block::Text {
             text: Cow::Borrowed("You are a concise assistant."),
             cache_control: Some(CacheControl::ephemeral()),
+            citations: None,
         }])),
         messages: vec![Message {
             role: Role::User,
-            content: Content::MultiPart(vec![Block::Text {
+            content: Content(vec![Block::Text {
                 text: Cow::Borrowed("Hello"),
                 cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
             }]),
         }],
         ..Prompt::default()
@@ -180,25 +182,25 @@ fn render_with_breakpoints_survives_after_system_breakpoint() {
 fn singlepart_and_multipart_render_equivalent() {
     let t = load_template();
     let single = Prompt {
-        system: Some(Content::SinglePart(Cow::Borrowed(
-            "You are a concise assistant.",
-        ))),
+        system: Some(Content::text("You are a concise assistant.")),
         messages: vec![Message {
             role: Role::User,
-            content: Content::SinglePart(Cow::Borrowed("Hello")),
+            content: Content::text("Hello"),
         }],
         ..Prompt::default()
     };
     let multi = Prompt {
-        system: Some(Content::MultiPart(vec![Block::Text {
+        system: Some(Content(vec![Block::Text {
             text: Cow::Borrowed("You are a concise assistant."),
             cache_control: Some(CacheControl::ephemeral()),
+            citations: None,
         }])),
         messages: vec![Message {
             role: Role::User,
-            content: Content::MultiPart(vec![Block::Text {
+            content: Content(vec![Block::Text {
                 text: Cow::Borrowed("Hello"),
                 cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
             }]),
         }],
         ..Prompt::default()

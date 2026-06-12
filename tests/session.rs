@@ -8,7 +8,7 @@ use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
 
 use drama_llama::{
     prompt::{ToolResult, ToolUse},
-    Block, ChatTemplate, Content, Message, Prompt, RenderOptions, Role,
+    Block, Content, Message, Prompt, RenderOptions, Role,
     Session, SessionError, Tool, ToolChoice, ToolChoiceOptions,
 };
 use serde_json::json;
@@ -41,43 +41,42 @@ fn complete_text_strawberry_turn_2() {
         }),
         cache_control: None,
         strict: None,
+        defer_loading: None,
+        allowed_callers: None,
     };
     let call_id = "call_3_r";
     let prompt = Prompt {
-        system: Some(Content::SinglePart(Cow::Borrowed(
-            "You are a helpful assistant.",
-        ))),
+        system: Some(Content::text("You are a helpful assistant.")),
         messages: vec![
             Message {
                 role: Role::User,
-                content: Content::SinglePart(Cow::Borrowed(
-                    "Count the number of r's in 'strawberry'",
-                )),
+                content: Content::text("Count the number of r's in 'strawberry'"),
             },
             Message {
                 role: Role::Assistant,
-                content: Content::MultiPart(vec![Block::ToolUse {
+                content: Content(vec![Block::ToolUse {
                     call: ToolUse {
                         id: Cow::Borrowed(call_id),
                         name: Cow::Borrowed("count_letters"),
                         input: json!({"letter": "r", "string": "strawberry"}),
                         cache_control: None,
+                        caller: None,
                     },
                 }]),
             },
             Message {
                 role: Role::User,
-                content: Content::MultiPart(vec![Block::ToolResult {
+                content: Content(vec![Block::ToolResult {
                     result: ToolResult {
                         tool_use_id: Cow::Borrowed(call_id),
-                        content: Content::SinglePart(Cow::Borrowed("3")),
+                        content: Content::text("3"),
                         is_error: false,
                         cache_control: None,
                     },
                 }]),
             },
         ],
-        functions: Some(vec![tool]),
+        tools: Some(vec![tool.into()]),
         ..Default::default()
     };
 
@@ -135,21 +134,17 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
         }),
         cache_control: None,
         strict: None,
+        defer_loading: None,
+        allowed_callers: None,
     };
     let prompt = Prompt {
-        system: Some(Content::SinglePart(Cow::Borrowed(
-            "You are a helpful assistant.",
-        ))),
+        system: Some(Content::text("You are a helpful assistant.")),
         messages: vec![Message {
             role: Role::User,
-            content: Content::SinglePart(Cow::Borrowed(
-                "Count r's in 'strawberry'",
-            )),
+            content: Content::text("Count r's in 'strawberry'"),
         }],
-        functions: Some(vec![tool]),
-        tool_choice: Some(ToolChoice::Method {
-            name: "count_letters".into(),
-        }),
+        tools: Some(vec![tool.into()]),
+        tool_choice: Some(ToolChoice::method("count_letters")),
         ..Default::default()
     };
 
@@ -197,26 +192,22 @@ fn strawberry_turn_1_prompt() -> Prompt {
         }),
         cache_control: None,
         strict: None,
+        defer_loading: None,
+        allowed_callers: None,
     };
     Prompt {
         // Match the strawberry example's system prompt — short ones
         // give the model too much latitude to hallucinate args.
-        system: Some(Content::SinglePart(Cow::Borrowed(
-            "You are a helpful assistant. You cannot count letters in a \
+        system: Some(Content::text("You are a helpful assistant. You cannot count letters in a \
              word reliably on your own because you see in tokens, not \
              letters. Use the `count_letters` tool when asked to count \
-             characters.",
-        ))),
+             characters.")),
         messages: vec![Message {
             role: Role::User,
-            content: Content::SinglePart(Cow::Borrowed(
-                "Count the number of r's in 'strawberry'",
-            )),
+            content: Content::text("Count the number of r's in 'strawberry'"),
         }],
-        functions: Some(vec![tool]),
-        tool_choice: Some(ToolChoice::Method {
-            name: "count_letters".into(),
-        }),
+        tools: Some(vec![tool.into()]),
+        tool_choice: Some(ToolChoice::method("count_letters")),
         ..Default::default()
     }
 }
@@ -252,12 +243,7 @@ fn complete_returns_message_with_tool_use() {
     let msg: Message = assistant.into();
     assert_eq!(msg.role, Role::Assistant);
     // Must contain a ToolUse block.
-    let blocks: Vec<&Block> = match &msg.content {
-        Content::MultiPart(b) => b.iter().collect(),
-        Content::SinglePart(_) => {
-            panic!("expected MultiPart with ToolUse, got SinglePart")
-        }
-    };
+    let blocks: Vec<&Block> = msg.content.0.iter().collect();
     let call = blocks
         .iter()
         .find_map(|b| match b {
@@ -421,7 +407,7 @@ fn complete_response_id_uses_supplied_uuid() {
     let prompt = Prompt {
         messages: vec![Message {
             role: Role::User,
-            content: Content::SinglePart(Cow::Borrowed("Say hi.")),
+            content: Content::text("Say hi."),
         }],
         ..Default::default()
     };

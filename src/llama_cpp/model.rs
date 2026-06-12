@@ -813,7 +813,7 @@ mod tests {
         // Jinja chat-template render. Every chat-tuned model must be
         // able to echo the user/assistant turns we feed it.
         let prompt = Prompt::default()
-            .set_system("A conversation between a user and an assistant.")
+            .system("A conversation between a user and an assistant.")
             .add_message((crate::Role::User, "Hello, world!"))
             .unwrap()
             .add_message((crate::Role::Assistant, "Hi!"))

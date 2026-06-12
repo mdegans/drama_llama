@@ -57,6 +57,11 @@ const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
+// The tag tables below are unused pending the partial-tag-holdback
+// investigation flagged in the FIXME — kept (with explicit allows)
+// because the streaming parser *should* probably be using them to
+// avoid emitting a tag split across chunk boundaries.
+#[allow(dead_code)]
 const ALL_TAGS: &[&str] = &[THINK_OPEN, THINK_CLOSE, TOOL_OPEN, TOOL_CLOSE];
 const OPEN_TAGS: &[&str] = &[THINK_OPEN, TOOL_OPEN];
 const CLOSE_TAGS: &[&str] = &[THINK_CLOSE, TOOL_CLOSE];
@@ -76,7 +81,9 @@ const fn max_strlen(arr: &[&str]) -> usize {
 /// Longest open tag — we only need to hold back this much at the tail
 /// of the buffer when looking for a partial tag match.
 // FIXME: These are unused but they probably should be. Worth investigating.
+#[allow(dead_code)]
 const MAX_OPEN_TAG_LEN: usize = max_strlen(OPEN_TAGS);
+#[allow(dead_code)]
 const MAX_CLOSE_TAG_LEN: usize = max_strlen(CLOSE_TAGS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +328,9 @@ fn parse_tool_call_body(
         name: Cow::Owned(wire.name),
         input: wire.arguments,
         cache_control: None,
+        // Locally-parsed calls are always model-initiated; `caller` is
+        // only ever `Some` for the API's programmatic tool calling.
+        caller: None,
     })
 }
 
