@@ -27,7 +27,7 @@ use std::{borrow::Cow, path::PathBuf};
 
 use drama_llama::{
     prompt::{ToolResult, ToolUse},
-    Block, Content, Message, Prompt, Role, Session, Tool,
+    Block, Content, Message, Prompt, Role, Tool,
 };
 use misanthropic::prompt::message::CacheControl;
 use serde_json::json;
@@ -120,7 +120,7 @@ fn build_round2(
 #[test]
 #[ignore = "requires model; sets DRAMA_LLAMA_COGITO_MODEL or models/model.gguf"]
 fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
-    let mut session = Session::from_path(model_path())
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
         .expect("model loads")
         .quiet()
         .with_prefix_cache(true);
@@ -144,17 +144,18 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
     // The response's tool_use (if any) — needed for round 2's
     // re-rendering. If the model produced text only, synthesize a
     // dummy ToolUse so we still exercise the hash-cache code path.
-    let mut tool_use = round1_resp
-        .inner
-        .tool_use()
-        .cloned()
-        .unwrap_or_else(|| ToolUse {
-            id: Cow::Borrowed("synthetic_call_1"),
-            name: Cow::Borrowed("count_letters"),
-            input: json!({"letter": "r", "string": "strawberry"}),
-            cache_control: None,
-            caller: None,
-        });
+    let mut tool_use =
+        round1_resp
+            .inner
+            .tool_use()
+            .cloned()
+            .unwrap_or_else(|| ToolUse {
+                id: Cow::Borrowed("synthetic_call_1"),
+                name: Cow::Borrowed("count_letters"),
+                input: json!({"letter": "r", "string": "strawberry"}),
+                cache_control: None,
+                caller: None,
+            });
     // Mark the assistant turn: the auto-tip hash matches a subsequent
     // request's partial render only where a breakpoint exists, and
     // breakpoints exist only at cache_control markers (see

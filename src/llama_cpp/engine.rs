@@ -1,8 +1,6 @@
 use crate::{
     llama_cpp::{
-        decoder::{
-            DecodeError, FlashAttention, LlamaCppDecoder, NewError,
-        },
+        decoder::{DecodeError, FlashAttention, LlamaCppDecoder, NewError},
         LlamaCppBackend,
     },
     log::silence_logs,

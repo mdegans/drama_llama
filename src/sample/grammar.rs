@@ -2426,7 +2426,7 @@ char ::= [\x00-\x7F] | [\x80-\xFF]"#;
 
         let model_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let mut engine = Engine::from_path(model_path).unwrap();
+        let mut engine = crate::LlamaCppEngine::from_path(model_path).unwrap();
 
         // A grammar that forces the output to look like a tool call for
         // `get_weather`. The constraint fixes the function name but lets

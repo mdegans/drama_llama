@@ -2,7 +2,7 @@
 //!
 //! A sidecar is a TOML file colocated with a model on disk that holds
 //! that model's preferred [`SampleOptions`] — sampling-mode chain,
-//! repetition-penalty config, etc. [`Session::from_path*`] looks for
+//! repetition-penalty config, etc. [`crate::LlamaCppSession::from_path*`] looks for
 //! one when loading a model and applies it via
 //! [`Session::with_sample_options`]. If no sidecar exists, a default is
 //! written so the user has a starting point to edit.
@@ -40,7 +40,7 @@
 //!   will rewrite the default.
 //! - To **tweak** something: edit the sidecar, save, restart.
 //!
-//! [`Session::from_path*`]: crate::Session::from_path
+//! [`crate::LlamaCppSession::from_path*`]: crate::crate::LlamaCppSession::from_path
 //! [`Session::with_sample_options`]: crate::Session::with_sample_options
 //! [`SamplingMode::Json`]: crate::SamplingMode::Json
 //! [`SamplingMode::Grammar`]: crate::SamplingMode::Grammar
@@ -110,10 +110,10 @@ pub fn load_sample_options(
 ///
 /// Does *not* overwrite an existing file — call
 /// [`load_sample_options`] first to detect existence; the
-/// [`Session::from_path*`] integration only writes when the read
+/// [`crate::LlamaCppSession::from_path*`] integration only writes when the read
 /// returned `Ok(None)`.
 ///
-/// [`Session::from_path*`]: crate::Session::from_path
+/// [`crate::LlamaCppSession::from_path*`]: crate::crate::LlamaCppSession::from_path
 pub fn write_default_sample_options(path: &Path) -> Result<(), SidecarError> {
     let opts = SampleOptions::default();
     let body = toml::to_string_pretty(&opts)?;

@@ -13,7 +13,7 @@
 //! ```no_run
 //! use drama_llama::{Prompt, Session};
 //!
-//! let mut session = Session::from_path("models/model.gguf".into())
+//! let mut session = crate::LlamaCppSession::from_path("models/model.gguf".into())
 //!     .unwrap()
 //!     .quiet();
 //! let prompt = Prompt::default(); // + system, messages, tools, etc.
@@ -467,6 +467,13 @@ fn apply_sidecar<B: Backend>(
 fn llama_cpp_sidecar_path(model_path: &std::path::Path) -> std::path::PathBuf {
     model_path.with_extension("sampling.toml")
 }
+
+/// Convenience alias for the llama.cpp-backed session, parallel to
+/// [`crate::LlamaCppEngine`]. Use it (or a turbofish) when both
+/// backends are compiled in and bare `crate::LlamaCppSession::from_path` would be
+/// ambiguous.
+#[cfg(feature = "llama-cpp")]
+pub type LlamaCppSession = Session<LlamaCppBackend>;
 
 // llama.cpp-specific constructors. Available only when the
 // `llama-cpp` feature is enabled.
@@ -2976,7 +2983,9 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_with_prefix_cache_default_off() {
-        let session = Session::from_path(model_path()).unwrap().quiet();
+        let session = crate::LlamaCppSession::from_path(model_path())
+            .unwrap()
+            .quiet();
         assert!(
             session.prefix_cache.is_none(),
             "default Session must have prefix cache disabled",
@@ -2988,7 +2997,9 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_last_and_total_usage_zero_initially() {
-        let session = Session::from_path(model_path()).unwrap().quiet();
+        let session = crate::LlamaCppSession::from_path(model_path())
+            .unwrap()
+            .quiet();
         assert_eq!(session.last_usage(), &Usage::default());
         assert_eq!(session.total_usage(), &Usage::default());
     }
@@ -3003,7 +3014,9 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_default_repetition_ignores_punctuation_category() {
-        let session = Session::from_path(model_path()).unwrap().quiet();
+        let session = crate::LlamaCppSession::from_path(model_path())
+            .unwrap()
+            .quiet();
         let with_rep = session.with_repetition(RepetitionOptions::default());
         let rep = with_rep
             .sample_options
@@ -3029,7 +3042,9 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_with_repetition_adds_special_tokens_to_ignored() {
-        let session = Session::from_path(model_path()).unwrap().quiet();
+        let session = crate::LlamaCppSession::from_path(model_path())
+            .unwrap()
+            .quiet();
         let eos = session.engine.model.eos();
         let eot = session.engine.model.eot();
         let specials = session.engine.model.special_tokens();
@@ -3071,7 +3086,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_clear_prefix_cache_zeroes_state() {
-        let mut session = Session::from_path(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true);
@@ -3120,7 +3135,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_hit_on_identical_prompts() {
-        let mut session = Session::from_path(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -3148,7 +3163,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_hit_on_shared_system_diverging_last_message() {
-        let mut session = Session::from_path(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -3172,7 +3187,7 @@ mod tests {
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_miss_no_breakpoints() {
         use misanthropic::prompt::message::Content as MContent;
-        let mut session = Session::from_path(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -3201,7 +3216,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_clear_invalidates_cache() {
-        let mut session = Session::from_path(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)

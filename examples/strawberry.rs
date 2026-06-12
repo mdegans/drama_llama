@@ -23,9 +23,7 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use clap::Parser;
-use drama_llama::{
-    Content, Prompt, RenderOptions, Role, Session, ToolChoice,
-};
+use drama_llama::{Content, Prompt, RenderOptions, Role, Session, ToolChoice};
 use misanthropic::tool::{tool, Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;

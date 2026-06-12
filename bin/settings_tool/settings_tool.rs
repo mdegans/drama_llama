@@ -52,9 +52,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::left("settings")
             .default_size(400.0)
-            .show_inside(ui, |ui| {
-                self.options.draw(ui, MAX_CONTEXT_SIZE)
-            });
+            .show_inside(ui, |ui| self.options.draw(ui, MAX_CONTEXT_SIZE));
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ComboBox::from_label("Format")

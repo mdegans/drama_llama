@@ -35,14 +35,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_path: PathBuf = std::env::var_os("DRAMA_LLAMA_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("models/model.gguf")
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
         });
 
     let json = std::fs::read_to_string(&prompt_path)?;
     let prompt: misanthropic::Prompt = serde_json::from_str(&json)?;
-    let model = LlamaCppModel::from_file(model_path.clone(), None)
-        .ok_or_else(|| format!("could not load model: {}", model_path.display()))?;
+    let model = LlamaCppModel::from_file(model_path.clone(), None).ok_or_else(
+        || format!("could not load model: {}", model_path.display()),
+    )?;
     let tmpl = ChatTemplate::from_model(&model)?;
 
     println!("=== prompt: {} ===", prompt_path.display());
@@ -135,7 +135,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn peek_first_text(content: &misanthropic::prompt::message::Content) -> Option<String> {
+fn peek_first_text(
+    content: &misanthropic::prompt::message::Content,
+) -> Option<String> {
     use misanthropic::prompt::message::Block;
     for b in &content.0 {
         if let Block::Text { text, .. } = b {

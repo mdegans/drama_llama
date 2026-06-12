@@ -49,11 +49,9 @@ impl From<MfError> for MoefluxError {
             MfError::StateFailed | MfError::StateBufferTooSmall { .. } => {
                 Self::StateFailed
             }
-            MfError::ModelMismatch { expected, detail } => {
-                Self::ModelMismatch(format!(
-                    "moeflux: binary built for {expected} — {detail}"
-                ))
-            }
+            MfError::ModelMismatch { expected, detail } => Self::ModelMismatch(
+                format!("moeflux: binary built for {expected} — {detail}"),
+            ),
         }
     }
 }

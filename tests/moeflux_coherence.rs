@@ -110,8 +110,8 @@ fn parse_worker_stdout(
         } else if let (Some(_chosen), Some(top)) =
             (v.get("chosen"), v.get("top"))
         {
-            let chosen = v["chosen"].as_i64().ok_or("step.chosen not i64")?
-                as i32;
+            let chosen =
+                v["chosen"].as_i64().ok_or("step.chosen not i64")? as i32;
             let top: Vec<(i32, f32)> = top
                 .as_array()
                 .ok_or("step.top not array")?
@@ -119,8 +119,7 @@ fn parse_worker_stdout(
                 .map(|pair| {
                     let a = pair.as_array().ok_or("top pair not array")?;
                     let id = a[0].as_i64().ok_or("top[0] not i64")? as i32;
-                    let logit =
-                        a[1].as_f64().ok_or("top[1] not f64")? as f32;
+                    let logit = a[1].as_f64().ok_or("top[1] not f64")? as f32;
                     Ok((id, logit))
                 })
                 .collect::<Result<_, String>>()?;
@@ -128,17 +127,21 @@ fn parse_worker_stdout(
         }
     }
 
-    let header = header
-        .ok_or_else(|| format!("no header line\nstderr:\n{stderr}"))?;
-    let trailer = trailer
-        .ok_or_else(|| format!("no trailer line\nstderr:\n{stderr}"))?;
+    let header =
+        header.ok_or_else(|| format!("no header line\nstderr:\n{stderr}"))?;
+    let trailer =
+        trailer.ok_or_else(|| format!("no trailer line\nstderr:\n{stderr}"))?;
     let h = &header["header"];
     let t = &trailer["trailer"];
 
-    let prompt_id =
-        h["prompt_id"].as_str().ok_or("header.prompt_id")?.to_string();
-    let gather_id =
-        h["gather_id"].as_str().ok_or("header.gather_id")?.to_string();
+    let prompt_id = h["prompt_id"]
+        .as_str()
+        .ok_or("header.prompt_id")?
+        .to_string();
+    let gather_id = h["gather_id"]
+        .as_str()
+        .ok_or("header.gather_id")?
+        .to_string();
     let n_vocab = h["n_vocab"].as_i64().ok_or("header.n_vocab")? as i32;
     let stop_set: HashSet<i32> = h["stop_set"]
         .as_array()
@@ -219,11 +222,7 @@ fn run_worker(prompt_id: &str, gather_id: u8) -> WorkerOutput {
 // Metric helpers
 // ──────────────────────────────────────────────────────────────────
 
-fn jaccard_top_k(
-    a: &[(i32, f32)],
-    b: &[(i32, f32)],
-    k: usize,
-) -> f64 {
+fn jaccard_top_k(a: &[(i32, f32)], b: &[(i32, f32)], k: usize) -> f64 {
     let sa: HashSet<i32> = a.iter().take(k).map(|p| p.0).collect();
     let sb: HashSet<i32> = b.iter().take(k).map(|p| p.0).collect();
     let inter = sa.intersection(&sb).count();
@@ -277,8 +276,18 @@ fn assert_pass_for_prompt(prompt_id: &str, a: &WorkerOutput, b: &WorkerOutput) {
         a.stop_set, b.stop_set,
         "stop_set mismatch across paths (both should see same model)"
     );
-    assert_eq!(a.chosen_seq.len(), N_STEPS, "A produced {} steps", a.chosen_seq.len());
-    assert_eq!(b.chosen_seq.len(), N_STEPS, "B produced {} steps", b.chosen_seq.len());
+    assert_eq!(
+        a.chosen_seq.len(),
+        N_STEPS,
+        "A produced {} steps",
+        a.chosen_seq.len()
+    );
+    assert_eq!(
+        b.chosen_seq.len(),
+        N_STEPS,
+        "B produced {} steps",
+        b.chosen_seq.len()
+    );
     assert_eq!(
         a.steps.len(),
         N_STEPS,
@@ -411,10 +420,7 @@ fn moeflux_sdpa_va_vs_vb() {
                 &vb.steps[i].top,
                 TOP_K_JACCARD,
             ));
-            cosines.push(cosine_union(
-                &va.steps[i].top,
-                &vb.steps[i].top,
-            ));
+            cosines.push(cosine_union(&va.steps[i].top, &vb.steps[i].top));
         }
         let mean_jac: f64 = jaccards.iter().sum::<f64>() / N_STEPS as f64;
         let mean_cos: f64 = cosines.iter().sum::<f64>() / N_STEPS as f64;

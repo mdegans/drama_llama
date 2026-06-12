@@ -959,7 +959,7 @@ mod tests {
 
         let model_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let mut engine = Engine::from_path(model_path).unwrap();
+        let mut engine = crate::LlamaCppEngine::from_path(model_path).unwrap();
 
         // Ask for a JSON character sheet. We use a minimalist system-style
         // prompt rather than a chat template so the test works regardless

@@ -116,6 +116,8 @@ pub use predictor::{
     all(feature = "moeflux", target_os = "macos")
 ))]
 mod session;
+#[cfg(feature = "llama-cpp")]
+pub use session::LlamaCppSession;
 #[cfg(any(
     feature = "llama-cpp",
     all(feature = "moeflux", target_os = "macos")

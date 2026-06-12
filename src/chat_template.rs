@@ -1156,12 +1156,11 @@ mod tests {
     #[test]
     #[ignore = "requires model"]
     fn chat_template_from_real_model() {
-        use crate::Engine;
         use std::path::PathBuf;
 
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let engine = Engine::from_path(path).unwrap();
+        let engine = crate::LlamaCppEngine::from_path(path).unwrap();
         let tmpl = ChatTemplate::from_model(&engine.model)
             .expect("model should have a chat template");
         let out = tmpl
@@ -1191,13 +1190,13 @@ mod tests {
     #[test]
     #[ignore = "requires model"]
     fn chat_template_renders_tools_against_real_model() {
-        use crate::{Engine, Tool};
+        use crate::Tool;
         use serde_json::json;
         use std::{borrow::Cow, path::PathBuf};
 
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let engine = Engine::from_path(path).unwrap();
+        let engine = crate::LlamaCppEngine::from_path(path).unwrap();
         let tmpl = ChatTemplate::from_model(&engine.model).unwrap();
 
         let tool = Tool {
@@ -1268,13 +1267,13 @@ mod tests {
     #[ignore = "requires model"]
     fn chat_template_renders_assistant_tool_call_against_real_model() {
         use crate::prompt::ToolUse;
-        use crate::Engine;
+
         use serde_json::json;
         use std::{borrow::Cow, path::PathBuf};
 
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let engine = Engine::from_path(path).unwrap();
+        let engine = crate::LlamaCppEngine::from_path(path).unwrap();
         let tmpl = ChatTemplate::from_model(&engine.model).unwrap();
 
         let call = ToolUse {
@@ -1326,7 +1325,6 @@ mod tests {
     #[test]
     #[ignore = "diagnostic helper"]
     fn dump_tokenize() {
-        use crate::Engine;
         use std::path::PathBuf;
         let Some(file) = std::env::var_os("DRAMA_LLAMA_TOKENIZE_FILE") else {
             // Helper, not a test: skip cleanly in `--include-ignored`
@@ -1338,7 +1336,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("read {file:?}: {e}"));
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let engine = Engine::from_path(path).unwrap();
+        let engine = crate::LlamaCppEngine::from_path(path).unwrap();
         let tokens_nospec = engine.model.tokenize(&text, false);
         let tokens_spec = engine.model.tokenize(&text, true);
         println!("parse_special=false: {} tokens", tokens_nospec.len());
@@ -1354,7 +1352,7 @@ mod tests {
     #[test]
     #[ignore = "fixture helper"]
     fn dump_strawberry_turn_1_output() {
-        use crate::{Engine, Tool};
+        use crate::Tool;
         use serde_json::json;
         use std::{borrow::Cow, path::PathBuf};
         let Some(dest) = std::env::var_os("DRAMA_LLAMA_DUMP_OUTPUT") else {
@@ -1365,7 +1363,7 @@ mod tests {
         };
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let engine = Engine::from_path(path).unwrap();
+        let engine = crate::LlamaCppEngine::from_path(path).unwrap();
         let tmpl = ChatTemplate::from_model(&engine.model).unwrap();
 
         let tool = Tool {
@@ -1421,7 +1419,6 @@ mod tests {
     #[test]
     #[ignore = "fixture helper"]
     fn dump_template_fixture() {
-        use crate::Engine;
         use std::path::PathBuf;
         let Some(dest) = std::env::var_os("DRAMA_LLAMA_DUMP_TEMPLATE") else {
             // Helper, not a test: skip cleanly in `--include-ignored`
@@ -1431,7 +1428,7 @@ mod tests {
         };
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let engine = Engine::from_path(path).unwrap();
+        let engine = crate::LlamaCppEngine::from_path(path).unwrap();
         let source = engine
             .model
             .get_meta("tokenizer.chat_template")
@@ -1834,12 +1831,11 @@ mod tests {
     #[test]
     #[ignore = "requires model"]
     fn test_tokenize_with_breakpoints_prefix_property() {
-        use crate::Engine;
         use std::path::PathBuf;
 
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let engine = Engine::from_path(path).unwrap();
+        let engine = crate::LlamaCppEngine::from_path(path).unwrap();
         let t = ChatTemplate::from_model(&engine.model).unwrap();
 
         let prompt = Prompt {

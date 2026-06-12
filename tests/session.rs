@@ -8,8 +8,8 @@ use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
 
 use drama_llama::{
     prompt::{ToolResult, ToolUse},
-    Block, Content, Message, Prompt, RenderOptions, Role,
-    Session, SessionError, Tool, ToolChoice, ToolChoiceOptions,
+    Block, Content, Message, Prompt, RenderOptions, Role, SessionError, Tool,
+    ToolChoice, ToolChoiceOptions,
 };
 use serde_json::json;
 
@@ -50,7 +50,9 @@ fn complete_text_strawberry_turn_2() {
         messages: vec![
             Message {
                 role: Role::User,
-                content: Content::text("Count the number of r's in 'strawberry'"),
+                content: Content::text(
+                    "Count the number of r's in 'strawberry'",
+                ),
             },
             Message {
                 role: Role::Assistant,
@@ -80,7 +82,7 @@ fn complete_text_strawberry_turn_2() {
         ..Default::default()
     };
 
-    let mut session = Session::from_path(model_path())
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .with_tool_choice_opts(ToolChoiceOptions {
@@ -148,7 +150,7 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
         ..Default::default()
     };
 
-    let mut session = Session::from_path(model_path())
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .with_tool_choice_opts(ToolChoiceOptions {
@@ -198,10 +200,12 @@ fn strawberry_turn_1_prompt() -> Prompt {
     Prompt {
         // Match the strawberry example's system prompt — short ones
         // give the model too much latitude to hallucinate args.
-        system: Some(Content::text("You are a helpful assistant. You cannot count letters in a \
+        system: Some(Content::text(
+            "You are a helpful assistant. You cannot count letters in a \
              word reliably on your own because you see in tokens, not \
              letters. Use the `count_letters` tool when asked to count \
-             characters.")),
+             characters.",
+        )),
         messages: vec![Message {
             role: Role::User,
             content: Content::text("Count the number of r's in 'strawberry'"),
@@ -231,7 +235,7 @@ fn cogito_tool_choice_opts() -> ToolChoiceOptions {
 #[ignore = "requires model"]
 fn complete_returns_message_with_tool_use() {
     let prompt = strawberry_turn_1_prompt();
-    let mut session = Session::from_path(model_path())
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .with_tool_choice_opts(cogito_tool_choice_opts())
@@ -273,7 +277,7 @@ fn complete_returns_message_with_tool_use() {
 #[ignore = "requires model"]
 fn grammar_violation_on_truncated_tool_call() {
     let prompt = strawberry_turn_1_prompt();
-    let mut session = Session::from_path(model_path())
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .with_tool_choice_opts(cogito_tool_choice_opts())
@@ -307,7 +311,7 @@ fn complete_text_round_trips_through_parse_and_render() {
     let prompt = strawberry_turn_1_prompt();
     let tool_opts = cogito_tool_choice_opts();
 
-    let mut session = Session::from_path(model_path())
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .with_tool_choice_opts(tool_opts)
@@ -412,7 +416,7 @@ fn complete_response_id_uses_supplied_uuid() {
         ..Default::default()
     };
 
-    let mut session = Session::from_path(model_path())
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .with_max_tokens(NonZeroUsize::new(4).unwrap());

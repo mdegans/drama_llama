@@ -79,10 +79,12 @@ fn shape_03_strawberry_turn_1_matches_fixture() {
         allowed_callers: None,
     };
     let prompt = Prompt {
-        system: Some(Content::text("You are a helpful assistant. You cannot count letters in a \
+        system: Some(Content::text(
+            "You are a helpful assistant. You cannot count letters in a \
              word reliably on your own because you see in tokens, not \
              letters. Use the `count_letters` tool when asked to count \
-             characters.")),
+             characters.",
+        )),
         messages: vec![Message {
             role: Role::User,
             content: Content::text("Count the number of r's in 'strawberry'"),
@@ -137,7 +139,9 @@ fn shape_04_strawberry_turn_2_matches_fixture() {
         messages: vec![
             Message {
                 role: Role::User,
-                content: Content::text("Count the number of r's in 'strawberry'"),
+                content: Content::text(
+                    "Count the number of r's in 'strawberry'",
+                ),
             },
             Message {
                 role: Role::Assistant,

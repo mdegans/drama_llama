@@ -1027,14 +1027,14 @@ mod tests {
     #[ignore = "requires model"]
     fn tool_choice_forces_call_against_real_model() {
         use crate::{
-            ChatTemplate, Content, Engine, Message, PredictOptions, Prompt,
+            ChatTemplate, Content, Message, PredictOptions, Prompt,
             RenderOptions, Role, SampleOptions, SamplingMode,
         };
         use std::{num::NonZeroUsize, path::PathBuf};
 
         let model_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-        let mut engine = Engine::from_path(model_path).unwrap();
+        let mut engine = crate::LlamaCppEngine::from_path(model_path).unwrap();
         let tmpl = ChatTemplate::from_model(&engine.model).unwrap();
 
         let weather = tool("get_weather");

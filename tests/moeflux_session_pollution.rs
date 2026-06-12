@@ -31,11 +31,10 @@
 
 #![cfg(all(feature = "moeflux", target_os = "macos"))]
 
-use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use drama_llama::{Content, Message, MoefluxEngine, Prompt, Role, Session};
+use drama_llama::{Message, MoefluxEngine, Prompt, Role, Session};
 
 fn env_path(var: &str, default: &str) -> PathBuf {
     PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
@@ -71,14 +70,10 @@ fn build_session() -> Session<drama_llama::MoefluxBackend> {
 }
 
 fn user_prompt(system: &'static str, user: &'static str) -> Prompt {
-    Prompt {
-        system: Some(Content::SinglePart(Cow::Borrowed(system))),
-        messages: vec![Message {
-            role: Role::User,
-            content: Content::SinglePart(Cow::Borrowed(user)),
-        }],
-        ..Prompt::default()
-    }
+    Prompt::default()
+        .system(system)
+        .add_message((Role::User, user))
+        .unwrap()
 }
 
 /// Length floor per completion. Symptom B emits ~24 tokens (a few
@@ -210,17 +205,12 @@ fn three_consecutive_completions_do_not_degenerate() {
 #[test]
 #[ignore = "long running; needs moeflux artifacts"]
 fn partial_hit_output_matches_fresh_session() {
-    use drama_llama::Block;
-    use misanthropic::prompt::message::CacheControl;
+    use misanthropic::prompt::message::UserMessage;
 
     fn cached_user(text: &'static str) -> Message {
-        Message {
-            role: Role::User,
-            content: Content::MultiPart(vec![Block::Text {
-                text: Cow::Borrowed(text),
-                cache_control: Some(CacheControl::ephemeral()),
-            }]),
-        }
+        let mut m = UserMessage::from(text);
+        m.cache();
+        m.into()
     }
 
     let system_text =
@@ -231,30 +221,23 @@ fn partial_hit_output_matches_fresh_session() {
     let user2_text =
         "Now tell me one interesting historical fact about the year 1989.";
 
-    let turn1 = Prompt {
-        system: Some(Content::MultiPart(vec![Block::Text {
-            text: Cow::Borrowed(system_text),
-            cache_control: Some(CacheControl::ephemeral()),
-        }])),
-        messages: vec![cached_user(user1_text)],
-        ..Prompt::default()
-    };
+    // `.cache()` after `.system(...)` marks the system block (the
+    // last cacheable block at that point in the chain).
+    let turn1 = Prompt::default()
+        .system(system_text)
+        .cache()
+        .add_message(cached_user(user1_text))
+        .unwrap();
 
-    let turn2 = Prompt {
-        system: Some(Content::MultiPart(vec![Block::Text {
-            text: Cow::Borrowed(system_text),
-            cache_control: Some(CacheControl::ephemeral()),
-        }])),
-        messages: vec![
-            cached_user(user1_text),
-            Message {
-                role: Role::Assistant,
-                content: Content::SinglePart(Cow::Borrowed(assistant1_text)),
-            },
-            cached_user(user2_text),
-        ],
-        ..Prompt::default()
-    };
+    let turn2 = Prompt::default()
+        .system(system_text)
+        .cache()
+        .add_message(cached_user(user1_text))
+        .unwrap()
+        .add_message((Role::Assistant, assistant1_text))
+        .unwrap()
+        .add_message(cached_user(user2_text))
+        .unwrap();
 
     // Cached run: A primes cache with turn1, then runs turn2 hitting
     // the partial-hit code path.

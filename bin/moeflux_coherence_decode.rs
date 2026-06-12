@@ -104,7 +104,9 @@ fn main() {
     let _progname = args.next();
     let prompt_id = match args.next() {
         Some(s) => s,
-        None => emit_error("missing prompt-id arg (one of: tobe, constitution, hobbit)"),
+        None => emit_error(
+            "missing prompt-id arg (one of: tobe, constitution, hobbit)",
+        ),
     };
     let prompt_str = match prompt_for(&prompt_id) {
         Some(p) => p,
@@ -148,7 +150,9 @@ fn main() {
     // -- tokenize --
     let prompt_tokens: Vec<Token> = engine.model.tokenize(prompt_str, false);
     if prompt_tokens.is_empty() {
-        emit_error(format!("tokenization produced 0 tokens for {prompt_str:?}"));
+        emit_error(format!(
+            "tokenization produced 0 tokens for {prompt_str:?}"
+        ));
     }
 
     // -- header --

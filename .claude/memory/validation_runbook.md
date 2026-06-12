@@ -45,8 +45,14 @@ different model. Examples are friendlier: `strawberry --model`,
 # Fast tests, default features (llama-cpp)
 cargo test
 
-# Full ignored sweep against models/model.gguf
-cargo test -- --include-ignored
+# Full ignored sweep against models/model.gguf.
+# --test-threads=1 is REQUIRED: parallel model tests construct
+# multiple ~20 GB engines concurrently and fail with
+# `decoder.step failed: ErrorCode { code: -3 }` (first seen
+# 2026-06-12; a 46 s wall time for the sweep is the tell that it
+# ran parallel). --no-fail-fast so a lib-target failure doesn't
+# skip the integration suites.
+cargo test --no-fail-fast -- --include-ignored --test-threads=1
 
 # moeflux integration tests (macOS; Temp Backup mounted)
 cargo test --features "moeflux,moeflux-model-qwen3-6-35b-a3b" \
