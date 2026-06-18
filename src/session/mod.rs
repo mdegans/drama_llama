@@ -390,12 +390,12 @@ pub struct Session<B: Backend> {
     /// reserved-token Deny mask) are prepended transiently inside
     /// `complete_*` and are *not* stored here — those are runtime-only.
     /// Defaults to `[SamplingMode::locally_typical()]` with
-    /// `repetition: None`: chat-style use wants the model to be able
-    /// to repeat natural short tokens (words, punctuation, digits that
-    /// appeared in the context — especially important for tool-result
-    /// follow-ups where the answer IS the digit). Story generation,
-    /// poetry, etc. opt in via per-model sidecar TOML or
-    /// [`Session::with_repetition`].
+    /// `repetition: Some(RepetitionOptions::default())` (on as of
+    /// v0.8.0 — the windowed decay removed the long-form degradation
+    /// that originally kept it off). Disable per-model via a sidecar
+    /// or [`Session::with_repetition`] / [`SampleOptions::greedy`] for
+    /// chat-style flows that must re-emit short context tokens
+    /// verbatim (e.g. a digit echoed from a tool result).
     sample_options: SampleOptions,
     /// RNG seed forwarded to every `predict_*` call. `None` =
     /// time-based seed (each call diverges); `Some(n)` = deterministic
@@ -620,13 +620,12 @@ impl<B: Backend> Session<B> {
         })
     }
 
-    /// Enable (or replace) repetition penalty. Default is `None`
-    /// because chat flows need the model to repeat natural tokens —
-    /// in particular, digits that appeared in a tool result (the
-    /// answer is often the same digit the tool just returned).
-    ///
-    /// Opt in for story generation, poetry, or anywhere loop-
-    /// prevention matters. See [`RepetitionOptions`] for parameters.
+    /// Enable (or replace) the repetition penalty. As of v0.8.0 the
+    /// default is `Some(RepetitionOptions::default())`; use this to
+    /// replace it with tuned parameters, or [`SampleOptions::greedy`] /
+    /// a sidecar to turn it off for chat flows that must repeat natural
+    /// short tokens (e.g. a digit echoed from a tool result). See
+    /// [`RepetitionOptions`] for parameters.
     ///
     /// The full set of model special tokens (EOS, EOT, BOS,
     /// chat-template markers like `<|start_header_id|>` /

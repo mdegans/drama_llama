@@ -19,15 +19,44 @@ use std::{
 #[cfg(feature = "egui")]
 use super::DELETE_ICON;
 
+/// Options for [`apply_sample_repetition_ngram`].
+///
+/// # Why this config is the odd one out
+///
+/// Unlike every other options struct in the crate ([`SampleOptions`],
+/// [`PredictOptions`], `RenderOptions`, `ToolChoiceOptions`,
+/// `OutputConfigOptions` — all of which expose public fields), the fields here
+/// are `pub(crate)` and reached through accessors. This is **deliberate**: it
+/// is the crate's only config with a cross-field invariant —
+/// [`ngram_min_size`](Self::ngram_min_size) `<=`
+/// [`ngram_max_size`](Self::ngram_max_size). A violated pair makes the
+/// generation-time `(min..=max)` range empty, silently disabling the penalty.
+///
+/// Do **not** "fix the inconsistency" by making the fields `pub`. That would let
+/// an external caller construct an inverted pair, reopening the hole that the
+/// three guards here close together:
+/// - **Setters clamp** with "just-set wins" — see
+///   [`set_ngram_min_size`](Self::set_ngram_min_size).
+/// - **`Deserialize` rejects** an inverted pair with
+///   [`RepetitionError::InvalidNgramRange`] (via `#[serde(try_from = ...)]` —
+///   keep it; don't revert to a plain derive). Strict rather than lenient
+///   because a hand-edited sidecar is read every run and never rewritten, so a
+///   silent clamp would hide the breakage forever.
+/// - **The apply site `debug_assert!`s** the invariant, surfacing any
+///   construction path that bypassed validation instead of masking it.
+///
+/// This struct is the template for the next config that earns a cross-field
+/// invariant before 1.0.
+///
+/// [`SampleOptions`]: crate::SampleOptions
+/// [`PredictOptions`]: crate::PredictOptions
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-/// Options for `apply_sample_repetition_penalties`.
+#[cfg_attr(feature = "serde", serde(try_from = "RepetitionOptionsShadow"))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepetitionOptions {
     /// Sets of tokens to ignore, by language. These are never penalized.
-    #[cfg_attr(feature = "serde", serde(default, alias = "ignored_stopwords"))]
     pub(crate) ignored_categories: BTreeSet<IgnoreCategory>,
     /// [`NGram`]s to ignore. These are never penalized.
-    #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) ignored: BTreeSet<NGram>,
     /// Sliding-window size. Only n-gram occurrences within the last
     /// `window_size` generation steps contribute to the penalty. Older
@@ -35,7 +64,6 @@ pub struct RepetitionOptions {
     /// This — together with [`Self::decay`] — bounds the additive penalty
     /// term so long generations don't have their natural logit gradient
     /// dominated by `count * penalty_freq`.
-    #[cfg_attr(feature = "serde", serde(default = "default_window_size"))]
     pub(crate) window_size: NonZeroU32,
     /// Per-step decay applied to in-window occurrences when computing the
     /// effective count for the penalty. The effective count contributed by one
@@ -43,7 +71,6 @@ pub struct RepetitionOptions {
     /// occurrences is bounded above by `1 / (1 - decay)` for sustained
     /// repetition. Use `1.0` to disable decay (all in-window occurrences count
     /// fully); recommended range `0.95..=0.99`.
-    #[cfg_attr(feature = "serde", serde(default = "default_decay"))]
     pub(crate) decay: f32,
     /// The maximum number of times an item can be repeated before it is
     /// penalized. This can be used to allow some n-grams to be repeated in
@@ -75,8 +102,66 @@ pub struct RepetitionOptions {
     /// another insult entirely such as ["eat", "shit", "buddy"]. Note that
     /// penalties *do* overlap so if bigrams *and* trigrams are penalized,
     /// "fuck" will also be penalized, and "go" *doubly* so, but not "yourself".
-    #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) surgical: bool,
+}
+
+/// Deserialize-only mirror of [`RepetitionOptions`]. The real struct routes its
+/// `Deserialize` through this via `#[serde(try_from = ...)]` so the
+/// `ngram_min_size <= ngram_max_size` invariant is validated on the way in
+/// (see [`TryFrom`] impl below). It carries every field-level serde attribute
+/// (`default`, `alias`); the real struct deliberately has none so the two can't
+/// drift in opposite directions. Never serialized — only ever constructed by
+/// serde during deserialization.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct RepetitionOptionsShadow {
+    #[serde(default, alias = "ignored_stopwords")]
+    ignored_categories: BTreeSet<IgnoreCategory>,
+    #[serde(default)]
+    ignored: BTreeSet<NGram>,
+    #[serde(default = "default_window_size")]
+    window_size: NonZeroU32,
+    #[serde(default = "default_decay")]
+    decay: f32,
+    penalty_max_count: NonZeroU8,
+    ngram_min_size: NonZeroU8,
+    ngram_max_size: NonZeroU8,
+    penalty_repeat: f32,
+    penalty_freq: f32,
+    penalty_present: f32,
+    #[serde(default)]
+    surgical: bool,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RepetitionOptionsShadow> for RepetitionOptions {
+    type Error = RepetitionError;
+
+    fn try_from(s: RepetitionOptionsShadow) -> Result<Self, Self::Error> {
+        if !Self::ngram_range_ordered(s.ngram_min_size, s.ngram_max_size) {
+            // Strict (not lenient-clamp): a hand-edited sidecar is read every
+            // run and never rewritten, so a silent fix would hide the breakage
+            // forever. serde maps this `Display` error through
+            // `de::Error::custom`. See the struct-level docs.
+            return Err(RepetitionError::InvalidNgramRange {
+                min: s.ngram_min_size,
+                max: s.ngram_max_size,
+            });
+        }
+        Ok(Self {
+            ignored_categories: s.ignored_categories,
+            ignored: s.ignored,
+            window_size: s.window_size,
+            decay: s.decay,
+            penalty_max_count: s.penalty_max_count,
+            ngram_min_size: s.ngram_min_size,
+            ngram_max_size: s.ngram_max_size,
+            penalty_repeat: s.penalty_repeat,
+            penalty_freq: s.penalty_freq,
+            penalty_present: s.penalty_present,
+            surgical: s.surgical,
+        })
+    }
 }
 
 /// Default window size — long enough to catch genuine paragraph-scale
@@ -137,7 +222,36 @@ impl Default for RepetitionOptions {
     }
 }
 
+/// Which ngram-size bound was just set, for [`RepetitionOptions::normalize_ngram_range`].
+#[derive(Clone, Copy)]
+enum NgramBound {
+    Min,
+    Max,
+}
+
 impl RepetitionOptions {
+    /// The crate's one cross-field invariant: the n-gram size range must be
+    /// ordered. A violated pair makes the generation-time `(min..=max)` range
+    /// empty, silently disabling the penalty.
+    #[inline]
+    fn ngram_range_ordered(min: NonZeroU8, max: NonZeroU8) -> bool {
+        min <= max
+    }
+
+    /// Restore `ngram_min_size <= ngram_max_size` in place with "just-set field
+    /// wins" semantics: the bound that was just assigned is authoritative, and
+    /// the other is raised/lowered to meet it. Used by the clamping ngram-size
+    /// setters and by the egui tail (to close immediate-mode one-frame lag).
+    fn normalize_ngram_range(&mut self, just_set: NgramBound) {
+        if Self::ngram_range_ordered(self.ngram_min_size, self.ngram_max_size) {
+            return;
+        }
+        match just_set {
+            NgramBound::Min => self.ngram_max_size = self.ngram_min_size,
+            NgramBound::Max => self.ngram_min_size = self.ngram_max_size,
+        }
+    }
+
     /// [`IgnoreCategory`]s of tokens. These are never penalized.
     pub fn ignored_categories(&self) -> &BTreeSet<IgnoreCategory> {
         &self.ignored_categories
@@ -271,7 +385,48 @@ impl RepetitionOptions {
         self.ignore_categories(stopwords, model)
     }
 
-    // TODO: ngram penality options
+    /// Minimum n-gram size to penalize, in tokens. Always `<=`
+    /// [`ngram_max_size`](Self::ngram_max_size).
+    pub fn ngram_min_size(&self) -> NonZeroU8 {
+        self.ngram_min_size
+    }
+
+    /// Set the minimum n-gram size. Clamped to uphold the
+    /// `ngram_min_size <= ngram_max_size` invariant with **"just-set wins"**:
+    /// if the new minimum exceeds the current maximum, the maximum is raised to
+    /// match. (Values are additionally clamped to `[1, NGram::CAPACITY]` at
+    /// apply time.)
+    ///
+    /// # Examples (starting from the default `min=1, max=4`)
+    /// ```text
+    /// .set_ngram_min_size(6).set_ngram_max_size(2)  // -> (6,6) then (2,2)
+    /// .set_ngram_max_size(2).set_ngram_min_size(6)  // -> (1,2) then (6,6)
+    /// ```
+    /// The end state is order-dependent because the most recently set bound
+    /// always wins; both results are valid ordered pairs.
+    pub fn set_ngram_min_size(mut self, ngram_min_size: NonZeroU8) -> Self {
+        self.ngram_min_size = ngram_min_size;
+        self.normalize_ngram_range(NgramBound::Min);
+        self
+    }
+
+    /// Maximum n-gram size to penalize, in tokens (capped at
+    /// [`NGram::CAPACITY`] at apply time). Always `>=`
+    /// [`ngram_min_size`](Self::ngram_min_size).
+    pub fn ngram_max_size(&self) -> NonZeroU8 {
+        self.ngram_max_size
+    }
+
+    /// Set the maximum n-gram size. Clamped to uphold the
+    /// `ngram_min_size <= ngram_max_size` invariant with **"just-set wins"**:
+    /// if the new maximum is below the current minimum, the minimum is lowered
+    /// to match. See [`set_ngram_min_size`](Self::set_ngram_min_size) for
+    /// worked ordering examples.
+    pub fn set_ngram_max_size(mut self, ngram_max_size: NonZeroU8) -> Self {
+        self.ngram_max_size = ngram_max_size;
+        self.normalize_ngram_range(NgramBound::Max);
+        self
+    }
 
     /// The maximum number of times an item can be repeated before it is
     /// penalized.
@@ -299,6 +454,42 @@ impl RepetitionOptions {
     /// Set the multiplicative penalty applied to repeated tokens.
     pub fn set_penalty_repeat(mut self, penalty_repeat: f32) -> Self {
         self.penalty_repeat = penalty_repeat;
+        self
+    }
+
+    /// The additive frequency penalty. Subtracts the windowed, decay-weighted
+    /// count of the n-gram from the penalized token's logit.
+    pub fn penalty_freq(&self) -> f32 {
+        self.penalty_freq
+    }
+
+    /// Set the additive frequency penalty.
+    pub fn set_penalty_freq(mut self, penalty_freq: f32) -> Self {
+        self.penalty_freq = penalty_freq;
+        self
+    }
+
+    /// The additive presence penalty. Subtracted once from the penalized
+    /// token's logit whenever the n-gram is present in the window.
+    pub fn penalty_present(&self) -> f32 {
+        self.penalty_present
+    }
+
+    /// Set the additive presence penalty.
+    pub fn set_penalty_present(mut self, penalty_present: f32) -> Self {
+        self.penalty_present = penalty_present;
+        self
+    }
+
+    /// Whether surgical mode is enabled. See the field docs for the
+    /// next-extension-token targeting behavior.
+    pub fn surgical(&self) -> bool {
+        self.surgical
+    }
+
+    /// Enable or disable surgical mode.
+    pub fn set_surgical(mut self, surgical: bool) -> Self {
+        self.surgical = surgical;
         self
     }
 
@@ -416,10 +607,13 @@ impl RepetitionOptions {
                 // NonZeroU8 does not implement emath::Numeric, so we have to
                 // convert and then back again.
                 let mut min_size = self.ngram_min_size.get();
+                // Dynamic upper bound keeps `min <= max` within the frame; the
+                // tail normalize closes the one-frame lag (see end of fn).
+                let max_bound = self.ngram_max_size.get();
                 let inner = ui.label("Ngram Min Size")
                     | ui.add(
                         egui::DragValue::new(&mut min_size)
-                            .range(1..=NGram::CAPACITY as u8),
+                            .range(1..=max_bound),
                     )
                     .on_hover_text_at_pointer(
                         "The minimum size of the n-gram to penalize (in tokens).",
@@ -437,10 +631,12 @@ impl RepetitionOptions {
         resp |= ui
             .horizontal(|ui| {
                 let mut max_size = self.ngram_max_size.get();
+                // Dynamic lower bound keeps `min <= max` within the frame.
+                let min_bound = self.ngram_min_size.get();
                 let inner = ui.label("Ngram Max Size")
                     | ui.add(
                         egui::DragValue::new(&mut max_size)
-                            .range(1..=NGram::CAPACITY as u8),
+                            .range(min_bound..=NGram::CAPACITY as u8),
                     )
                     .on_hover_text_at_pointer(
                         "The maximum size of the n-gram to penalize (in tokens).",
@@ -533,6 +729,14 @@ impl RepetitionOptions {
                  penalize \"York\" specifically. When disabled, all previously-seen tokens are penalized.",
             );
 
+        // Close the immediate-mode one-frame lag: each ngram-size slider's
+        // range derives from the *other* field's value as of frame start, so a
+        // drag that lowers max below an already-committed min can leave an
+        // inverted pair for a single frame. This is frame-ordering, not a data
+        // race (egui is single-threaded). Treat max as authoritative here,
+        // mirroring `set_ngram_max_size`'s "just-set wins".
+        self.normalize_ngram_range(NgramBound::Max);
+
         resp
     }
 
@@ -558,6 +762,8 @@ pub enum RepetitionError {
         n_gram_size: usize,
         penalize_ngram_index: u8,
     },
+    #[error("ngram_min_size ({min}) must be <= ngram_max_size ({max})")]
+    InvalidNgramRange { min: NonZeroU8, max: NonZeroU8 },
 }
 
 static_assertions::assert_impl_all!(RepetitionError: Send, Sync);
@@ -654,6 +860,18 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
         .min(NGram::CAPACITY as u8)
         .try_into()
         .unwrap();
+    // Invariant established by strict deserialize, the clamping ngram-size
+    // setters, and dynamic GUI ranges: no construction path can produce
+    // min > max. CAPACITY-clamping both to `[1, CAPACITY]` above cannot invert
+    // an already-ordered pair, so this assert documents the contract and
+    // surfaces validation holes in tests rather than masking them (the old
+    // min/max swap silently disabled the penalty on an inverted pair).
+    debug_assert!(
+        ngram_min_size <= ngram_max_size,
+        "ngram_min_size ({ngram_min_size}) > ngram_max_size \
+         ({ngram_max_size}): a construction path bypassed RepetitionOptions \
+         validation"
+    );
     // `effective_count > penalty_max_count` triggers the multiplicative
     // term (analogue of the old raw-count threshold).
     let penalty_max_count_f = penalty_max_count.get() as f32;
@@ -776,6 +994,146 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
     candidates.softmax_applied_to = None;
 
     Ok(candidates)
+}
+
+/// Invariant / builder / deserialize tests that need no model — run under any
+/// test build (the integration suite below is gated behind `llama-cpp`).
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+
+    fn nz(n: u8) -> NonZeroU8 {
+        NonZeroU8::new(n).unwrap()
+    }
+
+    /// "just-set wins": setting min above max raises max, then setting max
+    /// below the new min lowers min to match → (2, 2).
+    #[test]
+    fn set_min_then_max_just_set_wins() {
+        let o = RepetitionOptions::default()
+            .set_ngram_min_size(nz(6))
+            .set_ngram_max_size(nz(2));
+        assert_eq!(o.ngram_min_size(), nz(2));
+        assert_eq!(o.ngram_max_size(), nz(2));
+    }
+
+    /// Reverse order lands at (6, 6) — the most recently set bound wins.
+    #[test]
+    fn set_max_then_min_just_set_wins() {
+        let o = RepetitionOptions::default()
+            .set_ngram_max_size(nz(2))
+            .set_ngram_min_size(nz(6));
+        assert_eq!(o.ngram_min_size(), nz(6));
+        assert_eq!(o.ngram_max_size(), nz(6));
+    }
+
+    /// Property: no setter ordering for any pair in `1..=CAPACITY` can leave
+    /// an inverted range.
+    #[test]
+    fn setters_never_invert() {
+        for min in 1..=NGram::CAPACITY as u8 {
+            for max in 1..=NGram::CAPACITY as u8 {
+                let a = RepetitionOptions::default()
+                    .set_ngram_min_size(nz(min))
+                    .set_ngram_max_size(nz(max));
+                assert!(a.ngram_min_size() <= a.ngram_max_size());
+                let b = RepetitionOptions::default()
+                    .set_ngram_max_size(nz(max))
+                    .set_ngram_min_size(nz(min));
+                assert!(b.ngram_min_size() <= b.ngram_max_size());
+            }
+        }
+    }
+
+    /// Each new getter returns what the matching setter set.
+    #[test]
+    fn new_getters_roundtrip() {
+        let o = RepetitionOptions::default()
+            .set_penalty_freq(0.3)
+            .set_penalty_present(0.4)
+            .set_surgical(false)
+            .set_ngram_min_size(nz(2))
+            .set_ngram_max_size(nz(5));
+        assert_eq!(o.penalty_freq(), 0.3);
+        assert_eq!(o.penalty_present(), 0.4);
+        assert!(!o.surgical());
+        assert_eq!(o.ngram_min_size(), nz(2));
+        assert_eq!(o.ngram_max_size(), nz(5));
+    }
+
+    // Deserialize wiring is exercised through the real-world TOML path.
+    #[cfg(feature = "toml")]
+    mod de {
+        use super::*;
+
+        // Every field without a serde default — required in TOML.
+        const REQUIRED: &str = "\
+            penalty_max_count = 1\n\
+            ngram_min_size = 1\n\
+            ngram_max_size = 4\n\
+            penalty_repeat = 1.05\n\
+            penalty_freq = 0.125\n\
+            penalty_present = 0.0625\n";
+
+        /// Strict: an inverted range is rejected at deserialize, not silently
+        /// clamped. Regression guard for the dropped apply-site swap.
+        #[test]
+        fn rejects_inverted_ngram_range() {
+            let doc = "\
+                penalty_max_count = 1\n\
+                ngram_min_size = 4\n\
+                ngram_max_size = 2\n\
+                penalty_repeat = 1.05\n\
+                penalty_freq = 0.125\n\
+                penalty_present = 0.0625\n";
+            let err =
+                ::toml::from_str::<RepetitionOptions>(doc).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ngram_min_size") && msg.contains("must be <="),
+                "expected InvalidNgramRange message, got: {msg}"
+            );
+        }
+
+        /// Omitted defaulted fields fall back to their serde defaults. Note
+        /// `ignored_categories` defaults to an *empty* set (the field-level
+        /// `#[serde(default)]`), not the rich `RepetitionOptions::default()`.
+        #[test]
+        fn partial_applies_defaults() {
+            let o: RepetitionOptions =
+                ::toml::from_str(REQUIRED).unwrap();
+            assert_eq!(o.window_size().get(), 256);
+            assert_eq!(o.decay(), 0.95);
+            assert!(!o.surgical());
+            assert!(o.ignored().is_empty());
+            assert!(o.ignored_categories().is_empty());
+        }
+
+        /// The `ignored_stopwords` legacy key still maps onto
+        /// `ignored_categories`.
+        #[test]
+        fn ignored_stopwords_alias() {
+            let doc =
+                format!("{REQUIRED}ignored_categories = [\"English\"]\n");
+            let o: RepetitionOptions =
+                ::toml::from_str(&doc).unwrap();
+            assert!(o.ignored_categories().contains(&IgnoreCategory::English));
+
+            let doc =
+                format!("{REQUIRED}ignored_stopwords = [\"Json\"]\n");
+            let o: RepetitionOptions =
+                ::toml::from_str(&doc).unwrap();
+            assert!(o.ignored_categories().contains(&IgnoreCategory::Json));
+        }
+
+        /// A valid config (including the default) round-trips through TOML.
+        #[test]
+        fn default_roundtrips() {
+            let s = ::toml::to_string(&RepetitionOptions::default()).unwrap();
+            let o: RepetitionOptions = ::toml::from_str(&s).unwrap();
+            assert_eq!(o, RepetitionOptions::default());
+        }
+    }
 }
 
 #[cfg(all(test, feature = "llama-cpp"))]

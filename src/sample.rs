@@ -304,12 +304,17 @@ impl Default for SampleOptions {
     fn default() -> Self {
         Self {
             modes: vec![SamplingMode::locally_typical()],
-            // Off by default. Big-model prose gets degraded by the
-            // shipped repetition defaults (see qwen3 long-form
-            // degradation arc); per-model sidecars opt in explicitly
-            // when wanted. Matches `Session::from_engine`'s
-            // pre-sidecar default.
-            repetition: None,
+            // On by default as of v0.8.0. The long-form degradation that
+            // originally forced this off (qwen3 long-form arc) was the
+            // unbounded additive `count * penalty_freq` term; the windowed
+            // decay (see `RepetitionOptions::decay`) bounds it, and the
+            // retuned + surgical defaults were validated to leave big-model
+            // prose intact across technical / creative / social genres.
+            // NOTE: chat/tool-result flows that re-emit a short token from
+            // context (e.g. a digit the tool returned) now see a gentle
+            // penalty; if that proves a problem, opt back out via a sidecar
+            // or `SampleOptions::greedy()`.
+            repetition: Some(RepetitionOptions::default()),
             deferred_grammar: None,
         }
     }

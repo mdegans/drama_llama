@@ -554,7 +554,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
                 // `win_idx + max_size - 1`.
                 let trailing_pos = (win_idx + max_size - 1) as u64;
                 for slice in (opts.ngram_min_size.get()
-                    ..opts.ngram_max_size.get())
+                    ..=opts.ngram_max_size.get())
                     .filter_map(|n| win.get((win.len() - n as usize)..))
                 {
                     let ngram = NGram::try_from_tokens(slice).unwrap();
@@ -931,14 +931,14 @@ mod tests {
     fn test_default_options() {
         let opts = PredictOptions::default();
         assert_eq!(opts.sample_options, SampleOptions::default());
-        // SampleOptions::default() ships with `repetition: None` so
-        // probes and one-off generation paths don't get the
-        // RepetitionOptions defaults applied silently. Per-model
-        // sidecars opt in explicitly.
-        assert_eq!(opts.sample_options.repetition, None);
-        // RepetitionOptions::default() itself is still the canonical
-        // "if you opt in, here's the starting point" config.
-        let _ = RepetitionOptions::default();
+        // SampleOptions::default() ships repetition on as of v0.8.0
+        // (windowed decay removed the long-form degradation). Probes
+        // that want the raw logit gradient pass `--no-penalty` /
+        // construct `SampleOptions::greedy()`.
+        assert_eq!(
+            opts.sample_options.repetition,
+            Some(RepetitionOptions::default())
+        );
     }
 
     #[test]
