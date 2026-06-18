@@ -1,4 +1,5 @@
 use std::{
+    num::{NonZeroU128, NonZeroUsize},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -16,80 +17,72 @@ use drama_llama::{
     prompt::{AnthropicError, MessageResponse, Usage},
     ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
 };
-use std::num::{NonZeroU128, NonZeroUsize};
 use tokio::{sync::Mutex, task::spawn_blocking};
 use tracing::{error, info, instrument};
 
 #[derive(Parser)]
 #[command(about = "Demo /v1/messages server")]
 struct Args {
-    /// Path containing model files (llama.cpp) or model directories
-    /// (moeflux).
+    /// Path containing model files (llama.cpp) or model directories (moeflux).
     model_path: PathBuf,
     /// Port to use
     #[arg(long, default_value_t = 11435)]
     port: u16,
-    /// Inference backend. `llama-cpp` discovers `.gguf` files;
-    /// `moeflux` discovers child directories with the
-    /// `mlx/`/`artifacts/`/`root/` convention. Variants are
-    /// cfg-gated — a build with only one backend feature accepts
-    /// only that variant.
+    /// Inference backend. `llama-cpp` discovers `.gguf` files; `moeflux`
+    /// discovers child directories with the `mlx/`/`artifacts/`/`root/`
+    /// convention. Variants are cfg-gated — a build with only one backend
+    /// feature accepts only that variant.
     #[arg(long, value_enum, default_value_t = default_backend_kind())]
     backend: BackendKind,
-    /// Force the repetition-penalty filter OFF, even when the
-    /// per-model sampling sidecar enables it. Useful for probes,
-    /// canary runs, and any diagnostic where you want to see the
-    /// model's raw logit gradient with no penalty applied. Without
-    /// this flag, sampling configuration comes from
-    /// `<model>.sampling.toml` (gguf) or `parent/sampling.toml`
-    /// (moeflux) — `Session::from_path*` writes a default sidecar on
-    /// first load.
+    /// Force the repetition-penalty filter OFF, even when the per-model
+    /// sampling sidecar enables it. Useful for probes, canary runs, and any
+    /// diagnostic where you want to see the model's raw logit gradient with no
+    /// penalty applied. Without this flag, sampling configuration comes from
+    /// `<model>.sampling.toml` (gguf) or `parent/sampling.toml` (moeflux) —
+    /// `Session::from_path*` writes a default sidecar on first load.
     #[arg(long, default_value_t = false)]
     no_penalty: bool,
-    /// Optional fixed RNG seed forwarded to every prediction. Useful
-    /// for tuning iteration: same prompt + same seed = same output,
-    /// so a sidecar tweak shows up as a deliberate divergence rather
-    /// than a stochastic one. Omit to use the crate default
-    /// (`PredictOptions::DEFAULT_SEED`).
+    /// Optional fixed RNG seed forwarded to every prediction. Useful for tuning
+    /// iteration: same prompt + same seed = same output, so a sidecar tweak
+    /// shows up as a deliberate divergence rather than a stochastic one. Omit
+    /// to use the crate default (`PredictOptions::DEFAULT_SEED`).
     #[arg(long)]
     seed: Option<u128>,
-    /// Serve this model when a request names one that isn't on disk.
-    /// Lets unmodified Anthropic-SDK clients (which default to
-    /// `claude-*` ids) run against this server without per-client
-    /// model configuration. Must name a discoverable model; unknown
-    /// requested models still 404 when this is unset.
+    /// Serve this model when a request names one that isn't on disk. Lets
+    /// unmodified Anthropic-SDK clients (which default to `claude-*` ids) run
+    /// against this server without per-client model configuration. Must name a
+    /// discoverable model; unknown requested models still 404 when this is
+    /// unset.
     #[arg(long)]
     default_model: Option<String>,
     /// Append per-token probe records to this JSONL file. One
-    /// `{"event":"session_start","model":"…"}` line per `/v1/messages`
-    /// request, then one `{"event":"probe_ctx","ts_ms":T,"ctx":{…}}`
-    /// line per yielded token — where `ctx` is the full serialized
-    /// `ProbeCtx` (same schema as the `ctx` field on `--probe-stream`
-    /// `token` events: sampled token, `n_cur`, `snapshot` top-K +
-    /// entropy when available, etc.). `ts_ms` is relative to the moment
-    /// the recorder was installed for that request. Omit to disable
-    /// JSONL recording.
+    /// `{"event":"session_start","model":"…"}` line per `/v1/messages` request,
+    /// then one `{"event":"probe_ctx","ts_ms":T,"ctx":{…}}` line per yielded
+    /// token — where `ctx` is the full serialized `ProbeCtx` (same schema as
+    /// the `ctx` field on `--probe-stream` `token` events: sampled token,
+    /// `n_cur`, `snapshot` top-K + entropy when available, etc.). `ts_ms` is
+    /// relative to the moment the recorder was installed for that request. Omit
+    /// to disable JSONL recording.
     ///
-    /// Composes with `--probe-stream`: both recorders see every token
-    /// once via a `FanOutHook`. The JSONL recorder requests the same
-    /// snapshot budget as the streaming recorder (`top_k=100`,
-    /// `p_threshold=0`, `compute_entropy=true`); when both are active
-    /// the snapshot is captured once and shared.
+    /// Composes with `--probe-stream`: both recorders see every token once via
+    /// a `FanOutHook`. The JSONL recorder requests the same snapshot budget as
+    /// the streaming recorder (`top_k=100`, `p_threshold=0`,
+    /// `compute_entropy=true`); when both are active the snapshot is captured
+    /// once and shared.
     #[arg(long)]
     record_json: Option<PathBuf>,
-    /// Mount the `/probe` SSE endpoint and install a per-request
-    /// streaming recorder. Consumers connect once with `GET /probe`
-    /// and receive `session_start` / `token` / `session_end` events
-    /// for every request the server handles, tagged by the request's
-    /// UUID (also returned as `Message::id` on the sync response).
-    /// Late connectors miss early events; convention is to open
-    /// `/probe` before sending `/v1/messages`.
+    /// Mount the `/probe` SSE endpoint and install a per-request streaming
+    /// recorder. Consumers connect once with `GET /probe` and receive
+    /// `session_start` / `token` / `session_end` events for every request the
+    /// server handles, tagged by the request's UUID (also returned as
+    /// `Message::id` on the sync response). Late connectors miss early events;
+    /// convention is to open `/probe` before sending `/v1/messages`.
     #[arg(long, default_value_t = false)]
     probe_stream: bool,
 }
 
-/// Inference backend selector. Variants are cfg-gated to whichever
-/// crate features are enabled.
+/// Inference backend selector. Variants are cfg-gated to whichever crate
+/// features are enabled.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum BackendKind {
     #[cfg(feature = "llama-cpp")]
@@ -98,8 +91,8 @@ enum BackendKind {
     Moeflux,
 }
 
-/// Default `--backend` value: prefer llama-cpp when both backends are
-/// compiled in (it's been the default for the lifetime of blallama).
+/// Default `--backend` value: prefer llama-cpp when both backends are compiled
+/// in (it's been the default for the lifetime of blallama).
 const fn default_backend_kind() -> BackendKind {
     #[cfg(feature = "llama-cpp")]
     {
@@ -117,29 +110,27 @@ const fn default_backend_kind() -> BackendKind {
 #[derive(Clone)]
 struct AppState<B: Backend> {
     args: Arc<Args>,
-    /// Sender into the JSONL writer task. `None` if `--record-json`
-    /// wasn't given. Cloned per-request when installing the
-    /// [`JsonlProbeRecorder`]; all clones feed the same writer task /
-    /// output file.
+    /// Sender into the JSONL writer task. `None` if `--record-json` wasn't
+    /// given. Cloned per-request when installing the [`JsonlProbeRecorder`];
+    /// all clones feed the same writer task / output file.
     record_json_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
-    /// Streaming-probe broadcast bus. `None` if `--probe-stream`
-    /// wasn't given. Cloned per-request into a [`StreamingProbeRecorder`]
-    /// and (separately) subscribed by the `/probe` SSE handler. The
-    /// same bus carries `SessionStart` / `SessionEnd` events emitted
-    /// directly from the request handler around the generation call.
+    /// Streaming-probe broadcast bus. `None` if `--probe-stream` wasn't given.
+    /// Cloned per-request into a [`StreamingProbeRecorder`] and (separately)
+    /// subscribed by the `/probe` SSE handler. The same bus carries
+    /// `SessionStart` / `SessionEnd` events emitted directly from the request
+    /// handler around the generation call.
     probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
     session: Arc<Mutex<Option<Session<B>>>>,
 }
 
-/// List directory entries whose followed-symlink metadata satisfies
-/// `accept`. llama-cpp wants `is_file()` (one `.gguf` per model);
-/// moeflux wants `is_dir()` (one parent dir per model).
+/// List directory entries whose followed-symlink metadata satisfies `accept`.
+/// llama-cpp wants `is_file()` (one `.gguf` per model); moeflux wants
+/// `is_dir()` (one parent dir per model).
 ///
-/// Uses `metadata()` (which follows symlinks) rather than
-/// `file_type()` (which reports the entry as `symlink` without
-/// chasing it). Mike's test layout symlinks `mlx` / `artifacts` /
-/// `root` into a single moeflux model dir, and the dir itself can
-/// be a symlink — both forms must enumerate.
+/// Uses `metadata()` (which follows symlinks) rather than `file_type()` (which
+/// reports the entry as `symlink` without chasing it). Mike's test layout
+/// symlinks `mlx` / `artifacts` / `root` into a single moeflux model dir, and
+/// the dir itself can be a symlink — both forms must enumerate.
 async fn list_entries<P>(
     path: impl AsRef<Path>,
     accept: P,
@@ -150,8 +141,8 @@ where
     let mut read_dir = tokio::fs::read_dir(path).await?;
     let mut models = vec![];
     while let Some(entry) = read_dir.next_entry().await? {
-        // metadata() follows symlinks; symlink_metadata() would not.
-        // Skip entries whose target is missing or unreadable.
+        // metadata() follows symlinks; symlink_metadata() would not. Skip
+        // entries whose target is missing or unreadable.
         let Ok(meta) = entry.metadata().await else {
             continue;
         };
@@ -168,18 +159,17 @@ where
     Ok(models)
 }
 
-/// Accept predicate for the llama.cpp backend: regular `.gguf` files
-/// only. Without the extension check, `/api/tags` advertises (and
-/// `/v1/messages` accepts) sampling sidecars and Finder litter as
-/// "models".
+/// Accept predicate for the llama.cpp backend: regular `.gguf` files only.
+/// Without the extension check, `/api/tags` advertises (and `/v1/messages`
+/// accepts) sampling sidecars and Finder litter as "models".
 fn is_gguf(name: &str, meta: &std::fs::Metadata) -> bool {
     meta.is_file() && name.ends_with(".gguf")
 }
 
-/// Resolve a requested model id against what's on disk. `Ok(None)`
-/// means serve as-requested; `Ok(Some(d))` means substitute the
-/// `--default-model` (unmodified Anthropic-SDK clients request
-/// `claude-*` ids); `Err` is the 404 payload.
+/// Resolve a requested model id against what's on disk. `Ok(None)` means serve
+/// as-requested; `Ok(Some(d))` means substitute the `--default-model`
+/// (unmodified Anthropic-SDK clients request `claude-*` ids); `Err` is the 404
+/// payload.
 fn resolve_model(
     requested: &str,
     models: &[String],
@@ -207,7 +197,8 @@ where
         Ok(r) => r,
         Err(e) => {
             error!(error = %e);
-            std::process::exit(1); // We don't trust llama.cpp's destructors
+            std::process::exit(1); // We don't trust llama.cpp's destructors to
+                                   // clean up so this is fatal.
         }
     }
 }
@@ -260,13 +251,13 @@ fn log_moeflux_prefetch(
 fn init_logging() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 
-    // EnvFilter reads RUST_LOG. Falls back to "info" if unset.
-    // Syntax: RUST_LOG=info,drama_llama=debug,axum=warn
+    // EnvFilter reads RUST_LOG. Falls back to "info" if unset. Syntax:
+    // RUST_LOG=info,drama_llama=debug,axum=warn
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // JSON formatter for structured output (downstream-parseable).
-    // Span context flags control what span info rides on each event.
+    // JSON formatter for structured output (downstream-parseable). Span context
+    // flags control what span info rides on each event.
     let fmt_layer = fmt::layer()
         .json()
         .with_current_span(true) // include the active span on each event
@@ -432,8 +423,8 @@ mod llama_cpp_run {
             }
         };
 
-        // Per-request UUID — same id ends up on `Message.id` and on
-        // every `StreamProbeMsg` emitted while this request runs.
+        // Per-request UUID — same id ends up on `Message.id` and on every
+        // `StreamProbeMsg` emitted while this request runs.
         let id = uuid::Uuid::new_v4();
         install_per_request_hooks(
             &mut session,
@@ -442,12 +433,11 @@ mod llama_cpp_run {
             id,
         );
 
-        // Emit SessionStart on the bus before generation. SendError
-        // means zero subscribers; harmless, ignored. The model name
-        // here is the request's `prompt.model` (the user-facing name)
-        // rather than the engine's display_name (the GGUF internal
-        // name); both are recoverable from the JSONL ts_ms ordering
-        // if needed.
+        // Emit SessionStart on the bus before generation. SendError means zero
+        // subscribers; harmless, ignored. The model name here is the request's
+        // `prompt.model` (the user-facing name) rather than the engine's
+        // display_name (the GGUF internal name); both are recoverable from the
+        // JSONL ts_ms ordering if needed.
         if let Some(bus) = &state.probe_bus {
             let _ = bus.send(StreamProbeMsg::SessionStart {
                 id,
@@ -455,10 +445,10 @@ mod llama_cpp_run {
             });
         }
 
-        // Closure returns the session in *both* arms so it can be
-        // restored to the lock — otherwise a `complete_response` error
-        // drops it and the next request reloads from disk. See
-        // `is_reusable_after` for the reuse-vs-reload classification.
+        // Closure returns the session in *both* arms so it can be restored to
+        // the lock — otherwise a `complete_response` error drops it and the
+        // next request reloads from disk. See `is_reusable_after` for the
+        // reuse-vs-reload classification.
         let (session, result, elapsed) = spawn_blocking_or_bust(move || {
             let start = std::time::Instant::now();
             let result = session.complete_response_id(&prompt, id);
@@ -466,8 +456,8 @@ mod llama_cpp_run {
         })
         .await;
 
-        // SessionEnd fires regardless of generation success — the
-        // probe stream is a flight recorder, not a control channel.
+        // SessionEnd fires regardless of generation success — the probe stream
+        // is a flight recorder, not a control channel.
         if let Some(bus) = &state.probe_bus {
             let _ = bus.send(StreamProbeMsg::SessionEnd { id });
         }
@@ -683,21 +673,21 @@ mod moeflux_run {
             });
         }
 
-        // Scope prefetch counters to this request — moeflux's
-        // PrefetchState accumulates over the lifetime of RsCtx, so a
-        // fresh request needs a reset to read out a per-request rate.
+        // Scope prefetch counters to this request — moeflux's PrefetchState
+        // accumulates over the lifetime of RsCtx, so a fresh request needs a
+        // reset to read out a per-request rate.
         session.reset_prefetch_stats();
 
-        // Per-Op cmdbuf timing breakdown, gated on the same env that
-        // makes moeflux commit each Op as its own labeled cmdbuf.
+        // Per-Op cmdbuf timing breakdown, gated on the same env that makes
+        // moeflux commit each Op as its own labeled cmdbuf.
         let profile_per_op =
             std::env::var_os("MOEFLUX_PROFILE_PER_OP").is_some();
         if profile_per_op {
             session.reset_cmdbuf_stats();
         }
 
-        // See llama-cpp variant + `is_reusable_after` doc-comment for
-        // the reuse-vs-reload rationale.
+        // See llama-cpp variant + `is_reusable_after` doc-comment for the
+        // reuse-vs-reload rationale.
         let (session, result, elapsed) = spawn_blocking_or_bust(move || {
             let start = std::time::Instant::now();
             let result = session.complete_response_id(&prompt, id);
@@ -761,11 +751,10 @@ fn configure_session<B: Backend>(
     seed: Option<u128>,
 ) -> Session<B> {
     // Sampling configuration is loaded from the per-model sidecar
-    // (`<model>.sampling.toml` for gguf, `parent/sampling.toml` for
-    // moeflux) inside `Session::from_path*`. `--no-penalty` overrides
-    // the sidecar to force repetition penalty OFF — for probes,
-    // canary runs, or any "what does this model do with no penalty"
-    // diagnostic.
+    // (`<model>.sampling.toml` for gguf, `parent/sampling.toml` for moeflux)
+    // inside `Session::from_path*`. `--no-penalty` overrides the sidecar to
+    // force repetition penalty OFF — for probes, canary runs, or any "what does
+    // this model do with no penalty" diagnostic.
     let with_penalty = if no_penalty {
         s.without_repetition()
     } else {
@@ -774,18 +763,17 @@ fn configure_session<B: Backend>(
     let configured = with_penalty
         .with_seed(seed.and_then(NonZeroU128::new))
         .with_prefix_cache(true)
-        // Session-level generation cap. Distinct from `n_ctx` — that's
-        // the KV context window, set per-backend at engine
-        // construction (llama.cpp: `from_path_with_n_ctx(_, 65536)`;
-        // moeflux: compile-time per model variant, surfaced in the
-        // `session_ready` log below). 8K is the per-request gen
-        // ceiling; the prompt's `max_tokens` wins when smaller, this
-        // clips runaway requests.
+        // Session-level generation cap. Distinct from `n_ctx` — that's the KV
+        // context window, set per-backend at engine construction (llama.cpp:
+        // `from_path_with_n_ctx(_, 65536)`; moeflux: compile-time per model
+        // variant, surfaced in the `session_ready` log below). 8K is the
+        // per-request gen ceiling; the prompt's `max_tokens` wins when smaller,
+        // this clips runaway requests.
         .with_max_tokens(8192.try_into().unwrap());
-    // ProbeHook installation moved to per-request handlers — each
-    // /v1/messages request gets a fresh hook bound to its UUID, so the
-    // hook can fan out to JSONL, the broadcast bus, or both, with a
-    // recorder lifetime that exactly matches the request.
+    // ProbeHook installation moved to per-request handlers — each /v1/messages
+    // request gets a fresh hook bound to its UUID, so the hook can fan out to
+    // JSONL, the broadcast bus, or both, with a recorder lifetime that exactly
+    // matches the request.
     tracing::info!(
         event = "session_ready",
         n_ctx = configured.engine().n_ctx(),
@@ -802,11 +790,11 @@ fn configure_session<B: Backend>(
     configured
 }
 
-/// Default `SnapshotOpts` for the streaming recorder. top_k=100 +
-/// p_threshold=0 + entropy=true is the cross-validation suite's
-/// working set: refusal-class probes need tail-token visibility
-/// (high top_k, no threshold) and entropy is cheap when probes are
-/// infrequent. Override via `Args` if/when finer control is needed.
+/// Default `SnapshotOpts` for the streaming recorder. top_k=100 + p_threshold=0
+/// + entropy=true is the cross-validation suite's working set: refusal-class
+/// probes need tail-token visibility (high top_k, no threshold) and entropy is
+/// cheap when probes are infrequent. Override via `Args` if/when finer control
+/// is needed.
 fn default_stream_opts() -> SnapshotOpts {
     SnapshotOpts {
         top_k: NonZeroUsize::new(100).unwrap(),
@@ -815,10 +803,10 @@ fn default_stream_opts() -> SnapshotOpts {
     }
 }
 
-/// Build and install the per-request `FanOutHook` on `session`'s
-/// engine. Returns `true` when at least one recorder was installed (so
-/// the caller can emit `StreamProbeMsg::SessionStart` / `SessionEnd`
-/// only when there's a streaming consumer to receive them).
+/// Build and install the per-request `FanOutHook` on `session`'s engine.
+/// Returns `true` when at least one recorder was installed (so the caller can
+/// emit `StreamProbeMsg::SessionStart` / `SessionEnd` only when there's a
+/// streaming consumer to receive them).
 fn install_per_request_hooks<B: Backend>(
     session: &mut Session<B>,
     record_json_tx: Option<&tokio::sync::mpsc::Sender<serde_json::Value>>,
@@ -855,15 +843,15 @@ fn install_per_request_hooks<B: Backend>(
 // an unbounded mpsc; a single tokio task drains and writes.
 // ---------------------------------------------------------------------------
 
-/// Spawn a single JSONL writer task draining `rx` to `path` (append).
-/// Each message becomes one line. The task exits when every Sender
-/// is dropped (channel closes); on exit it flushes the BufWriter.
-/// Returns the Sender (Cloneable for per-session installs).
+/// Spawn a single JSONL writer task draining `rx` to `path` (append). Each
+/// message becomes one line. The task exits when every Sender is dropped
+/// (channel closes); on exit it flushes the BufWriter. Returns the Sender
+/// (Cloneable for per-session installs).
 ///
-/// Buffer is bounded so a stalled disk doesn't grow the channel
-/// without bound; see `JsonlProbeRecorder::on_token` for drop-on-full
-/// semantics. 4096 records ≈ 120 KB of in-flight state, plenty for
-/// any realistic decode rate (≤ ~50 tok/s on Apple Silicon).
+/// Buffer is bounded so a stalled disk doesn't grow the channel without bound;
+/// see `JsonlProbeRecorder::on_token` for drop-on-full semantics. 4096 records
+/// ≈ 120 KB of in-flight state, plenty for any realistic decode rate (≤ ~50
+/// tok/s on Apple Silicon).
 const PROBE_CHANNEL_DEPTH: usize = 4096;
 
 async fn spawn_probe_writer(
@@ -880,11 +868,11 @@ async fn spawn_probe_writer(
         tokio::sync::mpsc::channel::<serde_json::Value>(PROBE_CHANNEL_DEPTH);
 
     tokio::spawn(async move {
-        // Unbuffered writes. Per-line BufWriter would batch better but
-        // its flush only runs when all Senders drop; under SIGKILL or
-        // crash that flush never runs and the user sees an empty file.
-        // Probe write rate caps at ~50 tok/s so the per-line syscall
-        // cost is negligible — correctness over throughput.
+        // Unbuffered writes. Per-line BufWriter would batch better but its
+        // flush only runs when all Senders drop; under SIGKILL or crash that
+        // flush never runs and the user sees an empty file. Probe write rate
+        // caps at ~50 tok/s so the per-line syscall cost is negligible —
+        // correctness over throughput.
         let mut file = file;
         while let Some(value) = rx.recv().await {
             let line = match serde_json::to_string(&value) {
@@ -907,9 +895,9 @@ async fn spawn_probe_writer(
     Ok(tx)
 }
 
-/// Per-session [`ProbeHook`]. Sends each token to the shared writer
-/// task via the bounded mpsc — `on_token` returns in nanoseconds, so
-/// disk I/O never blocks the prediction loop.
+/// Per-session [`ProbeHook`]. Sends each token to the shared writer task via
+/// the bounded mpsc — `on_token` returns in nanoseconds, so disk I/O never
+/// blocks the prediction loop.
 struct JsonlProbeRecorder {
     tx: tokio::sync::mpsc::Sender<serde_json::Value>,
     session_start: std::time::Instant,
@@ -922,10 +910,9 @@ impl JsonlProbeRecorder {
         model_name: &str,
         opts: SnapshotOpts,
     ) -> Self {
-        // Best-effort: a session_start lost to a stalled disk is
-        // surprising but not catastrophic. The token records that
-        // follow carry their own model context via the file's
-        // append-only ordering.
+        // Best-effort: a session_start lost to a stalled disk is surprising but
+        // not catastrophic. The token records that follow carry their own model
+        // context via the file's append-only ordering.
         let _ = tx.try_send(serde_json::json!({
             "event": "session_start",
             "model": model_name,
@@ -949,12 +936,12 @@ impl ProbeHook for JsonlProbeRecorder {
             }
         };
         // Non-blocking send. Failure modes:
-        // - `Full(_)`: writer task is behind (slow / stalled disk).
-        //   Drop the record rather than block decode; a flat-line in
-        //   the probe log is the disk-stall signal.
-        // - `Closed(_)`: writer task exited (panicked or finished).
-        //   Same treatment — failing predictions because the probe
-        //   sink died would be worse than a missing record.
+        // - `Full(_)`: writer task is behind (slow / stalled disk). Drop the
+        //   record rather than block decode; a flat-line in the probe log is
+        //   the disk-stall signal.
+        // - `Closed(_)`: writer task exited (panicked or finished). Same
+        //   treatment — failing predictions because the probe sink died would
+        //   be worse than a missing record.
         let _ = self.tx.try_send(serde_json::json!({
             "event": "probe_ctx",
             "ts_ms": ts_ms,
@@ -970,11 +957,10 @@ impl ProbeHook for JsonlProbeRecorder {
 // ---------------------------------------------------------------------------
 // Streaming probe — broadcast bus + per-request recorder
 //
-// Fired only when `--probe-stream` is set. Consumers connect once to
-// `GET /probe` and receive `StreamProbeMsg` events for every request the
-// server handles, tagged by request UUID. The same UUID is returned on
-// the sync `/v1/messages` response as `Message::id`, so consumers join
-// the two by id.
+// Fired only when `--probe-stream` is set. Consumers connect once to `GET
+// /probe` and receive `StreamProbeMsg` events for every request the server
+// handles, tagged by request UUID. The same UUID is returned on the sync
+// `/v1/messages` response as `Message::id`, so consumers join the two by id.
 // ---------------------------------------------------------------------------
 
 /// Wire schema for the `/probe` SSE channel. Serializes to one of:
@@ -983,9 +969,8 @@ impl ProbeHook for JsonlProbeRecorder {
 /// `{"event":"session_end","id":"…"}`.
 ///
 /// `ctx` is the `ProbeCtx` rendered via `serde_json::to_value` —
-/// `sample_options` is `#[serde(skip)]` (grammar Arc/Mutex doesn't
-/// serialize cleanly); `snapshot` is the rich top-K + entropy view
-/// from slice-1.
+/// `sample_options` is `#[serde(skip)]` (grammar Arc/Mutex doesn't serialize
+/// cleanly); `snapshot` is the rich top-K + entropy view from slice-1.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum StreamProbeMsg {
@@ -1002,17 +987,17 @@ enum StreamProbeMsg {
     },
 }
 
-/// Capacity of the broadcast channel. Tokens cap at ~50 tok/s on Apple
-/// Silicon; 1024 absorbs ~20s of decode at full rate before a slow
-/// consumer starts dropping. `Lagged` is observed at the SSE handler
-/// boundary and logged at `warn`.
+/// Capacity of the broadcast channel. Tokens cap at ~50 tok/s on Apple Silicon;
+/// 1024 absorbs ~20s of decode at full rate before a slow consumer starts
+/// dropping. `Lagged` is observed at the SSE handler boundary and logged at
+/// `warn`.
 const PROBE_BROADCAST_CAPACITY: usize = 1024;
 
-/// Per-request streaming probe recorder. Fires `serde_json::to_value(&ctx)`
-/// per token and pushes a [`StreamProbeMsg::Token`] onto the bus.
+/// Per-request streaming probe recorder. Fires `serde_json::to_value(&ctx)` per
+/// token and pushes a [`StreamProbeMsg::Token`] onto the bus.
 ///
-/// `Sender::send` returns `Err` only when there are zero subscribers —
-/// silently ignored, since "no consumers means no observers" is fine.
+/// `Sender::send` returns `Err` only when there are zero subscribers — silently
+/// ignored, since "no consumers means no observers" is fine.
 struct StreamingProbeRecorder {
     bus: tokio::sync::broadcast::Sender<StreamProbeMsg>,
     id: uuid::Uuid,
@@ -1021,9 +1006,9 @@ struct StreamingProbeRecorder {
 
 impl ProbeHook for StreamingProbeRecorder {
     fn on_token(&mut self, ctx: ProbeCtx<'_>) {
-        // serde_json::to_value goes via the Serialize impl on ProbeCtx —
-        // owns the result, which the broadcast bus then clones once
-        // per receiver. Less code than deriving Clone on Snapshot etc.
+        // serde_json::to_value goes via the Serialize impl on ProbeCtx — owns
+        // the result, which the broadcast bus then clones once per receiver.
+        // Less code than deriving Clone on Snapshot etc.
         let value = match serde_json::to_value(&ctx) {
             Ok(v) => v,
             Err(e) => {
@@ -1042,30 +1027,29 @@ impl ProbeHook for StreamingProbeRecorder {
     }
 }
 
-/// Composes multiple [`ProbeHook`] implementations behind a single
-/// `Box<dyn ProbeHook>`. `Engine::set_probe_hook` accepts only one;
-/// when `--record-json` and `--probe-stream` are both set, this fans
-/// `on_token` to both inner recorders and aggregates `snapshot_opts`
-/// so capture cost is paid once.
+/// Composes multiple [`ProbeHook`] implementations behind a single `Box<dyn
+/// ProbeHook>`. `Engine::set_probe_hook` accepts only one; when `--record-json`
+/// and `--probe-stream` are both set, this fans `on_token` to both inner
+/// recorders and aggregates `snapshot_opts` so capture cost is paid once.
 struct FanOutHook {
     hooks: Vec<Box<dyn ProbeHook>>,
 }
 
 impl ProbeHook for FanOutHook {
     fn on_token(&mut self, ctx: ProbeCtx<'_>) {
-        // ProbeCtx is `#[non_exhaustive]` — can't struct-literal it
-        // from a downstream crate. It's also `Copy`, so we just copy
-        // the whole bag of borrows once per inner hook.
+        // ProbeCtx is `#[non_exhaustive]` — can't struct-literal it from a
+        // downstream crate. It's also `Copy`, so we just copy the whole bag of
+        // borrows once per inner hook.
         for hook in self.hooks.iter_mut() {
             hook.on_token(ctx);
         }
     }
 
     fn snapshot_opts(&self) -> Option<SnapshotOpts> {
-        // Aggregate: if any inner hook wants a snapshot, capture once
-        // with the union of opts (max top_k, min p_threshold,
-        // entropy-OR). Capture cost is paid once; cheap recorders see
-        // the populated `ctx.snapshot` and ignore it.
+        // Aggregate: if any inner hook wants a snapshot, capture once with the
+        // union of opts (max top_k, min p_threshold, entropy-OR). Capture cost
+        // is paid once; cheap recorders see the populated `ctx.snapshot` and
+        // ignore it.
         let mut acc: Option<SnapshotOpts> = None;
         for hook in self.hooks.iter() {
             if let Some(opts) = hook.snapshot_opts() {
@@ -1084,20 +1068,20 @@ impl ProbeHook for FanOutHook {
     }
 }
 
-/// `/probe` SSE handler. Subscribes a fresh receiver on the
-/// broadcast bus and emits each [`StreamProbeMsg`] as one
-/// `text/event-stream` event. Generic over the backend so both
-/// `llama_cpp_run` and `moeflux_run` can mount the same handler.
+/// `/probe` SSE handler. Subscribes a fresh receiver on the broadcast bus and
+/// emits each [`StreamProbeMsg`] as one `text/event-stream` event. Generic over
+/// the backend so both `llama_cpp_run` and `moeflux_run` can mount the same
+/// handler.
 ///
 /// Behavior:
-/// - **No bus** (server started without `--probe-stream`): return 404.
-///   The route is also gated at mount time, but defensive against
-///   anyone managing to hit the path through some other path.
-/// - **Lagged receiver** (slow consumer falls behind the broadcast
-///   ring): log at `warn` and continue. The consumer skips the
-///   missed events; the stream stays open.
-/// - **Channel closed** (sender dropped — only happens at server
-///   shutdown): the stream ends naturally.
+/// - **No bus** (server started without `--probe-stream`): return 404. The
+///   route is also gated at mount time, but defensive against anyone managing
+///   to hit the path through some other path.
+/// - **Lagged receiver** (slow consumer falls behind the broadcast ring): log
+///   at `warn` and continue. The consumer skips the missed events; the stream
+///   stays open.
+/// - **Channel closed** (sender dropped — only happens at server shutdown): the
+///   stream ends naturally.
 async fn route_probe_stream<B: Backend>(
     axum::extract::State(state): axum::extract::State<AppState<B>>,
 ) -> Result<
@@ -1153,33 +1137,32 @@ fn map_session_err(
     )
 }
 
-/// Decide whether a session is safe to reuse after `complete_response`
-/// returned this error variant. Reusable variants return the session
-/// to the lock so the next request can hit the prefix cache; non-
-/// reusable variants drop the session, forcing a reload — the
-/// pre-Phase-7 default that was applied unconditionally.
+/// Decide whether a session is safe to reuse after `complete_response` returned
+/// this error variant. Reusable variants return the session to the lock so the
+/// next request can hit the prefix cache; non- reusable variants drop the
+/// session, forcing a reload — the pre-Phase-7 default that was applied
+/// unconditionally.
 ///
-/// Default for unknown variants (added in future SessionError
-/// expansions) is **non-reusable**: erring on the side of correctness
-/// over the perf cost of a reload. New variants must be explicitly
-/// classified once their state implications are understood.
+/// Default for unknown variants (added in future SessionError expansions) is
+/// **non-reusable**: erring on the side of correctness over the perf cost of a
+/// reload. New variants must be explicitly classified once their state
+/// implications are understood.
 fn is_reusable_after(err: &drama_llama::SessionError) -> bool {
     use drama_llama::SessionError as E;
     match err {
-        // Render / grammar-compile errors fire before any decode work
-        // touches the engine. State is untouched — safe to reuse.
+        // Render / grammar-compile errors fire before any decode work touches
+        // the engine. State is untouched — safe to reuse.
         E::ChatTemplate(_) | E::ToolChoice(_) | E::OutputConfig(_) => true,
-        // run_call invalidates its own prefix cache on grammar
-        // violation, so the session is internally consistent.
+        // run_call invalidates its own prefix cache on grammar violation, so
+        // the session is internally consistent.
         E::GrammarViolation { .. } => true,
-        // Backend prefill error (Phase 7's `SessionError::Decode`).
-        // Engine state may be dirty — but Session's
-        // kv_setup_and_chunk_prefill on the next call will memory_clear
-        // or restore_to a known-good snapshot, recovering before any
-        // generation runs. Reusable.
+        // Backend prefill error (Phase 7's `SessionError::Decode`). Engine
+        // state may be dirty — but Session's kv_setup_and_chunk_prefill on the
+        // next call will memory_clear or restore_to a known-good snapshot,
+        // recovering before any generation runs. Reusable.
         E::Decode(_) => true,
-        // Engine setup errors can't fire post-load (session is already
-        // built); if they ever do, drop and reload.
+        // Engine setup errors can't fire post-load (session is already built);
+        // if they ever do, drop and reload.
         #[cfg(feature = "llama-cpp")]
         E::LlamaCppEngine(_) => false,
         #[cfg(all(feature = "moeflux", target_os = "macos"))]
@@ -1192,20 +1175,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
     let args = Args::parse();
 
-    // If --record-json is set, spin up the JSONL writer task before
-    // any request handles so per-request installs always have a
-    // Sender to clone. Failure to open the file is a startup error —
-    // the user asked for probe records and we can't deliver them.
+    // If --record-json is set, spin up the JSONL writer task before any request
+    // handles so per-request installs always have a Sender to clone. Failure to
+    // open the file is a startup error — the user asked for probe records and
+    // we can't deliver them.
     let record_json_tx = if let Some(path) = args.record_json.clone() {
         Some(spawn_probe_writer(path).await?)
     } else {
         None
     };
 
-    // If --probe-stream is set, build the broadcast bus shared by all
-    // request handlers (per-request `StreamingProbeRecorder` clones
-    // the Sender) and the /probe SSE handler (calls `subscribe()` on
-    // each consumer connect).
+    // If --probe-stream is set, build the broadcast bus shared by all request
+    // handlers (per-request `StreamingProbeRecorder` clones the Sender) and the
+    // /probe SSE handler (calls `subscribe()` on each consumer connect).
     let probe_bus = if args.probe_stream {
         Some(
             tokio::sync::broadcast::channel::<StreamProbeMsg>(
@@ -1237,10 +1219,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    /// `StreamProbeMsg` wire format check — SessionStart / Token /
-    /// SessionEnd serialize to the schema documented on the type. The
-    /// /probe consumer relies on the `event` discriminator + the `id`
-    /// field shape; this catches accidental shape changes.
+    /// `StreamProbeMsg` wire format check — SessionStart / Token / SessionEnd
+    /// serialize to the schema documented on the type. The /probe consumer
+    /// relies on the `event` discriminator + the `id` field shape; this catches
+    /// accidental shape changes.
     #[test]
     fn stream_probe_msg_wire_format() {
         let id =
@@ -1271,9 +1253,9 @@ mod tests {
         assert_eq!(end["id"], id_str);
     }
 
-    /// Test-only hook that declares a fixed `SnapshotOpts`. Used to
-    /// exercise `FanOutHook::snapshot_opts` aggregation without needing
-    /// a real `ProbeCtx` (which is non-exhaustive and can't be
+    /// Test-only hook that declares a fixed `SnapshotOpts`. Used to exercise
+    /// `FanOutHook::snapshot_opts` aggregation without needing a real
+    /// `ProbeCtx` (which is non-exhaustive and can't be
     /// struct-literal-constructed outside the defining crate).
     struct OptsHook(Option<SnapshotOpts>);
     impl ProbeHook for OptsHook {
@@ -1322,8 +1304,8 @@ mod tests {
     }
 
     /// `StreamingProbeRecorder` declares the snapshot appetite it was
-    /// configured with. Trivial but catches accidental hardcoding /
-    /// override of the `opts` field.
+    /// configured with. Trivial but catches accidental hardcoding / override of
+    /// the `opts` field.
     #[test]
     fn streaming_recorder_advertises_its_opts() {
         let (bus, _rx) = tokio::sync::broadcast::channel::<StreamProbeMsg>(4);
