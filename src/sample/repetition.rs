@@ -38,11 +38,11 @@ pub struct RepetitionOptions {
     #[cfg_attr(feature = "serde", serde(default = "default_window_size"))]
     pub(crate) window_size: NonZeroU32,
     /// Per-step decay applied to in-window occurrences when computing the
-    /// effective count for the penalty. The effective count contributed by
-    /// one occurrence at age `a` is `decay^a`; the sum over all in-window
+    /// effective count for the penalty. The effective count contributed by one
+    /// occurrence at age `a` is `decay^a`; the sum over all in-window
     /// occurrences is bounded above by `1 / (1 - decay)` for sustained
-    /// repetition. Use `1.0` to disable decay (all in-window occurrences
-    /// count fully); recommended range `0.95..=0.99`.
+    /// repetition. Use `1.0` to disable decay (all in-window occurrences count
+    /// fully); recommended range `0.95..=0.99`.
     #[cfg_attr(feature = "serde", serde(default = "default_decay"))]
     pub(crate) decay: f32,
     /// The maximum number of times an item can be repeated before it is
@@ -54,7 +54,10 @@ pub struct RepetitionOptions {
     pub(crate) ngram_min_size: NonZeroU8,
     /// NGram maximum size, capped at [`NGram::CAPACITY`].
     pub(crate) ngram_max_size: NonZeroU8,
-    /// Repetition penalty. A reasonable value is 1.15.
+    /// Repetition penalty. A reasonable value is 1.05-1.10. Keep in mind
+    /// overlapping n-gram penalties stack so this is stronger than with most
+    /// inference packages. Raise this to the power of the overlap to get a
+    /// comparable number.
     pub(crate) penalty_repeat: f32,
     /// The penalty for the frequency of the n-grams. This subtracts the
     /// frequency of the n-gram from the logit of the penalized token in the
@@ -66,16 +69,12 @@ pub struct RepetitionOptions {
     /// Surgical mode. For each repeating n-gram, penalize the earliest token
     /// that would extend the match in the trailing history. If no prefix has
     /// been re-emitted yet, this is the first token of the n-gram — blocking
-    /// the phrase at its entry point rather than only at its completion. If
-    /// that target token is in the ignored set, the n-gram is skipped
-    /// entirely (we do not fall through to the next token, which would
-    /// produce odd partial completions).
+    /// the phrase at its entry point rather than the entire completion.
     ///
-    /// Example: with `[The, New, York]` as a known repeating trigram, this
-    /// penalizes "The" before the phrase starts, "New" if "The" was just
-    /// emitted, or "York" if "The New" was just emitted. Lowercase stopwords
-    /// like "the" are skipped via the ignored set; uppercase "The" is not,
-    /// so proper-noun repetition is blocked at the first token.
+    /// Example: ["go", "fuck", "yourself"] would only penalize "go", ensuring
+    /// another insult entirely such as ["eat", "shit", "buddy"]. Note that
+    /// penalties *do* overlap so if bigrams *and* trigrams are penalized,
+    /// "fuck" will also be penalized, and "go" *doubly* so, but not "yourself".
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) surgical: bool,
 }
@@ -96,27 +95,14 @@ fn default_decay() -> f32 {
 
 impl Default for RepetitionOptions {
     fn default() -> Self {
-        // Defaults are the empirical Qwen3.5 A17B sweet spot
-        // discovered during v0.8.0 sidecar tuning (runs 04 / 09 /
-        // 10-12, captured in the rep-penalty work CHANGELOG entry).
-        // Held across three topics (Apollo, internet, jazz) and two
-        // seeds (1337, 9999) without a single fact swap.
-        //
-        // Per-model sidecars can override any of these — small models
-        // may want broad mode (`surgical = false`) and a stronger
-        // multiplicative; long-form generation may want a wider
-        // window / slower decay. The defaults aim to be safe on big
-        // MoE models where the prior defaults (1.06 / broad / no
-        // English ignore) showed digit and proper-noun swaps mid-
-        // essay (Apollo 11 → Apollo 13 / 19 / 196).
+        // Defaults are tuned for Qwen3.5 a17b and a3b
         Self {
-            // English stopwords + JSON syntax tokens are common-by-
-            // design; penalising them just biases the model away from
-            // natural prose / structured output for no anti-loop
-            // benefit. Punctuation is also default-on for the same
-            // reason — prose `. , ; : ! ?` have no lexical variety,
-            // so accumulating penalty on `.` biases toward run-ons.
-            // Users can override by calling
+            // English stopwords + JSON syntax tokens are common-by- design;
+            // penalising them just biases the model away from natural prose /
+            // structured output for no anti-loop benefit. Punctuation is also
+            // default-on for the same reason — prose `. , ; : ! ?` have no
+            // lexical variety, so accumulating penalty on `.` biases toward
+            // run-ons. Users can override by calling
             // `set_ignored_categories(vec![])`.
             ignored_categories: BTreeSet::from([
                 IgnoreCategory::English,
@@ -129,26 +115,23 @@ impl Default for RepetitionOptions {
             penalty_max_count: NonZeroU8::new(1).unwrap(),
             ngram_min_size: NonZeroU8::new(1).unwrap(),
             ngram_max_size: NonZeroU8::new(4).unwrap(),
-            // 1.05 — `1.05^4 ≈ 1.22` keeps the 4-gram stacked
-            // multiplicative inside the model's natural top-k spread.
-            // 1.06 (the prior default) → `1.06^4 ≈ 1.27` was already
-            // pushing factual tokens out of contention on big-model
-            // prose.
+            // 1.05 — `1.05^4 ≈ 1.22` keeps the 4-gram stacked multiplicative
+            // inside the model's natural top-k spread. 1.06 (the prior default)
+            // → `1.06^4 ≈ 1.27` was already pushing factual tokens out of
+            // contention on big-model prose.
             penalty_repeat: 1.05,
-            // 0.125 (was 0.1) and 0.0625 (was 0.1) — the saturated
-            // additive contribution is bounded by
-            // `1 / (1 - decay) * penalty_freq + penalty_present`
-            // ≈ 2.6 at these defaults. Comfortable inside any
+            // 0.125 (was 0.1) and 0.0625 (was 0.1) — the saturated additive
+            // contribution is bounded by `1 / (1 - decay) * penalty_freq +
+            // penalty_present` ≈ 2.6 at these defaults. Comfortable inside any
             // model's natural top-k spread.
             penalty_freq: 0.125,
             penalty_present: 0.0625,
-            // Surgical-on (was off): only penalises the *next-
-            // extension* token of a recurring n-gram, not every
-            // trailing token of every tracked n-gram. On big-vocab
-            // models this preserves digits and proper nouns even
-            // when the surrounding bigrams repeat. Small-vocab
-            // models that prefer broader penalty pressure can opt
-            // out via per-model sidecar.
+            // Surgical-on (was off): only penalises the *next- extension* token
+            // of a recurring n-gram, not every trailing token of every tracked
+            // n-gram. On big-vocab models this preserves digits and proper
+            // nouns even when the surrounding bigrams repeat. Small-vocab
+            // models that prefer broader penalty pressure can opt out via
+            // per-model sidecar.
             surgical: true,
         }
     }
