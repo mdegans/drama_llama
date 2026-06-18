@@ -134,7 +134,6 @@ fn main() {
         &mlx_dir,
         &artifacts_dir,
         &experts_dir,
-        8,
         false,
     ) {
         Ok(e) => e,

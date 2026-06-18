@@ -199,7 +199,6 @@ fn moeflux_matches_llama_cpp() {
             &mlx_dir,
             &artifacts_dir,
             &experts_dir,
-            8,
             false,
         )
         .expect("MoefluxEngine::from_paths");

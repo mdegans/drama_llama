@@ -52,7 +52,6 @@ fn moeflux_loads_and_predicts() {
         &mlx_dir,
         &artifacts_dir,
         &experts_dir,
-        8,     // experts_per_tok — Qwen3 MoE default top-K
         false, // use_2bit — stick with 4-bit
     )
     .expect("MoefluxEngine::from_paths failed");

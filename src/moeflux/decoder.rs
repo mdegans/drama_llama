@@ -99,24 +99,18 @@ impl MoefluxDecoder {
     /// - `manifest` — `model_weights.json` (sibling).
     /// - `vocab` — `vocab.bin` (produced by moeflux's `export_vocab.py`).
     /// - `experts_dir` — directory containing `packed_experts/`.
-    /// - `experts_per_tok` — MoE top-K at inference.
     /// - `use_2bit` — select `packed_experts_2bit/` layout.
+    ///
+    /// MoE top-K is not a parameter: it is model shape, fixed by the
+    /// compiled moeflux variant (`num_experts_per_tok`).
     pub fn open(
         weights: &Path,
         manifest: &Path,
         vocab: &Path,
         experts_dir: &Path,
-        experts_per_tok: u32,
         use_2bit: bool,
     ) -> Result<Self, MoefluxError> {
-        let ctx = Ctx::open(
-            weights,
-            manifest,
-            vocab,
-            experts_dir,
-            experts_per_tok,
-            use_2bit,
-        )?;
+        let ctx = Ctx::open(weights, manifest, vocab, experts_dir, use_2bit)?;
         let n_vocab = ctx.n_vocab();
         Ok(Self {
             ctx,

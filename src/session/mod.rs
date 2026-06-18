@@ -554,11 +554,11 @@ impl Session<MoefluxBackend> {
     /// Load a moeflux model from a parent directory using the
     /// drama_llama folder convention: `parent/mlx/`,
     /// `parent/artifacts/`, `parent/root/` (the experts dir).
-    /// Defaults `experts_per_tok = 8`, `use_2bit = false` — the Qwen3
-    /// MoE 4-bit setup. Power users who need explicit paths or
-    /// non-default runtime params can construct a
-    /// [`crate::MoefluxEngine`] directly via `MoefluxEngine::from_paths`
-    /// and hand it to [`Self::from_engine`].
+    /// Defaults `use_2bit = false` — the Qwen3 MoE 4-bit setup. MoE
+    /// top-K is variant-driven (not a parameter). Power users who need
+    /// explicit paths can construct a [`crate::MoefluxEngine`] directly
+    /// via `MoefluxEngine::from_paths` and hand it to
+    /// [`Self::from_engine`].
     ///
     /// Looks for a sampling sidecar at `parent/sampling.toml` —
     /// alongside the `mlx`/`artifacts`/`root` symlinks, *not* inside

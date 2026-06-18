@@ -43,13 +43,14 @@ impl MoefluxEngine {
     /// - `artifacts_dir` — moeflux artifacts directory containing
     ///   `model_weights.bin`, `model_weights.json`, `vocab.bin`.
     /// - `experts_dir` — directory containing `packed_experts/`.
-    /// - `experts_per_tok` — MoE top-K at inference.
     /// - `use_2bit` — select the 2-bit packed-experts layout.
+    ///
+    /// MoE top-K is model shape, fixed by the compiled moeflux variant
+    /// (`num_experts_per_tok`) — not a parameter.
     pub fn from_paths(
         mlx_dir: &Path,
         artifacts_dir: &Path,
         experts_dir: &Path,
-        experts_per_tok: u32,
         use_2bit: bool,
     ) -> Result<Self, MoefluxEngineError> {
         let model = MoefluxModel::from_mlx_dir(mlx_dir)?;
@@ -58,7 +59,6 @@ impl MoefluxEngine {
             &artifacts_dir.join("model_weights.json"),
             &artifacts_dir.join("vocab.bin"),
             experts_dir,
-            experts_per_tok,
             use_2bit,
         )?;
         Ok(Self {
@@ -78,10 +78,9 @@ impl MoefluxEngine {
     /// - `parent/root/` — the experts directory (contains
     ///   `packed_experts/`).
     ///
-    /// Defaults `experts_per_tok = 8`, `use_2bit = false` — the Qwen3
-    /// MoE 4-bit setup. Power users who need explicit paths or
-    /// non-default runtime params can use [`Self::from_paths`]
-    /// directly.
+    /// Defaults `use_2bit = false` — the Qwen3 MoE 4-bit setup. MoE
+    /// top-K is variant-driven (not a parameter). Power users who need
+    /// explicit paths can use [`Self::from_paths`] directly.
     ///
     /// This is the constructor `blallama` uses on the moeflux side so
     /// `--model <path>` is symmetric with the llama.cpp path. The
@@ -94,7 +93,7 @@ impl MoefluxEngine {
         let artifacts_dir = parent.join("artifacts");
         let experts_dir = parent.join("root");
         let mut engine =
-            Self::from_paths(&mlx_dir, &artifacts_dir, &experts_dir, 8, false)?;
+            Self::from_paths(&mlx_dir, &artifacts_dir, &experts_dir, false)?;
         // Override the model's display name to the parent dir's
         // basename — that's what blallama-style discovery flows
         // address the model by, and what they expect to see echoed

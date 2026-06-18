@@ -58,7 +58,6 @@ fn build_session() -> Session<drama_llama::MoefluxBackend> {
         &mlx_dir,
         &artifacts_dir,
         &experts_dir,
-        8,     // experts_per_tok
         false, // use_2bit
     )
     .expect("MoefluxEngine::from_paths");
