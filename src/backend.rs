@@ -270,40 +270,21 @@ pub trait Model {
     }
 }
 
-/// Bundle of decoder + model implementations that together form a
-/// backend. Plugs the typed pair into [`crate::Engine`] and
-/// [`crate::Session`] via a single generic parameter.
+/// Bundle of [`Decoder`] and [`Model`] implementations that together form a
+/// `Backend`. Used with [`Engine`] and [`Session`].
 ///
-/// Implementors are zero-sized type tags (e.g. [`crate::LlamaCppBackend`])
-/// — the actual work is in the associated [`Decoder`] and [`Model`]
-/// implementations. Compile-time monomorphization: every method on
-/// `Engine<B>` and `Session<B>` resolves to the concrete `B::Decoder`
-/// / `B::Model` impl with no runtime dispatch.
-///
-/// Decoders need `Send` so an `Engine` can move across `await` points
-/// (e.g. into `tokio::task::spawn_blocking`). `Sync` is intentionally
-/// *not* required: llama.cpp's `*mut llama_context` is internally
-/// mutable and unsound to share across threads, and decoders are only
-/// ever accessed through `&mut` anyway.
-///
-/// Models need both `Send + Sync` because the Predictor family's
-/// `Iterator` impls hand `&Model` to grammar / sampling code that may
-/// observe it from multiple positions. Both real-world model impls
-/// (`LlamaCppModel`, `MoefluxModel`) carry explicit
-/// `unsafe impl Sync` declarations.
-///
-/// Baking these bounds here lets consumers (`Engine<B>`, `Session<B>`,
-/// the Predictor family) drop per-site where-clauses.
+/// [`Engine`]: crate::Engine
+/// [`Session`]: crate::Session
 pub trait Backend {
     const NAME: &'static str;
 
-    /// Concrete decoder type for this backend. `Send` so the engine
-    /// can move between threads; not `Sync` (decode mutates state).
+    /// Concrete [`Decoder`] type for this [`Backend`]. `Send` so the engine can
+    /// move between threads; not `Sync` (decode mutates state).
     type Decoder: Decoder + Send;
-    /// Concrete model type for this backend. `Send + Sync` —
-    /// vocab and tokenizer are read concurrently by Iterator impls.
+    /// Concrete [`Model`] type for this [`Backend`]. `Send + Sync` — vocab and
+    /// tokenizer are read concurrently by Iterator impls.
     type Model: Model + Send + Sync;
 
-    /// Return `true` if a file or directory is supported.
-    fn is_supported(name: &str, meta: &std::fs::Metadata) -> bool;
+    /// Return `true` if a file or directory is supported by the [`Backend`].
+    fn is_supported_model(name: &str, meta: &std::fs::Metadata) -> bool;
 }

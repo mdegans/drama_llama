@@ -266,7 +266,7 @@ fn init_logging() {
 async fn route_tags<B: Backend>(
     State(state): State<AppState<B>>,
 ) -> Json<serde_json::Value> {
-    let names = list_entries(&state.args.model_path, B::is_supported)
+    let names = list_entries(&state.args.model_path, B::is_supported_model)
         .await
         .unwrap_or_default();
     let models: Vec<_> = names
@@ -357,7 +357,8 @@ where
     Session<B>: FromPath,
 {
     let models =
-        match list_entries(&state.args.model_path, B::is_supported).await {
+        match list_entries(&state.args.model_path, B::is_supported_model).await
+        {
             Ok(models) => models,
             Err(e) => {
                 let e = AnthropicError::NotFound {
