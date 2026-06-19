@@ -172,6 +172,7 @@ impl SessionError {
             Self::Decode(_) => true,
             // Tokio task failed to join. As of writing this likely means a panic
             // in an engine `FromPath` impl.
+            #[cfg(feature = "tokio")]
             Self::JoinError(_) => false,
             // Engine setup errors can't fire post-load (session is already built);
             // if they ever do, drop and reload.
