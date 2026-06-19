@@ -1086,8 +1086,7 @@ mod invariant_tests {
                 penalty_repeat = 1.05\n\
                 penalty_freq = 0.125\n\
                 penalty_present = 0.0625\n";
-            let err =
-                ::toml::from_str::<RepetitionOptions>(doc).unwrap_err();
+            let err = ::toml::from_str::<RepetitionOptions>(doc).unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("ngram_min_size") && msg.contains("must be <="),
@@ -1100,8 +1099,7 @@ mod invariant_tests {
         /// `#[serde(default)]`), not the rich `RepetitionOptions::default()`.
         #[test]
         fn partial_applies_defaults() {
-            let o: RepetitionOptions =
-                ::toml::from_str(REQUIRED).unwrap();
+            let o: RepetitionOptions = ::toml::from_str(REQUIRED).unwrap();
             assert_eq!(o.window_size().get(), 256);
             assert_eq!(o.decay(), 0.95);
             assert!(!o.surgical());
@@ -1113,16 +1111,12 @@ mod invariant_tests {
         /// `ignored_categories`.
         #[test]
         fn ignored_stopwords_alias() {
-            let doc =
-                format!("{REQUIRED}ignored_categories = [\"English\"]\n");
-            let o: RepetitionOptions =
-                ::toml::from_str(&doc).unwrap();
+            let doc = format!("{REQUIRED}ignored_categories = [\"English\"]\n");
+            let o: RepetitionOptions = ::toml::from_str(&doc).unwrap();
             assert!(o.ignored_categories().contains(&IgnoreCategory::English));
 
-            let doc =
-                format!("{REQUIRED}ignored_stopwords = [\"Json\"]\n");
-            let o: RepetitionOptions =
-                ::toml::from_str(&doc).unwrap();
+            let doc = format!("{REQUIRED}ignored_stopwords = [\"Json\"]\n");
+            let o: RepetitionOptions = ::toml::from_str(&doc).unwrap();
             assert!(o.ignored_categories().contains(&IgnoreCategory::Json));
         }
 
