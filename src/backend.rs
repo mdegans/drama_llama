@@ -12,6 +12,11 @@
 
 /// Canonical token identifier used across the crate. Alias for `i32`
 /// so it is ABI-compatible with llama.cpp's `llama_token`.
+// TODO: This doesn't need to be generic for now but should likely be a an
+// associated type. Where? Decoder, Model, or Backend? Not sure. If Model never
+// uses Token anywhere the choice is clear. If both Model and Decoder need Token
+// we have no choice but to put it in both places and add bounds to Backend that
+// Model's Token is the same as Decoder's if that's expressable.
 pub type Token = i32;
 
 /// A candidate slot: token id, raw logit, softmaxed probability.
