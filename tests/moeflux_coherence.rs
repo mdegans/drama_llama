@@ -74,6 +74,7 @@ struct StepLogits {
 #[derive(Debug)]
 struct WorkerOutput {
     prompt_id: String,
+    // FIXME: this field is never read. Should we be checking it?
     gather_id: String,
     n_vocab: i32,
     stop_set: HashSet<i32>,
