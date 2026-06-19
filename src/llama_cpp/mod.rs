@@ -24,4 +24,8 @@ impl crate::backend::Backend for LlamaCppBackend {
     const NAME: &'static str = "llama-cpp";
     type Decoder = LlamaCppDecoder;
     type Model = LlamaCppModel;
+
+    fn is_supported(name: &str, meta: &std::fs::Metadata) -> bool {
+        meta.is_file() && name.ends_with(".gguf")
+    }
 }

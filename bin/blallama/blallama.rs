@@ -159,13 +159,6 @@ where
     Ok(models)
 }
 
-/// Accept predicate for the llama.cpp backend: regular `.gguf` files only.
-/// Without the extension check, `/api/tags` advertises (and `/v1/messages`
-/// accepts) sampling sidecars and Finder litter as "models".
-fn is_gguf(name: &str, meta: &std::fs::Metadata) -> bool {
-    meta.is_file() && name.ends_with(".gguf")
-}
-
 /// Resolve a requested model id against what's on disk. `Ok(None)` means serve
 /// as-requested; `Ok(Some(d))` means substitute the `--default-model`
 /// (unmodified Anthropic-SDK clients request `claude-*` ids); `Err` is the 404
@@ -270,151 +263,67 @@ fn init_logging() {
     Registry::default().with(filter).with(fmt_layer).init();
 }
 
-// ---------------------------------------------------------------------------
-// llama.cpp run path
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "llama-cpp")]
-mod llama_cpp_run {
-    use super::*;
-    use drama_llama::LlamaCppBackend;
-
-    pub async fn run(
-        args: Args,
-        record_json_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
-        probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = tokio::net::TcpListener::bind(format!(
-            "0.0.0.0:{port}",
-            port = args.port
-        ))
-        .await?;
-
-        let session: Arc<Mutex<Option<Session<LlamaCppBackend>>>> =
-            Mutex::from(None).into();
-
-        let mut app = Router::new()
-            .route("/v1/messages", post(route_messages))
-            .route("/api/tags", get(route_tags));
-        if probe_bus.is_some() {
-            app = app.route(
-                "/probe",
-                axum::routing::get(route_probe_stream::<LlamaCppBackend>),
-            );
-        }
-        let app = app.with_state(AppState {
-            args: args.into(),
-            record_json_tx,
-            probe_bus,
-            session,
-        });
-        axum::serve(listener, app).await?;
-        Ok(())
-    }
-
-    async fn route_tags(
-        State(state): State<AppState<LlamaCppBackend>>,
-    ) -> Json<serde_json::Value> {
-        let names = list_entries(&state.args.model_path, is_gguf)
-            .await
-            .unwrap_or_default();
-        let models: Vec<_> = names
-            .iter()
-            .map(|name| {
-                serde_json::json!({
-                    "name": name,
-                    "model": name,
-                    "modified_at": "1970-01-01T00:00:00.000000000Z",
-                    "size": 0,
-                    "digest": "",
-                    "details": {
-                        "format": "gguf",
-                        "family": "",
-                        "families": [],
-                        "parameter_size": "",
-                        "quantization_level": ""
-                    }
-                })
+async fn route_tags<B: Backend>(
+    State(state): State<AppState<B>>,
+) -> Json<serde_json::Value> {
+    let names = list_entries(&state.args.model_path, B::is_supported)
+        .await
+        .unwrap_or_default();
+    let models: Vec<_> = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "model": name,
+                "modified_at": "1970-01-01T00:00:00.000000000Z",
+                "size": 0,
+                "digest": "",
+                "details": {
+                    "format": "gguf",
+                    "family": "",
+                    "families": [],
+                    "parameter_size": "",
+                    "quantization_level": ""
+                }
             })
-            .collect();
-        Json(serde_json::json!({ "models": models }))
-    }
+        })
+        .collect();
+    Json(serde_json::json!({ "models": models }))
 }
 
-// ---------------------------------------------------------------------------
-// moeflux run path
-// ---------------------------------------------------------------------------
+async fn run<B>(
+    args: Args,
+    record_json_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+    probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    B: Backend + 'static,
+    AppState<B>: Clone,
+    Session<B>: FromPath,
+{
+    let listener = tokio::net::TcpListener::bind(format!(
+        "0.0.0.0:{port}",
+        port = args.port
+    ))
+    .await?;
 
-#[cfg(all(feature = "moeflux", target_os = "macos"))]
-mod moeflux_run {
-    use super::*;
-    use drama_llama::MoefluxBackend;
+    let session: Arc<Mutex<Option<Session<B>>>> = Mutex::from(None).into();
 
-    pub async fn run(
-        args: Args,
-        record_json_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
-        probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = tokio::net::TcpListener::bind(format!(
-            "0.0.0.0:{port}",
-            port = args.port
-        ))
-        .await?;
-
-        let session: Arc<Mutex<Option<Session<MoefluxBackend>>>> =
-            Mutex::from(None).into();
-
-        let mut app = Router::new()
-            .route("/v1/messages", post(route_messages))
-            .route("/api/tags", get(route_tags));
-        if probe_bus.is_some() {
-            app = app.route(
-                "/probe",
-                axum::routing::get(route_probe_stream::<MoefluxBackend>),
-            );
-        }
-        let app = app.with_state(AppState {
-            args: args.into(),
-            record_json_tx,
-            probe_bus,
-            session,
-        });
-        axum::serve(listener, app).await?;
-        Ok(())
+    let mut app = Router::new()
+        .route("/v1/messages", post(route_messages))
+        .route("/api/tags", get(route_tags));
+    if probe_bus.is_some() {
+        app = app.route("/probe", axum::routing::get(route_probe_stream));
     }
-
-    async fn route_tags(
-        State(state): State<AppState<MoefluxBackend>>,
-    ) -> Json<serde_json::Value> {
-        let names = list_entries(&state.args.model_path, |_, m| m.is_dir())
-            .await
-            .unwrap_or_default();
-        let models: Vec<_> = names
-            .iter()
-            .map(|name| {
-                serde_json::json!({
-                    "name": name,
-                    "model": name,
-                    "modified_at": "1970-01-01T00:00:00.000000000Z",
-                    "size": 0,
-                    "digest": "",
-                    "details": {
-                        "format": "gguf",
-                        "family": "",
-                        "families": [],
-                        "parameter_size": "",
-                        "quantization_level": ""
-                    }
-                })
-            })
-            .collect();
-        Json(serde_json::json!({ "models": models }))
-    }
+    let app = app.with_state(AppState {
+        args: args.into(),
+        record_json_tx,
+        probe_bus,
+        session,
+    });
+    axum::serve(listener, app).await?;
+    Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Shared session helpers
-// ---------------------------------------------------------------------------
 
 async fn load_session<B>(
     root: impl AsRef<Path>,
@@ -447,16 +356,17 @@ where
     B: Backend + 'static,
     Session<B>: FromPath,
 {
-    let models = match list_entries(&state.args.model_path, is_gguf).await {
-        Ok(models) => models,
-        Err(e) => {
-            let e = AnthropicError::NotFound {
-                message: format!("Models could not be loaded: {e}"),
-            };
-            error!(error = %e);
-            return Err((StatusCode::NOT_FOUND, Json(e)));
-        }
-    };
+    let models =
+        match list_entries(&state.args.model_path, B::is_supported).await {
+            Ok(models) => models,
+            Err(e) => {
+                let e = AnthropicError::NotFound {
+                    message: format!("Models could not be loaded: {e}"),
+                };
+                error!(error = %e);
+                return Err((StatusCode::NOT_FOUND, Json(e)));
+            }
+        };
 
     match resolve_model(
         &prompt.model.to_string(),
@@ -1012,11 +922,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.backend {
         #[cfg(feature = "llama-cpp")]
         BackendKind::LlamaCpp => {
-            llama_cpp_run::run(args, record_json_tx, probe_bus).await
+            run::<drama_llama::LlamaCppBackend>(args, record_json_tx, probe_bus)
+                .await
         }
         #[cfg(all(feature = "moeflux", target_os = "macos"))]
         BackendKind::Moeflux => {
-            moeflux_run::run(args, record_json_tx, probe_bus).await
+            run::<drama_llama::MoefluxBackend>(args, record_json_tx, probe_bus)
+                .await
         }
     }
 }

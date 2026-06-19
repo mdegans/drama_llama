@@ -303,4 +303,7 @@ pub trait Backend {
     /// Concrete model type for this backend. `Send + Sync` —
     /// vocab and tokenizer are read concurrently by Iterator impls.
     type Model: Model + Send + Sync;
+
+    /// Return `true` if a file or directory is supported.
+    fn is_supported(name: &str, meta: &std::fs::Metadata) -> bool;
 }

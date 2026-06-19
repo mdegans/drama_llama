@@ -29,4 +29,10 @@ impl crate::backend::Backend for MoefluxBackend {
 
     type Decoder = MoefluxDecoder;
     type Model = MoefluxModel;
+
+    fn is_supported(_: &str, meta: &std::fs::Metadata) -> bool {
+        // This is cheap and if the required files aren't here we'll fail later
+        // with an std::io::Error.
+        meta.is_dir()
+    }
 }
