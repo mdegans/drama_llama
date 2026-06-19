@@ -149,6 +149,49 @@ pub enum SessionError {
     Decode(String),
 }
 
+impl SessionError {
+    /// For functions like [`complete_response`], return `true` if the
+    /// [`Session`] is re-usable, else false. Inverse of [`is_fatal`].
+    ///
+    /// [`complete_response`]: Session::complete_response
+    /// [`is_fatal`]: Self::is_fatal
+    pub fn is_reusable_after(&self) -> bool {
+        match self {
+            // Render / grammar-compile errors fire before any decode work touches
+            // the engine. State is untouched — safe to reuse.
+            Self::ChatTemplate(_)
+            | Self::ToolChoice(_)
+            | Self::OutputConfig(_) => true,
+            // run_call invalidates its own prefix cache on grammar violation, so
+            // the session is internally consistent.
+            Self::GrammarViolation { .. } => true,
+            // Backend prefill error (Phase 7's `SessionError::Decode`). Engine
+            // state may be dirty — but Session's kv_setup_and_chunk_prefill on the
+            // next call will memory_clear or restore_to a known-good snapshot,
+            // recovering before any generation runs. Reusable.
+            Self::Decode(_) => true,
+            // Tokio task failed to join. As of writing this likely means a panic
+            // in an engine `FromPath` impl.
+            Self::JoinError(_) => false,
+            // Engine setup errors can't fire post-load (session is already built);
+            // if they ever do, drop and reload.
+            #[cfg(feature = "llama-cpp")]
+            Self::LlamaCppEngine(_) => false,
+            #[cfg(all(feature = "moeflux", target_os = "macos"))]
+            Self::MoefluxEngine(_) => false,
+        }
+    }
+
+    /// For functions like [`complete_response`], return `true` if the error was
+    /// fatal and the [`Session`] should be dropped.
+    ///
+    /// [`complete_response`]: Session::complete_response
+    /// [`is_fatal`]: Self::is_fatal
+    pub fn is_fatal(&self) -> bool {
+        !self.is_reusable_after()
+    }
+}
+
 /// Default maximum tokens per [`Session::complete_text`] call. Users override
 /// via [`Session::with_max_tokens`].
 const DEFAULT_MAX_TOKENS: usize = 1024;

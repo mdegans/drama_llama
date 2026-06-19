@@ -573,7 +573,7 @@ where
         Ok(_) => {
             lock.replace(session);
         }
-        Err(e) if is_reusable_after(e) => {
+        Err(e) if !e.is_fatal() => {
             lock.replace(session);
         }
         Err(_) => {
@@ -976,42 +976,6 @@ fn map_session_err(
             message: e.to_string(),
         }),
     )
-}
-
-/// Decide whether a session is safe to reuse after `complete_response` returned
-/// this error variant. Reusable variants return the session to the lock so the
-/// next request can hit the prefix cache; non- reusable variants drop the
-/// session, forcing a reload — the pre-Phase-7 default that was applied
-/// unconditionally.
-///
-/// Default for unknown variants (added in future SessionError expansions) is
-/// **non-reusable**: erring on the side of correctness over the perf cost of a
-/// reload. New variants must be explicitly classified once their state
-/// implications are understood.
-fn is_reusable_after(err: &drama_llama::SessionError) -> bool {
-    use drama_llama::SessionError as E;
-    match err {
-        // Render / grammar-compile errors fire before any decode work touches
-        // the engine. State is untouched — safe to reuse.
-        E::ChatTemplate(_) | E::ToolChoice(_) | E::OutputConfig(_) => true,
-        // run_call invalidates its own prefix cache on grammar violation, so
-        // the session is internally consistent.
-        E::GrammarViolation { .. } => true,
-        // Backend prefill error (Phase 7's `SessionError::Decode`). Engine
-        // state may be dirty — but Session's kv_setup_and_chunk_prefill on the
-        // next call will memory_clear or restore_to a known-good snapshot,
-        // recovering before any generation runs. Reusable.
-        E::Decode(_) => true,
-        // Tokio task failed to join. As of writing this likely means a panic
-        // in an engine `FromPath` impl.
-        E::JoinError(_) => false,
-        // Engine setup errors can't fire post-load (session is already built);
-        // if they ever do, drop and reload.
-        #[cfg(feature = "llama-cpp")]
-        E::LlamaCppEngine(_) => false,
-        #[cfg(all(feature = "moeflux", target_os = "macos"))]
-        E::MoefluxEngine(_) => false,
-    }
 }
 
 #[tokio::main]
