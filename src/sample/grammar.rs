@@ -2421,7 +2421,7 @@ char ::= [\x00-\x7F] | [\x80-\xFF]"#;
     #[test]
     #[ignore = "requires model"]
     fn grammar_integration_tool_call() {
-        use crate::{Engine, PredictOptions, SampleOptions, SamplingMode};
+        use crate::{PredictOptions, SampleOptions, SamplingMode};
         use std::{num::NonZeroUsize, path::PathBuf};
 
         let model_path =

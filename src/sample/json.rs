@@ -954,7 +954,7 @@ mod tests {
     #[test]
     #[ignore = "requires model"]
     fn json_integration_character_sheet() {
-        use crate::{Engine, PredictOptions, SampleOptions, SamplingMode};
+        use crate::{PredictOptions, SampleOptions, SamplingMode};
         use std::{num::NonZeroUsize, path::PathBuf};
 
         let model_path =

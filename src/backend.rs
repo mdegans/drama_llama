@@ -295,6 +295,8 @@ pub trait Model {
 /// Baking these bounds here lets consumers (`Engine<B>`, `Session<B>`,
 /// the Predictor family) drop per-site where-clauses.
 pub trait Backend {
+    const NAME: &'static str;
+
     /// Concrete decoder type for this backend. `Send` so the engine
     /// can move between threads; not `Sync` (decode mutates state).
     type Decoder: Decoder + Send;

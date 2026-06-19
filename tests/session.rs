@@ -82,16 +82,17 @@ fn complete_text_strawberry_turn_2() {
         ..Default::default()
     };
 
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
-        .expect("session load")
-        .quiet()
-        .with_tool_choice_opts(ToolChoiceOptions {
-            arguments_field: "arguments",
-            wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-            allow_thought: true,
-            ..ToolChoiceOptions::default()
-        })
-        .with_max_tokens(NonZeroUsize::new(256).unwrap());
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_tool_choice_opts(ToolChoiceOptions {
+                arguments_field: "arguments",
+                wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
+                allow_thought: true,
+                ..ToolChoiceOptions::default()
+            })
+            .with_max_tokens(NonZeroUsize::new(256).unwrap());
 
     let out = session.complete_text(&prompt).expect("complete_text");
     println!("=== complete_text output ===\n{out}\n===");
@@ -150,17 +151,18 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
         ..Default::default()
     };
 
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
-        .expect("session load")
-        .quiet()
-        .with_tool_choice_opts(ToolChoiceOptions {
-            arguments_field: "arguments",
-            wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-            allow_thought: true,
-            ..ToolChoiceOptions::default()
-        })
-        .with_sampling(std::iter::empty()) // user chain empty — only grammar runs
-        .with_max_tokens(NonZeroUsize::new(128).unwrap());
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_tool_choice_opts(ToolChoiceOptions {
+                arguments_field: "arguments",
+                wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
+                allow_thought: true,
+                ..ToolChoiceOptions::default()
+            })
+            .with_sampling(std::iter::empty()) // user chain empty — only grammar runs
+            .with_max_tokens(NonZeroUsize::new(128).unwrap());
 
     let out = session.complete_text(&prompt).expect("complete_text");
     println!("=== forced-call output ===\n{out}\n===");
@@ -235,11 +237,12 @@ fn cogito_tool_choice_opts() -> ToolChoiceOptions {
 #[ignore = "requires model"]
 fn complete_returns_message_with_tool_use() {
     let prompt = strawberry_turn_1_prompt();
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
-        .expect("session load")
-        .quiet()
-        .with_tool_choice_opts(cogito_tool_choice_opts())
-        .with_max_tokens(NonZeroUsize::new(256).unwrap());
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_tool_choice_opts(cogito_tool_choice_opts())
+            .with_max_tokens(NonZeroUsize::new(256).unwrap());
 
     let assistant = session.complete(&prompt).expect("complete");
     println!("=== complete message ===\n{assistant:#?}\n===");
@@ -277,11 +280,12 @@ fn complete_returns_message_with_tool_use() {
 #[ignore = "requires model"]
 fn grammar_violation_on_truncated_tool_call() {
     let prompt = strawberry_turn_1_prompt();
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
-        .expect("session load")
-        .quiet()
-        .with_tool_choice_opts(cogito_tool_choice_opts())
-        .with_max_tokens(NonZeroUsize::new(4).unwrap()); // truncate hard
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_tool_choice_opts(cogito_tool_choice_opts())
+            .with_max_tokens(NonZeroUsize::new(4).unwrap()); // truncate hard
 
     let err = session
         .complete_blocks(&prompt)
@@ -311,11 +315,12 @@ fn complete_text_round_trips_through_parse_and_render() {
     let prompt = strawberry_turn_1_prompt();
     let tool_opts = cogito_tool_choice_opts();
 
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
-        .expect("session load")
-        .quiet()
-        .with_tool_choice_opts(tool_opts)
-        .with_max_tokens(NonZeroUsize::new(256).unwrap());
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_tool_choice_opts(tool_opts)
+            .with_max_tokens(NonZeroUsize::new(256).unwrap());
 
     let raw = session.complete_text(&prompt).expect("complete_text");
 
@@ -416,10 +421,11 @@ fn complete_response_id_uses_supplied_uuid() {
         ..Default::default()
     };
 
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
-        .expect("session load")
-        .quiet()
-        .with_max_tokens(NonZeroUsize::new(4).unwrap());
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_max_tokens(NonZeroUsize::new(4).unwrap());
 
     let id = uuid::Uuid::from_u128(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
     let response = session

@@ -98,6 +98,10 @@ pub use parse::{parse_completion, BlockParser};
 /// Errors from [`Session`].
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
+    /// A spawned tokio task failed to join.
+    #[cfg(feature = "tokio")]
+    #[error("Task join error: {0}")]
+    JoinError(#[from] tokio::task::JoinError),
     /// llama.cpp engine setup failed (model load or context init).
     /// Only emitted by `Session<LlamaCppBackend>::from_path*`
     /// constructors.
@@ -475,9 +479,26 @@ fn llama_cpp_sidecar_path(model_path: &std::path::Path) -> std::path::PathBuf {
 #[cfg(feature = "llama-cpp")]
 pub type LlamaCppSession = Session<LlamaCppBackend>;
 
-// llama.cpp-specific constructors. Available only when the
-// `llama-cpp` feature is enabled.
-#[cfg(feature = "llama-cpp")]
+#[cfg(feature = "tokio")]
+#[async_trait::async_trait]
+pub trait FromPath: Sized + Send {
+    /// Load a model from disk and wire up the chat template.
+    ///
+    /// Looks for a sampling sidecar, `sampling.toml` and applies it via
+    /// [`Self::with_sample_options`]. If none exists, writes the default so the
+    /// user has a starting point to edit. Requires the `toml` feature; without
+    /// it, sidecars are ignored.
+    async fn from_path(path: PathBuf) -> Result<Self, SessionError>;
+}
+
+#[async_trait::async_trait]
+#[cfg(all(feature = "llama-cpp", feature = "tokio"))]
+impl FromPath for Session<LlamaCppBackend> {
+    async fn from_path(path: PathBuf) -> Result<Self, SessionError> {
+        tokio::task::spawn_blocking(move || Self::from_path_sync(path)).await?
+    }
+}
+
 impl Session<LlamaCppBackend> {
     /// Load a model from disk and wire up the chat template.
     ///
@@ -486,7 +507,7 @@ impl Session<LlamaCppBackend> {
     /// via [`Self::with_sample_options`]. If none exists, writes the
     /// default so the user has a starting point to edit. Requires the
     /// `toml` feature; without it, sidecars are ignored.
-    pub fn from_path(path: PathBuf) -> Result<Self, SessionError> {
+    pub fn from_path_sync(path: PathBuf) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path(path)?;
         Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
@@ -547,6 +568,14 @@ impl Session<LlamaCppBackend> {
     }
 }
 
+#[async_trait::async_trait]
+#[cfg(all(feature = "tokio", feature = "moeflux"))]
+impl FromPath for Session<MoefluxBackend> {
+    async fn from_path(path: PathBuf) -> Result<Self, SessionError> {
+        tokio::task::spawn_blocking(move || Self::from_path_sync(path)).await?
+    }
+}
+
 // Moeflux-specific constructor. Available only on macOS with the
 // `moeflux` feature enabled.
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
@@ -566,7 +595,7 @@ impl Session<MoefluxBackend> {
     /// If none exists, writes the default so the user has a starting
     /// point to edit. Requires the `toml` feature; without it,
     /// sidecars are ignored.
-    pub fn from_path(parent: PathBuf) -> Result<Self, SessionError> {
+    pub fn from_path_sync(parent: PathBuf) -> Result<Self, SessionError> {
         let sidecar = parent.join("sampling.toml");
         let engine = crate::MoefluxEngine::from_path(&parent)?;
         Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
@@ -2979,10 +3008,11 @@ mod tests {
             .join("models/model.gguf")
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "long running, requires models/model.gguf"]
-    fn test_with_prefix_cache_default_off() {
+    async fn test_with_prefix_cache_default_off() {
         let session = crate::LlamaCppSession::from_path(model_path())
+            .await
             .unwrap()
             .quiet();
         assert!(
@@ -2993,10 +3023,11 @@ mod tests {
         assert!(on.prefix_cache.is_some());
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "long running, requires models/model.gguf"]
-    fn test_last_and_total_usage_zero_initially() {
+    async fn test_last_and_total_usage_zero_initially() {
         let session = crate::LlamaCppSession::from_path(model_path())
+            .await
             .unwrap()
             .quiet();
         assert_eq!(session.last_usage(), &Usage::default());
@@ -3010,10 +3041,11 @@ mod tests {
     /// in `ignored_categories` so the drain inside
     /// `apply_sample_repetition_ngram` materializes the punctuation
     /// tokens into `ignored` on first sample call.
-    #[test]
+    #[tokio::test]
     #[ignore = "long running, requires models/model.gguf"]
-    fn test_default_repetition_ignores_punctuation_category() {
+    async fn test_default_repetition_ignores_punctuation_category() {
         let session = crate::LlamaCppSession::from_path(model_path())
+            .await
             .unwrap()
             .quiet();
         let with_rep = session.with_repetition(RepetitionOptions::default());
@@ -3038,10 +3070,11 @@ mod tests {
     /// repetition, so `add_model_stops`'s ignored-list injection
     /// silently no-op'd (and for the earlier EOS/EOT-only fix that
     /// missed modern chat templates).
-    #[test]
+    #[tokio::test]
     #[ignore = "long running, requires models/model.gguf"]
-    fn test_with_repetition_adds_special_tokens_to_ignored() {
+    async fn test_with_repetition_adds_special_tokens_to_ignored() {
         let session = crate::LlamaCppSession::from_path(model_path())
+            .await
             .unwrap()
             .quiet();
         let eos = session.engine.model.eos();
@@ -3082,10 +3115,11 @@ mod tests {
         println!("special_tokens count = {}", specials.len());
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "long running, requires models/model.gguf"]
-    fn test_clear_prefix_cache_zeroes_state() {
+    async fn test_clear_prefix_cache_zeroes_state() {
         let mut session = crate::LlamaCppSession::from_path(model_path())
+            .await
             .unwrap()
             .quiet()
             .with_prefix_cache(true);
@@ -3134,7 +3168,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_hit_on_identical_prompts() {
-        let mut session = crate::LlamaCppSession::from_path(model_path())
+        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -3162,7 +3196,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_hit_on_shared_system_diverging_last_message() {
-        let mut session = crate::LlamaCppSession::from_path(model_path())
+        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -3186,7 +3220,7 @@ mod tests {
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_miss_no_breakpoints() {
         use misanthropic::prompt::message::Content as MContent;
-        let mut session = crate::LlamaCppSession::from_path(model_path())
+        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -3215,7 +3249,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_clear_invalidates_cache() {
-        let mut session = crate::LlamaCppSession::from_path(model_path())
+        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)

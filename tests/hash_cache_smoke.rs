@@ -120,10 +120,11 @@ fn build_round2(
 #[test]
 #[ignore = "requires model; sets DRAMA_LLAMA_COGITO_MODEL or models/model.gguf"]
 fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
-        .expect("model loads")
-        .quiet()
-        .with_prefix_cache(true);
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("model loads")
+            .quiet()
+            .with_prefix_cache(true);
 
     let (round1_prompt, _tool) = build_round1();
 

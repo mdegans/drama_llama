@@ -9,12 +9,7 @@ repository = "https://github.com/mdegans/drama_llama"
 # detect-infringement corpus out of the published crate. The corpus
 # contains copyrighted text used locally for testing; it must not be
 # redistributed via crates.io. Nothing in src/ references it.
-exclude = [
-    ".claude/",
-    "CLAUDE.md",
-    "tests/data/",
-    "**/.DS_Store",
-]
+exclude = [".claude/", "CLAUDE.md", "tests/data/", "**/.DS_Store"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -26,7 +21,9 @@ llama-cpp-sys-3 = { version = "0.7", optional = true }
 # still work via `--no-default-features`. Pinned to an exact pre-release
 # version since the API is unstable until 0.1.0 final.
 moeflux = { version = "=0.1.0-pre.4", optional = true }
-tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = [
+    "onig",
+] }
 
 derive_more = { version = "1", features = ["from"] }
 num = "0.4"
@@ -49,6 +46,7 @@ misanthropic = { version = "1.0.0-alpha.3", default-features = false, features =
 ] }
 
 axum = { version = "0.8", optional = true }
+async-trait = { version = "0.1", optional = true }
 tokio = { version = "1", optional = true }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 futures-util = { version = "0.3", optional = true }
@@ -106,11 +104,12 @@ egui = [
     "dep:image",
 ]
 repl = ["dep:rustyline", "cli"]
+tokio = ["tokio/full", "dep:async-trait"]
 axum = [
     "dep:axum",
     "dep:tokio-stream",
     "dep:futures-util",
-    "tokio/full",
+    "tokio",
     "tracing/async-await",
     "tracing-subscriber/json",
     "tracing-subscriber/env-filter",

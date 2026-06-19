@@ -25,6 +25,8 @@ pub use model::{MoefluxModel, MoefluxModelError};
 pub struct MoefluxBackend;
 
 impl crate::backend::Backend for MoefluxBackend {
+    const NAME: &'static str = "moeflux";
+
     type Decoder = MoefluxDecoder;
     type Model = MoefluxModel;
 }

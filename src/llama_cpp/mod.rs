@@ -21,6 +21,7 @@ pub use model::{llama_quantize, LlamaCppModel};
 pub struct LlamaCppBackend;
 
 impl crate::backend::Backend for LlamaCppBackend {
+    const NAME: &'static str = "llama-cpp";
     type Decoder = LlamaCppDecoder;
     type Model = LlamaCppModel;
 }

@@ -15,7 +15,7 @@ use clap::{Parser, ValueEnum};
 use drama_llama::{
     backend::{Backend, Model},
     prompt::{AnthropicError, MessageResponse, Usage},
-    ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
+    FromPath, ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
 };
 use tokio::{sync::Mutex, task::spawn_blocking};
 use tracing::{error, info, instrument};
@@ -270,6 +270,29 @@ fn init_logging() {
     Registry::default().with(filter).with(fmt_layer).init();
 }
 
+async fn load_session<B>(
+    root: impl AsRef<Path>,
+    model: String,
+    no_penalty: bool,
+    seed: Option<u128>,
+) -> Result<Session<B>, (StatusCode, Json<AnthropicError>)>
+where
+    B: Backend,
+    Session<B>: FromPath,
+{
+    let path = root.as_ref().join(&model);
+    tracing::info!(
+        event = "load_model",
+        backend = B::NAME,
+        model,
+        path = path.to_string_lossy().as_ref()
+    );
+    Session::<B>::from_path(path)
+        .await
+        .map(|s| configure_session(s, no_penalty, seed))
+        .map_err(map_session_err)
+}
+
 // ---------------------------------------------------------------------------
 // llama.cpp run path
 // ---------------------------------------------------------------------------
@@ -477,28 +500,6 @@ mod llama_cpp_run {
         let response = result.map_err(map_session_err)?;
         log_stats(&response.id, response.usage.clone(), elapsed);
         Ok(Json(response))
-    }
-
-    async fn load_session(
-        root: impl AsRef<Path>,
-        model: String,
-        no_penalty: bool,
-        seed: Option<u128>,
-    ) -> Result<Session<LlamaCppBackend>, (StatusCode, Json<AnthropicError>)>
-    {
-        let path = root.as_ref().join(&model);
-        tracing::info!(
-            event = "load_model",
-            backend = "llama-cpp",
-            model,
-            path = path.to_string_lossy().as_ref()
-        );
-        spawn_blocking_or_bust(|| {
-            Session::<LlamaCppBackend>::from_path_with_n_ctx(path, 65536)
-        })
-        .await
-        .map(|s| configure_session(s, no_penalty, seed))
-        .map_err(map_session_err)
     }
 }
 
@@ -718,26 +719,6 @@ mod moeflux_run {
         log_stats(&response.id, response.usage.clone(), elapsed);
         log_moeflux_prefetch(&response.id, prefetch_stats);
         Ok(Json(response))
-    }
-
-    async fn load_session(
-        root: impl AsRef<Path>,
-        model: String,
-        no_penalty: bool,
-        seed: Option<u128>,
-    ) -> Result<Session<MoefluxBackend>, (StatusCode, Json<AnthropicError>)>
-    {
-        let path = root.as_ref().join(&model);
-        tracing::info!(
-            event = "load_model",
-            backend = "moeflux",
-            model,
-            path = path.to_string_lossy().as_ref()
-        );
-        spawn_blocking_or_bust(|| Session::<MoefluxBackend>::from_path(path))
-            .await
-            .map(|s| configure_session(s, no_penalty, seed))
-            .map_err(map_session_err)
     }
 }
 
@@ -1161,6 +1142,9 @@ fn is_reusable_after(err: &drama_llama::SessionError) -> bool {
         // next call will memory_clear or restore_to a known-good snapshot,
         // recovering before any generation runs. Reusable.
         E::Decode(_) => true,
+        // Tokio task failed to join. As of writing this likely means a panic
+        // in an engine `FromPath` impl.
+        E::JoinError(_) => false,
         // Engine setup errors can't fire post-load (session is already built);
         // if they ever do, drop and reload.
         #[cfg(feature = "llama-cpp")]
