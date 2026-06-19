@@ -574,9 +574,11 @@ where
             lock.replace(session);
         }
         Err(e) if !e.is_fatal() => {
+            error!(error = %e);
             lock.replace(session);
         }
-        Err(_) => {
+        Err(e) => {
+            error!(erorr = %e);
             // Drop session; next request will reload.
         }
     }
