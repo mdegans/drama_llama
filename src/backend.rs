@@ -41,13 +41,12 @@ mod llama_cpp_abi {
 
 /// Decode backend: produces logits and manages the KV cache.
 ///
-/// Implementors own whatever session state is required to advance a
-/// single sequence (e.g. llama.cpp's `llama_context`). The trait is
-/// deliberately narrow — only what the sampling loop and prefix-cache
-/// machinery in `Session` / `Predictor` need. Everything else
-/// (diagnostics, thread knobs, state ser/de, construction) stays as
-/// inherent methods on the concrete implementor.
-pub trait Decoder {
+/// Implementors own whatever session state is required to advance a single
+/// sequence (e.g. llama.cpp's `llama_context`). The trait is deliberately
+/// narrow — only what the sampling loop and prefix-cache machinery in `Session`
+/// / `Predictor` need. Everything else (diagnostics, thread knobs, state
+/// ser/de, construction) stays as inherent methods on the concrete implementor.
+pub trait Decoder: Send {
     /// Backend-specific decode error (KV-full, bad position, etc.).
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -173,17 +172,9 @@ pub enum MemoryRmError {
     BackendUnsupported { pos: i32 },
 }
 
-/// Model backend: tokenization, vocab introspection, chat-template
-/// source, and non-decode-specific metadata.
-///
-/// Implementors are immutable in the happy path — a loaded model's
-/// vocabulary and tokenizer do not change. Methods take `&self`
-/// throughout. An [`Error`] associated type is provided for future
-/// fallible operations (e.g. tokenizer streaming) but every current
-/// method is infallible.
-///
-/// [`Error`]: Model::Error
-pub trait Model {
+/// Model state: tokenization, vocab introspection, chat-template source, and
+/// non-decode-specific metadata. Immutable.
+pub trait Model: Send + Sync {
     /// Backend-specific model error. For infallible backends, use
     /// `std::convert::Infallible`.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -280,10 +271,10 @@ pub trait Backend {
 
     /// Concrete [`Decoder`] type for this [`Backend`]. `Send` so the engine can
     /// move between threads; not `Sync` (decode mutates state).
-    type Decoder: Decoder + Send;
+    type Decoder: Decoder;
     /// Concrete [`Model`] type for this [`Backend`]. `Send + Sync` — vocab and
     /// tokenizer are read concurrently by Iterator impls.
-    type Model: Model + Send + Sync;
+    type Model: Model;
 
     /// Return `true` if a file or directory is supported by the [`Backend`].
     fn is_supported_model(name: &str, meta: &std::fs::Metadata) -> bool;
