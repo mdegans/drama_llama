@@ -270,29 +270,6 @@ fn init_logging() {
     Registry::default().with(filter).with(fmt_layer).init();
 }
 
-async fn load_session<B>(
-    root: impl AsRef<Path>,
-    model: String,
-    no_penalty: bool,
-    seed: Option<u128>,
-) -> Result<Session<B>, (StatusCode, Json<AnthropicError>)>
-where
-    B: Backend,
-    Session<B>: FromPath,
-{
-    let path = root.as_ref().join(&model);
-    tracing::info!(
-        event = "load_model",
-        backend = B::NAME,
-        model,
-        path = path.to_string_lossy().as_ref()
-    );
-    Session::<B>::from_path(path)
-        .await
-        .map(|s| configure_session(s, no_penalty, seed))
-        .map_err(map_session_err)
-}
-
 // ---------------------------------------------------------------------------
 // llama.cpp run path
 // ---------------------------------------------------------------------------
@@ -361,145 +338,6 @@ mod llama_cpp_run {
             })
             .collect();
         Json(serde_json::json!({ "models": models }))
-    }
-
-    async fn route_messages(
-        State(state): State<AppState<LlamaCppBackend>>,
-        Json(mut prompt): Json<Prompt>,
-    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
-        let models = match list_entries(&state.args.model_path, is_gguf).await {
-            Ok(models) => models,
-            Err(e) => {
-                let e = AnthropicError::NotFound {
-                    message: format!("Models could not be loaded: {e}"),
-                };
-                error!(error = %e);
-                return Err((StatusCode::NOT_FOUND, Json(e)));
-            }
-        };
-
-        match resolve_model(
-            &prompt.model.to_string(),
-            &models,
-            state.args.default_model.as_ref(),
-        ) {
-            Ok(None) => {}
-            Ok(Some(default)) => {
-                info!(
-                    requested = %prompt.model,
-                    served = %default,
-                    "substituting --default-model for unknown id",
-                );
-                prompt.model = default.into();
-            }
-            Err(e) => {
-                error!(error = %e);
-                return Err((StatusCode::NOT_FOUND, Json(e)));
-            }
-        }
-
-        complete(state, prompt).await
-    }
-
-    #[instrument(skip(state, prompt), fields(model = %prompt.model))]
-    async fn complete(
-        state: AppState<LlamaCppBackend>,
-        prompt: Prompt,
-    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
-        let mut lock = match state.session.try_lock() {
-            Ok(lock) => lock,
-            Err(_) => {
-                return Err((
-                    StatusCode::from_u16(529).unwrap(),
-                    Json(AnthropicError::Overloaded {
-                        message: "Session is busy.".into(),
-                        retry_after: None,
-                    }),
-                ))
-            }
-        };
-
-        let mut session = match lock.take() {
-            Some(session) => {
-                let display =
-                    session.engine().model.display_name().unwrap_or_default();
-                if display == prompt.model.to_string() {
-                    session
-                } else {
-                    load_session(
-                        &state.args.model_path,
-                        prompt.model.to_string(),
-                        state.args.no_penalty,
-                        state.args.seed,
-                    )
-                    .await?
-                }
-            }
-            None => {
-                load_session(
-                    &state.args.model_path,
-                    prompt.model.to_string(),
-                    state.args.no_penalty,
-                    state.args.seed,
-                )
-                .await?
-            }
-        };
-
-        // Per-request UUID — same id ends up on `Message.id` and on every
-        // `StreamProbeMsg` emitted while this request runs.
-        let id = uuid::Uuid::new_v4();
-        install_per_request_hooks(
-            &mut session,
-            state.record_json_tx.as_ref(),
-            state.probe_bus.as_ref(),
-            id,
-        );
-
-        // Emit SessionStart on the bus before generation. SendError means zero
-        // subscribers; harmless, ignored. The model name here is the request's
-        // `prompt.model` (the user-facing name) rather than the engine's
-        // display_name (the GGUF internal name); both are recoverable from the
-        // JSONL ts_ms ordering if needed.
-        if let Some(bus) = &state.probe_bus {
-            let _ = bus.send(StreamProbeMsg::SessionStart {
-                id,
-                model: prompt.model.to_string(),
-            });
-        }
-
-        // Closure returns the session in *both* arms so it can be restored to
-        // the lock — otherwise a `complete_response` error drops it and the
-        // next request reloads from disk. See `is_reusable_after` for the
-        // reuse-vs-reload classification.
-        let (session, result, elapsed) = spawn_blocking_or_bust(move || {
-            let start = std::time::Instant::now();
-            let result = session.complete_response_id(&prompt, id);
-            (session, result, start.elapsed())
-        })
-        .await;
-
-        // SessionEnd fires regardless of generation success — the probe stream
-        // is a flight recorder, not a control channel.
-        if let Some(bus) = &state.probe_bus {
-            let _ = bus.send(StreamProbeMsg::SessionEnd { id });
-        }
-
-        match &result {
-            Ok(_) => {
-                lock.replace(session);
-            }
-            Err(e) if is_reusable_after(e) => {
-                lock.replace(session);
-            }
-            Err(_) => {
-                // Drop session; next request will reload.
-            }
-        }
-
-        let response = result.map_err(map_session_err)?;
-        log_stats(&response.id, response.usage.clone(), elapsed);
-        Ok(Json(response))
     }
 }
 
@@ -572,82 +410,106 @@ mod moeflux_run {
             .collect();
         Json(serde_json::json!({ "models": models }))
     }
+}
 
-    async fn route_messages(
-        State(state): State<AppState<MoefluxBackend>>,
-        Json(mut prompt): Json<Prompt>,
-    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
-        let models =
-            match list_entries(&state.args.model_path, |_, m| m.is_dir()).await
-            {
-                Ok(models) => models,
-                Err(e) => {
-                    let e = AnthropicError::NotFound {
-                        message: format!("Models could not be loaded: {e}"),
-                    };
-                    error!(error = %e);
-                    return Err((StatusCode::NOT_FOUND, Json(e)));
-                }
+// ---------------------------------------------------------------------------
+// Shared session helpers
+// ---------------------------------------------------------------------------
+
+async fn load_session<B>(
+    root: impl AsRef<Path>,
+    model: String,
+    no_penalty: bool,
+    seed: Option<u128>,
+) -> Result<Session<B>, (StatusCode, Json<AnthropicError>)>
+where
+    B: Backend,
+    Session<B>: FromPath,
+{
+    let path = root.as_ref().join(&model);
+    tracing::info!(
+        event = "load_model",
+        backend = B::NAME,
+        model,
+        path = path.to_string_lossy().as_ref()
+    );
+    Session::<B>::from_path(path)
+        .await
+        .map(|s| configure_session(s, no_penalty, seed))
+        .map_err(map_session_err)
+}
+
+async fn route_messages<B>(
+    State(state): State<AppState<B>>,
+    Json(mut prompt): Json<Prompt>,
+) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
+where
+    B: Backend + 'static,
+    Session<B>: FromPath,
+{
+    let models = match list_entries(&state.args.model_path, is_gguf).await {
+        Ok(models) => models,
+        Err(e) => {
+            let e = AnthropicError::NotFound {
+                message: format!("Models could not be loaded: {e}"),
             };
-
-        match resolve_model(
-            &prompt.model.to_string(),
-            &models,
-            state.args.default_model.as_ref(),
-        ) {
-            Ok(None) => {}
-            Ok(Some(default)) => {
-                info!(
-                    requested = %prompt.model,
-                    served = %default,
-                    "substituting --default-model for unknown id",
-                );
-                prompt.model = default.into();
-            }
-            Err(e) => {
-                error!(error = %e);
-                return Err((StatusCode::NOT_FOUND, Json(e)));
-            }
+            error!(error = %e);
+            return Err((StatusCode::NOT_FOUND, Json(e)));
         }
+    };
 
-        complete(state, prompt).await
+    match resolve_model(
+        &prompt.model.to_string(),
+        &models,
+        state.args.default_model.as_ref(),
+    ) {
+        Ok(None) => {}
+        Ok(Some(default)) => {
+            info!(
+                requested = %prompt.model,
+                served = %default,
+                "substituting --default-model for unknown id",
+            );
+            prompt.model = default.into();
+        }
+        Err(e) => {
+            error!(error = %e);
+            return Err((StatusCode::NOT_FOUND, Json(e)));
+        }
     }
 
-    #[instrument(skip(state, prompt), fields(model = %prompt.model))]
-    async fn complete(
-        state: AppState<MoefluxBackend>,
-        prompt: Prompt,
-    ) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)> {
-        let mut lock = match state.session.try_lock() {
-            Ok(lock) => lock,
-            Err(_) => {
-                return Err((
-                    StatusCode::from_u16(529).unwrap(),
-                    Json(AnthropicError::Overloaded {
-                        message: "Session is busy.".into(),
-                        retry_after: None,
-                    }),
-                ))
-            }
-        };
+    complete(state, prompt).await
+}
 
-        let mut session = match lock.take() {
-            Some(session) => {
-                let display =
-                    session.engine().model.display_name().unwrap_or_default();
-                if display == prompt.model.to_string() {
-                    session
-                } else {
-                    load_session(
-                        &state.args.model_path,
-                        prompt.model.to_string(),
-                        state.args.no_penalty,
-                        state.args.seed,
-                    )
-                    .await?
-                }
-            }
-            None => {
+#[instrument(skip(state, prompt), fields(model = %prompt.model))]
+async fn complete<B>(
+    state: AppState<B>,
+    prompt: Prompt,
+) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
+where
+    B: Backend + 'static,
+    Session<B>: FromPath,
+{
+    let mut lock = match state.session.try_lock() {
+        Ok(lock) => lock,
+        Err(_) => {
+            return Err((
+                StatusCode::from_u16(529).unwrap(),
+                Json(AnthropicError::Overloaded {
+                    message: "Session is busy.".into(),
+                    retry_after: None,
+                }),
+            ))
+        }
+    };
+
+    let mut session = match lock.take() {
+        Some(session) => {
+            let display =
+                session.engine().model.display_name().unwrap_or_default();
+            if display == prompt.model.to_string() {
+                session
+            } else {
                 load_session(
                     &state.args.model_path,
                     prompt.model.to_string(),
@@ -656,75 +518,73 @@ mod moeflux_run {
                 )
                 .await?
             }
-        };
+        }
+        None => {
+            load_session(
+                &state.args.model_path,
+                prompt.model.to_string(),
+                state.args.no_penalty,
+                state.args.seed,
+            )
+            .await?
+        }
+    };
 
-        // Per-request UUID — see llama-cpp variant for full rationale.
-        let id = uuid::Uuid::new_v4();
-        install_per_request_hooks(
-            &mut session,
-            state.record_json_tx.as_ref(),
-            state.probe_bus.as_ref(),
+    // Per-request UUID — same id ends up on `Message.id` and on every
+    // `StreamProbeMsg` emitted while this request runs.
+    let id = uuid::Uuid::new_v4();
+    install_per_request_hooks(
+        &mut session,
+        state.record_json_tx.as_ref(),
+        state.probe_bus.as_ref(),
+        id,
+    );
+
+    // Emit SessionStart on the bus before generation. SendError means zero
+    // subscribers; harmless, ignored. The model name here is the request's
+    // `prompt.model` (the user-facing name) rather than the engine's
+    // display_name (the GGUF internal name); both are recoverable from the
+    // JSONL ts_ms ordering if needed.
+    if let Some(bus) = &state.probe_bus {
+        let _ = bus.send(StreamProbeMsg::SessionStart {
             id,
-        );
-
-        if let Some(bus) = &state.probe_bus {
-            let _ = bus.send(StreamProbeMsg::SessionStart {
-                id,
-                model: prompt.model.to_string(),
-            });
-        }
-
-        // Scope prefetch counters to this request — moeflux's PrefetchState
-        // accumulates over the lifetime of RsCtx, so a fresh request needs a
-        // reset to read out a per-request rate.
-        session.reset_prefetch_stats();
-
-        // Per-Op cmdbuf timing breakdown, gated on the same env that makes
-        // moeflux commit each Op as its own labeled cmdbuf.
-        let profile_per_op =
-            std::env::var_os("MOEFLUX_PROFILE_PER_OP").is_some();
-        if profile_per_op {
-            session.reset_cmdbuf_stats();
-        }
-
-        // See llama-cpp variant + `is_reusable_after` doc-comment for the
-        // reuse-vs-reload rationale.
-        let (session, result, elapsed) = spawn_blocking_or_bust(move || {
-            let start = std::time::Instant::now();
-            let result = session.complete_response_id(&prompt, id);
-            (session, result, start.elapsed())
-        })
-        .await;
-        let prefetch_stats = session.prefetch_stats();
-        if profile_per_op {
-            session.log_cmdbuf_stats();
-        }
-
-        if let Some(bus) = &state.probe_bus {
-            let _ = bus.send(StreamProbeMsg::SessionEnd { id });
-        }
-        match &result {
-            Ok(_) => {
-                lock.replace(session);
-            }
-            Err(e) if is_reusable_after(e) => {
-                lock.replace(session);
-            }
-            Err(_) => {
-                // Drop session; next request will reload.
-            }
-        }
-
-        let response = result.map_err(map_session_err)?;
-        log_stats(&response.id, response.usage.clone(), elapsed);
-        log_moeflux_prefetch(&response.id, prefetch_stats);
-        Ok(Json(response))
+            model: prompt.model.to_string(),
+        });
     }
-}
 
-// ---------------------------------------------------------------------------
-// Shared session post-load configuration
-// ---------------------------------------------------------------------------
+    // Closure returns the session in *both* arms so it can be restored to
+    // the lock — otherwise a `complete_response` error drops it and the
+    // next request reloads from disk. See `is_reusable_after` for the
+    // reuse-vs-reload classification.
+    let (session, result, elapsed) = spawn_blocking_or_bust(move || {
+        let start = std::time::Instant::now();
+        let result = session.complete_response_id(&prompt, id);
+        (session, result, start.elapsed())
+    })
+    .await;
+
+    // SessionEnd fires regardless of generation success — the probe stream
+    // is a flight recorder, not a control channel.
+    if let Some(bus) = &state.probe_bus {
+        let _ = bus.send(StreamProbeMsg::SessionEnd { id });
+    }
+
+    match &result {
+        Ok(_) => {
+            lock.replace(session);
+        }
+        Err(e) if is_reusable_after(e) => {
+            lock.replace(session);
+        }
+        Err(_) => {
+            // Drop session; next request will reload.
+        }
+    }
+
+    let response = result.map_err(map_session_err)?;
+    log_stats(&response.id, response.usage.clone(), elapsed);
+    Ok(Json(response))
+}
 
 fn configure_session<B: Backend>(
     s: Session<B>,
