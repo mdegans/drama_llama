@@ -4,7 +4,18 @@ description: Overlap Metal decode with CPU grammar filter by speculatively decod
 type: project
 ---
 
-Status: unscheduled, captured for long-term. Deferred past v0.7 tag.
+Status: **superseded** (2026-07-03) by
+[`plan_lazy_grammar_check.md`](plan_lazy_grammar_check.md) /
+[issue #28](https://github.com/mdegans/drama_llama/issues/28).
+The KV-rollback premise below no longer holds: llama.cpp rejects
+partial `seq_rm` for recurrent/hybrid models and moeflux C loses
+linear-attention state on partial truncation (see
+`qwen3_a3b_llama_cpp_rewind_diagnosis.md`). Replaced by an O(1)
+sample-then-check via the existing `accepts_bytes` API — no rewind,
+no threads. Kept for the motivating observation and cost model.
+
+Original status: unscheduled, captured for long-term. Deferred past
+v0.7 tag.
 
 ## Motivating observation
 
