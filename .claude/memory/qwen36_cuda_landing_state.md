@@ -63,3 +63,21 @@ misanthropic's real client (`tests/blallama.rs`).
   `general.sampling.*` GGUF keys.
 - Disk-backed snapshot persistence for the 1h TTL
   (`llama_state_seq_save_file` already bound).
+
+## Next session (agreed with Mike at close, 2026-07-10)
+
+1. **CUDA defaults** (brief) — the visibility gap: `cargo test` on this
+   box silently ran CPU; device-identity log line surviving `quiet()`,
+   maybe box-local cargo aliases. Don't make `cuda` a default feature.
+2. **Model support** (main) — issue #29 (Qwen XML-ish tool calls)
+   and template-family breadth.
+
+Why the pivot from Cogito: v0.8.0's tests were green historically
+because the arc focused on Cogito for downstream use, and Cogito's
+tool calls are natively JSON — Qwen3.6 is the first template family
+that broke the JSON assumptions. There's been no new smaller Cogito,
+Mike's unsure its startup (Deep Cogito, SF) survives, and Qwen3.6 is
+a big performance jump. On alignment: Qwen's probe results are close
+to Haiku's except on some China-sensitive topics (and the model is
+presumably a different personality in Chinese) — suitable for the
+main downstream purpose, Agora agents.
