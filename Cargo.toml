@@ -145,6 +145,14 @@ jsonschema = { version = "0.30", default-features = false }
 # Minimal executor for examples that drive misanthropic's async `Tool`
 # trait (`#[tool]` macro dispatch) against the synchronous Session.
 tokio = { version = "1", features = ["rt", "macros"] }
+# `tests/blallama.rs` drives the blallama binary over HTTP with the
+# real API client. The library dependency above disables default
+# features (no HTTP); tests re-enable the client half.
+misanthropic = { version = "1.0.0-alpha.7", default-features = false, features = [
+    "partial-eq",
+    "client",
+    "rustls-tls",
+] }
 
 # `doc-scrape-examples = true` opts each example into rustdoc's
 # example-scraping pass (see `cargo-args` under
@@ -178,6 +186,13 @@ doc-scrape-examples = true
 [[example]]
 name = "inspect_prompt"
 doc-scrape-examples = true
+
+# Spawns the blallama binary via `env!("CARGO_BIN_EXE_blallama")`, so
+# it needs the bin's exact feature set; cargo builds the bin for the
+# test only when these are active.
+[[test]]
+name = "blallama"
+required-features = ["axum", "cli", "toml"]
 
 [[bin]]
 name = "regurgitater"
