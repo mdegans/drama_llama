@@ -58,17 +58,44 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
   `ToolChoiceOptions`/`with_tool_choice_opts` deprecated (shim maps
   to CallSyntax). `SessionError::Dialect` added. All non-ignored
   tests green (294 lib + integration), fmt clean.
-- **Phase E remaining (Mike, GPU)**: run the new `#[ignore]` e2e in
-  `tests/session.rs` on Qwen3.6 —
-  `auto_tool_choice_parses_native_dialect_call`,
-  `thinking_works_under_forced_tool_grammar`,
-  `prefix_cache_survives_tool_turn`,
-  `complete_text_round_trips_through_parse_and_render` (now asserts
-  byte-prefix reconstruction; the old `<function=` skip is gone).
-  `cargo test --test session --features serde,toml -- --ignored`.
-  Close #27 + #29 after they pass. Note behavior change: streaming
-  yields reasoning as one `Thought` on close (pre-#27 it streamed
-  mislabeled as `Text`); thought-delta streaming is #26 territory.
+- **Phase E e2e GREEN — 9/9 on Qwen3.6-35B-A3B, RTX 3090**
+  (2026-07-10, session 2 cont.; Mike okayed GPU runs on this box —
+  the GPU-runs-are-Mike's rule was about macOS/Metal instability,
+  Nvidia is fine). First runs failed 5/9 with one shared signature:
+  sampled generation died at the second parameter. Greedy top-k
+  tracing (`Session::top_k_trace` + a manual predictor-loop example)
+  isolated THREE stacked causes, all fixed in `821639e`:
+  1. empty-piece reserved tokens legal mid-parse → livelock fuel
+     (extends d7a8cd6 to active constraints);
+  2. EOG passed byte-acceptance inside until() regions (`<|im_end|>`
+     literal bytes are legal raw-value content!) → predictor stop
+     mid-call. Fix: reject EOG **by id** while constraint incomplete
+     (llama.cpp grammar-sampler rule; `<|return|>` stays viable for
+     Phase G because Harmony's grammar completes first);
+  3. **repetition penalty vs delimiter exit**: the until() exit needs
+     exact bytes `\n</parameter>\n` built from tokens the call
+     already used 5-10× ("\n", "</", "parameter", ">") — penalty
+     crushed exactly those, sampling thrashing 1024 tokens of
+     near-misses. Fix: penalty suspended while any byte-constraint in
+     the chain is incomplete (constrained spans also no longer seed
+     penalty stats). Greedy was immune to all three — which is why
+     Phase A–D testing (greedy + FFI-free) never saw them.
+  Also relaxed the lazy-vs-masked RNG-stream-equality test (kept-set
+  can now be a singleton → no draw; token equality + fallback
+  bit-exactness are the real contracts). Test-side fixes: round-trip
+  must mirror session render opts (no stray `enable_thinking`);
+  thinking e2e must set `prompt.thinking` to get a pre-opened tag.
+  #27 + #29 closed. Behavior change: streaming yields reasoning as
+  one `Thought` on close (pre-#27 it streamed mislabeled as `Text`);
+  thought-delta streaming is #26 territory — and per Mike, #26
+  should yield `misanthropic::stream::Event` + reuse its `StreamExt`
+  machinery rather than a bespoke enum.
+- **Follow-up (not blocking)**: argument *fidelity* under sampling —
+  with the penalty suspended the structure completes, but
+  locally-typical can still pick a low-quality value (observed: empty
+  `string` param mid-debug; final green runs filled "strawberry"
+  correctly). If tool-arg quality regresses in blallama, consider
+  greedy-inside-constraint or a constrained-span sampler profile.
 - Gemma 4 + gpt-oss GGUFs downloaded to `models/`. NOTE: it's Gemma
   **4** (not 3) — llama.cpp gives it a hand-built handler, so Phase F
   may become "native weird template" rather than (or in addition to)
