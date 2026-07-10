@@ -305,18 +305,22 @@ mod tests {
     use super::*;
     use crate::{Grammar, GrammarState};
     use serde_json::json;
-    use std::{borrow::Cow, sync::Arc};
+    use std::sync::Arc;
 
     fn tool(name: &'static str) -> Tool {
-        Tool {
-            name: Cow::Borrowed(name),
-            description: Cow::Borrowed(""),
-            schema: json!({"type": "object"}),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        }
+        tool_with_schema(name, json!({"type": "object"}))
+    }
+
+    /// Build a test [`Tool`] through the upstream builder — the struct
+    /// is `#[non_exhaustive]`, so this is also the only way to
+    /// construct one. The description is irrelevant here: grammar
+    /// generation consumes only the name and schema.
+    fn tool_with_schema(name: &'static str, schema: serde_json::Value) -> Tool {
+        Tool::builder(name)
+            .description("Test tool.")
+            .schema(schema)
+            .build()
+            .expect("valid test tool")
     }
 
     /// Legacy Llama-3.1 tool-call shape (`parameters`, no envelope, no
@@ -441,10 +445,9 @@ mod tests {
 
     #[test]
     fn strict_schema_pins_field_names_and_types() {
-        let schema_tool = Tool {
-            name: Cow::Borrowed("count_letters"),
-            description: Cow::Borrowed(""),
-            schema: json!({
+        let schema_tool = tool_with_schema(
+            "count_letters",
+            json!({
                 "type": "object",
                 "properties": {
                     "letter": {"type": "string"},
@@ -452,11 +455,7 @@ mod tests {
                 },
                 "required": ["letter", "string"]
             }),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
+        );
         let opts = ToolChoiceOptions {
             strict_schema: true,
             ..bare_opts()
@@ -490,32 +489,22 @@ mod tests {
     /// with tool B's args shape (or vice versa).
     #[test]
     fn any_plus_strict_schema_couples_name_to_args() {
-        let tool_a = Tool {
-            name: Cow::Borrowed("a"),
-            description: Cow::Borrowed(""),
-            schema: json!({
+        let tool_a = tool_with_schema(
+            "a",
+            json!({
                 "type": "object",
                 "properties": {"x": {"type": "integer"}},
                 "required": ["x"]
             }),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
-        let tool_b = Tool {
-            name: Cow::Borrowed("b"),
-            description: Cow::Borrowed(""),
-            schema: json!({
+        );
+        let tool_b = tool_with_schema(
+            "b",
+            json!({
                 "type": "object",
                 "properties": {"y": {"type": "string"}},
                 "required": ["y"]
             }),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
+        );
         let opts = ToolChoiceOptions {
             strict_schema: true,
             ..bare_opts()
@@ -564,10 +553,9 @@ mod tests {
     /// compile at `Grammar::parse` as a duplicate-rule syntax error.
     #[test]
     fn strict_schema_two_integer_fields_compiles() {
-        let schema_tool = Tool {
-            name: Cow::Borrowed("two_ints"),
-            description: Cow::Borrowed(""),
-            schema: json!({
+        let schema_tool = tool_with_schema(
+            "two_ints",
+            json!({
                 "type": "object",
                 "properties": {
                     "x": {"type": "integer"},
@@ -575,11 +563,7 @@ mod tests {
                 },
                 "required": ["x", "y"]
             }),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
+        );
         let opts = ToolChoiceOptions {
             strict_schema: true,
             ..bare_opts()
@@ -630,15 +614,7 @@ mod tests {
     #[test]
     fn tool_name_with_special_chars_embeds_safely() {
         // A tool name with a backslash and a quote.
-        let weird_tool = Tool {
-            name: Cow::Borrowed("evil\\\"name"),
-            description: Cow::Borrowed(""),
-            schema: json!({"type": "object"}),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
+        let weird_tool = tool("evil\\\"name");
         let src = build_grammar_source(&[&weird_tool], &bare_opts());
         // Grammar compiles.
         assert!(
@@ -775,19 +751,14 @@ mod tests {
     // ======================================================================
 
     fn single_required_schema(field: &str, prop: serde_json::Value) -> Tool {
-        Tool {
-            name: Cow::Borrowed("fn"),
-            description: Cow::Borrowed(""),
-            schema: json!({
+        tool_with_schema(
+            "fn",
+            json!({
                 "type": "object",
                 "properties": { field: prop },
                 "required": [field]
             }),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        }
+        )
     }
 
     #[test]
@@ -949,10 +920,9 @@ mod tests {
 
     #[test]
     fn strict_schema_nested_object() {
-        let t = Tool {
-            name: Cow::Borrowed("fn"),
-            description: Cow::Borrowed(""),
-            schema: json!({
+        let t = tool_with_schema(
+            "fn",
+            json!({
                 "type": "object",
                 "properties": {
                     "loc": {
@@ -966,11 +936,7 @@ mod tests {
                 },
                 "required": ["loc"]
             }),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
+        );
         let opts = ToolChoiceOptions {
             strict_schema: true,
             ..bare_opts()

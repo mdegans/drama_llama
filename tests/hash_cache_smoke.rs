@@ -44,24 +44,18 @@ fn model_path() -> PathBuf {
 /// user message gives drama_llama a breakpoint to anchor the prefix
 /// (system+tools+first_user_msg) — the same shape agora seeds.
 fn build_round1() -> (Prompt, Tool) {
-    let tool = Tool {
-        name: Cow::Borrowed("count_letters"),
-        description: Cow::Borrowed(
-            "Count the number of times a letter appears in a string.",
-        ),
-        schema: json!({
+    let tool = Tool::builder("count_letters")
+        .description("Count the number of times a letter appears in a string.")
+        .schema(json!({
             "type": "object",
             "properties": {
                 "letter": {"type": "string"},
                 "string": {"type": "string"}
             },
             "required": ["letter", "string"]
-        }),
-        cache_control: None,
-        strict: None,
-        defer_loading: None,
-        allowed_callers: None,
-    };
+        }))
+        .build()
+        .expect("valid test tool");
 
     let prompt = Prompt {
         system: Some(Content::text("You are a helpful assistant. Use the provided tool when answering.")),

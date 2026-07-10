@@ -62,7 +62,7 @@ use crate::{
 /// JSON straight to the model. The training data — produced by
 /// ollama's Go runtime — always takes the shape
 /// `{"type": "function", "function": {"name": ..., "description":
-/// ..., "parameters": ...}}`. misanthropic's [`tool::Method`]
+/// ..., "parameters": ...}}`. misanthropic's [`tool::CustomMethodDef`]
 /// serializes in Anthropic shape (`input_schema` rather than
 /// `parameters`, no wire envelope), so we adapt through this
 /// function before handing off to minijinja.
@@ -71,7 +71,7 @@ use crate::{
 /// (minijinja alphabetizes on output anyway); the structural shape
 /// and field names are what matter.
 ///
-/// [`tool::Method`]: misanthropic::tool::Method
+/// [`tool::CustomMethodDef`]: misanthropic::tool::CustomMethodDef
 fn tool_wire_value(tool: &Tool) -> serde_json::Value {
     serde_json::json!({
         "type": "function",
@@ -486,7 +486,7 @@ impl RenderOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Breakpoint {
     /// After the tools section — any cache marker on any
-    /// [`tool::Method`](misanthropic::tool::Method) in
+    /// [`tool::CustomMethodDef`](misanthropic::tool::CustomMethodDef) in
     /// [`Prompt::functions`] produces this, regardless of which
     /// specific method was marked. Coarse by design: per-tool
     /// partial rendering would not produce a byte-prefix of the full
@@ -1192,30 +1192,24 @@ mod tests {
     fn chat_template_renders_tools_against_real_model() {
         use crate::Tool;
         use serde_json::json;
-        use std::{borrow::Cow, path::PathBuf};
+        use std::path::PathBuf;
 
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
         let engine = crate::LlamaCppEngine::from_path(path).unwrap();
         let tmpl = ChatTemplate::from_model(&engine.model).unwrap();
 
-        let tool = Tool {
-            name: Cow::Borrowed("get_weather"),
-            description: Cow::Borrowed(
-                "Look up the current weather in a city.",
-            ),
-            schema: json!({
+        let tool = Tool::builder("get_weather")
+            .description("Look up the current weather in a city.")
+            .schema(json!({
                 "type": "object",
                 "properties": {
                     "city": {"type": "string"}
                 },
                 "required": ["city"]
-            }),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
+            }))
+            .build()
+            .expect("valid test tool");
 
         let prompt = Prompt {
             system: Some(Content::text("You are helpful.")),
@@ -1354,7 +1348,7 @@ mod tests {
     fn dump_strawberry_turn_1_output() {
         use crate::Tool;
         use serde_json::json;
-        use std::{borrow::Cow, path::PathBuf};
+        use std::path::PathBuf;
         let Some(dest) = std::env::var_os("DRAMA_LLAMA_DUMP_OUTPUT") else {
             // Helper, not a test: skip cleanly in `--include-ignored`
             // sweeps instead of polluting them with a failure.
@@ -1366,24 +1360,20 @@ mod tests {
         let engine = crate::LlamaCppEngine::from_path(path).unwrap();
         let tmpl = ChatTemplate::from_model(&engine.model).unwrap();
 
-        let tool = Tool {
-            name: Cow::Borrowed("count_letters"),
-            description: Cow::Borrowed(
+        let tool = Tool::builder("count_letters")
+            .description(
                 "Count the number of times a letter appears in a string.",
-            ),
-            schema: json!({
+            )
+            .schema(json!({
                 "type": "object",
                 "properties": {
                     "letter": {"type": "string", "description": "the letter to count"},
                     "string": {"type": "string", "description": "the string to search"}
                 },
                 "required": ["letter", "string"]
-            }),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
+            }))
+            .build()
+            .expect("valid test tool");
         let prompt = Prompt {
             system: Some(Content::text(
                 "You are a helpful assistant. You cannot count letters in a \
@@ -1450,23 +1440,18 @@ mod tests {
     #[test]
     fn tools_rendered_as_openai_wire_envelope() {
         use serde_json::json;
-        use std::borrow::Cow;
-        let tool = crate::Tool {
-            name: Cow::Borrowed("count_letters"),
-            description: Cow::Borrowed("Count letters in a string."),
-            schema: json!({
+        let tool = crate::Tool::builder("count_letters")
+            .description("Count letters in a string.")
+            .schema(json!({
                 "type": "object",
                 "properties": {
                     "letter": {"type": "string"},
                     "string": {"type": "string"}
                 },
                 "required": ["letter", "string"]
-            }),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
+            }))
+            .build()
+            .expect("valid test tool");
         let src =
             r#"{%- for t in tools %}{{ t | tojson }}{% endfor %}"#.to_owned();
         let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
@@ -1510,28 +1495,21 @@ mod tests {
 
     /// A tool with no cache marker.
     fn tool_plain(name: &'static str) -> Tool {
-        Tool {
-            name: Cow::Borrowed(name),
-            description: Cow::Borrowed("tool"),
-            schema: json!({"type": "object", "properties": {}}),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        }
+        Tool::builder(name)
+            .description("tool")
+            .schema(json!({"type": "object", "properties": {}}))
+            .build()
+            .expect("valid test tool")
     }
 
     /// A tool marked with an ephemeral cache breakpoint.
     fn tool_cached(name: &'static str) -> Tool {
-        Tool {
-            name: Cow::Borrowed(name),
-            description: Cow::Borrowed("tool"),
-            schema: json!({"type": "object", "properties": {}}),
-            cache_control: Some(CacheControl::ephemeral()),
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        }
+        Tool::builder(name)
+            .description("tool")
+            .schema(json!({"type": "object", "properties": {}}))
+            .cache()
+            .build()
+            .expect("valid test tool")
     }
 
     /// Make a `Role::User` message whose content is a single Text

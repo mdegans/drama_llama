@@ -26,24 +26,18 @@ fn model_path() -> PathBuf {
 #[test]
 #[ignore = "requires model"]
 fn complete_text_strawberry_turn_2() {
-    let tool = Tool {
-        name: Cow::Borrowed("count_letters"),
-        description: Cow::Borrowed(
-            "Count the number of times a letter appears in a string.",
-        ),
-        schema: json!({
+    let tool = Tool::builder("count_letters")
+        .description("Count the number of times a letter appears in a string.")
+        .schema(json!({
             "type": "object",
             "properties": {
                 "letter": {"type": "string"},
                 "string": {"type": "string"}
             },
             "required": ["letter", "string"]
-        }),
-        cache_control: None,
-        strict: None,
-        defer_loading: None,
-        allowed_callers: None,
-    };
+        }))
+        .build()
+        .expect("valid test tool");
     let call_id = "call_3_r";
     let prompt = Prompt {
         system: Some(Content::text("You are a helpful assistant.")),
@@ -124,22 +118,18 @@ fn complete_text_strawberry_turn_2() {
 #[test]
 #[ignore = "requires model"]
 fn complete_text_grammar_prepended_even_with_empty_sampling() {
-    let tool = Tool {
-        name: Cow::Borrowed("count_letters"),
-        description: Cow::Borrowed("Count letters."),
-        schema: json!({
+    let tool = Tool::builder("count_letters")
+        .description("Count letters.")
+        .schema(json!({
             "type": "object",
             "properties": {
                 "letter": {"type": "string"},
                 "string": {"type": "string"}
             },
             "required": ["letter", "string"]
-        }),
-        cache_control: None,
-        strict: None,
-        defer_loading: None,
-        allowed_callers: None,
-    };
+        }))
+        .build()
+        .expect("valid test tool");
     let prompt = Prompt {
         system: Some(Content::text("You are a helpful assistant.")),
         messages: vec![Message {
@@ -181,24 +171,20 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
 }
 
 fn strawberry_turn_1_prompt() -> Prompt {
-    let tool = Tool {
-        name: Cow::Borrowed("count_letters"),
-        description: Cow::Borrowed(
+    let tool = Tool::builder("count_letters")
+        .description(
             "Count the number of times a letter appears in a string.",
-        ),
-        schema: json!({
+        )
+        .schema(json!({
             "type": "object",
             "properties": {
                 "letter": {"type": "string", "description": "the letter to count"},
                 "string": {"type": "string", "description": "the string to search"}
             },
             "required": ["letter", "string"]
-        }),
-        cache_control: None,
-        strict: None,
-        defer_loading: None,
-        allowed_callers: None,
-    };
+        }))
+        .build()
+        .expect("valid test tool");
     Prompt {
         // Match the strawberry example's system prompt — short ones
         // give the model too much latitude to hallucinate args.

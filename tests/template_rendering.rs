@@ -60,24 +60,20 @@ fn load_expected(name: &str) -> String {
 /// production path for tool use.
 #[test]
 fn shape_03_strawberry_turn_1_matches_fixture() {
-    let tool = Tool {
-        name: Cow::Borrowed("count_letters"),
-        description: Cow::Borrowed(
+    let tool = Tool::builder("count_letters")
+        .description(
             "Count the number of times a letter appears in a string.",
-        ),
-        schema: json!({
+        )
+        .schema(json!({
             "type": "object",
             "properties": {
                 "letter": {"type": "string", "description": "the letter to count"},
                 "string": {"type": "string", "description": "the string to search"}
             },
             "required": ["letter", "string"]
-        }),
-        cache_control: None,
-        strict: None,
-        defer_loading: None,
-        allowed_callers: None,
-    };
+        }))
+        .build()
+        .expect("valid test tool");
     let prompt = Prompt {
         system: Some(Content::text(
             "You are a helpful assistant. You cannot count letters in a \
@@ -115,24 +111,20 @@ fn shape_04_strawberry_turn_2_matches_fixture() {
     use drama_llama::prompt::{ToolResult, ToolUse};
     use drama_llama::Block;
 
-    let tool = Tool {
-        name: Cow::Borrowed("count_letters"),
-        description: Cow::Borrowed(
+    let tool = Tool::builder("count_letters")
+        .description(
             "Count the number of times a letter appears in a string.",
-        ),
-        schema: json!({
+        )
+        .schema(json!({
             "type": "object",
             "properties": {
                 "letter": {"type": "string", "description": "the letter to count"},
                 "string": {"type": "string", "description": "the string to search"}
             },
             "required": ["letter", "string"]
-        }),
-        cache_control: None,
-        strict: None,
-        defer_loading: None,
-        allowed_callers: None,
-    };
+        }))
+        .build()
+        .expect("valid test tool");
     let call_id = "call_3_r";
     let prompt = Prompt {
         system: Some(Content::text("You are a helpful assistant.")),
