@@ -1585,6 +1585,22 @@ pub struct GrammarStats {
     pub dfa_bitmap_hits: u64,
     /// Cumulative cache misses on per-state first-byte bitmap.
     pub dfa_bitmap_misses: u64,
+    /// Number of lazy sample-then-check verifications performed
+    /// (`SampleOptions::lazy_grammar`). In lazy mode this counts emitted
+    /// constrained tokens; `lazy_hits / lazy_checks` is the fast-path
+    /// acceptance rate.
+    pub lazy_checks: u64,
+    /// Lazy checks where the unconstrained pick was grammar-legal (no
+    /// fallback filter needed).
+    pub lazy_hits: u64,
+    /// Lazy checks that rejected the pick and re-ran the full masked
+    /// path. In lazy mode the filter counters above measure these
+    /// fallback invocations only.
+    pub lazy_fallbacks: u64,
+    /// Sum over lazy checks of wall-clock verification time, µs.
+    pub check_us_sum: u64,
+    /// Maximum across lazy checks of wall-clock verification time, µs.
+    pub check_us_max: u64,
 }
 
 struct StatsInner {
@@ -1603,6 +1619,11 @@ struct StatsInner {
     dfa_transition_misses: AtomicU64,
     dfa_bitmap_hits: AtomicU64,
     dfa_bitmap_misses: AtomicU64,
+    lazy_checks: AtomicU64,
+    lazy_hits: AtomicU64,
+    lazy_fallbacks: AtomicU64,
+    check_us_sum: AtomicU64,
+    check_us_max: AtomicU64,
 }
 
 static STATS: StatsInner = StatsInner {
@@ -1621,6 +1642,11 @@ static STATS: StatsInner = StatsInner {
     dfa_transition_misses: AtomicU64::new(0),
     dfa_bitmap_hits: AtomicU64::new(0),
     dfa_bitmap_misses: AtomicU64::new(0),
+    lazy_checks: AtomicU64::new(0),
+    lazy_hits: AtomicU64::new(0),
+    lazy_fallbacks: AtomicU64::new(0),
+    check_us_sum: AtomicU64::new(0),
+    check_us_max: AtomicU64::new(0),
 };
 
 static STATS_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1675,6 +1701,11 @@ pub fn grammar_stats_snapshot() -> GrammarStats {
             .load(Ordering::Relaxed),
         dfa_bitmap_hits: STATS.dfa_bitmap_hits.load(Ordering::Relaxed),
         dfa_bitmap_misses: STATS.dfa_bitmap_misses.load(Ordering::Relaxed),
+        lazy_checks: STATS.lazy_checks.load(Ordering::Relaxed),
+        lazy_hits: STATS.lazy_hits.load(Ordering::Relaxed),
+        lazy_fallbacks: STATS.lazy_fallbacks.load(Ordering::Relaxed),
+        check_us_sum: STATS.check_us_sum.load(Ordering::Relaxed),
+        check_us_max: STATS.check_us_max.load(Ordering::Relaxed),
     }
 }
 
@@ -1696,6 +1727,26 @@ pub fn grammar_stats_reset() {
     STATS.dfa_transition_misses.store(0, Ordering::Relaxed);
     STATS.dfa_bitmap_hits.store(0, Ordering::Relaxed);
     STATS.dfa_bitmap_misses.store(0, Ordering::Relaxed);
+    STATS.lazy_checks.store(0, Ordering::Relaxed);
+    STATS.lazy_hits.store(0, Ordering::Relaxed);
+    STATS.lazy_fallbacks.store(0, Ordering::Relaxed);
+    STATS.check_us_sum.store(0, Ordering::Relaxed);
+    STATS.check_us_max.store(0, Ordering::Relaxed);
+}
+
+/// Record one lazy sample-then-check verification
+/// (`SampleOptions::lazy_grammar`). No-op unless
+/// [`grammar_stats_enabled`]; callers pass the elapsed time only when
+/// they measured it (i.e. stats were enabled at check time).
+pub(crate) fn record_lazy(hit: bool, elapsed_us: u64) {
+    STATS.lazy_checks.fetch_add(1, Ordering::Relaxed);
+    if hit {
+        STATS.lazy_hits.fetch_add(1, Ordering::Relaxed);
+    } else {
+        STATS.lazy_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+    STATS.check_us_sum.fetch_add(elapsed_us, Ordering::Relaxed);
+    atomic_fetch_max(&STATS.check_us_max, elapsed_us);
 }
 
 fn record_stats(
