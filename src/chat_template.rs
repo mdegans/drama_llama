@@ -739,27 +739,46 @@ fn append_message(
             _ => None,
         })
         .collect();
+    // Text splits by block order around the first ToolUse: prose the
+    // model emitted BEFORE calling (announce-then-call) vs after.
+    // Reordering them would invert causality in the transcript, so
+    // causality-aware templates get both halves; stock templates read
+    // the merged `content` and keep their own layout.
     let mut reasoning = String::new();
-    let mut residual = String::new();
+    let mut content_pre = String::new();
+    let mut content_post = String::new();
+    let mut seen_call = false;
     for b in &blocks {
         match b {
-            Block::ToolUse { .. } => {}
+            Block::ToolUse { .. } => seen_call = true,
             Block::Thought { thought, .. }
                 if reingest == ReasoningReingest::Field =>
             {
                 reasoning.push_str(thought);
             }
-            other => append_block_text(&mut residual, other),
+            other => append_block_text(
+                if seen_call {
+                    &mut content_post
+                } else {
+                    &mut content_pre
+                },
+                other,
+            ),
         }
     }
 
     // One message carrying every call: the shape template
     // `tool_calls` loops iterate, so parallel calls re-render intact.
     if !calls.is_empty() {
-        out.push(tool_call_message(role, &residual, &calls, &reasoning));
+        out.push(tool_call_message(
+            role,
+            (&content_pre, &content_post),
+            &calls,
+            &reasoning,
+        ));
         return;
     }
-    out.push(assistant_text_message(role, residual, &reasoning));
+    out.push(assistant_text_message(role, content_pre, &reasoning));
 }
 
 fn text_message(role: &str, content: String) -> JinjaValue {
@@ -770,8 +789,8 @@ fn text_message(role: &str, content: String) -> JinjaValue {
 }
 
 /// Assistant message with one `tool_calls` entry per call. Shape:
-/// `{role, content, tool_calls: [{id, function: {name, arguments}},
-/// …]}`.
+/// `{role, content, content_pre, content_post,
+/// tool_calls: [{id, function: {name, arguments}}, …]}`.
 ///
 /// Llama 3.1's template reads `.function.name` and `.function.arguments`
 /// off each entry. OpenAI-style templates also look at `.id`, so we
@@ -779,9 +798,15 @@ fn text_message(role: &str, content: String) -> JinjaValue {
 /// need it default to `"function"`. A non-empty `reasoning` renders as
 /// both `reasoning` and `reasoning_content` (templates read one or the
 /// other).
+///
+/// `content` is the merged text (pre ++ post) — what stock templates
+/// read, laid out however they lay it out. `content_pre` /
+/// `content_post` carry the block-order split around the first call
+/// so causality-aware templates (our Gemma 4 cache-stable patch) can
+/// render announce-then-call in emission order.
 fn tool_call_message(
     role: &str,
-    content: &str,
+    (content_pre, content_post): (&str, &str),
     calls: &[&crate::prompt::ToolUse],
     reasoning: &str,
 ) -> JinjaValue {
@@ -797,16 +822,21 @@ fn tool_call_message(
             }
         })
         .collect();
+    let content = format!("{content_pre}{content_post}");
     if reasoning.is_empty() {
         minijinja::context! {
             role => role,
             content => content,
+            content_pre => content_pre,
+            content_post => content_post,
             tool_calls => tool_calls,
         }
     } else {
         minijinja::context! {
             role => role,
             content => content,
+            content_pre => content_pre,
+            content_post => content_post,
             tool_calls => tool_calls,
             reasoning => reasoning,
             reasoning_content => reasoning,
