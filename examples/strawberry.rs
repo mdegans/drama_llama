@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut strawberry = Strawberry;
 
-    let mut session = Session::from_path(model_path)?
+    let mut session = Session::from_path_sync(model_path)?
         .quiet()
         // A repetition penalty can talk the model out of repeating the
         // tool result's digit in its answer; the grammar already keeps

@@ -14,7 +14,7 @@ exclude = [".claude/", "CLAUDE.md", "tests/data/", "**/.DS_Store"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-llama-cpp-sys-3 = { version = "0.7", optional = true }
+llama-cpp-sys-3 = { version = "0.8", optional = true }
 
 # moeflux (Metal-backed streaming-MoE decoder). macOS-only; drama_llama's
 # own `moeflux` feature wraps the platform gate so cross-platform builds
@@ -41,7 +41,7 @@ rustc-hash = "2"
 sha2 = "0.10"
 minijinja = { version = "2.5", features = ["loader", "json"] }
 minijinja-contrib = { version = "2.5", features = ["pycompat"] }
-misanthropic = { version = "1.0.0-alpha.3", default-features = false, features = [
+misanthropic = { version = "1.0.0-alpha.7", default-features = false, features = [
     "partial-eq",
 ] }
 

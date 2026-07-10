@@ -852,7 +852,7 @@ impl<B: Backend> Session<B> {
     /// Default is disabled — existing callers are unaffected unless
     /// they opt in. When enabled, `Session` honors `cache_control`
     /// breakpoints on [`Block`](crate::Block)s,
-    /// [`tool::Method`](misanthropic::tool::Method)s,
+    /// [`tool::CustomMethodDef`](misanthropic::tool::CustomMethodDef)s,
     /// [`tool::Result`](misanthropic::tool::Result)s, and
     /// [`tool::Use`](misanthropic::tool::Use)s, resuming generation
     /// from the longest prefix shared with the previous call (clipped
@@ -1376,16 +1376,15 @@ impl<B: Backend> Session<B> {
         cache_read: usize,
         output_tokens: usize,
     ) -> Usage {
-        Usage {
-            counts: misanthropic::response::TokenCounts {
-                input_tokens: prompt_tokens as u64,
-                cache_creation_input_tokens: Some(0),
-                cache_read_input_tokens: Some(cache_read as u64),
-                output_tokens: output_tokens as u64,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+        // `TokenCounts` and `Usage` are `#[non_exhaustive]` upstream,
+        // so no struct expressions — default + assign, then the
+        // upstream `From<TokenCounts> for Usage`.
+        let mut counts = misanthropic::response::TokenCounts::default();
+        counts.input_tokens = prompt_tokens as u64;
+        counts.cache_creation_input_tokens = Some(0);
+        counts.cache_read_input_tokens = Some(cache_read as u64);
+        counts.output_tokens = output_tokens as u64;
+        counts.into()
     }
 
     /// SHA-256 of the canonical chat-template render of `prompt` with
@@ -2322,22 +2321,40 @@ impl<B: Backend> Session<B> {
             outcome.cache_read_tokens,
             outcome.generated_tokens,
         );
-        Ok(misanthropic::response::Message {
-            id: std::borrow::Cow::Owned(id.to_string()),
-            kind: None,
-            inner,
-            model: self
-                .engine
-                .model
-                .display_name()
-                .unwrap_or_else(|| "unknown".to_string())
-                .into(),
-            stop_reason: outcome.stop_reason,
-            stop_sequence: outcome.stop_sequence.map(std::borrow::Cow::Owned),
-            stop_details: None,
-            usage,
-            container: None,
-        })
+        let mut message = Self::empty_response_message();
+        message.id = std::borrow::Cow::Owned(id.to_string());
+        message.inner = inner;
+        message.model = self
+            .engine
+            .model
+            .display_name()
+            .unwrap_or_else(|| "unknown".to_string())
+            .into();
+        message.stop_reason = outcome.stop_reason;
+        message.stop_sequence =
+            outcome.stop_sequence.map(std::borrow::Cow::Owned);
+        message.usage = usage;
+        Ok(message)
+    }
+
+    /// Empty [`response::Message`](misanthropic::response::Message)
+    /// shell for local generation to fill in. The struct is
+    /// `#[non_exhaustive]` upstream with no public constructor (the API
+    /// client only ever *deserializes* one), so deserializing a minimal
+    /// wire payload is the only forward-compatible construction path
+    /// for a local-inference synthesizer; the caller then assigns the
+    /// real field values directly.
+    // TODO(upstream): add a constructor to misanthropic and drop this.
+    fn empty_response_message() -> misanthropic::response::Message {
+        serde_json::from_value(serde_json::json!({
+            "id": "",
+            "role": "assistant",
+            "content": [],
+            "model": "unknown",
+            "stop_reason": null,
+            "stop_sequence": null,
+        }))
+        .expect("static response::Message template deserializes")
     }
 }
 
@@ -2874,16 +2891,11 @@ mod tests {
     /// (which output_config never emits).
     #[test]
     fn test_resolve_grammar_tool_choice_wins_over_output_config() {
-        use std::borrow::Cow;
-        let tool = crate::Tool {
-            name: Cow::Borrowed("foo"),
-            description: Cow::Borrowed(""),
-            schema: serde_json::json!({"type": "object"}),
-            cache_control: None,
-            strict: None,
-            defer_loading: None,
-            allowed_callers: None,
-        };
+        let tool = crate::Tool::builder("foo")
+            .description("Test tool.")
+            .schema(serde_json::json!({"type": "object"}))
+            .build()
+            .expect("valid test tool");
         let prompt = Prompt {
             tools: Some(vec![tool.into()]),
             tool_choice: Some(crate::ToolChoice::method("foo")),
@@ -3052,11 +3064,10 @@ mod tests {
             .join("models/model.gguf")
     }
 
-    #[tokio::test]
+    #[test]
     #[ignore = "long running, requires models/model.gguf"]
-    async fn test_with_prefix_cache_default_off() {
-        let session = crate::LlamaCppSession::from_path(model_path())
-            .await
+    fn test_with_prefix_cache_default_off() {
+        let session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet();
         assert!(
@@ -3067,11 +3078,10 @@ mod tests {
         assert!(on.prefix_cache.is_some());
     }
 
-    #[tokio::test]
+    #[test]
     #[ignore = "long running, requires models/model.gguf"]
-    async fn test_last_and_total_usage_zero_initially() {
-        let session = crate::LlamaCppSession::from_path(model_path())
-            .await
+    fn test_last_and_total_usage_zero_initially() {
+        let session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet();
         assert_eq!(session.last_usage(), &Usage::default());
@@ -3085,11 +3095,10 @@ mod tests {
     /// in `ignored_categories` so the drain inside
     /// `apply_sample_repetition_ngram` materializes the punctuation
     /// tokens into `ignored` on first sample call.
-    #[tokio::test]
+    #[test]
     #[ignore = "long running, requires models/model.gguf"]
-    async fn test_default_repetition_ignores_punctuation_category() {
-        let session = crate::LlamaCppSession::from_path(model_path())
-            .await
+    fn test_default_repetition_ignores_punctuation_category() {
+        let session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet();
         let with_rep = session.with_repetition(RepetitionOptions::default());
@@ -3114,11 +3123,10 @@ mod tests {
     /// repetition, so `add_model_stops`'s ignored-list injection
     /// silently no-op'd (and for the earlier EOS/EOT-only fix that
     /// missed modern chat templates).
-    #[tokio::test]
+    #[test]
     #[ignore = "long running, requires models/model.gguf"]
-    async fn test_with_repetition_adds_special_tokens_to_ignored() {
-        let session = crate::LlamaCppSession::from_path(model_path())
-            .await
+    fn test_with_repetition_adds_special_tokens_to_ignored() {
+        let session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet();
         let eos = session.engine.model.eos();
@@ -3159,11 +3167,10 @@ mod tests {
         println!("special_tokens count = {}", specials.len());
     }
 
-    #[tokio::test]
+    #[test]
     #[ignore = "long running, requires models/model.gguf"]
-    async fn test_clear_prefix_cache_zeroes_state() {
-        let mut session = crate::LlamaCppSession::from_path(model_path())
-            .await
+    fn test_clear_prefix_cache_zeroes_state() {
+        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true);
