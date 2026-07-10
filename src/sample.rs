@@ -1166,13 +1166,44 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     mu: &mut Option<f32>,
     model: &M,
 ) -> Result<Token, SampleError> {
+    // Suspend the repetition penalty while any byte-constraint in the
+    // chain is active and incomplete. Constrained output is
+    // format-bound: the grammar necessarily repeats structural tokens
+    // (`\n`, `</`, tag words — ordinary text tokens, not on the
+    // special-token ignore list), and exiting a permissive region
+    // (raw until() value, JSON string) requires emitting an exact
+    // multi-byte delimiter built from exactly those tokens. With the
+    // penalty live, each repetition crushes the delimiter's logits
+    // further, systematically steering sampled generation away from
+    // the only exit — observed on Qwen3.6 as tool calls thrashing
+    // inside the second parameter value until `max_tokens` (greedy
+    // was immune; its margins dwarf the penalty). Anti-degeneration
+    // heuristics are for free prose; the constraint owns the shape
+    // here. Side effect (accepted, arguably desirable): `freq_map`
+    // ingestion lives inside the penalty pass, so tokens emitted
+    // during the constrained span never enter the stats — structural
+    // markers don't seed penalties against later prose. Free-running
+    // spans before a lazy trigger and after completion are penalized
+    // as usual.
+    let constrained_incomplete = opts.modes.iter().any(|m| match m {
+        SamplingMode::Grammar(state) => {
+            state.lock().map(|s| !s.is_complete()).unwrap_or(false)
+        }
+        SamplingMode::Json(state) => {
+            state.lock().map(|s| !s.is_complete()).unwrap_or(false)
+        }
+        _ => false,
+    });
+
     // Apply any repetition penalties to the candidates. This also applies the
     // softmax and sorts the candidates by logit where the most likely token is
     // first.
-    if let Some(repetition) = &mut opts.repetition {
-        candidates = apply_sample_repetition_ngram(
-            candidates, tokens, repetition, freq_map, model,
-        )?;
+    if !constrained_incomplete {
+        if let Some(repetition) = &mut opts.repetition {
+            candidates = apply_sample_repetition_ngram(
+                candidates, tokens, repetition, freq_map, model,
+            )?;
+        }
     }
 
     let lazy = opts.lazy_grammar
@@ -1200,16 +1231,21 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
 
     if let Some((rng_snap, mu_snap, saved)) = snapshot {
         // Verify just the chosen token's piece against every constraint —
-        // O(piece bytes) vs the O(vocab) filter sweep. Empty pieces are
-        // trivially accepted mid-parse, matching the filters'
-        // per-candidate behavior — but rejected once the constraint is
-        // complete, mirroring the filters' post-complete empty-piece
-        // drop (see `json_filter`) so the fallback reaches their
-        // force-EOS termination instead of looping on invisible
-        // reserved tokens.
+        // O(piece bytes) vs the O(vocab) filter sweep. Matching the
+        // masked filters: empty pieces are rejected outright (zero
+        // bytes never advance a matcher — reserved-token loops), and
+        // end-of-generation tokens are rejected BY ID while the
+        // constraint is incomplete (byte-acceptance can't catch EOG
+        // inside permissive regions like raw until() values — see
+        // `grammar_filter`). The fallback rerun below then applies
+        // the same policy vocab-wide, reaching force-EOS termination
+        // when nothing legal remains.
         let t0 = grammar::grammar_stats_enabled().then(std::time::Instant::now);
         let mut buf: Vec<u8> = Vec::with_capacity(32);
         model.token_to_piece_ref(chosen, &mut buf);
+        let chosen_is_eog = chosen == model.eos()
+            || (model.eot() >= 0 && chosen == model.eot())
+            || model.extra_eos_tokens().contains(&chosen);
         let legal = opts.modes.iter().all(|mode| match mode {
             SamplingMode::Json(state) => {
                 let state = state.lock().expect(
@@ -1217,7 +1253,8 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                      unrecoverable. Rebuild the mode with \
                      SamplingMode::json() and retry.",
                 );
-                !(buf.is_empty() && state.is_complete())
+                !buf.is_empty()
+                    && !(chosen_is_eog && !state.is_complete())
                     && state.accepts_bytes(&buf)
             }
             SamplingMode::Grammar(state) => {
@@ -1226,7 +1263,8 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                      is unrecoverable. Rebuild the mode with \
                      SamplingMode::grammar(...) and retry.",
                 );
-                !(buf.is_empty() && state.is_complete())
+                !buf.is_empty()
+                    && !(chosen_is_eog && !state.is_complete())
                     && state.accepts_bytes(&buf)
             }
             _ => true,
@@ -1396,7 +1434,7 @@ mod tests {
     /// empty piece (like Qwen's secondary EOS variants decode to).
     struct MockModel;
 
-    const PIECES: &[&str] = &["", "a", "b", "c", "x", ""];
+    const PIECES: &[&str] = &["", "a", "b", "c", "x", "", "a"];
     const EOS: Token = 0;
     const A: Token = 1;
     const B: Token = 2;
@@ -1406,6 +1444,10 @@ mod tests {
     /// EOS — the Qwen3.6 shape behind the post-complete budget-burn
     /// loop.
     const RSV: Token = 5;
+    /// An extra-EOS token whose piece renders as byte-legal text
+    /// ("a") — the `<|im_end|>`-inside-until() shape: byte-acceptance
+    /// alone cannot reject it, only the EOG-by-id rule can.
+    const EOG_A: Token = 6;
 
     impl crate::backend::Model for MockModel {
         type Error = std::convert::Infallible;
@@ -1423,7 +1465,10 @@ mod tests {
             EOS
         }
         fn special_tokens(&self) -> Vec<Token> {
-            vec![EOS]
+            vec![EOS, EOG_A]
+        }
+        fn extra_eos_tokens(&self) -> Vec<Token> {
+            vec![EOG_A]
         }
         fn max_token_len(&self) -> usize {
             1
@@ -1489,11 +1534,21 @@ mod tests {
     }
 
     /// Legal unconstrained winner: fast path must keep it and advance the
-    /// matcher exactly as the masked path would, token for token, with an
-    /// identical RNG draw stream.
+    /// matcher exactly as the masked path would, token for token.
+    ///
+    /// Deliberately NOT asserted: RNG-stream alignment across paths.
+    /// The masked filter drops empty-piece tokens (in any state — see
+    /// `grammar_filter`), so its kept set can collapse to a single
+    /// candidate, and `choose_candidate` consumes no draw for a
+    /// singleton — draw *counts* legitimately differ between the lazy
+    /// and masked paths. Cross-path bit-exactness only ever held for
+    /// peaked distributions anyway (one uniform draw over different
+    /// softmax sets can pick different tokens); the hard guarantee is
+    /// the fallback replay, pinned by
+    /// `lazy_fallback_matches_masked_path_exactly`.
     #[test]
     fn lazy_fast_path_matches_masked_on_legal_picks() {
-        let mut results: Vec<(Vec<Token>, u64)> = Vec::new();
+        let mut results: Vec<Vec<Token>> = Vec::new();
         for lazy in [false, true] {
             let mut opts = opts_with_grammar(lazy);
             let mut r = rng();
@@ -1513,11 +1568,9 @@ mod tests {
                 &mut r,
                 &mut mu,
             ));
-            // Compare the *next* draw to prove the RNG streams stayed
-            // aligned across paths.
-            results.push((toks, r.next_u64()));
+            results.push(toks);
         }
-        assert_eq!(results[0].0, vec![A, B]);
+        assert_eq!(results[0], vec![A, B]);
         assert_eq!(results[0], results[1]);
     }
 
@@ -1576,26 +1629,83 @@ mod tests {
         }
     }
 
-    /// Empty pieces are trivially legal on the fast path — mirroring the
-    /// masked filters, which keep empty-piece tokens unconditionally.
+    /// Empty pieces are rejected mid-grammar on both paths: an active
+    /// constraint owns termination, so a dominant empty-piece token
+    /// (EOS variant or reserved slot) must lose to a byte-legal
+    /// candidate rather than bail out of — or livelock inside — the
+    /// forced structure. Regression for the mid-call stall observed
+    /// on Qwen3.6: the repetition penalty crushed the grammar-forced
+    /// structural tokens until an unpenalized empty-piece reserved
+    /// token dominated, and generation burned to `max_tokens` with no
+    /// visible output.
     #[test]
-    fn lazy_accepts_empty_piece_mid_grammar() {
-        let mut opts = opts_with_grammar(true);
+    fn lazy_rejects_empty_piece_mid_grammar() {
+        for lazy in [true, false] {
+            let mut opts = opts_with_grammar(lazy);
+            let mut r = rng();
+            let mut mu = None;
+            // EOS (empty piece) dominates mid-grammar; "a" is the
+            // byte-legal pick and must win on both paths.
+            let tok = sample(
+                cands(&[(EOS, 20.0), (A, 0.0)]),
+                &mut opts,
+                &mut r,
+                &mut mu,
+            );
+            assert_eq!(tok, A, "lazy={lazy}");
+        }
+    }
+
+    /// An end-of-generation token whose piece is byte-LEGAL under the
+    /// grammar must still be rejected mid-parse, on both paths: EOG
+    /// is an end-of-generation *signal*, not content, and inside
+    /// permissive regions (raw until() values, JSON strings) its
+    /// literal piece bytes always pass the matcher. Regression for
+    /// the Qwen3.6 mid-call bail: the model sampled `<|im_end|>`
+    /// inside a `<parameter=…>` value — legal bytes to the until-DFA
+    /// — and the predictor's EOG stop killed the call at the second
+    /// parameter.
+    #[test]
+    fn eog_with_byte_legal_piece_rejected_mid_grammar() {
+        for lazy in [true, false] {
+            let mut opts = opts_with_grammar(lazy);
+            let mut r = rng();
+            let mut mu = None;
+            // EOG_A's piece is "a" — exactly what the "ab" grammar
+            // wants next — but it must lose to the real "a" token.
+            let tok = sample(
+                cands(&[(EOG_A, 20.0), (A, 0.0)]),
+                &mut opts,
+                &mut r,
+                &mut mu,
+            );
+            assert_eq!(tok, A, "lazy={lazy}");
+            // The matcher advanced by "a" exactly once: "b" completes.
+            match &opts.modes[0] {
+                SamplingMode::Grammar(state) => {
+                    assert!(state.lock().unwrap().accepts_bytes(b"b"));
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// Mid-grammar with ONLY empty/illegal pieces on offer, the
+    /// filter's force-EOS branch terminates generation (a grammar
+    /// violation the Session layer surfaces) instead of emitting an
+    /// invisible token and spinning.
+    #[test]
+    fn empty_piece_only_candidates_force_eos_mid_grammar() {
+        let mut opts = opts_with_grammar(false);
         let mut r = rng();
         let mut mu = None;
-        // EOS (empty piece) dominates mid-grammar. Masked mode would keep
-        // it too; both paths emit it.
-        let tok =
-            sample(cands(&[(EOS, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu);
+        let tok = sample(
+            cands(&[(RSV, 20.0), (EOS, 0.0)]),
+            &mut opts,
+            &mut r,
+            &mut mu,
+        );
         assert_eq!(tok, EOS);
-        // The matcher must not have advanced (empty bytes are a no-op):
-        // "ab" still parses from root.
-        match &opts.modes[0] {
-            SamplingMode::Grammar(state) => {
-                assert!(state.lock().unwrap().accepts_bytes(b"ab"));
-            }
-            _ => unreachable!(),
-        }
     }
 
     /// Post-complete, an empty-piece NON-EOS pick must not be
