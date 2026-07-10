@@ -523,9 +523,20 @@ pub(crate) fn json_filter<M: Model>(
 ) -> Candidates {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
     let mut kept: Vec<TokenData> = Vec::with_capacity(candidates.len().get());
+    // Post-complete, drop empty-piece tokens too: they trivially pass
+    // `accepts_bytes(&[])`, so without this the kept set never empties
+    // and the force-EOS branch below never fires — the model then
+    // burns the rest of `max_tokens` emitting invisible reserved
+    // tokens (observed on Qwen3.6: every constrained run consumed
+    // exactly `n` tokens; the loop tokens decode to "" so the output
+    // *looked* fine). Mid-parse empty pieces remain accepted.
+    let complete = state.is_complete();
     for cand in candidates.as_slice() {
         buf.clear();
         model.token_to_piece_ref(cand.id, &mut buf);
+        if complete && buf.is_empty() {
+            continue;
+        }
         if state.accepts_bytes(&buf) {
             kept.push(*cand);
         }
