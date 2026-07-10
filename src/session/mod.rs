@@ -25,10 +25,11 @@
 //!
 //! * Renders the prompt through the model's embedded Jinja chat template (via
 //!   [`ChatTemplate`]).
-//! * Compiles any [`ToolChoice`] into a [`SamplingMode::Grammar`] via
-//!   [`grammar_for_prompt`], and **prepends** it to the caller's sampling chain
-//!   each call. [`Session::with_sampling`] only replaces the user portion — it
-//!   can't override the grammar.
+//! * Compiles any [`ToolChoice`] into a [`SamplingMode::Grammar`] from the
+//!   model's template-derived tool-call dialect ([`Session::dialect`]), and
+//!   **prepends** it to the caller's sampling chain each call.
+//!   [`Session::with_sampling`] only replaces the user portion — it can't
+//!   override the grammar.
 //! * Tokenizes, runs the predictor, collects the result.
 //! * Streams or batches [`Block`]s via [`Session::complete_stream`] /
 //!   [`Session::complete_blocks`]; returns a full
@@ -80,9 +81,9 @@ use misanthropic::response::Usage;
 
 use crate::{
     backend::{Backend, Model},
-    grammar_for_prompt, output_config, ChatTemplate, ChatTemplateError, Engine,
-    OutputConfigError, OutputConfigOptions, PredictOptions, Prompt,
-    RenderOptions, RepetitionOptions, SampleOptions, SamplingMode, Token,
+    output_config, ChatTemplate, ChatTemplateError, Engine, OutputConfigError,
+    OutputConfigOptions, PredictOptions, Prompt, RenderOptions,
+    RepetitionOptions, SampleOptions, SamplingMode, Token, Tool, ToolChoice,
     ToolChoiceError, ToolChoiceOptions,
 };
 
@@ -91,9 +92,6 @@ use crate::{silence_logs, LlamaCppBackend, NewError};
 
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
 use crate::{moeflux::engine::MoefluxEngineError, MoefluxBackend};
-
-mod parse;
-pub use parse::{parse_completion, BlockParser};
 
 /// Errors from [`Session`].
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +128,12 @@ pub enum SessionError {
     /// [`OutputConfig`]: misanthropic::prompt::output::OutputConfig
     #[error("output config: {0}")]
     OutputConfig(#[from] OutputConfigError),
+    /// The dialect emitter could not produce a grammar for the
+    /// prompt's tools — an argument value is unrepresentable in the
+    /// model's tagged dialect, or the emitted GBNF failed to compile.
+    /// Fires before any decode work; the session stays reusable.
+    #[error("dialect: {0}")]
+    Dialect(#[from] crate::dialect::DialectError),
     /// Grammar-forced generation ended without producing a parseable tool call.
     /// Usually means the model was truncated by `max_tokens` before closing the
     /// `</tool_call>` tag, or (less commonly) the grammar itself has a gap that
@@ -161,7 +165,8 @@ impl SessionError {
             // the engine. State is untouched — safe to reuse.
             Self::ChatTemplate(_)
             | Self::ToolChoice(_)
-            | Self::OutputConfig(_) => true,
+            | Self::OutputConfig(_)
+            | Self::Dialect(_) => true,
             // run_call invalidates its own prefix cache on grammar violation, so
             // the session is internally consistent.
             Self::GrammarViolation { .. } => true,
@@ -430,7 +435,15 @@ pub struct TopKEntry {
 pub struct Session<B: Backend> {
     engine: Engine<B>,
     template: ChatTemplate,
-    tool_choice_opts: ToolChoiceOptions,
+    /// The model's tool-call dialect, derived from its chat template
+    /// at load by [`dialect::analyze_template`](crate::dialect::analyze_template)
+    /// and optionally overridden by a `dialect.toml` sidecar (see
+    /// [`Session::with_dialect`]). Drives both the tool-call grammar
+    /// ([`dialect::grammar_source`](crate::dialect::grammar_source))
+    /// and the completion parser
+    /// ([`dialect::parse_text`](crate::dialect::parse_text)), so
+    /// enforce/parse/re-ingest cannot drift apart.
+    dialect: crate::CallSyntax,
     output_config_opts: OutputConfigOptions,
     render_opts: RenderOptions,
     /// User's sampling configuration: the post-grammar sampling-mode
@@ -509,11 +522,123 @@ fn apply_sidecar<B: Backend>(
     }
 }
 
+/// Map deprecated [`ToolChoiceOptions`] onto the [`crate::CallSyntax`]
+/// they were approximating. `wrap_tags` become section markers around
+/// JSON-native calls (the Hermes shape the old grammar hardcoded);
+/// `allow_thought` maps to the `<think>` tags the old
+/// `emit_thought_rules` hardcoded. `strict_schema` has no mapping —
+/// the dialect emitter is always schema-strict.
+fn call_syntax_from_tool_choice_opts(
+    opts: &ToolChoiceOptions,
+) -> crate::CallSyntax {
+    use crate::dialect::{Family, ReasoningMode, ReasoningSyntax};
+    let mut syntax = crate::CallSyntax {
+        family: Family::JsonNative,
+        ..crate::CallSyntax::default()
+    };
+    if let Some((open, close)) = opts.wrap_tags {
+        syntax.section_start = open.into();
+        syntax.section_end = close.into();
+    }
+    syntax.json.args_field = opts.arguments_field.into();
+    if opts.allow_thought {
+        syntax.reasoning = ReasoningSyntax {
+            mode: ReasoningMode::TagBased,
+            start: "<think>".into(),
+            end: "</think>".into(),
+        };
+    }
+    syntax
+}
+
+/// Derive the model's tool-call dialect from its chat template.
+///
+/// Never fails a load: a missing template or an analysis error falls
+/// back to `CallSyntax::default()` (`Family::None` — content-only,
+/// no tool grammar/parse) with a stderr warning, per the plan's
+/// deliberate divergence from llama.cpp's hard error. The vocab
+/// cross-check result is advisory — suspects are logged, analysis is
+/// kept (a sidecar override is the correction path).
+fn analyze_dialect<M: crate::backend::Model + ?Sized>(
+    model: &M,
+) -> crate::CallSyntax {
+    let Some(source) = model.chat_template_source() else {
+        // Unreachable after `ChatTemplate::from_model` succeeded, but
+        // stay total: no template means no dialect to derive.
+        return crate::CallSyntax::default();
+    };
+    let bos = model.token_to_piece(model.bos());
+    let eos = model.token_to_piece(model.eos());
+    let syntax = match crate::dialect::analyze_template(&source, &bos, &eos) {
+        Ok(syntax) => syntax,
+        Err(e) => {
+            eprintln!(
+                "drama_llama: chat-template dialect analysis failed ({e}); \
+                 tool calls fall back to content-only parsing. Provide a \
+                 dialect.toml sidecar to override."
+            );
+            return crate::CallSyntax::default();
+        }
+    };
+    let _suspects = crate::dialect::vocab_cross_check(&syntax, model);
+    #[cfg(feature = "axum")]
+    if !_suspects.is_empty() {
+        tracing::debug!(
+            target: "drama_llama::session",
+            suspects = ?_suspects,
+            "dialect markers do not tokenize to single special tokens; \
+             possible template misdetection (sidecar override available)",
+        );
+    }
+    syntax
+}
+
+/// Apply the per-model dialect sidecar at `sidecar_path` to `session`,
+/// if any. Unlike the sampling sidecar, **no default is auto-written**:
+/// the template analyzer's output *is* the default, and a sidecar
+/// exists only to override a misdetected finetune (whole-struct
+/// replacement — see [`crate::sidecar::load_call_syntax`]). Parse
+/// errors warn to stderr and keep the analyzed dialect.
+///
+/// No-op when the `toml` feature is disabled.
+fn apply_dialect_sidecar<B: Backend>(
+    session: Session<B>,
+    #[allow(unused_variables)] sidecar_path: &std::path::Path,
+) -> Session<B> {
+    #[cfg(feature = "toml")]
+    {
+        match crate::sidecar::load_call_syntax(sidecar_path) {
+            Ok(Some(syntax)) => session.with_dialect(syntax),
+            Ok(None) => session,
+            Err(e) => {
+                eprintln!(
+                    "drama_llama: could not load dialect sidecar at \
+                     {sidecar_path:?}: {e}; using template analysis"
+                );
+                session
+            }
+        }
+    }
+    #[cfg(not(feature = "toml"))]
+    {
+        session
+    }
+}
+
 /// Sidecar path convention for llama-cpp models: sibling
 /// `<model>.sampling.toml` next to the `.gguf` file.
 #[cfg(feature = "llama-cpp")]
 fn llama_cpp_sidecar_path(model_path: &std::path::Path) -> std::path::PathBuf {
     model_path.with_extension("sampling.toml")
+}
+
+/// Dialect-sidecar convention for llama-cpp models: sibling
+/// `<model>.dialect.toml` next to the `.gguf` file.
+#[cfg(feature = "llama-cpp")]
+fn llama_cpp_dialect_sidecar_path(
+    model_path: &std::path::Path,
+) -> std::path::PathBuf {
+    model_path.with_extension("dialect.toml")
 }
 
 /// Convenience alias for the llama.cpp-backed session, parallel to
@@ -553,8 +678,12 @@ impl Session<LlamaCppBackend> {
     /// `toml` feature; without it, sidecars are ignored.
     pub fn from_path_sync(path: PathBuf) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
+        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path(path)?;
-        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
+        Ok(apply_dialect_sidecar(
+            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            &dialect_sidecar,
+        ))
     }
 
     /// Load a model from disk with an explicit Flash Attention policy.
@@ -567,9 +696,13 @@ impl Session<LlamaCppBackend> {
         fa: crate::FlashAttention,
     ) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
+        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
         let engine =
             crate::LlamaCppEngine::from_path_with_flash_attention(path, fa)?;
-        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
+        Ok(apply_dialect_sidecar(
+            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            &dialect_sidecar,
+        ))
     }
 
     /// Load a model from disk with an explicit KV context size.
@@ -586,8 +719,12 @@ impl Session<LlamaCppBackend> {
         n_ctx: u32,
     ) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
+        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path_with_n_ctx(path, n_ctx)?;
-        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
+        Ok(apply_dialect_sidecar(
+            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            &dialect_sidecar,
+        ))
     }
 
     /// Load a model CPU-only (zero GPU layers). Diagnostic path for
@@ -595,8 +732,12 @@ impl Session<LlamaCppBackend> {
     /// [`Self::from_path`].
     pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
+        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path_cpu_only(path)?;
-        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
+        Ok(apply_dialect_sidecar(
+            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            &dialect_sidecar,
+        ))
     }
 
     /// Silence llama.cpp's log spew (model load progress, KV cache
@@ -641,8 +782,12 @@ impl Session<MoefluxBackend> {
     /// sidecars are ignored.
     pub fn from_path_sync(parent: PathBuf) -> Result<Self, SessionError> {
         let sidecar = parent.join("sampling.toml");
+        let dialect_sidecar = parent.join("dialect.toml");
         let engine = crate::MoefluxEngine::from_path(&parent)?;
-        Ok(apply_sidecar(Self::from_engine(engine)?, &sidecar))
+        Ok(apply_dialect_sidecar(
+            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            &dialect_sidecar,
+        ))
     }
 
     /// Per-phase prefetch hit/miss counters since the last
@@ -678,10 +823,11 @@ impl<B: Backend> Session<B> {
     /// layout, moeflux runtime knobs, ...).
     pub fn from_engine(engine: Engine<B>) -> Result<Self, SessionError> {
         let template = ChatTemplate::from_model(&engine.model)?;
+        let dialect = analyze_dialect(&engine.model);
         Ok(Self {
             engine,
             template,
-            tool_choice_opts: ToolChoiceOptions::default(),
+            dialect,
             output_config_opts: OutputConfigOptions::default(),
             // `preserve_thinking` default: byte-stable transcripts are
             // the prefix cache's contract, and current Anthropic
@@ -760,18 +906,54 @@ impl<B: Backend> Session<B> {
         self
     }
 
-    /// Override the defaults used when compiling [`ToolChoice`] into a grammar
-    /// (e.g. `wrap_tags`, `arguments_field`, `allow_thought`, `strict_schema`).
+    /// Override the tool-call dialect derived from the chat template
+    /// at load. The dialect is the single source of truth for the
+    /// tool-call grammar *and* the completion parser, so an override
+    /// changes both in lockstep — that coupling is the round-trip
+    /// byte-stability invariant (emission must re-render
+    /// byte-identically, or every tool turn invalidates the prefix
+    /// cache).
     ///
-    /// Cogito / Qwen / Hermes templates want `wrap_tags =
-    /// Some(("<tool_call>\n", "\n</tool_call>"))`, `arguments_field =
-    /// "arguments"`, and `allow_thought = true`. See [`ToolChoiceOptions`] for
-    /// defaults.
+    /// Prefer a `dialect.toml` sidecar next to the model
+    /// (`<model>.dialect.toml` for GGUF, `parent/dialect.toml` for
+    /// moeflux) over calling this: sidecars keep the correction with
+    /// the model files. This builder is for constructed engines and
+    /// tests.
+    pub fn with_dialect(mut self, dialect: crate::CallSyntax) -> Self {
+        self.dialect = dialect;
+        self
+    }
+
+    /// The active tool-call dialect — template-derived unless
+    /// overridden by a sidecar or [`Self::with_dialect`].
+    pub fn dialect(&self) -> &crate::CallSyntax {
+        &self.dialect
+    }
+
+    /// Override the defaults used when compiling [`ToolChoice`] into a grammar
+    /// (e.g. `wrap_tags`, `arguments_field`, `allow_thought`).
+    ///
+    /// Deprecated: these knobs were a proto-dialect. The [`CallSyntax`]
+    /// dialect (template-derived at load, overridable via
+    /// [`Self::with_dialect`] or a `dialect.toml` sidecar) subsumes
+    /// them and additionally drives the parser, keeping enforce/parse/
+    /// re-ingest in agreement. This shim maps the old fields onto a
+    /// `CallSyntax`: `wrap_tags` → section markers, `arguments_field` →
+    /// `json.args_field`, `allow_thought` → `<think>` reasoning tags.
+    /// `strict_schema = false` has no mapping — the dialect emitter is
+    /// always schema-strict (unsupported schema features already fall
+    /// back to any-JSON per field).
     ///
     /// [`ToolChoice`]: crate::ToolChoice
-    pub fn with_tool_choice_opts(mut self, opts: ToolChoiceOptions) -> Self {
-        self.tool_choice_opts = opts;
-        self
+    /// [`CallSyntax`]: crate::CallSyntax
+    #[deprecated(
+        since = "0.8.0",
+        note = "use a `dialect.toml` sidecar or `Session::with_dialect`; \
+                the template-derived CallSyntax replaces these knobs"
+    )]
+    pub fn with_tool_choice_opts(self, opts: ToolChoiceOptions) -> Self {
+        let dialect = call_syntax_from_tool_choice_opts(&opts);
+        self.with_dialect(dialect)
     }
 
     /// Override the defaults used when compiling
@@ -1000,9 +1182,9 @@ impl<B: Backend> Session<B> {
         // `TokenPredictor` sees its trigger in the output.
         let (grammar_mode, deferred) = match resolve_grammar(
             prompt,
-            &self.tool_choice_opts,
+            &self.dialect,
             &self.output_config_opts,
-            render_ends_with_open_think(&rendered),
+            render_ends_with_open_reasoning(&rendered, &self.dialect),
         )? {
             None => (None, None),
             Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
@@ -1064,25 +1246,14 @@ impl<B: Backend> Session<B> {
         &mut self,
         prompt: &Prompt,
         include_user_sampling: bool,
-    ) -> Result<
-        (
-            Vec<Token>,
-            Vec<usize>,
-            Vec<SamplingMode>,
-            Option<crate::DeferredGrammar>,
-            Vec<[u8; 32]>,
-        ),
-        SessionError,
-    > {
-        let (tokens, breakpoints, partial_hashes, thought_pre_opened) = if self
+    ) -> Result<PreparedCall, SessionError> {
+        let (rendered_prompt, tokens, breakpoints, partial_hashes) = if self
             .prefix_cache
             .is_some()
         {
             let rendered = self
                 .template
                 .render_with_breakpoints(prompt, &self.render_opts)?;
-            let thought_pre_opened =
-                render_ends_with_open_think(&rendered.text);
             // Inlines `tokenize_with_breakpoints` so we can keep
             // the SHA-256 of each surviving partial paired with
             // its token index. The shared helper only returns
@@ -1112,24 +1283,22 @@ impl<B: Backend> Session<B> {
                 pairs.iter().map(|(idx, _)| *idx).collect();
             let hashes: Vec<[u8; 32]> =
                 pairs.into_iter().map(|(_, h)| h).collect();
-            (full_tokens, breakpoints, hashes, thought_pre_opened)
+            (rendered.text, full_tokens, breakpoints, hashes)
         } else {
             // Fast path: single render + tokenize, no partials.
             let rendered =
                 self.template.render_with(prompt, &self.render_opts)?;
-            (
-                self.engine.model.tokenize(&rendered, true),
-                Vec::new(),
-                Vec::new(),
-                render_ends_with_open_think(&rendered),
-            )
+            let tokens = self.engine.model.tokenize(&rendered, true);
+            (rendered, tokens, Vec::new(), Vec::new())
         };
+        let pre_opened_reasoning =
+            render_ends_with_open_reasoning(&rendered_prompt, &self.dialect);
 
-        let (grammar_mode, deferred) = match resolve_grammar(
+        let (grammar_mode, deferred_grammar) = match resolve_grammar(
             prompt,
-            &self.tool_choice_opts,
+            &self.dialect,
             &self.output_config_opts,
-            thought_pre_opened,
+            pre_opened_reasoning,
         )? {
             None => (None, None),
             Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
@@ -1147,7 +1316,15 @@ impl<B: Backend> Session<B> {
         } else {
             grammar_mode.into_iter().collect()
         };
-        Ok((tokens, breakpoints, modes, deferred, partial_hashes))
+        Ok(PreparedCall {
+            tokens,
+            breakpoints,
+            modes,
+            deferred_grammar,
+            partial_hashes,
+            pre_opened_reasoning,
+            rendered_prompt,
+        })
     }
 
     /// Prefix-cache KV-state setup + chunked prefill shared by every
@@ -1412,29 +1589,30 @@ impl<B: Backend> Session<B> {
         counts.into()
     }
 
-    /// SHA-256 of the canonical chat-template render of `prompt` with
-    /// the just-generated assistant `blocks` appended as an additional
-    /// message turn, rendered with `add_generation_prompt = false`. The
-    /// resulting bytes are exactly what a subsequent request's
+    /// The canonical chat-template render of `prompt` with the
+    /// just-generated assistant `blocks` appended as an additional
+    /// message turn, rendered with `add_generation_prompt = false`.
+    /// The resulting bytes are exactly what a subsequent request's
     /// `partial_text` would produce when the client places a
     /// `cache_control` marker on (or just past) that assistant message
-    /// — making this hash the cache key for the auto-tip.
+    /// — their SHA-256 is the cache key for the auto-tip, and they are
+    /// the reference the canonicalization check compares the raw
+    /// emission against.
     ///
     /// Errors propagate from `ChatTemplate::render_with`; callers
-    /// should treat the hash as best-effort and fall back to no tip
+    /// should treat the render as best-effort and fall back to no tip
     /// hash on error.
-    fn compute_tip_hash(
+    fn render_extended(
         &self,
         prompt: &Prompt,
         blocks: &[crate::Block],
-    ) -> Result<[u8; 32], SessionError> {
+    ) -> Result<String, SessionError> {
         let mut extended = prompt.clone();
         let asst: misanthropic::prompt::message::AssistantMessage =
             blocks.iter().cloned().collect();
         extended.messages.push(asst.into());
         let opts = self.render_opts.clone().with_generation_prompt(false);
-        let rendered = self.template.render_with(&extended, &opts)?;
-        Ok(hash_partial_text(&rendered))
+        Ok(self.template.render_with(&extended, &opts)?)
     }
 
     /// After a batch call succeeds, update [`self.prefix_cache`] to
@@ -1558,11 +1736,11 @@ impl<B: Backend> Session<B> {
     ///
     /// # Grammar
     ///
-    /// Grammar is prepended per-call: if [`grammar_for_prompt`] returns
-    /// `Some(grammar)`, the effective sampling chain is `[grammar,
-    /// ...self.sample_options.modes.iter().cloned()]`. This happens automatically
-    /// whenever `prompt.tool_choice` is `Some(Method | Any)` and the tool list
-    /// is non-empty.
+    /// Grammar is prepended per-call: if the dialect emitter compiles
+    /// a constraint for the prompt, the effective sampling chain is
+    /// `[grammar, ...self.sample_options.modes.iter().cloned()]`. This
+    /// happens automatically whenever `prompt.tool_choice` is
+    /// `Some(Method | Any)` and the tool list is non-empty.
     ///
     /// # Prefix caching
     ///
@@ -1576,8 +1754,14 @@ impl<B: Backend> Session<B> {
         &mut self,
         prompt: &Prompt,
     ) -> Result<String, SessionError> {
-        let (tokens, breakpoints, modes, deferred_grammar, partial_hashes) =
-            self.prepare_call_cached(prompt, true)?;
+        let PreparedCall {
+            tokens,
+            breakpoints,
+            modes,
+            deferred_grammar,
+            partial_hashes,
+            ..
+        } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
         let (suffix, cache_read, prefill_start) = self
@@ -1733,10 +1917,11 @@ impl<B: Backend> Session<B> {
     /// Stream [`Block`](crate::Block)s as they're generated.
     ///
     /// Each iterator yield is one fully-resolved block. Prose is flushed as
-    /// soon as enough bytes arrive to disambiguate it from a tag prefix;
-    /// `<think>…</think>` and `<tool_call>…</tool_call>` are emitted when their
-    /// closing tag arrives. Malformed JSON inside a well-framed tool_call falls
-    /// back to a `Block::Text` (see [`BlockParser`] for the parser contract).
+    /// soon as enough bytes arrive to disambiguate it from a dialect-marker
+    /// prefix; thought and tool-call blocks are emitted when their closing
+    /// marker arrives. A malformed call body inside well-framed markers
+    /// falls back to a `Block::Text` (see [`BlockStream`] and
+    /// [`crate::dialect::parse_text`] for the parser contract).
     ///
     /// **Prose arrives fragmented.** A run of prose yields one
     /// `Block::Text` per decoded piece, not one merged block — that's
@@ -1777,8 +1962,15 @@ impl<B: Backend> Session<B> {
         &'s mut self,
         prompt: &Prompt,
     ) -> Result<BlockStream<'s, B>, SessionError> {
-        let (tokens, breakpoints, modes, deferred_grammar, partial_hashes) =
-            self.prepare_call_cached(prompt, true)?;
+        let PreparedCall {
+            tokens,
+            breakpoints,
+            modes,
+            deferred_grammar,
+            partial_hashes,
+            pre_opened_reasoning,
+            ..
+        } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
         let (suffix, cache_read, prefill_start) = self
@@ -1842,6 +2034,17 @@ impl<B: Backend> Session<B> {
             lazy_grammar: self.sample_options.lazy_grammar,
         };
 
+        // The parse dialect + tool schemas outlive the engine borrow
+        // the predictor takes, so clone them out of `self` first.
+        let syntax = effective_tool_syntax(&self.dialect).into_owned();
+        let tools: Vec<Tool> = prompt
+            .tools
+            .iter()
+            .flatten()
+            .filter_map(|def| def.as_method())
+            .cloned()
+            .collect();
+
         let predictor = if prefill_start > 0 {
             self.engine.predict_pieces_resuming(
                 suffix,
@@ -1854,7 +2057,11 @@ impl<B: Backend> Session<B> {
         };
         Ok(BlockStream {
             predictor,
-            parser: BlockParser::new(),
+            parser: crate::dialect::StreamParser::new(
+                syntax,
+                tools,
+                pre_opened_reasoning,
+            ),
             pending: std::collections::VecDeque::new(),
             eos_pieces,
             drained: false,
@@ -1880,8 +2087,15 @@ impl<B: Backend> Session<B> {
             Some(ToolChoice::Method { .. }) | Some(ToolChoice::Any { .. })
         );
 
-        let (tokens, breakpoints, modes, deferred_grammar, partial_hashes) =
-            self.prepare_call_cached(prompt, true)?;
+        let PreparedCall {
+            tokens,
+            breakpoints,
+            modes,
+            deferred_grammar,
+            partial_hashes,
+            pre_opened_reasoning,
+            rendered_prompt,
+        } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = tokens.len();
 
         let (suffix, cache_read, prefill_start) = self
@@ -1954,13 +2168,11 @@ impl<B: Backend> Session<B> {
             lazy_grammar: self.sample_options.lazy_grammar,
         };
 
-        // Collect generated pieces + count tokens inline. We also
-        // track the concatenated raw-text buffer so stop-sequence
-        // matching can inspect it post-hoc.
+        // Collect generated pieces + count tokens inline. The
+        // concatenated raw-text buffer feeds the dialect parser after
+        // generation and stop-sequence matching post-hoc.
         let mut generated_count: usize = 0;
         let mut raw_text = String::new();
-        let mut blocks: Vec<crate::Block> = Vec::new();
-        let mut parser = BlockParser::new();
 
         // When the diagnostic is on, also capture the (token_id,
         // piece) pair for every emission. Empty pieces (the smoking
@@ -2006,8 +2218,6 @@ impl<B: Backend> Session<B> {
             }
             generated_count += 1;
             raw_text.push_str(&piece);
-            let emitted = parser.push(&piece);
-            blocks.extend(emitted);
 
             // Break early if any active grammar / json matcher has
             // reached its accept state. Avoids burning extra decode
@@ -2023,14 +2233,34 @@ impl<B: Backend> Session<B> {
             }
         }
         drop(predictor);
-        blocks.extend(parser.finish());
-        // The parser emits one block per resolved prose chunk for
-        // streaming friendliness. For batch callers (complete_blocks /
-        // complete / complete_response), collapse adjacent same-kind
-        // prose so `[Text, Text, Text]` becomes `[Text]` — semantically
-        // identical, and lets the `FromIterator<Block>` path flatten
-        // single-Text outputs into Content::SinglePart.
-        let blocks = merge_adjacent_prose(blocks);
+        // Parse the whole generation through the dialect envelope
+        // parser. `Final` leniency: a truncated trailing structure
+        // degrades to Text (or Thought for an unclosed reasoning
+        // block) instead of being suppressed, so nothing the model
+        // produced is silently dropped — the grammar-violation check
+        // below decides severity. Batch path parses once at the end;
+        // there is no incremental state to keep in sync (that was the
+        // BlockParser this replaced).
+        let parse_syntax = effective_tool_syntax(&self.dialect);
+        let parse_tools: Vec<Tool> = prompt
+            .tools
+            .iter()
+            .flatten()
+            .filter_map(|def| def.as_method())
+            .cloned()
+            .collect();
+        let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
+        let parsed = crate::dialect::parse_text(
+            &parse_syntax,
+            &tool_refs,
+            &raw_text,
+            pre_opened_reasoning,
+            crate::dialect::Leniency::Final,
+        );
+        // Collapse adjacent same-kind prose so `[Text, Text]` becomes
+        // `[Text]` — lets a lone `Text` output serialize to the
+        // string wire form downstream.
+        let blocks = merge_adjacent_prose(parsed.blocks);
 
         // Auto-tip: extend `prev_tokens` past the prompt with the
         // generated content (and the recorded-but-uncommitted close
@@ -2045,17 +2275,46 @@ impl<B: Backend> Session<B> {
         // Compute the auto-tip hash from the parsed assistant blocks
         // — `run_call` is the only completion path with parsed
         // structure available at save-time, so this is where the tip
-        // entry of the hash side-table actually gets populated. Best-
-        // effort: a render error logs and falls back to no tip hash
-        // (cache still works, just without the auto-tip side-table
-        // entry).
+        // entry of the hash side-table actually gets populated.
+        //
+        // Canonicalization gate (cache-stability layer 2): the tip
+        // hash is the SHA-256 of the *canonical re-render*, but the
+        // KV cache holds the *raw emission*. If those bytes diverge
+        // within the assistant span, a later hash match would splice
+        // KV state whose bytes don't match the new render — the exact
+        // corruption `compute_tip_hash` was built to prevent. So the
+        // hash is stored only when the canonical extended render is
+        // `rendered_prompt` + the raw emission, byte for byte
+        // (`render(parse(emission))` reproduces `emission` — the
+        // round-trip invariant). On divergence the tip entry is
+        // skipped; the next call falls back to the plain LCP walk,
+        // which compares token ids directly and is safe by
+        // construction. Best-effort throughout: a render error also
+        // just skips the entry.
         let blocks_owned: Vec<crate::Block> = blocks.to_vec();
-        let tip_hash = match self.compute_tip_hash(prompt, &blocks_owned) {
-            Ok(h) => Some(h),
+        let tip_hash = match self.render_extended(prompt, &blocks_owned) {
+            Ok(extended_render) => {
+                let byte_stable = extended_render
+                    .strip_prefix(rendered_prompt.as_str())
+                    .map(|tail| tail.starts_with(raw_text.as_str()))
+                    .unwrap_or(false);
+                if byte_stable {
+                    Some(hash_partial_text(&extended_render))
+                } else {
+                    #[cfg(feature = "axum")]
+                    tracing::debug!(
+                        target: "drama_llama::session",
+                        emission_bytes = raw_text.len(),
+                        "emission does not re-render byte-stable; \
+                         auto-tip hash skipped (LCP fallback)",
+                    );
+                    None
+                }
+            }
             Err(_e) => {
                 #[cfg(feature = "axum")]
                 tracing::debug!(
-                    "compute_tip_hash failed; tip hash side-table entry skipped"
+                    "render_extended failed; tip hash side-table entry skipped"
                 );
                 None
             }
@@ -2275,9 +2534,9 @@ impl<B: Backend> Session<B> {
 
     /// Batch variant returning a role-typed [`AssistantMessage`][am]. Routed
     /// through misanthropic's [`AssistantMessage: FromIterator<Block>`][am-fi]
-    /// so single- block outputs flatten to `Content::SinglePart` and multi-
-    /// block outputs stay `Content::MultiPart` — the crate-level convention,
-    /// not one we reinvent here.
+    /// so block collection follows the crate-level convention (a
+    /// single `Text` block serializes to the string wire form), not
+    /// one we reinvent here.
     ///
     /// Returning [`AssistantMessage`][am] rather than the bare [`Message`][m]
     /// is deliberate: it's statically impossible to paste a `Session::complete`
@@ -2386,17 +2645,155 @@ impl<B: Backend> Session<B> {
     }
 }
 
+/// The dialect actually used for tool-call enforcement and parsing.
+///
+/// A [`Family::None`](crate::dialect::Family::None) analysis means
+/// the chat template renders no tool calls at all (Gemma-style).
+/// Until the `Instructed` dialect lands (plan Phase F), those
+/// sessions fall back to the Hermes-JSON shape the pre-dialect
+/// grammar hardcoded — preserving today's behavior for callers that
+/// advertise tools anyway — while keeping any reasoning tags the
+/// analysis *did* detect.
+fn effective_tool_syntax(
+    dialect: &crate::CallSyntax,
+) -> std::borrow::Cow<'_, crate::CallSyntax> {
+    use std::borrow::Cow;
+    if dialect.family != crate::dialect::Family::None {
+        return Cow::Borrowed(dialect);
+    }
+    let mut fallback = crate::CallSyntax::hermes_json();
+    fallback.reasoning = dialect.reasoning.clone();
+    Cow::Owned(fallback)
+}
+
+/// Compile the eager (`Any` / `Method`) tool-call grammar for
+/// `prompt` from the session dialect. Returns `Ok(None)` for `Auto`,
+/// `None`, or an absent `tool_choice` — the lazy path
+/// ([`dialect_deferred_grammar_for_prompt`]) owns those.
+fn dialect_grammar_for_prompt(
+    prompt: &Prompt,
+    dialect: &crate::CallSyntax,
+    thought_pre_opened: bool,
+) -> Result<Option<SamplingMode>, SessionError> {
+    use crate::dialect::{Anchor, EmitOptions};
+    let Some(choice) = prompt.tool_choice.as_ref() else {
+        return Ok(None);
+    };
+    // Only custom defs carry a schema we can compile; server tools
+    // execute on Anthropic's side and can't occur in local inference.
+    let tools: Vec<Tool> = prompt
+        .tools
+        .iter()
+        .flatten()
+        .filter_map(|def| def.as_method())
+        .cloned()
+        .collect();
+    let (chosen, parallel): (Vec<&Tool>, bool) = match choice {
+        ToolChoice::Auto { .. } | ToolChoice::None => return Ok(None),
+        ToolChoice::Any {
+            disable_parallel_tool_use,
+            ..
+        } => {
+            if tools.is_empty() {
+                return Err(ToolChoiceError::NoTools.into());
+            }
+            (tools.iter().collect(), !disable_parallel_tool_use)
+        }
+        ToolChoice::Method {
+            name,
+            disable_parallel_tool_use,
+            ..
+        } => {
+            let Some(tool) =
+                tools.iter().find(|t| t.name.as_ref() == name.as_str())
+            else {
+                return Err(ToolChoiceError::UnknownTool(name.clone()).into());
+            };
+            (vec![tool], !disable_parallel_tool_use)
+        }
+    };
+    let syntax = effective_tool_syntax(dialect);
+    let opts = EmitOptions {
+        anchor: if thought_pre_opened {
+            Anchor::EagerThoughtPreOpened
+        } else {
+            Anchor::Eager
+        },
+        // Repeated calls need a per-call delimiter to be well-formed;
+        // section-only dialects (Hermes) stay single-call regardless
+        // of the wire flag.
+        parallel: parallel && !syntax.per_call_start.is_empty(),
+    };
+    let source = crate::dialect::grammar_source(&syntax, &chosen, &opts)?;
+    let mode = SamplingMode::grammar(&source).map_err(ToolChoiceError::from)?;
+    Ok(Some(mode))
+}
+
+/// Build the lazy (trigger-activated) tool-call constraint for a
+/// prompt whose `tool_choice` is `Auto` — or absent, which the
+/// Anthropic API treats as auto — with tools advertised. The
+/// [`DeferredGrammar`](crate::DeferredGrammar) sleeps until the
+/// dialect trigger ([`CallSyntax::trigger`](crate::CallSyntax::trigger))
+/// appears in the output; thought and prose before it run
+/// unconstrained. Returns `Ok(None)` when there is nothing to defer:
+/// a non-auto `tool_choice`, no tools, or a trigger-less dialect
+/// (bare JSON-native — no reliable activation substring).
+fn dialect_deferred_grammar_for_prompt(
+    prompt: &Prompt,
+    dialect: &crate::CallSyntax,
+) -> Result<Option<crate::DeferredGrammar>, SessionError> {
+    use crate::dialect::{Anchor, EmitOptions};
+    let disable_parallel = match prompt.tool_choice.as_ref() {
+        None => false,
+        Some(ToolChoice::Auto {
+            disable_parallel_tool_use,
+            ..
+        }) => *disable_parallel_tool_use,
+        Some(_) => return Ok(None),
+    };
+    let tools: Vec<Tool> = prompt
+        .tools
+        .iter()
+        .flatten()
+        .filter_map(|def| def.as_method())
+        .cloned()
+        .collect();
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    let syntax = effective_tool_syntax(dialect);
+    let trigger = syntax.trigger();
+    if trigger.is_empty() {
+        return Ok(None);
+    }
+    let opts = EmitOptions {
+        anchor: Anchor::Lazy,
+        parallel: !disable_parallel && !syntax.per_call_start.is_empty(),
+    };
+    let chosen: Vec<&Tool> = tools.iter().collect();
+    let source = crate::dialect::grammar_source(&syntax, &chosen, &opts)?;
+    let grammar =
+        SamplingMode::grammar(&source).map_err(ToolChoiceError::from)?;
+    Ok(Some(crate::DeferredGrammar {
+        activate_after: trigger.as_bytes().to_vec(),
+        grammar,
+        feed_trigger: true,
+    }))
+}
+
 /// Resolve the single grammar (if any) that should constrain
 /// generation for `prompt`. Priority:
 ///
-/// 1. `prompt.tool_choice` (when set and not `Auto`) — compiled via
-///    [`grammar_for_prompt`] with `tool_choice_opts`. Always produces a
-///    unified `Single` grammar (tool-choice has no thought preamble today).
+/// 1. `prompt.tool_choice` (when set and not `Auto`) — compiled from
+///    the session `dialect` via [`dialect_grammar_for_prompt`].
+///    Always produces a unified `Single` grammar.
 /// 2. `prompt.output_config` — compiled via
 ///    [`output_config::compile_prompt_output_config`]; may return either a
 ///    `Single` unified grammar or a `Deferred` phase-split grammar
 ///    depending on `output_config_opts.phase_split`.
-/// 3. `None` — generation is unconstrained.
+/// 3. `Auto` (or absent) tool_choice with tools — lazy deferred
+///    grammar from the dialect trigger.
+/// 4. `None` — generation is unconstrained.
 ///
 /// Tool-choice wins when both are set: tool schemas *are* structured
 /// output, and the model can only commit to one terminal shape per
@@ -2404,7 +2801,7 @@ impl<B: Backend> Session<B> {
 /// without instantiating an engine.
 fn resolve_grammar(
     prompt: &Prompt,
-    tool_choice_opts: &ToolChoiceOptions,
+    dialect: &crate::CallSyntax,
     output_config_opts: &OutputConfigOptions,
     thought_pre_opened: bool,
 ) -> Result<Option<crate::CompiledOutputConfig>, SessionError> {
@@ -2426,7 +2823,7 @@ fn resolve_grammar(
         );
     }
     if let Some(g) =
-        grammar_for_prompt(prompt, tool_choice_opts, thought_pre_opened)?
+        dialect_grammar_for_prompt(prompt, dialect, thought_pre_opened)?
     {
         #[cfg(feature = "axum")]
         tracing::debug!(
@@ -2455,9 +2852,7 @@ fn resolve_grammar(
     // output_config outranks the speculative auto grammar (only one
     // deferred slot exists, and output_config is the caller's direct
     // ask).
-    if let Some(d) =
-        crate::deferred_grammar_for_prompt(prompt, tool_choice_opts)?
-    {
+    if let Some(d) = dialect_deferred_grammar_for_prompt(prompt, dialect)? {
         #[cfg(feature = "axum")]
         tracing::debug!(
             target: "drama_llama::session",
@@ -2475,12 +2870,51 @@ fn resolve_grammar(
 }
 
 /// Whether a rendered generation prompt ends with a *pre-opened*
-/// `<think>` tag — Qwen-style `enable_thinking` templates append
+/// reasoning tag — Qwen-style `enable_thinking` templates append
 /// `<|im_start|>assistant\n<think>\n`, so generation starts inside the
-/// reasoning block and an eager grammar must not demand another
-/// literal `<think>`. See `RootShape::Eager` in `tool_choice`.
-fn render_ends_with_open_think(rendered: &str) -> bool {
-    rendered.trim_end().ends_with("<think>")
+/// reasoning block: an eager grammar must not demand another literal
+/// open tag ([`Anchor::EagerThoughtPreOpened`](crate::dialect::Anchor))
+/// and the parser must treat leading bytes as thought
+/// (`pre_opened_reasoning` in [`crate::dialect::parse_text`] — the
+/// unforced-path fix for issue #27). The tag is the dialect's, not a
+/// hardcoded `<think>`.
+fn render_ends_with_open_reasoning(
+    rendered: &str,
+    dialect: &crate::CallSyntax,
+) -> bool {
+    if dialect.reasoning.mode == crate::dialect::ReasoningMode::None {
+        return false;
+    }
+    let start = dialect.reasoning.start.trim();
+    !start.is_empty() && rendered.trim_end().ends_with(start)
+}
+
+/// Everything [`Session::prepare_call_cached`] derives from a prompt
+/// before any decode work: the tokenized render, cache-breakpoint
+/// metadata, the effective sampling chain, and the render-derived
+/// facts the parse / canonicalization stages need afterwards.
+struct PreparedCall {
+    /// Full prompt token ids (`parse_special = true`).
+    tokens: Vec<Token>,
+    /// Cache-breakpoint token indices, sorted ascending. Empty when
+    /// prefix caching is off.
+    breakpoints: Vec<usize>,
+    /// Effective sampling chain: grammar (if any) prepended to the
+    /// user's modes.
+    modes: Vec<SamplingMode>,
+    /// Lazy trigger-activated grammar, carried outside `modes` — it
+    /// stays suspended until the predictor sees its trigger.
+    deferred_grammar: Option<crate::DeferredGrammar>,
+    /// SHA-256 of each surviving partial render, parallel to
+    /// `breakpoints`.
+    partial_hashes: Vec<[u8; 32]>,
+    /// The rendered generation prompt ends inside an open reasoning
+    /// block (Qwen-style pre-opened `<think>\n`): generation starts
+    /// mid-thought, and the parser must be told (issue #27).
+    pre_opened_reasoning: bool,
+    /// The full rendered generation prompt — the byte prefix the
+    /// canonicalization check compares re-renders against.
+    rendered_prompt: String,
 }
 
 /// Everything [`Session::run_call`] produces about one batch call —
@@ -2527,18 +2961,14 @@ struct CallOutcome {
 /// sequence) over mechanical ones (token limit) so tool-call-forced
 /// flows and caller-supplied stop strings are never mis-labeled as
 /// `MaxTokens`.
-/// Collapse runs of adjacent same-kind prose blocks. The streaming
-/// [`BlockParser`] emits one [`Block::Text`] per resolved prose chunk
-/// and one [`Block::Thought`] per tagged chunk for streaming
-/// friendliness; batch callers want those coalesced before the
-/// [`FromIterator<Block>`] flattening path decides
-/// [`Content::SinglePart`] vs [`Content::MultiPart`].
+/// Collapse runs of adjacent same-kind prose blocks. The parser can
+/// emit one [`Block::Text`] per resolved prose chunk and one
+/// [`Block::Thought`] per tagged chunk; batch callers want those
+/// coalesced before the [`FromIterator<Block>`] collection path, so a
+/// lone `Text` output serializes to the string wire form.
 ///
 /// Tool-use and tool-result blocks are discrete units and pass through
 /// unchanged, as do any other non-prose variants.
-///
-/// [`Content::SinglePart`]: crate::Content::SinglePart
-/// [`Content::MultiPart`]: crate::Content::MultiPart
 fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
     use crate::Block;
     use std::borrow::Cow;
@@ -2601,22 +3031,41 @@ fn infer_stop_reason(
 }
 
 /// Streaming [`Iterator`] over [`crate::Block`]s, produced by
-/// [`Session::complete_stream`]. Yields each block as soon as its closing tag
-/// (or tag-prefix ambiguity resolution) arrives.
+/// [`Session::complete_stream`]. Yields each structured block
+/// (thought, tool call) as soon as its closing marker arrives; prose
+/// streams incrementally as it resolves.
 ///
-/// Prose is **not** merged: a run of plain text yields one [`Block::Text`]
-/// per decoded piece. Concatenate adjacent `Text` yields if you need the
-/// whole body as one string (the batch `complete_*` methods do this for
-/// you via `merge_adjacent_prose`).
+/// Internally this re-parses the full accumulated generation on
+/// every predictor tick through the dialect envelope parser
+/// ([`crate::dialect::parse_text`], `Leniency::Streaming`) and diffs
+/// the result against what has already been yielded. The re-parse is
+/// deliberately O(n²) over a generation — outputs are small, and a
+/// full partial parse per tick is what the streaming-events work
+/// (issue #26) needs; do not "optimize" it back into an incremental
+/// state machine (that's the `BlockParser` this replaced).
+///
+/// Prose is **not** merged: a run of plain text yields one
+/// [`Block::Text`] per resolved chunk (bytes that can no longer be
+/// the start of a dialect marker). Concatenate adjacent `Text` yields
+/// if you need the whole body as one string (the batch `complete_*`
+/// methods do this for you via `merge_adjacent_prose`).
+///
+/// Reasoning streams as one [`Block::Thought`] when its close marker
+/// arrives — including Qwen-style pre-opened reasoning, which the old
+/// parser mislabeled as streaming `Text` (issue #27).
 ///
 /// [`Block::Text`]: crate::Block::Text
+/// [`Block::Thought`]: crate::Block::Thought
 ///
-/// Drops trailing EOS and `[Invalid UTF-8]` pieces the predictor emits at
-/// stream end — those are artifacts of token-to-string conversion, not model
+/// Drops EOS and `[Invalid UTF-8]` pieces the predictor emits —
+/// those are artifacts of token-to-string conversion, not model
 /// output.
 pub struct BlockStream<'engine, B: Backend> {
     predictor: crate::PiecePredictor<'engine, B>,
-    parser: BlockParser,
+    /// Re-parse-per-tick streaming parser over the session dialect
+    /// (owned — the session borrow is held by `predictor` for the
+    /// stream's lifetime).
+    parser: crate::dialect::StreamParser,
     pending: std::collections::VecDeque<crate::Block>,
     /// EOS-like piece texts (primary EOS, EOT, every
     /// `extra_eos_tokens` declared by the model) — filtered out of
@@ -2643,19 +3092,19 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                     // Everything else goes through the parser.
                     if self.eos_pieces.contains(&piece)
                         || piece == "[Invalid UTF-8]"
+                        || piece.is_empty()
                     {
                         continue;
                     }
-                    let blocks = self.parser.push(&piece);
-                    self.pending.extend(blocks);
+                    self.pending.extend(self.parser.push(&piece));
                 }
                 None => {
                     self.drained = true;
-                    // Drain the parser — any trailing prose / partial
-                    // tag contents become final blocks.
-                    let final_blocks =
-                        std::mem::take(&mut self.parser).finish();
-                    self.pending.extend(final_blocks);
+                    // Final pass: partial trailing structures degrade
+                    // to Text / Thought per the parser's Final-leniency
+                    // contract, and held-back marker-prefix bytes
+                    // flush.
+                    self.pending.extend(self.parser.finish());
                 }
             }
         }
@@ -2857,7 +3306,7 @@ mod tests {
         let prompt = Prompt::default();
         let got = resolve_grammar(
             &prompt,
-            &ToolChoiceOptions::default(),
+            &crate::CallSyntax::hermes_json(),
             &OutputConfigOptions::default(),
             false,
         )
@@ -2888,7 +3337,7 @@ mod tests {
             });
         let got = resolve_grammar(
             &prompt,
-            &ToolChoiceOptions::default(),
+            &crate::CallSyntax::hermes_json(),
             &OutputConfigOptions::default(),
             false,
         )
@@ -2927,7 +3376,7 @@ mod tests {
         }));
         let got = resolve_grammar(
             &prompt,
-            &ToolChoiceOptions::default(),
+            &crate::CallSyntax::hermes_json(),
             &OutputConfigOptions {
                 allow_thought: true,
                 phase_split: false,
@@ -2967,7 +3416,7 @@ mod tests {
         }));
         let got = resolve_grammar(
             &prompt,
-            &ToolChoiceOptions::default(),
+            &crate::CallSyntax::hermes_json(),
             &OutputConfigOptions::default(),
             false,
         )
@@ -2986,6 +3435,124 @@ mod tests {
             !source.contains("output_schema"),
             "tool_choice grammar must not leak output_config rules, got: {source}"
         );
+    }
+
+    /// Auto (absent) tool_choice + tools + a tagged dialect → lazy
+    /// deferred grammar, trigger = the dialect's own call opener, and
+    /// the grammar constrains the dialect's tagged shape (not JSON).
+    #[test]
+    fn test_resolve_grammar_auto_lazy_uses_dialect_trigger() {
+        let tool = crate::Tool::builder("foo")
+            .description("Test tool.")
+            .schema(serde_json::json!({"type": "object"}))
+            .build()
+            .expect("valid test tool");
+        let prompt = Prompt {
+            tools: Some(vec![tool.into()]),
+            ..Prompt::default()
+        };
+        let got = resolve_grammar(
+            &prompt,
+            &crate::CallSyntax::qwen_xml(),
+            &OutputConfigOptions::default(),
+            false,
+        )
+        .expect("resolve");
+        let crate::CompiledOutputConfig::Deferred(deferred) =
+            got.expect("some compiled config")
+        else {
+            panic!("expected Deferred (auto-lazy) variant");
+        };
+        assert_eq!(deferred.activate_after.as_slice(), b"<tool_call>\n");
+        assert!(deferred.feed_trigger);
+        let SamplingMode::Grammar(state) = deferred.grammar else {
+            panic!("deferred.grammar must be SamplingMode::Grammar");
+        };
+        let source = state.lock().unwrap().grammar().source().to_string();
+        assert!(
+            source.contains("<function="),
+            "expected tagged-dialect grammar, got: {source}"
+        );
+    }
+
+    /// Method + pre-opened reasoning → eager grammar anchored on the
+    /// dialect's close tag (thought body first, then the call).
+    #[test]
+    fn test_resolve_grammar_method_anchors_pre_opened_thought() {
+        let tool = crate::Tool::builder("foo")
+            .description("Test tool.")
+            .schema(serde_json::json!({"type": "object"}))
+            .build()
+            .expect("valid test tool");
+        let prompt = Prompt {
+            tools: Some(vec![tool.into()]),
+            tool_choice: Some(crate::ToolChoice::method("foo")),
+            ..Prompt::default()
+        };
+        let got = resolve_grammar(
+            &prompt,
+            &crate::CallSyntax::qwen_xml(),
+            &OutputConfigOptions::default(),
+            true,
+        )
+        .expect("resolve");
+        let crate::CompiledOutputConfig::Single(SamplingMode::Grammar(state)) =
+            got.expect("some compiled config")
+        else {
+            panic!("expected Single(Grammar) variant");
+        };
+        let source = state.lock().unwrap().grammar().source().to_string();
+        assert!(
+            source.contains("thought_close"),
+            "pre-opened root must require the reasoning close, got: {source}"
+        );
+        assert!(
+            source.contains("<function="),
+            "expected tagged-dialect grammar, got: {source}"
+        );
+    }
+
+    /// A `Family::None` dialect (tool-less template) falls back to
+    /// the Hermes-JSON shape for tool enforcement — preserving the
+    /// pre-dialect behavior until Phase F's `Instructed` dialect —
+    /// while keeping whatever reasoning tags analysis detected.
+    #[test]
+    fn test_effective_tool_syntax_none_falls_back_to_hermes() {
+        use crate::dialect::{Family, ReasoningMode, ReasoningSyntax};
+        let dialect = crate::CallSyntax {
+            reasoning: ReasoningSyntax {
+                mode: ReasoningMode::TagBased,
+                start: "<reason>".into(),
+                end: "</reason>".into(),
+            },
+            ..crate::CallSyntax::default()
+        };
+        assert_eq!(dialect.family, Family::None);
+        let effective = effective_tool_syntax(&dialect);
+        assert_eq!(effective.family, Family::JsonNative);
+        assert_eq!(effective.section_start, "<tool_call>\n");
+        assert_eq!(effective.reasoning.start, "<reason>");
+        // Non-None dialects pass through untouched.
+        let qwen = crate::CallSyntax::qwen_xml();
+        assert_eq!(*effective_tool_syntax(&qwen), qwen);
+    }
+
+    /// Pre-opened detection follows the dialect's reasoning tag, not
+    /// a hardcoded `<think>`.
+    #[test]
+    fn test_render_ends_with_open_reasoning_is_dialect_driven() {
+        let qwen = crate::CallSyntax::qwen_xml();
+        assert!(render_ends_with_open_reasoning(
+            "<|im_start|>assistant\n<think>\n",
+            &qwen
+        ));
+        assert!(!render_ends_with_open_reasoning(
+            "<|im_start|>assistant\n",
+            &qwen
+        ));
+        // No reasoning mode → never pre-opened, even on a literal hit.
+        let none = crate::CallSyntax::hermes_json();
+        assert!(!render_ends_with_open_reasoning("...<think>", &none));
     }
 
     /// `PrefixCache::new()` starts with every field zeroed, and

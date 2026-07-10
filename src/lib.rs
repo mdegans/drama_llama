@@ -129,10 +129,7 @@ pub use session::LlamaCppSession;
     feature = "llama-cpp",
     all(feature = "moeflux", target_os = "macos")
 ))]
-pub use session::{
-    parse_completion, BlockParser, BlockStream, Session, SessionError,
-    TokenTrace, TopKEntry,
-};
+pub use session::{BlockStream, Session, SessionError, TokenTrace, TopKEntry};
 
 mod probability;
 pub use probability::{InvalidProbability, Probability};

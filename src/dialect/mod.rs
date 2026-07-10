@@ -22,12 +22,12 @@ mod emit;
 mod parse;
 mod segment;
 
-pub use analyzer::{analyze_template, AnalyzeError};
+pub use analyzer::{analyze_template, vocab_cross_check, AnalyzeError};
 pub use emit::{
     grammar_source, render_reference, validate_representable, Anchor,
     DialectError, EmitOptions,
 };
-pub use parse::{parse_text, Leniency, ParseStatus, Parsed};
+pub use parse::{parse_text, Leniency, ParseStatus, Parsed, StreamParser};
 
 /// Tool-call format family, per llama.cpp's classification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

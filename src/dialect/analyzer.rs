@@ -52,6 +52,41 @@ pub enum AnalyzeError {
     Template(#[from] minijinja::Error),
 }
 
+/// Optional post-analysis pass over a loaded model's vocabulary: the
+/// outer structural markers of a detected dialect (the call trigger
+/// and the reasoning tags) are trained as single special tokens in
+/// every family we know — a marker that tokenizes to several pieces
+/// is a strong misdetection signal for a finetune's template.
+///
+/// Returns the suspect markers (empty = all high-confidence). Callers
+/// decide severity; [`Session::from_engine`](crate::Session) logs
+/// them at debug level and continues — analysis never gates a load.
+/// Inner markers (`<function=`, `<parameter=`) are deliberately not
+/// checked: tagged dialects compose those from ordinary text tokens.
+pub fn vocab_cross_check<M: crate::backend::Model + ?Sized>(
+    syntax: &super::CallSyntax,
+    model: &M,
+) -> Vec<String> {
+    let mut suspects = Vec::new();
+    let candidates = [
+        syntax.trigger(),
+        syntax.reasoning.start.as_str(),
+        syntax.reasoning.end.as_str(),
+    ];
+    for marker in candidates {
+        let core = marker.trim();
+        if core.is_empty() {
+            continue;
+        }
+        if model.tokenize(core, true).len() != 1
+            && !suspects.iter().any(|s| s == core)
+        {
+            suspects.push(core.to_string());
+        }
+    }
+    suspects
+}
+
 /// A template environment prepared for sentinel probing.
 struct Probe<'s> {
     env: Environment<'s>,
