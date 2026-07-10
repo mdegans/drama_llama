@@ -9,12 +9,37 @@ use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
 use drama_llama::{
     prompt::{ToolResult, ToolUse},
     Block, Content, Message, Prompt, RenderOptions, Role, SessionError, Tool,
-    ToolChoice, ToolChoiceOptions,
+    ToolChoice,
 };
 use serde_json::json;
 
 fn model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
+}
+
+/// Parse raw completion bytes through the session's own dialect —
+/// what `Session::complete*` do internally. `pre_opened` mirrors the
+/// generation prompt ending inside an open reasoning block.
+fn parse_with_dialect(
+    session: &drama_llama::LlamaCppSession,
+    prompt: &Prompt,
+    raw: &str,
+    pre_opened: bool,
+) -> Vec<Block> {
+    let tool_refs: Vec<&Tool> = prompt
+        .tools
+        .iter()
+        .flatten()
+        .filter_map(|def| def.as_method())
+        .collect();
+    drama_llama::dialect::parse_text(
+        session.dialect(),
+        &tool_refs,
+        raw,
+        pre_opened,
+        drama_llama::dialect::Leniency::Final,
+    )
+    .blocks
 }
 
 /// Phase 1 milestone: `complete_text` runs end-to-end against a real
@@ -76,16 +101,12 @@ fn complete_text_strawberry_turn_2() {
         ..Default::default()
     };
 
+    // No dialect override: the session derives the tool-call format
+    // from the model's chat template at load (#30 Phase E).
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
             .quiet()
-            .with_tool_choice_opts(ToolChoiceOptions {
-                arguments_field: "arguments",
-                wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-                allow_thought: true,
-                ..ToolChoiceOptions::default()
-            })
             .with_max_tokens(NonZeroUsize::new(256).unwrap());
 
     let out = session.complete_text(&prompt).expect("complete_text");
@@ -145,12 +166,6 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
             .quiet()
-            .with_tool_choice_opts(ToolChoiceOptions {
-                arguments_field: "arguments",
-                wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-                allow_thought: true,
-                ..ToolChoiceOptions::default()
-            })
             .with_sampling(std::iter::empty()) // user chain empty — only grammar runs
             .with_max_tokens(NonZeroUsize::new(128).unwrap());
 
@@ -204,19 +219,6 @@ fn strawberry_turn_1_prompt() -> Prompt {
     }
 }
 
-fn cogito_tool_choice_opts() -> ToolChoiceOptions {
-    ToolChoiceOptions {
-        arguments_field: "arguments",
-        wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
-        allow_thought: true,
-        // strict_schema pins the argument KEYS to what the tool
-        // declared. Without this, cogito is free to hallucinate
-        // `{"word": "..."}` instead of `{"string": "..."}`; with it,
-        // the grammar rejects any tokens that would break the schema.
-        strict_schema: true,
-    }
-}
-
 /// Phase 3: `complete` returns a `Message` whose tool_use content
 /// matches the `letter` / `string` we asked the model to count.
 #[test]
@@ -227,7 +229,6 @@ fn complete_returns_message_with_tool_use() {
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
             .quiet()
-            .with_tool_choice_opts(cogito_tool_choice_opts())
             .with_max_tokens(NonZeroUsize::new(256).unwrap());
 
     let assistant = session.complete(&prompt).expect("complete");
@@ -270,7 +271,6 @@ fn grammar_violation_on_truncated_tool_call() {
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
             .quiet()
-            .with_tool_choice_opts(cogito_tool_choice_opts())
             .with_max_tokens(NonZeroUsize::new(4).unwrap()); // truncate hard
 
     let err = session
@@ -284,11 +284,17 @@ fn grammar_violation_on_truncated_tool_call() {
     }
 }
 
-/// Phase 3 round-trip invariant: `complete_text` and `complete` are
-/// two views of the same bytes. Parse the raw bytes into an
+/// Round-trip byte-stability — the #30 cache-correctness invariant,
+/// asserted end-to-end: `render(parse(emission))` must reproduce the
+/// emission byte-for-byte within the assistant span. Parse the raw
+/// bytes through the session's template-derived dialect into an
 /// [`AssistantMessage`], tack it onto the original [`Prompt`],
-/// re-render the whole thing, and assert the raw bytes appear
-/// verbatim in the re-rendered suffix.
+/// re-render, and assert the raw bytes are a byte prefix of the
+/// re-rendered suffix. This is what keeps the prefix cache (and its
+/// hash-keyed auto-tip) valid across tool turns — including the
+/// Qwen3.6 XML-ish shape the pre-dialect parser couldn't re-ingest
+/// (the old `<function=` skip is exactly what #29/#30 Phase E
+/// removed).
 ///
 /// One inference call so the bytes we're comparing against are
 /// deterministically the same bytes that got parsed — no seed /
@@ -296,32 +302,15 @@ fn grammar_violation_on_truncated_tool_call() {
 #[test]
 #[ignore = "requires model"]
 fn complete_text_round_trips_through_parse_and_render() {
-    use drama_llama::{parse_completion, AssistantMessage};
+    use drama_llama::AssistantMessage;
 
     let prompt = strawberry_turn_1_prompt();
-    let tool_opts = cogito_tool_choice_opts();
-
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
             .quiet()
-            .with_tool_choice_opts(tool_opts)
             .with_max_tokens(NonZeroUsize::new(256).unwrap());
-
-    let raw = session.complete_text(&prompt).expect("complete_text");
-
-    // Parse the same bytes into blocks → AssistantMessage.
-    let blocks = parse_completion(&raw);
-    assert!(!blocks.is_empty(), "parser dropped the output: {raw:?}");
-    let assistant: AssistantMessage = blocks.into_iter().collect();
-
-    // Build a follow-up prompt with the assistant turn appended, and
-    // render both versions via the same template that drove
-    // inference. Tool choice is cleared so the assistant turn is
-    // final, not forcing another call.
-    let mut follow_up = prompt.clone();
-    follow_up.messages.push(assistant.into());
-    follow_up.tool_choice = None;
+    println!("=== dialect ===\n{:#?}\n===", session.dialect());
 
     let render_opts = RenderOptions::default()
         .with_generation_prompt(true)
@@ -330,6 +319,31 @@ fn complete_text_round_trips_through_parse_and_render() {
         .template()
         .render_with(&prompt, &render_opts)
         .expect("render original");
+    let reasoning_open = session.dialect().reasoning.start.trim().to_owned();
+    let pre_opened = !reasoning_open.is_empty()
+        && rendered_original
+            .trim_end()
+            .ends_with(reasoning_open.as_str());
+
+    let raw = session.complete_text(&prompt).expect("complete_text");
+    println!("=== raw emission ===\n{raw}\n===");
+
+    // Parse the same bytes the way `Session::complete*` do.
+    let blocks = parse_with_dialect(&session, &prompt, &raw, pre_opened);
+    assert!(!blocks.is_empty(), "parser dropped the output: {raw:?}");
+    assert!(
+        blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })),
+        "Method tool_choice must parse to a ToolUse block; got {blocks:?}"
+    );
+    let assistant: AssistantMessage = blocks.into_iter().collect();
+
+    // Build a follow-up prompt with the assistant turn appended, and
+    // render via the same template that drove inference. Tool choice
+    // is cleared so the assistant turn is final, not forcing another
+    // call.
+    let mut follow_up = prompt.clone();
+    follow_up.messages.push(assistant.into());
+    follow_up.tool_choice = None;
     let rendered_follow_up = session
         .template()
         .render_with(
@@ -350,72 +364,169 @@ fn complete_text_round_trips_through_parse_and_render() {
             )
         });
 
-    // Templates that re-render tool calls in the Qwen3.5/3.6 XML-ish
-    // shape (`<function=...>`) emit bytes `parse_completion` cannot
-    // yet re-ingest, so block-level round-trip is genuinely
-    // unsupported there until the shape lands
-    // (https://github.com/mdegans/drama_llama/issues/29). Skip the
-    // comparison rather than assert what the template family cannot
-    // satisfy.
-    if suffix.contains("<function=") {
-        eprintln!(
-            "skipping block comparison: template re-renders tool calls \
-             in the XML-ish shape (issue #29). suffix:\n{suffix}"
-        );
-        return;
-    }
-
-    // Block-level (not byte-level) lossless round-trip: re-parsing
-    // the template's re-rendered output must yield the same blocks
-    // we parsed from the raw model output. Byte-level equality is
-    // impossible because Jinja's `tojson` filter canonicalizes JSON
-    // (compact + alphabetized), losing any intra-JSON whitespace the
-    // model emitted.
-    let raw_blocks = parse_completion(&raw);
-    // Strip the template's trailing <|im_end|>\n footer before
-    // reparsing, since our parser treats it as prose.
-    let suffix_trimmed =
-        suffix.trim_end_matches('\n').trim_end_matches("<|im_end|>");
-    let suffix_blocks = parse_completion(suffix_trimmed);
-
-    // Empty thought blocks are template framing, not content: Qwen3.6
-    // injects `<think>\n\n</think>` into re-rendered assistant turns
-    // even when the model emitted no reasoning. Drop them on both
-    // sides before comparing.
-    let not_framing = |b: &&Block| !matches!(b, Block::Thought { thought, .. } if thought.trim().is_empty());
-    let raw_blocks: Vec<&Block> =
-        raw_blocks.iter().filter(not_framing).collect();
-    let suffix_blocks: Vec<&Block> =
-        suffix_blocks.iter().filter(not_framing).collect();
-
-    assert_eq!(
-        raw_blocks.len(),
-        suffix_blocks.len(),
-        "block count mismatch: raw has {}, suffix has {}",
-        raw_blocks.len(),
-        suffix_blocks.len()
+    // The invariant itself. `complete_text` trims the EOS piece and
+    // trailing whitespace, so `raw` is a (possibly shortened) prefix
+    // of the true emission — `starts_with` is exactly the right
+    // comparison. If this fails, emitter and template have drifted:
+    // the canonicalization gate in `Session::run_call` will keep the
+    // cache safe (by skipping the auto-tip), but every tool turn
+    // pays a re-prefill — fix the dialect, don't relax the assert.
+    assert!(
+        suffix.starts_with(&raw),
+        "emission is not a byte prefix of the canonical re-render.\n\
+         --- emission ---\n{raw}\n--- re-rendered suffix ---\n{suffix}"
     );
-    for (a, b) in raw_blocks.iter().zip(suffix_blocks.iter()) {
-        match (a, b) {
-            (Block::ToolUse { call: ca }, Block::ToolUse { call: cb }) => {
-                assert_eq!(ca.name, cb.name);
-                assert_eq!(
-                    ca.input, cb.input,
-                    "tool_use args diverged across round-trip"
+}
+
+/// #30 Phase E: under `Auto` (unforced) tool choice the model calls
+/// the tool in its **native** dialect — no system-prompt retcon, no
+/// forced-JSON off-distribution emission — via the lazy
+/// trigger-activated grammar, and the dialect parser re-ingests it.
+/// This is the unforced path issue #27 reported broken (Qwen XML
+/// calls came back as `Block::Text`).
+#[test]
+#[ignore = "requires model"]
+fn auto_tool_choice_parses_native_dialect_call() {
+    let mut prompt = strawberry_turn_1_prompt();
+    prompt.tool_choice = Some(ToolChoice::auto());
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_max_tokens(NonZeroUsize::new(1024).unwrap());
+
+    let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
+    println!("=== auto blocks ===\n{blocks:#?}\n===");
+
+    let call = blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::ToolUse { call } => Some(call),
+            _ => None,
+        })
+        .expect("unforced path must still parse the native tool call");
+    assert_eq!(call.name, "count_letters");
+    assert!(
+        call.input.get("letter").is_some()
+            && call.input.get("string").is_some(),
+        "arguments must coerce to typed JSON, got: {:?}",
+        call.input
+    );
+}
+
+/// #30 Phase E: reasoning works *under* an eager (Method-forced)
+/// grammar. Qwen-style templates pre-open `<think>\n` in the
+/// generation prompt; the grammar anchors on that tail
+/// (`Anchor::EagerThoughtPreOpened`) instead of demanding a fresh
+/// open tag, and the parser attributes the pre-close bytes to a
+/// `Thought` block. Before Phase A/E this combination force-EOS'd or
+/// mislabeled the reasoning.
+#[test]
+#[ignore = "requires model"]
+fn thinking_works_under_forced_tool_grammar() {
+    let prompt = strawberry_turn_1_prompt();
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_max_tokens(NonZeroUsize::new(1024).unwrap());
+
+    let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
+    println!("=== forced blocks ===\n{blocks:#?}\n===");
+
+    assert!(
+        blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })),
+        "Method tool_choice must produce a ToolUse block"
+    );
+    // Thought is model-dependent in principle, but a pre-opened
+    // `<think>` template makes some reasoning bytes all but
+    // guaranteed; the point is they parse as Thought, not Text.
+    if let Some(Block::Thought { thought, .. }) =
+        blocks.iter().find(|b| matches!(b, Block::Thought { .. }))
+    {
+        assert!(
+            !thought.trim().is_empty(),
+            "pre-opened reasoning parsed as an empty Thought"
+        );
+    }
+    assert!(
+        !blocks.iter().any(|b| matches!(
+            b,
+            Block::Text { text, .. } if text.contains("</think>")
+        )),
+        "reasoning close marker leaked into a Text block: {blocks:#?}"
+    );
+}
+
+/// #30 Phase E cache-stability: across a tool turn (call → result →
+/// follow-up) the prefix cache reuses KV state instead of
+/// re-prefilling from scratch. This only holds when emission,
+/// re-render, and parse agree byte-for-byte — i.e. the whole dialect
+/// pipeline is consistent. GPU wall-clock comparisons are done
+/// elsewhere; here we assert the accounting: turn 2 must report
+/// nonzero `cache_read_input_tokens`.
+#[test]
+#[ignore = "requires model"]
+fn prefix_cache_survives_tool_turn() {
+    use misanthropic::prompt::message::AssistantMessage;
+
+    let mut prompt = strawberry_turn_1_prompt();
+    // Breakpoint after the tools block anchors the front of the
+    // prompt; the auto-tip covers the generated turn.
+    if let Some(tools) = prompt.tools.as_mut() {
+        if let Some(def) = tools.first_mut() {
+            if let Some(tool) = def.as_method_mut() {
+                tool.cache_control = Some(
+                    misanthropic::prompt::message::CacheControl::ephemeral(),
                 );
             }
-            (
-                Block::Thought { thought: ta, .. },
-                Block::Thought { thought: tb, .. },
-            ) => {
-                assert_eq!(ta, tb);
-            }
-            // Text blocks may differ in trailing whitespace from
-            // template framing — that's fine, the semantics match.
-            (Block::Text { .. }, Block::Text { .. }) => {}
-            _ => panic!("block type mismatch: {a:?} vs {b:?}"),
         }
     }
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_prefix_cache(true)
+            .with_max_tokens(NonZeroUsize::new(1024).unwrap());
+
+    // Turn 1: forced call.
+    let blocks = session.complete_blocks(&prompt).expect("turn 1");
+    let call = blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::ToolUse { call } => Some(call.clone()),
+            _ => None,
+        })
+        .expect("turn 1 must produce a ToolUse block");
+
+    // Turn 2: append assistant turn + tool result, ask for prose.
+    let assistant: AssistantMessage = blocks.iter().cloned().collect();
+    prompt.messages.push(assistant.into());
+    prompt.messages.push(Message {
+        role: Role::User,
+        content: Content(vec![Block::ToolResult {
+            result: ToolResult {
+                tool_use_id: call.id.clone(),
+                content: Content::text("3"),
+                is_error: false,
+                cache_control: None,
+            },
+        }]),
+    });
+    prompt.tool_choice = None;
+
+    let out = session.complete_text(&prompt).expect("turn 2");
+    println!("=== turn 2 ===\n{out}\n===");
+    let read = session
+        .last_usage()
+        .cache_read_input_tokens
+        .unwrap_or_default();
+    assert!(
+        read > 0,
+        "turn 2 reused no prefix — emission/re-render drift broke the \
+         cache across the tool turn (usage: {:?})",
+        session.last_usage()
+    );
 }
 
 /// `complete_response_id` threads the caller-supplied UUID through to

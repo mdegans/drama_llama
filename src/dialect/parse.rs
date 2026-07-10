@@ -63,6 +63,155 @@ pub struct Parsed {
     pub status: ParseStatus,
 }
 
+/// Streaming adapter over [`parse_text`]: accumulate pieces, re-parse
+/// the whole text per tick, and diff against what has already been
+/// yielded. Structured blocks (thought, tool call) emerge whole when
+/// their close marker arrives; trailing prose streams incrementally
+/// as byte deltas, holding back any tail that could still grow into a
+/// dialect marker.
+///
+/// The diff is sound because of two properties of [`parse_text`] on a
+/// growing input: the parsed block *prefix* is stable (landmarks are
+/// found by forward scan; longer input never re-classifies earlier
+/// complete blocks), and a trailing `Text` block only ever grows by
+/// appending (partial structures are suppressed under
+/// [`Leniency::Streaming`], and degraded ones append). The regression
+/// tests below pin both.
+#[derive(Debug)]
+pub struct StreamParser {
+    syntax: CallSyntax,
+    tools: Vec<crate::Tool>,
+    pre_opened_reasoning: bool,
+    /// Full accumulated generation, re-parsed each tick.
+    text: String,
+    /// Leading parsed blocks already yielded in full.
+    stable_blocks: usize,
+    /// Bytes of `blocks[stable_blocks]` (a still-growing trailing
+    /// `Text`) already yielded as deltas.
+    text_bytes_emitted: usize,
+}
+
+impl StreamParser {
+    pub fn new(
+        syntax: CallSyntax,
+        tools: Vec<crate::Tool>,
+        pre_opened_reasoning: bool,
+    ) -> Self {
+        Self {
+            syntax,
+            tools,
+            pre_opened_reasoning,
+            text: String::new(),
+            stable_blocks: 0,
+            text_bytes_emitted: 0,
+        }
+    }
+
+    /// Feed one decoded piece; returns every block (or prose delta)
+    /// newly resolved by it.
+    pub fn push(&mut self, piece: &str) -> Vec<Block> {
+        self.text.push_str(piece);
+        self.reparse(Leniency::Streaming)
+    }
+
+    /// Flush at end of generation: partial trailing structures
+    /// degrade per [`Leniency::Final`] and held-back marker-prefix
+    /// bytes are released.
+    pub fn finish(&mut self) -> Vec<Block> {
+        self.reparse(Leniency::Final)
+    }
+
+    /// Longest tail of `text` that is a proper prefix of a dialect
+    /// marker the prose scanner could re-classify — the open
+    /// landmarks (call trigger, reasoning open) *and* the close
+    /// markers that trail a parsed call (`per_call_end`,
+    /// `section_end`: an incomplete close degrades to prose on this
+    /// tick and is consumed as marker on the next). These bytes must
+    /// be held back from prose deltas until disambiguated.
+    fn landmark_holdback(&self, text: &str) -> usize {
+        let tail = text.as_bytes();
+        let mut best = 0;
+        for marker in [
+            self.syntax.trigger(),
+            self.syntax.reasoning.start.trim(),
+            self.syntax.per_call_end.trim(),
+            self.syntax.section_end.trim(),
+        ] {
+            let m = marker.as_bytes();
+            for k in ((best + 1)..m.len()).rev() {
+                if k > tail.len() {
+                    continue;
+                }
+                if tail[tail.len() - k..] == m[..k] {
+                    best = k;
+                    break;
+                }
+            }
+        }
+        // Byte-wise prefix matches can only end mid-char for
+        // non-ASCII markers; widen until the cut is a boundary so the
+        // delta slice below stays valid UTF-8.
+        while best > 0 && !text.is_char_boundary(text.len() - best) {
+            best += 1;
+        }
+        best
+    }
+
+    fn reparse(&mut self, leniency: Leniency) -> Vec<Block> {
+        let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
+        let parsed = parse_text(
+            &self.syntax,
+            &tool_refs,
+            &self.text,
+            self.pre_opened_reasoning,
+            leniency,
+        );
+        let blocks = parsed.blocks;
+        let last = blocks.len().saturating_sub(1);
+        let mut out = Vec::new();
+        for (i, block) in blocks.into_iter().enumerate() {
+            if i < self.stable_blocks {
+                continue;
+            }
+            let open_tail = i == last && leniency == Leniency::Streaming;
+            match block {
+                Block::Text { text, .. } => {
+                    // Interior Text is final. Trailing Text may still
+                    // grow (or its tail may become a marker), so under
+                    // Streaming yield only the safe delta and keep the
+                    // block open; under Final flush it whole.
+                    let end = if open_tail {
+                        text.len() - self.landmark_holdback(&text)
+                    } else {
+                        text.len()
+                    };
+                    if end > self.text_bytes_emitted {
+                        out.push(
+                            text[self.text_bytes_emitted..end]
+                                .to_string()
+                                .into(),
+                        );
+                        self.text_bytes_emitted = end;
+                    }
+                    if !open_tail {
+                        self.stable_blocks = i + 1;
+                        self.text_bytes_emitted = 0;
+                    }
+                }
+                // Thought / ToolUse only materialize once their close
+                // marker has been consumed — they cannot change on a
+                // longer re-parse. Yield immediately.
+                other => {
+                    out.push(other);
+                    self.stable_blocks = i + 1;
+                    self.text_bytes_emitted = 0;
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Parse `text` (the full accumulated generation) into blocks per
 /// `syntax`.
 ///
@@ -1092,6 +1241,146 @@ mod tests {
                  emission: {emission:?}\ngrammar:\n{src}",
                 syntax.family
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // StreamParser: re-parse-per-tick diffing.
+    // -----------------------------------------------------------------
+
+    /// Collapse adjacent Text blocks so chunking granularity doesn't
+    /// affect comparisons (the stream deliberately fragments prose).
+    fn merge_text(blocks: Vec<Block>) -> Vec<Block> {
+        let mut out: Vec<Block> = Vec::new();
+        for block in blocks {
+            match (out.last_mut(), block) {
+                (
+                    Some(Block::Text { text: prev, .. }),
+                    Block::Text { text: new, .. },
+                ) => {
+                    let merged = format!("{prev}{new}");
+                    *prev = merged.into();
+                }
+                (_, block) => out.push(block),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn stream_prose_yields_per_push() {
+        let mut p =
+            StreamParser::new(CallSyntax::qwen_xml(), vec![tool("t")], false);
+        let a = p.push("Hello ");
+        assert_eq!(merge_text(a), vec![Block::from("Hello ".to_string())]);
+        let b = p.push("world");
+        assert_eq!(merge_text(b), vec![Block::from("world".to_string())]);
+        assert!(p.finish().is_empty());
+    }
+
+    /// A prose tail that could still grow into the call trigger is
+    /// held back until disambiguated — the streaming soundness
+    /// property (never yield bytes a longer parse might re-classify).
+    #[test]
+    fn stream_holds_back_trigger_prefix() {
+        let mut p =
+            StreamParser::new(CallSyntax::qwen_xml(), vec![tool("t")], false);
+        let a = p.push("hi <tool");
+        assert_eq!(
+            merge_text(a),
+            vec![Block::from("hi ".to_string())],
+            "`<tool` must be held back pending disambiguation"
+        );
+        let b = p.push("box");
+        assert_eq!(merge_text(b), vec![Block::from("<toolbox".to_string())]);
+    }
+
+    /// Held-back trigger-prefix bytes flush at finish when the marker
+    /// never completed.
+    #[test]
+    fn stream_flushes_holdback_at_finish() {
+        let mut p =
+            StreamParser::new(CallSyntax::qwen_xml(), vec![tool("t")], false);
+        let a = p.push("hi <tool");
+        assert_eq!(merge_text(a), vec![Block::from("hi ".to_string())]);
+        let b = p.finish();
+        assert_eq!(merge_text(b), vec![Block::from("<tool".to_string())]);
+    }
+
+    /// Pre-opened reasoning buffers until the close marker, then
+    /// yields one Thought — never Text (the #27 fix, streaming side).
+    #[test]
+    fn stream_pre_opened_thought_buffers_until_close() {
+        let mut p =
+            StreamParser::new(CallSyntax::qwen_xml(), vec![tool("t")], true);
+        assert!(p.push("planning...").is_empty());
+        let out = p.push("\n</think>\n\nHello");
+        assert_eq!(out.len(), 2, "expected Thought + Text, got {out:?}");
+        assert!(
+            matches!(&out[0], Block::Thought { thought, .. } if thought == "planning..."),
+            "got {out:?}"
+        );
+        assert!(matches!(&out[1], Block::Text { .. }));
+    }
+
+    /// Chunking invariance: for every chunk size, streaming a full
+    /// thought + prose + tool-call emission yields the same blocks as
+    /// one Final batch parse. Pins both diff properties (stable block
+    /// prefix, append-only trailing Text).
+    #[test]
+    fn stream_matches_batch_for_any_chunking() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let input = serde_json::json!({"city": "Paris", "days": 3});
+        let call =
+            render_reference(&syntax, &[("get_weather", &input)]).expect("ok");
+        let emission =
+            format!("<think>\nreason it out\n</think>\n\nSure thing.\n{call}");
+        let batch = merge_text(
+            parse_text(&syntax, &[&t], &emission, false, Leniency::Final)
+                .blocks,
+        );
+        for chunk in 1..=7usize {
+            let mut p =
+                StreamParser::new(syntax.clone(), vec![t.clone()], false);
+            let mut streamed = Vec::new();
+            let bytes = emission.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                let mut j = (i + chunk).min(bytes.len());
+                while !emission.is_char_boundary(j) {
+                    j += 1;
+                }
+                streamed.extend(p.push(&emission[i..j]));
+                i = j;
+            }
+            streamed.extend(p.finish());
+            let streamed = merge_text(streamed);
+            assert_eq!(
+                streamed.len(),
+                batch.len(),
+                "chunk={chunk}: {streamed:#?} vs {batch:#?}"
+            );
+            for (s, b) in streamed.iter().zip(batch.iter()) {
+                match (s, b) {
+                    (
+                        Block::Text { text: a, .. },
+                        Block::Text { text: c, .. },
+                    ) => assert_eq!(a, c, "chunk={chunk}"),
+                    (
+                        Block::Thought { thought: a, .. },
+                        Block::Thought { thought: c, .. },
+                    ) => assert_eq!(a, c, "chunk={chunk}"),
+                    (
+                        Block::ToolUse { call: a },
+                        Block::ToolUse { call: c },
+                    ) => {
+                        assert_eq!(a.name, c.name, "chunk={chunk}");
+                        assert_eq!(a.input, c.input, "chunk={chunk}");
+                    }
+                    other => panic!("chunk={chunk}: mismatch {other:?}"),
+                }
+            }
         }
     }
 }

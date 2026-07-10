@@ -36,12 +36,39 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
   #27 fix). Reconstruction harness green on all 6 fixtures.
   NOTE deliberate divergence: args emitted SORTED BY KEY (minijinja
   alphabetizes re-renders; also closes the duplicate-optional hole).
-- **Next: Phase E** — Session resolves dialect at from_path
-  (analyzer + sidecar + vocab cross-check), resolve_grammar + parse
-  path go through the dialect (replace BlockParser + tool_choice
-  hardcoding; deprecate ToolChoiceOptions), canonicalization check
-  via render_reference, blallama e2e on Qwen3.6 (GPU runs Mike's).
-  Close #27 + #29 when it lands.
+- **Phase E LANDED (code)** (2026-07-10, session 2, Fable): Session
+  owns `dialect: CallSyntax` — analyzed at `from_engine` (never
+  gates a load; `Family::None` fallback = hermes_json for enforcement
+  until Phase F), `<model>.dialect.toml` / `parent/dialect.toml`
+  sidecar override at `from_path*`, `with_dialect` builder,
+  `vocab_cross_check` advisory (outer markers must be single tokens;
+  suspects → tracing::debug). `resolve_grammar` goes through
+  `dialect::grammar_source` (Method/Any eager w/ pre-opened anchor;
+  Auto → lazy deferred on `syntax.trigger()`; parallel gated on
+  `!disable_parallel_tool_use && per_call_start non-empty` — section-
+  only dialects stay single-call). `BlockParser` DELETED
+  (`session/parse.rs` gone, exports removed); batch path parses once
+  via `parse_text(Final)`, streaming via new
+  `dialect::StreamParser` (re-parse-per-tick + prose byte-deltas;
+  holdback covers open AND close markers — a partial `</tool_call>`
+  degrading to prose then reclassifying was caught by the
+  chunking-invariance test). Canonicalization gate: tip_hash stored
+  only when `render_extended(prompt+blocks)` == rendered_prompt ++
+  raw emission (byte prefix); else LCP-only fallback.
+  `ToolChoiceOptions`/`with_tool_choice_opts` deprecated (shim maps
+  to CallSyntax). `SessionError::Dialect` added. All non-ignored
+  tests green (294 lib + integration), fmt clean.
+- **Phase E remaining (Mike, GPU)**: run the new `#[ignore]` e2e in
+  `tests/session.rs` on Qwen3.6 —
+  `auto_tool_choice_parses_native_dialect_call`,
+  `thinking_works_under_forced_tool_grammar`,
+  `prefix_cache_survives_tool_turn`,
+  `complete_text_round_trips_through_parse_and_render` (now asserts
+  byte-prefix reconstruction; the old `<function=` skip is gone).
+  `cargo test --test session --features serde,toml -- --ignored`.
+  Close #27 + #29 after they pass. Note behavior change: streaming
+  yields reasoning as one `Thought` on close (pre-#27 it streamed
+  mislabeled as `Text`); thought-delta streaming is #26 territory.
 - Gemma 4 + gpt-oss GGUFs downloaded to `models/`. NOTE: it's Gemma
   **4** (not 3) — llama.cpp gives it a hand-built handler, so Phase F
   may become "native weird template" rather than (or in addition to)
