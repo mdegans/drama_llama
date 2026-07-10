@@ -134,6 +134,11 @@ impl StreamParser {
         for marker in [
             self.syntax.trigger(),
             self.syntax.reasoning.start.trim(),
+            // The close marker matters on its own for dialects where
+            // a stray close terminates content (Gemma channels), and
+            // the turn-exit marker is swallowed as envelope.
+            self.syntax.reasoning.end.trim(),
+            self.syntax.tool_response_start.trim(),
             self.syntax.per_call_end.trim(),
             self.syntax.section_end.trim(),
         ] {
@@ -300,6 +305,12 @@ impl<'a> Parser<'a> {
     }
 
     fn push_thought(&mut self, body: &str) {
+        // Empty thoughts carry no signal and some dialects emit them
+        // as pure noise (Gemma 4's pre-closed / trailing channel
+        // blocks) — drop rather than surface an empty block.
+        if body.is_empty() {
+            return;
+        }
         self.blocks.push(Block::Thought {
             thought: body.to_string().into(),
             signature: Cow::Borrowed(""),
@@ -357,6 +368,22 @@ impl<'a> Parser<'a> {
 
         let trigger = self.syntax.trigger().to_string();
         let reasoning_start = self.syntax.reasoning.start.trim().to_string();
+        // Gemma-style channel noise (TagWithDict): the reasoning open
+        // marker has the shape `<open>thought`, and the model may emit
+        // a bare `<open>` (an empty/other channel) or an unmatched
+        // close as pure noise around content. Both are consumed
+        // silently, upstream parity (`consume_empty_channels` and
+        // "stop at the first unmatched close" in
+        // `common_chat_params_init_gemma4`).
+        let channel_open = (self.syntax.family == Family::TagWithDict)
+            .then(|| reasoning_start.strip_suffix("thought"))
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let channel_close = channel_open
+            .is_some()
+            .then(|| self.syntax.reasoning.end.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         while self.pos < self.text.len() {
             // Next structural landmark: reasoning open or call
@@ -367,6 +394,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+
             let trigger_at = if trigger.is_empty() {
                 // Bare JSON-native dialects have no marker trigger:
                 // the JSON opener itself is the call landmark. A
@@ -380,6 +408,68 @@ impl<'a> Parser<'a> {
             } else {
                 rest.find(trigger.as_str())
             };
+
+            // Channel noise strictly before the next thought / call
+            // landmark is consumed first. A bare open is only *noise*
+            // when it is not the thought open itself: the open marker
+            // is a prefix of the thought marker, so `open_at ≤
+            // think_at` always, with equality meaning "this IS the
+            // thought open".
+            if let Some(open) = &channel_open {
+                let before_structs = |&p: &usize| {
+                    think_at.is_none_or(|t| p < t)
+                        && trigger_at.is_none_or(|t| p < t)
+                };
+                let open_at = rest
+                    .find(open.as_str())
+                    .filter(|&o| think_at != Some(o))
+                    .filter(before_structs);
+                let close_at = channel_close
+                    .as_deref()
+                    .and_then(|c| rest.find(c))
+                    .filter(before_structs)
+                    .filter(|&c| open_at.is_none_or(|o| c < o));
+                if let Some(c) = close_at {
+                    let prose = rest[..c].to_string();
+                    self.push_text(&prose);
+                    self.pos += c + channel_close.as_deref().unwrap().len();
+                    continue;
+                }
+                if let Some(o) = open_at {
+                    let prose = rest[..o].to_string();
+                    self.push_text(&prose);
+                    self.pos += o;
+                    let after = self.pos + open.len();
+                    let tail = &self.text[after..];
+                    // The bytes after the open could still grow into
+                    // `thought` — don't classify as noise yet.
+                    if tail.is_empty() || "thought".starts_with(tail) {
+                        self.incomplete(self.pos);
+                        return;
+                    }
+                    self.pos = after;
+                    continue;
+                }
+            }
+
+            // Turn-exit marker (`tool_response_start`, e.g. Gemma's
+            // `<|tool_response>`): envelope framing the grammar
+            // requires after the last call — swallow it silently
+            // wherever it appears outside a call; it is never
+            // content.
+            let exit = &self.syntax.tool_response_start;
+            if !exit.is_empty() {
+                let exit_at = rest.find(exit.as_str()).filter(|&p| {
+                    think_at.is_none_or(|t| p < t)
+                        && trigger_at.is_none_or(|t| p < t)
+                });
+                if let Some(p) = exit_at {
+                    let prose = rest[..p].to_string();
+                    self.push_text(&prose);
+                    self.pos += p + exit.len();
+                    continue;
+                }
+            }
 
             match (think_at, trigger_at) {
                 (Some(t), None) => {
@@ -521,6 +611,7 @@ impl<'a> Parser<'a> {
             Family::TagWithTagged => self.parse_tagged_call(),
             Family::TagWithJson => self.parse_tag_json_call(),
             Family::JsonNative => self.parse_json_native_call(),
+            Family::TagWithDict => self.parse_dict_call(),
             Family::None => CallOutcome::Malformed,
         }
     }
@@ -644,6 +735,208 @@ impl<'a> Parser<'a> {
         Value::String(raw.to_string())
     }
 
+    /// TAG_WITH_DICT (Gemma 4): `call:name{key:value,…}` after the
+    /// per-call opener. Values are dict-encoded (bare keys, quote-
+    /// marked strings); the recursive reader coerces them straight to
+    /// JSON.
+    fn parse_dict_call(&mut self) -> CallOutcome {
+        let f = &self.syntax.function;
+        if !self.eat(&f.name_prefix.clone()) {
+            return if self.rest().is_empty()
+                || f.name_prefix.starts_with(self.rest())
+            {
+                CallOutcome::Incomplete
+            } else {
+                CallOutcome::Malformed
+            };
+        }
+        let args_open = if self.syntax.arguments.start.is_empty() {
+            "{"
+        } else {
+            &self.syntax.arguments.start
+        }
+        .to_string();
+        let Some(name_end) = self.rest().find(&args_open) else {
+            return if self.rest().len() > 256 {
+                CallOutcome::Malformed
+            } else {
+                CallOutcome::Incomplete
+            };
+        };
+        let name = self.rest()[..name_end].to_string();
+        if name.is_empty() || name.len() > 256 {
+            return CallOutcome::Malformed;
+        }
+        // Leave the opening brace for the value reader.
+        self.pos += name_end;
+
+        match self.parse_dict_value() {
+            DictOutcome::Value(input) => {
+                self.push_call(name, input);
+                CallOutcome::Parsed
+            }
+            DictOutcome::Incomplete => CallOutcome::Incomplete,
+            DictOutcome::Malformed => CallOutcome::Malformed,
+        }
+    }
+
+    /// Read one dict-encoded value at `pos` (whitespace-lenient like
+    /// upstream's PEG; canonical output is compact).
+    fn parse_dict_value(&mut self) -> DictOutcome {
+        self.skip_ws();
+        let quote = self.syntax.arguments.string_quote.clone();
+        let rest = self.rest();
+
+        if rest.is_empty() {
+            return DictOutcome::Incomplete;
+        }
+        if !quote.is_empty()
+            && (rest.starts_with(&quote) || quote.starts_with(rest))
+        {
+            if !self.eat(&quote) {
+                return DictOutcome::Incomplete;
+            }
+            let Some(end) = self.rest().find(&quote) else {
+                return DictOutcome::Incomplete;
+            };
+            let s = self.rest()[..end].to_string();
+            self.pos += end + quote.len();
+            return DictOutcome::Value(Value::String(s));
+        }
+        match rest.as_bytes()[0] {
+            b'{' => self.parse_dict_object(),
+            b'[' => self.parse_dict_array(),
+            _ => self.parse_dict_scalar(),
+        }
+    }
+
+    fn parse_dict_object(&mut self) -> DictOutcome {
+        debug_assert!(self.eat("{"));
+        let mut map = serde_json::Map::new();
+        loop {
+            self.skip_ws();
+            if self.eat("}") {
+                return DictOutcome::Value(Value::Object(map));
+            }
+            if self.rest().is_empty() {
+                return DictOutcome::Incomplete;
+            }
+            // Bare key up to `:` (grammar parity: `[^:}]+`).
+            let Some(colon) = self.rest().find([':', '}']) else {
+                return DictOutcome::Incomplete;
+            };
+            if self.rest().as_bytes()[colon] == b'}' {
+                return DictOutcome::Malformed;
+            }
+            let key = self.rest()[..colon].trim().to_string();
+            if key.is_empty() {
+                return DictOutcome::Malformed;
+            }
+            self.pos += colon + 1;
+            let value = match self.parse_dict_value() {
+                DictOutcome::Value(v) => v,
+                other => return other,
+            };
+            map.insert(key, value);
+            self.skip_ws();
+            if self.eat(",") {
+                continue;
+            }
+            if self.eat("}") {
+                return DictOutcome::Value(Value::Object(map));
+            }
+            return if self.rest().is_empty() {
+                DictOutcome::Incomplete
+            } else {
+                DictOutcome::Malformed
+            };
+        }
+    }
+
+    fn parse_dict_array(&mut self) -> DictOutcome {
+        debug_assert!(self.eat("["));
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.eat("]") {
+                return DictOutcome::Value(Value::Array(items));
+            }
+            if self.rest().is_empty() {
+                return DictOutcome::Incomplete;
+            }
+            let value = match self.parse_dict_value() {
+                DictOutcome::Value(v) => v,
+                other => return other,
+            };
+            items.push(value);
+            self.skip_ws();
+            if self.eat(",") {
+                continue;
+            }
+            if self.eat("]") {
+                return DictOutcome::Value(Value::Array(items));
+            }
+            return if self.rest().is_empty() {
+                DictOutcome::Incomplete
+            } else {
+                DictOutcome::Malformed
+            };
+        }
+    }
+
+    /// Literals and numbers. `none`/`None` are minijinja/pythonic
+    /// null spellings (our re-render canonicalizes to `none`).
+    fn parse_dict_scalar(&mut self) -> DictOutcome {
+        let rest = self.rest();
+        let boundary = |s: &str| {
+            !s.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        for (lit, value) in [
+            ("true", Value::Bool(true)),
+            ("false", Value::Bool(false)),
+            ("null", Value::Null),
+            ("none", Value::Null),
+            ("None", Value::Null),
+        ] {
+            if let Some(after) = rest.strip_prefix(lit) {
+                if boundary(after) {
+                    self.pos += lit.len();
+                    return DictOutcome::Value(value);
+                }
+            }
+            // Trailing partial literal: could still complete.
+            if lit.starts_with(rest) {
+                return DictOutcome::Incomplete;
+            }
+        }
+        let len = rest
+            .find(|c: char| {
+                !matches!(c, '0'..='9' | '-' | '+' | '.' | 'e' | 'E')
+            })
+            .unwrap_or(rest.len());
+        if len == 0 {
+            return DictOutcome::Malformed;
+        }
+        // A number at end-of-input could still grow more digits.
+        if len == rest.len() && self.leniency == Leniency::Streaming {
+            return DictOutcome::Incomplete;
+        }
+        match serde_json::from_str::<Value>(&rest[..len]) {
+            Ok(v @ Value::Number(_)) => {
+                self.pos += len;
+                DictOutcome::Value(v)
+            }
+            _ => DictOutcome::Malformed,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        let ws = self.rest().len() - self.rest().trim_start().len();
+        self.pos += ws;
+    }
+
     fn parse_tag_json_call(&mut self) -> CallOutcome {
         let f = &self.syntax.function;
         if !self.eat(&f.name_prefix.clone()) {
@@ -761,6 +1054,13 @@ impl<'a> Parser<'a> {
 
 enum CallOutcome {
     Parsed,
+    Incomplete,
+    Malformed,
+}
+
+/// Outcome of reading one dict-encoded value.
+enum DictOutcome {
+    Value(Value),
     Incomplete,
     Malformed,
 }
@@ -945,6 +1245,7 @@ mod tests {
     use super::*;
     use crate::dialect::DialectError;
     use crate::dialect::{render_reference, validate_representable};
+    use serde_json::json;
 
     fn tool(name: &'static str) -> Tool {
         Tool::builder(name)
@@ -987,6 +1288,7 @@ mod tests {
             CallSyntax::qwen_xml(),
             CallSyntax::hermes_json(),
             CallSyntax::llama31_json(),
+            CallSyntax::gemma4(),
         ] {
             let emission =
                 render_reference(&syntax, &[("get_weather", &input)])
@@ -1217,10 +1519,16 @@ mod tests {
             CallSyntax::qwen_xml(),
             CallSyntax::hermes_json(),
             CallSyntax::llama31_json(),
+            CallSyntax::gemma4(),
         ] {
+            // The grammar additionally requires the turn-exit marker
+            // when the dialect has one (Gemma's `<|tool_response>`);
+            // it is turn framing, not call bytes, so render_reference
+            // doesn't include it.
             let emission =
                 render_reference(&syntax, &[("get_weather", &input)])
-                    .expect("representable");
+                    .expect("representable")
+                    + &syntax.tool_response_start;
             let src = grammar_source(
                 &syntax,
                 &[&t],
@@ -1241,6 +1549,391 @@ mod tests {
                  emission: {emission:?}\ngrammar:\n{src}",
                 syntax.family
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Gemma 4 (TagWithDict): upstream test-matrix port
+    // (llama.cpp tests/test-chat.cpp, "Google Gemma 4" section).
+    // -----------------------------------------------------------------
+
+    /// One parse; asserts exactly one call and returns its input.
+    fn gemma_call(text: &str) -> (String, Value) {
+        let syntax = CallSyntax::gemma4();
+        let t = tool("t");
+        let parsed = parse_text(&syntax, &[&t], text, false, Leniency::Final);
+        let calls = calls_of(&parsed.blocks);
+        assert_eq!(calls.len(), 1, "{text:?} → {:#?}", parsed.blocks);
+        (calls[0].0.to_string(), calls[0].1.clone())
+    }
+
+    /// The value-type matrix, byte-for-byte from upstream's pins.
+    #[test]
+    fn gemma4_value_types() {
+        for (text, name, want) in [
+            (
+                r#"<|tool_call>call:get_time{city:<|"|>London<|"|>}<tool_call|>"#,
+                "get_time",
+                json!({"city": "London"}),
+            ),
+            (
+                r#"<|tool_call>call:get_time{city:<|"|>San Francisco<|"|>}<tool_call|>"#,
+                "get_time",
+                json!({"city": "San Francisco"}),
+            ),
+            (
+                "<|tool_call>call:empty_args{}<tool_call|>",
+                "empty_args",
+                json!({}),
+            ),
+            (
+                "<|tool_call>call:special_function{arg1:42}<tool_call|>",
+                "special_function",
+                json!({"arg1": 42}),
+            ),
+            (
+                "<|tool_call>call:special_function{arg1:-7}<tool_call|>",
+                "special_function",
+                json!({"arg1": -7}),
+            ),
+            (
+                "<|tool_call>call:amount{orig:3.14}<tool_call|>",
+                "amount",
+                json!({"orig": 3.14}),
+            ),
+            (
+                "<|tool_call>call:amount{orig:1.5e10}<tool_call|>",
+                "amount",
+                json!({"orig": 1.5e10}),
+            ),
+            (
+                "<|tool_call>call:toggle{enabled:true}<tool_call|>",
+                "toggle",
+                json!({"enabled": true}),
+            ),
+            (
+                "<|tool_call>call:toggle{enabled:false}<tool_call|>",
+                "toggle",
+                json!({"enabled": false}),
+            ),
+            (
+                "<|tool_call>call:set_nullable{value:null}<tool_call|>",
+                "set_nullable",
+                json!({"value": null}),
+            ),
+            // minijinja's canonical null spelling (what a re-rendered
+            // turn contains).
+            (
+                "<|tool_call>call:set_nullable{value:none}<tool_call|>",
+                "set_nullable",
+                json!({"value": null}),
+            ),
+            (
+                r#"<|tool_call>call:todo_list{todos:[<|"|>buy milk<|"|>,<|"|>walk dog<|"|>]}<tool_call|>"#,
+                "todo_list",
+                json!({"todos": ["buy milk", "walk dog"]}),
+            ),
+            (
+                "<|tool_call>call:todo_list{todos:[]}<tool_call|>",
+                "todo_list",
+                json!({"todos": []}),
+            ),
+            (
+                r#"<|tool_call>call:set_config{config:{theme:<|"|>dark<|"|>,count:3}}<tool_call|>"#,
+                "set_config",
+                json!({"config": {"theme": "dark", "count": 3}}),
+            ),
+            (
+                "<|tool_call>call:set_config{config:{}}<tool_call|>",
+                "set_config",
+                json!({"config": {}}),
+            ),
+        ] {
+            let (got_name, got) = gemma_call(text);
+            assert_eq!(got_name, name, "{text:?}");
+            assert_eq!(got, want, "{text:?}");
+        }
+    }
+
+    /// Content and parallel calls around the dict envelope.
+    #[test]
+    fn gemma4_content_and_parallel() {
+        let syntax = CallSyntax::gemma4();
+        let t = tool("t");
+
+        let text = "Hello, world!\nWhat's up?<|tool_call>call:get_time\
+                    {city:<|\"|>Paris<|\"|>}<tool_call|>";
+        let parsed = parse_text(&syntax, &[&t], text, false, Leniency::Final);
+        assert!(
+            matches!(&parsed.blocks[0], Block::Text { text, .. }
+                if text.as_ref() == "Hello, world!\nWhat's up?"),
+            "{:#?}",
+            parsed.blocks
+        );
+        assert_eq!(calls_of(&parsed.blocks).len(), 1);
+
+        let text = "<|tool_call>call:get_time{city:<|\"|>London<|\"|>}\
+                    <tool_call|><|tool_call>call:get_weather\
+                    {city:<|\"|>Paris<|\"|>}<tool_call|>";
+        let parsed = parse_text(&syntax, &[&t], text, false, Leniency::Final);
+        let calls = calls_of(&parsed.blocks);
+        assert_eq!(calls.len(), 2, "{:#?}", parsed.blocks);
+        assert_eq!(calls[0].0, "get_time");
+        assert_eq!(calls[1].0, "get_weather");
+        assert_eq!(calls[1].1["city"], json!("Paris"));
+    }
+
+    /// The turn-exit marker (`<|tool_response>`) that the grammar
+    /// requires after the last call is envelope, not content: the
+    /// parser swallows it, whole and under any chunking.
+    #[test]
+    fn gemma4_turn_exit_marker_is_swallowed() {
+        let syntax = CallSyntax::gemma4();
+        let t = tool("t");
+        let text = "Okay.<|tool_call>call:get_time{city:<|\"|>Paris<|\"|>}\
+                    <tool_call|><|tool_response>";
+        let parsed = parse_text(&syntax, &[&t], text, false, Leniency::Final);
+        assert_eq!(calls_of(&parsed.blocks).len(), 1, "{:#?}", parsed.blocks);
+        assert!(
+            !parsed.blocks.iter().any(|b| matches!(
+                b,
+                Block::Text { text, .. } if text.contains("tool_response")
+            )),
+            "exit marker leaked into Text: {:#?}",
+            parsed.blocks
+        );
+
+        // Streaming: the marker (and any prefix of it) never surfaces
+        // as a prose delta.
+        for chunk in 1..=5usize {
+            let mut p =
+                StreamParser::new(syntax.clone(), vec![t.clone()], false);
+            let mut streamed = Vec::new();
+            let mut i = 0;
+            while i < text.len() {
+                let mut j = (i + chunk).min(text.len());
+                while !text.is_char_boundary(j) {
+                    j += 1;
+                }
+                streamed.extend(p.push(&text[i..j]));
+                i = j;
+            }
+            streamed.extend(p.finish());
+            let prose: String = streamed
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(prose, "Okay.", "chunk={chunk}: {streamed:#?}");
+        }
+    }
+
+    /// Channel-noise matrix: empty thoughts drop, unmatched closes
+    /// and bare channel opens are consumed silently (upstream edge
+    /// cases, `test-chat.cpp` "Edge cases").
+    #[test]
+    fn gemma4_channel_noise() {
+        let syntax = CallSyntax::gemma4();
+        let t = tool("t");
+        let content = "Hello, world!\nWhat's up?";
+
+        for (text, want_thought) in [
+            // Reasoning and content.
+            (
+                "<|channel>thought\nI'm\nthinking<channel|>Hello, world!\nWhat's up?",
+                Some("I'm\nthinking"),
+            ),
+            // Empty reasoning (budget=0: close before newline).
+            ("<|channel>thought<channel|>Hello, world!\nWhat's up?", None),
+            // Empty thought + trailing unmatched close.
+            (
+                "<|channel>thought\n<channel|>Hello, world!\nWhat's up?<channel|>",
+                None,
+            ),
+            // Trailing empty thought block after content.
+            (
+                "<|channel>thought\n<channel|>Hello, world!\nWhat's up?<|channel>thought\n<channel|>",
+                None,
+            ),
+            // ... plus a stray close on top.
+            (
+                "<|channel>thought\n<channel|>Hello, world!\nWhat's up?<|channel>thought\n<channel|><channel|>",
+                None,
+            ),
+            // Bare channel open before the real thought.
+            (
+                "<|channel><|channel>thought\nI'm\nthinking<channel|>Hello, world!\nWhat's up?",
+                Some("I'm\nthinking"),
+            ),
+        ] {
+            let parsed =
+                parse_text(&syntax, &[&t], text, false, Leniency::Final);
+            let blocks = merge_text(parsed.blocks);
+            let mut expect: Vec<Block> = Vec::new();
+            if let Some(thought) = want_thought {
+                expect.push(Block::Thought {
+                    thought: thought.to_string().into(),
+                    signature: std::borrow::Cow::Borrowed(""),
+                });
+            }
+            expect.push(content.to_string().into());
+            assert_eq!(blocks.len(), expect.len(), "{text:?}: {blocks:#?}");
+            for (got, want) in blocks.iter().zip(expect.iter()) {
+                match (got, want) {
+                    (
+                        Block::Text { text: a, .. },
+                        Block::Text { text: b, .. },
+                    ) => assert_eq!(a, b, "{text:?}"),
+                    (
+                        Block::Thought { thought: a, .. },
+                        Block::Thought { thought: b, .. },
+                    ) => assert_eq!(a, b, "{text:?}"),
+                    other => panic!("{text:?}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Unrepresentable dict values: the quote marker in a string (or
+    /// key) is a typed error at render/validate time; dict
+    /// terminators in keys likewise. Values containing OTHER markers
+    /// (per-call close, braces) round-trip fine inside quotes.
+    #[test]
+    fn gemma4_adversarial_values() {
+        let syntax = CallSyntax::gemma4();
+        let t = tool("get_weather");
+
+        for value in [
+            "trailing newline\n",
+            "{\"looks\": \"like json\"}",
+            "emoji 🍓 and 中文",
+            "a <tool_call|> inside",
+            "braces { } and commas , and colons :",
+        ] {
+            let input = json!({"city": value, "days": 1});
+            let emission =
+                render_reference(&syntax, &[("get_weather", &input)])
+                    .expect("representable");
+            let parsed =
+                parse_text(&syntax, &[&t], &emission, false, Leniency::Final);
+            let calls = calls_of(&parsed.blocks);
+            assert_eq!(calls.len(), 1, "value {value:?}: {parsed:#?}");
+            assert_eq!(
+                calls[0].1["city"],
+                json!(value),
+                "value {value:?} must round-trip byte-exact"
+            );
+        }
+
+        // Quote marker embedded in a string value: typed error.
+        let evil = json!({"city": "sneaky <|\"|> injection", "days": 1});
+        let err = render_reference(&syntax, &[("get_weather", &evil)])
+            .expect_err("unrepresentable");
+        assert!(matches!(err, DialectError::UnrepresentableValue { .. }));
+        // ... nested inside a container too.
+        let evil = json!({"city": "x", "days": 1,
+            "extra": {"inner": ["fine", "<|\"|>"]}});
+        assert!(validate_representable(&syntax, "get_weather", &evil).is_err());
+        // Dict terminators in keys.
+        let evil = json!({"bad:key": 1});
+        assert!(validate_representable(&syntax, "t", &evil).is_err());
+    }
+
+    /// Streaming chunking invariance for the Gemma envelope,
+    /// including channel noise around the thought.
+    #[test]
+    fn gemma4_stream_matches_batch_for_any_chunking() {
+        let syntax = CallSyntax::gemma4();
+        let t = tool("get_weather");
+        let input = json!({"city": "Paris", "days": 3});
+        let call =
+            render_reference(&syntax, &[("get_weather", &input)]).expect("ok");
+        let emission = format!(
+            "<|channel><|channel>thought\nreason it out\n<channel|>\
+             Sure thing.<channel|>{call}"
+        );
+        let batch = merge_text(
+            parse_text(&syntax, &[&t], &emission, false, Leniency::Final)
+                .blocks,
+        );
+        for chunk in 1..=7usize {
+            let mut p =
+                StreamParser::new(syntax.clone(), vec![t.clone()], false);
+            let mut streamed = Vec::new();
+            let bytes = emission.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                let mut j = (i + chunk).min(bytes.len());
+                while !emission.is_char_boundary(j) {
+                    j += 1;
+                }
+                streamed.extend(p.push(&emission[i..j]));
+                i = j;
+            }
+            streamed.extend(p.finish());
+            let streamed = merge_text(streamed);
+            assert_eq!(
+                streamed.len(),
+                batch.len(),
+                "chunk={chunk}: {streamed:#?} vs {batch:#?}"
+            );
+            for (s, b) in streamed.iter().zip(batch.iter()) {
+                match (s, b) {
+                    (
+                        Block::Text { text: a, .. },
+                        Block::Text { text: c, .. },
+                    ) => assert_eq!(a, c, "chunk={chunk}"),
+                    (
+                        Block::Thought { thought: a, .. },
+                        Block::Thought { thought: c, .. },
+                    ) => assert_eq!(a, c, "chunk={chunk}"),
+                    (
+                        Block::ToolUse { call: a },
+                        Block::ToolUse { call: c },
+                    ) => {
+                        assert_eq!(a.name, c.name, "chunk={chunk}");
+                        assert_eq!(a.input, c.input, "chunk={chunk}");
+                    }
+                    other => panic!("chunk={chunk}: mismatch {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Prefix-chop atomicity for the dict family (mirrors
+    /// `streaming_prefixes_are_atomic`).
+    #[test]
+    fn gemma4_streaming_prefixes_are_atomic() {
+        let syntax = CallSyntax::gemma4();
+        let t = tool("get_weather");
+        let input = json!({"city": "Paris", "days": 3, "detail": "x"});
+        let mut full =
+            String::from("<|channel>thought\nhm\n<channel|>Calling.");
+        full.push_str(
+            &render_reference(&syntax, &[("get_weather", &input)]).unwrap(),
+        );
+        let parsed = parse_text(&syntax, &[&t], &full, false, Leniency::Final);
+        assert_eq!(parsed.status, ParseStatus::Complete, "{parsed:#?}");
+        assert_eq!(calls_of(&parsed.blocks).len(), 1);
+        for i in 0..=full.len() {
+            if !full.is_char_boundary(i) {
+                continue;
+            }
+            let parsed = parse_text(
+                &syntax,
+                &[&t],
+                &full[..i],
+                false,
+                Leniency::Streaming,
+            );
+            let calls = calls_of(&parsed.blocks);
+            assert!(calls.len() <= 1, "prefix {i}: {:#?}", parsed.blocks);
+            if let Some((name, input_got)) = calls.first() {
+                assert_eq!(*name, "get_weather", "prefix {i}");
+                assert_eq!(*input_got, &input, "prefix {i}");
+            }
         }
     }
 

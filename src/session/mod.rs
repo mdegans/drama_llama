@@ -546,6 +546,7 @@ fn call_syntax_from_tool_choice_opts(
             mode: ReasoningMode::TagBased,
             start: "<think>".into(),
             end: "</think>".into(),
+            ..ReasoningSyntax::default()
         };
     }
     syntax
@@ -824,6 +825,7 @@ impl<B: Backend> Session<B> {
     pub fn from_engine(engine: Engine<B>) -> Result<Self, SessionError> {
         let template = ChatTemplate::from_model(&engine.model)?;
         let dialect = analyze_dialect(&engine.model);
+        let thought_reingest = dialect.reasoning.reingest;
         Ok(Self {
             engine,
             template,
@@ -835,7 +837,8 @@ impl<B: Backend> Session<B> {
             // [`Self::with_render_opts`].
             render_opts: RenderOptions::default()
                 .with_generation_prompt(true)
-                .with_extra("preserve_thinking", true),
+                .with_extra("preserve_thinking", true)
+                .with_thought_reingest(thought_reingest),
             sample_options: SampleOptions::default(),
             seed: Some(crate::PredictOptions::DEFAULT_SEED),
             max_tokens: NonZeroUsize::new(DEFAULT_MAX_TOKENS).unwrap(),
@@ -920,6 +923,10 @@ impl<B: Backend> Session<B> {
     /// the model files. This builder is for constructed engines and
     /// tests.
     pub fn with_dialect(mut self, dialect: crate::CallSyntax) -> Self {
+        // The re-ingest convention rides with the dialect: it decides
+        // how prior thoughts feed back through the template, which is
+        // part of the same byte-stability contract.
+        self.render_opts.thought_reingest = dialect.reasoning.reingest;
         self.dialect = dialect;
         self
     }
@@ -2648,12 +2655,13 @@ impl<B: Backend> Session<B> {
 /// The dialect actually used for tool-call enforcement and parsing.
 ///
 /// A [`Family::None`](crate::dialect::Family::None) analysis means
-/// the chat template renders no tool calls at all (Gemma-style).
-/// Until the `Instructed` dialect lands (plan Phase F), those
-/// sessions fall back to the Hermes-JSON shape the pre-dialect
-/// grammar hardcoded — preserving today's behavior for callers that
-/// advertise tools anyway — while keeping any reasoning tags the
-/// analysis *did* detect.
+/// the chat template renders no tool calls at all. Until the
+/// `Instructed` dialect lands (deferred from Phase F — Gemma 4
+/// turned out to have native tool support, so no on-disk model needs
+/// it yet), those sessions fall back to the Hermes-JSON shape the
+/// pre-dialect grammar hardcoded — preserving today's behavior for
+/// callers that advertise tools anyway — while keeping any reasoning
+/// tags the analysis *did* detect.
 fn effective_tool_syntax(
     dialect: &crate::CallSyntax,
 ) -> std::borrow::Cow<'_, crate::CallSyntax> {
@@ -3133,7 +3141,17 @@ fn any_grammar_complete(modes: &[SamplingMode]) -> bool {
 }
 
 fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
+    // Models can end a turn with EOT rather than EOS (Gemma 4:
+    // `<turn|>` vs `<eos>`) — trim whichever piece trails.
     let eos_piece = engine.model.token_to_piece(engine.model.eos());
+    let mut text = text;
+    let eot_id = engine.model.eot();
+    if eot_id >= 0 {
+        let eot_piece = engine.model.token_to_piece(eot_id);
+        if !eot_piece.is_empty() {
+            text = text.trim_end_matches(eot_piece.as_str());
+        }
+    }
     text.trim_end_matches(eos_piece.as_str())
         .trim_end_matches("[Invalid UTF-8]")
         .trim_end()
@@ -3514,8 +3532,9 @@ mod tests {
 
     /// A `Family::None` dialect (tool-less template) falls back to
     /// the Hermes-JSON shape for tool enforcement — preserving the
-    /// pre-dialect behavior until Phase F's `Instructed` dialect —
-    /// while keeping whatever reasoning tags analysis detected.
+    /// pre-dialect behavior until the `Instructed` dialect lands
+    /// (deferred follow-up to Phase F) — while keeping whatever
+    /// reasoning tags analysis detected.
     #[test]
     fn test_effective_tool_syntax_none_falls_back_to_hermes() {
         use crate::dialect::{Family, ReasoningMode, ReasoningSyntax};
@@ -3524,6 +3543,7 @@ mod tests {
                 mode: ReasoningMode::TagBased,
                 start: "<reason>".into(),
                 end: "</reason>".into(),
+                ..ReasoningSyntax::default()
             },
             ..crate::CallSyntax::default()
         };

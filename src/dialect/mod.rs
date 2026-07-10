@@ -38,7 +38,8 @@ pub use parse::{parse_text, Leniency, ParseStatus, Parsed, StreamParser};
 )]
 pub enum Family {
     /// Template renders no tool calls at all. The `Instructed`
-    /// dialect (Phase F) owns this case.
+    /// dialect (deferred follow-up to Phase F) will own this case;
+    /// today Session falls back to Hermes-JSON enforcement.
     #[default]
     None,
     /// Pure JSON: `{"name": "X", "arguments": {...}}`, possibly
@@ -50,6 +51,15 @@ pub enum Family {
     /// Tag-carried function with individually tagged arguments:
     /// `<parameter=key>value</parameter>` (Qwen3-Coder/3.6 XML).
     TagWithTagged,
+    /// Tag-carried function whose arguments render as one brace dict
+    /// with *bare* keys and a dedicated string-quote marker instead
+    /// of JSON quoting:
+    /// `<|tool_call>call:name{city:<|"|>London<|"|>}<tool_call|>`
+    /// (Gemma 4). The quote marker is a special token, so string
+    /// values need no in-band escaping — but a value containing the
+    /// marker's literal bytes is unrepresentable (typed error, like
+    /// [`Family::TagWithTagged`] close delimiters).
+    TagWithDict,
 }
 
 /// How the model's reasoning block is delimited.
@@ -108,6 +118,27 @@ fn is_default<T: Default + PartialEq>(v: &T) -> bool {
     *v == T::default()
 }
 
+/// How the assistant's prior thoughts feed back through the chat
+/// template on re-ingest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum ReasoningReingest {
+    /// Thought text is wrapped `<think>…</think>` inline in the
+    /// message `content` (legacy Qwen convention — those templates
+    /// reconstruct reasoning by splitting content on the tag).
+    #[default]
+    InlineThink,
+    /// Thought text is passed as the message's `reasoning` /
+    /// `reasoning_content` fields; the template owns the markers
+    /// (Gemma 4, DeepSeek-style templates). Inlining `<think>` for
+    /// these templates would pollute content instead.
+    Field,
+}
+
 /// Reasoning-block markers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(
@@ -121,6 +152,8 @@ pub struct ReasoningSyntax {
     pub start: String,
     /// e.g. `"</think>"`.
     pub end: String,
+    /// Re-ingest convention (drives `RenderOptions` in `Session`).
+    pub reingest: ReasoningReingest,
 }
 
 /// Content-block markers.
@@ -174,6 +207,9 @@ pub struct ArgumentsSyntax {
     pub value_suffix: String,
     /// Separator between arguments, if any.
     pub separator: String,
+    /// String-quote marker for [`Family::TagWithDict`] values
+    /// (e.g. `"<|\"|>"`); empty for other families.
+    pub string_quote: String,
 }
 
 /// Call-ID markers (tagged formats).
@@ -275,6 +311,18 @@ pub struct CallSyntax {
     pub user_start: String,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "is_default"))]
     pub assistant_start: String,
+    /// Marker that opens tool responses *inside the same turn*
+    /// (Gemma 4's `<|tool_response>`). Non-empty means the template
+    /// keeps a call turn open awaiting results, and the model's
+    /// trained continuation after its last call is this marker — so
+    /// the tool grammar *requires* it as the turn exit (after which
+    /// only EOG is legal: a deterministic stop that is also the
+    /// canonical re-render byte), and the parser swallows it as
+    /// envelope rather than surfacing it as text. Empty for dialects
+    /// whose models end call turns with EOG directly (Qwen, Hermes,
+    /// Llama).
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "is_default"))]
+    pub tool_response_start: String,
     /// Union of all non-empty markers (whitespace-trimmed) — tokens
     /// the tokenizer must keep intact / the sampler may see whole.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "is_default"))]
@@ -341,7 +389,65 @@ impl CallSyntax {
                 mode: ReasoningMode::TagBased,
                 start: "<think>".into(),
                 end: "</think>".into(),
+                reingest: ReasoningReingest::InlineThink,
             },
+            ..Self::default()
+        }
+    }
+
+    /// Gemma 4 native dialect — hand-built (llama.cpp hand-builds it
+    /// too: `common_chat_params_init_gemma4`), selected by source
+    /// sniff in the analyzer patches, not by differential probing.
+    ///
+    /// Calls: `<|tool_call>call:name{key:value,…}<tool_call|>` where
+    /// the dict has bare keys and strings quoted by the special token
+    /// `<|"|>`. Reasoning is channel-based
+    /// (`<|channel>thought\n…<channel|>`) and renders only on
+    /// tool-call turns. All markers are single vocab tokens.
+    pub fn gemma4() -> Self {
+        Self {
+            family: Family::TagWithDict,
+            per_call_start: "<|tool_call>".into(),
+            per_call_end: "<tool_call|>".into(),
+            function: FunctionSyntax {
+                name_prefix: "call:".into(),
+                name_suffix: String::new(),
+                close: String::new(),
+            },
+            arguments: ArgumentsSyntax {
+                start: "{".into(),
+                end: "}".into(),
+                name_suffix: ":".into(),
+                separator: ",".into(),
+                string_quote: "<|\"|>".into(),
+                ..ArgumentsSyntax::default()
+            },
+            reasoning: ReasoningSyntax {
+                mode: ReasoningMode::ToolsOnly,
+                start: "<|channel>thought\n".into(),
+                // Leading newline is canonical: the template re-renders
+                // reasoning as `<|channel>thought\n{text}\n<channel|>`,
+                // so the grammar must force the trailing newline too.
+                // Parsing trims, so the model may omit it (upstream's
+                // zero-budget case) at the cost of a one-turn
+                // canonicalization repair.
+                end: "\n<channel|>".into(),
+                reingest: ReasoningReingest::Field,
+            },
+            user_start: "<|turn>user\n".into(),
+            assistant_start: "<|turn>model\n".into(),
+            tool_response_start: "<|tool_response>".into(),
+            preserved_tokens: vec![
+                "<|channel>".into(),
+                "<channel|>".into(),
+                "<|tool_call>".into(),
+                "<tool_call|>".into(),
+                "<|tool_response>".into(),
+                "<tool_response|>".into(),
+                "<|turn>".into(),
+                "<turn|>".into(),
+                "<|\"|>".into(),
+            ],
             ..Self::default()
         }
     }

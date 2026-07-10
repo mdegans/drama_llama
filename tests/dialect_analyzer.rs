@@ -118,6 +118,27 @@ fn llama31_json_native() {
 
 /// A template with no tool support at all classifies as None
 /// (Instructed-dialect territory). Minimal inline source.
+/// Gemma 4 is a hand-built dialect selected by source sniff (Phase
+/// F), exactly like upstream's `common_chat_params_init_gemma4` —
+/// the analyzer patch must fire on both the GGUF dump and the
+/// upstream-vendored template and yield the baked constant wholesale.
+#[test]
+fn gemma4_sniffed() {
+    for fixture in ["gemma4-gguf.jinja", "google-gemma-4-31B-it.jinja"] {
+        let s = analyze(fixture, "<bos>", "<turn|>");
+        assert_eq!(s, CallSyntax::gemma4(), "{fixture}: {s:#?}");
+    }
+    let s = CallSyntax::gemma4();
+    assert_eq!(s.family, Family::TagWithDict);
+    assert_eq!(s.trigger(), "<|tool_call>");
+    assert_eq!(s.per_call_end, "<tool_call|>");
+    assert_eq!(s.function.name_prefix, "call:");
+    assert_eq!(s.arguments.string_quote, "<|\"|>");
+    assert_eq!(s.reasoning.mode, ReasoningMode::ToolsOnly);
+    assert_eq!(s.reasoning.start, "<|channel>thought\n");
+    assert_eq!(s.reasoning.end, "\n<channel|>");
+}
+
 #[test]
 fn toolless_template_family_none() {
     let source = r#"{%- for m in messages -%}

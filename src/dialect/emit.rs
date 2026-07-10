@@ -27,7 +27,8 @@ use std::fmt::Write;
 use serde_json::Value;
 
 use crate::grammar_compile::{
-    emit_until_rules, escape_for_gbnf_string, schema_to_gbnf, JSON_GRAMMAR,
+    dict_encode_value, emit_dict_value_rules, emit_until_rules,
+    escape_for_gbnf_string, schema_to_dict_gbnf, schema_to_gbnf, JSON_GRAMMAR,
 };
 use crate::Tool;
 
@@ -52,7 +53,8 @@ pub enum DialectError {
         delimiter: String,
     },
     /// The dialect has no tool-call format (Family::None) — nothing
-    /// to emit. Phase F's `Instructed` dialect owns this case.
+    /// to emit. The `Instructed` dialect (deferred follow-up to
+    /// Phase F) will own this case.
     #[error("dialect has no tool-call format (family = None)")]
     NoToolFormat,
     /// Emitted GBNF failed to compile — an emitter bug or a marker
@@ -144,7 +146,22 @@ pub fn grammar_source(
         }
     }
 
-    // Section wrapper + call multiplicity.
+    // Section wrapper + call multiplicity. Dialects whose template
+    // keeps the call turn open (`tool_response_start` non-empty,
+    // Gemma 4) REQUIRE the response opener as the turn exit: it is
+    // the model's trained continuation after its last call — masking
+    // it makes the model loop emitting more calls — and it is the
+    // canonical re-render byte. After the exit nothing else is
+    // legal, so the sampler's complete-constraint logic forces EOG:
+    // a deterministic stop.
+    let exit = if syntax.tool_response_start.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#" "{}""#,
+            escape_for_gbnf_string(&syntax.tool_response_start)
+        )
+    };
     let sec_open = escape_for_gbnf_string(&syntax.section_start);
     let sec_close = escape_for_gbnf_string(&syntax.section_end);
     let call_seq = if opts.parallel { "call+" } else { "call" };
@@ -153,12 +170,12 @@ pub fn grammar_source(
         syntax.section_end.is_empty(),
     ) {
         (true, true) => {
-            let _ = writeln!(src, "calls ::= {call_seq}");
+            let _ = writeln!(src, "calls ::= {call_seq}{exit}");
         }
         _ => {
             let _ = writeln!(
                 src,
-                r#"calls ::= "{sec_open}" {call_seq} "{sec_close}""#
+                r#"calls ::= "{sec_open}" {call_seq} "{sec_close}"{exit}"#
             );
         }
     }
@@ -201,10 +218,22 @@ pub fn grammar_source(
                     &mut src,
                 );
             }
+            Family::TagWithDict => {
+                emit_dict_call(
+                    syntax,
+                    tool,
+                    i,
+                    (&per_open, &per_close),
+                    &mut src,
+                );
+            }
             Family::None => unreachable!("checked above"),
         }
     }
 
+    if syntax.family == Family::TagWithDict {
+        emit_dict_value_rules(&syntax.arguments.string_quote, &mut src);
+    }
     src.push_str(JSON_GRAMMAR);
     Ok(src)
 }
@@ -320,6 +349,34 @@ fn emit_tagged_call(
     );
 }
 
+/// TAG_WITH_DICT (Gemma 4): literal `call:` + name, then the whole
+/// argument dict compiled from the schema in dict encoding — braces
+/// included, keys bare and sorted in place, strings quoted by the
+/// dialect's quote marker, compact separators. The generic `dvalue`
+/// rules it references are appended once per grammar by
+/// [`grammar_source`].
+fn emit_dict_call(
+    syntax: &CallSyntax,
+    tool: &Tool,
+    i: usize,
+    (per_open, per_close): (&str, &str),
+    src: &mut String,
+) {
+    let name_lit = escape_for_gbnf_string(tool.name.as_ref());
+    let fn_pre = escape_for_gbnf_string(&syntax.function.name_prefix);
+    let args_rule = format!("args_{i}");
+    schema_to_dict_gbnf(
+        &tool.schema,
+        &args_rule,
+        &syntax.arguments.string_quote,
+        src,
+    );
+    let _ = writeln!(
+        src,
+        r#"call_{i} ::= "{per_open}{fn_pre}{name_lit}" {args_rule} "{per_close}""#,
+    );
+}
+
 /// TAG_WITH_JSON: tagged name, JSON args object.
 fn emit_tag_json_call(
     syntax: &CallSyntax,
@@ -414,27 +471,79 @@ pub fn validate_representable(
     tool_name: &str,
     input: &Value,
 ) -> Result<(), DialectError> {
-    if syntax.family != Family::TagWithTagged {
-        return Ok(());
-    }
-    let delimiter = &syntax.arguments.value_suffix;
-    if delimiter.is_empty() {
-        return Ok(());
-    }
-    if let Some(obj) = input.as_object() {
-        for (key, val) in obj {
-            if let Some(s) = val.as_str() {
-                if s.contains(delimiter.as_str()) {
-                    return Err(DialectError::UnrepresentableValue {
-                        tool: tool_name.to_string(),
-                        param: key.clone(),
-                        delimiter: delimiter.clone(),
-                    });
+    match syntax.family {
+        Family::TagWithTagged => {
+            let delimiter = &syntax.arguments.value_suffix;
+            if delimiter.is_empty() {
+                return Ok(());
+            }
+            if let Some(obj) = input.as_object() {
+                for (key, val) in obj {
+                    if let Some(s) = val.as_str() {
+                        if s.contains(delimiter.as_str()) {
+                            return Err(DialectError::UnrepresentableValue {
+                                tool: tool_name.to_string(),
+                                param: key.clone(),
+                                delimiter: delimiter.clone(),
+                            });
+                        }
+                    }
                 }
             }
+            Ok(())
         }
+        Family::TagWithDict => {
+            let quote = &syntax.arguments.string_quote;
+            if quote.is_empty() {
+                return Ok(());
+            }
+            // Recursive: nested containers render inline, so *every*
+            // string is quote-delimited and *every* key is bare.
+            fn check(
+                tool: &str,
+                param: &str,
+                v: &Value,
+                quote: &str,
+            ) -> Result<(), DialectError> {
+                let err = |delimiter: &str| {
+                    Err(DialectError::UnrepresentableValue {
+                        tool: tool.to_string(),
+                        param: param.to_string(),
+                        delimiter: delimiter.to_string(),
+                    })
+                };
+                match v {
+                    Value::String(s) if s.contains(quote) => err(quote),
+                    Value::Object(map) => {
+                        for (k, val) in map {
+                            // Bare keys: the dict terminators (and the
+                            // quote marker) cannot appear in a key.
+                            if let Some(c) = k
+                                .chars()
+                                .find(|c| matches!(c, ':' | '{' | '}' | ','))
+                            {
+                                return err(&c.to_string());
+                            }
+                            if k.contains(quote) || k.is_empty() {
+                                return err(quote);
+                            }
+                            check(tool, k, val, quote)?;
+                        }
+                        Ok(())
+                    }
+                    Value::Array(items) => {
+                        for val in items {
+                            check(tool, param, val, quote)?;
+                        }
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            }
+            check(tool_name, "", input, quote)
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Canonical byte serialization of `calls` in `syntax` — the exact
@@ -552,6 +661,19 @@ pub fn render_reference(
                     }
                     out.push('}');
                 }
+            }
+            Family::TagWithDict => {
+                out.push_str(&syntax.function.name_prefix);
+                out.push_str(name);
+                // The whole args object, braces included — compact,
+                // key-sorted (BTreeMap ⇒ dictsort), quote-marked
+                // strings. Matches the template's `format_argument`
+                // with `escape_keys=False`.
+                dict_encode_value(
+                    input,
+                    &syntax.arguments.string_quote,
+                    &mut out,
+                );
             }
             Family::None => unreachable!("checked above"),
         }

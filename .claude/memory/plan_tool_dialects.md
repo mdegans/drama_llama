@@ -100,6 +100,75 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
   **4** (not 3) — llama.cpp gives it a hand-built handler, so Phase F
   may become "native weird template" rather than (or in addition to)
   `Instructed`. Re-scope F when its template gets probed.
+- **Phase F RE-SCOPED + LANDED** (2026-07-10, session 3, Fable; Mike
+  okayed "native only, Instructed deferred — play it by ear"). Probing
+  the Gemma 4 GGUF template killed the Instructed premise: it has FULL
+  native tool support, hand-built upstream
+  (`common_chat_params_init_gemma4`). Format:
+  `<|tool_call>call:name{key:value,…}<tool_call|>` — brace dict with
+  BARE keys, strings quoted by the special token `<|"|>` (no in-band
+  escaping possible → recursive `UnrepresentableValue`), values
+  otherwise JSON-ish; `<|channel>thought\n…\n<channel|>` reasoning
+  (renders ONLY on tool-call turns after last user =
+  `ReasoningMode::ToolsOnly`); asymmetric `<|x>`/`<x|>` markers, all
+  single vocab tokens (ids 46–106). Implementation:
+  - `Family::TagWithDict` + `CallSyntax::gemma4()` baked constant +
+    analyzer sniff patch (`<|tool_call>call:` && `<|"|>` in source →
+    wholesale overwrite, upstream-style).
+  - Dict-encoded schema compiler (`schema_to_dict_gbnf`) — sorted-
+    in-place object layout (optionals before first required carry
+    trailing comma; after, leading) matching `| dictsort` re-renders;
+    `dict_encode_value` is the single byte-encoding source for
+    grammar literals AND `render_reference`.
+  - minijinja probe findings baked in: null renders `none` (grammar
+    accepts null/none/None, parse coerces all → JSON null, render
+    emits `none`); floats are ryu-shortest (serde_json matches:
+    `1.5e10` → `15000000000.0`).
+  - Parser: recursive dict-value reader; channel noise per upstream
+    matrix (empty thoughts DROP, bare `<|channel>` and unmatched
+    `<channel|>` swallowed — full test-matrix port from
+    `tests/test-chat.cpp` "Google Gemma 4").
+  - **Thought re-ingest convention** (`ReasoningReingest` on
+    `ReasoningSyntax` → `RenderOptions::thought_reingest`, wired in
+    `from_engine`/`with_dialect`): Gemma wants thoughts as the
+    message `reasoning`/`reasoning_content` FIELDS, not inline
+    `<think>` (which its template would NOT strip → content
+    pollution). Also fixed alongside: `tool_call_message` now carries
+    ALL ToolUse blocks (was first-only — parallel-call re-ingest was
+    silently lossy for every dialect).
+  - **Turn-exit discovery (e2e round 1, 6/7)**: after `<tool_call|>`
+    Gemma's trained continuation is `<|tool_response>` (its template
+    keeps the call turn OPEN awaiting in-turn responses). Masking it
+    made the model loop identical calls to max_tokens. Fix:
+    `CallSyntax::tool_response_start` — grammar REQUIRES it as turn
+    exit (it's also the canonical re-render byte, so byte-stability
+    improves), after which nothing is legal → sampler's complete-
+    constraint logic forces EOG = deterministic stop; parser
+    swallows it as envelope (batch + streaming holdback).
+  - Reconstruction green through the REAL template incl. thought-via-
+    field, null→none, nested dict re-sort, parallel calls.
+  - KNOWN QUIRK 1 (accepted): Gemma's template renders assistant
+    `content` AFTER tool_calls; an Auto-mode "prose then call"
+    emission re-renders in the other order → canonicalization LCP
+    fallback for that turn. Cache-safe, one re-prefill; not fixable
+    at grammar level.
+  - KNOWN QUIRK 2 (accepted, e2e round 2): the NON-thinking
+    generation prompt ends with a pre-closed empty thought scaffold
+    `<|channel>thought\n<channel|>` that re-ingested turns do NOT
+    reproduce → same LCP fallback, shared prefix ends at
+    `<|turn>model\n`, one-assistant-turn re-prefill per non-thinking
+    turn (prefix_cache e2e still passes — the big prefix hits).
+    Thinking mode has no scaffold → full byte-stability. Sibling of
+    upstream's chat.cpp:1223 workaround.
+  - Bonus fix: `trim_eos` now also trims the EOT piece — Gemma
+    splits eos (`<eos>` id 1) from eot (`<turn|>` id 106) and
+    `complete_text` was leaving a trailing `<turn|>` in the text
+    (Qwen never showed it: its eot == eos piece).
+  - `Instructed` dialect DEFERRED (no on-disk model needs it;
+    `Family::None` keeps the hermes_json enforcement fallback).
+  - e2e: `tests/session_gemma4.rs` (7 tests, `--features serde,cuda`
+    — plain `serde` builds CPU-only and 31B crawls; that mistake cost
+    round 1). GPU runs on this box are fine per Phase E note.
 
 ## Problem
 
