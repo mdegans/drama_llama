@@ -96,13 +96,16 @@ pub use moeflux::{
 mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};
 
-#[cfg(feature = "toml")]
+// The module itself is feature-free: the chat-template sidecar is
+// raw Jinja and must work without `toml`. Only the TOML-encoded
+// sidecars (sampling, dialect) are gated.
 pub mod sidecar;
 #[cfg(feature = "toml")]
 pub use sidecar::{
     load_call_syntax, load_sample_options, write_call_syntax,
-    write_default_sample_options, SidecarError,
+    write_default_sample_options,
 };
+pub use sidecar::{load_template_source, SidecarError};
 
 mod engine;
 pub use engine::Engine;
