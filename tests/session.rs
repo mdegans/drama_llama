@@ -312,9 +312,16 @@ fn complete_text_round_trips_through_parse_and_render() {
             .with_max_tokens(NonZeroUsize::new(256).unwrap());
     println!("=== dialect ===\n{:#?}\n===", session.dialect());
 
+    // Mirror the session's own render defaults (`from_engine`):
+    // generation prompt on, `preserve_thinking` on, and NO explicit
+    // `enable_thinking` — the template derives it from
+    // `prompt.thinking`, and this prompt doesn't enable it. Using
+    // different opts here would compute the wrong `pre_opened` flag
+    // and desync the byte-prefix comparison from what `complete_text`
+    // actually rendered.
     let render_opts = RenderOptions::default()
         .with_generation_prompt(true)
-        .with_extra("enable_thinking", true);
+        .with_extra("preserve_thinking", true);
     let rendered_original = session
         .template()
         .render_with(&prompt, &render_opts)
@@ -350,7 +357,7 @@ fn complete_text_round_trips_through_parse_and_render() {
             &follow_up,
             &RenderOptions::default()
                 .with_generation_prompt(false)
-                .with_extra("enable_thinking", true),
+                .with_extra("preserve_thinking", true),
         )
         .expect("render follow_up");
 
@@ -424,7 +431,14 @@ fn auto_tool_choice_parses_native_dialect_call() {
 #[test]
 #[ignore = "requires model"]
 fn thinking_works_under_forced_tool_grammar() {
-    let prompt = strawberry_turn_1_prompt();
+    use misanthropic::prompt::thinking::Thinking;
+    // Thinking must be *enabled on the prompt* for the template to
+    // pre-open `<think>` in the generation prompt — that's the
+    // combination this test exists to exercise.
+    let prompt = strawberry_turn_1_prompt().thinking(Thinking::Enabled {
+        budget_tokens: std::num::NonZeroU32::new(512).unwrap(),
+        display: None,
+    });
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")

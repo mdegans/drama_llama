@@ -1858,21 +1858,49 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
         bitmap_pass: u64,
     }
 
-    // Post-complete, drop empty-piece tokens: they trivially pass the
-    // matcher, so the kept set never empties and the force-EOS branch
-    // below never fires — the model then burns the rest of
-    // `max_tokens` on invisible reserved tokens (same failure mode as
-    // `json_filter`; see the comment there). Mid-parse empty pieces
-    // remain accepted.
+    // Drop empty-piece tokens unconditionally: zero bytes can never
+    // advance the matcher, so they trivially pass it in ANY state.
+    // Post-complete they kept the force-EOS branch below from firing
+    // (invisible reserved-token budget burn); mid-parse they are
+    // livelock fuel — an unpenalized zero-byte token can dominate
+    // once the repetition penalty crushes the structural tokens the
+    // grammar keeps forcing.
+    //
+    // Mid-parse, additionally drop end-of-generation tokens BY ID.
+    // Byte-acceptance is the wrong test for EOG: inside a raw
+    // `until()` region every byte sequence is legal value content —
+    // including the literal piece bytes of `<|im_end|>` — so the
+    // matcher can never reject EOG and the predictor's stop fires
+    // mid-structure (observed on Qwen3.6: every sampled tool call
+    // died at the second parameter when the model bailed with
+    // `<|im_end|>`; greedy was immune). An active constraint owns
+    // termination: EOG becomes legal again once the grammar reaches
+    // an accept state — the same rule llama.cpp's grammar sampler
+    // applies. NOTE for Harmony (plan Phase G): `<|return|>` is both
+    // EOG and grammar-terminal; that works because the grammar is
+    // complete by the time it appears.
     let complete = state.is_complete();
+    let eog: Vec<crate::Token> = if complete {
+        Vec::new()
+    } else {
+        let mut v = model.extra_eos_tokens();
+        v.push(model.eos());
+        if model.eot() >= 0 {
+            v.push(model.eot());
+        }
+        v
+    };
 
     let acc = candidates
         .as_slice()
         .par_iter()
         .fold(Acc::default, |mut a, cand| {
+            if !complete && eog.contains(&cand.id) {
+                return a;
+            }
             let mut buf: Vec<u8> = Vec::with_capacity(32);
             model.token_to_piece_ref(cand.id, &mut buf);
-            if buf.is_empty() && complete {
+            if buf.is_empty() {
                 return a;
             }
             if let Some(&first) = buf.first() {

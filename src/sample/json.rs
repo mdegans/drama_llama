@@ -523,18 +523,32 @@ pub(crate) fn json_filter<M: Model>(
 ) -> Candidates {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
     let mut kept: Vec<TokenData> = Vec::with_capacity(candidates.len().get());
-    // Post-complete, drop empty-piece tokens too: they trivially pass
-    // `accepts_bytes(&[])`, so without this the kept set never empties
-    // and the force-EOS branch below never fires — the model then
-    // burns the rest of `max_tokens` emitting invisible reserved
-    // tokens (observed on Qwen3.6: every constrained run consumed
-    // exactly `n` tokens; the loop tokens decode to "" so the output
-    // *looked* fine). Mid-parse empty pieces remain accepted.
+    // Drop empty-piece tokens unconditionally (they trivially pass
+    // `accepts_bytes(&[])` in any state) and, mid-parse, drop
+    // end-of-generation tokens BY ID (byte-acceptance can't reject
+    // EOG inside permissive regions — JSON strings accept
+    // `<|im_end|>`'s literal bytes just like a raw until() run). See
+    // `grammar_filter` for the full account — both filters and the
+    // lazy check share this policy: an active constraint owns
+    // termination, and EOG becomes legal again at accept states.
     let complete = state.is_complete();
+    let eog: Vec<Token> = if complete {
+        Vec::new()
+    } else {
+        let mut v = model.extra_eos_tokens();
+        v.push(model.eos());
+        if model.eot() >= 0 {
+            v.push(model.eot());
+        }
+        v
+    };
     for cand in candidates.as_slice() {
+        if !complete && eog.contains(&cand.id) {
+            continue;
+        }
         buf.clear();
         model.token_to_piece_ref(cand.id, &mut buf);
-        if complete && buf.is_empty() {
+        if buf.is_empty() {
             continue;
         }
         if state.accepts_bytes(&buf) {
