@@ -172,6 +172,13 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`plan_tool_dialects.md`](.claude/memory/plan_tool_dialects.md)
+  — plan-of-record ([issue #30](https://github.com/mdegans/drama_llama/issues/30)):
+  per-model tool-call dialects. Template-derived `CallSyntax` (probe-
+  first, llama.cpp-validated) drives both the GBNF emitter and the
+  parser; phases A–G cover grammar-engine `until`, #28, analyzer,
+  emitter+parser (absorbs #29), Session/Qwen e2e, Gemma `Instructed`,
+  gpt-oss Harmony. Round-trip byte-stability is the cache invariant.
 - [`riir_moeflux_strategy.md`](.claude/memory/riir_moeflux_strategy.md)
   — the active RIIR plan: differential port of moeflux, branch
   `riir` in `~/Projects/moeflux`, no Arc, `metal-rs`. Phase 0/1a/2
