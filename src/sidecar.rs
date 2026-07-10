@@ -134,9 +134,87 @@ pub fn write_default_sample_options(path: &Path) -> Result<(), SidecarError> {
     })
 }
 
+/// Read a dialect sidecar from `path` if it exists and parse it as
+/// [`CallSyntax`](crate::CallSyntax).
+///
+/// Discovery convention mirrors the sampling sidecar: sibling file at
+/// `<model>.dialect.toml` for GGUF (`model.gguf` →
+/// `model.dialect.toml`), `parent/dialect.toml` for moeflux. Unlike
+/// sampling, **no default is auto-written**: the template analyzer's
+/// output *is* the default, and a sidecar exists only to override a
+/// misdetected finetune. All fields are `#[serde(default)]`, so a
+/// sidecar may specify only the fields it corrects — but note the
+/// merge is whole-struct replacement, not per-field patching over the
+/// analysis (simpler to reason about; a partial sidecar plus analyzer
+/// output would make round-trip failures very hard to attribute).
+pub fn load_call_syntax(
+    path: &Path,
+) -> Result<Option<crate::CallSyntax>, SidecarError> {
+    let bytes = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SidecarError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let syntax: crate::CallSyntax =
+        toml::from_str(&bytes).map_err(|source| SidecarError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(Some(syntax))
+}
+
+/// Serialize `syntax` to `path` as TOML. Utility for pinning an
+/// analyzer result into an editable override (e.g. via a future CLI
+/// `--dump-dialect`); nothing calls this automatically.
+pub fn write_call_syntax(
+    path: &Path,
+    syntax: &crate::CallSyntax,
+) -> Result<(), SidecarError> {
+    let body = toml::to_string_pretty(syntax)?;
+    let header = "# drama_llama per-model tool-call dialect sidecar.\n\
+         # Overrides the template analyzer's derived CallSyntax\n\
+         # entirely (whole-struct replacement, not per-field patch).\n\
+         # Delete to fall back to analysis.\n\n";
+    std::fs::write(path, format!("{header}{body}")).map_err(|source| {
+        SidecarError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CallSyntax dialect sidecar round-trips through TOML with all
+    /// marker whitespace intact (newlines in markers are the trained
+    /// format — losing one breaks round-trip byte-stability).
+    #[test]
+    fn call_syntax_roundtrip() {
+        let dir = tempfile_dir();
+        let path = dir.join("dialect.toml");
+
+        assert!(load_call_syntax(&path).unwrap().is_none());
+
+        for syntax in [
+            crate::CallSyntax::qwen_xml(),
+            crate::CallSyntax::hermes_json(),
+            crate::CallSyntax::llama31_json(),
+        ] {
+            write_call_syntax(&path, &syntax).unwrap();
+            let loaded = load_call_syntax(&path).unwrap().expect("written");
+            assert_eq!(loaded, syntax);
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
 
     /// Round-trip the default through `write_default → load`. Catches
     /// any field that can't be serialized (e.g. an `f32::NaN` slipping

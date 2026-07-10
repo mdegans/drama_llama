@@ -66,6 +66,9 @@ pub use output_config::{
     OutputConfigOptions,
 };
 
+pub mod dialect;
+pub use dialect::CallSyntax;
+
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp;
 #[cfg(feature = "llama-cpp")]
@@ -97,7 +100,8 @@ pub use ngram::{NGram, NGramData, NGramStats};
 pub mod sidecar;
 #[cfg(feature = "toml")]
 pub use sidecar::{
-    load_sample_options, write_default_sample_options, SidecarError,
+    load_call_syntax, load_sample_options, write_call_syntax,
+    write_default_sample_options, SidecarError,
 };
 
 mod engine;
