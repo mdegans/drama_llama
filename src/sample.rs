@@ -143,8 +143,12 @@ pub struct SampleOptions {
     /// *before* truncation samplers run. Streams from the two modes
     /// diverge, deliberately. Both are fully deterministic: fixed seed →
     /// identical stream, and exactly one RNG draw is consumed per emitted
-    /// token on either path. `false` reproduces v0.8.0 streams bit-exact
-    /// (the masked path *is* the fallback implementation).
+    /// token on either path. `false` keeps the masked path (which *is*
+    /// the fallback implementation), modulo one deliberate post-v0.8.0
+    /// fix in both modes: completed constraints no longer keep
+    /// empty-piece tokens, so generation terminates at document end
+    /// instead of looping on invisible reserved tokens (see
+    /// `json_filter`).
     ///
     /// Has no effect when `modes` contains no `Grammar`/`Json` mode.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -1197,28 +1201,34 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     if let Some((rng_snap, mu_snap, saved)) = snapshot {
         // Verify just the chosen token's piece against every constraint —
         // O(piece bytes) vs the O(vocab) filter sweep. Empty pieces are
-        // trivially accepted, matching the filters' per-candidate
-        // behavior.
+        // trivially accepted mid-parse, matching the filters'
+        // per-candidate behavior — but rejected once the constraint is
+        // complete, mirroring the filters' post-complete empty-piece
+        // drop (see `json_filter`) so the fallback reaches their
+        // force-EOS termination instead of looping on invisible
+        // reserved tokens.
         let t0 = grammar::grammar_stats_enabled().then(std::time::Instant::now);
         let mut buf: Vec<u8> = Vec::with_capacity(32);
         model.token_to_piece_ref(chosen, &mut buf);
         let legal = opts.modes.iter().all(|mode| match mode {
-            SamplingMode::Json(state) => state
-                .lock()
-                .expect(
+            SamplingMode::Json(state) => {
+                let state = state.lock().expect(
                     "SamplingMode::Json mutex poisoned; parser state is \
                      unrecoverable. Rebuild the mode with \
                      SamplingMode::json() and retry.",
-                )
-                .accepts_bytes(&buf),
-            SamplingMode::Grammar(state) => state
-                .lock()
-                .expect(
+                );
+                !(buf.is_empty() && state.is_complete())
+                    && state.accepts_bytes(&buf)
+            }
+            SamplingMode::Grammar(state) => {
+                let state = state.lock().expect(
                     "SamplingMode::Grammar mutex poisoned; matcher state \
                      is unrecoverable. Rebuild the mode with \
                      SamplingMode::grammar(...) and retry.",
-                )
-                .accepts_bytes(&buf),
+                );
+                !(buf.is_empty() && state.is_complete())
+                    && state.accepts_bytes(&buf)
+            }
             _ => true,
         });
         if let Some(t0) = t0 {
@@ -1386,12 +1396,16 @@ mod tests {
     /// empty piece (like Qwen's secondary EOS variants decode to).
     struct MockModel;
 
-    const PIECES: &[&str] = &["", "a", "b", "c", "x"];
+    const PIECES: &[&str] = &["", "a", "b", "c", "x", ""];
     const EOS: Token = 0;
     const A: Token = 1;
     const B: Token = 2;
     const C: Token = 3;
     const X: Token = 4;
+    /// A reserved-style token whose piece is empty but which is NOT
+    /// EOS — the Qwen3.6 shape behind the post-complete budget-burn
+    /// loop.
+    const RSV: Token = 5;
 
     impl crate::backend::Model for MockModel {
         type Error = std::convert::Infallible;
@@ -1582,6 +1596,54 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Post-complete, an empty-piece NON-EOS pick must not be
+    /// accepted: the fallback's force-EOS terminates generation
+    /// instead. Regression for the invisible reserved-token loop
+    /// observed on Qwen3.6 (every constrained run consumed exactly
+    /// `max_tokens` after the document completed).
+    #[test]
+    fn lazy_rejects_empty_piece_after_completion() {
+        let mut opts = opts_with_grammar(true);
+        let mut r = rng();
+        let mut mu = None;
+        assert_eq!(
+            sample(cands(&[(A, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            A
+        );
+        assert_eq!(
+            sample(cands(&[(B, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            B
+        );
+        // Grammar complete. The dominant pick is a reserved-style
+        // empty-piece token; pre-fix it was accepted and emitted
+        // forever. Now: rejected, fallback drops it too, EOS forced.
+        assert_eq!(
+            sample(cands(&[(RSV, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            EOS
+        );
+    }
+
+    /// Same shape through the masked path: the filter itself must
+    /// drop post-complete empty pieces and force EOS.
+    #[test]
+    fn masked_rejects_empty_piece_after_completion() {
+        let mut opts = opts_with_grammar(false);
+        let mut r = rng();
+        let mut mu = None;
+        assert_eq!(
+            sample(cands(&[(A, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            A
+        );
+        assert_eq!(
+            sample(cands(&[(B, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            B
+        );
+        assert_eq!(
+            sample(cands(&[(RSV, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            EOS
+        );
     }
 
     /// mu snapshot/restore: with mirostat in the chain, a lazy fallback

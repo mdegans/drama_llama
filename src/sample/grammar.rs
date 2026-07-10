@@ -1858,12 +1858,23 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
         bitmap_pass: u64,
     }
 
+    // Post-complete, drop empty-piece tokens: they trivially pass the
+    // matcher, so the kept set never empties and the force-EOS branch
+    // below never fires — the model then burns the rest of
+    // `max_tokens` on invisible reserved tokens (same failure mode as
+    // `json_filter`; see the comment there). Mid-parse empty pieces
+    // remain accepted.
+    let complete = state.is_complete();
+
     let acc = candidates
         .as_slice()
         .par_iter()
         .fold(Acc::default, |mut a, cand| {
             let mut buf: Vec<u8> = Vec::with_capacity(32);
             model.token_to_piece_ref(cand.id, &mut buf);
+            if buf.is_empty() && complete {
+                return a;
+            }
             if let Some(&first) = buf.first() {
                 if bitmap[(first as usize) >> 6] & (1u64 << (first & 63)) == 0 {
                     return a;
