@@ -131,6 +131,24 @@ pub struct SampleOptions {
     /// serialized — treat as per-run wiring. See [`DeferredGrammar`].
     #[cfg_attr(feature = "serde", serde(skip))]
     pub deferred_grammar: Option<DeferredGrammar>,
+    /// Sample-then-check for `Grammar`/`Json` modes: sample *without* the
+    /// grammar filters, then verify just the chosen token's piece with
+    /// `accepts_bytes` (O(piece) instead of O(vocab) per token). If the
+    /// piece is illegal, fall back to the full masked path over the
+    /// pre-fold candidates — so output is always grammar-legal.
+    ///
+    /// **Semantics differ from masked-first by design** (this is the same
+    /// accept-if-legal shape llama.cpp ships): the unconstrained winner
+    /// keeps its seat if legal; masked-first instead removes illegal mass
+    /// *before* truncation samplers run. Streams from the two modes
+    /// diverge, deliberately. Both are fully deterministic: fixed seed →
+    /// identical stream, and exactly one RNG draw is consumed per emitted
+    /// token on either path. `false` reproduces v0.8.0 streams bit-exact
+    /// (the masked path *is* the fallback implementation).
+    ///
+    /// Has no effect when `modes` contains no `Grammar`/`Json` mode.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub lazy_grammar: bool,
 }
 
 /// A grammar that starts suspended and activates once a specific byte
@@ -165,6 +183,7 @@ impl SampleOptions {
             modes: vec![SamplingMode::Greedy],
             repetition: None,
             deferred_grammar: None,
+            lazy_grammar: false,
         }
     }
 
@@ -316,6 +335,7 @@ impl Default for SampleOptions {
             // or `SampleOptions::greedy()`.
             repetition: Some(RepetitionOptions::default()),
             deferred_grammar: None,
+            lazy_grammar: false,
         }
     }
 }
@@ -1144,16 +1164,112 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
         )?;
     }
 
-    // Fold candidates, applying the sampling modes in order.
-    //
+    let lazy = opts.lazy_grammar
+        && opts.modes.iter().any(|m| {
+            matches!(m, SamplingMode::Json(_) | SamplingMode::Grammar(_))
+        });
+
+    // Lazy fallback snapshots: `Xoroshiro128` is `Copy` (`[u64; 2]`), `mu`
+    // is a plain `Option<f32>`, and the pre-fold candidates clone is a
+    // straight memcpy of the vector. Restoring these and replaying the
+    // fold consumes the identical RNG draw sequence on either path, so a
+    // fixed seed yields the same stream every run regardless of how many
+    // checks fall back.
+    let snapshot = if lazy {
+        Some((*rng, *mu, candidates.clone()))
+    } else {
+        None
+    };
+
+    let filtered = apply_modes(candidates, opts, rng, mu, model, lazy);
+    let mut chosen = choose_candidate(rng, filtered.softmax(None))
+        .is_one()
+        .unwrap()
+        .id;
+
+    if let Some((rng_snap, mu_snap, saved)) = snapshot {
+        // Verify just the chosen token's piece against every constraint —
+        // O(piece bytes) vs the O(vocab) filter sweep. Empty pieces are
+        // trivially accepted, matching the filters' per-candidate
+        // behavior.
+        let t0 = grammar::grammar_stats_enabled().then(std::time::Instant::now);
+        let mut buf: Vec<u8> = Vec::with_capacity(32);
+        model.token_to_piece_ref(chosen, &mut buf);
+        let legal = opts.modes.iter().all(|mode| match mode {
+            SamplingMode::Json(state) => state
+                .lock()
+                .expect(
+                    "SamplingMode::Json mutex poisoned; parser state is \
+                     unrecoverable. Rebuild the mode with \
+                     SamplingMode::json() and retry.",
+                )
+                .accepts_bytes(&buf),
+            SamplingMode::Grammar(state) => state
+                .lock()
+                .expect(
+                    "SamplingMode::Grammar mutex poisoned; matcher state \
+                     is unrecoverable. Rebuild the mode with \
+                     SamplingMode::grammar(...) and retry.",
+                )
+                .accepts_bytes(&buf),
+            _ => true,
+        });
+        if let Some(t0) = t0 {
+            grammar::record_lazy(legal, t0.elapsed().as_micros() as u64);
+        }
+        if !legal {
+            // Rejected: restore the pre-fold state and rerun the exact
+            // masked path, grammar filters included — with the forced-EOS
+            // termination those filters provide when nothing legal
+            // remains.
+            *rng = rng_snap;
+            *mu = mu_snap;
+            let filtered = apply_modes(saved, opts, rng, mu, model, false);
+            chosen = choose_candidate(rng, filtered.softmax(None))
+                .is_one()
+                .unwrap()
+                .id;
+        }
+    }
+
+    // Post-selection: advance every JSON and grammar parser in the chain
+    // by the chosen token. Multiple grammar constraints in the chain all
+    // observe the same chosen token and advance in lockstep.
+    json::advance_all(&opts.modes, chosen, model);
+    grammar::advance_all(&opts.modes, chosen, model);
+
+    Ok(chosen)
+}
+
+/// Fold `candidates` through `opts.modes` in order. With
+/// `skip_constraints`, the `Grammar`/`Json` arms pass candidates through
+/// untouched (the lazy fast path); every other mode still runs, so `Deny`
+/// reserved-token protection, truncation samplers, and mirostat behave
+/// identically on both paths.
+fn apply_modes<M: crate::backend::Model + Sync>(
+    candidates: Candidates,
+    opts: &SampleOptions,
+    rng: &mut xorshift::Xoroshiro128,
+    mu: &mut Option<f32>,
+    model: &M,
+    skip_constraints: bool,
+) -> Candidates {
     // `Arc::clone` on `SamplingMode::Json` is cheap and preserves shared-state
     // semantics across the fold — the cloned Arc still points at the same
-    // Mutex that the advance-step below will update.
-    let filtered =
-        opts.modes
-            .iter()
-            .cloned()
-            .fold(candidates, |candidates, mode| match mode {
+    // Mutex that the advance-step in `sample_token` will update.
+    opts.modes
+        .iter()
+        .cloned()
+        .fold(candidates, |candidates, mode| {
+            if skip_constraints
+                && matches!(
+                    mode,
+                    SamplingMode::Json(_) | SamplingMode::Grammar(_)
+                )
+            {
+                return candidates;
+            }
+            match mode {
                 SamplingMode::Greedy => candidates.sample_token_greedy(),
                 SamplingMode::TopP { p, min_keep } => {
                     candidates.top_p(p, min_keep)
@@ -1219,20 +1335,8 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                         Candidates::from_vec_unchecked(kept)
                     }
                 }
-            });
-
-    let chosen = choose_candidate(rng, filtered.softmax(None))
-        .is_one()
-        .unwrap()
-        .id;
-
-    // Post-selection: advance every JSON and grammar parser in the chain
-    // by the chosen token. Multiple grammar constraints in the chain all
-    // observe the same chosen token and advance in lockstep.
-    json::advance_all(&opts.modes, chosen, model);
-    grammar::advance_all(&opts.modes, chosen, model);
-
-    Ok(chosen)
+            }
+        })
 }
 
 /// Apply the softmax function to the remaining candidates and select a single
@@ -1262,4 +1366,240 @@ pub(crate) fn choose_candidate(
     // This can happen because of floating point errors
     let last = candidates.len().get() - 1;
     candidates.select(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ngram::NGramStats, Token, TokenData};
+    use xorshift::SeedableRng;
+
+    /// Minimal `Model` for exercising `sample_token` without a GGUF on
+    /// disk. Token id indexes straight into `PIECES`; id 0 is EOS with an
+    /// empty piece (like Qwen's secondary EOS variants decode to).
+    struct MockModel;
+
+    const PIECES: &[&str] = &["", "a", "b", "c", "x"];
+    const EOS: Token = 0;
+    const A: Token = 1;
+    const B: Token = 2;
+    const C: Token = 3;
+    const X: Token = 4;
+
+    impl crate::backend::Model for MockModel {
+        type Error = std::convert::Infallible;
+
+        fn n_vocab(&self) -> i32 {
+            PIECES.len() as i32
+        }
+        fn bos(&self) -> Token {
+            EOS
+        }
+        fn eos(&self) -> Token {
+            EOS
+        }
+        fn eot(&self) -> Token {
+            EOS
+        }
+        fn special_tokens(&self) -> Vec<Token> {
+            vec![EOS]
+        }
+        fn max_token_len(&self) -> usize {
+            1
+        }
+        fn tokenize(&self, _input: &str, _special: bool) -> Vec<Token> {
+            unimplemented!("not needed by sample_token")
+        }
+        fn token_to_piece(&self, token: Token) -> String {
+            PIECES[token as usize].to_string()
+        }
+        fn token_to_piece_ref(&self, token: Token, buf: &mut Vec<u8>) {
+            buf.clear();
+            buf.extend_from_slice(PIECES[token as usize].as_bytes());
+        }
+        fn context_size(&self) -> i32 {
+            4096
+        }
+        fn chat_template_source(&self) -> Option<String> {
+            None
+        }
+        fn get_meta(&self, _key: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// `root ::= "ab"` — accepts exactly the string "ab".
+    const AB_GRAMMAR: &str = r#"root ::= "ab""#;
+
+    fn opts_with_grammar(lazy: bool) -> SampleOptions {
+        SampleOptions {
+            modes: vec![
+                SamplingMode::grammar(AB_GRAMMAR).expect("test grammar parses")
+            ],
+            repetition: None,
+            deferred_grammar: None,
+            lazy_grammar: lazy,
+        }
+    }
+
+    /// Candidates from (id, logit) pairs.
+    fn cands(pairs: &[(Token, f32)]) -> Candidates {
+        Candidates::from_vec(
+            pairs
+                .iter()
+                .map(|&(id, logit)| TokenData { id, logit, p: 0.0 })
+                .collect(),
+        )
+    }
+
+    fn rng() -> xorshift::Xoroshiro128 {
+        xorshift::Xoroshiro128::from_seed(&[42, 1337][..])
+    }
+
+    fn sample(
+        candidates: Candidates,
+        opts: &mut SampleOptions,
+        rng: &mut xorshift::Xoroshiro128,
+        mu: &mut Option<f32>,
+    ) -> Token {
+        let mut freq = NGramStats::new();
+        sample_token(&[], candidates, opts, &mut freq, rng, mu, &MockModel)
+            .expect("sample_token")
+    }
+
+    /// Legal unconstrained winner: fast path must keep it and advance the
+    /// matcher exactly as the masked path would, token for token, with an
+    /// identical RNG draw stream.
+    #[test]
+    fn lazy_fast_path_matches_masked_on_legal_picks() {
+        let mut results: Vec<(Vec<Token>, u64)> = Vec::new();
+        for lazy in [false, true] {
+            let mut opts = opts_with_grammar(lazy);
+            let mut r = rng();
+            let mut mu = None;
+            let mut toks = Vec::new();
+            // "a" then "b" dominate in turn; both legal under the grammar
+            // at their step.
+            toks.push(sample(
+                cands(&[(A, 20.0), (X, 0.0), (EOS, -20.0)]),
+                &mut opts,
+                &mut r,
+                &mut mu,
+            ));
+            toks.push(sample(
+                cands(&[(B, 20.0), (X, 0.0), (EOS, -20.0)]),
+                &mut opts,
+                &mut r,
+                &mut mu,
+            ));
+            // Compare the *next* draw to prove the RNG streams stayed
+            // aligned across paths.
+            results.push((toks, r.next_u64()));
+        }
+        assert_eq!(results[0].0, vec![A, B]);
+        assert_eq!(results[0], results[1]);
+    }
+
+    /// Illegal unconstrained winner: the fallback must restore RNG + mu
+    /// and rerun the masked path bit-exactly — same chosen token, same
+    /// post-call RNG state as a `lazy = false` run.
+    #[test]
+    fn lazy_fallback_matches_masked_path_exactly() {
+        let mut results: Vec<(Token, u64)> = Vec::new();
+        for lazy in [false, true] {
+            let mut opts = opts_with_grammar(lazy);
+            let mut r = rng();
+            let mut mu = None;
+            // "x" dominates but is illegal; "a" is the legal pick.
+            let tok = sample(
+                cands(&[(X, 20.0), (A, 10.0), (EOS, -20.0)]),
+                &mut opts,
+                &mut r,
+                &mut mu,
+            );
+            results.push((tok, r.next_u64()));
+        }
+        assert_eq!(results[0].0, A);
+        assert_eq!(results[0], results[1]);
+    }
+
+    /// After the grammar completes, a lazy sample whose candidates hold
+    /// no legal (or empty) piece must fall back into the filter's
+    /// forced-EOS termination, and the auto-reset must leave the matcher
+    /// fresh.
+    #[test]
+    fn lazy_completion_forces_eos_and_resets() {
+        let mut opts = opts_with_grammar(true);
+        let mut r = rng();
+        let mut mu = None;
+        assert_eq!(
+            sample(cands(&[(A, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            A
+        );
+        assert_eq!(
+            sample(cands(&[(B, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            B
+        );
+        // Grammar complete; only non-empty illegal pieces on offer.
+        assert_eq!(
+            sample(cands(&[(C, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            EOS
+        );
+        // The filter auto-reset on completion: the matcher accepts "a"
+        // again from root.
+        match &opts.modes[0] {
+            SamplingMode::Grammar(state) => {
+                assert!(state.lock().unwrap().accepts_bytes(b"a"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Empty pieces are trivially legal on the fast path — mirroring the
+    /// masked filters, which keep empty-piece tokens unconditionally.
+    #[test]
+    fn lazy_accepts_empty_piece_mid_grammar() {
+        let mut opts = opts_with_grammar(true);
+        let mut r = rng();
+        let mut mu = None;
+        // EOS (empty piece) dominates mid-grammar. Masked mode would keep
+        // it too; both paths emit it.
+        let tok =
+            sample(cands(&[(EOS, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu);
+        assert_eq!(tok, EOS);
+        // The matcher must not have advanced (empty bytes are a no-op):
+        // "ab" still parses from root.
+        match &opts.modes[0] {
+            SamplingMode::Grammar(state) => {
+                assert!(state.lock().unwrap().accepts_bytes(b"ab"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// mu snapshot/restore: with mirostat in the chain, a lazy fallback
+    /// must leave `mu` exactly as the masked run computes it.
+    #[test]
+    fn lazy_fallback_restores_mu_for_mirostat() {
+        let mut results: Vec<(Token, Option<f32>, u64)> = Vec::new();
+        for lazy in [false, true] {
+            let mut opts = opts_with_grammar(lazy);
+            opts.modes.push(SamplingMode::MirostatV2 {
+                tau: 5.0,
+                eta: 0.1,
+                max_keep: None,
+            });
+            let mut r = rng();
+            let mut mu = None;
+            let tok = sample(
+                cands(&[(X, 20.0), (A, 10.0), (EOS, -20.0)]),
+                &mut opts,
+                &mut r,
+                &mut mu,
+            );
+            results.push((tok, mu, r.next_u64()));
+        }
+        assert_eq!(results[0].0, A);
+        assert_eq!(results[0], results[1]);
+    }
 }

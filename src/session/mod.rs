@@ -1590,6 +1590,7 @@ impl<B: Backend> Session<B> {
             modes,
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
+            lazy_grammar: self.sample_options.lazy_grammar,
         };
 
         // Count pieces as we consume them — one piece equals one
@@ -1833,6 +1834,7 @@ impl<B: Backend> Session<B> {
             modes,
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
+            lazy_grammar: self.sample_options.lazy_grammar,
         };
 
         let predictor = if prefill_start > 0 {
@@ -1944,6 +1946,7 @@ impl<B: Backend> Session<B> {
             modes,
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
+            lazy_grammar: self.sample_options.lazy_grammar,
         };
 
         // Collect generated pieces + count tokens inline. We also

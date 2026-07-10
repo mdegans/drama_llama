@@ -196,6 +196,11 @@ impl Deref for TokenDataArray<'_> {
 ///
 /// It is guaranteed, when not using unsafe methods, that:
 /// * The number of candidates is **at least 1** and at most `i32::MAX`.
+///
+/// `Clone` duplicates the full candidate vector (~3 MB at 250k vocab) —
+/// cheap next to a decode, but hot-path callers should clone only when
+/// they actually need a pre-fold snapshot (see `lazy_grammar`).
+#[derive(Clone)]
 pub struct Candidates {
     /// Cached state of whether the candidates are sorted, by what, and to what
     /// index. This is used to avoid unnecessary sorting.
