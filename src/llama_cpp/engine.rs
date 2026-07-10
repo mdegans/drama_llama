@@ -142,6 +142,43 @@ impl LlamaCppEngine {
         self.decoder.set_state(state)
     }
 
+    /// Size of the serialized state for a single sequence.
+    pub fn state_seq_size(&self, seq_id: i32) -> usize {
+        self.decoder.state_seq_size(seq_id)
+    }
+
+    /// Serialize a single sequence's state (KV cells plus recurrent
+    /// layer state). Restores via [`Self::set_state_seq`].
+    pub fn get_state_seq(&self, seq_id: i32) -> Vec<u8> {
+        self.decoder.get_state_seq(seq_id)
+    }
+
+    /// Restore a single sequence's state from
+    /// [`Self::get_state_seq`] bytes, loading as `dest_seq_id`.
+    /// Returns `false` if llama.cpp rejects the payload (the
+    /// destination sequence is left cleared).
+    pub fn set_state_seq(&mut self, state: &[u8], dest_seq_id: i32) -> bool {
+        self.decoder.set_state_seq(state, dest_seq_id)
+    }
+
+    /// Whether checkpointing takes real per-sequence snapshots. On by
+    /// default for recurrent / hybrid models (whose layer state cannot
+    /// be rewound by KV truncation); off for pure attention.
+    pub fn seq_snapshots_enabled(&self) -> bool {
+        self.decoder.seq_snapshots_enabled()
+    }
+
+    /// Force per-sequence snapshotting on or off. See
+    /// [`LlamaCppDecoder::set_seq_snapshots`](crate::LlamaCppDecoder::set_seq_snapshots).
+    pub fn set_seq_snapshots(&mut self, enabled: bool) {
+        self.decoder.set_seq_snapshots(enabled)
+    }
+
+    /// Number of per-sequence snapshots currently held.
+    pub fn seq_snapshot_count(&self) -> usize {
+        self.decoder.seq_snapshot_count()
+    }
+
     /// Performance information.
     pub fn get_timings(&self) -> llama_perf_context_data {
         self.decoder.get_timings()
