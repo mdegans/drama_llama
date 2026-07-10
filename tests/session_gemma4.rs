@@ -22,7 +22,18 @@ fn model_path() -> PathBuf {
         .join("models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf")
 }
 
+/// Install the cache-stability template sidecar next to the model —
+/// the deployment configuration this suite validates (blallama ships
+/// the same file). Idempotent; sourced from the versioned fixture.
+fn install_template_sidecar() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/templates/gemma4-cache-stable.jinja");
+    let sidecar = model_path().with_extension("template.jinja");
+    std::fs::copy(&fixture, &sidecar).expect("install template sidecar");
+}
+
 fn load_session(max_tokens: usize) -> drama_llama::LlamaCppSession {
+    install_template_sidecar();
     drama_llama::LlamaCppSession::from_path_sync(model_path())
         .expect("session load")
         .quiet()
@@ -234,28 +245,23 @@ fn emission_round_trips_through_parse_and_render() {
         )
         .expect("render follow_up");
 
-    // Gemma template quirk (accepted): the NON-thinking generation
-    // prompt ends with a pre-closed empty thought scaffold
-    // (`<|channel>thought\n<channel|>`) that a re-ingested assistant
-    // turn does not reproduce — the same family of quirk upstream
-    // works around at chat.cpp:1223. Production pays a one-turn
-    // re-prefill via the canonicalization LCP fallback; the shared
-    // prefix must therefore extend through `<|turn>model\n`, and the
-    // emission must follow it byte-for-byte in the re-render. (In
-    // thinking mode there is no scaffold and stability is full —
-    // pinned by the reconstruction harness.)
-    let scaffold = "<|channel>thought\n<channel|>";
-    let base = rendered_original
-        .strip_suffix(scaffold)
-        .unwrap_or(&rendered_original);
-    let suffix = rendered_follow_up.strip_prefix(base).unwrap_or_else(|| {
-        panic!(
-            "follow-up must extend the original prefix (modulo the \
-                 empty-thought scaffold).\n\
+    // STRICT byte-prefix: with the cache-stability template sidecar
+    // installed (`gemma4-cache-stable.jinja`), the re-ingested turn
+    // reproduces the non-thinking scaffold, so the follow-up render
+    // extends the generation prompt exactly — no LCP fallback, the
+    // assistant prefill is skippable. (The stock template drops the
+    // scaffold; that quirk and the patch are documented in the
+    // fixtures README and pinned FFI-free in dialect_roundtrip.rs.)
+    let suffix = rendered_follow_up
+        .strip_prefix(&rendered_original)
+        .unwrap_or_else(|| {
+            panic!(
+                "follow-up must extend the original prefix exactly \
+                 (is the template sidecar installed?).\n\
                  --- original ---\n{rendered_original}\n\
                  --- follow-up ---\n{rendered_follow_up}"
-        )
-    });
+            )
+        });
     assert!(
         suffix.starts_with(&raw),
         "emission is not a byte prefix of the canonical re-render.\n\

@@ -568,9 +568,20 @@ fn analyze_dialect<M: crate::backend::Model + ?Sized>(
         // stay total: no template means no dialect to derive.
         return crate::CallSyntax::default();
     };
+    analyze_dialect_source(model, &source)
+}
+
+/// [`analyze_dialect`] against an explicit template source — the
+/// template-sidecar path, where the effective template is not the
+/// model's embedded one. Grammar, parser, and render must all derive
+/// from the *same* source or round-trip byte-stability silently dies.
+fn analyze_dialect_source<M: crate::backend::Model + ?Sized>(
+    model: &M,
+    source: &str,
+) -> crate::CallSyntax {
     let bos = model.token_to_piece(model.bos());
     let eos = model.token_to_piece(model.eos());
-    let syntax = match crate::dialect::analyze_template(&source, &bos, &eos) {
+    let syntax = match crate::dialect::analyze_template(source, &bos, &eos) {
         Ok(syntax) => syntax,
         Err(e) => {
             eprintln!(
@@ -626,11 +637,53 @@ fn apply_dialect_sidecar<B: Backend>(
     }
 }
 
+/// Apply the per-model chat-template sidecar at `sidecar_path`, if
+/// any: raw Jinja source replacing the model's embedded template
+/// (see [`crate::sidecar::load_template_source`]). The dialect is
+/// re-analyzed against the override so grammar/parse/render stay in
+/// lockstep; an explicit dialect sidecar is applied *after* this and
+/// still wins. Compile/IO errors warn to stderr and keep the
+/// embedded template.
+fn apply_template_sidecar<B: Backend>(
+    mut session: Session<B>,
+    sidecar_path: &std::path::Path,
+) -> Session<B> {
+    match crate::sidecar::load_template_source(sidecar_path) {
+        Ok(Some(source)) => {
+            if let Err(e) = session.set_template_source(source) {
+                eprintln!(
+                    "drama_llama: template sidecar at {sidecar_path:?} \
+                     failed to compile: {e}; using the model's embedded \
+                     template"
+                );
+            }
+            session
+        }
+        Ok(None) => session,
+        Err(e) => {
+            eprintln!(
+                "drama_llama: could not read template sidecar at \
+                 {sidecar_path:?}: {e}; using the model's embedded template"
+            );
+            session
+        }
+    }
+}
+
 /// Sidecar path convention for llama-cpp models: sibling
 /// `<model>.sampling.toml` next to the `.gguf` file.
 #[cfg(feature = "llama-cpp")]
 fn llama_cpp_sidecar_path(model_path: &std::path::Path) -> std::path::PathBuf {
     model_path.with_extension("sampling.toml")
+}
+
+/// Template-sidecar convention for llama-cpp models: sibling
+/// `<model>.template.jinja` next to the `.gguf` file.
+#[cfg(feature = "llama-cpp")]
+fn llama_cpp_template_sidecar_path(
+    model_path: &std::path::Path,
+) -> std::path::PathBuf {
+    model_path.with_extension("template.jinja")
 }
 
 /// Dialect-sidecar convention for llama-cpp models: sibling
@@ -679,10 +732,14 @@ impl Session<LlamaCppBackend> {
     /// `toml` feature; without it, sidecars are ignored.
     pub fn from_path_sync(path: PathBuf) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
+        let template_sidecar = llama_cpp_template_sidecar_path(&path);
         let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path(path)?;
         Ok(apply_dialect_sidecar(
-            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            apply_template_sidecar(
+                apply_sidecar(Self::from_engine(engine)?, &sidecar),
+                &template_sidecar,
+            ),
             &dialect_sidecar,
         ))
     }
@@ -697,11 +754,15 @@ impl Session<LlamaCppBackend> {
         fa: crate::FlashAttention,
     ) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
+        let template_sidecar = llama_cpp_template_sidecar_path(&path);
         let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
         let engine =
             crate::LlamaCppEngine::from_path_with_flash_attention(path, fa)?;
         Ok(apply_dialect_sidecar(
-            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            apply_template_sidecar(
+                apply_sidecar(Self::from_engine(engine)?, &sidecar),
+                &template_sidecar,
+            ),
             &dialect_sidecar,
         ))
     }
@@ -720,10 +781,14 @@ impl Session<LlamaCppBackend> {
         n_ctx: u32,
     ) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
+        let template_sidecar = llama_cpp_template_sidecar_path(&path);
         let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path_with_n_ctx(path, n_ctx)?;
         Ok(apply_dialect_sidecar(
-            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            apply_template_sidecar(
+                apply_sidecar(Self::from_engine(engine)?, &sidecar),
+                &template_sidecar,
+            ),
             &dialect_sidecar,
         ))
     }
@@ -733,10 +798,14 @@ impl Session<LlamaCppBackend> {
     /// [`Self::from_path`].
     pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
+        let template_sidecar = llama_cpp_template_sidecar_path(&path);
         let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
         let engine = crate::LlamaCppEngine::from_path_cpu_only(path)?;
         Ok(apply_dialect_sidecar(
-            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            apply_template_sidecar(
+                apply_sidecar(Self::from_engine(engine)?, &sidecar),
+                &template_sidecar,
+            ),
             &dialect_sidecar,
         ))
     }
@@ -783,10 +852,14 @@ impl Session<MoefluxBackend> {
     /// sidecars are ignored.
     pub fn from_path_sync(parent: PathBuf) -> Result<Self, SessionError> {
         let sidecar = parent.join("sampling.toml");
+        let template_sidecar = parent.join("template.jinja");
         let dialect_sidecar = parent.join("dialect.toml");
         let engine = crate::MoefluxEngine::from_path(&parent)?;
         Ok(apply_dialect_sidecar(
-            apply_sidecar(Self::from_engine(engine)?, &sidecar),
+            apply_template_sidecar(
+                apply_sidecar(Self::from_engine(engine)?, &sidecar),
+                &template_sidecar,
+            ),
             &dialect_sidecar,
         ))
     }
@@ -929,6 +1002,33 @@ impl<B: Backend> Session<B> {
         self.render_opts.thought_reingest = dialect.reasoning.reingest;
         self.dialect = dialect;
         self
+    }
+
+    /// Replace the chat template with `source` (raw Jinja) and
+    /// re-analyze the tool-call dialect against it, so grammar,
+    /// parser, and render stay derived from the same template.
+    ///
+    /// This is the programmatic form of the `<model>.template.jinja`
+    /// sidecar (see [`crate::sidecar::load_template_source`]), which
+    /// exists to patch serving-side template bugs — e.g. the vendored
+    /// `gemma4-cache-stable.jinja` fixes Gemma 4's re-ingest path
+    /// dropping the thinking channel, which otherwise breaks KV-cache
+    /// byte-stability on every turn. A dialect sidecar or
+    /// [`Self::with_dialect`] call applied afterwards still overrides
+    /// the re-analysis.
+    ///
+    /// On compile failure the session is left unchanged.
+    pub fn set_template_source(
+        &mut self,
+        source: String,
+    ) -> Result<(), crate::ChatTemplateError> {
+        let bos = self.engine.model.token_to_piece(self.engine.model.bos());
+        let eos = self.engine.model.token_to_piece(self.engine.model.eos());
+        self.template = ChatTemplate::from_source(source.clone(), bos, eos)?;
+        let dialect = analyze_dialect_source(&self.engine.model, &source);
+        self.render_opts.thought_reingest = dialect.reasoning.reingest;
+        self.dialect = dialect;
+        Ok(())
     }
 
     /// The active tool-call dialect — template-derived unless

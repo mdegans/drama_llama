@@ -15,3 +15,13 @@ Unsloth GGUF. It is a lightly patched superset of the vendored
 turn-close fix); the tool-call rendering path is byte-identical, so
 upstream's pinned expectations (`tests/test-chat.cpp`, "Google Gemma
 4" section) apply to both.
+
+`gemma4-cache-stable.jinja` is drama_llama's cache-stability patch of
+`gemma4-gguf.jinja`: model turns re-render the thinking channel the
+model actually generated against (real reasoning, gated by
+`preserve_thinking` for aged turns; the empty
+`<|channel>thought\n<channel|>` scaffold otherwise), so the KV cache
+stays a byte prefix of the next render across tool turns. Deploy it
+as a `<model>.template.jinja` sidecar next to the GGUF. Everything
+outside the thinking-channel block is byte-identical to
+`gemma4-gguf.jinja`.

@@ -1,11 +1,15 @@
-//! Per-model sampling sidecar files.
+//! Per-model sidecar files.
 //!
-//! A sidecar is a TOML file colocated with a model on disk that holds
-//! that model's preferred [`SampleOptions`] — sampling-mode chain,
-//! repetition-penalty config, etc. [`crate::LlamaCppSession::from_path*`] looks for
-//! one when loading a model and applies it via
-//! [`Session::with_sample_options`]. If no sidecar exists, a default is
-//! written so the user has a starting point to edit.
+//! A sidecar is a file colocated with a model on disk that overrides
+//! one aspect of how it is served: sampling defaults
+//! (`<model>.sampling.toml`, [`SampleOptions`]), the tool-call
+//! dialect (`<model>.dialect.toml`,
+//! [`CallSyntax`](crate::CallSyntax)), or the chat template itself
+//! (`<model>.template.jinja`, raw Jinja — the only one available
+//! without the `toml` feature). [`crate::LlamaCppSession::from_path*`]
+//! looks for each when loading a model. For sampling, if no sidecar
+//! exists a default is written so the user has a starting point to
+//! edit.
 //!
 //! ## Where sidecars live
 //!
@@ -48,6 +52,7 @@
 
 use std::path::Path;
 
+#[cfg(feature = "toml")]
 use crate::SampleOptions;
 
 /// Failure mode for sidecar I/O.
@@ -59,12 +64,14 @@ pub enum SidecarError {
         #[source]
         source: std::io::Error,
     },
+    #[cfg(feature = "toml")]
     #[error("sidecar TOML parse at {path:?}: {source}")]
     Parse {
         path: std::path::PathBuf,
         #[source]
         source: toml::de::Error,
     },
+    #[cfg(feature = "toml")]
     #[error("sidecar TOML serialize: {0}")]
     Serialize(#[from] toml::ser::Error),
 }
@@ -82,6 +89,7 @@ static_assertions::assert_impl_all!(SidecarError: Send, Sync);
 ///   (permissions, etc.).
 /// - `Err(SidecarError::Parse)` — file exists but contains malformed
 ///   TOML or TOML that doesn't deserialize into [`SampleOptions`].
+#[cfg(feature = "toml")]
 pub fn load_sample_options(
     path: &Path,
 ) -> Result<Option<SampleOptions>, SidecarError> {
@@ -114,6 +122,7 @@ pub fn load_sample_options(
 /// returned `Ok(None)`.
 ///
 /// [`crate::LlamaCppSession::from_path*`]: crate::crate::LlamaCppSession::from_path
+#[cfg(feature = "toml")]
 pub fn write_default_sample_options(path: &Path) -> Result<(), SidecarError> {
     let opts = SampleOptions::default();
     let body = toml::to_string_pretty(&opts)?;
@@ -147,6 +156,7 @@ pub fn write_default_sample_options(path: &Path) -> Result<(), SidecarError> {
 /// merge is whole-struct replacement, not per-field patching over the
 /// analysis (simpler to reason about; a partial sidecar plus analyzer
 /// output would make round-trip failures very hard to attribute).
+#[cfg(feature = "toml")]
 pub fn load_call_syntax(
     path: &Path,
 ) -> Result<Option<crate::CallSyntax>, SidecarError> {
@@ -168,9 +178,35 @@ pub fn load_call_syntax(
     Ok(Some(syntax))
 }
 
+/// Read a chat-template sidecar from `path` if it exists — raw Jinja
+/// source overriding the model's embedded `tokenizer.chat_template`.
+///
+/// Discovery convention mirrors the other sidecars: sibling file at
+/// `<model>.template.jinja` for GGUF (`model.gguf` →
+/// `model.template.jinja`), `parent/template.jinja` for moeflux. No
+/// default is auto-written — the embedded template *is* the default;
+/// a sidecar exists to patch serving-side template bugs (e.g. the
+/// vendored `gemma4-cache-stable.jinja`, which fixes Gemma 4's
+/// re-ingest path dropping the thinking channel and breaking
+/// KV-cache byte-stability). The dialect analyzer re-runs against
+/// the override so grammar/parse/render stay in lockstep.
+pub fn load_template_source(
+    path: &Path,
+) -> Result<Option<String>, SidecarError> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(SidecarError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Serialize `syntax` to `path` as TOML. Utility for pinning an
 /// analyzer result into an editable override (e.g. via a future CLI
 /// `--dump-dialect`); nothing calls this automatically.
+#[cfg(feature = "toml")]
 pub fn write_call_syntax(
     path: &Path,
     syntax: &crate::CallSyntax,
@@ -188,7 +224,7 @@ pub fn write_call_syntax(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "toml"))]
 mod tests {
     use super::*;
 

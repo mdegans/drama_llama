@@ -169,6 +169,42 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
   - e2e: `tests/session_gemma4.rs` (7 tests, `--features serde,cuda`
     — plain `serde` builds CPU-only and 31B crawls; that mistake cost
     round 1). GPU runs on this box are fine per Phase E note.
+- **Phase F follow-up: cache-stable template sidecar** (2026-07-10,
+  session 3 cont.; Mike: "willing to sacrifice context for reasoning
+  quality" — keep aged thinking). Both known quirks above are now
+  FIXED for deployments that install the sidecar; only quirk 1
+  (content-after-calls ordering) remains accepted.
+  - `tests/fixtures/templates/gemma4-cache-stable.jinja` — patch of
+    the GGUF template: model messages ALWAYS render the thinking
+    channel (real reasoning gated on `preserve_thinking` |
+    last-turn; the empty `<|channel>thought\n<channel|>` scaffold
+    otherwise). Rationale: the model's emission always begins with a
+    thought block (it emits the empty scaffold itself when the
+    prompt omits it — observed e2e), so the stock template dropping
+    it on re-ingest is the template's bug. Note keeping aged
+    thinking is the ONLY cache-stable option — the thought bytes are
+    already in the KV; older Anthropic models dropped thinking too
+    (and stopped).
+  - New sidecar kind: `<model>.template.jinja` (GGUF) /
+    `parent/template.jinja` (moeflux) — raw Jinja override of the
+    embedded template. `sidecar::load_template_source` +
+    `Session::set_template_source` (recompiles ChatTemplate AND
+    re-analyzes the dialect from the SAME source — lockstep
+    invariant); applied before the dialect sidecar so an explicit
+    dialect override still wins. `sidecar` module un-gated from
+    `toml` (template sidecar is toml-free; TOML items gated
+    individually).
+  - Pins: `gemma4_cache_stable_prefix_continuity` (FFI-free, the
+    cache property itself: generation-prompt render is a byte PREFIX
+    of the follow-up render — non-thinking scaffold, thinking
+    byte-exact thought, aged thought preserved);
+    `reconstruct_gemma4_cache_stable`; analyzer sniff pin covers the
+    patched fixture. e2e installs the sidecar (copy fixture →
+    `models/<model>.template.jinja`) and the round-trip test asserts
+    the STRICT byte prefix (no LCP fallback — assistant prefill
+    skippable).
+  - blallama deployment note: ship `gemma4-cache-stable.jinja` as
+    `<model>.template.jinja` next to the Gemma GGUF.
 
 ## Problem
 

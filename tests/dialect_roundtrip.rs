@@ -173,6 +173,160 @@ fn reconstruct_gemma4_gguf() {
 }
 
 #[test]
+fn reconstruct_gemma4_cache_stable() {
+    // The patch must not disturb the call-rendering path.
+    assert_reconstruction("gemma4-cache-stable.jinja", "<bos>", "<turn|>");
+}
+
+/// The cache property itself, pinned FFI-free against the patched
+/// template: the generation-prompt render is a byte PREFIX of the
+/// follow-up render (turn appended, no generation prompt), so the KV
+/// laid down during generation is reusable verbatim. Three cases the
+/// stock template breaks:
+/// 1. non-thinking — the empty-thought scaffold must reappear on
+///    re-ingest;
+/// 2. thinking — the model's own thought block must re-render
+///    byte-identically;
+/// 3. aged thinking — `preserve_thinking` keeps the thought bytes
+///    once a later user message lands.
+#[test]
+fn gemma4_cache_stable_prefix_continuity() {
+    use drama_llama::dialect::ReasoningReingest;
+
+    let source = fixture_source("gemma4-cache-stable.jinja");
+    let syntax = CallSyntax::gemma4();
+    let tool = test_tool();
+    let input = json!({"city": "Paris", "days": 3});
+    let calls_ref = render_reference(&syntax, &[("get_weather", &input)])
+        .expect("representable");
+    let template = ChatTemplate::from_source(
+        source,
+        "<bos>".to_string(),
+        "<turn|>".to_string(),
+    )
+    .expect("template compiles");
+
+    let opts = |gen: bool, thinking: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", thinking)
+            .with_extra("preserve_thinking", true)
+            .with_thought_reingest(ReasoningReingest::Field)
+    };
+    let user = Message {
+        role: Role::User,
+        content: Content::text("What's the weather in Paris?"),
+    };
+    let call_block = Block::ToolUse {
+        call: ToolUse {
+            id: Cow::Borrowed("call00001"),
+            name: Cow::Borrowed("get_weather"),
+            input: input.clone(),
+            cache_control: None,
+            caller: None,
+        },
+    };
+    let base = Prompt {
+        messages: vec![user.clone()],
+        tools: Some(vec![tool.clone().into()]),
+        ..Default::default()
+    };
+
+    // Case 1: non-thinking. The generation prompt ends with the
+    // empty-thought scaffold; the re-ingested turn must reproduce it.
+    let p = template
+        .render_with(&base, &opts(true, false))
+        .expect("render");
+    assert!(
+        p.ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
+        "generation prompt tail changed: {p:?}"
+    );
+    let mut with_turn = base.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![call_block.clone()]),
+    });
+    let f = template
+        .render_with(&with_turn, &opts(false, false))
+        .expect("render");
+    let suffix = f.strip_prefix(&p).unwrap_or_else(|| {
+        panic!(
+            "non-thinking: follow-up must extend the generation \
+             prompt.\n--- gen ---\n{p:?}\n--- follow-up ---\n{f:?}"
+        )
+    });
+    assert!(
+        suffix.starts_with(&calls_ref),
+        "non-thinking: emission bytes must follow.\n{suffix:?}"
+    );
+    assert!(
+        suffix[calls_ref.len()..].starts_with("<|tool_response>"),
+        "turn-exit marker must follow the calls.\n{suffix:?}"
+    );
+
+    // Case 2: thinking. Bare model header; the model's thought block
+    // plus calls must re-render byte-identically.
+    let p = template
+        .render_with(&base, &opts(true, true))
+        .expect("render");
+    assert!(
+        p.ends_with("<|turn>model\n"),
+        "thinking generation prompt tail changed: {p:?}"
+    );
+    let thought = "weighing the options";
+    let mut with_turn = base.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![
+            Block::Thought {
+                thought: Cow::Borrowed(thought),
+                signature: Cow::Borrowed(""),
+            },
+            call_block.clone(),
+        ]),
+    });
+    let f = template
+        .render_with(&with_turn, &opts(false, true))
+        .expect("render");
+    let emission =
+        format!("<|channel>thought\n{thought}\n<channel|>{calls_ref}");
+    let suffix = f.strip_prefix(&p).unwrap_or_else(|| {
+        panic!(
+            "thinking: follow-up must extend the generation prompt.\n\
+             --- gen ---\n{p:?}\n--- follow-up ---\n{f:?}"
+        )
+    });
+    assert!(
+        suffix.starts_with(&emission),
+        "thinking: thought + calls must re-render byte-exact.\n\
+         --- want ---\n{emission:?}\n--- got ---\n{suffix:?}"
+    );
+
+    // Case 3: aging. A later user message must not strip the thought
+    // bytes (preserve_thinking) — the prior render stays a prefix.
+    let mut aged = with_turn.clone();
+    aged.messages.push(Message {
+        role: Role::User,
+        content: Content(vec![Block::ToolResult {
+            result: drama_llama::prompt::ToolResult {
+                tool_use_id: Cow::Borrowed("call00001"),
+                content: Content::text("22C, sunny"),
+                is_error: false,
+                cache_control: None,
+            },
+        }]),
+    });
+    let f_aged = template
+        .render_with(&aged, &opts(false, true))
+        .expect("render");
+    assert!(
+        f_aged.contains(&emission),
+        "aged turn lost its thought bytes despite preserve_thinking.\n\
+         --- want contained ---\n{emission:?}\n--- render ---\n{f_aged:?}"
+    );
+}
+
+#[test]
 fn reconstruct_gemma4_upstream() {
     assert_reconstruction("google-gemma-4-31B-it.jinja", "<bos>", "<turn|>");
 }

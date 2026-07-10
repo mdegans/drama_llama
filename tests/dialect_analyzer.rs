@@ -124,7 +124,13 @@ fn llama31_json_native() {
 /// upstream-vendored template and yield the baked constant wholesale.
 #[test]
 fn gemma4_sniffed() {
-    for fixture in ["gemma4-gguf.jinja", "google-gemma-4-31B-it.jinja"] {
+    for fixture in [
+        "gemma4-gguf.jinja",
+        "google-gemma-4-31B-it.jinja",
+        // The cache-stability template sidecar must resolve the SAME
+        // dialect — Session re-analyzes the override at load.
+        "gemma4-cache-stable.jinja",
+    ] {
         let s = analyze(fixture, "<bos>", "<turn|>");
         assert_eq!(s, CallSyntax::gemma4(), "{fixture}: {s:#?}");
     }
