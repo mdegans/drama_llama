@@ -130,6 +130,9 @@ pub fn compile_output_config(
         Ok(CompiledOutputConfig::Deferred(DeferredGrammar {
             grammar,
             activate_after: THINK_CLOSE_TRIGGER.to_vec(),
+            // The JSON-body grammar starts *after* `</think>`; the
+            // trigger itself stays outside the constrained span.
+            feed_trigger: false,
         }))
     } else {
         let source = build_grammar_source(schema, opts);

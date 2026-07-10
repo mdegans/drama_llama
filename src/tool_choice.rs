@@ -29,9 +29,13 @@
 //!
 //! # Auto
 //!
-//! [`ToolChoice::Auto`] returns `None` — no sampling constraint is
-//! needed because the model is free to call or not call. Pair with
-//! `Prompt::tools` to advertise the tools.
+//! [`ToolChoice::Auto`] (or an absent `tool_choice`) gets no *eager*
+//! constraint from [`grammar_for_tool_choice`] — the model is free to
+//! call or not call. [`deferred_grammar_for_prompt`] instead builds a
+//! *lazy* constraint: a [`DeferredGrammar`](crate::DeferredGrammar)
+//! that sleeps until the wrap-tag open appears in the output, then
+//! constrains the rest of the call (trigger bytes fed into the
+//! matcher). Prose and thought before the trigger run unconstrained.
 //!
 //! [`ToolChoice`]: misanthropic::tool::Choice
 //! [`Tool`]: crate::Tool
@@ -108,19 +112,52 @@ impl Default for ToolChoiceOptions {
     }
 }
 
+/// How the tool-call grammar's root rule anchors on the rendered
+/// generation prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootShape {
+    /// Eager (`Any` / `Method`): the grammar is active from the first
+    /// generated token. When `thought_pre_opened`, the rendered
+    /// generation prompt already *ends* with an open `<think>` tag
+    /// (Qwen-style `enable_thinking` templates append
+    /// `<|im_start|>assistant\n<think>\n`), so generation begins
+    /// inside the reasoning block: the root requires a think body and
+    /// the `</think>` close before the call — demanding another
+    /// literal `<think>` (the old behavior) made thinking impossible
+    /// under grammar. Pre-opened dominates
+    /// [`ToolChoiceOptions::allow_thought`]: the tag must be closed
+    /// for the assistant span to re-parse, whatever the caller's
+    /// thought policy.
+    Eager { thought_pre_opened: bool },
+    /// Lazy (`Auto`): the grammar sleeps until the wrap-tag trigger
+    /// appears in the output, and the trigger bytes are fed into the
+    /// matcher on activation ([`DeferredGrammar::feed_trigger`]). The
+    /// root is therefore exactly the wrapped call — no thought
+    /// prefix (thought happened before the trigger, unconstrained)
+    /// and no leading whitespace.
+    Lazy,
+}
+
 /// Build a [`SamplingMode::Grammar`] that forces the model's output to
 /// match the chosen tool-call shape.
 ///
-/// Returns `Ok(None)` for [`ToolChoice::Auto`] — no constraint is
-/// appropriate there. For [`ToolChoice::Any`] the grammar accepts any
+/// Returns `Ok(None)` for [`ToolChoice::Auto`] — no *eager*
+/// constraint is appropriate there; see
+/// [`deferred_grammar_for_prompt`] for the lazy trigger-activated
+/// constraint. For [`ToolChoice::Any`] the grammar accepts any
 /// of the tools in `tools`; [`ToolChoice::Method`] pins a specific
 /// tool. Returns an error if the chosen tool is not in `tools`, if
 /// `tools` is empty (and choice is not `Auto`), or if the generated
 /// GBNF fails to compile.
+///
+/// `thought_pre_opened`: whether the rendered generation prompt ends
+/// with an open `<think>` tag — see [`RootShape::Eager`]. Callers
+/// without a render in hand pass `false` (the historical behavior).
 pub fn grammar_for_tool_choice(
     choice: &ToolChoice,
     tools: &[Tool],
     opts: &ToolChoiceOptions,
+    thought_pre_opened: bool,
 ) -> Result<Option<SamplingMode>, ToolChoiceError> {
     // Resolve which tools the grammar is allowed to pick from. For
     // `Any` that's all advertised tools; for `Method` it's a singleton.
@@ -148,9 +185,65 @@ pub fn grammar_for_tool_choice(
         }
     };
 
-    let source = build_grammar_source(&chosen, opts);
+    let source = build_grammar_source(
+        &chosen,
+        opts,
+        RootShape::Eager { thought_pre_opened },
+    );
     let mode = SamplingMode::grammar(&source)?;
     Ok(Some(mode))
+}
+
+/// Build the lazy (trigger-activated) tool-call constraint for a
+/// prompt whose `tool_choice` is `Auto` — or absent, which the
+/// Anthropic API treats as auto — with tools advertised.
+///
+/// Returns a [`DeferredGrammar`] that sleeps until the wrap-tag open
+/// (e.g. `<tool_call>\n`) appears in the output, then activates with
+/// the trigger bytes fed into the matcher, constraining the remainder
+/// of the call to the tool schemas. Thought and prose before the
+/// trigger run unconstrained at full speed.
+///
+/// Returns `Ok(None)` when there is nothing to defer: a non-auto
+/// `tool_choice`, no tools, or no
+/// [`wrap_tags`](ToolChoiceOptions::wrap_tags) (bare-JSON dialects
+/// have no reliable trigger; Llama-3.1-style callers keep today's
+/// unconstrained-auto behavior).
+///
+/// Known trade-off (shared with llama.cpp's lazy grammars):
+/// activation is not gated on `</think>`, so a *literal*
+/// `<tool_call>` inside a reasoning block triggers the constraint
+/// early. Accepted — the parser, not the grammar, is the source of
+/// truth for what is really a call.
+pub fn deferred_grammar_for_prompt(
+    prompt: &Prompt,
+    opts: &ToolChoiceOptions,
+) -> Result<Option<crate::DeferredGrammar>, ToolChoiceError> {
+    match prompt.tool_choice.as_ref() {
+        None | Some(ToolChoice::Auto { .. }) => {}
+        Some(_) => return Ok(None),
+    }
+    let tools: Vec<Tool> = prompt
+        .tools
+        .iter()
+        .flatten()
+        .filter_map(|def| def.as_method())
+        .cloned()
+        .collect();
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    let Some((open, _)) = opts.wrap_tags else {
+        return Ok(None);
+    };
+    let chosen: Vec<&Tool> = tools.iter().collect();
+    let source = build_grammar_source(&chosen, opts, RootShape::Lazy);
+    let grammar = SamplingMode::grammar(&source)?;
+    Ok(Some(crate::DeferredGrammar {
+        grammar,
+        activate_after: open.as_bytes().to_vec(),
+        feed_trigger: true,
+    }))
 }
 
 /// Derive the tool-choice grammar directly from a [`Prompt`]. Reads
@@ -165,6 +258,7 @@ pub fn grammar_for_tool_choice(
 pub fn grammar_for_prompt(
     prompt: &Prompt,
     opts: &ToolChoiceOptions,
+    thought_pre_opened: bool,
 ) -> Result<Option<SamplingMode>, ToolChoiceError> {
     let Some(choice) = prompt.tool_choice.as_ref() else {
         return Ok(None);
@@ -179,7 +273,7 @@ pub fn grammar_for_prompt(
         .filter_map(|def| def.as_method())
         .cloned()
         .collect();
-    grammar_for_tool_choice(choice, &tools, opts)
+    grammar_for_tool_choice(choice, &tools, opts, thought_pre_opened)
 }
 
 /// Debug-only accessor for the compiled GBNF text. Kept public so the
@@ -190,7 +284,13 @@ pub fn build_grammar_source_for_debug(
     tools: &[&Tool],
     opts: &ToolChoiceOptions,
 ) -> String {
-    build_grammar_source(tools, opts)
+    build_grammar_source(
+        tools,
+        opts,
+        RootShape::Eager {
+            thought_pre_opened: false,
+        },
+    )
 }
 
 /// Emit the GBNF source text for a tool-choice constraint.
@@ -209,20 +309,45 @@ pub fn build_grammar_source_for_debug(
 pub(crate) fn build_grammar_source(
     tools: &[&Tool],
     opts: &ToolChoiceOptions,
+    shape: RootShape,
 ) -> String {
     let mut src = String::with_capacity(1024);
 
-    // Root rule: optional thought block, then (optionally wrapped) call.
+    // Root rule: reasoning prefix per `shape`, then the (optionally
+    // wrapped) call.
     let wrapped_call = if opts.wrap_tags.is_some() {
         "wrapped_call"
     } else {
         "call"
     };
-    if opts.allow_thought {
-        let _ = writeln!(src, "root ::= thought? ws {wrapped_call}");
-        emit_thought_rules(&mut src);
-    } else {
-        let _ = writeln!(src, "root ::= ws {wrapped_call}");
+    match shape {
+        RootShape::Eager {
+            thought_pre_opened: true,
+        } => {
+            // The template already opened `<think>`; the model is
+            // mid-reasoning at token 0 and must close the tag before
+            // the call. See `RootShape::Eager` for why this wins over
+            // `allow_thought`.
+            let _ = writeln!(
+                src,
+                r#"root ::= think_body "</think>" ws {wrapped_call}"#
+            );
+            emit_thought_rules(&mut src);
+        }
+        RootShape::Eager {
+            thought_pre_opened: false,
+        } if opts.allow_thought => {
+            let _ = writeln!(src, "root ::= thought? ws {wrapped_call}");
+            emit_thought_rules(&mut src);
+        }
+        RootShape::Eager { .. } => {
+            let _ = writeln!(src, "root ::= ws {wrapped_call}");
+        }
+        RootShape::Lazy => {
+            // Activation feeds the trigger (the wrap-tag open) into
+            // the matcher, so the root begins exactly there.
+            let _ = writeln!(src, "root ::= {wrapped_call}");
+        }
     }
     if let Some((open, close)) = opts.wrap_tags {
         // LlamaCppModel emits `<open>\n{…}\n</close>` in its trained format.
@@ -303,6 +428,18 @@ static_assertions::assert_impl_all!(ToolChoiceError: Send, Sync);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Historical default shape for the source-level tests: eager
+    /// root, no pre-opened thought.
+    fn eager_src(tools: &[&Tool], opts: &ToolChoiceOptions) -> String {
+        build_grammar_source(
+            tools,
+            opts,
+            RootShape::Eager {
+                thought_pre_opened: false,
+            },
+        )
+    }
     use crate::{Grammar, GrammarState};
     use serde_json::json;
     use std::sync::Arc;
@@ -349,6 +486,7 @@ mod tests {
             &ToolChoice::auto(),
             &[],
             &ToolChoiceOptions::default(),
+            false,
         )
         .unwrap();
         assert!(got.is_none());
@@ -360,6 +498,7 @@ mod tests {
             &ToolChoice::any(),
             &[],
             &ToolChoiceOptions::default(),
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, ToolChoiceError::NoTools));
@@ -371,6 +510,7 @@ mod tests {
             &ToolChoice::method("missing"),
             &[tool("get_weather")],
             &ToolChoiceOptions::default(),
+            false,
         )
         .unwrap_err();
         assert!(
@@ -381,7 +521,7 @@ mod tests {
     #[test]
     fn method_grammar_accepts_forced_call() {
         let t = tool("get_weather");
-        let src = build_grammar_source(&[&t], &bare_opts());
+        let src = eager_src(&[&t], &bare_opts());
         assert!(accepts(
             &src,
             r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#
@@ -397,7 +537,7 @@ mod tests {
     fn any_grammar_accepts_any_listed_name() {
         let a = tool("a");
         let b = tool("b");
-        let src = build_grammar_source(&[&a, &b], &bare_opts());
+        let src = eager_src(&[&a, &b], &bare_opts());
         assert!(accepts(&src, r#"{"name": "a", "parameters": {}}"#));
         assert!(accepts(&src, r#"{"name": "b", "parameters": {}}"#));
         assert!(!accepts(&src, r#"{"name": "c", "parameters": {}}"#));
@@ -410,7 +550,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(&src, r#"{"name": "x", "arguments": {}}"#));
         // With `arguments`, `parameters` is rejected.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {}}"#));
@@ -423,7 +563,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         // No thought.
         assert!(accepts(&src, r#"{"name": "x", "parameters": {}}"#));
         // With thought.
@@ -436,7 +576,7 @@ mod tests {
     #[test]
     fn deeply_nested_arguments_accepted() {
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &bare_opts());
+        let src = eager_src(&[&t], &bare_opts());
         assert!(accepts(
             &src,
             r#"{"name": "x", "parameters": {"a": {"b": [1, 2, {"c": "d"}]}}}"#
@@ -460,7 +600,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&schema_tool], &opts);
+        let src = eager_src(&[&schema_tool], &opts);
         // Correct shape accepted.
         assert!(accepts(
             &src,
@@ -509,7 +649,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&tool_a, &tool_b], &opts);
+        let src = eager_src(&[&tool_a, &tool_b], &opts);
 
         // Each tool's name accepts its own args.
         assert!(accepts(&src, r#"{"name": "a", "parameters": {"x": 1}}"#));
@@ -530,6 +670,7 @@ mod tests {
             &ToolChoice::any(),
             &[tool_a, tool_b],
             &opts,
+            false,
         );
         assert!(res.is_ok(), "Any+strict_schema must compile, got {res:?}");
     }
@@ -537,7 +678,7 @@ mod tests {
     #[test]
     fn malformed_arguments_rejected() {
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &bare_opts());
+        let src = eager_src(&[&t], &bare_opts());
         // Trailing comma is invalid JSON.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {"a": 1,}}"#));
         // Single-quoted string is invalid JSON.
@@ -573,6 +714,7 @@ mod tests {
             &ToolChoice::method("two_ints"),
             &[schema_tool.clone()],
             &opts,
+            false,
         );
         assert!(
             result.is_ok(),
@@ -581,7 +723,7 @@ mod tests {
         );
         // And the grammar must still accept valid inputs and reject
         // decimals.
-        let src = build_grammar_source(&[&schema_tool], &opts);
+        let src = eager_src(&[&schema_tool], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "two_ints", "parameters": {"x": 1, "y": 2}}"#
@@ -601,7 +743,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             "<think>if x < 5 then call x</think>\n{\"name\": \"x\", \"parameters\": {}}"
@@ -615,7 +757,7 @@ mod tests {
     fn tool_name_with_special_chars_embeds_safely() {
         // A tool name with a backslash and a quote.
         let weird_tool = tool("evil\\\"name");
-        let src = build_grammar_source(&[&weird_tool], &bare_opts());
+        let src = eager_src(&[&weird_tool], &bare_opts());
         // Grammar compiles.
         assert!(
             Grammar::parse(&src).is_ok(),
@@ -639,7 +781,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             "<tool_call>\n{\"name\": \"x\", \"parameters\": {}}\n</tool_call>"
@@ -653,7 +795,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         // With wrap_tags on, bare JSON without the envelope must be
         // rejected.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {}}"#));
@@ -666,7 +808,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         // Wrong close tag.
         assert!(!accepts(
             &src,
@@ -689,7 +831,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             "<think>plan the call</think>\n<tool_call>\n{\"name\": \"x\", \"parameters\": {}}\n</tool_call>"
@@ -710,7 +852,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(!accepts(
             &src,
             r#"<think>never closed {"name": "x", "parameters": {}}"#
@@ -724,7 +866,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         // Thought after the JSON is not in the grammar.
         assert!(!accepts(
             &src,
@@ -739,7 +881,7 @@ mod tests {
             ..bare_opts()
         };
         let t = tool("x");
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"<think></think>{"name": "x", "parameters": {}}"#
@@ -768,7 +910,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
         assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": -7}}"#));
         assert!(!accepts(
@@ -788,7 +930,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
         assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 1.5}}"#));
         assert!(accepts(
@@ -808,7 +950,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"b": true}}"#
@@ -831,7 +973,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"z": null}}"#
@@ -849,7 +991,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"color": "red"}}"#
@@ -874,7 +1016,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"level": 1}}"#
@@ -899,7 +1041,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"tags": ["a", "b"]}}"#
@@ -941,7 +1083,7 @@ mod tests {
             strict_schema: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts);
+        let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
             r#"{"name": "fn", "parameters": {"loc": {"x": 1, "y": 2}}}"#
@@ -968,7 +1110,8 @@ mod tests {
             ..Default::default()
         };
         let got =
-            grammar_for_prompt(&prompt, &ToolChoiceOptions::default()).unwrap();
+            grammar_for_prompt(&prompt, &ToolChoiceOptions::default(), false)
+                .unwrap();
         assert!(got.is_none());
     }
 
@@ -981,8 +1124,138 @@ mod tests {
             ..Default::default()
         };
         let got =
-            grammar_for_prompt(&prompt, &ToolChoiceOptions::default()).unwrap();
+            grammar_for_prompt(&prompt, &ToolChoiceOptions::default(), false)
+                .unwrap();
         assert!(got.is_none());
+    }
+
+    // ======================================================================
+    // RootShape: pre-opened thought + lazy (Phase A2)
+    // ======================================================================
+
+    /// Pre-opened `<think>`: generation starts inside the reasoning
+    /// block, so the root must accept body-then-close-then-call and
+    /// must reject a call that never closes the tag. Regression for
+    /// the Qwen can't-think-under-grammar bug.
+    #[test]
+    fn eager_pre_opened_thought_requires_close_before_call() {
+        let t = tool("get_weather");
+        let opts = ToolChoiceOptions {
+            wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
+            ..bare_opts()
+        };
+        let src = build_grammar_source(
+            &[&t],
+            &opts,
+            RootShape::Eager {
+                thought_pre_opened: true,
+            },
+        );
+        // Reasoning body, close, then the wrapped call.
+        assert!(accepts(
+            &src,
+            "the user wants weather, calling now</think>\n<tool_call>\n{\"name\": \"get_weather\", \"parameters\": {}}\n</tool_call>"
+        ));
+        // Empty body is fine — immediate close then call.
+        assert!(accepts(
+            &src,
+            "</think>\n<tool_call>\n{\"name\": \"get_weather\", \"parameters\": {}}\n</tool_call>"
+        ));
+        // Never closing the pre-opened tag: rejected, whatever
+        // follows.
+        assert!(!accepts(
+            &src,
+            "<tool_call>\n{\"name\": \"get_weather\", \"parameters\": {}}\n</tool_call>"
+        ));
+        // Pre-opened dominates allow_thought=false (bare_opts): the
+        // close is still required, not forbidden.
+        assert!(!accepts(
+            &src,
+            "{\"name\": \"get_weather\", \"parameters\": {}}"
+        ));
+    }
+
+    /// Lazy root: exactly the wrapped call from byte 0 (the trigger
+    /// bytes are fed in at promotion), no thought prefix, no leading
+    /// whitespace.
+    #[test]
+    fn lazy_root_is_exactly_the_wrapped_call() {
+        let t = tool("get_weather");
+        let opts = ToolChoiceOptions {
+            wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
+            allow_thought: true,
+            ..bare_opts()
+        };
+        let src = build_grammar_source(&[&t], &opts, RootShape::Lazy);
+        assert!(accepts(
+            &src,
+            "<tool_call>\n{\"name\": \"get_weather\", \"parameters\": {}}\n</tool_call>"
+        ));
+        // No thought prefix — the lazy grammar starts at the trigger.
+        assert!(!accepts(
+            &src,
+            "<think>x</think> <tool_call>\n{\"name\": \"get_weather\", \"parameters\": {}}\n</tool_call>"
+        ));
+        // No leading whitespace either.
+        assert!(!accepts(
+            &src,
+            " <tool_call>\n{\"name\": \"get_weather\", \"parameters\": {}}\n</tool_call>"
+        ));
+    }
+
+    /// `deferred_grammar_for_prompt`: auto (explicit or absent) with
+    /// tools yields a trigger-fed deferred grammar; Any / no-tools /
+    /// no-wrap-tags yield None.
+    #[test]
+    fn deferred_for_prompt_auto_shapes() {
+        use crate::Prompt;
+        let auto_with_tools = Prompt {
+            tool_choice: Some(ToolChoice::auto()),
+            tools: Some(vec![tool("x").into()]),
+            ..Default::default()
+        };
+        let opts = ToolChoiceOptions::default();
+        let d = deferred_grammar_for_prompt(&auto_with_tools, &opts)
+            .unwrap()
+            .expect("auto + tools must defer");
+        assert_eq!(d.activate_after, b"<tool_call>\n".to_vec());
+        assert!(d.feed_trigger);
+
+        // Absent tool_choice counts as auto.
+        let absent = Prompt {
+            tool_choice: None,
+            tools: Some(vec![tool("x").into()]),
+            ..Default::default()
+        };
+        assert!(deferred_grammar_for_prompt(&absent, &opts)
+            .unwrap()
+            .is_some());
+
+        // Non-auto choice: eager path's territory.
+        let any = Prompt {
+            tool_choice: Some(ToolChoice::any()),
+            tools: Some(vec![tool("x").into()]),
+            ..Default::default()
+        };
+        assert!(deferred_grammar_for_prompt(&any, &opts).unwrap().is_none());
+
+        // No tools advertised.
+        let no_tools = Prompt {
+            tool_choice: Some(ToolChoice::auto()),
+            ..Default::default()
+        };
+        assert!(deferred_grammar_for_prompt(&no_tools, &opts)
+            .unwrap()
+            .is_none());
+
+        // No wrap tags: no reliable trigger, keep unconstrained auto.
+        let bare = ToolChoiceOptions {
+            wrap_tags: None,
+            ..ToolChoiceOptions::default()
+        };
+        assert!(deferred_grammar_for_prompt(&auto_with_tools, &bare)
+            .unwrap()
+            .is_none());
     }
 
     /// End-to-end: force the model to make a specific tool call. The
@@ -1029,6 +1302,7 @@ mod tests {
             &choice,
             &tools,
             &ToolChoiceOptions::default(),
+            false,
         )
         .unwrap()
         .expect("Method choice should yield a grammar");

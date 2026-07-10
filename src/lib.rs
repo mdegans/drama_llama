@@ -50,12 +50,13 @@ pub use minijinja;
 
 pub(crate) mod grammar_compile;
 #[doc(hidden)]
-pub use grammar_compile::{schema_to_gbnf, JSON_GRAMMAR};
+pub use grammar_compile::{emit_until_rules, schema_to_gbnf, JSON_GRAMMAR};
 
 mod tool_choice;
 pub use tool_choice::{
-    build_grammar_source_for_debug, grammar_for_prompt,
-    grammar_for_tool_choice, ToolChoiceError, ToolChoiceOptions,
+    build_grammar_source_for_debug, deferred_grammar_for_prompt,
+    grammar_for_prompt, grammar_for_tool_choice, ToolChoiceError,
+    ToolChoiceOptions,
 };
 
 pub mod output_config;

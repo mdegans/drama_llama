@@ -174,6 +174,13 @@ pub struct DeferredGrammar {
     /// triggers promotion. Matched anywhere in the trailing window (same
     /// sizing as stop-strings), not just at the exact text end.
     pub activate_after: Vec<u8>,
+    /// Whether the trigger bytes themselves are fed into the grammar
+    /// state at promotion (llama.cpp lazy-pattern semantics: the
+    /// grammar root *starts with* the trigger, e.g. a `<tool_call>\n`
+    /// wrap-open). `false` keeps the original behavior — only bytes
+    /// *after* the trigger feed in (e.g. `</think>` triggering a
+    /// JSON-body grammar).
+    pub feed_trigger: bool,
 }
 
 impl SampleOptions {
