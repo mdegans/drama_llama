@@ -685,7 +685,16 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
                 .deferred_grammar
                 .take()
                 .expect("deferred_grammar presence checked above");
-            let tail = &self.text.as_bytes()[trigger_end..];
+            // Lazy-pattern grammars start their root at the trigger
+            // itself; feed from the trigger's first byte so the
+            // matcher lines up (`find_deferred_trigger_end` guarantees
+            // `trigger_end >= trigger.len()`).
+            let feed_from = if promoted.feed_trigger {
+                trigger_end - promoted.activate_after.len()
+            } else {
+                trigger_end
+            };
+            let tail = &self.text.as_bytes()[feed_from..];
             if !tail.is_empty() {
                 if let crate::SamplingMode::Grammar(state_arc) =
                     &promoted.grammar

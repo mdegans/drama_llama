@@ -1012,4 +1012,94 @@ mod tests {
         // constraint is syntactic, not semantic.
         println!("parsed as: {parsed:#}");
     }
+
+    /// Phase B2 validation for `SampleOptions::lazy_grammar` (#28) on a
+    /// real model:
+    ///
+    /// * every seed's output parses as valid JSON (fallback catches all
+    ///   illegal picks);
+    /// * the same seed run twice is byte-identical (lazy mode stays
+    ///   deterministic);
+    /// * with `DRAMA_LLAMA_GRAMMAR_STATS=1`, prints the measured
+    ///   fast-path acceptance rate — the number the plan's "~99%"
+    ///   anecdote gets replaced by.
+    ///
+    /// Lazy output legitimately differs from masked output (documented
+    /// semantics change); nothing here compares across the two modes.
+    #[cfg(feature = "serde")]
+    #[test]
+    #[ignore = "requires model, long running"]
+    fn json_integration_lazy_grammar() {
+        use crate::{PredictOptions, SampleOptions, SamplingMode};
+        use std::{
+            num::{NonZeroU128, NonZeroUsize},
+            path::PathBuf,
+        };
+
+        let model_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let mut engine = crate::LlamaCppEngine::from_path(model_path).unwrap();
+
+        const PROMPT: &str = "Output only valid JSON for a fantasy RPG \
+            character with these fields: name (string), class (string), \
+            level (integer), hp (integer), alive (bool), inventory (array \
+            of strings). Do not include any prose. JSON: ";
+        let tokens = engine.model.tokenize(PROMPT, false);
+        let eos_piece = engine.model.token_to_piece(engine.model.eos());
+
+        let mut run = |seed: u128| -> String {
+            let mut opts =
+                PredictOptions::default().add_model_stops(&engine.model);
+            opts.n = NonZeroUsize::new(256).unwrap();
+            opts.seed = Some(NonZeroU128::new(seed).unwrap());
+            opts.sample_options = SampleOptions {
+                modes: vec![
+                    SamplingMode::json(),
+                    SamplingMode::locally_typical(),
+                ],
+                lazy_grammar: true,
+                ..SampleOptions::default()
+            };
+            engine.predict_pieces(tokens.clone(), opts).collect()
+        };
+
+        for seed in [2u128, 3, 5, 7, 11] {
+            let output = run(seed);
+            let trimmed =
+                output.trim_end_matches(eos_piece.as_str()).trim_end();
+            let parsed: serde_json::Value = serde_json::from_str(trimmed)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "lazy output must be valid JSON. seed: {seed}, \
+                         parse error: {e}\noutput: {output:?}"
+                    )
+                });
+            println!("seed {seed}: {parsed:#}");
+        }
+
+        // Determinism: same seed, byte-identical output.
+        let first = run(13);
+        let second = run(13);
+        assert_eq!(
+            first, second,
+            "same seed must produce byte-identical output in lazy mode"
+        );
+
+        if crate::sample::grammar_stats_enabled() {
+            let stats = crate::sample::grammar_stats_snapshot();
+            let rate = stats.lazy_hits as f64
+                / (stats.lazy_checks.max(1)) as f64
+                * 100.0;
+            println!(
+                "lazy stats: checks={} hits={} fallbacks={} ({rate:.2}% \
+                 fast path), check µs sum={} max={}",
+                stats.lazy_checks,
+                stats.lazy_hits,
+                stats.lazy_fallbacks,
+                stats.check_us_sum,
+                stats.check_us_max,
+            );
+            assert!(stats.lazy_checks > 0, "lazy checks must have run");
+        }
+    }
 }

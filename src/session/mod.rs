@@ -1002,6 +1002,7 @@ impl<B: Backend> Session<B> {
             prompt,
             &self.tool_choice_opts,
             &self.output_config_opts,
+            render_ends_with_open_think(&rendered),
         )? {
             None => (None, None),
             Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
@@ -1073,13 +1074,15 @@ impl<B: Backend> Session<B> {
         ),
         SessionError,
     > {
-        let (tokens, breakpoints, partial_hashes) = if self
+        let (tokens, breakpoints, partial_hashes, thought_pre_opened) = if self
             .prefix_cache
             .is_some()
         {
             let rendered = self
                 .template
                 .render_with_breakpoints(prompt, &self.render_opts)?;
+            let thought_pre_opened =
+                render_ends_with_open_think(&rendered.text);
             // Inlines `tokenize_with_breakpoints` so we can keep
             // the SHA-256 of each surviving partial paired with
             // its token index. The shared helper only returns
@@ -1109,7 +1112,7 @@ impl<B: Backend> Session<B> {
                 pairs.iter().map(|(idx, _)| *idx).collect();
             let hashes: Vec<[u8; 32]> =
                 pairs.into_iter().map(|(_, h)| h).collect();
-            (full_tokens, breakpoints, hashes)
+            (full_tokens, breakpoints, hashes, thought_pre_opened)
         } else {
             // Fast path: single render + tokenize, no partials.
             let rendered =
@@ -1118,6 +1121,7 @@ impl<B: Backend> Session<B> {
                 self.engine.model.tokenize(&rendered, true),
                 Vec::new(),
                 Vec::new(),
+                render_ends_with_open_think(&rendered),
             )
         };
 
@@ -1125,6 +1129,7 @@ impl<B: Backend> Session<B> {
             prompt,
             &self.tool_choice_opts,
             &self.output_config_opts,
+            thought_pre_opened,
         )? {
             None => (None, None),
             Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
@@ -2401,6 +2406,7 @@ fn resolve_grammar(
     prompt: &Prompt,
     tool_choice_opts: &ToolChoiceOptions,
     output_config_opts: &OutputConfigOptions,
+    thought_pre_opened: bool,
 ) -> Result<Option<crate::CompiledOutputConfig>, SessionError> {
     #[cfg(feature = "axum")]
     {
@@ -2419,7 +2425,9 @@ fn resolve_grammar(
             "resolve_grammar: input",
         );
     }
-    if let Some(g) = grammar_for_prompt(prompt, tool_choice_opts)? {
+    if let Some(g) =
+        grammar_for_prompt(prompt, tool_choice_opts, thought_pre_opened)?
+    {
         #[cfg(feature = "axum")]
         tracing::debug!(
             target: "drama_llama::session",
@@ -2442,12 +2450,37 @@ fn resolve_grammar(
         );
         return Ok(Some(c));
     }
+    // Auto (or absent) tool_choice with tools advertised: lazy
+    // trigger-activated constraint. Lowest priority — an explicit
+    // output_config outranks the speculative auto grammar (only one
+    // deferred slot exists, and output_config is the caller's direct
+    // ask).
+    if let Some(d) =
+        crate::deferred_grammar_for_prompt(prompt, tool_choice_opts)?
+    {
+        #[cfg(feature = "axum")]
+        tracing::debug!(
+            target: "drama_llama::session",
+            kind = "tool_choice_auto_lazy",
+            "resolve_grammar: returning Deferred (auto)",
+        );
+        return Ok(Some(crate::CompiledOutputConfig::Deferred(d)));
+    }
     #[cfg(feature = "axum")]
     tracing::debug!(
         target: "drama_llama::session",
         "resolve_grammar: returning None (no grammar applied)",
     );
     Ok(None)
+}
+
+/// Whether a rendered generation prompt ends with a *pre-opened*
+/// `<think>` tag — Qwen-style `enable_thinking` templates append
+/// `<|im_start|>assistant\n<think>\n`, so generation starts inside the
+/// reasoning block and an eager grammar must not demand another
+/// literal `<think>`. See `RootShape::Eager` in `tool_choice`.
+fn render_ends_with_open_think(rendered: &str) -> bool {
+    rendered.trim_end().ends_with("<think>")
 }
 
 /// Everything [`Session::run_call`] produces about one batch call —
@@ -2826,6 +2859,7 @@ mod tests {
             &prompt,
             &ToolChoiceOptions::default(),
             &OutputConfigOptions::default(),
+            false,
         )
         .expect("resolve");
         assert!(got.is_none());
@@ -2856,6 +2890,7 @@ mod tests {
             &prompt,
             &ToolChoiceOptions::default(),
             &OutputConfigOptions::default(),
+            false,
         )
         .expect("resolve");
         let crate::CompiledOutputConfig::Deferred(deferred) =
@@ -2897,6 +2932,7 @@ mod tests {
                 allow_thought: true,
                 phase_split: false,
             },
+            false,
         )
         .expect("resolve");
         let crate::CompiledOutputConfig::Single(SamplingMode::Grammar(state)) =
@@ -2933,6 +2969,7 @@ mod tests {
             &prompt,
             &ToolChoiceOptions::default(),
             &OutputConfigOptions::default(),
+            false,
         )
         .expect("resolve");
         let crate::CompiledOutputConfig::Single(SamplingMode::Grammar(state)) =
