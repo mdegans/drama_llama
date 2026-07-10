@@ -12,3 +12,6 @@ model.sampling.toml
 screenshots/
 .claude/docs/*.pdf
 .DS_Store
+# Auto-generated per-model sampling sidecars (crate defaults written
+# on first Session load; see future_work_gguf_sampling_defaults.md).
+models/*.sampling.toml

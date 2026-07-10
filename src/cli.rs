@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use llama_cpp_sys_3::{
-    llama_context_default_params, llama_context_params,
-    llama_model_default_params, llama_model_params,
+    llama_context_params, llama_model_default_params, llama_model_params,
 };
 
 #[derive(Debug, Parser)]
@@ -47,8 +46,8 @@ impl From<&Args> for llama_model_params {
 
 impl From<&Args> for llama_context_params {
     fn from(args: &Args) -> Self {
-        // Safety: same as above
-        let mut params = unsafe { llama_context_default_params() };
+        // Upgrades ggml's 4-thread library default to all cores.
+        let mut params = crate::LlamaCppEngine::default_context_params();
         params.n_ctx = args.context;
 
         params

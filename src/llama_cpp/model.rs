@@ -764,6 +764,23 @@ mod tests {
 
     use super::*;
 
+    /// Load `models/model.gguf` with zero GPU layers. The metadata
+    /// tests only inspect vocab / metadata — CPU-only loading keeps
+    /// them VRAM-free so the default parallel test runner can't stack
+    /// several full models onto one card (observed: two of the three
+    /// failing with "unable to allocate CUDA0 buffer" on a 24 GB card
+    /// under `--features cuda`).
+    fn load_test_model_cpu() -> LlamaCppModel {
+        use std::path::PathBuf;
+
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("models/model.gguf");
+        let mut params =
+            unsafe { llama_cpp_sys_3::llama_model_default_params() };
+        params.n_gpu_layers = 0;
+        LlamaCppModel::from_file(path, Some(params)).unwrap()
+    }
+
     /// Smoke-test of model loading + introspection. Uses whatever
     /// `models/model.gguf` points to; assertions are model-agnostic so
     /// swapping the symlink (Llama → Qwen → Cogito) doesn't break the
@@ -772,12 +789,7 @@ mod tests {
     /// fixture test, not here.
     #[test]
     fn test_model() {
-        use std::path::PathBuf;
-
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("models/model.gguf");
-
-        let model = LlamaCppModel::from_file(path, None).unwrap();
+        let model = load_test_model_cpu();
 
         // Architecture-agnostic invariants every loaded model must
         // satisfy. BPE vocab is the common case (Llama, Qwen, Cogito,
@@ -838,10 +850,7 @@ mod tests {
 
     #[test]
     fn test_metadata() {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("models/model.gguf");
-
-        let model = LlamaCppModel::from_file(path, None).unwrap();
+        let model = load_test_model_cpu();
         let meta = model.meta();
         for (key, val) in meta.iter() {
             println!("{}: {}", key, val);
@@ -851,10 +860,7 @@ mod tests {
 
     #[test]
     fn test_model_desc() {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("models/model.gguf");
-
-        let model = LlamaCppModel::from_file(path, None).unwrap();
+        let model = load_test_model_cpu();
         let desc = model.desc();
         assert!(!desc.is_empty());
         assert!(!desc.ends_with("\0"));

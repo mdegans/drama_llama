@@ -26,8 +26,8 @@
 use std::{borrow::Cow, path::PathBuf};
 
 use drama_llama::{
-    prompt::{ToolResult, ToolUse},
-    Block, Content, Message, Prompt, Role, Tool,
+    prompt::ToolResult, Block, Content, Message, Prompt, RenderOptions, Role,
+    Tool,
 };
 use misanthropic::prompt::message::CacheControl;
 use serde_json::json;
@@ -76,48 +76,64 @@ fn build_round1() -> (Prompt, Tool) {
     (prompt, tool)
 }
 
-/// Extend the round-1 prompt with the assistant's tool_use response,
-/// a tool_result, and a follow-up user message. `cache_control` on
+/// Extend the round-1 prompt with the assistant's response content
+/// (verbatim, as parsed) and a follow-up user turn. `cache_control` on
 /// the follow-up gives drama_llama a fresh breakpoint at the new tip.
 fn build_round2(
     base_prompt: &Prompt,
-    tool_use: ToolUse,
-    result_text: &str,
+    assistant_content: Content,
+    user_blocks: Vec<Block>,
 ) -> Prompt {
-    let call_id = tool_use.id.clone();
     let mut prompt = base_prompt.clone();
     prompt.messages.push(Message {
         role: Role::Assistant,
-        content: Content(vec![Block::ToolUse { call: tool_use }]),
+        content: assistant_content,
     });
     prompt.messages.push(Message {
         role: Role::User,
-        content: Content(vec![
-            Block::ToolResult {
-                result: ToolResult {
-                    tool_use_id: call_id,
-                    content: Content::text(result_text.to_string()),
-                    is_error: false,
-                    cache_control: None,
-                },
-            },
-            Block::Text {
-                text: Cow::Borrowed("Thanks. Now spell that word backwards."),
-                cache_control: Some(CacheControl::ephemeral()),
-                citations: None,
-            },
-        ]),
+        content: Content(user_blocks),
     });
     prompt
+}
+
+/// Set an ephemeral cache marker on the last block of an assistant
+/// turn that supports one. The auto-tip hash matches a subsequent
+/// request's partial render only where a breakpoint exists, and
+/// breakpoints exist only at `cache_control` markers (see
+/// `Session::compute_tip_hash`). The marker is metadata, not rendered
+/// content, so it doesn't perturb the hash itself.
+fn mark_last_block(content: &mut Content) {
+    if let Some(last) = content.last_mut() {
+        match last {
+            Block::Text { cache_control, .. } => {
+                *cache_control = Some(CacheControl::ephemeral());
+            }
+            Block::ToolUse { call } => {
+                call.cache_control = Some(CacheControl::ephemeral());
+            }
+            _ => {}
+        }
+    }
 }
 
 #[test]
 #[ignore = "requires model; sets DRAMA_LLAMA_COGITO_MODEL or models/model.gguf"]
 fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
+    // `preserve_thinking` keeps prior-turn reasoning in re-renders.
+    // Without it, think-stripping templates (Qwen3.5/3.6) render round
+    // 2's transcript with different bytes than round 1 generated, the
+    // transcripts genuinely diverge at the assistant turn, and the
+    // auto-tip correctly cannot fire — reuse stops at the divergence.
+    // Byte-stable rendering is the contract the tip mechanic needs.
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("model loads")
             .quiet()
+            .with_render_opts(
+                RenderOptions::default()
+                    .with_generation_prompt(true)
+                    .with_extra("preserve_thinking", true),
+            )
             .with_prefix_cache(true);
 
     let (round1_prompt, _tool) = build_round1();
@@ -136,33 +152,37 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
         round1_cache_read.unwrap_or(0),
     );
 
-    // The response's tool_use (if any) — needed for round 2's
-    // re-rendering. If the model produced text only, synthesize a
-    // dummy ToolUse so we still exercise the hash-cache code path.
-    let mut tool_use =
-        round1_resp
-            .inner
-            .tool_use()
-            .cloned()
-            .unwrap_or_else(|| ToolUse {
-                id: Cow::Borrowed("synthetic_call_1"),
-                name: Cow::Borrowed("count_letters"),
-                input: json!({"letter": "r", "string": "strawberry"}),
+    // Round 2's assistant turn is the content round 1 *actually
+    // produced*, verbatim — the auto-tip hash was computed over those
+    // parsed blocks, so substituting anything else (e.g. a synthetic
+    // tool call) guarantees a miss. A tool_result rides along only if
+    // the model really called the tool; otherwise the follow-up is a
+    // plain user turn.
+    let mut assistant_content = round1_resp.inner.content.clone();
+    mark_last_block(&mut assistant_content);
+
+    let mut user_blocks: Vec<Block> = Vec::new();
+    if let Some(call) = round1_resp.inner.tool_use() {
+        user_blocks.push(Block::ToolResult {
+            result: ToolResult {
+                tool_use_id: call.id.clone(),
+                content: Content::text("3"),
+                is_error: false,
                 cache_control: None,
-                caller: None,
-            });
-    // Mark the assistant turn: the auto-tip hash matches a subsequent
-    // request's partial render only where a breakpoint exists, and
-    // breakpoints exist only at cache_control markers (see
-    // `Session::compute_tip_hash` — "places a marker on (or just past)
-    // that assistant message"). The marker is metadata, not rendered
-    // content, so it doesn't perturb the hash itself.
-    tool_use.cache_control = Some(CacheControl::ephemeral());
+            },
+        });
+    }
+    user_blocks.push(Block::Text {
+        text: Cow::Borrowed("Thanks. Now spell that word backwards."),
+        cache_control: Some(CacheControl::ephemeral()),
+        citations: None,
+    });
 
     // Round 2: extend the conversation; cache_read should jump from
     // ~prefix-only (system+tools+first_user_msg) to ~all-of-round-1
     // (auto-tip hit) when hash-keyed reuse fires.
-    let round2_prompt = build_round2(&round1_prompt, tool_use, "3");
+    let round2_prompt =
+        build_round2(&round1_prompt, assistant_content, user_blocks);
     let round2_resp = session
         .complete_response(&round2_prompt)
         .expect("round 2 completes");

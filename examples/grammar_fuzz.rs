@@ -260,7 +260,18 @@ fn gen_object(rng: &mut SmallRng, depth: usize) -> Value {
 
 fn gen_array(rng: &mut SmallRng, depth: usize) -> Value {
     let items = gen_schema(rng, depth.saturating_sub(1));
-    json!({ "type": "array", "items": items })
+    // A third of arrays carry `minItems: 1` — the one array-count
+    // constraint the grammar enforces (non-emptiness, Anthropic
+    // parity). Values > 1 are intentionally never generated: the
+    // grammar is deliberately permissive there (see
+    // schema_constraint_keywords_decision.md) and the jsonschema
+    // oracle would report that intentional non-feature as a Class 3
+    // finding.
+    if rng.random_range(0..3) == 0 {
+        json!({ "type": "array", "items": items, "minItems": 1 })
+    } else {
+        json!({ "type": "array", "items": items })
+    }
 }
 
 fn gen_any_of(rng: &mut SmallRng, depth: usize) -> Value {

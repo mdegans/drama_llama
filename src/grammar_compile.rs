@@ -27,6 +27,10 @@
 //!   optional properties"), so a model emitting in that canonical
 //!   order will not force-EOS against this grammar.
 //! * `type: array` with `items` → array of the item schema.
+//!   `minItems >= 1` additionally forces non-emptiness — matching
+//!   what Anthropic's structured outputs enforce (its sanitizer
+//!   passes `minItems: 0 | 1` through). Counts beyond non-emptiness
+//!   are ignored like other value-bound keywords (see below).
 //! * `type: string | integer | number | boolean | null` → the
 //!   corresponding JSON grammar rule.
 //! * `enum` (any JSON value) → alternation of literals.
@@ -195,10 +199,30 @@ fn emit_schema_rule(
             } else {
                 "value".to_string()
             };
-            let _ = writeln!(
-                out,
-                r#"{rule_name} ::= "[" ws ( {items_rule} ( ws "," ws {items_rule} )* )? ws "]""#
-            );
+            // `minItems >= 1` forces a non-empty array — exactly as
+            // much as Anthropic's own structured outputs enforce (the
+            // misanthropic sanitizer passes `minItems: 0 | 1` through
+            // and strips larger values). Counts beyond non-emptiness
+            // are deliberately NOT enforced: forcing N items
+            // manufactures filler entries, the value-bound failure
+            // mode documented in
+            // `.claude/memory/schema_constraint_keywords_decision.md`.
+            // `maxItems` remains unenforced (permissive) for the same
+            // reason.
+            let non_empty =
+                schema.get("minItems").and_then(|v| v.as_u64()).unwrap_or(0)
+                    >= 1;
+            if non_empty {
+                let _ = writeln!(
+                    out,
+                    r#"{rule_name} ::= "[" ws {items_rule} ( ws "," ws {items_rule} )* ws "]""#
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    r#"{rule_name} ::= "[" ws ( {items_rule} ( ws "," ws {items_rule} )* )? ws "]""#
+                );
+            }
         }
         _ => {
             // Unknown / unsupported — accept any JSON value.
@@ -485,6 +509,97 @@ mod tests {
         let src = wrap_with_root("root_obj", rules);
         assert!(accepts(&src, r#"{"inner":{"x":1}}"#));
         assert!(!accepts(&src, r#"{"inner":{}}"#));
+    }
+
+    /// A schemars-derived shape with a `$ref`-array and a string
+    /// array (the whodunit CaseFile pattern) must accept a POPULATED
+    /// instance — regression probe for suspects_considered=[] on
+    /// Qwen3.6: is it the model's choice or a grammar hole?
+    #[test]
+    fn compiles_ref_array_accepts_populated() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "suspects": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/Suspect"}
+                },
+                "evidence": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "culprit": {"type": "string"},
+            },
+            "required": ["suspects", "evidence", "culprit"],
+            "$defs": {
+                "Suspect": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "had_access": {"type": "boolean"},
+                    },
+                    "required": ["name", "had_access"],
+                }
+            }
+        });
+        let mut rules = String::new();
+        schema_to_gbnf(&schema, "case", &mut rules);
+        let src = wrap_with_root("case", rules);
+        assert!(
+            accepts(
+                &src,
+                r#"{"suspects":[{"name":"Crane","had_access":true},{"name":"Elsie","had_access":false}],"evidence":["poison","ledger"],"culprit":"Crane"}"#
+            ),
+            "grammar must accept populated $ref arrays:\n{src}"
+        );
+        assert!(accepts(
+            &src,
+            r#"{"suspects":[],"evidence":[],"culprit":"Crane"}"#
+        ));
+    }
+
+    /// `minItems >= 1` enforces non-emptiness and nothing more —
+    /// Anthropic-API parity (its sanitizer passes only `0 | 1`
+    /// through). Larger counts stay validator territory per
+    /// `.claude/memory/schema_constraint_keywords_decision.md`.
+    #[test]
+    fn min_items_enforces_non_empty_only() {
+        let schema = json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        });
+        let mut rules = String::new();
+        schema_to_gbnf(&schema, "arr1", &mut rules);
+        let src = wrap_with_root("arr1", rules);
+        assert!(!accepts(&src, "[]"), "empty must be rejected");
+        assert!(accepts(&src, r#"["a"]"#));
+        assert!(accepts(&src, r#"["a", "b"]"#));
+
+        // Counts beyond non-emptiness are NOT enforced: minItems 3
+        // still admits a single element (forcing more manufactures
+        // filler — the value-bound failure mode).
+        let schema = json!({
+            "type": "array",
+            "items": {"type": "integer"},
+            "minItems": 3,
+        });
+        let mut rules = String::new();
+        schema_to_gbnf(&schema, "arr3", &mut rules);
+        let src = wrap_with_root("arr3", rules);
+        assert!(!accepts(&src, "[]"));
+        assert!(accepts(&src, "[1]"), "counts beyond 1 are permissive");
+
+        // minItems 0 (and absent) keep the empty form.
+        let schema = json!({
+            "type": "array",
+            "items": {"type": "integer"},
+            "minItems": 0,
+        });
+        let mut rules = String::new();
+        schema_to_gbnf(&schema, "arr0", &mut rules);
+        let src = wrap_with_root("arr0", rules);
+        assert!(accepts(&src, "[]"));
     }
 
     #[test]

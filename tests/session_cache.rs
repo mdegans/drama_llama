@@ -146,36 +146,43 @@ fn shared_prefix_survives_divergent_turn() {
 #[test]
 #[ignore = "long running, requires models/model.gguf"]
 fn cached_output_matches_uncached_output() {
-    let mut cached = session(true);
-    let mut fresh = session(false);
-
+    // The sessions run sequentially, not side by side: two fully
+    // offloaded models don't fit a 24 GB card together, and the
+    // comparison doesn't need them concurrent.
     let prompt = base_prompt();
-    let out_cached_1 = cached.complete_response(&prompt).expect("cached r1");
+    let mut prompt2 = prompt.clone();
+
+    let (cached_text_1, cached_text_2, cached_read_2) = {
+        let mut cached = session(true);
+        let r1 = cached.complete_response(&prompt).expect("cached r1");
+        // Round 2 extends with the cached session's assistant turn;
+        // the fresh session will replay the identical transcript, so
+        // the cached session's reuse path is the only variable.
+        extend(&mut prompt2, r1.inner.content.clone(), "Now name a shape.");
+        let r2 = cached.complete_response(&prompt2).expect("cached r2");
+        (
+            r1.inner.content.to_string(),
+            r2.inner.content.to_string(),
+            r2.usage.cache_read_input_tokens.unwrap_or(0),
+        )
+    };
+
+    let mut fresh = session(false);
     let out_fresh_1 = fresh.complete_response(&prompt).expect("fresh r1");
     assert_eq!(
-        out_cached_1.inner.content.to_string(),
+        cached_text_1,
         out_fresh_1.inner.content.to_string(),
         "round 1 outputs diverged before any cache reuse — \
          nondeterminism, not a cache bug"
     );
 
-    // Round 2 extends with the SAME assistant turn on both sessions,
-    // so the cached session's reuse path is the only variable.
-    let mut prompt2 = prompt.clone();
-    extend(
-        &mut prompt2,
-        out_cached_1.inner.content.clone(),
-        "Now name a shape.",
-    );
-    let out_cached_2 = cached.complete_response(&prompt2).expect("cached r2");
     let out_fresh_2 = fresh.complete_response(&prompt2).expect("fresh r2");
-
     assert!(
-        out_cached_2.usage.cache_read_input_tokens.unwrap_or(0) > 0,
+        cached_read_2 > 0,
         "cached session failed to reuse — test would vacuously pass"
     );
     assert_eq!(
-        out_cached_2.inner.content.to_string(),
+        cached_text_2,
         out_fresh_2.inner.content.to_string(),
         "cache-path output diverged from fresh-session output"
     );
