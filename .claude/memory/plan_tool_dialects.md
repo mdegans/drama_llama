@@ -205,6 +205,34 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
     skippable).
   - blallama deployment note: ship `gemma4-cache-stable.jinja` as
     `<model>.template.jinja` next to the Gemma GGUF.
+- **Prose-before-call probe** (2026-07-10, session 3 cont.; Mike
+  rejected the template's call-first reorder as a causality
+  violation — "the model made a tool call and then tells the user
+  they will make it"). Probe on the 31B (raw `predict_pieces`,
+  3 hand-rolled history shapes + nudged-auto generation; reproduce:
+  greedy-ish seed 42, shapes A=reorder B=split-turns C=in-turn-causal;
+  production stop = first `<turn|>`, raw predictor doesn't stop at
+  eot so ignore the degenerate tail):
+  - **Gemma EMITS prose-before-call itself** when nudged ("briefly
+    tell the user what you're about to do"): Text then ToolUse.
+    ⇒ making the shape a typed error is DEAD — it would reject the
+    model's own output.
+  - ALL THREE history shapes produced the correct first-turn answer
+    ("There are 3 r's"). Model is flexible; the reorder objection is
+    about transcript integrity, not capability.
+  - Candidate fix shapes: B = announce turn closes + new model turn
+    calls (template-native-ish; upstream's chat.cpp:1223 workaround
+    produces this); C = announce + call inside one turn (exactly the
+    EMISSION order ⇒ also byte-stable for Gemma's own prose+call
+    turns). Both validated. C recommended: causal AND cache-exact.
+  - Sketch for implementation (not yet built): conversion splits
+    assistant text by block order into `content_pre` (before first
+    ToolUse) / `content_post` (after), keeps merged `content` for
+    stock templates (status-quo reorder, nothing lost); the
+    cache-stable template patch renders `content_pre` between the
+    thought channel and tool_calls (shape C), `content_post` in the
+    native after-responses slot. Re-pin prefix-continuity for a
+    prose+call turn; e2e with the nudge prompt.
 
 ## Problem
 
