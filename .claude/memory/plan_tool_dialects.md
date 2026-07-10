@@ -242,10 +242,15 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
     cache quirks remain for sidecar deployments. Residual edge (doc
     only): text BETWEEN parallel calls merges into content_post →
     one-turn LCP fallback; never observed.
-  - Transcript-integrity note (Mike): he's not strongly attached to
-    causality-purity per se — many official templates are mediocre
-    (Qwen included); C won on being the model's actual emission
-    (cache-exact) with the patch infrastructure already in place.
+  - Transcript-integrity note (Mike, corrected 2026-07-10): he IS
+    attached to causality correctness — an agent must not declare it
+    will do something after it already has (honesty implications,
+    among others). What he is NOT attached to is official-template
+    fidelity: templates are frequently mediocre (Qwen included) and
+    patchable, and — as the nudge probe showed — capable models can
+    work formats better suited to the Content Block design. So:
+    preserve event order always; feel free to patch templates to do
+    it.
 
 ## Problem
 
