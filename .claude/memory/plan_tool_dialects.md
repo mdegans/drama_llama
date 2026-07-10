@@ -24,8 +24,24 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
   `RootShape::Eager{thought_pre_opened}` — Qwen thinks under eager
   grammar now (Session detects the pre-opened `<think>` tail per
   render). Priority: eager tool grammar > output_config > auto-lazy.
-- **Next: Phase C** (CallSyntax + analyzer). Then D. Phase E should
-  also re-run the blallama e2e over the A2 auto-lazy path.
+- **Phase C LANDED** (`014bd17`): `CallSyntax` (serde/TOML),
+  differential analyzer (FFI-free core, catch_unwind-guarded probes,
+  patches-as-data), 6 vendored fixtures + qwen3.6-gguf dump, all 7
+  pins pass (Qwen XML markers byte-exact vs upstream). Sidecar:
+  `<model>.dialect.toml`. Vocab cross-check deferred to E.
+- **Phase D LANDED** (`898f9cb`, absorbs #29): grammar_source() +
+  render_reference() + validate_representable() (UnrepresentableValue
+  per amendments) in dialect/emit.rs; re-parse-per-tick lenient
+  envelope parser in dialect/parse.rs (pre_opened_reasoning = the
+  #27 fix). Reconstruction harness green on all 6 fixtures.
+  NOTE deliberate divergence: args emitted SORTED BY KEY (minijinja
+  alphabetizes re-renders; also closes the duplicate-optional hole).
+- **Next: Phase E** — Session resolves dialect at from_path
+  (analyzer + sidecar + vocab cross-check), resolve_grammar + parse
+  path go through the dialect (replace BlockParser + tool_choice
+  hardcoding; deprecate ToolChoiceOptions), canonicalization check
+  via render_reference, blallama e2e on Qwen3.6 (GPU runs Mike's).
+  Close #27 + #29 when it lands.
 - Gemma 4 + gpt-oss GGUFs downloaded to `models/`. NOTE: it's Gemma
   **4** (not 3) — llama.cpp gives it a hand-built handler, so Phase F
   may become "native weird template" rather than (or in addition to)
