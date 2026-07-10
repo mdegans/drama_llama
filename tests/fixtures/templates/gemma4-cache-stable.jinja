@@ -252,6 +252,16 @@
         {%- endif -%}
     {%- endif -%}
 
+    {#- Causality patch (drama_llama): prose the model emitted BEFORE
+        its calls (`content_pre`, split by block order) renders here,
+        in emission order and VERBATIM (no trim — byte-stability),
+        instead of being reordered into the after-responses content
+        slot. The after-call text (`content_post`) keeps the native
+        slot below. -#}
+    {%- if message.get('content_pre') -%}
+        {{- message['content_pre'] -}}
+    {%- endif -%}
+
             {%- if message['tool_calls'] -%}
                 {%- for tool_call in message['tool_calls'] -%}
                     {%- set function = tool_call['function'] -%}
@@ -316,15 +326,20 @@
                 {%- endfor -%}
             {%- endif -%}
 
+            {#- Causality patch (drama_llama): when the block-order
+                split is present, the native content slot carries only
+                the AFTER-call text; the before-call text already
+                rendered above the calls. -#}
+            {%- set native_content = message.get('content_post') if message.get('content_pre') is not none else message.get('content') -%}
             {%- set captured_content -%}
-            {%- if message['content'] is string -%}
+            {%- if native_content is string -%}
                 {%- if role == 'model' -%}
-                    {{- strip_thinking(message['content']) -}}
+                    {{- strip_thinking(native_content) -}}
                 {%- else -%}
-                    {{- message['content'] | trim -}}
+                    {{- native_content | trim -}}
                 {%- endif -%}
-            {%- elif message['content'] is sequence -%}
-                {%- for item in message['content'] -%}
+            {%- elif native_content is sequence -%}
+                {%- for item in native_content -%}
                     {%- if item['type'] == 'text' -%}
                         {%- if role == 'model' -%}
                             {{- strip_thinking(item['text']) -}}

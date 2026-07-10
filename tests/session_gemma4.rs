@@ -269,6 +269,96 @@ fn emission_round_trips_through_parse_and_render() {
     );
 }
 
+/// Announce-then-call (causality patch): nudged under Auto, the model
+/// emits prose BEFORE its call (probed 2026-07-10 — Gemma does this
+/// willingly); the blocks come back in emission order and the
+/// re-render reproduces the emission byte-for-byte — prose is NOT
+/// reordered into the after-responses slot.
+#[test]
+#[ignore = "requires Gemma 4 model"]
+fn announce_then_call_round_trips_in_emission_order() {
+    use drama_llama::AssistantMessage;
+
+    let mut prompt = count_letters_prompt();
+    prompt.system = Some(Content::text(
+        "You are a helpful assistant. Use the `count_letters` tool when \
+         asked to count characters. Before calling a tool, briefly tell \
+         the user what you are about to do.",
+    ));
+    prompt.tool_choice = Some(ToolChoice::auto());
+    let mut session = load_session(512);
+
+    let render_opts = RenderOptions::default()
+        .with_generation_prompt(true)
+        .with_extra("preserve_thinking", true)
+        .with_thought_reingest(session.dialect().reasoning.reingest);
+    let rendered_original = session
+        .template()
+        .render_with(&prompt, &render_opts)
+        .expect("render original");
+
+    let raw = session.complete_text(&prompt).expect("complete_text");
+    println!("=== raw emission ===\n{raw:?}\n===");
+
+    let tool_refs: Vec<&Tool> = prompt
+        .tools
+        .iter()
+        .flatten()
+        .filter_map(|def| def.as_method())
+        .collect();
+    let blocks = drama_llama::dialect::parse_text(
+        session.dialect(),
+        &tool_refs,
+        &raw,
+        false,
+        drama_llama::dialect::Leniency::Final,
+    )
+    .blocks;
+    println!("=== blocks ===\n{blocks:#?}\n===");
+    let first_text =
+        blocks.iter().position(|b| matches!(b, Block::Text { .. }));
+    let first_call = blocks
+        .iter()
+        .position(|b| matches!(b, Block::ToolUse { .. }))
+        .expect("nudged auto should still call the tool");
+    let announced = first_text.is_some_and(|t| t < first_call);
+    assert!(
+        announced,
+        "nudge did not produce prose before the call this run — \
+         blocks: {blocks:#?}"
+    );
+
+    let assistant: AssistantMessage = blocks.into_iter().collect();
+    let mut follow_up = prompt.clone();
+    follow_up.messages.push(assistant.into());
+    follow_up.tool_choice = None;
+    let rendered_follow_up = session
+        .template()
+        .render_with(
+            &follow_up,
+            &RenderOptions::default()
+                .with_generation_prompt(false)
+                .with_extra("preserve_thinking", true)
+                .with_thought_reingest(session.dialect().reasoning.reingest),
+        )
+        .expect("render follow_up");
+    let suffix = rendered_follow_up
+        .strip_prefix(&rendered_original)
+        .unwrap_or_else(|| {
+            panic!(
+                "follow-up must extend the original prefix exactly.\n\
+                 --- original ---\n{rendered_original}\n\
+                 --- follow-up ---\n{rendered_follow_up}"
+            )
+        });
+    assert!(
+        suffix.starts_with(&raw),
+        "announce-then-call emission is not a byte prefix of the \
+         re-render — prose got reordered or altered.\n\
+         --- emission ---\n{raw:?}\n--- suffix ---\n{suffix:?}"
+    );
+}
+
 /// Tool turn 2: assistant call + tool result re-ingest through the
 /// dict dialect (the template's forward-scan of `role: tool`
 /// messages), then free prose. The answer should surface the result.

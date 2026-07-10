@@ -225,14 +225,27 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
     produces this); C = announce + call inside one turn (exactly the
     EMISSION order ⇒ also byte-stable for Gemma's own prose+call
     turns). Both validated. C recommended: causal AND cache-exact.
-  - Sketch for implementation (not yet built): conversion splits
-    assistant text by block order into `content_pre` (before first
-    ToolUse) / `content_post` (after), keeps merged `content` for
-    stock templates (status-quo reorder, nothing lost); the
-    cache-stable template patch renders `content_pre` between the
-    thought channel and tool_calls (shape C), `content_post` in the
-    native after-responses slot. Re-pin prefix-continuity for a
-    prose+call turn; e2e with the nudge prompt.
+  - **IMPLEMENTED (shape C)** same session, Mike: "if C was actually
+    emitted it seems the clear choice… It is *your* call to do it
+    now": conversion splits assistant text by block order into
+    `content_pre` (before first ToolUse) / `content_post` (after),
+    keeps merged `content` for stock templates (status-quo reorder,
+    nothing lost); the cache-stable template patch renders
+    `content_pre` VERBATIM (no strip_thinking/trim — byte-stability)
+    between the thought channel and tool_calls, `content_post` in the
+    native after-responses slot via a `native_content` indirection.
+    Pins: prefix-continuity case 4 (announce w/ trailing `\n\n`
+    survives byte-exact); e2e
+    `announce_then_call_round_trips_in_emission_order` (nudged Auto —
+    model emitted `"I will count…\n\n" + call + <|tool_response>`,
+    STRICT byte-prefix round-trip). 8/8 e2e. With this, NO accepted
+    cache quirks remain for sidecar deployments. Residual edge (doc
+    only): text BETWEEN parallel calls merges into content_post →
+    one-turn LCP fallback; never observed.
+  - Transcript-integrity note (Mike): he's not strongly attached to
+    causality-purity per se — many official templates are mediocre
+    (Qwen included); C won on being the model's actual emission
+    (cache-exact) with the patch infrastructure already in place.
 
 ## Problem
 

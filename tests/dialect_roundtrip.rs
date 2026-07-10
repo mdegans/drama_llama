@@ -302,6 +302,42 @@ fn gemma4_cache_stable_prefix_continuity() {
          --- want ---\n{emission:?}\n--- got ---\n{suffix:?}"
     );
 
+    // Case 4: announce-then-call (causality patch). Prose the model
+    // emitted before its call re-renders in emission order and
+    // VERBATIM (trailing whitespace intact), not reordered into the
+    // after-responses slot; post-call prose keeps the native slot.
+    let announce = "I'll count the r's for you.\n\n";
+    let p = template
+        .render_with(&base, &opts(true, false))
+        .expect("render");
+    let mut with_turn = base.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![
+            Block::Text {
+                text: Cow::Borrowed(announce),
+                citations: None,
+                cache_control: None,
+            },
+            call_block.clone(),
+        ]),
+    });
+    let f = template
+        .render_with(&with_turn, &opts(false, false))
+        .expect("render");
+    let suffix = f.strip_prefix(&p).unwrap_or_else(|| {
+        panic!(
+            "announce-then-call: follow-up must extend the generation \
+             prompt.\n--- gen ---\n{p:?}\n--- follow-up ---\n{f:?}"
+        )
+    });
+    let emission = format!("{announce}{calls_ref}");
+    assert!(
+        suffix.starts_with(&emission),
+        "announce-then-call must re-render in emission order, \
+         verbatim.\n--- want ---\n{emission:?}\n--- got ---\n{suffix:?}"
+    );
+
     // Case 3: aging. A later user message must not strip the thought
     // bytes (preserve_thinking) — the prior render stays a prefix.
     let mut aged = with_turn.clone();
