@@ -308,16 +308,22 @@ impl LlamaCppDecoder {
         buf
     }
 
-    /// Deserialize the global state.
+    /// Deserialize the global state (bytes from [`Self::get_state`]).
+    ///
+    /// Note [`Self::state_size`] is *content-dependent* — the KV
+    /// portion grows with what the cache holds — so a valid saved
+    /// state routinely differs in length from the context's current
+    /// `state_size` (e.g. restoring after `memory_clear`). llama.cpp
+    /// reads the buffer's own header; no length precondition exists.
     ///
     /// # Panics
-    /// * If the length of `state` is not equal to [`Self::state_size`].
+    /// * If llama.cpp does not consume `state` fully — corrupt bytes
+    ///   or a state saved from a different model / context shape.
     pub fn set_state(&mut self, state: &[u8]) {
-        let len = self.state_size();
-        assert_eq!(state.len(), len);
-        let copied =
-            unsafe { llama_state_set_data(self.context, state.as_ptr(), len) };
-        assert_eq!(copied, len);
+        let read = unsafe {
+            llama_state_set_data(self.context, state.as_ptr(), state.len())
+        };
+        assert_eq!(read, state.len(), "llama.cpp rejected saved state");
     }
 
     /// Size of the serialized state for a single sequence.

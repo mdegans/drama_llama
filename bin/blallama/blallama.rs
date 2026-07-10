@@ -181,6 +181,28 @@ fn resolve_model(
     })
 }
 
+/// Anthropic wire envelope for errors: `{"type":"error","error":{...}}`.
+/// Real clients (misanthropic included) parse errors through this
+/// wrapper; serving the bare `AnthropicError` object is unparseable to
+/// them. misanthropic's own wrapper is `pub(crate)`
+/// (mdegans/misanthropic#134 asks to expose it) — replicated here
+/// until then.
+#[derive(serde::Serialize)]
+struct ErrorEnvelope {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    error: AnthropicError,
+}
+
+impl From<AnthropicError> for ErrorEnvelope {
+    fn from(error: AnthropicError) -> Self {
+        Self {
+            kind: "error",
+            error,
+        }
+    }
+}
+
 async fn spawn_blocking_or_bust<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
@@ -330,7 +352,7 @@ async fn load_session<B>(
     model: String,
     no_penalty: bool,
     seed: Option<u128>,
-) -> Result<Session<B>, (StatusCode, Json<AnthropicError>)>
+) -> Result<Session<B>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend,
     Session<B>: FromPath,
@@ -351,7 +373,7 @@ where
 async fn route_messages<B>(
     State(state): State<AppState<B>>,
     Json(mut prompt): Json<Prompt>,
-) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
+) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend + 'static,
     Session<B>: FromPath,
@@ -365,7 +387,7 @@ where
                     message: format!("Models could not be loaded: {e}"),
                 };
                 error!(error = %e);
-                return Err((StatusCode::NOT_FOUND, Json(e)));
+                return Err((StatusCode::NOT_FOUND, Json(e.into())));
             }
         };
 
@@ -385,7 +407,7 @@ where
         }
         Err(e) => {
             error!(error = %e);
-            return Err((StatusCode::NOT_FOUND, Json(e)));
+            return Err((StatusCode::NOT_FOUND, Json(e.into())));
         }
     }
 
@@ -396,7 +418,7 @@ where
 async fn complete<B>(
     state: AppState<B>,
     prompt: Prompt,
-) -> Result<Json<MessageResponse>, (StatusCode, Json<AnthropicError>)>
+) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend + 'static,
     Session<B>: FromPath,
@@ -406,10 +428,13 @@ where
         Err(_) => {
             return Err((
                 StatusCode::from_u16(529).unwrap(),
-                Json(AnthropicError::Overloaded {
-                    message: "Session is busy.".into(),
-                    retry_after: None,
-                }),
+                Json(
+                    AnthropicError::Overloaded {
+                        message: "Session is busy.".into(),
+                        retry_after: None,
+                    }
+                    .into(),
+                ),
             ))
         }
     };
@@ -881,13 +906,16 @@ where
 
 fn map_session_err(
     e: drama_llama::SessionError,
-) -> (StatusCode, Json<AnthropicError>) {
+) -> (StatusCode, Json<ErrorEnvelope>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(AnthropicError::Unknown {
-            code: Some(500.try_into().unwrap()),
-            message: e.to_string(),
-        }),
+        Json(
+            AnthropicError::Unknown {
+                code: Some(500.try_into().unwrap()),
+                message: e.to_string(),
+            }
+            .into(),
+        ),
     )
 }
 

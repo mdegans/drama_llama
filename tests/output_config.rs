@@ -46,11 +46,18 @@ enum Confidence {
 #[derive(schemars::JsonSchema, serde::Deserialize, Debug)]
 #[allow(dead_code)]
 struct CaseFile {
-    /// Every suspect considered, with their motive and whether they
-    /// had physical access to the scene.
+    /// Every suspect considered — one entry per named suspect in the
+    /// scenario, with their motive and whether they had physical
+    /// access to the scene. Never empty: even exonerated suspects
+    /// were considered and belong here. (`length(min = 1)` survives
+    /// the Anthropic schema sanitizer and compiles into the grammar,
+    /// so the empty-array exit is closed at the sampling level.)
+    #[schemars(length(min = 1))]
     suspects_considered: Vec<Suspect>,
     /// The evidence items the detective weighed, in the order
-    /// considered.
+    /// considered. At least one — a verdict without evidence is not a
+    /// verdict.
+    #[schemars(length(min = 1))]
     key_evidence: Vec<String>,
     /// The suspect name (must match one of `suspects_considered`).
     culprit: String,
@@ -103,7 +110,8 @@ fn whodunit_verdict() {
              under 300 tokens: note which suspects are ruled out by \
              their alibis, identify the one remaining with motive, \
              means, and opportunity, then CLOSE the think tag. Output \
-             the structured verdict as JSON matching the given schema.",
+             the structured verdict as JSON matching the given schema, \
+             listing ALL named suspects in `suspects_considered`.",
         )
         .add_message((Role::User, Content::text(SCENARIO)))
         .expect("add_message");

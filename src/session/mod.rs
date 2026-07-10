@@ -11,9 +11,9 @@
 //! block parsing, and — opt-in — prefix-cache reuse across calls.
 //!
 //! ```no_run
-//! use drama_llama::{Prompt, Session};
+//! use drama_llama::{LlamaCppSession, Prompt};
 //!
-//! let mut session = crate::LlamaCppSession::from_path("models/model.gguf".into())
+//! let mut session = LlamaCppSession::from_path_sync("models/model.gguf".into())
 //!     .unwrap()
 //!     .quiet();
 //! let prompt = Prompt::default(); // + system, messages, tools, etc.
@@ -683,7 +683,13 @@ impl<B: Backend> Session<B> {
             template,
             tool_choice_opts: ToolChoiceOptions::default(),
             output_config_opts: OutputConfigOptions::default(),
-            render_opts: RenderOptions::default().with_generation_prompt(true),
+            // `preserve_thinking` default: byte-stable transcripts are
+            // the prefix cache's contract, and current Anthropic
+            // models keep prior-turn thinking. See
+            // [`Self::with_render_opts`].
+            render_opts: RenderOptions::default()
+                .with_generation_prompt(true)
+                .with_extra("preserve_thinking", true),
             sample_options: SampleOptions::default(),
             seed: Some(crate::PredictOptions::DEFAULT_SEED),
             max_tokens: NonZeroUsize::new(DEFAULT_MAX_TOKENS).unwrap(),
@@ -789,8 +795,22 @@ impl<B: Backend> Session<B> {
     /// Override the defaults used when rendering the prompt through the chat
     /// template. The generation-prompt flag is forced to `true` regardless —
     /// `Session` is always rendering for live inference, never archival.
+    ///
+    /// Unless the caller sets it explicitly, `preserve_thinking => true`
+    /// is added to the template context (see the default in
+    /// [`Self::from_engine`]): templates that strip prior-turn
+    /// reasoning (Qwen3.5/3.6) re-render a conversation with different
+    /// bytes than the model generated, killing prefix-cache reuse past
+    /// the first assistant turn — and current Anthropic models
+    /// (Opus 4.5+ / Sonnet 4.6+) keep prior-turn thinking blocks too.
+    /// Opt out with `.with_extra("preserve_thinking", false)`; the
+    /// variable is inert for templates that don't read it.
     pub fn with_render_opts(mut self, opts: RenderOptions) -> Self {
-        self.render_opts = opts.with_generation_prompt(true);
+        let mut opts = opts.with_generation_prompt(true);
+        if !opts.extras.iter().any(|(k, _)| k == "preserve_thinking") {
+            opts = opts.with_extra("preserve_thinking", true);
+        }
+        self.render_opts = opts;
         self
     }
 

@@ -1254,9 +1254,13 @@ mod tests {
         }
     }
 
-    /// Render an assistant tool-call turn, confirming the template
-    /// emits a JSON tool-call shape (Llama 3.1 uses `"parameters"`,
-    /// Qwen/OpenAI-wire templates use `"arguments"`).
+    /// Render an assistant tool-call turn, confirming the tool-call
+    /// branch renders the call at all — name, argument key, and
+    /// argument value must survive into the transcript. The envelope
+    /// is deliberately unasserted: it varies by template family
+    /// (Llama 3.1 emits JSON with `"parameters"`, Qwen3 JSON with
+    /// `"arguments"`, Qwen3.6 an XML-ish
+    /// `<function=name><parameter=key>value` shape).
     #[test]
     #[ignore = "requires model"]
     fn chat_template_renders_assistant_tool_call_against_real_model() {
@@ -1296,16 +1300,16 @@ mod tests {
 
         let out = tmpl.render(&prompt, false).unwrap();
         assert!(
-            out.contains("\"name\": \"get_weather\""),
-            "tool-call branch must include function name. output:\n{out}"
+            out.contains("get_weather"),
+            "tool-call branch must include the function name. output:\n{out}"
         );
         assert!(
-            out.contains("\"parameters\"") || out.contains("\"arguments\""),
-            "tool-call branch must include the call arguments. output:\n{out}"
+            out.contains("city"),
+            "tool-call branch must include the argument key. output:\n{out}"
         );
         assert!(
-            out.contains("\"city\""),
-            "arguments should appear in rendered output. output:\n{out}"
+            out.contains("Paris"),
+            "tool-call branch must include the argument value. output:\n{out}"
         );
     }
 

@@ -99,3 +99,25 @@ still surface. If a future feature add (e.g., array-`items`
 constraints, additional anyOf shapes) introduces a new
 schema-to-grammar branch, add a fuzzer generator branch alongside it
 to keep coverage honest.
+
+## Addendum (2026-07-10): `minItems` non-emptiness IS enforced
+
+New information per the "don't re-litigate without new information"
+clause: misanthropic's `sanitize_for_anthropic` deliberately passes
+`minItems: 0 | 1` through (stripping only values ≥ 2) because
+**Anthropic's own structured outputs enforce non-emptiness
+server-side**. That puts `minItems: 1` in the API-parity bucket with
+`required` and `anyOf`, not the value-bound bucket above.
+
+`schema_to_gbnf` therefore now enforces exactly that much:
+`minItems >= 1` compiles to a non-empty array rule; counts beyond 1
+remain permissive (forcing N items manufactures filler entries — the
+same failure mode as `minLength`). `maxItems` remains unenforced.
+The fuzzer generates `minItems: 1` on a third of arrays (never ≥ 2,
+which would present the intentional non-feature as a Class 3
+finding).
+
+Trigger: Qwen3.6-35B-A3B answered the whodunit structured-output test
+with `suspects_considered: []` / `key_evidence: []` while filling
+every scalar field richly — the empty-array exit is a real model
+behavior that `length(min = 1)` + grammar now closes.

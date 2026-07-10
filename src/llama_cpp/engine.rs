@@ -34,6 +34,24 @@ impl LlamaCppEngine {
         Self::new(args.model, model_params, context_params, numa_strategy)
     }
 
+    /// llama.cpp's `llama_context_default_params()` with a usable
+    /// thread count. The upstream library default is a hard-coded 4
+    /// threads (ggml's `GGML_DEFAULT_N_THREADS`, marked "TODO: better
+    /// default" upstream), which cripples CPU inference on larger
+    /// machines — every llama.cpp *runner* overrides it, and so do we.
+    /// Uses all available logical cores for both generation and batch
+    /// processing; tune after construction with
+    /// [`Self::set_n_threads`].
+    pub fn default_context_params() -> llama_context_params {
+        let mut cp = unsafe { llama_context_default_params() };
+        if let Ok(n) = std::thread::available_parallelism() {
+            let n = n.get() as i32;
+            cp.n_threads = n;
+            cp.n_threads_batch = n;
+        }
+        cp
+    }
+
     /// Create a new `LlamaCppEngine` from a model `path`, `model_params`,
     /// `context_params` and `numa_strategy`. The path is the only
     /// required argument.
@@ -49,7 +67,7 @@ impl LlamaCppEngine {
                 None => return Err(NewError::Model { path }),
             };
         let context_params =
-            context_params.unwrap_or(unsafe { llama_context_default_params() });
+            context_params.unwrap_or_else(Self::default_context_params);
         let decoder =
             LlamaCppDecoder::new(&mut model, context_params, numa_strategy)?;
         Ok(Self {
@@ -79,7 +97,7 @@ impl LlamaCppEngine {
         path: PathBuf,
         fa: FlashAttention,
     ) -> Result<Self, NewError> {
-        let mut cp = unsafe { llama_context_default_params() };
+        let mut cp = Self::default_context_params();
         cp.flash_attn_type = fa.as_raw();
         Self::new(path, None, Some(cp), None)
     }
@@ -90,7 +108,7 @@ impl LlamaCppEngine {
         path: PathBuf,
         n_ctx: u32,
     ) -> Result<Self, NewError> {
-        let mut cp = unsafe { llama_context_default_params() };
+        let mut cp = Self::default_context_params();
         cp.n_ctx = n_ctx;
         cp.n_batch = n_ctx;
         cp.n_ubatch = cp.n_ubatch.min(n_ctx);

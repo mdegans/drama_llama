@@ -5,8 +5,11 @@
 //! `cache_control` ([`Content::MultiPart`]) — should render to the
 //! same Jinja-input shape and produce the same output bytes.
 //!
-//! `#[ignore]` because it reads the Qwen3 chat template from the
-//! moeflux artifact directory rather than committing a copy.
+#![cfg(feature = "llama-cpp")]
+//! `#[ignore]` because it needs a Qwen-family chat template: either
+//! `DRAMA_LLAMA_QWEN3_TEMPLATE` (a `chat_template.jinja` on disk, e.g.
+//! from the moeflux artifact directory on the macOS box), or — the
+//! fallback — the template embedded in `models/model.gguf`.
 
 use std::{borrow::Cow, path::PathBuf};
 
@@ -15,20 +18,22 @@ use drama_llama::{
 };
 use misanthropic::prompt::message::{Block, CacheControl};
 
-fn template_path() -> PathBuf {
-    PathBuf::from(
-        std::env::var("DRAMA_LLAMA_QWEN3_TEMPLATE").unwrap_or_else(|_| {
-            "/Volumes/Temp Backup/models/blallama/qwen3-6-a3b/mlx/chat_template.jinja"
-                .to_string()
-        }),
-    )
-}
-
 fn load_template() -> ChatTemplate {
-    let source = std::fs::read_to_string(template_path())
-        .expect("Qwen3 chat_template.jinja missing");
-    ChatTemplate::from_source(source, String::new(), "<|im_end|>".to_string())
-        .expect("template compiles")
+    if let Ok(path) = std::env::var("DRAMA_LLAMA_QWEN3_TEMPLATE") {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("template {path} unreadable: {e}"));
+        return ChatTemplate::from_source(
+            source,
+            String::new(),
+            "<|im_end|>".to_string(),
+        )
+        .expect("template compiles");
+    }
+    let model_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+    let model = drama_llama::LlamaCppModel::from_file(model_path, None)
+        .expect("set DRAMA_LLAMA_QWEN3_TEMPLATE or provide models/model.gguf");
+    ChatTemplate::from_model(&model).expect("template compiles")
 }
 
 fn opts() -> RenderOptions {
