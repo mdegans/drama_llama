@@ -135,6 +135,40 @@ design, more radical than our sketch:
 - Issue #28 (lazy O(1) grammar check) rolls into this sequence — same
   sampling-path code area as trigger-lazy activation.
 
+## Amendments (Mike + Claude, 2026-07-10 pre-implementation review)
+
+- **Unrepresentable raw values → typed error at ingest.** Tagged
+  dialects have no in-band escape the model was trained on (the
+  template dumps raw bytes between markers), so a client-constructed
+  string arg containing the dialect's close delimiter (e.g.
+  `</parameter>`) cannot round-trip. Escaping is rejected — it would
+  invent a private dialect the model has never seen. The library
+  raises a typed, catchable error at message-conversion time
+  (`UnrepresentableValue { tool, param, delimiter }`-shaped); the
+  consuming app may catch and substitute (e.g. replace the input with
+  a warning to the model). Policy stays in the app, per the 0.7
+  Vocab-removal philosophy. JSON dialects are immune (native
+  escaping). Distinct from *awkward-but-legal* values (trailing
+  newlines, JSON-looking strings), which must round-trip and get
+  Phase D harness fixtures, not errors.
+- **Phase D harness: adversarial fixtures required** — trailing
+  whitespace/newlines in raw values, embedded close-delimiters
+  (expect typed error), values that look like JSON, unicode.
+- **Phase C phrasing:** analyzer *core* is FFI-free (testable against
+  .jinja fixtures alone); the vocab cross-check is an optional
+  post-pass taking `&Model`, available at `Session::from_path` where
+  the model is already loaded.
+- **Re-parse-per-tick is deliberately O(n²)** over a generation
+  (llama.cpp ships the same; outputs are small). Comment it as
+  intentional so it isn't "optimized" back into an incremental state
+  machine — that's the BlockParser we're deleting. Full re-parse
+  yields a complete partial AST each tick, which is what #26
+  (streaming Events, 0.9) needs; D is a quiet prerequisite for #26.
+- **Phase ordering pick:** B before A's trigger-lazy half (both
+  rewrite `sample_token`; write activation logic once against the
+  post-#28 path shape). A's `until` emitter is independent and may
+  land in either order / parallel.
+
 ## Cache-stability strategy
 
 Wire constraint: raw emission formatting cannot survive the Anthropic
@@ -245,6 +279,9 @@ Order A↔B flexible.
 ## Pruning (do alongside, not as its own session)
 
 - #29: absorbed into Phase D — comment + close when D lands.
+- #27 (Session::parse misses Qwen XML on unforced path): fixed by
+  the Phase D/E generic envelope parser — comment + close alongside
+  #29.
 - `.claude/memory/qwen36_xml_tool_call_shape.md`: fold anything not
   already here into this doc, then delete.
 - `future_work_grammar_speculation.md`: already superseded by #28;
