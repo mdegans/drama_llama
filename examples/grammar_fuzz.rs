@@ -25,12 +25,29 @@
 //! * `pure` — CPU-bound, rayon-parallel. The default and the workhorse;
 //!   single-digit milliseconds per case lets us hit O(10^7) cases over
 //!   eight hours per worker. Run this in one terminal.
+//! * `until` — differential fuzzer for
+//!   [`emit_until_rules`](drama_llama::emit_until_rules) (the GBNF
+//!   encoding of llama.cpp's `until()` combinator). The in-crate unit
+//!   test `until_rules_match_naive_exhaustively` already covers every
+//!   string ≤7 chars over a 3-char alphabet; this subcommand covers
+//!   the space beyond that — longer strings, random delimiters up to
+//!   6 chars (including multi-byte), and a grammar walker that
+//!   generates accepted strings the naive matcher must agree with.
+//!   See "`until` findings" below for its own class numbering.
 //! * `model` — *stub for now*. The intended shape: ask Cogito (or
 //!   whatever `models/model.gguf` resolves to) to emit a JSON Schema;
 //!   feed the result through the same differential. GPU-bound, so it
 //!   composes with `pure` on a separate process. Wiring lands in a
 //!   follow-up session — pure mode is the high-leverage path.
 //! * `replay <finding.json>` — re-runs a saved finding for debugging.
+//!
+//! ## `until` findings
+//!
+//! `until` writes its own finding classes (5–8, `until_*` named)
+//! rather than reusing 1–3 — those are schema-pipeline shaped
+//! (`schema` + `bytes`), and an `until` case has neither. See
+//! `Finding::UntilCompileBroken` / `UntilMismatch` /
+//! `UntilWalkerMismatch` / `UntilPanicked`.
 //!
 //! ## Tonight-mode launch
 //!
@@ -55,7 +72,8 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use drama_llama::{
-    schema_to_gbnf, Grammar, GrammarError, GrammarState, JSON_GRAMMAR,
+    emit_until_rules, schema_to_gbnf, Grammar, GrammarError, GrammarState,
+    JSON_GRAMMAR,
 };
 use rand::rngs::SmallRng;
 use rand::seq::{IndexedRandom, SliceRandom};
@@ -77,6 +95,9 @@ struct Args {
 enum Cmd {
     /// CPU-bound random fuzzer. Multi-threaded via rayon.
     Pure(PureArgs),
+    /// Differential fuzzer for `emit_until_rules` (delimiter-terminated
+    /// GBNF rules). See the module docs' "`until` findings" section.
+    Until(UntilArgs),
     /// Re-run a saved finding. Prints the schema, the bytes, and the
     /// classification. Exit 0 if the finding still reproduces, 1 if it
     /// no longer does.
@@ -128,6 +149,33 @@ struct PureArgs {
     /// schema that crashed. Cripples throughput; use with `--threads 1`.
     #[arg(long)]
     trace_cases: bool,
+}
+
+#[derive(Parser, Debug)]
+struct UntilArgs {
+    /// How long to run before exiting cleanly. Accepts s/m/h suffixes
+    /// (e.g. `8h`, `45m`, `90s`). Defaults to "until killed."
+    #[arg(long, value_parser = parse_duration)]
+    duration: Option<Duration>,
+    /// Worker thread count. Defaults to rayon's auto-detect.
+    #[arg(long)]
+    threads: Option<usize>,
+    /// Per-case byte budget for the grammar walker (requirement 4's
+    /// generate-then-check direction). Delimiters are ≤6 chars and
+    /// direct-feed inputs are ≤~70 bytes, so this only needs enough
+    /// headroom to reach one `is_complete()`; 512 is generous.
+    #[arg(long, default_value_t = 512)]
+    walker_budget: usize,
+    /// Where to drop findings.
+    #[arg(long, default_value = "fuzz-corpus")]
+    corpus: PathBuf,
+    /// Stop after this many cases. Defaults to "no cap."
+    #[arg(long)]
+    cases: Option<u64>,
+    /// RNG seed shared across threads (each thread derives a unique
+    /// per-thread seed from this). Set this to reproduce a session.
+    #[arg(long, default_value_t = 0xC0FFEE)]
+    seed: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -329,6 +377,90 @@ fn gen_string_literal(rng: &mut SmallRng) -> String {
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// `until` generation
+// ───────────────────────────────────────────────────────────────────────
+//
+// `emit_until_rules` is the GBNF encoding of llama.cpp's `until()`
+// combinator: strings ending in exactly one occurrence of `delim`,
+// with `delim` occurring nowhere else. The unit test
+// `until_rules_match_naive_exhaustively` already brute-forces every
+// string ≤7 chars over a 3-char alphabet; this generator targets the
+// space beyond that — longer strings and a wider, more adversarial
+// alphabet mixing plain ASCII with GBNF-metacharacter-adjacent bytes
+// (`<`, `/`, `>`, `-`, `\`, `]`, `\n`) and an occasional multi-byte
+// codepoint, since the automaton runs on Unicode scalar values.
+
+/// Alphabet shared by delimiter and input generation. Chosen to
+/// include GBNF class/literal metacharacters (`-`, `\`, `]`) that
+/// `escape_for_gbnf_class` / `escape_for_gbnf_string` must handle, and
+/// angle-bracket/slash characters since dialect delimiters are
+/// XML-tag-shaped (`</parameter>`).
+const UNTIL_ALPHABET: [char; 10] =
+    ['a', 'b', 'c', '<', '/', '>', '-', '\\', ']', '\n'];
+
+/// Occasional multi-byte codepoint mixed into both delimiters and
+/// inputs — exercises the automaton's Unicode-scalar-value states
+/// (`until_rules_unicode_delimiter` covers the happy path; the fuzzer
+/// covers combinations that test doesn't enumerate).
+const UNTIL_MULTIBYTE: char = '→';
+
+/// Random delimiter, length 1–6. Self-overlapping shapes (`aa`,
+/// `aba`) are the ones that stress the KMP fallback logic in
+/// `emit_until_rules`, and they show up naturally here since the
+/// alphabet is small relative to the length range.
+fn gen_until_delim(rng: &mut SmallRng) -> String {
+    let len = rng.random_range(1..=6);
+    let mut s = String::with_capacity(len * 2);
+    for _ in 0..len {
+        if rng.random_bool(0.08) {
+            s.push(UNTIL_MULTIBYTE);
+        } else {
+            s.push(*UNTIL_ALPHABET.choose(rng).unwrap());
+        }
+    }
+    s
+}
+
+/// Random input, length roughly 0–64 chars, biased so both directions
+/// of the naive matcher (`ends_with(delim) && find == last occurrence`)
+/// are well represented:
+///
+/// * splicing a random-length prefix of `delim` (including the whole
+///   thing) into the middle of the string — the "partial tease" /
+///   "extra occurrence before the end" cases that a naive `[^delim]*`
+///   approximation gets wrong.
+/// * appending the full delimiter at the end — the accept case.
+///
+/// Length is a soft target: a splice can push a few chars past it, so
+/// actual output can run slightly over 64. That's fine for a fuzzer
+/// input distribution.
+fn gen_until_input(rng: &mut SmallRng, delim: &str) -> String {
+    let delim_chars: Vec<char> = delim.chars().collect();
+    let target_len = rng.random_range(0..=64usize);
+    let mut chars: Vec<char> =
+        Vec::with_capacity(target_len + delim_chars.len());
+    while chars.len() < target_len {
+        let pick: u32 = rng.random_range(0..100);
+        match pick {
+            // Splice a prefix of the delimiter (1..=full length) in.
+            0..25 => {
+                let n = rng.random_range(1..=delim_chars.len());
+                chars.extend_from_slice(&delim_chars[..n]);
+            }
+            25..30 => chars.push(UNTIL_MULTIBYTE),
+            _ => chars.push(*UNTIL_ALPHABET.choose(rng).unwrap()),
+        }
+    }
+    // Bias toward accepts: append the full delimiter at the end about
+    // half the time (including on top of a trailing partial splice —
+    // exercises the KMP fallback-then-complete transition).
+    if rng.random_bool(0.5) {
+        chars.extend_from_slice(&delim_chars);
+    }
+    chars.into_iter().collect()
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // Compile schema → grammar
 // ───────────────────────────────────────────────────────────────────────
 
@@ -494,6 +626,41 @@ enum Finding {
         panic_message: String,
         stage: &'static str,
     },
+    /// `until` subcommand: `Grammar::parse` failed on the GBNF
+    /// `emit_until_rules` emitted for `delim`. Distinct from
+    /// `CompileBroken` (schema-shaped) since an `until` case has no
+    /// JSON Schema to attach.
+    UntilCompileBroken {
+        delim: String,
+        gbnf_source: String,
+        error: String,
+    },
+    /// `until` subcommand: feeding `input` directly to the compiled
+    /// grammar disagreed with the naive matcher
+    /// (`input.ends_with(delim) && input.find(delim) == Some(input.len()
+    /// - delim.len())`). This is the core differential — a real finding
+    /// here is a bug in `emit_until_rules`.
+    UntilMismatch {
+        delim: String,
+        input: String,
+        naive: bool,
+        by_grammar: bool,
+    },
+    /// `until` subcommand: the grammar walker generated `generated` and
+    /// considered it complete, but the naive matcher does not accept
+    /// it. Covers the "generate accepted strings" direction
+    /// (requirement 4) that direct-input fuzzing can miss — the walker
+    /// explores paths random splicing may never construct.
+    UntilWalkerMismatch { delim: String, generated: String },
+    /// `until` subcommand: `emit_until_rules`, `Grammar::parse`, or the
+    /// matcher panicked while processing `delim`. Mirrors
+    /// `PipelinePanicked`'s catch_unwind safety net for the schema
+    /// pipeline.
+    UntilPanicked {
+        delim: String,
+        panic_message: String,
+        stage: &'static str,
+    },
 }
 
 impl Finding {
@@ -507,6 +674,12 @@ impl Finding {
                 "class3_grammar_accepts_schema_rejects"
             }
             Finding::PipelinePanicked { .. } => "class4_pipeline_panicked",
+            Finding::UntilCompileBroken { .. } => "class5_until_compile_broken",
+            Finding::UntilMismatch { .. } => "class6_until_mismatch",
+            Finding::UntilWalkerMismatch { .. } => {
+                "class7_until_walker_mismatch"
+            }
+            Finding::UntilPanicked { .. } => "class8_until_panicked",
         }
     }
 
@@ -557,6 +730,49 @@ impl Finding {
                 "schema": schema,
                 "bytes_lossy_utf8": String::from_utf8_lossy(bytes_so_far),
                 "bytes_hex": hex(bytes_so_far),
+                "panic_message": panic_message,
+            }),
+            Finding::UntilCompileBroken {
+                delim,
+                gbnf_source,
+                error,
+            } => json!({
+                "class": "until_compile_broken",
+                "delim": delim,
+                "delim_hex": hex(delim.as_bytes()),
+                "gbnf_source": gbnf_source,
+                "error": error,
+            }),
+            Finding::UntilMismatch {
+                delim,
+                input,
+                naive,
+                by_grammar,
+            } => json!({
+                "class": "until_mismatch",
+                "delim": delim,
+                "delim_hex": hex(delim.as_bytes()),
+                "input": input,
+                "input_hex": hex(input.as_bytes()),
+                "naive": naive,
+                "by_grammar": by_grammar,
+            }),
+            Finding::UntilWalkerMismatch { delim, generated } => json!({
+                "class": "until_walker_mismatch",
+                "delim": delim,
+                "delim_hex": hex(delim.as_bytes()),
+                "generated": generated,
+                "generated_hex": hex(generated.as_bytes()),
+            }),
+            Finding::UntilPanicked {
+                delim,
+                panic_message,
+                stage,
+            } => json!({
+                "class": "until_panicked",
+                "stage": stage,
+                "delim": delim,
+                "delim_hex": hex(delim.as_bytes()),
                 "panic_message": panic_message,
             }),
         }
@@ -685,6 +901,102 @@ fn run_case_inner(
     findings
 }
 
+/// `until` subcommand: single-case runner. Same `catch_unwind` safety
+/// net as `run_case` — the matcher can in principle blow its
+/// recursion / `pending`-buffer limits on adversarial input, same as
+/// the schema pipeline, so panics surface as `UntilPanicked` findings
+/// instead of taking down a worker thread.
+fn run_until_case(
+    rng: &mut SmallRng,
+    delim: &str,
+    walker_budget: usize,
+) -> Vec<Finding> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    match catch_unwind(AssertUnwindSafe(|| {
+        run_until_case_inner(rng, delim, walker_budget)
+    })) {
+        Ok(findings) => findings,
+        Err(panic) => vec![Finding::UntilPanicked {
+            delim: delim.to_string(),
+            panic_message: panic_payload_to_string(panic),
+            stage: "run_until_case",
+        }],
+    }
+}
+
+/// The two differential directions (requirements 3 and 4):
+///
+/// 1. Feed a generated `input` directly to the compiled grammar and
+///    compare accept/reject against the naive matcher.
+/// 2. Walk the grammar to generate strings it considers complete, and
+///    assert the naive matcher agrees they're accepted — the
+///    direction unit tests can't cover cheaply since it requires
+///    exploring the automaton's own reachable states rather than
+///    guessing them via random splicing.
+fn run_until_case_inner(
+    rng: &mut SmallRng,
+    delim: &str,
+    walker_budget: usize,
+) -> Vec<Finding> {
+    let mut rules = String::new();
+    emit_until_rules("u", delim, &mut rules);
+    let gbnf_source = format!("root ::= u\n{rules}");
+
+    let grammar = match Grammar::parse(&gbnf_source) {
+        Ok(g) => Arc::new(g),
+        Err(e) => {
+            return vec![Finding::UntilCompileBroken {
+                delim: delim.to_string(),
+                gbnf_source,
+                error: format!("{e:?}"),
+            }];
+        }
+    };
+
+    let mut findings = Vec::new();
+
+    // Direction 1: direct-feed vs naive matcher.
+    let input = gen_until_input(rng, delim);
+    let naive = input.ends_with(delim)
+        && input.find(delim) == Some(input.len() - delim.len());
+    let mut state = GrammarState::new(grammar.clone());
+    let by_grammar =
+        state.advance_bytes(input.as_bytes()).is_ok() && state.is_complete();
+    if by_grammar != naive {
+        findings.push(Finding::UntilMismatch {
+            delim: delim.to_string(),
+            input,
+            naive,
+            by_grammar,
+        });
+    }
+
+    // Direction 2: walk the grammar to generate an accepted string,
+    // then check the naive matcher agrees. The walker samples
+    // ASCII-only first bytes (see `bitmap_to_bytes`), so it never
+    // explores a transition through a multi-byte delimiter char — but
+    // it still exercises every ASCII-reachable KMP state, which is
+    // exactly what direction 1's random splicing can under-sample.
+    if let Some(bytes) = walk_grammar(grammar, rng, walker_budget) {
+        if let Ok(generated) = String::from_utf8(bytes) {
+            let naive_accepts = generated.ends_with(delim)
+                && generated.find(delim) == Some(generated.len() - delim.len());
+            if !naive_accepts {
+                findings.push(Finding::UntilWalkerMismatch {
+                    delim: delim.to_string(),
+                    generated,
+                });
+            }
+        }
+        // Non-UTF8 bytes shouldn't happen (ASCII-only walker sampling
+        // plus valid-UTF8 delimiter chars re-encoded), but if it ever
+        // does there's nothing to check against a `str`-based naive
+        // matcher — skip silently rather than force a spurious finding.
+    }
+
+    findings
+}
+
 /// Sync-write a one-line trace to FUZZ_TRACE_PATH (default
 /// `/tmp/fuzz_case_trace.log`). Used while hunting an uncatchable
 /// crash — every line is fsync'd so the file always reflects what
@@ -732,6 +1044,10 @@ fn ensure_corpus_dirs(root: &Path) -> std::io::Result<()> {
         "class2_grammar_accepts_serde_rejects",
         "class3_grammar_accepts_schema_rejects",
         "class4_pipeline_panicked",
+        "class5_until_compile_broken",
+        "class6_until_mismatch",
+        "class7_until_walker_mismatch",
+        "class8_until_panicked",
     ] {
         fs::create_dir_all(root.join(sub))?;
     }
@@ -831,8 +1147,60 @@ fn signature_hash(f: &Finding) -> u64 {
                 .collect::<String>()
                 .hash(&mut h);
         }
+        Finding::UntilCompileBroken { error, .. } => {
+            // Same reasoning as `CompileBroken`: hash the error
+            // discriminant, not the delimiter that triggered it — many
+            // delimiters can hit the same parser bug.
+            error.chars().take(32).collect::<String>().hash(&mut h);
+        }
+        Finding::UntilMismatch {
+            delim,
+            naive,
+            by_grammar,
+            ..
+        } => {
+            // The literal `input` varies per-case but isn't the bug;
+            // the bug is characterized by which direction the verdicts
+            // disagreed in, plus the delimiter's length and whether it
+            // self-overlaps (a border, e.g. "aa"/"aba") — self-overlap
+            // is what actually exercises the KMP fallback logic in
+            // `emit_until_rules`, so it's the more meaningful bucket
+            // than the delimiter's literal characters.
+            naive.hash(&mut h);
+            by_grammar.hash(&mut h);
+            delim.chars().count().hash(&mut h);
+            until_delim_has_border(delim).hash(&mut h);
+        }
+        Finding::UntilWalkerMismatch { delim, .. } => {
+            delim.chars().count().hash(&mut h);
+            until_delim_has_border(delim).hash(&mut h);
+        }
+        Finding::UntilPanicked {
+            panic_message,
+            stage,
+            ..
+        } => {
+            stage.hash(&mut h);
+            panic_message
+                .chars()
+                .take(64)
+                .collect::<String>()
+                .hash(&mut h);
+        }
     }
     h.finish()
+}
+
+/// Whether `delim` has a nontrivial border — a proper prefix that is
+/// also a suffix (e.g. `"aba"`: `"a"` is both). Borders are exactly
+/// what makes the KMP fallback transition in `emit_until_rules`
+/// nontrivial (state doesn't reset fully to 0 on a mismatch), so
+/// bucketing findings on this is a better dedup signal than the
+/// delimiter's literal text.
+fn until_delim_has_border(delim: &str) -> bool {
+    let chars: Vec<char> = delim.chars().collect();
+    let n = chars.len();
+    (1..n).any(|len| chars[..len] == chars[n - len..])
 }
 
 /// Extract the *keyword tail* from a `jsonschema` validator error.
@@ -1128,6 +1496,126 @@ fn run_pure(args: PureArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// `until` mode driver
+// ───────────────────────────────────────────────────────────────────────
+//
+// Structurally the same shape as `run_pure` (rayon scope over worker
+// threads, shared `Stats`, periodic heartbeat, duration/cases caps) —
+// reuses those exact helpers (`Stats`, `write_finding`,
+// `ensure_corpus_dirs`, `short_summary`). The only difference is what
+// each case generates and checks: a random delimiter + `run_until_case`
+// instead of a random schema + `run_case`.
+
+fn run_until(args: UntilArgs) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_corpus_dirs(&args.corpus)?;
+    let mut pool_builder =
+        rayon::ThreadPoolBuilder::new().stack_size(128 * 1024 * 1024);
+    if let Some(n) = args.threads {
+        pool_builder = pool_builder.num_threads(n);
+    }
+    pool_builder.build_global()?;
+    let started = Instant::now();
+    let stats = Arc::new(Stats::new());
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let heartbeat_handle = {
+        let stats = stats.clone();
+        let stop_flag = stop_flag.clone();
+        std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(30));
+                let cases = stats.cases.load(Ordering::Relaxed);
+                let findings = stats.findings.load(Ordering::Relaxed);
+                let new_f = stats.new_findings.load(Ordering::Relaxed);
+                let werr = stats.write_errors.load(Ordering::Relaxed);
+                let elapsed = started.elapsed().as_secs_f64();
+                let rate = cases as f64 / elapsed.max(1e-9);
+                eprintln!(
+                    "[until t+{elapsed:>6.0}s] cases={cases} ({rate:.1}/s) findings={findings} unique={new_f} write_errors={werr}"
+                );
+            }
+        })
+    };
+
+    let cases_cap = args.cases;
+    let duration_cap = args.duration;
+    let walker_budget = args.walker_budget;
+    let corpus = args.corpus.clone();
+    let seed = args.seed;
+
+    rayon::scope(|s| {
+        let workers = rayon::current_num_threads();
+        for tid in 0..workers {
+            let stop_flag = stop_flag.clone();
+            let stats = stats.clone();
+            let corpus = corpus.clone();
+            s.spawn(move |_| {
+                let mut rng =
+                    SmallRng::seed_from_u64(seed.wrapping_add(tid as u64));
+                loop {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Some(cap) = cases_cap {
+                        if stats.cases.load(Ordering::Relaxed) >= cap {
+                            stop_flag.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    if let Some(d) = duration_cap {
+                        if started.elapsed() >= d {
+                            stop_flag.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    stats.cases.fetch_add(1, Ordering::Relaxed);
+
+                    let delim = gen_until_delim(&mut rng);
+                    let findings =
+                        run_until_case(&mut rng, &delim, walker_budget);
+                    for f in findings {
+                        stats.findings.fetch_add(1, Ordering::Relaxed);
+                        match write_finding(&corpus, &f) {
+                            Ok(true) => {
+                                stats
+                                    .new_findings
+                                    .fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "[until t+{:>6.0}s] NEW finding: {} -> {}",
+                                    started.elapsed().as_secs_f64(),
+                                    f.class_dir(),
+                                    short_summary(&f),
+                                );
+                            }
+                            Ok(false) => { /* dup, silent */ }
+                            Err(e) => {
+                                eprintln!("write_finding error: {e}");
+                                stats
+                                    .write_errors
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    stop_flag.store(true, Ordering::Relaxed);
+    let _ = heartbeat_handle.join();
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let cases = stats.cases.load(Ordering::Relaxed);
+    let findings = stats.findings.load(Ordering::Relaxed);
+    let new_f = stats.new_findings.load(Ordering::Relaxed);
+    eprintln!(
+        "\n=== until done in {elapsed:.0}s: cases={cases} ({:.1}/s) findings={findings} unique={new_f} ===",
+        cases as f64 / elapsed.max(1e-9)
+    );
+    Ok(())
+}
+
 fn short_summary(f: &Finding) -> String {
     match f {
         Finding::CompileBroken { error, .. } => {
@@ -1159,6 +1647,39 @@ fn short_summary(f: &Finding) -> String {
             ..
         } => {
             format!("panic@{stage}: {}", first_line(panic_message))
+        }
+        Finding::UntilCompileBroken { delim, error, .. } => {
+            format!(
+                "until_compile_broken: delim={delim:?} {}",
+                first_line(error)
+            )
+        }
+        Finding::UntilMismatch {
+            delim,
+            input,
+            naive,
+            by_grammar,
+        } => {
+            format!(
+                "until_mismatch: delim={delim:?} input={:?} naive={naive} by_grammar={by_grammar}",
+                preview(input.as_bytes())
+            )
+        }
+        Finding::UntilWalkerMismatch { delim, generated } => {
+            format!(
+                "until_walker_mismatch: delim={delim:?} generated={:?}",
+                preview(generated.as_bytes())
+            )
+        }
+        Finding::UntilPanicked {
+            delim,
+            panic_message,
+            stage,
+        } => {
+            format!(
+                "until_panic@{stage}: delim={delim:?} {}",
+                first_line(panic_message)
+            )
         }
     }
 }
@@ -1265,6 +1786,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Pure(a) => run_pure(a),
+        Cmd::Until(a) => run_until(a),
         Cmd::Replay(a) => run_replay(a),
         Cmd::Report(a) => run_report(a),
     }

@@ -365,6 +365,117 @@ pub(crate) fn emit_thought_rules(out: &mut String) {
     let _ = writeln!(out, r#"think_char ::= [^<] | "<" [^/]"#);
 }
 
+/// Append GBNF rules matching raw content terminated by `delim`: the
+/// emitted language is every string ending in exactly one occurrence
+/// of `delim` — the delimiter appears nowhere except as the final
+/// suffix. Content before the terminator is unrestricted.
+///
+/// This is the multi-char generalization of the `think_char` trick
+/// and the GBNF encoding of llama.cpp's `until()` combinator
+/// (`gbnf_excluding_grammar`, upstream PR #24839): the KMP prefix
+/// automaton of `delim` emitted as right-linear rules, one rule per
+/// automaton state. Each state gets an explicit branch per distinct
+/// char of `delim` (advancing or falling back per KMP) and a
+/// catch-all negated class returning to state 0; completing the
+/// match terminates the rule. Exact — no lookahead required, so it
+/// compiles to plain GBNF.
+///
+/// The root rule is `{rule_name}`; helpers are `{rule_name}__s{i}`.
+/// Tagged dialects (Phase D) embed it as e.g.
+/// `param_value ::= until_param_close` where the parsed value is
+/// everything before the delimiter. The delimiter itself is part of
+/// the matched text.
+///
+/// States are over Unicode scalar values, matching the grammar
+/// engine's codepoint-based matcher (multi-byte UTF-8 delimiters
+/// work). Practical dialect delimiters are ASCII.
+///
+/// # Panics
+///
+/// Panics if `delim` is empty — an "until nothing" rule is
+/// meaningless and a caller bug.
+///
+/// Exposed as `#[doc(hidden)] pub` (re-exported at the crate root)
+/// so the in-tree fuzzer can compile `until` grammars directly. Not
+/// part of the stable surface — dialect callers should go through
+/// the tagged-dialect emitter once it lands (Phase D), not this
+/// function.
+#[doc(hidden)]
+pub fn emit_until_rules(rule_name: &str, delim: &str, out: &mut String) {
+    let d: Vec<char> = delim.chars().collect();
+    let n = d.len();
+    assert!(n > 0, "emit_until_rules: empty delimiter");
+
+    // Distinct delimiter chars in first-appearance order, for
+    // deterministic output.
+    let mut distinct: Vec<char> = Vec::new();
+    for &c in &d {
+        if !distinct.contains(&c) {
+            distinct.push(c);
+        }
+    }
+
+    // KMP transition: from state `i` (i chars of `delim` matched) on
+    // char `c`, the next state is the longest prefix of `delim` that
+    // is a suffix of `delim[..i] + c`. O(n²) per lookup; delimiters
+    // are tiny.
+    let delta = |i: usize, c: char| -> usize {
+        let mut k = (i + 1).min(n);
+        loop {
+            if k == 0 {
+                return 0;
+            }
+            if d[k - 1] == c && d[..k - 1] == d[i - (k - 1)..i] {
+                return k;
+            }
+            k -= 1;
+        }
+    };
+
+    // Catch-all class: any char not in the delimiter's alphabet
+    // always resets to state 0 (delta is 0 for chars outside the
+    // pattern), so one negated class covers all of them.
+    let class: String =
+        distinct.iter().map(|&c| escape_for_gbnf_class(c)).collect();
+
+    let _ = writeln!(out, "{rule_name} ::= {rule_name}__s0");
+    for i in 0..n {
+        let mut alts: Vec<String> = Vec::with_capacity(distinct.len() + 1);
+        for &c in &distinct {
+            let lit = escape_for_gbnf_string(&c.to_string());
+            let next = delta(i, c);
+            if next == n {
+                alts.push(format!(r#""{lit}""#));
+            } else {
+                alts.push(format!(r#""{lit}" {rule_name}__s{next}"#));
+            }
+        }
+        alts.push(format!("[^{class}] {rule_name}__s0"));
+        let _ = writeln!(
+            out,
+            "{rule_name}__s{i} ::= {alts}",
+            alts = alts.join(" | ")
+        );
+    }
+}
+
+/// Escape a char for embedding inside a GBNF `[...]` character
+/// class. Beyond the lexer's named escapes, `-` and `^` are emitted
+/// as `\xNN` since they carry meaning inside a class.
+fn escape_for_gbnf_class(c: char) -> String {
+    match c {
+        '\\' => r"\\".into(),
+        ']' => r"\]".into(),
+        '[' => r"\[".into(),
+        '\n' => r"\n".into(),
+        '\r' => r"\r".into(),
+        '\t' => r"\t".into(),
+        '-' | '^' => format!(r"\x{:02X}", c as u32),
+        c if (c as u32) < 0x20 => format!(r"\x{:02X}", c as u32),
+        c => c.to_string(),
+    }
+}
+
 /// Escape a Rust string so it can be embedded inside a GBNF `"..."`
 /// literal. Handles the escapes our GBNF lexer recognizes.
 pub(crate) fn escape_for_gbnf_string(s: &str) -> String {
@@ -640,6 +751,102 @@ mod tests {
         assert!(accepts(&src, r#""High""#));
         assert!(!accepts(&src, r#""Definite""#));
         assert!(!accepts(&src, r#""low""#)); // case-sensitive
+    }
+
+    /// Exhaustive differential check of `emit_until_rules` against a
+    /// naive matcher: over a 3-char alphabet, every string up to
+    /// length 7, for delimiters exercising self-overlap (`aa`, `aba`)
+    /// and the trivial single char. The grammar must accept exactly
+    /// the strings whose only occurrence of the delimiter is the
+    /// final suffix.
+    #[test]
+    fn until_rules_match_naive_exhaustively() {
+        const ALPHABET: [char; 3] = ['a', 'b', 'c'];
+        for delim in ["a", "ab", "aa", "aba", "abc"] {
+            let mut rules = String::new();
+            emit_until_rules("u", delim, &mut rules);
+            let src = format!("root ::= u\n{rules}");
+            let grammar = Arc::new(
+                Grammar::parse(&src).expect("until grammar must parse"),
+            );
+
+            // Enumerate all strings of length 0..=7 by counting in
+            // base 3.
+            for len in 0..=7usize {
+                for mut idx in 0..3usize.pow(len as u32) {
+                    let mut s = String::with_capacity(len);
+                    for _ in 0..len {
+                        s.push(ALPHABET[idx % 3]);
+                        idx /= 3;
+                    }
+                    let naive = s.ends_with(delim)
+                        && s.find(delim) == Some(s.len() - delim.len());
+                    let mut state = GrammarState::new(Arc::clone(&grammar));
+                    let by_grammar = state.advance_bytes(s.as_bytes()).is_ok()
+                        && state.is_complete();
+                    assert_eq!(
+                        by_grammar, naive,
+                        "delim {delim:?}, input {s:?}: grammar said \
+                         {by_grammar}, naive said {naive}\n{src}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The Phase D use case: raw parameter values terminated by the
+    /// Qwen XML close tag, including partial-overlap content the
+    /// naive `[^<]*`-style approximations get wrong.
+    #[test]
+    fn until_rules_handle_dialect_close_tags() {
+        let mut rules = String::new();
+        emit_until_rules("val", "</parameter>", &mut rules);
+        let src = format!("root ::= val\n{rules}");
+
+        // Empty content: just the delimiter.
+        assert!(accepts(&src, "</parameter>"));
+        // Plain content.
+        assert!(accepts(&src, "42 rue de la Paix\n</parameter>"));
+        // Content with partial-overlap teasers: `<`, `</`, `</param`.
+        assert!(accepts(&src, "a < b and c </ d </param e</parameter>"));
+        assert!(accepts(&src, "<</parameter>"));
+        assert!(accepts(&src, "</</parameter>"));
+        // Trailing whitespace inside the value survives (the
+        // awkward-but-legal class from the plan amendments).
+        assert!(accepts(&src, "value ends in newline\n\n</parameter>"));
+        // A full delimiter mid-content must reject: the value ended
+        // earlier, the rest is trailing garbage.
+        assert!(!accepts(&src, "x</parameter>y</parameter>"));
+        // No terminator at all: incomplete, not accepted.
+        assert!(!accepts(&src, "dangling"));
+        // Bare prefix of the delimiter at end: incomplete.
+        assert!(!accepts(&src, "value</param"));
+    }
+
+    /// Multi-byte UTF-8 delimiter chars work (the automaton runs on
+    /// codepoints, matching the engine's matcher).
+    #[test]
+    fn until_rules_unicode_delimiter() {
+        let mut rules = String::new();
+        emit_until_rules("u", "→end", &mut rules);
+        let src = format!("root ::= u\n{rules}");
+        assert!(accepts(&src, "before →end"));
+        assert!(accepts(&src, "→ not yet →end"));
+        assert!(!accepts(&src, "→end trailing"));
+    }
+
+    /// Delimiter chars that are metacharacters inside GBNF classes /
+    /// literals must be escaped, not break the emitted grammar.
+    #[test]
+    fn until_rules_escapes_metacharacters() {
+        for delim in ["]", "[x]", "a-b", "^", "\\", "\"", "\n\n"] {
+            let mut rules = String::new();
+            emit_until_rules("u", delim, &mut rules);
+            let src = format!("root ::= u\n{rules}");
+            let content = format!("some content{delim}");
+            assert!(accepts(&src, &content), "delim {delim:?} failed:\n{src}");
+            assert!(!accepts(&src, "no terminator"));
+        }
     }
 
     #[test]
