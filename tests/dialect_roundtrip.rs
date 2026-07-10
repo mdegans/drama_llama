@@ -166,3 +166,123 @@ fn reconstruct_llama31() {
         "<|eot_id|>",
     );
 }
+
+#[test]
+fn reconstruct_gemma4_gguf() {
+    assert_reconstruction("gemma4-gguf.jinja", "<bos>", "<turn|>");
+}
+
+#[test]
+fn reconstruct_gemma4_upstream() {
+    assert_reconstruction("google-gemma-4-31B-it.jinja", "<bos>", "<turn|>");
+}
+
+/// Gemma 4, the full-fidelity version: thought routed through the
+/// `reasoning` field (`ReasoningReingest::Field`), parallel calls,
+/// and the value-type corners probed against minijinja (null renders
+/// `none`, floats in ryu-shortest form, nested dicts re-sorted).
+/// The canonical emission — reasoning block plus both calls — must
+/// appear byte-for-byte in the template re-render.
+#[test]
+fn reconstruct_gemma4_thought_and_values() {
+    use drama_llama::dialect::ReasoningReingest;
+
+    let source = fixture_source("gemma4-gguf.jinja");
+    let syntax: CallSyntax =
+        analyze_template(&source, "<bos>", "<turn|>").expect("analyze");
+    assert_eq!(syntax, CallSyntax::gemma4(), "sniff patch must fire");
+
+    let tool = Tool::builder("configure")
+        .description("Configure a thing.")
+        .schema(json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "count": {"type": "integer"},
+                "ratio": {"type": "number"},
+                "flag": {"type": "boolean"},
+                "maybe": {"type": ["string", "null"]},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "nested": {"type": "object", "properties": {
+                    "z": {"type": "integer"}, "a": {"type": "string"}}},
+            },
+            "required": ["name", "count"],
+        }))
+        .build()
+        .expect("valid test tool");
+
+    let input_a = json!({
+        "name": "unit 🍓",
+        "count": 3,
+        "ratio": 1.5e10,
+        "flag": false,
+        "maybe": null,
+        "tags": ["x", "y"],
+        "nested": {"z": 2, "a": "v"},
+    });
+    let input_b = json!({"name": "second", "count": 1});
+    let thought = "weighing the options";
+
+    let calls_ref = render_reference(
+        &syntax,
+        &[("configure", &input_a), ("configure", &input_b)],
+    )
+    .expect("representable");
+    // What the template renders for a thinking tool-call turn:
+    // reasoning block immediately followed by the calls.
+    let emission =
+        format!("<|channel>thought\n{thought}\n<channel|>{calls_ref}");
+
+    // Emission → blocks (the parser half).
+    let parsed =
+        parse_text(&syntax, &[&tool], &emission, false, Leniency::Final);
+    assert_eq!(parsed.status, ParseStatus::Complete, "{parsed:#?}");
+    let blocks = &parsed.blocks;
+    assert!(
+        matches!(&blocks[0], Block::Thought { thought: t, .. }
+            if t.as_ref() == thought),
+        "{blocks:#?}"
+    );
+    let calls: Vec<&ToolUse> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { call } => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "{blocks:#?}");
+    assert_eq!(calls[0].input, input_a, "{blocks:#?}");
+    assert_eq!(calls[1].input, input_b, "{blocks:#?}");
+
+    // Blocks → template re-render (the render half).
+    let prompt = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("Configure it."),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(parsed.blocks),
+            },
+        ],
+        tools: Some(vec![tool.into()]),
+        ..Default::default()
+    };
+    let template = ChatTemplate::from_source(
+        source,
+        "<bos>".to_string(),
+        "<turn|>".to_string(),
+    )
+    .expect("template compiles");
+    let opts = RenderOptions::default()
+        .with_generation_prompt(false)
+        .with_extra("enable_thinking", true)
+        .with_thought_reingest(ReasoningReingest::Field);
+    let rendered = template.render_with(&prompt, &opts).expect("render");
+    assert!(
+        rendered.contains(&emission),
+        "reconstruction drift.\n--- canonical emission ---\n{emission:?}\n\
+         --- template re-render ---\n{rendered:?}"
+    );
+}

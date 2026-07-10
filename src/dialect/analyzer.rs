@@ -313,6 +313,17 @@ static PATCHES: &[Patch] = &[
             push_preserved(&mut syntax.preserved_tokens, "</think>");
         }
     },
+    // Gemma 4: hand-built dialect selected by source sniff, exactly
+    // as upstream does (`common_chat_params_init_gemma4`) — the
+    // differential probes can't segment its bare-key dict format or
+    // the asymmetric `<|…>` / `<…|>` marker convention. Full
+    // overwrite: any partial probe result for this template is
+    // noise.
+    |src, syntax| {
+        if src.contains("<|tool_call>call:") && src.contains("<|\"|>") {
+            *syntax = CallSyntax::gemma4();
+        }
+    },
 ];
 
 fn push_preserved(tokens: &mut Vec<String>, token: &str) {
@@ -343,6 +354,7 @@ fn collect_preserved_tokens(syntax: &mut CallSyntax) {
         &syntax.arguments.separator,
         &syntax.arguments.value_prefix,
         &syntax.arguments.value_suffix,
+        &syntax.arguments.string_quote,
         &syntax.call_id.prefix,
         &syntax.call_id.suffix,
     ] {

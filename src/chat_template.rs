@@ -240,7 +240,7 @@ impl ChatTemplate {
         prompt: &Prompt,
         opts: &RenderOptions,
     ) -> Result<String, ChatTemplateError> {
-        let messages = build_messages(prompt);
+        let messages = build_messages(prompt, opts.thought_reingest);
         // Only custom (client-executed) tool defs render into the
         // template; server tools execute on Anthropic's side and their
         // schemas aren't even visible to us.
@@ -422,6 +422,16 @@ pub struct RenderOptions {
     /// Template-specific extra variables. Keys become top-level names in
     /// the Jinja context. Values are arbitrary Serialize-able data.
     pub extras: Vec<(String, JinjaValue)>,
+    /// How assistant [`Block::Thought`]s re-ingest: inline
+    /// `<think>…</think>` text in `content` (default, legacy Qwen
+    /// convention) or as the message's `reasoning` /
+    /// `reasoning_content` fields (Gemma 4, DeepSeek-style templates
+    /// that own the reasoning markers themselves).
+    /// `Session` sets this from the model's analyzed dialect
+    /// ([`CallSyntax::reasoning`](crate::CallSyntax)).
+    ///
+    /// [`Block::Thought`]: crate::Block
+    pub thought_reingest: crate::dialect::ReasoningReingest,
 }
 
 impl RenderOptions {
@@ -451,6 +461,15 @@ impl RenderOptions {
     {
         self.extras
             .push((key.into(), JinjaValue::from_serialize(&value)));
+        self
+    }
+
+    /// Builder: set the thought re-ingest convention.
+    pub fn with_thought_reingest(
+        mut self,
+        reingest: crate::dialect::ReasoningReingest,
+    ) -> Self {
+        self.thought_reingest = reingest;
         self
     }
 }
@@ -647,16 +666,20 @@ pub fn tokenize_with_breakpoints<M: Model>(
 ///
 /// Tool-calling messages are emitted in the shape HF templates expect:
 ///
-/// * An assistant message with at least one [`Block::ToolUse`] becomes
-///   `{role: "assistant", tool_calls: [{function: {name, arguments}}]}`.
-///   Any accompanying text/thought is dropped — templates like
-///   Llama 3.1's render tool calls in a branch that doesn't emit
-///   `content`.
+/// * An assistant message with [`Block::ToolUse`]s becomes
+///   `{role: "assistant", tool_calls: [{function: {name, arguments}},
+///   …]}` — one message carrying *every* call, the shape template
+///   `tool_calls` loops iterate (parallel calls included).
+///   Accompanying text stays as `content`; thoughts route per
+///   `reingest`.
 /// * A user message containing [`Block::ToolResult`] blocks is split:
 ///   each tool result emits a separate `{role: "tool", content: ...}`
 ///   message. Any remaining text in the same user turn follows as a
 ///   normal user message.
-fn build_messages(prompt: &Prompt) -> Vec<JinjaValue> {
+fn build_messages(
+    prompt: &Prompt,
+    reingest: crate::dialect::ReasoningReingest,
+) -> Vec<JinjaValue> {
     let mut out: Vec<JinjaValue> =
         Vec::with_capacity(prompt.messages.len() + 1);
     if let Some(system) = prompt.system.as_ref() {
@@ -670,13 +693,18 @@ fn build_messages(prompt: &Prompt) -> Vec<JinjaValue> {
             // HF templates broadly accept repeated system messages.
             Role::System => "system",
         };
-        append_message(&mut out, role, &m.content);
+        append_message(&mut out, role, &m.content, reingest);
     }
     out
 }
 
 /// Emit one or more Jinja messages for a single misanthropic Message.
-fn append_message(out: &mut Vec<JinjaValue>, role: &str, content: &Content) {
+fn append_message(
+    out: &mut Vec<JinjaValue>,
+    role: &str,
+    content: &Content,
+    reingest: crate::dialect::ReasoningReingest,
+) {
     let blocks: Vec<&Block> = content.0.iter().collect();
 
     // User turn: split ToolResult blocks into their own "tool" messages,
@@ -698,31 +726,40 @@ fn append_message(out: &mut Vec<JinjaValue>, role: &str, content: &Content) {
         return;
     }
 
-    // Assistant turn: if any ToolUse, emit a tool-calling message. For a
-    // single-call convention (what Llama 3.1 and Anthropic both use),
-    // take the first ToolUse. Any surrounding thought is preserved as
-    // content so templates that support <think>…</think> get signal.
-    if let Some(call) = blocks.iter().find_map(|b| match b {
-        Block::ToolUse { call } => Some(call),
-        _ => None,
-    }) {
-        let mut residual = String::new();
-        for b in &blocks {
-            if matches!(b, Block::ToolUse { .. }) {
-                continue;
+    // Assistant turn. Thoughts route by convention: inline
+    // `<think>…</think>` in content (legacy Qwen templates
+    // reconstruct from content), or concatenated into the
+    // `reasoning`/`reasoning_content` fields (Gemma 4/DeepSeek-style
+    // templates own the markers; inlining would pollute content).
+    use crate::dialect::ReasoningReingest;
+    let calls: Vec<&crate::prompt::ToolUse> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { call } => Some(call),
+            _ => None,
+        })
+        .collect();
+    let mut reasoning = String::new();
+    let mut residual = String::new();
+    for b in &blocks {
+        match b {
+            Block::ToolUse { .. } => {}
+            Block::Thought { thought, .. }
+                if reingest == ReasoningReingest::Field =>
+            {
+                reasoning.push_str(thought);
             }
-            append_block_text(&mut residual, b);
+            other => append_block_text(&mut residual, other),
         }
-        out.push(tool_call_message(role, &residual, call));
-        return;
     }
 
-    // No tool blocks — plain flattening.
-    let mut flat = String::new();
-    for b in &blocks {
-        append_block_text(&mut flat, b);
+    // One message carrying every call: the shape template
+    // `tool_calls` loops iterate, so parallel calls re-render intact.
+    if !calls.is_empty() {
+        out.push(tool_call_message(role, &residual, &calls, &reasoning));
+        return;
     }
-    out.push(text_message(role, flat));
+    out.push(assistant_text_message(role, residual, &reasoning));
 }
 
 fn text_message(role: &str, content: String) -> JinjaValue {
@@ -732,29 +769,67 @@ fn text_message(role: &str, content: String) -> JinjaValue {
     }
 }
 
-/// Assistant message with a single `tool_calls` entry. Shape:
-/// `{role, content, tool_calls: [{id, function: {name, arguments}}]}`.
+/// Assistant message with one `tool_calls` entry per call. Shape:
+/// `{role, content, tool_calls: [{id, function: {name, arguments}},
+/// …]}`.
 ///
 /// Llama 3.1's template reads `.function.name` and `.function.arguments`
 /// off each entry. OpenAI-style templates also look at `.id`, so we
 /// include it. We intentionally omit the `type` field — templates that
-/// need it default to `"function"`.
+/// need it default to `"function"`. A non-empty `reasoning` renders as
+/// both `reasoning` and `reasoning_content` (templates read one or the
+/// other).
 fn tool_call_message(
     role: &str,
     content: &str,
-    call: &crate::prompt::ToolUse,
+    calls: &[&crate::prompt::ToolUse],
+    reasoning: &str,
 ) -> JinjaValue {
-    let tool_call = minijinja::context! {
-        id => call.id.as_ref(),
-        function => minijinja::context! {
-            name => call.name.as_ref(),
-            arguments => JinjaValue::from_serialize(&call.input),
-        },
-    };
+    let tool_calls: Vec<JinjaValue> = calls
+        .iter()
+        .map(|call| {
+            minijinja::context! {
+                id => call.id.as_ref(),
+                function => minijinja::context! {
+                    name => call.name.as_ref(),
+                    arguments => JinjaValue::from_serialize(&call.input),
+                },
+            }
+        })
+        .collect();
+    if reasoning.is_empty() {
+        minijinja::context! {
+            role => role,
+            content => content,
+            tool_calls => tool_calls,
+        }
+    } else {
+        minijinja::context! {
+            role => role,
+            content => content,
+            tool_calls => tool_calls,
+            reasoning => reasoning,
+            reasoning_content => reasoning,
+        }
+    }
+}
+
+/// Assistant message without tool calls; carries `reasoning` /
+/// `reasoning_content` fields when the caller routed thoughts there
+/// ([`ReasoningReingest::Field`](crate::dialect::ReasoningReingest)).
+fn assistant_text_message(
+    role: &str,
+    content: String,
+    reasoning: &str,
+) -> JinjaValue {
+    if reasoning.is_empty() {
+        return text_message(role, content);
+    }
     minijinja::context! {
         role => role,
         content => content,
-        tool_calls => vec![tool_call],
+        reasoning => reasoning,
+        reasoning_content => reasoning,
     }
 }
 

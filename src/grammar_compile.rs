@@ -351,6 +351,311 @@ fn emit_object_rule(
     let _ = writeln!(out, "{rule_name} ::= {body}");
 }
 
+// ===========================================================================
+// Dict value encoding (Family::TagWithDict — Gemma 4)
+// ===========================================================================
+//
+// JSON-shaped values with two twists the template trains the model
+// on: dict keys are *bare* (`city:` not `"city":`) and strings are
+// delimited by a dedicated quote marker (`<|"|>`) instead of `"` —
+// the marker is a single special token, so string content needs no
+// in-band escaping. Rendering is compact (no whitespace): that is
+// what the template's `format_argument` re-renders, and round-trip
+// byte-stability pins emission to re-render.
+//
+// Value-type canonical bytes were probed against our minijinja setup
+// (pycompat) rendering the Gemma 4 template:
+//   * null → `none` (minijinja lowercases; Python jinja says `None`,
+//     upstream llama.cpp parses `null`). We *render* `none` and
+//     *accept* all three in the grammar — if the model picks another
+//     spelling, Session's canonicalization layer repairs the bytes.
+//   * floats → serde_json/ryu shortest form matches minijinja
+//     (`1.5e10` ⇒ `15000000000.0`, `3.0` ⇒ `3.0`).
+
+/// Append `value` in dict encoding. Objects render key-sorted
+/// (serde_json's BTreeMap ⇒ same order as the template's
+/// `| dictsort`).
+pub(crate) fn dict_encode_value(v: &Value, quote: &str, out: &mut String) {
+    match v {
+        Value::String(s) => {
+            out.push_str(quote);
+            out.push_str(s);
+            out.push_str(quote);
+        }
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Null => out.push_str("none"),
+        Value::Number(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (k, val)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(k);
+                out.push(':');
+                dict_encode_value(val, quote, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, val) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                dict_encode_value(val, quote, out);
+            }
+            out.push(']');
+        }
+    }
+}
+
+/// Append the generic (schema-free) dict value rules: `dvalue`,
+/// `dobject`, `darray`, `dstring`, `dnull`. References `number` from
+/// [`JSON_GRAMMAR`], which callers append separately. Emit at most
+/// once per grammar.
+pub(crate) fn emit_dict_value_rules(quote: &str, out: &mut String) {
+    let _ = writeln!(
+        out,
+        r#"dvalue ::= dstring | dobject | darray | number | "true" | "false" | dnull"#
+    );
+    let _ = writeln!(out, r#"dnull ::= "null" | "none" | "None""#);
+    let _ = writeln!(
+        out,
+        r#"dobject ::= "{{" ( dmember ( "," dmember )* )? "}}""#
+    );
+    let _ = writeln!(out, r#"dmember ::= dkey ":" dvalue"#);
+    // Bare keys: anything but the key/dict terminators (upstream
+    // parity: `chars("[^:}]", 1, -1)`).
+    let _ = writeln!(out, r#"dkey ::= [^:}}]+"#);
+    let _ = writeln!(out, r#"darray ::= "[" ( dvalue ( "," dvalue )* )? "]""#);
+    let quote_lit = escape_for_gbnf_string(quote);
+    // The until-rule consumes string content AND the closing quote.
+    let _ = writeln!(out, r#"dstring ::= "{quote_lit}" dstring__body"#);
+    emit_until_rules("dstring__body", quote, out);
+}
+
+/// Dict-encoded counterpart of [`schema_to_gbnf`]: compile `schema`
+/// into rules producing dict-encoded values. Objects lay out
+/// key-sorted *in place* (required anchoring, optionals as
+/// self-contained comma groups) to match the template's `dictsort`
+/// re-render byte-for-byte.
+pub(crate) fn schema_to_dict_gbnf(
+    schema: &Value,
+    rule_name: &str,
+    quote: &str,
+    out: &mut String,
+) {
+    let defs = schema.get("$defs").and_then(|v| v.as_object());
+    let mut counter: usize = 0;
+    emit_dict_schema_rule(schema, rule_name, quote, out, &mut counter, defs);
+}
+
+fn emit_dict_schema_rule(
+    schema: &Value,
+    rule_name: &str,
+    quote: &str,
+    out: &mut String,
+    counter: &mut usize,
+    defs: Option<&serde_json::Map<String, Value>>,
+) {
+    if let Some(target) =
+        schema.get("$ref").and_then(|v| v.as_str()).and_then(|s| {
+            s.strip_prefix("#/$defs/")
+                .and_then(|name| defs.and_then(|m| m.get(name)))
+        })
+    {
+        emit_dict_schema_rule(target, rule_name, quote, out, counter, defs);
+        return;
+    }
+
+    if let Some(variants) = schema.get("anyOf").and_then(|v| v.as_array()) {
+        let mut sub_names: Vec<String> = Vec::with_capacity(variants.len());
+        for sub in variants {
+            *counter += 1;
+            let name = format!("{rule_name}__any_{c}", c = *counter);
+            emit_dict_schema_rule(sub, &name, quote, out, counter, defs);
+            sub_names.push(name);
+        }
+        if sub_names.is_empty() {
+            let _ = writeln!(out, "{rule_name} ::= dvalue");
+        } else {
+            let _ = writeln!(
+                out,
+                "{rule_name} ::= {alts}",
+                alts = sub_names.join(" | ")
+            );
+        }
+        return;
+    }
+
+    if let Some(variants) = schema.get("enum").and_then(|v| v.as_array()) {
+        let mut alt = String::new();
+        for (i, v) in variants.iter().enumerate() {
+            if i > 0 {
+                alt.push_str(" | ");
+            }
+            let mut lit = String::new();
+            dict_encode_value(v, quote, &mut lit);
+            let _ = write!(alt, r#""{}""#, escape_for_gbnf_string(&lit));
+        }
+        let _ = writeln!(out, "{rule_name} ::= {alt}");
+        return;
+    }
+
+    if let Some(v) = schema.get("const") {
+        let mut lit = String::new();
+        dict_encode_value(v, quote, &mut lit);
+        let _ = writeln!(
+            out,
+            r#"{rule_name} ::= "{}""#,
+            escape_for_gbnf_string(&lit)
+        );
+        return;
+    }
+
+    match schema.get("type").and_then(|v| v.as_str()) {
+        Some("object") => {
+            emit_dict_object_rule(schema, rule_name, quote, out, counter, defs)
+        }
+        Some("string") => {
+            let _ = writeln!(out, "{rule_name} ::= dstring");
+        }
+        Some("integer") => {
+            let _ = writeln!(out, "{rule_name} ::= int");
+        }
+        Some("number") => {
+            let _ = writeln!(out, "{rule_name} ::= number");
+        }
+        Some("boolean") => {
+            let _ = writeln!(out, r#"{rule_name} ::= "true" | "false""#);
+        }
+        Some("null") => {
+            let _ = writeln!(out, "{rule_name} ::= dnull");
+        }
+        Some("array") => {
+            let items_rule = if let Some(items) = schema.get("items") {
+                *counter += 1;
+                let name = format!("{rule_name}__item_{c}", c = *counter);
+                emit_dict_schema_rule(items, &name, quote, out, counter, defs);
+                name
+            } else {
+                "dvalue".to_string()
+            };
+            let non_empty =
+                schema.get("minItems").and_then(|v| v.as_u64()).unwrap_or(0)
+                    >= 1;
+            if non_empty {
+                let _ = writeln!(
+                    out,
+                    r#"{rule_name} ::= "[" {items_rule} ( "," {items_rule} )* "]""#
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    r#"{rule_name} ::= "[" ( {items_rule} ( "," {items_rule} )* )? "]""#
+                );
+            }
+        }
+        _ => {
+            let _ = writeln!(out, "{rule_name} ::= dvalue");
+        }
+    }
+}
+
+/// Dict object layout: keys sorted in place (matching `dictsort`
+/// re-renders), compact separators. Optionals *before* the first
+/// required slot render as `( "key:" child "," )?` (comma trailing);
+/// from the first required onward, each later slot carries its
+/// leading comma (`( "," "key:" child )?` when optional). All
+/// subsets containing every required key are reachable with correct
+/// commas, and — unlike a trailing-optionals layout — the accepted
+/// order is exactly the re-render order.
+fn emit_dict_object_rule(
+    schema: &Value,
+    rule_name: &str,
+    quote: &str,
+    out: &mut String,
+    counter: &mut usize,
+    defs: Option<&serde_json::Map<String, Value>>,
+) {
+    let props = schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let required: std::collections::HashSet<String> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if props.is_empty() {
+        let _ = writeln!(out, "{rule_name} ::= dobject");
+        return;
+    }
+
+    // BTreeMap iteration: already key-sorted.
+    let mut slots: Vec<(String, String, bool)> = Vec::new();
+    for (key, prop_schema) in props.iter() {
+        *counter += 1;
+        let child = format!("{rule_name}__{c}", c = *counter);
+        emit_dict_schema_rule(prop_schema, &child, quote, out, counter, defs);
+        slots.push((key.clone(), child, required.contains(key)));
+    }
+
+    let kv = |key: &str, child: &str| {
+        format!(r#""{}:" {child}"#, escape_for_gbnf_string(key))
+    };
+
+    let first_required = slots.iter().position(|(_, _, req)| *req);
+    let mut body = String::new();
+    match first_required {
+        Some(r) => {
+            for (key, child, _) in &slots[..r] {
+                let _ = write!(body, r#"( {} "," )? "#, kv(key, child));
+            }
+            let (key, child, _) = &slots[r];
+            body.push_str(&kv(key, child));
+            for (key, child, req) in &slots[r + 1..] {
+                if *req {
+                    let _ = write!(body, r#" "," {}"#, kv(key, child));
+                } else {
+                    let _ = write!(body, r#" ( "," {} )?"#, kv(key, child));
+                }
+            }
+            let _ = writeln!(out, r#"{rule_name} ::= "{{" {body} "}}""#);
+        }
+        None => {
+            // All optional: chain alternatives so every subset (in
+            // sorted order) is reachable, including the empty dict.
+            let n = slots.len();
+            let mut chain_names: Vec<String> = Vec::with_capacity(n);
+            for k in 0..n {
+                let chain_name = format!("{rule_name}__chain_{k}");
+                let mut tail = String::new();
+                for (i, (key, child, _)) in slots.iter().enumerate().skip(k) {
+                    if i == k {
+                        tail.push_str(&kv(key, child));
+                    } else {
+                        let _ = write!(tail, r#" ( "," {} )?"#, kv(key, child));
+                    }
+                }
+                let _ = writeln!(out, "{chain_name} ::= {tail}");
+                chain_names.push(chain_name);
+            }
+            let alts = chain_names.join(" | ");
+            let _ = writeln!(out, r#"{rule_name} ::= "{{" ( {alts} )? "}}""#);
+        }
+    }
+}
+
 /// Append GBNF rules for an optional `<think>...</think>` prefix.
 ///
 /// Emits the `thought`, `think_body`, and `think_char` rules. Callers
