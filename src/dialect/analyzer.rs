@@ -700,9 +700,14 @@ fn classify_and_extract(
     }
     let _ = probe; // parallel-call refinement happens in callers
 
-    // Ending markers never influence content: relax their whitespace.
-    syntax.section_end = syntax.section_end.trim().to_string();
-    syntax.per_call_end = syntax.per_call_end.trim().to_string();
+    // Trailing whitespace after ending markers is turn-end layout,
+    // not call structure: drop it. LEADING whitespace stays — it is
+    // the canonical separator between the last value and the closer
+    // (e.g. Hermes' `{json}\n</tool_call>`), and render_reference
+    // must reproduce it byte-for-byte. The parser matches closers
+    // whitespace-tolerantly, so keeping it costs nothing there.
+    syntax.section_end = syntax.section_end.trim_end().to_string();
+    syntax.per_call_end = syntax.per_call_end.trim_end().to_string();
 }
 
 /// JSON_NATIVE: parse the call object out of the haystack and map
@@ -795,8 +800,8 @@ fn extract_json_native(clean: &str, syntax: &mut CallSyntax) {
     syntax.json.parameter_order = located.into_iter().map(|(_, f)| f).collect();
 
     syntax.section_start = clean[..start].trim_start().to_string();
-    syntax.section_end = clean[end_excl..].trim().to_string();
-    if syntax.json.tools_array_wrapped && syntax.section_end == "]" {
+    syntax.section_end = clean[end_excl..].trim_end().to_string();
+    if syntax.json.tools_array_wrapped && syntax.section_end.trim() == "]" {
         syntax.section_end.clear();
     }
 }

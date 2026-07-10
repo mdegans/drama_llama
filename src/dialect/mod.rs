@@ -18,9 +18,16 @@
 //! this struct instead).
 
 mod analyzer;
+mod emit;
+mod parse;
 mod segment;
 
 pub use analyzer::{analyze_template, AnalyzeError};
+pub use emit::{
+    grammar_source, render_reference, validate_representable, Anchor,
+    DialectError, EmitOptions,
+};
+pub use parse::{parse_text, Leniency, ParseStatus, Parsed};
 
 /// Tool-call format family, per llama.cpp's classification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -329,6 +336,11 @@ impl CallSyntax {
                 name_suffix: ">\n".into(),
                 value_suffix: "\n</parameter>\n".into(),
                 ..ArgumentsSyntax::default()
+            },
+            reasoning: ReasoningSyntax {
+                mode: ReasoningMode::TagBased,
+                start: "<think>".into(),
+                end: "</think>".into(),
             },
             ..Self::default()
         }
