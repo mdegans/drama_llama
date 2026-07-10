@@ -7,6 +7,30 @@ D/Qwen below) and the format-selection knobs in `ToolChoiceOptions`
 (`wrap_tags` / `arguments_field` are a proto-dialect this plan
 subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
 
+## Progress (2026-07-10, session 1)
+
+- **Phase B LANDED** (`0810ea9` + fix `d7a8cd6`): lazy sample-then-
+  check behind `SampleOptions::lazy_grammar` (default still `false`;
+  flip is #28 phase 3, pending Mike's GPU tok/s comparison —
+  invocation: `DRAMA_LLAMA_GRAMMAR_STATS=1 cargo test --features
+  serde json_integration_lazy_grammar -- --ignored --nocapture`).
+  Bonus find via the new stats: post-complete constraints kept
+  empty-piece reserved tokens, so every constrained Qwen run burned
+  the full `max_tokens` invisibly. Fixed in both modes (`d7a8cd6`).
+- **Phase A LANDED** (`121aec6` A1, `530c6af` A2):
+  `emit_until_rules` (KMP-DFA complement, exhaustive+fuzz tested);
+  `DeferredGrammar::feed_trigger`; `deferred_grammar_for_prompt`
+  (Auto/absent + tools ⇒ trigger-lazy grammar);
+  `RootShape::Eager{thought_pre_opened}` — Qwen thinks under eager
+  grammar now (Session detects the pre-opened `<think>` tail per
+  render). Priority: eager tool grammar > output_config > auto-lazy.
+- **Next: Phase C** (CallSyntax + analyzer). Then D. Phase E should
+  also re-run the blallama e2e over the A2 auto-lazy path.
+- Gemma 4 + gpt-oss GGUFs downloaded to `models/`. NOTE: it's Gemma
+  **4** (not 3) — llama.cpp gives it a hand-built handler, so Phase F
+  may become "native weird template" rather than (or in addition to)
+  `Instructed`. Re-scope F when its template gets probed.
+
 ## Problem
 
 The tool-call *format* a model is trained on is implied by its chat
