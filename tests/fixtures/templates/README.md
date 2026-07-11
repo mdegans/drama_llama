@@ -25,3 +25,24 @@ stays a byte prefix of the next render across tool turns. Deploy it
 as a `<model>.template.jinja` sidecar next to the GGUF. Everything
 outside the thinking-channel block is byte-identical to
 `gemma4-gguf.jinja`.
+
+`gptoss-gguf.jinja` is dumped from the gpt-oss-20b Unsloth GGUF
+(`tokenizer.chat_template`, Apache 2.0 per its own footer) — the
+Harmony template we actually serve.
+
+`gptoss-cache-stable.jinja` is drama_llama's cache-stability patch of
+`gptoss-gguf.jinja` (#30 Phase G): the macro section (system /
+developer / TypeScript tool namespace) is byte-identical to stock;
+the message loop is rewritten so `render(parse(emission))` reproduces
+the emission — analysis (CoT) renders on every reasoning turn (gated
+by `preserve_thinking`, drama_llama's default), tool calls render in
+the model's trained channel-header shape
+(`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>`)
+for ALL `tool_calls` (stock renders only the first, in the role-header
+re-ingest shape), pre-call prose renders as a causal commentary
+preamble, and tool responses render by forward-scan with
+`tool_call_id`-resolved names. Deploy as `<model>.template.jinja`.
+Remaining accepted quirk: a final turn's emission ends with the EOG
+token `<|return|>` while re-ingest renders `<|end|>` (upstream issue
+#15417) — the token is never committed to KV, so the cost is a
+one-token LCP walk-back per final turn.
