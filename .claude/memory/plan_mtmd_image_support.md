@@ -318,11 +318,22 @@ plan text below:
    (attention over restored image cells); swapped image misses AT
    the media entry; literal `<__media__>` in content inert.
 
+9. **Gemma 4 non-causal e2e GREEN** (CPU, ~3 min — faster than
+   feared): grammar-constrained "samoyed" through the non-causal
+   `EmbdBatch` path (dense positions, `CausalAttnGuard`, ubatch fit
+   check — 49-token image chunk). It also caught a **pre-existing C0
+   bug**: the ingest injection guard scanned blocks via
+   `Model::tokenize`, which auto-prepends BOS on Gemma-style vocabs —
+   BOS is a special, so EVERY prompt false-positived as injection on
+   any `add_bos` model. Fixed with
+   `tokenize_special(add_special=false)`; injection detection
+   re-verified on Qwen.
+
 Open / carried forward: SmolVLM CI plumbing test + model-download
-caching; Gemma 4 non-causal e2e written (`#[ignore]`, very slow on
-CPU — run when GPU available); moeflux `NoVision`/`tokenize_special`
-compile-check on the next mac session; decode memoization behind the
-`decode_image` funnel; streaming tip extension (v2).
+caching; moeflux `NoVision`/`tokenize_special` compile-check on the
+next mac session; decode memoization behind the `decode_image`
+funnel; streaming tip extension (v2); Mike's `--features cuda`
+`--ignored` regression pass before publish.
 
 ## Phase C0 — special-token ingest integrity (standalone session, pre-C+D)
 

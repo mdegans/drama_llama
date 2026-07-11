@@ -282,8 +282,8 @@ pub enum ImageNewError {
 
 /// Dimensions and identity of an [`Image`], without the pixels.
 ///
-/// [`Vision::tokenize`] takes these instead of full [`Image`]s: token
-/// counts depend only on dimensions, so prompts can be counted,
+/// [`Vision::tokenize_image`] takes these instead of full [`Image`]s:
+/// token counts depend only on dimensions, so prompts can be counted,
 /// hashed, and cache-compared without decoding or re-preprocessing
 /// pixels. The inverse — [`Vision::prefill_image`] requiring a full
 /// [`Image`] — enforces "can't encode a placeholder" in the
