@@ -42,7 +42,8 @@ for ALL `tool_calls` (stock renders only the first, in the role-header
 re-ingest shape), pre-call prose renders as a causal commentary
 preamble, and tool responses render by forward-scan with
 `tool_call_id`-resolved names. Deploy as `<model>.template.jinja`.
-Remaining accepted quirk: a final turn's emission ends with the EOG
-token `<|return|>` while re-ingest renders `<|end|>` (upstream issue
-#15417) — the token is never committed to KV, so the cost is a
-one-token LCP walk-back per final turn.
+The `<|return|>`/`<|end|>` re-ingest rewrite (upstream issue #15417)
+costs nothing: the sampled EOG is never committed to KV, and the
+session's auto-tip records the CANONICAL close token from the
+byte-stable re-render (`compute_tip_extension`), so the next call's
+LCP walks through the rewritten `<|end|>` and splices at the tip.

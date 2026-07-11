@@ -299,12 +299,27 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
     the stock template renders any past message with that key as an
     analysis block, swallowing its final content (template bug).
     Sidecars read `reasoning_content` everywhere instead.
-  - **`<|return|>`→`<|end|>` needed ZERO session code**: the sampled
-    close-marker token is recorded-but-uncommitted (tip at kv_len),
-    the byte-prefix canonicalization gate compares committed bytes
-    only, and tip qualification through the divergent token degrades
-    to the lcp-1 walk — a one-token re-prefill per final turn. The
-    one accepted quirk for sidecar deployments.
+  - **`<|return|>`→`<|end|>` — RESOLVED (session 4 cont., after
+    Mike's review)**: my first landing note called the tip
+    disqualification "a one-token re-prefill", which was WRONG —
+    restore targets are only checkpointed positions (breakpoints +
+    tip), so a disqualified tip falls back to the last explicit
+    cache_control breakpoint: with only a system/tools marker that is
+    effectively the WHOLE conversation, every final turn. Fix: the
+    uncommitted stop token in `prev_tokens` is only ever a
+    *prediction* of the next render's bytes at that position, so
+    `compute_tip_extension` now records the CANONICAL close token(s)
+    (the byte-stable re-render's bytes after the raw emission,
+    tokenized, capped at 8) instead of the sampled EOG. LCP then
+    walks through `<|end|>` and the tip qualifies. Strictly better
+    for every dialect (Qwen gains the trailing `\n`, Gemma finals
+    gain theirs); a wrong prediction can only shorten LCP, never
+    corrupt KV (nothing beyond the tip is trusted as KV).
+    `complete_text` (raw view, no parsed blocks) keeps the sampled
+    token. e2e pin: `prefix_cache_survives_final_turn` — NO
+    cache_control anywhere, so the tip is the only anchor: zero reuse
+    pre-fix, whole-first-turn reuse post-fix. NO accepted cache
+    quirks remain for gpt-oss sidecar deployments.
   - Sidecar `gptoss-cache-stable.jinja`: stock macro section
     byte-identical (system/developer/TS namespace); message loop
     rewritten — analysis on every reasoning turn (preserve_thinking,

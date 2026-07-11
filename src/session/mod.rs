@@ -1938,8 +1938,17 @@ impl<B: Backend> Session<B> {
         // tip lands at `kv_len`, the checkpoint at `kv_len`, and
         // the next call's LCP can extend to `kv_len + 1` so the tip
         // qualifies under the `lcp-1` BPE-safety check.
-        let (extended_prev, internal_tip, head_for_checkpoint) =
-            self.compute_tip_extension(tokens, prompt_tokens, generated_tokens);
+        let (extended_prev, internal_tip, head_for_checkpoint) = self
+            .compute_tip_extension(
+                tokens,
+                prompt_tokens,
+                generated_tokens,
+                // `complete_text` is the raw-bytes debugging view — no
+                // parsed blocks, so no canonical re-render to derive the
+                // close from. The sampled stop token stays the tip
+                // prediction here.
+                None,
+            );
         if let Some(head) = head_for_checkpoint {
             self.engine.checkpoint_pos(0, head as i32);
         }
@@ -1975,10 +1984,25 @@ impl<B: Backend> Session<B> {
     ///   in its `tokens` vec but `decoder.step` was never called on
     ///   it — KV head sits at `prompt + content_count`,
     ///   `generated_tokens` length is `content_count + 1`. The extra
-    ///   token IS the close marker the next call's chat template
-    ///   re-renders. Tip lands at `kv_len`, checkpoint at `kv_len`.
+    ///   token is a *prediction* of what the next call's chat
+    ///   template re-renders at that position (it is never trusted
+    ///   as KV). Tip lands at `kv_len`, checkpoint at `kv_len`.
     ///   Next call's LCP can reach `kv_len + 1`, safe = `kv_len`,
     ///   tip eligible.
+    ///
+    ///   When `canonical_close` is provided (`run_call` derives it
+    ///   from the byte-stable canonical re-render), it REPLACES the
+    ///   sampled stop token in the extension: templates that rewrite
+    ///   the stop on re-ingest (gpt-oss renders `<|end|>` where the
+    ///   model emitted the EOG `<|return|>`, upstream issue #15417)
+    ///   would otherwise make the prediction wrong, the LCP stop at
+    ///   exactly `kv_len`, and the tip DISQUALIFY — and since restore
+    ///   targets are only checkpointed positions, reuse then falls
+    ///   all the way back to the last explicit `cache_control`
+    ///   breakpoint (potentially the whole conversation), not "one
+    ///   token". Substituting the canonical token makes the
+    ///   prediction true; a wrong prediction can only ever shorten
+    ///   the LCP, never corrupt KV.
     ///
     /// - **Max-tokens stop.** Every recorded token was committed —
     ///   `generated_tokens.len() == kv_len - prompt_len`. We have no
@@ -1993,6 +2017,7 @@ impl<B: Backend> Session<B> {
         prompt_tokens: Vec<Token>,
         prompt_len: usize,
         generated_tokens: Vec<Token>,
+        canonical_close: Option<Vec<Token>>,
     ) -> (Vec<Token>, Option<usize>, Option<usize>) {
         if self.prefix_cache.is_none() {
             return (prompt_tokens, None, None);
@@ -2012,6 +2037,15 @@ impl<B: Backend> Session<B> {
         // checkpoint both at kv_len. The "extra" token is what makes
         // the next call's LCP exceed kv_len so the tip qualifies.
         if generated_tokens.len() == kv_generated_count + 1 && kv_len >= 1 {
+            if let Some(close) = canonical_close {
+                if !close.is_empty() {
+                    // Replace the sampled stop token with the close
+                    // token(s) the canonical re-render actually
+                    // contains (see doc above).
+                    extended.truncate(prompt_len + kv_generated_count);
+                    extended.extend_from_slice(&close);
+                }
+            }
             return (extended, Some(kv_len), Some(kv_len));
         }
         // Max-tokens / grammar-complete case: every token committed,
@@ -2375,16 +2409,6 @@ impl<B: Backend> Session<B> {
         // string wire form downstream.
         let blocks = merge_adjacent_prose(parsed.blocks);
 
-        // Auto-tip: extend `prev_tokens` past the prompt with the
-        // generated content (and the recorded-but-uncommitted close
-        // marker, when present). See `compute_tip_extension` for the
-        // stop-condition handling.
-        let (extended_prev, internal_tip, head_for_checkpoint) =
-            self.compute_tip_extension(tokens, prompt_tokens, generated_tokens);
-        if let Some(head) = head_for_checkpoint {
-            self.engine.checkpoint_pos(0, head as i32);
-        }
-
         // Compute the auto-tip hash from the parsed assistant blocks
         // — `run_call` is the only completion path with parsed
         // structure available at save-time, so this is where the tip
@@ -2404,14 +2428,36 @@ impl<B: Backend> Session<B> {
         // which compares token ids directly and is safe by
         // construction. Best-effort throughout: a render error also
         // just skips the entry.
+        //
+        // The same byte-stable render also yields `canonical_close`:
+        // the token(s) the template renders AFTER the raw emission
+        // (the turn close — e.g. `<|im_end|>`, Gemma's
+        // `<|tool_response>`, gpt-oss's `<|end|>` rewrite of the
+        // sampled `<|return|>`). `compute_tip_extension` records
+        // those instead of the sampled stop token so the next call's
+        // LCP walks through the close and the tip stays eligible even
+        // when the template rewrites the stop on re-ingest.
         let blocks_owned: Vec<crate::Block> = blocks.to_vec();
+        let mut canonical_close: Option<Vec<Token>> = None;
         let tip_hash = match self.render_extended(prompt, &blocks_owned) {
             Ok(extended_render) => {
-                let byte_stable = extended_render
+                let close_bytes = extended_render
                     .strip_prefix(rendered_prompt.as_str())
-                    .map(|tail| tail.starts_with(raw_text.as_str()))
-                    .unwrap_or(false);
-                if byte_stable {
+                    .and_then(|tail| tail.strip_prefix(raw_text.as_str()));
+                if let Some(close) = close_bytes {
+                    if !close.is_empty() {
+                        // Special-token closes tokenize boundary-
+                        // stable; cap defensively — a wrong tail
+                        // token only shortens the next LCP.
+                        canonical_close = Some(
+                            self.engine
+                                .model
+                                .tokenize(close, true)
+                                .into_iter()
+                                .take(8)
+                                .collect(),
+                        );
+                    }
                     Some(hash_partial_text(&extended_render))
                 } else {
                     #[cfg(feature = "axum")]
@@ -2432,6 +2478,22 @@ impl<B: Backend> Session<B> {
                 None
             }
         };
+
+        // Auto-tip: extend `prev_tokens` past the prompt with the
+        // generated content and the canonical close (falling back to
+        // the recorded-but-uncommitted stop token when the render
+        // wasn't byte-stable). See `compute_tip_extension` for the
+        // stop-condition handling.
+        let (extended_prev, internal_tip, head_for_checkpoint) = self
+            .compute_tip_extension(
+                tokens,
+                prompt_tokens,
+                generated_tokens,
+                canonical_close,
+            );
+        if let Some(head) = head_for_checkpoint {
+            self.engine.checkpoint_pos(0, head as i32);
+        }
 
         // Cache + usage bookkeeping, then grammar-violation check.
         // Check last so a violation still records the work that was
