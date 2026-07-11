@@ -1848,7 +1848,11 @@ impl<B: Backend> Session<B> {
             self.engine.model.special_tokens().into_iter().collect();
         match find_injected_special_in_prompt(
             prompt,
-            |t| self.engine.model.tokenize(t, true),
+            // add_special = false: the scan must see only what the
+            // CONTENT tokenizes to. `Model::tokenize` auto-prepends
+            // BOS on vocabs that request it (Gemma), and BOS is a
+            // special — every block would false-positive as injection.
+            |t| self.engine.model.tokenize_special(t, false, true),
             &specials,
             |tok| self.engine.model.token_to_piece(tok),
         ) {

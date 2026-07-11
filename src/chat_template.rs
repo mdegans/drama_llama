@@ -445,7 +445,8 @@ pub struct RenderOptions {
     /// [`Block::Image`] renders as `<{sentinel}:{source_hash_hex}>`
     /// — an out-of-band marker the caller (`Session`) later splits
     /// the render on, mapping each occurrence back to its image by
-    /// source hash (see [`image_source_hash`]). When unset, a prompt
+    /// source hash (sha256 of the block's base64 payload — see
+    /// `image_source_hash`). When unset, a prompt
     /// containing images fails to render with
     /// [`ChatTemplateError::MediaUnsupported`] — never a silent
     /// drop.
