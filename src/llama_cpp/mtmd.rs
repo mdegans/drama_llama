@@ -1066,8 +1066,6 @@ mod tests {
     #[test]
     #[ignore = "long running; requires local model + mmproj sidecar"]
     fn segment_tokenize_differential() {
-        use crate::backend::Vision as _;
-
         let (model_path, mmproj) = local_vision_paths();
         let model =
             LlamaCppModel::from_file(model_path, None).expect("model load");
@@ -1138,7 +1136,7 @@ mod tests {
     #[test]
     #[ignore = "long running; requires local model + mmproj sidecar"]
     fn eval_loop_differential_vs_helper() {
-        use crate::{backend::Vision as _, Decoder as _};
+        use crate::Decoder as _;
 
         let (model_path, _) = local_vision_paths();
         let mut cp = crate::LlamaCppEngine::default_context_params();
@@ -1158,7 +1156,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut run = |engine: &mut crate::LlamaCppEngine,
+        let run = |engine: &mut crate::LlamaCppEngine,
                        use_helper: bool|
          -> (MediaSpan, Vec<f32>) {
             engine.memory_clear();

@@ -989,7 +989,7 @@ fn append_block_text(
 
 /// Does any block anywhere in `prompt` (system, messages, nested
 /// tool-result content) carry an image?
-fn prompt_has_images(prompt: &Prompt) -> bool {
+pub(crate) fn prompt_has_images(prompt: &Prompt) -> bool {
     fn block_has_image(block: &Block) -> bool {
         match block {
             Block::Image { .. } => true,
@@ -1059,6 +1059,17 @@ pub(crate) fn media_marker(sentinel: &str, source_hash: &[u8; 32]) -> String {
 /// A media-bearing render split on its sentinel: `n + 1` text
 /// segments interleaved with `n` image source hashes, in render
 /// order. Imageless renders come back as one segment and no hashes.
+///
+/// Consumed by `Session` (the only splitter); dead-code-allowed for
+/// builds without a session backend, where emission still exists but
+/// nothing splits.
+#[cfg_attr(
+    not(any(
+        feature = "llama-cpp",
+        all(feature = "moeflux", target_os = "macos")
+    )),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SplitRender<'a> {
     /// Text between (around) media markers;
@@ -1077,6 +1088,13 @@ pub(crate) struct SplitRender<'a> {
 /// the template mangled it (truncation mid-marker, etc.): that is an
 /// internal invariant violation, returned as `Err` with the byte
 /// offset, never silently treated as content.
+#[cfg_attr(
+    not(any(
+        feature = "llama-cpp",
+        all(feature = "moeflux", target_os = "macos")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn split_media_render<'a>(
     text: &'a str,
     sentinel: &str,
