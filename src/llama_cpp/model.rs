@@ -13,8 +13,8 @@ use llama_cpp_sys_3::{
     llama_token_to_piece, llama_tokenize, llama_vocab, llama_vocab_bos,
     llama_vocab_eos, llama_vocab_eot, llama_vocab_fim_mid, llama_vocab_fim_pre,
     llama_vocab_fim_suf, llama_vocab_get_add_bos, llama_vocab_get_add_eos,
-    llama_vocab_get_score, llama_vocab_get_text, llama_vocab_n_tokens,
-    llama_vocab_nl, llama_vocab_type,
+    llama_vocab_get_score, llama_vocab_get_text, llama_vocab_is_eog,
+    llama_vocab_n_tokens, llama_vocab_nl, llama_vocab_type,
 };
 use std::{
     collections::BTreeMap,
@@ -131,6 +131,10 @@ pub struct LlamaCppModel {
     /// token (stop-string windowing), and the naive compute is O(vocab), so
     /// we memoize the first call.
     max_token_len: std::sync::OnceLock<usize>,
+    /// Cached end-of-generation tokens beyond eos/eot (libllama's
+    /// `special_eog_ids`). The sampler consults this per candidate
+    /// sweep and the naive compute is O(vocab), so memoize.
+    extra_eos: std::sync::OnceLock<Vec<llama_token>>,
 }
 
 unsafe impl Send for LlamaCppModel {}
@@ -197,6 +201,7 @@ impl LlamaCppModel {
                 vocab,
                 file_name: Some(file_name),
                 max_token_len: std::sync::OnceLock::new(),
+                extra_eos: std::sync::OnceLock::new(),
             })
         }
     }
@@ -217,6 +222,7 @@ impl LlamaCppModel {
                 vocab,
                 file_name: None,
                 max_token_len: std::sync::OnceLock::new(),
+                extra_eos: std::sync::OnceLock::new(),
             })
         }
     }
@@ -310,6 +316,35 @@ impl LlamaCppModel {
                 (attr & mask) != 0
             })
             .collect()
+    }
+
+    /// End-of-generation tokens beyond [`eos`](Self::eos) and
+    /// [`eot`](Self::eot), per libllama's `special_eog_ids`
+    /// (`llama_vocab_is_eog`). libllama fills that set by token-text
+    /// matching (`<|im_end|>`, `<|return|>`, `<|call|>`, …) with
+    /// model-aware fixups — notably for gpt-oss/Harmony vocabs it
+    /// *removes* `<|end|>` so the in-stream channel separator stays
+    /// generatable while `<|return|>` (final) and `<|call|>` (tool
+    /// call) stop generation. Exposing the set here is Phase G of the
+    /// tool-dialects plan: without it only the GGUF's primary
+    /// eos/eot stop a prediction, and gpt-oss tool calls would run
+    /// through `<|call|>` to `max_tokens`.
+    ///
+    /// Memoized — first call is O(vocab), subsequent calls O(1).
+    pub fn extra_eos_tokens(&self) -> Vec<llama_token> {
+        self.extra_eos
+            .get_or_init(|| {
+                let eos = self.eos();
+                let eot = self.eot();
+                (0..self.n_vocab())
+                    .filter(|&t| {
+                        t != eos
+                            && t != eot
+                            && unsafe { llama_vocab_is_eog(self.vocab, t) }
+                    })
+                    .collect()
+            })
+            .clone()
     }
 
     /// Longest token length in this model's vocabulary. Memoized — first
@@ -747,6 +782,10 @@ impl crate::backend::Model for LlamaCppModel {
 
     fn get_meta(&self, key: &str) -> Option<String> {
         LlamaCppModel::get_meta(self, key)
+    }
+
+    fn extra_eos_tokens(&self) -> Vec<crate::Token> {
+        LlamaCppModel::extra_eos_tokens(self)
     }
 
     fn display_name(&self) -> Option<String> {

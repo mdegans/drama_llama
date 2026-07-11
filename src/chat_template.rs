@@ -752,7 +752,10 @@ fn append_message(
         match b {
             Block::ToolUse { .. } => seen_call = true,
             Block::Thought { thought, .. }
-                if reingest == ReasoningReingest::Field =>
+                if matches!(
+                    reingest,
+                    ReasoningReingest::Field | ReasoningReingest::Thinking
+                ) =>
             {
                 reasoning.push_str(thought);
             }
@@ -775,6 +778,7 @@ fn append_message(
             (&content_pre, &content_post),
             &calls,
             &reasoning,
+            reingest,
         ));
         return;
     }
@@ -809,6 +813,7 @@ fn tool_call_message(
     (content_pre, content_post): (&str, &str),
     calls: &[&crate::prompt::ToolUse],
     reasoning: &str,
+    reingest: crate::dialect::ReasoningReingest,
 ) -> JinjaValue {
     let tool_calls: Vec<JinjaValue> = calls
         .iter()
@@ -830,6 +835,20 @@ fn tool_call_message(
             content_pre => content_pre,
             content_post => content_post,
             tool_calls => tool_calls,
+        }
+    } else if reingest == crate::dialect::ReasoningReingest::Thinking {
+        // gpt-oss convention (upstream parity): the template reads
+        // `thinking`, and raises when merged `content` accompanies it
+        // on a tool-call message — withhold `content`; causality-
+        // aware sidecars read the pre/post split instead.
+        minijinja::context! {
+            role => role,
+            content_pre => content_pre,
+            content_post => content_post,
+            tool_calls => tool_calls,
+            thinking => reasoning,
+            reasoning => reasoning,
+            reasoning_content => reasoning,
         }
     } else {
         minijinja::context! {

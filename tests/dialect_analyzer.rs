@@ -145,6 +145,39 @@ fn gemma4_sniffed() {
     assert_eq!(s.reasoning.end, "\n<channel|>");
 }
 
+/// gpt-oss is a hand-built dialect selected by source sniff (Phase
+/// G), upstream parity: `chat.cpp:2350` detects Harmony by the
+/// `<|channel|>` substring alone (double pipe — no collision with
+/// Gemma's single-pipe `<|channel>`).
+#[test]
+fn gptoss_sniffed() {
+    for fixture in [
+        "gptoss-gguf.jinja",
+        // The cache-stability template sidecar must resolve the SAME
+        // dialect — Session re-analyzes the override at load.
+        "gptoss-cache-stable.jinja",
+    ] {
+        let s = analyze(fixture, "<|startoftext|>", "<|return|>");
+        assert_eq!(s, CallSyntax::gpt_oss(), "{fixture}: {s:#?}");
+    }
+    let s = CallSyntax::gpt_oss();
+    assert_eq!(s.family, Family::Harmony);
+    assert_eq!(s.reasoning.start, "<|channel|>analysis<|message|>");
+    assert_eq!(s.reasoning.end, "<|end|>");
+    // Structurally single-call: <|call|> is EOG, so the parallel gate
+    // (keyed on per_call_start) must stay off.
+    assert_eq!(s.per_call_start, "");
+    // Conservative lazy triggers — see CallSyntax::triggers docs.
+    assert_eq!(
+        s.triggers(),
+        vec![
+            "<|start|>assistant to=functions.".to_string(),
+            "<|channel|>commentary to=functions.".to_string(),
+            "<|channel|>analysis to=functions.".to_string(),
+        ]
+    );
+}
+
 #[test]
 fn toolless_template_family_none() {
     let source = r#"{%- for m in messages -%}

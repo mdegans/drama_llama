@@ -38,7 +38,7 @@ use serde_json::Value;
 use crate::prompt::{Block, ToolUse};
 use crate::Tool;
 
-use super::{CallSyntax, Family, ReasoningMode};
+use super::{harmony, CallSyntax, Family, ReasoningMode};
 
 /// Whether the parse saw a complete structure or ran out of input
 /// mid-call / mid-thought.
@@ -131,7 +131,7 @@ impl StreamParser {
     fn landmark_holdback(&self, text: &str) -> usize {
         let tail = text.as_bytes();
         let mut best = 0;
-        for marker in [
+        let generic = [
             self.syntax.trigger(),
             self.syntax.reasoning.start.trim(),
             // The close marker matters on its own for dialects where
@@ -141,7 +141,29 @@ impl StreamParser {
             self.syntax.tool_response_start.trim(),
             self.syntax.per_call_end.trim(),
             self.syntax.section_end.trim(),
-        ] {
+        ];
+        // Harmony's markers live outside the generic fields: a
+        // partial `<|end|>` / `<|start|>assistant` at the tail of
+        // streamed final content must be held back exactly like a
+        // partial `</tool_call>`. ` to=` is included because it opens
+        // a role-header recipient at a block boundary — prose ending
+        // in " to" is held a tick and released on the next byte.
+        let harmony_markers = [
+            harmony::START_ASSISTANT,
+            harmony::CHANNEL,
+            harmony::MESSAGE,
+            harmony::END,
+            harmony::CALL,
+            harmony::RETURN,
+            harmony::CONSTRAIN,
+            harmony::TO_FUNCTIONS,
+        ];
+        let markers: &[&str] = if self.syntax.family == Family::Harmony {
+            &harmony_markers
+        } else {
+            &generic
+        };
+        for marker in markers {
             let m = marker.as_bytes();
             for k in ((best + 1)..m.len()).rev() {
                 if k > tail.len() {
@@ -333,6 +355,14 @@ impl<'a> Parser<'a> {
     }
 
     fn run(&mut self, pre_opened_reasoning: bool) {
+        if self.syntax.family == Family::Harmony {
+            // Channel-block structure; the generic landmark scan
+            // below has no notion of per-block headers. gpt-oss never
+            // pre-opens reasoning (the generation prompt ends at
+            // `<|start|>assistant`), so that flag is moot here.
+            self.run_harmony();
+            return;
+        }
         let reasoning_on = self.syntax.reasoning.mode != ReasoningMode::None
             && !self.syntax.reasoning.end.is_empty();
 
@@ -612,8 +642,253 @@ impl<'a> Parser<'a> {
             Family::TagWithJson => self.parse_tag_json_call(),
             Family::JsonNative => self.parse_json_native_call(),
             Family::TagWithDict => self.parse_dict_call(),
-            Family::None => CallOutcome::Malformed,
+            // Harmony never reaches the generic call loop — `run`
+            // dispatches to `run_harmony` before it.
+            Family::None | Family::Harmony => CallOutcome::Malformed,
         }
+    }
+
+    /// Harmony (gpt-oss): parse the generation as a sequence of
+    /// channel blocks. Grammar of a block (parser side — deliberately
+    /// looser than the emitted GBNF, upstream stance):
+    ///
+    /// ```text
+    /// [<|start|>assistant] [stray] HEADER <|message|> BODY
+    /// stray  = <|channel|>commentary [ to=assistant]   (20b wart,
+    ///          only when another <|channel|> header follows)
+    /// HEADER = [ to=RECIPIENT] [<|channel|>WORD [ to=RECIPIENT]]
+    ///          [ [<|constrain|>]TYPE]
+    /// ```
+    ///
+    /// Dispatch on the parsed header, upstream parity
+    /// (`common_chat_params_init_gpt_oss` builder + test corpus):
+    /// * recipient `functions.NAME` → tool call, JSON body ended by
+    ///   `<|call|>` / end of input;
+    /// * any other recipient (`container.exec`, `python`,
+    ///   `assistant`) → unsolicited builtin traffic, swallowed whole;
+    /// * `analysis` → [`Block::Thought`] (verbatim body — the
+    ///   cache-stable re-render is byte-exact), one per block,
+    ///   multiple blocks allowed;
+    /// * `commentary` (no recipient) → preamble prose →
+    ///   [`Block::Text`];
+    /// * `final` → [`Block::Text`], body to `<|end|>` or end of
+    ///   input (trailing `<|return|>` / `<|call|>` pieces stripped).
+    fn run_harmony(&mut self) {
+        while self.pos < self.text.len() {
+            let block_start = self.pos;
+            match self.harmony_block() {
+                CallOutcome::Parsed => {}
+                CallOutcome::Incomplete => {
+                    // Degrade / suppress the whole block: `pos` may
+                    // already sit past the header, but a Final-mode
+                    // Text fallback must carry the header bytes too
+                    // (the dangling-call contract).
+                    self.incomplete(block_start);
+                    return;
+                }
+                CallOutcome::Malformed => {
+                    // Degrade to prose up to the next possible marker
+                    // byte — nothing silently dropped.
+                    let upto = match self.text[block_start + 1..].find("<|") {
+                        Some(next) => block_start + 1 + next,
+                        None => self.text.len(),
+                    };
+                    let chunk = self.text[block_start..upto].to_string();
+                    self.push_text(&chunk);
+                    self.pos = upto;
+                }
+            }
+        }
+    }
+
+    /// One Harmony channel block at `pos`. On `Incomplete` the caller
+    /// applies leniency from the *current* `pos` (start of the
+    /// still-growing structure).
+    fn harmony_block(&mut self) -> CallOutcome {
+        // Inter-block opener (absent on the first block: the
+        // generation prompt already ends with it).
+        if !self.eat(harmony::START_ASSISTANT)
+            && harmony::START_ASSISTANT.starts_with(self.rest())
+        {
+            return CallOutcome::Incomplete;
+        }
+        let rest = self.rest();
+        if rest.is_empty() {
+            return CallOutcome::Parsed;
+        }
+
+        let header_ish = rest.starts_with(harmony::CHANNEL)
+            || rest.starts_with(" to=")
+            || harmony::CHANNEL.starts_with(rest)
+            || " to=".starts_with(rest);
+        if !header_ish {
+            // Prose outside any block structure (grammarless model
+            // drift): consume up to the next possible marker.
+            let upto =
+                rest[1..].find("<|").map(|i| i + 1).unwrap_or(rest.len());
+            let prose = rest[..upto].to_string();
+            self.push_text(&prose);
+            self.pos += upto;
+            return CallOutcome::Parsed;
+        }
+
+        let Some(msg_rel) = rest.find(harmony::MESSAGE) else {
+            // Header still streaming in (or degenerate junk that will
+            // flush as Text at finish).
+            return CallOutcome::Incomplete;
+        };
+        let mut header = &rest[..msg_rel];
+        // An `<|end|>` inside the header region means this is not a
+        // block header at all.
+        if header.contains(harmony::END) {
+            return CallOutcome::Malformed;
+        }
+
+        // Stray-commentary wart: `<|channel|>commentary[ to=assistant]`
+        // immediately followed by the real channel header.
+        loop {
+            let Some(after) = header.strip_prefix(harmony::COMMENTARY) else {
+                break;
+            };
+            let after = after.strip_prefix(" to=assistant").unwrap_or(after);
+            if after.starts_with(harmony::CHANNEL) {
+                header = after;
+            } else {
+                break;
+            }
+        }
+
+        // Header fields. Owned copies: the borrows point into
+        // `self.text` and the body readers below need `&mut self`.
+        let mut recipient: Option<String> = None;
+        let mut channel: Option<String> = None;
+        let mut h = header;
+        if let Some(r) = h.strip_prefix(" to=") {
+            let end = r.find(harmony::CHANNEL).unwrap_or(r.len());
+            recipient = Some(r[..end].trim().to_string());
+            h = &r[end..];
+        }
+        if let Some(r) = h.strip_prefix(harmony::CHANNEL) {
+            let end = r.find(' ').unwrap_or(r.len());
+            channel = Some(r[..end].to_string());
+            let tail = &r[end..];
+            if let Some(r2) = tail.strip_prefix(" to=") {
+                let e2 = r2.find(' ').unwrap_or(r2.len());
+                recipient = Some(r2[..e2].trim().to_string());
+            }
+            // Whatever trails (` [<|constrain|>]TYPE`) is the
+            // constraint clause — parsed leniently by ignoring it.
+        }
+
+        self.pos += msg_rel + harmony::MESSAGE.len();
+
+        match (recipient, channel.as_deref()) {
+            (Some(r), _) if r.starts_with("functions.") => {
+                self.harmony_call(r["functions.".len()..].to_string())
+            }
+            (Some(_), _) => {
+                // Builtin / unsolicited recipient: swallow the block
+                // (upstream surfaces empty content for these).
+                self.harmony_swallow_body();
+                CallOutcome::Parsed
+            }
+            (None, Some("analysis")) => self.harmony_analysis(),
+            (None, Some("commentary")) => self.harmony_text_body(false),
+            (None, Some("final")) => self.harmony_text_body(true),
+            _ => CallOutcome::Malformed,
+        }
+    }
+
+    /// Analysis body → Thought, verbatim (no trimming: the
+    /// cache-stable re-render reproduces these bytes exactly).
+    /// Unclosed at end of input: `Final` surfaces the partial as a
+    /// Thought (the model was cut off mid-reasoning — upstream pins
+    /// the same), `Streaming` suppresses it whole (thought-delta
+    /// streaming is #26 territory).
+    fn harmony_analysis(&mut self) -> CallOutcome {
+        match self.rest().find(harmony::END) {
+            Some(at) => {
+                let body = self.rest()[..at].to_string();
+                self.push_thought(&body);
+                self.pos += at + harmony::END.len();
+                CallOutcome::Parsed
+            }
+            None => match self.leniency {
+                Leniency::Streaming => CallOutcome::Incomplete,
+                Leniency::Final => {
+                    let body = strip_harmony_eog(self.rest()).to_string();
+                    self.push_thought(&body);
+                    self.pos = self.text.len();
+                    CallOutcome::Parsed
+                }
+            },
+        }
+    }
+
+    /// Commentary-preamble / final body → Text. An unclosed body is
+    /// surfaced as a growing trailing Text block — final content is
+    /// the part of a Harmony generation users watch stream, and the
+    /// StreamParser's landmark holdback keeps partial markers out of
+    /// the deltas. `is_final` only affects trailing-EOG stripping.
+    fn harmony_text_body(&mut self, is_final: bool) -> CallOutcome {
+        match self.rest().find(harmony::END) {
+            Some(at) => {
+                let body = self.rest()[..at].to_string();
+                self.push_text(&body);
+                self.pos += at + harmony::END.len();
+                CallOutcome::Parsed
+            }
+            None => {
+                let body = if is_final {
+                    strip_harmony_eog(self.rest())
+                } else {
+                    self.rest()
+                }
+                .to_string();
+                self.push_text(&body);
+                self.pos = self.text.len();
+                CallOutcome::Parsed
+            }
+        }
+    }
+
+    /// Unsolicited builtin block: consumed silently through its
+    /// terminator (upstream: matched, content discarded).
+    fn harmony_swallow_body(&mut self) {
+        let rest = self.rest();
+        let end = [harmony::END, harmony::CALL]
+            .iter()
+            .filter_map(|m| rest.find(m).map(|at| at + m.len()))
+            .min()
+            .unwrap_or(rest.len());
+        self.pos += end;
+    }
+
+    /// Tool-call body: one JSON value, optionally terminated by the
+    /// `<|call|>` piece (EOG — usually absent from surfaced text).
+    fn harmony_call(&mut self, name: String) -> CallOutcome {
+        if name.is_empty() || name.len() > 256 {
+            return CallOutcome::Malformed;
+        }
+        self.skip_ws();
+        let Some((json_len, complete)) = balanced_json_len(self.rest()) else {
+            return if self.rest().trim().is_empty() {
+                CallOutcome::Incomplete
+            } else {
+                CallOutcome::Malformed
+            };
+        };
+        if !complete {
+            return CallOutcome::Incomplete;
+        }
+        let body = &self.rest()[..json_len];
+        let Some(input) = parse_json_healed(body) else {
+            return CallOutcome::Malformed;
+        };
+        self.pos += json_len;
+        let _ = self.eat(harmony::CALL);
+        self.push_call(name, input);
+        CallOutcome::Parsed
     }
 
     fn schema_for(&self, tool: &str, param: &str) -> Option<Value> {
@@ -1056,6 +1331,15 @@ enum CallOutcome {
     Parsed,
     Incomplete,
     Malformed,
+}
+
+/// Strip a trailing Harmony EOG piece from body text. Whether the
+/// predictor surfaces the stop token's bytes depends on the path
+/// (`trim_eos` covers eos/eot; `<|call|>` arrives via
+/// `extra_eos_tokens`), so the parser tolerates both.
+fn strip_harmony_eog(s: &str) -> &str {
+    let s = s.strip_suffix(harmony::RETURN).unwrap_or(s);
+    s.strip_suffix(harmony::CALL).unwrap_or(s)
 }
 
 /// Outcome of reading one dict-encoded value.
@@ -1935,6 +2219,416 @@ mod tests {
                 assert_eq!(*input_got, &input, "prefix {i}");
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Harmony / gpt-oss: upstream test-matrix port
+    // (llama.cpp tests/test-chat.cpp:5075-5254, gpt-oss section).
+    // -----------------------------------------------------------------
+
+    /// Upstream's `special_function_tool`: one required integer.
+    fn special_function() -> Tool {
+        Tool::builder("special_function")
+            .description("I'm special")
+            .schema(json!({
+                "type": "object",
+                "properties": {"arg1": {
+                    "type": "integer",
+                    "description": "The arg."
+                }},
+                "required": ["arg1"],
+            }))
+            .build()
+            .expect("valid test tool")
+    }
+
+    fn harmony_parse(text: &str, leniency: Leniency) -> Vec<Block> {
+        let syntax = CallSyntax::gpt_oss();
+        let t = special_function();
+        parse_text(&syntax, &[&t], text, false, leniency).blocks
+    }
+
+    /// Content-only messages: final and commentary-preamble channels
+    /// both surface as Text (upstream `message_assist`).
+    #[test]
+    fn harmony_content_channels() {
+        for text in [
+            "<|channel|>final<|message|>Hello, world!\nWhat's up?",
+            "<|channel|>commentary<|message|>Hello, world!\nWhat's up?",
+            // Trailing EOG pieces are envelope, not content.
+            "<|channel|>final<|message|>Hello, world!\nWhat's up?<|return|>",
+        ] {
+            let blocks = merge_text(harmony_parse(text, Leniency::Final));
+            assert_eq!(blocks.len(), 1, "{text:?}: {blocks:#?}");
+            assert!(
+                matches!(&blocks[0], Block::Text { text, .. }
+                    if text.as_ref() == "Hello, world!\nWhat's up?"),
+                "{text:?}: {blocks:#?}"
+            );
+        }
+    }
+
+    /// Reasoning then final content, including the stray-commentary
+    /// wart before either block (the 20b prefix), and a partial
+    /// analysis block under Final leniency (upstream pins reasoning
+    /// for the cut-off case).
+    #[test]
+    fn harmony_analysis_blocks() {
+        let want_thought = "I'm\nthinking";
+        let want_text = "Hello, world!\nWhat's up?";
+        for text in [
+            "<|channel|>analysis<|message|>I'm\nthinking<|end|>\
+             <|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?",
+            // Stray commentary before the analysis header.
+            "<|channel|>commentary to=assistant<|channel|>analysis<|message|>I'm\nthinking<|end|>\
+             <|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?",
+            // Stray commentary before the final header.
+            "<|channel|>analysis<|message|>I'm\nthinking<|end|>\
+             <|start|>assistant<|channel|>commentary<|channel|>final<|message|>Hello, world!\nWhat's up?",
+        ] {
+            let blocks = merge_text(harmony_parse(text, Leniency::Final));
+            assert_eq!(blocks.len(), 2, "{text:?}: {blocks:#?}");
+            assert!(
+                matches!(&blocks[0], Block::Thought { thought, .. }
+                    if thought.as_ref() == want_thought),
+                "{text:?}: {blocks:#?}"
+            );
+            assert!(
+                matches!(&blocks[1], Block::Text { text, .. }
+                    if text.as_ref() == want_text),
+                "{text:?}: {blocks:#?}"
+            );
+        }
+
+        // Cut off mid-reasoning: Final surfaces the partial Thought.
+        let blocks = merge_text(harmony_parse(
+            "<|channel|>analysis<|message|>I'm\nthinking",
+            Leniency::Final,
+        ));
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        assert!(
+            matches!(&blocks[0], Block::Thought { thought, .. }
+                if thought.as_ref() == want_thought),
+            "{blocks:#?}"
+        );
+
+        // Multiple analysis blocks stay separate Thoughts, in order.
+        let blocks = merge_text(harmony_parse(
+            "<|channel|>analysis<|message|>one<|end|>\
+             <|start|>assistant<|channel|>analysis<|message|>two<|end|>\
+             <|start|>assistant<|channel|>final<|message|>done",
+            Leniency::Final,
+        ));
+        assert_eq!(blocks.len(), 3, "{blocks:#?}");
+        assert!(matches!(&blocks[0], Block::Thought { thought, .. }
+            if thought.as_ref() == "one"));
+        assert!(matches!(&blocks[1], Block::Thought { thought, .. }
+            if thought.as_ref() == "two"));
+    }
+
+    /// The tool-call header matrix, byte-for-byte from upstream's
+    /// pins: both recipient positions, optional `<|constrain|>`, the
+    /// bare-type form the stock template re-renders, and a preceding
+    /// analysis block.
+    #[test]
+    fn harmony_call_headers() {
+        for text in [
+            // Recipient in role header, analysis channel.
+            " to=functions.special_function<|channel|>analysis<|message|>{\"arg1\": 1}",
+            // Recipient in channel header.
+            "<|channel|>analysis to=functions.special_function<|message|>{\"arg1\": 1}",
+            // With <|constrain|>json.
+            " to=functions.special_function<|channel|>analysis <|constrain|>json<|message|>{\"arg1\": 1}",
+            // Commentary channel.
+            "<|channel|>commentary to=functions.special_function<|message|>{\"arg1\": 1}",
+            // Channel header + constraint (canonical emission shape).
+            "<|channel|>commentary to=functions.special_function <|constrain|>json<|message|>{\"arg1\": 1}",
+            // Stock-template re-render: role header, bare type, <|call|>.
+            "<|start|>assistant to=functions.special_function<|channel|>commentary json<|message|>{\"arg1\": 1}<|call|>",
+        ] {
+            let blocks = harmony_parse(text, Leniency::Final);
+            let calls = calls_of(&blocks);
+            assert_eq!(calls.len(), 1, "{text:?}: {blocks:#?}");
+            assert_eq!(calls[0].0, "special_function", "{text:?}");
+            assert_eq!(calls[0].1, &json!({"arg1": 1}), "{text:?}");
+            // Header/envelope bytes never leak into Text.
+            assert!(
+                !blocks.iter().any(|b| matches!(b, Block::Text { .. })),
+                "{text:?}: {blocks:#?}"
+            );
+        }
+
+        // Reasoning then call (upstream message_assist_call_thoughts).
+        let blocks = harmony_parse(
+            "<|channel|>analysis<|message|>I'm\nthinking<|end|>\
+             <|start|>assistant to=functions.special_function<|channel|>analysis<|message|>{\"arg1\": 1}",
+            Leniency::Final,
+        );
+        assert!(
+            matches!(&blocks[0], Block::Thought { thought, .. }
+                if thought.as_ref() == "I'm\nthinking"),
+            "{blocks:#?}"
+        );
+        assert_eq!(calls_of(&blocks).len(), 1, "{blocks:#?}");
+    }
+
+    /// Unsolicited builtin-tool traffic (recipients outside
+    /// `functions.`) is swallowed whole — upstream surfaces empty
+    /// content for these.
+    #[test]
+    fn harmony_builtin_recipients_swallowed() {
+        for text in [
+            // Recipient in role header.
+            "<|channel|>analysis<|message|>thinking<|end|>\
+             <|start|>assistant to=container.exec<|channel|>commentary<|message|>python3 -c 'print(\"hello\")'",
+            // Recipient in channel header, code constraint.
+            "<|channel|>analysis<|message|>thinking<|end|>\
+             <|start|>assistant<|channel|>commentary to=python <|constrain|>code<|message|>print(\"hello\")",
+        ] {
+            let blocks = harmony_parse(text, Leniency::Final);
+            assert_eq!(blocks.len(), 1, "{text:?}: {blocks:#?}");
+            assert!(
+                matches!(&blocks[0], Block::Thought { thought, .. }
+                    if thought.as_ref() == "thinking"),
+                "{text:?}: {blocks:#?}"
+            );
+        }
+    }
+
+    /// Prose preamble (commentary, no recipient) before a call:
+    /// the causal announce-then-call shape.
+    #[test]
+    fn harmony_preamble_then_call() {
+        let blocks = harmony_parse(
+            "<|channel|>analysis<|message|>plan<|end|>\
+             <|start|>assistant<|channel|>commentary<|message|>I'll use the tool.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.special_function \
+             <|constrain|>json<|message|>{\"arg1\": 7}<|call|>",
+            Leniency::Final,
+        );
+        assert_eq!(blocks.len(), 3, "{blocks:#?}");
+        assert!(matches!(&blocks[0], Block::Thought { thought, .. }
+            if thought.as_ref() == "plan"));
+        assert!(matches!(&blocks[1], Block::Text { text, .. }
+            if text.as_ref() == "I'll use the tool."));
+        let calls = calls_of(&blocks);
+        assert_eq!(calls[0].1, &json!({"arg1": 7}), "{blocks:#?}");
+    }
+
+    /// Final-mode leniency: a dangling call degrades to Text carrying
+    /// the header bytes (the BlockParser::finish contract).
+    #[test]
+    fn harmony_partial_call_degrades_to_text() {
+        let blocks = harmony_parse(
+            "<|channel|>commentary to=functions.special_function \
+             <|constrain|>json<|message|>{\"arg1\": ",
+            Leniency::Final,
+        );
+        assert!(calls_of(&blocks).is_empty(), "{blocks:#?}");
+        let joined: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text { text, .. } => Some(text.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(joined.contains("to=functions."), "{blocks:#?}");
+    }
+
+    /// Reference render → parse is the identity on calls (the Phase D
+    /// invariant, Harmony edition), and the emitted grammar accepts
+    /// its own reference render under both anchors.
+    #[test]
+    fn harmony_reference_roundtrip_and_grammar() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        use crate::{Grammar, GrammarState};
+        use std::sync::Arc;
+
+        let syntax = CallSyntax::gpt_oss();
+        let t = special_function();
+        let input = json!({"arg1": 42});
+        let reference =
+            render_reference(&syntax, &[("special_function", &input)])
+                .expect("representable");
+        assert_eq!(
+            reference,
+            "<|channel|>commentary to=functions.special_function \
+             <|constrain|>json<|message|>{\"arg1\":42}"
+        );
+        let parsed = harmony_parse(&reference, Leniency::Final);
+        let calls = calls_of(&parsed);
+        assert_eq!(calls.len(), 1, "{parsed:#?}");
+        assert_eq!(calls[0].1, &input);
+
+        // Lazy grammar (Auto): accepts the canonical channel form AND
+        // the role-header form the stock template re-renders.
+        let lazy = grammar_source(
+            &syntax,
+            &[&t],
+            &EmitOptions {
+                anchor: Anchor::Lazy,
+                parallel: false,
+            },
+        )
+        .expect("emit lazy");
+        let grammar = Arc::new(
+            Grammar::parse(&lazy)
+                .unwrap_or_else(|e| panic!("lazy grammar: {e}\n{lazy}")),
+        );
+        for emission in [
+            reference.as_str(),
+            "<|start|>assistant to=functions.special_function\
+             <|channel|>commentary <|constrain|>json<|message|>{\"arg1\":42}",
+            // Stock re-render: bare constraint type.
+            "<|start|>assistant to=functions.special_function\
+             <|channel|>commentary json<|message|>{\"arg1\": 42}",
+        ] {
+            let mut state = GrammarState::new(grammar.clone());
+            assert!(
+                state.advance_bytes(emission.as_bytes()).is_ok()
+                    && state.is_complete(),
+                "lazy grammar must accept {emission:?}\n{lazy}"
+            );
+        }
+
+        // Eager grammar (Any/Method): analysis and preamble blocks,
+        // then the forced canonical call.
+        let eager = grammar_source(
+            &syntax,
+            &[&t],
+            &EmitOptions {
+                anchor: Anchor::Eager,
+                parallel: false,
+            },
+        )
+        .expect("emit eager");
+        let grammar = Arc::new(
+            Grammar::parse(&eager)
+                .unwrap_or_else(|e| panic!("eager grammar: {e}\n{eager}")),
+        );
+        let emission = format!(
+            "<|channel|>analysis<|message|>let me think<|end|>\
+             <|start|>assistant<|channel|>commentary<|message|>calling now\
+             <|end|><|start|>assistant{reference}"
+        );
+        let mut state = GrammarState::new(grammar.clone());
+        assert!(
+            state.advance_bytes(emission.as_bytes()).is_ok()
+                && state.is_complete(),
+            "eager grammar must accept {emission:?}\n{eager}"
+        );
+        // ... and the call alone (model may skip reasoning).
+        let mut state = GrammarState::new(grammar);
+        assert!(
+            state.advance_bytes(reference.as_bytes()).is_ok()
+                && state.is_complete(),
+            "eager grammar must accept the bare call\n{eager}"
+        );
+    }
+
+    /// Streaming chunking invariance for the Harmony envelope
+    /// (mirrors the Gemma/Qwen invariance pins), plus prefix-chop
+    /// atomicity for a call emission.
+    #[test]
+    fn harmony_stream_matches_batch_for_any_chunking() {
+        let syntax = CallSyntax::gpt_oss();
+        let t = special_function();
+        let emission = "<|channel|>analysis<|message|>reason it out<|end|>\
+             <|start|>assistant<|channel|>commentary<|message|>Sure thing.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.special_function \
+             <|constrain|>json<|message|>{\"arg1\":3}<|call|>";
+        let batch = merge_text(
+            parse_text(&syntax, &[&t], emission, false, Leniency::Final).blocks,
+        );
+        assert_eq!(calls_of(&batch).len(), 1, "{batch:#?}");
+        for chunk in 1..=7usize {
+            let mut p =
+                StreamParser::new(syntax.clone(), vec![t.clone()], false);
+            let mut streamed = Vec::new();
+            let mut i = 0;
+            while i < emission.len() {
+                let mut j = (i + chunk).min(emission.len());
+                while !emission.is_char_boundary(j) {
+                    j += 1;
+                }
+                streamed.extend(p.push(&emission[i..j]));
+                i = j;
+            }
+            streamed.extend(p.finish());
+            let streamed = merge_text(streamed);
+            assert_eq!(
+                streamed.len(),
+                batch.len(),
+                "chunk={chunk}: {streamed:#?} vs {batch:#?}"
+            );
+            for (s, b) in streamed.iter().zip(batch.iter()) {
+                match (s, b) {
+                    (
+                        Block::Text { text: a, .. },
+                        Block::Text { text: c, .. },
+                    ) => assert_eq!(a, c, "chunk={chunk}"),
+                    (
+                        Block::Thought { thought: a, .. },
+                        Block::Thought { thought: c, .. },
+                    ) => assert_eq!(a, c, "chunk={chunk}"),
+                    (
+                        Block::ToolUse { call: a },
+                        Block::ToolUse { call: c },
+                    ) => {
+                        assert_eq!(a.name, c.name, "chunk={chunk}");
+                        assert_eq!(a.input, c.input, "chunk={chunk}");
+                    }
+                    other => panic!("chunk={chunk}: mismatch {other:?}"),
+                }
+            }
+        }
+
+        // Prefix-chop atomicity: no prefix ever surfaces a call that
+        // the full parse doesn't have, and never panics.
+        for i in 0..=emission.len() {
+            if !emission.is_char_boundary(i) {
+                continue;
+            }
+            let parsed = parse_text(
+                &syntax,
+                &[&t],
+                &emission[..i],
+                false,
+                Leniency::Streaming,
+            );
+            let calls = calls_of(&parsed.blocks);
+            assert!(calls.len() <= 1, "prefix {i}: {:#?}", parsed.blocks);
+            if let Some((name, input)) = calls.first() {
+                assert_eq!(*name, "special_function", "prefix {i}");
+                assert_eq!(*input, &json!({"arg1": 3}), "prefix {i}");
+            }
+        }
+    }
+
+    /// Final-channel content streams incrementally as prose deltas —
+    /// the block users watch — with marker prefixes held back.
+    #[test]
+    fn harmony_final_content_streams() {
+        let syntax = CallSyntax::gpt_oss();
+        let t = special_function();
+        let mut p = StreamParser::new(syntax, vec![t], false);
+        assert!(p.push("<|channel|>analysis<|message|>hm").is_empty());
+        let out =
+            p.push("<|end|><|start|>assistant<|channel|>final<|message|>Hello");
+        assert_eq!(out.len(), 2, "{out:#?}");
+        assert!(matches!(&out[0], Block::Thought { thought, .. }
+            if thought.as_ref() == "hm"));
+        assert!(matches!(&out[1], Block::Text { text, .. }
+            if text.as_ref() == "Hello"));
+        let out = p.push(", world");
+        assert_eq!(merge_text(out), vec![Block::from(", world".to_string())]);
+        // A partial <|return|> is held back...
+        let out = p.push("!<|ret");
+        assert_eq!(merge_text(out), vec![Block::from("!".to_string())]);
+        // ...and swallowed once complete.
+        let out = p.push("urn|>");
+        assert!(out.is_empty(), "{out:#?}");
+        assert!(p.finish().is_empty());
     }
 
     // -----------------------------------------------------------------

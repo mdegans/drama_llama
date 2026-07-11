@@ -272,6 +272,16 @@ pub fn analyze_template(
     bos: &str,
     eos: &str,
 ) -> Result<CallSyntax, AnalyzeError> {
+    // Wholesale source sniffs run BEFORE probing (upstream order:
+    // `common_chat_try_specialized_template` precedes the diff
+    // analyzer). These templates are exactly the ones whose formats
+    // the differential probes can't segment — and whose guard
+    // `raise_exception`s the probe payloads may trip — so any probe
+    // result would be discarded noise anyway.
+    if let Some(hand_built) = sniff_hand_built(source) {
+        return Ok(hand_built);
+    }
+
     let probe = Probe::new(source, bos, eos)?;
 
     let reasoning = analyze_reasoning(&probe);
@@ -313,18 +323,28 @@ static PATCHES: &[Patch] = &[
             push_preserved(&mut syntax.preserved_tokens, "</think>");
         }
     },
-    // Gemma 4: hand-built dialect selected by source sniff, exactly
-    // as upstream does (`common_chat_params_init_gemma4`) — the
-    // differential probes can't segment its bare-key dict format or
-    // the asymmetric `<|…>` / `<…|>` marker convention. Full
-    // overwrite: any partial probe result for this template is
-    // noise.
-    |src, syntax| {
-        if src.contains("<|tool_call>call:") && src.contains("<|\"|>") {
-            *syntax = CallSyntax::gemma4();
-        }
-    },
 ];
+
+/// Source sniffs selecting hand-built dialects wholesale, checked
+/// before any differential probing (upstream's specialized-template
+/// dispatch). Order matters only if fragments could collide — they
+/// don't: Gemma 4's `<|tool_call>call:` / `<|"|>` and Harmony's
+/// `<|channel|>` (double pipe — Gemma's channel token is the
+/// single-pipe `<|channel>`) are mutually exclusive.
+fn sniff_hand_built(src: &str) -> Option<CallSyntax> {
+    // Gemma 4 (`common_chat_params_init_gemma4` upstream): bare-key
+    // dict format with the asymmetric `<|…>` / `<…|>` marker
+    // convention.
+    if src.contains("<|tool_call>call:") && src.contains("<|\"|>") {
+        return Some(CallSyntax::gemma4());
+    }
+    // gpt-oss / Harmony: upstream detects by this exact substring
+    // (`chat.cpp:2350`).
+    if src.contains("<|channel|>") {
+        return Some(CallSyntax::gpt_oss());
+    }
+    None
+}
 
 fn push_preserved(tokens: &mut Vec<String>, token: &str) {
     let t = token.trim();

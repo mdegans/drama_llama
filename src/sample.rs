@@ -174,10 +174,13 @@ pub struct DeferredGrammar {
     /// promotion panics otherwise. A fresh `GrammarState` is expected here
     /// — promoted grammars begin matching from root.
     pub grammar: SamplingMode,
-    /// Byte sequence whose appearance in the predictor's accumulated text
-    /// triggers promotion. Matched anywhere in the trailing window (same
-    /// sizing as stop-strings), not just at the exact text end.
-    pub activate_after: Vec<u8>,
+    /// Byte sequences (any-of) whose appearance in the predictor's
+    /// accumulated text triggers promotion. Matched anywhere in the
+    /// trailing window (same sizing as stop-strings), not just at the
+    /// exact text end. Most dialects have exactly one; Harmony's
+    /// tool-call header has several legal shapes
+    /// ([`CallSyntax::triggers`](crate::CallSyntax::triggers)).
+    pub activate_after: Vec<Vec<u8>>,
     /// Whether the trigger bytes themselves are fed into the grammar
     /// state at promotion (llama.cpp lazy-pattern semantics: the
     /// grammar root *starts with* the trigger, e.g. a `<tool_call>\n`
