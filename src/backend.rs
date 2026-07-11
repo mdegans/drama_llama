@@ -346,29 +346,30 @@ pub enum MediaChunk {
 ///
 /// [`Engine`]: crate::Engine
 pub trait Vision<D: Decoder>: Send {
-    /// Backend-specific media error (marker/count mismatch,
+    /// Backend-specific media error (segment/count mismatch,
     /// preprocessing failure, encode/decode failure, etc.).
     type Error: std::error::Error + Send + Sync + 'static;
-
-    /// The marker substring standing for one media item in prompt
-    /// text (e.g. mtmd's `<__media__>`). The chat-template layer
-    /// emits one marker per image block; [`Vision::tokenize`] splits
-    /// on it.
-    fn marker(&self) -> &str;
 
     /// Whether the loaded projector actually supports image input
     /// (a projector can in principle be audio-only).
     fn supports_images(&self) -> bool;
 
-    /// Tokenize `text` containing exactly `images.len()` occurrences
-    /// of [`Vision::marker`] (in image order) into text and media
-    /// chunks. `add_special` prepends BOS-style tokens;
+    /// Tokenize interleaved text `segments` and `images` into text
+    /// and media chunks: `segments[0]`, then `images[0]`, then
+    /// `segments[1]`, … — the caller must pass
+    /// `segments.len() == images.len() + 1` (empty segments are
+    /// fine). Taking pre-split segments instead of marker-bearing
+    /// text makes the boundary injection-proof **by type**: no
+    /// content byte is ever interpreted as a media marker, because
+    /// there is no marker.
+    ///
+    /// `add_special` prepends BOS-style tokens (first segment only);
     /// `parse_special` tokenizes special tokens appearing verbatim in
-    /// `text` as such (chat-template output wants `add_special =
-    /// false`, `parse_special = true`).
+    /// segment text as such (chat-template output wants
+    /// `add_special = false`, `parse_special = true`).
     fn tokenize(
         &self,
-        text: &str,
+        segments: &[&str],
         images: &[ImageInfo],
         add_special: bool,
         parse_special: bool,
@@ -397,17 +398,13 @@ pub enum NoVision {}
 impl<D: Decoder> Vision<D> for NoVision {
     type Error = std::convert::Infallible;
 
-    fn marker(&self) -> &str {
-        match *self {}
-    }
-
     fn supports_images(&self) -> bool {
         match *self {}
     }
 
     fn tokenize(
         &self,
-        _text: &str,
+        _segments: &[&str],
         _images: &[ImageInfo],
         _add_special: bool,
         _parse_special: bool,

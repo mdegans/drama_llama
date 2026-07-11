@@ -359,28 +359,72 @@ impl Mtmd {
 impl Vision<LlamaCppDecoder> for Mtmd {
     type Error = MtmdError;
 
-    fn marker(&self) -> &str {
-        Mtmd::marker(self)
-    }
-
     fn supports_images(&self) -> bool {
         Mtmd::supports_images(self)
     }
 
+    /// Segment assembly: each text segment tokenizes with ZERO
+    /// bitmaps (mtmd never sees a marker in caller text — marker
+    /// injection is structurally impossible), and each image
+    /// tokenizes as a lone marker + placeholder bitmap, exactly the
+    /// call `prefill_image` makes for the real encode. Wrapper
+    /// tokens the model adds around media (`<|vision_start|>` …)
+    /// come back as text chunks from the per-image tokenization and
+    /// are kept in place. Per-bitmap preprocessing identity
+    /// (validated in Phase B) is what makes this equal to a
+    /// full-text `mtmd_tokenize` on marker-clean prompts — see the
+    /// `segment_tokenize_differential` test.
     fn tokenize(
         &self,
-        text: &str,
+        segments: &[&str],
         images: &[ImageInfo],
         add_special: bool,
         parse_special: bool,
     ) -> Result<Vec<MediaChunk>, Self::Error> {
-        Ok(Mtmd::tokenize(
-            self,
-            text,
-            images,
-            add_special,
-            parse_special,
-        )?)
+        if segments.len() != images.len() + 1 {
+            return Err(MtmdTokenizeError::MarkerMismatch {
+                markers: segments.len().saturating_sub(1),
+                images: images.len(),
+            }
+            .into());
+        }
+        let mut out: Vec<MediaChunk> = Vec::new();
+        for (i, segment) in segments.iter().enumerate() {
+            if !segment.is_empty() {
+                let chunks = self.tokenize_raw(
+                    segment,
+                    &[],
+                    add_special && i == 0,
+                    parse_special,
+                )?;
+                out.extend(chunks.to_media_chunks(0)?);
+            }
+            if let Some(info) = images.get(i) {
+                let placeholder = Bitmap::placeholder(info)?;
+                let chunks = self.tokenize_raw(
+                    &self.marker,
+                    std::slice::from_ref(&placeholder),
+                    false,
+                    true,
+                )?;
+                out.extend(chunks.to_media_chunks(1)?);
+            }
+        }
+        // Merge adjacent text chunks so the output is independent of
+        // where segment boundaries fell (a text run split across a
+        // segment/wrapper boundary must compare equal to the same
+        // run tokenized whole).
+        let mut merged: Vec<MediaChunk> = Vec::with_capacity(out.len());
+        for chunk in out {
+            match (merged.last_mut(), chunk) {
+                (
+                    Some(MediaChunk::Text(acc)),
+                    MediaChunk::Text(more),
+                ) => acc.extend(more),
+                (_, chunk) => merged.push(chunk),
+            }
+        }
+        Ok(merged)
     }
 
     /// Rust-owned eval loop (Phase C+D): tokenize a lone marker with
@@ -543,6 +587,7 @@ impl Mtmd {
     /// differential-tested against (same context, identical logits).
     /// No pre-KV NaN guard — the helper has no hook between encode
     /// and decode.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn prefill_image_via_helper(
         &mut self,
         decoder: &mut LlamaCppDecoder,
@@ -1009,6 +1054,78 @@ mod tests {
         let pos_max = decoder.memory_seq_pos_max(0);
         assert!(pos_max >= 0, "KV cache holds the image cells");
         assert!(pos_max < span.n_tokens as i32 + span.n_pos as i32);
+    }
+
+    /// Segment-assembly differential (plan #31 C+D, work item 1):
+    /// [`Vision::tokenize`] on pre-split segments must produce the
+    /// same chunk stream as a full-text `mtmd_tokenize` of the
+    /// marker-joined prompt — proving our out-of-band split is
+    /// byte-identical to mtmd's own marker splitting (mtmd also
+    /// tokenizes each inter-marker piece separately, so there is no
+    /// BPE seam to diverge on).
+    #[test]
+    #[ignore = "long running; requires local model + mmproj sidecar"]
+    fn segment_tokenize_differential() {
+        use crate::backend::Vision as _;
+
+        let (model_path, mmproj) = local_vision_paths();
+        let model =
+            LlamaCppModel::from_file(model_path, None).expect("model load");
+        let mtmd = Mtmd::from_path(
+            &mmproj,
+            &model,
+            MtmdParams {
+                use_gpu: false,
+                warmup: false,
+                ..Default::default()
+            },
+        )
+        .expect("mmproj load");
+
+        let infos = [
+            ImageInfo {
+                width: 640,
+                height: 480,
+                id: [7; 32],
+            },
+            ImageInfo {
+                width: 320,
+                height: 240,
+                id: [9; 32],
+            },
+        ];
+        let segments =
+            ["<|im_start|>user\nCompare ", " with ", "<|im_end|>\n"];
+
+        let via_segments =
+            Vision::tokenize(&mtmd, &segments, &infos, false, true)
+                .expect("segment tokenize");
+
+        let joined = format!(
+            "{}{m}{}{m}{}",
+            segments[0],
+            segments[1],
+            segments[2],
+            m = mtmd.marker()
+        );
+        let via_marker = mtmd
+            .tokenize(&joined, &infos, false, true)
+            .expect("marker tokenize");
+
+        assert_eq!(
+            via_segments, via_marker,
+            "segment assembly must equal mtmd's own marker splitting"
+        );
+        // Sanity: both carry the two media chunks with round-tripped
+        // ids, in order.
+        let ids: Vec<_> = via_segments
+            .iter()
+            .filter_map(|c| match c {
+                MediaChunk::Media { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![[7; 32], [9; 32]]);
     }
 
     /// Differential test for the Rust-owned eval loop (plan #31 C+D,
