@@ -20,12 +20,16 @@ use std::{
 };
 
 use llama_cpp_sys_3::{
-    llama_n_batch, llama_pos, mtmd_bitmap, mtmd_bitmap_free, mtmd_bitmap_init,
+    llama_context, llama_decode, llama_get_model, llama_model_n_embd_inp,
+    llama_n_batch, llama_n_ubatch, llama_pos, llama_seq_id,
+    llama_set_causal_attn, mtmd_bitmap, mtmd_bitmap_free, mtmd_bitmap_init,
     mtmd_bitmap_set_id, mtmd_context, mtmd_context_params_default,
-    mtmd_decode_use_mrope, mtmd_free, mtmd_get_marker,
-    mtmd_helper_eval_chunk_single, mtmd_init_from_file, mtmd_input_chunk,
-    mtmd_input_chunk_get_id, mtmd_input_chunk_get_n_pos,
-    mtmd_input_chunk_get_n_tokens, mtmd_input_chunk_get_tokens_text,
+    mtmd_decode_use_mrope, mtmd_decode_use_non_causal, mtmd_decoder_pos,
+    mtmd_encode_chunk, mtmd_free, mtmd_get_marker, mtmd_get_output_embd,
+    mtmd_helper_eval_chunk_single, mtmd_helper_image_get_decoder_pos,
+    mtmd_init_from_file, mtmd_input_chunk, mtmd_input_chunk_get_id,
+    mtmd_input_chunk_get_n_pos, mtmd_input_chunk_get_n_tokens,
+    mtmd_input_chunk_get_tokens_image, mtmd_input_chunk_get_tokens_text,
     mtmd_input_chunk_get_type,
     mtmd_input_chunk_type_MTMD_INPUT_CHUNK_TYPE_TEXT, mtmd_input_chunks,
     mtmd_input_chunks_free, mtmd_input_chunks_get, mtmd_input_chunks_init,
@@ -130,8 +134,39 @@ pub enum MtmdPrefillError {
     /// one media chunk — should be unreachable for image projectors.
     #[error("marker tokenization produced no single media chunk")]
     NoMediaChunk,
-    /// Encode or decode failed inside the eval loop
-    /// (`mtmd_helper_eval_chunk_single` nonzero).
+    /// The image occupies more cells than one micro-batch holds and
+    /// the model requires non-causal (single-pass) image attention
+    /// (Gemma-style) — the decode cannot be split. Raise `n_ubatch`
+    /// or downscale the image. Checked before the expensive encode.
+    #[error(
+        "image needs {n_tokens} cells but n_ubatch is {n_ubatch} and the \
+         model requires single-pass (non-causal) image decode"
+    )]
+    ExceedsUbatch { n_tokens: u32, n_ubatch: u32 },
+    /// The projector encode failed (`mtmd_encode_chunk` nonzero).
+    #[error("media encode failed with code {code}")]
+    Encode { code: i32 },
+    /// The encoder produced a non-finite value (NaN/Inf), caught
+    /// BEFORE any KV write — NaN is maximally contagious in the KV
+    /// cache (one poisoned cell makes every later logit NaN and the
+    /// damage survives until the cells are wiped). `id` is the
+    /// offending bitmap's content hash (hex sha256 of its RGB8
+    /// pixels); `index` is the first bad element in the encoder
+    /// output. The KV cache is untouched; the caller decides whether
+    /// to drop the image or abort.
+    #[error(
+        "media encoder output contains a non-finite value at element \
+         {index} (image id {id}); rejected before any KV write"
+    )]
+    NonFinite { id: String, index: usize },
+    /// `llama_decode` of an embedding batch view failed. KV state for
+    /// this image may be partially written — callers should wipe
+    /// (Session routes this through its cache-miss error path).
+    #[error("media embedding decode failed with code {code}")]
+    Decode { code: i32 },
+    /// Encode or decode failed inside the bound upstream helper
+    /// (`mtmd_helper_eval_chunk_single` nonzero). Only reachable via
+    /// the crate-private helper path kept for differential testing.
     #[error("media chunk eval failed with code {code}")]
     Eval { code: i32 },
 }
@@ -348,17 +383,14 @@ impl Vision<LlamaCppDecoder> for Mtmd {
         )?)
     }
 
-    /// Phase B implementation: tokenize a lone marker with the one
-    /// real bitmap, then hand the media chunk to
-    /// `mtmd_helper_eval_chunk_single`, which batches the encode +
-    /// embedding decode and handles the non-causal attention toggle
-    /// (Gemma-style) internally.
-    ///
-    /// Phase C+D replaces these internals with the Rust-owned eval
-    /// loop (`EmbdBatch`, pre-KV NaN scan, M-RoPE positions) and
-    /// differential-tests it against this helper path; the signature
-    /// does not change. Until then there is no pre-KV NaN guard — the
-    /// helper offers no hook between encode and decode.
+    /// Rust-owned eval loop (Phase C+D): tokenize a lone marker with
+    /// the one real bitmap, encode on the projector, scan the
+    /// encoder output for non-finite values BEFORE any KV write,
+    /// then decode the embeddings through [`EmbdBatch`] views with
+    /// normal or M-RoPE positions and the non-causal attention
+    /// toggle (Gemma-style) guarded on every error path.
+    /// Differential-tested against the bound upstream helper
+    /// ([`Mtmd::prefill_image_via_helper`]).
     fn prefill_image(
         &mut self,
         decoder: &mut LlamaCppDecoder,
@@ -366,28 +398,170 @@ impl Vision<LlamaCppDecoder> for Mtmd {
         start_pos: usize,
         seq_id: i32,
     ) -> Result<MediaSpan, Self::Error> {
-        let bitmap = Bitmap::real(image)?;
+        let bitmap =
+            Bitmap::real(image).map_err(MtmdPrefillError::Tokenize)?;
         // Marker-only text: the media chunk it produces is identical
         // to the one a full-prompt tokenization yields for this image
         // (preprocessing is per-bitmap); any wrapper tokens the model
         // adds around markers live in *text* chunks, which the caller
         // prefills via the ordinary text path.
-        let chunks = self.tokenize_raw(
-            &self.marker,
-            std::slice::from_ref(&bitmap),
-            false,
-            true,
-        )?;
+        let chunks = self
+            .tokenize_raw(
+                &self.marker.clone(),
+                std::slice::from_ref(&bitmap),
+                false,
+                true,
+            )
+            .map_err(MtmdPrefillError::Tokenize)?;
+        let chunk =
+            chunks.find_media().ok_or(MtmdPrefillError::NoMediaChunk)?;
+        let span = self.eval_media_chunk(decoder, chunk, start_pos, seq_id)?;
+        Ok(span)
+    }
+}
 
-        let mut media: Option<*const mtmd_input_chunk> = None;
-        for i in 0..chunks.len() {
-            let chunk = chunks.get(i);
-            let ty = unsafe { mtmd_input_chunk_get_type(chunk) };
-            if ty != mtmd_input_chunk_type_MTMD_INPUT_CHUNK_TYPE_TEXT {
-                media = Some(chunk);
-            }
+impl Mtmd {
+    /// Encode one media chunk on the projector and decode its
+    /// embeddings into the KV cache at `start_pos` on `seq_id`. The
+    /// core of [`Vision::prefill_image`]; `chunk` must outlive the
+    /// call (it borrows from a live [`Chunks`]).
+    fn eval_media_chunk(
+        &mut self,
+        decoder: &mut LlamaCppDecoder,
+        chunk: *const mtmd_input_chunk,
+        start_pos: usize,
+        seq_id: i32,
+    ) -> Result<MediaSpan, MtmdPrefillError> {
+        let n_tokens =
+            unsafe { mtmd_input_chunk_get_n_tokens(chunk) } as usize;
+        let n_pos = unsafe { mtmd_input_chunk_get_n_pos(chunk) } as u32;
+
+        // Fit check up front, before the expensive encode: non-causal
+        // image attention (Gemma-style) means every image cell must
+        // attend to every other, so the decode cannot be split across
+        // micro-batches. (Upstream's helper has a TODO here and would
+        // decode garbage; we refuse instead.)
+        let non_causal =
+            unsafe { mtmd_decode_use_non_causal(self.ctx.as_ptr(), chunk) };
+        let n_ubatch = unsafe { llama_n_ubatch(decoder.context) } as usize;
+        if non_causal && n_tokens > n_ubatch {
+            return Err(MtmdPrefillError::ExceedsUbatch {
+                n_tokens: n_tokens as u32,
+                n_ubatch: n_ubatch as u32,
+            });
         }
-        let chunk = media.ok_or(MtmdPrefillError::NoMediaChunk)?;
+
+        // Encode. Output lands in the mtmd context's internal buffer
+        // (the reason `Mtmd` is `Send` but not `Sync`), valid until
+        // the next encode.
+        let ret = unsafe { mtmd_encode_chunk(self.ctx.as_ptr(), chunk) };
+        if ret != 0 {
+            return Err(MtmdPrefillError::Encode { code: ret });
+        }
+        let embd = unsafe { mtmd_get_output_embd(self.ctx.as_ptr()) };
+        if embd.is_null() {
+            return Err(MtmdPrefillError::Encode { code: -1 });
+        }
+        let n_embd = unsafe {
+            llama_model_n_embd_inp(llama_get_model(decoder.context))
+        } as usize;
+        let embd_slice =
+            unsafe { std::slice::from_raw_parts(embd, n_tokens * n_embd) };
+
+        // Pre-KV non-finite guard: this is the hook the upstream
+        // helper doesn't have. Nothing has touched the KV cache yet,
+        // so a poisoned encode is rejected with state fully intact.
+        if let Some(index) =
+            embd_slice.iter().position(|v| !v.is_finite())
+        {
+            let id_c = unsafe { mtmd_input_chunk_get_id(chunk) };
+            let id = if id_c.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(id_c) }.to_string_lossy().into_owned()
+            };
+            return Err(MtmdPrefillError::NonFinite { id, index });
+        }
+
+        // Positions: M-RoPE images get 4 plane-major position planes
+        // from upstream's own layout function; everything else is the
+        // ordinary dense single plane.
+        let mrope = self.decode_use_mrope();
+        let mut batch = EmbdBatch::new(
+            embd,
+            n_tokens,
+            if mrope { 4 } else { 1 },
+            n_embd,
+            seq_id,
+        );
+        if mrope {
+            let image_tokens =
+                unsafe { mtmd_input_chunk_get_tokens_image(chunk) };
+            if image_tokens.is_null() {
+                return Err(MtmdPrefillError::NoMediaChunk);
+            }
+            let mut rel =
+                vec![mtmd_decoder_pos { t: 0, x: 0, y: 0, z: 0 }; n_tokens];
+            unsafe {
+                mtmd_helper_image_get_decoder_pos(
+                    image_tokens,
+                    start_pos as llama_pos,
+                    rel.as_mut_ptr(),
+                )
+            };
+            batch.set_position_mrope_2d(&rel);
+        } else {
+            batch.set_position_normal(start_pos as llama_pos);
+        }
+
+        // Decode in n_batch slices. The guard restores causal
+        // attention on every exit path, including decode errors.
+        let n_batch = (unsafe { llama_n_batch(decoder.context) } as usize)
+            .max(1);
+        let _causal = CausalAttnGuard::disable_if(non_causal, decoder.context);
+        let mut offset = 0;
+        while offset < n_tokens {
+            let len = n_batch.min(n_tokens - offset);
+            let view = batch.view(offset, len);
+            let ret = unsafe { llama_decode(decoder.context, view) };
+            if ret != 0 {
+                return Err(MtmdPrefillError::Decode { code: ret });
+            }
+            offset += len;
+        }
+
+        Ok(MediaSpan {
+            n_tokens: n_tokens as u32,
+            n_pos,
+        })
+    }
+
+    /// The Phase B implementation of [`Vision::prefill_image`],
+    /// delegating encode + decode + position assignment + non-causal
+    /// toggle to upstream's `mtmd_helper_eval_chunk_single`. Kept
+    /// crate-private as the reference the Rust-owned eval loop is
+    /// differential-tested against (same context, identical logits).
+    /// No pre-KV NaN guard — the helper has no hook between encode
+    /// and decode.
+    pub(crate) fn prefill_image_via_helper(
+        &mut self,
+        decoder: &mut LlamaCppDecoder,
+        image: &Image,
+        start_pos: usize,
+        seq_id: i32,
+    ) -> Result<MediaSpan, MtmdError> {
+        let bitmap =
+            Bitmap::real(image).map_err(MtmdPrefillError::Tokenize)?;
+        let chunks = self
+            .tokenize_raw(
+                &self.marker.clone(),
+                std::slice::from_ref(&bitmap),
+                false,
+                true,
+            )
+            .map_err(MtmdPrefillError::Tokenize)?;
+        let chunk =
+            chunks.find_media().ok_or(MtmdPrefillError::NoMediaChunk)?;
 
         let n_tokens = unsafe { mtmd_input_chunk_get_n_tokens(chunk) } as u32;
         let n_pos = unsafe { mtmd_input_chunk_get_n_pos(chunk) } as u32;
@@ -416,6 +590,148 @@ impl Vision<LlamaCppDecoder> for Mtmd {
         );
 
         Ok(MediaSpan { n_tokens, n_pos })
+    }
+}
+
+/// Hand-assembled embedding batch for media decode.
+///
+/// `llama_batch_init` hard-allocates `pos` at `n_tokens` entries, but
+/// M-RoPE image decode needs `n_tokens × 4` plane-major position
+/// entries — extending [`crate::Batch`] is structurally insufficient
+/// (upstream's `decode_embd_batch` hand-assembles for the same
+/// reason). Every buffer is a Rust-owned `Vec`; the `llama_batch`
+/// handed to `llama_decode` is a borrowed VIEW and is never passed to
+/// `llama_batch_free`. Logits stay all-false: nothing reads logits
+/// after an embedding decode.
+struct EmbdBatch {
+    /// Plane-major positions, `n_tokens * n_pos_per_embd` entries.
+    pos: Vec<llama_pos>,
+    n_seq_id: Vec<i32>,
+    /// The one sequence id every token targets. Heap storage so the
+    /// pointers in `seq_ids` survive moves of the struct itself.
+    seq_id_0: Vec<llama_seq_id>,
+    seq_ids: Vec<*mut llama_seq_id>,
+    logits: Vec<i8>,
+    /// Scratch for M-RoPE views — plane slices of `pos` are
+    /// non-contiguous, so each view gathers them here.
+    pos_view: Vec<llama_pos>,
+    /// Encoder output, borrowed from the mtmd context (valid until
+    /// the next encode; `EmbdBatch` never outlives the eval call).
+    embd: *mut f32,
+    n_tokens: usize,
+    n_pos_per_embd: usize,
+    n_embd: usize,
+}
+
+impl EmbdBatch {
+    fn new(
+        embd: *mut f32,
+        n_tokens: usize,
+        n_pos_per_embd: usize,
+        n_embd: usize,
+        seq_id: llama_seq_id,
+    ) -> Self {
+        let mut batch = Self {
+            pos: vec![0; n_tokens * n_pos_per_embd],
+            n_seq_id: vec![1; n_tokens],
+            seq_id_0: vec![seq_id],
+            seq_ids: Vec::with_capacity(n_tokens),
+            logits: vec![0; n_tokens],
+            pos_view: Vec::new(),
+            embd,
+            n_tokens,
+            n_pos_per_embd,
+            n_embd,
+        };
+        let seq_ptr = batch.seq_id_0.as_mut_ptr();
+        batch.seq_ids = vec![seq_ptr; n_tokens];
+        batch
+    }
+
+    /// Dense single-plane positions `[pos_0, pos_0 + n_tokens)`.
+    fn set_position_normal(&mut self, pos_0: llama_pos) {
+        debug_assert_eq!(self.n_pos_per_embd, 1);
+        for (i, p) in self.pos.iter_mut().enumerate() {
+            *p = pos_0 + i as llama_pos;
+        }
+    }
+
+    /// M-RoPE image positions: plane-major `(t, y, x, z)` — the same
+    /// layout upstream's `decode_embd_batch::set_position_mrope_2d`
+    /// writes.
+    fn set_position_mrope_2d(&mut self, rel: &[mtmd_decoder_pos]) {
+        debug_assert_eq!(self.n_pos_per_embd, 4);
+        debug_assert_eq!(rel.len(), self.n_tokens);
+        let n = self.n_tokens;
+        // `mtmd_decoder_pos` fields are declared `uint32_t` upstream
+        // but hold `llama_pos` values (C++ converts implicitly).
+        for (i, r) in rel.iter().enumerate() {
+            self.pos[i] = r.t as llama_pos;
+            self.pos[i + n] = r.y as llama_pos;
+            self.pos[i + n * 2] = r.x as llama_pos;
+            self.pos[i + n * 3] = r.z as llama_pos;
+        }
+    }
+
+    /// A `llama_batch` view over tokens `[offset, offset + len)`.
+    /// Borrows this struct's buffers — do not free, do not outlive.
+    fn view(
+        &mut self,
+        offset: usize,
+        len: usize,
+    ) -> llama_cpp_sys_3::llama_batch {
+        debug_assert!(offset + len <= self.n_tokens);
+        let pos_ptr = if self.n_pos_per_embd > 1 {
+            // Gather each plane's slice: source layout is
+            // `tttt…yyyy…xxxx…zzzz…` over n_tokens, the view needs
+            // the same plane-major layout over len.
+            self.pos_view.clear();
+            self.pos_view.reserve(len * self.n_pos_per_embd);
+            for plane in 0..self.n_pos_per_embd {
+                let src = plane * self.n_tokens + offset;
+                self.pos_view.extend_from_slice(&self.pos[src..src + len]);
+            }
+            self.pos_view.as_mut_ptr()
+        } else {
+            self.pos[offset..].as_mut_ptr()
+        };
+        llama_cpp_sys_3::llama_batch {
+            n_tokens: len as i32,
+            token: std::ptr::null_mut(),
+            embd: unsafe { self.embd.add(offset * self.n_embd) },
+            pos: pos_ptr,
+            n_seq_id: self.n_seq_id[offset..].as_mut_ptr(),
+            seq_id: self.seq_ids[offset..].as_mut_ptr(),
+            logits: self.logits[offset..].as_mut_ptr(),
+        }
+    }
+}
+
+/// Disables causal attention for the lifetime of the guard and
+/// restores it on drop — error paths inside the media decode loop
+/// can't leave the context stuck non-causal.
+struct CausalAttnGuard {
+    ctx: *mut llama_context,
+    active: bool,
+}
+
+impl CausalAttnGuard {
+    fn disable_if(non_causal: bool, ctx: *mut llama_context) -> Self {
+        if non_causal {
+            unsafe { llama_set_causal_attn(ctx, false) };
+        }
+        Self {
+            ctx,
+            active: non_causal,
+        }
+    }
+}
+
+impl Drop for CausalAttnGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe { llama_set_causal_attn(self.ctx, true) };
+        }
     }
 }
 
@@ -488,6 +804,15 @@ impl Chunks {
     /// Borrow chunk `i`. Valid while `self` lives.
     fn get(&self, i: usize) -> *const mtmd_input_chunk {
         unsafe { mtmd_input_chunks_get(self.0.as_ptr(), i) }
+    }
+
+    /// The first non-text (media) chunk, if any. Valid while `self`
+    /// lives.
+    fn find_media(&self) -> Option<*const mtmd_input_chunk> {
+        (0..self.len()).map(|i| self.get(i)).find(|&chunk| {
+            let ty = unsafe { mtmd_input_chunk_get_type(chunk) };
+            ty != mtmd_input_chunk_type_MTMD_INPUT_CHUNK_TYPE_TEXT
+        })
     }
 
     /// Convert to the generic representation. `n_images` is the
@@ -684,6 +1009,86 @@ mod tests {
         let pos_max = decoder.memory_seq_pos_max(0);
         assert!(pos_max >= 0, "KV cache holds the image cells");
         assert!(pos_max < span.n_tokens as i32 + span.n_pos as i32);
+    }
+
+    /// Differential test for the Rust-owned eval loop (plan #31 C+D,
+    /// work item 4): same context, same prefix + image + trailing
+    /// text, once through upstream's `mtmd_helper_eval_chunk_single`
+    /// and once through [`Vision::prefill_image`]'s `EmbdBatch` loop.
+    /// CPU decode of identical batches is bit-deterministic, so the
+    /// trailing-text logits must match exactly — any position-plane
+    /// or batching mistake in the Rust loop shows up here.
+    #[test]
+    #[ignore = "long running; requires local model + mmproj sidecar"]
+    fn eval_loop_differential_vs_helper() {
+        use crate::{backend::Vision as _, Decoder as _};
+
+        let (model_path, _) = local_vision_paths();
+        let mut cp = crate::LlamaCppEngine::default_context_params();
+        cp.n_ctx = 8192;
+        let mut engine =
+            crate::LlamaCppEngine::new(model_path, None, Some(cp), None)
+                .expect("engine + mmproj sidecar load");
+
+        let prefix = engine.model.tokenize("Describe this image:", false);
+        let trail = engine.model.tokenize(" What breed is shown?", false);
+        let jpg = std::fs::read("tests/data/images/samoyed.jpg")
+            .expect("committed fixture");
+        let image = crate::Image::try_from(
+            image::load_from_memory(&jpg)
+                .expect("jpeg decode")
+                .thumbnail(512, 512),
+        )
+        .unwrap();
+
+        let mut run = |engine: &mut crate::LlamaCppEngine,
+                       use_helper: bool|
+         -> (MediaSpan, Vec<f32>) {
+            engine.memory_clear();
+            engine.prefill_chunk(&prefix, 0, 0).expect("prefix prefill");
+            let (vision, decoder) = engine.vision_and_decoder();
+            let vision = vision.expect("mmproj sidecar should auto-load");
+            let span = if use_helper {
+                vision
+                    .prefill_image_via_helper(
+                        decoder,
+                        &image,
+                        prefix.len(),
+                        0,
+                    )
+                    .expect("helper-path image prefill")
+            } else {
+                Vision::prefill_image(
+                    vision,
+                    decoder,
+                    &image,
+                    prefix.len(),
+                    0,
+                )
+                .expect("rust-loop image prefill")
+            };
+            let after = prefix.len() + span.n_pos as usize;
+            let logits = decoder
+                .prefill(&trail, after, 0)
+                .expect("trail prefill")
+                .to_vec();
+            (span, logits)
+        };
+
+        let (span_helper, logits_helper) = run(&mut engine, true);
+        let (span_rust, logits_rust) = run(&mut engine, false);
+
+        assert_eq!(span_helper, span_rust, "spans must agree");
+        assert_eq!(logits_helper.len(), logits_rust.len());
+        let n_diff = logits_helper
+            .iter()
+            .zip(&logits_rust)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            n_diff, 0,
+            "logits diverge between helper and Rust eval loop",
+        );
     }
 
     /// M-RoPE KV-semantics probe (plan #31 C+D, work item 4 —
