@@ -251,6 +251,133 @@ subsumes). Rolls issue #28 (lazy grammar check) into the sequence.
     work formats better suited to the Content Block design. So:
     preserve event order always; feel free to patch templates to do
     it.
+- **Phase G LANDED** (2026-07-11, session 4, Fable; commit `895c320`
+  core + e2e follow-up). `Family::Harmony`, hand-built emit+parse
+  paths like upstream's `common_chat_params_init_gpt_oss`; sniff =
+  `<|channel|>` in source (upstream chat.cpp:2350), run BEFORE
+  probing (`sniff_hand_built`, Gemma moved there too — those
+  templates' raise-guards can trip the probe payloads).
+  - **EOG plumbing was NOT free**: `LlamaCppModel` never implemented
+    `extra_eos_tokens` (only moeflux did). Now a memoized
+    `llama_vocab_is_eog` vocab scan; libllama's o200k_harmony fixup
+    (llama-vocab.cpp) gives `<|call|>`+`<|return|>` EOG with `<|end|>`
+    REMOVED from EOG — pinned against the real 20b vocab
+    (`gptoss_eog_token_set`, CPU-only load).
+  - **Canonical call shape = the TRAINED channel-header form**
+    `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}`
+    (compact sorted JSON = minijinja tojson): eager grammar forces
+    it, render_reference emits it, cache-stable sidecar re-renders
+    it. The STOCK template re-renders the role-header re-ingest form
+    (` to=functions.NAME<|channel|>commentary json<|message|>`) →
+    stock deployments get an LCP fallback per tool turn (semantic
+    round-trip pinned instead). e2e: the 20b emitted the canonical
+    form byte-perfect under Auto, unforced.
+  - Eager (Any/Method) grammar covers the WHOLE emission:
+    `(analysis|preamble until-<|end|> <|start|>assistant)* call`;
+    after args only EOG is legal → `<|call|>` stops
+    deterministically. Lazy (Auto): `DeferredGrammar.activate_after`
+    is now **any-of** (`Vec<Vec<u8>>`); Harmony triggers on 3
+    conservative header shapes (role-header + both channel-header
+    forms ending ` to=functions.`) — FP derails generation, FN only
+    loses enforcement (parser is source of truth). Position-0 bare
+    ` to=functions.` deliberately not a trigger.
+  - Parser `run_harmony`: channel-block reader — analysis→Thought
+    (VERBATIM body, multiple blocks stay separate Thoughts;
+    re-ingest concatenates them into one reasoning string → 1-turn
+    LCP fallback, documented residual), commentary preamble→Text,
+    final→Text streamed as deltas (landmark holdback got a
+    Harmony marker set incl. ` to=`), both recipient positions,
+    `<|constrain|>` optional at all three levels, stray
+    `<|channel|>commentary[ to=assistant]` swallowed, non-functions
+    recipients (container.exec/python builtins) swallowed whole.
+    Upstream pin corpus ported (test-chat.cpp:5075-5254).
+  - **`ReasoningReingest::Thinking`** (new variant): tool-call
+    messages carry the `thinking` key (what the stock template reads)
+    and WITHHOLD merged `content` (stock raises on both; upstream
+    erases the same way) while keeping content_pre/content_post for
+    the sidecar. `thinking` is NOT set on plain assistant messages —
+    the stock template renders any past message with that key as an
+    analysis block, swallowing its final content (template bug).
+    Sidecars read `reasoning_content` everywhere instead.
+  - **`<|return|>`→`<|end|>` needed ZERO session code**: the sampled
+    close-marker token is recorded-but-uncommitted (tip at kv_len),
+    the byte-prefix canonicalization gate compares committed bytes
+    only, and tip qualification through the divergent token degrades
+    to the lcp-1 walk — a one-token re-prefill per final turn. The
+    one accepted quirk for sidecar deployments.
+  - Sidecar `gptoss-cache-stable.jinja`: stock macro section
+    byte-identical (system/developer/TS namespace); message loop
+    rewritten — analysis on every reasoning turn (preserve_thinking,
+    aged thinking kept per Mike's standing call), ALL tool_calls
+    (stock renders `tool_calls[0]` only!), content_pre as causal
+    commentary preamble (shape C carried over), tool responses by
+    forward-scan with tool_call_id→name resolution (stock's
+    last_tool_call inference misattributes after parallel calls).
+    FFI-free prefix-continuity pin covers announce-then-call,
+    responses, aging, final turns.
+  - **e2e 8/8** on gpt-oss-20b Q8_K_XL (RTX 3090, `--features
+    serde,cuda`, `tests/session_gptoss.rs`): dialect at load, EOG
+    set, Method forced call, Auto native call, STRICT byte-prefix
+    round-trip (sidecar), announce-then-call in emission order,
+    tool-result turn answer, prefix cache across tool turn.
+    Announce nudge finding: the 20b PLANS the preamble in analysis
+    but skips emitting it unless the system prompt names the
+    commentary channel explicitly (two weaker phrasings failed;
+    "output a preamble message on the commentary channel (no
+    recipient)" works). `complete_text` returning envelope bytes
+    (`<|channel|>final<|message|>…`) is its documented raw-view
+    contract, not a leak — typed entry points parse clean.
+  - blallama deployment note: ship `gptoss-cache-stable.jinja` as
+    `<model>.template.jinja` next to the gpt-oss GGUF.
+- **Phase G postmortem — two sampler traps found by the regression
+  suites** (2026-07-11, session 4 cont.; Gemma suite caught both):
+  1. **EOG-by-id vs grammar-required exit markers.** libllama marks
+     Gemma's `<|tool_response>` (id 50) EOG, so the new
+     `extra_eos_tokens` fed it into the Phase E rule "reject EOG by
+     id while constraint incomplete" — vetoing the *only trained
+     stop* after a call. The grammar still offered a legal path
+     (another call), so the model looped identical calls to the
+     512-token context limit (NOT a no-legal-path case — no force-EOS
+     fires, no error; bounded runaway producing garbage that then
+     oversized the next call's prefill into
+     `GGML_ASSERT(n_tokens_all <= n_batch)`). FIX: mid-parse EOG
+     survives iff its own piece bytes COMPLETE the constraint
+     (`completes_with` on GrammarState/JsonState; cached path via
+     `cache.is_complete(sid)`). Qwen's `<|im_end|>`-as-raw-content
+     stays rejected (legal bytes, doesn't complete); Harmony
+     untouched (grammar complete before `<|return|>`/`<|call|>`).
+     Unit pin: `eog_kept_when_piece_completes_constraint`.
+  2. **Until-rule over a close marker with leading whitespace is a
+     trap.** Gemma's grammar thought-delimiter was the canonical
+     `"\n<channel|>"`; the model closed a thought as
+     `…text<channel|>` (no newline) and the until-region could then
+     NEVER exit — every later byte is legal thought content, so a
+     byte-perfect call, a stray close, a hallucinated tool-response
+     round, and rambling all "matched" until the budget died. The
+     parser was always lenient (scans `end.trim()`); the grammar now
+     keys on the SAME trimmed close. Non-canonical closes cost a
+     one-turn canonicalization repair (LCP), exactly like the parse
+     side. Pin: `gemma4_thought_close_without_newline_exits_grammar`.
+     Debugging note: the misleading signal was "model emits
+     grammar-illegal bytes" — replaying the emission through the
+     grammar FFI-free (advance_bytes per span) is what localized it.
+  3. **Mike's "make impossible" guard** (asked mid-session): run_call
+     now errors (`SessionError::GrammarViolation`, generalized
+     message) whenever generation ends with an EAGER constraint still
+     incomplete — even if tool_use blocks parsed. Deferred/Auto
+     exempt (never triggering is legal; activation tracking is a
+     possible follow-up), streaming permissive by documented
+     contract. This guard is what converted trap 2 from silent
+     garbage into a typed, diagnosable error on its first outing.
+     False-positive audit: the filter's post-complete reset (force-EOS
+     success path) can't clear `is_complete` before the check because
+     the session early-halts on completion, and eos-piece completions
+     halt via the stop-token check before another filter tick runs.
+  - Follow-up idea (Mike, deferred): when the grammar has exactly one
+    legal continuation, inject the canonical tokenization instead of
+    sampling — forced spans become immune to every sampler
+    interference class. Decode still required (KV), only sampling
+    skipped. Wouldn't have engaged for trap 1 (two legal paths).
 
 ## Problem
 
