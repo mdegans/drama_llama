@@ -354,24 +354,22 @@ pub trait Vision<D: Decoder>: Send {
     /// (a projector can in principle be audio-only).
     fn supports_images(&self) -> bool;
 
-    /// Tokenize interleaved text `segments` and `images` into text
-    /// and media chunks: `segments[0]`, then `images[0]`, then
-    /// `segments[1]`, … — the caller must pass
-    /// `segments.len() == images.len() + 1` (empty segments are
-    /// fine). Taking pre-split segments instead of marker-bearing
-    /// text makes the boundary injection-proof **by type**: no
-    /// content byte is ever interpreted as a media marker, because
-    /// there is no marker.
+    /// Tokenize ONE image into its chunk sequence: any wrapper text
+    /// chunks the model frames media with (`<|vision_start|>` …
+    /// `<|vision_end|>`) plus the media chunk itself, in order.
+    /// Placeholder-typed: an [`ImageInfo`] carries dims + identity
+    /// but no pixels, so counting/cache paths never pay preprocessing.
     ///
-    /// `add_special` prepends BOS-style tokens (first segment only);
-    /// `parse_special` tokenizes special tokens appearing verbatim in
-    /// segment text as such (chat-template output wants
-    /// `add_special = false`, `parse_special = true`).
-    fn tokenize(
+    /// This is deliberately image-only — prompt TEXT never crosses
+    /// this trait. The caller (`Session`) tokenizes text segments
+    /// through [`Model::tokenize`] / [`Model::tokenize_special`] and
+    /// interleaves; the vision backend sees nothing it could
+    /// misinterpret as a media marker, making marker injection
+    /// structurally impossible (content containing mtmd's literal
+    /// `<__media__>` is inert prose).
+    fn tokenize_image(
         &self,
-        segments: &[&str],
-        images: &[ImageInfo],
-        add_special: bool,
+        image: &ImageInfo,
         parse_special: bool,
     ) -> Result<Vec<MediaChunk>, Self::Error>;
 
@@ -402,11 +400,9 @@ impl<D: Decoder> Vision<D> for NoVision {
         match *self {}
     }
 
-    fn tokenize(
+    fn tokenize_image(
         &self,
-        _segments: &[&str],
-        _images: &[ImageInfo],
-        _add_special: bool,
+        _image: &ImageInfo,
         _parse_special: bool,
     ) -> Result<Vec<MediaChunk>, Self::Error> {
         match *self {}
@@ -505,6 +501,26 @@ pub trait Model: Send + Sync {
     /// special / control tokens when they appear verbatim in the
     /// input; otherwise they are treated as plain text.
     fn tokenize(&self, input: &str, special: bool) -> Vec<Token>;
+
+    /// [`Model::tokenize`] with explicit control of the tokenizer's
+    /// automatic leading specials (BOS on models whose vocab requests
+    /// it). Needed by callers assembling one token stream from
+    /// multiple text pieces — the media segment path — where only the
+    /// FIRST piece may carry the leading specials; `tokenize` would
+    /// re-add them to every piece on BOS-adding models.
+    ///
+    /// Default delegates to `tokenize` ignoring `add_special`,
+    /// correct for backends whose tokenizer never auto-prepends
+    /// (moeflux) — backends where it can (llama.cpp) must override.
+    fn tokenize_special(
+        &self,
+        input: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Vec<Token> {
+        let _ = add_special;
+        self.tokenize(input, parse_special)
+    }
 
     /// Convert a single token to its UTF-8 piece (may be empty).
     fn token_to_piece(&self, token: Token) -> String;
