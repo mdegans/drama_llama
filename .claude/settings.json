@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "env": {
+    "CUDACXX": "/usr/local/cuda/bin/nvcc",
+    "CUDA_PATH": "/usr/local/cuda"
+  }
+}
