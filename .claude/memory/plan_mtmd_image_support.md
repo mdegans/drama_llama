@@ -57,6 +57,19 @@ validation agent); decisions credited inline are Mike's.
 
 ## Phase A — llama-cpp-sys-3 `mtmd` feature (own session)
 
+**LANDED 2026-07-11** — PR mdegans/llama-cpp-sys#5, 3-OS CI green,
+published to crates.io as **0.8.1** (release job needed one retry:
+transient crates.io-wide 503 outage; index/downloads stayed up, only
+the Heroku app was down). Two notes beyond the plan below: (1) the
+`install` target depends on `all`, so the build is two cmake passes
+over one tree — tools OFF for `install`, then reconfigure with
+COMMON/TOOLS=ON and build only the `mtmd` target; (2) cmake verifies
+every configured tool's listed sources at generate time, so the crate
+ships `common/**`, `vendor/**`, and all non-server sibling tool dirs
+(`tools/mtmd` selectively: no test media / legacy python). Crate
+3.0→4.5MB. Phase B starts: bump dep to `0.8.1`, feature
+`mtmd = ["llama-cpp", "llama-cpp-sys-3/mtmd", ...]`.
+
 Repo: `~/Projects/llama-cpp-sys` (github.com/mdegans/llama-cpp-sys).
 PR from fork; CI (win/mac/linux, ~10m) must pass; merge to main deploys.
 
