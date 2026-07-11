@@ -655,6 +655,19 @@ impl Decoder for LlamaCppDecoder {
         // the sequence actually holding [0, pos) — removing an empty
         // range is a success to llama.cpp, but reporting it as a
         // lossless rewind would resume generation over missing KV.
+        //
+        // Position-density caveat (media, #31): the check assumes a
+        // cell exists at `pos - 1`. M-RoPE images break density —
+        // all ~n_tokens cells share the chunk's start position and
+        // positions (start, start + n_pos) are a gap — so a truncate
+        // to a boundary just past an M-RoPE image sees `pos_max ==
+        // image_start != pos - 1` and fails closed here even though
+        // the prefix is intact (validated by
+        // `mtmd::tests::mrope_kv_semantics_probe`). That is
+        // acceptable: Session boundaries land in text (breakpoints
+        // are message-granular and message-close text follows every
+        // image), and a false failure only costs the snapshot /
+        // full-reprefill fallback, never correctness.
         if LlamaCppDecoder::memory_seq_rm(self, seq_id, pos, -1)
             && LlamaCppDecoder::memory_seq_pos_max(self, seq_id) == pos - 1
         {

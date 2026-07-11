@@ -169,6 +169,55 @@ pub enum SessionError {
          ({piece:?}); reject as possible prompt injection"
     )]
     InjectedSpecialToken { token: Token, piece: String },
+    /// The prompt contains images but this session cannot consume
+    /// them — the `media` feature is off, the backend has no vision
+    /// support, no projector is loaded, or the loaded projector is
+    /// not an image projector. Never a silent drop.
+    #[error("prompt contains images but {reason}")]
+    MediaUnsupported { reason: String },
+    /// A media operation (image decode, tokenize, or encode) failed.
+    /// Wraps the underlying error as a string to keep `SessionError`
+    /// backend-agnostic; KV state was wiped where the failure could
+    /// have left partial image cells behind.
+    #[error("media: {0}")]
+    Media(String),
+    /// The real image encode produced a different KV extent than the
+    /// placeholder tokenization recorded in the cache entry. Every
+    /// later position would silently shift — the worst silent
+    /// corruption in the media design — so the call fails typed and
+    /// the KV cache is wiped.
+    #[error(
+        "media span mismatch for image {id}: placeholder recorded \
+         {expected:?} but encode produced {actual:?}; KV wiped"
+    )]
+    MediaSpanMismatch {
+        id: String,
+        expected: crate::backend::MediaSpan,
+        actual: crate::backend::MediaSpan,
+    },
+    /// The rendered prompt ends with a media chunk. The predictor
+    /// needs at least one trailing text token to resume from
+    /// (generation prompts normally guarantee this; a template that
+    /// doesn't append one after a trailing image surfaces here as a
+    /// typed error, never as the predictor's non-empty assert).
+    #[error(
+        "rendered prompt ends with media; a trailing text run (e.g. \
+         a generation prompt) is required"
+    )]
+    TrailingMedia,
+    /// The prompt's KV-cell footprint plus the requested generation
+    /// budget exceeds the context. Cell-space check: an M-RoPE image
+    /// can occupy ~1024 cells while advancing the position counter by
+    /// only ~32, so position-based checks undercount.
+    #[error(
+        "prompt needs {needed_cells} KV cells + {max_tokens} \
+         generation but n_ctx is {n_ctx}"
+    )]
+    ContextOverflow {
+        needed_cells: usize,
+        max_tokens: usize,
+        n_ctx: usize,
+    },
 }
 
 impl SessionError {
@@ -192,6 +241,15 @@ impl SessionError {
             // before any render / tokenize / decode touches the engine.
             // State is pristine — safe to reuse.
             Self::InjectedSpecialToken { .. } => true,
+            // Media capability / shape errors fire during prepare,
+            // before any decode. State untouched — safe to reuse.
+            Self::MediaUnsupported { .. }
+            | Self::TrailingMedia
+            | Self::ContextOverflow { .. } => true,
+            // Media eval failures wipe the KV + prefix cache on the
+            // way out (partial image cells must not survive), leaving
+            // the session internally consistent.
+            Self::Media(_) | Self::MediaSpanMismatch { .. } => true,
             // Backend prefill error (Phase 7's `SessionError::Decode`). Engine
             // state may be dirty — but Session's kv_setup_and_chunk_prefill on the
             // next call will memory_clear or restore_to a known-good snapshot,
@@ -224,6 +282,111 @@ impl SessionError {
 /// via [`Session::with_max_tokens`].
 const DEFAULT_MAX_TOKENS: usize = 1024;
 
+/// One unit of prefix-cache identity: a single text token, or one
+/// media item (image) identified by its content hash.
+///
+/// The two number spaces media forces apart, carried explicitly:
+///
+/// * **entry space** — indices into a `Vec<CacheEntry>`; what LCP
+///   walks, slicing, and breakpoint bookkeeping use.
+/// * **position space** — the engine's KV position counter; what
+///   `restore_to` / `checkpoint_pos` / `prefill` consume. A token
+///   advances it by 1, a media entry by `span.n_pos`.
+/// * **cell space** — actual KV cells consumed; what context-fit
+///   checks and usage accounting need. A token is 1 cell, a media
+///   entry `span.n_tokens` (an M-RoPE image: ~1024 cells over ~16-32
+///   positions, all sharing one tracked position — see the
+///   `mrope_kv_semantics_probe`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheEntry {
+    Token(Token),
+    Media {
+        /// RGB8 content hash of the image (see [`crate::Image::id`]).
+        id: [u8; 32],
+        span: crate::backend::MediaSpan,
+    },
+}
+
+impl CacheEntry {
+    /// KV positions this entry advances the cursor by.
+    fn n_pos(&self) -> usize {
+        match self {
+            Self::Token(_) => 1,
+            Self::Media { span, .. } => span.n_pos as usize,
+        }
+    }
+
+    /// KV cells this entry occupies.
+    fn n_cells(&self) -> usize {
+        match self {
+            Self::Token(_) => 1,
+            Self::Media { span, .. } => span.n_tokens as usize,
+        }
+    }
+
+    fn is_media(&self) -> bool {
+        matches!(self, Self::Media { .. })
+    }
+}
+
+/// An entry index and its engine position, computed together against
+/// ONE specific entry list — the carried pair that keeps entry space
+/// and position space from being conflated.
+///
+/// An entry index is only meaningful against the list it was computed
+/// from; translating it later against a *different* list is exactly
+/// the order-of-operations hazard this type exists to kill
+/// (`record_cache_hit` overwrites the stored entries before the
+/// `forget_pos` calls use the *old* tip). Construction sites compute
+/// `.pos` once via [`entry_pos_at`]; use sites read `.pos` for the
+/// engine and `.entry` for slicing/LCP — no "translate against which
+/// list?" question survives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct EntryPos {
+    entry: usize,
+    pos: usize,
+}
+
+/// The [`EntryPos`] of entry index `entry` within `entries` (position
+/// = sum of `n_pos` over everything before it).
+fn entry_pos_at(entries: &[CacheEntry], entry: usize) -> EntryPos {
+    EntryPos {
+        entry,
+        pos: entries[..entry].iter().map(CacheEntry::n_pos).sum(),
+    }
+}
+
+/// Total KV cells occupied by `entries`.
+fn entries_cell_len(entries: &[CacheEntry]) -> usize {
+    entries.iter().map(CacheEntry::n_cells).sum()
+}
+
+/// Wrap plain text tokens as entries.
+fn entries_from_tokens(
+    tokens: impl IntoIterator<Item = Token>,
+) -> Vec<CacheEntry> {
+    tokens.into_iter().map(CacheEntry::Token).collect()
+}
+
+/// Flatten a media-aware tokenization into entries.
+fn entries_from_chunks(
+    chunks: Vec<crate::backend::MediaChunk>,
+) -> Vec<CacheEntry> {
+    use crate::backend::MediaChunk;
+    let mut out = Vec::new();
+    for chunk in chunks {
+        match chunk {
+            MediaChunk::Text(tokens) => {
+                out.extend(tokens.into_iter().map(CacheEntry::Token))
+            }
+            MediaChunk::Media { id, span } => {
+                out.push(CacheEntry::Media { id, span })
+            }
+        }
+    }
+    out
+}
+
 /// Per-session prefix-cache state.
 ///
 /// Tracks the previous call's prompt **plus generated content** tokens, the
@@ -236,7 +399,7 @@ const DEFAULT_MAX_TOKENS: usize = 1024;
 /// [`Session::with_prefix_cache`] / [`Session::clear_prefix_cache`] /
 /// [`Session::last_usage`].
 struct PrefixCache {
-    /// Previous call's prompt tokens with the generated assistant content
+    /// Previous call's prompt entries with the generated assistant content
     /// appended. Includes the assistant content because that content is in
     /// the engine's KV cache (see the predictor-stop coupling note at
     /// [`Self::internal_tip`]) and we want the next call's
@@ -247,13 +410,14 @@ struct PrefixCache {
     /// fires before [`crate::predictor::CandidatePredictor::next`] would
     /// have called `decoder.step` on the EOS, so the EOS lands in the
     /// predictor's `tokens` vec but never in KV. We mirror that: our
-    /// `prev_tokens` matches what the engine's KV cache actually holds.
-    prev_tokens: Vec<Token>,
-    /// Token indices in `prev_tokens` where `cache_control` breakpoints landed.
-    /// Sorted ascending.
-    prev_breakpoints: Vec<usize>,
-    /// Tokens reused in the last call. `0` = full re-prefill.
-    last_reused_tokens: usize,
+    /// `prev_entries` matches what the engine's KV cache actually holds.
+    prev_entries: Vec<CacheEntry>,
+    /// Entry/position pairs in `prev_entries` where `cache_control`
+    /// breakpoints landed, computed against `prev_entries` at creation.
+    /// Sorted ascending by entry.
+    prev_breakpoints: Vec<EntryPos>,
+    /// KV cells reused in the last call. `0` = full re-prefill.
+    last_reused_cells: usize,
     /// Internal post-generation tip — set by `record_cache_hit` after a
     /// successful completion when prefix caching is on. Consulted by
     /// [`compute_l_hit`] as one more eligible breakpoint candidate
@@ -261,21 +425,21 @@ struct PrefixCache {
     /// it never gets serialized into `cache_control` markers and never
     /// counts against the Anthropic 4-slot budget.
     ///
-    /// Placed at `prev_tokens.len() - 1` (one back from the KV head, for
-    /// `compute_l_hit`'s `lcp-1` BPE-safety margin) so the next call's
-    /// LCP — which extends exactly to `prev_tokens.len()` when its
-    /// tokenization adds one more token (typically the chat template's
+    /// Placed one entry back from the KV head (for [`compute_l_hit`]'s
+    /// `lcp-1` BPE-safety margin) so the next call's LCP — which
+    /// extends exactly to `prev_entries.len()` when its tokenization
+    /// adds one more token (typically the chat template's
     /// assistant-close marker) — leaves the tip eligible.
     ///
     /// **Predictor-stop coupling:** this design hinges on the
     /// `TokenPredictor` stop-sequence check (`predictor.rs:608`) firing
     /// before `decoder.step` commits the previously-recorded EOS. If a
     /// future predictor refactor commits every recorded token before
-    /// the next stop check, `prev_tokens` (which we set to the engine's
+    /// the next stop check, `prev_entries` (which we set to the engine's
     /// KV state, EOS-free) will desync from `inner.tokens` and silently
     /// corrupt the next call's restore. Update both ends together if
     /// you change predictor stop semantics.
-    internal_tip: Option<usize>,
+    internal_tip: Option<EntryPos>,
     /// SHA-256 of the canonical chat-template render (i.e. the
     /// `partial_text`) at each breakpoint, parallel to
     /// [`Self::prev_breakpoints`] (same indexing). Used by
@@ -300,9 +464,9 @@ impl PrefixCache {
     /// Fresh, empty cache.
     fn new() -> Self {
         Self {
-            prev_tokens: Vec::new(),
+            prev_entries: Vec::new(),
             prev_breakpoints: Vec::new(),
-            last_reused_tokens: 0,
+            last_reused_cells: 0,
             internal_tip: None,
             prev_breakpoint_hashes: Vec::new(),
             prev_tip_hash: None,
@@ -311,17 +475,20 @@ impl PrefixCache {
 
     /// Zero every field. Called from [`Session::clear_prefix_cache`].
     fn clear(&mut self) {
-        self.prev_tokens.clear();
+        self.prev_entries.clear();
         self.prev_breakpoints.clear();
-        self.last_reused_tokens = 0;
+        self.last_reused_cells = 0;
         self.internal_tip = None;
         self.prev_breakpoint_hashes.clear();
         self.prev_tip_hash = None;
     }
 }
 
-/// Length of the longest prefix shared between `a` and `b`, in tokens.
-fn longest_common_prefix_len(a: &[Token], b: &[Token]) -> usize {
+/// Length of the longest prefix shared between `a` and `b`, in
+/// entries. Media entries compare by content hash and span — a
+/// swapped image with identical surrounding text stops the walk at
+/// the media entry.
+fn longest_common_prefix_len(a: &[CacheEntry], b: &[CacheEntry]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
@@ -399,56 +566,208 @@ fn find_injected_special_in_prompt(
     None
 }
 
-/// SHA-256 of the canonical chat-template render at a single
-/// breakpoint. Caller passes a `partial_text` from
-/// [`crate::chat_template::RenderedWithBreakpoints`].
+/// Per-call random media sentinel: 32 hex chars (128 bits), never
+/// surfaced anywhere, so no content — chosen before the call, by
+/// construction — can contain it. Sourced from `RandomState`'s
+/// OS-seeded keys plus the clock; NUL-free and ASCII by construction.
+#[cfg(feature = "media")]
+fn generate_media_sentinel() -> String {
+    use std::fmt::Write;
+    use std::hash::{BuildHasher, Hasher};
+    let mut out = String::with_capacity(32);
+    for salt in 0..2u64 {
+        let mut hasher =
+            std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(salt);
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        write!(out, "{:016x}", hasher.finish())
+            .expect("writing to String cannot fail");
+    }
+    out
+}
+
+/// THE `Block::Image` → [`crate::backend::Image`] funnel (plan #31
+/// item 10): every decode in `Session` goes through this one function
+/// so the future decode memo (keyed by source hash, bounded LRU) is a
+/// one-site change. v1 body is the bare conversion — per-turn
+/// re-decode accepted for now. Cache identity stays the RGB8 hash the
+/// conversion computes; a memo here may only ever skip the decode,
+/// never change identity.
+#[cfg(feature = "media")]
+fn decode_image(
+    api: &misanthropic::prompt::message::Image,
+) -> Result<crate::backend::Image, SessionError> {
+    crate::backend::Image::try_from(api)
+        .map_err(|e| SessionError::Media(format!("image decode: {e}")))
+}
+
+/// Everything one call needs to route images: the per-call sentinel,
+/// decoded pixels by RGB8 id, and the source-hash aliases that map
+/// sentinel occurrences back to those pixels. Imageless prompts get
+/// the empty context (sentinel `None`).
+#[derive(Default)]
+struct MediaContext {
+    sentinel: Option<String>,
+    media_by_id: std::collections::HashMap<[u8; 32], crate::backend::Image>,
+    source_to_id: std::collections::HashMap<[u8; 32], [u8; 32]>,
+}
+
+/// Collect and decode every image block in `prompt` (system,
+/// messages, nested tool-result content) through the [`decode_image`]
+/// funnel, building the call's [`MediaContext`].
+#[cfg(feature = "media")]
+fn collect_media(prompt: &Prompt) -> Result<MediaContext, SessionError> {
+    use misanthropic::prompt::message::Block;
+
+    fn walk<'a>(block: &'a Block, out: &mut Vec<&'a misanthropic::prompt::message::Image>) {
+        match block {
+            Block::Image { image, .. } => out.push(image),
+            Block::ToolResult { result } => {
+                for b in &result.content.0 {
+                    walk(b, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut api_images = Vec::new();
+    for b in prompt.system.iter().flat_map(|c| c.0.iter()) {
+        walk(b, &mut api_images);
+    }
+    for b in prompt.messages.iter().flat_map(|m| m.content.0.iter()) {
+        walk(b, &mut api_images);
+    }
+    if api_images.is_empty() {
+        return Ok(MediaContext::default());
+    }
+
+    let mut ctx = MediaContext {
+        sentinel: Some(generate_media_sentinel()),
+        ..MediaContext::default()
+    };
+    for api in api_images {
+        let source = crate::chat_template::image_source_hash(api);
+        if ctx.source_to_id.contains_key(&source) {
+            continue; // duplicate block, already decoded
+        }
+        let image = decode_image(api)?;
+        ctx.source_to_id.insert(source, *image.id());
+        ctx.media_by_id.entry(*image.id()).or_insert(image);
+    }
+    Ok(ctx)
+}
+
+/// Best-effort media-aware structural hash of a canonical render:
+/// split on the call sentinel (if any), map each source hash to its
+/// RGB8 id, and hash via [`hash_segments`]. Returns `None` when the
+/// split fails or a source hash is unknown — callers treat that as
+/// "skip this cache key" (LCP fallback), never as a value to store.
+fn hash_render_best_effort(
+    text: &str,
+    sentinel: Option<&str>,
+    source_to_id: &std::collections::HashMap<[u8; 32], [u8; 32]>,
+) -> Option<[u8; 32]> {
+    let Some(sentinel) = sentinel else {
+        return Some(hash_partial_text(text));
+    };
+    let split =
+        crate::chat_template::split_media_render(text, sentinel).ok()?;
+    let ids = split
+        .source_hashes
+        .iter()
+        .map(|s| source_to_id.get(s).copied())
+        .collect::<Option<Vec<_>>>()?;
+    Some(hash_segments(&split.segments, &ids))
+}
+
+/// SHA-256 of one canonical render, computed over its media SPLIT
+/// STRUCTURE: length-prefixed text segments interleaved with image
+/// content hashes, in render order. An imageless render is the
+/// degenerate case (one segment, no ids).
 ///
 /// Used as the cache key for hash-keyed prefix-reuse on `PrefixCache`:
 /// two calls whose source data agrees up to a given breakpoint produce
-/// identical `partial_text`s (the chat-template render is deterministic
-/// given source and excludes `cache_control` metadata), so the same
-/// hash. The `prev_tokens` stored against this hash come from the
-/// model's original emission and may not be a bytewise-identical
-/// tokenization of the same `partial_text` — a single-token BPE drift
-/// at the JSON-whitespace boundary is acceptable; cogito's permissive
+/// identical splits (the chat-template render is deterministic given
+/// source and excludes `cache_control` metadata — and the random
+/// media sentinel never enters the hash, only the segment bytes
+/// between markers do), so the same hash. Hashing the structure
+/// instead of a marker-canonicalized flat string is load-bearing:
+/// content can contain any placeholder-shaped bytes it likes, but it
+/// cannot forge a split boundary, because boundaries come from the
+/// out-of-band sentinel. Image ids are mixed at every media position,
+/// so image A's KV can never hash-hit for image B (and the id is the
+/// RGB8 pixel hash — re-encodings of the same pixels rightly hit).
+///
+/// The stored entries against this hash come from the model's
+/// original emission and may not be a bytewise-identical tokenization
+/// of the same partial — a single-token BPE drift at the
+/// JSON-whitespace boundary is acceptable; cogito's permissive
 /// grammar means the model is whitespace-tolerant and the existing
 /// `lcp-1` safety margin in [`compute_l_hit`] handles it.
-fn hash_partial_text(text: &str) -> [u8; 32] {
+fn hash_segments(segments: &[&str], ids: &[[u8; 32]]) -> [u8; 32] {
     use sha2::Digest;
+    debug_assert_eq!(segments.len(), ids.len() + 1);
     let mut hasher = sha2::Sha256::new();
-    hasher.update(text.as_bytes());
+    for (i, segment) in segments.iter().enumerate() {
+        hasher.update((segment.len() as u64).to_le_bytes());
+        hasher.update(segment.as_bytes());
+        if let Some(id) = ids.get(i) {
+            hasher.update(id);
+        }
+    }
     hasher.finalize().into()
 }
 
-/// Hash-keyed L_hit lookup. Returns the largest cached token position
+/// [`hash_segments`] for an imageless render.
+fn hash_partial_text(text: &str) -> [u8; 32] {
+    hash_segments(&[text], &[])
+}
+
+/// Hash-keyed L_hit lookup. Returns the largest cached [`EntryPos`]
 /// (over breakpoint hashes paired with `prev_breakpoints`, plus the
 /// auto-tip hash paired with `internal_tip`) whose stored hash also
-/// appears in `new_breakpoint_hashes`. Returns 0 when no hash matches.
+/// appears in `new_breakpoint_hashes`. Returns the zero position when
+/// no hash matches.
 ///
-/// `cap` bounds the result — typically `new_tokens.len()` — so we
-/// never claim to reuse more tokens than the new request has.
+/// `cap` bounds the result in entry space — typically the new entry
+/// count — so we never claim to reuse more than the new request has.
+///
+/// The returned pair was computed against the PREVIOUS entry list,
+/// but a hash match implies the canonical renders (and mixed image
+/// ids) agree over that prefix, so the prefix entries — and therefore
+/// both coordinates — are identical in the new list. Same equality
+/// argument the token-space version relied on, now covering media.
 ///
 /// Pure function; lifted out of `kv_setup_and_chunk_prefill` so its
-/// "longest match wins, capped at new_tokens.len()" contract is
-/// directly testable without an engine.
+/// "longest match wins, capped" contract is directly testable
+/// without an engine.
 fn hash_keyed_l_hit(
-    prev_breakpoints: &[usize],
+    prev_breakpoints: &[EntryPos],
     prev_breakpoint_hashes: &[[u8; 32]],
-    internal_tip: Option<usize>,
+    internal_tip: Option<EntryPos>,
     prev_tip_hash: Option<[u8; 32]>,
     new_breakpoint_hashes: &[[u8; 32]],
     cap: usize,
-) -> usize {
+) -> EntryPos {
     let new_set: std::collections::HashSet<&[u8; 32]> =
         new_breakpoint_hashes.iter().collect();
-    let mut picked: usize = 0;
-    for (pos, h) in prev_breakpoints.iter().zip(prev_breakpoint_hashes.iter()) {
-        if *pos <= cap && *pos > picked && new_set.contains(h) {
-            picked = *pos;
+    let mut picked = EntryPos::default();
+    for (ep, h) in prev_breakpoints.iter().zip(prev_breakpoint_hashes.iter()) {
+        if ep.entry <= cap && ep.entry > picked.entry && new_set.contains(h) {
+            picked = *ep;
         }
     }
     if let (Some(tip), Some(tip_h)) = (internal_tip, prev_tip_hash.as_ref()) {
-        if tip <= cap && tip > picked && new_set.contains(tip_h) {
+        if tip.entry <= cap
+            && tip.entry > picked.entry
+            && new_set.contains(tip_h)
+        {
             picked = tip;
         }
     }
@@ -457,14 +776,16 @@ fn hash_keyed_l_hit(
 
 /// Cache-reuse length for a call.
 ///
-/// Given the previously-cached `prev_tokens`, the newly-rendered `new_tokens`,
-/// the new call's breakpoint token indices (sorted ascending), and an optional
-/// `internal_tip` from the prior generation's post-content position, compute
-/// `L_hit`: the largest position that is
+/// Given the previously-cached `prev_entries`, the newly-rendered
+/// `new_entries`, the new call's breakpoints (sorted ascending by
+/// entry), and an optional `internal_tip` from the prior generation's
+/// post-content position, compute `L_hit`: the largest [`EntryPos`]
+/// whose entry index is
 ///
-/// 1. less than or equal to the common-prefix length of the two token streams,
-///    with one token of BPE-boundary safety (to avoid reusing a position whose
-///    successor might tokenize differently); and
+/// 1. less than or equal to the common-prefix length of the two entry
+///    streams, with one entry of BPE-boundary safety (to avoid
+///    reusing a position whose successor might tokenize differently);
+///    and
 /// 2. strictly greater than zero (we only reuse at breakpoints).
 ///
 /// Both `new_breakpoints` and `internal_tip` are eligible candidates. The
@@ -472,27 +793,39 @@ fn hash_keyed_l_hit(
 /// independent of user-facing `cache_control` markers, so it doesn't count
 /// against the Anthropic 4-slot budget. See [`PrefixCache::internal_tip`].
 ///
-/// Returns `0` when no candidate is eligible — the caller should treat that as
-/// a full re-prefill. Pure function, tested directly.
+/// The tip was computed against `prev_entries`; within the common
+/// prefix the two lists are identical entry-for-entry, so its `.pos`
+/// is valid against `new_entries` too (the eligibility check
+/// guarantees the winner sits inside the prefix).
+///
+/// Returns the zero position when no candidate is eligible — the
+/// caller should treat that as a full re-prefill. Pure function,
+/// tested directly.
 fn compute_l_hit(
-    prev_tokens: &[Token],
-    new_tokens: &[Token],
-    new_breakpoints: &[usize],
-    internal_tip: Option<usize>,
-) -> usize {
-    let lcp = longest_common_prefix_len(prev_tokens, new_tokens);
-    // BPE-boundary safety: back off by one token so a breakpoint falling
+    prev_entries: &[CacheEntry],
+    new_entries: &[CacheEntry],
+    new_breakpoints: &[EntryPos],
+    internal_tip: Option<EntryPos>,
+) -> EntryPos {
+    let lcp = longest_common_prefix_len(prev_entries, new_entries);
+    // BPE-boundary safety: back off by one entry so a breakpoint falling
     // exactly at the prefix end can't reuse a position whose successor might
     // re-tokenize differently once more context is added.
     let safe = if lcp == 0 { 0 } else { lcp - 1 };
     let user_best = new_breakpoints
         .iter()
         .rev()
-        .find(|&&bp| bp <= safe && bp > 0)
+        .find(|bp| bp.entry <= safe && bp.entry > 0)
         .copied()
-        .unwrap_or(0);
-    let tip_best = internal_tip.filter(|&t| t <= safe && t > 0).unwrap_or(0);
-    user_best.max(tip_best)
+        .unwrap_or_default();
+    let tip_best = internal_tip
+        .filter(|t| t.entry <= safe && t.entry > 0)
+        .unwrap_or_default();
+    if user_best.entry >= tip_best.entry {
+        user_best
+    } else {
+        tip_best
+    }
 }
 
 /// One generated-position entry in a [`Session::top_k_trace`] dump.
@@ -1251,6 +1584,29 @@ impl<B: Backend> Session<B> {
             .expect("min of two NonZero values is NonZero")
     }
 
+    /// Up-front context-fit check in CELL space (plan #31 item 6):
+    /// Σ `n_cells` over the prompt's entries plus the generation
+    /// budget must fit `n_ctx`. The predictor's own guard reasons in
+    /// positions, which undercounts M-RoPE images (~1024 cells over
+    /// ~16-32 positions) — without this check such a prompt would
+    /// exhaust KV slots mid-decode instead of failing typed up front.
+    fn check_context_fit(
+        &mut self,
+        entries: &[CacheEntry],
+        max_tokens: usize,
+    ) -> Result<(), SessionError> {
+        let needed_cells = entries_cell_len(entries);
+        let n_ctx = self.engine.n_ctx() as usize;
+        if needed_cells + max_tokens > n_ctx {
+            return Err(SessionError::ContextOverflow {
+                needed_cells,
+                max_tokens,
+                n_ctx,
+            });
+        }
+        Ok(())
+    }
+
     /// Enable (or disable) prefix-cache reuse across `complete_*`
     /// calls.
     ///
@@ -1385,6 +1741,12 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    /// Diagnostic-path prepare (used by [`Self::top_k_trace`]): no
+    /// media support — its consumers drive the raw candidate
+    /// predictor, which cannot decode images. Rendering without a
+    /// media sentinel makes an image-bearing prompt fail typed
+    /// ([`ChatTemplateError::MediaUnsupported`]) instead of feeding
+    /// the model sentinel bytes as prose.
     fn prepare_call(
         &mut self,
         prompt: &Prompt,
@@ -1462,12 +1824,134 @@ impl<B: Backend> Session<B> {
         Ok((tokens, modes, deferred))
     }
 
+    /// Build the call's [`MediaContext`]: collect + decode the
+    /// prompt's images (through the [`decode_image`] funnel) and
+    /// verify this session can actually consume them. Imageless
+    /// prompts get the empty context for free; prompts with images
+    /// on a session that cannot take them get a typed
+    /// [`SessionError::MediaUnsupported`] — never a silent drop.
+    fn prepare_media(
+        &self,
+        prompt: &Prompt,
+    ) -> Result<MediaContext, SessionError> {
+        #[cfg(feature = "media")]
+        {
+            let ctx = collect_media(prompt)?;
+            if ctx.sentinel.is_some() {
+                use crate::backend::Vision as _;
+                match self.engine.vision() {
+                    None => {
+                        return Err(SessionError::MediaUnsupported {
+                            reason: "no vision projector is loaded \
+                                     (llama.cpp: place a \
+                                     <model>.mmproj.gguf sidecar next to \
+                                     the model, or call load_mmproj)"
+                                .into(),
+                        })
+                    }
+                    Some(v) if !v.supports_images() => {
+                        return Err(SessionError::MediaUnsupported {
+                            reason: "the loaded projector does not \
+                                     support image input"
+                                .into(),
+                        })
+                    }
+                    Some(_) => {}
+                }
+            }
+            Ok(ctx)
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            if crate::chat_template::prompt_has_images(prompt) {
+                return Err(SessionError::MediaUnsupported {
+                    reason: "the `media` feature is disabled".into(),
+                });
+            }
+            Ok(MediaContext::default())
+        }
+    }
+
+    /// Media-aware tokenization of one render (full or partial):
+    /// split on the call sentinel, tokenize text segments + image
+    /// placeholders through the backend's [`Vision`], and hash the
+    /// split structure. Imageless renders — and sentinel-free
+    /// partials that end before the prompt's first image — take the
+    /// plain tokenizer path (identical output; mtmd tokenizes
+    /// marker-free text with the same tokenizer).
+    ///
+    /// Returns `(entries, image RGB8 ids in render order, hash)`.
+    ///
+    /// [`Vision`]: crate::backend::Vision
+    fn tokenize_split(
+        &self,
+        text: &str,
+        media: &MediaContext,
+    ) -> Result<(Vec<CacheEntry>, Vec<[u8; 32]>, [u8; 32]), SessionError>
+    {
+        use crate::backend::Vision as _;
+        let plain = |text: &str| {
+            let tokens = self.engine.model.tokenize(text, true);
+            (entries_from_tokens(tokens), Vec::new(), hash_partial_text(text))
+        };
+        let Some(sentinel) = media.sentinel.as_deref() else {
+            return Ok(plain(text));
+        };
+        let split = crate::chat_template::split_media_render(text, sentinel)
+            .map_err(|at| {
+                SessionError::Media(format!(
+                    "mangled media marker at byte {at} of the render — \
+                     the template corrupted a sentinel"
+                ))
+            })?;
+        if split.source_hashes.is_empty() {
+            return Ok(plain(text));
+        }
+        let ids = split
+            .source_hashes
+            .iter()
+            .map(|src| {
+                media.source_to_id.get(src).copied().ok_or_else(|| {
+                    SessionError::Media(
+                        "render marker references an image the prompt \
+                         walk never saw"
+                            .into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<[u8; 32]>, _>>()?;
+        let infos = ids
+            .iter()
+            .map(|id| {
+                media.media_by_id.get(id).map(|img| img.info()).ok_or_else(
+                    || {
+                        SessionError::Media(
+                            "media context is missing decoded pixels \
+                             for an image id"
+                                .into(),
+                        )
+                    },
+                )
+            })
+            .collect::<Result<Vec<crate::backend::ImageInfo>, _>>()?;
+        let vision = self.engine.vision().ok_or_else(|| {
+            SessionError::MediaUnsupported {
+                reason: "no vision projector is loaded".into(),
+            }
+        })?;
+        let chunks = vision
+            .tokenize(&split.segments, &infos, false, true)
+            .map_err(|e| SessionError::Media(format!("media tokenize: {e}")))?;
+        let hash = hash_segments(&split.segments, &ids);
+        Ok((entries_from_chunks(chunks), ids, hash))
+    }
+
     /// Cache-aware superset of [`Self::prepare_call`]: renders the
     /// prompt **with** cache breakpoints, tokenizes both the full
-    /// render and each partial via
-    /// [`tokenize_with_breakpoints`](crate::chat_template::tokenize_with_breakpoints),
-    /// and returns the full token stream, the breakpoint token
-    /// indices (sorted ascending), and the sampling-mode chain.
+    /// render and each partial media-aware via
+    /// [`Self::tokenize_split`],
+    /// and returns the full entry stream, the breakpoint entry
+    /// positions (sorted ascending), and the sampling-mode chain.
     ///
     /// When the caller has not enabled prefix caching
     /// ([`Self::with_prefix_cache(false)`](Self::with_prefix_cache)),
@@ -1481,49 +1965,61 @@ impl<B: Backend> Session<B> {
         include_user_sampling: bool,
     ) -> Result<PreparedCall, SessionError> {
         self.check_no_special_injection(prompt)?;
-        let (rendered_prompt, tokens, breakpoints, partial_hashes) = if self
+        let media = self.prepare_media(prompt)?;
+        let opts = match media.sentinel.as_deref() {
+            Some(sentinel) => {
+                self.render_opts.clone().with_media_sentinel(sentinel)
+            }
+            None => self.render_opts.clone(),
+        };
+        let (rendered_prompt, entries, breakpoints, partial_hashes) = if self
             .prefix_cache
             .is_some()
         {
-            let rendered = self
-                .template
-                .render_with_breakpoints(prompt, &self.render_opts)?;
+            let rendered =
+                self.template.render_with_breakpoints(prompt, &opts)?;
             // Inlines `tokenize_with_breakpoints` so we can keep
             // the SHA-256 of each surviving partial paired with
-            // its token index. The shared helper only returns
+            // its entry position. The shared helper only returns
             // indices and applies sort+dedup, which would lose
-            // the partial→hash mapping.
-            let full_tokens = self.engine.model.tokenize(&rendered.text, true);
-            let mut pairs: Vec<(usize, [u8; 32])> =
+            // the partial→hash mapping (and knows nothing of media).
+            let (full_entries, full_ids, _) =
+                self.tokenize_split(&rendered.text, &media)?;
+            let mut pairs: Vec<(EntryPos, [u8; 32])> =
                 Vec::with_capacity(rendered.partial_texts.len());
             for partial in &rendered.partial_texts {
-                let partial_tokens = self.engine.model.tokenize(partial, true);
+                let (p_entries, p_ids, p_hash) =
+                    self.tokenize_split(partial, &media)?;
                 // Same fail-open contract as
-                // `chat_template::tokenize_with_breakpoints`:
-                // drop the breakpoint silently if the partial
-                // doesn't form a prefix of the full render.
-                if partial_tokens.len() <= full_tokens.len()
-                    && full_tokens[..partial_tokens.len()] == partial_tokens[..]
+                // `chat_template::tokenize_with_breakpoints`,
+                // generalized: drop the breakpoint silently unless
+                // the partial is an entry-wise prefix of the full
+                // render AND its images are the full render's first
+                // k (media entries compare by id + span, so a
+                // reordered or swapped image also fails the check).
+                if p_entries.len() <= full_entries.len()
+                    && full_entries[..p_entries.len()] == p_entries[..]
+                    && p_ids.len() <= full_ids.len()
+                    && full_ids[..p_ids.len()] == p_ids[..]
                 {
                     pairs.push((
-                        partial_tokens.len(),
-                        hash_partial_text(partial),
+                        entry_pos_at(&full_entries, p_entries.len()),
+                        p_hash,
                     ));
                 }
             }
-            pairs.sort_by_key(|(idx, _)| *idx);
-            pairs.dedup_by_key(|(idx, _)| *idx);
-            let breakpoints: Vec<usize> =
-                pairs.iter().map(|(idx, _)| *idx).collect();
+            pairs.sort_by_key(|(ep, _)| ep.entry);
+            pairs.dedup_by_key(|(ep, _)| ep.entry);
+            let breakpoints: Vec<EntryPos> =
+                pairs.iter().map(|(ep, _)| *ep).collect();
             let hashes: Vec<[u8; 32]> =
                 pairs.into_iter().map(|(_, h)| h).collect();
-            (rendered.text, full_tokens, breakpoints, hashes)
+            (rendered.text, full_entries, breakpoints, hashes)
         } else {
             // Fast path: single render + tokenize, no partials.
-            let rendered =
-                self.template.render_with(prompt, &self.render_opts)?;
-            let tokens = self.engine.model.tokenize(&rendered, true);
-            (rendered, tokens, Vec::new(), Vec::new())
+            let rendered = self.template.render_with(prompt, &opts)?;
+            let (entries, _, _) = self.tokenize_split(&rendered, &media)?;
+            (rendered, entries, Vec::new(), Vec::new())
         };
         let pre_opened_reasoning =
             render_ends_with_open_reasoning(&rendered_prompt, &self.dialect);
@@ -1551,13 +2047,16 @@ impl<B: Backend> Session<B> {
             grammar_mode.into_iter().collect()
         };
         Ok(PreparedCall {
-            tokens,
+            entries,
             breakpoints,
             modes,
             deferred_grammar,
             partial_hashes,
             pre_opened_reasoning,
             rendered_prompt,
+            media_by_id: media.media_by_id,
+            source_to_id: media.source_to_id,
+            media_sentinel: media.sentinel,
         })
     }
 
@@ -1578,34 +2077,55 @@ impl<B: Backend> Session<B> {
     /// `memory_clear` + re-prefill from position 0.
     ///
     /// Returns:
-    /// * `suffix` — the tokens past the last breakpoint, to be
-    ///   passed to `predict_pieces_resuming` along with `prefill_start`.
-    /// * `cache_read` — number of input tokens served from the
-    ///   restored snapshot (zero when full miss / fallback).
-    /// * `prefill_start` — position from which the predictor's
-    ///   prefill resumes; equals the last breakpoint at which we
-    ///   already prefilled + checkpointed within this call (or
-    ///   `cache_read` when no breakpoints lie between `cache_read`
-    ///   and the un-breakpointed tail).
+    /// * `suffix` — the trailing all-text tokens, to be passed to
+    ///   `predict_pieces_resuming` along with `prefill_start`. Media
+    ///   can never appear here: everything up to the last media
+    ///   entry (and the last breakpoint) is prefilled by the walk in
+    ///   this function, so the non-resuming predictor constructor —
+    ///   which `memory_clear`s and cannot decode media — is
+    ///   structurally unreachable for media prompts.
+    /// * `cache_read` — KV cells served from the restored snapshot
+    ///   (zero when full miss / fallback).
+    /// * `prefill_start` — engine position from which the
+    ///   predictor's prefill resumes.
     ///
-    /// **Empty-suffix guard.** If `compute_l_hit` returns
-    /// `new_tokens.len()` (a perfect-prefix match), `cache_read` is
-    /// backed off to the next-smaller breakpoint so the predictor
-    /// always sees at least one token. Breakpoints that land at
-    /// exactly `new_tokens.len()` are excluded from the chunked
-    /// prefill for the same reason — we only checkpoint at
-    /// breakpoints strictly inside the prompt body.
+    /// **Empty-suffix guard.** If `compute_l_hit` covers every entry
+    /// (a perfect-prefix match), `cache_read` is backed off to the
+    /// next-smaller breakpoint so the predictor always sees at least
+    /// one token. Breakpoints at exactly the entry count are excluded
+    /// from the chunked prefill for the same reason.
+    ///
+    /// **Trailing-media guard.** An entry list ending in media has no
+    /// text for the predictor to resume from —
+    /// [`SessionError::TrailingMedia`], typed, never the predictor's
+    /// non-empty assert.
     ///
     /// This function touches the KV cache but nothing else on `self`
-    /// beyond the engine.
+    /// beyond the engine — except on media eval failures, where it
+    /// wipes KV + prefix cache (`record_cache_miss_on_error`) so
+    /// partial image cells can never survive into a later call.
     fn kv_setup_and_chunk_prefill(
         &mut self,
-        new_tokens: &[Token],
-        new_breakpoints: &[usize],
+        new_entries: &[CacheEntry],
+        new_breakpoints: &[EntryPos],
         new_breakpoint_hashes: &[[u8; 32]],
+        media_by_id: &std::collections::HashMap<
+            [u8; 32],
+            crate::backend::Image,
+        >,
     ) -> Result<(Vec<Token>, usize, usize), SessionError> {
+        // The suffix handed to the predictor must be non-empty text.
+        let trailing_start = new_entries
+            .iter()
+            .rposition(CacheEntry::is_media)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if trailing_start == new_entries.len() {
+            return Err(SessionError::TrailingMedia);
+        }
+
         let l_hit_raw = match self.prefix_cache.as_ref() {
-            Some(cache) if !cache.prev_tokens.is_empty() => {
+            Some(cache) if !cache.prev_entries.is_empty() => {
                 // Hash-keyed fast path: if any cached breakpoint or
                 // the auto-tip hash matches a hash from the new
                 // request's partial renders, jump straight to the
@@ -1621,14 +2141,15 @@ impl<B: Backend> Session<B> {
                     cache.internal_tip,
                     cache.prev_tip_hash,
                     new_breakpoint_hashes,
-                    new_tokens.len(),
+                    new_entries.len(),
                 );
-                if hash_picked > 0 {
+                if hash_picked.entry > 0 {
                     #[cfg(feature = "axum")]
                     tracing::debug!(
-                        hash_picked,
-                        prev_len = cache.prev_tokens.len(),
-                        new_len = new_tokens.len(),
+                        hash_picked_entry = hash_picked.entry,
+                        hash_picked_pos = hash_picked.pos,
+                        prev_len = cache.prev_entries.len(),
+                        new_len = new_entries.len(),
                         "hash-keyed prefix-reuse: cached position matched by SHA-256 of partial render",
                     );
                     // Use the hash-matched position directly. Skip the
@@ -1640,8 +2161,8 @@ impl<B: Backend> Session<B> {
                     hash_picked
                 } else {
                     let picked = compute_l_hit(
-                        &cache.prev_tokens,
-                        new_tokens,
+                        &cache.prev_entries,
+                        new_entries,
                         new_breakpoints,
                         cache.internal_tip,
                     );
@@ -1657,29 +2178,25 @@ impl<B: Backend> Session<B> {
                     #[cfg(feature = "axum")]
                     if let Some(tip) = cache.internal_tip {
                         let lcp = longest_common_prefix_len(
-                            &cache.prev_tokens,
-                            new_tokens,
+                            &cache.prev_entries,
+                            new_entries,
                         );
                         let safe = lcp.saturating_sub(1);
-                        if tip > safe && tip > picked {
-                            let prev_len = cache.prev_tokens.len();
-                            let new_len = new_tokens.len();
-                            let prev_at_lcp = cache
-                                .prev_tokens
-                                .get(lcp)
-                                .copied()
-                                .unwrap_or(-1);
-                            let new_at_lcp =
-                                new_tokens.get(lcp).copied().unwrap_or(-1);
+                        if tip.entry > safe && tip.entry > picked.entry {
+                            let prev_len = cache.prev_entries.len();
+                            let new_len = new_entries.len();
+                            let prev_at_lcp =
+                                cache.prev_entries.get(lcp).copied();
+                            let new_at_lcp = new_entries.get(lcp).copied();
                             tracing::debug!(
-                            tip,
+                            tip_entry = tip.entry,
                             lcp,
                             safe,
-                            picked,
+                            picked_entry = picked.entry,
                             prev_len,
                             new_len,
-                            prev_at_lcp,
-                            new_at_lcp,
+                            prev_at_lcp = ?prev_at_lcp,
+                            new_at_lcp = ?new_at_lcp,
                             "auto-tip ineligible: tip past safe (LCP shorter than expected — \
                              likely re-tokenization mismatch in asst content)",
                         );
@@ -1688,38 +2205,39 @@ impl<B: Backend> Session<B> {
                     picked
                 }
             }
-            _ => 0,
+            _ => EntryPos::default(),
         };
 
         // Empty-suffix guard: if the cache covers the entire new
         // prompt, the predictor would receive an empty token slice
         // (panic on construction). Back off to the next-smaller
         // breakpoint so at least one token survives for the predictor.
-        let cache_read = if l_hit_raw == new_tokens.len() {
+        let cache_read = if l_hit_raw.entry == new_entries.len() {
             new_breakpoints
                 .iter()
                 .rev()
-                .find(|&&bp| bp < l_hit_raw && bp > 0)
+                .find(|bp| bp.entry < l_hit_raw.entry && bp.entry > 0)
                 .copied()
-                .unwrap_or(0)
+                .unwrap_or_default()
         } else {
             l_hit_raw
         };
 
         // Restore (or full-clear on no-cache / fallback path).
         let mut effective_cache_read = cache_read;
-        if cache_read > 0 {
-            match self.engine.restore_to(0, cache_read as i32) {
+        if cache_read.entry > 0 {
+            match self.engine.restore_to(0, cache_read.pos as i32) {
                 Ok(()) => {}
                 Err(_e) => {
                     #[cfg(feature = "axum")]
                     tracing::debug!(
-                        cache_read,
+                        cache_read_entry = cache_read.entry,
+                        cache_read_pos = cache_read.pos,
                         error = %_e,
                         "checkpoint missing; falling back to full reprefill",
                     );
                     self.engine.memory_clear();
-                    effective_cache_read = 0;
+                    effective_cache_read = EntryPos::default();
                 }
             }
         } else {
@@ -1739,33 +2257,40 @@ impl<B: Backend> Session<B> {
         // anchor — the most valuable cross-agent prefix — because
         // the orphans are newer than it. Explicit eviction here
         // protects the anchor.
-        if effective_cache_read > 0 {
+        if effective_cache_read.entry > 0 {
             if let Some(cache) = self.prefix_cache.as_ref() {
+                // Engine snapshots are keyed by POSITION, so orphan
+                // comparison happens in position space: an old
+                // breakpoint's `.pos` (computed against the old entry
+                // list at its creation) names the same engine
+                // snapshot slot as any new breakpoint with equal
+                // `.pos`.
                 let new_bp_set: std::collections::HashSet<usize> =
-                    new_breakpoints.iter().copied().collect();
-                let tip = cache.internal_tip;
+                    new_breakpoints.iter().map(|bp| bp.pos).collect();
+                let tip_pos = cache.internal_tip.map(|t| t.pos);
                 let orphans: Vec<usize> = cache
                     .prev_breakpoints
                     .iter()
-                    .copied()
-                    .filter(|&old_bp| {
-                        old_bp > 0
-                            && old_bp <= effective_cache_read
-                            && !new_bp_set.contains(&old_bp)
-                            && Some(old_bp) != tip
+                    .map(|bp| bp.pos)
+                    .filter(|&old_pos| {
+                        old_pos > 0
+                            && old_pos <= effective_cache_read.pos
+                            && !new_bp_set.contains(&old_pos)
+                            && Some(old_pos) != tip_pos
                     })
                     .collect();
-                for old_bp in orphans {
-                    if let Err(_e) = self.engine.forget_pos(0, old_bp as i32) {
+                for old_pos in orphans {
+                    if let Err(_e) = self.engine.forget_pos(0, old_pos as i32)
+                    {
                         // Best-effort orphan reclamation — failure here
                         // means the backend didn't have a snapshot at
-                        // `old_bp` (already evicted by LRU, never
+                        // `old_pos` (already evicted by LRU, never
                         // checkpointed, etc.). Not a correctness bug;
                         // logged at debug so spikes show up in tracing.
                         #[cfg(feature = "axum")]
                         tracing::debug!(
                             target: "drama_llama::session",
-                            pos = old_bp,
+                            pos = old_pos,
                             error = %_e,
                             "forget_pos failed on orphaned breakpoint \
                              snapshot; ignoring",
@@ -1775,30 +2300,138 @@ impl<B: Backend> Session<B> {
             }
         }
 
-        // Chunked prefill at every breakpoint strictly between
-        // `effective_cache_read` and `new_tokens.len()`. Each chunk
-        // gets a checkpoint so the next turn can rewind to that
-        // boundary lossless.
-        let mut prefill_start = effective_cache_read;
-        for &bp in new_breakpoints
+        // ONE walk over [effective_cache_read, suffix_start): text
+        // runs through the ordinary prefill, media entries through
+        // the vision eval loop, a lossless checkpoint at every
+        // breakpoint boundary passed. The suffix — everything from
+        // the last in-prompt breakpoint or the last media entry,
+        // whichever is later — stays text-only and goes to the
+        // resuming predictor.
+        let last_bp_entry = new_breakpoints
             .iter()
-            .filter(|&&bp| bp > effective_cache_read && bp < new_tokens.len())
-        {
-            if bp > prefill_start {
-                self.engine
-                    .prefill_chunk(
-                        &new_tokens[prefill_start..bp],
-                        prefill_start,
-                        0,
-                    )
-                    .map_err(|e| SessionError::Decode(format!("{e}")))?;
-                self.engine.checkpoint_pos(0, bp as i32);
+            .filter(|bp| {
+                bp.entry > effective_cache_read.entry
+                    && bp.entry < new_entries.len()
+            })
+            .map(|bp| bp.entry)
+            .max()
+            .unwrap_or(effective_cache_read.entry);
+        let suffix_start = last_bp_entry.max(trailing_start);
+
+        let checkpoint_at: std::collections::BTreeMap<usize, usize> =
+            new_breakpoints
+                .iter()
+                .filter(|bp| {
+                    bp.entry > effective_cache_read.entry
+                        && bp.entry <= suffix_start
+                })
+                .map(|bp| (bp.entry, bp.pos))
+                .collect();
+
+        // suffix_start >= effective_cache_read.entry by construction
+        // (last_bp_entry defaults to it; trailing_start below it means
+        // the media is inside the reused prefix).
+        let suffix_start = suffix_start.max(effective_cache_read.entry);
+        let mut i = effective_cache_read.entry;
+        let mut pos = effective_cache_read.pos;
+        while i < suffix_start {
+            match new_entries[i] {
+                CacheEntry::Token(_) => {
+                    // Gather the text run: up to the next media
+                    // entry, checkpoint boundary, or the suffix.
+                    let mut end = i;
+                    while end < suffix_start
+                        && !new_entries[end].is_media()
+                        && !(end > i && checkpoint_at.contains_key(&end))
+                    {
+                        end += 1;
+                    }
+                    let run: Vec<Token> = new_entries[i..end]
+                        .iter()
+                        .map(|e| match e {
+                            CacheEntry::Token(t) => *t,
+                            CacheEntry::Media { .. } => unreachable!(),
+                        })
+                        .collect();
+                    self.engine
+                        .prefill_chunk(&run, pos, 0)
+                        .map_err(|e| SessionError::Decode(format!("{e}")))?;
+                    pos += run.len();
+                    i = end;
+                }
+                CacheEntry::Media { id, span } => {
+                    let Some(image) = media_by_id.get(&id) else {
+                        self.record_cache_miss_on_error();
+                        return Err(SessionError::Media(
+                            "prompt entry references an image with no \
+                             decoded pixels in this call's media context"
+                                .into(),
+                        ));
+                    };
+                    let result = {
+                        use crate::backend::Vision as _;
+                        let (vision, decoder) =
+                            self.engine.vision_and_decoder();
+                        match vision {
+                            Some(v) => v
+                                .prefill_image(decoder, image, pos, 0)
+                                .map_err(|e| format!("image prefill: {e}")),
+                            None => Err("vision projector unloaded \
+                                         mid-call"
+                                .to_string()),
+                        }
+                    };
+                    let real = match result {
+                        Ok(real) => real,
+                        Err(msg) => {
+                            // Partial image cells must not survive.
+                            self.record_cache_miss_on_error();
+                            return Err(SessionError::Media(msg));
+                        }
+                    };
+                    // Placeholder-vs-real span assert (plan 5a): if
+                    // the encode's extent differs from what the
+                    // placeholder tokenization recorded, every later
+                    // position silently shifts — the worst silent
+                    // corruption in the design, one `if` to prevent.
+                    if real != span {
+                        self.record_cache_miss_on_error();
+                        return Err(SessionError::MediaSpanMismatch {
+                            id: id
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect(),
+                            expected: span,
+                            actual: real,
+                        });
+                    }
+                    pos += span.n_pos as usize;
+                    i += 1;
+                }
             }
-            prefill_start = bp;
+            if let Some(&bp_pos) = checkpoint_at.get(&i) {
+                debug_assert_eq!(
+                    pos, bp_pos,
+                    "walk position disagrees with breakpoint EntryPos",
+                );
+                self.engine.checkpoint_pos(0, bp_pos as i32);
+            }
         }
 
-        let suffix = new_tokens[prefill_start..].to_vec();
-        Ok((suffix, effective_cache_read, prefill_start))
+        let suffix: Vec<Token> = new_entries[suffix_start..]
+            .iter()
+            .map(|e| match e {
+                CacheEntry::Token(t) => *t,
+                // Unreachable: suffix_start >= trailing_start, and
+                // trailing_start is one past the last media entry.
+                CacheEntry::Media { .. } => {
+                    unreachable!("media entry in predictor suffix")
+                }
+            })
+            .collect();
+        let cache_read_cells =
+            entries_cell_len(&new_entries[..effective_cache_read.entry]);
+        Ok((suffix, cache_read_cells, pos))
     }
 
     /// Build a [`Usage`] for one `complete_*` call. `Option` fields
@@ -1836,16 +2469,24 @@ impl<B: Backend> Session<B> {
     /// Errors propagate from `ChatTemplate::render_with`; callers
     /// should treat the render as best-effort and fall back to no tip
     /// hash on error.
+    /// `media_sentinel` must be the SAME per-call sentinel the
+    /// original render used — otherwise the byte-prefix comparison
+    /// against `rendered_prompt` can never match on media prompts.
     fn render_extended(
         &self,
         prompt: &Prompt,
         blocks: &[crate::Block],
+        media_sentinel: Option<&str>,
     ) -> Result<String, SessionError> {
         let mut extended = prompt.clone();
         let asst: misanthropic::prompt::message::AssistantMessage =
             blocks.iter().cloned().collect();
         extended.messages.push(asst.into());
-        let opts = self.render_opts.clone().with_generation_prompt(false);
+        let mut opts =
+            self.render_opts.clone().with_generation_prompt(false);
+        if let Some(sentinel) = media_sentinel {
+            opts = opts.with_media_sentinel(sentinel);
+        }
         Ok(self.template.render_with(&extended, &opts)?)
     }
 
@@ -1869,35 +2510,45 @@ impl<B: Backend> Session<B> {
     /// No-op when caching is off.
     fn record_cache_hit(
         &mut self,
-        new_tokens: Vec<Token>,
-        new_breakpoints: Vec<usize>,
-        l_hit: usize,
-        internal_tip: Option<usize>,
+        new_entries: Vec<CacheEntry>,
+        new_breakpoints: Vec<EntryPos>,
+        reused_cells: usize,
+        internal_tip: Option<EntryPos>,
         new_breakpoint_hashes: Vec<[u8; 32]>,
         tip_hash: Option<[u8; 32]>,
     ) {
         // Capture the old tip BEFORE overwriting — needed for the
         // explicit-eviction fast path so the engine can free the prior
-        // snapshot. The "not in new_breakpoints" guard preserves any
-        // tip position that happens to coincide with a current user
-        // breakpoint (rare, but possible — chunked-prefill snapshots
-        // share the same engine.checkpoint_pos slot, so freeing one
-        // would lose the other).
-        let old_tip = self.prefix_cache.as_ref().and_then(|c| c.internal_tip);
+        // snapshot. Its `.pos` was computed against the OLD entry list
+        // at creation (the carried-pair discipline), so using it after
+        // `prev_entries` is overwritten below stays correct — this is
+        // exactly the order-of-operations hazard a translate-on-use
+        // helper would have. The "not in new_breakpoints" guard
+        // preserves any tip position that happens to coincide with a
+        // current user breakpoint (rare, but possible — chunked-prefill
+        // snapshots share the same engine.checkpoint_pos slot, so
+        // freeing one would lose the other). Position space throughout:
+        // engine snapshots are keyed by position.
+        let old_tip =
+            self.prefix_cache.as_ref().and_then(|c| c.internal_tip);
         if let Some(cache) = self.prefix_cache.as_mut() {
-            cache.prev_tokens = new_tokens;
+            cache.prev_entries = new_entries;
             cache.prev_breakpoints = new_breakpoints;
-            cache.last_reused_tokens = l_hit;
+            cache.last_reused_cells = reused_cells;
             cache.internal_tip = internal_tip;
             cache.prev_breakpoint_hashes = new_breakpoint_hashes;
             cache.prev_tip_hash = tip_hash;
         }
-        if let (Some(old), Some(new)) = (old_tip, internal_tip) {
+        if let (Some(old), Some(new)) =
+            (old_tip.map(|t| t.pos), internal_tip.map(|t| t.pos))
+        {
             if old != new
                 && !self
                     .prefix_cache
                     .as_ref()
-                    .map(|c| c.prev_breakpoints.contains(&old))
+                    .map(|c| {
+                        c.prev_breakpoints.iter().any(|bp| bp.pos == old)
+                    })
                     .unwrap_or(false)
             {
                 if let Err(_e) = self.engine.forget_pos(0, old as i32) {
@@ -1910,13 +2561,13 @@ impl<B: Backend> Session<B> {
                     );
                 }
             }
-        } else if let Some(old) = old_tip {
+        } else if let Some(old) = old_tip.map(|t| t.pos) {
             // New tip is None (e.g., streaming path that skips the
             // tip extension). Free the stale tip snapshot.
             if !self
                 .prefix_cache
                 .as_ref()
-                .map(|c| c.prev_breakpoints.contains(&old))
+                .map(|c| c.prev_breakpoints.iter().any(|bp| bp.pos == old))
                 .unwrap_or(false)
             {
                 if let Err(_e) = self.engine.forget_pos(0, old as i32) {
@@ -1989,20 +2640,26 @@ impl<B: Backend> Session<B> {
         prompt: &Prompt,
     ) -> Result<String, SessionError> {
         let PreparedCall {
-            tokens,
+            entries,
             breakpoints,
             modes,
             deferred_grammar,
             partial_hashes,
+            media_by_id,
             ..
         } = self.prepare_call_cached(prompt, true)?;
-        let prompt_tokens = tokens.len();
+        let prompt_tokens = entries_cell_len(&entries);
+        self.check_context_fit(
+            &entries,
+            self.effective_max_tokens(prompt).get(),
+        )?;
 
         let (suffix, cache_read, prefill_start) = self
             .kv_setup_and_chunk_prefill(
-                &tokens,
+                &entries,
                 &breakpoints,
                 &partial_hashes,
+                &media_by_id,
             )?;
 
         let mut predict_opts =
@@ -2065,8 +2722,7 @@ impl<B: Backend> Session<B> {
         // qualifies under the `lcp-1` BPE-safety check.
         let (extended_prev, internal_tip, head_for_checkpoint) = self
             .compute_tip_extension(
-                tokens,
-                prompt_tokens,
+                entries,
                 generated_tokens,
                 // `complete_text` is the raw-bytes debugging view — no
                 // parsed blocks, so no canonical re-render to derive the
@@ -2137,48 +2793,65 @@ impl<B: Backend> Session<B> {
     ///   the tip — fall back to the existing breakpoint-only path.
     ///
     /// - **Cache off / empty engine.** Return prompt as-is, no tip.
+    ///
+    /// All arithmetic here is POSITION space vs position space: the
+    /// prompt's position length comes from its entries (an M-RoPE
+    /// image advances positions by `n_pos`, not by its cell count),
+    /// and the generated region past the prompt is plain text where
+    /// entries, positions, and cells coincide. The returned tip is a
+    /// carried [`EntryPos`] computed against the returned entry list.
     fn compute_tip_extension(
         &mut self,
-        prompt_tokens: Vec<Token>,
-        prompt_len: usize,
+        prompt_entries: Vec<CacheEntry>,
         generated_tokens: Vec<Token>,
         canonical_close: Option<Vec<Token>>,
-    ) -> (Vec<Token>, Option<usize>, Option<usize>) {
+    ) -> (Vec<CacheEntry>, Option<EntryPos>, Option<usize>) {
         if self.prefix_cache.is_none() {
-            return (prompt_tokens, None, None);
+            return (prompt_entries, None, None);
         }
         let kv_max = self.engine.memory_seq_pos_max(0);
         if kv_max < 0 {
-            return (prompt_tokens, None, None);
+            return (prompt_entries, None, None);
         }
-        let kv_len = (kv_max as usize) + 1;
-        let kv_generated_count = kv_len.saturating_sub(prompt_len);
+        let kv_pos_len = (kv_max as usize) + 1;
+        let prompt_entry_len = prompt_entries.len();
+        let prompt_pos_len: usize =
+            prompt_entries.iter().map(CacheEntry::n_pos).sum();
+        let kv_generated_count = kv_pos_len.saturating_sub(prompt_pos_len);
 
-        let mut extended = prompt_tokens;
-        extended.extend_from_slice(&generated_tokens);
+        let mut extended = prompt_entries;
+        extended.extend(generated_tokens.iter().copied().map(CacheEntry::Token));
 
         // Stop-sequence case: generated_tokens has one extra token
         // (the recorded-but-uncommitted close marker). Tip and
-        // checkpoint both at kv_len. The "extra" token is what makes
-        // the next call's LCP exceed kv_len so the tip qualifies.
-        if generated_tokens.len() == kv_generated_count + 1 && kv_len >= 1 {
+        // checkpoint both at the KV head. The "extra" token is what
+        // makes the next call's LCP exceed the tip entry so it
+        // qualifies.
+        if generated_tokens.len() == kv_generated_count + 1 && kv_pos_len >= 1
+        {
             if let Some(close) = canonical_close {
                 if !close.is_empty() {
                     // Replace the sampled stop token with the close
                     // token(s) the canonical re-render actually
                     // contains (see doc above).
-                    extended.truncate(prompt_len + kv_generated_count);
-                    extended.extend_from_slice(&close);
+                    extended.truncate(prompt_entry_len + kv_generated_count);
+                    extended.extend(
+                        close.iter().copied().map(CacheEntry::Token),
+                    );
                 }
             }
-            return (extended, Some(kv_len), Some(kv_len));
+            let tip = EntryPos {
+                entry: prompt_entry_len + kv_generated_count,
+                pos: kv_pos_len,
+            };
+            return (extended, Some(tip), Some(kv_pos_len));
         }
         // Max-tokens / grammar-complete case: every token committed,
         // no spare. No tip extension possible — fall through to the
-        // breakpoint-only path. Truncate extended to KV length so it
-        // matches engine state exactly (avoids any future LCP walk
+        // breakpoint-only path. Truncate extended to the KV extent so
+        // it matches engine state exactly (avoids any future LCP walk
         // running off the end of KV).
-        extended.truncate(kv_len);
+        extended.truncate(prompt_entry_len + kv_generated_count);
         (extended, None, None)
     }
 
@@ -2231,21 +2904,27 @@ impl<B: Backend> Session<B> {
         prompt: &Prompt,
     ) -> Result<BlockStream<'s, B>, SessionError> {
         let PreparedCall {
-            tokens,
+            entries,
             breakpoints,
             modes,
             deferred_grammar,
             partial_hashes,
             pre_opened_reasoning,
+            media_by_id,
             ..
         } = self.prepare_call_cached(prompt, true)?;
-        let prompt_tokens = tokens.len();
+        let prompt_tokens = entries_cell_len(&entries);
+        self.check_context_fit(
+            &entries,
+            self.effective_max_tokens(prompt).get(),
+        )?;
 
         let (suffix, cache_read, prefill_start) = self
             .kv_setup_and_chunk_prefill(
-                &tokens,
+                &entries,
                 &breakpoints,
                 &partial_hashes,
+                &media_by_id,
             )?;
 
         // Streaming: the cache must be updated BEFORE the predictor
@@ -2266,7 +2945,7 @@ impl<B: Backend> Session<B> {
         // (see comment above). Pass `None` for tip_hash; breakpoint
         // hash side-table still covers explicit cache_control markers.
         self.record_cache_hit(
-            tokens,
+            entries,
             breakpoints,
             cache_read,
             None,
@@ -2356,21 +3035,29 @@ impl<B: Backend> Session<B> {
         );
 
         let PreparedCall {
-            tokens,
+            entries,
             breakpoints,
             modes,
             deferred_grammar,
             partial_hashes,
             pre_opened_reasoning,
             rendered_prompt,
+            media_by_id,
+            source_to_id,
+            media_sentinel,
         } = self.prepare_call_cached(prompt, true)?;
-        let prompt_tokens = tokens.len();
+        let prompt_tokens = entries_cell_len(&entries);
+        self.check_context_fit(
+            &entries,
+            self.effective_max_tokens(prompt).get(),
+        )?;
 
         let (suffix, cache_read, prefill_start) = self
             .kv_setup_and_chunk_prefill(
-                &tokens,
+                &entries,
                 &breakpoints,
                 &partial_hashes,
+                &media_by_id,
             )?;
 
         // Pieces we drop from the surfaced output: the primary EOS,
@@ -2564,7 +3251,11 @@ impl<B: Backend> Session<B> {
         // when the template rewrites the stop on re-ingest.
         let blocks_owned: Vec<crate::Block> = blocks.to_vec();
         let mut canonical_close: Option<Vec<Token>> = None;
-        let tip_hash = match self.render_extended(prompt, &blocks_owned) {
+        let tip_hash = match self.render_extended(
+            prompt,
+            &blocks_owned,
+            media_sentinel.as_deref(),
+        ) {
             Ok(extended_render) => {
                 let close_bytes = extended_render
                     .strip_prefix(rendered_prompt.as_str())
@@ -2583,7 +3274,17 @@ impl<B: Backend> Session<B> {
                                 .collect(),
                         );
                     }
-                    Some(hash_partial_text(&extended_render))
+                    // Media-aware structural hash — hashing raw bytes
+                    // would bake the per-call random sentinel into
+                    // the key and never match across calls. Best
+                    // effort: a failed split or unknown source hash
+                    // skips the tip entry (LCP fallback), it never
+                    // stores a wrong key.
+                    hash_render_best_effort(
+                        &extended_render,
+                        media_sentinel.as_deref(),
+                        &source_to_id,
+                    )
                 } else {
                     #[cfg(feature = "axum")]
                     tracing::debug!(
@@ -2611,8 +3312,7 @@ impl<B: Backend> Session<B> {
         // stop-condition handling.
         let (extended_prev, internal_tip, head_for_checkpoint) = self
             .compute_tip_extension(
-                tokens,
-                prompt_tokens,
+                entries,
                 generated_tokens,
                 canonical_close,
             );
@@ -3214,11 +3914,13 @@ fn render_ends_with_open_reasoning(
 /// metadata, the effective sampling chain, and the render-derived
 /// facts the parse / canonicalization stages need afterwards.
 struct PreparedCall {
-    /// Full prompt token ids (`parse_special = true`).
-    tokens: Vec<Token>,
-    /// Cache-breakpoint token indices, sorted ascending. Empty when
-    /// prefix caching is off.
-    breakpoints: Vec<usize>,
+    /// Full prompt entries (`parse_special = true` for text; media
+    /// entries from the vision tokenizer's placeholder pass).
+    entries: Vec<CacheEntry>,
+    /// Cache-breakpoint entry/position pairs, sorted ascending by
+    /// entry, computed against `entries`. Empty when prefix caching
+    /// is off.
+    breakpoints: Vec<EntryPos>,
     /// Effective sampling chain: grammar (if any) prepended to the
     /// user's modes.
     modes: Vec<SamplingMode>,
@@ -3233,8 +3935,21 @@ struct PreparedCall {
     /// mid-thought, and the parser must be told (issue #27).
     pre_opened_reasoning: bool,
     /// The full rendered generation prompt — the byte prefix the
-    /// canonicalization check compares re-renders against.
+    /// canonicalization check compares re-renders against. Contains
+    /// this call's media sentinels when images are present.
     rendered_prompt: String,
+    /// Decoded pixels for every media entry, keyed by RGB8 content
+    /// hash ([`crate::Image::id`] — the same id `CacheEntry::Media`
+    /// carries). Empty for imageless prompts.
+    media_by_id: std::collections::HashMap<[u8; 32], crate::backend::Image>,
+    /// Source-hash → RGB8-id aliases for this prompt's image blocks
+    /// (see [`crate::chat_template::image_source_hash`]) — what maps
+    /// a sentinel occurrence in a render back to its cache identity.
+    source_to_id: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    /// This call's random media sentinel, kept so `render_extended`
+    /// re-renders byte-identically for the canonicalization check.
+    /// `None` for imageless prompts.
+    media_sentinel: Option<String>,
 }
 
 /// Everything [`Session::run_call`] produces about one batch call —
@@ -3477,35 +4192,106 @@ mod tests {
     // Pure-Rust helper tests — no model, no KV, no #[ignore].
     // -----------------------------------------------------------------
 
+    /// Test shorthand: wrap tokens as all-token entries.
+    fn toks(ts: impl IntoIterator<Item = Token>) -> Vec<CacheEntry> {
+        entries_from_tokens(ts)
+    }
+
+    /// Test shorthand: an [`EntryPos`] in an all-token list, where
+    /// entry index and position coincide.
+    fn ep(entry: usize) -> EntryPos {
+        EntryPos { entry, pos: entry }
+    }
+
+    /// Test shorthand: a media entry with a distinguishing id byte
+    /// and an M-RoPE-shaped span (many cells, few positions).
+    fn media(id_byte: u8) -> CacheEntry {
+        CacheEntry::Media {
+            id: [id_byte; 32],
+            span: crate::backend::MediaSpan {
+                n_tokens: 256,
+                n_pos: 16,
+            },
+        }
+    }
+
     /// `longest_common_prefix_len` covers the edge shapes we rely on:
     /// empty inputs, identical inputs, one-token-different,
     /// one-shorter, and totally-disjoint. Token ids are arbitrary
     /// `i32`s — the function doesn't care about the vocab.
     #[test]
     fn test_longest_common_prefix_len() {
-        assert_eq!(longest_common_prefix_len(&[], &[]), 0);
-        assert_eq!(longest_common_prefix_len(&[1, 2, 3], &[]), 0);
-        assert_eq!(longest_common_prefix_len(&[], &[1, 2, 3]), 0);
+        assert_eq!(longest_common_prefix_len(&toks([]), &toks([])), 0);
+        assert_eq!(longest_common_prefix_len(&toks([1, 2, 3]), &toks([])), 0);
+        assert_eq!(longest_common_prefix_len(&toks([]), &toks([1, 2, 3])), 0);
         assert_eq!(
-            longest_common_prefix_len(&[1, 2, 3], &[1, 2, 3]),
+            longest_common_prefix_len(&toks([1, 2, 3]), &toks([1, 2, 3])),
             3,
             "identical",
         );
         assert_eq!(
-            longest_common_prefix_len(&[1, 2, 3, 4], &[1, 2, 3, 9]),
+            longest_common_prefix_len(
+                &toks([1, 2, 3, 4]),
+                &toks([1, 2, 3, 9])
+            ),
             3,
             "one-different",
         );
         assert_eq!(
-            longest_common_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]),
+            longest_common_prefix_len(
+                &toks([1, 2, 3]),
+                &toks([1, 2, 3, 4, 5])
+            ),
             3,
             "one-shorter",
         );
         assert_eq!(
-            longest_common_prefix_len(&[1, 2, 3], &[9, 8, 7]),
+            longest_common_prefix_len(&toks([1, 2, 3]), &toks([9, 8, 7])),
             0,
             "disjoint",
         );
+    }
+
+    /// Media entries participate in the LCP walk by content hash and
+    /// span: identical images extend the prefix, a swapped image (same
+    /// surrounding text) stops it at the media entry.
+    #[test]
+    fn test_lcp_media_entries() {
+        let a = vec![CacheEntry::Token(1), media(7), CacheEntry::Token(2)];
+        let same = vec![CacheEntry::Token(1), media(7), CacheEntry::Token(2)];
+        let swapped =
+            vec![CacheEntry::Token(1), media(9), CacheEntry::Token(2)];
+        assert_eq!(longest_common_prefix_len(&a, &same), 3);
+        assert_eq!(
+            longest_common_prefix_len(&a, &swapped),
+            1,
+            "swapped image stops the walk at the media entry"
+        );
+    }
+
+    /// [`entry_pos_at`] sums `n_pos` (not cells): a media entry with
+    /// 256 cells over 16 positions advances the boundary position by
+    /// 16. [`entries_cell_len`] sums cells.
+    #[test]
+    fn test_entry_pos_and_cell_accounting() {
+        let entries = vec![
+            CacheEntry::Token(1),
+            CacheEntry::Token(2),
+            media(7),
+            CacheEntry::Token(3),
+        ];
+        assert_eq!(entry_pos_at(&entries, 0), EntryPos { entry: 0, pos: 0 });
+        assert_eq!(entry_pos_at(&entries, 2), EntryPos { entry: 2, pos: 2 });
+        assert_eq!(
+            entry_pos_at(&entries, 3),
+            EntryPos { entry: 3, pos: 18 },
+            "media advances positions by n_pos"
+        );
+        assert_eq!(
+            entry_pos_at(&entries, 4),
+            EntryPos { entry: 4, pos: 19 }
+        );
+        assert_eq!(entries_cell_len(&entries), 259, "cells count n_tokens");
     }
 
     /// `block_free_text` pulls text + thought bodies, recurses into
@@ -3598,10 +4384,10 @@ mod tests {
     /// → `L_hit == 0`, even when the common prefix is long.
     #[test]
     fn test_l_hit_computation_no_breakpoints() {
-        let prev: Vec<Token> = (0..20).collect();
-        let new_: Vec<Token> = (0..10).chain(100..110).collect();
+        let prev = toks(0..20);
+        let new_ = toks((0..10).chain(100..110));
         assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
-        assert_eq!(compute_l_hit(&prev, &new_, &[], None), 0);
+        assert_eq!(compute_l_hit(&prev, &new_, &[], None), ep(0));
     }
 
     /// With breakpoints at [5, 8, 12] and a common prefix of 10, the
@@ -3609,11 +4395,31 @@ mod tests {
     /// `8`, so `L_hit == 8`.
     #[test]
     fn test_l_hit_computation_with_breakpoint() {
-        let prev: Vec<Token> = (0..20).collect();
-        let new_: Vec<Token> = (0..10).chain(100..110).collect();
-        let breakpoints = vec![5, 8, 12];
+        let prev = toks(0..20);
+        let new_ = toks((0..10).chain(100..110));
+        let breakpoints = vec![ep(5), ep(8), ep(12)];
         assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), 8);
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), ep(8));
+    }
+
+    /// Eligibility is decided in ENTRY space while the winner carries
+    /// its own position: with a media entry (n_pos = 16) inside the
+    /// prefix, a breakpoint two entries past it has pos ≠ entry, and
+    /// `compute_l_hit` returns that carried pair untranslated.
+    #[test]
+    fn test_l_hit_media_position_carried() {
+        // [tok, media, tok, tok, tok, tok] — breakpoint after entry 3
+        // sits at position 1 (tok) + 16 (media) + 2 (toks) = 19.
+        let mut prev = vec![CacheEntry::Token(1), media(7)];
+        prev.extend(toks(10..14));
+        let new_ = prev.clone();
+        let bp = entry_pos_at(&new_, 4);
+        assert_eq!(bp, EntryPos { entry: 4, pos: 19 });
+        assert_eq!(
+            compute_l_hit(&prev, &new_[..5], &[bp], None),
+            bp,
+            "winner is the carried pair, not a re-derived position"
+        );
     }
 
     /// Common prefix of 5 with a breakpoint exactly at 5: BPE-safe cap
@@ -3622,31 +4428,31 @@ mod tests {
     /// resuming exactly at the prefix end is unsafe.
     #[test]
     fn test_l_hit_computation_bpe_backoff() {
-        let prev: Vec<Token> = (0..10).collect();
-        let new_: Vec<Token> = (0..5).chain(200..205).chain(300..305).collect();
-        let breakpoints = vec![5];
+        let prev = toks(0..10);
+        let new_ = toks((0..5).chain(200..205).chain(300..305));
+        let breakpoints = vec![ep(5)];
         assert_eq!(longest_common_prefix_len(&prev, &new_), 5);
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), 0);
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), ep(0));
     }
 
     /// When the common prefix is zero, `L_hit` must also be zero,
     /// regardless of breakpoint placement.
     #[test]
     fn test_l_hit_zero_common_prefix() {
-        let prev = vec![10, 20, 30];
-        let new_ = vec![40, 50, 60];
-        let breakpoints = vec![1, 2, 3];
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), 0);
+        let prev = toks([10, 20, 30]);
+        let new_ = toks([40, 50, 60]);
+        let breakpoints = vec![ep(1), ep(2), ep(3)];
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), ep(0));
     }
 
     /// Empty previous tokens — first call against a cold cache —
     /// always lands at `L_hit == 0`.
     #[test]
     fn test_l_hit_empty_prev() {
-        let prev: Vec<Token> = Vec::new();
-        let new_: Vec<Token> = vec![1, 2, 3, 4, 5];
-        let breakpoints = vec![1, 3];
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), 0);
+        let prev = toks([]);
+        let new_ = toks([1, 2, 3, 4, 5]);
+        let breakpoints = vec![ep(1), ep(3)];
+        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), ep(0));
     }
 
     /// Internal tip eligible: tip at `lcp - 1` (the BPE-safe boundary)
@@ -3654,14 +4460,14 @@ mod tests {
     /// This is the common-case "always-append" hit.
     #[test]
     fn test_l_hit_internal_tip_eligible() {
-        // prev_tokens = prompt(0..5) + asst_content(5..8). The next call
+        // prev_entries = prompt(0..5) + asst_content(5..8). The next call
         // appends the chat template's assistant-close marker (here `99`)
         // and a fresh user message. LCP = 8 (matches through asst_content),
-        // safe = 7. Tip placed at 7 (= prev_tokens.len() - 1) is eligible.
-        let prev: Vec<Token> = (0..8).collect();
-        let new_: Vec<Token> = (0..8).chain([99, 50, 51, 52]).collect();
+        // safe = 7. Tip placed at 7 (= prev_entries.len() - 1) is eligible.
+        let prev = toks(0..8);
+        let new_ = toks((0..8).chain([99, 50, 51, 52]));
         assert_eq!(longest_common_prefix_len(&prev, &new_), 8);
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(7)), 7);
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(7))), ep(7));
     }
 
     /// Internal tip blocked by a short LCP: tip at 7 but LCP is only
@@ -3669,51 +4475,54 @@ mod tests {
     /// Failure-mode safety net — strictly never worse than today.
     #[test]
     fn test_l_hit_internal_tip_blocked_by_lcp() {
-        let prev: Vec<Token> = (0..8).collect();
-        let new_: Vec<Token> = vec![0, 1, 2, 99, 99, 99, 99, 99];
+        let prev = toks(0..8);
+        let new_ = toks([0, 1, 2, 99, 99, 99, 99, 99]);
         assert_eq!(longest_common_prefix_len(&prev, &new_), 3);
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(7)), 0);
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(7))), ep(0));
     }
 
     /// Tip and a larger user breakpoint both eligible → user breakpoint
     /// wins (we always pick the largest eligible position).
     #[test]
     fn test_l_hit_internal_tip_loses_to_larger_user_bp() {
-        let prev: Vec<Token> = (0..10).collect();
-        let new_: Vec<Token> = (0..10).chain([99, 50]).collect();
-        let breakpoints = vec![8];
+        let prev = toks(0..10);
+        let new_ = toks((0..10).chain([99, 50]));
+        let breakpoints = vec![ep(8)];
         // LCP = 10, safe = 9. Tip at 4 eligible (≤9). User BP at 8 also
         // eligible. Largest wins: 8.
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, Some(4)), 8);
+        assert_eq!(
+            compute_l_hit(&prev, &new_, &breakpoints, Some(ep(4))),
+            ep(8)
+        );
     }
 
     /// Tip exactly at `lcp - 1` is eligible (BPE-safety boundary,
     /// `bp <= safe` is inclusive).
     #[test]
     fn test_l_hit_internal_tip_at_safe_boundary() {
-        let prev: Vec<Token> = (0..5).collect();
-        let new_: Vec<Token> = (0..5).chain([99, 50]).collect();
+        let prev = toks(0..5);
+        let new_ = toks((0..5).chain([99, 50]));
         // LCP = 5, safe = 4. Tip at 4 (= safe) eligible.
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(4)), 4);
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(4))), ep(4));
     }
 
     /// Tip exactly at `lcp` is ineligible (one past safe).
     /// Regression guard: don't relax the BPE-safety check accidentally.
     #[test]
     fn test_l_hit_internal_tip_one_past_safe() {
-        let prev: Vec<Token> = (0..5).collect();
-        let new_: Vec<Token> = (0..5).chain([99, 50]).collect();
+        let prev = toks(0..5);
+        let new_ = toks((0..5).chain([99, 50]));
         // LCP = 5, safe = 4. Tip at 5 (= lcp, > safe) ineligible.
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(5)), 0);
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(5))), ep(0));
     }
 
     /// Tip at zero is rejected (we only reuse at positions > 0,
     /// matching the existing breakpoint constraint).
     #[test]
     fn test_l_hit_internal_tip_zero_rejected() {
-        let prev: Vec<Token> = (0..5).collect();
-        let new_: Vec<Token> = (0..5).chain([99]).collect();
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(0)), 0);
+        let prev = toks(0..5);
+        let new_ = toks((0..5).chain([99]));
+        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(0))), ep(0));
     }
 
     /// No tool_choice and no output_config → no grammar constraint.
@@ -4024,18 +4833,18 @@ mod tests {
     #[test]
     fn test_prefix_cache_reset_zeroes_state() {
         let mut cache = PrefixCache::new();
-        assert!(cache.prev_tokens.is_empty());
+        assert!(cache.prev_entries.is_empty());
         assert!(cache.prev_breakpoints.is_empty());
-        assert_eq!(cache.last_reused_tokens, 0);
+        assert_eq!(cache.last_reused_cells, 0);
 
-        cache.prev_tokens = vec![1, 2, 3];
-        cache.prev_breakpoints = vec![1, 2];
-        cache.last_reused_tokens = 2;
+        cache.prev_entries = toks([1, 2, 3]);
+        cache.prev_breakpoints = vec![ep(1), ep(2)];
+        cache.last_reused_cells = 2;
 
         cache.clear();
-        assert!(cache.prev_tokens.is_empty());
+        assert!(cache.prev_entries.is_empty());
         assert!(cache.prev_breakpoints.is_empty());
-        assert_eq!(cache.last_reused_tokens, 0);
+        assert_eq!(cache.last_reused_cells, 0);
     }
 
     /// Stop-reason inference: tool use wins over everything. When a
@@ -4366,18 +5175,18 @@ mod tests {
             .with_prefix_cache(true);
         // Force some "used" state so we know clear actually zeros.
         if let Some(cache) = session.prefix_cache.as_mut() {
-            cache.prev_tokens = vec![1, 2, 3];
-            cache.prev_breakpoints = vec![1, 2];
-            cache.last_reused_tokens = 2;
+            cache.prev_entries = toks([1, 2, 3]);
+            cache.prev_breakpoints = vec![ep(1), ep(2)];
+            cache.last_reused_cells = 2;
         }
         session.clear_prefix_cache();
         let cache = session
             .prefix_cache
             .as_ref()
             .expect("clear does not drop the cache, only zeros it");
-        assert!(cache.prev_tokens.is_empty());
+        assert!(cache.prev_entries.is_empty());
         assert!(cache.prev_breakpoints.is_empty());
-        assert_eq!(cache.last_reused_tokens, 0);
+        assert_eq!(cache.last_reused_cells, 0);
     }
 
     // -----------------------------------------------------------------
@@ -4534,12 +5343,44 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// `hash_segments` hashes the split STRUCTURE: content cannot
+    /// forge a media boundary, and image identity is mixed at every
+    /// media position.
+    #[test]
+    fn test_hash_segments_structure() {
+        let id_a = [1u8; 32];
+        let id_b = [2u8; 32];
+        // Same concatenated bytes, different boundary → different hash.
+        assert_ne!(
+            hash_segments(&["ab", "c"], &[id_a]),
+            hash_segments(&["a", "bc"], &[id_a]),
+        );
+        // Same split, different image → different hash (image A's KV
+        // can never hash-hit for image B).
+        assert_ne!(
+            hash_segments(&["a", "b"], &[id_a]),
+            hash_segments(&["a", "b"], &[id_b]),
+        );
+        // Content containing marker-shaped bytes is NOT a boundary.
+        assert_ne!(
+            hash_segments(&["x<__media__>y"], &[]),
+            hash_segments(&["x", "y"], &[id_a]),
+        );
+        // Determinism.
+        assert_eq!(
+            hash_segments(&["a", "b"], &[id_a]),
+            hash_segments(&["a", "b"], &[id_a]),
+        );
+        // Imageless degenerate case is the plain-text hash.
+        assert_eq!(hash_segments(&["hello"], &[]), hash_partial_text("hello"));
+    }
+
     /// Single matching breakpoint hash → returns its position.
     #[test]
     fn test_hash_keyed_l_hit_single_breakpoint_match() {
         let h_a = hash_partial_text("aaa");
         let h_b = hash_partial_text("bbb");
-        let prev_breakpoints = vec![100usize];
+        let prev_breakpoints = vec![ep(100)];
         let prev_hashes = vec![h_a];
         // New request has hash matching cached breakpoint.
         let new_hashes = vec![h_a];
@@ -4552,7 +5393,7 @@ mod tests {
                 &new_hashes,
                 500,
             ),
-            100
+            ep(100)
         );
         // Different hash → no match.
         let new_hashes_no_match = vec![h_b];
@@ -4565,7 +5406,7 @@ mod tests {
                 &new_hashes_no_match,
                 500,
             ),
-            0
+            ep(0)
         );
     }
 
@@ -4576,7 +5417,7 @@ mod tests {
         let h_a = hash_partial_text("aaa");
         let h_b = hash_partial_text("bbb");
         let h_c = hash_partial_text("ccc");
-        let prev_breakpoints = vec![100, 200, 300];
+        let prev_breakpoints = vec![ep(100), ep(200), ep(300)];
         let prev_hashes = vec![h_a, h_b, h_c];
         // New request matches 100 and 200 only (not 300).
         let new_hashes = vec![h_a, h_b];
@@ -4589,7 +5430,7 @@ mod tests {
                 &new_hashes,
                 500,
             ),
-            200,
+            ep(200),
             "should pick the largest matching cached position",
         );
     }
@@ -4600,7 +5441,7 @@ mod tests {
     fn test_hash_keyed_l_hit_tip_beats_breakpoint() {
         let h_bp = hash_partial_text("aaa");
         let h_tip = hash_partial_text("bbb");
-        let prev_breakpoints = vec![100];
+        let prev_breakpoints = vec![ep(100)];
         let prev_hashes = vec![h_bp];
         let new_hashes = vec![h_bp, h_tip];
         // Tip at 250 with matching hash should win over bp at 100.
@@ -4608,12 +5449,12 @@ mod tests {
             hash_keyed_l_hit(
                 &prev_breakpoints,
                 &prev_hashes,
-                Some(250),
+                Some(ep(250)),
                 Some(h_tip),
                 &new_hashes,
                 500,
             ),
-            250,
+            ep(250),
         );
     }
 
@@ -4623,7 +5464,7 @@ mod tests {
     #[test]
     fn test_hash_keyed_l_hit_cap_bound() {
         let h = hash_partial_text("aaa");
-        let prev_breakpoints = vec![100, 800];
+        let prev_breakpoints = vec![ep(100), ep(800)];
         let prev_hashes = vec![h, h];
         let new_hashes = vec![h];
         // Cap at 500 → 800 rejected, falls back to 100.
@@ -4636,7 +5477,7 @@ mod tests {
                 &new_hashes,
                 500,
             ),
-            100,
+            ep(100),
         );
     }
 
@@ -4645,31 +5486,31 @@ mod tests {
     fn test_hash_keyed_l_hit_no_match() {
         let h_a = hash_partial_text("aaa");
         let h_b = hash_partial_text("bbb");
-        let prev_breakpoints = vec![100, 200];
+        let prev_breakpoints = vec![ep(100), ep(200)];
         let prev_hashes = vec![h_a, h_a];
         let new_hashes = vec![h_b];
         assert_eq!(
             hash_keyed_l_hit(
                 &prev_breakpoints,
                 &prev_hashes,
-                Some(300),
+                Some(ep(300)),
                 Some(h_b),
                 &new_hashes,
                 500,
             ),
-            300,
+            ep(300),
             "tip with matching hash should still win even when bps miss",
         );
         assert_eq!(
             hash_keyed_l_hit(
                 &prev_breakpoints,
                 &prev_hashes,
-                Some(300),
+                Some(ep(300)),
                 Some(h_a),
                 &new_hashes,
                 500,
             ),
-            0,
+            ep(0),
             "no hashes match → 0",
         );
     }
@@ -4678,6 +5519,9 @@ mod tests {
     #[test]
     fn test_hash_keyed_l_hit_empty_side_table() {
         let h = hash_partial_text("aaa");
-        assert_eq!(hash_keyed_l_hit(&[], &[], None, None, &[h], 500), 0);
+        assert_eq!(
+            hash_keyed_l_hit(&[], &[], None, None, &[h], 500),
+            ep(0)
+        );
     }
 }
