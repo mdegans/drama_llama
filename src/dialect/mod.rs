@@ -366,9 +366,11 @@ pub mod harmony {
     pub const END: &str = "<|end|>";
     /// EOG: ends a tool call.
     pub const CALL: &str = "<|call|>";
-    /// EOG: ends a final message. Re-ingest renders `<|end|>` in its
-    /// place (upstream issue #15417); the divergence costs one LCP
-    /// token per final turn.
+    /// EOG: ends a final message. Re-ingest renders `<|end|>` in
+    /// its place (upstream issue #15417); the session's auto-tip
+    /// records that canonical close instead of the sampled EOG
+    /// (`compute_tip_extension`), so the rewrite costs no cache
+    /// reuse.
     pub const RETURN: &str = "<|return|>";
     pub const CONSTRAIN: &str = "<|constrain|>";
     /// Recipient prefix for client tools; other recipients

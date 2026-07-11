@@ -486,3 +486,62 @@ fn gptoss_eog_token_set() {
     );
     assert!(model.eos() == ret || extra.contains(&ret));
 }
+
+/// Prefix cache across a FINAL turn — the `<|return|>` → `<|end|>`
+/// re-ingest rewrite (upstream #15417). The model ends its answer
+/// with the EOG `<|return|>`, but every later render of that turn
+/// closes with `<|end|>`; recording the sampled stop as the tip
+/// prediction made the next call's LCP die exactly at the tip, and
+/// since restore targets are only checkpointed positions, reuse fell
+/// back to the last explicit `cache_control` breakpoint — here there
+/// are NONE, so pre-fix this test reads zero cache. The tip now
+/// records the CANONICAL close token from the byte-stable re-render,
+/// so turn 2 splices at the tip and reuses the whole first turn.
+#[test]
+#[ignore = "requires gpt-oss model"]
+fn prefix_cache_survives_final_turn() {
+    use drama_llama::AssistantMessage;
+
+    let mut session = load_session(1024).with_prefix_cache(true);
+    let mut prompt = Prompt {
+        system: Some(Content::text("You are a helpful assistant.")),
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text(
+                "What is the capital of France? Answer briefly.",
+            ),
+        }],
+        ..Default::default()
+    };
+
+    let blocks = session.complete_blocks(&prompt).expect("turn 1");
+    assert!(
+        blocks.iter().any(|b| matches!(b, Block::Text { .. })),
+        "turn 1 must produce a final answer: {blocks:#?}"
+    );
+    let turn1_prompt = session.last_usage().input_tokens;
+
+    let assistant: AssistantMessage = blocks.into_iter().collect();
+    prompt.messages.push(assistant.into());
+    prompt.messages.push(Message {
+        role: Role::User,
+        content: Content::text("And of Italy?"),
+    });
+
+    let out = session.complete_text(&prompt).expect("turn 2");
+    println!("=== turn 2 ===\n{out}\n===");
+    let read = session
+        .last_usage()
+        .cache_read_input_tokens
+        .unwrap_or_default();
+    // The tip is the ONLY eligible anchor (no cache_control set), and
+    // it sits past the whole first turn (prompt + generation). Zero
+    // or prompt-sized reuse means the canonical-close substitution
+    // regressed and the <|return|>/<|end|> mismatch disqualified it.
+    assert!(
+        read as u64 > turn1_prompt as u64,
+        "turn 2 must splice at the tip (past the whole first turn); \
+         cache_read={read}, turn-1 prompt={turn1_prompt} (usage: {:?})",
+        session.last_usage()
+    );
+}
