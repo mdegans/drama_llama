@@ -14,7 +14,7 @@ exclude = [".claude/", "CLAUDE.md", "tests/data/", "**/.DS_Store"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-llama-cpp-sys-3 = { version = "0.8", optional = true }
+llama-cpp-sys-3 = { version = "0.8.1", optional = true }
 
 # moeflux (Metal-backed streaming-MoE decoder). macOS-only; drama_llama's
 # own `moeflux` feature wraps the platform gate so cross-platform builds
@@ -96,6 +96,23 @@ serde = ["tinyvec/serde"]
 stats = ["dep:stringmetrics"]
 cuda = ["llama-cpp", "llama-cpp-sys-3/cuda"]
 cuda_f16 = ["llama-cpp", "llama-cpp-sys-3/cuda_f16"]
+# `media` gates the backend-agnostic image layer: `Block::Image` decode
+# via the `image` crate (never mtmd's bundled stb_image — CVE posture)
+# and the conversions into the frozen `Image` pixel record consumed by
+# the `Vision` trait. No C dependency — compiles without `llama-cpp`,
+# so moeflux-only builds can enable it (and get typed "media
+# unsupported" errors from `NoVision` instead of silent drops).
+media = [
+    "dep:image",
+    "image/jpeg",
+    "misanthropic/image",
+    "misanthropic/jpeg",
+    "misanthropic/png",
+]
+# `mtmd` gates the llama.cpp multimodal backend: libmtmd bindings from
+# llama-cpp-sys-3 plus the safe `Mtmd` wrapper (`src/llama_cpp/mtmd.rs`)
+# implementing `Vision<LlamaCppDecoder>`.
+mtmd = ["media", "llama-cpp", "llama-cpp-sys-3/mtmd"]
 egui = [
     "dep:egui",
     "dep:eframe",
@@ -232,6 +249,10 @@ features = [
     "egui",
     "json-schema",
     "repl",
+    # `mtmd` implies `media`; extends the docs.rs C build with libmtmd.
+    # If docs.rs ever times out on it, drop to "media" (pure Rust) and
+    # lose only the `Mtmd` page.
+    "mtmd",
 ]
 # Scrape the examples above into the rendered docs (nightly-only
 # rustdoc feature; docs.rs builds on nightly).

@@ -70,11 +70,34 @@ impl LlamaCppEngine {
             context_params.unwrap_or_else(Self::default_context_params);
         let decoder =
             LlamaCppDecoder::new(&mut model, context_params, numa_strategy)?;
-        Ok(Self {
+        #[allow(unused_mut)]
+        let mut engine = Self {
+            vision: None,
             decoder,
             model,
             probe_hook: None,
-        })
+        };
+        // mmproj sidecar convention: a sibling `<model>.mmproj.gguf`
+        // opts the model into vision by existing. A present-but-broken
+        // sidecar is a hard error — silently continuing text-only
+        // would be the silent image drop this feature exists to kill.
+        #[cfg(feature = "mtmd")]
+        {
+            use crate::llama_cpp::mtmd::{Mtmd, MtmdParams};
+            if let Some(mmproj) = crate::sidecar::mmproj_path(&path) {
+                let mtmd = Mtmd::from_path(
+                    &mmproj,
+                    &engine.model,
+                    MtmdParams::default(),
+                )
+                .map_err(|source| NewError::Mtmd {
+                    path: mmproj,
+                    source,
+                })?;
+                engine.vision = Some(mtmd);
+            }
+        }
+        Ok(engine)
     }
 
     /// Create a new engine from a model `path`. Default model and
@@ -89,6 +112,23 @@ impl LlamaCppEngine {
         let mut mp = unsafe { llama_model_default_params() };
         mp.n_gpu_layers = 0;
         Self::new(path, Some(mp), None, None)
+    }
+
+    /// Load a multimodal projector (mmproj GGUF) from an arbitrary
+    /// path, replacing any current vision capability. The sidecar
+    /// convention (`<model>.mmproj.gguf`, see
+    /// [`crate::sidecar::mmproj_path`]) is auto-loaded at
+    /// construction; this is for projectors living elsewhere.
+    #[cfg(feature = "mtmd")]
+    pub fn load_mmproj(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        params: crate::llama_cpp::mtmd::MtmdParams,
+    ) -> Result<(), crate::llama_cpp::mtmd::MtmdNewError> {
+        let mtmd =
+            crate::llama_cpp::mtmd::Mtmd::from_path(path, &self.model, params)?;
+        self.vision = Some(mtmd);
+        Ok(())
     }
 
     /// Create a new engine from a model `path` with an explicit Flash

@@ -62,6 +62,7 @@ impl MoefluxEngine {
             use_2bit,
         )?;
         Ok(Self {
+            vision: None,
             decoder,
             model,
             probe_hook: None,

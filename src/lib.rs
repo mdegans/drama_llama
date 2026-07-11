@@ -21,7 +21,12 @@ pub use sample::{
 };
 
 pub mod backend;
-pub use backend::{Backend, Decoder, Model, Token, TokenData};
+#[cfg(feature = "media")]
+pub use backend::ImageDecodeError;
+pub use backend::{
+    Backend, Decoder, Image, ImageInfo, ImageNewError, MediaChunk, MediaSpan,
+    Model, NoVision, Token, TokenData, Vision,
+};
 
 #[cfg(feature = "llama-cpp")]
 mod batch;
@@ -76,6 +81,8 @@ pub use llama_cpp::{
     llama_quantize, DecodeError, FlashAttention, LlamaCppBackend,
     LlamaCppDecoder, LlamaCppEngine, LlamaCppModel, NewError,
 };
+#[cfg(feature = "mtmd")]
+pub use llama_cpp::{Mtmd, MtmdParams};
 
 #[cfg(feature = "llama-cpp")]
 pub mod log;

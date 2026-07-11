@@ -98,38 +98,125 @@ PR from fork; CI (win/mac/linux, ~10m) must pass; merge to main deploys.
 
 ## Phase B — drama_llama safe layer (own session)
 
-New module `src/llama_cpp/mtmd.rs`; feature
-`mtmd = ["llama-cpp", "llama-cpp-sys-3/mtmd", "dep:image", "image/jpeg", ...]`
-(+ misanthropic image features for `Block::Image` decode; fixture is .jpg).
+**LANDED 2026-07-11** (same session as the interface redesign below).
+Full feature matrix green locally: `--no-default-features`,
+`--no-default-features --features media` (proves llama.cpp stays
+optional — the lib-test build now also compiles without `llama-cpp`;
+seven ungated `LlamaCppEngine` uses in chat_template tests were
+pre-existing breakage, now cfg-gated), default, `mtmd`, and the full
+docs feature set. Both `#[ignore]` integration tests pass against
+the local Qwen 3.6 f16 mmproj (CPU): tokenize chunk structure
+(placeholder path, id round-trip, typed mismatches) and an
+end-to-end `prefill_image` smoke (sidecar auto-load → samoyed.jpg
+thumbnail → helper eval → KV advanced). Findings beyond the plan:
 
-House style: thiserror per-op error enums + `assert_impl_all!(Send, Sync)`,
-`from_path*` constructors, consuming-self where state must stay consistent.
+1. **`mtmd_tokenize` return codes are not classifiable.** The header
+   documents marker-count mismatch as code 1, but the implementation
+   throws → code 2 on one path and returns 1 on another, and code 2
+   also covers preprocessing and unsupported-modality failures. We
+   now count markers in Rust before crossing the boundary (same
+   substring semantics) for a typed `MarkerMismatch { markers,
+   images }`; every nonzero C code maps to one `Code { code }`
+   variant. Relevant to C+D work item 1: marker counting on our side
+   is load-bearing, not belt-and-suspenders.
+2. bindgen renders `const mtmd_bitmap **` as `*mut *const` — the
+   bitmap array passed to `mtmd_tokenize` needs a `mut` binding.
+3. `NewError` (decoder module) gained an `Mtmd` variant for the
+   sidecar auto-load hard-error path.
 
-- `Mtmd` — owns `*mut mtmd_context`.
-  `from_path(mmproj, &LlamaCppModel, MtmdParams) -> Result<Self, MtmdNewError>`;
-  `supports_vision/audio()`, `marker()`,
-  `tokenize(&self, text, &[BitmapRef], add_special) -> Result<Chunks, MtmdTokenizeError>`.
-- `Bitmap` — owns `*mut mtmd_bitmap`. `from_rgb8(nx, ny, &[u8])`,
-  `try_from_block(&Block)` (image-crate decode), `id()` = our sha256 of
-  pixels (feeds cache identity; not mtmd's FNV). Dims validated by
-  construction (nx·ny·3 == len; reject 0-dim).
-  **Placeholder bitmaps are a separate type or typestate** (upstream:
-  data==nullptr tokenizes/counts but must carry real nx/ny, and encode
-  rejects them — enforce "can't encode a placeholder" at the type level).
-- `Chunks`/`Chunk<'_>` — owns `*mut mtmd_input_chunks`;
-  `Chunk::Text(&[Token])` | `Chunk::Media { id, n_tokens, n_pos }`;
-  `n_tokens()`, `n_pos()` (M-RoPE-aware, ≠ n_tokens).
-- ⚠ **Ownership**: `LlamaCppEngine` is `pub type … = Engine<LlamaCppBackend>`
-  (`src/llama_cpp/engine.rs:22`) — a generic struct; it cannot own
-  backend-specific state. `Option<Mtmd>` hangs off **`LlamaCppModel`**
-  (or `LlamaCppDecoder`; either drops before the raw model per documented
-  field order, `engine.rs:22-27`), surfaced through the `Model` trait as a
-  defaulted accessor (`fn mtmd(&self) -> Option<&…> { None }`-shaped) so
-  generic Session code can branch and moeflux gets the typed
-  "media unsupported" error for free.
-- Sidecar: `from_path*` auto-loads `<model>.mmproj.gguf` (extends
-  `src/sidecar.rs` convention); explicit constructor for arbitrary paths.
-- Interface refined in-session; this sketch was reviewed but not committed.
+**Interface redesigned in a dedicated design session (Mike + Fable 5,
+2026-07-11) before implementation — supersedes the original sketch.**
+Driving constraints (Mike's): drama_llama is not a llama.cpp-only crate
+— llama.cpp must stay optional (moeflux-only builds); don't tie public
+interfaces to llama.cpp types; use `image::DynamicImage` as the pixel
+source of truth (CVE posture: never mtmd's stb_image); no `Multimodal`
+trait family until a second implementor exists.
+
+Key discovery that forced the redesign: the original sketch's defaulted
+`Model` accessor returning `Option<&Mtmd>` cannot typecheck on a generic
+trait — `Mtmd` is feature-gated. Some backend-agnostic surface is
+mandatory, not stylistic.
+
+### Generic surface (`backend.rs`, unconditional, dep-free)
+
+- `Image` — frozen RGB8 record: `{ rgb8: Vec<u8>, width, height,
+  id: [u8; 32] }`. `id` = sha256 of the RGB8 pixels, memoized at
+  construction so pixels and cache identity can never disagree (the
+  hash-mixing discipline, enforced structurally). Dims validated
+  (w·h·3 == len, no 0-dim). `sha2` is already an unconditional dep.
+- `ImageInfo` — `{ width, height, id }`, dims + identity without
+  pixels. What the placeholder/counting path consumes.
+- `MediaChunk` — `Text(Vec<Token>) | Media { id, n_tokens: u32,
+  n_pos: u32 }`. Exactly what `CacheEntry` (Phase C+D) needs; mtmd's
+  chunk handles stay private.
+- `Vision<D: Decoder>: Send` — small trait, generic over the decoder
+  (generic param, not associated type, so `NoVision` can blanket-impl):
+  `marker()`, `tokenize(&self, text, &[ImageInfo], add_special,
+  parse_special) -> Vec<MediaChunk>`,
+  `prefill_image(&mut self, &mut D, &Image, start_pos, seq_id) ->
+  MediaSpan`. The `&mut D` argument is what lets tokenize live off
+  `Decoder` while prefill still reaches the context; `Decoder` itself
+  is untouched. Signatures enforce the placeholder typestate: counting
+  takes `ImageInfo` (no pixels), encoding takes `Image` (pixels
+  guaranteed).
+- `NoVision` — uninhabited enum, blanket `impl<D: Decoder> Vision<D>`.
+  `Option<NoVision>` is statically `None`.
+- `Backend` gains `type Vision: Vision<Self::Decoder>`.
+  `MoefluxBackend` → `NoVision` (one line, in-repo — can't
+  compile-check on Linux, Metal-gated; verify next mac session).
+  `LlamaCppBackend` → `Mtmd` under `cfg(mtmd)`, else `NoVision`.
+- `Engine<B>` owns `Option<B::Vision>`, declared **first** (drops
+  before decoder teardown / model free). Accessors: `vision()`,
+  `set_vision()`, and a split-borrow `vision_and_decoder()` for the
+  media prefill path.
+- Conversions under `cfg(media)`: `TryFrom<image::DynamicImage>`
+  (via `to_rgb8()`; Try because 0-dim must reject) and
+  `TryFrom<&misanthropic Image>` via upstream `Image::decode()` —
+  **already exists** in misanthropic (`message.rs:2466`, feature
+  `image` + per-codec features); URL variant errors (we never fetch).
+
+### Features
+
+- `media` — backend-agnostic: `dep:image`, `misanthropic/image` +
+  codecs, the conversions, later the Session media paths. Compiles
+  without llama.cpp; `cargo check --no-default-features --features
+  media` locks llama.cpp-optionality in (add to CI).
+- `mtmd = ["media", "llama-cpp", "llama-cpp-sys-3/mtmd"]` (sys ≥0.8.1).
+- Images with no `media` → typed error at render (kills the silent
+  drop for all builds); `media` + `NoVision` → typed
+  backend-unsupported error.
+
+### llama.cpp side (`src/llama_cpp/mtmd.rs`)
+
+House style: thiserror per-op error enums, `assert_impl_all!(Send)`.
+
+- `Mtmd` — owns `*mut mtmd_context`; `Send` not `Sync` (encode mutates
+  the ctx's output buffer — same reason it must NOT hang off the
+  `Send + Sync` `Model`; this + the unreachable-from-`prefill_image`
+  problem is why ownership moved from the plan's original
+  `LlamaCppModel` home to Engine). Constructor
+  `from_path(mmproj, &LlamaCppModel, MtmdParams)` follows the
+  `LlamaCppDecoder::new` precedent (safe fn, derived raw ptr, drop
+  order enforced by Engine field order + docs).
+- `Bitmap` — **private** to the module now; the generic signatures
+  enforce what the old public typestate was for. Built from `Image`
+  (real) or `ImageInfo` (placeholder, data==nullptr); id = hex of our
+  sha256 via `mtmd_bitmap_set_id`.
+- `tokenize` → placeholder bitmaps → walk `mtmd_input_chunks` →
+  `Vec<MediaChunk>` (ids hex-decoded from chunk ids; media-chunk
+  count must equal image count — typed error otherwise, guards
+  qwen-style consecutive-bitmap merging).
+- `prefill_image` (Phase B) = tokenize marker-only text with the one
+  real bitmap → `mtmd_helper_eval_chunk_single` on the media chunk.
+  **C+D replaces the internals** with the Rust-owned loop (EmbdBatch,
+  pre-KV NaN scan, M-RoPE positions, non-causal toggle) and
+  differential-tests against this helper path. Public signature does
+  not change. NaN guard arrives with the Rust loop (helper has no
+  pre-KV hook).
+- Sidecar: `<model>.mmproj.gguf` discovery in `sidecar.rs`;
+  `LlamaCppEngine` auto-loads when the sibling exists +
+  `load_mmproj()` for arbitrary paths. Session `from_path` wiring
+  lands with C+D (Session can't consume images until then).
 
 ## Phase C+D — Session integration, cache-aware (one big session)
 

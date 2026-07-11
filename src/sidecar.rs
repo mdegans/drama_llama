@@ -4,9 +4,10 @@
 //! one aspect of how it is served: sampling defaults
 //! (`<model>.sampling.toml`, [`SampleOptions`]), the tool-call
 //! dialect (`<model>.dialect.toml`,
-//! [`CallSyntax`](crate::CallSyntax)), or the chat template itself
-//! (`<model>.template.jinja`, raw Jinja — the only one available
-//! without the `toml` feature). [`crate::LlamaCppSession::from_path*`]
+//! [`CallSyntax`](crate::CallSyntax)), the chat template itself
+//! (`<model>.template.jinja`, raw Jinja), or the multimodal
+//! projector (`<model>.mmproj.gguf`, [`mmproj_path`] — enables image
+//! input under the `mtmd` feature). [`crate::LlamaCppSession::from_path*`]
 //! looks for each when loading a model. For sampling, if no sidecar
 //! exists a default is written so the user has a starting point to
 //! edit.
@@ -201,6 +202,19 @@ pub fn load_template_source(
             source,
         }),
     }
+}
+
+/// Multimodal-projector sidecar convention: sibling
+/// `<model>.mmproj.gguf` next to the `.gguf` file (`model.gguf` →
+/// `model.mmproj.gguf`). Returns `Some(path)` only when the file
+/// exists — unlike the sampling sidecar, nothing is auto-written; the
+/// projector opts the model into vision *by existing*. Consumed by
+/// `LlamaCppEngine`'s constructors (under the `mtmd` feature); a
+/// present-but-unloadable projector is a hard error there, because
+/// continuing text-only would silently drop images.
+pub fn mmproj_path(model_path: &Path) -> Option<std::path::PathBuf> {
+    let path = model_path.with_extension("mmproj.gguf");
+    path.is_file().then_some(path)
 }
 
 /// Serialize `syntax` to `path` as TOML. Utility for pinning an

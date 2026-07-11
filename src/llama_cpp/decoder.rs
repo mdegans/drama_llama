@@ -40,6 +40,16 @@ pub enum NewError {
     Model { path: PathBuf },
     #[error("Could not create context")]
     Context,
+    /// An mmproj sidecar exists next to the model but failed to load.
+    /// Hard error by design: continuing text-only would silently drop
+    /// images.
+    #[cfg(feature = "mtmd")]
+    #[error("Could not load mmproj sidecar {path}: {source}")]
+    Mtmd {
+        path: PathBuf,
+        #[source]
+        source: crate::llama_cpp::mtmd::MtmdNewError,
+    },
 }
 
 static_assertions::assert_impl_all!(NewError: Send, Sync);
