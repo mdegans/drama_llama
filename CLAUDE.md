@@ -179,6 +179,15 @@ for the current arc:
   parser; phases A–G cover grammar-engine `until`, #28, analyzer,
   emitter+parser (absorbs #29), Session/Qwen e2e, Gemma `Instructed`,
   gpt-oss Harmony. Round-trip byte-stability is the cache invariant.
+- [`plan_mtmd_image_support.md`](.claude/memory/plan_mtmd_image_support.md)
+  — plan-of-record ([issue #31](https://github.com/mdegans/drama_llama/issues/31)):
+  image input via llama.cpp's mtmd, the last v0.8.0 feature. Three
+  sessions: A (`mtmd` feature in llama-cpp-sys-3, upstream cmake target +
+  bindgen + packaging), B (safe layer `src/llama_cpp/mtmd.rs`, `Mtmd` on
+  `LlamaCppModel` via Model-trait accessor), C+D (Session integration,
+  cache-aware from the start: `CacheEntry` sentinels, entry↔position
+  translation, Rust-owned eval loop with pre-KV NaN guard, `EmbdBatch`).
+  Adversarially validated 2026-07-11; ten design holes pre-fixed in plan.
 - [`riir_moeflux_strategy.md`](.claude/memory/riir_moeflux_strategy.md)
   — the active RIIR plan: differential port of moeflux, branch
   `riir` in `~/Projects/moeflux`, no Arc, `metal-rs`. Phase 0/1a/2
