@@ -1257,8 +1257,14 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                      SamplingMode::json() and retry.",
                 );
                 !buf.is_empty()
-                    && !(chosen_is_eog && !state.is_complete())
-                    && state.accepts_bytes(&buf)
+                    && if chosen_is_eog && !state.is_complete() {
+                        // Mid-parse EOG survives only when its own
+                        // bytes finish the constraint (dialect exit
+                        // markers, see `grammar_filter`).
+                        state.completes_with(&buf)
+                    } else {
+                        state.accepts_bytes(&buf)
+                    }
             }
             SamplingMode::Grammar(state) => {
                 let state = state.lock().expect(
@@ -1267,8 +1273,11 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                      SamplingMode::grammar(...) and retry.",
                 );
                 !buf.is_empty()
-                    && !(chosen_is_eog && !state.is_complete())
-                    && state.accepts_bytes(&buf)
+                    && if chosen_is_eog && !state.is_complete() {
+                        state.completes_with(&buf)
+                    } else {
+                        state.accepts_bytes(&buf)
+                    }
             }
             _ => true,
         });
@@ -1437,7 +1446,7 @@ mod tests {
     /// empty piece (like Qwen's secondary EOS variants decode to).
     struct MockModel;
 
-    const PIECES: &[&str] = &["", "a", "b", "c", "x", "", "a"];
+    const PIECES: &[&str] = &["", "a", "b", "c", "x", "", "a", "b"];
     const EOS: Token = 0;
     const A: Token = 1;
     const B: Token = 2;
@@ -1451,6 +1460,11 @@ mod tests {
     /// ("a") — the `<|im_end|>`-inside-until() shape: byte-acceptance
     /// alone cannot reject it, only the EOG-by-id rule can.
     const EOG_A: Token = 6;
+    /// An extra-EOS token whose piece ("b") COMPLETES the test
+    /// grammar from the mid-parse state — the dialect-exit-marker
+    /// shape (Gemma 4's `<|tool_response>` is both grammar-required
+    /// exit bytes and a vocab EOG).
+    const EOG_B: Token = 7;
 
     impl crate::backend::Model for MockModel {
         type Error = std::convert::Infallible;
@@ -1471,7 +1485,7 @@ mod tests {
             vec![EOS, EOG_A]
         }
         fn extra_eos_tokens(&self) -> Vec<Token> {
-            vec![EOG_A]
+            vec![EOG_A, EOG_B]
         }
         fn max_token_len(&self) -> usize {
             1
@@ -1690,6 +1704,43 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+
+    /// An EOG token whose own piece bytes COMPLETE the constraint is
+    /// legal mid-parse — the dialect-exit-marker case: Gemma 4's
+    /// `<|tool_response>` is both the grammar-required exit bytes and
+    /// a vocab EOG (libllama marks it), and rejecting it by id left
+    /// the model with no trained stop, looping identical calls to the
+    /// context limit (plan Phase G postmortem). Both sampling paths.
+    #[test]
+    fn eog_kept_when_piece_completes_constraint() {
+        for lazy in [false, true] {
+            let mut opts = opts_with_grammar(lazy);
+            let mut r = rng();
+            let mut mu = None;
+            assert_eq!(
+                sample(
+                    cands(&[(A, 20.0), (X, 0.0)]),
+                    &mut opts,
+                    &mut r,
+                    &mut mu
+                ),
+                A,
+                "lazy={lazy}"
+            );
+            // Mid-parse (after "a"): EOG_B's piece "b" finishes
+            // `root ::= "ab"` — it must survive the EOG-by-id rule.
+            assert_eq!(
+                sample(
+                    cands(&[(EOG_B, 20.0), (B, 0.0), (X, -20.0)]),
+                    &mut opts,
+                    &mut r,
+                    &mut mu
+                ),
+                EOG_B,
+                "lazy={lazy}"
+            );
         }
     }
 

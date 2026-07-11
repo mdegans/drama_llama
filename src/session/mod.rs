@@ -135,11 +135,13 @@ pub enum SessionError {
     #[error("dialect: {0}")]
     Dialect(#[from] crate::dialect::DialectError),
     /// Grammar-forced generation ended without producing a parseable tool call.
-    /// Usually means the model was truncated by `max_tokens` before closing the
-    /// `</tool_call>` tag, or (less commonly) the grammar itself has a gap that
-    /// let the model produce bytes the parser couldn't interpret as a tool
-    /// call.
-    #[error("grammar violation: forced tool call did not produce a tool_use block; partial_output={partial_output:?}")]
+    /// Usually means the model was truncated by `max_tokens` (or the
+    /// context limit) before closing the constrained structure — a
+    /// forced call missing its `tool_use` block, or an eager
+    /// grammar/JSON constraint left mid-structure at end of
+    /// generation. Constraint-incomplete output is never returned
+    /// silently.
+    #[error("grammar violation: generation ended without satisfying the active constraint; partial_output={partial_output:?}")]
     GrammarViolation {
         /// Any prose / thought blocks that streamed before the violation was
         /// detected. Callers can surface this to the user or log it for
@@ -2252,6 +2254,10 @@ impl<B: Backend> Session<B> {
             })
             .cloned()
             .collect();
+        // Eager handles only (active from token 0): the
+        // incomplete-at-end violation check below must not fire for a
+        // deferred grammar that legitimately never triggered.
+        let eager_grammar_handles = grammar_handles.clone();
         if let Some(dg) = &deferred_grammar {
             grammar_handles.push(dg.grammar.clone());
         }
@@ -2442,10 +2448,24 @@ impl<B: Backend> Session<B> {
             Self::make_usage(prompt_tokens, cache_read, generated_count);
         self.record_usage(usage);
 
-        if forced_tool_call
-            && !blocks
-                .iter()
-                .any(|b| matches!(b, crate::Block::ToolUse { .. }))
+        // A generation that ends while an *eager* constraint is still
+        // mid-structure is a violation even when a tool_use parsed —
+        // exit-marker postmortem (plan Phase G): a sampler bug vetoed
+        // Gemma's grammar-required turn exit and the model looped
+        // identical calls to the context limit; the parsed calls
+        // looked fine, but the transcript was garbage and its
+        // re-ingest oversized the next call's prefill. Silent
+        // constraint-incomplete output must be impossible: surface it
+        // as the typed error instead. (Deferred/Auto grammars are
+        // exempt: never triggering is legal. Streaming stays
+        // permissive by documented contract.)
+        let eager_incomplete = !eager_grammar_handles.is_empty()
+            && !any_grammar_complete(&eager_grammar_handles);
+        if eager_incomplete
+            || (forced_tool_call
+                && !blocks
+                    .iter()
+                    .any(|b| matches!(b, crate::Block::ToolUse { .. })))
         {
             let partial = blocks
                 .iter()
