@@ -666,13 +666,13 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         // the model. A matcher-level rejection on the tail collapses the
         // iterator — the caller sees generation end rather than an ungated
         // JSON phase. See `DeferredGrammar`.
-        if let Some(trigger_end) = self
+        if let Some((trigger_end, trigger_len)) = self
             .options
             .sample_options
             .deferred_grammar
             .as_ref()
             .and_then(|d| {
-                find_deferred_trigger_end(
+                find_any_deferred_trigger_end(
                     self.text.as_bytes(),
                     &d.activate_after,
                     self.max_stop_len + self.inner.engine.model.max_token_len(),
@@ -690,7 +690,7 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             // matcher lines up (`find_deferred_trigger_end` guarantees
             // `trigger_end >= trigger.len()`).
             let feed_from = if promoted.feed_trigger {
-                trigger_end - promoted.activate_after.len()
+                trigger_end - trigger_len
             } else {
                 trigger_end
             };
@@ -746,6 +746,24 @@ fn find_deferred_trigger_end(
         .windows(trigger.len())
         .position(|w| w == trigger)
         .map(|rel| search_start + rel + trigger.len())
+}
+
+/// Any-of variant over a trigger set: the earliest match wins (ties
+/// go to the longer trigger, so `<x> to=` beats ` to=`-style overlaps
+/// feeding the right byte count). Returns `(trigger_end,
+/// trigger_len)` for the winner.
+fn find_any_deferred_trigger_end(
+    haystack: &[u8],
+    triggers: &[Vec<u8>],
+    window: usize,
+) -> Option<(usize, usize)> {
+    triggers
+        .iter()
+        .filter_map(|t| {
+            find_deferred_trigger_end(haystack, t, window)
+                .map(|end| (end, t.len()))
+        })
+        .min_by_key(|&(end, len)| (end - len, std::cmp::Reverse(len)))
 }
 
 /// A predictor that predicts pieces of text.

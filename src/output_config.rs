@@ -129,7 +129,7 @@ pub fn compile_output_config(
         let grammar = SamplingMode::grammar(&source)?;
         Ok(CompiledOutputConfig::Deferred(DeferredGrammar {
             grammar,
-            activate_after: THINK_CLOSE_TRIGGER.to_vec(),
+            activate_after: vec![THINK_CLOSE_TRIGGER.to_vec()],
             // The JSON-body grammar starts *after* `</think>`; the
             // trigger itself stays outside the constrained span.
             feed_trigger: false,
@@ -329,7 +329,7 @@ mod tests {
         let CompiledOutputConfig::Deferred(deferred) = compiled else {
             panic!("expected Deferred variant on default options");
         };
-        assert_eq!(deferred.activate_after.as_slice(), b"</think>");
+        assert_eq!(deferred.activate_after, vec![b"</think>".to_vec()]);
         // JSON-only grammar accepts bare JSON…
         let SamplingMode::Grammar(state) = deferred.grammar else {
             panic!("deferred grammar must be SamplingMode::Grammar");

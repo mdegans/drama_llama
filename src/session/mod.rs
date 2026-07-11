@@ -2870,8 +2870,13 @@ fn dialect_deferred_grammar_for_prompt(
         return Ok(None);
     }
     let syntax = effective_tool_syntax(dialect);
-    let trigger = syntax.trigger();
-    if trigger.is_empty() {
+    let triggers: Vec<Vec<u8>> = syntax
+        .triggers()
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .map(String::into_bytes)
+        .collect();
+    if triggers.is_empty() {
         return Ok(None);
     }
     let opts = EmitOptions {
@@ -2883,7 +2888,7 @@ fn dialect_deferred_grammar_for_prompt(
     let grammar =
         SamplingMode::grammar(&source).map_err(ToolChoiceError::from)?;
     Ok(Some(crate::DeferredGrammar {
-        activate_after: trigger.as_bytes().to_vec(),
+        activate_after: triggers,
         grammar,
         feed_trigger: true,
     }))
@@ -3465,7 +3470,7 @@ mod tests {
         else {
             panic!("expected Deferred variant (phase_split defaults on)");
         };
-        assert_eq!(deferred.activate_after.as_slice(), b"</think>");
+        assert_eq!(deferred.activate_after, vec![b"</think>".to_vec()]);
         let SamplingMode::Grammar(state) = deferred.grammar else {
             panic!("deferred.grammar must be SamplingMode::Grammar");
         };
@@ -3581,7 +3586,7 @@ mod tests {
         else {
             panic!("expected Deferred (auto-lazy) variant");
         };
-        assert_eq!(deferred.activate_after.as_slice(), b"<tool_call>\n");
+        assert_eq!(deferred.activate_after, vec![b"<tool_call>\n".to_vec()]);
         assert!(deferred.feed_trigger);
         let SamplingMode::Grammar(state) = deferred.grammar else {
             panic!("deferred.grammar must be SamplingMode::Grammar");
@@ -3590,6 +3595,51 @@ mod tests {
         assert!(
             source.contains("<function="),
             "expected tagged-dialect grammar, got: {source}"
+        );
+    }
+
+    /// Harmony auto-lazy: the deferred grammar carries the full
+    /// any-of trigger set (both recipient-header shapes) and the
+    /// hand-built lazy root.
+    #[test]
+    fn test_resolve_grammar_auto_lazy_harmony_triggers() {
+        let tool = crate::Tool::builder("foo")
+            .description("Test tool.")
+            .schema(serde_json::json!({"type": "object"}))
+            .build()
+            .expect("valid test tool");
+        let prompt = Prompt {
+            tools: Some(vec![tool.into()]),
+            ..Prompt::default()
+        };
+        let got = resolve_grammar(
+            &prompt,
+            &crate::CallSyntax::gpt_oss(),
+            &OutputConfigOptions::default(),
+            false,
+        )
+        .expect("resolve");
+        let crate::CompiledOutputConfig::Deferred(deferred) =
+            got.expect("some compiled config")
+        else {
+            panic!("expected Deferred (auto-lazy) variant");
+        };
+        assert_eq!(
+            deferred.activate_after,
+            vec![
+                b"<|start|>assistant to=functions.".to_vec(),
+                b"<|channel|>commentary to=functions.".to_vec(),
+                b"<|channel|>analysis to=functions.".to_vec(),
+            ]
+        );
+        assert!(deferred.feed_trigger);
+        let SamplingMode::Grammar(state) = deferred.grammar else {
+            panic!("deferred.grammar must be SamplingMode::Grammar");
+        };
+        let source = state.lock().unwrap().grammar().source().to_string();
+        assert!(
+            source.contains("h_role_form") && source.contains("h_chan_form"),
+            "expected Harmony lazy grammar, got: {source}"
         );
     }
 

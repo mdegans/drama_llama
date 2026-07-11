@@ -32,7 +32,7 @@ use crate::grammar_compile::{
 };
 use crate::Tool;
 
-use super::{CallSyntax, Family, ReasoningMode};
+use super::{harmony, CallSyntax, Family, ReasoningMode};
 
 /// Errors from dialect emission / reference rendering.
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +113,12 @@ pub fn grammar_source(
 ) -> Result<String, DialectError> {
     if syntax.family == Family::None {
         return Err(DialectError::NoToolFormat);
+    }
+    if syntax.family == Family::Harmony {
+        // The channel-block structure doesn't decompose into the
+        // generic section/per-call root below — hand-built, like the
+        // parser side.
+        return harmony_grammar_source(tools, opts);
     }
     let mut src = String::with_capacity(2048);
     let mut until_counter = 0usize;
@@ -227,12 +233,118 @@ pub fn grammar_source(
                     &mut src,
                 );
             }
-            Family::None => unreachable!("checked above"),
+            Family::None | Family::Harmony => unreachable!("checked above"),
         }
     }
 
     if syntax.family == Family::TagWithDict {
         emit_dict_value_rules(&syntax.arguments.string_quote, &mut src);
+    }
+    src.push_str(JSON_GRAMMAR);
+    Ok(src)
+}
+
+/// Hand-built Harmony (gpt-oss) grammar.
+///
+/// Eager (`Any`/`Method`): the generation prompt ends at
+/// `<|start|>assistant`, and every Harmony message is a channel
+/// block, so the grammar covers the *whole* emission — any number of
+/// analysis / commentary-preamble blocks (each closed by `<|end|>`
+/// and reopened by `<|start|>assistant`), then the forced call in its
+/// canonical trained shape:
+/// `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}`.
+/// After the args complete nothing further is legal, so the sampler's
+/// complete-constraint logic admits only EOG — the model's `<|call|>`
+/// (see `extra_eos_tokens`), a deterministic stop that is also the
+/// canonical re-render byte.
+///
+/// Lazy (`Auto`): activated by one of [`CallSyntax::triggers`] (both
+/// recipient positions); the root accepts either header shape from
+/// the trigger's first byte, with the constraint clause lenient
+/// (optional, `<|constrain|>` literal optional, any `[A-Za-z0-9_-]+`
+/// type — upstream parity) because the pre-trigger bytes were sampled
+/// free and canonical-byte forcing is pointless mid-header.
+fn harmony_grammar_source(
+    tools: &[&Tool],
+    opts: &EmitOptions,
+) -> Result<String, DialectError> {
+    let mut src = String::with_capacity(2048);
+    let start = escape_for_gbnf_string(harmony::START_ASSISTANT);
+    let chan = escape_for_gbnf_string(harmony::CHANNEL);
+    let msg = escape_for_gbnf_string(harmony::MESSAGE);
+    let to_fn = escape_for_gbnf_string(harmony::TO_FUNCTIONS);
+    let constrain = escape_for_gbnf_string(harmony::CONSTRAIN);
+    let analysis_open = escape_for_gbnf_string(harmony::ANALYSIS_OPEN);
+    let commentary_open = escape_for_gbnf_string(harmony::COMMENTARY_OPEN);
+
+    match opts.anchor {
+        Anchor::Lazy => {
+            let _ = writeln!(src, "root ::= h_role_form | h_chan_form");
+            let role_alts = (0..tools.len())
+                .map(|i| format!("h_role_{i}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let chan_alts = (0..tools.len())
+                .map(|i| format!("h_chan_{i}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let _ = writeln!(
+                src,
+                r#"h_role_form ::= "{start}{to_fn}" ( {role_alts} )"#
+            );
+            let _ = writeln!(
+                src,
+                r#"h_chan_form ::= ( "{chan}commentary{to_fn}" | "{chan}analysis{to_fn}" ) ( {chan_alts} )"#
+            );
+            let _ = writeln!(
+                src,
+                r#"h_channel ::= "{chan}" ( "commentary" | "analysis" )"#
+            );
+            let _ = writeln!(
+                src,
+                r#"h_constraint ::= " " ( "{constrain}" )? h_ctype"#
+            );
+            let _ = writeln!(src, "h_ctype ::= [A-Za-z0-9_-]+");
+            for (i, tool) in tools.iter().enumerate() {
+                let name_lit = escape_for_gbnf_string(tool.name.as_ref());
+                // Recipient in the role header: the channel clause
+                // follows the name.
+                let _ = writeln!(
+                    src,
+                    r#"h_role_{i} ::= "{name_lit}" h_channel h_constraint? "{msg}" h_args_{i}"#
+                );
+                // Recipient in the channel header: the channel was
+                // consumed by the trigger.
+                let _ = writeln!(
+                    src,
+                    r#"h_chan_{i} ::= "{name_lit}" h_constraint? "{msg}" h_args_{i}"#
+                );
+            }
+        }
+        Anchor::Eager | Anchor::EagerThoughtPreOpened => {
+            // The gpt-oss generation prompt never pre-opens a
+            // reasoning block, so both eager anchors share one shape.
+            emit_until_rules("h_end", harmony::END, &mut src);
+            let call_alts = (0..tools.len())
+                .map(|i| format!("h_call_{i}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let _ = writeln!(src, "root ::= h_seg* ( {call_alts} )");
+            let _ = writeln!(
+                src,
+                r#"h_seg ::= ( "{analysis_open}" | "{commentary_open}" ) h_end "{start}""#
+            );
+            for (i, tool) in tools.iter().enumerate() {
+                let name_lit = escape_for_gbnf_string(tool.name.as_ref());
+                let _ = writeln!(
+                    src,
+                    r#"h_call_{i} ::= "{chan}commentary{to_fn}{name_lit} {constrain}json{msg}" h_args_{i}"#
+                );
+            }
+        }
+    }
+    for (i, tool) in tools.iter().enumerate() {
+        schema_to_gbnf(&tool.schema, &format!("h_args_{i}"), &mut src);
     }
     src.push_str(JSON_GRAMMAR);
     Ok(src)
@@ -562,10 +674,35 @@ pub fn render_reference(
     }
     let mut out = String::new();
     out.push_str(&syntax.section_start);
-    for (name, input) in calls {
+    for (call_idx, (name, input)) in calls.iter().enumerate() {
         validate_representable(syntax, name, input)?;
         out.push_str(&syntax.per_call_start);
         match syntax.family {
+            Family::Harmony => {
+                // Canonical trained shape (channel-header recipient);
+                // the cache-stable sidecar re-renders the same bytes.
+                // A generation only ever produces one call (`<|call|>`
+                // is EOG); client-constructed parallel calls become
+                // consecutive messages, separated here by the same
+                // `<|call|><|start|>assistant` framing the sidecar
+                // renders. The *trailing* `<|call|>` is EOG framing,
+                // not call bytes, so it is excluded (Gemma's
+                // `tool_response_start` precedent).
+                if call_idx > 0 {
+                    out.push_str(harmony::CALL);
+                    out.push_str(harmony::START_ASSISTANT);
+                }
+                out.push_str(harmony::COMMENTARY);
+                out.push_str(harmony::TO_FUNCTIONS);
+                out.push_str(name);
+                out.push(' ');
+                out.push_str(harmony::CONSTRAIN);
+                out.push_str("json");
+                out.push_str(harmony::MESSAGE);
+                out.push_str(
+                    &serde_json::to_string(input).expect("serializable"),
+                );
+            }
             Family::TagWithTagged => {
                 out.push_str(&syntax.function.name_prefix);
                 out.push_str(name);

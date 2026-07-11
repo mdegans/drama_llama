@@ -60,6 +60,15 @@ pub enum Family {
     /// marker's literal bytes is unrepresentable (typed error, like
     /// [`Family::TagWithTagged`] close delimiters).
     TagWithDict,
+    /// OpenAI Harmony (gpt-oss): every message is a channel block
+    /// (`<|channel|>analysis|commentary|final<|message|>…`), tool
+    /// calls address a recipient (`to=functions.NAME`, legal in the
+    /// role header or the channel header) with JSON arguments and end
+    /// at the EOG token `<|call|>`. Too structural for the generic
+    /// marker fields — the emitter and parser have hand-built paths
+    /// keyed on this variant, like upstream's dedicated handler
+    /// (`common_chat_params_init_gpt_oss`).
+    Harmony,
 }
 
 /// How the model's reasoning block is delimited.
@@ -137,6 +146,17 @@ pub enum ReasoningReingest {
     /// (Gemma 4, DeepSeek-style templates). Inlining `<think>` for
     /// these templates would pollute content instead.
     Field,
+    /// [`Field`](Self::Field), plus the gpt-oss stock-template
+    /// accommodations: tool-call messages additionally carry the
+    /// `thinking` key (the field that template documents) and
+    /// withhold the merged `content` (the template raises when both
+    /// are set with `tool_calls`; upstream erases content the same
+    /// way). `thinking` is NOT set on plain assistant messages — the
+    /// stock template renders any past message carrying that key as
+    /// an analysis channel block, swallowing its final content — so
+    /// cache-stable sidecars read `reasoning_content` /
+    /// `content_pre` / `content_post` instead.
+    Thinking,
 }
 
 /// Reasoning-block markers.
@@ -329,6 +349,38 @@ pub struct CallSyntax {
     pub preserved_tokens: Vec<String>,
 }
 
+/// Literal markers of the Harmony ([`Family::Harmony`]) wire format,
+/// shared by the hand-built emitter and parser so they cannot drift.
+/// Verbatim from the gpt-oss chat template / upstream
+/// `common_chat_params_init_gpt_oss`.
+pub mod harmony {
+    /// Opens every message after the first in a generation (the
+    /// generation prompt itself ends with it, so the first block
+    /// starts directly at its channel header).
+    pub const START_ASSISTANT: &str = "<|start|>assistant";
+    pub const CHANNEL: &str = "<|channel|>";
+    pub const MESSAGE: &str = "<|message|>";
+    /// Ends analysis / commentary blocks in-stream. NOT
+    /// end-of-generation — libllama removes it from `special_eog_ids`
+    /// for Harmony vocabs (see `LlamaCppModel::extra_eos_tokens`).
+    pub const END: &str = "<|end|>";
+    /// EOG: ends a tool call.
+    pub const CALL: &str = "<|call|>";
+    /// EOG: ends a final message. Re-ingest renders `<|end|>` in its
+    /// place (upstream issue #15417); the divergence costs one LCP
+    /// token per final turn.
+    pub const RETURN: &str = "<|return|>";
+    pub const CONSTRAIN: &str = "<|constrain|>";
+    /// Recipient prefix for client tools; other recipients
+    /// (`container.exec`, `python`, `browser.search`) are builtin
+    /// tools we swallow, upstream parity.
+    pub const TO_FUNCTIONS: &str = " to=functions.";
+    pub const ANALYSIS_OPEN: &str = "<|channel|>analysis<|message|>";
+    pub const COMMENTARY: &str = "<|channel|>commentary";
+    pub const COMMENTARY_OPEN: &str = "<|channel|>commentary<|message|>";
+    pub const FINAL_OPEN: &str = "<|channel|>final<|message|>";
+}
+
 impl CallSyntax {
     /// The byte sequence whose appearance in generated text activates
     /// the lazy tool-call grammar: the outermost call-opening marker.
@@ -337,6 +389,41 @@ impl CallSyntax {
             &self.section_start
         } else {
             &self.per_call_start
+        }
+    }
+
+    /// All lazy-activation byte sequences. Most dialects have exactly
+    /// one ([`Self::trigger`]); Harmony's tool-call header has no
+    /// single distinctive marker, so it triggers on any of the
+    /// recipient-bearing header shapes. Deliberately conservative — a
+    /// false activation derails generation (the grammar starts
+    /// forcing call bytes mid-thought), while a miss only loses
+    /// enforcement for that call: the parser still recognizes it and
+    /// the canonicalization gate covers the bytes. Upstream uses
+    /// anchored regexes for the same reason (`chat.cpp` gpt-oss
+    /// `grammar_triggers`).
+    pub fn triggers(&self) -> Vec<String> {
+        match self.family {
+            Family::Harmony => vec![
+                // Recipient in the role header.
+                format!(
+                    "{}{}",
+                    harmony::START_ASSISTANT,
+                    harmony::TO_FUNCTIONS
+                ),
+                // Recipient in the channel header.
+                format!(
+                    "{}commentary{}",
+                    harmony::CHANNEL,
+                    harmony::TO_FUNCTIONS
+                ),
+                format!(
+                    "{}analysis{}",
+                    harmony::CHANNEL,
+                    harmony::TO_FUNCTIONS
+                ),
+            ],
+            _ => vec![self.trigger().to_string()],
         }
     }
 
@@ -447,6 +534,59 @@ impl CallSyntax {
                 "<|turn>".into(),
                 "<turn|>".into(),
                 "<|\"|>".into(),
+            ],
+            ..Self::default()
+        }
+    }
+
+    /// gpt-oss / OpenAI Harmony dialect — hand-built (llama.cpp
+    /// hand-builds it too: `common_chat_params_init_gpt_oss`),
+    /// selected by source sniff (`<|channel|>` in the template).
+    ///
+    /// Every message is a channel block; a generation is
+    /// `analysis*/commentary* blocks separated by <|start|>assistant`,
+    /// ending in either a final message
+    /// (`<|channel|>final<|message|>… <|return|>`) or a tool call.
+    /// Canonical call shape (what the grammar forces and the
+    /// cache-stable sidecar re-renders — the model's *trained*
+    /// channel-header form):
+    /// `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`.
+    /// The parser additionally accepts the role-header form
+    /// (`<|start|>assistant to=functions.NAME<|channel|>…`), bare
+    /// constraint types without `<|constrain|>`, and the stock
+    /// template's re-render (` json<|message|>`), upstream parity.
+    ///
+    /// The call-marker fields stay empty: the shapes above don't
+    /// decompose into the generic prefix/suffix vocabulary, so the
+    /// emitter and parser use hand-built paths over the [`harmony`]
+    /// literals instead. Empty `per_call_start` also keeps Session's
+    /// parallel-call gate off — Harmony is structurally single-call
+    /// (`<|call|>` is EOG).
+    pub fn gpt_oss() -> Self {
+        Self {
+            family: Family::Harmony,
+            reasoning: ReasoningSyntax {
+                mode: ReasoningMode::TagBased,
+                start: harmony::ANALYSIS_OPEN.into(),
+                end: harmony::END.into(),
+                reingest: ReasoningReingest::Thinking,
+            },
+            content: ContentSyntax {
+                mode: ContentMode::AlwaysWrapped,
+                start: harmony::FINAL_OPEN.into(),
+                // No close marker: final content runs to EOG.
+                end: String::new(),
+            },
+            user_start: "<|start|>user<|message|>".into(),
+            assistant_start: harmony::START_ASSISTANT.into(),
+            preserved_tokens: vec![
+                "<|start|>".into(),
+                "<|channel|>".into(),
+                "<|message|>".into(),
+                "<|end|>".into(),
+                "<|constrain|>".into(),
+                "<|call|>".into(),
+                "<|return|>".into(),
             ],
             ..Self::default()
         }

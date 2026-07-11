@@ -362,6 +362,254 @@ fn gemma4_cache_stable_prefix_continuity() {
     );
 }
 
+/// gpt-oss, cache-stable sidecar: the canonical channel-header
+/// emission must reappear byte-for-byte (the generic harness).
+#[test]
+fn reconstruct_gptoss_cache_stable() {
+    assert_reconstruction(
+        "gptoss-cache-stable.jinja",
+        "<|startoftext|>",
+        "<|return|>",
+    );
+}
+
+/// gpt-oss, stock (Unsloth GGUF) template: re-renders the ROLE-header
+/// re-ingest shape (` to=functions.NAME<|channel|>commentary json`)
+/// rather than the trained channel-header emission shape, so byte
+/// stability requires the sidecar. Pin the *semantic* round-trip:
+/// emission → blocks → stock re-render → parse again → same call.
+#[test]
+fn reconstruct_gptoss_gguf_semantic() {
+    let source = fixture_source("gptoss-gguf.jinja");
+    let syntax: CallSyntax =
+        analyze_template(&source, "<|startoftext|>", "<|return|>")
+            .expect("analyze");
+    assert_eq!(syntax, CallSyntax::gpt_oss(), "sniff must fire");
+    let tool = test_tool();
+    let input = json!({"city": "Paris", "days": 3});
+
+    let prompt = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("What's the weather in Paris?"),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![Block::ToolUse {
+                    call: ToolUse {
+                        id: Cow::Borrowed("call00001"),
+                        name: Cow::Borrowed("get_weather"),
+                        input: input.clone(),
+                        cache_control: None,
+                        caller: None,
+                    },
+                }]),
+            },
+        ],
+        tools: Some(vec![tool.clone().into()]),
+        ..Default::default()
+    };
+    let template = ChatTemplate::from_source(
+        source,
+        "<|startoftext|>".to_string(),
+        "<|return|>".to_string(),
+    )
+    .expect("template compiles");
+    let opts = RenderOptions::default().with_generation_prompt(false);
+    let rendered = template.render_with(&prompt, &opts).expect("render");
+
+    // Locate the re-rendered assistant call turn and parse it back.
+    let call_at = rendered
+        .find("<|start|>assistant to=functions.")
+        .unwrap_or_else(|| panic!("no role-header call in:\n{rendered:?}"));
+    let parsed = parse_text(
+        &syntax,
+        &[&tool],
+        &rendered[call_at..],
+        false,
+        Leniency::Final,
+    );
+    let calls: Vec<&ToolUse> = parsed
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { call } => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "{:#?}", parsed.blocks);
+    assert_eq!(calls[0].name.as_ref(), "get_weather");
+    assert_eq!(calls[0].input, input, "{:#?}", parsed.blocks);
+}
+
+/// The cache property itself, pinned FFI-free against the gpt-oss
+/// sidecar: the generation-prompt render is a byte PREFIX of the
+/// follow-up render, through thinking, announce-then-call, tool
+/// responses, aged reasoning, and a final turn. The stock template
+/// breaks every one of these (CoT dropped on past turns, role-header
+/// call shape, first-call-only).
+#[test]
+fn gptoss_cache_stable_prefix_continuity() {
+    use drama_llama::dialect::ReasoningReingest;
+
+    let source = fixture_source("gptoss-cache-stable.jinja");
+    let syntax = CallSyntax::gpt_oss();
+    let tool = test_tool();
+    let input = json!({"city": "Paris", "days": 3});
+    let calls_ref = render_reference(&syntax, &[("get_weather", &input)])
+        .expect("representable");
+    let template = ChatTemplate::from_source(
+        source,
+        "<|startoftext|>".to_string(),
+        "<|return|>".to_string(),
+    )
+    .expect("template compiles");
+
+    let opts = |gen: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("preserve_thinking", true)
+            .with_thought_reingest(ReasoningReingest::Thinking)
+    };
+    let user = Message {
+        role: Role::User,
+        content: Content::text("What's the weather in Paris?"),
+    };
+    let call_block = Block::ToolUse {
+        call: ToolUse {
+            id: Cow::Borrowed("call00001"),
+            name: Cow::Borrowed("get_weather"),
+            input: input.clone(),
+            cache_control: None,
+            caller: None,
+        },
+    };
+    let base = Prompt {
+        messages: vec![user.clone()],
+        tools: Some(vec![tool.clone().into()]),
+        ..Default::default()
+    };
+    let thought = "user wants weather; get_weather fits";
+    let announce = "Let me check that for you.\n\n";
+
+    // Generation prompt tail: bare `<|start|>assistant`, the block
+    // opener every emission continues from.
+    let p = template.render_with(&base, &opts(true)).expect("render");
+    assert!(
+        p.ends_with("<|start|>assistant"),
+        "generation prompt tail changed: {p:?}"
+    );
+
+    // Announce-then-call with thinking: the emission byte order —
+    // analysis block, commentary preamble (VERBATIM, trailing
+    // whitespace intact), canonical call — must re-render as a strict
+    // extension of the generation prompt.
+    let mut with_turn = base.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![
+            Block::Thought {
+                thought: Cow::Borrowed(thought),
+                signature: Cow::Borrowed(""),
+            },
+            Block::Text {
+                text: Cow::Borrowed(announce),
+                citations: None,
+                cache_control: None,
+            },
+            call_block.clone(),
+        ]),
+    });
+    let f = template
+        .render_with(&with_turn, &opts(false))
+        .expect("render");
+    let suffix = f.strip_prefix(&p).unwrap_or_else(|| {
+        panic!(
+            "follow-up must extend the generation prompt.\n--- gen ---\n\
+             {p:?}\n--- follow-up ---\n{f:?}"
+        )
+    });
+    let emission = format!(
+        "<|channel|>analysis<|message|>{thought}<|end|>\
+         <|start|>assistant<|channel|>commentary<|message|>{announce}<|end|>\
+         <|start|>assistant{calls_ref}<|call|>"
+    );
+    assert!(
+        suffix.starts_with(&emission),
+        "emission bytes must re-render verbatim.\n--- want ---\n\
+         {emission:?}\n--- got ---\n{suffix:?}"
+    );
+
+    // Tool response renders by forward-scan with the id-resolved
+    // name, and the aged turn keeps its thought bytes
+    // (preserve_thinking).
+    let mut aged = with_turn.clone();
+    aged.messages.push(Message {
+        role: Role::User,
+        content: Content(vec![Block::ToolResult {
+            result: drama_llama::prompt::ToolResult {
+                tool_use_id: Cow::Borrowed("call00001"),
+                content: Content::text("22C, sunny"),
+                is_error: false,
+                cache_control: None,
+            },
+        }]),
+    });
+    let f_aged = template.render_with(&aged, &opts(false)).expect("render");
+    let with_response = format!(
+        "{emission}<|start|>functions.get_weather to=assistant\
+         <|channel|>commentary<|message|>22C, sunny<|end|>"
+    );
+    assert!(
+        f_aged.contains(&with_response),
+        "aged call turn + response must render continuously.\n\
+         --- want contained ---\n{with_response:?}\n--- render ---\n\
+         {f_aged:?}"
+    );
+
+    // Final turn: thinking then content. The re-render closes with
+    // <|end|> where the emission ended with the (uncommitted)
+    // <|return|> EOG — the emission TEXT is still a strict prefix.
+    let mut final_turn = base.clone();
+    final_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![
+            Block::Thought {
+                thought: Cow::Borrowed(thought),
+                signature: Cow::Borrowed(""),
+            },
+            Block::Text {
+                text: Cow::Borrowed("It's 22C and sunny."),
+                citations: None,
+                cache_control: None,
+            },
+        ]),
+    });
+    let f_final = template
+        .render_with(&final_turn, &opts(false))
+        .expect("render");
+    let suffix = f_final.strip_prefix(&p).unwrap_or_else(|| {
+        panic!(
+            "final turn must extend the generation prompt.\n--- gen ---\n\
+             {p:?}\n--- follow-up ---\n{f_final:?}"
+        )
+    });
+    let emission = format!(
+        "<|channel|>analysis<|message|>{thought}<|end|>\
+         <|start|>assistant<|channel|>final<|message|>It's 22C and sunny."
+    );
+    assert!(
+        suffix.starts_with(&emission),
+        "final-turn emission must be a byte prefix of the re-render.\n\
+         --- want ---\n{emission:?}\n--- got ---\n{suffix:?}"
+    );
+    assert!(
+        suffix[emission.len()..].starts_with("<|end|>"),
+        "re-ingest close must be <|end|> (issue #15417 rewrite).\n{suffix:?}"
+    );
+}
+
 #[test]
 fn reconstruct_gemma4_upstream() {
     assert_reconstruction("google-gemma-4-31B-it.jinja", "<bos>", "<turn|>");

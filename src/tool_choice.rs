@@ -241,7 +241,7 @@ pub fn deferred_grammar_for_prompt(
     let grammar = SamplingMode::grammar(&source)?;
     Ok(Some(crate::DeferredGrammar {
         grammar,
-        activate_after: open.as_bytes().to_vec(),
+        activate_after: vec![open.as_bytes().to_vec()],
         feed_trigger: true,
     }))
 }
@@ -1218,7 +1218,7 @@ mod tests {
         let d = deferred_grammar_for_prompt(&auto_with_tools, &opts)
             .unwrap()
             .expect("auto + tools must defer");
-        assert_eq!(d.activate_after, b"<tool_call>\n".to_vec());
+        assert_eq!(d.activate_after, vec![b"<tool_call>\n".to_vec()]);
         assert!(d.feed_trigger);
 
         // Absent tool_choice counts as auto.
