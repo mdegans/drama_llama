@@ -126,18 +126,30 @@ pub fn grammar_source(
     // Root.
     let has_reasoning = syntax.reasoning.mode != ReasoningMode::None
         && !syntax.reasoning.end.is_empty();
+    // The until-delimiter for the thought body is the WHITESPACE-
+    // TRIMMED close marker, matching the parser's leniency
+    // (`parse_thought` scans for `reasoning.end.trim()`). Canonical
+    // ends carry leading whitespace for byte-stable re-rendering
+    // (Gemma's `"\n<channel|>"`), but an until-rule over the full
+    // form is a trap: a model that closes without the newline can
+    // NEVER exit the region — every subsequent byte is legal thought
+    // content — and generation free-runs to the token budget
+    // (observed e2e on Gemma 4, plan Phase G postmortem). A
+    // non-canonical close now costs a one-turn canonicalization
+    // repair instead, same as the parse side always did.
+    let thought_delim = syntax.reasoning.end.trim();
     match (opts.anchor, has_reasoning) {
         (Anchor::Lazy, _) => {
             let _ = writeln!(src, "root ::= calls");
         }
         (Anchor::EagerThoughtPreOpened, _) => {
             // Close tag required; body is raw-until-close.
-            emit_until_rules("thought_close", &syntax.reasoning.end, &mut src);
+            emit_until_rules("thought_close", thought_delim, &mut src);
             let _ = writeln!(src, "root ::= thought_close ws calls");
         }
         (Anchor::Eager, true) => {
             let start_lit = escape_for_gbnf_string(&syntax.reasoning.start);
-            emit_until_rules("thought_close", &syntax.reasoning.end, &mut src);
+            emit_until_rules("thought_close", thought_delim, &mut src);
             if syntax.reasoning.start.is_empty() {
                 let _ = writeln!(src, "root ::= thought_close? ws calls");
             } else {

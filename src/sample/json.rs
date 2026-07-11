@@ -96,6 +96,19 @@ impl JsonState {
         true
     }
 
+    /// True iff feeding `bytes` would succeed AND leave a complete
+    /// document — the EOG-doubles-as-terminator test (see
+    /// `grammar_filter`'s EOG policy). Does not mutate `self`.
+    pub fn completes_with(&self, bytes: &[u8]) -> bool {
+        let mut clone = self.clone();
+        for &b in bytes {
+            if clone.feed(b).is_err() {
+                return false;
+            }
+        }
+        clone.is_complete()
+    }
+
     /// Commit `bytes` to parse state. Call after sampling selects a token.
     pub fn advance_bytes(&mut self, bytes: &[u8]) -> Result<(), JsonError> {
         for &b in bytes {
@@ -543,12 +556,21 @@ pub(crate) fn json_filter<M: Model>(
         v
     };
     for cand in candidates.as_slice() {
-        if !complete && eog.contains(&cand.id) {
-            continue;
-        }
+        // Mid-parse EOG survives only when its own piece bytes finish
+        // the document — a dialect exit marker doubling as a stop
+        // token (Gemma's `<|tool_response>`). EOG whose bytes are
+        // merely *legal content* (a JSON string accepts `<|im_end|>`
+        // literally) stays rejected.
+        let cand_is_eog = eog.contains(&cand.id);
         buf.clear();
         model.token_to_piece_ref(cand.id, &mut buf);
         if buf.is_empty() {
+            continue;
+        }
+        if cand_is_eog {
+            if state.completes_with(&buf) {
+                kept.push(*cand);
+            }
             continue;
         }
         if state.accepts_bytes(&buf) {

@@ -795,6 +795,13 @@ impl GrammarState {
         self.inner.accepts_bytes(&self.grammar, bytes)
     }
 
+    /// True iff feeding `bytes` would succeed AND leave the matcher in
+    /// an accepting state — the EOG-doubles-as-exit test (see
+    /// [`grammar_filter`]'s EOG policy). Does not mutate `self`.
+    pub fn completes_with(&self, bytes: &[u8]) -> bool {
+        self.inner.completes_with(&self.grammar, bytes)
+    }
+
     /// 256-bit bitmap indexed by byte value: bit `b` is set iff feeding
     /// byte `b` next could plausibly extend the match into a codepoint
     /// accepted by at least one active stack. See
@@ -852,6 +859,12 @@ impl StackState {
     fn accepts_bytes(&self, grammar: &Grammar, bytes: &[u8]) -> bool {
         let mut scratch = self.clone();
         scratch.advance_bytes(grammar, bytes).is_ok()
+    }
+
+    /// [`Self::accepts_bytes`] + the scratch state ends accepting.
+    fn completes_with(&self, grammar: &Grammar, bytes: &[u8]) -> bool {
+        let mut scratch = self.clone();
+        scratch.advance_bytes(grammar, bytes).is_ok() && scratch.is_complete()
     }
 
     /// Conservative 256-bit bitmap of which first byte values could plausibly
@@ -1239,11 +1252,10 @@ impl DfaCache {
     /// True iff the state is an accepting state (empty pending + at least one
     /// empty stack).
     ///
-    /// Currently unused: `GrammarState::is_complete` answers completeness
-    /// off the NFA `StackState` directly, even when the DFA cache is
-    /// active. Kept as the DFA-side mirror (with its `complete` memo
-    /// above) for when the completeness check moves behind the cache.
-    #[allow(dead_code)]
+    /// Used by `grammar_filter`'s EOG exemption: an end-of-generation
+    /// token survives mid-parse only when the DFA state after its
+    /// piece bytes is accepting (a dialect exit marker doubling as a
+    /// stop token).
     pub(crate) fn is_complete(&self, sid: StateId) -> bool {
         if sid == REJECT_STATE {
             return false;
@@ -1866,8 +1878,9 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
     // once the repetition penalty crushes the structural tokens the
     // grammar keeps forcing.
     //
-    // Mid-parse, additionally drop end-of-generation tokens BY ID.
-    // Byte-acceptance is the wrong test for EOG: inside a raw
+    // Mid-parse, additionally drop end-of-generation tokens BY ID —
+    // UNLESS the token's own piece bytes finish the constraint.
+    // Byte-acceptance alone is the wrong test for EOG: inside a raw
     // `until()` region every byte sequence is legal value content —
     // including the literal piece bytes of `<|im_end|>` — so the
     // matcher can never reject EOG and the predictor's stop fires
@@ -1876,9 +1889,13 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
     // `<|im_end|>`; greedy was immune). An active constraint owns
     // termination: EOG becomes legal again once the grammar reaches
     // an accept state — the same rule llama.cpp's grammar sampler
-    // applies. NOTE for Harmony (plan Phase G): `<|return|>` is both
-    // EOG and grammar-terminal; that works because the grammar is
-    // complete by the time it appears.
+    // applies. The completes-with exemption covers dialect exit
+    // markers that libllama also marks EOG (Gemma 4's
+    // `<|tool_response>`, plan Phase G postmortem): the grammar
+    // REQUIRES the marker as its final bytes, so rejecting it by id
+    // left the model with no legal path and generation burned to the
+    // context limit. Harmony's `<|return|>`/`<|call|>` need no
+    // exemption — the grammar is already complete when they appear.
     let complete = state.is_complete();
     let eog: Vec<crate::Token> = if complete {
         Vec::new()
@@ -1895,9 +1912,10 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
         .as_slice()
         .par_iter()
         .fold(Acc::default, |mut a, cand| {
-            if !complete && eog.contains(&cand.id) {
-                return a;
-            }
+            // `eog` is empty once complete, so this only marks
+            // mid-parse EOG candidates: kept below only when their
+            // own bytes finish the constraint (exit-marker case).
+            let cand_is_eog = eog.contains(&cand.id);
             let mut buf: Vec<u8> = Vec::with_capacity(32);
             model.token_to_piece_ref(cand.id, &mut buf);
             if buf.is_empty() {
@@ -1919,7 +1937,14 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
                         break;
                     }
                 }
-                !rejected && cache.terminal_valid(grammar, sid)
+                !rejected
+                    && if cand_is_eog {
+                        cache.is_complete(sid)
+                    } else {
+                        cache.terminal_valid(grammar, sid)
+                    }
+            } else if cand_is_eog {
+                inner.completes_with(grammar, &buf)
             } else {
                 inner.accepts_bytes(grammar, &buf)
             };

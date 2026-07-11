@@ -1836,6 +1836,49 @@ mod tests {
         }
     }
 
+    /// The eager grammar must exit the thought until-region on a
+    /// close marker WITHOUT the canonical leading newline. Trap
+    /// regression (plan Phase G postmortem): with the delimiter
+    /// `"\n<channel|>"`, a model closing as `...text<channel|>` could
+    /// never leave the region — every later byte was legal thought
+    /// content — and generation free-ran to the token budget. The
+    /// grammar now keys on the trimmed close, like the parser always
+    /// did; the missing newline costs a one-turn canonicalization
+    /// repair instead.
+    #[test]
+    fn gemma4_thought_close_without_newline_exits_grammar() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        use crate::{Grammar, GrammarState};
+        use std::sync::Arc;
+
+        let syntax = CallSyntax::gemma4();
+        let t = tool("get_weather");
+        let input = serde_json::json!({"city": "Paris", "days": 3});
+        let call = render_reference(&syntax, &[("get_weather", &input)])
+            .expect("representable");
+        let src = grammar_source(
+            &syntax,
+            &[&t],
+            &EmitOptions {
+                anchor: Anchor::Eager,
+                parallel: true,
+            },
+        )
+        .expect("emit");
+        let grammar = Arc::new(Grammar::parse(&src).expect("grammar"));
+        for close in ["\n<channel|>", "<channel|>"] {
+            let emission = format!(
+                "<|channel>thought\nplanning{close}{call}<|tool_response>"
+            );
+            let mut state = GrammarState::new(grammar.clone());
+            assert!(
+                state.advance_bytes(emission.as_bytes()).is_ok()
+                    && state.is_complete(),
+                "close {close:?} must exit the thought and complete\n{src}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------
     // Gemma 4 (TagWithDict): upstream test-matrix port
     // (llama.cpp tests/test-chat.cpp, "Google Gemma 4" section).
