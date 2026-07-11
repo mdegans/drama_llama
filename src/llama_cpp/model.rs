@@ -578,6 +578,25 @@ impl LlamaCppModel {
     }
     /// Tokenize a string into a Vec of tokens.
     pub fn tokenize(&self, input: &str, special: bool) -> Vec<llama_token> {
+        let mut result =
+            self.tokenize_raw_special(input, self.add_bos(), special);
+        if self.add_eos() {
+            result.push(self.eos());
+        }
+        result
+    }
+
+    /// Raw `llama_tokenize` with explicit `add_special` (controls the
+    /// vocab-driven automatic BOS) and no EOS append. Building block
+    /// for [`Self::tokenize`] and the trait's `tokenize_special` —
+    /// the media segment path needs mid-stream pieces tokenized
+    /// without leading specials.
+    fn tokenize_raw_special(
+        &self,
+        input: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Vec<llama_token> {
         // Adapted from `llama.cpp/common/common.cpp` which is not exposed to
         // the public API.
 
@@ -585,7 +604,7 @@ impl LlamaCppModel {
         // guaranteed to be enough, but it will probably be enough in most
         // cases.
         let mut n_tokens: i32 = (input.as_bytes().len()
-            + if self.add_bos() { 1 } else { 0 })
+            + if add_special { 1 } else { 0 })
         .try_into()
         .unwrap();
         n_tokens /= 3;
@@ -604,8 +623,8 @@ impl LlamaCppModel {
                 input.len().try_into().unwrap(),
                 result.as_mut_ptr(),
                 result.len().try_into().unwrap(),
-                self.add_bos(),
-                special,
+                add_special,
+                parse_special,
             )
         };
 
@@ -622,17 +641,13 @@ impl LlamaCppModel {
                     input.len().try_into().unwrap(),
                     result.as_mut_ptr(),
                     result.len().try_into().unwrap(),
-                    self.add_bos(),
-                    special,
+                    add_special,
+                    parse_special,
                 )
             };
             assert_eq!(check, -n_tokens);
         } else {
             result.resize(n_tokens as usize, 0);
-        }
-
-        if self.add_eos() {
-            result.push(self.eos());
         }
 
         result
@@ -762,6 +777,20 @@ impl crate::backend::Model for LlamaCppModel {
 
     fn tokenize(&self, input: &str, special: bool) -> Vec<crate::Token> {
         LlamaCppModel::tokenize(self, input, special)
+    }
+
+    fn tokenize_special(
+        &self,
+        input: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Vec<crate::Token> {
+        let mut result =
+            self.tokenize_raw_special(input, add_special, parse_special);
+        if add_special && self.add_eos() {
+            result.push(LlamaCppModel::eos(self));
+        }
+        result
     }
 
     fn token_to_piece(&self, token: crate::Token) -> String {

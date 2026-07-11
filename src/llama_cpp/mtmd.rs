@@ -363,68 +363,31 @@ impl Vision<LlamaCppDecoder> for Mtmd {
         Mtmd::supports_images(self)
     }
 
-    /// Segment assembly: each text segment tokenizes with ZERO
-    /// bitmaps (mtmd never sees a marker in caller text — marker
-    /// injection is structurally impossible), and each image
-    /// tokenizes as a lone marker + placeholder bitmap, exactly the
-    /// call `prefill_image` makes for the real encode. Wrapper
-    /// tokens the model adds around media (`<|vision_start|>` …)
-    /// come back as text chunks from the per-image tokenization and
-    /// are kept in place. Per-bitmap preprocessing identity
-    /// (validated in Phase B) is what makes this equal to a
-    /// full-text `mtmd_tokenize` on marker-clean prompts — see the
-    /// `segment_tokenize_differential` test.
-    fn tokenize(
+    /// One image = lone marker + placeholder bitmap through
+    /// `mtmd_tokenize` — exactly the call `prefill_image` makes for
+    /// the real encode (per-bitmap preprocessing identity, validated
+    /// in Phase B), so the placeholder span always matches the
+    /// encode-time span. Wrapper tokens the model frames media with
+    /// (`<|vision_start|>` …) come back as text chunks around the
+    /// media chunk and are returned in place. Prompt text NEVER
+    /// enters this function — only the marker constant does — so no
+    /// content byte can ever be interpreted as a marker.
+    fn tokenize_image(
         &self,
-        segments: &[&str],
-        images: &[ImageInfo],
-        add_special: bool,
+        image: &ImageInfo,
         parse_special: bool,
     ) -> Result<Vec<MediaChunk>, Self::Error> {
-        if segments.len() != images.len() + 1 {
-            return Err(MtmdTokenizeError::MarkerMismatch {
-                markers: segments.len().saturating_sub(1),
-                images: images.len(),
-            }
-            .into());
-        }
-        let mut out: Vec<MediaChunk> = Vec::new();
-        for (i, segment) in segments.iter().enumerate() {
-            if !segment.is_empty() {
-                let chunks = self.tokenize_raw(
-                    segment,
-                    &[],
-                    add_special && i == 0,
-                    parse_special,
-                )?;
-                out.extend(chunks.to_media_chunks(0)?);
-            }
-            if let Some(info) = images.get(i) {
-                let placeholder = Bitmap::placeholder(info)?;
-                let chunks = self.tokenize_raw(
-                    &self.marker,
-                    std::slice::from_ref(&placeholder),
-                    false,
-                    true,
-                )?;
-                out.extend(chunks.to_media_chunks(1)?);
-            }
-        }
-        // Merge adjacent text chunks so the output is independent of
-        // where segment boundaries fell (a text run split across a
-        // segment/wrapper boundary must compare equal to the same
-        // run tokenized whole).
-        let mut merged: Vec<MediaChunk> = Vec::with_capacity(out.len());
-        for chunk in out {
-            match (merged.last_mut(), chunk) {
-                (
-                    Some(MediaChunk::Text(acc)),
-                    MediaChunk::Text(more),
-                ) => acc.extend(more),
-                (_, chunk) => merged.push(chunk),
-            }
-        }
-        Ok(merged)
+        let placeholder =
+            Bitmap::placeholder(image).map_err(MtmdError::Tokenize)?;
+        let chunks = self
+            .tokenize_raw(
+                &self.marker,
+                std::slice::from_ref(&placeholder),
+                false,
+                parse_special,
+            )
+            .map_err(MtmdError::Tokenize)?;
+        Ok(chunks.to_media_chunks(1).map_err(MtmdError::Tokenize)?)
     }
 
     /// Rust-owned eval loop (Phase C+D): tokenize a lone marker with
@@ -1095,9 +1058,42 @@ mod tests {
         let segments =
             ["<|im_start|>user\nCompare ", " with ", "<|im_end|>\n"];
 
-        let via_segments =
-            Vision::tokenize(&mtmd, &segments, &infos, false, true)
-                .expect("segment tokenize");
+        // Session-style assembly: text through the MODEL tokenizer
+        // (segment 0 like a full render, later segments without
+        // leading specials), each image through tokenize_image.
+        #[derive(Debug, PartialEq)]
+        enum Flat {
+            Tok(crate::Token),
+            Media([u8; 32], MediaSpan),
+        }
+        let flatten = |chunks: &[MediaChunk], out: &mut Vec<Flat>| {
+            for c in chunks {
+                match c {
+                    MediaChunk::Text(ts) => {
+                        out.extend(ts.iter().map(|t| Flat::Tok(*t)))
+                    }
+                    MediaChunk::Media { id, span } => {
+                        out.push(Flat::Media(*id, *span))
+                    }
+                }
+            }
+        };
+
+        let mut assembled: Vec<Flat> = Vec::new();
+        for (i, segment) in segments.iter().enumerate() {
+            use crate::backend::Model as _;
+            let tokens = if i == 0 {
+                crate::backend::Model::tokenize(&model, segment, true)
+            } else {
+                model.tokenize_special(segment, false, true)
+            };
+            assembled.extend(tokens.into_iter().map(Flat::Tok));
+            if let Some(info) = infos.get(i) {
+                let chunks = Vision::tokenize_image(&mtmd, info, true)
+                    .expect("image tokenize");
+                flatten(&chunks, &mut assembled);
+            }
+        }
 
         let joined = format!(
             "{}{m}{}{m}{}",
@@ -1109,18 +1105,19 @@ mod tests {
         let via_marker = mtmd
             .tokenize(&joined, &infos, false, true)
             .expect("marker tokenize");
+        let mut reference: Vec<Flat> = Vec::new();
+        flatten(&via_marker, &mut reference);
 
         assert_eq!(
-            via_segments, via_marker,
+            assembled, reference,
             "segment assembly must equal mtmd's own marker splitting"
         );
-        // Sanity: both carry the two media chunks with round-tripped
-        // ids, in order.
-        let ids: Vec<_> = via_segments
+        // Sanity: the two media items round-trip their ids, in order.
+        let ids: Vec<_> = assembled
             .iter()
-            .filter_map(|c| match c {
-                MediaChunk::Media { id, .. } => Some(*id),
-                _ => None,
+            .filter_map(|f| match f {
+                Flat::Media(id, _) => Some(*id),
+                Flat::Tok(_) => None,
             })
             .collect();
         assert_eq!(ids, vec![[7; 32], [9; 32]]);

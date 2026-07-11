@@ -252,6 +252,78 @@ House style: thiserror per-op error enums, `assert_impl_all!(Send)`.
   `load_mmproj()` for arbitrary paths. Session `from_path` wiring
   lands with C+D (Session can't consume images until then).
 
+## Phase C+D — LANDED 2026-07-11 (session summary)
+
+All ten work items shipped in one session (commits: probe → eval loop
+→ sentinel/segment tokenize → session cache surgery → tokenize_image
+redesign + e2e + emit ban). Findings and design deltas beyond the
+plan text below:
+
+1. **M-RoPE geometry is more extreme than sketched** (probe,
+   validated live): ALL image cells carry `t = pos_0` — one tracked
+   position for the whole image, `n_pos = max(nx, ny)`, and the
+   positions `(pos_0, pos_0+n_pos)` are a GAP nothing occupies.
+   `pos_max` after an image reports `pos_0`. Also: Qwen 3.6 is a
+   HYBRID (recurrent+attention) — partial-range `memory_seq_rm` is
+   refused wholesale, so restore only ever works via checkpoint
+   snapshots; checkpoint-at-boundary → restore → re-extend across a
+   media chunk validated, including at the image-end boundary.
+   Recurrent memory logs benign "non-consecutive token position"
+   warnings on every M-RoPE jump.
+2. **Sentinel design upgraded during implementation**: emission is
+   `<{R}:{source_hash_hex}>` (R = 32-hex per-call random,
+   source hash = sha256 of the block's base64) — the embedded source
+   hash removes any renderer/collector ordering contract and
+   survives message-reordering templates. Cache hashes are
+   `hash_segments` over the SPLIT STRUCTURE (length-prefixed
+   segments + RGB8 ids interleaved) at BOTH the per-partial and tip
+   sites — flat-string canonicalization was found forgeable by
+   content containing the placeholder.
+3. **Vision::tokenize(segments, …) was NOT injection-proof** — e2e
+   caught it: mtmd_tokenize splits on `<__media__>` inside any text
+   it is given, including our segments. Final design:
+   `Vision::tokenize_image(&ImageInfo)` only (wrapper text chunks +
+   media chunk); Session tokenizes text segments through
+   `Model::tokenize` (segment 0) / new `Model::tokenize_special`
+   (later segments, `add_special=false` so BOS-adding vocabs don't
+   re-prefix mid-stream). mtmd never sees ANY prompt text. Segment
+   differential test proves assembly == mtmd's own splitting.
+4. **Rust eval loop bitwise-matches the upstream helper** (Qwen 3.6
+   CPU, first try). `EmbdBatch` plane order is `(t, y, x, z)`;
+   `mtmd_decoder_pos` fields are declared `uint32_t` upstream but
+   hold llama_pos values. Helper path kept crate-private for the
+   differential.
+5. **mmproj sidecar discovery follows symlinks** (sidecar.rs):
+   `models/model.gguf → real.gguf` finds `real.mmproj.gguf`.
+6. **Emit ban set logic**: exempt = EOG family + specials whose
+   piece is CONTAINED IN a dialect marker (preserved_tokens +
+   section/per_call/reasoning/tool_response_start — NOT
+   user_start/assistant_start, which are parser anchors the model
+   never emits; Harmony's in-stream framing lives in its
+   preserved_tokens explicitly). Two traps found live: empty
+   preserved entries (`piece.contains("")` exempts everything) and
+   the reverse-substring direction (`">"` marker exempts every
+   special). Ban rides the #28 snapshot: O(log n) check of the
+   sampled id, full masked resample on hit, force-EOS when vacuous.
+   `Session::with_emit_specials_ban(false)` opts out (Qwen-VL
+   grounding markers like `<|box_start|>` are not dialect markers).
+7. **User-supplied `SamplingMode::Grammar` shares matcher state
+   across calls** (Arc) — pre-existing Session semantics, bit the
+   e2e; per-call constraints must be rebuilt via `with_sampling`.
+   Production tool-choice grammars are compiled fresh per call and
+   unaffected.
+8. e2e green (Qwen 3.6, CPU): grammar-constrained "samoyed";
+   identical re-ask reuses through the image (no re-encode);
+   multi-turn reuse crosses the media prefix and answers "white"
+   (attention over restored image cells); swapped image misses AT
+   the media entry; literal `<__media__>` in content inert.
+
+Open / carried forward: SmolVLM CI plumbing test + model-download
+caching; Gemma 4 non-causal e2e written (`#[ignore]`, very slow on
+CPU — run when GPU available); moeflux `NoVision`/`tokenize_special`
+compile-check on the next mac session; decode memoization behind the
+`decode_image` funnel; streaming tip extension (v2).
+
 ## Phase C0 — special-token ingest integrity (standalone session, pre-C+D)
 
 Added in the 2026-07-11 plan-bounce. A pre-existing injection hole,

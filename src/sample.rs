@@ -153,6 +153,21 @@ pub struct SampleOptions {
     /// Has no effect when `modes` contains no `Grammar`/`Json` mode.
     #[cfg_attr(feature = "serde", serde(default))]
     pub lazy_grammar: bool,
+    /// Emit-side special-token ban (sorted ids): specials the active
+    /// chat dialect never legitimately emits — turn-open markers,
+    /// reserved-vocab controls — everything except EOG tokens and the
+    /// dialect's own in-stream markers. Checked on the SAMPLED token
+    /// (O(log n) per token, the accept-then-mask shape) with a full
+    /// masked resample only on a hit, so free prose can't smuggle
+    /// chat-framing tokens into the transcript (the emission-side
+    /// sibling of `Session`'s ingest injection guard). The banned
+    /// token's byte *text* stays expressible through ordinary
+    /// tokenization — this bans the control token id, not the
+    /// characters. Empty (the default) disables the check. Runtime
+    /// wiring set by `Session` per call from the model's specials ×
+    /// the analyzed dialect; not serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub banned_specials: std::sync::Arc<[Token]>,
 }
 
 /// A grammar that starts suspended and activates once a specific byte
@@ -198,6 +213,7 @@ impl SampleOptions {
             repetition: None,
             deferred_grammar: None,
             lazy_grammar: false,
+            banned_specials: std::sync::Arc::from([]),
         }
     }
 
@@ -350,6 +366,7 @@ impl Default for SampleOptions {
             repetition: Some(RepetitionOptions::default()),
             deferred_grammar: None,
             lazy_grammar: false,
+            banned_specials: std::sync::Arc::from([]),
         }
     }
 }
@@ -1213,14 +1230,16 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
         && opts.modes.iter().any(|m| {
             matches!(m, SamplingMode::Json(_) | SamplingMode::Grammar(_))
         });
+    let banned = opts.banned_specials.clone();
 
-    // Lazy fallback snapshots: `Xoroshiro128` is `Copy` (`[u64; 2]`), `mu`
-    // is a plain `Option<f32>`, and the pre-fold candidates clone is a
-    // straight memcpy of the vector. Restoring these and replaying the
-    // fold consumes the identical RNG draw sequence on either path, so a
-    // fixed seed yields the same stream every run regardless of how many
-    // checks fall back.
-    let snapshot = if lazy {
+    // Fallback snapshots (lazy-grammar check and/or emit-side specials
+    // ban): `Xoroshiro128` is `Copy` (`[u64; 2]`), `mu` is a plain
+    // `Option<f32>`, and the pre-fold candidates clone is a straight
+    // memcpy of the vector. Restoring these and replaying the fold
+    // consumes the identical RNG draw sequence on either path, so a
+    // fixed seed yields the same stream every run regardless of how
+    // many checks fall back.
+    let snapshot = if lazy || !banned.is_empty() {
         Some((*rng, *mu, candidates.clone()))
     } else {
         None
@@ -1232,7 +1251,9 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
         .unwrap()
         .id;
 
-    if let Some((rng_snap, mu_snap, saved)) = snapshot {
+    if let Some((rng_snap, mu_snap, saved)) =
+        snapshot.as_ref().filter(|_| lazy)
+    {
         // Verify just the chosen token's piece against every constraint —
         // O(piece bytes) vs the O(vocab) filter sweep. Matching the
         // masked filters: empty pieces are rejected outright (zero
@@ -1289,9 +1310,46 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
             // masked path, grammar filters included — with the forced-EOS
             // termination those filters provide when nothing legal
             // remains.
+            *rng = *rng_snap;
+            *mu = *mu_snap;
+            let filtered =
+                apply_modes(saved.clone(), opts, rng, mu, model, false);
+            chosen = choose_candidate(rng, filtered.softmax(None))
+                .is_one()
+                .unwrap()
+                .id;
+        }
+    }
+
+    // Emit-side special-token ban (#31 item 9): the sampled id is
+    // checked against the dialect ban set — O(log n) per token, the
+    // same accept-then-mask shape as the lazy path above. On a hit
+    // (pathological, not steady-state) restore the pre-fold state,
+    // drop every banned id from the candidates, and rerun the full
+    // masked path. The emission is never silently rewritten: the
+    // resample IS the mask, applied before anything commits, and a
+    // vacuously-empty candidate set forces EOS exactly like
+    // `SamplingMode::Deny`.
+    if !banned.is_empty() && banned.binary_search(&chosen).is_ok() {
+        if let Some((rng_snap, mu_snap, saved)) = snapshot {
             *rng = rng_snap;
             *mu = mu_snap;
-            let filtered = apply_modes(saved, opts, rng, mu, model, false);
+            let kept: Vec<crate::TokenData> = saved
+                .as_slice()
+                .iter()
+                .filter(|td| banned.binary_search(&td.id).is_err())
+                .copied()
+                .collect();
+            let cleaned = if kept.is_empty() {
+                Candidates::from_vec(vec![crate::TokenData {
+                    id: model.eos(),
+                    logit: 0.0,
+                    p: 0.0,
+                }])
+            } else {
+                Candidates::from_vec_unchecked(kept)
+            };
+            let filtered = apply_modes(cleaned, opts, rng, mu, model, false);
             chosen = choose_candidate(rng, filtered.softmax(None))
                 .is_one()
                 .unwrap()
@@ -1522,6 +1580,7 @@ mod tests {
             repetition: None,
             deferred_grammar: None,
             lazy_grammar: lazy,
+            ..SampleOptions::default()
         }
     }
 
@@ -1548,6 +1607,72 @@ mod tests {
         let mut freq = NGramStats::new();
         sample_token(&[], candidates, opts, &mut freq, rng, mu, &MockModel)
             .expect("sample_token")
+    }
+
+    /// Emit-side special-token ban (#31 item 9): a banned sampled id
+    /// triggers the masked resample (never surfaced), a non-banned
+    /// winner is untouched, and a vacuously-banned candidate set
+    /// forces EOS.
+    #[test]
+    fn banned_specials_masked_resample() {
+        let mut opts = SampleOptions {
+            modes: vec![SamplingMode::Greedy],
+            repetition: None,
+            deferred_grammar: None,
+            lazy_grammar: false,
+            banned_specials: vec![X].into(),
+        };
+        let mut r = rng();
+        let mut mu = None;
+
+        // Banned winner is masked; next-best is sampled instead.
+        let picked = sample(
+            cands(&[(X, 10.0), (A, 5.0), (B, 1.0)]),
+            &mut opts,
+            &mut r,
+            &mut mu,
+        );
+        assert_eq!(picked, A, "banned winner must be masked, not surfaced");
+
+        // Non-banned winner passes untouched.
+        let picked =
+            sample(cands(&[(A, 10.0), (X, 5.0)]), &mut opts, &mut r, &mut mu);
+        assert_eq!(picked, A);
+
+        // Every candidate banned → forced EOS (Deny semantics), so
+        // generation terminates instead of deadlocking.
+        let mut opts = SampleOptions {
+            modes: vec![SamplingMode::Greedy],
+            repetition: None,
+            deferred_grammar: None,
+            lazy_grammar: false,
+            banned_specials: vec![A, B, C, X].into(),
+        };
+        let picked =
+            sample(cands(&[(A, 10.0), (X, 5.0)]), &mut opts, &mut r, &mut mu);
+        assert_eq!(picked, EOS);
+    }
+
+    /// Ban vs grammar conflict: banning a token the grammar requires
+    /// resolves to the grammar's forced-EOS termination, never a
+    /// banned emission and never a deadlock. (Session never bans
+    /// dialect-marker tokens, so this is a mechanism guarantee, not a
+    /// steady-state path.)
+    #[test]
+    fn banned_specials_with_grammar_terminates() {
+        let mut opts = opts_with_grammar(false);
+        opts.banned_specials = vec![A].into();
+        let mut r = rng();
+        let mut mu = None;
+        // Grammar "ab" requires A first; A is banned → masked rerun
+        // has no legal candidate → force-EOS.
+        let picked = sample(
+            cands(&[(A, 10.0), (B, 5.0), (X, 1.0)]),
+            &mut opts,
+            &mut r,
+            &mut mu,
+        );
+        assert_eq!(picked, EOS);
     }
 
     /// Legal unconstrained winner: fast path must keep it and advance the

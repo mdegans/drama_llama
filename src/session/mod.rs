@@ -896,6 +896,14 @@ pub struct Session<B: Backend> {
     /// changes rather than RNG noise.
     seed: Option<std::num::NonZeroU128>,
     max_tokens: NonZeroUsize,
+    /// Emit-side special-token ban (on by default): the sampled token
+    /// is checked against [`Session::emit_ban_set`] each step, and
+    /// chat-framing specials the dialect never legitimately emits are
+    /// masked + resampled. Disable via
+    /// [`Session::with_emit_specials_ban`] for workloads where the
+    /// model legitimately emits non-dialect specials (e.g. Qwen-VL
+    /// grounding markers like `<|box_start|>`).
+    emit_specials_ban: bool,
     /// Prefix-cache state. `Some` iff the caller opted in via
     /// [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
     /// `None` means every call is a full re-prefill (the pre-0.7
@@ -1344,6 +1352,7 @@ impl<B: Backend> Session<B> {
             sample_options: SampleOptions::default(),
             seed: Some(crate::PredictOptions::DEFAULT_SEED),
             max_tokens: NonZeroUsize::new(DEFAULT_MAX_TOKENS).unwrap(),
+            emit_specials_ban: true,
             prefix_cache: None,
             last_usage: Usage::default(),
             total_usage: Usage::default(),
@@ -1584,27 +1593,136 @@ impl<B: Backend> Session<B> {
             .expect("min of two NonZero values is NonZero")
     }
 
-    /// Up-front context-fit check in CELL space (plan #31 item 6):
-    /// Σ `n_cells` over the prompt's entries plus the generation
-    /// budget must fit `n_ctx`. The predictor's own guard reasons in
-    /// positions, which undercounts M-RoPE images (~1024 cells over
-    /// ~16-32 positions) — without this check such a prompt would
-    /// exhaust KV slots mid-decode instead of failing typed up front.
+    /// The emit-side special-token ban set (#31 item 9), handed to
+    /// [`SampleOptions::banned_specials`] on every call: specials the
+    /// active dialect never legitimately emits. Universe is
+    /// [`Model::special_tokens`]; exempt are the EOG family (eos,
+    /// eot, extra EOS) and any special whose piece overlaps a dialect
+    /// marker in either substring direction — tool-call framing,
+    /// reasoning tags, Harmony's in-stream message framing. What
+    /// remains is chat structure the model must never inject
+    /// mid-generation (turn-open markers like `<|im_start|>`, BOS,
+    /// reserved-vocab controls): the emission-side sibling of the
+    /// ingest injection guard, same set logic as the Qwen3
+    /// reserved-token grammar fix but standing rather than
+    /// grammar-only. Sorted for the sampler's binary search.
+    ///
+    /// Returns the empty set when the ban is disabled
+    /// ([`Session::with_emit_specials_ban`]).
+    ///
+    /// [`Model::special_tokens`]: crate::backend::Model::special_tokens
+    /// [`SampleOptions::banned_specials`]: crate::SampleOptions
+    fn emit_ban_set(&self) -> std::sync::Arc<[Token]> {
+        if !self.emit_specials_ban {
+            return std::sync::Arc::from([]);
+        }
+        let model = &self.engine.model;
+        let syntax = effective_tool_syntax(&self.dialect);
+        // Trimmed and non-empty: an empty marker would exempt every
+        // special via the vacuous `piece.contains("")`.
+        let mut markers: Vec<String> = syntax
+            .preserved_tokens
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        // NOT included: `user_start` / `assistant_start`. Those are
+        // parser anchors for re-ingested transcripts — the template
+        // writes them, the model never emits them (Qwen's
+        // `<|im_start|>` must stay banned). Harmony, whose model DOES
+        // emit message framing mid-generation, carries those pieces
+        // in `preserved_tokens` explicitly — mirroring the analyzer's
+        // own `collect_preserved_tokens` exclusion of the anchors.
+        for s in [
+            &syntax.section_start,
+            &syntax.section_end,
+            &syntax.per_call_start,
+            &syntax.per_call_end,
+            &syntax.reasoning.start,
+            &syntax.reasoning.end,
+            &syntax.tool_response_start,
+        ] {
+            let t = s.trim();
+            if !t.is_empty() {
+                markers.push(t.to_string());
+            }
+        }
+        let mut eog = vec![model.eos(), model.eot()];
+        eog.extend(model.extra_eos_tokens());
+        let mut banned: Vec<Token> = model
+            .special_tokens()
+            .into_iter()
+            .filter(|&t| {
+                if eog.contains(&t) {
+                    return false;
+                }
+                let piece = model.token_to_piece(t);
+                if piece.is_empty() {
+                    // Empty-piece reserved tokens: invisible in output,
+                    // never legitimate, classic loop fuel.
+                    return true;
+                }
+                // Exempt iff some marker CONTAINS the piece (equal or
+                // wrapped, e.g. `<tool_call>` inside `<tool_call>\n`).
+                // The reverse direction would let short structural
+                // markers (`>` from `<function=…>` syntax) vacuously
+                // exempt every special.
+                !markers.iter().any(|m| m.contains(piece.as_str()))
+            })
+            .collect();
+        banned.sort_unstable();
+        banned.dedup();
+        banned.into()
+    }
+
+    /// Up-front context-fit check in CELL space (plan #31 item 6).
+    ///
+    /// The predictor's own guard reasons in POSITIONS: it stops
+    /// generation once the cursor reaches `n_ctx`, which is exactly
+    /// right for text (1 cell per position — a too-large `max_tokens`
+    /// soft-truncates, the long-standing behavior). Media breaks the
+    /// equivalence: an M-RoPE image occupies ~1024 KV cells while
+    /// advancing positions by ~16-32, so a prompt can look
+    /// position-fine and still exhaust KV slots mid-decode (landing
+    /// in the predictor's `expect`s). This check models that exactly:
+    /// prompt cells plus the generation the predictor would actually
+    /// run (`max_tokens`, position-capped) must fit `n_ctx` cells.
+    /// For imageless prompts cells == positions and this can never
+    /// fire — text behavior is unchanged.
     fn check_context_fit(
         &mut self,
         entries: &[CacheEntry],
         max_tokens: usize,
     ) -> Result<(), SessionError> {
         let needed_cells = entries_cell_len(entries);
+        let prompt_pos: usize =
+            entries.iter().map(CacheEntry::n_pos).sum();
         let n_ctx = self.engine.n_ctx() as usize;
-        if needed_cells + max_tokens > n_ctx {
+        let worst_generated = max_tokens.min(n_ctx.saturating_sub(prompt_pos));
+        if needed_cells + worst_generated > n_ctx {
             return Err(SessionError::ContextOverflow {
                 needed_cells,
-                max_tokens,
+                max_tokens: worst_generated,
                 n_ctx,
             });
         }
         Ok(())
+    }
+
+    /// Enable (or disable) the emit-side special-token ban. On by
+    /// default: each sampled token is checked against the dialect ban
+    /// set (see [`SampleOptions::banned_specials`]) so free prose
+    /// cannot smuggle chat-framing control tokens — `<|im_start|>`
+    /// and friends — into the transcript. Disable for workloads where
+    /// the model legitimately emits specials the dialect doesn't
+    /// describe (e.g. Qwen-VL grounding markers `<|box_start|>` /
+    /// `<|object_ref_start|>`); the ingest-side injection guard still
+    /// protects re-ingestion either way.
+    ///
+    /// [`SampleOptions::banned_specials`]: crate::SampleOptions
+    pub fn with_emit_specials_ban(mut self, on: bool) -> Self {
+        self.emit_specials_ban = on;
+        self
     }
 
     /// Enable (or disable) prefix-cache reuse across `complete_*`
@@ -1873,16 +1991,25 @@ impl<B: Backend> Session<B> {
     }
 
     /// Media-aware tokenization of one render (full or partial):
-    /// split on the call sentinel, tokenize text segments + image
-    /// placeholders through the backend's [`Vision`], and hash the
-    /// split structure. Imageless renders — and sentinel-free
+    /// split on the call sentinel, tokenize the text segments through
+    /// the MODEL tokenizer (the vision backend never sees prompt
+    /// text — a literal `<__media__>` in content is inert prose),
+    /// each image through [`Vision::tokenize_image`], interleave, and
+    /// hash the split structure. Imageless renders — and sentinel-free
     /// partials that end before the prompt's first image — take the
-    /// plain tokenizer path (identical output; mtmd tokenizes
-    /// marker-free text with the same tokenizer).
+    /// plain tokenizer path (byte-identical output).
+    ///
+    /// Segment 0 tokenizes exactly like a full render
+    /// ([`Model::tokenize`], which owns the automatic-BOS decision);
+    /// later segments use [`Model::tokenize_special`] with
+    /// `add_special = false` so BOS-adding tokenizers don't re-prefix
+    /// mid-stream pieces.
     ///
     /// Returns `(entries, image RGB8 ids in render order, hash)`.
     ///
-    /// [`Vision`]: crate::backend::Vision
+    /// [`Vision::tokenize_image`]: crate::backend::Vision::tokenize_image
+    /// [`Model::tokenize`]: crate::backend::Model::tokenize
+    /// [`Model::tokenize_special`]: crate::backend::Model::tokenize_special
     fn tokenize_split(
         &self,
         text: &str,
@@ -1920,30 +2047,43 @@ impl<B: Backend> Session<B> {
                 })
             })
             .collect::<Result<Vec<[u8; 32]>, _>>()?;
-        let infos = ids
-            .iter()
-            .map(|id| {
-                media.media_by_id.get(id).map(|img| img.info()).ok_or_else(
-                    || {
-                        SessionError::Media(
-                            "media context is missing decoded pixels \
-                             for an image id"
-                                .into(),
-                        )
-                    },
-                )
-            })
-            .collect::<Result<Vec<crate::backend::ImageInfo>, _>>()?;
         let vision = self.engine.vision().ok_or_else(|| {
             SessionError::MediaUnsupported {
                 reason: "no vision projector is loaded".into(),
             }
         })?;
-        let chunks = vision
-            .tokenize(&split.segments, &infos, false, true)
-            .map_err(|e| SessionError::Media(format!("media tokenize: {e}")))?;
+
+        let mut entries: Vec<CacheEntry> = Vec::new();
+        for (i, segment) in split.segments.iter().enumerate() {
+            if !segment.is_empty() {
+                let tokens = if i == 0 {
+                    self.engine.model.tokenize(segment, true)
+                } else {
+                    self.engine.model.tokenize_special(segment, false, true)
+                };
+                entries.extend(tokens.into_iter().map(CacheEntry::Token));
+            }
+            if let Some(id) = ids.get(i) {
+                let info = media
+                    .media_by_id
+                    .get(id)
+                    .map(|img| img.info())
+                    .ok_or_else(|| {
+                        SessionError::Media(
+                            "media context is missing decoded pixels \
+                             for an image id"
+                                .into(),
+                        )
+                    })?;
+                let chunks =
+                    vision.tokenize_image(&info, true).map_err(|e| {
+                        SessionError::Media(format!("media tokenize: {e}"))
+                    })?;
+                entries.extend(entries_from_chunks(chunks));
+            }
+        }
         let hash = hash_segments(&split.segments, &ids);
-        Ok((entries_from_chunks(chunks), ids, hash))
+        Ok((entries, ids, hash))
     }
 
     /// Cache-aware superset of [`Self::prepare_call`]: renders the
@@ -2671,6 +2811,7 @@ impl<B: Backend> Session<B> {
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
             lazy_grammar: self.sample_options.lazy_grammar,
+            banned_specials: self.emit_ban_set(),
         };
 
         // Count pieces as we consume them — one piece equals one
@@ -2979,6 +3120,7 @@ impl<B: Backend> Session<B> {
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
             lazy_grammar: self.sample_options.lazy_grammar,
+            banned_specials: self.emit_ban_set(),
         };
 
         // The parse dialect + tool schemas outlive the engine borrow
@@ -3125,6 +3267,7 @@ impl<B: Backend> Session<B> {
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
             lazy_grammar: self.sample_options.lazy_grammar,
+            banned_specials: self.emit_ban_set(),
         };
 
         // Collect generated pieces + count tokens inline. The
@@ -5523,5 +5666,361 @@ mod tests {
             hash_keyed_l_hit(&[], &[], None, None, &[h], 500),
             ep(0)
         );
+    }
+
+    /// The emit-side ban set on a real vocab (Qwen 3.6): turn-open
+    /// framing is banned, EOG and dialect markers are exempt.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_emit_ban_set_qwen() {
+        let session = crate::LlamaCppSession::from_path_sync(model_path())
+            .unwrap()
+            .quiet();
+        let one = |s: &str| {
+            let toks = session.engine().model.tokenize(s, true);
+            assert_eq!(toks.len(), 1, "{s:?} must be one special token");
+            toks[0]
+        };
+        let ban = session.emit_ban_set();
+        let banned = |t: Token| ban.binary_search(&t).is_ok();
+
+        assert!(
+            banned(one("<|im_start|>")),
+            "turn-open framing must be banned"
+        );
+        assert!(
+            !banned(one("<|im_end|>")),
+            "EOG must be exempt (it ends generation legitimately)"
+        );
+        assert!(
+            !banned(one("<tool_call>")),
+            "dialect tool-call marker must be exempt"
+        );
+        assert!(
+            !banned(one("<think>")),
+            "dialect reasoning marker must be exempt"
+        );
+        assert!(!ban.is_empty(), "reserved specials should populate the set");
+    }
+
+    // -----------------------------------------------------------------
+    // Media (image input) end-to-end tests. All #[ignore] — require
+    // models/model.gguf with a <model>.mmproj.gguf sidecar next to
+    // the symlink target (Qwen 3.6 locally) and real wall-clock time
+    // (CPU projector encode + short constrained generations).
+    // -----------------------------------------------------------------
+
+    #[cfg(feature = "mtmd")]
+    mod media_e2e {
+        use super::*;
+        use misanthropic::prompt::message::{
+            Block, Content as MContent, Image as ApiImage, MediaType,
+        };
+
+        /// The committed samoyed fixture, downscaled for CPU encode
+        /// speed, re-encoded as an API image block payload.
+        fn samoyed_api_image(px: u32) -> ApiImage {
+            let jpg = std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/images/samoyed.jpg"
+            ))
+            .expect("committed fixture");
+            let rgba = image::load_from_memory(&jpg)
+                .expect("jpeg decode")
+                .thumbnail(px, px)
+                .to_rgba8();
+            ApiImage::encode(MediaType::Png, rgba).expect("png encode")
+        }
+
+        fn text_block(s: &str) -> Block {
+            Block::Text {
+                text: s.to_string().into(),
+                cache_control: None,
+                citations: None,
+            }
+        }
+
+        /// System (cached) + one user turn of question text followed
+        /// by the image, with a cache marker on the turn.
+        fn image_prompt(question: &str, api: ApiImage) -> Prompt {
+            let mut p = Prompt::default()
+                .system("You are a concise assistant.")
+                .cache();
+            p.messages.push(crate::Message {
+                role: crate::Role::User,
+                content: MContent(vec![
+                    text_block(question),
+                    Block::Image {
+                        image: api,
+                        cache_control: None,
+                    },
+                ]),
+            });
+            p.cache()
+        }
+
+        fn media_session_for(
+            path: std::path::PathBuf,
+        ) -> crate::Session<crate::LlamaCppBackend> {
+            let session =
+                crate::LlamaCppSession::from_path_with_n_ctx(path, 8192)
+                    .unwrap()
+                    .quiet()
+                    .with_prefix_cache(true)
+                    .with_max_tokens(NonZeroUsize::new(24).unwrap());
+            assert!(
+                session.engine().vision().is_some(),
+                "mmproj sidecar should auto-load (symlinks resolve to \
+                 the target's sibling)"
+            );
+            session
+        }
+
+        fn media_session() -> crate::Session<crate::LlamaCppBackend> {
+            media_session_for(model_path())
+        }
+
+        fn text_of(msg: &misanthropic::response::Message) -> String {
+            msg.inner
+                .content
+                .0
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text { text, .. } => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// `(cells before the media entry, media cell count, media id)`
+        /// from the recorded cache state.
+        fn media_entry_stats(
+            session: &crate::Session<crate::LlamaCppBackend>,
+        ) -> (usize, usize, [u8; 32]) {
+            let cache = session.prefix_cache.as_ref().expect("cache on");
+            let idx = cache
+                .prev_entries
+                .iter()
+                .position(CacheEntry::is_media)
+                .expect("a media entry should be recorded");
+            let before = entries_cell_len(&cache.prev_entries[..idx]);
+            match cache.prev_entries[idx] {
+                CacheEntry::Media { id, span } => {
+                    (before, span.n_tokens as usize, id)
+                }
+                CacheEntry::Token(_) => unreachable!(),
+            }
+        }
+
+        /// The plan's breed-level assertion, grammar-constrained to a
+        /// fixed list so the answer is exactly one word — plus the
+        /// cache contract across three calls: full prefill, identical
+        /// re-ask (media reused from KV, no re-encode), and a
+        /// follow-up turn whose reuse crosses the media prefix.
+        #[test]
+        #[ignore = "long running; requires local model + mmproj sidecar"]
+        fn media_e2e_breed_cache_and_multiturn() {
+            let breeds = r#"root ::= ("Samoyed" | "samoyed" | "Poodle" | "poodle" | "Husky" | "husky" | "Labrador" | "labrador" | "Pug" | "pug")"#;
+            let colors = r#"root ::= ("White" | "white" | "Black" | "black" | "Brown" | "brown" | "Golden" | "golden" | "Gray" | "gray")"#;
+
+            // A user-supplied Grammar mode carries its matcher state
+            // in an Arc, shared by every call that clones it — so a
+            // grammar completed in call 1 would arrive pre-completed
+            // in call 2. Rebuild the constraint before each call
+            // (production tool-call grammars are compiled fresh per
+            // call by resolve_grammar; only with_sampling persists).
+            let mut session = media_session().with_sampling([
+                SamplingMode::grammar(breeds).unwrap(),
+                SamplingMode::Greedy,
+            ]);
+            let prompt = image_prompt(
+                "What breed of dog is shown? Answer with one word.",
+                samoyed_api_image(256),
+            );
+
+            // Call 1: cold — full prefill, one image encode.
+            let first = session.complete_response(&prompt).unwrap();
+            assert_eq!(first.usage.cache_read_input_tokens, Some(0));
+            assert_eq!(
+                text_of(&first).trim().to_lowercase(),
+                "samoyed",
+                "grammar-constrained breed answer"
+            );
+            let (before, media_cells, media_id) = media_entry_stats(&session);
+            assert!(media_cells > 1, "image occupies many KV cells");
+            // Usage counts cells, not entries: prompt_tokens must
+            // include the image's full cell footprint.
+            assert!(
+                first.usage.input_tokens as usize > before + media_cells,
+                "input_tokens is cell-space"
+            );
+
+            // Call 2: identical prompt — reuse must cover the media
+            // entry (no re-encode; the walk only encodes entries past
+            // the restore point). Fresh grammar (see above).
+            session = session.with_sampling([
+                SamplingMode::grammar(breeds).unwrap(),
+                SamplingMode::Greedy,
+            ]);
+            let second = session.complete_response(&prompt).unwrap();
+            let reused =
+                second.usage.cache_read_input_tokens.unwrap() as usize;
+            assert!(
+                reused >= before + media_cells,
+                "reuse ({reused} cells) must cover the image \
+                 ({before} + {media_cells})"
+            );
+            assert_eq!(
+                text_of(&second).trim().to_lowercase(),
+                "samoyed",
+                "deterministic repeat"
+            );
+            let (_, _, media_id_2) = media_entry_stats(&session);
+            assert_eq!(media_id, media_id_2, "same image, same identity");
+
+            // Call 3: append the assistant reply + a follow-up turn.
+            // Reuse crosses the media prefix; the answer exercises
+            // actual attention to the image cells (a samoyed is
+            // white).
+            let mut extended = prompt.clone();
+            extended.messages.push(first.inner.clone().into());
+            extended.messages.push(crate::Message {
+                role: crate::Role::User,
+                content: MContent(vec![text_block(
+                    "What color is its coat? Answer with one word.",
+                )]),
+            });
+            let extended = extended.cache();
+            session = session.with_sampling([
+                SamplingMode::grammar(colors).unwrap(),
+                SamplingMode::Greedy,
+            ]);
+            let third = session.complete_response(&extended).unwrap();
+            let reused_3 =
+                third.usage.cache_read_input_tokens.unwrap() as usize;
+            assert!(
+                reused_3 >= before + media_cells,
+                "multi-turn reuse crosses the media prefix ({reused_3})"
+            );
+            assert_eq!(
+                text_of(&third).trim().to_lowercase(),
+                "white",
+                "the model actually attends to the reused image cells"
+            );
+        }
+
+        /// The Gemma 4 path: NORMAL (dense) media positions and
+        /// NON-CAUSAL image attention — the eval-loop branches the
+        /// M-RoPE Qwen tests never touch (single-ubatch fit check,
+        /// `CausalAttnGuard`, dense position plane). Same
+        /// grammar-constrained breed question; a dense 31B on CPU, so
+        /// this is the slowest test in the suite.
+        #[test]
+        #[ignore = "very long running; requires local Gemma 4 + mmproj"]
+        fn media_e2e_gemma_non_causal_breed() {
+            let gemma = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf");
+            if !gemma.is_file() {
+                panic!("local Gemma 4 model not found at {gemma:?}");
+            }
+            let breeds = r#"root ::= ("Samoyed" | "samoyed" | "Poodle" | "poodle" | "Husky" | "husky" | "Labrador" | "labrador" | "Pug" | "pug")"#;
+            let mut session = media_session_for(gemma).with_sampling([
+                SamplingMode::grammar(breeds).unwrap(),
+                SamplingMode::Greedy,
+            ]);
+            {
+                use crate::backend::Vision as _;
+                let (vision, _) = session.engine_mut().vision_and_decoder();
+                assert!(vision.expect("loaded").supports_images());
+            }
+
+            let prompt = image_prompt(
+                "What breed of dog is shown? Answer with one word.",
+                samoyed_api_image(256),
+            );
+            let first = session.complete_response(&prompt).unwrap();
+            assert_eq!(
+                text_of(&first).trim().to_lowercase(),
+                "samoyed",
+                "non-causal image decode produces a usable answer"
+            );
+            let (_, media_cells, _) = media_entry_stats(&session);
+            assert!(media_cells > 1);
+        }
+
+        /// Identical text, swapped image bytes → the LCP stops at the
+        /// media entry (identity is the RGB8 hash), so reuse cannot
+        /// extend past the cells before the image, and the new
+        /// image's identity replaces the old in the recorded cache.
+        #[test]
+        #[ignore = "long running; requires local model + mmproj sidecar"]
+        fn media_e2e_swapped_image_misses_at_media() {
+            let mut session =
+                media_session().with_sampling(std::iter::empty());
+            let question = "Briefly, what is shown in this image?";
+
+            let p1 = image_prompt(question, samoyed_api_image(256));
+            let _ = session.complete_response(&p1).unwrap();
+            let (before, _, id_1) = media_entry_stats(&session);
+
+            let red = image::RgbaImage::from_pixel(
+                64,
+                64,
+                image::Rgba([255, 0, 0, 255]),
+            );
+            let api2 =
+                ApiImage::encode(MediaType::Png, red).expect("png encode");
+            let p2 = image_prompt(question, api2);
+            let second = session.complete_response(&p2).unwrap();
+            let reused =
+                second.usage.cache_read_input_tokens.unwrap() as usize;
+            assert!(
+                reused <= before,
+                "swapped image must miss at the media entry \
+                 (reused {reused}, media starts after {before} cells)"
+            );
+            let (_, _, id_2) = media_entry_stats(&session);
+            assert_ne!(id_1, id_2, "new image identity recorded");
+        }
+
+        /// A literal `<__media__>` (mtmd's marker) in content is inert
+        /// prose: the prompt still carries exactly one media entry —
+        /// the real image — and completes normally.
+        #[test]
+        #[ignore = "long running; requires local model + mmproj sidecar"]
+        fn media_e2e_literal_marker_is_inert() {
+            let mut session =
+                media_session().with_sampling(std::iter::empty());
+            let mut p = Prompt::default()
+                .system("You are a concise assistant.")
+                .cache();
+            p.messages.push(crate::Message {
+                role: crate::Role::User,
+                content: MContent(vec![
+                    text_block(
+                        "The string <__media__> is mtmd's marker. \
+                         Describe the attached image in one sentence.",
+                    ),
+                    Block::Image {
+                        image: samoyed_api_image(128),
+                        cache_control: None,
+                    },
+                ]),
+            });
+            let p = p.cache();
+
+            let resp = session.complete_response(&p).unwrap();
+            assert!(!text_of(&resp).is_empty());
+            let cache = session.prefix_cache.as_ref().unwrap();
+            let media_count = cache
+                .prev_entries
+                .iter()
+                .filter(|e| e.is_media())
+                .count();
+            assert_eq!(
+                media_count, 1,
+                "literal marker in content must not become media"
+            );
+        }
     }
 }

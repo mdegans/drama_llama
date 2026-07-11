@@ -212,8 +212,20 @@ pub fn load_template_source(
 /// `LlamaCppEngine`'s constructors (under the `mtmd` feature); a
 /// present-but-unloadable projector is a hard error there, because
 /// continuing text-only would silently drop images.
+/// Symlinked models resolve through the link: if no sidecar sits next
+/// to the link itself, the canonical target's sibling is checked —
+/// the projector belongs with the real weights (`models/model.gguf →
+/// /big/disk/qwen.gguf` finds `/big/disk/qwen.mmproj.gguf`).
 pub fn mmproj_path(model_path: &Path) -> Option<std::path::PathBuf> {
     let path = model_path.with_extension("mmproj.gguf");
+    if path.is_file() {
+        return Some(path);
+    }
+    let canonical = std::fs::canonicalize(model_path).ok()?;
+    if canonical == model_path {
+        return None;
+    }
+    let path = canonical.with_extension("mmproj.gguf");
     path.is_file().then_some(path)
 }
 
