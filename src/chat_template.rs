@@ -240,7 +240,16 @@ impl ChatTemplate {
         prompt: &Prompt,
         opts: &RenderOptions,
     ) -> Result<String, ChatTemplateError> {
-        let messages = build_messages(prompt, opts.thought_reingest);
+        // Images require a media sentinel to render into — anything
+        // else is the silent drop this check exists to kill.
+        if opts.media_sentinel.is_none() && prompt_has_images(prompt) {
+            return Err(ChatTemplateError::MediaUnsupported);
+        }
+        let messages = build_messages(
+            prompt,
+            opts.thought_reingest,
+            opts.media_sentinel.as_deref(),
+        );
         // Only custom (client-executed) tool defs render into the
         // template; server tools execute on Anthropic's side and their
         // schemas aren't even visible to us.
@@ -432,6 +441,24 @@ pub struct RenderOptions {
     ///
     /// [`Block::Thought`]: crate::Block
     pub thought_reingest: crate::dialect::ReasoningReingest,
+    /// Per-call random media sentinel. When set, each
+    /// [`Block::Image`] renders as `<{sentinel}:{source_hash_hex}>`
+    /// — an out-of-band marker the caller (`Session`) later splits
+    /// the render on, mapping each occurrence back to its image by
+    /// source hash (see [`image_source_hash`]). When unset, a prompt
+    /// containing images fails to render with
+    /// [`ChatTemplateError::MediaUnsupported`] — never a silent
+    /// drop.
+    ///
+    /// The sentinel being random per call (and never surfaced
+    /// anywhere) is what makes marker injection structurally
+    /// impossible: no content — user text, tool results, source
+    /// files under discussion, even a literal mtmd `<__media__>` —
+    /// can collide with it, so downstream media splitting never
+    /// interprets content bytes.
+    ///
+    /// [`Block::Image`]: crate::Block
+    pub media_sentinel: Option<String>,
 }
 
 impl RenderOptions {
@@ -470,6 +497,16 @@ impl RenderOptions {
         reingest: crate::dialect::ReasoningReingest,
     ) -> Self {
         self.thought_reingest = reingest;
+        self
+    }
+
+    /// Builder: set the per-call media sentinel (see
+    /// [`RenderOptions::media_sentinel`]).
+    pub fn with_media_sentinel<S>(mut self, sentinel: S) -> Self
+    where
+        S: Into<String>,
+    {
+        self.media_sentinel = Some(sentinel.into());
         self
     }
 }
@@ -679,11 +716,15 @@ pub fn tokenize_with_breakpoints<M: Model>(
 fn build_messages(
     prompt: &Prompt,
     reingest: crate::dialect::ReasoningReingest,
+    media_sentinel: Option<&str>,
 ) -> Vec<JinjaValue> {
     let mut out: Vec<JinjaValue> =
         Vec::with_capacity(prompt.messages.len() + 1);
     if let Some(system) = prompt.system.as_ref() {
-        out.push(text_message("system", flatten_text(system)));
+        out.push(text_message(
+            "system",
+            flatten_text(system, media_sentinel),
+        ));
     }
     for m in &prompt.messages {
         let role = match m.role {
@@ -693,7 +734,7 @@ fn build_messages(
             // HF templates broadly accept repeated system messages.
             Role::System => "system",
         };
-        append_message(&mut out, role, &m.content, reingest);
+        append_message(&mut out, role, &m.content, reingest, media_sentinel);
     }
     out
 }
@@ -704,6 +745,7 @@ fn append_message(
     role: &str,
     content: &Content,
     reingest: crate::dialect::ReasoningReingest,
+    media_sentinel: Option<&str>,
 ) {
     let blocks: Vec<&Block> = content.0.iter().collect();
 
@@ -714,10 +756,13 @@ fn append_message(
         for b in &blocks {
             match b {
                 Block::ToolResult { result } => {
-                    let content = flatten_text(&result.content);
+                    let content =
+                        flatten_text(&result.content, media_sentinel);
                     out.push(tool_result_message(&result.tool_use_id, content));
                 }
-                other => append_block_text(&mut residual, other),
+                other => {
+                    append_block_text(&mut residual, other, media_sentinel)
+                }
             }
         }
         if !residual.is_empty() {
@@ -766,6 +811,7 @@ fn append_message(
                     &mut content_pre
                 },
                 other,
+                media_sentinel,
             ),
         }
     }
@@ -895,10 +941,10 @@ fn tool_result_message(tool_use_id: &str, content: String) -> JinjaValue {
 
 /// Flatten any [`Content`] to a single string using [`append_block_text`]
 /// for each part.
-fn flatten_text(content: &Content) -> String {
+fn flatten_text(content: &Content, media_sentinel: Option<&str>) -> String {
     let mut out = String::new();
     for b in &content.0 {
-        append_block_text(&mut out, b);
+        append_block_text(&mut out, b, media_sentinel);
     }
     out
 }
@@ -906,7 +952,11 @@ fn flatten_text(content: &Content) -> String {
 /// Append a single block's user-visible text to `out`. Tool-use and
 /// tool-result blocks are handled at the message level (see
 /// [`append_message`]); here they contribute nothing.
-fn append_block_text(out: &mut String, block: &Block) {
+fn append_block_text(
+    out: &mut String,
+    block: &Block,
+    media_sentinel: Option<&str>,
+) {
     match block {
         Block::Text { text, .. } => out.push_str(text),
         Block::Thought { thought, .. } => {
@@ -914,11 +964,157 @@ fn append_block_text(out: &mut String, block: &Block) {
             out.push_str(thought);
             out.push_str("</think>");
         }
+        // Sentinel emission: `<{R}:{source_hash_hex}>`. The caller
+        // splits the render on this and resolves each occurrence
+        // back to its image by source hash — no ordering contract
+        // between renderer and collector, robust even to templates
+        // that reorder messages. `render_with_env` guarantees the
+        // sentinel is present whenever images are (the
+        // `MediaUnsupported` check), so the `None` arm here is
+        // unreachable rather than a silent drop.
+        Block::Image { image, .. } => {
+            if let Some(sentinel) = media_sentinel {
+                out.push_str(&media_marker(
+                    sentinel,
+                    &image_source_hash(image),
+                ));
+            }
+        }
         // Tool-use / tool-result blocks are handled at the message
-        // level; redacted thoughts, images, documents, and the server-
-        // tool block family contribute no template-visible text.
+        // level; redacted thoughts, documents, and the server-tool
+        // block family contribute no template-visible text.
         _ => {}
     }
+}
+
+/// Does any block anywhere in `prompt` (system, messages, nested
+/// tool-result content) carry an image?
+fn prompt_has_images(prompt: &Prompt) -> bool {
+    fn block_has_image(block: &Block) -> bool {
+        match block {
+            Block::Image { .. } => true,
+            Block::ToolResult { result } => {
+                result.content.0.iter().any(block_has_image)
+            }
+            _ => false,
+        }
+    }
+    prompt
+        .system
+        .iter()
+        .flat_map(|c| c.0.iter())
+        .chain(prompt.messages.iter().flat_map(|m| m.content.0.iter()))
+        .any(block_has_image)
+}
+
+// ===========================================================================
+// Media sentinels
+// ===========================================================================
+
+/// SHA-256 identifying a [`Block::Image`]'s *source* bytes — the
+/// base64 payload (or URL string), domain-separated by kind. This is
+/// the correlation key between a sentinel occurrence in the render
+/// and the block it came from; it is NOT the cache identity (that is
+/// the RGB8 pixel hash, [`crate::Image::id`], computed after decode).
+/// Two different encodings of the same pixels get different source
+/// hashes but the same cache id — correct on both axes.
+///
+/// [`Block::Image`]: crate::Block
+pub(crate) fn image_source_hash(
+    image: &misanthropic::prompt::message::Image,
+) -> [u8; 32] {
+    use misanthropic::prompt::message::Image as ApiImage;
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    match image {
+        ApiImage::Base64 { data, .. } => {
+            hasher.update(b"b64:");
+            hasher.update(data.as_bytes());
+        }
+        ApiImage::Url { url } => {
+            // URLs are never fetched — this errors later at decode —
+            // but the sentinel still needs a unique key to keep the
+            // render structurally valid up to that typed error.
+            hasher.update(b"url:");
+            hasher.update(url.as_bytes());
+        }
+    }
+    hasher.finalize().into()
+}
+
+/// The rendered form of one image: `<{sentinel}:{hex64}>`.
+pub(crate) fn media_marker(sentinel: &str, source_hash: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(sentinel.len() + 68);
+    s.push('<');
+    s.push_str(sentinel);
+    s.push(':');
+    for b in source_hash {
+        write!(s, "{b:02x}").expect("writing to String cannot fail");
+    }
+    s.push('>');
+    s
+}
+
+/// A media-bearing render split on its sentinel: `n + 1` text
+/// segments interleaved with `n` image source hashes, in render
+/// order. Imageless renders come back as one segment and no hashes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SplitRender<'a> {
+    /// Text between (around) media markers;
+    /// `segments.len() == source_hashes.len() + 1`.
+    pub segments: Vec<&'a str>,
+    /// Source hash of the image at each marker (see
+    /// [`image_source_hash`]).
+    pub source_hashes: Vec<[u8; 32]>,
+}
+
+/// Split `text` on `<{sentinel}:{hex64}>` markers.
+///
+/// The sentinel is per-call random and never surfaced, so content
+/// cannot contain it — every occurrence is one of our own emissions.
+/// A sentinel occurrence that does not parse as a full marker means
+/// the template mangled it (truncation mid-marker, etc.): that is an
+/// internal invariant violation, returned as `Err` with the byte
+/// offset, never silently treated as content.
+pub(crate) fn split_media_render<'a>(
+    text: &'a str,
+    sentinel: &str,
+) -> Result<SplitRender<'a>, usize> {
+    let pattern = format!("<{sentinel}:");
+    let mut segments = Vec::new();
+    let mut source_hashes = Vec::new();
+    let mut rest = text;
+    let mut base = 0usize;
+    while let Some(at) = rest.find(&pattern) {
+        let hex_start = at + pattern.len();
+        let hex_end = hex_start + 64;
+        let ok = rest.len() > hex_end
+            && rest.as_bytes()[hex_end] == b'>'
+            && rest[hex_start..hex_end]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit());
+        if !ok {
+            return Err(base + at);
+        }
+        let mut hash = [0u8; 32];
+        for (i, byte) in hash.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(
+                &rest[hex_start + i * 2..hex_start + i * 2 + 2],
+                16,
+            )
+            .expect("checked hexdigit above");
+        }
+        segments.push(&rest[..at]);
+        source_hashes.push(hash);
+        rest = &rest[hex_end + 1..];
+        base += hex_end + 1;
+    }
+    segments.push(rest);
+    Ok(SplitRender {
+        segments,
+        source_hashes,
+    })
 }
 
 // ===========================================================================
@@ -1059,6 +1255,16 @@ pub enum ChatTemplateError {
     NoTemplate,
     #[error("chat template error: {0}")]
     Jinja(String),
+    /// The prompt contains [`Block::Image`]s but the caller provided
+    /// no [`RenderOptions::media_sentinel`] — there is nowhere for
+    /// the images to go. `Session` sets the sentinel when (and only
+    /// when) it can actually consume images; anything else erroring
+    /// here is what kills the historical silent image drop.
+    #[error(
+        "prompt contains image blocks but no media sentinel is \
+         configured; this renderer cannot represent images"
+    )]
+    MediaUnsupported,
 }
 
 impl ChatTemplateError {
@@ -1982,5 +2188,169 @@ mod tests {
             engine.model.tokenize(&rendered.partial_texts[0], true);
         assert_eq!(partial_tokens.len(), idx);
         assert_eq!(&full_tokens[..idx], partial_tokens.as_slice());
+    }
+
+    // =======================================================================
+    // Media sentinels
+    // =======================================================================
+
+    fn one_px_png_block() -> Block {
+        // Any base64 payload works — the render layer only hashes the
+        // source bytes; nothing decodes here.
+        Block::Image {
+            image: misanthropic::prompt::message::Image::Base64 {
+                media_type: misanthropic::prompt::message::MediaType::Png,
+                data: "aGVsbG8gcGl4ZWxz".into(),
+            },
+            cache_control: None,
+        }
+    }
+
+    fn image_prompt() -> Prompt {
+        Prompt {
+            messages: vec![Message {
+                role: Role::User,
+                content: Content(vec![
+                    Block::Text {
+                        text: "What breed is ".into(),
+                        cache_control: None,
+                        citations: None,
+                    },
+                    one_px_png_block(),
+                    Block::Text {
+                        text: " shown here?".into(),
+                        cache_control: None,
+                        citations: None,
+                    },
+                ]),
+            }],
+            ..Prompt::default()
+        }
+    }
+
+    #[test]
+    fn image_without_sentinel_is_a_typed_error() {
+        let err = tmpl()
+            .render(&image_prompt(), true)
+            .expect_err("image with no sentinel must not render");
+        assert!(matches!(err, ChatTemplateError::MediaUnsupported));
+        // Imageless prompts are unaffected.
+        assert!(tmpl().render(&simple_prompt(), true).is_ok());
+    }
+
+    #[test]
+    fn image_renders_as_sentinel_marker_and_splits_back() {
+        let sentinel = "0123456789abcdef0123456789abcdef";
+        let opts = RenderOptions::default()
+            .with_generation_prompt(true)
+            .with_media_sentinel(sentinel);
+        let out = tmpl().render_with(&image_prompt(), &opts).unwrap();
+
+        let src_hash = match one_px_png_block() {
+            Block::Image { image, .. } => image_source_hash(&image),
+            _ => unreachable!(),
+        };
+        let marker = media_marker(sentinel, &src_hash);
+        assert!(out.contains(&marker), "render carries the marker");
+
+        let split = split_media_render(&out, sentinel).unwrap();
+        assert_eq!(split.source_hashes, vec![src_hash]);
+        assert_eq!(split.segments.len(), 2);
+        assert!(split.segments[0].ends_with("What breed is "));
+        assert!(split.segments[1].starts_with(" shown here?"));
+        // Reassembly is lossless.
+        let reassembled = format!(
+            "{}{}{}",
+            split.segments[0], marker, split.segments[1]
+        );
+        assert_eq!(reassembled, out);
+    }
+
+    #[test]
+    fn literal_markers_in_content_are_inert() {
+        let sentinel = "ffffffffffffffffffffffffffffffff";
+        // Content containing mtmd's real marker AND a full sentinel-
+        // shaped string with a different random part: all inert prose.
+        let evil = format!(
+            "look: <__media__> and <{}:{}>",
+            "00000000000000000000000000000000",
+            "ab".repeat(32)
+        );
+        let p = Prompt::default()
+            .add_message((Role::User, evil.as_str()))
+            .unwrap();
+        let opts = RenderOptions::default().with_media_sentinel(sentinel);
+        let out = tmpl().render_with(&p, &opts).unwrap();
+        let split = split_media_render(&out, sentinel).unwrap();
+        assert!(split.source_hashes.is_empty());
+        assert_eq!(split.segments.len(), 1);
+        assert!(split.segments[0].contains(&evil), "content round-trips");
+    }
+
+    #[test]
+    fn split_media_render_rejects_mangled_markers() {
+        let sentinel = "0123456789abcdef0123456789abcdef";
+        // Truncated mid-hash: parse must fail loudly, never fall back
+        // to treating the mangled marker as content.
+        let mangled = format!("text <{sentinel}:abc123 more");
+        assert!(split_media_render(&mangled, sentinel).is_err());
+        // Sentinel-free text is one segment.
+        let clean = split_media_render("no media here", sentinel).unwrap();
+        assert_eq!(clean.segments, vec!["no media here"]);
+    }
+
+    #[test]
+    fn image_source_hash_separates_kinds_and_payloads() {
+        use misanthropic::prompt::message::{Image as ApiImage, MediaType};
+        let a = ApiImage::Base64 {
+            media_type: MediaType::Png,
+            data: "AAAA".into(),
+        };
+        let b = ApiImage::Base64 {
+            media_type: MediaType::Png,
+            data: "BBBB".into(),
+        };
+        let url = ApiImage::Url {
+            url: "https://example.com/x.png".into(),
+        };
+        assert_ne!(image_source_hash(&a), image_source_hash(&b));
+        assert_ne!(image_source_hash(&a), image_source_hash(&url));
+        assert_eq!(image_source_hash(&a), image_source_hash(&a));
+    }
+
+    #[test]
+    fn image_in_tool_result_renders_a_marker() {
+        use misanthropic::tool;
+        let sentinel = "11111111111111111111111111111111";
+        let result = tool::Result {
+            tool_use_id: "call_1".into(),
+            content: Content(vec![
+                Block::Text {
+                    text: "screenshot:".into(),
+                    cache_control: None,
+                    citations: None,
+                },
+                one_px_png_block(),
+            ]),
+            is_error: false,
+            cache_control: None,
+        };
+        let p = Prompt {
+            messages: vec![Message {
+                role: Role::User,
+                content: Content(vec![Block::ToolResult {
+                    result: result.into(),
+                }]),
+            }],
+            ..Prompt::default()
+        };
+        let opts = RenderOptions::default().with_media_sentinel(sentinel);
+        let out = tmpl().render_with(&p, &opts).unwrap();
+        let split = split_media_render(&out, sentinel).unwrap();
+        assert_eq!(
+            split.source_hashes.len(),
+            1,
+            "tool-result images render markers too"
+        );
     }
 }
