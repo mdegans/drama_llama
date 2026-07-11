@@ -686,6 +686,163 @@ mod tests {
         assert!(pos_max < span.n_tokens as i32 + span.n_pos as i32);
     }
 
+    /// M-RoPE KV-semantics probe (plan #31 C+D, work item 4 —
+    /// front-loaded before the media KV walk is built on top).
+    ///
+    /// Upstream source facts this validates against a live model
+    /// (`mtmd.cpp:1898` `mtmd_image_tokens_get_decoder_pos`,
+    /// `:1957` `mtmd_image_tokens_get_n_pos`):
+    ///
+    /// * Every M-RoPE image cell carries `t = pos_0` — the whole
+    ///   image sits at ONE tracked KV position; only the y/x RoPE
+    ///   planes vary.
+    /// * `n_pos = max(nx, ny)`, so positions
+    ///   `[pos_0 + 1, pos_0 + n_pos)` form a GAP no cell ever
+    ///   occupies (until later text lands at `pos_0 + n_pos`).
+    ///
+    /// And one fact about the local Qwen 3.6 in particular: it is a
+    /// HYBRID model (recurrent + attention layers), so partial-range
+    /// `memory_seq_rm` is refused wholesale and `restore_to` only
+    /// ever succeeds through the per-position state snapshots that
+    /// `checkpoint_pos` records (`seq_snapshots_enabled`). The
+    /// recurrent memory also logs benign "non-consecutive token
+    /// position" warnings on every M-RoPE position jump — its
+    /// `cell.pos` bookkeeping expects dense positions, but tokens
+    /// are still processed in sequence order.
+    ///
+    /// Consequences the Session KV walk must respect:
+    ///
+    /// * `memory_seq_pos_max` after an image at `P` reports `P`,
+    ///   not `P + n_pos - 1` — position-space "KV length" cannot be
+    ///   derived from pos_max when the tip is a media chunk.
+    /// * Boundaries the walk wants to rewind to MUST be
+    ///   checkpointed at prefill time (Session already does this) —
+    ///   including a boundary at image-end, which works via
+    ///   snapshot even though the truncate-based path would fail
+    ///   its dense-position check there (pure-attention M-RoPE
+    ///   models fall back to full reprefill at such a boundary).
+    /// * A restore to an uncheckpointed position fails closed; on
+    ///   this hybrid the KV is left untouched (truncate refused
+    ///   up front), while on pure-attention models the truncate
+    ///   half runs first — either way Session's fallback is
+    ///   `memory_clear` + full reprefill.
+    #[test]
+    #[ignore = "long running; requires local model + mmproj sidecar"]
+    fn mrope_kv_semantics_probe() {
+        use crate::backend::Vision as _;
+
+        let (model_path, _) = local_vision_paths();
+        let mut cp = crate::LlamaCppEngine::default_context_params();
+        cp.n_ctx = 8192;
+        let mut engine =
+            crate::LlamaCppEngine::new(model_path, None, Some(cp), None)
+                .expect("engine + mmproj sidecar load");
+
+        let mrope = engine
+            .vision()
+            .expect("mmproj sidecar should auto-load")
+            .decode_use_mrope();
+        assert!(
+            mrope,
+            "probe requires an M-RoPE model (Qwen-VL family); the local \
+             model symlink points elsewhere"
+        );
+
+        // Text prefix [0, T).
+        let prefix = engine.model.tokenize("Describe this image:", false);
+        let t = prefix.len();
+        engine.prefill_chunk(&prefix, 0, 0).expect("text prefill");
+        assert_eq!(engine.memory_seq_pos_max(0), t as i32 - 1);
+
+        // Image at position T.
+        let jpg = std::fs::read("tests/data/images/samoyed.jpg")
+            .expect("committed fixture");
+        let decoded = image::load_from_memory(&jpg).expect("jpeg decode");
+        let image =
+            crate::Image::try_from(decoded.thumbnail(512, 512)).unwrap();
+        let (vision, decoder) = engine.vision_and_decoder();
+        let snapshots = decoder.seq_snapshots_enabled();
+        let span = vision
+            .expect("vision loaded above")
+            .prefill_image(decoder, &image, t, 0)
+            .expect("image prefill");
+        eprintln!(
+            "probe: image span n_tokens={} n_pos={} at P={t}, \
+             seq_snapshots_enabled={snapshots}",
+            span.n_tokens, span.n_pos
+        );
+        assert!(
+            span.n_tokens > span.n_pos,
+            "M-RoPE image should occupy more cells than positions"
+        );
+
+        // THE load-bearing surprise: all image cells share t = P.
+        assert_eq!(
+            engine.memory_seq_pos_max(0),
+            t as i32,
+            "M-RoPE image cells all carry the chunk start position"
+        );
+
+        // Checkpoint the image-end boundary, exactly as the Session
+        // walk will after a media chunk.
+        let after = t + span.n_pos as usize;
+        engine.checkpoint_pos(0, after as i32);
+
+        // Trailing text at P + n_pos (the position-counter jump),
+        // with a mid-text checkpointed boundary.
+        let trail = engine.model.tokenize(" What breed is shown?", false);
+        assert!(trail.len() >= 3, "probe needs a few trailing tokens");
+        let b_text = after + 2;
+        engine
+            .prefill_chunk(&trail[..2], after, 0)
+            .expect("trail prefill (head)");
+        engine.checkpoint_pos(0, b_text as i32);
+        engine
+            .prefill_chunk(&trail[2..], b_text, 0)
+            .expect("trail prefill (tail)");
+        let full_end = after + trail.len();
+        assert_eq!(engine.memory_seq_pos_max(0), full_end as i32 - 1);
+
+        // Rewind to the checkpointed text boundary and re-extend:
+        // the core prefix-cache maneuver, now with an image in the
+        // retained prefix.
+        engine
+            .restore_to(0, b_text as i32)
+            .expect("restore to a checkpointed text boundary");
+        assert_eq!(engine.memory_seq_pos_max(0), b_text as i32 - 1);
+        engine
+            .prefill_chunk(&trail[2..], b_text, 0)
+            .expect("re-extend after restore");
+        assert_eq!(engine.memory_seq_pos_max(0), full_end as i32 - 1);
+
+        // Rewind to the image-end boundary. On this hybrid it rides
+        // the snapshot; the retained tip is the media chunk, so
+        // pos_max reports P — the walk must track the boundary
+        // position itself (EntryPos) and never infer it from pos_max.
+        engine
+            .restore_to(0, after as i32)
+            .expect("restore to the checkpointed image-end boundary");
+        assert_eq!(engine.memory_seq_pos_max(0), t as i32);
+        engine
+            .prefill_chunk(&trail, after, 0)
+            .expect("re-extend from image-end boundary");
+        assert_eq!(engine.memory_seq_pos_max(0), full_end as i32 - 1);
+
+        // Uncheckpointed position (mid-gap, worst case) fails closed.
+        let mid_gap = t + (span.n_pos as usize / 2);
+        assert!(
+            engine.restore_to(0, mid_gap as i32).is_err(),
+            "restore to an uncheckpointed mid-gap position must fail"
+        );
+        if snapshots {
+            // Hybrid: the truncate half was refused up front, so the
+            // failed restore left KV untouched.
+            assert_eq!(engine.memory_seq_pos_max(0), full_end as i32 - 1);
+            // ... and raw partial-range removal is likewise refused.
+            assert!(!engine.memory_seq_rm(0, t as i32, -1));
+        }
+    }
+
     #[test]
     fn hex_roundtrip() {
         let mut id = [0u8; 32];
