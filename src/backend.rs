@@ -177,6 +177,304 @@ pub enum MemoryRmError {
     BackendUnsupported { pos: i32 },
 }
 
+/// A frozen, decoded image crossing the backend-agnostic media
+/// boundary: tightly-packed RGB8 pixels plus a memoized content hash.
+///
+/// This is deliberately a plain record, not an image abstraction —
+/// `image::DynamicImage` is the pixel source of truth (decode, scale,
+/// convert live there), and an `Image` is the hashed RGB8 snapshot of
+/// one, produced at the boundary via the `media`-gated `TryFrom`
+/// impls. Keeping `image` types out of the trait layer keeps the
+/// codec stack out of builds that never touch media.
+///
+/// `id` is the sha256 of the RGB8 pixel buffer, computed once at
+/// construction. Bundling identity with the pixels (instead of
+/// passing hashes alongside) makes "pixels and cache identity
+/// disagree" unrepresentable — prefix-cache correctness hangs off
+/// this hash, and a false hit would serve image A's KV cells for
+/// image B.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    rgb8: Vec<u8>,
+    width: u32,
+    height: u32,
+    id: [u8; 32],
+}
+
+impl Image {
+    /// Construct from a tightly-packed RGB8 buffer (`RGBRGBRGB…`,
+    /// `width * height * 3` bytes). Rejects zero dimensions and
+    /// length mismatches; computes and memoizes the content hash.
+    pub fn from_rgb8(
+        rgb8: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, ImageNewError> {
+        if width == 0 || height == 0 {
+            return Err(ImageNewError::ZeroDim { width, height });
+        }
+        let expected = width as usize * height as usize * 3;
+        if rgb8.len() != expected {
+            return Err(ImageNewError::LengthMismatch {
+                width,
+                height,
+                expected,
+                actual: rgb8.len(),
+            });
+        }
+        let id = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&rgb8).into()
+        };
+        Ok(Self {
+            rgb8,
+            width,
+            height,
+            id,
+        })
+    }
+
+    /// Tightly-packed RGB8 pixels, `width * height * 3` bytes.
+    pub fn rgb8(&self) -> &[u8] {
+        &self.rgb8
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// sha256 of the RGB8 pixel buffer. Feeds prefix-cache identity.
+    pub fn id(&self) -> &[u8; 32] {
+        &self.id
+    }
+
+    /// Dims + identity without the pixels — what the counting /
+    /// cache-compare paths consume.
+    pub fn info(&self) -> ImageInfo {
+        ImageInfo {
+            width: self.width,
+            height: self.height,
+            id: self.id,
+        }
+    }
+}
+
+/// Failure constructing an [`Image`].
+#[derive(Debug, thiserror::Error)]
+pub enum ImageNewError {
+    #[error("image dimensions must be non-zero, got {width}x{height}")]
+    ZeroDim { width: u32, height: u32 },
+    #[error(
+        "RGB8 buffer length {actual} != width {width} * height {height} \
+         * 3 = {expected}"
+    )]
+    LengthMismatch {
+        width: u32,
+        height: u32,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+/// Dimensions and identity of an [`Image`], without the pixels.
+///
+/// [`Vision::tokenize`] takes these instead of full [`Image`]s: token
+/// counts depend only on dimensions, so prompts can be counted,
+/// hashed, and cache-compared without decoding or re-preprocessing
+/// pixels. The inverse — [`Vision::prefill_image`] requiring a full
+/// [`Image`] — enforces "can't encode a placeholder" in the
+/// signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub width: u32,
+    pub height: u32,
+    /// sha256 of the RGB8 pixels (see [`Image::id`]).
+    pub id: [u8; 32],
+}
+
+impl From<&Image> for ImageInfo {
+    fn from(image: &Image) -> Self {
+        image.info()
+    }
+}
+
+/// Token/position extent of one media item in the KV cache.
+///
+/// These differ on M-RoPE models (e.g. Qwen-VL): an image can occupy
+/// ~1024 KV cells (`n_tokens`) while advancing the position counter
+/// by only ~32 (`n_pos`). Context-fit checks are cell-space
+/// (`n_tokens`); position cursors advance by `n_pos`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaSpan {
+    pub n_tokens: u32,
+    pub n_pos: u32,
+}
+
+/// One chunk of a media-aware tokenization: a run of ordinary text
+/// tokens, or one media item identified by its content hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaChunk {
+    Text(Vec<Token>),
+    Media {
+        /// Content hash of the source image (see [`Image::id`]).
+        id: [u8; 32],
+        span: MediaSpan,
+    },
+}
+
+/// Vision (image-input) capability of a backend.
+///
+/// Small by design: it traffics only in backend-agnostic types
+/// ([`ImageInfo`], [`MediaChunk`], [`Image`]) so generic `Session`
+/// code can tokenize and prefill media without naming a concrete
+/// backend — and it is deliberately *not* a general multimodal trait
+/// family; with one implementor (mtmd) the abstraction stays as small
+/// as what `Session` needs from it.
+///
+/// The decoder is a type parameter rather than an associated type so
+/// the uninhabited [`NoVision`] can implement `Vision<D>` for every
+/// backend. [`Vision::prefill_image`] takes the decoder as an
+/// argument: encoder state lives on the implementor (`&mut self` —
+/// mtmd's context owns the encoder output buffer and is not
+/// thread-safe, which is also why the instance hangs off [`Engine`]
+/// rather than the `Send + Sync` [`Model`]), while the KV write needs
+/// the decoder. `Session` owns both via [`Engine`].
+///
+/// [`Engine`]: crate::Engine
+pub trait Vision<D: Decoder>: Send {
+    /// Backend-specific media error (marker/count mismatch,
+    /// preprocessing failure, encode/decode failure, etc.).
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// The marker substring standing for one media item in prompt
+    /// text (e.g. mtmd's `<__media__>`). The chat-template layer
+    /// emits one marker per image block; [`Vision::tokenize`] splits
+    /// on it.
+    fn marker(&self) -> &str;
+
+    /// Whether the loaded projector actually supports image input
+    /// (a projector can in principle be audio-only).
+    fn supports_images(&self) -> bool;
+
+    /// Tokenize `text` containing exactly `images.len()` occurrences
+    /// of [`Vision::marker`] (in image order) into text and media
+    /// chunks. `add_special` prepends BOS-style tokens;
+    /// `parse_special` tokenizes special tokens appearing verbatim in
+    /// `text` as such (chat-template output wants `add_special =
+    /// false`, `parse_special = true`).
+    fn tokenize(
+        &self,
+        text: &str,
+        images: &[ImageInfo],
+        add_special: bool,
+        parse_special: bool,
+    ) -> Result<Vec<MediaChunk>, Self::Error>;
+
+    /// Encode `image` and write its embeddings into the KV cache
+    /// starting at `start_pos` on `seq_id`. Returns the extent
+    /// written; the caller advances its position cursor by
+    /// [`MediaSpan::n_pos`] (not `n_tokens` — they differ on M-RoPE
+    /// models).
+    fn prefill_image(
+        &mut self,
+        decoder: &mut D,
+        image: &Image,
+        start_pos: usize,
+        seq_id: i32,
+    ) -> Result<MediaSpan, Self::Error>;
+}
+
+/// [`Vision`] type for backends without one. Uninhabited, so an
+/// `Option<NoVision>` is statically `None`: the "media unsupported"
+/// branch in generic code is free and cannot be misused.
+#[derive(Debug, Clone, Copy)]
+pub enum NoVision {}
+
+impl<D: Decoder> Vision<D> for NoVision {
+    type Error = std::convert::Infallible;
+
+    fn marker(&self) -> &str {
+        match *self {}
+    }
+
+    fn supports_images(&self) -> bool {
+        match *self {}
+    }
+
+    fn tokenize(
+        &self,
+        _text: &str,
+        _images: &[ImageInfo],
+        _add_special: bool,
+        _parse_special: bool,
+    ) -> Result<Vec<MediaChunk>, Self::Error> {
+        match *self {}
+    }
+
+    fn prefill_image(
+        &mut self,
+        _decoder: &mut D,
+        _image: &Image,
+        _start_pos: usize,
+        _seq_id: i32,
+    ) -> Result<MediaSpan, Self::Error> {
+        match *self {}
+    }
+}
+
+/// Conversions from the two upstream image sources: the `image` crate
+/// (pixel source of truth) and misanthropic's API-shaped
+/// [`Image`](misanthropic::prompt::message::Image) blocks. Gated on
+/// `media` so the codec stack stays out of builds that never touch
+/// images; decoding always goes through the `image` crate, never
+/// mtmd's bundled stb_image.
+#[cfg(feature = "media")]
+mod media_convert {
+    use super::{Image, ImageNewError};
+
+    /// Failure decoding an API image block into an [`Image`].
+    #[derive(Debug, thiserror::Error)]
+    pub enum ImageDecodeError {
+        /// Base64/codec failure, or a URL source (we never fetch —
+        /// download it yourself and re-embed as base64).
+        #[error(transparent)]
+        Decode(#[from] misanthropic::prompt::message::ImageDecodeError),
+        /// Decoded pixels failed [`Image`] validation.
+        #[error(transparent)]
+        Image(#[from] ImageNewError),
+    }
+
+    impl TryFrom<image::DynamicImage> for Image {
+        type Error = ImageNewError;
+
+        /// Snapshot any `DynamicImage` into a hashed RGB8 record.
+        /// Fallible only for zero-dimension images.
+        fn try_from(image: image::DynamicImage) -> Result<Self, Self::Error> {
+            let rgb8 = image.to_rgb8();
+            let (width, height) = rgb8.dimensions();
+            Image::from_rgb8(rgb8.into_raw(), width, height)
+        }
+    }
+
+    impl TryFrom<&misanthropic::prompt::message::Image> for Image {
+        type Error = ImageDecodeError;
+
+        fn try_from(
+            image: &misanthropic::prompt::message::Image,
+        ) -> Result<Self, Self::Error> {
+            let rgba = image.decode()?;
+            Ok(image::DynamicImage::ImageRgba8(rgba).try_into()?)
+        }
+    }
+}
+
+#[cfg(feature = "media")]
+pub use media_convert::ImageDecodeError;
+
 /// Model state: tokenization, vocab introspection, chat-template source, and
 /// non-decode-specific metadata. Immutable.
 pub trait Model: Send + Sync {
@@ -280,7 +578,86 @@ pub trait Backend {
     /// Concrete [`Model`] type for this [`Backend`]. `Send + Sync` — vocab and
     /// tokenizer are read concurrently by Iterator impls.
     type Model: Model;
+    /// Concrete [`Vision`] capability type for this [`Backend`].
+    /// Backends without image support use [`NoVision`]. The instance
+    /// (if any) is owned by [`Engine`], declared to drop before the
+    /// decoder and model it references.
+    ///
+    /// [`Engine`]: crate::Engine
+    type Vision: Vision<Self::Decoder>;
 
     /// Return `true` if a file or directory is supported by the [`Backend`].
     fn is_supported_model(name: &str, meta: &std::fs::Metadata) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_from_rgb8_validates() {
+        assert!(matches!(
+            Image::from_rgb8(vec![], 0, 1),
+            Err(ImageNewError::ZeroDim { .. })
+        ));
+        assert!(matches!(
+            Image::from_rgb8(vec![0; 5], 1, 2),
+            Err(ImageNewError::LengthMismatch { .. })
+        ));
+        let img = Image::from_rgb8(vec![7; 12], 2, 2).unwrap();
+        assert_eq!((img.width(), img.height()), (2, 2));
+        assert_eq!(img.rgb8().len(), 12);
+    }
+
+    #[test]
+    fn image_id_tracks_pixels() {
+        let a = Image::from_rgb8(vec![0; 12], 2, 2).unwrap();
+        let b = Image::from_rgb8(vec![0; 12], 2, 2).unwrap();
+        let c = Image::from_rgb8(vec![1; 12], 2, 2).unwrap();
+        assert_eq!(a.id(), b.id());
+        assert_ne!(a.id(), c.id());
+        assert_eq!(a.info().id, *a.id());
+        // Identity is pixel-buffer based; geometry travels alongside
+        // in ImageInfo, so same bytes / different dims share an id but
+        // never an info.
+        let d = Image::from_rgb8(vec![0; 12], 4, 1).unwrap();
+        assert_eq!(d.id(), a.id());
+        assert_ne!(d.info(), a.info());
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn image_try_from_dynamic() {
+        let img =
+            Image::try_from(image::DynamicImage::new_rgba8(3, 2)).unwrap();
+        assert_eq!((img.width(), img.height()), (3, 2));
+        assert!(matches!(
+            Image::try_from(image::DynamicImage::new_rgba8(0, 0)),
+            Err(ImageNewError::ZeroDim { .. })
+        ));
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn image_from_misanthropic_roundtrip() {
+        use misanthropic::prompt::message;
+
+        // One opaque red pixel, one semi-transparent green one — PNG
+        // is lossless and to_rgb8 drops alpha without compositing.
+        let mut rgba = image::RgbaImage::new(2, 1);
+        rgba.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        rgba.put_pixel(1, 0, image::Rgba([0, 255, 0, 128]));
+        let api = message::Image::encode(message::MediaType::Png, rgba)
+            .expect("png encode");
+
+        let img = Image::try_from(&api).unwrap();
+        assert_eq!((img.width(), img.height()), (2, 1));
+        assert_eq!(img.rgb8(), &[255, 0, 0, 0, 255, 0]);
+
+        // URL sources are never fetched — typed error.
+        let url = message::Image::Url {
+            url: "https://example.com/x.png".into(),
+        };
+        assert!(Image::try_from(&url).is_err());
+    }
 }

@@ -20,16 +20,23 @@ use std::num::NonZeroUsize;
 /// parameter. Use the `LlamaCppEngine` / `MoefluxEngine` type aliases
 /// (feature-gated) for the common backends.
 ///
-/// Field declaration order (`decoder` before `model`) matters for
-/// Drop: Rust drops fields in declaration order, so the decoder's
-/// context is freed — and the backend teared down if it was the last
-/// decoder — before the model is freed. This matches llama.cpp's
-/// expected ordering.
+/// Field declaration order (`vision`, then `decoder`, then `model`)
+/// matters for Drop: Rust drops fields in declaration order, so the
+/// vision context (which references the model and allocates through
+/// the live backend) is freed first, then the decoder's context —
+/// tearing the backend down if it was the last decoder — and the
+/// model last. This matches llama.cpp's expected ordering.
 ///
-/// `Engine<B>` is `Send` whenever `B::Decoder` and `B::Model` are —
-/// which they are by `Backend`'s associated-type bounds. No manual
-/// unsafe impl needed; auto-derive does the right thing.
+/// `Engine<B>` is `Send` whenever `B::Vision`, `B::Decoder` and
+/// `B::Model` are — which they are by `Backend`'s associated-type
+/// bounds. No manual unsafe impl needed; auto-derive does the right
+/// thing.
 pub struct Engine<B: Backend> {
+    /// Optional vision (image-input) capability. `None` until loaded
+    /// (llama.cpp: an mmproj sidecar or [`Engine::set_vision`]);
+    /// statically always `None` for backends whose `B::Vision` is
+    /// the uninhabited [`crate::NoVision`].
+    pub(crate) vision: Option<B::Vision>,
     pub(crate) decoder: B::Decoder,
     /// The model. Public so callers (e.g. Session) can tokenize, look
     /// up special tokens, and render chat templates without going
@@ -47,6 +54,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Engine")
+            .field("vision", &self.vision.as_ref().map(|_| "B::Vision"))
             .field("decoder", &self.decoder)
             .field("model", &self.model)
             .field(
@@ -69,6 +77,33 @@ impl<B: Backend> Engine<B> {
     /// Context length (tokens).
     pub fn n_ctx(&self) -> u32 {
         self.decoder.n_ctx()
+    }
+
+    /// The vision capability, if one is loaded. `None` means images
+    /// are unsupported on this engine (either the backend has no
+    /// vision path at all, or no projector was loaded).
+    pub fn vision(&self) -> Option<&B::Vision> {
+        self.vision.as_ref()
+    }
+
+    /// Install (or remove) the vision capability, returning the
+    /// previous one. Backend-specific constructors (e.g. the mmproj
+    /// sidecar auto-load) normally handle this; the setter exists for
+    /// arbitrary-path loads and tests.
+    pub fn set_vision(
+        &mut self,
+        vision: Option<B::Vision>,
+    ) -> Option<B::Vision> {
+        std::mem::replace(&mut self.vision, vision)
+    }
+
+    /// Split borrow for the media prefill path:
+    /// [`crate::Vision::prefill_image`] needs `&mut` both halves at
+    /// once, which two separate accessors can't hand out.
+    pub fn vision_and_decoder(
+        &mut self,
+    ) -> (Option<&mut B::Vision>, &mut B::Decoder) {
+        (self.vision.as_mut(), &mut self.decoder)
     }
 
     /// Clear the KV cache.

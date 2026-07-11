@@ -1271,6 +1271,7 @@ mod tests {
         assert!(out.contains("Hello world"));
     }
 
+    #[cfg(feature = "llama-cpp")]
     /// End-to-end: render with the real chat template embedded in
     /// `models/model.gguf` and sanity-check the output. Assertions are
     /// template-agnostic: templates differ on whether BOS appears in
@@ -1305,6 +1306,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "llama-cpp")]
     /// Exercise the tools branch of the real template in
     /// `models/model.gguf`: pass a single function definition, render,
     /// and assert the rendered prompt includes the function name and
@@ -1378,6 +1380,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "llama-cpp")]
     /// Render an assistant tool-call turn, confirming the tool-call
     /// branch renders the call at all — name, argument key, and
     /// argument value must survive into the transcript. The envelope
@@ -1437,6 +1440,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "llama-cpp")]
     /// Diagnostic: read a file from
     /// `DRAMA_LLAMA_TOKENIZE_FILE` and print (count, first 20 ids, last 20
     /// ids) of drama_llama's tokenization. Lets us compare against
@@ -1467,6 +1471,7 @@ mod tests {
         println!("(spec) first 20: {head_spec:?}");
     }
 
+    #[cfg(feature = "llama-cpp")]
     /// One-off dump: render the strawberry turn-1 Prompt through our
     /// ChatTemplate and write the bytes to
     /// `DRAMA_LLAMA_DUMP_OUTPUT`. For diffing against the Python
@@ -1528,6 +1533,7 @@ mod tests {
         println!("wrote {} bytes to {:?}", out.len(), dest);
     }
 
+    #[cfg(feature = "llama-cpp")]
     /// One-off dump helper: write the GGUF's embedded
     /// `tokenizer.chat_template` out to the path in
     /// `DRAMA_LLAMA_DUMP_TEMPLATE` so we can commit it as a pinned
@@ -1928,6 +1934,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "llama-cpp")]
     /// LlamaCppModel-backed round-trip: render a prompt with a mid-
     /// conversation cache breakpoint, tokenize full + partial, and
     /// assert the partial's tokens are a proper prefix of the full's

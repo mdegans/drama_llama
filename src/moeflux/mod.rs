@@ -26,6 +26,9 @@ impl Backend for MoefluxBackend {
 
     type Decoder = MoefluxDecoder;
     type Model = MoefluxModel;
+    // moeflux has no vision path; images give a typed "unsupported"
+    // error in generic Session code instead of a silent drop.
+    type Vision = crate::NoVision;
 
     fn is_supported_model(_: &str, meta: &std::fs::Metadata) -> bool {
         // This is cheap and if the required files aren't here we'll fail later
