@@ -105,13 +105,12 @@ fn whodunit_verdict() {
     let prompt = Prompt::default()
         .structured_output::<CaseFile>()
         .system(
-            "Enable deep thinking subroutine. You are a brief, \
-             decisive detective. Reason inside <think>...</think> in \
-             under 300 tokens: note which suspects are ruled out by \
-             their alibis, identify the one remaining with motive, \
-             means, and opportunity, then CLOSE the think tag. Output \
-             the structured verdict as JSON matching the given schema, \
-             listing ALL named suspects in `suspects_considered`.",
+            "You are a brief, decisive detective. Think before \
+             answering, in under 300 tokens: note which suspects are \
+             ruled out by their alibis, identify the one remaining with \
+             motive, means, and opportunity. Then output the structured \
+             verdict as JSON matching the given schema, listing ALL \
+             named suspects in `suspects_considered`.",
         )
         .add_message((Role::User, Content::text(SCENARIO)))
         .expect("add_message");
