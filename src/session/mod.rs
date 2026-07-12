@@ -5766,8 +5766,22 @@ mod tests {
         fn media_session_for(
             path: std::path::PathBuf,
         ) -> crate::Session<crate::LlamaCppBackend> {
+            media_session_for_n_ctx(path, 8192)
+        }
+
+        /// As [`media_session_for`] but with an explicit `n_ctx`. The
+        /// Gemma-4-31B (dense) + vision path sits right at the edge of a
+        /// 24 GB card: weights (~17 GB) + mmproj (~1.2 GB) + an 8192-cell
+        /// KV leaves too little for the compute buffers (fails allocating
+        /// the last ~533 MiB pp buffer). It loads at 4096 instead — still
+        /// ample for a one-image, one-word-answer turn. The A3B media
+        /// tests (`model.gguf`) are a lighter MoE and stay at 8192.
+        fn media_session_for_n_ctx(
+            path: std::path::PathBuf,
+            n_ctx: u32,
+        ) -> crate::Session<crate::LlamaCppBackend> {
             let session =
-                crate::LlamaCppSession::from_path_with_n_ctx(path, 8192)
+                crate::LlamaCppSession::from_path_with_n_ctx(path, n_ctx)
                     .unwrap()
                     .quiet()
                     .with_prefix_cache(true)
@@ -5928,10 +5942,11 @@ mod tests {
                 panic!("local Gemma 4 model not found at {gemma:?}");
             }
             let breeds = r#"root ::= ("Samoyed" | "samoyed" | "Poodle" | "poodle" | "Husky" | "husky" | "Labrador" | "labrador" | "Pug" | "pug")"#;
-            let mut session = media_session_for(gemma).with_sampling([
-                SamplingMode::grammar(breeds).unwrap(),
-                SamplingMode::Greedy,
-            ]);
+            let mut session = media_session_for_n_ctx(gemma, 4096)
+                .with_sampling([
+                    SamplingMode::grammar(breeds).unwrap(),
+                    SamplingMode::Greedy,
+                ]);
             {
                 use crate::backend::Vision as _;
                 let (vision, _) = session.engine_mut().vision_and_decoder();
