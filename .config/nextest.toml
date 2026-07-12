@@ -1,0 +1,27 @@
+# nextest configuration for drama_llama.
+#
+# GPU serialization
+# -----------------
+# Every model-loading integration test pulls a GGUF/MLX model onto the GPU.
+# Two running at once collide — VRAM OOM on CUDA, thrash-or-crash on Metal
+# (see .claude/memory/gpu-session-ops.md). Every such test is #[ignore]'d, so
+# only the `full` profile — the one `just test full` runs with
+# `--run-ignored all` — actually executes them and needs the guard. The
+# default profile (`just test`, `just test cpu`) runs no model tests and stays
+# fully parallel.
+
+[test-groups]
+# One model on the device at a time.
+gpu = { max-threads = 1 }
+
+[profile.full]
+# `just test full` — the long-running #[ignore]'d GPU/model suite.
+
+[[profile.full.overrides]]
+# Serialize every integration-test binary (kind(test)) through the single-slot
+# `gpu` group; unit tests (kind(lib)) stay parallel. Broader than strictly
+# necessary — a handful of pure-logic integration tests get serialized too —
+# but robust: there's no list of model-loading files to keep in sync, and the
+# extra cost is seconds inside an already GPU-bound, minutes-long run.
+filter = 'kind(test)'
+test-group = 'gpu'

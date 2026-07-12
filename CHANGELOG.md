@@ -383,6 +383,16 @@ Three further arcs land on top of the split:
   `--features llama-cpp,...` (default), `--features
   moeflux-model-qwen3-6-35b-a3b` (moeflux only on macOS), and both
   enabled together. All four combinations build clean.
+- **Dev workflow: `justfile` + cargo-nextest** (`just setup` installs
+  nextest). `just test` runs the fast suite GPU-accelerated,
+  `just test full` adds the long-running `#[ignore]`d GPU/model tests,
+  `just test cpu` runs CPU-only. CUDA is auto-enabled on Linux by the
+  justfile (Metal is automatic on macOS) — deliberately kept OUT of
+  the crate's default features so a bare `cargo build` stays portable.
+  Model tests are serialized onto the GPU one-at-a-time via a nextest
+  `gpu` test-group active in the `full` profile (see
+  `.config/nextest.toml`); GPU vs. CPU builds use separate target dirs
+  to avoid evicting each other's llama.cpp build.
 - Send/Sync trade-offs: `B::Decoder` is required Send (not Sync) —
   `*mut llama_context` is internally mutable. `B::Model` is Send +
   Sync (Iterator impls hand `&Model` to grammar / sampling code
