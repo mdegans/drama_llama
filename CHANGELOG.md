@@ -13,6 +13,30 @@ drive either llama.cpp or moeflux's Metal MoE runtime through the
 same surface. Runs Cogito-class MoE models on Apple Silicon without
 the Anthropic API as a dependency.
 
+Three further arcs land on top of the split:
+
+- **Image input** via llama.cpp's mtmd ([#31]). A backend-agnostic
+  `Vision<D>` trait, a safe `Mtmd` wrapper, and a cache-aware
+  `Session` media path let vision models take `Block::Image` input.
+  Images are rendered out-of-band through a per-call random sentinel
+  — mtmd never sees prompt text — and the prefix cache accounts in
+  M-RoPE cell space so an image mid-prompt doesn't invalidate the
+  KV walk. Gated on `feature = "mtmd"` (or pure-Rust `feature =
+  "media"`).
+- **Per-model tool-call dialects** ([#30], absorbing [#29]). A
+  `CallSyntax` derived by differentially analyzing each model's chat
+  template drives both the GBNF grammar emitter and the response
+  parser, so `Session` speaks a model's *native* tool-call format
+  instead of one imposed shape. Qwen3.5/3.6 (XML-ish), Gemma 4
+  (`TagWithDict`, causal announce-then-call), and gpt-oss (Harmony
+  channels) ship as validated dialects. Round-trip byte-stability is
+  the cache invariant.
+- **Lazy grammar checking** ([#28]). Grammar-constrained sampling
+  now samples first and checks the one sampled token
+  (`GrammarState::accepts_bytes`, O(piece)), falling back to a full
+  O(vocab) mask only on rejection — instead of masking the whole
+  vocabulary every step.
+
 ### Added
 
 - **`SamplingMode::Deny { range: Range<Token> }`** — sample-time
@@ -105,6 +129,95 @@ the Anthropic API as a dependency.
   prediction. For tuning iteration where you want sidecar changes
   to show up as deliberate divergences rather than stochastic ones.
 
+#### Image input — mtmd ([#31])
+
+- **`feature = "media"` and `feature = "mtmd"`** — two-tier gating.
+  `media` is the pure-Rust image layer (decode via the `image` crate
+  — never mtmd's bundled `stb_image`, a deliberate CVE-posture
+  choice — plus the conversions into the frozen `Image` pixel
+  record); it compiles without `llama-cpp`, so moeflux-only builds
+  get typed "media unsupported" errors from `NoVision` rather than
+  silent drops. `mtmd` adds the llama.cpp multimodal backend on top
+  (libmtmd bindings + the safe `Mtmd` wrapper).
+- **`backend::Vision<D: Decoder>` trait** — the backend-agnostic
+  image-input capability, generic over the decoder. Placeholder-
+  typed by design: `tokenize_image` takes an `ImageInfo` (dims +
+  identity hash, no pixels), while `prefill_image` requires a full
+  `Image` and the decoder — encoding a placeholder is unrepresentable
+  in the type. `NoVision` is the uninhabited impl for backends
+  without vision, so generic `Session` code compiles for every
+  backend.
+- **`backend::Image` / `ImageInfo` / `MediaSpan` / `MediaChunk`** —
+  the frozen pixel record (`Image::from_rgb8`, sha256 identity via
+  `Image::id`) and the placeholder / span types the `Vision` trait
+  and the media-aware cache traffic in.
+- **`llama_cpp::Mtmd`** (`feature = "mtmd"`) — safe wrapper owning
+  the `mtmd_context`, implementing `Vision<LlamaCppDecoder>`.
+  `MtmdParams` is the small stable construction subset; typed error
+  ladder (`MtmdNewError` / `MtmdTokenizeError` / `MtmdPrefillError`
+  / `MtmdError`), all `Send + Sync`. The media eval loop is Rust-
+  owned (`EmbdBatch`, a pre-KV `NaN` guard, explicit M-RoPE position
+  planes) rather than delegated to mtmd's C helper.
+- **`Session` media path** — `Block::Image` is accepted at ingest,
+  decoded through `media`, and rendered out-of-band via a per-call
+  random sentinel so mtmd never tokenizes prompt text (injection-
+  proof by construction). The prefix cache is media-aware end to
+  end: `CacheEntry` (token vs. media sentinel), `EntryPos`
+  (entry↔position translation), and cell-space accounting so an
+  image's M-RoPE cell span participates in the longest-common-prefix
+  KV walk instead of forcing a full reprefill.
+
+#### Per-model tool-call dialects ([#30], absorbs [#29])
+
+- **`drama_llama::dialect` module** — template-derived tool-call
+  formats. `CallSyntax` (with `ReasoningSyntax` / `ContentSyntax` /
+  `FunctionSyntax` / `ArgumentsSyntax` / `CallIdSyntax` /
+  `JsonFields` and the `Family` / `ReasoningMode` / `ContentMode`
+  axes) is the single description that drives both emission and
+  parsing.
+- **`analyze_template` / `vocab_cross_check`** — the differential
+  analyzer that derives a `CallSyntax` from a model's chat template
+  (probe-first, llama.cpp-validated), cross-checked against the
+  model's vocab so emitted markers are real tokens.
+- **`grammar_source` / `render_reference` / `validate_representable`
+  / `EmitOptions` / `Anchor`** — the GBNF emitter half: a
+  `CallSyntax` compiles to a grammar that constrains generation to
+  the model's native call shape.
+- **`parse_text` / `StreamParser` / `ParseStatus` / `Parsed` /
+  `Leniency`** — the parser half: the model's emitted envelope is
+  re-ingested back into typed tool-call blocks, byte-stable with
+  what the grammar emitted (the cache invariant).
+- **`emit_until_rules`** (in `grammar_compile`) — GBNF encoding of
+  llama.cpp's `until()` combinator (KMP-DFA complement), the
+  grammar-engine primitive dialects need to consume "everything up
+  to the closing tag." Exhaustively differential-tested against a
+  naive matcher.
+- **`Session::with_dialect` / `Session::dialect`** — a dialect is
+  analyzed once at load and thereafter drives grammar construction
+  and response parsing. Shipped dialects: Qwen3.5/3.6 (XML-ish,
+  native format from [#29]), Gemma 4 (`TagWithDict`, causal
+  announce-then-call render), gpt-oss (Harmony channel format; see
+  the `dialect::harmony` submodule).
+- **Chat-template sidecar** — an optional `<model>.chat_template.jinja`
+  sibling overrides the GGUF-embedded template (used to ship the
+  cache-stable Gemma 4 / gpt-oss templates without patching the
+  model file).
+
+#### Lazy grammar checking ([#28])
+
+- **Sample-then-check grammar constraint** — `SamplingMode::Grammar`
+  / `Json` now sample a token from the *unmasked* distribution and
+  validate just that token with `GrammarState::accepts_bytes`
+  (O(piece)); only on rejection does the full O(vocab) mask-and-
+  resample path run. Common case drops from per-step vocab masking
+  to a single byte-run check.
+- **`SampleOptions::banned_specials: Arc<[Token]>`** — emit-side
+  special-token mask applied before sampling, so a dialect's illegal
+  control tokens never reach the candidate set (opt-out via
+  `Session::with_emit_specials_ban(false)` for e.g. Qwen-VL
+  grounding markers). Falls back to a resample when the ban would
+  empty the set.
+
 ### Changed
 
 - **`Session::run_call` now breaks generation on grammar accept**.
@@ -140,6 +253,20 @@ the Anthropic API as a dependency.
 - **`unsafe impl Send for Engine`** dropped — auto-derive picks it
   up from `B::Decoder: Send` + `B::Model: Send` baked into the
   Backend trait.
+- **`llama-cpp-sys-3` 0.7 → 0.8.1.** Picks up the upstream cmake
+  `mtmd` target, libmtmd bindgen, and packaging that back the new
+  `mtmd` feature.
+- **`misanthropic` alpha.3 → alpha.7.** Adds the image content-block
+  types `Session` needs to accept `Block::Image`; the `image` /
+  `jpeg` / `png` sub-features are pulled in by drama_llama's `media`
+  feature.
+- **`Session` tool-call termination is constraint-owned.** With a
+  dialect active, the emitted call's own close marker (not a raw
+  sampled EOG) terminates the turn: EOG and empty-piece tokens are
+  masked while a constraint is live, the repetition penalty is
+  suspended across the structured span, and the recorded tip is the
+  canonical close token rather than whatever EOG happened to be
+  sampled — so the next turn's cache walk stays byte-stable.
 
 ### Fixed
 
@@ -188,6 +315,24 @@ the Anthropic API as a dependency.
   `SampleOptions::default()` ships with `repetition: None` to
   match the historical Session behavior and protect probes from
   silently inheriting a default penalty.
+- **Special-token injection through prompt content.** `Session`
+  rejects `Block::Text` content bearing chat-format control tokens
+  (`<|im_end|>` and friends) or media markers at ingest via
+  `check_no_special_injection` — a framing token inside content is
+  an accident or an injection, never meaning, and letting it through
+  desynchronizes the KV cache, the block parser, and the marker-
+  count contract. This is format-integrity enforcement, not content
+  filtering: `Session` owns it, `Engine`/the raw predictor stay
+  permissive for callers deliberately hand-feeding control tokens.
+- **Ingest injection guard no longer false-positives on `add_bos`
+  vocabs.** The guard keyed off raw tokenization including a leading
+  BOS the caller never wrote; on `add_bos` vocabs that flagged clean
+  content. Now compared against the content's own token span.
+- **Grammar exit-marker EOG exemption + until-delimiter trim.** A
+  completed constraint whose close marker *is* an EOG-adjacent token
+  no longer double-terminates or trims the closing delimiter out of
+  the emitted text; incomplete-constraint violations surface as
+  errors instead of silent truncation.
 
 ### Removed
 
@@ -379,3 +524,7 @@ flip `DRAMA_LLAMA_DFA_CACHE=0`.
   for a follow-up PR.
 
 [0.7.0]: https://github.com/mdegans/drama_llama/releases/tag/v0.7.0
+[#28]: https://github.com/mdegans/drama_llama/issues/28
+[#29]: https://github.com/mdegans/drama_llama/issues/29
+[#30]: https://github.com/mdegans/drama_llama/issues/30
+[#31]: https://github.com/mdegans/drama_llama/issues/31
