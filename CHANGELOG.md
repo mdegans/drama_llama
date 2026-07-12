@@ -385,14 +385,16 @@ Three further arcs land on top of the split:
   enabled together. All four combinations build clean.
 - **Dev workflow: `justfile` + cargo-nextest** (`just setup` installs
   nextest). `just test` runs the fast suite GPU-accelerated,
-  `just test full` adds the long-running `#[ignore]`d GPU/model tests,
-  `just test cpu` runs CPU-only. CUDA is auto-enabled on Linux by the
-  justfile (Metal is automatic on macOS) — deliberately kept OUT of
-  the crate's default features so a bare `cargo build` stays portable.
-  Model tests are serialized onto the GPU one-at-a-time via a nextest
-  `gpu` test-group active in the `full` profile (see
-  `.config/nextest.toml`); GPU vs. CPU builds use separate target dirs
-  to avoid evicting each other's llama.cpp build.
+  `just test full` runs only the long-running `#[ignore]`d GPU/model
+  tests, `just test cpu` runs CPU-only. CUDA is auto-enabled on Linux
+  by the justfile (Metal is automatic on macOS) — deliberately kept
+  OUT of the crate's default features so a bare `cargo build` stays
+  portable. A 30B-class model barely fits once on a 24GB card, so the
+  model tests must run one-at-a-time; the nextest `full` profile caps
+  `test-threads = 1` (see `.config/nextest.toml`) and `just test full`
+  runs only the ignored tests, so the whole set is serialized without
+  a fragile per-test filter. GPU vs. CPU builds use separate target
+  dirs to avoid evicting each other's llama.cpp build.
 - Send/Sync trade-offs: `B::Decoder` is required Send (not Sync) —
   `*mut llama_context` is internally mutable. `B::Model` is Send +
   Sync (Iterator impls hand `&Model` to grammar / sampling code

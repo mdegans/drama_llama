@@ -2,26 +2,23 @@
 #
 # GPU serialization
 # -----------------
-# Every model-loading integration test pulls a GGUF/MLX model onto the GPU.
-# Two running at once collide — VRAM OOM on CUDA, thrash-or-crash on Metal
-# (see .claude/memory/gpu-session-ops.md). Every such test is #[ignore]'d, so
-# only the `full` profile — the one `just test full` runs with
-# `--run-ignored all` — actually executes them and needs the guard. The
-# default profile (`just test`, `just test cpu`) runs no model tests and stays
-# fully parallel.
-
-[test-groups]
-# One model on the device at a time.
-gpu = { max-threads = 1 }
+# Model-loading tests each pull a 30B-class GGUF/MLX model onto the GPU; only
+# one fits on a 24GB card, so they MUST run one-at-a-time — otherwise
+# `cudaMalloc failed: out of memory` on CUDA / thrash-or-crash on Metal (see
+# .claude/memory/gpu-session-ops.md).
+#
+# These tests are all #[ignore]'d, but they live in BOTH integration binaries
+# (tests/ → kind(test)) AND unit modules (src/ → kind(lib), ~46 of them),
+# interleaved with fast pure-Rust unit tests. There is no filterset predicate
+# for "loads a model", so a kind()-scoped test-group cannot catch them all — an
+# earlier kind(test)-only `gpu` group missed every ignored src/ unit test and
+# still OOM'd.
+#
+# So instead of trying to select the GPU tests, `just test full` runs ONLY the
+# ignored tests (`--run-ignored only`) under this profile — and in that set
+# essentially every test is a GPU test — and we cap the whole profile at a
+# single test at a time. No filter to get wrong. The default profile
+# (`just test`, `just test cpu`) runs no model tests and stays fully parallel.
 
 [profile.full]
-# `just test full` — the long-running #[ignore]'d GPU/model suite.
-
-[[profile.full.overrides]]
-# Serialize every integration-test binary (kind(test)) through the single-slot
-# `gpu` group; unit tests (kind(lib)) stay parallel. Broader than strictly
-# necessary — a handful of pure-logic integration tests get serialized too —
-# but robust: there's no list of model-loading files to keep in sync, and the
-# extra cost is seconds inside an already GPU-bound, minutes-long run.
-filter = 'kind(test)'
-test-group = 'gpu'
+test-threads = 1

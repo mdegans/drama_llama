@@ -38,8 +38,10 @@ test mode="":
           cargo nextest run --features "{{gpu_features}}"
         ;;
       full)
+        # Only the #[ignore]'d GPU/model tests, one at a time (profile 'full'
+        # caps test-threads=1 — a 30B model barely fits once on the card).
         CARGO_TARGET_DIR="{{gpu_target}}" \
-          cargo nextest run --features "{{gpu_features}}" --profile full --run-ignored all
+          cargo nextest run --features "{{gpu_features}}" --profile full --run-ignored only
         ;;
       cpu)
         CARGO_TARGET_DIR="{{cpu_target}}" \
