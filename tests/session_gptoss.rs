@@ -246,41 +246,82 @@ fn emission_round_trips_through_parse_and_render() {
     );
 }
 
-/// Announce-then-call (causality): nudged under Auto, prose the model
-/// emits before its call comes back in emission order (commentary
-/// preamble block) and the re-render reproduces the emission bytes.
+/// Announce-then-call (causality), DETERMINISTIC. The invariant worth
+/// regression-testing is *ours*: that an announce-then-call assistant
+/// turn — reasoning, then a commentary preamble, then the tool call —
+/// renders, parses back in the same emission order, and round-trips
+/// byte-for-byte (the cache-stability contract). It does NOT depend on
+/// live generation: gpt-oss won't reliably emit the preamble without
+/// model-specific nudging (it plans it in the analysis channel, then
+/// skips to the call), and its output isn't reproducible across runs or
+/// hardware (Metal especially). So we construct the turn, drive it
+/// through the real gpt-oss template + dialect, and assert on our own
+/// render/parse. Live "does Auto still call the tool" coverage lives in
+/// `auto_tool_choice_parses_native_call`.
 #[test]
-#[ignore = "requires gpt-oss model"]
+#[ignore = "requires gpt-oss model (for its real template + dialect)"]
 fn announce_then_call_round_trips_in_emission_order() {
     use drama_llama::AssistantMessage;
 
-    let mut prompt = count_letters_prompt();
-    // Harmony-idiomatic preamble nudge: the first e2e rounds showed
-    // the model *planning* an announcement in analysis but skipping
-    // the commentary preamble unless the channel is named explicitly.
-    prompt.system = Some(Content::text(
-        "You are a helpful assistant. Use the `count_letters` tool when \
-         asked to count characters. IMPORTANT: before every tool call, \
-         first output a preamble message on the commentary channel (no \
-         recipient) telling the user what you are about to do — e.g. \
-         `<|channel|>commentary<|message|>I'll count that now.<|end|>` \
-         — and only then make the tool call.",
-    ));
-    prompt.tool_choice = Some(ToolChoice::auto());
-    let mut session = load_session(1024);
+    let session = load_session(1024);
+    let prompt = count_letters_prompt();
 
-    let render_opts = RenderOptions::default()
-        .with_generation_prompt(true)
-        .with_extra("preserve_thinking", true)
-        .with_thought_reingest(session.dialect().reasoning.reingest);
-    let rendered_original = session
+    // Shared render options; only the generation-prompt flag differs
+    // between the prompt prefix and the completed turn.
+    let opts = |gen_prompt: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen_prompt)
+            .with_extra("preserve_thinking", true)
+            .with_thought_reingest(session.dialect().reasoning.reingest)
+    };
+
+    // An announce-then-call turn: analysis (Thought), a commentary
+    // preamble (Text), then the call (ToolUse) — in that order.
+    let turn = vec![
+        Block::Thought {
+            thought: "The user wants the count of 'r' in 'strawberry'. \
+                      I'll announce what I'm doing, then call \
+                      count_letters."
+                .into(),
+            signature: Cow::Borrowed(""),
+        },
+        "I'll count that now.".into(),
+        Block::ToolUse {
+            call: ToolUse {
+                id: Cow::Borrowed("call_0_count_letters"),
+                name: Cow::Borrowed("count_letters"),
+                input: json!({"letter": "r", "string": "strawberry"}),
+                cache_control: None,
+                caller: None,
+            },
+        },
+    ];
+
+    // Render the turn through the real template, then isolate the
+    // emission (the suffix past the generation-prompt prefix). This is
+    // the canonical byte form our pipeline produces.
+    let prefix = session
         .template()
-        .render_with(&prompt, &render_opts)
-        .expect("render original");
+        .render_with(&prompt, &opts(true))
+        .expect("render prompt prefix");
+    let render_turn = |turn: Vec<Block>| -> String {
+        let assistant: AssistantMessage = turn.into_iter().collect();
+        let mut with_turn = prompt.clone();
+        with_turn.messages.push(assistant.into());
+        let rendered = session
+            .template()
+            .render_with(&with_turn, &opts(false))
+            .expect("render turn");
+        rendered
+            .strip_prefix(&prefix)
+            .expect("turn must extend the prompt prefix exactly")
+            .to_string()
+    };
+    let emission = render_turn(turn);
+    println!("=== emission ===\n{emission:?}\n===");
 
-    let raw = session.complete_text(&prompt).expect("complete_text");
-    println!("=== raw emission ===\n{raw:?}\n===");
-
+    // Parse the emission back: the commentary preamble (Text) must
+    // survive and still precede the tool call in emission order.
     let tool_refs: Vec<&Tool> = prompt
         .tools
         .iter()
@@ -290,53 +331,30 @@ fn announce_then_call_round_trips_in_emission_order() {
     let blocks = drama_llama::dialect::parse_text(
         session.dialect(),
         &tool_refs,
-        &raw,
-        false,
+        &emission,
+        false, // gpt-oss never pre-opens reasoning in the prompt tail
         drama_llama::dialect::Leniency::Final,
     )
     .blocks;
-    println!("=== blocks ===\n{blocks:#?}\n===");
+    println!("=== parsed blocks ===\n{blocks:#?}\n===");
     let first_text =
         blocks.iter().position(|b| matches!(b, Block::Text { .. }));
     let first_call = blocks
         .iter()
         .position(|b| matches!(b, Block::ToolUse { .. }))
-        .expect("nudged auto should still call the tool");
-    let announced = first_text.is_some_and(|t| t < first_call);
+        .expect("round-trip must preserve the tool call");
     assert!(
-        announced,
-        "nudge did not produce prose before the call this run — \
+        first_text.is_some_and(|t| t < first_call),
+        "commentary preamble must precede the call in emission order — \
          blocks: {blocks:#?}"
     );
 
-    let assistant: AssistantMessage = blocks.into_iter().collect();
-    let mut follow_up = prompt.clone();
-    follow_up.messages.push(assistant.into());
-    follow_up.tool_choice = None;
-    let rendered_follow_up = session
-        .template()
-        .render_with(
-            &follow_up,
-            &RenderOptions::default()
-                .with_generation_prompt(false)
-                .with_extra("preserve_thinking", true)
-                .with_thought_reingest(session.dialect().reasoning.reingest),
-        )
-        .expect("render follow_up");
-    let suffix = rendered_follow_up
-        .strip_prefix(&rendered_original)
-        .unwrap_or_else(|| {
-            panic!(
-                "follow-up must extend the original prefix exactly.\n\
-                 --- original ---\n{rendered_original}\n\
-                 --- follow-up ---\n{rendered_follow_up}"
-            )
-        });
-    assert!(
-        suffix.starts_with(&raw),
-        "announce-then-call emission is not a byte prefix of the \
-         re-render — prose got reordered or altered.\n\
-         --- emission ---\n{raw:?}\n--- suffix ---\n{suffix:?}"
+    // Byte-stability: re-rendering the parsed blocks reproduces the
+    // emission exactly (the prefix-cache contract).
+    let emission2 = render_turn(blocks);
+    assert_eq!(
+        emission, emission2,
+        "announce-then-call is not byte-stable across parse -> render"
     );
 }
 
