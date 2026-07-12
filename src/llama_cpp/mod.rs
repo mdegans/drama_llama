@@ -34,6 +34,12 @@ impl Backend for LlamaCppBackend {
     type Vision = crate::NoVision;
 
     fn is_supported_model(name: &str, meta: &std::fs::Metadata) -> bool {
-        meta.is_file() && name.ends_with(".gguf")
+        // `<model>.mmproj.gguf` is a vision *projector* sidecar, not a
+        // standalone model — it auto-loads alongside its base model and
+        // fails if asked to load on its own. Exclude it so it never
+        // surfaces in `/api/tags` (or gets picked as a default).
+        meta.is_file()
+            && name.ends_with(".gguf")
+            && !name.ends_with(".mmproj.gguf")
     }
 }
