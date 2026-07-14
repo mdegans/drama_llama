@@ -5,7 +5,7 @@
 //! `schemars`); the session compiles it into a sampling grammar, so the
 //! JSON body *cannot* deviate from the schema. Reasoning models think
 //! first — [`Session::complete_stream`] yields each [`Block`] as it
-//! parses, so the `<think>` block appears as soon as it closes rather
+//! parses, so the thought arrives as soon as its envelope closes rather
 //! than after the whole run.
 //!
 //! ```sh
@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use drama_llama::{Block, Prompt, Role, Session};
+use drama_llama::{Block, LlamaCppSession, Prompt, Role};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -96,17 +96,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("models/model.gguf"));
 
-    let mut session = Session::from_path_with_n_ctx(path, 8192)?.quiet();
+    let mut session =
+        LlamaCppSession::from_path_with_n_ctx(path, 8192)?.quiet();
 
+    // No literal `<think>` / `</think>` in the prompt text: those are
+    // control tokens in reasoning vocabs, and `Session` rejects blocks
+    // that tokenize to specials (`SessionError::InjectedSpecialToken`) —
+    // the reasoning envelope is the dialect's to emit, not content's to
+    // spell. Asking for the *behaviour* is dialect-neutral and works on
+    // models whose tags aren't spelled `<think>` at all.
     let prompt = Prompt::default()
         .structured_output::<CaseFile>()
         .system(
             "Enable deep thinking subroutine. You are a brief, \
-             decisive detective. Reason inside <think>...</think> in \
-             under 300 tokens: note which suspects are ruled out by \
-             their alibis, identify the one remaining with motive, \
-             means, and opportunity, then CLOSE the think tag. Output \
-             the structured verdict as JSON matching the given schema.",
+             decisive detective. Think first, in under 300 tokens: note \
+             which suspects are ruled out by their alibis, then identify \
+             the one remaining with motive, means, and opportunity. Then \
+             stop reasoning and output the structured verdict as JSON \
+             matching the given schema.",
         )
         .add_message((Role::User, SCENARIO))?;
 

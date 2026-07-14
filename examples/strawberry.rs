@@ -23,7 +23,9 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use clap::Parser;
-use drama_llama::{Content, Prompt, RenderOptions, Role, Session, ToolChoice};
+use drama_llama::{
+    Content, LlamaCppSession, Prompt, RenderOptions, Role, ToolChoice,
+};
 use misanthropic::tool::{tool, Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -93,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut strawberry = Strawberry;
 
-    let mut session = Session::from_path_sync(model_path)?
+    let mut session = LlamaCppSession::from_path_sync(model_path)?
         .quiet()
         // A repetition penalty can talk the model out of repeating the
         // tool result's digit in its answer; the grammar already keeps

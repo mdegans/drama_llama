@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# Installed by `just install-hooks`, which points core.hooksPath here — so this
+# file is versioned and every clone gets the same gate with one command.
+#
+# Two checks, both cheap enough to sit in front of every commit:
+#
+#   1. rustfmt is clean (the whole tree, not just the diff — a formatter is
+#      only useful if the tree is a fixed point of it).
+#   2. the unignored test suite passes.
+#
+# The #[ignore]'d tests are deliberately NOT run: they load 13-18 GB models
+# onto a GPU and take minutes. Those are `just test full`, run by hand.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Non-Rust commits (memory notes, docs, fixtures) skip both checks — nothing
+# they touch can break a build, and a docs typo shouldn't cost a test run.
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+if ! grep -qE '(\.rs$|^Cargo\.(toml|lock)$|^justfile$|^rustfmt\.toml$)' <<<"$staged"; then
+    echo "pre-commit: no Rust/build changes staged — skipping fmt + tests"
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --check"
+if ! cargo fmt --check; then
+    echo >&2
+    echo "pre-commit: FAILED — tree is not rustfmt-clean. Run \`just fmt\`." >&2
+    exit 1
+fi
+
+echo "pre-commit: just test (unignored)"
+if ! just test; then
+    echo >&2
+    echo "pre-commit: FAILED — unignored tests are red." >&2
+    echo "pre-commit: full log in target/test-logs/unignored.log" >&2
+    exit 1
+fi
+
+
+echo "pre-commit: ok"

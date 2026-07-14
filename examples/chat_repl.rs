@@ -18,7 +18,7 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use clap::Parser;
-use drama_llama::{CachedPrompt, Prompt, Session, UserMessage};
+use drama_llama::{CachedPrompt, LlamaCppSession, Prompt, UserMessage};
 use rustyline::{error::ReadlineError, DefaultEditor};
 
 #[derive(Parser, Debug)]
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n =
         NonZeroUsize::new(args.max_tokens).ok_or("--max-tokens must be > 0")?;
 
-    let mut session = Session::from_path(args.model)?
+    let mut session = LlamaCppSession::from_path(args.model)?
         .quiet()
         .with_prefix_cache(true)
         .with_max_tokens(n);
