@@ -172,6 +172,21 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`eog_is_not_eos_plus_eot.md`](.claude/memory/eog_is_not_eos_plus_eot.md)
+  — **read before touching stop logic.** `Model::eog_tokens()` is
+  libllama's `special_eog_ids` verbatim and is the single authority for
+  "does this end the turn". Never rebuild it from `eos`/`eot`: gpt-oss's
+  `eot` IS `<|end|>`, the Harmony channel separator, which upstream
+  deliberately excludes from EOG. Cost six failing tests. The lesson
+  generalizes — when llama.cpp gives you both a *label* (`eot`) and a
+  *predicate* (`is_eog`), the predicate is the contract.
+- [`logit_comparability_across_backends.md`](.claude/memory/logit_comparability_across_backends.md)
+  — how far logits are comparable across backends, measured. Greedy
+  streams and prefill logits port; the deep-context top-K tail does not
+  (MoE routing flips are a *discrete* divergence). Matters for the
+  moeflux diff-oracle: don't conclude "moeflux is broken" from a
+  divergent deep-context tail, and don't widen a tolerance to cover a
+  membership change.
 - [`plan_tool_dialects.md`](.claude/memory/plan_tool_dialects.md)
   — plan-of-record ([issue #30](https://github.com/mdegans/drama_llama/issues/30)):
   per-model tool-call dialects. Template-derived `CallSyntax` (probe-
