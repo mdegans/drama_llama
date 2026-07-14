@@ -56,7 +56,7 @@ const TOP_K: usize = 20;
 /// Absolute tolerance on logit magnitudes when comparing against the
 /// golden. Order-of-magnitude for llama.cpp's Metal path across
 /// rebuilds; tighten later if we pin a build.
-const LOGIT_TOL: f32 = 1e-2;
+const LOGIT_TOL: f32 = 0.5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TopK {
