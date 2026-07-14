@@ -35,17 +35,17 @@ test mode="":
     case "{{mode}}" in
       "")
         CARGO_TARGET_DIR="{{gpu_target}}" \
-          cargo nextest run --features "{{gpu_features}}"
+          cargo nextest run --features "{{gpu_features}}" --no-fail-fast
         ;;
       full)
         # Only the #[ignore]'d GPU/model tests, one at a time (profile 'full'
         # caps test-threads=1 — a 30B model barely fits once on the card).
         CARGO_TARGET_DIR="{{gpu_target}}" \
-          cargo nextest run --features "{{gpu_features}}" --profile full --run-ignored only
+          cargo nextest run --features "{{gpu_features}}" --profile full --run-ignored only --no-fail-fast
         ;;
       cpu)
         CARGO_TARGET_DIR="{{cpu_target}}" \
-          cargo nextest run --features "{{base_features}}"
+          cargo nextest run --features "{{base_features}}" --no-fail-fast
         ;;
       *)
         echo "just test: unknown mode '{{mode}}' — use (nothing) | full | cpu" >&2
