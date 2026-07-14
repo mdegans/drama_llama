@@ -8,27 +8,54 @@ whole job.
 
 ## Checklist
 
-- [ ] Full `cargo test` (default features) — quick re-green.
-- [ ] Long-running tests: `cargo test -- --include-ignored` with
-      `models/model.gguf` valid. These haven't run in a while.
-- [ ] **At least three models** through the examples / ignored tests.
-      Candidates on hand: Qwen3.6-35B-A3B (gguf + moeflux artifacts),
-      whatever `models/model.gguf` points at, cogito — pick per
-      what's mounted; record which were used.
-- [ ] `cross_backend.rs` #[ignore] run (both backends + 35B
-      artifacts) — newly compile-fixed (e0d2d34), hasn't *run* since
-      before the backend split.
-- [ ] **`blallama.rs`** — must test. (Binary/serving path.)
+**2026-07-14: feature freeze.** Mike: stop adding to 0.8.0 and publish.
+Interface tweaks and condensing the examples are 0.9→1.0 work; no new
+model support planned (but "you never know").
+
+- [x] Full `cargo test` (default features) — 363/363 unignored green
+      (`just test`).
+- [x] Long-running tests: the whole `#[ignore]`'d sweep (`just test
+      full`) green, incl. the seven that were red at session start (see
+      `eog_is_not_eos_plus_eot`).
+- [x] **At least three models.** Used: Qwen3.6-35B-A3B (GGUF +
+      moeflux MLX artifacts), gpt-oss-20b-UD-Q8_K_XL, gemma-4-31B-it-qat.
+- [x] `cross_backend.rs` — RUN, and rewritten (teacher-forced; the old
+      self-driven-trajectory metric was measuring chaos). 29/29 decisive
+      argmax, worst-step mass recall 0.979. Also added `just test
+      moeflux`, without which nothing could *reach* these suites —
+      neither `just test` nor `just test full` sees them.
+- [x] **The June blocker is CLOSED.** `partial_hit_output_matches_
+      fresh_session` (the moeflux batched-prefill GPU-KV-mirror bug) now
+      PASSES on the `=0.1.0-pre.4` pin. No 0.8.1 pin-bump caveat needed;
+      the moeflux feature can ship.
+- [ ] **`blallama.rs`** — must test. (Binary/serving path.) Still the
+      biggest untested surface, and the one users actually hit.
 - [ ] Misanthropic examples as a test harness against the local
       server: the non-streaming ones SHOULD run as-is; the
       streaming-API ones are expected to fail until issue #26
       (stream `misanthropic::stream::Event`) lands in 0.9. Don't
       chase streaming failures — they're known-out-of-scope.
-- [ ] Examples sweep: strawberry, whodunit, chat_repl, grammar_fuzz,
-      dump_template, inspect_prompt — each with required features.
+- [ ] Examples sweep: strawberry, chat_repl, grammar_fuzz,
+      dump_template, inspect_prompt (`just example NAME` runs each with
+      the right features + target dir). `whodunit` ran green — but took
+      ~15 min, see the perf note below.
 - [ ] Pre-publish hygiene: README, version metadata, `cargo package`
-      file list, doc build zero-warnings.
+      file list, doc build zero-warnings, and date the CHANGELOG's
+      `## [0.8.0] — Unreleased`.
 - [ ] Then: `cargo publish` on Mike's go, tag.
+
+## Known-and-accepted going into publish
+
+- **`whodunit` takes ~15 min** (Qwen3.6-35B, JSON grammar, n_ctx 8192).
+  NOT runaway generation — Mike localized the time to *sort*. Suspect a
+  full 248k-candidate sort per token, possibly re-sorted per chain stage
+  or per grammar-rejection fallback. Deliberately deferred: it is a perf
+  issue, not a correctness one, and it wants its own session. Do not
+  block publish on it; do not "fix" it by lowering `n_ctx`.
+- Two warnings under the `moeflux` feature (`log_moeflux_prefetch` dead,
+  `WorkerOutput.gather_id` unread). Left alone on purpose — the first
+  looks like disconnected instrumentation, and deleting telemetry to
+  silence a warning loses information. Ask before touching.
 
 ## Status 2026-06-12 evening (mid-session)
 
