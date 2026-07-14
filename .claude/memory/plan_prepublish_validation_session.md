@@ -46,12 +46,42 @@ model support planned (but "you never know").
 
 ## Known-and-accepted going into publish
 
-- **`whodunit` takes ~15 min** (Qwen3.6-35B, JSON grammar, n_ctx 8192).
-  NOT runaway generation — Mike localized the time to *sort*. Suspect a
-  full 248k-candidate sort per token, possibly re-sorted per chain stage
-  or per grammar-rejection fallback. Deliberately deferred: it is a perf
-  issue, not a correctness one, and it wants its own session. Do not
-  block publish on it; do not "fix" it by lowering `n_ctx`.
+- **`whodunit` takes ~15 min** — this is [#33], already profiled on CUDA:
+  `Candidates::softmax(None)` heapsorts the full 248k vocab *every
+  token*, and `locally_typical` (the default mode) calls it every token
+  (~48% of per-token cost). Softmax is order-independent and only needs
+  the max — an O(n) scan.
+  Mac cross-check added 2026-07-14, and it says #33 is not the whole
+  story: `bench.py --model a3b --backend llama-cpp` gets **24 tok/s**
+  through blallama on the *same sampling policy* (I diffed the sidecars —
+  both are `LocallyTypical p=0.5`), so bench pays the same per-token
+  sort and is fine. A 48% tax buys ~2×; it cannot explain whodunit being
+  >10× slower. The only thing whodunit adds is the JSON grammar, so
+  suspect a SECOND cost: the lazy check ([#28]) re-runs a full O(vocab)
+  mask on rejection, which re-runs the chain and triggers *another*
+  full-vocab sort — N rejections ⇒ N+1 sorts/token.
+  **Settle it cheaply before profiling anything:** count whodunit's
+  output tokens. If it emitted ~20k, 15 min at 24 tok/s is just
+  arithmetic and there is no second cost. Then, if needed,
+  `grammar_stats_enabled()` already counts fallback re-runs.
+  Deferred deliberately: perf, not correctness. Do not block publish on
+  it; do not "fix" it by lowering `n_ctx`.
+- **`temperature` is silently ignored** ([#35], filed 2026-07-14). There
+  is no `SamplingMode::Temperature` in the crate at all (`sample.rs:230`
+  calls its absence "an oversight"), so blallama's Anthropic-compatible
+  `/v1/messages` cannot honor the field even in principle — requests are
+  sampled with whatever the model's `sampling.toml` says. For a server
+  advertising Anthropic compatibility this is a wire-compat gap, not just
+  a missing feature. **Publish-hygiene action: document it as unsupported
+  in the README** rather than let it look honored. Implementation is 0.9
+  interface-pass work.
+  (It also fooled our own bench: `bench.py` sends `temperature: 0.0` and
+  believed it benched greedy — it benched LocallyTypical. Runs stay
+  deterministic via `seed=42`, so past numbers remain comparable.)
+
+[#28]: https://github.com/mdegans/drama_llama/issues/28
+[#33]: https://github.com/mdegans/drama_llama/issues/33
+[#35]: https://github.com/mdegans/drama_llama/issues/35
 - Two warnings under the `moeflux` feature (`log_moeflux_prefetch` dead,
   `WorkerOutput.gather_id` unread). Left alone on purpose — the first
   looks like disconnected instrumentation, and deleting telemetry to
