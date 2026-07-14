@@ -1335,8 +1335,9 @@ enum CallOutcome {
 
 /// Strip a trailing Harmony EOG piece from body text. Whether the
 /// predictor surfaces the stop token's bytes depends on the path
-/// (`trim_eos` covers eos/eot; `<|call|>` arrives via
-/// `extra_eos_tokens`), so the parser tolerates both.
+/// (`trim_eos` covers the whole EOG set — `<|return|>` and `<|call|>`
+/// alike), so the parser tolerates both. `<|end|>` is deliberately not
+/// here: it is in-stream structure, not a terminator.
 fn strip_harmony_eog(s: &str) -> &str {
     let s = s.strip_suffix(harmony::RETURN).unwrap_or(s);
     s.strip_suffix(harmony::CALL).unwrap_or(s)

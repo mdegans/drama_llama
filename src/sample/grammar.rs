@@ -1896,16 +1896,17 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
     // left the model with no legal path and generation burned to the
     // context limit. Harmony's `<|return|>`/`<|call|>` need no
     // exemption — the grammar is already complete when they appear.
+    //
+    // The set is [`Model::eog_tokens`] and nothing else. Unioning in
+    // `eot()` was the same class of bug from the other side: gpt-oss's
+    // EOT is `<|end|>`, which is NOT EOG, and masking it mid-grammar
+    // left a Harmony model unable to close its analysis channel — it
+    // rambled ("Let's do. We'll call. We'll output.") to `max_tokens`.
     let complete = state.is_complete();
     let eog: Vec<crate::Token> = if complete {
         Vec::new()
     } else {
-        let mut v = model.extra_eos_tokens();
-        v.push(model.eos());
-        if model.eot() >= 0 {
-            v.push(model.eot());
-        }
-        v
+        model.eog_tokens()
     };
 
     let acc = candidates

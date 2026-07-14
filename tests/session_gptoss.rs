@@ -460,16 +460,24 @@ fn prefix_cache_survives_tool_turn() {
 }
 
 /// The EOG contract Phase G's grammar and stop logic rely on, pinned
-/// against the real vocab: `<|return|>` and `<|call|>` end
-/// generation, while `<|end|>` (the in-stream channel separator) must
-/// NOT — libllama's o200k_harmony workaround removes it from
-/// `special_eog_ids`, and `extra_eos_tokens` must surface exactly
-/// that set. CPU-only load: vocab introspection needs no GPU.
+/// against the real vocab: `<|return|>` and `<|call|>` end generation,
+/// while `<|end|>` (the in-stream channel separator) must NOT.
+///
+/// The trap this test exists to catch: `<|end|>` **is this vocab's
+/// EOT**. libllama auto-detects EOT by token text and `"<|end|>"` is on
+/// that list, so `special_eot_id` lands on it; the o200k_harmony
+/// workaround then removes `<|end|>` from `special_eog_ids` — and
+/// *doesn't* touch `special_eot_id`. Upstream stays consistent because
+/// its generation loop only ever asks `llama_vocab_is_eog`. So must
+/// ours: a stop set built as `{eos} ∪ {eot} ∪ extras` drags `<|end|>`
+/// back in, and a Harmony turn then dies right after its analysis block
+/// (unconstrained) or can never close the channel at all (under a tool
+/// grammar, where the same set is masked while the grammar is
+/// incomplete). Hence `Model::eog_tokens` is the *whole* set and the
+/// single authority. CPU-only load: vocab introspection needs no GPU.
 #[test]
 #[ignore = "long running - requires gpt-oss model"]
 fn gptoss_eog_token_set() {
-    use drama_llama::Model as _;
-
     let mut params = unsafe { llama_cpp_sys_3::llama_model_default_params() };
     params.n_gpu_layers = 0;
     let model =
@@ -483,26 +491,42 @@ fn gptoss_eog_token_set() {
         toks[0]
     };
 
-    // GGUF metadata: eos = <|return|>, eot = <|endoftext|>.
-    assert_eq!(piece_of(model.eos()), "<|return|>");
-
     let call = by_piece("<|call|>");
     let end = by_piece("<|end|>");
     let ret = by_piece("<|return|>");
 
-    let extra = model.extra_eos_tokens();
+    // The vocab as libllama reports it: EOS is the final-message stop,
+    // EOT is the channel separator (the quirk above). Pinned so a
+    // change upstream shows up here rather than as a mute Harmony model.
+    assert_eq!(piece_of(model.eos()), "<|return|>");
+    assert_eq!(
+        piece_of(model.eot()),
+        "<|end|>",
+        "upstream quirk pin: libllama auto-detects EOT by text and \
+         `<|end|>` is on that list. If this changes, the carve-out below \
+         may be obsolete — but never assume eot == stop."
+    );
+
+    let eog = model.eog_tokens();
+    let pieces = || eog.iter().map(|&t| piece_of(t)).collect::<Vec<_>>();
     assert!(
-        extra.contains(&call),
-        "<|call|> must stop generation (tool-call turn exit); extra = \
-         {:?}",
-        extra.iter().map(|&t| piece_of(t)).collect::<Vec<_>>()
+        eog.contains(&call),
+        "<|call|> must stop generation (tool-call turn exit); eog = {:?}",
+        pieces()
     );
     assert!(
-        !extra.contains(&end) && model.eos() != end && model.eot() != end,
+        eog.contains(&ret),
+        "<|return|> must stop generation (final-message exit); eog = {:?}",
+        pieces()
+    );
+    assert!(
+        !eog.contains(&end),
         "<|end|> is the in-stream channel separator and must stay \
-         generatable"
+         generatable — it IS this vocab's eot(), which is exactly why \
+         the stop set must be eog_tokens() and never a union with \
+         eot(); eog = {:?}",
+        pieces()
     );
-    assert!(model.eos() == ret || extra.contains(&ret));
 }
 
 /// Prefix cache across a FINAL turn — the `<|return|>` → `<|end|>`

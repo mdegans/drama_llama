@@ -99,39 +99,40 @@ impl PredictOptions {
         }
     }
 
-    /// Add the model's end-of-sequence and end-of-turn tokens as stop
-    /// sequences.
+    /// Add the model's end-of-generation tokens ([`Model::eog_tokens`])
+    /// as stop sequences.
     ///
-    /// Both EOS and EOT are added when they're distinct so chat-tuned
-    /// models that emit `<|eot_id|>` between turns terminate cleanly.
-    /// Repetition penalty ignores these — otherwise a strong penalty can
-    /// keep the model from ever closing a turn.
+    /// Every one of them, and *only* them: EOG is the model's own
+    /// answer to "does emitting this end the turn", and a vocab can
+    /// have an `eot()` that is not in it (gpt-oss's `<|end|>` is the
+    /// in-stream channel separator — stopping there truncates a
+    /// Harmony turn at the end of its reasoning block). Multi-EOS
+    /// vocabs are covered by the same set: Qwen3 declares
+    /// `eos_token_id` as `[<|im_end|>, <|endoftext|>]`, and the
+    /// secondary decodes to an empty piece, so missing it means the
+    /// model loops invisibly until `max_tokens`.
+    ///
+    /// The repetition penalty ignores the EOG set *and* eos/eot even
+    /// when eot isn't EOG: a penalized `<|end|>` is a Harmony model
+    /// that can't close a channel. Structure is never repetition.
+    ///
+    /// [`Model::eog_tokens`]: crate::backend::Model::eog_tokens
     pub fn add_model_stops<M: Model>(mut self, model: &M) -> Self {
-        let eos = model.eos();
-        self.stop_sequences.push(vec![eos]);
-        if let Some(opts) = &mut self.sample_options.repetition {
-            opts.ignored.insert(eos.into());
-        }
-        let eot = model.eot();
-        if eot != eos && eot >= 0 {
-            self.stop_sequences.push(vec![eot]);
-            if let Some(opts) = &mut self.sample_options.repetition {
-                opts.ignored.insert(eot.into());
-            }
-        }
-        // Multi-EOS configs (e.g. Qwen3 declares `eos_token_id` as
-        // `[<|im_end|>, <|endoftext|>]`). Without these, the model
-        // can sit in a loop on the secondary variant after a
-        // grammar-constrained response closes — its decoded text is
-        // empty for HF-style tokenizers, so the loop runs invisibly
-        // until `max_tokens` hits.
-        for extra in model.extra_eos_tokens() {
-            if extra == eos || extra == eot || extra < 0 {
+        let eog = model.eog_tokens();
+        for &token in &eog {
+            if token < 0 {
                 continue;
             }
-            self.stop_sequences.push(vec![extra]);
-            if let Some(opts) = &mut self.sample_options.repetition {
-                opts.ignored.insert(extra.into());
+            self.stop_sequences.push(vec![token]);
+        }
+        if let Some(opts) = &mut self.sample_options.repetition {
+            for token in eog
+                .iter()
+                .copied()
+                .chain([model.eos(), model.eot()])
+                .filter(|&t| t >= 0)
+            {
+                opts.ignored.insert(token.into());
             }
         }
         // Reserved / unused vocab slots (decode to empty strings,

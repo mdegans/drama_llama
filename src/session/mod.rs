@@ -624,7 +624,10 @@ struct MediaContext {
 fn collect_media(prompt: &Prompt) -> Result<MediaContext, SessionError> {
     use misanthropic::prompt::message::Block;
 
-    fn walk<'a>(block: &'a Block, out: &mut Vec<&'a misanthropic::prompt::message::Image>) {
+    fn walk<'a>(
+        block: &'a Block,
+        out: &mut Vec<&'a misanthropic::prompt::message::Image>,
+    ) {
         match block {
             Block::Image { image, .. } => out.push(image),
             Block::ToolResult { result } => {
@@ -1133,9 +1136,20 @@ fn llama_cpp_dialect_sidecar_path(
 }
 
 /// Convenience alias for the llama.cpp-backed session, parallel to
-/// [`crate::LlamaCppEngine`]. Use it (or a turbofish) when both
-/// backends are compiled in and bare `crate::LlamaCppSession::from_path` would be
-/// ambiguous.
+/// [`crate::LlamaCppEngine`].
+///
+/// **Name this (or [`Session<B>`] with a turbofish), not a bare
+/// `Session`.** `Session::from_path*` are *inherent* methods on the
+/// per-backend impls, so a bare `Session::from_path(..)` only compiles
+/// while exactly one `Backend` is enabled — it resolves by having a
+/// single candidate, not by inference. Compile llama.cpp and moeflux
+/// together and every such call becomes `E0034: multiple applicable
+/// items in scope`. That combination is not exotic: it is what
+/// `just test moeflux` builds (the cross-backend suite needs both), so
+/// a bare `Session` in an example or a doctest breaks that build even
+/// though it looks fine in the default one.
+///
+/// [`Session<B>`]: Session
 #[cfg(feature = "llama-cpp")]
 pub type LlamaCppSession = Session<LlamaCppBackend>;
 
@@ -1647,8 +1661,11 @@ impl<B: Backend> Session<B> {
                 markers.push(t.to_string());
             }
         }
-        let mut eog = vec![model.eos(), model.eot()];
-        eog.extend(model.extra_eos_tokens());
+        // EOG is exempt: a stop token is never an injection. `<|end|>`
+        // is NOT in this set for Harmony (it's the channel separator,
+        // not a stop) — it stays generatable via the marker exemption
+        // below, since gpt-oss carries it in `preserved_tokens`.
+        let eog = model.eog_tokens();
         let mut banned: Vec<Token> = model
             .special_tokens()
             .into_iter()
@@ -1675,6 +1692,33 @@ impl<B: Backend> Session<B> {
         banned.into()
     }
 
+    /// Decoded pieces of every end-of-generation token
+    /// ([`Model::eog_tokens`]) — the sentinels filtered out of surfaced
+    /// output, since they are framing rather than content. Empty pieces
+    /// are excluded: empty is also what a stuck-on-secondary-EOS loop
+    /// emits, and we would rather `add_model_stops` halt that loop than
+    /// silently swallow every empty piece.
+    ///
+    /// EOG, deliberately, and not eos/eot: gpt-oss's EOT is `<|end|>`,
+    /// which is *structure the parser needs* (it closes the analysis
+    /// channel). Filtering it out of the text would leave the dialect
+    /// parser with an unterminated reasoning block that swallows the
+    /// rest of the turn.
+    ///
+    /// [`Model::eog_tokens`]: crate::backend::Model::eog_tokens
+    fn eog_pieces(&self) -> std::collections::BTreeSet<String> {
+        let mut pieces: std::collections::BTreeSet<String> = self
+            .engine
+            .model
+            .eog_tokens()
+            .into_iter()
+            .filter(|&t| t >= 0)
+            .map(|t| self.engine.model.token_to_piece(t))
+            .collect();
+        pieces.remove("");
+        pieces
+    }
+
     /// Up-front context-fit check in CELL space (plan #31 item 6).
     ///
     /// The predictor's own guard reasons in POSITIONS: it stops
@@ -1695,8 +1739,7 @@ impl<B: Backend> Session<B> {
         max_tokens: usize,
     ) -> Result<(), SessionError> {
         let needed_cells = entries_cell_len(entries);
-        let prompt_pos: usize =
-            entries.iter().map(CacheEntry::n_pos).sum();
+        let prompt_pos: usize = entries.iter().map(CacheEntry::n_pos).sum();
         let n_ctx = self.engine.n_ctx() as usize;
         let worst_generated = max_tokens.min(n_ctx.saturating_sub(prompt_pos));
         if needed_cells + worst_generated > n_ctx {
@@ -2018,12 +2061,15 @@ impl<B: Backend> Session<B> {
         &self,
         text: &str,
         media: &MediaContext,
-    ) -> Result<(Vec<CacheEntry>, Vec<[u8; 32]>, [u8; 32]), SessionError>
-    {
+    ) -> Result<(Vec<CacheEntry>, Vec<[u8; 32]>, [u8; 32]), SessionError> {
         use crate::backend::Vision as _;
         let plain = |text: &str| {
             let tokens = self.engine.model.tokenize(text, true);
-            (entries_from_tokens(tokens), Vec::new(), hash_partial_text(text))
+            (
+                entries_from_tokens(tokens),
+                Vec::new(),
+                hash_partial_text(text),
+            )
         };
         let Some(sentinel) = media.sentinel.as_deref() else {
             return Ok(plain(text));
@@ -2116,55 +2162,53 @@ impl<B: Backend> Session<B> {
             }
             None => self.render_opts.clone(),
         };
-        let (rendered_prompt, entries, breakpoints, partial_hashes) = if self
-            .prefix_cache
-            .is_some()
-        {
-            let rendered =
-                self.template.render_with_breakpoints(prompt, &opts)?;
-            // Inlines `tokenize_with_breakpoints` so we can keep
-            // the SHA-256 of each surviving partial paired with
-            // its entry position. The shared helper only returns
-            // indices and applies sort+dedup, which would lose
-            // the partial→hash mapping (and knows nothing of media).
-            let (full_entries, full_ids, _) =
-                self.tokenize_split(&rendered.text, &media)?;
-            let mut pairs: Vec<(EntryPos, [u8; 32])> =
-                Vec::with_capacity(rendered.partial_texts.len());
-            for partial in &rendered.partial_texts {
-                let (p_entries, p_ids, p_hash) =
-                    self.tokenize_split(partial, &media)?;
-                // Same fail-open contract as
-                // `chat_template::tokenize_with_breakpoints`,
-                // generalized: drop the breakpoint silently unless
-                // the partial is an entry-wise prefix of the full
-                // render AND its images are the full render's first
-                // k (media entries compare by id + span, so a
-                // reordered or swapped image also fails the check).
-                if p_entries.len() <= full_entries.len()
-                    && full_entries[..p_entries.len()] == p_entries[..]
-                    && p_ids.len() <= full_ids.len()
-                    && full_ids[..p_ids.len()] == p_ids[..]
-                {
-                    pairs.push((
-                        entry_pos_at(&full_entries, p_entries.len()),
-                        p_hash,
-                    ));
+        let (rendered_prompt, entries, breakpoints, partial_hashes) =
+            if self.prefix_cache.is_some() {
+                let rendered =
+                    self.template.render_with_breakpoints(prompt, &opts)?;
+                // Inlines `tokenize_with_breakpoints` so we can keep
+                // the SHA-256 of each surviving partial paired with
+                // its entry position. The shared helper only returns
+                // indices and applies sort+dedup, which would lose
+                // the partial→hash mapping (and knows nothing of media).
+                let (full_entries, full_ids, _) =
+                    self.tokenize_split(&rendered.text, &media)?;
+                let mut pairs: Vec<(EntryPos, [u8; 32])> =
+                    Vec::with_capacity(rendered.partial_texts.len());
+                for partial in &rendered.partial_texts {
+                    let (p_entries, p_ids, p_hash) =
+                        self.tokenize_split(partial, &media)?;
+                    // Same fail-open contract as
+                    // `chat_template::tokenize_with_breakpoints`,
+                    // generalized: drop the breakpoint silently unless
+                    // the partial is an entry-wise prefix of the full
+                    // render AND its images are the full render's first
+                    // k (media entries compare by id + span, so a
+                    // reordered or swapped image also fails the check).
+                    if p_entries.len() <= full_entries.len()
+                        && full_entries[..p_entries.len()] == p_entries[..]
+                        && p_ids.len() <= full_ids.len()
+                        && full_ids[..p_ids.len()] == p_ids[..]
+                    {
+                        pairs.push((
+                            entry_pos_at(&full_entries, p_entries.len()),
+                            p_hash,
+                        ));
+                    }
                 }
-            }
-            pairs.sort_by_key(|(ep, _)| ep.entry);
-            pairs.dedup_by_key(|(ep, _)| ep.entry);
-            let breakpoints: Vec<EntryPos> =
-                pairs.iter().map(|(ep, _)| *ep).collect();
-            let hashes: Vec<[u8; 32]> =
-                pairs.into_iter().map(|(_, h)| h).collect();
-            (rendered.text, full_entries, breakpoints, hashes)
-        } else {
-            // Fast path: single render + tokenize, no partials.
-            let rendered = self.template.render_with(prompt, &opts)?;
-            let (entries, _, _) = self.tokenize_split(&rendered, &media)?;
-            (rendered, entries, Vec::new(), Vec::new())
-        };
+                pairs.sort_by_key(|(ep, _)| ep.entry);
+                pairs.dedup_by_key(|(ep, _)| ep.entry);
+                let breakpoints: Vec<EntryPos> =
+                    pairs.iter().map(|(ep, _)| *ep).collect();
+                let hashes: Vec<[u8; 32]> =
+                    pairs.into_iter().map(|(_, h)| h).collect();
+                (rendered.text, full_entries, breakpoints, hashes)
+            } else {
+                // Fast path: single render + tokenize, no partials.
+                let rendered = self.template.render_with(prompt, &opts)?;
+                let (entries, _, _) = self.tokenize_split(&rendered, &media)?;
+                (rendered, entries, Vec::new(), Vec::new())
+            };
         let pre_opened_reasoning =
             render_ends_with_open_reasoning(&rendered_prompt, &self.dialect);
 
@@ -2333,17 +2377,17 @@ impl<B: Backend> Session<B> {
                                 cache.prev_entries.get(lcp).copied();
                             let new_at_lcp = new_entries.get(lcp).copied();
                             tracing::debug!(
-                            tip_entry = tip.entry,
-                            lcp,
-                            safe,
-                            picked_entry = picked.entry,
-                            prev_len,
-                            new_len,
-                            prev_at_lcp = ?prev_at_lcp,
-                            new_at_lcp = ?new_at_lcp,
-                            "auto-tip ineligible: tip past safe (LCP shorter than expected — \
-                             likely re-tokenization mismatch in asst content)",
-                        );
+                                tip_entry = tip.entry,
+                                lcp,
+                                safe,
+                                picked_entry = picked.entry,
+                                prev_len,
+                                new_len,
+                                prev_at_lcp = ?prev_at_lcp,
+                                new_at_lcp = ?new_at_lcp,
+                                "auto-tip ineligible: tip past safe (LCP shorter than expected — \
+                                 likely re-tokenization mismatch in asst content)",
+                            );
                         }
                     }
                     picked
@@ -2424,8 +2468,7 @@ impl<B: Backend> Session<B> {
                     })
                     .collect();
                 for old_pos in orphans {
-                    if let Err(_e) = self.engine.forget_pos(0, old_pos as i32)
-                    {
+                    if let Err(_e) = self.engine.forget_pos(0, old_pos as i32) {
                         // Best-effort orphan reclamation — failure here
                         // means the backend didn't have a snapshot at
                         // `old_pos` (already evicted by LRU, never
@@ -2541,10 +2584,7 @@ impl<B: Backend> Session<B> {
                     if real != span {
                         self.record_cache_miss_on_error();
                         return Err(SessionError::MediaSpanMismatch {
-                            id: id
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect(),
+                            id: id.iter().map(|b| format!("{b:02x}")).collect(),
                             expected: span,
                             actual: real,
                         });
@@ -2626,8 +2666,7 @@ impl<B: Backend> Session<B> {
         let asst: misanthropic::prompt::message::AssistantMessage =
             blocks.iter().cloned().collect();
         extended.messages.push(asst.into());
-        let mut opts =
-            self.render_opts.clone().with_generation_prompt(false);
+        let mut opts = self.render_opts.clone().with_generation_prompt(false);
         if let Some(sentinel) = media_sentinel {
             opts = opts.with_media_sentinel(sentinel);
         }
@@ -2673,8 +2712,7 @@ impl<B: Backend> Session<B> {
         // snapshots share the same engine.checkpoint_pos slot, so
         // freeing one would lose the other). Position space throughout:
         // engine snapshots are keyed by position.
-        let old_tip =
-            self.prefix_cache.as_ref().and_then(|c| c.internal_tip);
+        let old_tip = self.prefix_cache.as_ref().and_then(|c| c.internal_tip);
         if let Some(cache) = self.prefix_cache.as_mut() {
             cache.prev_entries = new_entries;
             cache.prev_breakpoints = new_breakpoints;
@@ -2690,9 +2728,7 @@ impl<B: Backend> Session<B> {
                 && !self
                     .prefix_cache
                     .as_ref()
-                    .map(|c| {
-                        c.prev_breakpoints.iter().any(|bp| bp.pos == old)
-                    })
+                    .map(|c| c.prev_breakpoints.iter().any(|bp| bp.pos == old))
                     .unwrap_or(false)
             {
                 if let Err(_e) = self.engine.forget_pos(0, old as i32) {
@@ -2965,24 +3001,23 @@ impl<B: Backend> Session<B> {
         let kv_generated_count = kv_pos_len.saturating_sub(prompt_pos_len);
 
         let mut extended = prompt_entries;
-        extended.extend(generated_tokens.iter().copied().map(CacheEntry::Token));
+        extended
+            .extend(generated_tokens.iter().copied().map(CacheEntry::Token));
 
         // Stop-sequence case: generated_tokens has one extra token
         // (the recorded-but-uncommitted close marker). Tip and
         // checkpoint both at the KV head. The "extra" token is what
         // makes the next call's LCP exceed the tip entry so it
         // qualifies.
-        if generated_tokens.len() == kv_generated_count + 1 && kv_pos_len >= 1
-        {
+        if generated_tokens.len() == kv_generated_count + 1 && kv_pos_len >= 1 {
             if let Some(close) = canonical_close {
                 if !close.is_empty() {
                     // Replace the sampled stop token with the close
                     // token(s) the canonical re-render actually
                     // contains (see doc above).
                     extended.truncate(prompt_entry_len + kv_generated_count);
-                    extended.extend(
-                        close.iter().copied().map(CacheEntry::Token),
-                    );
+                    extended
+                        .extend(close.iter().copied().map(CacheEntry::Token));
                 }
             }
             let tip = EntryPos {
@@ -3100,20 +3135,7 @@ impl<B: Backend> Session<B> {
         let usage = Self::make_usage(prompt_tokens, cache_read, 0);
         self.record_usage(usage);
 
-        let mut eos_pieces: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        eos_pieces
-            .insert(self.engine.model.token_to_piece(self.engine.model.eos()));
-        let eot_id = self.engine.model.eot();
-        if eot_id >= 0 {
-            eos_pieces.insert(self.engine.model.token_to_piece(eot_id));
-        }
-        for extra in self.engine.model.extra_eos_tokens() {
-            if extra >= 0 {
-                eos_pieces.insert(self.engine.model.token_to_piece(extra));
-            }
-        }
-        eos_pieces.remove("");
+        let eos_pieces = self.eog_pieces();
 
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
@@ -3206,29 +3228,11 @@ impl<B: Backend> Session<B> {
                 &media_by_id,
             )?;
 
-        // Pieces we drop from the surfaced output: the primary EOS,
-        // the EOT (if distinct), every extra-EOS the model declares
-        // (e.g. Qwen3's `<|endoftext|>`), and the invalid-UTF-8
-        // sentinel. Pre-decode once so the inner loop is a hash
-        // lookup. Empty pieces are kept out of the set — empty is
-        // also what a stuck-on-secondary-EOS loop emits, but we'd
-        // rather rely on the new `extra_eos_tokens` plumbing in
-        // PredictOptions::add_model_stops to halt the loop cleanly
-        // than silently swallow every empty piece.
-        let mut eos_pieces: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        eos_pieces
-            .insert(self.engine.model.token_to_piece(self.engine.model.eos()));
-        let eot_id = self.engine.model.eot();
-        if eot_id >= 0 {
-            eos_pieces.insert(self.engine.model.token_to_piece(eot_id));
-        }
-        for extra in self.engine.model.extra_eos_tokens() {
-            if extra >= 0 {
-                eos_pieces.insert(self.engine.model.token_to_piece(extra));
-            }
-        }
-        eos_pieces.remove("");
+        // Pieces we drop from the surfaced output: every EOG token
+        // (see `eog_pieces` — stop tokens are framing, not content) and
+        // the invalid-UTF-8 sentinel. Pre-decoded once so the inner
+        // loop is a hash lookup.
+        let eos_pieces = self.eog_pieces();
 
         // Capture grammar / json mode handles BEFORE moving `modes`
         // into the predictor. Each `SamplingMode::Grammar` /
@@ -3458,11 +3462,7 @@ impl<B: Backend> Session<B> {
         // wasn't byte-stable). See `compute_tip_extension` for the
         // stop-condition handling.
         let (extended_prev, internal_tip, head_for_checkpoint) = self
-            .compute_tip_extension(
-                entries,
-                generated_tokens,
-                canonical_close,
-            );
+            .compute_tip_extension(entries, generated_tokens, canonical_close);
         if let Some(head) = head_for_checkpoint {
             self.engine.checkpoint_pos(0, head as i32);
         }
@@ -4249,10 +4249,11 @@ pub struct BlockStream<'engine, B: Backend> {
     /// stream's lifetime).
     parser: crate::dialect::StreamParser,
     pending: std::collections::VecDeque<crate::Block>,
-    /// EOS-like piece texts (primary EOS, EOT, every
-    /// `extra_eos_tokens` declared by the model) — filtered out of
-    /// the stream since they're sentinels, not content the caller
-    /// wants to see.
+    /// Piece texts of the model's end-of-generation tokens
+    /// (`Model::eog_tokens`) — filtered out of the stream since they
+    /// are sentinels, not content the caller wants to see. Framing
+    /// that merely *looks* terminal is kept: gpt-oss's `<|end|>` is
+    /// this vocab's `eot()` but not EOG, and the parser needs it.
     eos_pieces: std::collections::BTreeSet<String>,
     drained: bool,
 }
@@ -4315,20 +4316,24 @@ fn any_grammar_complete(modes: &[SamplingMode]) -> bool {
 }
 
 fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
-    // Models can end a turn with EOT rather than EOS (Gemma 4:
-    // `<turn|>` vs `<eos>`) — trim whichever piece trails.
-    let eos_piece = engine.model.token_to_piece(engine.model.eos());
+    // A turn can close on any of the model's EOG tokens, not just the
+    // primary EOS (Gemma 4 ends on `<turn|>`, Harmony on `<|return|>`
+    // or `<|call|>`) — trim whichever trails. Non-EOG framing is left
+    // alone even when the vocab calls it EOT: gpt-oss's `<|end|>` is
+    // the parser's channel separator, not a terminator.
     let mut text = text;
-    let eot_id = engine.model.eot();
-    if eot_id >= 0 {
-        let eot_piece = engine.model.token_to_piece(eot_id);
-        if !eot_piece.is_empty() {
-            text = text.trim_end_matches(eot_piece.as_str());
+    for piece in engine
+        .model
+        .eog_tokens()
+        .into_iter()
+        .filter(|&t| t >= 0)
+        .map(|t| engine.model.token_to_piece(t))
+    {
+        if !piece.is_empty() {
+            text = text.trim_end_matches(piece.as_str());
         }
     }
-    text.trim_end_matches(eos_piece.as_str())
-        .trim_end_matches("[Invalid UTF-8]")
-        .trim_end()
+    text.trim_end_matches("[Invalid UTF-8]").trim_end()
 }
 
 #[cfg(test)]
@@ -4377,18 +4382,12 @@ mod tests {
             "identical",
         );
         assert_eq!(
-            longest_common_prefix_len(
-                &toks([1, 2, 3, 4]),
-                &toks([1, 2, 3, 9])
-            ),
+            longest_common_prefix_len(&toks([1, 2, 3, 4]), &toks([1, 2, 3, 9])),
             3,
             "one-different",
         );
         assert_eq!(
-            longest_common_prefix_len(
-                &toks([1, 2, 3]),
-                &toks([1, 2, 3, 4, 5])
-            ),
+            longest_common_prefix_len(&toks([1, 2, 3]), &toks([1, 2, 3, 4, 5])),
             3,
             "one-shorter",
         );
@@ -4434,10 +4433,7 @@ mod tests {
             EntryPos { entry: 3, pos: 18 },
             "media advances positions by n_pos"
         );
-        assert_eq!(
-            entry_pos_at(&entries, 4),
-            EntryPos { entry: 4, pos: 19 }
-        );
+        assert_eq!(entry_pos_at(&entries, 4), EntryPos { entry: 4, pos: 19 });
         assert_eq!(entries_cell_len(&entries), 259, "cells count n_tokens");
     }
 
@@ -5666,10 +5662,7 @@ mod tests {
     #[test]
     fn test_hash_keyed_l_hit_empty_side_table() {
         let h = hash_partial_text("aaa");
-        assert_eq!(
-            hash_keyed_l_hit(&[], &[], None, None, &[h], 500),
-            ep(0)
-        );
+        assert_eq!(hash_keyed_l_hit(&[], &[], None, None, &[h], 500), ep(0));
     }
 
     /// The emit-side ban set on a real vocab (Qwen 3.6): turn-open
@@ -5881,8 +5874,7 @@ mod tests {
                 SamplingMode::Greedy,
             ]);
             let second = session.complete_response(&prompt).unwrap();
-            let reused =
-                second.usage.cache_read_input_tokens.unwrap() as usize;
+            let reused = second.usage.cache_read_input_tokens.unwrap() as usize;
             assert!(
                 reused >= before + media_cells,
                 "reuse ({reused} cells) must cover the image \
@@ -5948,7 +5940,6 @@ mod tests {
                     SamplingMode::Greedy,
                 ]);
             {
-                use crate::backend::Vision as _;
                 let (vision, _) = session.engine_mut().vision_and_decoder();
                 assert!(vision.expect("loaded").supports_images());
             }
@@ -5974,8 +5965,7 @@ mod tests {
         #[test]
         #[ignore = "long running; requires local model + mmproj sidecar"]
         fn media_e2e_swapped_image_misses_at_media() {
-            let mut session =
-                media_session().with_sampling(std::iter::empty());
+            let mut session = media_session().with_sampling(std::iter::empty());
             let question = "Briefly, what is shown in this image?";
 
             let p1 = image_prompt(question, samoyed_api_image(256));
@@ -5991,8 +5981,7 @@ mod tests {
                 ApiImage::encode(MediaType::Png, red).expect("png encode");
             let p2 = image_prompt(question, api2);
             let second = session.complete_response(&p2).unwrap();
-            let reused =
-                second.usage.cache_read_input_tokens.unwrap() as usize;
+            let reused = second.usage.cache_read_input_tokens.unwrap() as usize;
             assert!(
                 reused <= before,
                 "swapped image must miss at the media entry \
@@ -6008,8 +5997,7 @@ mod tests {
         #[test]
         #[ignore = "long running; requires local model + mmproj sidecar"]
         fn media_e2e_literal_marker_is_inert() {
-            let mut session =
-                media_session().with_sampling(std::iter::empty());
+            let mut session = media_session().with_sampling(std::iter::empty());
             let mut p = Prompt::default()
                 .system("You are a concise assistant.")
                 .cache();
@@ -6031,11 +6019,8 @@ mod tests {
             let resp = session.complete_response(&p).unwrap();
             assert!(!text_of(&resp).is_empty());
             let cache = session.prefix_cache.as_ref().unwrap();
-            let media_count = cache
-                .prev_entries
-                .iter()
-                .filter(|e| e.is_media())
-                .count();
+            let media_count =
+                cache.prev_entries.iter().filter(|e| e.is_media()).count();
             assert_eq!(
                 media_count, 1,
                 "literal marker in content must not become media"

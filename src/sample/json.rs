@@ -548,12 +548,7 @@ pub(crate) fn json_filter<M: Model>(
     let eog: Vec<Token> = if complete {
         Vec::new()
     } else {
-        let mut v = model.extra_eos_tokens();
-        v.push(model.eos());
-        if model.eot() >= 0 {
-            v.push(model.eot());
-        }
-        v
+        model.eog_tokens()
     };
     for cand in candidates.as_slice() {
         // Mid-parse EOG survives only when its own piece bytes finish

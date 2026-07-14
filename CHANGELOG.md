@@ -52,12 +52,15 @@ Three further arcs land on top of the split:
   scattering reserved tokens after a structured response closes.
   See `.claude/memory/grammar_reserved_token_loop.md` for the
   full analysis.
-- **`Model::extra_eos_tokens()`** — trait method exposing
-  additional EOS-like token ids beyond `eos` and `eot`. Default
-  empty; `MoefluxModel` overrides to expose the tail of the
-  `eos_token_id` config array (Qwen3 declares `[<|im_end|>,
-  <|endoftext|>]`; without this hook, `<|endoftext|>` would never
-  reach `add_model_stops`).
+- **`Model::eog_tokens()`** — trait method exposing the model's
+  complete end-of-generation set, and the single authority for what
+  stops a prediction. `LlamaCppModel` returns libllama's
+  `special_eog_ids` verbatim (`llama_vocab_is_eog`); `MoefluxModel`
+  composes it from the `eos_token_id` config array (Qwen3 declares
+  `[<|im_end|>, <|endoftext|>]`, and the secondary decodes to an
+  empty piece, so missing it means an invisible loop to
+  `max_tokens`). Never derive a stop set from `eos()`/`eot()` — see
+  *Changed* and *Fixed*.
 - **`Model::display_name()`** — human-readable identifier for
   loaded models. `LlamaCppModel` returns the GGUF basename;
   `MoefluxModel` returns the parent dir's basename (overridden
@@ -220,6 +223,18 @@ Three further arcs land on top of the split:
 
 ### Changed
 
+- **`Model::extra_eos_tokens` → `Model::eog_tokens`**, and it now
+  returns the *whole* end-of-generation set (`eos` and `eot`
+  included) rather than the extras beyond them. For the llama.cpp
+  backend that set is libllama's `special_eog_ids` verbatim —
+  `llama_vocab_is_eog`, quirks and per-family workarounds included.
+  It is the single authority for both "does emitting this end the
+  turn" and "may this token be masked while a constraint is open";
+  callers must not derive a stop set from `eos()`/`eot()`, which are
+  labels the vocab applies, not statements about behavior (see
+  *Fixed*). Backends that have no `is_eog` oracle report their own
+  truth: `MoefluxModel` composes it from the tokenizer config, where
+  `eot` genuinely does terminate a turn.
 - **`Session::run_call` now breaks generation on grammar accept**.
   When any active `SamplingMode::Grammar` / `SamplingMode::Json`
   matcher reaches its accept state, the call halts immediately
@@ -270,6 +285,24 @@ Three further arcs land on top of the split:
 
 ### Fixed
 
+- **Harmony turns died at the end of their reasoning block —
+  `eot` is not a stop token.** libllama auto-detects the EOT token
+  *by text*, and `"<|end|>"` is on that match list, so gpt-oss's
+  `eot()` is `<|end|>` — its in-stream *channel separator*. libllama
+  then removes `<|end|>` from `special_eog_ids` precisely so the model
+  can close an analysis channel and keep going, and leaves
+  `special_eot_id` pointing at it; upstream stays consistent because
+  its generation loop only ever asks `llama_vocab_is_eog`. drama_llama
+  instead rebuilt the stop set by hand as `{eos} ∪ {eot} ∪ extras`, in
+  seven places, dragging `<|end|>` back in. Unconstrained, a Harmony
+  turn stopped dead after its analysis block (one lone `Block::Thought`
+  came back — no answer, no tool call); under a tool grammar, where the
+  same set is masked while the constraint is incomplete, the model
+  could not emit the token that closes the channel and rambled to
+  `max_tokens`. `<|end|>`'s piece was also being stripped from the
+  surfaced text, which would have left the dialect parser with an
+  unterminated reasoning block. Fixed by deleting the union: see
+  `Model::eog_tokens` under *Changed*.
 - **Qwen3 chat-template thinking-mode forced on by default.**
   `ChatTemplate::render_with` never consulted `prompt.thinking`,
   leaving the Jinja `enable_thinking` variable undefined. Templates
@@ -294,7 +327,7 @@ Three further arcs land on top of the split:
   `max_tokens` exhausted. Cross-backend testing (A3B on llama.cpp
   vs moeflux) confirms the issue lives at the model/grammar
   layer, not in either backend's decode path. Fixed via the
-  `SamplingMode::Deny` mask + `Model::extra_eos_tokens` plumbing
+  `SamplingMode::Deny` mask + `Model::eog_tokens` plumbing
   + grammar-accept-state break described above.
 - **Repetition-penalty additive growth on long generations.**
   The additive `count * penalty_freq + penalty_present` term grew

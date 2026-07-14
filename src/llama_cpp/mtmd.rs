@@ -405,8 +405,7 @@ impl Vision<LlamaCppDecoder> for Mtmd {
         start_pos: usize,
         seq_id: i32,
     ) -> Result<MediaSpan, Self::Error> {
-        let bitmap =
-            Bitmap::real(image).map_err(MtmdPrefillError::Tokenize)?;
+        let bitmap = Bitmap::real(image).map_err(MtmdPrefillError::Tokenize)?;
         // Marker-only text: the media chunk it produces is identical
         // to the one a full-prompt tokenization yields for this image
         // (preprocessing is per-bitmap); any wrapper tokens the model
@@ -439,8 +438,7 @@ impl Mtmd {
         start_pos: usize,
         seq_id: i32,
     ) -> Result<MediaSpan, MtmdPrefillError> {
-        let n_tokens =
-            unsafe { mtmd_input_chunk_get_n_tokens(chunk) } as usize;
+        let n_tokens = unsafe { mtmd_input_chunk_get_n_tokens(chunk) } as usize;
         let n_pos = unsafe { mtmd_input_chunk_get_n_pos(chunk) } as u32;
 
         // Fit check up front, before the expensive encode: non-causal
@@ -469,23 +467,23 @@ impl Mtmd {
         if embd.is_null() {
             return Err(MtmdPrefillError::Encode { code: -1 });
         }
-        let n_embd = unsafe {
-            llama_model_n_embd_inp(llama_get_model(decoder.context))
-        } as usize;
+        let n_embd =
+            unsafe { llama_model_n_embd_inp(llama_get_model(decoder.context)) }
+                as usize;
         let embd_slice =
             unsafe { std::slice::from_raw_parts(embd, n_tokens * n_embd) };
 
         // Pre-KV non-finite guard: this is the hook the upstream
         // helper doesn't have. Nothing has touched the KV cache yet,
         // so a poisoned encode is rejected with state fully intact.
-        if let Some(index) =
-            embd_slice.iter().position(|v| !v.is_finite())
-        {
+        if let Some(index) = embd_slice.iter().position(|v| !v.is_finite()) {
             let id_c = unsafe { mtmd_input_chunk_get_id(chunk) };
             let id = if id_c.is_null() {
                 String::new()
             } else {
-                unsafe { CStr::from_ptr(id_c) }.to_string_lossy().into_owned()
+                unsafe { CStr::from_ptr(id_c) }
+                    .to_string_lossy()
+                    .into_owned()
             };
             return Err(MtmdPrefillError::NonFinite { id, index });
         }
@@ -507,8 +505,15 @@ impl Mtmd {
             if image_tokens.is_null() {
                 return Err(MtmdPrefillError::NoMediaChunk);
             }
-            let mut rel =
-                vec![mtmd_decoder_pos { t: 0, x: 0, y: 0, z: 0 }; n_tokens];
+            let mut rel = vec![
+                mtmd_decoder_pos {
+                    t: 0,
+                    x: 0,
+                    y: 0,
+                    z: 0
+                };
+                n_tokens
+            ];
             unsafe {
                 mtmd_helper_image_get_decoder_pos(
                     image_tokens,
@@ -523,8 +528,8 @@ impl Mtmd {
 
         // Decode in n_batch slices. The guard restores causal
         // attention on every exit path, including decode errors.
-        let n_batch = (unsafe { llama_n_batch(decoder.context) } as usize)
-            .max(1);
+        let n_batch =
+            (unsafe { llama_n_batch(decoder.context) } as usize).max(1);
         let _causal = CausalAttnGuard::disable_if(non_causal, decoder.context);
         let mut offset = 0;
         while offset < n_tokens {
@@ -558,8 +563,7 @@ impl Mtmd {
         start_pos: usize,
         seq_id: i32,
     ) -> Result<MediaSpan, MtmdError> {
-        let bitmap =
-            Bitmap::real(image).map_err(MtmdPrefillError::Tokenize)?;
+        let bitmap = Bitmap::real(image).map_err(MtmdPrefillError::Tokenize)?;
         let chunks = self
             .tokenize_raw(
                 &self.marker.clone(),
@@ -1055,8 +1059,7 @@ mod tests {
                 id: [9; 32],
             },
         ];
-        let segments =
-            ["<|im_start|>user\nCompare ", " with ", "<|im_end|>\n"];
+        let segments = ["<|im_start|>user\nCompare ", " with ", "<|im_end|>\n"];
 
         // Session-style assembly: text through the MODEL tokenizer
         // (segment 0 like a full render, later segments without
@@ -1154,7 +1157,7 @@ mod tests {
         .unwrap();
 
         let run = |engine: &mut crate::LlamaCppEngine,
-                       use_helper: bool|
+                   use_helper: bool|
          -> (MediaSpan, Vec<f32>) {
             engine.memory_clear();
             engine.prefill_chunk(&prefix, 0, 0).expect("prefix prefill");
@@ -1162,22 +1165,11 @@ mod tests {
             let vision = vision.expect("mmproj sidecar should auto-load");
             let span = if use_helper {
                 vision
-                    .prefill_image_via_helper(
-                        decoder,
-                        &image,
-                        prefix.len(),
-                        0,
-                    )
+                    .prefill_image_via_helper(decoder, &image, prefix.len(), 0)
                     .expect("helper-path image prefill")
             } else {
-                Vision::prefill_image(
-                    vision,
-                    decoder,
-                    &image,
-                    prefix.len(),
-                    0,
-                )
-                .expect("rust-loop image prefill")
+                Vision::prefill_image(vision, decoder, &image, prefix.len(), 0)
+                    .expect("rust-loop image prefill")
             };
             let after = prefix.len() + span.n_pos as usize;
             let logits = decoder

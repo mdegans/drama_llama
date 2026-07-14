@@ -362,7 +362,12 @@ pub mod harmony {
     pub const MESSAGE: &str = "<|message|>";
     /// Ends analysis / commentary blocks in-stream. NOT
     /// end-of-generation — libllama removes it from `special_eog_ids`
-    /// for Harmony vocabs (see `LlamaCppModel::extra_eos_tokens`).
+    /// for Harmony vocabs (see [`Model::eog_tokens`]). It *is* this
+    /// vocab's `eot()`, though, which is the trap: derive a stop set
+    /// from eos/eot instead of asking `eog_tokens` and a Harmony turn
+    /// dies at the end of its reasoning block.
+    ///
+    /// [`Model::eog_tokens`]: crate::backend::Model::eog_tokens
     pub const END: &str = "<|end|>";
     /// EOG: ends a tool call.
     pub const CALL: &str = "<|call|>";

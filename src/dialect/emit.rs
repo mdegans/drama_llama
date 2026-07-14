@@ -267,8 +267,10 @@ pub fn grammar_source(
 /// `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}`.
 /// After the args complete nothing further is legal, so the sampler's
 /// complete-constraint logic admits only EOG — the model's `<|call|>`
-/// (see `extra_eos_tokens`), a deterministic stop that is also the
+/// (see [`Model::eog_tokens`]), a deterministic stop that is also the
 /// canonical re-render byte.
+///
+/// [`Model::eog_tokens`]: crate::backend::Model::eog_tokens
 ///
 /// Lazy (`Auto`): activated by one of [`CallSyntax::triggers`] (both
 /// recipient positions); the root accepts either header shape from

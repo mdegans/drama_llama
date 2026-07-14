@@ -722,10 +722,7 @@ fn build_messages(
     let mut out: Vec<JinjaValue> =
         Vec::with_capacity(prompt.messages.len() + 1);
     if let Some(system) = prompt.system.as_ref() {
-        out.push(text_message(
-            "system",
-            flatten_text(system, media_sentinel),
-        ));
+        out.push(text_message("system", flatten_text(system, media_sentinel)));
     }
     for m in &prompt.messages {
         let role = match m.role {
@@ -757,8 +754,7 @@ fn append_message(
         for b in &blocks {
             match b {
                 Block::ToolResult { result } => {
-                    let content =
-                        flatten_text(&result.content, media_sentinel);
+                    let content = flatten_text(&result.content, media_sentinel);
                     out.push(tool_result_message(&result.tool_use_id, content));
                 }
                 other => {
@@ -2278,10 +2274,8 @@ mod tests {
         assert!(split.segments[0].ends_with("What breed is "));
         assert!(split.segments[1].starts_with(" shown here?"));
         // Reassembly is lossless.
-        let reassembled = format!(
-            "{}{}{}",
-            split.segments[0], marker, split.segments[1]
-        );
+        let reassembled =
+            format!("{}{}{}", split.segments[0], marker, split.segments[1]);
         assert_eq!(reassembled, out);
     }
 

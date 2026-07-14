@@ -131,10 +131,10 @@ pub struct LlamaCppModel {
     /// token (stop-string windowing), and the naive compute is O(vocab), so
     /// we memoize the first call.
     max_token_len: std::sync::OnceLock<usize>,
-    /// Cached end-of-generation tokens beyond eos/eot (libllama's
+    /// Cached end-of-generation token set (libllama's
     /// `special_eog_ids`). The sampler consults this per candidate
     /// sweep and the naive compute is O(vocab), so memoize.
-    extra_eos: std::sync::OnceLock<Vec<llama_token>>,
+    eog: std::sync::OnceLock<Vec<llama_token>>,
 }
 
 unsafe impl Send for LlamaCppModel {}
@@ -201,7 +201,7 @@ impl LlamaCppModel {
                 vocab,
                 file_name: Some(file_name),
                 max_token_len: std::sync::OnceLock::new(),
-                extra_eos: std::sync::OnceLock::new(),
+                eog: std::sync::OnceLock::new(),
             })
         }
     }
@@ -222,7 +222,7 @@ impl LlamaCppModel {
                 vocab,
                 file_name: None,
                 max_token_len: std::sync::OnceLock::new(),
-                extra_eos: std::sync::OnceLock::new(),
+                eog: std::sync::OnceLock::new(),
             })
         }
     }
@@ -318,30 +318,28 @@ impl LlamaCppModel {
             .collect()
     }
 
-    /// End-of-generation tokens beyond [`eos`](Self::eos) and
-    /// [`eot`](Self::eot), per libllama's `special_eog_ids`
-    /// (`llama_vocab_is_eog`). libllama fills that set by token-text
-    /// matching (`<|im_end|>`, `<|return|>`, `<|call|>`, …) with
-    /// model-aware fixups — notably for gpt-oss/Harmony vocabs it
-    /// *removes* `<|end|>` so the in-stream channel separator stays
-    /// generatable while `<|return|>` (final) and `<|call|>` (tool
-    /// call) stop generation. Exposing the set here is Phase G of the
-    /// tool-dialects plan: without it only the GGUF's primary
-    /// eos/eot stop a prediction, and gpt-oss tool calls would run
-    /// through `<|call|>` to `max_tokens`.
+    /// libllama's `special_eog_ids` set, verbatim: every token for
+    /// which `llama_vocab_is_eog` holds. This is the set libllama's
+    /// own generation loop stops on, so it is the one we stop on.
+    ///
+    /// libllama fills it by token-text matching (`<|im_end|>`,
+    /// `<|return|>`, `<|call|>`, …), then applies model-aware fixups.
+    /// Those fixups are exactly why this must be read rather than
+    /// derived from [`eos`](Self::eos) / [`eot`](Self::eot): for
+    /// Harmony vocabs it *removes* `<|end|>` from the set so the
+    /// in-stream channel separator stays generatable — while leaving
+    /// `special_eot_id` pointing at `<|end|>` (llama-vocab.cpp: EOT is
+    /// auto-detected by text, and `"<|end|>"` is on that list). So
+    /// gpt-oss has an EOT that does not end generation, and only
+    /// `<|return|>` (final), `<|call|>` (tool call) and
+    /// `<|endoftext|>` do.
     ///
     /// Memoized — first call is O(vocab), subsequent calls O(1).
-    pub fn extra_eos_tokens(&self) -> Vec<llama_token> {
-        self.extra_eos
+    pub fn eog_tokens(&self) -> Vec<llama_token> {
+        self.eog
             .get_or_init(|| {
-                let eos = self.eos();
-                let eot = self.eot();
                 (0..self.n_vocab())
-                    .filter(|&t| {
-                        t != eos
-                            && t != eot
-                            && unsafe { llama_vocab_is_eog(self.vocab, t) }
-                    })
+                    .filter(|&t| unsafe { llama_vocab_is_eog(self.vocab, t) })
                     .collect()
             })
             .clone()
@@ -813,8 +811,8 @@ impl crate::backend::Model for LlamaCppModel {
         LlamaCppModel::get_meta(self, key)
     }
 
-    fn extra_eos_tokens(&self) -> Vec<crate::Token> {
-        LlamaCppModel::extra_eos_tokens(self)
+    fn eog_tokens(&self) -> Vec<crate::Token> {
+        LlamaCppModel::eog_tokens(self)
     }
 
     fn display_name(&self) -> Option<String> {

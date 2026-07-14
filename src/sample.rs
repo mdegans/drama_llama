@@ -1251,8 +1251,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
         .unwrap()
         .id;
 
-    if let Some((rng_snap, mu_snap, saved)) =
-        snapshot.as_ref().filter(|_| lazy)
+    if let Some((rng_snap, mu_snap, saved)) = snapshot.as_ref().filter(|_| lazy)
     {
         // Verify just the chosen token's piece against every constraint —
         // O(piece bytes) vs the O(vocab) filter sweep. Matching the
@@ -1267,9 +1266,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
         let t0 = grammar::grammar_stats_enabled().then(std::time::Instant::now);
         let mut buf: Vec<u8> = Vec::with_capacity(32);
         model.token_to_piece_ref(chosen, &mut buf);
-        let chosen_is_eog = chosen == model.eos()
-            || (model.eot() >= 0 && chosen == model.eot())
-            || model.extra_eos_tokens().contains(&chosen);
+        let chosen_is_eog = model.eog_tokens().contains(&chosen);
         let legal = opts.modes.iter().all(|mode| match mode {
             SamplingMode::Json(state) => {
                 let state = state.lock().expect(
@@ -1542,8 +1539,8 @@ mod tests {
         fn special_tokens(&self) -> Vec<Token> {
             vec![EOS, EOG_A]
         }
-        fn extra_eos_tokens(&self) -> Vec<Token> {
-            vec![EOG_A, EOG_B]
+        fn eog_tokens(&self) -> Vec<Token> {
+            vec![EOS, EOG_A, EOG_B]
         }
         fn max_token_len(&self) -> usize {
             1

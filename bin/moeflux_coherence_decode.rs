@@ -35,9 +35,11 @@
 //! {"trailer":{"done":true,"chosen_seq":[12345, 9876, ...]}}
 //! ```
 //!
-//! `stop_set` is `eos | eot | extra_eos_tokens` (the actual stop set,
-//! NOT `special_tokens()` which includes chat-template controls that
-//! can appear in legitimate continuations).
+//! `stop_set` is `Model::eog_tokens()` (the actual stop set, NOT
+//! `special_tokens()` — which includes chat-template controls that can
+//! appear in legitimate continuations — and NOT a union with `eot()`,
+//! which on some vocabs is in-stream structure rather than a
+//! terminator).
 //!
 //! Exit codes:
 //! - `0` — success (all 30 steps produced + trailer emitted)
@@ -141,10 +143,7 @@ fn main() {
     };
 
     let n_vocab = engine.model.n_vocab();
-    let stop_set: Vec<Token> = std::iter::once(engine.model.eos())
-        .chain(std::iter::once(engine.model.eot()))
-        .chain(engine.model.extra_eos_tokens())
-        .collect();
+    let stop_set: Vec<Token> = engine.model.eog_tokens();
 
     // -- tokenize --
     let prompt_tokens: Vec<Token> = engine.model.tokenize(prompt_str, false);

@@ -294,8 +294,21 @@ impl Model for MoefluxModel {
         self.name.clone()
     }
 
-    fn extra_eos_tokens(&self) -> Vec<Token> {
-        self.extra_eos.clone()
+    /// No libllama to ask, so compose the set: the config's EOS ids
+    /// (`resolve_extra_eos` already returns the secondaries) plus the
+    /// primary EOS and the EOT. Unlike the llama.cpp vocab there is no
+    /// text-matching auto-detect here — `eot` comes from the
+    /// tokenizer config and genuinely does end a turn — so unioning it
+    /// in is correct for this backend. Moeflux hosts Qwen3 only; if it
+    /// ever hosts a Harmony vocab, this needs the `<|end|>` carve-out.
+    fn eog_tokens(&self) -> Vec<Token> {
+        let mut v = self.extra_eos.clone();
+        for t in [self.eos, self.eot] {
+            if t >= 0 && !v.contains(&t) {
+                v.push(t);
+            }
+        }
+        v
     }
 }
 

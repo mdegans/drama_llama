@@ -545,23 +545,36 @@ pub trait Model: Send + Sync {
     /// value as a string, or `None` if missing.
     fn get_meta(&self, key: &str) -> Option<String>;
 
-    /// Additional end-of-sequence-like tokens beyond [`Model::eos`]
-    /// and [`Model::eot`]. Some models declare more than one EOS in
-    /// their config — Qwen3, for instance, sets `eos_token_id` to
-    /// `[<|im_end|>, <|endoftext|>]` and the model treats either as
-    /// "I'm done." Without this hook, only the primary EOS would
-    /// stop generation, and the model can land in a loop emitting
-    /// the secondary variant (whose decoded text is empty for
-    /// HF-style tokenizers) until `max_tokens` hits.
+    /// Every token that ENDS GENERATION for this model — the complete
+    /// set, `eos` and `eot` included. This is the single authority for
+    /// "should I stop here?" and "may this token be masked while a
+    /// constraint is open?"; ask it, never `eos()`/`eot()`.
     ///
-    /// Default: empty. Backends with a single EOS need not override.
-    /// `PredictOptions::add_model_stops` consumes the result and
-    /// adds each as an additional stop sequence; Session's piece
-    /// filter also drops their decoded text from the surfaced
-    /// output.
-    fn extra_eos_tokens(&self) -> Vec<Token> {
-        Vec::new()
-    }
+    /// It is deliberately NOT `{eos} ∪ {eot} ∪ extras`. A model's EOT
+    /// is whatever its vocab *calls* an end-of-turn marker, which is
+    /// not the same question as whether emitting it ends the turn.
+    /// gpt-oss is the case in point: llama.cpp auto-detects EOT by
+    /// text and `<|end|>` is on that list, so `eot()` is `<|end|>` —
+    /// the Harmony *in-stream channel separator*, which upstream then
+    /// removes from its EOG set precisely so the model can close an
+    /// analysis channel and keep going. Union `eot` back in and a
+    /// Harmony turn dies right after the reasoning block, or (under a
+    /// tool grammar, where this set is also the mask-while-incomplete
+    /// set) the model can never close the channel at all and burns to
+    /// `max_tokens`. Multi-EOS vocabs are covered too: Qwen3 declares
+    /// `eos_token_id` as `[<|im_end|>, <|endoftext|>]`, and the
+    /// secondary decodes to an empty piece, so missing it means an
+    /// invisible loop.
+    ///
+    /// Backends must report their own truth rather than derive it:
+    /// `LlamaCppModel` returns libllama's `special_eog_ids` verbatim
+    /// (`llama_vocab_is_eog`), quirks and workarounds included.
+    ///
+    /// Consumed by `PredictOptions::add_model_stops` (stop sequences),
+    /// the grammar / JSON candidate filters (mid-constraint EOG mask),
+    /// and Session's piece filter (sentinels dropped from the surfaced
+    /// output).
+    fn eog_tokens(&self) -> Vec<Token>;
 
     /// Human-readable identifier for this loaded model. Used by
     /// servers (e.g. `blallama`) to populate the `model` field of API
