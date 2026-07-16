@@ -602,7 +602,7 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         // `inner.tokens` but never in the engine's KV cache.
         // `Session`'s prefix-cache auto-tip (see
         // `session/mod.rs::compute_tip_extension` and
-        // `PrefixCache::internal_tip`) relies on this exact behavior:
+        // `PrefixCache::tip`) relies on this exact behavior:
         // `prev_tokens` is set to the engine's KV state (EOS-free)
         // while the recorded-but-uncommitted EOS in `inner.tokens` is
         // what makes the next call's LCP extend one token past KV,

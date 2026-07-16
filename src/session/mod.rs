@@ -393,16 +393,39 @@ fn entries_from_chunks(
 /// indices within those tokens where `cache_control` breakpoints landed (sorted
 /// ascending), the number of tokens actually reused on the last call, and an
 /// internal post-generation tip breakpoint maintained by `Session` itself
-/// (not visible to API callers — see [`Self::internal_tip`]).
+/// (not visible to API callers — see [`Self::tip`]).
 ///
 /// Private to the session module; callers interact through
 /// [`Session::with_prefix_cache`] / [`Session::clear_prefix_cache`] /
 /// [`Session::last_usage`].
+/// A resumable position in the previous call's entry stream: where it
+/// is (`pos`), how to recognize it across calls (`hash`). Prompt
+/// breakpoints come from `cache_control` markers; the session's
+/// private post-generation tip is one of these too (see
+/// [`PrefixCache::tip`]).
+#[derive(Clone, Debug)]
+struct Breakpoint {
+    /// Entry/position pair, computed against
+    /// [`PrefixCache::prev_entries`] at creation.
+    at: EntryPos,
+    /// SHA-256 of the canonical chat-template render (the
+    /// `partial_text`) up to this breakpoint. Used by the hash-keyed
+    /// lookup to recognize a prefix across calls even when the
+    /// byte-level rendering would diverge (e.g. cogito-style
+    /// permissive JSON whitespace re-rendered through
+    /// `serde_json::to_string` on `Block::ToolUse.input`). The render
+    /// is independent of `cache_control` markers — those are metadata,
+    /// not rendered content — so hashes stay stable as breakpoints
+    /// move with `cache_windowed`. `None` = LCP-matchable only (e.g. a
+    /// tip recorded on a path that could not re-render).
+    hash: Option<[u8; 32]>,
+}
+
 struct PrefixCache {
     /// Previous call's prompt entries with the generated assistant content
     /// appended. Includes the assistant content because that content is in
     /// the engine's KV cache (see the predictor-stop coupling note at
-    /// [`Self::internal_tip`]) and we want the next call's
+    /// [`Self::tip`]) and we want the next call's
     /// [`compute_l_hit`] LCP walk to extend through it.
     ///
     /// Does NOT include the EOS / assistant-close token: the predictor's
@@ -412,18 +435,20 @@ struct PrefixCache {
     /// predictor's `tokens` vec but never in KV. We mirror that: our
     /// `prev_entries` matches what the engine's KV cache actually holds.
     prev_entries: Vec<CacheEntry>,
-    /// Entry/position pairs in `prev_entries` where `cache_control`
-    /// breakpoints landed, computed against `prev_entries` at creation.
-    /// Sorted ascending by entry.
-    prev_breakpoints: Vec<EntryPos>,
+    /// [`Breakpoint`]s where `cache_control` markers landed, sorted
+    /// ascending by entry.
+    breakpoints: Vec<Breakpoint>,
     /// KV cells reused in the last call. `0` = full re-prefill.
     last_reused_cells: usize,
     /// Internal post-generation tip — set by `record_cache_hit` after a
     /// successful completion when prefix caching is on. Consulted by
     /// [`compute_l_hit`] as one more eligible breakpoint candidate
-    /// alongside `new_breakpoints`. Separate from `prev_breakpoints` so
+    /// alongside `new_breakpoints`. Separate from `breakpoints` so
     /// it never gets serialized into `cache_control` markers and never
-    /// counts against the Anthropic 4-slot budget.
+    /// counts against the Anthropic 4-slot budget. Its `hash` covers
+    /// the canonical render up to the auto-tip position (end of
+    /// just-generated assistant content), computed by re-rendering the
+    /// conversation with the parsed assistant block appended.
     ///
     /// Placed one entry back from the KV head (for [`compute_l_hit`]'s
     /// `lcp-1` BPE-safety margin) so the next call's LCP — which
@@ -444,25 +469,7 @@ struct PrefixCache {
     /// constraint matchers, so entries, KV, and `SamplerState` all
     /// describe the same stream position (rng/`mu` exempt — they
     /// advanced to *sample* the terminal token; unobservable).
-    internal_tip: Option<EntryPos>,
-    /// SHA-256 of the canonical chat-template render (i.e. the
-    /// `partial_text`) at each breakpoint, parallel to
-    /// [`Self::prev_breakpoints`] (same indexing). Used by
-    /// [`compute_l_hit`]'s hash-keyed lookup to recognize a prefix
-    /// across calls even when the byte-level rendering would diverge
-    /// (e.g. cogito-style permissive JSON whitespace re-rendered through
-    /// `serde_json::to_string` on `Block::ToolUse.input`). The render
-    /// is independent of `cache_control` markers — those are metadata,
-    /// not rendered content — so hashes stay stable as breakpoints
-    /// move with `cache_windowed`.
-    prev_breakpoint_hashes: Vec<[u8; 32]>,
-    /// SHA-256 of the canonical chat-template render up to the
-    /// auto-tip position (end of just-generated assistant content).
-    /// `None` until the first generation completes. Computed by
-    /// re-rendering the conversation with the parsed assistant block
-    /// appended, taking the partial render at that synthesized
-    /// breakpoint, and hashing.
-    prev_tip_hash: Option<[u8; 32]>,
+    tip: Option<Breakpoint>,
 }
 
 impl PrefixCache {
@@ -470,22 +477,18 @@ impl PrefixCache {
     fn new() -> Self {
         Self {
             prev_entries: Vec::new(),
-            prev_breakpoints: Vec::new(),
+            breakpoints: Vec::new(),
             last_reused_cells: 0,
-            internal_tip: None,
-            prev_breakpoint_hashes: Vec::new(),
-            prev_tip_hash: None,
+            tip: None,
         }
     }
 
     /// Zero every field. Called from [`Session::clear_prefix_cache`].
     fn clear(&mut self) {
         self.prev_entries.clear();
-        self.prev_breakpoints.clear();
+        self.breakpoints.clear();
         self.last_reused_cells = 0;
-        self.internal_tip = None;
-        self.prev_breakpoint_hashes.clear();
-        self.prev_tip_hash = None;
+        self.tip = None;
     }
 }
 
@@ -738,10 +741,10 @@ fn hash_partial_text(text: &str) -> [u8; 32] {
 }
 
 /// Hash-keyed L_hit lookup. Returns the largest cached [`EntryPos`]
-/// (over breakpoint hashes paired with `prev_breakpoints`, plus the
-/// auto-tip hash paired with `internal_tip`) whose stored hash also
-/// appears in `new_breakpoint_hashes`. Returns the zero position when
-/// no hash matches.
+/// over the prompt [`Breakpoint`]s plus the auto-tip whose stored
+/// hash also appears in `new_breakpoint_hashes`. Hashless breakpoints
+/// (LCP-only) never match here. Returns the zero position when no
+/// hash matches.
 ///
 /// `cap` bounds the result in entry space — typically the new entry
 /// count — so we never claim to reuse more than the new request has.
@@ -756,27 +759,23 @@ fn hash_partial_text(text: &str) -> [u8; 32] {
 /// "longest match wins, capped" contract is directly testable
 /// without an engine.
 fn hash_keyed_l_hit(
-    prev_breakpoints: &[EntryPos],
-    prev_breakpoint_hashes: &[[u8; 32]],
-    internal_tip: Option<EntryPos>,
-    prev_tip_hash: Option<[u8; 32]>,
+    breakpoints: &[Breakpoint],
+    tip: Option<&Breakpoint>,
     new_breakpoint_hashes: &[[u8; 32]],
     cap: usize,
 ) -> EntryPos {
     let new_set: std::collections::HashSet<&[u8; 32]> =
         new_breakpoint_hashes.iter().collect();
     let mut picked = EntryPos::default();
-    for (ep, h) in prev_breakpoints.iter().zip(prev_breakpoint_hashes.iter()) {
-        if ep.entry <= cap && ep.entry > picked.entry && new_set.contains(h) {
-            picked = *ep;
-        }
-    }
-    if let (Some(tip), Some(tip_h)) = (internal_tip, prev_tip_hash.as_ref()) {
-        if tip.entry <= cap
-            && tip.entry > picked.entry
-            && new_set.contains(tip_h)
+    for bp in breakpoints.iter().chain(tip) {
+        let Some(h) = bp.hash.as_ref() else {
+            continue;
+        };
+        if bp.at.entry <= cap
+            && bp.at.entry > picked.entry
+            && new_set.contains(h)
         {
-            picked = tip;
+            picked = bp.at;
         }
     }
     picked
@@ -799,7 +798,7 @@ fn hash_keyed_l_hit(
 /// Both `new_breakpoints` and `internal_tip` are eligible candidates. The
 /// `internal_tip` is `Session`'s private post-generation cache anchor —
 /// independent of user-facing `cache_control` markers, so it doesn't count
-/// against the Anthropic 4-slot budget. See [`PrefixCache::internal_tip`].
+/// against the Anthropic 4-slot budget. See [`PrefixCache::tip`].
 ///
 /// The tip was computed against `prev_entries`; within the common
 /// prefix the two lists are identical entry-for-entry, so its `.pos`
@@ -2379,10 +2378,8 @@ impl<B: Backend> Session<B> {
                 // and the canonical chat-template re-render (the
                 // partial_text the new request hashes).
                 let hash_picked = hash_keyed_l_hit(
-                    &cache.prev_breakpoints,
-                    &cache.prev_breakpoint_hashes,
-                    cache.internal_tip,
-                    cache.prev_tip_hash,
+                    &cache.breakpoints,
+                    cache.tip.as_ref(),
                     new_breakpoint_hashes,
                     new_entries.len(),
                 );
@@ -2407,7 +2404,7 @@ impl<B: Backend> Session<B> {
                         &cache.prev_entries,
                         new_entries,
                         new_breakpoints,
-                        cache.internal_tip,
+                        cache.tip.as_ref().map(|t| t.at),
                     );
                     // Diagnostic: when the auto-tip is set but didn't win,
                     // log enough state to attribute the loss. The case worth
@@ -2419,7 +2416,7 @@ impl<B: Backend> Session<B> {
                     // a single-token shift or a wholesale re-render
                     // (thoughts stripped, JSON re-serialized, etc.).
                     #[cfg(feature = "axum")]
-                    if let Some(tip) = cache.internal_tip {
+                    if let Some(tip) = cache.tip.as_ref().map(|t| t.at) {
                         let lcp = longest_common_prefix_len(
                             &cache.prev_entries,
                             new_entries,
@@ -2510,11 +2507,11 @@ impl<B: Backend> Session<B> {
                 // `.pos`.
                 let new_bp_set: std::collections::HashSet<usize> =
                     new_breakpoints.iter().map(|bp| bp.pos).collect();
-                let tip_pos = cache.internal_tip.map(|t| t.pos);
+                let tip_pos = cache.tip.as_ref().map(|t| t.at.pos);
                 let orphans: Vec<usize> = cache
-                    .prev_breakpoints
+                    .breakpoints
                     .iter()
-                    .map(|bp| bp.pos)
+                    .map(|bp| bp.at.pos)
                     .filter(|&old_pos| {
                         old_pos > 0
                             && old_pos <= effective_cache_read.pos
@@ -2767,25 +2764,34 @@ impl<B: Backend> Session<B> {
         // snapshots share the same engine.checkpoint_pos slot, so
         // freeing one would lose the other). Position space throughout:
         // engine snapshots are keyed by position.
-        let old_tip = self.prefix_cache.as_ref().and_then(|c| c.internal_tip);
+        let old_tip = self
+            .prefix_cache
+            .as_ref()
+            .and_then(|c| c.tip.as_ref())
+            .map(|t| t.at);
+        let new_tip_pos = internal_tip.map(|t| t.pos);
         if let Some(cache) = self.prefix_cache.as_mut() {
             cache.prev_entries = new_entries;
-            cache.prev_breakpoints = new_breakpoints;
+            cache.breakpoints = new_breakpoints
+                .into_iter()
+                .zip(new_breakpoint_hashes.into_iter().map(Some))
+                .map(|(at, hash)| Breakpoint { at, hash })
+                .collect();
             cache.last_reused_cells = reused_cells;
-            cache.internal_tip = internal_tip;
-            cache.prev_breakpoint_hashes = new_breakpoint_hashes;
-            cache.prev_tip_hash = tip_hash;
+            cache.tip =
+                internal_tip.map(|at| Breakpoint { at, hash: tip_hash });
         }
-        if let (Some(old), Some(new)) =
-            (old_tip.map(|t| t.pos), internal_tip.map(|t| t.pos))
-        {
-            if old != new
-                && !self
-                    .prefix_cache
-                    .as_ref()
-                    .map(|c| c.prev_breakpoints.iter().any(|bp| bp.pos == old))
-                    .unwrap_or(false)
-            {
+        // Free the displaced (tip moved) or stale (tip gone — e.g. the
+        // streaming path that skips the tip extension) old tip
+        // snapshot, unless a current user breakpoint shares its slot.
+        if let Some(old) = old_tip.map(|t| t.pos) {
+            let displaced = new_tip_pos != Some(old);
+            let shared = self
+                .prefix_cache
+                .as_ref()
+                .map(|c| c.breakpoints.iter().any(|bp| bp.at.pos == old))
+                .unwrap_or(false);
+            if displaced && !shared {
                 if let Err(_e) = self.engine.forget_pos(0, old as i32) {
                     #[cfg(feature = "axum")]
                     tracing::debug!(
@@ -2793,25 +2799,6 @@ impl<B: Backend> Session<B> {
                         pos = old,
                         error = %_e,
                         "forget_pos failed on displaced auto-tip; ignoring",
-                    );
-                }
-            }
-        } else if let Some(old) = old_tip.map(|t| t.pos) {
-            // New tip is None (e.g., streaming path that skips the
-            // tip extension). Free the stale tip snapshot.
-            if !self
-                .prefix_cache
-                .as_ref()
-                .map(|c| c.prev_breakpoints.iter().any(|bp| bp.pos == old))
-                .unwrap_or(false)
-            {
-                if let Err(_e) = self.engine.forget_pos(0, old as i32) {
-                    #[cfg(feature = "axum")]
-                    tracing::debug!(
-                        target: "drama_llama::session",
-                        pos = old,
-                        error = %_e,
-                        "forget_pos failed on stale auto-tip; ignoring",
                     );
                 }
             }
@@ -2905,7 +2892,7 @@ impl<B: Backend> Session<B> {
         // the predictor does. When prefix caching is on, also capture
         // generated token IDs so we can extend `prev_tokens` past the
         // prompt for the next call's `compute_l_hit` walk; see
-        // [`PrefixCache::internal_tip`] for the design.
+        // [`PrefixCache::tip`] for the design.
         let mut generated_count: usize = 0;
         let mut text = String::new();
         let cache_on = self.prefix_cache.is_some();
@@ -2940,7 +2927,7 @@ impl<B: Backend> Session<B> {
         // Auto-tip: extend `prev_tokens` past the prompt with the
         // generated content **including the recorded-but-uncommitted
         // EOS / close-marker token** (predictor-stop coupling — see
-        // [`PrefixCache::internal_tip`]). When stop fired on a stop
+        // [`PrefixCache::tip`]). When stop fired on a stop
         // sequence (the common case), `generated_tokens` has one
         // more token than KV; that extra token is the close marker
         // the chat template will re-render in the next call. The
@@ -4369,6 +4356,15 @@ mod tests {
         EntryPos { entry, pos: entry }
     }
 
+    /// Test shorthand: a [`Breakpoint`] at [`ep`]`(entry)` with an
+    /// optional render hash.
+    fn bp(entry: usize, hash: Option<[u8; 32]>) -> Breakpoint {
+        Breakpoint {
+            at: ep(entry),
+            hash,
+        }
+    }
+
     /// Test shorthand: a media entry with a distinguishing id byte
     /// and an M-RoPE-shaped span (many cells, few positions).
     fn media(id_byte: u8) -> CacheEntry {
@@ -4985,16 +4981,16 @@ mod tests {
     fn test_prefix_cache_reset_zeroes_state() {
         let mut cache = PrefixCache::new();
         assert!(cache.prev_entries.is_empty());
-        assert!(cache.prev_breakpoints.is_empty());
+        assert!(cache.breakpoints.is_empty());
         assert_eq!(cache.last_reused_cells, 0);
 
         cache.prev_entries = toks([1, 2, 3]);
-        cache.prev_breakpoints = vec![ep(1), ep(2)];
+        cache.breakpoints = vec![bp(1, None), bp(2, None)];
         cache.last_reused_cells = 2;
 
         cache.clear();
         assert!(cache.prev_entries.is_empty());
-        assert!(cache.prev_breakpoints.is_empty());
+        assert!(cache.breakpoints.is_empty());
         assert_eq!(cache.last_reused_cells, 0);
     }
 
@@ -5327,7 +5323,7 @@ mod tests {
         // Force some "used" state so we know clear actually zeros.
         if let Some(cache) = session.prefix_cache.as_mut() {
             cache.prev_entries = toks([1, 2, 3]);
-            cache.prev_breakpoints = vec![ep(1), ep(2)];
+            cache.breakpoints = vec![bp(1, None), bp(2, None)];
             cache.last_reused_cells = 2;
         }
         session.clear_prefix_cache();
@@ -5336,7 +5332,7 @@ mod tests {
             .as_ref()
             .expect("clear does not drop the cache, only zeros it");
         assert!(cache.prev_entries.is_empty());
-        assert!(cache.prev_breakpoints.is_empty());
+        assert!(cache.breakpoints.is_empty());
         assert_eq!(cache.last_reused_cells, 0);
     }
 
@@ -5531,32 +5527,17 @@ mod tests {
     fn test_hash_keyed_l_hit_single_breakpoint_match() {
         let h_a = hash_partial_text("aaa");
         let h_b = hash_partial_text("bbb");
-        let prev_breakpoints = vec![ep(100)];
-        let prev_hashes = vec![h_a];
+        let breakpoints = vec![bp(100, Some(h_a))];
         // New request has hash matching cached breakpoint.
         let new_hashes = vec![h_a];
         assert_eq!(
-            hash_keyed_l_hit(
-                &prev_breakpoints,
-                &prev_hashes,
-                None,
-                None,
-                &new_hashes,
-                500,
-            ),
+            hash_keyed_l_hit(&breakpoints, None, &new_hashes, 500),
             ep(100)
         );
         // Different hash → no match.
         let new_hashes_no_match = vec![h_b];
         assert_eq!(
-            hash_keyed_l_hit(
-                &prev_breakpoints,
-                &prev_hashes,
-                None,
-                None,
-                &new_hashes_no_match,
-                500,
-            ),
+            hash_keyed_l_hit(&breakpoints, None, &new_hashes_no_match, 500),
             ep(0)
         );
     }
@@ -5568,19 +5549,12 @@ mod tests {
         let h_a = hash_partial_text("aaa");
         let h_b = hash_partial_text("bbb");
         let h_c = hash_partial_text("ccc");
-        let prev_breakpoints = vec![ep(100), ep(200), ep(300)];
-        let prev_hashes = vec![h_a, h_b, h_c];
+        let breakpoints =
+            vec![bp(100, Some(h_a)), bp(200, Some(h_b)), bp(300, Some(h_c))];
         // New request matches 100 and 200 only (not 300).
         let new_hashes = vec![h_a, h_b];
         assert_eq!(
-            hash_keyed_l_hit(
-                &prev_breakpoints,
-                &prev_hashes,
-                None,
-                None,
-                &new_hashes,
-                500,
-            ),
+            hash_keyed_l_hit(&breakpoints, None, &new_hashes, 500),
             ep(200),
             "should pick the largest matching cached position",
         );
@@ -5592,19 +5566,12 @@ mod tests {
     fn test_hash_keyed_l_hit_tip_beats_breakpoint() {
         let h_bp = hash_partial_text("aaa");
         let h_tip = hash_partial_text("bbb");
-        let prev_breakpoints = vec![ep(100)];
-        let prev_hashes = vec![h_bp];
+        let breakpoints = vec![bp(100, Some(h_bp))];
+        let tip = bp(250, Some(h_tip));
         let new_hashes = vec![h_bp, h_tip];
         // Tip at 250 with matching hash should win over bp at 100.
         assert_eq!(
-            hash_keyed_l_hit(
-                &prev_breakpoints,
-                &prev_hashes,
-                Some(ep(250)),
-                Some(h_tip),
-                &new_hashes,
-                500,
-            ),
+            hash_keyed_l_hit(&breakpoints, Some(&tip), &new_hashes, 500),
             ep(250),
         );
     }
@@ -5615,19 +5582,11 @@ mod tests {
     #[test]
     fn test_hash_keyed_l_hit_cap_bound() {
         let h = hash_partial_text("aaa");
-        let prev_breakpoints = vec![ep(100), ep(800)];
-        let prev_hashes = vec![h, h];
+        let breakpoints = vec![bp(100, Some(h)), bp(800, Some(h))];
         let new_hashes = vec![h];
         // Cap at 500 → 800 rejected, falls back to 100.
         assert_eq!(
-            hash_keyed_l_hit(
-                &prev_breakpoints,
-                &prev_hashes,
-                None,
-                None,
-                &new_hashes,
-                500,
-            ),
+            hash_keyed_l_hit(&breakpoints, None, &new_hashes, 500),
             ep(100),
         );
     }
@@ -5637,15 +5596,12 @@ mod tests {
     fn test_hash_keyed_l_hit_no_match() {
         let h_a = hash_partial_text("aaa");
         let h_b = hash_partial_text("bbb");
-        let prev_breakpoints = vec![ep(100), ep(200)];
-        let prev_hashes = vec![h_a, h_a];
+        let breakpoints = vec![bp(100, Some(h_a)), bp(200, Some(h_a))];
         let new_hashes = vec![h_b];
         assert_eq!(
             hash_keyed_l_hit(
-                &prev_breakpoints,
-                &prev_hashes,
-                Some(ep(300)),
-                Some(h_b),
+                &breakpoints,
+                Some(&bp(300, Some(h_b))),
                 &new_hashes,
                 500,
             ),
@@ -5654,10 +5610,8 @@ mod tests {
         );
         assert_eq!(
             hash_keyed_l_hit(
-                &prev_breakpoints,
-                &prev_hashes,
-                Some(ep(300)),
-                Some(h_a),
+                &breakpoints,
+                Some(&bp(300, Some(h_a))),
                 &new_hashes,
                 500,
             ),
@@ -5670,7 +5624,7 @@ mod tests {
     #[test]
     fn test_hash_keyed_l_hit_empty_side_table() {
         let h = hash_partial_text("aaa");
-        assert_eq!(hash_keyed_l_hit(&[], &[], None, None, &[h], 500), ep(0));
+        assert_eq!(hash_keyed_l_hit(&[], None, &[h], 500), ep(0));
     }
 
     /// The emit-side ban set on a real vocab (Qwen 3.6): turn-open

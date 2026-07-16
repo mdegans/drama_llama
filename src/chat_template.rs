@@ -101,8 +101,8 @@ pub struct ChatTemplate {
     /// The canonical case is Qwen3's `No user query found in messages.`
     /// raise, which fires whenever the messages list contains no
     /// non-tool-response user-role message — exactly the state
-    /// [`render_partial`] produces for [`Breakpoint::AfterTools`] and
-    /// [`Breakpoint::AfterSystem`] (both truncate `messages` to empty).
+    /// [`render_partial`] produces for [`PromptBreakpoint::AfterTools`] and
+    /// [`PromptBreakpoint::AfterSystem`] (both truncate `messages` to empty).
     /// Without permissive rendering those partials get dropped silently
     /// from `partial_texts`, taking the front-of-prompt cache anchor
     /// with them.
@@ -397,10 +397,10 @@ impl ChatTemplate {
 /// actually exist in the prompt appear.
 ///
 /// [`Session`]: crate::Session
-/// [`AfterTools`]: Breakpoint::AfterTools
-/// [`AfterSystem`]: Breakpoint::AfterSystem
-/// [`AfterMessage(0)`]: Breakpoint::AfterMessage
-/// [`AfterMessage(1)`]: Breakpoint::AfterMessage
+/// [`AfterTools`]: PromptBreakpoint::AfterTools
+/// [`AfterSystem`]: PromptBreakpoint::AfterSystem
+/// [`AfterMessage(0)`]: PromptBreakpoint::AfterMessage
+/// [`AfterMessage(1)`]: PromptBreakpoint::AfterMessage
 #[derive(Clone, Debug)]
 pub struct RenderedWithBreakpoints {
     /// Full render — equivalent to
@@ -537,11 +537,11 @@ impl RenderOptions {
 /// list's closing `]` lands differently), we silently drop that
 /// breakpoint at tokenization time.
 ///
-/// [`AfterTools`]: Breakpoint::AfterTools
-/// [`AfterSystem`]: Breakpoint::AfterSystem
-/// [`AfterMessage(i)`]: Breakpoint::AfterMessage
+/// [`AfterTools`]: PromptBreakpoint::AfterTools
+/// [`AfterSystem`]: PromptBreakpoint::AfterSystem
+/// [`AfterMessage(i)`]: PromptBreakpoint::AfterMessage
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Breakpoint {
+enum PromptBreakpoint {
     /// After the tools section — any cache marker on any
     /// [`tool::CustomMethodDef`](misanthropic::tool::CustomMethodDef) in
     /// [`Prompt::functions`] produces this, regardless of which
@@ -566,8 +566,8 @@ enum Breakpoint {
 }
 
 /// Walk `prompt` and return the ordered list of cache breakpoints it
-/// declares. See [`Breakpoint`] for the ordering rule and granularity.
-fn collect_breakpoints(prompt: &Prompt) -> Vec<Breakpoint> {
+/// declares. See [`PromptBreakpoint`] for the ordering rule and granularity.
+fn collect_breakpoints(prompt: &Prompt) -> Vec<PromptBreakpoint> {
     let mut out = Vec::new();
 
     let tools_cached = prompt
@@ -575,18 +575,18 @@ fn collect_breakpoints(prompt: &Prompt) -> Vec<Breakpoint> {
         .as_ref()
         .is_some_and(|defs| defs.iter().any(|m| m.is_cached()));
     if tools_cached {
-        out.push(Breakpoint::AfterTools);
+        out.push(PromptBreakpoint::AfterTools);
     }
 
     let system_cached =
         prompt.system.as_ref().is_some_and(|c| content_has_cache(c));
     if system_cached {
-        out.push(Breakpoint::AfterSystem);
+        out.push(PromptBreakpoint::AfterSystem);
     }
 
     for (i, m) in prompt.messages.iter().enumerate() {
         if content_has_cache(&m.content) {
-            out.push(Breakpoint::AfterMessage(i));
+            out.push(PromptBreakpoint::AfterMessage(i));
         }
     }
 
@@ -605,10 +605,10 @@ fn render_partial(
     template: &ChatTemplate,
     prompt: &Prompt,
     opts: &RenderOptions,
-    up_to: Breakpoint,
+    up_to: PromptBreakpoint,
 ) -> Result<String, ChatTemplateError> {
     let truncated = match up_to {
-        Breakpoint::AfterTools => Prompt {
+        PromptBreakpoint::AfterTools => Prompt {
             tools: prompt.tools.clone(),
             // Carry the system content too. Every modern template
             // (Qwen3, Llama 3.1, Hermes, Cogito) coalesces tools into
@@ -623,13 +623,13 @@ fn render_partial(
             messages: Vec::new(),
             ..Prompt::default()
         },
-        Breakpoint::AfterSystem => Prompt {
+        PromptBreakpoint::AfterSystem => Prompt {
             tools: prompt.tools.clone(),
             system: prompt.system.clone(),
             messages: Vec::new(),
             ..Prompt::default()
         },
-        Breakpoint::AfterMessage(i) => Prompt {
+        PromptBreakpoint::AfterMessage(i) => Prompt {
             tools: prompt.tools.clone(),
             system: prompt.system.clone(),
             messages: prompt.messages[..=i].to_vec(),
@@ -1312,11 +1312,11 @@ mod tests {
     /// motivate [`ChatTemplate::env_permissive`]:
     ///
     /// 1. `{% if not messages %}{{ raise_exception('No messages provided.') }}{% endif %}`
-    ///    — fires on [`Breakpoint::AfterTools`] where `messages` is empty.
+    ///    — fires on [`PromptBreakpoint::AfterTools`] where `messages` is empty.
     /// 2. The `multi_step_tool` walk: scans `messages[::-1]` for a
     ///    user-role message whose content isn't a `<tool_response>...`
     ///    wrapper, raises `No user query found in messages.` if none
-    ///    found. Fires on [`Breakpoint::AfterSystem`] where the only
+    ///    found. Fires on [`PromptBreakpoint::AfterSystem`] where the only
     ///    message present is the synthesized system message.
     ///
     /// Trimmed from the real Qwen3.6-35B-A3B `tokenizer.chat_template`
@@ -1883,7 +1883,10 @@ mod tests {
     #[test]
     fn test_collect_breakpoints_empty() {
         let prompt = simple_prompt();
-        assert_eq!(collect_breakpoints(&prompt), Vec::<Breakpoint>::new());
+        assert_eq!(
+            collect_breakpoints(&prompt),
+            Vec::<PromptBreakpoint>::new()
+        );
     }
 
     #[test]
@@ -1892,7 +1895,10 @@ mod tests {
             tools: Some(vec![tool_cached("cached_tool").into()]),
             ..Prompt::default()
         };
-        assert_eq!(collect_breakpoints(&prompt), vec![Breakpoint::AfterTools]);
+        assert_eq!(
+            collect_breakpoints(&prompt),
+            vec![PromptBreakpoint::AfterTools]
+        );
     }
 
     #[test]
@@ -1921,10 +1927,10 @@ mod tests {
         assert_eq!(
             collect_breakpoints(&prompt),
             vec![
-                Breakpoint::AfterTools,
-                Breakpoint::AfterSystem,
-                Breakpoint::AfterMessage(0),
-                Breakpoint::AfterMessage(2),
+                PromptBreakpoint::AfterTools,
+                PromptBreakpoint::AfterSystem,
+                PromptBreakpoint::AfterMessage(0),
+                PromptBreakpoint::AfterMessage(2),
             ]
         );
     }
@@ -1944,9 +1950,13 @@ mod tests {
             ..Prompt::default()
         };
         let opts = RenderOptions::default().with_generation_prompt(true);
-        let partial =
-            render_partial(&tmpl(), &prompt, &opts, Breakpoint::AfterSystem)
-                .unwrap();
+        let partial = render_partial(
+            &tmpl(),
+            &prompt,
+            &opts,
+            PromptBreakpoint::AfterSystem,
+        )
+        .unwrap();
 
         let reference = Prompt {
             system: prompt.system.clone(),
@@ -2018,7 +2028,7 @@ mod tests {
     /// Qwen3-family templates raise `No user query found in messages.`
     /// whenever `messages` contains no non-tool-response user-role
     /// entry — exactly the state [`render_partial`] produces for
-    /// [`Breakpoint::AfterSystem`] (truncates `messages` to empty).
+    /// [`PromptBreakpoint::AfterSystem`] (truncates `messages` to empty).
     /// Before the permissive-env split, this raise silently dropped the
     /// AfterSystem partial from `partial_texts`, killing the front-of-
     /// prompt cache anchor on every call. Permissive env rebinds
@@ -2039,7 +2049,7 @@ mod tests {
             &qwen3_like_tmpl(),
             &prompt,
             &opts,
-            Breakpoint::AfterSystem,
+            PromptBreakpoint::AfterSystem,
         )
         .expect(
             "permissive env must let AfterSystem render even when the \
@@ -2061,7 +2071,7 @@ mod tests {
         );
     }
 
-    /// Same idea for `Breakpoint::AfterTools`: `render_partial` truncates
+    /// Same idea for `PromptBreakpoint::AfterTools`: `render_partial` truncates
     /// both `system` and `messages` to empty, hitting both Qwen3 raises
     /// (`No messages provided.` and `No user query found in messages.`).
     /// Permissive env must drop both, leaving the tools-embedded system
@@ -2082,7 +2092,7 @@ mod tests {
             &qwen3_like_tmpl(),
             &prompt,
             &opts,
-            Breakpoint::AfterTools,
+            PromptBreakpoint::AfterTools,
         )
         .expect(
             "permissive env must let AfterTools render even when the \
