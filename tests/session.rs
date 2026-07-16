@@ -439,11 +439,19 @@ fn thinking_works_under_forced_tool_grammar() {
         budget_tokens: std::num::NonZeroU32::new(512).unwrap(),
         display: None,
     });
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(1024).unwrap());
+    // Explicit n_ctx: `from_path` inherits llama.cpp's default 512,
+    // and prefill (~330) + a stream-dependent think phase overflows
+    // it — the context ceiling silently ends iteration mid-call and
+    // surfaces as GrammarViolation (bit us when the 0.8.0 RNG swap
+    // produced a longer-thinking trajectory). Room for prompt +
+    // max_tokens is the requirement.
+    let mut session = drama_llama::LlamaCppSession::from_path_with_n_ctx(
+        model_path(),
+        4096,
+    )
+    .expect("session load")
+    .quiet()
+    .with_max_tokens(NonZeroUsize::new(1024).unwrap());
 
     let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
     println!("=== forced blocks ===\n{blocks:#?}\n===");
