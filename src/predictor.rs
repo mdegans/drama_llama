@@ -450,6 +450,13 @@ pub struct TokenPredictor<'engine, B: Backend> {
     options: PredictOptions,
     pub text: String,
     pub(crate) max_stop_len: usize,
+    /// Set when the just-sampled token satisfied a stop condition; the
+    /// following `next()` returns `None` without decoding it (the
+    /// recorded-but-uncommitted terminal token the auto-tip relies on).
+    /// Starts `false`: all stop windows (generated-token tail,
+    /// generated text) are empty before the first sample, so no stop
+    /// can precede it.
+    stopped: bool,
     pub(crate) inner: CandidatePredictor<'engine, B>,
 }
 
@@ -467,6 +474,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             options,
             text: String::new(),
             max_stop_len,
+            stopped: false,
             inner,
         }
     }
@@ -490,6 +498,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             options,
             text: String::new(),
             max_stop_len,
+            stopped: false,
             inner,
         }
     }
@@ -586,45 +595,24 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
     type Item = Token;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let decoded_tokens =
-            &self.inner.tokens[self.inner.tokens.len() - self.inner.n_decode..];
-
-        // NOTE (auto-tip dependency): this stop-sequence check fires
-        // BEFORE `inner.next()` would call `decoder.step` on the
-        // previously-recorded EOS, so the EOS lands in `inner.tokens`
-        // but never in the engine's KV cache. `Session`'s prefix-cache
-        // auto-tip (see `session/mod.rs::compute_tip_extension` and
+        // NOTE (auto-tip dependency): a terminal token sets `stopped`
+        // on the iteration that sampled it, and this early-return fires
+        // BEFORE `inner.next()` would call `decoder.step` on it — so
+        // the recorded terminal token (e.g. EOS) lands in
+        // `inner.tokens` but never in the engine's KV cache.
+        // `Session`'s prefix-cache auto-tip (see
+        // `session/mod.rs::compute_tip_extension` and
         // `PrefixCache::internal_tip`) relies on this exact behavior:
         // `prev_tokens` is set to the engine's KV state (EOS-free)
         // while the recorded-but-uncommitted EOS in `inner.tokens` is
         // what makes the next call's LCP extend one token past KV,
         // letting the tip qualify under `compute_l_hit`'s lcp-1
-        // safety. If you change this stop-check ordering — e.g.,
-        // commit every recorded token before the next stop check —
-        // update `Session::compute_tip_extension` in lockstep or the
-        // tip will desync from KV and silently corrupt restores.
-        for sequence in self.options.stop_sequences.iter() {
-            if decoded_tokens.ends_with(sequence) {
-                return None;
-            }
-        }
-        // Beginning of the end to check for stop strings. We don't want to
-        // check the entire text because context lengths are getting long and
-        // users might use many stop strings.
-        let end = self.inner.tokens.len().saturating_sub(
-            self.max_stop_len + self.inner.engine.model.max_token_len(),
-        );
-        for s in self.options.stop_strings.iter() {
-            if let Some(slice) = self.text.get(end..) {
-                if slice.contains(s) {
-                    return None;
-                }
-            }
-        }
-        for regex in self.options.regex_stop_sequences.iter() {
-            if regex.is_match(&self.text) {
-                return None;
-            }
+        // safety. If you change this ordering — e.g. commit every
+        // recorded token before checking `stopped` — update
+        // `Session::compute_tip_extension` in lockstep or the tip will
+        // desync from KV and silently corrupt restores.
+        if self.stopped {
+            return None;
         }
 
         let candidates = self.inner.next()?;
@@ -652,13 +640,69 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         let piece = self.inner.engine.model.token_to_piece(next_token);
         self.text.push_str(&piece);
 
+        // Evaluate every stop condition against the just-sampled token,
+        // BEFORE advancing the constraint matchers: a token that
+        // terminates generation must never mutate the sampler state
+        // (tip invariant — it is absent from the cache entries and the
+        // KV alike, so the state must not carry its bytes either). The
+        // rng (and possibly mirostat `mu`) already advanced to *sample*
+        // it; that is a deliberate, documented exemption — no oracle
+        // can observe it. Inputs are byte-identical to what the old
+        // top-of-next-call checks saw: the token tail is checked as if
+        // `next_token` were already recorded, and the stop-string
+        // window start compensates for the not-yet-recorded token
+        // (`+ 1`).
+        let decoded_tokens =
+            &self.inner.tokens[self.inner.tokens.len() - self.inner.n_decode..];
+        let stopped_by_sequence =
+            self.options.stop_sequences.iter().any(|sequence| {
+                match sequence.split_last() {
+                    Some((&last, rest)) => {
+                        last == next_token && decoded_tokens.ends_with(rest)
+                    }
+                    None => false,
+                }
+            });
+        // Beginning of the end to check for stop strings. We don't want to
+        // check the entire text because context lengths are getting long and
+        // users might use many stop strings.
+        let end = (self.inner.tokens.len() + 1).saturating_sub(
+            self.max_stop_len + self.inner.engine.model.max_token_len(),
+        );
+        let stopped_by_string = self.options.stop_strings.iter().any(|s| {
+            self.text.get(end..).is_some_and(|slice| slice.contains(s))
+        });
+        let stopped_by_regex = self
+            .options
+            .regex_stop_sequences
+            .iter()
+            .any(|regex| regex.is_match(&self.text));
+        self.stopped =
+            stopped_by_sequence || stopped_by_string || stopped_by_regex;
+
+        // Advance the constraint matchers only when generation
+        // continues. Order is load-bearing: advance-before-scan — at
+        // advance time a not-yet-triggered deferred matcher is inactive
+        // and receives nothing; activation below then feeds the tail
+        // (including this piece's post-trigger bytes) exactly once.
+        if !self.stopped {
+            self.state.advance(
+                &self.options.sample_options,
+                next_token,
+                &self.inner.engine.model,
+            );
+        }
+
         // Deferred-grammar activation: if the accumulated text now
         // contains a trigger, flag the state's deferred matcher active
         // and feed any post-trigger tail bytes so it lines up with the
         // model. A matcher-level rejection on the tail collapses the
         // iterator — the caller sees generation end rather than an
-        // ungated JSON phase. See `DeferredGrammar`.
-        if let (Some(spec), Some(true)) = (
+        // ungated JSON phase. See `DeferredGrammar`. A trigger completed
+        // by a terminal token deliberately does not activate (tip
+        // invariant): `stopped` short-circuits the scan.
+        if let (false, Some(spec), Some(true)) = (
+            self.stopped,
             self.options.sample_options.deferred_grammar.as_ref(),
             self.state.deferred_inactive(),
         ) {

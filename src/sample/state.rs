@@ -184,7 +184,13 @@ impl SamplerState {
     /// the prior step (EOS fallback chose an out-of-grammar token) and
     /// generation terminates on the next step via the EOS stop
     /// sequence.
-    pub(crate) fn advance<M: Model>(
+    ///
+    /// [`Candidates::sample_token`](crate::Candidates::sample_token)
+    /// deliberately does not call this: whether the chosen token
+    /// continues generation is the caller's call, and a token that
+    /// terminates it must never mutate the state (tip invariant). Call
+    /// this only for tokens that keep generating.
+    pub fn advance<M: Model>(
         &mut self,
         config: &SamplerConfig,
         token: Token,

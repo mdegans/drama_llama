@@ -68,26 +68,34 @@ post-split code map):
    full-vocab Candidates TODO) dies. Incremental = suffix-seed from the
    matched breakpoint's cached stats. If `IndexRef` needs a helper, write
    the consuming code first, PR misanthropic upstream (alpha bump).
-6. **Tip invariant (new, decided):** *entries, KV, and the tip's
-   `SamplerState` must all describe the same stream position; the sampled
-   stop token is in none of them.* Entries+KV already hold (truncate-and-
-   swap in `compute_tip_extension`, :2984-3036 — tip sits exactly at the KV
-   head, not "several tokens prior"; the entry list extends one past it with
-   the canonical close). The state side requires: **hoist `state.advance()`
-   out of `sample_token` into the predictor loop, after the stop check** —
-   a token that terminates generation never mutates the state. Today this
-   is violated silently; masked for EOG stops by `repetition.ignored` but
-   live for custom stop sequences (ngram) and always for the matcher
-   (advanced over stop-token bytes, not canonical-close bytes). The rng is
-   the one deliberate, documented exemption (it advanced to sample the stop
-   token; no oracle can observe the difference).
+6. **Tip invariant (new, decided; CORRECTED during implementation):**
+   *entries, KV, and the tip's `SamplerState` must all describe the same
+   stream position; the sampled stop token is in none of them.* Entries+KV
+   already hold (truncate-and-swap in `compute_tip_extension` — tip sits
+   exactly at the KV head, not "several tokens prior"; the entry list
+   extends one past it with the canonical close). The state side: **hoist
+   `state.advance()` out of `sample_token` into the predictor loop, gated
+   on the stop evaluation** (landed as a `stopped` flag set on the
+   iteration that samples the terminal token; the following `next()`
+   returns `None`). CORRECTIONS from exploration (the original claims here
+   were wrong): ngram ingestion is *lazy* — a token sampled at step N is
+   ingested at step N+1's penalty pass, so a terminal token was NEVER
+   ingested into the stats; the "phantom stats" concern didn't exist. The
+   hoist's only observable effect is **matcher/deferred-matcher
+   advancement** on terminal tokens. Exemptions (documented): rng AND `mu`
+   both advanced during the fold that produced the terminal token; no
+   oracle can observe either. A deferred-grammar trigger completed BY the
+   terminal token deliberately no longer activates.
 7. **Integration tests (try-to-break-it list):**
    - incremental-vs-cold seeding equality: same prompt, cold full-prefill
      seeding vs breakpoint-resume suffix seeding → `ngram_stats` bit-equal
      (BTreeMap ⇒ plain assert_eq).
-   - the breaker: same, but first turn ends via a custom non-EOG stop
-     sequence — surfaces the phantom-advance bug; should FAIL pre-hoist,
-     green post-hoist.
+   - the breaker (REVISED — matcher-targeted, not stats-targeted; see
+     correction in item 6): grammar generation terminated by a custom stop
+     firing on the grammar-completing bytes; `grammar_complete()` must be
+     false (terminal bytes never fed). Landed as
+     `tests/tip_invariant.rs::terminal_token_does_not_advance_matchers`,
+     verified red pre-hoist / green post-hoist.
    - reconcile matrix: resume same-grammar (position carries), changed
      grammar (matcher-only reset; stats/rng/mu carry), modes-vec length
      change (no OOB/panic).

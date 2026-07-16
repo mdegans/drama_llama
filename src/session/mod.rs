@@ -432,13 +432,18 @@ struct PrefixCache {
     /// assistant-close marker) — leaves the tip eligible.
     ///
     /// **Predictor-stop coupling:** this design hinges on the
-    /// `TokenPredictor` stop-sequence check (`predictor.rs:608`) firing
-    /// before `decoder.step` commits the previously-recorded EOS. If a
-    /// future predictor refactor commits every recorded token before
-    /// the next stop check, `prev_entries` (which we set to the engine's
-    /// KV state, EOS-free) will desync from `inner.tokens` and silently
-    /// corrupt the next call's restore. Update both ends together if
-    /// you change predictor stop semantics.
+    /// `TokenPredictor` `stopped` early-return (set on the iteration
+    /// that sampled the terminal token) firing before `decoder.step`
+    /// would commit it. If a future predictor refactor commits every
+    /// recorded token before checking `stopped`, `prev_entries` (which
+    /// we set to the engine's KV state, EOS-free) will desync from
+    /// `inner.tokens` and silently corrupt the next call's restore.
+    /// Update both ends together if you change predictor stop
+    /// semantics. The same flag upholds the tip invariant on the
+    /// sampler-state side: a terminal token never advances the
+    /// constraint matchers, so entries, KV, and `SamplerState` all
+    /// describe the same stream position (rng/`mu` exempt — they
+    /// advanced to *sample* the terminal token; unobservable).
     internal_tip: Option<EntryPos>,
     /// SHA-256 of the canonical chat-template render (i.e. the
     /// `partial_text`) at each breakpoint, parallel to

@@ -983,6 +983,11 @@ impl SamplerConfig {
 }
 
 /// Sample a token from the candidates.
+///
+/// Does NOT advance the constraint matchers: whether the chosen token
+/// continues generation is the caller's call, and a token that
+/// terminates it must never mutate `state` (tip invariant). Callers
+/// that keep generating follow up with [`SamplerState::advance`].
 pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     tokens: &[Token],
     mut candidates: Candidates,
@@ -1120,12 +1125,12 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
         }
     }
 
-    // Post-selection: advance every constraint matcher (including an
-    // activated deferred grammar) by the chosen token. Multiple
-    // constraints all observe the same chosen token and advance in
-    // lockstep.
-    state.advance(opts, chosen, model);
-
+    // NOTE: constraint matchers are deliberately NOT advanced here.
+    // The caller decides whether the chosen token continues generation
+    // and calls `state.advance` only then (tip invariant: a token that
+    // terminates generation never mutates the sampler state — it is
+    // absent from the cache entries and the KV alike, so the state must
+    // not carry its bytes either). See `TokenPredictor::next`.
     Ok(chosen)
 }
 
@@ -1383,13 +1388,18 @@ mod tests {
         opts.init_state(TEST_SEED, &MockModel)
     }
 
+    /// Sample and advance — the non-terminal-token path, as the
+    /// predictor loop drives it. Tests exercising the tip invariant
+    /// (terminal tokens must not advance) call `sample_token` raw.
     fn sample(
         candidates: Candidates,
         opts: &SamplerConfig,
         state: &mut SamplerState,
     ) -> Token {
-        sample_token(&[], candidates, opts, state, &MockModel)
-            .expect("sample_token")
+        let chosen = sample_token(&[], candidates, opts, state, &MockModel)
+            .expect("sample_token");
+        state.advance(opts, chosen, &MockModel);
+        chosen
     }
 
     /// True iff the (single) grammar matcher accepts `bytes` from its
@@ -1720,6 +1730,7 @@ mod tests {
             &MockModel,
         )
         .unwrap();
+        state.advance(&opts, tok, &MockModel);
         tokens.push(tok);
 
         // Snapshot → restore.
@@ -1737,6 +1748,7 @@ mod tests {
             let a =
                 sample_token(&tokens, c.clone(), &opts, &mut state, &MockModel)
                     .unwrap();
+            state.advance(&opts, a, &MockModel);
             let b = sample_token(
                 &restored_tokens,
                 c,
@@ -1745,6 +1757,7 @@ mod tests {
                 &MockModel,
             )
             .unwrap();
+            restored.advance(&opts, b, &MockModel);
             assert_eq!(a, b, "diverged at step {step}");
             assert_eq!(state, restored, "state diverged at step {step}");
             tokens.push(a);

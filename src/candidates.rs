@@ -1184,6 +1184,12 @@ impl Candidates {
     /// Sample a token from the candidates using [`SamplerConfig`] (the
     /// immutable config) and a [`crate::SamplerState`] (the per-call
     /// run-state; construct via [`SamplerConfig::init_state`]).
+    ///
+    /// Constraint matchers are NOT advanced here. If the chosen token
+    /// continues generation, follow up with
+    /// [`crate::SamplerState::advance`]; if it terminates generation
+    /// (stop sequence, EOG), do not — a terminal token must never
+    /// mutate the sampler state (tip invariant).
     pub fn sample_token<M: Model + Sync>(
         self,
         tokens: &[Token],
