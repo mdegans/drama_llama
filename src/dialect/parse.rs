@@ -1925,9 +1925,9 @@ mod tests {
                 json!({"arg1": -7}),
             ),
             (
-                "<|tool_call>call:amount{orig:3.14}<tool_call|>",
+                "<|tool_call>call:amount{orig:3.5}<tool_call|>",
                 "amount",
-                json!({"orig": 3.14}),
+                json!({"orig": 3.5}),
             ),
             (
                 "<|tool_call>call:amount{orig:1.5e10}<tool_call|>",
