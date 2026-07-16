@@ -22,13 +22,13 @@
 //!
 //! Request-level fields (`model` id, `max_tokens`, `temperature`,
 //! `stream`, `top_k`, `top_p`, `metadata`) are ignored locally — use
-//! [`PredictOptions`] and [`SampleOptions`] for the local equivalents.
+//! [`PredictOptions`] and [`SamplerConfig`] for the local equivalents.
 //!
 //! [`Prompt`]: misanthropic::Prompt
 //! [`ChatTemplate`]: crate::ChatTemplate
 //! [`grammar_for_prompt`]: crate::grammar_for_prompt
 //! [`PredictOptions`]: crate::PredictOptions
-//! [`SampleOptions`]: crate::SampleOptions
+//! [`SamplerConfig`]: crate::SamplerConfig
 
 // misanthropic ≥1.0.0-alpha.2 dropped the pervasive `'a` lifetime from
 // its public API — everything is owned (`Cow<'static, _>`) now, so these

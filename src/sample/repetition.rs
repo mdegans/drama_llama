@@ -23,7 +23,7 @@ use super::DELETE_ICON;
 ///
 /// # Why this config is the odd one out
 ///
-/// Unlike every other options struct in the crate ([`SampleOptions`],
+/// Unlike every other options struct in the crate ([`SamplerConfig`],
 /// [`PredictOptions`], `RenderOptions`, `ToolChoiceOptions`,
 /// `OutputConfigOptions` — all of which expose public fields), the fields here
 /// are `pub(crate)` and reached through accessors. This is **deliberate**: it
@@ -48,7 +48,7 @@ use super::DELETE_ICON;
 /// This struct is the template for the next config that earns a cross-field
 /// invariant before 1.0.
 ///
-/// [`SampleOptions`]: crate::SampleOptions
+/// [`SamplerConfig`]: crate::SamplerConfig
 /// [`PredictOptions`]: crate::PredictOptions
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "RepetitionOptionsShadow"))]
@@ -255,6 +255,25 @@ impl RepetitionOptions {
     /// [`IgnoreCategory`]s of tokens. These are never penalized.
     pub fn ignored_categories(&self) -> &BTreeSet<IgnoreCategory> {
         &self.ignored_categories
+    }
+
+    /// The effective ignore set: [`Self::ignored`] plus every
+    /// [`Self::ignored_categories`] entry tokenized against `model`.
+    /// Computed once per call (by `SamplerConfig::init_state`) and
+    /// passed into [`apply_sample_repetition_ngram`] — tokenizing the
+    /// category word lists is far too expensive to redo per sampled
+    /// token, and the config is immutable so it can't memoize in place.
+    pub fn resolved_ignored<M: crate::backend::Model>(
+        &self,
+        model: &M,
+    ) -> BTreeSet<NGram> {
+        let mut resolved = self.ignored.clone();
+        for cats in &self.ignored_categories {
+            for token in cats.into_tokens(model) {
+                resolved.insert(NGram::from(token));
+            }
+        }
+        resolved
     }
 
     /// Use [`RepetitionOptions::ignored_categories`] instead.
@@ -815,20 +834,24 @@ fn surgical_target(
 /// Originally inspired by `llama.cpp`'s repetition penalties, extended with
 /// n-gram support. Rewritten by Claude (Anthropic) to fix a design issue where
 /// penalties were only applied to the trailing token.
-pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
+pub fn apply_sample_repetition_ngram(
     candidates: Candidates,
     tokens: &[Token],
-    opts: &mut RepetitionOptions,
+    opts: &RepetitionOptions,
+    ignored: &BTreeSet<NGram>,
     freq_map: &mut NGramStats,
-    model: &M,
 ) -> Result<Candidates, RepetitionError> {
     let k = candidates.len();
     let n_vocab = k.get();
     let mut candidates = candidates.sort(Sorted::ById { k });
 
-    let RepetitionOptions {
-        ignored_categories,
-        ignored,
+    // `ignored` is the RESOLVED set — `opts.ignored` plus the tokenized
+    // `ignored_categories` — computed once per call by
+    // [`RepetitionOptions::resolved_ignored`] (via
+    // `SamplerConfig::init_state`), since tokenizing category word
+    // lists per sampled token would be wasteful and mutating the
+    // config to memoize it is no longer possible (config is immutable).
+    let &RepetitionOptions {
         window_size,
         decay,
         ngram_max_size,
@@ -838,15 +861,8 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
         penalty_present,
         penalty_repeat,
         surgical,
+        ..
     } = opts;
-
-    // Drain ignored categories into the ignored set. BTreeSet::insert
-    // silently handles duplicates; no manual dedup check needed.
-    while let Some(cats) = ignored_categories.pop_first() {
-        for token in cats.into_tokens(model) {
-            ignored.insert(NGram::from(token));
-        }
-    }
 
     let ngram_min_size: usize = ngram_min_size
         .get()
@@ -900,13 +916,13 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
             .and_then(|start| tokens.get(start..))
     }) {
         let ngram = NGram::try_from(slice).unwrap();
-        if ngram_is_ignored(ngram, &ignored) {
+        if ngram_is_ignored(ngram, ignored) {
             continue;
         }
         freq_map.add(ngram, &candidates, current_step);
     }
 
-    if *surgical {
+    if surgical {
         // Phase 2 (surgical): For each repeating n-gram, penalize the earliest
         // token that would extend the match — slice[k], where k is the longest
         // prefix already re-emitted in the trailing history. With k=0 (no
@@ -922,14 +938,14 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
         // in the ignored set, uppercase "The" is not — so proper-noun phrases
         // get blocked at their entry point.
         for (ngram, data) in freq_map.iter() {
-            if ngram_is_ignored(*ngram, &ignored) {
+            if ngram_is_ignored(*ngram, ignored) {
                 continue;
             }
             let effective = data.windowed_decayed_count(current_step, decay);
             if effective <= penalty_max_count_f {
                 continue;
             }
-            let target = match surgical_target(ngram, tokens, &ignored) {
+            let target = match surgical_target(ngram, tokens, ignored) {
                 Some(t) => t as usize,
                 None => continue,
             };
@@ -944,21 +960,21 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
             } else {
                 candidate.logit /= scaled_penalty;
             }
-            candidate.logit -= effective * *penalty_freq + *penalty_present;
+            candidate.logit -= effective * penalty_freq + penalty_present;
         }
     } else {
         // Phase 2 (broad): Penalize ALL tracked n-grams. For each n-gram,
         // penalize the last non-ignored token. This ensures all previously-seen
         // tokens get their logits reduced.
         for (ngram, data) in freq_map.iter() {
-            if ngram_is_ignored(*ngram, &ignored) {
+            if ngram_is_ignored(*ngram, ignored) {
                 continue;
             }
 
             // Find the last non-ignored token in the n-gram to penalize.
             let mut penalized_token = None;
             for &token in ngram.as_slice().iter().rev() {
-                if ngram_is_ignored(token.into(), &ignored) {
+                if ngram_is_ignored(token.into(), ignored) {
                     continue;
                 }
                 penalized_token = Some(token);
@@ -986,7 +1002,7 @@ pub fn apply_sample_repetition_ngram<M: crate::backend::Model>(
             // Additive penalties: frequency scales with the windowed,
             // decay-weighted count (bounded above by `1 / (1 - decay)`),
             // presence is binary.
-            candidate.logit -= effective * *penalty_freq + *penalty_present;
+            candidate.logit -= effective * penalty_freq + penalty_present;
         }
     }
 
@@ -1167,6 +1183,7 @@ mod tests {
     ) -> (Vec<f32>, NGramStats) {
         let mut freq_map = NGramStats::new();
         let mut result_logits = logits.to_vec();
+        let ignored = opts.resolved_ignored(model);
 
         for _ in 0..steps {
             let candidates = make_candidates(&result_logits);
@@ -1174,8 +1191,8 @@ mod tests {
                 candidates,
                 token_history,
                 opts,
+                &ignored,
                 &mut freq_map,
-                model,
             )
             .unwrap();
             result_logits = result.iter().map(|c| c.logit).collect();
@@ -1470,9 +1487,10 @@ mod tests {
         let baseline: Vec<f32> = (0..n_vocab).map(|_| 1.0).collect();
         let mut tokens: Vec<Token> = Vec::new();
 
-        let mut opts = RepetitionOptions::default();
+        let opts = RepetitionOptions::default();
         let window = opts.window_size().get() as usize;
         let mut freq_map = NGramStats::new();
+        let ignored = opts.resolved_ignored(&model);
 
         let snapshot = |result: &Candidates| -> f32 {
             let pop = result
@@ -1501,9 +1519,9 @@ mod tests {
             let result = apply_sample_repetition_ngram(
                 candidates,
                 &tokens,
-                &mut opts,
+                &opts,
+                &ignored,
                 &mut freq_map,
-                &model,
             )
             .unwrap();
             // step is zero-indexed, so step + 1 is the iteration count.
@@ -1560,9 +1578,10 @@ mod tests {
         let baseline: Vec<f32> = (0..n_vocab).map(|_| 1.0).collect();
         let mut tokens: Vec<Token> = Vec::new();
 
-        let mut opts = RepetitionOptions::default();
+        let opts = RepetitionOptions::default();
         let window = opts.window_size().get() as usize;
         let mut freq_map = NGramStats::new();
+        let ignored = opts.resolved_ignored(&model);
 
         // Phase A: saturate. Emit `popular` for `window` steps so the
         // unigram's effective count converges near `1 / (1 - decay)`.
@@ -1572,9 +1591,9 @@ mod tests {
             let _ = apply_sample_repetition_ngram(
                 candidates,
                 &tokens,
-                &mut opts,
+                &opts,
+                &ignored,
                 &mut freq_map,
-                &model,
             )
             .unwrap();
         }
@@ -1584,9 +1603,9 @@ mod tests {
         let saturated = apply_sample_repetition_ngram(
             saturated_candidates,
             &tokens,
-            &mut opts,
+            &opts,
+            &ignored,
             &mut freq_map,
-            &model,
         )
         .unwrap();
         let popular_sat = saturated
@@ -1610,9 +1629,9 @@ mod tests {
             let _ = apply_sample_repetition_ngram(
                 candidates,
                 &tokens,
-                &mut opts,
+                &opts,
+                &ignored,
                 &mut freq_map,
-                &model,
             )
             .unwrap();
         }
@@ -1621,9 +1640,9 @@ mod tests {
         let final_result = apply_sample_repetition_ngram(
             final_candidates,
             &tokens,
-            &mut opts,
+            &opts,
+            &ignored,
             &mut freq_map,
-            &model,
         )
         .unwrap();
         let popular_final = final_result

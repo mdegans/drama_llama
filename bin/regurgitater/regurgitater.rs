@@ -168,7 +168,7 @@ pub async fn tos() -> String {
 
 #[rocket::main]
 async fn main() {
-    use drama_llama::SampleOptions;
+    use drama_llama::SamplerConfig;
     use llama_cpp_sys_3::llama_token;
     use rocket::{
         fs::{relative, FileServer},
@@ -201,7 +201,7 @@ async fn main() {
         };
 
         let mut opts = PredictOptions::default();
-        opts.sample_options = SampleOptions::greedy();
+        opts.sample_options = SamplerConfig::greedy();
 
         let ready = || {
             to_client

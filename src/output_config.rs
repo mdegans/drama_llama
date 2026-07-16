@@ -76,9 +76,9 @@ impl Default for OutputConfigOptions {
 /// unconstrained until the trigger, then promote the JSON grammar).
 #[derive(Clone, Debug)]
 pub enum CompiledOutputConfig {
-    /// Standard single-grammar shape. Push this into `SampleOptions::modes`.
+    /// Standard single-grammar shape. Push this into `SamplerConfig::modes`.
     Single(SamplingMode),
-    /// Phase-split shape. Install into `SampleOptions::deferred_grammar`
+    /// Phase-split shape. Install into `SamplerConfig::deferred_grammar`
     /// and let `TokenPredictor` promote it when the trigger is emitted.
     Deferred(DeferredGrammar),
 }
@@ -126,9 +126,8 @@ pub fn compile_output_config(
     };
     if opts.phase_split && opts.allow_thought {
         let source = build_json_only_grammar_source(schema);
-        let grammar = crate::GrammarState::from_source(&source)?;
         Ok(CompiledOutputConfig::Deferred(DeferredGrammar {
-            grammar: std::sync::Arc::new(std::sync::Mutex::new(grammar)),
+            grammar: crate::CompiledGrammar::parse(&source)?,
             activate_after: vec![THINK_CLOSE_TRIGGER.to_vec()],
             // The JSON-body grammar starts *after* `</think>`; the
             // trigger itself stays outside the constrained span.
@@ -332,7 +331,7 @@ mod tests {
         assert_eq!(deferred.activate_after, vec![b"</think>".to_vec()]);
         // JSON-only grammar accepts bare JSON…
         let state = deferred.grammar;
-        let source = state.lock().unwrap().grammar().source().to_string();
+        let source = state.source().to_string();
         assert!(source.contains("output_schema"));
         assert!(
             !source.contains("think_body"),
@@ -359,7 +358,7 @@ mod tests {
         else {
             panic!("expected Single(Grammar) variant");
         };
-        let source = state.lock().unwrap().grammar().source().to_string();
+        let source = state.source().to_string();
         assert!(source.contains("think_body"));
     }
 

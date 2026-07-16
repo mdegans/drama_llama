@@ -36,7 +36,7 @@
 use dashmap::DashMap;
 use rayon::prelude::*;
 
-use crate::{Token, TokenData};
+use crate::TokenData;
 use rustc_hash::FxHashMap;
 use tinyvec::{ArrayVec, TinyVec};
 
@@ -740,6 +740,90 @@ pub(crate) struct StackState {
     pending: ArrayVec<[u8; 4]>,
 }
 
+/// A compiled grammar plus its lazy-DFA cache — the *config* half of a
+/// grammar constraint. Immutable: matching position lives in the
+/// per-call sampler state (`StackState`), never here.
+///
+/// `Clone` shares both the compiled rules and the cache (`Arc`), so a
+/// Session-owned config keeps one warm cache across calls. The cache is
+/// a pure memoization of the grammar: equality and serialization both
+/// ignore it (equality compares source; serde round-trips source only —
+/// `DfaCache` state ids are process-local interning and must never
+/// cross a serialization boundary).
+///
+/// This is the sampler config's single carve-out from full derive
+/// purity — one manual `PartialEq`, one source-only serde impl. Don't
+/// add more.
+#[derive(Clone, Debug)]
+pub struct CompiledGrammar {
+    pub(crate) grammar: Arc<Grammar>,
+    pub(crate) dfa: Arc<DfaCache>,
+}
+
+impl CompiledGrammar {
+    /// Compile from GBNF source. Returns the parse error if the grammar
+    /// is malformed.
+    pub fn parse(source: &str) -> Result<Self, GrammarError> {
+        Ok(Self::from_grammar(Arc::new(Grammar::parse(source)?)))
+    }
+
+    /// Compile by loading a `.gbnf` file from disk.
+    pub fn from_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, GrammarError> {
+        Ok(Self::from_grammar(Arc::new(Grammar::from_file(path)?)))
+    }
+
+    /// Wrap an already-compiled grammar with a fresh cache.
+    pub fn from_grammar(grammar: Arc<Grammar>) -> Self {
+        Self {
+            grammar,
+            dfa: Arc::new(DfaCache::new()),
+        }
+    }
+
+    /// The original GBNF source.
+    pub fn source(&self) -> &str {
+        self.grammar.source()
+    }
+
+    /// A fresh matcher at this grammar's root rule.
+    pub(crate) fn root_state(&self) -> StackState {
+        StackState::new_rooted(&self.grammar)
+    }
+}
+
+/// Source-identity equality; the DFA cache is ignored (pure
+/// acceleration). Same rationale as [`GrammarState`]'s manual impl.
+impl PartialEq for CompiledGrammar {
+    fn eq(&self, other: &Self) -> bool {
+        self.grammar == other.grammar
+    }
+}
+
+/// Serializes as the GBNF source string only; deserialization re-parses
+/// and starts a cold cache. Same compile is deterministic, so matcher
+/// positions serialized alongside remain index-consistent.
+#[cfg(feature = "serde")]
+impl serde::Serialize for CompiledGrammar {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.source())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for CompiledGrammar {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let source = String::deserialize(deserializer)?;
+        Self::parse(&source).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Active matching state for a [`Grammar`].
 ///
 /// Thin wrapper: owns the `Arc<Grammar>` plus the mutable `StackState`.
@@ -750,35 +834,21 @@ pub(crate) struct StackState {
 /// small for practical grammars. `accepts_bytes` relies on cloning for
 /// speculative simulation.
 ///
-/// Each `GrammarState` also owns an `Arc<DfaCache>` — a lazily-populated
-/// memoization layer over NFA states and one-byte transitions. `Clone` on
-/// `GrammarState` shares the same cache; independently constructed
-/// `GrammarState`s build independent caches.
-#[derive(Clone, Debug)]
+/// The sampling chain does not use this type — `SamplingMode::Grammar`
+/// holds a [`CompiledGrammar`] (config, with the lazy-DFA cache) and
+/// the matcher `StackState` lives in `SamplerState`. `GrammarState` is
+/// the standalone convenience for callers driving a matcher by hand.
+#[derive(Clone, Debug, PartialEq)]
 pub struct GrammarState {
     grammar: Arc<Grammar>,
     inner: StackState,
-    cache: Arc<DfaCache>,
-}
-
-/// Equality ignores the lazy-DFA cache: it is a pure acceleration structure
-/// and two states with identical matcher contents are semantically equal
-/// regardless of which cache instance happens to be attached.
-impl PartialEq for GrammarState {
-    fn eq(&self, other: &Self) -> bool {
-        self.grammar == other.grammar && self.inner == other.inner
-    }
 }
 
 impl GrammarState {
     /// Construct a fresh matcher rooted at the grammar's `root` rule.
     pub fn new(grammar: Arc<Grammar>) -> Self {
         let inner = StackState::new_rooted(&grammar);
-        Self {
-            grammar,
-            inner,
-            cache: Arc::new(DfaCache::new()),
-        }
+        Self { grammar, inner }
     }
 
     /// Construct a fresh matcher directly from GBNF source. Returns the
@@ -869,19 +939,19 @@ impl StackState {
         self.expand(grammar);
     }
 
-    fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.pending.is_empty() && self.stacks.iter().any(|s| s.is_empty())
     }
 
     /// True iff feeding `bytes` would succeed from the current state.
     /// Clones only the matcher state — the `Arc<Grammar>` is not touched.
-    fn accepts_bytes(&self, grammar: &Grammar, bytes: &[u8]) -> bool {
+    pub(crate) fn accepts_bytes(&self, grammar: &Grammar, bytes: &[u8]) -> bool {
         let mut scratch = self.clone();
         scratch.advance_bytes(grammar, bytes).is_ok()
     }
 
     /// [`Self::accepts_bytes`] + the scratch state ends accepting.
-    fn completes_with(&self, grammar: &Grammar, bytes: &[u8]) -> bool {
+    pub(crate) fn completes_with(&self, grammar: &Grammar, bytes: &[u8]) -> bool {
         let mut scratch = self.clone();
         scratch.advance_bytes(grammar, bytes).is_ok() && scratch.is_complete()
     }
@@ -935,7 +1005,7 @@ impl StackState {
         false
     }
 
-    fn advance_bytes(
+    pub(crate) fn advance_bytes(
         &mut self,
         grammar: &Grammar,
         bytes: &[u8],
@@ -1158,6 +1228,16 @@ pub(crate) struct DfaCache {
     bitmap_misses: AtomicU64,
 }
 
+/// Interned-state cap for a config-homed (Session-lifetime) cache.
+/// Non-recursive grammars plateau at a few hundred states, but a
+/// recursive grammar (arbitrarily nested JSON) mints a fresh state per
+/// nesting depth, so an uncapped cache grows without bound across
+/// turns. Clearing is always safe — the cache is pure memoization —
+/// so on exceed we restart cold. Soft cap: checked at the base-state
+/// intern (single-threaded point, once per sampled token); one token
+/// step may overshoot by its own transitions, which is noise.
+const DFA_CACHE_MAX_STATES: usize = 65_536;
+
 impl DfaCache {
     pub(crate) fn new() -> Self {
         Self {
@@ -1174,6 +1254,28 @@ impl DfaCache {
             bitmap_hits: AtomicU64::new(0),
             bitmap_misses: AtomicU64::new(0),
         }
+    }
+
+    /// Intern the per-token-step base state, enforcing the growth cap
+    /// first. MUST only be called from the single-threaded point of the
+    /// sampling step (before the rayon fold): the clear invalidates
+    /// every outstanding `StateId`, which is only safe when none are
+    /// live. Do NOT call concurrently with `transition`.
+    pub(crate) fn intern_base(&self, state: &StackState) -> StateId {
+        let over = {
+            let g = self.interned.read().unwrap();
+            g.states.len() > DFA_CACHE_MAX_STATES
+        };
+        if over {
+            let mut g = self.interned.write().unwrap();
+            g.intern.clear();
+            g.states.clear();
+            self.transitions.clear();
+            self.bitmaps.clear();
+            self.complete.clear();
+            self.terminal_valid.clear();
+        }
+        self.intern(state)
     }
 
     /// Intern a canonical `StackState`, returning its `StateId`. Reads fast-
@@ -1617,7 +1719,7 @@ pub struct GrammarStats {
     /// Cumulative cache misses on per-state first-byte bitmap.
     pub dfa_bitmap_misses: u64,
     /// Number of lazy sample-then-check verifications performed
-    /// (`SampleOptions::lazy_grammar`). In lazy mode this counts emitted
+    /// (`SamplerConfig::lazy_grammar`). In lazy mode this counts emitted
     /// constrained tokens; `lazy_hits / lazy_checks` is the fast-path
     /// acceptance rate.
     pub lazy_checks: u64,
@@ -1766,7 +1868,7 @@ pub fn grammar_stats_reset() {
 }
 
 /// Record one lazy sample-then-check verification
-/// (`SampleOptions::lazy_grammar`). No-op unless
+/// (`SamplerConfig::lazy_grammar`). No-op unless
 /// [`grammar_stats_enabled`]; callers pass the elapsed time only when
 /// they measured it (i.e. stats were enabled at check time).
 pub(crate) fn record_lazy(hit: bool, elapsed_us: u64) {
@@ -1844,7 +1946,8 @@ fn record_stats(
 ///   preserved for inspection via [`GrammarState::stack_depth`].
 pub(crate) fn grammar_filter<M: Model + Sync>(
     candidates: Candidates,
-    state: &mut GrammarState,
+    compiled: &CompiledGrammar,
+    matcher: &StackState,
     model: &M,
 ) -> Candidates {
     // Each candidate check is independent: clone the matcher state,
@@ -1867,20 +1970,21 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
     let t0 = stats_on.then(Instant::now);
     let candidates_in = candidates.as_slice().len() as u64;
 
-    let grammar: &Grammar = &state.grammar;
-    let inner: &StackState = &state.inner;
+    let grammar: &Grammar = &compiled.grammar;
+    let inner: &StackState = matcher;
     let cache_on = dfa_cache_enabled();
-    let cache: &Arc<DfaCache> = &state.cache;
+    let cache: &Arc<DfaCache> = &compiled.dfa;
 
     // Fast path: the lazy-DFA cache memoizes one-byte transitions and the
     // first-byte bitmap per canonical matcher state. Intern the base state
-    // up-front so every candidate walks the same transition table from the
-    // same state id.
-    let base_id = if cache_on { cache.intern(inner) } else { 0 };
+    // up-front (growth-capped: the config-homed cache lives for the
+    // Session, not the call) so every candidate walks the same
+    // transition table from the same state id.
+    let base_id = if cache_on { cache.intern_base(inner) } else { 0 };
     let bitmap = if cache_on {
         cache.first_byte_bitmap(grammar, base_id)
     } else {
-        state.first_byte_bitmap()
+        inner.first_byte_bitmap(grammar)
     };
 
     #[derive(Default)]
@@ -1921,7 +2025,7 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
     // EOT is `<|end|>`, which is NOT EOG, and masking it mid-grammar
     // left a Harmony model unable to close its analysis channel — it
     // rambled ("Let's do. We'll call. We'll output.") to `max_tokens`.
-    let complete = state.is_complete();
+    let complete = inner.is_complete();
     let eog: Vec<crate::Token> = if complete {
         Vec::new()
     } else {
@@ -2005,9 +2109,11 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
         "grammar_filter",
     );
     if kept.is_empty() {
-        if state.is_complete() {
-            state.reset();
-        }
+        // Success termination and grammar violation converge on the
+        // same force-EOS shape; matcher state is per-call now (fresh
+        // via `SamplerConfig::init_state`), so there is no
+        // reset-for-the-next-generation step — that contract died with
+        // the config/state split.
         let eos = TokenData {
             id: model.eos(),
             logit: 0.0,
@@ -2017,42 +2123,6 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
     }
 
     Candidates::from_vec_unchecked(kept)
-}
-
-/// Advance every `SamplingMode::Grammar` state in `modes` by the bytes of
-/// `token`.
-///
-/// # Panics
-///
-/// Panics if any grammar mutex is poisoned. A poisoned mutex means a
-/// previous panic left the matcher in an undefined state, and silently
-/// continuing would produce output that violates the grammar.
-pub(crate) fn advance_all<M: Model>(
-    modes: &[crate::SamplingMode],
-    token: Token,
-    model: &M,
-) {
-    use crate::SamplingMode;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut computed = false;
-    for mode in modes {
-        if let SamplingMode::Grammar(state) = mode {
-            if !computed {
-                model.token_to_piece_ref(token, &mut buf);
-                computed = true;
-            }
-            let mut locked = state.lock().expect(
-                "SamplingMode::Grammar mutex poisoned during advance; \
-                 matcher state is unrecoverable. Rebuild the mode and \
-                 retry.",
-            );
-            // An advance error means the grammar was violated on the prior
-            // step (EOS fallback chose an out-of-grammar token). Generation
-            // terminates on the next step via the EOS stop_sequence, so
-            // silently no-op here.
-            let _ = locked.advance_bytes(&buf);
-        }
-    }
 }
 
 // ===========================================================================
@@ -2104,7 +2174,6 @@ mod tests {
         let mut resumed = GrammarState {
             grammar,
             inner: restored,
-            cache: Arc::new(DfaCache::new()),
         };
         resumed.advance_bytes(&bytes[2..]).unwrap();
         assert!(resumed.is_complete());
@@ -2589,7 +2658,7 @@ char ::= [\x00-\x7F] | [\x80-\xFF]"#;
     #[test]
     #[ignore = "requires model"]
     fn grammar_integration_tool_call() {
-        use crate::{PredictOptions, SampleOptions, SamplingMode};
+        use crate::{PredictOptions, SamplerConfig, SamplingMode};
         use std::{num::NonZeroUsize, path::PathBuf};
 
         let model_path =
@@ -2613,9 +2682,9 @@ char ::= [\x00-\x7F] | [\x80-\xFF]"#;
         opts.n = NonZeroUsize::new(256).unwrap();
         let grammar_mode =
             SamplingMode::grammar(GBNF).expect("test grammar should parse");
-        opts.sample_options = SampleOptions {
+        opts.sample_options = SamplerConfig {
             modes: vec![grammar_mode, SamplingMode::locally_typical()],
-            ..SampleOptions::default()
+            ..SamplerConfig::default()
         };
 
         let eos_piece = engine.model.token_to_piece(engine.model.eos());

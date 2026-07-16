@@ -226,7 +226,7 @@ pub struct NGramStats {
 #[cfg(feature = "serde")]
 mod data_serde {
     use super::*;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(
         map: &BTreeMap<NGram, NGramData>,

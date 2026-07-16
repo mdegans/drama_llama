@@ -198,7 +198,7 @@ pub fn grammar_for_tool_choice(
 /// prompt whose `tool_choice` is `Auto` — or absent, which the
 /// Anthropic API treats as auto — with tools advertised.
 ///
-/// Returns a [`DeferredGrammar`] that sleeps until the wrap-tag open
+/// Returns a [`crate::DeferredGrammar`] that sleeps until the wrap-tag open
 /// (e.g. `<tool_call>\n`) appears in the output, then activates with
 /// the trigger bytes fed into the matcher, constraining the remainder
 /// of the call to the tool schemas. Thought and prose before the
@@ -238,9 +238,8 @@ pub fn deferred_grammar_for_prompt(
     };
     let chosen: Vec<&Tool> = tools.iter().collect();
     let source = build_grammar_source(&chosen, opts, RootShape::Lazy);
-    let grammar = crate::GrammarState::from_source(&source)?;
     Ok(Some(crate::DeferredGrammar {
-        grammar: std::sync::Arc::new(std::sync::Mutex::new(grammar)),
+        grammar: crate::CompiledGrammar::parse(&source)?,
         activate_after: vec![open.as_bytes().to_vec()],
         feed_trigger: true,
     }))
@@ -1267,7 +1266,7 @@ mod tests {
     fn tool_choice_forces_call_against_real_model() {
         use crate::{
             ChatTemplate, Content, Message, PredictOptions, Prompt,
-            RenderOptions, Role, SampleOptions, SamplingMode,
+            RenderOptions, Role, SamplerConfig, SamplingMode,
         };
         use std::{num::NonZeroUsize, path::PathBuf};
 
@@ -1310,9 +1309,9 @@ mod tests {
         let tokens = engine.model.tokenize(&rendered, false);
         let mut opts = PredictOptions::default().add_model_stops(&engine.model);
         opts.n = NonZeroUsize::new(256).unwrap();
-        opts.sample_options = SampleOptions {
+        opts.sample_options = SamplerConfig {
             modes: vec![forced, SamplingMode::locally_typical()],
-            ..SampleOptions::default()
+            ..SamplerConfig::default()
         };
 
         let eos_piece = engine.model.token_to_piece(engine.model.eos());

@@ -1,11 +1,10 @@
 use std::num::{NonZeroU128, NonZeroUsize};
 
-use rand_pcg::Pcg64Mcg;
+
 
 use crate::{
     backend::{Backend, Decoder, Model},
-    ngram::NGramStats,
-    sample::SampleOptions,
+    sample::SamplerConfig,
     Candidates, Engine, NGram, Token,
 };
 
@@ -69,7 +68,7 @@ pub struct PredictOptions {
     )]
     pub regex_stop_sequences: Vec<regex::Regex>,
     /// Sampling options.
-    pub sample_options: SampleOptions,
+    pub sample_options: SamplerConfig,
 }
 
 impl Default for PredictOptions {
@@ -80,7 +79,7 @@ impl Default for PredictOptions {
             stop_sequences: Vec::new(),
             stop_strings: Vec::new(),
             regex_stop_sequences: Vec::new(),
-            sample_options: SampleOptions::default(),
+            sample_options: SamplerConfig::default(),
         }
     }
 }
@@ -94,7 +93,7 @@ impl PredictOptions {
     /// Shortcut for greedy sampling/
     pub fn greedy() -> Self {
         Self {
-            sample_options: SampleOptions::greedy(),
+            sample_options: SamplerConfig::greedy(),
             ..Self::default()
         }
     }
@@ -445,13 +444,14 @@ impl<'engine, B: Backend> From<CandidatePredictor<'engine, B>> for Vec<Token> {
 }
 
 pub struct TokenPredictor<'engine, B: Backend> {
-    rng: Pcg64Mcg,
-    ngram_stats: NGramStats,
+    /// Per-call sampler run-state (matchers, RNG, mu, n-gram stats).
+    /// Built by `prepare` from the effective config via
+    /// `SamplerConfig::init_state` — the config in `options` stays
+    /// immutable for the life of the predictor.
+    state: crate::SamplerState,
     options: PredictOptions,
     pub text: String,
     pub(crate) max_stop_len: usize,
-    /// Mu value for Mirostat sampling
-    mu: Option<f32>,
     pub(crate) inner: CandidatePredictor<'engine, B>,
 }
 
@@ -461,16 +461,14 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         tokens: Vec<Token>,
         options: PredictOptions,
     ) -> Self {
-        let (rng, ngram_stats, options, max_stop_len) =
+        let (state, options, max_stop_len) =
             Self::prepare(engine, &tokens, options);
         let inner = CandidatePredictor::new(engine, tokens, options.n);
         Self {
-            rng,
-            ngram_stats,
+            state,
             options,
             text: String::new(),
             max_stop_len,
-            mu: None,
             inner,
         }
     }
@@ -484,20 +482,39 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         seq_id: i32,
         options: PredictOptions,
     ) -> Self {
-        let (rng, ngram_stats, options, max_stop_len) =
+        let (state, options, max_stop_len) =
             Self::prepare(engine, &tokens, options);
         let inner = CandidatePredictor::new_resuming(
             engine, tokens, start_pos, seq_id, options.n,
         );
         Self {
-            rng,
-            ngram_stats,
+            state,
             options,
             text: String::new(),
             max_stop_len,
-            mu: None,
             inner,
         }
+    }
+
+    /// The live sampler run-state: matcher positions, working RNG,
+    /// mirostat `mu`, n-gram stats. The replacement for observing
+    /// matcher progress through shared `Arc<Mutex<…>>` handles.
+    pub fn sampler_state(&self) -> &crate::SamplerState {
+        &self.state
+    }
+
+    /// True iff any constraint matcher — including an activated
+    /// deferred grammar — has reached its accept state.
+    pub fn grammar_complete(&self) -> bool {
+        self.state.grammar_complete()
+    }
+
+    /// True iff the config carried eager (active-from-token-0)
+    /// constraints and none reached accept — the incomplete-at-end
+    /// violation signal. Deferred grammars are exempt (never
+    /// triggering is legal).
+    pub fn eager_constraint_incomplete(&self) -> bool {
+        self.state.eager_constraint_incomplete()
     }
 
     /// Shared setup for [`Self::new`] and [`Self::new_resuming`]: seed
@@ -507,7 +524,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         engine: &Engine<B>,
         tokens: &[Token],
         mut options: PredictOptions,
-    ) -> (Pcg64Mcg, NGramStats, PredictOptions, usize) {
+    ) -> (crate::SamplerState, PredictOptions, usize) {
         let seed = match options.seed {
             Some(seed) => seed,
             None => match std::time::SystemTime::now()
@@ -523,18 +540,20 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         };
         options.seed = Some(seed);
 
-        let mut ngram_stats = NGramStats::new();
+        let mut state =
+            options.sample_options.init_state(seed.get(), &engine.model);
+
         // Dummy candidates to start. TODO: Rethink this. Ngram stats are
         // supposed to include data like cumulative probabilities, but we don't
         // have that here, although we could calculate them from the tokens.
         let candidates =
             Candidates::new(engine.model.n_vocab() as usize).unwrap();
-        // Init ngram stats. Each n-gram occurrence is recorded at the
-        // absolute position of its trailing token in the prompt, so the
-        // windowed-decay penalty math (RepetitionOptions.window_size +
-        // decay) sees prompt occurrences at their true distance from the
-        // current generation step.
-        if let Some(opts) = &mut options.sample_options.repetition {
+        // Seed ngram stats from the prompt. Each n-gram occurrence is
+        // recorded at the absolute position of its trailing token, so
+        // the windowed-decay penalty math (RepetitionOptions.window_size
+        // + decay) sees prompt occurrences at their true distance from
+        // the current generation step.
+        if let Some(opts) = &options.sample_options.repetition {
             let max_size = opts.ngram_max_size.get() as usize;
             for (win_idx, win) in tokens.windows(max_size).enumerate() {
                 // Last token of the window sits at absolute index
@@ -545,7 +564,11 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
                     .filter_map(|n| win.get((win.len() - n as usize)..))
                 {
                     let ngram = NGram::try_from_tokens(slice).unwrap();
-                    let _ = ngram_stats.add(ngram, &candidates, trailing_pos);
+                    let _ = state.seed_prompt_ngram(
+                        ngram,
+                        &candidates,
+                        trailing_pos,
+                    );
                 }
             }
         }
@@ -557,12 +580,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             .max()
             .unwrap_or(0);
 
-        (
-            Pcg64Mcg::new(seed.get()),
-            ngram_stats,
-            options,
-            max_stop_len,
-        )
+        (state, options, max_stop_len)
     }
 }
 
@@ -636,10 +654,8 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         let next_token = candidates
             .sample_token(
                 &self.inner.tokens,
-                &mut self.options.sample_options,
-                &mut self.ngram_stats,
-                &mut self.rng,
-                &mut self.mu,
+                &self.options.sample_options,
+                &mut self.state,
                 &self.inner.engine.model,
             )
             .unwrap();
@@ -647,61 +663,45 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         let piece = self.inner.engine.model.token_to_piece(next_token);
         self.text.push_str(&piece);
 
-        // Deferred-grammar promotion: if the accumulated text now contains
-        // the trigger bytes, move the grammar into `modes` and feed any
-        // post-trigger tail bytes to its state so the matcher lines up with
-        // the model. A matcher-level rejection on the tail collapses the
-        // iterator — the caller sees generation end rather than an ungated
-        // JSON phase. See `DeferredGrammar`.
-        if let Some((trigger_end, trigger_len)) = self
-            .options
-            .sample_options
-            .deferred_grammar
-            .as_ref()
-            .and_then(|d| {
+        // Deferred-grammar activation: if the accumulated text now
+        // contains a trigger, flag the state's deferred matcher active
+        // and feed any post-trigger tail bytes so it lines up with the
+        // model. A matcher-level rejection on the tail collapses the
+        // iterator — the caller sees generation end rather than an
+        // ungated JSON phase. See `DeferredGrammar`.
+        if let (Some(spec), Some(true)) = (
+            self.options.sample_options.deferred_grammar.as_ref(),
+            self.state.deferred_inactive(),
+        ) {
+            if let Some((trigger_end, trigger_len)) =
                 find_any_deferred_trigger_end(
                     self.text.as_bytes(),
-                    &d.activate_after,
+                    &spec.activate_after,
                     self.max_stop_len + self.inner.engine.model.max_token_len(),
                 )
-            })
-        {
-            let promoted = self
-                .options
-                .sample_options
-                .deferred_grammar
-                .take()
-                .expect("deferred_grammar presence checked above");
-            // Lazy-pattern grammars start their root at the trigger
-            // itself; feed from the trigger's first byte so the
-            // matcher lines up (`find_deferred_trigger_end` guarantees
-            // `trigger_end >= trigger.len()`).
-            let feed_from = if promoted.feed_trigger {
-                trigger_end - trigger_len
-            } else {
-                trigger_end
-            };
-            let tail = &self.text.as_bytes()[feed_from..];
-            if !tail.is_empty() {
-                let mut locked = promoted
-                    .grammar
-                    .lock()
-                    .expect("deferred grammar mutex poisoned at promotion");
-                if locked.advance_bytes(tail).is_err() {
+            {
+                // Lazy-pattern grammars start their root at the trigger
+                // itself; feed from the trigger's first byte so the
+                // matcher lines up (`find_deferred_trigger_end`
+                // guarantees `trigger_end >= trigger.len()`).
+                let feed_from = if spec.feed_trigger {
+                    trigger_end - trigger_len
+                } else {
+                    trigger_end
+                };
+                let tail = &self.text.as_bytes()[feed_from..];
+                if self.state.activate_deferred(spec, tail).is_err() {
                     return None;
                 }
             }
-            self.options
-                .sample_options
-                .modes
-                .push(crate::SamplingMode::Grammar(promoted.grammar));
         }
 
         if let Some(hook) = self.inner.engine.probe_hook.as_mut() {
             hook.on_token(crate::ProbeCtx {
                 token: next_token,
                 n_cur: self.inner.n_cur,
-                sample_options: &self.options.sample_options,
+                config: &self.options.sample_options,
+                state: &self.state,
                 snapshot: snapshot.as_ref(),
                 piece: &piece,
                 generation_index: (self.inner.n_decode - 1) as u32,
@@ -804,6 +804,21 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     /// Get the last token that was predicted.
     pub fn last_token(&self) -> Option<Token> {
         self.inner.inner.tokens.last().copied()
+    }
+
+    /// The live sampler run-state. See [`TokenPredictor::sampler_state`].
+    pub fn sampler_state(&self) -> &crate::SamplerState {
+        self.inner.sampler_state()
+    }
+
+    /// See [`TokenPredictor::grammar_complete`].
+    pub fn grammar_complete(&self) -> bool {
+        self.inner.grammar_complete()
+    }
+
+    /// See [`TokenPredictor::eager_constraint_incomplete`].
+    pub fn eager_constraint_incomplete(&self) -> bool {
+        self.inner.eager_constraint_incomplete()
     }
 }
 
@@ -935,7 +950,7 @@ impl<'engine, B: Backend> Iterator for Predictor<'engine, B> {
 #[cfg(all(test, feature = "llama-cpp"))]
 mod tests {
     use crate::{
-        LlamaCppEngine, PredictOptions, RepetitionOptions, SampleOptions, Token,
+        LlamaCppEngine, PredictOptions, RepetitionOptions, SamplerConfig, Token,
     };
     use std::{num::NonZeroUsize, path::PathBuf};
 
@@ -944,11 +959,11 @@ mod tests {
     #[test]
     fn test_default_options() {
         let opts = PredictOptions::default();
-        assert_eq!(opts.sample_options, SampleOptions::default());
-        // SampleOptions::default() ships repetition on as of v0.8.0
+        assert_eq!(opts.sample_options, SamplerConfig::default());
+        // SamplerConfig::default() ships repetition on as of v0.8.0
         // (windowed decay removed the long-form degradation). Probes
         // that want the raw logit gradient pass `--no-penalty` /
-        // construct `SampleOptions::greedy()`.
+        // construct `SamplerConfig::greedy()`.
         assert_eq!(
             opts.sample_options.repetition,
             Some(RepetitionOptions::default())

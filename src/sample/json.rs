@@ -522,16 +522,17 @@ static_assertions::assert_impl_all!(JsonState: Send, Sync);
 /// EOS. Two cases trigger this:
 ///
 /// * **Success termination**: the document is complete and the strict
-///   post-complete rule (no trailing bytes) rejected every token. The
-///   parser is reset so the next generation on the same mode instance
-///   starts fresh. Generation terminates via the EOS stop-sequence.
+///   post-complete rule (no trailing bytes) rejected every token.
+///   Generation terminates via the EOS stop-sequence. (Parser state is
+///   per-call — fresh via `SamplerConfig::init_state` — so there is no
+///   reset-for-the-next-generation step.)
 /// * **Grammar violation**: the parser is mid-parse but no candidate token
 ///   can extend it. The state is preserved for debugging; the caller can
 ///   inspect the stack depth via [`JsonState::stack_depth`]. Generation
 ///   still terminates via EOS.
 pub(crate) fn json_filter<M: Model>(
     candidates: Candidates,
-    state: &mut JsonState,
+    state: &JsonState,
     model: &M,
 ) -> Candidates {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
@@ -574,13 +575,6 @@ pub(crate) fn json_filter<M: Model>(
     }
 
     if kept.is_empty() {
-        // Distinguish success termination from grammar violation. On
-        // success, reset so the next generation starts fresh without the
-        // caller having to remember. On violation, leave state intact for
-        // the caller to inspect.
-        if state.is_complete() {
-            state.reset();
-        }
         let eos = TokenData {
             id: model.eos(),
             logit: 0.0,
@@ -590,45 +584,6 @@ pub(crate) fn json_filter<M: Model>(
     }
 
     Candidates::from_vec_unchecked(kept)
-}
-
-/// Advance every `SamplingMode::Json` state in `modes` by the bytes of
-/// `token`.
-///
-/// # Panics
-///
-/// Panics if any `SamplingMode::Json` mutex is poisoned. A poisoned mutex
-/// means a previous panic left the parser state undefined, and silently
-/// continuing would produce output that violates the grammar — contrary to
-/// the [`SamplingMode::Json`] contract. Rebuild the mode and retry.
-///
-/// [`SamplingMode::Json`]: crate::SamplingMode::Json
-pub(crate) fn advance_all<M: Model>(
-    modes: &[crate::SamplingMode],
-    token: Token,
-    model: &M,
-) {
-    use crate::SamplingMode;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut computed = false;
-    for mode in modes {
-        if let SamplingMode::Json(state) = mode {
-            if !computed {
-                model.token_to_piece_ref(token, &mut buf);
-                computed = true;
-            }
-            let mut locked = state.lock().expect(
-                "SamplingMode::Json mutex poisoned during advance; parser \
-                 state is unrecoverable. Rebuild the mode with \
-                 SamplingMode::json() and retry.",
-            );
-            // An advance error means the grammar was violated on the prior
-            // step (EOS fallback chose an out-of-grammar token). Generation
-            // will terminate on the next step via the stop_sequence for
-            // EOS, so we silently no-op on this specific failure mode.
-            let _ = locked.advance_bytes(&buf);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -996,7 +951,7 @@ mod tests {
     #[test]
     #[ignore = "requires model"]
     fn json_integration_character_sheet() {
-        use crate::{PredictOptions, SampleOptions, SamplingMode};
+        use crate::{PredictOptions, SamplerConfig, SamplingMode};
         use std::{num::NonZeroUsize, path::PathBuf};
 
         let model_path =
@@ -1021,9 +976,9 @@ mod tests {
         opts.n = NonZeroUsize::new(256).unwrap();
         // JSON first so invalid tokens are pruned before locally-typical
         // sampling picks among what remains.
-        opts.sample_options = SampleOptions {
+        opts.sample_options = SamplerConfig {
             modes: vec![SamplingMode::json(), SamplingMode::locally_typical()],
-            ..SampleOptions::default()
+            ..SamplerConfig::default()
         };
 
         // Capture EOS piece before we start predicting — `predict_pieces`
@@ -1055,7 +1010,7 @@ mod tests {
         println!("parsed as: {parsed:#}");
     }
 
-    /// Phase B2 validation for `SampleOptions::lazy_grammar` (#28) on a
+    /// Phase B2 validation for `SamplerConfig::lazy_grammar` (#28) on a
     /// real model:
     ///
     /// * every seed's output parses as valid JSON (fallback catches all
@@ -1072,7 +1027,7 @@ mod tests {
     #[test]
     #[ignore = "requires model, long running"]
     fn json_integration_lazy_grammar() {
-        use crate::{PredictOptions, SampleOptions, SamplingMode};
+        use crate::{PredictOptions, SamplerConfig, SamplingMode};
         use std::{
             num::{NonZeroU128, NonZeroUsize},
             path::PathBuf,
@@ -1094,13 +1049,13 @@ mod tests {
                 PredictOptions::default().add_model_stops(&engine.model);
             opts.n = NonZeroUsize::new(256).unwrap();
             opts.seed = Some(NonZeroU128::new(seed).unwrap());
-            opts.sample_options = SampleOptions {
+            opts.sample_options = SamplerConfig {
                 modes: vec![
                     SamplingMode::json(),
                     SamplingMode::locally_typical(),
                 ],
                 lazy_grammar: true,
-                ..SampleOptions::default()
+                ..SamplerConfig::default()
             };
             engine.predict_pieces(tokens.clone(), opts).collect()
         };

@@ -83,7 +83,7 @@ use crate::{
     backend::{Backend, Model},
     output_config, ChatTemplate, ChatTemplateError, Engine, OutputConfigError,
     OutputConfigOptions, PredictOptions, Prompt, RenderOptions,
-    RepetitionOptions, SampleOptions, SamplingMode, Token, Tool, ToolChoice,
+    RepetitionOptions, SamplerConfig, SamplingMode, Token, Tool, ToolChoice,
     ToolChoiceError, ToolChoiceOptions,
 };
 
@@ -886,10 +886,10 @@ pub struct Session<B: Backend> {
     /// `repetition: Some(RepetitionOptions::default())` (on as of
     /// v0.8.0 — the windowed decay removed the long-form degradation
     /// that originally kept it off). Disable per-model via a sidecar
-    /// or [`Session::with_repetition`] / [`SampleOptions::greedy`] for
+    /// or [`Session::with_repetition`] / [`SamplerConfig::greedy`] for
     /// chat-style flows that must re-emit short context tokens
     /// verbatim (e.g. a digit echoed from a tool result).
-    sample_options: SampleOptions,
+    sample_options: SamplerConfig,
     /// RNG seed forwarded to every `predict_*` call. `None` =
     /// time-based seed (each call diverges); `Some(n)` = deterministic
     /// across runs given the same prompt and model. Default is
@@ -1363,7 +1363,7 @@ impl<B: Backend> Session<B> {
                 .with_generation_prompt(true)
                 .with_extra("preserve_thinking", true)
                 .with_thought_reingest(thought_reingest),
-            sample_options: SampleOptions::default(),
+            sample_options: SamplerConfig::default(),
             seed: Some(crate::PredictOptions::DEFAULT_SEED),
             max_tokens: NonZeroUsize::new(DEFAULT_MAX_TOKENS).unwrap(),
             emit_specials_ban: true,
@@ -1375,7 +1375,7 @@ impl<B: Backend> Session<B> {
 
     /// Enable (or replace) the repetition penalty. As of v0.8.0 the
     /// default is `Some(RepetitionOptions::default())`; use this to
-    /// replace it with tuned parameters, or [`SampleOptions::greedy`] /
+    /// replace it with tuned parameters, or [`SamplerConfig::greedy`] /
     /// a sidecar to turn it off for chat flows that must repeat natural
     /// short tokens (e.g. a digit echoed from a tool result). See
     /// [`RepetitionOptions`] for parameters.
@@ -1412,7 +1412,7 @@ impl<B: Backend> Session<B> {
         self
     }
 
-    /// Replace the entire sampling configuration ([`SampleOptions`]) —
+    /// Replace the entire sampling configuration ([`SamplerConfig`]) —
     /// post-grammar sampling-mode chain *and* repetition penalty *and*
     /// any deferred grammar — wholesale. This is the wholesale entry
     /// point used by per-model TOML sidecar loading
@@ -1426,7 +1426,7 @@ impl<B: Backend> Session<B> {
     /// [`Self::with_repetition`]. Without it a strong rep penalty
     /// would prevent the model from emitting EOS / chat-template
     /// markers / tool-call markers and stall every turn.
-    pub fn with_sample_options(mut self, mut opts: SampleOptions) -> Self {
+    pub fn with_sample_options(mut self, mut opts: SamplerConfig) -> Self {
         if let Some(rep) = opts.repetition.as_mut() {
             rep.extend_ignored(self.engine.model.special_tokens());
         }
@@ -1608,7 +1608,7 @@ impl<B: Backend> Session<B> {
     }
 
     /// The emit-side special-token ban set (#31 item 9), handed to
-    /// [`SampleOptions::banned_specials`] on every call: specials the
+    /// [`SamplerConfig::banned_specials`] on every call: specials the
     /// active dialect never legitimately emits. Universe is
     /// [`Model::special_tokens`]; exempt are the EOG family (eos,
     /// eot, extra EOS) and any special whose piece overlaps a dialect
@@ -1625,7 +1625,7 @@ impl<B: Backend> Session<B> {
     /// ([`Session::with_emit_specials_ban`]).
     ///
     /// [`Model::special_tokens`]: crate::backend::Model::special_tokens
-    /// [`SampleOptions::banned_specials`]: crate::SampleOptions
+    /// [`SamplerConfig::banned_specials`]: crate::SamplerConfig
     fn emit_ban_set(&self) -> Vec<Token> {
         if !self.emit_specials_ban {
             return Vec::new();
@@ -1754,7 +1754,7 @@ impl<B: Backend> Session<B> {
 
     /// Enable (or disable) the emit-side special-token ban. On by
     /// default: each sampled token is checked against the dialect ban
-    /// set (see [`SampleOptions::banned_specials`]) so free prose
+    /// set (see [`SamplerConfig::banned_specials`]) so free prose
     /// cannot smuggle chat-framing control tokens — `<|im_start|>`
     /// and friends — into the transcript. Disable for workloads where
     /// the model legitimately emits specials the dialect doesn't
@@ -1762,7 +1762,7 @@ impl<B: Backend> Session<B> {
     /// `<|object_ref_start|>`); the ingest-side injection guard still
     /// protects re-ingestion either way.
     ///
-    /// [`SampleOptions::banned_specials`]: crate::SampleOptions
+    /// [`SamplerConfig::banned_specials`]: crate::SamplerConfig
     pub fn with_emit_specials_ban(mut self, on: bool) -> Self {
         self.emit_specials_ban = on;
         self
@@ -2846,7 +2846,7 @@ impl<B: Backend> Session<B> {
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.seed = self.seed;
-        predict_opts.sample_options = SampleOptions {
+        predict_opts.sample_options = SamplerConfig {
             modes,
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
@@ -3141,7 +3141,7 @@ impl<B: Backend> Session<B> {
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.seed = self.seed;
-        predict_opts.sample_options = SampleOptions {
+        predict_opts.sample_options = SamplerConfig {
             modes,
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
@@ -3234,34 +3234,14 @@ impl<B: Backend> Session<B> {
         // loop is a hash lookup.
         let eos_pieces = self.eog_pieces();
 
-        // Capture grammar / json mode handles BEFORE moving `modes`
-        // into the predictor. Each `SamplingMode::Grammar` /
-        // `::Json` wraps an `Arc<Mutex<State>>`, so cloning the
-        // SamplingMode shares the underlying state — once the
-        // matcher accepts mid-fold, our captured handles see it.
-        // Includes any deferred grammar which may activate
-        // mid-generation (its state lives in the same Arc); without
-        // capturing here we'd miss the post-`</think>` JSON
-        // matcher's completion.
-        let mut grammar_handles: Vec<SamplingMode> = modes
-            .iter()
-            .filter(|m| {
-                matches!(m, SamplingMode::Grammar(_) | SamplingMode::Json(_))
-            })
-            .cloned()
-            .collect();
-        // Eager handles only (active from token 0): the
-        // incomplete-at-end violation check below must not fire for a
-        // deferred grammar that legitimately never triggered.
-        let eager_grammar_handles = grammar_handles.clone();
-        if let Some(dg) = &deferred_grammar {
-            grammar_handles.push(SamplingMode::Grammar(dg.grammar.clone()));
-        }
+        // Matcher progress (early-break on accept, incomplete-at-end
+        // violation) is observed through the predictor's
+        // `sampler_state()` accessors — the owned `SamplerState`
+        // replaced the shared `Arc<Mutex<…>>` handle channel.
         #[cfg(feature = "axum")]
         tracing::debug!(
             target: "drama_llama::session",
             n_modes = modes.len(),
-            n_grammar_handles = grammar_handles.len(),
             has_deferred = deferred_grammar.is_some(),
             "run_call: modes prepared",
         );
@@ -3270,7 +3250,7 @@ impl<B: Backend> Session<B> {
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.seed = self.seed;
-        predict_opts.sample_options = SampleOptions {
+        predict_opts.sample_options = SamplerConfig {
             modes,
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar: deferred_grammar.clone(),
@@ -3337,11 +3317,15 @@ impl<B: Backend> Session<B> {
             // catches reserved tokens, but a properly-misbehaving
             // model could still emit non-empty-piece junk that
             // grammars won't see). One-shot: as soon as ANY
-            // captured matcher is_complete, halt.
-            if any_grammar_complete(&grammar_handles) {
+            // matcher (including an activated deferred grammar)
+            // is_complete, halt.
+            if predictor.grammar_complete() {
                 break;
             }
         }
+        // Capture the incomplete-at-end violation signal before the
+        // predictor (and its owned SamplerState) drops.
+        let eager_incomplete = predictor.eager_constraint_incomplete();
         drop(predictor);
         // Parse the whole generation through the dialect envelope
         // parser. `Final` leniency: a truncated trailing structure
@@ -3492,9 +3476,8 @@ impl<B: Backend> Session<B> {
         // constraint-incomplete output must be impossible: surface it
         // as the typed error instead. (Deferred/Auto grammars are
         // exempt: never triggering is legal. Streaming stays
-        // permissive by documented contract.)
-        let eager_incomplete = !eager_grammar_handles.is_empty()
-            && !any_grammar_complete(&eager_grammar_handles);
+        // permissive by documented contract.) `eager_incomplete` was
+        // captured from the predictor's SamplerState before drop.
         if eager_incomplete
             || (forced_tool_call
                 && !blocks
@@ -3648,21 +3631,34 @@ impl<B: Backend> Session<B> {
         let mut trace: Vec<TokenTrace> = Vec::new();
         let mut position: usize = 0;
 
-        while let Some(cands) = predictor.next() {
-            let filtered = modes.iter().fold(cands, |c, mode| match mode {
-                SamplingMode::Grammar(state) => {
-                    let mut locked = state.lock().expect(
-                        "SamplingMode::Grammar mutex poisoned in \
-                         top_k_trace; matcher state unrecoverable.",
-                    );
-                    grammar_mod::grammar_filter(
-                        c,
-                        &mut locked,
-                        &predictor.engine.model,
-                    )
+        // Local matcher per grammar mode: this diagnostic path bypasses
+        // the predictor (and thus SamplerState), so it owns its own
+        // matcher positions, index-aligned with `modes`.
+        let mut matchers: Vec<Option<grammar_mod::StackState>> = modes
+            .iter()
+            .map(|m| match m {
+                SamplingMode::Grammar(compiled) => {
+                    Some(compiled.root_state())
                 }
-                _ => c,
-            });
+                _ => None,
+            })
+            .collect();
+
+        while let Some(cands) = predictor.next() {
+            let filtered = modes.iter().zip(matchers.iter()).fold(
+                cands,
+                |c, (mode, matcher)| match (mode, matcher) {
+                    (SamplingMode::Grammar(compiled), Some(matcher)) => {
+                        grammar_mod::grammar_filter(
+                            c,
+                            compiled,
+                            matcher,
+                            &predictor.engine.model,
+                        )
+                    }
+                    _ => c,
+                },
+            );
 
             let sorted = filtered.sort(Sorted::ByLogit { k: k_nz });
             let top_k: Vec<TopKEntry> = sorted
@@ -3686,7 +3682,17 @@ impl<B: Backend> Session<B> {
                 break;
             }
 
-            grammar_mod::advance_all(&modes, chosen, &predictor.engine.model);
+            let mut buf: Vec<u8> = Vec::new();
+            predictor.engine.model.token_to_piece_ref(chosen, &mut buf);
+            for (mode, matcher) in modes.iter().zip(matchers.iter_mut()) {
+                if let (SamplingMode::Grammar(compiled), Some(matcher)) =
+                    (mode, matcher)
+                {
+                    // Advance errors mean the prior step violated the
+                    // grammar (EOS fallback); the trace ends on EOS.
+                    let _ = matcher.advance_bytes(&compiled.grammar, &buf);
+                }
+            }
             predictor.record_choice(chosen);
         }
 
@@ -3939,11 +3945,11 @@ fn dialect_deferred_grammar_for_prompt(
     };
     let chosen: Vec<&Tool> = tools.iter().collect();
     let source = crate::dialect::grammar_source(&syntax, &chosen, &opts)?;
-    let grammar = crate::GrammarState::from_source(&source)
+    let grammar = crate::CompiledGrammar::parse(&source)
         .map_err(ToolChoiceError::from)?;
     Ok(Some(crate::DeferredGrammar {
         activate_after: triggers,
-        grammar: std::sync::Arc::new(std::sync::Mutex::new(grammar)),
+        grammar,
         feed_trigger: true,
     }))
 }
@@ -4297,24 +4303,6 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
 /// Strip trailing EOS piece and the `[Invalid UTF-8]` marker predictors emit
 /// for byte-fallback tokens at stream end. Matches what
 /// `examples/strawberry.rs` does by hand today.
-/// True iff any [`SamplingMode::Grammar`] / [`SamplingMode::Json`] in
-/// `modes` has reached its accept state. Acquires each mode's mutex
-/// once. A poisoned mutex is treated as "not complete" rather than
-/// panicking — a poisoned matcher means a prior parse error and is
-/// already a degraded state; we'd rather let normal stop machinery
-/// catch up than crash the session.
-fn any_grammar_complete(modes: &[SamplingMode]) -> bool {
-    modes.iter().any(|m| match m {
-        SamplingMode::Grammar(state) => {
-            state.lock().map(|s| s.is_complete()).unwrap_or(false)
-        }
-        SamplingMode::Json(state) => {
-            state.lock().map(|s| s.is_complete()).unwrap_or(false)
-        }
-        _ => false,
-    })
-}
-
 fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
     // A turn can close on any of the model's EOG tokens, not just the
     // primary EOS (Gemma 4 ends on `<turn|>`, Harmony on `<|return|>`
@@ -4717,7 +4705,7 @@ mod tests {
         };
         assert_eq!(deferred.activate_after, vec![b"</think>".to_vec()]);
         let state = deferred.grammar;
-        let source = state.lock().unwrap().grammar().source().to_string();
+        let source = state.source().to_string();
         assert!(
             source.contains("output_schema"),
             "expected output_config grammar, got: {source}"
@@ -4755,7 +4743,7 @@ mod tests {
         else {
             panic!("expected Single(Grammar) variant");
         };
-        let source = state.lock().unwrap().grammar().source().to_string();
+        let source = state.source().to_string();
         assert!(source.contains("output_schema"));
         assert!(source.contains("think_body"));
     }
@@ -4792,7 +4780,7 @@ mod tests {
         else {
             panic!("expected Single(Grammar) variant for tool_choice");
         };
-        let source = state.lock().unwrap().grammar().source().to_string();
+        let source = state.source().to_string();
         assert!(
             source.contains("call_0"),
             "expected tool_choice grammar, got: {source}"
@@ -4832,7 +4820,7 @@ mod tests {
         assert_eq!(deferred.activate_after, vec![b"<tool_call>\n".to_vec()]);
         assert!(deferred.feed_trigger);
         let state = deferred.grammar;
-        let source = state.lock().unwrap().grammar().source().to_string();
+        let source = state.source().to_string();
         assert!(
             source.contains("<function="),
             "expected tagged-dialect grammar, got: {source}"
@@ -4875,7 +4863,7 @@ mod tests {
         );
         assert!(deferred.feed_trigger);
         let state = deferred.grammar;
-        let source = state.lock().unwrap().grammar().source().to_string();
+        let source = state.source().to_string();
         assert!(
             source.contains("h_role_form") && source.contains("h_chan_form"),
             "expected Harmony lazy grammar, got: {source}"
@@ -4908,7 +4896,7 @@ mod tests {
         else {
             panic!("expected Single(Grammar) variant");
         };
-        let source = state.lock().unwrap().grammar().source().to_string();
+        let source = state.source().to_string();
         assert!(
             source.contains("thought_close"),
             "pre-opened root must require the reasoning close, got: {source}"

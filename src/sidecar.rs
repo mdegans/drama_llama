@@ -2,7 +2,7 @@
 //!
 //! A sidecar is a file colocated with a model on disk that overrides
 //! one aspect of how it is served: sampling defaults
-//! (`<model>.sampling.toml`, [`SampleOptions`]), the tool-call
+//! (`<model>.sampling.toml`, [`SamplerConfig`]), the tool-call
 //! dialect (`<model>.dialect.toml`,
 //! [`CallSyntax`](crate::CallSyntax)), the chat template itself
 //! (`<model>.template.jinja`, raw Jinja), or the multimodal
@@ -24,7 +24,7 @@
 //!
 //! ## What lives in a sidecar
 //!
-//! Everything in [`SampleOptions`] that is `Serialize` /
+//! Everything in [`SamplerConfig`] that is `Serialize` /
 //! `Deserialize`:
 //! - `modes` — the sampling-mode chain
 //!   ([`SamplingMode::TopP`](crate::SamplingMode::TopP),
@@ -54,7 +54,7 @@
 use std::path::Path;
 
 #[cfg(feature = "toml")]
-use crate::SampleOptions;
+use crate::SamplerConfig;
 
 /// Failure mode for sidecar I/O.
 #[derive(Debug, thiserror::Error)]
@@ -80,7 +80,7 @@ pub enum SidecarError {
 static_assertions::assert_impl_all!(SidecarError: Send, Sync);
 
 /// Read a sidecar from `path` if it exists and parse it as
-/// [`SampleOptions`].
+/// [`SamplerConfig`].
 ///
 /// Returns:
 /// - `Ok(Some(opts))` — sidecar found and parsed.
@@ -89,11 +89,11 @@ static_assertions::assert_impl_all!(SidecarError: Send, Sync);
 /// - `Err(SidecarError::Io)` — file exists but couldn't be read
 ///   (permissions, etc.).
 /// - `Err(SidecarError::Parse)` — file exists but contains malformed
-///   TOML or TOML that doesn't deserialize into [`SampleOptions`].
+///   TOML or TOML that doesn't deserialize into [`SamplerConfig`].
 #[cfg(feature = "toml")]
 pub fn load_sample_options(
     path: &Path,
-) -> Result<Option<SampleOptions>, SidecarError> {
+) -> Result<Option<SamplerConfig>, SidecarError> {
     let bytes = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -104,7 +104,7 @@ pub fn load_sample_options(
             });
         }
     };
-    let opts: SampleOptions =
+    let opts: SamplerConfig =
         toml::from_str(&bytes).map_err(|source| SidecarError::Parse {
             path: path.to_path_buf(),
             source,
@@ -112,7 +112,7 @@ pub fn load_sample_options(
     Ok(Some(opts))
 }
 
-/// Write [`SampleOptions::default()`] to `path` as TOML so the user
+/// Write [`SamplerConfig::default()`] to `path` as TOML so the user
 /// has a starting point to edit. Best-effort: if the parent dir
 /// doesn't exist or the file isn't writable, returns the underlying
 /// IO error and the caller decides whether to log + continue.
@@ -125,11 +125,11 @@ pub fn load_sample_options(
 /// [`crate::LlamaCppSession::from_path*`]: crate::crate::LlamaCppSession::from_path
 #[cfg(feature = "toml")]
 pub fn write_default_sample_options(path: &Path) -> Result<(), SidecarError> {
-    let opts = SampleOptions::default();
+    let opts = SamplerConfig::default();
     let body = toml::to_string_pretty(&opts)?;
     let header = "# drama_llama per-model sampling sidecar.\n\
          # Edit to tune sampling for this model. Delete to reset to\n\
-         # SampleOptions::default(); the next load will rewrite this\n\
+         # SamplerConfig::default(); the next load will rewrite this\n\
          # file.\n\
          #\n\
          # See drama_llama::sidecar module docs for the layout\n\
@@ -293,7 +293,7 @@ mod tests {
         // Write default, then load — should round-trip equal.
         write_default_sample_options(&path).unwrap();
         let loaded = load_sample_options(&path).unwrap().expect("file written");
-        assert_eq!(loaded, SampleOptions::default());
+        assert_eq!(loaded, SamplerConfig::default());
 
         // Cleanup.
         let _ = std::fs::remove_file(&path);

@@ -31,7 +31,7 @@
 //! a separate engine per parallel agent, not a shared hook across
 //! engines).
 
-use crate::{SampleOptions, Snapshot, SnapshotOpts, Token};
+use crate::{SamplerConfig, Snapshot, SnapshotOpts, Token};
 
 /// Per-token observer for [`crate::TokenPredictor`].
 ///
@@ -59,7 +59,7 @@ pub trait ProbeHook: Send {
 /// Per-token state passed to [`ProbeHook::on_token`].
 ///
 /// Existing-field semantics ([`Self::token`], [`Self::n_cur`],
-/// [`Self::sample_options`]) are preserved from earlier versions; the
+/// [`Self::config`]) are carried over from earlier versions; the
 /// rich fields ([`Self::snapshot`], [`Self::piece`],
 /// [`Self::generation_index`]) are populated when the hook returned
 /// `Some(SnapshotOpts)` from [`ProbeHook::snapshot_opts`].
@@ -76,14 +76,21 @@ pub struct ProbeCtx<'a> {
     /// Position the token will land at on the next decode step. Equal
     /// to the index in the prefill+generation token sequence.
     pub n_cur: usize,
-    /// Sampler chain configuration used to choose `token`. Includes
-    /// repetition penalty, sampling modes (top-k / top-p / mirostat /
-    /// grammar / etc.), and any deferred-grammar state.
+    /// Sampler chain configuration used to choose `token`: repetition
+    /// penalty, sampling modes (top-k / top-p / mirostat / grammar /
+    /// etc.), and any deferred-grammar spec. Immutable config; live
+    /// positions are in [`Self::state`].
     ///
-    /// Skipped from serde — grammar `Arc<Mutex<...>>` doesn't serialize
-    /// cleanly, and consumers who want a digest can pull it explicitly.
+    /// Skipped from serde — grammar config serializes source-only and
+    /// consumers who want a digest can pull it explicitly.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub sample_options: &'a SampleOptions,
+    pub config: &'a SamplerConfig,
+    /// Live sampler run-state at the moment `token` was chosen:
+    /// matcher positions (grammar/JSON, deferred activation), working
+    /// RNG, mirostat `mu`, n-gram stats. The replacement for probing
+    /// matcher progress through the old shared `Arc<Mutex<…>>` handles.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub state: &'a crate::SamplerState,
     /// Pre-everything candidates snapshot. `None` when the hook's
     /// [`ProbeHook::snapshot_opts`] returned `None` — predictor skipped
     /// capture. `Some` when capture ran.

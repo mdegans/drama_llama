@@ -3,105 +3,22 @@ use crate::{ngram::NGramStats, Candidates, Probability, Token};
 use rand::RngExt as _;
 
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+
 
 pub(crate) mod grammar;
 mod json;
 mod repetition;
+pub(crate) mod state;
 
 pub use grammar::{
     grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
-    Grammar, GrammarError, GrammarState, GrammarStats,
+    CompiledGrammar, Grammar, GrammarError, GrammarState, GrammarStats,
 };
 pub use json::{JsonError, JsonState};
+pub use state::SamplerState;
 pub use repetition::{
     apply_sample_repetition_ngram, RepetitionError, RepetitionOptions,
 };
-
-/// Serialize a `SamplingMode::Json` parser state.
-///
-/// Locks the mutex momentarily and delegates to [`JsonState`]'s derive. The
-/// wrapping `Arc<Mutex<…>>` is discarded on the wire — deserialization
-/// reconstructs a fresh Arc/Mutex around the decoded state.
-#[cfg(feature = "serde")]
-fn serialize_json_state<S>(
-    arc: &Arc<Mutex<JsonState>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::Serialize;
-    // If the mutex is poisoned, fall back to a fresh state. This keeps
-    // serialization from panicking in degraded conditions; the cost is that
-    // the serialized snapshot will be "fresh" instead of the actual state.
-    // Better than taking down the serializer.
-    match arc.lock() {
-        Ok(guard) => guard.serialize(serializer),
-        Err(_poison) => {
-            // Poison means a holder panicked mid-mutation. Rare and
-            // diagnostic-worthy — log at warn so it doesn't disappear
-            // into a fresh-state snapshot silently.
-            #[cfg(feature = "axum")]
-            tracing::warn!(
-                target: "drama_llama::sample",
-                "JsonState mutex poisoned during serialization; \
-                 serializing a fresh state in its place",
-            );
-            JsonState::new().serialize(serializer)
-        }
-    }
-}
-
-/// Deserialize a `SamplingMode::Json` parser state into a fresh
-/// `Arc<Mutex<JsonState>>`.
-#[cfg(feature = "serde")]
-fn deserialize_json_state<'de, D>(
-    deserializer: D,
-) -> Result<Arc<Mutex<JsonState>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    let state = JsonState::deserialize(deserializer)?;
-    Ok(Arc::new(Mutex::new(state)))
-}
-
-/// Serialize a `SamplingMode::Grammar` by writing out the GBNF source
-/// text only. The matcher's mid-parse position is NOT serialized — on
-/// deserialize a fresh matcher is constructed from the source. This
-/// mirrors how the Json variant reconstructs its `Arc<Mutex<…>>` wrapping
-/// but accepts that grammar position info is lost across reload.
-#[cfg(feature = "serde")]
-fn serialize_grammar<S>(
-    arc: &Arc<Mutex<GrammarState>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::Serialize;
-    let source = match arc.lock() {
-        Ok(guard) => guard.grammar().source().to_owned(),
-        Err(poisoned) => poisoned.into_inner().grammar().source().to_owned(),
-    };
-    source.serialize(serializer)
-}
-
-/// Deserialize a `SamplingMode::Grammar` by re-parsing the GBNF source
-/// text and constructing a fresh matcher.
-#[cfg(feature = "serde")]
-fn deserialize_grammar<'de, D>(
-    deserializer: D,
-) -> Result<Arc<Mutex<GrammarState>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::{de::Error, Deserialize};
-    let source = String::deserialize(deserializer)?;
-    let grammar = Grammar::parse(&source).map_err(D::Error::custom)?;
-    Ok(Arc::new(Mutex::new(GrammarState::new(Arc::new(grammar)))))
-}
 
 #[cfg(feature = "egui")]
 pub(crate) const DELETE_ICON: egui::ImageSource<'static> =
@@ -111,7 +28,7 @@ pub(crate) const DELETE_ICON: egui::ImageSource<'static> =
 /// Options determining how raw logits are turned into a token. This is used by
 /// [`Candidates::sample_token`] and associated functions.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SampleOptions {
+pub struct SamplerConfig {
     /// Sampling modes to apply in order. Greedy, Mirostat, and MirostatV2 are
     /// guaranteed to return a single token, so they should be the last mode.
     // TODO: There may be a way to refactor mirostat and mirostat v2 to return
@@ -125,11 +42,12 @@ pub struct SampleOptions {
     /// with any of them, including greedy.
     pub repetition: Option<RepetitionOptions>,
     /// Optional grammar that stays dormant until a byte sequence appears in
-    /// the predictor's output, then gets promoted into `modes`. Used to skip
+    /// the predictor's output, then activates (its matcher lives in
+    /// [`SamplerState`], flagged active on trigger). Used to skip
     /// grammar filtering during free-form preambles like `<think>…</think>`
-    /// and only activate it for the structured portion that follows. Not
-    /// serialized — treat as per-run wiring. See [`DeferredGrammar`].
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// and only activate it for the structured portion that follows.
+    /// See [`DeferredGrammar`].
+    #[cfg_attr(feature = "serde", serde(default))]
     pub deferred_grammar: Option<DeferredGrammar>,
     /// Sample-then-check for `Grammar`/`Json` modes: sample *without* the
     /// grammar filters, then verify just the chosen token's piece with
@@ -165,17 +83,17 @@ pub struct SampleOptions {
     /// tokenization — this bans the control token id, not the
     /// characters. Empty (the default) disables the check. Runtime
     /// wiring set by `Session` per call from the model's specials ×
-    /// the analyzed dialect; not serialized.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// the analyzed dialect.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub banned_specials: Vec<Token>,
 }
 
 /// A grammar that starts suspended and activates once a specific byte
-/// sequence appears in the predictor's generated text. Promotion is driven
+/// sequence appears in the predictor's generated text. Activation is driven
 /// by `TokenPredictor`: when the trigger is found in the accumulated output,
-/// the grammar moves into `SampleOptions::modes` and any bytes emitted after
-/// the trigger are fed into its state so the matcher lines up with the
-/// model's byte position.
+/// the matcher in [`SamplerState`] is flagged active and any bytes emitted
+/// after the trigger are fed into it so it lines up with the model's byte
+/// position.
 ///
 /// Typical use: reactor / structured-output workloads where the model emits
 /// `<think>…</think>` then JSON. The JSON grammar is the deferred one;
@@ -183,12 +101,14 @@ pub struct SampleOptions {
 /// skipped entirely, restoring pure-inference tok/s. See
 /// `src/output_config.rs` for the compiler that builds one from an
 /// `OutputConfig`.
-#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeferredGrammar {
-    /// The grammar matcher to promote (wrapped into a
-    /// `SamplingMode::Grammar` at promotion). A fresh [`GrammarState`]
-    /// is expected here — promoted grammars begin matching from root.
-    pub grammar: Arc<Mutex<GrammarState>>,
+    /// The grammar to promote. Pure spec — the matcher that starts
+    /// walking it on activation lives in [`SamplerState`], created at
+    /// `init_state` and flagged active by the predictor when a trigger
+    /// fires.
+    pub grammar: CompiledGrammar,
     /// Byte sequences (any-of) whose appearance in the predictor's
     /// accumulated text triggers promotion. Matched anywhere in the
     /// trailing window (same sizing as stop-strings), not just at the
@@ -205,23 +125,7 @@ pub struct DeferredGrammar {
     pub feed_trigger: bool,
 }
 
-// Manual because `Arc<Mutex<GrammarState>>` has no derived equality;
-// mirrors the `SamplingMode::Grammar` arm (poisoned lock compares
-// unequal). Dies with the config/state split, which stores the grammar
-// spec here instead of a live matcher.
-impl PartialEq for DeferredGrammar {
-    fn eq(&self, other: &Self) -> bool {
-        self.activate_after == other.activate_after
-            && self.feed_trigger == other.feed_trigger
-            && (Arc::ptr_eq(&self.grammar, &other.grammar)
-                || match (self.grammar.lock(), other.grammar.lock()) {
-                    (Ok(a), Ok(b)) => *a == *b,
-                    _ => false,
-                })
-    }
-}
-
-impl SampleOptions {
+impl SamplerConfig {
     /// Greedy sampling. No repetition penalty.
     pub fn greedy() -> Self {
         Self {
@@ -233,7 +137,7 @@ impl SampleOptions {
         }
     }
 
-    /// Draw [`egui::Ui`] for [`SampleOptions`] but without the outer
+    /// Draw [`egui::Ui`] for [`SamplerConfig`] but without the outer
     /// [`egui::CollapsingHeader`].
     #[cfg(feature = "egui")]
     pub fn draw_inner(&mut self, ui: &mut egui::Ui) -> egui::Response {
@@ -343,7 +247,7 @@ impl SampleOptions {
         resp
     }
 
-    /// Draw [`egui::Ui`] for [`SampleOptions`]. This lets the user add or remove
+    /// Draw [`egui::Ui`] for [`SamplerConfig`]. This lets the user add or remove
     /// sampling modes, ensuring there is always at least one. It also allows
     /// the user to set repetition options.
     #[cfg(feature = "egui")]
@@ -362,7 +266,7 @@ impl SampleOptions {
     }
 }
 
-impl Default for SampleOptions {
+impl Default for SamplerConfig {
     fn default() -> Self {
         Self {
             modes: vec![SamplingMode::locally_typical()],
@@ -375,7 +279,7 @@ impl Default for SampleOptions {
             // NOTE: chat/tool-result flows that re-emit a short token from
             // context (e.g. a digit the tool returned) now see a gentle
             // penalty; if that proves a problem, opt back out via a sidecar
-            // or `SampleOptions::greedy()`.
+            // or `SamplerConfig::greedy()`.
             repetition: Some(RepetitionOptions::default()),
             deferred_grammar: None,
             lazy_grammar: false,
@@ -385,7 +289,7 @@ impl Default for SampleOptions {
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 // TODO: add `min_keep` and `mad_keep` to all the sampling modes since it's
 // doable and it would be nice to have a more consistent API.
 pub enum SamplingMode {
@@ -546,25 +450,19 @@ pub enum SamplingMode {
     ///
     /// * **Success** — the document has been closed; the strict post-complete
     ///   rule rejects all further bytes (including whitespace, so the model
-    ///   can't burn its token budget on trailing ws). The parser is
-    ///   **auto-reset** before returning EOS, so the next generation on the
-    ///   same mode instance starts fresh.
+    ///   can't burn its token budget on trailing ws).
     /// * **Grammar violation** — the parser is mid-parse but no candidate
-    ///   token extends it. State is preserved for inspection.
+    ///   token extends it.
     ///
     /// **For generation to actually stop**, EOS must be in
     /// [`PredictOptions::stop_sequences`]. Use
-    /// [`PredictOptions::add_model_stops`] (or add EOS explicitly) —
-    /// otherwise the predictor will keep sampling past EOS and the
-    /// auto-reset will let the model emit another JSON document.
+    /// [`PredictOptions::add_model_stops`] (or add EOS explicitly).
     ///
-    /// # State sharing
+    /// # State
     ///
-    /// [`JsonState`] is wrapped in `Arc<Mutex<…>>` so cloning
-    /// `SampleOptions` keeps the parser state shared across clones (one
-    /// parser per generation). To start a fresh generation manually, either
-    /// rebuild the mode or call [`JsonState::reset`] through the mutex. The
-    /// auto-reset on success-termination covers the common case.
+    /// This variant is pure config — the JSON grammar is built in, so it
+    /// carries nothing. The parser position ([`JsonState`]) lives in
+    /// [`SamplerState`], fresh per call via `SamplerConfig::init_state`.
     ///
     /// # Placement
     ///
@@ -574,24 +472,9 @@ pub enum SamplingMode {
     /// prompt's trailing colon); trailing whitespace after the document
     /// closes is rejected (see Termination above).
     ///
-    /// # Serde
-    ///
-    /// Under `serde`, the parse state is serialized — reloading
-    /// mid-generation will resume with the parser aligned to the
-    /// already-emitted tokens.
-    ///
     /// [`PredictOptions::stop_sequences`]: crate::PredictOptions::stop_sequences
     /// [`PredictOptions::add_model_stops`]: crate::PredictOptions::add_model_stops
-    Json(
-        #[cfg_attr(
-            feature = "serde",
-            serde(
-                serialize_with = "serialize_json_state",
-                deserialize_with = "deserialize_json_state"
-            )
-        )]
-        Arc<Mutex<JsonState>>,
-    ),
+    Json,
     /// GBNF-constrained sampling. Rejects any candidate whose bytes would
     /// violate the grammar.
     ///
@@ -601,40 +484,34 @@ pub enum SamplingMode {
     /// forces a single EOS candidate. Two cases trigger this:
     ///
     /// * **Success** — the grammar has reached an accept state; all further
-    ///   tokens are rejected. The matcher is **auto-reset** before
-    ///   returning EOS, so the next generation on the same mode instance
-    ///   starts fresh.
+    ///   tokens are rejected.
     /// * **Grammar violation** — the matcher is mid-parse but no candidate
-    ///   token extends it. State is preserved for inspection.
+    ///   token extends it.
     ///
     /// **For generation to actually stop**, EOS must be in
     /// [`PredictOptions::stop_sequences`]. Use
-    /// [`PredictOptions::add_model_stops`] — otherwise the auto-reset will
-    /// let the model emit another document after EOS.
+    /// [`PredictOptions::add_model_stops`].
     ///
     /// # Construction
     ///
     /// Use [`SamplingMode::grammar`] to parse GBNF source, or
     /// [`SamplingMode::grammar_from_file`] to load a `.gbnf` file.
     ///
+    /// # State
+    ///
+    /// [`CompiledGrammar`] is pure config: compiled rules + the shared
+    /// lazy-DFA cache. The matcher position lives in [`SamplerState`],
+    /// fresh per call via `SamplerConfig::init_state`.
+    ///
     /// # Serde
     ///
-    /// Under `serde`, only the GBNF source text is serialized. On
-    /// deserialize the source is re-parsed and the matcher starts fresh —
-    /// mid-parse position is NOT preserved across reload.
+    /// Only the GBNF source text is serialized; deserialization
+    /// re-parses it (deterministic compile, so matcher positions
+    /// serialized alongside in `SamplerState` stay index-consistent).
     ///
     /// [`PredictOptions::stop_sequences`]: crate::PredictOptions::stop_sequences
     /// [`PredictOptions::add_model_stops`]: crate::PredictOptions::add_model_stops
-    Grammar(
-        #[cfg_attr(
-            feature = "serde",
-            serde(
-                serialize_with = "serialize_grammar",
-                deserialize_with = "deserialize_grammar"
-            )
-        )]
-        Arc<Mutex<GrammarState>>,
-    ),
+    Grammar(CompiledGrammar),
     /// Forbid every token id in `range` from sampling. Logits for
     /// matching candidates are dropped before downstream modes run.
     ///
@@ -692,16 +569,13 @@ impl SamplingMode {
     /// Construct a fresh JSON-constrained sampling mode at the root of a
     /// document.
     pub fn json() -> Self {
-        Self::Json(Arc::new(Mutex::new(JsonState::new())))
+        Self::Json
     }
 
     /// Construct a GBNF-constrained sampling mode from a GBNF source
     /// string. Returns the parse error if the grammar is malformed.
     pub fn grammar(source: &str) -> Result<Self, GrammarError> {
-        let grammar = Arc::new(Grammar::parse(source)?);
-        Ok(Self::Grammar(Arc::new(Mutex::new(GrammarState::new(
-            grammar,
-        )))))
+        Ok(Self::Grammar(CompiledGrammar::parse(source)?))
     }
 
     /// Construct a GBNF-constrained sampling mode by loading a `.gbnf`
@@ -709,10 +583,7 @@ impl SamplingMode {
     pub fn grammar_from_file(
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, GrammarError> {
-        let grammar = Arc::new(Grammar::from_file(path)?);
-        Ok(Self::Grammar(Arc::new(Mutex::new(GrammarState::new(
-            grammar,
-        )))))
+        Ok(Self::Grammar(CompiledGrammar::from_file(path)?))
     }
 
     /// The name of the sampling mode.
@@ -729,7 +600,7 @@ impl SamplingMode {
             Self::MirostatV2 { .. } => "Mirostat V2",
             Self::SplitP { .. } => "Split P",
             Self::SplitL { .. } => "Split L",
-            Self::Json(_) => "JSON",
+            Self::Json => "JSON",
             Self::Grammar(_) => "Grammar",
             Self::Deny { .. } => "Deny",
         }
@@ -749,7 +620,7 @@ impl SamplingMode {
             Self::MirostatV2 { .. } => "Mirostat v2 sampling. Described here: https://arxiv.org/pdf/2007.14966.pdf",
             Self::SplitP { .. } => "Cuts off the tail where the difference between adjacent probabilities is greatest.",
             Self::SplitL { .. } => "Cuts off the tail where the difference between adjacent logits is greatest.",
-            Self::Json(_) => "Constrains generation to valid JSON. Place early in the chain so it prunes candidates before top-p/top-k. On grammar violation, forces EOS and terminates.",
+            Self::Json => "Constrains generation to valid JSON. Place early in the chain so it prunes candidates before top-p/top-k. On grammar violation, forces EOS and terminates.",
             Self::Grammar(_) => "Constrains generation to a GBNF grammar. Place early in the chain so it prunes candidates before top-p/top-k. On grammar violation, forces EOS and terminates.",
             Self::Deny { .. } => "Forbids every candidate whose token id falls in `range`. Place at the start of the chain — typically used for the model's reserved/empty-piece vocab tail.",
         }
@@ -998,63 +869,17 @@ impl SamplingMode {
 
                 inner
             }
-            Self::Json(state) => {
-                let (complete, depth) = match state.lock() {
-                    Ok(s) => (s.is_complete(), s.stack_depth()),
-                    Err(_) => (false, 0),
-                };
-                let status = if complete {
-                    "JSON: complete".to_string()
-                } else {
-                    format!("JSON: in progress (depth {depth})")
-                };
-                let resp = ui.label(status).on_hover_text_at_pointer(
-                    "JSON grammar constraint. Filters candidates to those that keep output valid JSON. On violation, forces EOS.",
-                );
-                if ui
-                    .button("Reset parser")
+            Self::Json => ui
+                .label("JSON grammar (built in)")
+                .on_hover_text_at_pointer(
+                    "JSON grammar constraint. Filters candidates to those that keep output valid JSON. On violation, forces EOS. Live parser position is per-call state, not shown here.",
+                ),
+            Self::Grammar(compiled) => {
+                let rule_count = compiled.grammar.rule_count();
+                ui.label(format!("Grammar ({rule_count} rules)"))
                     .on_hover_text_at_pointer(
-                        "Restart the parser at the root of a new document.",
+                        "GBNF grammar constraint. Filters candidates to those that extend the grammar. On violation, forces EOS. Live matcher position is per-call state, not shown here.",
                     )
-                    .clicked()
-                {
-                    if let Ok(mut s) = state.lock() {
-                        s.reset();
-                    }
-                }
-                resp
-            }
-            Self::Grammar(state) => {
-                let (complete, depth, rule_count) = match state.lock() {
-                    Ok(s) => (
-                        s.is_complete(),
-                        s.stack_depth(),
-                        s.grammar().rule_count(),
-                    ),
-                    Err(_) => (false, 0, 0),
-                };
-                let status = if complete {
-                    format!("Grammar: complete ({rule_count} rules)")
-                } else {
-                    format!(
-                        "Grammar: in progress ({depth} active, {rule_count} rules)"
-                    )
-                };
-                let resp = ui.label(status).on_hover_text_at_pointer(
-                    "GBNF grammar constraint. Filters candidates to those that extend the grammar. On violation, forces EOS.",
-                );
-                if ui
-                    .button("Reset matcher")
-                    .on_hover_text_at_pointer(
-                        "Restart the matcher at the root rule.",
-                    )
-                    .clicked()
-                {
-                    if let Ok(mut s) = state.lock() {
-                        s.reset();
-                    }
-                }
-                resp
             }
             Self::Deny { range } => {
                 ui.label(format!(
@@ -1093,123 +918,6 @@ impl Default for SamplingMode {
     }
 }
 
-impl PartialEq for SamplingMode {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Greedy, Self::Greedy) => true,
-            (Self::Temperature { t: t1 }, Self::Temperature { t: t2 }) => {
-                t1 == t2
-            }
-            (
-                Self::TopP {
-                    p: p1,
-                    min_keep: k1,
-                },
-                Self::TopP {
-                    p: p2,
-                    min_keep: k2,
-                },
-            ) => p1 == p2 && k1 == k2,
-            (Self::TopK { k: k1 }, Self::TopK { k: k2 }) => k1 == k2,
-            (
-                Self::MinP {
-                    p: p1,
-                    min_keep: k1,
-                },
-                Self::MinP {
-                    p: p2,
-                    min_keep: k2,
-                },
-            ) => p1 == p2 && k1 == k2,
-            (
-                Self::TailFree {
-                    z: z1,
-                    min_keep: k1,
-                },
-                Self::TailFree {
-                    z: z2,
-                    min_keep: k2,
-                },
-            ) => z1 == z2 && k1 == k2,
-            (
-                Self::LocallyTypical {
-                    p: p1,
-                    min_keep: k1,
-                },
-                Self::LocallyTypical {
-                    p: p2,
-                    min_keep: k2,
-                },
-            ) => p1 == p2 && k1 == k2,
-            (
-                Self::Mirostat {
-                    tau: t1,
-                    eta: e1,
-                    max_keep: m1,
-                },
-                Self::Mirostat {
-                    tau: t2,
-                    eta: e2,
-                    max_keep: m2,
-                },
-            ) => t1 == t2 && e1 == e2 && m1 == m2,
-            (
-                Self::MirostatV2 {
-                    tau: t1,
-                    eta: e1,
-                    max_keep: m1,
-                },
-                Self::MirostatV2 {
-                    tau: t2,
-                    eta: e2,
-                    max_keep: m2,
-                },
-            ) => t1 == t2 && e1 == e2 && m1 == m2,
-            (
-                Self::SplitP {
-                    min_keep: a1,
-                    max_keep: b1,
-                },
-                Self::SplitP {
-                    min_keep: a2,
-                    max_keep: b2,
-                },
-            ) => a1 == a2 && b1 == b2,
-            (
-                Self::SplitL {
-                    min_keep: a1,
-                    max_keep: b1,
-                },
-                Self::SplitL {
-                    min_keep: a2,
-                    max_keep: b2,
-                },
-            ) => a1 == a2 && b1 == b2,
-            // Two `Json` variants compare equal if they share the same Arc
-            // (identity) OR if their locked states are structurally equal. A
-            // poisoned mutex compares unequal — we can't safely inspect it.
-            (Self::Json(a), Self::Json(b)) => {
-                if Arc::ptr_eq(a, b) {
-                    return true;
-                }
-                match (a.lock(), b.lock()) {
-                    (Ok(a), Ok(b)) => *a == *b,
-                    _ => false,
-                }
-            }
-            (Self::Grammar(a), Self::Grammar(b)) => {
-                if Arc::ptr_eq(a, b) {
-                    return true;
-                }
-                match (a.lock(), b.lock()) {
-                    (Ok(a), Ok(b)) => *a == *b,
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
-    }
-}
 
 #[derive(Debug, thiserror::Error, derive_more::From)]
 pub enum SampleError {
@@ -1219,14 +927,54 @@ pub enum SampleError {
 
 static_assertions::assert_impl_all!(SampleError: Send, Sync);
 
+/// Construction of a fresh [`SamplerState`] from the effective config —
+/// the sole constructor (config is the authority; the only other door
+/// is validated deserialization).
+impl SamplerConfig {
+    /// Build the per-call run-state this config implies: fresh matchers
+    /// at each grammar's root, an inactive deferred matcher when a
+    /// deferred grammar is configured, a seeded working RNG, empty
+    /// n-gram stats, and the resolved repetition ignore set.
+    pub fn init_state<M: crate::backend::Model>(
+        &self,
+        seed: u128,
+        model: &M,
+    ) -> SamplerState {
+        use crate::sample::state::{DeferredMatcher, MatcherState};
+        SamplerState {
+            matchers: self
+                .modes
+                .iter()
+                .map(|m| match m {
+                    SamplingMode::Grammar(compiled) => {
+                        MatcherState::Grammar(compiled.root_state())
+                    }
+                    SamplingMode::Json => MatcherState::Json(JsonState::new()),
+                    _ => MatcherState::Stateless,
+                })
+                .collect(),
+            deferred: self.deferred_grammar.as_ref().map(|d| DeferredMatcher {
+                active: false,
+                matcher: d.grammar.root_state(),
+            }),
+            mu: None,
+            rng: rand_pcg::Pcg64Mcg::new(seed),
+            ngram_stats: NGramStats::new(),
+            resolved_ignored: self
+                .repetition
+                .as_ref()
+                .map(|r| r.resolved_ignored(model))
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// Sample a token from the candidates.
 pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     tokens: &[Token],
     mut candidates: Candidates,
-    opts: &mut SampleOptions,
-    freq_map: &mut NGramStats,
-    rng: &mut rand_pcg::Pcg64Mcg,
-    mu: &mut Option<f32>,
+    opts: &SamplerConfig,
+    state: &mut SamplerState,
     model: &M,
 ) -> Result<Token, SampleError> {
     // Suspend the repetition penalty while any byte-constraint in the
@@ -1242,38 +990,33 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // inside the second parameter value until `max_tokens` (greedy
     // was immune; its margins dwarf the penalty). Anti-degeneration
     // heuristics are for free prose; the constraint owns the shape
-    // here. Side effect (accepted, arguably desirable): `freq_map`
+    // here. Side effect (accepted, arguably desirable): stats
     // ingestion lives inside the penalty pass, so tokens emitted
     // during the constrained span never enter the stats — structural
     // markers don't seed penalties against later prose. Free-running
     // spans before a lazy trigger and after completion are penalized
     // as usual.
-    let constrained_incomplete = opts.modes.iter().any(|m| match m {
-        SamplingMode::Grammar(state) => {
-            state.lock().map(|s| !s.is_complete()).unwrap_or(false)
-        }
-        SamplingMode::Json(state) => {
-            state.lock().map(|s| !s.is_complete()).unwrap_or(false)
-        }
-        _ => false,
-    });
-
-    // Apply any repetition penalties to the candidates. This also applies the
-    // softmax and sorts the candidates by logit where the most likely token is
-    // first.
-    if !constrained_incomplete {
-        if let Some(repetition) = &mut opts.repetition {
+    if !state.constrained_incomplete() {
+        if let Some(repetition) = &opts.repetition {
+            // Split borrow: the pass reads the resolved ignore set and
+            // mutates the stats accumulator — disjoint state fields.
+            let SamplerState {
+                ngram_stats,
+                resolved_ignored,
+                ..
+            } = &mut *state;
             candidates = apply_sample_repetition_ngram(
-                candidates, tokens, repetition, freq_map, model,
+                candidates,
+                tokens,
+                repetition,
+                resolved_ignored,
+                ngram_stats,
             )?;
         }
     }
 
-    let lazy = opts.lazy_grammar
-        && opts.modes.iter().any(|m| {
-            matches!(m, SamplingMode::Json(_) | SamplingMode::Grammar(_))
-        });
-    let banned = opts.banned_specials.clone();
+    let lazy = opts.lazy_grammar && state.has_active_constraint();
+    let banned = opts.banned_specials.as_slice();
 
     // Fallback snapshots (lazy-grammar check and/or emit-side specials
     // ban): `Pcg64Mcg` is a single `u128` of state (Clone), `mu` is a
@@ -1283,13 +1026,13 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // a fixed seed yields the same stream every run regardless of how
     // many checks fall back.
     let snapshot = if lazy || !banned.is_empty() {
-        Some((rng.clone(), *mu, candidates.clone()))
+        Some((state.rng.clone(), state.mu, candidates.clone()))
     } else {
         None
     };
 
-    let filtered = apply_modes(candidates, opts, rng, mu, model, lazy);
-    let mut chosen = choose_candidate(rng, filtered.softmax(None))
+    let filtered = apply_modes(candidates, opts, state, model, lazy);
+    let mut chosen = choose_candidate(&mut state.rng, filtered.softmax(None))
         .is_one()
         .unwrap()
         .id;
@@ -1307,41 +1050,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
         // the same policy vocab-wide, reaching force-EOS termination
         // when nothing legal remains.
         let t0 = grammar::grammar_stats_enabled().then(std::time::Instant::now);
-        let mut buf: Vec<u8> = Vec::with_capacity(32);
-        model.token_to_piece_ref(chosen, &mut buf);
-        let chosen_is_eog = model.eog_tokens().contains(&chosen);
-        let legal = opts.modes.iter().all(|mode| match mode {
-            SamplingMode::Json(state) => {
-                let state = state.lock().expect(
-                    "SamplingMode::Json mutex poisoned; parser state is \
-                     unrecoverable. Rebuild the mode with \
-                     SamplingMode::json() and retry.",
-                );
-                !buf.is_empty()
-                    && if chosen_is_eog && !state.is_complete() {
-                        // Mid-parse EOG survives only when its own
-                        // bytes finish the constraint (dialect exit
-                        // markers, see `grammar_filter`).
-                        state.completes_with(&buf)
-                    } else {
-                        state.accepts_bytes(&buf)
-                    }
-            }
-            SamplingMode::Grammar(state) => {
-                let state = state.lock().expect(
-                    "SamplingMode::Grammar mutex poisoned; matcher state \
-                     is unrecoverable. Rebuild the mode with \
-                     SamplingMode::grammar(...) and retry.",
-                );
-                !buf.is_empty()
-                    && if chosen_is_eog && !state.is_complete() {
-                        state.completes_with(&buf)
-                    } else {
-                        state.accepts_bytes(&buf)
-                    }
-            }
-            _ => true,
-        });
+        let legal = state.accepts_chosen(opts, chosen, model);
         if let Some(t0) = t0 {
             grammar::record_lazy(legal, t0.elapsed().as_micros() as u64);
         }
@@ -1350,11 +1059,11 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
             // masked path, grammar filters included — with the forced-EOS
             // termination those filters provide when nothing legal
             // remains.
-            *rng = rng_snap.clone();
-            *mu = *mu_snap;
+            state.rng = rng_snap.clone();
+            state.mu = *mu_snap;
             let filtered =
-                apply_modes(saved.clone(), opts, rng, mu, model, false);
-            chosen = choose_candidate(rng, filtered.softmax(None))
+                apply_modes(saved.clone(), opts, state, model, false);
+            chosen = choose_candidate(&mut state.rng, filtered.softmax(None))
                 .is_one()
                 .unwrap()
                 .id;
@@ -1370,10 +1079,11 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // resample IS the mask, applied before anything commits, and a
     // vacuously-empty candidate set forces EOS exactly like
     // `SamplingMode::Deny`.
+    let banned = opts.banned_specials.as_slice();
     if !banned.is_empty() && banned.binary_search(&chosen).is_ok() {
         if let Some((rng_snap, mu_snap, saved)) = snapshot {
-            *rng = rng_snap;
-            *mu = mu_snap;
+            state.rng = rng_snap;
+            state.mu = mu_snap;
             let kept: Vec<crate::TokenData> = saved
                 .as_slice()
                 .iter()
@@ -1389,100 +1099,108 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
             } else {
                 Candidates::from_vec_unchecked(kept)
             };
-            let filtered = apply_modes(cleaned, opts, rng, mu, model, false);
-            chosen = choose_candidate(rng, filtered.softmax(None))
+            let filtered = apply_modes(cleaned, opts, state, model, false);
+            chosen = choose_candidate(&mut state.rng, filtered.softmax(None))
                 .is_one()
                 .unwrap()
                 .id;
         }
     }
 
-    // Post-selection: advance every JSON and grammar parser in the chain
-    // by the chosen token. Multiple grammar constraints in the chain all
-    // observe the same chosen token and advance in lockstep.
-    json::advance_all(&opts.modes, chosen, model);
-    grammar::advance_all(&opts.modes, chosen, model);
+    // Post-selection: advance every constraint matcher (including an
+    // activated deferred grammar) by the chosen token. Multiple
+    // constraints all observe the same chosen token and advance in
+    // lockstep.
+    state.advance(opts, chosen, model);
 
     Ok(chosen)
 }
 
-/// Fold `candidates` through `opts.modes` in order. With
-/// `skip_constraints`, the `Grammar`/`Json` arms pass candidates through
-/// untouched (the lazy fast path); every other mode still runs, so `Deny`
-/// reserved-token protection, truncation samplers, and mirostat behave
-/// identically on both paths.
+/// Fold `candidates` through `opts.modes` in order (plus the activated
+/// deferred grammar, if any — it runs last, matching its old
+/// pushed-to-the-end promotion position). With `skip_constraints`, the
+/// `Grammar`/`Json` arms pass candidates through untouched (the lazy
+/// fast path); every other mode still runs, so `Deny` reserved-token
+/// protection, truncation samplers, and mirostat behave identically on
+/// both paths.
 fn apply_modes<M: crate::backend::Model + Sync>(
     candidates: Candidates,
-    opts: &SampleOptions,
-    rng: &mut rand_pcg::Pcg64Mcg,
-    mu: &mut Option<f32>,
+    opts: &SamplerConfig,
+    state: &mut SamplerState,
     model: &M,
     skip_constraints: bool,
 ) -> Candidates {
-    // `Arc::clone` on `SamplingMode::Json` is cheap and preserves shared-state
-    // semantics across the fold — the cloned Arc still points at the same
-    // Mutex that the advance-step in `sample_token` will update.
-    opts.modes
+    use crate::sample::state::MatcherState;
+    debug_assert_eq!(opts.modes.len(), state.matchers.len());
+    // Split borrow: matchers are read by the constraint arms while
+    // rng/mu feed mirostat — disjoint fields of the same state.
+    let SamplerState {
+        matchers,
+        deferred,
+        mu,
+        rng,
+        ..
+    } = &mut *state;
+    let mut candidates = opts
+        .modes
         .iter()
-        .cloned()
-        .fold(candidates, |candidates, mode| {
+        .zip(matchers.iter())
+        .fold(candidates, |candidates, (mode, matcher)| {
             if skip_constraints
                 && matches!(
                     mode,
-                    SamplingMode::Json(_) | SamplingMode::Grammar(_)
+                    SamplingMode::Json | SamplingMode::Grammar(_)
                 )
             {
                 return candidates;
             }
-            match mode {
-                SamplingMode::Greedy => candidates.sample_token_greedy(),
-                SamplingMode::Temperature { t } => candidates.temperature(t),
-                SamplingMode::TopP { p, min_keep } => {
-                    candidates.top_p(p, min_keep)
+            match (mode, matcher) {
+                (SamplingMode::Greedy, _) => candidates.sample_token_greedy(),
+                (SamplingMode::Temperature { t }, _) => {
+                    candidates.temperature(*t)
                 }
-                SamplingMode::TopK { k } => candidates.top_k(k),
-                SamplingMode::MinP { p, min_keep } => {
-                    candidates.min_p(p, min_keep)
+                (SamplingMode::TopP { p, min_keep }, _) => {
+                    candidates.top_p(*p, *min_keep)
                 }
-                SamplingMode::TailFree { z, min_keep } => {
-                    candidates.tail_free(z, min_keep)
+                (SamplingMode::TopK { k }, _) => candidates.top_k(*k),
+                (SamplingMode::MinP { p, min_keep }, _) => {
+                    candidates.min_p(*p, *min_keep)
                 }
-                SamplingMode::LocallyTypical { p, min_keep } => {
-                    candidates.locally_typical(p, min_keep)
+                (SamplingMode::TailFree { z, min_keep }, _) => {
+                    candidates.tail_free(*z, *min_keep)
                 }
-                SamplingMode::Mirostat { tau, eta, max_keep } => {
-                    candidates.mirostat(rng, tau, eta, max_keep, mu)
+                (SamplingMode::LocallyTypical { p, min_keep }, _) => {
+                    candidates.locally_typical(*p, *min_keep)
                 }
-                SamplingMode::MirostatV2 { tau, eta, max_keep } => {
-                    candidates.mirostat_v2(rng, tau, eta, max_keep, mu)
+                (SamplingMode::Mirostat { tau, eta, max_keep }, _) => {
+                    candidates.mirostat(rng, *tau, *eta, *max_keep, mu)
                 }
-                SamplingMode::SplitP { min_keep, max_keep } => {
-                    candidates.split_p(min_keep, max_keep)
+                (SamplingMode::MirostatV2 { tau, eta, max_keep }, _) => {
+                    candidates.mirostat_v2(rng, *tau, *eta, *max_keep, mu)
                 }
-                SamplingMode::SplitL { min_keep, max_keep } => {
-                    candidates.split_l(min_keep, max_keep)
+                (SamplingMode::SplitP { min_keep, max_keep }, _) => {
+                    candidates.split_p(*min_keep, *max_keep)
                 }
-                SamplingMode::Json(state) => {
-                    // A poisoned mutex here means a prior panic occurred
-                    // while advancing the parser — the state is unknown,
-                    // so silently emitting non-JSON would violate the
-                    // `SamplingMode::Json` contract. Fail fast instead.
-                    let mut locked = state.lock().expect(
-                        "SamplingMode::Json mutex poisoned; parser state \
-                         is unrecoverable. Rebuild the mode with \
-                         SamplingMode::json() and retry.",
-                    );
-                    json::json_filter(candidates, &mut locked, model)
+                (SamplingMode::SplitL { min_keep, max_keep }, _) => {
+                    candidates.split_l(*min_keep, *max_keep)
                 }
-                SamplingMode::Grammar(state) => {
-                    let mut locked = state.lock().expect(
-                        "SamplingMode::Grammar mutex poisoned; matcher \
-                         state is unrecoverable. Rebuild the mode with \
-                         SamplingMode::grammar(...) and retry.",
-                    );
-                    grammar::grammar_filter(candidates, &mut locked, model)
+                (SamplingMode::Json, MatcherState::Json(parser)) => {
+                    json::json_filter(candidates, parser, model)
                 }
-                SamplingMode::Deny { range } => {
+                (
+                    SamplingMode::Grammar(compiled),
+                    MatcherState::Grammar(matcher),
+                ) => grammar::grammar_filter(
+                    candidates, compiled, matcher, model,
+                ),
+                (SamplingMode::Json, _) | (SamplingMode::Grammar(_), _) => {
+                    // Config/state kind mismatch: impossible via
+                    // init_state; deserialized state is validated
+                    // before use. Pass through rather than panic.
+                    debug_assert!(false, "matcher/mode kind mismatch");
+                    candidates
+                }
+                (SamplingMode::Deny { range }, _) => {
                     let kept: Vec<crate::TokenData> = candidates
                         .as_slice()
                         .iter()
@@ -1502,7 +1220,22 @@ fn apply_modes<M: crate::backend::Model + Sync>(
                     }
                 }
             }
-        })
+        });
+    if !skip_constraints {
+        if let (Some(d), Some(spec)) =
+            (deferred.as_ref(), opts.deferred_grammar.as_ref())
+        {
+            if d.active {
+                candidates = grammar::grammar_filter(
+                    candidates,
+                    &spec.grammar,
+                    &d.matcher,
+                    model,
+                );
+            }
+        }
+    }
+    candidates
 }
 
 /// Apply the softmax function to the remaining candidates and select a single
@@ -1537,7 +1270,7 @@ pub(crate) fn choose_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ngram::NGramStats, Token, TokenData};
+    use crate::{Token, TokenData};
     use rand::Rng as _;
 
     /// Minimal `Model` for exercising `sample_token` without a GGUF on
@@ -1613,15 +1346,15 @@ mod tests {
     /// `root ::= "ab"` — accepts exactly the string "ab".
     const AB_GRAMMAR: &str = r#"root ::= "ab""#;
 
-    fn opts_with_grammar(lazy: bool) -> SampleOptions {
-        SampleOptions {
+    fn opts_with_grammar(lazy: bool) -> SamplerConfig {
+        SamplerConfig {
             modes: vec![
                 SamplingMode::grammar(AB_GRAMMAR).expect("test grammar parses")
             ],
             repetition: None,
             deferred_grammar: None,
             lazy_grammar: lazy,
-            ..SampleOptions::default()
+            ..SamplerConfig::default()
         }
     }
 
@@ -1635,19 +1368,35 @@ mod tests {
         )
     }
 
-    fn rng() -> rand_pcg::Pcg64Mcg {
-        rand_pcg::Pcg64Mcg::new((1337u128 << 64) | 42)
+    const TEST_SEED: u128 = (1337u128 << 64) | 42;
+
+    fn state_for(opts: &SamplerConfig) -> SamplerState {
+        opts.init_state(TEST_SEED, &MockModel)
     }
 
     fn sample(
         candidates: Candidates,
-        opts: &mut SampleOptions,
-        rng: &mut rand_pcg::Pcg64Mcg,
-        mu: &mut Option<f32>,
+        opts: &SamplerConfig,
+        state: &mut SamplerState,
     ) -> Token {
-        let mut freq = NGramStats::new();
-        sample_token(&[], candidates, opts, &mut freq, rng, mu, &MockModel)
+        sample_token(&[], candidates, opts, state, &MockModel)
             .expect("sample_token")
+    }
+
+    /// True iff the (single) grammar matcher accepts `bytes` from its
+    /// current position.
+    fn grammar_accepts(
+        opts: &SamplerConfig,
+        state: &SamplerState,
+        bytes: &[u8],
+    ) -> bool {
+        use crate::sample::state::MatcherState;
+        match (&opts.modes[0], &state.matchers[0]) {
+            (SamplingMode::Grammar(compiled), MatcherState::Grammar(s)) => {
+                s.accepts_bytes(&compiled.grammar, bytes)
+            }
+            _ => unreachable!("first mode is not a grammar"),
+        }
     }
 
     /// Emit-side special-token ban (#31 item 9): a banned sampled id
@@ -1656,41 +1405,35 @@ mod tests {
     /// forces EOS.
     #[test]
     fn banned_specials_masked_resample() {
-        let mut opts = SampleOptions {
+        let opts = SamplerConfig {
             modes: vec![SamplingMode::Greedy],
             repetition: None,
             deferred_grammar: None,
             lazy_grammar: false,
-            banned_specials: vec![X].into(),
+            banned_specials: vec![X],
         };
-        let mut r = rng();
-        let mut mu = None;
+        let mut state = state_for(&opts);
 
         // Banned winner is masked; next-best is sampled instead.
-        let picked = sample(
-            cands(&[(X, 10.0), (A, 5.0), (B, 1.0)]),
-            &mut opts,
-            &mut r,
-            &mut mu,
-        );
+        let picked =
+            sample(cands(&[(X, 10.0), (A, 5.0), (B, 1.0)]), &opts, &mut state);
         assert_eq!(picked, A, "banned winner must be masked, not surfaced");
 
         // Non-banned winner passes untouched.
-        let picked =
-            sample(cands(&[(A, 10.0), (X, 5.0)]), &mut opts, &mut r, &mut mu);
+        let picked = sample(cands(&[(A, 10.0), (X, 5.0)]), &opts, &mut state);
         assert_eq!(picked, A);
 
         // Every candidate banned → forced EOS (Deny semantics), so
         // generation terminates instead of deadlocking.
-        let mut opts = SampleOptions {
+        let opts = SamplerConfig {
             modes: vec![SamplingMode::Greedy],
             repetition: None,
             deferred_grammar: None,
             lazy_grammar: false,
-            banned_specials: vec![A, B, C, X].into(),
+            banned_specials: vec![A, B, C, X],
         };
-        let picked =
-            sample(cands(&[(A, 10.0), (X, 5.0)]), &mut opts, &mut r, &mut mu);
+        let mut state = state_for(&opts);
+        let picked = sample(cands(&[(A, 10.0), (X, 5.0)]), &opts, &mut state);
         assert_eq!(picked, EOS);
     }
 
@@ -1702,17 +1445,12 @@ mod tests {
     #[test]
     fn banned_specials_with_grammar_terminates() {
         let mut opts = opts_with_grammar(false);
-        opts.banned_specials = vec![A].into();
-        let mut r = rng();
-        let mut mu = None;
+        opts.banned_specials = vec![A];
+        let mut state = state_for(&opts);
         // Grammar "ab" requires A first; A is banned → masked rerun
         // has no legal candidate → force-EOS.
-        let picked = sample(
-            cands(&[(A, 10.0), (B, 5.0), (X, 1.0)]),
-            &mut opts,
-            &mut r,
-            &mut mu,
-        );
+        let picked =
+            sample(cands(&[(A, 10.0), (B, 5.0), (X, 1.0)]), &opts, &mut state);
         assert_eq!(picked, EOS);
     }
 
@@ -1733,23 +1471,20 @@ mod tests {
     fn lazy_fast_path_matches_masked_on_legal_picks() {
         let mut results: Vec<Vec<Token>> = Vec::new();
         for lazy in [false, true] {
-            let mut opts = opts_with_grammar(lazy);
-            let mut r = rng();
-            let mut mu = None;
+            let opts = opts_with_grammar(lazy);
+            let mut state = state_for(&opts);
             let mut toks = Vec::new();
             // "a" then "b" dominate in turn; both legal under the grammar
             // at their step.
             toks.push(sample(
                 cands(&[(A, 20.0), (X, 0.0), (EOS, -20.0)]),
-                &mut opts,
-                &mut r,
-                &mut mu,
+                &opts,
+                &mut state,
             ));
             toks.push(sample(
                 cands(&[(B, 20.0), (X, 0.0), (EOS, -20.0)]),
-                &mut opts,
-                &mut r,
-                &mut mu,
+                &opts,
+                &mut state,
             ));
             results.push(toks);
         }
@@ -1764,17 +1499,15 @@ mod tests {
     fn lazy_fallback_matches_masked_path_exactly() {
         let mut results: Vec<(Token, u64)> = Vec::new();
         for lazy in [false, true] {
-            let mut opts = opts_with_grammar(lazy);
-            let mut r = rng();
-            let mut mu = None;
+            let opts = opts_with_grammar(lazy);
+            let mut state = state_for(&opts);
             // "x" dominates but is illegal; "a" is the legal pick.
             let tok = sample(
                 cands(&[(X, 20.0), (A, 10.0), (EOS, -20.0)]),
-                &mut opts,
-                &mut r,
-                &mut mu,
+                &opts,
+                &mut state,
             );
-            results.push((tok, r.next_u64()));
+            results.push((tok, state.rng.next_u64()));
         }
         assert_eq!(results[0].0, A);
         assert_eq!(results[0], results[1]);
@@ -1782,34 +1515,31 @@ mod tests {
 
     /// After the grammar completes, a lazy sample whose candidates hold
     /// no legal (or empty) piece must fall back into the filter's
-    /// forced-EOS termination, and the auto-reset must leave the matcher
-    /// fresh.
+    /// forced-EOS termination. The matcher stays complete — the old
+    /// auto-reset-for-the-next-generation died with the config/state
+    /// split (fresh state per call via `init_state` replaces it).
     #[test]
-    fn lazy_completion_forces_eos_and_resets() {
-        let mut opts = opts_with_grammar(true);
-        let mut r = rng();
-        let mut mu = None;
+    fn lazy_completion_forces_eos_and_stays_complete() {
+        let opts = opts_with_grammar(true);
+        let mut state = state_for(&opts);
         assert_eq!(
-            sample(cands(&[(A, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state),
             A
         );
         assert_eq!(
-            sample(cands(&[(B, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            sample(cands(&[(B, 20.0), (X, 0.0)]), &opts, &mut state),
             B
         );
         // Grammar complete; only non-empty illegal pieces on offer.
         assert_eq!(
-            sample(cands(&[(C, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            sample(cands(&[(C, 20.0), (X, 0.0)]), &opts, &mut state),
             EOS
         );
-        // The filter auto-reset on completion: the matcher accepts "a"
-        // again from root.
-        match &opts.modes[0] {
-            SamplingMode::Grammar(state) => {
-                assert!(state.lock().unwrap().accepts_bytes(b"a"));
-            }
-            _ => unreachable!(),
-        }
+        // No auto-reset: the matcher remains at accept.
+        assert!(state.grammar_complete());
+        // A fresh state from the same config starts at root again.
+        let fresh = state_for(&opts);
+        assert!(grammar_accepts(&opts, &fresh, b"a"));
     }
 
     /// Empty pieces are rejected mid-grammar on both paths: an active
@@ -1824,17 +1554,12 @@ mod tests {
     #[test]
     fn lazy_rejects_empty_piece_mid_grammar() {
         for lazy in [true, false] {
-            let mut opts = opts_with_grammar(lazy);
-            let mut r = rng();
-            let mut mu = None;
+            let opts = opts_with_grammar(lazy);
+            let mut state = state_for(&opts);
             // EOS (empty piece) dominates mid-grammar; "a" is the
             // byte-legal pick and must win on both paths.
-            let tok = sample(
-                cands(&[(EOS, 20.0), (A, 0.0)]),
-                &mut opts,
-                &mut r,
-                &mut mu,
-            );
+            let tok =
+                sample(cands(&[(EOS, 20.0), (A, 0.0)]), &opts, &mut state);
             assert_eq!(tok, A, "lazy={lazy}");
         }
     }
@@ -1851,25 +1576,15 @@ mod tests {
     #[test]
     fn eog_with_byte_legal_piece_rejected_mid_grammar() {
         for lazy in [true, false] {
-            let mut opts = opts_with_grammar(lazy);
-            let mut r = rng();
-            let mut mu = None;
+            let opts = opts_with_grammar(lazy);
+            let mut state = state_for(&opts);
             // EOG_A's piece is "a" — exactly what the "ab" grammar
             // wants next — but it must lose to the real "a" token.
-            let tok = sample(
-                cands(&[(EOG_A, 20.0), (A, 0.0)]),
-                &mut opts,
-                &mut r,
-                &mut mu,
-            );
+            let tok =
+                sample(cands(&[(EOG_A, 20.0), (A, 0.0)]), &opts, &mut state);
             assert_eq!(tok, A, "lazy={lazy}");
             // The matcher advanced by "a" exactly once: "b" completes.
-            match &opts.modes[0] {
-                SamplingMode::Grammar(state) => {
-                    assert!(state.lock().unwrap().accepts_bytes(b"b"));
-                }
-                _ => unreachable!(),
-            }
+            assert!(grammar_accepts(&opts, &state, b"b"));
         }
     }
 
@@ -1882,16 +1597,10 @@ mod tests {
     #[test]
     fn eog_kept_when_piece_completes_constraint() {
         for lazy in [false, true] {
-            let mut opts = opts_with_grammar(lazy);
-            let mut r = rng();
-            let mut mu = None;
+            let opts = opts_with_grammar(lazy);
+            let mut state = state_for(&opts);
             assert_eq!(
-                sample(
-                    cands(&[(A, 20.0), (X, 0.0)]),
-                    &mut opts,
-                    &mut r,
-                    &mut mu
-                ),
+                sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state),
                 A,
                 "lazy={lazy}"
             );
@@ -1900,9 +1609,8 @@ mod tests {
             assert_eq!(
                 sample(
                     cands(&[(EOG_B, 20.0), (B, 0.0), (X, -20.0)]),
-                    &mut opts,
-                    &mut r,
-                    &mut mu
+                    &opts,
+                    &mut state
                 ),
                 EOG_B,
                 "lazy={lazy}"
@@ -1916,15 +1624,9 @@ mod tests {
     /// invisible token and spinning.
     #[test]
     fn empty_piece_only_candidates_force_eos_mid_grammar() {
-        let mut opts = opts_with_grammar(false);
-        let mut r = rng();
-        let mut mu = None;
-        let tok = sample(
-            cands(&[(RSV, 20.0), (EOS, 0.0)]),
-            &mut opts,
-            &mut r,
-            &mut mu,
-        );
+        let opts = opts_with_grammar(false);
+        let mut state = state_for(&opts);
+        let tok = sample(cands(&[(RSV, 20.0), (EOS, 0.0)]), &opts, &mut state);
         assert_eq!(tok, EOS);
     }
 
@@ -1935,22 +1637,21 @@ mod tests {
     /// `max_tokens` after the document completed).
     #[test]
     fn lazy_rejects_empty_piece_after_completion() {
-        let mut opts = opts_with_grammar(true);
-        let mut r = rng();
-        let mut mu = None;
+        let opts = opts_with_grammar(true);
+        let mut state = state_for(&opts);
         assert_eq!(
-            sample(cands(&[(A, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state),
             A
         );
         assert_eq!(
-            sample(cands(&[(B, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            sample(cands(&[(B, 20.0), (X, 0.0)]), &opts, &mut state),
             B
         );
         // Grammar complete. The dominant pick is a reserved-style
         // empty-piece token; pre-fix it was accepted and emitted
         // forever. Now: rejected, fallback drops it too, EOS forced.
         assert_eq!(
-            sample(cands(&[(RSV, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            sample(cands(&[(RSV, 20.0), (X, 0.0)]), &opts, &mut state),
             EOS
         );
     }
@@ -1959,19 +1660,18 @@ mod tests {
     /// drop post-complete empty pieces and force EOS.
     #[test]
     fn masked_rejects_empty_piece_after_completion() {
-        let mut opts = opts_with_grammar(false);
-        let mut r = rng();
-        let mut mu = None;
+        let opts = opts_with_grammar(false);
+        let mut state = state_for(&opts);
         assert_eq!(
-            sample(cands(&[(A, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state),
             A
         );
         assert_eq!(
-            sample(cands(&[(B, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            sample(cands(&[(B, 20.0), (X, 0.0)]), &opts, &mut state),
             B
         );
         assert_eq!(
-            sample(cands(&[(RSV, 20.0), (X, 0.0)]), &mut opts, &mut r, &mut mu),
+            sample(cands(&[(RSV, 20.0), (X, 0.0)]), &opts, &mut state),
             EOS
         );
     }
@@ -1988,17 +1688,75 @@ mod tests {
                 eta: 0.1,
                 max_keep: None,
             });
-            let mut r = rng();
-            let mut mu = None;
+            let mut state = state_for(&opts);
             let tok = sample(
                 cands(&[(X, 20.0), (A, 10.0), (EOS, -20.0)]),
-                &mut opts,
-                &mut r,
-                &mut mu,
+                &opts,
+                &mut state,
             );
-            results.push((tok, mu, r.next_u64()));
+            results.push((tok, state.mu, state.rng.next_u64()));
         }
         assert_eq!(results[0].0, A);
         assert_eq!(results[0], results[1]);
+    }
+
+    /// The headline invariant of the config/state split: serialize a
+    /// mid-generation `SamplerState`, restore it, and both the restored
+    /// and original states must produce the identical continuation and
+    /// remain equal (derived `PartialEq`) after every subsequent step.
+    /// Covers the grammar matcher position, the working RNG, mirostat
+    /// `mu`, and the n-gram stats.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn sampler_state_serde_round_trip_bit_exact() {
+        let mut opts = opts_with_grammar(false);
+        // Empty categories: the defaults resolve against a real
+        // tokenizer, which MockModel doesn't have.
+        opts.repetition = Some(
+            RepetitionOptions::default()
+                .set_ignored_categories(std::iter::empty()),
+        );
+        let opts = opts;
+        let mut state = state_for(&opts);
+
+        // Advance mid-grammar (one step into "ab").
+        let mut tokens: Vec<Token> = Vec::new();
+        let tok = sample_token(
+            &tokens,
+            cands(&[(A, 20.0), (X, 0.0), (EOS, -20.0)]),
+            &opts,
+            &mut state,
+            &MockModel,
+        )
+        .unwrap();
+        tokens.push(tok);
+
+        // Snapshot → restore.
+        let blob = serde_json::to_string(&state).unwrap();
+        let mut restored: SamplerState = serde_json::from_str(&blob).unwrap();
+        assert_eq!(state, restored);
+        // Canonical bytes: a second serialization is identical.
+        assert_eq!(blob, serde_json::to_string(&restored).unwrap());
+
+        // Continue both in lockstep; streams and states must match
+        // exactly at every step.
+        let mut restored_tokens = tokens.clone();
+        for step in 0..8 {
+            let c = cands(&[(B, 4.0), (A, 3.9), (X, 3.8), (EOS, -20.0)]);
+            let a = sample_token(&tokens, c.clone(), &opts, &mut state, &MockModel)
+                .unwrap();
+            let b = sample_token(
+                &restored_tokens,
+                c,
+                &opts,
+                &mut restored,
+                &MockModel,
+            )
+            .unwrap();
+            assert_eq!(a, b, "diverged at step {step}");
+            assert_eq!(state, restored, "state diverged at step {step}");
+            tokens.push(a);
+            restored_tokens.push(b);
+        }
     }
 }

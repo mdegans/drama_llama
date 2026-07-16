@@ -11,7 +11,7 @@ use crate::{
     backend::Model,
     ngram::NGramStats,
     sample::{choose_candidate, SampleError},
-    Probability, RepetitionOptions, SampleOptions, Token, TokenData,
+    Probability, RepetitionOptions, SamplerConfig, Token, TokenData,
 };
 
 #[cfg(feature = "llama-cpp")]
@@ -1181,19 +1181,17 @@ impl Candidates {
         new.truncate(split_idx.max(min_keep).try_into().unwrap())
     }
 
-    /// Sample a token from the candidates using [`SampleOptions`].
+    /// Sample a token from the candidates using [`SamplerConfig`] (the
+    /// immutable config) and a [`crate::SamplerState`] (the per-call
+    /// run-state; construct via [`SamplerConfig::init_state`]).
     pub fn sample_token<M: Model + Sync>(
         self,
         tokens: &[Token],
-        opts: &mut SampleOptions,
-        freq_map: &mut NGramStats,
-        rng: &mut rand_pcg::Pcg64Mcg,
-        mu: &mut Option<f32>,
+        opts: &SamplerConfig,
+        state: &mut crate::SamplerState,
         model: &M,
     ) -> Result<Token, SampleError> {
-        crate::sample::sample_token(
-            tokens, self, opts, freq_map, rng, mu, model,
-        )
+        crate::sample::sample_token(tokens, self, opts, state, model)
     }
 
     /// Apply repetition penalties to the candidates. This code is inspired by
@@ -1201,19 +1199,22 @@ impl Candidates {
     /// and an [`NGramStats`] object to keep track of n-gram frequencies as
     /// well as other stats like the number of tokens processed.
     ///
+    /// `ignored` is the resolved ignore set — see
+    /// [`RepetitionOptions::resolved_ignored`].
+    ///
     /// # Note
     /// * This method may apply the softmax if it has not been applied yet.
     /// * This method may sort the candidates if they are not already sorted.
     /// * This method may change the logits of the candidates.
-    pub fn penalize_repetition<M: Model>(
+    pub fn penalize_repetition(
         self,
         tokens: &[Token],
-        opts: &mut RepetitionOptions,
+        opts: &RepetitionOptions,
+        ignored: &std::collections::BTreeSet<crate::NGram>,
         freq_map: &mut NGramStats,
-        model: &M,
     ) -> Result<Candidates, crate::sample::RepetitionError> {
         crate::sample::apply_sample_repetition_ngram(
-            self, tokens, opts, freq_map, model,
+            self, tokens, opts, ignored, freq_map,
         )
     }
 
