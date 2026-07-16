@@ -352,6 +352,54 @@ impl SamplerState {
         }
     }
 
+    /// Read-only: would `token`'s piece bring any incomplete
+    /// constraint (eager matcher, or the activated deferred grammar)
+    /// to its accept state — or is one already there? The predictor
+    /// evaluates this for the TERMINAL token, which must never mutate
+    /// the state (tip invariant) but still decides generation
+    /// validity: in the dialect-exit-marker shape (Gemma 4's
+    /// `<|tool_response>`) the grammar's required exit bytes are also
+    /// a vocab EOG/stop, so the token that ends generation is the
+    /// same token that completes the grammar. Mirrors the byte rules
+    /// of the masked filters (`completes_with`; empty pieces complete
+    /// nothing).
+    pub(crate) fn completes_with_terminal<M: Model>(
+        &self,
+        config: &SamplerConfig,
+        token: Token,
+        model: &M,
+    ) -> bool {
+        let mut buf: Vec<u8> = Vec::with_capacity(32);
+        model.token_to_piece_ref(token, &mut buf);
+        let modes = config.modes.iter().zip(self.matchers.iter()).any(
+            |(mode, matcher)| match (mode, matcher) {
+                (
+                    SamplingMode::Grammar(compiled),
+                    MatcherState::Grammar { stack, .. },
+                ) => {
+                    stack.is_complete()
+                        || (!buf.is_empty()
+                            && stack.completes_with(&compiled.grammar, &buf))
+                }
+                (SamplingMode::Json, MatcherState::Json(s)) => {
+                    s.is_complete()
+                        || (!buf.is_empty() && s.completes_with(&buf))
+                }
+                _ => false,
+            },
+        );
+        modes
+            || match (&self.deferred, &config.deferred_grammar) {
+                (Some(d), Some(spec)) if d.active => {
+                    d.matcher.is_complete()
+                        || (!buf.is_empty()
+                            && d.matcher
+                                .completes_with(&spec.grammar.grammar, &buf))
+                }
+                _ => false,
+            }
+    }
+
     /// Lazy-path legality of the chosen token: its piece bytes must
     /// extend (or, for a mid-parse EOG token, *finish*) every active
     /// constraint. Mirrors the masked filters' policy — empty pieces

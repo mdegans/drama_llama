@@ -57,9 +57,26 @@ fn terminal_token_does_not_advance_matchers() {
         "grammar should have forced the text 'hello', got {:?}",
         predictor.text
     );
+    // Both faces of the design, asserted together:
+    // 1. The STATE never carries the terminal token — its matcher
+    //    position must describe the KV head, not one past it.
     assert!(
-        !predictor.grammar_complete(),
+        !predictor.sampler_state().grammar_complete(),
         "tip invariant violated: the terminal token's bytes advanced the \
          grammar matcher (state describes a position past the KV head)"
+    );
+    // 2. Generation VALIDITY still sees the terminal token's effect:
+    //    the predictor-level accessor reports completion (the
+    //    dialect-exit-marker shape — a stop whose bytes complete the
+    //    grammar must not read as a violation).
+    assert!(
+        predictor.grammar_complete(),
+        "terminal completion lost: the stop token's bytes complete the \
+         grammar, and validity accessors must see that"
+    );
+    assert!(
+        !predictor.eager_constraint_incomplete(),
+        "a terminal token that completes the grammar must not register \
+         as an incomplete-constraint violation"
     );
 }

@@ -461,6 +461,16 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// generated text) are empty before the first sample, so no stop
     /// can precede it.
     stopped: bool,
+    /// Set alongside `stopped` when the terminal token's bytes would
+    /// have completed a constraint (`SamplerState::completes_with_terminal`).
+    /// The terminal token never advances the matchers (tip invariant),
+    /// but generation VALIDITY must still see its effect — the
+    /// dialect-exit-marker shape where the grammar's required exit
+    /// bytes are also a vocab EOG (Gemma 4's `<|tool_response>`).
+    /// Folded into [`Self::grammar_complete`] /
+    /// [`Self::eager_constraint_incomplete`]; the state itself stays
+    /// pure.
+    terminal_completed: bool,
     pub(crate) inner: CandidatePredictor<'engine, B>,
 }
 
@@ -484,6 +494,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             text: String::new(),
             max_stop_len,
             stopped: false,
+            terminal_completed: false,
             inner,
         }
     }
@@ -509,6 +520,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             text: String::new(),
             max_stop_len,
             stopped: false,
+            terminal_completed: false,
             inner,
         }
     }
@@ -521,17 +533,22 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     }
 
     /// True iff any constraint matcher — including an activated
-    /// deferred grammar — has reached its accept state.
+    /// deferred grammar — has reached its accept state, or the
+    /// terminal token's bytes would have completed one (the state
+    /// itself never carries the terminal token — tip invariant; see
+    /// `terminal_completed`).
     pub fn grammar_complete(&self) -> bool {
-        self.state.grammar_complete()
+        self.state.grammar_complete() || self.terminal_completed
     }
 
     /// True iff the config carried eager (active-from-token-0)
     /// constraints and none reached accept — the incomplete-at-end
     /// violation signal. Deferred grammars are exempt (never
-    /// triggering is legal).
+    /// triggering is legal). A terminal token whose bytes complete
+    /// the constraint counts as completion (see `terminal_completed`)
+    /// even though it never advances the state.
     pub fn eager_constraint_incomplete(&self) -> bool {
-        self.state.eager_constraint_incomplete()
+        self.state.eager_constraint_incomplete() && !self.terminal_completed
     }
 
     /// Shared setup for [`Self::new`] and [`Self::new_resuming`]: seed
@@ -678,6 +695,15 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             .any(|regex| regex.is_match(&self.text));
         self.stopped =
             stopped_by_sequence || stopped_by_string || stopped_by_regex;
+        if self.stopped {
+            // Read-only validity check for the terminal token (which
+            // will not advance the matchers below).
+            self.terminal_completed = self.state.completes_with_terminal(
+                &self.options.sample_options,
+                next_token,
+                &self.inner.engine.model,
+            );
+        }
 
         // Advance the constraint matchers only when generation
         // continues. Order is load-bearing: advance-before-scan — at
