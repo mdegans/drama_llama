@@ -153,6 +153,15 @@ moeflux-model-qwen3-6-35b-a3b = ["moeflux", "moeflux/model-qwen3-6-35b-a3b"]
 # expert-paging machinery.
 moeflux-model-cogito-v2-671b = ["moeflux", "moeflux/model-cogito-v2-671b"]
 
+# Optimize test builds at the release level (3). The model-backed
+# suite runs the sampler per token — at the default opt-level 0,
+# whodunit_verdict measured 395s vs 92s optimized (#33). Unlike
+# --cargo-profile release this keeps debug_assertions and overflow
+# checks, which the sampler tests rely on. Compile time cost is small
+# next to model runtime.
+[profile.test]
+opt-level = 3
+
 [dev-dependencies]
 # Oracle for the in-tree fuzzer (`examples/grammar_fuzz.rs`): validates
 # `serde_json::Value`s against a JSON Schema so we can detect Class 3
