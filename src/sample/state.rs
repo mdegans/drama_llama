@@ -185,6 +185,18 @@ impl SamplerState {
         d.matcher.advance_bytes(&spec.grammar.grammar, tail)
     }
 
+    /// The repetition-penalty n-gram accumulator (read-only
+    /// observability — probes and tests compare fold results;
+    /// [`crate::NGramStats`] derives `PartialEq` for exactly that).
+    pub fn ngram_stats(&self) -> &crate::NGramStats {
+        &self.ngram_stats
+    }
+
+    /// The prose-corpus step counter (see the field docs).
+    pub fn step(&self) -> u64 {
+        self.step
+    }
+
     /// True iff `ngram` is in the resolved repetition ignore set —
     /// the seeding fold skips these, matching the live pass.
     pub(crate) fn resolved_ignored_contains(

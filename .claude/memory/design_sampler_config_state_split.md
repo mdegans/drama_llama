@@ -22,12 +22,36 @@ Two implementation decisions made in the landing (not in the original design):
 and homed in `SamplerState.resolved_ignored` — a documented config×model memo
 riding the state, not an accumulator.
 
-**Remaining: Phase 2** (Session-owned config, state homed in `PrefixCache`
-breakpoints w/ clone-on-load + promote-at-turn-end, seed trichotomy with
-default → `None`, incremental block-gated prompt-seeding, per-Session
-`emit_ban_set` memo) — next session, plus **Phase 3** (deserialize door,
-blallama wire, clone-cost + permissive-region spikes). Open items are marked;
-everything else is decided.
+**Phase 2 LANDED 2026-07-16 PM** (ten commits, `3b61cfa..` on v0.8.0): the
+cum_prob removal, the advance-hoist (tip invariant, `stopped` flag,
+`tests/tip_invariant.rs` verified red-pre/green-post), `predict_options_for`
++ emit-ban memo (invalidated in with_dialect / set_template_source /
+with_emit_specials_ban — the middle one was missed by the plan, found in
+review), the `Breakpoint { at, hash, state, cursor }` unification (+
+chat_template::Breakpoint → `PromptBreakpoint`), seed default → `None` +
+the `initial_state` injection seam through every `predict_*`,
+state-in-cache with `resumed_from` reconcile-by-grammar-identity
+(matchers/DeferredMatcher now carry their grammar's source hash — the same
+field the Phase-3 deserialize door needs), the prose-corpus `step` counter,
+`PromptBreakpoint`-tagged partials, and the block-gated seeding fold
+(`seed_prose_fold` — Session-owned; raw `Engine::predict_*` no longer
+prompt-seeds, documented). `tests/sampler_state_cache.rs` pins the matrix:
+**incremental fold == cold fold bit-exact** (NGramStats + step, real
+model), seeded fork reproducible, breakpoint-resume deterministic (the fold
+never draws rng, so the snapshot rng is the initial rng), changed-grammar
+resume reconciles e2e. Notable semantics settled during landing:
+`partial_hit_output_matches_fresh_session` now pins repetition OFF
+(resume-by-default legitimately carries stats, so cached-vs-fresh equality
+under a penalty is no longer the contract); tip stats are live-accumulated,
+deliberately ≠ a re-fold (BPE at splice boundaries); model-backed suites
+must run serialized (`just test full` / --test-threads=1 —
+.config/nextest.toml already enforces this; raw parallel `cargo test`
+flakes are Metal contention, not bugs).
+
+**Remaining: Phase 3** (deserialize door — the matcher grammar-hash field
+already exists; blallama seed header; clone-cost + permissive-region
+spikes; streaming tip promotion follow-up; e2e assistant-prefill
+partial-completion resume test once prefill-shaped prompts are exercised).
 
 ## Phase 2 design round (Mike + Claude Fable 5, 2026-07-16 PM)
 
