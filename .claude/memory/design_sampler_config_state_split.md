@@ -1,10 +1,33 @@
 # Design — SampleOptions config/state split + cacheable SamplerState
 
 **Status:** Design settled (Mike + Claude Opus 4.8 2026-07-15; reviewed against
-code + revised with Mike by Claude Fable 5 2026-07-16). **NOT yet a plan of
-record** — next step is scoping into one (design → plan-mode → execute, per
-`feedback_design_before_execute`). Open items are marked; everything else is
-decided.
+code + revised with Mike by Claude Fable 5 2026-07-16). **Phases 0–1 LANDED
+2026-07-16** (six commits, `756f748..bc211f7`): all four pre-lands (BTreeMap
+NGramStats; banned_specials → Vec; Temperature mode #35; DeferredGrammar
+tightening), the rand_pcg groundwork (xorshift could not expose its state —
+`Pcg64Mcg` per Mike, u128 seed matches `NonZeroU128` directly), and the split
+itself — `SamplerConfig` (renamed) + `SamplerState`, CompiledGrammar carve-out,
+DFA cache config-homed **with a 64k interned-state growth cap** (Mike's
+question: recursive grammars mint a state per nesting depth, so a
+Session-lifetime cache needs the cap; clear-on-exceed is safe, pure memoization),
+deferred-activation flag, observation channels replaced (predictor accessors +
+ProbeCtx `config`/`state`), deletion ledger executed (~350 lines), bit-exact
+serialize→restore→continue test green. Fast suite green both feature sets;
+model-backed `--include-ignored` pending (Mike runs).
+
+Two implementation decisions made in the landing (not in the original design):
+(1) `sample_token` takes NO seed param — seed enters only at `init_state`;
+(2) the repetition category-drain (which mutated config to memoize) became
+`RepetitionOptions::resolved_ignored(model)`, computed once at `init_state`
+and homed in `SamplerState.resolved_ignored` — a documented config×model memo
+riding the state, not an accumulator.
+
+**Remaining: Phase 2** (Session-owned config, state homed in `PrefixCache`
+breakpoints w/ clone-on-load + promote-at-turn-end, seed trichotomy with
+default → `None`, incremental block-gated prompt-seeding, per-Session
+`emit_ban_set` memo) — next session, plus **Phase 3** (deserialize door,
+blallama wire, clone-cost + permissive-region spikes). Open items are marked;
+everything else is decided.
 
 Huge blast radius by design — this touches `sample.rs`, `predictor.rs`,
 `session/mod.rs`, `engine.rs`, `output_config.rs`. Deliberate, phased, and
