@@ -919,7 +919,7 @@ pub fn apply_sample_repetition_ngram(
         if ngram_is_ignored(ngram, ignored) {
             continue;
         }
-        freq_map.add(ngram, &candidates, current_step);
+        freq_map.add(ngram, current_step);
     }
 
     if surgical {
@@ -1446,12 +1446,7 @@ mod tests {
 
         println!("\nNGram frequency map:");
         for (ngram, data) in freq_map.iter() {
-            println!(
-                "  {:?}: count={}, cum_prob={:.4}",
-                ngram.as_slice(),
-                data.count(),
-                data.cum_prob()
-            );
+            println!("  {:?}: count={}", ngram.as_slice(), data.count());
         }
     }
 

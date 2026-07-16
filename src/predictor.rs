@@ -541,11 +541,6 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         let mut state =
             options.sample_options.init_state(seed.get(), &engine.model);
 
-        // Dummy candidates to start. TODO: Rethink this. Ngram stats are
-        // supposed to include data like cumulative probabilities, but we don't
-        // have that here, although we could calculate them from the tokens.
-        let candidates =
-            Candidates::new(engine.model.n_vocab() as usize).unwrap();
         // Seed ngram stats from the prompt. Each n-gram occurrence is
         // recorded at the absolute position of its trailing token, so
         // the windowed-decay penalty math (RepetitionOptions.window_size
@@ -562,11 +557,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
                     .filter_map(|n| win.get((win.len() - n as usize)..))
                 {
                     let ngram = NGram::try_from_tokens(slice).unwrap();
-                    let _ = state.seed_prompt_ngram(
-                        ngram,
-                        &candidates,
-                        trailing_pos,
-                    );
+                    let _ = state.seed_prompt_ngram(ngram, trailing_pos);
                 }
             }
         }

@@ -173,10 +173,9 @@ impl SamplerState {
     pub(crate) fn seed_prompt_ngram(
         &mut self,
         ngram: crate::NGram,
-        candidates: &crate::Candidates,
         trailing_pos: u64,
     ) -> &mut crate::ngram::NGramData {
-        self.ngram_stats.add(ngram, candidates, trailing_pos)
+        self.ngram_stats.add(ngram, trailing_pos)
     }
 
     /// Advance every active matcher (and the activated deferred

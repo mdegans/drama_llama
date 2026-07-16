@@ -5,7 +5,7 @@ use std::{
 };
 use tinyvec::ArrayVec;
 
-use crate::{utils::cold, Candidates, Token};
+use crate::{utils::cold, Token};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NGramNewError {
@@ -123,8 +123,6 @@ pub struct NGramData {
     /// windowed-decay math (`count == positions.len()` invariant and
     /// `windowed_decayed_count` both depend on it).
     positions: VecDeque<u64>,
-    /// The sum of the probabilities of the individual tokens in the Ngram.
-    cum_prob: f64,
     /// Weight of the Ngram. This can be used for anything.
     weight: f64,
 }
@@ -132,14 +130,6 @@ pub struct NGramData {
 impl NGramData {
     pub const fn count(&self) -> usize {
         self.count
-    }
-
-    pub const fn cum_prob(&self) -> f64 {
-        self.cum_prob
-    }
-
-    pub fn avg_cum_prob(&self) -> f64 {
-        self.cum_prob / self.count as f64
     }
 
     pub const fn weight(&self) -> f64 {
@@ -205,7 +195,7 @@ impl NGramData {
 /// It keeps track of:
 /// * The total number of [`NGram`]s that have been added.
 /// * The total number of tokens that have been added.
-/// * [`NGramData`] for each [`NGram`] including count, cum_prob, and weight.
+/// * [`NGramData`] for each [`NGram`] including count, positions, and weight.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct NGramStats {
@@ -255,49 +245,20 @@ impl NGramStats {
     }
 
     /// Add an [`NGram`] observed at `current_step`, updating the
-    /// [`NGramData`]'s count, position queue, and cum_prob. Returns a
-    /// mutable reference to the updated [`NGramData`].
+    /// [`NGramData`]'s count and position queue. Returns a mutable
+    /// reference to the updated [`NGramData`].
     ///
     /// `current_step` is the absolute generation step at which the
     /// occurrence happened; it feeds windowed-decay penalty math via
     /// [`NGramData::windowed_decayed_count`] and
     /// [`NGramStats::evict_outside_window`].
-    ///
-    /// # Note
-    /// * This function applies softmax to the candidates if it hasn't been
-    ///   applied already.
-    ///
-    /// # Panics
-    /// * If the candidates are not sorted by id.
-    pub fn add(
-        &mut self,
-        key: NGram,
-        candidates: &Candidates,
-        current_step: u64,
-    ) -> &mut NGramData {
-        // This only applies softmax if it hasn't been applied already, like on
-        // the first call.
-
-        // This doesn't invalidate the softmax state, and is not applied to the
-        // candidates if it has already been applied.
-        assert!(candidates
-            .is_sorted()
-            .by_id()
-            .is_some_and(|k| k == candidates.len()));
-
+    pub fn add(&mut self, key: NGram, current_step: u64) -> &mut NGramData {
         self.ngram_count += 1;
         self.token_count += key.len();
 
         let entry = self.data.entry(key).or_insert(NGramData::default());
         entry.count += 1;
         entry.positions.push_back(current_step);
-        // Accumulated probability of the NGram
-        let cum_prob: f64 = key
-            .iter()
-            .map(|&token| candidates[token.abs() as usize].p as f64)
-            .sum();
-
-        entry.cum_prob += cum_prob;
 
         entry
     }
@@ -326,11 +287,6 @@ impl NGramStats {
             while let Some(&front) = data.positions.front() {
                 if front < cutoff {
                     data.positions.pop_front();
-                    // Match remove_one's accounting: subtract the average
-                    // contribution per occurrence so cum_prob / count stays
-                    // sensible.
-                    let avg_cp = data.cum_prob / data.count.max(1) as f64;
-                    data.cum_prob -= avg_cp;
                     data.count -= 1;
                     *stats_ngram_count -= 1;
                     *stats_token_count -= ngram.len();
@@ -355,7 +311,6 @@ impl NGramStats {
             self.ngram_count -= 1;
             self.token_count -= key.len();
 
-            data.cum_prob -= data.avg_cum_prob();
             data.count -= 1;
             // Pop the oldest recorded position to keep
             // `count == positions.len()`.
@@ -422,8 +377,6 @@ impl Into<BTreeMap<NGram, NGramData>> for NGramStats {
 
 #[cfg(test)]
 mod tests {
-    use crate::Sorted;
-
     use super::*;
 
     #[test]
@@ -465,7 +418,6 @@ mod tests {
     fn test_ngram_data() {
         let mut data = NGramData::default();
         assert_eq!(data.count(), 0);
-        assert_eq!(data.cum_prob(), 0.0);
         assert_eq!(data.weight(), 0.0);
         data.add_weight(1.0);
         assert_approx_eq!(data.weight(), 1.0, 1e-6);
@@ -488,20 +440,11 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn test_ngram_stats_serde_round_trip() {
-        let n: usize = 10;
         let mut stats = NGramStats::new();
-        let mut c = Candidates::new(n).unwrap();
-        for i in 0..n {
-            c.data[i].id = i as Token;
-            c.data[i].logit = -(i as f32 / n as f32);
-        }
-        let c = c.softmax(None);
-        let k = c.len();
-        let c = c.sort(Sorted::ById { k });
 
         for step in 0..8u64 {
             let ngram = NGram::try_from_tokens(&[step as Token, 1, 2]).unwrap();
-            stats.add(ngram, &c, step);
+            stats.add(ngram, step);
         }
         stats.evict_outside_window(8, 4);
 
@@ -515,104 +458,46 @@ mod tests {
 
     #[test]
     fn test_ngram_stats() {
-        let n: usize = 10;
         let mut stats = NGramStats::new();
         let a = NGram::try_from_tokens(&[0, 1, 2, 3, 4, 5, 6]).unwrap();
         let b = NGram::try_from_tokens(&[0, 1, 2, 3, 4]).unwrap();
 
-        let mut c = Candidates::new(n).unwrap();
-        for i in 0..n {
-            c.data[i].id = i as Token;
-            c.data[i].logit = -(i as f32 / n as f32);
-        }
-        let c = c.softmax(None);
-        let k = c.len();
-        let c = c.sort(Sorted::ById { k });
-
-        let count = stats.add(a, &c, 0).count;
+        let count = stats.add(a, 0).count;
         assert_eq!(count, 1);
         assert_eq!(stats.total_ngram_count(), 1);
         assert_eq!(stats.total_token_count(), 7);
         assert_approx_eq!(stats.avg_ngram_length(), 7.0, 1e-6);
-        let expected_cum_prob: f64 = c.iter().take(7).map(|t| t.p as f64).sum();
-        assert_approx_eq!(
-            stats.get(&a).unwrap().cum_prob(),
-            expected_cum_prob,
-            1e-6
-        );
-        assert_approx_eq!(
-            stats.get(&a).unwrap().avg_cum_prob(),
-            expected_cum_prob,
-            1e-6
-        );
 
-        let count = stats.add(b, &c, 0).count;
+        let count = stats.add(b, 0).count;
         assert_eq!(count, 1);
         assert_eq!(stats.total_ngram_count(), 2);
         assert_eq!(stats.total_token_count(), 12);
-        let expected_cum_prob: f64 = c.iter().take(5).map(|t| t.p as f64).sum();
-        assert_approx_eq!(
-            stats.get(&b).unwrap().cum_prob(),
-            expected_cum_prob,
-            1e-6
-        );
         assert_approx_eq!(stats.avg_ngram_length(), 6.0, 1e-6);
 
-        let count = stats.add(b, &c, 0).count;
+        let count = stats.add(b, 0).count;
         assert_eq!(count, 2);
         assert_eq!(stats.total_ngram_count(), 3);
         assert_eq!(stats.total_token_count(), 17);
-        assert_approx_eq!(
-            stats.get(&b).unwrap().avg_cum_prob(),
-            expected_cum_prob,
-            1e-6
-        );
-        let expected_cum_prob: f64 = expected_cum_prob * count as f64;
-        assert_approx_eq!(
-            stats.get(&b).unwrap().cum_prob(),
-            expected_cum_prob,
-            1e-6
-        );
         assert_approx_eq!(stats.avg_ngram_length(), 5.666666666666667, 1e-6);
 
         let data = stats.remove_every(&b).unwrap();
-        assert_approx_eq!(data.cum_prob(), expected_cum_prob, 1e-6);
         assert_eq!(data.count(), 2);
         assert_eq!(data.weight(), 0.0);
         assert_eq!(stats.total_ngram_count(), 1);
         assert_eq!(stats.total_token_count(), 7);
         assert_approx_eq!(stats.avg_ngram_length(), 7.0, 1e-6);
 
-        let _ = stats.add(b, &c, 0);
-        let count = stats.add(b, &c, 0).count;
-        let expected_cum_prob: f64 = c.iter().take(5).map(|t| t.p as f64).sum();
+        let _ = stats.add(b, 0);
+        let count = stats.add(b, 0).count;
         assert_eq!(count, 2);
         assert_eq!(stats.total_ngram_count(), 3);
         assert_eq!(stats.total_token_count(), 17);
-        assert_approx_eq!(
-            stats.get(&b).unwrap().avg_cum_prob(),
-            expected_cum_prob,
-            1e-6
-        );
-        let expected_cum_prob: f64 = expected_cum_prob * count as f64;
-        assert_approx_eq!(
-            stats.get(&b).unwrap().cum_prob(),
-            expected_cum_prob,
-            1e-6
-        );
         assert_approx_eq!(stats.avg_ngram_length(), 5.666666666666667, 1e-6);
 
         let data = stats.remove_one(&b).unwrap();
-        let expected_cum_prob: f64 = c.iter().take(5).map(|t| t.p as f64).sum();
         assert_eq!(data.count, 1);
-        assert_approx_eq!(data.cum_prob, expected_cum_prob, 1e-6);
         assert_eq!(stats.total_ngram_count(), 2);
         assert_eq!(stats.total_token_count(), 12);
-        assert_approx_eq!(
-            stats.get(&b).unwrap().cum_prob(),
-            expected_cum_prob,
-            1e-6
-        );
         assert_approx_eq!(stats.avg_ngram_length(), 6.0, 1e-6);
     }
 
@@ -621,23 +506,13 @@ mod tests {
     /// drops old positions, `remove_one` decrements both).
     #[test]
     fn ngram_stats_windowed_decay_invariants() {
-        let n: usize = 8;
         let mut stats = NGramStats::new();
         let g = NGram::from(7 as Token);
 
-        let mut c = Candidates::new(n).unwrap();
-        for i in 0..n {
-            c.data[i].id = i as Token;
-            c.data[i].logit = 1.0;
-        }
-        let c = c.softmax(None);
-        let k = c.len();
-        let c = c.sort(Sorted::ById { k });
-
         // Add the same unigram at three different generation steps.
-        stats.add(g, &c, 10);
-        stats.add(g, &c, 20);
-        stats.add(g, &c, 30);
+        stats.add(g, 10);
+        stats.add(g, 20);
+        stats.add(g, 30);
         assert_eq!(stats.get(&g).unwrap().count(), 3);
 
         // Effective count at step 30 with decay 1.0 (no decay) is just
