@@ -912,6 +912,14 @@ pub struct Session<B: Backend> {
     /// model legitimately emits non-dialect specials (e.g. Qwen-VL
     /// grounding markers like `<|box_start|>`).
     emit_specials_ban: bool,
+    /// Memoized [`Session::emit_ban_set`] — a pure function of
+    /// `(model, dialect, emit_specials_ban)`. The model is fixed for
+    /// the session's life; the other two change only through
+    /// [`Session::with_dialect`], [`Session::set_template_source`],
+    /// and [`Session::with_emit_specials_ban`], each of which calls
+    /// [`Session::refresh_emit_ban`]. Call sites clone this instead of
+    /// re-scanning the vocab per call.
+    emit_ban: Vec<Token>,
     /// Prefix-cache state. `Some` iff the caller opted in via
     /// [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
     /// `None` means every call is a full re-prefill (the pre-0.7
@@ -1355,7 +1363,7 @@ impl<B: Backend> Session<B> {
         let template = ChatTemplate::from_model(&engine.model)?;
         let dialect = analyze_dialect(&engine.model);
         let thought_reingest = dialect.reasoning.reingest;
-        Ok(Self {
+        let mut session = Self {
             engine,
             template,
             dialect,
@@ -1372,10 +1380,13 @@ impl<B: Backend> Session<B> {
             seed: Some(crate::PredictOptions::DEFAULT_SEED),
             max_tokens: NonZeroUsize::new(DEFAULT_MAX_TOKENS).unwrap(),
             emit_specials_ban: true,
+            emit_ban: Vec::new(),
             prefix_cache: None,
             last_usage: Usage::default(),
             total_usage: Usage::default(),
-        })
+        };
+        session.refresh_emit_ban();
+        Ok(session)
     }
 
     /// Enable (or replace) the repetition penalty. As of v0.8.0 the
@@ -1458,6 +1469,7 @@ impl<B: Backend> Session<B> {
         // part of the same byte-stability contract.
         self.render_opts.thought_reingest = dialect.reasoning.reingest;
         self.dialect = dialect;
+        self.refresh_emit_ban();
         self
     }
 
@@ -1485,6 +1497,7 @@ impl<B: Backend> Session<B> {
         let dialect = analyze_dialect_source(&self.engine.model, &source);
         self.render_opts.thought_reingest = dialect.reasoning.reingest;
         self.dialect = dialect;
+        self.refresh_emit_ban();
         Ok(())
     }
 
@@ -1612,7 +1625,43 @@ impl<B: Backend> Session<B> {
             .expect("min of two NonZero values is NonZero")
     }
 
-    /// The emit-side special-token ban set (#31 item 9), handed to
+    /// Assemble the effective per-call [`PredictOptions`]: model stop
+    /// sequences, the session's token budget and seed, and the
+    /// effective sampler config — session-stable knobs plus the
+    /// call-derived `modes` / `deferred_grammar` from
+    /// [`PreparedCall`]. The single construction site for all three
+    /// `complete_*` paths ("config is the authority": the effective
+    /// config is assembled first; predictor state derives from it).
+    fn predict_options_for(
+        &self,
+        prompt: &Prompt,
+        modes: Vec<SamplingMode>,
+        deferred_grammar: Option<crate::DeferredGrammar>,
+    ) -> PredictOptions {
+        let mut predict_opts =
+            PredictOptions::default().add_model_stops(&self.engine.model);
+        predict_opts.n = self.effective_max_tokens(prompt);
+        predict_opts.seed = self.seed;
+        predict_opts.sample_options = SamplerConfig {
+            modes,
+            repetition: self.sample_options.repetition.clone(),
+            deferred_grammar,
+            lazy_grammar: self.sample_options.lazy_grammar,
+            banned_specials: self.emit_ban.clone(),
+        };
+        predict_opts
+    }
+
+    /// Recompute the [`Session::emit_ban`] memo. Called from
+    /// `from_engine` and the three setters that change its inputs
+    /// ([`Session::with_dialect`], [`Session::set_template_source`],
+    /// [`Session::with_emit_specials_ban`]).
+    fn refresh_emit_ban(&mut self) {
+        self.emit_ban = self.emit_ban_set();
+    }
+
+    /// The emit-side special-token ban set (#31 item 9), memoized as
+    /// [`Session::emit_ban`] and handed to
     /// [`SamplerConfig::banned_specials`] on every call: specials the
     /// active dialect never legitimately emits. Universe is
     /// [`Model::special_tokens`]; exempt are the EOG family (eos,
@@ -1770,6 +1819,7 @@ impl<B: Backend> Session<B> {
     /// [`SamplerConfig::banned_specials`]: crate::SamplerConfig
     pub fn with_emit_specials_ban(mut self, on: bool) -> Self {
         self.emit_specials_ban = on;
+        self.refresh_emit_ban();
         self
     }
 
@@ -2847,17 +2897,8 @@ impl<B: Backend> Session<B> {
                 &media_by_id,
             )?;
 
-        let mut predict_opts =
-            PredictOptions::default().add_model_stops(&self.engine.model);
-        predict_opts.n = self.effective_max_tokens(prompt);
-        predict_opts.seed = self.seed;
-        predict_opts.sample_options = SamplerConfig {
-            modes,
-            repetition: self.sample_options.repetition.clone(),
-            deferred_grammar: deferred_grammar.clone(),
-            lazy_grammar: self.sample_options.lazy_grammar,
-            banned_specials: self.emit_ban_set(),
-        };
+        let predict_opts =
+            self.predict_options_for(prompt, modes, deferred_grammar.clone());
 
         // Count pieces as we consume them — one piece equals one
         // generated token before any post-hoc stop-string trimming
@@ -3142,17 +3183,8 @@ impl<B: Backend> Session<B> {
 
         let eos_pieces = self.eog_pieces();
 
-        let mut predict_opts =
-            PredictOptions::default().add_model_stops(&self.engine.model);
-        predict_opts.n = self.effective_max_tokens(prompt);
-        predict_opts.seed = self.seed;
-        predict_opts.sample_options = SamplerConfig {
-            modes,
-            repetition: self.sample_options.repetition.clone(),
-            deferred_grammar: deferred_grammar.clone(),
-            lazy_grammar: self.sample_options.lazy_grammar,
-            banned_specials: self.emit_ban_set(),
-        };
+        let predict_opts =
+            self.predict_options_for(prompt, modes, deferred_grammar.clone());
 
         // The parse dialect + tool schemas outlive the engine borrow
         // the predictor takes, so clone them out of `self` first.
@@ -3251,17 +3283,8 @@ impl<B: Backend> Session<B> {
             "run_call: modes prepared",
         );
 
-        let mut predict_opts =
-            PredictOptions::default().add_model_stops(&self.engine.model);
-        predict_opts.n = self.effective_max_tokens(prompt);
-        predict_opts.seed = self.seed;
-        predict_opts.sample_options = SamplerConfig {
-            modes,
-            repetition: self.sample_options.repetition.clone(),
-            deferred_grammar: deferred_grammar.clone(),
-            lazy_grammar: self.sample_options.lazy_grammar,
-            banned_specials: self.emit_ban_set(),
-        };
+        let predict_opts =
+            self.predict_options_for(prompt, modes, deferred_grammar.clone());
 
         // Collect generated pieces + count tokens inline. The
         // concatenated raw-text buffer feeds the dialect parser after
