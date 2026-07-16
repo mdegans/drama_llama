@@ -573,7 +573,10 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         // recorded at the absolute position of its trailing token, so
         // the windowed-decay penalty math (RepetitionOptions.window_size
         // + decay) sees prompt occurrences at their true distance from
-        // the current generation step.
+        // the current generation step. The prose-step counter starts
+        // at the prompt length so the first penalty pass sees the same
+        // step basis the old tokens.len() derivation produced.
+        state.step = tokens.len() as u64;
         if let Some(opts) = &options.sample_options.repetition {
             let max_size = opts.ngram_max_size.get() as usize;
             for (win_idx, win) in tokens.windows(max_size).enumerate() {

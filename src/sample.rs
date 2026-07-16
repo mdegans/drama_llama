@@ -975,6 +975,7 @@ impl SamplerConfig {
             mu: None,
             rng: rand_pcg::Pcg64Mcg::new(seed),
             ngram_stats: NGramStats::new(),
+            step: 0,
             resolved_ignored: self
                 .repetition
                 .as_ref()
@@ -1023,15 +1024,20 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
             let SamplerState {
                 ngram_stats,
                 resolved_ignored,
+                step,
                 ..
             } = &mut *state;
             candidates = apply_sample_repetition_ngram(
                 candidates,
                 tokens,
+                *step,
                 repetition,
                 resolved_ignored,
                 ngram_stats,
             )?;
+            // The prose corpus advances one step per executed pass;
+            // constrained spans (which skip the pass) consume none.
+            *step += 1;
         }
     }
 

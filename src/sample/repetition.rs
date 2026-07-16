@@ -834,9 +834,16 @@ fn surgical_target(
 /// Originally inspired by `llama.cpp`'s repetition penalties, extended with
 /// n-gram support. Rewritten by Claude (Anthropic) to fix a design issue where
 /// penalties were only applied to the trailing token.
+/// `current_step` is the absolute step this pass's occurrences are
+/// recorded at, and the reference point for windowed eviction/decay.
+/// Production passes `SamplerState::step` — the prose-corpus counter
+/// (+1 per executed penalty pass, +1 per seeded prose token), which is
+/// stable across cache resumes where a token-position basis would be
+/// suffix-relative and incoherent.
 pub fn apply_sample_repetition_ngram(
     candidates: Candidates,
     tokens: &[Token],
+    current_step: u64,
     opts: &RepetitionOptions,
     ignored: &BTreeSet<NGram>,
     freq_map: &mut NGramStats,
@@ -895,12 +902,6 @@ pub fn apply_sample_repetition_ngram(
     // Clamp decay to (0, 1]; out-of-range values would either wedge the
     // sum to NaN/inf or invert the decay direction.
     let decay = decay.clamp(f32::MIN_POSITIVE, 1.0);
-
-    // The "current step" we attribute to occurrences added in this call.
-    // Trailing n-grams all live at the most recent token position; using a
-    // single value per call keeps eviction cheap and matches what
-    // production sees (one penalty pass per generation step).
-    let current_step = tokens.len() as u64;
 
     // Drop any positions that fell out of the window since the last call,
     // before recording the new ones. Cheap: only pops the front entries
@@ -1190,6 +1191,7 @@ mod tests {
             let result = apply_sample_repetition_ngram(
                 candidates,
                 token_history,
+                token_history.len() as u64,
                 opts,
                 &ignored,
                 &mut freq_map,
@@ -1514,6 +1516,7 @@ mod tests {
             let result = apply_sample_repetition_ngram(
                 candidates,
                 &tokens,
+                tokens.len() as u64,
                 &opts,
                 &ignored,
                 &mut freq_map,
@@ -1586,6 +1589,7 @@ mod tests {
             let _ = apply_sample_repetition_ngram(
                 candidates,
                 &tokens,
+                tokens.len() as u64,
                 &opts,
                 &ignored,
                 &mut freq_map,
@@ -1598,6 +1602,7 @@ mod tests {
         let saturated = apply_sample_repetition_ngram(
             saturated_candidates,
             &tokens,
+            tokens.len() as u64,
             &opts,
             &ignored,
             &mut freq_map,
@@ -1624,6 +1629,7 @@ mod tests {
             let _ = apply_sample_repetition_ngram(
                 candidates,
                 &tokens,
+                tokens.len() as u64,
                 &opts,
                 &ignored,
                 &mut freq_map,
@@ -1635,6 +1641,7 @@ mod tests {
         let final_result = apply_sample_repetition_ngram(
             final_candidates,
             &tokens,
+            tokens.len() as u64,
             &opts,
             &ignored,
             &mut freq_map,

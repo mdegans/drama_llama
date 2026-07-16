@@ -74,6 +74,13 @@ pub struct SamplerState {
     pub(crate) rng: rand_pcg::Pcg64Mcg,
     /// Repetition-penalty accumulator.
     pub(crate) ngram_stats: NGramStats,
+    /// Prose-corpus step counter — the `current_step` basis for
+    /// windowed eviction/decay in the penalty pass. Advances +1 per
+    /// prose token seeded and +1 per *executed* penalty pass
+    /// (constrained spans skip the pass, so structured output consumes
+    /// no window). Cross-call stable, unlike `tokens.len()`, which is
+    /// suffix-relative on a cache resume.
+    pub(crate) step: u64,
     /// Resolved repetition ignore set (`RepetitionOptions::ignored` ∪
     /// tokenized `ignored_categories`). A per-call memo of config ×
     /// model, computed once at `init_state` — NOT an accumulator, but
@@ -315,6 +322,7 @@ impl SamplerState {
             mu: cached.mu,
             rng: cached.rng.clone(),
             ngram_stats: cached.ngram_stats.clone(),
+            step: cached.step,
             resolved_ignored: config
                 .repetition
                 .as_ref()

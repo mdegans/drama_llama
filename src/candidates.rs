@@ -1212,15 +1212,24 @@ impl Candidates {
     /// * This method may apply the softmax if it has not been applied yet.
     /// * This method may sort the candidates if they are not already sorted.
     /// * This method may change the logits of the candidates.
+    /// `current_step` is the absolute step for windowed eviction/decay
+    /// (see `SamplerState::step`); pass `tokens.len() as u64` for the
+    /// simple token-position basis.
     pub fn penalize_repetition(
         self,
         tokens: &[Token],
+        current_step: u64,
         opts: &RepetitionOptions,
         ignored: &std::collections::BTreeSet<crate::NGram>,
         freq_map: &mut NGramStats,
     ) -> Result<Candidates, crate::sample::RepetitionError> {
         crate::sample::apply_sample_repetition_ngram(
-            self, tokens, opts, ignored, freq_map,
+            self,
+            tokens,
+            current_step,
+            opts,
+            ignored,
+            freq_map,
         )
     }
 
