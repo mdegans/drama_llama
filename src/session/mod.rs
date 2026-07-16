@@ -83,8 +83,8 @@ use crate::{
     backend::{Backend, Model},
     output_config, ChatTemplate, ChatTemplateError, Engine, OutputConfigError,
     OutputConfigOptions, PredictOptions, Prompt, RenderOptions,
-    RepetitionOptions, SamplerConfig, SamplingMode, Token, Tool, ToolChoice,
-    ToolChoiceError, ToolChoiceOptions,
+    RepetitionOptions, SamplerConfig, SamplerState, SamplingMode, Token, Tool,
+    ToolChoice, ToolChoiceError, ToolChoiceOptions,
 };
 
 #[cfg(feature = "llama-cpp")]
@@ -419,6 +419,14 @@ struct Breakpoint {
     /// move with `cache_windowed`. `None` = LCP-matchable only (e.g. a
     /// tip recorded on a path that could not re-render).
     hash: Option<[u8; 32]>,
+    /// The sampler run-state snapshotted at this position, paired with
+    /// the KV snapshot at the same position (snapshot-coupled: restore
+    /// is both or neither). Cloned on load, reconciled against the new
+    /// call's effective config by [`SamplerState::resumed_from`].
+    /// `None` until a path that promotes state has run (the tip gets
+    /// one at turn end; prompt breakpoints get theirs from the
+    /// Session-side seeding fold — Phase 2 commit 9).
+    state: Option<SamplerState>,
 }
 
 struct PrefixCache {
@@ -1651,6 +1659,35 @@ impl<B: Backend> Session<B> {
         predict_opts
     }
 
+    /// Resolve the resume/fork/fresh trichotomy for one call.
+    ///
+    /// - `Some(seed)` on the session ⇒ **fork**: the cached stream is
+    ///   ignored; `None` is returned so the predictor builds a fresh
+    ///   deterministic state from the options (whose `seed` it reads).
+    /// - No seed + a cached state at the matched breakpoint ⇒
+    ///   **resume**: the cached state is reconciled against this
+    ///   call's effective config ([`SamplerState::resumed_from`]) and
+    ///   injected — the conversation continues its stream.
+    /// - No seed + no cached state ⇒ **fresh**: `None`; the predictor
+    ///   initializes from fresh entropy.
+    ///
+    /// There is no separate resume/fork verb anywhere in the API —
+    /// this branch is the whole trichotomy.
+    fn initial_state_for(
+        &self,
+        config: &SamplerConfig,
+        cached: Option<SamplerState>,
+    ) -> Option<SamplerState> {
+        match (self.seed, cached) {
+            (None, Some(cached)) => Some(SamplerState::resumed_from(
+                &cached,
+                config,
+                &self.engine.model,
+            )),
+            _ => None,
+        }
+    }
+
     /// Recompute the [`Session::emit_ban`] memo. Called from
     /// `from_engine` and the three setters that change its inputs
     /// ([`Session::with_dialect`], [`Session::set_template_source`],
@@ -2330,6 +2367,12 @@ impl<B: Backend> Session<B> {
     ///   (zero when full miss / fallback).
     /// * `prefill_start` — engine position from which the
     ///   predictor's prefill resumes.
+    /// * `cached_state` — the [`SamplerState`] stored at the matched
+    ///   [`Breakpoint`]/tip, cloned. `None` on a miss, on the
+    ///   `NoCheckpoint` fallback, or when the matched breakpoint
+    ///   carries no state. Keyed on the *effective* restore position,
+    ///   so the empty-suffix backoff and the fallback path stay
+    ///   consistent with the KV side by construction.
     ///
     /// **Empty-suffix guard.** If `compute_l_hit` covers every entry
     /// (a perfect-prefix match), `cache_read` is backed off to the
@@ -2355,7 +2398,8 @@ impl<B: Backend> Session<B> {
             [u8; 32],
             crate::backend::Image,
         >,
-    ) -> Result<(Vec<Token>, usize, usize), SessionError> {
+    ) -> Result<(Vec<Token>, usize, usize, Option<SamplerState>), SessionError>
+    {
         // The suffix handed to the predictor must be non-empty text.
         let trailing_start = new_entries
             .iter()
@@ -2483,6 +2527,23 @@ impl<B: Backend> Session<B> {
         } else {
             self.engine.memory_clear();
         }
+
+        // The sampler state cached at the position we actually
+        // restored to (KV and SamplerState are snapshot-coupled: both
+        // or neither).
+        let cached_state: Option<SamplerState> = if effective_cache_read.pos > 0
+        {
+            self.prefix_cache.as_ref().and_then(|cache| {
+                cache
+                    .breakpoints
+                    .iter()
+                    .chain(cache.tip.as_ref())
+                    .find(|bp| bp.at.pos == effective_cache_read.pos)
+                    .and_then(|bp| bp.state.clone())
+            })
+        } else {
+            None
+        };
 
         // Orphan pruning: free snapshots from the previous call's
         // breakpoints that aren't still set in this call's
@@ -2667,7 +2728,7 @@ impl<B: Backend> Session<B> {
             .collect();
         let cache_read_cells =
             entries_cell_len(&new_entries[..effective_cache_read.entry]);
-        Ok((suffix, cache_read_cells, pos))
+        Ok((suffix, cache_read_cells, pos, cached_state))
     }
 
     /// Build a [`Usage`] for one `complete_*` call. `Option` fields
@@ -2751,6 +2812,7 @@ impl<B: Backend> Session<B> {
         internal_tip: Option<EntryPos>,
         new_breakpoint_hashes: Vec<[u8; 32]>,
         tip_hash: Option<[u8; 32]>,
+        tip_state: Option<SamplerState>,
     ) {
         // Capture the old tip BEFORE overwriting — needed for the
         // explicit-eviction fast path so the engine can free the prior
@@ -2775,11 +2837,18 @@ impl<B: Backend> Session<B> {
             cache.breakpoints = new_breakpoints
                 .into_iter()
                 .zip(new_breakpoint_hashes.into_iter().map(Some))
-                .map(|(at, hash)| Breakpoint { at, hash })
+                .map(|(at, hash)| Breakpoint {
+                    at,
+                    hash,
+                    state: None,
+                })
                 .collect();
             cache.last_reused_cells = reused_cells;
-            cache.tip =
-                internal_tip.map(|at| Breakpoint { at, hash: tip_hash });
+            cache.tip = internal_tip.map(|at| Breakpoint {
+                at,
+                hash: tip_hash,
+                state: tip_state,
+            });
         }
         // Free the displaced (tip moved) or stale (tip gone — e.g. the
         // streaming path that skips the tip extension) old tip
@@ -2876,7 +2945,7 @@ impl<B: Backend> Session<B> {
             self.effective_max_tokens(prompt).get(),
         )?;
 
-        let (suffix, cache_read, prefill_start) = self
+        let (suffix, cache_read, prefill_start, cached_state) = self
             .kv_setup_and_chunk_prefill(
                 &entries,
                 &breakpoints,
@@ -2886,6 +2955,8 @@ impl<B: Backend> Session<B> {
 
         let predict_opts =
             self.predict_options_for(prompt, modes, deferred_grammar.clone());
+        let initial_state =
+            self.initial_state_for(&predict_opts.sample_options, cached_state);
 
         // Count pieces as we consume them — one piece equals one
         // generated token before any post-hoc stop-string trimming
@@ -2904,10 +2975,11 @@ impl<B: Backend> Session<B> {
                 prefill_start,
                 0,
                 predict_opts,
-                None,
+                initial_state,
             )
         } else {
-            self.engine.predict_pieces(suffix, predict_opts, None)
+            self.engine
+                .predict_pieces(suffix, predict_opts, initial_state)
         };
         while let Some(piece) = predictor.next() {
             if cache_on {
@@ -2919,8 +2991,10 @@ impl<B: Backend> Session<B> {
             generated_count += 1;
             text.push_str(&piece);
         }
-        // Drop the predictor so it releases the engine borrow — we
-        // need `&self.engine` for `trim_eos` below.
+        // Capture the final sampler state for tip promotion, then drop
+        // the predictor so it releases the engine borrow — we need
+        // `&self.engine` for `trim_eos` below.
+        let final_state = cache_on.then(|| predictor.sampler_state().clone());
         drop(predictor);
 
         let trimmed = trim_eos(&text, &self.engine).to_string();
@@ -2960,6 +3034,7 @@ impl<B: Backend> Session<B> {
             internal_tip,
             partial_hashes,
             None,
+            final_state,
         );
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
@@ -3133,7 +3208,7 @@ impl<B: Backend> Session<B> {
             self.effective_max_tokens(prompt).get(),
         )?;
 
-        let (suffix, cache_read, prefill_start) = self
+        let (suffix, cache_read, prefill_start, cached_state) = self
             .kv_setup_and_chunk_prefill(
                 &entries,
                 &breakpoints,
@@ -3165,6 +3240,9 @@ impl<B: Backend> Session<B> {
             None,
             partial_hashes,
             None,
+            // Streaming tip state promotion rides the same v2
+            // follow-up as the tip itself (comment above).
+            None,
         );
         let usage = Self::make_usage(prompt_tokens, cache_read, 0);
         self.record_usage(usage);
@@ -3173,6 +3251,8 @@ impl<B: Backend> Session<B> {
 
         let predict_opts =
             self.predict_options_for(prompt, modes, deferred_grammar.clone());
+        let initial_state =
+            self.initial_state_for(&predict_opts.sample_options, cached_state);
 
         // The parse dialect + tool schemas outlive the engine borrow
         // the predictor takes, so clone them out of `self` first.
@@ -3191,10 +3271,11 @@ impl<B: Backend> Session<B> {
                 prefill_start,
                 0,
                 predict_opts,
-                None,
+                initial_state,
             )
         } else {
-            self.engine.predict_pieces(suffix, predict_opts, None)
+            self.engine
+                .predict_pieces(suffix, predict_opts, initial_state)
         };
         Ok(BlockStream {
             predictor,
@@ -3246,7 +3327,7 @@ impl<B: Backend> Session<B> {
             self.effective_max_tokens(prompt).get(),
         )?;
 
-        let (suffix, cache_read, prefill_start) = self
+        let (suffix, cache_read, prefill_start, cached_state) = self
             .kv_setup_and_chunk_prefill(
                 &entries,
                 &breakpoints,
@@ -3274,6 +3355,8 @@ impl<B: Backend> Session<B> {
 
         let predict_opts =
             self.predict_options_for(prompt, modes, deferred_grammar.clone());
+        let initial_state =
+            self.initial_state_for(&predict_opts.sample_options, cached_state);
 
         // Collect generated pieces + count tokens inline. The
         // concatenated raw-text buffer feeds the dialect parser after
@@ -3304,10 +3387,11 @@ impl<B: Backend> Session<B> {
                 prefill_start,
                 0,
                 predict_opts,
-                None,
+                initial_state,
             )
         } else {
-            self.engine.predict_pieces(suffix, predict_opts, None)
+            self.engine
+                .predict_pieces(suffix, predict_opts, initial_state)
         };
 
         while let Some(piece) = predictor.next() {
@@ -3341,9 +3425,10 @@ impl<B: Backend> Session<B> {
                 break;
             }
         }
-        // Capture the incomplete-at-end violation signal before the
-        // predictor (and its owned SamplerState) drops.
+        // Capture the incomplete-at-end violation signal and the final
+        // sampler state (tip promotion) before the predictor drops.
         let eager_incomplete = predictor.eager_constraint_incomplete();
+        let final_state = cache_on.then(|| predictor.sampler_state().clone());
         drop(predictor);
         // Parse the whole generation through the dialect envelope
         // parser. `Final` leniency: a truncated trailing structure
@@ -3479,6 +3564,7 @@ impl<B: Backend> Session<B> {
             internal_tip,
             partial_hashes,
             tip_hash,
+            final_state,
         );
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
@@ -4365,6 +4451,7 @@ mod tests {
         Breakpoint {
             at: ep(entry),
             hash,
+            state: None,
         }
     }
 

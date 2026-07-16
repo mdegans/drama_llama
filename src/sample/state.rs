@@ -30,7 +30,14 @@ use crate::{SamplerConfig, SamplingMode, Token};
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MatcherState {
     Stateless,
-    Grammar(StackState),
+    Grammar {
+        /// Identity of the compiled grammar this position indexes into
+        /// ([`crate::CompiledGrammar::source_hash`]). Positions are
+        /// only meaningful against the same source; reconciliation and
+        /// the (Phase 3) deserialize door both gate on this.
+        grammar: [u8; 32],
+        stack: StackState,
+    },
     Json(JsonState),
 }
 
@@ -44,6 +51,9 @@ pub(crate) struct DeferredMatcher {
     /// dance — the spec stays in config, only this flag and the
     /// matcher live here.
     pub(crate) active: bool,
+    /// Identity of the deferred spec's compiled grammar — same
+    /// contract as [`MatcherState::Grammar::grammar`].
+    pub(crate) grammar: [u8; 32],
     pub(crate) matcher: StackState,
 }
 
@@ -80,7 +90,7 @@ impl SamplerState {
     /// penalizing it steers generation away from exit delimiters.
     pub(crate) fn constrained_incomplete(&self) -> bool {
         self.matchers.iter().any(|m| match m {
-            MatcherState::Grammar(s) => !s.is_complete(),
+            MatcherState::Grammar { stack, .. } => !stack.is_complete(),
             MatcherState::Json(s) => !s.is_complete(),
             MatcherState::Stateless => false,
         }) || self
@@ -105,7 +115,7 @@ impl SamplerState {
     /// output is complete.
     pub fn grammar_complete(&self) -> bool {
         self.matchers.iter().any(|m| match m {
-            MatcherState::Grammar(s) => s.is_complete(),
+            MatcherState::Grammar { stack, .. } => stack.is_complete(),
             MatcherState::Json(s) => s.is_complete(),
             MatcherState::Stateless => false,
         }) || self
@@ -122,9 +132,9 @@ impl SamplerState {
         let mut any = false;
         for m in &self.matchers {
             match m {
-                MatcherState::Grammar(s) => {
+                MatcherState::Grammar { stack, .. } => {
                     any = true;
-                    if s.is_complete() {
+                    if stack.is_complete() {
                         return false;
                     }
                 }
@@ -208,9 +218,12 @@ impl SamplerState {
         for (mode, matcher) in config.modes.iter().zip(self.matchers.iter_mut())
         {
             match (mode, matcher) {
-                (SamplingMode::Grammar(compiled), MatcherState::Grammar(s)) => {
+                (
+                    SamplingMode::Grammar(compiled),
+                    MatcherState::Grammar { stack, .. },
+                ) => {
                     piece(&mut buf, &mut computed);
-                    let _ = s.advance_bytes(&compiled.grammar, &buf);
+                    let _ = stack.advance_bytes(&compiled.grammar, &buf);
                 }
                 (SamplingMode::Json, MatcherState::Json(s)) => {
                     piece(&mut buf, &mut computed);
@@ -226,6 +239,87 @@ impl SamplerState {
                 piece(&mut buf, &mut computed);
                 let _ = d.matcher.advance_bytes(&spec.grammar.grammar, &buf);
             }
+        }
+    }
+
+    /// Build the working state for a call that resumes `cached` under
+    /// `config` — the reconcile-by-grammar-identity load rule (design
+    /// memo, Phase 2 round):
+    ///
+    /// - The matchers vec is built fresh from `config.modes` (never
+    ///   cloned wholesale — the cached vec was aligned to a *different*
+    ///   effective config's modes, so verbatim reuse risks
+    ///   out-of-bounds rule indices). Each new grammar mode carries the
+    ///   cached position forward **iff** a cached matcher walked the
+    ///   identical compiled grammar ([`crate::CompiledGrammar::source_hash`];
+    ///   same source ⇒ same deterministic compile ⇒ same indices);
+    ///   otherwise it starts at root. This is what makes
+    ///   assistant-prefill / partial-completion resume work while a
+    ///   changed grammar resets only the matcher.
+    /// - The JSON matcher carries unconditionally (fixed built-in
+    ///   grammar, no identity to mismatch).
+    /// - The deferred matcher carries (flag + position) iff the spec's
+    ///   grammar identity matches; else fresh inactive root.
+    /// - `mu`, the working rng, and `ngram_stats` carry
+    ///   unconditionally — they are the stream being resumed.
+    /// - `resolved_ignored` is recomputed from `config` × `model`: it
+    ///   is a config memo riding the state, and repetition knobs are a
+    ///   free per-call override.
+    pub fn resumed_from<M: Model>(
+        cached: &SamplerState,
+        config: &SamplerConfig,
+        model: &M,
+    ) -> SamplerState {
+        let cached_grammar = |hash: &[u8; 32]| {
+            cached.matchers.iter().find_map(|m| match m {
+                MatcherState::Grammar { grammar, stack } if grammar == hash => {
+                    Some(stack.clone())
+                }
+                _ => None,
+            })
+        };
+        let cached_json = || {
+            cached.matchers.iter().find_map(|m| match m {
+                MatcherState::Json(s) => Some(s.clone()),
+                _ => None,
+            })
+        };
+        SamplerState {
+            matchers: config
+                .modes
+                .iter()
+                .map(|mode| match mode {
+                    SamplingMode::Grammar(compiled) => {
+                        let grammar = compiled.source_hash();
+                        let stack = cached_grammar(&grammar)
+                            .unwrap_or_else(|| compiled.root_state());
+                        MatcherState::Grammar { grammar, stack }
+                    }
+                    SamplingMode::Json => MatcherState::Json(
+                        cached_json().unwrap_or_else(JsonState::new),
+                    ),
+                    _ => MatcherState::Stateless,
+                })
+                .collect(),
+            deferred: config.deferred_grammar.as_ref().map(|spec| {
+                let grammar = spec.grammar.source_hash();
+                match cached.deferred.as_ref() {
+                    Some(d) if d.grammar == grammar => d.clone(),
+                    _ => DeferredMatcher {
+                        active: false,
+                        grammar,
+                        matcher: spec.grammar.root_state(),
+                    },
+                }
+            }),
+            mu: cached.mu,
+            rng: cached.rng.clone(),
+            ngram_stats: cached.ngram_stats.clone(),
+            resolved_ignored: config
+                .repetition
+                .as_ref()
+                .map(|r| r.resolved_ignored(model))
+                .unwrap_or_default(),
         }
     }
 
@@ -254,9 +348,10 @@ impl SamplerState {
 
         let modes_ok = config.modes.iter().zip(self.matchers.iter()).all(
             |(mode, matcher)| match (mode, matcher) {
-                (SamplingMode::Grammar(compiled), MatcherState::Grammar(s)) => {
-                    grammar_ok(&compiled.grammar, s)
-                }
+                (
+                    SamplingMode::Grammar(compiled),
+                    MatcherState::Grammar { stack, .. },
+                ) => grammar_ok(&compiled.grammar, stack),
                 (SamplingMode::Json, MatcherState::Json(s)) => {
                     !buf.is_empty()
                         && if chosen_is_eog && !s.is_complete() {

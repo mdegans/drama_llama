@@ -240,8 +240,17 @@ fn partial_hit_output_matches_fresh_session() {
 
     // Cached run: A primes cache with turn1, then runs turn2 hitting
     // the partial-hit code path.
-    let mut session_a =
-        build_session().with_sampling([drama_llama::SamplingMode::Greedy]);
+    //
+    // Repetition is OFF for both sessions: resume-by-default (Phase 2)
+    // deliberately carries n-gram stats across a cached session's
+    // calls, so with a penalty active, cached-vs-fresh outputs may
+    // legitimately differ. This test hunts KV/recurrent-state
+    // pollution, not sampler-stream divergence — pin the sampler
+    // variables (greedy, no penalty) so any divergence is the real
+    // target.
+    let mut session_a = build_session()
+        .without_repetition()
+        .with_sampling([drama_llama::SamplingMode::Greedy]);
     let _warm = session_a
         .complete_text(&turn1)
         .expect("complete_text turn1 (cached session)");
@@ -252,6 +261,7 @@ fn partial_hit_output_matches_fresh_session() {
     // Fresh ground-truth run: B has no cache, runs turn2 directly.
     let mut session_b = build_session()
         .with_prefix_cache(false)
+        .without_repetition()
         .with_sampling([drama_llama::SamplingMode::Greedy]);
     let fresh_turn2 = session_b
         .complete_text(&turn2)

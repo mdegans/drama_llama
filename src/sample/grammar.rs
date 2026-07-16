@@ -781,6 +781,20 @@ impl CompiledGrammar {
         self.grammar.source()
     }
 
+    /// SHA-256 of the GBNF source — the grammar's identity. Matcher
+    /// positions in a [`SamplerState`](crate::SamplerState) index into
+    /// a *specific* compiled grammar, so each grammar matcher carries
+    /// this hash; `SamplerState::resumed_from` carries a cached
+    /// position forward iff the identities agree (same source ⇒ same
+    /// deterministic compile ⇒ same indices). The (Phase 3)
+    /// deserialize door's grammar-identity gate uses the same value.
+    pub(crate) fn source_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.source().as_bytes());
+        hasher.finalize().into()
+    }
+
     /// A fresh matcher at this grammar's root rule.
     pub(crate) fn root_state(&self) -> StackState {
         StackState::new_rooted(&self.grammar)

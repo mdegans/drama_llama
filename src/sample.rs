@@ -959,15 +959,17 @@ impl SamplerConfig {
                 .modes
                 .iter()
                 .map(|m| match m {
-                    SamplingMode::Grammar(compiled) => {
-                        MatcherState::Grammar(compiled.root_state())
-                    }
+                    SamplingMode::Grammar(compiled) => MatcherState::Grammar {
+                        grammar: compiled.source_hash(),
+                        stack: compiled.root_state(),
+                    },
                     SamplingMode::Json => MatcherState::Json(JsonState::new()),
                     _ => MatcherState::Stateless,
                 })
                 .collect(),
             deferred: self.deferred_grammar.as_ref().map(|d| DeferredMatcher {
                 active: false,
+                grammar: d.grammar.source_hash(),
                 matcher: d.grammar.root_state(),
             }),
             mu: None,
@@ -1202,10 +1204,10 @@ fn apply_modes<M: crate::backend::Model + Sync>(
                 }
                 (
                     SamplingMode::Grammar(compiled),
-                    MatcherState::Grammar(matcher),
-                ) => grammar::grammar_filter(
-                    candidates, compiled, matcher, model,
-                ),
+                    MatcherState::Grammar { stack, .. },
+                ) => {
+                    grammar::grammar_filter(candidates, compiled, stack, model)
+                }
                 (SamplingMode::Json, _) | (SamplingMode::Grammar(_), _) => {
                     // Config/state kind mismatch: impossible via
                     // init_state; deserialized state is validated
@@ -1411,9 +1413,10 @@ mod tests {
     ) -> bool {
         use crate::sample::state::MatcherState;
         match (&opts.modes[0], &state.matchers[0]) {
-            (SamplingMode::Grammar(compiled), MatcherState::Grammar(s)) => {
-                s.accepts_bytes(&compiled.grammar, bytes)
-            }
+            (
+                SamplingMode::Grammar(compiled),
+                MatcherState::Grammar { stack, .. },
+            ) => stack.accepts_bytes(&compiled.grammar, bytes),
             _ => unreachable!("first mode is not a grammar"),
         }
     }
@@ -1699,6 +1702,126 @@ mod tests {
         }
         assert_eq!(results[0].0, A);
         assert_eq!(results[0], results[1]);
+    }
+
+    /// The reconcile-by-grammar-identity load rule
+    /// ([`SamplerState::resumed_from`]): same grammar carries the
+    /// matcher position; a different grammar resets ONLY the matcher
+    /// (to the new grammar's root); `mu`/rng/ngram stats carry
+    /// unconditionally; a longer modes vec cannot OOB (fresh
+    /// index-aligned build).
+    #[test]
+    fn resumed_from_reconciles_by_grammar_identity() {
+        let opts = opts_with_grammar(false);
+        let mut cached = state_for(&opts);
+        // Advance mid-grammar (one step into "ab") and give the
+        // stream distinguishable content.
+        let tok = sample(
+            cands(&[(A, 20.0), (X, 0.0), (EOS, -20.0)]),
+            &opts,
+            &mut cached,
+        );
+        assert_eq!(tok, A);
+        cached.mu = Some(3.5);
+        cached.ngram_stats.add(crate::NGram::from(A), 1);
+
+        // Same grammar: position carries — "b" completes, "a" no
+        // longer accepted.
+        let resumed = SamplerState::resumed_from(&cached, &opts, &MockModel);
+        assert_eq!(resumed.matchers, cached.matchers);
+        assert_eq!(resumed.mu, cached.mu);
+        assert_eq!(resumed.rng, cached.rng);
+        assert_eq!(resumed.ngram_stats, cached.ngram_stats);
+        assert!(grammar_accepts(&opts, &resumed, b"b"));
+        assert!(!grammar_accepts(&opts, &resumed, b"a"));
+
+        // Different grammar: matcher at the NEW grammar's root; the
+        // stream still carries.
+        let other = SamplerConfig {
+            modes: vec![SamplingMode::grammar(r#"root ::= "ba""#).unwrap()],
+            ..opts.clone()
+        };
+        let resumed = SamplerState::resumed_from(&cached, &other, &MockModel);
+        assert!(grammar_accepts(&other, &resumed, b"b"), "root of \"ba\"");
+        assert!(!grammar_accepts(&other, &resumed, b"a"));
+        assert_eq!(resumed.rng, cached.rng);
+        assert_eq!(resumed.ngram_stats, cached.ngram_stats);
+
+        // Longer modes vec (run_call prepends call-derived modes):
+        // fresh index-aligned build, matched grammar still carries.
+        let longer = SamplerConfig {
+            modes: vec![opts.modes[0].clone(), SamplingMode::Greedy],
+            ..opts.clone()
+        };
+        let resumed = SamplerState::resumed_from(&cached, &longer, &MockModel);
+        assert_eq!(resumed.matchers.len(), 2);
+        assert!(grammar_accepts(&longer, &resumed, b"b"), "carried position");
+        assert!(matches!(
+            resumed.matchers[1],
+            crate::sample::state::MatcherState::Stateless
+        ));
+
+        // Shrunk to no constraints at all: nothing to reconcile, no
+        // panic, stream carries.
+        let bare = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            ..opts.clone()
+        };
+        let resumed = SamplerState::resumed_from(&cached, &bare, &MockModel);
+        assert_eq!(resumed.matchers.len(), 1);
+        assert_eq!(resumed.ngram_stats, cached.ngram_stats);
+    }
+
+    /// `resumed_from` deferred-matcher reconcile: same spec carries the
+    /// activation flag + position; a different deferred grammar gets a
+    /// fresh inactive root. `resolved_ignored` is recomputed from the
+    /// effective config, not carried.
+    #[test]
+    fn resumed_from_deferred_and_resolved_ignored() {
+        let deferred = crate::DeferredGrammar {
+            grammar: CompiledGrammar::parse(AB_GRAMMAR).unwrap(),
+            activate_after: vec![b"!".to_vec()],
+            feed_trigger: false,
+        };
+        let opts = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            deferred_grammar: Some(deferred.clone()),
+            repetition: None,
+            ..SamplerConfig::default()
+        };
+        let mut cached = state_for(&opts);
+        cached.activate_deferred(&deferred, b"a").unwrap();
+        // Stale memo that a recompute must drop (repetition is None ⇒
+        // resolved_ignored must come back empty).
+        cached.resolved_ignored.insert(crate::NGram::from(X));
+
+        // Same spec: activation + position carry.
+        let resumed = SamplerState::resumed_from(&cached, &opts, &MockModel);
+        assert_eq!(resumed.deferred, cached.deferred);
+        assert!(resumed.deferred.as_ref().unwrap().active);
+        assert!(
+            resumed.resolved_ignored.is_empty(),
+            "resolved_ignored is a config memo — recomputed, not carried",
+        );
+
+        // Different deferred grammar: fresh inactive root.
+        let other = SamplerConfig {
+            deferred_grammar: Some(crate::DeferredGrammar {
+                grammar: CompiledGrammar::parse(r#"root ::= "ba""#).unwrap(),
+                ..deferred
+            }),
+            ..opts.clone()
+        };
+        let resumed = SamplerState::resumed_from(&cached, &other, &MockModel);
+        assert!(!resumed.deferred.as_ref().unwrap().active);
+
+        // No deferred in the new config: none in the state.
+        let none = SamplerConfig {
+            deferred_grammar: None,
+            ..opts.clone()
+        };
+        let resumed = SamplerState::resumed_from(&cached, &none, &MockModel);
+        assert!(resumed.deferred.is_none());
     }
 
     /// The headline invariant of the config/state split: serialize a
