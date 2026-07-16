@@ -1,6 +1,6 @@
 use crate::{ngram::NGramStats, Candidates, Probability, Token};
 
-use xorshift::Rng;
+use rand::RngExt as _;
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -1225,7 +1225,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     mut candidates: Candidates,
     opts: &mut SampleOptions,
     freq_map: &mut NGramStats,
-    rng: &mut xorshift::Xoroshiro128,
+    rng: &mut rand_pcg::Pcg64Mcg,
     mu: &mut Option<f32>,
     model: &M,
 ) -> Result<Token, SampleError> {
@@ -1276,14 +1276,14 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     let banned = opts.banned_specials.clone();
 
     // Fallback snapshots (lazy-grammar check and/or emit-side specials
-    // ban): `Xoroshiro128` is `Copy` (`[u64; 2]`), `mu` is a plain
-    // `Option<f32>`, and the pre-fold candidates clone is a straight
-    // memcpy of the vector. Restoring these and replaying the fold
-    // consumes the identical RNG draw sequence on either path, so a
-    // fixed seed yields the same stream every run regardless of how
+    // ban): `Pcg64Mcg` is a single `u128` of state (Clone), `mu` is a
+    // plain `Option<f32>`, and the pre-fold candidates clone is a
+    // straight memcpy of the vector. Restoring these and replaying the
+    // fold consumes the identical RNG draw sequence on either path, so
+    // a fixed seed yields the same stream every run regardless of how
     // many checks fall back.
     let snapshot = if lazy || !banned.is_empty() {
-        Some((*rng, *mu, candidates.clone()))
+        Some((rng.clone(), *mu, candidates.clone()))
     } else {
         None
     };
@@ -1350,7 +1350,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
             // masked path, grammar filters included — with the forced-EOS
             // termination those filters provide when nothing legal
             // remains.
-            *rng = *rng_snap;
+            *rng = rng_snap.clone();
             *mu = *mu_snap;
             let filtered =
                 apply_modes(saved.clone(), opts, rng, mu, model, false);
@@ -1414,7 +1414,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
 fn apply_modes<M: crate::backend::Model + Sync>(
     candidates: Candidates,
     opts: &SampleOptions,
-    rng: &mut xorshift::Xoroshiro128,
+    rng: &mut rand_pcg::Pcg64Mcg,
     mu: &mut Option<f32>,
     model: &M,
     skip_constraints: bool,
@@ -1510,7 +1510,7 @@ fn apply_modes<M: crate::backend::Model + Sync>(
 /// one token.
 // TODO: better name
 pub(crate) fn choose_candidate(
-    rng: &mut xorshift::Xoroshiro128,
+    rng: &mut rand_pcg::Pcg64Mcg,
     candidates: Candidates,
 ) -> Candidates {
     if candidates.len().get() == 1 {
@@ -1520,7 +1520,7 @@ pub(crate) fn choose_candidate(
     let candidates = candidates.softmax(None);
 
     // Pick a token based on the probabilities
-    let val = rng.gen_range(0.0, 1.0);
+    let val = rng.random_range(0.0..1.0);
     let mut cum_prob = 0.0;
     for (i, token) in candidates.iter().enumerate() {
         cum_prob += token.p;
@@ -1538,7 +1538,7 @@ pub(crate) fn choose_candidate(
 mod tests {
     use super::*;
     use crate::{ngram::NGramStats, Token, TokenData};
-    use xorshift::SeedableRng;
+    use rand::Rng as _;
 
     /// Minimal `Model` for exercising `sample_token` without a GGUF on
     /// disk. Token id indexes straight into `PIECES`; id 0 is EOS with an
@@ -1635,14 +1635,14 @@ mod tests {
         )
     }
 
-    fn rng() -> xorshift::Xoroshiro128 {
-        xorshift::Xoroshiro128::from_seed(&[42, 1337][..])
+    fn rng() -> rand_pcg::Pcg64Mcg {
+        rand_pcg::Pcg64Mcg::new((1337u128 << 64) | 42)
     }
 
     fn sample(
         candidates: Candidates,
         opts: &mut SampleOptions,
-        rng: &mut xorshift::Xoroshiro128,
+        rng: &mut rand_pcg::Pcg64Mcg,
         mu: &mut Option<f32>,
     ) -> Token {
         let mut freq = NGramStats::new();

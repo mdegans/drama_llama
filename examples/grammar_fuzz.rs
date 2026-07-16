@@ -77,7 +77,7 @@ use drama_llama::{
 };
 use rand::rngs::SmallRng;
 use rand::seq::{IndexedRandom, SliceRandom};
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt as _, SeedableRng};
 use serde_json::{json, Value};
 
 // ───────────────────────────────────────────────────────────────────────

@@ -701,6 +701,10 @@ fn is_name_char(c: char) -> bool {
 
 /// Position within the element stream: which alt of which rule, and how
 /// far through it.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Position {
     rule_idx: u32,
@@ -721,6 +725,15 @@ struct Position {
 /// stacks coexist because GBNF rules branch on alternation. `Stack` is a
 /// [`TinyVec`] so typical-depth stacks stay inline (no per-clone heap
 /// allocation).
+// Serializable so a sampler-state snapshot can carry the matcher's
+// exact position. NOTE for the deserialize door (config/state split
+// Phase 3): positions index into a *specific* compiled grammar; a
+// deserialized StackState is only meaningful against the same source,
+// and indices must be bounds-checked on restore.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StackState {
     stacks: Vec<Stack>,
@@ -2064,6 +2077,39 @@ mod tests {
 
     fn parse_ok(src: &str) -> Grammar {
         Grammar::parse(src).expect("grammar should parse")
+    }
+
+    /// A mid-parse `StackState` must serde round-trip exactly (derived
+    /// `Eq`) and, restored against the same grammar, continue matching
+    /// from the same position — including a buffered partial UTF-8
+    /// codepoint in `pending`.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn stack_state_serde_round_trip() {
+        let grammar = Arc::new(parse_ok(
+            r#"root ::= "héllo" | "hénlo""#,
+        ));
+        let mut state = GrammarState::new(grammar.clone());
+        // Stop mid-codepoint: feed "h" + the first byte of "é" (2-byte
+        // UTF-8) so `pending` is non-empty and both alternation stacks
+        // are still alive.
+        let bytes = "héllo".as_bytes();
+        state.advance_bytes(&bytes[..2]).unwrap();
+
+        let json = serde_json::to_string(&state.inner).unwrap();
+        let restored: StackState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state.inner, restored);
+
+        // The restored matcher finishes the parse identically.
+        let mut resumed = GrammarState {
+            grammar,
+            inner: restored,
+            cache: Arc::new(DfaCache::new()),
+        };
+        resumed.advance_bytes(&bytes[2..]).unwrap();
+        assert!(resumed.is_complete());
+        state.advance_bytes(&bytes[2..]).unwrap();
+        assert_eq!(state.inner, resumed.inner);
     }
 
     #[test]

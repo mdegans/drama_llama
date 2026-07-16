@@ -119,8 +119,9 @@ pub struct NGramData {
     count: usize,
     /// Absolute generation step of each currently-tracked occurrence,
     /// in insertion order. Used by windowed-decay penalty math.
-    /// Skipped from serde — runtime state, not persisted config.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// Serialized: a restored snapshot must continue the exact same
+    /// windowed-decay math (`count == positions.len()` invariant and
+    /// `windowed_decayed_count` both depend on it).
     positions: VecDeque<u64>,
     /// The sum of the probabilities of the individual tokens in the Ngram.
     cum_prob: f64,
@@ -205,17 +206,42 @@ impl NGramData {
 /// * The total number of [`NGram`]s that have been added.
 /// * The total number of tokens that have been added.
 /// * [`NGramData`] for each [`NGram`] including count, cum_prob, and weight.
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-// TODO: Implement Deserialize
-#[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NGramStats {
     // BTreeMap, not HashMap: both penalty passes iterate this map and
     // accumulate additive float penalties, so iteration order must be
     // deterministic for a serialized-then-restored state to continue the
     // exact same stream. It also makes serialized blobs canonical.
+    // On the wire this is a sequence of (NGram, NGramData) pairs —
+    // human-readable formats (JSON, TOML) reject non-string map keys.
+    #[cfg_attr(feature = "serde", serde(with = "data_serde"))]
     data: BTreeMap<NGram, NGramData>,
     ngram_count: usize,
     token_count: usize,
+}
+
+/// `NGramStats::data` as a pair-sequence on the wire. BTreeMap
+/// iteration keeps the emitted sequence canonical.
+#[cfg(feature = "serde")]
+mod data_serde {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<NGram, NGramData>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(map.iter())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<NGram, NGramData>, D::Error> {
+        Ok(Vec::<(NGram, NGramData)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
 }
 
 impl NGramStats {
@@ -453,6 +479,39 @@ mod tests {
         assert_approx_eq!(data.weight(), 1.0, 1e-6);
         data.add_weight(f64::NAN);
         assert_approx_eq!(data.weight(), 1.0, 1e-6);
+    }
+
+    /// A serde round-trip must reconstruct the stats exactly —
+    /// including `positions`, which the windowed-decay penalty math
+    /// reads. Derived `PartialEq` is the comparator, same as the
+    /// eventual SamplerState bit-exact test.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_ngram_stats_serde_round_trip() {
+        let n: usize = 10;
+        let mut stats = NGramStats::new();
+        let mut c = Candidates::new(n).unwrap();
+        for i in 0..n {
+            c.data[i].id = i as Token;
+            c.data[i].logit = -(i as f32 / n as f32);
+        }
+        let c = c.softmax(None);
+        let k = c.len();
+        let c = c.sort(Sorted::ById { k });
+
+        for step in 0..8u64 {
+            let ngram =
+                NGram::try_from_tokens(&[step as Token, 1, 2]).unwrap();
+            stats.add(ngram, &c, step);
+        }
+        stats.evict_outside_window(8, 4);
+
+        let json = serde_json::to_string(&stats).unwrap();
+        let restored: NGramStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(stats, restored);
+        // And a second serialization is byte-identical (canonical blobs
+        // — BTreeMap ordering).
+        assert_eq!(json, serde_json::to_string(&restored).unwrap());
     }
 
     #[test]

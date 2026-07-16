@@ -878,7 +878,7 @@ impl Candidates {
     ///   container.
     pub fn mirostat(
         self,
-        rng: &mut xorshift::Xoroshiro128,
+        rng: &mut rand_pcg::Pcg64Mcg,
         tau: f32,
         eta: f32,
         max_keep: Option<NonZeroUsize>,
@@ -949,7 +949,7 @@ impl Candidates {
     /// the rationale that more than 100 candidates is likely to be too many.
     pub fn mirostat_v2(
         self,
-        rng: &mut xorshift::Xoroshiro128,
+        rng: &mut rand_pcg::Pcg64Mcg,
         tau: f32,
         eta: f32,
         max_keep: Option<NonZeroUsize>,
@@ -1187,7 +1187,7 @@ impl Candidates {
         tokens: &[Token],
         opts: &mut SampleOptions,
         freq_map: &mut NGramStats,
-        rng: &mut xorshift::Xoroshiro128,
+        rng: &mut rand_pcg::Pcg64Mcg,
         mu: &mut Option<f32>,
         model: &M,
     ) -> Result<Token, SampleError> {

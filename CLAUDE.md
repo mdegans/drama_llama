@@ -278,7 +278,7 @@ cargo test -- --include-ignored
 # Build binaries (each has required features)
 cargo build --bin dittomancer --features "webchat,cli"
 cargo build --bin regurgitater --features "webchat,cli,stats"
-cargo build --bin settings_tool --features "egui,serde,serde_json"
+cargo build --bin settings_tool --features "egui,serde"
 
 # Generate docs
 cargo doc --open --features "webchat,cli,stats,toml,serde,egui"
@@ -323,5 +323,5 @@ cargo doc --open --features "webchat,cli,stats,toml,serde,egui"
 
 - Sampling is intentionally **not** delegated to llama.cpp's sampler chain API. The Rust implementations exist for learning/control purposes and should be maintained independently.
 - `Candidates` uses consuming `self` methods (e.g. `softmax(self) -> Self`) to enforce that sort/softmax state tracking stays consistent.
-- The crate manages its own RNG (`xorshift::Xoroshiro128`) rather than using llama.cpp's RNG.
+- The crate manages its own RNG (`rand_pcg::Pcg64Mcg` — serializable state, `u128` seed) rather than using llama.cpp's RNG.
 - Most tests that exercise the model are `#[ignore]` tagged as "long running". The model symlink at `models/model.gguf` must point to a valid GGUF file.

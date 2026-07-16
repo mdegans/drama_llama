@@ -1,6 +1,6 @@
 use std::num::{NonZeroU128, NonZeroUsize};
 
-use xorshift::{SeedableRng, Xoroshiro128};
+use rand_pcg::Pcg64Mcg;
 
 use crate::{
     backend::{Backend, Decoder, Model},
@@ -445,7 +445,7 @@ impl<'engine, B: Backend> From<CandidatePredictor<'engine, B>> for Vec<Token> {
 }
 
 pub struct TokenPredictor<'engine, B: Backend> {
-    rng: Xoroshiro128,
+    rng: Pcg64Mcg,
     ngram_stats: NGramStats,
     options: PredictOptions,
     pub text: String,
@@ -507,8 +507,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         engine: &Engine<B>,
         tokens: &[Token],
         mut options: PredictOptions,
-    ) -> (Xoroshiro128, NGramStats, PredictOptions, usize) {
-        // convert seed from a u128 to [u64; 2] to seed the rng
+    ) -> (Pcg64Mcg, NGramStats, PredictOptions, usize) {
         let seed = match options.seed {
             Some(seed) => seed,
             None => match std::time::SystemTime::now()
@@ -523,19 +522,6 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             },
         };
         options.seed = Some(seed);
-
-        // I can't think of a cleaner way to do this without unsafe right now.
-        let seed = seed.get().to_le_bytes();
-        let seed = [
-            u64::from_le_bytes([
-                seed[0], seed[1], seed[2], seed[3], seed[4], seed[5], seed[6],
-                seed[7],
-            ]),
-            u64::from_le_bytes([
-                seed[8], seed[9], seed[10], seed[11], seed[12], seed[13],
-                seed[14], seed[15],
-            ]),
-        ];
 
         let mut ngram_stats = NGramStats::new();
         // Dummy candidates to start. TODO: Rethink this. Ngram stats are
@@ -572,7 +558,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             .unwrap_or(0);
 
         (
-            Xoroshiro128::from_seed(&seed),
+            Pcg64Mcg::new(seed.get()),
             ngram_stats,
             options,
             max_stop_len,

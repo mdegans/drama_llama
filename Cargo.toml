@@ -29,12 +29,12 @@ derive_more = { version = "1", features = ["from"] }
 num = "0.4"
 uuid = { version = "1", features = ["v4"] }
 partial_sort = { version = "0.2.0" }
-rand = { version = "0.9" }
+rand = { version = "0.10" }
 regex = "1.10"
 static_assertions = "1.1.0"
 thiserror = "1.0"
 tinyvec = { version = "1.6", features = ["alloc"] }
-xorshift = "0.1"
+rand_pcg = { version = "0.10.2", default-features = false }
 rayon = "1.10.0"
 dashmap = "6"
 rustc-hash = "2"
@@ -92,7 +92,7 @@ webchat = [
 # `SampleOptions` through serde-derived impls.
 toml = ["dep:toml", "serde"]
 cli = ["dep:clap", "llama-cpp"]
-serde = ["tinyvec/serde"]
+serde = ["tinyvec/serde", "rand_pcg/serde"]
 stats = ["dep:stringmetrics"]
 cuda = ["llama-cpp", "llama-cpp-sys-3/cuda"]
 cuda_f16 = ["llama-cpp", "llama-cpp-sys-3/cuda_f16"]
