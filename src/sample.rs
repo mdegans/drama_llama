@@ -167,7 +167,7 @@ pub struct SampleOptions {
     /// wiring set by `Session` per call from the model's specials ×
     /// the analyzed dialect; not serialized.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub banned_specials: std::sync::Arc<[Token]>,
+    pub banned_specials: Vec<Token>,
 }
 
 /// A grammar that starts suspended and activates once a specific byte
@@ -213,7 +213,7 @@ impl SampleOptions {
             repetition: None,
             deferred_grammar: None,
             lazy_grammar: false,
-            banned_specials: std::sync::Arc::from([]),
+            banned_specials: Vec::new(),
         }
     }
 
@@ -366,7 +366,7 @@ impl Default for SampleOptions {
             repetition: Some(RepetitionOptions::default()),
             deferred_grammar: None,
             lazy_grammar: false,
-            banned_specials: std::sync::Arc::from([]),
+            banned_specials: Vec::new(),
         }
     }
 }

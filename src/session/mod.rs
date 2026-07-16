@@ -1626,9 +1626,9 @@ impl<B: Backend> Session<B> {
     ///
     /// [`Model::special_tokens`]: crate::backend::Model::special_tokens
     /// [`SampleOptions::banned_specials`]: crate::SampleOptions
-    fn emit_ban_set(&self) -> std::sync::Arc<[Token]> {
+    fn emit_ban_set(&self) -> Vec<Token> {
         if !self.emit_specials_ban {
-            return std::sync::Arc::from([]);
+            return Vec::new();
         }
         let model = &self.engine.model;
         let syntax = effective_tool_syntax(&self.dialect);
@@ -1689,7 +1689,7 @@ impl<B: Backend> Session<B> {
             .collect();
         banned.sort_unstable();
         banned.dedup();
-        banned.into()
+        banned
     }
 
     /// Decoded pieces of every end-of-generation token
