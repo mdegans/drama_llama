@@ -351,10 +351,10 @@ impl ChatTemplate {
     ) -> Result<RenderedWithBreakpoints, ChatTemplateError> {
         let text = self.render_with(prompt, opts)?;
         let breakpoints = collect_breakpoints(prompt);
-        let mut partial_texts = Vec::with_capacity(breakpoints.len());
+        let mut partials = Vec::with_capacity(breakpoints.len());
         for bp in breakpoints {
             match render_partial(self, prompt, opts, bp) {
-                Ok(s) => partial_texts.push(s),
+                Ok(s) => partials.push((bp, s)),
                 Err(_e) => {
                     // Drop this breakpoint — same fail-open posture
                     // tokenize_with_breakpoints uses for non-prefix-
@@ -375,10 +375,7 @@ impl ChatTemplate {
                 }
             }
         }
-        Ok(RenderedWithBreakpoints {
-            text,
-            partial_texts,
-        })
+        Ok(RenderedWithBreakpoints { text, partials })
     }
 }
 
@@ -391,10 +388,14 @@ impl ChatTemplate {
 /// each should tokenize to a strict prefix of [`text`](Self::text) for
 /// any well-behaved chat template.
 ///
-/// `partial_texts` is ordered canonically by how much of the prompt is
+/// `partials` is ordered canonically by how much of the prompt is
 /// included: [`AfterTools`], then [`AfterSystem`], then
 /// [`AfterMessage(0)`], [`AfterMessage(1)`], … Only breakpoints that
-/// actually exist in the prompt appear.
+/// actually exist in the prompt appear. Each partial carries the
+/// [`PromptBreakpoint`] it truncates at, so cache machinery can map a
+/// matched breakpoint back to its position in Prompt *structure*
+/// (which blocks precede it) — the Session's block-gated seeding fold
+/// resumes from exactly that cursor.
 ///
 /// [`Session`]: crate::Session
 /// [`AfterTools`]: PromptBreakpoint::AfterTools
@@ -406,8 +407,9 @@ pub struct RenderedWithBreakpoints {
     /// Full render — equivalent to
     /// [`ChatTemplate::render_with`]'s output.
     pub text: String,
-    /// One partial render per breakpoint, in canonical order.
-    pub partial_texts: Vec<String>,
+    /// One `(breakpoint, partial render)` pair per breakpoint, in
+    /// canonical order.
+    pub partials: Vec<(PromptBreakpoint, String)>,
 }
 
 /// Options passed to [`ChatTemplate::render_with`].
@@ -541,7 +543,7 @@ impl RenderOptions {
 /// [`AfterSystem`]: PromptBreakpoint::AfterSystem
 /// [`AfterMessage(i)`]: PromptBreakpoint::AfterMessage
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PromptBreakpoint {
+pub enum PromptBreakpoint {
     /// After the tools section — any cache marker on any
     /// [`tool::CustomMethodDef`](misanthropic::tool::CustomMethodDef) in
     /// [`Prompt::functions`] produces this, regardless of which
@@ -673,9 +675,8 @@ pub fn tokenize_with_breakpoints<M: Model>(
     rendered: &RenderedWithBreakpoints,
 ) -> (Vec<Token>, Vec<usize>) {
     let full_tokens = model.tokenize(&rendered.text, true);
-    let mut indices: Vec<usize> =
-        Vec::with_capacity(rendered.partial_texts.len());
-    for partial in &rendered.partial_texts {
+    let mut indices: Vec<usize> = Vec::with_capacity(rendered.partials.len());
+    for (_, partial) in &rendered.partials {
         let partial_tokens = model.tokenize(partial, true);
         if partial_tokens.len() <= full_tokens.len()
             && full_tokens[..partial_tokens.len()] == partial_tokens[..]
@@ -1980,7 +1981,7 @@ mod tests {
                 &RenderOptions::default().with_generation_prompt(true),
             )
             .unwrap();
-        assert!(out.partial_texts.is_empty());
+        assert!(out.partials.is_empty());
         assert!(out.text.starts_with("<|begin_of_text|>"));
     }
 
@@ -2012,12 +2013,8 @@ mod tests {
             "full render must end with generation prompt: {:?}",
             out.text
         );
-        assert_eq!(
-            out.partial_texts.len(),
-            1,
-            "one cache marker → one partial"
-        );
-        for (i, p) in out.partial_texts.iter().enumerate() {
+        assert_eq!(out.partials.len(), 1, "one cache marker → one partial");
+        for (i, (_, p)) in out.partials.iter().enumerate() {
             assert!(
                 !p.ends_with(GEN),
                 "partial {i} must not end with generation prompt: {p:?}"
@@ -2136,11 +2133,11 @@ mod tests {
             )
             .expect("full render must succeed on a well-formed Qwen3 prompt");
         assert_eq!(
-            out.partial_texts.len(),
+            out.partials.len(),
             1,
             "AfterSystem breakpoint must survive partial rendering"
         );
-        assert!(out.partial_texts[0].contains("You are agent."));
+        assert!(out.partials[0].1.contains("You are agent."));
     }
 
     /// Strict env (full render) must continue to surface raises as
@@ -2200,7 +2197,7 @@ mod tests {
 
         let opts = RenderOptions::default().with_generation_prompt(true);
         let rendered = t.render_with_breakpoints(&prompt, &opts).unwrap();
-        assert_eq!(rendered.partial_texts.len(), 1);
+        assert_eq!(rendered.partials.len(), 1);
 
         let (full_tokens, indices) =
             tokenize_with_breakpoints(&engine.model, &rendered);
@@ -2210,7 +2207,7 @@ mod tests {
 
         // The partial's tokens equal the full's tokens up to `idx`.
         let partial_tokens =
-            engine.model.tokenize(&rendered.partial_texts[0], true);
+            engine.model.tokenize(&rendered.partials[0].1, true);
         assert_eq!(partial_tokens.len(), idx);
         assert_eq!(&full_tokens[..idx], partial_tokens.as_slice());
     }

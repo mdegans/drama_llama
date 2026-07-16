@@ -81,6 +81,7 @@ use misanthropic::response::Usage;
 
 use crate::{
     backend::{Backend, Model},
+    chat_template::PromptBreakpoint,
     output_config, ChatTemplate, ChatTemplateError, Engine, OutputConfigError,
     OutputConfigOptions, PredictOptions, Prompt, RenderOptions,
     RepetitionOptions, SamplerConfig, SamplerState, SamplingMode, Token, Tool,
@@ -2253,53 +2254,62 @@ impl<B: Backend> Session<B> {
             }
             None => self.render_opts.clone(),
         };
-        let (rendered_prompt, entries, breakpoints, partial_hashes) =
-            if self.prefix_cache.is_some() {
-                let rendered =
-                    self.template.render_with_breakpoints(prompt, &opts)?;
-                // Inlines `tokenize_with_breakpoints` so we can keep
-                // the SHA-256 of each surviving partial paired with
-                // its entry position. The shared helper only returns
-                // indices and applies sort+dedup, which would lose
-                // the partial→hash mapping (and knows nothing of media).
-                let (full_entries, full_ids, _) =
-                    self.tokenize_split(&rendered.text, &media)?;
-                let mut pairs: Vec<(EntryPos, [u8; 32])> =
-                    Vec::with_capacity(rendered.partial_texts.len());
-                for partial in &rendered.partial_texts {
-                    let (p_entries, p_ids, p_hash) =
-                        self.tokenize_split(partial, &media)?;
-                    // Same fail-open contract as
-                    // `chat_template::tokenize_with_breakpoints`,
-                    // generalized: drop the breakpoint silently unless
-                    // the partial is an entry-wise prefix of the full
-                    // render AND its images are the full render's first
-                    // k (media entries compare by id + span, so a
-                    // reordered or swapped image also fails the check).
-                    if p_entries.len() <= full_entries.len()
-                        && full_entries[..p_entries.len()] == p_entries[..]
-                        && p_ids.len() <= full_ids.len()
-                        && full_ids[..p_ids.len()] == p_ids[..]
-                    {
-                        pairs.push((
-                            entry_pos_at(&full_entries, p_entries.len()),
-                            p_hash,
-                        ));
-                    }
+        let (
+            rendered_prompt,
+            entries,
+            breakpoints,
+            partial_hashes,
+            breakpoint_ids,
+        ) = if self.prefix_cache.is_some() {
+            let rendered =
+                self.template.render_with_breakpoints(prompt, &opts)?;
+            // Inlines `tokenize_with_breakpoints` so we can keep
+            // the SHA-256 of each surviving partial paired with
+            // its entry position and PromptBreakpoint identity.
+            // The shared helper only returns indices and applies
+            // sort+dedup, which would lose the mapping (and knows
+            // nothing of media).
+            let (full_entries, full_ids, _) =
+                self.tokenize_split(&rendered.text, &media)?;
+            let mut triples: Vec<(EntryPos, [u8; 32], PromptBreakpoint)> =
+                Vec::with_capacity(rendered.partials.len());
+            for (bp_id, partial) in &rendered.partials {
+                let (p_entries, p_ids, p_hash) =
+                    self.tokenize_split(partial, &media)?;
+                // Same fail-open contract as
+                // `chat_template::tokenize_with_breakpoints`,
+                // generalized: drop the breakpoint silently unless
+                // the partial is an entry-wise prefix of the full
+                // render AND its images are the full render's first
+                // k (media entries compare by id + span, so a
+                // reordered or swapped image also fails the check).
+                if p_entries.len() <= full_entries.len()
+                    && full_entries[..p_entries.len()] == p_entries[..]
+                    && p_ids.len() <= full_ids.len()
+                    && full_ids[..p_ids.len()] == p_ids[..]
+                {
+                    triples.push((
+                        entry_pos_at(&full_entries, p_entries.len()),
+                        p_hash,
+                        *bp_id,
+                    ));
                 }
-                pairs.sort_by_key(|(ep, _)| ep.entry);
-                pairs.dedup_by_key(|(ep, _)| ep.entry);
-                let breakpoints: Vec<EntryPos> =
-                    pairs.iter().map(|(ep, _)| *ep).collect();
-                let hashes: Vec<[u8; 32]> =
-                    pairs.into_iter().map(|(_, h)| h).collect();
-                (rendered.text, full_entries, breakpoints, hashes)
-            } else {
-                // Fast path: single render + tokenize, no partials.
-                let rendered = self.template.render_with(prompt, &opts)?;
-                let (entries, _, _) = self.tokenize_split(&rendered, &media)?;
-                (rendered, entries, Vec::new(), Vec::new())
-            };
+            }
+            triples.sort_by_key(|(ep, _, _)| ep.entry);
+            triples.dedup_by_key(|(ep, _, _)| ep.entry);
+            let breakpoints: Vec<EntryPos> =
+                triples.iter().map(|(ep, _, _)| *ep).collect();
+            let hashes: Vec<[u8; 32]> =
+                triples.iter().map(|(_, h, _)| *h).collect();
+            let ids: Vec<PromptBreakpoint> =
+                triples.into_iter().map(|(_, _, id)| id).collect();
+            (rendered.text, full_entries, breakpoints, hashes, ids)
+        } else {
+            // Fast path: single render + tokenize, no partials.
+            let rendered = self.template.render_with(prompt, &opts)?;
+            let (entries, _, _) = self.tokenize_split(&rendered, &media)?;
+            (rendered, entries, Vec::new(), Vec::new(), Vec::new())
+        };
         let pre_opened_reasoning =
             render_ends_with_open_reasoning(&rendered_prompt, &self.dialect);
 
@@ -2331,6 +2341,7 @@ impl<B: Backend> Session<B> {
             modes,
             deferred_grammar,
             partial_hashes,
+            breakpoint_ids,
             pre_opened_reasoning,
             rendered_prompt,
             media_by_id: media.media_by_id,
@@ -3315,6 +3326,7 @@ impl<B: Backend> Session<B> {
             modes,
             deferred_grammar,
             partial_hashes,
+            breakpoint_ids: _,
             pre_opened_reasoning,
             rendered_prompt,
             media_by_id,
@@ -4185,6 +4197,11 @@ struct PreparedCall {
     /// SHA-256 of each surviving partial render, parallel to
     /// `breakpoints`.
     partial_hashes: Vec<[u8; 32]>,
+    /// [`PromptBreakpoint`] identity of each surviving breakpoint,
+    /// parallel to `breakpoints` (dropped in lockstep by the
+    /// prefix-safety check). Maps a matched breakpoint back to Prompt
+    /// structure — the seeding fold's resume cursor.
+    breakpoint_ids: Vec<PromptBreakpoint>,
     /// The rendered generation prompt ends inside an open reasoning
     /// block (Qwen-style pre-opened `<think>\n`): generation starts
     /// mid-thought, and the parser must be told (issue #27).
