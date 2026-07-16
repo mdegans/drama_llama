@@ -227,9 +227,6 @@ impl SampleOptions {
                 // Otherwise they must remove and re-add them in the desired order.
                 // TODO: Test combinations of modes since I am fairly sure some make the
                 // assumption all candidates are present and may crash if they are not.
-                // TODO: Add temperature to the sampling modes. It's an oversight that
-                // it's not here. It's not a priority since it's not very useful on it's
-                // own, but it could be in combination with other modes.
                 let mut remove = None;
                 let n_modes = self.modes.len();
                 for (i, mode) in self.modes.iter_mut().enumerate() {
@@ -379,6 +376,16 @@ pub enum SamplingMode {
     /// Greedy sampling. The most likely next token is always chosen. Not very
     /// useful unless you want to regurgitate the training data.
     Greedy,
+    /// Temperature scaling. Divides every logit by `t`, flattening
+    /// (`t > 1.0`) or sharpening (`t < 1.0`) the distribution before
+    /// whatever follows in the chain. Composable: place before a
+    /// truncation mode (top-p/top-k) in the conventional order.
+    Temperature {
+        /// `t <= 0.0` collapses to greedy (argmax), matching `llama.cpp`.
+        /// `1.0` is a no-op. Reasonable values are 0.2 (focused) to 1.5
+        /// (diverse).
+        t: f32,
+    },
     /// Top-p sampling. A token is chosen from the top tokens whose cumulative
     /// probability is greater than or equal to `p`.
     TopP {
@@ -645,8 +652,9 @@ pub enum SamplingMode {
 impl SamplingMode {
     // TODO: Figure out a way to statically assert that the length of this list
     // is equal to the number of variants in SamplingMode.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Greedy,
+        Self::temperature(),
         Self::top_p(),
         Self::top_k(),
         Self::min_p(),
@@ -695,6 +703,7 @@ impl SamplingMode {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Greedy => "Greedy",
+            Self::Temperature { .. } => "Temperature",
             Self::TopP { .. } => "Top-P",
             Self::TopK { .. } => "Top-K",
             Self::MinP { .. } => "Min-P",
@@ -714,6 +723,7 @@ impl SamplingMode {
     pub fn help(&self) -> &'static str {
         match self {
             Self::Greedy => "The most likely next token is always chosen. Not very useful unless you want to regurgitate the training data.",
+            Self::Temperature { .. } => "Divides every logit by `t`, flattening (t > 1.0) or sharpening (t < 1.0) the distribution. t <= 0.0 collapses to greedy.",
             Self::TopP { .. } => "A token is chosen from the top tokens whose cumulative probability is greater than or equal to `p`.",
             Self::TopK { .. } => "A token is chosen from the top `k` tokens. This is not very good.",
             Self::MinP { .. } => "Min-p sampling. `p` sets the minimum probability to keep a token. Below that the tail is cut off. `p` is scaled by the top token's probability to balance diversity and quality.",
@@ -727,6 +737,11 @@ impl SamplingMode {
             Self::Grammar(_) => "Constrains generation to a GBNF grammar. Place early in the chain so it prunes candidates before top-p/top-k. On grammar violation, forces EOS and terminates.",
             Self::Deny { .. } => "Forbids every candidate whose token id falls in `range`. Place at the start of the chain — typically used for the model's reserved/empty-piece vocab tail.",
         }
+    }
+
+    /// Default temperature scaling: t = 0.8 (the `llama.cpp` default).
+    pub const fn temperature() -> Self {
+        Self::Temperature { t: 0.8 }
     }
 
     /// Default top-p sampling: p = 0.9 with no minimum keep.
@@ -864,6 +879,15 @@ impl SamplingMode {
             // is available for each branch. This way the caller can use it to
             // detect clicks, changes, etc.
             Self::Greedy => ui.separator(),
+            Self::Temperature { t } => {
+                let inner = ui
+                    .add(egui::Slider::new(t, 0.0..=2.0).text("T"))
+                    .on_hover_text_at_pointer(
+                        "Higher is more diverse, lower is more focused. 1.0 is a no-op; 0.0 is greedy.",
+                    );
+                *t = t.clamp(0.0, 2.0);
+                inner
+            }
             Self::TopP { p, min_keep } => {
                 let mut inner = ui.add(egui::Slider::new(&mut p.p, 0.0..=1.0).text("P"))
                     .on_hover_text_at_pointer("0.9-0.95 is a good range for creative uses. Higher is more diverse, but potentially less coherent. 0.0 will give the same result as greedy.");
@@ -1057,6 +1081,9 @@ impl PartialEq for SamplingMode {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Greedy, Self::Greedy) => true,
+            (Self::Temperature { t: t1 }, Self::Temperature { t: t2 }) => {
+                t1 == t2
+            }
             (
                 Self::TopP {
                     p: p1,
@@ -1393,6 +1420,7 @@ fn apply_modes<M: crate::backend::Model + Sync>(
             }
             match mode {
                 SamplingMode::Greedy => candidates.sample_token_greedy(),
+                SamplingMode::Temperature { t } => candidates.temperature(t),
                 SamplingMode::TopP { p, min_keep } => {
                     candidates.top_p(p, min_keep)
                 }

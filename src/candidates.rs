@@ -991,6 +991,30 @@ impl Candidates {
         new
     }
 
+    /// Temperature scaling. Divides every logit by `t`, flattening
+    /// (`t > 1.0`) or sharpening (`t < 1.0`) the distribution.
+    /// `t <= 0.0` collapses to greedy (argmax), matching `llama.cpp`.
+    ///
+    /// Time complexity is O(n). Sort order is unchanged (positive
+    /// divisor), but probabilities are stale afterwards, so any applied
+    /// softmax is invalidated.
+    pub fn temperature(mut self, t: f32) -> Self {
+        if t <= 0.0 {
+            return self.sample_token_greedy();
+        }
+        if t == 1.0 {
+            return self;
+        }
+
+        for token in self.data.iter_mut() {
+            token.logit /= t;
+        }
+
+        // Scaling changes the distribution but not the ordering.
+        self.softmax_applied_to = None;
+        self
+    }
+
     /// Entropy sampling.
     ///
     /// Time complexity is O(n) where softmax has already been applied to n.
@@ -1785,6 +1809,46 @@ mod tests {
             .iter()
             .zip(out.iter().skip(1))
             .all(|(a, b)| a.logit >= b.logit));
+    }
+
+    #[test]
+    fn test_temperature() {
+        // t == 1.0 is a no-op: logits unchanged, softmax cache preserved.
+        let n = 5;
+        let mut c = Candidates::new(n).unwrap();
+        for i in 0..n {
+            c.data[i].logit = -(i as f32);
+        }
+        let c = c.softmax(None);
+        assert!(c.softmax_applied_to.is_some());
+        let out = c.temperature(1.0);
+        assert!(out.softmax_applied_to.is_some(), "t=1.0 must be a no-op");
+        assert!(out
+            .iter()
+            .zip(out.iter().skip(1))
+            .all(|(a, b)| a.logit >= b.logit));
+
+        // t > 0 divides every logit by t, preserves order, and
+        // invalidates any applied softmax.
+        let expected: Vec<f32> = out.iter().map(|d| d.logit / 2.0).collect();
+        let out = out.temperature(2.0);
+        let after: Vec<f32> = out.iter().map(|d| d.logit).collect();
+        assert_eq!(expected, after);
+        assert!(out.softmax_applied_to.is_none());
+        assert!(out
+            .iter()
+            .zip(out.iter().skip(1))
+            .all(|(a, b)| a.logit >= b.logit));
+
+        // t <= 0 collapses to greedy: a single candidate, the argmax.
+        let n = 5;
+        let mut c = Candidates::new(n).unwrap();
+        for i in 0..n {
+            c.data[i].logit = i as f32; // argmax is id 4
+        }
+        let out = c.temperature(0.0);
+        assert_eq!(out.len(), NonZeroUsize::new(1).unwrap());
+        assert_eq!(out.iter().next().unwrap().id, 4);
     }
 
     #[test]
