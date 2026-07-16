@@ -4,7 +4,6 @@ use rand::RngExt as _;
 
 use std::num::NonZeroUsize;
 
-
 pub(crate) mod grammar;
 mod json;
 mod repetition;
@@ -15,10 +14,10 @@ pub use grammar::{
     CompiledGrammar, Grammar, GrammarError, GrammarState, GrammarStats,
 };
 pub use json::{JsonError, JsonState};
-pub use state::SamplerState;
 pub use repetition::{
     apply_sample_repetition_ngram, RepetitionError, RepetitionOptions,
 };
+pub use state::SamplerState;
 
 #[cfg(feature = "egui")]
 pub(crate) const DELETE_ICON: egui::ImageSource<'static> =
@@ -933,7 +932,6 @@ impl Default for SamplingMode {
     }
 }
 
-
 #[derive(Debug, thiserror::Error, derive_more::From)]
 pub enum SampleError {
     #[error("Sampling failed because of a repetition error: {err}")]
@@ -1156,16 +1154,11 @@ fn apply_modes<M: crate::backend::Model + Sync>(
         rng,
         ..
     } = &mut *state;
-    let mut candidates = opts
-        .modes
-        .iter()
-        .zip(matchers.iter())
-        .fold(candidates, |candidates, (mode, matcher)| {
+    let mut candidates = opts.modes.iter().zip(matchers.iter()).fold(
+        candidates,
+        |candidates, (mode, matcher)| {
             if skip_constraints
-                && matches!(
-                    mode,
-                    SamplingMode::Json | SamplingMode::Grammar(_)
-                )
+                && matches!(mode, SamplingMode::Json | SamplingMode::Grammar(_))
             {
                 return candidates;
             }
@@ -1235,7 +1228,8 @@ fn apply_modes<M: crate::backend::Model + Sync>(
                     }
                 }
             }
-        });
+        },
+    );
     if !skip_constraints {
         if let (Some(d), Some(spec)) =
             (deferred.as_ref(), opts.deferred_grammar.as_ref())
@@ -1537,14 +1531,8 @@ mod tests {
     fn lazy_completion_forces_eos_and_stays_complete() {
         let opts = opts_with_grammar(true);
         let mut state = state_for(&opts);
-        assert_eq!(
-            sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state),
-            A
-        );
-        assert_eq!(
-            sample(cands(&[(B, 20.0), (X, 0.0)]), &opts, &mut state),
-            B
-        );
+        assert_eq!(sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state), A);
+        assert_eq!(sample(cands(&[(B, 20.0), (X, 0.0)]), &opts, &mut state), B);
         // Grammar complete; only non-empty illegal pieces on offer.
         assert_eq!(
             sample(cands(&[(C, 20.0), (X, 0.0)]), &opts, &mut state),
@@ -1654,14 +1642,8 @@ mod tests {
     fn lazy_rejects_empty_piece_after_completion() {
         let opts = opts_with_grammar(true);
         let mut state = state_for(&opts);
-        assert_eq!(
-            sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state),
-            A
-        );
-        assert_eq!(
-            sample(cands(&[(B, 20.0), (X, 0.0)]), &opts, &mut state),
-            B
-        );
+        assert_eq!(sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state), A);
+        assert_eq!(sample(cands(&[(B, 20.0), (X, 0.0)]), &opts, &mut state), B);
         // Grammar complete. The dominant pick is a reserved-style
         // empty-piece token; pre-fix it was accepted and emitted
         // forever. Now: rejected, fallback drops it too, EOS forced.
@@ -1677,14 +1659,8 @@ mod tests {
     fn masked_rejects_empty_piece_after_completion() {
         let opts = opts_with_grammar(false);
         let mut state = state_for(&opts);
-        assert_eq!(
-            sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state),
-            A
-        );
-        assert_eq!(
-            sample(cands(&[(B, 20.0), (X, 0.0)]), &opts, &mut state),
-            B
-        );
+        assert_eq!(sample(cands(&[(A, 20.0), (X, 0.0)]), &opts, &mut state), A);
+        assert_eq!(sample(cands(&[(B, 20.0), (X, 0.0)]), &opts, &mut state), B);
         assert_eq!(
             sample(cands(&[(RSV, 20.0), (X, 0.0)]), &opts, &mut state),
             EOS
@@ -1758,8 +1734,9 @@ mod tests {
         let mut restored_tokens = tokens.clone();
         for step in 0..8 {
             let c = cands(&[(B, 4.0), (A, 3.9), (X, 3.8), (EOS, -20.0)]);
-            let a = sample_token(&tokens, c.clone(), &opts, &mut state, &MockModel)
-                .unwrap();
+            let a =
+                sample_token(&tokens, c.clone(), &opts, &mut state, &MockModel)
+                    .unwrap();
             let b = sample_token(
                 &restored_tokens,
                 c,
