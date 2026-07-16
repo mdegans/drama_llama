@@ -45,8 +45,12 @@ where
 pub struct PredictOptions {
     /// Maximum number of tokens to predict.
     pub n: NonZeroUsize,
-    /// Random seed. If this is `Some`, the prediction will be deterministic.
-    /// Otherwise the seed will be based on the current time.
+    /// Random seed. `Some` = deterministic prediction (a fork, under
+    /// `Session`'s resume/fork/fresh trichotomy). `None` (the default)
+    /// = a fresh random seed per call — unless the caller resumes a
+    /// cached [`SamplerState`](crate::SamplerState), whose working rng
+    /// continues the prior stream. [`Self::DEFAULT_SEED`] remains
+    /// available for reproducible runs.
     pub seed: Option<NonZeroU128>,
     /// Stop sequences by token. When any of these are reached, the prediction
     /// will stop.
@@ -73,7 +77,7 @@ impl Default for PredictOptions {
     fn default() -> Self {
         Self {
             n: NonZeroUsize::new(512).unwrap(),
-            seed: Some(Self::DEFAULT_SEED),
+            seed: None,
             stop_sequences: Vec::new(),
             stop_strings: Vec::new(),
             regex_stop_sequences: Vec::new(),
@@ -461,13 +465,18 @@ pub struct TokenPredictor<'engine, B: Backend> {
 }
 
 impl<'engine, B: Backend> TokenPredictor<'engine, B> {
+    /// `initial_state`: `Some` resumes a caller-owned
+    /// [`SamplerState`](crate::SamplerState) (no `init_state`, no
+    /// prompt seeding — see [`Self::prepare`]); `None` builds a fresh
+    /// state from `options`.
     pub fn new(
         engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> Self {
         let (state, options, max_stop_len) =
-            Self::prepare(engine, &tokens, options);
+            Self::prepare(engine, &tokens, options, initial_state);
         let inner = CandidatePredictor::new(engine, tokens, options.n);
         Self {
             state,
@@ -480,16 +489,17 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     }
 
     /// Create a `TokenPredictor` that resumes generation from a
-    /// pre-populated KV cache.
+    /// pre-populated KV cache. `initial_state` as in [`Self::new`].
     pub fn new_resuming(
         engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         start_pos: usize,
         seq_id: i32,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> Self {
         let (state, options, max_stop_len) =
-            Self::prepare(engine, &tokens, options);
+            Self::prepare(engine, &tokens, options, initial_state);
         let inner = CandidatePredictor::new_resuming(
             engine, tokens, start_pos, seq_id, options.n,
         );
@@ -531,20 +541,29 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         engine: &Engine<B>,
         tokens: &[Token],
         mut options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> (crate::SamplerState, PredictOptions, usize) {
-        let seed = match options.seed {
-            Some(seed) => seed,
-            None => match std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-            {
-                0 => {
-                    panic!("System clock is broken. Can't get a seed.")
-                }
-                seed => NonZeroU128::new(seed).unwrap(),
-            },
-        };
+        let max_stop_len = options
+            .stop_sequences
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+
+        // A caller-provided state is authoritative: it resumes a prior
+        // stream (rng mid-sequence, carried n-gram stats, reconciled
+        // matchers — see `SamplerState::resumed_from`), so neither
+        // `init_state` nor prompt seeding runs. The caller owns both.
+        if let Some(state) = initial_state {
+            return (state, options, max_stop_len);
+        }
+
+        let seed = options.seed.unwrap_or_else(|| {
+            // Fresh entropy per call ("no seed + no cached state" in
+            // the resume/fork/fresh trichotomy). `max(1)` for NonZero;
+            // losing one value of the space is harmless.
+            NonZeroU128::new(rand::random::<u128>().max(1)).unwrap()
+        });
         options.seed = Some(seed);
 
         let mut state =
@@ -570,13 +589,6 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
                 }
             }
         }
-
-        let max_stop_len = options
-            .stop_sequences
-            .iter()
-            .map(|s| s.len())
-            .max()
-            .unwrap_or(0);
 
         (state, options, max_stop_len)
     }
@@ -795,28 +807,38 @@ pub struct PiecePredictor<'engine, B: Backend> {
 }
 
 impl<'engine, B: Backend> PiecePredictor<'engine, B> {
+    /// `initial_state` as in [`TokenPredictor::new`].
     pub fn new(
         engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> Self {
-        let token_predictor = TokenPredictor::new(engine, tokens, options);
+        let token_predictor =
+            TokenPredictor::new(engine, tokens, options, initial_state);
         Self {
             inner: token_predictor,
         }
     }
 
     /// Create a `PiecePredictor` that resumes generation from a
-    /// pre-populated KV cache.
+    /// pre-populated KV cache. `initial_state` as in
+    /// [`TokenPredictor::new`].
     pub fn new_resuming(
         engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         start_pos: usize,
         seq_id: i32,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> Self {
         let token_predictor = TokenPredictor::new_resuming(
-            engine, tokens, start_pos, seq_id, options,
+            engine,
+            tokens,
+            start_pos,
+            seq_id,
+            options,
+            initial_state,
         );
         Self {
             inner: token_predictor,
@@ -953,12 +975,15 @@ pub struct Predictor<'engine, B: Backend> {
 }
 
 impl<'engine, B: Backend> Predictor<'engine, B> {
+    /// `initial_state` as in [`TokenPredictor::new`].
     pub fn new(
         engine: &'engine mut Engine<B>,
         tokens: Vec<Token>,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> Self {
-        let piece_predictor = PiecePredictor::new(engine, tokens, options);
+        let piece_predictor =
+            PiecePredictor::new(engine, tokens, options, initial_state);
         Self {
             inner: piece_predictor,
         }
@@ -1019,7 +1044,8 @@ mod tests {
         let mut opts = PredictOptions::greedy().add_stop(".".to_owned());
         opts.n = NonZeroUsize::new(2 + expected.len()).unwrap();
 
-        let actual: Vec<Token> = engine.predict_tokens(prefix, opts).collect();
+        let actual: Vec<Token> =
+            engine.predict_tokens(prefix, opts, None).collect();
 
         // Greedy continuation should reproduce the source text, but the
         // final token is the model's pick — Qwen3.6 ends the pangram with
@@ -1100,7 +1126,8 @@ mod tests {
         let mut opts = PredictOptions::greedy().add_stop(".".to_owned());
         opts.n = NonZeroUsize::new(2 + expected.len()).unwrap();
 
-        let actual: Vec<String> = engine.predict_pieces(prefix, opts).collect();
+        let actual: Vec<String> =
+            engine.predict_pieces(prefix, opts, None).collect();
 
         // Prefix-compare joined text; see test_token_predictor for why
         // exact piece-by-piece equality is too strict across models.

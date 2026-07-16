@@ -985,7 +985,7 @@ mod tests {
         // borrows the engine mutably.
         let eos_piece = engine.model.token_to_piece(engine.model.eos());
 
-        let predictor = engine.predict_pieces(tokens, opts);
+        let predictor = engine.predict_pieces(tokens, opts, None);
         let output: String = predictor.collect();
 
         println!("=== Generated JSON ===\n{output}\n======================");
@@ -1057,7 +1057,7 @@ mod tests {
                 lazy_grammar: true,
                 ..SamplerConfig::default()
             };
-            engine.predict_pieces(tokens.clone(), opts).collect()
+            engine.predict_pieces(tokens.clone(), opts, None).collect()
         };
 
         for seed in [2u128, 3, 5, 7, 11] {

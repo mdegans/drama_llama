@@ -194,12 +194,20 @@ impl<B: Backend> Engine<B> {
     }
 
     /// Iterator that predicts a sequence of tokens.
+    ///
+    /// `initial_state`: `Some` resumes a caller-owned
+    /// [`SamplerState`](crate::SamplerState) — the predictor skips
+    /// state construction and prompt seeding, continuing the given
+    /// stream. `None` builds a fresh state from `options` (seeded by
+    /// `options.seed`, random when absent). Same on every `predict_*`
+    /// below.
     pub fn predict_tokens<'a>(
         &'a mut self,
         tokens: Vec<Token>,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> TokenPredictor<'a, B> {
-        TokenPredictor::new(self, tokens, options)
+        TokenPredictor::new(self, tokens, options, initial_state)
     }
 
     /// Iterator that predicts a sequence of pieces (strings).
@@ -207,8 +215,9 @@ impl<B: Backend> Engine<B> {
         &'a mut self,
         tokens: Vec<Token>,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> PiecePredictor<'a, B> {
-        PiecePredictor::new(self, tokens, options)
+        PiecePredictor::new(self, tokens, options, initial_state)
     }
 
     /// Iterator that predicts both tokens and pieces.
@@ -216,8 +225,9 @@ impl<B: Backend> Engine<B> {
         &'a mut self,
         tokens: Vec<Token>,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> Predictor<'a, B> {
-        Predictor::new(self, tokens, options)
+        Predictor::new(self, tokens, options, initial_state)
     }
 
     /// Resume candidate prediction from a KV cache the caller has
@@ -241,8 +251,16 @@ impl<B: Backend> Engine<B> {
         start_pos: usize,
         seq_id: i32,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> TokenPredictor<'a, B> {
-        TokenPredictor::new_resuming(self, tokens, start_pos, seq_id, options)
+        TokenPredictor::new_resuming(
+            self,
+            tokens,
+            start_pos,
+            seq_id,
+            options,
+            initial_state,
+        )
     }
 
     /// Resume piece prediction from a pre-populated KV cache.
@@ -252,7 +270,15 @@ impl<B: Backend> Engine<B> {
         start_pos: usize,
         seq_id: i32,
         options: PredictOptions,
+        initial_state: Option<crate::SamplerState>,
     ) -> PiecePredictor<'a, B> {
-        PiecePredictor::new_resuming(self, tokens, start_pos, seq_id, options)
+        PiecePredictor::new_resuming(
+            self,
+            tokens,
+            start_pos,
+            seq_id,
+            options,
+            initial_state,
+        )
     }
 }

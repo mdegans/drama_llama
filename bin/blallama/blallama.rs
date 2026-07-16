@@ -42,10 +42,12 @@ struct Args {
     /// `Session::from_path*` writes a default sidecar on first load.
     #[arg(long, default_value_t = false)]
     no_penalty: bool,
-    /// Optional fixed RNG seed forwarded to every prediction. Useful for tuning
+    /// Optional fixed RNG seed forwarded to every prediction (a "fork" under
+    /// the session's resume/fork/fresh trichotomy). Useful for tuning
     /// iteration: same prompt + same seed = same output, so a sidecar tweak
     /// shows up as a deliberate divergence rather than a stochastic one. Omit
-    /// to use the crate default (`PredictOptions::DEFAULT_SEED`).
+    /// for the default: resume a cached stream on a hit, fresh entropy
+    /// otherwise.
     #[arg(long)]
     seed: Option<u128>,
     /// Serve this model when a request names one that isn't on disk. Lets

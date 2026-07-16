@@ -59,7 +59,7 @@ fn greedy_continuation(
     n: usize,
 ) -> Vec<Token> {
     engine
-        .predict_tokens_resuming(tail, start_pos, 0, greedy_opts(n))
+        .predict_tokens_resuming(tail, start_pos, 0, greedy_opts(n), None)
         .collect()
 }
 

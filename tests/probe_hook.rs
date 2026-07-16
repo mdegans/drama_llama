@@ -49,7 +49,7 @@ fn probe_hook_fires_once_per_yielded_token() {
     opts.n = NonZeroUsize::new(N_STEPS).unwrap();
 
     let yielded: Vec<Token> =
-        engine.predict_tokens(prompt_tokens, opts).collect();
+        engine.predict_tokens(prompt_tokens, opts, None).collect();
 
     let recorded = log.lock().unwrap().clone();
 
@@ -98,7 +98,8 @@ fn probe_hook_can_be_cleared() {
     let mut opts = PredictOptions::greedy();
     opts.n = NonZeroUsize::new(N_STEPS).unwrap();
 
-    let _: Vec<Token> = engine.predict_tokens(prompt_tokens, opts).collect();
+    let _: Vec<Token> =
+        engine.predict_tokens(prompt_tokens, opts, None).collect();
 
     assert!(
         log.lock().unwrap().is_empty(),
@@ -163,7 +164,8 @@ fn probe_hook_snapshot_populated_when_requested() {
     let mut opts = PredictOptions::greedy();
     opts.n = NonZeroUsize::new(N_STEPS).unwrap();
 
-    let _: Vec<Token> = engine.predict_tokens(prompt_tokens, opts).collect();
+    let _: Vec<Token> =
+        engine.predict_tokens(prompt_tokens, opts, None).collect();
 
     let recorded = log.lock().unwrap().clone();
     assert!(!recorded.is_empty(), "hook must fire at least once");
@@ -216,7 +218,7 @@ fn probe_hook_snapshot_does_not_perturb_sampling() {
         let prompt_tokens = engine.model.tokenize(prompt, false);
         let mut opts = PredictOptions::greedy();
         opts.n = NonZeroUsize::new(N_STEPS).unwrap();
-        engine.predict_tokens(prompt_tokens, opts).collect()
+        engine.predict_tokens(prompt_tokens, opts, None).collect()
     };
 
     let no_snap = run(false);

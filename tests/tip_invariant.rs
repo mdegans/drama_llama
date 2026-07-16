@@ -45,7 +45,7 @@ fn terminal_token_does_not_advance_matchers() {
     ];
     options.stop_strings.push("hello".to_string());
 
-    let mut predictor = engine.predict_tokens(tokens, options);
+    let mut predictor = engine.predict_tokens(tokens, options, None);
     let mut generated = 0usize;
     for _ in predictor.by_ref() {
         generated += 1;

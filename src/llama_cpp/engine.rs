@@ -392,7 +392,7 @@ mod tests {
         opts.n = std::num::NonZeroUsize::new(16).unwrap();
 
         let fresh: Vec<String> = engine_a
-            .predict_pieces(tokens_a.clone(), opts.clone())
+            .predict_pieces(tokens_a.clone(), opts.clone(), None)
             .collect();
 
         drop(engine_a);
@@ -410,7 +410,7 @@ mod tests {
             .expect("priming prefill failed");
 
         let resumed: Vec<String> = engine_b
-            .predict_pieces_resuming(suffix.to_vec(), k, 0, opts)
+            .predict_pieces_resuming(suffix.to_vec(), k, 0, opts, None)
             .collect();
 
         assert_eq!(

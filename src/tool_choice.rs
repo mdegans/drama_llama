@@ -1315,7 +1315,7 @@ mod tests {
         };
 
         let eos_piece = engine.model.token_to_piece(engine.model.eos());
-        let predictor = engine.predict_pieces(tokens, opts);
+        let predictor = engine.predict_pieces(tokens, opts, None);
         let output: String = predictor.collect();
 
         println!(

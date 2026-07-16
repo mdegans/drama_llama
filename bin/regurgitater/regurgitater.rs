@@ -350,7 +350,7 @@ async fn main() {
                     (engine.n_ctx() as usize - chunk.len()).try_into().unwrap();
 
                 for Predicted { token, piece } in
-                    engine.predict(chunk, opts.clone())
+                    engine.predict(chunk, opts.clone(), None)
                 {
                     if from_client.is_closed() {
                         break 'outer;

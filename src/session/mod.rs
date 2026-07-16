@@ -894,13 +894,14 @@ pub struct Session<B: Backend> {
     /// chat-style flows that must re-emit short context tokens
     /// verbatim (e.g. a digit echoed from a tool result).
     sample_options: SamplerConfig,
-    /// RNG seed forwarded to every `predict_*` call. `None` =
-    /// time-based seed (each call diverges); `Some(n)` = deterministic
-    /// across runs given the same prompt and model. Default is
-    /// [`PredictOptions::DEFAULT_SEED`] so behavior matches pre-0.8
-    /// Sessions; override via [`Session::with_seed`] for tuning
-    /// iteration where you want differences to come from config
-    /// changes rather than RNG noise.
+    /// RNG seed, the fork/resume/fresh selector. `Some(n)` = fork:
+    /// every call builds a fresh deterministic state from `n`,
+    /// ignoring any cached stream — reproducible across runs given the
+    /// same prompt and model ([`Session::with_seed`];
+    /// [`PredictOptions::DEFAULT_SEED`] is a good fixed choice).
+    /// `None` (the default) = resume when a cached [`SamplerState`]
+    /// matches (the conversation continues its stream), fresh random
+    /// state otherwise.
     seed: Option<std::num::NonZeroU128>,
     max_tokens: NonZeroUsize,
     /// Emit-side special-token ban (on by default): the sampled token
@@ -1376,7 +1377,7 @@ impl<B: Backend> Session<B> {
                 .with_extra("preserve_thinking", true)
                 .with_thought_reingest(thought_reingest),
             sample_options: SamplerConfig::default(),
-            seed: Some(crate::PredictOptions::DEFAULT_SEED),
+            seed: None,
             max_tokens: NonZeroUsize::new(DEFAULT_MAX_TOKENS).unwrap(),
             emit_specials_ban: true,
             emit_ban: Vec::new(),
@@ -1414,14 +1415,13 @@ impl<B: Backend> Session<B> {
         self
     }
 
-    /// Set the RNG seed forwarded to every `predict_*` call.
-    ///
-    /// `None` = time-based seed (each call diverges, the historical
-    /// default for one-shot generation). `Some(n)` = deterministic
-    /// across runs given the same prompt. For tuning iteration —
-    /// changing rep-penalty knobs and seeing what the change actually
-    /// did rather than guessing across stochastic divergence — set a
-    /// fixed seed.
+    /// Set the RNG seed — the fork/resume/fresh selector (see
+    /// [`Session::seed`](field). `Some(n)` = fork: deterministic
+    /// across runs given the same prompt, ignoring any cached stream.
+    /// For tuning iteration — changing rep-penalty knobs and seeing
+    /// what the change actually did rather than guessing across
+    /// stochastic divergence — set a fixed seed. `None` (default) =
+    /// resume the cached stream on a hit, fresh entropy on a miss.
     pub fn with_seed(mut self, seed: Option<std::num::NonZeroU128>) -> Self {
         self.seed = seed;
         self
@@ -2904,9 +2904,10 @@ impl<B: Backend> Session<B> {
                 prefill_start,
                 0,
                 predict_opts,
+                None,
             )
         } else {
-            self.engine.predict_pieces(suffix, predict_opts)
+            self.engine.predict_pieces(suffix, predict_opts, None)
         };
         while let Some(piece) = predictor.next() {
             if cache_on {
@@ -3190,9 +3191,10 @@ impl<B: Backend> Session<B> {
                 prefill_start,
                 0,
                 predict_opts,
+                None,
             )
         } else {
-            self.engine.predict_pieces(suffix, predict_opts)
+            self.engine.predict_pieces(suffix, predict_opts, None)
         };
         Ok(BlockStream {
             predictor,
@@ -3302,9 +3304,10 @@ impl<B: Backend> Session<B> {
                 prefill_start,
                 0,
                 predict_opts,
+                None,
             )
         } else {
-            self.engine.predict_pieces(suffix, predict_opts)
+            self.engine.predict_pieces(suffix, predict_opts, None)
         };
 
         while let Some(piece) = predictor.next() {
