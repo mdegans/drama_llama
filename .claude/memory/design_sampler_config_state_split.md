@@ -469,9 +469,12 @@ deleting it.
 2. Outcome-dependent: strength pruning (clone-cost measurement) and the
    permissive-region mechanism (spike).
 3. Canonical-pipeline details for the API compile: exact placement of `MinP`
-   if we ever map it, and whether the compiled pipeline replaces Mirostat
-   modes too (leaning yes — Anthropic semantics requested = Anthropic-shaped
-   pipeline delivered).
+   if we ever map it. ~~Whether the compiled pipeline replaces Mirostat modes
+   too~~ — RESOLVED (Mike, 2026-07-16): yes. Standing principle: **any
+   divergence from the official Anthropic API is a bug**, except where we can
+   strictly improve on it (e.g. the bonus tip breakpoint); downstream code
+   accounts for this. Anthropic semantics requested = Anthropic-shaped
+   pipeline delivered.
 
 ## Related in-repo memory
 
