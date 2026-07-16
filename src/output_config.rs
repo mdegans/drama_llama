@@ -90,7 +90,7 @@ impl CompiledOutputConfig {
     pub fn into_grammar(self) -> SamplingMode {
         match self {
             Self::Single(g) => g,
-            Self::Deferred(d) => d.grammar,
+            Self::Deferred(d) => SamplingMode::Grammar(d.grammar),
         }
     }
 }
@@ -126,9 +126,9 @@ pub fn compile_output_config(
     };
     if opts.phase_split && opts.allow_thought {
         let source = build_json_only_grammar_source(schema);
-        let grammar = SamplingMode::grammar(&source)?;
+        let grammar = crate::GrammarState::from_source(&source)?;
         Ok(CompiledOutputConfig::Deferred(DeferredGrammar {
-            grammar,
+            grammar: std::sync::Arc::new(std::sync::Mutex::new(grammar)),
             activate_after: vec![THINK_CLOSE_TRIGGER.to_vec()],
             // The JSON-body grammar starts *after* `</think>`; the
             // trigger itself stays outside the constrained span.
@@ -331,9 +331,7 @@ mod tests {
         };
         assert_eq!(deferred.activate_after, vec![b"</think>".to_vec()]);
         // JSON-only grammar accepts bare JSON…
-        let SamplingMode::Grammar(state) = deferred.grammar else {
-            panic!("deferred grammar must be SamplingMode::Grammar");
-        };
+        let state = deferred.grammar;
         let source = state.lock().unwrap().grammar().source().to_string();
         assert!(source.contains("output_schema"));
         assert!(

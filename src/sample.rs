@@ -183,12 +183,12 @@ pub struct SampleOptions {
 /// skipped entirely, restoring pure-inference tok/s. See
 /// `src/output_config.rs` for the compiler that builds one from an
 /// `OutputConfig`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DeferredGrammar {
-    /// The grammar to promote. Must be a `SamplingMode::Grammar(_)`;
-    /// promotion panics otherwise. A fresh `GrammarState` is expected here
-    /// — promoted grammars begin matching from root.
-    pub grammar: SamplingMode,
+    /// The grammar matcher to promote (wrapped into a
+    /// `SamplingMode::Grammar` at promotion). A fresh [`GrammarState`]
+    /// is expected here — promoted grammars begin matching from root.
+    pub grammar: Arc<Mutex<GrammarState>>,
     /// Byte sequences (any-of) whose appearance in the predictor's
     /// accumulated text triggers promotion. Matched anywhere in the
     /// trailing window (same sizing as stop-strings), not just at the
@@ -203,6 +203,22 @@ pub struct DeferredGrammar {
     /// *after* the trigger feed in (e.g. `</think>` triggering a
     /// JSON-body grammar).
     pub feed_trigger: bool,
+}
+
+// Manual because `Arc<Mutex<GrammarState>>` has no derived equality;
+// mirrors the `SamplingMode::Grammar` arm (poisoned lock compares
+// unequal). Dies with the config/state split, which stores the grammar
+// spec here instead of a live matcher.
+impl PartialEq for DeferredGrammar {
+    fn eq(&self, other: &Self) -> bool {
+        self.activate_after == other.activate_after
+            && self.feed_trigger == other.feed_trigger
+            && (Arc::ptr_eq(&self.grammar, &other.grammar)
+                || match (self.grammar.lock(), other.grammar.lock()) {
+                    (Ok(a), Ok(b)) => *a == *b,
+                    _ => false,
+                })
+    }
 }
 
 impl SampleOptions {

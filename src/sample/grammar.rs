@@ -768,6 +768,12 @@ impl GrammarState {
         }
     }
 
+    /// Construct a fresh matcher directly from GBNF source. Returns the
+    /// parse error if the grammar is malformed.
+    pub fn from_source(source: &str) -> Result<Self, GrammarError> {
+        Ok(Self::new(Arc::new(Grammar::parse(source)?)))
+    }
+
     /// Reset to the fresh starting state.
     pub fn reset(&mut self) {
         self.inner.reset(&self.grammar);

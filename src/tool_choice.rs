@@ -238,9 +238,9 @@ pub fn deferred_grammar_for_prompt(
     };
     let chosen: Vec<&Tool> = tools.iter().collect();
     let source = build_grammar_source(&chosen, opts, RootShape::Lazy);
-    let grammar = SamplingMode::grammar(&source)?;
+    let grammar = crate::GrammarState::from_source(&source)?;
     Ok(Some(crate::DeferredGrammar {
-        grammar,
+        grammar: std::sync::Arc::new(std::sync::Mutex::new(grammar)),
         activate_after: vec![open.as_bytes().to_vec()],
         feed_trigger: true,
     }))

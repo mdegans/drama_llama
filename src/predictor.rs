@@ -697,18 +697,18 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             };
             let tail = &self.text.as_bytes()[feed_from..];
             if !tail.is_empty() {
-                if let crate::SamplingMode::Grammar(state_arc) =
-                    &promoted.grammar
-                {
-                    let mut locked = state_arc
-                        .lock()
-                        .expect("deferred grammar mutex poisoned at promotion");
-                    if locked.advance_bytes(tail).is_err() {
-                        return None;
-                    }
+                let mut locked = promoted
+                    .grammar
+                    .lock()
+                    .expect("deferred grammar mutex poisoned at promotion");
+                if locked.advance_bytes(tail).is_err() {
+                    return None;
                 }
             }
-            self.options.sample_options.modes.push(promoted.grammar);
+            self.options
+                .sample_options
+                .modes
+                .push(crate::SamplingMode::Grammar(promoted.grammar));
         }
 
         if let Some(hook) = self.inner.engine.probe_hook.as_mut() {

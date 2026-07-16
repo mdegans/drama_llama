@@ -3255,7 +3255,7 @@ impl<B: Backend> Session<B> {
         // deferred grammar that legitimately never triggered.
         let eager_grammar_handles = grammar_handles.clone();
         if let Some(dg) = &deferred_grammar {
-            grammar_handles.push(dg.grammar.clone());
+            grammar_handles.push(SamplingMode::Grammar(dg.grammar.clone()));
         }
         #[cfg(feature = "axum")]
         tracing::debug!(
@@ -3939,11 +3939,11 @@ fn dialect_deferred_grammar_for_prompt(
     };
     let chosen: Vec<&Tool> = tools.iter().collect();
     let source = crate::dialect::grammar_source(&syntax, &chosen, &opts)?;
-    let grammar =
-        SamplingMode::grammar(&source).map_err(ToolChoiceError::from)?;
+    let grammar = crate::GrammarState::from_source(&source)
+        .map_err(ToolChoiceError::from)?;
     Ok(Some(crate::DeferredGrammar {
         activate_after: triggers,
-        grammar,
+        grammar: std::sync::Arc::new(std::sync::Mutex::new(grammar)),
         feed_trigger: true,
     }))
 }
@@ -4716,9 +4716,7 @@ mod tests {
             panic!("expected Deferred variant (phase_split defaults on)");
         };
         assert_eq!(deferred.activate_after, vec![b"</think>".to_vec()]);
-        let SamplingMode::Grammar(state) = deferred.grammar else {
-            panic!("deferred.grammar must be SamplingMode::Grammar");
-        };
+        let state = deferred.grammar;
         let source = state.lock().unwrap().grammar().source().to_string();
         assert!(
             source.contains("output_schema"),
@@ -4833,9 +4831,7 @@ mod tests {
         };
         assert_eq!(deferred.activate_after, vec![b"<tool_call>\n".to_vec()]);
         assert!(deferred.feed_trigger);
-        let SamplingMode::Grammar(state) = deferred.grammar else {
-            panic!("deferred.grammar must be SamplingMode::Grammar");
-        };
+        let state = deferred.grammar;
         let source = state.lock().unwrap().grammar().source().to_string();
         assert!(
             source.contains("<function="),
@@ -4878,9 +4874,7 @@ mod tests {
             ]
         );
         assert!(deferred.feed_trigger);
-        let SamplingMode::Grammar(state) = deferred.grammar else {
-            panic!("deferred.grammar must be SamplingMode::Grammar");
-        };
+        let state = deferred.grammar;
         let source = state.lock().unwrap().grammar().source().to_string();
         assert!(
             source.contains("h_role_form") && source.contains("h_chan_form"),
