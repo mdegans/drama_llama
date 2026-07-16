@@ -1,6 +1,6 @@
 use core::slice;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     ops::Index,
 };
 use tinyvec::ArrayVec;
@@ -209,7 +209,11 @@ impl NGramData {
 // TODO: Implement Deserialize
 #[derive(Debug)]
 pub struct NGramStats {
-    data: HashMap<NGram, NGramData>,
+    // BTreeMap, not HashMap: both penalty passes iterate this map and
+    // accumulate additive float penalties, so iteration order must be
+    // deterministic for a serialized-then-restored state to continue the
+    // exact same stream. It also makes serialized blobs canonical.
+    data: BTreeMap<NGram, NGramData>,
     ngram_count: usize,
     token_count: usize,
 }
@@ -218,7 +222,7 @@ impl NGramStats {
     /// Create a new, empty NGramStats.
     pub fn new() -> Self {
         NGramStats {
-            data: HashMap::new(),
+            data: BTreeMap::new(),
             ngram_count: 0,
             token_count: 0,
         }
@@ -384,8 +388,8 @@ impl NGramStats {
     }
 }
 
-impl Into<HashMap<NGram, NGramData>> for NGramStats {
-    fn into(self) -> HashMap<NGram, NGramData> {
+impl Into<BTreeMap<NGram, NGramData>> for NGramStats {
+    fn into(self) -> BTreeMap<NGram, NGramData> {
         self.data
     }
 }
