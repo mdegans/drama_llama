@@ -3,7 +3,7 @@ use std::num::{NonZeroU128, NonZeroUsize};
 use crate::{
     backend::{Backend, Decoder, Model},
     sample::SamplerConfig,
-    Candidates, Engine, NGram, Token,
+    Candidates, Engine, Token,
 };
 
 #[cfg(feature = "serde")]
@@ -476,7 +476,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         initial_state: Option<crate::SamplerState>,
     ) -> Self {
         let (state, options, max_stop_len) =
-            Self::prepare(engine, &tokens, options, initial_state);
+            Self::prepare(engine, options, initial_state);
         let inner = CandidatePredictor::new(engine, tokens, options.n);
         Self {
             state,
@@ -499,7 +499,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         initial_state: Option<crate::SamplerState>,
     ) -> Self {
         let (state, options, max_stop_len) =
-            Self::prepare(engine, &tokens, options, initial_state);
+            Self::prepare(engine, options, initial_state);
         let inner = CandidatePredictor::new_resuming(
             engine, tokens, start_pos, seq_id, options.n,
         );
@@ -535,11 +535,19 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     }
 
     /// Shared setup for [`Self::new`] and [`Self::new_resuming`]: seed
-    /// normalization, RNG construction, n-gram stats seeding, and the
+    /// normalization, state construction (unless injected), and the
     /// max stop-sequence length.
+    ///
+    /// NOTE: raw `Engine::predict_*` paths do NOT prompt-seed the
+    /// repetition stats (the old whole-prompt window loop lived here).
+    /// Prompt seeding is block-gated and Session-owned now —
+    /// `Session`'s prose fold seeds prose blocks only (tool results
+    /// and other structured content excluded) and injects the state
+    /// through `initial_state`. A raw caller who wants prompt seeding
+    /// builds its own [`SamplerState`](crate::SamplerState) and
+    /// injects it.
     fn prepare(
         engine: &Engine<B>,
-        tokens: &[Token],
         mut options: PredictOptions,
         initial_state: Option<crate::SamplerState>,
     ) -> (crate::SamplerState, PredictOptions, usize) {
@@ -550,10 +558,10 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             .max()
             .unwrap_or(0);
 
-        // A caller-provided state is authoritative: it resumes a prior
-        // stream (rng mid-sequence, carried n-gram stats, reconciled
-        // matchers — see `SamplerState::resumed_from`), so neither
-        // `init_state` nor prompt seeding runs. The caller owns both.
+        // A caller-provided state is authoritative: it resumes (or
+        // freshly seeds) a prior stream — rng mid-sequence, carried
+        // n-gram stats, reconciled matchers (see
+        // `SamplerState::resumed_from`) — so `init_state` is skipped.
         if let Some(state) = initial_state {
             return (state, options, max_stop_len);
         }
@@ -566,32 +574,8 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         });
         options.seed = Some(seed);
 
-        let mut state =
+        let state =
             options.sample_options.init_state(seed.get(), &engine.model);
-
-        // Seed ngram stats from the prompt. Each n-gram occurrence is
-        // recorded at the absolute position of its trailing token, so
-        // the windowed-decay penalty math (RepetitionOptions.window_size
-        // + decay) sees prompt occurrences at their true distance from
-        // the current generation step. The prose-step counter starts
-        // at the prompt length so the first penalty pass sees the same
-        // step basis the old tokens.len() derivation produced.
-        state.step = tokens.len() as u64;
-        if let Some(opts) = &options.sample_options.repetition {
-            let max_size = opts.ngram_max_size.get() as usize;
-            for (win_idx, win) in tokens.windows(max_size).enumerate() {
-                // Last token of the window sits at absolute index
-                // `win_idx + max_size - 1`.
-                let trailing_pos = (win_idx + max_size - 1) as u64;
-                for slice in (opts.ngram_min_size.get()
-                    ..=opts.ngram_max_size.get())
-                    .filter_map(|n| win.get((win.len() - n as usize)..))
-                {
-                    let ngram = NGram::try_from_tokens(slice).unwrap();
-                    let _ = state.seed_prompt_ngram(ngram, trailing_pos);
-                }
-            }
-        }
 
         (state, options, max_stop_len)
     }

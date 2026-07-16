@@ -424,10 +424,19 @@ struct Breakpoint {
     /// the KV snapshot at the same position (snapshot-coupled: restore
     /// is both or neither). Cloned on load, reconciled against the new
     /// call's effective config by [`SamplerState::resumed_from`].
-    /// `None` until a path that promotes state has run (the tip gets
-    /// one at turn end; prompt breakpoints get theirs from the
-    /// Session-side seeding fold — Phase 2 commit 9).
+    /// `None` when no path has produced one (repetition disabled, or
+    /// a fail-open fold path). The tip gets its state at turn end;
+    /// prompt breakpoints get theirs from the seeding fold's
+    /// per-boundary snapshots (or inherit a hash-matched predecessor's
+    /// in [`Session::record_cache_hit`]).
     state: Option<SamplerState>,
+    /// The seeding fold's resume position for this breakpoint. Prefix
+    /// identity makes a stored cursor valid against the next call's
+    /// prompt structure (see [`cursor_of`]); the tip's cursor is
+    /// synthesized at promotion (`msgs_done = messages.len() + 1` —
+    /// the assistant reply's prose was accumulated live during
+    /// generation and must not be re-folded).
+    cursor: SeedCursor,
 }
 
 struct PrefixCache {
@@ -530,6 +539,150 @@ fn block_free_text<'a>(block: &'a crate::Block, out: &mut Vec<&'a str>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Position in the prompt's prose fold: everything strictly before the
+/// cursor has been ingested into the n-gram stats. Ordered by prompt
+/// coverage (derived `Ord`: tools-only < system-done < message counts).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct SeedCursor {
+    /// The system section's prose has been folded.
+    system_done: bool,
+    /// Messages `[0, msgs_done)` have been folded.
+    msgs_done: usize,
+}
+
+/// Map a [`PromptBreakpoint`] to the fold cursor of the content it
+/// covers. Valid across calls for a matched prefix: prefix identity
+/// (hash/LCP) implies identical message indexing over that prefix, so
+/// a cursor stored on a cached [`Breakpoint`] names the same position
+/// in the *new* prompt's structure.
+fn cursor_of(bp: PromptBreakpoint) -> SeedCursor {
+    match bp {
+        // Tools carry no prose, so "tools done" folds from the top.
+        PromptBreakpoint::AfterTools => SeedCursor {
+            system_done: false,
+            msgs_done: 0,
+        },
+        PromptBreakpoint::AfterSystem => SeedCursor {
+            system_done: true,
+            msgs_done: 0,
+        },
+        PromptBreakpoint::AfterMessage(i) => SeedCursor {
+            system_done: true,
+            msgs_done: i + 1,
+        },
+    }
+}
+
+/// Ingest the prose blocks of `prompt` in `[from, upto)` into `state`'s
+/// n-gram stats — the block-gated prompt-seeding fold ("repetition over
+/// the running PROSE corpus, structured regions excluded").
+///
+/// Prose = [`Block::Text`] (system included — parroting the system
+/// prompt is exactly what the penalty should see) and
+/// [`Block::Thought`]. Everything else — tool-use arguments, tool
+/// results (the digit-penalty case), media, documents, server-tool
+/// blocks — is structured and excluded. Each prose block tokenizes
+/// independently (`parse_special = false`): n-grams never span
+/// template markup or block boundaries, and `state.step` advances one
+/// per prose token, so the windowed-decay math measures distance in
+/// prose. N-grams in the resolved ignore set are skipped, matching the
+/// live pass's ingestion rule.
+///
+/// Cold == incremental by construction: folding `[start, end)` in one
+/// call or in cursor-split segments is the same fold.
+fn seed_prose_fold<M: Model>(
+    state: &mut SamplerState,
+    prompt: &Prompt,
+    from: SeedCursor,
+    upto: Option<SeedCursor>,
+    rep: &RepetitionOptions,
+    model: &M,
+) {
+    let end = upto.unwrap_or(SeedCursor {
+        system_done: true,
+        msgs_done: prompt.messages.len(),
+    });
+    if !from.system_done && end.system_done {
+        if let Some(system) = prompt.system.as_ref() {
+            for block in &system.0 {
+                seed_prose_block(state, block, rep, model);
+            }
+        }
+    }
+    let msg_end = end.msgs_done.min(prompt.messages.len());
+    for msg in prompt.messages.iter().take(msg_end).skip(from.msgs_done) {
+        for block in &msg.content.0 {
+            seed_prose_block(state, block, rep, model);
+        }
+    }
+}
+
+/// One block of [`seed_prose_fold`]: tokenize the block's prose (if it
+/// has any) and record its trailing n-grams at prose-step positions.
+/// Window shape mirrors the live penalty pass — occurrences land at
+/// their trailing token's step, sub-sizes `min..=max` per window.
+fn seed_prose_block<M: Model>(
+    state: &mut SamplerState,
+    block: &crate::Block,
+    rep: &RepetitionOptions,
+    model: &M,
+) {
+    let text: &str = match block {
+        crate::Block::Text { text, .. } => text.as_ref(),
+        crate::Block::Thought { thought, .. } => thought.as_ref(),
+        _ => return,
+    };
+    let tokens = model.tokenize(text, false);
+    let base = state.step;
+    let max = rep.ngram_max_size.get() as usize;
+    let min = rep.ngram_min_size.get() as usize;
+    for (win_idx, win) in tokens.windows(max).enumerate() {
+        let trailing_pos = base + (win_idx + max - 1) as u64;
+        for slice in (min..=max).filter_map(|n| win.get((win.len() - n)..)) {
+            let ngram = crate::NGram::try_from_tokens(slice).unwrap();
+            if state.resolved_ignored_contains(&ngram) {
+                continue;
+            }
+            let _ = state.seed_prompt_ngram(ngram, trailing_pos);
+        }
+    }
+    state.step = base + tokens.len() as u64;
+}
+
+/// Zip the index-parallel [`PreparedCall`] breakpoint columns with the
+/// fold's per-boundary state snapshots into cache [`Breakpoint`]s.
+fn assemble_breakpoints(
+    breakpoints: Vec<EntryPos>,
+    partial_hashes: Vec<[u8; 32]>,
+    breakpoint_ids: Vec<PromptBreakpoint>,
+    bp_states: Vec<Option<SamplerState>>,
+) -> Vec<Breakpoint> {
+    debug_assert_eq!(breakpoints.len(), partial_hashes.len());
+    debug_assert_eq!(breakpoints.len(), breakpoint_ids.len());
+    debug_assert_eq!(breakpoints.len(), bp_states.len());
+    breakpoints
+        .into_iter()
+        .zip(partial_hashes)
+        .zip(breakpoint_ids.into_iter().zip(bp_states))
+        .map(|((at, hash), (id, state))| Breakpoint {
+            at,
+            hash: Some(hash),
+            state,
+            cursor: cursor_of(id),
+        })
+        .collect()
+}
+
+/// The auto-tip's fold cursor: the assistant reply (message index
+/// `messages.len()` once appended) was accumulated live during
+/// generation, so the next call's fold resumes after it.
+fn tip_cursor(prompt: &Prompt) -> SeedCursor {
+    SeedCursor {
+        system_done: true,
+        msgs_done: prompt.messages.len() + 1,
     }
 }
 
@@ -1660,33 +1813,76 @@ impl<B: Backend> Session<B> {
         predict_opts
     }
 
-    /// Resolve the resume/fork/fresh trichotomy for one call.
+    /// Build the call's working [`SamplerState`]: resolve the
+    /// resume/fork/fresh trichotomy, then run the block-gated prose
+    /// seeding fold over the un-reused part of the prompt, snapshotting
+    /// at each breakpoint boundary passed.
     ///
-    /// - `Some(seed)` on the session ⇒ **fork**: the cached stream is
-    ///   ignored; `None` is returned so the predictor builds a fresh
-    ///   deterministic state from the options (whose `seed` it reads).
+    /// Trichotomy (there is no separate resume/fork verb anywhere in
+    /// the API — this branch is the whole thing):
+    /// - `Some(seed)` on the session ⇒ **fork**: fresh deterministic
+    ///   state, cached stream ignored, cold fold from the top.
     /// - No seed + a cached state at the matched breakpoint ⇒
-    ///   **resume**: the cached state is reconciled against this
-    ///   call's effective config ([`SamplerState::resumed_from`]) and
-    ///   injected — the conversation continues its stream.
-    /// - No seed + no cached state ⇒ **fresh**: `None`; the predictor
-    ///   initializes from fresh entropy.
+    ///   **resume**: reconciled against this call's effective config
+    ///   ([`SamplerState::resumed_from`]); the fold covers only the
+    ///   suffix past the matched cursor.
+    /// - No seed + no cached state ⇒ **fresh**: fresh entropy, cold
+    ///   fold from the top.
     ///
-    /// There is no separate resume/fork verb anywhere in the API —
-    /// this branch is the whole trichotomy.
-    fn initial_state_for(
+    /// Returns the working state plus one pre-generation snapshot per
+    /// entry of `breakpoint_ids` (index-parallel): `Some` for
+    /// boundaries the fold passed (including the matched boundary
+    /// itself — its snapshot is the reconciled state), `None` for
+    /// boundaries inside the reused prefix (those inherit a
+    /// hash-matched predecessor's state in
+    /// [`Session::record_cache_hit`]). Snapshots are `None` across the
+    /// board when repetition is off — the fold is stats-only; rng
+    /// stream resume rides the tip.
+    fn build_initial_state(
         &self,
         config: &SamplerConfig,
-        cached: Option<SamplerState>,
-    ) -> Option<SamplerState> {
-        match (self.seed, cached) {
-            (None, Some(cached)) => Some(SamplerState::resumed_from(
-                &cached,
-                config,
-                &self.engine.model,
-            )),
-            _ => None,
+        cached: Option<(SamplerState, SeedCursor)>,
+        prompt: &Prompt,
+        breakpoint_ids: &[PromptBreakpoint],
+    ) -> (SamplerState, Vec<Option<SamplerState>>) {
+        let model = &self.engine.model;
+        let (mut state, from) = match (self.seed, cached) {
+            (None, Some((cached, cursor))) => {
+                (SamplerState::resumed_from(&cached, config, model), cursor)
+            }
+            (Some(seed), _) => {
+                (config.init_state(seed.get(), model), SeedCursor::default())
+            }
+            (None, None) => (
+                config.init_state(rand::random::<u128>().max(1), model),
+                SeedCursor::default(),
+            ),
+        };
+        let mut bp_states: Vec<Option<SamplerState>> =
+            vec![None; breakpoint_ids.len()];
+        if let Some(rep) = &config.repetition {
+            let mut pos = from;
+            for (j, id) in breakpoint_ids.iter().enumerate() {
+                let cur = cursor_of(*id);
+                if cur < pos {
+                    continue;
+                }
+                if cur > pos {
+                    seed_prose_fold(
+                        &mut state,
+                        prompt,
+                        pos,
+                        Some(cur),
+                        rep,
+                        model,
+                    );
+                    pos = cur;
+                }
+                bp_states[j] = Some(state.clone());
+            }
+            seed_prose_fold(&mut state, prompt, pos, None, rep, model);
         }
+        (state, bp_states)
     }
 
     /// Recompute the [`Session::emit_ban`] memo. Called from
@@ -2379,11 +2575,11 @@ impl<B: Backend> Session<B> {
     /// * `prefill_start` — engine position from which the
     ///   predictor's prefill resumes.
     /// * `cached_state` — the [`SamplerState`] stored at the matched
-    ///   [`Breakpoint`]/tip, cloned. `None` on a miss, on the
-    ///   `NoCheckpoint` fallback, or when the matched breakpoint
-    ///   carries no state. Keyed on the *effective* restore position,
-    ///   so the empty-suffix backoff and the fallback path stay
-    ///   consistent with the KV side by construction.
+    ///   [`Breakpoint`]/tip (cloned) and its fold cursor. `None` on a
+    ///   miss, on the `NoCheckpoint` fallback, or when the matched
+    ///   breakpoint carries no state. Keyed on the *effective* restore
+    ///   position, so the empty-suffix backoff and the fallback path
+    ///   stay consistent with the KV side by construction.
     ///
     /// **Empty-suffix guard.** If `compute_l_hit` covers every entry
     /// (a perfect-prefix match), `cache_read` is backed off to the
@@ -2409,8 +2605,10 @@ impl<B: Backend> Session<B> {
             [u8; 32],
             crate::backend::Image,
         >,
-    ) -> Result<(Vec<Token>, usize, usize, Option<SamplerState>), SessionError>
-    {
+    ) -> Result<
+        (Vec<Token>, usize, usize, Option<(SamplerState, SeedCursor)>),
+        SessionError,
+    > {
         // The suffix handed to the predictor must be non-empty text.
         let trailing_start = new_entries
             .iter()
@@ -2541,20 +2739,21 @@ impl<B: Backend> Session<B> {
 
         // The sampler state cached at the position we actually
         // restored to (KV and SamplerState are snapshot-coupled: both
-        // or neither).
-        let cached_state: Option<SamplerState> = if effective_cache_read.pos > 0
-        {
-            self.prefix_cache.as_ref().and_then(|cache| {
-                cache
-                    .breakpoints
-                    .iter()
-                    .chain(cache.tip.as_ref())
-                    .find(|bp| bp.at.pos == effective_cache_read.pos)
-                    .and_then(|bp| bp.state.clone())
-            })
-        } else {
-            None
-        };
+        // or neither), plus the fold cursor to resume prose seeding
+        // from. Keyed on the effective restore position.
+        let cached_state: Option<(SamplerState, SeedCursor)> =
+            if effective_cache_read.pos > 0 {
+                self.prefix_cache.as_ref().and_then(|cache| {
+                    cache
+                        .breakpoints
+                        .iter()
+                        .chain(cache.tip.as_ref())
+                        .find(|bp| bp.at.pos == effective_cache_read.pos)
+                        .and_then(|bp| bp.state.clone().map(|s| (s, bp.cursor)))
+                })
+            } else {
+                None
+            };
 
         // Orphan pruning: free snapshots from the previous call's
         // breakpoints that aren't still set in this call's
@@ -2808,22 +3007,20 @@ impl<B: Backend> Session<B> {
     /// tip's snapshot is freed via [`Engine::forget_pos`] — without
     /// this, tip snapshots accumulate one per call in moeflux's LRU.
     ///
-    /// `new_breakpoint_hashes` parallels `new_breakpoints` (same
-    /// indexing) and stores SHA-256 of each surviving partial render;
-    /// `tip_hash` stores the same for the auto-tip position. Both are
-    /// consulted by [`compute_l_hit`]'s hash-keyed fast path on
-    /// subsequent calls.
+    /// The caller assembles the new [`Breakpoint`]s (position, render
+    /// hash, fold-snapshot state, cursor); breakpoints whose fold
+    /// snapshot is `None` because they sat inside the reused prefix
+    /// inherit the state of a hash-matched breakpoint from the
+    /// outgoing cache here (the prefix identity that justified the
+    /// reuse also makes the old state valid at the same boundary).
     ///
     /// No-op when caching is off.
     fn record_cache_hit(
         &mut self,
         new_entries: Vec<CacheEntry>,
-        new_breakpoints: Vec<EntryPos>,
+        mut new_breakpoints: Vec<Breakpoint>,
         reused_cells: usize,
-        internal_tip: Option<EntryPos>,
-        new_breakpoint_hashes: Vec<[u8; 32]>,
-        tip_hash: Option<[u8; 32]>,
-        tip_state: Option<SamplerState>,
+        tip: Option<Breakpoint>,
     ) {
         // Capture the old tip BEFORE overwriting — needed for the
         // explicit-eviction fast path so the engine can free the prior
@@ -2842,24 +3039,26 @@ impl<B: Backend> Session<B> {
             .as_ref()
             .and_then(|c| c.tip.as_ref())
             .map(|t| t.at);
-        let new_tip_pos = internal_tip.map(|t| t.pos);
+        let new_tip_pos = tip.as_ref().map(|t| t.at.pos);
         if let Some(cache) = self.prefix_cache.as_mut() {
+            // State inheritance for reused-prefix breakpoints: match by
+            // render hash against the outgoing breakpoints (and tip).
+            for bp in new_breakpoints.iter_mut() {
+                if bp.state.is_some() {
+                    continue;
+                }
+                let Some(h) = bp.hash else { continue };
+                bp.state = cache
+                    .breakpoints
+                    .iter()
+                    .chain(cache.tip.as_ref())
+                    .find(|old| old.hash == Some(h) && old.state.is_some())
+                    .and_then(|old| old.state.clone());
+            }
             cache.prev_entries = new_entries;
-            cache.breakpoints = new_breakpoints
-                .into_iter()
-                .zip(new_breakpoint_hashes.into_iter().map(Some))
-                .map(|(at, hash)| Breakpoint {
-                    at,
-                    hash,
-                    state: None,
-                })
-                .collect();
+            cache.breakpoints = new_breakpoints;
             cache.last_reused_cells = reused_cells;
-            cache.tip = internal_tip.map(|at| Breakpoint {
-                at,
-                hash: tip_hash,
-                state: tip_state,
-            });
+            cache.tip = tip;
         }
         // Free the displaced (tip moved) or stale (tip gone — e.g. the
         // streaming path that skips the tip extension) old tip
@@ -2947,6 +3146,7 @@ impl<B: Backend> Session<B> {
             modes,
             deferred_grammar,
             partial_hashes,
+            breakpoint_ids,
             media_by_id,
             ..
         } = self.prepare_call_cached(prompt, true)?;
@@ -2966,8 +3166,12 @@ impl<B: Backend> Session<B> {
 
         let predict_opts =
             self.predict_options_for(prompt, modes, deferred_grammar.clone());
-        let initial_state =
-            self.initial_state_for(&predict_opts.sample_options, cached_state);
+        let (initial_state, bp_states) = self.build_initial_state(
+            &predict_opts.sample_options,
+            cached_state,
+            prompt,
+            &breakpoint_ids,
+        );
 
         // Count pieces as we consume them — one piece equals one
         // generated token before any post-hoc stop-string trimming
@@ -2986,11 +3190,14 @@ impl<B: Backend> Session<B> {
                 prefill_start,
                 0,
                 predict_opts,
-                initial_state,
+                Some(initial_state),
             )
         } else {
-            self.engine
-                .predict_pieces(suffix, predict_opts, initial_state)
+            self.engine.predict_pieces(
+                suffix,
+                predict_opts,
+                Some(initial_state),
+            )
         };
         while let Some(piece) = predictor.next() {
             if cache_on {
@@ -3036,16 +3243,23 @@ impl<B: Backend> Session<B> {
 
         // `complete_text` doesn't parse blocks, so we have no
         // structured assistant content to canonical-render for the tip
-        // hash. Pass `None`; the breakpoint hash side-table still
-        // covers the explicit cache_control markers.
+        // hash — the tip stays LCP-matchable only.
+        let tip = internal_tip.map(|at| Breakpoint {
+            at,
+            hash: None,
+            state: final_state,
+            cursor: tip_cursor(prompt),
+        });
         self.record_cache_hit(
             extended_prev,
-            breakpoints,
+            assemble_breakpoints(
+                breakpoints,
+                partial_hashes,
+                breakpoint_ids,
+                bp_states,
+            ),
             cache_read,
-            internal_tip,
-            partial_hashes,
-            None,
-            final_state,
+            tip,
         );
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
@@ -3209,6 +3423,7 @@ impl<B: Backend> Session<B> {
             modes,
             deferred_grammar,
             partial_hashes,
+            breakpoint_ids,
             pre_opened_reasoning,
             media_by_id,
             ..
@@ -3227,43 +3442,45 @@ impl<B: Backend> Session<B> {
                 &media_by_id,
             )?;
 
+        let predict_opts =
+            self.predict_options_for(prompt, modes, deferred_grammar.clone());
+        let (initial_state, bp_states) = self.build_initial_state(
+            &predict_opts.sample_options,
+            cached_state,
+            prompt,
+            &breakpoint_ids,
+        );
+
         // Streaming: the cache must be updated BEFORE the predictor
         // borrows `&mut self.engine`, because the returned stream
         // holds that borrow for the lifetime of iteration. Usage
         // follows the same ordering — output count stays 0 because we
         // can't count pieces from here.
         //
-        // Auto-tip is **out of scope for the streaming path** for now:
-        // `compute_tip_extension` would need to fire after the stream
-        // drops, which would require a stream-completion callback.
-        // Streaming callers in our workload don't reuse the session
-        // for further turns, so passing `None` for the tip is fine —
-        // the breakpoint-only path still works exactly as before.
-        // (See plan: streaming tip extension is a v2 follow-up.)
-        // Streaming path: no parsed assistant content available at
-        // setup time, and tip extension itself is a v2 follow-up
-        // (see comment above). Pass `None` for tip_hash; breakpoint
-        // hash side-table still covers explicit cache_control markers.
+        // Auto-tip (and its state promotion) is **out of scope for the
+        // streaming path** for now: `compute_tip_extension` would need
+        // to fire after the stream drops, which would require a
+        // stream-completion callback. Streaming callers in our
+        // workload don't reuse the session for further turns, so
+        // passing `None` for the tip is fine — the breakpoint-only
+        // path (whose fold-snapshot states ARE recorded, below) still
+        // works exactly as before. (See plan: streaming tip extension
+        // is a v2 follow-up.)
         self.record_cache_hit(
             entries,
-            breakpoints,
+            assemble_breakpoints(
+                breakpoints,
+                partial_hashes,
+                breakpoint_ids,
+                bp_states,
+            ),
             cache_read,
-            None,
-            partial_hashes,
-            None,
-            // Streaming tip state promotion rides the same v2
-            // follow-up as the tip itself (comment above).
             None,
         );
         let usage = Self::make_usage(prompt_tokens, cache_read, 0);
         self.record_usage(usage);
 
         let eos_pieces = self.eog_pieces();
-
-        let predict_opts =
-            self.predict_options_for(prompt, modes, deferred_grammar.clone());
-        let initial_state =
-            self.initial_state_for(&predict_opts.sample_options, cached_state);
 
         // The parse dialect + tool schemas outlive the engine borrow
         // the predictor takes, so clone them out of `self` first.
@@ -3282,11 +3499,14 @@ impl<B: Backend> Session<B> {
                 prefill_start,
                 0,
                 predict_opts,
-                initial_state,
+                Some(initial_state),
             )
         } else {
-            self.engine
-                .predict_pieces(suffix, predict_opts, initial_state)
+            self.engine.predict_pieces(
+                suffix,
+                predict_opts,
+                Some(initial_state),
+            )
         };
         Ok(BlockStream {
             predictor,
@@ -3326,7 +3546,7 @@ impl<B: Backend> Session<B> {
             modes,
             deferred_grammar,
             partial_hashes,
-            breakpoint_ids: _,
+            breakpoint_ids,
             pre_opened_reasoning,
             rendered_prompt,
             media_by_id,
@@ -3367,8 +3587,12 @@ impl<B: Backend> Session<B> {
 
         let predict_opts =
             self.predict_options_for(prompt, modes, deferred_grammar.clone());
-        let initial_state =
-            self.initial_state_for(&predict_opts.sample_options, cached_state);
+        let (initial_state, bp_states) = self.build_initial_state(
+            &predict_opts.sample_options,
+            cached_state,
+            prompt,
+            &breakpoint_ids,
+        );
 
         // Collect generated pieces + count tokens inline. The
         // concatenated raw-text buffer feeds the dialect parser after
@@ -3399,11 +3623,14 @@ impl<B: Backend> Session<B> {
                 prefill_start,
                 0,
                 predict_opts,
-                initial_state,
+                Some(initial_state),
             )
         } else {
-            self.engine
-                .predict_pieces(suffix, predict_opts, initial_state)
+            self.engine.predict_pieces(
+                suffix,
+                predict_opts,
+                Some(initial_state),
+            )
         };
 
         while let Some(piece) = predictor.next() {
@@ -3569,14 +3796,22 @@ impl<B: Backend> Session<B> {
         // Cache + usage bookkeeping, then grammar-violation check.
         // Check last so a violation still records the work that was
         // done — usage numbers are correct either way.
+        let tip = internal_tip.map(|at| Breakpoint {
+            at,
+            hash: tip_hash,
+            state: final_state,
+            cursor: tip_cursor(prompt),
+        });
         self.record_cache_hit(
             extended_prev,
-            breakpoints,
+            assemble_breakpoints(
+                breakpoints,
+                partial_hashes,
+                breakpoint_ids,
+                bp_states,
+            ),
             cache_read,
-            internal_tip,
-            partial_hashes,
-            tip_hash,
-            final_state,
+            tip,
         );
         let usage =
             Self::make_usage(prompt_tokens, cache_read, generated_count);
@@ -4469,6 +4704,7 @@ mod tests {
             at: ep(entry),
             hash,
             state: None,
+            cursor: SeedCursor::default(),
         }
     }
 

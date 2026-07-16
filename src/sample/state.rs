@@ -185,8 +185,17 @@ impl SamplerState {
         d.matcher.advance_bytes(&spec.grammar.grammar, tail)
     }
 
+    /// True iff `ngram` is in the resolved repetition ignore set —
+    /// the seeding fold skips these, matching the live pass.
+    pub(crate) fn resolved_ignored_contains(
+        &self,
+        ngram: &crate::NGram,
+    ) -> bool {
+        self.resolved_ignored.contains(ngram)
+    }
+
     /// Record a prompt n-gram occurrence into the stats accumulator
-    /// (predictor prompt-seeding).
+    /// (the Session's prose-seeding fold).
     pub(crate) fn seed_prompt_ngram(
         &mut self,
         ngram: crate::NGram,
