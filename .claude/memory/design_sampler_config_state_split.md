@@ -29,6 +29,69 @@ default → `None`, incremental block-gated prompt-seeding, per-Session
 blallama wire, clone-cost + permissive-region spikes). Open items are marked;
 everything else is decided.
 
+## Phase 2 design round (Mike + Claude Fable 5, 2026-07-16 PM)
+
+Converged decisions from the pre-Phase-2 design chat (grounded in a
+post-split code map):
+
+1. **`Breakpoint` struct unification.** `PrefixCache` is parallel vecs today
+   (`prev_breakpoints: Vec<EntryPos>` + `prev_breakpoint_hashes` + the tip
+   pair). Adding a fourth parallel `Vec<SamplerState>` is the smell; unify
+   into `Breakpoint { pos: EntryPos, hash: [u8; 32], state: SamplerState }`,
+   tip becomes `Option<Breakpoint>`.
+2. **Load = reconcile-by-grammar-identity, NOT reset and NOT verbatim clone.**
+   Full state is stored (over-fused, unchanged). At load, one named
+   constructor (`SamplerState::resumed_from(&cached, &effective_config)`):
+   for each mode in the new effective config, carry the cached matcher's
+   position iff the compiled grammar is identical; else that matcher starts
+   at root. Everything else — `mu`, rng, `ngram_stats`, `resolved_ignored` —
+   carries unconditionally. Rationale: `matchers` is index-aligned with the
+   *effective* (per-call) modes vec, which can differ per call (run_call
+   prepends call-derived grammar modes) — verbatim clone risks OOB indices;
+   but partial completions / assistant-prefill (tip resume) need matcher
+   position to carry when the grammar IS the same. This is the override
+   matrix + deserialize gate 3 applied to the in-memory path; the same code
+   serves the deserialize door later.
+3. **Borrow topology spike DISSOLVED.** The effective config is genuinely
+   per-call (session config + call-derived grammar modes never stored on
+   Session), so there is no stable config to borrow and no new predictor
+   lifetime. Phase 2 instead delivers: one `effective_config(&self,
+   &PreparedCall)` helper replacing the triplicated assembly
+   (complete_text/complete_stream/run_call), plus memoized stable inputs.
+4. **`emit_ban_set` memo = cached field invalidated in exactly two setters**
+   (`with_dialect` session/mod.rs:1450, `with_emit_specials_ban` :1766).
+   Currently recomputed per call at all three assembly sites.
+5. **Seeding moves to Session, walks blocks via
+   `misanthropic::prompt::Index`/`BlockIndex`** (`Prompt::indices()` yields
+   cache-prefix order; breakpoints happen at blocks only). The predictor's
+   whole-prompt reseed loop (predictor.rs:549-572, incl. the dummy
+   full-vocab Candidates TODO) dies. Incremental = suffix-seed from the
+   matched breakpoint's cached stats. If `IndexRef` needs a helper, write
+   the consuming code first, PR misanthropic upstream (alpha bump).
+6. **Tip invariant (new, decided):** *entries, KV, and the tip's
+   `SamplerState` must all describe the same stream position; the sampled
+   stop token is in none of them.* Entries+KV already hold (truncate-and-
+   swap in `compute_tip_extension`, :2984-3036 — tip sits exactly at the KV
+   head, not "several tokens prior"; the entry list extends one past it with
+   the canonical close). The state side requires: **hoist `state.advance()`
+   out of `sample_token` into the predictor loop, after the stop check** —
+   a token that terminates generation never mutates the state. Today this
+   is violated silently; masked for EOG stops by `repetition.ignored` but
+   live for custom stop sequences (ngram) and always for the matcher
+   (advanced over stop-token bytes, not canonical-close bytes). The rng is
+   the one deliberate, documented exemption (it advanced to sample the stop
+   token; no oracle can observe the difference).
+7. **Integration tests (try-to-break-it list):**
+   - incremental-vs-cold seeding equality: same prompt, cold full-prefill
+     seeding vs breakpoint-resume suffix seeding → `ngram_stats` bit-equal
+     (BTreeMap ⇒ plain assert_eq).
+   - the breaker: same, but first turn ends via a custom non-EOG stop
+     sequence — surfaces the phantom-advance bug; should FAIL pre-hoist,
+     green post-hoist.
+   - reconcile matrix: resume same-grammar (position carries), changed
+     grammar (matcher-only reset; stats/rng/mu carry), modes-vec length
+     change (no OOB/panic).
+
 Huge blast radius by design — this touches `sample.rs`, `predictor.rs`,
 `session/mod.rs`, `engine.rs`, `output_config.rs`. Deliberate, phased, and
 "done right we delete a lot of code." Do NOT start editing from this memo;
