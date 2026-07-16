@@ -500,8 +500,7 @@ mod tests {
         let c = c.sort(Sorted::ById { k });
 
         for step in 0..8u64 {
-            let ngram =
-                NGram::try_from_tokens(&[step as Token, 1, 2]).unwrap();
+            let ngram = NGram::try_from_tokens(&[step as Token, 1, 2]).unwrap();
             stats.add(ngram, &c, step);
         }
         stats.evict_outside_window(8, 4);

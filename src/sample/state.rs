@@ -203,10 +203,7 @@ impl SamplerState {
         for (mode, matcher) in config.modes.iter().zip(self.matchers.iter_mut())
         {
             match (mode, matcher) {
-                (
-                    SamplingMode::Grammar(compiled),
-                    MatcherState::Grammar(s),
-                ) => {
+                (SamplingMode::Grammar(compiled), MatcherState::Grammar(s)) => {
                     piece(&mut buf, &mut computed);
                     let _ = s.advance_bytes(&compiled.grammar, &buf);
                 }
@@ -252,10 +249,9 @@ impl SamplerState {
 
         let modes_ok = config.modes.iter().zip(self.matchers.iter()).all(
             |(mode, matcher)| match (mode, matcher) {
-                (
-                    SamplingMode::Grammar(compiled),
-                    MatcherState::Grammar(s),
-                ) => grammar_ok(&compiled.grammar, s),
+                (SamplingMode::Grammar(compiled), MatcherState::Grammar(s)) => {
+                    grammar_ok(&compiled.grammar, s)
+                }
                 (SamplingMode::Json, MatcherState::Json(s)) => {
                     !buf.is_empty()
                         && if chosen_is_eog && !s.is_complete() {

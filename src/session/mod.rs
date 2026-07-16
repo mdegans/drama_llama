@@ -3637,9 +3637,7 @@ impl<B: Backend> Session<B> {
         let mut matchers: Vec<Option<grammar_mod::StackState>> = modes
             .iter()
             .map(|m| match m {
-                SamplingMode::Grammar(compiled) => {
-                    Some(compiled.root_state())
-                }
+                SamplingMode::Grammar(compiled) => Some(compiled.root_state()),
                 _ => None,
             })
             .collect();

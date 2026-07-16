@@ -701,10 +701,7 @@ fn is_name_char(c: char) -> bool {
 
 /// Position within the element stream: which alt of which rule, and how
 /// far through it.
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Position {
     rule_idx: u32,
@@ -730,10 +727,7 @@ struct Position {
 // Phase 3): positions index into a *specific* compiled grammar; a
 // deserialized StackState is only meaningful against the same source,
 // and indices must be bounds-checked on restore.
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize, serde::Serialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StackState {
     stacks: Vec<Stack>,
@@ -945,13 +939,21 @@ impl StackState {
 
     /// True iff feeding `bytes` would succeed from the current state.
     /// Clones only the matcher state — the `Arc<Grammar>` is not touched.
-    pub(crate) fn accepts_bytes(&self, grammar: &Grammar, bytes: &[u8]) -> bool {
+    pub(crate) fn accepts_bytes(
+        &self,
+        grammar: &Grammar,
+        bytes: &[u8],
+    ) -> bool {
         let mut scratch = self.clone();
         scratch.advance_bytes(grammar, bytes).is_ok()
     }
 
     /// [`Self::accepts_bytes`] + the scratch state ends accepting.
-    pub(crate) fn completes_with(&self, grammar: &Grammar, bytes: &[u8]) -> bool {
+    pub(crate) fn completes_with(
+        &self,
+        grammar: &Grammar,
+        bytes: &[u8],
+    ) -> bool {
         let mut scratch = self.clone();
         scratch.advance_bytes(grammar, bytes).is_ok() && scratch.is_complete()
     }
@@ -1980,7 +1982,11 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
     // up-front (growth-capped: the config-homed cache lives for the
     // Session, not the call) so every candidate walks the same
     // transition table from the same state id.
-    let base_id = if cache_on { cache.intern_base(inner) } else { 0 };
+    let base_id = if cache_on {
+        cache.intern_base(inner)
+    } else {
+        0
+    };
     let bitmap = if cache_on {
         cache.first_byte_bitmap(grammar, base_id)
     } else {
@@ -2156,9 +2162,7 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn stack_state_serde_round_trip() {
-        let grammar = Arc::new(parse_ok(
-            r#"root ::= "héllo" | "hénlo""#,
-        ));
+        let grammar = Arc::new(parse_ok(r#"root ::= "héllo" | "hénlo""#));
         let mut state = GrammarState::new(grammar.clone());
         // Stop mid-codepoint: feed "h" + the first byte of "é" (2-byte
         // UTF-8) so `pending` is non-empty and both alternation stacks

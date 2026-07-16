@@ -68,8 +68,16 @@ pub struct SamplerConfig {
     /// instead of looping on invisible reserved tokens (see
     /// `json_filter`).
     ///
+    /// **Default `true`** (#28 step 3, flipped 2026-07-16): the masked
+    /// path burns a full-vocab rayon sweep per constrained token even
+    /// with the DFA cache; sample-then-check is O(piece) in the
+    /// steady state with identical grammar-legality guarantees. Greedy
+    /// streams are unchanged by the flip (the fallback replay *is* the
+    /// masked path, so an illegal argmax converges to the same pick);
+    /// sampled streams under constraints differ, deliberately.
+    ///
     /// Has no effect when `modes` contains no `Grammar`/`Json` mode.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(feature = "serde", serde(default = "default_lazy_grammar"))]
     pub lazy_grammar: bool,
     /// Emit-side special-token ban (sorted ids): specials the active
     /// chat dialect never legitimately emits — turn-open markers,
@@ -125,6 +133,13 @@ pub struct DeferredGrammar {
     pub feed_trigger: bool,
 }
 
+/// The `lazy_grammar` default — `true` — shared by `Default`,
+/// `greedy()`, and serde (a config that omits the field gets the same
+/// answer as a constructed one).
+const fn default_lazy_grammar() -> bool {
+    true
+}
+
 impl SamplerConfig {
     /// Greedy sampling. No repetition penalty.
     pub fn greedy() -> Self {
@@ -132,7 +147,7 @@ impl SamplerConfig {
             modes: vec![SamplingMode::Greedy],
             repetition: None,
             deferred_grammar: None,
-            lazy_grammar: false,
+            lazy_grammar: default_lazy_grammar(),
             banned_specials: Vec::new(),
         }
     }
@@ -282,7 +297,7 @@ impl Default for SamplerConfig {
             // or `SamplerConfig::greedy()`.
             repetition: Some(RepetitionOptions::default()),
             deferred_grammar: None,
-            lazy_grammar: false,
+            lazy_grammar: default_lazy_grammar(),
             banned_specials: Vec::new(),
         }
     }

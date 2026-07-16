@@ -1,7 +1,5 @@
 use std::num::{NonZeroU128, NonZeroUsize};
 
-
-
 use crate::{
     backend::{Backend, Decoder, Model},
     sample::SamplerConfig,
