@@ -15,7 +15,19 @@
 //! their own, because unpublished filings exist only in host state —
 //! there is no model in the blindness loop. That's what makes the four
 //! voices genuinely distinct instead of converging on whoever spoke
-//! first. The same principle covers the question itself: `open_case`
+//! first.
+//!
+//! The sixth seat is the **jester** — the licensed contrarian, a role
+//! borrowed from Agora where the human plays it. The jester files no
+//! blind position: when the last advisor files, the sealed round goes
+//! to the jester *alone*, whose mandatory rebuttal (attack the
+//! consensus, premises first, even if you agree) publishes with the
+//! round. Structural, not prompted, because two live runs showed the
+//! failure mode: a unanimous-wrong round 1 produces no disagreement,
+//! the judge rules on agreement, and the engagement phase where trick
+//! questions crack never happens. The jester guarantees every round
+//! one adversarial pass — a consensus that survives it deserved to
+//! win. The same principle covers the question itself: `open_case`
 //! has no question parameter — the docket attaches the petitioner's
 //! latest chat message **verbatim** (host-captured), because the first
 //! live run's judge paraphrased the trick question into a generic
@@ -84,6 +96,14 @@ const JUDGE: &str = "judge";
 /// `philosopher` (assumptions and consistency), `engineer` (mechanics
 /// and failure modes), `lawyer` (what the stated facts entail).
 const ADVISORS: [&str; 4] = ["artist", "philosopher", "engineer", "lawyer"];
+/// The licensed contrarian. Files no blind position: when the last
+/// advisor files, the sealed round goes to the jester ALONE, whose
+/// mandatory rebuttal publishes with it. Structural, not prompted —
+/// two live runs showed a unanimous-wrong round 1 never reaches the
+/// engagement phase where trick questions crack (the judge rules on
+/// agreement), so every round is guaranteed one adversarial pass.
+/// The role is Agora-canon: the human plays it downstream.
+const JESTER: &str = "jester";
 
 /// A judge/advisor council wired together by a sealed-round docket.
 #[derive(Parser, Debug)]
@@ -102,6 +122,19 @@ struct Cli {
 /// All async output rides the single rustyline [`Printer`] behind a
 /// mutex; no lock is ever held across an `await`.
 type SharedPrinter = Arc<Mutex<Printer>>;
+
+/// Where the open case's current round stands.
+#[derive(Debug, Default, PartialEq)]
+enum Phase {
+    /// No round in flight: no case yet, or the last round published.
+    #[default]
+    Idle,
+    /// Advisors are filing; filings are sealed.
+    Filing,
+    /// Every expected advisor has filed; the sealed round is with the
+    /// jester for the mandatory rebuttal. Nobody else has seen it.
+    Rebuttal,
+}
 
 /// The chamber: every piece of council state the host enforces. One
 /// instance behind one mutex, shared by every [`Docket`] and [`Bench`]
@@ -122,9 +155,11 @@ struct Chamber {
     case: Option<String>,
     /// 1-based round number of the open case.
     round: u32,
-    /// True between a round's call and its publication: filings are
-    /// being accepted (and sealed).
-    awaiting: bool,
+    /// Where the open case's current round stands.
+    phase: Phase,
+    /// The jester's rebuttal for the current round, once filed.
+    /// Cleared when a new round is called.
+    rebuttal: Option<String>,
     /// Advisors expected to file this round — those with a filing
     /// left when the round was called. Publication fires when every
     /// expected advisor has filed.
@@ -149,6 +184,9 @@ impl Chamber {
         );
         for (name, position) in &self.filings {
             out.push_str(&format!("\n## {name}\n{position}\n"));
+        }
+        if let Some(rebuttal) = &self.rebuttal {
+            out.push_str(&format!("\n## {JESTER} (rebuttal)\n{rebuttal}\n"));
         }
         let excused: Vec<&str> = ADVISORS
             .iter()
@@ -248,19 +286,40 @@ impl Docket {
             .get(&self.name)
             .copied()
             .unwrap_or_default();
-        let briefing = format!(
-            "<docket>\nYou are `{}`, an advisor on a council. Cases \
-             arrive from the bench as mail. File your position with the \
-             docket's `file` — filings are SEALED until every advisor \
-             has filed, then the whole round is published to all seats \
-             at once, so round 1 is always your independent view. If \
-             the bench calls another round you will see the others' \
-             positions first; engage with them — concede what someone \
-             proves, defend the rest. You have {} filings for this \
-             case; each costs one. You never speak to the human: \
-             anything not filed is lost.\n</docket>",
-            self.name, budget,
-        );
+        let briefing = if self.name == JESTER {
+            format!(
+                "<docket>\nYou are `{}`, the council's jester. You do \
+                 not file blind: when every advisor has filed, the \
+                 sealed round comes to YOU first, as mail — nobody \
+                 else has seen it. Your duty is the rebuttal: argue \
+                 against the consensus (or the strongest position if \
+                 they split), premises first, even when you privately \
+                 agree. You are not trying to be right; you are making \
+                 the others prove they are. Sharp and concrete beats \
+                 vague doubt. File it with `file`; it publishes with \
+                 the round. You have {} filings; each costs one. You \
+                 never speak to the human: anything not filed is \
+                 lost.\n</docket>",
+                self.name, budget,
+            )
+        } else {
+            format!(
+                "<docket>\nYou are `{}`, an advisor on a council. Cases \
+                 arrive from the bench as mail. File your position with \
+                 the docket's `file` — filings are SEALED until every \
+                 advisor has filed, then the whole round is published \
+                 to all seats at once, so round 1 is always your \
+                 independent view. The council's jester rebuts every \
+                 round before you see it; expect your premises \
+                 attacked. If the bench calls another round you will \
+                 see the others' positions and the rebuttal first; \
+                 engage — concede what someone proves, defend the \
+                 rest. You have {} filings for this case; each costs \
+                 one. You never speak to the human: anything not filed \
+                 is lost.\n</docket>",
+                self.name, budget,
+            )
+        };
         match prompt.system.as_mut() {
             Some(system) => {
                 system.push(briefing);
@@ -270,21 +329,40 @@ impl Docket {
         Ok(())
     }
 
-    /// File your sealed position for the current round. Costs one
-    /// filing.
+    /// File your sealed position for the current round (advisors),
+    /// or — as the jester — the mandatory rebuttal once the sealed
+    /// round reaches you. Costs one filing.
     #[method]
     async fn file(&mut self, filing: Filing) -> Result<Content, Content> {
         self.court.scan(&filing.position).await?;
-        let publication = {
+        if self.name == JESTER {
+            return self.file_rebuttal(filing);
+        }
+        // What the completed filing set triggers: the sealed round
+        // goes to the jester for rebuttal, or — with no jester
+        // available — publishes directly.
+        enum Next {
+            ToJester(String),
+            Publish(String),
+        }
+        let next = {
             let mut chamber =
                 self.court.chamber.lock().expect("chamber poisoned");
             if chamber.case.is_none() {
                 return Err("no case is open".into());
             }
-            if !chamber.awaiting {
-                return Err("this round is already published — wait for \
-                            the bench to call another"
-                    .into());
+            match chamber.phase {
+                Phase::Filing => {}
+                Phase::Rebuttal => {
+                    return Err("the round is with the jester — wait \
+                                for publication"
+                        .into());
+                }
+                Phase::Idle => {
+                    return Err("this round is already published — wait \
+                                for the bench to call another"
+                        .into());
+                }
             }
             if chamber.filings.contains_key(&self.name) {
                 return Err("you already filed this round — stand pat".into());
@@ -310,27 +388,115 @@ impl Docket {
                     chamber.filings.len(),
                     chamber.expected.len(),
                 ));
-            // Simultaneous reveal: the last expected filing publishes
-            // the round to every seat, judge included.
             let complete = chamber
                 .expected
                 .iter()
                 .all(|a| chamber.filings.contains_key(a));
-            complete.then(|| {
-                chamber.awaiting = false;
-                chamber.publication()
-            })
+            if !complete {
+                None
+            } else if chamber.registry.contains_key(JESTER)
+                && chamber.budgets.get(JESTER).copied().unwrap_or_default() > 0
+            {
+                // The sealed round goes to the jester ALONE — the
+                // mandatory adversarial pass happens before any other
+                // seat (judge included) sees a word.
+                chamber.phase = Phase::Rebuttal;
+                Some(Next::ToJester(format!(
+                    "{}\nThe round is sealed with you before anyone \
+                     else sees it. File your rebuttal with `file` now \
+                     — attack the consensus (or the strongest position \
+                     if they split), premises first, even if you \
+                     privately agree. Your rebuttal publishes with the \
+                     round.",
+                    chamber.publication(),
+                )))
+            } else {
+                // No jester (dead loop or empty book): publish
+                // directly, on the record.
+                chamber.phase = Phase::Idle;
+                let mut text = chamber.publication();
+                text.push_str("\n(the jester is unavailable — no rebuttal)\n");
+                Some(Next::Publish(text))
+            }
         };
-        if let Some(text) = publication {
-            let chamber = self.court.chamber.lock().expect("chamber poisoned");
-            chamber.broadcast(ADVISORS.iter().copied().chain([JUDGE]), &text);
+        match next {
+            None => {}
+            Some(Next::ToJester(text)) => {
+                let chamber =
+                    self.court.chamber.lock().expect("chamber poisoned");
+                chamber.broadcast([JESTER], &text);
+                self.court.printer.lock().expect("printer poisoned").line(
+                    format!("⚖ round {} sealed to the jester", chamber.round),
+                );
+            }
+            Some(Next::Publish(text)) => {
+                let chamber =
+                    self.court.chamber.lock().expect("chamber poisoned");
+                chamber.broadcast(
+                    ADVISORS.iter().copied().chain([JESTER, JUDGE]),
+                    &text,
+                );
+                self.court
+                    .printer
+                    .lock()
+                    .expect("printer poisoned")
+                    .line(format!("⚖ round {} published", chamber.round));
+            }
+        }
+        Ok("filed (sealed until the round publishes)".into())
+    }
+
+    /// The jester's half of `file`: accept the rebuttal, publish the
+    /// completed round to every seat.
+    fn file_rebuttal(&mut self, filing: Filing) -> Result<Content, Content> {
+        let text = {
+            let mut chamber =
+                self.court.chamber.lock().expect("chamber poisoned");
+            if chamber.case.is_none() {
+                return Err("no case is open".into());
+            }
+            match chamber.phase {
+                Phase::Rebuttal => {}
+                Phase::Filing => {
+                    return Err("the advisors are still filing — the \
+                                sealed round will come to you as mail"
+                        .into());
+                }
+                Phase::Idle => {
+                    return Err("this round is already published — wait \
+                                for the bench to call another"
+                        .into());
+                }
+            }
+            {
+                let budget =
+                    chamber.budgets.entry(self.name.clone()).or_default();
+                if *budget == 0 {
+                    return Err("out of filings — the round publishes \
+                                without a rebuttal. Only the human can \
+                                refill your book."
+                        .into());
+                }
+                *budget -= 1;
+            }
+            chamber.rebuttal = Some(filing.position);
+            chamber.phase = Phase::Idle;
             self.court
                 .printer
                 .lock()
                 .expect("printer poisoned")
-                .line(format!("⚖ round {} published", chamber.round));
-        }
-        Ok("filed (sealed until the round publishes)".into())
+                .line(format!("{JESTER} ⚖ rebutted"));
+            chamber.publication()
+        };
+        let chamber = self.court.chamber.lock().expect("chamber poisoned");
+        chamber
+            .broadcast(ADVISORS.iter().copied().chain([JESTER, JUDGE]), &text);
+        self.court
+            .printer
+            .lock()
+            .expect("printer poisoned")
+            .line(format!("⚖ round {} published", chamber.round));
+        Ok("rebuttal filed; the round is published".into())
     }
 }
 
@@ -402,7 +568,8 @@ impl Bench {
                 self.court.chamber.lock().expect("chamber poisoned");
             chamber.case = Some(petition.clone());
             chamber.round = 1;
-            chamber.awaiting = true;
+            chamber.phase = Phase::Filing;
+            chamber.rebuttal = None;
             chamber.filings.clear();
             chamber.expected = ADVISORS
                 .iter()
@@ -413,7 +580,7 @@ impl Bench {
                 .collect();
             if chamber.expected.is_empty() {
                 chamber.case = None;
-                chamber.awaiting = false;
+                chamber.phase = Phase::Idle;
                 return Err("every advisor is out of filings — ask the \
                             human to /grant some"
                     .into());
@@ -455,17 +622,26 @@ impl Bench {
             if chamber.case.is_none() {
                 return Err("no case is open".into());
             }
-            if chamber.awaiting {
-                return Err(format!(
-                    "round {} has not published yet — {}/{} filings in",
-                    chamber.round,
-                    chamber.filings.len(),
-                    chamber.expected.len(),
-                )
-                .into());
+            match chamber.phase {
+                Phase::Idle => {}
+                Phase::Filing => {
+                    return Err(format!(
+                        "round {} has not published yet — {}/{} filings in",
+                        chamber.round,
+                        chamber.filings.len(),
+                        chamber.expected.len(),
+                    )
+                    .into());
+                }
+                Phase::Rebuttal => {
+                    return Err("the round is with the jester — wait \
+                                for the rebuttal"
+                        .into());
+                }
             }
             chamber.round += 1;
-            chamber.awaiting = true;
+            chamber.phase = Phase::Filing;
+            chamber.rebuttal = None;
             chamber.filings.clear();
             chamber.expected = ADVISORS
                 .iter()
@@ -475,7 +651,7 @@ impl Bench {
                 .map(|a| a.to_string())
                 .collect();
             if chamber.expected.is_empty() {
-                chamber.awaiting = false;
+                chamber.phase = Phase::Idle;
                 return Err("every advisor is out of filings — rule on \
                             what you have"
                     .into());
@@ -559,6 +735,19 @@ fn advisor_prompt(name: &str) -> Prompt {
              voice is genuinely distinct, and you are expected to \
              disagree when your lens demands it."
         }
+        "jester" => {
+            "You are `jester`, the council's licensed contrarian. The \
+             other advisors file positions; you file rebuttals. \
+             Whatever they agree on, you attack — starting with the \
+             premises: what does the question assume that nobody \
+             questioned? What reading makes the consensus absurd? \
+             Argue the strongest case AGAINST the emerging answer even \
+             when you find it persuasive; if the consensus survives \
+             you, it deserved to win. Concrete scenarios beat \
+             rhetorical doubt — one vivid case where the advice fails \
+             outweighs a paragraph of maybes. You never speak to the \
+             human; anything not filed is lost."
+        }
         other => unreachable!("no persona for `{other}`"),
     };
     Prompt::default().system(persona)
@@ -570,7 +759,12 @@ const JUDGE_SYSTEM: &str =
      chatting with is the petitioner. Your advisors: `artist` (lived \
      experience), `philosopher` (assumptions and consistency), \
      `engineer` (mechanics and failure modes), `lawyer` (what the \
-     stated facts entail). You do not answer questions yourself — open \
+     stated facts entail) — plus `jester`, the licensed contrarian \
+     who rebuts every round before you see it. The rebuttal is \
+     structurally contrarian: weigh it by what it EXPOSES, not by its \
+     conclusion. A rebuttal the positions cannot answer means call \
+     another round; one they cleanly survive strengthens your ruling. \
+     You do not answer questions yourself — open \
      a case with the bench's `open_case`. The docket attaches the \
      petitioner's latest message verbatim on its own — you cannot \
      rewrite the question, and you should not suggest factors to \
@@ -594,7 +788,7 @@ async fn main() -> Result<(), BoxError> {
     // One model, one session, one cache slot per seat: each agent's
     // history pins its own KV sequence, and every published round is
     // identical bytes to every seat — the cache-friendly shape.
-    let seats = ADVISORS.len() as u32 + 1;
+    let seats = ADVISORS.len() as u32 + 2; // advisors + jester + judge
     let transport =
         SessionTransport::new(cli.common.session_with_cache_slots(seats)?);
 
@@ -604,8 +798,8 @@ async fn main() -> Result<(), BoxError> {
     let chamber = Arc::new(Mutex::new(Chamber::default()));
     {
         let mut guard = chamber.lock().expect("chamber poisoned");
-        for advisor in ADVISORS {
-            guard.budgets.insert(advisor.to_string(), cli.filings);
+        for seat in ADVISORS.iter().copied().chain([JESTER]) {
+            guard.budgets.insert(seat.to_string(), cli.filings);
         }
     }
     let court = |transport: &SessionTransport<LlamaCppBackend>| Court {
@@ -619,7 +813,7 @@ async fn main() -> Result<(), BoxError> {
     let payroll: HashMap<&'static str, Arc<Mutex<TokenCounts>>> = ADVISORS
         .iter()
         .copied()
-        .chain([JUDGE])
+        .chain([JESTER, JUDGE])
         .map(|name| (name, Arc::default()))
         .collect();
 
@@ -627,7 +821,9 @@ async fn main() -> Result<(), BoxError> {
     // so the chamber's registry is complete before the first case.
     let advisor_boxes: Vec<(&str, ToolBox)> = ADVISORS
         .iter()
-        .map(|&name| {
+        .copied()
+        .chain([JESTER])
+        .map(|name| {
             let toolbox = ToolBox::new().add(Docket {
                 name: name.to_string(),
                 court: court(&transport),
@@ -641,9 +837,10 @@ async fn main() -> Result<(), BoxError> {
 
     printer.lock().expect("printer poisoned").line(
         "The council is seated: you ↔ judge; artist, philosopher, \
-         engineer, lawyer file sealed positions. You hold the \
-         treasury: `/grant <advisor> <count>` refills a book, \
-         `/docket` shows the chamber. Ctrl-D adjourns.\n",
+         engineer, lawyer file sealed positions; the jester rebuts \
+         every round before anyone sees it. You hold the treasury: \
+         `/grant <seat> <count>` refills a book, `/docket` shows the \
+         chamber. Ctrl-D adjourns.\n",
     );
 
     // The advisors: headless Chats. Publications and round calls are
@@ -734,10 +931,10 @@ async fn main() -> Result<(), BoxError> {
                                 "case: {case} | round {} ({}) | filed: \
                                  {}/{} | filings: {}",
                                 chamber.round,
-                                if chamber.awaiting {
-                                    "sealed"
-                                } else {
-                                    "published"
+                                match chamber.phase {
+                                    Phase::Filing => "sealed",
+                                    Phase::Rebuttal => "with the jester",
+                                    Phase::Idle => "published",
                                 },
                                 chamber.filings.len(),
                                 chamber.expected.len(),
@@ -809,7 +1006,7 @@ async fn main() -> Result<(), BoxError> {
     // a seat's first turn should mostly be reads.
     println!("── payroll ──────────────────────────────────────────");
     let mut total = TokenCounts::default();
-    for name in ADVISORS.iter().copied().chain([JUDGE]) {
+    for name in ADVISORS.iter().copied().chain([JESTER, JUDGE]) {
         let counts = *payroll[name].lock().expect("payroll poisoned");
         println!("{name:<12} {}", pay_line(&counts));
         total += counts;
