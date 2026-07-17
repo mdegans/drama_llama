@@ -136,6 +136,11 @@ mod session;
 pub use session::FromPath;
 #[cfg(feature = "llama-cpp")]
 pub use session::LlamaCppSession;
+#[cfg(all(
+    feature = "tokio",
+    any(feature = "llama-cpp", all(feature = "moeflux", target_os = "macos"))
+))]
+pub use session::SessionTransport;
 #[cfg(any(
     feature = "llama-cpp",
     all(feature = "moeflux", target_os = "macos")
