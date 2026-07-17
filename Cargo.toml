@@ -201,6 +201,11 @@ required-features = ["tokio", "cli", "json-schema"]
 doc-scrape-examples = true
 
 [[example]]
+name = "structured_commit_classifier"
+required-features = ["tokio", "cli", "json-schema"]
+doc-scrape-examples = true
+
+[[example]]
 name = "strawberry"
 required-features = ["cli", "json-schema"]
 doc-scrape-examples = true
