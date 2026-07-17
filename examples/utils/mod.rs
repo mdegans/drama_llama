@@ -18,10 +18,21 @@ mod args;
 #[allow(unused_imports)]
 pub use args::{Args, ChatArgs, CommonArgs};
 
-/// Initialize logging for an example. With `verbose`, the default level is
-/// `debug` (otherwise `warn`); `RUST_LOG` overrides either. Safe to call once.
+/// Initialize logging for an example. With `verbose`, the examples and the
+/// chat driver log at `debug` (otherwise `warn`); `RUST_LOG` overrides
+/// either. Safe to call once.
+///
+/// The verbose filter is *scoped* rather than a global `debug` default —
+/// a global default also turns on rustyline's per-keypress debug logging,
+/// which floods the readline examples (one log line per key).
 pub fn log_init(verbose: bool) {
-    let default = if verbose { "debug" } else { "warn" };
+    let default = if verbose {
+        // Example binaries log under their own name; cover the set plus
+        // the crates whose narration is actually wanted.
+        "warn,swarm=debug,python=debug,misanthropic=debug,drama_llama=debug"
+    } else {
+        "warn"
+    };
     let env = env_logger::Env::default().default_filter_or(default);
     // `try_init` so a second call (or a pre-installed logger) is a no-op.
     let _ = env_logger::Builder::from_env(env).try_init();
