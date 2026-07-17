@@ -196,6 +196,11 @@ required-features = ["tokio", "cli"]
 doc-scrape-examples = true
 
 [[example]]
+name = "few_shot_triage"
+required-features = ["tokio", "cli", "json-schema"]
+doc-scrape-examples = true
+
+[[example]]
 name = "strawberry"
 required-features = ["cli", "json-schema"]
 doc-scrape-examples = true
