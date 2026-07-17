@@ -83,6 +83,19 @@ pub trait Decoder: Send {
     /// Context length in tokens.
     fn n_ctx(&self) -> u32;
 
+    /// Maximum number of distinct KV sequences this decoder supports.
+    /// `Session`'s multi-slot prefix cache clamps its slot count to
+    /// this.
+    ///
+    /// **No default impl: forces every backend to make an explicit
+    /// choice.** llama.cpp reports the context's `n_seq_max` (cells
+    /// are physically partitioned or unified per context params);
+    /// moeflux reports a large value because its `seq_id` is a
+    /// *namespace label only* — one physical stream, realized as
+    /// whole-state snapshots per `(seq, pos)` — so any number of
+    /// sequences can exist, just never concurrently resident.
+    fn n_seq_max(&self) -> u32;
+
     /// Clear the entire KV cache.
     fn memory_clear(&mut self);
 

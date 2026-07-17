@@ -1,13 +1,10 @@
 use crate::{
     backend::{Decoder, MemoryRmError},
+    snapshot_store::SnapshotStore,
     Batch, LlamaCppModel, Token,
 };
 
-use std::{
-    collections::{HashMap, VecDeque},
-    path::PathBuf,
-    sync::Mutex,
-};
+use std::{path::PathBuf, sync::Mutex};
 
 use llama_cpp_sys_3::{
     ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED, llama_backend_free,
@@ -19,11 +16,11 @@ use llama_cpp_sys_3::{
     llama_memory_clear, llama_memory_seq_add, llama_memory_seq_cp,
     llama_memory_seq_div, llama_memory_seq_keep, llama_memory_seq_pos_max,
     llama_memory_seq_rm, llama_model_is_hybrid, llama_model_is_recurrent,
-    llama_n_batch, llama_n_ctx, llama_new_context_with_model, llama_numa_init,
-    llama_perf_context, llama_perf_context_data, llama_perf_context_reset,
-    llama_pos, llama_seq_id, llama_set_n_threads, llama_state_get_data,
-    llama_state_get_size, llama_state_seq_get_data, llama_state_seq_get_size,
-    llama_state_seq_set_data, llama_state_set_data,
+    llama_n_batch, llama_n_ctx, llama_n_seq_max, llama_new_context_with_model,
+    llama_numa_init, llama_perf_context, llama_perf_context_data,
+    llama_perf_context_reset, llama_pos, llama_seq_id, llama_set_n_threads,
+    llama_state_get_data, llama_state_get_size, llama_state_seq_get_data,
+    llama_state_seq_get_size, llama_state_seq_set_data, llama_state_set_data,
 };
 
 use thiserror::Error;
@@ -96,80 +93,6 @@ impl FlashAttention {
                 llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED
             }
         }
-    }
-}
-
-/// Max host-RAM sequence-state snapshots retained per decoder.
-/// Anthropic's cache budget is 4 explicit breakpoints; `Session` adds
-/// one internal tip. 16 leaves generous slack for multi-sequence use
-/// before the LRU starts evicting.
-const MAX_SEQ_SNAPSHOTS: usize = 16;
-
-/// Bounded LRU of serialized per-sequence decoder states, keyed by
-/// `(seq_id, pos)`. Pure bookkeeping — FFI-free, so the eviction /
-/// invalidation logic is unit-testable without a model.
-///
-/// A stored value is the *entire* serialized state for that sequence
-/// (`llama_state_seq_get_data` wire format), taken when the sequence
-/// held exactly positions `[0, pos)`. Restoring one replaces the
-/// sequence wholesale, so entries stay restorable regardless of later
-/// KV mutations; invalidation exists to keep the trait's rewind
-/// semantics ("futures are dropped") uniform across backends, not
-/// because the bytes go stale.
-#[derive(Debug, Default)]
-struct SnapshotStore {
-    map: HashMap<(llama_seq_id, llama_pos), Vec<u8>>,
-    /// Insertion order, oldest first. Re-inserting an existing key
-    /// refreshes its position.
-    order: VecDeque<(llama_seq_id, llama_pos)>,
-}
-
-impl SnapshotStore {
-    /// Insert (or replace) the snapshot at `key`, evicting the oldest
-    /// entries beyond [`MAX_SEQ_SNAPSHOTS`].
-    fn insert(&mut self, key: (llama_seq_id, llama_pos), bytes: Vec<u8>) {
-        if self.map.insert(key, bytes).is_some() {
-            self.order.retain(|k| *k != key);
-        }
-        self.order.push_back(key);
-        while self.map.len() > MAX_SEQ_SNAPSHOTS {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.map.remove(&oldest);
-        }
-    }
-
-    /// Remove and return the snapshot at `key`, if any.
-    fn take(&mut self, key: (llama_seq_id, llama_pos)) -> Option<Vec<u8>> {
-        let bytes = self.map.remove(&key)?;
-        self.order.retain(|k| *k != key);
-        Some(bytes)
-    }
-
-    /// Drop the snapshot at `key`. Idempotent.
-    fn forget(&mut self, key: (llama_seq_id, llama_pos)) {
-        if self.map.remove(&key).is_some() {
-            self.order.retain(|k| *k != key);
-        }
-    }
-
-    /// Drop every snapshot on `seq_id` at positions strictly greater
-    /// than `pos` — the "futures are invalid after a rewind" rule from
-    /// [`Decoder::restore_to`].
-    fn invalidate_after(&mut self, seq_id: llama_seq_id, pos: llama_pos) {
-        self.map.retain(|&(s, p), _| s != seq_id || p <= pos);
-        self.order.retain(|&(s, p)| s != seq_id || p <= pos);
-    }
-
-    /// Drop everything.
-    fn clear(&mut self) {
-        self.map.clear();
-        self.order.clear();
-    }
-
-    fn len(&self) -> usize {
-        self.map.len()
     }
 }
 
@@ -600,6 +523,10 @@ impl Decoder for LlamaCppDecoder {
         LlamaCppDecoder::n_ctx(self)
     }
 
+    fn n_seq_max(&self) -> u32 {
+        unsafe { llama_n_seq_max(self.context) }
+    }
+
     fn memory_clear(&mut self) {
         LlamaCppDecoder::memory_clear(self);
         // Session clears on full re-prefill; the old positions are
@@ -702,83 +629,5 @@ impl Decoder for LlamaCppDecoder {
     ) -> Result<(), MemoryRmError> {
         self.seq_snapshots.forget((seq_id, pos));
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn store_with(keys: &[(i32, i32)]) -> SnapshotStore {
-        let mut s = SnapshotStore::default();
-        for &k in keys {
-            s.insert(k, vec![0u8; 4]);
-        }
-        s
-    }
-
-    #[test]
-    fn snapshot_store_insert_take_forget_roundtrip() {
-        let mut s = SnapshotStore::default();
-        s.insert((0, 10), vec![1, 2, 3]);
-        assert_eq!(s.len(), 1);
-        assert_eq!(s.take((0, 10)), Some(vec![1, 2, 3]));
-        assert_eq!(s.len(), 0);
-        assert_eq!(s.take((0, 10)), None);
-        // forget is idempotent on absent keys.
-        s.forget((0, 10));
-        s.forget((0, 10));
-    }
-
-    #[test]
-    fn snapshot_store_replace_refreshes_lru_position() {
-        // Fill to capacity, then re-insert the oldest key. The next
-        // eviction must hit the second-oldest, not the refreshed one.
-        let keys: Vec<(i32, i32)> =
-            (0..MAX_SEQ_SNAPSHOTS as i32).map(|i| (0, i)).collect();
-        let mut s = store_with(&keys);
-        s.insert((0, 0), vec![9]); // refresh oldest
-        s.insert((0, 999), vec![8]); // overflow → evict (0, 1)
-        assert_eq!(s.len(), MAX_SEQ_SNAPSHOTS);
-        assert_eq!(s.take((0, 1)), None, "second-oldest should be evicted");
-        assert_eq!(s.take((0, 0)), Some(vec![9]), "refreshed key survives");
-    }
-
-    #[test]
-    fn snapshot_store_evicts_oldest_beyond_cap() {
-        let keys: Vec<(i32, i32)> = (0..(MAX_SEQ_SNAPSHOTS as i32 + 3))
-            .map(|i| (0, i))
-            .collect();
-        let mut s = store_with(&keys);
-        assert_eq!(s.len(), MAX_SEQ_SNAPSHOTS);
-        // The three oldest are gone; the newest three are present.
-        assert_eq!(s.take((0, 0)), None);
-        assert_eq!(s.take((0, 1)), None);
-        assert_eq!(s.take((0, 2)), None);
-        assert!(s.take((0, MAX_SEQ_SNAPSHOTS as i32 + 2)).is_some());
-    }
-
-    #[test]
-    fn snapshot_store_invalidate_after_is_per_sequence() {
-        let mut s = store_with(&[(0, 5), (0, 10), (0, 20), (1, 15)]);
-        s.invalidate_after(0, 10);
-        // (0, 20) dropped: strictly greater than pos on seq 0.
-        assert_eq!(s.take((0, 20)), None);
-        // (0, 10) kept: boundary is inclusive.
-        assert!(s.take((0, 10)).is_some());
-        assert!(s.take((0, 5)).is_some());
-        // Other sequences untouched.
-        assert!(s.take((1, 15)).is_some());
-    }
-
-    #[test]
-    fn snapshot_store_clear_empties_map_and_order() {
-        let mut s = store_with(&[(0, 1), (0, 2)]);
-        s.clear();
-        assert_eq!(s.len(), 0);
-        // Insert after clear must not resurrect stale order entries.
-        s.insert((0, 3), vec![1]);
-        assert_eq!(s.len(), 1);
-        assert!(s.take((0, 3)).is_some());
     }
 }

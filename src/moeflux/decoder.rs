@@ -3,11 +3,12 @@
 
 use std::path::Path;
 
-use moeflux::{CheckpointError, Ctx, Error as MfError};
+use moeflux::{Ctx, Error as MfError};
 use thiserror::Error;
 
 use crate::{
     backend::{Decoder, MemoryRmError},
+    snapshot_store::SnapshotStore,
     Token,
 };
 
@@ -79,6 +80,21 @@ pub struct PrefetchStats {
 ///
 /// Single-threaded per instance: `Ctx` is `Send` but not `Sync` (see
 /// moeflux.h).
+///
+/// # Sequences are a namespace, not a partition
+///
+/// moeflux physically maintains **one** stream — `Ctx` ignores
+/// `seq_id`. This wrapper realizes the [`Decoder`] trait's `(seq_id,
+/// pos)` keying on top of it: [`Decoder::checkpoint_pos`] serializes
+/// the whole `Ctx` state (`state_save`) into a wrapper-owned
+/// [`SnapshotStore`] keyed `(seq_id, pos)`, and
+/// [`Decoder::restore_to`] loads the blob back (`state_load`) — the
+/// blob *is* the entire history, so loading it is the sequence
+/// switch. [`Self::active_seq`] tracks which sequence the live
+/// stream currently embodies; see the per-method docs for how calls
+/// targeting an *inactive* sequence behave. Cost note: switching
+/// sequences is a whole-state GPU upload — far cheaper than a
+/// re-prefill, but not free like llama.cpp's resident-cell switch.
 #[derive(Debug)]
 pub struct MoefluxDecoder {
     ctx: Ctx,
@@ -88,6 +104,23 @@ pub struct MoefluxDecoder {
     logits: Vec<f32>,
     /// Per-phase prefetch counters. See [`PrefetchStats`].
     prefetch_stats: PrefetchStats,
+    /// Wrapper-owned `(seq_id, pos)` → whole-`Ctx`-state blobs.
+    /// Replaces `Ctx`'s internal position-keyed checkpoint map, which
+    /// cannot distinguish sequences. Host-RAM budget = blob count
+    /// (LRU-capped in [`SnapshotStore`]) × `state_size` — the *dual
+    /// budget*: `Session`'s cell budget bounds bookkeeping, this cap
+    /// bounds actual memory here.
+    snapshots: SnapshotStore,
+    /// The sequence the live stream currently embodies. `-1` = fresh /
+    /// unowned (no eval since construction or [`Decoder::memory_clear`]).
+    ///
+    /// **The guard this enables is load-bearing**: mutating calls
+    /// targeting a different sequence must not touch the live stream —
+    /// most critically [`Decoder::memory_seq_rm`], which `Session`'s
+    /// multi-slot cache calls to evict *inactive* slots. Without the
+    /// guard, evicting slot B while slot A is generating would wipe
+    /// A's state mid-flight.
+    active_seq: i32,
 }
 
 impl MoefluxDecoder {
@@ -116,7 +149,22 @@ impl MoefluxDecoder {
             ctx,
             logits: vec![0.0f32; n_vocab],
             prefetch_stats: PrefetchStats::default(),
+            snapshots: SnapshotStore::default(),
+            active_seq: -1,
         })
+    }
+
+    /// Reset the live stream for a switch to `seq_id`, if it currently
+    /// embodies a *different* sequence. The wrapper's snapshot store
+    /// is untouched — it's what makes the departed sequence
+    /// recoverable.
+    fn switch_stream_to(&mut self, seq_id: i32) {
+        if self.active_seq != seq_id {
+            if self.active_seq != -1 {
+                self.ctx.memory_clear();
+            }
+            self.active_seq = seq_id;
+        }
     }
 
     /// Vocabulary size as reported by moeflux. Must equal the vocab
@@ -137,10 +185,12 @@ impl MoefluxDecoder {
         self.ctx.model_name()
     }
 
-    /// Underlying moeflux context for callers that need state
-    /// snapshot / restore (moeflux supports prefix-cache re-use via
-    /// `state_save` / `state_load`; this crate does not yet expose
-    /// those through the Decoder trait).
+    /// Underlying moeflux context. The [`Decoder`] trait's snapshot
+    /// surface (`checkpoint_pos` / `restore_to` / `forget_pos`) is
+    /// realized wrapper-side over `state_save` / `state_load` — direct
+    /// `Ctx` access here is for diagnostics and tests, not state
+    /// management (mixing `Ctx::checkpoint_pos` with the wrapper's
+    /// store would split the snapshot namespace).
     pub fn ctx(&self) -> &Ctx {
         &self.ctx
     }
@@ -215,6 +265,16 @@ impl Decoder for MoefluxDecoder {
         if tokens.is_empty() {
             return Ok(&[]);
         }
+        // A prefill targeting a different sequence than the live
+        // stream is a fresh start for that sequence (a mid-history
+        // resume must come through `restore_to`, which switches
+        // `active_seq` itself).
+        debug_assert!(
+            seq_id == self.active_seq || start_pos == 0,
+            "cross-sequence prefill at pos {start_pos} without restore \
+             (Session bug)",
+        );
+        self.switch_stream_to(seq_id);
         let (h0, m0) = self.ctx.prefetch_stats();
         let result =
             self.ctx
@@ -232,6 +292,13 @@ impl Decoder for MoefluxDecoder {
         pos: usize,
         seq_id: i32,
     ) -> Result<&[f32], Self::Error> {
+        // A step always extends the live stream; stepping an inactive
+        // sequence would silently decode against another agent's
+        // history.
+        debug_assert_eq!(
+            seq_id, self.active_seq,
+            "step on inactive sequence (Session bug)",
+        );
         let (h0, m0) = self.ctx.prefetch_stats();
         let result = self.ctx.eval_token(token, pos, seq_id, &mut self.logits);
         let (h1, m1) = self.ctx.prefetch_stats();
@@ -247,11 +314,34 @@ impl Decoder for MoefluxDecoder {
         self.ctx.n_ctx().try_into().unwrap_or(u32::MAX)
     }
 
-    fn memory_clear(&mut self) {
-        self.ctx.memory_clear();
+    fn n_seq_max(&self) -> u32 {
+        // A namespace, not a partition (see the struct docs): any
+        // number of sequences can exist as snapshot blobs, just never
+        // concurrently resident. Report "unbounded" and let Session's
+        // slot config choose its own cap.
+        u32::MAX
     }
 
+    fn memory_clear(&mut self) {
+        self.ctx.memory_clear();
+        // Full clear is `Session`'s thread-swap hammer: every
+        // sequence's snapshots die with the KV.
+        self.snapshots.clear();
+        self.active_seq = -1;
+    }
+
+    /// Truncate `seq_id`'s live state — **only if it is the active
+    /// sequence** (or `seq_id < 0`, "any sequence" per the trait).
+    /// A removal targeting an inactive sequence is a no-op returning
+    /// `true`: the live stream belongs to someone else, and the
+    /// inactive sequence's actual storage is its snapshot blobs, which
+    /// `Session` frees separately via [`Decoder::forget_pos`]. Without
+    /// this guard, evicting an inactive cache slot would wipe the
+    /// active agent's state.
     fn memory_seq_rm(&mut self, seq_id: i32, p0: i32, p1: i32) -> bool {
+        if seq_id >= 0 && seq_id != self.active_seq {
+            return true;
+        }
         self.ctx.memory_seq_rm(seq_id, p0, p1)
     }
 
@@ -273,42 +363,59 @@ impl Decoder for MoefluxDecoder {
         self.ctx.memory_seq_pos_max(seq_id)
     }
 
-    /// Forwards to [`Ctx::checkpoint_pos`]. moeflux's recurrence is
-    /// GPU-resident and folds full history; the snapshot reads it
-    /// back via the existing `state_save` wire format. The trait
-    /// surface is infallible — `state_save` errors only if linear
-    /// buffers aren't initialized, which can't happen here because
-    /// drama_llama's Session always prefills before checkpointing.
-    /// We surface that contract violation as a panic.
-    fn checkpoint_pos(&mut self, _seq_id: i32, pos: i32) {
+    /// Serialize the whole `Ctx` state (`state_save`) into the
+    /// wrapper's `(seq_id, pos)` snapshot store. moeflux's recurrence
+    /// is GPU-resident and folds full history; the snapshot reads it
+    /// back via the `state_save` wire format, so restoring it later is
+    /// lossless. The trait surface is infallible — `state_save` errors
+    /// only if linear buffers aren't initialized, which can't happen
+    /// here because drama_llama's Session always prefills before
+    /// checkpointing. We surface that contract violation as a panic.
+    ///
+    /// Only the *active* sequence can be checkpointed: the blob is a
+    /// serialization of the live stream, and checkpointing an inactive
+    /// sequence would label another agent's state with this key.
+    fn checkpoint_pos(&mut self, seq_id: i32, pos: i32) {
+        debug_assert_eq!(
+            seq_id, self.active_seq,
+            "checkpoint_pos on inactive sequence (Session bug)",
+        );
+        let mut buf = vec![0u8; self.ctx.state_size()];
         self.ctx
-            .checkpoint_pos(pos)
+            .state_save(&mut buf)
             .expect("checkpoint_pos before first prefill (Session bug)");
+        self.snapshots.insert((seq_id, pos), buf);
     }
 
+    /// Load the blob stored at `(seq_id, pos)` back into the live
+    /// stream (`state_load`) — the blob is the entire history, so this
+    /// *is* the sequence switch; `active_seq` becomes `seq_id`.
+    /// Snapshots on `seq_id` at positions `> pos` are dropped per the
+    /// trait contract (other sequences' snapshots are untouched — the
+    /// per-seq keying is exactly what makes that safe).
     fn restore_to(
         &mut self,
-        _seq_id: i32,
+        seq_id: i32,
         pos: i32,
     ) -> Result<(), MemoryRmError> {
-        match self.ctx.restore_to(pos) {
-            Ok(()) => Ok(()),
-            Err(CheckpointError::NoCheckpoint { pos }) => {
-                Err(MemoryRmError::NoCheckpoint { pos })
-            }
-            // A reload error from a buffer we wrote ourselves with
-            // `state_save` is a moeflux-internal bug; surface as
-            // BackendUnsupported so Session falls back gracefully
-            // rather than crashing.
-            Err(CheckpointError::Snapshot(_)) => {
-                Err(MemoryRmError::BackendUnsupported { pos })
-            }
+        let Some(bytes) = self.snapshots.get((seq_id, pos)) else {
+            return Err(MemoryRmError::NoCheckpoint { pos });
+        };
+        // A reload error from a buffer we wrote ourselves with
+        // `state_save` is a moeflux-internal bug; surface as
+        // BackendUnsupported so Session falls back gracefully rather
+        // than crashing. `state_load` preflights before mutating, so
+        // the live stream is unchanged on error.
+        if self.ctx.state_load(bytes).is_err() {
+            return Err(MemoryRmError::BackendUnsupported { pos });
         }
+        self.active_seq = seq_id;
+        self.snapshots.invalidate_after(seq_id, pos);
+        Ok(())
     }
 
-    /// Forwards to [`Ctx::forget_pos`]: removes the entry at `pos`
-    /// from `Ctx`'s `checkpoints` map and `checkpoint_order` LRU
-    /// without touching any other snapshot.
+    /// Drop the blob at `(seq_id, pos)` without touching any other
+    /// snapshot or the live stream.
     ///
     /// `Session` calls this in two paths: tip replacement
     /// (`record_cache_hit` evicting the previous tip) and orphan
@@ -322,10 +429,10 @@ impl Decoder for MoefluxDecoder {
     /// positions already pruned by `restore_to`'s forward-drop.
     fn forget_pos(
         &mut self,
-        _seq_id: i32,
+        seq_id: i32,
         pos: i32,
     ) -> Result<(), MemoryRmError> {
-        self.ctx.forget_pos(pos);
+        self.snapshots.forget((seq_id, pos));
         Ok(())
     }
 }

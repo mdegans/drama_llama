@@ -101,6 +101,12 @@ pub use moeflux::{
     MoefluxModelError,
 };
 
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub(crate) mod snapshot_store;
+
 mod ngram;
 pub use ngram::{NGram, NGramData, NGramStats};
 

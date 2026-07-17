@@ -79,6 +79,12 @@ impl<B: Backend> Engine<B> {
         self.decoder.n_ctx()
     }
 
+    /// Maximum number of distinct KV sequences the decoder supports.
+    /// See [`Decoder::n_seq_max`].
+    pub fn n_seq_max(&self) -> u32 {
+        self.decoder.n_seq_max()
+    }
+
     /// The vision capability, if one is loaded. `None` means images
     /// are unsupported on this engine (either the backend has no
     /// vision path at all, or no projector was loaded).
