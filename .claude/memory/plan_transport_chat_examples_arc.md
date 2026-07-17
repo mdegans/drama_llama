@@ -180,6 +180,28 @@ policy = cells not entries. Read `.claude/memory/blallama_session_state_pollutio
 first (lossy `memory_seq_rm` partial-truncate + lossy C `memory_clear` findings
 constrain which primitives are trustworthy).
 
+**Next-session slate additions (first live swarm run, 2026-07-17 evening):**
+
+1. **Council charter**: re-prompt the swarm away from "software company" so it
+   answers general questions (the car-wash trick question got refracted into a
+   "car-wash-advisor CLI" spec — the charter forces every ask into build-a-tool
+   shape). Mike: "perhaps a council."
+2. **Mail-boundary special-token rejection**: ant died mid-run —
+   `☠ ant: prompt content contains reserved special token 248058 ("<tool_call>")`.
+   Wasp's letter body contained literal dialect markup; the mail tool pushed
+   it; it was SEATED into ant's prompt; Session's ingest guard then rejected
+   every subsequent request — unrecoverable, loop dies. The guard is correct
+   (format integrity per CLAUDE.md) but fires too late for multi-agent flows.
+   Fix: validate at the letter boundary — `Mail::send` (ours, in the port)
+   checks body/subject and returns an is_error tool result ("rewrite it") so
+   the sender recovers and nobody's transcript is poisoned. Needs drama_llama
+   to expose the special-token check through Session/SessionTransport (today
+   it's internal, `check_no_special_injection`).
+3. Also observed, working as designed but worth knowing: wasp double-sends
+   (quiesce grants another round after each dispatch — two stamps for
+   critique + "Re:"), and turns slow monotonically without the cache rework
+   (every growing history re-prefills per agent switch — the known thrash).
+
 **Validation (decided, Mike 2026-07-17): panic-tripwire, not measurement.** The
 swarm wiring is already proven by the Anthropic-side Transport, and a baseline
 run with cache misses would take all day — so skip the before/after wall-clock
