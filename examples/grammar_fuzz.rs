@@ -243,6 +243,15 @@ fn gen_primitive(rng: &mut SmallRng) -> Value {
         .choose(rng)
         .copied()
         .unwrap();
+    // A third of primitives render as the nullable type-array shape
+    // schemars 1.x emits for `Option<T>` (`"type": ["T", "null"]`) —
+    // the shape that dead-ended the council's optional tool parameter
+    // (2026-07-17). The compiler collapses it via `effective_type`;
+    // Class-2 keeps it honest (collapsed output must still satisfy
+    // the nullable schema, which it does by construction).
+    if t != "null" && rng.random_range(0..3) == 0 {
+        return json!({ "type": [t, "null"] });
+    }
     json!({ "type": t })
 }
 
