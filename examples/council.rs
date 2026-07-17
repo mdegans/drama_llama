@@ -171,6 +171,12 @@ struct Chamber {
     /// Advisor name → filings remaining. Only host code writes it
     /// upward (`/grant`).
     budgets: HashMap<String, u32>,
+    /// Seats already auto-nudged this round. A seat whose turn ends
+    /// with no tool call while its filing is due gets exactly ONE
+    /// host reminder per round (a derailed model that ignores the
+    /// nudge is the human's to `/nudge` — unbounded auto-nudging
+    /// would burn model rounds forever).
+    nudged: BTreeSet<String>,
 }
 
 impl Chamber {
@@ -200,6 +206,19 @@ impl Chamber {
             ));
         }
         out
+    }
+
+    /// Does the chamber currently owe a filing from `name`? True for
+    /// an expected advisor who hasn't filed while the round is in
+    /// Filing, and for the jester while the round is in Rebuttal.
+    fn filing_due(&self, name: &str) -> bool {
+        match self.phase {
+            Phase::Filing => {
+                self.expected.contains(name) && !self.filings.contains_key(name)
+            }
+            Phase::Rebuttal => name == JESTER && self.rebuttal.is_none(),
+            Phase::Idle => false,
+        }
     }
 
     /// Send `text` to every seat in `names`. Dead loops are skipped —
@@ -251,14 +270,29 @@ struct Docket {
 }
 
 /// A filed position. The field docs become the JSON-schema property
-/// descriptions the model sees.
+/// descriptions the model sees. Field order is load-bearing: the
+/// tagged-dialect grammar emits parameters alphabetically, so
+/// `analysis` is physically written before `verdict` — the model must
+/// work the problem before it is allowed to conclude (reason-first,
+/// enforced by structure rather than asked for in prose).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Filing {
-    /// Your position on the open case, complete and self-contained:
-    /// your answer, your reasoning through your lens, and anything
-    /// the question smuggles in that the others may have missed. The
-    /// record shows only what you write here.
-    position: String,
+    /// Work the case through your lens FIRST, in full: premises, what
+    /// the words entail, concrete scenarios, anything the question
+    /// smuggles in that the others may miss. The record shows only
+    /// what you write here.
+    analysis: String,
+    /// Your conclusion, in one or two sentences, stated only after
+    /// the analysis above and following from it.
+    verdict: String,
+}
+
+impl Filing {
+    /// The record entry: analysis first, verdict flagged for the
+    /// judge's (and the human's) scanning eye.
+    fn into_record(self) -> String {
+        format!("{}\n\n**Verdict:** {}", self.analysis, self.verdict)
+    }
 }
 
 #[tool(name = "docket")]
@@ -334,7 +368,8 @@ impl Docket {
     /// round reaches you. Costs one filing.
     #[method]
     async fn file(&mut self, filing: Filing) -> Result<Content, Content> {
-        self.court.scan(&filing.position).await?;
+        self.court.scan(&filing.analysis).await?;
+        self.court.scan(&filing.verdict).await?;
         if self.name == JESTER {
             return self.file_rebuttal(filing);
         }
@@ -377,7 +412,9 @@ impl Docket {
                 }
                 *budget -= 1;
             }
-            chamber.filings.insert(self.name.clone(), filing.position);
+            chamber
+                .filings
+                .insert(self.name.clone(), filing.into_record());
             self.court
                 .printer
                 .lock()
@@ -401,6 +438,7 @@ impl Docket {
                 // mandatory adversarial pass happens before any other
                 // seat (judge included) sees a word.
                 chamber.phase = Phase::Rebuttal;
+                chamber.nudged.remove(JESTER);
                 Some(Next::ToJester(format!(
                     "{}\nThe round is sealed with you before anyone \
                      else sees it. File your rebuttal with `file` now \
@@ -479,7 +517,7 @@ impl Docket {
                 }
                 *budget -= 1;
             }
-            chamber.rebuttal = Some(filing.position);
+            chamber.rebuttal = Some(filing.into_record());
             chamber.phase = Phase::Idle;
             self.court
                 .printer
@@ -571,6 +609,7 @@ impl Bench {
             chamber.phase = Phase::Filing;
             chamber.rebuttal = None;
             chamber.filings.clear();
+            chamber.nudged.clear();
             chamber.expected = ADVISORS
                 .iter()
                 .filter(|a| {
@@ -643,6 +682,7 @@ impl Bench {
             chamber.phase = Phase::Filing;
             chamber.rebuttal = None;
             chamber.filings.clear();
+            chamber.nudged.clear();
             chamber.expected = ADVISORS
                 .iter()
                 .filter(|a| {
@@ -852,6 +892,7 @@ async fn main() -> Result<(), BoxError> {
         let transport = transport.clone();
         let printer = Arc::clone(&printer);
         let usage = Arc::clone(&payroll[name]);
+        let chamber_nudge = Arc::clone(&chamber);
         let mut done = quit.subscribe();
         council.spawn(async move {
             let outcome =
@@ -864,6 +905,30 @@ async fn main() -> Result<(), BoxError> {
                         // The advisors' inner monologue, under
                         // `--verbose`.
                         log::debug!("{name} ▸ {}", msg.content);
+                        // Anti-stall: a turn that ends with NO tool
+                        // call while this seat owes a filing means the
+                        // model answered in prose and went idle — with
+                        // publication waiting on it, that's deadlock
+                        // (tool_choice can't be forced here: the
+                        // post-dispatch round must be free to say
+                        // nothing). One host reminder per round; a
+                        // seat that ignores it is the human's to
+                        // `/nudge`.
+                        if msg.tool_use().is_none() {
+                            let mut chamber =
+                                chamber_nudge.lock().expect("chamber poisoned");
+                            if chamber.filing_due(name)
+                                && chamber.nudged.insert(name.to_string())
+                            {
+                                chamber.broadcast(
+                                    [name],
+                                    "From: the bench\nYou have not \
+                                     filed. Nothing you say outside \
+                                     the docket reaches the council — \
+                                     file with `file` now.",
+                                );
+                            }
+                        }
                         [msg.into()]
                     })
                     .run((), async move |_state: &mut ()| {
@@ -926,10 +991,16 @@ async fn main() -> Result<(), BoxError> {
                             .map(|(name, n)| format!("{name}: {n}"))
                             .collect();
                         budgets.sort();
+                        let missing: Vec<&str> = ADVISORS
+                            .iter()
+                            .copied()
+                            .chain([JESTER])
+                            .filter(|seat| chamber.filing_due(seat))
+                            .collect();
                         print(match chamber.case.as_deref() {
                             Some(case) => format!(
                                 "case: {case} | round {} ({}) | filed: \
-                                 {}/{} | filings: {}",
+                                 {}/{} | awaiting: {} | filings: {}",
                                 chamber.round,
                                 match chamber.phase {
                                     Phase::Filing => "sealed",
@@ -938,6 +1009,11 @@ async fn main() -> Result<(), BoxError> {
                                 },
                                 chamber.filings.len(),
                                 chamber.expected.len(),
+                                if missing.is_empty() {
+                                    "nobody".to_string()
+                                } else {
+                                    missing.join(", ")
+                                },
                                 budgets.join(" | "),
                             ),
                             None => format!(
@@ -985,8 +1061,26 @@ async fn main() -> Result<(), BoxError> {
                             None => print(format!("no advisor named `{name}`")),
                         }
                     }
+                    (Some("nudge"), Some(name), None) => {
+                        let chamber =
+                            chamber_cli.lock().expect("chamber poisoned");
+                        if chamber.filing_due(name) {
+                            chamber.broadcast(
+                                [name],
+                                "From: the bench\nThe human demands \
+                                 your filing. Nothing you say outside \
+                                 the docket reaches the council — file \
+                                 with `file` now.",
+                            );
+                            print(format!("nudged {name}"));
+                        } else {
+                            print(format!("no filing is due from `{name}`"));
+                        }
+                    }
                     _ => print(
-                        "commands: /grant <advisor> <count>, /docket".into(),
+                        "commands: /grant <seat> <count>, /docket, \
+                         /nudge <seat>"
+                            .into(),
                     ),
                 }
             }
