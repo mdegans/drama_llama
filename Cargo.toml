@@ -41,7 +41,7 @@ rustc-hash = "2"
 sha2 = "0.10"
 minijinja = { version = "2.5", features = ["loader", "json"] }
 minijinja-contrib = { version = "2.5", features = ["pycompat"] }
-misanthropic = { version = "1.0.0-alpha.7", default-features = false, features = [
+misanthropic = { version = "1.0.0-alpha.11", default-features = false, features = [
     "partial-eq",
 ] }
 
@@ -174,7 +174,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 # `tests/blallama.rs` drives the blallama binary over HTTP with the
 # real API client. The library dependency above disables default
 # features (no HTTP); tests re-enable the client half.
-misanthropic = { version = "1.0.0-alpha.7", default-features = false, features = [
+misanthropic = { version = "1.0.0-alpha.11", default-features = false, features = [
     "partial-eq",
     "client",
     "rustls-tls",
