@@ -239,6 +239,11 @@ required-features = ["tokio", "repl", "json-schema"]
 doc-scrape-examples = true
 
 [[example]]
+name = "council"
+required-features = ["tokio", "repl", "json-schema"]
+doc-scrape-examples = true
+
+[[example]]
 name = "strawberry"
 required-features = ["cli", "json-schema"]
 doc-scrape-examples = true
