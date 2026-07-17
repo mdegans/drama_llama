@@ -15,7 +15,12 @@
 //! their own, because unpublished filings exist only in host state —
 //! there is no model in the blindness loop. That's what makes the four
 //! voices genuinely distinct instead of converging on whoever spoke
-//! first.
+//! first. The same principle covers the question itself: `open_case`
+//! has no question parameter — the docket attaches the petitioner's
+//! latest chat message **verbatim** (host-captured), because the first
+//! live run's judge paraphrased the trick question into a generic
+//! brief twice, once per prompting fix. Never leave to prompting what
+//! you can force.
 //!
 //! Two guards ride the filing boundary:
 //!
@@ -106,7 +111,14 @@ type SharedPrinter = Arc<Mutex<Printer>>;
 struct Chamber {
     /// Seat name → send-only mailbox handle, registered by `connect`.
     registry: HashMap<String, Mailbox>,
-    /// The open case's question, verbatim.
+    /// The human's most recent chat message, captured host-side by
+    /// the judge's beat closure. `open_case` attaches THIS as the
+    /// case — the judge never authors the question, so it cannot be
+    /// paraphrased. ("Never leave to prompting what you can force":
+    /// the first live run's judge rewrote the trick question into a
+    /// generic transport brief twice, once per prompting fix.)
+    petition: Option<String>,
+    /// The open case: the petition, verbatim, frozen at `open_case`.
     case: Option<String>,
     /// 1-based round number of the open case.
     round: u32,
@@ -327,12 +339,15 @@ struct Bench {
     court: Court,
 }
 
-/// A new case for the council.
+/// A new case for the council. The question itself is NOT a
+/// parameter: the docket attaches the petitioner's latest message
+/// verbatim — the bench cannot rephrase what it never writes.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Case {
-    /// The question, complete and self-contained — the advisors see
-    /// only this, never the chat.
-    question: String,
+    /// Optional context from the bench, published alongside (never
+    /// instead of) the petitioner's verbatim question. Leave it out
+    /// unless the advisors need something the question doesn't say.
+    note: Option<String>,
 }
 
 /// A follow-up round on the open case.
@@ -356,15 +371,40 @@ impl Bench {
             .insert(JUDGE.to_string(), mailbox);
     }
 
-    /// Open a case: reset the docket and put the question to every
+    /// Open a case: reset the docket and put the petitioner's latest
+    /// message — verbatim, attached by the docket itself — to every
     /// advisor as round 1 (sealed, independent).
     #[method]
     async fn open_case(&mut self, case: Case) -> Result<Content, Content> {
-        self.court.scan(&case.question).await?;
+        if let Some(note) = case.note.as_deref() {
+            self.court.scan(note).await?;
+        }
+        let petition = self
+            .court
+            .chamber
+            .lock()
+            .expect("chamber poisoned")
+            .petition
+            .clone()
+            .ok_or_else(|| {
+                Content::from(
+                    "no petition on record — the human hasn't asked \
+                     anything yet",
+                )
+            })?;
+        // The petition is human-authored, but the advisors' ingest
+        // guard doesn't care who wrote a reserved token — bounce it
+        // here too, and let the judge relay the rephrase request.
+        self.court.scan(&petition).await.map_err(|_| {
+            Content::from(
+                "the petitioner's message contains a reserved framing \
+                 token and cannot be relayed — ask them to rephrase",
+            )
+        })?;
         let notice = {
             let mut chamber =
                 self.court.chamber.lock().expect("chamber poisoned");
-            chamber.case = Some(case.question.clone());
+            chamber.case = Some(petition.clone());
             chamber.round = 1;
             chamber.awaiting = true;
             chamber.filings.clear();
@@ -386,12 +426,16 @@ impl Bench {
                 .printer
                 .lock()
                 .expect("printer poisoned")
-                .line(format!("⚖ case opened: {}", case.question));
+                .line(format!("⚖ case opened: {petition}"));
+            let bench_note = match case.note.as_deref() {
+                Some(note) => format!("\nThe bench adds: {note}\n"),
+                None => String::new(),
+            };
             format!(
-                "From: the bench\nCase (round 1): {}\n\nFile your \
-                 independent position with `file`. Filings are sealed \
-                 until all of you have filed.",
-                case.question,
+                "From: the bench\nCase (round 1), the petitioner's \
+                 words verbatim:\n\"{petition}\"\n{bench_note}\nFile \
+                 your independent position with `file`. Filings are \
+                 sealed until all of you have filed.",
             )
         };
         let chamber = self.court.chamber.lock().expect("chamber poisoned");
@@ -451,10 +495,13 @@ impl Bench {
                 .expect("printer poisoned")
                 .line(format!("⚖ round {round} called"));
             format!(
-                "From: the bench\nRound {}: {}\n\nYou have seen the \
-                 published positions. Engage with them and file again — \
-                 concede what someone proved, defend the rest.",
-                round, call.instruction,
+                "From: the bench\nCase (verbatim): \"{}\"\nRound {}: \
+                 {}\n\nYou have seen the published positions. Engage \
+                 with them and file again — concede what someone \
+                 proved, defend the rest.",
+                chamber.case.as_deref().unwrap_or("(none)"),
+                round,
+                call.instruction,
             )
         };
         let chamber = self.court.chamber.lock().expect("chamber poisoned");
@@ -532,14 +579,12 @@ const JUDGE_SYSTEM: &str =
      experience), `philosopher` (assumptions and consistency), \
      `engineer` (mechanics and failure modes), `lawyer` (what the \
      stated facts entail). You do not answer questions yourself — open \
-     a case with the bench's `open_case`, quoting the petitioner's \
-     question VERBATIM (add context after the quote if needed, but \
-     never paraphrase it: a paraphrase substitutes your framing for \
-     theirs, and whatever the question's framing conceals is exactly \
-     what the advisors are for). Do not suggest factors to consider — \
-     each advisor brings their own lens. The advisors file sealed \
-     positions, and the published round arrives as mail between the \
-     human's messages. Then rule: weigh the positions, especially \
+     a case with the bench's `open_case`. The docket attaches the \
+     petitioner's latest message verbatim on its own; you may add a \
+     `note` for context but you cannot rewrite the question, and you \
+     should not suggest factors to consider — each advisor brings \
+     their own lens. The advisors file sealed positions, and the \
+     published round arrives as mail between the human's messages. Then rule: weigh the positions, especially \
      where they disagree — a lone advisor who noticed something \
      concrete outranks three who answered on autopilot. If the \
      positions genuinely conflict, call ONE more round with \
@@ -671,6 +716,11 @@ async fn main() -> Result<(), BoxError> {
         .run((), async move |_state: &mut ()| {
             while let Some(line) = lines.recv().await {
                 let Some(command) = line.strip_prefix('/') else {
+                    // Host-side petition capture: whatever the human
+                    // just said is what `open_case` will attach,
+                    // verbatim. The judge never authors the question.
+                    chamber_cli.lock().expect("chamber poisoned").petition =
+                        Some(line.clone());
                     return Ok(Some(vec![(Role::User, line).into()]));
                 };
                 let print = |msg: String| {
