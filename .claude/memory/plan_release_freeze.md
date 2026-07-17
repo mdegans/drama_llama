@@ -26,6 +26,20 @@ so it's additive whenever it happens).
 - Prepublish validation checklist:
   `plan_prepublish_validation_session.md` (from the June unblocking;
   publish on Mike's go).
+- Council iteration (late 2026-07-17, post-freeze-declaration): the
+  **jester** landed (structural rebuttal phase — sealed round goes to
+  the licensed contrarian alone before publication) and WON its debut:
+  unanimous-wrong round 1, rebuttal nailed the category error, judge
+  ruled Drive. Plus reason-first filings (analysis+verdict, order
+  grammar-enforced), anti-stall nudges, bounce-texts-are-prompts fix,
+  1024-token seat cap. Known wart: small models burn rounds filing
+  meta-diary into their only tool — dissolves under the one-tool
+  forced protocol designed on
+  [misanthropic#139](https://github.com/mdegans/misanthropic/issues/139)
+  (per-round tool_choice / dispatch-once-per-beat; Quirks-aware since
+  local grammar forcing is cache-free where Anthropic's isn't). Mike
+  is probing contrarian side-effects; swarm.rs also wants a shakedown
+  pass under the fixed cache.
 
 ## Context for the freeze decision
 
