@@ -389,13 +389,20 @@ impl Docket {
             match chamber.phase {
                 Phase::Filing => {}
                 Phase::Rebuttal => {
-                    return Err("the round is with the jester — wait \
-                                for publication"
+                    return Err("not accepted: the sealed round is with \
+                                the jester. Do nothing. The published \
+                                record (every position plus the \
+                                rebuttal) will arrive as mail from the \
+                                bench; file again only when the bench \
+                                calls the NEXT round."
                         .into());
                 }
                 Phase::Idle => {
-                    return Err("this round is already published — wait \
-                                for the bench to call another"
+                    return Err("not accepted: this round already \
+                                published — the record arrived as mail \
+                                from the bench; scroll up and read it. \
+                                Do nothing further until the bench \
+                                calls the next round."
                         .into());
                 }
             }
@@ -829,8 +836,15 @@ async fn main() -> Result<(), BoxError> {
     // history pins its own KV sequence, and every published round is
     // identical bytes to every seat — the cache-friendly shape.
     let seats = ADVISORS.len() as u32 + 2; // advisors + jester + judge
-    let transport =
-        SessionTransport::new(cli.common.session_with_cache_slots(seats)?);
+    let mut session = cli.common.session_with_cache_slots(seats)?;
+    if cli.common.max_tokens.is_none() {
+        // Rulings and analyses are long-form; the session default cap
+        // truncated a judge mid-ruling on the first jester run.
+        session = session.with_max_tokens(
+            std::num::NonZeroUsize::new(1024).expect("nonzero"),
+        );
+    }
+    let transport = SessionTransport::new(session);
 
     let (mut lines, printer) = utils::spawn_readline_loop("you ▸ ")?;
     let printer: SharedPrinter = Arc::new(Mutex::new(printer));
