@@ -2665,6 +2665,40 @@ impl<B: Backend> Session<B> {
     /// structured-chat layer where blocks are content and the special
     /// tokens are format. Callers who want to hand-feed control tokens
     /// drop below the block abstraction to the raw predictor.
+    /// Scan `text` for content that would tokenize (with
+    /// `parse_special = true`, the setting every prepare path uses) to
+    /// a reserved chat-framing special token. Returns the first
+    /// offender's `(id, piece)`, or `None` if the text is clean.
+    ///
+    /// The same predicate the ingest guard applies to every prompt
+    /// (see [`SessionError::InjectedSpecialToken`]), exposed so
+    /// *relay boundaries* — tools that carry model-authored text into
+    /// another session's prompt (mail, docket filings, agent-to-agent
+    /// pipes) — can check at **send** time and bounce the offending
+    /// message back to its author as a recoverable tool error, instead
+    /// of letting it poison the recipient's prompt and kill their loop
+    /// at ingest. (A model can byte-spell a marker like `<tool_call>`
+    /// in ordinary text — see issue #37 — so relays need this even
+    /// once emission-side bans improve.)
+    pub fn scan_text_for_specials(
+        &self,
+        text: &str,
+    ) -> Option<(Token, String)> {
+        let specials: std::collections::HashSet<Token> =
+            self.engine.model.special_tokens().into_iter().collect();
+        if specials.is_empty() || text.is_empty() {
+            return None;
+        }
+        // add_special = false, same rationale as the ingest guard:
+        // auto-prepended BOS is a special and would false-positive.
+        self.engine
+            .model
+            .tokenize_special(text, false, true)
+            .into_iter()
+            .find(|tok| specials.contains(tok))
+            .map(|tok| (tok, self.engine.model.token_to_piece(tok)))
+    }
+
     fn check_no_special_injection(
         &self,
         prompt: &Prompt,
@@ -6555,6 +6589,21 @@ mod tests {
                 Err(SessionError::InjectedSpecialToken { .. })
             ),
             "injection via tool-result content must be rejected",
+        );
+
+        // The public relay-boundary scan applies the same predicate to
+        // bare text: senders (mail/docket tools) bounce before the
+        // recipient's ingest guard ever sees the poison.
+        assert_eq!(
+            session.scan_text_for_specials(&injected_text),
+            Some((victim, piece.clone())),
+            "relay scan must flag the same injection the guard rejects",
+        );
+        assert!(
+            session
+                .scan_text_for_specials("what is the capital of France?")
+                .is_none(),
+            "relay scan must pass ordinary prose",
         );
 
         // A clean prompt with the same shape still prepares — no

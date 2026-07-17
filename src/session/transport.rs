@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use misanthropic::{model, response, CachedPrompt, Prompt, Quirks, Transport};
 
-use crate::{backend::Model as _, Backend, Session, SessionError};
+use crate::{backend::Model as _, Backend, Session, SessionError, Token};
 
 /// A [`misanthropic::Transport`] over a locally-owned [`Session`] — see the
 /// module docs for the concurrency model.
@@ -67,6 +67,22 @@ impl<B: Backend> SessionTransport<B> {
     /// lock, so this never races a decode.
     pub fn session(&self) -> Arc<tokio::sync::Mutex<Session<B>>> {
         self.session.clone()
+    }
+
+    /// [`Session::scan_text_for_specials`] through the shared handle:
+    /// scan `text` for content that would tokenize to a reserved
+    /// chat-framing special, returning the first offender's
+    /// `(id, piece)`. For relay tools (mail, docket filings) holding a
+    /// transport clone — check at send time and bounce the message
+    /// back to its author as a recoverable `is_error` tool result,
+    /// instead of poisoning the recipient's prompt and killing their
+    /// loop at ingest. Briefly awaits the session lock (a completion
+    /// in flight holds it).
+    pub async fn scan_text_for_specials(
+        &self,
+        text: &str,
+    ) -> Option<(Token, String)> {
+        self.session.lock().await.scan_text_for_specials(text)
     }
 }
 
