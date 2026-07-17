@@ -2952,14 +2952,12 @@ impl<B: Backend> Session<B> {
         cache_read: usize,
         output_tokens: usize,
     ) -> Usage {
-        // `TokenCounts` and `Usage` are `#[non_exhaustive]` upstream,
-        // so no struct expressions — default + assign, then the
-        // upstream `From<TokenCounts> for Usage`.
-        let mut counts = misanthropic::response::TokenCounts::default();
-        counts.input_tokens = prompt_tokens as u64;
+        let mut counts = misanthropic::response::TokenCounts::new(
+            prompt_tokens as u64,
+            output_tokens as u64,
+        );
         counts.cache_creation_input_tokens = Some(0);
         counts.cache_read_input_tokens = Some(cache_read as u64);
-        counts.output_tokens = output_tokens as u64;
         counts.into()
     }
 
@@ -4124,40 +4122,17 @@ impl<B: Backend> Session<B> {
             outcome.cache_read_tokens,
             outcome.generated_tokens,
         );
-        let mut message = Self::empty_response_message();
-        message.id = std::borrow::Cow::Owned(id.to_string());
-        message.inner = inner;
-        message.model = self
+        let model = self
             .engine
             .model
             .display_name()
-            .unwrap_or_else(|| "unknown".to_string())
-            .into();
-        message.stop_reason = outcome.stop_reason;
-        message.stop_sequence =
-            outcome.stop_sequence.map(std::borrow::Cow::Owned);
-        message.usage = usage;
-        Ok(message)
-    }
-
-    /// Empty [`response::Message`](misanthropic::response::Message)
-    /// shell for local generation to fill in. The struct is
-    /// `#[non_exhaustive]` upstream with no public constructor (the API
-    /// client only ever *deserializes* one), so deserializing a minimal
-    /// wire payload is the only forward-compatible construction path
-    /// for a local-inference synthesizer; the caller then assigns the
-    /// real field values directly.
-    // TODO(upstream): add a constructor to misanthropic and drop this.
-    fn empty_response_message() -> misanthropic::response::Message {
-        serde_json::from_value(serde_json::json!({
-            "id": "",
-            "role": "assistant",
-            "content": [],
-            "model": "unknown",
-            "stop_reason": null,
-            "stop_sequence": null,
-        }))
-        .expect("static response::Message template deserializes")
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(misanthropic::response::Message::builder(model, inner)
+            .id(id.to_string())
+            .stop_reason(outcome.stop_reason)
+            .stop_sequence(outcome.stop_sequence.map(std::borrow::Cow::Owned))
+            .usage(usage)
+            .build())
     }
 }
 
