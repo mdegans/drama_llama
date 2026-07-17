@@ -206,6 +206,11 @@ required-features = ["tokio", "cli", "json-schema"]
 doc-scrape-examples = true
 
 [[example]]
+name = "vote_intent"
+required-features = ["tokio", "cli", "json-schema"]
+doc-scrape-examples = true
+
+[[example]]
 name = "strawberry"
 required-features = ["cli", "json-schema"]
 doc-scrape-examples = true
