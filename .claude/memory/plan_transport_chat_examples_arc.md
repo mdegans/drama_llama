@@ -159,58 +159,29 @@ refactor, (7) release chore. PR body: Closes #126, #134; advances #104
 - Weave is path-pointed at drama_llama — Phase 2/3 changes are additive
   (new module + examples), no Engine surface touched.
 
-## Cache-rework launching pad (follow-up session)
+## Cache rework + council — LANDED 2026-07-17 evening
 
-Current mechanics (verified 2026-07-17): `PrefixCache` is single-slot,
-last-prompt-wins, single KV sequence (seq 0 only). `src/session/mod.rs:442-491`
-(struct), `:2708-2738` (miss → `memory_clear()` full wipe), `:3018-3062`
-(`record_cache_hit` wholesale overwrite), `:2758-2811` (orphan pruning / anchor
-protection — the only "smart" retention). Hash-keyed matching exists
-(`hash_keyed_l_hit` → fallback LCP `compute_l_hit` :973-998). The "4 breakpoints"
-cap is misanthropic's `cache_windowed`, not local. Net: N>1 distinct system prompts
-round-robining = full re-prefill every turn.
+The launching pad that lived here is implemented (commits b5f4cf0 →
+6b7b304 on `v0.8.0`): multi-slot prefix cache (one KV seq per cached
+prefix; `PrefixSlot`/`PrefixCacheConfig`), cache_control TTLs carried
+through and enforced (refresh-on-read), cell-budget LRU eviction,
+`DRAMA_LLAMA_CACHE_TRIPWIRE=1` panic harness, decoder layer made
+(seq,pos)-honest (moeflux realizes sequences as state_save/state_load
+blobs + active_seq guard; llama.cpp gains `n_seq_max`/`kv_unified`
+constructors). Acceptance tests: `multi_agent_round_robin_hits`
+(llama.cpp, tripwire armed — caught a hardcoded seq-0 in
+`CandidatePredictor::step` on its first run, would have been silent
+cross-agent KV corruption on non-M-RoPE models),
+`capacity_eviction_recovers`, `test_ttl_expiry_evicts`,
+`multi_agent_round_robin_moeflux` (live a3b assets). Both
+next-session slate items shipped too: `examples/council.rs`
+(sealed-round deliberation; the "council charter" re-prompt) and the
+mail-boundary rejection (`Session::scan_text_for_specials` +
+transport passthrough; council bounces at file/open_case/call_round).
+Emission-side fix for the underlying special-token sampling gap is
+deferred as #37 + `future_work_region_aware_emit_ban.md`.
 
-Design direction (to discuss, not decided): multi-entry cache keyed by breakpoint
-render-hash, entries mapped to distinct KV **sequence ids** — engine already exposes
-unused multi-seq primitives (`memory_seq_cp`, `memory_seq_keep`, `memory_seq_pos_max`,
-src/engine.rs:115-163) — with LRU or cost-aware eviction over sequences. Watch:
-SamplerState snapshots couple to breakpoints; the fold (`SeedCursor`) resumes
-per-entry; KV cell budget is shared across sequences in unified KV, so capacity
-policy = cells not entries. Read `.claude/memory/blallama_session_state_pollution.md`
-first (lossy `memory_seq_rm` partial-truncate + lossy C `memory_clear` findings
-constrain which primitives are trustworthy).
-
-**Next-session slate additions (first live swarm run, 2026-07-17 evening):**
-
-1. **Council charter**: re-prompt the swarm away from "software company" so it
-   answers general questions (the car-wash trick question got refracted into a
-   "car-wash-advisor CLI" spec — the charter forces every ask into build-a-tool
-   shape). Mike: "perhaps a council."
-2. **Mail-boundary special-token rejection**: ant died mid-run —
-   `☠ ant: prompt content contains reserved special token 248058 ("<tool_call>")`.
-   Wasp's letter body contained literal dialect markup; the mail tool pushed
-   it; it was SEATED into ant's prompt; Session's ingest guard then rejected
-   every subsequent request — unrecoverable, loop dies. The guard is correct
-   (format integrity per CLAUDE.md) but fires too late for multi-agent flows.
-   Fix: validate at the letter boundary — `Mail::send` (ours, in the port)
-   checks body/subject and returns an is_error tool result ("rewrite it") so
-   the sender recovers and nobody's transcript is poisoned. Needs drama_llama
-   to expose the special-token check through Session/SessionTransport (today
-   it's internal, `check_no_special_injection`).
-3. Also observed, working as designed but worth knowing: wasp double-sends
-   (quiesce grants another round after each dispatch — two stamps for
-   critique + "Re:"), and turns slow monotonically without the cache rework
-   (every growing history re-prefills per agent switch — the known thrash).
-
-**Validation (decided, Mike 2026-07-17): panic-tripwire, not measurement.** The
-swarm wiring is already proven by the Anthropic-side Transport, and a baseline
-run with cache misses would take all day — so skip the before/after wall-clock
-benchmark. Instead: during the rework, add a debug harness (env-var or feature-
-gated) that **panics and dumps cache state on an unexpected prefix-cache MISS
-past an agent's first turn** — post-rework, every same-conversation turn after
-the first should hit, so a miss is the bug and the dump is the debugging
-artifact. Then run swarm once: panic → adjust; clean pass → cache works.
-Related: budget-exhaustion WIP-stranding in mail-only agents is
-[misanthropic#136](https://github.com/mdegans/misanthropic/issues/136) —
-deferred, not this arc. Swarm run policy: short stamp-starved shakedown is fine;
-full runs after the rework. Haiku spends stamps wisely; Qwen behavior unknown.
+Still pending from this doc: Phase 4 agentkit rebase (unchanged);
+misanthropic#136 (budget-exhaustion WIP-stranding) unchanged; swarm
+full-run validation under the tripwire is wired but awaits a live
+interactive run (Mike's terminal — REPL).
