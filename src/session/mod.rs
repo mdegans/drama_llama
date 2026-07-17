@@ -59,12 +59,33 @@
 //!   [`tool::Use`](misanthropic::tool::Use) /
 //!   [`tool::Result`](misanthropic::tool::Result). Without breakpoints, every
 //!   call is a full re-prefill.
-//! * **Single sequence.** All prefill/decode uses `seq_id = 0`. Parallel
-//!   conversation threads need one [`Session`] each.
-//! * **Thread swap = clear.** When swapping conversation threads or reloading
-//!   system/tools outside the `cache_control` contract, call
-//!   [`Session::clear_prefix_cache`] to zero both the cache metadata and the KV
-//!   state. The library can't detect semantic-level context swaps on its own.
+//! * **Multi-slot.** The cache holds up to
+//!   [`PrefixCacheConfig::max_slots`] cached prefixes (clamped to the
+//!   backend's sequence capacity), each pinned to its own KV sequence — N
+//!   agents round-robining distinct histories through one session each keep
+//!   their prefix. On a default llama.cpp context (`n_seq_max` == 1) this
+//!   degenerates to one slot on seq 0; build the engine with a
+//!   multi-sequence constructor (e.g.
+//!   [`LlamaCppEngine::from_path_with_n_ctx_and_seqs`](crate::LlamaCppEngine::from_path_with_n_ctx_and_seqs))
+//!   to raise the ceiling.
+//! * **Bounded.** Slots share one KV cell budget
+//!   ([`PrefixCacheConfig::capacity_cells`], default the engine's `n_ctx` —
+//!   unified KV shares one physical pool); least-recently-used slots evict
+//!   when the incoming call wouldn't fit. Each `cache_control` marker's
+//!   ephemeral TTL (5m default, 1h opt-in) is honored: a breakpoint idle past
+//!   its TTL loses its snapshot, and a fully-expired slot is evicted. The
+//!   clock refreshes on every reuse (Anthropic refresh-on-read semantics).
+//! * **Thread swap = clear.** When reloading system/tools outside the
+//!   `cache_control` contract, call [`Session::clear_prefix_cache`] to zero
+//!   every slot AND the KV state. The library can't detect semantic-level
+//!   context swaps on its own. (Distinct agents/threads with *marked*
+//!   prompts don't need this — that's what the slots are for.)
+//!
+//! Debug tripwire: set `DRAMA_LLAMA_CACHE_TRIPWIRE=1` and any *unexpected*
+//! cache miss — a live slot demonstrably covers the new prompt's first
+//! cached region (or shares a long prefix) yet nothing was reused — panics
+//! with a full cache-state dump instead of silently re-prefilling. Genuine
+//! first turns and post-eviction misses don't trip it.
 //!
 //! Usage statistics matching the Anthropic API shape are tracked on every
 //! `complete_*` call: see [`Session::last_usage`] and [`Session::total_usage`].
@@ -633,6 +654,98 @@ fn sweep_expired(
     out
 }
 
+/// Is the debug cache tripwire armed? (`DRAMA_LLAMA_CACHE_TRIPWIRE=1`
+/// in the environment; read once.)
+fn cache_tripwire_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| {
+        std::env::var("DRAMA_LLAMA_CACHE_TRIPWIRE").is_ok_and(|v| v == "1")
+    })
+}
+
+/// Shared-prefix length (entries) below which a zero-selection miss is
+/// ordinary — a genuine first turn shares only template boilerplate
+/// with other agents' histories.
+const TRIPWIRE_DRIFT_ENTRIES: usize = 64;
+
+/// The tripwire condition, evaluated only when selection returned
+/// nothing over non-empty slots: is this miss explicable? Two
+/// violation classes:
+///
+/// * **hard** — a live slot's first cached breakpoint region is a
+///   prefix of the new prompt (`lcp >= first_bp.entry`), yet nothing
+///   was reused: a selection bug, or the caller dropped its
+///   `cache_control` markers mid-conversation.
+/// * **drift** — a live slot shares ≥ [`TRIPWIRE_DRIFT_ENTRIES`]
+///   entries with the new prompt and still nothing matched: the
+///   re-render byte-drift failure mode (hash AND breakpoint-clipped
+///   LCP both defeated).
+///
+/// Genuine first turns match neither (their history prefixes nothing
+/// beyond boilerplate); TTL/capacity evictions removed their slots
+/// before this check, so they read as expected misses. Returns a
+/// dump-ready report. Pure.
+fn tripwire_violation(
+    slots: &[PrefixSlot],
+    new_entries: &[CacheEntry],
+    new_breakpoint_hashes: &[[u8; 32]],
+) -> Option<String> {
+    use std::fmt::Write;
+    let mut report = String::new();
+    for slot in slots {
+        if slot.prev_entries.is_empty() {
+            continue;
+        }
+        let lcp = longest_common_prefix_len(&slot.prev_entries, new_entries);
+        let first_bp = slot
+            .breakpoints
+            .first()
+            .map(|bp| bp.at.entry)
+            .unwrap_or(usize::MAX);
+        let hard = lcp >= first_bp;
+        let drift = lcp >= TRIPWIRE_DRIFT_ENTRIES;
+        if !(hard || drift) {
+            continue;
+        }
+        if report.is_empty() {
+            let _ = writeln!(
+                report,
+                "prefix-cache tripwire: unexpected miss — no slot \
+                 selected, but at least one covers the new prompt. \
+                 new: {} entries, {} breakpoint hashes.",
+                new_entries.len(),
+                new_breakpoint_hashes.len(),
+            );
+        }
+        let _ = writeln!(
+            report,
+            "  slot seq={} [{}]: cells={} age={:?} lcp={} first_bp={:?}",
+            slot.seq_id,
+            if hard { "HARD" } else { "drift" },
+            slot.cells(),
+            slot.last_used.elapsed(),
+            lcp,
+            slot.breakpoints.first().map(|bp| bp.at),
+        );
+        for bp in slot.breakpoints.iter().chain(slot.tip.as_ref()) {
+            let _ = writeln!(
+                report,
+                "    bp entry={} pos={} ttl={} hash={}",
+                bp.at.entry,
+                bp.at.pos,
+                bp.ttl,
+                bp.hash
+                    .map(|h| format!(
+                        "{:02x}{:02x}{:02x}{:02x}",
+                        h[0], h[1], h[2], h[3]
+                    ))
+                    .unwrap_or_else(|| "-".into()),
+            );
+        }
+    }
+    (!report.is_empty()).then_some(report)
+}
+
 /// Plan LRU eviction so the incoming call fits the cell budget: the
 /// pending slot's new footprint is `needed_cells` (prompt + generation
 /// headroom — its old contents are being overwritten), every other
@@ -743,6 +856,7 @@ impl PrefixCache {
     /// The most-recently-used live slot (for test inspection of "what
     /// the last call recorded").
     #[cfg(test)]
+    #[allow(dead_code)] // only the mtmd-gated tests read it
     fn last_slot(&self) -> Option<&PrefixSlot> {
         self.slots.iter().max_by_key(|s| s.last_used)
     }
@@ -3111,6 +3225,18 @@ impl<B: Backend> Session<B> {
                     }
                 }
                 None => {
+                    if cache_tripwire_armed() {
+                        let cache =
+                            self.prefix_cache.as_ref().expect("cache_on");
+                        if let Some(report) = tripwire_violation(
+                            &cache.slots,
+                            new_entries,
+                            new_breakpoint_hashes,
+                        ) {
+                            eprintln!("{report}");
+                            panic!("prefix-cache tripwire: unexpected miss");
+                        }
+                    }
                     let seq = self.allocate_slot(now);
                     (seq, EntryPos::default())
                 }
@@ -6128,12 +6254,92 @@ mod tests {
     }
 
     #[test]
+    fn test_tripwire_hard_violation_fires() {
+        // The slot's first breakpoint region is a prefix of the new
+        // prompt — a zero-selection miss here is a bug.
+        let now = std::time::Instant::now();
+        let mut slot = aged_slot(0, 10, 8, now);
+        slot.breakpoints = vec![bp(4, None)];
+        let new_entries: Vec<CacheEntry> =
+            (0..8 as Token).map(CacheEntry::Token).collect();
+        let report =
+            tripwire_violation(&[slot], &new_entries, &[]).expect("fires");
+        assert!(report.contains("HARD"), "{report}");
+    }
+
+    #[test]
+    fn test_tripwire_drift_violation_fires() {
+        // No breakpoints on the slot, but a long shared prefix (≥ the
+        // drift threshold) went unreused — re-render drift shape.
+        let now = std::time::Instant::now();
+        let slot = aged_slot(0, 10, 100, now);
+        let new_entries: Vec<CacheEntry> =
+            (0..100 as Token).map(CacheEntry::Token).collect();
+        let report =
+            tripwire_violation(&[slot], &new_entries, &[]).expect("fires");
+        assert!(report.contains("drift"), "{report}");
+    }
+
+    #[test]
+    fn test_tripwire_silent_on_genuine_first_turn() {
+        // A different agent's history shares nothing with the new
+        // prompt — an ordinary miss.
+        let now = std::time::Instant::now();
+        let mut slot = aged_slot(0, 10, 0, now);
+        slot.prev_entries =
+            (500..600 as Token).map(CacheEntry::Token).collect();
+        slot.breakpoints = vec![bp(4, None)];
+        let new_entries: Vec<CacheEntry> =
+            (0..100 as Token).map(CacheEntry::Token).collect();
+        assert!(tripwire_violation(&[slot], &new_entries, &[]).is_none());
+    }
+
+    #[test]
     fn test_select_slot_none_on_no_offer() {
         let now = std::time::Instant::now();
         let slot = aged_slot(0, 10, 0, now); // empty prev_entries
         let new_entries: Vec<CacheEntry> =
             (0..4 as Token).map(CacheEntry::Token).collect();
         assert!(select_slot(&[slot], &new_entries, &[ep(2)], &[]).is_none());
+    }
+
+    /// TTL expiry, end to end (backdated clock — no wall sleeping):
+    /// prime a slot, age it past its 5-minute TTL, and the next
+    /// identical call must sweep it and re-prefill from scratch —
+    /// while still succeeding.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_ttl_expiry_evicts() {
+        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+            .unwrap()
+            .quiet()
+            .with_sampling(std::iter::empty())
+            .with_prefix_cache(true);
+        let prompt = Prompt::default()
+            .system("You are a helpful assistant. Keep replies short.")
+            .cache()
+            .add_message((crate::Role::User, "Pick a number 1-10."))
+            .unwrap()
+            .cache();
+
+        let _ = session.complete_response(&prompt).unwrap();
+        // Backdate every slot 10 minutes: all-5m breakpoints expire.
+        for slot in session.prefix_cache.as_mut().unwrap().slots.iter_mut() {
+            slot.last_used -= std::time::Duration::from_secs(600);
+        }
+        let after = session.complete_response(&prompt).unwrap();
+        assert_eq!(
+            after.usage.cache_read_input_tokens,
+            Some(0),
+            "expired slot must not be reused",
+        );
+        // The sweep evicted it wholesale, and the call re-established
+        // a fresh slot: an immediate repeat hits again.
+        let again = session.complete_response(&prompt).unwrap();
+        assert!(
+            again.usage.cache_read_input_tokens.unwrap_or(0) > 0,
+            "re-established slot must hit",
+        );
     }
 
     /// Stop-reason inference: tool use wins over everything. When a

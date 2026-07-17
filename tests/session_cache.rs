@@ -205,3 +205,116 @@ fn clear_prefix_cache_forces_full_reprefill() {
         "cleared cache must not reuse"
     );
 }
+
+/// A per-agent prompt: distinct cached system persona + a cached user
+/// turn — the swarm/council shape in miniature.
+fn agent_prompt(persona: &'static str, user: &'static str) -> Prompt {
+    Prompt {
+        system: Some(Content(vec![Block::Text {
+            text: Cow::Borrowed(persona),
+            cache_control: Some(CacheControl::ephemeral()),
+            citations: None,
+        }])),
+        messages: vec![cached_user(user)],
+        ..Prompt::default()
+    }
+}
+
+/// Three agents with distinct histories round-robining through ONE
+/// session must each get prefix reuse on their second round — the
+/// multi-slot cache's reason to exist. The tripwire is armed for the
+/// whole test: any unexpected miss past an agent's first turn panics
+/// with a cache-state dump instead of silently re-prefilling.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn multi_agent_round_robin_hits() {
+    // OnceLock reads this on the first miss check; nextest's
+    // process-per-test isolation keeps it scoped to this test.
+    std::env::set_var("DRAMA_LLAMA_CACHE_TRIPWIRE", "1");
+    let mut session =
+        LlamaCppSession::from_path_with_cache_slots(model_path(), 4096, 3)
+            .expect("session load")
+            .quiet()
+            .without_repetition()
+            .with_sampling([SamplingMode::Greedy])
+            .with_max_tokens(NonZeroUsize::new(32).unwrap())
+            .with_prefix_cache(true);
+
+    let personas = [
+        "You are `ant`, a terse architect. One short sentence.",
+        "You are `bee`, a cheerful builder. One short sentence.",
+        "You are `moth`, a skeptical tester. One short sentence.",
+    ];
+    let mut prompts: Vec<Prompt> = personas
+        .iter()
+        .map(|p| agent_prompt(p, "Introduce yourself."))
+        .collect();
+
+    // Round 1: every agent's first turn is a legitimate miss.
+    for prompt in prompts.iter_mut() {
+        let r = session.complete_response(prompt).expect("round 1");
+        extend(prompt, r.inner.content, "Now name your favorite tool.");
+    }
+
+    // Round 2, interleaved: every call must reuse its own slot.
+    for (i, prompt) in prompts.iter().enumerate() {
+        let r = session.complete_response(prompt).expect("round 2");
+        let read = r.usage.cache_read_input_tokens.unwrap_or(0);
+        assert!(
+            read > 0,
+            "agent {i} round 2 must hit its slot; got read={read}"
+        );
+    }
+}
+
+/// With a cell budget that fits only ~2 of 3 agents, the
+/// least-recently-used agent's slot is evicted; its next call is a
+/// *working* miss (coherent output, zero reuse), and an immediate
+/// repeat re-establishes the slot and hits.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn capacity_eviction_recovers() {
+    let mut session =
+        LlamaCppSession::from_path_with_cache_slots(model_path(), 2048, 3)
+            .expect("session load")
+            .quiet()
+            .without_repetition()
+            .with_sampling([SamplingMode::Greedy])
+            .with_max_tokens(NonZeroUsize::new(24).unwrap())
+            .with_prefix_cache_config(drama_llama::PrefixCacheConfig {
+                max_slots: 3,
+                // Each agent's history is ~33 cells and an incoming call
+                // budgets ~54 (30-cell prompt + 24-token headroom): two
+                // resident histories + one incoming call exceed 100, so the
+                // third arrival must evict the LRU slot; one resident + one
+                // incoming fits.
+                capacity_cells: Some(100),
+            });
+
+    let a = agent_prompt("You are agent A. One short sentence.", "Say 'A'.");
+    let b = agent_prompt("You are agent B. One short sentence.", "Say 'B'.");
+    let c = agent_prompt("You are agent C. One short sentence.", "Say 'C'.");
+
+    session.complete_response(&a).expect("A primes");
+    session.complete_response(&b).expect("B primes");
+    session.complete_response(&c).expect("C evicts A (LRU)");
+
+    // A was evicted: working miss.
+    let r = session.complete_response(&a).expect("A after eviction");
+    assert_eq!(
+        r.usage.cache_read_input_tokens,
+        Some(0),
+        "evicted agent must re-prefill"
+    );
+    assert!(
+        !r.inner.content.to_string().is_empty(),
+        "post-eviction output must be coherent"
+    );
+
+    // ...and the re-established slot hits on repeat.
+    let r = session.complete_response(&a).expect("A re-established");
+    assert!(
+        r.usage.cache_read_input_tokens.unwrap_or(0) > 0,
+        "re-established slot must hit"
+    );
+}

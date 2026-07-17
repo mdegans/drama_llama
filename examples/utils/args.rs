@@ -62,18 +62,44 @@ impl CommonArgs {
     pub fn session(
         &self,
     ) -> Result<drama_llama::LlamaCppSession, drama_llama::SessionError> {
-        let mut session = drama_llama::LlamaCppSession::from_path_with_n_ctx(
+        let session = drama_llama::LlamaCppSession::from_path_with_n_ctx(
             self.model.clone(),
             self.n_ctx,
-        )?
-        .quiet();
+        )?;
+        Ok(self.finish_session(session))
+    }
+
+    /// [`Self::session`], built for `slots` concurrent cached prefixes
+    /// (multi-sequence unified KV — see
+    /// `LlamaCppSession::from_path_with_cache_slots`). What multi-agent
+    /// examples (swarm, council) want: one slot per agent, so agent
+    /// switches stop thrashing the prefix cache.
+    #[cfg(feature = "llama-cpp")]
+    pub fn session_with_cache_slots(
+        &self,
+        slots: u32,
+    ) -> Result<drama_llama::LlamaCppSession, drama_llama::SessionError> {
+        let session = drama_llama::LlamaCppSession::from_path_with_cache_slots(
+            self.model.clone(),
+            self.n_ctx,
+            slots,
+        )?;
+        Ok(self.finish_session(session))
+    }
+
+    #[cfg(feature = "llama-cpp")]
+    fn finish_session(
+        &self,
+        mut session: drama_llama::LlamaCppSession,
+    ) -> drama_llama::LlamaCppSession {
+        session = session.quiet();
         if let Some(max_tokens) = self.max_tokens {
             session = session.with_max_tokens(
                 std::num::NonZeroUsize::new(max_tokens.get() as usize)
                     .expect("NonZeroU32 fits NonZeroUsize"),
             );
         }
-        Ok(session)
+        session
     }
 }
 

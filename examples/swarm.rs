@@ -30,11 +30,15 @@
 //! the driver's quirk-aware caching ([`Chat::cache`]): the transport
 //! reports `breakpoint_after_assistant`, so the driver re-marks a rolling
 //! end-of-assistant breakpoint each turn — the render the session's
-//! hash-keyed prefix cache keys on. Honest caveat: the session currently
-//! keeps a *single* cached prefix, so round-robining five distinct agent
-//! histories through it re-prefills on every agent switch. The payroll's
-//! `cache r` column shows exactly how much (or little) survived — this
-//! example is the motivating benchmark for the multi-sequence cache rework.
+//! hash-keyed prefix cache keys on. The session is built with one cache
+//! slot per seat ([`CommonArgs::session_with_cache_slots`]): each agent's
+//! history pins its own KV sequence, so agent switches reuse instead of
+//! re-prefilling. The payroll's `cache r` column shows how much each seat
+//! reused; run with `DRAMA_LLAMA_CACHE_TRIPWIRE=1` and any *unexpected*
+//! miss past an agent's first turn panics with a cache-state dump — this
+//! example is the multi-slot cache's acceptance harness.
+//!
+//! [`CommonArgs::session_with_cache_slots`]: utils::CommonArgs::session_with_cache_slots
 //!
 //! The point: the `Chat` driver is unchanged. N concurrent loops,
 //! agent-to-agent communication, role asymmetry (thinkers get words,
@@ -397,8 +401,11 @@ async fn main() -> Result<(), BoxError> {
     utils::log_init(cli.common.verbose);
 
     // Load the local model once; every seat gets a clone of the handle
-    // and serializes through the same session (and the same KV cache).
-    let transport = SessionTransport::new(cli.common.session()?);
+    // and serializes through the same session. One cache slot per seat:
+    // each agent's history keeps its own KV sequence across switches.
+    let seats = WORKERS.len() as u32 + 1;
+    let transport =
+        SessionTransport::new(cli.common.session_with_cache_slots(seats)?);
 
     let (mut lines, printer) = utils::spawn_readline_loop("you ▸ ")?;
     let printer: SharedPrinter = Arc::new(Mutex::new(printer));
