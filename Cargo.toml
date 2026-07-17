@@ -216,6 +216,11 @@ required-features = ["tokio", "cli"]
 doc-scrape-examples = true
 
 [[example]]
+name = "prompt_caching"
+required-features = ["tokio", "cli"]
+doc-scrape-examples = true
+
+[[example]]
 name = "strawberry"
 required-features = ["cli", "json-schema"]
 doc-scrape-examples = true
