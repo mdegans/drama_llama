@@ -191,6 +191,11 @@ misanthropic = { version = "1.0.0-alpha.11", default-features = false, features 
 # unflagged ones are excluded — keep the flag on every example whose
 # required features are in the docs.rs feature list.
 [[example]]
+name = "neologism"
+required-features = ["tokio", "cli"]
+doc-scrape-examples = true
+
+[[example]]
 name = "strawberry"
 required-features = ["cli", "json-schema"]
 doc-scrape-examples = true
