@@ -320,6 +320,13 @@ pub struct CandidatePredictor<'engine, B: Backend> {
     /// Next position to decode at. After prefill, equals
     /// `start_pos + prompt.len()`; each successful step bumps it by 1.
     pub n_cur: usize,
+    /// The KV sequence generation decodes on — the constructor's
+    /// `seq_id` (0 for [`Self::new`]). Every `step` must target it:
+    /// a hardcoded 0 here once sent agent B's tokens into agent A's
+    /// sequence under the multi-slot prefix cache (caught by
+    /// llama.cpp's M-RoPE position-continuity check; on non-M-RoPE
+    /// models it would have been silent cross-agent corruption).
+    seq_id: i32,
     /// The number of tokens that have been decoded.
     pub n_decode: usize,
     /// The number of tokens to generate.
@@ -352,6 +359,7 @@ impl<'engine, B: Backend> CandidatePredictor<'engine, B> {
             n_cur,
             n_decode: 0,
             n,
+            seq_id: 0,
         }
     }
 
@@ -393,6 +401,7 @@ impl<'engine, B: Backend> CandidatePredictor<'engine, B> {
             n_cur,
             n_decode: 0,
             n,
+            seq_id,
         }
     }
 
@@ -430,7 +439,7 @@ impl<'engine, B: Backend> Iterator for CandidatePredictor<'engine, B> {
         let logits = self
             .engine
             .decoder
-            .step(token, self.n_cur, 0)
+            .step(token, self.n_cur, self.seq_id)
             .expect("decoder.step failed");
         let candidates = Candidates::from_logits(logits.iter().cloned());
         self.n_cur += 1;
