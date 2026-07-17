@@ -187,6 +187,9 @@ misanthropic = { version = "1.0.0-alpha.11", default-features = false, features 
     "rustls-tls",
     "chat",
     "markdown",
+    "derive",
+    "bash",
+    "bash-container",
 ] }
 
 # `doc-scrape-examples = true` opts each example into rustdoc's
@@ -228,6 +231,11 @@ doc-scrape-examples = true
 [[example]]
 name = "python"
 required-features = ["tokio", "cli"]
+doc-scrape-examples = true
+
+[[example]]
+name = "swarm"
+required-features = ["tokio", "repl", "json-schema"]
 doc-scrape-examples = true
 
 [[example]]
