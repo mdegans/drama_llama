@@ -445,9 +445,36 @@ struct Breakpoint {
 /// Default cap on live [`PrefixSlot`]s when the backend offers more
 /// sequences than we want to manage (see
 /// [`Session::with_prefix_cache`]). Covers the swarm/council examples
-/// (five agents) with headroom; the bounds commit makes this
-/// configurable.
+/// (five agents) with headroom. Override via [`PrefixCacheConfig`].
 const DEFAULT_MAX_SLOTS: usize = 8;
+
+/// Configuration for the multi-slot prefix cache
+/// ([`Session::with_prefix_cache_config`]).
+#[derive(Clone, Copy, Debug)]
+pub struct PrefixCacheConfig {
+    /// Maximum live cached prefixes. Clamped at install time to the
+    /// backend's [`Decoder::n_seq_max`](crate::backend::Decoder) —
+    /// on a default llama.cpp context (`n_seq_max` == 1) the cache
+    /// runs single-slot regardless of this value; build the engine
+    /// with `from_path_with_n_ctx_and_seqs` (or another
+    /// multi-sequence constructor) to raise the ceiling.
+    pub max_slots: usize,
+    /// KV cell budget shared by every slot (unified KV shares one
+    /// physical pool). When the incoming call's footprint (prompt +
+    /// generation headroom) plus the other slots' cells exceeds
+    /// this, least-recently-used slots are evicted until it fits.
+    /// `None` = the engine's `n_ctx`.
+    pub capacity_cells: Option<usize>,
+}
+
+impl Default for PrefixCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_slots: DEFAULT_MAX_SLOTS,
+            capacity_cells: None,
+        }
+    }
+}
 
 /// One cached conversation prefix — an agent's history — pinned to
 /// its own KV sequence. The multi-slot [`PrefixCache`] holds several
@@ -542,6 +569,95 @@ impl PrefixSlot {
             .filter(|&p| p > 0)
             .collect()
     }
+
+    /// This slot's KV cell footprint.
+    fn cells(&self) -> usize {
+        entries_cell_len(&self.prev_entries)
+    }
+
+    /// Is `bp` past its TTL? The clock runs from the slot's
+    /// `last_used` — refreshed on every read and write (Anthropic
+    /// refresh-on-read semantics), so an actively-reused slot never
+    /// expires.
+    fn expired(&self, bp: &Breakpoint, now: std::time::Instant) -> bool {
+        now.duration_since(self.last_used)
+            > crate::chat_template::ttl_duration(&bp.ttl)
+    }
+}
+
+/// One slot's TTL-sweep outcome: snapshot positions to forget, and
+/// whether the whole slot dies (every breakpoint and the tip
+/// expired — nothing left to resume from).
+#[derive(Debug, PartialEq)]
+struct SweepAction {
+    seq: i32,
+    /// Expired snapshot positions (`pos > 0`) to `forget_pos`.
+    forget: Vec<usize>,
+    /// Evict the slot wholesale.
+    evict: bool,
+}
+
+/// Plan the TTL sweep over `slots` at `now`. Pure — the caller
+/// executes the engine-side frees and metadata pruning. A slot with
+/// no breakpoints and no tip is skipped (nothing to expire; a
+/// leftover pending shell dies through LRU instead).
+fn sweep_expired(
+    slots: &[PrefixSlot],
+    now: std::time::Instant,
+) -> Vec<SweepAction> {
+    let mut out = Vec::new();
+    for slot in slots {
+        let total = slot.breakpoints.len() + slot.tip.iter().count();
+        if total == 0 {
+            continue;
+        }
+        let expired: Vec<&Breakpoint> = slot
+            .breakpoints
+            .iter()
+            .chain(slot.tip.as_ref())
+            .filter(|bp| slot.expired(bp, now))
+            .collect();
+        if expired.is_empty() {
+            continue;
+        }
+        out.push(SweepAction {
+            seq: slot.seq_id,
+            forget: expired
+                .iter()
+                .map(|bp| bp.at.pos)
+                .filter(|&p| p > 0)
+                .collect(),
+            evict: expired.len() == total,
+        });
+    }
+    out
+}
+
+/// Plan LRU eviction so the incoming call fits the cell budget: the
+/// pending slot's new footprint is `needed_cells` (prompt + generation
+/// headroom — its old contents are being overwritten), every other
+/// slot costs its recorded cells. Oldest-first until it fits; the
+/// pending slot is never evicted. Pure.
+fn plan_eviction(
+    slots: &[PrefixSlot],
+    capacity_cells: usize,
+    needed_cells: usize,
+    protect_seq: i32,
+) -> Vec<i32> {
+    let mut others: Vec<&PrefixSlot> =
+        slots.iter().filter(|s| s.seq_id != protect_seq).collect();
+    others.sort_by_key(|s| s.last_used);
+    let mut used: usize =
+        others.iter().map(|s| s.cells()).sum::<usize>() + needed_cells;
+    let mut evict = Vec::new();
+    for slot in others {
+        if used <= capacity_cells {
+            break;
+        }
+        used -= slot.cells();
+        evict.push(slot.seq_id);
+    }
+    evict
 }
 
 /// Per-session prefix-cache state: a bounded set of [`PrefixSlot`]s,
@@ -581,11 +697,15 @@ struct PrefixCache {
     /// KV cells reused in the last call, across whichever slot was
     /// selected. `0` = full re-prefill.
     last_reused_cells: usize,
+    /// Shared KV cell budget — see
+    /// [`PrefixCacheConfig::capacity_cells`], resolved at install.
+    capacity_cells: usize,
 }
 
 impl PrefixCache {
-    /// Fresh, empty cache with capacity for `max_slots` slots.
-    fn new(max_slots: usize) -> Self {
+    /// Fresh, empty cache with capacity for `max_slots` slots over a
+    /// budget of `capacity_cells` KV cells.
+    fn new(max_slots: usize, capacity_cells: usize) -> Self {
         let max_slots = max_slots.max(1);
         Self {
             slots: Vec::new(),
@@ -594,6 +714,7 @@ impl PrefixCache {
             pending: None,
             last_active: None,
             last_reused_cells: 0,
+            capacity_cells,
         }
     }
 
@@ -1620,6 +1741,35 @@ impl Session<LlamaCppBackend> {
         ))
     }
 
+    /// [`Self::from_path_with_n_ctx`] plus multi-sequence KV support
+    /// (`slots` sequences over one unified `n_ctx` cell pool — see
+    /// [`crate::LlamaCppEngine::from_path_with_n_ctx_and_seqs`]).
+    /// Combine with [`Self::with_prefix_cache`] /
+    /// [`Self::with_prefix_cache_config`]: the prefix cache sizes its
+    /// slot count from the engine's `n_seq_max`, so this is the
+    /// constructor that makes N-agent workloads (swarm, council)
+    /// actually cache N prefixes. Sidecar handling matches
+    /// [`Self::from_path`].
+    pub fn from_path_with_cache_slots(
+        path: PathBuf,
+        n_ctx: u32,
+        slots: u32,
+    ) -> Result<Self, SessionError> {
+        let sidecar = llama_cpp_sidecar_path(&path);
+        let template_sidecar = llama_cpp_template_sidecar_path(&path);
+        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
+        let engine = crate::LlamaCppEngine::from_path_with_n_ctx_and_seqs(
+            path, n_ctx, slots,
+        )?;
+        Ok(apply_dialect_sidecar(
+            apply_template_sidecar(
+                apply_sidecar(Self::from_engine(engine)?, &sidecar),
+                &template_sidecar,
+            ),
+            &dialect_sidecar,
+        ))
+    }
+
     /// Load a model CPU-only (zero GPU layers). Diagnostic path for
     /// isolating GPU-kernel divergence. Sidecar handling matches
     /// [`Self::from_path`].
@@ -2275,18 +2425,41 @@ impl<B: Backend> Session<B> {
     pub fn with_prefix_cache(mut self, on: bool) -> Self {
         if on {
             if self.prefix_cache.is_none() {
-                // Slot capacity: as many KV sequences as the backend
-                // offers, capped at a sane default. On a default
-                // llama.cpp context (`n_seq_max` == 1) this is exactly
-                // the pre-multi-slot behavior: one slot, seq 0.
-                let max_slots =
-                    (self.engine.n_seq_max() as usize).min(DEFAULT_MAX_SLOTS);
-                self.prefix_cache = Some(PrefixCache::new(max_slots));
+                return self
+                    .with_prefix_cache_config(PrefixCacheConfig::default());
             }
         } else if self.prefix_cache.is_some() {
             self.clear_prefix_cache();
             self.prefix_cache = None;
         }
+        self
+    }
+
+    /// Enable prefix caching with an explicit [`PrefixCacheConfig`]
+    /// (slot count + KV cell budget). `max_slots` is clamped to the
+    /// backend's sequence capacity — on a default llama.cpp context
+    /// (`n_seq_max` == 1) the cache runs single-slot on seq 0, exactly
+    /// the pre-multi-slot behavior; build the engine with a
+    /// multi-sequence constructor (e.g.
+    /// `from_path_with_n_ctx_and_seqs`) to cache several agents'
+    /// prefixes concurrently.
+    ///
+    /// Re-configuring an already-enabled cache clears it first (slot
+    /// layout changed; stale KV must not survive).
+    pub fn with_prefix_cache_config(
+        mut self,
+        config: PrefixCacheConfig,
+    ) -> Self {
+        if self.prefix_cache.is_some() {
+            self.clear_prefix_cache();
+        }
+        let max_slots = config
+            .max_slots
+            .clamp(1, (self.engine.n_seq_max() as usize).max(1));
+        let capacity_cells = config
+            .capacity_cells
+            .unwrap_or(self.engine.n_ctx() as usize);
+        self.prefix_cache = Some(PrefixCache::new(max_slots, capacity_cells));
         self
     }
 
@@ -2828,6 +3001,7 @@ impl<B: Backend> Session<B> {
             [u8; 32],
             crate::backend::Image,
         >,
+        headroom_cells: usize,
     ) -> Result<
         (
             Vec<Token>,
@@ -2856,6 +3030,8 @@ impl<B: Backend> Session<B> {
         // the least-recently-used one at capacity) and never touches
         // the other slots' sequences.
         let now = std::time::Instant::now();
+        // TTL sweep first: an expired prefix must not be selectable.
+        self.sweep_expired_slots(now);
         let cache_on = self.prefix_cache.is_some();
         let (active_seq, effective_cache_read) = if !cache_on {
             self.engine.memory_clear();
@@ -2942,6 +3118,31 @@ impl<B: Backend> Session<B> {
         };
         if let Some(cache) = self.prefix_cache.as_mut() {
             cache.pending = Some(active_seq);
+        }
+
+        // Capacity eviction: the pending slot's incoming footprint
+        // (prompt + generation headroom) plus every other slot's
+        // cells must fit the unified budget. Evict LRU slots until it
+        // does — under context pressure this degrades gracefully to
+        // single-slot.
+        if cache_on {
+            let plan = {
+                let cache = self.prefix_cache.as_ref().expect("cache_on");
+                plan_eviction(
+                    &cache.slots,
+                    cache.capacity_cells,
+                    entries_cell_len(new_entries) + headroom_cells,
+                    active_seq,
+                )
+            };
+            for seq in plan {
+                #[cfg(feature = "axum")]
+                tracing::debug!(
+                    seq_id = seq,
+                    "prefix-cache over cell budget; evicting LRU slot",
+                );
+                self.evict_slot(seq);
+            }
         }
 
         // The sampler state cached at the position we actually
@@ -3212,14 +3413,7 @@ impl<B: Backend> Session<B> {
                     seq_id = seq,
                     "prefix-cache at slot capacity; evicting LRU slot",
                 );
-                self.free_slot_engine_state(seq);
-                if let Some(cache) = self.prefix_cache.as_mut() {
-                    cache.slots.retain(|s| s.seq_id != seq);
-                    if cache.last_active == Some(seq) {
-                        cache.last_active = None;
-                    }
-                    cache.free_seq_ids.push(seq);
-                }
+                self.evict_slot(seq);
             }
         }
         let seq = {
@@ -3236,6 +3430,62 @@ impl<B: Backend> Session<B> {
         };
         self.engine.memory_seq_rm(seq, -1, -1);
         seq
+    }
+
+    /// Remove a live slot entirely: engine footprint freed, metadata
+    /// dropped, seq id recycled.
+    fn evict_slot(&mut self, seq: i32) {
+        self.free_slot_engine_state(seq);
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            cache.slots.retain(|s| s.seq_id != seq);
+            if cache.last_active == Some(seq) {
+                cache.last_active = None;
+            }
+            cache.free_seq_ids.push(seq);
+        }
+    }
+
+    /// Execute the TTL sweep: expired breakpoints lose their engine
+    /// snapshots and their metadata; slots with nothing left alive
+    /// are evicted wholesale. See [`sweep_expired`] for the rule.
+    fn sweep_expired_slots(&mut self, now: std::time::Instant) {
+        let actions = match self.prefix_cache.as_ref() {
+            Some(cache) if !cache.slots.is_empty() => {
+                sweep_expired(&cache.slots, now)
+            }
+            _ => return,
+        };
+        for action in actions {
+            #[cfg(feature = "axum")]
+            tracing::debug!(
+                seq_id = action.seq,
+                forget = action.forget.len(),
+                evict = action.evict,
+                "prefix-cache TTL sweep",
+            );
+            if action.evict {
+                self.evict_slot(action.seq);
+                continue;
+            }
+            for &pos in &action.forget {
+                let _ = self.engine.forget_pos(action.seq, pos as i32);
+            }
+            if let Some(slot) = self
+                .prefix_cache
+                .as_mut()
+                .and_then(|c| c.slot_mut(action.seq))
+            {
+                slot.breakpoints
+                    .retain(|bp| !action.forget.contains(&bp.at.pos));
+                if slot
+                    .tip
+                    .as_ref()
+                    .is_some_and(|t| action.forget.contains(&t.at.pos))
+                {
+                    slot.tip = None;
+                }
+            }
+        }
     }
 
     /// Build a [`Usage`] for one `complete_*` call. `Option` fields
@@ -3424,11 +3674,7 @@ impl<B: Backend> Session<B> {
             .and_then(|c| c.pending.take().or(c.last_active.take()));
         match seq {
             Some(seq) if self.prefix_cache.is_some() => {
-                self.free_slot_engine_state(seq);
-                if let Some(cache) = self.prefix_cache.as_mut() {
-                    cache.slots.retain(|s| s.seq_id != seq);
-                    cache.free_seq_ids.push(seq);
-                }
+                self.evict_slot(seq);
             }
             _ => {
                 self.engine.memory_clear();
@@ -3497,10 +3743,8 @@ impl<B: Backend> Session<B> {
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
-        self.check_context_fit(
-            &entries,
-            self.effective_max_tokens(prompt).get(),
-        )?;
+        let headroom = self.effective_max_tokens(prompt).get();
+        self.check_context_fit(&entries, headroom)?;
 
         let (suffix, cache_read, prefill_start, cached_state, active_seq) =
             self.kv_setup_and_chunk_prefill(
@@ -3508,6 +3752,7 @@ impl<B: Backend> Session<B> {
                 &breakpoints,
                 &partial_hashes,
                 &media_by_id,
+                headroom,
             )?;
 
         let predict_opts =
@@ -3785,10 +4030,8 @@ impl<B: Backend> Session<B> {
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
-        self.check_context_fit(
-            &entries,
-            self.effective_max_tokens(prompt).get(),
-        )?;
+        let headroom = self.effective_max_tokens(prompt).get();
+        self.check_context_fit(&entries, headroom)?;
 
         let (suffix, cache_read, prefill_start, cached_state, active_seq) =
             self.kv_setup_and_chunk_prefill(
@@ -3796,6 +4039,7 @@ impl<B: Backend> Session<B> {
                 &breakpoints,
                 &partial_hashes,
                 &media_by_id,
+                headroom,
             )?;
 
         let predict_opts =
@@ -3917,10 +4161,8 @@ impl<B: Backend> Session<B> {
             media_sentinel,
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
-        self.check_context_fit(
-            &entries,
-            self.effective_max_tokens(prompt).get(),
-        )?;
+        let headroom = self.effective_max_tokens(prompt).get();
+        self.check_context_fit(&entries, headroom)?;
 
         let (suffix, cache_read, prefill_start, cached_state, active_seq) =
             self.kv_setup_and_chunk_prefill(
@@ -3928,6 +4170,7 @@ impl<B: Backend> Session<B> {
                 &breakpoints,
                 &partial_hashes,
                 &media_by_id,
+                headroom,
             )?;
 
         // Pieces we drop from the surfaced output: every EOG token
@@ -5678,7 +5921,7 @@ mod tests {
     /// invariant `Session::clear_prefix_cache` relies on.
     #[test]
     fn test_prefix_cache_reset_zeroes_state() {
-        let mut cache = PrefixCache::new(2);
+        let mut cache = PrefixCache::new(2, 4096);
         assert!(cache.slots.is_empty());
         assert_eq!(cache.free_seq_ids, vec![1, 0], "pop yields 0 first");
         assert_eq!(cache.last_reused_cells, 0);
@@ -5700,6 +5943,197 @@ mod tests {
         );
         assert!(cache.pending.is_none());
         assert_eq!(cache.last_reused_cells, 0);
+    }
+
+    /// Test shorthand: a [`Breakpoint`] with an explicit TTL.
+    fn bp_ttl(
+        entry: usize,
+        hash: Option<[u8; 32]>,
+        ttl: CacheTtl,
+    ) -> Breakpoint {
+        Breakpoint {
+            ttl,
+            ..bp(entry, hash)
+        }
+    }
+
+    /// Test shorthand: an aged slot — `last_used` (and `created`)
+    /// backdated `age_secs` before `now`, holding `n_entries` token
+    /// entries.
+    fn aged_slot(
+        seq: i32,
+        age_secs: u64,
+        n_entries: usize,
+        now: std::time::Instant,
+    ) -> PrefixSlot {
+        let mut slot = PrefixSlot::new(
+            seq,
+            now - std::time::Duration::from_secs(age_secs),
+        );
+        slot.prev_entries =
+            (0..n_entries as Token).map(CacheEntry::Token).collect();
+        slot
+    }
+
+    #[test]
+    fn test_sweep_mixed_ttls_forgets_only_expired() {
+        // Slot 10 minutes old: its 5m breakpoint is expired, its 1h
+        // breakpoint and 1h tip survive → partial forget, no evict.
+        let now = std::time::Instant::now();
+        let mut slot = aged_slot(0, 600, 20, now);
+        slot.breakpoints = vec![
+            bp_ttl(5, None, CacheTtl::FiveMinutes),
+            bp_ttl(10, None, CacheTtl::OneHour),
+        ];
+        slot.tip = Some(bp_ttl(15, None, CacheTtl::OneHour));
+        let actions = sweep_expired(&[slot], now);
+        assert_eq!(
+            actions,
+            vec![SweepAction {
+                seq: 0,
+                forget: vec![5],
+                evict: false
+            }]
+        );
+    }
+
+    #[test]
+    fn test_sweep_evicts_fully_expired_slot() {
+        // Everything 5m in a 10-minute-old slot → wholesale eviction.
+        let now = std::time::Instant::now();
+        let mut slot = aged_slot(3, 600, 20, now);
+        slot.breakpoints = vec![
+            bp_ttl(5, None, CacheTtl::FiveMinutes),
+            bp_ttl(10, None, CacheTtl::FiveMinutes),
+        ];
+        slot.tip = Some(bp_ttl(15, None, CacheTtl::FiveMinutes));
+        let actions = sweep_expired(&[slot], now);
+        assert_eq!(
+            actions,
+            vec![SweepAction {
+                seq: 3,
+                forget: vec![5, 10, 15],
+                evict: true
+            }]
+        );
+    }
+
+    #[test]
+    fn test_sweep_refresh_on_read_resets_clock() {
+        // A slot read (or written) just now has a fresh `last_used`
+        // regardless of its age — nothing expires.
+        let now = std::time::Instant::now();
+        let mut slot = aged_slot(0, 600, 20, now);
+        slot.breakpoints = vec![bp_ttl(5, None, CacheTtl::FiveMinutes)];
+        slot.last_used = now; // the refresh
+        assert!(sweep_expired(&[slot], now).is_empty());
+    }
+
+    #[test]
+    fn test_sweep_skips_empty_slots() {
+        // A pending shell with no breakpoints and no tip has nothing
+        // to expire.
+        let now = std::time::Instant::now();
+        let slot = aged_slot(0, 7200, 0, now);
+        assert!(sweep_expired(&[slot], now).is_empty());
+    }
+
+    #[test]
+    fn test_plan_eviction_lru_order_and_protection() {
+        // Three non-pending slots of 100 cells each (ages 30/20/10s),
+        // capacity 250, incoming footprint 100: need to shed 150 →
+        // evict the two oldest, never the pending slot.
+        let now = std::time::Instant::now();
+        let slots = vec![
+            aged_slot(0, 30, 100, now),
+            aged_slot(1, 20, 100, now),
+            aged_slot(2, 10, 100, now),
+            aged_slot(3, 0, 100, now), // pending (old cells ignored)
+        ];
+        assert_eq!(plan_eviction(&slots, 250, 100, 3), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_plan_eviction_no_eviction_when_fits() {
+        let now = std::time::Instant::now();
+        let slots = vec![aged_slot(0, 10, 100, now), aged_slot(1, 0, 100, now)];
+        assert!(plan_eviction(&slots, 4096, 200, 1).is_empty());
+    }
+
+    #[test]
+    fn test_plan_eviction_oversized_call_evicts_all_others() {
+        // Incoming footprint alone exceeds capacity: every other slot
+        // goes; the pending slot survives (check_context_fit is the
+        // authority on whether the call itself fits).
+        let now = std::time::Instant::now();
+        let slots = vec![aged_slot(0, 10, 100, now), aged_slot(1, 0, 50, now)];
+        assert_eq!(plan_eviction(&slots, 300, 400, 1), vec![0]);
+    }
+
+    #[test]
+    fn test_select_slot_largest_hit_wins() {
+        // Slot 0 shares only the first 3 entries with the new prompt
+        // (offer clips to the breakpoint at 2); slot 1 shares all 8
+        // (offer reaches the breakpoint at 4). Slot 1 wins. (LCP
+        // path: no hashes anywhere.)
+        let now = std::time::Instant::now();
+        let mut a = aged_slot(0, 10, 8, now);
+        a.prev_entries = [0, 1, 2, 100, 101, 102, 103, 104]
+            .into_iter()
+            .map(CacheEntry::Token)
+            .collect();
+        let b = aged_slot(1, 10, 8, now);
+        // New prompt = slot 1's entries; its breakpoints sit at 2
+        // and 4.
+        let new_entries: Vec<CacheEntry> =
+            (0..8 as Token).map(CacheEntry::Token).collect();
+        let new_bps = [ep(2), ep(4)];
+        let picked = select_slot(&[a, b], &new_entries, &new_bps, &[]).unwrap();
+        assert_eq!(picked, (1, ep(4)));
+    }
+
+    #[test]
+    fn test_select_slot_tie_breaks_toward_mru() {
+        let now = std::time::Instant::now();
+        let mut a = aged_slot(0, 30, 8, now);
+        a.breakpoints = vec![bp(4, None)];
+        let mut b = aged_slot(1, 5, 8, now);
+        b.breakpoints = vec![bp(4, None)];
+        let new_entries: Vec<CacheEntry> =
+            (0..8 as Token).map(CacheEntry::Token).collect();
+        let new_bps = [ep(4)];
+        let picked = select_slot(&[a, b], &new_entries, &new_bps, &[]).unwrap();
+        assert_eq!(picked.0, 1, "most recently used wins the tie");
+    }
+
+    #[test]
+    fn test_select_slot_hash_beats_lcp() {
+        // Slot 0's entries diverge from the new prompt immediately
+        // (LCP 0) but its breakpoint hash matches a new partial hash
+        // at entry 6; slot 1 offers only an LCP hit at entry 4. The
+        // hash-keyed match wins because it names the larger prefix.
+        let now = std::time::Instant::now();
+        let h = [7u8; 32];
+        let mut a = aged_slot(0, 10, 8, now);
+        a.prev_entries = (100..108 as Token).map(CacheEntry::Token).collect();
+        a.breakpoints = vec![bp(6, Some(h))];
+        let mut b = aged_slot(1, 10, 8, now);
+        b.breakpoints = vec![bp(4, None)];
+        let new_entries: Vec<CacheEntry> =
+            (0..8 as Token).map(CacheEntry::Token).collect();
+        let new_bps = [ep(4), ep(6)];
+        let picked =
+            select_slot(&[a, b], &new_entries, &new_bps, &[h]).unwrap();
+        assert_eq!(picked, (0, ep(6)));
+    }
+
+    #[test]
+    fn test_select_slot_none_on_no_offer() {
+        let now = std::time::Instant::now();
+        let slot = aged_slot(0, 10, 0, now); // empty prev_entries
+        let new_entries: Vec<CacheEntry> =
+            (0..4 as Token).map(CacheEntry::Token).collect();
+        assert!(select_slot(&[slot], &new_entries, &[ep(2)], &[]).is_none());
     }
 
     /// Stop-reason inference: tool use wins over everything. When a

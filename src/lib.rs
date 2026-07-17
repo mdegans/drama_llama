@@ -151,7 +151,10 @@ pub use session::SessionTransport;
     feature = "llama-cpp",
     all(feature = "moeflux", target_os = "macos")
 ))]
-pub use session::{BlockStream, Session, SessionError, TokenTrace, TopKEntry};
+pub use session::{
+    BlockStream, PrefixCacheConfig, Session, SessionError, TokenTrace,
+    TopKEntry,
+};
 
 mod probability;
 pub use probability::{InvalidProbability, Probability};

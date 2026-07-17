@@ -155,6 +155,30 @@ impl LlamaCppEngine {
         Self::new(path, None, Some(cp), None)
     }
 
+    /// [`Self::from_path_with_n_ctx`] plus multi-sequence support:
+    /// `n_seq_max` KV sequences over one **unified** cell pool of
+    /// `n_ctx` (llama.cpp's recommended shape for sequences sharing
+    /// large prefixes). This is what the multi-slot prefix cache
+    /// wants: `Session::with_prefix_cache` sizes its slot count from
+    /// [`crate::backend::Decoder::n_seq_max`], so a session built on
+    /// this engine caches up to `n_seq_max` distinct conversation
+    /// prefixes (agents) concurrently instead of thrashing one slot.
+    /// On recurrent / hybrid models `n_seq_max` also sizes the
+    /// per-sequence recurrent-state slots.
+    pub fn from_path_with_n_ctx_and_seqs(
+        path: PathBuf,
+        n_ctx: u32,
+        n_seq_max: u32,
+    ) -> Result<Self, NewError> {
+        let mut cp = Self::default_context_params();
+        cp.n_ctx = n_ctx;
+        cp.n_batch = n_ctx;
+        cp.n_ubatch = cp.n_ubatch.min(n_ctx);
+        cp.n_seq_max = n_seq_max.max(1);
+        cp.kv_unified = true;
+        Self::new(path, None, Some(cp), None)
+    }
+
     /// Returns true if mmap is supported.
     pub fn supports_mmap() -> bool {
         unsafe { llama_supports_mmap() }
