@@ -393,26 +393,15 @@ fn entries_from_chunks(
     out
 }
 
-/// Per-session prefix-cache state.
-///
-/// Tracks the previous call's prompt **plus generated content** tokens, the
-/// indices within those tokens where `cache_control` breakpoints landed (sorted
-/// ascending), the number of tokens actually reused on the last call, and an
-/// internal post-generation tip breakpoint maintained by `Session` itself
-/// (not visible to API callers — see [`Self::tip`]).
-///
-/// Private to the session module; callers interact through
-/// [`Session::with_prefix_cache`] / [`Session::clear_prefix_cache`] /
-/// [`Session::last_usage`].
-/// A resumable position in the previous call's entry stream: where it
+/// A resumable position in a cached slot's entry stream: where it
 /// is (`pos`), how to recognize it across calls (`hash`). Prompt
 /// breakpoints come from `cache_control` markers; the session's
 /// private post-generation tip is one of these too (see
-/// [`PrefixCache::tip`]).
+/// [`PrefixSlot::tip`]).
 #[derive(Clone, Debug)]
 struct Breakpoint {
     /// Entry/position pair, computed against
-    /// [`PrefixCache::prev_entries`] at creation.
+    /// [`PrefixSlot::prev_entries`] at creation.
     at: EntryPos,
     /// SHA-256 of the canonical chat-template render (the
     /// `partial_text`) up to this breakpoint. Used by the hash-keyed
@@ -453,7 +442,25 @@ struct Breakpoint {
     ttl: CacheTtl,
 }
 
-struct PrefixCache {
+/// Default cap on live [`PrefixSlot`]s when the backend offers more
+/// sequences than we want to manage (see
+/// [`Session::with_prefix_cache`]). Covers the swarm/council examples
+/// (five agents) with headroom; the bounds commit makes this
+/// configurable.
+const DEFAULT_MAX_SLOTS: usize = 8;
+
+/// One cached conversation prefix — an agent's history — pinned to
+/// its own KV sequence. The multi-slot [`PrefixCache`] holds several
+/// of these so N agents round-robining through one session each keep
+/// their prefix; matching happens per-slot with the same hash-keyed /
+/// LCP machinery the single-slot design used.
+#[derive(Debug)]
+struct PrefixSlot {
+    /// The KV sequence this slot's state lives on. Unique per live
+    /// slot; recycled through [`PrefixCache::free_seq_ids`] on
+    /// eviction. The slot's engine-side footprint — KV cells and
+    /// `(seq, pos)` snapshots — is all keyed by this.
+    seq_id: i32,
     /// Previous call's prompt entries with the generated assistant content
     /// appended. Includes the assistant content because that content is in
     /// the engine's KV cache (see the predictor-stop coupling note at
@@ -470,8 +477,6 @@ struct PrefixCache {
     /// [`Breakpoint`]s where `cache_control` markers landed, sorted
     /// ascending by entry.
     breakpoints: Vec<Breakpoint>,
-    /// KV cells reused in the last call. `0` = full re-prefill.
-    last_reused_cells: usize,
     /// Internal post-generation tip — set by `record_cache_hit` after a
     /// successful completion when prefix caching is on. Consulted by
     /// [`compute_l_hit`] as one more eligible breakpoint candidate
@@ -502,25 +507,123 @@ struct PrefixCache {
     /// describe the same stream position (rng/`mu` exempt — they
     /// advanced to *sample* the terminal token; unobservable).
     tip: Option<Breakpoint>,
+    /// Last touch — read (selected for reuse) or write
+    /// (`record_cache_hit`). Anthropic refresh-on-read semantics: TTL
+    /// expiry (enforced by the bounds commit) measures from here, and
+    /// LRU eviction orders by it.
+    last_used: std::time::Instant,
+    /// When the slot was allocated. Diagnostics (and the future disk
+    /// cache); never used for expiry — that's [`Self::last_used`].
+    #[allow(dead_code)]
+    created: std::time::Instant,
 }
 
-impl PrefixCache {
-    /// Fresh, empty cache.
-    fn new() -> Self {
+impl PrefixSlot {
+    /// A fresh, empty slot owning `seq_id`.
+    fn new(seq_id: i32, now: std::time::Instant) -> Self {
         Self {
+            seq_id,
             prev_entries: Vec::new(),
             breakpoints: Vec::new(),
-            last_reused_cells: 0,
             tip: None,
+            last_used: now,
+            created: now,
         }
     }
 
-    /// Zero every field. Called from [`Session::clear_prefix_cache`].
+    /// Every engine-side snapshot position this slot may hold blobs
+    /// at: its breakpoints plus the tip. Used when freeing the slot's
+    /// engine footprint on eviction / error-wipe.
+    fn snapshot_positions(&self) -> Vec<usize> {
+        self.breakpoints
+            .iter()
+            .map(|bp| bp.at.pos)
+            .chain(self.tip.as_ref().map(|t| t.at.pos))
+            .filter(|&p| p > 0)
+            .collect()
+    }
+}
+
+/// Per-session prefix-cache state: a bounded set of [`PrefixSlot`]s,
+/// each pinning one cached conversation prefix to its own KV
+/// sequence.
+///
+/// Slots are identified by their stable `seq_id` (never by vector
+/// index — slots are removed on eviction and error-wipe, and indices
+/// would dangle). `pending` marks the slot claimed by the in-flight
+/// call between [`Session::kv_setup_and_chunk_prefill`] and
+/// [`Session::record_cache_hit`] / `record_cache_miss_on_error`.
+///
+/// Private to the session module; callers interact through
+/// [`Session::with_prefix_cache`] / [`Session::clear_prefix_cache`] /
+/// [`Session::last_usage`].
+#[derive(Debug)]
+struct PrefixCache {
+    /// Live slots, unordered. Bounded by `free_seq_ids` running dry
+    /// (allocation evicts the least-recently-used slot when full).
+    slots: Vec<PrefixSlot>,
+    /// Recyclable sequence ids in `[0, max_slots)`. Popping yields the
+    /// smallest first, so the single-slot degenerate case (max_slots
+    /// == 1, e.g. a default llama.cpp context with `n_seq_max` == 1)
+    /// runs entirely on seq 0 — structurally identical to the
+    /// pre-multi-slot design.
+    free_seq_ids: Vec<i32>,
+    /// The `seq_id` of the slot claimed by the in-flight call. Set by
+    /// `kv_setup_and_chunk_prefill`, consumed by `record_cache_hit` /
+    /// `record_cache_miss_on_error`.
+    pending: Option<i32>,
+    /// The `seq_id` of the slot the most recent completed call wrote
+    /// (post-`record_cache_hit`). Error paths that fire *after* the
+    /// hit was recorded (e.g. the grammar-violation check) use this to
+    /// scope their wipe to the offending slot instead of nuking every
+    /// agent's KV.
+    last_active: Option<i32>,
+    /// KV cells reused in the last call, across whichever slot was
+    /// selected. `0` = full re-prefill.
+    last_reused_cells: usize,
+}
+
+impl PrefixCache {
+    /// Fresh, empty cache with capacity for `max_slots` slots.
+    fn new(max_slots: usize) -> Self {
+        let max_slots = max_slots.max(1);
+        Self {
+            slots: Vec::new(),
+            // Reversed so `pop` hands out the smallest id first.
+            free_seq_ids: (0..max_slots as i32).rev().collect(),
+            pending: None,
+            last_active: None,
+            last_reused_cells: 0,
+        }
+    }
+
+    /// Zero every slot and reclaim every seq id. Called from
+    /// [`Session::clear_prefix_cache`]. The engine-side wipe
+    /// (`memory_clear`) is the caller's job.
     fn clear(&mut self) {
-        self.prev_entries.clear();
-        self.breakpoints.clear();
+        let max_slots = self.slots.len() + self.free_seq_ids.len();
+        self.slots.clear();
+        self.free_seq_ids = (0..max_slots as i32).rev().collect();
+        self.pending = None;
+        self.last_active = None;
         self.last_reused_cells = 0;
-        self.tip = None;
+    }
+
+    /// The slot owning `seq_id`, if live.
+    fn slot(&self, seq_id: i32) -> Option<&PrefixSlot> {
+        self.slots.iter().find(|s| s.seq_id == seq_id)
+    }
+
+    /// Mutable [`Self::slot`].
+    fn slot_mut(&mut self, seq_id: i32) -> Option<&mut PrefixSlot> {
+        self.slots.iter_mut().find(|s| s.seq_id == seq_id)
+    }
+
+    /// The most-recently-used live slot (for test inspection of "what
+    /// the last call recorded").
+    #[cfg(test)]
+    fn last_slot(&self) -> Option<&PrefixSlot> {
+        self.slots.iter().max_by_key(|s| s.last_used)
     }
 }
 
@@ -989,7 +1092,7 @@ fn hash_keyed_l_hit(
 /// Both `new_breakpoints` and `internal_tip` are eligible candidates. The
 /// `internal_tip` is `Session`'s private post-generation cache anchor —
 /// independent of user-facing `cache_control` markers, so it doesn't count
-/// against the Anthropic 4-slot budget. See [`PrefixCache::tip`].
+/// against the Anthropic 4-slot budget. See [`PrefixSlot::tip`].
 ///
 /// The tip was computed against `prev_entries`; within the common
 /// prefix the two lists are identical entry-for-entry, so its `.pos`
@@ -1024,6 +1127,75 @@ fn compute_l_hit(
     } else {
         tip_best
     }
+}
+
+/// One slot's reuse offer for the new call: hash-keyed lookup first
+/// ([`hash_keyed_l_hit`] — trusts render-hash equality, sidesteps BPE
+/// drift), LCP fallback ([`compute_l_hit`]) second. Zero entry = the
+/// slot offers nothing.
+fn slot_l_hit(
+    slot: &PrefixSlot,
+    new_entries: &[CacheEntry],
+    new_breakpoints: &[EntryPos],
+    new_breakpoint_hashes: &[[u8; 32]],
+) -> EntryPos {
+    let hash_picked = hash_keyed_l_hit(
+        &slot.breakpoints,
+        slot.tip.as_ref(),
+        new_breakpoint_hashes,
+        new_entries.len(),
+    );
+    if hash_picked.entry > 0 {
+        hash_picked
+    } else {
+        compute_l_hit(
+            &slot.prev_entries,
+            new_entries,
+            new_breakpoints,
+            slot.tip.as_ref().map(|t| t.at),
+        )
+    }
+}
+
+/// Pick the slot to reuse for the new call: the one offering the
+/// largest [`slot_l_hit`], ties broken toward the most recently used.
+/// Returns the winner's `seq_id` and its hit, or `None` when no slot
+/// offers a nonzero prefix (the caller allocates a fresh slot).
+///
+/// Pure function over the slot set — directly testable without an
+/// engine.
+fn select_slot(
+    slots: &[PrefixSlot],
+    new_entries: &[CacheEntry],
+    new_breakpoints: &[EntryPos],
+    new_breakpoint_hashes: &[[u8; 32]],
+) -> Option<(i32, EntryPos)> {
+    let mut best: Option<(&PrefixSlot, EntryPos)> = None;
+    for slot in slots {
+        if slot.prev_entries.is_empty() {
+            continue;
+        }
+        let hit = slot_l_hit(
+            slot,
+            new_entries,
+            new_breakpoints,
+            new_breakpoint_hashes,
+        );
+        if hit.entry == 0 {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((b, bhit)) => {
+                hit.entry > bhit.entry
+                    || (hit.entry == bhit.entry && slot.last_used > b.last_used)
+            }
+        };
+        if better {
+            best = Some((slot, hit));
+        }
+    }
+    best.map(|(slot, hit)| (slot.seq_id, hit))
 }
 
 /// One generated-position entry in a [`Session::top_k_trace`] dump.
@@ -2103,7 +2275,13 @@ impl<B: Backend> Session<B> {
     pub fn with_prefix_cache(mut self, on: bool) -> Self {
         if on {
             if self.prefix_cache.is_none() {
-                self.prefix_cache = Some(PrefixCache::new());
+                // Slot capacity: as many KV sequences as the backend
+                // offers, capped at a sane default. On a default
+                // llama.cpp context (`n_seq_max` == 1) this is exactly
+                // the pre-multi-slot behavior: one slot, seq 0.
+                let max_slots =
+                    (self.engine.n_seq_max() as usize).min(DEFAULT_MAX_SLOTS);
+                self.prefix_cache = Some(PrefixCache::new(max_slots));
             }
         } else if self.prefix_cache.is_some() {
             self.clear_prefix_cache();
@@ -2651,7 +2829,13 @@ impl<B: Backend> Session<B> {
             crate::backend::Image,
         >,
     ) -> Result<
-        (Vec<Token>, usize, usize, Option<(SamplerState, SeedCursor)>),
+        (
+            Vec<Token>,
+            usize,
+            usize,
+            Option<(SamplerState, SeedCursor)>,
+            i32,
+        ),
         SessionError,
     > {
         // The suffix handed to the predictor must be non-empty text.
@@ -2664,122 +2848,100 @@ impl<B: Backend> Session<B> {
             return Err(SessionError::TrailingMedia);
         }
 
-        let l_hit_raw = match self.prefix_cache.as_ref() {
-            Some(cache) if !cache.prev_entries.is_empty() => {
-                // Hash-keyed fast path: if any cached breakpoint or
-                // the auto-tip hash matches a hash from the new
-                // request's partial renders, jump straight to the
-                // largest matching cached token position. Sidesteps
-                // `compute_l_hit`'s LCP — useful when the byte-level
-                // tokenization of an assistant block diverges between
-                // the model's original emission (in `prev_tokens`)
-                // and the canonical chat-template re-render (the
-                // partial_text the new request hashes).
-                let hash_picked = hash_keyed_l_hit(
-                    &cache.breakpoints,
-                    cache.tip.as_ref(),
-                    new_breakpoint_hashes,
-                    new_entries.len(),
-                );
-                if hash_picked.entry > 0 {
-                    #[cfg(feature = "axum")]
-                    tracing::debug!(
-                        hash_picked_entry = hash_picked.entry,
-                        hash_picked_pos = hash_picked.pos,
-                        prev_len = cache.prev_entries.len(),
-                        new_len = new_entries.len(),
-                        "hash-keyed prefix-reuse: cached position matched by SHA-256 of partial render",
-                    );
-                    // Use the hash-matched position directly. Skip the
-                    // LCP path below — we trust the hash equality
-                    // (canonical chat-template render produced the
-                    // same bytes for the cached prefix), accepting
-                    // the BPE-drift caveat at the splice for
-                    // permissive-grammar emissions like cogito.
-                    hash_picked
-                } else {
-                    let picked = compute_l_hit(
-                        &cache.prev_entries,
-                        new_entries,
-                        new_breakpoints,
-                        cache.tip.as_ref().map(|t| t.at),
-                    );
-                    // Diagnostic: when the auto-tip is set but didn't win,
-                    // log enough state to attribute the loss. The case worth
-                    // attention is `tip > safe` — the LCP cut off shorter
-                    // than `prev_tokens` length, almost always a BPE
-                    // re-tokenization mismatch in the assistant content.
-                    // `prev_at_lcp` and `new_at_lcp` point at the first
-                    // divergent token; comparing them tells us whether it's
-                    // a single-token shift or a wholesale re-render
-                    // (thoughts stripped, JSON re-serialized, etc.).
-                    #[cfg(feature = "axum")]
-                    if let Some(tip) = cache.tip.as_ref().map(|t| t.at) {
-                        let lcp = longest_common_prefix_len(
-                            &cache.prev_entries,
-                            new_entries,
-                        );
-                        let safe = lcp.saturating_sub(1);
-                        if tip.entry > safe && tip.entry > picked.entry {
-                            let prev_len = cache.prev_entries.len();
-                            let new_len = new_entries.len();
-                            let prev_at_lcp =
-                                cache.prev_entries.get(lcp).copied();
-                            let new_at_lcp = new_entries.get(lcp).copied();
-                            tracing::debug!(
-                                tip_entry = tip.entry,
-                                lcp,
-                                safe,
-                                picked_entry = picked.entry,
-                                prev_len,
-                                new_len,
-                                prev_at_lcp = ?prev_at_lcp,
-                                new_at_lcp = ?new_at_lcp,
-                                "auto-tip ineligible: tip past safe (LCP shorter than expected — \
-                                 likely re-tokenization mismatch in asst content)",
-                            );
-                        }
-                    }
-                    picked
-                }
-            }
-            _ => EntryPos::default(),
-        };
-
-        // Empty-suffix guard: if the cache covers the entire new
-        // prompt, the predictor would receive an empty token slice
-        // (panic on construction). Back off to the next-smaller
-        // breakpoint so at least one token survives for the predictor.
-        let cache_read = if l_hit_raw.entry == new_entries.len() {
-            new_breakpoints
-                .iter()
-                .rev()
-                .find(|bp| bp.entry < l_hit_raw.entry && bp.entry > 0)
-                .copied()
-                .unwrap_or_default()
-        } else {
-            l_hit_raw
-        };
-
-        // Restore (or full-clear on no-cache / fallback path).
-        let mut effective_cache_read = cache_read;
-        if cache_read.entry > 0 {
-            match self.engine.restore_to(0, cache_read.pos as i32) {
-                Ok(()) => {}
-                Err(_e) => {
-                    #[cfg(feature = "axum")]
-                    tracing::debug!(
-                        cache_read_entry = cache_read.entry,
-                        cache_read_pos = cache_read.pos,
-                        error = %_e,
-                        "checkpoint missing; falling back to full reprefill",
-                    );
-                    self.engine.memory_clear();
-                    effective_cache_read = EntryPos::default();
-                }
-            }
-        } else {
+        // Slot selection + restore. Cache off ⇒ the legacy
+        // single-sequence behavior: full clear, everything on seq 0.
+        // Cache on ⇒ pick the slot offering the largest reusable
+        // prefix (hash-keyed first, LCP fallback — see [`slot_l_hit`])
+        // and restore its KV; a miss allocates a fresh slot (evicting
+        // the least-recently-used one at capacity) and never touches
+        // the other slots' sequences.
+        let now = std::time::Instant::now();
+        let cache_on = self.prefix_cache.is_some();
+        let (active_seq, effective_cache_read) = if !cache_on {
             self.engine.memory_clear();
+            (0, EntryPos::default())
+        } else {
+            let selection = {
+                let cache = self.prefix_cache.as_ref().expect("cache_on");
+                select_slot(
+                    &cache.slots,
+                    new_entries,
+                    new_breakpoints,
+                    new_breakpoint_hashes,
+                )
+            };
+            match selection {
+                Some((seq, l_hit_raw)) => {
+                    #[cfg(feature = "axum")]
+                    tracing::debug!(
+                        seq_id = seq,
+                        l_hit_entry = l_hit_raw.entry,
+                        l_hit_pos = l_hit_raw.pos,
+                        new_len = new_entries.len(),
+                        "prefix-reuse: slot selected",
+                    );
+                    // Empty-suffix guard: if the slot covers the
+                    // entire new prompt, the predictor would receive
+                    // an empty token slice (panic on construction).
+                    // Back off to the next-smaller breakpoint so at
+                    // least one token survives for the predictor.
+                    let cache_read = if l_hit_raw.entry == new_entries.len() {
+                        new_breakpoints
+                            .iter()
+                            .rev()
+                            .find(|bp| {
+                                bp.entry < l_hit_raw.entry && bp.entry > 0
+                            })
+                            .copied()
+                            .unwrap_or_default()
+                    } else {
+                        l_hit_raw
+                    };
+                    if cache_read.entry > 0 {
+                        match self.engine.restore_to(seq, cache_read.pos as i32)
+                        {
+                            Ok(()) => {
+                                if let Some(slot) = self
+                                    .prefix_cache
+                                    .as_mut()
+                                    .and_then(|c| c.slot_mut(seq))
+                                {
+                                    // Refresh-on-read: reuse renews
+                                    // the slot's TTL/LRU clock.
+                                    slot.last_used = now;
+                                }
+                                (seq, cache_read)
+                            }
+                            Err(_e) => {
+                                #[cfg(feature = "axum")]
+                                tracing::debug!(
+                                    seq_id = seq,
+                                    cache_read_entry = cache_read.entry,
+                                    cache_read_pos = cache_read.pos,
+                                    error = %_e,
+                                    "checkpoint missing; wiping slot and \
+                                     falling back to full reprefill",
+                                );
+                                self.reset_slot(seq, now);
+                                (seq, EntryPos::default())
+                            }
+                        }
+                    } else {
+                        // Backoff landed at zero: nothing reusable
+                        // after all. Reuse the selected slot as the
+                        // pending one, emptied.
+                        self.reset_slot(seq, now);
+                        (seq, EntryPos::default())
+                    }
+                }
+                None => {
+                    let seq = self.allocate_slot(now);
+                    (seq, EntryPos::default())
+                }
+            }
+        };
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            cache.pending = Some(active_seq);
         }
 
         // The sampler state cached at the position we actually
@@ -2788,14 +2950,18 @@ impl<B: Backend> Session<B> {
         // from. Keyed on the effective restore position.
         let cached_state: Option<(SamplerState, SeedCursor)> =
             if effective_cache_read.pos > 0 {
-                self.prefix_cache.as_ref().and_then(|cache| {
-                    cache
-                        .breakpoints
-                        .iter()
-                        .chain(cache.tip.as_ref())
-                        .find(|bp| bp.at.pos == effective_cache_read.pos)
-                        .and_then(|bp| bp.state.clone().map(|s| (s, bp.cursor)))
-                })
+                self.prefix_cache
+                    .as_ref()
+                    .and_then(|cache| cache.slot(active_seq))
+                    .and_then(|slot| {
+                        slot.breakpoints
+                            .iter()
+                            .chain(slot.tip.as_ref())
+                            .find(|bp| bp.at.pos == effective_cache_read.pos)
+                            .and_then(|bp| {
+                                bp.state.clone().map(|s| (s, bp.cursor))
+                            })
+                    })
             } else {
                 None
             };
@@ -2814,17 +2980,21 @@ impl<B: Backend> Session<B> {
         // the orphans are newer than it. Explicit eviction here
         // protects the anchor.
         if effective_cache_read.entry > 0 {
-            if let Some(cache) = self.prefix_cache.as_ref() {
-                // Engine snapshots are keyed by POSITION, so orphan
-                // comparison happens in position space: an old
-                // breakpoint's `.pos` (computed against the old entry
-                // list at its creation) names the same engine
-                // snapshot slot as any new breakpoint with equal
-                // `.pos`.
+            if let Some(slot) = self
+                .prefix_cache
+                .as_ref()
+                .and_then(|cache| cache.slot(active_seq))
+            {
+                // Engine snapshots are keyed by (seq, POSITION), so
+                // orphan comparison happens in position space within
+                // this slot's sequence: an old breakpoint's `.pos`
+                // (computed against the old entry list at its
+                // creation) names the same engine snapshot slot as
+                // any new breakpoint with equal `.pos`.
                 let new_bp_set: std::collections::HashSet<usize> =
                     new_breakpoints.iter().map(|bp| bp.pos).collect();
-                let tip_pos = cache.tip.as_ref().map(|t| t.at.pos);
-                let orphans: Vec<usize> = cache
+                let tip_pos = slot.tip.as_ref().map(|t| t.at.pos);
+                let orphans: Vec<usize> = slot
                     .breakpoints
                     .iter()
                     .map(|bp| bp.at.pos)
@@ -2836,7 +3006,9 @@ impl<B: Backend> Session<B> {
                     })
                     .collect();
                 for old_pos in orphans {
-                    if let Err(_e) = self.engine.forget_pos(0, old_pos as i32) {
+                    if let Err(_e) =
+                        self.engine.forget_pos(active_seq, old_pos as i32)
+                    {
                         // Best-effort orphan reclamation — failure here
                         // means the backend didn't have a snapshot at
                         // `old_pos` (already evicted by LRU, never
@@ -2909,7 +3081,7 @@ impl<B: Backend> Session<B> {
                         })
                         .collect();
                     self.engine
-                        .prefill_chunk(&run, pos, 0)
+                        .prefill_chunk(&run, pos, active_seq)
                         .map_err(|e| SessionError::Decode(format!("{e}")))?;
                     pos += run.len();
                     i = end;
@@ -2929,7 +3101,7 @@ impl<B: Backend> Session<B> {
                             self.engine.vision_and_decoder();
                         match vision {
                             Some(v) => v
-                                .prefill_image(decoder, image, pos, 0)
+                                .prefill_image(decoder, image, pos, active_seq)
                                 .map_err(|e| format!("image prefill: {e}")),
                             None => Err("vision projector unloaded \
                                          mid-call"
@@ -2966,7 +3138,7 @@ impl<B: Backend> Session<B> {
                     pos, bp_pos,
                     "walk position disagrees with breakpoint EntryPos",
                 );
-                self.engine.checkpoint_pos(0, bp_pos as i32);
+                self.engine.checkpoint_pos(active_seq, bp_pos as i32);
             }
         }
 
@@ -2983,7 +3155,87 @@ impl<B: Backend> Session<B> {
             .collect();
         let cache_read_cells =
             entries_cell_len(&new_entries[..effective_cache_read.entry]);
-        Ok((suffix, cache_read_cells, pos, cached_state))
+        Ok((suffix, cache_read_cells, pos, cached_state, active_seq))
+    }
+
+    /// Empty a live slot in place — engine footprint freed, metadata
+    /// reset — keeping its `seq_id` claimed for the in-flight call.
+    fn reset_slot(&mut self, seq_id: i32, now: std::time::Instant) {
+        self.free_slot_engine_state(seq_id);
+        if let Some(slot) = self
+            .prefix_cache
+            .as_mut()
+            .and_then(|cache| cache.slot_mut(seq_id))
+        {
+            *slot = PrefixSlot::new(seq_id, now);
+        }
+    }
+
+    /// Free a slot's engine-side footprint: every `(seq, pos)`
+    /// snapshot blob it may hold, then the sequence's KV cells.
+    /// Slot metadata is the caller's concern. Safe on backends where
+    /// the sequence isn't resident (moeflux no-ops inactive
+    /// `memory_seq_rm` — the blobs freed here ARE that slot's real
+    /// storage).
+    fn free_slot_engine_state(&mut self, seq_id: i32) {
+        let positions = self
+            .prefix_cache
+            .as_ref()
+            .and_then(|cache| cache.slot(seq_id))
+            .map(|slot| slot.snapshot_positions())
+            .unwrap_or_default();
+        for pos in positions {
+            let _ = self.engine.forget_pos(seq_id, pos as i32);
+        }
+        self.engine.memory_seq_rm(seq_id, -1, -1);
+    }
+
+    /// Claim a fresh slot for a full re-prefill: pop a free seq id,
+    /// or evict the least-recently-used slot to reclaim one. The new
+    /// slot is registered and its sequence defensively emptied.
+    fn allocate_slot(&mut self, now: std::time::Instant) -> i32 {
+        let need_evict = self
+            .prefix_cache
+            .as_ref()
+            .is_some_and(|cache| cache.free_seq_ids.is_empty());
+        if need_evict {
+            let lru_seq = self.prefix_cache.as_ref().and_then(|cache| {
+                cache
+                    .slots
+                    .iter()
+                    .min_by_key(|s| s.last_used)
+                    .map(|s| s.seq_id)
+            });
+            if let Some(seq) = lru_seq {
+                #[cfg(feature = "axum")]
+                tracing::debug!(
+                    seq_id = seq,
+                    "prefix-cache at slot capacity; evicting LRU slot",
+                );
+                self.free_slot_engine_state(seq);
+                if let Some(cache) = self.prefix_cache.as_mut() {
+                    cache.slots.retain(|s| s.seq_id != seq);
+                    if cache.last_active == Some(seq) {
+                        cache.last_active = None;
+                    }
+                    cache.free_seq_ids.push(seq);
+                }
+            }
+        }
+        let seq = {
+            let cache = self
+                .prefix_cache
+                .as_mut()
+                .expect("allocate_slot requires the cache");
+            let seq = cache
+                .free_seq_ids
+                .pop()
+                .expect("free list non-empty after eviction");
+            cache.slots.push(PrefixSlot::new(seq, now));
+            seq
+        };
+        self.engine.memory_seq_rm(seq, -1, -1);
+        seq
     }
 
     /// Build a [`Usage`] for one `complete_*` call. `Option` fields
@@ -3065,6 +3317,20 @@ impl<B: Backend> Session<B> {
         reused_cells: usize,
         tip: Option<Breakpoint>,
     ) {
+        let now = std::time::Instant::now();
+        // Resolve the pending slot claimed by kv_setup. No pending +
+        // cache on shouldn't happen (every complete_* routes through
+        // kv_setup), but tolerate it as a no-op.
+        let Some(seq) = self.prefix_cache.as_mut().and_then(|c| {
+            let seq = c.pending.take();
+            if let Some(seq) = seq {
+                c.last_active = Some(seq);
+            }
+            c.last_reused_cells = reused_cells;
+            seq
+        }) else {
+            return;
+        };
         // Capture the old tip BEFORE overwriting — needed for the
         // explicit-eviction fast path so the engine can free the prior
         // snapshot. Its `.pos` was computed against the OLD entry list
@@ -3076,32 +3342,39 @@ impl<B: Backend> Session<B> {
         // current user breakpoint (rare, but possible — chunked-prefill
         // snapshots share the same engine.checkpoint_pos slot, so
         // freeing one would lose the other). Position space throughout:
-        // engine snapshots are keyed by position.
+        // engine snapshots are keyed by (seq, position).
         let old_tip = self
             .prefix_cache
             .as_ref()
-            .and_then(|c| c.tip.as_ref())
+            .and_then(|c| c.slot(seq))
+            .and_then(|s| s.tip.as_ref())
             .map(|t| t.at);
         let new_tip_pos = tip.as_ref().map(|t| t.at.pos);
-        if let Some(cache) = self.prefix_cache.as_mut() {
+        if let Some(slot) =
+            self.prefix_cache.as_mut().and_then(|c| c.slot_mut(seq))
+        {
             // State inheritance for reused-prefix breakpoints: match by
-            // render hash against the outgoing breakpoints (and tip).
+            // render hash against this slot's outgoing breakpoints
+            // (and tip). Slot-local by design — sampler state is keyed
+            // by render identity, so cross-slot inheritance would be
+            // sound in principle, but slot-local keeps the reasoning
+            // simple and only costs a first-formation re-fold.
             for bp in new_breakpoints.iter_mut() {
                 if bp.state.is_some() {
                     continue;
                 }
                 let Some(h) = bp.hash else { continue };
-                bp.state = cache
+                bp.state = slot
                     .breakpoints
                     .iter()
-                    .chain(cache.tip.as_ref())
+                    .chain(slot.tip.as_ref())
                     .find(|old| old.hash == Some(h) && old.state.is_some())
                     .and_then(|old| old.state.clone());
             }
-            cache.prev_entries = new_entries;
-            cache.breakpoints = new_breakpoints;
-            cache.last_reused_cells = reused_cells;
-            cache.tip = tip;
+            slot.prev_entries = new_entries;
+            slot.breakpoints = new_breakpoints;
+            slot.tip = tip;
+            slot.last_used = now;
         }
         // Free the displaced (tip moved) or stale (tip gone — e.g. the
         // streaming path that skips the tip extension) old tip
@@ -3111,10 +3384,11 @@ impl<B: Backend> Session<B> {
             let shared = self
                 .prefix_cache
                 .as_ref()
-                .map(|c| c.breakpoints.iter().any(|bp| bp.at.pos == old))
+                .and_then(|c| c.slot(seq))
+                .map(|s| s.breakpoints.iter().any(|bp| bp.at.pos == old))
                 .unwrap_or(false);
             if displaced && !shared {
-                if let Err(_e) = self.engine.forget_pos(0, old as i32) {
+                if let Err(_e) = self.engine.forget_pos(seq, old as i32) {
                     #[cfg(feature = "axum")]
                     tracing::debug!(
                         target: "drama_llama::session",
@@ -3127,13 +3401,41 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// After a batch call fails, invalidate [`self.prefix_cache`] and
-    /// wipe the KV state — partial decodes may have left the cache
-    /// inconsistent with `prev_tokens`.
+    /// After a batch call fails, invalidate the slot the call was
+    /// using and wipe its KV state — partial decodes may have left
+    /// that sequence inconsistent with its recorded entries. Other
+    /// slots' sequences are untouched: one agent's media failure or
+    /// grammar violation must not cost every other agent its prefix.
+    ///
+    /// Scope resolution: the in-flight `pending` slot if the error
+    /// fired mid-call, else `last_active` (errors after
+    /// [`Self::record_cache_hit`], e.g. the grammar-violation check).
+    /// With no attributable slot (or cache off), fall back to the
+    /// conservative full wipe.
+    ///
+    /// Known small leak: checkpoints taken *this call* at the new
+    /// prompt's breakpoints aren't in the dying slot's metadata yet,
+    /// so their blobs aren't forgotten here. Backend snapshot stores
+    /// are LRU-capped, so the leak is bounded and self-healing.
     fn record_cache_miss_on_error(&mut self) {
-        self.engine.memory_clear();
-        if let Some(cache) = self.prefix_cache.as_mut() {
-            cache.clear();
+        let seq = self
+            .prefix_cache
+            .as_mut()
+            .and_then(|c| c.pending.take().or(c.last_active.take()));
+        match seq {
+            Some(seq) if self.prefix_cache.is_some() => {
+                self.free_slot_engine_state(seq);
+                if let Some(cache) = self.prefix_cache.as_mut() {
+                    cache.slots.retain(|s| s.seq_id != seq);
+                    cache.free_seq_ids.push(seq);
+                }
+            }
+            _ => {
+                self.engine.memory_clear();
+                if let Some(cache) = self.prefix_cache.as_mut() {
+                    cache.clear();
+                }
+            }
         }
     }
 
@@ -3200,8 +3502,8 @@ impl<B: Backend> Session<B> {
             self.effective_max_tokens(prompt).get(),
         )?;
 
-        let (suffix, cache_read, prefill_start, cached_state) = self
-            .kv_setup_and_chunk_prefill(
+        let (suffix, cache_read, prefill_start, cached_state, active_seq) =
+            self.kv_setup_and_chunk_prefill(
                 &entries,
                 &breakpoints,
                 &partial_hashes,
@@ -3222,17 +3524,22 @@ impl<B: Backend> Session<B> {
         // the predictor does. When prefix caching is on, also capture
         // generated token IDs so we can extend `prev_tokens` past the
         // prompt for the next call's `compute_l_hit` walk; see
-        // [`PrefixCache::tip`] for the design.
+        // [`PrefixSlot::tip`] for the design.
         let mut generated_count: usize = 0;
         let mut text = String::new();
         let cache_on = self.prefix_cache.is_some();
         let mut generated_tokens: Vec<Token> =
             if cache_on { Vec::new() } else { Vec::new() };
-        let mut predictor = if prefill_start > 0 {
+        let mut predictor = if self.prefix_cache.is_some() {
+            // Cache on: ALWAYS the resuming constructor — even at
+            // prefill_start == 0 — because the non-resuming one calls
+            // `decoder.memory_clear()` (predictor.rs), which would
+            // wipe every other slot's sequence. `active_seq` is the
+            // pending slot's sequence.
             self.engine.predict_pieces_resuming(
                 suffix,
                 prefill_start,
-                0,
+                active_seq,
                 predict_opts,
                 Some(initial_state),
             )
@@ -3264,7 +3571,7 @@ impl<B: Backend> Session<B> {
         // Auto-tip: extend `prev_tokens` past the prompt with the
         // generated content **including the recorded-but-uncommitted
         // EOS / close-marker token** (predictor-stop coupling — see
-        // [`PrefixCache::tip`]). When stop fired on a stop
+        // [`PrefixSlot::tip`]). When stop fired on a stop
         // sequence (the common case), `generated_tokens` has one
         // more token than KV; that extra token is the close marker
         // the chat template will re-render in the next call. The
@@ -3280,9 +3587,10 @@ impl<B: Backend> Session<B> {
                 // close from. The sampled stop token stays the tip
                 // prediction here.
                 None,
+                active_seq,
             );
         if let Some(head) = head_for_checkpoint {
-            self.engine.checkpoint_pos(0, head as i32);
+            self.engine.checkpoint_pos(active_seq, head as i32);
         }
 
         // `complete_text` doesn't parse blocks, so we have no
@@ -3366,11 +3674,12 @@ impl<B: Backend> Session<B> {
         prompt_entries: Vec<CacheEntry>,
         generated_tokens: Vec<Token>,
         canonical_close: Option<Vec<Token>>,
+        active_seq: i32,
     ) -> (Vec<CacheEntry>, Option<EntryPos>, Option<usize>) {
         if self.prefix_cache.is_none() {
             return (prompt_entries, None, None);
         }
-        let kv_max = self.engine.memory_seq_pos_max(0);
+        let kv_max = self.engine.memory_seq_pos_max(active_seq);
         if kv_max < 0 {
             return (prompt_entries, None, None);
         }
@@ -3481,8 +3790,8 @@ impl<B: Backend> Session<B> {
             self.effective_max_tokens(prompt).get(),
         )?;
 
-        let (suffix, cache_read, prefill_start, cached_state) = self
-            .kv_setup_and_chunk_prefill(
+        let (suffix, cache_read, prefill_start, cached_state, active_seq) =
+            self.kv_setup_and_chunk_prefill(
                 &entries,
                 &breakpoints,
                 &partial_hashes,
@@ -3541,11 +3850,16 @@ impl<B: Backend> Session<B> {
             .cloned()
             .collect();
 
-        let predictor = if prefill_start > 0 {
+        let predictor = if self.prefix_cache.is_some() {
+            // Cache on: ALWAYS the resuming constructor — even at
+            // prefill_start == 0 — because the non-resuming one calls
+            // `decoder.memory_clear()` (predictor.rs), which would
+            // wipe every other slot's sequence. `active_seq` is the
+            // pending slot's sequence.
             self.engine.predict_pieces_resuming(
                 suffix,
                 prefill_start,
-                0,
+                active_seq,
                 predict_opts,
                 Some(initial_state),
             )
@@ -3608,8 +3922,8 @@ impl<B: Backend> Session<B> {
             self.effective_max_tokens(prompt).get(),
         )?;
 
-        let (suffix, cache_read, prefill_start, cached_state) = self
-            .kv_setup_and_chunk_prefill(
+        let (suffix, cache_read, prefill_start, cached_state, active_seq) =
+            self.kv_setup_and_chunk_prefill(
                 &entries,
                 &breakpoints,
                 &partial_hashes,
@@ -3666,11 +3980,16 @@ impl<B: Backend> Session<B> {
         let mut generated_tokens: Vec<Token> =
             if cache_on { Vec::new() } else { Vec::new() };
 
-        let mut predictor = if prefill_start > 0 {
+        let mut predictor = if self.prefix_cache.is_some() {
+            // Cache on: ALWAYS the resuming constructor — even at
+            // prefill_start == 0 — because the non-resuming one calls
+            // `decoder.memory_clear()` (predictor.rs), which would
+            // wipe every other slot's sequence. `active_seq` is the
+            // pending slot's sequence.
             self.engine.predict_pieces_resuming(
                 suffix,
                 prefill_start,
-                0,
+                active_seq,
                 predict_opts,
                 Some(initial_state),
             )
@@ -3837,9 +4156,14 @@ impl<B: Backend> Session<B> {
         // wasn't byte-stable). See `compute_tip_extension` for the
         // stop-condition handling.
         let (extended_prev, internal_tip, head_for_checkpoint) = self
-            .compute_tip_extension(entries, generated_tokens, canonical_close);
+            .compute_tip_extension(
+                entries,
+                generated_tokens,
+                canonical_close,
+                active_seq,
+            );
         if let Some(head) = head_for_checkpoint {
-            self.engine.checkpoint_pos(0, head as i32);
+            self.engine.checkpoint_pos(active_seq, head as i32);
         }
 
         // Cache + usage bookkeeping, then grammar-violation check.
@@ -5354,18 +5678,27 @@ mod tests {
     /// invariant `Session::clear_prefix_cache` relies on.
     #[test]
     fn test_prefix_cache_reset_zeroes_state() {
-        let mut cache = PrefixCache::new();
-        assert!(cache.prev_entries.is_empty());
-        assert!(cache.breakpoints.is_empty());
+        let mut cache = PrefixCache::new(2);
+        assert!(cache.slots.is_empty());
+        assert_eq!(cache.free_seq_ids, vec![1, 0], "pop yields 0 first");
         assert_eq!(cache.last_reused_cells, 0);
 
-        cache.prev_entries = toks([1, 2, 3]);
-        cache.breakpoints = vec![bp(1, None), bp(2, None)];
+        let now = std::time::Instant::now();
+        let mut slot = PrefixSlot::new(cache.free_seq_ids.pop().unwrap(), now);
+        slot.prev_entries = toks([1, 2, 3]);
+        slot.breakpoints = vec![bp(1, None), bp(2, None)];
+        cache.slots.push(slot);
+        cache.pending = Some(0);
         cache.last_reused_cells = 2;
 
         cache.clear();
-        assert!(cache.prev_entries.is_empty());
-        assert!(cache.breakpoints.is_empty());
+        assert!(cache.slots.is_empty());
+        assert_eq!(
+            cache.free_seq_ids,
+            vec![1, 0],
+            "clear reclaims every seq id"
+        );
+        assert!(cache.pending.is_none());
         assert_eq!(cache.last_reused_cells, 0);
     }
 
@@ -5697,8 +6030,11 @@ mod tests {
             .with_prefix_cache(true);
         // Force some "used" state so we know clear actually zeros.
         if let Some(cache) = session.prefix_cache.as_mut() {
-            cache.prev_entries = toks([1, 2, 3]);
-            cache.breakpoints = vec![bp(1, None), bp(2, None)];
+            let seq = cache.free_seq_ids.pop().unwrap();
+            let mut slot = PrefixSlot::new(seq, std::time::Instant::now());
+            slot.prev_entries = toks([1, 2, 3]);
+            slot.breakpoints = vec![bp(1, None), bp(2, None)];
+            cache.slots.push(slot);
             cache.last_reused_cells = 2;
         }
         session.clear_prefix_cache();
@@ -5706,8 +6042,7 @@ mod tests {
             .prefix_cache
             .as_ref()
             .expect("clear does not drop the cache, only zeros it");
-        assert!(cache.prev_entries.is_empty());
-        assert!(cache.breakpoints.is_empty());
+        assert!(cache.slots.is_empty());
         assert_eq!(cache.last_reused_cells, 0);
     }
 
@@ -6146,13 +6481,14 @@ mod tests {
             session: &crate::Session<crate::LlamaCppBackend>,
         ) -> (usize, usize, [u8; 32]) {
             let cache = session.prefix_cache.as_ref().expect("cache on");
-            let idx = cache
+            let slot = cache.last_slot().expect("a slot should be recorded");
+            let idx = slot
                 .prev_entries
                 .iter()
                 .position(CacheEntry::is_media)
                 .expect("a media entry should be recorded");
-            let before = entries_cell_len(&cache.prev_entries[..idx]);
-            match cache.prev_entries[idx] {
+            let before = entries_cell_len(&slot.prev_entries[..idx]);
+            match slot.prev_entries[idx] {
                 CacheEntry::Media { id, span } => {
                     (before, span.n_tokens as usize, id)
                 }
@@ -6356,8 +6692,9 @@ mod tests {
             let resp = session.complete_response(&p).unwrap();
             assert!(!text_of(&resp).is_empty());
             let cache = session.prefix_cache.as_ref().unwrap();
+            let slot = cache.last_slot().expect("a slot should be recorded");
             let media_count =
-                cache.prev_entries.iter().filter(|e| e.is_media()).count();
+                slot.prev_entries.iter().filter(|e| e.is_media()).count();
             assert_eq!(
                 media_count, 1,
                 "literal marker in content must not become media"
