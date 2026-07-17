@@ -171,6 +171,9 @@ jsonschema = { version = "0.30", default-features = false }
 # Minimal executor for examples that drive misanthropic's async `Tool`
 # trait (`#[tool]` macro dispatch) against the synchronous Session.
 tokio = { version = "1", features = ["rt", "macros"] }
+# Logging for the ported examples' `utils::log_init`.
+env_logger = "0.11"
+log = "0.4"
 # `tests/blallama.rs` drives the blallama binary over HTTP with the
 # real API client. The library dependency above disables default
 # features (no HTTP); tests re-enable the client half.
@@ -178,6 +181,7 @@ misanthropic = { version = "1.0.0-alpha.11", default-features = false, features 
     "partial-eq",
     "client",
     "rustls-tls",
+    "chat",
 ] }
 
 # `doc-scrape-examples = true` opts each example into rustdoc's
