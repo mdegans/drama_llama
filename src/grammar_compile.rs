@@ -91,6 +91,40 @@ pub fn schema_to_gbnf(schema: &Value, rule_name: &str, out: &mut String) {
     emit_schema_rule(schema, rule_name, out, &mut counter, defs);
 }
 
+/// The schema's effective type, seeing through nullability: a bare
+/// `"type": "T"`, or a type array whose non-`"null"` entries collapse
+/// to exactly one `T` — schemars 1.x renders `Option<T>` as
+/// `"type": ["T", "null"]`, and the council's optional-only tool
+/// parameter compiled to a dead-end without this (the tagged-dialect
+/// emitter fell through to a JSON `value` rule inside an XML
+/// parameter; the model's prose was fully masked and the
+/// grammar-exempt EOG won argmax, truncating the call mid-parameter).
+///
+/// Collapsing drops the `null` alternative deliberately: optionality
+/// is expressed at the *property* level (omit the key / the
+/// `arg_rule?` wrapper), and a model that wants `null` omits instead.
+/// The tightened grammar still satisfies the original schema, so the
+/// fuzzer's Class-2 property (grammar output validates against the
+/// schema) holds by construction. Genuine multi-type unions
+/// (`["string", "integer"]`) stay `None` → permissive fallthrough.
+pub(crate) fn effective_type(schema: &Value) -> Option<&str> {
+    match schema.get("type")? {
+        Value::String(s) => Some(s.as_str()),
+        Value::Array(arr) => {
+            if !arr.iter().all(|v| v.is_string()) {
+                return None;
+            }
+            let mut non_null = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| *s != "null");
+            let first = non_null.next()?;
+            non_null.next().is_none().then_some(first)
+        }
+        _ => None,
+    }
+}
+
 fn emit_schema_rule(
     schema: &Value,
     rule_name: &str,
@@ -168,7 +202,7 @@ fn emit_schema_rule(
         return;
     }
 
-    match schema.get("type").and_then(|v| v.as_str()) {
+    match effective_type(schema) {
         Some("object") => {
             emit_object_rule(schema, rule_name, out, counter, defs)
         }
@@ -179,7 +213,7 @@ fn emit_schema_rule(
             // JSON grammar's `number` also permits decimals; reject
             // those for integer fields by referencing `int` directly
             // (defined in JSON_GRAMMAR, no frac/exp trailer).
-            let _ = writeln!(out, "{rule_name} ::= int");
+            let _ = writeln!(out, "{rule_name} ::= integer");
         }
         Some("number") => {
             let _ = writeln!(out, "{rule_name} ::= number");
@@ -516,7 +550,7 @@ fn emit_dict_schema_rule(
         return;
     }
 
-    match schema.get("type").and_then(|v| v.as_str()) {
+    match effective_type(schema) {
         Some("object") => {
             emit_dict_object_rule(schema, rule_name, quote, out, counter, defs)
         }
@@ -524,7 +558,7 @@ fn emit_dict_schema_rule(
             let _ = writeln!(out, "{rule_name} ::= dstring");
         }
         Some("integer") => {
-            let _ = writeln!(out, "{rule_name} ::= int");
+            let _ = writeln!(out, "{rule_name} ::= integer");
         }
         Some("number") => {
             let _ = writeln!(out, "{rule_name} ::= number");
@@ -824,10 +858,19 @@ low_surrogate ::= [dD] [c-fC-F] hex hex
 hex ::= [0-9a-fA-F]
 number ::= int frac? exp?
 int ::= "-"? ( "0" | [1-9] [0-9]* )
+integer ::= "0" | "-"? [1-9] [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]?
 frac ::= "." [0-9]+
 exp ::= [eE] [+\-]? [0-9] [0-9]?
 ws ::= [ \t\n\r]?
 "#;
+// `integer` (used by `type: integer` fields; `int` stays permissive
+// because `number` composes it and must express `-0.5`) forbids `-0`
+// and caps at 18 digits so every grammar-emitted integer fits `i64` —
+// serde_json parses 19+-digit literals (and `-0`) as `f64`, which the
+// schema validator then type-rejects. Both were fuzzer Class-3
+// findings (2026-07-17). Style follows `exp` below: explicit
+// optionals, no `{m,n}` (unsupported by the matcher).
+//
 // `exp` allows 1-2 exponent digits (vs the original `[0-9]+`) so a
 // grammar-emitted number is guaranteed to fit in `f64`'s ±E308 range.
 // 1e99 is the largest representable; in practice tool-arg numbers

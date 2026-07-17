@@ -399,7 +399,12 @@ fn schema_args(tool: &Tool) -> (Vec<(String, Value)>, Vec<(String, Value)>) {
 }
 
 fn schema_is_string(schema: &Value) -> bool {
-    schema.get("type").and_then(|t| t.as_str()) == Some("string")
+    // Sees through nullability: `Option<String>` renders as
+    // `"type": ["string", "null"]` (schemars 1.x) and must take the
+    // raw until-rule path like any other string — the JSON-value
+    // fallthrough inside an XML parameter is a generation dead-end
+    // (see `effective_type`).
+    crate::grammar_compile::effective_type(schema) == Some("string")
         && schema.get("enum").is_none()
 }
 
