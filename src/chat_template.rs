@@ -51,6 +51,8 @@ use minijinja::{
 };
 use serde::Serialize;
 
+use misanthropic::prompt::message::{CacheControl, CacheTtl};
+
 use crate::{
     backend::Model, prompt::Tool, Block, Content, Prompt, Role, Token,
 };
@@ -352,9 +354,9 @@ impl ChatTemplate {
         let text = self.render_with(prompt, opts)?;
         let breakpoints = collect_breakpoints(prompt);
         let mut partials = Vec::with_capacity(breakpoints.len());
-        for bp in breakpoints {
+        for (bp, ttl) in breakpoints {
             match render_partial(self, prompt, opts, bp) {
-                Ok(s) => partials.push((bp, s)),
+                Ok(s) => partials.push((bp, ttl, s)),
                 Err(_e) => {
                     // Drop this breakpoint — same fail-open posture
                     // tokenize_with_breakpoints uses for non-prefix-
@@ -407,9 +409,12 @@ pub struct RenderedWithBreakpoints {
     /// Full render — equivalent to
     /// [`ChatTemplate::render_with`]'s output.
     pub text: String,
-    /// One `(breakpoint, partial render)` pair per breakpoint, in
-    /// canonical order.
-    pub partials: Vec<(PromptBreakpoint, String)>,
+    /// One `(breakpoint, ttl, partial render)` triple per breakpoint,
+    /// in canonical order. The TTL is the marker's `cache_control`
+    /// ephemeral lifetime (5m default, 1h opt-in) — see
+    /// [`collect_breakpoints`] for how a section with several cached
+    /// blocks resolves to one TTL.
+    pub partials: Vec<(PromptBreakpoint, CacheTtl, String)>,
 }
 
 /// Options passed to [`ChatTemplate::render_with`].
@@ -568,36 +573,103 @@ pub enum PromptBreakpoint {
 }
 
 /// Walk `prompt` and return the ordered list of cache breakpoints it
-/// declares. See [`PromptBreakpoint`] for the ordering rule and granularity.
-fn collect_breakpoints(prompt: &Prompt) -> Vec<PromptBreakpoint> {
+/// declares, each with its `cache_control` TTL. See [`PromptBreakpoint`]
+/// for the ordering rule and granularity. Since a breakpoint is
+/// per-*section* (tools / system / message) while markers are
+/// per-*block*, a section with several cached blocks resolves to the
+/// **max** TTL among them — the generous reading: any block asking for
+/// an hour keeps the whole section's prefix alive for an hour.
+fn collect_breakpoints(prompt: &Prompt) -> Vec<(PromptBreakpoint, CacheTtl)> {
     let mut out = Vec::new();
 
-    let tools_cached = prompt
-        .tools
-        .as_ref()
-        .is_some_and(|defs| defs.iter().any(|m| m.is_cached()));
-    if tools_cached {
-        out.push(PromptBreakpoint::AfterTools);
+    let tools_ttl = prompt.tools.as_ref().and_then(|defs| {
+        defs.iter().filter_map(method_cache_ttl).reduce(max_ttl)
+    });
+    if let Some(ttl) = tools_ttl {
+        out.push((PromptBreakpoint::AfterTools, ttl));
     }
 
-    let system_cached =
-        prompt.system.as_ref().is_some_and(|c| content_has_cache(c));
-    if system_cached {
-        out.push(PromptBreakpoint::AfterSystem);
+    let system_ttl = prompt.system.as_ref().and_then(content_cache_ttl);
+    if let Some(ttl) = system_ttl {
+        out.push((PromptBreakpoint::AfterSystem, ttl));
     }
 
     for (i, m) in prompt.messages.iter().enumerate() {
-        if content_has_cache(&m.content) {
-            out.push(PromptBreakpoint::AfterMessage(i));
+        if let Some(ttl) = content_cache_ttl(&m.content) {
+            out.push((PromptBreakpoint::AfterMessage(i), ttl));
         }
     }
 
     out
 }
 
-/// Does any block inside `content` carry a `cache_control` marker?
-fn content_has_cache(content: &Content) -> bool {
-    content.0.iter().any(|b| b.is_cached())
+/// The TTL a `cache_control` marker asks for: the explicit `ttl`, or
+/// five minutes when the marker omits it (Anthropic semantics —
+/// `{type: "ephemeral"}` alone means 5m).
+fn control_ttl(control: &Option<CacheControl>) -> Option<CacheTtl> {
+    control.as_ref().map(|cc| match cc {
+        CacheControl::Ephemeral { ttl } => {
+            ttl.clone().unwrap_or(CacheTtl::FiveMinutes)
+        }
+    })
+}
+
+/// The TTL of `block`'s cache marker, if it carries one. Mirrors the
+/// variant arms of [`Block::is_cached`] — the block kinds that cannot
+/// carry a marker return `None`.
+fn block_cache_ttl(block: &Block) -> Option<CacheTtl> {
+    use misanthropic::tool;
+    match block {
+        Block::Text { cache_control, .. }
+        | Block::Image { cache_control, .. }
+        | Block::Document { cache_control, .. }
+        | Block::ToolUse {
+            call: tool::Use { cache_control, .. },
+        }
+        | Block::ToolResult {
+            result: tool::Result { cache_control, .. },
+        }
+        | Block::ServerToolUse {
+            call: tool::Use { cache_control, .. },
+        } => control_ttl(cache_control),
+        _ => None,
+    }
+}
+
+/// The TTL of a tool definition's cache marker, if any. Server-side
+/// definitions don't expose their `cache_control` upstream (private
+/// accessor), so a marked server def contributes the conservative
+/// 5-minute default.
+fn method_cache_ttl(def: &misanthropic::tool::MethodDef) -> Option<CacheTtl> {
+    use misanthropic::tool::MethodDef;
+    match def {
+        MethodDef::Custom(c) => control_ttl(&c.cache_control),
+        MethodDef::Server(s) => s.is_cached().then_some(CacheTtl::FiveMinutes),
+    }
+}
+
+/// The section-level TTL of `content`: max TTL over its cached blocks,
+/// `None` when no block carries a marker.
+fn content_cache_ttl(content: &Content) -> Option<CacheTtl> {
+    content.0.iter().filter_map(block_cache_ttl).reduce(max_ttl)
+}
+
+/// Wall-clock lifetime of a cache TTL.
+pub(crate) fn ttl_duration(ttl: &CacheTtl) -> std::time::Duration {
+    match ttl {
+        CacheTtl::FiveMinutes => std::time::Duration::from_secs(5 * 60),
+        CacheTtl::OneHour => std::time::Duration::from_secs(60 * 60),
+    }
+}
+
+/// The longer-lived of two TTLs (by [`ttl_duration`] — `CacheTtl`
+/// deliberately has no `Ord` upstream).
+pub(crate) fn max_ttl(a: CacheTtl, b: CacheTtl) -> CacheTtl {
+    if ttl_duration(&b) > ttl_duration(&a) {
+        b
+    } else {
+        a
+    }
 }
 
 /// Render `prompt` truncated at `up_to` with
@@ -676,7 +748,7 @@ pub fn tokenize_with_breakpoints<M: Model>(
 ) -> (Vec<Token>, Vec<usize>) {
     let full_tokens = model.tokenize(&rendered.text, true);
     let mut indices: Vec<usize> = Vec::with_capacity(rendered.partials.len());
-    for (_, partial) in &rendered.partials {
+    for (_, _, partial) in &rendered.partials {
         let partial_tokens = model.tokenize(partial, true);
         if partial_tokens.len() <= full_tokens.len()
             && full_tokens[..partial_tokens.len()] == partial_tokens[..]
@@ -1845,7 +1917,7 @@ mod tests {
     // Phase 2: cache_control breakpoint discovery + partial rendering
     // ----------------------------------------------------------------
 
-    use misanthropic::prompt::message::CacheControl;
+    use misanthropic::prompt::message::{CacheControl, CacheTtl};
     use serde_json::json;
     use std::borrow::Cow;
 
@@ -1886,7 +1958,7 @@ mod tests {
         let prompt = simple_prompt();
         assert_eq!(
             collect_breakpoints(&prompt),
-            Vec::<PromptBreakpoint>::new()
+            Vec::<(PromptBreakpoint, CacheTtl)>::new()
         );
     }
 
@@ -1898,7 +1970,7 @@ mod tests {
         };
         assert_eq!(
             collect_breakpoints(&prompt),
-            vec![PromptBreakpoint::AfterTools]
+            vec![(PromptBreakpoint::AfterTools, CacheTtl::FiveMinutes)]
         );
     }
 
@@ -1928,11 +2000,72 @@ mod tests {
         assert_eq!(
             collect_breakpoints(&prompt),
             vec![
-                PromptBreakpoint::AfterTools,
-                PromptBreakpoint::AfterSystem,
-                PromptBreakpoint::AfterMessage(0),
-                PromptBreakpoint::AfterMessage(2),
+                (PromptBreakpoint::AfterTools, CacheTtl::FiveMinutes),
+                (PromptBreakpoint::AfterSystem, CacheTtl::FiveMinutes),
+                (PromptBreakpoint::AfterMessage(0), CacheTtl::FiveMinutes),
+                (PromptBreakpoint::AfterMessage(2), CacheTtl::FiveMinutes),
             ]
+        );
+    }
+
+    #[test]
+    fn test_collect_breakpoints_section_ttl_is_max() {
+        // Two cached blocks in one system section, 5m and 1h — the
+        // section resolves to the max (1h). A 1h marker on a message
+        // carries through unchanged.
+        let system = Content(vec![
+            Block::Text {
+                text: Cow::Borrowed("You are helpful."),
+                cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
+            },
+            Block::Text {
+                text: Cow::Borrowed("Stay helpful."),
+                cache_control: Some(CacheControl::one_hour()),
+                citations: None,
+            },
+        ]);
+        let msg = Message {
+            role: Role::User,
+            content: Content(vec![Block::Text {
+                text: Cow::Borrowed("hi"),
+                cache_control: Some(CacheControl::one_hour()),
+                citations: None,
+            }]),
+        };
+        let prompt = Prompt {
+            system: Some(system),
+            messages: vec![msg],
+            ..Prompt::default()
+        };
+        assert_eq!(
+            collect_breakpoints(&prompt),
+            vec![
+                (PromptBreakpoint::AfterSystem, CacheTtl::OneHour),
+                (PromptBreakpoint::AfterMessage(0), CacheTtl::OneHour),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_max_ttl_and_duration() {
+        use std::time::Duration;
+        assert_eq!(
+            ttl_duration(&CacheTtl::FiveMinutes),
+            Duration::from_secs(300)
+        );
+        assert_eq!(ttl_duration(&CacheTtl::OneHour), Duration::from_secs(3600));
+        assert_eq!(
+            max_ttl(CacheTtl::FiveMinutes, CacheTtl::OneHour),
+            CacheTtl::OneHour
+        );
+        assert_eq!(
+            max_ttl(CacheTtl::OneHour, CacheTtl::FiveMinutes),
+            CacheTtl::OneHour
+        );
+        assert_eq!(
+            max_ttl(CacheTtl::FiveMinutes, CacheTtl::FiveMinutes),
+            CacheTtl::FiveMinutes
         );
     }
 
@@ -2014,7 +2147,7 @@ mod tests {
             out.text
         );
         assert_eq!(out.partials.len(), 1, "one cache marker → one partial");
-        for (i, (_, p)) in out.partials.iter().enumerate() {
+        for (i, (_, _, p)) in out.partials.iter().enumerate() {
             assert!(
                 !p.ends_with(GEN),
                 "partial {i} must not end with generation prompt: {p:?}"
@@ -2137,7 +2270,7 @@ mod tests {
             1,
             "AfterSystem breakpoint must survive partial rendering"
         );
-        assert!(out.partials[0].1.contains("You are agent."));
+        assert!(out.partials[0].2.contains("You are agent."));
     }
 
     /// Strict env (full render) must continue to surface raises as
@@ -2207,7 +2340,7 @@ mod tests {
 
         // The partial's tokens equal the full's tokens up to `idx`.
         let partial_tokens =
-            engine.model.tokenize(&rendered.partials[0].1, true);
+            engine.model.tokenize(&rendered.partials[0].2, true);
         assert_eq!(partial_tokens.len(), idx);
         assert_eq!(&full_tokens[..idx], partial_tokens.as_slice());
     }

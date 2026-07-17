@@ -77,7 +77,7 @@
 
 use std::{num::NonZeroUsize, path::PathBuf};
 
-use misanthropic::response::Usage;
+use misanthropic::{prompt::message::CacheTtl, response::Usage};
 
 use crate::{
     backend::{Backend, Model},
@@ -442,6 +442,15 @@ struct Breakpoint {
     /// the assistant reply's prose was accumulated live during
     /// generation and must not be re-folded).
     cursor: SeedCursor,
+    /// The `cache_control` ephemeral lifetime this breakpoint was
+    /// marked with (5m default, 1h opt-in), carried from the prompt
+    /// block through [`crate::chat_template`]'s breakpoint discovery.
+    /// The session's private tip inherits the call's longest
+    /// breakpoint TTL (the tip is the *most* valuable anchor; it
+    /// should never outlive-vs-die before the markers that framed it).
+    /// Recorded as of this commit; expiry enforcement lands with the
+    /// multi-slot cache bounds.
+    ttl: CacheTtl,
 }
 
 struct PrefixCache {
@@ -663,22 +672,37 @@ fn assemble_breakpoints(
     breakpoints: Vec<EntryPos>,
     partial_hashes: Vec<[u8; 32]>,
     breakpoint_ids: Vec<PromptBreakpoint>,
+    breakpoint_ttls: Vec<CacheTtl>,
     bp_states: Vec<Option<SamplerState>>,
 ) -> Vec<Breakpoint> {
     debug_assert_eq!(breakpoints.len(), partial_hashes.len());
     debug_assert_eq!(breakpoints.len(), breakpoint_ids.len());
+    debug_assert_eq!(breakpoints.len(), breakpoint_ttls.len());
     debug_assert_eq!(breakpoints.len(), bp_states.len());
     breakpoints
         .into_iter()
         .zip(partial_hashes)
         .zip(breakpoint_ids.into_iter().zip(bp_states))
-        .map(|((at, hash), (id, state))| Breakpoint {
+        .zip(breakpoint_ttls)
+        .map(|(((at, hash), (id, state)), ttl)| Breakpoint {
             at,
             hash: Some(hash),
             state,
             cursor: cursor_of(id),
+            ttl,
         })
         .collect()
+}
+
+/// The TTL the session's private tip inherits: the call's longest
+/// breakpoint TTL (see [`Breakpoint::ttl`]), defaulting to five
+/// minutes on a markerless call.
+fn tip_ttl(breakpoint_ttls: &[CacheTtl]) -> CacheTtl {
+    breakpoint_ttls
+        .iter()
+        .cloned()
+        .reduce(crate::chat_template::max_ttl)
+        .unwrap_or(CacheTtl::FiveMinutes)
 }
 
 /// The auto-tip's fold cursor: the assistant reply (message index
@@ -2461,6 +2485,7 @@ impl<B: Backend> Session<B> {
             breakpoints,
             partial_hashes,
             breakpoint_ids,
+            breakpoint_ttls,
         ) = if self.prefix_cache.is_some() {
             let rendered =
                 self.template.render_with_breakpoints(prompt, &opts)?;
@@ -2472,9 +2497,13 @@ impl<B: Backend> Session<B> {
             // nothing of media).
             let (full_entries, full_ids, _) =
                 self.tokenize_split(&rendered.text, &media)?;
-            let mut triples: Vec<(EntryPos, [u8; 32], PromptBreakpoint)> =
-                Vec::with_capacity(rendered.partials.len());
-            for (bp_id, partial) in &rendered.partials {
+            let mut rows: Vec<(
+                EntryPos,
+                [u8; 32],
+                PromptBreakpoint,
+                CacheTtl,
+            )> = Vec::with_capacity(rendered.partials.len());
+            for (bp_id, ttl, partial) in &rendered.partials {
                 let (p_entries, p_ids, p_hash) =
                     self.tokenize_split(partial, &media)?;
                 // Same fail-open contract as
@@ -2489,27 +2518,37 @@ impl<B: Backend> Session<B> {
                     && p_ids.len() <= full_ids.len()
                     && full_ids[..p_ids.len()] == p_ids[..]
                 {
-                    triples.push((
+                    rows.push((
                         entry_pos_at(&full_entries, p_entries.len()),
                         p_hash,
                         *bp_id,
+                        ttl.clone(),
                     ));
                 }
             }
-            triples.sort_by_key(|(ep, _, _)| ep.entry);
-            triples.dedup_by_key(|(ep, _, _)| ep.entry);
+            rows.sort_by_key(|(ep, _, _, _)| ep.entry);
+            rows.dedup_by_key(|(ep, _, _, _)| ep.entry);
             let breakpoints: Vec<EntryPos> =
-                triples.iter().map(|(ep, _, _)| *ep).collect();
+                rows.iter().map(|(ep, _, _, _)| *ep).collect();
             let hashes: Vec<[u8; 32]> =
-                triples.iter().map(|(_, h, _)| *h).collect();
+                rows.iter().map(|(_, h, _, _)| *h).collect();
             let ids: Vec<PromptBreakpoint> =
-                triples.into_iter().map(|(_, _, id)| id).collect();
-            (rendered.text, full_entries, breakpoints, hashes, ids)
+                rows.iter().map(|(_, _, id, _)| *id).collect();
+            let ttls: Vec<CacheTtl> =
+                rows.into_iter().map(|(_, _, _, ttl)| ttl).collect();
+            (rendered.text, full_entries, breakpoints, hashes, ids, ttls)
         } else {
             // Fast path: single render + tokenize, no partials.
             let rendered = self.template.render_with(prompt, &opts)?;
             let (entries, _, _) = self.tokenize_split(&rendered, &media)?;
-            (rendered, entries, Vec::new(), Vec::new(), Vec::new())
+            (
+                rendered,
+                entries,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
         };
         let pre_opened_reasoning =
             render_ends_with_open_reasoning(&rendered_prompt, &self.dialect);
@@ -2543,6 +2582,7 @@ impl<B: Backend> Session<B> {
             deferred_grammar,
             partial_hashes,
             breakpoint_ids,
+            breakpoint_ttls,
             pre_opened_reasoning,
             rendered_prompt,
             media_by_id: media.media_by_id,
@@ -3150,6 +3190,7 @@ impl<B: Backend> Session<B> {
             deferred_grammar,
             partial_hashes,
             breakpoint_ids,
+            breakpoint_ttls,
             media_by_id,
             ..
         } = self.prepare_call_cached(prompt, true)?;
@@ -3252,6 +3293,7 @@ impl<B: Backend> Session<B> {
             hash: None,
             state: final_state,
             cursor: tip_cursor(prompt),
+            ttl: tip_ttl(&breakpoint_ttls),
         });
         self.record_cache_hit(
             extended_prev,
@@ -3259,6 +3301,7 @@ impl<B: Backend> Session<B> {
                 breakpoints,
                 partial_hashes,
                 breakpoint_ids,
+                breakpoint_ttls,
                 bp_states,
             ),
             cache_read,
@@ -3427,6 +3470,7 @@ impl<B: Backend> Session<B> {
             deferred_grammar,
             partial_hashes,
             breakpoint_ids,
+            breakpoint_ttls,
             pre_opened_reasoning,
             media_by_id,
             ..
@@ -3475,6 +3519,7 @@ impl<B: Backend> Session<B> {
                 breakpoints,
                 partial_hashes,
                 breakpoint_ids,
+                breakpoint_ttls,
                 bp_states,
             ),
             cache_read,
@@ -3550,6 +3595,7 @@ impl<B: Backend> Session<B> {
             deferred_grammar,
             partial_hashes,
             breakpoint_ids,
+            breakpoint_ttls,
             pre_opened_reasoning,
             rendered_prompt,
             media_by_id,
@@ -3804,6 +3850,7 @@ impl<B: Backend> Session<B> {
             hash: tip_hash,
             state: final_state,
             cursor: tip_cursor(prompt),
+            ttl: tip_ttl(&breakpoint_ttls),
         });
         self.record_cache_hit(
             extended_prev,
@@ -3811,6 +3858,7 @@ impl<B: Backend> Session<B> {
                 breakpoints,
                 partial_hashes,
                 breakpoint_ids,
+                breakpoint_ttls,
                 bp_states,
             ),
             cache_read,
@@ -4417,6 +4465,9 @@ struct PreparedCall {
     /// prefix-safety check). Maps a matched breakpoint back to Prompt
     /// structure — the seeding fold's resume cursor.
     breakpoint_ids: Vec<PromptBreakpoint>,
+    /// `cache_control` ephemeral TTL of each surviving breakpoint,
+    /// parallel to `breakpoints` (see [`Breakpoint::ttl`]).
+    breakpoint_ttls: Vec<CacheTtl>,
     /// The rendered generation prompt ends inside an open reasoning
     /// block (Qwen-style pre-opened `<think>\n`): generation starts
     /// mid-thought, and the parser must be told (issue #27).
@@ -4685,6 +4736,7 @@ mod tests {
             hash,
             state: None,
             cursor: SeedCursor::default(),
+            ttl: CacheTtl::FiveMinutes,
         }
     }
 

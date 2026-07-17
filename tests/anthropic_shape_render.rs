@@ -174,7 +174,7 @@ fn render_with_breakpoints_survives_after_system_breakpoint() {
         .expect("render_with_breakpoints must succeed even when AfterSystem partial fails");
     eprintln!("=== full ===\n{}\n=== end ===", rendered.text);
     eprintln!("=== {} partials ===", rendered.partials.len());
-    for (i, p) in rendered.partials.iter().map(|(_, p)| p).enumerate() {
+    for (i, p) in rendered.partials.iter().map(|(_, _, p)| p).enumerate() {
         eprintln!("--- partial {i} ---\n{p}");
     }
     assert!(rendered.text.contains("Hello"));
