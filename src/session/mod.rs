@@ -669,28 +669,42 @@ fn cache_tripwire_armed() -> bool {
 const TRIPWIRE_DRIFT_ENTRIES: usize = 64;
 
 /// The tripwire condition, evaluated only when selection returned
-/// nothing over non-empty slots: is this miss explicable? Two
-/// violation classes:
+/// nothing over non-empty slots: is this miss explicable? A new call
+/// with no breakpoints and no partial hashes short-circuits to `None`
+/// (reuse structurally impossible — see the in-function comment). Two
+/// violation classes past that gate:
 ///
 /// * **hard** — a live slot's first cached breakpoint region is a
 ///   prefix of the new prompt (`lcp >= first_bp.entry`), yet nothing
 ///   was reused: a selection bug, or the caller dropped its
 ///   `cache_control` markers mid-conversation.
 /// * **drift** — a live slot shares ≥ [`TRIPWIRE_DRIFT_ENTRIES`]
-///   entries with the new prompt and still nothing matched: the
+///   entries with the new prompt, the new call marks a breakpoint
+///   *inside* that shared prefix, and still nothing matched: the
 ///   re-render byte-drift failure mode (hash AND breakpoint-clipped
 ///   LCP both defeated).
 ///
-/// Genuine first turns match neither (their history prefixes nothing
-/// beyond boilerplate); TTL/capacity evictions removed their slots
-/// before this check, so they read as expected misses. Returns a
-/// dump-ready report. Pure.
+/// TTL/capacity evictions removed their slots before this check, so
+/// they read as expected misses. Returns a dump-ready report. Pure.
 fn tripwire_violation(
     slots: &[PrefixSlot],
     new_entries: &[CacheEntry],
+    new_breakpoints: &[EntryPos],
     new_breakpoint_hashes: &[[u8; 32]],
 ) -> Option<String> {
     use std::fmt::Write;
+    // A new call with NO breakpoints and no partial hashes cannot
+    // reuse anything — hash matching needs the new call's hashes, and
+    // the LCP path only reuses at the new call's marked positions —
+    // so its miss is structural, never a violation. This is every
+    // seat's first turn under the `Chat` driver (markers land after
+    // seated *assistant* turns), even when seats share a large
+    // tool-schema prefix: the council's four advisors share ~350
+    // entries of identical docket schema, the live false positive
+    // (2026-07-17) that shaped this rule.
+    if new_breakpoints.is_empty() && new_breakpoint_hashes.is_empty() {
+        return None;
+    }
     let mut report = String::new();
     for slot in slots {
         if slot.prev_entries.is_empty() {
@@ -703,7 +717,14 @@ fn tripwire_violation(
             .map(|bp| bp.at.entry)
             .unwrap_or(usize::MAX);
         let hard = lcp >= first_bp;
-        let drift = lcp >= TRIPWIRE_DRIFT_ENTRIES;
+        // Reuse via LCP is only possible at one of the NEW call's
+        // breakpoints (inside the `lcp - 1` BPE-safety margin), so
+        // drift additionally requires one there — shared boilerplate
+        // with no marker inside it is unreusable, not a bug.
+        let reusable_bp = new_breakpoints
+            .iter()
+            .any(|bp| bp.entry > 0 && bp.entry <= lcp.saturating_sub(1));
+        let drift = lcp >= TRIPWIRE_DRIFT_ENTRIES && reusable_bp;
         if !(hard || drift) {
             continue;
         }
@@ -3265,6 +3286,7 @@ impl<B: Backend> Session<B> {
                         if let Some(report) = tripwire_violation(
                             &cache.slots,
                             new_entries,
+                            new_breakpoints,
                             new_breakpoint_hashes,
                         ) {
                             eprintln!("{report}");
@@ -6290,27 +6312,29 @@ mod tests {
     #[test]
     fn test_tripwire_hard_violation_fires() {
         // The slot's first breakpoint region is a prefix of the new
-        // prompt — a zero-selection miss here is a bug.
+        // prompt and the new call carries markers of its own — a
+        // zero-selection miss here is a bug.
         let now = std::time::Instant::now();
         let mut slot = aged_slot(0, 10, 8, now);
         slot.breakpoints = vec![bp(4, None)];
         let new_entries: Vec<CacheEntry> =
             (0..8 as Token).map(CacheEntry::Token).collect();
-        let report =
-            tripwire_violation(&[slot], &new_entries, &[]).expect("fires");
+        let report = tripwire_violation(&[slot], &new_entries, &[ep(6)], &[])
+            .expect("fires");
         assert!(report.contains("HARD"), "{report}");
     }
 
     #[test]
     fn test_tripwire_drift_violation_fires() {
         // No breakpoints on the slot, but a long shared prefix (≥ the
-        // drift threshold) went unreused — re-render drift shape.
+        // drift threshold) with a NEW breakpoint inside it went
+        // unreused — re-render drift shape.
         let now = std::time::Instant::now();
         let slot = aged_slot(0, 10, 100, now);
         let new_entries: Vec<CacheEntry> =
             (0..100 as Token).map(CacheEntry::Token).collect();
-        let report =
-            tripwire_violation(&[slot], &new_entries, &[]).expect("fires");
+        let report = tripwire_violation(&[slot], &new_entries, &[ep(80)], &[])
+            .expect("fires");
         assert!(report.contains("drift"), "{report}");
     }
 
@@ -6325,7 +6349,39 @@ mod tests {
         slot.breakpoints = vec![bp(4, None)];
         let new_entries: Vec<CacheEntry> =
             (0..100 as Token).map(CacheEntry::Token).collect();
-        assert!(tripwire_violation(&[slot], &new_entries, &[]).is_none());
+        assert!(
+            tripwire_violation(&[slot], &new_entries, &[ep(50)], &[]).is_none()
+        );
+    }
+
+    #[test]
+    fn test_tripwire_silent_on_markerless_first_turn() {
+        // The live council false positive (2026-07-17): a seat's first
+        // turn carries NO cache markers (the Chat driver marks after
+        // seated assistant turns) but shares ~350 entries of identical
+        // tool schema with another seat's slot. Reuse is structurally
+        // impossible — no anchors on the new call — so no violation,
+        // however large the shared prefix.
+        let now = std::time::Instant::now();
+        let mut slot = aged_slot(1, 10, 400, now);
+        slot.breakpoints = vec![bp(390, None)];
+        let new_entries: Vec<CacheEntry> =
+            (0..358 as Token).map(CacheEntry::Token).collect();
+        assert!(tripwire_violation(&[slot], &new_entries, &[], &[]).is_none());
+    }
+
+    #[test]
+    fn test_tripwire_silent_on_shared_boilerplate_without_marker() {
+        // Long shared prefix, but the new call's only marker sits
+        // PAST it — nothing reusable inside the shared region, so a
+        // miss is expected, not drift.
+        let now = std::time::Instant::now();
+        let slot = aged_slot(0, 10, 100, now);
+        let mut new_entries: Vec<CacheEntry> =
+            (0..100 as Token).map(CacheEntry::Token).collect();
+        new_entries.extend((500..600 as Token).map(CacheEntry::Token));
+        assert!(tripwire_violation(&[slot], &new_entries, &[ep(150)], &[])
+            .is_none());
     }
 
     #[test]
