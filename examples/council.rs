@@ -339,16 +339,15 @@ struct Bench {
     court: Court,
 }
 
-/// A new case for the council. The question itself is NOT a
-/// parameter: the docket attaches the petitioner's latest message
-/// verbatim — the bench cannot rephrase what it never writes.
+/// A new case for the council. It carries NOTHING: the docket
+/// attaches the petitioner's latest message verbatim — the bench
+/// cannot rephrase what it never writes. (A `note` field existed
+/// briefly; the judge immediately used it to smuggle its paraphrase
+/// back in — "The bench adds: petitioner is deciding between
+/// walking and driving..." — so it went the way of the question
+/// parameter.)
 #[derive(Debug, Deserialize, JsonSchema)]
-struct Case {
-    /// Optional context from the bench, published alongside (never
-    /// instead of) the petitioner's verbatim question. Leave it out
-    /// unless the advisors need something the question doesn't say.
-    note: Option<String>,
-}
+struct Case {}
 
 /// A follow-up round on the open case.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -375,10 +374,7 @@ impl Bench {
     /// message — verbatim, attached by the docket itself — to every
     /// advisor as round 1 (sealed, independent).
     #[method]
-    async fn open_case(&mut self, case: Case) -> Result<Content, Content> {
-        if let Some(note) = case.note.as_deref() {
-            self.court.scan(note).await?;
-        }
+    async fn open_case(&mut self, _case: Case) -> Result<Content, Content> {
         let petition = self
             .court
             .chamber
@@ -427,15 +423,11 @@ impl Bench {
                 .lock()
                 .expect("printer poisoned")
                 .line(format!("⚖ case opened: {petition}"));
-            let bench_note = match case.note.as_deref() {
-                Some(note) => format!("\nThe bench adds: {note}\n"),
-                None => String::new(),
-            };
             format!(
                 "From: the bench\nCase (round 1), the petitioner's \
-                 words verbatim:\n\"{petition}\"\n{bench_note}\nFile \
-                 your independent position with `file`. Filings are \
-                 sealed until all of you have filed.",
+                 words verbatim:\n\"{petition}\"\n\nFile your \
+                 independent position with `file`. Filings are sealed \
+                 until all of you have filed.",
             )
         };
         let chamber = self.court.chamber.lock().expect("chamber poisoned");
@@ -580,10 +572,10 @@ const JUDGE_SYSTEM: &str =
      `engineer` (mechanics and failure modes), `lawyer` (what the \
      stated facts entail). You do not answer questions yourself — open \
      a case with the bench's `open_case`. The docket attaches the \
-     petitioner's latest message verbatim on its own; you may add a \
-     `note` for context but you cannot rewrite the question, and you \
-     should not suggest factors to consider — each advisor brings \
-     their own lens. The advisors file sealed positions, and the \
+     petitioner's latest message verbatim on its own — you cannot \
+     rewrite the question, and you should not suggest factors to \
+     consider: each advisor brings their own lens. Wait for the \
+     published round (it arrives as mail) before calling another. The advisors file sealed positions, and the \
      published round arrives as mail between the human's messages. Then rule: weigh the positions, especially \
      where they disagree — a lone advisor who noticed something \
      concrete outranks three who answered on autopilot. If the \
