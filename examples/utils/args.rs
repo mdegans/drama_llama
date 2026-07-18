@@ -76,6 +76,13 @@ impl CommonArgs {
     /// `LlamaCppSession::from_path_with_cache_slots`). What multi-agent
     /// examples (swarm, council) want: one slot per agent, so agent
     /// switches stop thrashing the prefix cache.
+    ///
+    /// The prefix cache itself is switched **on** here: the library
+    /// constructor only shapes the KV pool (its docs say "combine with
+    /// `with_prefix_cache`"), and forgetting the combine step means
+    /// every call cold-prefills while the payroll shows zero reads and
+    /// the cache tripwire — which lives inside cache selection — can
+    /// never fire. That was the council's zero-cache-reads bug.
     #[cfg(feature = "llama-cpp")]
     pub fn session_with_cache_slots(
         &self,
@@ -85,7 +92,8 @@ impl CommonArgs {
             self.model.clone(),
             self.n_ctx,
             slots,
-        )?;
+        )?
+        .with_prefix_cache(true);
         Ok(self.finish_session(session))
     }
 
