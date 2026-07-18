@@ -110,6 +110,11 @@ where
     /// The blallama-class quirk profile shared by both prompt-type impls:
     /// prefix reuse keys on the end-of-assistant render, and changing
     /// `output_config` does not invalidate the prefix cache.
+    ///
+    /// `cache_stats_unreported` stays `false`, which assumes the
+    /// wrapped session has its prefix cache enabled — the session
+    /// reports both cache counters as `None` when it's off.
+    /// [`Self::new`] enforces the assumption (`with_prefix_cache(true)`).
     fn local_quirks() -> Quirks {
         // `Quirks` is `#[non_exhaustive]`: mutate a default, no literal.
         let mut quirks = Quirks::default();

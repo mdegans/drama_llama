@@ -2632,11 +2632,16 @@ impl<B: Backend> Session<B> {
     /// The [`Usage`] from the most recent `complete_*` call. Zeroed
     /// at [`Session`] construction; overwritten on every call.
     ///
-    /// For local inference, `cache_creation_input_tokens` is always
-    /// `Some(0)` — there's no asymmetric creation-vs-read cost like
-    /// the Anthropic API has. `cache_read_input_tokens` is the number
-    /// of prompt tokens reused from the previous call's KV state, or
-    /// `Some(0)` when caching is disabled or the call missed.
+    /// Cache counters follow the Anthropic field semantics and are
+    /// reported iff the prefix cache is enabled:
+    /// `cache_read_input_tokens` is the prompt tokens restored from a
+    /// cached prefix (`Some(0)` on a cache-on miss / cold call), and
+    /// `cache_creation_input_tokens` is the prompt tokens newly
+    /// decoded into the cache this call (`input − read`; every decoded
+    /// token lands in the slot's tip/breakpoint snapshots). With the
+    /// prefix cache disabled both are `None` — not reported, rather
+    /// than a `Some(0)` indistinguishable from a healthy cold call.
+    /// `input_tokens` is always the full prompt.
     pub fn last_usage(&self) -> &Usage {
         &self.last_usage
     }
@@ -3684,23 +3689,37 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// Build a [`Usage`] for one `complete_*` call. `Option` fields
-    /// are always populated — locally we know both cache counters
-    /// exactly, so recording them explicitly (even as `Some(0)`) is
-    /// more informative than `None` and keeps
-    /// [`Usage::AddAssign`](std::ops::AddAssign) behavior well-
-    /// defined across calls.
+    /// Build a [`Usage`] for one `complete_*` call.
+    ///
+    /// The cache counters follow the Anthropic field semantics and are
+    /// populated **iff the prefix cache is enabled** (`cache_read` is
+    /// `Some`): `cache_read_input_tokens` is the prompt cells restored
+    /// from a slot, and `cache_creation_input_tokens` is the remainder
+    /// — every newly decoded prompt token lands in the slot's tip /
+    /// breakpoint snapshots, so it is a token "used to create the
+    /// cache entry". `input_tokens` stays the **full** prompt (local
+    /// convention; `read + creation == input` when the cache is on —
+    /// switch here if downstream ever needs API-billing-style input).
+    /// With the cache disabled both counters stay `None` ("not
+    /// reported"), which misanthropic's `AddAssign` (`.or(rhs)`)
+    /// accumulates sanely against `Some` calls.
     fn make_usage(
         prompt_tokens: usize,
-        cache_read: usize,
+        cache_read: Option<usize>,
         output_tokens: usize,
     ) -> Usage {
         let mut counts = misanthropic::response::TokenCounts::new(
             prompt_tokens as u64,
             output_tokens as u64,
         );
-        counts.cache_creation_input_tokens = Some(0);
-        counts.cache_read_input_tokens = Some(cache_read as u64);
+        if let Some(cache_read) = cache_read {
+            // A prefix of the same entry list whose full length is
+            // `prompt_tokens`, so underflow is impossible; saturate
+            // anyway rather than wrap on a future bookkeeping bug.
+            counts.cache_creation_input_tokens =
+                Some(prompt_tokens.saturating_sub(cache_read) as u64);
+            counts.cache_read_input_tokens = Some(cache_read as u64);
+        }
         counts.into()
     }
 
@@ -4056,8 +4075,11 @@ impl<B: Backend> Session<B> {
             cache_read,
             tip,
         );
-        let usage =
-            Self::make_usage(prompt_tokens, cache_read, generated_count);
+        let usage = Self::make_usage(
+            prompt_tokens,
+            self.prefix_cache.is_some().then_some(cache_read),
+            generated_count,
+        );
         self.record_usage(usage);
 
         Ok(trimmed)
@@ -4199,9 +4221,10 @@ impl<B: Backend> Session<B> {
     /// Output-token count is not known until the stream is consumed,
     /// so [`Self::last_usage`]'s `output_tokens` is set to 0 for
     /// streaming calls. Input counts (`input_tokens`,
-    /// `cache_read_input_tokens`) are accurate. Callers who need an
-    /// output count should count pieces themselves or use a batch
-    /// entry point.
+    /// `cache_read_input_tokens`, `cache_creation_input_tokens`) are
+    /// accurate — all three are known before the stream starts.
+    /// Callers who need an output count should count pieces themselves
+    /// or use a batch entry point.
     ///
     /// # Errors
     ///
@@ -4274,7 +4297,11 @@ impl<B: Backend> Session<B> {
             cache_read,
             None,
         );
-        let usage = Self::make_usage(prompt_tokens, cache_read, 0);
+        let usage = Self::make_usage(
+            prompt_tokens,
+            self.prefix_cache.is_some().then_some(cache_read),
+            0,
+        );
         self.record_usage(usage);
 
         let eos_pieces = self.eog_pieces();
@@ -4627,9 +4654,12 @@ impl<B: Backend> Session<B> {
             cache_read,
             tip,
         );
-        let usage =
-            Self::make_usage(prompt_tokens, cache_read, generated_count);
-        self.record_usage(usage);
+        let usage = Self::make_usage(
+            prompt_tokens,
+            self.prefix_cache.is_some().then_some(cache_read),
+            generated_count,
+        );
+        self.record_usage(usage.clone());
 
         // A generation that ends while an *eager* constraint is still
         // mid-structure is a violation even when a tool_use parsed —
@@ -4717,9 +4747,7 @@ impl<B: Backend> Session<B> {
 
         Ok(CallOutcome {
             blocks,
-            prompt_tokens,
-            cache_read_tokens: cache_read,
-            generated_tokens: generated_count,
+            usage,
             stop_reason,
             stop_sequence,
         })
@@ -4933,11 +4961,6 @@ impl<B: Backend> Session<B> {
         let outcome = self.run_call(prompt)?;
         let inner: crate::AssistantMessage =
             outcome.blocks.into_iter().collect();
-        let usage = Self::make_usage(
-            outcome.prompt_tokens,
-            outcome.cache_read_tokens,
-            outcome.generated_tokens,
-        );
         let model = self
             .engine
             .model
@@ -4947,7 +4970,7 @@ impl<B: Backend> Session<B> {
             .id(id.to_string())
             .stop_reason(outcome.stop_reason)
             .stop_sequence(outcome.stop_sequence.map(std::borrow::Cow::Owned))
-            .usage(usage)
+            .usage(outcome.usage)
             .build())
     }
 }
@@ -5260,14 +5283,11 @@ struct PreparedCall {
 struct CallOutcome {
     /// Parsed blocks from the completion.
     blocks: Vec<crate::Block>,
-    /// Full prompt token length — input for the
-    /// [`Usage`](misanthropic::response::Usage) `input_tokens` field.
-    prompt_tokens: usize,
-    /// Tokens reused from the prefix cache (0 on miss).
-    cache_read_tokens: usize,
-    /// Tokens emitted by the predictor (pre-trim, pre-stop-string
-    /// truncation). This is the count the model actually generated.
-    generated_tokens: usize,
+    /// The call's [`Usage`] — byte-identical to what
+    /// [`Session::record_usage`] just stored as `last_usage`, so a
+    /// projected `response::Message` provably matches the session's
+    /// own accounting (one build, two homes).
+    usage: Usage,
     /// Inferred [`StopReason`](misanthropic::response::StopReason),
     /// or `None` if ambiguous.
     stop_reason: Option<misanthropic::response::StopReason>,
@@ -6437,13 +6457,93 @@ mod tests {
             Some(0),
             "expired slot must not be reused",
         );
+        assert_eq!(
+            after.usage.cache_creation_input_tokens,
+            Some(after.usage.input_tokens),
+            "an expired-miss call re-creates the whole prompt",
+        );
         // The sweep evicted it wholesale, and the call re-established
         // a fresh slot: an immediate repeat hits again.
         let again = session.complete_response(&prompt).unwrap();
-        assert!(
-            again.usage.cache_read_input_tokens.unwrap_or(0) > 0,
-            "re-established slot must hit",
+        let read = again.usage.cache_read_input_tokens.unwrap_or(0);
+        assert!(read > 0, "re-established slot must hit");
+        assert_eq!(
+            again.usage.cache_creation_input_tokens,
+            Some(again.usage.input_tokens - read),
+            "read + creation must partition the prompt",
         );
+    }
+
+    /// The cache counters over an append-only two-call flow (the
+    /// council/agent shape): cache-on call 1 is cold — read `Some(0)`,
+    /// creation == the whole prompt; call 2 (assistant turn seated,
+    /// new user turn appended, tail marked) must read a nonzero
+    /// prefix, with creation covering exactly the un-reused remainder.
+    /// A cache-OFF session reports both counters as `None`.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_usage_counters_across_append_only_calls() {
+        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+            .unwrap()
+            .quiet()
+            .with_max_tokens(NonZeroUsize::new(16).unwrap())
+            .with_prefix_cache(true);
+        let mut prompt = Prompt::default()
+            .system("You are a helpful assistant. Keep replies short.")
+            .cache()
+            .add_message((crate::Role::User, "Pick a number 1-10."))
+            .unwrap();
+
+        let first = session.complete_response(&prompt).unwrap();
+        assert_eq!(
+            first.usage.cache_read_input_tokens,
+            Some(0),
+            "cold call: reported, zero",
+        );
+        assert_eq!(
+            first.usage.cache_creation_input_tokens,
+            Some(first.usage.input_tokens),
+            "cold call creates the whole prompt",
+        );
+
+        // Append-only continuation: seat the assistant turn, add a
+        // user turn, mark the tail (the council/Chat placement).
+        prompt.messages.push(first.inner.into());
+        prompt
+            .messages
+            .push((crate::Role::User, "Now pick another.").into());
+        prompt.cache_windowed(2);
+
+        let second = session.complete_response(&prompt).unwrap();
+        let read = second.usage.cache_read_input_tokens.unwrap_or(0);
+        // Never assert an exact read count — the lcp-1 BPE safety
+        // margin may shave up to one entry off the reused prefix.
+        assert!(read > 0, "append-only follow-up must hit the cache");
+        assert_eq!(
+            second.usage.cache_creation_input_tokens,
+            Some(second.usage.input_tokens - read),
+            "read + creation must partition the prompt",
+        );
+        assert!(
+            second.usage.cache_creation_input_tokens.unwrap()
+                < second.usage.input_tokens,
+            "follow-up must not re-create the whole prompt",
+        );
+
+        // Cache OFF: honestly not reported.
+        let mut off = crate::LlamaCppSession::from_path_sync(model_path())
+            .unwrap()
+            .quiet()
+            .with_max_tokens(NonZeroUsize::new(16).unwrap());
+        let cold = off
+            .complete_response(
+                &Prompt::default()
+                    .add_message((crate::Role::User, "Pick a number 1-10."))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(cold.usage.cache_read_input_tokens, None);
+        assert_eq!(cold.usage.cache_creation_input_tokens, None);
     }
 
     /// Stop-reason inference: tool use wins over everything. When a
@@ -6537,17 +6637,31 @@ mod tests {
         assert_eq!(u.cache_read_input_tokens, None);
     }
 
-    /// `make_usage` is the function both batch + streaming paths use
-    /// to stamp [`Usage`] values. It must always populate both cache
-    /// counters (even at zero) so `Usage::AddAssign` accumulates
-    /// them across calls instead of hitting the `None.or(Some(rhs))`
-    /// first-value edge case.
+    /// `make_usage` is the one function every `complete_*` path uses
+    /// to stamp [`Usage`] values. With the prefix cache on
+    /// (`cache_read: Some`), both cache counters are populated and
+    /// partition the prompt: `read + creation == input`.
     #[test]
     fn test_make_usage_populates_cache_counters() {
-        let u = Session::<crate::LlamaCppBackend>::make_usage(100, 42, 10);
+        let u =
+            Session::<crate::LlamaCppBackend>::make_usage(100, Some(42), 10);
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.cache_read_input_tokens, Some(42));
-        assert_eq!(u.cache_creation_input_tokens, Some(0));
+        assert_eq!(u.cache_creation_input_tokens, Some(58));
+        assert_eq!(u.output_tokens, 10);
+    }
+
+    /// With the prefix cache disabled (`cache_read: None`), the cache
+    /// counters are honestly *not reported* — `None`, never a
+    /// `Some(0)` indistinguishable from a healthy cold call.
+    /// misanthropic's `AddAssign` (`.or(rhs)`) accumulates mixed
+    /// None/Some calls sanely, so `total_usage` stays correct.
+    #[test]
+    fn test_make_usage_none_when_cache_disabled() {
+        let u = Session::<crate::LlamaCppBackend>::make_usage(100, None, 10);
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.cache_read_input_tokens, None);
+        assert_eq!(u.cache_creation_input_tokens, None);
         assert_eq!(u.output_tokens, 10);
     }
 

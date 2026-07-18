@@ -285,6 +285,27 @@ Three further arcs land on top of the split:
 
 ### Fixed
 
+- **Cache usage counters are honest now** ([#40]).
+  `cache_creation_input_tokens` had been hardcoded `Some(0)` since the
+  original caching commit; it now reports the prompt tokens newly
+  decoded into the cache this call (`input − read`, per the Anthropic
+  field semantics — every decoded token lands in the slot's
+  tip/breakpoint snapshots). With the prefix cache **disabled**, both
+  cache counters are now `None` ("not reported") instead of `Some(0)`,
+  so consumers can finally distinguish cache-off from a healthy cold
+  call. `input_tokens` stays the full prompt. Additionally,
+  `complete_response`'s `Message.usage` is now the *same* `Usage` the
+  session records as `last_usage` (carried through `CallOutcome`)
+  instead of an identical second build.
+- **The constructor-default repetition penalty no longer penalizes
+  specials.** `from_engine` seeded `SamplerConfig::default()` without
+  the specials injection the `with_repetition` / `with_sample_options`
+  setters apply, and the per-call assembly discards
+  `add_model_stops`' injection — so a session that never routed
+  through those setters (no sidecar on disk, sidecar parse error,
+  `from_engine` directly) penalized its own EOG/framing tokens,
+  making every turn less likely to end than the last. Injected at
+  construction now; all paths protected.
 - **Harmony turns died at the end of their reasoning block —
   `eot` is not a stop token.** libllama auto-detects the EOT token
   *by text*, and `"<|end|>"` is on that match list, so gpt-oss's
@@ -573,3 +594,4 @@ flip `DRAMA_LLAMA_DFA_CACHE=0`.
 [#29]: https://github.com/mdegans/drama_llama/issues/29
 [#30]: https://github.com/mdegans/drama_llama/issues/30
 [#31]: https://github.com/mdegans/drama_llama/issues/31
+[#40]: https://github.com/mdegans/drama_llama/issues/40
