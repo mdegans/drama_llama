@@ -848,6 +848,34 @@ pub fn apply_sample_repetition_ngram(
     ignored: &BTreeSet<NGram>,
     freq_map: &mut NGramStats,
 ) -> Result<Candidates, RepetitionError> {
+    apply_sample_repetition_ngram_guarded(
+        candidates,
+        tokens,
+        current_step,
+        opts,
+        ignored,
+        freq_map,
+        None,
+    )
+}
+
+/// [`apply_sample_repetition_ngram`] with an optional free-region guard —
+/// the constrained-region variant. When `guard` is `Some`, a token the
+/// guard reports as *protected* (its bytes advance the grammar out of the
+/// current free region — closing quote, merged `",`/`"}` pieces) is never
+/// penalized, in either surgical or broad mode. Phase 1 recording is
+/// deliberately unguarded: *observing* an exit token in the stats is
+/// harmless; only the logit reduction is exempted. See
+/// [`super::region`] for the walk semantics.
+pub(crate) fn apply_sample_repetition_ngram_guarded(
+    candidates: Candidates,
+    tokens: &[Token],
+    current_step: u64,
+    opts: &RepetitionOptions,
+    ignored: &BTreeSet<NGram>,
+    freq_map: &mut NGramStats,
+    guard: Option<&dyn super::region::RegionGuard>,
+) -> Result<Candidates, RepetitionError> {
     let k = candidates.len();
     let n_vocab = k.get();
     let mut candidates = candidates.sort(Sorted::ById { k });
@@ -953,6 +981,11 @@ pub fn apply_sample_repetition_ngram(
             if target >= n_vocab {
                 continue;
             }
+            // Free-region exemption: never reduce the logit of a token
+            // whose bytes exit the region (constrained pass only).
+            if guard.is_some_and(|g| g.is_protected(target as Token)) {
+                continue;
+            }
 
             let candidate = &mut candidates.data[target];
             let scaled_penalty = penalty_repeat.powf(ngram.len() as f32);
@@ -985,6 +1018,10 @@ pub fn apply_sample_repetition_ngram(
                 Some(token) if (token as usize) < n_vocab => token as usize,
                 _ => continue,
             };
+            // Free-region exemption — see the surgical arm above.
+            if guard.is_some_and(|g| g.is_protected(penalized_token as Token)) {
+                continue;
+            }
 
             let candidate = &mut candidates.data[penalized_token];
             let effective = data.windowed_decayed_count(current_step, decay);
@@ -1059,6 +1096,93 @@ mod invariant_tests {
                     .set_ngram_min_size(nz(min));
                 assert!(b.ngram_min_size() <= b.ngram_max_size());
             }
+        }
+    }
+
+    /// A stub guard protecting one token: that token's logit is
+    /// bit-identical through the guarded pass (both arms), an
+    /// unprotected repeat is penalized, and `guard: None` is
+    /// byte-identical to the public fn.
+    #[test]
+    fn guard_exempts_protected_token() {
+        use crate::sample::region::RegionGuard;
+        use crate::{Candidates, Token, TokenData};
+
+        struct Protect(Token);
+        impl RegionGuard for Protect {
+            fn is_protected(&self, token: Token) -> bool {
+                token == self.0
+            }
+        }
+
+        let dense = |n: usize| {
+            Candidates::from_vec(
+                (0..n)
+                    .map(|id| TokenData {
+                        id: id as i32,
+                        logit: if id == 3 { 2.0 } else { -1.0 },
+                        p: 0.0,
+                    })
+                    .collect(),
+            )
+        };
+
+        for surgical in [false, true] {
+            let opts = RepetitionOptions {
+                penalty_repeat: 1.15,
+                penalty_freq: 0.0,
+                penalty_present: 0.5,
+                ignored_categories: BTreeSet::new(),
+                ngram_min_size: NonZeroU8::new(1).unwrap(),
+                ngram_max_size: NonZeroU8::new(1).unwrap(),
+                surgical,
+                ..RepetitionOptions::default()
+            };
+            let ignored = BTreeSet::new();
+            let tokens: Vec<Token> = vec![3];
+
+            // Two passes: penalty_max_count=1 means the penalty fires
+            // from the second sighting.
+            let run = |guard: Option<&dyn RegionGuard>| {
+                let mut freq = NGramStats::new();
+                let mut logits: Vec<f32> = Vec::new();
+                for step in 0..2u64 {
+                    let out = apply_sample_repetition_ngram_guarded(
+                        dense(10),
+                        &tokens,
+                        step,
+                        &opts,
+                        &ignored,
+                        &mut freq,
+                        guard,
+                    )
+                    .unwrap();
+                    logits = out.iter().map(|c| c.logit).collect();
+                }
+                logits
+            };
+
+            let unguarded = run(None);
+            assert!(
+                unguarded[3] < 2.0,
+                "surgical={surgical}: unguarded repeat must be penalized"
+            );
+
+            let protect = Protect(3);
+            let guarded = run(Some(&protect));
+            assert_eq!(
+                guarded[3], 2.0,
+                "surgical={surgical}: protected token's logit must be \
+                 bit-identical"
+            );
+
+            let other = Protect(7);
+            let guarded_other = run(Some(&other));
+            assert_eq!(
+                guarded_other, unguarded,
+                "surgical={surgical}: guard protecting an untouched token \
+                 must not change anything"
+            );
         }
     }
 

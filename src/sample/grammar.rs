@@ -1057,7 +1057,9 @@ impl StackState {
         self.any_stack_top_intersects(grammar, lo, hi)
     }
 
-    fn feed_byte(
+    // `pub(crate)` for the region guard's uncached walk (see
+    // `sample::region`); everything else goes through `advance_bytes`.
+    pub(crate) fn feed_byte(
         &mut self,
         grammar: &Grammar,
         b: u8,
@@ -1482,8 +1484,9 @@ impl std::fmt::Debug for DfaCache {
 
 /// Env-gated toggle: set `DRAMA_LLAMA_DFA_CACHE=0` to disable the lazy-DFA
 /// cache and fall back to the per-candidate clone-and-walk path. Cached at
-/// first access.
-fn dfa_cache_enabled() -> bool {
+/// first access. `pub(crate)` so `sample::region`'s guard walks take the
+/// same path as `grammar_filter` — the flag must never change streams.
+pub(crate) fn dfa_cache_enabled() -> bool {
     static DFA_ENABLED: OnceLock<bool> = OnceLock::new();
     *DFA_ENABLED.get_or_init(|| {
         std::env::var_os("DRAMA_LLAMA_DFA_CACHE")
