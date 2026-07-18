@@ -40,6 +40,28 @@ so it's additive whenever it happens).
   local grammar forcing is cache-free where Anthropic's isn't). Mike
   is probing contrarian side-effects; swarm.rs also wants a shakedown
   pass under the fixed cache.
+- Council iteration (2026-07-18): **reaction phase — the judge rules
+  last**. The 07:11 run showed the rebuttal flipping two advisors and
+  the concessions being discarded: publication went to all seats at
+  once, the judge's short ruling out-raced the long reactions through
+  the session mutex, late filings bounced off `Phase::Idle`. A ruling
+  is chat prose — ungateable — so the gate is information ordering:
+  rebuttal → one mandatory (free) reaction per advisor → record
+  publishes to the judge ALONE. No seat wakes without a duty (missing
+  record pieces ride the next duty-bearing mail), so post-publish
+  chatter is structurally impossible and rounds cost fewer model
+  turns. Plus: lost seats excused not awaited (`Mailbox::send`
+  failure prunes at delivery; `/nudge` a corpse to excuse it
+  mid-round — the recovery for this run's lawyer death, a live
+  #37→#38 instance), and `Court::scan`'s bounce echo defanged
+  (`‹tool_call›` — the verbatim quote was itself a poison vector).
+  System-role record delivery considered, deferred until misanthropic
+  model `Capabilities` (Qwen template likely lacks mid-conversation
+  system). Landed `6614ffd`; awaiting a live shakedown run. Next arc
+  (Mike's pick): the payroll/cache-reads diagnosis — `cache w` is
+  hardcoded `Some(0)`, `in` double-counts reads, and reads look
+  shallow (tripwire only guards total misses, not hit depth; prime
+  suspect is think-strip breaking tip-hash byte stability).
 
 ## Context for the freeze decision
 
