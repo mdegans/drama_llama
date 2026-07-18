@@ -52,19 +52,35 @@ sections as they resolve (delete-resolved-memos convention).
   assembly is honest (stop_reason/sequence/read real; thinking-token
   details honestly `None`).
 
-## Next session A — confirm/fix any remaining cache miss
+## Next session A — capacity eviction (diagnosed 2026-07-18 ~12:14)
 
-Run the council (Mike's terminal). Expectations with honest stats:
-round-1 filings `w == full prompt, r == 0`; every follow-up `r > 0`
-(assert stays quiet). If the assert fires: suspects are the two
-zero-report paths above, TTL (markers are 1h now — a steward pause
-> 1h fires it spuriously), or a render byte-instability breaking the
-prefix hash (round-trip byte-stability is the cache invariant —
-check `DRAMA_LLAMA_CACHE_TRIPWIRE=1` and the tripwire's drift
-diagnostics once the cache is actually on). Model-backed tests to
-run first: `cargo test --features toml -- --ignored test_make_usage
-test_ttl_expiry_evicts test_usage_counters_across_append_only_calls`.
-When the numbers make sense: remove the temporary council assert.
+The 12:10 run CONFIRMED the fix (writes real, reads hitting — e.g.
+`artist reacted [in: 4389 | w: 3530 | r: 859]`) and then the assert
+caught a real miss: engineer's round-2 filing
+`[in: 9078 | w: 9078 | r: 0]`. **Diagnosis: unified-KV capacity, not
+a cache bug.** At philosopher's round-2 call the resident transcripts
+summed ≈34.8k cells (artist 9,348; philosopher →10,594; engineer
+5,405; lawyer 5,412; jester 4,026) against `--n-ctx 32768`, plus the
+4,096 `check_context_fit` headroom — LRU had to evict, and the
+least-recent slots were jester then engineer; engineer's next call
+honestly re-prefilled in full. Six seats × deep rounds ≈ 6×10k+ cells:
+32k cannot hold round 3.
+
+Session A work:
+- Decide the capacity posture: bigger council default (model limit is
+  1M; Mike: memory is not a concern on this box — 65536+ is cheap),
+  and/or make eviction *visible* in-run (a `log::debug` at the LRU
+  evict site naming the seq, so a miss is attributable without
+  arithmetic — check whether one already exists under --verbose).
+- Make the temporary assert capacity-aware or retire it — its
+  "append-only ⇒ always hit" assumption is wrong under legitimate LRU
+  eviction. It has already earned its keep; don't let it cry wolf.
+- Model-backed tests: `cargo test --features toml -- --ignored
+  test_make_usage test_ttl_expiry_evicts
+  test_usage_counters_across_append_only_calls`.
+- Still-unverified suspects only if a miss survives the capacity
+  math: the two zero-report paths above, >1h steward pause (marker
+  TTL), render byte-drift (tripwire + drift diagnostics).
 
 ## Next session B — free-region repetition penalty (#43)
 
