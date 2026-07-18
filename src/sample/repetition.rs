@@ -103,6 +103,14 @@ pub struct RepetitionOptions {
     /// penalties *do* overlap so if bigrams *and* trigrams are penalized,
     /// "fuck" will also be penalized, and "go" *doubly* so, but not "yourself".
     pub(crate) surgical: bool,
+    /// Apply the penalty inside permissive free regions of an active
+    /// constraint (JSON string bodies, `until()` values) using a
+    /// call-local accumulator, with region-exit tokens exempted by the
+    /// grammar-aware guard (see `sample::region`). Off restores the
+    /// blanket suspension: no penalty at all while any constraint is
+    /// incomplete. Default **on** — this is what breaks small-model
+    /// loops inside always-on tool-call grammars.
+    pub(crate) constrained_regions: bool,
 }
 
 /// Deserialize-only mirror of [`RepetitionOptions`]. The real struct routes its
@@ -131,6 +139,8 @@ struct RepetitionOptionsShadow {
     penalty_present: f32,
     #[serde(default)]
     surgical: bool,
+    #[serde(default = "default_constrained_regions")]
+    constrained_regions: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -160,8 +170,15 @@ impl TryFrom<RepetitionOptionsShadow> for RepetitionOptions {
             penalty_freq: s.penalty_freq,
             penalty_present: s.penalty_present,
             surgical: s.surgical,
+            constrained_regions: s.constrained_regions,
         })
     }
+}
+
+/// Default for the `constrained_regions` gate — on. A sidecar that
+/// predates the field keeps the loop-breaking behavior.
+fn default_constrained_regions() -> bool {
+    true
 }
 
 /// Default window size — long enough to catch genuine paragraph-scale
@@ -218,6 +235,7 @@ impl Default for RepetitionOptions {
             // models that prefer broader penalty pressure can opt out via
             // per-model sidecar.
             surgical: true,
+            constrained_regions: default_constrained_regions(),
         }
     }
 }
@@ -512,6 +530,19 @@ impl RepetitionOptions {
         self
     }
 
+    /// Whether the penalty runs inside permissive free regions of an
+    /// active constraint. See the field docs.
+    pub fn constrained_regions(&self) -> bool {
+        self.constrained_regions
+    }
+
+    /// Enable or disable the constrained-region penalty. Off restores
+    /// the blanket suspension while any constraint is incomplete.
+    pub fn set_constrained_regions(mut self, on: bool) -> Self {
+        self.constrained_regions = on;
+        self
+    }
+
     /// Sliding-window size in generation steps. See field docs.
     pub fn window_size(&self) -> NonZeroU32 {
         self.window_size
@@ -746,6 +777,16 @@ impl RepetitionOptions {
                 "When enabled, only penalize the token that would complete a repeated n-gram pattern. \
                  For example, if \"The New\" was just generated and \"The New York\" has appeared before, \
                  penalize \"York\" specifically. When disabled, all previously-seen tokens are penalized.",
+            );
+
+        // Constrained-region penalty
+        resp |= ui.checkbox(&mut self.constrained_regions, "In free regions of grammars")
+            .on_hover_text_at_pointer(
+                "Apply the penalty inside free-text regions of grammar-constrained output \
+                 (e.g. JSON string bodies) to break repetition loops there. Tokens that close \
+                 the region (closing quote, delimiters) are never penalized, so the grammar \
+                 always stays completable. When disabled, the penalty is fully suspended while \
+                 any grammar is active.",
             );
 
         // Close the immediate-mode one-frame lag: each ngram-size slider's

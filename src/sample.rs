@@ -1011,35 +1011,52 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     state: &mut SamplerState,
     model: &M,
 ) -> Result<Token, SampleError> {
-    // Suspend the repetition penalty while any byte-constraint in the
-    // chain is active and incomplete. Constrained output is
-    // format-bound: the grammar necessarily repeats structural tokens
-    // (`\n`, `</`, tag words — ordinary text tokens, not on the
-    // special-token ignore list), and exiting a permissive region
-    // (raw until() value, JSON string) requires emitting an exact
-    // multi-byte delimiter built from exactly those tokens. With the
-    // penalty live, each repetition crushes the delimiter's logits
-    // further, systematically steering sampled generation away from
-    // the only exit — observed on Qwen3.6 as tool calls thrashing
-    // inside the second parameter value until `max_tokens` (greedy
-    // was immune; its margins dwarf the penalty). Anti-degeneration
-    // heuristics are for free prose; the constraint owns the shape
-    // here. Side effect (accepted, arguably desirable): stats
-    // ingestion lives inside the penalty pass, so tokens emitted
-    // during the constrained span never enter the stats — structural
-    // markers don't seed penalties against later prose. Free-running
-    // spans before a lazy trigger and after completion are penalized
-    // as usual.
-    if !state.constrained_incomplete() {
-        if let Some(repetition) = &opts.repetition {
-            // Split borrow: the pass reads the resolved ignore set and
-            // mutates the stats accumulator — disjoint state fields.
-            let SamplerState {
-                ngram_stats,
-                resolved_ignored,
-                step,
-                ..
-            } = &mut *state;
+    // Repetition penalty, in one of three regimes per token:
+    //
+    // (a) UNCONSTRAINED — the pre-existing pass over the persistent
+    //     prose corpus, unchanged.
+    // (b) CONSTRAINED, all incomplete constraints in a *permissive*
+    //     free region (JSON string body, until() value — see
+    //     `sample::region`) — the penalty runs against a CALL-LOCAL
+    //     accumulator with the region guard exempting every token
+    //     whose bytes exit the region. This is what breaks
+    //     small-model loops inside always-on tool-call grammars: the
+    //     loop tokens accrue penalty while the closing delimiter's
+    //     logit is untouched (and thus relatively boosted).
+    // (c) CONSTRAINED at a *structural* state — full suspension, the
+    //     original rule. Constrained output is format-bound there:
+    //     the grammar necessarily repeats structural tokens (`\n`,
+    //     `</`, tag words), and exiting requires an exact delimiter
+    //     built from exactly those tokens. With the penalty live,
+    //     each repetition crushes the delimiter's logits further,
+    //     systematically steering sampled generation away from the
+    //     only exit — observed on Qwen3.6 as tool calls thrashing
+    //     inside the second parameter value until `max_tokens`
+    //     (greedy was immune; its margins dwarf the penalty).
+    //
+    // Stats ingestion lives inside each pass: constrained-span tokens
+    // never enter the PERSISTENT stats (structural markers must not
+    // seed penalties against later prose, and Session's cold fold
+    // could not re-derive them — seeding excludes tool args). The
+    // call-local accumulator absorbs regime (b) and dies at the call
+    // boundary. Each corpus advances its own step counter only when
+    // its pass executes.
+    if let Some(repetition) = &opts.repetition {
+        let incomplete = state.constrained_incomplete();
+        // Split borrow: the passes read the resolved ignore set and
+        // the matcher positions, and mutate one stats accumulator —
+        // disjoint state fields.
+        let SamplerState {
+            matchers,
+            deferred,
+            ngram_stats,
+            resolved_ignored,
+            step,
+            constrained_ngram_stats,
+            constrained_step,
+            ..
+        } = &mut *state;
+        if !incomplete {
             candidates = apply_sample_repetition_ngram(
                 candidates,
                 tokens,
@@ -1048,9 +1065,29 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                 resolved_ignored,
                 ngram_stats,
             )?;
-            // The prose corpus advances one step per executed pass;
-            // constrained spans (which skip the pass) consume none.
             *step += 1;
+        } else if repetition.constrained_regions() {
+            // `build` returns None at structural states (regime (c))
+            // and pre-checks every incomplete constraint permissive.
+            // Single-threaded point of the step — `intern_base` safe.
+            if let Some(guard) = region::ConstraintGuard::build(
+                &opts.modes,
+                &*matchers,
+                deferred.as_ref(),
+                opts.deferred_grammar.as_ref(),
+                model,
+            ) {
+                candidates = repetition::apply_sample_repetition_ngram_guarded(
+                    candidates,
+                    tokens,
+                    *constrained_step,
+                    repetition,
+                    resolved_ignored,
+                    constrained_ngram_stats,
+                    Some(&guard),
+                )?;
+                *constrained_step += 1;
+            }
         }
     }
 
@@ -1313,12 +1350,19 @@ mod tests {
     /// empty piece (like Qwen's secondary EOS variants decode to).
     struct MockModel;
 
-    const PIECES: &[&str] = &["", "a", "b", "c", "x", "", "a", "b"];
+    // Ids 0–7 are stable (several tests hardcode them); new pieces are
+    // append-only. 8+ serve the constrained-repetition battery: a bare
+    // quote and the merged close `",` — the token shape the bare-char
+    // ignore list can never cover.
+    const PIECES: &[&str] =
+        &["", "a", "b", "c", "x", "", "a", "b", "\"", "\","];
     const EOS: Token = 0;
     const A: Token = 1;
     const B: Token = 2;
     const C: Token = 3;
     const X: Token = 4;
+    const QUOTE: Token = 8;
+    const QUOTE_COMMA: Token = 9;
     /// A reserved-style token whose piece is empty but which is NOT
     /// EOS — the Qwen3.6 shape behind the post-complete budget-burn
     /// loop.
@@ -1355,7 +1399,7 @@ mod tests {
             vec![EOS, EOG_A, EOG_B]
         }
         fn max_token_len(&self) -> usize {
-            1
+            2
         }
         fn tokenize(&self, _input: &str, _special: bool) -> Vec<Token> {
             unimplemented!("not needed by sample_token")
@@ -1380,6 +1424,10 @@ mod tests {
 
     /// `root ::= "ab"` — accepts exactly the string "ab".
     const AB_GRAMMAR: &str = r#"root ::= "ab""#;
+
+    /// A quoted string closed by the merged token `",` — the free-region
+    /// island shape for the constrained-repetition battery.
+    const STR_GRAMMAR: &str = r#"root ::= "\"" [^"]* "\",""#;
 
     fn opts_with_grammar(lazy: bool) -> SamplerConfig {
         SamplerConfig {
@@ -1932,41 +1980,264 @@ mod tests {
         assert_eq!(resumed.constrained_step, 0);
     }
 
-    /// Pre-feature blobs (no constrained fields) deserialize to the
-    /// empty accumulator via `serde(default)` — and a populated
-    /// mid-call snapshot round-trips the new fields bit-exactly.
+    /// A populated mid-call snapshot round-trips the constrained
+    /// fields bit-exactly with canonical bytes. (Blobs from a binary
+    /// predating the fields deserialize via `serde(default)` — worth
+    /// the attribute for upgrade-within-cache-TTL skew, not worth a
+    /// brittle canonical-tail test.)
     #[cfg(feature = "serde")]
     #[test]
-    fn constrained_fields_serde_compat_and_round_trip() {
+    fn constrained_fields_serde_round_trip() {
         let opts = opts_with_grammar(false);
         let mut state = state_for(&opts);
         state.constrained_ngram_stats.add(crate::NGram::from(A), 2);
         state.constrained_step = 3;
 
-        // Populated snapshot round-trips exactly, canonical bytes.
         let blob = serde_json::to_string(&state).unwrap();
         let restored: SamplerState = serde_json::from_str(&blob).unwrap();
         assert_eq!(state, restored);
         assert_eq!(blob, serde_json::to_string(&restored).unwrap());
+    }
 
-        // Old-blob compat: strip the new (trailing) fields by string
-        // surgery — a `serde_json::Value` round trip would mangle the
-        // u128 RNG state (Value has no u128 representation), so the
-        // doctored blob must go straight from string to state. A fresh
-        // state keeps the tail canonical and empty.
-        let fresh = state_for(&opts);
-        let blob = serde_json::to_string(&fresh).unwrap();
-        let tail = ",\"constrained_ngram_stats\":{\"data\":[],\
-                    \"ngram_count\":0,\"token_count\":0},\
-                    \"constrained_step\":0}";
+    // ── Constrained-region repetition battery ────────────────────────
+
+    /// Grammar + greedy, repetition tuned so a unigram loop flips the
+    /// order within a few steps. `on` is the `constrained_regions`
+    /// knob; `lazy` selects the fast path.
+    fn str_opts(on: bool, lazy: bool) -> SamplerConfig {
+        SamplerConfig {
+            modes: vec![
+                SamplingMode::grammar(STR_GRAMMAR)
+                    .expect("test grammar parses"),
+                SamplingMode::Greedy,
+            ],
+            repetition: Some(
+                RepetitionOptions::default()
+                    .set_ignored_categories(std::iter::empty())
+                    .set_penalty_repeat(1.1)
+                    .set_penalty_freq(0.5)
+                    .set_penalty_present(0.5)
+                    .set_constrained_regions(on),
+            ),
+            deferred_grammar: None,
+            lazy_grammar: lazy,
+            ..SamplerConfig::default()
+        }
+    }
+
+    /// Dense candidates over the whole mock vocab (the penalty pass
+    /// indexes `data[token_id]`, so every id must be present), with
+    /// per-id overrides.
+    fn dense(overrides: &[(Token, f32)]) -> Candidates {
+        let mut logits = vec![-20.0f32; PIECES.len()];
+        for &(id, logit) in overrides {
+            logits[id as usize] = logit;
+        }
+        cands(
+            &logits
+                .iter()
+                .enumerate()
+                .map(|(id, &l)| (id as Token, l))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Drive generation from just past the opening quote, greedy, with
+    /// the content token `A` slightly above the merged close `",`.
+    /// Returns (state, generated tokens, completed?).
+    fn drive_string_island(
+        opts: &SamplerConfig,
+        max_steps: usize,
+    ) -> (SamplerState, Vec<Token>, bool) {
+        let mut state = state_for(opts);
+        let mut tokens: Vec<Token> = vec![QUOTE];
+        state.advance(opts, QUOTE, &MockModel);
+        for _ in 0..max_steps {
+            let c = dense(&[(A, 4.0), (QUOTE_COMMA, 3.9)]);
+            let tok =
+                sample_token(&tokens, c, opts, &mut state, &MockModel).unwrap();
+            state.advance(opts, tok, &MockModel);
+            tokens.push(tok);
+            if state.grammar_complete() {
+                return (state, tokens, true);
+            }
+        }
+        (state, tokens, false)
+    }
+
+    /// The headline: with the feature ON, in-region repetition pressure
+    /// flips the greedy order and the merged close `",` is emitted —
+    /// the grammar completes. The call-local accumulator did the work;
+    /// the persistent prose corpus is untouched. Post-completion, the
+    /// persistent pass resumes.
+    #[test]
+    fn constrained_loop_breaks_and_closes() {
+        let opts = str_opts(true, false);
+        let (mut state, tokens, completed) = drive_string_island(&opts, 8);
         assert!(
-            blob.ends_with(tail),
-            "canonical serialization tail changed; update this test: \
-             ...{}",
-            &blob[blob.len().saturating_sub(120)..]
+            completed,
+            "penalty must flip the order and close: {tokens:?}"
         );
-        let old_blob = format!("{}}}", &blob[..blob.len() - tail.len()]);
-        let old: SamplerState = serde_json::from_str(&old_blob).unwrap();
-        assert_eq!(old, fresh, "stripped blob must deserialize to defaults");
+        assert_eq!(*tokens.last().unwrap(), QUOTE_COMMA);
+        assert!(
+            state.constrained_step() > 0,
+            "guarded pass must have executed"
+        );
+        assert_eq!(state.step(), 0, "prose corpus must not advance");
+        assert_eq!(
+            state.ngram_stats(),
+            &crate::NGramStats::default(),
+            "persistent stats must not see constrained tokens"
+        );
+
+        // Post-completion the constraint is complete ⇒ regime (a): the
+        // persistent pass runs again (the complete grammar force-EOSes
+        // the pick, which is irrelevant to the corpus bookkeeping).
+        let _ = sample_token(
+            &tokens,
+            dense(&[(A, 4.0)]),
+            &opts,
+            &mut state,
+            &MockModel,
+        )
+        .unwrap();
+        assert_eq!(state.step(), 1, "prose pass resumes after completion");
+        assert_ne!(state.ngram_stats(), &crate::NGramStats::default());
+    }
+
+    /// Counterfactual pinning the old failure: feature OFF restores the
+    /// blanket suspension — the model loops on `A` for the whole budget
+    /// and the grammar never completes.
+    #[test]
+    fn constrained_loop_off_never_closes() {
+        let opts = str_opts(false, false);
+        let (state, tokens, completed) = drive_string_island(&opts, 8);
+        assert!(!completed, "without the feature the loop must persist");
+        assert!(tokens[1..].iter().all(|&t| t == A), "{tokens:?}");
+        assert_eq!(state.constrained_step(), 0);
+        assert_eq!(
+            state.constrained_ngram_stats(),
+            &crate::NGramStats::default()
+        );
+    }
+
+    /// Lazy/masked parity: greedy streams are identical and both
+    /// complete. (Cross-path bit-equality holds here because greedy
+    /// consumes no RNG.)
+    #[test]
+    fn constrained_loop_lazy_masked_parity() {
+        let (_, masked_tokens, masked_done) =
+            drive_string_island(&str_opts(true, false), 8);
+        let (_, lazy_tokens, lazy_done) =
+            drive_string_island(&str_opts(true, true), 8);
+        assert!(masked_done && lazy_done);
+        assert_eq!(masked_tokens, lazy_tokens);
+    }
+
+    /// The exit token is never penalized: even with heavy hand-seeded
+    /// repetition of `",` in the call-local map, the guard protects it
+    /// and it stays the greedy pick. A content token seeded the same
+    /// way IS penalized — the contrast that proves the guard, not the
+    /// tuning, made the difference.
+    #[test]
+    fn constrained_exit_token_never_penalized() {
+        let opts = str_opts(true, false);
+
+        let seeded = |seed_tok: Token| -> Token {
+            let mut state = state_for(&opts);
+            state.advance(&opts, QUOTE, &MockModel);
+            for s in 0..5 {
+                state
+                    .constrained_ngram_stats
+                    .add(crate::NGram::from(seed_tok), s);
+            }
+            state.constrained_step = 5;
+            // The seeded token on top; a clean rival just below.
+            let c = dense(&[(seed_tok, 4.0), (B, 3.9)]);
+            sample_token(&[QUOTE], c, &opts, &mut state, &MockModel).unwrap()
+        };
+
+        // Protected exit: penalty skipped, stays on top.
+        assert_eq!(seeded(QUOTE_COMMA), QUOTE_COMMA);
+        // Unprotected content: penalized off the top.
+        assert_eq!(seeded(A), B);
+    }
+
+    /// Structural states skip the guarded pass entirely (build returns
+    /// None): counters stay zero and the pick matches the feature-off
+    /// run — exactly the pre-feature suspension.
+    #[test]
+    fn constrained_structural_state_skips() {
+        let run = |on: bool| -> (Token, SamplerState) {
+            let opts = SamplerConfig {
+                modes: vec![
+                    SamplingMode::grammar(AB_GRAMMAR)
+                        .expect("test grammar parses"),
+                    SamplingMode::Greedy,
+                ],
+                repetition: Some(
+                    RepetitionOptions::default()
+                        .set_ignored_categories(std::iter::empty())
+                        .set_constrained_regions(on),
+                ),
+                deferred_grammar: None,
+                lazy_grammar: false,
+                ..SamplerConfig::default()
+            };
+            let mut state = state_for(&opts);
+            let tok = sample_token(
+                &[],
+                dense(&[(A, 4.0), (B, 3.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap();
+            (tok, state)
+        };
+        let (on_tok, on_state) = run(true);
+        let (off_tok, _) = run(false);
+        assert_eq!(on_tok, off_tok);
+        assert_eq!(on_tok, A, "grammar wants 'a' first");
+        assert_eq!(on_state.constrained_step(), 0);
+        assert_eq!(
+            on_state.constrained_ngram_stats(),
+            &crate::NGramStats::default()
+        );
+        assert_eq!(on_state.step(), 0);
+    }
+
+    /// Unconstrained generation is bit-identical with the knob on or
+    /// off — the feature must be invisible outside grammars.
+    #[test]
+    fn unconstrained_stream_unchanged_by_knob() {
+        let run = |on: bool| -> (Vec<Token>, SamplerState) {
+            let opts = SamplerConfig {
+                modes: vec![],
+                repetition: Some(
+                    RepetitionOptions::default()
+                        .set_ignored_categories(std::iter::empty())
+                        .set_constrained_regions(on),
+                ),
+                deferred_grammar: None,
+                lazy_grammar: true,
+                ..SamplerConfig::default()
+            };
+            let mut state = state_for(&opts);
+            let mut tokens: Vec<Token> = Vec::new();
+            for _ in 0..16 {
+                let c = dense(&[(A, 2.0), (B, 1.9), (C, 1.8), (X, 1.7)]);
+                let tok =
+                    sample_token(&tokens, c, &opts, &mut state, &MockModel)
+                        .unwrap();
+                state.advance(&opts, tok, &MockModel);
+                tokens.push(tok);
+            }
+            (tokens, state)
+        };
+        let (on_tokens, on_state) = run(true);
+        let (off_tokens, off_state) = run(false);
+        assert_eq!(on_tokens, off_tokens);
+        assert_eq!(on_state, off_state);
     }
 }
