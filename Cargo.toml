@@ -240,7 +240,7 @@ doc-scrape-examples = true
 
 [[example]]
 name = "council"
-required-features = ["tokio", "repl", "json-schema"]
+required-features = ["repl"]
 doc-scrape-examples = true
 
 [[example]]
