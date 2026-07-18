@@ -57,11 +57,27 @@ so it's additive whenever it happens).
   (`‹tool_call›` — the verbatim quote was itself a poison vector).
   System-role record delivery considered, deferred until misanthropic
   model `Capabilities` (Qwen template likely lacks mid-conversation
-  system). Landed `6614ffd`; awaiting a live shakedown run. Next arc
-  (Mike's pick): the payroll/cache-reads diagnosis — `cache w` is
-  hardcoded `Some(0)`, `in` double-counts reads, and reads look
-  shallow (tripwire only guards total misses, not hit depth; prime
-  suspect is think-strip breaking tip-hash byte stability).
+  system). Landed `6614ffd`. **Run two of the phase (same day) ended
+  with no ruling** — the jester died on its FIRST rebuttal attempt
+  (#37→#38 own-emission chain; never rebutted at all), the round hung
+  in Rebuttal (excusal was delivery/nudge-triggered only), and the
+  artist sparred thirteen bounced rounds with a *hallucinated* jester,
+  reciting the briefing's "I stand by my filing" hint as a mantra.
+  Fixes in `f92e663`: **a dead jester is fatal** (Mike's call —
+  `jester_is_dead`, epitaph + exit(1); advisors stay excusable, now
+  reaped on loop death so no phase waits on a corpse; empty book still
+  publishes with the gap on the record), the Rebuttal bounce names the
+  hallucination outright ("NO rebuttal has been issued yet"), the
+  stand-pat hint is deleted (models don't need an invitation to not
+  fold), and `log_init` now covers `council=debug` — the jester's raw
+  emission was invisible in run two, which is the first thing to look
+  at next run (WHY does it emit a frame marker mid-rebuttal: length
+  truncation at the 1024 cap vs #37 sampling; the log will tell).
+  Next arc (Mike's pick): the payroll/cache-reads diagnosis —
+  `cache w` is hardcoded `Some(0)`, `in` double-counts reads, and
+  reads look shallow (tripwire only guards total misses, not hit
+  depth; prime suspect is think-strip breaking tip-hash byte
+  stability).
 
 ## Context for the freeze decision
 
