@@ -1,6 +1,12 @@
 # Plan of record: repetition penalty inside grammar free regions
 
-**Status: in progress (2026-07-18). Phases 1–5; see task list / commits.**
+**Status: code complete (2026-07-18), Phases 1–5 landed in five commits
+(predicates → guard → state → gate/config → e2e). Fast suite green
+(411). Pending: Mike-run model-backed verification —
+`cargo test --test constrained_repetition -- --ignored --test-threads=1`
+plus the fold-equivalence oracle
+`cargo test --test sampler_state_cache -- --ignored --test-threads=1`,
+and a council smoke.**
 
 ## Problem
 

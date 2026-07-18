@@ -1287,6 +1287,8 @@ mod invariant_tests {
             assert!(!o.surgical());
             assert!(o.ignored().is_empty());
             assert!(o.ignored_categories().is_empty());
+            // Pre-feature sidecars keep the loop-breaking behavior.
+            assert!(o.constrained_regions());
         }
 
         /// The `ignored_stopwords` legacy key still maps onto
