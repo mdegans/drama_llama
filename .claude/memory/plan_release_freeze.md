@@ -79,27 +79,34 @@ so it's additive whenever it happens).
   round returns to you"); fixed in `4315aef` (ACKs confirm and stop —
   tool results are prompts, and an ACK that narrates the future is an
   invitation to simulate it).
-- **Next session (Mike, 2026-07-18): make the corpse impossible, then
-  make any council death a programmer error (panic).** Three links to
-  break, all library-side: (1) #37 region-aware emit ban — frame
-  specials unsampleable inside permissive constraint regions (sketch
-  in `future_work_region_aware_emit_ban.md`); (2) #38 containment —
-  deferred-grammar incomplete-at-end is a typed violation, EOG masked
-  inside an activated constraint unless `completes_with_terminal`,
-  parse-failed frame text never seats silently; (3) the byte-spelled
-  vector (multi-token spellings re-collapsed by `parse_special` at
-  ingest — no sampler ban can stop it), which needs a seat-side or
-  Session-side own-transcript answer and is what upgrades "unlikely"
-  to "impossible". Then council: every ☠ becomes panic — `excuse`,
-  the reaper, and `jester_is_dead` all collapse into "dead seat =
-  bug, crash loud". Design conversation first (per the
-  design-before-execute discipline); frequency data on #38: two seat
-  deaths in two consecutive live runs, different seats.
-  After that: the payroll/cache-reads diagnosis —
+- **Council v2 (2026-07-18 PM, `0c3be5d`): synchronous, host-driven
+  rewrite — guided by `agora/crates/agora-council`.** Runs three and
+  four proved the fight was structural: the protocol is synchronous
+  and the Chat driver's at-will substrate kept producing hallucinated
+  rebuttals (run four's philosopher also hit #27's unforced-path
+  XML-dialect emission, unparsed + truncated). Mike's call: rewrite
+  as the downstream consumer's shape. Host owns every transcript; one
+  forced-tool completion per seat per phase; sealing is call order;
+  the human is petitioner + steward (agora `steward::prompt_action`
+  analog); judge has no tools and rules last in prose. Properties by
+  construction: no hallucinated futures, no wrong-dialect calls
+  (tool_choice-forced grammar, cache-free), **corpse impossible at
+  the example level** (a failed completion appends nothing — any
+  completion error = programmer error, loud nonzero exit; the entire
+  corpse machinery from earlier today deleted with the substrate).
+  1176 → 660 lines, no tokio, `required-features = ["repl"]`.
+  Residual: #37 in-string frame BYTES (grammar-legal) — filings are
+  relay-scanned, hit = loud adjourn; closed for real by the
+  region-aware emit ban.
+- **Library work still queued (releases-blocking as before):** #37
+  region-aware emit ban + #38 containment (other consumers, swarm,
+  and unforced paths still exposed; council v2 removed the pressure
+  but not the defects). Then: the payroll/cache-reads diagnosis —
   `cache w` is hardcoded `Some(0)`, `in` double-counts reads, and
   reads look shallow (tripwire only guards total misses, not hit
   depth; prime suspect is think-strip breaking tip-hash byte
-  stability).
+  stability). Council v2's sequential forced-call shape is a cleaner
+  probe for that diagnosis than v1 was.
 
 ## Context for the freeze decision
 
