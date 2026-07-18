@@ -28,8 +28,13 @@ pub use args::{Args, ChatArgs, CommonArgs};
 pub fn log_init(verbose: bool) {
     let default = if verbose {
         // Example binaries log under their own name; cover the set plus
-        // the crates whose narration is actually wanted.
-        "warn,swarm=debug,python=debug,misanthropic=debug,drama_llama=debug"
+        // the crates whose narration is actually wanted. (Miss one and
+        // its narration silently vanishes: council's `jester ▸` lines
+        // were invisible for the 2026-07-18 run-two postmortem —
+        // exactly the output that would have shown what the dead seat
+        // actually emitted.)
+        "warn,swarm=debug,python=debug,council=debug,misanthropic=debug,\
+         drama_llama=debug"
     } else {
         "warn"
     };

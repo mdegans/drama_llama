@@ -75,12 +75,18 @@
 //!   bounce itself seats as a tool result in the author's prompt, so
 //!   a verbatim quote would be the guard poisoning the very
 //!   transcript it protects.
-//! * **Lost seats are excused, not awaited**: a `Mailbox::send` that
-//!   fails means the seat's `Chat` loop is dead (issues #37/#38 are
-//!   live ways to die). The dead seat is dropped from the round at
-//!   the delivery that discovers it — and `/nudge <seat>` excuses a
-//!   seat that died *after* delivery, advancing the phase if it was
-//!   the last one owed. The council degrades rather than deadlocks.
+//! * **Lost advisors are excused, not awaited — a lost jester is
+//!   fatal**: an advisor whose `Chat` loop dies (issues #37/#38 are
+//!   live ways to die) is excused the moment its loop exits — the
+//!   round advances as if the seat had answered, which matters most
+//!   when the round is WITH the dead seat (run two's dead seat left
+//!   the round hung with no ruling; nothing would ever have
+//!   delivered to it again). Failed deliveries (`Mailbox::send`) and
+//!   `/nudge <seat>` excuse as fallbacks. The jester is the one seat
+//!   the council cannot lose and still be itself — deliberation
+//!   without the adversarial pass is the failure mode this example
+//!   exists to prevent — so a dead jester adjourns the council on
+//!   the spot ([`jester_is_dead`]) rather than quietly degrading it.
 //!
 //! Cache shape: this example is deliberately kind to the multi-slot
 //! prefix cache (one KV sequence per seat, see
@@ -233,6 +239,20 @@ struct Chamber {
     nudged: BTreeSet<String>,
 }
 
+/// A dead jester is fatal, not excusable: every later round would
+/// publish un-rebutted, silently stripping the council of the exact
+/// adversarial guarantee it exists to demonstrate. Better a loud
+/// corpse than a quiet sham. (`std::process::exit`, not `panic!` — a
+/// panic in a worker task is captured by the `JoinSet` and would not
+/// end the run until adjourn, which is the hang this replaces.)
+fn jester_is_dead(printer: &SharedPrinter) -> ! {
+    printer.lock().expect("printer poisoned").line(
+        "the jester is dead; the council cannot deliberate \
+         un-rebutted — adjourning",
+    );
+    std::process::exit(1);
+}
+
 impl Chamber {
     /// The sealed round so far: positions, plus the rebuttal once it
     /// is in. One identical text for every recipient of a broadcast.
@@ -328,12 +348,14 @@ impl Chamber {
         lost
     }
 
-    /// Excuse a lost seat from the round and advance the phase when
-    /// that completes it — the docket never waits on a seat that
-    /// cannot answer. Excusing the jester mid-Rebuttal publishes
-    /// without one; excusing the last awaited advisor seals or
-    /// publishes as if they had filed.
+    /// Excuse a lost **advisor** from the round — mailbox dropped, no
+    /// longer expected — and advance the phase when that completes
+    /// it: the docket never waits on a seat that cannot answer.
+    /// Excusing the last awaited advisor seals or publishes as if
+    /// they had filed. The jester is not excusable: reaching this
+    /// with a dead jester is [`jester_is_dead`] — fatal.
     fn excuse(&mut self, name: &str, printer: &SharedPrinter) {
+        self.registry.remove(name);
         self.expected.remove(name);
         match self.phase {
             Phase::Filing => {
@@ -361,17 +383,16 @@ impl Chamber {
                     self.publish_to_bench(printer);
                 }
             }
-            Phase::Rebuttal if name == JESTER => {
-                self.publish_to_bench(printer);
-            }
+            Phase::Rebuttal if name == JESTER => jester_is_dead(printer),
             _ => {}
         }
     }
 
     /// Every expected position is in: seal the round to the jester
-    /// for the mandatory rebuttal — or, with no jester reachable
-    /// (dead loop or empty book), publish directly to the bench, on
-    /// the record.
+    /// for the mandatory rebuttal. An empty jester book publishes
+    /// directly to the bench with the gap on the record (the human
+    /// declined to fund a rebuttal — recoverable via `/grant`); a
+    /// jester whose seat is *dead* is [`jester_is_dead`] — fatal.
     fn seal_or_publish(&mut self, printer: &SharedPrinter) {
         let jester_ready = self.registry.contains_key(JESTER)
             && self.budgets.get(JESTER).copied().unwrap_or_default() > 0;
@@ -393,18 +414,18 @@ impl Chamber {
             );
             self.phase = Phase::Rebuttal;
             self.nudged.remove(JESTER);
-            if self.broadcast([JESTER], &text).is_empty() {
-                printer.lock().expect("printer poisoned").line(format!(
-                    "⚖ round {} sealed to the jester",
-                    self.round
-                ));
-                return;
+            if !self.broadcast([JESTER], &text).is_empty() {
+                jester_is_dead(printer);
             }
             printer
                 .lock()
                 .expect("printer poisoned")
-                .line(format!("⚖ the {JESTER}'s seat is lost — excused"));
+                .line(format!("⚖ round {} sealed to the jester", self.round));
+            return;
         }
+        // Empty book (never death — that is fatal above): the human
+        // declined to fund a rebuttal, so the round publishes without
+        // one, the gap on the record.
         self.publish_to_bench(printer);
     }
 
@@ -571,10 +592,9 @@ impl Docket {
                  the docket's `file` — filings are SEALED until every \
                  advisor has filed, so round 1 is always your \
                  independent view. The council's jester then rebuts \
-                 the sealed round, and it returns to YOU: file ONE \
-                 reaction with the same `file` — concede what the \
-                 rebuttal proves, defend the rest (\"I stand by my \
-                 filing\" is a valid reaction). Only then does the \
+                 the sealed round, and it returns to YOU as mail: file \
+                 ONE reaction with the same `file` — concede what the \
+                 rebuttal proves, defend the rest. Only then does the \
                  full record — positions, rebuttal, reactions — reach \
                  the bench for the ruling. Positions cost one filing \
                  from your book of {}; reactions are free. If the \
@@ -613,10 +633,18 @@ impl Docket {
         match chamber.phase {
             Phase::Filing => self.file_position(chamber, filing),
             Phase::Reaction => self.file_reaction(chamber, filing),
-            Phase::Rebuttal => Err("not accepted: the sealed round is \
-                                    with the jester. Do nothing — the \
-                                    round returns to you for a \
-                                    reaction once the rebuttal is in."
+            // Names the failure mode outright: run two (2026-07-18)
+            // had an advisor invent a rebuttal from the briefing's
+            // promise of one and spar with it for thirteen rounds —
+            // the softer "the round is with the jester" read as
+            // confirmation the jester had spoken.
+            Phase::Rebuttal => Err("not accepted: the round is sealed \
+                                    with the jester and NO rebuttal \
+                                    has been issued yet — if you are \
+                                    reacting to one, you imagined it. \
+                                    Do nothing; the rebuttal arrives \
+                                    as mail when the round returns to \
+                                    you for reactions."
                 .into()),
             Phase::Idle => Err("not accepted: this round is already \
                                 published to the bench. Do nothing \
@@ -764,9 +792,9 @@ impl Docket {
             "{}\nThe round is back with you, sealed — the bench has \
              seen nothing yet. File ONE reaction with `file` (it \
              costs no filing): concede what the rebuttal proves, \
-             defend what it does not. \"I stand by my filing\" is a \
-             valid reaction. The full record — positions, rebuttal, \
-             reactions — then publishes to the bench for the ruling.",
+             defend what it does not. The full record — positions, \
+             rebuttal, reactions — then publishes to the bench for \
+             the ruling.",
             chamber.publication(),
         );
         let expected: Vec<String> = chamber.expected.iter().cloned().collect();
@@ -1211,6 +1239,7 @@ async fn main() -> Result<(), BoxError> {
         let printer = Arc::clone(&printer);
         let usage = Arc::clone(&payroll[name]);
         let chamber_nudge = Arc::clone(&chamber);
+        let chamber_reaper = Arc::clone(&chamber);
         let mut done = quit.subscribe();
         council.spawn(async move {
             let outcome =
@@ -1262,6 +1291,19 @@ async fn main() -> Result<(), BoxError> {
                     .lock()
                     .expect("printer poisoned")
                     .line(format!("☠ {name}: {error}"));
+                if name == JESTER {
+                    jester_is_dead(&printer);
+                }
+                // A dead advisor's loop can never file: excuse the
+                // seat the moment it dies, so no phase waits on it.
+                // Discovery at delivery / via `/nudge` still covers
+                // the rest, but a seat that dies while the round is
+                // WITH it is reachable by neither — run two's round
+                // hung with no ruling exactly that way.
+                chamber_reaper
+                    .lock()
+                    .expect("chamber poisoned")
+                    .excuse(name, &printer);
             }
         });
     }
