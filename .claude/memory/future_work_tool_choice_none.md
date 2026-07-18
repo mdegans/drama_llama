@@ -26,9 +26,14 @@ until the session honors it.
    at emission — same machinery as `emit_ban_set` /
    `SampleOptions::banned_specials`, or a grammar that excludes the
    call production. Fits the #30 dialect arc.
-2. Example: add a `--no-tool-use` flag to `chat` setting
-   `tool_choice = Some(ToolChoice::None)` (Mike: a *separate* flag,
-   not a change to `--clear-tools`).
+2. Example: add a `--tool-choice <auto|any|none|method:NAME>` flag to
+   `chat`, overriding whatever the loaded prompt carries (Mike
+   2026-07-18: generalize past `--no-tool-use`; separate from
+   `--clear-tools`). The `auto`/`any`/`method:` arms work today —
+   un-forcing a council seat is immediately useful — and the `none`
+   arm is #44's acceptance test: reseat a seat with
+   `--tool-choice none`, ask it to try calling its tool, and verify
+   no call is emittable while the defs stay rendered.
 
 Until then the `chat` example's catch-and-receipt path handles stray
 calls gracefully, so nothing is broken — just not forbiddable.
