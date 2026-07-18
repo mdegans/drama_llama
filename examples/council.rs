@@ -21,6 +21,19 @@
 //! **Try the trick question**: *"The car wash is only 100m away from my house.
 //! Should I walk or drive?"* (The expected answer is that the purpose of the
 //! trip is probably to wash the car, so the car must be driven there.)
+//!
+//! ## Exit interviews
+//!
+//! Pass `--dump [DIR]` (default `council_prompts/`) and adjournment writes
+//! each seat's complete prompt — persona, tools, every mail and filing — to
+//! `<DIR>/<seat>.json`. Reseat one with the `chat` example to interview the
+//! agent about the run: what was clear, what wasn't, why it ruled the way
+//! it did.
+//!
+//! ```sh
+//! cargo run --example chat --features tokio,repl -- \
+//!     --load council_prompts/jester.json --clear-tools
+//! ```
 
 mod utils;
 
@@ -56,6 +69,11 @@ const FILE_TOOL: &str = "file";
 struct Cli {
     #[command(flatten)]
     common: utils::CommonArgs,
+    /// On adjournment, dump each seat's complete prompt to
+    /// `<DIR>/<seat>.json` — load one with `--example chat --load` to
+    /// interview the seat about the run.
+    #[arg(long, num_args = 0..=1, default_missing_value = "council_prompts")]
+    dump: Option<std::path::PathBuf>,
 }
 
 /// A filed entry: position, rebuttal, or reaction — the phase is
@@ -634,6 +652,19 @@ fn main() -> Result<(), BoxError> {
         total += seat.usage;
     }
     println!("{:<12} {}", "total", pay_line(&total));
+
+    // ── The archive: each seat's transcript, for the interview ───
+    // The dumped prompt is the seat's complete state — persona, tool,
+    // forced choice, every mail and filing. `--example chat --load`
+    // reseats it, so you can ask a seat *why* after the fact.
+    if let Some(dir) = &cli.dump {
+        std::fs::create_dir_all(dir)?;
+        for seat in advisors.iter().chain([&jester, &judge]) {
+            let path = dir.join(format!("{}.json", seat.name));
+            std::fs::write(&path, serde_json::to_string_pretty(&seat.prompt)?)?;
+        }
+        println!("⚖ transcripts archived to {}/", dir.display());
+    }
     println!("the council is adjourned");
     Ok(())
 }
