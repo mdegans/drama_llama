@@ -28,7 +28,7 @@ mod utils;
 
 use std::collections::BTreeMap;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use drama_llama::LlamaCppSession;
 use misanthropic::{
     prompt::message::{CacheControl, Role},
@@ -274,23 +274,47 @@ fn defang(piece: &str) -> String {
     }
 }
 
+/// TEMPORARY diagnostic (cache-reads investigation): every completion
+/// after a seat's first must resume from its slot's cached prefix —
+/// the transcript is append-only and the tail carries 1-hour markers,
+/// so a zero cache-read is exactly the miss the tripwire should have
+/// caught. Panic loudly with the counts so the failing turn is
+/// attributable. Remove once the payroll numbers make sense.
+fn assert_cache_hit(seat: &Seat, counts: &TokenCounts, first: bool) {
+    if first {
+        return;
+    }
+    assert!(
+        counts.cache_read_input_tokens.unwrap_or(0) > 0,
+        "☠ {}: no prefix-cache read on a follow-up call ({})",
+        seat.name,
+        pay_line(counts),
+    );
+}
+
 /// One forced completion for a filing seat: mail in, [`Filing`] plus
-/// the turn's output-token count out. The transcript gains the
-/// assistant turn ONLY on full success — on any error nothing
-/// model-authored is ever seated, so a failed call cannot poison the
-/// seat. Errors carry the seat name; the caller bails (any completion
-/// failure is a programmer error, not a council event).
+/// the turn's [`TokenCounts`] out. The transcript gains the assistant
+/// turn ONLY on full success — on any error nothing model-authored is
+/// ever seated, so a failed call cannot poison the seat. Errors carry
+/// the seat name; the caller bails (any completion failure is a
+/// programmer error, not a council event).
 fn file_call(
     session: &mut LlamaCppSession,
     seat: &mut Seat,
     mail: String,
-) -> Result<(Filing, u64), BoxError> {
+) -> Result<(Filing, TokenCounts), BoxError> {
+    let first_call = !seat
+        .prompt
+        .messages
+        .iter()
+        .any(|m| m.role == Role::Assistant);
     seat.prompt.messages.push((Role::User, mail).into());
     let message = session
         .complete_response(&seat.prompt)
         .map_err(|e| format!("☠ {}: {e}", seat.name))?;
-    let out_tokens = message.usage.counts.output_tokens;
-    seat.usage += message.usage.counts;
+    let counts = message.usage.counts;
+    assert_cache_hit(seat, &counts, first_call);
+    seat.usage += counts;
     log::debug!("{} ▸ {message}", seat.name);
     let call = message.tool_use().ok_or_else(|| {
         // Unreachable on the forced path (the session reports a
@@ -327,30 +351,36 @@ fn file_call(
     // turns, easily past the 5-minute sweep — which would drop its
     // snapshots and re-prefill the whole transcript every phase.
     seat.prompt.cache_windowed_with(2, CacheControl::one_hour());
-    Ok((filing, out_tokens))
+    Ok((filing, counts))
 }
 
 /// The judge's completion: mail in, prose ruling (plus the turn's
-/// output-token count) out. Same append-only, success-only transcript
+/// [`TokenCounts`]) out. Same append-only, success-only transcript
 /// discipline as [`file_call`].
 fn rule_call(
     session: &mut LlamaCppSession,
     judge: &mut Seat,
     mail: String,
-) -> Result<(String, u64), BoxError> {
+) -> Result<(String, TokenCounts), BoxError> {
+    let first_call = !judge
+        .prompt
+        .messages
+        .iter()
+        .any(|m| m.role == Role::Assistant);
     judge.prompt.messages.push((Role::User, mail).into());
     let message = session
         .complete_response(&judge.prompt)
         .map_err(|e| format!("☠ {}: {e}", judge.name))?;
-    let out_tokens = message.usage.counts.output_tokens;
-    judge.usage += message.usage.counts;
+    let counts = message.usage.counts;
+    assert_cache_hit(judge, &counts, first_call);
+    judge.usage += counts;
     let ruling = message.to_string();
     judge.prompt.messages.push(message.inner.into());
     // One-hour tail window; see `file_call` for why not ephemeral.
     judge
         .prompt
         .cache_windowed_with(2, CacheControl::one_hour());
-    Ok((ruling, out_tokens))
+    Ok((ruling, counts))
 }
 
 /// The positions of a round, rendered in stable order — identical
@@ -417,14 +447,18 @@ fn scan_human(session: &LlamaCppSession, text: &str) -> Result<(), String> {
 }
 
 fn main() -> Result<(), BoxError> {
-    let mut cli = Cli::parse();
+    // `--n-ctx` is the whole unified KV budget across all six slots;
+    // the shared 8192 example default starved multi-round cases, so
+    // this example quadruples it. `mut_arg` (not a post-parse patch)
+    // so `--help` prints the default that will actually be used.
+    let cli = Cli::from_arg_matches(
+        &Cli::command()
+            .mut_arg("n_ctx", |a| a.default_value("32768"))
+            .get_matches(),
+    )?;
     utils::log_init(cli.common.verbose);
 
-    // One model, one session, one cache slot per seat. `--n-ctx` is
-    // the whole unified KV budget across all six slots; the shared
-    // 8192 example default starved multi-round cases, so seed 4× it
-    // (an explicit `--n-ctx` still wins).
-    cli.common.n_ctx.get_or_insert(32768);
+    // One model, one session, one cache slot per seat.
     let seats = ADVISORS.len() as u32 + 2; // advisors + jester + judge
     let mut session = cli.common.session_with_cache_slots(seats)?;
     if cli.common.max_tokens.is_none() {
@@ -505,11 +539,13 @@ fn main() -> Result<(), BoxError> {
             };
             let mut filings: BTreeMap<&'static str, String> = BTreeMap::new();
             for seat in advisors.iter_mut() {
-                let (filing, n_out) =
+                let (filing, counts) =
                     file_call(&mut session, seat, notice.clone())?;
                 println!(
-                    "{} ⚖ filed [{n_out} tok] — {}",
-                    seat.name, filing.verdict
+                    "{} ⚖ filed [{}] — {}",
+                    seat.name,
+                    pay_line(&counts),
+                    filing.verdict
                 );
                 filings.insert(seat.name, filing.into_record());
             }
@@ -529,9 +565,11 @@ fn main() -> Result<(), BoxError> {
                  (or the strongest position if they split), premises \
                  first, even if you privately agree.",
             );
-            let (rebuttal, n_out) = file_call(&mut session, &mut jester, seal)?;
+            let (rebuttal, counts) =
+                file_call(&mut session, &mut jester, seal)?;
             println!(
-                "{JESTER} ⚖ rebutted [{n_out} tok] — {}",
+                "{JESTER} ⚖ rebutted [{}] — {}",
+                pay_line(&counts),
                 rebuttal.verdict
             );
             let rebuttal = rebuttal.into_record();
@@ -546,11 +584,13 @@ fn main() -> Result<(), BoxError> {
             );
             let mut reactions: BTreeMap<&'static str, String> = BTreeMap::new();
             for seat in advisors.iter_mut() {
-                let (reaction, n_out) =
+                let (reaction, counts) =
                     file_call(&mut session, seat, react_mail.clone())?;
                 println!(
-                    "{} ⚖ reacted [{n_out} tok] — {}",
-                    seat.name, reaction.verdict
+                    "{} ⚖ reacted [{}] — {}",
+                    seat.name,
+                    pay_line(&counts),
+                    reaction.verdict
                 );
                 reactions.insert(seat.name, reaction.into_record());
             }
@@ -591,12 +631,12 @@ fn main() -> Result<(), BoxError> {
         }
 
         // ── The ruling: the judge sees the record LAST ───────────
-        let (ruling, n_out) = rule_call(
+        let (ruling, counts) = rule_call(
             &mut session,
             &mut judge,
             record_text(&petition, &rounds),
         )?;
-        println!("\njudge [{n_out} tok] ▸ {ruling}\n");
+        println!("\njudge [{}] ▸ {ruling}\n", pay_line(&counts));
     }
 
     // ── The payroll ──────────────────────────────────────────────
