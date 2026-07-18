@@ -66,20 +66,13 @@ struct Cli {
 /// alphabetically, so `analysis` is physically written before
 /// `verdict` — the model must work the problem before it is allowed
 /// to conclude (reason-first, enforced by structure).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, derive_more::Display)]
+#[display("{}\n\n**Verdict:** {}", self.analysis, self.verdict)]
 struct Filing {
     /// Work the case through your lens FIRST, in full.
     analysis: String,
     /// The conclusion, stated only after the analysis.
     verdict: String,
-}
-
-impl Filing {
-    /// The record entry: analysis first, verdict flagged for the
-    /// judge's (and the human's) scanning eye.
-    fn into_record(self) -> String {
-        format!("{}\n\n**Verdict:** {}", self.analysis, self.verdict)
-    }
 }
 
 /// The tool definition every non-judge seat carries. The schema is
@@ -516,9 +509,7 @@ fn main() -> Result<(), BoxError> {
         loop {
             let n = rounds.len() as u32 + 1;
 
-            // ── Sealed filings ───────────────────────────────────
-            // Sealing is call order: nothing an advisor has not been
-            // mailed exists, as far as their prompt is concerned.
+            // The council deliberates alone with sealed filings
             let notice = match (&instruction, rounds.last()) {
                 (Some(instruction), Some(prev)) => format!(
                     "From: the bench\nCase (verbatim): \
@@ -545,10 +536,10 @@ fn main() -> Result<(), BoxError> {
                     pay_line(&counts),
                     filing.verdict
                 );
-                filings.insert(seat.name, filing.into_record());
+                filings.insert(seat.name, filing.to_string());
             }
 
-            // ── The rebuttal ─────────────────────────────────────
+            // The contrarian Jester responds
             let mut seal = positions_text(&petition, n, &filings);
             if let Some(prev) = rounds.last() {
                 seal.push_str(&format!(
@@ -570,9 +561,8 @@ fn main() -> Result<(), BoxError> {
                 pay_line(&counts),
                 rebuttal.verdict
             );
-            let rebuttal = rebuttal.into_record();
 
-            // ── Reactions ────────────────────────────────────────
+            // The council integrates the rebuttal
             let react_mail = format!(
                 "{}\n## {JESTER} (rebuttal)\n{rebuttal}\n\nThe round \
                  is back with you, sealed — the bench has seen \
@@ -590,17 +580,16 @@ fn main() -> Result<(), BoxError> {
                     pay_line(&counts),
                     reaction.verdict
                 );
-                reactions.insert(seat.name, reaction.into_record());
+                reactions.insert(seat.name, reaction.to_string());
             }
 
             rounds.push(Round {
                 filings,
-                rebuttal,
+                rebuttal: rebuttal.to_string(),
                 reactions,
             });
 
-            // ── The steward beat ─────────────────────────────────
-            // (agora-council's `steward::prompt_action` analog.)
+            // Additional human input here if needed
             instruction = loop {
                 let line = match editor.readline(
                     "⚖ enter = send to the judge | instruction = \
