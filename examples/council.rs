@@ -480,9 +480,12 @@ fn main() -> Result<(), BoxError> {
     let mut session = cli.common.session_with_cache_slots(seats)?;
     if cli.common.max_tokens.is_none() {
         // Filings and rulings are long-form; the session default cap
-        // truncated a judge mid-ruling in an early live run.
+        // truncated a judge mid-ruling in an early live run, and 1024
+        // truncated a jester rebuttal ~90% of the way through its
+        // analysis (run five) — on the forced path that is a typed
+        // GrammarViolation and adjourns the council.
         session = session.with_max_tokens(
-            std::num::NonZeroUsize::new(1024).expect("nonzero"),
+            std::num::NonZeroUsize::new(2048).expect("nonzero"),
         );
     }
 
