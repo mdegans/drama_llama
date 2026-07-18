@@ -2033,6 +2033,20 @@ impl<B: Backend> Session<B> {
             last_usage: Usage::default(),
             total_usage: Usage::default(),
         };
+        // The default config ships with the repetition penalty on, so
+        // the specials protection [`Self::with_repetition`] /
+        // [`Self::with_sample_options`] apply on replacement must also
+        // cover the constructor default: a session that never routes
+        // through those setters (no sidecar on disk, sidecar parse
+        // error, `from_engine` directly) would otherwise penalize the
+        // model's own EOG/framing tokens — every turn runs longer than
+        // the last because ending it keeps getting less likely.
+        // (`predict_options_for` clones this config verbatim; the
+        // injection `add_model_stops` does on a default PredictOptions
+        // is discarded there, so it cannot be the safety net.)
+        if let Some(rep) = session.sample_options.repetition.as_mut() {
+            rep.extend_ignored(session.engine.model.special_tokens());
+        }
         session.refresh_emit_ban();
         Ok(session)
     }
@@ -6764,6 +6778,41 @@ mod tests {
         // Sanity check that the sweep isn't silently returning only a
         // couple — actual count varies by model.
         println!("special_tokens count = {}", specials.len());
+    }
+
+    /// The CONSTRUCTOR default must be protected too, not only the
+    /// `with_*` setters: `from_engine` seeds `SamplerConfig::default()`
+    /// with repetition ON, and `predict_options_for` clones the
+    /// session's config verbatim (discarding the injection
+    /// `add_model_stops` performs on a default `PredictOptions`). A
+    /// session that never routes through `with_repetition` /
+    /// `with_sample_options` — no sidecar on disk, sidecar parse
+    /// error, or `from_engine` directly — must still never penalize
+    /// the model's specials.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_from_engine_default_ignores_special_tokens() {
+        let engine = crate::LlamaCppEngine::from_path(model_path()).unwrap();
+        let session =
+            crate::LlamaCppSession::from_engine(engine).unwrap().quiet();
+        let rep = session
+            .sample_options
+            .repetition
+            .as_ref()
+            .expect("repetition on by default");
+        let ignored = rep.ignored();
+        let eos = session.engine.model.eos();
+        assert!(
+            ignored.contains(&crate::NGram::from(eos)),
+            "EOS ({eos}) must be ignored by the constructor default",
+        );
+        for &t in &session.engine.model.special_tokens() {
+            assert!(
+                ignored.contains(&crate::NGram::from(t)),
+                "special token {t} must be ignored by the constructor \
+                 default",
+            );
+        }
     }
 
     #[test]
