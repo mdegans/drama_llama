@@ -35,7 +35,7 @@ model support planned (but "you never know").
       streaming-API ones are expected to fail until issue #26
       (stream `misanthropic::stream::Event`) lands in 0.9. Don't
       chase streaming failures — they're known-out-of-scope.
-- [ ] Examples sweep: strawberry, chat_repl, grammar_fuzz,
+- [ ] Examples sweep: strawberry, chat (né chat_repl), grammar_fuzz,
       dump_template, inspect_prompt (`just example NAME` runs each with
       the right features + target dir). `whodunit` ran green — but took
       ~15 min, see the perf note below.

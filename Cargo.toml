@@ -257,8 +257,8 @@ required-features = ["cli"]
 doc-scrape-examples = true
 
 [[example]]
-name = "chat_repl"
-required-features = ["repl"]
+name = "chat"
+required-features = ["tokio", "repl"]
 doc-scrape-examples = true
 
 [[example]]
@@ -304,8 +304,8 @@ required-features = ["moeflux-model-qwen3-6-35b-a3b"]
 
 [package.metadata.docs.rs]
 # `cuda` will break the build on platforms without it, and it doesn't change the
-# docs anyway. `repl` is included so chat_repl participates in example
-# scraping.
+# docs anyway. `tokio` and `repl` are included so the chat-loop examples
+# (chat, council, swarm, …) participate in example scraping.
 features = [
     "webchat",
     "cli",
@@ -315,6 +315,7 @@ features = [
     "egui",
     "json-schema",
     "repl",
+    "tokio",
     # `mtmd` implies `media`; extends the docs.rs C build with libmtmd.
     # If docs.rs ever times out on it, drop to "media" (pure Rust) and
     # lose only the `Mtmd` page.

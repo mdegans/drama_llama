@@ -17,3 +17,6 @@ model.sampling.toml
 screenshots/
 .claude/docs/*.pdf
 .DS_Store
+
+# Default output dir of `council --dump` (exit-interview transcripts)
+/council_prompts/

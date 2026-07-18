@@ -220,6 +220,16 @@ Three further arcs land on top of the split:
   `Session::with_emit_specials_ban(false)` for e.g. Qwen-VL
   grounding markers). Falls back to a resample when the ban would
   empty the set.
+- **Exit interviews for agents** — the `council` example grew
+  `--dump [DIR]`, archiving each seat's complete prompt to
+  `<DIR>/<seat>.json` on adjournment, and the `chat_repl` example
+  became `chat`: `--load` reseats a dumped prompt so you can
+  interview the agent about the run. Loaded tools are kept verbatim
+  (their schemas are debug context); every tool call is printed but
+  only bash executes (`--add-bash`, Docker-sandboxed `RichBash`
+  driven without a `ToolBox`); everything else is answered with a
+  stub receipt so the transcript stays wire-legal. `--clear-tools`
+  strips tools for a prose-only interview.
 
 ### Changed
 

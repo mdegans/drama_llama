@@ -36,7 +36,7 @@ overrides needed.
 llama-cpp ignored test hardcodes it via `CARGO_MANIFEST_DIR`. Symlink
 (or hard-link) swap is the only way to point the test suite at a
 different model. Examples are friendlier: `strawberry --model`,
-`whodunit <path>`, `chat_repl <path>`, `dump_template <path>`,
+`whodunit <path>`, `chat --model <path>`, `dump_template <path>`,
 `inspect_prompt` via `DRAMA_LLAMA_MODEL`.
 
 ## Invocations
@@ -67,7 +67,7 @@ cargo test --features "llama-cpp,moeflux,moeflux-model-qwen3-6-35b-a3b" \
 # Examples (model path optional where shown)
 cargo run --release --example strawberry --features "cli,json-schema" -- [--model <gguf>]
 cargo run --release --example whodunit --features "json-schema" -- [<gguf>]
-cargo run --release --example chat_repl --features "repl" -- <gguf>   # path REQUIRED
+cargo run --release --example chat --features "tokio,repl" -- [--model <gguf>]
 cargo run --release --example dump_template -- [<gguf>]
 cargo run --release --example inspect_prompt --features cli -- <prompt.json>
 cargo run --release --example grammar_fuzz --features cli -- pure --duration 5m --threads 6 --corpus ./fuzz-corpus

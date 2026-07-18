@@ -119,12 +119,14 @@ test mode="" filter="":
 
 # Run an example against the same feature set and target dir as `just test`, so
 # the two share one llama.cpp build instead of evicting each other's.
+# `tokio`/`repl` are appended: the chat-loop examples (chat, council,
+# swarm) require them, and the extra deps don't touch the llama.cpp build.
 #   just example whodunit
 #   just example whodunit models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf
 # Run an example with the shared feature set / target dir.
 example name *args:
     CARGO_TARGET_DIR="{{gpu_target}}" \
-      cargo run --release --features "{{gpu_features}}" --example {{name}} -- {{args}}
+      cargo run --release --features "{{gpu_features}},tokio,repl" --example {{name}} -- {{args}}
 
 # Format the tree. The pre-commit hook checks this, so the tree must be a fixed
 # point of rustfmt: one that isn't makes every later diff carry someone else's

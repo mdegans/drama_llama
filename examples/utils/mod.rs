@@ -33,8 +33,8 @@ pub fn log_init(verbose: bool) {
         // were invisible for the 2026-07-18 run-two postmortem —
         // exactly the output that would have shown what the dead seat
         // actually emitted.)
-        "warn,swarm=debug,python=debug,council=debug,misanthropic=debug,\
-         drama_llama=debug"
+        "warn,swarm=debug,python=debug,council=debug,chat=debug,\
+         misanthropic=debug,drama_llama=debug"
     } else {
         "warn"
     };
