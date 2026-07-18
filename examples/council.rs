@@ -1,28 +1,26 @@
-//! Example: a **deliberative council** — four advisors, a jester, and
-//! a judge, host-driven and synchronous. You are the petitioner *and*
-//! the steward: your question opens a case, and between rounds you
-//! decide whether deliberation continues or the record goes to the
-//! judge, who rules last.
+//! An example council that will deliberate and answer your questions, in some
+//! cases delivering better performance than some very large models.
 //!
-//! Per round: the advisors (`artist`, `philosopher`, `engineer`,
-//! `lawyer`) each file a sealed position; the `jester` — the licensed
-//! contrarian — rebuts; the advisors each react; only then does the
-//! complete record reach the `judge`. Sealing is call order: a seat's
-//! prompt simply never contains what its phase hasn't delivered yet.
-//! Every non-judge completion is `tool_choice`-forced through the
-//! `file` tool, and each seat owns one KV slot with an append-only
-//! transcript — the shape the multi-slot prefix cache is built for.
-//! Run with `DRAMA_LLAMA_CACHE_TRIPWIRE=1` to panic on any unexpected
-//! cache miss.
+//! ## Composition
+//!
+//! There are six agents with different assigned personas. *Artist, Philosopher,
+//! Engineer, Lawyer* and a contrarian *Jester*. The only purpose of the *Judge*
+//! is to relay the decision of the council.
+//!
+//! ## Flow
+//!
+//! 1. The first round is blind. Simulacra deliberate independently.
+//! 2. At the end of a the first round a contrarian Jester shakes things up.
+//! 3. Another round of deliberation.
+//! 4. Judge rules, delivers your answer.
 //!
 //! ```sh
-//! cargo run --example council --features repl
+//! cargo run --example council --features tokio,repl,json-schema
 //! ```
 //!
-//! Try the trick question: *"The car wash is only 100m away from my
-//! house. Should I walk or drive?"* — the experiment is whether four
-//! adversarially-distinct lenses plus a structural contrarian notice
-//! what one pass misses: the car has to *be* at the car wash.
+//! **Try the trick question**: *"The car wash is only 100m away from my house.
+//! Should I walk or drive?"* (The expected answer is that the purpose of the
+//! trip is probably to wash the car, so the car must be driven there.)
 
 mod utils;
 
