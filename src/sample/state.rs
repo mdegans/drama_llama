@@ -88,6 +88,28 @@ pub struct SamplerState {
     /// word lists per sampled token. Deterministic content, so it
     /// rides the bit-exact serialize/restore path harmlessly.
     pub(crate) resolved_ignored: std::collections::BTreeSet<crate::NGram>,
+    /// **Call-local** repetition accumulator for constrained free
+    /// regions (grammar string bodies, `until()` values — see
+    /// `sample::region`). Serialized and compared like every other
+    /// field: anything that influences logits influences RNG
+    /// consumption downstream, so it must ride a mid-call snapshot for
+    /// restore-and-continue to replay the identical stream (same
+    /// rationale as serializing `rng`). But it is NEVER carried across
+    /// call boundaries — `init_state` and `resumed_from` both start it
+    /// empty — which is what keeps (a) the incremental-vs-cold fold
+    /// equivalence intact (Session seeding deliberately excludes
+    /// tool-use args, so the *persistent* `ngram_stats` never sees
+    /// constrained tokens) and (b) cross-call tool-arg repetition a
+    /// non-goal by construction. `serde(default)` so pre-feature blobs
+    /// deserialize to the empty accumulator.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) constrained_ngram_stats: NGramStats,
+    /// Step counter for the constrained-region window/decay math —
+    /// advances once per executed *guarded* pass, exactly as `step`
+    /// does for the prose corpus. Same call-boundary reset and same
+    /// serialization rationale as [`Self::constrained_ngram_stats`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) constrained_step: u64,
 }
 
 impl SamplerState {
@@ -195,6 +217,17 @@ impl SamplerState {
     /// The prose-corpus step counter (see the field docs).
     pub fn step(&self) -> u64 {
         self.step
+    }
+
+    /// The call-local constrained-region accumulator (read-only
+    /// observability, mirroring [`Self::ngram_stats`]).
+    pub fn constrained_ngram_stats(&self) -> &crate::NGramStats {
+        &self.constrained_ngram_stats
+    }
+
+    /// The constrained-region step counter (see the field docs).
+    pub fn constrained_step(&self) -> u64 {
+        self.constrained_step
     }
 
     /// True iff `ngram` is in the resolved repetition ignore set —
@@ -349,6 +382,14 @@ impl SamplerState {
                 .as_ref()
                 .map(|r| r.resolved_ignored(model))
                 .unwrap_or_default(),
+            // The determinism linchpin: the constrained-region
+            // accumulator is call-local and starts EMPTY on resume —
+            // deliberately NOT cloned from `cached`. A resumed call and
+            // a cold-prefill call must derive identical states at every
+            // breakpoint, and cold fold cannot (and must not) recover
+            // mid-call ephemera. See the field docs.
+            constrained_ngram_stats: NGramStats::default(),
+            constrained_step: 0,
         }
     }
 

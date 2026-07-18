@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 
 pub(crate) mod grammar;
 mod json;
+pub(crate) mod region;
 mod repetition;
 pub(crate) mod state;
 
@@ -991,6 +992,8 @@ impl SamplerConfig {
                 .as_ref()
                 .map(|r| r.resolved_ignored(model))
                 .unwrap_or_default(),
+            constrained_ngram_stats: NGramStats::new(),
+            constrained_step: 0,
         }
     }
 }
@@ -1902,5 +1905,68 @@ mod tests {
             tokens.push(a);
             restored_tokens.push(b);
         }
+    }
+
+    /// The constrained-region accumulator is call-local: `resumed_from`
+    /// starts it empty (NOT cloned from the cached state) while the
+    /// stream fields — rng, mu, persistent stats, step — carry. This is
+    /// the determinism linchpin for cold-prefill ≡ resume equivalence.
+    #[test]
+    fn resumed_from_resets_constrained_ephemera() {
+        let opts = opts_with_grammar(false);
+        let mut cached = state_for(&opts);
+        cached.ngram_stats.add(crate::NGram::from(A), 3);
+        cached.step = 7;
+        cached.constrained_ngram_stats.add(crate::NGram::from(B), 5);
+        cached.constrained_step = 5;
+
+        let resumed = SamplerState::resumed_from(&cached, &opts, &MockModel);
+        assert_eq!(resumed.ngram_stats, cached.ngram_stats, "stream carries");
+        assert_eq!(resumed.step, 7);
+        assert_eq!(resumed.rng, cached.rng);
+        assert_eq!(
+            resumed.constrained_ngram_stats,
+            crate::NGramStats::default(),
+            "call-local accumulator must start empty on resume"
+        );
+        assert_eq!(resumed.constrained_step, 0);
+    }
+
+    /// Pre-feature blobs (no constrained fields) deserialize to the
+    /// empty accumulator via `serde(default)` — and a populated
+    /// mid-call snapshot round-trips the new fields bit-exactly.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn constrained_fields_serde_compat_and_round_trip() {
+        let opts = opts_with_grammar(false);
+        let mut state = state_for(&opts);
+        state.constrained_ngram_stats.add(crate::NGram::from(A), 2);
+        state.constrained_step = 3;
+
+        // Populated snapshot round-trips exactly, canonical bytes.
+        let blob = serde_json::to_string(&state).unwrap();
+        let restored: SamplerState = serde_json::from_str(&blob).unwrap();
+        assert_eq!(state, restored);
+        assert_eq!(blob, serde_json::to_string(&restored).unwrap());
+
+        // Old-blob compat: strip the new (trailing) fields by string
+        // surgery — a `serde_json::Value` round trip would mangle the
+        // u128 RNG state (Value has no u128 representation), so the
+        // doctored blob must go straight from string to state. A fresh
+        // state keeps the tail canonical and empty.
+        let fresh = state_for(&opts);
+        let blob = serde_json::to_string(&fresh).unwrap();
+        let tail = ",\"constrained_ngram_stats\":{\"data\":[],\
+                    \"ngram_count\":0,\"token_count\":0},\
+                    \"constrained_step\":0}";
+        assert!(
+            blob.ends_with(tail),
+            "canonical serialization tail changed; update this test: \
+             ...{}",
+            &blob[blob.len().saturating_sub(120)..]
+        );
+        let old_blob = format!("{}}}", &blob[..blob.len() - tail.len()]);
+        let old: SamplerState = serde_json::from_str(&old_blob).unwrap();
+        assert_eq!(old, fresh, "stripped blob must deserialize to defaults");
     }
 }

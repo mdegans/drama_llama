@@ -234,6 +234,12 @@ mod data_serde {
     }
 }
 
+impl Default for NGramStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NGramStats {
     /// Create a new, empty NGramStats.
     pub fn new() -> Self {
