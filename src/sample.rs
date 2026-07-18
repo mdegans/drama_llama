@@ -283,7 +283,17 @@ impl SamplerConfig {
 impl Default for SamplerConfig {
     fn default() -> Self {
         Self {
-            modes: vec![SamplingMode::locally_typical()],
+            // Top-K 1024 is a pre-cut, not a sampler: typical mass
+            // lives well inside the top few hundred tokens, so the
+            // narrowing is behaviorally invisible — but it bounds the
+            // locally-typical pass (softmax + entropy over candidates)
+            // at 1024 entries instead of the full vocab.
+            modes: vec![
+                SamplingMode::TopK {
+                    k: std::num::NonZeroUsize::new(1024).unwrap(),
+                },
+                SamplingMode::locally_typical(),
+            ],
             // On by default as of v0.8.0. The long-form degradation that
             // originally forced this off (qwen3 long-form arc) was the
             // unbounded additive `count * penalty_freq` term; the windowed
