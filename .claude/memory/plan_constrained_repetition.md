@@ -1,12 +1,31 @@
 # Plan of record: repetition penalty inside grammar free regions
 
-**Status: code complete (2026-07-18), Phases 1–5 landed in five commits
+**Status: COMPLETE (2026-07-18). Phases 1–5 landed in five commits
 (predicates → guard → state → gate/config → e2e). Fast suite green
-(411). Pending: Mike-run model-backed verification —
-`cargo test --test constrained_repetition -- --ignored --test-threads=1`
-plus the fold-equivalence oracle
-`cargo test --test sampler_state_cache -- --ignored --test-threads=1`,
-and a council smoke.**
+(411); model-backed verification all green same day
+(`constrained_repetition`, `sampler_state_cache` fold oracle,
+`tip_invariant`, `dialect_auto_toolcall`); council smoke clean — all
+filings closed, honest cache counters, no budget burns. Remaining
+follow-ups tracked in the section below.**
+
+## Open follow-ups (queue for a future session)
+
+1. **until() delimiter protection (optional, low priority)** — the v1
+   limitation: mid-delimiter tokens of `until("</arg>")`-style exits
+   remain penalizable (intermediate KMP states are permissive).
+   Sketch: additionally protect tokens whose walk ends in a different
+   `StateId` than a self-looping base. Becomes relevant when the
+   dialect work (plan_tool_dialects phases D–G, Harmony) starts
+   emitting until() grammars into live sessions — do it then, not
+   before.
+2. **Changelog note** — default-ON changes every sampled constrained
+   stream with repetition enabled; consumers pinning streams by seed
+   will see diffs. `set_constrained_regions(false)` is the escape
+   hatch. Write the note when cutting v0.8.0.
+3. **Artist trailing `\"` curiosity** (council, not this feature) —
+   both artist outputs ended with an escaped quote. Mike's approach:
+   dump per-seat prompts at the end of a run and read the full
+   context before guessing.
 
 ## Problem
 
