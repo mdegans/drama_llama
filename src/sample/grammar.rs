@@ -972,6 +972,20 @@ impl StackState {
         scratch.advance_bytes(grammar, bytes).is_ok() && scratch.is_complete()
     }
 
+    /// True iff the current state is a *permissive* free region — a span
+    /// like a JSON string body or an `until()` raw value where the grammar
+    /// accepts nearly any next byte and the model, not the grammar, owns
+    /// the content. Proxy: popcount of the first-byte bitmap against
+    /// [`PERMISSIVE_MIN_POPCOUNT`]. Misreads are safe in both directions:
+    /// structural→permissive still exempts every region-exit token via the
+    /// protected walk, and permissive→structural is exactly the pre-feature
+    /// behavior (penalty suspended). See `sample::region`.
+    pub(crate) fn is_permissive(&self, grammar: &Grammar) -> bool {
+        let bm = self.first_byte_bitmap(grammar);
+        bm.iter().map(|w| w.count_ones()).sum::<u32>()
+            >= PERMISSIVE_MIN_POPCOUNT
+    }
+
     /// Conservative 256-bit bitmap of which first byte values could plausibly
     /// extend the match from the current state. Set bit ⇒ "maybe accepted"
     /// (still needs full `accepts_bytes` confirmation); cleared bit ⇒
@@ -1206,6 +1220,16 @@ pub(crate) type StateId = u32;
 /// the matcher with no surviving stacks (i.e. the byte is rejected).
 pub(crate) const REJECT_STATE: StateId = u32::MAX;
 
+/// Minimum set bits in a state's first-byte bitmap for the state to count
+/// as a permissive "free region" (see [`StackState::is_permissive`]).
+/// Measured margins on the built-in grammars: JSON string body ≈ 147 set
+/// bits, `until()` raw-value states ≈ 179; structural states (awaiting
+/// key/colon/comma, numbers, literals, whitespace) ≤ ~25. The threshold is
+/// deliberately non-critical — see the safety-asymmetry note on
+/// `is_permissive`. Mid-UTF-8 states (pending continuation bytes, exactly
+/// 64 legal next bytes) land permissive, which is the safe side.
+pub(crate) const PERMISSIVE_MIN_POPCOUNT: u32 = 64;
+
 struct DfaInterned {
     /// Canonical `StackState` → `StateId`. Canonical = post-`expand`, so
     /// stacks are sorted + deduped.
@@ -1384,6 +1408,23 @@ impl DfaCache {
         let bm = state.first_byte_bitmap(grammar);
         self.bitmaps.insert(sid, bm);
         bm
+    }
+
+    /// Memoized [`StackState::is_permissive`] for an interned state. Rides
+    /// the `bitmaps` memo (the popcount on a hit is noise) — deliberately
+    /// NOT a separate map, so there is no extra entry to keep in
+    /// `intern_base`'s cold-clear block. `REJECT_STATE` → `false`.
+    pub(crate) fn is_permissive(
+        &self,
+        grammar: &Grammar,
+        sid: StateId,
+    ) -> bool {
+        if sid == REJECT_STATE {
+            return false;
+        }
+        let bm = self.first_byte_bitmap(grammar, sid);
+        bm.iter().map(|w| w.count_ones()).sum::<u32>()
+            >= PERMISSIVE_MIN_POPCOUNT
     }
 
     /// True iff the state is an accepting state (empty pending + at least one
@@ -2858,5 +2899,122 @@ char ::= [\x00-\x7F] | [\x80-\xFF]"#;
         }
         // Hiragana U+3041..U+3093 all start with 3-byte lead 0xE3.
         assert!(bit_is_set(&bm, 0xE3));
+    }
+
+    fn popcount(bm: &[u64; 4]) -> u32 {
+        bm.iter().map(|w| w.count_ones()).sum()
+    }
+
+    /// Walk `input` from the root of `src` and return the live state.
+    fn walked(src: &str, input: &str) -> GrammarState {
+        let grammar = Arc::new(parse_ok(src));
+        let mut state = GrammarState::new(grammar);
+        state
+            .advance_bytes(input.as_bytes())
+            .expect("prefix should be legal for the grammar");
+        state
+    }
+
+    /// String bodies in the built-in JSON grammar are permissive; every
+    /// structural state is not. Popcount margins are asserted well away
+    /// from `PERMISSIVE_MIN_POPCOUNT` on both sides so threshold drift
+    /// (or a charset change in `JSON_GRAMMAR`) is caught here, not in a
+    /// looping council seat.
+    #[test]
+    fn permissive_json_string_body_vs_structural() {
+        let src = format!("root ::= value\n{}", crate::JSON_GRAMMAR);
+        // Free regions: key and value string bodies, empty or mid-content.
+        for p in ["\"", "{\"", "{\"a\":\"x", "[\"y"] {
+            let st = walked(&src, p);
+            let pc = popcount(&st.first_byte_bitmap());
+            assert!(
+                st.inner.is_permissive(&st.grammar),
+                "expected permissive at {p:?} (popcount {pc})"
+            );
+            assert!(pc >= 100, "margin eroded at {p:?}: popcount {pc}");
+        }
+        // Structural: root, awaiting key/colon/value/comma, numbers,
+        // mid-literal.
+        for p in ["", "{", "{\"a\"", "{\"a\":", "{\"a\":1", "[tr"] {
+            let st = walked(&src, p);
+            let pc = popcount(&st.first_byte_bitmap());
+            assert!(
+                !st.inner.is_permissive(&st.grammar),
+                "expected structural at {p:?} (popcount {pc})"
+            );
+            assert!(pc <= 32, "margin eroded at {p:?}: popcount {pc}");
+        }
+    }
+
+    /// `until()` KMP states are permissive even mid-delimiter-prefix.
+    /// This pins the documented v1 limitation: multi-token exit
+    /// delimiters pass through permissive states, so mid-delimiter
+    /// tokens remain penalizable (bounded by windowed decay) — see the
+    /// follow-up note in `sample::region`.
+    #[test]
+    fn permissive_until_states() {
+        let mut src = String::from("root ::= body\n");
+        crate::emit_until_rules("body", "</arg>", &mut src);
+        for p in ["", "<", "</"] {
+            let st = walked(&src, p);
+            assert!(
+                st.inner.is_permissive(&st.grammar),
+                "until state after {p:?} should be permissive"
+            );
+        }
+    }
+
+    /// Production-shape tool-call grammar (schema-derived): the value
+    /// string is permissive; the literal key is structural.
+    #[test]
+    fn permissive_schema_tool_call_grammar() {
+        let mut src = String::new();
+        crate::schema_to_gbnf(
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "msg": { "type": "string" } },
+                "required": ["msg"],
+            }),
+            "root",
+            &mut src,
+        );
+        src.push_str(crate::JSON_GRAMMAR);
+
+        let in_value = walked(&src, "{\"msg\":\"h");
+        assert!(in_value.inner.is_permissive(&in_value.grammar));
+
+        let mid_key = walked(&src, "{\"m");
+        assert!(!mid_key.inner.is_permissive(&mid_key.grammar));
+    }
+
+    /// The DFA-cached predicate agrees with the uncached one at every
+    /// state along a walk that visits strings, escapes, numbers,
+    /// literals, and container boundaries — the parity that keeps
+    /// `DRAMA_LLAMA_DFA_CACHE=0` from ever changing sampled streams.
+    #[test]
+    fn dfa_permissive_matches_uncached() {
+        let src = format!("root ::= value\n{}", crate::JSON_GRAMMAR);
+        let cg = CompiledGrammar::parse(&src).unwrap();
+        let input = "{\"a\":\"x\\u00e9y\",\"b\":[1,true,\"z\"]}";
+
+        let mut state = cg.root_state();
+        let mut sid = cg.dfa.intern_base(&state);
+        assert_eq!(
+            cg.dfa.is_permissive(&cg.grammar, sid),
+            state.is_permissive(&cg.grammar),
+            "divergence at root"
+        );
+        for &b in input.as_bytes() {
+            sid = cg.dfa.transition(&cg.grammar, sid, b);
+            assert_ne!(sid, REJECT_STATE, "walk rejected byte {b:#x}");
+            state.feed_byte(&cg.grammar, b).unwrap();
+            assert_eq!(
+                cg.dfa.is_permissive(&cg.grammar, sid),
+                state.is_permissive(&cg.grammar),
+                "divergence after byte {b:#x}"
+            );
+        }
+        // Reject sentinel is never permissive.
+        assert!(!cg.dfa.is_permissive(&cg.grammar, REJECT_STATE));
     }
 }

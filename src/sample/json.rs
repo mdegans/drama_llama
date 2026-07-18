@@ -84,6 +84,37 @@ impl JsonState {
         Ok(())
     }
 
+    /// True iff the parser is inside a string body proper — top frame is
+    /// `Frame::String(StringState::Normal)`. Key strings count as much as
+    /// value strings (both are free-form content). `AfterEscape`/`Hex` are
+    /// deliberately structural: only a handful of bytes are legal there.
+    /// This is the JSON engine's "permissive free region" predicate for the
+    /// constrained-region repetition penalty (see `sample::region`).
+    pub(crate) fn in_free_region(&self) -> bool {
+        matches!(self.stack.last(), Some(Frame::String(StringState::Normal)))
+    }
+
+    /// Region-exit walk for the repetition-penalty guard: feed `bytes` on a
+    /// clone; **protected** (returns `true`) as soon as some byte-prefix
+    /// leaves the free region or completes the document — penalizing such a
+    /// token could impede the only exit. A byte rejected while still inside
+    /// the region ⇒ not protected (the token is filter-masked anyway, so
+    /// penalizing it is harmless). Empty `bytes` ⇒ not protected. Same
+    /// early-return semantics as the GBNF walk in `sample::region` — the
+    /// two engines must agree so streams don't depend on the engine choice.
+    pub(crate) fn exit_protects(&self, bytes: &[u8]) -> bool {
+        let mut clone = self.clone();
+        for &b in bytes {
+            if clone.feed(b).is_err() {
+                return false;
+            }
+            if clone.is_complete() || !clone.in_free_region() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// True iff feeding `bytes` would succeed from the current state. Does
     /// not mutate `self`.
     pub fn accepts_bytes(&self, bytes: &[u8]) -> bool {
@@ -1098,5 +1129,80 @@ mod tests {
             );
             assert!(stats.lazy_checks > 0, "lazy checks must have run");
         }
+    }
+
+    /// Walk `input` from a fresh document and return the state.
+    fn state_after(input: &str) -> JsonState {
+        let mut s = JsonState::new();
+        feed_all(&mut s, input).expect("prefix should be legal JSON");
+        s
+    }
+
+    /// `in_free_region` is true exactly inside a string body proper —
+    /// key strings included — and false in every structural state:
+    /// root, containers awaiting punctuation, escapes, hex, numbers,
+    /// and literals.
+    #[test]
+    fn in_free_region_frames() {
+        // Free: string bodies, key or value, empty or mid-content.
+        for p in &["\"", "\"x", "{\"", "{\"a", "{\"a\":\"", "{\"a\":\"x"] {
+            assert!(state_after(p).in_free_region(), "expected free: {p:?}");
+        }
+        // Structural: everything else.
+        for p in &[
+            "",               // root
+            "{",              // awaiting key
+            "{\"a\"",         // awaiting colon
+            "{\"a\":",        // awaiting value
+            "{\"a\":\"x\"",   // awaiting comma/close
+            "{\"a\":\"x\\",   // AfterEscape
+            "{\"a\":\"x\\u",  // Hex(0)
+            "{\"a\":\"x\\u1", // Hex(1)
+            "{\"a\":1",       // number
+            "[t",             // literal
+            "[1,",            // array awaiting value
+        ] {
+            assert!(
+                !state_after(p).in_free_region(),
+                "expected structural: {p:?}"
+            );
+        }
+    }
+
+    /// The region-exit walk protects any token whose byte-prefix leaves
+    /// the string body (or completes the document) — including merged
+    /// tokens — and does not protect pure-content or rejected tokens.
+    #[test]
+    fn exit_protects_walks() {
+        let mid_value = state_after("{\"a\":\"x");
+
+        // Pure content: stays in the region — penalizable.
+        assert!(!mid_value.exit_protects(b"y"));
+        assert!(!mid_value.exit_protects(b" the"));
+        // Empty piece: never protected.
+        assert!(!mid_value.exit_protects(b""));
+        // Rejected while still inside the region (raw control byte):
+        // masked anyway — penalizable.
+        assert!(!mid_value.exit_protects(b"\x00"));
+
+        // The bare close and every merged form: protected.
+        assert!(mid_value.exit_protects(b"\""));
+        assert!(mid_value.exit_protects(b"\","));
+        assert!(mid_value.exit_protects(b"\"}"));
+        // Content then close within one token: protected.
+        assert!(mid_value.exit_protects(b"y\""));
+        // Escape intro: the AfterEscape state is structural (accepted
+        // quirk — only a handful of bytes are legal there).
+        assert!(mid_value.exit_protects(b"\\"));
+
+        // Root-level string: the close completes the document — the
+        // `is_complete` arm of the walk.
+        let root_str = state_after("\"x");
+        assert!(root_str.exit_protects(b"\""));
+
+        // Early-return beats later rejection: `"x"` then garbage that
+        // the object state would reject still protects, because the
+        // prefix already left the region.
+        assert!(mid_value.exit_protects(b"\"]"));
     }
 }
