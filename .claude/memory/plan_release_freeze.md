@@ -73,7 +73,29 @@ so it's additive whenever it happens).
   emission was invisible in run two, which is the first thing to look
   at next run (WHY does it emit a frame marker mid-rebuttal: length
   truncation at the 1024 cap vs #37 sampling; the log will tell).
-  Next arc (Mike's pick): the payroll/cache-reads diagnosis —
+  Run three (same day, `council=debug` now visible): the artist
+  hallucinated the rebuttal 21 s after the seal — the priming was the
+  *filing ACK's* forward pointer ("after the jester's rebuttal the
+  round returns to you"); fixed in `4315aef` (ACKs confirm and stop —
+  tool results are prompts, and an ACK that narrates the future is an
+  invitation to simulate it).
+- **Next session (Mike, 2026-07-18): make the corpse impossible, then
+  make any council death a programmer error (panic).** Three links to
+  break, all library-side: (1) #37 region-aware emit ban — frame
+  specials unsampleable inside permissive constraint regions (sketch
+  in `future_work_region_aware_emit_ban.md`); (2) #38 containment —
+  deferred-grammar incomplete-at-end is a typed violation, EOG masked
+  inside an activated constraint unless `completes_with_terminal`,
+  parse-failed frame text never seats silently; (3) the byte-spelled
+  vector (multi-token spellings re-collapsed by `parse_special` at
+  ingest — no sampler ban can stop it), which needs a seat-side or
+  Session-side own-transcript answer and is what upgrades "unlikely"
+  to "impossible". Then council: every ☠ becomes panic — `excuse`,
+  the reaper, and `jester_is_dead` all collapse into "dead seat =
+  bug, crash loud". Design conversation first (per the
+  design-before-execute discipline); frequency data on #38: two seat
+  deaths in two consecutive live runs, different seats.
+  After that: the payroll/cache-reads diagnosis —
   `cache w` is hardcoded `Some(0)`, `in` double-counts reads, and
   reads look shallow (tripwire only guards total misses, not hit
   depth; prime suspect is think-strip breaking tip-hash byte
