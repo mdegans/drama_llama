@@ -1,93 +1,28 @@
-//! Example: a **deliberative council** — four advisors, a jester, one
-//! judge, sealed rounds, **host-driven and synchronous**. You are the
-//! petitioner *and* the steward: your question opens a case verbatim,
-//! and between rounds you decide whether the council deliberates
-//! further or the record goes to the judge, who rules last.
+//! Example: a **deliberative council** — four advisors, a jester, and
+//! a judge, host-driven and synchronous. You are the petitioner *and*
+//! the steward: your question opens a case, and between rounds you
+//! decide whether deliberation continues or the record goes to the
+//! judge, who rules last.
 //!
-//! The protocol per case: the advisors (`artist`, `philosopher`,
-//! `engineer`, `lawyer`) each file a sealed position; the sealed round
-//! goes to the `jester` — the licensed contrarian, an Agora-canon role
-//! — for the mandatory rebuttal; the round returns to the advisors for
-//! one reaction each; and only then does the complete record —
-//! positions, rebuttal, reactions — reach the `judge`. A consensus
-//! that survives the rebuttal deserved to win; one that cracks is
-//! exactly what the trick questions are for.
-//!
-//! ## Why host-driven (the v2 rewrite)
-//!
-//! The first council drove six autonomous `Chat` loops wired by
-//! mailboxes — the [`swarm`](../swarm/index.html) shape — and
-//! host-enforced the protocol *on top*: a phase machine, sealed
-//! filings, budgets, anti-stall nudges, dead-seat reapers. Three live
-//! runs (2026-07-18) showed the mismatch was structural. The council
-//! protocol is **synchronous** — strict phase order, sealed
-//! information, the judge last — and simulating it on an
-//! at-will-agents substrate meant fighting the substrate: advisors
-//! filed "reactions" to rebuttals that had not happened yet (a
-//! promised future is an invitation to simulate it), the judge's
-//! short ruling completion could out-race the engagement it should
-//! have ruled on, and one seat death per run left rounds hung.
-//!
-//! This rewrite follows the downstream agora-council binary
-//! (`agora/crates/agora-council` — `deliberation.rs` drives one
-//! forced-tool completion per agent per round, sequentially, with the
-//! human steward deciding between rounds). The host owns everything:
-//!
-//! * **Sealing is call order.** An advisor's prompt simply does not
-//!   contain the others' filings until the phase that delivers them.
-//!   Round-1 independence needs no machinery at all.
-//! * **Hallucinated futures are impossible.** A seat runs exactly
-//!   when the protocol needs its filing, with exactly the mail the
-//!   phase provides — there are no free-running rounds to speculate
-//!   in.
-//! * **Malformed and wrong-dialect calls are impossible.** Every seat
-//!   completion is `tool_choice`-forced, so emission is
-//!   grammar-constrained (the unforced-path dialect drift of issue
-//!   #27 is never reachable). Forcing is cache-free: `tool_choice`
-//!   changes the sampler, not the rendered bytes.
-//! * **The corpse is impossible.** Transcripts are host-owned
-//!   [`Prompt`]s; a failed completion returns `Err` and appends
-//!   *nothing*, so a seat can never poison its own transcript (the
-//!   issue #37/#38 death chain that killed one seat per live run).
-//!   Any completion error is therefore a programmer error: the
-//!   council adjourns loudly (nonzero exit). No retries, no excusals,
-//!   no degraded modes.
-//!
-//! Residual exposure, tracked on #37: a forced grammar still permits
-//! frame-marker *bytes* inside argument strings, so every filing is
-//! scanned before relay ([`Session::scan_text_for_specials`]) and a
-//! hit adjourns the council naming the seat (the echo defanged —
-//! `‹tool_call›` — because the guard must not carry the poison it
-//! guards against). The region-aware emit ban closes this at the
-//! sampler.
-//!
-//! ## Cache shape
-//!
-//! One KV slot per seat ([`CommonArgs::session_with_cache_slots`]),
-//! and every transcript is **append-only** — a deliberate deviation
-//! from agora-council's stateless re-render, because monotonically
-//! growing per-seat prompts are the shape our multi-slot prefix cache
-//! is built for. A rolling two-deep `cache_control` window rides each
-//! seat's assistant tail ([`Prompt::cache_windowed_with`], the same
-//! placement the `Chat` driver used). Within a phase, broadcast mail
-//! is identical bytes to its recipients. Run with
-//! `DRAMA_LLAMA_CACHE_TRIPWIRE=1` to panic on any unexpected miss.
+//! Per round: the advisors (`artist`, `philosopher`, `engineer`,
+//! `lawyer`) each file a sealed position; the `jester` — the licensed
+//! contrarian — rebuts; the advisors each react; only then does the
+//! complete record reach the `judge`. Sealing is call order: a seat's
+//! prompt simply never contains what its phase hasn't delivered yet.
+//! Every non-judge completion is `tool_choice`-forced through the
+//! `file` tool, and each seat owns one KV slot with an append-only
+//! transcript — the shape the multi-slot prefix cache is built for.
+//! Run with `DRAMA_LLAMA_CACHE_TRIPWIRE=1` to panic on any unexpected
+//! cache miss.
 //!
 //! ```sh
 //! cargo run --example council --features repl
 //! ```
 //!
 //! Try the trick question: *"The car wash is only 100m away from my
-//! house. Should I walk or drive?"* Success is a ruling that notices
-//! the question answers itself — the car has to *be* at the car wash.
-//! One well-briefed model usually anthropomorphizes the distance and
-//! says "walk"; the experiment is whether four adversarially-distinct
-//! lenses plus a structural contrarian catch what one pass misses.
-//!
-//! [`Prompt`]: misanthropic::Prompt
-//! [`Prompt::cache_windowed_with`]: misanthropic::Prompt::cache_windowed_with
-//! [`Session::scan_text_for_specials`]: drama_llama::Session::scan_text_for_specials
-//! [`CommonArgs::session_with_cache_slots`]: utils::CommonArgs::session_with_cache_slots
+//! house. Should I walk or drive?"* — the experiment is whether four
+//! adversarially-distinct lenses plus a structural contrarian notice
+//! what one pass misses: the car has to *be* at the car wash.
 
 mod utils;
 
@@ -339,21 +274,22 @@ fn defang(piece: &str) -> String {
     }
 }
 
-/// One forced completion for a filing seat: mail in, [`Filing`] out.
-/// The transcript gains the assistant turn ONLY on full success — on
-/// any error nothing model-authored is ever seated, so a failed call
-/// cannot poison the seat. Errors carry the seat name; the caller
-/// bails (any completion failure is a programmer error, not a
-/// council event).
+/// One forced completion for a filing seat: mail in, [`Filing`] plus
+/// the turn's output-token count out. The transcript gains the
+/// assistant turn ONLY on full success — on any error nothing
+/// model-authored is ever seated, so a failed call cannot poison the
+/// seat. Errors carry the seat name; the caller bails (any completion
+/// failure is a programmer error, not a council event).
 fn file_call(
     session: &mut LlamaCppSession,
     seat: &mut Seat,
     mail: String,
-) -> Result<Filing, BoxError> {
+) -> Result<(Filing, u64), BoxError> {
     seat.prompt.messages.push((Role::User, mail).into());
     let message = session
         .complete_response(&seat.prompt)
         .map_err(|e| format!("☠ {}: {e}", seat.name))?;
+    let out_tokens = message.usage.counts.output_tokens;
     seat.usage += message.usage.counts;
     log::debug!("{} ▸ {message}", seat.name);
     let call = message.tool_use().ok_or_else(|| {
@@ -383,29 +319,38 @@ fn file_call(
         }
     }
     seat.prompt.messages.push(message.inner.into());
-    seat.prompt
-        .cache_windowed_with(2, CacheControl::ephemeral());
-    Ok(filing)
+    // Assistant-tail breakpoint, right after generation — the same
+    // placement the `Chat` driver derives from the transport's
+    // `breakpoint_after_assistant` quirk, matching the snapshot the
+    // session takes internally at end of generation. One-hour TTL,
+    // not ephemeral: a seat sits idle while the other five take their
+    // turns, easily past the 5-minute sweep — which would drop its
+    // snapshots and re-prefill the whole transcript every phase.
+    seat.prompt.cache_windowed_with(2, CacheControl::one_hour());
+    Ok((filing, out_tokens))
 }
 
-/// The judge's completion: mail in, prose ruling out. Same
-/// append-only, success-only transcript discipline as [`file_call`].
+/// The judge's completion: mail in, prose ruling (plus the turn's
+/// output-token count) out. Same append-only, success-only transcript
+/// discipline as [`file_call`].
 fn rule_call(
     session: &mut LlamaCppSession,
     judge: &mut Seat,
     mail: String,
-) -> Result<String, BoxError> {
+) -> Result<(String, u64), BoxError> {
     judge.prompt.messages.push((Role::User, mail).into());
     let message = session
         .complete_response(&judge.prompt)
         .map_err(|e| format!("☠ {}: {e}", judge.name))?;
+    let out_tokens = message.usage.counts.output_tokens;
     judge.usage += message.usage.counts;
     let ruling = message.to_string();
     judge.prompt.messages.push(message.inner.into());
+    // One-hour tail window; see `file_call` for why not ephemeral.
     judge
         .prompt
-        .cache_windowed_with(2, CacheControl::ephemeral());
-    Ok(ruling)
+        .cache_windowed_with(2, CacheControl::one_hour());
+    Ok((ruling, out_tokens))
 }
 
 /// The positions of a round, rendered in stable order — identical
@@ -472,10 +417,14 @@ fn scan_human(session: &LlamaCppSession, text: &str) -> Result<(), String> {
 }
 
 fn main() -> Result<(), BoxError> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     utils::log_init(cli.common.verbose);
 
-    // One model, one session, one cache slot per seat.
+    // One model, one session, one cache slot per seat. `--n-ctx` is
+    // the whole unified KV budget across all six slots; the shared
+    // 8192 example default starved multi-round cases, so seed 4× it
+    // (an explicit `--n-ctx` still wins).
+    cli.common.n_ctx.get_or_insert(32768);
     let seats = ADVISORS.len() as u32 + 2; // advisors + jester + judge
     let mut session = cli.common.session_with_cache_slots(seats)?;
     if cli.common.max_tokens.is_none() {
@@ -483,9 +432,8 @@ fn main() -> Result<(), BoxError> {
         // rebuttal, 2048 an engineer reaction (runs five and six) —
         // on the forced path that is a typed GrammarViolation and
         // adjourns the council. Not 8192: `check_context_fit`
-        // reserves this much headroom per call, and the default
-        // `--n-ctx 8192` is the whole unified budget across all six
-        // seats' slots. Deep multi-round cases want `--n-ctx 16384`.
+        // reserves this much headroom per call out of the shared
+        // `--n-ctx` budget above.
         session = session.with_max_tokens(
             std::num::NonZeroUsize::new(4096).expect("nonzero"),
         );
@@ -557,8 +505,12 @@ fn main() -> Result<(), BoxError> {
             };
             let mut filings: BTreeMap<&'static str, String> = BTreeMap::new();
             for seat in advisors.iter_mut() {
-                let filing = file_call(&mut session, seat, notice.clone())?;
-                println!("{} ⚖ filed — {}", seat.name, filing.verdict);
+                let (filing, n_out) =
+                    file_call(&mut session, seat, notice.clone())?;
+                println!(
+                    "{} ⚖ filed [{n_out} tok] — {}",
+                    seat.name, filing.verdict
+                );
                 filings.insert(seat.name, filing.into_record());
             }
 
@@ -577,8 +529,11 @@ fn main() -> Result<(), BoxError> {
                  (or the strongest position if they split), premises \
                  first, even if you privately agree.",
             );
-            let rebuttal = file_call(&mut session, &mut jester, seal)?;
-            println!("{JESTER} ⚖ rebutted — {}", rebuttal.verdict);
+            let (rebuttal, n_out) = file_call(&mut session, &mut jester, seal)?;
+            println!(
+                "{JESTER} ⚖ rebutted [{n_out} tok] — {}",
+                rebuttal.verdict
+            );
             let rebuttal = rebuttal.into_record();
 
             // ── Reactions ────────────────────────────────────────
@@ -591,9 +546,12 @@ fn main() -> Result<(), BoxError> {
             );
             let mut reactions: BTreeMap<&'static str, String> = BTreeMap::new();
             for seat in advisors.iter_mut() {
-                let reaction =
+                let (reaction, n_out) =
                     file_call(&mut session, seat, react_mail.clone())?;
-                println!("{} ⚖ reacted — {}", seat.name, reaction.verdict);
+                println!(
+                    "{} ⚖ reacted [{n_out} tok] — {}",
+                    seat.name, reaction.verdict
+                );
                 reactions.insert(seat.name, reaction.into_record());
             }
 
@@ -633,12 +591,12 @@ fn main() -> Result<(), BoxError> {
         }
 
         // ── The ruling: the judge sees the record LAST ───────────
-        let ruling = rule_call(
+        let (ruling, n_out) = rule_call(
             &mut session,
             &mut judge,
             record_text(&petition, &rounds),
         )?;
-        println!("\njudge ▸ {ruling}\n");
+        println!("\njudge [{n_out} tok] ▸ {ruling}\n");
     }
 
     // ── The payroll ──────────────────────────────────────────────

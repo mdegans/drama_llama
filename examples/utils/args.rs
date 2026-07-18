@@ -24,9 +24,10 @@ pub struct CommonArgs {
     #[arg(long)]
     pub max_tokens: Option<NonZeroU32>,
 
-    /// Context length (KV cells) for the session.
-    #[arg(long, default_value_t = 8192)]
-    pub n_ctx: u32,
+    /// Context length (KV cells) for the session [default: 8192;
+    /// examples with many cache slots seed a larger default].
+    #[arg(long)]
+    pub n_ctx: Option<u32>,
 
     /// Override the example's built-in system prompt.
     #[arg(long)]
@@ -42,6 +43,12 @@ pub struct CommonArgs {
 pub fn default_model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
 }
+
+/// The `--n-ctx` fallback when neither the user nor the example set
+/// one. Single-seat examples fit comfortably; multi-seat examples
+/// (swarm, council) seed their own larger default before building the
+/// session, since the whole unified KV budget is split across slots.
+pub const DEFAULT_N_CTX: u32 = 8192;
 
 impl CommonArgs {
     /// Apply whichever of `--max-tokens` / `--system` the user set onto
@@ -64,7 +71,7 @@ impl CommonArgs {
     ) -> Result<drama_llama::LlamaCppSession, drama_llama::SessionError> {
         let session = drama_llama::LlamaCppSession::from_path_with_n_ctx(
             self.model.clone(),
-            self.n_ctx,
+            self.n_ctx.unwrap_or(DEFAULT_N_CTX),
         )?;
         Ok(self.finish_session(session))
     }
@@ -81,7 +88,7 @@ impl CommonArgs {
     ) -> Result<drama_llama::LlamaCppSession, drama_llama::SessionError> {
         let session = drama_llama::LlamaCppSession::from_path_with_cache_slots(
             self.model.clone(),
-            self.n_ctx,
+            self.n_ctx.unwrap_or(DEFAULT_N_CTX),
             slots,
         )?;
         Ok(self.finish_session(session))
