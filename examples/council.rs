@@ -695,8 +695,14 @@ impl Docket {
         if complete {
             chamber.seal_or_publish(&self.court.printer);
         }
-        Ok("filed (sealed; after the jester's rebuttal the round \
-            returns to you for a reaction)"
+        // The ACK confirms and STOPS — no forward pointer. Run three
+        // showed the model treating "after the jester's rebuttal the
+        // round returns to you" as a script: it filed a "reaction" to
+        // an unissued rebuttal in the very next quiesce round, 21
+        // seconds after the seal.
+        Ok("filed and sealed. Do NOTHING until the next mail from the \
+            bench reaches you — anything you produce before then is \
+            lost."
             .into())
     }
 
