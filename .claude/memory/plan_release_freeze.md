@@ -19,6 +19,13 @@ so it's additive whenever it happens).
   Both are "a misbehaving model must not poison a transcript" — the
   council demo is the showcase, so these are release-blocking in
   spirit.
+- [#39](https://github.com/mdegans/drama_llama/issues/39) —
+  `Session::with_max_tokens`: name collides with the wire param, min
+  is silent, and the 1024 default beats misanthropic's 4096 `Prompt`
+  default (truncated the jester's first real rebuttal, run five).
+  Direction: rename to a ceiling (`with_max_tokens_ceiling` — NOT
+  ctx-flavored; it's a generation cap, not context), default
+  unlimited, log on clip. Small surface, freeze-appropriate polish.
 - Longer fuzz soaks with the widened corpus (nullable type-arrays now
   generated; `pure --duration 8h` per the fuzzer's own docs). The
   2026-07-17 sweeps: nullable collapse clean, found + fixed two
