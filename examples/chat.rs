@@ -34,6 +34,11 @@
 //!
 //! - `--clear-tools` strips tools and any forced choice — a prose-only
 //!   interview.
+//! - `--tool-choice <auto|any|none|method:NAME>` overrides the loaded
+//!   choice while keeping the defs rendered, so the prefix is unchanged
+//!   (unlike `--clear-tools`). `auto` un-forces a council seat so it may
+//!   answer in prose *or* file; `none` forbids any call while the agent
+//!   still sees its tools — the prefix-preserving "don't call" mode.
 //! - `--add-bash` appends misanthropic's [`RichBash`] in a Docker sandbox
 //!   (needs Docker; the published misan-bashd image is pulled on first
 //!   run) and dispatches its calls for real — no [`ToolBox`], the loop
@@ -76,6 +81,18 @@ struct Cli {
     /// prose-only interview.
     #[arg(long)]
     clear_tools: bool,
+    /// Override the loaded prompt's tool choice, keeping the defs
+    /// rendered (so the prefix is unchanged — unlike `--clear-tools`):
+    /// `auto` (call or answer in prose), `any` (must call some tool),
+    /// `none` (may not call — the prefix-preserving "don't call" mode),
+    /// or `method:NAME` (must call NAME). Un-force a council seat with
+    /// `auto`; forbid its filing with `none`.
+    #[arg(
+        long,
+        value_parser = parse_tool_choice,
+        value_name = "auto|any|none|method:NAME"
+    )]
+    tool_choice: Option<tool::Choice>,
     /// Add misanthropic's rich bash tool in a Docker sandbox (needs
     /// Docker; the published misan-bashd image is pulled on first run).
     #[arg(long)]
@@ -119,6 +136,14 @@ async fn main() -> Result<(), BoxError> {
     if cli.clear_tools {
         prompt.tools = None;
         prompt.tool_choice = None;
+    }
+    // Override last: `--tool-choice` reshapes the choice while leaving
+    // the defs in place (prefix intact). `any`/`method:` on a
+    // defs-stripped prompt (`--clear-tools`) will surface as a typed
+    // "no tools" error at completion, which is the honest outcome of
+    // contradictory flags.
+    if let Some(choice) = &cli.tool_choice {
+        prompt.tool_choice = Some(choice.clone());
     }
 
     // ── Bash, manually driven ────────────────────────────────────
@@ -169,6 +194,9 @@ async fn main() -> Result<(), BoxError> {
         ),
         None => println!("chat — prefix cache on. Ctrl-D exits."),
     }
+    if let Some(choice) = &cli.tool_choice {
+        println!("  tool choice → {}", describe_choice(choice));
+    }
 
     // Drive the interview, then tear the sandbox down even on the error
     // path — it is a running container, not memory.
@@ -189,6 +217,33 @@ async fn main() -> Result<(), BoxError> {
     }
     println!("\nsession totals — {}", pay_line(&total));
     outcome
+}
+
+/// Parse `--tool-choice`: `auto`, `any`, `none`, or `method:NAME`.
+fn parse_tool_choice(s: &str) -> Result<tool::Choice, String> {
+    match s {
+        "auto" => Ok(tool::Choice::auto()),
+        "any" => Ok(tool::Choice::any()),
+        "none" => Ok(tool::Choice::none()),
+        other => other
+            .strip_prefix("method:")
+            .filter(|name| !name.is_empty())
+            .map(tool::Choice::method)
+            .ok_or_else(|| {
+                format!("expected auto|any|none|method:NAME, got {other:?}")
+            }),
+    }
+}
+
+/// A short human label for an effective [`tool::Choice`], for the
+/// startup banner.
+fn describe_choice(choice: &tool::Choice) -> String {
+    match choice {
+        tool::Choice::Auto { .. } => "auto (call or prose)".into(),
+        tool::Choice::Any { .. } => "any (must call a tool)".into(),
+        tool::Choice::None => "none (calls forbidden, defs kept)".into(),
+        tool::Choice::Method { name, .. } => format!("must call {name}"),
+    }
 }
 
 /// Whether `prompt` forces a tool call on every completion.
