@@ -12,7 +12,7 @@ sections as they resolve (delete-resolved-memos convention).
   `SessionTransport::new` that the v2 rewrite (direct
   `complete_response`) silently lost. Fixed in the examples helper
   (`session_with_cache_slots` → `.with_prefix_cache(true)`).
-- **Honest cache stats** (closes #40): `cache_creation_input_tokens`
+- **Honest cache stats** (#40, closed 2026-07-19): `cache_creation_input_tokens`
   had been hardcoded `Some(0)` since the original caching commit
   (468f32d, 2026-04-19 — it never worked; the "used to work" memory
   was reads via the transport). Now `creation = input − read` (every
@@ -82,14 +82,9 @@ Session A work:
   math: the two zero-report paths above, >1h steward pause (marker
   TTL), render byte-drift (tripwire + drift diagnostics).
 
-## Next session B — free-region repetition penalty (#43)
+## Next session B — DONE (2026-07-18; #43 closed 2026-07-19)
 
-After A. Region-aware suspension instead of all-or-nothing: penalty
-(and stats ingestion) live only inside permissive regions (JSON string
-values, until() spans) while a grammar is active. Evidence: artist
-looped a paragraph verbatim ~10× inside a forced call's `analysis`
-string, burned 4096 tokens to max_tokens → GrammarViolation (#36 is
-the misreport half). Care points in the issue: exit delimiters stay
-unpenalized, `SamplerState::step` coherence across cache resumes,
-structural tokens never seed stats. Pairs with the region-aware emit
-ban (#37 / future_work_region_aware_emit_ban.md).
+Free-region repetition penalty landed as the constrained-repetition
+arc — see `plan_constrained_repetition.md` for the surviving follow-ups
+(`until()` delimiter protection, CHANGELOG note). The region-aware emit
+ban (#37) is a separate, still-open concern.

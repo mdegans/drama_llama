@@ -207,13 +207,6 @@ for the current arc:
   — the active RIIR plan: differential port of moeflux, branch
   `riir` in `~/Projects/moeflux`, no Arc, `metal-rs`. Phase 0/1a/2
   landed; Phase 3 (forward pass bottom-up) is next.
-- [`plan_lazy_grammar_check.md`](.claude/memory/plan_lazy_grammar_check.md)
-  — plan-of-record ([issue #28](https://github.com/mdegans/drama_llama/issues/28)):
-  replace per-token O(vocab) grammar masking with an O(1)
-  `accepts_bytes` check of the sampled token, full mask only on
-  rejection. Supersedes the speculative-rollback sketch in
-  `future_work_grammar_speculation.md`. All inside `sample_token`;
-  no predictor changes, no KV rewind.
 - [`blallama_session_state_pollution.md`](.claude/memory/blallama_session_state_pollution.md)
   — bisect findings that motivated the RIIR. `memory_clear` is
   also lossy in C (not just `memory_seq_rm`), original argmax-only
@@ -251,8 +244,7 @@ Older but still load-bearing:
   — Qwen3 reserved-token-mask fix.
 - [`future_work_*.md`](.claude/memory/) — block predictor, Rust
   audit, prefill progress callback, others. Things to come back
-  to. (Grammar speculation is superseded — see
-  `plan_lazy_grammar_check.md` above.)
+  to.
 
 ## Build & Test Commands
 
