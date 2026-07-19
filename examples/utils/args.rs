@@ -24,6 +24,16 @@ pub struct CommonArgs {
     #[arg(long)]
     pub max_tokens: Option<NonZeroU32>,
 
+    /// Fixed RNG seed, applied to the session as a "fork" (same prompt +
+    /// same seed ⇒ same output). Default UNSET: a session resumes cached
+    /// sampler state on a cache hit and uses fresh entropy otherwise —
+    /// which is what the cache examples (council/swarm/prompt_caching)
+    /// exercise; forcing a seed discards that resume snapshot. Note:
+    /// `--seed 0` maps through `NonZeroU128::new(0) == None`, i.e. "no
+    /// seed".
+    #[arg(long)]
+    pub seed: Option<u128>,
+
     /// Context length (KV cells) for the session. Examples with many
     /// cache slots override the default upward via `mut_arg` (see
     /// council) so `--help` always shows the real value.
@@ -103,6 +113,8 @@ impl CommonArgs {
         mut session: drama_llama::LlamaCppSession,
     ) -> drama_llama::LlamaCppSession {
         session = session.quiet();
+        session =
+            session.with_seed(self.seed.and_then(std::num::NonZeroU128::new));
         if let Some(max_tokens) = self.max_tokens {
             session = session.with_max_tokens(
                 std::num::NonZeroUsize::new(max_tokens.get() as usize)
