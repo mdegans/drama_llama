@@ -551,7 +551,7 @@ impl RenderOptions {
 pub enum PromptBreakpoint {
     /// After the tools section — any cache marker on any
     /// [`tool::CustomMethodDef`](misanthropic::tool::CustomMethodDef) in
-    /// [`Prompt::functions`] produces this, regardless of which
+    /// [`Prompt::tools`] produces this, regardless of which
     /// specific method was marked. Coarse by design: per-tool
     /// partial rendering would not produce a byte-prefix of the full
     /// render (the closing `]` of the tools JSON array lands
