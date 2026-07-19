@@ -1831,7 +1831,7 @@ impl Session<LlamaCppBackend> {
     ///
     /// Diagnostic escape hatch for output-divergence debugging — see
     /// [`FlashAttention`](crate::FlashAttention) for the when and why.
-    /// Sidecar handling matches [`Self::from_path`].
+    /// Sidecar handling matches [`Self::from_path_sync`].
     pub fn from_path_with_flash_attention(
         path: PathBuf,
         fa: crate::FlashAttention,
@@ -1852,13 +1852,13 @@ impl Session<LlamaCppBackend> {
 
     /// Load a model from disk with an explicit KV context size.
     ///
-    /// [`Self::from_path`] inherits llama.cpp's default `n_ctx = 512`,
+    /// [`Self::from_path_sync`] inherits llama.cpp's default `n_ctx = 512`,
     /// which truncates chat and structured-output workloads well
     /// before they finish. Use this builder when the prompt plus the
     /// generation cap ([`Self::with_max_tokens`]) can exceed 512
     /// tokens — which is almost always for reasoning-capable models.
     /// Typical values: 4096 – 16384. Sidecar handling matches
-    /// [`Self::from_path`].
+    /// [`Self::from_path_sync`].
     pub fn from_path_with_n_ctx(
         path: PathBuf,
         n_ctx: u32,
@@ -1884,7 +1884,7 @@ impl Session<LlamaCppBackend> {
     /// slot count from the engine's `n_seq_max`, so this is the
     /// constructor that makes N-agent workloads (swarm, council)
     /// actually cache N prefixes. Sidecar handling matches
-    /// [`Self::from_path`].
+    /// [`Self::from_path_sync`].
     pub fn from_path_with_cache_slots(
         path: PathBuf,
         n_ctx: u32,
@@ -1907,7 +1907,7 @@ impl Session<LlamaCppBackend> {
 
     /// Load a model CPU-only (zero GPU layers). Diagnostic path for
     /// isolating GPU-kernel divergence. Sidecar handling matches
-    /// [`Self::from_path`].
+    /// [`Self::from_path_sync`].
     pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, SessionError> {
         let sidecar = llama_cpp_sidecar_path(&path);
         let template_sidecar = llama_cpp_template_sidecar_path(&path);
@@ -2077,8 +2077,8 @@ impl<B: Backend> Session<B> {
         self
     }
 
-    /// Set the RNG seed — the fork/resume/fresh selector (see
-    /// [`Session::seed`](field). `Some(n)` = fork: deterministic
+    /// Set the RNG seed — the fork/resume/fresh selector (see the
+    /// `seed` field). `Some(n)` = fork: deterministic
     /// across runs given the same prompt, ignoring any cached stream.
     /// For tuning iteration — changing rep-penalty knobs and seeing
     /// what the change actually did rather than guessing across

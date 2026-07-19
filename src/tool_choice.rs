@@ -151,7 +151,7 @@ pub(crate) enum RootShape {
 /// GBNF fails to compile.
 ///
 /// `thought_pre_opened`: whether the rendered generation prompt ends
-/// with an open `<think>` tag — see [`RootShape::Eager`]. Callers
+/// with an open `<think>` tag — see `RootShape::Eager`. Callers
 /// without a render in hand pass `false` (the historical behavior).
 pub fn grammar_for_tool_choice(
     choice: &ToolChoice,

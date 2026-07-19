@@ -289,9 +289,28 @@ Three further arcs land on top of the split:
   dialect active, the emitted call's own close marker (not a raw
   sampled EOG) terminates the turn: EOG and empty-piece tokens are
   masked while a constraint is live, the repetition penalty is
-  suspended across the structured span, and the recorded tip is the
-  canonical close token rather than whatever EOG happened to be
-  sampled — so the next turn's cache walk stays byte-stable.
+  suspended across structural emission (region-aware within free-text
+  spans — see below), and the recorded tip is the canonical close
+  token rather than whatever EOG happened to be sampled — so the next
+  turn's cache walk stays byte-stable.
+- **Repetition penalty now applies inside grammar free-text regions.**
+  The penalty was previously suspended for the entire span of any
+  active byte-constraint — which also silenced it inside the free
+  islands where the model writes prose (JSON string bodies, `until()`
+  spans), letting small models loop a paragraph verbatim inside a
+  forced tool-call argument. Suspension is now scoped to *structural*
+  emission (delimiters, keys, tags); inside permissive regions the
+  penalty runs against a call-local n-gram accumulator, with
+  region-exit tokens (the closing quote, merged `",` pieces) left
+  unpenalized so the model can always leave the region. Default-on;
+  opt out with `RepetitionOptions::set_constrained_regions(false)`,
+  which restores the pre-feature blanket suspension exactly. ([#43])
+- **Default sampler chain prepends a top-k 1024 cut before
+  locally-typical.** The stock `SamplerConfig` now applies a top-k
+  1024 pre-cut ahead of the locally-typical stage (typical mass
+  concentrates in the head, so the cut trims the tail cheaply).
+  Output for streams pinned by seed against the previous default
+  chain will differ.
 
 ### Fixed
 
@@ -605,3 +624,4 @@ flip `DRAMA_LLAMA_DFA_CACHE=0`.
 [#30]: https://github.com/mdegans/drama_llama/issues/30
 [#31]: https://github.com/mdegans/drama_llama/issues/31
 [#40]: https://github.com/mdegans/drama_llama/issues/40
+[#43]: https://github.com/mdegans/drama_llama/issues/43

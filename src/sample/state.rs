@@ -312,7 +312,7 @@ impl SamplerState {
     ///   effective config's modes, so verbatim reuse risks
     ///   out-of-bounds rule indices). Each new grammar mode carries the
     ///   cached position forward **iff** a cached matcher walked the
-    ///   identical compiled grammar ([`crate::CompiledGrammar::source_hash`];
+    ///   identical compiled grammar (`CompiledGrammar::source_hash`;
     ///   same source ⇒ same deterministic compile ⇒ same indices);
     ///   otherwise it starts at root. This is what makes
     ///   assistant-prefill / partial-completion resume work while a

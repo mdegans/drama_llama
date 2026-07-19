@@ -45,7 +45,7 @@
 //!   will rewrite the default.
 //! - To **tweak** something: edit the sidecar, save, restart.
 //!
-//! [`crate::LlamaCppSession::from_path*`]: crate::crate::LlamaCppSession::from_path
+//! [`crate::LlamaCppSession::from_path*`]: crate::LlamaCppSession::from_path_sync
 //! [`Session::with_sample_options`]: crate::Session::with_sample_options
 //! [`SamplingMode::Json`]: crate::SamplingMode::Json
 //! [`SamplingMode::Grammar`]: crate::SamplingMode::Grammar
@@ -122,7 +122,7 @@ pub fn load_sample_options(
 /// [`crate::LlamaCppSession::from_path*`] integration only writes when the read
 /// returned `Ok(None)`.
 ///
-/// [`crate::LlamaCppSession::from_path*`]: crate::crate::LlamaCppSession::from_path
+/// [`crate::LlamaCppSession::from_path*`]: crate::LlamaCppSession::from_path_sync
 #[cfg(feature = "toml")]
 pub fn write_default_sample_options(path: &Path) -> Result<(), SidecarError> {
     let opts = SamplerConfig::default();

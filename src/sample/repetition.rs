@@ -19,7 +19,7 @@ use std::{
 #[cfg(feature = "egui")]
 use super::DELETE_ICON;
 
-/// Options for [`apply_sample_repetition_ngram`].
+/// Options for [`Candidates::penalize_repetition`](crate::Candidates::penalize_repetition).
 ///
 /// # Why this config is the odd one out
 ///
@@ -278,7 +278,7 @@ impl RepetitionOptions {
     /// The effective ignore set: [`Self::ignored`] plus every
     /// [`Self::ignored_categories`] entry tokenized against `model`.
     /// Computed once per call (by `SamplerConfig::init_state`) and
-    /// passed into [`apply_sample_repetition_ngram`] — tokenizing the
+    /// passed into [`Candidates::penalize_repetition`](crate::Candidates::penalize_repetition) — tokenizing the
     /// category word lists is far too expensive to redo per sampled
     /// token, and the config is immutable so it can't memoize in place.
     pub fn resolved_ignored<M: crate::backend::Model>(

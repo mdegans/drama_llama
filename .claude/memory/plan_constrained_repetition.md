@@ -18,10 +18,10 @@ follow-ups tracked in the section below.**
    dialect work (plan_tool_dialects phases D–G, Harmony) starts
    emitting until() grammars into live sessions — do it then, not
    before.
-2. **Changelog note** — default-ON changes every sampled constrained
-   stream with repetition enabled; consumers pinning streams by seed
-   will see diffs. `set_constrained_regions(false)` is the escape
-   hatch. Write the note when cutting v0.8.0.
+2. **Changelog note** — DONE (2026-07-19): logged under `[0.8.0]
+   ### Changed` alongside the top-k-1024-before-locally-typical
+   default-chain change. `set_constrained_regions(false)` documented
+   as the escape hatch.
 3. **Artist trailing `\"` curiosity** (council, not this feature) —
    both artist outputs ended with an escaped quote. Mike's approach:
    dump per-seat prompts at the end of a run and read the full

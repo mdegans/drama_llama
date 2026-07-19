@@ -486,7 +486,7 @@ pub struct TokenPredictor<'engine, B: Backend> {
 impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     /// `initial_state`: `Some` resumes a caller-owned
     /// [`SamplerState`](crate::SamplerState) (no `init_state`, no
-    /// prompt seeding — see [`Self::prepare`]); `None` builds a fresh
+    /// prompt seeding — see `Self::prepare`); `None` builds a fresh
     /// state from `options`.
     pub fn new(
         engine: &'engine mut Engine<B>,

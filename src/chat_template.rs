@@ -412,7 +412,7 @@ pub struct RenderedWithBreakpoints {
     /// One `(breakpoint, ttl, partial render)` triple per breakpoint,
     /// in canonical order. The TTL is the marker's `cache_control`
     /// ephemeral lifetime (5m default, 1h opt-in) — see
-    /// [`collect_breakpoints`] for how a section with several cached
+    /// `collect_breakpoints` for how a section with several cached
     /// blocks resolves to one TTL.
     pub partials: Vec<(PromptBreakpoint, CacheTtl, String)>,
 }
@@ -559,7 +559,7 @@ pub enum PromptBreakpoint {
     AfterTools,
     /// After the system section — any cache marker on any block in
     /// [`Prompt::system`] produces this. Coarse by design for the
-    /// same reason as [`AfterTools`].
+    /// same reason as [`AfterTools`](Self::AfterTools).
     AfterSystem,
     /// After message index `i`, inclusive. Emitted iff
     /// `prompt.messages[i]`'s content has at least one block with

@@ -894,7 +894,7 @@ impl GrammarState {
 
     /// True iff feeding `bytes` would succeed AND leave the matcher in
     /// an accepting state — the EOG-doubles-as-exit test (see
-    /// [`grammar_filter`]'s EOG policy). Does not mutate `self`.
+    /// `grammar_filter`'s EOG policy). Does not mutate `self`.
     pub fn completes_with(&self, bytes: &[u8]) -> bool {
         self.inner.completes_with(&self.grammar, bytes)
     }

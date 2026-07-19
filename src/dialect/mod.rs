@@ -6,7 +6,7 @@
 //! value drives both the GBNF emitter (Phase D) and the generic
 //! envelope parser (Phase D), so enforce/parse/re-ingest can't drift
 //! apart. It is **derived from** the template by differential
-//! probing ([`analyzer`]): render sentinel payloads, diff the
+//! probing (`analyzer`): render sentinel payloads, diff the
 //! outputs, extract the markers. Baked constants cover the known
 //! families; a `<model>.dialect.toml` sidecar overrides analysis
 //! when a finetune's template misdetects.
