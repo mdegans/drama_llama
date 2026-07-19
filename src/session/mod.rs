@@ -1791,7 +1791,7 @@ pub trait FromPath: Sized + Send {
     /// Load a model from disk and wire up the chat template.
     ///
     /// Looks for a sampling sidecar, `sampling.toml` and applies it via
-    /// [`Self::with_sample_options`]. If none exists, writes the default so the
+    /// [`Session::with_sample_options`](crate::Session::with_sample_options). If none exists, writes the default so the
     /// user has a starting point to edit. Requires the `toml` feature; without
     /// it, sidecars are ignored.
     async fn from_path(path: PathBuf) -> Result<Self, SessionError>;

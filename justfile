@@ -14,6 +14,15 @@
 base_features := "cli,toml,axum,serde,stats,json-schema,mtmd"
 gpu_features  := base_features + if os() == "linux" { ",cuda" } else { "" }
 
+# Feature set for the rustdoc gate (`just doc` / `just check`). Held to
+# `base_features` so the doc build REUSES the `just test` compilation on macOS
+# (rustdoc pass only, no recompile) — a pre-commit doc gate is only worth it if
+# it's ~free. Covers the whole library surface including mtmd; the webchat/egui
+# -only items are UI glue and currently add no doc warnings. Full-surface sweep
+# before a release:
+#   cargo doc --no-deps --features "webchat,cli,stats,toml,serde,egui,mtmd"
+doc_features := base_features
+
 # moeflux is macOS-only (Metal kernels) and selects its model at COMPILE time —
 # each model is its own feature, exactly one enabled at a time. Hence a variable
 # rather than a constant: override with
@@ -136,6 +145,29 @@ example name *args:
 # Format the tree with rustfmt (the pre-commit hook enforces this).
 fmt:
     cargo fmt
+
+# Build the docs with broken/private intra-doc links promoted to hard errors —
+# the rustdoc gate the pre-commit hook enforces (issue #47). Shares `just test`'s
+# target dir + feature set, so on macOS it reuses that build and only runs the
+# rustdoc pass. A regression fails the commit; fix the link, point it at the
+# public item, or drop it to a plain `code span`.
+doc:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_TARGET_DIR="{{gpu_target}}"
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "{{doc_features}}"
+
+# Fast static gate: rustfmt-clean + rustdoc-clean, no model tests (those are
+# `just test`, which the pre-commit hook runs separately). Run by hand for a
+# quick "is the tree lint-clean" without paying the test-suite cost.
+check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "+ cargo fmt --check"
+    cargo fmt --check
+    echo "+ just doc (rustdoc -D warnings)"
+    just doc
+    echo "check: ok"
 
 # Point git at the versioned hooks in .githooks/ — one config line, no copying,
 # and the hook stays under review like any other file. See .githooks/pre-commit

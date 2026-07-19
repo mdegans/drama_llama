@@ -3,11 +3,14 @@
 # Installed by `just install-hooks`, which points core.hooksPath here — so this
 # file is versioned and every clone gets the same gate with one command.
 #
-# Two checks, both cheap enough to sit in front of every commit:
+# Two gates, both cheap enough to sit in front of every commit:
 #
-#   1. rustfmt is clean (the whole tree, not just the diff — a formatter is
-#      only useful if the tree is a fixed point of it).
-#   2. the unignored test suite passes.
+#   1. `just check` — rustfmt is clean (the whole tree, not just the diff — a
+#      formatter is only useful if the tree is a fixed point of it) AND rustdoc
+#      is clean (broken/private intra-doc links promoted to hard errors). The
+#      doc build reuses the test build's artifacts, so it's a rustdoc pass, not
+#      a recompile.
+#   2. `just test` — the unignored test suite passes.
 #
 # The #[ignore]'d tests are deliberately NOT run: they load 13-18 GB models
 # onto a GPU and take minutes. Those are `just test full`, run by hand.
@@ -24,10 +27,11 @@ if ! grep -qE '(\.rs$|^Cargo\.(toml|lock)$|^justfile$|^rustfmt\.toml$)' <<<"$sta
     exit 0
 fi
 
-echo "pre-commit: cargo fmt --check"
-if ! cargo fmt --check; then
+echo "pre-commit: just check (rustfmt + rustdoc)"
+if ! just check; then
     echo >&2
-    echo "pre-commit: FAILED — tree is not rustfmt-clean. Run \`just fmt\`." >&2
+    echo "pre-commit: FAILED — tree is not fmt/doc-clean (see above)." >&2
+    echo "pre-commit:   \`just fmt\` fixes formatting; fix or de-link a broken doc link for rustdoc." >&2
     exit 1
 fi
 

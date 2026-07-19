@@ -292,7 +292,7 @@ impl Mtmd {
     /// Tokenize `text` (containing one [`Self::marker`] per image,
     /// in order) into [`MediaChunk`]s using placeholder bitmaps —
     /// dims and identity only, no pixels touched. See
-    /// [`Vision::tokenize`] for the flag semantics.
+    /// [`Vision::tokenize_image`](crate::Vision::tokenize_image) for the flag semantics.
     pub fn tokenize(
         &self,
         text: &str,
@@ -393,11 +393,11 @@ impl Vision<LlamaCppDecoder> for Mtmd {
     /// Rust-owned eval loop (Phase C+D): tokenize a lone marker with
     /// the one real bitmap, encode on the projector, scan the
     /// encoder output for non-finite values BEFORE any KV write,
-    /// then decode the embeddings through [`EmbdBatch`] views with
+    /// then decode the embeddings through `EmbdBatch` views with
     /// normal or M-RoPE positions and the non-causal attention
     /// toggle (Gemma-style) guarded on every error path.
     /// Differential-tested against the bound upstream helper
-    /// ([`Mtmd::prefill_image_via_helper`]).
+    /// (`Mtmd::prefill_image_via_helper`).
     fn prefill_image(
         &mut self,
         decoder: &mut LlamaCppDecoder,
