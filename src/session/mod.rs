@@ -305,10 +305,6 @@ impl SessionError {
     }
 }
 
-/// Default maximum tokens per [`Session::complete_text`] call. Users override
-/// via [`Session::with_max_tokens`].
-const DEFAULT_MAX_TOKENS: usize = 1024;
-
 /// One unit of prefix-cache identity: a single text token, or one
 /// media item (image) identified by its content hash.
 ///
@@ -1522,7 +1518,6 @@ pub struct Session<B: Backend> {
     /// matches (the conversation continues its stream), fresh random
     /// state otherwise.
     seed: Option<std::num::NonZeroU128>,
-    max_tokens: NonZeroUsize,
     /// Emit-side special-token ban (on by default): the sampled token
     /// is checked against [`Session::emit_ban_set`] each step, and
     /// chat-framing specials the dialect never legitimately emits are
@@ -1855,7 +1850,7 @@ impl Session<LlamaCppBackend> {
     /// [`Self::from_path_sync`] inherits llama.cpp's default `n_ctx = 512`,
     /// which truncates chat and structured-output workloads well
     /// before they finish. Use this builder when the prompt plus the
-    /// generation cap ([`Self::with_max_tokens`]) can exceed 512
+    /// generation cap (`prompt.max_tokens`) can exceed 512
     /// tokens — which is almost always for reasoning-capable models.
     /// Typical values: 4096 – 16384. Sidecar handling matches
     /// [`Self::from_path_sync`].
@@ -2026,7 +2021,6 @@ impl<B: Backend> Session<B> {
                 .with_thought_reingest(thought_reingest),
             sample_options: SamplerConfig::default(),
             seed: None,
-            max_tokens: NonZeroUsize::new(DEFAULT_MAX_TOKENS).unwrap(),
             emit_specials_ban: true,
             emit_ban: Vec::new(),
             prefix_cache: None,
@@ -2253,41 +2247,8 @@ impl<B: Backend> Session<B> {
         self
     }
 
-    /// Set the maximum tokens generated per `complete_*` call.
-    ///
-    /// This is a *defensive* generation cap. Every `Prompt` carries its
-    /// own [`Prompt::max_tokens`] (Anthropic-API required field,
-    /// `NonZeroU32`), and the effective cap for any call is
-    /// `min(prompt.max_tokens, self.max_tokens)` — per-request wins when
-    /// it's smaller, Session's cap clips it when the request asks for
-    /// more than this Session is willing to emit. Set this high (or to
-    /// the model's `n_ctx`) if you want Prompt's value to always win.
-    ///
-    /// This is a *generation* cap, independent of the engine's KV
-    /// context size (`n_ctx`). If the prompt plus `n` exceeds the
-    /// engine's configured `n_ctx`, generation truncates at the KV
-    /// cache boundary regardless of this value — reached via
-    /// [`Self::from_path_with_n_ctx`] or by constructing an
-    /// [`LlamaCppEngine`](crate::LlamaCppEngine) directly.
-    pub fn with_max_tokens(mut self, n: NonZeroUsize) -> Self {
-        self.max_tokens = n;
-        self
-    }
-
-    /// Effective generation cap for a single call: the minimum of
-    /// `prompt.max_tokens` (per-request, Anthropic-API-required) and
-    /// `self.max_tokens` (Session-level defensive ceiling).
-    ///
-    /// Both inputs are `NonZero`, so the minimum is also `NonZero`.
-    fn effective_max_tokens(&self, prompt: &Prompt) -> NonZeroUsize {
-        let req = prompt.max_tokens.get() as usize;
-        let cap = self.max_tokens.get();
-        NonZeroUsize::new(req.min(cap))
-            .expect("min of two NonZero values is NonZero")
-    }
-
     /// Assemble the effective per-call [`PredictOptions`]: model stop
-    /// sequences, the session's token budget and seed, and the
+    /// sequences, the prompt's token budget and the session's seed, and the
     /// effective sampler config — session-stable knobs plus the
     /// call-derived `modes` / `deferred_grammar` from
     /// [`PreparedCall`]. The single construction site for all three
@@ -2301,7 +2262,15 @@ impl<B: Backend> Session<B> {
     ) -> PredictOptions {
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
-        predict_opts.n = self.effective_max_tokens(prompt);
+        // The generation cap is the prompt's `max_tokens` (Anthropic wire
+        // field, a `NonZeroU32` that is always present) — the sole
+        // authority since the Session-level ceiling was removed. NOTE: a
+        // per-turn output cap is a *model-card* concern with no GGUF
+        // backing — llama.cpp's typed `general.sampling.*` metadata stops
+        // at mirostat, and `context_length` is the KV window, not an
+        // output ceiling — so there is nothing to read from the model.
+        predict_opts.n =
+            NonZeroUsize::new(prompt.max_tokens.get() as usize).unwrap();
         predict_opts.seed = self.seed;
         // `ToolChoice::None` — "must not use any tool" (issue #44) — is
         // enforced here rather than by a grammar: the standing emit-ban
@@ -4050,7 +4019,7 @@ impl<B: Backend> Session<B> {
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
-        let headroom = self.effective_max_tokens(prompt).get();
+        let headroom = prompt.max_tokens.get() as usize;
         self.check_context_fit(&entries, headroom)?;
 
         let (suffix, cache_read, prefill_start, cached_state, active_seq) =
@@ -4341,7 +4310,7 @@ impl<B: Backend> Session<B> {
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
-        let headroom = self.effective_max_tokens(prompt).get();
+        let headroom = prompt.max_tokens.get() as usize;
         self.check_context_fit(&entries, headroom)?;
 
         let (suffix, cache_read, prefill_start, cached_state, active_seq) =
@@ -4476,7 +4445,7 @@ impl<B: Backend> Session<B> {
             media_sentinel,
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
-        let headroom = self.effective_max_tokens(prompt).get();
+        let headroom = prompt.max_tokens.get() as usize;
         self.check_context_fit(&entries, headroom)?;
 
         let (suffix, cache_read, prefill_start, cached_state, active_seq) =
@@ -4791,7 +4760,7 @@ impl<B: Backend> Session<B> {
             &blocks,
             &raw_text,
             generated_count,
-            self.effective_max_tokens(prompt),
+            NonZeroUsize::new(prompt.max_tokens.get() as usize).unwrap(),
             prompt.stop_sequences.as_deref(),
         );
 
@@ -4865,7 +4834,7 @@ impl<B: Backend> Session<B> {
     }
 
     /// Greedy-driven diagnostic: render the prompt, decode it, then
-    /// greedy-sample up to [`Session::with_max_tokens`] tokens, recording the
+    /// greedy-sample up to `prompt.max_tokens` tokens, recording the
     /// **top-k candidates + their logits + decoded pieces** at every generated
     /// position.
     ///
@@ -4910,9 +4879,10 @@ impl<B: Backend> Session<B> {
         let k_nz = NonZeroUsize::new(k.max(1)).unwrap();
         let eos = self.engine.model.eos();
 
-        let mut predictor = self
-            .engine
-            .predict_candidates(tokens, self.effective_max_tokens(prompt));
+        let mut predictor = self.engine.predict_candidates(
+            tokens,
+            NonZeroUsize::new(prompt.max_tokens.get() as usize).unwrap(),
+        );
         let mut trace: Vec<TokenTrace> = Vec::new();
         let mut position: usize = 0;
 
@@ -5592,6 +5562,7 @@ fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
 
     // -----------------------------------------------------------------
     // Pure-Rust helper tests — no model, no KV, no #[ignore].
@@ -5957,7 +5928,6 @@ mod tests {
     #[test]
     fn test_resolve_grammar_output_config_when_no_tool_choice() {
         use misanthropic::prompt::thinking::Thinking;
-        use std::num::NonZeroU32;
         let prompt = Prompt::default()
             .json_schema(serde_json::json!({
                 "type": "object",
@@ -6583,10 +6553,10 @@ mod tests {
         let mut session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
             .quiet()
-            .with_max_tokens(NonZeroUsize::new(16).unwrap())
             .with_prefix_cache(true);
         let mut prompt = Prompt::default()
             .system("You are a helpful assistant. Keep replies short.")
+            .max_tokens(NonZeroU32::new(16).unwrap())
             .cache()
             .add_message((crate::Role::User, "Pick a number 1-10."))
             .unwrap();
@@ -6630,11 +6600,11 @@ mod tests {
         // Cache OFF: honestly not reported.
         let mut off = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(16).unwrap());
+            .quiet();
         let cold = off
             .complete_response(
                 &Prompt::default()
+                    .max_tokens(NonZeroU32::new(16).unwrap())
                     .add_message((crate::Role::User, "Pick a number 1-10."))
                     .unwrap(),
             )
@@ -7463,8 +7433,14 @@ mod tests {
         /// System (cached) + one user turn of question text followed
         /// by the image, with a cache marker on the turn.
         fn image_prompt(question: &str, api: ApiImage) -> Prompt {
+            // Small generation bound to keep these ignored media tests fast
+            // AND to keep the check_context_fit headroom reservation small:
+            // for media prompts (cells > positions) a large max_tokens can
+            // push prompt_pos + max_tokens past n_ctx (esp. the 4096 Gemma
+            // path). The cap lives on the prompt now, not the session.
             let mut p = Prompt::default()
                 .system("You are a concise assistant.")
+                .max_tokens(NonZeroU32::new(24).unwrap())
                 .cache();
             p.messages.push(crate::Message {
                 role: crate::Role::User,
@@ -7500,8 +7476,7 @@ mod tests {
                 crate::LlamaCppSession::from_path_with_n_ctx(path, n_ctx)
                     .unwrap()
                     .quiet()
-                    .with_prefix_cache(true)
-                    .with_max_tokens(NonZeroUsize::new(24).unwrap());
+                    .with_prefix_cache(true);
             assert!(
                 session.engine().vision().is_some(),
                 "mmproj sidecar should auto-load (symlinks resolve to \
@@ -7724,6 +7699,7 @@ mod tests {
             let mut session = media_session().with_sampling(std::iter::empty());
             let mut p = Prompt::default()
                 .system("You are a concise assistant.")
+                .max_tokens(NonZeroU32::new(24).unwrap())
                 .cache();
             p.messages.push(crate::Message {
                 role: crate::Role::User,

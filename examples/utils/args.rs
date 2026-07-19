@@ -115,12 +115,9 @@ impl CommonArgs {
         session = session.quiet();
         session =
             session.with_seed(self.seed.and_then(std::num::NonZeroU128::new));
-        if let Some(max_tokens) = self.max_tokens {
-            session = session.with_max_tokens(
-                std::num::NonZeroUsize::new(max_tokens.get() as usize)
-                    .expect("NonZeroU32 fits NonZeroUsize"),
-            );
-        }
+        // The `--max-tokens` override now rides on the prompt via
+        // [`Self::configure`] (`prompt.max_tokens`), the sole generation cap
+        // since `Session::with_max_tokens` was removed.
         session
     }
 }

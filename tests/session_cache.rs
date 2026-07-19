@@ -13,7 +13,7 @@
 
 #![cfg(feature = "llama-cpp")]
 
-use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
+use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
     Block, Content, LlamaCppSession, Message, Prompt, Role, SamplingMode,
@@ -31,7 +31,6 @@ fn session(prefix_cache: bool) -> LlamaCppSession {
         .quiet()
         .without_repetition()
         .with_sampling([SamplingMode::Greedy])
-        .with_max_tokens(NonZeroUsize::new(48).unwrap())
         .with_prefix_cache(prefix_cache)
 }
 
@@ -54,6 +53,7 @@ fn base_prompt() -> Prompt {
             "You are a concise assistant. Answer in one short sentence.",
         )),
         messages: vec![cached_user("Name a primary color.")],
+        max_tokens: NonZeroU32::new(48).unwrap(),
         ..Prompt::default()
     }
 }
@@ -237,7 +237,6 @@ fn multi_agent_round_robin_hits() {
             .quiet()
             .without_repetition()
             .with_sampling([SamplingMode::Greedy])
-            .with_max_tokens(NonZeroUsize::new(32).unwrap())
             .with_prefix_cache(true);
 
     let personas = [
@@ -247,7 +246,10 @@ fn multi_agent_round_robin_hits() {
     ];
     let mut prompts: Vec<Prompt> = personas
         .iter()
-        .map(|p| agent_prompt(p, "Introduce yourself."))
+        .map(|p| {
+            agent_prompt(p, "Introduce yourself.")
+                .max_tokens(NonZeroU32::new(32).unwrap())
+        })
         .collect();
 
     // Round 1: every agent's first turn is a legitimate miss.
@@ -280,7 +282,6 @@ fn capacity_eviction_recovers() {
             .quiet()
             .without_repetition()
             .with_sampling([SamplingMode::Greedy])
-            .with_max_tokens(NonZeroUsize::new(24).unwrap())
             .with_prefix_cache_config(drama_llama::PrefixCacheConfig {
                 max_slots: 3,
                 // Each agent's history is ~33 cells and an incoming call
@@ -291,9 +292,12 @@ fn capacity_eviction_recovers() {
                 capacity_cells: Some(100),
             });
 
-    let a = agent_prompt("You are agent A. One short sentence.", "Say 'A'.");
-    let b = agent_prompt("You are agent B. One short sentence.", "Say 'B'.");
-    let c = agent_prompt("You are agent C. One short sentence.", "Say 'C'.");
+    let a = agent_prompt("You are agent A. One short sentence.", "Say 'A'.")
+        .max_tokens(NonZeroU32::new(24).unwrap());
+    let b = agent_prompt("You are agent B. One short sentence.", "Say 'B'.")
+        .max_tokens(NonZeroU32::new(24).unwrap());
+    let c = agent_prompt("You are agent C. One short sentence.", "Say 'C'.")
+        .max_tokens(NonZeroU32::new(24).unwrap());
 
     session.complete_response(&a).expect("A primes");
     session.complete_response(&b).expect("B primes");

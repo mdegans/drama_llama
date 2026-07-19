@@ -11,7 +11,7 @@
 
 #![cfg(feature = "llama-cpp")]
 
-use std::num::{NonZeroU128, NonZeroUsize};
+use std::num::{NonZeroU128, NonZeroU32};
 use std::path::PathBuf;
 
 use drama_llama::{
@@ -38,6 +38,7 @@ fn prompt() -> Prompt {
                  you can.",
             ),
         }],
+        max_tokens: NonZeroU32::new(64).unwrap(),
         ..Prompt::default()
     }
 }
@@ -54,7 +55,6 @@ fn session(constrained_regions: bool) -> LlamaCppSession {
     LlamaCppSession::from_path_sync(model_path())
         .expect("session load")
         .quiet()
-        .with_max_tokens(NonZeroUsize::new(64).unwrap())
         .with_seed(Some(NonZeroU128::new(0xC0FFEE).unwrap()))
         .with_sample_options(opts)
 }

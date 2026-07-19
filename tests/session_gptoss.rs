@@ -8,7 +8,7 @@
 //! `#[ignore]`d. Run with
 //! `cargo test --features serde,cuda --test session_gptoss -- --ignored`.
 
-use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
+use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
     prompt::{ToolResult, ToolUse},
@@ -32,12 +32,11 @@ fn install_template_sidecar() {
     std::fs::copy(&fixture, &sidecar).expect("install template sidecar");
 }
 
-fn load_session(max_tokens: usize) -> drama_llama::LlamaCppSession {
+fn load_session() -> drama_llama::LlamaCppSession {
     install_template_sidecar();
     drama_llama::LlamaCppSession::from_path_sync(model_path())
         .expect("session load")
         .quiet()
-        .with_max_tokens(NonZeroUsize::new(max_tokens).unwrap())
 }
 
 fn count_letters_prompt() -> Prompt {
@@ -77,7 +76,7 @@ fn count_letters_prompt() -> Prompt {
 #[test]
 #[ignore = "requires gpt-oss model"]
 fn dialect_resolves_to_gpt_oss_at_load() {
-    let session = load_session(16);
+    let session = load_session();
     assert_eq!(
         session.dialect(),
         &CallSyntax::gpt_oss(),
@@ -92,8 +91,9 @@ fn dialect_resolves_to_gpt_oss_at_load() {
 #[test]
 #[ignore = "requires gpt-oss model"]
 fn forced_call_parses_to_tool_use() {
-    let prompt = count_letters_prompt();
-    let mut session = load_session(1024);
+    let prompt =
+        count_letters_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
+    let mut session = load_session();
 
     let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
     println!("=== forced blocks ===\n{blocks:#?}\n===");
@@ -142,9 +142,10 @@ fn forced_call_parses_to_tool_use() {
 #[test]
 #[ignore = "requires gpt-oss model"]
 fn auto_tool_choice_parses_native_call() {
-    let mut prompt = count_letters_prompt();
+    let mut prompt =
+        count_letters_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
     prompt.tool_choice = Some(ToolChoice::auto());
-    let mut session = load_session(1024);
+    let mut session = load_session();
 
     let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
     println!("=== auto blocks ===\n{blocks:#?}\n===");
@@ -174,8 +175,9 @@ fn auto_tool_choice_parses_native_call() {
 fn emission_round_trips_through_parse_and_render() {
     use drama_llama::AssistantMessage;
 
-    let prompt = count_letters_prompt();
-    let mut session = load_session(1024);
+    let prompt =
+        count_letters_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
+    let mut session = load_session();
     println!("=== dialect ===\n{:#?}\n===", session.dialect());
 
     let render_opts = RenderOptions::default()
@@ -263,7 +265,7 @@ fn emission_round_trips_through_parse_and_render() {
 fn announce_then_call_round_trips_in_emission_order() {
     use drama_llama::AssistantMessage;
 
-    let session = load_session(1024);
+    let session = load_session();
     let prompt = count_letters_prompt();
 
     // Shared render options; only the generation-prompt flag differs
@@ -365,7 +367,8 @@ fn announce_then_call_round_trips_in_emission_order() {
 #[ignore = "requires gpt-oss model"]
 fn tool_result_turn_produces_prose_answer() {
     let call_id = "call_0_count_letters";
-    let mut prompt = count_letters_prompt();
+    let mut prompt =
+        count_letters_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
     prompt.tool_choice = None;
     prompt.messages.push(Message {
         role: Role::Assistant,
@@ -391,7 +394,7 @@ fn tool_result_turn_produces_prose_answer() {
         }]),
     });
 
-    let mut session = load_session(1024);
+    let mut session = load_session();
     let out = session.complete_text(&prompt).expect("complete_text");
     println!("=== turn 2 ===\n{out}\n===");
     assert!(!out.trim().is_empty(), "got empty output");
@@ -409,7 +412,8 @@ fn tool_result_turn_produces_prose_answer() {
 fn prefix_cache_survives_tool_turn() {
     use misanthropic::prompt::message::AssistantMessage;
 
-    let mut prompt = count_letters_prompt();
+    let mut prompt =
+        count_letters_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
     if let Some(tools) = prompt.tools.as_mut() {
         if let Some(def) = tools.first_mut() {
             if let Some(tool) = def.as_method_mut() {
@@ -419,7 +423,7 @@ fn prefix_cache_survives_tool_turn() {
             }
         }
     }
-    let mut session = load_session(1024).with_prefix_cache(true);
+    let mut session = load_session().with_prefix_cache(true);
 
     let blocks = session.complete_blocks(&prompt).expect("turn 1");
     let call = blocks
@@ -544,7 +548,7 @@ fn gptoss_eog_token_set() {
 fn prefix_cache_survives_final_turn() {
     use drama_llama::AssistantMessage;
 
-    let mut session = load_session(1024).with_prefix_cache(true);
+    let mut session = load_session().with_prefix_cache(true);
     let mut prompt = Prompt {
         system: Some(Content::text("You are a helpful assistant.")),
         messages: vec![Message {
@@ -554,7 +558,8 @@ fn prefix_cache_survives_final_turn() {
             ),
         }],
         ..Default::default()
-    };
+    }
+    .max_tokens(NonZeroU32::new(1024).unwrap());
 
     let blocks = session.complete_blocks(&prompt).expect("turn 1");
     assert!(

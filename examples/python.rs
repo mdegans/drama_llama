@@ -250,6 +250,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cache()
         .add_message((Role::User, args.prompt))?;
 
+    // Apply the shared `--max-tokens` / `--system` overrides onto the prompt.
+    // (Other examples call this; python didn't — after the Session-level
+    // max_tokens cap was removed, the prompt is the sole home for the
+    // generation budget, so `--max-tokens` only works via this call.)
+    chat = args.common.configure(chat);
+
     // Call the tool and retry up to 3 times.
     for retry in 0..3 {
         let message = transport.send(&chat).await?;

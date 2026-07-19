@@ -13,7 +13,7 @@
 
 #![cfg(feature = "llama-cpp")]
 
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::{num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{Block, LlamaCppSession, Prompt, Role, SamplingMode};
 
@@ -85,8 +85,7 @@ fn run_auto_toolcall(tool: misanthropic::tool::CustomMethodDef) {
         .expect("session load")
         .quiet()
         .without_repetition()
-        .with_sampling([SamplingMode::Greedy])
-        .with_max_tokens(NonZeroUsize::new(256).unwrap());
+        .with_sampling([SamplingMode::Greedy]);
 
     let prompt = Prompt {
         system: Some(misanthropic::prompt::message::Content::text(
@@ -103,6 +102,7 @@ fn run_auto_toolcall(tool: misanthropic::tool::CustomMethodDef) {
             ),
         }],
         tools: Some(vec![tool.into()]),
+        max_tokens: NonZeroU32::new(256).unwrap(),
         ..Prompt::default()
     };
 

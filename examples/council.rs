@@ -470,17 +470,14 @@ fn main() -> Result<(), BoxError> {
     // One model, one session, one cache slot per seat.
     let seats = ADVISORS.len() as u32 + 2; // advisors + jester + judge
     let mut session = cli.common.session_with_cache_slots(seats)?;
-    if cli.common.max_tokens.is_none() {
-        // Filings and rulings are long-form; 1024 truncated a jester
-        // rebuttal, 2048 an engineer reaction (runs five and six) —
-        // on the forced path that is a typed GrammarViolation and
-        // adjourns the council. Not 8192: `check_context_fit`
-        // reserves this much headroom per call out of the shared
-        // `--n-ctx` budget above.
-        session = session.with_max_tokens(
-            std::num::NonZeroUsize::new(4096).expect("nonzero"),
-        );
-    }
+    // Filings and rulings are long-form; the seats rely on the prompt's
+    // `max_tokens` default (4096) as the generation budget — 1024 truncated
+    // a jester rebuttal, 2048 an engineer reaction (runs five and six), and
+    // on the forced path that is a typed GrammarViolation that adjourns the
+    // council. Not 8192: `check_context_fit` reserves `max_tokens` of
+    // headroom per call out of the shared `--n-ctx` budget above. The
+    // Session-level cap was removed, so this budget now lives on the seat
+    // prompts (`Prompt::default().max_tokens` == 4096).
 
     let mut advisors: Vec<Seat> = ADVISORS
         .iter()

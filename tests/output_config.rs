@@ -17,7 +17,7 @@
 //! thought-prefix behavior rather than a vanity demo.
 #![cfg(feature = "json-schema")]
 
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::{num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{Block, Content, Prompt, RenderOptions, Role, Session};
 
@@ -99,10 +99,10 @@ fn whodunit_verdict() {
         .quiet()
         .with_render_opts(
             RenderOptions::default().with_extra("enable_thinking", true),
-        )
-        .with_max_tokens(NonZeroUsize::new(4096).unwrap());
+        );
 
     let prompt = Prompt::default()
+        .max_tokens(NonZeroU32::new(4096).unwrap())
         .structured_output::<CaseFile>()
         .system(
             "You are a brief, decisive detective. Think before \

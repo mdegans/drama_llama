@@ -31,7 +31,7 @@
 
 #![cfg(all(feature = "moeflux", target_os = "macos"))]
 
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use drama_llama::{Message, MoefluxEngine, Prompt, Role, Session};
@@ -65,11 +65,11 @@ fn build_session() -> Session<drama_llama::MoefluxBackend> {
     Session::from_engine(engine)
         .expect("Session::from_engine")
         .with_prefix_cache(true)
-        .with_max_tokens(NonZeroUsize::new(MAX_TOKENS).unwrap())
 }
 
 fn user_prompt(system: &'static str, user: &'static str) -> Prompt {
     Prompt::default()
+        .max_tokens(NonZeroU32::new(MAX_TOKENS as u32).unwrap())
         .system(system)
         .add_message((Role::User, user))
         .unwrap()
@@ -223,12 +223,14 @@ fn partial_hit_output_matches_fresh_session() {
     // `.cache()` after `.system(...)` marks the system block (the
     // last cacheable block at that point in the chain).
     let turn1 = Prompt::default()
+        .max_tokens(NonZeroU32::new(MAX_TOKENS as u32).unwrap())
         .system(system_text)
         .cache()
         .add_message(cached_user(user1_text))
         .unwrap();
 
     let turn2 = Prompt::default()
+        .max_tokens(NonZeroU32::new(MAX_TOKENS as u32).unwrap())
         .system(system_text)
         .cache()
         .add_message(cached_user(user1_text))

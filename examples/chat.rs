@@ -169,15 +169,9 @@ async fn main() -> Result<(), BoxError> {
     }
 
     let mut session = cli.common.session_with_cache_slots(1)?;
-    if cli.common.max_tokens.is_none() {
-        // Council-sized filings need council-sized budgets: a forced
-        // seat that hits the cap mid-call is a typed GrammarViolation,
-        // not a graceful truncation (the council learned this at 1024
-        // and 2048; its default is what interviews inherit here).
-        session = session.with_max_tokens(
-            std::num::NonZeroUsize::new(4096).expect("nonzero"),
-        );
-    }
+    // Generation budget rides on the prompt (`prompt.max_tokens`, default
+    // 4096 — ample for council-sized filings) since the Session-level cap
+    // was removed; `--max-tokens` overrides it via `CommonArgs::configure`.
 
     match &cli.load {
         Some(path) => println!(

@@ -22,7 +22,7 @@
 
 #![cfg(all(feature = "moeflux", target_os = "macos"))]
 
-use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
+use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
     Block, Content, Message, MoefluxEngine, Prompt, Role, Session,
@@ -58,7 +58,6 @@ fn build_session() -> Session<drama_llama::MoefluxBackend> {
     Session::from_engine(engine)
         .expect("Session::from_engine")
         .with_prefix_cache(true)
-        .with_max_tokens(NonZeroUsize::new(48).unwrap())
 }
 
 /// A cache-marked user turn.
@@ -82,6 +81,7 @@ fn agent_prompt(persona: &'static str, user: &'static str) -> Prompt {
             citations: None,
         }])),
         messages: vec![cached_user(user)],
+        max_tokens: NonZeroU32::new(48).unwrap(),
         ..Prompt::default()
     }
 }

@@ -4,7 +4,7 @@
 //! `#[ignore = "requires model"]`. Run with
 //! `cargo test --test session -- --ignored`.
 
-use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
+use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
     prompt::{ToolResult, ToolUse},
@@ -98,6 +98,7 @@ fn complete_text_strawberry_turn_2() {
             },
         ],
         tools: Some(vec![tool.into()]),
+        max_tokens: NonZeroU32::new(256).unwrap(),
         ..Default::default()
     };
 
@@ -106,8 +107,7 @@ fn complete_text_strawberry_turn_2() {
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(256).unwrap());
+            .quiet();
 
     let out = session.complete_text(&prompt).expect("complete_text");
     println!("=== complete_text output ===\n{out}\n===");
@@ -159,6 +159,7 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
         }],
         tools: Some(vec![tool.into()]),
         tool_choice: Some(ToolChoice::method("count_letters")),
+        max_tokens: NonZeroU32::new(128).unwrap(),
         ..Default::default()
     };
 
@@ -166,8 +167,7 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
             .quiet()
-            .with_sampling(std::iter::empty()) // user chain empty — only grammar runs
-            .with_max_tokens(NonZeroUsize::new(128).unwrap());
+            .with_sampling(std::iter::empty()); // user chain empty — only grammar runs
 
     let out = session.complete_text(&prompt).expect("complete_text");
     println!("=== forced-call output ===\n{out}\n===");
@@ -224,12 +224,12 @@ fn strawberry_turn_1_prompt() -> Prompt {
 #[test]
 #[ignore = "requires model"]
 fn complete_returns_message_with_tool_use() {
-    let prompt = strawberry_turn_1_prompt();
+    let prompt =
+        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(256).unwrap());
+            .quiet();
 
     let assistant = session.complete(&prompt).expect("complete");
     println!("=== complete message ===\n{assistant:#?}\n===");
@@ -266,12 +266,13 @@ fn complete_returns_message_with_tool_use() {
 #[test]
 #[ignore = "requires model"]
 fn grammar_violation_on_truncated_tool_call() {
-    let prompt = strawberry_turn_1_prompt();
+    // truncate hard
+    let prompt =
+        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(4).unwrap());
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(4).unwrap()); // truncate hard
+            .quiet();
 
     let err = session
         .complete_blocks(&prompt)
@@ -304,12 +305,12 @@ fn grammar_violation_on_truncated_tool_call() {
 fn complete_text_round_trips_through_parse_and_render() {
     use drama_llama::AssistantMessage;
 
-    let prompt = strawberry_turn_1_prompt();
+    let prompt =
+        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(256).unwrap());
+            .quiet();
     println!("=== dialect ===\n{:#?}\n===", session.dialect());
 
     // Mirror the session's own render defaults (`from_engine`):
@@ -394,13 +395,13 @@ fn complete_text_round_trips_through_parse_and_render() {
 #[test]
 #[ignore = "requires model"]
 fn auto_tool_choice_parses_native_dialect_call() {
-    let mut prompt = strawberry_turn_1_prompt();
+    let mut prompt =
+        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
     prompt.tool_choice = Some(ToolChoice::auto());
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(1024).unwrap());
+            .quiet();
 
     let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
     println!("=== auto blocks ===\n{blocks:#?}\n===");
@@ -433,13 +434,13 @@ fn auto_tool_choice_parses_native_dialect_call() {
 #[test]
 #[ignore = "requires model"]
 fn tool_choice_none_forbids_calls_defs_still_rendered() {
-    let mut prompt = strawberry_turn_1_prompt();
+    let mut prompt =
+        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
     prompt.tool_choice = Some(ToolChoice::none());
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(256).unwrap());
+            .quiet();
 
     // Prefix preservation: `tool_choice` never touches the render, only
     // the sampler — so the prompt under `None` is byte-identical to the
@@ -485,10 +486,12 @@ fn thinking_works_under_forced_tool_grammar() {
     // Thinking must be *enabled on the prompt* for the template to
     // pre-open `<think>` in the generation prompt — that's the
     // combination this test exists to exercise.
-    let prompt = strawberry_turn_1_prompt().thinking(Thinking::Enabled {
-        budget_tokens: std::num::NonZeroU32::new(512).unwrap(),
-        display: None,
-    });
+    let prompt = strawberry_turn_1_prompt()
+        .max_tokens(NonZeroU32::new(1024).unwrap())
+        .thinking(Thinking::Enabled {
+            budget_tokens: std::num::NonZeroU32::new(512).unwrap(),
+            display: None,
+        });
     // Explicit n_ctx: `from_path` inherits llama.cpp's default 512,
     // and prefill (~330) + a stream-dependent think phase overflows
     // it — the context ceiling silently ends iteration mid-call and
@@ -498,8 +501,7 @@ fn thinking_works_under_forced_tool_grammar() {
     let mut session =
         drama_llama::LlamaCppSession::from_path_with_n_ctx(model_path(), 4096)
             .expect("session load")
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(1024).unwrap());
+            .quiet();
 
     let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
     println!("=== forced blocks ===\n{blocks:#?}\n===");
@@ -540,7 +542,8 @@ fn thinking_works_under_forced_tool_grammar() {
 fn prefix_cache_survives_tool_turn() {
     use misanthropic::prompt::message::AssistantMessage;
 
-    let mut prompt = strawberry_turn_1_prompt();
+    let mut prompt =
+        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
     // Breakpoint after the tools block anchors the front of the
     // prompt; the auto-tip covers the generated turn.
     if let Some(tools) = prompt.tools.as_mut() {
@@ -556,8 +559,7 @@ fn prefix_cache_survives_tool_turn() {
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
             .quiet()
-            .with_prefix_cache(true)
-            .with_max_tokens(NonZeroUsize::new(1024).unwrap());
+            .with_prefix_cache(true);
 
     // Turn 1: forced call.
     let blocks = session.complete_blocks(&prompt).expect("turn 1");
@@ -610,14 +612,14 @@ fn complete_response_id_uses_supplied_uuid() {
             role: Role::User,
             content: Content::text("Say hi."),
         }],
+        max_tokens: NonZeroU32::new(4).unwrap(),
         ..Default::default()
     };
 
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
-            .quiet()
-            .with_max_tokens(NonZeroUsize::new(4).unwrap());
+            .quiet();
 
     let id = uuid::Uuid::from_u128(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
     let response = session

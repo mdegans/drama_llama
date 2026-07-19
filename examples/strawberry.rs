@@ -20,7 +20,7 @@
 //! [`Tool`]: misanthropic::tool::Tool
 //! [`ToolChoice::method`]: drama_llama::ToolChoice::method
 
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::{num::NonZeroU32, path::PathBuf};
 
 use clap::Parser;
 use drama_llama::{
@@ -108,10 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // (Qwen3, Cogito) pair it with the grammar's optional
                 // thought preamble.
                 .with_extra("enable_thinking", true),
-        )
-        .with_max_tokens(NonZeroUsize::new(256).unwrap());
+        );
 
     let mut chat = Prompt::default()
+        .max_tokens(NonZeroU32::new(256).unwrap())
         .system(
             "You are a helpful assistant. You cannot count letters in a \
              word reliably on your own because you see in tokens, not \

@@ -222,8 +222,7 @@ mod tests {
     async fn send_populates_the_response_and_serializes() {
         let session = crate::LlamaCppSession::from_path_sync(model_path())
             .unwrap()
-            .quiet()
-            .with_max_tokens(std::num::NonZeroUsize::new(8).unwrap());
+            .quiet();
         let transport = SessionTransport::new(session);
 
         // Two prompt-type impls exist; pin one for the call.
@@ -231,6 +230,9 @@ mod tests {
         let info = models.into_iter().next().expect("one advertised model");
 
         let mut prompt = Prompt::default();
+        // Small generation bound to keep this ignored test fast (the cap
+        // now lives on the prompt, not the session).
+        prompt.max_tokens = std::num::NonZeroU32::new(8).unwrap();
         prompt.messages.push(
             (misanthropic::prompt::message::Role::User, "Say hi.").into(),
         );

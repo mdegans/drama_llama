@@ -13,7 +13,7 @@
 
 use std::{
     borrow::Cow,
-    num::{NonZeroU128, NonZeroUsize},
+    num::{NonZeroU128, NonZeroU32},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -32,7 +32,6 @@ fn session() -> LlamaCppSession {
     LlamaCppSession::from_path_sync(model_path())
         .expect("session load")
         .quiet()
-        .with_max_tokens(NonZeroUsize::new(8).unwrap())
         .with_prefix_cache(true)
 }
 
@@ -60,6 +59,7 @@ fn prompt_1() -> Prompt {
     Prompt {
         system: Some(Content::text(SYSTEM)),
         messages: vec![cached_user(USER_1)],
+        max_tokens: NonZeroU32::new(8).unwrap(),
         ..Prompt::default()
     }
 }

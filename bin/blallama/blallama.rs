@@ -541,16 +541,14 @@ fn configure_session<B: Backend>(
     } else {
         s
     };
+    // NOTE: there is no server-side generation ceiling. `prompt.max_tokens`
+    // is the sole generation authority (the Session-level cap was removed);
+    // a request is honored as long as context remains, and one that asks for
+    // more than fits simply fails at generation — we don't babysit a magic
+    // ceiling constant that would need bumping as context windows grow.
     let configured = with_penalty
         .with_seed(seed.and_then(NonZeroU128::new))
-        .with_prefix_cache(true)
-        // Session-level generation cap. Distinct from `n_ctx` — that's the KV
-        // context window, set per-backend at engine construction (llama.cpp:
-        // `from_path_with_n_ctx(_, 65536)`; moeflux: compile-time per model
-        // variant, surfaced in the `session_ready` log below). 8K is the
-        // per-request gen ceiling; the prompt's `max_tokens` wins when smaller,
-        // this clips runaway requests.
-        .with_max_tokens(8192.try_into().unwrap());
+        .with_prefix_cache(true);
     // ProbeHook installation moved to per-request handlers — each /v1/messages
     // request gets a fresh hook bound to its UUID, so the hook can fan out to
     // JSONL, the broadcast bus, or both, with a recorder lifetime that exactly
@@ -558,7 +556,6 @@ fn configure_session<B: Backend>(
     tracing::info!(
         event = "session_ready",
         n_ctx = configured.engine().n_ctx(),
-        session_max_tokens = 8192u32,
         no_penalty,
         seed = seed.map(|n| n as u64),
         model = configured
