@@ -2303,12 +2303,27 @@ impl<B: Backend> Session<B> {
             PredictOptions::default().add_model_stops(&self.engine.model);
         predict_opts.n = self.effective_max_tokens(prompt);
         predict_opts.seed = self.seed;
+        // `ToolChoice::None` — "must not use any tool" (issue #44) — is
+        // enforced here rather than by a grammar: the standing emit-ban
+        // exempts the dialect's tool-call opener (so Auto/Any/Method
+        // can call), so `None` re-adds it for this call alone, leaving
+        // the tool defs rendered and the prefix intact.
+        let banned_specials =
+            if matches!(prompt.tool_choice.as_ref(), Some(ToolChoice::None)) {
+                let mut b = self.emit_ban.clone();
+                b.extend(self.tool_none_ban_set());
+                b.sort_unstable();
+                b.dedup();
+                b
+            } else {
+                self.emit_ban.clone()
+            };
         predict_opts.sample_options = SamplerConfig {
             modes,
             repetition: self.sample_options.repetition.clone(),
             deferred_grammar,
             lazy_grammar: self.sample_options.lazy_grammar,
-            banned_specials: self.emit_ban.clone(),
+            banned_specials,
         };
         predict_opts
     }
@@ -2477,6 +2492,83 @@ impl<B: Backend> Session<B> {
         banned.sort_unstable();
         banned.dedup();
         banned
+    }
+
+    /// The per-call tool-call *opener* ban that enforces
+    /// [`ToolChoice::None`] — "the model must not use any tool, even if
+    /// tools are provided" (issue #44). Unioned into
+    /// [`SamplerConfig::banned_specials`] only for that choice, so the
+    /// tool defs stay rendered (the prefix the model saw is unchanged —
+    /// unlike stripping the defs) while no parseable call can start.
+    ///
+    /// Derived by tokenizing the dialect's call-opener markers
+    /// (`section_start` / `per_call_start`) with `parse_special` and
+    /// keeping the *special* tokens among the pieces: precisely the
+    /// tokens the model must emit to begin a call, and the same bytes
+    /// the parser keys on to recognize one. Specials shared with a
+    /// non-tool structural marker (reasoning tags, turn openers) are
+    /// exempt, so a marker the model legitimately emits in prose is
+    /// never banned. These opener specials are deliberately *exempt*
+    /// from the standing [`Session::emit_ban`] (so `Auto` / `Any` /
+    /// `Method` calls work); `None` re-adds them for its call alone.
+    ///
+    /// Dialects whose openers are not distinct specials yield the
+    /// empty set — Harmony (empty section/per-call; channel-header
+    /// openers share `<|channel|>` / `<|start|>` with ordinary
+    /// messages) and bare-JSON (Llama-3.1, no opener marker at all).
+    /// Those are exactly the dialects the lazy `Auto` path can't
+    /// trigger on either ([`CallSyntax::triggers`] is empty), so `None`
+    /// there is a conservative no-op — defs rendered, free generation —
+    /// rather than a hard guarantee, mirroring that deliberately
+    /// conservative trigger policy: a miss only loses enforcement.
+    ///
+    /// Independent of [`Session::with_emit_specials_ban`]: that toggle
+    /// governs chat-framing specials the dialect never emits, whereas
+    /// this is an explicit per-call API contract the caller opted into
+    /// via `tool_choice`. Sorted (from the [`BTreeSet`]) for the
+    /// sampler's binary search.
+    ///
+    /// [`CallSyntax::triggers`]: crate::CallSyntax::triggers
+    /// [`SamplerConfig::banned_specials`]: crate::SamplerConfig
+    /// [`BTreeSet`]: std::collections::BTreeSet
+    fn tool_none_ban_set(&self) -> Vec<Token> {
+        use std::collections::{BTreeSet, HashSet};
+        let model = &self.engine.model;
+        let syntax = effective_tool_syntax(&self.dialect);
+        let special: HashSet<Token> =
+            model.special_tokens().into_iter().collect();
+        // Special tokens the tokenizer produces for `s` (parse_special),
+        // i.e. the specials the model must emit to reproduce `s`. Empty
+        // for whitespace-only / empty markers.
+        let specials_of = |s: &str| -> Vec<Token> {
+            if s.trim().is_empty() {
+                return Vec::new();
+            }
+            model
+                .tokenize(s, true)
+                .into_iter()
+                .filter(|t| special.contains(t))
+                .collect()
+        };
+        let mut ban: BTreeSet<Token> = BTreeSet::new();
+        for opener in [&syntax.section_start, &syntax.per_call_start] {
+            ban.extend(specials_of(opener));
+        }
+        // A special the model legitimately emits outside a call must
+        // stay generatable: reasoning tags and turn openers. (Harmony's
+        // opener specials fall out here too, but its section/per-call
+        // markers are empty, so `ban` is already empty.)
+        for m in [
+            &syntax.reasoning.start,
+            &syntax.reasoning.end,
+            &syntax.user_start,
+            &syntax.assistant_start,
+        ] {
+            for t in specials_of(m) {
+                ban.remove(&t);
+            }
+        }
+        ban.into_iter().collect()
     }
 
     /// Decoded pieces of every end-of-generation token
@@ -4998,9 +5090,11 @@ fn effective_tool_syntax(
 }
 
 /// Compile the eager (`Any` / `Method`) tool-call grammar for
-/// `prompt` from the session dialect. Returns `Ok(None)` for `Auto`,
-/// `None`, or an absent `tool_choice` — the lazy path
-/// ([`dialect_deferred_grammar_for_prompt`]) owns those.
+/// `prompt` from the session dialect. Returns `Ok(None)` for `Auto`
+/// (owned by the lazy path,
+/// [`dialect_deferred_grammar_for_prompt`]), for `None` (enforced by
+/// the opener ban, [`Session::tool_none_ban_set`] — not a grammar),
+/// and for an absent `tool_choice`.
 fn dialect_grammar_for_prompt(
     prompt: &Prompt,
     dialect: &crate::CallSyntax,
@@ -5020,6 +5114,9 @@ fn dialect_grammar_for_prompt(
         .cloned()
         .collect();
     let (chosen, parallel): (Vec<&Tool>, bool) = match choice {
+        // No forced grammar: `Auto` defers to the lazy trigger path and
+        // `None` is enforced by the opener ban in `predict_options_for`
+        // (issue #44), not by constraining generation.
         ToolChoice::Auto { .. } | ToolChoice::None => return Ok(None),
         ToolChoice::Any {
             disable_parallel_tool_use,
@@ -7278,6 +7375,52 @@ mod tests {
             "dialect reasoning marker must be exempt"
         );
         assert!(!ban.is_empty(), "reserved specials should populate the set");
+    }
+
+    /// `ToolChoice::None` (issue #44): the tool-call opener special is
+    /// banned so no call can start, while reasoning / turn framing and
+    /// the standing emit-ban stay exactly as they were. The opener is
+    /// deliberately absent from the standing emit-ban (so Auto/Any can
+    /// call) — `None`'s ban re-adds it for that call alone.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_tool_none_ban_set_qwen() {
+        let session = crate::LlamaCppSession::from_path_sync(model_path())
+            .unwrap()
+            .quiet();
+        let one = |s: &str| {
+            let toks = session.engine().model.tokenize(s, true);
+            assert_eq!(toks.len(), 1, "{s:?} must be one special token");
+            toks[0]
+        };
+        let none_ban = session.tool_none_ban_set();
+        let in_ban = |t: Token| none_ban.binary_search(&t).is_ok();
+
+        // The opener the standing emit-ban exempts is banned under None.
+        let opener = one("<tool_call>");
+        assert!(
+            in_ban(opener),
+            "tool-call opener must be banned for ToolChoice::None"
+        );
+        assert!(
+            session.emit_ban_set().binary_search(&opener).is_err(),
+            "opener must NOT be in the standing emit-ban (Auto/Any call)"
+        );
+        // Reasoning tags and turn openers the model legitimately emits
+        // stay generatable.
+        assert!(
+            !in_ban(one("<think>")),
+            "reasoning marker must stay generatable"
+        );
+        assert!(
+            !in_ban(one("<|im_start|>")),
+            "turn framing is not a tool-call opener"
+        );
+        // Sorted for the sampler's binary search, no dupes.
+        let mut sorted = none_ban.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(none_ban, sorted, "ban set must be sorted and deduped");
     }
 
     // -----------------------------------------------------------------

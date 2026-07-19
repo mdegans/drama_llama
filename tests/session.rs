@@ -421,6 +421,56 @@ fn auto_tool_choice_parses_native_dialect_call() {
     );
 }
 
+/// Issue #44: `ToolChoice::None` — "the model must not use any tool,
+/// even if tools are provided" — is enforced locally. The prompt begs
+/// for a call (the `count_letters` tool is advertised and the user
+/// asks the exact question the system prompt says to use it for), yet
+/// no `ToolUse` block may be emitted — while the tool defs stay
+/// rendered so the prefix is byte-identical to what the model would
+/// see under `Auto`. That is the prefix-preserving "don't call" mode
+/// the `chat` interview flow wants; contrast `--clear-tools`, which
+/// strips the defs and shifts the prefix.
+#[test]
+#[ignore = "requires model"]
+fn tool_choice_none_forbids_calls_defs_still_rendered() {
+    let mut prompt = strawberry_turn_1_prompt();
+    prompt.tool_choice = Some(ToolChoice::none());
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_max_tokens(NonZeroUsize::new(256).unwrap());
+
+    // Prefix preservation: `tool_choice` never touches the render, only
+    // the sampler — so the prompt under `None` is byte-identical to the
+    // same prompt under `Auto`, defs and all. (`--clear-tools` would
+    // strip the defs and this equality would break.)
+    let render = |p: &Prompt| {
+        session
+            .template()
+            .render_with(p, &RenderOptions::default())
+            .expect("render")
+    };
+    let mut as_auto = prompt.clone();
+    as_auto.tool_choice = Some(ToolChoice::auto());
+    assert_eq!(
+        render(&prompt),
+        render(&as_auto),
+        "None must not alter the rendered prefix (defs stay rendered)"
+    );
+    assert!(
+        render(&prompt).contains("count_letters"),
+        "tool defs must remain in the prompt under None"
+    );
+
+    let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
+    println!("=== none blocks ===\n{blocks:#?}\n===");
+    assert!(
+        !blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })),
+        "ToolChoice::None must forbid every tool call; got {blocks:#?}"
+    );
+}
+
 /// #30 Phase E: reasoning works *under* an eager (Method-forced)
 /// grammar. Qwen-style templates pre-open `<think>\n` in the
 /// generation prompt; the grammar anchors on that tail
