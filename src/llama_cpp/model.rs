@@ -19,7 +19,7 @@ use llama_cpp_sys_3::{
 use std::{
     collections::BTreeMap,
     ffi::{c_char, CStr, CString, OsStr, OsString},
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     path::PathBuf,
 };
 
@@ -452,6 +452,76 @@ impl LlamaCppModel {
         }
     }
 
+    /// The sampling settings this GGUF recommends for itself, read
+    /// from `llama.cpp`'s typed `general.sampling.*` metadata
+    /// namespace (`enum llama_model_meta_key` in `llama.h`). Absent
+    /// keys stay `None`; a model that carries none of them yields
+    /// [`SamplingParams::default`](crate::SamplingParams::default).
+    ///
+    /// # Why parsing
+    ///
+    /// Upstream exposes no typed value getter —
+    /// `llama_model_meta_val_str` is the only accessor, and every
+    /// value arrives pre-stringified through `std::to_string`
+    /// (`"%f"`, six decimals). So `top_p` reads back as `"0.950000"`,
+    /// `temp` as `"1.000000"`, `top_k` as `"20"`. The rounding is
+    /// harmless and mildly helpful: it recovers the intended `0.95`
+    /// from the `float32` `0.949999988` actually stored in the file.
+    ///
+    /// # Malformed values
+    ///
+    /// A key that is present but unparseable, or a `top_p`/`min_p`
+    /// outside `0.0..=1.0`, is treated as absent rather than as an
+    /// error. A junk metadata value must not stop a model from
+    /// loading — the user can always override in the sidecar.
+    ///
+    /// # Not read
+    ///
+    /// `xtc_*` (no corresponding [`SamplingMode`](crate::SamplingMode)),
+    /// `penalty_repeat` / `penalty_last_n` (this crate's repetition
+    /// penalty is n-gram-based with windowed decay and has no honest
+    /// scalar preimage), and `sequence` (defined upstream but never
+    /// written — `llama-model-saver.cpp` still has it commented out).
+    pub fn recommended_sampling(&self) -> crate::SamplingParams {
+        // Parse a metadata value, treating both "absent" and
+        // "present but junk" as None.
+        let num = |key: &str| -> Option<f64> {
+            LlamaCppModel::get_meta(self, key)?.trim().parse().ok()
+        };
+        let prob_f64 = |key: &str| crate::Probability::from_f(num(key)?).ok();
+        let prob_f32 =
+            |key: &str| crate::Probability::from_f(num(key)? as f32).ok();
+
+        // Mirostat is terminal, so it is read as a unit: the mode
+        // selector plus its two parameters, defaulting to llama.cpp's
+        // own tau/eta when the model names an algorithm but not its
+        // tuning.
+        let mirostat = match num("general.sampling.mirostat") {
+            Some(v) if v >= 1.0 => {
+                let tau =
+                    num("general.sampling.mirostat_tau").unwrap_or(5.0) as f32;
+                let eta =
+                    num("general.sampling.mirostat_eta").unwrap_or(0.1) as f32;
+                if v >= 2.0 {
+                    Some(crate::Mirostat::V2 { tau, eta })
+                } else {
+                    Some(crate::Mirostat::V1 { tau, eta })
+                }
+            }
+            _ => None,
+        };
+
+        crate::SamplingParams {
+            temp: num("general.sampling.temp").map(|t| t as f32),
+            top_p: prob_f64("general.sampling.top_p"),
+            top_k: num("general.sampling.top_k")
+                .filter(|k| *k >= 1.0)
+                .and_then(|k| NonZeroUsize::new(k as usize)),
+            min_p: prob_f32("general.sampling.min_p"),
+            mirostat,
+        }
+    }
+
     /// Get all metadata entries.
     ///
     /// Calling this is less efficient than calling `get_meta` for specific
@@ -807,8 +877,8 @@ impl crate::backend::Model for LlamaCppModel {
         self.get_meta("tokenizer.chat_template")
     }
 
-    fn get_meta(&self, key: &str) -> Option<String> {
-        LlamaCppModel::get_meta(self, key)
+    fn recommended_sampling(&self) -> crate::SamplingParams {
+        LlamaCppModel::recommended_sampling(self)
     }
 
     fn eog_tokens(&self) -> Vec<crate::Token> {
@@ -922,6 +992,52 @@ mod tests {
             println!("{}: {}", key, val);
         }
         println!("{:#?}", meta);
+    }
+
+    /// The model's own `general.sampling.*` recommendation is read
+    /// and parsed. This is the check whose absence let #35 sit: the
+    /// values were sitting in the GGUF the whole time, unread.
+    ///
+    /// Asserted loosely on purpose — `models/model.gguf` is a symlink
+    /// the developer repoints, so this pins the *contract* (keys are
+    /// found, parse, and land in range) rather than one model's
+    /// numbers. The exact Qwen3.6 triple (20 / 0.95 / 1.0) is covered
+    /// by the seeding check in the sidecar tests.
+    #[test]
+    fn test_recommended_sampling() {
+        let model = load_test_model_cpu();
+        let params = model.recommended_sampling();
+        // Printed like `test_metadata` does: when the symlink is
+        // repointed, this is how you see what the new model asks for.
+        println!("recommended_sampling: {params:#?}");
+
+        // Whatever the symlink points at, a model that advertises a
+        // key must round-trip it into range. A model that advertises
+        // none yields the empty params — also valid (gpt-oss).
+        if let Some(t) = params.temp {
+            assert!(t.is_finite() && t >= 0.0, "temp out of range: {t}");
+        }
+        if let Some(p) = params.top_p {
+            let p = p.into_f();
+            assert!((0.0..=1.0).contains(&p), "top_p out of range: {p}");
+        }
+
+        // Guard the stringified-float parse specifically: llama.cpp
+        // hands back `"0.950000"` (std::to_string, "%f"), and a naive
+        // integer parse of top_k would silently yield None. If the
+        // model advertises top_k at all, it must have parsed.
+        if LlamaCppModel::get_meta(&model, "general.sampling.top_k").is_some() {
+            assert!(
+                params.top_k.is_some(),
+                "model advertises general.sampling.top_k but it did not parse"
+            );
+        }
+        if LlamaCppModel::get_meta(&model, "general.sampling.top_p").is_some() {
+            assert!(
+                params.top_p.is_some(),
+                "model advertises general.sampling.top_p but it did not parse"
+            );
+        }
     }
 
     #[test]

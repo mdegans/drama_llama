@@ -8,6 +8,7 @@
 //! the same directory an MLX export produces — the directory
 //! `extract_weights.py` reads from.
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -160,6 +161,28 @@ impl MoefluxModel {
     pub fn set_name(&mut self, name: String) {
         self.name = Some(name);
     }
+
+    /// Look up dotted paths through `config.json`. `model_type`,
+    /// `vocab_size`, `hidden_size` etc. resolve at the top level;
+    /// nested keys (`quantization.bits`) walk through. Scalar values
+    /// are stringified; non-scalar values are JSON-encoded.
+    ///
+    /// Backend-specific by nature — this key space is HF
+    /// `config.json`, not GGUF — which is why it is inherent rather
+    /// than part of the [`Model`] trait.
+    pub fn get_meta(&self, key: &str) -> Option<String> {
+        let mut current = &self.config;
+        for part in key.split('.') {
+            current = current.get(part)?;
+        }
+        Some(match current {
+            JsonValue::String(s) => s.clone(),
+            JsonValue::Number(n) => n.to_string(),
+            JsonValue::Bool(b) => b.to_string(),
+            JsonValue::Null => "null".to_string(),
+            other => other.to_string(),
+        })
+    }
 }
 
 /// Tokenize via the HF pipeline. Errors from the tokenizer indicate
@@ -272,22 +295,53 @@ impl Model for MoefluxModel {
         self.chat_template.clone()
     }
 
-    fn get_meta(&self, key: &str) -> Option<String> {
-        // Look up dotted paths through `config.json`. `model_type`,
-        // `vocab_size`, `hidden_size` etc. resolve at the top level;
-        // nested keys (`quantization.bits`) walk through. Scalar
-        // values are stringified; non-scalar values are JSON-encoded.
-        let mut current = &self.config;
-        for part in key.split('.') {
-            current = current.get(part)?;
+    /// Hardcoded per model variant. moeflux has no GGUF metadata to
+    /// read — its config is HF `config.json`, which carries no
+    /// `general.sampling.*` namespace and no `generation_config`
+    /// (that lives in a separate file MLX exports don't always
+    /// include). So the recommendation comes from the model card,
+    /// baked in at the same compile-time variant selection moeflux
+    /// already uses everywhere else.
+    ///
+    /// The `compile_error!` arm is load-bearing: without it, adding a
+    /// fourth `moeflux-model-*` feature would silently produce a
+    /// model with no recommendation rather than a build failure.
+    fn recommended_sampling(&self) -> crate::SamplingParams {
+        #[cfg(feature = "moeflux-model-qwen3-6-35b-a3b")]
+        {
+            // Matches this model's GGUF `general.sampling.*` exactly
+            // (verified against Qwen3.6-35B-A3B-UD-IQ4_XS.gguf), so
+            // the moeflux and llama.cpp backends agree on defaults
+            // for the same weights.
+            crate::SamplingParams {
+                temp: Some(1.0),
+                top_p: crate::Probability::from_f(0.95).ok(),
+                top_k: NonZeroUsize::new(20),
+                min_p: None,
+                mirostat: None,
+            }
         }
-        Some(match current {
-            JsonValue::String(s) => s.clone(),
-            JsonValue::Number(n) => n.to_string(),
-            JsonValue::Bool(b) => b.to_string(),
-            JsonValue::Null => "null".to_string(),
-            other => other.to_string(),
-        })
+        #[cfg(not(feature = "moeflux-model-qwen3-6-35b-a3b"))]
+        {
+            // A new `moeflux-model-*` feature lands here and fails
+            // the build until someone fills in its recommendation.
+            #[cfg(not(any(
+                feature = "moeflux-model-qwen3-5-a17b",
+                feature = "moeflux-model-cogito-v2-671b",
+            )))]
+            compile_error!(
+                "exactly one `moeflux-model-*` feature must be enabled \
+                 alongside `moeflux`, and each needs a \
+                 `recommended_sampling` arm"
+            );
+
+            // a17b and cogito-v2 deliberately recommend nothing
+            // rather than guess: their cards have not been checked,
+            // and an invented number would be indistinguishable from
+            // a verified one at the call site. Callers fall back to
+            // `SamplerConfig::default()`, which is the honest answer.
+            crate::SamplingParams::default()
+        }
     }
 
     fn display_name(&self) -> Option<String> {

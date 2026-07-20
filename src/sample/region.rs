@@ -274,8 +274,8 @@ mod tests {
         fn chat_template_source(&self) -> Option<String> {
             None
         }
-        fn get_meta(&self, _key: &str) -> Option<String> {
-            None
+        fn recommended_sampling(&self) -> crate::SamplingParams {
+            crate::SamplingParams::default()
         }
     }
 

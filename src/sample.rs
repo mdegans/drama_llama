@@ -140,6 +140,140 @@ const fn default_lazy_grammar() -> bool {
     true
 }
 
+/// The scalar sampling knobs that a *model* recommends and that the
+/// Anthropic wire format can carry — the common vocabulary shared by
+/// llama.cpp's `general.sampling.*` GGUF metadata, OpenAI's and
+/// Anthropic's request bodies, and every `--temp`-style CLI on earth.
+///
+/// Deliberately **not** a [`SamplerConfig`]: this is a bag of
+/// independent values, not an ordered pipeline. Converting to a
+/// pipeline is [`From<SamplingParams> for Vec<SamplingMode>`], which
+/// imposes the canonical `llama.cpp` order.
+///
+/// Every field is `Option` because "the model didn't say" and "the
+/// client didn't ask" are the same shape and must stay
+/// distinguishable from "the model said 1.0". Members are stored
+/// **already validated** ([`Probability`] rather than raw `f32`) so
+/// that conversion into modes cannot fail — validation happens once,
+/// at the edge where the value enters (metadata parse or wire
+/// deserialization).
+///
+/// Two producers:
+/// * [`Model::recommended_sampling`](crate::backend::Model::recommended_sampling)
+///   — what the model's own metadata asks for. Seeds a fresh sampling
+///   sidecar (see the [`sidecar`](crate::sidecar) module docs).
+/// * The request body's `temperature` / `top_p` / `top_k`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SamplingParams {
+    /// Temperature. Not a [`Probability`] — values above `1.0` are
+    /// legal and useful (`llama.cpp` allows them), and `t <= 0.0` is
+    /// defined as greedy. Nothing to validate.
+    pub temp: Option<f32>,
+    /// Nucleus / top-p threshold.
+    pub top_p: Option<Probability<f64>>,
+    /// Top-k cutoff.
+    pub top_k: Option<NonZeroUsize>,
+    /// Min-p threshold. Readable from model metadata; not on the
+    /// Anthropic wire.
+    pub min_p: Option<Probability<f32>>,
+    /// Mirostat, if the model asks for it. Terminal — see
+    /// [`From<SamplingParams> for Vec<SamplingMode>`].
+    pub mirostat: Option<Mirostat>,
+}
+
+/// Which mirostat algorithm a model recommends, plus its parameters.
+/// Mirostat is *terminal* — it yields a single token — so it never
+/// composes with the truncation knobs in [`SamplingParams`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Mirostat {
+    /// Mirostat v1. See [`SamplingMode::Mirostat`].
+    V1 {
+        /// Target entropy.
+        tau: f32,
+        /// Learning rate.
+        eta: f32,
+    },
+    /// Mirostat v2. See [`SamplingMode::MirostatV2`].
+    V2 {
+        /// Target entropy.
+        tau: f32,
+        /// Learning rate.
+        eta: f32,
+    },
+}
+
+impl SamplingParams {
+    /// True when nothing at all was specified — the model carries no
+    /// `general.sampling.*` metadata (gpt-oss), or the request set no
+    /// sampling fields. Callers use this to decide whether to fall
+    /// back to [`SamplerConfig::default`].
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl From<SamplingParams> for Vec<SamplingMode> {
+    /// Compile a bag of scalars into an ordered chain.
+    ///
+    /// Order is `llama.cpp`'s conventional one — top-k, then top-p,
+    /// then min-p, then temperature — so that truncation happens
+    /// before rescaling and a chain built here behaves the way every
+    /// other inference stack's does with the same numbers.
+    ///
+    /// Mirostat, when present, is emitted **alone**: it returns a
+    /// single token, and every mode after a single-candidate set is a
+    /// silent no-op (`Candidates::top_k` and friends open with
+    /// `if len == 1 { return self }`). Emitting `[Mirostat, TopK]`
+    /// would look like a composed chain while the `TopK` did nothing
+    /// — the misleading shape is worse than the dropped knob.
+    ///
+    /// `None` members are skipped, so an empty `SamplingParams`
+    /// yields an empty chain (which the caller should treat as
+    /// "use the default", not "sample from the raw distribution").
+    fn from(params: SamplingParams) -> Self {
+        // `min_keep` has no metadata or wire equivalent; 1 matches
+        // the crate's own `SamplingMode::top_p()` / `min_p()`
+        // constructors.
+        const MIN_KEEP: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+
+        if let Some(mirostat) = params.mirostat {
+            return match mirostat {
+                Mirostat::V1 { tau, eta } => vec![SamplingMode::Mirostat {
+                    tau,
+                    eta,
+                    max_keep: None,
+                }],
+                Mirostat::V2 { tau, eta } => vec![SamplingMode::MirostatV2 {
+                    tau,
+                    eta,
+                    max_keep: None,
+                }],
+            };
+        }
+
+        let mut modes = Vec::with_capacity(4);
+        if let Some(k) = params.top_k {
+            modes.push(SamplingMode::TopK { k });
+        }
+        if let Some(p) = params.top_p {
+            modes.push(SamplingMode::TopP {
+                p,
+                min_keep: MIN_KEEP,
+            });
+        }
+        if let Some(p) = params.min_p {
+            modes.push(SamplingMode::MinP {
+                p,
+                min_keep: MIN_KEEP,
+            });
+        }
+        if let Some(t) = params.temp {
+            modes.push(SamplingMode::Temperature { t });
+        }
+        modes
+    }
+}
+
 impl SamplerConfig {
     /// Greedy sampling. No repetition penalty.
     pub fn greedy() -> Self {
@@ -1417,8 +1551,8 @@ mod tests {
         fn chat_template_source(&self) -> Option<String> {
             None
         }
-        fn get_meta(&self, _key: &str) -> Option<String> {
-            None
+        fn recommended_sampling(&self) -> crate::SamplingParams {
+            crate::SamplingParams::default()
         }
     }
 
@@ -1469,6 +1603,78 @@ mod tests {
             .expect("sample_token");
         state.advance(opts, chosen, &MockModel);
         chosen
+    }
+
+    /// Build a `SamplingParams` from raw scalars, panicking on an
+    /// out-of-range probability. Test-only sugar — production code
+    /// goes through the fallible `Probability::from_f`.
+    fn params(
+        temp: Option<f32>,
+        top_p: Option<f64>,
+        top_k: Option<usize>,
+    ) -> SamplingParams {
+        SamplingParams {
+            temp,
+            top_p: top_p.map(|p| Probability::from_f(p).expect("in range")),
+            top_k: top_k.map(|k| NonZeroUsize::new(k).expect("nonzero")),
+            min_p: None,
+            mirostat: None,
+        }
+    }
+
+    /// `SamplingParams` compiles to the canonical `llama.cpp` order:
+    /// truncation before rescaling, so temperature is last.
+    #[test]
+    fn params_into_modes_canonical_order() {
+        let modes: Vec<SamplingMode> =
+            params(Some(0.7), Some(0.9), Some(20)).into();
+        assert_eq!(
+            modes,
+            vec![
+                SamplingMode::TopK {
+                    k: NonZeroUsize::new(20).unwrap()
+                },
+                SamplingMode::TopP {
+                    p: Probability::from_f(0.9).unwrap(),
+                    min_keep: NonZeroUsize::new(1).unwrap(),
+                },
+                SamplingMode::Temperature { t: 0.7 },
+            ],
+            "top-k then top-p then temperature"
+        );
+    }
+
+    /// Absent members are skipped rather than defaulted — a request
+    /// that sets only `temperature` must not silently acquire a
+    /// top-k it never asked for.
+    #[test]
+    fn params_into_modes_skips_none() {
+        let modes: Vec<SamplingMode> = params(Some(1.2), None, None).into();
+        assert_eq!(modes, vec![SamplingMode::Temperature { t: 1.2 }]);
+
+        let empty: Vec<SamplingMode> = SamplingParams::default().into();
+        assert!(empty.is_empty(), "nothing specified => nothing emitted");
+        assert!(SamplingParams::default().is_empty());
+    }
+
+    /// Mirostat is terminal — it yields a single token, after which
+    /// every later mode is a silent no-op. Emitting it alongside the
+    /// truncation knobs would look composed while doing nothing, so
+    /// it is emitted alone.
+    #[test]
+    fn params_into_modes_mirostat_is_alone() {
+        let mut p = params(Some(0.7), Some(0.9), Some(20));
+        p.mirostat = Some(Mirostat::V2 { tau: 5.0, eta: 0.1 });
+        let modes: Vec<SamplingMode> = p.into();
+        assert_eq!(
+            modes,
+            vec![SamplingMode::MirostatV2 {
+                tau: 5.0,
+                eta: 0.1,
+                max_keep: None
+            }],
+            "mirostat suppresses the truncation chain entirely"
+        );
     }
 
     /// True iff the (single) grammar matcher accepts `bytes` from its

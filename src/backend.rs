@@ -554,9 +554,27 @@ pub trait Model: Send + Sync {
     /// `tokenizer.chat_template` metadata), if any.
     fn chat_template_source(&self) -> Option<String>;
 
-    /// Generic GGUF-style metadata lookup by string key. Returns the
-    /// value as a string, or `None` if missing.
-    fn get_meta(&self, key: &str) -> Option<String>;
+    /// The sampling settings this model recommends for itself, or an
+    /// empty [`SamplingParams`](crate::SamplingParams) when it says nothing.
+    ///
+    /// Used to seed a fresh sampling sidecar (see the
+    /// [`sidecar`](crate::sidecar) module docs) and as the fallback
+    /// tier when a request specifies some sampling knobs but not
+    /// others.
+    ///
+    /// This is deliberately a *semantic* accessor rather than a
+    /// generic `get_meta(key)`. Metadata key spaces are
+    /// backend-specific — GGUF `general.sampling.*` for llama.cpp,
+    /// `config.json` paths for moeflux — so no caller generic over
+    /// `M: Model` could pass a correct key. Each backend answers the
+    /// question in its own terms instead; `chat_template_source`
+    /// above is the same pattern.
+    ///
+    /// Required rather than defaulted: a new backend should have to
+    /// decide what it recommends, not inherit a silent "nothing".
+    /// Backends with no notion of recommended sampling return
+    /// [`SamplingParams::default`](crate::SamplingParams::default).
+    fn recommended_sampling(&self) -> crate::SamplingParams;
 
     /// Every token that ENDS GENERATION for this model — the complete
     /// set, `eos` and `eot` included. This is the single authority for
