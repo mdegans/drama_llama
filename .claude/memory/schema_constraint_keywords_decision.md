@@ -121,3 +121,20 @@ Trigger: Qwen3.6-35B-A3B answered the whodunit structured-output test
 with `suspects_considered: []` / `key_evidence: []` while filling
 every scalar field richly — the empty-array exit is a real model
 behavior that `length(min = 1)` + grammar now closes.
+
+## Addendum (2026-07-20): counts > 1 wanted for *creative* schemas
+
+New information per the same clause. Mike: enforcing counts "could
+force hallucinated entries" — agreed for extractive schemas — but
+"for creative things, however, it's great." The filler-entry failure
+mode inverts by task type: inventing the fifth plot twist *is* the
+task, whereas inventing a fifth suspect is the deceptive bug above.
+
+So the blanket refusal is too coarse; what's missing is a way for the
+caller to declare which kind of schema it is. This does NOT reverse
+the decision — the default stays permissive, because the extractive
+failure is the one that passes validation while meaning nothing.
+Design sketch, the two-site obstacle (misanthropic's sanitizer strips
+`minItems >= 2` before we compile, *and* `schema_to_gbnf` ignores it),
+and the opt-in options are in
+[`future_work_min_items_for_creative.md`](future_work_min_items_for_creative.md).
