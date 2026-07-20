@@ -133,6 +133,112 @@ fn complete_text_strawberry_turn_2() {
     );
 }
 
+/// #35: the request's `temperature` actually reaches the sampler.
+///
+/// The session carries **no seed**, so each call draws fresh entropy
+/// and a stochastic chain would wander. `temperature: 0.0` collapses
+/// to argmax, so two runs must agree byte for byte. Before #35 was
+/// fixed the field was dropped on the floor and this sampled with the
+/// sidecar's chain instead — the exact bug that had `bench.py`
+/// believing it benched a greedy path for months.
+///
+/// Deliberately asserts reproducibility rather than a fixed string:
+/// the model behind `models/model.gguf` is a symlink the developer
+/// repoints, so the *contract* is what is testable, not the text.
+#[test]
+#[ignore = "requires model"]
+fn request_temperature_zero_is_reproducible() {
+    let prompt = Prompt {
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("Name three primary colors."),
+        }],
+        max_tokens: NonZeroU32::new(48).unwrap(),
+        temperature: Some(0.0),
+        ..Default::default()
+    };
+
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            // Fresh entropy per call — the whole point. With a fixed
+            // seed this would pass even with temperature ignored.
+            .with_seed(None);
+
+    let first = session.complete_text(&prompt).expect("first");
+    let second = session.complete_text(&prompt).expect("second");
+    println!("=== temperature 0.0, run 1 ===\n{first}\n===");
+
+    assert!(!first.trim().is_empty(), "got empty output");
+    assert_eq!(
+        first, second,
+        "temperature 0.0 must be argmax and so reproducible without a seed"
+    );
+
+    // Control: the same session at a high temperature must *not* be
+    // reproducible. Without this, the assertion above would pass just
+    // as happily if generation were deterministic for some unrelated
+    // reason (a cached state, a degenerate prompt) and would prove
+    // nothing about temperature reaching the sampler.
+    let hot = Prompt {
+        temperature: Some(1.5),
+        ..prompt.clone()
+    };
+    let runs: Vec<String> = (0..4)
+        .map(|_| session.complete_text(&hot).expect("hot run"))
+        .collect();
+    println!("=== temperature 1.5, run 1 ===\n{}\n===", runs[0]);
+    assert!(
+        runs.iter().any(|r| *r != runs[0]),
+        "temperature 1.5 produced identical text across 4 unseeded runs; \
+         the sampler is not actually stochastic, so the argmax assertion \
+         above proves nothing"
+    );
+}
+
+/// An out-of-range `top_p` is rejected with a typed error rather than
+/// clamped. Silently sampling with a value the client did not ask for
+/// is the same class of bug as ignoring the field entirely — and the
+/// session stays reusable afterwards, since validation happens before
+/// any decode work.
+#[test]
+#[ignore = "requires model"]
+fn request_top_p_out_of_range_is_rejected() {
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet();
+
+    let bad = Prompt {
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("Hello."),
+        }],
+        max_tokens: NonZeroU32::new(16).unwrap(),
+        top_p: Some(1.5),
+        ..Default::default()
+    };
+    let err = session.complete_text(&bad).expect_err("1.5 is not a top_p");
+    assert!(
+        matches!(err, SessionError::RequestTopP(_)),
+        "expected RequestTopP, got: {err:?}"
+    );
+    assert!(
+        err.is_reusable_after(),
+        "validation precedes any decode work"
+    );
+
+    // And the session really is still usable.
+    let good = Prompt {
+        max_tokens: NonZeroU32::new(16).unwrap(),
+        top_p: None,
+        ..bad
+    };
+    let out = session.complete_text(&good).expect("session still usable");
+    assert!(!out.trim().is_empty());
+}
+
 /// Grammar is prepended per-call even when the user passes an empty
 /// sampling chain. This is the key contract for `with_sampling`: it
 /// controls only the user portion; grammar can't be overridden away.

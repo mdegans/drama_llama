@@ -14,11 +14,11 @@ pub use data::{IgnoreCategory, StopWords};
 
 mod sample;
 pub use sample::{
-    grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
-    CompiledGrammar, DeferredGrammar, Grammar, GrammarError, GrammarState,
-    GrammarStats, JsonError, JsonState, Mirostat, RepetitionError,
-    RepetitionOptions, SamplerConfig, SamplerState, SamplingMode,
-    SamplingParams,
+    apply_request_sampling, grammar_stats_enabled, grammar_stats_reset,
+    grammar_stats_snapshot, CompiledGrammar, DeferredGrammar, Grammar,
+    GrammarError, GrammarState, GrammarStats, JsonError, JsonState, Mirostat,
+    RepetitionError, RepetitionOptions, SamplerConfig, SamplerState,
+    SamplingMode, SamplingParams,
 };
 
 pub mod backend;

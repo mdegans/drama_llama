@@ -19,16 +19,57 @@
 //! | `tool_choice`      | [`grammar_for_prompt`] grammar compiler  |
 //! | `stop_sequences`   | callers wire into [`PredictOptions`]     |
 //! | `thinking`         | [`ChatTemplate`] — drives `enable_thinking` extra |
+//! | `max_tokens`       | [`Session`] — the sole generation cap    |
+//! | `temperature` / `top_p` / `top_k` | [`Session`] — folded into the sampling chain |
 //!
-//! Request-level fields (`model` id, `max_tokens`, `temperature`,
-//! `stream`, `top_k`, `top_p`, `metadata`) are ignored locally — use
-//! [`PredictOptions`] and [`SamplerConfig`] for the local equivalents.
+//! The remaining request-level fields (`model` id, `stream`,
+//! `metadata`) are ignored locally — use [`PredictOptions`] and
+//! [`SamplerConfig`] for the local equivalents.
+//!
+//! # Sampling precedence
+//!
+//! `temperature` / `top_p` / `top_k` are honored, layered over the
+//! per-model sidecar and the model's own metadata:
+//!
+//! ```text
+//! request temperature/top_p/top_k     (per-call)
+//!   └─ <model>.sampling.toml sidecar  (per-model, editable)
+//!        └─ general.sampling.* GGUF metadata  (seeds the sidecar)
+//!             └─ SamplerConfig::default()
+//! ```
+//!
+//! A request that names knobs already present exactly once in the
+//! chain retunes them in place; anything else rebuilds the chain in
+//! canonical order, falling back to the model's recommendation for
+//! whatever the request left unset. See
+//! [`apply_request_sampling`](crate::apply_request_sampling) for the
+//! full rule and [`sidecar`](crate::sidecar) for the seeding half.
+//!
+//! Each tier is optional and drops through to the next. A model that
+//! advertises no `general.sampling.*` metadata (gpt-oss, and every
+//! moeflux model without a per-variant constant) simply seeds its
+//! sidecar from [`SamplerConfig::default`] — the behavior before
+//! this tier existed. A request that sets no sampling fields leaves
+//! the chain exactly as configured.
+//!
+//! `temperature: 0.0` collapses to argmax, matching `llama.cpp`,
+//! OpenAI, and Anthropic. Note that repetition penalties still apply
+//! at `0.0` — it is greedy-with-penalty, not raw greedy — which stays
+//! deterministic but is not the same distribution as
+//! [`SamplerConfig::greedy`].
+//!
+//! An out-of-range `top_p` is a typed error
+//! ([`SessionError::RequestTopP`]), never a silent clamp.
 //!
 //! [`Prompt`]: misanthropic::Prompt
 //! [`ChatTemplate`]: crate::ChatTemplate
 //! [`grammar_for_prompt`]: crate::grammar_for_prompt
 //! [`PredictOptions`]: crate::PredictOptions
 //! [`SamplerConfig`]: crate::SamplerConfig
+//! [`SamplerConfig::default`]: crate::SamplerConfig::default
+//! [`SamplerConfig::greedy`]: crate::SamplerConfig::greedy
+//! [`Session`]: crate::Session
+//! [`SessionError::RequestTopP`]: crate::SessionError::RequestTopP
 
 // misanthropic ≥1.0.0-alpha.2 dropped the pervasive `'a` lifetime from
 // its public API — everything is owned (`Cow<'static, _>`) now, so these

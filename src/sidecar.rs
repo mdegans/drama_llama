@@ -9,8 +9,49 @@
 //! projector (`<model>.mmproj.gguf`, [`mmproj_path`] — enables image
 //! input under the `mtmd` feature). [`crate::LlamaCppSession::from_path*`]
 //! looks for each when loading a model. For sampling, if no sidecar
-//! exists a default is written so the user has a starting point to
-//! edit.
+//! exists one is written so the user has a starting point to edit —
+//! seeded from the model's own recommendation where it has one (see
+//! below).
+//!
+//! ## Sampling precedence
+//!
+//! ```text
+//! request temperature/top_p/top_k     (per-call, see `apply_request_sampling`)
+//!   └─ <model>.sampling.toml sidecar  (per-model, editable — this module)
+//!        └─ general.sampling.* GGUF metadata  (seeds the sidecar)
+//!             └─ SamplerConfig::default()
+//! ```
+//!
+//! The metadata tier **seeds** the sidecar rather than applying
+//! invisibly at load. That keeps exactly one authority for a model's
+//! defaults — the file on disk — and makes the model's own
+//! recommendation visible and editable instead of a hidden layer the
+//! user has to know about to explain their own output.
+//!
+//! **Not every model advertises sampling metadata**, and that is a
+//! normal case, not an error: gpt-oss carries no `general.sampling.*`
+//! keys at all, and moeflux has no such namespace to begin with. When
+//! [`Model::recommended_sampling`](crate::backend::Model::recommended_sampling)
+//! comes back empty the seed is plain [`SamplerConfig::default()`] —
+//! the same file that was written before this tier existed. Partial
+//! metadata is honored partially: a model advertising only `top_k`
+//! seeds a one-mode chain rather than filling the gaps with invented
+//! numbers. Either way the written file states in its header comment
+//! which tier it came from, so a user comparing two models' sidecars
+//! can tell a recommendation from a fallback.
+//!
+//! Only `modes` is ever model-derived. `repetition` stays at the
+//! crate default: upstream's `penalty_repeat` / `penalty_last_n` are
+//! scalars, while [`RepetitionOptions`](crate::RepetitionOptions) is
+//! n-gram-based with windowed decay, and there is no honest mapping
+//! between the two.
+//!
+//! Backends differ in what they can offer here. The llama.cpp backend
+//! reads llama.cpp's typed `general.sampling.*` namespace; moeflux has
+//! no equivalent (its config is HF `config.json`) and answers from a
+//! per-variant constant. Either way the question is asked through
+//! [`Model::recommended_sampling`](crate::backend::Model::recommended_sampling),
+//! never by key.
 //!
 //! ## Where sidecars live
 //!
@@ -41,8 +82,11 @@
 //!
 //! ## Reset / tweak
 //!
-//! - To **reset** to defaults: delete the sidecar file. The next load
-//!   will rewrite the default.
+//! - To **reset**: delete the sidecar file. The next load rewrites it,
+//!   re-seeding from the model's metadata. Note that an existing
+//!   sidecar is *never* overwritten, so a file written before the
+//!   model-metadata seeding landed keeps its old contents until it is
+//!   deleted.
 //! - To **tweak** something: edit the sidecar, save, restart.
 //!
 //! [`crate::LlamaCppSession::from_path*`]: crate::LlamaCppSession::from_path_sync

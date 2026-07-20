@@ -155,6 +155,13 @@ pub enum SessionError {
     /// [`OutputConfig`]: misanthropic::prompt::output::OutputConfig
     #[error("output config: {0}")]
     OutputConfig(#[from] OutputConfigError),
+    /// The request's `top_p` is outside `0.0..=1.0`. Rejected rather
+    /// than clamped: silently sampling with a value the client did
+    /// not ask for is the same class of bug as ignoring the field
+    /// altogether. Fires before any decode work; the session stays
+    /// reusable.
+    #[error("request top_p: {0}")]
+    RequestTopP(#[from] crate::InvalidProbability<f64>),
     /// The dialect emitter could not produce a grammar for the
     /// prompt's tools — an argument value is unrepresentable in the
     /// model's tagged dialect, or the emitted GBNF failed to compile.
@@ -261,6 +268,9 @@ impl SessionError {
             | Self::ToolChoice(_)
             | Self::OutputConfig(_)
             | Self::Dialect(_) => true,
+            // Request validation fires while assembling the sampler
+            // config, before any decode work. State untouched.
+            Self::RequestTopP(_) => true,
             // run_call invalidates its own prefix cache on grammar violation, so
             // the session is internally consistent.
             Self::GrammarViolation { .. } => true,
@@ -2267,12 +2277,20 @@ impl<B: Backend> Session<B> {
     /// [`PreparedCall`]. The single construction site for all three
     /// `complete_*` paths ("config is the authority": the effective
     /// config is assembled first; predictor state derives from it).
+    ///
+    /// This is also where the request's own sampling knobs
+    /// (`temperature` / `top_p` / `top_k`) fold into the chain — see
+    /// [`apply_request_sampling`](crate::apply_request_sampling) for
+    /// the precedence rule. Reading wire fields here matches what the
+    /// function already does with `max_tokens` and `tool_choice`.
+    /// `top_k_trace` deliberately does not route through here, so
+    /// diagnostic traces keep showing the unshaped distribution.
     fn predict_options_for(
         &self,
         prompt: &Prompt,
         modes: Vec<SamplingMode>,
         deferred_grammar: Option<crate::DeferredGrammar>,
-    ) -> PredictOptions {
+    ) -> Result<PredictOptions, SessionError> {
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
         // The generation cap is the prompt's `max_tokens` (Anthropic wire
@@ -2300,6 +2318,32 @@ impl<B: Backend> Session<B> {
             } else {
                 self.emit_ban.clone()
             };
+        // Fold in the request's own sampling knobs. Only `modes` is
+        // reachable from the wire: `repetition`, `lazy_grammar` and
+        // `banned_specials` are assembled below from session state,
+        // so a remote client cannot reach the emit-side special-token
+        // ban no matter what it sends.
+        let requested = crate::SamplingParams {
+            temp: prompt.temperature,
+            top_p: prompt
+                .top_p
+                .map(|p| crate::Probability::from_f(p as f64))
+                .transpose()?,
+            // `NonZeroU16` on the wire, so the conversion cannot fail
+            // — `and_then` just avoids an unreachable unwrap.
+            top_k: prompt
+                .top_k
+                .and_then(|k| NonZeroUsize::new(k.get() as usize)),
+            // Neither is expressible in the Anthropic request format.
+            min_p: None,
+            mirostat: None,
+        };
+        let modes = crate::apply_request_sampling(
+            modes,
+            requested,
+            self.engine.model.recommended_sampling(),
+        );
+
         predict_opts.sample_options = SamplerConfig {
             modes,
             repetition: self.sample_options.repetition.clone(),
@@ -2307,7 +2351,7 @@ impl<B: Backend> Session<B> {
             lazy_grammar: self.sample_options.lazy_grammar,
             banned_specials,
         };
-        predict_opts
+        Ok(predict_opts)
     }
 
     /// Build the call's working [`SamplerState`]: resolve the
@@ -2751,34 +2795,6 @@ impl<B: Backend> Session<B> {
         &self.template
     }
 
-    /// Shared setup for every `complete_*` entry point: render the
-    /// prompt through the chat template, tokenize with
-    /// `parse_special=true` (so `<|im_start|>` etc. resolve to their
-    /// single special-token IDs), and build the effective sampling
-    /// chain — grammar from [`Prompt::tool_choice`] prepended,
-    /// optionally followed by [`Self::with_sampling`]'s user filters.
-    ///
-    /// `include_user_sampling = true` for production calls
-    /// ([`Self::complete_text`] / [`Self::complete_stream`]).
-    /// `include_user_sampling = false` for diagnostic calls
-    /// ([`Self::top_k_trace`]) that want the raw grammar-filtered
-    /// candidate distribution without user-filter shaping.
-    ///
-    /// Returns the token ids and the [`SamplingMode`] chain; callers
-    /// wire them into whatever predictor / `PredictOptions` shape they
-    /// need.
-    ///
-    /// [`Prompt::tool_choice`]: crate::Prompt
-    /// Reject prompts whose free-text content would inject reserved
-    /// chat-framing special tokens (see
-    /// [`SessionError::InjectedSpecialToken`]). Called at the top of
-    /// every prepare path so no `complete_*` / `top_k_trace` entry can
-    /// tokenize poisoned content.
-    ///
-    /// Protocol integrity, not content policy: `Session` is the
-    /// structured-chat layer where blocks are content and the special
-    /// tokens are format. Callers who want to hand-feed control tokens
-    /// drop below the block abstraction to the raw predictor.
     /// Scan `text` for content that would tokenize (with
     /// `parse_special = true`, the setting every prepare path uses) to
     /// a reserved chat-framing special token. Returns the first
@@ -2813,6 +2829,16 @@ impl<B: Backend> Session<B> {
             .map(|tok| (tok, self.engine.model.token_to_piece(tok)))
     }
 
+    /// Reject prompts whose free-text content would inject reserved
+    /// chat-framing special tokens (see
+    /// [`SessionError::InjectedSpecialToken`]). Called at the top of
+    /// every prepare path so no `complete_*` / `top_k_trace` entry can
+    /// tokenize poisoned content.
+    ///
+    /// Protocol integrity, not content policy: `Session` is the
+    /// structured-chat layer where blocks are content and the special
+    /// tokens are format. Callers who want to hand-feed control tokens
+    /// drop below the block abstraction to the raw predictor.
     fn check_no_special_injection(
         &self,
         prompt: &Prompt,
@@ -2836,12 +2862,36 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    /// Shared setup for every `complete_*` entry point: render the
+    /// prompt through the chat template, tokenize with
+    /// `parse_special=true` (so `<|im_start|>` etc. resolve to their
+    /// single special-token IDs), and build the effective sampling
+    /// chain — grammar from [`Prompt::tool_choice`] prepended,
+    /// optionally followed by [`Self::with_sampling`]'s user filters.
+    ///
+    /// `include_user_sampling = true` for production calls
+    /// ([`Self::complete_text`] / [`Self::complete_stream`]).
+    /// `include_user_sampling = false` for diagnostic calls
+    /// ([`Self::top_k_trace`]) that want the raw grammar-filtered
+    /// candidate distribution without user-filter shaping.
+    ///
+    /// The chain produced here is the *session's*. A request's own
+    /// `temperature` / `top_p` / `top_k` fold in later, at
+    /// [`Self::predict_options_for`] — which `top_k_trace` does not
+    /// call, so diagnostic traces stay unshaped from both directions.
+    ///
+    /// Returns the token ids and the [`SamplingMode`] chain; callers
+    /// wire them into whatever predictor / `PredictOptions` shape they
+    /// need.
+    ///
     /// Diagnostic-path prepare (used by [`Self::top_k_trace`]): no
     /// media support — its consumers drive the raw candidate
     /// predictor, which cannot decode images. Rendering without a
     /// media sentinel makes an image-bearing prompt fail typed
     /// ([`ChatTemplateError::MediaUnsupported`]) instead of feeding
     /// the model sentinel bytes as prose.
+    ///
+    /// [`Prompt::tool_choice`]: crate::Prompt
     fn prepare_call(
         &mut self,
         prompt: &Prompt,
@@ -4045,7 +4095,7 @@ impl<B: Backend> Session<B> {
             )?;
 
         let predict_opts =
-            self.predict_options_for(prompt, modes, deferred_grammar.clone());
+            self.predict_options_for(prompt, modes, deferred_grammar.clone())?;
         let (initial_state, bp_states) = self.build_initial_state(
             &predict_opts.sample_options,
             cached_state,
@@ -4336,7 +4386,7 @@ impl<B: Backend> Session<B> {
             )?;
 
         let predict_opts =
-            self.predict_options_for(prompt, modes, deferred_grammar.clone());
+            self.predict_options_for(prompt, modes, deferred_grammar.clone())?;
         let (initial_state, bp_states) = self.build_initial_state(
             &predict_opts.sample_options,
             cached_state,
@@ -4489,7 +4539,7 @@ impl<B: Backend> Session<B> {
         );
 
         let predict_opts =
-            self.predict_options_for(prompt, modes, deferred_grammar.clone());
+            self.predict_options_for(prompt, modes, deferred_grammar.clone())?;
         let (initial_state, bp_states) = self.build_initial_state(
             &predict_opts.sample_options,
             cached_state,

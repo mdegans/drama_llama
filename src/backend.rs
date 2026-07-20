@@ -562,6 +562,18 @@ pub trait Model: Send + Sync {
     /// tier when a request specifies some sampling knobs but not
     /// others.
     ///
+    /// **Returning empty is expected, not exceptional.** Plenty of
+    /// models ship no recommendation (gpt-oss carries no
+    /// `general.sampling.*` keys), and callers must treat empty as
+    /// "use the crate default" rather than as a failure — sidecar
+    /// seeding falls back to
+    /// [`SamplerConfig::default`](crate::SamplerConfig::default), and
+    /// request handling falls back to whatever the chain already had.
+    /// Partial answers are fine too: report only the knobs the model
+    /// actually names and leave the rest `None`, rather than filling
+    /// gaps with invented values that would be indistinguishable from
+    /// advertised ones at the call site.
+    ///
     /// This is deliberately a *semantic* accessor rather than a
     /// generic `get_meta(key)`. Metadata key spaces are
     /// backend-specific — GGUF `general.sampling.*` for llama.cpp,

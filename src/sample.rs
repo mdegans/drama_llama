@@ -96,6 +96,134 @@ pub struct SamplerConfig {
     pub banned_specials: Vec<Token>,
 }
 
+/// True for modes that constrain *what may be emitted* rather than
+/// shape the distribution — grammar, JSON, and token-range denial.
+/// These survive a request-driven chain rebuild; the truncation
+/// samplers do not.
+fn is_constraint(mode: &SamplingMode) -> bool {
+    matches!(
+        mode,
+        SamplingMode::Json
+            | SamplingMode::Grammar(_)
+            | SamplingMode::Deny { .. }
+    )
+}
+
+/// Fold a request's sampling knobs into an existing mode chain.
+///
+/// # The rule
+///
+/// Evaluated over the **whole requested set**, never per-parameter:
+///
+/// * If every knob the request names appears in `modes` **exactly
+///   once**, each is patched in place and the rest of the chain is
+///   left alone. So a request setting only `top_k` against the
+///   default chain retunes the top-k and keeps `LocallyTypical`.
+/// * Otherwise the chain is rebuilt: constraint modes (grammar,
+///   JSON, `Deny`) are kept as a prefix, every distribution-shaping
+///   mode is discarded,
+///   and a canonical `TopK → TopP → MinP → Temperature` chain is
+///   built from `requested` layered over `fallback` (the model's
+///   [`recommended_sampling`](crate::backend::Model::recommended_sampling)).
+///
+/// # Why not per-parameter
+///
+/// Mixing would produce a chain that is neither behavior. Given
+/// `[TopK, TopP, LocallyTypical]` and a request setting `top_p` and
+/// `temperature`, patching the `TopP` while appending a `Temperature`
+/// leaves `LocallyTypical` sitting at an arbitrary position between
+/// them — unexplainable in docs and dependent on sidecar contents the
+/// client cannot see.
+///
+/// # Why not always rebuild
+///
+/// Because the sidecar is *seeded* from the same metadata used as
+/// `fallback`, patch and rebuild agree for any model that advertises
+/// `general.sampling.*`. They diverge only on a hand-edited sidecar —
+/// and there, discarding the operator's deliberate choice the moment
+/// any client sets any knob is the worse surprise.
+///
+/// # What is never touched
+///
+/// Only `modes`. Repetition penalties, `lazy_grammar`, and
+/// `banned_specials` live on [`SamplerConfig`] and are out of reach —
+/// `banned_specials` in particular is emission-side protocol
+/// integrity, which a remote client must not be able to switch off.
+///
+/// # Mirostat
+///
+/// A `requested` mirostat always forces a rebuild: it is terminal, so
+/// patching it into an existing chain would leave the surrounding
+/// modes as silent no-ops. In the other direction, a `fallback`
+/// mirostat is dropped whenever the request asks for anything else,
+/// since it would otherwise swallow the very knobs the client set.
+pub fn apply_request_sampling(
+    modes: Vec<SamplingMode>,
+    requested: SamplingParams,
+    fallback: SamplingParams,
+) -> Vec<SamplingMode> {
+    if requested.is_empty() {
+        return modes;
+    }
+
+    // A knob is patchable when the request didn't name it, or named
+    // it and the chain has exactly one mode to put it in. Zero is
+    // "nowhere to put it"; two or more is "no way to tell which the
+    // client meant" — both mean rebuild.
+    let unambiguous = |asked: bool, pred: fn(&SamplingMode) -> bool| {
+        !asked || modes.iter().filter(|m| pred(m)).count() == 1
+    };
+    let can_patch = requested.mirostat.is_none()
+        && unambiguous(requested.temp.is_some(), |m| {
+            matches!(m, SamplingMode::Temperature { .. })
+        })
+        && unambiguous(requested.top_p.is_some(), |m| {
+            matches!(m, SamplingMode::TopP { .. })
+        })
+        && unambiguous(requested.top_k.is_some(), |m| {
+            matches!(m, SamplingMode::TopK { .. })
+        })
+        && unambiguous(requested.min_p.is_some(), |m| {
+            matches!(m, SamplingMode::MinP { .. })
+        });
+
+    if can_patch {
+        return modes
+            .into_iter()
+            .map(|mode| match mode {
+                SamplingMode::Temperature { t } => SamplingMode::Temperature {
+                    t: requested.temp.unwrap_or(t),
+                },
+                SamplingMode::TopP { p, min_keep } => SamplingMode::TopP {
+                    p: requested.top_p.unwrap_or(p),
+                    min_keep,
+                },
+                SamplingMode::TopK { k } => SamplingMode::TopK {
+                    k: requested.top_k.unwrap_or(k),
+                },
+                SamplingMode::MinP { p, min_keep } => SamplingMode::MinP {
+                    p: requested.min_p.unwrap_or(p),
+                    min_keep,
+                },
+                other => other,
+            })
+            .collect();
+    }
+
+    let mut merged = requested.or(fallback);
+    // `requested` is non-empty and named no mirostat, so it named a
+    // truncation knob — which a fallback mirostat would silently
+    // swallow, since mirostat compiles to a chain of one.
+    if requested.mirostat.is_none() {
+        merged.mirostat = None;
+    }
+
+    let mut rebuilt: Vec<SamplingMode> =
+        modes.into_iter().filter(is_constraint).collect();
+    rebuilt.extend(Vec::<SamplingMode>::from(merged));
+    rebuilt
+}
+
 /// A grammar that starts suspended and activates once a specific byte
 /// sequence appears in the predictor's generated text. Activation is driven
 /// by `TokenPredictor`: when the trigger is found in the accumulated output,
@@ -209,6 +337,21 @@ impl SamplingParams {
     /// back to [`SamplerConfig::default`].
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Field-by-field [`Option::or`]: `self`'s values win, `other`
+    /// fills the gaps. Used to layer a request's explicit knobs over
+    /// the model's recommendation, so a client that sets only
+    /// `temperature` still gets the model's own top-k and top-p
+    /// rather than the crate's.
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            temp: self.temp.or(other.temp),
+            top_p: self.top_p.or(other.top_p),
+            top_k: self.top_k.or(other.top_k),
+            min_p: self.min_p.or(other.min_p),
+            mirostat: self.mirostat.or(other.mirostat),
+        }
     }
 }
 
@@ -1675,6 +1818,231 @@ mod tests {
             }],
             "mirostat suppresses the truncation chain entirely"
         );
+    }
+
+    /// The crate default chain, the realistic patch target.
+    fn default_chain() -> Vec<SamplingMode> {
+        SamplerConfig::default().modes
+    }
+
+    /// The chain a metadata-seeded sidecar produces (Qwen3.6's).
+    fn seeded_chain() -> Vec<SamplingMode> {
+        params(Some(1.0), Some(0.95), Some(20)).into()
+    }
+
+    /// A knob that appears exactly once is retuned in place, and
+    /// everything else in the chain survives. This is the case that
+    /// makes `top_k` tweakable without blowing away `LocallyTypical`.
+    #[test]
+    fn request_patches_unambiguous_knob_in_place() {
+        let got = apply_request_sampling(
+            default_chain(),
+            params(None, None, Some(7)),
+            SamplingParams::default(),
+        );
+        assert_eq!(
+            got,
+            vec![
+                SamplingMode::TopK {
+                    k: NonZeroUsize::new(7).unwrap()
+                },
+                SamplingMode::locally_typical(),
+            ],
+            "top-k retuned, locally-typical untouched"
+        );
+    }
+
+    /// A knob with no slot in the chain forces a rebuild — there is
+    /// nowhere to put it, and inserting at a guessed position would
+    /// make behavior depend on sidecar contents the client can't see.
+    #[test]
+    fn request_rebuilds_when_knob_absent() {
+        // The default chain has no TopP.
+        let got = apply_request_sampling(
+            default_chain(),
+            params(None, Some(0.8), None),
+            SamplingParams::default(),
+        );
+        assert_eq!(
+            got,
+            vec![SamplingMode::TopP {
+                p: Probability::from_f(0.8).unwrap(),
+                min_keep: NonZeroUsize::new(1).unwrap(),
+            }],
+            "LocallyTypical is discarded on rebuild"
+        );
+    }
+
+    /// Unspecified knobs fall back to the model's recommendation, not
+    /// to the crate default — a client setting only `temperature`
+    /// still gets the model's own top-k / top-p.
+    #[test]
+    fn request_rebuild_falls_back_to_model_metadata() {
+        let got = apply_request_sampling(
+            default_chain(),
+            params(None, Some(0.8), None),
+            params(Some(1.0), Some(0.95), Some(20)),
+        );
+        assert_eq!(
+            got,
+            vec![
+                SamplingMode::TopK {
+                    k: NonZeroUsize::new(20).unwrap()
+                },
+                SamplingMode::TopP {
+                    p: Probability::from_f(0.8).unwrap(),
+                    min_keep: NonZeroUsize::new(1).unwrap(),
+                },
+                SamplingMode::Temperature { t: 1.0 },
+            ],
+            "requested top_p wins; top_k and temp come from the model"
+        );
+    }
+
+    /// Mixed presence is resolved over the whole requested set, not
+    /// per-parameter: one absent knob rebuilds the entire chain.
+    /// Patching `TopP` while appending `Temperature` would leave
+    /// `LocallyTypical` at an arbitrary position — neither behavior.
+    #[test]
+    fn request_mixed_presence_rebuilds_whole_chain() {
+        let mut chain = default_chain();
+        chain.insert(
+            1,
+            SamplingMode::TopP {
+                p: Probability::from_f(0.9).unwrap(),
+                min_keep: NonZeroUsize::new(1).unwrap(),
+            },
+        );
+        // top_p is present once, temperature is absent.
+        let got = apply_request_sampling(
+            chain,
+            params(Some(0.5), Some(0.8), None),
+            SamplingParams::default(),
+        );
+        assert!(
+            !got.contains(&SamplingMode::locally_typical()),
+            "one absent knob rebuilds everything: {got:?}"
+        );
+        assert_eq!(
+            got,
+            vec![
+                SamplingMode::TopP {
+                    p: Probability::from_f(0.8).unwrap(),
+                    min_keep: NonZeroUsize::new(1).unwrap(),
+                },
+                SamplingMode::Temperature { t: 0.5 },
+            ]
+        );
+    }
+
+    /// A duplicated knob is ambiguous — there is no way to tell which
+    /// slot the client meant — so it rebuilds rather than guessing.
+    #[test]
+    fn request_duplicate_knob_rebuilds() {
+        let chain = vec![
+            SamplingMode::TopK {
+                k: NonZeroUsize::new(100).unwrap(),
+            },
+            SamplingMode::locally_typical(),
+            SamplingMode::TopK {
+                k: NonZeroUsize::new(40).unwrap(),
+            },
+        ];
+        let got = apply_request_sampling(
+            chain,
+            params(None, None, Some(7)),
+            SamplingParams::default(),
+        );
+        assert_eq!(
+            got,
+            vec![SamplingMode::TopK {
+                k: NonZeroUsize::new(7).unwrap()
+            }],
+            "two top-k slots => rebuild, not a guess"
+        );
+    }
+
+    /// Constraint modes are not sampling knobs: a grammar survives a
+    /// rebuild, and stays at the front where it prunes candidates
+    /// before the truncation samplers run. Losing this would let a
+    /// client's `temperature` silently disable a tool-call grammar.
+    #[test]
+    fn request_rebuild_preserves_constraints() {
+        let grammar = SamplingMode::grammar("root ::= .+").unwrap();
+        let mut chain = vec![grammar.clone()];
+        chain.extend(default_chain());
+
+        let got = apply_request_sampling(
+            chain,
+            params(None, Some(0.8), None),
+            SamplingParams::default(),
+        );
+        assert_eq!(got.first(), Some(&grammar), "grammar must lead: {got:?}");
+        assert_eq!(got.len(), 2, "grammar + rebuilt top-p only");
+    }
+
+    /// An empty request is a no-op. Most calls set no sampling fields
+    /// at all, and they must get exactly the configured chain.
+    #[test]
+    fn request_empty_leaves_chain_alone() {
+        let got = apply_request_sampling(
+            seeded_chain(),
+            SamplingParams::default(),
+            params(Some(1.0), Some(0.95), Some(20)),
+        );
+        assert_eq!(got, seeded_chain());
+    }
+
+    /// Against a metadata-seeded sidecar every knob has exactly one
+    /// slot, so the common case is a pure in-place retune — patch and
+    /// rebuild agree here, which is why patch-first is safe.
+    #[test]
+    fn request_against_seeded_chain_patches_all() {
+        let got = apply_request_sampling(
+            seeded_chain(),
+            params(Some(0.0), Some(0.5), Some(3)),
+            SamplingParams::default(),
+        );
+        assert_eq!(
+            got,
+            vec![
+                SamplingMode::TopK {
+                    k: NonZeroUsize::new(3).unwrap()
+                },
+                SamplingMode::TopP {
+                    p: Probability::from_f(0.5).unwrap(),
+                    min_keep: NonZeroUsize::new(1).unwrap(),
+                },
+                // 0.0 reaches the mode intact; `Candidates::temperature`
+                // is what turns it into argmax.
+                SamplingMode::Temperature { t: 0.0 },
+            ]
+        );
+    }
+
+    /// A model that recommends mirostat must not have it swallow the
+    /// knobs a client explicitly asked for — mirostat compiles to a
+    /// chain of one, so everything after it would be a silent no-op.
+    #[test]
+    fn request_drops_fallback_mirostat() {
+        let fallback = SamplingParams {
+            mirostat: Some(Mirostat::V2 { tau: 5.0, eta: 0.1 }),
+            ..params(Some(1.0), None, Some(20))
+        };
+        let got = apply_request_sampling(
+            vec![SamplingMode::locally_typical()],
+            params(None, Some(0.8), None),
+            fallback,
+        );
+        assert!(
+            !got.iter()
+                .any(|m| matches!(m, SamplingMode::MirostatV2 { .. })),
+            "fallback mirostat must not eat the requested top_p: {got:?}"
+        );
+        assert!(got.contains(&SamplingMode::TopP {
+            p: Probability::from_f(0.8).unwrap(),
+            min_keep: NonZeroUsize::new(1).unwrap(),
+        }));
     }
 
     /// True iff the (single) grammar matcher accepts `bytes` from its
