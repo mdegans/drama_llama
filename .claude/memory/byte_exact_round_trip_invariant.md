@@ -102,40 +102,66 @@ defense-in-depth on both.
   prefill/bootstrap CoT). Needs a design session; NOT a prerequisite for
   #53 (which rides the repair above).
 
-- **#58: multi-call round-trip (distinct, also owed).** The round-trip
-  *fuzzer* (`tests/session.rs::complete_text_round_trips_through_parse_and_render`)
-  is dominated by a different failure than #53: a repeat-prone Qwen (new
-  vendor-recommended sampling defaults + repeat penalty exempting special
-  tokens) emits 3–20 back-to-back tool calls, and that turn doesn't
-  round-trip. ~55% of seeds fail; every seed emitted ≥3 calls — both far
-  above the ~10% rate that would point at the model rather than our code
-  (Mike's heuristic), so it's likely ours: a renderer call-join or
-  arg-canonicalization asymmetry. Isolated to the byte-exact assertion —
-  every *structural* Qwen tool-call test (Method/auto/None/forced+
-  thinking/cache-survival) is green. See [[completed-work]] and #58.
+- **#58: multi-call round-trip — DIAGNOSED + FIXED (2026-07-20).** Ground
+  truth from replaying seeds (not the memo's earlier guesses):
+  - Dialect is **`TagWithTagged`** (Qwen3-Coder XML tags), NOT `JsonNative`
+    as this memo assumed. And the gen-prompt `<think>\n\n</think>` scaffold
+    matches on both sides — NOT the asymmetry hypothesized below.
+  - **Root cause = the inter-call separator.** On a well-formed N-call
+    turn every byte round-trips *except the join*: the model emitted
+    `</tool_call><tool_call>` (grammar was `calls ::= call+`, no separator)
+    while the Qwen3-Coder template re-renders `</tool_call>\n<tool_call>`
+    (its `loop.first`-gated `\n`). Even hallucinated `Response: …` text
+    inside `<parameter>` values round-tripped perfectly. The analyzer
+    *saw* that `\n` in the 2-call diff and discarded it (`trim_start`).
+  - **Fix (landed, verified):** new `CallSyntax::call_separator`, analyzed
+    from the 2-call render (`analyzer.rs` `check_per_call_markers` +
+    `analyze_json_native_parallel_calls`), woven into the grammar
+    (`calls ::= call ( SEP call )*`, `emit.rs`) and `render_reference`.
+    Unit assertions on the Qwen fixtures (`call_separator == "\n"`,
+    no model) + a deterministic **greedy** round-trip test
+    (`multi_call_round_trips_under_greedy`, 5-call turn round-trips
+    byte-exact). Arg ORDER was never the issue: the tagged grammar
+    force-sorts alphabetically and render + minijinja agree.
+  - **Split out → [#61](https://github.com/mdegans/drama_llama/issues/61):**
+    the fuzzer's *other* failure (seed 2, `:481`) is grammar-legal garbage
+    the model stuffs into the unbounded raw-value region under stochastic
+    sampling. MEASURED: recommended ≡ locally-typical byte-identical (NOT
+    our tail-cut sampler); **greedy is clean on every seed/quant** (model
+    knows the answer; sampling realizes its uncertainty in the value
+    region at temp=1.0); Q8 quant halves the rate but doesn't fix it. The
+    unbounded `until`-value is the enabler. Not a pipeline bug.
+  - **[#60](https://github.com/mdegans/drama_llama/issues/60):** Mike wants
+    tool-arg *declaration* order (reasoning-ish before answer-ish; matters
+    for small models). Its own session — global `serde_json` preserve_order
+    + re-align grammar/render/minijinja + re-close the duplicate-optional
+    hole that sorting currently closes.
 
-## What's actually left (revised 2026-07-20 after the investigation)
+## What's actually left (revised 2026-07-20 PM after the fix)
 
-The grammar-fix step is deleted — it doesn't exist as a sound change
-(above). What remains:
+The gen-prompt-vs-completed-turn scaffold-asymmetry hypothesis was
+WRONG (the scaffold matches). What remains:
 
-1. **#58 multi-call round-trip is the real blocker on the test** (not
-   #53's unclosed-think). Leading suspect after seeing the scaffold: the
-   Qwen template emits `<think>\n\n</think>` in the *generation prompt*
-   but likely NOT (or differently) when re-rendering a *completed*
-   assistant turn — a gen-prompt-vs-completed-turn asymmetry that would
-   break `strip_prefix` independent of call count. Verify in
-   `chat_template.rs` (`append_message`, generation_prompt handling).
-   Also the renderer call-join / arg-canonicalization angle.
-2. **Residual Auto+unclosed-think: DECIDED — cache-safe repair** (above).
-   The fuller open-thought mechanism is [#59](https://github.com/mdegans/drama_llama/issues/59)
-   (signature-field flag; trailing-only invariant; design session). Only
-   after #58 is fixed does flipping
-   `complete_text_round_trips_through_parse_and_render` to a hard
-   assertion make sense; today its failures are #58, not #53.
+1. **#58 multi-call separator: DONE** (`call_separator`, above). The
+   deterministic greedy round-trip test is the reliable byte-exact gate.
+2. **#61 grammar-legal garbage under sampling: OPEN.** Options in the
+   issue; leaning "scope the invariant to well-formed emissions (greedy
+   test is the gate) + maybe lower forced-region temp" over the
+   expensive parser↔grammar boundary-alignment. NOTE the tension: the
+   old fuzzer `complete_text_round_trips_through_parse_and_render` uses
+   *sampled* output, so it stays intermittently red on garbage seeds —
+   it now tests #61, not #58. Decide with Mike whether to convert it to
+   greedy, keep it as a known-flaky canary, or delete it in favor of the
+   greedy test.
+3. **#60 declaration-order args: OPEN**, its own session.
+4. **Residual Auto+unclosed-think: DECIDED — cache-safe repair** (above);
+   fuller mechanism is [#59](https://github.com/mdegans/drama_llama/issues/59).
 
 The round-trip byte-stability is *the* prefix-cache invariant (see
-[[plan_tool_dialects]]). But the enforcement layer is NOT always the
-grammar — where the emission is un-grammared (the lazy pre-trigger
-region), the grammar cannot help, and the honest options are a
-renderer-preserves-bytes change or a cache-safe repair.
+[[plan_tool_dialects]]). Enforcement is the grammar WHERE the emission
+is grammared: `call_separator` makes the grammar force the same
+inter-call join the template renders, so well-formed N-call turns hold
+by construction. Where the emission is un-grammared (lazy pre-trigger)
+or grammar-legal-but-degenerate (#61's unbounded value), the grammar
+can't help and the honest options are a renderer/parser byte-alignment
+or a cache-safe repair.
