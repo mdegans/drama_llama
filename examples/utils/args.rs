@@ -1,22 +1,17 @@
 //! Shared command-line flags for the examples.
 //!
-//! Composed with clap's `#[command(flatten)]`: an example derives its own
-//! `Parser` and flattens [`CommonArgs`] (and [`ChatArgs`] for chat-loop
-//! examples), adding only its own arguments. Examples that need nothing
-//! beyond the common shape can parse [`Args`] directly.
+//! Examples `#[command(flatten)]`: [`CommonArgs`] into their own.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU128, NonZeroU32};
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, Parser};
 use misanthropic::Prompt;
 
-/// Flags shared by most examples. Flatten into an example's `Parser` and
-/// apply with [`configure`](CommonArgs::configure).
+/// Flags shared by most examples. `#[command(flatten)]` into example args.
 #[derive(ClapArgs, Debug, Clone)]
 pub struct CommonArgs {
-    /// Path to a GGUF model. Defaults to the repo's `models/model.gguf`
-    /// symlink.
+    /// Path to a GGUF model.
     #[arg(short, long, default_value_os_t = default_model_path())]
     pub model: PathBuf,
 
@@ -24,19 +19,10 @@ pub struct CommonArgs {
     #[arg(long)]
     pub max_tokens: Option<NonZeroU32>,
 
-    /// Fixed RNG seed, applied to the session as a "fork" (same prompt +
-    /// same seed ⇒ same output). Default UNSET: a session resumes cached
-    /// sampler state on a cache hit and uses fresh entropy otherwise —
-    /// which is what the cache examples (council/swarm/prompt_caching)
-    /// exercise; forcing a seed discards that resume snapshot. Note:
-    /// `--seed 0` maps through `NonZeroU128::new(0) == None`, i.e. "no
-    /// seed".
-    #[arg(long)]
-    pub seed: Option<u128>,
+    /// RNG seed for new generation. Unset means random.
+    pub seed: Option<NonZeroU128>,
 
-    /// Context length (KV cells) for the session. Examples with many
-    /// cache slots override the default upward via `mut_arg` (see
-    /// council) so `--help` always shows the real value.
+    /// Max context length
     #[arg(long, default_value_t = 8192)]
     pub n_ctx: u32,
 
@@ -49,8 +35,7 @@ pub struct CommonArgs {
     pub verbose: bool,
 }
 
-/// The repo-conventional model path: `models/model.gguf` next to
-/// `Cargo.toml`, usually a symlink to a real GGUF.
+/// `{CARGO_MANIFEST_DIR}/models/model.gguf`
 pub fn default_model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
 }
@@ -113,8 +98,7 @@ impl CommonArgs {
         mut session: drama_llama::LlamaCppSession,
     ) -> drama_llama::LlamaCppSession {
         session = session.quiet();
-        session =
-            session.with_seed(self.seed.and_then(std::num::NonZeroU128::new));
+        session = session.with_seed(self.seed);
         // The `--max-tokens` override now rides on the prompt via
         // [`Self::configure`] (`prompt.max_tokens`), the sole generation cap
         // since `Session::with_max_tokens` was removed.
