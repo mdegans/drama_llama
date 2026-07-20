@@ -156,13 +156,30 @@ fn whodunit_verdict() {
 
     println!("=== verdict ===\n{verdict:#?}\n===");
 
-    // (3) The array of suspects deserialized correctly through the
-    // $ref → Suspect path. We asked for three; at least two should
-    // appear.
+    // (3) The array of suspects deserialized through the $ref →
+    // Suspect path, and is non-empty.
+    //
+    // Non-emptiness is the strongest claim this assertion can
+    // honestly make: `length(min = 1)` is enforced in the grammar,
+    // but counts beyond 1 are deliberately NOT — misanthropic's
+    // sanitizer strips `minItems >= 2` (Anthropic only enforces
+    // non-emptiness server-side) and `schema_to_gbnf` ignores larger
+    // counts on purpose, because forcing N items makes the model
+    // manufacture filler entries. See
+    // `.claude/memory/schema_constraint_keywords_decision.md` — whose
+    // trigger was *this test*, answering `suspects_considered: []`.
+    //
+    // So asserting ≥2 here, as this used to, claimed more than the
+    // grammar guarantees and left the difference resting on the
+    // model's mood; it duly broke when the sidecar's default chain
+    // got hotter. Multi-element `$ref`-array coverage lives where it
+    // can be deterministic: `compiles_ref_array_accepts_populated` in
+    // `src/grammar_compile.rs` accepts a two-element array with no
+    // model in the loop.
     assert!(
-        verdict.suspects_considered.len() >= 2,
-        "expected ≥2 suspects considered (tests $ref array), got {}: {:#?}",
-        verdict.suspects_considered.len(),
+        !verdict.suspects_considered.is_empty(),
+        "suspects_considered must be non-empty (grammar enforces \
+         minItems=1): {:#?}",
         verdict.suspects_considered,
     );
 
