@@ -376,22 +376,50 @@ impl<'a> Parser<'a> {
                     self.pos += at + end.len();
                 }
                 None => {
-                    // Entire text so far is thought-in-progress.
-                    match self.leniency {
-                        Leniency::Streaming => {
-                            self.status = ParseStatus::NeedMoreInput;
-                            self.pos = self.text.len();
-                        }
-                        Leniency::Final => {
-                            // Unclosed thought at end of generation:
-                            // surface what we have as a Thought — the
-                            // model was cut off mid-reasoning.
-                            let body = self.rest().to_string();
+                    // No reasoning close anywhere. Before treating the
+                    // remainder as an unterminated thought, check whether
+                    // the model emitted a tool call *inside* the still-open
+                    // reasoning block (issue #53): under the lazy trigger
+                    // grammar the model may decide to call mid-thought and
+                    // never close `</think>`. The call is content, not
+                    // reasoning — split the thought at the trigger and let
+                    // the main loop parse the call. Restricted to marker
+                    // dialects (non-empty trigger); a bare-JSON `{`/`[`
+                    // trigger would false-positive on braces in reasoning
+                    // prose/code/math. We only reach here with the close
+                    // provably absent, so there is no close/trigger
+                    // ordering ambiguity.
+                    let trigger = self.syntax.trigger();
+                    let call_at = (!trigger.is_empty())
+                        .then(|| self.rest().find(trigger))
+                        .flatten();
+                    match call_at {
+                        Some(at) => {
+                            let body = &self.rest()[..at];
                             self.push_thought(body.trim_end());
-                            self.pos = self.text.len();
+                            self.pos += at;
+                            // Fall through to the main landmark loop, which
+                            // parses the call section from the trigger.
+                        }
+                        None => {
+                            // Entire text so far is thought-in-progress.
+                            match self.leniency {
+                                Leniency::Streaming => {
+                                    self.status = ParseStatus::NeedMoreInput;
+                                    self.pos = self.text.len();
+                                }
+                                Leniency::Final => {
+                                    // Unclosed thought at end of generation:
+                                    // surface what we have as a Thought —
+                                    // the model was cut off mid-reasoning.
+                                    let body = self.rest().to_string();
+                                    self.push_thought(body.trim_end());
+                                    self.pos = self.text.len();
+                                }
+                            }
+                            return;
                         }
                     }
-                    return;
                 }
             }
         }
@@ -553,7 +581,37 @@ impl<'a> Parser<'a> {
                 // templates lay the tag out.
                 let _ = self.eat("\n");
             }
-            None => self.incomplete(start),
+            None => {
+                // No reasoning close. Did the model emit a tool call
+                // inside the still-open reasoning block (issue #53)?
+                // Split the thought at the trigger and return to the
+                // main loop, which parses the call. Marker dialects only
+                // (non-empty trigger); a bare-JSON `{`/`[` would
+                // false-positive on prose braces. Reached only with the
+                // close provably absent, so no ordering ambiguity.
+                let trigger = self.syntax.trigger();
+                let call_at = (!trigger.is_empty())
+                    .then(|| self.rest().find(trigger))
+                    .flatten();
+                match call_at {
+                    Some(at) => {
+                        // `open` was already eaten, so `rest()` is the
+                        // body; mirror the closed branch's leading-`\n`
+                        // strip + `trim_end` for byte-identical thoughts.
+                        let body = &self.rest()[..at];
+                        let body = body
+                            .strip_prefix('\n')
+                            .unwrap_or(body)
+                            .trim_end()
+                            .to_string();
+                        self.push_thought(&body);
+                        self.pos += at;
+                        // Return to the main loop; the trigger dispatches
+                        // to parse_calls on the next iteration.
+                    }
+                    None => self.incomplete(start),
+                }
+            }
         }
     }
 
@@ -1690,6 +1748,213 @@ mod tests {
             assert_eq!(calls[0].1["days"], serde_json::json!(3));
             assert_eq!(calls[1].1["city"], serde_json::json!("London"));
         }
+    }
+
+    // Issue #53: a tool call emitted inside an *unclosed* reasoning
+    // block must surface as a `ToolUse`, not be swallowed into the
+    // Thought (pre-opened) or a Text block (mid-stream). Deterministic
+    // parser-level coverage — the model-backed round-trip fuzzer can't
+    // reliably reproduce this shape on a thinking-disabled prompt.
+    // These assert the *functional* fix (call surfaces); byte-exact
+    // round-trip of an unclosed-think emission is a grammar/canon
+    // concern tracked separately.
+
+    /// Pre-opened reasoning, no `</think>`, then a call: prose becomes
+    /// a Thought and the call a ToolUse. (Bug site 1 — the pre-opened
+    /// `None`-close arm.)
+    #[test]
+    fn pre_opened_unclosed_think_then_call() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let input = json!({"city": "Paris", "days": 3});
+        let call =
+            render_reference(&syntax, &[("get_weather", &input)]).unwrap();
+        // Text begins INSIDE reasoning (pre-opened); no `</think>`.
+        let text = format!("planning the call\n{call}");
+        let parsed = parse_text(&syntax, &[&t], &text, true, Leniency::Final);
+        assert_eq!(
+            parsed.status,
+            ParseStatus::Complete,
+            "{:#?}",
+            parsed.blocks
+        );
+        assert!(
+            matches!(&parsed.blocks[0], Block::Thought { thought, .. }
+                if thought.contains("planning")),
+            "prose before the call is a Thought: {:#?}",
+            parsed.blocks
+        );
+        let calls = calls_of(&parsed.blocks);
+        assert_eq!(
+            calls.len(),
+            1,
+            "the call must surface, not be swallowed: {:#?}",
+            parsed.blocks
+        );
+        assert_eq!(calls[0].1["city"], json!("Paris"));
+        assert!(
+            !parsed
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::Text { .. })),
+            "no stray Text carrying the swallowed call: {:#?}",
+            parsed.blocks
+        );
+    }
+
+    /// Mid-stream `<think>{prose}<tool_call>…` with no close. (Bug
+    /// site 2 — the `parse_thought` `None`-close branch.)
+    #[test]
+    fn midstream_unclosed_think_then_call() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let input = json!({"city": "Paris", "days": 3});
+        let call =
+            render_reference(&syntax, &[("get_weather", &input)]).unwrap();
+        let text = format!("<think>\nreason it out\n{call}"); // no </think>
+        let parsed = parse_text(&syntax, &[&t], &text, false, Leniency::Final);
+        assert!(
+            matches!(&parsed.blocks[0], Block::Thought { thought, .. }
+                if thought.contains("reason it out")),
+            "{:#?}",
+            parsed.blocks
+        );
+        assert_eq!(calls_of(&parsed.blocks).len(), 1, "{:#?}", parsed.blocks);
+    }
+
+    /// Guard: a `<tool_call>`-like substring that is NOT the real
+    /// trigger (`<tool_call>\n`) must not cause an over-eager split.
+    /// Mid-stream preserves it as Text (the #38 fallback), pre-opened
+    /// as a Thought — either way no spurious ToolUse and no dropped
+    /// bytes.
+    #[test]
+    fn unclosed_think_fake_trigger_substring_is_not_a_call() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        // "<tool_call>" followed by a space, not the "<tool_call>\n"
+        // trigger.
+        let midstream = "<think>\nI could emit a <tool_call> but not yet";
+        let parsed =
+            parse_text(&syntax, &[&t], midstream, false, Leniency::Final);
+        assert!(
+            calls_of(&parsed.blocks).is_empty(),
+            "fake trigger must not become a call: {:#?}",
+            parsed.blocks
+        );
+        assert!(
+            parsed
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::Text { text, .. }
+                if text.contains("<tool_call>"))),
+            "the substring is preserved, not dropped: {:#?}",
+            parsed.blocks
+        );
+
+        // Same shape, pre-opened: preserved as a Thought instead.
+        let pre = "reasoning with a <tool_call> mention only";
+        let parsed = parse_text(&syntax, &[&t], pre, true, Leniency::Final);
+        assert!(calls_of(&parsed.blocks).is_empty(), "{:#?}", parsed.blocks);
+        assert!(
+            matches!(&parsed.blocks[0], Block::Thought { thought, .. }
+                if thought.contains("<tool_call>")),
+            "{:#?}",
+            parsed.blocks
+        );
+    }
+
+    /// Regression: a properly-*closed* `</think>` then a call still
+    /// parses to Thought + ToolUse, in both literal and pre-opened
+    /// forms — the fix must not disturb the happy path.
+    #[test]
+    fn closed_think_then_call_still_parses() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let input = json!({"city": "Paris", "days": 3});
+        let call =
+            render_reference(&syntax, &[("get_weather", &input)]).unwrap();
+        let closed = format!("<think>\nthinking\n</think>\n{call}");
+        for (text, pre) in [
+            (closed.clone(), false),
+            (closed.strip_prefix("<think>").unwrap().to_string(), true),
+        ] {
+            let parsed =
+                parse_text(&syntax, &[&t], &text, pre, Leniency::Final);
+            assert!(
+                matches!(&parsed.blocks[0], Block::Thought { thought, .. }
+                    if thought.contains("thinking")),
+                "pre={pre}: {:#?}",
+                parsed.blocks
+            );
+            assert_eq!(
+                calls_of(&parsed.blocks).len(),
+                1,
+                "pre={pre}: {:#?}",
+                parsed.blocks
+            );
+        }
+    }
+
+    /// Empty reasoning body before the call yields no stray empty
+    /// Thought (`push_thought` drops empties).
+    #[test]
+    fn unclosed_think_empty_body_no_empty_thought() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let input = json!({"city": "Paris", "days": 3});
+        let call =
+            render_reference(&syntax, &[("get_weather", &input)]).unwrap();
+        // Pre-opened, call immediately: no reasoning prose, no close.
+        let parsed = parse_text(&syntax, &[&t], &call, true, Leniency::Final);
+        assert!(
+            !parsed
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::Thought { .. })),
+            "empty reasoning must not make a Thought: {:#?}",
+            parsed.blocks
+        );
+        assert_eq!(calls_of(&parsed.blocks).len(), 1, "{:#?}", parsed.blocks);
+    }
+
+    /// Multiple calls after an unclosed reasoning block: all surface.
+    #[test]
+    fn unclosed_think_then_two_calls() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let a = json!({"city": "Paris", "days": 3});
+        let b = json!({"city": "London", "days": 5});
+        let two = format!(
+            "{}\n{}",
+            render_reference(&syntax, &[("get_weather", &a)]).unwrap(),
+            render_reference(&syntax, &[("get_weather", &b)]).unwrap(),
+        );
+        let text = format!("planning\n{two}");
+        let parsed = parse_text(&syntax, &[&t], &text, true, Leniency::Final);
+        let calls = calls_of(&parsed.blocks);
+        assert_eq!(calls.len(), 2, "{:#?}", parsed.blocks);
+        assert_eq!(calls[1].1["city"], json!("London"));
+    }
+
+    /// Streaming: a partial call inside an unclosed reasoning block
+    /// must report `NeedMoreInput` and surface no call — the Thought
+    /// split is stable once the full trigger is buffered, but the call
+    /// is held back until complete.
+    #[test]
+    fn streaming_unclosed_think_partial_call_needs_more_input() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let text =
+            "planning\n<tool_call>\n<function=get_weather>\n<parameter=ci";
+        let parsed =
+            parse_text(&syntax, &[&t], text, true, Leniency::Streaming);
+        assert_eq!(
+            parsed.status,
+            ParseStatus::NeedMoreInput,
+            "{:#?}",
+            parsed.blocks
+        );
+        assert!(calls_of(&parsed.blocks).is_empty(), "{:#?}", parsed.blocks);
     }
 
     /// Prefix-chop atomicity: parsing any prefix of a full emission
