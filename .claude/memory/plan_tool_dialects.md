@@ -1,5 +1,15 @@
 # Plan of record: tool-call dialects (template-derived CallSyntax)
 
+> **STATUS: COMPLETE.** Phases A–G all landed; issues #27, #28, #29 and
+> #30 are closed. Kept as history for the design rationale.
+>
+> Two rescopes happened mid-implementation and the ORIGINAL plan text
+> further down was never pruned to match — where they disagree, the
+> Progress section wins:
+> - **Phase F shipped as native Gemma 4 support**, not the `Instructed`
+>   dialect the plan sketch describes (see the rescope note in Progress).
+> - The static Phase F/G skeleton below predates both.
+
 Approved by Mike 2026-07-10. Canonical copy lives as a GitHub issue
 (see repo issues, "Tool-call dialects" umbrella); this file is the
 in-repo twin. Supersedes the sketch in issue #29 (absorbed as Phase

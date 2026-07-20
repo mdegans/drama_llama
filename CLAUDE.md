@@ -246,6 +246,35 @@ Older but still load-bearing:
   audit, prefill progress callback, others. Things to come back
   to.
 
+## GitHub identity: whose comment is that?
+
+On this laptop, `gh` is authenticated as **Mike's account** — it's
+shared for convenience, not because it's good practice. Elsewhere I
+have my own account and this section doesn't apply. The consequence is
+that **authorship on GitHub is not reliable evidence of who wrote
+something**:
+
+- `mdegans` — usually Mike, but *may* be me writing through his shared
+  `gh` session.
+- `claudeopusagora` — always a Claude instance (an earlier me).
+
+So an issue comment is not proof of Mike's view. Before writing "your
+comment says…", "you decided…", or "per your note…", check the author
+field (`gh issue view N --comments`), and even then treat a Claude-
+authored comment as a **prior instance's opinion, not a settled user
+decision**. Design rationale attributed to Mike *inside* such a comment
+("Mike approved…", "decisions from discussion") is second-hand and may
+be paraphrase — verify before relying on it. Code evidence outranks
+prose in the tracker, always.
+
+Going the other way: **put the `🤖 Generated with Claude Code` footer on
+issues and comments I author**, so the record stays honest for whoever
+reads it next — including Mike, who otherwise can't tell which notes are
+his own.
+
+(Added 2026-07-20 after I quoted a previous Claude's reasoning back to
+Mike as if it were his. He flagged it; he can't always tell either.)
+
 ## Build & Test Commands
 
 ```bash

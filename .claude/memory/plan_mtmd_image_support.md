@@ -1,5 +1,22 @@
 # Image support via llama.cpp mtmd (drama_llama + llama-cpp-sys-3)
 
+> **STATUS: COMPLETE.** All phases (A, B, C0, C+D) landed 2026-07-11.
+> Issue #31 closed 2026-07-20. Kept as history — the design rationale
+> and the M-RoPE / sentinel / cache-entry findings below are still the
+> reference for anyone touching media. The plan text after the phase
+> summaries is the ORIGINAL plan, not a description of what shipped;
+> where the two disagree the "LANDED" session summaries win (notably:
+> `Vision::tokenize_image` replaced the segment-based interface, and
+> sentinel rendering replaced marker escape/reject).
+>
+> Of the "Open / carried forward" list (below): the moeflux `NoVision`
+> compile-check is **done** (`src/moeflux/mod.rs:31`), and the SmolVLM
+> CI test is **dropped, not deferred** — this repo has no CI at all to
+> host it (issue #50 closed as false-premised; #51 tracks the actual
+> absence-of-CI gap). Genuinely still open: decode memoization behind
+> the `decode_image` funnel, faithful `parse_special=false` content-span
+> handling, and streaming tip extension (v2).
+
 ## Context
 
 drama_llama's `Block::Image` (upstream misanthropic, `image`-crate decode)
