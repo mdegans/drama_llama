@@ -20,10 +20,17 @@ resolved and were removed rather than left as ghosts:
 
 ## What actually remains
 
-The unsafe audit was completed for **moeflux only**
-(`riir_unsafe_audit.md`, 2026-04-28, scoped to
-`crates/moeflux/src/riir/`). drama_llama's own FFI surface has never
-had the same pass. Current inventory:
+**drama_llama's llama.cpp FFI has been audited before** — Mike,
+2026-07-20 — but the pass was never written down, so no artifact
+survives to check against or to diff a new pass on. moeflux's
+equivalent *was* recorded (`riir_unsafe_audit.md`, 2026-04-28, scoped
+to `crates/moeflux/src/riir/`) and is the format to copy.
+
+A redo is warranted on both counts: there is nothing on paper, and the
+surface has moved materially since. `src/llama_cpp/mtmd.rs` did not
+exist at the time (landed 2026-07-11 for #31), and `decoder.rs` /
+`model.rs` were reworked through the `Session<B: Backend>` split.
+Current inventory:
 
 | file | `unsafe` occurrences |
 |---|---|
@@ -32,8 +39,8 @@ had the same pass. Current inventory:
 | `src/llama_cpp/decoder.rs` | 42 |
 | `src/llama_cpp/engine.rs` | 5 |
 
-`src/llama_cpp/mtmd.rs` is the priority: it is the newest of the four
-(landed 2026-07-11 for #31), the least exercised, and it is where the
+`src/llama_cpp/mtmd.rs` is the priority: it postdates the unrecorded
+audit entirely, it is the least exercised, and it is where the
 hand-assembled `llama_batch` view lives — `EmbdBatch` builds a
 `llama_batch` by hand rather than through `llama_batch_init`, with
 Rust-owned buffers and a documented no-`llama_batch_free` invariant.
@@ -54,5 +61,9 @@ the transmute sites trusting it, and they are not co-located.
 Per unsafe block: write down its invariant, then flag the ones where
 the invariant is load-bearing but not obviously stated at the site.
 Same format as `riir_unsafe_audit.md`, which is the worked example.
+
+**Commit the artifact.** The point of the redo is as much the written
+record as the reading — an audit nobody can find is one that has to be
+run again from scratch, which is exactly why this entry exists.
 
 Still a dedicated session, not folded into feature work.
