@@ -27,8 +27,9 @@ use std::{
 ///
 /// Adapted from `llama.cpp/common/common.cpp`
 ///
-/// # Panics
-/// * If the token's piece is not valid UTF-8.
+/// Infallible: out-of-range ids render as `[invalid token N]`, and
+/// bytes that don't decode as `[Invalid UTF-8]`. Both substitutions
+/// are lossy.
 fn token_to_piece(token: llama_token, model: &LlamaCppModel) -> String {
     // Out-of-range ids (notably LLAMA_TOKEN_NULL = -1, returned by
     // vocab accessors like `eot()` when the model lacks the token)
@@ -353,7 +354,10 @@ impl LlamaCppModel {
         *self.max_token_len.get_or_init(|| {
             let mut max_len = 0;
             for i in 0..self.n_vocab() {
-                max_len = max_len.max(self.token_to_text(i).len());
+                // `i` is always in range here, so the `None` arm is
+                // unreachable; `map_or` keeps it total anyway.
+                max_len =
+                    max_len.max(self.token_to_text(i).map_or(0, str::len));
             }
             max_len
         })
@@ -539,7 +543,11 @@ impl LlamaCppModel {
                     buf.as_mut_ptr() as *mut c_char,
                     buf.len(),
                 ) + 1;
-                if required < 0 {
+                // llama.h:586 — "-1 on failure". `required` is already
+                // `ret + 1`, so a failure arrives here as 0, not as a
+                // negative. Testing `< 0` would let it through and
+                // then underflow at `required as usize - 1` below.
+                if required < 1 {
                     continue;
                 }
                 if buf.len() != required as usize {
@@ -645,13 +653,14 @@ impl LlamaCppModel {
         String::from_utf8(buf).ok()
     }
     /// Tokenize a string into a Vec of tokens.
+    ///
+    /// BOS/EOS are left entirely to llama.cpp: `add_special = true`
+    /// means "add whichever of them the vocab is configured for"
+    /// (llama.h:1132), and it honours `add_bos` and `add_eos`
+    /// independently. Appending EOS here as well would double it on
+    /// any GGUF that sets both flags.
     pub fn tokenize(&self, input: &str, special: bool) -> Vec<llama_token> {
-        let mut result =
-            self.tokenize_raw_special(input, self.add_bos(), special);
-        if self.add_eos() {
-            result.push(self.eos());
-        }
-        result
+        self.tokenize_raw_special(input, true, special)
     }
 
     /// Raw `llama_tokenize` with explicit `add_special` (controls the
@@ -697,6 +706,16 @@ impl LlamaCppModel {
         };
 
         if n_tokens < 0 {
+            // llama.h:1131 — INT32_MIN is an overflow sentinel, *not*
+            // a required-size hint, and negating it overflows. Only
+            // reachable past 2^31 tokens, but it's the one negative
+            // return that must not be treated as a length.
+            assert_ne!(
+                n_tokens,
+                i32::MIN,
+                "llama_tokenize reported tokenization overflow \
+                 (result exceeds i32::MAX tokens)"
+            );
             // this shouldn't happen, because there should be enough space, but
             // if not, `-n_tokens` indicates the number of tokens that are
             // needed.
@@ -723,16 +742,19 @@ impl LlamaCppModel {
 
     /// Convert a single token to a piece.
     ///
-    /// # Panics
-    /// * If the token's piece is not valid UTF-8.
+    /// Does not panic on invalid UTF-8: out-of-range ids render as
+    /// `[invalid token N]` and undecodable bytes as `[Invalid UTF-8]`.
+    /// Note that the latter is *lossy* and fires for merely
+    /// *incomplete* sequences too — a codepoint split across
+    /// byte-fallback tokens has no valid rendering in isolation. Use
+    /// the byte-preserving [`Model::token_to_piece_ref`](crate::backend::Model::token_to_piece_ref)
+    /// and buffer the bytes yourself if you need to reassemble those.
     pub fn token_to_piece(&self, token: llama_token) -> String {
         token_to_piece(token, &self)
     }
 
-    /// Convert tokens to text.
-    ///
-    /// # Panics
-    /// * If any token's piece is not valid UTF-8.
+    /// Convert tokens to pieces. Lossy on split codepoints — see
+    /// [`Self::token_to_piece`].
     pub fn tokens_to_pieces<'a, Ts>(
         &'a self,
         tokens: Ts,
@@ -745,8 +767,8 @@ impl LlamaCppModel {
 
     /// Convert tokens to a single string. Does not strip any prefix or suffix.
     ///
-    /// # Panics
-    /// * If any token's piece is not valid UTF-8.
+    /// Lossy on codepoints split across tokens — see
+    /// [`Self::token_to_piece`].
     pub fn tokens_to_string<Ts>(&self, tokens: Ts) -> String
     where
         Ts: IntoIterator<Item = llama_token>,
@@ -759,23 +781,41 @@ impl LlamaCppModel {
     /// This calls `llama_token_get_text`. It does not copy the underlying
     /// string, but whitespace is not converted.
     ///
+    /// Out-of-range ids return `None` rather than reaching the C++
+    /// `id_to_token.at(id)`, which throws `std::out_of_range` — an
+    /// exception unwinding through `extern "C"` aborts the process.
+    /// `LLAMA_TOKEN_NULL` (-1) is the id that makes this reachable in
+    /// practice: vocab accessors like `eot()` return it on models that
+    /// lack the token. Same hazard [`Self::token_to_piece`] guards.
+    ///
     /// # Panics
     /// * If the token text is invalid UTF-8
     // It's unclear how this differs from `token_to_piece` other than returning
     // a c_str() ptr to the underlying c++ std::string
-    pub fn token_to_text<'a>(&'a self, token: llama_token) -> &'a str {
+    pub fn token_to_text<'a>(&'a self, token: llama_token) -> Option<&'a str> {
+        if token < 0 || token >= self.n_vocab() {
+            return None;
+        }
+        // SAFETY: `token` is in range per the guard above, so the C++
+        // `.at()` cannot throw. The returned pointer borrows the
+        // `std::string` inside the vocab's `id_to_token`, which lives
+        // as long as the model — tied here to `&'a self`.
         let ptr = unsafe { llama_vocab_get_text(self.vocab, token) };
-        return unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        Some(unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
     }
 
     /// Convert tokens to text.
+    ///
+    /// Yields `None` for any out-of-range id rather than dropping it,
+    /// so the output stays positionally aligned with `tokens`. See
+    /// [`Self::token_to_text`].
     ///
     /// # Panics
     /// * If any token's piece is not valid UTF-8.
     pub fn tokens_to_text<'a, Ts>(
         &'a self,
         tokens: Ts,
-    ) -> impl Iterator<Item = &'a str> + 'a
+    ) -> impl Iterator<Item = Option<&'a str>> + 'a
     where
         Ts: IntoIterator<Item = &'a llama_token> + 'a,
     {
@@ -787,15 +827,24 @@ impl LlamaCppModel {
     // required. It's not the logits or probabilities, because that's stored in
     // the context. It may be a multiplier for the token's probability. The
     // constructor's configuration includes overrides for KV pairs.
-    pub fn token_to_score(&self, token: llama_token) -> f32 {
-        unsafe { llama_vocab_get_score(self.vocab, token) }
+    /// Out-of-range ids return `None`; see [`Self::token_to_text`] for
+    /// why (`.at()` throws, and the unwind aborts).
+    pub fn token_to_score(&self, token: llama_token) -> Option<f32> {
+        if token < 0 || token >= self.n_vocab() {
+            return None;
+        }
+        // SAFETY: in range per the guard, so `.at()` cannot throw.
+        Some(unsafe { llama_vocab_get_score(self.vocab, token) })
     }
 
     /// Get scores for a given slice of tokens.
+    ///
+    /// Yields `None` for any out-of-range id, keeping the output
+    /// positionally aligned with `tokens`.
     pub fn tokens_to_scores<'a, Ts>(
         &'a self,
         tokens: Ts,
-    ) -> impl Iterator<Item = f32> + 'a
+    ) -> impl Iterator<Item = Option<f32>> + 'a
     where
         Ts: IntoIterator<Item = &'a llama_token> + 'a,
     {
@@ -853,12 +902,9 @@ impl crate::backend::Model for LlamaCppModel {
         add_special: bool,
         parse_special: bool,
     ) -> Vec<crate::Token> {
-        let mut result =
-            self.tokenize_raw_special(input, add_special, parse_special);
-        if add_special && self.add_eos() {
-            result.push(LlamaCppModel::eos(self));
-        }
-        result
+        // No manual EOS append: `add_special` already covers both BOS
+        // and EOS on the llama.cpp side. See `LlamaCppModel::tokenize`.
+        self.tokenize_raw_special(input, add_special, parse_special)
     }
 
     fn token_to_piece(&self, token: crate::Token) -> String {
@@ -958,8 +1004,9 @@ mod tests {
         let hello_tokens = model.tokenize("Hello", false);
         assert!(!hello_tokens.is_empty());
         let any_hello = hello_tokens.iter().any(|&t| {
-            let text = model.token_to_text(t);
-            text.contains("Hello") || text.contains("hello")
+            model.token_to_text(t).is_some_and(|text| {
+                text.contains("Hello") || text.contains("hello")
+            })
         });
         assert!(
             any_hello,

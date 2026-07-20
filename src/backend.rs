@@ -37,11 +37,31 @@ pub struct TokenData {
 
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp_abi {
-    use super::TokenData;
-    use llama_cpp_sys_3::llama_token_data;
+    use super::{Token, TokenData};
+    use llama_cpp_sys_3::{llama_token, llama_token_data};
 
     static_assertions::assert_eq_size!(TokenData, llama_token_data);
     static_assertions::assert_eq_align!(TokenData, llama_token_data);
+
+    // Size and align alone do NOT establish the layout contract: all
+    // three fields are 4 bytes, so *any permutation* of them passes
+    // the two asserts above while silently swapping logits with
+    // probabilities at every cast site. Pin the offsets too, so a
+    // reorder upstream is a compile error rather than a wrong answer.
+    // (llama.h carries a `// TODO: simplify` on this struct, so it is
+    // not a hypothetical.)
+    const _: () = {
+        use std::mem::offset_of;
+        assert!(offset_of!(TokenData, id) == offset_of!(llama_token_data, id));
+        assert!(
+            offset_of!(TokenData, logit) == offset_of!(llama_token_data, logit)
+        );
+        assert!(offset_of!(TokenData, p) == offset_of!(llama_token_data, p));
+        // `Token` is cast to `llama_token` wholesale in batch and
+        // candidate plumbing; it had no assertion of its own.
+        assert!(size_of::<Token>() == size_of::<llama_token>());
+        assert!(align_of::<Token>() == align_of::<llama_token>());
+    };
 }
 
 /// Decode backend: produces logits and manages the KV cache.

@@ -77,10 +77,13 @@ pub struct MoefluxModel {
     name: Option<String>,
 }
 
-unsafe impl Send for MoefluxModel {}
-// `tokenizers::Tokenizer` is `Send + Sync`; `JsonValue` and `String`
-// are trivially so. Matches LlamaCppModel's Sync.
-unsafe impl Sync for MoefluxModel {}
+// No manual `unsafe impl Send`/`Sync`: every field is already
+// `Send + Sync` (`tokenizers::Tokenizer`, `JsonValue`, `String`,
+// `Token`, `Vec<Token>`, `OnceLock<usize>`), so the auto-derive
+// covers it. Asserting it by hand would only suppress the compile
+// error we *want* if a future field (an `Rc`, a `Cell`, a raw
+// pointer) makes the type genuinely thread-unsafe.
+static_assertions::assert_impl_all!(MoefluxModel: Send, Sync);
 
 impl MoefluxModel {
     /// Load a model from the MLX export directory.

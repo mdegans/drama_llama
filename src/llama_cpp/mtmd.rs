@@ -20,17 +20,17 @@ use std::{
 };
 
 use llama_cpp_sys_3::{
-    llama_context, llama_decode, llama_get_model, llama_model_n_embd_inp,
-    llama_n_batch, llama_n_ubatch, llama_pos, llama_seq_id,
-    llama_set_causal_attn, mtmd_bitmap, mtmd_bitmap_free, mtmd_bitmap_init,
-    mtmd_bitmap_set_id, mtmd_context, mtmd_context_params_default,
-    mtmd_decode_use_mrope, mtmd_decode_use_non_causal, mtmd_decoder_pos,
-    mtmd_encode_chunk, mtmd_free, mtmd_get_marker, mtmd_get_output_embd,
-    mtmd_helper_eval_chunk_single, mtmd_helper_image_get_decoder_pos,
-    mtmd_init_from_file, mtmd_input_chunk, mtmd_input_chunk_get_id,
-    mtmd_input_chunk_get_n_pos, mtmd_input_chunk_get_n_tokens,
-    mtmd_input_chunk_get_tokens_image, mtmd_input_chunk_get_tokens_text,
-    mtmd_input_chunk_get_type,
+    llama_context, llama_decode, llama_get_model, llama_model,
+    llama_model_n_embd_inp, llama_n_batch, llama_n_ubatch, llama_pos,
+    llama_seq_id, llama_set_causal_attn, mtmd_bitmap, mtmd_bitmap_free,
+    mtmd_bitmap_init, mtmd_bitmap_set_id, mtmd_context,
+    mtmd_context_params_default, mtmd_decode_use_mrope,
+    mtmd_decode_use_non_causal, mtmd_decoder_pos, mtmd_encode_chunk, mtmd_free,
+    mtmd_get_marker, mtmd_get_output_embd, mtmd_helper_eval_chunk_single,
+    mtmd_helper_image_get_decoder_pos, mtmd_init_from_file, mtmd_input_chunk,
+    mtmd_input_chunk_get_id, mtmd_input_chunk_get_n_pos,
+    mtmd_input_chunk_get_n_tokens, mtmd_input_chunk_get_tokens_image,
+    mtmd_input_chunk_get_tokens_text, mtmd_input_chunk_get_type,
     mtmd_input_chunk_type_MTMD_INPUT_CHUNK_TYPE_TEXT, mtmd_input_chunks,
     mtmd_input_chunks_free, mtmd_input_chunks_get, mtmd_input_chunks_init,
     mtmd_input_chunks_size, mtmd_input_text, mtmd_support_audio,
@@ -146,6 +146,13 @@ pub enum MtmdPrefillError {
     /// The projector encode failed (`mtmd_encode_chunk` nonzero).
     #[error("media encode failed with code {code}")]
     Encode { code: i32 },
+    /// This [`Mtmd`] was built against a different model than the
+    /// decoder it was handed. mtmd validates projector/text-model
+    /// agreement (embedding width, RoPE type) only at construction,
+    /// so pairing it with a foreign decoder would size buffers from
+    /// one model and index them with another's dimensions.
+    #[error("projector was loaded for a different model than this decoder's")]
+    ModelMismatch,
     /// The encoder produced a non-finite value (NaN/Inf), caught
     /// BEFORE any KV write — NaN is maximally contagious in the KV
     /// cache (one poisoned cell makes every later logit NaN and the
@@ -204,6 +211,10 @@ pub struct Mtmd {
     ctx: NonNull<mtmd_context>,
     /// Owned copy of the context's media marker (`<__media__>`).
     marker: String,
+    /// The model this projector was validated against at
+    /// construction. Compared (never dereferenced) against the
+    /// decoder's model on every eval — see [`Mtmd::eval_media_chunk`].
+    model: *const llama_model,
 }
 
 unsafe impl Send for Mtmd {}
@@ -262,7 +273,11 @@ impl Mtmd {
             .to_string_lossy()
             .into_owned();
 
-        Ok(Self { ctx, marker })
+        Ok(Self {
+            ctx,
+            marker,
+            model: model.inner,
+        })
     }
 
     /// Whether the projector supports image input.
@@ -438,6 +453,20 @@ impl Mtmd {
         start_pos: usize,
         seq_id: i32,
     ) -> Result<MediaSpan, MtmdPrefillError> {
+        // mtmd enforces projector/text-model agreement (n_embd, RoPE
+        // type) once, inside `mtmd_init_from_file`. That guarantee is
+        // void the moment this projector meets a different model — and
+        // `Engine::set_vision` makes that reachable from safe code.
+        // Below we read `n_embd` from the *decoder's* model to size a
+        // slice over a buffer mtmd allocated from *its* model, and take
+        // the M-RoPE decision from the mtmd context while llama.cpp
+        // reads `pos` using the decoder's `n_pos_per_embd`. Mismatched,
+        // any of those three is an out-of-bounds access.
+        if !std::ptr::eq(self.model, unsafe {
+            llama_get_model(decoder.context)
+        }) {
+            return Err(MtmdPrefillError::ModelMismatch);
+        }
         let n_tokens = unsafe { mtmd_input_chunk_get_n_tokens(chunk) } as usize;
         let n_pos = unsafe { mtmd_input_chunk_get_n_pos(chunk) } as u32;
 

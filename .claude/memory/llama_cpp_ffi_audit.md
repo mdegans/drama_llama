@@ -377,6 +377,61 @@ confirmed; whether a model in our fleet triggers it is not.
   describing it backwards — the old `Box` is dropped under the same
   mutex the trampoline holds while calling `cb`.
 
+## Status (2026-07-20, same session)
+
+Fixed in this pass: **1** (`&mut self` on `decode`/`prefill_inherent`,
+which makes the `&self` on `logits`/`embeddings` sound), **2** (null
+checks + accurate `# Panics` on all four accessors), **4**
+(`BatchTooLarge` pre-check), **5** (range guards on `token_to_text` /
+`token_to_score`, now `Option`-returning), **6** (delegate BOS/EOS to
+`add_special`), **8** (per-field `offset_of` asserts + `Token` size /
+align), **9** (raw write instead of a `&mut [bool]` over uninit),
+**10** (poison-safe `engine_count()`; note the finding's "NUMA
+`try_into().unwrap()` panics" premise was *false* — `ggml_numa_strategy`
+is `c_uint`, so it was a `u32 → u32` infallible conversion — but the
+poisoning concern it rode in on is real and now fixed, and the spurious
+conversion was simplified away), **11** (`n_embd_out` row stride), **12**'s `meta()` underflow,
+`INT32_MIN` sentinel, `moeflux` no-op `unsafe impl`s, the deprecated
+`llama_new_context_with_model`, and the `log.rs` unwind guard.
+
+Partially fixed: **3** — `DecodeError` now distinguishes `Aborted` /
+`Fatal` / `InvalidBatch` and exposes `kv_dirty()`, but nothing acts on
+it yet. Reconciliation is [#52](https://github.com/mdegans/drama_llama/issues/52).
+
+Also fixed: **7a**, via a stored `*const llama_model` on `Mtmd`
+compared at the top of `eval_media_chunk` (`ModelMismatch`).
+
+Deferred to issues: [#52](https://github.com/mdegans/drama_llama/issues/52)
+(KV-dirty reconciliation), [#54](https://github.com/mdegans/drama_llama/issues/54)
+(lifetime coupling — 7b and the `LlamaCppDecoder::new` twin),
+[#55](https://github.com/mdegans/drama_llama/issues/55) (split-codepoint
+loss; wants doing with the streaming work),
+[#56](https://github.com/mdegans/drama_llama/issues/56) (log reentrancy,
+`Batch` OOM, `add_tokens` position).
+
+### Methodology note — do not repeat this mistake
+
+A model-backed test (`complete_text_round_trips_through_parse_and_render`)
+failed on the changed tree, passed on `HEAD`, and passed again when the
+`tokenize` change was reverted. Three data points, all pointing at a
+regression that **did not exist**: the test fails ~1 run in 3 on its
+own, because `Session` picks a random seed when `with_seed` is unset.
+
+Two lessons. First, on a suite with model-backed tests, a single run
+per side of a bisect carries almost no information — the token ids
+were later compared directly and proved identical at `add_special`
+true and false (this GGUF has `add_bos=false` and no `add_eos` key),
+which is the evidence that should have been gathered first. Second,
+the flake is *worth keeping*: the random seed is fuzzing emission
+shapes, and it surfaced a genuine parse/render asymmetry
+([#53](https://github.com/mdegans/drama_llama/issues/53)) — a tool call
+emitted inside an unclosed `<think>` block does not round-trip.
+Seeding the test would have hidden a real bug.
+
+Also: the parallel `--test-threads=1` rule in `validation_runbook.md`
+is real. Running the ignored sweep in parallel produced 5 bogus
+`-3` failures before the runbook was consulted.
+
 ## Verdict and fix order
 
 Ownership — the thing this audit was chartered to check — is in good

@@ -48,9 +48,11 @@ cargo test
 # Full ignored sweep against models/model.gguf.
 # --test-threads=1 is REQUIRED: parallel model tests construct
 # multiple ~20 GB engines concurrently and fail with
-# `decoder.step failed: ErrorCode { code: -3 }` (first seen
-# 2026-06-12; a 46 s wall time for the sweep is the tell that it
-# ran parallel). --no-fail-fast so a lib-target failure doesn't
+# `decoder.step failed: Fatal { code: -3 }` (first seen
+# 2026-06-12, when it read `ErrorCode { code: -3 }`; the FFI audit
+# split that variant out — -3 is GGML_STATUS_FAILED, a compute-graph
+# failure. A 46 s wall time for the sweep is the tell that it ran
+# parallel). --no-fail-fast so a lib-target failure doesn't
 # skip the integration suites.
 cargo test --no-fail-fast -- --include-ignored --test-threads=1
 

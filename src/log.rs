@@ -84,7 +84,19 @@ unsafe extern "C" fn trampoline(
     let lvl = LogLevel::from(level);
     if let Ok(guard) = GLOBAL_LOG_CALLBACK.lock() {
         if let Some(cb) = guard.as_ref() {
-            cb(lvl, s);
+            // The closure is consumer-supplied and runs on whatever
+            // thread llama.cpp/ggml logs from. Unwinding out of an
+            // `extern "C"` fn hits Rust's abort-on-unwind shim, so a
+            // stray `.unwrap()` in someone's log sink would take the
+            // process down with no diagnostic beyond the panic
+            // message. Swallow it: a dropped log line is a better
+            // failure mode than a dead process, and losing logging is
+            // exactly the situation where you can least afford to
+            // lose the process.
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cb(lvl, s)
+                }));
         }
     }
 }

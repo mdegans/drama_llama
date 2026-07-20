@@ -13,14 +13,15 @@ use llama_cpp_sys_3::{
     llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED,
     llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED, llama_free,
     llama_get_embeddings_ith, llama_get_logits_ith, llama_get_memory,
-    llama_memory_clear, llama_memory_seq_add, llama_memory_seq_cp,
-    llama_memory_seq_div, llama_memory_seq_keep, llama_memory_seq_pos_max,
-    llama_memory_seq_rm, llama_model_is_hybrid, llama_model_is_recurrent,
-    llama_n_batch, llama_n_ctx, llama_n_seq_max, llama_new_context_with_model,
-    llama_numa_init, llama_perf_context, llama_perf_context_data,
-    llama_perf_context_reset, llama_pos, llama_seq_id, llama_set_n_threads,
-    llama_state_get_data, llama_state_get_size, llama_state_seq_get_data,
-    llama_state_seq_get_size, llama_state_seq_set_data, llama_state_set_data,
+    llama_init_from_model, llama_memory_clear, llama_memory_seq_add,
+    llama_memory_seq_cp, llama_memory_seq_div, llama_memory_seq_keep,
+    llama_memory_seq_pos_max, llama_memory_seq_rm, llama_model_is_hybrid,
+    llama_model_is_recurrent, llama_model_n_embd_out, llama_n_batch,
+    llama_n_ctx, llama_n_seq_max, llama_numa_init, llama_perf_context,
+    llama_perf_context_data, llama_perf_context_reset, llama_pos, llama_seq_id,
+    llama_set_n_threads, llama_state_get_data, llama_state_get_size,
+    llama_state_seq_get_data, llama_state_seq_get_size,
+    llama_state_seq_set_data, llama_state_set_data,
 };
 
 use thiserror::Error;
@@ -28,6 +29,19 @@ use thiserror::Error;
 /// Global engine count. When this drops to 0, the llama backend is freed in
 /// the last [`LlamaCppDecoder`]'s `Drop` implementation.
 pub(super) static ENGINE_COUNT: Mutex<usize> = Mutex::new(0);
+
+/// Lock [`ENGINE_COUNT`], ignoring poisoning.
+///
+/// The guarded region is a single `usize` increment/decrement plus the
+/// backend init/free calls; there is no invariant a panicking holder
+/// could leave half-established that a later caller would misread. But
+/// `Drop` also takes this lock, so propagating a poison error would
+/// turn every subsequent teardown into a panic-during-unwind — an
+/// abort. Recovering the inner value is strictly the safer failure
+/// mode here.
+fn engine_count() -> std::sync::MutexGuard<'static, usize> {
+    ENGINE_COUNT.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Possible errors when creating a new [`crate::Engine`] or
 /// [`LlamaCppDecoder`].
@@ -56,8 +70,49 @@ static_assertions::assert_impl_all!(NewError: Send, Sync);
 pub enum DecodeError {
     #[error("Could not find a KV slot for the Batch. Try reducing the size of the batch or increase the context size.")]
     NoKvSlot,
-    #[error("`llama_decode` returned an error code: {code}")]
+    /// `llama_decode` rejected the batch before touching the KV cache.
+    #[error("`llama_decode` rejected the batch as invalid (-1)")]
+    InvalidBatch,
+    /// Aborted mid-batch. **The KV cache is dirty**: llama.h:952 —
+    /// "processed ubatches will remain in the context's memory".
+    #[error("`llama_decode` was aborted (2); processed ubatches remain in the KV cache")]
+    Aborted,
+    /// Fatal error mid-batch. **The KV cache is dirty**, same as
+    /// [`Self::Aborted`].
+    #[error("`llama_decode` failed fatally ({code}); processed ubatches remain in the KV cache")]
+    Fatal { code: i32 },
+    /// A return code llama.cpp did not document at the version we were
+    /// built against. Treated as KV-dirty, because we cannot know.
+    #[error("`llama_decode` returned an unrecognized code: {code}")]
     ErrorCode { code: i32 },
+    /// Caught before the call. llama.cpp asserts
+    /// `n_tokens_all <= cparams.n_batch` with a non-`NDEBUG`-gated
+    /// `GGML_ASSERT`, i.e. it aborts the *process* rather than
+    /// returning, so this has to be checked on our side.
+    #[error(
+        "batch of {n_tokens} tokens exceeds the context's n_batch of {n_batch}"
+    )]
+    BatchTooLarge { n_tokens: usize, n_batch: u32 },
+}
+
+impl DecodeError {
+    /// Whether the KV cache may hold partially-decoded ubatches.
+    ///
+    /// llama.h:950-958 splits decode failures in two: `1` and `-1`
+    /// restore "the state before this call", while `2` and `< -1`
+    /// leave whatever ubatches already completed sitting in memory.
+    /// After a KV-dirty error, a caller's own position bookkeeping is
+    /// no longer trustworthy — reconcile against
+    /// [`LlamaCppDecoder::memory_seq_pos_max`] or wipe the sequence
+    /// before reusing it.
+    pub fn kv_dirty(&self) -> bool {
+        match self {
+            Self::NoKvSlot
+            | Self::InvalidBatch
+            | Self::BatchTooLarge { .. } => false,
+            Self::Aborted | Self::Fatal { .. } | Self::ErrorCode { .. } => true,
+        }
+    }
 }
 
 static_assertions::assert_impl_all!(DecodeError: Send, Sync);
@@ -110,9 +165,16 @@ pub struct LlamaCppDecoder {
     pub(crate) context: *mut llama_context,
     /// Cached vocab size from the source model — used to size logit slices.
     n_vocab: usize,
-    /// Cached embedding dimension from the source model — used to size
-    /// embedding slices.
+    /// Cached embedding dimension from the source model. Reported by
+    /// [`Self::embedding_size`]; **not** the slice stride — see
+    /// [`Self::embedding_size_out`].
     embedding_size: usize,
+    /// Row stride for [`Self::embeddings`], from
+    /// `llama_model_n_embd_out`. Equals `embedding_size` unless the
+    /// GGUF publishes `%s.embedding_length_out` (or the arch overrides
+    /// it, e.g. WavTokenizer-dec). llama.cpp indexes `embd.data` by
+    /// this, so sizing slices with `embedding_size` would over-read.
+    embedding_size_out: usize,
     /// Host-RAM per-sequence state snapshots backing
     /// [`Decoder::checkpoint_pos`] / [`Decoder::restore_to`]. Only
     /// populated when [`Self::seq_snapshots_enabled`].
@@ -145,32 +207,37 @@ impl LlamaCppDecoder {
         context_params: llama_context_params,
         numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
+        // `ggml_numa_strategy` is `c_uint` (== u32), so this is a plain
+        // pass-through — resolved before the guard on principle: no
+        // fallible work belongs inside a region whose panic would
+        // poison ENGINE_COUNT and turn every later `Drop` into an
+        // abort. (The prior code did a `u32 -> u32` `try_into().unwrap()`
+        // here, which looked like a panic risk but was infallible.)
+        let numa = numa_strategy
+            .unwrap_or(ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED);
+
         {
-            let mut count = ENGINE_COUNT.lock().unwrap();
+            let mut count = engine_count();
             *count += 1;
             if *count == 1 {
+                // SAFETY: first live decoder in the process; the guard
+                // serializes this against any concurrent init/free.
                 unsafe {
                     llama_backend_init();
-                    llama_numa_init(
-                        numa_strategy
-                            .unwrap_or(
-                                ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED
-                                    .try_into()
-                                    .unwrap(),
-                            )
-                            .try_into()
-                            .unwrap(),
-                    );
+                    llama_numa_init(numa);
                 }
             }
         }
 
+        // SAFETY: `model` is live (borrowed `&mut`) and outlives the
+        // context — `Engine` declares `decoder` before `model` so drop
+        // order tears the context down first.
         let context = unsafe {
-            llama_new_context_with_model(model.as_ptr_mut(), context_params)
+            llama_init_from_model(model.as_ptr_mut(), context_params)
         };
         if context.is_null() {
             // Roll back the count we just reserved.
-            let mut count = ENGINE_COUNT.lock().unwrap();
+            let mut count = engine_count();
             *count -= 1;
             if *count == 0 {
                 unsafe { llama_backend_free() };
@@ -190,6 +257,11 @@ impl LlamaCppDecoder {
             context,
             n_vocab: model.n_vocab() as usize,
             embedding_size: model.embedding_size() as usize,
+            // SAFETY: `model` is live for the call (we hold `&mut` to
+            // it) and this only reads cached hparams.
+            embedding_size_out: unsafe {
+                llama_model_n_embd_out(model.as_ptr())
+            } as usize,
             seq_snapshots: SnapshotStore::default(),
             seq_snapshots_enabled: needs_snapshots,
         })
@@ -406,12 +478,32 @@ impl LlamaCppDecoder {
     }
 
     /// Run one batch through `llama_decode`.
-    pub fn decode(&self, batch: &Batch) -> Result<(), DecodeError> {
+    ///
+    /// Takes `&mut self` because it mutates C-side context state — the
+    /// KV cache and the logits buffer. That is also what makes the
+    /// borrows handed out by [`Self::logits`] / [`Self::embeddings`]
+    /// sound: `llama_decode` reallocates the logits buffer when
+    /// `n_outputs` grows (`output_reserve` frees `buf_output`), so a
+    /// live slice must not survive across this call, and `&mut self`
+    /// is what stops it.
+    ///
+    /// On error, check [`DecodeError::kv_dirty`] before trusting any
+    /// position bookkeeping.
+    pub fn decode(&mut self, batch: &Batch) -> Result<(), DecodeError> {
+        // SAFETY: `self.context` is a live context (non-null since
+        // construction, freed only in `Drop`); `batch.batch` is a
+        // `llama_batch` owned by `Batch`, valid for the call and not
+        // retained by llama.cpp.
         let ret = unsafe { llama_decode(self.context, batch.batch) };
+        // llama.h:950-958. Codes 2 and < -1 leave processed ubatches
+        // in the KV cache; 1 and -1 restore the pre-call state.
         match ret {
             0 => Ok(()),
             1 => Err(DecodeError::NoKvSlot),
-            _ => Err(DecodeError::ErrorCode { code: ret }),
+            2 => Err(DecodeError::Aborted),
+            -1 => Err(DecodeError::InvalidBatch),
+            code if code < -1 => Err(DecodeError::Fatal { code }),
+            code => Err(DecodeError::ErrorCode { code }),
         }
     }
 
@@ -422,13 +514,24 @@ impl LlamaCppDecoder {
     /// Caller owns KV placement. Only the final token has logits
     /// enabled. Empty `tokens` is a no-op.
     pub fn prefill_inherent(
-        &self,
+        &mut self,
         tokens: &[Token],
         start_pos: usize,
         seq_id: llama_seq_id,
     ) -> Result<(), DecodeError> {
         if tokens.is_empty() {
             return Ok(());
+        }
+        // llama.cpp asserts `n_tokens_all <= cparams.n_batch` with a
+        // GGML_ASSERT, which is *not* NDEBUG-gated — overflowing it
+        // aborts the process instead of returning an error. Check on
+        // our side so the signature's `Result` means something.
+        let n_batch = self.n_batch();
+        if tokens.len() > n_batch as usize {
+            return Err(DecodeError::BatchTooLarge {
+                n_tokens: tokens.len(),
+                n_batch,
+            });
         }
         let mut batch = Batch::new(tokens.len(), 0, 1)
             .expect("prefill batch allocation failed");
@@ -444,38 +547,95 @@ impl LlamaCppDecoder {
 
     /// Get logits for the i'th token of the most recent decode.
     ///
+    /// The returned slice borrows the context's logits buffer, which
+    /// [`Self::decode`] reallocates — `&self` here against `&mut self`
+    /// there is what keeps that borrow sound.
+    ///
     /// # Panics
-    /// - If the index is invalid (panics come from the C side).
+    /// If `i` is not an output row of the last decode (i.e. the batch
+    /// did not set `logits[i]`). llama.h:1009 documents a NULL return
+    /// for invalid ids; debug builds of llama.cpp `GGML_ABORT` first,
+    /// release builds return NULL and we panic here rather than
+    /// building a slice over it.
     pub fn logits(&self, i: usize) -> &[f32] {
         let ptr = unsafe {
             llama_get_logits_ith(self.context, i.try_into().unwrap())
         };
+        assert!(
+            !ptr.is_null(),
+            "llama_get_logits_ith({i}) returned NULL: no logits for \
+             that row. The batch must set logits[{i}] = true before \
+             decoding."
+        );
+        // SAFETY: non-null per the assert; llama.cpp guarantees
+        // `n_vocab` contiguous floats per output row (the same stride
+        // it uses internally, `model.vocab.n_tokens()`); the borrow is
+        // tied to `&self` and `decode` takes `&mut self`.
         unsafe { std::slice::from_raw_parts(ptr, self.n_vocab) }
     }
 
     /// Mutable logits for the i'th token.
+    ///
+    /// # Panics
+    /// Same contract as [`Self::logits`].
     pub fn logits_mut(&mut self, i: i32) -> &mut [f32] {
         let ptr = unsafe { llama_get_logits_ith(self.context, i) };
+        assert!(
+            !ptr.is_null(),
+            "llama_get_logits_ith({i}) returned NULL: no logits for \
+             that row. The batch must set logits[{i}] = true before \
+             decoding."
+        );
+        // SAFETY: as `logits`, and `&mut self` makes the mutable
+        // aliasing exclusive.
         unsafe { std::slice::from_raw_parts_mut(ptr, self.n_vocab) }
     }
 
     /// Get embeddings for the i'th sequence.
+    ///
+    /// # Panics
+    /// If the context was not created with embeddings enabled, or `i`
+    /// is not an output row. Note that a plain generative context
+    /// fails this on the *first* call — llama.cpp throws "no
+    /// embeddings" and returns NULL when `embd.data` is unset.
     pub fn embeddings(&self, i: i32) -> &[f32] {
         let ptr = unsafe { llama_get_embeddings_ith(self.context, i) };
-        unsafe { std::slice::from_raw_parts(ptr, self.embedding_size) }
+        assert!(
+            !ptr.is_null(),
+            "llama_get_embeddings_ith({i}) returned NULL: the context \
+             has no embeddings. Create it with `embeddings = true`."
+        );
+        // SAFETY: non-null per the assert. Stride is `n_embd_out`, not
+        // `n_embd` — llama-context.cpp advances by
+        // `hparams.n_embd_out()`, and the two differ for models
+        // publishing `%s.embedding_length_out`. The header comment
+        // still says n_embd; the implementation is the contract.
+        unsafe { std::slice::from_raw_parts(ptr, self.embedding_size_out) }
     }
 
     /// Mutable embeddings for the i'th sequence.
+    ///
+    /// # Panics
+    /// Same contract as [`Self::embeddings`].
     pub fn embeddings_mut(&mut self, i: i32) -> &mut [f32] {
         let ptr = unsafe { llama_get_embeddings_ith(self.context, i) };
-        unsafe { std::slice::from_raw_parts_mut(ptr, self.embedding_size) }
+        assert!(
+            !ptr.is_null(),
+            "llama_get_embeddings_ith({i}) returned NULL: the context \
+             has no embeddings. Create it with `embeddings = true`."
+        );
+        // SAFETY: as `embeddings`, with exclusive access via `&mut`.
+        unsafe { std::slice::from_raw_parts_mut(ptr, self.embedding_size_out) }
     }
 }
 
 impl Drop for LlamaCppDecoder {
     fn drop(&mut self) {
+        // `llama_free` deliberately runs *outside* the guard: holding
+        // it across context teardown would let a concurrent `new`
+        // race init against free.
         unsafe { llama_free(self.context) };
-        let mut count = ENGINE_COUNT.lock().unwrap();
+        let mut count = engine_count();
         *count -= 1;
         if *count == 0 {
             unsafe { llama_backend_free() };

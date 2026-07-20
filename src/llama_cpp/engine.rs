@@ -291,14 +291,20 @@ impl LlamaCppEngine {
     }
 
     /// Run one batch through `llama_decode`.
-    pub fn decode(&self, batch: &Batch) -> Result<(), DecodeError> {
+    ///
+    /// `&mut self` is load-bearing: it prevents a slice from
+    /// [`Self::logits`] staying live across a decode, which
+    /// reallocates the buffer that slice points into.
+    pub fn decode(&mut self, batch: &Batch) -> Result<(), DecodeError> {
         self.decoder.decode(batch)
     }
 
     /// Decode `tokens` into the KV cache at positions
     /// `[start_pos, start_pos + tokens.len())` for `seq_id`.
+    ///
+    /// See [`Self::decode`] for why this takes `&mut self`.
     pub fn prefill(
-        &self,
+        &mut self,
         tokens: &[llama_token],
         start_pos: usize,
         seq_id: llama_seq_id,

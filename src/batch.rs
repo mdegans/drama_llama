@@ -239,16 +239,6 @@ impl Batch {
         }
     }
 
-    /// Whether logits should be calculated at a given index in the batch.
-    fn logits_mut(&mut self) -> &mut [bool] {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.batch.logits as *mut bool,
-                self.len(),
-            )
-        }
-    }
-
     /// Clear the batch.
     pub fn clear(&mut self) {
         self.batch.n_tokens = 0;
@@ -318,7 +308,17 @@ impl Batch {
                 sequence[0] = 0;
             }
         }
-        self.logits_mut()[i] = logits;
+        // SAFETY: `batch.logits` is a `malloc`'d array of `capacity`
+        // `int8_t` — llama.h:928, "All members are left
+        // uninitialized" — and slot `i` is in bounds per the capacity
+        // check above. Written through the raw pointer deliberately:
+        // going via a `&mut [bool]` would materialize a reference
+        // spanning slot `i` while it still holds an arbitrary malloc
+        // byte, and a reference to an invalid `bool` is UB whether or
+        // not it is ever read.
+        unsafe {
+            self.batch.logits.add(i).write(logits as i8);
+        }
 
         Ok(())
     }
