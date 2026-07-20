@@ -180,6 +180,16 @@ for the current arc:
   deliberately excludes from EOG. Cost six failing tests. The lesson
   generalizes — when llama.cpp gives you both a *label* (`eot`) and a
   *predicate* (`is_eog`), the predicate is the contract.
+- [`llama_cpp_ffi_audit.md`](.claude/memory/llama_cpp_ffi_audit.md)
+  — **read before touching `src/llama_cpp/` or `batch.rs`.** 2026-07-20
+  audit against llama.h 0.8.1. Ownership is clean (nothing frees what
+  llama.cpp owns; the `EmbdBatch` hand-assembly is exemplary and its
+  missing `seq_id` sentinel is *correct*) — the defects are API shape:
+  `decode`/`logits` both take `&self`, so a live logits slice can't
+  block a reallocating decode (safe-code UAF); `llama_get_*_ith` NULL
+  returns are unchecked and release builds take the UB path while debug
+  aborts. Carries the checked-and-clean list so a future pass doesn't
+  re-litigate settled ground.
 - [`logit_comparability_across_backends.md`](.claude/memory/logit_comparability_across_backends.md)
   — how far logits are comparable across backends, measured. Greedy
   streams and prefill logits port; the deep-context top-K tail does not
@@ -242,9 +252,9 @@ Older but still load-bearing:
   — diagnosis trace; rep-penalty was the dominant cause.
 - [`grammar_reserved_token_loop.md`](.claude/memory/grammar_reserved_token_loop.md)
   — Qwen3 reserved-token-mask fix.
-- [`future_work_*.md`](.claude/memory/) — block predictor, Rust
-  audit, prefill progress callback, others. Things to come back
-  to.
+- [`future_work_*.md`](.claude/memory/) — block predictor, prefill
+  progress callback, others. Things to come back to. (The Rust/FFI
+  audit graduated to `llama_cpp_ffi_audit.md` above.)
 
 ## GitHub identity: whose comment is that?
 
