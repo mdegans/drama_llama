@@ -1040,6 +1040,66 @@ mod tests {
         }
     }
 
+    /// Cross-model check of the `general.sampling.*` reader against
+    /// real files, including the **absent** case — a model that
+    /// advertises nothing must yield empty params so the sidecar
+    /// falls back to `SamplerConfig::default()` rather than to a
+    /// half-populated chain.
+    ///
+    /// `#[ignore]`d because it needs specific models beyond the
+    /// `model.gguf` symlink; each is skipped individually if missing,
+    /// so it stays useful on a partial model dir.
+    #[test]
+    #[ignore = "long running, requires the full models/ dir"]
+    fn test_recommended_sampling_across_models() {
+        use std::path::PathBuf;
+
+        // (file, expected top_k, expected top_p, expected temp)
+        let cases: &[(&str, Option<usize>, Option<f64>, Option<f32>)] = &[
+            (
+                "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf",
+                Some(20),
+                Some(0.95),
+                Some(1.0),
+            ),
+            (
+                "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+                Some(64),
+                Some(0.95),
+                Some(1.0),
+            ),
+            // Advertises no sampling metadata at all.
+            ("gpt-oss-20b-UD-Q8_K_XL.gguf", None, None, None),
+        ];
+
+        for (file, want_k, want_p, want_t) in cases {
+            let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            path.push("models");
+            path.push(file);
+            if !path.is_file() {
+                eprintln!("skipping absent model {file}");
+                continue;
+            }
+            let mut params =
+                unsafe { llama_cpp_sys_3::llama_model_default_params() };
+            params.n_gpu_layers = 0;
+            let model = LlamaCppModel::from_file(path, Some(params))
+                .unwrap_or_else(|| panic!("load {file}"));
+
+            let got = model.recommended_sampling();
+            assert_eq!(got.top_k.map(|k| k.get()), *want_k, "{file} top_k");
+            assert_eq!(got.top_p.map(|p| p.into_f()), *want_p, "{file} top_p");
+            assert_eq!(got.temp, *want_t, "{file} temp");
+
+            // The empty case must be *fully* empty — a model with no
+            // recommendation seeds the crate default, and `is_empty`
+            // is what that decision keys off.
+            if want_k.is_none() && want_p.is_none() && want_t.is_none() {
+                assert!(got.is_empty(), "{file} should recommend nothing");
+            }
+        }
+    }
+
     #[test]
     fn test_model_desc() {
         let model = load_test_model_cpu();

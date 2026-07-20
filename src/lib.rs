@@ -117,8 +117,8 @@ pub use ngram::{NGram, NGramData, NGramStats};
 pub mod sidecar;
 #[cfg(feature = "toml")]
 pub use sidecar::{
-    load_call_syntax, load_sample_options, write_call_syntax,
-    write_default_sample_options,
+    load_call_syntax, load_sample_options, seed_config_for, write_call_syntax,
+    write_sample_options,
 };
 pub use sidecar::{load_template_source, SidecarError};
 

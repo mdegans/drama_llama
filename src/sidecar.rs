@@ -112,36 +112,89 @@ pub fn load_sample_options(
     Ok(Some(opts))
 }
 
-/// Write [`SamplerConfig::default()`] to `path` as TOML so the user
-/// has a starting point to edit. Best-effort: if the parent dir
-/// doesn't exist or the file isn't writable, returns the underlying
-/// IO error and the caller decides whether to log + continue.
+/// Write `opts` to `path` as TOML so the user has a starting point to
+/// edit. Best-effort: if the parent dir doesn't exist or the file
+/// isn't writable, returns the underlying IO error and the caller
+/// decides whether to log + continue.
 ///
 /// Does *not* overwrite an existing file — call
 /// [`load_sample_options`] first to detect existence; the
 /// [`crate::LlamaCppSession::from_path*`] integration only writes when the read
 /// returned `Ok(None)`.
 ///
+/// `from_metadata` only selects the header comment. Pass `true` when
+/// `opts` was derived from the model's own
+/// [`recommended_sampling`](crate::backend::Model::recommended_sampling)
+/// so the file says where its numbers came from — otherwise a user
+/// comparing two models' sidecars has no way to tell a model's
+/// recommendation from the crate default.
+///
 /// [`crate::LlamaCppSession::from_path*`]: crate::LlamaCppSession::from_path_sync
 #[cfg(feature = "toml")]
-pub fn write_default_sample_options(path: &Path) -> Result<(), SidecarError> {
-    let opts = SamplerConfig::default();
-    let body = toml::to_string_pretty(&opts)?;
-    let header = "# drama_llama per-model sampling sidecar.\n\
-         # Edit to tune sampling for this model. Delete to reset to\n\
-         # SamplerConfig::default(); the next load will rewrite this\n\
-         # file.\n\
+pub fn write_sample_options(
+    path: &Path,
+    opts: &SamplerConfig,
+    from_metadata: bool,
+) -> Result<(), SidecarError> {
+    let body = toml::to_string_pretty(opts)?;
+    let provenance = if from_metadata {
+        "# The mode chain below was seeded from this model's own\n\
+         # `general.sampling.*` metadata — what the model asks for.\n"
+    } else {
+        "# The model advertised no `general.sampling.*` metadata, so\n\
+         # the mode chain below is SamplerConfig::default().\n"
+    };
+    let header = format!(
+        "# drama_llama per-model sampling sidecar.\n\
+         # Edit to tune sampling for this model. Delete to reset; the\n\
+         # next load will rewrite this file.\n\
          #\n\
-         # See drama_llama::sidecar module docs for the layout\n\
-         # convention and what's intentionally excluded (Json,\n\
-         # Grammar, Deny modes — those are per-request runtime, not\n\
-         # per-model defaults).\n\n";
+         {provenance}\
+         #\n\
+         # See drama_llama::sidecar module docs for the precedence\n\
+         # ladder and what's intentionally excluded (Json, Grammar,\n\
+         # Deny modes — those are per-request runtime, not per-model\n\
+         # defaults).\n\n"
+    );
     std::fs::write(path, format!("{header}{body}")).map_err(|source| {
         SidecarError::Io {
             path: path.to_path_buf(),
             source,
         }
     })
+}
+
+/// The sampling config to seed a fresh sidecar with for `model`:
+/// its own [`recommended_sampling`](crate::backend::Model::recommended_sampling)
+/// compiled into a mode chain, or [`SamplerConfig::default()`] when
+/// the model recommends nothing.
+///
+/// Returns the config plus whether it came from metadata (for
+/// [`write_sample_options`]'s header).
+///
+/// Only `modes` is model-derived. `repetition` and friends stay at
+/// the crate default: upstream's `penalty_repeat` / `penalty_last_n`
+/// are scalars, while [`RepetitionOptions`](crate::RepetitionOptions)
+/// is n-gram-based with
+/// windowed decay, and there is no honest mapping between them.
+#[cfg(feature = "toml")]
+pub fn seed_config_for<M: crate::backend::Model>(
+    model: &M,
+) -> (SamplerConfig, bool) {
+    let params = model.recommended_sampling();
+    if params.is_empty() {
+        return (SamplerConfig::default(), false);
+    }
+    let modes: Vec<crate::SamplingMode> = params.into();
+    // `is_empty` was false, so the chain is non-empty by construction.
+    debug_assert!(!modes.is_empty());
+    (
+        SamplerConfig {
+            modes,
+            ..SamplerConfig::default()
+        },
+        true,
+    )
 }
 
 /// Read a dialect sidecar from `path` if it exists and parse it as
@@ -291,11 +344,52 @@ mod tests {
         assert!(loaded.is_none(), "no file should be Ok(None)");
 
         // Write default, then load — should round-trip equal.
-        write_default_sample_options(&path).unwrap();
+        write_sample_options(&path, &SamplerConfig::default(), false).unwrap();
         let loaded = load_sample_options(&path).unwrap().expect("file written");
         assert_eq!(loaded, SamplerConfig::default());
 
         // Cleanup.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A metadata-seeded chain survives the TOML round-trip intact —
+    /// the whole point of seeding is that the numbers reach the file
+    /// the user edits. Uses the exact triple Qwen3.6 advertises.
+    #[test]
+    fn metadata_seeded_roundtrip() {
+        let dir = tempfile_dir();
+        let path = dir.join("sampling.toml");
+
+        let params = crate::SamplingParams {
+            temp: Some(1.0),
+            top_p: crate::Probability::from_f(0.95).ok(),
+            top_k: std::num::NonZeroUsize::new(20),
+            min_p: None,
+            mirostat: None,
+        };
+        let seeded = SamplerConfig {
+            modes: params.into(),
+            ..SamplerConfig::default()
+        };
+        assert_ne!(
+            seeded,
+            SamplerConfig::default(),
+            "test is vacuous if the seed matches the crate default"
+        );
+
+        write_sample_options(&path, &seeded, true).unwrap();
+        let loaded = load_sample_options(&path).unwrap().expect("file written");
+        assert_eq!(loaded, seeded);
+
+        // The provenance header is the only way a user can tell a
+        // model's recommendation from the crate default on disk.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("general.sampling.*"),
+            "seeded sidecar must say where its numbers came from"
+        );
+
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }

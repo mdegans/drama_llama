@@ -1564,15 +1564,28 @@ fn apply_sidecar<B: Backend>(
         match crate::sidecar::load_sample_options(sidecar_path) {
             Ok(Some(opts)) => session.with_sample_options(opts),
             Ok(None) => {
-                if let Err(e) =
-                    crate::sidecar::write_default_sample_options(sidecar_path)
-                {
+                // No sidecar yet: seed one from what the model itself
+                // recommends (`general.sampling.*`), falling back to
+                // the crate default for models that advertise
+                // nothing. Seeding rather than applying invisibly
+                // keeps the sidecar the single authority — the user
+                // can see and edit what the model asked for.
+                let (seed, from_metadata) =
+                    crate::sidecar::seed_config_for(&session.engine.model);
+                if let Err(e) = crate::sidecar::write_sample_options(
+                    sidecar_path,
+                    &seed,
+                    from_metadata,
+                ) {
                     eprintln!(
                         "drama_llama: could not write default sampling \
                          sidecar at {sidecar_path:?}: {e}"
                     );
                 }
-                session
+                // Apply the seed regardless of whether the write
+                // landed — a read-only model dir should still get the
+                // model's recommended sampling for this session.
+                session.with_sample_options(seed)
             }
             Err(e) => {
                 eprintln!(
