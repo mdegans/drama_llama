@@ -17,7 +17,10 @@
 //! thought-prefix behavior rather than a vanity demo.
 #![cfg(feature = "json-schema")]
 
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{
+    num::{NonZeroU128, NonZeroU32},
+    path::PathBuf,
+};
 
 use drama_llama::{Block, Content, Prompt, RenderOptions, Role, Session};
 
@@ -97,6 +100,20 @@ fn whodunit_verdict() {
     let mut session = Session::from_path_with_n_ctx(model_path(), 8192)
         .expect("session load")
         .quiet()
+        // Seeded deliberately. The assertions below are about the
+        // *shape* of the structured output — thought block present,
+        // `$ref` array populated, typed round-trip — but they are
+        // read off stochastic generation, so unseeded they measure
+        // the model's mood as much as the code. Seeding makes a
+        // failure mean "the structured-output path changed", which is
+        // the only thing this test can honestly report on.
+        //
+        // A seed is safe here in a way it would not be in the cache
+        // suites: those rely on unseeded runs to exercise the
+        // sampler-state resume path (a forced seed forks every call
+        // and discards the KV-paired snapshot), whereas this is a
+        // single completion with no reuse.
+        .with_seed(NonZeroU128::new(42))
         .with_render_opts(
             RenderOptions::default().with_extra("enable_thinking", true),
         );
