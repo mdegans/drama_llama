@@ -13,6 +13,8 @@ use drama_llama::{
 };
 use serde_json::json;
 
+mod common;
+
 fn model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
 }
@@ -413,10 +415,15 @@ fn complete_text_round_trips_through_parse_and_render() {
 
     let prompt =
         strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
+    // Random seed by default so this keeps fuzzing emission shapes (it
+    // found #53 that way), but resolved-and-printed via `test_seed()`
+    // so a failure is replayable: `DRAMA_LLAMA_TEST_SEED=<n> cargo test
+    // --test session complete_text_round_trips -- --ignored`.
     let mut session =
         drama_llama::LlamaCppSession::from_path_sync(model_path())
             .expect("session load")
-            .quiet();
+            .quiet()
+            .with_seed(Some(common::test_seed()));
     println!("=== dialect ===\n{:#?}\n===", session.dialect());
 
     // Mirror the session's own render defaults (`from_engine`):
