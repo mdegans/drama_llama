@@ -405,9 +405,26 @@ Deferred to issues: [#52](https://github.com/mdegans/drama_llama/issues/52)
 (KV-dirty reconciliation), [#54](https://github.com/mdegans/drama_llama/issues/54)
 (lifetime coupling — 7b and the `LlamaCppDecoder::new` twin),
 [#55](https://github.com/mdegans/drama_llama/issues/55) (split-codepoint
-loss; wants doing with the streaming work),
-[#56](https://github.com/mdegans/drama_llama/issues/56) (log reentrancy,
-`Batch` OOM, `add_tokens` position).
+loss; wants doing with the streaming work).
+
+**Follow-up pass (2026-07-20, later session) — [#56](https://github.com/mdegans/drama_llama/issues/56)
+CLOSED:** all three leftovers fixed. Log reentrancy: `LogFn` is now an
+`Arc`; `trampoline` clones it out and drops the guard before the call,
+so a sink that logs or touches `set/clear_log_callback` no longer
+deadlocks (regression test: a sink that clears itself mid-callback).
+`Batch::new` rejects OOM (null `token`/`embd`/`pos`/`n_seq_id`/`logits`
+when `capacity > 0`; `capacity == 0` exempt — `malloc(0)` may return
+NULL legitimately; a failed `seq_id` alloc crashes inside
+`llama_batch_init` at the terminator write and never reaches Rust).
+`Batch::add_tokens` deleted (dead, `pub`, wrote every token at one
+position). Same session closed [#57](https://github.com/mdegans/drama_llama/issues/57)
+(replayable test seeds: `tests/common/mod.rs::test_seed()`, env-seeded +
+printed, wired into the round-trip fuzzer — the seed *replayed* #53's
+failure deterministically, which is the proof it works).
+
+Still open: #52 (design — decode hook + `Session` reconciliation), #54
+(lifetime coupling; wants a design call — lifetime param vs `Arc` vs
+explicit `Drop`), #55 (streaming session).
 
 ### Methodology note — do not repeat this mistake
 
