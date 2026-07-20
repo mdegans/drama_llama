@@ -39,9 +39,19 @@ model support planned (but "you never know").
       dump_template, inspect_prompt (`just example NAME` runs each with
       the right features + target dir). `whodunit` ran green — but took
       ~15 min, see the perf note below.
+- [ ] **Media regression pass** (added post-#31, which landed
+      2026-07-11 — after this checklist was first written). The
+      `#[ignore]`'d media e2e sweep with `--features mtmd` against
+      both validation targets: Qwen 3.6 (M-RoPE) and Gemma 4
+      (non-causal). This local pass is the ONLY gate on the sentinel
+      split, segment tokenize, `EmbdBatch` planes, and the media-aware
+      KV walk — this repo has no CI at all (#51), so nothing catches a
+      media regression except running it.
 - [ ] Pre-publish hygiene: README, version metadata, `cargo package`
       file list, doc build zero-warnings, and date the CHANGELOG's
-      `## [0.8.0] — Unreleased`.
+      `## [0.8.0] — Unreleased`. `cargo package` now needs a check
+      with `mtmd` on too — the feature pulls extra llama.cpp source
+      dirs into the sys crate's `include`.
 - [ ] Then: `cargo publish` on Mike's go, tag.
 
 ## Known-and-accepted going into publish
