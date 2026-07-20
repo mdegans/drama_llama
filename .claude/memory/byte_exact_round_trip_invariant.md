@@ -80,15 +80,27 @@ defense-in-depth on both.
      none.
 
   So byte-exact round-trip for the residual (Auto + unclosed-think) case
-  is NOT grammar-achievable. Two options remain, and this is a **decision
-  for Mike, not yet made**: (a) a `Block::Thought` "was-unclosed" bit —
-  needs a schema change in the local `misanthropic` crate
-  (`prompt/message.rs:1017-1037`) and the renderer honoring it; agent
-  flags it invasive and arguably off-distribution (re-ingesting an
-  unclosed `<think>` isn't a template-expected shape); or (b) accept the
-  cache-safe one-turn repair there (contradicts the hard-invariant, but is
-  what the codebase already does — see the `emit.rs:130-139` comment). The
-  parser fix (77a4da0) still stands as correct defense-in-depth.
+  is NOT grammar-achievable. **DECISION (Mike, 2026-07-20): accept the
+  cache-safe one-turn repair for the residual** — it's rare (unclosed
+  ≈ ran-out-the-clock; a trained Qwen closes `</think>` before acting),
+  it's what the codebase already does (`emit.rs:130-139` comment), and
+  the two end-of-prompt breakpoints keep a miss to one message. The
+  parser fix (77a4da0) stands as correct defense-in-depth.
+
+  The fuller "mark a thought open so the renderer omits `</think>`" idea
+  was NOT dropped — it graduated into its own deliberate feature,
+  [#59](https://github.com/mdegans/drama_llama/issues/59) (open /
+  continuable / prefillable thoughts). Key points settled in discussion:
+  the flag lives in the **existing unused `signature` field** (no
+  `misanthropic` schema change — a body sentinel was rejected as `[Invalid
+  UTF-8]`-class content pollution, #55); the overload is safe (we never
+  hand-craft thoughts *to* Anthropic, and Anthropic thoughts arrive
+  closed); and the **load-bearing invariant is trailing-only** — an open
+  `<think>` is legal only on the very last block of the prompt, never
+  mid-history. It generalizes today's empty-`thought_pre_opened` path and
+  serves three needs (round-trip fidelity, continue a truncated thought,
+  prefill/bootstrap CoT). Needs a design session; NOT a prerequisite for
+  #53 (which rides the repair above).
 
 - **#58: multi-call round-trip (distinct, also owed).** The round-trip
   *fuzzer* (`tests/session.rs::complete_text_round_trips_through_parse_and_render`)
@@ -115,10 +127,12 @@ The grammar-fix step is deleted — it doesn't exist as a sound change
    break `strip_prefix` independent of call count. Verify in
    `chat_template.rs` (`append_message`, generation_prompt handling).
    Also the renderer call-join / arg-canonicalization angle.
-2. **Decision (Mike):** for the residual Auto+unclosed-think case —
-   `misanthropic` "was-unclosed" bit vs accept cache-safe repair. Only
-   then does flipping `complete_text_round_trips_through_parse_and_render`
-   to a hard assertion make sense; today its failures are #58, not #53.
+2. **Residual Auto+unclosed-think: DECIDED — cache-safe repair** (above).
+   The fuller open-thought mechanism is [#59](https://github.com/mdegans/drama_llama/issues/59)
+   (signature-field flag; trailing-only invariant; design session). Only
+   after #58 is fixed does flipping
+   `complete_text_round_trips_through_parse_and_render` to a hard
+   assertion make sense; today its failures are #58, not #53.
 
 The round-trip byte-stability is *the* prefix-cache invariant (see
 [[plan_tool_dialects]]). But the enforcement layer is NOT always the
