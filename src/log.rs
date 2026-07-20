@@ -9,12 +9,22 @@
 //! another thread either runs the old closure to completion or finds an
 //! empty slot and is dropped.
 //!
+//! The closure is held behind an [`Arc`], and `trampoline` clones that
+//! `Arc` out of the slot and *releases the lock before calling it*. This
+//! makes the callback re-entrant-safe: a sink that itself triggers a
+//! llama.cpp/ggml log line, or that calls [`set_log_callback`] /
+//! [`clear_log_callback`], no longer deadlocks on the non-reentrant
+//! `Mutex`. (A sink that logs unconditionally will recurse — that is the
+//! caller's bug, but a visible stack overflow beats a silent hang.) The
+//! cloned `Arc` keeps the closure alive for the whole call even if
+//! another thread swaps or clears the slot meanwhile.
+//!
 //! Prefer [`set_log_callback`] (closures). [`set_log_callback_raw`] is
 //! available for callers that already hold a `ggml_log_callback` function
 //! pointer.
 
 use std::ffi::{c_void, CStr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use llama_cpp_sys_3::{
     ggml_log_callback, ggml_log_level, ggml_log_level_GGML_LOG_LEVEL_CONT,
@@ -56,7 +66,7 @@ impl From<ggml_log_level> for LogLevel {
     }
 }
 
-type LogFn = Box<dyn Fn(LogLevel, &str) + Send + Sync + 'static>;
+type LogFn = Arc<dyn Fn(LogLevel, &str) + Send + Sync + 'static>;
 
 /// Global closure slot. Replaced by [`set_log_callback`]; cleared by
 /// [`clear_log_callback`]. Read by [`trampoline`] on every log line
@@ -82,22 +92,31 @@ unsafe extern "C" fn trampoline(
         Err(_) => return,
     };
     let lvl = LogLevel::from(level);
-    if let Ok(guard) = GLOBAL_LOG_CALLBACK.lock() {
-        if let Some(cb) = guard.as_ref() {
-            // The closure is consumer-supplied and runs on whatever
-            // thread llama.cpp/ggml logs from. Unwinding out of an
-            // `extern "C"` fn hits Rust's abort-on-unwind shim, so a
-            // stray `.unwrap()` in someone's log sink would take the
-            // process down with no diagnostic beyond the panic
-            // message. Swallow it: a dropped log line is a better
-            // failure mode than a dead process, and losing logging is
-            // exactly the situation where you can least afford to
-            // lose the process.
-            let _ =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    cb(lvl, s)
-                }));
-        }
+
+    // Clone the `Arc` out and drop the guard *before* calling the
+    // closure. Holding the lock across the call would deadlock a
+    // consumer whose sink logs (re-entering here) or calls
+    // set/clear_log_callback (both take this same non-reentrant lock).
+    // The cloned `Arc` keeps the closure alive across the call even if
+    // another thread swaps or clears the slot in the meantime.
+    let cb = {
+        let guard = GLOBAL_LOG_CALLBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(Arc::clone)
+    };
+    if let Some(cb) = cb {
+        // The closure is consumer-supplied and runs on whatever thread
+        // llama.cpp/ggml logs from. Unwinding out of an `extern "C"` fn
+        // hits Rust's abort-on-unwind shim, so a stray `.unwrap()` in
+        // someone's log sink would take the process down with no
+        // diagnostic beyond the panic message. Swallow it: a dropped
+        // log line is a better failure mode than a dead process, and
+        // losing logging is exactly the situation where you can least
+        // afford to lose the process.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cb(lvl, s)
+        }));
     }
 }
 
@@ -110,8 +129,10 @@ where
     F: Fn(LogLevel, &str) + Send + Sync + 'static,
 {
     {
-        let mut guard = GLOBAL_LOG_CALLBACK.lock().unwrap();
-        *guard = Some(Box::new(f));
+        let mut guard = GLOBAL_LOG_CALLBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Arc::new(f));
     }
     // SAFETY: `trampoline` reads from the `'static`
     // `GLOBAL_LOG_CALLBACK` slot only — it never touches `user_data`,
@@ -133,7 +154,9 @@ pub fn clear_log_callback() {
         llama_log_set(None, std::ptr::null_mut());
         ggml_log_set(None, std::ptr::null_mut());
     }
-    let mut guard = GLOBAL_LOG_CALLBACK.lock().unwrap();
+    let mut guard = GLOBAL_LOG_CALLBACK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
 
@@ -178,7 +201,9 @@ pub unsafe fn set_log_callback_raw(
     // sink. Drop happens after the swap, so a racing log line either
     // ran the old trampoline (and found Some(cb)) or hits the new
     // `callback` directly.
-    let mut guard = GLOBAL_LOG_CALLBACK.lock().unwrap();
+    let mut guard = GLOBAL_LOG_CALLBACK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
 
@@ -226,6 +251,47 @@ mod tests {
         clear_log_callback();
         // Round-trip again to confirm the slot is reusable.
         set_log_callback(|_, _| {});
+        clear_log_callback();
+    }
+
+    /// Regression for the reentrancy deadlock (issue #56): a sink that
+    /// calls back into the log machinery — here `clear_log_callback`,
+    /// which takes the same `Mutex` the trampoline used to hold across
+    /// the call — must not deadlock. Before the `Arc`-clone-then-unlock
+    /// fix this hung; now it completes and the test returns.
+    #[test]
+    fn sink_may_touch_the_lock_without_deadlock() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        {
+            let r = ran.clone();
+            set_log_callback(move |_, _| {
+                r.fetch_add(1, Ordering::SeqCst);
+                // Re-enter the lock from inside the callback. The
+                // trampoline must already have released it.
+                clear_log_callback();
+            });
+        }
+        let msg = std::ffi::CString::new("reentrant").unwrap();
+        unsafe {
+            trampoline(
+                ggml_log_level_GGML_LOG_LEVEL_INFO,
+                msg.as_ptr(),
+                std::ptr::null_mut(),
+            );
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        // The callback cleared itself; a second dispatch is a no-op.
+        unsafe {
+            trampoline(
+                ggml_log_level_GGML_LOG_LEVEL_INFO,
+                msg.as_ptr(),
+                std::ptr::null_mut(),
+            );
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
         clear_log_callback();
     }
 }

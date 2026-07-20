@@ -59,6 +59,35 @@ impl Batch {
         // sanity
         debug_assert!(batch.n_tokens == 0);
 
+        // `llama_batch_init` (llama-batch.cpp:877) null-checks none of
+        // its `malloc`s and returns a struct with null members on OOM.
+        // For a non-empty batch every later accessor would then build a
+        // slice over NULL, so reject it here. Only the buffers whose
+        // failure is *observable from Rust* are checked: a failed
+        // `seq_id` allocation crashes inside `llama_batch_init` itself
+        // (it writes the `seq_id[capacity] = nullptr` terminator before
+        // returning), so it can never reach us as a null. `capacity ==
+        // 0` is exempt — those are `malloc(0)`, which the C standard
+        // permits to return NULL for a legitimately-empty batch.
+        if capacity > 0 {
+            let primary_null = if embd_len == 0 {
+                batch.token.is_null()
+            } else {
+                batch.embd.is_null()
+            };
+            if primary_null
+                || batch.pos.is_null()
+                || batch.n_seq_id.is_null()
+                || batch.logits.is_null()
+            {
+                // Free whatever did allocate. `llama_batch_free`
+                // tolerates the nulls and walks `seq_id` to the
+                // terminator that was written above.
+                unsafe { llama_batch_free(batch) };
+                return None;
+            }
+        }
+
         Some(Self {
             batch,
             capacity,
@@ -318,24 +347,6 @@ impl Batch {
         // not it is ever read.
         unsafe {
             self.batch.logits.add(i).write(logits as i8);
-        }
-
-        Ok(())
-    }
-
-    /// Add tokens to the batch.
-    pub fn add_tokens<I>(
-        &mut self,
-        tokens: I,
-        pos: usize,
-        seq_ids: Option<&[llama_seq_id]>,
-        logits: bool,
-    ) -> Result<(), AddError>
-    where
-        I: IntoIterator<Item = llama_token>,
-    {
-        for token in tokens {
-            self.add_token(token, pos, seq_ids, logits)?;
         }
 
         Ok(())
