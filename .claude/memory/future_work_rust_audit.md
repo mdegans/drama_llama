@@ -20,11 +20,14 @@ resolved and were removed rather than left as ghosts:
 
 ## What actually remains
 
-**drama_llama's llama.cpp FFI has been audited before** — Mike,
-2026-07-20 — but the pass was never written down, so no artifact
-survives to check against or to diff a new pass on. moeflux's
-equivalent *was* recorded (`riir_unsafe_audit.md`, 2026-04-28, scoped
-to `crates/moeflux/src/riir/`) and is the format to copy.
+**drama_llama's llama.cpp FFI has been scanned before** — Mike,
+2026-07-20 — most likely in a cloud Claude Code session, and his read
+is that it **found nothing, which is why nothing was recorded**. Treat
+that as a probable-clean prior rather than lost findings, but not as
+coverage: there is no artifact to check against or diff a new pass on,
+and the scan's scope is unknown. moeflux's equivalent *was* recorded
+(`riir_unsafe_audit.md`, 2026-04-28, scoped to
+`crates/moeflux/src/riir/`) and is the format to copy.
 
 A redo is warranted on both counts: there is nothing on paper, and the
 surface has moved materially since. `src/llama_cpp/mtmd.rs` did not
