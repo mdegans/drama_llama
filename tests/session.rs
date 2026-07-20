@@ -499,6 +499,87 @@ fn complete_text_round_trips_through_parse_and_render() {
     );
 }
 
+/// #58 acceptance: a **well-formed multi-tool-call** turn round-trips
+/// byte-exact — `render(parse(raw)).starts_with(raw)` — the prefix-cache
+/// invariant. Uses **greedy** sampling so emission is deterministic and
+/// well-formed: the invariant covers grammar-forced shapes, and greedy
+/// takes the distribution's mode, sidestepping the sampler-induced
+/// grammar-legal garbage that is a separate concern (#61). Regression
+/// guard for the inter-call separator (`call_separator`): before the fix
+/// the model emitted `</tool_call><tool_call>` while the template
+/// re-rendered `</tool_call>\n<tool_call>`, so every N>=2-call turn
+/// failed the byte-prefix check.
+#[test]
+#[ignore = "requires model"]
+fn multi_call_round_trips_under_greedy() {
+    use drama_llama::{AssistantMessage, SamplerConfig};
+
+    let prompt =
+        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet()
+            .with_sample_options(SamplerConfig::greedy());
+
+    // The fix in one line: the analyzer must have captured the
+    // template's inter-call separator.
+    println!("call_separator = {:?}", session.dialect().call_separator);
+
+    let render_opts = RenderOptions::default()
+        .with_generation_prompt(true)
+        .with_extra("preserve_thinking", true);
+    let rendered_original = session
+        .template()
+        .render_with(&prompt, &render_opts)
+        .expect("render original");
+    let reasoning_open = session.dialect().reasoning.start.trim().to_owned();
+    let pre_opened = !reasoning_open.is_empty()
+        && rendered_original
+            .trim_end()
+            .ends_with(reasoning_open.as_str());
+
+    let raw = session.complete_text(&prompt).expect("complete_text");
+    println!("=== raw ===\n{raw}\n===");
+    assert!(
+        raw.matches("<tool_call>").count() >= 2,
+        "expected a multi-call turn to exercise the separator; got {raw:?}"
+    );
+
+    let blocks = parse_with_dialect(&session, &prompt, &raw, pre_opened);
+    let n_calls = blocks
+        .iter()
+        .filter(|b| matches!(b, Block::ToolUse { .. }))
+        .count();
+    assert!(
+        n_calls >= 2,
+        "parser must surface the >=2 calls; got {blocks:?}"
+    );
+    let assistant: AssistantMessage = blocks.into_iter().collect();
+
+    let mut follow_up = prompt.clone();
+    follow_up.messages.push(assistant.into());
+    follow_up.tool_choice = None;
+    let rendered_follow_up = session
+        .template()
+        .render_with(
+            &follow_up,
+            &RenderOptions::default()
+                .with_generation_prompt(false)
+                .with_extra("preserve_thinking", true),
+        )
+        .expect("render follow_up");
+
+    let suffix = rendered_follow_up
+        .strip_prefix(&rendered_original)
+        .expect("follow-up must extend the original prefix");
+    assert!(
+        suffix.starts_with(&raw),
+        "emission is not a byte prefix of the canonical re-render.\n\
+         --- emission ---\n{raw}\n--- re-rendered suffix ---\n{suffix}"
+    );
+}
+
 /// #30 Phase E: under `Auto` (unforced) tool choice the model calls
 /// the tool in its **native** dialect — no system-prompt retcon, no
 /// forced-JSON off-distribution emission — via the lazy

@@ -993,6 +993,13 @@ fn check_per_call_markers(probe: &Probe, syntax: &mut CallSyntax) {
     if !syntax.section_start.is_empty()
         && second.starts_with(syntax.section_start.trim_end())
     {
+        // The whitespace between call 1's end marker and call 2's
+        // start marker is the template's inter-call separator (the
+        // `loop.first`-gated `"\n"`). It was being discarded by
+        // `trim_start`; capture it so the grammar and re-render weave
+        // it back in and an N-call turn round-trips byte-exact (#58).
+        let sep_len = filtered.right.len() - second.len();
+        syntax.call_separator = filtered.right[..sep_len].to_string();
         syntax.per_call_start = std::mem::take(&mut syntax.section_start);
         syntax.per_call_end = std::mem::take(&mut syntax.section_end);
     }
@@ -1015,11 +1022,20 @@ fn analyze_json_native_parallel_calls(probe: &Probe, syntax: &mut CallSyntax) {
     }) else {
         return;
     };
-    if !syntax.section_start.is_empty()
-        && cmp.diff.right.contains(syntax.section_start.trim())
-    {
-        syntax.per_call_start = std::mem::take(&mut syntax.section_start);
-        syntax.per_call_end = std::mem::take(&mut syntax.section_end);
+    if !syntax.section_start.is_empty() {
+        let marker = syntax.section_start.trim();
+        if let Some(pos) = cmp.diff.right.find(marker) {
+            // Bytes before the second call's start marker are the
+            // inter-call separator, when they're pure whitespace
+            // (#58); anything else means the diff isn't a clean call
+            // boundary, so leave the separator empty.
+            let lead = &cmp.diff.right[..pos];
+            if !lead.is_empty() && lead.chars().all(char::is_whitespace) {
+                syntax.call_separator = lead.to_string();
+            }
+            syntax.per_call_start = std::mem::take(&mut syntax.section_start);
+            syntax.per_call_end = std::mem::take(&mut syntax.section_end);
+        }
     }
 }
 

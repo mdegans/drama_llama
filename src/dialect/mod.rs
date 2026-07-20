@@ -314,6 +314,23 @@ pub struct CallSyntax {
     pub per_call_start: String,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "is_default"))]
     pub per_call_end: String,
+    /// Bytes the template inserts *between* consecutive calls (after a
+    /// call's [`per_call_end`], before the next's [`per_call_start`]) —
+    /// the `loop.first`-gated separator in parallel-call templates
+    /// (Qwen3-Coder emits `"\n"`, so `</tool_call>\n<tool_call>`).
+    /// Empty when calls concatenate directly. Load-bearing for
+    /// round-trip byte-stability: the grammar forces it and
+    /// [`render_reference`] re-renders it, so an N-call turn parses →
+    /// renders back to the same bytes. Never wraps the first or last
+    /// call — that framing is [`section_start`]/[`section_end`].
+    ///
+    /// [`per_call_end`]: Self::per_call_end
+    /// [`per_call_start`]: Self::per_call_start
+    /// [`section_start`]: Self::section_start
+    /// [`section_end`]: Self::section_end
+    /// [`render_reference`]: crate::dialect::emit::render_reference
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "is_default"))]
+    pub call_separator: String,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "is_default"))]
     pub function: FunctionSyntax,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "is_default"))]

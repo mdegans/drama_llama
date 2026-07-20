@@ -34,6 +34,11 @@ fn qwen3_coder_xml() {
     assert_eq!(s.arguments.name_suffix, ">\n", "{s:#?}");
     assert_eq!(s.arguments.value_suffix, "\n</parameter>\n", "{s:#?}");
     assert_eq!(s.trigger(), "<tool_call>\n", "{s:#?}");
+    // #58: the `loop.first`-gated newline the template weaves between
+    // consecutive calls. Without it a multi-call turn re-renders as
+    // `</tool_call>\n<tool_call>` but the grammar forces
+    // `</tool_call><tool_call>`, breaking round-trip byte-stability.
+    assert_eq!(s.call_separator, "\n", "{s:#?}");
 }
 
 /// The template we actually serve: Qwen3.6 (Unsloth GGUF dump).
@@ -50,6 +55,7 @@ fn qwen36_gguf_xml() {
     assert_eq!(s.arguments.name_prefix, "<parameter=", "{s:#?}");
     assert_eq!(s.arguments.name_suffix, ">\n", "{s:#?}");
     assert_eq!(s.arguments.value_suffix, "\n</parameter>\n", "{s:#?}");
+    assert_eq!(s.call_separator, "\n", "{s:#?}"); // #58, see above
 }
 
 /// Qwen3 chat (0.6B template): Hermes-style JSON inside <tool_call>

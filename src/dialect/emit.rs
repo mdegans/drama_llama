@@ -182,7 +182,20 @@ pub fn grammar_source(
     };
     let sec_open = escape_for_gbnf_string(&syntax.section_start);
     let sec_close = escape_for_gbnf_string(&syntax.section_end);
-    let call_seq = if opts.parallel { "call+" } else { "call" };
+    // Parallel calls are joined by the template's inter-call separator
+    // (Qwen3-Coder's `"\n"`), not concatenated — so the grammar forces
+    // `call ( SEP call )*` and re-render byte-matches. Empty separator
+    // collapses to `call+`.
+    let sep = escape_for_gbnf_string(&syntax.call_separator);
+    let call_seq = if opts.parallel {
+        if sep.is_empty() {
+            "call+".to_string()
+        } else {
+            format!(r#"call ( "{sep}" call )*"#)
+        }
+    } else {
+        "call".to_string()
+    };
     match (
         syntax.section_start.is_empty(),
         syntax.section_end.is_empty(),
@@ -695,6 +708,13 @@ pub fn render_reference(
     out.push_str(&syntax.section_start);
     for (call_idx, (name, input)) in calls.iter().enumerate() {
         validate_representable(syntax, name, input)?;
+        // Inter-call separator the template weaves between adjacent
+        // calls (empty for Harmony, whose own call framing is handled
+        // in its match arm below). Mirrors the grammar's
+        // `call ( SEP call )*` so an N-call turn round-trips.
+        if call_idx > 0 {
+            out.push_str(&syntax.call_separator);
+        }
         out.push_str(&syntax.per_call_start);
         match syntax.family {
             Family::Harmony => {
