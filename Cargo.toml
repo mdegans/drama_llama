@@ -275,6 +275,15 @@ name = "grammar_fuzz"
 required-features = ["cli"]
 doc-scrape-examples = true
 
+# The worked example for the raw prediction API: `Engine` +
+# `CandidatePredictor` / `PiecePredictor`, no `Session`. Everything else
+# in here drives the crate through `Session`/`Transport`, so this is the
+# only place a reader sees the iterator layer those are built on.
+[[example]]
+name = "whoami"
+required-features = ["cli"]
+doc-scrape-examples = true
+
 [[example]]
 name = "chat"
 required-features = ["tokio", "repl"]
