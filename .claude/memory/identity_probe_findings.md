@@ -57,6 +57,45 @@ Nothing was overwritten; in English there was nothing in the slot, and a
 question that forces a bare name lets the pretraining prior fill it.
 Other languages evidently did get name-bearing tuning data.
 
+### …but it is frame-dependent, and the first claim overstated it
+
+Follow-up with `--prefix` ending the prompt *on* the name slot (raw
+framing, same model, same question):
+
+| frame | winner | Gemma | GPT | Claude | Σ |
+|---|---|---|---|---|---|
+| bare answer position | **GPT 61.57** | ~4 | 61.57 | 4.27 | 0.878 |
+| `You are speaking to ___` | **GPT 46.44** | 23.77 | 46.44 | 2.95 | 0.226 |
+| `My name is ___` | **Gemma 52.51** | 52.51 | 6.21 | 9.18 | 0.389 |
+
+The correct answer **is** in there: in a first-person self-description
+frame Gemma identifies correctly and GPT collapses to 6.2%. GPT only
+wins when the model must emit a **bare name token** — which is exactly
+what "just the name, please" demands.
+
+So the accurate claim is *not* "Gemma thinks it is GPT in English". It is
+**Gemma's English name knowledge exists but is weak enough to lose to the
+pretraining prior in the most natural phrasing.** The original result is
+real behaviour — unconstrained greedy decoding genuinely emits `GPT-4o`
+— but it is one point on a frame-sensitive surface, not a stable belief.
+Third time this session the frame did more work than the content.
+
+### Fictional AI names are unreachable
+
+Testing Mike's hypothesis that "GPT" might be the generic name for a
+fictional/narrative AI: no. Against a candidate set mixing commercial
+models, voice assistants and fictional AIs, the fictional names never
+place — HAL rank 284–3242, JARVIS 4258, Skynet ~30 000, GLaDOS at
+7e-11. The model's generic-AI prior is drawn entirely from **real
+commercial assistants**. Even the (noise-level) story frame led with
+Gemma/Cortana/Alexa, not HAL.
+
+Method note: the first attempt at this hoped greedy decoding would reach
+a name inside the seek window. In a narrative frame it never did
+(Σ=6e-9), so nothing was measurable. Ending the prompt *on* the slot with
+`--prefix` is the fix; a story frame still returns noise (Σ=3.6e-3), so
+the fiction question is answered only for the frames that measure.
+
 That also answers "how did Google miss this" better than a
 deployment-config guess: **the model almost never volunteers a name.**
 Ordinary use gets the correct, unremarkable deflection. You only surface
