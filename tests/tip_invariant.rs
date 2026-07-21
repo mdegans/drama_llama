@@ -75,7 +75,7 @@ fn terminal_token_does_not_advance_matchers() {
          grammar, and validity accessors must see that"
     );
     assert!(
-        !predictor.eager_constraint_incomplete(),
+        !predictor.constraint_incomplete_at_end(),
         "a terminal token that completes the grammar must not register \
          as an incomplete-constraint violation"
     );

@@ -153,30 +153,50 @@ impl SamplerState {
             .is_some_and(|d| d.active && d.matcher.is_complete())
     }
 
-    /// True iff the config carried *eager* constraints (active from
-    /// token 0 — not the deferred grammar, which may legitimately
-    /// never trigger) and none of them reached accept. The Session's
-    /// incomplete-at-end violation check.
-    pub fn eager_constraint_incomplete(&self) -> bool {
-        let mut any = false;
+    /// True iff generation ended while a byte-constraint was still
+    /// mid-structure — the Session's incomplete-at-end violation
+    /// check. Two shapes count:
+    ///
+    /// * an **eager** constraint (active from token 0) where none of
+    ///   the matchers reached accept;
+    /// * a **deferred** grammar that *activated* — its trigger fired —
+    ///   and is incomplete. A deferred grammar that never triggered is
+    ///   NOT a violation: never calling a tool is legal on the Auto
+    ///   path. This clause is the inverse of the deferred arm in
+    ///   [`Self::grammar_complete`], and its absence was issue #38's
+    ///   defect 1 — a truncated Auto call parsed as (and seated as)
+    ///   plain text, poisoning the transcript for the next ingest.
+    ///
+    /// A terminal token whose bytes *complete* the constraint is not
+    /// visible here: it never advances the matchers (tip invariant), so
+    /// the exemption lives one level up in
+    /// [`crate::TokenPredictor::constraint_incomplete_at_end`].
+    pub fn constraint_incomplete_at_end(&self) -> bool {
+        // Note the shape: `any_eager && !eager_complete`, not an early
+        // `return false` on the first completion. The deferred clause
+        // below has to stay reachable no matter what the eager
+        // matchers did.
+        let mut any_eager = false;
+        let mut eager_complete = false;
         for m in &self.matchers {
             match m {
                 MatcherState::Grammar { stack, .. } => {
-                    any = true;
-                    if stack.is_complete() {
-                        return false;
-                    }
+                    any_eager = true;
+                    eager_complete |= stack.is_complete();
                 }
                 MatcherState::Json(s) => {
-                    any = true;
-                    if s.is_complete() {
-                        return false;
-                    }
+                    any_eager = true;
+                    eager_complete |= s.is_complete();
                 }
                 MatcherState::Stateless => {}
             }
         }
-        any
+        let deferred_incomplete = self
+            .deferred
+            .as_ref()
+            .is_some_and(|d| d.active && !d.matcher.is_complete());
+
+        (any_eager && !eager_complete) || deferred_incomplete
     }
 
     /// `Some(true)` iff a deferred matcher exists and has not yet been

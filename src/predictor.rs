@@ -662,7 +662,7 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// dialect-exit-marker shape where the grammar's required exit
     /// bytes are also a vocab EOG (Gemma 4's `<|tool_response>`).
     /// Folded into [`Self::grammar_complete`] /
-    /// [`Self::eager_constraint_incomplete`]; the state itself stays
+    /// [`Self::constraint_incomplete_at_end`]; the state itself stays
     /// pure.
     terminal_completed: bool,
     /// Carries the incomplete tail of a codepoint split across
@@ -743,14 +743,19 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         self.state.grammar_complete() || self.terminal_completed
     }
 
-    /// True iff the config carried eager (active-from-token-0)
-    /// constraints and none reached accept — the incomplete-at-end
-    /// violation signal. Deferred grammars are exempt (never
-    /// triggering is legal). A terminal token whose bytes complete
-    /// the constraint counts as completion (see `terminal_completed`)
-    /// even though it never advances the state.
-    pub fn eager_constraint_incomplete(&self) -> bool {
-        self.state.eager_constraint_incomplete() && !self.terminal_completed
+    /// True iff generation ended mid-constraint — the incomplete-at-end
+    /// violation signal. Covers an eager constraint that never reached
+    /// accept **and** a deferred grammar that activated and is
+    /// incomplete (issue #38, defect 1). A deferred grammar that never
+    /// triggered is exempt: never calling a tool is legal.
+    ///
+    /// A terminal token whose bytes complete the constraint counts as
+    /// completion (see `terminal_completed`) even though it never
+    /// advances the state — that is what keeps the Gemma 4 shape, where
+    /// the required closing bytes *are* an EOG token, from reading as a
+    /// violation.
+    pub fn constraint_incomplete_at_end(&self) -> bool {
+        self.state.constraint_incomplete_at_end() && !self.terminal_completed
     }
 
     /// Close out the UTF-8 reassembler at stream end (issue #55).
@@ -1116,9 +1121,9 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
         self.inner.grammar_complete()
     }
 
-    /// See [`TokenPredictor::eager_constraint_incomplete`].
-    pub fn eager_constraint_incomplete(&self) -> bool {
-        self.inner.eager_constraint_incomplete()
+    /// See [`TokenPredictor::constraint_incomplete_at_end`].
+    pub fn constraint_incomplete_at_end(&self) -> bool {
+        self.inner.constraint_incomplete_at_end()
     }
 }
 

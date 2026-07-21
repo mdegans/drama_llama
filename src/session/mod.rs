@@ -4951,7 +4951,7 @@ impl<B: Backend> Session<B> {
         }
         // Capture the incomplete-at-end violation signal and the final
         // sampler state (tip promotion) before the predictor drops.
-        let eager_incomplete = predictor.eager_constraint_incomplete();
+        let constraint_incomplete = predictor.constraint_incomplete_at_end();
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
         drop(predictor);
         // Parse the whole generation through the dialect envelope
@@ -5112,7 +5112,7 @@ impl<B: Backend> Session<B> {
         );
         self.record_usage(usage.clone());
 
-        // A generation that ends while an *eager* constraint is still
+        // A generation that ends while a constraint is still
         // mid-structure is a violation even when a tool_use parsed —
         // exit-marker postmortem (plan Phase G): a sampler bug vetoed
         // Gemma's grammar-required turn exit and the model looped
@@ -5120,11 +5120,22 @@ impl<B: Backend> Session<B> {
         // looked fine, but the transcript was garbage and its
         // re-ingest oversized the next call's prefill. Silent
         // constraint-incomplete output must be impossible: surface it
-        // as the typed error instead. (Deferred/Auto grammars are
-        // exempt: never triggering is legal. Streaming stays
-        // permissive by documented contract.) `eager_incomplete` was
-        // captured from the predictor's SamplerState before drop.
-        if eager_incomplete
+        // as the typed error instead.
+        //
+        // This covers the *activated* deferred grammar too (#38 defect
+        // 1). A deferred grammar that never triggered stays exempt —
+        // never calling a tool is legal on the Auto path — but one
+        // whose trigger fired is a live constraint like any other, and
+        // leaving it unflagged is what let a truncated Auto call get
+        // seated as plain `Block::Text`, with its `<tool_call>` frame
+        // marker intact. The next ingest of that transcript trips
+        // `check_no_special_injection` and the caller's loop dies one
+        // turn after the actual failure, permanently.
+        //
+        // Streaming stays permissive by documented contract.
+        // `constraint_incomplete` was captured from the predictor's
+        // SamplerState before drop.
+        if constraint_incomplete
             || (forced_tool_call
                 && !blocks
                     .iter()

@@ -2694,6 +2694,91 @@ mod tests {
         assert!(resumed.deferred.is_none());
     }
 
+    /// #38 defect 1: an **activated** deferred grammar left
+    /// mid-structure at end of generation is a violation, exactly like
+    /// an incomplete eager one. One that never triggered is not —
+    /// declining to call a tool is legal on the Auto path.
+    ///
+    /// Before the fix this returned `false` for the mid-structure case,
+    /// so a truncated Auto call came back as `Ok` and its `<tool_call>`
+    /// frame marker was seated as plain `Block::Text` — poison for the
+    /// next ingest.
+    #[test]
+    fn constraint_incomplete_at_end_sees_activated_deferred() {
+        let deferred = crate::DeferredGrammar {
+            grammar: CompiledGrammar::parse(AB_GRAMMAR).unwrap(),
+            activate_after: vec![b"!".to_vec()],
+            feed_trigger: false,
+        };
+        let opts = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            deferred_grammar: Some(deferred.clone()),
+            repetition: None,
+            ..SamplerConfig::default()
+        };
+
+        // Configured but never triggered: the model just didn't call.
+        assert!(
+            !state_for(&opts).constraint_incomplete_at_end(),
+            "a deferred grammar that never triggered is not a violation",
+        );
+
+        // Activated and mid-structure (`root ::= \"ab\"` fed only
+        // \"a\") — the truncated-call shape.
+        let mut mid = state_for(&opts);
+        mid.activate_deferred(&deferred, b"a").unwrap();
+        assert!(
+            mid.constraint_incomplete_at_end(),
+            "an activated deferred grammar left mid-structure must flag",
+        );
+
+        // Activated and complete: a clean turn.
+        let mut done = state_for(&opts);
+        done.activate_deferred(&deferred, b"ab").unwrap();
+        assert!(
+            !done.constraint_incomplete_at_end(),
+            "a completed deferred grammar is not a violation",
+        );
+
+        // The activation flag survives a cache resume, so a turn that
+        // resumes onto a live matcher is judged the same way.
+        let resumed = SamplerState::resumed_from(&mid, &opts, &MockModel);
+        assert!(resumed.deferred.as_ref().unwrap().active);
+        assert!(
+            resumed.constraint_incomplete_at_end(),
+            "resumed activated matcher must be judged like a fresh one",
+        );
+    }
+
+    /// The eager half is unchanged by the deferred clause: an eager
+    /// grammar that never reached accept still flags, and a config with
+    /// no byte-constraint at all never does (plain prose generation
+    /// must not be reported as a violation).
+    #[test]
+    fn constraint_incomplete_at_end_eager_and_unconstrained() {
+        let eager = SamplerConfig {
+            modes: vec![SamplingMode::Grammar(
+                CompiledGrammar::parse(AB_GRAMMAR).unwrap(),
+            )],
+            repetition: None,
+            ..SamplerConfig::default()
+        };
+        assert!(
+            state_for(&eager).constraint_incomplete_at_end(),
+            "a fresh eager grammar has not reached accept",
+        );
+
+        let bare = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: None,
+            ..SamplerConfig::default()
+        };
+        assert!(
+            !state_for(&bare).constraint_incomplete_at_end(),
+            "no constraint, no violation",
+        );
+    }
+
     /// The headline invariant of the config/state split: serialize a
     /// mid-generation `SamplerState`, restore it, and both the restored
     /// and original states must produce the identical continuation and
