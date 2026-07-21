@@ -95,6 +95,29 @@ header; possible, not done.
    **rejected**: an unmatched `<think>` in a final user or tool message
    would flip the grammar anchor — content deciding framing.
 
+## Do NOT filter open thoughts as a "safety" measure
+
+Considered and rejected (Mike, 2026-07-21) after I proposed pruning
+client-supplied open thoughts at blallama's `POST /v1/messages`
+(`Json<Prompt>`, `blallama.rs:377`):
+
+- **It filters one shape and leaves the equivalent one.** A *closed*
+  thought that implies compliance steers nearly as well — worse answer
+  quality, same effect. Pruning open ones is theater.
+- **It costs a real capability.** blallama's users are devs, who must
+  put something (axum, an API key, TLS) in front before an end user
+  reaches it. Some of them will want exactly what we want.
+- **blallama's rule of thumb**: any divergence from the Anthropic API is
+  a bug, unless it is better or more flexible (like the tip
+  breakpoints) *and* has a use case that, properly deployed, makes the
+  user safer.
+
+Also, don't document "the same lever points the other way" as a warning.
+Anyone using this crate has the weights and can hand-feed control tokens
+through the raw predictor already — the boundary CLAUDE.md draws is
+`Session` enforces, `Engine` does not. A warning adds no defense and
+does add an idea.
+
 ## No implicit merge across the public API
 
 `complete_blocks` returns only what that call generated. Seating a
@@ -112,6 +135,20 @@ and resumes it: measured **cache read 84 / created 1**. Pinned as
 `unrenderable_open_thought_is_rejected` in `tests/session.rs`, plus
 byte-exactness (`open_thought_tail_appends_raw_after_generation_prompt`,
 body ending in `\n\n\n`) in `chat_template.rs`.
+
+## The general case: #63
+
+This shipped the narrow slice — a trailing assistant message whose
+*sole* block is an open thought. [#63](https://github.com/mdegans/drama_llama/issues/63)
+is the general one Mike wants next: full **assistant prefill**
+(`continue_final_message`), including carrying a seeded refusal into the
+`Text` block so the answer continues in the voice the reasoning set up.
+It is an Anthropic-API parity gap, so by blallama's rule of thumb the
+absence is a bug. The mechanism differs: a general prefill needs the
+*intra-message* layout (`<think>\n` ++ thought ++ `\n</think>\n\n` ++
+text), which is what `dialect::render_reference` already emits from the
+analyzed `CallSyntax` — so #59's raw-body append becomes the degenerate
+case of "append the dialect emission of the trailing message".
 
 Related: [[byte_exact_round_trip_invariant]], #38 (tool-call half still
 open), #62 (the release-only `debug_assert!` parser bug found while
