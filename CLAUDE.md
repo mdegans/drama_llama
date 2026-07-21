@@ -172,6 +172,17 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`truncated_call_containment.md`](.claude/memory/truncated_call_containment.md)
+  — **read before proposing any "just ban the token" fix.** Why a
+  truncated tool call cannot be prevented, only contained: the four
+  classes (model-bails — already closed; opener-in-free-region — legal
+  by construction; byte-spelling — mostly not a vector, the trigger scan
+  is byte-based; budget exhaustion — irreducible). Carries the
+  *reason* 0.7 tore out the ban set (banning `r` broke
+  `count_letters("strawberry")`), why containment must key on "does this
+  text contain a special" rather than "did the parser degrade" (keying
+  on degradation breaks every structured generation on Llama 3.1), and
+  the two-errors decision for #38.
 - [`eog_is_not_eos_plus_eot.md`](.claude/memory/eog_is_not_eos_plus_eot.md)
   — **read before touching stop logic.** `Model::eog_tokens()` is
   libllama's `special_eog_ids` verbatim and is the single authority for
