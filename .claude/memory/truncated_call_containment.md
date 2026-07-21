@@ -162,6 +162,34 @@ reserved bytes must not print them.
   flattens to `500 Unknown`, `bin/blallama/blallama.rs:953-966`);
   `complete_text` has no violation check at all (`session/mod.rs:4396`).
 
+## Live verification (2026-07-21, defect 1 only)
+
+`just example council --verbose`, piped petition (the documented
+car-wash trick question), full sealed-round → rebuttal → reaction →
+ruling cycle. **Six seats, zero deaths, clean adjournment, exit 0**;
+zero occurrences of `reserved special token` / `GrammarViolation` /
+bounced mail. Payroll: `in: 32278 | cache w: 27860 | cache r: 4418 |
+out: 10319`.
+
+Substantively the council also flipped correctly — unanimous WALK in
+round one, the Jester caught that the destination is a *Car* Wash, all
+four advisors conceded, judge ruled DRIVE. That is the reaction-phase
+ordering working: without it the concessions race the ruling through the
+session mutex and get discarded.
+
+**What this did NOT verify:** nothing truncated, so the new check never
+fired. This is a no-regression result, not a proof the fix triggers
+correctly in the wild — that is covered by
+`constraint_incomplete_at_end_sees_activated_deferred` and the model
+tests. To exercise it live, run with a deliberately small `max_tokens`
+so a filing truncates mid-call; better done alongside defect 3, once
+there is a containment error to catch what defect 1 lets through.
+
+Driving the example non-interactively: `printf 'QUESTION\n\n' | just
+example council --verbose`. rustyline reads fine from a pipe — first
+line is the petition, the empty line is "send to the judge", EOF
+adjourns.
+
 ## Method note
 
 Three of Mike's recollections were checked against the tree this
