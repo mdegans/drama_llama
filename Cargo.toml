@@ -14,6 +14,20 @@ exclude = [".claude/", "CLAUDE.md", "tests/data/", "**/.DS_Store"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+# BEFORE RAISING THIS VERSION: `src/llama_cpp/model.rs` carries
+# `unsafe impl Sync for ModelInner`, and its soundness is a claim about
+# llama.cpp, not about our code — that a loaded model is immutable.
+# `llama_context` holds it as `const llama_model &`, there are no
+# `mutable` members in llama-model.h / llama-vocab.h, and the one
+# upstream call that writes a model through a context (`llama_opt_init`,
+# finetune) is deliberately never bound into our safe surface.
+#
+# An upstream change to any of those breaks the impl **silently** — it
+# is a `unsafe impl`, so nothing in this crate will fail to compile and
+# no test will go red. Re-read the SAFETY comment at that impl when you
+# bump, and see the resolution note in
+# `.claude/memory/llama_cpp_ffi_audit.md` (#54) for what was verified
+# and where.
 llama-cpp-sys-3 = { version = "0.8.1", optional = true }
 
 # moeflux (Metal-backed streaming-MoE decoder). macOS-only; drama_llama's
