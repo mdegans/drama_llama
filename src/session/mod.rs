@@ -203,6 +203,25 @@ pub enum SessionError {
          ({piece:?}); reject as possible prompt injection"
     )]
     InjectedSpecialToken { token: Token, piece: String },
+    /// The prompt carries an *open* thought — a reasoning block whose
+    /// close marker the model never emitted, flagged with
+    /// [`OPEN_THOUGHT_SIGNATURE`](crate::prompt::OPEN_THOUGHT_SIGNATURE).
+    ///
+    /// There is no byte-exact way to render one: the chat template
+    /// supplies its own close marker and normalizes the whitespace
+    /// around the thought, so the re-rendered prefix cannot match the
+    /// KV cells the thought was generated against. Rendering it anyway
+    /// is a silent prefix-cache miss — minutes of re-prefill on a long
+    /// prompt — so this fails loudly instead. Prune with
+    /// [`prune_open_thoughts`](crate::prompt::prune_open_thoughts) and
+    /// resubmit; the cost is one turn's cache miss, not a corrupted
+    /// transcript.
+    #[error(
+        "message {index} carries an unclosed (open) thought, which \
+         cannot be rendered byte-exactly; call \
+         `drama_llama::prompt::prune_open_thoughts` and resubmit"
+    )]
+    UnrenderableOpenThought { index: usize },
     /// The prompt contains images but this session cannot consume
     /// them — the `media` feature is off, the backend has no vision
     /// support, no projector is loaded, or the loaded projector is
@@ -274,10 +293,13 @@ impl SessionError {
             // run_call invalidates its own prefix cache on grammar violation, so
             // the session is internally consistent.
             Self::GrammarViolation { .. } => true,
-            // Injection guard fires at the top of the prepare path,
-            // before any render / tokenize / decode touches the engine.
-            // State is pristine — safe to reuse.
-            Self::InjectedSpecialToken { .. } => true,
+            // Injection guard and open-thought shape check both fire at
+            // the top of the prepare path, before any render / tokenize
+            // / decode touches the engine. State is pristine — safe to
+            // reuse (and the open-thought case is *expected* to be
+            // retried, after pruning).
+            Self::InjectedSpecialToken { .. }
+            | Self::UnrenderableOpenThought { .. } => true,
             // Media capability / shape errors fire during prepare,
             // before any decode. State untouched — safe to reuse.
             Self::MediaUnsupported { .. }
@@ -1128,6 +1150,28 @@ fn find_injected_special_in_prompt(
         }
     }
     None
+}
+
+/// Index of the first message carrying an open thought
+/// ([`crate::prompt::OPEN_THOUGHT_SIGNATURE`]), if any — the check
+/// behind [`SessionError::UnrenderableOpenThought`].
+///
+/// An open thought is a reasoning block with no close marker. There is
+/// no way to render one through the chat template: the template lays
+/// out its own close and normalizes the surrounding whitespace
+/// irreversibly (Qwen3.6 `|trim`s content and `lstrip`/`rstrip`s the
+/// split halves), so the re-rendered bytes cannot match the KV the
+/// thought was generated against. Rendering it anyway is a silent
+/// prefix-cache miss, which on a long prompt is minutes of prefill —
+/// hence a hard error instead. Prune and resubmit
+/// ([`crate::prompt::prune_open_thoughts`]).
+///
+/// Model-free and pure, like [`find_injected_special_in_prompt`], so
+/// the walk is unit-testable without loading a model.
+fn find_open_thought(prompt: &Prompt) -> Option<usize> {
+    prompt.messages.iter().position(|msg| {
+        msg.content.0.iter().any(crate::prompt::is_open_thought)
+    })
 }
 
 /// Per-call random media sentinel: 32 hex chars (128 bits), never
@@ -2862,6 +2906,26 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    /// Reject prompts carrying an *open* thought (see
+    /// [`SessionError::UnrenderableOpenThought`]). Called at the top of
+    /// every prepare path, beside
+    /// [`Self::check_no_special_injection`], so no `complete_*` /
+    /// `top_k_trace` entry can render one.
+    ///
+    /// Same discipline as the injection guard, aimed at a different
+    /// failure: that one keeps framing tokens out of content, this one
+    /// keeps un-renderable framing *state* out of the cache. Both
+    /// choose a loud rejection over a silent divergence.
+    fn check_no_open_thought(
+        &self,
+        prompt: &Prompt,
+    ) -> Result<(), SessionError> {
+        match find_open_thought(prompt) {
+            Some(index) => Err(SessionError::UnrenderableOpenThought { index }),
+            None => Ok(()),
+        }
+    }
+
     /// Shared setup for every `complete_*` entry point: render the
     /// prompt through the chat template, tokenize with
     /// `parse_special=true` (so `<|im_start|>` etc. resolve to their
@@ -2905,6 +2969,7 @@ impl<B: Backend> Session<B> {
         SessionError,
     > {
         self.check_no_special_injection(prompt)?;
+        self.check_no_open_thought(prompt)?;
         let rendered = self.template.render_with(prompt, &self.render_opts)?;
         // parse_special=true: the rendered prompt contains chat markers
         // (`<|im_start|>`, `<|im_end|>`, etc.) that must tokenize to
@@ -3135,6 +3200,7 @@ impl<B: Backend> Session<B> {
         include_user_sampling: bool,
     ) -> Result<PreparedCall, SessionError> {
         self.check_no_special_injection(prompt)?;
+        self.check_no_open_thought(prompt)?;
         let media = self.prepare_media(prompt)?;
         let opts = match media.sentinel.as_deref() {
             Some(sentinel) => {
@@ -5458,6 +5524,9 @@ struct CallOutcome {
 fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
     use crate::Block;
     use std::borrow::Cow;
+    fn is_open(signature: &Cow<'static, str>) -> bool {
+        signature.as_ref() == crate::prompt::OPEN_THOUGHT_SIGNATURE
+    }
     let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
     for block in blocks {
         match (out.last_mut(), block) {
@@ -5467,10 +5536,25 @@ fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
             ) => {
                 *prev = Cow::Owned(format!("{prev}{new}"));
             }
+            // Only same-openness runs coalesce. A closed thought
+            // followed by an open one means the model emitted
+            // `</think>…<think>` between them (`parse_thought` eats
+            // exactly one `\n` after the close), so merging would
+            // silently swallow those marker bytes and hand back a
+            // legal-looking sole *open* thought whose re-render no
+            // longer matches the KV — a silent cache miss, which is
+            // the one outcome the open-thought machinery exists to
+            // prevent. See [`crate::prompt::OPEN_THOUGHT_SIGNATURE`].
             (
-                Some(Block::Thought { thought: prev, .. }),
-                Block::Thought { thought: new, .. },
-            ) => {
+                Some(Block::Thought {
+                    thought: prev,
+                    signature: prev_sig,
+                }),
+                Block::Thought {
+                    thought: new,
+                    signature: new_sig,
+                },
+            ) if is_open(prev_sig) == is_open(&new_sig) => {
                 *prev = Cow::Owned(format!("{prev}{new}"));
             }
             (_, block) => out.push(block),
@@ -5508,6 +5592,12 @@ fn infer_stop_reason(
     }
 
     match blocks.last() {
+        // An *open* thought is the opposite of an ended turn: the
+        // reasoning block never closed. `MaxTokens` above catches the
+        // usual cause, so reaching here means the model emitted EOS
+        // mid-thought — genuinely ambiguous, which is what `None` is
+        // for. Never `EndTurn`.
+        Some(b) if crate::prompt::is_open_thought(b) => (None, None),
         Some(crate::Block::Text { .. })
         | Some(crate::Block::Thought { .. }) => {
             (Some(StopReason::EndTurn), None)
@@ -5819,6 +5909,112 @@ mod tests {
         assert!(
             find_injected_special_in_prompt(&in_text, tok, &empty, piece)
                 .is_none(),
+        );
+    }
+
+    /// The open-thought ingest guard: found anywhere, reported by
+    /// message index, and clean prompts cost nothing.
+    #[test]
+    fn test_find_open_thought() {
+        use crate::prompt::{is_open_thought, open_thought};
+
+        let clean = Prompt::default()
+            .add_message((crate::Role::User, "hi"))
+            .unwrap();
+        assert_eq!(find_open_thought(&clean), None);
+
+        // A closed thought is not an open one — polarity check.
+        let closed = crate::Block::Thought {
+            thought: "done reasoning".into(),
+            signature: "".into(),
+        };
+        assert!(!is_open_thought(&closed));
+
+        let mut with_open = clean.clone();
+        with_open.messages.push(crate::Message {
+            role: crate::Role::Assistant,
+            content: crate::Content(vec![open_thought("cut off")]),
+        });
+        assert_eq!(find_open_thought(&with_open), Some(1));
+
+        // The shape a caller assembles in good faith from
+        // `complete_blocks`: prose before a spontaneous `<think>`
+        // leaves a leading Text. Still rejected — it cannot render
+        // byte-exactly — and `prune_open_thoughts` is the remedy.
+        let mut mixed = clean.clone();
+        mixed.messages.push(crate::Message {
+            role: crate::Role::Assistant,
+            content: crate::Content(vec![
+                crate::Block::from("\n"),
+                open_thought("cut off"),
+            ]),
+        });
+        assert_eq!(find_open_thought(&mixed), Some(1));
+        assert_eq!(crate::prompt::prune_open_thoughts(&mut mixed), 1);
+        assert_eq!(find_open_thought(&mixed), None);
+        assert_eq!(mixed.messages.len(), 2, "the Text block survives pruning");
+
+        // Pruning a sole open thought drops the now-empty message.
+        let mut sole = with_open.clone();
+        assert_eq!(crate::prompt::prune_open_thoughts(&mut sole), 1);
+        assert_eq!(sole.messages.len(), 1);
+    }
+
+    /// Adjacent thoughts coalesce only when they agree on openness.
+    /// A closed→open pair means the model emitted `</think>…<think>`
+    /// between them; merging would swallow those marker bytes and hand
+    /// back a legal-looking sole open thought whose re-render no longer
+    /// matches the KV — a silent cache miss.
+    #[test]
+    fn test_merge_adjacent_prose_respects_openness() {
+        use crate::prompt::open_thought;
+
+        let closed = |s: &str| crate::Block::Thought {
+            thought: s.to_string().into(),
+            signature: "".into(),
+        };
+
+        let merged = merge_adjacent_prose(vec![closed("one "), closed("two")]);
+        assert_eq!(merged.len(), 1, "{merged:#?}");
+
+        let merged = merge_adjacent_prose(vec![
+            open_thought("one "),
+            open_thought("two"),
+        ]);
+        assert_eq!(merged.len(), 1, "{merged:#?}");
+        assert!(crate::prompt::is_open_thought(&merged[0]));
+
+        let merged =
+            merge_adjacent_prose(vec![closed("one"), open_thought("two")]);
+        assert_eq!(
+            merged.len(),
+            2,
+            "mixed openness must NOT merge: {merged:#?}"
+        );
+    }
+
+    /// A trailing *open* thought is the opposite of an ended turn.
+    /// `MaxTokens` catches the usual cause; reaching the trailing-block
+    /// arm means EOS mid-thought, which is genuinely ambiguous.
+    #[test]
+    fn test_infer_stop_reason_open_thought_is_not_end_turn() {
+        use misanthropic::response::StopReason;
+        let max = NonZeroUsize::new(100).unwrap();
+
+        let closed = vec![crate::Block::Thought {
+            thought: "done".into(),
+            signature: "".into(),
+        }];
+        assert_eq!(
+            infer_stop_reason(&closed, "done", 10, max, None).0,
+            Some(StopReason::EndTurn),
+        );
+
+        let open = vec![crate::prompt::open_thought("cut off")];
+        assert_eq!(
+            infer_stop_reason(&open, "cut off", 10, max, None).0,
+            None,
+            "an unclosed thought never reports EndTurn",
         );
     }
 

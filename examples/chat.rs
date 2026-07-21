@@ -338,6 +338,18 @@ async fn drive(
             println!("  [{}]", pay_line(&message.usage.counts));
 
             prompt.seat(message.inner, &mut pending)?;
+            // A turn cut off mid-`<think>` seats an *open* thought,
+            // which the next call would reject: there is no byte-exact
+            // way to re-render a reasoning block whose close marker was
+            // never emitted. Prune it here — same spirit as the
+            // rephrase prompt above, catching a rejectable state before
+            // it becomes an error.
+            if drama_llama::prompt::prune_open_thoughts(prompt) > 0 {
+                println!(
+                    "  (reasoning was cut off by max_tokens — dropped \
+                     the partial thought to keep the transcript legal)"
+                );
+            }
             // Rolling assistant-tail breakpoint — the render the
             // session's prefix cache keys on. One-hour TTL: an
             // interviewer thinks longer than the 5-minute sweep.

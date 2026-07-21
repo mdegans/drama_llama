@@ -339,6 +339,35 @@ impl<'a> Parser<'a> {
         });
     }
 
+    /// Push a thought whose close marker never arrived — the model was
+    /// cut off mid-reasoning.
+    ///
+    /// Two differences from [`Self::push_thought`], both load-bearing:
+    ///
+    /// * The body is stored **raw**. The closed path can normalize
+    ///   whitespace because a canonical close marker re-supplies it on
+    ///   render (and the chat template applies the mirror-image
+    ///   `lstrip`/`rstrip` of its own); an open thought has no close,
+    ///   so trimmed bytes are gone for good and the re-render no longer
+    ///   matches the KV.
+    /// * It carries [`OPEN_THOUGHT_SIGNATURE`], which is what stops the
+    ///   renderer from inventing a close marker the model never wrote.
+    ///
+    /// [`OPEN_THOUGHT_SIGNATURE`]: crate::prompt::OPEN_THOUGHT_SIGNATURE
+    fn push_open_thought(&mut self, body: &str) {
+        if body.is_empty() {
+            // Nothing was generated before the cutoff. Dropping it is
+            // byte-safe: under a pre-opened template the generation
+            // prompt re-emits the open marker by itself, so an empty
+            // open thought contributes no bytes either way.
+            return;
+        }
+        self.blocks.push(Block::Thought {
+            thought: body.to_string().into(),
+            signature: Cow::Borrowed(crate::prompt::OPEN_THOUGHT_SIGNATURE),
+        });
+    }
+
     /// The incomplete tail starting at `from`: suppress or degrade
     /// per leniency.
     fn incomplete(&mut self, from: usize) {
@@ -410,10 +439,12 @@ impl<'a> Parser<'a> {
                                 }
                                 Leniency::Final => {
                                     // Unclosed thought at end of generation:
-                                    // surface what we have as a Thought —
-                                    // the model was cut off mid-reasoning.
+                                    // surface what we have as an *open*
+                                    // Thought — the model was cut off
+                                    // mid-reasoning. Raw, untrimmed: these
+                                    // bytes must re-render exactly.
                                     let body = self.rest().to_string();
-                                    self.push_thought(body.trim_end());
+                                    self.push_open_thought(&body);
                                     self.pos = self.text.len();
                                 }
                             }
@@ -564,7 +595,6 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_thought(&mut self, open: &str) {
-        let start = self.pos;
         // NOT `debug_assert!(self.eat(open))`: `debug_assert!` does not
         // evaluate its argument in release builds, so the marker would
         // go unconsumed and end up inside the thought body — frame
@@ -615,7 +645,25 @@ impl<'a> Parser<'a> {
                         // Return to the main loop; the trigger dispatches
                         // to parse_calls on the next iteration.
                     }
-                    None => self.incomplete(start),
+                    // No close and no call: the model was cut off
+                    // mid-reasoning. `open` is already eaten, so
+                    // `rest()` is exactly the body — surface it as an
+                    // open Thought rather than letting `incomplete`
+                    // degrade the whole span (marker bytes included)
+                    // into a `Text` block. That degradation is the
+                    // thought-half of issue #38: frame markers seated
+                    // as content.
+                    None => match self.leniency {
+                        Leniency::Streaming => {
+                            self.status = ParseStatus::NeedMoreInput;
+                            self.pos = self.text.len();
+                        }
+                        Leniency::Final => {
+                            let body = self.rest().to_string();
+                            self.push_open_thought(&body);
+                            self.pos = self.text.len();
+                        }
+                    },
                 }
             }
         }
@@ -881,7 +929,14 @@ impl<'a> Parser<'a> {
                 Leniency::Streaming => CallOutcome::Incomplete,
                 Leniency::Final => {
                     let body = strip_harmony_eog(self.rest()).to_string();
-                    self.push_thought(&body);
+                    // Open: the analysis channel never closed. Harmony
+                    // can't *render* an open thought (its generation
+                    // prompt never pre-opens a channel — `emit.rs`
+                    // collapses both eager anchors), so this turns a
+                    // silent re-render with a fabricated `<|end|>` into
+                    // a loud rejection at ingest. Stated limitation,
+                    // not an oversight.
+                    self.push_open_thought(&body);
                     self.pos = self.text.len();
                     CallOutcome::Parsed
                 }
@@ -1832,11 +1887,122 @@ mod tests {
         assert_eq!(calls_of(&parsed.blocks).len(), 1, "{:#?}", parsed.blocks);
     }
 
+    /// A pre-opened reasoning block cut off by `max_tokens` surfaces as
+    /// an **open** Thought whose body is byte-exact — trailing
+    /// whitespace included. The whitespace is the point: the closed
+    /// path may trim it because a canonical close marker re-supplies it
+    /// on render, but an open thought has no close, so a trim would
+    /// silently lose bytes the KV cache holds.
+    #[test]
+    fn pre_opened_unclosed_thought_is_open_and_byte_exact() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        // Ran out the clock mid-paragraph: real trailing newlines.
+        let emission = "Weighing the two options.\n\n\n";
+        let parsed =
+            parse_text(&syntax, &[&t], emission, true, Leniency::Final);
+        assert_eq!(parsed.blocks.len(), 1, "{:#?}", parsed.blocks);
+        let Block::Thought { thought, signature } = &parsed.blocks[0] else {
+            panic!("expected a Thought: {:#?}", parsed.blocks);
+        };
+        assert_eq!(
+            thought, emission,
+            "open thought bodies are stored raw, not trimmed"
+        );
+        assert_eq!(signature, crate::prompt::OPEN_THOUGHT_SIGNATURE);
+        assert!(crate::prompt::is_open_thought(&parsed.blocks[0]));
+    }
+
+    /// The same emission with its close marker present takes the closed
+    /// path: empty signature, and the whitespace normalization that
+    /// mirrors what the chat template does on re-render.
+    #[test]
+    fn closed_thought_keeps_empty_signature_and_normalization() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let parsed = parse_text(
+            &syntax,
+            &[&t],
+            "Weighing the two options.\n\n\n</think>\n\nDone.",
+            true,
+            Leniency::Final,
+        );
+        let Block::Thought { thought, signature } = &parsed.blocks[0] else {
+            panic!("expected a Thought: {:#?}", parsed.blocks);
+        };
+        assert_eq!(thought, "Weighing the two options.");
+        assert!(signature.is_empty(), "closed thoughts carry no signature");
+        assert!(!crate::prompt::is_open_thought(&parsed.blocks[0]));
+    }
+
+    /// A *spontaneous* `<think>` (not pre-opened) that never closes used
+    /// to fall through to `incomplete`, which seated the literal
+    /// `<think>` marker inside a `Block::Text` — the thought-half of
+    /// issue #38. It is now an open Thought, marker excluded from the
+    /// body since the renderer re-emits it.
+    #[test]
+    fn spontaneous_unclosed_thought_is_open_not_marker_text() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let parsed = parse_text(
+            &syntax,
+            &[&t],
+            "<think>\nstill reasoning when the clock ran out",
+            false,
+            Leniency::Final,
+        );
+        assert_eq!(parsed.blocks.len(), 1, "{:#?}", parsed.blocks);
+        assert!(
+            crate::prompt::is_open_thought(&parsed.blocks[0]),
+            "{:#?}",
+            parsed.blocks
+        );
+        let Block::Thought { thought, .. } = &parsed.blocks[0] else {
+            panic!("expected a Thought: {:#?}", parsed.blocks);
+        };
+        assert_eq!(
+            thought, "\nstill reasoning when the clock ran out",
+            "the open marker is framing, not body"
+        );
+    }
+
+    /// Streaming must agree with batch on openness: `finish()` reparses
+    /// under `Leniency::Final`, so the flush yields the same open
+    /// Thought the batch parser produces.
+    #[test]
+    fn stream_flush_agrees_with_batch_on_open_thought() {
+        let syntax = CallSyntax::qwen_xml();
+        let emission = "reasoning, interrupted\n\n";
+        let batch =
+            parse_text(&syntax, &[&tool("t")], emission, true, Leniency::Final)
+                .blocks;
+
+        let mut p = StreamParser::new(syntax, vec![tool("t")], true);
+        let mut streamed = p.push(emission);
+        streamed.extend(p.finish());
+
+        assert_eq!(streamed, batch, "streaming flush must equal batch");
+        assert!(streamed.iter().any(crate::prompt::is_open_thought));
+    }
+
+    /// An open thought with no body at all is dropped, deliberately:
+    /// under a pre-opened template the generation prompt re-emits the
+    /// open marker itself, so an empty open thought contributes no
+    /// bytes either way. Pinned so it stays a decision.
+    #[test]
+    fn empty_open_thought_is_dropped() {
+        let syntax = CallSyntax::qwen_xml();
+        let parsed =
+            parse_text(&syntax, &[&tool("t")], "", true, Leniency::Final);
+        assert!(parsed.blocks.is_empty(), "{:#?}", parsed.blocks);
+    }
+
     /// Guard: a `<tool_call>`-like substring that is NOT the real
     /// trigger (`<tool_call>\n`) must not cause an over-eager split.
-    /// Mid-stream preserves it as Text (the #38 fallback), pre-opened
-    /// as a Thought — either way no spurious ToolUse and no dropped
-    /// bytes.
+    /// The unclosed reasoning block surfaces as an *open* Thought
+    /// carrying the substring verbatim — no spurious ToolUse, no
+    /// dropped bytes, and (unlike the old `incomplete` fallback) no
+    /// `<think>` marker seated in a Text block.
     #[test]
     fn unclosed_think_fake_trigger_substring_is_not_a_call() {
         let syntax = CallSyntax::qwen_xml();
@@ -1855,9 +2021,19 @@ mod tests {
             parsed
                 .blocks
                 .iter()
-                .any(|b| matches!(b, Block::Text { text, .. }
-                if text.contains("<tool_call>"))),
+                .any(|b| matches!(b, Block::Thought { thought, .. }
+                if thought.contains("<tool_call>"))),
             "the substring is preserved, not dropped: {:#?}",
+            parsed.blocks
+        );
+        // And the reasoning open marker stays framing, not content.
+        assert!(
+            parsed
+                .blocks
+                .iter()
+                .all(|b| !matches!(b, Block::Text { text, .. }
+                if text.contains("<think>"))),
+            "no `<think>` marker seated as Text (#38): {:#?}",
             parsed.blocks
         );
 
@@ -2619,7 +2795,11 @@ mod tests {
             );
         }
 
-        // Cut off mid-reasoning: Final surfaces the partial Thought.
+        // Cut off mid-reasoning: Final surfaces the partial Thought,
+        // flagged OPEN. Harmony can't render an open thought back (its
+        // generation prompt never pre-opens a channel), so the flag is
+        // what turns a silent re-render with a fabricated `<|end|>`
+        // into a loud rejection at ingest.
         let blocks = merge_text(harmony_parse(
             "<|channel|>analysis<|message|>I'm\nthinking",
             Leniency::Final,
@@ -2630,6 +2810,13 @@ mod tests {
                 if thought.as_ref() == want_thought),
             "{blocks:#?}"
         );
+        assert!(crate::prompt::is_open_thought(&blocks[0]), "{blocks:#?}");
+        // The closed sibling above must NOT be flagged.
+        let closed = merge_text(harmony_parse(
+            "<|channel|>analysis<|message|>I'm\nthinking<|end|>",
+            Leniency::Final,
+        ));
+        assert!(!crate::prompt::is_open_thought(&closed[0]), "{closed:#?}");
 
         // Multiple analysis blocks stay separate Thoughts, in order.
         let blocks = merge_text(harmony_parse(
