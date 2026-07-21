@@ -28,6 +28,11 @@ exclude = [".claude/", "CLAUDE.md", "tests/data/", "**/.DS_Store"]
 # bump, and see the resolution note in
 # `.claude/memory/llama_cpp_ffi_audit.md` (#54) for what was verified
 # and where.
+#
+# A CI tripwire for this lives upstream, where the submodule bump
+# actually happens: mdegans/llama-cpp-sys#6. Until that lands, this
+# comment is the only thing standing between a routine version bump and
+# an unsound `Sync`.
 llama-cpp-sys-3 = { version = "0.8.1", optional = true }
 
 # moeflux (Metal-backed streaming-MoE decoder). macOS-only; drama_llama's

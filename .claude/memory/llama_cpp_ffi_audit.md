@@ -464,6 +464,21 @@ Notes for whoever audits next:
   `hparams.n_ctx_train` and `llama_set_param`s every weight tensor.
   Binding it into the safe surface would invalidate `unsafe impl Sync`.
   That named exclusion now lives in the safety comment.
+- **The `Sync` claim is about llama.cpp, not about us, and we bump
+  `llama-cpp-sys` often — so it can rot with nothing going red.**
+  Warning at the bump site (`Cargo.toml`, on the dependency line, since
+  that is the line your hand is on); CI tripwire tracked upstream at
+  **mdegans/llama-cpp-sys#6**, which is where the submodule bump
+  actually happens and where 3-OS CI already exists. Until that lands
+  the comment is the only defence, which is weak — treat a bump as a
+  prompt to re-read the SAFETY block, not a routine version edit.
+- **Not a "never bind finetuning" rule** (Mike wants to try it
+  eventually). The `Arc` is what makes it *tractable*: `Arc::get_mut`
+  yields `Some` only when exactly one handle exists — i.e. no context
+  and no projector holds the model — so a future
+  `LlamaCppModel::try_get_mut()` hands out mutable access precisely
+  when it is sound. Mutation must be gated on exclusive access; it
+  need not be forbidden.
 - **Drop order is no longer load-bearing anywhere.** Both `Drop` impls
   (`LlamaCppDecoder`, `Mtmd`) run to completion before their fields
   drop, so the C handle is freed and only then is the model handle
