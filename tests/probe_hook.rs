@@ -42,7 +42,7 @@ fn probe_hook_fires_once_per_yielded_token() {
 
     engine.set_probe_hook(Some(Box::new(CountingHook { log: log.clone() })));
 
-    let prompt_tokens = engine.model.tokenize(PROMPT, false);
+    let prompt_tokens = engine.model().tokenize(PROMPT, false);
     let prompt_len = prompt_tokens.len();
 
     let mut opts = PredictOptions::greedy();
@@ -94,7 +94,7 @@ fn probe_hook_can_be_cleared() {
     engine.set_probe_hook(Some(Box::new(CountingHook { log: log.clone() })));
     engine.set_probe_hook(None);
 
-    let prompt_tokens = engine.model.tokenize(PROMPT, false);
+    let prompt_tokens = engine.model().tokenize(PROMPT, false);
     let mut opts = PredictOptions::greedy();
     opts.n = NonZeroUsize::new(N_STEPS).unwrap();
 
@@ -160,7 +160,7 @@ fn probe_hook_snapshot_populated_when_requested() {
         },
     })));
 
-    let prompt_tokens = engine.model.tokenize(PROMPT, false);
+    let prompt_tokens = engine.model().tokenize(PROMPT, false);
     let mut opts = PredictOptions::greedy();
     opts.n = NonZeroUsize::new(N_STEPS).unwrap();
 
@@ -215,7 +215,7 @@ fn probe_hook_snapshot_does_not_perturb_sampling() {
             engine.set_probe_hook(Some(Box::new(CountingHook { log })));
         }
 
-        let prompt_tokens = engine.model.tokenize(prompt, false);
+        let prompt_tokens = engine.model().tokenize(prompt, false);
         let mut opts = PredictOptions::greedy();
         opts.n = NonZeroUsize::new(N_STEPS).unwrap();
         engine.predict_tokens(prompt_tokens, opts, None).collect()

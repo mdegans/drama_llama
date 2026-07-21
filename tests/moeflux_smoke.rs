@@ -56,7 +56,7 @@ fn moeflux_loads_and_predicts() {
     )
     .expect("MoefluxEngine::from_paths failed");
 
-    let n_vocab = engine.model.n_vocab();
+    let n_vocab = engine.model().n_vocab();
     eprintln!("loaded: n_vocab={n_vocab}, n_ctx={}", engine.n_ctx());
     assert_eq!(
         n_vocab, 248320,
@@ -66,12 +66,12 @@ fn moeflux_loads_and_predicts() {
 
     // Tokenization round-trip via the HF tokenizer.
     let prompt = "The quick brown fox";
-    let tokens = engine.model.tokenize(prompt, false);
+    let tokens = engine.model().tokenize(prompt, false);
     eprintln!("tokenized {prompt:?} -> {tokens:?}");
     assert!(!tokens.is_empty());
     let detok: String = tokens
         .iter()
-        .map(|&t| engine.model.token_to_piece(t))
+        .map(|&t| engine.model().token_to_piece(t))
         .collect();
     assert!(
         detok.contains("quick brown fox"),
@@ -99,7 +99,7 @@ fn moeflux_loads_and_predicts() {
     eprintln!("decoded 4 greedy tokens: {decoded:?}");
     let pieces: Vec<String> = decoded
         .iter()
-        .map(|&t| engine.model.token_to_piece(t))
+        .map(|&t| engine.model().token_to_piece(t))
         .collect();
     eprintln!("pieces: {pieces:?}");
     assert_eq!(decoded.len(), 4);

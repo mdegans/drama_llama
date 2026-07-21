@@ -20,17 +20,17 @@ use std::{
 };
 
 use llama_cpp_sys_3::{
-    llama_context, llama_decode, llama_get_model, llama_model,
-    llama_model_n_embd_inp, llama_n_batch, llama_n_ubatch, llama_pos,
-    llama_seq_id, llama_set_causal_attn, mtmd_bitmap, mtmd_bitmap_free,
-    mtmd_bitmap_init, mtmd_bitmap_set_id, mtmd_context,
-    mtmd_context_params_default, mtmd_decode_use_mrope,
-    mtmd_decode_use_non_causal, mtmd_decoder_pos, mtmd_encode_chunk, mtmd_free,
-    mtmd_get_marker, mtmd_get_output_embd, mtmd_helper_eval_chunk_single,
-    mtmd_helper_image_get_decoder_pos, mtmd_init_from_file, mtmd_input_chunk,
-    mtmd_input_chunk_get_id, mtmd_input_chunk_get_n_pos,
-    mtmd_input_chunk_get_n_tokens, mtmd_input_chunk_get_tokens_image,
-    mtmd_input_chunk_get_tokens_text, mtmd_input_chunk_get_type,
+    llama_context, llama_decode, llama_get_model, llama_model_n_embd_inp,
+    llama_n_batch, llama_n_ubatch, llama_pos, llama_seq_id,
+    llama_set_causal_attn, mtmd_bitmap, mtmd_bitmap_free, mtmd_bitmap_init,
+    mtmd_bitmap_set_id, mtmd_context, mtmd_context_params_default,
+    mtmd_decode_use_mrope, mtmd_decode_use_non_causal, mtmd_decoder_pos,
+    mtmd_encode_chunk, mtmd_free, mtmd_get_marker, mtmd_get_output_embd,
+    mtmd_helper_eval_chunk_single, mtmd_helper_image_get_decoder_pos,
+    mtmd_init_from_file, mtmd_input_chunk, mtmd_input_chunk_get_id,
+    mtmd_input_chunk_get_n_pos, mtmd_input_chunk_get_n_tokens,
+    mtmd_input_chunk_get_tokens_image, mtmd_input_chunk_get_tokens_text,
+    mtmd_input_chunk_get_type,
     mtmd_input_chunk_type_MTMD_INPUT_CHUNK_TYPE_TEXT, mtmd_input_chunks,
     mtmd_input_chunks_free, mtmd_input_chunks_get, mtmd_input_chunks_init,
     mtmd_input_chunks_size, mtmd_input_text, mtmd_support_audio,
@@ -202,19 +202,20 @@ static_assertions::assert_impl_all!(MtmdError: Send, Sync);
 ///
 /// # Lifetime
 ///
-/// The context holds a pointer to the text model it was initialized
-/// with (vocab reads during tokenize) — an `Mtmd` must not outlive
-/// its [`LlamaCppModel`]. This is the same informal contract as
-/// [`LlamaCppDecoder::new`]; for engine-owned instances,
-/// [`crate::Engine`]'s field order (vision drops first) enforces it.
+/// The context caches the text model's vocab pointer at construction
+/// and dereferences it during tokenize, so an `Mtmd` must not outlive
+/// its [`LlamaCppModel`]. It holds a handle on that model to make the
+/// point moot (issue #54) — the weights cannot be freed while a
+/// projector still refers to them.
 pub struct Mtmd {
     ctx: NonNull<mtmd_context>,
     /// Owned copy of the context's media marker (`<__media__>`).
     marker: String,
     /// The model this projector was validated against at
-    /// construction. Compared (never dereferenced) against the
-    /// decoder's model on every eval — see [`Mtmd::eval_media_chunk`].
-    model: *const llama_model,
+    /// construction. Doubles as the keepalive above and as the
+    /// identity compared (never dereferenced) against the decoder's
+    /// model on every eval — see [`Mtmd::eval_media_chunk`].
+    model: LlamaCppModel,
 }
 
 unsafe impl Send for Mtmd {}
@@ -232,6 +233,8 @@ impl std::fmt::Debug for Mtmd {
 
 impl Drop for Mtmd {
     fn drop(&mut self) {
+        // Runs to completion before any field drops, so the projector
+        // is freed while the `model` handle is still held.
         unsafe { mtmd_free(self.ctx.as_ptr()) }
     }
 }
@@ -263,7 +266,7 @@ impl Mtmd {
         cp.warmup = params.warmup;
 
         let ctx =
-            unsafe { mtmd_init_from_file(path_c.as_ptr(), model.inner, cp) };
+            unsafe { mtmd_init_from_file(path_c.as_ptr(), model.as_ptr(), cp) };
         let ctx =
             NonNull::new(ctx).ok_or_else(|| MtmdNewError::LoadFailed {
                 path: mmproj.to_path_buf(),
@@ -276,7 +279,7 @@ impl Mtmd {
         Ok(Self {
             ctx,
             marker,
-            model: model.inner,
+            model: model.clone(),
         })
     }
 
@@ -462,7 +465,7 @@ impl Mtmd {
         // the M-RoPE decision from the mtmd context while llama.cpp
         // reads `pos` using the decoder's `n_pos_per_embd`. Mismatched,
         // any of those three is an out-of-bounds access.
-        if !std::ptr::eq(self.model, unsafe {
+        if !std::ptr::eq(self.model.as_ptr(), unsafe {
             llama_get_model(decoder.context)
         }) {
             return Err(MtmdPrefillError::ModelMismatch);

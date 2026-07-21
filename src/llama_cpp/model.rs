@@ -63,7 +63,7 @@ fn token_to_piece_ref(
     // is no risk of a buffer overflow.
     let n_tokens = unsafe {
         llama_token_to_piece(
-            model.vocab,
+            model.0.vocab,
             token,
             buf.as_mut_ptr() as *mut i8,
             buf.len().try_into().unwrap(),
@@ -77,7 +77,7 @@ fn token_to_piece_ref(
 
         let check = unsafe {
             llama_token_to_piece(
-                model.vocab,
+                model.0.vocab,
                 token,
                 buf.as_mut_ptr() as *mut i8,
                 buf.len().try_into().unwrap(),
@@ -126,15 +126,16 @@ pub fn llama_quantize(
     }
 }
 
-/// An ergonomic wrapper for a `llama.cpp` model.
-#[derive(Debug)]
-pub struct LlamaCppModel {
-    pub(crate) inner: *mut llama_model,
+/// Owns the `*mut llama_model` and frees it on drop. Never exposed —
+/// [`LlamaCppModel`] is the handle, and the split exists so that
+/// handle can be cheaply cloned.
+struct ModelInner {
+    inner: *mut llama_model,
     /// The vocabulary associated with this model. This pointer is valid for the
     /// lifetime of the model and does not need to be freed separately.
-    pub(crate) vocab: *const llama_vocab,
+    vocab: *const llama_vocab,
     /// LlamaCppModel basename
-    pub(crate) file_name: Option<OsString>,
+    file_name: Option<OsString>,
     /// Cached longest-token length. The predictor calls this per generated
     /// token (stop-string windowing), and the naive compute is O(vocab), so
     /// we memoize the first call.
@@ -145,11 +146,11 @@ pub struct LlamaCppModel {
     eog: std::sync::OnceLock<Vec<llama_token>>,
 }
 
-unsafe impl Send for LlamaCppModel {}
+unsafe impl Send for ModelInner {}
 
 // SAFETY:
-// `LlamaCppModel` holds a raw `*mut llama_model`. llama.cpp's model data is
-// immutable after `llama_load_model_from_file` returns — weights,
+// `ModelInner` holds a raw `*mut llama_model`. llama.cpp's model data is
+// immutable after `llama_model_load_from_file` returns — weights,
 // vocab tables, and metadata are allocated once and read-only
 // thereafter. All `&LlamaCppModel` call sites in this crate only invoke
 // vocab-read APIs (`llama_token_to_piece`, `llama_n_vocab`, metadata
@@ -158,11 +159,65 @@ unsafe impl Send for LlamaCppModel {}
 // (tokenization of *batches* into a context, decoding) target the
 // separately-owned `*mut llama_context`, not the model.
 //
-// The borrow checker ensures nothing drops or re-assigns the model
-// while `&LlamaCppModel` references are alive, so the "immutable after load"
-// invariant holds for every shared reference. Adding any method that
-// mutates llama_model state would invalidate this impl.
-unsafe impl Sync for LlamaCppModel {}
+// Verified against the vendored llama.cpp rather than assumed, because
+// `Clone` makes shared access reachable rather than hypothetical:
+// `llama_context` stores the model as `const llama_model &`
+// (llama-context.h:276) and `llama_get_model` hands back a
+// `const llama_model *`; there are no `mutable` members in
+// llama-model.h or llama-vocab.h; and the non-const `llama_model *` in
+// `llama_init_from_model`'s signature is vestigial — its body only
+// reads (`hparams`, `arch`, `split_mode()`) before binding to that
+// const ref.
+//
+// The one upstream call that genuinely writes a model through a
+// context is `llama_opt_init` (llama-context.cpp:3245, the finetune
+// entry point): it assigns `model->hparams.n_ctx_train` and runs
+// `llama_set_param` over every weight tensor. It is not bound into
+// this crate's safe surface, and exposing it — or any other
+// model-mutating operation — would invalidate this impl.
+unsafe impl Sync for ModelInner {}
+
+/// An ergonomic wrapper for a `llama.cpp` model.
+///
+/// A cheap-to-clone handle: every clone names the same loaded model
+/// and only bumps a refcount, and the weights are freed when the last
+/// handle drops. That is what lets a [`LlamaCppDecoder`] (and an
+/// [`Mtmd`] projector) hold the model alive for as long as its
+/// `llama_context` needs it — a `llama_context` keeps a reference to
+/// the model for its whole life, so an independently-owned model was
+/// a use-after-free waiting to happen (issue #54).
+///
+/// Cloning is also how you get **several contexts over one copy of
+/// the weights**: loading the same GGUF twice costs two full weight
+/// allocations (on Metal, two copies in unified memory), whereas
+/// cloning the handle into a second [`LlamaCppDecoder`] costs only
+/// that decoder's KV cache.
+///
+/// [`LlamaCppDecoder`]: crate::LlamaCppDecoder
+/// [`Mtmd`]: crate::llama_cpp::mtmd::Mtmd
+#[derive(Clone)]
+pub struct LlamaCppModel(std::sync::Arc<ModelInner>);
+
+// The handle is only useful if it can actually be shared: `Clone` is
+// what keeps a context's weights alive, and `Send`/`Sync` are what let
+// a decoder built from a clone move to another thread. All three come
+// from `ModelInner`'s unsafe impls above, so pin them here — losing
+// one should be a compile error at this line rather than a puzzling
+// failure at some downstream `Engine: Send` bound.
+static_assertions::assert_impl_all!(LlamaCppModel: Send, Sync, Clone);
+
+// Manual, so the output stays flat rather than nesting through the
+// private `ModelInner` (`Engine`'s `Debug` prints the model).
+impl std::fmt::Debug for LlamaCppModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlamaCppModel")
+            .field("inner", &self.0.inner)
+            .field("vocab", &self.0.vocab)
+            .field("file_name", &self.0.file_name)
+            .field("handles", &std::sync::Arc::strong_count(&self.0))
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, From)]
 pub enum MetaKey<'a> {
@@ -204,13 +259,13 @@ impl LlamaCppModel {
             None
         } else {
             let vocab = unsafe { llama_model_get_vocab(model) };
-            Some(Self {
+            Some(Self(std::sync::Arc::new(ModelInner {
                 inner: model,
                 vocab,
                 file_name: Some(file_name),
                 max_token_len: std::sync::OnceLock::new(),
                 eog: std::sync::OnceLock::new(),
-            })
+            })))
         }
     }
 
@@ -225,13 +280,13 @@ impl LlamaCppModel {
             None
         } else {
             let vocab = llama_model_get_vocab(ptr);
-            Some(Self {
+            Some(Self(std::sync::Arc::new(ModelInner {
                 inner: ptr,
                 vocab,
                 file_name: None,
                 max_token_len: std::sync::OnceLock::new(),
                 eog: std::sync::OnceLock::new(),
-            })
+            })))
         }
     }
 
@@ -239,30 +294,53 @@ impl LlamaCppModel {
     ///
     /// [`from_file`]: LlamaCppModel::from_file
     pub fn file_name<'a>(&'a self) -> Option<&'a OsStr> {
-        self.file_name.as_deref()
+        self.0.file_name.as_deref()
     }
 
-    /// Unwrap the model and return the raw pointer.
+    /// Unwrap the model and return the raw pointer, or `None` if this
+    /// is not the last handle — other clones (a [`LlamaCppDecoder`]'s
+    /// keepalive, an [`Mtmd`] projector's) are still relying on the
+    /// model staying alive, so there is nothing to hand over.
     ///
     /// # Safety
     /// The caller is responsible for freeing the model using `llama_free_model`
     /// or `LlamaCppModel::from_raw` and then dropping it.
-    pub fn into_raw(self) -> *mut llama_model {
-        let ptr = self.inner;
-        std::mem::forget(self);
-        ptr
+    ///
+    /// [`LlamaCppDecoder`]: crate::LlamaCppDecoder
+    /// [`Mtmd`]: crate::llama_cpp::mtmd::Mtmd
+    pub fn into_raw(self) -> Option<*mut llama_model> {
+        // `ManuallyDrop` so `ModelInner::drop` does not free the model
+        // out from under the pointer we are handing back.
+        let inner =
+            std::mem::ManuallyDrop::new(std::sync::Arc::into_inner(self.0)?);
+        Some(inner.inner)
     }
 
     /// Return the inner model.
     pub fn as_ptr(&self) -> *const llama_model {
-        debug_assert_eq!(self.inner.is_null(), false);
-        self.inner as *const llama_model
+        debug_assert_eq!(self.0.inner.is_null(), false);
+        self.0.inner as *const llama_model
     }
 
     /// Return the inner model mutably.
-    pub fn as_ptr_mut(&mut self) -> *mut llama_model {
-        debug_assert_eq!(self.inner.is_null(), false);
-        self.inner
+    ///
+    /// # Safety
+    /// The caller must not mutate the model through this pointer.
+    /// llama.cpp treats a loaded model as const everywhere in the
+    /// inference path — `llama_context` holds it as
+    /// `const llama_model &` — and this crate's
+    /// `unsafe impl Sync for ModelInner` depends on that. The one
+    /// upstream call that breaks it is `llama_opt_init` (the finetune
+    /// entry point), which rewrites `hparams` and every weight
+    /// tensor; calling it through this pointer is undefined behaviour
+    /// as far as the rest of the crate is concerned.
+    ///
+    /// Takes `&self` rather than `&mut self` deliberately:
+    /// [`LlamaCppModel`] is a shared handle, so a `&mut` would falsely
+    /// imply exclusive access to the underlying model.
+    pub unsafe fn as_ptr_mut(&self) -> *mut llama_model {
+        debug_assert_eq!(self.0.inner.is_null(), false);
+        self.0.inner
     }
 
     // Safety: The getters that follow are safe because they are simple accessor
@@ -270,37 +348,37 @@ impl LlamaCppModel {
 
     /// Return the Beginning of Sequence (BOS) token.
     pub fn bos(&self) -> llama_token {
-        unsafe { llama_vocab_bos(self.vocab) }
+        unsafe { llama_vocab_bos(self.0.vocab) }
     }
 
     /// Return the End of Sequence (EOS) token.
     pub fn eos(&self) -> llama_token {
-        unsafe { llama_vocab_eos(self.vocab) }
+        unsafe { llama_vocab_eos(self.0.vocab) }
     }
 
     /// Return the next-line token.
     pub fn next_line(&self) -> llama_token {
-        unsafe { llama_vocab_nl(self.vocab) }
+        unsafe { llama_vocab_nl(self.0.vocab) }
     }
 
     /// Return the infill prefix token.
     pub fn infill_prefix(&self) -> llama_token {
-        unsafe { llama_vocab_fim_pre(self.vocab) }
+        unsafe { llama_vocab_fim_pre(self.0.vocab) }
     }
 
     /// Return the infill middle token.
     pub fn infill_middle(&self) -> llama_token {
-        unsafe { llama_vocab_fim_mid(self.vocab) }
+        unsafe { llama_vocab_fim_mid(self.0.vocab) }
     }
 
     /// Return the end of turn token.
     pub fn eot(&self) -> llama_token {
-        unsafe { llama_vocab_eot(self.vocab) }
+        unsafe { llama_vocab_eot(self.0.vocab) }
     }
 
     /// Return the infill suffix token.
     pub fn infill_suffix(&self) -> llama_token {
-        unsafe { llama_vocab_fim_suf(self.vocab) }
+        unsafe { llama_vocab_fim_suf(self.0.vocab) }
     }
 
     /// Collect every token with the `CONTROL` or `USER_DEFINED` attribute
@@ -320,7 +398,7 @@ impl LlamaCppModel {
             | llama_token_attr_LLAMA_TOKEN_ATTR_USER_DEFINED;
         (0..n)
             .filter(|&t| {
-                let attr = unsafe { llama_token_get_attr(self.vocab, t) };
+                let attr = unsafe { llama_token_get_attr(self.0.vocab, t) };
                 (attr & mask) != 0
             })
             .collect()
@@ -344,10 +422,11 @@ impl LlamaCppModel {
     ///
     /// Memoized — first call is O(vocab), subsequent calls O(1).
     pub fn eog_tokens(&self) -> Vec<llama_token> {
-        self.eog
+        self.0
+            .eog
             .get_or_init(|| {
                 (0..self.n_vocab())
-                    .filter(|&t| unsafe { llama_vocab_is_eog(self.vocab, t) })
+                    .filter(|&t| unsafe { llama_vocab_is_eog(self.0.vocab, t) })
                     .collect()
             })
             .clone()
@@ -358,7 +437,7 @@ impl LlamaCppModel {
     /// The predictor hits this per generated token for stop-string
     /// windowing, so the cache matters.
     pub fn max_token_len(&self) -> usize {
-        *self.max_token_len.get_or_init(|| {
+        *self.0.max_token_len.get_or_init(|| {
             let mut max_len = 0;
             for i in 0..self.n_vocab() {
                 // `i` is always in range here, so the `None` arm is
@@ -372,57 +451,57 @@ impl LlamaCppModel {
 
     /// Return whether BOS token should be added.
     pub fn add_bos(&self) -> bool {
-        unsafe { llama_vocab_get_add_bos(self.vocab) }
+        unsafe { llama_vocab_get_add_bos(self.0.vocab) }
     }
 
     /// Return whether the EOS token should be added.
     pub fn add_eos(&self) -> bool {
-        unsafe { llama_vocab_get_add_eos(self.vocab) }
+        unsafe { llama_vocab_get_add_eos(self.0.vocab) }
     }
 
     /// Vocab type.
     pub fn vocab_type(&self) -> llama_vocab_type {
-        unsafe { llama_vocab_type(self.vocab) }
+        unsafe { llama_vocab_type(self.0.vocab) }
     }
 
     /// Vocab size.
     pub fn n_vocab(&self) -> i32 {
-        unsafe { llama_vocab_n_tokens(self.vocab) }
+        unsafe { llama_vocab_n_tokens(self.0.vocab) }
     }
 
     /// Context size the model was trained with.
     pub fn context_size(&self) -> i32 {
-        unsafe { llama_model_n_ctx_train(self.inner) }
+        unsafe { llama_model_n_ctx_train(self.0.inner) }
     }
 
     /// Embedding size.
     pub fn embedding_size(&self) -> i32 {
-        unsafe { llama_model_n_embd(self.inner) }
+        unsafe { llama_model_n_embd(self.0.inner) }
     }
 
     /// Rotary Position Encoding (RoPE) type.
     pub fn rope_type(&self) -> i32 {
-        unsafe { llama_model_rope_type(self.inner) }
+        unsafe { llama_model_rope_type(self.0.inner) }
     }
 
     /// RoPE frequency scaling factor.
     pub fn rope_freq_scale(&self) -> f32 {
-        unsafe { llama_model_rope_freq_scale_train(self.inner) }
+        unsafe { llama_model_rope_freq_scale_train(self.0.inner) }
     }
 
     /// Get the number of metadata entries.
     pub fn meta_count(&self) -> i32 {
-        unsafe { llama_model_meta_count(self.inner) }
+        unsafe { llama_model_meta_count(self.0.inner) }
     }
 
     /// The total size of all the tensors in the model in bytes.
     pub fn size(&self) -> u64 {
-        unsafe { llama_model_size(self.inner) }
+        unsafe { llama_model_size(self.0.inner) }
     }
 
     /// The total number of parameters in the model.
     pub fn n_params(&self) -> u64 {
-        unsafe { llama_model_n_params(self.inner) }
+        unsafe { llama_model_n_params(self.0.inner) }
     }
 
     /// A string describing the model type.
@@ -432,7 +511,7 @@ impl LlamaCppModel {
         // The string will be null-terminated.
         let required = unsafe {
             llama_model_desc(
-                self.inner,
+                self.0.inner,
                 buf.as_mut_ptr() as *mut c_char,
                 buf.len(),
             )
@@ -445,7 +524,7 @@ impl LlamaCppModel {
                 buf.resize(required as usize, 0);
                 let check = unsafe {
                     llama_model_desc(
-                        self.inner,
+                        self.0.inner,
                         buf.as_mut_ptr() as *mut c_char,
                         buf.len(),
                     )
@@ -545,7 +624,7 @@ impl LlamaCppModel {
             let key_str = unsafe {
                 let mut buf: Vec<u8> = vec![0; 8];
                 let required = llama_model_meta_key_by_index(
-                    self.inner,
+                    self.0.inner,
                     i,
                     buf.as_mut_ptr() as *mut c_char,
                     buf.len(),
@@ -560,7 +639,7 @@ impl LlamaCppModel {
                 if buf.len() != required as usize {
                     buf.resize(required as usize, 0);
                     let check = llama_model_meta_key_by_index(
-                        self.inner,
+                        self.0.inner,
                         i,
                         buf.as_mut_ptr() as *mut c_char,
                         buf.len(),
@@ -598,7 +677,7 @@ impl LlamaCppModel {
             // correct length.
             MetaKey::Int(i) => unsafe {
                 let required = llama_model_meta_val_str_by_index(
-                    self.inner,
+                    self.0.inner,
                     i,
                     buf.as_mut_ptr() as *mut c_char,
                     buf.len(),
@@ -611,7 +690,7 @@ impl LlamaCppModel {
                 if buf.len() != required as usize {
                     buf.resize(required as usize, 0);
                     let check = llama_model_meta_val_str_by_index(
-                        self.inner,
+                        self.0.inner,
                         i,
                         buf.as_mut_ptr() as *mut c_char,
                         buf.len(),
@@ -629,7 +708,7 @@ impl LlamaCppModel {
                 let key = CString::new(s).unwrap();
                 let required = unsafe {
                     llama_model_meta_val_str(
-                        self.inner,
+                        self.0.inner,
                         key.as_c_str().as_ptr(),
                         buf.as_mut_ptr() as *mut c_char,
                         buf.len(),
@@ -643,7 +722,7 @@ impl LlamaCppModel {
                     buf.resize(required as usize, 0);
                     let check = unsafe {
                         llama_model_meta_val_str(
-                            self.inner,
+                            self.0.inner,
                             key.as_c_str().as_ptr(),
                             buf.as_mut_ptr() as *mut c_char,
                             buf.len(),
@@ -702,7 +781,7 @@ impl LlamaCppModel {
         // function will return the number of tokens needed.
         n_tokens = unsafe {
             llama_tokenize(
-                self.vocab,
+                self.0.vocab,
                 input.as_bytes().as_ptr() as *const i8,
                 input.len().try_into().unwrap(),
                 result.as_mut_ptr(),
@@ -730,7 +809,7 @@ impl LlamaCppModel {
             // Safety: Same as above, but we double-check the length below.
             let check = unsafe {
                 llama_tokenize(
-                    self.vocab,
+                    self.0.vocab,
                     input.as_bytes().as_ptr() as *const i8,
                     input.len().try_into().unwrap(),
                     result.as_mut_ptr(),
@@ -833,7 +912,7 @@ impl LlamaCppModel {
         // `.at()` cannot throw. The returned pointer borrows the
         // `std::string` inside the vocab's `id_to_token`, which lives
         // as long as the model — tied here to `&'a self`.
-        let ptr = unsafe { llama_vocab_get_text(self.vocab, token) };
+        let ptr = unsafe { llama_vocab_get_text(self.0.vocab, token) };
         Some(unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
     }
 
@@ -867,7 +946,7 @@ impl LlamaCppModel {
             return None;
         }
         // SAFETY: in range per the guard, so `.at()` cannot throw.
-        Some(unsafe { llama_vocab_get_score(self.vocab, token) })
+        Some(unsafe { llama_vocab_get_score(self.0.vocab, token) })
     }
 
     /// Get scores for a given slice of tokens.
@@ -887,7 +966,7 @@ impl LlamaCppModel {
     }
 }
 
-impl Drop for LlamaCppModel {
+impl Drop for ModelInner {
     fn drop(&mut self) {
         unsafe { llama_model_free(self.inner) };
     }
@@ -965,7 +1044,8 @@ impl crate::backend::Model for LlamaCppModel {
     }
 
     fn display_name(&self) -> Option<String> {
-        self.file_name
+        self.0
+            .file_name
             .as_deref()
             .map(|s| s.to_string_lossy().into_owned())
     }

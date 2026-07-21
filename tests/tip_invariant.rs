@@ -33,7 +33,7 @@ fn engine() -> LlamaCppEngine {
 #[ignore = "long running, requires models/model.gguf"]
 fn terminal_token_does_not_advance_matchers() {
     let mut engine = engine();
-    let tokens = engine.model.tokenize("Say hello: ", true);
+    let tokens = engine.model().tokenize("Say hello: ", true);
 
     let mut options = PredictOptions {
         n: NonZeroUsize::new(8).unwrap(),

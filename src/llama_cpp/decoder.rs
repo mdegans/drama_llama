@@ -157,13 +157,22 @@ impl FlashAttention {
 /// Implements [`crate::backend::Decoder`]. `LlamaCppDecoder::new`
 /// handles backend lifecycle (`llama_backend_init` + `llama_numa_init`
 /// on the first-ever decoder; `llama_backend_free` on the last
-/// dropped). `n_vocab` and `embedding_size` are cached at construction
-/// so the decoder can produce correctly-sized slices without holding a
-/// reference to the [`LlamaCppModel`] that produced it.
+/// dropped).
 #[derive(Debug)]
 pub struct LlamaCppDecoder {
     pub(crate) context: *mut llama_context,
-    /// Cached vocab size from the source model — used to size logit slices.
+    /// The model this context was created from.
+    ///
+    /// A `llama_context` holds `const llama_model &` for its entire
+    /// life, so it must never outlive the weights. Holding a handle
+    /// (a refcount bump — see [`LlamaCppModel`]) is what makes that
+    /// structural instead of a drop-order convention the caller could
+    /// break without writing `unsafe` (issue #54).
+    model: LlamaCppModel,
+    /// Cached vocab size from the source model — used to size logit
+    /// slices. Cached rather than read from `model` per call purely to
+    /// keep an FFI hop out of [`Self::logits`], which the sampling
+    /// loop hits once per token.
     n_vocab: usize,
     /// Cached embedding dimension from the source model. Reported by
     /// [`Self::embedding_size`]; **not** the slice stride — see
@@ -194,6 +203,11 @@ unsafe impl Send for LlamaCppDecoder {}
 impl LlamaCppDecoder {
     /// Create a decoder bound to `model` with the given context params.
     ///
+    /// The decoder keeps a handle on `model`, so the weights outlive
+    /// the context no matter what the caller does with its own handle.
+    /// Two decoders built from clones of one handle share a single
+    /// copy of the weights and pay only for their own KV caches.
+    ///
     /// Handles the llama.cpp backend lifecycle: on the first-ever
     /// decoder (`ENGINE_COUNT` transitions 0→1) runs
     /// `llama_backend_init` + `llama_numa_init`. Subsequent decoders
@@ -203,7 +217,7 @@ impl LlamaCppDecoder {
     /// backend torn down if we were the first). The caller can
     /// retry without double-init.
     pub fn new(
-        model: &mut LlamaCppModel,
+        model: &LlamaCppModel,
         context_params: llama_context_params,
         numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
@@ -229,9 +243,12 @@ impl LlamaCppDecoder {
             }
         }
 
-        // SAFETY: `model` is live (borrowed `&mut`) and outlives the
-        // context — `Engine` declares `decoder` before `model` so drop
-        // order tears the context down first.
+        // SAFETY: `model` is live for the call, and the handle we
+        // store below keeps it live for as long as the context exists.
+        // `as_ptr_mut` is sound here specifically because
+        // `llama_init_from_model` only reads the model before binding
+        // it to the context's `const llama_model &` — the non-const in
+        // its signature is vestigial (see `ModelInner`'s `Sync` note).
         let context = unsafe {
             llama_init_from_model(model.as_ptr_mut(), context_params)
         };
@@ -257,14 +274,26 @@ impl LlamaCppDecoder {
             context,
             n_vocab: model.n_vocab() as usize,
             embedding_size: model.embedding_size() as usize,
-            // SAFETY: `model` is live for the call (we hold `&mut` to
-            // it) and this only reads cached hparams.
+            // SAFETY: `model` is live for the call and this only reads
+            // cached hparams.
             embedding_size_out: unsafe {
                 llama_model_n_embd_out(model.as_ptr())
             } as usize,
+            model: model.clone(),
             seq_snapshots: SnapshotStore::default(),
             seq_snapshots_enabled: needs_snapshots,
         })
+    }
+
+    /// The model this decoder's context was created from.
+    ///
+    /// The decoder holds its own handle, so this stays valid even
+    /// after every other handle has been dropped — which is what makes
+    /// a standalone decoder usable on its own (tokenize, look up
+    /// special tokens) without threading a second `LlamaCppModel`
+    /// alongside it.
+    pub fn model(&self) -> &LlamaCppModel {
+        &self.model
     }
 
     /// Raw pointer to the underlying llama.cpp context (const).
@@ -273,7 +302,10 @@ impl LlamaCppDecoder {
     }
 
     /// Raw pointer to the underlying llama.cpp context (mut).
-    pub fn context_ptr_mut(&self) -> *mut llama_context {
+    ///
+    /// Takes `&mut self` so the exclusivity the pointer implies is
+    /// actually held — the same reason [`Self::decode`] does.
+    pub fn context_ptr_mut(&mut self) -> *mut llama_context {
         self.context
     }
 
@@ -631,6 +663,12 @@ impl LlamaCppDecoder {
 
 impl Drop for LlamaCppDecoder {
     fn drop(&mut self) {
+        // Teardown order is airtight without depending on field
+        // order: a manual `Drop::drop` runs to completion *before* any
+        // field is dropped, so the context is freed here and only then
+        // is the `model` handle released (freeing the weights if this
+        // was the last handle).
+        //
         // `llama_free` deliberately runs *outside* the guard: holding
         // it across context teardown would let a concurrent `new`
         // race init against free.
@@ -789,5 +827,93 @@ impl Decoder for LlamaCppDecoder {
     ) -> Result<(), MemoryRmError> {
         self.seq_snapshots.forget((seq_id, pos));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llama_cpp::LlamaCppEngine;
+
+    const PROMPT: &str = "The quick brown fox jumps over the lazy dog.";
+
+    fn model() -> LlamaCppModel {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models/model.gguf");
+        LlamaCppModel::from_file(path, None).expect("model load failed")
+    }
+
+    /// A decoder keeps its own handle on the model, so the context
+    /// stays valid after the caller drops the handle it built from
+    /// (issue #54). Before the model became refcounted this was a
+    /// use-after-free: `llama_context` holds `const llama_model &` for
+    /// its whole life, and dropping the last `LlamaCppModel` freed the
+    /// weights out from under it.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn decoder_outlives_model_handle() {
+        let model = model();
+        let mut decoder = LlamaCppDecoder::new(
+            &model,
+            LlamaCppEngine::default_context_params(),
+            None,
+        )
+        .expect("context creation failed");
+
+        // Consume the caller's handle entirely; only the decoder's
+        // remains. `into_raw` returning `None` is the *deterministic*
+        // half of this test — it proves the decoder holds a strong
+        // reference of its own. The prefill below is the behavioural
+        // half, but a use-after-free is UB and is not guaranteed to
+        // manifest as a crash we could assert on, so it cannot carry
+        // the test alone.
+        assert!(
+            model.into_raw().is_none(),
+            "the decoder does not hold a handle on the model — its \
+             context can outlive the weights (issue #54)",
+        );
+
+        let tokens = decoder.model().tokenize(PROMPT, true);
+        assert!(tokens.len() >= 4, "prompt tokenization too short");
+        decoder
+            .prefill_inherent(&tokens, 0, 0)
+            .expect("prefill failed");
+
+        let logits = decoder.logits(tokens.len() - 1);
+        assert_eq!(logits.len(), decoder.n_vocab());
+        assert!(
+            logits.iter().all(|l| l.is_finite()),
+            "non-finite logits: the context is reading freed weights",
+        );
+    }
+
+    /// Two contexts over one copy of the weights — what the refcounted
+    /// handle buys beyond the safety fix. Loading the GGUF twice would
+    /// cost two full weight allocations; cloning the handle costs each
+    /// decoder only its own KV cache. Also exercises `ENGINE_COUNT`
+    /// with two live contexts (backend init once, freed on the last
+    /// drop).
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn two_decoders_share_one_model() {
+        let model = model();
+        let params = LlamaCppEngine::default_context_params();
+        let mut a = LlamaCppDecoder::new(&model, params, None)
+            .expect("first context creation failed");
+        let mut b = LlamaCppDecoder::new(&model, params, None)
+            .expect("second context creation failed");
+
+        let tokens = model.tokenize(PROMPT, true);
+        a.prefill_inherent(&tokens, 0, 0).expect("prefill a failed");
+        b.prefill_inherent(&tokens, 0, 0).expect("prefill b failed");
+
+        // Same weights, same prompt, same positions: the two contexts
+        // must agree. (Same-backend, same-process, so this is an
+        // equality check, not a tolerance one.)
+        assert_eq!(
+            a.logits(tokens.len() - 1),
+            b.logits(tokens.len() - 1),
+            "two contexts over one model disagreed on the same prompt",
+        );
     }
 }

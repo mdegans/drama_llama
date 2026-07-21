@@ -61,15 +61,14 @@ impl LlamaCppEngine {
         context_params: Option<llama_context_params>,
         numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
-        let mut model =
-            match LlamaCppModel::from_file(path.clone(), model_params) {
-                Some(m) => m,
-                None => return Err(NewError::Model { path }),
-            };
+        let model = match LlamaCppModel::from_file(path.clone(), model_params) {
+            Some(m) => m,
+            None => return Err(NewError::Model { path }),
+        };
         let context_params =
             context_params.unwrap_or_else(Self::default_context_params);
         let decoder =
-            LlamaCppDecoder::new(&mut model, context_params, numa_strategy)?;
+            LlamaCppDecoder::new(&model, context_params, numa_strategy)?;
         #[allow(unused_mut)]
         let mut engine = Self {
             vision: None,
@@ -200,7 +199,7 @@ impl LlamaCppEngine {
     }
 
     /// Raw pointer to the underlying llama.cpp context (mut).
-    pub fn context_ptr_mut(&self) -> *mut llama_context {
+    pub fn context_ptr_mut(&mut self) -> *mut llama_context {
         self.decoder.context_ptr_mut()
     }
 

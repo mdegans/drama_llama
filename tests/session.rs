@@ -119,8 +119,8 @@ fn complete_text_strawberry_turn_2() {
     assert!(!out.trim().is_empty(), "got empty output");
     let eos = session
         .engine()
-        .model
-        .token_to_piece(session.engine().model.eos());
+        .model()
+        .token_to_piece(session.engine().model().eos());
     assert!(
         !out.ends_with(eos.as_str()),
         "EOS piece {eos:?} should have been trimmed; got: {out:?}"

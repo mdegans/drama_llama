@@ -179,8 +179,8 @@ where
     B: Backend,
     F: FnMut(usize, &[TokenData]) -> Token,
 {
-    let prompt_tokens = engine.model.tokenize(PROMPT, false);
-    let n_vocab = engine.model.n_vocab();
+    let prompt_tokens = engine.model().tokenize(PROMPT, false);
+    let n_vocab = engine.model().n_vocab();
 
     let mut topk: Vec<Vec<TokenData>> = Vec::with_capacity(N_STEPS);
     let mut fed: Vec<Token> = Vec::with_capacity(N_STEPS);
@@ -295,7 +295,7 @@ fn moeflux_matches_llama_cpp() {
     eprintln!("loading {gguf:?}");
     let mut llama_engine =
         LlamaCppEngine::from_path(gguf.clone()).unwrap().quiet();
-    eprintln!("  n_vocab={}", llama_engine.model.n_vocab());
+    eprintln!("  n_vocab={}", llama_engine.model().n_vocab());
     eprintln!("  n_ctx={}", llama_engine.n_ctx());
     let llama = capture(&mut llama_engine, |_step, top| top[0].id);
     let reference: Vec<Token> = llama.fed.clone();
@@ -311,7 +311,7 @@ fn moeflux_matches_llama_cpp() {
             false,
         )
         .expect("MoefluxEngine::from_paths");
-        eprintln!("  n_vocab={}", engine.model.n_vocab());
+        eprintln!("  n_vocab={}", engine.model().n_vocab());
         eprintln!("  n_ctx={}", engine.n_ctx());
         capture(&mut engine, |step, _top| reference[step])
     };
@@ -329,7 +329,7 @@ fn moeflux_matches_llama_cpp() {
 
     // Every step is now a like-for-like comparison: same context, two
     // backends, two distributions.
-    let piece = |t: Token| llama_engine.model.token_to_piece(t);
+    let piece = |t: Token| llama_engine.model().token_to_piece(t);
     let steps: Vec<Step> = (0..N_STEPS)
         .map(|i| {
             let (l, m) = (&llama.topk[i], &moeflux.topk[i]);

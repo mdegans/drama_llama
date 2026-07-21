@@ -318,7 +318,7 @@ async fn main() {
         };
 
         'outer: while let Some(request) = from_client.blocking_recv() {
-            let tokens = engine.model.tokenize(&request.text, false);
+            let tokens = engine.model().tokenize(&request.text, false);
 
             let chunk_size = tokens.len() / request.chunks;
 
@@ -328,7 +328,7 @@ async fn main() {
                 let percent_of_tokens = i * chunk_size * 100 / tokens.len();
                 next_chunk(percent_of_tokens);
                 send_prefix(
-                    engine.model.tokens_to_string(chunk.iter().cloned()),
+                    engine.model().tokens_to_string(chunk.iter().cloned()),
                 );
                 let chunk = chunk.to_vec();
                 let mut completion = Vec::with_capacity(ground_truth.len());
@@ -378,10 +378,11 @@ async fn main() {
                     }
                 }
 
-                let ground_truth =
-                    engine.model.tokens_to_string(ground_truth.iter().cloned());
+                let ground_truth = engine
+                    .model()
+                    .tokens_to_string(ground_truth.iter().cloned());
                 let completion =
-                    engine.model.tokens_to_string(completion.iter().cloned());
+                    engine.model().tokens_to_string(completion.iter().cloned());
 
                 update_string_similarity(ground_truth, completion);
             }

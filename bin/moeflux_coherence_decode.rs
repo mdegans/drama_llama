@@ -142,11 +142,11 @@ fn main() {
         Err(e) => emit_error(format!("MoefluxEngine::from_paths failed: {e}")),
     };
 
-    let n_vocab = engine.model.n_vocab();
-    let stop_set: Vec<Token> = engine.model.eog_tokens();
+    let n_vocab = engine.model().n_vocab();
+    let stop_set: Vec<Token> = engine.model().eog_tokens();
 
     // -- tokenize --
-    let prompt_tokens: Vec<Token> = engine.model.tokenize(prompt_str, false);
+    let prompt_tokens: Vec<Token> = engine.model().tokenize(prompt_str, false);
     if prompt_tokens.is_empty() {
         emit_error(format!(
             "tokenization produced 0 tokens for {prompt_str:?}"

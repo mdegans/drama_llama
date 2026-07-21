@@ -20,12 +20,29 @@ use std::num::NonZeroUsize;
 /// parameter. Use the `LlamaCppEngine` / `MoefluxEngine` type aliases
 /// (feature-gated) for the common backends.
 ///
+/// **Why the two live in one type:** a decoder's context borrows from
+/// the model on backends that have one (llama.cpp's `llama_context`
+/// keeps a `const llama_model &` for its whole life), so their
+/// lifetimes have to coincide. Co-owning them here is what makes that
+/// true by construction — it is the reason this type exists, not an
+/// incidental convenience. That rationale was lost once and cost a
+/// use-after-free reachable from safe code: the `model` field had
+/// become `pub`, so `engine.model = other` dropped the weights in
+/// place while the decoder still pointed at them (issue #54). Keep
+/// both fields non-public, and if a future backend needs the model
+/// reachable in some new way, add an accessor rather than reopening
+/// the field.
+///
 /// Field declaration order (`vision`, then `decoder`, then `model`)
-/// matters for Drop: Rust drops fields in declaration order, so the
-/// vision context (which references the model and allocates through
-/// the live backend) is freed first, then the decoder's context —
-/// tearing the backend down if it was the last decoder — and the
-/// model last. This matches llama.cpp's expected ordering.
+/// is the natural teardown order — vision context, then decoder
+/// context (tearing the backend down if it was the last decoder),
+/// then the model — but it is no longer load-bearing. It used to be:
+/// a backend whose contexts borrow the model relied on this order and
+/// nothing else, so a routine field reorder was a silent
+/// use-after-free (issue #54). Backends now hold their own handle on
+/// the model (llama.cpp: `LlamaCppModel` is a refcounted handle that
+/// `LlamaCppDecoder` and `Mtmd` each clone), so the weights outlive
+/// whatever refers to them regardless of the order here.
 ///
 /// `Engine<B>` is `Send` whenever `B::Vision`, `B::Decoder` and
 /// `B::Model` are — which they are by `Backend`'s associated-type
@@ -38,10 +55,15 @@ pub struct Engine<B: Backend> {
     /// the uninhabited [`crate::NoVision`].
     pub(crate) vision: Option<B::Vision>,
     pub(crate) decoder: B::Decoder,
-    /// The model. Public so callers (e.g. Session) can tokenize, look
-    /// up special tokens, and render chat templates without going
-    /// through Engine forwarding methods.
-    pub model: B::Model,
+    /// The model. Read it through [`Engine::model`].
+    ///
+    /// Deliberately not public: replacing it would leave a tokenizer
+    /// and chat template that disagree with a KV cache built from the
+    /// *previous* model — silent garbage output rather than an error.
+    /// (Before the model became a refcounted handle it was worse than
+    /// that: assignment dropped the old model in place while the
+    /// decoder's context still pointed at it.)
+    pub(crate) model: B::Model,
     /// Optional per-token probe-mode hook. See [`crate::ProbeHook`]
     /// and [`Self::set_probe_hook`].
     pub(crate) probe_hook: Option<Box<dyn ProbeHook>>,
@@ -72,6 +94,12 @@ impl<B: Backend> Engine<B> {
     /// for the contract. Pass `None` to clear an installed hook.
     pub fn set_probe_hook(&mut self, hook: Option<Box<dyn ProbeHook>>) {
         self.probe_hook = hook;
+    }
+
+    /// The model: tokenization, vocab introspection, chat template,
+    /// metadata. See [`crate::Model`].
+    pub fn model(&self) -> &B::Model {
+        &self.model
     }
 
     /// Context length (tokens).

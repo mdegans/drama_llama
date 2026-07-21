@@ -145,11 +145,11 @@ fn capture() -> Golden {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
     let mut engine = LlamaCppEngine::from_path(path).unwrap().quiet();
 
-    let prompt_tokens = engine.model.tokenize(PROMPT, true);
+    let prompt_tokens = engine.model().tokenize(PROMPT, true);
     let meta = ModelMeta {
-        n_vocab: engine.model.n_vocab(),
-        architecture: engine.model.get_meta("general.architecture"),
-        context_size: engine.model.context_size(),
+        n_vocab: engine.model().n_vocab(),
+        architecture: engine.model().get_meta("general.architecture"),
+        context_size: engine.model().context_size(),
     };
 
     let mut step_0_raw: Option<Vec<TokenData>> = None;
@@ -184,7 +184,7 @@ fn capture() -> Golden {
         raw.into_iter()
             .map(|td| TopK {
                 token: td.id,
-                piece: engine.model.token_to_piece(td.id),
+                piece: engine.model().token_to_piece(td.id),
                 logit: td.logit,
             })
             .collect()
@@ -196,7 +196,7 @@ fn capture() -> Golden {
         topk_to_entries(step_n_raw.expect("step N never captured"));
     let pieces: Vec<String> = tokens
         .iter()
-        .map(|&t| engine.model.token_to_piece(t))
+        .map(|&t| engine.model().token_to_piece(t))
         .collect();
 
     Golden {

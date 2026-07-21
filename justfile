@@ -7,20 +7,25 @@
 # portable (macOS and CI don't drag in the nvcc/C build), while `just` still
 # gives the batteries-included, GPU-accelerated dev loop on Linux.
 
-# Shared library/test feature set. `test` and `test full` use the GPU set;
+# Shared library/test feature set — every doc-visible feature, so the gates
+# cover the whole public surface. `test` and `test full` use the GPU set;
 # `test cpu` is the same set minus `cuda`. Keeping the rest identical means the
 # llama.cpp build is NOT evicted when switching between `test` and `test full`
 # (the nvcc-rebuild trap — one feature set per GPU session).
-base_features := "cli,toml,axum,serde,stats,json-schema,mtmd"
+#
+# `webchat` and `egui` were left out originally on the theory that they're UI
+# glue; that just meant a library API change could break them without any gate
+# noticing (caught during #54, where `Engine::model` went private). They cost
+# ~30s of dependency compilation once and nothing thereafter, which is not
+# worth the blind spot.
+base_features := "cli,toml,axum,serde,stats,json-schema,mtmd,webchat,egui"
 gpu_features  := base_features + if os() == "linux" { ",cuda" } else { "" }
 
 # Feature set for the rustdoc gate (`just doc` / `just check`). Held to
 # `base_features` so the doc build REUSES the `just test` compilation on macOS
 # (rustdoc pass only, no recompile) — a pre-commit doc gate is only worth it if
-# it's ~free. Covers the whole library surface including mtmd; the webchat/egui
-# -only items are UI glue and currently add no doc warnings. Full-surface sweep
-# before a release:
-#   cargo doc --no-deps --features "webchat,cli,stats,toml,serde,egui,mtmd"
+# it's ~free. That set is now the full doc-visible surface, so this is also the
+# release sweep; there is no longer a wider set to run by hand.
 doc_features := base_features
 
 # moeflux is macOS-only (Metal kernels) and selects its model at COMPILE time —

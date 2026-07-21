@@ -482,7 +482,7 @@ where
     let mut session = match lock.take() {
         Some(session) => {
             let display =
-                session.engine().model.display_name().unwrap_or_default();
+                session.engine().model().display_name().unwrap_or_default();
             if display == prompt.model.to_string() {
                 session
             } else {
@@ -598,7 +598,7 @@ fn configure_session<B: Backend>(
         seed = seed.map(|n| n as u64),
         model = configured
             .engine()
-            .model
+            .model()
             .display_name()
             .unwrap_or_default()
             .as_str(),
@@ -632,7 +632,7 @@ fn install_per_request_hooks<B: Backend>(
     let mut hooks: Vec<Box<dyn ProbeHook>> = Vec::new();
     if let Some(tx) = record_json_tx {
         let model_name =
-            session.engine().model.display_name().unwrap_or_default();
+            session.engine().model().display_name().unwrap_or_default();
         hooks.push(Box::new(JsonlProbeRecorder::install(
             tx.clone(),
             model_name.as_str(),

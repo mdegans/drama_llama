@@ -71,7 +71,7 @@ fn greedy_continuation(
 fn state_seq_roundtrip_resumes_generation_identically() {
     let mut engine = engine();
     let tokens = engine
-        .model
+        .model()
         .tokenize("Once upon a time, in a land far away,", true);
     assert!(tokens.len() >= 2, "prompt must tokenize to >= 2 tokens");
 
@@ -111,7 +111,7 @@ fn forced_snapshot_restores_after_kv_wipe() {
     assert!(engine.seq_snapshots_enabled());
 
     let tokens = engine
-        .model
+        .model()
         .tokenize("The quick brown fox jumps over the lazy dog. Then", true);
     let (head_len, tail) = prefill_head(&mut engine, &tokens);
 
@@ -152,7 +152,7 @@ fn restore_without_snapshot_after_wipe_is_no_checkpoint() {
     let mut engine = engine();
     engine.set_seq_snapshots(true);
 
-    let tokens = engine.model.tokenize("Hello there, general", true);
+    let tokens = engine.model().tokenize("Hello there, general", true);
     let (head_len, _tail) = prefill_head(&mut engine, &tokens);
 
     // No checkpoint_pos call. Wipe and attempt a rewind.
@@ -176,7 +176,9 @@ fn forget_pos_and_memory_clear_free_snapshots() {
     let mut engine = engine();
     engine.set_seq_snapshots(true);
 
-    let tokens = engine.model.tokenize("Counting: one two three four", true);
+    let tokens = engine
+        .model()
+        .tokenize("Counting: one two three four", true);
     let mid = tokens.len() / 2;
     engine.memory_clear();
     engine.prefill_chunk(&tokens[..mid], 0, 0).expect("prefill");
@@ -209,7 +211,7 @@ fn forget_pos_and_memory_clear_free_snapshots() {
 fn global_state_roundtrip_resumes_generation_identically() {
     let mut engine = engine();
     let tokens = engine
-        .model
+        .model()
         .tokenize("List three colors of the rainbow:", true);
 
     let (head_len, tail) = prefill_head(&mut engine, &tokens);
