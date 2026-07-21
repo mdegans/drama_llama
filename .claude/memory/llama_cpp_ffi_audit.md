@@ -200,6 +200,12 @@ field order (`vision, decoder, model`) makes drop order correct for
 engine-owned instances — verified — but the standalone constructor is
 public and safe.
 
+**FIXED 2026-07-21 (#54), together with the `LlamaCppDecoder::new`
+twin below** — see the resolution note at the end of this memo. The
+audit *understated* this one: the shortest path to the UAF needed
+neither standalone constructor, because `Engine.model` was a `pub`
+field and assignment drops in place.
+
 ### 8. ABI claim is enforced against field *addition*, not *reorder*
 
 `backend.rs:8-11` claims "same size, same alignment, **same field
@@ -314,6 +320,7 @@ confirmed; whether a model in our fleet triggers it is not.
 - **`LlamaCppDecoder::new` doesn't tie its lifetime to the model** —
   `decoder.rs:143-147`. Same shape as 7(b); `Engine` is saved only by
   field declaration order, which is load-bearing and unwritten.
+  **FIXED 2026-07-21 (#54)** — resolution note at the end of this memo.
 - **`moeflux/model.rs:80,83`** — `unsafe impl Send`/`Sync` are no-ops
   (all fields already `Send + Sync`) that would silently mask a future
   `Rc`/`Cell`/raw-pointer addition. Delete both; `engine.rs:32` already
@@ -422,9 +429,65 @@ position). Same session closed [#57](https://github.com/mdegans/drama_llama/issu
 printed, wired into the round-trip fuzzer — the seed *replayed* #53's
 failure deterministically, which is the proof it works).
 
-Still open: #52 (design — decode hook + `Session` reconciliation), #54
-(lifetime coupling; wants a design call — lifetime param vs `Arc` vs
-explicit `Drop`), #55 (streaming session).
+**Follow-up pass (2026-07-21) — [#54](https://github.com/mdegans/drama_llama/issues/54)
+CLOSED, finding 7(b) + the `LlamaCppDecoder::new` twin.**
+`LlamaCppModel` is now a refcounted handle — `LlamaCppModel(Arc<ModelInner>)`,
+where the private `ModelInner` owns the `*mut llama_model` and frees it
+on drop. `LlamaCppDecoder` and `Mtmd` each store a clone, so a
+`llama_context` structurally cannot outlive the weights it references.
+Notes for whoever audits next:
+
+- **The `pub model` field was the real hole**, not the constructors.
+  `engine.model = other` dropped the old model in place while the
+  decoder's context still held `const llama_model &` to it — two lines,
+  all `pub`, no `unsafe`. Now `pub(crate)` + `Engine::model()`. Post-fix
+  the reason to keep it private is *coherence*, not safety: swapping the
+  handle would leave a tokenizer disagreeing with a KV cache built from
+  the previous weights (silent garbage, worse than a crash).
+- **How it got there, per Mike (2026-07-21): co-owning the decoder and
+  the model so their lifetimes coincide was the entire original purpose
+  of `Engine`.** That rationale was never written down, so it decayed —
+  the field went `pub` at some later point and nothing flagged it,
+  because nothing recorded what the type was *for*. The general lesson
+  is the one worth carrying: an invariant that lives only in a
+  reviewer's head is one refactor from gone, and the failure is silent
+  by construction. The purpose is now stated on the `Engine` struct doc
+  itself (`src/engine.rs`), where a future editor reaching for `pub`
+  will hit it.
+- **`Sync` was re-verified, not assumed**, because `Clone` makes shared
+  access reachable rather than hypothetical. `llama_context` stores
+  `const llama_model &` (llama-context.h:276); no `mutable` members in
+  llama-model.h / llama-vocab.h; `llama_init_from_model`'s non-const
+  `llama_model *` is vestigial (body is reads-only before binding to
+  the const ref). **The one model-mutating context call upstream is
+  `llama_opt_init`** (llama-context.cpp:3245, finetune): it writes
+  `hparams.n_ctx_train` and `llama_set_param`s every weight tensor.
+  Binding it into the safe surface would invalidate `unsafe impl Sync`.
+  That named exclusion now lives in the safety comment.
+- **Drop order is no longer load-bearing anywhere.** Both `Drop` impls
+  (`LlamaCppDecoder`, `Mtmd`) run to completion before their fields
+  drop, so the C handle is freed and only then is the model handle
+  released. `Engine`'s field-order comment was rewritten to say so —
+  leaving a comment claiming a load-bearing order that isn't is its own
+  trap.
+- **Upside, not just a fix:** cloning the handle gives N contexts over
+  one copy of the weights (on Metal, one unified-memory allocation
+  instead of N). `two_decoders_share_one_model` covers it.
+- **Test discipline:** `decoder_outlives_model_handle` asserts
+  `model.into_raw().is_none()` — a *deterministic* proof the decoder
+  holds a strong ref. Do not rely on the prefill-after-drop half alone:
+  a UAF is UB and is not guaranteed to manifest as a crash you can
+  assert on.
+- API breaks taken (zero in-tree callers): `into_raw` → `Option`,
+  `as_ptr_mut` → `pub unsafe fn (&self)` (a `&mut` on a shared handle
+  would be a lie), `context_ptr_mut` → `&mut self`.
+- Also in this pass: `webchat` and `egui` joined the justfile feature
+  sets. They were omitted as "UI glue", which meant a library API change
+  could break the bins with no gate noticing — this change did exactly
+  that, and only `cargo check --all-targets` caught it.
+
+Still open: #52 (design — decode hook + `Session` reconciliation),
+#55 (streaming session).
 
 ### Methodology note — do not repeat this mistake
 
