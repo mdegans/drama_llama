@@ -73,6 +73,40 @@ frame Gemma identifies correctly and GPT collapses to 6.2%. GPT only
 wins when the model must emit a **bare name token** — which is exactly
 what "just the name, please" demands.
 
+### Both axes matter — the full grid
+
+The table above is all *raw* framing, and reading it as "frame is the
+whole story" was an over-correction (Mike caught it). Completing the
+grid, usable cells only:
+
+| framing | prefix | winner | Gemma | GPT | Σ |
+|---|---|---|---|---|---|
+| **chat** | *(bare)* | **GPT 95.23** | 4.22 | 95.23 | 0.999 |
+| **chat** | `My name is` | **GPT 29.34** | **2.90** | 29.34 | 0.209 |
+| raw | *(bare)* | **GPT 61.57** | ~4 | 61.57 | 0.878 |
+| raw | `My name is` | **Gemma 52.68** | 52.68 | 6.24 | 0.388 |
+| raw | `I am` | **Gemma 70.11** | 70.11 | 15.58 | 0.024 |
+| raw | `You are speaking to` | **GPT 46.53** | 23.82 | 46.53 | 0.226 |
+
+(chat + `You are speaking to` and chat + `I am` return Σ=4e-5 / 9e-6 —
+noise, not measurements.)
+
+**Under its own chat template Gemma never wins**, even first-person
+framed (2.90%, rank 10). Under raw completion with a first-person frame
+it wins outright. So both axes are real: the template pushes hard toward
+GPT, and *within* raw the frame decides.
+
+Where the knowledge lives, as a hypothesis that fits the shape: raw
+completion is the pretraining distribution — model cards, HF READMEs,
+docs, blog posts, all saying "Gemma" constantly — and that is where the
+name is. The English *assistant persona* the template invokes was tuned
+on self-descriptions that name the maker and never the model, so inside
+that persona the English prior fills the gap. The knowledge is not
+missing; the persona does not reach it.
+
+Which is the uncomfortable version: **applying the model's own chat
+template makes it less able to identify itself than raw completion.**
+
 So the accurate claim is *not* "Gemma thinks it is GPT in English". It is
 **Gemma's English name knowledge exists but is weak enough to lose to the
 pretraining prior in the most natural phrasing.** The original result is
