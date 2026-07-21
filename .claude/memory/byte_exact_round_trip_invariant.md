@@ -144,6 +144,56 @@ defense-in-depth on both.
     + re-align grammar/render/minijinja + re-close the duplicate-optional
     hole that sorting currently closes.
 
+## 2026-07-21 PM: #61 materially closed by the #37 region ban
+
+The unexpected answer to #61 was **not** any of the four options listed
+in that issue. It was **#37** — forbidding emission of frame specials
+inside permissive constraint regions (`dd18157`).
+
+Mechanism: #61's garbage is marker-shaped text (`<tool_call>`,
+`</think>`, `</function>`) stuffed into an unbounded `until()` value.
+Those markers were reachable as **single special ids** because
+`emit_ban_set` exempts anything overlapping a dialect marker — an
+exemption that is correct at frame positions and wrong everywhere else.
+Banning them where frames are illegal removes the model's cheapest path
+into the weeds.
+
+**Controlled A/B** (both sweeps back-to-back, same thermal state — #61
+warns heat is a confound, so a one-sided sweep proves nothing):
+
+| seeds | clean HEAD | with region ban |
+|---|---|---|
+| 1,2,3,4,5,8,12345 | PASS | PASS |
+| **6, 7** | **FAIL** | **PASS** |
+
+7/9 → 9/9, and the two recovered seeds are exactly the two failing ones.
+Note clean HEAD scored better than #58's historical 4/9 — intervening
+fixes (`call_separator`, #53 parser, #59) had already recovered several,
+so don't compare against the memo's old numbers, only against a
+same-session control.
+
+**Residual, deliberately not closed:** a model can still *byte-spell*
+`<tool_call>` inside a string. Ingest re-tokenizes with `parse_special`
+and rejects it identically, so relay boundaries still need their own
+policy. The ban removes the single-token path, which is the one the
+model actually takes.
+
+**The reusable lesson:** the permissive-region predicate built for the
+constrained-repetition arc (`src/sample/region.rs`) turned out to be the
+load-bearing piece of a completely different fix. `ConstraintGuard::build`
+returning `Some` *is* the "are frames legal here?" predicate, and
+`is_protected` *is* the "is this token an exit delimiter?" predicate.
+Before building a region query, check whether that module already answers
+it.
+
+Also settled while verifying: **EOG is already forbidden mid-constraint**,
+region-independently — `grammar_filter` (`grammar.rs:2129`) and
+`accepts_chosen` (`state.rs:460`) both keep a mid-constraint EOG only if
+its own bytes *complete* the constraint. So "must close `</think>` before
+stopping" holds wherever a grammar is active. This makes **#38's defect 2
+stale** (noted on that issue) and scopes the real gap to the un-grammared
+lazy pre-trigger span, filed as **#64**.
+
 ## What's actually left (revised 2026-07-20 PM after the fix)
 
 The gen-prompt-vs-completed-turn scaffold-asymmetry hypothesis was
@@ -151,15 +201,15 @@ WRONG (the scaffold matches). What remains:
 
 1. **#58 multi-call separator: DONE** (`call_separator`, above). The
    deterministic greedy round-trip test is the reliable byte-exact gate.
-2. **#61 grammar-legal garbage under sampling: OPEN.** Options in the
-   issue; leaning "scope the invariant to well-formed emissions (greedy
-   test is the gate) + maybe lower forced-region temp" over the
-   expensive parser↔grammar boundary-alignment. NOTE the tension: the
-   old fuzzer `complete_text_round_trips_through_parse_and_render` uses
-   *sampled* output, so it stays intermittently red on garbage seeds —
-   it now tests #61, not #58. Decide with Mike whether to convert it to
-   greedy, keep it as a known-flaky canary, or delete it in favor of the
-   greedy test.
+2. **#61 grammar-legal garbage under sampling: MATERIALLY CLOSED
+   2026-07-21** by #37's region ban — see the section above. None of the
+   four options in the issue was the answer. **Keep the sampled fuzzer**
+   (`complete_text_round_trips_through_parse_and_render`) rather than
+   converting it to greedy: Mike, 2026-07-21 — "those tests fuzz so they
+   find things we didn't think of," and an increased pass rate is the
+   bar, not a green-every-seed guarantee. The deterministic
+   `multi_call_round_trips_under_greedy` remains the hard byte-exact gate;
+   the fuzzer is the discovery instrument.
 3. **#60 declaration-order args: OPEN**, its own session.
 4. **Residual Auto+unclosed-think: DECIDED — cache-safe repair** (above);
    fuller mechanism is [#59](https://github.com/mdegans/drama_llama/issues/59).

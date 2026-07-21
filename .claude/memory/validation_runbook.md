@@ -5,6 +5,32 @@ Everything here was verified on disk that day. This is the
 "how do I actually run all the model-touching stuff" reference;
 the per-release checklist lives in the publish-session plan memos.
 
+## Never run model-backed tests with `cargo test`
+
+**Use `just test` (unignored) and `just test full` (the `#[ignore]`d
+model/GPU tests).** Both go through `cargo-nextest`, which runs each test
+in its own process; the `full` profile serializes them.
+
+`cargo test` overlaps test *binaries* — and `--test-threads=1` does not
+fix it, since that only serializes *within* one binary. With a ~19 GB
+model per test you get memory exhaustion surfacing as a llama.cpp decode
+failure:
+
+```
+thread '<varies>' panicked at src/predictor.rs:443:
+decoder.step failed: Fatal { code: -3 }
+```
+
+Diagnostic tell: **the failing test changes between runs** while the
+pass/fail counts stay identical (48 passed / 1 failed, different test each
+time). That is the harness, not the code — re-run the single test alone
+to confirm before suspecting a regression. Burned ~10 minutes of model
+runs on this 2026-07-21; Mike called it out.
+
+Single-binary invocations (`cargo test --test session -- --ignored`) do
+happen to work, because that is one binary and those tests are `serial`.
+Not worth relying on — just use `just`.
+
 ## Model inventory (this machine)
 
 | Path | What |
