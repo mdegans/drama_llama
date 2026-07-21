@@ -891,9 +891,10 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         // it; that is a deliberate, documented exemption — no oracle
         // can observe it. Inputs are byte-identical to what the old
         // top-of-next-call checks saw: the token tail is checked as if
-        // `next_token` were already recorded, and the stop-string
-        // window start compensates for the not-yet-recorded token
-        // (`+ 1`).
+        // `next_token` were already recorded. The stop-string window
+        // needs no such compensation — `self.text` already carries this
+        // token's bytes (pushed above), and the window is sized in
+        // bytes off that text, not in tokens (#65).
         let decoded_tokens =
             &self.inner.tokens[self.inner.tokens.len() - self.inner.n_decode..];
         let stopped_by_sequence =
@@ -908,12 +909,16 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         // Beginning of the end to check for stop strings. We don't want to
         // check the entire text because context lengths are getting long and
         // users might use many stop strings.
-        let end = (self.inner.tokens.len() + 1).saturating_sub(
-            self.max_stop_len + self.inner.engine.model.max_token_len(),
+        let end = stop_window_start(
+            &self.text,
+            self.max_stop_len,
+            self.inner.engine.model.max_token_len(),
         );
-        let stopped_by_string = self.options.stop_strings.iter().any(|s| {
-            self.text.get(end..).is_some_and(|slice| slice.contains(s))
-        });
+        let stopped_by_string = self
+            .options
+            .stop_strings
+            .iter()
+            .any(|s| self.text[end..].contains(s));
         let stopped_by_regex = self
             .options
             .regex_stop_sequences
@@ -996,6 +1001,34 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
 
         Some(next_token)
     }
+}
+
+/// Byte offset at which a stop-string search over `text` may begin: the
+/// trailing `max_stop_len + max_token_len` bytes, walked back to a char
+/// boundary. Keeps the per-step cost bounded as generation grows.
+///
+/// **Bytes, not tokens** (issue #65). The window used to be sized from
+/// `CandidatePredictor::tokens.len()` — a *prompt-inclusive token
+/// count* — and then used as a byte index into generated-bytes-only
+/// text. For any prompt longer than the window that produced an offset
+/// past the end of the text, `str::get` returned `None`, and early
+/// stop-string termination silently never fired. On an Agora-scale
+/// prompt it never fired at all.
+///
+/// The char-boundary walk-back is load-bearing on its own: `str::get`
+/// and `str` indexing both reject a non-boundary offset, so without it
+/// the same silent failure returns intermittently, mid-codepoint. It
+/// always terminates — offset 0 is a boundary by definition.
+fn stop_window_start(
+    text: &str,
+    max_stop_len: usize,
+    max_token_len: usize,
+) -> usize {
+    let mut end = text.len().saturating_sub(max_stop_len + max_token_len);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Window-bounded search: returns the byte offset one past the last byte of
@@ -1187,26 +1220,23 @@ impl<'engine, B: Backend> Iterator for PiecePredictor<'engine, B> {
                 // string at the end of the loop. If we don't truncate the text,
                 // anything that follows the stop string will be included in the
                 // text.
-                let mut end = self.inner.inner.tokens.len().saturating_sub(
-                    self.inner.max_stop_len
-                        + self.inner.inner.engine.model.max_token_len(),
-                );
-
+                // Recomputed per stop string, not hoisted: a truncation
+                // below shortens `text`, and a stale offset past the new
+                // end would panic on the next iteration's slice. The old
+                // code got away with hoisting only because its offset was
+                // a token count that the char-boundary walk-back happened
+                // to clamp back into range — which is also why this site
+                // never truncated anything on a long prompt (#65).
                 for s in self.inner.options.stop_strings.iter() {
-                    // It's possible at this point that `end` does not lie on a
-                    // character boundary, so we move backwards until we find a
-                    // character boundary.
-                    while !self.inner.text.is_char_boundary(end) {
-                        if end == 0 {
-                            break;
-                        }
-                        end -= 1;
-                    }
-
+                    let end = stop_window_start(
+                        &self.inner.text,
+                        self.inner.max_stop_len,
+                        self.inner.inner.engine.model.max_token_len(),
+                    );
                     if let Some(idx) = self.inner.text[end..].find(s) {
-                        self.inner.text.truncate(
-                            (end + idx + s.len()).min(self.inner.text.len()),
-                        );
+                        // In range by construction: `idx + s.len()` is
+                        // bounded by the length of the slice it was found in.
+                        self.inner.text.truncate(end + idx + s.len());
                     }
                 }
 
@@ -1436,6 +1466,54 @@ mod tests {
         let hay = b"anything";
         let got = super::find_deferred_trigger_end(hay, b"", 64);
         assert_eq!(got, None);
+    }
+
+    /// #65: the window is sized in **bytes off the generated text**. It
+    /// used to be sized off a prompt-inclusive token count, so on any
+    /// prompt longer than the window the offset ran past the end of the
+    /// text and early stop-string termination silently never fired.
+    ///
+    /// The regression shape to keep in mind: the offset must never
+    /// depend on how long the prompt was. These cases pin that by
+    /// construction — nothing here knows about a prompt at all.
+    #[test]
+    fn stop_window_start_is_sized_in_bytes_not_tokens() {
+        // Text shorter than the window: scan all of it.
+        assert_eq!(super::stop_window_start("short", 8, 16), 0);
+
+        // Text longer than the window: scan exactly the trailing
+        // `max_stop_len + max_token_len` bytes.
+        let text = "a".repeat(100);
+        assert_eq!(super::stop_window_start(&text, 8, 16), 76);
+
+        // A stop string ending at the very end of the text is always
+        // inside the window, which is the property the sizing exists
+        // for.
+        let text = format!("{}STOP", "x".repeat(500));
+        let end = super::stop_window_start(&text, 4, 16);
+        assert!(text[end..].contains("STOP"));
+    }
+
+    /// The walk-back is not cosmetic: `str` indexing rejects a
+    /// non-boundary offset, so landing mid-codepoint would reintroduce
+    /// #65's silent failure intermittently. Terminates at 0, which is a
+    /// boundary by definition.
+    #[test]
+    fn stop_window_start_lands_on_a_char_boundary() {
+        // Multi-byte throughout, so a naive offset lands mid-codepoint.
+        let text = "é".repeat(50); // 100 bytes, 2 bytes per char
+        for max_stop_len in 0..12 {
+            let end = super::stop_window_start(&text, max_stop_len, 5);
+            assert!(
+                text.is_char_boundary(end),
+                "offset {end} splits a codepoint (max_stop_len={max_stop_len})",
+            );
+            // Must not panic, and must be usable as a slice start.
+            let _ = &text[end..];
+        }
+
+        // Degenerate: empty text, huge window.
+        assert_eq!(super::stop_window_start("", 1000, 1000), 0);
     }
 
     #[test]
