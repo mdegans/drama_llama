@@ -1574,6 +1574,74 @@ pub struct TopKEntry {
 /// (`MoefluxBackend`). Backend-specific constructors
 /// (`Session::<B>::from_path*`) live in specialized impl blocks; the
 /// rest of the API is generic.
+///
+/// # The round-trip invariant
+///
+/// The prefix cache is keyed on the rendered prompt. A finished
+/// assistant turn is parsed into [`Block`]s, and the *next* call
+/// re-renders those blocks back into the prompt. The cache only survives
+/// if that round-trip is byte-exact:
+///
+/// ```text
+/// render(parse(raw)) == raw
+/// ```
+///
+/// When it isn't, the re-rendered prefix diverges from what the model
+/// actually saw, every cached token past the divergence is unusable, and
+/// the turn re-prefills. Nothing is ever *corrupted* by a mismatch — the
+/// canonicalization gate falls back to a token-id longest-common-prefix
+/// walk — but it is expensive: the lost breakpoint often sits on
+/// system+tools, usually the largest part of the prompt, so a single
+/// mismatch can cost minutes on a long conversation.
+///
+/// ## What round-trips, and what cannot
+///
+/// **Prose round-trips for free.** A [`Block::Text`] renders back
+/// byte-for-byte.
+///
+/// **Complete structures round-trip by construction.** Reasoning and
+/// tool calls are emitted under a grammar that forces the same shape the
+/// template re-renders, down to the separator between consecutive calls.
+/// The parser cuts a tool-call argument at the first occurrence of its
+/// close delimiter — the identical rule the grammar's `until` uses — so a
+/// well-formed emission parses and re-renders to the same bytes even when
+/// its *content* is garbage.
+///
+/// **Incomplete structures round-trip only if the block type admits being
+/// open**, and exactly one does. Generation can always run out of budget
+/// mid-structure: a grammar constrains what is legal, never whether the
+/// model finishes.
+///
+/// * A **thought** is text, so "unclosed" is a representable state. A
+///   trailing [`Block::Thought`] may be marked open, in which case it
+///   renders without its close marker and the next call continues it
+///   instead of restarting. The same mechanism makes reasoning *prefill*
+///   work — seed a partial thought and the model continues from inside
+///   it. Legal only on the final block of a prompt; an open thought
+///   mid-history has no meaning.
+/// * A **tool call** is structure. [`Block::ToolUse`] carries its
+///   arguments as a `serde_json::Value`, and there is no such thing as
+///   half an object — a call truncated mid-emission has no representation
+///   and never will. Retaining the raw bytes is not an escape hatch: a
+///   frame marker sitting inside a [`Block::Text`] is rejected as an
+///   injection by the very next call that ingests the transcript.
+///
+/// So for a truncated tool call the entire solution space is: surface a
+/// typed error and let the caller retry, or strip the partial call and
+/// salvage the rest. Neither round-trips, and that follows from the data
+/// model rather than being a gap left to close later.
+///
+/// ## Practical mitigation
+///
+/// Place two cache breakpoints at the end of the prompt rather than one.
+/// A mismatch then invalidates a single message instead of everything
+/// back to the previous structural boundary, bounding the worst case to
+/// one re-prefilled message wherever the divergence lands.
+///
+/// [`Block`]: crate::Block
+/// [`Block::Text`]: crate::Block::Text
+/// [`Block::Thought`]: crate::Block::Thought
+/// [`Block::ToolUse`]: crate::Block::ToolUse
 pub struct Session<B: Backend> {
     engine: Engine<B>,
     template: ChatTemplate,

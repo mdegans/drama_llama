@@ -144,19 +144,63 @@ defense-in-depth on both.
     + re-align grammar/render/minijinja + re-close the duplicate-optional
     hole that sorting currently closes.
 
-## 2026-07-21 PM: #61 materially closed by the #37 region ban
+## THE PERMANENT BOUND (settled 2026-07-21, Mike)
 
-The unexpected answer to #61 was **not** any of the four options listed
-in that issue. It was **#37** — forbidding emission of frame specials
-inside permissive constraint regions (`dd18157`).
+**Complete structures round-trip. Incomplete ones round-trip only where
+the block type admits openness.** Exactly one does.
 
-Mechanism: #61's garbage is marker-shaped text (`<tool_call>`,
-`</think>`, `</function>`) stuffed into an unbounded `until()` value.
-Those markers were reachable as **single special ids** because
-`emit_ban_set` exempts anything overlapping a dialect marker — an
-exemption that is correct at frame positions and wrong everywhere else.
-Banning them where frames are illegal removes the model's cheapest path
-into the weeds.
+- **Thought** = text ⇒ "unclosed" is representable ⇒ [[open_thought_blocks]]
+  handles it (trailing-only), and the same mechanism gives us CoT prefill.
+- **Tool call** = structure ⇒ `Block::ToolUse` args are a
+  `serde_json::Value` ⇒ **half an object has no representation and never
+  will.** Not a missing feature — a type-level impossibility. Keeping raw
+  bytes instead just recreates #38's poison (frame marker inside a
+  `Block::Text` ⇒ ingest rejects ⇒ dead loop).
+
+So for a truncated call the *complete* solution space is #38's two
+options: typed error (caller retries) or strip-and-salvage. Stop looking
+for a third. Generation can always run out of budget mid-structure — a
+grammar constrains what is **legal**, never whether the model **finishes**.
+
+Documented for consumers in `Session`'s rustdoc and `bin/blallama/blallama.rs`
+module docs (feature inlined, no issue refs, per Mike). Downstream
+mitigation, also recorded there: **two cache breakpoints at the end of the
+prompt**, so a miss costs one message rather than everything back to the
+previous structural boundary.
+
+## 2026-07-21 PM: #37 region ban — what it actually fixed
+
+**CORRECTION.** `dd18157`'s commit message says "materially closes #61."
+That is **overclaimed**; the evidence says something more interesting.
+
+I diffed the two seeds (6, 7) that recovered. Both failed with an
+identical signature, and it is **not** #61's "grammar-legal garbage in an
+unbounded raw value":
+
+```
+orig: ...assistant\n<think>\n\n</think>\n\n\n          ← scaffold, thinking off
+foll: ...assistant\n<think>\n<tool_call>\n<function=  ← open think, call inside
+```
+
+That is the **#53 unclosed-`<think>`-swallows-call** case. Mechanism:
+under `Method` + thinking-off the grammar is
+`root ::= ( "<think>" thought_close )? ws calls` (`emit.rs:158`), and
+`thought_close` is built by `emit_until_rules` — an **until-region, hence
+permissive**. So once `<think>` is emitted, everything to `</think>` is a
+free region, where pre-#37 `<tool_call>` was grammar-legal (until accepts
+any byte) *and* ban-exempt (marker exemption). The model could open a call
+inside an unclosed thought. Post-#37 that special is banned there, and its
+bytes don't exit the until-region so the exit exemption doesn't rescue it.
+
+**The lesson worth keeping:** this memo previously concluded the
+unclosed-think round-trip failure was "NOT grammar-achievable" and listed
+the correct `emit.rs` edit as "none." That was *right* — and it framed the
+problem as grammar-or-nothing. It was never a grammar problem. **A sampler
+fix existed the whole time.** When a memo says "no fix at layer X,"
+re-ask which layer owns the behavior before recording it as unfixable.
+
+Also: **#61's documented repro (seed 2) no longer reproduces on clean
+HEAD** — it passed in the control sweep, independent of any change here.
 
 **Controlled A/B** (both sweeps back-to-back, same thermal state — #61
 warns heat is a confound, so a one-sided sweep proves nothing):
@@ -177,6 +221,17 @@ same-session control.
 and rejects it identically, so relay boundaries still need their own
 policy. The ban removes the single-token path, which is the one the
 model actually takes.
+
+**Also ruled out while diagnosing this** — recorded so nobody re-derives
+it. #61's "Options" section proposes aligning the parser's value
+termination with the grammar's. They are *already* aligned:
+`parse_tagged_call` cuts at `self.rest().find(&a.value_suffix)`
+(`parse.rs:1090`) — first occurrence of the close literal, byte-identical
+to the grammar's KMP `until`. The `else` branch (no close found) is what
+breaks round-trip: `CallOutcome::Incomplete` → `incomplete()` →
+`push_text(tail)` under `Leniency::Final`, collapsing the whole remainder
+into one `Block::Text`. So the failure is **non-completion, not boundary
+disagreement**, which is the same permanent bound as the section above.
 
 **The reusable lesson:** the permissive-region predicate built for the
 constrained-repetition arc (`src/sample/region.rs`) turned out to be the

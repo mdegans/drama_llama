@@ -1,3 +1,41 @@
+//! Demo Anthropic-compatible `/v1/messages` server over a local model.
+//!
+//! # Why a turn sometimes re-prefills
+//!
+//! Throughput here is dominated by the prefix cache, and the prefix cache
+//! is keyed on the *rendered* prompt. Each finished assistant turn is
+//! parsed into blocks, and the next request re-renders those blocks back
+//! into the prompt. The cache survives only when that round-trip is
+//! byte-exact — `render(parse(raw)) == raw`. When it isn't, every cached
+//! token past the divergence is unusable and the turn re-prefills.
+//!
+//! Nothing is corrupted when that happens; the session falls back to a
+//! token-id longest-common-prefix walk. It is purely a cost, but a large
+//! one: the lost breakpoint frequently sits on system+tools, usually the
+//! biggest part of the prompt, so one mismatch can cost minutes on a long
+//! conversation. A sudden collapse in cache-read counts on an otherwise
+//! healthy conversation is nearly always this.
+//!
+//! Prose always round-trips. Complete reasoning blocks and complete tool
+//! calls round-trip by construction — they are emitted under a grammar
+//! that forces the shape the template re-renders, so even *garbage*
+//! arguments survive intact as long as the structure closed.
+//!
+//! The one thing that cannot round-trip is a **structure the model never
+//! finished**, because generation can always run out of budget
+//! mid-emission. A truncated *thought* is fine: thoughts are text, so an
+//! unclosed one is representable, renders without its close marker, and
+//! the next request continues it. A truncated *tool call* is not: its
+//! arguments are a JSON value, and half an object has no representation.
+//! Such a turn surfaces as an error or is salvaged with the partial call
+//! stripped — it never round-trips, and no amount of future work changes
+//! that.
+//!
+//! Practical consequence for clients: put **two cache breakpoints at the
+//! end of the prompt** rather than one. A mismatch then costs a single
+//! re-prefilled message instead of everything back to the previous
+//! structural boundary.
+
 use std::{
     num::{NonZeroU128, NonZeroUsize},
     path::{Path, PathBuf},
