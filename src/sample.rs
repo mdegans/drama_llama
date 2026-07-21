@@ -1,4 +1,7 @@
 use crate::{ngram::NGramStats, Candidates, Probability, Token};
+// `is_protected` — the region-exit walk shared with the constrained
+// repetition penalty, reused by the region-scoped emit ban (#37).
+use crate::sample::region::RegionGuard as _;
 
 use rand::RngExt as _;
 
@@ -94,6 +97,42 @@ pub struct SamplerConfig {
     /// the analyzed dialect.
     #[cfg_attr(feature = "serde", serde(default))]
     pub banned_specials: Vec<Token>,
+    /// Region-scoped special-token ban (sorted ids), applied *only*
+    /// inside a **permissive** constraint region — a JSON string body
+    /// or an `until()` raw value, where the grammar accepts nearly any
+    /// byte and the model owns the content (issue #37).
+    ///
+    /// [`banned_specials`] must exempt the dialect's own markers, since
+    /// the session emits `<tool_call>` legitimately as the *frame*. But
+    /// a frame marker is only ever legitimate at a frame position, and
+    /// those are grammar *literals* — so inside a free region the
+    /// exemption buys nothing and costs everything: `<tool_call>` is
+    /// byte-legal string content, ban-exempt, and therefore committed as
+    /// the real special id inside an argument value. Relaying that text
+    /// into another session's prompt trips the ingest injection guard
+    /// and kills the receiving loop.
+    ///
+    /// So this set carries **no marker exemption** (every special except
+    /// the EOG family) and is consulted only where frames are never
+    /// legal. Two guards keep it from breaking legitimate emission:
+    ///
+    /// * It applies only when *every* active constraint is in a
+    ///   permissive state. At a structural position the standing
+    ///   [`banned_specials`] applies instead — banning marker tokens
+    ///   there would force the frame to be spelled as multiple byte
+    ///   tokens, which destabilizes the prefix cache.
+    /// * A special whose bytes *leave* the region is never banned. That
+    ///   is the region-exit walk the constrained-repetition guard
+    ///   already implements, so a dialect whose exit delimiter is itself
+    ///   a special (Harmony's `<|end|>`) stays completable.
+    ///
+    /// Empty (the default) disables the region-scoped check, leaving
+    /// only the standing ban. Runtime wiring set by `Session`; like
+    /// [`banned_specials`] it is unreachable from the wire.
+    ///
+    /// [`banned_specials`]: SamplerConfig::banned_specials
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub banned_specials_constrained: Vec<Token>,
 }
 
 /// True for modes that constrain *what may be emitted* rather than
@@ -426,6 +465,7 @@ impl SamplerConfig {
             deferred_grammar: None,
             lazy_grammar: default_lazy_grammar(),
             banned_specials: Vec::new(),
+            banned_specials_constrained: Vec::new(),
         }
     }
 
@@ -586,6 +626,7 @@ impl Default for SamplerConfig {
             deferred_grammar: None,
             lazy_grammar: default_lazy_grammar(),
             banned_specials: Vec::new(),
+            banned_specials_constrained: Vec::new(),
         }
     }
 }
@@ -1370,6 +1411,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
 
     let lazy = opts.lazy_grammar && state.has_active_constraint();
     let banned = opts.banned_specials.as_slice();
+    let banned_in_region = opts.banned_specials_constrained.as_slice();
 
     // Fallback snapshots (lazy-grammar check and/or emit-side specials
     // ban): `Pcg64Mcg` is a single `u128` of state (Clone), `mu` is a
@@ -1378,7 +1420,8 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // fold consumes the identical RNG draw sequence on either path, so
     // a fixed seed yields the same stream every run regardless of how
     // many checks fall back.
-    let snapshot = if lazy || !banned.is_empty() {
+    let snapshot = if lazy || !banned.is_empty() || !banned_in_region.is_empty()
+    {
         Some((state.rng.clone(), state.mu, candidates.clone()))
     } else {
         None
@@ -1432,8 +1475,46 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // resample IS the mask, applied before anything commits, and a
     // vacuously-empty candidate set forces EOS exactly like
     // `SamplingMode::Deny`.
+    //
+    // Two sets, selected by position (#37). At a structural position the
+    // standing `banned_specials` applies — it exempts the dialect's own
+    // markers so the frame can be emitted as single tokens (banning them
+    // there would force a multi-token spelling and destabilize the prefix
+    // cache). Inside a *permissive* free region — a JSON string body, an
+    // `until()` raw value — no frame is ever legal, so the stricter
+    // no-exemption `banned_specials_constrained` applies instead and
+    // `<tool_call>` can no longer be committed as a real special id
+    // inside an argument value.
     let banned = opts.banned_specials.as_slice();
-    if !banned.is_empty() && banned.binary_search(&chosen).is_ok() {
+    // Accept-then-check, same shape as everything else here: the region
+    // query walks every active constraint, so it runs only once the
+    // sampled id is known to be in the stricter set. Steady state pays
+    // one binary search.
+    let region_ban = !banned_in_region.is_empty()
+        && banned_in_region.binary_search(&chosen).is_ok()
+        && match region::ConstraintGuard::build(
+            &opts.modes,
+            &state.matchers,
+            state.deferred.as_ref(),
+            opts.deferred_grammar.as_ref(),
+            model,
+        ) {
+            // `build` is `Some` only when every active constraint is
+            // incomplete AND permissive — precisely where frames are
+            // illegal. One exemption: a token whose bytes *leave* the
+            // region is that region's exit delimiter, not content, so it
+            // stays emittable even when it is a special (Harmony's
+            // `<|end|>`). Banning it would make the constraint
+            // uncompletable.
+            Some(guard) => !guard.is_protected(chosen),
+            // Structural position, or no live constraint at all: the
+            // standing ban governs, unchanged.
+            None => false,
+        };
+    let banned = if region_ban { banned_in_region } else { banned };
+    if region_ban
+        || (!banned.is_empty() && banned.binary_search(&chosen).is_ok())
+    {
         if let Some((rng_snap, mu_snap, saved)) = snapshot {
             state.rng = rng_snap;
             state.mu = mu_snap;
@@ -2074,6 +2155,7 @@ mod tests {
             deferred_grammar: None,
             lazy_grammar: false,
             banned_specials: vec![X],
+            ..SamplerConfig::default()
         };
         let mut state = state_for(&opts);
 
@@ -2094,6 +2176,7 @@ mod tests {
             deferred_grammar: None,
             lazy_grammar: false,
             banned_specials: vec![A, B, C, X],
+            ..SamplerConfig::default()
         };
         let mut state = state_for(&opts);
         let picked = sample(cands(&[(A, 10.0), (X, 5.0)]), &opts, &mut state);
@@ -2115,6 +2198,152 @@ mod tests {
         let picked =
             sample(cands(&[(A, 10.0), (B, 5.0), (X, 1.0)]), &opts, &mut state);
         assert_eq!(picked, EOS);
+    }
+
+    // ── Region-scoped emit ban (#37) ─────────────────────────────────
+
+    /// Grammar + greedy, with a region-scoped ban set and (by default)
+    /// an empty standing set — the shape `Session` produces for a frame
+    /// marker: exempt from the standing ban so the frame can be emitted,
+    /// present in the stricter set so it cannot become argument content.
+    fn region_ban_opts(
+        standing: Vec<Token>,
+        in_region: Vec<Token>,
+    ) -> SamplerConfig {
+        SamplerConfig {
+            modes: vec![
+                SamplingMode::grammar(STR_GRAMMAR)
+                    .expect("test grammar parses"),
+                SamplingMode::Greedy,
+            ],
+            repetition: None,
+            deferred_grammar: None,
+            lazy_grammar: false,
+            banned_specials: standing,
+            banned_specials_constrained: in_region,
+        }
+    }
+
+    /// A state parked mid-string-body — the permissive free region.
+    fn in_string_body(opts: &SamplerConfig) -> SamplerState {
+        let mut state = state_for(opts);
+        state.advance(opts, QUOTE, &MockModel);
+        state.advance(opts, A, &MockModel);
+        state
+    }
+
+    /// The headline (#37): a token exempt from the standing ban — a
+    /// dialect frame marker — is masked inside a permissive region,
+    /// where it would be argument *content* rather than framing.
+    #[test]
+    fn region_ban_masks_frame_special_inside_free_region() {
+        let opts = region_ban_opts(vec![], vec![X]);
+        let mut state = in_string_body(&opts);
+        let picked = sample_token(
+            &[QUOTE, A],
+            cands(&[(X, 10.0), (B, 5.0)]),
+            &opts,
+            &mut state,
+            &MockModel,
+        )
+        .unwrap();
+        assert_eq!(
+            picked, B,
+            "frame special must be masked inside the free region"
+        );
+    }
+
+    /// The load-bearing negative: with no live constraint there is no
+    /// region, so the stricter set is inert and the standing ban alone
+    /// governs. This is what keeps frame literals emittable as single
+    /// tokens — banning them at frame positions would force a
+    /// multi-token spelling and destabilize the prefix cache.
+    #[test]
+    fn region_ban_inert_outside_a_constraint() {
+        let opts = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: None,
+            deferred_grammar: None,
+            lazy_grammar: false,
+            banned_specials: vec![],
+            banned_specials_constrained: vec![X],
+        };
+        let mut state = state_for(&opts);
+        let picked = sample_token(
+            &[],
+            cands(&[(X, 10.0), (A, 5.0)]),
+            &opts,
+            &mut state,
+            &MockModel,
+        )
+        .unwrap();
+        assert_eq!(
+            picked, X,
+            "the stricter set must not apply without a permissive region"
+        );
+    }
+
+    /// Structural positions inside a live grammar are not free regions
+    /// either: at the root only `"` is legal, so `ConstraintGuard::build`
+    /// vetoes and the stricter set stays inert.
+    #[test]
+    fn region_ban_inert_at_structural_position() {
+        let opts = region_ban_opts(vec![], vec![QUOTE]);
+        let mut state = state_for(&opts);
+        let picked = sample_token(
+            &[],
+            cands(&[(QUOTE, 10.0), (A, 5.0)]),
+            &opts,
+            &mut state,
+            &MockModel,
+        )
+        .unwrap();
+        assert_eq!(
+            picked, QUOTE,
+            "structural position must fall back to the standing ban"
+        );
+    }
+
+    /// The exit exemption: a token whose bytes *leave* the region is
+    /// that region's delimiter, not content, so it stays emittable even
+    /// when listed. Without this a dialect whose exit marker is itself a
+    /// special (Harmony's `<|end|>`) would have an uncompletable
+    /// constraint. Covers the merged form (`",`) the walk exists for.
+    #[test]
+    fn region_ban_exempts_region_exit_tokens() {
+        let opts = region_ban_opts(vec![], vec![QUOTE_COMMA]);
+        let mut state = in_string_body(&opts);
+        let picked = sample_token(
+            &[QUOTE, A],
+            cands(&[(QUOTE_COMMA, 10.0), (A, 5.0)]),
+            &opts,
+            &mut state,
+            &MockModel,
+        )
+        .unwrap();
+        assert_eq!(
+            picked, QUOTE_COMMA,
+            "the region's own exit delimiter must stay emittable"
+        );
+    }
+
+    /// Selecting the stricter set must not drop a standing ban: a token
+    /// banned everywhere stays banned inside the region. (`Session`
+    /// unions the two for exactly this reason; here the standing branch
+    /// carries it.)
+    #[test]
+    fn region_ban_does_not_weaken_the_standing_ban() {
+        let opts = region_ban_opts(vec![B], vec![X]);
+        let mut state = in_string_body(&opts);
+        let picked = sample_token(
+            &[QUOTE, A],
+            cands(&[(B, 10.0), (C, 5.0)]),
+            &opts,
+            &mut state,
+            &MockModel,
+        )
+        .unwrap();
+        assert_eq!(picked, C, "standing ban must survive inside a region");
     }
 
     /// Legal unconstrained winner: fast path must keep it and advance the

@@ -1625,6 +1625,10 @@ pub struct Session<B: Backend> {
     /// [`Session::refresh_emit_ban`]. Call sites clone this instead of
     /// re-scanning the vocab per call.
     emit_ban: Vec<Token>,
+    /// Memoized [`Session::emit_ban_set_constrained`] — the region-scoped
+    /// sibling of [`Session::emit_ban`], refreshed by the same
+    /// [`Session::refresh_emit_ban`] since it has identical inputs.
+    emit_ban_constrained: Vec<Token>,
     /// Prefix-cache state. `Some` iff the caller opted in via
     /// [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
     /// `None` means every call is a full re-prefill (the pre-0.7
@@ -2129,6 +2133,7 @@ impl<B: Backend> Session<B> {
             seed: None,
             emit_specials_ban: true,
             emit_ban: Vec::new(),
+            emit_ban_constrained: Vec::new(),
             prefix_cache: None,
             last_usage: Usage::default(),
             total_usage: Usage::default(),
@@ -2407,6 +2412,23 @@ impl<B: Backend> Session<B> {
             } else {
                 self.emit_ban.clone()
             };
+        // The region-scoped set (#37) must never be *weaker* than the
+        // standing one, or a token banned at frame positions would come
+        // back inside a free region. Union rather than argue about set
+        // containment: the strict set is EOG-exempt while a per-call
+        // addition need not be, so "strict ⊇ standing" is one Gemma-shaped
+        // vocab away from being false.
+        let banned_specials_constrained =
+            if self.emit_ban_constrained.is_empty() {
+                // Ban disabled — stays disabled, no resurrection via union.
+                Vec::new()
+            } else {
+                let mut b = self.emit_ban_constrained.clone();
+                b.extend(banned_specials.iter().copied());
+                b.sort_unstable();
+                b.dedup();
+                b
+            };
         // Fold in the request's own sampling knobs. Only `modes` is
         // reachable from the wire: `repetition`, `lazy_grammar` and
         // `banned_specials` are assembled below from session state,
@@ -2439,6 +2461,7 @@ impl<B: Backend> Session<B> {
             deferred_grammar,
             lazy_grammar: self.sample_options.lazy_grammar,
             banned_specials,
+            banned_specials_constrained,
         };
         Ok(predict_opts)
     }
@@ -2521,6 +2544,7 @@ impl<B: Backend> Session<B> {
     /// [`Session::with_emit_specials_ban`]).
     fn refresh_emit_ban(&mut self) {
         self.emit_ban = self.emit_ban_set();
+        self.emit_ban_constrained = self.emit_ban_set_constrained();
     }
 
     /// The emit-side special-token ban set (#31 item 9), memoized as
@@ -2603,6 +2627,79 @@ impl<B: Backend> Session<B> {
                 // exempt every special.
                 !markers.iter().any(|m| m.contains(piece.as_str()))
             })
+            .collect();
+        banned.sort_unstable();
+        banned.dedup();
+        banned
+    }
+
+    /// The **region-scoped** emit ban (issue #37), memoized as
+    /// [`Session::emit_ban_constrained`] and handed to
+    /// [`SamplerConfig::banned_specials_constrained`]: every special
+    /// except the EOG family, with **no marker exemption**.
+    ///
+    /// [`Session::emit_ban_set`] must exempt the dialect's markers so
+    /// the session can emit `<tool_call>` as the call *frame*. That
+    /// exemption is unconditional today, which is the bug: inside a
+    /// permissive constraint region — a JSON string body, an `until()`
+    /// raw value — a frame marker is not framing, it is *content*, and
+    /// it is byte-legal there (the grammar matches decoded piece bytes,
+    /// not token identity). Grammar-legal + ban-exempt meant the frame
+    /// special was committed as its real id inside an argument value; a
+    /// tool that relayed that text into another session's prompt then
+    /// tripped [`Session::check_no_special_injection`] and killed the
+    /// receiving loop.
+    ///
+    /// A frame is only legal at a frame position, and frame positions
+    /// are grammar *literals* — never permissive — so dropping the
+    /// exemption costs nothing legitimate. The sampler applies this set
+    /// only where every active constraint is permissive, and exempts any
+    /// token whose bytes leave the region (a dialect whose exit
+    /// delimiter is itself a special stays completable); see
+    /// [`SamplerConfig::banned_specials_constrained`] for both guards.
+    ///
+    /// EOG stays exempt, and *not* because a stop is always legal here —
+    /// it usually isn't. Stopping mid-constraint is already forbidden by
+    /// the layer that can tell the difference: both the masked filter
+    /// (`grammar_filter`) and the lazy check (`SamplerState::accepts_chosen`)
+    /// keep an EOG candidate, while the constraint is incomplete, **only
+    /// if its own bytes complete it**. That rule ignores permissiveness,
+    /// so it holds inside a free region too — an unbounded `until()`
+    /// value cannot be abandoned before its close delimiter, and a
+    /// `</think>` a grammar requires must be emitted before the model may
+    /// stop. Duplicating that here would be a flat id-set standing in for
+    /// a completion-aware decision: it cannot distinguish the Gemma 4
+    /// shape, where the required closing bytes *are* an EOG token
+    /// (`<|tool_response>`) that the filter deliberately keeps.
+    ///
+    /// What neither set covers is a region with no grammar at all — the
+    /// lazy/Auto pre-trigger reasoning span. There is no constraint to be
+    /// incomplete there, so nothing forbids EOG with `<think>` still
+    /// open; that gap is [#59]'s open-thought territory, not this ban's.
+    ///
+    /// [#59]: https://github.com/mdegans/drama_llama/issues/59
+    ///
+    /// Honors [`Session::with_emit_specials_ban`] — the opt-out
+    /// (Qwen-VL grounding markers) disables both sets, not just one.
+    ///
+    /// **This does not eliminate the class.** A model can spell
+    /// `<tool_call>` as ordinary multi-token bytes inside a string;
+    /// ingest re-tokenizes surfaced text with `parse_special` and
+    /// rejects it identically. Relay boundaries still need their own
+    /// policy — this removes the single-token path, which is the one the
+    /// model actually takes.
+    ///
+    /// [`SamplerConfig::banned_specials_constrained`]: crate::SamplerConfig::banned_specials_constrained
+    fn emit_ban_set_constrained(&self) -> Vec<Token> {
+        if !self.emit_specials_ban {
+            return Vec::new();
+        }
+        let model = &self.engine.model;
+        let eog = model.eog_tokens();
+        let mut banned: Vec<Token> = model
+            .special_tokens()
+            .into_iter()
+            .filter(|t| !eog.contains(t))
             .collect();
         banned.sort_unstable();
         banned.dedup();
@@ -7740,6 +7837,62 @@ mod tests {
             "dialect reasoning marker must be exempt"
         );
         assert!(!ban.is_empty(), "reserved specials should populate the set");
+    }
+
+    /// The region-scoped ban set (#37) on a real vocab: the marker
+    /// exemption is gone — inside a free region a frame marker is
+    /// content, not framing — while EOG stays exempt. Pairs with the
+    /// sampler-side `region_ban_*` battery, which pins *where* it
+    /// applies; this pins *what is in it*.
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_emit_ban_set_constrained_qwen() {
+        let session = crate::LlamaCppSession::from_path_sync(model_path())
+            .unwrap()
+            .quiet();
+        let one = |s: &str| {
+            let toks = session.engine().model.tokenize(s, true);
+            assert_eq!(toks.len(), 1, "{s:?} must be one special token");
+            toks[0]
+        };
+        let strict = session.emit_ban_set_constrained();
+        let banned = |t: Token| strict.binary_search(&t).is_ok();
+
+        // The whole point: markers exempt from the standing set are
+        // banned here. `<tool_call>` inside a `<parameter>` value is the
+        // swarm-example poisoning that motivated the issue.
+        assert!(
+            banned(one("<tool_call>")),
+            "tool-call marker must be banned inside free regions"
+        );
+        assert!(
+            banned(one("<think>")),
+            "reasoning marker must be banned inside free regions"
+        );
+        assert!(
+            banned(one("<|im_start|>")),
+            "turn-open framing stays banned"
+        );
+        assert!(
+            !banned(one("<|im_end|>")),
+            "EOG stays exempt — a stop token is never an injection"
+        );
+
+        // Superset of the standing set: selecting the stricter set inside
+        // a region must never resurrect something banned everywhere.
+        for t in session.emit_ban_set() {
+            assert!(
+                banned(t),
+                "region set must contain every standing-banned id ({t})"
+            );
+        }
+
+        // The opt-out disables both sets, not just one.
+        let session = session.with_emit_specials_ban(false);
+        assert!(
+            session.emit_ban_set_constrained().is_empty(),
+            "with_emit_specials_ban(false) must disable the region set too"
+        );
     }
 
     /// `ToolChoice::None` (issue #44): the tool-call opener special is
