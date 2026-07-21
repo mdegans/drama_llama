@@ -78,9 +78,30 @@ objection that stands is collateral, not cost.)
 ## Why containment cannot key on "the parser degraded"
 
 The first plan for defect 3 was to have `parse_text` report a
-degradation and have `Session` error on it. **This is wrong and would
-have been a serious regression.** Found by a Plan agent, confirmed by
-Mike:
+degradation and have `Session` error on it. Found by a Plan agent —
+but **scoped down by Mike afterwards, and the correction matters**, so
+read both halves before citing this.
+
+**The correction (Mike, 2026-07-21): we don't support Llama 3.1.**
+`llama31_json()` is the *only* trigger-less dialect in the tree.
+`hermes_json()` is also `JsonNative` but carries
+`section_start: "<tool_call>\n"`, so its trigger is non-empty — and it
+is what `ToolChoiceOptions::default()` hardcodes. On every shipped
+dialect (hermes, `qwen_xml`, `gemma4`, harmony) each degradation site
+begins at a landmark that *is* a frame marker, so degradation and
+poisoning coincide and the degradation-keyed design would have worked.
+
+**Why we still didn't take it.** Not because it breaks today, but
+because it depends on "every degradation begins at a frame marker"
+staying true as dialects are added — an invariant nothing enforces and
+which `llama31_json()` already violates. `scan_text_for_specials` is
+exactly coextensive with the ingest guard that will reject the text
+anyway (same predicate, no drift), covers byte-spelled markers, and
+needs no `Parsed` API change. Robustness, not rescue.
+
+The failure mode below is therefore **latent rather than routine** — it
+fires only for a trigger-less dialect. It is still worth understanding,
+because it is what the invariant costs when it lapses:
 
 Trigger-less `JsonNative` dialects (Llama 3.1 — `CallSyntax::llama31_json()`,
 `dialect/mod.rs:467-476`) have `trigger() == ""`, so the landmark scan
