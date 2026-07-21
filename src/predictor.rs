@@ -454,6 +454,191 @@ impl<'engine, B: Backend> From<CandidatePredictor<'engine, B>> for Vec<Token> {
     }
 }
 
+/// Reassembles UTF-8 across token boundaries.
+///
+/// Byte-level BPE vocabularies (the `gpt2` family, which is what our
+/// models use) have *bytes* for an alphabet, so a multi-byte codepoint
+/// routinely splits across consecutive tokens. Each half is
+/// **incomplete**, not invalid — rendering it in isolation destroys the
+/// character outright. That was issue #55: `Model::token_to_piece`
+/// substituted a sentinel string, and every streaming consumer then
+/// string-matched the sentinel away, silently deleting the character.
+///
+/// So: hold the incomplete tail between tokens and emit it once the
+/// codepoint closes. Bytes that can *never* close (a genuinely
+/// malformed sequence) become U+FFFD immediately and are stepped over
+/// — buffering those instead would grow `carry` without bound on a
+/// malformed stream and stall every later emission.
+#[derive(Debug, Default)]
+struct Utf8Reassembler {
+    /// Trailing bytes of a not-yet-complete codepoint. Never holds a
+    /// complete one; those leave the moment they close. Bounded by the
+    /// 3 bytes a truncated UTF-8 sequence can carry.
+    carry: Vec<u8>,
+    /// Reused scratch for [`Model::token_to_piece_ref`]. Distinct from
+    /// `carry` on purpose — scratch lives for one token, carry lives
+    /// *across* tokens (the distinction issue #55 turns on).
+    scratch: Vec<u8>,
+}
+
+impl Utf8Reassembler {
+    /// Feed one token's raw piece bytes; returns whatever is complete
+    /// as of this token. Empty mid-codepoint.
+    fn push<M: Model + ?Sized>(&mut self, model: &M, token: Token) -> String {
+        // `token_to_piece_ref`, never `Model::token_to_piece` — the
+        // latter is lossy on exactly the bytes we are here to
+        // reassemble.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        model.token_to_piece_ref(token, &mut scratch);
+        let piece = self.push_bytes(&scratch);
+        self.scratch = scratch;
+        piece
+    }
+
+    /// Byte-level half of [`Self::push`], split out so the carry logic
+    /// is testable without a model.
+    fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        self.carry.extend_from_slice(bytes);
+
+        let mut out = String::with_capacity(self.carry.len());
+        let mut emitted = 0;
+        loop {
+            match std::str::from_utf8(&self.carry[emitted..]) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    emitted = self.carry.len();
+                    break;
+                }
+                Err(e) => {
+                    let good = e.valid_up_to();
+                    out.push_str(
+                        std::str::from_utf8(&self.carry[emitted..][..good])
+                            .expect("valid_up_to() is a UTF-8 boundary"),
+                    );
+                    emitted += good;
+                    match e.error_len() {
+                        // A real invalid sequence — no later token can
+                        // complete it. Replace and step over it.
+                        Some(n) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            emitted += n;
+                        }
+                        // Truncated at the end of input: the next token
+                        // carries the rest. Hold it.
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.carry.drain(..emitted);
+
+        out
+    }
+
+    /// Stream end: whatever is still held can never close, so it
+    /// surfaces as U+FFFD rather than vanishing.
+    fn flush(&mut self) -> String {
+        let tail = String::from_utf8_lossy(&self.carry).into_owned();
+        self.carry.clear();
+        tail
+    }
+}
+
+/// Model-free tests for the issue #55 carry logic. The byte splits
+/// below are what a byte-level BPE vocab actually hands us: one
+/// codepoint, several byte-fallback tokens.
+#[cfg(test)]
+mod utf8_reassembler_tests {
+    use super::Utf8Reassembler;
+
+    /// U+1F999 LLAMA — four bytes, the worst case for splitting.
+    const LLAMA: [u8; 4] = [0xf0, 0x9f, 0xa6, 0x99];
+
+    #[test]
+    fn ascii_passes_straight_through() {
+        let mut r = Utf8Reassembler::default();
+        assert_eq!(r.push_bytes(b"The quick "), "The quick ");
+        assert_eq!(r.push_bytes(b"brown fox"), "brown fox");
+        assert!(r.carry.is_empty());
+        assert_eq!(r.flush(), "");
+    }
+
+    #[test]
+    fn emoji_split_one_three() {
+        let mut r = Utf8Reassembler::default();
+        assert_eq!(r.push_bytes(&LLAMA[..1]), "");
+        assert_eq!(r.carry.len(), 1);
+        assert_eq!(r.push_bytes(&LLAMA[1..]), "🦙");
+        assert!(r.carry.is_empty());
+    }
+
+    #[test]
+    fn emoji_split_two_two() {
+        let mut r = Utf8Reassembler::default();
+        assert_eq!(r.push_bytes(&LLAMA[..2]), "");
+        assert_eq!(r.push_bytes(&LLAMA[2..]), "🦙");
+        assert!(r.carry.is_empty());
+    }
+
+    /// Surrounding text must ride along with the reassembled codepoint,
+    /// in order, in one emission.
+    #[test]
+    fn text_around_a_split_codepoint_keeps_its_order() {
+        let mut r = Utf8Reassembler::default();
+        let mut head = b"a ".to_vec();
+        head.extend_from_slice(&LLAMA[..3]);
+        assert_eq!(r.push_bytes(&head), "a ");
+
+        let mut tail = vec![LLAMA[3]];
+        tail.extend_from_slice(b" b");
+        assert_eq!(r.push_bytes(&tail), "🦙 b");
+    }
+
+    /// A lone continuation byte can never complete. It must become
+    /// U+FFFD immediately — buffering it would grow `carry` forever and
+    /// stall every later emission (the trap called out in issue #55).
+    #[test]
+    fn lone_continuation_byte_is_replaced_not_buffered() {
+        let mut r = Utf8Reassembler::default();
+        assert_eq!(r.push_bytes(&[0x80]), "\u{FFFD}");
+        assert!(r.carry.is_empty(), "invalid bytes must not be carried");
+        // And the stream keeps flowing afterwards.
+        assert_eq!(r.push_bytes(b"ok"), "ok");
+    }
+
+    /// Repeated garbage must not accumulate — `carry` stays bounded.
+    #[test]
+    fn malformed_stream_does_not_grow_carry() {
+        let mut r = Utf8Reassembler::default();
+        for _ in 0..64 {
+            assert_eq!(r.push_bytes(&[0xff]), "\u{FFFD}");
+            assert!(r.carry.is_empty());
+        }
+    }
+
+    /// Invalid bytes ahead of a truncated tail: replace the first,
+    /// hold the second.
+    #[test]
+    fn invalid_then_incomplete() {
+        let mut r = Utf8Reassembler::default();
+        let mut bytes = vec![0x80];
+        bytes.extend_from_slice(&LLAMA[..2]);
+        assert_eq!(r.push_bytes(&bytes), "\u{FFFD}");
+        assert_eq!(r.carry, &LLAMA[..2]);
+    }
+
+    #[test]
+    fn flush_emits_the_orphaned_tail() {
+        let mut r = Utf8Reassembler::default();
+        assert_eq!(r.push_bytes(&LLAMA[..2]), "");
+        assert_eq!(r.flush(), "\u{FFFD}");
+        assert!(r.carry.is_empty());
+        // Idempotent: `PiecePredictor` guards against a second call,
+        // but the reassembler does not rely on that guard.
+        assert_eq!(r.flush(), "");
+    }
+}
+
 pub struct TokenPredictor<'engine, B: Backend> {
     /// Per-call sampler run-state (matchers, RNG, mu, n-gram stats).
     /// Built by `prepare` from the effective config via
@@ -480,6 +665,12 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// [`Self::eager_constraint_incomplete`]; the state itself stays
     /// pure.
     terminal_completed: bool,
+    /// Carries the incomplete tail of a codepoint split across
+    /// byte-fallback tokens (issue #55). Owned *here*, alongside
+    /// `text`, on purpose: the stop-string, regex and deferred-trigger
+    /// scans all read `text`, so reassembling into it makes the bytes
+    /// they scan the same bytes the model actually emitted.
+    reassembler: Utf8Reassembler,
     pub(crate) inner: CandidatePredictor<'engine, B>,
 }
 
@@ -504,6 +695,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             max_stop_len,
             stopped: false,
             terminal_completed: false,
+            reassembler: Utf8Reassembler::default(),
             inner,
         }
     }
@@ -530,6 +722,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             max_stop_len,
             stopped: false,
             terminal_completed: false,
+            reassembler: Utf8Reassembler::default(),
             inner,
         }
     }
@@ -558,6 +751,19 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     /// even though it never advances the state.
     pub fn eager_constraint_incomplete(&self) -> bool {
         self.state.eager_constraint_incomplete() && !self.terminal_completed
+    }
+
+    /// Close out the UTF-8 reassembler at stream end (issue #55).
+    ///
+    /// Bytes still held are a codepoint the generation cut in half, so
+    /// they land in [`Self::text`] as U+FFFD instead of disappearing.
+    /// Returns the appended text — the piece-level iterator yields
+    /// exactly what this appended, keeping the stream and `text`
+    /// byte-identical. Idempotent: a second call appends nothing.
+    pub(crate) fn flush_utf8(&mut self) -> String {
+        let tail = self.reassembler.flush();
+        self.text.push_str(&tail);
+        tail
     }
 
     /// Shared setup for [`Self::new`] and [`Self::new_resuming`]: seed
@@ -662,7 +868,13 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             )
             .unwrap();
 
-        let piece = self.inner.engine.model.token_to_piece(next_token);
+        // Reassembled, not converted in isolation: a token that is
+        // only part of a codepoint yields nothing here and its bytes
+        // ride along in the reassembler until the codepoint closes
+        // (issue #55). `text` is the sole record of what was emitted —
+        // `PiecePredictor` yields the delta it grew by, so the stream
+        // and `into_text()` cannot disagree.
+        let piece = self.reassembler.push(&self.inner.engine.model, next_token);
         self.text.push_str(&piece);
 
         // Evaluate every stop condition against the just-sampled token,
@@ -824,8 +1036,17 @@ fn find_any_deferred_trigger_end(
 ///
 /// If the predictor stops predicting because of a stop sequence, the text will
 /// be truncated at the stop sequence.
+///
+/// Pieces are **reassembled**, not converted one token at a time: a
+/// codepoint split across byte-fallback tokens is held until it closes
+/// and then yielded whole, so a token can yield the empty string
+/// (issue #55).
 pub struct PiecePredictor<'engine, B: Backend> {
     inner: TokenPredictor<'engine, B>,
+    /// Whether [`TokenPredictor::flush_utf8`] has run. The flush is a
+    /// one-shot extra yield at stream end, so the terminal `None` arm
+    /// has to know not to repeat it.
+    flushed: bool,
 }
 
 impl<'engine, B: Backend> PiecePredictor<'engine, B> {
@@ -840,6 +1061,7 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
             TokenPredictor::new(engine, tokens, options, initial_state);
         Self {
             inner: token_predictor,
+            flushed: false,
         }
     }
 
@@ -864,6 +1086,7 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
         );
         Self {
             inner: token_predictor,
+            flushed: false,
         }
     }
 
@@ -931,9 +1154,28 @@ impl<'engine, B: Backend> Iterator for PiecePredictor<'engine, B> {
     type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let token = match self.inner.next() {
-            Some(token) => token,
+        // The yielded piece is the delta `text` grew by, sliced rather
+        // than re-derived from the token: the reassembler may hold this
+        // token's bytes back (or release a codepoint the *previous*
+        // token opened), so token → piece is no longer a function.
+        // Slicing makes "what was yielded" == "what is in `text`" a
+        // property of the code rather than a promise (issue #55).
+        let emitted = self.inner.text.len();
+        match self.inner.next() {
+            Some(_) => Some(self.inner.text[emitted..].to_owned()),
             None => {
+                // Stream end. Surface any codepoint the last token left
+                // half-delivered before the text is finalized — one
+                // extra yield, then the next call falls through here to
+                // the stop-string truncation below.
+                if !self.flushed {
+                    self.flushed = true;
+                    let tail = self.inner.flush_utf8();
+                    if !tail.is_empty() {
+                        return Some(tail);
+                    }
+                }
+
                 // We have to check the text for stop strings and truncate the
                 // text if we find one. This matters in cases where a user is
                 // using a while let loop and might convert the predictor into a
@@ -963,11 +1205,9 @@ impl<'engine, B: Backend> Iterator for PiecePredictor<'engine, B> {
                     }
                 }
 
-                return None;
+                None
             }
-        };
-        let piece = self.inner.inner.engine.model.token_to_piece(token);
-        Some(piece)
+        }
     }
 }
 
@@ -989,6 +1229,10 @@ impl<'engine, B: Backend> From<PiecePredictor<'engine, B>> for Vec<Token> {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Predicted {
     pub token: Token,
+    /// Text that became renderable *at* `token` — not necessarily the
+    /// text *of* `token`. A codepoint split across byte-fallback
+    /// tokens is held until it closes, so `piece` may be empty, or may
+    /// carry bytes an earlier token contributed (issue #55).
     pub piece: String,
 }
 

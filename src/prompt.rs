@@ -124,8 +124,8 @@ pub use misanthropic::response::Usage;
 /// flag rather than extend `misanthropic`'s schema (it models the
 /// Anthropic wire format; this is not part of it) and rather than put
 /// a marker in the thought *body*, which would be framing bytes inside
-/// content — the `[Invalid UTF-8]` bug class, and fatal to byte-stable
-/// re-rendering.
+/// content — the sentinel-string-in-content bug class (issue #55), and
+/// fatal to byte-stable re-rendering.
 ///
 /// The overload is safe in both directions: we never hand-craft a
 /// thought *to* Anthropic, and any thought that arrives *from*

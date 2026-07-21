@@ -556,6 +556,11 @@ pub trait Model: Send + Sync {
     }
 
     /// Convert a single token to its UTF-8 piece (may be empty).
+    ///
+    /// One-shot: undecodable bytes become U+FFFD, which is *lossy* for
+    /// a codepoint split across byte-fallback tokens. Per-token
+    /// streaming must use [`Self::token_to_piece_ref`] with a carry
+    /// buffer instead (issue #55).
     fn token_to_piece(&self, token: Token) -> String;
 
     /// Write the raw bytes for `token`'s piece into `buf`, resizing

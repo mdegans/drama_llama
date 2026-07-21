@@ -4861,7 +4861,7 @@ impl<B: Backend> Session<B> {
                     generated_tokens.push(token);
                 }
             }
-            if eos_pieces.contains(&piece) || piece == "[Invalid UTF-8]" {
+            if eos_pieces.contains(&piece) {
                 continue;
             }
             generated_count += 1;
@@ -5854,9 +5854,12 @@ fn infer_stop_reason(
 /// [`Block::Text`]: crate::Block::Text
 /// [`Block::Thought`]: crate::Block::Thought
 ///
-/// Drops EOS and `[Invalid UTF-8]` pieces the predictor emits —
-/// those are artifacts of token-to-string conversion, not model
-/// output.
+/// Drops the EOS pieces the predictor emits — those are artifacts of
+/// token-to-string conversion, not model output. Empty pieces are
+/// dropped too: the predictor reassembles codepoints split across
+/// byte-fallback tokens, so a token mid-codepoint yields nothing and
+/// the whole character arrives with the token that closes it
+/// (issue #55).
 pub struct BlockStream<'engine, B: Backend> {
     predictor: crate::PiecePredictor<'engine, B>,
     /// Re-parse-per-tick streaming parser over the session dialect
@@ -5888,10 +5891,7 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                 Some(piece) => {
                     // Skip the sentinel pieces — they aren't content.
                     // Everything else goes through the parser.
-                    if self.eos_pieces.contains(&piece)
-                        || piece == "[Invalid UTF-8]"
-                        || piece.is_empty()
-                    {
+                    if self.eos_pieces.contains(&piece) || piece.is_empty() {
                         continue;
                     }
                     self.pending.extend(self.parser.push(&piece));
@@ -5909,9 +5909,12 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
     }
 }
 
-/// Strip trailing EOS piece and the `[Invalid UTF-8]` marker predictors emit
-/// for byte-fallback tokens at stream end. Matches what
+/// Strip the trailing EOS piece. Matches what
 /// `examples/strawberry.rs` does by hand today.
+///
+/// No longer strips a byte-fallback marker: the predictor reassembles
+/// codepoints split across tokens rather than rendering each half as a
+/// sentinel string (issue #55), so there is nothing left to trim.
 fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
     // A turn can close on any of the model's EOG tokens, not just the
     // primary EOS (Gemma 4 ends on `<turn|>`, Harmony on `<|return|>`
@@ -5930,7 +5933,7 @@ fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
             text = text.trim_end_matches(piece.as_str());
         }
     }
-    text.trim_end_matches("[Invalid UTF-8]").trim_end()
+    text.trim_end()
 }
 
 #[cfg(test)]

@@ -28,8 +28,11 @@ use std::{
 /// Adapted from `llama.cpp/common/common.cpp`
 ///
 /// Infallible: out-of-range ids render as `[invalid token N]`, and
-/// bytes that don't decode as `[Invalid UTF-8]`. Both substitutions
-/// are lossy.
+/// bytes that don't decode become U+FFFD. Both substitutions are
+/// lossy — a *single* token's bytes are frequently only part of a
+/// codepoint on byte-level BPE vocabs, and nothing here can know
+/// that. Streaming callers must reassemble across tokens instead
+/// (issue #55); see [`LlamaCppModel::token_to_piece`].
 fn token_to_piece(token: llama_token, model: &LlamaCppModel) -> String {
     // Out-of-range ids (notably LLAMA_TOKEN_NULL = -1, returned by
     // vocab accessors like `eot()` when the model lacks the token)
@@ -42,7 +45,11 @@ fn token_to_piece(token: llama_token, model: &LlamaCppModel) -> String {
     let mut buf = vec![0; 8];
     token_to_piece_ref(token, model, &mut buf);
 
-    String::from_utf8(buf).unwrap_or("[Invalid UTF-8]".to_string())
+    // Lossy, not a sentinel string: `[Invalid UTF-8]` used to land
+    // here, and 15 bytes of ASCII in the middle of model output is
+    // indistinguishable from content the model wrote. U+FFFD is the
+    // standard mark and can never be confused for prose (issue #55).
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Same as `token_to_piece`, but allows reusable buffers.
@@ -743,18 +750,26 @@ impl LlamaCppModel {
     /// Convert a single token to a piece.
     ///
     /// Does not panic on invalid UTF-8: out-of-range ids render as
-    /// `[invalid token N]` and undecodable bytes as `[Invalid UTF-8]`.
-    /// Note that the latter is *lossy* and fires for merely
-    /// *incomplete* sequences too — a codepoint split across
-    /// byte-fallback tokens has no valid rendering in isolation. Use
+    /// `[invalid token N]` and undecodable bytes as U+FFFD.
+    ///
+    /// **One-shot only.** The U+FFFD substitution is *lossy* and fires
+    /// for merely *incomplete* sequences too — on a byte-level BPE
+    /// vocab a multi-byte codepoint routinely splits across
+    /// byte-fallback tokens, and neither half has a valid rendering in
+    /// isolation. Converting a stream one token at a time therefore
+    /// destroys those characters (issue #55). Use
+    /// [`Self::tokens_to_string`] when you hold the whole sequence, or
     /// the byte-preserving [`Model::token_to_piece_ref`](crate::backend::Model::token_to_piece_ref)
-    /// and buffer the bytes yourself if you need to reassemble those.
+    /// with a carry buffer when the tokens arrive one at a time —
+    /// which is what [`PiecePredictor`](crate::PiecePredictor) does.
     pub fn token_to_piece(&self, token: llama_token) -> String {
         token_to_piece(token, &self)
     }
 
-    /// Convert tokens to pieces. Lossy on split codepoints — see
-    /// [`Self::token_to_piece`].
+    /// Convert tokens to pieces, one string per token. Lossy on split
+    /// codepoints — see [`Self::token_to_piece`]. Prefer
+    /// [`Self::tokens_to_string`] unless you specifically need the
+    /// per-token boundaries.
     pub fn tokens_to_pieces<'a, Ts>(
         &'a self,
         tokens: Ts,
@@ -767,13 +782,31 @@ impl LlamaCppModel {
 
     /// Convert tokens to a single string. Does not strip any prefix or suffix.
     ///
-    /// Lossy on codepoints split across tokens — see
-    /// [`Self::token_to_piece`].
+    /// Whole-sequence, so it does *not* suffer the split-codepoint loss
+    /// [`Self::token_to_piece`] carries: the raw bytes are concatenated
+    /// first and decoded once, which reassembles any codepoint that
+    /// straddles a token boundary (issue #55). Streaming callers, who
+    /// do not have every byte up front, need the carry buffer in
+    /// [`PiecePredictor`](crate::PiecePredictor) instead.
     pub fn tokens_to_string<Ts>(&self, tokens: Ts) -> String
     where
         Ts: IntoIterator<Item = llama_token>,
     {
-        self.tokens_to_pieces(tokens).collect()
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut piece: Vec<u8> = Vec::new();
+        for token in tokens {
+            // Same out-of-range guard as `token_to_piece` — an id
+            // llama.cpp would throw on never reaches the FFI call.
+            if token < 0 || token >= self.n_vocab() {
+                bytes.extend_from_slice(
+                    format!("[invalid token {token}]").as_bytes(),
+                );
+                continue;
+            }
+            token_to_piece_ref(token, self, &mut piece);
+            bytes.extend_from_slice(&piece);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// Get text for a given token.

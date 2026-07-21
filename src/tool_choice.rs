@@ -1314,19 +1314,17 @@ mod tests {
             ..SamplerConfig::default()
         };
 
-        let eos_piece = engine.model.token_to_piece(engine.model.eos());
         let predictor = engine.predict_pieces(tokens, opts, None);
         let output: String = predictor.collect();
 
         println!(
             "=== forced tool call ===\n{output}\n========================"
         );
-        let _ = eos_piece; // Some tokens render as [Invalid UTF-8] so
-                           // trim_end_matches isn't reliable; slice to
-                           // the grammar-forced closing brace instead.
-
-        // Slice from the first `{` to the matching `}`. The grammar
-        // guarantees a single balanced object.
+        // Slice from the first `{` to the matching `}` rather than
+        // trimming a trailing EOS piece — the grammar guarantees a
+        // single balanced object, which is the tighter contract.
+        // (Historically this was also a `[Invalid UTF-8]` workaround;
+        // the predictor reassembles split codepoints now — issue #55.)
         let start =
             output.find('{').expect("output must contain opening brace");
         let mut depth = 0;
