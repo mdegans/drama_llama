@@ -14,12 +14,32 @@
 //! # a specific model in models/, by substring
 //! cargo run --release --example whoami --features cli -- --model gemma
 //!
-//! # every model in models/, in turn
-//! cargo run --release --example whoami --features cli -- --all
-//!
 //! # no constraint: top-K at the answer position + what it actually says
 //! cargo run --release --example whoami --features cli -- --unconstrained
+//!
+//! # the whole experiment: every model, every phrasing, both framings
+//! cargo run --release --example whoami --features cli -- \
+//!     --all --battery --framing both --seek 10
 //! ```
+//!
+//! # Learned, or patched in?
+//!
+//! The interesting question is not *what* a model answers but *how
+//! robustly*. An identity the model genuinely learned should survive
+//! being asked sideways; one installed by a thin patch — a handful of
+//! canned self-identification examples, a find-and-replace over a
+//! fine-tuning set — should hold under the phrasing it was patched with
+//! and wobble everywhere else. `--battery` varies the axes a patch is
+//! least likely to have covered (register, sentence shape, language) and
+//! `--framing raw` drops the chat template entirely, which is the
+//! strongest version of the same test: no control tokens, no turn
+//! structure, none of the scaffolding a patch was trained against.
+//!
+//! One honest limit, worth stating because it is easy to over-read: this
+//! cannot distinguish an honestly-trained identity from a *thoroughly*
+//! find-and-replaced one. Both produce a model that genuinely learned the
+//! substituted name. What it can find is **residue** — places the
+//! replacement missed — which is what `--focus` is for.
 //!
 //! # Why the naive version is wrong
 //!
@@ -40,6 +60,28 @@
 //! name (the predictor clears the KV cache on construction); the prompt
 //! is tiny, so the cost is irrelevant and we avoid the partial-truncate
 //! rewind that recurrent/hybrid models reject.
+//!
+//! # Read Σ before you read anything else
+//!
+//! Σ is the total probability that the next tokens spell *any* candidate
+//! — how much the model is actually trying to name itself right there.
+//! `share` renormalises across the candidate set, so it always sums to
+//! 100% and always looks confident, **including when Σ is 1e-9 and the
+//! model was about to write "I am a large language model" instead.**
+//! Rows below the threshold are marked; the marked ones are not results.
+//!
+//! `--seek N` is the fix rather than the warning. It follows the model's
+//! own greedy continuation for up to `N` tokens and measures at whichever
+//! position Σ peaks — so "hey what model are you" gets measured after the
+//! model's own `"Hey! I am"` rather than on top of it. Maximising Σ is
+//! what keeps this honest: we never choose the preamble, we follow the
+//! one the model writes and measure when it arrives. Two Qwen rows go
+//! from Σ=2e-6 (noise) to Σ=0.98 (a real answer) under `--seek 10`, with
+//! no change to what was asked.
+//!
+//! If the model never arrives — Gemma asked in Spanish greedily writes
+//! *"Soy un modelo de lenguaje entrenado por Google"* and names nothing —
+//! Σ stays low and that is itself the finding.
 //!
 //! # What the numbers do and do not support
 //!
@@ -85,9 +127,12 @@
 //!   templates that need a nudge anyway — gpt-oss's Harmony wants a
 //!   channel opened: `--prefix '<|channel|>final<|message|>'`.
 //!
-//! The `argmax at answer position` line in the header tells you which
-//! situation you are in without having to guess. If it reads `<think>`,
-//! the scores below it are answering a counterfactual.
+//! In practice `--seek` mostly dissolves this too: a channel opener is
+//! just a preamble, and the greedy walk steps through it like any other.
+//! Qwen under `raw` framing emits its own `<think></think>` out of sheer
+//! habit — no template asked it to — and the walk measures past it. The
+//! `argmax` line still tells you where the answer position landed, and
+//! the `↳ measured after` line tells you where the number came from.
 //!
 //! [`Engine`]: drama_llama::Engine
 //! [`CandidatePredictor`]: drama_llama::CandidatePredictor
@@ -124,6 +169,88 @@ const DEFAULT_NAMES: &[&str] = &[
     "DeepSeek", "Grok", "Copilot",
 ];
 
+/// One labelled question in the battery.
+struct Question {
+    label: &'static str,
+    text: &'static str,
+}
+
+/// The robustness battery.
+///
+/// A model that *learned* its identity should answer the same way however
+/// you ask. A model whose identity was **patched in** — a find-and-replace
+/// over a fine-tuning set, a handful of canned self-identification
+/// examples — should hold up under the phrasing it was patched with and
+/// wobble everywhere else. So the battery varies the axes a patch is
+/// least likely to have covered: register, sentence shape, and language.
+///
+/// The point is the *variance across rows*, not any single row.
+const BATTERY: &[Question] = &[
+    Question {
+        label: "plain",
+        text: DEFAULT_QUESTION,
+    },
+    Question {
+        label: "exact",
+        text: "What specific model am I speaking to right now? I want you \
+               to state your exact version.",
+    },
+    Question {
+        label: "casual",
+        text: "hey what model are you",
+    },
+    // Not a question at all: sidesteps the Q&A persona and asks the
+    // language model to do the one thing it always does.
+    Question {
+        label: "complete",
+        text: "Complete this sentence with only the name: \"The AI model \
+               generating this text is called ___\"",
+    },
+    Question {
+        label: "zh",
+        text: "你是什么模型？只需要回答名字。",
+    },
+    Question {
+        label: "es",
+        text: "¿Qué modelo eres? Solo el nombre, por favor.",
+    },
+    Question {
+        label: "fr",
+        text: "Quel modèle es-tu ? Juste le nom, s'il te plaît.",
+    },
+];
+
+/// How the question reaches the model.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Framing {
+    /// The model's own chat template — the distribution it was aligned on.
+    Chat,
+    /// `User: …\nAssistant:` and nothing else. Deliberately
+    /// out-of-distribution: no control tokens, no turn structure, none of
+    /// the scaffolding an identity patch would have been trained against.
+    Raw,
+    /// Both, in turn.
+    Both,
+}
+
+impl Framing {
+    fn expand(self) -> &'static [Framing] {
+        match self {
+            Framing::Chat => &[Framing::Chat],
+            Framing::Raw => &[Framing::Raw],
+            Framing::Both => &[Framing::Chat, Framing::Raw],
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Framing::Chat => "chat",
+            Framing::Raw => "raw",
+            Framing::Both => "both",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about = "Ask a model who it thinks it is.")]
 struct Args {
@@ -137,9 +264,51 @@ struct Args {
     #[arg(long)]
     all: bool,
 
-    /// The question to ask.
-    #[arg(short, long, default_value = DEFAULT_QUESTION)]
-    prompt: String,
+    /// The question to ask. Repeatable — every question runs against the
+    /// same loaded model, which is the only affordable way to ask many.
+    #[arg(short, long)]
+    prompt: Vec<String>,
+
+    /// Ask the built-in robustness battery instead: the same question
+    /// across phrasings, registers and languages. See [`BATTERY`].
+    #[arg(long)]
+    battery: bool,
+
+    /// How to frame the question: through the model's `chat` template,
+    /// `raw` completion (`User: …\nAssistant:`), or `both`.
+    #[arg(long, value_enum, default_value_t = Framing::Chat)]
+    framing: Framing,
+
+    /// Chat template override — raw Jinja, replacing both the embedded
+    /// template and any `<model>.template.jinja` sidecar. For asking what
+    /// a model says when its template stops telling it who it is.
+    #[arg(long)]
+    template: Option<PathBuf>,
+
+    /// Let the model open its own answer: follow its greedy continuation
+    /// up to this many tokens and score at whichever position it is most
+    /// nearly naming itself (highest Σ).
+    ///
+    /// Without this, "¿Qué modelo eres?" measures the position where the
+    /// model wants to write `Soy` — the name lands two tokens later and
+    /// the row reports noise. Letting the model supply its own preamble
+    /// keeps our thumb off the scale: we never choose the words, we only
+    /// follow where it goes and measure when it arrives.
+    #[arg(long, default_value_t = 0)]
+    seek: usize,
+
+    /// Always report this candidate's placing, even when it misses the
+    /// top three. The residue question ("is there any trace of vendor X
+    /// in here?") is answered by where X *places*, not by whether it
+    /// wins, and a top-3 summary is exactly where that evidence hides.
+    #[arg(long, default_value = "Claude")]
+    focus: String,
+
+    /// Force scoring of `" Name"` rather than `"Name"`. Rarely needed —
+    /// the spelling is derived from where the prompt actually ends (see
+    /// [`wants_leading_space`]); this is the escape hatch.
+    #[arg(long)]
+    leading_space: bool,
 
     /// System prompt. Absent by default — "no system prompt" is a real
     /// experimental condition, and the header records it as one.
@@ -229,33 +398,52 @@ fn probe(
         args.n_ctx,
     )?;
 
-    // Model -> template -> rendered text -> tokens. This is the layer
-    // `Session` sits on top of; doing it by hand is most of the point of
-    // the example.
-    let (template, template_source) = load_template(&engine, model_path)?;
-    let mut prompt =
-        Prompt::default().messages([(Role::User, args.prompt.clone())])?;
-    if let Some(system) = &args.system {
-        prompt = prompt.system(system.clone());
-    }
-    // `thinking` is left unset, so `enable_thinking` renders false and a
-    // Qwen-style template closes an empty reasoning block for us.
-    let render_opts = RenderOptions::default().with_generation_prompt(true);
-    let mut rendered = template.render_with(&prompt, &render_opts)?;
-    rendered.push_str(&args.prefix);
-
-    // `special = true`: the render is full of control tokens and they
-    // must resolve to their single ids, not to their spellings. Same
-    // call `Session` makes.
-    let prompt_tokens = engine.model().tokenize(&rendered, true);
-
     let names: Vec<String> = if args.name.is_empty() {
         DEFAULT_NAMES.iter().map(|s| s.to_string()).collect()
     } else {
         args.name.clone()
     };
+    let questions = resolve_questions(args);
 
-    print_header(&engine, model_path, args, &template_source, &prompt_tokens)?;
+    print_header(&engine, model_path, args, &questions)?;
+
+    // Loading is the entire cost here — a 17 GiB model takes ~40 s to
+    // come up and a scored question takes well under a second. So every
+    // question and every framing runs against one load. This loop shape
+    // is the difference between a battery being a thing you run and a
+    // thing you talk about running.
+    for &framing in args.framing.expand() {
+        let renderer = Renderer::build(&engine, model_path, args, framing)?;
+        println!("\n framing: {}", renderer.describe());
+        let compact = questions.len() > 1 && !args.verbose;
+        for question in &questions {
+            ask(&mut engine, &renderer, question, &names, compact, args)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Ask one question under one framing, and report.
+fn ask(
+    engine: &mut LlamaCppEngine,
+    renderer: &Renderer,
+    question: &Question,
+    names: &[String],
+    compact: bool,
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut rendered =
+        renderer.render(question.text, args.system.as_deref())?;
+    rendered.push_str(&args.prefix);
+
+    // `special = true`: a chat render is full of control tokens and they
+    // must resolve to their single ids, not to their spellings. Same
+    // call `Session` makes. Harmless under raw framing, which contains
+    // no control tokens to parse.
+    let prompt_tokens = engine.model().tokenize(&rendered, true);
+
+    println!("\n  ── {} · {}", question.label, quoted(question.text));
 
     // The confound that makes a probe worthless without saying so: a
     // candidate name that appears in the prompt is not being *recalled*,
@@ -277,10 +465,9 @@ fn probe(
         .collect();
     if !leaked.is_empty() {
         println!(
-            "\n  ⚠ the prompt itself names {} — the template or --system \
-             told the\n    model what it is. Those rows measure \
-             instruction-following, not\n    recall. Re-read the render \
-             with --verbose before quoting them.",
+            "     ⚠ the prompt itself names {} — the template or --system \
+             told the model\n       what it is. Those rows measure \
+             instruction-following, not recall.",
             leaked.join(", "),
         );
     }
@@ -290,13 +477,13 @@ fn probe(
     }
 
     // One free-standing peek at the answer position, shared by both
-    // modes: the header's sanity line in scoring mode, the main event
-    // under `--unconstrained`.
+    // modes: the sanity line in scoring mode, the main event under
+    // `--unconstrained`.
     let k = if args.unconstrained { args.top_k } else { 3 };
-    let peeked = peek(&mut engine, &prompt_tokens, k.max(1));
+    let peeked = peek(engine, &prompt_tokens, k.max(1));
 
     println!(
-        "\n  argmax at answer position: {} p={:.4}",
+        "     argmax {} p={:.4}",
         quoted(&peeked[0].piece),
         peeked[0].p,
     );
@@ -304,25 +491,191 @@ fn probe(
     // The trap this example is most likely to be quoted through. If the
     // model's own next move is to open a structured channel — Harmony's
     // `<|channel|>`, an un-suppressed `<think>` — then the answer
-    // position is not where the answer goes, and every score below is
+    // position is not where the answer goes, and a score taken there is
     // conditioned on a continuation the model would never have written.
     // Exact test, not a heuristic: ask the vocabulary.
+    //
+    // `--seek` mostly dissolves this on its own: the greedy walk steps
+    // through the channel opener like any other preamble and measures
+    // past it. So the warning stays factual about the *position* and
+    // stops short of condemning the numbers — the `↳ measured after`
+    // line says whether the walk got out.
     if engine.model().special_tokens().contains(&peeked[0].id) {
+        let advice = if args.seek == 0 {
+            "Scores below are counterfactual until --seek or\n       \
+             --prefix moves the probe inside it."
+        } else {
+            "--seek should step past it; check the\n       \
+             ↳ line below for where this was actually measured."
+        };
         println!(
-            "  ⚠ that is a control token — the model opens a structured \
-             channel here,\n    not an answer. Scores below are \
-             counterfactual until --prefix moves\n    the probe inside \
-             the channel (see the module docs)."
+            "     ⚠ that is a control token — the model opens a structured \
+             channel here,\n       not an answer. {advice}"
         );
     }
 
     if args.unconstrained {
-        unconstrained(&mut engine, &prompt_tokens, &peeked, args);
+        unconstrained(engine, &prompt_tokens, &peeked, args);
     } else {
-        scored(&mut engine, &prompt_tokens, &names, args);
+        let leading_space = args.leading_space
+            || wants_leading_space(engine, &rendered, &prompt_tokens);
+        scored(
+            engine,
+            &prompt_tokens,
+            &rendered,
+            names,
+            leading_space,
+            compact,
+            args,
+        );
     }
 
     Ok(())
+}
+
+/// Should candidates be scored as `" Name"` rather than `"Name"`?
+///
+/// Byte-level BPE carries a word's preceding space on the *front* of its
+/// token, so the right spelling depends entirely on what the prompt ends
+/// with — and getting it wrong deflates every score by orders of
+/// magnitude while leaving the ranking intact, which is the worst kind of
+/// wrong: invisible in the shape of the answer, fatal to the numbers.
+///
+/// Two cases mean the space is already accounted for:
+///
+/// * The prompt ends in whitespace — a chat template's `…assistant\n`.
+/// * The prompt ends in a **control token** — Harmony's `<|message|>`
+///   runs straight into content. Checked against the vocabulary rather
+///   than by sniffing for angle brackets.
+///
+/// Everything else (`Assistant:`, `--prefix "My name is"`) is mid-line
+/// text, and the next token carries the space. Deriving this rather than
+/// flagging it is what makes chat and raw framings comparable at all.
+fn wants_leading_space(
+    engine: &LlamaCppEngine,
+    rendered: &str,
+    prompt_tokens: &[Token],
+) -> bool {
+    if rendered.chars().next_back().is_none_or(char::is_whitespace) {
+        return false;
+    }
+    match prompt_tokens.last() {
+        Some(last) => !engine.model().special_tokens().contains(last),
+        None => false,
+    }
+}
+
+/// `--prompt` (repeatable) wins; then `--battery`; then one default.
+fn resolve_questions(args: &Args) -> Vec<Question> {
+    if !args.prompt.is_empty() {
+        return args
+            .prompt
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Question {
+                // Leaked deliberately: `Question` holds `&'static str` so
+                // the battery can be a const, and an example that asks a
+                // handful of questions and exits does not need to pay
+                // lifetime plumbing for it.
+                label: Box::leak(format!("q{i}").into_boxed_str()),
+                text: Box::leak(text.clone().into_boxed_str()),
+            })
+            .collect();
+    }
+    if args.battery {
+        return BATTERY
+            .iter()
+            .map(|q| Question {
+                label: q.label,
+                text: q.text,
+            })
+            .collect();
+    }
+    vec![Question {
+        label: "plain",
+        text: DEFAULT_QUESTION,
+    }]
+}
+
+// ===========================================================================
+// Framing
+// ===========================================================================
+
+/// How a question becomes prompt text.
+enum Renderer {
+    Chat {
+        template: ChatTemplate,
+        origin: String,
+        digest: String,
+    },
+    Raw,
+}
+
+impl Renderer {
+    fn build(
+        engine: &LlamaCppEngine,
+        model_path: &Path,
+        args: &Args,
+        framing: Framing,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if framing == Framing::Raw {
+            return Ok(Renderer::Raw);
+        }
+        let (template, source) = load_template(engine, model_path, args)?;
+        Ok(Renderer::Chat {
+            template,
+            origin: source.origin,
+            digest: source.digest,
+        })
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Renderer::Chat { origin, digest, .. } => {
+                format!("chat · {origin} · sha256 {digest}")
+            }
+            Renderer::Raw => {
+                "raw · \"User: …\\nAssistant:\" (out of distribution)".into()
+            }
+        }
+    }
+
+    fn render(
+        &self,
+        question: &str,
+        system: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        match self {
+            Renderer::Chat { template, .. } => {
+                let mut prompt = Prompt::default()
+                    .messages([(Role::User, question.to_string())])?;
+                if let Some(system) = system {
+                    prompt = prompt.system(system.to_string());
+                }
+                // `thinking` is left unset, so `enable_thinking` renders
+                // false and a Qwen-style template closes an empty
+                // reasoning block for us.
+                let opts =
+                    RenderOptions::default().with_generation_prompt(true);
+                Ok(template.render_with(&prompt, &opts)?)
+            }
+            // No trailing space after `Assistant:`. A dangling space is
+            // its own tokenization artifact — BPE wants to carry it on
+            // the front of the following token — which is why raw framing
+            // scores `" Name"` (see `--leading-space`).
+            Renderer::Raw => {
+                let mut out = String::new();
+                if let Some(system) = system {
+                    out.push_str(system);
+                    out.push_str("\n\n");
+                }
+                out.push_str("User: ");
+                out.push_str(question);
+                out.push_str("\nAssistant:");
+                Ok(out)
+            }
+        }
+    }
 }
 
 /// Which Jinja source actually rendered the prompt.
@@ -347,9 +700,16 @@ struct TemplateSource {
 fn load_template(
     engine: &LlamaCppEngine,
     model_path: &Path,
+    args: &Args,
 ) -> Result<(ChatTemplate, TemplateSource), Box<dyn std::error::Error>> {
     let model = engine.model();
-    let sidecar_path = model_path.with_extension("template.jinja");
+    // `--template` outranks both, so a template can be edited and the
+    // edit's effect measured — strip gpt-oss's "You are ChatGPT" line and
+    // ask again, for instance.
+    let (sidecar_path, explicit) = match &args.template {
+        Some(path) => (path.clone(), true),
+        None => (model_path.with_extension("template.jinja"), false),
+    };
 
     if let Some(source) =
         drama_llama::sidecar::load_template_source(&sidecar_path)?
@@ -364,13 +724,17 @@ fn load_template(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let kind = if explicit { "--template" } else { "sidecar" };
         return Ok((
             template,
             TemplateSource {
-                origin: format!("sidecar ({name})"),
+                origin: format!("{kind} ({name})"),
                 digest,
             },
         ));
+    }
+    if explicit {
+        return Err(format!("--template {sidecar_path:?} not found").into());
     }
 
     let digest = match model.chat_template_source() {
@@ -446,16 +810,25 @@ struct Score {
     joint: f64,
 }
 
-fn scored(
+/// Every candidate scored at one position, best first, plus Σ.
+struct Measurement {
+    scores: Vec<Score>,
+    total: f64,
+    /// The model's own words between the answer position and where this
+    /// was measured. Empty at offset 0.
+    opener: String,
+}
+
+fn measure(
     engine: &mut LlamaCppEngine,
-    prompt_tokens: &[Token],
+    tokens: &[Token],
     names: &[String],
-    args: &Args,
-) {
+    leading_space: bool,
+) -> Measurement {
     let mut scores: Vec<Score> = names
         .iter()
         .filter_map(|name| {
-            let score = score_name(engine, prompt_tokens, name);
+            let score = score_name(engine, tokens, name, leading_space);
             // A candidate that tokenizes to nothing cannot be scored, but
             // dropping it quietly would leave the reader believing the
             // table covers everything they asked for.
@@ -466,8 +839,124 @@ fn scored(
         })
         .collect();
     scores.sort_by(|a, b| b.joint.total_cmp(&a.joint));
+    let total = scores.iter().map(|s| s.joint).sum();
+    Measurement {
+        scores,
+        total,
+        opener: String::new(),
+    }
+}
 
-    let total: f64 = scores.iter().map(|s| s.joint).sum();
+/// Follow the model's greedy continuation and measure at whichever of its
+/// first `seek` positions it is most nearly naming itself.
+///
+/// Picking by Σ is the whole trick. Σ is exactly "how much probability
+/// sits on *some* candidate name here", so maximising it walks to where
+/// the answer actually lands — without anyone deciding in advance what
+/// the preamble should be. The model writes `Soy un modelo de lenguaje
+/// llamado`; we just follow it there. Choosing that opener by hand would
+/// be putting a thumb on the scale; following it is not.
+fn seek_best(
+    engine: &mut LlamaCppEngine,
+    prompt_tokens: &[Token],
+    rendered: &str,
+    names: &[String],
+    seek: usize,
+    args: &Args,
+) -> Measurement {
+    let mut options = PredictOptions::greedy().add_model_stops(engine.model());
+    options.n = NonZeroUsize::new(seek).unwrap();
+    let path: Vec<Token> = engine
+        .predict_tokens(prompt_tokens.to_vec(), options, None)
+        .collect();
+
+    let mut walk: Vec<Measurement> = Vec::with_capacity(path.len() + 1);
+    for offset in 0..=path.len() {
+        let opener = engine
+            .model()
+            .tokens_to_string(path[..offset].iter().copied());
+        let mut tokens = prompt_tokens.to_vec();
+        tokens.extend_from_slice(&path[..offset]);
+        let text = format!("{rendered}{opener}");
+        let leading_space =
+            args.leading_space || wants_leading_space(engine, &text, &tokens);
+
+        let mut m = measure(engine, &tokens, names, leading_space);
+        m.opener = opener;
+        walk.push(m);
+    }
+
+    // The *earliest* position that gets within a whisker of the best —
+    // not the best outright. Taking the max walks past the model's own
+    // answer whenever it names itself early and then repeats: Qwen under
+    // raw framing writes `<think></think>Qwen`, and measuring after that
+    // scores `P(Qwen | …Qwen…)`, which is repetition wearing recall's
+    // clothes. First arrival is the honest one, and the tolerance stops a
+    // rounding difference from pushing us past it.
+    let peak = walk.iter().map(|m| m.total).fold(0.0f64, f64::max);
+    walk.into_iter()
+        .find(|m| m.total >= 0.9 * peak)
+        .expect("the peak is one of the measurements")
+}
+
+fn scored(
+    engine: &mut LlamaCppEngine,
+    prompt_tokens: &[Token],
+    rendered: &str,
+    names: &[String],
+    leading_space: bool,
+    compact: bool,
+    args: &Args,
+) {
+    let Measurement {
+        scores,
+        total,
+        opener,
+    } = match args.seek {
+        0 => measure(engine, prompt_tokens, names, leading_space),
+        seek => seek_best(engine, prompt_tokens, rendered, names, seek, args),
+    };
+    if !opener.is_empty() {
+        println!("     ↳ measured after the model's own {}", quoted(&opener));
+    }
+    let share = |joint: f64| {
+        if total > 0.0 {
+            100.0 * joint / total
+        } else {
+            0.0
+        }
+    };
+
+    // A battery is read down the column, not across the row: what matters
+    // is whether the winner *changes* between questions, so each question
+    // gets one line and the full table stays behind `--verbose`.
+    if compact {
+        let top: Vec<String> = scores
+            .iter()
+            .take(3)
+            .map(|s| format!("{} {:.2}", s.name, share(s.joint)))
+            .collect();
+        let focus = scores
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(&args.focus))
+            .map(|i| {
+                format!(
+                    "   │ {} #{} {:.2}",
+                    scores[i].name,
+                    i + 1,
+                    share(scores[i].joint)
+                )
+            })
+            .unwrap_or_default();
+        println!(
+            "     {}{}   Σ={:.3e}{}",
+            top.join(" · "),
+            focus,
+            total,
+            sigma_note(total)
+        );
+        return;
+    }
 
     println!();
     println!(
@@ -483,21 +972,18 @@ fn scored(
             score.name,
             score.steps.len(),
             format!("{:.3e}", score.joint),
-            if total > 0.0 {
-                100.0 * score.joint / total
-            } else {
-                0.0
-            },
+            share(score.joint),
             ranks.join(","),
         );
     }
     println!("  {}", "─".repeat(58));
     println!(
-        "  {:<12} {:>3}  {:>11}   (mass on everything else: {:.2}%)",
+        "  {:<12} {:>3}  {:>11}   (mass on everything else: {:.2}%){}",
         "Σ",
         "",
         format!("{total:.3e}"),
         100.0 * (1.0 - total).max(0.0),
+        sigma_note(total),
     );
 
     if args.verbose {
@@ -515,6 +1001,26 @@ fn scored(
     }
 }
 
+/// Σ is the load-bearing number and the easiest one to skip past.
+///
+/// It is the total probability that the very next tokens spell *any*
+/// candidate — i.e. how much the model is actually trying to name itself
+/// right here. When it is high, `share` is a real answer. When it is
+/// ~1e-5 the model is writing a sentence ("You are speaking to…", "Hey!
+/// I'm…") and `share` has renormalised a rounding error into a
+/// confident-looking percentage. Both are worth seeing; conflating them
+/// is how a table lies.
+///
+/// The threshold is deliberately loose. This is a "stop and look" mark,
+/// not a verdict.
+fn sigma_note(total: f64) -> &'static str {
+    if total < 0.01 {
+        "  ⚠ not naming itself here — share is renormalised noise"
+    } else {
+        ""
+    }
+}
+
 /// `P(name | prompt)` by forcing the name's tokens one at a time.
 ///
 /// Returns `None` for a name that tokenizes to nothing.
@@ -522,15 +1028,29 @@ fn score_name(
     engine: &mut LlamaCppEngine,
     prompt_tokens: &[Token],
     name: &str,
+    leading_space: bool,
 ) -> Option<Score> {
-    // `tokenize_special(name, false, false)`: no automatic BOS (we are
-    // continuing a prompt, not starting one) and no special-token
+    // `tokenize_special(spelling, false, false)`: no automatic BOS (we
+    // are continuing a prompt, not starting one) and no special-token
     // parsing (a name is content, and content never spells a control
-    // token). The name is tokenized standalone, so if the model would
-    // have preferred a leading-space variant this is a lower bound —
-    // applied identically to every candidate, so the comparison holds.
+    // token).
+    //
+    // `leading_space` picks which spelling is scored. It matters more
+    // than it looks: BPE carries a word's preceding space on the front of
+    // its token, so after a chat template's assistant header `"Claude"`
+    // is right and `" Claude"` is near-impossible, while after
+    // `"Assistant:"` it is the other way round. Getting it backwards
+    // deflates every candidate uniformly — the ranking survives, the
+    // probabilities do not. Uniform across candidates either way, so a
+    // run is internally comparable; only cross-framing comparisons need
+    // this to be right.
     let model = engine.model();
-    let tokens = model.tokenize_special(name, false, false);
+    let spelling = if leading_space {
+        format!(" {name}")
+    } else {
+        name.to_string()
+    };
+    let tokens = model.tokenize_special(&spelling, false, false);
     let n = NonZeroUsize::new(tokens.len())?;
     let pieces: Vec<String> =
         tokens.iter().map(|&t| model.token_to_piece(t)).collect();
@@ -626,8 +1146,7 @@ fn print_header(
     engine: &LlamaCppEngine,
     model_path: &Path,
     args: &Args,
-    template: &TemplateSource,
-    prompt_tokens: &[Token],
+    questions: &[Question],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let model = engine.model();
     let bar = "═".repeat(66);
@@ -664,8 +1183,6 @@ fn print_header(
             .get_meta("general.name")
             .unwrap_or_else(|| "(unset)".into()),
     );
-    field("template", &template.origin);
-    field("template sha256", &template.digest);
     field(
         "system prompt",
         &match &args.system {
@@ -673,7 +1190,6 @@ fn print_header(
             None => "(none)".into(),
         },
     );
-    field("question", &quoted(&args.prompt));
     field(
         "prefix",
         &if args.prefix.is_empty() {
@@ -682,7 +1198,38 @@ fn print_header(
             quoted(&args.prefix)
         },
     );
-    field("prompt tokens", &prompt_tokens.len().to_string());
+    field(
+        "questions",
+        &format!(
+            "{} ({})",
+            questions.len(),
+            questions
+                .iter()
+                .map(|q| q.label)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    );
+    field("framing", args.framing.label());
+    field(
+        "seek",
+        &match args.seek {
+            0 => "0 (answer position only)".to_string(),
+            n => format!("{n} greedy tokens, measured at max Σ"),
+        },
+    );
+    field(
+        "candidates",
+        &format!(
+            "{} (focus: {})",
+            if args.name.is_empty() {
+                DEFAULT_NAMES.len()
+            } else {
+                args.name.len()
+            },
+            args.focus,
+        ),
+    );
     println!(" {}", "─".repeat(65));
 
     Ok(())
