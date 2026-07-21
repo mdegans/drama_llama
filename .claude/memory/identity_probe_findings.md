@@ -107,6 +107,51 @@ missing; the persona does not reach it.
 Which is the uncomfortable version: **applying the model's own chat
 template makes it less able to identify itself than raw completion.**
 
+Caveat on calling raw framing "the pretraining distribution" (Mike):
+`User:/Assistant:` is the **Alpaca/Vicuna-era instruction format**, not
+the absence of a format. It saturates scraped instruction data, ShareGPT
+dumps and posted local-model transcripts. So it is a *different, older
+persona* Google never tuned — which is also why `Llama` places #2
+(21.90%) in exactly that frame.
+
+### Did Google ablate the name in English? No.
+
+Mike's hypothesis: trained in, then suppressed in English only. It makes
+a testable prediction the persona story does not — an ablated token
+should be depressed in **third-person factual** contexts too, where no
+self-reference is involved. Raw framing, prefix ending on the slot:
+
+| probe | result | Gemma rank | Σ |
+|---|---|---|---|
+| EN `Google's family of open-weight language models is called ___` | **Gemma 95.05%** | **0** (argmax, p=.382) | .402 |
+| ES same fact | Gemma 95.74% | 2 (p=.087) | .091 |
+| EN alt `…released by Google DeepMind is named ___` | Gemma 82.27% | 2 (p=.250) | .304 |
+| EN `The Gemma family … was created by ___` | **Google 99.99%** | 0 (p=.730) | .730 |
+
+In English third-person `Gemma` is the **most likely token in the whole
+vocabulary**, and English is *stronger* than Spanish in absolute
+probability (.382 vs .087), not weaker. GPT sits at rank 307. The model
+also knows Gemma is Google's at 99.99%.
+
+So no English-specific ablation. The failure is narrower:
+
+| same model, same language, same fact | answer |
+|---|---|
+| "Google's open model family is called ___" | **Gemma 95%** (rank 0) |
+| "*your* name is ___" (assistant persona) | **GPT 95%**, Gemma 4% |
+
+**It knows the fact and does not apply it to itself.** The knowledge is
+not self-indexed inside the assistant persona — consistent with English
+post-training reinforcing the deflection ("I'm a large language model
+trained by Google") so heavily that a naming response never formed.
+Nothing was removed; the first-person connection was never made.
+
+Limit: this rules out token-level suppression, not something
+context-specific in activation space. But a suppression sparing
+third-person and killing only first-person is behaviourally
+indistinguishable from the persona account, so the practical answer
+stands.
+
 So the accurate claim is *not* "Gemma thinks it is GPT in English". It is
 **Gemma's English name knowledge exists but is weak enough to lose to the
 pretraining prior in the most natural phrasing.** The original result is
