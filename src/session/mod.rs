@@ -1152,26 +1152,63 @@ fn find_injected_special_in_prompt(
     None
 }
 
-/// Index of the first message carrying an open thought
-/// ([`crate::prompt::OPEN_THOUGHT_SIGNATURE`]), if any — the check
-/// behind [`SessionError::UnrenderableOpenThought`].
+/// Index of the first message carrying an **unrenderable** open thought
+/// ([`crate::prompt::OPEN_THOUGHT_SIGNATURE`]) — the check behind
+/// [`SessionError::UnrenderableOpenThought`].
 ///
-/// An open thought is a reasoning block with no close marker. There is
-/// no way to render one through the chat template: the template lays
-/// out its own close and normalizes the surrounding whitespace
-/// irreversibly (Qwen3.6 `|trim`s content and `lstrip`/`rstrip`s the
-/// split halves), so the re-rendered bytes cannot match the KV the
-/// thought was generated against. Rendering it anyway is a silent
-/// prefix-cache miss, which on a long prompt is minutes of prefill —
-/// hence a hard error instead. Prune and resubmit
+/// An open thought is a reasoning block with no close marker. Exactly
+/// one position can be rendered byte-exactly: the sole block of the
+/// trailing assistant message, which
+/// [`chat_template::open_thought_tail`] withholds from the template and
+/// appends to the finished generation prompt. Anywhere else, the
+/// template would have to lay out bytes around it, and it normalizes
+/// whitespace irreversibly (Qwen3.6 `|trim`s content and
+/// `lstrip`/`rstrip`s the halves it splits on `</think>`) — so the
+/// re-rendered prefix could not match the KV the thought was generated
+/// against. That is a silent prefix-cache miss, minutes of prefill on a
+/// long prompt, so it is a hard error instead: prune and resubmit
 /// ([`crate::prompt::prune_open_thoughts`]).
+///
+/// Renderable ⟺ sole-block-of-the-tail, so this rejects shapes a caller
+/// can assemble in good faith — prose before a spontaneous `<think>`
+/// leaves a leading `Text`, making `[Text, Thought(open)]`. That shape
+/// mis-renders today; the error is the honest version of it.
+///
+/// `dialect_renders_open` gates on whether the model's dialect can
+/// express a resumed reasoning block at all: Harmony (gpt-oss) never
+/// pre-opens a channel in its generation prompt, and a dialect with no
+/// reasoning markers has nothing to resume.
 ///
 /// Model-free and pure, like [`find_injected_special_in_prompt`], so
 /// the walk is unit-testable without loading a model.
-fn find_open_thought(prompt: &Prompt) -> Option<usize> {
-    prompt.messages.iter().position(|msg| {
-        msg.content.0.iter().any(crate::prompt::is_open_thought)
+fn find_open_thought(
+    prompt: &Prompt,
+    dialect_renders_open: bool,
+) -> Option<usize> {
+    let renderable_tail = dialect_renders_open
+        && crate::chat_template::open_thought_tail(prompt).is_some();
+    let last = prompt.messages.len().saturating_sub(1);
+    prompt.messages.iter().enumerate().find_map(|(i, msg)| {
+        let carries = msg.content.0.iter().any(crate::prompt::is_open_thought);
+        let excused = renderable_tail && i == last;
+        (carries && !excused).then_some(i)
     })
+}
+
+/// Can this dialect express a *resumed* reasoning block — i.e. can a
+/// render end inside an open reasoning region the model will continue?
+///
+/// Requires a reasoning open marker to append, and excludes
+/// [`Family::Harmony`]: gpt-oss's generation prompt ends at
+/// `<|start|>assistant` and never pre-opens a channel, which
+/// `dialect::emit` mirrors by collapsing both eager anchors into one
+/// shape. A Harmony truncation is still *flagged* open by the parser —
+/// it just gets rejected here rather than silently re-rendered with an
+/// `<|end|>` the model never emitted.
+fn dialect_renders_open_thought(dialect: &crate::CallSyntax) -> bool {
+    dialect.family != crate::dialect::Family::Harmony
+        && dialect.reasoning.mode != crate::dialect::ReasoningMode::None
+        && !dialect.reasoning.start.trim().is_empty()
 }
 
 /// Per-call random media sentinel: 32 hex chars (128 bits), never
@@ -2073,6 +2110,7 @@ impl<B: Backend> Session<B> {
         let template = ChatTemplate::from_model(&engine.model)?;
         let dialect = analyze_dialect(&engine.model);
         let thought_reingest = dialect.reasoning.reingest;
+        let reasoning_start = dialect.reasoning.start.clone();
         let mut session = Self {
             engine,
             template,
@@ -2085,7 +2123,8 @@ impl<B: Backend> Session<B> {
             render_opts: RenderOptions::default()
                 .with_generation_prompt(true)
                 .with_extra("preserve_thinking", true)
-                .with_thought_reingest(thought_reingest),
+                .with_thought_reingest(thought_reingest)
+                .with_reasoning_start(reasoning_start),
             sample_options: SamplerConfig::default(),
             seed: None,
             emit_specials_ban: true,
@@ -2286,8 +2325,14 @@ impl<B: Backend> Session<B> {
     /// (Opus 4.5+ / Sonnet 4.6+) keep prior-turn thinking blocks too.
     /// Opt out with `.with_extra("preserve_thinking", false)`; the
     /// variable is inert for templates that don't read it.
+    /// The reasoning open marker is likewise forced from the analyzed
+    /// dialect: it is a fact about the model, not a preference, and
+    /// without it a prompt ending in an open thought would fail to
+    /// render ([`ChatTemplateError::OpenThoughtUnsupported`]).
     pub fn with_render_opts(mut self, opts: RenderOptions) -> Self {
-        let mut opts = opts.with_generation_prompt(true);
+        let mut opts = opts
+            .with_generation_prompt(true)
+            .with_reasoning_start(&self.dialect.reasoning.start);
         if !opts.extras.iter().any(|(k, _)| k == "preserve_thinking") {
             opts = opts.with_extra("preserve_thinking", true);
         }
@@ -2920,7 +2965,10 @@ impl<B: Backend> Session<B> {
         &self,
         prompt: &Prompt,
     ) -> Result<(), SessionError> {
-        match find_open_thought(prompt) {
+        match find_open_thought(
+            prompt,
+            dialect_renders_open_thought(&self.dialect),
+        ) {
             Some(index) => Err(SessionError::UnrenderableOpenThought { index }),
             None => Ok(()),
         }
@@ -2989,7 +3037,8 @@ impl<B: Backend> Session<B> {
             prompt,
             &self.dialect,
             &self.output_config_opts,
-            render_ends_with_open_reasoning(&rendered, &self.dialect),
+            render_ends_with_open_reasoning(&rendered, &self.dialect)
+                || prompt_resumes_open_reasoning(prompt, &self.dialect),
         )? {
             None => (None, None),
             Some(crate::CompiledOutputConfig::Single(g)) => (Some(g), None),
@@ -3279,8 +3328,13 @@ impl<B: Backend> Session<B> {
                 Vec::new(),
             )
         };
+        // Generation begins mid-thought either because the template
+        // scaffolded a bare open marker, or because the prompt's own
+        // tail is a prefilled/resumed open thought the renderer
+        // appended after that scaffold.
         let pre_opened_reasoning =
-            render_ends_with_open_reasoning(&rendered_prompt, &self.dialect);
+            render_ends_with_open_reasoning(&rendered_prompt, &self.dialect)
+                || prompt_resumes_open_reasoning(prompt, &self.dialect);
 
         let (grammar_mode, deferred_grammar) = match resolve_grammar(
             prompt,
@@ -3938,7 +3992,49 @@ impl<B: Backend> Session<B> {
         let mut extended = prompt.clone();
         let asst: misanthropic::prompt::message::AssistantMessage =
             blocks.iter().cloned().collect();
-        extended.messages.push(asst.into());
+        let mut asst: crate::Message = asst.into();
+        // Continuation turns MERGE rather than append. When the prompt's
+        // tail is an open thought, the completion resumed it — seating
+        // the new blocks as a *separate* assistant message would push
+        // the open thought into mid-history, where it is unrenderable,
+        // and the canonicalization gate would fail on every continued
+        // turn: exactly the lost auto-tip this machinery exists to
+        // prevent. After the merge, a continued turn is byte-identical
+        // to one that ran to completion in a single call.
+        //
+        // Internal-only: the public API never merges for the caller
+        // (`complete_blocks` returns new blocks; an un-merged prompt
+        // errors loudly at ingest). This is the one place that knows
+        // both halves belong to one turn.
+        if let Some(seed) =
+            crate::chat_template::open_thought_tail(&extended).map(String::from)
+        {
+            extended.messages.pop();
+            match asst.content.0.first_mut() {
+                // The completion resumed the thought: one contiguous
+                // byte run, so the bodies concatenate and the openness
+                // is whatever the *continuation* ended as — closed if
+                // it finished the block, still open if it ran out the
+                // clock again. Note this is NOT `merge_adjacent_prose`,
+                // which refuses to merge across openness: there the
+                // blocks are separated by real `</think>…<think>`
+                // bytes, here they are not separated by anything.
+                Some(crate::Block::Thought { thought, .. }) => {
+                    *thought = format!("{seed}{thought}").into();
+                }
+                // The completion closed the block immediately, emitting
+                // no further reasoning (`push_thought` drops an empty
+                // body), so the seed *is* the whole, now-closed thought.
+                _ => asst.content.0.insert(
+                    0,
+                    crate::Block::Thought {
+                        thought: seed.into(),
+                        signature: "".into(),
+                    },
+                ),
+            }
+        }
+        extended.messages.push(asst);
         let mut opts = self.render_opts.clone().with_generation_prompt(false);
         if let Some(sentinel) = media_sentinel {
             opts = opts.with_media_sentinel(sentinel);
@@ -5410,6 +5506,15 @@ fn resolve_grammar(
 /// (`pre_opened_reasoning` in [`crate::dialect::parse_text`] — the
 /// unforced-path fix for issue #27). The tag is the dialect's, not a
 /// hardcoded `<think>`.
+///
+/// Deliberately narrow — it only recognizes the *bare* trailing marker.
+/// The other way a render can end inside a reasoning block is a
+/// prefilled/resumed open thought, and that case is known from the
+/// prompt rather than sniffed from the string (see
+/// [`prompt_resumes_open_reasoning`]). Widening this to "last open
+/// marker occurs after the last close" would let an unmatched `<think>`
+/// in a final user or tool message flip the grammar anchor — content
+/// deciding framing, which is the bug class this crate keeps out.
 fn render_ends_with_open_reasoning(
     rendered: &str,
     dialect: &crate::CallSyntax,
@@ -5419,6 +5524,25 @@ fn render_ends_with_open_reasoning(
     }
     let start = dialect.reasoning.start.trim();
     !start.is_empty() && rendered.trim_end().ends_with(start)
+}
+
+/// Whether the prompt itself ends inside a reasoning block, because its
+/// tail is a prefilled or resumed open thought that the renderer
+/// appends after the generation prompt.
+///
+/// The `||` partner of [`render_ends_with_open_reasoning`]: together
+/// they answer "does generation begin mid-thought?", one from the
+/// template's scaffold and one from the prompt's own tail. Both feed
+/// the same two consumers — [`Anchor::EagerThoughtPreOpened`] for the
+/// grammar, and `pre_opened_reasoning` for the parser.
+///
+/// [`Anchor::EagerThoughtPreOpened`]: crate::dialect::Anchor
+fn prompt_resumes_open_reasoning(
+    prompt: &Prompt,
+    dialect: &crate::CallSyntax,
+) -> bool {
+    dialect_renders_open_thought(dialect)
+        && crate::chat_template::open_thought_tail(prompt).is_some()
 }
 
 /// Everything [`Session::prepare_call_cached`] derives from a prompt
@@ -5921,7 +6045,7 @@ mod tests {
         let clean = Prompt::default()
             .add_message((crate::Role::User, "hi"))
             .unwrap();
-        assert_eq!(find_open_thought(&clean), None);
+        assert_eq!(find_open_thought(&clean, true), None);
 
         // A closed thought is not an open one — polarity check.
         let closed = crate::Block::Thought {
@@ -5930,17 +6054,29 @@ mod tests {
         };
         assert!(!is_open_thought(&closed));
 
+        // The renderable shape: sole block of the trailing assistant
+        // message. Excused on a dialect that can resume a reasoning
+        // block, rejected on one that cannot (Harmony, or no markers).
         let mut with_open = clean.clone();
         with_open.messages.push(crate::Message {
             role: crate::Role::Assistant,
             content: crate::Content(vec![open_thought("cut off")]),
         });
-        assert_eq!(find_open_thought(&with_open), Some(1));
+        assert_eq!(find_open_thought(&with_open, true), None);
+        assert_eq!(find_open_thought(&with_open, false), Some(1));
+
+        // Mid-history is never renderable, whatever the dialect.
+        let mut mid = with_open.clone();
+        mid.messages
+            .push(crate::Message::from((crate::Role::User, "and?")));
+        assert_eq!(find_open_thought(&mid, true), Some(1));
 
         // The shape a caller assembles in good faith from
         // `complete_blocks`: prose before a spontaneous `<think>`
-        // leaves a leading Text. Still rejected — it cannot render
-        // byte-exactly — and `prune_open_thoughts` is the remedy.
+        // leaves a leading Text, so the thought is not the sole block
+        // and cannot be appended after the generation prompt. Rejected
+        // even though it is at the tail; `prune_open_thoughts` is the
+        // remedy the error names.
         let mut mixed = clean.clone();
         mixed.messages.push(crate::Message {
             role: crate::Role::Assistant,
@@ -5949,9 +6085,9 @@ mod tests {
                 open_thought("cut off"),
             ]),
         });
-        assert_eq!(find_open_thought(&mixed), Some(1));
+        assert_eq!(find_open_thought(&mixed, true), Some(1));
         assert_eq!(crate::prompt::prune_open_thoughts(&mut mixed), 1);
-        assert_eq!(find_open_thought(&mixed), None);
+        assert_eq!(find_open_thought(&mixed, true), None);
         assert_eq!(mixed.messages.len(), 2, "the Text block survives pruning");
 
         // Pruning a sole open thought drops the now-empty message.

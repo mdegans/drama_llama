@@ -89,8 +89,15 @@ defense-in-depth on both.
 
   The fuller "mark a thought open so the renderer omits `</think>`" idea
   was NOT dropped — it graduated into its own deliberate feature,
-  [#59](https://github.com/mdegans/drama_llama/issues/59) (open /
-  continuable / prefillable thoughts). Key points settled in discussion:
+  [#59](https://github.com/mdegans/drama_llama/issues/59), which
+  **landed 2026-07-21 — see [[open_thought_blocks]]** for the mechanism
+  and its two non-obvious couplings (`render_extended` must merge; the
+  pre-opened check is an OR, not a widened scan). One correction to the
+  notes below: "the renderer omits the close" is the wrong mechanism —
+  the trailing thought is *withheld from the template entirely* and
+  appended to the finished generation prompt, because anything that
+  reaches Jinja gets its whitespace normalized irreversibly. Key points
+  settled in discussion:
   the flag lives in the **existing unused `signature` field** (no
   `misanthropic` schema change — a body sentinel was rejected as `[Invalid
   UTF-8]`-class content pollution, #55); the overload is safe (we never

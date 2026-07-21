@@ -247,10 +247,21 @@ impl ChatTemplate {
         if opts.media_sentinel.is_none() && prompt_has_images(prompt) {
             return Err(ChatTemplateError::MediaUnsupported);
         }
+        // An open thought at the tail is *withheld* from the template
+        // and appended to the finished render instead — see
+        // `open_thought_tail`. Its bytes must never pass through Jinja.
+        let open_tail = open_thought_tail(prompt);
+        let reasoning_start = match (open_tail, &opts.reasoning_start) {
+            (Some(_), None) => {
+                return Err(ChatTemplateError::OpenThoughtUnsupported)
+            }
+            (_, start) => start.as_deref().unwrap_or_default(),
+        };
         let messages = build_messages(
             prompt,
             opts.thought_reingest,
             opts.media_sentinel.as_deref(),
+            open_tail.is_some(),
         );
         // Only custom (client-executed) tool defs render into the
         // template; server tools execute on Anthropic's side and their
@@ -283,13 +294,21 @@ impl ChatTemplate {
         // only add the derived value when the caller hasn't.
         let extras_has_thinking =
             opts.extras.iter().any(|(k, _)| k == "enable_thinking");
+        // An open trailing thought IS a generation prompt: the model
+        // resumes *inside* the reasoning block, so the render must end
+        // at the assistant header (plus the withheld body) and never
+        // close the turn. This overrides the caller's setting, which
+        // is what keeps the partial-render and canonicalization paths
+        // — both of which pass `false` — consistent with the full one.
+        let add_generation_prompt =
+            opts.add_generation_prompt || open_tail.is_some();
         let base_ctx = if extras_has_thinking {
             minijinja::context! {
                 bos_token => &self.bos_token,
                 eos_token => &self.eos_token,
                 messages => messages,
                 tools => tools_value,
-                add_generation_prompt => opts.add_generation_prompt,
+                add_generation_prompt => add_generation_prompt,
                 date_string => date_string,
             }
         } else {
@@ -298,7 +317,7 @@ impl ChatTemplate {
                 eos_token => &self.eos_token,
                 messages => messages,
                 tools => tools_value,
-                add_generation_prompt => opts.add_generation_prompt,
+                add_generation_prompt => add_generation_prompt,
                 date_string => date_string,
                 enable_thinking => prompt.thinking.is_some(),
             }
@@ -319,7 +338,28 @@ impl ChatTemplate {
         let tmpl = env
             .get_template(self.template_name)
             .map_err(ChatTemplateError::from_jinja)?;
-        tmpl.render(ctx).map_err(ChatTemplateError::from_jinja)
+        let mut out =
+            tmpl.render(ctx).map_err(ChatTemplateError::from_jinja)?;
+        // Append the withheld open thought, raw. Byte-exactness is the
+        // whole point: the KV cache holds these bytes verbatim, and
+        // anything routed through Jinja would come back normalized
+        // (Qwen3.6 `|trim`s message content and lstrip/rstrip's the
+        // halves it splits on `</think>`), making `\n` and `\n\n\n`
+        // indistinguishable.
+        if let Some(body) = open_tail {
+            // The open marker comes from whichever side actually emits
+            // it: a thinking-enabled template ends its generation
+            // prompt with `<think>` already, so appending another would
+            // duplicate it. Otherwise (thinking off — Qwen scaffolds a
+            // *closed* `<think>\n\n</think>\n\n` — or a template with
+            // no reasoning scaffold) we supply it, which reproduces the
+            // exact bytes a spontaneous unclosed `<think>` emitted.
+            if !out.trim_end().ends_with(reasoning_start) {
+                out.push_str(reasoning_start);
+            }
+            out.push_str(body);
+        }
+        Ok(out)
     }
 
     /// Render the prompt plus one partial render per `cache_control`
@@ -467,6 +507,19 @@ pub struct RenderOptions {
     ///
     /// [`Block::Image`]: crate::Block
     pub media_sentinel: Option<String>,
+    /// The dialect's reasoning **open** marker, trimmed (`"<think>"`).
+    /// Required only to render a prompt whose tail is an *open* thought
+    /// ([`OPEN_THOUGHT_SIGNATURE`]); such a prompt fails with
+    /// [`ChatTemplateError::OpenThoughtUnsupported`] when this is
+    /// unset, never a silently dropped body. `Session` sets it from the
+    /// analyzed dialect, beside [`Self::thought_reingest`].
+    ///
+    /// Trimmed on purpose: the parser matches the trimmed form and the
+    /// model emits the trimmed form; any canonical whitespace around
+    /// the marker belongs to the template, not to us.
+    ///
+    /// [`OPEN_THOUGHT_SIGNATURE`]: crate::prompt::OPEN_THOUGHT_SIGNATURE
+    pub reasoning_start: Option<String>,
 }
 
 impl RenderOptions {
@@ -515,6 +568,19 @@ impl RenderOptions {
         S: Into<String>,
     {
         self.media_sentinel = Some(sentinel.into());
+        self
+    }
+
+    /// Builder: set the dialect's reasoning open marker (see
+    /// [`RenderOptions::reasoning_start`]). Stored trimmed; an
+    /// all-whitespace or empty marker is treated as absent, since a
+    /// dialect with no open marker cannot express an open thought.
+    pub fn with_reasoning_start<S>(mut self, start: S) -> Self
+    where
+        S: AsRef<str>,
+    {
+        let start = start.as_ref().trim();
+        self.reasoning_start = (!start.is_empty()).then(|| start.to_string());
         self
     }
 }
@@ -791,13 +857,20 @@ fn build_messages(
     prompt: &Prompt,
     reingest: crate::dialect::ReasoningReingest,
     media_sentinel: Option<&str>,
+    withhold_tail: bool,
 ) -> Vec<JinjaValue> {
     let mut out: Vec<JinjaValue> =
         Vec::with_capacity(prompt.messages.len() + 1);
     if let Some(system) = prompt.system.as_ref() {
         out.push(text_message("system", flatten_text(system, media_sentinel)));
     }
-    for m in &prompt.messages {
+    let messages = match withhold_tail {
+        // The trailing open-thought message is rendered by the caller,
+        // after the generation prompt — see `open_thought_tail`.
+        true => &prompt.messages[..prompt.messages.len() - 1],
+        false => &prompt.messages[..],
+    };
+    for m in messages {
         let role = match m.role {
             Role::User => "user",
             Role::Assistant => "assistant",
@@ -1054,6 +1127,39 @@ fn append_block_text(
         // level; redacted thoughts, documents, and the server-tool
         // block family contribute no template-visible text.
         _ => {}
+    }
+}
+
+/// The body of a renderable *open* thought at the prompt's tail, if
+/// there is one.
+///
+/// An open thought ([`OPEN_THOUGHT_SIGNATURE`]) is a reasoning block the
+/// model never closed, or one a caller prefilled to steer the reasoning.
+/// It renders by being withheld from the template and appended to the
+/// finished generation prompt, so the only expressible position is the
+/// **sole block of the trailing assistant message** — anything else
+/// would need the template to lay out bytes around it, and the template
+/// normalizes whitespace irreversibly.
+///
+/// Returning `None` for every other position is not a silent pass:
+/// `Session` rejects those at ingest
+/// ([`SessionError::UnrenderableOpenThought`]) before rendering is
+/// reached. This function only decides *renderable or not*.
+///
+/// [`OPEN_THOUGHT_SIGNATURE`]: crate::prompt::OPEN_THOUGHT_SIGNATURE
+/// [`SessionError::UnrenderableOpenThought`]: crate::SessionError::UnrenderableOpenThought
+pub(crate) fn open_thought_tail(prompt: &Prompt) -> Option<&str> {
+    let last = prompt.messages.last()?;
+    if last.role != Role::Assistant {
+        return None;
+    }
+    match last.content.0.as_slice() {
+        [Block::Thought { thought, signature }]
+            if signature.as_ref() == crate::prompt::OPEN_THOUGHT_SIGNATURE =>
+        {
+            Some(thought.as_ref())
+        }
+        _ => None,
     }
 }
 
@@ -1353,6 +1459,23 @@ pub enum ChatTemplateError {
          configured; this renderer cannot represent images"
     )]
     MediaUnsupported,
+    /// The prompt's tail is an *open* thought
+    /// ([`OPEN_THOUGHT_SIGNATURE`]) but no reasoning open marker was
+    /// configured ([`RenderOptions::reasoning_start`]), so there is
+    /// nothing to resume the reasoning block with. Rendering the body
+    /// without its marker would hand the model prose where it expects
+    /// to be mid-thought; dropping the body would lose it silently.
+    /// Neither is acceptable, so this is typed.
+    ///
+    /// `Session` always configures the marker from the analyzed
+    /// dialect, so this only reaches direct [`ChatTemplate`] callers.
+    ///
+    /// [`OPEN_THOUGHT_SIGNATURE`]: crate::prompt::OPEN_THOUGHT_SIGNATURE
+    #[error(
+        "prompt ends with an open thought but no reasoning open marker \
+         is configured; set `RenderOptions::with_reasoning_start`"
+    )]
+    OpenThoughtUnsupported,
 }
 
 impl ChatTemplateError {
@@ -2067,6 +2190,122 @@ mod tests {
             max_ttl(CacheTtl::FiveMinutes, CacheTtl::FiveMinutes),
             CacheTtl::FiveMinutes
         );
+    }
+
+    /// The load-bearing property of the whole open-thought feature:
+    /// rendering a prompt whose tail is an open thought produces
+    /// exactly `<the generation prompt> ++ <the thought's bytes>`.
+    ///
+    /// The body deliberately ends in `\n\n\n`. Whitespace is the entire
+    /// game — the KV cache holds the model's bytes verbatim, and any
+    /// path through Jinja would normalize them away (Qwen3.6 `|trim`s
+    /// message content), making `\n` and `\n\n\n` indistinguishable and
+    /// the re-render a silent cache miss.
+    #[test]
+    fn open_thought_tail_appends_raw_after_generation_prompt() {
+        let base = Prompt::default().add_message((Role::User, "why?")).unwrap();
+        let opts = RenderOptions::default()
+            .with_generation_prompt(true)
+            .with_reasoning_start("<think>");
+
+        let generation_prompt =
+            qwen3_like_tmpl().render_with(&base, &opts).unwrap();
+
+        let body = "Weighing the two options.\n\n\n";
+        let mut resumed = base.clone();
+        resumed.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(vec![crate::prompt::open_thought(body)]),
+        });
+        let rendered = qwen3_like_tmpl().render_with(&resumed, &opts).unwrap();
+
+        assert_eq!(
+            rendered,
+            format!("{generation_prompt}<think>{body}"),
+            "an open tail must render as generation prompt ++ raw body",
+        );
+        // No close marker, and the turn is never ended: the model
+        // resumes *inside* the reasoning block.
+        assert!(!rendered.contains("</think>"));
+        assert!(rendered.ends_with("\n\n\n"));
+    }
+
+    /// The append happens even when the caller asked for
+    /// `add_generation_prompt=false` — an open trailing thought IS a
+    /// generation prompt, and this is what keeps the partial-render and
+    /// canonicalization paths (which both pass `false`) consistent with
+    /// the full render.
+    #[test]
+    fn open_thought_tail_forces_the_generation_prompt() {
+        let mut prompt =
+            Prompt::default().add_message((Role::User, "why?")).unwrap();
+        prompt.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(vec![crate::prompt::open_thought("hmm")]),
+        });
+        let rendered = qwen3_like_tmpl()
+            .render_with(
+                &prompt,
+                &RenderOptions::default()
+                    .with_generation_prompt(false)
+                    .with_reasoning_start("<think>"),
+            )
+            .unwrap();
+        assert!(rendered.ends_with("<|im_start|>assistant<think>hmm"));
+    }
+
+    /// A dialect with no reasoning open marker cannot resume a thought.
+    /// Dropping the body would be the silent failure this whole feature
+    /// exists to eliminate, so it is typed.
+    #[test]
+    fn open_thought_without_marker_is_typed_error() {
+        let mut prompt =
+            Prompt::default().add_message((Role::User, "why?")).unwrap();
+        prompt.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(vec![crate::prompt::open_thought("hmm")]),
+        });
+        assert!(matches!(
+            qwen3_like_tmpl().render_with(&prompt, &RenderOptions::default()),
+            Err(ChatTemplateError::OpenThoughtUnsupported),
+        ));
+    }
+
+    /// Only the sole-block trailing assistant shape is diverted. A
+    /// leading `Text` beside it, or a non-tail position, renders the
+    /// ordinary way — `Session` rejects those at ingest, so the
+    /// renderer must not silently treat them as resumable.
+    #[test]
+    fn open_thought_tail_requires_sole_block_at_the_tail() {
+        let base = Prompt::default().add_message((Role::User, "why?")).unwrap();
+
+        let mut with_text = base.clone();
+        with_text.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(vec![
+                Block::from("\n"),
+                crate::prompt::open_thought("hmm"),
+            ]),
+        });
+        assert!(open_thought_tail(&with_text).is_none());
+
+        let mut not_tail = base.clone();
+        not_tail.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(vec![crate::prompt::open_thought("hmm")]),
+        });
+        not_tail
+            .messages
+            .push(Message::from((Role::User, "still there?")));
+        assert!(open_thought_tail(&not_tail).is_none());
+
+        // A user turn can never carry reasoning.
+        let mut user_side = base.clone();
+        user_side.messages.push(Message {
+            role: Role::User,
+            content: Content(vec![crate::prompt::open_thought("hmm")]),
+        });
+        assert!(open_thought_tail(&user_side).is_none());
     }
 
     #[test]

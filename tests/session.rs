@@ -826,3 +826,110 @@ fn complete_response_id_uses_supplied_uuid() {
         "response.id must match the supplied UUID",
     );
 }
+
+/// The payoff of #59, stated as an assertion: a thought truncated by
+/// `max_tokens` comes back flagged **open**, can be seated straight back
+/// onto the prompt, and the resumed call reads the whole thing from the
+/// prefix cache instead of re-prefilling it.
+///
+/// This is what byte-exact re-rendering buys. The open thought is
+/// withheld from the chat template and appended to the finished
+/// generation prompt verbatim; route it through Jinja instead and the
+/// template's `|trim` silently eats the trailing whitespace, the bytes
+/// stop matching the KV, and every continuation costs a full re-prefill.
+///
+/// Deliberately greedy: openness is a structural property, not a
+/// sampled one, but a stochastic run could finish reasoning inside the
+/// budget and make the test vacuous.
+#[test]
+#[ignore = "requires model"]
+fn truncated_thought_resumes_from_cache() {
+    use drama_llama::prompt::is_open_thought;
+    use misanthropic::prompt::thinking::Thinking;
+
+    let asked = Prompt::default()
+        .system("You are a helpful assistant.")
+        .thinking(Thinking::Enabled {
+            budget_tokens: NonZeroU32::new(512).unwrap(),
+            display: None,
+        })
+        .add_message((Role::User, "Explain why the sky is blue."))
+        .unwrap()
+        // Small enough that reasoning cannot finish.
+        .max_tokens(NonZeroU32::new(48).unwrap());
+
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_with_n_ctx(model_path(), 4096)
+            .expect("session load")
+            .quiet()
+            .with_sample_options(drama_llama::SamplerConfig::greedy())
+            .with_prefix_cache(true);
+
+    let cut = session.complete_blocks(&asked).expect("first call");
+    let partial = cut.first().expect("at least one block");
+    assert!(
+        is_open_thought(partial),
+        "a thought cut off by max_tokens must come back open: {cut:#?}",
+    );
+
+    // Seat it exactly as returned — sole block of the trailing
+    // assistant message, the only renderable position.
+    let mut resumed = asked.max_tokens(NonZeroU32::new(64).unwrap());
+    resumed.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![partial.clone()]),
+    });
+
+    let response = session.complete_response(&resumed).expect("resumed call");
+    let read = response.usage.counts.cache_read_input_tokens.unwrap_or(0);
+    let created = response
+        .usage
+        .counts
+        .cache_creation_input_tokens
+        .unwrap_or(0);
+    assert!(
+        read > 0,
+        "resuming an open thought must reuse the KV, not re-prefill \
+         (read {read}, created {created})",
+    );
+    assert!(
+        created <= 2,
+        "the seed re-renders byte-exactly, so at most a token or two is \
+         new (read {read}, created {created})",
+    );
+}
+
+/// The invariant that keeps the above honest: an open thought anywhere
+/// it cannot be rendered byte-exactly is a typed error, not a silent
+/// mis-render. `[Text, Thought(open)]` is the shape a caller assembles
+/// in good faith when the model emitted prose before an unclosed
+/// `<think>`, so it is the one worth pinning.
+#[test]
+#[ignore = "requires model"]
+fn unrenderable_open_thought_is_rejected() {
+    let mut prompt = Prompt::default().add_message((Role::User, "hi")).unwrap();
+    prompt.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![
+            Block::from("\n"),
+            drama_llama::prompt::open_thought("cut off mid-reason"),
+        ]),
+    });
+
+    let mut session =
+        drama_llama::LlamaCppSession::from_path_sync(model_path())
+            .expect("session load")
+            .quiet();
+
+    let err = session.complete_blocks(&prompt).unwrap_err();
+    assert!(
+        matches!(err, SessionError::UnrenderableOpenThought { index: 1 }),
+        "expected UnrenderableOpenThought, got {err:?}",
+    );
+    // The error names its own remedy, and the remedy works.
+    assert!(err.to_string().contains("prune_open_thoughts"));
+    assert_eq!(drama_llama::prompt::prune_open_thoughts(&mut prompt), 1);
+    session
+        .complete_blocks(&prompt)
+        .expect("clean after pruning");
+}
