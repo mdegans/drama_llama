@@ -323,6 +323,30 @@ to a human can differ ~30× in what they measure. Any identity probe must
 report which frame it induced — `--seek`'s `↳ measured after` line does
 exactly that, which is the second reason it earns its keep.
 
+## Open threads
+
+* **Quantisation is an unaddressed confound.** Every Gemma number here is
+  from `gemma-4-31B-it-qat-UD-Q4_K_XL` (Q4_0 QAT). A weak association
+  (Gemma 4%) losing to a strong prior (GPT 95%) is exactly what
+  quantisation would exaggerate. Re-run at higher precision before
+  treating the size of the effect as real — if it shrinks, the finding
+  becomes "quantisation erodes a weak self-name", which is different and
+  also worth having. Mike is on this.
+* **Gemma 2 and 3.** Same behaviour across generations reads as policy
+  (supporting the rebrand-motive account); a change reads as accident.
+  Not in `models/`; `--all` picks them up automatically if they land
+  there. Older Gemmas may need template work — `--framing raw` sidesteps
+  it, and is arguably the better instrument anyway since it is the same
+  frame across every model.
+* **Read the Gemma model/system card.** Is any of this documented? Mike's
+  prior, and mine: "says GPT-4o unprompted" is not in there.
+* **Σ-collapse as a conflict signature.** Told it was Gemma, Qwen
+  complied on share while its willingness to name itself at all fell 17×
+  (Σ .958 → .055). If that generalises, trained-vs-prompted identity
+  conflict shows up as *reluctance* rather than pushback — invisible to
+  any share-only measurement. Nobody has characterised this; the
+  instrument already measures it.
+
 ## Method notes worth keeping
 
 * **Σ decides whether a row means anything.** It is the total
