@@ -486,6 +486,15 @@ where
             if display == prompt.model.to_string() {
                 session
             } else {
+                // Free the outgoing model BEFORE loading the incoming
+                // one. Without this the old session stays bound across
+                // the `.await`, so a model switch peaks at both models
+                // resident — ~38 GB for a pair of 19 GB models, which
+                // a 24 GB card does not survive. Nothing is lost by
+                // dropping early: on the `?` path below the session is
+                // gone either way, having already been `take`n out of
+                // the lock.
+                drop(session);
                 load_session(
                     &state.args.model_path,
                     prompt.model.to_string(),
