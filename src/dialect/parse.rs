@@ -565,7 +565,13 @@ impl<'a> Parser<'a> {
 
     fn parse_thought(&mut self, open: &str) {
         let start = self.pos;
-        debug_assert!(self.eat(open));
+        // NOT `debug_assert!(self.eat(open))`: `debug_assert!` does not
+        // evaluate its argument in release builds, so the marker would
+        // go unconsumed and end up inside the thought body — frame
+        // bytes seated as content, and a release-only divergence no
+        // debug test can see (#62). Consume first, assert second.
+        let ate = self.eat(open);
+        debug_assert!(ate, "parse_thought: open marker not at self.pos");
         let end = self.syntax.reasoning.end.trim();
         match self.rest().find(end) {
             Some(at) => {
@@ -1144,7 +1150,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_dict_object(&mut self) -> DictOutcome {
-        debug_assert!(self.eat("{"));
+        // Consume first, assert second — see `parse_thought` (#62).
+        let ate = self.eat("{");
+        debug_assert!(ate, "parse_dict_object: `{{` not at self.pos");
         let mut map = serde_json::Map::new();
         loop {
             self.skip_ws();
@@ -1187,7 +1195,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_dict_array(&mut self) -> DictOutcome {
-        debug_assert!(self.eat("["));
+        // Consume first, assert second — see `parse_thought` (#62).
+        let ate = self.eat("[");
+        debug_assert!(ate, "parse_dict_array: `[` not at self.pos");
         let mut items = Vec::new();
         loop {
             self.skip_ws();
