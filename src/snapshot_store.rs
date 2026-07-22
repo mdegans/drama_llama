@@ -78,6 +78,12 @@ impl SnapshotStore {
     }
 
     /// Remove and return the snapshot at `key`, if any.
+    ///
+    /// The mirror of [`Self::get`]: llama.cpp takes + re-inserts around
+    /// its `&mut self` FFI call, so this is llama.cpp-only and dead in a
+    /// moeflux-only build — hence the cfg on the lint, pointing the
+    /// opposite way to `get`'s.
+    #[cfg_attr(not(feature = "llama-cpp"), allow(dead_code))]
     pub(crate) fn take(&mut self, key: (i32, i32)) -> Option<Vec<u8>> {
         let bytes = self.map.remove(&key)?;
         self.order.retain(|k| *k != key);
@@ -105,6 +111,9 @@ impl SnapshotStore {
         self.order.clear();
     }
 
+    /// Number of live snapshots. Read only by llama.cpp's
+    /// `checkpoint_count`, so it is dead in a moeflux-only build.
+    #[cfg_attr(not(feature = "llama-cpp"), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }

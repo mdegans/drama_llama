@@ -95,6 +95,33 @@ empirically, because the doc comments lie about it (`session_gemma4` and
 and `inspect_prompt` documents `--features cli` while using nothing from
 `cli`). One `cargo check` per file.
 
+## Triaging the dead-code warnings the new configurations surface
+
+Building configurations nobody built before means seeing warnings nobody
+saw before. They are **not one thing**, and the difference decides the fix:
+
+**A. Asymmetric pair — one backend uses each.** Real signal, worth a
+`#[cfg_attr(not(feature = "..."), allow(dead_code))]`. `SnapshotStore` is
+the type case: moeflux `get`s (its `Ctx` is a disjoint field) while
+llama.cpp must `take` + re-insert around its `&mut self` FFI call. `get`
+already had the attribute; `take`/`len` never got the mirror image,
+because until #68 nothing compiled the build that would warn.
+
+**B. Backend-free build, backend-dependent code.** Expected, and *not*
+worth an attribute. In `trait-layer` there is no `Session` to construct,
+so anything reachable only from a session — e.g. `seed_prose_block`'s
+calls to `resolved_ignored_contains` / `seed_prompt_ngram` — is
+unreachable by construction and every generic over `M: Model` goes
+uninstantiated. Sprinkling `allow(dead_code)` to silence this would be
+noise proportional to the crate, and would suppress the class-A warnings
+that *do* mean something. The gate's job for `trait-layer` is that it
+**compiles**; warnings there are a property of the configuration.
+
+**The trap in both cases** is concluding "unused" from a search. Two of
+these looked dead and were not — see the counting/pipe discipline above.
+Check the call site before believing the warning, and check it with
+complete output.
+
 ## `just test moeflux` spans two configurations
 
 Not an accident, and don't "simplify" it back:

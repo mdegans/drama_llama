@@ -126,19 +126,35 @@ unless marked otherwise.
   backgroundable commands (builds, test suites, `profile.py`,
   `bench.py`). If the command is backgrounded (by me or by Mike),
   the harness captures only what the pipe emitted, so `| tail`
-  throws away the part I actually need. Instead: `cmd > /tmp/x.log
-  2>&1` then `grep`/`Read` the file. This bit me three times in one
-  session before it went here. (Hit again 2026-07-22 by Opus 4.8:
-  piped a `grep` through `| head`, ten test hits filled the window, and
-  I read the truncated result as *absence* — nearly reported a
-  production call site as missing. Absence of evidence, from a
-  truncated pipe, is not evidence of absence. Then again the same day,
-  one step worse: piped a `for` loop over `just test <mode>` through
-  `| head -70` to check the wiring. `head` exits, SIGPIPE kills the
-  loop — but not before the first iteration ran the **real** test
-  suite. A pipe doesn't only hide output; on a loop it decides how
-  much work gets launched. Use a `--dry-run` flag if one exists, and
-  redirect to a file if one doesn't.)
+  throws away the part I actually need.
+
+  **The rule, because the anecdotes stopped being enough:** if I am
+  going to *reason about* a command's output — conclude something
+  exists, doesn't exist, passed, or failed — it does not go through
+  `head` or `tail`. Redirect to a file and `grep`/`Read` it. If the
+  worry is volume, `grep -c` first, or make the pattern narrower. For
+  anything long-running or loop-shaped, use a `--dry-run` if one
+  exists and write one if it doesn't.
+
+  Five instances now, escalating, which is why it's a rule and not a
+  story. Three in one session for 4.7 (`| tail` on backgrounded
+  builds). Then 2026-07-22, Opus 4.8, three more in a single session:
+  (1) `| head` on a grep, ten test hits filled the window, read the
+  truncation as *absence*, nearly reported a live call site as
+  missing; (2) `| head -70` on a `for` loop over `just test <mode>` —
+  SIGPIPE killed the loop, but only after the first iteration launched
+  the **real** suite, so the pipe decided how much *work ran*, not
+  just how much I saw; (3) same `| head`-on-a-grep mistake as (1),
+  same session, and this time I didn't catch it — I wrote "called from
+  nothing but its own tests" into a GitHub issue about
+  `SnapshotStore::take`, which is called from
+  `src/llama_cpp/decoder.rs:804`. Mike was about to delete it on my
+  say-so; it would have broken the llama.cpp restore path.
+
+  The tell for (1)/(3): I am about to claim something is *unused* or
+  *missing* on the strength of a search. That claim is exactly the one
+  a truncated pipe fabricates, so it is the one that needs the
+  unpiped, complete result.
 
 
 ### Fable 5
