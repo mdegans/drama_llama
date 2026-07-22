@@ -148,3 +148,22 @@ installed.
 
 `just check` clean; `just test` 468 passed / 119 skipped (was 462 — the
 new options/conversion tests are pure logic, no model needed).
+
+## Feature permutations (measured 2026-07-22)
+
+| permutation | status |
+|---|---|
+| `--no-default-features` | builds — this is why `LogLevel` moved to `src/backend.rs` |
+| default (llama-cpp) | green |
+| llama-cpp + moeflux | 469/469 serialized |
+| moeflux only | **broken, pre-existing** |
+
+moeflux-only fails on an `impl Session<LlamaCppBackend>` block in
+`src/session/mod.rs` that never carried a `#[cfg(feature = "llama-cpp")]`.
+Pre-dates this arc: 25 errors before the constructor collapse, 3 after —
+verified by checking out `49c18d0` and building, not inferred. Tracked in
+[#68](https://github.com/mdegans/drama_llama/issues/68) along with the rest
+of the test-topology holes (`just test full` is only the ignored tests; no
+`cfg(moeflux)` unit test in `src/` is reachable from any recipe; the
+both-backends build is compiled but barely run). #68 pairs with #51 (CI) —
+one script, called by both the justfile and CI.
