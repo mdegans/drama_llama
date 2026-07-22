@@ -49,9 +49,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use drama_llama::{
     backend::{Backend, Model},
+    cli::{default_backend_kind, BackendKind},
     prompt::{AnthropicError, MessageResponse, Usage},
     FromPath, ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
 };
@@ -119,32 +120,6 @@ struct Args {
     /// convention is to open `/probe` before sending `/v1/messages`.
     #[arg(long, default_value_t = false)]
     probe_stream: bool,
-}
-
-/// Inference backend selector. Variants are cfg-gated to whichever crate
-/// features are enabled.
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum BackendKind {
-    #[cfg(feature = "llama-cpp")]
-    LlamaCpp,
-    #[cfg(all(feature = "moeflux", target_os = "macos"))]
-    Moeflux,
-}
-
-/// Default `--backend` value: prefer llama-cpp when both backends are compiled
-/// in (it's been the default for the lifetime of blallama).
-const fn default_backend_kind() -> BackendKind {
-    #[cfg(feature = "llama-cpp")]
-    {
-        BackendKind::LlamaCpp
-    }
-    #[cfg(all(
-        all(feature = "moeflux", target_os = "macos"),
-        not(feature = "llama-cpp"),
-    ))]
-    {
-        BackendKind::Moeflux
-    }
 }
 
 #[derive(Clone)]

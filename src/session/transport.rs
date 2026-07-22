@@ -175,6 +175,59 @@ where
     }
 }
 
+/// A [`SessionTransport`] with its backend erased — what a caller holds when
+/// the model behind it is chosen at runtime rather than at compile time.
+///
+/// [`Transport`] is the whole interface for driving a completion, and it is
+/// dyn-compatible, so backend polymorphism above the session needs no
+/// `Session` trait and no generic parameter: a caller takes
+/// `Arc<dyn LocalTransport>` and the one `match` that names
+/// `LlamaCppBackend` or `MoefluxBackend` lives at construction. (Code spans,
+/// not links — either backend may be absent from a given build.)
+///
+/// This trait exists because erasing to a bare `dyn Transport` would drop
+/// [`SessionTransport::scan_text_for_specials`], which has no API-side
+/// counterpart — a remote endpoint cannot be prompt-injected with *its own*
+/// framing tokens, and a local one can. Relay tools need that guard after
+/// erasure, so it rides along as the trait's one method.
+///
+/// Both prompt-type supertraits are listed because [`SessionTransport`]
+/// serves both and callers use both ([`CachedPrompt`] for frozen-prefix
+/// flows). A trait object implements its supertraits, so
+/// `Arc<dyn LocalTransport>` is a valid `T: Transport` for anything generic
+/// over one — the [`Chat`](misanthropic::chat::Chat) driver included — while
+/// still carrying the scan. One erased type, not two.
+#[async_trait::async_trait]
+pub trait LocalTransport:
+    Transport<Prompt, Error = SessionError>
+    + Transport<CachedPrompt, Error = SessionError>
+{
+    /// [`Session::scan_text_for_specials`] through the erased transport —
+    /// see [`SessionTransport::scan_text_for_specials`] for semantics.
+    async fn scan_text_for_specials(
+        &self,
+        text: &str,
+    ) -> Option<(Token, String)>;
+}
+
+#[async_trait::async_trait]
+impl<B> LocalTransport for SessionTransport<B>
+where
+    B: Backend + 'static,
+    Session<B>: Send,
+{
+    async fn scan_text_for_specials(
+        &self,
+        text: &str,
+    ) -> Option<(Token, String)> {
+        // Resolves to the inherent method of the same name (inherent wins
+        // over trait), which is the real implementation; this is a forward,
+        // not a recursion. Both exist so a caller holding a concrete
+        // `SessionTransport` needs no `use` of this trait.
+        SessionTransport::scan_text_for_specials(self, text).await
+    }
+}
+
 #[cfg(feature = "llama-cpp")]
 static_assertions::assert_impl_all!(
     crate::LlamaCppSession: Send
@@ -182,6 +235,17 @@ static_assertions::assert_impl_all!(
 #[cfg(feature = "llama-cpp")]
 static_assertions::assert_impl_all!(
     SessionTransport<crate::LlamaCppBackend>: Send, Sync, Clone
+);
+// The erasure, compile-gated. Everything downstream of `CommonArgs` hangs
+// off `Arc<dyn LocalTransport>` satisfying `T: Transport` for both prompt
+// types; if that holds, the examples compile.
+static_assertions::assert_impl_all!(
+    std::sync::Arc<dyn LocalTransport>:
+        Transport<Prompt>,
+        Transport<CachedPrompt>,
+        Send,
+        Sync,
+        Clone
 );
 static_assertions::assert_impl_all!(
     SessionError: std::error::Error, Send, Sync

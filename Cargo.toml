@@ -60,7 +60,7 @@ rustc-hash = "2"
 sha2 = "0.10"
 minijinja = { version = "2.5", features = ["loader", "json"] }
 minijinja-contrib = { version = "2.5", features = ["pycompat"] }
-misanthropic = { version = "1.0.0-alpha.11", default-features = false, features = [
+misanthropic = { version = "1.0.0-alpha.12", default-features = false, features = [
     "partial-eq",
 ] }
 
@@ -200,7 +200,7 @@ tempfile = "3"
 # `tests/blallama.rs` drives the blallama binary over HTTP with the
 # real API client. The library dependency above disables default
 # features (no HTTP); tests re-enable the client half.
-misanthropic = { version = "1.0.0-alpha.11", default-features = false, features = [
+misanthropic = { version = "1.0.0-alpha.12", default-features = false, features = [
     "partial-eq",
     "client",
     "rustls-tls",
@@ -352,3 +352,9 @@ features = [
 # Scrape the examples above into the rendered docs (nightly-only
 # rustdoc feature; docs.rs builds on nightly).
 cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+
+# TEMPORARY (#48): misanthropic#140 adds `impl Transport for Arc<T>`, which
+# `examples/utils::CommonArgs` needs to hand `Chat` an erased transport.
+# Drop this and pin `1.0.0-alpha.12` above once the tag is published.
+[patch.crates-io]
+misanthropic = { path = "../misanthropic/misanthropic" }

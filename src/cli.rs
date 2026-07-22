@@ -53,3 +53,41 @@ impl From<&Args> for llama_context_params {
         params
     }
 }
+
+/// Inference backend selector for a `--backend` flag. Variants are cfg-gated
+/// to whichever crate features are enabled, so a single-backend build gets a
+/// single-variant flag rather than one that can name a backend that isn't
+/// there.
+///
+/// Shared by `bin/blallama` and the examples' `CommonArgs` so there is one
+/// answer to "which backends does this build have" rather than one per
+/// consumer.
+///
+/// Note the `cli` feature implies `llama-cpp` (see `Cargo.toml`), so
+/// [`Self::LlamaCpp`] is always present wherever this type compiles today.
+/// The cfg is kept anyway: it is what the enum *means*, and it is what makes
+/// splitting `cli` into `clap`-only a one-line change rather than a hunt.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum BackendKind {
+    #[cfg(feature = "llama-cpp")]
+    LlamaCpp,
+    #[cfg(all(feature = "moeflux", target_os = "macos"))]
+    Moeflux,
+}
+
+/// Default `--backend` value: prefer llama-cpp when both backends are
+/// compiled in (it has been blallama's default for its whole life, and it is
+/// the backend the example models are packaged for).
+pub const fn default_backend_kind() -> BackendKind {
+    #[cfg(feature = "llama-cpp")]
+    {
+        BackendKind::LlamaCpp
+    }
+    #[cfg(all(
+        all(feature = "moeflux", target_os = "macos"),
+        not(feature = "llama-cpp"),
+    ))]
+    {
+        BackendKind::Moeflux
+    }
+}

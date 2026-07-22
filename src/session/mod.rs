@@ -112,7 +112,7 @@ use crate::{
 #[cfg(feature = "tokio")]
 mod transport;
 #[cfg(feature = "tokio")]
-pub use transport::SessionTransport;
+pub use transport::{LocalTransport, SessionTransport};
 
 #[cfg(feature = "llama-cpp")]
 use crate::{silence_logs, LlamaCppBackend, NewError};
