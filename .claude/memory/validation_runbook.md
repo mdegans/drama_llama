@@ -7,9 +7,14 @@ the per-release checklist lives in the publish-session plan memos.
 
 ## Never run model-backed tests with `cargo test`
 
-**Use `just test` (unignored) and `just test full` (the `#[ignore]`d
-model/GPU tests).** Both go through `cargo-nextest`, which runs each test
-in its own process; the `full` profile serializes them.
+**Use `just test` (unignored) and `just test ignored` (the `#[ignore]`d
+model/GPU tests); `just test all` is both.** All go through `cargo-nextest`,
+which runs each test in its own process; the `full` *nextest profile*
+serializes them.
+
+(The mode used to be called `just test full`, which did NOT mean everything
+— only the ignored set. Renamed in #68; `full` is now a hard error that
+tells you to pick `ignored` or `all`. The nextest profile keeps the name.)
 
 `cargo test` overlaps test *binaries* — and `--test-threads=1` does not
 fix it, since that only serializes *within* one binary. With a ~19 GB

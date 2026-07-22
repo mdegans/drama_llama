@@ -132,7 +132,13 @@ unless marked otherwise.
   piped a `grep` through `| head`, ten test hits filled the window, and
   I read the truncated result as *absence* — nearly reported a
   production call site as missing. Absence of evidence, from a
-  truncated pipe, is not evidence of absence.)
+  truncated pipe, is not evidence of absence. Then again the same day,
+  one step worse: piped a `for` loop over `just test <mode>` through
+  `| head -70` to check the wiring. `head` exits, SIGPIPE kills the
+  loop — but not before the first iteration ran the **real** test
+  suite. A pipe doesn't only hide output; on a loop it decides how
+  much work gets launched. Use a `--dry-run` flag if one exists, and
+  redirect to a file if one doesn't.)
 
 
 ### Fable 5
@@ -235,6 +241,15 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`test_topology.md`](.claude/memory/test_topology.md)
+  — **read before adding a test recipe, a feature, or a
+  `#[cfg(feature = "llama-cpp")]`.** `scripts/test.py` owns the topology
+  (configuration × tier); the justfile delegates to it and the hooks call
+  the justfile. Why `just test full` is now a hard error rather than an
+  alias, why no configuration is tested under the name "default", why
+  `just test moeflux` deliberately spans two configurations, and the
+  `nextest list` count discipline that catches a backend-agnostic test
+  being silently gated behind `llama-cpp`.
 - [`truncated_call_containment.md`](.claude/memory/truncated_call_containment.md)
   — **read before proposing any "just ban the token" fix.** Why a
   truncated tool call cannot be prevented, only contained: the four
@@ -382,33 +397,47 @@ Mike as if it were his. He flagged it; he can't always tell either.)
 
 ## Build & Test Commands
 
+**Never run the model-backed tests with `cargo test`.** It overlaps test
+*binaries* — `--test-threads=1` does not fix that, since it only serializes
+*within* one binary — so two ~19 GB models load at once and the OOM surfaces
+as a llama.cpp decode failure (`Fatal { code: -3 }`) that reads like a
+regression. Tell: the failing test name changes between runs while the
+pass/fail counts stay identical. Everything below goes through
+`cargo-nextest`, which gives each test its own process.
+
+`just` recipes are thin wrappers over `scripts/test.py`, which owns the test
+topology so the justfile and CI cannot drift from each other (#68). Run
+`python3 scripts/test.py --help` for the full interface, or use it directly on
+Windows — the recipe bodies are bash.
+
 ```bash
-# Build (library only, no optional features)
-cargo build
+just setup            # install cargo-nextest (once)
+just install-hooks    # point git at .githooks/ (once)
 
-# Build with all doc-visible features
-cargo build --features "webchat,cli,stats,toml,serde,egui"
+# Tests. Configuration (which backend) and tier (which tests) are separate
+# axes; these modes are the useful combinations.
+just test             # unignored tests, llama.cpp, GPU-accelerated
+just test ignored     # ONLY the #[ignore]'d model tests, serialized
+just test all         # genuinely everything — unignored AND ignored
+just test cpu         # unignored, no CUDA
+just test moeflux     # the moeflux-only configuration, plus cross-backend
+just test both        # unignored tests with BOTH backends linked
+just test NAME        # tests/suites matching NAME, any tier, uncaptured
 
-# Run tests (requires models/model.gguf to be a valid GGUF model)
-cargo test
+# Gates. `check` is what the pre-commit hook runs (fast, static);
+# `permutations` builds every feature configuration including test targets,
+# and is for pre-release or after touching cfgs/features.
+just check
+just permutations
+just permutations --dry-run   # print the cargo invocations, run nothing
 
-# Run a single test
-cargo test test_name
-
-# Run long-running tests (ignored by default, require a model)
-cargo test -- --ignored
-
-# Run tests including long-running ones
-cargo test -- --include-ignored
-
-# Build binaries (each has required features)
-cargo build --bin dittomancer --features "webchat,cli"
-cargo build --bin regurgitater --features "webchat,cli,stats"
-cargo build --bin settings_tool --features "egui,serde"
-
-# Generate docs
-cargo doc --open --features "webchat,cli,stats,toml,serde,egui"
+just fmt              # rustfmt the tree (the hook enforces this)
+just doc              # rustdoc with broken intra-doc links as hard errors
+just example whodunit # run an example against `just test`'s build
 ```
+
+The model-backed tests need `models/model.gguf` to be a valid GGUF (usually a
+symlink). `just test moeflux` additionally wants the expert shards mounted.
 
 ## Architecture
 
