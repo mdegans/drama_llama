@@ -39,9 +39,8 @@ non-emptiness (`0234162`), so it will not catch a recurrence.
 (`1cc85d6`) precisely so the sidecar is the knob: edit
 `<model>.sampling.toml`, re-run, compare. `--seed` supplies
 determinism. So the A/B is: seeded-from-metadata chain vs. the tuned
-default, same prompt, same seed — on **quality**, not tok/s (tok/s
-will differ too, because different tokens mean different MoE routing,
-but that is not the question).
+default, same prompt, same seed — on **quality**, not tok/s. (Measured
+2026-07-22: tok/s is a wash, both ~24 — see below.)
 
 Quality needs a judged comparison, not an assertion: run both chains
 over a fixed prompt set spanning the genres that matter here
@@ -50,6 +49,33 @@ compare. The long-form-degradation arc
 ([`qwen3_long_form_degradation.md`](qwen3_long_form_degradation.md))
 is the precedent for how this went wrong last time and what to watch
 for.
+
+## Perf axis: settled, and it is a non-issue (2026-07-22)
+
+Mike ran `bench.py` on the seeded chain (`TopK{20}, TopP{0.95},
+Temperature{1.0}`): **24 tok/s, not meaningfully moved** from the prior
+run on `TopK` ahead of `LocallyTypical`. Both are ~24.
+
+So the two chains cost the same, and the open question narrows to
+**quality alone**. The mechanism is worth keeping: `LocallyTypical` was
+only ever expensive on an *unpruned* candidate set — put a `TopK` in
+front of it and the tail is gone before it runs, so the entropy pass
+walks a short list. The new seeded chain prunes harder still
+(`k=20` vs `k=1024`), which is why it did not get faster: there was
+nothing left to win.
+
+**`partial_sort` earns its keep** — this is the same finding [#33] came
+at from the other side. #33 removed a *gratuitous full-vocab* sort;
+what remains is a partial sort over a pruned set, and it does not show
+up. Do not re-litigate sampler-chain cost on the assumption that
+`LocallyTypical` is slow: it is slow only without a `TopK` ahead of it,
+and every chain in play has one.
+
+Caveat for anyone comparing logs: tok/s across chains is only loosely
+comparable anyway — different tokens mean different MoE expert routing.
+"Both ~24" is the claim; a 0.3 tok/s delta between them would not be.
+
+[#33]: https://github.com/mdegans/drama_llama/issues/33
 
 ## Downstream decision this blocks
 
