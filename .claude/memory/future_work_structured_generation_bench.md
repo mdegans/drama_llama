@@ -77,11 +77,33 @@ Two traps for a harness, both the silent kind:
 In lazy mode the filter counters measure **fallback invocations only**,
 which is exactly the decomposition this needs.
 
-## "Makes me wonder about other things"
+## Why 10% is suspicious (Mike's actual reasoning)
 
-Mike's phrasing, and worth preserving as the open part. He did not say
-what the other things are; the following are **my hypotheses, not his**,
-offered as things to check rather than conclusions:
+**"The models are large enough that even quantized, emitting an illegal
+token 10% of the time just sounds high."** That is the concern, and it
+is not a cost concern — it is a "something is off" signal. A capable
+model shown a JSON grammar should mostly *want* to emit legal JSON.
+
+**His own leading explanation, and it is a good one:** the recommended
+Qwen sampling settings are **a bit hot**, and the miss-rate observation
+post-dates the switch to them. A hotter chain samples further into the
+tail, tail tokens are likelier to be grammar-illegal, and the fallback
+rate rises accordingly — no deeper pathology required.
+
+Note this subsumes, and is more plausible than, my `TopK{20}` guess
+below: the mechanism is *hot sampling reaching lower-probability
+tokens*, not a tight top-k discarding legal ones. Check his first.
+
+**The unintended upside, worth not "fixing" away:** the hot chain gave
+a lot of tests free fuzzing of the illegal-token path. The grammar
+fallback got exercised far harder than any deliberate test would have
+bothered to. If the chain is later cooled, that coverage disappears
+silently — consider replacing it with a deliberate test rather than
+just losing it.
+
+## Other hypotheses (mine, not Mike's)
+
+Offered as things to check rather than conclusions:
 
 - **A miss rate should be bursty, not uniform.** Rejections ought to
   cluster at structural boundaries (right after `{`, at a key→value
@@ -109,12 +131,18 @@ the same structured prompt under both chains and compare
 
 ## Shape of the work
 
-1. A structured mode for `bench.py` (a fixed schema + prompt, sampling
-   fields still unsent so the sidecar stays the knob), reporting tok/s
-   *and* a `GrammarStats` snapshot — with `DRAMA_LLAMA_GRAMMAR_STATS`
-   passed into the blallama subprocess and a `calls > 0` assertion so a
-   misconfigured run fails loudly instead of reporting zeros. Record the
-   chain with the number, same discipline as `bench.py:47-62`.
+1. **A Rust harness, not a `bench.py` mode.** Mike, 2026-07-22:
+   extending `bench.py` "might not be the best place given how easy it
+   is to wire that up in Rust." He is right — structured output is a
+   handful of lines against `Session` directly
+   (`OutputConfig::for_type::<T>()`), and going through blallama's HTTP
+   surface buys nothing here while forcing the env vars through a
+   subprocess boundary. An in-repo bench/example reads
+   `grammar_stats_snapshot()` from the same process that generated the
+   tokens.
+   Still assert `calls > 0` so a run with collection off fails loudly
+   instead of reporting zeros, and record the sampling chain alongside
+   the number (same discipline as `bench.py:47-62`).
    `DRAMA_LLAMA_DFA_CACHE=0` is a second run, not a second column.
 2. Profile it. Do not assume the answer; the last two sampler-perf
    assumptions in this repo were both wrong in the same direction
