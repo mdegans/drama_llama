@@ -35,10 +35,18 @@ model support planned (but "you never know").
       streaming-API ones are expected to fail until issue #26
       (stream `misanthropic::stream::Event`) lands in 0.9. Don't
       chase streaming failures — they're known-out-of-scope.
+- [ ] **Point misanthropic's `Client` tests at blallama.** Mike,
+      2026-07-22: genuinely unknown whether they pass. They currently
+      hardcode Anthropic's endpoint, so this needs changes on the
+      *misanthropic* side first (a base-URL override the tests can
+      point somewhere else). The highest-value remaining check — it is
+      the closest thing to "does our Anthropic compatibility actually
+      hold" that exists — and a fair amount of work. Cross-repo, so
+      slice it explicitly before starting.
 - [ ] Examples sweep: strawberry, chat (né chat_repl), grammar_fuzz,
       dump_template, inspect_prompt (`just example NAME` runs each with
-      the right features + target dir). `whodunit` ran green — but took
-      ~15 min, see the perf note below.
+      the right features + target dir). `whodunit` ran green and now
+      takes ~30 s (was ~15 min before [#33] landed).
 - [ ] **Media regression pass** (added post-#31, which landed
       2026-07-11 — after this checklist was first written). The
       `#[ignore]`'d media e2e sweep with `--features mtmd` against
@@ -47,6 +55,15 @@ model support planned (but "you never know").
       split, segment tokenize, `EmbdBatch` planes, and the media-aware
       KV walk — this repo has no CI at all (#51), so nothing catches a
       media regression except running it.
+- [ ] **Tracker items filed after this list was written**, all of which
+      are publish-adjacent rather than publish-blocking:
+      [#66](https://github.com/mdegans/drama_llama/issues/66) (rewrite
+      README — overlaps the hygiene line below),
+      [#51](https://github.com/mdegans/drama_llama/issues/51) (no CI) and
+      [#68](https://github.com/mdegans/drama_llama/issues/68) (test
+      topology; they pair — one script called by both the justfile and
+      CI). Decide deliberately whether CI lands before or after the tag;
+      neither blocks `cargo publish`.
 - [ ] Pre-publish hygiene: README, version metadata, `cargo package`
       file list, doc build zero-warnings, and date the CHANGELOG's
       `## [0.8.0] — Unreleased`. `cargo package` now needs a check
@@ -56,38 +73,20 @@ model support planned (but "you never know").
 
 ## Known-and-accepted going into publish
 
-- **`whodunit` takes ~15 min** — this is [#33], already profiled on CUDA:
-  `Candidates::softmax(None)` heapsorts the full 248k vocab *every
-  token*, and `locally_typical` (the default mode) calls it every token
-  (~48% of per-token cost). Softmax is order-independent and only needs
-  the max — an O(n) scan.
-  Mac cross-check added 2026-07-14, and it says #33 is not the whole
-  story: `bench.py --model a3b --backend llama-cpp` gets **24 tok/s**
-  through blallama on the *same sampling policy* (I diffed the sidecars —
-  both are `LocallyTypical p=0.5`), so bench pays the same per-token
-  sort and is fine. A 48% tax buys ~2×; it cannot explain whodunit being
-  >10× slower. The only thing whodunit adds is the JSON grammar, so
-  suspect a SECOND cost: the lazy check ([#28]) re-runs a full O(vocab)
-  mask on rejection, which re-runs the chain and triggers *another*
-  full-vocab sort — N rejections ⇒ N+1 sorts/token.
-  **Settle it cheaply before profiling anything:** count whodunit's
-  output tokens. If it emitted ~20k, 15 min at 24 tok/s is just
-  arithmetic and there is no second cost. Then, if needed,
-  `grammar_stats_enabled()` already counts fallback re-runs.
-  Deferred deliberately: perf, not correctness. Do not block publish on
-  it; do not "fix" it by lowering `n_ctx`.
-- **`temperature` is silently ignored** ([#35], filed 2026-07-14). There
-  is no `SamplingMode::Temperature` in the crate at all (`sample.rs:230`
-  calls its absence "an oversight"), so blallama's Anthropic-compatible
-  `/v1/messages` cannot honor the field even in principle — requests are
-  sampled with whatever the model's `sampling.toml` says. For a server
-  advertising Anthropic compatibility this is a wire-compat gap, not just
-  a missing feature. **Publish-hygiene action: document it as unsupported
-  in the README** rather than let it look honored. Implementation is 0.9
-  interface-pass work.
-  (It also fooled our own bench: `bench.py` sends `temperature: 0.0` and
-  believed it benched greedy — it benched LocallyTypical. Runs stay
-  deterministic via `seed=42`, so past numbers remain comparable.)
+**Both original entries are RESOLVED (verified 2026-07-22).** Nothing is
+currently on this list.
+
+- ~~`whodunit` takes ~15 min~~ — [#33] **closed**. The gratuitous
+  full-vocab sort in `Candidates::softmax(None)` is gone; whodunit runs
+  in ~30 s. The suspected *second* cost (a lazy-grammar rejection
+  re-running the chain, [#28]) never needed chasing — #28 closed too.
+- ~~`temperature` is silently ignored~~ — [#35] **closed**.
+  `SamplingMode::Temperature` exists (`src/sample.rs`), requests map onto
+  a canonical `TopK → TopP → MinP → Temperature` chain, so blallama's
+  `/v1/messages` honors the field. The README no longer needs to document
+  it as unsupported — and note `bench.py` sending `temperature: 0.0` now
+  means what it says, so *pre-#35 numbers are not comparable to post-#35
+  ones* at nonzero temperature. (Seeded runs stay deterministic.)
 
 [#28]: https://github.com/mdegans/drama_llama/issues/28
 [#33]: https://github.com/mdegans/drama_llama/issues/33
@@ -97,7 +96,12 @@ model support planned (but "you never know").
   looks like disconnected instrumentation, and deleting telemetry to
   silence a warning loses information. Ask before touching.
 
-## Status 2026-06-12 evening (mid-session)
+## Status 2026-06-12 evening (mid-session) — HISTORICAL
+
+Superseded: the blocker below was **fixed** (see the closed checklist
+item above — `partial_hit_output_matches_fresh_session` passes on the
+`=0.1.0-pre.4` pin, so no 0.8.1 pin-bump is needed). Kept for the
+diagnosis chain, not for its conclusions.
 
 - 1a + full serial ignored sweep (1b3): **green** — 277 lib tests +
   all integration suites, after fixing 14 stale/parallelism failures
