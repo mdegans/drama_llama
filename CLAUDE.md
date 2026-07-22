@@ -224,6 +224,16 @@ for the current arc:
   cache-aware from the start: `CacheEntry` sentinels, entry↔position
   translation, Rust-owned eval loop with pre-KV NaN guard, `EmbdBatch`).
   Adversarially validated 2026-07-11; ten design holes pre-fixed in plan.
+- [`examples_erase_at_transport.md`](.claude/memory/examples_erase_at_transport.md)
+  — **read before touching `examples/utils/args.rs`.** Why #48 landed as
+  `Arc<dyn LocalTransport>` rather than the `Box<dyn Session>` the issue
+  proposed (`Transport` is already the whole interface, and dyn `Model`
+  would put a virtual call in the per-token loop). Carries three traps:
+  `from_path_with_cache_slots(.., 1)` is not `from_path_with_n_ctx` (it
+  flips `kv_unified`); `quiet()` is llama.cpp-only and correctly so; and
+  `Box` is `#[fundamental]` so it cannot take a blanket impl where `Arc`
+  can. Also why whodunit stays backend-concrete — `Transport` has no
+  streaming method.
 - [`riir_moeflux_strategy.md`](.claude/memory/riir_moeflux_strategy.md)
   — the active RIIR plan: differential port of moeflux, branch
   `riir` in `~/Projects/moeflux`, no Arc, `metal-rs`. Phase 0/1a/2
