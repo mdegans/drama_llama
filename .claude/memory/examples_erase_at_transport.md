@@ -120,12 +120,41 @@ Each of the four now says so in its module docs, because the low-level
 examples were once ported away wholesale and the crate was left with
 nothing demonstrating that layer.
 
-## Verified
+## Verified (2026-07-22)
 
-`just check`, 462 unignored + 119 ignored model tests green.
-`strawberry` returns the correct letter count (proves the repetition knob
-survived the move); `unhelpful` reports `cache read: 84` (proves
-`SessionTransport::new` enables the prefix cache now that the example no
-longer does). `swarm` is the only example driving `Chat` over the erased
-`Arc`, and it is rustyline-interactive, so it was not run — the bound is
-compile-proven and the forwarding is unit-tested upstream.
+`just check`, 462 unignored + 119/119 ignored model tests green.
+
+- `strawberry` (llama.cpp) — correct letter count, so the repetition knob
+  survived the move from example body into the builder.
+- `unhelpful` (llama.cpp, blocking bridge) — `cache read: 84`, so
+  `SessionTransport::new` really does enable the prefix cache now that
+  the example no longer sets it. A zero here would have been the council
+  zero-cache-reads bug again.
+- `neologism --backend moeflux` against `qwen3-6-a3b` — coherent output.
+  This is the point of the whole issue. (a3b deliberately: cogito-v2-671b
+  is the blocked one at ~12 s/token, a17b has the mmap working-set
+  problem.) Building both backends together also compiles clean, which is
+  what would catch the `E0034` bare-`Session::from_path` hazard.
+- `--backend moeflux --n-ctx 4096` warns, then fails with a typed error.
+
+The **`Arc<T>: Transport` blanket impl from misanthropic#140 is
+runtime-verified**, not merely compile-verified: `transport.send(..)` on
+an `Arc<dyn LocalTransport>` resolves at the `Arc` level (shallower than
+the deref to `dyn LocalTransport`), and that is the path strawberry and
+neologism took on both backends. `BlockingTransport::send` is the
+exception — it derefs explicitly (`&*self.inner`), so it does *not*
+exercise the blanket.
+
+**Not verified: `swarm`.** It is the only example driving misanthropic's
+`Chat` over the erased `Arc`. Two blockers, both incidental: rustyline
+rejects a pipe with `Errno(ENOTTY)` (a pty via
+`script -q /dev/null` gets past it), and `bee`/`moth` then die because
+`DockerSandbox`'s default image is
+`concat!("mdegans/misan-bashd:", env!("CARGO_PKG_VERSION"))` — so the
+misanthropic version bump retargeted it to a tag not yet on Docker Hub.
+With two seats dead the beat never dispatched and the run stalled.
+Residual risk is small: `Chat` only calls `Transport::send` on its `T`,
+which is the same call the verified examples make. Remedy if it needs
+running before the image publishes: `just build-bashd` in misanthropic
+(note that pins a *local* image at that tag, shadowing the published one
+until pulled).
