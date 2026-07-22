@@ -1,0 +1,96 @@
+# CI for drama_llama (#51).
+#
+# Everything here delegates to `scripts/test.py`, which the justfile and the
+# git hooks also call. That is the whole design (#68): the tests that gate a
+# commit locally are byte-for-byte the ones that gate a push, and neither can
+# drift from the other by editing only one of them. If a job below needs a new
+# flag, add it to the script — do not inline a cargo invocation here.
+#
+# SCOPE: model-free only. Every `#[ignore]`d test loads 13-40 GB of weights
+# from a local disk and wants a GPU; those tiers (`ignored`, `all`, and all of
+# `just test moeflux`) stay local, permanently. What CI can do is prove the
+# permutation matrix still compiles and that the fast tier is green on an OS
+# nobody develops on.
+
+name: CI
+
+on:
+  push:
+    branches: [main, "v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI failure should be readable without re-running with more verbosity.
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # The whole tree, not just the diff — a formatter is only useful if the
+      # tree is a fixed point of it. Same gate as .githooks/pre-commit.
+      - run: cargo fmt --check
+
+  gate:
+    name: permutations (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # llama-cpp-sys-3 builds llama.cpp through cmake; without a cache
+          # key that separates the two runners they fight over one entry.
+          key: ${{ matrix.os }}-gate
+      # `--ci` drops the configurations a runner cannot have: `llama-cpp`
+      # carries `cuda` on Linux and wants nvcc. It keeps `trait-layer` (no C
+      # dependency at all), `llama-cpp-cpu`, and — on macOS only — the moeflux
+      # and both-backends configurations, which compile Metal kernels but need
+      # no weights to do it.
+      #
+      # `--all-targets` is the point of this job: a configuration building as
+      # a *library* is not the same claim as its test targets building. #68
+      # was filed because moeflux-only compiled as a library while ~38 of its
+      # test targets had never been built by anyone.
+      - run: python3 scripts/test.py check --ci
+
+  test:
+    name: unignored (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-test
+      - uses: taiki-e/install-action@nextest
+      # `llama-cpp-cpu`, not `llama-cpp`: identical feature set minus `cuda`.
+      # This is the same tier the pre-commit hook runs, on two OSes instead of
+      # whichever one the committer happens to own.
+      - run: python3 scripts/test.py run -c llama-cpp-cpu -t unignored
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: target/test-logs/
+          if-no-files-found: ignore

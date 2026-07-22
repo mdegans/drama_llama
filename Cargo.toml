@@ -410,8 +410,14 @@ features = [
 # rustdoc feature; docs.rs builds on nightly).
 cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 
-# TEMPORARY (#48): misanthropic#140 adds `impl Transport for Arc<T>`, which
-# `examples/utils::CommonArgs` needs to hand `Chat` an erased transport.
-# Drop this and pin `1.0.0-alpha.12` above once the tag is published.
-[patch.crates-io]
-misanthropic = { path = "../misanthropic/misanthropic" }
+# No [patch.crates-io]. There was one (#48) pointing misanthropic at a
+# sibling working copy, waiting on misanthropic#140's `impl Transport for
+# Arc<T>` — which `examples/utils::CommonArgs` needs to hand `Chat` an
+# erased transport. That shipped in 1.0.0-alpha.12, the version pinned
+# above, so the patch is gone.
+#
+# Think hard before adding another one: a path patch resolves to a
+# directory that exists on exactly one machine, so CI dies at manifest
+# resolution before it reaches any feature set or target (#51). If a
+# sibling checkout is genuinely needed mid-development, keep it in
+# `.cargo/config.toml` (gitignored) rather than here.
