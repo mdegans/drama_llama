@@ -224,16 +224,27 @@ for the current arc:
   cache-aware from the start: `CacheEntry` sentinels, entry↔position
   translation, Rust-owned eval loop with pre-KV NaN guard, `EmbdBatch`).
   Adversarially validated 2026-07-11; ten design holes pre-fixed in plan.
+- [`per_backend_load_options.md`](.claude/memory/per_backend_load_options.md)
+  — **read before adding a constructor, proposing a shared cross-backend
+  config struct, or making the crate decide where logs go.** `FromPath`
+  now carries `type Options`; the five `from_path_*` variants collapsed
+  into `from_path_with`. Carries the bug that justified it (blallama
+  served every model at `n_ctx = 512` because the trait could not express
+  a context size), why two same-named traits are `E0034`, why the options
+  are per-backend (the intersection is *empty* — gate a shared struct on
+  moeflux getting runtime KV sizing), why the CLI union and the library
+  options cannot be one type, and why logging is the application's job
+  (`Err(NotImplemented)` beats a default no-op; no constructor installs a
+  sink).
 - [`examples_erase_at_transport.md`](.claude/memory/examples_erase_at_transport.md)
   — **read before touching `examples/utils/args.rs`.** Why #48 landed as
   `Arc<dyn LocalTransport>` rather than the `Box<dyn Session>` the issue
   proposed (`Transport` is already the whole interface, and dyn `Model`
-  would put a virtual call in the per-token loop). Carries three traps:
-  `from_path_with_cache_slots(.., 1)` is not `from_path_with_n_ctx` (it
-  flips `kv_unified`); `quiet()` is llama.cpp-only and correctly so; and
-  `Box` is `#[fundamental]` so it cannot take a blanket impl where `Arc`
-  can. Also why whodunit stays backend-concrete — `Transport` has no
-  streaming method.
+  would put a virtual call in the per-token loop). Also why whodunit stays
+  backend-concrete — `Transport` has no streaming method — and that `Box`
+  is `#[fundamental]` so it cannot take a blanket impl where `Arc` can.
+  Partly superseded above: its constructor names predate the rename
+  (`from_path_sync` is now `FromPath::from_path`).
 - [`riir_moeflux_strategy.md`](.claude/memory/riir_moeflux_strategy.md)
   — the active RIIR plan: differential port of moeflux, branch
   `riir` in `~/Projects/moeflux`, no Arc, `metal-rs`. Phase 0/1a/2

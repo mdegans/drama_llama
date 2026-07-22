@@ -39,6 +39,36 @@ Three further arcs land on top of the split:
 
 ### Added
 
+- **`FromPath::Options`** — an associated type carrying whatever a
+  backend needs to be told at load time, so generic code can ask for
+  a context size. `LlamaCppOptions` (`n_ctx`, `cache_slots`,
+  `flash_attn`, `no_gpu`, `numa`) and `MoefluxOptions` (`use_2bit`);
+  both `serde`-serializable, and `clap::Args`-flattenable under
+  `feature = "cli"` for single-backend binaries. Every field unset
+  means the backend's own default, so `from_path` is unchanged
+  behaviour. `FromPath` gained `from_path_with` (the constructor),
+  keeps `from_path` (default options) and `from_path_async` (the
+  same on tokio's blocking pool) as provided methods, and is no
+  longer `tokio`-gated.
+- **`cli::BackendArgs`** — the union of every compiled-in backend's
+  load knobs plus the `--backend` selector, for binaries that pick
+  their backend at run time (clap flattens at compile time, so such
+  a binary cannot flatten `B::Options` directly). Narrows to a
+  concrete backend's options with `TryFrom`, returning
+  `cli::UnsupportedOptions` when a flag names something that backend
+  has no notion of. Also `cli::DEFAULT_N_CTX` (32768), the value
+  this repo's own front-ends default to.
+- **`Backend::set_log_callback` / `Backend::clear_log_callback`** —
+  route a backend's native log stream wherever the application wants,
+  returning `Result<(), NotImplemented>` with a default body that
+  errors. Lets an application install a sink *before* loading a
+  model, which is when llama.cpp is loudest and the only point at
+  which the noise can be caught. `LogLevel` moved to
+  `crate::backend` (its `Other` variant now carries `u32`) so it
+  compiles with no backend feature enabled.
+- **`blallama --n-ctx` / `--cache-slots` / `--use-2bit`**, via the
+  flattened `BackendArgs`.
+
 - **`SamplingMode::Deny { range: Range<Token> }`** — sample-time
   mask for forbidden token-id ranges. Constructor:
   `SamplingMode::deny_range(r)`. Filters candidates whose id falls
@@ -233,6 +263,16 @@ Three further arcs land on top of the split:
 
 ### Changed
 
+- **`tracing` is now a non-optional dependency** (with its `log`
+  feature), and the crate's own diagnostics — sidecar read/write
+  failures, chat-template dialect analysis failures — emit
+  `tracing::warn!` instead of writing to stderr unconditionally.
+  `RUST_LOG` now governs them on every backend.
+- **`Session::from_path_sync` is now `FromPath::from_path`** (the
+  trait must be in scope). `Session::from_path_with_n_ctx` and
+  `LlamaCppEngine::from_path_with_n_ctx` remain as shorthand for the
+  common case.
+
 - **`Model::extra_eos_tokens` → `Model::eog_tokens`**, and it now
   returns the *whole* end-of-generation set (`eos` and `eot`
   included) rather than the extras beyond them. For the llama.cpp
@@ -313,6 +353,16 @@ Three further arcs land on top of the split:
   chain will differ.
 
 ### Fixed
+
+- **`blallama` served every llama.cpp model at `n_ctx = 512`.** It is
+  generic over the backend, so it could only reach `FromPath`, and
+  `FromPath` carried nothing but a path — leaving llama.cpp's own
+  512-token default in place with no way to override it. Its
+  `session_ready` log line had been reporting this all along. Fixed
+  by `FromPath::Options`; `--n-ctx` now defaults to 32768.
+- **`--seed` did not exist on any example.** The field in
+  `CommonArgs` was missing its `#[arg(long)]` attribute, so clap made
+  it a positional argument instead of a flag.
 
 - **Cache usage counters are honest now** ([#40]).
   `cache_creation_input_tokens` had been hardcoded `Some(0)` since the
@@ -419,6 +469,17 @@ Three further arcs land on top of the split:
 
 ### Removed
 
+- **`cli::Args`** and **`LlamaCppEngine::from_cli`** — superseded by
+  `LlamaCppOptions`, which is the same idea with the missing knobs,
+  serde support, and no CLI dependency. `regurgitater` wraps it in
+  its own `Parser` struct.
+- **`Session::from_path_cpu_only`**, **`Session::from_path_with_flash_attention`**,
+  **`Session::from_path_with_cache_slots`**, and the matching
+  `LlamaCppEngine::from_path_cpu_only` /
+  `from_path_with_flash_attention` / `from_path_with_n_ctx_and_seqs`
+  — all expressible as `from_path_with(path, options)`. The first two
+  had no callers at all.
+
 - **`blallama --repetition-penalty`** (the v0.7.x band-aid opt-in
   flag). Sampling configuration now comes from the per-model
   sidecar; for force-off probe runs use the new `--no-penalty`
@@ -438,6 +499,24 @@ Three further arcs land on top of the split:
   unchanged. For ergonomic surface unchanged uses, prefer
   `session.engine().model.display_name()` over the now-llama-cpp-
   only `session.engine().model.file_name()`.
+- `Session::from_path_sync(p)` → `Session::from_path(p)`, with
+  `use drama_llama::FromPath;` — it is a trait method now.
+- The specialized constructors become one call with an options
+  struct. `from_path_with_cache_slots(p, 4096, 3)` becomes:
+
+  ```rust
+  Session::from_path_with(
+      p,
+      LlamaCppOptions::default().with_n_ctx(4096).with_cache_slots(3),
+  )
+  ```
+
+  Note `cache_slots: Some(1)` is still not the same as leaving it
+  unset — it switches the KV cache to unified, exactly as the old
+  three-argument constructor did.
+- Loading in async code: `from_path_async(path, options)` runs the
+  load on tokio's blocking pool. The old `FromPath::from_path` was
+  async; the new one is sync.
 
 ### Notes
 

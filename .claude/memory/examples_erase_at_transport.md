@@ -45,14 +45,29 @@ on `tokenize` / `token_to_piece_ref`, which are per-token in the sampling
 loop. `Transport` sits above the hot path; "dispatch cost is nil" is true
 there and false one layer down.
 
+> **Superseded in part (2026-07-22), see
+> [`per_backend_load_options.md`](per_backend_load_options.md).** The
+> constructor zoo this memo describes is gone: `from_path_sync` is now
+> `FromPath::from_path`, and the five `from_path_*` variants collapsed
+> into `FromPath::from_path_with(path, B::Options)`. Where this file
+> says `from_path_sync`, read `from_path`. The erasure design below —
+> `Arc<dyn LocalTransport>`, one `match`, the flags-vs-builder split —
+> is unchanged and still current.
+
 ## Traps found the hard way
 
 - **`from_path_with_cache_slots(path, n_ctx, 1)` is NOT
   `from_path_with_n_ctx(path, n_ctx)`.** The multi-slot constructor also
-  sets `kv_unified = true` (`src/llama_cpp/engine.rs:167`). Routing every
-  session through it would have silently changed KV behaviour for the
-  eight examples that never asked for slots. `TransportBuilder::build`
-  branches on slot count for this reason — leave the branch alone.
+  sets `kv_unified = true`. Routing every session through it would have
+  silently changed KV behaviour for the eight examples that never asked
+  for slots.
+  **Now expressed as a field, not two constructors:**
+  `LlamaCppOptions::cache_slots` is `None` vs `Some(1)`, and `Some(1)`
+  still flips `kv_unified` — deliberately, since asking for one slot is
+  asking for the unified pool. Pinned by
+  `one_cache_slot_still_unifies_the_kv_cache` in
+  `src/llama_cpp/options.rs`, so the branch no longer has to be
+  remembered by hand.
 - **`quiet()` is llama.cpp-only and that is correct**, not an oversight.
   It calls `silence_logs()`, which muzzles a C library writing to stderr,
   process-globally. moeflux logs through the `log` crate, which
