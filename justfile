@@ -45,9 +45,15 @@ default: test
 #   just test ignored    ONLY the #[ignore]'d model tests, serialized
 #   just test all        genuinely everything — unignored AND ignored
 #   just test cpu        unignored, no CUDA (separate target dir)
-#   just test moeflux    the moeflux-only configuration, everything in it
+#   just test moeflux    the moeflux configurations, INCLUDING model tests
+#   just test moeflux-quick   moeflux unit tests only — no weights, seconds
 #   just test both       unignored tests with BOTH backends linked
 #   just test NAME       tests/suites matching NAME, any tier, uncaptured
+#
+# `just test moeflux` loads real weights (`--run-ignored all`) and takes
+# ~12 minutes on the default a3b variant. On `qwen3-5-a17b` (~2 tok/s) it
+# takes hours; the script warns before starting. `just permutations` runs
+# NO tests at all — it is `cargo check --all-targets`, a compile gate.
 #
 # `moeflux` and `NAME` take an optional filter — the moeflux suites are ~12
 # minutes and re-running one shouldn't cost all of them:
@@ -75,6 +81,12 @@ test mode="" filter="" *args:
       all)       run -c llama-cpp     -t all       ;;
       cpu)       run -c llama-cpp-cpu -t unignored ;;
       both)      run -c both          -t unignored ${filter:+--filter "$filter"} ;;
+      moeflux-quick)
+        # The moeflux-only configuration's fast tier: every `cfg(moeflux)`
+        # unit test, no weights, seconds not hours. This is the "did I break
+        # the moeflux build" check; `just test moeflux` is the real thing.
+        run -c moeflux -t unignored ${filter:+--filter "$filter"}
+        ;;
       moeflux)
         # Two configurations, because "the moeflux work" spans two. The
         # moeflux-only universe holds the moeflux suites AND every

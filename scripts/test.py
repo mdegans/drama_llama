@@ -55,11 +55,20 @@ DRY_RUN = False
 # compile-time selection with a runtime variant config; don't lean
 # further into it in the meantime.
 DEFAULT_MOEFLUX_MODEL = "qwen3-6-35b-a3b"
-MOEFLUX_MODELS = [
-    "qwen3-6-35b-a3b",
-    "qwen3-5-a17b",
-    "cogito-v2-671b",
-]
+
+# Variant -> why you might not want to run the model tests on it. a3b is
+# the fast one and the default for exactly that reason; the others are
+# real configurations that are simply not a dev-loop cost. Empty string
+# means "no warning".
+MOEFLUX_MODELS: dict[str, str] = {
+    "qwen3-6-35b-a3b": "",
+    "qwen3-5-a17b": "~2 tok/s — the model-test tiers take hours, "
+    "possibly all night. It exists for backup Agora council work and "
+    "tests, not for the dev loop.",
+    "cogito-v2-671b": "does not fit in RAM on this class of machine; "
+    "experts re-page on every routing change and warm tokens cost "
+    "~12 s each. The model-test tiers are not practical here.",
+}
 
 # Features that name no backend: they compile against the trait layer and
 # are legal in every configuration. `cli` and `axum` belong here as of
@@ -283,10 +292,35 @@ def require_nextest() -> None:
         )
 
 
+def warn_slow_variant(config: Config, tier: str, model: str) -> None:
+    """Say so before spending a night on it.
+
+    Only the tiers that actually load weights are worth warning about —
+    `unignored` never touches a model, so a slow variant costs nothing
+    there. A warning rather than a refusal: running a17b's model tests is
+    a legitimate thing to want, just not by accident.
+    """
+    if not config.moeflux or tier == "unignored":
+        return
+    note = MOEFLUX_MODELS.get(model, "")
+    if note:
+        print(f"\n!! moeflux variant {model}: {note}", file=sys.stderr)
+        print(
+            f"!! This runs the model tests. For the fast variant, drop "
+            f"--moeflux-model (defaults to {DEFAULT_MOEFLUX_MODEL}); for "
+            f"no model tests, use `-t unignored`.\n",
+            file=sys.stderr,
+        )
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not DRY_RUN:
         require_nextest()
     config = resolve_config(args.config)
+    # `--filter` implies the `all` tier, so it warns too.
+    warn_slow_variant(
+        config, "all" if args.filter else args.tier, args.moeflux_model
+    )
     features = config.feature_list(args.moeflux_model)
 
     cmd = [
