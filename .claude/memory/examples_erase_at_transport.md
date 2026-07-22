@@ -60,7 +60,24 @@ there and false one layer down.
   no-op on half its backends. It lives in the llama-cpp arm of `build`,
   not the shared finisher. (Also worth knowing: it only silences
   *post-load* spew — every caller applies it after construction, so model
-  load logs print regardless. Pre-existing, all the way back.)
+  load logs print regardless. Pre-existing, all the way back. See the
+  future-work note below.)
+
+  **Future work (Mike, 2026-07-22): `Backend::quiet()` with a default
+  no-op body.** The real defect is ordering, not placement: llama.cpp is
+  loudest during load, and `.quiet()` always runs after it. `Backend` is
+  a type-level bundle with no `self`, so an associated fn fits; llama.cpp
+  implements it with `silence_logs()`, moeflux keeps the default (its
+  stray `eprintln!`s want moving to `tracing`/`log` regardless, after
+  which `RUST_LOG` governs them and the no-op is the *correct* impl, not
+  a gap). Call it from the caller *before* construction — one line at the
+  top of each arm of `TransportBuilder::build`, which is already the only
+  place naming a concrete backend. Deliberately do **not** make
+  `FromPath` generic over `B` to do this: the per-backend constructors
+  do not line up (llama.cpp has five, moeflux one), so a generic
+  `FromPath` forces either a lowest-common-denominator signature or an
+  options struct, and it would decide quiet-ness for callers who
+  legitimately want load logs when a model won't load.
 - **`Box<T>` cannot take a blanket trait impl; `Arc<T>` can.** `Box` is
   `#[fundamental]`, so downstream `impl Trait for Box<TheirType>` is legal
   and a blanket `Box<T>` impl collides with it — breaking, not additive.
