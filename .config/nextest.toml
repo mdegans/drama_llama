@@ -14,11 +14,15 @@
 # earlier kind(test)-only `gpu` group missed every ignored src/ unit test and
 # still OOM'd.
 #
-# So instead of trying to select the GPU tests, `just test full` runs ONLY the
-# ignored tests (`--run-ignored only`) under this profile — and in that set
-# essentially every test is a GPU test — and we cap the whole profile at a
-# single test at a time. No filter to get wrong. The default profile
+# So instead of trying to select the GPU tests, every tier that can reach a
+# model test runs under this profile and we cap the whole profile at a single
+# test at a time. No filter to get wrong. `just test ignored` runs ONLY the
+# ignored tests (`--run-ignored only`); `just test all` runs those plus the
+# fast ones (`--run-ignored all`) and pays the serialization for both, which is
+# the price of a mode that is honestly everything. The default profile
 # (`just test`, `just test cpu`) runs no model tests and stays fully parallel.
+#
+# Tiers are defined in `scripts/test.py`, which the justfile and CI both call.
 
 [profile.full]
 test-threads = 1

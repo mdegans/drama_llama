@@ -1,143 +1,115 @@
 # drama_llama task runner — run `just` (or `just --list`) to see recipes.
 #
-# Feature selection is OS-aware: CUDA is enabled automatically on Linux; on
-# macOS llama.cpp uses Metal with no feature flag, so `test` and `test cpu`
-# build the same thing there. CUDA is deliberately kept OUT of the crate's
-# *default* features and chosen here instead — that keeps a bare `cargo build`
-# portable (macOS and CI don't drag in the nvcc/C build), while `just` still
-# gives the batteries-included, GPU-accelerated dev loop on Linux.
+# The test topology lives in `scripts/test.py`, not here. CI calls that script
+# and the git hooks call these recipes, so the tests that gate a commit are
+# byte-for-byte the ones that gate a push, and neither can drift from the other
+# by editing only one of them (#68). The recipes below are thin wrappers that
+# exist for muscle memory and for the hooks; `python3 scripts/test.py --help`
+# is the real interface, and it is what to call on Windows (these recipe bodies
+# are bash).
 
-# Shared library/test feature set — every doc-visible feature, so the gates
-# cover the whole public surface. `test` and `test full` use the GPU set;
-# `test cpu` is the same set minus `cuda`. Keeping the rest identical means the
-# llama.cpp build is NOT evicted when switching between `test` and `test full`
-# (the nvcc-rebuild trap — one feature set per GPU session).
+# Feature set for the rustdoc gate (`just doc` / `just check`) and for
+# `just example`. Matches the `llama-cpp` configuration in scripts/test.py, so
+# the doc build REUSES the `just test` compilation on macOS — a rustdoc pass,
+# not a recompile. A pre-commit doc gate is only worth having if it's ~free.
+# That set is the full doc-visible surface, so this is also the release sweep;
+# there is no longer a wider set to run by hand.
 #
-# `webchat` and `egui` were left out originally on the theory that they're UI
-# glue; that just meant a library API change could break them without any gate
-# noticing (caught during #54, where `Engine::model` went private). They cost
-# ~30s of dependency compilation once and nothing thereafter, which is not
-# worth the blind spot.
-base_features := "cli,toml,axum,serde,stats,json-schema,mtmd,webchat,egui"
+# `llama-cpp` is named explicitly rather than inherited from `default`: it may
+# not always be a default feature, and the permutation gate deliberately does
+# not test any configuration by the name "default".
+base_features := "llama-cpp,cli,toml,axum,serde,stats,json-schema,mtmd,webchat,egui"
 gpu_features  := base_features + if os() == "linux" { ",cuda" } else { "" }
-
-# Feature set for the rustdoc gate (`just doc` / `just check`). Held to
-# `base_features` so the doc build REUSES the `just test` compilation on macOS
-# (rustdoc pass only, no recompile) — a pre-commit doc gate is only worth it if
-# it's ~free. That set is now the full doc-visible surface, so this is also the
-# release sweep; there is no longer a wider set to run by hand.
-doc_features := base_features
+doc_features  := base_features
 
 # moeflux is macOS-only (Metal kernels) and selects its model at COMPILE time —
-# each model is its own feature, exactly one enabled at a time. Hence a variable
-# rather than a constant: override with
+# each model is its own feature and exactly one must be enabled, which is what
+# implies `moeflux` itself. Hence a variable rather than a constant:
 #   just --set moeflux_model cogito-v2-671b test moeflux
-# (Phase 7 replaces the compile-time selection with a runtime variant config;
-# don't lean further into it in the meantime.) Enabling moeflux rebuilds
-# drama_llama but NOT llama-cpp-sys — that crate's own features are untouched, so
-# the llama.cpp C build survives the switch.
+# a3b is the fast one; a17b runs at ~2 tok/s and exists for backup Agora
+# council work and tests. (Phase 7 replaces the compile-time selection with a
+# runtime variant config; don't lean further into it in the meantime.)
 moeflux_model := "qwen3-6-35b-a3b"
 
-# Separate target dirs for the GPU (CUDA/Metal) and CPU builds, so alternating
-# `just test` and `just test cpu` does not evict each other's llama.cpp build
-# (a CUDA rebuild is ~20-40 min). `test` and `test full` share the GPU dir.
+# Target dir for the recipes that still drive cargo directly. Kept separate
+# from the CPU build's dir so alternating the two does not evict each other's
+# llama.cpp build (a CUDA rebuild is ~20-40 min); scripts/test.py knows the
+# same rule.
 gpu_target := justfile_directory() / "target"
-cpu_target := justfile_directory() / "target" / "cpu"
-
-# Every run is tee'd here, so a failure can be read back after the fact instead
-# of re-run to be seen. Under `target/`, hence already gitignored.
-log_dir := justfile_directory() / "target" / "test-logs"
 
 # Default recipe: the fast GPU test loop.
 default: test
 
-# Run the test suite via cargo-nextest (`just setup` installs it). Modes:
-#   just test          unignored tests, GPU-accelerated (CUDA on Linux / Metal on macOS)
-#   just test full     also the long-running #[ignore]'d GPU/model tests, serialized
-#   just test cpu      unignored tests, CPU-only (no CUDA; separate target dir)
-#   just test moeflux  the moeflux + cross-backend suites (macOS; needs the weights
-#                      mounted). Takes an optional filter — these are 12 minutes
-#                      of tests and re-running one shouldn't cost all of them:
-#                        just test moeflux cross_backend
-#                      The model variant is a compile-time feature, so it's a
-#                      justfile variable rather than an argument:
-#                        just --set moeflux_model cogito-v2-671b test moeflux
-#   just test NAME     just the tests (or suites) matching NAME — see below
-# Anything that isn't a known mode is a substring filter over test *and* binary
-# names, run with the ignored tests included, serialized, and uncaptured (so the
-# suites' block/emission dumps are visible on a pass, not only on a failure):
-#   just test forced_call_parses_to_tool_use   one test
-#   just test session_gptoss                   one suite
-# Output of every mode lands in target/test-logs/<mode>.log.
-# Modes: (none)=unignored+GPU · full=+ignored · cpu=no CUDA · moeflux=moeflux suites · NAME=filter
-test mode="" filter="":
+# Run tests (via scripts/test.py; `just setup` installs cargo-nextest). Modes:
+#   just test            unignored tests, llama.cpp, GPU-accelerated
+#   just test ignored    ONLY the #[ignore]'d model tests, serialized
+#   just test all        genuinely everything — unignored AND ignored
+#   just test cpu        unignored, no CUDA (separate target dir)
+#   just test moeflux    the moeflux-only configuration, everything in it
+#   just test both       unignored tests with BOTH backends linked
+#   just test NAME       tests/suites matching NAME, any tier, uncaptured
+#
+# `moeflux` and `NAME` take an optional filter — the moeflux suites are ~12
+# minutes and re-running one shouldn't cost all of them:
+#   just test moeflux cross_backend
+#
+# NOTE: `full` used to mean `--run-ignored only`, i.e. ONLY the model tests and
+# not everything. That ambiguity is the reason it is now an error rather than
+# an alias for either — pick `ignored` (the old behaviour) or `all`.
+#
+# Output of every mode lands in target/test-logs/.
+test mode="" filter="" *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p "{{log_dir}}"
+    # Trailing args go straight to the script — mainly `--dry-run`, which
+    # prints the cargo invocations without running them and is the only way to
+    # check this wiring without paying tens of minutes per mode:
+    #   just test moeflux "" --dry-run
+    run() { python3 scripts/test.py run --moeflux-model "{{moeflux_model}}" "$@" {{args}}; }
+    # `just test NAME` consumes the mode as the filter; every other mode names
+    # a configuration and takes the filter as its second argument.
+    filter="{{filter}}"
     case "{{mode}}" in
-      "")
-        export CARGO_TARGET_DIR="{{gpu_target}}"
-        name=unignored
-        cmd=(cargo nextest run --features "{{gpu_features}}" --no-fail-fast)
+      "")        run -c llama-cpp     -t unignored ;;
+      ignored)   run -c llama-cpp     -t ignored   ;;
+      all)       run -c llama-cpp     -t all       ;;
+      cpu)       run -c llama-cpp-cpu -t unignored ;;
+      both)      run -c both          -t unignored ${filter:+--filter "$filter"} ;;
+      moeflux)
+        # Two configurations, because "the moeflux work" spans two. The
+        # moeflux-only universe holds the moeflux suites AND every
+        # `cfg(moeflux)` unit test under src/ — those were unreachable from
+        # any recipe before #68, because the old filterset named only the
+        # moeflux/cross_backend *binaries* and the lib binary is neither.
+        run -c moeflux -t all ${filter:+--filter "$filter"}
+        # The cross-backend oracle diffs llama.cpp against moeflux, so it
+        # only exists in a build with both linked — it is NOT reachable from
+        # the moeflux-only configuration above.
+        run -c both -t all --filter "${filter:-cross_backend}"
         ;;
       full)
-        # Only the #[ignore]'d GPU/model tests, one at a time (profile 'full'
-        # caps test-threads=1 — a 30B model barely fits once on the card).
-        export CARGO_TARGET_DIR="{{gpu_target}}"
-        name=full
-        cmd=(cargo nextest run --features "{{gpu_features}}" --profile full --run-ignored only --no-fail-fast)
+        echo "just test full: removed — it meant ONLY the ignored tests," >&2
+        echo "  which is now 'just test ignored'. For everything (unignored" >&2
+        echo "  AND ignored) use 'just test all'." >&2
+        exit 2
         ;;
-      cpu)
-        export CARGO_TARGET_DIR="{{cpu_target}}"
-        name=cpu
-        cmd=(cargo nextest run --features "{{base_features}}" --no-fail-fast)
-        ;;
-      moeflux)
-        # The moeflux + cross-backend suites are cfg-gated on the moeflux feature
-        # AND macOS, so a bare `just test` can't reach them — they need their own
-        # feature set. Ignored by default (they want ~40 GB of expert shards on a
-        # mounted volume), hence --run-ignored all.
-        if [ "$(uname -s)" != "Darwin" ]; then
-          echo "just test moeflux: macOS only (moeflux is Metal-backed)" >&2
-          exit 2
-        fi
-        export CARGO_TARGET_DIR="{{gpu_target}}"
-        # Universe is the moeflux + cross-backend binaries; an optional filter
-        # narrows to one test within them.
-        set="binary(~moeflux) + binary(~cross_backend)"
-        if [ -n "{{filter}}" ]; then
-          set="($set) & (test(~{{filter}}) + binary(~{{filter}}))"
-          name="moeflux-$(printf '%s' '{{filter}}' | tr -cs '[:alnum:]_.-' '_')"
-        else
-          name="moeflux"
-        fi
-        cmd=(cargo nextest run \
-             --features "{{gpu_features}},moeflux-model-{{moeflux_model}}" \
-             --profile full --run-ignored all --no-capture --no-fail-fast \
-             -E "$set")
-        ;;
-      *)
-        # Filter mode. `--run-ignored all` so a named long-running test runs
-        # without also having to remember which of the two lists it's on.
-        export CARGO_TARGET_DIR="{{gpu_target}}"
-        name="$(printf '%s' '{{mode}}' | tr -cs '[:alnum:]_.-' '_')"
-        cmd=(cargo nextest run --features "{{gpu_features}}" --profile full \
-             --run-ignored all --no-capture --no-fail-fast \
-             -E 'test(~{{mode}}) + binary(~{{mode}})')
-        ;;
+      *)         run -c llama-cpp --filter "{{mode}}" ;;
     esac
-    log="{{log_dir}}/${name}.log"
-    echo "+ ${cmd[*]}"
-    echo "+ log: ${log}"
-    "${cmd[@]}" 2>&1 | tee "${log}"
+
+# The permutation gate: every feature configuration compiles, test targets
+# included. Slower than `just check` (it builds moeflux and the no-backend
+# trait layer), so it is NOT in the pre-commit hook — run it before a release
+# or after touching cfgs, features, or anything in src/llama_cpp/ or
+# src/moeflux/. `--ci` narrows to the configurations a runner can build.
+permutations *args:
+    python3 scripts/test.py check --moeflux-model "{{moeflux_model}}" {{args}}
 
 # Run an example against the same feature set and target dir as `just test`, so
 # the two share one llama.cpp build instead of evicting each other's.
-# `tokio`/`repl` are appended: the chat-loop examples (chat, council,
-# swarm) require them, and the extra deps don't touch the llama.cpp build.
+# `tokio`/`repl` are appended: the chat-loop examples (chat, council, swarm)
+# require them, and the extra deps don't touch the llama.cpp build.
 #   just example whodunit
 #   just example whodunit models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf
-# Run an example with the shared feature set / target dir.
 example name *args:
     CARGO_TARGET_DIR="{{gpu_target}}" \
       cargo run --release --features "{{gpu_features}},tokio,repl" --example {{name}} -- {{args}}
@@ -147,7 +119,6 @@ example name *args:
 # reformatting. Note rustfmt's output varies across toolchain versions — if two
 # machines fight over the same lines, that's why, and the fix is to agree on a
 # toolchain, not to keep re-running this.
-# Format the tree with rustfmt (the pre-commit hook enforces this).
 fmt:
     cargo fmt
 
@@ -177,7 +148,6 @@ check:
 # Point git at the versioned hooks in .githooks/ — one config line, no copying,
 # and the hook stays under review like any other file. See .githooks/pre-commit
 # for what it gates (rustfmt + the unignored tests).
-# Point git at the versioned pre-commit hook in .githooks/.
 install-hooks:
     git config core.hooksPath .githooks
     @echo "hooks installed: core.hooksPath -> .githooks"

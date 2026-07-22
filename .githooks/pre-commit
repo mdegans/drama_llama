@@ -13,7 +13,8 @@
 #   2. `just test` — the unignored test suite passes.
 #
 # The #[ignore]'d tests are deliberately NOT run: they load 13-18 GB models
-# onto a GPU and take minutes. Those are `just test full`, run by hand.
+# onto a GPU and take minutes. Those are `just test ignored` (or `just test
+# all` for those plus these), run by hand.
 
 set -euo pipefail
 
