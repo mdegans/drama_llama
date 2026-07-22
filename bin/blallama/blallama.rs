@@ -266,30 +266,14 @@ fn log_stats(id: impl AsRef<str>, usage: Usage, elapsed: Duration) {
     );
 }
 
-#[cfg(all(feature = "moeflux", target_os = "macos"))]
-fn log_moeflux_prefetch(
-    id: impl AsRef<str>,
-    stats: drama_llama::moeflux::PrefetchStats,
-) {
-    let rate = |h: u64, m: u64| -> f64 {
-        let t = h + m;
-        if t > 0 {
-            h as f64 / t as f64
-        } else {
-            0.0
-        }
-    };
-    info!(
-        event = "moeflux_prefetch",
-        id = id.as_ref(),
-        prefill_hits = stats.prefill_hits,
-        prefill_misses = stats.prefill_misses,
-        prefill_hit_rate = rate(stats.prefill_hits, stats.prefill_misses),
-        decode_hits = stats.decode_hits,
-        decode_misses = stats.decode_misses,
-        decode_hit_rate = rate(stats.decode_hits, stats.decode_misses),
-    );
-}
+// There was a `log_moeflux_prefetch` here that formatted
+// `MoefluxDecoder::prefetch_stats()` into a tracing event. It was never
+// called — not once in its life — and only surfaced as dead code when the
+// permutation gate started building the moeflux configurations with
+// `--all-targets` (#68). Removed rather than wired up (#69): the counters
+// live in moeflux, so the emitter belongs there too, instead of every
+// consumer hand-rolling one. `prefetch_stats()` is still public, so
+// nothing is lost but the formatting.
 
 // Credit To Claude Opus 4.7 for this
 fn init_logging() {
