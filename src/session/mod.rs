@@ -2052,6 +2052,7 @@ impl FromPath for Session<LlamaCppBackend> {
     }
 }
 
+#[cfg(feature = "llama-cpp")]
 impl Session<LlamaCppBackend> {
     /// Load a model from disk with an explicit KV context size.
     ///
@@ -7040,6 +7041,7 @@ mod tests {
     /// prime a slot, age it past its 5-minute TTL, and the next
     /// identical call must sweep it and re-prefill from scratch —
     /// while still succeeding.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_ttl_expiry_evicts() {
@@ -7089,6 +7091,7 @@ mod tests {
     /// new user turn appended, tail marked) must read a nonzero
     /// prefix, with creation covering exactly the un-reused remainder.
     /// A cache-OFF session reports both counters as `None`.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_usage_counters_across_append_only_calls() {
@@ -7250,6 +7253,7 @@ mod tests {
     /// to stamp [`Usage`] values. With the prefix cache on
     /// (`cache_read: Some`), both cache counters are populated and
     /// partition the prompt: `read + creation == input`.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     fn test_make_usage_populates_cache_counters() {
         let u =
@@ -7265,6 +7269,7 @@ mod tests {
     /// `Some(0)` indistinguishable from a healthy cold call.
     /// misanthropic's `AddAssign` (`.or(rhs)`) accumulates mixed
     /// None/Some calls sanely, so `total_usage` stays correct.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     fn test_make_usage_none_when_cache_disabled() {
         let u = Session::<crate::LlamaCppBackend>::make_usage(100, None, 10);
@@ -7280,11 +7285,13 @@ mod tests {
     // test in the crate.
     // -----------------------------------------------------------------
 
+    #[cfg(feature = "llama-cpp")]
     fn model_path() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("models/model.gguf")
     }
 
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_with_prefix_cache_default_off() {
@@ -7308,6 +7315,7 @@ mod tests {
     /// tokenizer level, then (b) `prepare_call` / `prepare_call_cached`
     /// now reject it with a typed error naming the offending token,
     /// while clean prompts still prepare.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_special_token_injection_rejected() {
@@ -7414,6 +7422,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_last_and_total_usage_zero_initially() {
@@ -7431,6 +7440,7 @@ mod tests {
     /// in `ignored_categories` so the drain inside
     /// `apply_sample_repetition_ngram` materializes the punctuation
     /// tokens into `ignored` on first sample call.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_default_repetition_ignores_punctuation_category() {
@@ -7459,6 +7469,7 @@ mod tests {
     /// repetition, so `add_model_stops`'s ignored-list injection
     /// silently no-op'd (and for the earlier EOS/EOT-only fix that
     /// missed modern chat templates).
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_with_repetition_adds_special_tokens_to_ignored() {
@@ -7512,6 +7523,7 @@ mod tests {
     /// `with_sample_options` — no sidecar on disk, sidecar parse
     /// error, or `from_engine` directly — must still never penalize
     /// the model's specials.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_from_engine_default_ignores_special_tokens() {
@@ -7538,6 +7550,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_clear_prefix_cache_zeroes_state() {
@@ -7577,6 +7590,7 @@ mod tests {
     /// is nothing at the system boundary to reuse. Each
     /// [`Prompt::cache`] call marks the last cacheable block at that
     /// point in the chain.
+    #[cfg(feature = "llama-cpp")]
     fn cached_prompt(user_msg: &'static str) -> Prompt {
         Prompt::default()
             .system("You are a helpful assistant. Keep replies short.")
@@ -7589,6 +7603,7 @@ mod tests {
     /// Two back-to-back [`Session::complete_response`] calls on the
     /// exact same cached prompt must produce a cache hit on the
     /// second call (`usage.cache_read_input_tokens > 0`).
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_hit_on_identical_prompts() {
@@ -7617,6 +7632,7 @@ mod tests {
     /// Two prompts with identical system + tools but diverging last
     /// user messages: second call must reuse at least the
     /// system-boundary worth of tokens.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_hit_on_shared_system_diverging_last_message() {
@@ -7640,6 +7656,7 @@ mod tests {
 
     /// Prompt with no `cache_control` markers: second call has
     /// nothing to reuse, so `cache_read_input_tokens == 0`.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_miss_no_breakpoints() {
@@ -7670,6 +7687,7 @@ mod tests {
     /// [`Session::clear_prefix_cache`] must invalidate the cache so
     /// the next call misses even if the prompt is identical to the
     /// one that populated the cache.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_clear_invalidates_cache() {
@@ -7856,6 +7874,7 @@ mod tests {
 
     /// The emit-side ban set on a real vocab (Qwen 3.6): turn-open
     /// framing is banned, EOG and dialect markers are exempt.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_emit_ban_set_qwen() {
@@ -7894,6 +7913,7 @@ mod tests {
     /// content, not framing — while EOG stays exempt. Pairs with the
     /// sampler-side `region_ban_*` battery, which pins *where* it
     /// applies; this pins *what is in it*.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_emit_ban_set_constrained_qwen() {
@@ -7950,6 +7970,7 @@ mod tests {
     /// the standing emit-ban stay exactly as they were. The opener is
     /// deliberately absent from the standing emit-ban (so Auto/Any can
     /// call) — `None`'s ban re-adds it for that call alone.
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_tool_none_ban_set_qwen() {

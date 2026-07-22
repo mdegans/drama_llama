@@ -116,7 +116,13 @@ webchat = [
 # module. Pulls in `serde` because the sidecar round-trips
 # `SampleOptions` through serde-derived impls.
 toml = ["dep:toml", "serde"]
-cli = ["dep:clap", "llama-cpp"]
+# `cli` is clap plus the backend-agnostic CLI types in `src/cli.rs`
+# (`BackendKind`, `BackendArgs`) — both cfg-gated per backend, so this
+# does NOT imply a backend. It used to imply `llama-cpp`, which made a
+# moeflux-only front-end impossible to build even though the library
+# supported it (#68). A build with `cli` and no backend feature is a
+# hard error with a message; see `src/cli.rs`.
+cli = ["dep:clap"]
 serde = ["tinyvec/serde", "rand_pcg/serde"]
 stats = ["dep:stringmetrics"]
 cuda = ["llama-cpp", "llama-cpp-sys-3/cuda"]
@@ -155,7 +161,6 @@ axum = [
     "tracing/async-await",
     "tracing-subscriber/json",
     "tracing-subscriber/env-filter",
-    "llama-cpp",
 ]
 # Enable typed structured-output helpers: `Prompt::structured_output::<T>()`,
 # `OutputConfig::for_type::<T>()`. Requires `schemars` for schema derivation.
@@ -292,10 +297,13 @@ doc-scrape-examples = true
 # The worked example for the raw prediction API: `Engine` +
 # `CandidatePredictor` / `PiecePredictor`, no `Session`. Everything else
 # in here drives the crate through `Session`/`Transport`, so this is the
-# only place a reader sees the iterator layer those are built on.
+# only place a reader sees the iterator layer those are built on. Names
+# `LlamaCpp*` types directly (see the module doc comment) rather than
+# going through the backend-generic API, so it needs `llama-cpp` itself
+# now that `cli` no longer implies it (#68).
 [[example]]
 name = "whoami"
-required-features = ["cli"]
+required-features = ["cli", "llama-cpp"]
 doc-scrape-examples = true
 
 [[example]]
@@ -305,12 +313,24 @@ doc-scrape-examples = true
 
 [[example]]
 name = "whodunit"
-required-features = ["json-schema"]
+required-features = ["json-schema", "llama-cpp"]
 doc-scrape-examples = true
 
+# Deliberately backend-concrete (see the module doc comment): drives
+# `LlamaCppModel` directly rather than through the `Transport` erasure,
+# so it needs `llama-cpp` itself now that nothing else pulls it in for
+# free (#68).
 [[example]]
 name = "inspect_prompt"
+required-features = ["llama-cpp"]
 doc-scrape-examples = true
+
+# Deliberately backend-concrete (see the module doc comment): reads
+# GGUF metadata through `LlamaCppModel` directly, below the `Transport`
+# erasure the other examples use.
+[[example]]
+name = "dump_template"
+required-features = ["llama-cpp"]
 
 # Spawns the blallama binary via `env!("CARGO_BIN_EXE_blallama")`, so
 # it needs the bin's exact feature set; cargo builds the bin for the
@@ -318,6 +338,29 @@ doc-scrape-examples = true
 [[test]]
 name = "blallama"
 required-features = ["axum", "cli", "toml"]
+
+# Every test in these four files loads a real llama.cpp model via
+# `LlamaCppSession`/`LlamaCppEngine`/`FromPath` — wholly llama.cpp-only
+# (#68), so the whole target is gated rather than per-test.
+[[test]]
+name = "session"
+required-features = ["llama-cpp"]
+
+[[test]]
+name = "session_gemma4"
+required-features = ["llama-cpp"]
+
+[[test]]
+name = "session_gptoss"
+required-features = ["llama-cpp"]
+
+# `#![cfg(feature = "json-schema")]` inside the file already empties it
+# out without that feature; `llama-cpp` is required too, for
+# `Session::from_path_with_n_ctx` (the `Session<LlamaCppBackend>`
+# inherent impl gated in `src/session/mod.rs`).
+[[test]]
+name = "output_config"
+required-features = ["json-schema", "llama-cpp"]
 
 [[bin]]
 name = "regurgitater"

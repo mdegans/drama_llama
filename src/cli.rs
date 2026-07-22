@@ -7,6 +7,11 @@
 //! [`LlamaCppOptions`](crate::LlamaCppOptions) and friends, and a
 //! single-backend binary should flatten those directly.
 //!
+//! This module is backend-agnostic: every variant and every knob is
+//! cfg-gated to its backend, so the `cli` feature deliberately does not
+//! imply one. It does require *some* backend — a selector over an empty
+//! set of backends is not a meaningful thing to build.
+//!
 //! # Why the union has to exist
 //!
 //! `#[command(flatten)]` resolves at compile time and `--backend` is
@@ -15,6 +20,19 @@
 //! command. The union struct is the only shape that works, and it must
 //! then be narrowed to a concrete backend's options with
 //! [`TryFrom`], which is where an inapplicable flag gets caught.
+
+// `BackendKind` is a selector over the compiled-in backends, and
+// `default_backend_kind` must return one of them. With no backend feature the
+// enum is empty and both are meaningless — caught here with a sentence rather
+// than downstream as a type error about an empty match.
+#[cfg(not(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+)))]
+compile_error!(
+    "the `cli` feature needs a backend: enable `llama-cpp`, or a \
+     `moeflux-model-*` feature on macOS"
+);
 
 /// Inference backend selector for a `--backend` flag. Variants are cfg-gated
 /// to whichever crate features are enabled, so a single-backend build gets a
@@ -25,10 +43,10 @@
 /// answer to "which backends does this build have" rather than one per
 /// consumer.
 ///
-/// Note the `cli` feature implies `llama-cpp` (see `Cargo.toml`), so
-/// [`Self::LlamaCpp`] is always present wherever this type compiles today.
-/// The cfg is kept anyway: it is what the enum *means*, and it is what makes
-/// splitting `cli` into `clap`-only a one-line change rather than a hunt.
+/// The `cli` feature no longer implies `llama-cpp` (it did until #68, which
+/// is why a moeflux-only front-end could not be built), so both variants are
+/// genuinely optional and a moeflux-only build gets a `--backend` flag that
+/// offers exactly `moeflux`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]

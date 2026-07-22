@@ -2717,6 +2717,7 @@ char ::= [\x00-\x7F] | [\x80-\xFF]"#;
     /// End-to-end integration test: run a real model with a GBNF that
     /// forces a specific tool-call shape.
     #[cfg(feature = "serde")]
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "requires model"]
     fn grammar_integration_tool_call() {

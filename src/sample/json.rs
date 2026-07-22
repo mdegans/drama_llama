@@ -979,6 +979,7 @@ mod tests {
     /// The constraint is advisory: it rejects tokens that would produce
     /// invalid JSON, but it can't force a specific shape.
     #[cfg(feature = "serde")]
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "requires model"]
     fn json_integration_character_sheet() {
@@ -1055,6 +1056,7 @@ mod tests {
     /// Lazy output legitimately differs from masked output (documented
     /// semantics change); nothing here compares across the two modes.
     #[cfg(feature = "serde")]
+    #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "requires model, long running"]
     fn json_integration_lazy_grammar() {
