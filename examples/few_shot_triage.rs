@@ -22,7 +22,6 @@
 mod utils;
 
 use clap::Parser;
-use drama_llama::SessionTransport;
 use misanthropic::{prompt::message::Role, Prompt, Transport};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -75,7 +74,7 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     utils::log_init(cli.common.verbose);
-    let transport = SessionTransport::new(cli.common.session()?);
+    let transport = cli.common.transport().build()?;
 
     let report = cli.report.unwrap_or_else(|| {
         "Checkout total shows $0.00 even though the cart has items. Only \

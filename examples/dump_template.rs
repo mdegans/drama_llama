@@ -4,6 +4,10 @@
 //! cargo run --example dump_template                     # models/model.gguf
 //! cargo run --example dump_template -- /path/to/x.gguf  # explicit path
 //! ```
+//!
+//! Deliberately backend-concrete: this reads GGUF metadata through
+//! `LlamaCppModel`, below the `Transport` erasure the other examples use.
+//! Keep it that way — it is one of the few examples of the raw model API.
 use std::path::PathBuf;
 
 use drama_llama::LlamaCppModel;

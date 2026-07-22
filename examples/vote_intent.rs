@@ -23,7 +23,6 @@ mod utils;
 use std::io::Read;
 
 use clap::Parser;
-use drama_llama::SessionTransport;
 use misanthropic::{prompt::message::Role, Prompt, Transport};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -99,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
-    let transport = SessionTransport::new(args.common.session()?);
+    let transport = args.common.transport().build()?;
 
     let system = "You are a thoughtful agent participating in a governed \
         social network. Read the user-provided post and produce a \

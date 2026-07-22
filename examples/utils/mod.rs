@@ -16,7 +16,10 @@ pub use misanthropic::chat::{BoxError, BudgetPolicy, Chat};
 // Shared CLI flags — pure data + `Prompt`/`Session` mapping.
 mod args;
 #[allow(unused_imports)]
-pub use args::{Args, ChatArgs, CommonArgs};
+pub use args::{
+    Args, BlockingTransport, BlockingTransportError, ChatArgs, CommonArgs,
+    TransportBuilder,
+};
 
 /// Initialize logging for an example. With `verbose`, the examples and the
 /// chat driver log at `debug` (otherwise `warn`); `RUST_LOG` overrides

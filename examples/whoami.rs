@@ -137,6 +137,15 @@
 //! [`Engine`]: drama_llama::Engine
 //! [`CandidatePredictor`]: drama_llama::CandidatePredictor
 //! [`record_choice`]: drama_llama::CandidatePredictor::record_choice
+//!
+//! # Deliberately backend-concrete
+//!
+//! Unlike the `Transport`-driven examples, this one names `LlamaCpp*`
+//! directly and takes no `--backend`. That is the point: it demonstrates
+//! the raw [`Engine`] / [`CandidatePredictor`] layer, which sits *below*
+//! the erasure boundary. Do not "upgrade" it onto `Session` or a
+//! transport — the low-level examples were once ported away wholesale and
+//! the crate was left with nothing showing this layer at all.
 
 use std::collections::btree_map::{BTreeMap, Entry};
 use std::collections::HashSet;

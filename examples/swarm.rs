@@ -74,7 +74,6 @@ use std::{
 };
 
 use clap::Parser;
-use drama_llama::SessionTransport;
 use misanthropic::{
     prompt::message::{CacheControl, Content, Role},
     response::TokenCounts,
@@ -404,8 +403,7 @@ async fn main() -> Result<(), BoxError> {
     // and serializes through the same session. One cache slot per seat:
     // each agent's history keeps its own KV sequence across switches.
     let seats = WORKERS.len() as u32 + 1;
-    let transport =
-        SessionTransport::new(cli.common.session_with_cache_slots(seats)?);
+    let transport = cli.common.transport().cache_slots(seats).build()?;
 
     let (mut lines, printer) = utils::spawn_readline_loop("you ▸ ")?;
     let printer: SharedPrinter = Arc::new(Mutex::new(printer));

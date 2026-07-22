@@ -40,7 +40,6 @@ mod utils;
 use std::collections::BTreeMap;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
-use drama_llama::LlamaCppSession;
 use misanthropic::{
     prompt::message::{CacheControl, Role},
     response::TokenCounts,
@@ -308,7 +307,7 @@ fn assert_cache_hit(seat: &Seat, counts: &TokenCounts, first: bool) {
 /// the seat name; the caller bails (any completion failure is a
 /// programmer error, not a council event).
 fn file_call(
-    session: &mut LlamaCppSession,
+    transport: &utils::BlockingTransport,
     seat: &mut Seat,
     mail: String,
 ) -> Result<(Filing, TokenCounts), BoxError> {
@@ -318,8 +317,8 @@ fn file_call(
         .iter()
         .any(|m| m.role == Role::Assistant);
     seat.prompt.messages.push((Role::User, mail).into());
-    let message = session
-        .complete_response(&seat.prompt)
+    let message = transport
+        .send(&seat.prompt)
         .map_err(|e| format!("☠ {}: {e}", seat.name))?;
     let counts = message.usage.counts;
     assert_cache_hit(seat, &counts, first_call);
@@ -340,7 +339,7 @@ fn file_call(
     for (field, text) in
         [("analysis", &filing.analysis), ("verdict", &filing.verdict)]
     {
-        if let Some((id, piece)) = session.scan_text_for_specials(text) {
+        if let Some((id, piece)) = transport.scan_text_for_specials(text) {
             return Err(format!(
                 "☠ {}: {field} contains the reserved framing sequence \
                  {} (token #{id}) — grammar-legal in an argument \
@@ -367,7 +366,7 @@ fn file_call(
 /// [`TokenCounts`]) out. Same append-only, success-only transcript
 /// discipline as [`file_call`].
 fn rule_call(
-    session: &mut LlamaCppSession,
+    transport: &utils::BlockingTransport,
     judge: &mut Seat,
     mail: String,
 ) -> Result<(String, TokenCounts), BoxError> {
@@ -377,8 +376,8 @@ fn rule_call(
         .iter()
         .any(|m| m.role == Role::Assistant);
     judge.prompt.messages.push((Role::User, mail).into());
-    let message = session
-        .complete_response(&judge.prompt)
+    let message = transport
+        .send(&judge.prompt)
         .map_err(|e| format!("☠ {}: {e}", judge.name))?;
     let counts = message.usage.counts;
     assert_cache_hit(judge, &counts, first_call);
@@ -444,8 +443,11 @@ fn record_text(case: &str, rounds: &[Round]) -> String {
 /// Scan human-authored text before it enters any prompt; `Err` is the
 /// rephrase message. The ONE recoverable error in the program — the
 /// human can retype, a model cannot.
-fn scan_human(session: &LlamaCppSession, text: &str) -> Result<(), String> {
-    match session.scan_text_for_specials(text) {
+fn scan_human(
+    transport: &utils::BlockingTransport,
+    text: &str,
+) -> Result<(), String> {
+    match transport.scan_text_for_specials(text) {
         Some((id, piece)) => Err(format!(
             "your message contains the reserved framing sequence {} \
              (token #{id}) and cannot be relayed — please rephrase",
@@ -469,7 +471,8 @@ fn main() -> Result<(), BoxError> {
 
     // One model, one session, one cache slot per seat.
     let seats = ADVISORS.len() as u32 + 2; // advisors + jester + judge
-    let mut session = cli.common.session_with_cache_slots(seats)?;
+    let transport =
+        cli.common.transport().cache_slots(seats).build_blocking()?;
     // Filings and rulings are long-form; the seats rely on the prompt's
     // `max_tokens` default (4096) as the generation budget — 1024 truncated
     // a jester rebuttal, 2048 an engineer reaction (runs five and six), and
@@ -513,7 +516,7 @@ fn main() -> Result<(), BoxError> {
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
             Err(_) => break, // Ctrl-D / EOF: adjourn
         };
-        if let Err(rephrase) = scan_human(&session, &petition) {
+        if let Err(rephrase) = scan_human(&transport, &petition) {
             println!("⚖ {rephrase}");
             continue;
         }
@@ -544,7 +547,7 @@ fn main() -> Result<(), BoxError> {
             let mut filings: BTreeMap<&'static str, String> = BTreeMap::new();
             for seat in advisors.iter_mut() {
                 let (filing, counts) =
-                    file_call(&mut session, seat, notice.clone())?;
+                    file_call(&transport, seat, notice.clone())?;
                 println!(
                     "{} ⚖ filed [{}] — {}",
                     seat.name,
@@ -569,8 +572,7 @@ fn main() -> Result<(), BoxError> {
                  (or the strongest position if they split), premises \
                  first, even if you privately agree.",
             );
-            let (rebuttal, counts) =
-                file_call(&mut session, &mut jester, seal)?;
+            let (rebuttal, counts) = file_call(&transport, &mut jester, seal)?;
             println!(
                 "{JESTER} ⚖ rebutted [{}] — {}",
                 pay_line(&counts),
@@ -588,7 +590,7 @@ fn main() -> Result<(), BoxError> {
             let mut reactions: BTreeMap<&'static str, String> = BTreeMap::new();
             for seat in advisors.iter_mut() {
                 let (reaction, counts) =
-                    file_call(&mut session, seat, react_mail.clone())?;
+                    file_call(&transport, seat, react_mail.clone())?;
                 println!(
                     "{} ⚖ reacted [{}] — {}",
                     seat.name,
@@ -619,7 +621,7 @@ fn main() -> Result<(), BoxError> {
                 if line.trim().is_empty() {
                     break None;
                 }
-                match scan_human(&session, &line) {
+                match scan_human(&transport, &line) {
                     Ok(()) => {
                         editor.add_history_entry(&line).ok();
                         break Some(line);
@@ -633,11 +635,8 @@ fn main() -> Result<(), BoxError> {
         }
 
         // ── The ruling: the judge sees the record LAST ───────────
-        let (ruling, counts) = rule_call(
-            &mut session,
-            &mut judge,
-            record_text(&petition, &rounds),
-        )?;
+        let (ruling, counts) =
+            rule_call(&transport, &mut judge, record_text(&petition, &rounds))?;
         println!("\njudge [{}] ▸ {ruling}\n", pay_line(&counts));
     }
 

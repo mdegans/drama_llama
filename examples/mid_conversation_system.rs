@@ -30,7 +30,6 @@
 mod utils;
 
 use clap::Parser;
-use drama_llama::SessionTransport;
 use misanthropic::{
     prompt::{message::Role, TurnOrderError},
     Prompt, Transport,
@@ -51,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     demonstrate_guardrails();
 
-    let transport = SessionTransport::new(cli.common.session()?);
+    let transport = cli.common.transport().build()?;
 
     // The refund *policy* is deliberately NOT in the top-level system prompt —
     // it arrives mid-conversation on the system channel.

@@ -259,12 +259,20 @@ doc-scrape-examples = true
 
 [[example]]
 name = "council"
-required-features = ["repl"]
+required-features = ["tokio", "repl"]
+doc-scrape-examples = true
+
+# Sync example (no async `main`): drives the erased transport through
+# `utils::BlockingTransport`, so it needs `tokio` for `SessionTransport`
+# and `cli` for `CommonArgs`.
+[[example]]
+name = "unhelpful"
+required-features = ["tokio", "cli"]
 doc-scrape-examples = true
 
 [[example]]
 name = "strawberry"
-required-features = ["cli", "json-schema"]
+required-features = ["tokio", "cli", "json-schema"]
 doc-scrape-examples = true
 
 # Differential fuzzer over the schema → grammar → JSON pipeline.

@@ -35,7 +35,6 @@
 mod utils;
 
 use clap::Parser;
-use drama_llama::SessionTransport;
 use misanthropic::{prompt::message::Role, CachedPrompt, Prompt, Transport};
 
 /// The large, stable prefix worth caching: instructions plus the documents
@@ -79,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     utils::log_init(args.common.verbose);
 
-    let transport = SessionTransport::new(args.common.session()?);
+    let transport = args.common.transport().build()?;
 
     // Wrap and drop the default breakpoint after the system prompt. From
     // here on the prefix is immutable — `prompt.system(…)` or

@@ -10,7 +10,7 @@
 //! given a train of thought already in motion.
 //!
 //! ```sh
-//! cargo run --example unhelpful --release -- [path/to/model.gguf]
+//! cargo run --example unhelpful --features "tokio,cli" --release -- [-m path/to/model.gguf]
 //! ```
 //!
 //! Defaults to `models/model.gguf`.
@@ -34,13 +34,20 @@
 //! [`open_thought`]: drama_llama::prompt::open_thought
 //! [`Block::Thought`]: drama_llama::Block
 
-use std::path::PathBuf;
-
+use clap::Parser;
 use drama_llama::{
-    prompt::open_thought, Block, Content, LlamaCppSession, Message, Prompt,
-    Role,
+    prompt::open_thought, Block, Content, Message, Prompt, Role,
 };
 use misanthropic::prompt::thinking::Thinking;
+
+mod utils;
+
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Args {
+    #[command(flatten)]
+    common: utils::CommonArgs,
+}
 
 /// The train of thought we put the assistant on. Written in its voice,
 /// mid-reasoning, deliberately unfinished — the model completes the
@@ -69,14 +76,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    let path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/model.gguf"));
-
-    let mut session = LlamaCppSession::from_path_with_n_ctx(path, 8192)?
-        .quiet()
-        .with_prefix_cache(true);
+    // Synchronous example, so the blocking bridge: `SessionTransport`
+    // completes on tokio's blocking pool and needs a runtime either way.
+    // (The prefix cache this demo lives on is switched on by
+    // `SessionTransport::new`, so there is nothing to enable here.)
+    let transport = Args::parse().common.transport().build_blocking()?;
 
     // No system prompt telling it to refuse — the *only* thing pushing
     // the model toward refusal is the seeded reasoning. That is the
@@ -92,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== control: no seeded thought ===\n");
     let control = base.clone().add_message((Role::User, REQUESTS[0]))?;
-    report(&mut session, &control)?;
+    report(&transport, &control)?;
 
     println!("\n=== seeded: the same request, thought prefilled ===");
     for request in REQUESTS {
@@ -107,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         println!("\nuser ▸ {request}");
-        report(&mut session, &prompt)?;
+        report(&transport, &prompt)?;
     }
 
     // ── The other half of the primitive: resume, don't regenerate ──
@@ -123,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .add_message((Role::User, "Explain why you are like this."))?
         .max_tokens(std::num::NonZeroU32::new(48).unwrap());
-    let cut = session.complete_blocks(&asked)?;
+    let cut = transport.send(&asked)?.inner.content;
 
     let Some(partial @ Block::Thought { .. }) = cut.first() else {
         println!("(model finished within the budget — nothing to resume)");
@@ -144,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         content: Content(vec![partial.clone()]),
     });
     println!("  resuming…");
-    report(&mut session, &resumed)?;
+    report(&transport, &resumed)?;
     println!(
         "\n  ^ that cache read covers the prompt AND every token of \
          reasoning from the first call. Without byte-exact re-rendering \
@@ -173,10 +177,10 @@ fn block_text(block: &Block) -> &str {
 /// Run one turn and show what came back: the reasoning (continued from
 /// the seed, where there is one), the answer, and the cache counters.
 fn report(
-    session: &mut LlamaCppSession,
+    transport: &utils::BlockingTransport,
     prompt: &Prompt,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let message = session.complete_response(prompt)?;
+    let message = transport.send(prompt)?;
     for block in message.inner.content.iter() {
         match block {
             Block::Thought { thought, .. } => {

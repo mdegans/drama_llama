@@ -49,7 +49,7 @@
 
 mod utils;
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use misanthropic::{
@@ -168,7 +168,7 @@ async fn main() -> Result<(), BoxError> {
         prompt = prompt.add_tools(bash.definitions());
     }
 
-    let mut session = cli.common.session_with_cache_slots(1)?;
+    let transport = cli.common.transport().build()?;
     // Generation budget rides on the prompt (`prompt.max_tokens`, default
     // 4096 — ample for council-sized filings) since the Session-level cap
     // was removed; `--max-tokens` overrides it via `CommonArgs::configure`.
@@ -197,7 +197,7 @@ async fn main() -> Result<(), BoxError> {
     let mut total = TokenCounts::default();
     let outcome = drive(
         &cli,
-        &mut session,
+        &transport,
         &mut prompt,
         bash.as_mut(),
         &bash_methods,
@@ -252,7 +252,7 @@ fn forced(prompt: &Prompt) -> bool {
 /// — printing every block and answering every tool call — until Ctrl-D.
 async fn drive(
     cli: &Cli,
-    session: &mut drama_llama::LlamaCppSession,
+    transport: &Arc<dyn drama_llama::LocalTransport>,
     prompt: &mut Prompt,
     mut bash: Option<&mut RichBash>,
     bash_methods: &HashSet<String>,
@@ -305,7 +305,7 @@ async fn drive(
         // Same ingest guard as the council: framing bytes in a human
         // line would be rejected at ingest anyway, so catch them as a
         // rephrase instead of an error.
-        if let Some((id, _)) = session.scan_text_for_specials(&line) {
+        if let Some((id, _)) = transport.scan_text_for_specials(&line).await {
             println!(
                 "✗ your message contains a reserved framing sequence \
                  (token #{id}) and cannot be relayed — please rephrase"
@@ -316,7 +316,7 @@ async fn drive(
 
         let mut rounds = 0usize;
         loop {
-            let message = session.complete_response(prompt)?;
+            let message = transport.send(prompt).await?;
             *total += message.usage.counts;
 
             // Echo every block in order: prose as prose, tool calls as

@@ -19,6 +19,11 @@
 //!   comparing two consecutive prompt logs.
 //! - The `add_generation_prompt=true` render's tail tokens (what the
 //!   model would see queued up before its first generated token).
+//!
+//! Deliberately backend-concrete: renders and tokenizes through
+//! `LlamaCppModel` directly, below the `Transport` erasure the other
+//! examples use. Keep it that way — prefix-cache attribution is a
+//! tokenizer-level question, not a transport-level one.
 
 use std::path::PathBuf;
 

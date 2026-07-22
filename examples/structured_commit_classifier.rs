@@ -24,7 +24,6 @@ mod utils;
 use std::io::Read;
 
 use clap::Parser;
-use drama_llama::SessionTransport;
 use misanthropic::{prompt::message::Role, Prompt, Transport};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -117,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
-    let transport = SessionTransport::new(args.common.session()?);
+    let transport = args.common.transport().build()?;
 
     let system = "You are an experienced code reviewer classifying a diff \
         into a conventional-commit-style message. Base the category on \

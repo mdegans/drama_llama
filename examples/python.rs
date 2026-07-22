@@ -19,7 +19,6 @@ use std::{
 use clap::Parser;
 use subprocess::{Exec, Redirection};
 
-use drama_llama::SessionTransport;
 use misanthropic::{
     json,
     markdown::ToMarkdown,
@@ -151,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load the local model and wrap it as a `Transport` — the local
     // stand-in for `Client::new(key)`.
-    let transport = SessionTransport::new(args.common.session()?);
+    let transport = args.common.transport().build()?;
 
     // Get the Python version so the Assistant can write code for the correct
     // version.

@@ -13,22 +13,25 @@
 //! into a grammar that constrains sampling, so the call is guaranteed.
 //!
 //! ```sh
-//! cargo run --example strawberry --features "cli,json-schema" --release
+//! cargo run --example strawberry --features "tokio,cli,json-schema" --release
 //! ```
 //!
 //! [`tool`]: misanthropic::tool::tool
 //! [`Tool`]: misanthropic::tool::Tool
 //! [`ToolChoice::method`]: drama_llama::ToolChoice::method
 
-use std::{num::NonZeroU32, path::PathBuf};
+use std::num::NonZeroU32;
 
 use clap::Parser;
-use drama_llama::{
-    Content, LlamaCppSession, Prompt, RenderOptions, Role, ToolChoice,
+use drama_llama::{Block, Content, Prompt, RenderOptions, Role, ToolChoice};
+use misanthropic::{
+    tool::{tool, Tool},
+    Transport,
 };
-use misanthropic::tool::{tool, Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+mod utils;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -40,9 +43,9 @@ struct Args {
         default_value = "Count the number of r's in 'strawberry'"
     )]
     prompt: String,
-    /// Path to a GGUF model. Defaults to `models/model.gguf`.
-    #[arg(long)]
-    model: Option<PathBuf>,
+
+    #[command(flatten)]
+    common: utils::CommonArgs,
 }
 
 /// Arguments for the `count_letters` method. The field docs become the
@@ -89,26 +92,26 @@ impl Strawberry {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let model_path = args.model.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
-    });
 
     let mut strawberry = Strawberry;
 
-    let mut session = LlamaCppSession::from_path_sync(model_path)?
-        .quiet()
+    let transport = args
+        .common
+        .transport()
         // A repetition penalty can talk the model out of repeating the
         // tool result's digit in its answer; the grammar already keeps
-        // the call itself well-formed.
+        // the call itself well-formed. Deliberately set here rather than
+        // exposed as a flag — the demo is wrong without it.
         .without_repetition()
-        .with_render_opts(
+        .render_opts(
             RenderOptions::default()
                 .with_generation_prompt(true)
                 // Templates that gate a <think> block on this variable
                 // (Qwen3, Cogito) pair it with the grammar's optional
                 // thought preamble.
                 .with_extra("enable_thinking", true),
-        );
+        )
+        .build()?;
 
     let mut chat = Prompt::default()
         .max_tokens(NonZeroU32::new(256).unwrap())
@@ -129,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     chat.tool_choice = Some(ToolChoice::method(name));
 
     // Turn 1: the grammar-forced tool call.
-    let message = session.complete_response(&chat)?;
+    let message = transport.send(&chat).await?;
     let Some(call) = message.tool_use() else {
         return Err("tool was not called".into());
     };
@@ -143,9 +146,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = strawberry.call(call).await;
     chat.push_message(result)?;
 
-    // Turn 2: free generation for the prose answer.
+    // Turn 2: free generation for the prose answer. Reasoning models may
+    // also emit a `Thought`; the answer is the `Text` blocks.
     chat.tool_choice = None;
-    let answer = session.complete_text(&chat)?;
+    let message = transport.send(&chat).await?;
+    let answer: String = message
+        .inner
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            Block::Text { text, .. } => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect();
     println!("{}", answer.trim());
 
     Ok(())

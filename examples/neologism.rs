@@ -12,7 +12,6 @@
 mod utils;
 
 use clap::Parser;
-use drama_llama::SessionTransport;
 use misanthropic::{prompt::message::Role, Prompt, Transport};
 
 /// Invent new words and provide their definitions based on user-provided
@@ -41,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load the local model and wrap it as a `Transport` — the local
     // stand-in for `Client::new(key)`.
-    let transport = SessionTransport::new(args.common.session()?);
+    let transport = args.common.transport().build()?;
 
     // Request a completion. The prompt-building patterns are misanthropic's
     // own — messages from tuples of `Role` and `String`, etc.

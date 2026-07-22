@@ -18,6 +18,12 @@
 //! [`Prompt::structured_output`]: misanthropic::Prompt::structured_output
 //! [`Session::complete_stream`]: drama_llama::Session::complete_stream
 //! [`Block`]: drama_llama::Block
+//!
+//! Deliberately backend-concrete, and for a specific reason: this example
+//! exists to show [`Session::complete_stream`], and `Transport` has no
+//! streaming method — so unlike the other chat-shaped examples it cannot
+//! be driven through an erased transport without deleting the very thing
+//! it demonstrates. Revisit if `Transport` ever grows a `stream`.
 
 use std::path::PathBuf;
 
