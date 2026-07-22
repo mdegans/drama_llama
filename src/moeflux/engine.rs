@@ -10,7 +10,7 @@ use crate::{
     moeflux::{
         decoder::{MoefluxDecoder, MoefluxError},
         model::{MoefluxModel, MoefluxModelError},
-        MoefluxBackend,
+        MoefluxBackend, MoefluxOptions,
     },
     Engine,
 };
@@ -79,9 +79,8 @@ impl MoefluxEngine {
     /// - `parent/root/` — the experts directory (contains
     ///   `packed_experts/`).
     ///
-    /// Defaults `use_2bit = false` — the Qwen3 MoE 4-bit setup. MoE
-    /// top-K is variant-driven (not a parameter). Power users who need
-    /// explicit paths can use [`Self::from_paths`] directly.
+    /// MoE top-K is variant-driven (not a parameter). Power users who
+    /// need explicit paths can use [`Self::from_paths`] directly.
     ///
     /// This is the constructor `blallama` uses on the moeflux side so
     /// `--model <path>` is symmetric with the llama.cpp path. The
@@ -89,12 +88,19 @@ impl MoefluxEngine {
     /// flat sibling layout (`<stem>-mlx-4bit/`, `<stem>-artifacts/`,
     /// `<stem>-root/`); migration via the moeflux conversion script
     /// is tracked in `.claude/memory/`.
-    pub fn from_path(parent: &Path) -> Result<Self, MoefluxEngineError> {
+    pub fn from_path_with(
+        parent: &Path,
+        options: MoefluxOptions,
+    ) -> Result<Self, MoefluxEngineError> {
         let mlx_dir = parent.join("mlx");
         let artifacts_dir = parent.join("artifacts");
         let experts_dir = parent.join("root");
-        let mut engine =
-            Self::from_paths(&mlx_dir, &artifacts_dir, &experts_dir, false)?;
+        let mut engine = Self::from_paths(
+            &mlx_dir,
+            &artifacts_dir,
+            &experts_dir,
+            options.use_2bit,
+        )?;
         // Override the model's display name to the parent dir's
         // basename — that's what blallama-style discovery flows
         // address the model by, and what they expect to see echoed
@@ -108,5 +114,11 @@ impl MoefluxEngine {
             engine.model.set_name(name);
         }
         Ok(engine)
+    }
+
+    /// [`Self::from_path_with`] with default options — `use_2bit =
+    /// false`, the Qwen3 MoE 4-bit setup the on-disk artifacts use.
+    pub fn from_path(parent: &Path) -> Result<Self, MoefluxEngineError> {
+        Self::from_path_with(parent, MoefluxOptions::default())
     }
 }

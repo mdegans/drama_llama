@@ -8,8 +8,8 @@ use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
     prompt::{ToolResult, ToolUse},
-    Block, Content, Message, Prompt, RenderOptions, Role, SessionError, Tool,
-    ToolChoice,
+    Block, Content, FromPath, Message, Prompt, RenderOptions, Role,
+    SessionError, Tool, ToolChoice,
 };
 use serde_json::json;
 
@@ -106,10 +106,9 @@ fn complete_text_strawberry_turn_2() {
 
     // No dialect override: the session derives the tool-call format
     // from the model's chat template at load (#30 Phase E).
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet();
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
 
     let out = session.complete_text(&prompt).expect("complete_text");
     println!("=== complete_text output ===\n{out}\n===");
@@ -160,13 +159,12 @@ fn request_temperature_zero_is_reproducible() {
         ..Default::default()
     };
 
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet()
-            // Fresh entropy per call — the whole point. With a fixed
-            // seed this would pass even with temperature ignored.
-            .with_seed(None);
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet()
+        // Fresh entropy per call — the whole point. With a fixed
+        // seed this would pass even with temperature ignored.
+        .with_seed(None);
 
     let first = session.complete_text(&prompt).expect("first");
     let second = session.complete_text(&prompt).expect("second");
@@ -207,10 +205,9 @@ fn request_temperature_zero_is_reproducible() {
 #[test]
 #[ignore = "requires model"]
 fn request_top_p_out_of_range_is_rejected() {
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet();
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
 
     let bad = Prompt {
         messages: vec![Message {
@@ -271,11 +268,10 @@ fn complete_text_grammar_prepended_even_with_empty_sampling() {
         ..Default::default()
     };
 
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet()
-            .with_sampling(std::iter::empty()); // user chain empty — only grammar runs
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet()
+        .with_sampling(std::iter::empty()); // user chain empty — only grammar runs
 
     let out = session.complete_text(&prompt).expect("complete_text");
     println!("=== forced-call output ===\n{out}\n===");
@@ -334,10 +330,9 @@ fn strawberry_turn_1_prompt() -> Prompt {
 fn complete_returns_message_with_tool_use() {
     let prompt =
         strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet();
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
 
     let assistant = session.complete(&prompt).expect("complete");
     println!("=== complete message ===\n{assistant:#?}\n===");
@@ -377,10 +372,9 @@ fn grammar_violation_on_truncated_tool_call() {
     // truncate hard
     let prompt =
         strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(4).unwrap());
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet();
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
 
     let err = session
         .complete_blocks(&prompt)
@@ -419,11 +413,10 @@ fn complete_text_round_trips_through_parse_and_render() {
     // found #53 that way), but resolved-and-printed via `test_seed()`
     // so a failure is replayable: `DRAMA_LLAMA_TEST_SEED=<n> cargo test
     // --test session complete_text_round_trips -- --ignored`.
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet()
-            .with_seed(Some(common::test_seed()));
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet()
+        .with_seed(Some(common::test_seed()));
     println!("=== dialect ===\n{:#?}\n===", session.dialect());
 
     // Mirror the session's own render defaults (`from_engine`):
@@ -516,11 +509,10 @@ fn multi_call_round_trips_under_greedy() {
 
     let prompt =
         strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet()
-            .with_sample_options(SamplerConfig::greedy());
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet()
+        .with_sample_options(SamplerConfig::greedy());
 
     // The fix in one line: the analyzer must have captured the
     // template's inter-call separator.
@@ -592,10 +584,9 @@ fn auto_tool_choice_parses_native_dialect_call() {
     let mut prompt =
         strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
     prompt.tool_choice = Some(ToolChoice::auto());
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet();
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
 
     let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
     println!("=== auto blocks ===\n{blocks:#?}\n===");
@@ -631,10 +622,9 @@ fn tool_choice_none_forbids_calls_defs_still_rendered() {
     let mut prompt =
         strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
     prompt.tool_choice = Some(ToolChoice::none());
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet();
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
 
     // Prefix preservation: `tool_choice` never touches the render, only
     // the sampler — so the prompt under `None` is byte-identical to the
@@ -749,11 +739,10 @@ fn prefix_cache_survives_tool_turn() {
             }
         }
     }
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet()
-            .with_prefix_cache(true);
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet()
+        .with_prefix_cache(true);
 
     // Turn 1: forced call.
     let blocks = session.complete_blocks(&prompt).expect("turn 1");
@@ -810,10 +799,9 @@ fn complete_response_id_uses_supplied_uuid() {
         ..Default::default()
     };
 
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet();
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
 
     let id = uuid::Uuid::from_u128(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
     let response = session
@@ -916,10 +904,9 @@ fn unrenderable_open_thought_is_rejected() {
         ]),
     });
 
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("session load")
-            .quiet();
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
 
     let err = session.complete_blocks(&prompt).unwrap_err();
     assert!(

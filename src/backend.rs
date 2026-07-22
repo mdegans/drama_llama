@@ -682,6 +682,106 @@ pub trait Backend {
 
     /// Return `true` if a file or directory is supported by the [`Backend`].
     fn is_supported_model(name: &str, meta: &std::fs::Metadata) -> bool;
+
+    /// Route this backend's own log output through `f`, replacing any
+    /// previously installed sink. Process-global.
+    ///
+    /// # Call this *before* loading a model
+    ///
+    /// A backend wrapping a C library is at its loudest during load —
+    /// weights, KV cache sizing, compute buffers. Nothing in this crate
+    /// installs a sink for you, deliberately: a caller whose model will
+    /// not load wants those lines, and a constructor that decided
+    /// quietness could not give them back. Where the logs go is the
+    /// application's call, and only the application can make it early
+    /// enough.
+    ///
+    /// # `NotImplemented` is a real answer
+    ///
+    /// A backend with no sink of its own returns
+    /// [`NotImplemented`] and the default body does exactly that. This
+    /// is not a stub: `moeflux` logs through `tracing`, so there is no
+    /// C-side slot to hijack and the honest response is to say so and
+    /// point the caller at their subscriber. A silent no-op would be
+    /// indistinguishable from a sink that was installed and never fired.
+    ///
+    /// # Threading
+    ///
+    /// `f` runs on whatever thread the backend logs from — bring your
+    /// own synchronization if you need single-threaded sink semantics.
+    ///
+    /// ```no_run
+    /// # use drama_llama::{Backend, LlamaCppBackend};
+    /// // Bridge llama.cpp into `tracing`, then load.
+    /// let _ = LlamaCppBackend::set_log_callback(|level, text| {
+    ///     tracing::debug!(target: "llama.cpp", ?level, "{}", text.trim_end());
+    /// });
+    /// ```
+    fn set_log_callback<F>(f: F) -> Result<(), NotImplemented>
+    where
+        F: Fn(LogLevel, &str) + Send + Sync + 'static,
+    {
+        drop(f);
+        Err(NotImplemented {
+            backend: Self::NAME,
+            what: "log callback",
+        })
+    }
+
+    /// Undo [`Self::set_log_callback`], restoring the backend's default
+    /// log destination (usually stderr).
+    fn clear_log_callback() -> Result<(), NotImplemented> {
+        Err(NotImplemented {
+            backend: Self::NAME,
+            what: "log callback",
+        })
+    }
+}
+
+/// The backend has no implementation of this capability.
+///
+/// Distinct from a failure: nothing went wrong, there is simply nothing
+/// there. Carries the backend's [`Backend::NAME`] so a caller that is
+/// generic over `B` can report *which* one declined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the {backend} backend does not implement {what}")]
+pub struct NotImplemented {
+    /// The backend that declined, by [`Backend::NAME`].
+    pub backend: &'static str,
+    /// What was asked for, lower case and unpunctuated ("log callback").
+    pub what: &'static str,
+}
+
+/// Severity of a log line emitted by a backend's underlying library.
+///
+/// Lives here rather than beside the llama.cpp bindings because
+/// [`Backend::set_log_callback`] is backend-agnostic and this type has
+/// to compile without any backend feature enabled. The variants are
+/// llama.cpp/ggml-shaped because that is the only backend with a native
+/// sink today; a backend that has no notion of one simply never emits
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    /// No severity attached — a raw log line (e.g. a continuation
+    /// print).
+    None,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    /// Continuation of the previous line, with no newline between them.
+    ///
+    /// **Expect a flood of these.** llama.cpp draws its model-load
+    /// progress as a run of dots, each one its own `Cont` call, so a
+    /// sink that emits one record per call turns a progress bar into
+    /// hundreds of log lines. A sink that cares should buffer `Cont`
+    /// text and flush on the next non-`Cont` line, or drop `Cont`
+    /// outright. Filtering this is the sink's job, not ours — we do not
+    /// know which of the two you want.
+    Cont,
+    /// Unknown / future variant. Carries the raw value so a library
+    /// that grows its enum cannot silently drop messages.
+    Other(u32),
 }
 
 #[cfg(test)]

@@ -17,8 +17,8 @@ pub use misanthropic::chat::{BoxError, BudgetPolicy, Chat};
 mod args;
 #[allow(unused_imports)]
 pub use args::{
-    Args, BlockingTransport, BlockingTransportError, ChatArgs, CommonArgs,
-    TransportBuilder,
+    Args, BlockingTransport, BlockingTransportError, BuildError, ChatArgs,
+    CommonArgs, TransportBuilder,
 };
 
 /// Initialize logging for an example. With `verbose`, the examples and the
@@ -28,6 +28,21 @@ pub use args::{
 /// The verbose filter is *scoped* rather than a global `debug` default —
 /// a global default also turns on rustyline's per-keypress debug logging,
 /// which floods the readline examples (one log line per key).
+///
+/// # Call this before loading a model
+///
+/// This also routes each compiled-in backend's native log stream into the
+/// `log` crate, which is the whole reason it has to run *first*: llama.cpp
+/// is at its loudest during model load, so a sink installed afterwards
+/// (which is all `Session::quiet` could ever be) never sees the noisy part.
+///
+/// With the bridge in place `RUST_LOG` governs it like anything else. The
+/// backends log under the `llama_cpp` target, which is deliberately *not*
+/// in the `--verbose` set — a model load at `debug` is hundreds of lines
+/// nobody asked for. Opt in explicitly with `RUST_LOG=llama_cpp=debug`
+/// (the load-progress dots arrive as `trace`, so even that stays
+/// readable). Warnings and errors from the backend do now reach the
+/// terminal by default, which `Session::quiet` used to swallow.
 pub fn log_init(verbose: bool) {
     let default = if verbose {
         // Example binaries log under their own name; cover the set plus
@@ -44,6 +59,52 @@ pub fn log_init(verbose: bool) {
     let env = env_logger::Env::default().default_filter_or(default);
     // `try_init` so a second call (or a pre-installed logger) is a no-op.
     let _ = env_logger::Builder::from_env(env).try_init();
+
+    install_backend_log_bridges();
+}
+
+/// Point every compiled-in backend's native log sink at the `log` crate.
+///
+/// Gated by `cfg` rather than dispatched on `--backend`: installing a sink
+/// only affects the library that owns it, so doing it for everything linked
+/// is both simpler and correct — and it can happen before the flags are
+/// even parsed. Backends with no sink of their own answer
+/// `Err(NotImplemented)`, which is the expected reply and not worth
+/// reporting; `moeflux` logs through `tracing`, so `RUST_LOG` already
+/// governs it.
+fn install_backend_log_bridges() {
+    use drama_llama::LogLevel;
+
+    fn bridge(level: LogLevel, text: &str) {
+        // `Cont` is llama.cpp's load-progress dots — one call per dot.
+        // Folding them into `trace` keeps a progress bar from becoming
+        // several hundred log records at `debug`.
+        let level = match level {
+            LogLevel::Error => log::Level::Error,
+            LogLevel::Warn => log::Level::Warn,
+            LogLevel::Info => log::Level::Info,
+            LogLevel::Debug | LogLevel::None | LogLevel::Other(_) => {
+                log::Level::Debug
+            }
+            LogLevel::Cont => log::Level::Trace,
+        };
+        // llama.cpp terminates its own lines; `log` adds another.
+        let text = text.trim_end_matches('\n');
+        if !text.is_empty() {
+            log::log!(target: "llama_cpp", level, "{text}");
+        }
+    }
+
+    #[cfg(feature = "llama-cpp")]
+    {
+        use drama_llama::Backend as _;
+        let _ = drama_llama::LlamaCppBackend::set_log_callback(bridge);
+    }
+    #[cfg(all(feature = "moeflux", target_os = "macos"))]
+    {
+        use drama_llama::Backend as _;
+        let _ = drama_llama::MoefluxBackend::set_log_callback(bridge);
+    }
 }
 
 /// Spawn a dedicated thread running a `rustyline` prompt and return the

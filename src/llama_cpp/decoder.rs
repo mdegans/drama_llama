@@ -126,6 +126,8 @@ static_assertions::assert_impl_all!(DecodeError: Send, Sync);
 /// attention path on close-race token distributions, and toggling it off
 /// rules that out as a source of divergence against other runners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum FlashAttention {
     /// Let llama.cpp decide based on backend capabilities (default).
     Auto,

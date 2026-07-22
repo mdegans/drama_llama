@@ -26,8 +26,8 @@
 use std::{borrow::Cow, path::PathBuf};
 
 use drama_llama::{
-    prompt::ToolResult, Block, Content, Message, Prompt, RenderOptions, Role,
-    Tool,
+    prompt::ToolResult, Block, Content, FromPath, Message, Prompt,
+    RenderOptions, Role, Tool,
 };
 use misanthropic::prompt::message::CacheControl;
 use serde_json::json;
@@ -125,16 +125,15 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
     // transcripts genuinely diverge at the assistant turn, and the
     // auto-tip correctly cannot fire — reuse stops at the divergence.
     // Byte-stable rendering is the contract the tip mechanic needs.
-    let mut session =
-        drama_llama::LlamaCppSession::from_path_sync(model_path())
-            .expect("model loads")
-            .quiet()
-            .with_render_opts(
-                RenderOptions::default()
-                    .with_generation_prompt(true)
-                    .with_extra("preserve_thinking", true),
-            )
-            .with_prefix_cache(true);
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("model loads")
+        .quiet()
+        .with_render_opts(
+            RenderOptions::default()
+                .with_generation_prompt(true)
+                .with_extra("preserve_thinking", true),
+        )
+        .with_prefix_cache(true);
 
     let (round1_prompt, _tool) = build_round1();
 

@@ -12,8 +12,8 @@ use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
     prompt::{ToolResult, ToolUse},
-    Block, CallSyntax, Content, Message, Prompt, RenderOptions, Role, Tool,
-    ToolChoice,
+    Block, CallSyntax, Content, FromPath, Message, Prompt, RenderOptions, Role,
+    Tool, ToolChoice,
 };
 use serde_json::json;
 
@@ -34,7 +34,7 @@ fn install_template_sidecar() {
 
 fn load_session() -> drama_llama::LlamaCppSession {
     install_template_sidecar();
-    drama_llama::LlamaCppSession::from_path_sync(model_path())
+    drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
 }

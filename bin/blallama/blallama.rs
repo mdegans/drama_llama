@@ -52,7 +52,7 @@ use axum::{
 use clap::Parser;
 use drama_llama::{
     backend::{Backend, Model},
-    cli::{default_backend_kind, BackendKind},
+    cli::{BackendArgs, BackendKind},
     prompt::{AnthropicError, MessageResponse, Usage},
     FromPath, ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
 };
@@ -67,12 +67,19 @@ struct Args {
     /// Port to use
     #[arg(long, default_value_t = 11435)]
     port: u16,
-    /// Inference backend. `llama-cpp` discovers `.gguf` files; `moeflux`
+    /// Backend selection (`llama-cpp` discovers `.gguf` files; `moeflux`
     /// discovers child directories with the `mlx/`/`artifacts/`/`root/`
-    /// convention. Variants are cfg-gated — a build with only one backend
-    /// feature accepts only that variant.
-    #[arg(long, value_enum, default_value_t = default_backend_kind())]
-    backend: BackendKind,
+    /// convention) plus that backend's load-time knobs. Variants are
+    /// cfg-gated — a build with only one backend feature accepts only
+    /// that variant.
+    ///
+    /// `--n-ctx` in particular: this server used to have no way to set
+    /// it at all, so every llama.cpp model was served at llama.cpp's
+    /// 512-token default and silently truncated anything real. It now
+    /// defaults to `cli::DEFAULT_N_CTX`; raise it for long agentic
+    /// conversations if the box has the memory.
+    #[command(flatten)]
+    load: BackendArgs,
     /// Force the repetition-penalty filter OFF, even when the per-model
     /// sampling sidecar enables it. Useful for probes, canary runs, and any
     /// diagnostic where you want to see the model's raw logit gradient with no
@@ -123,8 +130,15 @@ struct Args {
 }
 
 #[derive(Clone)]
-struct AppState<B: Backend> {
+struct AppState<B: Backend>
+where
+    Session<B>: FromPath,
+{
     args: Arc<Args>,
+    /// Load-time options for `B`, narrowed from [`Args::load`] once at
+    /// startup so an inapplicable flag is a refusal to boot rather than
+    /// a surprise on the first request.
+    load_options: <Session<B> as FromPath>::Options,
     /// Sender into the JSONL writer task. `None` if `--record-json` wasn't
     /// given. Cloned per-request when installing the [`JsonlProbeRecorder`];
     /// all clones feed the same writer task / output file.
@@ -300,9 +314,13 @@ fn init_logging() {
     Registry::default().with(filter).with(fmt_layer).init();
 }
 
-async fn route_tags<B: Backend>(
+async fn route_tags<B>(
     State(state): State<AppState<B>>,
-) -> Json<serde_json::Value> {
+) -> Json<serde_json::Value>
+where
+    B: Backend,
+    Session<B>: FromPath,
+{
     let names = list_entries(&state.args.model_path, B::is_supported_model)
         .await
         .unwrap_or_default();
@@ -330,6 +348,7 @@ async fn route_tags<B: Backend>(
 
 async fn run<B>(
     args: Args,
+    load_options: <Session<B> as FromPath>::Options,
     record_json_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     probe_bus: Option<tokio::sync::broadcast::Sender<StreamProbeMsg>>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -354,6 +373,7 @@ where
     }
     let app = app.with_state(AppState {
         args: args.into(),
+        load_options,
         record_json_tx,
         probe_bus,
         session,
@@ -365,6 +385,7 @@ where
 async fn load_session<B>(
     root: impl AsRef<Path>,
     model: String,
+    options: <Session<B> as FromPath>::Options,
     no_penalty: bool,
     seed: Option<u128>,
 ) -> Result<Session<B>, (StatusCode, Json<ErrorEnvelope>)>
@@ -379,7 +400,9 @@ where
         model,
         path = path.to_string_lossy().as_ref()
     );
-    Session::<B>::from_path(path)
+    // `from_path_async`, not `from_path`: loading is seconds of blocking
+    // file and GPU work and this is a reactor thread.
+    Session::<B>::from_path_async(path, options)
         .await
         .map(|s| configure_session(s, no_penalty, seed))
         .map_err(map_session_err)
@@ -473,6 +496,7 @@ where
                 load_session(
                     &state.args.model_path,
                     prompt.model.to_string(),
+                    state.load_options.clone(),
                     state.args.no_penalty,
                     state.args.seed,
                 )
@@ -483,6 +507,7 @@ where
             load_session(
                 &state.args.model_path,
                 prompt.model.to_string(),
+                state.load_options.clone(),
                 state.args.no_penalty,
                 state.args.seed,
             )
@@ -894,6 +919,7 @@ async fn route_probe_stream<B: Backend>(
 >
 where
     AppState<B>: Clone,
+    Session<B>: FromPath,
 {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures_util::StreamExt as _;
@@ -969,16 +995,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    match args.backend {
+    // Narrow the union flags to the chosen backend's options here, in the
+    // one place that names a concrete backend. A flag the backend has no
+    // notion of stops the process now rather than being dropped and
+    // discovered as a mysteriously short context later.
+    match args.load.backend {
         #[cfg(feature = "llama-cpp")]
         BackendKind::LlamaCpp => {
-            run::<drama_llama::LlamaCppBackend>(args, record_json_tx, probe_bus)
-                .await
+            let options = drama_llama::LlamaCppOptions::try_from(&args.load)?;
+            run::<drama_llama::LlamaCppBackend>(
+                args,
+                options,
+                record_json_tx,
+                probe_bus,
+            )
+            .await
         }
         #[cfg(all(feature = "moeflux", target_os = "macos"))]
         BackendKind::Moeflux => {
-            run::<drama_llama::MoefluxBackend>(args, record_json_tx, probe_bus)
-                .await
+            let options = drama_llama::MoefluxOptions::try_from(&args.load)?;
+            run::<drama_llama::MoefluxBackend>(
+                args,
+                options,
+                record_json_tx,
+                probe_bus,
+            )
+            .await
         }
     }
 }

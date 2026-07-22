@@ -1,7 +1,7 @@
 use crate::{
     llama_cpp::{
-        decoder::{DecodeError, FlashAttention, LlamaCppDecoder, NewError},
-        LlamaCppBackend,
+        decoder::{DecodeError, LlamaCppDecoder, NewError},
+        LlamaCppBackend, LlamaCppOptions,
     },
     log::silence_logs,
     Batch, Engine, LlamaCppModel,
@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use llama_cpp_sys_3::{
     llama_context, llama_context_default_params, llama_context_params,
-    llama_model_default_params, llama_model_params, llama_perf_context_data,
-    llama_seq_id, llama_supports_gpu_offload, llama_supports_mlock,
-    llama_supports_mmap, llama_token,
+    llama_model_params, llama_perf_context_data, llama_seq_id,
+    llama_supports_gpu_offload, llama_supports_mlock, llama_supports_mmap,
+    llama_token,
 };
 
 /// Convenience alias for the llama.cpp-backed pair. Use
@@ -22,18 +22,6 @@ use llama_cpp_sys_3::{
 pub type LlamaCppEngine = Engine<LlamaCppBackend>;
 
 impl LlamaCppEngine {
-    /// Create a new `LlamaCppEngine` from common command line
-    /// arguments.
-    #[cfg(feature = "cli")]
-    pub fn from_cli(
-        args: crate::cli::Args,
-        numa_strategy: Option<u32>,
-    ) -> Result<Self, NewError> {
-        let model_params = Some(args.model_params());
-        let context_params = Some(args.context_params());
-        Self::new(args.model, model_params, context_params, numa_strategy)
-    }
-
     /// llama.cpp's `llama_context_default_params()` with a usable
     /// thread count. The upstream library default is a hard-coded 4
     /// threads (ggml's `GGML_DEFAULT_N_THREADS`, marked "TODO: better
@@ -99,18 +87,30 @@ impl LlamaCppEngine {
         Ok(engine)
     }
 
-    /// Create a new engine from a model `path`. Default model and
-    /// context parameters are used.
-    pub fn from_path(path: PathBuf) -> Result<Self, NewError> {
-        Self::new(path, None, None, None)
+    /// Create a new engine from a model `path` and load-time
+    /// [`LlamaCppOptions`] — context size, KV slots, Flash Attention
+    /// policy, GPU offload, NUMA.
+    ///
+    /// This is the constructor; [`Self::from_path`] is it with every
+    /// option left at llama.cpp's default.
+    pub fn from_path_with(
+        path: PathBuf,
+        options: LlamaCppOptions,
+    ) -> Result<Self, NewError> {
+        Self::new(
+            path,
+            Some(options.model_params()),
+            Some(options.context_params()),
+            options.numa,
+        )
     }
 
-    /// Create a new engine from a model `path` forcing CPU-only
-    /// inference (zero GPU layers).
-    pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, NewError> {
-        let mut mp = unsafe { llama_model_default_params() };
-        mp.n_gpu_layers = 0;
-        Self::new(path, Some(mp), None, None)
+    /// Create a new engine from a model `path`. Default model and
+    /// context parameters are used — note that llama.cpp's default
+    /// `n_ctx` is 512, which is rarely what you want; see
+    /// [`LlamaCppOptions::n_ctx`].
+    pub fn from_path(path: PathBuf) -> Result<Self, NewError> {
+        Self::from_path_with(path, LlamaCppOptions::default())
     }
 
     /// Load a multimodal projector (mmproj GGUF) from an arbitrary
@@ -130,52 +130,14 @@ impl LlamaCppEngine {
         Ok(())
     }
 
-    /// Create a new engine from a model `path` with an explicit Flash
-    /// Attention policy.
-    pub fn from_path_with_flash_attention(
-        path: PathBuf,
-        fa: FlashAttention,
-    ) -> Result<Self, NewError> {
-        let mut cp = Self::default_context_params();
-        cp.flash_attn_type = fa.as_raw();
-        Self::new(path, None, Some(cp), None)
-    }
-
     /// Create a new engine from a model `path` with an explicit KV
-    /// context size.
+    /// context size. Shorthand for the one option almost every caller
+    /// sets; everything else goes through [`Self::from_path_with`].
     pub fn from_path_with_n_ctx(
         path: PathBuf,
         n_ctx: u32,
     ) -> Result<Self, NewError> {
-        let mut cp = Self::default_context_params();
-        cp.n_ctx = n_ctx;
-        cp.n_batch = n_ctx;
-        cp.n_ubatch = cp.n_ubatch.min(n_ctx);
-        Self::new(path, None, Some(cp), None)
-    }
-
-    /// [`Self::from_path_with_n_ctx`] plus multi-sequence support:
-    /// `n_seq_max` KV sequences over one **unified** cell pool of
-    /// `n_ctx` (llama.cpp's recommended shape for sequences sharing
-    /// large prefixes). This is what the multi-slot prefix cache
-    /// wants: `Session::with_prefix_cache` sizes its slot count from
-    /// [`crate::backend::Decoder::n_seq_max`], so a session built on
-    /// this engine caches up to `n_seq_max` distinct conversation
-    /// prefixes (agents) concurrently instead of thrashing one slot.
-    /// On recurrent / hybrid models `n_seq_max` also sizes the
-    /// per-sequence recurrent-state slots.
-    pub fn from_path_with_n_ctx_and_seqs(
-        path: PathBuf,
-        n_ctx: u32,
-        n_seq_max: u32,
-    ) -> Result<Self, NewError> {
-        let mut cp = Self::default_context_params();
-        cp.n_ctx = n_ctx;
-        cp.n_batch = n_ctx;
-        cp.n_ubatch = cp.n_ubatch.min(n_ctx);
-        cp.n_seq_max = n_seq_max.max(1);
-        cp.kv_unified = true;
-        Self::new(path, None, Some(cp), None)
+        Self::from_path_with(path, LlamaCppOptions::default().with_n_ctx(n_ctx))
     }
 
     /// Returns true if mmap is supported.

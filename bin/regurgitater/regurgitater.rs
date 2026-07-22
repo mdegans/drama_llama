@@ -31,7 +31,21 @@ use rocket::{
 
 use stringmetrics::jaccard;
 
-use drama_llama::{cli::Args, Engine, PredictOptions, Predicted};
+use drama_llama::{LlamaCppEngine, LlamaCppOptions, PredictOptions, Predicted};
+
+/// Model path plus llama.cpp's load-time options, which this binary
+/// flattens directly — it is single-backend, so it can name the concrete
+/// [`LlamaCppOptions`] rather than going through
+/// [`BackendArgs`](drama_llama::cli::BackendArgs).
+#[derive(Debug, clap::Parser)]
+pub struct Args {
+    /// Path to the model
+    #[arg(short, long)]
+    pub model: std::path::PathBuf,
+
+    #[command(flatten)]
+    pub options: LlamaCppOptions,
+}
 
 #[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, rocket::UriDisplayQuery))]
@@ -176,7 +190,11 @@ async fn main() {
         tokio::sync::{broadcast, mpsc},
     };
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // This binary predates `LlamaCppOptions` and shipped a 1024-token
+    // default; llama.cpp's own default is 512. Keep the old behaviour for
+    // a user who says nothing.
+    args.options.n_ctx.get_or_insert(1024);
 
     // Our worker thread receives inference requests from the client and sends
     // the generated completions and scores back to the client.
@@ -184,21 +202,22 @@ async fn main() {
     let (to_client, _) = broadcast::channel::<Response>(1024);
     let to_client_clone = to_client.clone();
     let worker = rocket::tokio::task::spawn_blocking(move || {
-        let mut engine = match Engine::from_cli(args, None) {
-            Ok(engine) => engine,
-            Err(e) => {
-                to_client
-                    .send(Response {
-                        kind: ResponseKind::Fatal,
-                        content: format!(
-                            "Failed to load engine because: {}",
-                            e
-                        ),
-                    })
-                    .ok();
-                return;
-            }
-        };
+        let mut engine =
+            match LlamaCppEngine::from_path_with(args.model, args.options) {
+                Ok(engine) => engine,
+                Err(e) => {
+                    to_client
+                        .send(Response {
+                            kind: ResponseKind::Fatal,
+                            content: format!(
+                                "Failed to load engine because: {}",
+                                e
+                            ),
+                        })
+                        .ok();
+                    return;
+                }
+            };
 
         let mut opts = PredictOptions::default();
         opts.sample_options = SamplerConfig::greedy();

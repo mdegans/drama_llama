@@ -15,7 +15,9 @@
 
 use std::{num::NonZeroU32, path::PathBuf};
 
-use drama_llama::{Block, LlamaCppSession, Prompt, Role, SamplingMode};
+use drama_llama::{
+    Block, FromPath, LlamaCppSession, Prompt, Role, SamplingMode,
+};
 
 fn model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
@@ -81,7 +83,7 @@ fn auto_tool_call_parses_or_text_is_clean() {
 }
 
 fn run_auto_toolcall(tool: misanthropic::tool::CustomMethodDef) {
-    let mut session = LlamaCppSession::from_path_sync(model_path())
+    let mut session = LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .without_repetition()

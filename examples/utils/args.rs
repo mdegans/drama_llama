@@ -17,28 +17,29 @@
 //! Settings split three ways here, and the split is deliberate:
 //!
 //! - **Universal** — nothing to configure. The prefix cache is switched on by
-//!   [`SessionTransport::new`](drama_llama::SessionTransport::new); llama.cpp
-//!   log spew is silenced at construction.
+//!   [`SessionTransport::new`](drama_llama::SessionTransport::new).
 //! - **User preference** — a flag on [`CommonArgs`], one default for every
-//!   example: `--model`, `--backend`, `--n-ctx`, `--seed`, `--max-tokens`,
-//!   `--system`, `--verbose`.
+//!   example: `--model`, `--seed`, `--max-tokens`, `--system`, `--verbose`,
+//!   plus the backend's own knobs via a flattened
+//!   [`BackendArgs`](drama_llama::cli::BackendArgs) (`--backend`, `--n-ctx`,
+//!   `--cache-slots`, `--use-2bit`).
 //! - **Example requirement** — a [`TransportBuilder`] argument, set in code,
 //!   deliberately *not* a flag. `strawberry` has to echo the digit from its
 //!   tool result, so its `without_repetition` is load-bearing; exposing it as
 //!   `--repetition` would let a user silently break the demo and get a wrong
 //!   letter count out of an example whose whole job is a correct one.
+//!
+//! A knob the chosen backend has no notion of is an **error**, not a warning
+//! — `--backend moeflux --n-ctx 4096` refuses to run rather than quietly
+//! ignoring the context size. See
+//! [`UnsupportedOptions`](drama_llama::cli::UnsupportedOptions).
 
 use std::num::{NonZeroU128, NonZeroU32};
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, Parser};
-use drama_llama::cli::{default_backend_kind, BackendKind};
+use drama_llama::cli::{BackendArgs, BackendKind};
 use misanthropic::Prompt;
-
-/// Default `--n-ctx`. Named so the moeflux arm can tell "the user asked for a
-/// context size" from "the user said nothing" — an `Option` would do the same
-/// job but would drop the default out of `--help`, where it is worth seeing.
-const DEFAULT_N_CTX: u32 = 8192;
 
 /// Flags shared by most examples. `#[command(flatten)]` into example args.
 #[derive(ClapArgs, Debug, Clone)]
@@ -48,22 +49,17 @@ pub struct CommonArgs {
     #[arg(short, long, default_value_os_t = default_model_path())]
     pub model: PathBuf,
 
-    /// Inference backend. Choices are whichever backends this build compiled
-    /// in, so a single-backend build offers exactly one.
-    #[arg(long, value_enum, default_value_t = default_backend_kind())]
-    pub backend: BackendKind,
+    /// Which backend, and how to load it.
+    #[command(flatten)]
+    pub load: BackendArgs,
 
     /// Override `max_tokens` (also applied to the session).
     #[arg(long)]
     pub max_tokens: Option<NonZeroU32>,
 
     /// RNG seed for new generation. Unset means random.
+    #[arg(long)]
     pub seed: Option<NonZeroU128>,
-
-    /// Max context length. llama-cpp only — moeflux takes its context length
-    /// from the model export.
-    #[arg(long, default_value_t = DEFAULT_N_CTX)]
-    pub n_ctx: u32,
 
     /// Override the example's built-in system prompt.
     #[arg(long)]
@@ -100,7 +96,7 @@ impl CommonArgs {
     /// ```no_run
     /// # let common: utils::CommonArgs = todo!();
     /// let transport = common.transport().cache_slots(5).build()?;
-    /// # Ok::<_, drama_llama::SessionError>(())
+    /// # Ok::<_, BuildError>(())
     /// ```
     #[cfg(feature = "tokio")]
     pub fn transport(&self) -> TransportBuilder<'_> {
@@ -151,47 +147,60 @@ impl TransportBuilder<'_> {
 
     /// Load the model and wrap it in the erased transport.
     ///
-    /// This is the one place in the examples that names a concrete backend.
+    /// This is the one place in the examples that names a concrete backend,
+    /// and therefore the one place that can narrow
+    /// [`BackendArgs`](drama_llama::cli::BackendArgs) to a concrete backend's
+    /// options.
     pub fn build(
         self,
-    ) -> Result<
-        std::sync::Arc<dyn drama_llama::LocalTransport>,
-        drama_llama::SessionError,
-    > {
-        use drama_llama::SessionTransport;
+    ) -> Result<std::sync::Arc<dyn drama_llama::LocalTransport>, BuildError>
+    {
+        use drama_llama::{FromPath, SessionTransport};
 
-        match self.args.backend {
+        match self.args.load.backend {
             #[cfg(feature = "llama-cpp")]
             BackendKind::LlamaCpp => {
-                let session = if self.cache_slots > 1 {
-                    drama_llama::LlamaCppSession::from_path_with_cache_slots(
-                        self.args.model.clone(),
-                        self.args.n_ctx,
-                        self.cache_slots,
-                    )?
-                } else {
-                    // Deliberately *not* `..._with_cache_slots(.., 1)`: that
-                    // constructor also flips `kv_unified`, so it is not the
-                    // identity at one slot.
-                    drama_llama::LlamaCppSession::from_path_with_n_ctx(
-                        self.args.model.clone(),
-                        self.args.n_ctx,
-                    )?
-                };
-                // `quiet` is llama.cpp-specific (it silences that library's
-                // log spew, process-globally), hence in this arm rather than
-                // the shared finisher.
+                let mut options =
+                    drama_llama::LlamaCppOptions::try_from(&self.args.load)?;
+                // `cache_slots` is an example *requirement* (swarm and
+                // council want one slot per agent) rather than a user
+                // preference, so it is applied here — but only where the user
+                // expressed none, so an explicit `--cache-slots` still wins.
+                // `n_ctx` needs no such handling: `BackendArgs` carries the
+                // default eagerly.
+                if self.cache_slots > 1 {
+                    options.cache_slots.get_or_insert(self.cache_slots);
+                }
+                let session = drama_llama::LlamaCppSession::from_path_with(
+                    self.args.model.clone(),
+                    options,
+                )?;
                 Ok(std::sync::Arc::new(SessionTransport::new(
-                    self.finish(session.quiet()),
+                    self.finish(session),
                 )))
             }
             #[cfg(all(feature = "moeflux", target_os = "macos"))]
             BackendKind::Moeflux => {
-                self.warn_llama_cpp_only_knobs();
+                let options =
+                    drama_llama::MoefluxOptions::try_from(&self.args.load)?;
+                // Not an error, unlike a `--cache-slots` the user typed:
+                // this one is the example's own request and the user never
+                // asked for it. Still worth saying, because the consequence
+                // is a re-prefill on every agent switch rather than a cache
+                // hit — a large difference in a multi-agent example, and an
+                // otherwise invisible one.
+                if self.cache_slots > 1 {
+                    log::info!(
+                        "this example asked for {} KV cache slots; moeflux \
+                         has one physical stream (its seq_id is a namespace \
+                         label), so agent switches will re-prefill",
+                        self.cache_slots,
+                    );
+                }
                 let session = drama_llama::Session::<
                     drama_llama::MoefluxBackend,
-                >::from_path_sync(
-                    self.args.model.clone()
+                >::from_path_with(
+                    self.args.model.clone(), options
                 )?;
                 Ok(std::sync::Arc::new(SessionTransport::new(
                     self.finish(session),
@@ -230,33 +239,10 @@ impl TransportBuilder<'_> {
         // `Session::with_max_tokens` was removed.
         session
     }
-
-    /// Say so rather than silently dropping knobs the chosen backend has no
-    /// notion of. `Session<MoefluxBackend>` has one constructor and no KV
-    /// slot concept, so both of these are genuinely inapplicable — but a user
-    /// who typed `--n-ctx` deserves to know it did nothing.
-    #[cfg(all(feature = "moeflux", target_os = "macos"))]
-    fn warn_llama_cpp_only_knobs(&self) {
-        if self.args.n_ctx != DEFAULT_N_CTX {
-            log::warn!(
-                "--n-ctx {} ignored: the moeflux backend takes its context \
-                 length from the model export",
-                self.args.n_ctx,
-            );
-        }
-        if self.cache_slots > 1 {
-            log::warn!(
-                "{} cache slots requested but ignored: moeflux has one \
-                 physical stream (its seq_id is a namespace label), so \
-                 per-agent KV slots do not exist",
-                self.cache_slots,
-            );
-        }
-    }
 }
 
-/// Failure building a [`BlockingTransport`]: loading the model, or standing
-/// up the runtime it needs.
+/// Failure building the transport: narrowing the flags to the chosen
+/// backend, or loading the model itself.
 ///
 /// Typed rather than boxed because the examples' `main`s box to different
 /// things — `Box<dyn Error>` in some, `Box<dyn Error + Send + Sync>` in
@@ -264,9 +250,21 @@ impl TransportBuilder<'_> {
 /// boxed error type would compile in half the call sites.
 #[cfg(feature = "tokio")]
 #[derive(Debug, thiserror::Error)]
-pub enum BlockingTransportError {
+pub enum BuildError {
     #[error(transparent)]
     Session(#[from] drama_llama::SessionError),
+    /// A flag the chosen backend has no notion of. Fatal on purpose — see
+    /// the module docs.
+    #[error(transparent)]
+    Options(#[from] drama_llama::cli::UnsupportedOptions),
+}
+
+/// [`BuildError`] plus the runtime a [`BlockingTransport`] has to stand up.
+#[cfg(feature = "tokio")]
+#[derive(Debug, thiserror::Error)]
+pub enum BlockingTransportError {
+    #[error(transparent)]
+    Build(#[from] BuildError),
     #[error("could not start the tokio runtime: {0}")]
     Runtime(#[from] std::io::Error),
 }

@@ -6,12 +6,14 @@
 pub mod decoder;
 pub mod engine;
 pub mod model;
+pub mod options;
 
 use crate::Backend;
 
 pub use decoder::{MoefluxDecoder, MoefluxError, PrefetchStats};
 pub use engine::MoefluxEngine;
 pub use model::{MoefluxModel, MoefluxModelError};
+pub use options::MoefluxOptions;
 
 /// Tag for the moeflux [`Backend`]. Use as a type parameter for [`Engine`] or
 /// [`Session`].

@@ -33,36 +33,26 @@ use llama_cpp_sys_3::{
     ggml_log_level_GGML_LOG_LEVEL_WARN, ggml_log_set, llama_log_set,
 };
 
-/// Log severity from llama.cpp / ggml. Unknown C values map to
-/// [`LogLevel::Other`] so a future llama.cpp release that grows the
-/// enum can't silently drop messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel {
-    /// `GGML_LOG_LEVEL_NONE` — used for raw `LLAMA_LOG(...)` lines
-    /// that carry no severity (e.g. continuation prints).
-    None,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    /// `GGML_LOG_LEVEL_CONT` — continuation of the previous line.
-    Cont,
-    /// Unknown / future variant. Carries the raw C value.
-    Other(ggml_log_level),
-}
+pub use crate::backend::LogLevel;
 
-impl From<ggml_log_level> for LogLevel {
-    fn from(level: ggml_log_level) -> Self {
-        #[allow(non_upper_case_globals)]
-        match level {
-            ggml_log_level_GGML_LOG_LEVEL_NONE => LogLevel::None,
-            ggml_log_level_GGML_LOG_LEVEL_DEBUG => LogLevel::Debug,
-            ggml_log_level_GGML_LOG_LEVEL_INFO => LogLevel::Info,
-            ggml_log_level_GGML_LOG_LEVEL_WARN => LogLevel::Warn,
-            ggml_log_level_GGML_LOG_LEVEL_ERROR => LogLevel::Error,
-            ggml_log_level_GGML_LOG_LEVEL_CONT => LogLevel::Cont,
-            other => LogLevel::Other(other),
-        }
+/// Map ggml's C enum onto the backend-agnostic [`LogLevel`]. Unknown C
+/// values become [`LogLevel::Other`] so a future llama.cpp release that
+/// grows the enum can't silently drop messages.
+///
+/// A free function rather than a `From` impl: both types are foreign to
+/// each other only by convention — `ggml_log_level` is a bindgen type
+/// alias for a primitive, so a blanket `From<u32>` would collide with
+/// anything else that ever maps a raw integer.
+pub(crate) fn log_level_from_raw(level: ggml_log_level) -> LogLevel {
+    #[allow(non_upper_case_globals)]
+    match level {
+        ggml_log_level_GGML_LOG_LEVEL_NONE => LogLevel::None,
+        ggml_log_level_GGML_LOG_LEVEL_DEBUG => LogLevel::Debug,
+        ggml_log_level_GGML_LOG_LEVEL_INFO => LogLevel::Info,
+        ggml_log_level_GGML_LOG_LEVEL_WARN => LogLevel::Warn,
+        ggml_log_level_GGML_LOG_LEVEL_ERROR => LogLevel::Error,
+        ggml_log_level_GGML_LOG_LEVEL_CONT => LogLevel::Cont,
+        other => LogLevel::Other(other as u32),
     }
 }
 
@@ -91,7 +81,7 @@ unsafe extern "C" fn trampoline(
         Ok(s) => s,
         Err(_) => return,
     };
-    let lvl = LogLevel::from(level);
+    let lvl = log_level_from_raw(level);
 
     // Clone the `Arc` out and drop the guard *before* calling the
     // closure. Holding the lock across the call would deadlock a

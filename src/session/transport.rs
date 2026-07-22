@@ -284,7 +284,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "long running; requires models/model.gguf"]
     async fn send_populates_the_response_and_serializes() {
-        let session = crate::LlamaCppSession::from_path_sync(model_path())
+        use crate::FromPath;
+        let session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
         let transport = SessionTransport::new(session);

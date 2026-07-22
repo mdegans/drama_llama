@@ -89,7 +89,7 @@
 //!   deleted.
 //! - To **tweak** something: edit the sidecar, save, restart.
 //!
-//! [`crate::LlamaCppSession::from_path*`]: crate::LlamaCppSession::from_path_sync
+//! [`crate::LlamaCppSession::from_path*`]: crate::FromPath::from_path
 //! [`Session::with_sample_options`]: crate::Session::with_sample_options
 //! [`SamplingMode::Json`]: crate::SamplingMode::Json
 //! [`SamplingMode::Grammar`]: crate::SamplingMode::Grammar
@@ -173,7 +173,7 @@ pub fn load_sample_options(
 /// comparing two models' sidecars has no way to tell a model's
 /// recommendation from the crate default.
 ///
-/// [`crate::LlamaCppSession::from_path*`]: crate::LlamaCppSession::from_path_sync
+/// [`crate::LlamaCppSession::from_path*`]: crate::FromPath::from_path
 #[cfg(feature = "toml")]
 pub fn write_sample_options(
     path: &Path,

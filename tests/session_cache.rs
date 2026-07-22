@@ -16,7 +16,8 @@
 use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
-    Block, Content, LlamaCppSession, Message, Prompt, Role, SamplingMode,
+    Block, Content, FromPath, LlamaCppOptions, LlamaCppSession, Message,
+    Prompt, Role, SamplingMode,
 };
 use misanthropic::prompt::message::CacheControl;
 
@@ -26,7 +27,7 @@ fn model_path() -> PathBuf {
 
 /// Deterministic session: greedy, no repetition penalty, short cap.
 fn session(prefix_cache: bool) -> LlamaCppSession {
-    LlamaCppSession::from_path_sync(model_path())
+    LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .without_repetition()
@@ -231,13 +232,17 @@ fn multi_agent_round_robin_hits() {
     // OnceLock reads this on the first miss check; nextest's
     // process-per-test isolation keeps it scoped to this test.
     std::env::set_var("DRAMA_LLAMA_CACHE_TRIPWIRE", "1");
-    let mut session =
-        LlamaCppSession::from_path_with_cache_slots(model_path(), 4096, 3)
-            .expect("session load")
-            .quiet()
-            .without_repetition()
-            .with_sampling([SamplingMode::Greedy])
-            .with_prefix_cache(true);
+    let mut session = LlamaCppSession::from_path_with(
+        model_path(),
+        LlamaCppOptions::default()
+            .with_n_ctx(4096)
+            .with_cache_slots(3),
+    )
+    .expect("session load")
+    .quiet()
+    .without_repetition()
+    .with_sampling([SamplingMode::Greedy])
+    .with_prefix_cache(true);
 
     let personas = [
         "You are `ant`, a terse architect. One short sentence.",
@@ -276,21 +281,25 @@ fn multi_agent_round_robin_hits() {
 #[test]
 #[ignore = "long running, requires models/model.gguf"]
 fn capacity_eviction_recovers() {
-    let mut session =
-        LlamaCppSession::from_path_with_cache_slots(model_path(), 2048, 3)
-            .expect("session load")
-            .quiet()
-            .without_repetition()
-            .with_sampling([SamplingMode::Greedy])
-            .with_prefix_cache_config(drama_llama::PrefixCacheConfig {
-                max_slots: 3,
-                // Each agent's history is ~33 cells and an incoming call
-                // budgets ~54 (30-cell prompt + 24-token headroom): two
-                // resident histories + one incoming call exceed 100, so the
-                // third arrival must evict the LRU slot; one resident + one
-                // incoming fits.
-                capacity_cells: Some(100),
-            });
+    let mut session = LlamaCppSession::from_path_with(
+        model_path(),
+        LlamaCppOptions::default()
+            .with_n_ctx(2048)
+            .with_cache_slots(3),
+    )
+    .expect("session load")
+    .quiet()
+    .without_repetition()
+    .with_sampling([SamplingMode::Greedy])
+    .with_prefix_cache_config(drama_llama::PrefixCacheConfig {
+        max_slots: 3,
+        // Each agent's history is ~33 cells and an incoming call
+        // budgets ~54 (30-cell prompt + 24-token headroom): two
+        // resident histories + one incoming call exceed 100, so the
+        // third arrival must evict the LRU slot; one resident + one
+        // incoming fits.
+        capacity_cells: Some(100),
+    });
 
     let a = agent_prompt("You are agent A. One short sentence.", "Say 'A'.")
         .max_tokens(NonZeroU32::new(24).unwrap());

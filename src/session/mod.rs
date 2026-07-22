@@ -11,9 +11,9 @@
 //! block parsing, and — opt-in — prefix-cache reuse across calls.
 //!
 //! ```no_run
-//! use drama_llama::{LlamaCppSession, Prompt};
+//! use drama_llama::{FromPath, LlamaCppSession, Prompt};
 //!
-//! let mut session = LlamaCppSession::from_path_sync("models/model.gguf".into())
+//! let mut session = LlamaCppSession::from_path("models/model.gguf".into())
 //!     .unwrap()
 //!     .quiet();
 //! let prompt = Prompt::default(); // + system, messages, tools, etc.
@@ -64,10 +64,9 @@
 //!   backend's sequence capacity), each pinned to its own KV sequence — N
 //!   agents round-robining distinct histories through one session each keep
 //!   their prefix. On a default llama.cpp context (`n_seq_max` == 1) this
-//!   degenerates to one slot on seq 0; build the engine with a
-//!   multi-sequence constructor (e.g.
-//!   [`LlamaCppEngine::from_path_with_n_ctx_and_seqs`](crate::LlamaCppEngine::from_path_with_n_ctx_and_seqs))
-//!   to raise the ceiling.
+//!   degenerates to one slot on seq 0; load with
+//!   [`LlamaCppOptions::cache_slots`](crate::LlamaCppOptions::cache_slots)
+//!   set to raise the ceiling.
 //! * **Bounded.** Slots share one KV cell budget
 //!   ([`PrefixCacheConfig::capacity_cells`], default the engine's `n_ctx` —
 //!   unified KV shares one physical pool); least-recently-used slots evict
@@ -504,9 +503,8 @@ pub struct PrefixCacheConfig {
     /// Maximum live cached prefixes. Clamped at install time to the
     /// backend's [`Decoder::n_seq_max`](crate::backend::Decoder) —
     /// on a default llama.cpp context (`n_seq_max` == 1) the cache
-    /// runs single-slot regardless of this value; build the engine
-    /// with `from_path_with_n_ctx_and_seqs` (or another
-    /// multi-sequence constructor) to raise the ceiling.
+    /// runs single-slot regardless of this value; load with
+    /// `LlamaCppOptions::cache_slots` set to raise the ceiling.
     pub max_slots: usize,
     /// KV cell budget shared by every slot (unified KV shares one
     /// physical pool). When the incoming call's footprint (prompt +
@@ -1713,7 +1711,7 @@ pub struct Session<B: Backend> {
 
 /// Apply the per-model sampling sidecar at `sidecar_path` to
 /// `session`, if any. Best-effort: missing file → write defaults so the
-/// user has a starting point; parse error → warn to stderr and keep
+/// user has a starting point; parse error → warn via `tracing` and keep
 /// the session as-is. Returns the session in every case so the caller
 /// can chain.
 ///
@@ -1740,9 +1738,9 @@ fn apply_sidecar<B: Backend>(
                     &seed,
                     from_metadata,
                 ) {
-                    eprintln!(
-                        "drama_llama: could not write default sampling \
-                         sidecar at {sidecar_path:?}: {e}"
+                    tracing::warn!(
+                        "could not write default sampling sidecar at \
+                         {sidecar_path:?}: {e}"
                     );
                 }
                 // Apply the seed regardless of whether the write
@@ -1751,9 +1749,9 @@ fn apply_sidecar<B: Backend>(
                 session.with_sample_options(seed)
             }
             Err(e) => {
-                eprintln!(
-                    "drama_llama: could not load sampling sidecar at \
-                     {sidecar_path:?}: {e}; using crate defaults"
+                tracing::warn!(
+                    "could not load sampling sidecar at {sidecar_path:?}: \
+                     {e}; using crate defaults"
                 );
                 session
             }
@@ -1827,10 +1825,10 @@ fn analyze_dialect_source<M: crate::backend::Model + ?Sized>(
     let syntax = match crate::dialect::analyze_template(source, &bos, &eos) {
         Ok(syntax) => syntax,
         Err(e) => {
-            eprintln!(
-                "drama_llama: chat-template dialect analysis failed ({e}); \
-                 tool calls fall back to content-only parsing. Provide a \
-                 dialect.toml sidecar to override."
+            tracing::warn!(
+                "chat-template dialect analysis failed ({e}); tool calls \
+                 fall back to content-only parsing. Provide a dialect.toml \
+                 sidecar to override."
             );
             return crate::CallSyntax::default();
         }
@@ -1853,7 +1851,7 @@ fn analyze_dialect_source<M: crate::backend::Model + ?Sized>(
 /// the template analyzer's output *is* the default, and a sidecar
 /// exists only to override a misdetected finetune (whole-struct
 /// replacement — see [`crate::sidecar::load_call_syntax`]). Parse
-/// errors warn to stderr and keep the analyzed dialect.
+/// errors warn via `tracing` and keep the analyzed dialect.
 ///
 /// No-op when the `toml` feature is disabled.
 fn apply_dialect_sidecar<B: Backend>(
@@ -1866,9 +1864,9 @@ fn apply_dialect_sidecar<B: Backend>(
             Ok(Some(syntax)) => session.with_dialect(syntax),
             Ok(None) => session,
             Err(e) => {
-                eprintln!(
-                    "drama_llama: could not load dialect sidecar at \
-                     {sidecar_path:?}: {e}; using template analysis"
+                tracing::warn!(
+                    "could not load dialect sidecar at {sidecar_path:?}: \
+                     {e}; using template analysis"
                 );
                 session
             }
@@ -1885,7 +1883,7 @@ fn apply_dialect_sidecar<B: Backend>(
 /// (see [`crate::sidecar::load_template_source`]). The dialect is
 /// re-analyzed against the override so grammar/parse/render stay in
 /// lockstep; an explicit dialect sidecar is applied *after* this and
-/// still wins. Compile/IO errors warn to stderr and keep the
+/// still wins. Compile/IO errors warn via `tracing` and keep the
 /// embedded template.
 fn apply_template_sidecar<B: Backend>(
     mut session: Session<B>,
@@ -1894,19 +1892,18 @@ fn apply_template_sidecar<B: Backend>(
     match crate::sidecar::load_template_source(sidecar_path) {
         Ok(Some(source)) => {
             if let Err(e) = session.set_template_source(source) {
-                eprintln!(
-                    "drama_llama: template sidecar at {sidecar_path:?} \
-                     failed to compile: {e}; using the model's embedded \
-                     template"
+                tracing::warn!(
+                    "template sidecar at {sidecar_path:?} failed to \
+                     compile: {e}; using the model's embedded template"
                 );
             }
             session
         }
         Ok(None) => session,
         Err(e) => {
-            eprintln!(
-                "drama_llama: could not read template sidecar at \
-                 {sidecar_path:?}: {e}; using the model's embedded template"
+            tracing::warn!(
+                "could not read template sidecar at {sidecar_path:?}: {e}; \
+                 using the model's embedded template"
             );
             session
         }
@@ -1942,155 +1939,133 @@ fn llama_cpp_dialect_sidecar_path(
 /// [`crate::LlamaCppEngine`].
 ///
 /// **Name this (or [`Session<B>`] with a turbofish), not a bare
-/// `Session`.** `Session::from_path*` are *inherent* methods on the
-/// per-backend impls, so a bare `Session::from_path(..)` only compiles
-/// while exactly one `Backend` is enabled — it resolves by having a
-/// single candidate, not by inference. Compile llama.cpp and moeflux
-/// together and every such call becomes `E0034: multiple applicable
-/// items in scope`. That combination is not exotic: it is what
-/// `just test moeflux` builds (the cross-backend suite needs both), so
-/// a bare `Session` in an example or a doctest breaks that build even
-/// though it looks fine in the default one.
+/// `Session`.** A bare `Session::from_path(..)` only compiles while
+/// exactly one `Backend` is enabled — with one candidate `B` is
+/// inferred, with two it is ambiguous and the associated `Options`
+/// type is unresolvable with it. Any remaining *inherent* constructor
+/// (`from_path_with_n_ctx`) is worse: two of them in scope is
+/// `E0034: multiple applicable items in scope`. That combination is not
+/// exotic — it is what `just test moeflux` builds (the cross-backend
+/// suite needs both), so a bare `Session` in an example or a doctest
+/// breaks that build even though it looks fine in the default one.
 ///
 /// [`Session<B>`]: Session
 #[cfg(feature = "llama-cpp")]
 pub type LlamaCppSession = Session<LlamaCppBackend>;
 
-#[cfg(feature = "tokio")]
-#[async_trait::async_trait]
-pub trait FromPath: Sized + Send {
-    /// Load a model from disk and wire up the chat template.
+/// Load a [`Session`] from a path, with whatever load-time options its
+/// backend understands.
+///
+/// One trait, three entry points, and only [`Self::from_path_with`] has
+/// to be written by an implementor:
+///
+/// - [`from_path_with`](Self::from_path_with) — the constructor.
+/// - [`from_path`](Self::from_path) — the same with default options.
+/// - [`from_path_async`](Self::from_path_async) — the same off the async
+///   runtime's blocking pool. Loading a model is seconds of blocking
+///   file and GPU work, so it must not run on a reactor thread.
+///
+/// # Why the options are an associated type
+///
+/// Backends do not agree on what "load a model" is configurable by. The
+/// intersection of llama.cpp's knobs (context size, KV slots, Flash
+/// Attention, GPU offload) and moeflux's (`use_2bit`) is empty — moeflux
+/// takes its context length from a compile-time constant. A shared
+/// options struct would have to either lie about what it honours or
+/// degrade to a lowest common denominator, so each backend brings its
+/// own: [`LlamaCppOptions`](crate::LlamaCppOptions),
+/// `MoefluxOptions`.
+///
+/// Generic code (`fn load<B>() where Session<B>: FromPath`) can still
+/// pass options through — it just cannot name their fields. Code that
+/// picks a backend from a runtime flag should build
+/// [`BackendArgs`](crate::cli::BackendArgs) and convert.
+///
+/// # Sidecars
+///
+/// Every implementation looks for a sampling sidecar (`sampling.toml`)
+/// beside the model and applies it via
+/// [`Session::with_sample_options`](crate::Session::with_sample_options),
+/// writing the default if none exists so there is something to edit.
+/// Chat-template and dialect sidecars are picked up the same way.
+/// Requires the `toml` feature; without it, sidecars are ignored.
+#[cfg_attr(feature = "tokio", async_trait::async_trait)]
+pub trait FromPath: Sized + Send + 'static {
+    /// Load-time options for this backend. `Default` must mean "load the
+    /// way this backend would have loaded anyway" — never our own
+    /// opinion of a good default, because [`Self::from_path`] is defined
+    /// as this type's default.
     ///
-    /// Looks for a sampling sidecar, `sampling.toml` and applies it via
-    /// [`Session::with_sample_options`](crate::Session::with_sample_options). If none exists, writes the default so the
-    /// user has a starting point to edit. Requires the `toml` feature; without
-    /// it, sidecars are ignored.
-    async fn from_path(path: PathBuf) -> Result<Self, SessionError>;
+    /// The bundle is what a plain configuration record satisfies
+    /// anyway: `Clone + Send + Sync + 'static` because a server holds
+    /// one set for the life of the process, shares it across handler
+    /// tasks, and hands a copy to each load.
+    type Options: Default + Clone + Send + Sync + 'static;
+
+    /// Load a model from `path` with explicit `options`, and wire up the
+    /// chat template and sidecars.
+    fn from_path_with(
+        path: PathBuf,
+        options: Self::Options,
+    ) -> Result<Self, SessionError>;
+
+    /// [`Self::from_path_with`] with default options.
+    ///
+    /// Note for llama.cpp: its default `n_ctx` is **512**, which
+    /// truncates chat and structured-output workloads long before they
+    /// finish. Reach for [`Self::from_path_with`] (or
+    /// [`Session::from_path_with_n_ctx`]) for anything reasoning-shaped.
+    fn from_path(path: PathBuf) -> Result<Self, SessionError> {
+        Self::from_path_with(path, Self::Options::default())
+    }
+
+    /// [`Self::from_path_with`] on the blocking pool.
+    #[cfg(feature = "tokio")]
+    async fn from_path_async(
+        path: PathBuf,
+        options: Self::Options,
+    ) -> Result<Self, SessionError> {
+        tokio::task::spawn_blocking(move || Self::from_path_with(path, options))
+            .await?
+    }
 }
 
-#[async_trait::async_trait]
-#[cfg(all(feature = "llama-cpp", feature = "tokio"))]
+#[cfg(feature = "llama-cpp")]
 impl FromPath for Session<LlamaCppBackend> {
-    async fn from_path(path: PathBuf) -> Result<Self, SessionError> {
-        tokio::task::spawn_blocking(move || Self::from_path_sync(path)).await?
+    type Options = crate::LlamaCppOptions;
+
+    fn from_path_with(
+        path: PathBuf,
+        options: Self::Options,
+    ) -> Result<Self, SessionError> {
+        let sidecar = llama_cpp_sidecar_path(&path);
+        let template_sidecar = llama_cpp_template_sidecar_path(&path);
+        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
+        let engine = crate::LlamaCppEngine::from_path_with(path, options)?;
+        Ok(apply_dialect_sidecar(
+            apply_template_sidecar(
+                apply_sidecar(Self::from_engine(engine)?, &sidecar),
+                &template_sidecar,
+            ),
+            &dialect_sidecar,
+        ))
     }
 }
 
 impl Session<LlamaCppBackend> {
-    /// Load a model from disk and wire up the chat template.
-    ///
-    /// Looks for a sampling sidecar at
-    /// `<model>.sampling.toml` (sibling of the `.gguf`) and applies it
-    /// via [`Self::with_sample_options`]. If none exists, writes the
-    /// default so the user has a starting point to edit. Requires the
-    /// `toml` feature; without it, sidecars are ignored.
-    pub fn from_path_sync(path: PathBuf) -> Result<Self, SessionError> {
-        let sidecar = llama_cpp_sidecar_path(&path);
-        let template_sidecar = llama_cpp_template_sidecar_path(&path);
-        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
-        let engine = crate::LlamaCppEngine::from_path(path)?;
-        Ok(apply_dialect_sidecar(
-            apply_template_sidecar(
-                apply_sidecar(Self::from_engine(engine)?, &sidecar),
-                &template_sidecar,
-            ),
-            &dialect_sidecar,
-        ))
-    }
-
-    /// Load a model from disk with an explicit Flash Attention policy.
-    ///
-    /// Diagnostic escape hatch for output-divergence debugging — see
-    /// [`FlashAttention`](crate::FlashAttention) for the when and why.
-    /// Sidecar handling matches [`Self::from_path_sync`].
-    pub fn from_path_with_flash_attention(
-        path: PathBuf,
-        fa: crate::FlashAttention,
-    ) -> Result<Self, SessionError> {
-        let sidecar = llama_cpp_sidecar_path(&path);
-        let template_sidecar = llama_cpp_template_sidecar_path(&path);
-        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
-        let engine =
-            crate::LlamaCppEngine::from_path_with_flash_attention(path, fa)?;
-        Ok(apply_dialect_sidecar(
-            apply_template_sidecar(
-                apply_sidecar(Self::from_engine(engine)?, &sidecar),
-                &template_sidecar,
-            ),
-            &dialect_sidecar,
-        ))
-    }
-
     /// Load a model from disk with an explicit KV context size.
     ///
-    /// [`Self::from_path_sync`] inherits llama.cpp's default `n_ctx = 512`,
-    /// which truncates chat and structured-output workloads well
-    /// before they finish. Use this builder when the prompt plus the
-    /// generation cap (`prompt.max_tokens`) can exceed 512
-    /// tokens — which is almost always for reasoning-capable models.
-    /// Typical values: 4096 – 16384. Sidecar handling matches
-    /// [`Self::from_path_sync`].
+    /// Shorthand for the one option nearly every caller sets;
+    /// [`FromPath::from_path_with`] takes the rest. Typical values:
+    /// 4096 – 16384.
     pub fn from_path_with_n_ctx(
         path: PathBuf,
         n_ctx: u32,
     ) -> Result<Self, SessionError> {
-        let sidecar = llama_cpp_sidecar_path(&path);
-        let template_sidecar = llama_cpp_template_sidecar_path(&path);
-        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
-        let engine = crate::LlamaCppEngine::from_path_with_n_ctx(path, n_ctx)?;
-        Ok(apply_dialect_sidecar(
-            apply_template_sidecar(
-                apply_sidecar(Self::from_engine(engine)?, &sidecar),
-                &template_sidecar,
-            ),
-            &dialect_sidecar,
-        ))
-    }
-
-    /// [`Self::from_path_with_n_ctx`] plus multi-sequence KV support
-    /// (`slots` sequences over one unified `n_ctx` cell pool — see
-    /// [`crate::LlamaCppEngine::from_path_with_n_ctx_and_seqs`]).
-    /// Combine with [`Self::with_prefix_cache`] /
-    /// [`Self::with_prefix_cache_config`]: the prefix cache sizes its
-    /// slot count from the engine's `n_seq_max`, so this is the
-    /// constructor that makes N-agent workloads (swarm, council)
-    /// actually cache N prefixes. Sidecar handling matches
-    /// [`Self::from_path_sync`].
-    pub fn from_path_with_cache_slots(
-        path: PathBuf,
-        n_ctx: u32,
-        slots: u32,
-    ) -> Result<Self, SessionError> {
-        let sidecar = llama_cpp_sidecar_path(&path);
-        let template_sidecar = llama_cpp_template_sidecar_path(&path);
-        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
-        let engine = crate::LlamaCppEngine::from_path_with_n_ctx_and_seqs(
-            path, n_ctx, slots,
-        )?;
-        Ok(apply_dialect_sidecar(
-            apply_template_sidecar(
-                apply_sidecar(Self::from_engine(engine)?, &sidecar),
-                &template_sidecar,
-            ),
-            &dialect_sidecar,
-        ))
-    }
-
-    /// Load a model CPU-only (zero GPU layers). Diagnostic path for
-    /// isolating GPU-kernel divergence. Sidecar handling matches
-    /// [`Self::from_path_sync`].
-    pub fn from_path_cpu_only(path: PathBuf) -> Result<Self, SessionError> {
-        let sidecar = llama_cpp_sidecar_path(&path);
-        let template_sidecar = llama_cpp_template_sidecar_path(&path);
-        let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
-        let engine = crate::LlamaCppEngine::from_path_cpu_only(path)?;
-        Ok(apply_dialect_sidecar(
-            apply_template_sidecar(
-                apply_sidecar(Self::from_engine(engine)?, &sidecar),
-                &template_sidecar,
-            ),
-            &dialect_sidecar,
-        ))
+        Self::from_path_with(
+            path,
+            crate::LlamaCppOptions::default().with_n_ctx(n_ctx),
+        )
     }
 
     /// Silence llama.cpp's log spew (model load progress, KV cache
@@ -2106,38 +2081,27 @@ impl Session<LlamaCppBackend> {
     }
 }
 
-#[async_trait::async_trait]
-#[cfg(all(feature = "tokio", feature = "moeflux"))]
-impl FromPath for Session<MoefluxBackend> {
-    async fn from_path(path: PathBuf) -> Result<Self, SessionError> {
-        tokio::task::spawn_blocking(move || Self::from_path_sync(path)).await?
-    }
-}
-
-// Moeflux-specific constructor. Available only on macOS with the
-// `moeflux` feature enabled.
+/// Load a moeflux model from a parent directory using the drama_llama
+/// folder convention: `parent/mlx/`, `parent/artifacts/`,
+/// `parent/root/` (the experts dir). MoE top-K is variant-driven (not a
+/// parameter). Power users who need explicit paths can construct a
+/// [`crate::MoefluxEngine`] via `MoefluxEngine::from_paths` and hand it
+/// to [`Session::from_engine`].
+///
+/// The sampling sidecar is `parent/sampling.toml` — alongside the
+/// `mlx`/`artifacts`/`root` symlinks, *not* inside any of them.
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
-impl Session<MoefluxBackend> {
-    /// Load a moeflux model from a parent directory using the
-    /// drama_llama folder convention: `parent/mlx/`,
-    /// `parent/artifacts/`, `parent/root/` (the experts dir).
-    /// Defaults `use_2bit = false` — the Qwen3 MoE 4-bit setup. MoE
-    /// top-K is variant-driven (not a parameter). Power users who need
-    /// explicit paths can construct a [`crate::MoefluxEngine`] directly
-    /// via `MoefluxEngine::from_paths` and hand it to
-    /// [`Self::from_engine`].
-    ///
-    /// Looks for a sampling sidecar at `parent/sampling.toml` —
-    /// alongside the `mlx`/`artifacts`/`root` symlinks, *not* inside
-    /// any of them — and applies it via [`Self::with_sample_options`].
-    /// If none exists, writes the default so the user has a starting
-    /// point to edit. Requires the `toml` feature; without it,
-    /// sidecars are ignored.
-    pub fn from_path_sync(parent: PathBuf) -> Result<Self, SessionError> {
+impl FromPath for Session<MoefluxBackend> {
+    type Options = crate::MoefluxOptions;
+
+    fn from_path_with(
+        parent: PathBuf,
+        options: Self::Options,
+    ) -> Result<Self, SessionError> {
         let sidecar = parent.join("sampling.toml");
         let template_sidecar = parent.join("template.jinja");
         let dialect_sidecar = parent.join("dialect.toml");
-        let engine = crate::MoefluxEngine::from_path(&parent)?;
+        let engine = crate::MoefluxEngine::from_path_with(&parent, options)?;
         Ok(apply_dialect_sidecar(
             apply_template_sidecar(
                 apply_sidecar(Self::from_engine(engine)?, &sidecar),
@@ -2146,7 +2110,12 @@ impl Session<MoefluxBackend> {
             &dialect_sidecar,
         ))
     }
+}
 
+// Moeflux-specific accessors. Available only on macOS with the
+// `moeflux` feature enabled.
+#[cfg(all(feature = "moeflux", target_os = "macos"))]
+impl Session<MoefluxBackend> {
     /// Per-phase prefetch hit/miss counters since the last
     /// [`Self::reset_prefetch_stats`]. See
     /// [`crate::MoefluxDecoder::prefetch_stats`].
@@ -2960,9 +2929,8 @@ impl<B: Backend> Session<B> {
     /// (slot count + KV cell budget). `max_slots` is clamped to the
     /// backend's sequence capacity — on a default llama.cpp context
     /// (`n_seq_max` == 1) the cache runs single-slot on seq 0, exactly
-    /// the pre-multi-slot behavior; build the engine with a
-    /// multi-sequence constructor (e.g.
-    /// `from_path_with_n_ctx_and_seqs`) to cache several agents'
+    /// the pre-multi-slot behavior; load with
+    /// `LlamaCppOptions::cache_slots` set to cache several agents'
     /// prefixes concurrently.
     ///
     /// Re-configuring an already-enabled cache clears it first (slot
@@ -7075,7 +7043,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_ttl_expiry_evicts() {
-        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_sampling(std::iter::empty())
@@ -7124,7 +7092,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_usage_counters_across_append_only_calls() {
-        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true);
@@ -7172,7 +7140,7 @@ mod tests {
         );
 
         // Cache OFF: honestly not reported.
-        let mut off = crate::LlamaCppSession::from_path_sync(model_path())
+        let mut off = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
         let cold = off
@@ -7320,7 +7288,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_with_prefix_cache_default_off() {
-        let session = crate::LlamaCppSession::from_path_sync(model_path())
+        let session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
         assert!(
@@ -7345,7 +7313,7 @@ mod tests {
     fn test_special_token_injection_rejected() {
         use misanthropic::prompt::message::Role;
 
-        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
 
@@ -7449,7 +7417,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_last_and_total_usage_zero_initially() {
-        let session = crate::LlamaCppSession::from_path_sync(model_path())
+        let session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
         assert_eq!(session.last_usage(), &Usage::default());
@@ -7466,7 +7434,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_default_repetition_ignores_punctuation_category() {
-        let session = crate::LlamaCppSession::from_path_sync(model_path())
+        let session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
         let with_rep = session.with_repetition(RepetitionOptions::default());
@@ -7494,7 +7462,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_with_repetition_adds_special_tokens_to_ignored() {
-        let session = crate::LlamaCppSession::from_path_sync(model_path())
+        let session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
         let eos = session.engine.model.eos();
@@ -7573,7 +7541,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_clear_prefix_cache_zeroes_state() {
-        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true);
@@ -7624,7 +7592,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_hit_on_identical_prompts() {
-        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -7652,7 +7620,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_hit_on_shared_system_diverging_last_message() {
-        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -7676,7 +7644,7 @@ mod tests {
     #[ignore = "long running, requires models/model.gguf"]
     fn test_cache_miss_no_breakpoints() {
         use misanthropic::prompt::message::Content as MContent;
-        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -7705,7 +7673,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_clear_invalidates_cache() {
-        let mut session = crate::LlamaCppSession::from_path_sync(model_path())
+        let mut session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet()
             .with_prefix_cache(true)
@@ -7891,7 +7859,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_emit_ban_set_qwen() {
-        let session = crate::LlamaCppSession::from_path_sync(model_path())
+        let session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
         let one = |s: &str| {
@@ -7929,7 +7897,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_emit_ban_set_constrained_qwen() {
-        let session = crate::LlamaCppSession::from_path_sync(model_path())
+        let session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
         let one = |s: &str| {
@@ -7985,7 +7953,7 @@ mod tests {
     #[test]
     #[ignore = "long running, requires models/model.gguf"]
     fn test_tool_none_ban_set_qwen() {
-        let session = crate::LlamaCppSession::from_path_sync(model_path())
+        let session = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
         let one = |s: &str| {

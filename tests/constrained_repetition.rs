@@ -15,7 +15,7 @@ use std::num::{NonZeroU128, NonZeroU32};
 use std::path::PathBuf;
 
 use drama_llama::{
-    Content, LlamaCppSession, Message, Prompt, Role, SamplerConfig,
+    Content, FromPath, LlamaCppSession, Message, Prompt, Role, SamplerConfig,
     SamplingMode,
 };
 
@@ -52,7 +52,7 @@ fn session(constrained_regions: bool) -> LlamaCppSession {
     opts.repetition = opts
         .repetition
         .map(|r| r.set_constrained_regions(constrained_regions));
-    LlamaCppSession::from_path_sync(model_path())
+    LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .with_seed(Some(NonZeroU128::new(0xC0FFEE).unwrap()))

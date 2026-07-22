@@ -69,7 +69,13 @@ async-trait = { version = "0.1", optional = true }
 tokio = { version = "1", optional = true }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 futures-util = { version = "0.3", optional = true }
-tracing = { version = "0.1", optional = true }
+# Non-optional: this crate's own diagnostics (sidecar read/write
+# failures, mostly) have to go *somewhere*, and gating each call site on
+# a feature is more moving parts than the dependency is worth. The `log`
+# feature emits `log` records when no `tracing` subscriber is installed,
+# so consumers using `env_logger` — the examples, among others — see our
+# events without any bridging setup of their own.
+tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", optional = true }
 markdown = { version = "=1.0.0-alpha.16", optional = true }
 rocket = { version = "0.5", optional = true, features = ["json"] }
@@ -163,7 +169,7 @@ json-schema = ["dep:schemars", "misanthropic/derive"]
 # and the HuggingFace `tokenizers` crate for Rust-side tokenization.
 # Exactly one of `moeflux-model-*` must be enabled alongside — moeflux
 # is compile-time variant-selected.
-moeflux = ["dep:moeflux", "dep:tokenizers", "dep:tracing"]
+moeflux = ["dep:moeflux", "dep:tokenizers"]
 moeflux-model-qwen3-5-a17b = ["moeflux", "moeflux/model-qwen3-5-a17b"]
 moeflux-model-qwen3-6-35b-a3b = ["moeflux", "moeflux/model-qwen3-6-35b-a3b"]
 # Cogito-V2-Preview-671B (DeepSeek-V3 architecture). MLA attention,

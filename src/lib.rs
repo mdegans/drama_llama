@@ -25,8 +25,8 @@ pub mod backend;
 #[cfg(feature = "media")]
 pub use backend::ImageDecodeError;
 pub use backend::{
-    Backend, Decoder, Image, ImageInfo, ImageNewError, MediaChunk, MediaSpan,
-    Model, NoVision, Token, TokenData, Vision,
+    Backend, Decoder, Image, ImageInfo, ImageNewError, LogLevel, MediaChunk,
+    MediaSpan, Model, NoVision, NotImplemented, Token, TokenData, Vision,
 };
 
 #[cfg(feature = "llama-cpp")]
@@ -81,7 +81,7 @@ mod llama_cpp;
 #[cfg(feature = "llama-cpp")]
 pub use llama_cpp::{
     llama_quantize, DecodeError, FlashAttention, LlamaCppBackend,
-    LlamaCppDecoder, LlamaCppEngine, LlamaCppModel, NewError,
+    LlamaCppDecoder, LlamaCppEngine, LlamaCppModel, LlamaCppOptions, NewError,
 };
 #[cfg(feature = "mtmd")]
 pub use llama_cpp::{Mtmd, MtmdParams};
@@ -91,7 +91,6 @@ pub mod log;
 #[cfg(feature = "llama-cpp")]
 pub use log::{
     clear_log_callback, restore_default_logs, set_log_callback, silence_logs,
-    LogLevel,
 };
 
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
@@ -99,7 +98,7 @@ pub mod moeflux;
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
 pub use moeflux::{
     MoefluxBackend, MoefluxDecoder, MoefluxEngine, MoefluxError, MoefluxModel,
-    MoefluxModelError,
+    MoefluxModelError, MoefluxOptions,
 };
 
 #[cfg(any(
@@ -139,7 +138,12 @@ pub use predictor::{
     all(feature = "moeflux", target_os = "macos")
 ))]
 mod session;
-#[cfg(feature = "tokio")]
+// Not `tokio`-gated: only `FromPath::from_path_async` needs a runtime,
+// and it is a provided method. The sync half is the trait's core.
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
 pub use session::FromPath;
 #[cfg(feature = "llama-cpp")]
 pub use session::LlamaCppSession;

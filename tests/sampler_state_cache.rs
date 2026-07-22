@@ -19,8 +19,8 @@ use std::{
 };
 
 use drama_llama::{
-    Block, Content, LlamaCppSession, Message, NGramStats, ProbeCtx, ProbeHook,
-    Prompt, Role, SamplingMode,
+    Block, Content, FromPath, LlamaCppSession, Message, NGramStats, ProbeCtx,
+    ProbeHook, Prompt, Role, SamplingMode,
 };
 use misanthropic::prompt::message::CacheControl;
 
@@ -29,7 +29,7 @@ fn model_path() -> PathBuf {
 }
 
 fn session() -> LlamaCppSession {
-    LlamaCppSession::from_path_sync(model_path())
+    LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
         .with_prefix_cache(true)
