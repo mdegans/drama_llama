@@ -931,20 +931,52 @@ fn longest_common_prefix_len(a: &[CacheEntry], b: &[CacheEntry]) -> usize {
 ///
 /// "Free text" = strings a caller can fill with arbitrary content that
 /// the chat template renders verbatim: [`Block::Text`] bodies,
-/// [`Block::Thought`] bodies, and — recursively —
-/// [`Block::ToolResult`] content (external data lands here: a tool that
-/// fetches a web page delivers whatever the page said). Images,
-/// documents, redacted thoughts, and tool-use argument JSON contribute
-/// nothing here: the first three render no user-controlled text, and
-/// tool-use arguments are structured data, not free prose. Used by the
+/// [`Block::Thought`] bodies, [`Block::ToolUse`] surfaces (`name`,
+/// `id`, and the string content of `input` — templates render all
+/// three into the prompt, so a special piece in any of them becomes
+/// real control tokens; the #37 relay scenario is exactly a
+/// tool-use-shaped payload), and — recursively —
+/// [`Block::ToolResult`] content plus its `tool_use_id` (external data
+/// lands here: a tool that fetches a web page delivers whatever the
+/// page said). Images, documents, and redacted thoughts contribute
+/// nothing: they render no user-controlled text. Used by the
 /// special-token injection guard ([`Session::check_no_special_injection`]).
 fn block_free_text<'a>(block: &'a crate::Block, out: &mut Vec<&'a str>) {
     match block {
         crate::Block::Text { text, .. } => out.push(text.as_ref()),
         crate::Block::Thought { thought, .. } => out.push(thought.as_ref()),
+        crate::Block::ToolUse { call }
+        | crate::Block::ServerToolUse { call } => {
+            out.push(call.id.as_ref());
+            out.push(call.name.as_ref());
+            value_free_text(&call.input, out);
+        }
         crate::Block::ToolResult { result } => {
+            out.push(result.tool_use_id.as_ref());
             for b in &result.content.0 {
                 block_free_text(b, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The string surfaces of a JSON value (keys and string leaves), for
+/// [`block_free_text`]'s tool-use walk. Numbers and booleans cannot
+/// carry a special piece; a piece split across two adjacent strings is
+/// interrupted by the serialized punctuation between them.
+fn value_free_text<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.as_str()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                value_free_text(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                out.push(key.as_str());
+                value_free_text(val, out);
             }
         }
         _ => {}
@@ -1046,8 +1078,12 @@ fn seed_prose_block<M: Model>(
     };
     let tokens = model.tokenize(text, false);
     let base = state.step;
-    let max = rep.ngram_max_size.get() as usize;
-    let min = rep.ngram_min_size.get() as usize;
+    // CAPACITY-clamp mirrors the live pass's apply-time clamp
+    // (`repetition.rs`); the setter only normalizes min ≤ max, so an
+    // over-CAPACITY `ngram_max_size` reached the `try_from_tokens`
+    // unwrap below and panicked on any prose block ≥ max tokens.
+    let max = (rep.ngram_max_size.get() as usize).min(crate::NGram::CAPACITY);
+    let min = (rep.ngram_min_size.get() as usize).min(max);
     for (win_idx, win) in tokens.windows(max).enumerate() {
         let trailing_pos = base + (win_idx + max - 1) as u64;
         for slice in (min..=max).filter_map(|n| win.get((win.len() - n)..)) {
@@ -5006,10 +5042,16 @@ impl<B: Backend> Session<B> {
                         // Special-token closes tokenize boundary-
                         // stable; cap defensively — a wrong tail
                         // token only shortens the next LCP.
+                        // add_special = false: `Model::tokenize`
+                        // auto-prepends BOS on vocabs that request it
+                        // (Gemma, Llama-3), and a BOS inside the tip
+                        // stops the next call's LCP walk exactly
+                        // there — silently defeating the auto-tip on
+                        // every add_bos model.
                         canonical_close = Some(
                             self.engine
                                 .model
-                                .tokenize(close, true)
+                                .tokenize_special(close, false, true)
                                 .into_iter()
                                 .take(8)
                                 .collect(),
@@ -6108,10 +6150,11 @@ mod tests {
         assert_eq!(entries_cell_len(&entries), 259, "cells count n_tokens");
     }
 
-    /// `block_free_text` pulls text + thought bodies, recurses into
-    /// tool-result content (the external-data injection surface), and
-    /// contributes nothing for blocks with no free user text
-    /// (redacted thoughts, images, documents, tool-use framing).
+    /// `block_free_text` pulls text + thought bodies, tool-use/result
+    /// surfaces (ids, names, input strings — templates render them
+    /// verbatim), recurses into tool-result content (the external-data
+    /// injection surface), and contributes nothing for blocks with no
+    /// free user text (redacted thoughts, images, documents).
     #[test]
     fn test_block_free_text_collects_and_recurses() {
         use misanthropic::{prompt::message::Block, tool};
@@ -6128,7 +6171,7 @@ mod tests {
         block_free_text(&b_text, &mut out);
         block_free_text(&b_thought, &mut out);
         block_free_text(&b_tool, &mut out);
-        assert_eq!(out, vec!["hello", "thinking", "tool said stuff"]);
+        assert_eq!(out, vec!["hello", "thinking", "call_1", "tool said stuff"]);
 
         // Blocks with no free user text hit the skip arm.
         let b_redacted = Block::RedactedThought {
@@ -6192,6 +6235,162 @@ mod tests {
             find_injected_special_in_prompt(&in_text, tok, &empty, piece)
                 .is_none(),
         );
+    }
+
+    /// The injection scan covers [`Block::ToolUse`] surfaces (`name`,
+    /// `id`, `input` string leaves and keys) and
+    /// [`Block::ToolResult`]'s `tool_use_id` — templates render all of
+    /// them verbatim into the prompt (the #37 relay scenario is a
+    /// tool-use-shaped payload), so they are free text to the guard.
+    #[test]
+    fn test_find_injected_special_in_tool_use_surfaces() {
+        use misanthropic::prompt::message::{Content, Message, Role};
+
+        let specials: std::collections::HashSet<Token> =
+            [999].into_iter().collect();
+        let tok = |t: &str| {
+            t.split_whitespace()
+                .map(|w| if w == "EVIL" { 999 } else { 1 })
+                .collect::<Vec<Token>>()
+        };
+        let piece = |t: Token| if t == 999 { "EVIL" } else { "ok" }.to_string();
+
+        let prompt_with = |block: crate::Block, role: Role| {
+            let mut p = Prompt::default();
+            p.messages.push(Message {
+                role,
+                content: Content(vec![block]),
+            });
+            p
+        };
+
+        let hostile_calls = [
+            // name
+            crate::prompt::ToolUse::new("EVIL", serde_json::json!({})),
+            // id
+            crate::prompt::ToolUse::new("ok", serde_json::json!({}))
+                .with_id("EVIL"),
+            // input string leaf
+            crate::prompt::ToolUse::new(
+                "ok",
+                serde_json::json!({"q": "x EVIL y"}),
+            ),
+            // input object key
+            crate::prompt::ToolUse::new("ok", serde_json::json!({"EVIL": 1})),
+            // input nested array leaf
+            crate::prompt::ToolUse::new(
+                "ok",
+                serde_json::json!({"a": [1, ["x", "EVIL"]]}),
+            ),
+        ];
+        for call in hostile_calls {
+            let p = prompt_with(call.into(), Role::Assistant);
+            assert_eq!(
+                find_injected_special_in_prompt(&p, tok, &specials, piece),
+                Some((999, "EVIL".to_string())),
+                "injection via a ToolUse surface is caught",
+            );
+        }
+
+        // ToolResult's tool_use_id.
+        let result = misanthropic::tool::Result {
+            tool_use_id: "EVIL".into(),
+            content: "all fine".into(),
+            is_error: false,
+            cache_control: None,
+        };
+        let p = prompt_with(result.into(), Role::User);
+        assert_eq!(
+            find_injected_special_in_prompt(&p, tok, &specials, piece),
+            Some((999, "EVIL".to_string())),
+            "injection via ToolResult.tool_use_id is caught",
+        );
+
+        // A clean call — numbers, booleans, ordinary strings — still
+        // passes.
+        let clean = crate::prompt::ToolUse::new(
+            "get_weather",
+            serde_json::json!({"city": "Zürich", "days": 3, "cache": true}),
+        )
+        .with_id("call_1");
+        let p = prompt_with(clean.into(), Role::Assistant);
+        assert!(
+            find_injected_special_in_prompt(&p, tok, &specials, piece)
+                .is_none(),
+            "clean tool call is not rejected",
+        );
+    }
+
+    /// `seed_prose_block` clamps the n-gram window to
+    /// [`crate::NGram::CAPACITY`] the way the live penalty pass does —
+    /// an over-CAPACITY `ngram_max_size` (which the setter permits;
+    /// only min ≤ max is normalized) panicked the fold's
+    /// `try_from_tokens(..).unwrap()` on any prose block at least that
+    /// long, reachable from `with_repetition` + any `complete_*`.
+    #[test]
+    fn test_seed_prose_block_clamps_ngram_max() {
+        use std::num::NonZeroU8;
+
+        struct SeedMock;
+        impl crate::backend::Model for SeedMock {
+            type Error = std::convert::Infallible;
+            fn n_vocab(&self) -> i32 {
+                32
+            }
+            fn bos(&self) -> Token {
+                0
+            }
+            fn eos(&self) -> Token {
+                0
+            }
+            fn eot(&self) -> Token {
+                0
+            }
+            fn special_tokens(&self) -> Vec<Token> {
+                vec![0]
+            }
+            fn eog_tokens(&self) -> Vec<Token> {
+                vec![0]
+            }
+            fn max_token_len(&self) -> usize {
+                8
+            }
+            fn tokenize(&self, input: &str, _special: bool) -> Vec<Token> {
+                input
+                    .split_whitespace()
+                    .enumerate()
+                    .map(|(i, _)| (i % 31 + 1) as Token)
+                    .collect()
+            }
+            fn token_to_piece(&self, _token: Token) -> String {
+                "x".to_string()
+            }
+            fn token_to_piece_ref(&self, _token: Token, buf: &mut Vec<u8>) {
+                buf.clear();
+                buf.push(b'x');
+            }
+            fn context_size(&self) -> i32 {
+                4096
+            }
+            fn chat_template_source(&self) -> Option<String> {
+                None
+            }
+            fn recommended_sampling(&self) -> crate::SamplingParams {
+                crate::SamplingParams::default()
+            }
+        }
+
+        let over = NonZeroU8::new(crate::NGram::CAPACITY as u8 + 1).unwrap();
+        let rep = RepetitionOptions::default().set_ngram_max_size(over);
+        let opts = SamplerConfig {
+            repetition: Some(rep.clone()),
+            ..SamplerConfig::default()
+        };
+        let mut state = opts.init_state(42, &SeedMock);
+        let block: crate::Block =
+            "one two three four five six seven eight nine ten".into();
+        // Panicked before the clamp.
+        seed_prose_block(&mut state, &block, &rep, &SeedMock);
     }
 
     /// The open-thought ingest guard: found anywhere, reported by
