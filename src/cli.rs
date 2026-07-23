@@ -116,6 +116,7 @@ pub const DEFAULT_N_CTX: u32 = 32768;
 /// their own path argument.
 #[derive(Debug, Clone, clap::Args)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct BackendArgs {
     /// Inference backend. Choices are whichever backends this build
     /// compiled in, so a single-backend build offers exactly one.
@@ -145,6 +146,21 @@ pub struct BackendArgs {
     pub use_2bit: bool,
 }
 
+impl Default for BackendArgs {
+    /// Exactly what parsing an empty command line yields: the same
+    /// defaults the `clap` attributes advertise in `--help`. Exists so
+    /// the struct stays constructible in code now that it is
+    /// `#[non_exhaustive]` (mutate a default; no literal).
+    fn default() -> Self {
+        Self {
+            backend: default_backend_kind(),
+            n_ctx: DEFAULT_N_CTX,
+            cache_slots: None,
+            use_2bit: false,
+        }
+    }
+}
+
 /// A flag was set that the chosen backend has no notion of.
 ///
 /// Deliberately fatal rather than a warning. Quietly dropping `--n-ctx
@@ -154,6 +170,7 @@ pub struct BackendArgs {
 /// for anyone.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("--backend {backend} does not support: {}", .flags.join(" "))]
+#[non_exhaustive]
 pub struct UnsupportedOptions {
     /// The backend that was asked for, by [`Backend::NAME`](crate::Backend::NAME).
     pub backend: &'static str,

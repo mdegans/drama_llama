@@ -291,14 +291,18 @@ fn capacity_eviction_recovers() {
     .quiet()
     .without_repetition()
     .with_sampling([SamplingMode::Greedy])
-    .with_prefix_cache_config(drama_llama::PrefixCacheConfig {
-        max_slots: 3,
+    .with_prefix_cache_config({
+        // `PrefixCacheConfig` is `#[non_exhaustive]`: mutate a
+        // default, no literal.
+        let mut config = drama_llama::PrefixCacheConfig::default();
+        config.max_slots = 3;
         // Each agent's history is ~33 cells and an incoming call
         // budgets ~54 (30-cell prompt + 24-token headroom): two
         // resident histories + one incoming call exceed 100, so the
         // third arrival must evict the LRU slot; one resident + one
         // incoming fits.
-        capacity_cells: Some(100),
+        config.capacity_cells = Some(100);
+        config
     });
 
     let a = agent_prompt("You are agent A. One short sentence.", "Say 'A'.")

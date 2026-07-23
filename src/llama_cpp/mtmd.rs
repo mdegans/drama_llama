@@ -72,6 +72,7 @@ impl Default for MtmdParams {
 
 /// Failure constructing an [`Mtmd`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MtmdNewError {
     /// The path cannot be handed to C (not UTF-8, or embedded NUL).
     #[error("mmproj path {path:?} is not valid UTF-8 or contains a NUL")]
@@ -86,6 +87,7 @@ static_assertions::assert_impl_all!(MtmdNewError: Send, Sync);
 
 /// Failure tokenizing marker-bearing text into [`MediaChunk`]s.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MtmdTokenizeError {
     /// Text contains an interior NUL and cannot cross the C boundary.
     #[error("prompt text contains a NUL byte: {0}")]
@@ -127,6 +129,7 @@ static_assertions::assert_impl_all!(MtmdTokenizeError: Send, Sync);
 
 /// Failure encoding + decoding an [`Image`] into the KV cache.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MtmdPrefillError {
     #[error(transparent)]
     Tokenize(#[from] MtmdTokenizeError),
@@ -184,6 +187,7 @@ static_assertions::assert_impl_all!(MtmdPrefillError: Send, Sync);
 /// type across both operations. The per-op enums remain the precise
 /// types on the inherent methods.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MtmdError {
     #[error(transparent)]
     Tokenize(#[from] MtmdTokenizeError),

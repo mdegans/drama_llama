@@ -20,6 +20,7 @@ use crate::{backend::Model, Token};
 
 /// Errors constructing a [`MoefluxModel`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MoefluxModelError {
     /// A required artifact was missing from `mlx_dir`.
     #[error("missing artifact {0}")]
@@ -42,7 +43,7 @@ pub enum MoefluxModelError {
 /// Constructed via [`Self::from_mlx_dir`]. The MLX artifacts
 /// directory is the canonical "HF export" form — the same directory
 /// `tools/extract_weights.py` consumes when producing
-/// `model_weights.bin` for [`crate::moeflux::MoefluxDecoder`].
+/// `model_weights.bin` for [`crate::MoefluxDecoder`].
 #[derive(Debug)]
 pub struct MoefluxModel {
     tokenizer: Tokenizer,
@@ -462,7 +463,10 @@ fn config_i64(value: &JsonValue, key: &str) -> Option<i64> {
 /// Convenience: locate the standard MLX export directory for a model
 /// name below a root. Example: `mlx_dir(&root, "qwen3-6-35b-a3b")`
 /// returns `<root>/qwen3-6-35b-a3b-mlx-4bit`. Useful in tests that
-/// locate artifacts from an env var.
-pub fn mlx_dir(root: &Path, model_stem: &str) -> PathBuf {
+/// locate artifacts from an env var. Crate-private since the module
+/// went private for 0.8.0 — no in-tree caller today, kept for the
+/// disk-convention it documents.
+#[allow(dead_code)]
+pub(crate) fn mlx_dir(root: &Path, model_stem: &str) -> PathBuf {
     root.join(format!("{model_stem}-mlx-4bit"))
 }

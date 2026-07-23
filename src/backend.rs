@@ -198,6 +198,7 @@ pub trait Decoder: Send {
 /// prefix-cache machinery in `Session` so it can fall back to a full
 /// re-prefill when a snapshot is missing.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MemoryRmError {
     /// No snapshot at the requested position. Caller should
     /// `memory_clear` and full-reprefill.
@@ -298,6 +299,7 @@ impl Image {
 
 /// Failure constructing an [`Image`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ImageNewError {
     #[error("image dimensions must be non-zero, got {width}x{height}")]
     ZeroDim { width: u32, height: u32 },
@@ -350,6 +352,7 @@ pub struct MediaSpan {
 /// One chunk of a media-aware tokenization: a run of ordinary text
 /// tokens, or one media item identified by its content hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MediaChunk {
     Text(Vec<Token>),
     Media {
@@ -464,6 +467,7 @@ mod media_convert {
 
     /// Failure decoding an API image block into an [`Image`].
     #[derive(Debug, thiserror::Error)]
+    #[non_exhaustive]
     pub enum ImageDecodeError {
         /// Base64/codec failure, or a URL source (we never fetch —
         /// download it yourself and re-embed as base64).
@@ -770,6 +774,7 @@ pub struct NotImplemented {
 /// sink today; a backend that has no notion of one simply never emits
 /// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogLevel {
     /// No severity attached — a raw log line (e.g. a continuation
     /// print).

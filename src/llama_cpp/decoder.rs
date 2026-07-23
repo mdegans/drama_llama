@@ -46,6 +46,7 @@ fn engine_count() -> std::sync::MutexGuard<'static, usize> {
 /// Possible errors when creating a new [`crate::Engine`] or
 /// [`LlamaCppDecoder`].
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum NewError {
     #[error("Could not load model from file: {path}")]
     Model { path: PathBuf },
@@ -67,6 +68,7 @@ static_assertions::assert_impl_all!(NewError: Send, Sync);
 
 /// Possible errors when calling [`LlamaCppDecoder::decode`].
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum DecodeError {
     #[error("Could not find a KV slot for the Batch. Try reducing the size of the batch or increase the context size.")]
     NoKvSlot,

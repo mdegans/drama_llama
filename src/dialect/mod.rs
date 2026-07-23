@@ -36,6 +36,7 @@ pub use parse::{parse_text, Leniency, ParseStatus, Parsed, StreamParser};
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "snake_case")
 )]
+#[non_exhaustive]
 pub enum Family {
     /// Template renders no tool calls at all. The `Instructed`
     /// dialect (deferred follow-up to Phase F) will own this case;
@@ -78,6 +79,7 @@ pub enum Family {
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "snake_case")
 )]
+#[non_exhaustive]
 pub enum ReasoningMode {
     /// No reasoning markers detected.
     #[default]
@@ -96,6 +98,7 @@ pub enum ReasoningMode {
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "snake_case")
 )]
+#[non_exhaustive]
 pub enum ContentMode {
     /// Plain text, no markers.
     #[default]
@@ -114,6 +117,7 @@ pub enum ContentMode {
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "snake_case")
 )]
+#[non_exhaustive]
 pub enum CallIdPosition {
     #[default]
     None,
@@ -135,6 +139,7 @@ fn is_default<T: Default + PartialEq>(v: &T) -> bool {
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "snake_case")
 )]
+#[non_exhaustive]
 pub enum ReasoningReingest {
     /// Thought text is wrapped `<think>…</think>` inline in the
     /// message `content` (legacy Qwen convention — those templates
@@ -166,6 +171,7 @@ pub enum ReasoningReingest {
     derive(serde::Serialize, serde::Deserialize),
     serde(default)
 )]
+#[non_exhaustive]
 pub struct ReasoningSyntax {
     pub mode: ReasoningMode,
     /// e.g. `"<think>"`, `""` (delimiter-style templates only close).
@@ -183,6 +189,7 @@ pub struct ReasoningSyntax {
     derive(serde::Serialize, serde::Deserialize),
     serde(default)
 )]
+#[non_exhaustive]
 pub struct ContentSyntax {
     pub mode: ContentMode,
     pub start: String,
@@ -196,6 +203,7 @@ pub struct ContentSyntax {
     derive(serde::Serialize, serde::Deserialize),
     serde(default)
 )]
+#[non_exhaustive]
 pub struct FunctionSyntax {
     /// e.g. `"<function="`, `"\"name\": \""`.
     pub name_prefix: String,
@@ -212,6 +220,7 @@ pub struct FunctionSyntax {
     derive(serde::Serialize, serde::Deserialize),
     serde(default)
 )]
+#[non_exhaustive]
 pub struct ArgumentsSyntax {
     /// Wrapper around the whole argument list, if any
     /// (e.g. `"<|tool_call_argument_begin|>"`).
@@ -239,6 +248,7 @@ pub struct ArgumentsSyntax {
     derive(serde::Serialize, serde::Deserialize),
     serde(default)
 )]
+#[non_exhaustive]
 pub struct CallIdSyntax {
     pub position: CallIdPosition,
     pub prefix: String,
@@ -253,6 +263,7 @@ pub struct CallIdSyntax {
     derive(serde::Serialize, serde::Deserialize),
     serde(default)
 )]
+#[non_exhaustive]
 pub struct JsonFields {
     /// Wrapper object key when calls nest one level
     /// (OpenAI's `{"function": {...}}`); empty when flat.
@@ -301,6 +312,7 @@ impl Default for JsonFields {
     derive(serde::Serialize, serde::Deserialize),
     serde(default)
 )]
+#[non_exhaustive]
 pub struct CallSyntax {
     pub family: Family,
     /// Wrapper around the whole tool-call section (all calls),

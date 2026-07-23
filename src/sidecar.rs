@@ -102,6 +102,7 @@ use crate::SamplerConfig;
 
 /// Failure mode for sidecar I/O.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SidecarError {
     #[error("sidecar I/O at {path:?}: {source}")]
     Io {

@@ -215,6 +215,7 @@ pub struct Candidates {
 static_assertions::assert_impl_all!(Candidates: Send, Sync);
 
 #[derive(Debug, thiserror::Error, derive_more::From)]
+#[non_exhaustive]
 pub enum CandidatesNewError {
     #[error("Could not convert vocabulary size to i32 because: `{0}`.")]
     OutOfRange(TryFromIntError),

@@ -47,6 +47,7 @@ const CALL_ID_002: &str = "call00002";
 const CALL_ID_999: &str = "call99999";
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AnalyzeError {
     #[error("template failed to compile: {0}")]
     Template(#[from] minijinja::Error),

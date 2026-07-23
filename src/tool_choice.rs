@@ -413,6 +413,7 @@ pub(crate) fn build_grammar_source(
 
 /// Errors from [`grammar_for_tool_choice`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ToolChoiceError {
     #[error("tool list is empty; cannot enforce tool_choice")]
     NoTools,

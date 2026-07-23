@@ -773,6 +773,7 @@ impl RepetitionOptions {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RepetitionError {
     #[error("Too few candidates ({actual}). The minimum is {min}. It cannot be less than the n-gram size.")]
     TooFewCandidates { min: usize, actual: usize },

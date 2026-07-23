@@ -17,6 +17,7 @@
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
+#[non_exhaustive]
 pub struct MoefluxOptions {
     /// Select the 2-bit packed-experts layout. Defaults to `false` — the
     /// 4-bit Qwen3 MoE setup, which is what the on-disk artifacts use.
@@ -29,8 +30,8 @@ pub struct MoefluxOptions {
 
 impl MoefluxOptions {
     /// Select the 2-bit packed-experts layout. See [`Self::use_2bit`].
-    pub fn use_2bit(mut self) -> Self {
-        self.use_2bit = true;
+    pub fn with_use_2bit(mut self, use_2bit: bool) -> Self {
+        self.use_2bit = use_2bit;
         self
     }
 }

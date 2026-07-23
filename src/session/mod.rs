@@ -131,6 +131,7 @@ use crate::{moeflux::engine::MoefluxEngineError, MoefluxBackend};
 
 /// Errors from [`Session`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SessionError {
     /// A spawned tokio task failed to join.
     #[cfg(feature = "tokio")]
@@ -509,6 +510,7 @@ const DEFAULT_MAX_SLOTS: usize = 8;
 /// Configuration for the multi-slot prefix cache
 /// ([`Session::with_prefix_cache_config`]).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct PrefixCacheConfig {
     /// Maximum live cached prefixes. Clamped at install time to the
     /// backend's [`Decoder::n_seq_max`](crate::backend::Decoder) —
@@ -2177,14 +2179,15 @@ impl Session<MoefluxBackend> {
     }
 
     /// Zero the moeflux per-label cmdbuf timing stats — call before a
-    /// measured prefill. See [`crate::MoefluxDecoder::reset_cmdbuf_stats`].
+    /// measured prefill so the breakdown is scoped to it.
     pub fn reset_cmdbuf_stats(&self) {
         self.engine.decoder.reset_cmdbuf_stats();
     }
 
-    /// Log the moeflux per-label cmdbuf timing breakdown. Most useful
-    /// under `MOEFLUX_PROFILE_PER_OP`. See
-    /// [`crate::MoefluxDecoder::log_cmdbuf_stats`].
+    /// Log the moeflux per-label cmdbuf timing breakdown, rows sorted
+    /// by total CPU wait descending. Most useful under
+    /// `MOEFLUX_PROFILE_PER_OP`. A no-op when no labeled commit has
+    /// run.
     pub fn log_cmdbuf_stats(&self) {
         self.engine.decoder.log_cmdbuf_stats();
     }

@@ -1698,6 +1698,7 @@ fn decode_utf8(buf: &[u8]) -> Utf8Decode {
 // ===========================================================================
 
 #[derive(Debug, thiserror::Error, PartialEq)]
+#[non_exhaustive]
 pub enum GrammarError {
     #[error("GBNF syntax error at byte {pos}: {msg}")]
     Syntax { pos: usize, msg: String },

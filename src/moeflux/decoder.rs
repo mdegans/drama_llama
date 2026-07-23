@@ -14,6 +14,7 @@ use crate::{
 
 /// Errors from the moeflux decoder path.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MoefluxError {
     /// A path argument contained an interior NUL and could not be
     /// passed through the C FFI.
@@ -168,7 +169,7 @@ impl MoefluxDecoder {
     }
 
     /// Vocabulary size as reported by moeflux. Must equal the vocab
-    /// size [`crate::moeflux::MoefluxModel`] was loaded for, or logit
+    /// size [`crate::MoefluxModel`] was loaded for, or logit
     /// indices disagree between the two backends.
     pub fn n_vocab(&self) -> usize {
         self.ctx.n_vocab()
@@ -176,7 +177,11 @@ impl MoefluxDecoder {
 
     /// Canonical EOS token id baked into the compile-time variant
     /// (`EOS_TOKEN_1` in `model_variant.h`).
-    pub fn eos_raw(&self) -> i32 {
+    ///
+    /// Diagnostic; unused today but kept for parity with the C-side
+    /// header. Not public API — EOG authority is `Model::eog_tokens`.
+    #[allow(dead_code)]
+    pub(crate) fn eos_raw(&self) -> i32 {
         self.ctx.eos()
     }
 
@@ -190,13 +195,18 @@ impl MoefluxDecoder {
     /// realized wrapper-side over `state_save` / `state_load` — direct
     /// `Ctx` access here is for diagnostics and tests, not state
     /// management (mixing `Ctx::checkpoint_pos` with the wrapper's
-    /// store would split the snapshot namespace).
-    pub fn ctx(&self) -> &Ctx {
+    /// store would split the snapshot namespace). Crate-private:
+    /// `moeflux::Ctx` is a third-party type (pinned pre-release) and
+    /// must not leak into the public API.
+    #[allow(dead_code)]
+    pub(crate) fn ctx(&self) -> &Ctx {
         &self.ctx
     }
 
-    /// Mutable access to the underlying moeflux context.
-    pub fn ctx_mut(&mut self) -> &mut Ctx {
+    /// Mutable access to the underlying moeflux context. See
+    /// [`Self::ctx`] for why this is crate-private.
+    #[allow(dead_code)]
+    pub(crate) fn ctx_mut(&mut self) -> &mut Ctx {
         &mut self.ctx
     }
 
@@ -215,8 +225,9 @@ impl MoefluxDecoder {
     }
 
     /// Zero the moeflux per-label cmdbuf timing stats — call before a
-    /// measured prefill so the breakdown is scoped to it.
-    pub fn reset_cmdbuf_stats(&self) {
+    /// measured prefill so the breakdown is scoped to it. Internal
+    /// diagnostic; the public surface is `Session::reset_cmdbuf_stats`.
+    pub(crate) fn reset_cmdbuf_stats(&self) {
         self.ctx.reset_cmdbuf_stats();
     }
 
@@ -224,8 +235,9 @@ impl MoefluxDecoder {
     /// by total CPU wait descending (dominant work first). Most useful
     /// under `MOEFLUX_PROFILE_PER_OP`, where each [`Op`] commits as its
     /// own labeled cmdbuf so the labels are per-Op. A no-op when no
-    /// labeled commit has run.
-    pub fn log_cmdbuf_stats(&self) {
+    /// labeled commit has run. Internal diagnostic; the public surface
+    /// is `Session::log_cmdbuf_stats`.
+    pub(crate) fn log_cmdbuf_stats(&self) {
         let mut stats = self.ctx.cmdbuf_stats();
         if stats.is_empty() {
             return;

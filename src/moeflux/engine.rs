@@ -24,6 +24,7 @@ pub type MoefluxEngine = Engine<MoefluxBackend>;
 /// model-side (HF tokenizer / config) and decoder-side (mf_init_model)
 /// failure modes.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MoefluxEngineError {
     /// Model-side failure (tokenizer or config parse).
     #[error(transparent)]

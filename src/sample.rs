@@ -31,6 +31,7 @@ pub(crate) const DELETE_ICON: egui::ImageSource<'static> =
 /// Options determining how raw logits are turned into a token. This is used by
 /// [`Candidates::sample_token`] and associated functions.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SamplerConfig {
     /// Sampling modes to apply in order. Greedy, Mirostat, and MirostatV2 are
     /// guaranteed to return a single token, so they should be the last mode.
@@ -331,6 +332,7 @@ const fn default_lazy_grammar() -> bool {
 ///   sidecar (see the [`sidecar`](crate::sidecar) module docs).
 /// * The request body's `temperature` / `top_p` / `top_k`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct SamplingParams {
     /// Temperature. Not a [`Probability`] — values above `1.0` are
     /// legal and useful (`llama.cpp` allows them), and `t <= 0.0` is
@@ -1262,6 +1264,7 @@ impl Default for SamplingMode {
 }
 
 #[derive(Debug, thiserror::Error, derive_more::From)]
+#[non_exhaustive]
 pub enum SampleError {
     #[error("Sampling failed because of a repetition error: {err}")]
     RepetitionError { err: RepetitionError },

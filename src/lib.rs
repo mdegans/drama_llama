@@ -103,11 +103,12 @@ pub use log::{
 };
 
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
-pub mod moeflux;
+mod moeflux;
 #[cfg(all(feature = "moeflux", target_os = "macos"))]
 pub use moeflux::{
-    MoefluxBackend, MoefluxDecoder, MoefluxEngine, MoefluxError, MoefluxModel,
-    MoefluxModelError, MoefluxOptions,
+    MoefluxBackend, MoefluxDecoder, MoefluxEngine, MoefluxEngineError,
+    MoefluxError, MoefluxModel, MoefluxModelError, MoefluxOptions,
+    PrefetchStats,
 };
 
 #[cfg(any(

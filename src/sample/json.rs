@@ -534,6 +534,7 @@ fn is_hex(b: u8) -> bool {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
+#[non_exhaustive]
 pub enum JsonError {
     #[error("unexpected byte {0:#04x} for current JSON state")]
     UnexpectedByte(u8),

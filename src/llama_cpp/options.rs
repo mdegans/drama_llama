@@ -31,6 +31,7 @@ use crate::llama_cpp::{FlashAttention, LlamaCppEngine};
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
+#[non_exhaustive]
 pub struct LlamaCppOptions {
     /// KV context size in tokens. `None` inherits llama.cpp's default,
     /// which is **512** — small enough to truncate a chat or a

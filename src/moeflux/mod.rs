@@ -11,7 +11,7 @@ pub mod options;
 use crate::Backend;
 
 pub use decoder::{MoefluxDecoder, MoefluxError, PrefetchStats};
-pub use engine::MoefluxEngine;
+pub use engine::{MoefluxEngine, MoefluxEngineError};
 pub use model::{MoefluxModel, MoefluxModelError};
 pub use options::MoefluxOptions;
 

@@ -36,6 +36,7 @@ use super::{harmony, CallSyntax, Family, ReasoningMode};
 
 /// Errors from dialect emission / reference rendering.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DialectError {
     /// A raw (tagged) string value contains the dialect's close
     /// delimiter and therefore cannot round-trip: tagged dialects
@@ -88,6 +89,7 @@ pub enum Anchor {
 
 /// Emission options.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EmitOptions {
     pub anchor: Anchor,
     /// Allow more than one call per turn. Gated on the caller's

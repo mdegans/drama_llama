@@ -87,6 +87,9 @@ fn install_backend_log_bridges() {
                 log::Level::Debug
             }
             LogLevel::Cont => log::Level::Trace,
+            // `LogLevel` is `#[non_exhaustive]`; treat unknown future
+            // levels like `Other`.
+            _ => log::Level::Debug,
         };
         // llama.cpp terminates its own lines; `log` adds another.
         let text = text.trim_end_matches('\n');

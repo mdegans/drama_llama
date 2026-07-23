@@ -1444,6 +1444,7 @@ fn civil_from_unix(secs: i64) -> (i32, i32, i32, i32, i32, i32) {
 // ===========================================================================
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ChatTemplateError {
     #[error("model has no `tokenizer.chat_template` metadata")]
     NoTemplate,

@@ -164,10 +164,11 @@ fn main() {
             let syntax = dialect_syntax(name);
             let tools: Vec<Tool> = args.tools.iter().map(load_tool).collect();
             let refs: Vec<&Tool> = tools.iter().collect();
-            let opts = EmitOptions {
-                anchor: args.anchor,
-                parallel: !syntax.per_call_start.is_empty(),
-            };
+            // `EmitOptions` is `#[non_exhaustive]`: mutate a
+            // default, no literal.
+            let mut opts = EmitOptions::default();
+            opts.anchor = args.anchor;
+            opts.parallel = !syntax.per_call_start.is_empty();
             grammar_source(&syntax, &refs, &opts).unwrap_or_else(|e| {
                 eprintln!("grammar_source: {e}");
                 std::process::exit(2);

@@ -8,6 +8,7 @@ use tinyvec::ArrayVec;
 use crate::{utils::cold, Token};
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum NGramNewError {
     #[error("Need at least one token to create an NGram.")]
     NotEnoughTokens,

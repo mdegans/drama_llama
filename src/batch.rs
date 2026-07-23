@@ -22,6 +22,7 @@ pub struct Batch {
 }
 
 #[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
 pub enum AddError {
     #[error("The batch is full")]
     Full,
