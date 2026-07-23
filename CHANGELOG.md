@@ -39,6 +39,31 @@ Three further arcs land on top of the split:
 
 ### Added
 
+- **The README is now the crate-level documentation** (#66), mounted
+  with `#![doc = include_str!("../README.md")]`, so the front page of
+  the repository and the front page of docs.rs cannot drift apart. It
+  was rewritten from the v0.3-era text it still carried, which
+  advertised a `bin/dittomancer` deleted in `57016dd` and a hardcoded
+  n-gram blocklist removed in `c2d8579`. Its two `rust` blocks are
+  doctests: a `no_run` structured-output walkthrough that is
+  type-checked on every CI run, and an executed one driving the GBNF
+  matcher standalone.
+- **Coverage** (#70) — `scripts/test.py coverage`, `just coverage`,
+  and a CI job uploading to Codecov. Runs the tests under
+  cargo-llvm-cov once and re-reads that data per output format
+  (`--lcov`, `--json`, `--html`, and a per-file table). Defaults to
+  `-t all` because the fast tier alone reports every generation path
+  as dead code. Read the headline percentage as an upper bound:
+  llvm-cov filters by file, so `#[cfg(test)] mod tests` inside `src/`
+  cannot be excluded from it.
+- **`scripts/test.py doctest`** / `just doctest`, wired into `just
+  check` and its own CI job. cargo-nextest has no doctest support
+  (nextest-rs/nextest#16), so until now every recipe in the repo ran
+  exactly zero of them — which stopped being acceptable once the
+  README became a doctest. The pre-commit hook and `ci.yml` both
+  skipped `.md`-only changes; both now treat `README.md` and
+  `TERMS_OF_USE.md` as source, since `src/lib.rs` `include_str!`s
+  them.
 - **`FromPath::Options`** — an associated type carrying whatever a
   backend needs to be told at load time, so generic code can ask for
   a context size. `LlamaCppOptions` (`n_ctx`, `cache_slots`,
@@ -520,16 +545,22 @@ Three further arcs land on top of the split:
 
 ### Notes
 
-- **`blallama` no longer enables the repetition-penalty filter by
-  default.** Current `RepetitionOptions::default()` settings
+- **`blallama` takes its repetition-penalty setting from the
+  per-model sidecar**, not from a flag. The v0.7.x defaults
   (`penalty_max_count=1`, `ngram_min_size=1`, `penalty_repeat=1.06`)
-  were originally sized for small downstream models in Weave; on the
-  larger MoE models drama_llama now drives they over-penalise common
-  content tokens during long-form free-text generation and degrade
-  output to thesaurus chains or sentence-fragment loops. New
-  `--repetition-penalty` flag re-enables the filter for diagnosis.
-  Library defaults stay; tuning + broader test coverage tracked
-  separately.
+  were sized for small downstream models in Weave; on the larger MoE
+  models drama_llama now drives they over-penalise common content
+  tokens during long-form free-text generation and degrade output to
+  thesaurus chains or sentence-fragment loops. `--no-penalty`
+  overrides the sidecar to force the filter OFF for probe and canary
+  runs; there is no flag to force it on, because the sidecar is where
+  that decision now lives.
+
+  (This bullet said "no longer enables the filter by default … new
+  `--repetition-penalty` flag re-enables it", carried over from
+  v0.7.x. That flag was removed in this same release — see *Removed*
+  — and the sentence had been contradicting the entry three sections
+  up ever since.)
 - **Upstream moeflux MAX_K bump.** moeflux fork commit `d013a0b`
   raises `MAX_K` from 8 to 16 in `metal_infer/infer.m` (plus the
   combine-shader binding shifts). Without it, A17B (`K=10`) silently

@@ -1,3 +1,13 @@
+// The crate-level docs ARE the README, so the front page of docs.rs and the
+// front page of the repository cannot drift apart, and the examples on it are
+// doctests (#66). Two consequences worth knowing before editing README.md:
+//
+//   * Its ```rust blocks are compiled on every CI run. `just doctest` — NOT
+//     `just test`, since nextest cannot run doctests at all.
+//   * Its links must be absolute. A relative one resolves against the repo on
+//     GitHub and against nothing on docs.rs.
+#![doc = include_str!("../README.md")]
+
 // TODO: Importing everything from the submodules is fine for small crates, but
 // this is getting crowded. When we go to version 0.2.0, we should consider
 // making modules public.
