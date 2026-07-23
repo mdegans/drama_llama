@@ -257,6 +257,15 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`plan_ci_self_hosted_runner.md`](.claude/memory/plan_ci_self_hosted_runner.md)
+  — **read first if this session is on the remote runner box.** CI's
+  first-run state (green both OSes bar four model-needing "unignored"
+  metadata tests that fail in ~11s — a tier-invariant gap worth
+  understanding), the self-hosted runner plan (Linux: account + rootless
+  Docker + systemd + register; macOS VM: Metal-in-VM unknown, NVIDIA-only
+  generation if it fails), and the 3090 VRAM snag that may force a smaller
+  Qwen and a test-expectation re-baseline. Written where the remote can
+  find it because `~/.claude/` won't be there.
 - [`test_topology.md`](.claude/memory/test_topology.md)
   — **read before adding a test recipe, a feature, or a
   `#[cfg(feature = "llama-cpp")]`.** `scripts/test.py` owns the topology
