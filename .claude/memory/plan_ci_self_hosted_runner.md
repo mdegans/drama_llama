@@ -48,76 +48,95 @@ installed, rootless nvidia-docker set up (our jobs run *outside* a
 container, so that part is for other repos). Its first run reproduced the
 hosted result exactly: same four failures.
 
-Weights live **outside the workspace**, at
-`~/src/drama_llama/models` for the `ghrunner-drama-llama` account:
+Weights live **outside the workspace**, in a **root-owned, immutable
+`/models`** — shared by every account on the box rather than copied per
+runner account. As of 2026-07-23 it holds the full set the suite wants:
+`model.gguf`/`model.mmproj.gguf` (Qwen3.6-35B-A3B **IQ3_S**), the IQ4_XS
+Qwen pair, the Gemma 4 pair, and gpt-oss.
 
-    Qwen3.6-35B-A3B-UD-IQ3_S.gguf          13G   (hardlinked to model.gguf)
-    Qwen3.6-35B-A3B-UD-IQ3_S.mmproj.gguf  861M   (→ model.mmproj.gguf)
+Immutability works because the `link-models` composite action links only
+`*.gguf`. Every path a test *writes* — the `.sampling.toml` sidecar, the
+Gemma/gpt-oss `.template.jinja` sidecars — resolves to a plain file in the
+workspace `models/`, beside the symlink rather than through it. `/models`
+does carry its own sidecars; they are deliberately not linked, so each run
+regenerates the sampling sidecar from GGUF metadata and exercises that path.
 
-**Note the quant differs from the laptop's** — the box is **IQ3_S**, Mike's
-Mac is **IQ4_XS**. Two consequences. Generation assertions that depend on
-output quality may behave differently on the box than they do locally, so a
-CI-only failure in a content assertion is a quant suspect before it is a
-regression. And `test_recommended_sampling_across_models` names
-`Qwen3.6-35B-A3B-UD-IQ4_XS.gguf` literally, so on the box it skips *all
-three* of its cases and passes vacuously.
+**The `model.gguf` quant differs from the laptop's** — the box is
+**IQ3_S**, Mike's Mac is **IQ4_XS** (he sized down after the default n_ctx
+went to 32k). So a CI-only failure in a content assertion is a quant
+suspect before it is a regression. Mike wants exactly this exposed: the
+tests should be flexible enough to work across Qwen variants, and the box
+can run an 8-bit occasionally to check the other direction. Known
+hard-coded variant: `test_recommended_sampling_across_models` names
+`Qwen3.6-35B-A3B-UD-IQ4_XS.gguf` literally — it passes on the box only
+because that file happens to be in `/models` too.
 
-No `.sampling.toml` sidecar is shipped: the run generates it from GGUF
-metadata, which exercises that path for free.
-
-### What the `model` job does, and what it deliberately skips
+### What the `model` job does
 
 `ci.yml`'s `model` job is Linux-only: `-c llama-cpp` (CUDA on Linux)
 `-t ignored`, serialized by the `full` nextest profile, behind a
 **`concurrency` group not keyed on the ref** so a second PR queues instead
-of landing on a busy card.
+of landing on a busy card. All 119 ignored tests, since `/models` is
+complete.
 
-Three suites are excluded with `test.py -x` because their weights are not
-on the box — Gemma 4 (17 GB) and gpt-oss (13 GB) — and, importantly, those
-tests **`panic!` rather than skip** when the file is missing, so they
-cannot be left to no-op: `session_gemma4`, `session_gptoss`, and
-`media_e2e_gemma` (same Gemma weights, but inside the lib binary, hence a
-test name rather than a binary name). Expected count: **99 of 119** ignored
-tests. Delete an `-x` the day its weights land on the box.
+If a runner ever has a *partial* model directory, exclude the affected
+suites by name rather than expecting them to no-op — they **`panic!`
+rather than skip** when their file is absent:
 
-`-x` is a filterset, not a runtime skip, on purpose — an absent-weights
-test that reports itself green is exactly the silent coverage loss #68
-exists to prevent.
+    -x session_gemma4 -x session_gptoss -x media_e2e_gemma
 
-### Self-hosted changes two Actions habits
+`-x` is a filterset, not a runtime skip, on purpose: an absent-weights test
+that reports itself green is exactly the silent coverage loss #68 exists to
+prevent.
 
-- **`clean: false` on every checkout.** The default runs `git clean -ffdx`,
-  which deletes `target/` — and a self-hosted workspace persists, so that
-  default is the difference between reusing the llama.cpp build and paying
-  20-40 min for it every run. Must be uniform across jobs: with one runner
-  they share one workspace, so a single `clean: true` job wipes the others'
-  build. Cost: a file deleted on a branch lingers, notably a removed
-  `tests/*.rs` that cargo keeps compiling. `git clean -ffdx` on the box
-  clears it.
-- **No `Swatinem/rust-cache`.** Nothing to restore once the workspace
-  persists, and a CUDA llama.cpp build does not fit in a 10 GB Actions
-  cache.
+**VRAM watch item.** `session_gemma4` loads a *dense* 31B (Q4_K_XL, 17 GB)
+at the default 32k context. On a 24 GB 3090 that is close to the edge —
+a `unable to allocate CUDA0 buffer` there is arithmetic, not a regression.
+The Qwen MoE at 13 GB has plenty of room.
 
-Build parallelism is capped at 16 of 32 cores (`CARGO_BUILD_JOBS`, which
-cargo forwards to build scripts as `NUM_JOBS`, which is what the `cmake`
-crate reads for llama.cpp). **Never cap tests the same way**:
-`NEXTEST_TEST_THREADS` overrides the `full` profile's `test-threads = 1`,
-which is the only thing keeping two models off one card.
+### Self-hosted changes one Actions habit
+
+**No `Swatinem/rust-cache`**: a CUDA llama.cpp build does not fit in a 10 GB
+Actions cache. Checkout is left on its **default `clean: true`**, so every
+run rebuilds from scratch — Mike's call, and measured: both llama.cpp
+builds are quick on this hardware (M2 Max 96 GB on the Mac side, and the
+box is comparable depending on the work). The alternative, `clean: false`,
+buys a warm `target/` but has a nastier failure mode: a file deleted on a
+branch lingers, notably a removed `tests/*.rs` that cargo keeps compiling.
+If the measurement ever argues for persistence, the fix is a target dir
+**outside** the workspace, not `clean: false` — with one runner every job
+shares one workspace, so a single cleaning job wipes the others' build.
+
+Build parallelism is **per runner**, in each job's `env`: 16 of the Linux
+box's 32 cores (it does other work), 4 on the macOS VM, which is all it was
+given. `CARGO_BUILD_JOBS` is what cargo forwards to build scripts as
+`NUM_JOBS`, which is what the `cmake` crate reads for llama.cpp, so one knob
+covers both halves. **Never cap tests the same way**: `NEXTEST_TEST_THREADS`
+overrides the `full` profile's `test-threads = 1`, which is the only thing
+keeping two models off one card.
 
 ### macOS leg: still the uncertain one
 
-A Parallels VM, mid-setup, Xcode and friends still to install. **Metal in
-the VM is unverified** and deliberately out of scope: moeflux would want
+A Parallels VM on the M2 Max: **4 cores, 32 GiB** of the host's 96. Metal
+in the VM is unverified and deliberately out of scope — moeflux would want
 the expert shards mounted in, tens of GB for a second copy of what the host
 already has. So generation testing is **NVIDIA-only** and macOS stays a
 compile-and-fast-tests gate; Metal generation is covered by the pre-commit
 hook on the machine we develop on.
 
-Open on macOS: the `test` job's four metadata tests need
-`models/model.gguf` there too. The cheap answer is a **read-only Parallels
-share of the host's models directory**, pointed at with
-`DRAMA_LLAMA_MODELS` in the runner's environment (the `link-models`
-composite action reads it) — no second 13 GB copy.
+The `test` job's four metadata tests need `models/model.gguf` there too, so
+the host's models directory is shared into the VM and `DRAMA_LLAMA_MODELS`
+points at wherever Parallels mounts it (the `link-models` action reads it;
+the mount point is not hard-coded anywhere).
+
+**Watch for mmap over the share.** llama.cpp mmaps weights by default, and
+mmap over a Parallels shared folder is the kind of thing that either works
+fine or fails into a full read of the file. Four of these tests run *in
+parallel* in a 32 GiB VM against a 13-17 GB file; if the mmap does not
+hold, that is an OOM rather than a slow test. Fallbacks in order of
+preference: a small real GGUF inside the VM (must be >1B params —
+`test_model` asserts `n_params() > 1_000_000_000`), or
+`-x llama_cpp::model::tests` on the macOS leg only.
 
 ## VRAM: probably fine, watch the first run
 
@@ -139,10 +158,16 @@ exercise — should still work.
   no way to trigger a run at all. Do it when v0.8.0 merges to main. Note
   the motivation has *shifted* — self-hosted minutes are free, so the
   reason to drop `push` is now GPU contention, not credit.
-- **GPU contention across repos** — the box serves several. An Actions
-  `concurrency` group only orders jobs within this repo; nothing stops
-  another repo's runner from taking the card at the same time. Mike has
-  said he wants to elaborate on this off-tracker. A machine-level lock
-  (flock around the model job) is the shape of the answer if one is needed.
+- **GPU contention with the rest of the box** — it is not a dedicated CI
+  machine. An Actions `concurrency` group only orders jobs *within this
+  repo*; it cannot see other repos' runners, and it certainly cannot see
+  non-CI workloads that pull a model onto the card periodically. Quiet
+  today, so not a problem yet, but a future intermittent CUDA OOM or a
+  slow model job is this before it is a regression. Options when it bites,
+  in order of how much they cost: pause the other workload around a push
+  (works, unpleasant), a machine-level `flock` around the model job, or a
+  VRAM precondition check that fails fast with a legible message rather
+  than mid-suite. Ask Mike before designing — he has context here that is
+  deliberately not written down in this repo.
 - **#69** — moeflux prefetch telemetry; unrelated to CI, revisit on a17b
   perf work.

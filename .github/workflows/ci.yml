@@ -26,14 +26,29 @@
 # stays a compile-and-fast-tests gate. Metal generation is covered by the
 # pre-commit hook on the machine we actually develop on.
 #
-# BUILD PARALLELISM is capped at 16 of 32 cores (`CARGO_BUILD_JOBS`, which
-# cargo also forwards to build scripts as `NUM_JOBS`, which is what the
-# `cmake` crate reads for llama.cpp's own build). The box does other work.
+# BUILD PARALLELISM is per-runner, not global: 16 of the Linux box's 32
+# cores (it does other work), and 4 on the macOS VM, which is all it was
+# given. `CARGO_BUILD_JOBS` is also what cargo forwards to build scripts as
+# `NUM_JOBS`, which is what the `cmake` crate reads for llama.cpp's own
+# build, so one knob covers both halves.
 #
 # Do NOT add `NEXTEST_TEST_THREADS` to cap *test* parallelism the same way:
 # the environment variable overrides the `full` profile's `test-threads = 1`
 # (`.config/nextest.toml`), which is the only thing keeping two 13 GB models
 # off one 24 GB card. Cap builds, never tests.
+#
+# CHECKOUT IS LEFT ON ITS DEFAULT `clean: true`, which runs `git clean -ffdx`
+# and so deletes `target/` every run. That is a real rebuild each time, and
+# it is a deliberate choice: Mike measured both llama.cpp builds as quick on
+# this hardware, and a persistent workspace has a nastier failure mode — a
+# file deleted on a branch lingers, notably a removed `tests/*.rs` that cargo
+# would happily keep compiling. Full rebuilds also mean the `.sampling.toml`
+# sidecar is regenerated from GGUF metadata every run, which exercises that
+# path for free. Revisit only if the measurement says otherwise; the fix then
+# is a target dir OUTSIDE the workspace, not `clean: false` (with one runner
+# all jobs share one workspace, so a single cleaning job wipes the others').
+# There is no `Swatinem/rust-cache` for the same reason it would not help: a
+# CUDA llama.cpp build does not fit in a 10 GB Actions cache.
 
 name: CI
 
@@ -47,10 +62,6 @@ env:
   CARGO_TERM_COLOR: always
   # A CI failure should be readable without re-running with more verbosity.
   RUST_BACKTRACE: 1
-  # See BUILD PARALLELISM above. `CMAKE_BUILD_PARALLEL_LEVEL` is belt and
-  # braces: it caps cmake directly, whichever generator it picks.
-  CARGO_BUILD_JOBS: "16"
-  CMAKE_BUILD_PARALLEL_LEVEL: "16"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -63,10 +74,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-        with:
-          # See `clean: false` in the `gate` job — this one shares the same
-          # workspace, so it has to agree or it wipes the others' build.
-          clean: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -77,9 +84,8 @@ jobs:
   gate:
     name: permutations (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    # Generous because the FIRST run on a cold workspace builds llama.cpp
-    # twice on Linux — once with CUDA (`llama-cpp`) and once without
-    # (`llama-cpp-cpu`, its own target dir). Later runs reuse both.
+    # Generous because every run builds llama.cpp from scratch (see CHECKOUT
+    # above) — twice on Linux, with CUDA and without, in separate target dirs.
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -87,24 +93,16 @@ jobs:
         include:
           - name: linux
             runner: [self-hosted, linux]
+            jobs: 16
           - name: macos
             runner: [self-hosted, macos]
+            jobs: 4
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+      # Belt and braces: caps cmake directly, whichever generator it picks.
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.jobs }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          # `clean: true` (the default) runs `git clean -ffdx`, which deletes
-          # `target/` — and on a self-hosted runner the workspace persists
-          # between runs, so that is the difference between reusing the
-          # llama.cpp build and paying 20-40 minutes for it every single run.
-          # Keeping it is also why there is no `Swatinem/rust-cache` here any
-          # more: nothing to restore, and a CUDA llama.cpp build does not fit
-          # in a 10 GB Actions cache anyway.
-          #
-          # The cost is that a file deleted on a branch lingers in the
-          # workspace — notably a removed `tests/*.rs`, which cargo would keep
-          # compiling. If a failure ever looks like it is testing code that no
-          # longer exists, that is this; `git clean -ffdx` on the box clears it.
-          clean: false
       - uses: dtolnay/rust-toolchain@stable
       # No `--ci`: that flag drops the configurations a *hosted* runner cannot
       # build, and the whole point of this box is that it can. It has nvcc, so
@@ -127,12 +125,15 @@ jobs:
         include:
           - name: linux
             runner: [self-hosted, linux]
+            jobs: 16
           - name: macos
             runner: [self-hosted, macos]
+            jobs: 4
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.jobs }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          clean: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - name: link model weights
@@ -175,10 +176,11 @@ jobs:
       group: gpu-${{ github.repository }}
       cancel-in-progress: false
     timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "16"
+      CMAKE_BUILD_PARALLEL_LEVEL: "16"
     steps:
       - uses: actions/checkout@v4
-        with:
-          clean: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       # Printed, not asserted: when a test dies of `unable to allocate CUDA0
@@ -191,15 +193,17 @@ jobs:
       # is the tier that loads real weights — 119 tests, ~11 minutes on Mike's
       # Mac. Serialized to one at a time by the `full` nextest profile.
       #
-      # `-x` drops the suites whose weights are not on this box. Gemma 4
-      # (17 GB) and gpt-oss (13 GB) are not downloaded, and both `panic!`
-      # rather than skip when the file is absent, so they cannot simply be
-      # left to no-op. `media_e2e_gemma` needs the same Gemma weights but
-      # lives in the lib binary, hence a test name rather than a binary name.
-      # Delete an `-x` the day its weights land on the box.
-      - run: >
-          python3 scripts/test.py run -c llama-cpp -t ignored
-          -x session_gemma4 -x session_gptoss -x media_e2e_gemma
+      # This assumes the shared models directory holds ALL of them:
+      # `model.gguf` + `model.mmproj.gguf`, the Gemma 4 pair, and gpt-oss.
+      # The suites that need the latter two `panic!` rather than skip when
+      # their file is absent, so a partial directory is not a soft failure —
+      # exclude them by name instead, which is what `test.py -x` is for:
+      #
+      #   -x session_gemma4 -x session_gptoss -x media_e2e_gemma
+      #
+      # (`media_e2e_gemma` wants the same Gemma weights but lives in the lib
+      # binary, hence a test name where the other two are binary names.)
+      - run: python3 scripts/test.py run -c llama-cpp -t ignored
       - name: upload logs
         if: failure()
         uses: actions/upload-artifact@v4
