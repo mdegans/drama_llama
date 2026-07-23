@@ -241,6 +241,67 @@ what model it assumes. A smaller model is also faster, and
 grammar-constrained tool calling — the capability the interesting tests
 exercise — should still work.
 
+## What the ignored tier caught on its first CUDA run (2026-07-23)
+
+**119 tests, 464s.** First run: 113 passed / 6 failed. After two fixes:
+**116 passed / 3 failed.** The bet in #70 — that a model-capable runner
+turns CI from a compile gate into a real regression gate — paid out
+immediately, and paid out on a *library* bug, not on CI plumbing.
+
+### Two real defects, fixed
+
+- **`bin/blallama` dropped every symlinked model.** `list_entries` used
+  `DirEntry::metadata()`, which **does not traverse the link** — it is
+  `symlink_metadata` in all but name, returning `is_symlink() == true` and
+  `is_file() == false`. The comment directly above it asserted the
+  opposite, which is how it survived review: the code read as though it
+  had already handled the case. `/api/tags` came back empty.
+  **Not CI-only** — the same doc comment names the moeflux
+  `mlx`/`artifacts`/`root` symlink layout as the case it exists to
+  support, and that was broken too. Invisible on a dev box because a dev
+  `models/` holds regular files and hardlinks; CI is simply the first
+  environment to symlink them in. Verified with a standalone program
+  before believing either the docs or the comment.
+- **`test_usage_counters_across_append_only_calls` needed two models
+  resident.** It held the cache-on session alive while constructing the
+  cache-off one: 13 + 13 GB, free on a 96 GB Mac, impossible on a 24 GB
+  card. `drop(session)` first; nothing below it needed the session.
+
+The generalizable lesson: **a 24 GB card and a symlinked, read-only model
+directory are both configurations no developer here runs**, so they are
+exactly where the untested assumptions were. Expect the next batch of
+CI-only failures to have the same flavour rather than to be regressions.
+
+### Three left, and two are not code
+
+- **`all_shapes_match_python_jinja2`** — `uv` is not installed on
+  balerion (`/usr/bin/env: 'uv': No such file or directory`). Install it.
+  Deliberately NOT added to `runner-path`'s required-tools list: one test
+  needs it, and failing the whole job early over it would be worse than
+  the one red test.
+- **`gptoss_eog_token_set`** — `eot()` is `<|endoftext|>` on the box and
+  `<|end|>` on the Mac, with `eos()` == `<|return|>` on both. Same
+  `llama-cpp-sys-3 0.8.1` from `Cargo.lock`, same code path, so identical
+  bytes cannot give different answers: **the two
+  `gpt-oss-20b-UD-Q8_K_XL.gguf` files are different files.** `/models`'
+  is dated Jul 10, the laptop's Jul 13; unsloth re-uploads "UD" quants and
+  tokenizer metadata is what changes. Laptop reference: `file size =
+  12.28 GiB (5.04 BPW)`, `n_vocab = 201088`. **Fix by re-syncing the
+  file, not by touching the test** — the pin is doing precisely the job
+  its doc comment describes. Note the contrast with the Qwen quant, which
+  is a difference Mike *chose*; this one is accidental drift between two
+  copies sharing a name, and argues for `/models` being the single source
+  that the laptop syncs *from*.
+- **`regression_llama_cpp_baseline`** — `token 11 ',' drifted 0.5926 >
+  tol 0.5`, `max_drift=0.9906`, `shared_ids=15/20`, `cosine=0.787`.
+  Golden captured on IQ4_XS, box runs IQ3_S. **Mike's call, and he asked
+  to see it**: he wants the tests flexible enough to span Qwen variants.
+  Do NOT widen the tolerance — per [[logit_comparability_across_backends]]
+  a widened tolerance that covers a membership change hides the thing the
+  test exists to detect, and `shared_ids=15/20` *is* a membership change.
+  The honest options are re-baselining per box, or recording which model a
+  golden came from and refusing to compare across variants.
+
 ## Open issues
 
 - **#70** — CI cost/runner. Also holds "drop the `push` trigger, keep
