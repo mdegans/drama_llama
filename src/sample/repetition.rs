@@ -6,7 +6,7 @@
 #[allow(deprecated)]
 use crate::{
     candidates::Sorted,
-    data::{ignore_category::IgnoreCategory, StopWords},
+    data::ignore_category::IgnoreCategory,
     ngram::{NGram, NGramStats},
     Candidates, Token,
 };
@@ -294,13 +294,6 @@ impl RepetitionOptions {
         resolved
     }
 
-    /// Use [`RepetitionOptions::ignored_categories`] instead.
-    #[allow(deprecated)]
-    #[deprecated(since = "0.7.0", note = "renamed to `ignored_categories`")]
-    pub fn ignored_stopwords(&self) -> &BTreeSet<StopWords> {
-        self.ignored_categories()
-    }
-
     /// Set [`IgnoreCategory`]s to ignore. These are never penalized.
     pub fn set_ignored_categories<It>(mut self, ignored_categories: It) -> Self
     where
@@ -310,35 +303,12 @@ impl RepetitionOptions {
         self
     }
 
-    /// Use [`RepetitionOptions::set_ignored_categories`] instead.
-    #[allow(deprecated)]
-    #[deprecated(since = "0.7.0", note = "renamed to `set_ignored_categories`")]
-    pub fn set_ignored_stopwords<It>(self, ignored_stopwords: It) -> Self
-    where
-        It: IntoIterator<Item = StopWords>,
-    {
-        self.set_ignored_categories(ignored_stopwords)
-    }
-
     /// Extend the list of [`IgnoreCategory`]
     pub fn extend_ignored_categories<It>(&mut self, ignored_categories: It)
     where
         It: IntoIterator<Item = IgnoreCategory>,
     {
         self.ignored_categories.extend(ignored_categories);
-    }
-
-    /// Use [`RepetitionOptions::extend_ignored_categories`] instead.
-    #[allow(deprecated)]
-    #[deprecated(
-        since = "0.7.0",
-        note = "renamed to `extend_ignored_categories`"
-    )]
-    pub fn extend_ignored_stopwords<It>(&mut self, stopwords: It)
-    where
-        It: IntoIterator<Item = StopWords>,
-    {
-        self.extend_ignored_categories(stopwords);
     }
 
     /// Ngrams to ignore. These are never penalized.
@@ -409,17 +379,6 @@ impl RepetitionOptions {
     ) -> Self {
         self.extend_ignored(ignore_categories.into_tokens(model));
         self
-    }
-
-    /// Use [`RepetitionOptions::ignore_categories`] instead.
-    #[allow(deprecated)]
-    #[deprecated(since = "0.7.0", note = "renamed to `ignore_categories`")]
-    pub fn ignore_stopwords<M: crate::backend::Model>(
-        self,
-        stopwords: StopWords,
-        model: &M,
-    ) -> Self {
-        self.ignore_categories(stopwords, model)
     }
 
     /// Minimum n-gram size to penalize, in tokens. Always `<=`

@@ -21,10 +21,6 @@ pub enum IgnoreCategory {
     Punctuation,
 }
 
-/// Use [`IgnoreCategory`] instead.
-#[deprecated(since = "0.7.0", note = "renamed to `IgnoreCategory`")]
-pub type StopWords = IgnoreCategory;
-
 impl IgnoreCategory {
     pub const ALL: [IgnoreCategory; 3] = [
         IgnoreCategory::English,
