@@ -1,5 +1,6 @@
 {
-  "backend": "llama-cpp",
+  "backend": "llama-cpp/metal",
+  "system_info": "MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | ACCELERATE = 1 | REPACK = 1 | ",
   "model_meta": {
     "n_vocab": 248320,
     "architecture": "qwen35moe",

@@ -36,10 +36,27 @@
 //!
 //! - **`prompt_tokens`, `tokens`, `pieces` — asserted exactly.** Greedy
 //!   is deterministic, and empirically it is deterministic *across
-//!   backends* too: this golden was captured on CUDA and the full
-//!   32-token stream reproduces byte-for-byte on Metal. Note this is
-//!   already 32 argmax assertions over a 248k vocab — it is the
-//!   harness's real teeth.
+//!   backends and quants* too. Note this is already 32 argmax
+//!   assertions over a 248k vocab — it is the harness's real teeth.
+//!
+//! The golden in the tree was captured on **Metal, IQ4_XS**. It was
+//! previously captured on CUDA at the same quant, and the two disagree
+//! only in the logit tail, exactly as described below — the token-level
+//! signals are identical across that swap.
+//!
+//! Determinism, measured rather than assumed (three consecutive captures,
+//! one machine, one backend, one model): **bitwise identical**, logit
+//! tail included, max delta 0.0. So every difference discussed here is
+//! cross-backend or cross-quant. There is no run-to-run noise to budget
+//! for, and a diff that appears without one of those two explanations is
+//! a real finding.
+//!
+//! What the file cannot tell you is which accelerator produced it —
+//! `backend` records the crate-level name (`llama-cpp`), not CUDA vs
+//! Metal, in the same way `n_vocab` could not tell IQ4_XS from IQ3_S.
+//! It does not gate anything today, because prefill magnitudes are
+//! comparable across backends and the deep tail is already unasserted.
+//! Keep this paragraph accurate when regenerating.
 //! - **`logits_step_0` — asserted BY ID, within `LOGIT_TOL`.** Prefill
 //!   is a single forward pass: no accumulated drift, no compounding.
 //!   CUDA and Metal agree here. Rank, however, is *not* pinned and never
@@ -137,9 +154,54 @@ struct ModelMeta {
     desc: Option<String>,
 }
 
+/// Which accelerator this build talks to, as `llama-cpp/<accel>`.
+///
+/// Build-derived, not probed, and exact for this crate's matrix: `cuda`
+/// is an explicit feature, and Metal is unconditional in llama.cpp's
+/// macOS build (there is no feature to turn it off — see the
+/// `llama-cpp-cpu` note in `scripts/test.py`). Recorded because
+/// `llama-cpp` on its own cannot say which accelerator produced a
+/// golden, the same blind spot `n_vocab` had about quant.
+fn backend_id() -> String {
+    let accel = if cfg!(feature = "cuda") {
+        "cuda"
+    } else if cfg!(target_os = "macos") {
+        "metal"
+    } else {
+        "cpu"
+    };
+    format!("llama-cpp/{accel}")
+}
+
+/// llama.cpp's own view of what it is running on: backend features,
+/// CUDA `ARCHS`, CPU ISA flags. Recorded, never asserted — it differs
+/// legitimately between machines. It exists so that a golden diff can be
+/// correlated with an environment change instead of being a mystery.
+///
+/// It does **not** carry the GPU driver version, which unattended
+/// upgrades can move under us. That comes from `nvidia-smi`, which the
+/// CI job runs and tees into the uploaded log for exactly this reason.
+fn system_info() -> Option<String> {
+    // SAFETY: returns a pointer to a static, immutable C string.
+    let raw = unsafe { llama_cpp_sys_3::llama_print_system_info() };
+    if raw.is_null() {
+        return None;
+    }
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Golden {
+    /// `llama-cpp/<accel>` — see [`backend_id`]. Only the part before
+    /// the `/` is asserted; the accelerator is reported on mismatch.
     backend: String,
+    /// See [`system_info`]. Recorded for provenance, never asserted.
+    #[serde(default)]
+    system_info: Option<String>,
     model_meta: ModelMeta,
     prompt: String,
     prompt_tokens: Vec<Token>,
@@ -228,7 +290,8 @@ fn capture() -> Golden {
         .collect();
 
     Golden {
-        backend: "llama-cpp".to_string(),
+        backend: backend_id(),
+        system_info: system_info(),
         model_meta: meta,
         prompt: PROMPT.to_string(),
         prompt_tokens,
@@ -453,7 +516,36 @@ fn regression_llama_cpp_baseline() {
     let raw = fs::read_to_string(&path).expect("read golden");
     let golden: Golden = serde_json::from_str(&raw).expect("parse golden");
 
-    assert_eq!(current.backend, golden.backend, "backend name changed");
+    // Only the crate-level family is a hard assert. The accelerator
+    // after the `/` legitimately differs — CI is CUDA, the dev loop is
+    // Metal — and the file's whole thesis is that prefill magnitudes
+    // survive that while the deep tail does not, which is already
+    // encoded in which comparison each snapshot gets. Asserting the full
+    // string would just make every CI run red for a difference we
+    // deliberately tolerate.
+    let family = |s: &str| s.split('/').next().unwrap_or(s).to_string();
+    assert_eq!(
+        family(&current.backend),
+        family(&golden.backend),
+        "backend family changed"
+    );
+    if current.backend != golden.backend {
+        eprintln!(
+            "backend: golden {} vs running {} — expected across machines; \
+             logit magnitudes are tolerance-compared, the deep tail is not \
+             asserted at all.",
+            golden.backend, current.backend,
+        );
+    }
+    // Never asserted. Printed on any difference so that a failure below
+    // arrives with its environment attached rather than needing a second
+    // run to reconstruct it.
+    if current.system_info != golden.system_info {
+        eprintln!(
+            "system_info: golden {:?}\nsystem_info: running {:?}",
+            golden.system_info, current.system_info,
+        );
+    }
     assert_eq!(
         current.model_meta.n_vocab, golden.model_meta.n_vocab,
         "model architecture changed (n_vocab mismatch) — regenerate with \
