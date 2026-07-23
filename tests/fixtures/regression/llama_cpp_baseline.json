@@ -3,7 +3,8 @@
   "model_meta": {
     "n_vocab": 248320,
     "architecture": "qwen35moe",
-    "context_size": 262144
+    "context_size": 262144,
+    "desc": "qwen35moe 35B.A3B IQ4_XS - 4.25 bpw"
   },
   "prompt": "The quick brown fox",
   "prompt_tokens": [
@@ -86,204 +87,204 @@
     {
       "token": 33075,
       "piece": " jumps",
-      "logit": 18.5069
+      "logit": 18.350859
     },
     {
       "token": 25174,
       "piece": " jumped",
-      "logit": 15.929268
-    },
-    {
-      "token": 369,
-      "piece": " is",
-      "logit": 14.417183
+      "logit": 15.568998
     },
     {
       "token": 198,
       "piece": "\n",
-      "logit": 14.305826
+      "logit": 14.368879
+    },
+    {
+      "token": 369,
+      "piece": " is",
+      "logit": 14.276883
     },
     {
       "token": 11,
       "piece": ",",
-      "logit": 13.670404
+      "logit": 13.662373
     },
     {
       "token": 220,
       "piece": " ",
-      "logit": 12.593064
+      "logit": 12.666435
     },
     {
       "token": 318,
       "piece": " (",
-      "logit": 12.397597
+      "logit": 12.4015255
     },
     {
       "token": 31586,
       "piece": " ______",
-      "logit": 12.323037
+      "logit": 12.393204
     },
     {
       "token": 271,
       "piece": "\n\n",
-      "logit": 12.286577
+      "logit": 12.309646
     },
     {
       "token": 1076,
       "piece": "...",
-      "logit": 12.166843
-    },
-    {
-      "token": 80581,
-      "piece": " leaps",
-      "logit": 12.153879
-    },
-    {
-      "token": 2423,
-      "piece": " ...",
-      "logit": 12.153744
-    },
-    {
-      "token": 1259,
-      "piece": " __",
-      "logit": 12.050466
-    },
-    {
-      "token": 7538,
-      "piece": " jump",
-      "logit": 12.047902
+      "logit": 12.1657
     },
     {
       "token": 7201,
       "piece": " ___",
-      "logit": 11.909442
-    },
-    {
-      "token": 63668,
-      "piece": " _____",
-      "logit": 11.89555
+      "logit": 12.104432
     },
     {
       "token": 13,
       "piece": ".",
-      "logit": 11.876312
+      "logit": 12.101341
     },
     {
-      "token": 321,
-      "piece": " and",
-      "logit": 11.851966
+      "token": 1259,
+      "piece": " __",
+      "logit": 12.0639305
+    },
+    {
+      "token": 80581,
+      "piece": " leaps",
+      "logit": 12.051981
+    },
+    {
+      "token": 2423,
+      "piece": " ...",
+      "logit": 12.047497
+    },
+    {
+      "token": 63668,
+      "piece": " _____",
+      "logit": 12.004202
     },
     {
       "token": 471,
       "piece": " -",
-      "logit": 11.801491
+      "logit": 11.931843
     },
     {
-      "token": 56167,
-      "piece": " hops",
-      "logit": 11.668305
+      "token": 321,
+      "piece": " and",
+      "logit": 11.85112
+    },
+    {
+      "token": 7538,
+      "piece": " jump",
+      "logit": 11.789728
+    },
+    {
+      "token": 29739,
+      "piece": " ____",
+      "logit": 11.653596
     }
   ],
   "logits_step_n": [
     {
       "token": 13477,
       "piece": " brown",
-      "logit": 22.961727
+      "logit": 22.830767
+    },
+    {
+      "token": 11316,
+      "piece": " sentence",
+      "logit": 14.836643
     },
     {
       "token": 271,
       "piece": "\n\n",
-      "logit": 15.778098
+      "logit": 14.569298
     },
     {
       "token": 37550,
       "piece": " fox",
-      "logit": 14.647947
-    },
-    {
-      "token": 198,
-      "piece": "\n",
-      "logit": 14.072224
+      "logit": 13.927601
     },
     {
       "token": 62284,
       "piece": "brown",
-      "logit": 13.323727
-    },
-    {
-      "token": 248044,
-      "piece": "<|endoftext|>",
-      "logit": 13.058687
-    },
-    {
-      "token": 1076,
-      "piece": "...",
-      "logit": 13.037836
-    },
-    {
-      "token": 292,
-      "piece": " b",
-      "logit": 12.994238
-    },
-    {
-      "token": 321,
-      "piece": " and",
-      "logit": 12.93345
-    },
-    {
-      "token": 220,
-      "piece": " ",
-      "logit": 12.695624
-    },
-    {
-      "token": 57271,
-      "piece": " brow",
-      "logit": 12.3567295
-    },
-    {
-      "token": 2423,
-      "piece": " ...",
-      "logit": 12.291879
-    },
-    {
-      "token": 248046,
-      "piece": "<|im_end|>",
-      "logit": 12.244869
-    },
-    {
-      "token": 13,
-      "piece": ".",
-      "logit": 12.222002
-    },
-    {
-      "token": 11,
-      "piece": ",",
-      "logit": 12.205711
-    },
-    {
-      "token": 6105,
-      "piece": " blue",
-      "logit": 11.729216
-    },
-    {
-      "token": 2972,
-      "piece": " **",
-      "logit": 11.594069
-    },
-    {
-      "token": 1402,
-      "piece": "-b",
-      "logit": 11.515375
+      "logit": 13.425165
     },
     {
       "token": 3565,
       "piece": " black",
-      "logit": 11.390913
+      "logit": 12.644411
     },
     {
-      "token": 1363,
-      "piece": " br",
-      "logit": 11.388493
+      "token": 10158,
+      "piece": " Brown",
+      "logit": 12.241826
+    },
+    {
+      "token": 198,
+      "piece": "\n",
+      "logit": 12.209521
+    },
+    {
+      "token": 3841,
+      "piece": " quick",
+      "logit": 12.008394
+    },
+    {
+      "token": 6105,
+      "piece": " blue",
+      "logit": 11.986942
+    },
+    {
+      "token": 93530,
+      "piece": " pang",
+      "logit": 11.958442
+    },
+    {
+      "token": 57271,
+      "piece": " brow",
+      "logit": 11.951618
+    },
+    {
+      "token": 292,
+      "piece": " b",
+      "logit": 11.752019
+    },
+    {
+      "token": 248044,
+      "piece": "<|endoftext|>",
+      "logit": 11.687658
+    },
+    {
+      "token": 5388,
+      "piece": " dog",
+      "logit": 11.487045
+    },
+    {
+      "token": 348,
+      "piece": " *",
+      "logit": 11.341734
+    },
+    {
+      "token": 17676,
+      "piece": " pink",
+      "logit": 11.280069
+    },
+    {
+      "token": 118934,
+      "piece": "棕色",
+      "logit": 11.214523
+    },
+    {
+      "token": 4055,
+      "piece": " random",
+      "logit": 11.200252
+    },
+    {
+      "token": 4022,
+      "piece": " white",
+      "logit": 11.184359
     }
   ]
 }

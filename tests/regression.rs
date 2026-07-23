@@ -17,8 +17,22 @@
 //!
 //! The golden is checked in once and compared on every machine, so it
 //! may only assert things that are actually invariant across backends,
-//! GPU drivers, and llama.cpp point releases. Measured on this model
-//! (Qwen3.6-35B-A3B, IQ4_XS), that line falls in a specific place:
+//! GPU drivers, llama.cpp point releases — and, since CI, **quants**.
+//! The dev box runs Qwen3.6-35B-A3B at IQ4_XS and the CI box runs the
+//! same model at IQ3_S, so "the same model" no longer implies the same
+//! weights. `model_meta.desc` carries llama.cpp's own description,
+//! which names the quant, and it is what decides how much of the golden
+//! is comparable on a given machine. (`n_vocab`, the previous identity
+//! check, cannot see this at all — it is equal across every quant of
+//! one model.)
+//!
+//! Measured against a golden captured on IQ4_XS, running IQ3_S: the
+//! token-level signals below reproduce **exactly**, and only the logit
+//! magnitudes move. That is the empirical basis for the split — the
+//! teeth are quant-invariant, the numbers are not.
+//!
+//! Measured on this model (Qwen3.6-35B-A3B, IQ4_XS), that line falls in
+//! a specific place:
 //!
 //! - **`prompt_tokens`, `tokens`, `pieces` — asserted exactly.** Greedy
 //!   is deterministic, and empirically it is deterministic *across
@@ -108,6 +122,19 @@ struct ModelMeta {
     n_vocab: i32,
     architecture: Option<String>,
     context_size: i32,
+    /// llama.cpp's own model description, which carries the **quant** —
+    /// e.g. `qwen3moe 35B.A3B IQ4_XS - 4.25 bpw`. This is the field that
+    /// distinguishes two quantisations of one model, and `n_vocab` above
+    /// is not: it is identical across every quant of the same weights,
+    /// so on its own it is an *architecture* check wearing an identity
+    /// label. Which quant produced the golden decides how much of the
+    /// golden is comparable — see `regression_llama_cpp_baseline`.
+    ///
+    /// `Option` + `serde(default)` so a golden captured before this
+    /// field existed still parses; `None` is treated as "unknown", and
+    /// unknown is not assumed to match.
+    #[serde(default)]
+    desc: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +177,7 @@ fn capture() -> Golden {
         n_vocab: engine.model().n_vocab(),
         architecture: engine.model().get_meta("general.architecture"),
         context_size: engine.model().context_size(),
+        desc: Some(engine.model().desc()),
     };
 
     let mut step_0_raw: Option<Vec<TokenData>> = None;
@@ -428,20 +456,65 @@ fn regression_llama_cpp_baseline() {
     assert_eq!(current.backend, golden.backend, "backend name changed");
     assert_eq!(
         current.model_meta.n_vocab, golden.model_meta.n_vocab,
-        "model identity changed (n_vocab mismatch) — regenerate with \
+        "model architecture changed (n_vocab mismatch) — regenerate with \
          DRAMA_LLAMA_UPDATE_GOLDEN=1 if this is intentional"
     );
+
+    // Same weights, or merely the same model at a different quant? The
+    // dev box runs IQ4_XS and CI runs IQ3_S, deliberately — Mike sized
+    // down after the default n_ctx went to 32k — so this is the normal
+    // case, not an error, and the split below is what lets one golden
+    // serve both.
+    let same_quant = current.model_meta.desc.is_some()
+        && current.model_meta.desc == golden.model_meta.desc;
+
+    // Quant-INVARIANT, asserted unconditionally. This is the harness's
+    // real teeth and the reason a cross-quant run is still worth
+    // something: `tokens` alone is 32 argmax assertions over a 248k
+    // vocab. Measured IQ4_XS -> IQ3_S: all three reproduce exactly.
+    //
+    // That is one data point, not a theorem. A coarser quant could flip
+    // an argmax mid-stream; if one ever does, record the finding — do
+    // not quietly demote these to advisory, because then the harness
+    // asserts nothing that matters.
     assert_eq!(
         current.prompt_tokens, golden.prompt_tokens,
         "prompt tokenization drifted"
     );
     assert_eq!(current.tokens, golden.tokens, "greedy token stream drifted");
     assert_eq!(current.pieces, golden.pieces, "decoded pieces drifted");
-    assert_topk_close(
-        "logits_step_0",
-        &current.logits_step_0,
-        &golden.logits_step_0,
-    );
+
+    // Quant-SENSITIVE: logit *magnitudes*. Asserted only against the
+    // quant that produced them. Across quants the drift is real and
+    // uninteresting — measured 0.59-0.99 nats with 15/20 shared ids at
+    // prefill, which is a membership change, and per
+    // `.claude/memory/logit_comparability_across_backends.md` a
+    // tolerance widened far enough to swallow a membership change has
+    // stopped testing the thing it exists to test.
+    //
+    // So: same quant, assert as before; different quant, fall back to
+    // the treatment `logits_step_n` already gets — argmax asserted, tail
+    // printed. Recorded, not enforced. Same rule this file already
+    // encodes, applied along one more axis.
+    if same_quant {
+        assert_topk_close(
+            "logits_step_0",
+            &current.logits_step_0,
+            &golden.logits_step_0,
+        );
+    } else {
+        eprintln!(
+            "logits_step_0: golden quant {:?} != running quant {:?} — \
+             magnitudes recorded, not asserted (argmax still is).",
+            golden.model_meta.desc, current.model_meta.desc,
+        );
+        assert_argmax_only(
+            "logits_step_0",
+            &current.logits_step_0,
+            &golden.logits_step_0,
+        );
+    }
+
     assert_argmax_only(
         "logits_step_n",
         &current.logits_step_n,
