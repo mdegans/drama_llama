@@ -28,10 +28,12 @@ runs:
         set -euo pipefail
 
         # Candidates, in priority order: Homebrew on Apple silicon, Homebrew
-        # on Intel / the usual local prefix, and the CMake.app bundle for a
+        # on Intel / the usual local prefix, the per-user prefix that
+        # curl-installers default to (`uv` lands there, and the template
+        # rendering suite shells out to it), and the CMake.app bundle for a
         # .dmg install. Each is added only if it exists, so this stays a
         # no-op on a machine laid out differently.
-        for d in /opt/homebrew/bin /usr/local/bin /Applications/CMake.app/Contents/bin; do
+        for d in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" /Applications/CMake.app/Contents/bin; do
           if [ -d "$d" ]; then
             echo "$d" >> "$GITHUB_PATH"
             PATH="$d:$PATH"
