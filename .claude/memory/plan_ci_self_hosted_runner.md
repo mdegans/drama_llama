@@ -415,13 +415,14 @@ supersede, a running one is not.
 
 ## Open issues
 
-- **#70** — CI cost/runner. Also holds "drop the `push` trigger, keep
-  `pull_request` + `workflow_dispatch`". **Deliberately not done yet**:
-  `workflow_dispatch` does not appear until the workflow exists on the
-  default branch, so with `push` gone and `v0.8.0` unmerged there would be
-  no way to trigger a run at all. Do it when v0.8.0 merges to main. Note
-  the motivation has *shifted* — self-hosted minutes are free, so the
-  reason to drop `push` is now GPU contention, not credit.
+- **#70 — closed, and the `push` trigger STAYS.** Mike's call,
+  2026-07-23: "we can afford to wait 10m each push. It doesn't tie up my
+  mac or balerion. It gives us useful feedback if it fails." The whole
+  premise of that issue was hosted-minutes cost, and self-hosting
+  dissolved it. **Do not re-propose dropping `push`** — it was considered
+  and rejected on its merits, not forgotten. (`paths-ignore` already
+  keeps docs-only pushes free, verified in practice: a `.claude/**`-only
+  push creates no run at all and so cannot even cancel one in flight.)
 - **GPU contention with the rest of the box** — it is not a dedicated CI
   machine. An Actions `concurrency` group only orders jobs *within this
   repo*; it cannot see other repos' runners, and it certainly cannot see
@@ -435,3 +436,33 @@ supersede, a running one is not.
   deliberately not written down in this repo.
 - **#69** — moeflux prefetch telemetry; unrelated to CI, revisit on a17b
   perf work.
+
+## What comes next for CI (Mike, 2026-07-23)
+
+**Coverage, paired with the README rewrite**, so the badge lands in the
+same session it has somewhere to live. His reasoning on badges is worth
+keeping because it shapes what we point one at: a green badge on a crate
+is a good signal, a red one reads as "they bothered once and stopped —
+or it points at main and they got unlucky." So the badge should point at
+something that is *reliably* green, and be worth trusting when it isn't.
+
+Two things that make coverage here unusual, both worth remembering
+before designing that session:
+
+- **Meaningful coverage needs the self-hosted box.** 119 of the tests
+  cannot run without weights and a GPU, and they are the ones exercising
+  the interesting paths — Session, the cache, the dialects, mtmd. A
+  coverage number from the unignored tier alone would systematically
+  understate the tested surface *and* mis-attribute which code is
+  actually exercised. This is a second payoff from the runner that was
+  not part of #70's argument.
+- **It has to go through `scripts/test.py`**, like everything else
+  (#68), or the coverage build silently becomes a fifth configuration
+  nobody else runs. `cargo-llvm-cov` has first-class nextest support
+  (`cargo llvm-cov nextest`), which is the natural fit — but the
+  tier/configuration axes are the script's to own, not the workflow's.
+
+**After 1.0**: stricter branch protection on `main`, with only new
+releases pushed there. That changes the required-checks calculus — see
+the `paths-ignore` caveat in `ci.yml`, since a skipped required check
+blocks a merge rather than passing it.
