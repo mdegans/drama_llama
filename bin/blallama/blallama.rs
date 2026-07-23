@@ -156,10 +156,14 @@ where
 /// llama-cpp wants `is_file()` (one `.gguf` per model); moeflux wants
 /// `is_dir()` (one parent dir per model).
 ///
-/// Uses `metadata()` (which follows symlinks) rather than `file_type()` (which
-/// reports the entry as `symlink` without chasing it). Mike's test layout
-/// symlinks `mlx` / `artifacts` / `root` into a single moeflux model dir, and
-/// the dir itself can be a symlink — both forms must enumerate.
+/// Uses `fs::metadata(path)` rather than `DirEntry::metadata()` or
+/// `file_type()`. **Only the first of the three follows symlinks** — this is a
+/// genuine trap, because `DirEntry::metadata()` reads like the one that would:
+/// it does not, and returns `is_symlink() == true` / `is_file() == false`, so a
+/// symlinked model is silently dropped from the listing. Mike's test layout
+/// symlinks `mlx` / `artifacts` / `root` into a single moeflux model dir, CI
+/// symlinks every `.gguf` in from a shared read-only `/models`, and the dir
+/// itself can be a symlink — all of those forms must enumerate.
 async fn list_entries<P>(
     path: impl AsRef<Path>,
     accept: P,
@@ -170,9 +174,10 @@ where
     let mut read_dir = tokio::fs::read_dir(path).await?;
     let mut models = vec![];
     while let Some(entry) = read_dir.next_entry().await? {
-        // metadata() follows symlinks; symlink_metadata() would not. Skip
-        // entries whose target is missing or unreadable.
-        let Ok(meta) = entry.metadata().await else {
+        // NOT `entry.metadata()`: that one does not traverse the link (it is
+        // `symlink_metadata` in all but name). Skip entries whose target is
+        // missing or unreadable — a dangling link is not a servable model.
+        let Ok(meta) = tokio::fs::metadata(entry.path()).await else {
             continue;
         };
         let model = if let Ok(model) = entry.file_name().into_string() {
