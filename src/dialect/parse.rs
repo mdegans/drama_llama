@@ -723,10 +723,18 @@ impl<'a> Parser<'a> {
                     // Degrade the whole section from the trigger to
                     // the next landmark (or end) into Text — nothing
                     // silently dropped; Session decides severity.
-                    let upto = match self.text[start + 1..]
+                    // Step one *char* past the trigger start — a
+                    // byte step slices mid-char when a derived
+                    // trigger opens with a multi-byte char.
+                    let step = self.text[start..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(1);
+                    let upto = match self.text[start + step..]
                         .find(self.syntax.trigger())
                     {
-                        Some(next) => start + 1 + next,
+                        Some(next) => start + step + next,
                         None => self.text.len(),
                     };
                     let chunk = self.text[start..upto].to_string();
@@ -1056,6 +1064,13 @@ impl<'a> Parser<'a> {
 
         let mut args = serde_json::Map::new();
         loop {
+            // Progress guard: with a degenerate syntax (empty argument
+            // markers and a close that never matches — reachable via
+            // the analyzer's TagWithTagged fallback on an odd template,
+            // or a user-constructed `CallSyntax`), an iteration can
+            // consume zero bytes. Zero progress must be Malformed, not
+            // a hang.
+            let iter_start = self.pos;
             // Function close ends the argument list.
             if !f.close.is_empty() {
                 let ws = self.rest().len() - self.rest().trim_start().len();
@@ -1098,6 +1113,9 @@ impl<'a> Parser<'a> {
 
             if !a.separator.is_empty() {
                 let _ = self.eat(&a.separator.clone());
+            }
+            if self.pos == iter_start {
+                return CallOutcome::Malformed;
             }
         }
 
@@ -1547,7 +1565,14 @@ fn heal_json(body: &str) -> String {
     while i < bytes.len() {
         let b = bytes[i];
         if in_string {
-            out.push(b as char);
+            // Copy whole chars — pushing a raw UTF-8 byte `as char`
+            // reinterprets it as Latin-1 and mojibakes non-ASCII
+            // content into *valid* JSON serde then accepts. The state
+            // bytes (`\`, `"`) are ASCII, so testing the lead byte is
+            // enough.
+            let ch_len =
+                body[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            out.push_str(&body[i..i + ch_len]);
             if escaped {
                 escaped = false;
             } else if b == b'\\' {
@@ -1555,7 +1580,7 @@ fn heal_json(body: &str) -> String {
             } else if b == b'"' {
                 in_string = false;
             }
-            i += 1;
+            i += ch_len;
             continue;
         }
         match b {
@@ -1572,9 +1597,17 @@ fn heal_json(body: &str) -> String {
                 while i < bytes.len() {
                     let c = bytes[i];
                     if c == b'\\' && i + 1 < bytes.len() {
+                        // `\` is ASCII, so i + 1 is a char boundary;
+                        // copy the escaped char whole (it may be
+                        // multi-byte).
+                        let ch_len = body[i + 1..]
+                            .chars()
+                            .next()
+                            .map(char::len_utf8)
+                            .unwrap_or(1);
                         out.push('\\');
-                        out.push(bytes[i + 1] as char);
-                        i += 2;
+                        out.push_str(&body[i + 1..i + 1 + ch_len]);
+                        i += 1 + ch_len;
                         continue;
                     }
                     if c == b'\'' {
@@ -1583,10 +1616,17 @@ fn heal_json(body: &str) -> String {
                     }
                     if c == b'"' {
                         out.push_str("\\\"");
+                        i += 1;
                     } else {
-                        out.push(c as char);
+                        // Whole chars, as above.
+                        let ch_len = body[i..]
+                            .chars()
+                            .next()
+                            .map(char::len_utf8)
+                            .unwrap_or(1);
+                        out.push_str(&body[i..i + ch_len]);
+                        i += ch_len;
                     }
-                    i += 1;
                 }
                 out.push('"');
             }
@@ -2221,6 +2261,48 @@ mod tests {
         assert_eq!(heal_json(r#"{"a": "True None"}"#), r#"{"a": "True None"}"#);
         // Identifier boundaries respected.
         assert_eq!(heal_json(r#"{"a": Truex}"#), r#"{"a": Truex}"#);
+    }
+
+    /// Non-ASCII string content survives every heal path byte-exact —
+    /// the per-byte `as char` copy used to mojibake it ("Zürich" →
+    /// "ZÃ¼rich") into *valid* JSON serde then accepted.
+    #[test]
+    fn heal_json_preserves_non_ascii() {
+        // Double-quoted path.
+        assert_eq!(
+            heal_json(r#"{"city": "Zürich", "n": 1"#),
+            r#"{"city": "Zürich", "n": 1}"#
+        );
+        // Single-quoted path.
+        assert_eq!(heal_json("{'city': 'Zürich'}"), r#"{"city": "Zürich"}"#);
+        // Escape followed by a multi-byte char.
+        assert_eq!(heal_json("{'a': '\\é'}"), r#"{"a": "\é"}"#);
+        // Astral plane (4-byte) content, both quote styles.
+        assert_eq!(heal_json(r#"{"a": "🦙"}"#), r#"{"a": "🦙"}"#);
+        assert_eq!(heal_json("{'a': '🦙'}"), r#"{"a": "🦙"}"#);
+        // End-to-end through the healed-parse entry point.
+        let v = parse_json_healed("{'city': 'Zürich'}").unwrap();
+        assert_eq!(v["city"], serde_json::json!("Zürich"));
+    }
+
+    /// A degenerate `CallSyntax` (empty argument markers, unmatched
+    /// close) must yield Malformed, not consume zero bytes per
+    /// iteration forever. Reachable via the analyzer's TagWithTagged
+    /// fallback on odd templates and via user-constructed syntaxes.
+    #[test]
+    fn tagged_call_degenerate_syntax_terminates() {
+        let mut syntax = CallSyntax::default();
+        syntax.family = Family::TagWithTagged;
+        // Trigger comes from `section_start`; every argument marker
+        // stays empty (the degenerate extraction result) and the close
+        // never appears in the input.
+        syntax.section_start = "<fn>".into();
+        syntax.function.name_suffix = "\n".into();
+        syntax.function.close = "</never>".into();
+        let t = tool("get_weather");
+        // Hung before the progress guard; any non-hanging outcome is
+        // acceptable.
+        let _ = parse_text(&syntax, &[&t], "<fn>f\nx", false, Leniency::Final);
     }
 
     /// JsonNative with array-wrapped parallel calls (upstream's

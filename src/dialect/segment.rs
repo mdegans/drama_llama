@@ -250,22 +250,40 @@ pub(crate) fn calculate_diff_split(left: &str, right: &str) -> DiffSplit {
 }
 
 fn common_prefix_len(a: &str, b: &str) -> usize {
-    // Byte-wise like upstream; slicing callers re-align to char
-    // boundaries implicitly because both sides share the same bytes.
-    a.as_bytes()
+    // Byte-wise like upstream, then rounded down to a char boundary —
+    // two renders can diverge *inside* a multi-byte character that
+    // shares lead bytes (é `C3 A9` vs è `C3 A8`), and callers slice
+    // `&str`s at this length. The boundary must hold in both strings:
+    // at the divergence point the bytes differ, so boundary-ness can
+    // differ too.
+    let mut n = a
+        .as_bytes()
         .iter()
         .zip(b.as_bytes())
         .take_while(|(x, y)| x == y)
-        .count()
+        .count();
+    while n > 0 && !(a.is_char_boundary(n) && b.is_char_boundary(n)) {
+        n -= 1;
+    }
+    n
 }
 
 fn common_suffix_len(a: &str, b: &str) -> usize {
-    a.as_bytes()
+    // Char-boundary rounding as in `common_prefix_len`, measured from
+    // the tails.
+    let mut n = a
+        .as_bytes()
         .iter()
         .rev()
         .zip(b.as_bytes().iter().rev())
         .take_while(|(x, y)| x == y)
-        .count()
+        .count();
+    while n > 0
+        && !(a.is_char_boundary(a.len() - n) && b.is_char_boundary(b.len() - n))
+    {
+        n -= 1;
+    }
+    n
 }
 
 /// The prefix of `full` up to the first occurrence of the common
@@ -443,6 +461,40 @@ mod tests {
         assert_eq!(d.suffix, "");
         assert_eq!(d.left, "");
         assert_eq!(d.right, "<|assistant|>yo\n");
+    }
+
+    #[test]
+    fn diff_split_multibyte_divergence() {
+        // é (C3 A9) and è (C3 A8) share a lead byte; the byte-wise
+        // common prefix ends mid-char and must be rounded back to the
+        // boundary rather than panicking (any non-English template).
+        let d = calculate_diff_split("aé", "aè");
+        assert_eq!(d.prefix, "a");
+        assert_eq!(d.suffix, "");
+        assert_eq!(d.left, "é");
+        assert_eq!(d.right, "è");
+
+        // Same class from the suffix side: shared continuation byte.
+        let d = calculate_diff_split("éa", "èa");
+        assert_eq!(d.prefix, "");
+        assert_eq!(d.suffix, "a");
+        assert_eq!(d.left, "é");
+        assert_eq!(d.right, "è");
+
+        // And through the marker-segmented path.
+        let d =
+            calculate_diff_split("<|user|>café<|end|>", "<|user|>cafè<|end|>");
+        assert_eq!(d.prefix, "<|user|>caf");
+        assert_eq!(d.left, "é");
+        assert_eq!(d.right, "è");
+    }
+
+    #[test]
+    fn common_helpers_multibyte_divergence() {
+        // `until_common_prefix` slices `left[..n]` — n must land on a
+        // char boundary when the divergence is mid-char.
+        assert_eq!(until_common_prefix("x défg", "dé1", "dè2"), "x ");
+        assert_eq!(after_common_suffix("x défg y", "1éfg", "2èfg"), " y");
     }
 
     #[test]

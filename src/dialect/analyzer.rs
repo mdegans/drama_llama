@@ -1437,25 +1437,27 @@ fn extract_args_markers(probe: &Probe, syntax: &mut CallSyntax) {
     } else {
         syntax.per_call_end.clone()
     };
-    let prefix_pos = if prefix_marker.is_empty() {
-        0
+    // Cut past the marker only when it is actually *found* — the old
+    // shape skipped `marker.len()` unrelated bytes on a miss
+    // (`rfind(..).unwrap_or(0)` then an unconditional advance), which
+    // both chopped real content and could slice mid-char on
+    // non-ASCII.
+    let prefix_cut = if prefix_marker.is_empty() {
+        diff.prefix.as_str()
     } else {
-        diff.prefix.rfind(&prefix_marker).unwrap_or(0)
+        match diff.prefix.rfind(&prefix_marker) {
+            Some(pos) => &diff.prefix[pos + prefix_marker.len()..],
+            None => diff.prefix.as_str(),
+        }
     };
-    let suffix_pos = if suffix_marker.is_empty() {
-        diff.suffix.len()
+    let suffix_cut = if suffix_marker.is_empty() {
+        diff.suffix.as_str()
     } else {
-        diff.suffix
+        &diff.suffix[..diff
+            .suffix
             .find(&suffix_marker)
-            .unwrap_or(diff.suffix.len())
+            .unwrap_or(diff.suffix.len())]
     };
-    let prefix_cut = &diff.prefix[(prefix_pos
-        + if prefix_pos > 0 || !prefix_marker.is_empty() {
-            prefix_marker.len().min(diff.prefix.len() - prefix_pos)
-        } else {
-            0
-        })..];
-    let suffix_cut = &diff.suffix[..suffix_pos];
 
     let mut args_start = until_common_prefix(prefix_cut, "{}", "{\"first\":");
     let args_end = after_common_suffix(suffix_cut, "{}", "\"XXXX\"}");
