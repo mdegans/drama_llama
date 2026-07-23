@@ -1,4 +1,4 @@
-# CI for drama_llama (#51).
+# CI for drama_llama (#51, #70).
 #
 # Everything here delegates to `scripts/test.py`, which the justfile and the
 # git hooks also call. That is the whole design (#68): the tests that gate a
@@ -6,26 +6,34 @@
 # drift from the other by editing only one of them. If a job below needs a new
 # flag, add it to the script — do not inline a cargo invocation here.
 #
-# RUNNERS: self-hosted, pulled forward from next session (Mike's box: 32 cores,
-# 128 GiB, a 3090). This is deliberate — hosted GH Actions minutes are a
-# limited budget Mike has run out before, and self-hosted minutes are free.
-# Until a runner is registered with matching labels the workflow simply QUEUES
-# (it does not fail and it does not touch hosted minutes), which is the point:
-# a push now costs nothing and waits for the box. See
-# `.claude/memory/plan_ci_self_hosted_runner.md` for the standup plan and the
-# open questions this does NOT yet answer:
-#   - the labels below must match what the runner is registered with;
-#   - macOS is a self-hosted VM whose Metal support is unverified — if Metal
-#     doesn't work in the VM, generation testing is NVIDIA-only and this leg
-#     stays a compile gate (or moves back to hosted `macos-latest`);
-#   - the 3090 box unlocks what no hosted runner can — `check` without `--ci`
-#     (CUDA), and the `ignored` model-test tier — but those need a `concurrency`
-#     group (a 30B model fits once; `full` caps test-threads=1) and are
-#     next-session work, not turned on here.
+# RUNNERS: self-hosted, on Mike's box — 32 cores, 128 GiB, a 3090. Two
+# payoffs (#70). Hosted Actions minutes are a budget he has exhausted before,
+# and self-hosted ones are free; more importantly, no hosted runner can hold a
+# 13 GB model, so on hosted infrastructure CI could only ever be a compile
+# gate. The `model` job below is the thing that budget bought.
 #
-# SCOPE TODAY (unchanged): model-free. The commands still run `check --ci` and
-# the `unignored` tier only; no weights, no GPU. Broadening that is gated on the
-# runner existing and is designed next session.
+# WHAT RUNS WHERE, and why it is asymmetric:
+#
+#   fmt     linux    seconds
+#   gate    both     every feature configuration compiles, test targets too
+#   test    both     the unignored tier — no weights on the GPU
+#   model   linux    the #[ignore]'d tier: real weights, real CUDA
+#
+# `model` is Linux-only on purpose. The macOS leg is a Parallels VM whose
+# Metal support is unverified, and the moeflux configuration would want the
+# expert shards mounted into it — tens of GB for a second copy of what the
+# host already has. So generation testing is NVIDIA-only for now and macOS
+# stays a compile-and-fast-tests gate. Metal generation is covered by the
+# pre-commit hook on the machine we actually develop on.
+#
+# BUILD PARALLELISM is capped at 16 of 32 cores (`CARGO_BUILD_JOBS`, which
+# cargo also forwards to build scripts as `NUM_JOBS`, which is what the
+# `cmake` crate reads for llama.cpp's own build). The box does other work.
+#
+# Do NOT add `NEXTEST_TEST_THREADS` to cap *test* parallelism the same way:
+# the environment variable overrides the `full` profile's `test-threads = 1`
+# (`.config/nextest.toml`), which is the only thing keeping two 13 GB models
+# off one 24 GB card. Cap builds, never tests.
 
 name: CI
 
@@ -39,6 +47,10 @@ env:
   CARGO_TERM_COLOR: always
   # A CI failure should be readable without re-running with more verbosity.
   RUST_BACKTRACE: 1
+  # See BUILD PARALLELISM above. `CMAKE_BUILD_PARALLEL_LEVEL` is belt and
+  # braces: it caps cmake directly, whichever generator it picks.
+  CARGO_BUILD_JOBS: "16"
+  CMAKE_BUILD_PARALLEL_LEVEL: "16"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -48,8 +60,13 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: [self-hosted, linux]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # See `clean: false` in the `gate` job — this one shares the same
+          # workspace, so it has to agree or it wipes the others' build.
+          clean: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -60,6 +77,10 @@ jobs:
   gate:
     name: permutations (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
+    # Generous because the FIRST run on a cold workspace builds llama.cpp
+    # twice on Linux — once with CUDA (`llama-cpp`) and once without
+    # (`llama-cpp-cpu`, its own target dir). Later runs reuse both.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -70,29 +91,36 @@ jobs:
             runner: [self-hosted, macos]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
         with:
-          # llama-cpp-sys-3 builds llama.cpp through cmake; without a cache
-          # key that separates the two runners they fight over one entry.
-          key: ${{ matrix.name }}-gate
-      # `--ci` drops the configurations a runner cannot have: `llama-cpp`
-      # carries `cuda` on Linux and wants nvcc. It keeps `trait-layer` (no C
-      # dependency at all), `llama-cpp-cpu`, and — on macOS only — the moeflux
-      # and both-backends configurations, which compile Metal kernels but need
-      # no weights to do it. (On the 3090 box with a CUDA toolchain installed,
-      # next session may drop `--ci` here to cover the `llama-cpp`/`cuda`
-      # config — untestable on any hosted runner.)
+          # `clean: true` (the default) runs `git clean -ffdx`, which deletes
+          # `target/` — and on a self-hosted runner the workspace persists
+          # between runs, so that is the difference between reusing the
+          # llama.cpp build and paying 20-40 minutes for it every single run.
+          # Keeping it is also why there is no `Swatinem/rust-cache` here any
+          # more: nothing to restore, and a CUDA llama.cpp build does not fit
+          # in a 10 GB Actions cache anyway.
+          #
+          # The cost is that a file deleted on a branch lingers in the
+          # workspace — notably a removed `tests/*.rs`, which cargo would keep
+          # compiling. If a failure ever looks like it is testing code that no
+          # longer exists, that is this; `git clean -ffdx` on the box clears it.
+          clean: false
+      - uses: dtolnay/rust-toolchain@stable
+      # No `--ci`: that flag drops the configurations a *hosted* runner cannot
+      # build, and the whole point of this box is that it can. It has nvcc, so
+      # the `llama-cpp` configuration — llama.cpp + CUDA, untestable anywhere
+      # else — is now covered here rather than only on Mike's laptop.
       #
       # `--all-targets` is the point of this job: a configuration building as
       # a *library* is not the same claim as its test targets building. #68
       # was filed because moeflux-only compiled as a library while ~38 of its
       # test targets had never been built by anyone.
-      - run: python3 scripts/test.py check --ci
+      - run: python3 scripts/test.py check
 
   test:
     name: unignored (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -103,19 +131,79 @@ jobs:
             runner: [self-hosted, macos]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}-test
+          clean: false
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
-      # `llama-cpp-cpu`, not `llama-cpp`: identical feature set minus `cuda`.
-      # This is the same tier the pre-commit hook runs, on two OSes instead of
-      # whichever one the committer happens to own.
+      - name: link model weights
+        uses: ./.github/actions/link-models
+      # `llama-cpp-cpu`, not `llama-cpp`: identical feature set minus `cuda`,
+      # in its own target dir. Running the fast tier here rather than under
+      # CUDA is deliberate — four of these tests DO load `models/model.gguf`,
+      # but with `n_gpu_layers = 0` (see `load_test_model_cpu`), so the tier
+      # stays fully parallel and touches no VRAM. Under `--features cuda` they
+      # would race the `model` job for the card. Everything CUDA-shaped is in
+      # the `ignored` tier, which is `model`'s job.
       - run: python3 scripts/test.py run -c llama-cpp-cpu -t unignored
+      # Named exactly, not the whole directory: `clean: false` means
+      # `target/test-logs/` accumulates every mode this box has ever run,
+      # and an artifact holding another job's stale log is worse than none.
+      # (The log lives under `target/`, never the config's own target dir —
+      # see `log_path` in scripts/test.py.)
       - name: upload logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ matrix.name }}
-          path: target/test-logs/
+          path: target/test-logs/llama-cpp-cpu-unignored.log
+          if-no-files-found: ignore
+
+  model:
+    name: model tests (linux, cuda)
+    runs-on: [self-hosted, linux]
+    # Don't spend the card on a tree that isn't even formatted. Deliberately
+    # NOT `needs: [test]`: that job is a matrix, so depending on it would make
+    # the GPU tier hostage to the macOS VM being up.
+    needs: [fmt]
+    # The scarce resource is one 3090, and unlike the workflow-level group
+    # above this one is not keyed on the ref — a second PR must queue rather
+    # than land on a busy card. `cancel-in-progress: false` because a
+    # half-finished model tier tells you nothing. (This only covers jobs in
+    # THIS repo; other repos' runners on the same box are a separate problem
+    # and a machine-level lock, not an Actions concurrency group.)
+    concurrency:
+      group: gpu-${{ github.repository }}
+      cancel-in-progress: false
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      # Printed, not asserted: when a test dies of `unable to allocate CUDA0
+      # buffer`, the first question is what else was resident.
+      - name: gpu
+        run: nvidia-smi
+      - name: link model weights
+        uses: ./.github/actions/link-models
+      # `-c llama-cpp` is the CUDA configuration on Linux, and `-t ignored`
+      # is the tier that loads real weights — 119 tests, ~11 minutes on Mike's
+      # Mac. Serialized to one at a time by the `full` nextest profile.
+      #
+      # `-x` drops the suites whose weights are not on this box. Gemma 4
+      # (17 GB) and gpt-oss (13 GB) are not downloaded, and both `panic!`
+      # rather than skip when the file is absent, so they cannot simply be
+      # left to no-op. `media_e2e_gemma` needs the same Gemma weights but
+      # lives in the lib binary, hence a test name rather than a binary name.
+      # Delete an `-x` the day its weights land on the box.
+      - run: >
+          python3 scripts/test.py run -c llama-cpp -t ignored
+          -x session_gemma4 -x session_gptoss -x media_e2e_gemma
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-model
+          path: target/test-logs/llama-cpp-ignored.log
           if-no-files-found: ignore

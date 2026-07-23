@@ -25,6 +25,7 @@ Usage
     scripts/test.py run --tier all            # llama-cpp, everything
     scripts/test.py run -c moeflux --tier all # moeflux-only, everything
     scripts/test.py run --filter strawberry   # one test, any tier
+    scripts/test.py run -t ignored -x session_gptoss   # minus a suite
     scripts/test.py check --config all        # the permutation gate
     scripts/test.py configs                   # what exists, and why
 """
@@ -313,6 +314,34 @@ def warn_slow_variant(config: Config, tier: str, model: str) -> None:
         )
 
 
+def filterset(include: str | None, exclude: list[str]) -> str:
+    """The nextest filterset for one include substring and N excludes.
+
+    A substring is matched against test AND binary names, because the
+    thing a caller names may be either — `session_gemma4` is a binary,
+    `media_e2e_gemma` is a test inside the lib binary, and the caller
+    should not have to know which.
+
+    Exclusion exists for machines with a *partial* model directory: the
+    CI box has `models/model.gguf` and its projector, not the Gemma 4 or
+    gpt-oss weights, and the suites that need those `panic!` rather than
+    skip. Expressed as a filterset rather than as a runtime skip on
+    purpose — a skipped-because-absent test that reports itself green is
+    exactly the silent coverage loss #68 exists to prevent, whereas an
+    excluded one shows up in nextest's own "N tests run, M skipped" line
+    and in the printed command.
+    """
+    expr = (
+        f"test(~{include}) + binary(~{include})" if include else "all()"
+    )
+    if exclude:
+        dropped = " + ".join(
+            f"test(~{name}) + binary(~{name})" for name in exclude
+        )
+        expr = f"({expr}) - ({dropped})"
+    return expr
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not DRY_RUN:
         require_nextest()
@@ -339,11 +368,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         # so the suites' block/emission dumps are visible on a pass and
         # not only on a failure.
         cmd += TIERS["all"] + ["--no-capture"]
-        cmd += ["-E", f"test(~{args.filter}) + binary(~{args.filter})"]
         name = f"{config.name}-{sanitize(args.filter)}"
     else:
         cmd += TIERS[args.tier]
         name = f"{config.name}-{args.tier}"
+
+    if args.filter or args.exclude:
+        cmd += ["-E", filterset(args.filter, args.exclude)]
 
     return run_command(cmd, config.target_dir(), log_path(name))
 
@@ -475,6 +506,17 @@ def main() -> int:
         "--filter",
         help="substring matched against test AND binary names; implies "
         "the `all` tier and uncaptured output",
+    )
+    p_run.add_argument(
+        "-x",
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="substring of a test OR binary name to leave out; repeatable "
+        "and composes with --filter. For a machine with only some of the "
+        "weights: the CI box has models/model.gguf but not the Gemma 4 or "
+        "gpt-oss files, and those suites panic rather than skip",
     )
     add_common(p_run)
     p_run.set_defaults(func=cmd_run)

@@ -165,14 +165,33 @@ its "Starting N tests ... (M skipped)" line. Cross-check the two; an
 off-by-one in the guard number sends the next person hunting a test that
 was never there.
 
-## CI (#51) is blocked, and not on this
+## `-x/--exclude`: for a machine with only *some* of the weights
 
-`[patch.crates-io] misanthropic = { path = "../misanthropic/misanthropic" }`
-is a sibling working copy. On a runner it does not exist and cargo fails at
-manifest resolution, before any feature set or target. The gate is ready
-(`scripts/test.py check --ci`); the patch has to go first — ideally by
-publishing `misanthropic 1.0.0-alpha.13`, as the Cargo.toml comment already
-plans. Details in the [#51] comment.
+Added 2026-07-23 for the self-hosted runner. `-x NAME` drops everything
+whose test **or** binary name contains `NAME`, repeatable, composing with
+`--filter`:
+
+    scripts/test.py run -t ignored -x session_gptoss -x media_e2e_gemma
+
+It exists because the CI box has `models/model.gguf` and its projector but
+not the Gemma 4 or gpt-oss weights, and those suites **`panic!` rather than
+skip** when the file is absent. A filterset rather than a runtime skip on
+purpose: a test that reports itself green because its weights were missing
+is the exact silent coverage loss this whole memo is about, whereas an
+excluded one shows in nextest's "N tests run, M skipped" line and in the
+printed command. Same reason `--filter` matches both name kinds — the
+caller shouldn't have to know that `session_gemma4` is a binary while
+`media_e2e_gemma` is a test inside the lib binary.
+
+## CI (#51, #70) — landed, and now runs the model tier
+
+The old blocker (a `[patch.crates-io]` pointing misanthropic at a sibling
+working copy, which does not exist on a runner) is gone; the patch was
+dropped once `misanthropic 1.0.0-alpha.12` shipped. CI landed in `5218aea`
+and moved to a self-hosted box on 2026-07-23, which is what made the
+weights-dependent tiers automatable at all. See
+[[plan_ci_self_hosted_runner]] for the box, the weights layout, the
+`clean: false` / no-rust-cache reasoning, and what the `model` job skips.
 
 [#68]: https://github.com/mdegans/drama_llama/issues/68
 [#51]: https://github.com/mdegans/drama_llama/issues/51

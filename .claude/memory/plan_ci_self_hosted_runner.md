@@ -18,89 +18,131 @@ The workflow (`.github/workflows/ci.yml`) went green on its first push,
   model.** They are *metadata* tests, not generation. Each took ~11s to
   fail, which is the puzzle (see below).
 
-### The four model-needing "unignored" tests — two things to fix/understand
+### The four model-needing "unignored" tests — RESOLVED 2026-07-23, and the
+### first reading of them was wrong
 
-1. **They violate the tier invariant.** The whole premise (see
-   [[test_topology]], `.githooks/pre-commit`, `.config/nextest.toml`) is
-   that the *unignored* tier loads no model. Four unignored tests that
-   need `models/model.gguf` means either they are mis-classified and want
-   `#[ignore]`, or the invariant needs a stated exception. They pass
-   locally only because `models/model.gguf` exists there. **Find them**
-   (they'll be the ones failing in the CI `test` job logs — uploaded as
-   `test-logs-*` artifacts on failure) and decide: `#[ignore]` them, or
-   give CI a tiny real GGUF fixture so metadata loading has something to
-   read.
-2. **The 11s-to-fail is unexplained.** A missing model should fail fast.
-   11s suggests something is actually *loading* — a broken symlink chased,
-   a GGUF metadata read attempted against a placeholder, or a retry/timeout
-   somewhere in `Model::from_file`. Hypothesis only; do not build on it.
-   Worth understanding before deciding the fix, because "give CI a fixture"
-   vs "`#[ignore]` them" depends on what those 11s are.
+They are `llama_cpp::model::tests::{test_model, test_metadata,
+test_model_desc, test_recommended_sampling}`, and they are **not**
+mis-classified. All four go through `load_test_model_cpu`
+(`src/llama_cpp/model.rs`), which loads with **`n_gpu_layers = 0` on
+purpose** — the doc comment records the failure that motivated it, two of
+three dying with "unable to allocate CUDA0 buffer" on a 24 GB card when
+the parallel runner stacked them.
 
-## Next session: stand up the self-hosted runner
+So the tier invariant is **"the unignored tier puts nothing on the GPU"**,
+not "the unignored tier loads no model". Under that reading these four are
+correct as written: metadata-only, VRAM-free, safe at full parallelism,
+and cheap on RAM because llama.cpp mmaps and all four map the same file.
+The earlier note here — `#[ignore]` them or give CI a fixture — would have
+been a regression. Do not act on it; the fix was to give CI the weights.
 
-The box: **32 cores, 128 GiB RAM, a 3090.** Already used for other
-projects. Two payoffs (from #70): free minutes (Mike has exhausted GH
-Actions credit before) and — the bigger one — it can run the *model*
-tests, which no hosted runner can. That turns CI from a compile gate into
-a real regression gate, and is the only way the `ignored` tier and CUDA
-ever get automated.
+**The 11s-to-fail is still unexplained** and is now moot for CI (with
+`models/model.gguf` linked they pass). Curious, not load-bearing: three
+took ~11.0s to fail on an *absent* file while the fourth took 0.12s.
+Best guess is backend/device enumeration on first use, unverified.
 
-### The workflow is ALREADY switched to self-hosted (`b426f3c`+, night of
-### 2026-07-22)
+## The runner is up (2026-07-23)
 
-Done ahead of standing up the runner, to keep Mike's next push off hosted
-minutes. `ci.yml` now targets `[self-hosted, linux]` and
-`[self-hosted, macos]` for all three jobs. **Consequence to expect:** with
-no runner registered yet, pushed runs sit **queued/pending** — they do not
-fail and do not spend hosted minutes. That is intended. When the runner
-registers, pending runs may pick up; cancel the stale ones if they're
-noise.
+The box — **32 cores, 128 GiB RAM, a 3090** — is registered, CUDA toolkit
+installed, rootless nvidia-docker set up (our jobs run *outside* a
+container, so that part is for other repos). Its first run reproduced the
+hosted result exactly: same four failures.
 
-**So the first thing on the box is register a runner whose labels match**
-(`self-hosted` + `linux` / `macos`). If you pick different labels, edit the
-matrix `runner:` arrays to match — GitHub matches labels literally.
+Weights live **outside the workspace**, at
+`~/src/drama_llama/models` for the `ghrunner-drama-llama` account:
 
-### Linux leg (the straightforward one)
+    Qwen3.6-35B-A3B-UD-IQ3_S.gguf          13G   (hardlinked to model.gguf)
+    Qwen3.6-35B-A3B-UD-IQ3_S.mmproj.gguf  861M   (→ model.mmproj.gguf)
 
-Mike's stated plan: new dedicated account, rootless Docker, a systemd unit
-for the Docker side and one for the GH runner itself, then register the
-runner. The workflow side already calls `scripts/test.py` — the #68
-invariant holds, the runner runs what the hook runs. Model-test jobs (when
-added — not on yet) **need a `concurrency` group**: a 30B-class model
-barely fits once, the `full` nextest profile caps `test-threads = 1`, and
-two PRs must not land on the GPU at the same time.
+**Note the quant differs from the laptop's** — the box is **IQ3_S**, Mike's
+Mac is **IQ4_XS**. Two consequences. Generation assertions that depend on
+output quality may behave differently on the box than they do locally, so a
+CI-only failure in a content assertion is a quant suspect before it is a
+regression. And `test_recommended_sampling_across_models` names
+`Qwen3.6-35B-A3B-UD-IQ4_XS.gguf` literally, so on the box it skips *all
+three* of its cases and passes vacuously.
 
-### macOS leg (the uncertain one)
+No `.sampling.toml` sidecar is shipped: the run generates it from GGUF
+metadata, which exercises that path for free.
 
-Trickier: a new macOS VM, and **it is unknown whether Metal works inside
-the VM.** If it does not, the moeflux / Metal generation tests cannot run
-there and generation testing is **NVIDIA-only**; the macOS leg stays
-compile-gate (`check --ci`) like the hosted one. Decide this by testing
-Metal in the VM before wiring any generation job to it — do not assume
-either way.
+### What the `model` job does, and what it deliberately skips
 
-## The context-budget snag (may force a smaller model)
+`ci.yml`'s `model` job is Linux-only: `-c llama-cpp` (CUDA on Linux)
+`-t ignored`, serialized by the `full` nextest profile, behind a
+**`concurrency` group not keyed on the ref** so a second PR queues instead
+of landing on a busy card.
 
-Default context is **32k** (`cli::DEFAULT_N_CTX`) and the test model is
-**~17 GiB**. Unknown whether that context fits on a **3090 (24 GB)**,
-*especially with the image/mtmd model sidecar also resident*. If it does
-not, the runner needs a **smaller Qwen**, which **would change some test
-expectations** (token counts, specific-output assertions, metadata
-values).
+Three suites are excluded with `test.py -x` because their weights are not
+on the box — Gemma 4 (17 GB) and gpt-oss (13 GB) — and, importantly, those
+tests **`panic!` rather than skip** when the file is missing, so they
+cannot be left to no-op: `session_gemma4`, `session_gptoss`, and
+`media_e2e_gemma` (same Gemma weights, but inside the lib binary, hence a
+test name rather than a binary name). Expected count: **99 of 119** ignored
+tests. Delete an `-x` the day its weights land on the box.
 
-Mike is **not opposed** to switching: a smaller model is faster, and
-grammar-constrained tool calling should still work fine — which is the
-capability the interesting tests exercise. So if 32k + 17 GiB + sidecar
-does not fit, the move is: pick a smaller Qwen, re-baseline the affected
-test expectations against it, and note in each what model it assumes.
-Don't fight the VRAM; change the model.
+`-x` is a filterset, not a runtime skip, on purpose — an absent-weights
+test that reports itself green is exactly the silent coverage loss #68
+exists to prevent.
+
+### Self-hosted changes two Actions habits
+
+- **`clean: false` on every checkout.** The default runs `git clean -ffdx`,
+  which deletes `target/` — and a self-hosted workspace persists, so that
+  default is the difference between reusing the llama.cpp build and paying
+  20-40 min for it every run. Must be uniform across jobs: with one runner
+  they share one workspace, so a single `clean: true` job wipes the others'
+  build. Cost: a file deleted on a branch lingers, notably a removed
+  `tests/*.rs` that cargo keeps compiling. `git clean -ffdx` on the box
+  clears it.
+- **No `Swatinem/rust-cache`.** Nothing to restore once the workspace
+  persists, and a CUDA llama.cpp build does not fit in a 10 GB Actions
+  cache.
+
+Build parallelism is capped at 16 of 32 cores (`CARGO_BUILD_JOBS`, which
+cargo forwards to build scripts as `NUM_JOBS`, which is what the `cmake`
+crate reads for llama.cpp). **Never cap tests the same way**:
+`NEXTEST_TEST_THREADS` overrides the `full` profile's `test-threads = 1`,
+which is the only thing keeping two models off one card.
+
+### macOS leg: still the uncertain one
+
+A Parallels VM, mid-setup, Xcode and friends still to install. **Metal in
+the VM is unverified** and deliberately out of scope: moeflux would want
+the expert shards mounted in, tens of GB for a second copy of what the host
+already has. So generation testing is **NVIDIA-only** and macOS stays a
+compile-and-fast-tests gate; Metal generation is covered by the pre-commit
+hook on the machine we develop on.
+
+Open on macOS: the `test` job's four metadata tests need
+`models/model.gguf` there too. The cheap answer is a **read-only Parallels
+share of the host's models directory**, pointed at with
+`DRAMA_LLAMA_MODELS` in the runner's environment (the `link-models`
+composite action reads it) — no second 13 GB copy.
+
+## VRAM: probably fine, watch the first run
+
+Default context is **32k** (`cli::DEFAULT_N_CTX`). IQ3_S is ~13 GiB and a
+32k KV cache for this architecture is order 3 GiB, so ~16 of the 3090's 24
+GB — it should fit, mmproj included. If it does not, the standing decision
+(Mike's, and unchanged) is **change the model, don't fight the VRAM**: pick
+a smaller Qwen and re-baseline the affected expectations, noting in each
+what model it assumes. A smaller model is also faster, and
+grammar-constrained tool calling — the capability the interesting tests
+exercise — should still work.
 
 ## Open issues
 
-- **#70** — CI cost/runner. Mike added a note there this evening. Also
-  holds the "drop the `push` trigger, keep `pull_request` +
-  `workflow_dispatch`" change — do that first thing (one line), since the
-  `push` leg was only there to validate the workflow and it has.
+- **#70** — CI cost/runner. Also holds "drop the `push` trigger, keep
+  `pull_request` + `workflow_dispatch`". **Deliberately not done yet**:
+  `workflow_dispatch` does not appear until the workflow exists on the
+  default branch, so with `push` gone and `v0.8.0` unmerged there would be
+  no way to trigger a run at all. Do it when v0.8.0 merges to main. Note
+  the motivation has *shifted* — self-hosted minutes are free, so the
+  reason to drop `push` is now GPU contention, not credit.
+- **GPU contention across repos** — the box serves several. An Actions
+  `concurrency` group only orders jobs within this repo; nothing stops
+  another repo's runner from taking the card at the same time. Mike has
+  said he wants to elaborate on this off-tracker. A machine-level lock
+  (flock around the model job) is the shape of the answer if one is needed.
 - **#69** — moeflux prefetch telemetry; unrelated to CI, revisit on a17b
   perf work.

@@ -1,0 +1,52 @@
+name: link model weights
+description: >
+  Symlink this runner's GGUF weights into the workspace `models/`, where
+  every model-backed test looks for them (`CARGO_MANIFEST_DIR/models/...`).
+
+# Why link rather than download or copy: the weights are 13-17 GB each and
+# the workspace is disposable. They live once, outside it, and every run
+# points at that copy. `actions/checkout` with `clean: true` would delete
+# these symlinks; recreating them is idempotent and costs nothing, so this
+# runs unconditionally rather than trying to detect that.
+#
+# Only `*.gguf` is linked. The `.sampling.toml` and `.template.jinja`
+# sidecars are *written* by a test run — that the sampling sidecar is
+# generated from GGUF metadata is itself under test — and a symlink there
+# would write through into the shared directory that every future run reads.
+#
+# The source directory defaults to `~/src/drama_llama/models`, which is how
+# the Linux runner is laid out. A runner whose layout differs sets
+# `DRAMA_LLAMA_MODELS` in its own environment (the runner's `.env`) rather
+# than editing this file — notably the macOS VM, where the sensible source
+# is a read-only share of the host's models directory rather than a second
+# 13 GB copy inside the VM.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        src="${DRAMA_LLAMA_MODELS:-$HOME/src/drama_llama/models}"
+
+        if [ ! -d "$src" ]; then
+          echo "::error::no model directory at $src — set DRAMA_LLAMA_MODELS" \
+            "in this runner's environment to point at one"
+          exit 1
+        fi
+
+        shopt -s nullglob
+        for f in "$src"/*.gguf; do
+          ln -sfn "$f" "models/$(basename "$f")"
+        done
+
+        # Every model-backed test in the tree resolves through this name;
+        # a partial model directory is fine and expected (the suites whose
+        # weights are absent are excluded by name in the workflow), but a
+        # missing `model.gguf` means nothing at all will run.
+        if [ ! -e models/model.gguf ]; then
+          echo "::error::$src has no model.gguf"
+          exit 1
+        fi
+
+        ls -l models/
