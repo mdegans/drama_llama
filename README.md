@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/mdegans/drama_llama/graph/badge.svg)](https://codecov.io/gh/mdegans/drama_llama)
-[![tests](https://img.shields.io/badge/tests-587-blue)](#testing)
+[![tests](https://img.shields.io/badge/tests-593-blue)](#testing)
 [![license](https://img.shields.io/badge/license-RAIL--S-lightgrey)](https://github.com/mdegans/drama_llama/blob/main/LICENSE.md)
 
 `drama_llama` runs language models on your own hardware behind an API shaped
@@ -24,70 +24,76 @@ distribution before a choice is made. Malformed JSON is not unlikely, it is
 unreachable.
 
 ```rust,no_run
-# // Compiled and type-checked by CI; not run here, since it wants weights.
-# #[cfg(all(feature = "llama-cpp", feature = "json-schema"))]
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-use drama_llama::{FromPath, LlamaCppOptions, LlamaCppSession, Prompt, Role};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+// Compiled and type-checked by CI — not run, since it wants weights. The
+// cfg gate keeps the doctest building when these features are off.
+#[cfg(all(feature = "llama-cpp", feature = "json-schema"))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use drama_llama::{
+        FromPath, LlamaCppOptions, LlamaCppSession, Prompt, Role,
+    };
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
 
-/// Field order is generation order. `summary` is written first, so the
-/// model has already said what the bug *is* before it has to commit to a
-/// severity — each field is context for the next.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct Triage {
-    /// One-line, imperative summary of the underlying problem.
-    summary: String,
-    /// How bad it is, chosen after summarizing.
-    severity: Severity,
-    /// Concrete, ordered steps to reproduce.
-    repro_steps: Vec<String>,
-    /// True when the report says the behavior regressed.
-    is_regression: bool,
+    /// Field order is generation order. `summary` is written first, so
+    /// the model has already said what the bug *is* before it has to
+    /// commit to a severity — each field is context for the next.
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct Triage {
+        /// One-line, imperative summary of the underlying problem.
+        summary: String,
+        /// How bad it is, chosen after summarizing.
+        severity: Severity,
+        /// Concrete, ordered steps to reproduce.
+        repro_steps: Vec<String>,
+        /// True when the report says the behavior regressed.
+        is_regression: bool,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    #[schemars(rename_all = "snake_case")]
+    enum Severity {
+        Low,
+        Medium,
+        High,
+        Critical,
+    }
+
+    let mut session = LlamaCppSession::from_path_with(
+        "models/model.gguf".into(),
+        LlamaCppOptions::default().with_n_ctx(8192),
+    )?;
+
+    let prompt = Prompt::default()
+        .system("You triage incoming bug reports.")
+        // A worked exemplar teaches field *depth* — that `repro_steps`
+        // should be concrete and non-empty — which a bare schema cannot
+        // express. It seeds the schema too, so the two cannot drift apart.
+        .add_examples([(
+            "Login does nothing in Safari. Started after last week's release.",
+            Triage {
+                summary: "Login button unresponsive on Safari".into(),
+                severity: Severity::High,
+                repro_steps: vec![
+                    "Open the app in Safari".into(),
+                    "Click 'Log in'; observe no network request".into(),
+                ],
+                is_regression: true,
+            },
+        )])?
+        .add_message((Role::User, "Checkout total shows $0.00 on mobile."))?;
+
+    // The response has the Anthropic shape — content, usage, stop
+    // reason — and `.json()` parses its text block, skipping any
+    // leading thought blocks. The parse cannot fail on malformed JSON:
+    // the model was not able to emit any.
+    let triage: Triage = session.complete_response(&prompt)?.json()?;
+    println!("{triage:#?}");
+    Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-#[schemars(rename_all = "snake_case")]
-enum Severity {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-let mut session = LlamaCppSession::from_path_with(
-    "models/model.gguf".into(),
-    LlamaCppOptions::default().with_n_ctx(8192),
-)?;
-
-let prompt = Prompt::default()
-    .system("You triage incoming bug reports.")
-    // A worked exemplar teaches field *depth* — that `repro_steps` should
-    // be concrete and non-empty — which a bare schema cannot express. It
-    // seeds the schema too, so the two cannot drift apart.
-    .add_examples([(
-        "Login does nothing in Safari. Started after last week's release.",
-        Triage {
-            summary: "Login button unresponsive on Safari".into(),
-            severity: Severity::High,
-            repro_steps: vec![
-                "Open the app in Safari".into(),
-                "Click 'Log in'; observe no network request".into(),
-            ],
-            is_regression: true,
-        },
-    )])?
-    .add_message((Role::User, "Checkout total shows $0.00 on mobile."))?;
-
-// This parse cannot fail on malformed JSON. The model was not able to
-// emit any.
-let triage: Triage = serde_json::from_str(&session.complete_text(&prompt)?)?;
-println!("{triage:#?}");
-# Ok(())
-# }
-# #[cfg(not(all(feature = "llama-cpp", feature = "json-schema")))]
-# fn main() {}
+#[cfg(not(all(feature = "llama-cpp", feature = "json-schema")))]
+fn main() {}
 ```
 
 The grammar engine underneath is ours — a pure-Rust GBNF parser, matcher and
@@ -104,17 +110,16 @@ let gbnf = r#"
 "#;
 
 // As a sampling mode this constrains generation token by token.
-let mode = SamplingMode::grammar(gbnf)?;
+let mode = SamplingMode::grammar(gbnf).unwrap();
 assert!(matches!(mode, SamplingMode::Grammar(_)));
 
 // The same grammar, driven by hand. `completes_with` asks whether the
 // bytes are accepted *and* land in a final state; `accepts_bytes` asks
 // only whether they are a legal prefix. Neither mutates the matcher.
-let state = GrammarState::from_source(gbnf)?;
+let state = GrammarState::from_source(gbnf).unwrap();
 assert!(state.completes_with(br#"{"ok": true}"#));
 assert!(state.accepts_bytes(br#"{"ok": "#));
 assert!(!state.accepts_bytes(br#"{"ok": maybe"#));
-# Ok::<(), drama_llama::GrammarError>(())
 ```
 
 [GBNF]: https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md
@@ -202,7 +207,7 @@ sampler-settings editor).
 
 ## Testing
 
-587 tests across 27 binaries in the default configuration — 468 that run in
+593 tests across 27 binaries in the default configuration — 474 that run in
 seconds and 119 that load real weights onto a real accelerator. The
 model-backed tier is `#[ignore]`d so the fast loop stays fast, and the whole
 topology — *which features* × *which tests* — lives in one place,
