@@ -575,12 +575,15 @@ Verified and now settled (extend the do-not-re-litigate list):
 
 Open, minor, deliberately not release blockers:
 
-- **F1**: `mtmd_input_chunks_init` / `mtmd_bitmap_init` are bare
-  `new`/resize with no try/catch upstream (`mtmd.cpp:1707-1712,
-  1782-1784`), so C++ `bad_alloc` would unwind across `extern "C"`
-  into Rust — OOM-only, upstream defect; the siblings all catch.
-  **File upstream** (llama.cpp), optionally mirror in llama-cpp-sys#
-  tracker.
+- **F1**: `mtmd_input_chunks_init` / `mtmd_bitmap_init` (and, found
+  while writing the report, `mtmd_bitmap_init_from_audio` /
+  `mtmd_bitmap_init_lazy`) are bare `new`/resize with no try/catch
+  upstream, so C++ `bad_alloc` would unwind across `extern "C"` into
+  Rust — OOM-only, upstream defect; the siblings
+  (`mtmd_tokenize`/`mtmd_encode_chunk`/`mtmd_init_from_file`) all
+  catch. **Filed 2026-07-23: ggml-org/llama.cpp#26047** (drafted by
+  Fable, filed via Mike's `gh`, AI-provenance stated in the body).
+  Watch for the fix, then bump; nothing to do our side.
 - **F2**: `CausalAttnGuard` restores `true`, not the prior value —
   wrong only if a non-causal (embeddings) context ever runs image
   prefill; nothing in-crate does today.
