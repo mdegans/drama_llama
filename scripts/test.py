@@ -447,20 +447,41 @@ def cmd_run(args: argparse.Namespace) -> int:
     return run_command(cmd, config.target_dir(), log_path(name))
 
 
-# Files that execute during the run but do not count as covered surface.
+# Directories that execute during the run but do not count as covered
+# surface. Two different justifications, deliberately kept apart:
 #
-# `tests/` and `examples/` are test *inputs*, not the thing under test:
-# integration-test bodies are ~100% covered by definition and would inflate
-# the number by several points while saying nothing about `src/`. `bin/`
-# is deliberately absent from this list — the binaries ship in the
-# published crate, so they are surface a user can reach.
+# BY CATEGORY — `tests/`, `examples/`, `benches/` are test *inputs*, not
+# the thing under test. Integration-test bodies are ~100% covered by
+# definition and would inflate the number by several points while saying
+# nothing about `src/`.
 #
-# What this CANNOT exclude is `#[cfg(test)] mod tests` inside `src/`:
-# llvm-cov filters by file, and those live in the same file as the code
-# they test. There is a lot of that in this crate, so read the reported
-# percentage as an upper bound. The per-file table, which is the actually
-# useful output, is unaffected.
-COVERAGE_IGNORE = r"(^|/)(tests|examples|benches)/"
+# BY DECISION — the two toy binaries. Mike's call, 2026-07-23, with the
+# reasoning recorded on the issue: they are demos (regurgitater exists to
+# show a model reciting The Hobbit chapter one), they fail obviously when
+# they fail, and testing them is real work for little signal. Between
+# them they are ~284 lines, about 1.2 points of the total. Excluded so
+# the headline number describes the library and the serving surface
+# rather than being dragged by two things nobody depends on.
+#
+# `bin/blallama` is NOT excluded: it is a real serving surface with real
+# integration tests, and it went 17.6% -> 49.4% once its coverage was
+# actually being recorded.
+COVERAGE_IGNORE_DIRS = [
+    "tests",
+    "examples",
+    "benches",
+    "bin/regurgitater",
+    "bin/settings_tool",
+]
+COVERAGE_IGNORE = (
+    r"(^|/)(" + "|".join(COVERAGE_IGNORE_DIRS) + r")/"
+)
+
+# What none of the above CAN exclude is `#[cfg(test)] mod tests` inside
+# `src/`: llvm-cov filters by file, and those live in the same file as
+# the code they test. There is a lot of that in this crate, so read the
+# reported percentage as an upper bound. The per-file table, which is the
+# actually useful output, is unaffected.
 
 # Where the artifacts land. Under `target/` (not the config's own target
 # dir) for the same reason the test logs are, so a run in either the CUDA

@@ -208,6 +208,12 @@ log = "0.4"
 # confirmation) via a subprocess with a timeout, staged in a tempfile.
 subprocess = "0.2"
 tempfile = "3"
+# `tests/blallama.rs` stops the spawned server with SIGTERM rather than
+# `Child::kill()`'s SIGKILL, so the binary drains and — the reason it
+# matters here — runs the `atexit` handler that writes its coverage
+# `.profraw`. std has no portable signal sender. Already in the graph via
+# tokio/rand; this only names it.
+libc = "0.2"
 # `tests/blallama.rs` drives the blallama binary over HTTP with the
 # real API client. The library dependency above disables default
 # features (no HTTP); tests re-enable the client half.

@@ -367,8 +367,55 @@ where
         probe_bus,
         session,
     });
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Resolve on SIGTERM or Ctrl-C, so `main` returns normally instead of the
+/// process being torn down mid-flight.
+///
+/// Correct for a server on its own terms — Docker and systemd both stop a
+/// container with SIGTERM, and until this existed blallama died uncleanly
+/// under both, dropping in-flight requests rather than draining them.
+///
+/// It is also load-bearing for **coverage**. The LLVM profiling runtime
+/// writes its `.profraw` from an `atexit` handler, and `atexit` does not run
+/// for a signal-killed process. `tests/blallama.rs` used to `Child::kill()`
+/// (SIGKILL, uncatchable), so everything those tests drove through this
+/// binary — a full `/v1/messages` completion with cache reuse — was invisible
+/// to `cargo llvm-cov`. Measurably: blallama's coverage was byte-identical
+/// (17.64%) whether the integration tier ran or was skipped entirely.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // Nothing useful to do if the handler won't install; fall back
+            // to Ctrl-C alone rather than resolving immediately, which
+            // would shut the server down the instant it started.
+            Err(e) => {
+                tracing::warn!("could not install SIGTERM handler: {e}");
+                std::future::pending::<()>().await
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("SIGINT — draining"),
+        _ = terminate => tracing::info!("SIGTERM — draining"),
+    }
 }
 
 async fn load_session<B>(

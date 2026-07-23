@@ -32,7 +32,36 @@ struct Server {
 }
 
 impl Drop for Server {
+    /// SIGTERM, wait, and only then SIGKILL.
+    ///
+    /// This used to be a bare `Child::kill()`, which is SIGKILL and is
+    /// uncatchable. The LLVM coverage runtime writes its `.profraw` from an
+    /// `atexit` handler, so a SIGKILL'd server writes nothing — every line
+    /// these tests drive through the real binary was absent from coverage,
+    /// and blallama scored an identical 17.64% whether this tier ran or was
+    /// skipped outright. `blallama` now drains on SIGTERM and returns from
+    /// `main`, which is what lets the handler fire.
+    ///
+    /// The SIGKILL fallback stays: a server that will not drain must not
+    /// wedge the suite, and a leaked child would hold the port.
     fn drop(&mut self) {
+        #[cfg(unix)]
+        // SAFETY: `kill(2)` with a pid we own and a valid signal number.
+        // The child cannot have been reaped yet — nothing else calls
+        // `wait` on it, and this is the only `Drop`.
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
