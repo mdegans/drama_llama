@@ -1,0 +1,28 @@
+# Codecov configuration. Uploaded from the `coverage` job in
+# .github/workflows/ci.yml, which runs `scripts/test.py coverage -t all`.
+#
+# No `ignore:` list here on purpose. `tests/`, `examples/` and `benches/`
+# are already excluded upstream, by COVERAGE_IGNORE in scripts/test.py, so
+# the lcov that arrives has never contained them. Restating the list here
+# would give it two homes and one of them would eventually be wrong.
+
+coverage:
+  status:
+    # Informational, both of them: nothing here blocks a merge on a
+    # coverage number. This project's gate is that the tests pass; the
+    # percentage is a map of where to look next, not a threshold to
+    # game. Flip `informational` off if that ever stops being true.
+    project:
+      default:
+        target: auto
+        threshold: 2%
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# The `coverage` job does not run on pull_request — it is a second full
+# pass over the one GPU on a shared box, and a PR already gets the same
+# tests uninstrumented. With no PR upload there is nothing to comment,
+# and a "no report found" comment on every PR is worse than silence.
+comment: false

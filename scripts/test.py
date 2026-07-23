@@ -27,6 +27,7 @@ Usage
     scripts/test.py run --filter strawberry   # one test, any tier
     scripts/test.py run -t ignored -x session_gptoss   # minus a suite
     scripts/test.py check --config all        # the permutation gate
+    scripts/test.py coverage -t all           # instrumented, with a report
     scripts/test.py configs                   # what exists, and why
 """
 
@@ -203,18 +204,58 @@ CONFIGS: dict[str, Config] = {
     ]
 }
 
-# tier -> extra nextest arguments.
-#
-#   unignored  the fast loop: no model is loaded, so it stays parallel.
-#   ignored    ONLY the #[ignore]'d tests. Each loads a 13-19 GB model
-#              onto the GPU and only one fits, hence profile `full`
-#              (test-threads = 1). This is what `just test full` meant,
-#              under a name that says so.
-#   all        genuinely everything, serialized for the same reason.
-TIERS: dict[str, list[str]] = {
-    "unignored": [],
-    "ignored": ["--profile", "full", "--run-ignored", "only"],
-    "all": ["--profile", "full", "--run-ignored", "all"],
+@dataclass(frozen=True)
+class Tier:
+    """Which tests run, and under which nextest profile.
+
+    A tier is deliberately NOT a fixed argv. `cargo llvm-cov` defines
+    its own `--profile` (the *cargo* build profile), so passing nextest's
+    `--profile full` through it selects a cargo profile that does not
+    exist. The two callers therefore render the same tier differently —
+    `run` as a flag, `coverage` as `NEXTEST_PROFILE` in the environment,
+    which nextest reads and llvm-cov never sees. Rendering per caller
+    keeps that collision explicit instead of rewriting an argv string
+    somewhere downstream.
+    """
+
+    # nextest profile. `full` is `test-threads = 1` (.config/nextest.toml),
+    # the only thing keeping two 13-19 GB models off one card.
+    profile: str | None
+    # nextest --run-ignored value.
+    run_ignored: str | None
+
+    def flags(self) -> list[str]:
+        """As command-line arguments, for plain `cargo nextest run`."""
+        args: list[str] = []
+        if self.profile:
+            args += ["--profile", self.profile]
+        if self.run_ignored:
+            args += ["--run-ignored", self.run_ignored]
+        return args
+
+    def env(self) -> dict[str, str]:
+        """The half that must travel as environment, plus its flags.
+
+        See the class doc: only the profile is ambiguous, so only the
+        profile moves. `--run-ignored` is not an llvm-cov option and is
+        forwarded to nextest untouched.
+        """
+        return {"NEXTEST_PROFILE": self.profile} if self.profile else {}
+
+    def env_flags(self) -> list[str]:
+        """The flags that are safe to pass *through* `cargo llvm-cov`."""
+        return ["--run-ignored", self.run_ignored] if self.run_ignored else []
+
+
+# unignored  the fast loop: no model is loaded, so it stays parallel.
+# ignored    ONLY the #[ignore]'d tests. Each loads a 13-19 GB model onto
+#            the GPU and only one fits, hence profile `full`. This is what
+#            `just test full` meant, under a name that says so.
+# all        genuinely everything, serialized for the same reason.
+TIERS: dict[str, Tier] = {
+    "unignored": Tier(profile=None, run_ignored=None),
+    "ignored": Tier(profile="full", run_ignored="only"),
+    "all": Tier(profile="full", run_ignored="all"),
 }
 
 
@@ -224,16 +265,27 @@ def log_path(name: str) -> Path:
     return d / f"{name}.log"
 
 
-def run_command(cmd: list[str], target_dir: Path, log: Path | None) -> int:
+def run_command(
+    cmd: list[str],
+    target_dir: Path,
+    log: Path | None,
+    extra_env: dict[str, str] | None = None,
+) -> int:
     """Run `cmd`, streaming to stdout and (optionally) tee'ing to `log`.
 
     Tee'd rather than redirected so a failure can be read back after the
     fact instead of re-run to be seen — and streamed rather than
     captured so a long model test shows progress instead of going quiet
     for ten minutes.
+
+    `extra_env` is printed alongside the command for the same reason the
+    target dir is: a run that is only reproducible if you also knew about
+    an invisible variable is not reproducible.
     """
-    env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir), **(extra_env or {}))
     print(f"+ CARGO_TARGET_DIR={target_dir}", flush=True)
+    for key, value in (extra_env or {}).items():
+        print(f"+ {key}={value}", flush=True)
     print(f"+ {' '.join(cmd)}", flush=True)
     if log is not None:
         print(f"+ log: {log}", flush=True)
@@ -342,6 +394,33 @@ def filterset(include: str | None, exclude: list[str]) -> str:
     return expr
 
 
+def selection(
+    config: Config, args: argparse.Namespace
+) -> tuple[Tier, list[str], str]:
+    """Resolve (tier, trailing nextest args, log name) for a test run.
+
+    Shared by `run` and `coverage` so the two cannot select different
+    tests — the whole point of this script, one level down. The tier is
+    returned rather than rendered because its profile has to travel
+    differently for each; see `Tier`.
+    """
+    if args.filter:
+        # A named test is asked for by name, so run it whichever list it
+        # is on rather than making the caller remember — and uncaptured,
+        # so the suites' block/emission dumps are visible on a pass and
+        # not only on a failure.
+        tier, extra = TIERS["all"], ["--no-capture"]
+        name = f"{config.name}-{sanitize(args.filter)}"
+    else:
+        tier, extra = TIERS[args.tier], []
+        name = f"{config.name}-{args.tier}"
+
+    if args.filter or args.exclude:
+        extra += ["-E", filterset(args.filter, args.exclude)]
+
+    return tier, extra, name
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not DRY_RUN:
         require_nextest()
@@ -351,6 +430,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         config, "all" if args.filter else args.tier, args.moeflux_model
     )
     features = config.feature_list(args.moeflux_model)
+    tier, extra, name = selection(config, args)
 
     cmd = [
         "cargo",
@@ -360,23 +440,148 @@ def cmd_run(args: argparse.Namespace) -> int:
         "--features",
         ",".join(features),
         "--no-fail-fast",
+        *tier.flags(),
+        *extra,
     ]
 
-    if args.filter:
-        # A named test is asked for by name, so run it whichever list it
-        # is on rather than making the caller remember — and uncaptured,
-        # so the suites' block/emission dumps are visible on a pass and
-        # not only on a failure.
-        cmd += TIERS["all"] + ["--no-capture"]
-        name = f"{config.name}-{sanitize(args.filter)}"
-    else:
-        cmd += TIERS[args.tier]
-        name = f"{config.name}-{args.tier}"
-
-    if args.filter or args.exclude:
-        cmd += ["-E", filterset(args.filter, args.exclude)]
-
     return run_command(cmd, config.target_dir(), log_path(name))
+
+
+# Files that execute during the run but do not count as covered surface.
+#
+# `tests/` and `examples/` are test *inputs*, not the thing under test:
+# integration-test bodies are ~100% covered by definition and would inflate
+# the number by several points while saying nothing about `src/`. `bin/`
+# is deliberately absent from this list — the binaries ship in the
+# published crate, so they are surface a user can reach.
+#
+# What this CANNOT exclude is `#[cfg(test)] mod tests` inside `src/`:
+# llvm-cov filters by file, and those live in the same file as the code
+# they test. There is a lot of that in this crate, so read the reported
+# percentage as an upper bound. The per-file table, which is the actually
+# useful output, is unaffected.
+COVERAGE_IGNORE = r"(^|/)(tests|examples|benches)/"
+
+# Where the artifacts land. Under `target/` (not the config's own target
+# dir) for the same reason the test logs are, so a run in either the CUDA
+# or the CPU configuration leaves its report somewhere one path can find.
+COVERAGE_DIR = REPO / "target" / "coverage"
+
+
+def require_llvm_cov() -> None:
+    if shutil.which("cargo-llvm-cov") is None:
+        sys.exit(
+            "cargo-llvm-cov not found — install it with `just setup` "
+            "(or `cargo install cargo-llvm-cov --locked`)"
+        )
+
+
+def cmd_coverage(args: argparse.Namespace) -> int:
+    """Instrumented test run, then one or more reports over the same data.
+
+    Split into `--no-report` + N × `report` on purpose: the profraw data
+    is expensive (a full instrumented rebuild plus, at `-t all`, every
+    model test) and every output format is a cheap re-read of it. So a
+    CI job can emit the human summary, the lcov for an uploader, and the
+    JSON the badge is cut from without running the suite three times.
+
+    Note `--doctests` is not passed: it needs nightly rustc. The README
+    doctests therefore run under `just doc`/`cargo test --doc` and are
+    absent from these numbers.
+    """
+    if not DRY_RUN:
+        require_nextest()
+        require_llvm_cov()
+    config = resolve_config(args.config)
+    warn_slow_variant(
+        config, "all" if args.filter else args.tier, args.moeflux_model
+    )
+    features = config.feature_list(args.moeflux_model)
+    tier, extra, name = selection(config, args)
+    name = f"coverage-{name}"
+    target_dir = config.target_dir()
+    cargo_features = [
+        "--no-default-features",
+        "--features",
+        ",".join(features),
+    ]
+
+    code = run_command(
+        [
+            "cargo",
+            "llvm-cov",
+            "nextest",
+            "--no-report",
+            *cargo_features,
+            "--no-fail-fast",
+            # `tier.flags()` would pass `--profile full` to llvm-cov,
+            # which reads it as a *cargo* profile. See `Tier`.
+            *tier.env_flags(),
+            *extra,
+        ],
+        target_dir,
+        log_path(name),
+        tier.env(),
+    )
+    # Deliberately not an early return. A red run still produced coverage
+    # data, and on the run you most want to look at — the one that broke
+    # something — bailing here would throw it away.
+    if code != 0:
+        print(
+            f"\n!! tests exited {code}; reporting on partial data anyway",
+            file=sys.stderr,
+        )
+
+    if not DRY_RUN:
+        COVERAGE_DIR.mkdir(parents=True, exist_ok=True)
+    reports: list[list[str]] = []
+    if args.lcov:
+        reports.append(["--lcov", "--output-path", str(args.lcov)])
+    if args.json:
+        reports.append(
+            ["--json", "--summary-only", "--output-path", str(args.json)]
+        )
+    if args.html:
+        reports.append(
+            ["--html", "--output-dir", str(COVERAGE_DIR / "html")]
+            + (["--open"] if args.open else [])
+        )
+    # The human summary goes last so it is the final thing on the
+    # terminal, and it carries `--fail-under-lines` because it is the one
+    # report guaranteed to run.
+    #
+    # `--summary-only` alone, NOT `--summary-only --text`: in llvm-cov's
+    # vocabulary "text" is the annotated-source format, so adding it turns
+    # a 40-line per-file table into 46k lines of listing. The per-file
+    # table is the default and is what this is for.
+    summary = ["--summary-only"]
+    if args.fail_under is not None:
+        summary += ["--fail-under-lines", str(args.fail_under)]
+    reports.append(summary)
+
+    failed = code
+    for report in reports:
+        # No feature flags here. `cargo llvm-cov report --help` lists
+        # `--no-default-features` and `--features`, but the subcommand
+        # rejects them at parse time ("invalid option ... for subcommand
+        # 'report'"); the help text is shared across subcommands and
+        # overstates this one. They are not needed either — `report`
+        # reads the object list and profraw files the run above left
+        # behind, so it already knows what was built.
+        rc = run_command(
+            [
+                "cargo",
+                "llvm-cov",
+                "report",
+                "--ignore-filename-regex",
+                COVERAGE_IGNORE,
+                *report,
+            ],
+            target_dir,
+            None,
+        )
+        failed = failed or rc
+    return failed
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -435,6 +640,33 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
     print("\ncheck: ok", flush=True)
     return 0
+
+
+def cmd_doctest(args: argparse.Namespace) -> int:
+    """Run the doctests, which nextest cannot.
+
+    This is not a stylistic preference: cargo-nextest's process-per-test
+    model has no doctest support at all (nextest-rs/nextest#16), so every
+    other recipe in this file runs zero of them. Without this subcommand
+    the ` ```rust ` blocks in `lib.rs` — the README among them, mounted
+    with `#![doc = include_str!]` — would compile in nobody's CI and rot
+    exactly as fast as an untested example.
+
+    Same features and target dir as `check`/`just doc`, so it reuses that
+    build rather than making a third one.
+    """
+    config = resolve_config(args.config)
+    cmd = [
+        "cargo",
+        "test",
+        "--doc",
+        "--no-default-features",
+        "--features",
+        ",".join(config.feature_list(args.moeflux_model)),
+    ]
+    return run_command(
+        cmd, config.target_dir(), log_path(f"{config.name}-doctest")
+    )
 
 
 def cmd_configs(_: argparse.Namespace) -> int:
@@ -521,6 +753,73 @@ def main() -> int:
     add_common(p_run)
     p_run.set_defaults(func=cmd_run)
 
+    p_cov = sub.add_parser(
+        "coverage",
+        help="instrumented run + coverage report (cargo-llvm-cov)",
+        description=cmd_coverage.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # Same selection flags as `run`, and shared code behind them: a
+    # coverage number for a different set of tests than the ones that
+    # gate a commit would be measuring something nobody runs.
+    p_cov.add_argument(
+        "-c",
+        "--config",
+        default="llama-cpp",
+        help="feature configuration (default: %(default)s)",
+    )
+    p_cov.add_argument(
+        "-t",
+        "--tier",
+        default="all",
+        choices=list(TIERS),
+        help="which tests (default: %(default)s). Unlike `run` this "
+        "defaults to everything — the unignored tier alone reports the "
+        "generation paths as dead code, which is the opposite of true",
+    )
+    p_cov.add_argument("-f", "--filter", help="see `run --filter`")
+    p_cov.add_argument(
+        "-x",
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="see `run --exclude`",
+    )
+    p_cov.add_argument(
+        "--lcov",
+        nargs="?",
+        const=COVERAGE_DIR / "lcov.info",
+        type=Path,
+        help="also write lcov (default path: %(const)s)",
+    )
+    p_cov.add_argument(
+        "--json",
+        nargs="?",
+        const=COVERAGE_DIR / "summary.json",
+        type=Path,
+        help="also write the JSON summary, which is what a badge is cut "
+        "from (default path: %(const)s)",
+    )
+    p_cov.add_argument(
+        "--html",
+        action="store_true",
+        help=f"also write a browsable report to {COVERAGE_DIR / 'html'}",
+    )
+    p_cov.add_argument(
+        "--open",
+        action="store_true",
+        help="open the HTML report in a browser (implies --html)",
+    )
+    p_cov.add_argument(
+        "--fail-under",
+        type=float,
+        metavar="PCT",
+        help="exit nonzero if line coverage is below PCT",
+    )
+    add_common(p_cov)
+    p_cov.set_defaults(func=cmd_coverage)
+
     p_check = sub.add_parser(
         "check", help="permutation gate: cargo check --all-targets"
     )
@@ -538,12 +837,30 @@ def main() -> int:
     add_common(p_check)
     p_check.set_defaults(func=cmd_check)
 
+    p_doc = sub.add_parser(
+        "doctest",
+        help="run the doctests (nextest cannot — see the subcommand doc)",
+        description=cmd_doctest.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_doc.add_argument(
+        "-c",
+        "--config",
+        default="llama-cpp",
+        help="feature configuration (default: %(default)s)",
+    )
+    add_common(p_doc)
+    p_doc.set_defaults(func=cmd_doctest)
+
     p_configs = sub.add_parser("configs", help="list configurations")
     p_configs.set_defaults(func=cmd_configs)
 
     args = parser.parse_args()
     global DRY_RUN
     DRY_RUN = getattr(args, "dry_run", False)
+    # `--open` with nothing to open is a silent no-op otherwise.
+    if getattr(args, "open", False):
+        args.html = True
     return args.func(args)
 
 

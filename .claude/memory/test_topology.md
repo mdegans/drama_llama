@@ -25,6 +25,19 @@ The nextest *profile* is still called `full` (`.config/nextest.toml`,
 `test-threads = 1`). That name is fine — it means "the serialized profile"
 and is not user-facing.
 
+### A tier is not an argv (2026-07-23)
+
+`TIERS` used to map a name to a fixed list of nextest flags. It is now a
+`Tier` dataclass that renders itself **per caller**, because `cargo
+llvm-cov` defines its own `--profile` meaning the *cargo build profile*.
+Passing nextest's `--profile full` through it selects a cargo profile that
+does not exist. So `run` renders the profile as a flag and `coverage`
+renders it as `NEXTEST_PROFILE` in the environment, which nextest reads and
+llvm-cov never sees (`Tier.flags()` vs `Tier.env()` / `Tier.env_flags()`).
+
+Keep the collision in the type rather than rewriting an argv downstream. If
+a third caller appears, give it a third renderer.
+
 ## Configurations
 
 | name | backend | notes |
@@ -182,6 +195,75 @@ excluded one shows in nextest's "N tests run, M skipped" line and in the
 printed command. Same reason `--filter` matches both name kinds — the
 caller shouldn't have to know that `session_gemma4` is a binary while
 `media_e2e_gemma` is a test inside the lib binary.
+
+## Two subcommands that are not `run` (2026-07-23, #66/#70)
+
+### `doctest` — because nextest runs *zero* doctests
+
+cargo-nextest's process-per-test model has no doctest support at all
+(nextest-rs/nextest#16). Every recipe in this file therefore ran none of
+them, silently, forever. That became load-bearing the moment the crate root
+became `#![doc = include_str!("../README.md")]`: the README's ```rust blocks
+are now doctests, so the front page of the crate is only honest if something
+compiles it.
+
+`scripts/test.py doctest` is that something. It is wired into **`just
+check`** (≈2 s against a warm build), which is what the pre-commit hook
+runs, and into its own CI job.
+
+Two consequences that are easy to miss, both fixed at the same time:
+
+- `.githooks/pre-commit` skipped any commit touching no `.rs`/`Cargo`/
+  `justfile` file. A README-only commit could break the build and sail
+  through. `README.md` and `TERMS_OF_USE.md` are now in that pattern —
+  `src/lib.rs` `include_str!`s both.
+- `ci.yml` had `paths-ignore: ["**.md", ...]` with the same hole. Fixing it
+  required inverting to `paths:` starting from `**`, because **only `paths`
+  honours the `!` negation character** — `paths-ignore` does not, and the
+  two cannot both filter one event. Verified against GitHub's docs, not
+  assumed.
+
+### `coverage` — cargo-llvm-cov, one run, N reports
+
+`scripts/test.py coverage` runs the tests instrumented with `--no-report`,
+then re-reads that profraw data once per output format (`--lcov`, `--json`,
+`--html`, and the human table). The split is the point: the data is
+expensive — a full instrumented rebuild plus, at `-t all`, every model test
+— and each format is a cheap re-read. A red run still gets reported on,
+deliberately; the run you most want numbers from is the one that broke
+something.
+
+It shares `selection()` with `run`, so it cannot measure a different set of
+tests than the ones that gate a commit.
+
+**Defaults to `-t all`, unlike `run`.** The fast tier alone reports every
+generation path as dead code — `engine.rs` 0%, `llama_cpp/decoder.rs` 0%,
+`session/mod.rs` 32% — because most of this crate is only reachable with a
+model loaded. A badge cut from the unignored tier would be a lie.
+
+Three llvm-cov gotchas, each of which cost a run:
+
+- `cargo llvm-cov report` **rejects** `--features` / `--no-default-features`
+  at parse time even though its own `--help` lists them (the help text is
+  shared across subcommands). It does not need them: it reads the object
+  list the run left behind.
+- `--text` is the *annotated source* format, not "the text table". `report
+  --summary-only --text` prints 46 000 lines of listing; `--summary-only`
+  alone prints the 40-line per-file table you wanted.
+- `--doctests` needs nightly, so doctest coverage is absent from these
+  numbers. That is what the `doctest` subcommand is for.
+
+**Read the headline percentage as an upper bound.** `COVERAGE_IGNORE`
+excludes `tests/`, `examples/`, `benches/` (test *inputs*, ~100% covered by
+definition), but llvm-cov filters by **file**, and this crate keeps a great
+deal of `#[cfg(test)] mod tests` in the same file as the code it tests.
+Nothing on stable can exclude those. The per-file table is unaffected and is
+the useful output.
+
+Codecov, uploaded from CI on push only (never `pull_request` — a second full
+pass over the one GPU on a shared box, for numbers a PR does not need).
+`codecov.yml` marks both statuses `informational`, so coverage never blocks
+a merge; the gate here is that the tests pass.
 
 ## CI (#51, #70) — landed, and now runs the model tier
 

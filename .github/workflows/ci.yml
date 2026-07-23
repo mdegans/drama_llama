@@ -14,10 +14,12 @@
 #
 # WHAT RUNS WHERE, and why it is asymmetric:
 #
-#   fmt     linux    seconds
-#   gate    both     every feature configuration compiles, test targets too
-#   test    both     the unignored tier — no weights on the GPU
-#   model   linux    the #[ignore]'d tier: real weights, real CUDA
+#   fmt       linux    seconds
+#   gate      both     every feature configuration compiles, test targets too
+#   test      both     the unignored tier — no weights on the GPU
+#   model     linux    the #[ignore]'d tier: real weights, real CUDA
+#   doctest   linux    the doctests, which nextest cannot run at all
+#   coverage  linux    instrumented `-t all`, uploaded to Codecov. Push only.
 #
 # `model` is Linux-only on purpose. The macOS leg is a Parallels VM whose
 # Metal support is unverified, and the moeflux configuration would want the
@@ -59,19 +61,37 @@ name: CI
 # other end of the chain, and it exists because it was violated within
 # minutes of the model job first going green.
 #
-# `paths-ignore` and not `paths`: the default must be to run. A new
-# directory nobody thought about should cost a CI run, not silently skip
-# one. Note this would need revisiting if these jobs ever become *required*
+# Written as `paths` starting from `**` rather than as `paths-ignore`, and
+# the leading `**` is load-bearing twice over:
+#
+#   1. The default must be to RUN. A new directory nobody thought about
+#      should cost a CI run, not silently skip one.
+#   2. Only `paths` honours the `!` negation character — `paths-ignore` does
+#      not, and the two cannot both filter one event. Two markdown files are
+#      compiled INTO the crate (see below), so the list has to be able to
+#      take a file back out of an exclusion, which is a thing only this
+#      form can express.
+#
+# Note this would need revisiting if these jobs ever become *required*
 # checks — a skipped required check blocks a merge rather than passing it.
 on:
   push:
     branches: [main, "v*"]
-    paths-ignore: &docs
-      - ".claude/**"
-      - "**.md"
-      - "LICENSE*"
+    paths: &source
+      - "**"
+      - "!.claude/**"
+      - "!**.md"
+      - "!LICENSE*"
+      # ...except these two, which `src/lib.rs` pulls in with
+      # `include_str!` — the README as the crate-level docs (so its
+      # examples are doctests that CI compiles) and TERMS_OF_USE.md as
+      # `drama_llama::TOS`. Editing either is editing source: a README
+      # typo in a ```rust block fails the `doctest` job. Order matters
+      # here — a positive pattern after a negative one re-includes.
+      - "README.md"
+      - "TERMS_OF_USE.md"
   pull_request:
-    paths-ignore: *docs
+    paths: *source
   workflow_dispatch:
 
 env:
@@ -277,6 +297,97 @@ jobs:
       # See the `gate` job. This is the big one — a CUDA build plus every
       # test binary, and the runner that holds it is the runner with the
       # GPU jobs queued behind it.
+      - name: reclaim disk
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/target"
+
+  # Nextest's process-per-test model has no doctest support (nextest-rs/nextest#16),
+  # so every other job here runs exactly zero doctests. That matters more than
+  # usual in this repo: the crate root is `#![doc = include_str!("../README.md")]`,
+  # so the README's examples ARE doctests, and without this job the front page
+  # of the crate would compile in nobody's CI and rot at the speed of an
+  # untested example. Cheap, no weights, no GPU — hence no concurrency group.
+  doctest:
+    name: doctests (linux)
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "16"
+      CMAKE_BUILD_PARALLEL_LEVEL: "16"
+      RAYON_NUM_THREADS: "16"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/runner-path
+      - uses: dtolnay/rust-toolchain@stable
+      # `llama-cpp-cpu`: the doctests that touch a backend are `no_run`, so
+      # they need the types to exist and nothing else. No reason to spend
+      # nvcc — or to queue behind the card — to type-check them.
+      - run: python3 scripts/test.py doctest -c llama-cpp-cpu
+      - name: reclaim disk
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/target"
+
+  # Coverage. Deliberately NOT on pull_request: it is a second full pass over
+  # the one GPU on a box that also runs Agora, and a PR already gets the same
+  # tests uninstrumented from `test` and `model`. Codecov's badge tracks the
+  # branch anyway, so measuring on push is what the badge actually needs.
+  #
+  # `-t all`, not `-t ignored`: the fast tier alone reports every generation
+  # path as dead code (engine.rs 0%, decoder.rs 0%, session/mod.rs 32%), which
+  # is the opposite of true and would make the badge a lie. Most of this crate
+  # is only reachable with a model loaded.
+  coverage:
+    name: coverage (linux, cuda)
+    runs-on: [self-hosted, linux]
+    needs: [fmt]
+    if: github.event_name != 'pull_request'
+    # Same card as `model`, same queue. See that job for why this is not
+    # keyed on the ref and why it does not cancel in progress.
+    concurrency:
+      group: gpu-${{ github.repository }}
+      cancel-in-progress: false
+    timeout-minutes: 240
+    env:
+      CARGO_BUILD_JOBS: "16"
+      CMAKE_BUILD_PARALLEL_LEVEL: "16"
+      RAYON_NUM_THREADS: "16"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/runner-path
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # cargo-llvm-cov shells out to llvm-profdata / llvm-cov from this
+          # component. Without it the run fails after the whole build.
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: link model weights
+        uses: ./.github/actions/link-models
+      - run: python3 scripts/test.py coverage -c llama-cpp -t all --lcov --json
+      # Before `reclaim disk`, which deletes the directory these live in.
+      # `if: always()` on both: a red test run still produced coverage, and
+      # the run you most want the numbers from is the one that broke
+      # something. `scripts/test.py coverage` reports on partial data for
+      # the same reason.
+      - name: upload to codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/coverage/lcov.info
+          # An upload hiccup is not a test failure. The job's exit status
+          # should mean "the tests passed", not "codecov.io was reachable".
+          fail_ci_if_error: false
+      - name: upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            target/coverage/lcov.info
+            target/coverage/summary.json
+            target/test-logs/coverage-llama-cpp-all.log
+          if-no-files-found: ignore
       - name: reclaim disk
         if: always()
         run: rm -rf "$GITHUB_WORKSPACE/target"

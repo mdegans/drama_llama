@@ -6,10 +6,11 @@
 # Two gates, both cheap enough to sit in front of every commit:
 #
 #   1. `just check` — rustfmt is clean (the whole tree, not just the diff — a
-#      formatter is only useful if the tree is a fixed point of it) AND rustdoc
-#      is clean (broken/private intra-doc links promoted to hard errors). The
-#      doc build reuses the test build's artifacts, so it's a rustdoc pass, not
-#      a recompile.
+#      formatter is only useful if the tree is a fixed point of it), rustdoc is
+#      clean (broken/private intra-doc links promoted to hard errors), and the
+#      doctests pass. The doc build reuses the test build's artifacts, so it's
+#      a rustdoc pass, not a recompile; the doctests add ~2s on top and are
+#      here because nextest cannot run them, so gate 2 runs exactly zero.
 #   2. `just test` — the unignored test suite passes.
 #
 # The #[ignore]'d tests are deliberately NOT run: they load 13-18 GB models
@@ -22,8 +23,14 @@ cd "$(git rev-parse --show-toplevel)"
 
 # Non-Rust commits (memory notes, docs, fixtures) skip both checks — nothing
 # they touch can break a build, and a docs typo shouldn't cost a test run.
+#
+# README.md and TERMS_OF_USE.md are the exceptions, and they are why this list
+# is not just "*.rs": `src/lib.rs` pulls both in with `include_str!`. The
+# README is the crate-level documentation, so its ```rust blocks are doctests
+# that `just check` compiles and runs. A README edit really can turn the tree
+# red, and skipping the gate for it would let that reach CI.
 staged="$(git diff --cached --name-only --diff-filter=ACMR)"
-if ! grep -qE '(\.rs$|^Cargo\.(toml|lock)$|^justfile$|^rustfmt\.toml$)' <<<"$staged"; then
+if ! grep -qE '(\.rs$|^Cargo\.(toml|lock)$|^justfile$|^rustfmt\.toml$|^README\.md$|^TERMS_OF_USE\.md$)' <<<"$staged"; then
     echo "pre-commit: no Rust/build changes staged — skipping fmt + tests"
     exit 0
 fi

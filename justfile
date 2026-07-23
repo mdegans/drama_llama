@@ -108,6 +108,24 @@ test mode="" filter="" *args:
       *)         run -c llama-cpp --filter "{{mode}}" ;;
     esac
 
+# Coverage, via cargo-llvm-cov (`just setup` installs it).
+#   just coverage              everything — unignored AND model tests
+#   just coverage unignored    the fast tier only, no weights
+#   just coverage "" --html --open      browsable per-file report
+#
+# Defaults to the `all` tier because the fast tier alone reports every
+# generation path as dead code — most of this crate is only reachable with a
+# model loaded, so `unignored` coverage measures the wrong thing. Expect the
+# same ~12 minutes `just test all` costs, plus a full instrumented rebuild
+# into target/llvm-cov-target (llama.cpp included, the first time).
+#
+# `tests/` and `examples/` are excluded from the report; `#[cfg(test)] mod
+# tests` inside src/ cannot be, so the headline percentage is an upper bound.
+# The per-file table is the part to actually read.
+coverage tier="all" *args:
+    python3 scripts/test.py coverage --moeflux-model "{{moeflux_model}}" \
+      -c llama-cpp -t "{{tier}}" {{args}}
+
 # The permutation gate: every feature configuration compiles, test targets
 # included. Slower than `just check` (it builds moeflux and the no-backend
 # trait layer), so it is NOT in the pre-commit hook — run it before a release
@@ -145,9 +163,22 @@ doc:
     export CARGO_TARGET_DIR="{{gpu_target}}"
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "{{doc_features}}"
 
-# Fast static gate: rustfmt-clean + rustdoc-clean, no model tests (those are
-# `just test`, which the pre-commit hook runs separately). Run by hand for a
-# quick "is the tree lint-clean" without paying the test-suite cost.
+# Run the doctests. Separate from `just test` because nextest has no doctest
+# support at all, so none of the test recipes run a single one — and the
+# top-level module doc is `include_str!("../README.md")`, so the README's
+# examples are doctests. Shares `just doc`'s build.
+doctest:
+    python3 scripts/test.py doctest -c llama-cpp
+
+# Fast static gate: rustfmt-clean + rustdoc-clean + doctests, no model tests
+# (those are `just test`, which the pre-commit hook runs separately). Run by
+# hand for a quick "is the tree lint-clean" without paying the test-suite cost.
+#
+# The doctests are in here rather than alongside `just test` because nextest
+# cannot run them, so `just test` runs zero — and because they cost ~2s against
+# a warm build, which is well inside this recipe's budget. They are load-bearing
+# now that the crate root is `#![doc = include_str!("../README.md")]`: the
+# README's examples are the only thing keeping the front page honest.
 check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -155,6 +186,8 @@ check:
     cargo fmt --check
     echo "+ just doc (rustdoc -D warnings)"
     just doc
+    echo "+ just doctest"
+    just doctest
     echo "check: ok"
 
 # Point git at the versioned hooks in .githooks/ — one config line, no copying,
@@ -164,6 +197,8 @@ install-hooks:
     git config core.hooksPath .githooks
     @echo "hooks installed: core.hooksPath -> .githooks"
 
-# Install the dev tools these recipes need (cargo-nextest).
+# Install the dev tools these recipes need.
 setup:
     cargo install cargo-nextest --locked
+    cargo install cargo-llvm-cov --locked
+    rustup component add llvm-tools-preview
