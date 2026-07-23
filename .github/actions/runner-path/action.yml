@@ -53,22 +53,32 @@ runs:
           echo "CUDACXX=$cuda_root/bin/nvcc" >> "$GITHUB_ENV"
         fi
 
-        # cmake is not optional in any configuration that has a C dependency,
-        # so fail here — two seconds in, with a message that says what to do —
-        # rather than ninety seconds into a cargo build with a build-script
-        # panic and a stack trace through the `cmake` crate.
-        if ! command -v cmake >/dev/null; then
-          echo "::error::cmake is not on this runner's PATH. It is installed" \
-            "but the runner service does not see it: launchd/systemd source" \
-            "no shell rc file. Either install it somewhere this action" \
-            "already looks, or add its directory to the runner's own .path" \
-            "file and restart the service."
+        # Both of these are hard requirements of `llama-cpp-sys-3`'s build
+        # script, which drives llama.cpp through
+        # `cmake::Config::new(..).generator("Ninja")` — the generator is
+        # hard-coded there, so ninja is not a preference this workflow could
+        # opt out of by choosing Makefiles. Fail here, two seconds in with a
+        # message that says what to do, rather than ninety seconds into a
+        # cargo build with a build-script panic and a stack trace through the
+        # `cmake` crate.
+        missing=""
+        for tool in cmake ninja; do
+          command -v "$tool" >/dev/null || missing="$missing $tool"
+        done
+        if [ -n "$missing" ]; then
+          echo "::error::not on this runner's PATH:$missing — required by" \
+            "llama-cpp-sys-3's build script. If a tool IS installed, the" \
+            "runner service simply cannot see it: launchd/systemd source no" \
+            "shell rc file. Either install it somewhere this action already" \
+            "looks, or add its directory to the runner's own .path file and" \
+            "restart the service."
           exit 1
         fi
 
         # Printed, not asserted: when this breaks again, the log should say
         # which tools the job actually had rather than only which it lacked.
         echo "cmake:  $(command -v cmake) — $(cmake --version | head -1)"
+        echo "ninja:  $(command -v ninja) — $(ninja --version)"
         if command -v nvcc >/dev/null; then
           echo "nvcc:   $(command -v nvcc) — $(nvcc --version | tail -1)"
         else
