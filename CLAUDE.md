@@ -286,6 +286,17 @@ for the current arc:
   text contain a special" rather than "did the parser degrade" (keying
   on degradation breaks every structured generation on Llama 3.1), and
   the two-errors decision for #38.
+- [`one_dot_oh_wishlist.md`](.claude/memory/one_dot_oh_wishlist.md)
+  — deferred items from the 0.8.0 pre-publish review (2026-07-23):
+  breaking-later decisions (Token associated type, root-vs-modules,
+  log-callback consolidation) and the minor-polish list. Read before
+  planning 1.0 or a polish session.
+- [`plan_preserve_order_60.md`](.claude/memory/plan_preserve_order_60.md)
+  — plan-of-record for #60 (declaration-order tool args). The
+  minijinja blocker is gone (`preserve_order` exists there too); one
+  deliberate session, re-baselines round-trip fixtures, and closes
+  the downstream feature-unification hazard on sorted keys as the
+  same work.
 - [`eog_is_not_eos_plus_eot.md`](.claude/memory/eog_is_not_eos_plus_eot.md)
   — **read before touching stop logic.** `Model::eog_tokens()` is
   libllama's `special_eog_ids` verbatim and is the single authority for
