@@ -550,3 +550,49 @@ Recommended order:
 `decoder.rs` carries 42 `unsafe` blocks and **zero** `// SAFETY`
 comments, which is the structural reason #1 could drift from the rule
 `backend.rs:64` already states correctly.
+
+## Addendum: 0.8.0 pre-publish delta audit (2026-07-23)
+
+A second pass over everything unsafe-bearing that changed since this
+audit (delta from `54b8d15`): `options.rs` (new), `log.rs` (rewritten),
+`engine.rs` (from_path_with refactor), plus a from-scratch verification
+of the mtmd wrapper's load-bearing C-side facts against the vendored
+source at 0.8.1 parity. **Verdict: sound; published as-is.**
+
+Verified and now settled (extend the do-not-re-litigate list):
+
+- All prior-audit fixes confirmed present, not assumed (decode/prefill
+  `&mut self`; four `llama_get_*_ith` null checks; Mtmd model-identity
+  check; the #54 Arc keepalive; moeflux has zero unsafe).
+- mtmd C-side facts pinned: NULL-bitmap ctor is memcpy-safe; encoder
+  output slice length exactly matches the C buffer resize; M-RoPE
+  `rel` buffer count and (t, y, x, z) plane order match
+  `mtmd-helper.cpp`; `mtmd_tokenize`/`mtmd_encode_chunk`/
+  `mtmd_init_from_file` are exception-caught C-side.
+- `log.rs` rewrite: catch_unwind around the consumer closure, Arc
+  cloned out and mutex released before the call (reentrancy-safe),
+  clear/swap is drop-after-swap — no callback-outlives-data hazard.
+
+Open, minor, deliberately not release blockers:
+
+- **F1**: `mtmd_input_chunks_init` / `mtmd_bitmap_init` are bare
+  `new`/resize with no try/catch upstream (`mtmd.cpp:1707-1712,
+  1782-1784`), so C++ `bad_alloc` would unwind across `extern "C"`
+  into Rust — OOM-only, upstream defect; the siblings all catch.
+  **File upstream** (llama.cpp), optionally mirror in llama-cpp-sys#
+  tracker.
+- **F2**: `CausalAttnGuard` restores `true`, not the prior value —
+  wrong only if a non-causal (embeddings) context ever runs image
+  prefill; nothing in-crate does today.
+- **F3**: audio chunks on an M-RoPE model fail closed with a
+  misleading `NoMediaChunk` error (upstream would take `mrope_1d`).
+  Matters only if a `Block` audio variant ever appears.
+- **F4**: `set_log_callback` vs `set_log_callback_raw`/`clear` can
+  interleave to misroute logs (Rust slot Some while raw C callback
+  registered, or trampoline against empty slot). No UAF in any
+  interleaving; purely logs-may-be-lost on a process-global race.
+- **F5**: `LlamaCppOptions::numa` is a serde-settable raw `u32` fed
+  to `llama_numa_init` unvalidated — defined-but-meaningless on
+  out-of-range, not UB. CLI correctly skips the arg.
+- **F6**: `start_pos as llama_pos` wraps past `i32::MAX`; unreachable
+  with any real `n_ctx`.
