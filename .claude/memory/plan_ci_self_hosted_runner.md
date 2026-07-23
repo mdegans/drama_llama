@@ -150,6 +150,30 @@ is *identical* to `llama-cpp` because Metal is unconditional in llama.cpp's
 build; what actually keeps the GPU out of it is that the unignored tier
 puts nothing there (`n_gpu_layers = 0`) and the `model` job is Linux-only.
 
+### What a fresh runner actually needs (checked in the sources, 2026-07-23)
+
+- **`cmake`, and it is the one CLT does not give you.** `llama-cpp-sys-3`
+  drives llama.cpp through `cmake::Config::new("external/llama.cpp").build()`,
+  which shells out to a `cmake` binary. Hosted `macos-latest` has it
+  preinstalled, which is why the first CI run never surfaced this; a bare
+  VM does not. `brew install cmake`.
+- **Xcode Command Line Tools** — clang, the macOS SDK, libclang for
+  bindgen, git, python3.
+- **rustup**, for `dtolnay/rust-toolchain@stable` to have something to
+  drive.
+- **NOT the Metal toolchain.** This was predicted and it was wrong: neither
+  crate compiles a `.metal` file at build time. `llama-cpp-sys-3` sets
+  `GGML_METAL_EMBED_LIBRARY=ON`, which embeds the shader *source* and
+  compiles it at runtime through the Metal framework; the published
+  `moeflux` crate has **no build.rs at all** and does
+  `include_str!("shaders.metal")` + `new_library_with_source`
+  (`src/riir/backend/gpu/metal.rs`). So full Xcode is not needed to
+  *compile*. Whether Metal *runs* in the VM is a separate, still-open
+  question — and one CI does not currently ask, since macOS is CPU-only.
+- Both `llama-cpp-sys-3` and `moeflux` are crates.io dependencies with
+  vendored sources — no submodules, no sibling working copies. The
+  `[patch.crates-io]` class of blocker that held #51 up cannot recur here.
+
 **Watch for mmap over the share.** llama.cpp mmaps weights by default, and
 mmap over a Parallels shared folder is the kind of thing that either works
 fine or fails into a full read of the file. Four of these tests run *in
