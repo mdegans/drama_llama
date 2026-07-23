@@ -169,6 +169,13 @@ doc:
     export CARGO_TARGET_DIR="{{gpu_target}}"
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "{{doc_features}}"
 
+# Verify README.md's hand-counted test numbers (the shields.io badge and
+# the prose in Testing) against `cargo nextest list`, so they cannot
+# drift silently. `just badge --fix` rewrites them. CI runs the check
+# after the fast tier; it shares that build, so the list is nearly free.
+badge *args:
+    python3 scripts/test.py badge --moeflux-model "{{moeflux_model}}" {{args}}
+
 # Run the doctests. Separate from `just test` because nextest has no doctest
 # support at all, so none of the test recipes run a single one — and the
 # top-level module doc is `include_str!("../README.md")`, so the README's

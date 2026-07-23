@@ -222,6 +222,13 @@ jobs:
       # would race the `model` job for the card. Everything CUDA-shaped is in
       # the `ignored` tier, which is `model`'s job.
       - run: python3 scripts/test.py run -c llama-cpp-cpu -t unignored
+      # README's tests-N badge and prose counts are hand-written; this
+      # compares them against `cargo nextest list` so they cannot drift
+      # silently (`scripts/test.py badge --fix` rewrites them). The
+      # binaries are already built by the step above, so the list is
+      # nearly free. No test is cuda-gated, so the cpu config's counts
+      # equal the default config's the README describes.
+      - run: python3 scripts/test.py badge -c llama-cpp-cpu
       # Named exactly, not the whole directory: `clean: false` means
       # `target/test-logs/` accumulates every mode this box has ever run,
       # and an artifact holding another job's stale log is worse than none.

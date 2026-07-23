@@ -783,6 +783,126 @@ def cmd_doctest(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_badge(args: argparse.Namespace) -> int:
+    """Verify README.md's hand-counted test numbers against reality.
+
+    The README carries a shields.io `tests-N` badge and a prose claim
+    ("N tests across M binaries … U that run in seconds and I that load
+    real weights"). Hand-maintained counts drift silently — this
+    compares them against `cargo nextest list` for the same
+    configuration the numbers describe, and `--fix` rewrites them.
+
+    CI runs this after the test job (the test binaries are already
+    built, so the list is nearly free). It is deliberately NOT in the
+    pre-commit hook: README edits are rare and the hook stays fast.
+    """
+    import json as _json
+    import re as _re
+
+    require_nextest()
+    config = resolve_config(args.config)
+    features = config.feature_list(args.moeflux_model)
+    cmd = [
+        "cargo",
+        "nextest",
+        "list",
+        "--message-format",
+        "json",
+        "--no-default-features",
+        "--features",
+        ",".join(features),
+    ]
+    print(f"+ CARGO_TARGET_DIR={config.target_dir()}", flush=True)
+    print(f"+ {' '.join(cmd)}", flush=True)
+    if DRY_RUN:
+        return 0
+    proc = subprocess.run(
+        cmd,
+        cwd=REPO,
+        env=dict(os.environ, CARGO_TARGET_DIR=str(config.target_dir())),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        return proc.returncode
+
+    suites = _json.loads(proc.stdout).get("rust-suites", {})
+    # Count every suite, empty ones included — matching nextest's own
+    # "Starting N tests across M binaries" line, which is where the
+    # README's phrasing comes from.
+    binaries = len(suites)
+    total = ignored = 0
+    for suite in suites.values():
+        cases = suite.get("testcases", {})
+        total += len(cases)
+        ignored += sum(1 for c in cases.values() if c.get("ignored"))
+    unignored = total - ignored
+
+    readme = REPO / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    patterns = {
+        "badge": (r"tests-(\d+)-blue", (total,)),
+        "total/binaries": (
+            r"(\d+) tests across (\d+) binaries",
+            (total, binaries),
+        ),
+        "unignored/ignored": (
+            r"(\d+) that run in\s+seconds and (\d+) that load",
+            (unignored, ignored),
+        ),
+    }
+    stale = []
+    for label, (pattern, want) in patterns.items():
+        m = _re.search(pattern, text)
+        if m is None:
+            print(f"badge: README pattern for {label} not found", flush=True)
+            stale.append(label)
+        elif tuple(int(g) for g in m.groups()) != want:
+            print(
+                f"badge: {label} says {'/'.join(m.groups())}, "
+                f"nextest says {'/'.join(str(w) for w in want)}",
+                flush=True,
+            )
+            stale.append((label, pattern, want))
+
+    if not stale:
+        print(
+            f"badge: ok ({total} tests, {binaries} binaries, "
+            f"{unignored} + {ignored})",
+            flush=True,
+        )
+        return 0
+    if not args.fix:
+        print(
+            "badge: STALE — update README.md or run "
+            "`scripts/test.py badge --fix`",
+            file=sys.stderr,
+        )
+        return 1
+    for entry in stale:
+        if isinstance(entry, str):
+            print(f"badge: cannot fix missing pattern for {entry}")
+            return 1
+        _, pattern, want = entry
+        it = iter(want)
+
+        def sub(m: "_re.Match[str]") -> str:
+            s, out = m.group(0), []
+            last = 0
+            for g in range(1, (m.lastindex or 0) + 1):
+                out.append(s[last : m.start(g) - m.start(0)])
+                out.append(str(next(it)))
+                last = m.end(g) - m.start(0)
+            out.append(s[last:])
+            return "".join(out)
+
+        text = _re.sub(pattern, sub, text, count=1)
+    readme.write_text(text, encoding="utf-8")
+    print("badge: README.md updated", flush=True)
+    return 0
+
+
 def cmd_configs(_: argparse.Namespace) -> int:
     for name, config in CONFIGS.items():
         flags = []
@@ -980,6 +1100,27 @@ def main() -> int:
     )
     add_common(p_doc)
     p_doc.set_defaults(func=cmd_doctest)
+
+    p_badge = sub.add_parser(
+        "badge",
+        help="verify README's test-count badge against `nextest list`",
+        description=cmd_badge.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_badge.add_argument(
+        "-c",
+        "--config",
+        default="llama-cpp",
+        help="configuration the README numbers describe "
+        "(default: %(default)s)",
+    )
+    p_badge.add_argument(
+        "--fix",
+        action="store_true",
+        help="rewrite README.md's numbers instead of failing",
+    )
+    add_common(p_badge)
+    p_badge.set_defaults(func=cmd_badge)
 
     p_configs = sub.add_parser("configs", help="list configurations")
     p_configs.set_defaults(func=cmd_configs)
