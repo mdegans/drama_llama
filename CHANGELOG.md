@@ -116,18 +116,16 @@ Three further arcs land on top of the split:
   empty piece, so missing it means an invisible loop to
   `max_tokens`). Never derive a stop set from `eos()`/`eot()` — see
   *Changed* and *Fixed*.
-- **`Model::display_name()`** — human-readable identifier for
-  loaded models. `LlamaCppModel` returns the GGUF basename;
+- **`Model::display_name(&self) -> Option<String>`** — human-readable
+  identifier on the trait. `LlamaCppModel` returns the GGUF basename;
   `MoefluxModel` returns the parent dir's basename (overridden
   by `MoefluxEngine::from_path` to match the discovery-dir name).
+  Used by `Session::complete_response` for the `model` field of
+  responses, and by `blallama` for model-name matching.
 - **`backend::Backend` trait** bundling `type Decoder: Decoder + Send`
   and `type Model: Model + Send + Sync` as a single generic
   parameter. Compile-time monomorphization, no `dyn` indirection on
   the hot path. ZST tag impls: `LlamaCppBackend`, `MoefluxBackend`.
-- **`Model::display_name(&self) -> Option<String>`** on the trait.
-  Both backends populate (GGUF basename / MLX-export dir basename).
-  Used by `Session::complete_response` for the `model` field of
-  responses, and by `blallama` for model-name matching.
 - **`MoefluxEngine::from_path(parent: &Path)`** — convention-based
   wrapper around `from_paths`. Expects `parent/{mlx,artifacts,root}/`
   with sane runtime defaults (`experts_per_tok = 8`, `use_2bit =
@@ -153,7 +151,7 @@ Three further arcs land on top of the split:
   - `Json`/`Grammar`/`Deny` modes are excluded from sidecars on
     purpose — those are runtime per-request constraints, not
     per-model defaults.
-- **`Session::with_sample_options(SampleOptions)`** — wholesale
+- **`Session::with_sample_options(SamplerConfig)`** — wholesale
   setter used by sidecar loading. Sets the post-grammar sampling
   chain, repetition penalty, and any deferred grammar in one shot.
   Auto-extends `repetition.ignored` with the model's special
@@ -186,6 +184,65 @@ Three further arcs land on top of the split:
 - **`blallama --seed <u128>`** — fixed RNG seed forwarded to every
   prediction. For tuning iteration where you want sidecar changes
   to show up as deliberate divergences rather than stochastic ones.
+- **Probe mode** — `Engine::set_probe_hook` installs a per-token
+  `ProbeHook` observer on the prediction loop, so a consumer (canary
+  suite, batch evaluation, Weave) can watch each yielded token
+  without forking the predictor iterator. `ProbeCtx` carries the
+  sampled token, its position, and the effective sampler
+  configuration; hooks self-declare their snapshot appetite via
+  `ProbeHook::snapshot_opts` — the default `None` skips the per-token
+  softmax/sort entirely, while `Some(SnapshotOpts)` populates a rich
+  `Candidates` `Snapshot` (`Candidates::capture_snapshot`:
+  pre-everything top-k probabilities and ranks, optional entropy)
+  for cross-validating external behavior against internal
+  disposition. `blallama` exposes both recorders: `--record-json
+  <FILE>` appends one JSONL record per token, and `--probe-stream`
+  mounts a `/probe` SSE endpoint streaming per-request
+  `session_start` / `token` / `session_end` events.
+- **`SessionTransport` / `LocalTransport`** ([#48]) — a
+  `misanthropic::Transport` over a locally-owned `Session`, so
+  anything generic over a transport (the upstream `Chat` driver
+  included) drives local inference exactly as it would the API
+  client. Completions run on tokio's blocking pool behind an async
+  mutex, one at a time — cloning the transport clones the *handle*,
+  and every clone serializes through the same session and KV cache,
+  the honest shape of one local model on one GPU. `LocalTransport`
+  is the erasure: `Arc<dyn LocalTransport>` serves both `Prompt` and
+  `CachedPrompt` and carries `scan_text_for_specials` through the
+  erased type, which is how the examples went backend-generic (see
+  `.claude/memory/examples_erase_at_transport.md` for why the type
+  is the transport, not a boxed `Session`).
+- **Multi-slot prefix cache.** The v0.7 single-sequence prompt cache
+  grew slots: up to `PrefixCacheConfig::max_slots` cached prefixes
+  (clamped to the engine's sequence count), so a council of agents
+  each keep a warm prefix instead of evicting one another. Enable
+  with `Session::with_prefix_cache(true)`, tune with
+  `Session::with_prefix_cache_config`. Slots evict
+  least-recently-used against a cell budget
+  (`PrefixCacheConfig::capacity_cells`, default the engine's
+  `n_ctx`), and breakpoints honor Anthropic-style TTLs (5m default,
+  1h opt-in) with refresh-on-read semantics: an idle breakpoint past
+  its TTL loses its snapshot, and a fully-expired slot is evicted.
+- **`Model::recommended_sampling()`**, with **`SamplingParams` /
+  `Mirostat`** and **`apply_request_sampling`** — each backend
+  reports the sampling settings the model recommends for itself
+  (GGUF `general.sampling.*` for llama.cpp; returning empty is
+  expected, not exceptional — gpt-oss carries no such keys). Seeds a
+  fresh sampling sidecar, and serves as the fallback tier for
+  per-request sampling: `apply_request_sampling` patches a single
+  unambiguous knob into the existing chain, otherwise rebuilds a
+  canonical `TopK → TopP → MinP → Temperature` chain from the
+  request layered over the model's recommendation — keeping
+  constraint modes as a prefix and never touching repetition or
+  `banned_specials`, which are emission-side protocol integrity a
+  remote client must not be able to switch off.
+- **`ToolChoice::None` is enforced** ([#44]) — "the model must not
+  use any tool" now bans the dialect's tool-call opener for that
+  call alone (the standing emit-ban exempts the opener so
+  Auto/Any/Method can call), leaving the tool definitions rendered
+  and the cached prefix intact. Use cases: prefix-preserving
+  interviews, and forcing prose out of a tool loop. The `chat`
+  example grew `--tool-choice <auto|any|none|method:NAME>`.
 
 #### Image input — mtmd ([#31])
 
@@ -269,7 +326,7 @@ Three further arcs land on top of the split:
   (O(piece)); only on rejection does the full O(vocab) mask-and-
   resample path run. Common case drops from per-step vocab masking
   to a single byte-run check.
-- **`SampleOptions::banned_specials: Arc<[Token]>`** — emit-side
+- **`SamplerConfig::banned_specials: Vec<Token>`** — emit-side
   special-token mask applied before sampling, so a dialect's illegal
   control tokens never reach the candidate set (opt-out via
   `Session::with_emit_specials_ban(false)` for e.g. Qwen-VL
@@ -288,6 +345,51 @@ Three further arcs land on top of the split:
 
 ### Changed
 
+- **Pre-publish API hardening** (pre-crates.io review). Every public
+  error enum, the growth-prone enums (`LogLevel`, `MediaChunk`,
+  `Family` — whose docs already promise an `Instructed` variant —
+  `ReasoningMode`, `ContentMode`, `CallIdPosition`,
+  `ReasoningReingest`), and the options/config structs
+  (`LlamaCppOptions`, `MoefluxOptions`, `BackendArgs`,
+  `SamplerConfig`, `SamplingParams`, `PrefixCacheConfig`,
+  `EmitOptions`, `CallSyntax` and its field-structs) are
+  `#[non_exhaustive]`: adding a variant or field later must not be a
+  breaking change. Construction is `Default` + pub-field mutation or
+  the `with_*` builders (`BackendArgs` gained the `Default` its clap
+  attributes already advertised; `MoefluxOptions::use_2bit()` is now
+  `with_use_2bit(bool)`, matching the family). The `moeflux` module
+  itself went private with curated re-exports, mirroring
+  `llama_cpp`: `MoefluxDecoder::ctx()`/`ctx_mut()` leaked
+  `moeflux::Ctx` — a third-party type pinned at a pre-release — into
+  the public API, and the cmdbuf/`eos_raw` diagnostics were public.
+  `MoefluxEngineError` and `PrefetchStats` joined the crate-root
+  exports because public signatures name them.
+- **`SampleOptions` split into `SamplerConfig` + `SamplerState`.**
+  The old type conflated immutable configuration with live per-call
+  run-state — grammar matcher positions behind `Arc<Mutex<_>>`, ~80
+  lines of custom serde hooks (inconsistent between the `Json` and
+  `Grammar` variants), and a ~113-line mutex-locking `PartialEq`.
+  `SamplerConfig` is now a pure value: derive-serializable,
+  `PartialEq`, no interior mutability, and `banned_specials` became a
+  plain `Vec<Token>` in the same move. `SamplerState` gathers
+  everything a run accumulates: matcher positions, mirostat `mu`, the
+  n-gram stats, and the working RNG — now `rand_pcg::Pcg64Mcg`, whose
+  single-`u128` state can actually be serialized (the previous
+  `xorshift::Xoroshiro128` could not expose its state, which is the
+  point).
+  The effective config is the sole constructor of a fresh state
+  (`SamplerConfig::init_state`), and `Engine::predict_tokens` /
+  `predict_pieces` / `predict` (plus their `_resuming` variants) take
+  a new `initial_state: Option<SamplerState>` parameter to resume a
+  caller-owned state. `Session` caches the state at breakpoints
+  alongside the KV snapshot, and the per-call seed default flipped to
+  `None`, making the seed encode resume/fork/fresh: no seed + cache
+  hit resumes the exact stream, no seed + miss draws a fresh random
+  seed, an explicit seed forks deterministically. Serialize → restore
+  → continue is bit-exact — `NGramStats` moved to `BTreeMap` so
+  iteration order (and thus float accumulation) survives a round
+  trip. See `.claude/memory/design_sampler_config_state_split.md`
+  for the full design.
 - **`tracing` is now a non-optional dependency** (with its `log`
   feature), and the crate's own diagnostics — sidecar read/write
   failures, chat-template dialect analysis failures — emit
@@ -346,7 +448,7 @@ Three further arcs land on top of the split:
 - **`llama-cpp-sys-3` 0.7 → 0.8.1.** Picks up the upstream cmake
   `mtmd` target, libmtmd bindgen, and packaging that back the new
   `mtmd` feature.
-- **`misanthropic` alpha.3 → alpha.7.** Adds the image content-block
+- **`misanthropic` alpha.3 → alpha.12.** Adds the image content-block
   types `Session` needs to accept `Block::Image`; the `image` /
   `jpeg` / `png` sub-features are pulled in by drama_llama's `media`
   feature.
@@ -468,11 +570,11 @@ Three further arcs land on top of the split:
   is `Σ decay^(current_step - position)`, bounded above by
   `1 / (1 - decay)`. With defaults (window=256, decay=0.95) the
   effective count saturates near 20 regardless of how long
-  generation runs. `Session::with_repetition` and the per-model
-  sampling sidecar are the supported paths to opt in.
-  `SampleOptions::default()` ships with `repetition: None` to
-  match the historical Session behavior and protect probes from
-  silently inheriting a default penalty.
+  generation runs. With the growth bounded,
+  `SamplerConfig::default()` now ships the penalty **on** — the
+  unbounded additive term was the reason it had been off — with
+  `SamplerConfig::greedy()`, the per-model sidecar, and blallama's
+  `--no-penalty` as the opt-outs.
 - **Special-token injection through prompt content.** `Session`
   rejects `Block::Text` content bearing chat-format control tokens
   (`<|im_end|>` and friends) or media markers at ingest via
@@ -482,6 +584,12 @@ Three further arcs land on top of the split:
   count contract. This is format-integrity enforcement, not content
   filtering: `Session` owns it, `Engine`/the raw predictor stay
   permissive for callers deliberately hand-feeding control tokens.
+  The guard scans `ToolUse` surfaces too — tool name, call id, every
+  string leaf *and key* of the `input` (`ServerToolUse` included),
+  and `ToolResult.tool_use_id` — because templates render all of
+  them verbatim and ingest tokenizes with specials enabled, so a
+  special piece in any of them became real control tokens; the
+  [#37] relay scenario is exactly a tool-use-shaped payload.
 - **Ingest injection guard no longer false-positives on `add_bos`
   vocabs.** The guard keyed off raw tokenization including a leading
   BOS the caller never wrote; on `add_bos` vocabs that flagged clean
@@ -491,6 +599,43 @@ Three further arcs land on top of the split:
   no longer double-terminates or trims the closing delimiter out of
   the emitted text; incomplete-constraint violations surface as
   errors instead of silent truncation.
+- **A safe-code use-after-free through `pub Engine.model`** ([#54]).
+  `llama_context` keeps a reference to its model for its whole life,
+  but nothing tied the decoder's lifetime to the model's — only
+  `Engine`'s field declaration order kept drops sound, and
+  `engine.model = other` through the `pub` field freed the weights
+  under a live context. Two lines, all safe code. `LlamaCppModel` is
+  now a cheap-clone refcounted handle (a private inner owns the
+  pointer); the decoder and `Mtmd` each hold a clone, so the weights
+  structurally outlive anything referencing them. `Engine.model` is
+  private behind `Engine::model()` — now for coherence rather than
+  safety: swapping the model would leave the tokenizer disagreeing
+  with a KV cache built from the previous weights. See *Migration*.
+- **The auto-tip was silently defeated on `add_bos` vocabs.** The
+  canonical close token was tokenized with `add_special = true`, so
+  on Gemma / Llama-3-style vocabs the stored tip ended `[.., BOS,
+  close]`; the next call's longest-common-prefix walk stopped at the
+  BOS and fell back to the last breakpoint on every such model.
+- **Dialect analyzer / parser hardening from the pre-publish
+  review.** The template diff-split and its common-prefix/suffix
+  helpers now round byte-wise match lengths down to char boundaries
+  in both strings — two renders diverging inside a multi-byte
+  character (any non-English template) panicked `Session` load,
+  outside the analyzer's `catch_unwind`. `heal_json` copied
+  quoted-string bytes `as char` (a Latin-1 reinterpretation),
+  mojibaking non-ASCII tool arguments into valid JSON that serde
+  then accepted — silent corruption on every heal path.
+  `parse_tagged_call` gained a per-iteration progress guard: a
+  degenerate `CallSyntax` (reachable via the analyzer's fallback)
+  consumed zero bytes per iteration forever; zero progress is now
+  `Malformed`. The `Malformed`-degrade path and
+  `extract_args_markers` no longer slice mid-character or chop real
+  content on non-ASCII input.
+- **An over-`CAPACITY` `ngram_max_size` panicked prompt seeding.**
+  The prose-seeding fold now clamps to `NGram::CAPACITY` like the
+  live penalty pass does; previously `with_repetition` with a large
+  `ngram_max_size` plus any `complete_*` over a long-enough prose
+  block hit an `unwrap` in the fold.
 
 ### Removed
 
@@ -509,6 +654,14 @@ Three further arcs land on top of the split:
   flag). Sampling configuration now comes from the per-model
   sidecar; for force-off probe runs use the new `--no-penalty`
   flag, which overrides the sidecar.
+- **`StopWords` and the `*_stopwords` methods** — the pure-rename
+  shims deprecated in 0.7.0 (`type StopWords = IgnoreCategory` and
+  the four `ignored_stopwords`-family methods on
+  `RepetitionOptions`). Live replacements have existed since 0.7.0,
+  and 0.8.0 is a breaking release, so they go now rather than riding
+  through another one. The TOML sidecar's legacy `ignored_stopwords`
+  key keeps working — that back-compat lives in a serde alias on the
+  field, not in the removed API.
 
 ### Migration
 
@@ -522,8 +675,10 @@ Three further arcs land on top of the split:
 - `Session::engine()` returns `&Engine<B>` (was `&LlamaCppEngine`).
   For a `Session<LlamaCppBackend>` that's the same type — calls
   unchanged. For ergonomic surface unchanged uses, prefer
-  `session.engine().model.display_name()` over the now-llama-cpp-
-  only `session.engine().model.file_name()`.
+  `session.engine().model().display_name()` over the now-llama-cpp-
+  only `session.engine().model().file_name()`.
+- `Engine.model` is no longer a `pub` field ([#54], see *Fixed*);
+  use the `Engine::model()` accessor.
 - `Session::from_path_sync(p)` → `Session::from_path(p)`, with
   `use drama_llama::FromPath;` — it is a trait method now.
 - The specialized constructors become one call with an options
@@ -578,16 +733,20 @@ Three further arcs land on top of the split:
   enabled together. All four combinations build clean.
 - **Dev workflow: `justfile` + cargo-nextest** (`just setup` installs
   nextest). `just test` runs the fast suite GPU-accelerated,
-  `just test full` runs only the long-running `#[ignore]`d GPU/model
-  tests, `just test cpu` runs CPU-only. CUDA is auto-enabled on Linux
-  by the justfile (Metal is automatic on macOS) — deliberately kept
-  OUT of the crate's default features so a bare `cargo build` stays
-  portable. A 30B-class model barely fits once on a 24GB card, so the
-  model tests must run one-at-a-time; the nextest `full` profile caps
-  `test-threads = 1` (see `.config/nextest.toml`) and `just test full`
-  runs only the ignored tests, so the whole set is serialized without
-  a fragile per-test filter. GPU vs. CPU builds use separate target
-  dirs to avoid evicting each other's llama.cpp build.
+  `just test ignored` runs only the long-running `#[ignore]`d
+  GPU/model tests, `just test all` runs both, and `just test cpu`
+  runs CPU-only — the recipes are thin wrappers over
+  `scripts/test.py`, which owns the configuration × tier topology so
+  the justfile, the hooks, and CI cannot drift ([#68]). CUDA is
+  auto-enabled on Linux (Metal is automatic on macOS) — deliberately
+  kept OUT of the crate's default features so a bare `cargo build`
+  stays portable. A 30B-class model barely fits once on a 24GB card,
+  so the model tests must run one-at-a-time; the nextest `full`
+  profile caps `test-threads = 1` (see `.config/nextest.toml`) and
+  `just test ignored` / `just test all` run under it, so the whole
+  set is serialized without a fragile per-test filter. GPU vs. CPU
+  builds use separate target dirs to avoid evicting each other's
+  llama.cpp build.
 - Send/Sync trade-offs: `B::Decoder` is required Send (not Sync) —
   `*mut llama_context` is internally mutable. `B::Model` is Send +
   Sync (Iterator impls hand `&Model` to grammar / sampling code
@@ -728,10 +887,16 @@ flip `DRAMA_LLAMA_DFA_CACHE=0`.
 - egui 0.34 deprecation warnings (`clamp_range`, `id_source`) are left
   for a follow-up PR.
 
+[0.8.0]: https://github.com/mdegans/drama_llama/releases/tag/v0.8.0
 [0.7.0]: https://github.com/mdegans/drama_llama/releases/tag/v0.7.0
 [#28]: https://github.com/mdegans/drama_llama/issues/28
 [#29]: https://github.com/mdegans/drama_llama/issues/29
 [#30]: https://github.com/mdegans/drama_llama/issues/30
 [#31]: https://github.com/mdegans/drama_llama/issues/31
+[#37]: https://github.com/mdegans/drama_llama/issues/37
 [#40]: https://github.com/mdegans/drama_llama/issues/40
 [#43]: https://github.com/mdegans/drama_llama/issues/43
+[#44]: https://github.com/mdegans/drama_llama/issues/44
+[#48]: https://github.com/mdegans/drama_llama/issues/48
+[#54]: https://github.com/mdegans/drama_llama/issues/54
+[#68]: https://github.com/mdegans/drama_llama/issues/68
