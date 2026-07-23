@@ -499,18 +499,14 @@ fn gptoss_eog_token_set() {
     let end = by_piece("<|end|>");
     let ret = by_piece("<|return|>");
 
-    // The vocab as libllama reports it: EOS is the final-message stop,
-    // EOT is the channel separator (the quirk above). Pinned so a
-    // change upstream shows up here rather than as a mute Harmony model.
+    // EOS is the final-message stop. Deterministic: read from KV
+    // metadata, not guessed.
     assert_eq!(piece_of(model.eos()), "<|return|>");
-    assert_eq!(
-        piece_of(model.eot()),
-        "<|end|>",
-        "upstream quirk pin: libllama auto-detects EOT by text and \
-         `<|end|>` is on that list. If this changes, the carve-out below \
-         may be obsolete — but never assume eot == stop."
-    );
 
+    // The eog set is the contract, so it is asserted FIRST — the eot
+    // pin below is the flakier claim and must not be able to abort the
+    // run before these have executed. (It did exactly that on Linux:
+    // the carve-out went unverified there until this reorder.)
     let eog = model.eog_tokens();
     let pieces = || eog.iter().map(|&t| piece_of(t)).collect::<Vec<_>>();
     assert!(
@@ -530,6 +526,43 @@ fn gptoss_eog_token_set() {
          the stop set must be eog_tokens() and never a union with \
          eot(); eog = {:?}",
         pieces()
+    );
+
+    // Now the eot pin — deliberately weaker than it looks, because
+    // upstream does not actually guarantee a value here.
+    //
+    // `llama_vocab::impl::load` auto-detects EOT by iterating
+    // `token_to_id` and taking the FIRST entry whose text is on a
+    // candidate list — and `token_to_id` is a
+    // `std::unordered_map<std::string, llama_token>`
+    // (llama-vocab.cpp). Iteration order of an unordered container is
+    // unspecified, so for any vocab holding two or more candidates the
+    // winner is whatever the standard library happened to hash first.
+    // This vocab holds both `<|end|>` and `<|endoftext|>`, and the two
+    // platforms disagree: libc++ (macOS) yields `<|end|>`, libstdc++
+    // (Linux/CI) yields `<|endoftext|>`, on byte-identical weights —
+    // sha256-verified, after the difference was first misdiagnosed as
+    // two different downloads.
+    //
+    // So this asserts only what upstream can actually deliver: that
+    // auto-detection still fires and lands on a plausible turn-ender.
+    // The change that would genuinely hurt — upstream giving up and
+    // leaving eot NULL, or picking something absurd — still trips it.
+    // What it must NOT do is pin one platform's hash order and call
+    // that a contract.
+    //
+    // None of this reaches generation, and that is the point of
+    // `.claude/memory/eog_is_not_eos_plus_eot.md`: we stop on
+    // `eog_tokens()`, never on a set built from `eot()`. The label
+    // wobbles across platforms; the predicate does not.
+    let eot = piece_of(model.eot());
+    assert!(
+        eot == "<|end|>" || eot == "<|endoftext|>",
+        "eot auto-detection landed somewhere unexpected: {eot:?}. \
+         Upstream picks the first candidate out of an unordered_map, so \
+         either value is legal here — but a third one means the \
+         candidate list or the detection changed, and the carve-out \
+         above needs re-reading. Never assume eot == stop."
     );
 }
 
