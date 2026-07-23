@@ -584,6 +584,74 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     return failed
 
 
+def selected_configs(
+    name: str, model: str, ci: bool = False
+) -> list[tuple[Config, list[str]]]:
+    """Resolve `-c NAME` (or `-c all`) to the configurations to actually run.
+
+    Shared by `check` and `doctest`, the two subcommands that sweep the
+    permutation space rather than naming one point in it. Prints its own
+    skip lines: a configuration silently not running is the failure mode
+    this whole script exists to prevent, so every omission says why.
+    """
+    names = list(CONFIGS) if name == "all" else [name]
+    out: list[tuple[Config, list[str]]] = []
+    # Two configs can resolve to the same (features, target dir) — notably
+    # llama-cpp and llama-cpp-cpu off Linux, where there is no CUDA to tell
+    # them apart. Running the second is a cache hit rather than a cost, but
+    # reporting it as a distinct permutation would overstate the coverage.
+    seen: dict[tuple[str, str], str] = {}
+    for n in names:
+        config = CONFIGS[n]
+        if config.macos_only and platform.system() != "Darwin":
+            print(f"= skip {n}: macOS-only", flush=True)
+            continue
+        if ci and not config.ci_eligible:
+            print(f"= skip {n}: not CI-eligible", flush=True)
+            continue
+        features = config.feature_list(model)
+        key = (",".join(features), str(config.target_dir()))
+        if key in seen:
+            print(
+                f"= skip {n}: identical to {seen[key]} on this platform",
+                flush=True,
+            )
+            continue
+        seen[key] = n
+        out.append((config, features))
+    return out
+
+
+def sweep(
+    label: str,
+    configs: list[tuple[Config, list[str]]],
+    build: "callable",
+) -> int:
+    """Run `build(features)` in each configuration; report every failure.
+
+    Never short-circuits. Knowing that three configurations are broken
+    beats rediscovering them one commit at a time.
+    """
+    failures: list[str] = []
+    for config, features in configs:
+        print(f"\n=== {label}: {config.name} ===", flush=True)
+        code = run_command(
+            build(features),
+            config.target_dir(),
+            log_path(f"{label}-{config.name}"),
+        )
+        if code != 0:
+            failures.append(config.name)
+
+    if failures:
+        print(
+            f"\n{label}: FAILED for {', '.join(failures)}", file=sys.stderr
+        )
+        return 1
+    print(f"\n{label}: ok", flush=True)
+    return 0
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """The permutation gate: every configuration compiles, tests included.
 
@@ -591,55 +659,23 @@ def cmd_check(args: argparse.Namespace) -> int:
     claim as the test targets building, and #68 was filed because a
     configuration that compiled as a library had ~38 broken test
     targets nobody had ever built.
-    """
-    if args.config == "all":
-        names = list(CONFIGS)
-    else:
-        names = [args.config]
 
-    failures: list[str] = []
-    # Two configs can resolve to the same (features, target dir) — notably
-    # llama-cpp and llama-cpp-cpu off Linux, where there is no CUDA to tell
-    # them apart. Checking the second is a cache hit rather than a cost, but
-    # reporting it as a distinct permutation would overstate the coverage.
-    seen: dict[tuple[str, str], str] = {}
-    for name in names:
-        config = CONFIGS[name]
-        if config.macos_only and platform.system() != "Darwin":
-            print(f"= skip {name}: macOS-only", flush=True)
-            continue
-        if args.ci and not config.ci_eligible:
-            print(f"= skip {name}: not CI-eligible", flush=True)
-            continue
-        features = config.feature_list(args.moeflux_model)
-        key = (",".join(features), str(config.target_dir()))
-        if key in seen:
-            print(
-                f"= skip {name}: identical to {seen[key]} on this platform",
-                flush=True,
-            )
-            continue
-        seen[key] = name
-        cmd = [
+    Note it does NOT cover doctests: `cargo check` does not compile them.
+    That is `doctest`'s job, and it is why that subcommand sweeps
+    configurations too rather than running just one.
+    """
+    return sweep(
+        "check",
+        selected_configs(args.config, args.moeflux_model, args.ci),
+        lambda features: [
             "cargo",
             "check",
             "--all-targets",
             "--no-default-features",
             "--features",
             ",".join(features),
-        ]
-        print(f"\n=== check: {name} ===", flush=True)
-        code = run_command(
-            cmd, config.target_dir(), log_path(f"check-{name}")
-        )
-        if code != 0:
-            failures.append(name)
-
-    if failures:
-        print(f"\ncheck: FAILED for {', '.join(failures)}", file=sys.stderr)
-        return 1
-    print("\ncheck: ok", flush=True)
-    return 0
+        ],
+    )
 
 
 def cmd_doctest(args: argparse.Namespace) -> int:
@@ -652,20 +688,29 @@ def cmd_doctest(args: argparse.Namespace) -> int:
     with `#![doc = include_str!]` — would compile in nobody's CI and rot
     exactly as fast as an untested example.
 
-    Same features and target dir as `check`/`just doc`, so it reuses that
-    build rather than making a third one.
+    **It takes `-c all`, and CI uses it**, because a doctest is a
+    per-configuration claim exactly like a test target is. `cargo check
+    --all-targets` does NOT compile doctests, so the permutation gate
+    cannot see them: `Backend::set_log_callback`'s example named
+    `LlamaCppBackend` — a `llama-cpp`-gated type, in a doc comment on a
+    backend-*agnostic* trait method — and failed to compile in every
+    configuration without that feature. `trait-layer` exists as the
+    canary for precisely that leak and could not catch this one.
+
+    Same features and target dir as `check`/`just doc`, so it reuses
+    those builds rather than making more.
     """
-    config = resolve_config(args.config)
-    cmd = [
-        "cargo",
-        "test",
-        "--doc",
-        "--no-default-features",
-        "--features",
-        ",".join(config.feature_list(args.moeflux_model)),
-    ]
-    return run_command(
-        cmd, config.target_dir(), log_path(f"{config.name}-doctest")
+    return sweep(
+        "doctest",
+        selected_configs(args.config, args.moeflux_model, args.ci),
+        lambda features: [
+            "cargo",
+            "test",
+            "--doc",
+            "--no-default-features",
+            "--features",
+            ",".join(features),
+        ],
     )
 
 
@@ -847,7 +892,15 @@ def main() -> int:
         "-c",
         "--config",
         default="llama-cpp",
-        help="feature configuration (default: %(default)s)",
+        help="one configuration, or `all` (default: %(default)s). The "
+        "default is the fast local loop; CI sweeps `all`, because a "
+        "doctest naming a feature-gated type is broken per-configuration "
+        "and `check` cannot see it",
+    )
+    p_doc.add_argument(
+        "--ci",
+        action="store_true",
+        help="skip configurations that need a GPU, weights or a C toolchain",
     )
     add_common(p_doc)
     p_doc.set_defaults(func=cmd_doctest)

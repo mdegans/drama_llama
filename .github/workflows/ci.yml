@@ -15,10 +15,10 @@
 # WHAT RUNS WHERE, and why it is asymmetric:
 #
 #   fmt       linux    seconds
-#   gate      both     every feature configuration compiles, test targets too
+#   gate      both     every feature configuration compiles, test targets too,
+#                      PLUS the doctests, which nextest cannot run at all
 #   test      both     the unignored tier — no weights on the GPU
 #   model     linux    the #[ignore]'d tier: real weights, real CUDA
-#   doctest   linux    the doctests, which nextest cannot run at all
 #   coverage  linux    instrumented `-t all`, uploaded to Codecov. Push only.
 #
 # `model` is Linux-only on purpose. The macOS leg is a Parallels VM whose
@@ -151,6 +151,20 @@ jobs:
       # was filed because moeflux-only compiled as a library while ~38 of its
       # test targets had never been built by anyone.
       - run: python3 scripts/test.py check
+      # Doctests live HERE, not in a job of their own, because they are a
+      # per-configuration claim and this is the job that already paid to
+      # build every configuration. `cargo check --all-targets` does not
+      # compile doctests, so the permutation gate was blind to them: three
+      # doc examples named `llama-cpp`-gated types without saying so and
+      # failed to compile in configurations that lack the feature — one of
+      # them on `Backend::set_log_callback`, a backend-*agnostic* trait
+      # method, which is the exact leak `trait-layer` exists to catch.
+      # Nothing reported it because nothing ran doctests at all until #66.
+      #
+      # Same `-c all --ci` sweep on both legs, and the asymmetry is the
+      # point: `moeflux` and `both` are macOS-only, so the macOS leg is
+      # the only place a moeflux-only doc example is ever compiled.
+      - run: python3 scripts/test.py doctest -c all --ci
       # Free by construction: checkout runs `git clean -ffdx` at the START
       # of every run, so this tree is deleted and rebuilt next time no
       # matter what — leaving it on disk between runs buys nothing and
@@ -297,32 +311,6 @@ jobs:
       # See the `gate` job. This is the big one — a CUDA build plus every
       # test binary, and the runner that holds it is the runner with the
       # GPU jobs queued behind it.
-      - name: reclaim disk
-        if: always()
-        run: rm -rf "$GITHUB_WORKSPACE/target"
-
-  # Nextest's process-per-test model has no doctest support (nextest-rs/nextest#16),
-  # so every other job here runs exactly zero doctests. That matters more than
-  # usual in this repo: the crate root is `#![doc = include_str!("../README.md")]`,
-  # so the README's examples ARE doctests, and without this job the front page
-  # of the crate would compile in nobody's CI and rot at the speed of an
-  # untested example. Cheap, no weights, no GPU — hence no concurrency group.
-  doctest:
-    name: doctests (linux)
-    runs-on: [self-hosted, linux]
-    timeout-minutes: 90
-    env:
-      CARGO_BUILD_JOBS: "16"
-      CMAKE_BUILD_PARALLEL_LEVEL: "16"
-      RAYON_NUM_THREADS: "16"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/runner-path
-      - uses: dtolnay/rust-toolchain@stable
-      # `llama-cpp-cpu`: the doctests that touch a backend are `no_run`, so
-      # they need the types to exist and nothing else. No reason to spend
-      # nvcc — or to queue behind the card — to type-check them.
-      - run: python3 scripts/test.py doctest -c llama-cpp-cpu
       - name: reclaim disk
         if: always()
         run: rm -rf "$GITHUB_WORKSPACE/target"

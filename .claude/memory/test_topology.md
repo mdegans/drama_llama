@@ -209,7 +209,36 @@ compiles it.
 
 `scripts/test.py doctest` is that something. It is wired into **`just
 check`** (≈2 s against a warm build), which is what the pre-commit hook
-runs, and into its own CI job.
+runs, and into the **`gate`** CI job.
+
+#### A doctest is a per-configuration claim, and `check` is blind to it
+
+The first `-c all` sweep found **three broken doc examples**, all of the
+same shape: a doc comment naming a `llama-cpp`-gated type without a cfg
+gate, so it failed to compile in every configuration lacking the feature.
+
+| where | broken in | why it matters |
+|---|---|---|
+| `Backend::set_log_callback` | `trait-layer` | on a backend-**agnostic** trait method |
+| `session/mod.rs` module doc | `moeflux` | names `LlamaCppSession` |
+| `cli::BackendArgs` | `moeflux` | `cli` stopped implying `llama-cpp` in #68 |
+
+The `trait-layer` configuration exists precisely as the canary for
+llama.cpp leaking into generic code — and it could not catch this,
+because **`cargo check --all-targets` does not compile doctests**. So
+the permutation gate and the doctest sweep are two different gates over
+the same axis, and both are needed.
+
+Fixed with hidden `#` cfg lines (`# #[cfg(feature = "llama-cpp")] fn
+main() { … }` plus a `not(...)` empty arm) — invisible in rendered docs,
+and the pattern the README's own example uses.
+
+`doctest` therefore takes `-c all` and shares `selected_configs()` /
+`sweep()` with `check`. CI runs it **inside `gate`** rather than in its
+own job: `gate` already builds every configuration on both OSes, so the
+sweep is nearly free there, and the macOS leg is the only place a
+`moeflux`/`both` doc example is ever compiled. `just check` stays on the
+single fast configuration; `just doctest all` is the pre-release sweep.
 
 Two consequences that are easy to miss, both fixed at the same time:
 
@@ -250,8 +279,15 @@ Three llvm-cov gotchas, each of which cost a run:
 - `--text` is the *annotated source* format, not "the text table". `report
   --summary-only --text` prints 46 000 lines of listing; `--summary-only`
   alone prints the 40-line per-file table you wanted.
-- `--doctests` needs nightly, so doctest coverage is absent from these
-  numbers. That is what the `doctest` subcommand is for.
+- `--doctests` needs nightly. **Merging doctest and nextest coverage
+  works** — `llvm-cov nextest --no-report`, then `llvm-cov --doc
+  --no-report`, then `report --doctests` — but **both passes must run on
+  the same toolchain**, or the profraw versions disagree. Mike's call is
+  to run the whole coverage job on nightly: `test`/`model` stay on
+  stable, so correctness confidence is unchanged and it buys
+  nightly-toolchain testing for free. Verified 2026-07-23 on the
+  `trait-layer` config; `src/lib.rs` (i.e. the README) appears in the
+  merged table, which is how you can tell it took.
 
 **Read the headline percentage as an upper bound.** `COVERAGE_IGNORE`
 excludes `tests/`, `examples/`, `benches/` (test *inputs*, ~100% covered by

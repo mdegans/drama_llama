@@ -11,6 +11,13 @@
 //! block parsing, and — opt-in — prefix-cache reuse across calls.
 //!
 //! ```no_run
+//! # // cfg-gated: this module compiles for either backend, so the
+//! # // example naming the llama.cpp alias has to say so. It did not,
+//! # // and failed to compile in the moeflux-only configuration from the
+//! # // day that configuration started building (#68) until 2026-07-23 —
+//! # // nothing ran doctests, so nothing reported it.
+//! # #[cfg(feature = "llama-cpp")]
+//! # fn main() {
 //! use drama_llama::{FromPath, LlamaCppSession, Prompt};
 //!
 //! let mut session = LlamaCppSession::from_path("models/model.gguf".into())
@@ -19,6 +26,9 @@
 //! let prompt = Prompt::default(); // + system, messages, tools, etc.
 //! let raw = session.complete_text(&prompt).unwrap();
 //! println!("{raw}");
+//! # }
+//! # #[cfg(not(feature = "llama-cpp"))]
+//! # fn main() {}
 //! ```
 //!
 //! # What `Session` does for you

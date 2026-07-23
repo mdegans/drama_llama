@@ -167,8 +167,17 @@ doc:
 # support at all, so none of the test recipes run a single one — and the
 # top-level module doc is `include_str!("../README.md")`, so the README's
 # examples are doctests. Shares `just doc`'s build.
-doctest:
-    python3 scripts/test.py doctest -c llama-cpp
+#
+#   just doctest              the llama-cpp configuration (fast; in `just check`)
+#   just doctest all          every configuration — what CI's `gate` job runs
+#
+# Use `all` before a release or after touching a doc example that names a
+# feature-gated type. A doctest is a per-configuration claim and `just
+# permutations` cannot see it: `cargo check --all-targets` does not compile
+# doctests. Three examples were broken in the moeflux-only and trait-layer
+# builds for want of this.
+doctest config="llama-cpp":
+    python3 scripts/test.py doctest -c "{{config}}"
 
 # Fast static gate: rustfmt-clean + rustdoc-clean + doctests, no model tests
 # (those are `just test`, which the pre-commit hook runs separately). Run by

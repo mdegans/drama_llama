@@ -94,10 +94,20 @@ pub const DEFAULT_N_CTX: u32 = 32768;
 /// Narrow it to a concrete backend's options with [`TryFrom`]:
 ///
 /// ```no_run
-/// # use drama_llama::{cli::BackendArgs, LlamaCppOptions};
+/// # // cfg-gated because this module is deliberately backend-agnostic
+/// # // as of #68 — `cli` no longer implies `llama-cpp` — and a
+/// # // moeflux-only build has no `LlamaCppOptions` to narrow to. The
+/// # // example outlived that change by a day and nothing noticed,
+/// # // because nothing ran doctests until 2026-07-23.
+/// # #[cfg(feature = "llama-cpp")]
+/// # fn main() -> Result<(), drama_llama::cli::UnsupportedOptions> {
+/// use drama_llama::{cli::BackendArgs, LlamaCppOptions};
 /// # let args: BackendArgs = todo!();
 /// let options = LlamaCppOptions::try_from(&args)?;
-/// # Ok::<_, drama_llama::cli::UnsupportedOptions>(())
+/// # Ok(())
+/// # }
+/// # #[cfg(not(feature = "llama-cpp"))]
+/// # fn main() {}
 /// ```
 ///
 /// The model path is deliberately absent: consumers disagree about what

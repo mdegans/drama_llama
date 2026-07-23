@@ -711,11 +711,20 @@ pub trait Backend {
     /// own synchronization if you need single-threaded sink semantics.
     ///
     /// ```no_run
-    /// # use drama_llama::{Backend, LlamaCppBackend};
+    /// # // cfg-gated: this is a doc example on a backend-AGNOSTIC trait
+    /// # // method, so naming a concrete backend makes it fail to compile in
+    /// # // every configuration that lacks one. It did, until 2026-07-23 --
+    /// # // nothing ran doctests, so nobody found out. See scripts/test.py.
+    /// # #[cfg(feature = "llama-cpp")]
+    /// # fn main() {
+    /// use drama_llama::{Backend, LlamaCppBackend};
     /// // Bridge llama.cpp into `tracing`, then load.
     /// let _ = LlamaCppBackend::set_log_callback(|level, text| {
     ///     tracing::debug!(target: "llama.cpp", ?level, "{}", text.trim_end());
     /// });
+    /// # }
+    /// # #[cfg(not(feature = "llama-cpp"))]
+    /// # fn main() {}
     /// ```
     fn set_log_callback<F>(f: F) -> Result<(), NotImplemented>
     where
