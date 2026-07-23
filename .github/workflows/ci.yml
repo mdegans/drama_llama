@@ -342,7 +342,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/runner-path
-      - uses: dtolnay/rust-toolchain@stable
+      # NIGHTLY, and only here. llvm-cov's doctest support is unstable, and
+      # doctests have to be in the number: nextest cannot run them, so they
+      # are otherwise outside both the test run and the report. Both passes
+      # must share a toolchain — profraw from a stable-built binary does not
+      # merge with profraw from a nightly-built one — so the flag switches
+      # the whole run, which is why this is a job-level toolchain rather
+      # than a `+nightly` on one command.
+      #
+      # `test` and `model` stay on stable, so nothing about correctness
+      # confidence changes. It also means every push type-checks the crate
+      # on nightly for free, which is a real second gate we would otherwise
+      # not have.
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           # cargo-llvm-cov shells out to llvm-profdata / llvm-cov from this
           # component. Without it the run fails after the whole build.
@@ -351,7 +363,9 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: link model weights
         uses: ./.github/actions/link-models
-      - run: python3 scripts/test.py coverage -c llama-cpp -t all --lcov --json
+      - run: >-
+          python3 scripts/test.py coverage
+          -c llama-cpp -t all --doctests --lcov --json
       # Before `reclaim disk`, which deletes the directory these live in.
       # `if: always()` on both: a red test run still produced coverage, and
       # the run you most want the numbers from is the one that broke

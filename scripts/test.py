@@ -497,6 +497,26 @@ def require_llvm_cov() -> None:
         )
 
 
+def require_nightly() -> None:
+    """`--doctests` is nightly-only; fail before paying for a build."""
+    try:
+        installed = subprocess.run(
+            ["rustup", "toolchain", "list"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        # No rustup (a distro toolchain, say). `cargo +nightly` will say
+        # something useful on its own; don't block on a guess.
+        return
+    if "nightly" not in installed:
+        sys.exit(
+            "--doctests needs the nightly toolchain (llvm-cov's doctest "
+            "support is unstable) — `rustup toolchain install nightly`"
+        )
+
+
 def cmd_coverage(args: argparse.Namespace) -> int:
     """Instrumented test run, then one or more reports over the same data.
 
@@ -506,13 +526,21 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     CI job can emit the human summary, the lcov for an uploader, and the
     JSON the badge is cut from without running the suite three times.
 
-    Note `--doctests` is not passed: it needs nightly rustc. The README
-    doctests therefore run under `just doc`/`cargo test --doc` and are
-    absent from these numbers.
+    `--doctests` adds a second instrumented pass over the doctests and
+    merges it into the same report. It is opt-in because llvm-cov's
+    doctest support is nightly-only — and because BOTH passes then have
+    to be nightly, since profraw written by a stable-built binary will
+    not merge with profraw from a nightly-built one. So the flag
+    switches the whole run to `cargo +nightly` rather than just the
+    doctest pass. CI takes it: `test` and `model` stay on stable, so
+    correctness confidence is unchanged, and measuring on nightly buys
+    nightly-toolchain testing for free.
     """
     if not DRY_RUN:
         require_nextest()
         require_llvm_cov()
+        if args.doctests:
+            require_nightly()
     config = resolve_config(args.config)
     warn_slow_variant(
         config, "all" if args.filter else args.tier, args.moeflux_model
@@ -527,9 +555,13 @@ def cmd_coverage(args: argparse.Namespace) -> int:
         ",".join(features),
     ]
 
+    # One toolchain for every pass. See the docstring: mixing them
+    # produces profraw the merge step cannot read.
+    cargo = ["cargo", "+nightly"] if args.doctests else ["cargo"]
+
     code = run_command(
         [
-            "cargo",
+            *cargo,
             "llvm-cov",
             "nextest",
             "--no-report",
@@ -552,6 +584,21 @@ def cmd_coverage(args: argparse.Namespace) -> int:
             f"\n!! tests exited {code}; reporting on partial data anyway",
             file=sys.stderr,
         )
+
+    if args.doctests:
+        # Second instrumented pass, same `--no-report` accumulation. Not
+        # gated on the first one passing, for the reason above.
+        rc = run_command(
+            [*cargo, "llvm-cov", "--doc", "--no-report", *cargo_features],
+            target_dir,
+            log_path(f"{name}-doc"),
+        )
+        if rc != 0:
+            print(
+                f"\n!! doctests exited {rc}; reporting anyway",
+                file=sys.stderr,
+            )
+            code = code or rc
 
     if not DRY_RUN:
         COVERAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -591,9 +638,10 @@ def cmd_coverage(args: argparse.Namespace) -> int:
         # behind, so it already knows what was built.
         rc = run_command(
             [
-                "cargo",
+                *cargo,
                 "llvm-cov",
                 "report",
+                *(["--doctests"] if args.doctests else []),
                 "--ignore-filename-regex",
                 COVERAGE_IGNORE,
                 *report,
@@ -876,6 +924,13 @@ def main() -> int:
         "--open",
         action="store_true",
         help="open the HTML report in a browser (implies --html)",
+    )
+    p_cov.add_argument(
+        "--doctests",
+        action="store_true",
+        help="also measure the doctests. Switches the WHOLE run to "
+        "`cargo +nightly` — llvm-cov's doctest support is nightly-only, "
+        "and profraw from two toolchains will not merge",
     )
     p_cov.add_argument(
         "--fail-under",

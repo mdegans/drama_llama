@@ -112,6 +112,12 @@ test mode="" filter="" *args:
 #   just coverage              everything — unignored AND model tests
 #   just coverage unignored    the fast tier only, no weights
 #   just coverage "" --html --open      browsable per-file report
+#   just coverage "" --doctests         + doctest coverage (needs nightly)
+#
+# `--doctests` is what CI runs. It switches the whole run to `cargo +nightly`,
+# because llvm-cov's doctest support is unstable and profraw from two
+# toolchains will not merge. Leave it off locally unless you're reproducing
+# CI's number — it forces a separate nightly build of everything.
 #
 # Defaults to the `all` tier because the fast tier alone reports every
 # generation path as dead code — most of this crate is only reachable with a
