@@ -131,6 +131,17 @@ jobs:
       # was filed because moeflux-only compiled as a library while ~38 of its
       # test targets had never been built by anyone.
       - run: python3 scripts/test.py check
+      # Free by construction: checkout runs `git clean -ffdx` at the START
+      # of every run, so this tree is deleted and rebuilt next time no
+      # matter what — leaving it on disk between runs buys nothing and
+      # costs ~9 GB for a Metal build, more for CUDA plus the separate
+      # `target/cpu` dir, times every registered runner. Nothing else
+      # bounds a runner account's disk use, and the box is shared.
+      # `always()` so a failed job cleans up too; artifact upload, where
+      # there is one, runs before this.
+      - name: reclaim disk
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/target"
 
   test:
     name: unignored (${{ matrix.name }})
@@ -176,6 +187,11 @@ jobs:
           name: test-logs-${{ matrix.name }}
           path: target/test-logs/llama-cpp-cpu-unignored.log
           if-no-files-found: ignore
+      # See the `gate` job: the tree is rebuilt from scratch next run
+      # regardless, so holding it costs disk and saves nothing.
+      - name: reclaim disk
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/target"
 
   model:
     name: model tests (linux, cuda)
@@ -230,3 +246,9 @@ jobs:
           name: test-logs-model
           path: target/test-logs/llama-cpp-ignored.log
           if-no-files-found: ignore
+      # See the `gate` job. This is the big one — a CUDA build plus every
+      # test binary, and the runner that holds it is the runner with the
+      # GPU jobs queued behind it.
+      - name: reclaim disk
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/target"
