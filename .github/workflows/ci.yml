@@ -103,6 +103,7 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.jobs }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/runner-path
       - uses: dtolnay/rust-toolchain@stable
       # No `--ci`: that flag drops the configurations a *hosted* runner cannot
       # build, and the whole point of this box is that it can. It has nvcc, so
@@ -134,6 +135,7 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.jobs }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/runner-path
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - name: link model weights
@@ -181,6 +183,7 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: "16"
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/runner-path
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       # Printed, not asserted: when a test dies of `unable to allocate CUDA0

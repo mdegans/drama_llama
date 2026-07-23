@@ -1,0 +1,76 @@
+name: runner PATH
+description: >
+  Put the toolchain a self-hosted runner has installed but does not expose
+  on `PATH` back on `PATH`, and fail legibly if a required tool is missing.
+
+# The GitHub runner runs under launchd (macOS) or systemd (Linux). Neither
+# sources a login shell, so neither sees `.zshrc`, `.zprofile`, or anything
+# Homebrew's shellenv wrote there — the service gets a minimal PATH captured
+# when the runner was configured. Everything installed afterwards is
+# invisible to it. This bit us twice in one run (2026-07-23): `cmake` missing
+# on macOS, `nvcc` missing on Linux, both installed, both simply not on the
+# service's PATH.
+#
+# The alternative is a `.path` / `.env` file in each runner's own directory.
+# That works, but it is per-runner state on two machines with more than one
+# runner instance each, invisible to review, and silently absent the next
+# time a runner is re-registered. This is versioned, applies everywhere at
+# once, and is a no-op on a runner that already had a sane PATH.
+#
+# Hosted runners need none of this — they preinstall cmake and put it on
+# PATH, which is exactly why the first hosted CI run never surfaced any of it.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+
+        # Candidates, in priority order: Homebrew on Apple silicon, Homebrew
+        # on Intel / the usual local prefix, and the CMake.app bundle for a
+        # .dmg install. Each is added only if it exists, so this stays a
+        # no-op on a machine laid out differently.
+        for d in /opt/homebrew/bin /usr/local/bin /Applications/CMake.app/Contents/bin; do
+          if [ -d "$d" ]; then
+            echo "$d" >> "$GITHUB_PATH"
+            PATH="$d:$PATH"
+          fi
+        done
+        export PATH
+
+        # nvcc, if this box has a CUDA toolkit. `CUDA_PATH`/`CUDA_HOME` are
+        # honoured first and in that order because llama-cpp-sys-3's build
+        # script reads exactly those two, in exactly that order, to find the
+        # link libraries — a box where they disagree with what we compile
+        # against is a box that fails confusingly at link time.
+        cuda_root="${CUDA_PATH:-${CUDA_HOME:-/usr/local/cuda}}"
+        if [ -x "$cuda_root/bin/nvcc" ]; then
+          echo "$cuda_root/bin" >> "$GITHUB_PATH"
+          PATH="$cuda_root/bin:$PATH"
+          # CMake looks for CUDACXX before it searches PATH, and naming it
+          # explicitly is what its own error message asks for.
+          echo "CUDACXX=$cuda_root/bin/nvcc" >> "$GITHUB_ENV"
+        fi
+
+        # cmake is not optional in any configuration that has a C dependency,
+        # so fail here — two seconds in, with a message that says what to do —
+        # rather than ninety seconds into a cargo build with a build-script
+        # panic and a stack trace through the `cmake` crate.
+        if ! command -v cmake >/dev/null; then
+          echo "::error::cmake is not on this runner's PATH. It is installed" \
+            "but the runner service does not see it: launchd/systemd source" \
+            "no shell rc file. Either install it somewhere this action" \
+            "already looks, or add its directory to the runner's own .path" \
+            "file and restart the service."
+          exit 1
+        fi
+
+        # Printed, not asserted: when this breaks again, the log should say
+        # which tools the job actually had rather than only which it lacked.
+        echo "cmake:  $(command -v cmake) — $(cmake --version | head -1)"
+        if command -v nvcc >/dev/null; then
+          echo "nvcc:   $(command -v nvcc) — $(nvcc --version | tail -1)"
+        else
+          echo "nvcc:   absent (fine unless this job builds the cuda feature)"
+        fi
