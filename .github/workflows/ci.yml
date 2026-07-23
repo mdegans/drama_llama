@@ -6,11 +6,26 @@
 # drift from the other by editing only one of them. If a job below needs a new
 # flag, add it to the script — do not inline a cargo invocation here.
 #
-# SCOPE: model-free only. Every `#[ignore]`d test loads 13-40 GB of weights
-# from a local disk and wants a GPU; those tiers (`ignored`, `all`, and all of
-# `just test moeflux`) stay local, permanently. What CI can do is prove the
-# permutation matrix still compiles and that the fast tier is green on an OS
-# nobody develops on.
+# RUNNERS: self-hosted, pulled forward from next session (Mike's box: 32 cores,
+# 128 GiB, a 3090). This is deliberate — hosted GH Actions minutes are a
+# limited budget Mike has run out before, and self-hosted minutes are free.
+# Until a runner is registered with matching labels the workflow simply QUEUES
+# (it does not fail and it does not touch hosted minutes), which is the point:
+# a push now costs nothing and waits for the box. See
+# `.claude/memory/plan_ci_self_hosted_runner.md` for the standup plan and the
+# open questions this does NOT yet answer:
+#   - the labels below must match what the runner is registered with;
+#   - macOS is a self-hosted VM whose Metal support is unverified — if Metal
+#     doesn't work in the VM, generation testing is NVIDIA-only and this leg
+#     stays a compile gate (or moves back to hosted `macos-latest`);
+#   - the 3090 box unlocks what no hosted runner can — `check` without `--ci`
+#     (CUDA), and the `ignored` model-test tier — but those need a `concurrency`
+#     group (a 30B model fits once; `full` caps test-threads=1) and are
+#     next-session work, not turned on here.
+#
+# SCOPE TODAY (unchanged): model-free. The commands still run `check --ci` and
+# the `unignored` tier only; no weights, no GPU. Broadening that is gated on the
+# runner existing and is designed next session.
 
 name: CI
 
@@ -32,7 +47,7 @@ concurrency:
 jobs:
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,12 +58,16 @@ jobs:
       - run: cargo fmt --check
 
   gate:
-    name: permutations (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: permutations (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - name: linux
+            runner: [self-hosted, linux]
+          - name: macos
+            runner: [self-hosted, macos]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,12 +75,14 @@ jobs:
         with:
           # llama-cpp-sys-3 builds llama.cpp through cmake; without a cache
           # key that separates the two runners they fight over one entry.
-          key: ${{ matrix.os }}-gate
+          key: ${{ matrix.name }}-gate
       # `--ci` drops the configurations a runner cannot have: `llama-cpp`
       # carries `cuda` on Linux and wants nvcc. It keeps `trait-layer` (no C
       # dependency at all), `llama-cpp-cpu`, and — on macOS only — the moeflux
       # and both-backends configurations, which compile Metal kernels but need
-      # no weights to do it.
+      # no weights to do it. (On the 3090 box with a CUDA toolchain installed,
+      # next session may drop `--ci` here to cover the `llama-cpp`/`cuda`
+      # config — untestable on any hosted runner.)
       #
       # `--all-targets` is the point of this job: a configuration building as
       # a *library* is not the same claim as its test targets building. #68
@@ -70,18 +91,22 @@ jobs:
       - run: python3 scripts/test.py check --ci
 
   test:
-    name: unignored (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: unignored (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - name: linux
+            runner: [self-hosted, linux]
+          - name: macos
+            runner: [self-hosted, macos]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.os }}-test
+          key: ${{ matrix.name }}-test
       - uses: taiki-e/install-action@nextest
       # `llama-cpp-cpu`, not `llama-cpp`: identical feature set minus `cuda`.
       # This is the same tier the pre-commit hook runs, on two OSes instead of
@@ -91,6 +116,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.os }}
+          name: test-logs-${{ matrix.name }}
           path: target/test-logs/
           if-no-files-found: ignore

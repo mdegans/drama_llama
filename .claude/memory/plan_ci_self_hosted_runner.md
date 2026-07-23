@@ -46,15 +46,30 @@ tests, which no hosted runner can. That turns CI from a compile gate into
 a real regression gate, and is the only way the `ignored` tier and CUDA
 ever get automated.
 
+### The workflow is ALREADY switched to self-hosted (`b426f3c`+, night of
+### 2026-07-22)
+
+Done ahead of standing up the runner, to keep Mike's next push off hosted
+minutes. `ci.yml` now targets `[self-hosted, linux]` and
+`[self-hosted, macos]` for all three jobs. **Consequence to expect:** with
+no runner registered yet, pushed runs sit **queued/pending** — they do not
+fail and do not spend hosted minutes. That is intended. When the runner
+registers, pending runs may pick up; cancel the stale ones if they're
+noise.
+
+**So the first thing on the box is register a runner whose labels match**
+(`self-hosted` + `linux` / `macos`). If you pick different labels, edit the
+matrix `runner:` arrays to match — GitHub matches labels literally.
+
 ### Linux leg (the straightforward one)
 
 Mike's stated plan: new dedicated account, rootless Docker, a systemd unit
 for the Docker side and one for the GH runner itself, then register the
-runner. The workflow side is a `runs-on: [self-hosted, linux, ...]` job
-calling `scripts/test.py` — the #68 invariant holds, the runner runs what
-the hook runs. Model-test jobs **need a `concurrency` group**: a 30B-class
-model barely fits once, the `full` nextest profile caps
-`test-threads = 1`, and two PRs must not land on the GPU at the same time.
+runner. The workflow side already calls `scripts/test.py` — the #68
+invariant holds, the runner runs what the hook runs. Model-test jobs (when
+added — not on yet) **need a `concurrency` group**: a 30B-class model
+barely fits once, the `full` nextest profile caps `test-threads = 1`, and
+two PRs must not land on the GPU at the same time.
 
 ### macOS leg (the uncertain one)
 
