@@ -341,6 +341,69 @@ CI-only failures to have the same flavour rather than to be regressions.
   own note that ranks 10/11 sit 0.0001 apart, and independent support for
   not asserting those numbers across quants.
 
+### Where it ended (2026-07-23)
+
+**All six jobs green, both OSes, `119 tests run: 119 passed` in 461s.**
+The arc took four CI rounds: PATH → ninja → the two real defects → the
+three data/provenance fixes.
+
+Timings, for judging whether something later has regressed:
+
+| job | time | note |
+|---|---|---|
+| `model` (linux, cuda) | ~7m45s | 119 model tests, serialized |
+| `gate` (linux) | ~3m15s | three configs, two llama.cpp builds |
+| `unignored` (macos) | ~8m04s | Metal build + 468 tests on 4 cores |
+| `unignored` (linux) | ~2m50s | |
+
+Balerion beats the Mac on the CPU-bound tests — `json_integration_lazy_grammar`
+~21s vs ~60s — because the grammar engine is rayon-parallel and rayon's
+pool defaults to `available_parallelism()`. That is now capped
+(`RAYON_NUM_THREADS`, per-runner) so it stops taking all 32 on a shared
+box. Verified in rayon-core 1.13.0 `get_num_threads`: RAYON_NUM_THREADS
+first, then `available_parallelism()` — **not** the `num_cpus` crate,
+though the deprecated `RAYON_RS_NUM_CPUS` is still honoured.
+
+### Provenance the golden now carries, and why each field exists
+
+Every one of these was added because something *looked* like identity and
+was not:
+
+- `backend` is `llama-cpp/<accel>`, not `llama-cpp` — the old value could
+  not distinguish CUDA from Metal. Only the family before the `/` is
+  asserted.
+- `model_meta.desc` carries the quant; `n_vocab` cannot.
+- `system_info` is llama.cpp's own machine view. Recorded, never
+  asserted.
+- The GPU **driver** is invisible in-process, so CI tees `nvidia-smi`
+  into the uploaded artifact — kept on green runs too, because the useful
+  one is the earlier passing run you diff a later failure against.
+
+**Determinism is measured, not assumed**: three consecutive captures on
+one machine are *bitwise* identical, logit tail included, max delta 0.0.
+So any future golden diff is cross-backend, cross-quant, or real — there
+is no run-to-run noise to budget for. Details in `tests/regression.rs`'s
+module docs.
+
+### Two wrong conclusions I reached, both the same shape
+
+Worth keeping, because the failure mode is subtle and I hit it twice in
+one session: **treating "same name" as "same inputs."**
+
+1. gpt-oss `eot` differed across machines, so I concluded the two
+   identically-named `.gguf` files must differ — "identical bytes cannot
+   give different answers." Mike's `sha256sum` said identical. The
+   reasoning was only valid if the *compiled code* were identical too,
+   and it was not: different platform, different C++ standard library.
+2. Regenerating the golden changed the logit tail, so I reported
+   run-to-run nondeterminism. The old golden had been captured on **CUDA**
+   (commit `7762b9b`, and the file's own doc comment said so); I had
+   regenerated on Metal. Cross-backend, exactly as documented.
+
+Both times the fix was the same: **establish what actually differs before
+reasoning from what appears not to.** Check the provenance of a fixture
+before treating it as a control.
+
 ### A discipline the tooling cannot enforce
 
 **Do not `git push` while the model job is in flight.** The workflow's
