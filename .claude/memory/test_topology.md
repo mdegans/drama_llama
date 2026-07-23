@@ -270,6 +270,55 @@ generation path as dead code — `engine.rs` 0%, `llama_cpp/decoder.rs` 0%,
 `session/mod.rs` 32% — because most of this crate is only reachable with a
 model loaded. A badge cut from the unignored tier would be a lie.
 
+#### A spawned binary needs a graceful shutdown or it contributes NOTHING
+
+**The generalizable lesson of this arc.** `tests/blallama.rs` spawns the
+real binary and drives a full `/v1/messages` completion through it. None
+of that was counted, because `Drop for Server` used `Child::kill()` —
+SIGKILL, uncatchable — and the LLVM profiling runtime writes its
+`.profraw` from an **`atexit` handler**, which a signal-killed process
+never reaches.
+
+The tell was diagnostic and is worth reusing: blallama's coverage was
+**byte-identical (17.64%)** whether the integration tier ran or was
+skipped outright. If a subprocess-driving test suite moves a binary's
+coverage by exactly zero, the profile is not being written — do not go
+looking for missing tests.
+
+Fixed by giving blallama `with_graceful_shutdown` on a SIGTERM/SIGINT
+future so `main` returns normally, and having the test send SIGTERM (via
+`libc`, a dev-dependency; std has no portable signal sender) with a 10 s
+deadline before falling back to SIGKILL. **17.64% → 49.41%, zero new
+tests.** SIGTERM alone would not have sufficed: Rust installs no handler,
+and the default action also skips `atexit`. Both halves are required.
+
+Note the *denominator* moved too, 533 → 933 lines. The real binary
+carries monomorphizations the test-harness build never instantiates, so
+we had not merely been missing coverage — we had been measuring a
+smaller, wrong version of the file. Same effect crate-wide: total lines
+went 23 684 → 27 919 once the real binary was profiled. Anything that
+reuses this pattern (`regurgitater`, see [#71]) inherits the bug.
+
+#### Current numbers, and the two exclusions
+
+**84.46% lines** / 84.51% regions / 83.09% functions at `-c llama-cpp -t
+all`. The standing target is **>90% before publish** — Mike's standard,
+his reasoning being that code which isn't covered is broken, so nothing
+critical should be missing it.
+
+`COVERAGE_IGNORE_DIRS` holds two *kinds* of exclusion, deliberately kept
+apart because they are different claims:
+
+- **by category** — `tests/`, `examples/`, `benches/`: test inputs, ~100%
+  covered by definition.
+- **by decision** — `bin/regurgitater`, `bin/settings_tool`: demos, ~284
+  lines, ~1.2 points. Mike's call, recorded in [#71] with what it would
+  take to bring them back in (`egui_kittest` 0.34.x for the latter).
+
+`bin/blallama` is **not** excluded — it is a real serving surface.
+
+[#71]: https://github.com/mdegans/drama_llama/issues/71
+
 Three llvm-cov gotchas, each of which cost a run:
 
 - `cargo llvm-cov report` **rejects** `--features` / `--no-default-features`
