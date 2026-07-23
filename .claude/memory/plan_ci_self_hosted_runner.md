@@ -272,35 +272,83 @@ directory are both configurations no developer here runs**, so they are
 exactly where the untested assumptions were. Expect the next batch of
 CI-only failures to have the same flavour rather than to be regressions.
 
-### Three left, and two are not code
+### The other three, all resolved — and one is an upstream bug
 
-- **`all_shapes_match_python_jinja2`** — `uv` is not installed on
-  balerion (`/usr/bin/env: 'uv': No such file or directory`). Install it.
-  Deliberately NOT added to `runner-path`'s required-tools list: one test
-  needs it, and failing the whole job early over it would be worse than
-  the one red test.
-- **`gptoss_eog_token_set`** — `eot()` is `<|endoftext|>` on the box and
-  `<|end|>` on the Mac, with `eos()` == `<|return|>` on both. Same
-  `llama-cpp-sys-3 0.8.1` from `Cargo.lock`, same code path, so identical
-  bytes cannot give different answers: **the two
-  `gpt-oss-20b-UD-Q8_K_XL.gguf` files are different files.** `/models`'
-  is dated Jul 10, the laptop's Jul 13; unsloth re-uploads "UD" quants and
-  tokenizer metadata is what changes. Laptop reference: `file size =
-  12.28 GiB (5.04 BPW)`, `n_vocab = 201088`. **Fix by re-syncing the
-  file, not by touching the test** — the pin is doing precisely the job
-  its doc comment describes. Note the contrast with the Qwen quant, which
-  is a difference Mike *chose*; this one is accidental drift between two
-  copies sharing a name, and argues for `/models` being the single source
-  that the laptop syncs *from*.
-- **`regression_llama_cpp_baseline`** — `token 11 ',' drifted 0.5926 >
-  tol 0.5`, `max_drift=0.9906`, `shared_ids=15/20`, `cosine=0.787`.
-  Golden captured on IQ4_XS, box runs IQ3_S. **Mike's call, and he asked
-  to see it**: he wants the tests flexible enough to span Qwen variants.
-  Do NOT widen the tolerance — per [[logit_comparability_across_backends]]
-  a widened tolerance that covers a membership change hides the thing the
-  test exists to detect, and `shared_ids=15/20` *is* a membership change.
-  The honest options are re-baselining per box, or recording which model a
-  golden came from and refusing to compare across variants.
+- **`all_shapes_match_python_jinja2`** — `uv` was not on the *service's*
+  PATH (`/usr/bin/env: 'uv': No such file or directory`). Third instance
+  of the PATH failure above; `$HOME/.local/bin` added to `runner-path`.
+  Deliberately NOT in that action's required-tools list: one test needs
+  uv, and failing the whole job early over it is worse than one red test.
+
+- **`gptoss_eog_token_set` — an upstream llama.cpp bug, and my first
+  diagnosis was wrong.** `eot()` is `<|end|>` on macOS and
+  `<|endoftext|>` on Linux. I concluded the two `.gguf` files must
+  differ, reasoning that identical bytes and a pinned `llama-cpp-sys-3`
+  cannot produce different answers. Mike ran `sha256sum`: **identical**.
+  The reasoning was only ever valid if the *compiled code* were identical
+  too, and it is not — different platform, different C++ standard
+  library.
+
+  `llama_vocab::impl::load` auto-detects EOT by iterating `token_to_id`
+  and taking the **first** entry whose text is on a candidate list
+  (llama-vocab.cpp, loop at ~2564). `token_to_id` is a
+  `std::unordered_map<std::string, llama_token>` (~1811). Iteration order
+  of an unordered container is unspecified, so for any vocab holding two
+  or more candidates the winner is whichever the standard library hashed
+  first. gpt-oss holds both `<|end|>` and `<|endoftext|>`. libc++ yields
+  one, libstdc++ the other. **Worth reporting upstream**; Mike notes it
+  may already have changed, and a `llama-cpp-sys` bump will tell us.
+
+  Harmless for us *precisely because* of
+  [[eog_is_not_eos_plus_eot]] — we stop on `eog_tokens()` and never on a
+  set built from `eot()`. The label wobbles across platforms; the
+  predicate does not. That memo's thesis is now load-bearing rather than
+  cautious.
+
+  The test was also **hiding its own point**: the eot pin ran *before*
+  the eog assertions, so on Linux it aborted first and the
+  `<|end|>`-stays-generatable carve-out — the entire reason the test
+  exists — was never verified there. Reordered, and the pin now accepts
+  either value.
+
+- **`regression_llama_cpp_baseline` — the golden is now cross-quant.**
+  Mike's ask: cross-quant invariance is desirable, at least across the
+  quants we actually use.
+
+  Measured before deciding. Running IQ3_S against the IQ4_XS golden,
+  `prompt_tokens`, `tokens` and `pieces` reproduce **exactly**; only
+  logit magnitudes move (0.59-0.99 nats, 15/20 shared ids at prefill).
+  So the harness's teeth — `tokens` alone is 32 argmax assertions over a
+  248k vocab — are quant-invariant. They are now asserted
+  unconditionally, while magnitudes are asserted only against the quant
+  that produced them and otherwise fall back to the treatment
+  `logits_step_n` already gets (argmax asserted, tail printed). Same rule
+  the file already encoded, applied along one more axis.
+
+  **Not** a widened tolerance: 15/20 shared ids is a membership change,
+  and per [[logit_comparability_across_backends]] a tolerance loose
+  enough to swallow one has stopped testing what it exists to test.
+
+  The old identity guard could not have caught this: it compared
+  `model_meta.n_vocab`, which is equal across every quant of one model —
+  an architecture check wearing an identity label. `model_meta.desc` now
+  carries llama.cpp's own description, which names the quant
+  (`qwen35moe 35B.A3B IQ4_XS - 4.25 bpw`).
+
+  Side finding from regenerating the golden: **top-K membership is not
+  stable run-to-run on one machine either** — token-level signals came
+  back byte-identical, the logit tail did not. Consistent with the file's
+  own note that ranks 10/11 sit 0.0001 apart, and independent support for
+  not asserting those numbers across quants.
+
+### A discipline the tooling cannot enforce
+
+**Do not `git push` while the model job is in flight.** The workflow's
+`concurrency.cancel-in-progress: true` is Mike's stated preference and is
+right in general, but it cancels the *whole run*, and a job-level
+concurrency group cannot opt out of that. Cost a live GPU job once here.
+Check `gh run view --json jobs` first; a *queued* model job is free to
+supersede, a running one is not.
 
 ## Open issues
 

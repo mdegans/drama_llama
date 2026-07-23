@@ -160,6 +160,14 @@ jobs:
     env:
       CARGO_BUILD_JOBS: ${{ matrix.jobs }}
       CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.jobs }}
+      # Capping builds left the *tests* uncapped: the grammar engine uses
+      # rayon, whose global pool defaults to
+      # `std::thread::available_parallelism()` — all 32 logical CPUs here
+      # (rayon-core `get_num_threads`). Same per-runner number as the
+      # build cap. Unlike NEXTEST_TEST_THREADS this is safe: it bounds CPU
+      # inside one test process and has nothing to do with the GPU
+      # serialization that keeps two models off one card.
+      RAYON_NUM_THREADS: ${{ matrix.jobs }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/runner-path
@@ -213,15 +221,25 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "16"
       CMAKE_BUILD_PARALLEL_LEVEL: "16"
+      # See the `test` job: rayon's default pool is every logical CPU.
+      RAYON_NUM_THREADS: "16"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/runner-path
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
-      # Printed, not asserted: when a test dies of `unable to allocate CUDA0
-      # buffer`, the first question is what else was resident.
+      # Two jobs in one. Printed, because when a test dies of `unable to
+      # allocate CUDA0 buffer` the first question is what else was
+      # resident. And saved, because the driver moves under us on
+      # unattended upgrades, and a logit-level golden diff is only
+      # interpretable next to the driver that produced it. The regression
+      # harness records llama.cpp's own view of the machine, but nothing
+      # in-process can see the driver version — this is where it comes
+      # from. Job logs age out; the artifact rides with the run.
       - name: gpu
-        run: nvidia-smi
+        run: |
+          mkdir -p target/test-logs
+          nvidia-smi | tee target/test-logs/nvidia-smi.txt
       - name: link model weights
         uses: ./.github/actions/link-models
       # `-c llama-cpp` is the CUDA configuration on Linux, and `-t ignored`
@@ -245,6 +263,16 @@ jobs:
         with:
           name: test-logs-model
           path: target/test-logs/llama-cpp-ignored.log
+          if-no-files-found: ignore
+      # Kept on success too, unlike the test log. A few KB, and its whole
+      # value is being there for the *earlier* green run you want to diff
+      # a later red one against.
+      - name: upload gpu environment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-env
+          path: target/test-logs/nvidia-smi.txt
           if-no-files-found: ignore
       # See the `gate` job. This is the big one — a CUDA build plus every
       # test binary, and the runner that holds it is the runner with the
