@@ -52,10 +52,26 @@
 
 name: CI
 
+# A memory note or a README typo must not spend eight minutes of the one
+# GPU on this box. `.githooks/pre-commit` already makes exactly this call
+# locally ("Non-Rust commits (memory notes, docs, fixtures) skip both checks
+# — nothing they touch can break a build"); this is the same rule at the
+# other end of the chain, and it exists because it was violated within
+# minutes of the model job first going green.
+#
+# `paths-ignore` and not `paths`: the default must be to run. A new
+# directory nobody thought about should cost a CI run, not silently skip
+# one. Note this would need revisiting if these jobs ever become *required*
+# checks — a skipped required check blocks a merge rather than passing it.
 on:
   push:
     branches: [main, "v*"]
+    paths-ignore: &docs
+      - ".claude/**"
+      - "**.md"
+      - "LICENSE*"
   pull_request:
+    paths-ignore: *docs
   workflow_dispatch:
 
 env:
