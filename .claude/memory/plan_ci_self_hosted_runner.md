@@ -150,29 +150,76 @@ is *identical* to `llama-cpp` because Metal is unconditional in llama.cpp's
 build; what actually keeps the GPU out of it is that the unignored tier
 puts nothing there (`n_gpu_layers = 0`) and the `model` job is Linux-only.
 
-### What a fresh runner actually needs (checked in the sources, 2026-07-23)
+### What a fresh runner actually needs
 
-- **`cmake`, and it is the one CLT does not give you.** `llama-cpp-sys-3`
-  drives llama.cpp through `cmake::Config::new("external/llama.cpp").build()`,
-  which shells out to a `cmake` binary. Hosted `macos-latest` has it
-  preinstalled, which is why the first CI run never surfaced this; a bare
-  VM does not. `brew install cmake`.
+Two of the three were learned the hard way on 2026-07-23, and they were
+**all the same failure wearing different hats** — see the PATH note below.
+
+- **`cmake` AND `ninja`.** `llama-cpp-sys-3`'s build script drives
+  llama.cpp through `cmake::Config::new(..).generator("Ninja")` — the
+  generator is *hard-coded* there, so ninja is not a preference CI could
+  route around by choosing Makefiles. Neither ships with Xcode CLT. Hosted
+  `macos-latest` preinstalls both, which is exactly why the first hosted CI
+  run never surfaced either. `.github/actions/runner-path` now checks both
+  up front and names whichever is missing.
 - **Xcode Command Line Tools** — clang, the macOS SDK, libclang for
   bindgen, git, python3.
 - **rustup**, for `dtolnay/rust-toolchain@stable` to have something to
   drive.
-- **NOT the Metal toolchain.** This was predicted and it was wrong: neither
-  crate compiles a `.metal` file at build time. `llama-cpp-sys-3` sets
-  `GGML_METAL_EMBED_LIBRARY=ON`, which embeds the shader *source* and
-  compiles it at runtime through the Metal framework; the published
-  `moeflux` crate has **no build.rs at all** and does
-  `include_str!("shaders.metal")` + `new_library_with_source`
-  (`src/riir/backend/gpu/metal.rs`). So full Xcode is not needed to
-  *compile*. Whether Metal *runs* in the VM is a separate, still-open
-  question — and one CI does not currently ask, since macOS is CPU-only.
+- **NOT the Metal toolchain.** Predicted as a blocker, wrong, and now
+  disproven empirically as well as from source: the `moeflux` and
+  `trait-layer` configurations both checked clean on the CLT-only VM.
+  Neither crate compiles a `.metal` at build time — `llama-cpp-sys-3` sets
+  `GGML_METAL_EMBED_LIBRARY=ON` (embeds the shader *source*, compiles it at
+  runtime through the Metal framework) and the published `moeflux` crate
+  has **no build.rs at all**, just `include_str!("shaders.metal")` +
+  `new_library_with_source` (`src/riir/backend/gpu/metal.rs`). Whether
+  Metal *runs* in the VM remains open — CI does not ask, macOS being
+  CPU-only.
 - Both `llama-cpp-sys-3` and `moeflux` are crates.io dependencies with
   vendored sources — no submodules, no sibling working copies. The
   `[patch.crates-io]` class of blocker that held #51 up cannot recur here.
+
+### The failure mode to suspect first: the runner service's PATH
+
+Every single failure of the first two real runs was this, and it will be
+the first guess for the next unexplained one too. The runner runs under
+**launchd (macOS) / systemd (Linux)**, neither of which sources a login
+shell. So `.zshrc`, `.zprofile`, `.zshenv`, `brew shellenv` — none of it is
+visible to the service, which gets a minimal PATH snapshotted when the
+runner was configured. **Everything installed afterwards is invisible.**
+
+It cost three separate-looking failures: no `.zshrc` to put
+`DRAMA_LLAMA_MODELS` in (answer: `~/actions-runner/.env`), `cmake` not
+found on macOS, `nvcc` not found on Linux — the latter reported as
+`No CMAKE_CUDA_COMPILER could be found` *while CMake had located the CUDA
+toolkit headers at /usr/local/cuda perfectly well*. Read that message
+carefully if it recurs: "could be found" is PATH, whereas "The CUDA
+compiler identification is unknown" would be a host-compiler mismatch and
+an entirely different fix.
+
+Fixed in-repo (`.github/actions/runner-path`) rather than per-runner,
+because per-runner `.path`/`.env` state is invisible to review, multiplies
+by runner instance — the Linux paths say `runner-1`, and Linux jobs from
+one workflow run were observed executing **concurrently**, so there is more
+than one — and evaporates the next time a runner is re-registered. The
+action no-ops on any runner that already has a sane PATH.
+
+**Corollary worth remembering: more than one Linux runner is registered.**
+The GPU concurrency group on the `model` job is therefore load-bearing, not
+belt-and-braces.
+
+### Measured build times (2026-07-23, run 30003151215)
+
+Mike's "builds are quick on balerion" was right by a wide margin, and this
+is what retires the `clean: false` question — there is nothing here worth
+the stale-file hazard.
+
+- `permutations (linux)`, **clean tree, all three Linux configurations**
+  (trait-layer, llama.cpp+CUDA, llama.cpp-CPU — two full cmake+ninja
+  llama.cpp builds among them): **3m16s**.
+- `llama-cpp-cpu` alone, from-scratch llama.cpp build plus
+  `check --all-targets`: ~36s.
 
 **Watch for mmap over the share.** llama.cpp mmaps weights by default, and
 mmap over a Parallels shared folder is the kind of thing that either works
