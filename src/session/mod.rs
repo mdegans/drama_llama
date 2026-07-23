@@ -7143,6 +7143,13 @@ mod tests {
         );
 
         // Cache OFF: honestly not reported.
+        //
+        // Drop the cache-on session first — nothing below needs it, and
+        // holding both alive means two copies of the weights resident at
+        // once. That is free on a 96 GB unified-memory Mac and impossible
+        // on CI's 24 GB card, where the second load simply fails: 13 GB +
+        // 13 GB does not fit. The test is about counters, not residency.
+        drop(session);
         let mut off = crate::LlamaCppSession::from_path(model_path())
             .unwrap()
             .quiet();
