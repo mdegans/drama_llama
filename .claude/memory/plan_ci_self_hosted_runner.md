@@ -125,9 +125,30 @@ compile-and-fast-tests gate; Metal generation is covered by the pre-commit
 hook on the machine we develop on.
 
 The `test` job's four metadata tests need `models/model.gguf` there too, so
-the host's models directory is shared into the VM and `DRAMA_LLAMA_MODELS`
-points at wherever Parallels mounts it (the `link-models` action reads it;
-the mount point is not hard-coded anywhere).
+the host's models directory is shared into the VM **read-only**, landing at
+`/Volumes/My Shared Files/models` (note the spaces — every path in the
+`link-models` action is quoted for exactly this). `DRAMA_LLAMA_MODELS`
+points at it.
+
+**Set it in `~/actions-runner/.env`, not in a shell rc file.** The runner
+runs under launchd (macOS) / systemd (Linux); neither sources `.zshrc`,
+`.zprofile`, or `.zshenv`. `.env` in the runner's own directory is the
+documented mechanism and is read by `runsvc.sh` on both platforms. No
+quotes around the value — the file is parsed as `KEY=rest-of-line`, so
+quotes would end up *in* the path.
+
+Note the share carries Mike's laptop layout, so on macOS `model.gguf` is
+the **IQ4_XS** Qwen while on Linux it is IQ3_S. Free variant coverage,
+and the reason a metadata assertion could in principle disagree across
+the two legs.
+
+**macOS is CPU-only in CI, and that is now a decision rather than a
+default** (Mike, 2026-07-23) — Metal in the VM is unproven and weights
+come over a share. Worth knowing what "CPU-only" can and cannot mean here:
+the crate has no switch for it. On macOS the `llama-cpp-cpu` configuration
+is *identical* to `llama-cpp` because Metal is unconditional in llama.cpp's
+build; what actually keeps the GPU out of it is that the unignored tier
+puts nothing there (`n_gpu_layers = 0`) and the `model` job is Linux-only.
 
 **Watch for mmap over the share.** llama.cpp mmaps weights by default, and
 mmap over a Parallels shared folder is the kind of thing that either works
