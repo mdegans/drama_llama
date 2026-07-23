@@ -581,9 +581,11 @@ Open, minor, deliberately not release blockers:
   upstream, so C++ `bad_alloc` would unwind across `extern "C"` into
   Rust — OOM-only, upstream defect; the siblings
   (`mtmd_tokenize`/`mtmd_encode_chunk`/`mtmd_init_from_file`) all
-  catch. **Filed 2026-07-23: ggml-org/llama.cpp#26047** (drafted by
-  Fable, filed via Mike's `gh`, AI-provenance stated in the body).
-  Watch for the fix, then bump; nothing to do our side.
+  catch. **Reported upstream 2026-07-23; tracked there, nothing to do
+  our side.** No action needed here — this line is the whole record;
+  don't go re-read the upstream thread to check status (it's an
+  OOM-only robustness fix and there's nothing for us to act on until
+  a version bump surfaces it naturally).
 - **F2**: `CausalAttnGuard` restores `true`, not the prior value —
   wrong only if a non-causal (embeddings) context ever runs image
   prefill; nothing in-crate does today.
