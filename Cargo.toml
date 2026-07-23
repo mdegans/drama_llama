@@ -2,14 +2,22 @@
 name = "drama_llama"
 version = "0.8.0"
 edition = "2021"
-description = "A library for language modeling and text generation."
+description = "Local LLM inference behind an Anthropic-shaped API: llama.cpp and Metal-MoE backends, chat sessions with prefix caching, per-model tool-call dialects, and GBNF-constrained structured output."
 license-file = "LICENSE.md"
 repository = "https://github.com/mdegans/drama_llama"
+keywords = ["llm", "llama", "inference", "text-generation", "gguf"]
+categories = ["text-processing", "api-bindings", "science"]
 # Keep session memory, agent instructions, and (especially) the
 # detect-infringement corpus out of the published crate. The corpus
 # contains copyrighted text used locally for testing; it must not be
 # redistributed via crates.io. Nothing in src/ references it.
-exclude = [".claude/", "CLAUDE.md", "tests/data/", "**/.DS_Store"]
+exclude = [
+    ".claude/",
+    "CLAUDE.md",
+    "tests/data/",
+    "**/.DS_Store",
+    "**/__pycache__/",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
