@@ -82,14 +82,19 @@ on:
       - "!.claude/**"
       - "!**.md"
       - "!LICENSE*"
-      # ...except these two, which `src/lib.rs` pulls in with
-      # `include_str!` — the README as the crate-level docs (so its
-      # examples are doctests that CI compiles) and TERMS_OF_USE.md as
-      # `drama_llama::TOS`. Editing either is editing source: a README
-      # typo in a ```rust block fails the `doctest` job. Order matters
-      # here — a positive pattern after a negative one re-includes.
+      # ...except this one. `src/lib.rs` mounts it as the crate-level
+      # docs with `include_str!`, so its ```rust blocks are doctests the
+      # `gate` job compiles, and a typo in one turns the tree red.
+      # Editing it is editing source. Order matters here — a positive
+      # pattern after a negative one re-includes.
+      #
+      # TERMS_OF_USE.md is deliberately NOT here, though `src/lib.rs`
+      # `include_str!`s it too as `drama_llama::TOS`. The difference is
+      # what an edit can do: the README carries compiled code, that file
+      # carries prose. Changing it alters one string constant, which
+      # nothing validates and no test can fail on — so a wording change
+      # should not cost a 36-minute run and a turn on the GPU.
       - "README.md"
-      - "TERMS_OF_USE.md"
   pull_request:
     paths: *source
   workflow_dispatch:

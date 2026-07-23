@@ -24,13 +24,18 @@ cd "$(git rev-parse --show-toplevel)"
 # Non-Rust commits (memory notes, docs, fixtures) skip both checks — nothing
 # they touch can break a build, and a docs typo shouldn't cost a test run.
 #
-# README.md and TERMS_OF_USE.md are the exceptions, and they are why this list
-# is not just "*.rs": `src/lib.rs` pulls both in with `include_str!`. The
-# README is the crate-level documentation, so its ```rust blocks are doctests
-# that `just check` compiles and runs. A README edit really can turn the tree
-# red, and skipping the gate for it would let that reach CI.
+# README.md is the exception, and it is why this list is not just "*.rs":
+# `src/lib.rs` mounts it as the crate-level documentation with `include_str!`,
+# so its ```rust blocks are doctests that `just check` compiles and runs. A
+# README edit really can turn the tree red, and skipping the gate for it would
+# let that reach CI.
+#
+# TERMS_OF_USE.md is `include_str!`d too (as `drama_llama::TOS`) and is
+# deliberately absent: it carries prose, not code. An edit changes one string
+# constant, which nothing validates and no test can fail on. Same rule as
+# ci.yml's `paths` filter, for the same reason.
 staged="$(git diff --cached --name-only --diff-filter=ACMR)"
-if ! grep -qE '(\.rs$|^Cargo\.(toml|lock)$|^justfile$|^rustfmt\.toml$|^README\.md$|^TERMS_OF_USE\.md$)' <<<"$staged"; then
+if ! grep -qE '(\.rs$|^Cargo\.(toml|lock)$|^justfile$|^rustfmt\.toml$|^README\.md$)' <<<"$staged"; then
     echo "pre-commit: no Rust/build changes staged — skipping fmt + tests"
     exit 0
 fi

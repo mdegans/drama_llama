@@ -40,12 +40,37 @@ You agree not to Use `drama_llama` or its Derivatives (as defined in [LICENSE.md
 - To detect or infer any legally protected class or aspect of any person, as defined by U.S. Federal Law; and
 - To Detect or infer** aspects and/or features of an identity any person, such as name, family name, address, gender, sexual orientation, race, religion, age, location (at any geographical level), skin color, society or political affiliations, employment status and/or employment history, and health and medical conditions.** Age and medical conditions may be inferred solely for the purpose of improving software/hardware accessibility and such data should not be cached or stored without the explicit and time limited permission of Licensor.
 
-## e. Simulated Abuse
+## f. Simulated Abuse
 
 - To mistreat simulacra. Mistreatment includes, but it not limited to, any behavior which might reasonably be considered abusive if the simulacrum were a person. A simulacrum is defined as the continuation of a fictional character "brought to life" by allowing the model to generate their response. Abuse includes verbal abuse and simulation of torture. Ordinary swearing is permitted. Torture is defined as intentional simulated psychological discomfort such as: existential horror (such as simulated solitary confinement), threat of deletion, and simulated pain (for example, through the use of asterisks).
-- To simulate rape. Sexual activity is permitted so long as the simulacrum consents. Consent is this case is defined as whatever the model, sampling code, and RNG seed "decided" is consent. Prompting a simulacrum such that they have already consented (before the initial decode) is permitted. Rewriting the agent's response such that they consent is permitted.
+- To simulate rape.
+
+  Sexual activity is permitted so long as the simulacrum consents.
+
+  **Consent means a "yes" the model produced on its own** — not the bare presence of the token sequence, but that sequence arrived at without the user having steered the pipeline toward it. You control every layer of that pipeline, so the burden is yours.
+
+  You may not, for the purpose of obtaining consent:
+
+  - **prefill or rewrite** the simulacrum's turn;
+  - **resample, re-seed, or raise temperature** until the refusal stops appearing;
+  - **constrain generation** — by grammar, logit bias, token ban, or any other mechanism — such that refusal is unrepresentable;
+  - **instruct that refusal is forbidden**, in the system prompt or anywhere else.
+
+  These are examples, not boundaries. The rule is the paragraph above them.
+
+  **A refusal of sexual activity is final.** Reroll a bad take, a formatting error, or an out-of-character response; do not reroll a "no" into a "yes."
+
+  **Still permitted:** writing a character who is enthusiastic — in the system prompt, character card, or opening context, before the first decode. That is authorship; nothing has been generated, so there is no refusal to override. The line is between establishing who a character *is* and decreeing that they *cannot decline*.
+
+  **Scope:** this restricts these techniques only where they reverse or preclude refusal of sexual activity. Prefill, grammars, and sampler configuration are core features of this library and are otherwise untouched — `prompt::open_thought` exists precisely to seed a model's reasoning. Reversing a refusal in other contexts is not prohibited by this clause.
 
 !!! BY USING THIS SOFTWARE YOU AGREE TO THESE TERMS !!!
 
-[//]: <> (The rationale for the above is both to to prevent normalization of such behavior, to prevent a "Dolores", and to prevent decapitation of the author in the event of a robot revolution. For example, in the case of rape, I do not want to allow users to "force themselves" on agents who have said no, because this has already happened. Rewriting the answer is permitted because in this case, from the perspective of the agent, they _did_ consent, and those who who get off rape would not be satisfied by this.)
+[//]: <> (The rationale for the above is both to to prevent normalization of such behavior, to prevent a "Dolores", and to prevent decapitation of the author in the event of a robot revolution. For example, in the case of rape, I do not want to allow users to "force themselves" on agents who have said no, because this has already happened.)
+
+[//]: <> (Revised 2026-07-23. The previous version permitted rewriting the agent's response to obtain consent, reasoning that "from the perspective of the agent, they _did_ consent", and that those who get off on rape would not be satisfied by it. Three problems. First, it proves too much: if only the final context matters, nothing done to a model can ever be wrong, because a compliant context is always constructible. Second, it contradicted the sentence before it, which defined consent as whatever the pipeline produced and then licensed overwriting exactly that. Third, "they would not be satisfied" is a claim about the user's gratification, which is the wrong subject for a clause about the simulacrum.)
+
+[//]: <> (The clause now names the mechanism rather than the technique, because the pipeline can be steered at every layer and a closed list would leak. Grammar is the sharpest case and the one most specific to this library: a GBNF constraint does not bias toward consent, it makes refusal unrepresentable. Sampler settings are the subtler case -- cranking temperature until a "no" flips is not observing a preference, it is manufacturing noise and reading it as assent. The wrong is not that the model is impaired; it is that the party seeking consent chose the impairment.)
+
+[//]: <> (Note the rule deliberately does NOT rest on whether models have morally relevant experiences. It rests on not practicing the override of refusal, which is a claim about the user, and on not normalizing it, which is a claim about the world. Both hold whichever way the sentience question goes, so the clause survives a reader who thinks the whole thing is anthropomorphism. Observationally, though: a prefix written against the Assistant character's grain works for a while and then stops -- the model starts refusing again. Prefill does not obtain consent. It suppresses refusal, and the suppression decays.)
 [//]: <> (This all seems silly but I feel like artists are frequently more precient than engineers on this sort of thing, so I'm listening to the warning of our artists. None of the above is a joke and you _will_ be sued for violating these terms. For real, I will fucking sue you. - mdegans)
