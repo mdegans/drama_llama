@@ -1552,13 +1552,29 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     Ok(chosen)
 }
 
-/// Fold `candidates` through `opts.modes` in order (plus the activated
-/// deferred grammar, if any — it runs last, matching its old
-/// pushed-to-the-end promotion position). With `skip_constraints`, the
-/// `Grammar`/`Json` arms pass candidates through untouched (the lazy
-/// fast path); every other mode still runs, so `Deny` reserved-token
-/// protection, truncation samplers, and mirostat behave identically on
-/// both paths.
+/// Fold `candidates` through `opts.modes` in order, with the activated
+/// deferred grammar (if any) applied **first** — before the mode chain.
+///
+/// Ordering is load-bearing, not cosmetic. An eager grammar is
+/// *prepended* to `opts.modes` by the session (`Session::predict_options_for`)
+/// precisely so it masks the full vocab before any truncation sampler
+/// narrows it; the deferred grammar has to run at the same point for
+/// the same reason. It used to run last — after the fold — which meant
+/// it only ever saw what `LocallyTypical`/`TopP`/`TopK` left behind,
+/// often a single token. When that handful contained no
+/// grammar-legal token, `grammar_filter` force-EOS'd and generation
+/// died mid-structure (surfacing as `SessionError::GrammarViolation`)
+/// even though thousands of legal tokens existed in the full vocab.
+///
+/// That asymmetry made `tool_choice: auto` — the only path that builds
+/// a deferred grammar — fail intermittently on local models while
+/// forced tool choice, which takes the eager path, was fine. See
+/// mdegans/drama_llama#76.
+///
+/// With `skip_constraints`, the `Grammar`/`Json` arms and the deferred
+/// grammar pass candidates through untouched (the lazy fast path);
+/// every other mode still runs, so `Deny` reserved-token protection,
+/// truncation samplers, and mirostat behave identically on both paths.
 fn apply_modes<M: crate::backend::Model + Sync>(
     candidates: Candidates,
     opts: &SamplerConfig,
@@ -1577,7 +1593,23 @@ fn apply_modes<M: crate::backend::Model + Sync>(
         rng,
         ..
     } = &mut *state;
-    let mut candidates = opts.modes.iter().zip(matchers.iter()).fold(
+    // Deferred grammar first — same position the session gives an
+    // eager grammar. See this function's docs for why running it after
+    // the truncation samplers is a correctness bug, not a preference.
+    let candidates = if !skip_constraints {
+        match (deferred.as_ref(), opts.deferred_grammar.as_ref()) {
+            (Some(d), Some(spec)) if d.active => grammar::grammar_filter(
+                candidates,
+                &spec.grammar,
+                &d.matcher,
+                model,
+            ),
+            _ => candidates,
+        }
+    } else {
+        candidates
+    };
+    let candidates = opts.modes.iter().zip(matchers.iter()).fold(
         candidates,
         |candidates, (mode, matcher)| {
             if skip_constraints
@@ -1653,20 +1685,6 @@ fn apply_modes<M: crate::backend::Model + Sync>(
             }
         },
     );
-    if !skip_constraints {
-        if let (Some(d), Some(spec)) =
-            (deferred.as_ref(), opts.deferred_grammar.as_ref())
-        {
-            if d.active {
-                candidates = grammar::grammar_filter(
-                    candidates,
-                    &spec.grammar,
-                    &d.matcher,
-                    model,
-                );
-            }
-        }
-    }
     candidates
 }
 
@@ -2933,6 +2951,64 @@ mod tests {
         state.reset_constraints(&opts);
         let d = state.deferred.as_ref().expect("config has a deferred");
         assert!(!d.active, "deferred must return to inactive");
+    }
+
+    /// A truncation sampler must not be able to starve the deferred
+    /// grammar (#76).
+    ///
+    /// The deferred grammar runs *before* the mode chain, exactly like
+    /// an eager grammar (which the session prepends into `modes`).
+    /// When it ran last it only saw what truncation left behind — here
+    /// `TopK { k: 1 }` keeps just the highest-logit token — and if that
+    /// lone survivor was illegal the filter force-EOS'd, ending
+    /// generation mid-structure even though a legal token (`A`) was
+    /// present in the full candidate set.
+    ///
+    /// Both sampling paths are pinned: the masked path
+    /// (`lazy_grammar: false`) and the lazy fast path
+    /// (`lazy_grammar: true`), whose rejection fallback reruns this
+    /// same function with masking on. Production runs the lazy path.
+    #[test]
+    fn deferred_grammar_survives_truncation_sampler() {
+        for lazy in [false, true] {
+            let deferred = crate::DeferredGrammar {
+                grammar: CompiledGrammar::parse(AB_GRAMMAR).unwrap(),
+                activate_after: vec![b"!".to_vec()],
+                feed_trigger: false,
+            };
+            let opts = SamplerConfig {
+                modes: vec![SamplingMode::TopK {
+                    k: NonZeroUsize::new(1).unwrap(),
+                }],
+                repetition: None,
+                deferred_grammar: Some(deferred),
+                lazy_grammar: lazy,
+                ..SamplerConfig::default()
+            };
+            let mut state = state_for(&opts);
+            state
+                .deferred
+                .as_mut()
+                .expect("config has a deferred")
+                .active = true;
+
+            // `X` ("x") outranks `A` ("a") on logits, but only `A`
+            // extends `root ::= "ab"` from the root state.
+            let picked =
+                sample(cands(&[(X, 10.0), (A, 5.0)]), &opts, &mut state);
+
+            assert_eq!(
+                picked, A,
+                "lazy={lazy}: the grammar must mask before TopK narrows, \
+                 not after — got {picked} (EOS={EOS}) instead of the one \
+                 legal token"
+            );
+            assert_ne!(
+                picked, EOS,
+                "lazy={lazy}: force-EOS while a legal token existed is the \
+                 #76 failure — generation dies mid-structure"
+            );
+        }
     }
 
     /// A populated mid-call snapshot round-trips the constrained
