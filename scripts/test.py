@@ -742,8 +742,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     Note it does NOT cover doctests: `cargo check` does not compile them.
     That is `doctest`'s job, and it is why that subcommand sweeps
     configurations too rather than running just one.
+
+    Since 2026-07-24 this also runs the `badge` verification (the
+    llama-cpp-cpu configuration, same as CI's badge step), so a stale
+    README test count fails at the pre-commit hook instead of ~40
+    minutes later in CI — the 0.8.1 PR hit exactly that. On a warm
+    tree `cargo nextest list` is near-free; on a cold tree it builds
+    the cpu test binaries once, which is the price of the gate.
     """
-    return sweep(
+    rc = sweep(
         "check",
         selected_configs(args.config, args.moeflux_model, args.ci),
         lambda features: [
@@ -754,6 +761,15 @@ def cmd_check(args: argparse.Namespace) -> int:
             "--features",
             ",".join(features),
         ],
+    )
+    if rc != 0:
+        return rc
+    return cmd_badge(
+        argparse.Namespace(
+            config="llama-cpp-cpu",
+            moeflux_model=args.moeflux_model,
+            fix=False,
+        )
     )
 
 
@@ -891,8 +907,12 @@ def cmd_badge(args: argparse.Namespace) -> int:
     configuration the numbers describe, and `--fix` rewrites them.
 
     CI runs this after the test job (the test binaries are already
-    built, so the list is nearly free). It is deliberately NOT in the
-    pre-commit hook: README edits are rare and the hook stays fast.
+    built, so the list is nearly free). Since 2026-07-24 `check` runs
+    it too — the pre-commit hook is now gated on it, a deliberate
+    reversal of the original "keep the hook fast" exclusion after a
+    stale badge failed the 0.8.1 PR in CI. `nextest list` on a warm
+    target dir keeps the hook cheap; a cold tree pays one cpu-config
+    test-binary build.
     """
     import json as _json
     import re as _re
