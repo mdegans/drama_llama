@@ -76,7 +76,11 @@ name: CI
 # checks — a skipped required check blocks a merge rather than passing it.
 on:
   push:
-    branches: [main, "v*"]
+    # `main` only. Branch work is covered by `pull_request` below; when
+    # this also listed "v*", opening a PR from a release branch ran the
+    # whole matrix twice (the push ref and the merge ref are different
+    # concurrency groups), including two queued turns on the one GPU.
+    branches: [main]
     paths: &source
       - "**"
       - "!.claude/**"
