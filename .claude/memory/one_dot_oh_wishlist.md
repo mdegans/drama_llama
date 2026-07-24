@@ -29,6 +29,16 @@ in 0.8.0; this is what remains.
 
 ## Quality, non-breaking, any time
 
+- **Clippy sweep, then gate it in CI.** Measured 2026-07-24 (release
+  eve): 57 lib warnings + 29 more across test targets, ~half
+  auto-fixable via `cargo clippy --fix`. Too noisy to gate 0.8.0 on
+  without either shipping late or sweeping mechanically right before a
+  release — deliberately deferred. The shape when it lands: sweep first
+  (fix or `#[allow]` with a reason, never blanket-allow at crate
+  level), then `cargo clippy --all-targets -- -D warnings` as a
+  `test.py` subcommand so the hook/justfile/CI chain stays one source
+  of truth. Mike asked for this explicitly ("Are we checking clippy in
+  CI?" — answer was no, nowhere).
 - `#![warn(missing_docs)]` + the ~10 undocumented pub items the review
   listed (notably the root-re-exported `Tool`/`ToolUse`/`ToolResult`/
   `MessageResponse` aliases in src/prompt.rs use `//` not `///`, so
