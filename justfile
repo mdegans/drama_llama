@@ -169,6 +169,15 @@ doc:
     export CARGO_TARGET_DIR="{{gpu_target}}"
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "{{doc_features}}"
 
+# Rehearse the docs.rs build: nightly + `-Zrustdoc-scrape-examples` + the
+# feature list from `[package.metadata.docs.rs]`. Catches what `just doc`
+# cannot — example `//!` docs are only compiled by the scrape pass, which
+# otherwise first runs on docs.rs itself, after publish. Needs the nightly
+# toolchain, which is why it is NOT part of `just check` or the hook; CI
+# runs it per push/PR instead.
+docsrs:
+    python3 scripts/test.py docsrs
+
 # Verify README.md's hand-counted test numbers (the shields.io badge and
 # the prose in Testing) against `cargo nextest list`, so they cannot
 # drift silently. `just badge --fix` rewrites them. CI runs the check

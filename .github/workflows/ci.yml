@@ -186,6 +186,36 @@ jobs:
         if: always()
         run: rm -rf "$GITHUB_WORKSPACE/target"
 
+  # The docs.rs rehearsal (`scripts/test.py docsrs`): nightly +
+  # `-Zrustdoc-scrape-examples` + the feature list read from
+  # `[package.metadata.docs.rs]`, with rustdoc warnings promoted to
+  # errors. This is the ONLY place example `//!` docs are compiled —
+  # `gate` runs the doctests and `just doc` lints the library docs, but
+  # the scrape pass otherwise first runs on docs.rs itself, after
+  # publish, where a broken link "succeeds" and renders broken. Three
+  # examples had rotted exactly that way before 0.8.0 shipped.
+  #
+  # Linux only: the pass is platform-independent (no CUDA in the docs.rs
+  # feature set) and the macOS VM's four cores are better spent on the
+  # jobs only macOS can run.
+  docs:
+    name: docs.rs rehearsal (linux)
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "16"
+      CMAKE_BUILD_PARALLEL_LEVEL: "16"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/runner-path
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: python3 scripts/test.py docsrs
+      # See the `gate` job: the tree is rebuilt from scratch next run
+      # regardless, so holding it costs disk and saves nothing.
+      - name: reclaim disk
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/target"
+
   test:
     name: unignored (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}

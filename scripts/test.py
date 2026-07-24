@@ -783,6 +783,59 @@ def cmd_doctest(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_docsrs(_: argparse.Namespace) -> int:
+    """Rehearse the docs.rs build: nightly, scrape-examples, their features.
+
+    docs.rs builds this crate with the feature list and cargo-args from
+    `[package.metadata.docs.rs]` — including `-Zrustdoc-scrape-examples`,
+    a nightly-only pass that compiles every example's `//!` docs. Nothing
+    else here runs that pass: `just doc` is stable and never scrapes, so
+    a broken intra-doc link in an example header compiles in nobody's
+    gate and first fails in public, on docs.rs, after publish. Three did
+    exactly that in the 0.8.0 pre-release sweep.
+
+    The feature list is read from the manifest rather than restated, so
+    this rehearsal cannot drift from what docs.rs will actually do. One
+    deliberate difference: `-D warnings`. docs.rs would "succeed" and
+    render the broken link; here that is the failure being tested for.
+
+    NO `--no-default-features`: docs.rs keeps the default features and
+    adds the metadata list on top, so the rehearsal must too.
+    """
+    import tomllib
+
+    manifest = tomllib.loads((REPO / "Cargo.toml").read_text("utf-8"))
+    meta = manifest["package"]["metadata"]["docs"]["rs"]
+    if not DRY_RUN:
+        nightly = subprocess.run(
+            ["cargo", "+nightly", "--version"], capture_output=True
+        )
+        if nightly.returncode != 0:
+            sys.exit(
+                "nightly toolchain not found — scrape-examples is "
+                "nightly-only (docs.rs builds on nightly). "
+                "`rustup toolchain install nightly`"
+            )
+    # The cpu config's target dir, not the default one: the docs.rs
+    # feature set has no `cuda`, and on Linux building llama-cpp-sys
+    # without it in the shared dir would evict the CUDA C build
+    # (a ~20-40 min rebuild). Matches the eviction logic in `Config`.
+    return run_command(
+        [
+            "cargo",
+            "+nightly",
+            "doc",
+            "--no-deps",
+            *meta["cargo-args"],
+            "--features",
+            ",".join(meta["features"]),
+        ],
+        CONFIGS["llama-cpp-cpu"].target_dir(),
+        log_path("docsrs"),
+        {"RUSTDOCFLAGS": "-D warnings"},
+    )
+
+
 def cmd_badge(args: argparse.Namespace) -> int:
     """Verify README.md's hand-counted test numbers against reality.
 
@@ -1100,6 +1153,15 @@ def main() -> int:
     )
     add_common(p_doc)
     p_doc.set_defaults(func=cmd_doctest)
+
+    p_docsrs = sub.add_parser(
+        "docsrs",
+        help="rehearse the docs.rs build (nightly + scrape-examples)",
+        description=cmd_docsrs.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_common(p_docsrs)
+    p_docsrs.set_defaults(func=cmd_docsrs)
 
     p_badge = sub.add_parser(
         "badge",
