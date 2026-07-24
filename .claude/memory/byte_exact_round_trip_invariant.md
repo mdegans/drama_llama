@@ -152,7 +152,11 @@ defense-in-depth on both.
     model-generated calls (parse order == grammar order). Exceptions &
     hazards that outlive the session: (1) dict/Gemma stays explicitly
     alphabetical — its templates `dictsort`, which sorts regardless of
-    the feature; (2) minijinja's SerializeStruct path still alphabetizes
+    the feature (a no-`dictsort` sidecar is a no-op today because the
+    gemma4 sniff hard-codes the sorted dict paths;
+    [#72](https://github.com/mdegans/drama_llama/issues/72) is the
+    probed `dict_sorted` flag that would make such a sidecar opt Gemma
+    into declaration order — experiment for OOD behavior first); (2) minijinja's SerializeStruct path still alphabetizes
     Rust *structs* fed to templates — we only feed `serde_json::Value`,
     keep it that way; (3) Anthropic structured outputs reorder
     required-first, so cross-engine tools should declare required fields
