@@ -1019,6 +1019,19 @@ fn cursor_of(bp: PromptBreakpoint) -> SeedCursor {
     }
 }
 
+/// Whether a resumed snapshot's constraint-matcher positions are still
+/// valid for this call: true iff the cursor already covers every
+/// message, i.e. generation continues the snapshotted assistant turn
+/// (assistant-prefill / partial-completion — the seated reply is the
+/// last message and the tip cursor's `messages.len() + 1` covers it).
+/// False when the fold has messages left past the cursor (a seated
+/// tool result, a new user turn): the snapshotted turn closed, the
+/// call opens a fresh assistant turn, and the caller must
+/// [`SamplerState::reset_constraints`]. Pure; tested directly.
+fn matcher_carry_valid(messages_len: usize, cursor: SeedCursor) -> bool {
+    messages_len <= cursor.msgs_done
+}
+
 /// Ingest the prose blocks of `prompt` in `[from, upto)` into `state`'s
 /// n-gram stats — the block-gated prompt-seeding fold ("repetition over
 /// the running PROSE corpus, structured regions excluded").
@@ -2588,7 +2601,23 @@ impl<B: Backend> Session<B> {
         let model = &self.engine.model;
         let (mut state, from) = match (self.seed, cached) {
             (None, Some((cached, cursor))) => {
-                (SamplerState::resumed_from(&cached, config, model), cursor)
+                let mut state =
+                    SamplerState::resumed_from(&cached, config, model);
+                // The reconcile carries matcher positions on grammar
+                // identity, which is only valid when generation resumes
+                // the snapshotted assistant turn itself. If the fold
+                // has messages left past the cursor — a seated tool
+                // result, a new user turn — that turn has closed and
+                // this call opens a fresh one: a carried position
+                // (parked at tool-call-complete, where only the turn
+                // terminator is legal) would force an immediate EOS
+                // (the 0-output-token round-2 bug). The prose stream
+                // (rng / mu / n-gram stats) still carries — it measures
+                // the corpus, not turn structure.
+                if !matcher_carry_valid(prompt.messages.len(), cursor) {
+                    state.reset_constraints(config);
+                }
+                (state, cursor)
             }
             (Some(seed), _) => {
                 (config.init_state(seed.get(), model), SeedCursor::default())
@@ -6092,6 +6121,36 @@ mod tests {
                 n_pos: 16,
             },
         }
+    }
+
+    /// The tip-resume continuity rule ([`matcher_carry_valid`]):
+    /// matcher positions carry only when the cursor already covers
+    /// every message. Regression for the 0-output-token round-2 bug
+    /// (2026-07-24): a tool round-trip appends the seated assistant
+    /// turn plus a tool_result, the tip's matcher (parked at
+    /// tool-call-complete) carried into the fresh turn, and the only
+    /// legal token was EOS.
+    #[test]
+    fn matcher_carry_validity() {
+        // Round-1 tip: one message at generation time, synthesized
+        // cursor covers the appended assistant reply (msgs_done = 2).
+        let tip = SeedCursor {
+            system_done: true,
+            msgs_done: 2,
+        };
+        // Partial-completion continuation: the seated reply IS the
+        // last message (len 2) — continuous, carry stands.
+        assert!(matcher_carry_valid(2, tip));
+        // Tool round-trip: assistant + tool_result seated (len 3) —
+        // the turn closed, matchers must reset.
+        assert!(!matcher_carry_valid(3, tip));
+        // Prompt-breakpoint resume mid-history: reset (harmless —
+        // fold snapshots hold root matchers).
+        let after_msg_0 = SeedCursor {
+            system_done: true,
+            msgs_done: 1,
+        };
+        assert!(!matcher_carry_valid(3, after_msg_0));
     }
 
     /// `longest_common_prefix_len` covers the edge shapes we rely on:

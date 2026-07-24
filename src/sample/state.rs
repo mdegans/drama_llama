@@ -413,6 +413,46 @@ impl SamplerState {
         }
     }
 
+    /// Reset every constraint matcher (eager, JSON, deferred) to its
+    /// grammar's root, keeping the stream fields (`mu`, rng, n-gram
+    /// stats, `step`) intact.
+    ///
+    /// [`resumed_from`](Self::resumed_from) carries matcher positions
+    /// whenever the grammar identity matches, which is correct only
+    /// when generation resumes the snapshotted assistant turn itself
+    /// (assistant-prefill / partial-completion). When the new call
+    /// folds prompt content *past* the snapshot — a seated tool
+    /// result, a new user turn — the snapshotted turn has closed and
+    /// the call opens a fresh assistant turn, so a carried position
+    /// (typically parked at tool-call-complete, where only the turn
+    /// terminator is legal) would mask every real candidate and force
+    /// an immediate EOS: the 0-output-token second-round bug. The
+    /// session decides continuity (`matcher_carry_valid` in
+    /// `session::build_initial_state`); this is the reset half.
+    pub(crate) fn reset_constraints(&mut self, config: &SamplerConfig) {
+        self.matchers = config
+            .modes
+            .iter()
+            .map(|mode| match mode {
+                SamplingMode::Grammar(compiled) => MatcherState::Grammar {
+                    grammar: compiled.source_hash(),
+                    stack: compiled.root_state(),
+                },
+                SamplingMode::Json => MatcherState::Json(JsonState::new()),
+                _ => MatcherState::Stateless,
+            })
+            .collect();
+        self.deferred =
+            config
+                .deferred_grammar
+                .as_ref()
+                .map(|spec| DeferredMatcher {
+                    active: false,
+                    grammar: spec.grammar.source_hash(),
+                    matcher: spec.grammar.root_state(),
+                });
+    }
+
     /// Read-only: would `token`'s piece bring any incomplete
     /// constraint (eager matcher, or the activated deferred grammar)
     /// to its accept state — or is one already there? The predictor

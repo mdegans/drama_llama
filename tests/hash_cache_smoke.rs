@@ -213,4 +213,21 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
          (input_tokens={round2_input_tokens}, round1_input={round1_input_tokens}, \
          round1_gen={round1_gen})",
     );
+
+    // The assertion this test shipped without (2026-07-24): a tip
+    // resume must actually GENERATE. The stale-matcher-carry bug made
+    // every round 2 after a tool round-trip emit 0 tokens (the tip's
+    // grammar matcher, parked at tool-call-complete, carried into the
+    // fresh assistant turn where only the turn terminator was legal) —
+    // while this test's cache_read threshold kept passing. Cache stats
+    // are not a proxy for output.
+    assert!(
+        round2_resp.usage.output_tokens > 0,
+        "round 2 generated no tokens after the tip resume \
+         (stale constraint-matcher carry?)",
+    );
+    assert!(
+        !round2_resp.inner.content.0.is_empty(),
+        "round 2 returned an empty content array",
+    );
 }
