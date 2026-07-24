@@ -8,21 +8,27 @@
 
 coverage:
   status:
-    # Informational, both of them: nothing here blocks a merge on a
-    # coverage number. This project's gate is that the tests pass; the
-    # percentage is a map of where to look next, not a threshold to
-    # game. Flip `informational` off if that ever stops being true.
+    # `project` is a REAL gate (2026-07-24, Mike's call): a hard 80%
+    # floor, required in branch protection. The coverage job runs on
+    # pull_request now precisely so this check can be satisfied — a
+    # required status with no upload sits at "Expected" forever and
+    # wedges the merge. Headroom is real but thin (82.81% at the time
+    # of the flip), and most uncovered mass is model-gated code — if
+    # this flaps on a refactor that didn't reduce testing, the answer
+    # may be a threshold, not deleted tests.
     project:
       default:
-        target: auto
-        threshold: 2%
-        informational: true
+        target: 80%
+        informational: false
+    # Patch stays informational: new lines in model-gated code can
+    # only be covered by the weights-loading tiers, and a hard
+    # new-lines gate would punish exactly the code that is hardest to
+    # test. The project floor above already catches real erosion.
     patch:
       default:
         informational: true
 
-# The `coverage` job does not run on pull_request — it is a second full
-# pass over the one GPU on a shared box, and a PR already gets the same
-# tests uninstrumented. With no PR upload there is nothing to comment,
-# and a "no report found" comment on every PR is worse than silence.
+# PR uploads exist now, so a comment would have data — but the status
+# check and the Codecov dashboard already carry it. Off to keep PR
+# threads about the diff.
 comment: false

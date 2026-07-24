@@ -19,7 +19,10 @@
 #                      PLUS the doctests, which nextest cannot run at all
 #   test      both     the unignored tier — no weights on the GPU
 #   model     linux    the #[ignore]'d tier: real weights, real CUDA
-#   coverage  linux    instrumented `-t all`, uploaded to Codecov. Push only.
+#   coverage  linux    instrumented `-t all` on nightly, uploaded to Codecov.
+#                      Runs on PRs too: the codecov project status is a
+#                      required check (80% floor), which only a PR upload
+#                      can satisfy. Also the nightly canary for the GPU tier.
 #
 # `model` is Linux-only on purpose. The macOS leg is a Parallels VM whose
 # Metal support is unverified, and the moeflux configuration would want the
@@ -387,10 +390,15 @@ jobs:
         if: always()
         run: rm -rf "$GITHUB_WORKSPACE/target"
 
-  # Coverage. Deliberately NOT on pull_request: it is a second full pass over
-  # the one GPU on a box that also runs Agora, and a PR already gets the same
-  # tests uninstrumented from `test` and `model`. Codecov's badge tracks the
-  # branch anyway, so measuring on push is what the badge actually needs.
+  # Coverage, on push AND pull_request (flipped 2026-07-24). It used to skip
+  # PRs — a second full pass over the one GPU on a shared box — but branch
+  # protection now REQUIRES codecov's project status at 80%, and a required
+  # status with no PR upload sits at "Expected" forever and wedges every
+  # merge. The cost is accepted: a PR takes two serialized turns on the
+  # card (`model`, then this). Two side benefits Mike wants: PRs get a real
+  # coverage number before merge, and since this is the one job on nightly,
+  # every PR also proves the GPU tier still builds and passes there — an
+  # early canary for nightly breakage.
   #
   # `-t all`, not `-t ignored`: the fast tier alone reports every generation
   # path as dead code (engine.rs 0%, decoder.rs 0%, session/mod.rs 32%), which
@@ -400,7 +408,6 @@ jobs:
     name: coverage (linux, cuda)
     runs-on: [self-hosted, linux]
     needs: [fmt]
-    if: github.event_name != 'pull_request'
     # Same card as `model`, same queue. See that job for why this is not
     # keyed on the ref and why it does not cancel in progress.
     concurrency:
