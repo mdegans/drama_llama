@@ -128,8 +128,11 @@ defense-in-depth on both.
     Unit assertions on the Qwen fixtures (`call_separator == "\n"`,
     no model) + a deterministic **greedy** round-trip test
     (`multi_call_round_trips_under_greedy`, 5-call turn round-trips
-    byte-exact). Arg ORDER was never the issue: the tagged grammar
-    force-sorts alphabetically and render + minijinja agree.
+    byte-exact). Arg ORDER was never the issue: at the time the tagged
+    grammar force-sorted alphabetically and render + minijinja agreed.
+    (Since 2026-07-24 / #60 the agreed order is schema *declaration*
+    order via `preserve_order` — same three-producer agreement, new
+    canonical order; dict/Gemma stays alphabetical per `dictsort`.)
   - **Split out → [#61](https://github.com/mdegans/drama_llama/issues/61):**
     the fuzzer's *other* failure (seed 2, `:481`) is grammar-legal garbage
     the model stuffs into the unbounded raw-value region under stochastic
@@ -138,11 +141,28 @@ defense-in-depth on both.
     knows the answer; sampling realizes its uncertainty in the value
     region at temp=1.0); Q8 quant halves the rate but doesn't fix it. The
     unbounded `until`-value is the enabler. Not a pipeline bug.
-  - **[#60](https://github.com/mdegans/drama_llama/issues/60):** Mike wants
-    tool-arg *declaration* order (reasoning-ish before answer-ish; matters
-    for small models). Its own session — global `serde_json` preserve_order
-    + re-align grammar/render/minijinja + re-close the duplicate-optional
-    hole that sorting currently closes.
+  - **[#60](https://github.com/mdegans/drama_llama/issues/60): LANDED
+    2026-07-24.** `serde_json/preserve_order` + `minijinja/preserve_order`
+    on unconditionally; grammar iterates `properties` in declaration
+    order with required-ness by *membership* in `required:` (never that
+    array's order); optionals stay in place — any fixed order closes the
+    duplicate-optional hole, alphabetization was never load-bearing.
+    `render_reference` renders the input Map's own order, which agrees
+    with template re-render by construction and with the grammar for
+    model-generated calls (parse order == grammar order). Exceptions &
+    hazards that outlive the session: (1) dict/Gemma stays explicitly
+    alphabetical — its templates `dictsort`, which sorts regardless of
+    the feature; (2) minijinja's SerializeStruct path still alphabetizes
+    Rust *structs* fed to templates — we only feed `serde_json::Value`,
+    keep it that way; (3) Anthropic structured outputs reorder
+    required-first, so cross-engine tools should declare required fields
+    first if identical ordering matters (the misanthropic `#[tool]`
+    macro does NOT enforce that — verified 2026-07-24); (4) the
+    `serde_json_preserves_insertion_order` canary +
+    `declaration_order_*` round-trip tests trip if anyone drops the
+    features. Canonical bytes changed (defs envelope now
+    type/function + name/description/parameters = ollama training
+    shape); 0.8.0-dev-era warm caches won't match — changelogged.
 
 ## THE PERMANENT BOUND (settled 2026-07-21, Mike)
 
@@ -265,7 +285,8 @@ WRONG (the scaffold matches). What remains:
    bar, not a green-every-seed guarantee. The deterministic
    `multi_call_round_trips_under_greedy` remains the hard byte-exact gate;
    the fuzzer is the discovery instrument.
-3. **#60 declaration-order args: OPEN**, its own session.
+3. **#60 declaration-order args: LANDED 2026-07-24** — see the #60
+   entry above for the full delta and surviving hazards.
 4. **Residual Auto+unclosed-think: DECIDED — cache-safe repair** (above);
    fuller mechanism is [#59](https://github.com/mdegans/drama_llama/issues/59).
 

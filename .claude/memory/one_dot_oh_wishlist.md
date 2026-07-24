@@ -55,6 +55,8 @@ in 0.8.0; this is what remains.
 - minijinja `tojson` HTML-escapes `<`/`>`/`&` while the grammar lets
   the model emit them raw → canonicalization-gate cache miss on tool
   args containing URLs. Doc note, or custom non-escaping tojson.
-  (Interacts with #60 — see `plan_preserve_order_60.md`.)
+  (#60 landed 2026-07-24 — declaration order via `preserve_order`;
+  the escaping mismatch is unchanged by it. See
+  `byte_exact_round_trip_invariant.md` for the landed state.)
 - mtmd upstream findings: see the 2026-07-23 addendum in
   `llama_cpp_ffi_audit.md` (F1 wants an upstream issue).
