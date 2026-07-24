@@ -31,14 +31,13 @@
 //! reports `breakpoint_after_assistant`, so the driver re-marks a rolling
 //! end-of-assistant breakpoint each turn — the render the session's
 //! hash-keyed prefix cache keys on. The session is built with one cache
-//! slot per seat ([`CommonArgs::session_with_cache_slots`]): each agent's
+//! slot per seat (`TransportBuilder::cache_slots`): each agent's
 //! history pins its own KV sequence, so agent switches reuse instead of
 //! re-prefilling. The payroll's `cache r` column shows how much each seat
 //! reused; run with `DRAMA_LLAMA_CACHE_TRIPWIRE=1` and any *unexpected*
 //! miss past an agent's first turn panics with a cache-state dump — this
 //! example is the multi-slot cache's acceptance harness.
 //!
-//! [`CommonArgs::session_with_cache_slots`]: utils::CommonArgs::session_with_cache_slots
 //!
 //! The point: the `Chat` driver is unchanged. N concurrent loops,
 //! agent-to-agent communication, role asymmetry (thinkers get words,

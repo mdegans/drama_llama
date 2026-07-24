@@ -26,7 +26,7 @@
 //!   single-digit milliseconds per case lets us hit O(10^7) cases over
 //!   eight hours per worker. Run this in one terminal.
 //! * `until` — differential fuzzer for
-//!   [`emit_until_rules`](drama_llama::emit_until_rules) (the GBNF
+//!   [`emit_until_rules`] (the GBNF
 //!   encoding of llama.cpp's `until()` combinator). The in-crate unit
 //!   test `until_rules_match_naive_exhaustively` already covers every
 //!   string ≤7 chars over a 3-char alphabet; this subcommand covers

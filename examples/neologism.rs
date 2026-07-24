@@ -8,6 +8,7 @@
 //! ```
 //!
 //! [`Client`]: misanthropic::Client
+//! [`SessionTransport`]: drama_llama::SessionTransport
 
 mod utils;
 
