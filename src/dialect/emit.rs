@@ -11,16 +11,32 @@
 //!   Used by the reconstruction harness and Session's
 //!   canonicalization check (cache-stability layer 2).
 //!
-//! ## Argument order: sorted, not declaration order
+//! ## Argument order: schema declaration order (#60)
 //!
-//! llama.cpp emits required args in schema-declaration order. We
-//! deliberately diverge: minijinja alphabetizes object keys on output
-//! (and serde_json's default map is a BTreeMap), so the template's
-//! re-render of `tool_calls` is *sorted by key* — and round-trip
-//! byte-stability pins emission to re-render. Sorting also lets
-//! optionals sit in place (`a? b c?` for required `b`) instead of
-//! trailing any-order, which closes upstream's duplicate-optional
-//! grammar hole entirely.
+//! With `serde_json/preserve_order` + `minijinja/preserve_order` on
+//! (unconditionally — see Cargo.toml), JSON maps keep insertion
+//! order end-to-end: schemars derives `properties` in field
+//! declaration order, the grammar emits fields in that order (so a
+//! small model conditions later args on earlier, reasoning-ish
+//! ones), the parser inserts in parse order, and minijinja's
+//! `tojson` re-renders it unchanged. Matches llama.cpp. Two
+//! refinements:
+//!
+//! * Optionals sit *in place* (`a? b c?` for required `b`) rather
+//!   than trailing any-order. Any *fixed* order — each key appearing
+//!   exactly once in the grammar — is what closes upstream's
+//!   duplicate-optional grammar hole; alphabetization never was the
+//!   load-bearing part.
+//! * [`render_reference`] takes `(name, input)` with no schema, so
+//!   it renders the input Map's own order. That agrees with the
+//!   template re-render by construction (same Map), and with the
+//!   grammar for model-generated calls because parse order equals
+//!   grammar order. Caller-constructed inputs are canonical in
+//!   whatever order their Map carries.
+//!
+//! The dict family (Gemma 4) is the exception: its templates pipe
+//! arguments through `| dictsort`, so that family stays explicitly
+//! alphabetical everywhere.
 
 use std::fmt::Write;
 
@@ -379,10 +395,12 @@ fn harmony_grammar_source(
     Ok(src)
 }
 
-/// Sorted required/optional key partition from a tool's input
-/// schema. Unknown / empty schemas yield no keys (permissive object
+/// The tool's argument slots in `properties` iteration order
+/// (declaration order under `preserve_order`), each flagged required
+/// by *membership* in `required:` — never by that array's order.
+/// Unknown / empty schemas yield no keys (permissive object
 /// downstream for JSON families; zero args for tagged).
-fn schema_args(tool: &Tool) -> (Vec<(String, Value)>, Vec<(String, Value)>) {
+fn schema_args(tool: &Tool) -> Vec<(String, Value, bool)> {
     let props = tool
         .schema
         .get("properties")
@@ -399,18 +417,13 @@ fn schema_args(tool: &Tool) -> (Vec<(String, Value)>, Vec<(String, Value)>) {
                 .collect()
         })
         .unwrap_or_default();
-    // serde_json's default map is a BTreeMap: iteration is already
-    // key-sorted, matching minijinja's re-render order.
-    let mut req = Vec::new();
-    let mut opt = Vec::new();
-    for (k, v) in props {
-        if required.contains(&k) {
-            req.push((k, v));
-        } else {
-            opt.push((k, v));
-        }
-    }
-    (req, opt)
+    props
+        .into_iter()
+        .map(|(k, v)| {
+            let req = required.contains(&k);
+            (k, v, req)
+        })
+        .collect()
 }
 
 fn schema_is_string(schema: &Value) -> bool {
@@ -423,8 +436,9 @@ fn schema_is_string(schema: &Value) -> bool {
         && schema.get("enum").is_none()
 }
 
-/// TAG_WITH_TAGGED: literal name; args sorted-by-key in place
-/// (optionals wrapped in `( ... )?`); string values raw-until-close,
+/// TAG_WITH_TAGGED: literal name; args in schema declaration order
+/// in place (optionals wrapped in `( ... )?`); string values
+/// raw-until-close,
 /// other values schema-compiled JSON + literal close.
 fn emit_tagged_call(
     syntax: &CallSyntax,
@@ -444,14 +458,7 @@ fn emit_tagged_call(
     let val_suf_lit = escape_for_gbnf_string(&syntax.arguments.value_suffix);
     let sep = escape_for_gbnf_string(&syntax.arguments.separator);
 
-    let (req, opt) = schema_args(tool);
-    // Merge back to one sorted list, remembering optionality.
-    let mut all: Vec<(String, Value, bool)> = req
-        .into_iter()
-        .map(|(k, v)| (k, v, true))
-        .chain(opt.into_iter().map(|(k, v)| (k, v, false)))
-        .collect();
-    all.sort_by(|a, b| a.0.cmp(&b.0));
+    let all = schema_args(tool);
 
     let mut body = String::new();
     for (key, schema, required) in &all {
@@ -751,7 +758,9 @@ pub fn render_reference(
                 out.push_str(name);
                 out.push_str(&syntax.function.name_suffix);
                 if let Some(obj) = input.as_object() {
-                    // BTreeMap: already key-sorted, like minijinja.
+                    // Map insertion order (preserve_order): parse
+                    // order == grammar order, and minijinja renders
+                    // the same Map — agreement by construction.
                     let mut first = true;
                     for (key, val) in obj {
                         if !first {
@@ -805,9 +814,12 @@ pub fn render_reference(
                     } else {
                         &syntax.json.args_field
                     };
-                    // serde_json Map preserves insertion order only
-                    // with preserve_order; default sorts. Render
-                    // manually to honor parameter_order.
+                    // Manual render: honors parameter_order for the
+                    // top-level fields and emits the spaced
+                    // separators (`", "`, `": "`) this shape is
+                    // probed with — compact `to_string` couldn't.
+                    // The inner args object still rides the Map
+                    // (insertion order under preserve_order).
                     let mut order: Vec<&str> = syntax
                         .json
                         .parameter_order

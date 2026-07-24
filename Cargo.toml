@@ -66,7 +66,18 @@ rayon = "1.10.0"
 dashmap = "6"
 rustc-hash = "2"
 sha2 = "0.10"
-minijinja = { version = "2.5", features = ["loader", "json"] }
+# `preserve_order` on minijinja + serde_json (below) keeps JSON maps
+# in insertion order end-to-end (schemars declaration order →
+# template render → grammar → parse → re-render). Enabled
+# unconditionally: half-on would reintroduce the feature-unification
+# hazard where a downstream crate flips serde_json's Map under us
+# (#60). The dict/Gemma family is pinned alphabetical separately —
+# its templates `dictsort`.
+minijinja = { version = "2.5", features = [
+    "loader",
+    "json",
+    "preserve_order",
+] }
 minijinja-contrib = { version = "2.5", features = ["pycompat"] }
 misanthropic = { version = "1.0.0-alpha.12", default-features = false, features = [
     "partial-eq",
@@ -90,7 +101,7 @@ rocket = { version = "0.5", optional = true, features = ["json"] }
 clap = { version = "4.5", optional = true, features = ["derive"] }
 stringmetrics = { version = "2.2.2", optional = true }
 toml = { version = "0.8", optional = true }
-serde_json = { version = "1.0" }
+serde_json = { version = "1.0", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 dirs = { version = "5.0.1", optional = true }
 egui = { version = "0.34", optional = true }

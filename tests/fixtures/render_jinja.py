@@ -58,8 +58,10 @@ def render(template_path: Path, variables_path: Path) -> str:
     # template uses and therefore what cogito was trained on. Python
     # jinja2's default `tojson` is pretty-printed (via `json.dumps`'s
     # default `', '` / `': '` separators) and is the outlier here.
+    # `sort_keys` stays False: minijinja runs with `preserve_order`
+    # (#60), so maps render in insertion order — as do Python dicts.
     env.policies["json.dumps_kwargs"] = {
-        "sort_keys": True,
+        "sort_keys": False,
         "separators": (",", ":"),
         "ensure_ascii": False,
     }

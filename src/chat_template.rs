@@ -69,9 +69,12 @@ use crate::{
 /// `parameters`, no wire envelope), so we adapt through this
 /// function before handing off to minijinja.
 ///
-/// Key order within the JSON object is irrelevant for the model
-/// (minijinja alphabetizes on output anyway); the structural shape
-/// and field names are what matter.
+/// Key order in this `json!` literal is the wire order: with
+/// `preserve_order` on (serde_json + minijinja), maps render in
+/// insertion order, so the envelope goes out `type, function` /
+/// `name, description, parameters` — the shape ollama's Go runtime
+/// produced in the training data — and `parameters` keeps the
+/// schema's field declaration order (#60).
 ///
 /// [`tool::CustomMethodDef`]: misanthropic::tool::CustomMethodDef
 fn tool_wire_value(tool: &Tool) -> serde_json::Value {
@@ -1592,6 +1595,28 @@ mod tests {
             "<|end_of_text|>".to_owned(),
         )
         .expect("template should compile")
+    }
+
+    /// #60: the wire envelope serializes in `json!`-literal order —
+    /// `type` before `function`; inside, `name`, `description`,
+    /// `parameters` — the shape ollama's Go runtime produced in the
+    /// training data. Rides on `serde_json/preserve_order`.
+    #[test]
+    fn tool_wire_value_is_insertion_ordered() {
+        let tool = crate::Tool::builder("t")
+            .description("d")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {},
+            }))
+            .build()
+            .expect("valid tool");
+        let wire =
+            serde_json::to_string(&tool_wire_value(&tool)).expect("serialize");
+        assert!(
+            wire.starts_with(r#"{"type":"function","function":{"name":"t","description":"d","parameters":"#),
+            "wire envelope order drifted: {wire}"
+        );
     }
 
     #[test]

@@ -345,6 +345,30 @@ Three further arcs land on top of the split:
 
 ### Changed
 
+- **Tool arguments render in schema declaration order** ([#60]).
+  `serde_json/preserve_order` and `minijinja/preserve_order` are now
+  enabled unconditionally, so JSON maps keep insertion order
+  end-to-end: schemars-derived `properties` arrive in field
+  declaration order, the GBNF grammar emits arguments in that order
+  (letting a model condition later arguments on earlier,
+  reasoning-ish ones), the parser preserves it, and minijinja's
+  `tojson` re-renders it unchanged — matching llama.cpp. Required
+  vs. optional is now classified by *membership* in `required:`,
+  never by that array's order, and optionals sit in place in the
+  grammar. The dict family (Gemma 4) is the deliberate exception:
+  its model-shipped templates pipe arguments through `| dictsort`,
+  so that family stays explicitly alphabetical. Behavior-breaking
+  for caches: the canonical bytes of rendered tool definitions and
+  tool calls change (previously alphabetized), so warm prefix caches
+  from earlier 0.8.0 dev builds will not match. Enabling the
+  features ourselves also closes a feature-unification hazard where
+  a downstream crate enabling `serde_json/preserve_order` would have
+  silently broken the old sorted-order assumptions. Note for tools
+  served to both a local backend and the Anthropic API: Anthropic's
+  structured outputs reorder required properties first, so declare
+  required fields before optional ones if identical ordering across
+  engines matters.
+
 - **Pre-publish API hardening** (pre-crates.io review). Every public
   error enum, the growth-prone enums (`LogLevel`, `MediaChunk`,
   `Family` — whose docs already promise an `Instructed` variant —
@@ -899,4 +923,5 @@ flip `DRAMA_LLAMA_DFA_CACHE=0`.
 [#44]: https://github.com/mdegans/drama_llama/issues/44
 [#48]: https://github.com/mdegans/drama_llama/issues/48
 [#54]: https://github.com/mdegans/drama_llama/issues/54
+[#60]: https://github.com/mdegans/drama_llama/issues/60
 [#68]: https://github.com/mdegans/drama_llama/issues/68

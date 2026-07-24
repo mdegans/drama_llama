@@ -618,7 +618,8 @@ fn reconstruct_gemma4_upstream() {
 /// Gemma 4, the full-fidelity version: thought routed through the
 /// `reasoning` field (`ReasoningReingest::Field`), parallel calls,
 /// and the value-type corners probed against minijinja (null renders
-/// `none`, floats in ryu-shortest form, nested dicts re-sorted).
+/// `none`, floats in ryu-shortest form, nested dicts explicitly
+/// re-sorted to match the template's `dictsort`).
 /// The canonical emission — reasoning block plus both calls — must
 /// appear byte-for-byte in the template re-render.
 #[test]
@@ -722,5 +723,231 @@ fn reconstruct_gemma4_thought_and_values() {
         rendered.contains(&emission),
         "reconstruction drift.\n--- canonical emission ---\n{emission:?}\n\
          --- template re-render ---\n{rendered:?}"
+    );
+}
+
+// ===========================================================================
+// #60 — schema declaration order
+// ===========================================================================
+
+/// A tool whose field declaration order (`zulu`, `alpha`, `mike`)
+/// disagrees with alphabetical, with an optional (`alpha`)
+/// interleaved between the two required fields.
+fn zam_tool() -> (Tool, serde_json::Value) {
+    let tool = Tool::builder("plan_route")
+        .description("Plan a route.")
+        .schema(json!({
+            "type": "object",
+            "properties": {
+                "zulu": {"type": "string"},
+                "alpha": {"type": "string"},
+                "mike": {"type": "integer"},
+            },
+            "required": ["zulu", "mike"],
+        }))
+        .build()
+        .expect("valid test tool");
+    let input = json!({"zulu": "first", "alpha": "between", "mike": 3});
+    (tool, input)
+}
+
+/// Positions of the three arg names in `text`, for order assertions.
+fn zam_positions(text: &str, ctx: &str) -> (usize, usize, usize) {
+    let find = |k: &str| {
+        text.find(k)
+            .unwrap_or_else(|| panic!("{ctx}: `{k}` missing:\n{text}"))
+    };
+    (find("zulu"), find("alpha"), find("mike"))
+}
+
+/// #60, the point of `preserve_order`: for the tojson/serde-driven
+/// families, args must flow in schema DECLARATION order — grammar,
+/// canonical emission, parse, and template re-render all agreeing —
+/// even when declaration order contradicts alphabetical. If this
+/// trips, `preserve_order` regressed somewhere in the chain and the
+/// prefix cache is next.
+fn assert_declaration_order(fixture: &str, bos: &str, eos: &str) {
+    use drama_llama::dialect::{grammar_source, EmitOptions};
+
+    let source = fixture_source(fixture);
+    let syntax: CallSyntax =
+        analyze_template(&source, bos, eos).expect("analyze");
+    let (tool, input) = zam_tool();
+
+    // Grammar constrains generation to declaration order.
+    let grammar = grammar_source(&syntax, &[&tool], &EmitOptions::default())
+        .expect("grammar");
+    let (z, a, m) = zam_positions(&grammar, fixture);
+    assert!(
+        z < a && a < m,
+        "{fixture}: grammar not in declaration order:\n{grammar}"
+    );
+
+    // Canonical emission renders the input Map's declaration order.
+    let emission = render_reference(&syntax, &[("plan_route", &input)])
+        .expect("representable");
+    let (z, a, m) = zam_positions(&emission, fixture);
+    assert!(
+        z < a && a < m,
+        "{fixture}: emission not in declaration order: {emission:?}"
+    );
+
+    // Emission → blocks, byte-order preserved through the parse.
+    let parsed =
+        parse_text(&syntax, &[&tool], &emission, false, Leniency::Final);
+    assert_eq!(
+        parsed.status,
+        ParseStatus::Complete,
+        "{fixture}: {emission:?} → {:#?}",
+        parsed.blocks
+    );
+    let calls: Vec<&ToolUse> = parsed
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { call } => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "{fixture}: {:#?}", parsed.blocks);
+    assert_eq!(calls[0].input, input, "{fixture}");
+    // Map equality ignores order — pin the serialized bytes too.
+    assert_eq!(
+        serde_json::to_string(&calls[0].input).unwrap(),
+        serde_json::to_string(&input).unwrap(),
+        "{fixture}: parse re-ordered the args"
+    );
+
+    // Blocks → template re-render: emission bytes survive verbatim.
+    let prompt = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("Plan the route."),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![Block::ToolUse {
+                    call: ToolUse {
+                        id: Cow::Borrowed("call00001"),
+                        name: Cow::Borrowed("plan_route"),
+                        input: input.clone(),
+                        cache_control: None,
+                        caller: None,
+                    },
+                }]),
+            },
+        ],
+        tools: Some(vec![tool.clone().into()]),
+        ..Default::default()
+    };
+    let template =
+        ChatTemplate::from_source(source, bos.to_string(), eos.to_string())
+            .expect("template compiles");
+    let opts = RenderOptions::default()
+        .with_generation_prompt(false)
+        .with_extra("enable_thinking", true);
+    let rendered = template.render_with(&prompt, &opts).expect("render");
+    assert!(
+        rendered.contains(&emission),
+        "{fixture}: reconstruction drift.\n--- canonical emission ---\n\
+         {emission:?}\n--- template re-render ---\n{rendered:?}"
+    );
+}
+
+#[test]
+fn declaration_order_qwen3_coder() {
+    assert_declaration_order("Qwen3-Coder.jinja", "", "<|im_end|>");
+}
+
+#[test]
+fn declaration_order_hermes3() {
+    assert_declaration_order(
+        "NousResearch-Hermes-3-Llama-3.1-8B-tool_use.jinja",
+        "",
+        "<|im_end|>",
+    );
+}
+
+#[test]
+fn declaration_order_llama31() {
+    assert_declaration_order(
+        "meta-llama-Llama-3.1-8B-Instruct.jinja",
+        "<|begin_of_text|>",
+        "<|eot_id|>",
+    );
+}
+
+#[test]
+fn declaration_order_gptoss_cache_stable() {
+    assert_declaration_order(
+        "gptoss-cache-stable.jinja",
+        "<|startoftext|>",
+        "<|return|>",
+    );
+}
+
+/// The dict family is the deliberate exception to #60: Gemma 4's
+/// model-shipped templates pipe arguments through `| dictsort`, which
+/// alphabetizes regardless of `preserve_order` — so grammar, encoder,
+/// and re-render stay explicitly alphabetical there.
+#[test]
+fn dict_family_stays_dictsort_alphabetical() {
+    use drama_llama::dialect::{grammar_source, EmitOptions};
+
+    let source = fixture_source("gemma4-gguf.jinja");
+    let syntax: CallSyntax =
+        analyze_template(&source, "<bos>", "<turn|>").expect("analyze");
+    assert_eq!(syntax, CallSyntax::gemma4(), "sniff patch must fire");
+    let (tool, input) = zam_tool();
+
+    let grammar = grammar_source(&syntax, &[&tool], &EmitOptions::default())
+        .expect("grammar");
+    let (z, a, m) = zam_positions(&grammar, "gemma4 grammar");
+    assert!(
+        a < m && m < z,
+        "gemma4: grammar not alphabetical:\n{grammar}"
+    );
+
+    let emission = render_reference(&syntax, &[("plan_route", &input)])
+        .expect("representable");
+    let (z, a, m) = zam_positions(&emission, "gemma4 emission");
+    assert!(
+        a < m && m < z,
+        "gemma4: emission not alphabetical: {emission:?}"
+    );
+
+    // And the template agrees — dictsort re-renders alphabetically.
+    let parsed =
+        parse_text(&syntax, &[&tool], &emission, false, Leniency::Final);
+    assert_eq!(parsed.status, ParseStatus::Complete, "{:#?}", parsed.blocks);
+    let prompt = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("Plan the route."),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(parsed.blocks),
+            },
+        ],
+        tools: Some(vec![tool.into()]),
+        ..Default::default()
+    };
+    let template = ChatTemplate::from_source(
+        source,
+        "<bos>".to_string(),
+        "<turn|>".to_string(),
+    )
+    .expect("template compiles");
+    let opts = RenderOptions::default()
+        .with_generation_prompt(false)
+        .with_extra("enable_thinking", true);
+    let rendered = template.render_with(&prompt, &opts).expect("render");
+    assert!(
+        rendered.contains(&emission),
+        "gemma4: reconstruction drift.\n--- canonical emission ---\n\
+         {emission:?}\n--- template re-render ---\n{rendered:?}"
     );
 }

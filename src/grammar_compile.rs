@@ -14,18 +14,20 @@
 //! [`misanthropic::prompt::output::sanitize_for_anthropic`]:
 //!
 //! * `type: object` with `properties` (+ optional `required`) →
-//!   required fields first (in `required:`-array order), then
-//!   optional fields each wrapped in `( ws "," ws ... )?` so they
-//!   may be omitted but must match the declared type when present.
-//!   The all-optional case (no `required`) emits N "chain"
-//!   alternatives so all 2^N inclusion patterns are reachable.
+//!   fields in `properties` iteration order (declaration order under
+//!   `preserve_order`), required-ness by membership in `required:`.
+//!   Optionals sit *in place*, wrapped in `( ... )?`, so they may be
+//!   omitted but must match the declared type when present. The
+//!   all-optional case (no `required`) emits N "chain" alternatives
+//!   so all 2^N inclusion patterns are reachable.
 //!
-//!   The required-first / optional-after layout matches Anthropic's
-//!   structured-outputs documentation ("properties in objects
-//!   maintain their defined ordering from your schema, with one
-//!   important caveat: required properties appear first, followed by
-//!   optional properties"), so a model emitting in that canonical
-//!   order will not force-EOS against this grammar.
+//!   Anthropic's structured outputs order the same way with one
+//!   caveat: "required properties appear first, followed by optional
+//!   properties". Locally the grammar *forces* our order, so there is
+//!   no force-EOS risk — but a schema that interleaves optionals
+//!   before required fields will render in different orders on the
+//!   two engines. Declare required fields first when a tool serves
+//!   both and the difference matters.
 //! * `type: array` with `items` → array of the item schema.
 //!   `minItems >= 1` additionally forces non-emptiness — matching
 //!   what Anthropic's structured outputs enforce (its sanitizer
@@ -295,94 +297,95 @@ fn emit_object_rule(
         return;
     }
 
-    // Layout: required first (in `required:`-array order), then
-    // optionals. This matches Anthropic's documented tool-call
-    // convention (optionals trailing), and lets the leading-comma
-    // logic stay simple — every required slot anchors the chain, so
-    // each optional gets a self-contained `( ws "," ws ... )?` slot.
+    // Layout: slots in `properties` iteration order (declaration
+    // order under `preserve_order`), required-ness by *membership* in
+    // `required:` — never by the array's order. Optionals sit in
+    // place — before the first required slot as `( member "," )?`
+    // (comma trailing), after it as `( "," member )?` — so the
+    // accepted order is exactly the re-render order (the Map's own),
+    // and every subset containing the required keys parses with
+    // correct commas. Each key appears exactly once in the grammar;
+    // that fixed order is what closes the duplicate-optional hole —
+    // any fixed order does, alphabetization was never the
+    // load-bearing part.
     //
-    // Trade: declaration order from `properties` is not preserved for
-    // required props (we use `required:`-array order instead). In
-    // practice the two are aligned in real schemas and serde_json's
-    // default Map iterator is alphabetical anyway, so neither order
-    // is "the schema author's intent" with high confidence.
-    let mut required_slots: Vec<(String, String)> = Vec::new();
+    // Required names absent from `properties` are rare but legal;
+    // they get a permissive `value` slot up front (their position is
+    // arbitrary — no schema entry defines one).
+    let mut slots: Vec<(String, String, bool)> = Vec::new();
     for name in &required_vec {
-        *counter += 1;
-        let child_rule = format!("{rule_name}__{c}", c = *counter);
-        if let Some(prop_schema) = props.get(name) {
-            emit_schema_rule(prop_schema, &child_rule, out, counter, defs);
-            required_slots.push((name.clone(), child_rule));
-        } else {
-            // Required prop absent from `properties` — rare but legal;
-            // permissive `value` is the safest fallback.
-            required_slots.push((name.clone(), "value".to_string()));
+        if !props.contains_key(name) {
+            slots.push((name.clone(), "value".to_string(), true));
         }
     }
-    let mut optional_slots: Vec<(String, String)> = Vec::new();
     for (name, prop_schema) in props.iter() {
-        if required_set.contains(name) {
-            continue;
-        }
         *counter += 1;
         let child_rule = format!("{rule_name}__{c}", c = *counter);
         emit_schema_rule(prop_schema, &child_rule, out, counter, defs);
-        optional_slots.push((name.clone(), child_rule));
+        slots.push((name.clone(), child_rule, required_set.contains(name)));
     }
 
-    if required_slots.is_empty() {
-        // All-optional case. Emit chain alternatives so all 2^N
-        // include/skip combinations are reachable: for each starting
-        // position K, emit prop[K] followed by `(",", prop[K+1])?` ...
-        // `(",", prop[N-1])?`. The outer wrapping is
-        // `(chain_0 | chain_1 | ... | chain_{N-1})?` so the
-        // empty-object case is also matched.
-        let n = optional_slots.len();
-        let mut chain_names: Vec<String> = Vec::with_capacity(n);
-        for k in 0..n {
-            let chain_name = format!("{rule_name}__chain_{k}");
-            let mut tail = String::new();
-            for (i, (name, child)) in optional_slots.iter().enumerate().skip(k)
-            {
-                let lit = escape_for_gbnf_string(
-                    &serde_json::to_string(name).unwrap(),
-                );
-                if i == k {
-                    let _ = write!(&mut tail, r#""{lit}" ws ":" ws {child}"#);
+    let member = |name: &str, child: &str| {
+        let lit = escape_for_gbnf_string(&serde_json::to_string(name).unwrap());
+        format!(r#""{lit}" ws ":" ws {child}"#)
+    };
+
+    let first_required = slots.iter().position(|(_, _, req)| *req);
+    match first_required {
+        None => {
+            // All-optional case. Emit chain alternatives so all 2^N
+            // include/skip combinations are reachable: for each
+            // starting position K, emit slot[K] followed by
+            // `(",", slot[K+1])?` ... `(",", slot[N-1])?`. The outer
+            // wrapping is `(chain_0 | chain_1 | ... | chain_{N-1})?`
+            // so the empty-object case is also matched.
+            let n = slots.len();
+            let mut chain_names: Vec<String> = Vec::with_capacity(n);
+            for k in 0..n {
+                let chain_name = format!("{rule_name}__chain_{k}");
+                let mut tail = String::new();
+                for (i, (name, child, _)) in slots.iter().enumerate().skip(k) {
+                    if i == k {
+                        tail.push_str(&member(name, child));
+                    } else {
+                        let _ = write!(
+                            &mut tail,
+                            r#" ( ws "," ws {} )?"#,
+                            member(name, child)
+                        );
+                    }
+                }
+                let _ = writeln!(out, "{chain_name} ::= {tail}");
+                chain_names.push(chain_name);
+            }
+            let alts = chain_names.join(" | ");
+            let _ =
+                writeln!(out, r#"{rule_name} ::= "{{" ws ( {alts} )? ws "}}""#);
+        }
+        Some(r) => {
+            let mut body = String::from("\"{\" ws");
+            for (name, child, _) in &slots[..r] {
+                let _ =
+                    write!(body, r#" ( {} ws "," ws )?"#, member(name, child));
+            }
+            let (name, child, _) = &slots[r];
+            let _ = write!(body, " {}", member(name, child));
+            for (name, child, req) in &slots[r + 1..] {
+                if *req {
+                    let _ =
+                        write!(body, r#" ws "," ws {}"#, member(name, child));
                 } else {
                     let _ = write!(
-                        &mut tail,
-                        r#" ( ws "," ws "{lit}" ws ":" ws {child} )?"#
+                        body,
+                        r#" ( ws "," ws {} )?"#,
+                        member(name, child)
                     );
                 }
             }
-            let _ = writeln!(out, "{chain_name} ::= {tail}");
-            chain_names.push(chain_name);
+            body.push_str(" ws \"}\"");
+            let _ = writeln!(out, "{rule_name} ::= {body}");
         }
-        let alts = chain_names.join(" | ");
-        let _ = writeln!(out, r#"{rule_name} ::= "{{" ws ( {alts} )? ws "}}""#);
-        return;
     }
-
-    // Mixed required + (zero or more) optional. Required first, then
-    // optionals each as `( ws "," ws "<name>" ws ":" ws <typed> )?`.
-    let mut body = String::from("\"{\" ws");
-    for (i, (field_name, child_rule)) in required_slots.iter().enumerate() {
-        if i > 0 {
-            body.push_str(r#" ws "," ws"#);
-        }
-        let lit =
-            escape_for_gbnf_string(&serde_json::to_string(field_name).unwrap());
-        let _ = write!(body, r#" "{lit}" ws ":" ws {child_rule}"#);
-    }
-    for (field_name, child_rule) in optional_slots.iter() {
-        let lit =
-            escape_for_gbnf_string(&serde_json::to_string(field_name).unwrap());
-        let _ =
-            write!(body, r#" ( ws "," ws "{lit}" ws ":" ws {child_rule} )?"#);
-    }
-    body.push_str(" ws \"}\"");
-    let _ = writeln!(out, "{rule_name} ::= {body}");
 }
 
 // ===========================================================================
@@ -935,6 +938,19 @@ mod tests {
         src.push_str(&rules);
         src.push_str(JSON_GRAMMAR);
         src
+    }
+
+    /// Canary for `serde_json/preserve_order` (#60): the whole
+    /// declaration-order chain — schemars properties, grammar
+    /// emission, parse, template re-render — rides on the Map keeping
+    /// insertion order. If someone drops the feature from Cargo.toml,
+    /// this fails before the round-trip fixtures start flaking.
+    #[test]
+    fn serde_json_preserves_insertion_order() {
+        assert_eq!(
+            serde_json::to_string(&json!({"b": 1, "a": 2})).unwrap(),
+            r#"{"b":1,"a":2}"#,
+        );
     }
 
     #[test]
