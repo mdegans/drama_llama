@@ -186,6 +186,32 @@ jobs:
         if: always()
         run: rm -rf "$GITHUB_WORKSPACE/target"
 
+  # Clippy with -D warnings (`scripts/test.py clippy`), on the same
+  # llama-cpp-cpu configuration the `test` job runs: identical Rust
+  # surface to the CUDA config, no CUDA C build on the clock. The tree
+  # went warning-clean on 2026-07-24; this job is what keeps it clean.
+  # Linux-only for the same reason as `docs`: nothing platform-gated is
+  # in the linted feature set, and the macOS VM's cores are scarce.
+  clippy:
+    name: clippy (linux)
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "16"
+      CMAKE_BUILD_PARALLEL_LEVEL: "16"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/runner-path
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: python3 scripts/test.py clippy -c llama-cpp-cpu
+      # See the `gate` job: the tree is rebuilt from scratch next run
+      # regardless, so holding it costs disk and saves nothing.
+      - name: reclaim disk
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/target"
+
   # The docs.rs rehearsal (`scripts/test.py docsrs`): nightly +
   # `-Zrustdoc-scrape-examples` + the feature list read from
   # `[package.metadata.docs.rs]`, with rustdoc warnings promoted to

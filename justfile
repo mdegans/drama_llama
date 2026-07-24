@@ -169,6 +169,15 @@ doc:
     export CARGO_TARGET_DIR="{{gpu_target}}"
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "{{doc_features}}"
 
+# Clippy with warnings promoted to errors, over the same configuration
+# `just test` builds (so it reuses that build and lints the feature set the
+# tests actually exercise). The tree is warning-clean as of 2026-07-24;
+# `just check` and CI both run this so it stays that way. Resolve a new
+# warning by fixing it or by a site-level `#[allow]` with a reason — never
+# a blanket crate-level allow.
+clippy config="llama-cpp":
+    python3 scripts/test.py clippy -c "{{config}}"
+
 # Rehearse the docs.rs build: nightly + `-Zrustdoc-scrape-examples` + the
 # feature list from `[package.metadata.docs.rs]`. Catches what `just doc`
 # cannot — example `//!` docs are only compiled by the scrape pass, which
@@ -219,6 +228,8 @@ check:
     just doc
     echo "+ just doctest"
     just doctest
+    echo "+ just clippy (-D warnings)"
+    just clippy
     echo "check: ok"
 
 # Point git at the versioned hooks in .githooks/ — one config line, no copying,

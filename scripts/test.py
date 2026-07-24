@@ -783,6 +783,41 @@ def cmd_doctest(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_clippy(args: argparse.Namespace) -> int:
+    """Clippy with warnings promoted to errors.
+
+    The tree went warning-clean on 2026-07-24 (release eve, 86 warnings
+    swept: auto-fix for the mechanical half, hand-fixes or site-level
+    `#[allow]`-with-a-reason for the rest — never a blanket crate-level
+    allow, which hides new fires along with the old). This gate is what
+    keeps it clean: one new warning is one red job while the diff that
+    introduced it is still open.
+
+    Takes `-c` like `run` does and defaults to the same configuration,
+    so the lint claim covers the feature set the tests actually build —
+    not just default features — and reuses that build's target dir. CI
+    passes `-c llama-cpp-cpu` for the same reason the test job does:
+    identical Rust surface, no CUDA C build on the clock.
+    """
+    config = resolve_config(args.config)
+    features = config.feature_list(args.moeflux_model)
+    return run_command(
+        [
+            "cargo",
+            "clippy",
+            "--all-targets",
+            "--no-default-features",
+            "--features",
+            ",".join(features),
+            "--",
+            "-D",
+            "warnings",
+        ],
+        config.target_dir(),
+        log_path(f"clippy-{config.name}"),
+    )
+
+
 def cmd_docsrs(_: argparse.Namespace) -> int:
     """Rehearse the docs.rs build: nightly, scrape-examples, their features.
 
@@ -1153,6 +1188,22 @@ def main() -> int:
     )
     add_common(p_doc)
     p_doc.set_defaults(func=cmd_doctest)
+
+    p_clippy = sub.add_parser(
+        "clippy",
+        help="clippy with -D warnings (the tree is warning-clean; keep it)",
+        description=cmd_clippy.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_clippy.add_argument(
+        "-c",
+        "--config",
+        default="llama-cpp",
+        help="configuration to lint (default: %(default)s, same as "
+        "`run`; CI uses llama-cpp-cpu)",
+    )
+    add_common(p_clippy)
+    p_clippy.set_defaults(func=cmd_clippy)
 
     p_docsrs = sub.add_parser(
         "docsrs",
