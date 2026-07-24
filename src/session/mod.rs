@@ -5218,7 +5218,7 @@ impl<B: Backend> Session<B> {
             }
             let mut hist_vec: Vec<(Token, usize, String)> =
                 hist.into_iter().map(|(t, (c, p))| (t, c, p)).collect();
-            hist_vec.sort_by(|a, b| b.1.cmp(&a.1));
+            hist_vec.sort_by_key(|e| std::cmp::Reverse(e.1));
             // First 16 token IDs (in emission order) and last 16 — the
             // loop boundary is usually near the end.
             let head: Vec<_> =

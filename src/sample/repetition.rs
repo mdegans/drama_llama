@@ -559,13 +559,12 @@ impl RepetitionOptions {
                 .selected_text("Select a category...")
                 .show_ui(ui, |ui| {
                     for category in IgnoreCategory::ALL {
-                        if !self.ignored_categories.contains(&category) {
-                            if ui
+                        if !self.ignored_categories.contains(&category)
+                            && ui
                                 .selectable_label(false, category.as_str())
                                 .clicked()
-                            {
-                                self.ignored_categories.insert(category);
-                            }
+                        {
+                            self.ignored_categories.insert(category);
                         }
                     }
                 })

@@ -283,6 +283,9 @@ mod tests {
     #[cfg(feature = "llama-cpp")]
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "long running; requires models/model.gguf"]
+    // `Prompt` is `#[non_exhaustive]`, so the struct-update literal clippy
+    // wants for `prompt` below is E0639 from outside misanthropic.
+    #[allow(clippy::field_reassign_with_default)]
     async fn send_populates_the_response_and_serializes() {
         use crate::FromPath;
         let session = crate::LlamaCppSession::from_path(model_path())

@@ -500,8 +500,7 @@ impl SamplerConfig {
                         }
 
                         mode.draw(ui, i)
-                    })
-                    .inner;
+                    });
                 }
 
                 // We could use a Vec, but it's unlikely that a user can delete two

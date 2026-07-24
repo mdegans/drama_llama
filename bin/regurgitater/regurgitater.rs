@@ -6,6 +6,12 @@
 // completed that, and it's very true. I'm not sure if it's a good thing or a
 // bad thing.
 //
+// Bin-wide because it can't be narrower: rocket's `FromForm` derive expands
+// the `#[field]` validators into a sibling `const _` block, which no
+// struct- or field-level `#[allow]` can reach. One lint, one cause — the
+// borrow it complains about is rocket's, not ours.
+#![allow(clippy::needless_borrows_for_generic_args)]
+
 /// Detect copyright infringement in llama.cpp supported models. Greedy sampling
 /// is used to always choose the next token. In cases where the model has
 /// memorized sequences of text, this will result in the model generating the
@@ -66,6 +72,9 @@ pub struct Request {
     #[field(default = ComparisonMode::Jaccard)]
     pub mode: ComparisonMode,
     /// Number of chunks to split the text into.
+    // The allow is for code `FromForm` expands from `#[field]` — not
+    // ours to fix.
+    #[allow(clippy::needless_borrows_for_generic_args)]
     #[field(validate = range(1..10), default = 5)]
     pub chunks: usize,
 }
@@ -219,8 +228,10 @@ async fn main() {
                 }
             };
 
-        let mut opts = PredictOptions::default();
-        opts.sample_options = SamplerConfig::greedy();
+        let mut opts = PredictOptions {
+            sample_options: SamplerConfig::greedy(),
+            ..Default::default()
+        };
 
         let ready = || {
             to_client

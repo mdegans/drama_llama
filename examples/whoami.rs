@@ -969,8 +969,8 @@ fn scored(
 
     println!();
     println!(
-        "  {:<12} {:>3}  {:>11}  {:>7}  {}",
-        "name", "tok", "P(name)", "share", "ranks"
+        "  {:<12} {:>3}  {:>11}  {:>7}  ranks",
+        "name", "tok", "P(name)", "share"
     );
     println!("  {}", "─".repeat(58));
     for score in &scores {

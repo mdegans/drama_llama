@@ -517,7 +517,7 @@ where
         Some(session) => {
             let display =
                 session.engine().model().display_name().unwrap_or_default();
-            if display == prompt.model.to_string() {
+            if prompt.model == display {
                 session
             } else {
                 // Free the outgoing model BEFORE loading the incoming
@@ -651,11 +651,11 @@ fn configure_session<B: Backend>(
     configured
 }
 
-/// Default `SnapshotOpts` for the streaming recorder. top_k=100 + p_threshold=0
-/// + entropy=true is the cross-validation suite's working set: refusal-class
-/// probes need tail-token visibility (high top_k, no threshold) and entropy is
-/// cheap when probes are infrequent. Override via `Args` if/when finer control
-/// is needed.
+/// Default `SnapshotOpts` for the streaming recorder. top_k=100 with
+/// p_threshold=0 and entropy=true is the cross-validation suite's working
+/// set: refusal-class probes need tail-token visibility (high top_k, no
+/// threshold) and entropy is cheap when probes are infrequent. Override via
+/// `Args` if/when finer control is needed.
 fn default_stream_opts() -> SnapshotOpts {
     SnapshotOpts {
         top_k: NonZeroUsize::new(100).unwrap(),
@@ -789,7 +789,7 @@ impl JsonlProbeRecorder {
 impl ProbeHook for JsonlProbeRecorder {
     fn on_token(&mut self, ctx: ProbeCtx<'_>) {
         let ts_ms = self.session_start.elapsed().as_millis() as u64;
-        let ctx_value = match serde_json::to_value(&ctx) {
+        let ctx_value = match serde_json::to_value(ctx) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(event = "probe_write_serialize_failed", error = %e);
@@ -870,7 +870,7 @@ impl ProbeHook for StreamingProbeRecorder {
         // serde_json::to_value goes via the Serialize impl on ProbeCtx — owns
         // the result, which the broadcast bus then clones once per receiver.
         // Less code than deriving Clone on Snapshot etc.
-        let value = match serde_json::to_value(&ctx) {
+        let value = match serde_json::to_value(ctx) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(event = "probe_stream_serialize_failed", error = %e);

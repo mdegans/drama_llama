@@ -582,8 +582,8 @@ fn bitmap_to_bytes(bitmap: &[u64; 4]) -> Vec<u8> {
     // should bound its pending pushes. Until then, sample only ASCII;
     // we lose multibyte coverage but the fuzzer can run cleanly.
     let mut out = Vec::with_capacity(8);
-    for word_i in 0..2 {
-        let word = bitmap[word_i];
+    // `.take(2)`: only words 0–1 (bytes 0–127) — the ASCII-only rule above.
+    for (word_i, &word) in bitmap.iter().enumerate().take(2) {
         if word == 0 {
             continue;
         }

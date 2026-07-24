@@ -409,7 +409,7 @@ impl Vision<LlamaCppDecoder> for Mtmd {
                 parse_special,
             )
             .map_err(MtmdError::Tokenize)?;
-        Ok(chunks.to_media_chunks(1).map_err(MtmdError::Tokenize)?)
+        chunks.to_media_chunks(1).map_err(MtmdError::Tokenize)
     }
 
     /// Rust-owned eval loop (Phase C+D): tokenize a lone marker with
@@ -898,7 +898,7 @@ impl Chunks {
                         .into_owned()
                 };
                 let id = hex_decode(&id)
-                    .ok_or_else(|| MtmdTokenizeError::BadChunkId { id })?;
+                    .ok_or(MtmdTokenizeError::BadChunkId { id })?;
                 let n_tokens =
                     unsafe { mtmd_input_chunk_get_n_tokens(chunk) } as u32;
                 let n_pos = unsafe { mtmd_input_chunk_get_n_pos(chunk) } as u32;

@@ -6,9 +6,9 @@ use serde::Serialize;
 #[derive(Clone, Copy, PartialEq, Default)]
 enum Mode {
     #[default]
-    JSON,
+    Json,
     #[cfg(feature = "toml")]
-    TOML,
+    Toml,
 }
 
 impl Mode {
@@ -17,12 +17,12 @@ impl Mode {
         S: Serialize,
     {
         match self {
-            Mode::JSON => match serde_json::to_string_pretty(&s) {
+            Mode::Json => match serde_json::to_string_pretty(&s) {
                 Ok(s) => s,
                 Err(e) => format!("Error: {}", e),
             },
             #[cfg(feature = "toml")]
-            Mode::TOML => match toml::to_string_pretty(&s) {
+            Mode::Toml => match toml::to_string_pretty(&s) {
                 Ok(s) => s,
                 Err(e) => format!("Error: {}", e),
             },
@@ -31,9 +31,9 @@ impl Mode {
 
     fn as_str(self) -> &'static str {
         match self {
-            Mode::JSON => "JSON",
+            Mode::Json => "JSON",
             #[cfg(feature = "toml")]
-            Mode::TOML => "TOML",
+            Mode::Toml => "TOML",
         }
     }
 }
@@ -60,14 +60,14 @@ impl eframe::App for App {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
                         &mut self.mode,
-                        Mode::JSON,
-                        Mode::JSON.as_str(),
+                        Mode::Json,
+                        Mode::Json.as_str(),
                     );
                     #[cfg(feature = "toml")]
                     ui.selectable_value(
                         &mut self.mode,
-                        Mode::TOML,
-                        Mode::TOML.as_str(),
+                        Mode::Toml,
+                        Mode::Toml.as_str(),
                     );
                 });
 
