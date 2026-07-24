@@ -2,6 +2,11 @@
 name = "drama_llama"
 version = "0.8.0"
 edition = "2021"
+# The stable toolchain CI actually tests (nothing older is ever built
+# here, so a lower claim would be untested). Bump freely alongside CI's
+# toolchain; this exists so an older-toolchain user gets a clear cargo
+# error instead of a mystery build failure.
+rust-version = "1.97"
 description = "Local LLM inference behind an Anthropic-shaped API: llama.cpp and Metal-MoE backends, chat sessions with prefix caching, per-model tool-call dialects, and GBNF-constrained structured output."
 license-file = "LICENSE.md"
 repository = "https://github.com/mdegans/drama_llama"
@@ -356,6 +361,7 @@ doc-scrape-examples = true
 [[example]]
 name = "dump_template"
 required-features = ["llama-cpp"]
+doc-scrape-examples = true
 
 # Spawns the blallama binary via `env!("CARGO_BIN_EXE_blallama")`, so
 # it needs the bin's exact feature set; cargo builds the bin for the
