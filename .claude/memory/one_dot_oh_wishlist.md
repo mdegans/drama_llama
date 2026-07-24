@@ -29,17 +29,14 @@ in 0.8.0; this is what remains.
 
 ## Quality, non-breaking, any time
 
-- **Gate clippy in CI.** The sweep itself landed 2026-07-24 (commit
-  `refactor(lint): clippy sweep`): `cargo clippy --all-targets`
-  (default features) is warning-clean, resolved by fix-or-`#[allow]`-
-  with-a-reason (no blanket crate-level allows). What remains is the
-  *gate*: add `cargo clippy --all-targets -- -D warnings` as a
-  `test.py` subcommand and wire it through the hook/justfile/CI chain
-  so all three stay one source of truth. Mike asked for this
-  explicitly ("Are we checking clippy in CI?" — answer was no,
-  nowhere). Note the sweep was scoped to *default features*; the gate
-  should decide whether to also cover the other feature configs
-  (`permutations`-style) — those weren't swept and may still warn.
+- **Permutation-wide clippy.** The sweep and the gate both landed
+  2026-07-24 (`test.py clippy` → `just clippy` → `just check` → CI
+  job, `-D warnings`), covering the llama-cpp configuration's full
+  feature set plus `repl`/`tokio` (the example-only extras were swept
+  too). NOT covered: `trait-layer`/no-default-features and the
+  moeflux configurations — a `-c all` sweep in the `check` style
+  would close that, but each config multiplies CI lint time; decide
+  whether the moeflux arc's code quality earns it before 1.0.
 - `#![warn(missing_docs)]` + the ~10 undocumented pub items the review
   listed (notably the root-re-exported `Tool`/`ToolUse`/`ToolResult`/
   `MessageResponse` aliases in src/prompt.rs use `//` not `///`, so
