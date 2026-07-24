@@ -1,6 +1,6 @@
 [package]
 name = "drama_llama"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 # The stable toolchain CI actually tests (nothing older is ever built
 # here, so a lower claim would be untested). Bump freely alongside CI's

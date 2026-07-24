@@ -4,6 +4,28 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — 2026-07-24
+
+### Fixed
+
+- **Tip resume into a new assistant turn no longer forces an
+  immediate EOS** (the 0-output-token second-round bug). A cached
+  tip's `SamplerState` carries constraint-matcher positions on
+  grammar identity — correct for assistant-prefill / partial-
+  completion resume, but wrong when the new call seats the generated
+  turn plus a tool result: the matcher arrived parked at
+  tool-call-complete, where the only legal continuation is the turn
+  terminator, so every second acting round of an agentic session
+  generated zero tokens (reproduced on both Qwen 3.6 and gpt-oss —
+  template-independent). `Session::build_initial_state` now resets
+  matchers (eager, JSON, and deferred) to their grammar roots when
+  the fold has messages past the resume cursor
+  (`matcher_carry_valid`); the prose stream (rng, mirostat `mu`,
+  n-gram stats) still carries. `hash_cache_smoke` — which exercised
+  the exact failing shape but asserted only cache-read counters —
+  now also asserts round 2 produces output: cache stats are not a
+  proxy for generation.
+
 ## [0.8.0] — 2026-07-24
 
 Backend split. The chat-style API (`Session`), the engine layer

@@ -2872,6 +2872,69 @@ mod tests {
         assert_eq!(resumed.constrained_step, 0);
     }
 
+    /// `reset_constraints` — the new-turn half of a tip resume: every
+    /// matcher returns to its grammar's root and the deferred matcher
+    /// to inactive root, while the prose stream (rng, `mu`, n-gram
+    /// stats, `step`) is untouched. Regression for the 0-output-token
+    /// round-2 bug (2026-07-24): a tip snapshot parked at
+    /// tool-call-complete carried into a NEW assistant turn masks
+    /// every candidate and forces an immediate EOS.
+    #[test]
+    fn reset_constraints_returns_matchers_to_root() {
+        let opts = opts_with_grammar(false);
+        let mut state = state_for(&opts);
+        // Walk one step into "ab": now only "b" is legal — the
+        // stale-carry shape.
+        let tok = sample(
+            cands(&[(A, 20.0), (X, 0.0), (EOS, -20.0)]),
+            &opts,
+            &mut state,
+        );
+        assert_eq!(tok, A);
+        assert!(!grammar_accepts(&opts, &state, b"a"));
+        state.mu = Some(2.5);
+        state.ngram_stats.add(crate::NGram::from(A), 2);
+        let rng_before = state.rng.clone();
+        let stats_before = state.ngram_stats.clone();
+        let step_before = state.step;
+
+        state.reset_constraints(&opts);
+        assert!(grammar_accepts(&opts, &state, b"a"), "back at root");
+        assert!(!grammar_accepts(&opts, &state, b"b"), "position dropped");
+        assert_eq!(state.mu, Some(2.5), "stream carries");
+        assert_eq!(state.rng, rng_before);
+        assert_eq!(state.ngram_stats, stats_before);
+        assert_eq!(state.step, step_before);
+    }
+
+    /// `reset_constraints` on a deferred (lazy) grammar: an activated,
+    /// mid-walk matcher returns to the inactive root — the tip shape
+    /// for `tool_choice: auto`, where the trigger had activated the
+    /// grammar and the completed call parked it at accept.
+    #[test]
+    fn reset_constraints_deactivates_deferred() {
+        let deferred = crate::DeferredGrammar {
+            grammar: CompiledGrammar::parse(AB_GRAMMAR).unwrap(),
+            activate_after: vec![b"!".to_vec()],
+            feed_trigger: false,
+        };
+        let opts = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: None,
+            deferred_grammar: Some(deferred),
+            lazy_grammar: true,
+            ..SamplerConfig::default()
+        };
+        let mut state = state_for(&opts);
+        if let Some(d) = state.deferred.as_mut() {
+            d.active = true;
+        }
+
+        state.reset_constraints(&opts);
+        let d = state.deferred.as_ref().expect("config has a deferred");
+        assert!(!d.active, "deferred must return to inactive");
+    }
+
     /// A populated mid-call snapshot round-trips the constrained
     /// fields bit-exactly with canonical bytes. (Blobs from a binary
     /// predating the fields deserialize via `serde(default)` — worth
