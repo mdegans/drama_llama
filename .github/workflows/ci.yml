@@ -418,6 +418,11 @@ jobs:
       CARGO_BUILD_JOBS: "16"
       CMAKE_BUILD_PARALLEL_LEVEL: "16"
       RAYON_NUM_THREADS: "16"
+      # Half of the toolchain pin below: `test.py coverage` invokes
+      # `cargo +<this>`, and a command-line `+name` outranks every other
+      # rustup override — installing the dated nightly is not enough.
+      # Remove together with the pin.
+      DRAMA_LLAMA_NIGHTLY: nightly-2026-07-23
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/runner-path
@@ -433,8 +438,17 @@ jobs:
       # confidence changes. It also means every push type-checks the crate
       # on nightly for free, which is a real second gate we would otherwise
       # not have.
-      - uses: dtolnay/rust-toolchain@nightly
+      # PINNED nightly, temporarily. nightly-2026-07-24 (89c61a754) ICEs
+      # codegen'ing tokio under this crate's test profile (opt-level=3 +
+      # debug-assertions): "not immediate: OperandRef" in
+      # rustc_codegen_ssa/src/mir/operand.rs:291 — caught by this job's
+      # first PR run, which is exactly the nightly-canary role it has.
+      # 2026-07-23 is the last nightly that built the suite green.
+      # UNPIN (back to `dtolnay/rust-toolchain@nightly`, no `toolchain:`)
+      # once upstream fixes it; check rust-lang/rust for the I-ICE issue.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-07-23
           # cargo-llvm-cov shells out to llvm-profdata / llvm-cov from this
           # component. Without it the run fails after the whole build.
           components: llvm-tools-preview

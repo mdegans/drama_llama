@@ -497,6 +497,16 @@ def require_llvm_cov() -> None:
         )
 
 
+# The toolchain used wherever this script needs nightly (`coverage
+# --doctests`, `docsrs`). Overridable so CI can pin a dated nightly when
+# the current one is broken — nightly-2026-07-24 ICEs codegen'ing tokio
+# under this crate's test profile (opt-level=3 + debug-assertions). A
+# `+name` on the cargo command line outranks every other rustup override
+# (RUSTUP_TOOLCHAIN, the action's default, rust-toolchain files), so a
+# pin only works if it lands where the `+` is written: here.
+NIGHTLY = os.environ.get("DRAMA_LLAMA_NIGHTLY", "nightly")
+
+
 def require_nightly() -> None:
     """`--doctests` is nightly-only; fail before paying for a build."""
     try:
@@ -510,10 +520,10 @@ def require_nightly() -> None:
         # No rustup (a distro toolchain, say). `cargo +nightly` will say
         # something useful on its own; don't block on a guess.
         return
-    if "nightly" not in installed:
+    if NIGHTLY not in installed:
         sys.exit(
-            "--doctests needs the nightly toolchain (llvm-cov's doctest "
-            "support is unstable) — `rustup toolchain install nightly`"
+            f"--doctests needs the {NIGHTLY} toolchain (llvm-cov's doctest "
+            f"support is unstable) — `rustup toolchain install {NIGHTLY}`"
         )
 
 
@@ -557,7 +567,7 @@ def cmd_coverage(args: argparse.Namespace) -> int:
 
     # One toolchain for every pass. See the docstring: mixing them
     # produces profraw the merge step cannot read.
-    cargo = ["cargo", "+nightly"] if args.doctests else ["cargo"]
+    cargo = ["cargo", f"+{NIGHTLY}"] if args.doctests else ["cargo"]
 
     code = run_command(
         [
@@ -843,13 +853,13 @@ def cmd_docsrs(_: argparse.Namespace) -> int:
     meta = manifest["package"]["metadata"]["docs"]["rs"]
     if not DRY_RUN:
         nightly = subprocess.run(
-            ["cargo", "+nightly", "--version"], capture_output=True
+            ["cargo", f"+{NIGHTLY}", "--version"], capture_output=True
         )
         if nightly.returncode != 0:
             sys.exit(
-                "nightly toolchain not found — scrape-examples is "
+                f"{NIGHTLY} toolchain not found — scrape-examples is "
                 "nightly-only (docs.rs builds on nightly). "
-                "`rustup toolchain install nightly`"
+                f"`rustup toolchain install {NIGHTLY}`"
             )
     # The cpu config's target dir, not the default one: the docs.rs
     # feature set has no `cuda`, and on Linux building llama-cpp-sys
@@ -858,7 +868,7 @@ def cmd_docsrs(_: argparse.Namespace) -> int:
     return run_command(
         [
             "cargo",
-            "+nightly",
+            f"+{NIGHTLY}",
             "doc",
             "--no-deps",
             *meta["cargo-args"],
