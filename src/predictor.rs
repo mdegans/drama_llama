@@ -1163,13 +1163,13 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
 impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     /// Predict and collect all the pieces, truncating at stop sequences.
     pub fn collect_text(mut self) -> String {
-        while let Some(_) = self.next() {}
+        for _ in self.by_ref() {}
         self.into_text()
     }
 
     /// Predict and collect the tokens and text, truncating at stop sequences.
     pub fn collect_tokens_and_text(mut self) -> (Vec<Token>, String) {
-        while let Some(_) = self.next() {}
+        for _ in self.by_ref() {}
         self.into_tokens_and_text()
     }
 
@@ -1180,7 +1180,7 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     ) -> (Vec<String>, Vec<Token>, String) {
         let mut pieces = Vec::new();
         // We can't collect because it consumes the predictor.
-        while let Some(piece) = self.next() {
+        for piece in self.by_ref() {
             pieces.push(piece);
         }
         let (tokens, text) = self.into_tokens_and_text();
@@ -1521,7 +1521,7 @@ mod tests {
         // Place the trigger way before the tail window; should miss.
         let mut hay = Vec::new();
         hay.extend_from_slice(b"</think>");
-        hay.extend_from_slice(&vec![b'.'; 200]);
+        hay.extend_from_slice(&[b'.'; 200]);
         let got = super::find_deferred_trigger_end(&hay, b"</think>", 16);
         assert_eq!(got, None);
     }
@@ -1530,9 +1530,9 @@ mod tests {
     fn find_deferred_trigger_end_window_includes_trigger_boundary() {
         // Trigger ends exactly at the start of the window — must still hit.
         let mut hay = Vec::new();
-        hay.extend_from_slice(&vec![b'.'; 200]);
+        hay.extend_from_slice(&[b'.'; 200]);
         hay.extend_from_slice(b"</think>");
-        hay.extend_from_slice(&vec![b'x'; 8]);
+        hay.extend_from_slice(&[b'x'; 8]);
         let got = super::find_deferred_trigger_end(&hay, b"</think>", 16);
         assert_eq!(got, Some(208));
     }

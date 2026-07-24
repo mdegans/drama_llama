@@ -866,10 +866,7 @@ impl<'a> Parser<'a> {
 
         // Stray-commentary wart: `<|channel|>commentary[ to=assistant]`
         // immediately followed by the real channel header.
-        loop {
-            let Some(after) = header.strip_prefix(harmony::COMMENTARY) else {
-                break;
-            };
+        while let Some(after) = header.strip_prefix(harmony::COMMENTARY) {
             let after = after.strip_prefix(" to=assistant").unwrap_or(after);
             if after.starts_with(harmony::CHANNEL) {
                 header = after;
@@ -2291,12 +2288,14 @@ mod tests {
     /// fallback on odd templates and via user-constructed syntaxes.
     #[test]
     fn tagged_call_degenerate_syntax_terminates() {
-        let mut syntax = CallSyntax::default();
-        syntax.family = Family::TagWithTagged;
         // Trigger comes from `section_start`; every argument marker
         // stays empty (the degenerate extraction result) and the close
         // never appears in the input.
-        syntax.section_start = "<fn>".into();
+        let mut syntax = CallSyntax {
+            family: Family::TagWithTagged,
+            section_start: "<fn>".into(),
+            ..Default::default()
+        };
         syntax.function.name_suffix = "\n".into();
         syntax.function.close = "</never>".into();
         let t = tool("get_weather");

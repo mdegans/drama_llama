@@ -315,7 +315,7 @@ impl RepetitionOptions {
     ///
     /// # Notes:
     /// * any tokens in [`PredictOptions::stop_sequences`], including EOS, are
-    /// automatically ignored.
+    ///   automatically ignored.
     ///
     /// [`PredictOptions::stop_sequences`]: crate::PredictOptions::stop_sequences
     pub fn ignored(&self) -> &BTreeSet<NGram> {
@@ -327,7 +327,7 @@ impl RepetitionOptions {
     ///
     /// # Notes:
     /// * any tokens in [`PredictOptions::stop_sequences`], including EOS, are
-    /// automatically ignored.
+    ///   automatically ignored.
     ///
     /// [`PredictOptions::stop_sequences`]: crate::PredictOptions::stop_sequences
     pub fn set_ignored<It, Ng>(mut self, ignored: It) -> Self
@@ -904,14 +904,12 @@ pub(crate) fn apply_sample_repetition_ngram_guarded(
         .get()
         .max(1)
         .min(NGram::CAPACITY as u8)
-        .try_into()
-        .unwrap();
+        .into();
     let ngram_max_size: usize = ngram_max_size
         .get()
         .max(1)
         .min(NGram::CAPACITY as u8)
-        .try_into()
-        .unwrap();
+        .into();
     // Invariant established by strict deserialize, the clamping ngram-size
     // setters, and dynamic GUI ranges: no construction path can produce
     // min > max. CAPACITY-clamping both to `[1, CAPACITY]` above cannot invert
@@ -1694,6 +1692,9 @@ mod tests {
     /// logit returns to baseline.
     #[test]
     #[ignore = "long-running; uses real model"]
+    // The per-step pushes interleave with sampling calls that mutate
+    // `freq_map`; `vec![tok; n]` would drop that per-iteration work.
+    #[allow(clippy::same_item_push)]
     fn gap_decays_after_popular_ngram_exits_window() {
         let model = load_model();
         let n_vocab = 1024;

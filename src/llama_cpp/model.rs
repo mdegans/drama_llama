@@ -293,7 +293,7 @@ impl LlamaCppModel {
     /// Return the base filename if the `LlamaCppModel` was loaded [`from_file`]
     ///
     /// [`from_file`]: LlamaCppModel::from_file
-    pub fn file_name<'a>(&'a self) -> Option<&'a OsStr> {
+    pub fn file_name(&self) -> Option<&OsStr> {
         self.0.file_name.as_deref()
     }
 
@@ -318,7 +318,7 @@ impl LlamaCppModel {
 
     /// Return the inner model.
     pub fn as_ptr(&self) -> *const llama_model {
-        debug_assert_eq!(self.0.inner.is_null(), false);
+        debug_assert!(!self.0.inner.is_null());
         self.0.inner as *const llama_model
     }
 
@@ -339,7 +339,7 @@ impl LlamaCppModel {
     /// [`LlamaCppModel`] is a shared handle, so a `&mut` would falsely
     /// imply exclusive access to the underlying model.
     pub unsafe fn as_ptr_mut(&self) -> *mut llama_model {
-        debug_assert_eq!(self.0.inner.is_null(), false);
+        debug_assert!(!self.0.inner.is_null());
         self.0.inner
     }
 
@@ -537,8 +537,7 @@ impl LlamaCppModel {
 
             // This could fail if the model has junk in the description. It's
             // not a programmer error, so we'll just return an error string.
-            return String::from_utf8(buf)
-                .unwrap_or("[Invalid UTF-8]".to_string());
+            String::from_utf8(buf).unwrap_or("[Invalid UTF-8]".to_string())
         }
     }
 
@@ -766,10 +765,9 @@ impl LlamaCppModel {
         // Guess a reasonable number of tokens to allocate. This is not
         // guaranteed to be enough, but it will probably be enough in most
         // cases.
-        let mut n_tokens: i32 = (input.as_bytes().len()
-            + if add_special { 1 } else { 0 })
-        .try_into()
-        .unwrap();
+        let mut n_tokens: i32 = (input.len() + if add_special { 1 } else { 0 })
+            .try_into()
+            .unwrap();
         n_tokens /= 3;
 
         let mut result = vec![0; n_tokens as usize];
@@ -842,7 +840,7 @@ impl LlamaCppModel {
     /// with a carry buffer when the tokens arrive one at a time —
     /// which is what [`PiecePredictor`](crate::PiecePredictor) does.
     pub fn token_to_piece(&self, token: llama_token) -> String {
-        token_to_piece(token, &self)
+        token_to_piece(token, self)
     }
 
     /// Convert tokens to pieces, one string per token. Lossy on split
@@ -904,7 +902,7 @@ impl LlamaCppModel {
     /// * If the token text is invalid UTF-8
     // It's unclear how this differs from `token_to_piece` other than returning
     // a c_str() ptr to the underlying c++ std::string
-    pub fn token_to_text<'a>(&'a self, token: llama_token) -> Option<&'a str> {
+    pub fn token_to_text(&self, token: llama_token) -> Option<&str> {
         if token < 0 || token >= self.n_vocab() {
             return None;
         }
@@ -1211,6 +1209,9 @@ mod tests {
     /// so it stays useful on a partial model dir.
     #[test]
     #[ignore = "long running, requires the full models/ dir"]
+    // One-off test fixture; the tuple fields are labeled by the comment
+    // above and a type alias would not read more clearly here.
+    #[allow(clippy::type_complexity)]
     fn test_recommended_sampling_across_models() {
         use std::path::PathBuf;
 

@@ -54,8 +54,7 @@ impl IgnoreCategory {
             // TODO: there is allocation here that can be avoided by turning the
             // tokenize function into a method returning an iterator, however
             // it's not a big deal since this is only done once.
-            .map(|word| model.tokenize(word, false).into_iter())
-            .flatten()
+            .flat_map(|word| model.tokenize(word, false).into_iter())
     }
 }
 

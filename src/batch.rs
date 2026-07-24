@@ -154,7 +154,7 @@ impl Batch {
                         self.batch.token,
                         self.capacity(),
                     )
-                }[..self.len() as usize],
+                }[..self.len()],
             )
         }
     }
@@ -174,7 +174,7 @@ impl Batch {
                         self.batch.token,
                         self.capacity(),
                     )
-                }[..self.len() as usize],
+                }[..self.len()],
             )
         }
     }
@@ -188,7 +188,7 @@ impl Batch {
             debug_assert!(!self.batch.token.is_null());
             None
         } else {
-            if (i as usize) >= self.len() {
+            if i >= self.len() {
                 None
             } else {
                 // SAFETY: `batch.embd` is a `capacity * embd_len` f32
@@ -215,7 +215,7 @@ impl Batch {
             debug_assert!(!self.batch.token.is_null());
             None
         } else {
-            if (i as usize) >= self.len() {
+            if i >= self.len() {
                 None
             } else {
                 // SAFETY: see [`Self::embd`]; `&mut self` plus the
@@ -374,7 +374,7 @@ mod tests {
                 assert_eq!(batch.capacity(), 16);
                 assert_eq!(batch.len(), i);
                 assert_eq!(batch.embd_len(), 0);
-                assert_eq!(batch.n_seq_max(), n_seq_max as usize);
+                assert_eq!(batch.n_seq_max(), n_seq_max);
                 assert!(batch.tokens().is_some());
                 assert!(batch.tokens_mut().is_some());
                 assert!(batch.embd(i).is_none());
@@ -383,13 +383,13 @@ mod tests {
                     batch.add_token(
                         i as llama_token,
                         i,
-                        Some(&vec![42; n_seq_max as usize]),
+                        Some(&vec![42; n_seq_max]),
                         true
                     ),
                     Ok(())
                 );
                 assert_eq!(batch.n_seq()[i], n_seq_max as i32);
-                assert_eq!(batch.logits()[i], true);
+                assert!(batch.logits()[i]);
                 assert_eq!(batch.pos()[i], i as i32);
             }
 
@@ -409,7 +409,7 @@ mod tests {
                     Ok(())
                 );
                 assert_eq!(batch.n_seq()[i], 1);
-                assert_eq!(batch.logits()[i], false);
+                assert!(!batch.logits()[i]);
                 assert_eq!(batch.pos()[i], i as i32);
             }
 

@@ -20,9 +20,10 @@ use llama_cpp_sys_3::llama_token_data_array;
 use std::ops::Deref;
 
 /// Sort state of the candidates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Sorted {
     /// The candidates may or may not be sorted.
+    #[default]
     Unknown,
     /// The candidates are sorted because there is only one candidate left. In
     /// this case they are sorted by id, logit, and probability.
@@ -35,12 +36,6 @@ pub enum Sorted {
     ///
     /// See [`Candidates::softmax`] for calculating probabilities.
     ByLogit { k: NonZeroUsize },
-}
-
-impl Default for Sorted {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl Sorted {
@@ -108,6 +103,10 @@ impl TokenDataArray<'_> {
     ///
     /// # Panics
     /// * If the arr.size has been modified to be out of bounds.
+    // Renaming or moving to the `AsRef` trait is a public-API break; a
+    // trait impl also can't carry the size-invariant `# Panics` contract.
+    // Revisit for 1.0 — see `.claude/memory/one_dot_oh_wishlist.md`.
+    #[allow(clippy::should_implement_trait)]
     pub fn as_ref(&self) -> &llama_token_data_array {
         assert!(self.arr.size == self.len().get());
         &self.arr
@@ -123,6 +122,10 @@ impl TokenDataArray<'_> {
     /// * If `arr.size` is shrunk, the Candidates struct must be truncated to
     ///   the new size. Growing the candidates is not allowed and will cause
     ///   a panic or truncation on the next access.
+    // Public-API break to rename; and `AsMut` is the wrong contract anyway
+    // — this resets sort/softmax state as a side effect, which `AsMut::as_mut`
+    // must not. Revisit for 1.0 — see `.claude/memory/one_dot_oh_wishlist.md`.
+    #[allow(clippy::should_implement_trait)]
     pub fn as_mut(&mut self) -> &mut llama_token_data_array {
         self.arr.size = self.len().get();
         self.candidates.sort_state = Sorted::Unknown;
@@ -332,13 +335,11 @@ impl Candidates {
     where
         T: IntoIterator<Item = f32>,
     {
-        Self::from_iter(
-            (0..).zip(it.into_iter()).map(|(id, logit)| TokenData {
-                id,
-                logit,
-                p: 0.0,
-            }),
-        )
+        Self::from_iter((0..).zip(it).map(|(id, logit)| TokenData {
+            id,
+            logit,
+            p: 0.0,
+        }))
     }
 
     /// Create a new Candidates container from a [`Vec`] without checking if the
@@ -604,7 +605,7 @@ impl Candidates {
         });
         let cum_sum: f32 = cum_sum as f32;
         for token in &mut new.data {
-            token.p /= cum_sum as f32;
+            token.p /= cum_sum;
         }
 
         // We're not changing the logits so we don't need to sort again.
@@ -833,8 +834,7 @@ impl Candidates {
                 if token.p != 0.0 {
                     (f64::from(token.p).ln() - entropy)
                         .abs()
-                        .min(f64::MAX)
-                        .max(f64::MIN)
+                        .clamp(f64::MIN, f64::MAX)
                 } else {
                     // If p is 0, the entropy is 0 and the score is infinity.
                     f64::MAX
@@ -901,7 +901,6 @@ impl Candidates {
         let mu = opt_mu.unwrap_or(2.0 * tau);
 
         // Estimate s_hat using the most probable m tokens
-        let s_hat;
         let mut t_i;
         let mut b_i;
         let mut sum_ti_bi = 0.0;
@@ -912,7 +911,7 @@ impl Candidates {
             sum_ti_bi += t_i * b_i;
             sum_ti_sq += t_i * t_i;
         }
-        s_hat = sum_ti_bi / sum_ti_sq;
+        let s_hat = sum_ti_bi / sum_ti_sq;
 
         // Compute k from the estimated s_hat and target suprise value
         let epsilon_hat = s_hat - 1.0;
@@ -945,9 +944,9 @@ impl Candidates {
     ///
     /// # Note
     /// * This is a translation of `llama_sample_token_mirostat_v2` but differs
-    /// slightly in that `max_keep` is supported. If the original behavior is
-    /// desired, set `max_keep` to `self.len()`. The defualt is 100 like v1 with
-    /// the rationale that more than 100 candidates is likely to be too many.
+    ///   slightly in that `max_keep` is supported. If the original behavior is
+    ///   desired, set `max_keep` to `self.len()`. The defualt is 100 like v1 with
+    ///   the rationale that more than 100 candidates is likely to be too many.
     pub fn mirostat_v2(
         self,
         rng: &mut rand_pcg::Pcg64Mcg,
@@ -1213,6 +1212,7 @@ impl Candidates {
     /// * This method may apply the softmax if it has not been applied yet.
     /// * This method may sort the candidates if they are not already sorted.
     /// * This method may change the logits of the candidates.
+    ///
     /// `current_step` is the absolute step for windowed eviction/decay
     /// (see `SamplerState::step`); pass `tokens.len() as u64` for the
     /// simple token-position basis.
@@ -1453,7 +1453,7 @@ mod tests {
         let candidates = Candidates::new(n.get()).unwrap();
         assert_eq!(candidates.data.len(), n.get());
         assert_eq!(candidates.len(), n);
-        assert_eq!(Some(n.try_into().unwrap()), candidates.is_sorted().by_id());
+        assert_eq!(Some(n), candidates.is_sorted().by_id());
 
         for i in 0..n.get() {
             assert_eq!(candidates[i].id, i as i32);
@@ -1467,7 +1467,7 @@ mod tests {
         // Test with a vector sorted by id
         let v = (0..10)
             .map(|i| TokenData {
-                id: i as i32,
+                id: i,
                 logit: 0.0,
                 p: 0.0,
             })
@@ -1481,7 +1481,7 @@ mod tests {
         // Test with a vector sorted by logit
         let v = (0..10)
             .map(|i| TokenData {
-                id: 9 - i as i32,
+                id: 9 - i,
                 logit: -(i as f32),
                 p: 0.0,
             })
@@ -1495,7 +1495,7 @@ mod tests {
         // Test with a vector that is not sorted
         let v = (0..10)
             .map(|i| TokenData {
-                id: 9 - i as i32,
+                id: 9 - i,
                 logit: i as f32,
                 p: 0.0,
             })
@@ -1913,7 +1913,7 @@ mod tests {
     fn capture_snapshot_top_k_cap_honored() {
         // 100 logits, decreasing — softmax produces a clean ranking.
         let logits: Vec<f32> = (0..100).map(|i| -(i as f32) * 0.1).collect();
-        let c = Candidates::from_logits(logits.into_iter());
+        let c = Candidates::from_logits(logits);
 
         let snap = c.capture_snapshot(&snapshot_opts(5, 0.0, false));
 
@@ -1934,7 +1934,7 @@ mod tests {
         // should drop everything but the argmax.
         let mut logits: Vec<f32> = vec![0.0; 50];
         logits[0] = 20.0;
-        let c = Candidates::from_logits(logits.into_iter());
+        let c = Candidates::from_logits(logits);
 
         let snap = c.capture_snapshot(&snapshot_opts(20, 0.5, false));
         assert_eq!(snap.top_k.len(), 1);
@@ -1943,7 +1943,7 @@ mod tests {
         // Now a degenerate flat distribution — threshold above every
         // p, but the argmax is *still* retained.
         let logits: Vec<f32> = vec![0.0; 50];
-        let c = Candidates::from_logits(logits.into_iter());
+        let c = Candidates::from_logits(logits);
         let snap = c.capture_snapshot(&snapshot_opts(20, 0.5, false));
         assert_eq!(
             snap.top_k.len(),
@@ -1955,7 +1955,7 @@ mod tests {
     #[test]
     fn capture_snapshot_cumulative_mass_matches_sum() {
         let logits: Vec<f32> = (0..32).map(|i| -(i as f32) * 0.05).collect();
-        let c = Candidates::from_logits(logits.into_iter());
+        let c = Candidates::from_logits(logits);
         let snap = c.capture_snapshot(&snapshot_opts(8, 0.0, false));
         let sum: f32 = snap.top_k.iter().map(|td| td.p).sum();
         assert!(
@@ -1971,7 +1971,7 @@ mod tests {
         // Uniform distribution → entropy = ln(V).
         let v = 64usize;
         let logits: Vec<f32> = vec![0.0; v];
-        let c = Candidates::from_logits(logits.into_iter());
+        let c = Candidates::from_logits(logits);
         let snap = c.capture_snapshot(&snapshot_opts(v, 0.0, true));
         let h = snap.entropy.expect("entropy requested");
         let expected = (v as f32).ln();
@@ -1985,7 +1985,7 @@ mod tests {
         // One-hot (sharp spike) → entropy ≈ 0.
         let mut logits: Vec<f32> = vec![-50.0; v];
         logits[0] = 50.0;
-        let c = Candidates::from_logits(logits.into_iter());
+        let c = Candidates::from_logits(logits);
         let snap = c.capture_snapshot(&snapshot_opts(v, 0.0, true));
         let h = snap.entropy.expect("entropy requested");
         assert!(h < 1e-3, "one-hot entropy {} should be near 0", h);
@@ -1994,7 +1994,7 @@ mod tests {
     #[test]
     fn capture_snapshot_compute_entropy_false_yields_none() {
         let logits: Vec<f32> = (0..16).map(|i| -(i as f32)).collect();
-        let c = Candidates::from_logits(logits.into_iter());
+        let c = Candidates::from_logits(logits);
         let snap = c.capture_snapshot(&snapshot_opts(4, 0.0, false));
         assert!(snap.entropy.is_none());
     }
@@ -2002,7 +2002,7 @@ mod tests {
     #[test]
     fn capture_snapshot_borrow_is_state_pure() {
         let logits: Vec<f32> = (0..32).map(|i| -(i as f32) * 0.1).collect();
-        let c = Candidates::from_logits(logits.into_iter());
+        let c = Candidates::from_logits(logits);
         let sort_before = c.sort_state;
         let softmax_before = c.softmax_applied_to;
 
@@ -2023,7 +2023,7 @@ mod tests {
     #[test]
     fn snapshot_lookup_p_and_rank() {
         let logits: Vec<f32> = (0..16).map(|i| -(i as f32) * 0.5).collect();
-        let c = Candidates::from_logits(logits.into_iter());
+        let c = Candidates::from_logits(logits);
         let snap = c.capture_snapshot(&snapshot_opts(4, 0.0, false));
 
         // Token 0 is argmax (largest logit) → rank 1, p > 0.

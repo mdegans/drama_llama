@@ -530,7 +530,7 @@ fn is_ws(b: u8) -> bool {
 }
 
 fn is_hex(b: u8) -> bool {
-    matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
+    b.is_ascii_hexdigit()
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]

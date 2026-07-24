@@ -2368,19 +2368,21 @@ mod tests {
         for lazy in [false, true] {
             let opts = opts_with_grammar(lazy);
             let mut state = state_for(&opts);
-            let mut toks = Vec::new();
             // "a" then "b" dominate in turn; both legal under the grammar
-            // at their step.
-            toks.push(sample(
-                cands(&[(A, 20.0), (X, 0.0), (EOS, -20.0)]),
-                &opts,
-                &mut state,
-            ));
-            toks.push(sample(
-                cands(&[(B, 20.0), (X, 0.0), (EOS, -20.0)]),
-                &opts,
-                &mut state,
-            ));
+            // at their step. `vec!` evaluates left-to-right, so the two
+            // `sample` calls thread `state` in order.
+            let toks = vec![
+                sample(
+                    cands(&[(A, 20.0), (X, 0.0), (EOS, -20.0)]),
+                    &opts,
+                    &mut state,
+                ),
+                sample(
+                    cands(&[(B, 20.0), (X, 0.0), (EOS, -20.0)]),
+                    &opts,
+                    &mut state,
+                ),
+            ];
             results.push(toks);
         }
         assert_eq!(results[0], vec![A, B]);

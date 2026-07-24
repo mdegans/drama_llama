@@ -101,9 +101,9 @@ macro_rules! impl_from_to_float {
                 }
             }
 
-            impl Into<$t> for Probability<$t> {
-                fn into(self) -> $t {
-                    self.into_f()
+            impl From<Probability<$t>> for $t {
+                fn from(p: Probability<$t>) -> $t {
+                    p.into_f()
                 }
             }
         )*

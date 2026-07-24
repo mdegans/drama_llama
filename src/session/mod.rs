@@ -52,13 +52,13 @@
 //!
 //! Local inference has no "cache creation" cost in the Anthropic sense — the
 //! whole prompt is decoded on every call anyway — but it *does* pay a linear
-//! prefill cost in tokens. When successive calls share a long prefix (system
-//! + tools + early turns), re-prefilling those positions wastes work. The
-//! opt-in prefix cache keeps the KV state from the previous call around and, on
-//! the next call, computes the longest common prefix of `new_tokens` and
-//! `prev_tokens`, clipped to the nearest `cache_control` breakpoint declared in
-//! the prompt, and resumes generation from that position via
-//! [`LlamaCppEngine::predict_pieces_resuming`].
+//! prefill cost in tokens. When successive calls share a long prefix
+//! (system + tools + early turns), re-prefilling those positions wastes
+//! work. The opt-in prefix cache keeps the KV state from the previous call
+//! around and, on the next call, computes the longest common prefix of
+//! `new_tokens` and `prev_tokens`, clipped to the nearest `cache_control`
+//! breakpoint declared in the prompt, and resumes generation from that
+//! position via [`LlamaCppEngine::predict_pieces_resuming`].
 //!
 //! The contract:
 //!
@@ -3187,6 +3187,9 @@ impl<B: Backend> Session<B> {
     /// the model sentinel bytes as prose.
     ///
     /// [`Prompt::tool_choice`]: crate::Prompt
+    // Private helper; the tuple is self-documenting at its one call site,
+    // and a type alias would hide the positional field meaning.
+    #[allow(clippy::type_complexity)]
     fn prepare_call(
         &mut self,
         prompt: &Prompt,
@@ -3334,6 +3337,9 @@ impl<B: Backend> Session<B> {
     /// [`Vision::tokenize_image`]: crate::backend::Vision::tokenize_image
     /// [`Model::tokenize`]: crate::backend::Model::tokenize
     /// [`Model::tokenize_special`]: crate::backend::Model::tokenize_special
+    // Private helper; the tuple is self-documenting at its one call site,
+    // and a type alias would hide the positional field meaning.
+    #[allow(clippy::type_complexity)]
     fn tokenize_split(
         &self,
         text: &str,
@@ -3607,6 +3613,9 @@ impl<B: Backend> Session<B> {
     /// beyond the engine — except on media eval failures, where it
     /// wipes KV + prefix cache (`record_cache_miss_on_error`) so
     /// partial image cells can never survive into a later call.
+    // Private helper; the tuple is self-documenting at its one call site,
+    // and a type alias would hide the positional field meaning.
+    #[allow(clippy::type_complexity)]
     fn kv_setup_and_chunk_prefill(
         &mut self,
         new_entries: &[CacheEntry],
@@ -4457,8 +4466,9 @@ impl<B: Backend> Session<B> {
         let mut generated_count: usize = 0;
         let mut text = String::new();
         let cache_on = self.prefix_cache.is_some();
-        let mut generated_tokens: Vec<Token> =
-            if cache_on { Vec::new() } else { Vec::new() };
+        // Only populated when caching is on (see above); starts empty
+        // either way.
+        let mut generated_tokens: Vec<Token> = Vec::new();
         let mut predictor = if self.prefix_cache.is_some() {
             // Cache on: ALWAYS the resuming constructor — even at
             // prefill_start == 0 — because the non-resuming one calls
@@ -4912,8 +4922,9 @@ impl<B: Backend> Session<B> {
         // (no EOS filter — we want the recorded-but-uncommitted EOS
         // for the auto-tip extension; see `compute_tip_extension`).
         let cache_on = self.prefix_cache.is_some();
-        let mut generated_tokens: Vec<Token> =
-            if cache_on { Vec::new() } else { Vec::new() };
+        // Only populated when caching is on (see above); starts empty
+        // either way.
+        let mut generated_tokens: Vec<Token> = Vec::new();
 
         let mut predictor = if self.prefix_cache.is_some() {
             // Cache on: ALWAYS the resuming constructor — even at
@@ -5848,8 +5859,8 @@ struct CallOutcome {
 fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
     use crate::Block;
     use std::borrow::Cow;
-    fn is_open(signature: &Cow<'static, str>) -> bool {
-        signature.as_ref() == crate::prompt::OPEN_THOUGHT_SIGNATURE
+    fn is_open(signature: &str) -> bool {
+        signature == crate::prompt::OPEN_THOUGHT_SIGNATURE
     }
     let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
     for block in blocks {

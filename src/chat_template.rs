@@ -2756,9 +2756,7 @@ mod tests {
         let p = Prompt {
             messages: vec![Message {
                 role: Role::User,
-                content: Content(vec![Block::ToolResult {
-                    result: result.into(),
-                }]),
+                content: Content(vec![Block::ToolResult { result }]),
             }],
             ..Prompt::default()
         };

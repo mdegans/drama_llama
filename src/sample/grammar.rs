@@ -378,7 +378,7 @@ impl<'a> GrammarBuilder<'a> {
                 chars.next();
                 i = idx + c.len_utf8();
             } else if c == '#' {
-                while let Some((_, c2)) = chars.next() {
+                for (_, c2) in chars.by_ref() {
                     if c2 == '\n' {
                         break;
                     }
@@ -402,8 +402,7 @@ impl<'a> GrammarBuilder<'a> {
         if j == 0 {
             return false;
         }
-        let after =
-            &rest[j..].trim_start_matches(|c: char| c == ' ' || c == '\t');
+        let after = &rest[j..].trim_start_matches([' ', '\t']);
         after.starts_with("::=")
     }
 
@@ -2483,9 +2482,9 @@ ws ::= [ \t\n\r]?
         for _ in 0..4096 {
             let bitmap = state.first_byte_bitmap();
             let mut chosen: Option<u8> = None;
-            'outer: for w in 0..2usize {
+            'outer: for (w, &word) in bitmap.iter().enumerate() {
                 for b in 0..64u8 {
-                    if (bitmap[w] >> b) & 1 == 1 {
+                    if (word >> b) & 1 == 1 {
                         let byte = (w as u8) * 64 + b;
                         if state.accepts_bytes(&[byte]) {
                             chosen = Some(byte);

@@ -174,13 +174,13 @@ impl<'a, M: Model> ConstraintGuard<'a, M> {
                         return None;
                     }
                 }
-                (SamplingMode::Json, MatcherState::Json(s)) => {
-                    if !s.is_complete() {
-                        if !s.in_free_region() {
-                            return None;
-                        }
-                        entries.push(GuardEntry::Json { state: s });
+                (SamplingMode::Json, MatcherState::Json(s))
+                    if !s.is_complete() =>
+                {
+                    if !s.in_free_region() {
+                        return None;
                     }
+                    entries.push(GuardEntry::Json { state: s });
                 }
                 _ => {}
             }

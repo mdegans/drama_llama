@@ -249,12 +249,12 @@ directly on Windows, since the recipe bodies are bash.
 
 - [ ] Automatic batch scheduling and better parallelism
 - [ ] Runtime model-variant selection for moeflux, replacing the compile-time
-      feature selection
+  feature selection
 - [ ] Stream `misanthropic::stream::Event` from `Session::complete_stream`
-      ([#26](https://github.com/mdegans/drama_llama/issues/26))
+  ([#26](https://github.com/mdegans/drama_llama/issues/26))
 - [ ] Tokenization in the browser
 - [ ] Backends beyond llama.cpp and moeflux — an NPU target is the long-term
-      goal
+  goal
 
 See [`CHANGELOG.md`] for what has already landed, and the [issue tracker] for
 what is actively broken.

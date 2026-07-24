@@ -107,11 +107,15 @@ fn probe_hook_can_be_cleared() {
     );
 }
 
+/// Per-token capture record: `(token, has_snapshot, sampled_p,
+/// sampled_rank, top_k_len)`.
+type SnapshotLog = Arc<Mutex<Vec<(Token, bool, f32, Option<u32>, usize)>>>;
+
 /// Captures snapshot presence + sampled-token lookup results per token.
 /// Used to verify the rich-capture path is wired correctly when a hook
 /// declares appetite via `snapshot_opts`.
 struct SnapshotHook {
-    log: Arc<Mutex<Vec<(Token, bool, f32, Option<u32>, usize)>>>,
+    log: SnapshotLog,
     opts: SnapshotOpts,
 }
 
@@ -143,8 +147,7 @@ impl ProbeHook for SnapshotHook {
 #[test]
 #[ignore = "long running"]
 fn probe_hook_snapshot_populated_when_requested() {
-    let log: Arc<Mutex<Vec<(Token, bool, f32, Option<u32>, usize)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let log: SnapshotLog = Arc::new(Mutex::new(Vec::new()));
 
     let mut engine = LlamaCppEngine::from_path(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf"),

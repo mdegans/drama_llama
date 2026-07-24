@@ -712,7 +712,7 @@ mod tests {
         // Compilation must succeed — the previous bug errored here.
         let result = grammar_for_tool_choice(
             &ToolChoice::method("two_ints"),
-            &[schema_tool.clone()],
+            std::slice::from_ref(&schema_tool),
             &opts,
             false,
         );
@@ -1362,7 +1362,7 @@ mod tests {
         // assert against that, not a hardcoded name.
         let field = ToolChoiceOptions::default().arguments_field;
         assert!(
-            value.get(&*field).is_some(),
+            value.get(field).is_some(),
             "forced output must have a `{field}` field. output: {output:?}"
         );
     }

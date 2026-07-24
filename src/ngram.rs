@@ -76,6 +76,11 @@ impl NGram {
         self.data.len()
     }
 
+    /// Returns `true` if the n-gram contains no tokens.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     pub const fn capacity(&self) -> usize {
         Self::CAPACITY
     }
@@ -263,7 +268,7 @@ impl NGramStats {
         self.ngram_count += 1;
         self.token_count += key.len();
 
-        let entry = self.data.entry(key).or_insert(NGramData::default());
+        let entry = self.data.entry(key).or_default();
         entry.count += 1;
         entry.positions.push_back(current_step);
 
@@ -376,9 +381,9 @@ impl NGramStats {
     }
 }
 
-impl Into<BTreeMap<NGram, NGramData>> for NGramStats {
-    fn into(self) -> BTreeMap<NGram, NGramData> {
-        self.data
+impl From<NGramStats> for BTreeMap<NGram, NGramData> {
+    fn from(val: NGramStats) -> Self {
+        val.data
     }
 }
 

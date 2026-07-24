@@ -52,7 +52,7 @@ pub(crate) fn log_level_from_raw(level: ggml_log_level) -> LogLevel {
         ggml_log_level_GGML_LOG_LEVEL_WARN => LogLevel::Warn,
         ggml_log_level_GGML_LOG_LEVEL_ERROR => LogLevel::Error,
         ggml_log_level_GGML_LOG_LEVEL_CONT => LogLevel::Cont,
-        other => LogLevel::Other(other as u32),
+        other => LogLevel::Other(other),
     }
 }
 
