@@ -444,8 +444,9 @@ jobs:
       # rustc_codegen_ssa/src/mir/operand.rs:291 — caught by this job's
       # first PR run, which is exactly the nightly-canary role it has.
       # 2026-07-23 is the last nightly that built the suite green.
-      # UNPIN (back to `dtolnay/rust-toolchain@nightly`, no `toolchain:`)
-      # once upstream fixes it; check rust-lang/rust for the I-ICE issue.
+      # UNPIN (back to `dtolnay/rust-toolchain@nightly`, no `toolchain:`,
+      # and drop DRAMA_LLAMA_NIGHTLY above) once rust-lang/rust#159822 is
+      # fixed in a nightly.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-07-23
