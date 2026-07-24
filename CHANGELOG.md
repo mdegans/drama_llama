@@ -4,6 +4,31 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] — 2026-07-24
+
+### Fixed
+
+- **A truncation sampler can no longer starve the deferred (lazy)
+  tool-call grammar** ([#76]). An eager grammar — the forced
+  `tool_choice` path — is prepended into `SamplerConfig::modes` by the
+  session so it masks the full vocab *before* `LocallyTypical` / `TopP`
+  / `TopK` narrow it. The deferred grammar, which is not in `modes`,
+  was applied after the entire fold instead, so it only ever saw what
+  truncation left behind — frequently a single token. When that lone
+  survivor was illegal, `grammar_filter` force-EOS'd and generation
+  ended mid-structure, surfacing as
+  `SessionError::GrammarViolation`, even though thousands of legal
+  tokens existed in the full candidate set.
+
+  Because only `tool_choice: auto` builds a deferred grammar, this
+  presented as *intermittent* tool-call failures on local models under
+  auto while forced tool choice was unaffected, and it was independent
+  of `max_tokens` (reproduced identically at 2048, 4096, 8192, and
+  16384). `apply_modes` now runs the deferred grammar first, at the
+  same point an eager grammar runs. Reproduced end-to-end on
+  gpt-oss-20b via a multi-round agentic tool session, where it failed
+  on the first acting round every time and passes 8/8 rounds after.
+
 ## [0.8.1] — 2026-07-24
 
 ### Fixed
@@ -959,3 +984,4 @@ flip `DRAMA_LLAMA_DFA_CACHE=0`.
 [#54]: https://github.com/mdegans/drama_llama/issues/54
 [#60]: https://github.com/mdegans/drama_llama/issues/60
 [#68]: https://github.com/mdegans/drama_llama/issues/68
+[#76]: https://github.com/mdegans/drama_llama/issues/76
