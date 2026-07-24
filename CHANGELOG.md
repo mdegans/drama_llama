@@ -4,7 +4,7 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.0] — Unreleased
+## [0.8.0] — 2026-07-24
 
 Backend split. The chat-style API (`Session`), the engine layer
 (`Engine`), the Predictor family, and the binary (`blallama`) are
@@ -778,6 +778,15 @@ Three further arcs land on top of the split:
 - See `.claude/memory/moeflux_disk_convention.md` for the
   forward-looking on-disk layout `MoefluxEngine::from_path`
   expects, and the migration story for current artifacts.
+- **Known issues** (tracked, not fixed in this release):
+  - Context-full during generation ends the stream silently and, on
+    the grammar path, misreports as a `GrammarViolation` ([#36]).
+  - A tool call truncated by the token budget can seat frame-marker
+    text in the transcript; containment (not prevention) is the
+    planned fix ([#38]).
+  - On the un-grammared lazy path, nothing forbids EOG while a
+    thought block is open, so a model can end its turn mid-thought
+    ([#64]).
 
 ## [0.7.0] — 2026-04-22
 
@@ -914,6 +923,9 @@ flip `DRAMA_LLAMA_DFA_CACHE=0`.
 [0.8.0]: https://github.com/mdegans/drama_llama/releases/tag/v0.8.0
 [0.7.0]: https://github.com/mdegans/drama_llama/releases/tag/v0.7.0
 [#28]: https://github.com/mdegans/drama_llama/issues/28
+[#36]: https://github.com/mdegans/drama_llama/issues/36
+[#38]: https://github.com/mdegans/drama_llama/issues/38
+[#64]: https://github.com/mdegans/drama_llama/issues/64
 [#29]: https://github.com/mdegans/drama_llama/issues/29
 [#30]: https://github.com/mdegans/drama_llama/issues/30
 [#31]: https://github.com/mdegans/drama_llama/issues/31
