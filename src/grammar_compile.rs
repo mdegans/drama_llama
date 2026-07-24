@@ -406,9 +406,10 @@ fn emit_object_rule(
 //   * floats → serde_json/ryu shortest form matches minijinja
 //     (`1.5e10` ⇒ `15000000000.0`, `3.0` ⇒ `3.0`).
 
-/// Append `value` in dict encoding. Objects render key-sorted
-/// (serde_json's BTreeMap ⇒ same order as the template's
-/// `| dictsort`).
+/// Append `value` in dict encoding. Objects render explicitly
+/// key-sorted: the Gemma templates pipe arguments through
+/// `| dictsort`, which alphabetizes regardless of the Map's own
+/// iteration order, and re-render byte-stability pins us to it.
 pub(crate) fn dict_encode_value(v: &Value, quote: &str, out: &mut String) {
     match v {
         Value::String(s) => {
@@ -422,8 +423,10 @@ pub(crate) fn dict_encode_value(v: &Value, quote: &str, out: &mut String) {
             let _ = write!(out, "{n}");
         }
         Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by_key(|(k, _)| *k);
             out.push('{');
-            for (i, (k, val)) in map.iter().enumerate() {
+            for (i, (k, val)) in entries.into_iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
@@ -473,7 +476,7 @@ pub(crate) fn emit_dict_value_rules(quote: &str, out: &mut String) {
 
 /// Dict-encoded counterpart of [`schema_to_gbnf`]: compile `schema`
 /// into rules producing dict-encoded values. Objects lay out
-/// key-sorted *in place* (required anchoring, optionals as
+/// explicitly key-sorted *in place* (required anchoring, optionals as
 /// self-contained comma groups) to match the template's `dictsort`
 /// re-render byte-for-byte.
 pub(crate) fn schema_to_dict_gbnf(
@@ -599,8 +602,9 @@ fn emit_dict_schema_rule(
     }
 }
 
-/// Dict object layout: keys sorted in place (matching `dictsort`
-/// re-renders), compact separators. Optionals *before* the first
+/// Dict object layout: keys explicitly sorted in place (the Gemma
+/// templates `dictsort` their re-renders, which alphabetizes
+/// regardless of Map iteration order), compact separators. Optionals *before* the first
 /// required slot render as `( "key:" child "," )?` (comma trailing);
 /// from the first required onward, each later slot carries its
 /// leading comma (`( "," "key:" child )?` when optional). All
@@ -635,9 +639,12 @@ fn emit_dict_object_rule(
         return;
     }
 
-    // BTreeMap iteration: already key-sorted.
+    // Explicit sort: `dictsort` alphabetizes no matter what order the
+    // Map yields, so the grammar must too.
+    let mut entries: Vec<(&String, &Value)> = props.iter().collect();
+    entries.sort_unstable_by_key(|(k, _)| *k);
     let mut slots: Vec<(String, String, bool)> = Vec::new();
-    for (key, prop_schema) in props.iter() {
+    for (key, prop_schema) in entries {
         *counter += 1;
         let child = format!("{rule_name}__{c}", c = *counter);
         emit_dict_schema_rule(prop_schema, &child, quote, out, counter, defs);

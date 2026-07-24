@@ -497,8 +497,10 @@ fn emit_tagged_call(
 
 /// TAG_WITH_DICT (Gemma 4): literal `call:` + name, then the whole
 /// argument dict compiled from the schema in dict encoding — braces
-/// included, keys bare and sorted in place, strings quoted by the
-/// dialect's quote marker, compact separators. The generic `dvalue`
+/// included, keys bare and explicitly sorted in place (the Gemma
+/// templates `dictsort` their re-renders, so alphabetical is
+/// upstream's decree, not ours), strings quoted by the dialect's
+/// quote marker, compact separators. The generic `dvalue`
 /// rules it references are appended once per grammar by
 /// [`grammar_source`].
 fn emit_dict_call(
@@ -844,9 +846,10 @@ pub fn render_reference(
                 out.push_str(&syntax.function.name_prefix);
                 out.push_str(name);
                 // The whole args object, braces included — compact,
-                // key-sorted (BTreeMap ⇒ dictsort), quote-marked
-                // strings. Matches the template's `format_argument`
-                // with `escape_keys=False`.
+                // explicitly key-sorted (the template `dictsort`s,
+                // so we must too), quote-marked strings. Matches the
+                // template's `format_argument` with
+                // `escape_keys=False`.
                 dict_encode_value(
                     input,
                     &syntax.arguments.string_quote,
