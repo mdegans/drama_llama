@@ -234,7 +234,10 @@ check:
 
 # Point git at the versioned hooks in .githooks/ — one config line, no copying,
 # and the hook stays under review like any other file. See .githooks/pre-commit
-# for what it gates (rustfmt + the unignored tests).
+# for what it gates (rustfmt + the unignored tests) and .githooks/pre-push,
+# which refuses to push a branch that isn't built on the current origin/main
+# (the stale-base conflict this crate keeps hitting across its two dev
+# machines). Run this in every clone — the setting is per-repo, not global.
 install-hooks:
     git config core.hooksPath .githooks
     @echo "hooks installed: core.hooksPath -> .githooks"

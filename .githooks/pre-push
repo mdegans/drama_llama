@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# Installed by `just install-hooks`, which points core.hooksPath here — so this
+# file is versioned and every clone gets the same gate with one command.
+#
+# One gate: refuse to push a branch that is not built on the current tip of an
+# integration branch (`main`, `dev`, or whatever `hooks.baseBranches` names).
+#
+# This exists because the failure it catches is silent until CI. This crate is
+# developed on two machines (Linux/CUDA and macOS/Metal), and a branch cut from
+# a stale local base — or from another topic branch that was later
+# squash-merged — carries commits that are *content-identical* to what upstream
+# already has but have different SHAs. Git cannot match them up, so the PR opens
+# with conflicts in whatever those commits touched (README's test-count badge
+# and CHANGELOG are the reliable casualties, since nearly every change edits
+# both).
+#
+# Squash-merge makes this strictly worse than rebase-merge: rebasing preserves
+# patch identity, so a stale branch usually replays cleanly, while squashing
+# rewrites N commits into one new SHA and guarantees the mismatch. The fix in
+# both cases is the same, and it is what this hook tells you to do.
+#
+# Being current with ANY integration branch passes. Work here is usually cut
+# from `dev` and lands there; `main` is the release line. A branch is only
+# stale if it is behind everything it could reasonably target — this hook has
+# no way to know which branch a future PR will aim at, and guessing wrong to
+# block a legitimate push would be worse than the conflict it prevents.
+#
+# Configure the set per-repo (a repo with no `dev` simply never matches it):
+#
+#     git config hooks.baseBranches "main dev release"
+#
+# Bypass with `git push --no-verify` when you mean it (pushing a deliberate
+# fork of an older base, say). Deletions and pushes of a base branch are exempt.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+remote_name="${1:-}"
+
+read -r -a base_branches <<<"$(git config hooks.baseBranches || echo 'main dev')"
+
+# Fetch each candidate that exists upstream. Fetching rather than trusting the
+# remote-tracking ref is the whole point — a stale ref is exactly how the branch
+# got stale in the first place. Absent branches (no `dev` here yet) are skipped,
+# not an error.
+declare -a names=() shas=()
+for b in "${base_branches[@]}"; do
+    if git fetch --quiet origin "$b" 2>/dev/null; then
+        names+=("$b")
+        shas+=("$(git rev-parse FETCH_HEAD)")
+    fi
+done
+
+# No network, or none of the candidates exist. Warn and allow: "offline" must
+# not mean "cannot push work".
+if [[ ${#names[@]} -eq 0 ]]; then
+    echo "pre-push: WARNING — could not resolve any base branch; skipping check" >&2
+    exit 0
+fi
+
+# stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per ref.
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # Branch deletion — nothing to check.
+    if [[ "$local_sha" =~ ^0+$ ]]; then
+        continue
+    fi
+
+    # Pushing a base branch itself (a maintainer merging) is not a topic branch.
+    skip=""
+    for b in "${base_branches[@]}"; do
+        [[ "$remote_ref" == "refs/heads/$b" ]] && skip=1
+    done
+    [[ -n "$skip" ]] && continue
+
+    current_on=""
+    for i in "${!names[@]}"; do
+        if git merge-base --is-ancestor "${shas[$i]}" "$local_sha"; then
+            current_on="${names[$i]}"
+            break
+        fi
+    done
+    if [[ -n "$current_on" ]]; then
+        continue
+    fi
+
+    echo >&2
+    echo "pre-push: REFUSED — ${local_ref#refs/heads/} is not built on the current tip of" >&2
+    echo "pre-push: any integration branch (${names[*]})." >&2
+    echo >&2
+    for i in "${!names[@]}"; do
+        behind="$(git rev-list --count "$local_sha..${shas[$i]}")"
+        new="$(git rev-list --count --cherry-pick --right-only "${shas[$i]}...$local_sha" 2>/dev/null || echo '?')"
+        echo "pre-push:   vs origin/${names[$i]}: $behind commit(s) ahead of this branch;" >&2
+        echo "pre-push:     $new commit(s) here are genuinely new, the rest already exist" >&2
+        echo "pre-push:     upstream under different SHAs and are the conflict you'd open." >&2
+    done
+    echo >&2
+    echo "pre-push: Replant onto whichever you intend to target:" >&2
+    echo "pre-push:   git fetch origin && git rebase origin/${names[0]}" >&2
+    echo >&2
+    echo "pre-push: If this branch duplicates already-squashed upstream commits, rebase" >&2
+    echo "pre-push: will conflict on identical content. Cherry-pick just your own work:" >&2
+    echo "pre-push:   git checkout -b <name>-rebased origin/${names[0]} && git cherry-pick <your shas>" >&2
+    echo >&2
+    echo "pre-push: Deliberate? Re-run with --no-verify." >&2
+    exit 1
+done
+
+echo "pre-push: ok — based on current origin/${current_on:-${names[0]}}${remote_name:+ (remote: $remote_name)}"
