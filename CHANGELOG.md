@@ -4,6 +4,36 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] — 2026-07-25
+
+### Added
+
+- **`llama_cpp::gpu_device_names`** — the GPU-class compute devices ggml
+  actually discovered, as opposed to the ones the build asked for. Those
+  differ in a way nothing else reported: a `feature = "cuda"` build links
+  CUDA and then silently runs every model on the CPU when the driver is
+  unusable, and from inside the process that is indistinguishable from a
+  box with no card.
+
+- **A test asserting a `cuda` build found a GPU.** The model tier stays
+  **green** through CPU fallback — correctness doesn't depend on the
+  device — and timing doesn't give it away either, because only the
+  generation-heavy tests slow down while load-dominated ones get *faster*
+  (no VRAM upload, weights already in page cache). The suite's wall clock
+  can therefore move in either direction, which makes an explicit device
+  assertion the only reliable signal.
+
+  Caught for real on 2026-07-25: an unattended upgrade of
+  `nvidia-driver-580-server` (580.159.03 → 580.173.02) left the old kernel
+  module loaded against new userspace libraries. `nvidia-smi` failed
+  outright, `cuInit` returned 804 (`CUDA_ERROR_SYSTEM_DRIVER_MISMATCH`),
+  ggml found zero CUDA devices, and the entire model tier passed on the
+  CPU with nothing in CI saying so. The new test fails in 0.04 s and names
+  the diagnosis.
+
+  Set `DRAMA_LLAMA_ALLOW_CPU_FALLBACK=1` to exercise the CPU path
+  deliberately — a legitimate thing to want; silently getting it is not.
+
 ## [0.8.2] — 2026-07-24
 
 ### Fixed
