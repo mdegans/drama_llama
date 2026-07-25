@@ -132,34 +132,52 @@ mod tests {
     /// purpose. That is a legitimate thing to want; silently getting it is
     /// not. Note the CPU path is far slower on the generation-heavy tests
     /// (`whodunit` and friends), so expect the ignored tier to crawl.
-    #[cfg(feature = "cuda")]
+    ///
+    /// The `cuda` gate is on the **body**, not on `#[test]`, so the test is
+    /// listed in every configuration and `nextest list` returns the same
+    /// count everywhere. That keeps README.md's hand-counted numbers
+    /// config-independent — gating the attribute instead makes the badge
+    /// mean one thing under `llama-cpp` and another under `llama-cpp-cpu`,
+    /// which is how #82 went red. Same rule for any future
+    /// backend-specific test.
     #[test]
     fn cuda_build_has_a_gpu_device() {
-        if std::env::var_os("DRAMA_LLAMA_ALLOW_CPU_FALLBACK").is_some() {
-            eprintln!(
-                "cuda_build_has_a_gpu_device: DRAMA_LLAMA_ALLOW_CPU_FALLBACK \
-                 set — skipping (CPU path is intentional)"
-            );
-            return;
-        }
-
-        let gpus = super::gpu_device_names();
-        assert!(
-            !gpus.is_empty(),
-            "built with `feature = \"cuda\"` but ggml found no GPU device — \
-             every model test will silently run on the CPU.\n\
-             \n\
-             Most likely the driver is unusable rather than absent. Check:\n\
-             \n\
-             \tnvidia-smi                # NVML mismatch reports here first\n\
-             \tcat /proc/driver/nvidia/version   # loaded kernel module\n\
-             \tls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*  # userspace\n\
-             \n\
-             A driver upgrade with the old module still loaded needs a \
-             reboot (or an nvidia module reload).\n\
-             \n\
-             Testing the CPU path deliberately? \
-             Set DRAMA_LLAMA_ALLOW_CPU_FALLBACK=1."
+        #[cfg(not(feature = "cuda"))]
+        eprintln!(
+            "cuda_build_has_a_gpu_device: not a `cuda` build — nothing to \
+             assert"
         );
+
+        #[cfg(feature = "cuda")]
+        {
+            if std::env::var_os("DRAMA_LLAMA_ALLOW_CPU_FALLBACK").is_some() {
+                eprintln!(
+                    "cuda_build_has_a_gpu_device: \
+                     DRAMA_LLAMA_ALLOW_CPU_FALLBACK set — skipping (CPU path \
+                     is intentional)"
+                );
+                return;
+            }
+
+            let gpus = super::gpu_device_names();
+            assert!(
+                !gpus.is_empty(),
+                "built with `feature = \"cuda\"` but ggml found no GPU \
+                 device — every model test will silently run on the CPU.\n\
+                 \n\
+                 Most likely the driver is unusable rather than absent. \
+                 Check:\n\
+                 \n\
+                 \tnvidia-smi                # NVML mismatch reports here first\n\
+                 \tcat /proc/driver/nvidia/version   # loaded kernel module\n\
+                 \tls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*  # userspace\n\
+                 \n\
+                 A driver upgrade with the old module still loaded needs a \
+                 reboot (or an nvidia module reload).\n\
+                 \n\
+                 Testing the CPU path deliberately? \
+                 Set DRAMA_LLAMA_ALLOW_CPU_FALLBACK=1."
+            );
+        }
     }
 }

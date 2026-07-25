@@ -219,6 +219,15 @@ doctest config="llama-cpp":
 # a warm build, which is well inside this recipe's budget. They are load-bearing
 # now that the crate root is `#![doc = include_str!("../README.md")]`: the
 # README's examples are the only thing keeping the front page honest.
+#
+# `just badge` is in here — this is the recipe the pre-commit hook runs, and
+# 6d4a9e2 put that gate in `scripts/test.py check` (`just permutations`)
+# instead, which the hook deliberately does not run, so a stale badge sailed
+# through to CI in #82. It costs a `nextest list` in the same target dir and
+# feature set as `just test`, which the hook runs immediately after — so the
+# test binaries it builds are the ones that run a moment later, not a second
+# build. The counts do not vary by configuration (see `cuda_build_has_a_gpu_
+# device`), so there is no need to reach for the cpu config the way CI does.
 check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -230,6 +239,8 @@ check:
     just doctest
     echo "+ just clippy (-D warnings)"
     just clippy
+    echo "+ just badge (README counts)"
+    just badge
     echo "check: ok"
 
 # Point git at the versioned hooks in .githooks/ — one config line, no copying,
