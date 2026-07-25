@@ -34,6 +34,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Set `DRAMA_LLAMA_ALLOW_CPU_FALLBACK=1` to exercise the CPU path
   deliberately — a legitimate thing to want; silently getting it is not.
 
+  The test's `cuda` gate is on its **body**, not on `#[test]`, so it is
+  listed in every configuration and `nextest list` returns the same count
+  everywhere. Gating the attribute makes README.md's hand-counted numbers
+  mean one thing under `llama-cpp` (605) and another under
+  `llama-cpp-cpu` (604) — which is how this PR first went red. House rule
+  now, and the reason `just check` can verify the badge against whichever
+  target dir is warm instead of building the cpu one.
+
+- **A `nvidia-smi` preflight on `test.py run`** for `cuda` configurations
+  on Linux. Reaches the same verdict as the test above roughly 40 minutes
+  earlier — before a cold cuda build rather than after it. It is not a
+  replacement: a working `nvidia-smi` says nothing about a llama.cpp that
+  cmake quietly configured without CUDA, so ggml's own device list stays
+  the authority. Honours `DRAMA_LLAMA_ALLOW_CPU_FALLBACK=1`.
+
+### Fixed
+
+- **The pre-commit hook actually gates the README badge now.** 6d4a9e2
+  put that gate in `scripts/test.py check` and claimed the hook was
+  covered; it was not. The hook runs `just check`, whereas that function
+  is `just permutations` — which the hook deliberately skips as too slow
+  — so the gate never ran once, and a stale badge reached CI in #82. It
+  lives in the `just check` recipe now.
+
+- **CI's `gpu` step no longer swallows a failing `nvidia-smi`.** It pipes
+  into `tee` under the default `bash -e`, which takes its status from
+  `tee`, so the exact driver-mismatch state the step exists to record
+  reported green. It sets `pipefail` now.
+
 ## [0.8.2] — 2026-07-24
 
 ### Fixed

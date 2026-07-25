@@ -289,8 +289,9 @@ jobs:
       # compares them against `cargo nextest list` so they cannot drift
       # silently (`scripts/test.py badge --fix` rewrites them). The
       # binaries are already built by the step above, so the list is
-      # nearly free. No test is cuda-gated, so the cpu config's counts
-      # equal the default config's the README describes.
+      # nearly free. No test gates its `#[test]` attribute on a feature
+      # — backend-specific tests gate their body instead — so the cpu
+      # config's counts equal the default config's the README describes.
       - run: python3 scripts/test.py badge -c llama-cpp-cpu
       # Named exactly, not the whole directory: `clean: false` means
       # `target/test-logs/` accumulates every mode this box has ever run,
@@ -345,8 +346,13 @@ jobs:
       # harness records llama.cpp's own view of the machine, but nothing
       # in-process can see the driver version — this is where it comes
       # from. Job logs age out; the artifact rides with the run.
+      #
+      # `pipefail` is load-bearing: the default `bash -e` takes its status
+      # from `tee`, so the driver-mismatch state this step exists to record
+      # — where `nvidia-smi` fails outright — used to sail through green.
       - name: gpu
         run: |
+          set -o pipefail
           mkdir -p target/test-logs
           nvidia-smi | tee target/test-logs/nvidia-smi.txt
       - name: link model weights

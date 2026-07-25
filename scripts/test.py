@@ -421,6 +421,51 @@ def selection(
     return tier, extra, name
 
 
+def preflight_gpu(features: list[str]) -> int:
+    """Fail a `cuda` run before the build if the driver is unusable.
+
+    Strictly a fast path to the same verdict
+    `llama_cpp::tests::cuda_build_has_a_gpu_device` reaches — that test
+    asks ggml what this build actually found and stays the authority,
+    because a `nvidia-smi` that works proves nothing about a llama.cpp
+    that cmake quietly configured without CUDA. What this buys is the
+    ~40 minutes between "start a cold cuda build" and "watch the model
+    tier pass on the CPU": an unusable driver reports here in two
+    seconds.
+
+    `DRAMA_LLAMA_ALLOW_CPU_FALLBACK=1` skips it, same as the test.
+    """
+    if "cuda" not in features or platform.system() != "Linux":
+        return 0
+    if os.environ.get("DRAMA_LLAMA_ALLOW_CPU_FALLBACK"):
+        print("= preflight: CPU fallback allowed — skipping", flush=True)
+        return 0
+    if shutil.which("nvidia-smi") is None:
+        print(
+            "preflight: built with `cuda` but no `nvidia-smi` on PATH.\n"
+            "Set DRAMA_LLAMA_ALLOW_CPU_FALLBACK=1 to run on the CPU anyway.",
+            file=sys.stderr,
+        )
+        return 1
+    probe = subprocess.run(
+        ["nvidia-smi"], capture_output=True, text=True, check=False
+    )
+    if probe.returncode != 0:
+        print(
+            "preflight: `nvidia-smi` failed — the driver is unusable, so a "
+            "`cuda` build will silently run every model test on the CPU.\n"
+            "\n"
+            f"{(probe.stderr or probe.stdout).strip()}\n"
+            "\n"
+            "An unattended driver upgrade with the old kernel module still "
+            "loaded needs a reboot (or an nvidia module reload).\n"
+            "Set DRAMA_LLAMA_ALLOW_CPU_FALLBACK=1 to run on the CPU anyway.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not DRY_RUN:
         require_nextest()
@@ -430,6 +475,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         config, "all" if args.filter else args.tier, args.moeflux_model
     )
     features = config.feature_list(args.moeflux_model)
+    if not DRY_RUN:
+        rc = preflight_gpu(features)
+        if rc != 0:
+            return rc
     tier, extra, name = selection(config, args)
 
     cmd = [
@@ -743,14 +792,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     That is `doctest`'s job, and it is why that subcommand sweeps
     configurations too rather than running just one.
 
-    Since 2026-07-24 this also runs the `badge` verification (the
-    llama-cpp-cpu configuration, same as CI's badge step), so a stale
-    README test count fails at the pre-commit hook instead of ~40
-    minutes later in CI — the 0.8.1 PR hit exactly that. On a warm
-    tree `cargo nextest list` is near-free; on a cold tree it builds
-    the cpu test binaries once, which is the price of the gate.
+    The `badge` verification is deliberately NOT here. It was added
+    here on 2026-07-24 (6d4a9e2) on the theory that this gated the
+    pre-commit hook — it does not. The hook runs `just check`; this is
+    `just permutations`, which the hook skips as too slow, so the gate
+    never ran and a stale badge reached CI in #82. It lives in the
+    `just check` recipe now, and CI runs `badge` as its own step after
+    the test job.
     """
-    rc = sweep(
+    return sweep(
         "check",
         selected_configs(args.config, args.moeflux_model, args.ci),
         lambda features: [
@@ -761,15 +811,6 @@ def cmd_check(args: argparse.Namespace) -> int:
             "--features",
             ",".join(features),
         ],
-    )
-    if rc != 0:
-        return rc
-    return cmd_badge(
-        argparse.Namespace(
-            config="llama-cpp-cpu",
-            moeflux_model=args.moeflux_model,
-            fix=False,
-        )
     )
 
 
@@ -907,12 +948,18 @@ def cmd_badge(args: argparse.Namespace) -> int:
     configuration the numbers describe, and `--fix` rewrites them.
 
     CI runs this after the test job (the test binaries are already
-    built, so the list is nearly free). Since 2026-07-24 `check` runs
-    it too — the pre-commit hook is now gated on it, a deliberate
-    reversal of the original "keep the hook fast" exclusion after a
-    stale badge failed the 0.8.1 PR in CI. `nextest list` on a warm
-    target dir keeps the hook cheap; a cold tree pays one cpu-config
-    test-binary build.
+    built, so the list is nearly free), and the `just check` recipe
+    runs it, which is what puts it in front of every commit — a
+    deliberate reversal of the original "keep the hook fast" exclusion
+    after a stale badge failed the 0.8.1 PR in CI.
+
+    The counts are the same in every configuration, so the hook can
+    verify them against whichever target dir is already warm rather
+    than building a second one. That invariant is a house rule, not an
+    accident: a backend-specific test puts its `cfg` on the **body**,
+    never on `#[test]` (see `cuda_build_has_a_gpu_device`). Gate the
+    attribute and the badge means one number under `llama-cpp` and
+    another under `llama-cpp-cpu` — #82 went red exactly that way.
     """
     import json as _json
     import re as _re
