@@ -89,8 +89,9 @@ pub use dialect::CallSyntax;
 mod llama_cpp;
 #[cfg(feature = "llama-cpp")]
 pub use llama_cpp::{
-    llama_quantize, DecodeError, FlashAttention, LlamaCppBackend,
-    LlamaCppDecoder, LlamaCppEngine, LlamaCppModel, LlamaCppOptions, NewError,
+    gpu_device_names, llama_quantize, DecodeError, FlashAttention,
+    LlamaCppBackend, LlamaCppDecoder, LlamaCppEngine, LlamaCppModel,
+    LlamaCppOptions, NewError,
 };
 #[cfg(feature = "mtmd")]
 pub use llama_cpp::{Mtmd, MtmdParams};
