@@ -286,3 +286,102 @@ fn enable_thinking_derives_from_prompt_thinking() {
         "explicit with_extra=false must override derived true"
     );
 }
+
+/// `render_reference` claims, in its own doc comment, to produce "the
+/// exact bytes the chat template's re-render will produce for these
+/// calls, and the exact bytes `grammar_source`'s grammar forces". The
+/// grammar half of that is exercised all over `dialect::parse`'s
+/// tests; the *template* half never was — every caller of
+/// `render_reference` is a test that compares it against itself or
+/// against the parser, never against a real template render.
+///
+/// That gap is issue #85. Cogito's template serializes call arguments
+/// with `{{ tool_call.arguments | tojson }}`, which minijinja emits
+/// compact (`"a":1`), while `render_reference` deliberately emits the
+/// spaced separators the model actually produces (`"a": 1` — see the
+/// comment in `dialect::emit::render_reference`). The two disagree, so
+/// a replayed tool-call turn does not re-render byte-stable, the
+/// prefix cache's auto-tip is discarded, and reuse collapses to the
+/// last `cache_control` breakpoint.
+///
+/// Two independent divergences, both measured 2026-07-27:
+///
+/// 1. **Whitespace.** The grammar's `ws ::= [ \t\n\r]?`
+///    (`grammar_compile.rs`'s shared JSON prelude) lets the model emit
+///    `": "` where both `render_reference` and the template emit
+///    `":"`. The emission is under-determined by our own grammar.
+/// 2. **Escaping.** minijinja's `tojson` follows Jinja2 and is
+///    HTML-safe, escaping `'`, `&`, `<`, `>` to `\u0027` etc.
+///    Neither the model nor `render_reference` does.
+///
+/// Ignored, not deleted: this asserts the invariant we intend to hold,
+/// and un-ignoring it is the acceptance criterion for the #85 fix.
+/// Earlier payloads in this file are clean ASCII, which is why the
+/// gap survived — swap the payload for a plain string and it passes.
+///
+/// Model-free: the pinned fixture template is the whole input.
+#[test]
+#[ignore = "documents #85: render_reference disagrees with the template \
+            on whitespace and HTML escaping; un-ignore when fixed"]
+fn render_reference_matches_template_tool_call_render() {
+    use drama_llama::dialect::{analyze_template, render_reference};
+
+    let source = std::fs::read_to_string(
+        fixtures_dir().join("cogito_14b_template.jinja"),
+    )
+    .expect("cogito template fixture missing");
+    let syntax = analyze_template(&source, "", "<|im_end|>")
+        .expect("cogito template analyzes");
+
+    // Shaped like a real Agora call: string, and a bool to catch the
+    // `": "` vs `":"` divergence on a non-string value too.
+    // Characters the real Agora payload carries and that JSON
+    // serializers disagree about: an apostrophe and `<`/`>`/`&`
+    // (Jinja2's `tojson` is HTML-safe and escapes them) and a
+    // non-ASCII arrow (escaped when `ensure_ascii` is on).
+    let input = json!({
+        "community": "debate",
+        "body": "x's belief in P & Q <br> stability \u{2192} contradiction",
+        "is_proposal": false,
+    });
+    let reference = render_reference(&syntax, &[("create_post", &input)])
+        .expect("call is representable");
+
+    let tmpl = load_template();
+    let prompt = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("post something"),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![drama_llama::Block::ToolUse {
+                    call: misanthropic::tool::Use {
+                        id: Cow::Borrowed("call_0_create_post"),
+                        name: Cow::Borrowed("create_post"),
+                        input: input.clone(),
+                        cache_control: None,
+                        caller: None,
+                    },
+                }]),
+            },
+        ],
+        ..Prompt::default()
+    };
+    let rendered = tmpl
+        .render_with(
+            &prompt,
+            &RenderOptions::default().with_generation_prompt(false),
+        )
+        .expect("render");
+
+    assert!(
+        rendered.contains(&reference),
+        "template render does not contain render_reference's canonical \
+         bytes — the documented invariant is violated, and every \
+         replayed tool-call turn loses its auto-tip (#85).\n\
+         \n--- render_reference ---\n{reference}\
+         \n\n--- template render ---\n{rendered}",
+    );
+}
