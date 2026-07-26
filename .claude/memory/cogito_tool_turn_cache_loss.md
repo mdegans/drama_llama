@@ -100,6 +100,29 @@ byte streams disagree:
    practice. It is a *second*, independent break: fixing whitespace
    alone would still leave apostrophe-bearing calls diverging.
 
+**Not a minijinja bug — verified.** Python jinja2 (the reference impl,
+and what HuggingFace's `apply_chat_template` uses) renders this template
+**byte-identically to minijinja**, compact *and* HTML-escaped:
+
+    uv run --script tests/fixtures/render_jinja.py \
+        tests/fixtures/cogito_14b_template.jinja <vars>.json
+
+Jinja2's `tojson` is `htmlsafe_json_dumps`, not plain `json.dumps` — so
+compact separators and `'&<>` escaping are *correct* Jinja behaviour, not
+drift. There is no implementation bug to fix; the whole Jinja ecosystem
+renders tool-call history one way and the model writes it another.
+
+Consequence for the fix direction: **do not** pin the grammar to the
+template's output. That would require the model to emit `\u0027` for
+every apostrophe — six characters fighting the model for no benefit. The
+render must move to the model, which means owning the tool-call
+serialization rather than deferring to the template's `tojson`.
+
+Worth noting independently of #85: rendering the model's own apostrophe
+back to it as `\u0027` is a *fidelity* bug. History the model reads
+differs from what it wrote, on every `tojson`-based template. HTML-safety
+escaping in a context with no HTML.
+
 **Why this went unnoticed:** every pre-existing test payload is clean
 ASCII with no `'&<>`, and the whitespace question never arose because
 nothing compared `render_reference` against a real template render.
