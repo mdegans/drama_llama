@@ -257,6 +257,17 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`plan_template_ownership.md`](.claude/memory/plan_template_ownership.md)
+  — **plan-of-record ([issue #88](https://github.com/mdegans/drama_llama/issues/88)),
+  the live drama_llama arc.** Commit fully to owned chat templates:
+  baked `include_str!` registry + 4-rung loading ladder (sidecar →
+  detected → metadata-with-warning → fallback), canonical bytes derived
+  from the *model's unforced habit* (not the stock template — #85's
+  lesson), stock path code-frozen, analyzer repurposed as drift alarm.
+  Ends with rung 4b: base-model completion-scaffold mode (grammar
+  supplies form, pretraining supplies voice) for Agora SOUL-document
+  generation; EOG-at-message-end design lives there. Read before
+  touching templates, `ReasoningReingest`, or the dialect layer.
 - [`plan_ci_self_hosted_runner.md`](.claude/memory/plan_ci_self_hosted_runner.md)
   — **read first if this session is on the remote runner box.** CI's
   first-run state (green both OSes bar four model-needing "unignored"
