@@ -44,7 +44,8 @@ use serde_json::Value;
 
 use crate::grammar_compile::{
     dict_encode_value, emit_dict_value_rules, emit_until_rules,
-    escape_for_gbnf_string, schema_to_dict_gbnf, schema_to_gbnf, JSON_GRAMMAR,
+    escape_for_gbnf_string, json_grammar_canonical, schema_to_dict_gbnf,
+    schema_to_gbnf, FIELD_SEP, KV_SEP,
 };
 use crate::Tool;
 
@@ -163,22 +164,22 @@ pub fn grammar_source(
         (Anchor::EagerThoughtPreOpened, _) => {
             // Close tag required; body is raw-until-close.
             emit_until_rules("thought_close", thought_delim, &mut src);
-            let _ = writeln!(src, "root ::= thought_close ws calls");
+            let _ = writeln!(src, "root ::= thought_close fws calls");
         }
         (Anchor::Eager, true) => {
             let start_lit = escape_for_gbnf_string(&syntax.reasoning.start);
             emit_until_rules("thought_close", thought_delim, &mut src);
             if syntax.reasoning.start.is_empty() {
-                let _ = writeln!(src, "root ::= thought_close? ws calls");
+                let _ = writeln!(src, "root ::= thought_close? fws calls");
             } else {
                 let _ = writeln!(
                     src,
-                    r#"root ::= ( "{start_lit}" thought_close )? ws calls"#
+                    r#"root ::= ( "{start_lit}" thought_close )? fws calls"#
                 );
             }
         }
         (Anchor::Eager, false) => {
-            let _ = writeln!(src, "root ::= ws calls");
+            let _ = writeln!(src, "root ::= fws calls");
         }
     }
 
@@ -283,7 +284,7 @@ pub fn grammar_source(
     if syntax.family == Family::TagWithDict {
         emit_dict_value_rules(&syntax.arguments.string_quote, &mut src);
     }
-    src.push_str(JSON_GRAMMAR);
+    src.push_str(&json_grammar_canonical());
     Ok(src)
 }
 
@@ -391,7 +392,7 @@ fn harmony_grammar_source(
     for (i, tool) in tools.iter().enumerate() {
         schema_to_gbnf(&tool.schema, &format!("h_args_{i}"), &mut src);
     }
-    src.push_str(JSON_GRAMMAR);
+    src.push_str(&json_grammar_canonical());
     Ok(src)
 }
 
@@ -570,7 +571,7 @@ fn emit_json_native_call(
     if syntax.json.fun_name_is_key {
         let _ = writeln!(
             src,
-            r#"call_{i} ::= "{per_open}" "{{" ws "{name_lit}" ws ":" ws {args_rule} ws "}}" "{per_close}""#,
+            r#"call_{i} ::= "{per_open}" "{{" "{name_lit}" "{KV_SEP}" {args_rule} "}}" "{per_close}""#,
         );
         return;
     }
@@ -601,20 +602,20 @@ fn emit_json_native_call(
     let mut fields = String::new();
     for (j, field) in order.iter().enumerate() {
         if j > 0 {
-            fields.push_str(r#" ws "," ws"#);
+            let _ = write!(fields, r#" "{FIELD_SEP}""#);
         }
         let field_lit = escape_for_gbnf_string(
             &serde_json::to_string(field).expect("string"),
         );
         if *field == name_field {
-            let _ = write!(fields, r#" "{field_lit}" ws ":" ws "{name_lit}""#);
+            let _ = write!(fields, r#" "{field_lit}" "{KV_SEP}" "{name_lit}""#);
         } else {
-            let _ = write!(fields, r#" "{field_lit}" ws ":" ws {args_rule}"#);
+            let _ = write!(fields, r#" "{field_lit}" "{KV_SEP}" {args_rule}"#);
         }
     }
     let _ = writeln!(
         src,
-        r#"call_{i} ::= "{per_open}" "{{" ws{fields} ws "}}" "{per_close}""#,
+        r#"call_{i} ::= "{per_open}" "{{"{fields} "}}" "{per_close}""#,
     );
 }
 

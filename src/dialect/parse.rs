@@ -1720,6 +1720,62 @@ mod tests {
             .collect()
     }
 
+    /// The grammar admits exactly what `render_reference` emits.
+    ///
+    /// This is the invariant #85 fell through: `render_reference`'s own
+    /// doc comment promised "the exact bytes ... `grammar_source`'s
+    /// grammar forces", but nothing checked the two against each other.
+    /// The grammar's `ws` was permissive, so the model could emit `": "`
+    /// where the serializer emits `":"`, the re-render was not
+    /// byte-identical to the KV, and the prefix cache's auto-tip was
+    /// discarded — 4705 tokens per turn against cogito-32b.
+    ///
+    /// Uses a payload with an apostrophe and `&` on purpose: those are
+    /// what Jinja's HTML-safe `tojson` used to escape, and clean-ASCII
+    /// payloads are why this went unnoticed for so long.
+    #[test]
+    fn canonical_call_grammar_admits_render_reference() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        use crate::{Grammar, GrammarState};
+        use std::sync::Arc;
+
+        let input = serde_json::json!({
+            "city": "x's cafe & bar",
+            "days": 3,
+        });
+        let t = tool("get_weather");
+        for syntax in [
+            CallSyntax::hermes_json(),
+            CallSyntax::llama31_json(),
+            CallSyntax::qwen_xml(),
+        ] {
+            let emission =
+                render_reference(&syntax, &[("get_weather", &input)])
+                    .expect("representable");
+            let src = grammar_source(
+                &syntax,
+                &[&t],
+                &EmitOptions {
+                    anchor: Anchor::Lazy,
+                    parallel: false,
+                },
+            )
+            .expect("emit");
+            let grammar = Arc::new(
+                Grammar::parse(&src)
+                    .unwrap_or_else(|e| panic!("grammar: {e}\n{src}")),
+            );
+            let mut state = GrammarState::new(grammar);
+            assert!(
+                state.advance_bytes(emission.as_bytes()).is_ok()
+                    && state.is_complete(),
+                "{:?}: grammar rejects its own reference render \
+                 {emission:?}\n{src}",
+                syntax.family,
+            );
+        }
+    }
+
     /// render_reference → parse_text is the identity on calls, for
     /// every family. The core Phase D invariant.
     #[test]
@@ -3066,9 +3122,13 @@ mod tests {
             reference.as_str(),
             "<|start|>assistant to=functions.special_function\
              <|channel|>commentary <|constrain|>json<|message|>{\"arg1\":42}",
-            // Stock re-render: bare constraint type.
+            // Stock re-render: bare constraint type. The JSON is
+            // compact like the other two — `tojson` no longer
+            // HTML-escapes *or* spaces, and the grammar admits exactly
+            // one spelling now (#85). The variation under test here is
+            // the bare `json` constraint, not the whitespace.
             "<|start|>assistant to=functions.special_function\
-             <|channel|>commentary json<|message|>{\"arg1\": 42}",
+             <|channel|>commentary json<|message|>{\"arg1\":42}",
         ] {
             let mut state = GrammarState::new(grammar.clone());
             assert!(

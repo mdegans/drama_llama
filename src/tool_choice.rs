@@ -44,7 +44,8 @@
 use std::fmt::Write;
 
 use crate::grammar_compile::{
-    emit_thought_rules, escape_for_gbnf_string, schema_to_gbnf, JSON_GRAMMAR,
+    emit_thought_rules, escape_for_gbnf_string, json_grammar_canonical,
+    schema_to_gbnf, FIELD_SEP, KV_SEP,
 };
 use crate::{GrammarError, Prompt, SamplingMode, Tool, ToolChoice};
 
@@ -329,18 +330,18 @@ pub(crate) fn build_grammar_source(
             // `allow_thought`.
             let _ = writeln!(
                 src,
-                r#"root ::= think_body "</think>" ws {wrapped_call}"#
+                r#"root ::= think_body "</think>" fws {wrapped_call}"#
             );
             emit_thought_rules(&mut src);
         }
         RootShape::Eager {
             thought_pre_opened: false,
         } if opts.allow_thought => {
-            let _ = writeln!(src, "root ::= thought? ws {wrapped_call}");
+            let _ = writeln!(src, "root ::= thought? fws {wrapped_call}");
             emit_thought_rules(&mut src);
         }
         RootShape::Eager { .. } => {
-            let _ = writeln!(src, "root ::= ws {wrapped_call}");
+            let _ = writeln!(src, "root ::= fws {wrapped_call}");
         }
         RootShape::Lazy => {
             // Activation feeds the trigger (the wrap-tag open) into
@@ -392,7 +393,7 @@ pub(crate) fn build_grammar_source(
         };
         let _ = writeln!(
             src,
-            r#"call_{i} ::= "\"name\"" ws ":" ws "{name_lit}" ws "," ws "{arg_field_lit}" ws ":" ws {args_rule}"#,
+            r#"call_{i} ::= "\"name\"" "{KV_SEP}" "{name_lit}" "{FIELD_SEP}" "{arg_field_lit}" "{KV_SEP}" {args_rule}"#,
         );
     }
 
@@ -406,7 +407,7 @@ pub(crate) fn build_grammar_source(
     }
 
     // Standard JSON grammar — RFC 8259-ish, enough for tool arguments.
-    src.push_str(JSON_GRAMMAR);
+    src.push_str(&json_grammar_canonical());
 
     src
 }
@@ -524,7 +525,7 @@ mod tests {
         let src = eager_src(&[&t], &bare_opts());
         assert!(accepts(
             &src,
-            r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#
+            r#"{"name": "get_weather", "parameters": {"city":"Paris"}}"#
         ));
         // Other tool names must be rejected.
         assert!(!accepts(
@@ -579,7 +580,7 @@ mod tests {
         let src = eager_src(&[&t], &bare_opts());
         assert!(accepts(
             &src,
-            r#"{"name": "x", "parameters": {"a": {"b": [1, 2, {"c": "d"}]}}}"#
+            r#"{"name": "x", "parameters": {"a":{"b":[1,2,{"c":"d"}]}}}"#
         ));
     }
 
@@ -604,22 +605,22 @@ mod tests {
         // Correct shape accepted.
         assert!(accepts(
             &src,
-            r#"{"name": "count_letters", "parameters": {"letter": "r", "string": "strawberry"}}"#
+            r#"{"name": "count_letters", "parameters": {"letter":"r","string":"strawberry"}}"#
         ));
         // Hallucinated field names rejected.
         assert!(!accepts(
             &src,
-            r#"{"name": "count_letters", "parameters": {"chr": "r", "str": "strawberry"}}"#
+            r#"{"name": "count_letters", "parameters": {"chr":"r","str":"strawberry"}}"#
         ));
         // Missing required field rejected.
         assert!(!accepts(
             &src,
-            r#"{"name": "count_letters", "parameters": {"letter": "r"}}"#
+            r#"{"name": "count_letters", "parameters": {"letter":"r"}}"#
         ));
         // Wrong type for required field rejected.
         assert!(!accepts(
             &src,
-            r#"{"name": "count_letters", "parameters": {"letter": 1, "string": "x"}}"#
+            r#"{"name": "count_letters", "parameters": {"letter":1,"string":"x"}}"#
         ));
     }
 
@@ -652,18 +653,15 @@ mod tests {
         let src = eager_src(&[&tool_a, &tool_b], &opts);
 
         // Each tool's name accepts its own args.
-        assert!(accepts(&src, r#"{"name": "a", "parameters": {"x": 1}}"#));
-        assert!(accepts(&src, r#"{"name": "b", "parameters": {"y": "hi"}}"#));
+        assert!(accepts(&src, r#"{"name": "a", "parameters": {"x":1}}"#));
+        assert!(accepts(&src, r#"{"name": "b", "parameters": {"y":"hi"}}"#));
         // Cross-pairing rejected: name a + b's args, or name b + a's
         // args — these are exactly the failure mode the per-tool
         // alternatives prevent.
-        assert!(!accepts(
-            &src,
-            r#"{"name": "a", "parameters": {"y": "hi"}}"#
-        ));
-        assert!(!accepts(&src, r#"{"name": "b", "parameters": {"x": 1}}"#));
+        assert!(!accepts(&src, r#"{"name": "a", "parameters": {"y":"hi"}}"#));
+        assert!(!accepts(&src, r#"{"name": "b", "parameters": {"x":1}}"#));
         // Unknown name rejected.
-        assert!(!accepts(&src, r#"{"name": "c", "parameters": {"x": 1}}"#));
+        assert!(!accepts(&src, r#"{"name": "c", "parameters": {"x":1}}"#));
         // grammar_for_tool_choice path (with default opts) also
         // succeeds — no AnyWithStrictSchema error.
         let res = grammar_for_tool_choice(
@@ -680,7 +678,7 @@ mod tests {
         let t = tool("x");
         let src = eager_src(&[&t], &bare_opts());
         // Trailing comma is invalid JSON.
-        assert!(!accepts(&src, r#"{"name": "x", "parameters": {"a": 1,}}"#));
+        assert!(!accepts(&src, r#"{"name": "x", "parameters": {"a":1,}}"#));
         // Single-quoted string is invalid JSON.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {'a': 1}}"#));
     }
@@ -726,11 +724,11 @@ mod tests {
         let src = eager_src(&[&schema_tool], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "two_ints", "parameters": {"x": 1, "y": 2}}"#
+            r#"{"name": "two_ints", "parameters": {"x":1,"y":2}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "two_ints", "parameters": {"x": 1.5, "y": 2}}"#
+            r#"{"name": "two_ints", "parameters": {"x":1.5,"y":2}}"#
         ));
     }
 
@@ -911,15 +909,12 @@ mod tests {
             ..bare_opts()
         };
         let src = eager_src(&[&t], &opts);
-        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
-        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": -7}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n":42}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n":-7}}"#));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"n":1.5}}"#));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"n": 1.5}}"#
-        ));
-        assert!(!accepts(
-            &src,
-            r#"{"name": "fn", "parameters": {"n": 1e10}}"#
+            r#"{"name": "fn", "parameters": {"n":1e10}}"#
         ));
     }
 
@@ -931,16 +926,13 @@ mod tests {
             ..bare_opts()
         };
         let src = eager_src(&[&t], &opts);
-        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
-        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 1.5}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n":42}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n":1.5}}"#));
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"n": -0.5e3}}"#
+            r#"{"name": "fn", "parameters": {"n":-0.5e3}}"#
         ));
-        assert!(!accepts(
-            &src,
-            r#"{"name": "fn", "parameters": {"n": "x"}}"#
-        ));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"n":"x"}}"#));
     }
 
     #[test]
@@ -951,19 +943,16 @@ mod tests {
             ..bare_opts()
         };
         let src = eager_src(&[&t], &opts);
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"b":true}}"#));
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"b": true}}"#
-        ));
-        assert!(accepts(
-            &src,
-            r#"{"name": "fn", "parameters": {"b": false}}"#
+            r#"{"name": "fn", "parameters": {"b":false}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"b": "true"}}"#
+            r#"{"name": "fn", "parameters": {"b":"true"}}"#
         ));
-        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"b": 1}}"#));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"b":1}}"#));
     }
 
     #[test]
@@ -974,11 +963,8 @@ mod tests {
             ..bare_opts()
         };
         let src = eager_src(&[&t], &opts);
-        assert!(accepts(
-            &src,
-            r#"{"name": "fn", "parameters": {"z": null}}"#
-        ));
-        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"z": 0}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"z":null}}"#));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"z":0}}"#));
     }
 
     #[test]
@@ -994,15 +980,15 @@ mod tests {
         let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"color": "red"}}"#
+            r#"{"name": "fn", "parameters": {"color":"red"}}"#
         ));
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"color": "blue"}}"#
+            r#"{"name": "fn", "parameters": {"color":"blue"}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"color": "yellow"}}"#
+            r#"{"name": "fn", "parameters": {"color":"yellow"}}"#
         ));
     }
 
@@ -1019,15 +1005,15 @@ mod tests {
         let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"level": 1}}"#
+            r#"{"name": "fn", "parameters": {"level":1}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"level": 4}}"#
+            r#"{"name": "fn", "parameters": {"level":4}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"level": "1"}}"#
+            r#"{"name": "fn", "parameters": {"level":"1"}}"#
         ));
     }
 
@@ -1044,19 +1030,19 @@ mod tests {
         let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"tags": ["a", "b"]}}"#
+            r#"{"name": "fn", "parameters": {"tags":["a","b"]}}"#
         ));
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"tags": []}}"#
+            r#"{"name": "fn", "parameters": {"tags":[]}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"tags": [1, 2]}}"#
+            r#"{"name": "fn", "parameters": {"tags":[1, 2]}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"tags": "a"}}"#
+            r#"{"name": "fn", "parameters": {"tags":"a"}}"#
         ));
     }
 
@@ -1086,15 +1072,15 @@ mod tests {
         let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"loc": {"x": 1, "y": 2}}}"#
+            r#"{"name": "fn", "parameters": {"loc":{"x":1,"y":2}}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"loc": {"x": 1}}}"#
+            r#"{"name": "fn", "parameters": {"loc":{"x":1}}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"loc": "origin"}}"#
+            r#"{"name": "fn", "parameters": {"loc":"origin"}}"#
         ));
     }
 
