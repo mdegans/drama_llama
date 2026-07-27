@@ -138,13 +138,38 @@ everything else in this plan. Unconstrained prose is unaffected (its
 segmentation is canonical), which is why plain chat reuses happily
 without marking and hid this.
 
-**Open design question, deliberately not answered here**: the tip
-carries a hash, but `hash_keyed_l_hit` only compares it against
-breakpoint hashes the *new call declares*. We could instead hash the
-new call's prefix at the tip's own entry and compare directly, making
-tip reuse survive BPE drift with no marking required. That is a real
-improvement and a real design change — Mike's call, not a bugfix to
-slip in.
+**Open design question**: the tip carries a hash, but
+`hash_keyed_l_hit` only compares it against breakpoint hashes the *new
+call declares*. We could instead hash the new call's prefix at the
+tip's own entry and compare directly, making tip reuse survive BPE
+drift with no marking required. A real improvement and a real design
+change — Mike's call, not a bugfix to slip in.
+
+**…and chasing that turned up a live silent-corruption bug:
+[issue #91](https://github.com/mdegans/drama_llama/issues/91).**
+`hash_keyed_l_hit` returns a position computed against `prev_entries`
+and the caller indexes `new_entries` with it, with no translation. Its
+doc justifies this by claiming a hash match makes the prefix entries
+"identical in the new list" — true for bytes, false for segmentation,
+and its signature (a bare set of hashes, no entry indices) cannot
+express the new-space answer anyway. Measured on Qwen3.6: the same
+**2322 bytes** occupied **616 entries in `prev`, 613 in `new`**, so
+reuse at 616 skipped `new_entries[613..616]` — three tokens of the new
+user message, never decoded. Cause visible at the LCP end: the grammar
+forces a bare `"` (token 1) where the tokenizer merges the quote into
+the following word (token 39441). Fires on grammar-constrained turns
+replayed WITH `cache_control` on the assistant turn — i.e. the
+configuration that otherwise works. Pinned model-free by
+`hash_keyed_l_hit_result_is_prev_space_issue_91`. Fix direction in the
+issue; option (1) there is the same change this design question wants,
+so they want designing together.
+
+Note the shape of the near-miss: the earlier probe
+(`tests/retokenization_drift.rs`, since deleted) tokenized the emission
+**in isolation** and found zero drift, which would have exonerated the
+whole area. Drift only appears against the *whole-render* tokenization
+with the real schema grammar. Isolating the suspect changed its
+behavior — measure the thing in situ.
 
 ---
 

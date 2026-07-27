@@ -8362,6 +8362,48 @@ mod tests {
         );
     }
 
+    /// Characterization of a KNOWN DEFECT (issue #91), pinned so the
+    /// fix has something to change.
+    ///
+    /// [`hash_keyed_l_hit`] returns the position it stored against the
+    /// PREVIOUS entry list, and the caller
+    /// (`kv_setup_and_chunk_prefill`) uses it to index the NEW list —
+    /// `restore_to(cache_read.pos)` then prefill `new_entries[
+    /// cache_read.entry..]`, with no translation step. Its doc
+    /// justifies that by claiming a hash match makes "the prefix
+    /// entries … identical in the new list".
+    ///
+    /// A hash match implies the **bytes** agree. It does not imply the
+    /// **segmentation** agrees, and this signature cannot bridge the
+    /// gap: `new_breakpoint_hashes` is a bare set of hashes with no
+    /// entry indices attached, so the function has no way to learn
+    /// where those bytes end in the new list. It can only ever return
+    /// prev-space.
+    ///
+    /// Measured live on Qwen3.6 with a schema-grammar turn: the same
+    /// 2322 bytes occupied 616 entries in `prev` and 613 in `new`
+    /// (the grammar forces a bare `"` where the tokenizer merges the
+    /// quote into the following word), so reuse at entry 616 skipped
+    /// `new_entries[613..616]` — three tokens of the new user message,
+    /// silently never decoded.
+    #[test]
+    fn hash_keyed_l_hit_result_is_prev_space_issue_91() {
+        let h = hash_partial_text("same bytes, two segmentations");
+        // The stored tip: those bytes ended at entry 616 in the list
+        // the model actually emitted.
+        let tip = bp(616, Some(h));
+        // The new call hashes the same bytes — but the only thing this
+        // function receives is the hash itself. Whether they end at
+        // 613, 616 or 620 in the new list is not expressible.
+        let new_hashes = vec![h];
+        assert_eq!(
+            hash_keyed_l_hit(&[], Some(&tip), &new_hashes, 1000),
+            ep(616),
+            "returns the PREV-space entry; the caller then indexes \
+             new_entries with it (#91)"
+        );
+    }
+
     /// `cap` argument bounds the result — a cached position > cap is
     /// rejected even if the hash matches. Protects against claiming
     /// to reuse more tokens than the new request has.
