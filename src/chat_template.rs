@@ -46,8 +46,8 @@
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use minijinja::{
-    value::Value as JinjaValue, Environment, Error as JinjaError,
-    UndefinedBehavior,
+    value::{Kwargs, Value as JinjaValue},
+    Environment, Error as JinjaError, UndefinedBehavior,
 };
 use serde::Serialize;
 
@@ -162,6 +162,8 @@ impl ChatTemplate {
         );
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
+        // Overrides minijinja's builtin. See `tojson_unescaped`.
+        env.add_filter("tojson", tojson_unescaped);
         env.add_template_owned("chat", source.clone())
             .map_err(ChatTemplateError::from_jinja)?;
 
@@ -179,6 +181,11 @@ impl ChatTemplate {
         env_permissive.set_undefined_behavior(UndefinedBehavior::Chainable);
         env_permissive.add_function("raise_exception", raise_exception_noop);
         env_permissive.add_function("strftime_now", strftime_now);
+        // Must match the strict env exactly: a partial render that
+        // escapes differently from the full render is not a prefix of
+        // it, and `Session` silently drops such partials — costing the
+        // very breakpoints this is meant to preserve.
+        env_permissive.add_filter("tojson", tojson_unescaped);
         env_permissive
             .add_template_owned("chat", source)
             .map_err(ChatTemplateError::from_jinja)?;
@@ -1317,6 +1324,84 @@ pub(crate) fn split_media_render<'a>(
 // ===========================================================================
 // Jinja-side helpers
 // ===========================================================================
+
+/// `tojson` without Jinja's HTML-safety escaping.
+///
+/// Jinja2's `tojson` is `htmlsafe_json_dumps`, which escapes `'`, `&`,
+/// `<`, and `>` to `'`, `&`, `<`, `>` — a defense
+/// against JSON embedded in `<script>` blocks, inherited from Jinja's
+/// web origins. minijinja matches that faithfully (verified byte-for-byte
+/// against the Python reference renderer in
+/// `tests/fixtures/render_jinja.py`), so this is *correct* Jinja
+/// behavior, not drift.
+///
+/// It is nonetheless wrong for us, in two ways:
+///
+/// 1. **Round-trip.** A model emits a literal `'`; the template renders
+///    it back as `'`. The re-render is then not byte-identical to
+///    what the KV holds, the auto-tip is discarded, and prefix reuse
+///    collapses to the last `cache_control` breakpoint — measured at
+///    4705 tokens lost per turn against cogito-32b (#85). Byte-stable
+///    re-rendering is the invariant the whole prefix cache rests on.
+/// 2. **Fidelity.** The escaped form is what the model *reads back* as
+///    its own prior turn, so its history diverges from what it wrote.
+///    The same applies to tool descriptions in the `<tools>` block,
+///    which also route through this filter.
+///
+/// Constraining generation to emit the escaped form instead was measured
+/// and rejected: `'` and friends tokenize to exactly 5 tokens with
+/// no merges, taking a realistic prose argument from 47 to 107 tokens
+/// (+128%) — generated tokens, on the most common punctuation in
+/// English.
+///
+/// There is no HTML anywhere in a chat prompt, so nothing is lost. The
+/// cost is that our rendered bytes differ from other Jinja-based stacks
+/// in exactly these four characters.
+/// The `indent=N` kwarg is honored because real templates pass it —
+/// Llama 3.1 renders its tool listing with `t | tojson(indent=4)`, and
+/// dropping the kwarg is a render-time "too many arguments" error, not
+/// a silent formatting change.
+fn tojson_unescaped(
+    value: JinjaValue,
+    kwargs: Kwargs,
+) -> Result<JinjaValue, JinjaError> {
+    let indent: Option<usize> = kwargs.get("indent").ok();
+    // Rejects any kwarg we don't model rather than ignoring it: a
+    // silently-dropped formatting argument would change rendered bytes
+    // without anyone noticing, which is the class of bug this whole
+    // filter exists to close.
+    kwargs.assert_all_used()?;
+
+    let json = match indent {
+        Some(width) => {
+            let pad = vec![b' '; width];
+            let mut buf = Vec::new();
+            let mut ser = serde_json::Serializer::with_formatter(
+                &mut buf,
+                serde_json::ser::PrettyFormatter::with_indent(&pad),
+            );
+            value.serialize(&mut ser).map_err(|e| json_err(&e))?;
+            String::from_utf8(buf).map_err(|e| {
+                JinjaError::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("tojson: {e}"),
+                )
+            })?
+        }
+        None => serde_json::to_string(&value).map_err(|e| json_err(&e))?,
+    };
+
+    // Safe-string so an autoescaping template can't re-escape the JSON
+    // we just deliberately left unescaped.
+    Ok(JinjaValue::from_safe_string(json))
+}
+
+fn json_err(e: &serde_json::Error) -> JinjaError {
+    JinjaError::new(
+        minijinja::ErrorKind::InvalidOperation,
+        format!("tojson: {e}"),
+    )
+}
 
 /// HF templates commonly call `raise_exception("msg")` to reject invalid
 /// input. Surface that as a render-time error instead of panicking.
