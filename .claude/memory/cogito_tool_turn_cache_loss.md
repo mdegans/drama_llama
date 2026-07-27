@@ -210,6 +210,61 @@ Watch out: `<tool_call>` is a *special* token, so any design that feeds
 canonical call bytes back through a text path will trip
 `check_no_special_injection` and needs an internal bypass.
 
+## Outcome (2026-07-27) — fixed, both halves
+
+- `368d11e` — `tojson` no longer HTML-escapes (render half).
+- `86c9fe4` — `json_grammar_canonical()` pins JSON-internal whitespace
+  for tool calls (emission half). One-site prelude swap: `schema_to_gbnf`
+  references `ws` **by name**, so its output is prelude-agnostic and the
+  same generated rules are permissive under `JSON_GRAMMAR` and canonical
+  under the new one.
+
+Measured against cogito-32b via `tests/hash_cache_smoke.rs`, n=3 each:
+
+| revision | result | round-2 `cache_read` |
+|---|---|---|
+| `4d59754` (pre-work) | FAIL 3/3 | 167, deterministic |
+| after both commits | pass 3/3 | 195–204 |
+
+Round 1's prompt is 170 tokens, so reuse now extends *past* it into the
+previous emission — the tip is alive.
+
+Two design points worth keeping:
+
+- **The canonical form is mixed, not uniformly compact.** Cogito's
+  template hardcodes `{"name": "` and `", "arguments": ` as literal
+  text, so the envelope spacing is imposed on us and only the argument
+  *interior* is ours. `KV_SEP` / `FIELD_SEP` (`grammar_compile.rs`) are
+  shared by the grammar emitter and `render_reference` so the two cannot
+  drift. **That drift is the root cause, more than the whitespace.**
+- **Framing whitespace is separate (`fws`).** Root rules keep permissive
+  whitespace for the `\n\n` a thinking model puts between `</think>`
+  and its call. Pinning that too would mask tokens the model is trained
+  to emit, for no cache benefit. A global `ws ::= ""` looks like a
+  one-liner and is wrong.
+
+## Why CI never caught it (read before trusting a green model tier)
+
+`tests/hash_cache_smoke.rs` describes this exact bug and was **red for
+cogito and green in CI at the same time**. It falls back to
+`models/model.gguf` when `DRAMA_LLAMA_COGITO_MODEL` is unset, and the
+runner's Qwen renders tool calls as `<parameter=…>` tags with no JSON
+envelope to disagree about. Cogito has never run in CI and does not fit
+the 3090 (Mike, 2026-07-27), so it never will there.
+
+Generalize: **a model-backed test that silently falls back to a
+different model is not coverage** — it is coverage of whichever model
+the runner happens to hold. The durable guards for this class are
+model-free and live in the fast tier:
+
+- `dialect::parse::tests::canonical_call_grammar_admits_render_reference`
+- `grammar_compile::tests::canonical_json_grammar_pins_ws`
+- `grammar_compile::tests::canonical_prelude_admits_only_compact_json`
+- `template_rendering::render_reference_matches_template_tool_call_render`
+
+All four use payloads containing `'` and `&` deliberately. Clean-ASCII
+payloads are precisely why this survived so long.
+
 ## Related
 
 - Issue #86 — `render_partial` drops `prompt.thinking`, so partials
