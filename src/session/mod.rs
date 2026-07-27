@@ -1151,6 +1151,110 @@ fn tip_ttl(breakpoint_ttls: &[CacheTtl]) -> CacheTtl {
         .unwrap_or(CacheTtl::FiveMinutes)
 }
 
+/// The pure core of `Session::compute_tip_extension`: given the
+/// prompt's cache entries, every token the predictor *recorded*, the
+/// canonical re-render's tail past the KV head, and the KV head
+/// position, produce the extended entry list, the internal tip, and
+/// the head position to checkpoint at.
+///
+/// # There is always exactly one recorded token past the KV head
+///
+/// The predictor decodes lazily: the token sampled on iteration `k` is
+/// only committed to KV by iteration `k + 1`'s `decoder.step`
+/// ([`crate::CandidatePredictor`]). So whatever ends generation, the
+/// last sampled token is recorded in `generated_tokens` and absent
+/// from KV — for **all three** endings:
+///
+/// - **stop sequence / EOG** — `TokenPredictor::next` early-returns on
+///   `stopped` before stepping the terminal token;
+/// - **grammar complete** — `run_call` breaks out of the piece loop;
+/// - **max tokens / context full** — `CandidatePredictor::next`
+///   returns `None` on its budget check.
+///
+/// `generated_tokens.len() == kv_generated_count + 1` is therefore a
+/// *consistency check on the bookkeeping*, *not* a discriminator
+/// between stop conditions. An earlier version of this doc claimed
+/// max-tokens produced no tip; it always did, because the arithmetic
+/// never told the endings apart. The one shape that legitimately fails
+/// the check is a trailing UTF-8 flush yield — `PiecePredictor` emits a
+/// piece with no new token, the caller records the previous token
+/// twice, and the count comes out one too high. That ending is
+/// deliberately tip-less: its byte accounting is not trustworthy.
+///
+/// # What the extra token is for, and why the tail replaces it
+///
+/// It is a *prediction* of what the next call's chat template
+/// re-renders at that position; it is never trusted as KV. The tip and
+/// the checkpoint both land at `kv_pos_len`, so the next call's LCP can
+/// reach `kv_pos_len + 1`, `safe` (`lcp - 1`, see `compute_l_hit`)
+/// reaches the tip entry, and the tip qualifies. A wrong prediction can
+/// only ever *shorten* that LCP — never corrupt KV, because restore
+/// targets are checkpointed positions only.
+///
+/// `canonical_tail` is what makes the prediction true. It is the
+/// byte-stable re-render's own tokenization of everything at and past
+/// the KV head, which differs by ending:
+///
+/// - **stop sequence** — the terminal token's piece never reached the
+///   surfaced text, so the tail is just the turn close. Substituting is
+///   load-bearing because templates *rewrite* the stop on re-ingest:
+///   gpt-oss renders `<|end|>` where the model emitted the EOG
+///   `<|return|>` (upstream issue #15417).
+/// - **grammar complete / max tokens** — the last sampled token IS
+///   surfaced content, so the re-render reproduces it *before* the
+///   close and the tail is `piece + close`.
+///
+/// Feeding the stop-sequence tail (close only) on a grammar-complete
+/// ending drops a real content token from the prediction, stops the
+/// next LCP exactly *at* the tip entry, and disqualifies the tip — so
+/// the tip survived only when its hash matched. Since grammar-complete
+/// is the normal ending for a tool call, that silently cost reuse on
+/// tool-call turns whenever the hash missed (#88 phase 5).
+///
+/// # Position space
+///
+/// All arithmetic here is POSITION space vs position space: the
+/// prompt's position length comes from its entries (an M-RoPE image
+/// advances positions by `n_pos`, not by its cell count), and the
+/// generated region past the prompt is plain text where entries,
+/// positions, and cells coincide. The returned tip is a carried
+/// [`EntryPos`] computed against the returned entry list.
+fn tip_extension(
+    prompt_entries: Vec<CacheEntry>,
+    generated_tokens: Vec<Token>,
+    canonical_tail: Option<Vec<Token>>,
+    kv_pos_len: usize,
+) -> (Vec<CacheEntry>, Option<EntryPos>, Option<usize>) {
+    let prompt_entry_len = prompt_entries.len();
+    let prompt_pos_len: usize =
+        prompt_entries.iter().map(CacheEntry::n_pos).sum();
+    let kv_generated_count = kv_pos_len.saturating_sub(prompt_pos_len);
+
+    let mut extended = prompt_entries;
+    extended.extend(generated_tokens.iter().copied().map(CacheEntry::Token));
+
+    if generated_tokens.len() == kv_generated_count + 1 && kv_pos_len >= 1 {
+        if let Some(tail) = canonical_tail {
+            if !tail.is_empty() {
+                // Replace the whole past-KV region with what the
+                // canonical re-render puts there (see doc above).
+                extended.truncate(prompt_entry_len + kv_generated_count);
+                extended.extend(tail.iter().copied().map(CacheEntry::Token));
+            }
+        }
+        let tip = EntryPos {
+            entry: prompt_entry_len + kv_generated_count,
+            pos: kv_pos_len,
+        };
+        return (extended, Some(tip), Some(kv_pos_len));
+    }
+    // Bookkeeping disagrees (the UTF-8 flush ending). No tip; truncate
+    // to the KV extent so the entry list matches engine state exactly
+    // and no future LCP walk runs off the end of KV.
+    extended.truncate(prompt_entry_len + kv_generated_count);
+    (extended, None, None)
+}
+
 /// The auto-tip's fold cursor: the assistant reply (message index
 /// `messages.len()` once appended) was accumulated live during
 /// generation, so the next call's fold resumes after it.
@@ -4642,53 +4746,17 @@ impl<B: Backend> Session<B> {
     /// successful generation. Shared between `complete_text` and
     /// `run_call`.
     ///
-    /// **Behavior depends on which stop condition fired**, queried
-    /// via [`Engine::memory_seq_pos_max`]:
+    /// Thin wrapper over `tip_extension`: the only thing here that
+    /// needs `self` is the KV head query
+    /// ([`Engine::memory_seq_pos_max`]). Everything else is pure and
+    /// unit-tested without a model.
     ///
-    /// - **Stop sequence (common case).** Predictor recorded the EOS
-    ///   in its `tokens` vec but `decoder.step` was never called on
-    ///   it — KV head sits at `prompt + content_count`,
-    ///   `generated_tokens` length is `content_count + 1`. The extra
-    ///   token is a *prediction* of what the next call's chat
-    ///   template re-renders at that position (it is never trusted
-    ///   as KV). Tip lands at `kv_len`, checkpoint at `kv_len`.
-    ///   Next call's LCP can reach `kv_len + 1`, safe = `kv_len`,
-    ///   tip eligible.
-    ///
-    ///   When `canonical_close` is provided (`run_call` derives it
-    ///   from the byte-stable canonical re-render), it REPLACES the
-    ///   sampled stop token in the extension: templates that rewrite
-    ///   the stop on re-ingest (gpt-oss renders `<|end|>` where the
-    ///   model emitted the EOG `<|return|>`, upstream issue #15417)
-    ///   would otherwise make the prediction wrong, the LCP stop at
-    ///   exactly `kv_len`, and the tip DISQUALIFY — and since restore
-    ///   targets are only checkpointed positions, reuse then falls
-    ///   all the way back to the last explicit `cache_control`
-    ///   breakpoint (potentially the whole conversation), not "one
-    ///   token". Substituting the canonical token makes the
-    ///   prediction true; a wrong prediction can only ever shorten
-    ///   the LCP, never corrupt KV.
-    ///
-    /// - **Max-tokens stop.** Every recorded token was committed —
-    ///   `generated_tokens.len() == kv_len - prompt_len`. We have no
-    ///   extra token to extend `prev_tokens` past KV. Skip the tip
-    ///   (no eligible position past `kv_len - 1` without a snapshot
-    ///   there). Returns the same `prev_tokens` shape and `None` for
-    ///   the tip — fall back to the existing breakpoint-only path.
-    ///
-    /// - **Cache off / empty engine.** Return prompt as-is, no tip.
-    ///
-    /// All arithmetic here is POSITION space vs position space: the
-    /// prompt's position length comes from its entries (an M-RoPE
-    /// image advances positions by `n_pos`, not by its cell count),
-    /// and the generated region past the prompt is plain text where
-    /// entries, positions, and cells coincide. The returned tip is a
-    /// carried [`EntryPos`] computed against the returned entry list.
+    /// **Cache off / empty engine**: return the prompt as-is, no tip.
     fn compute_tip_extension(
         &mut self,
         prompt_entries: Vec<CacheEntry>,
         generated_tokens: Vec<Token>,
-        canonical_close: Option<Vec<Token>>,
+        canonical_tail: Option<Vec<Token>>,
         active_seq: i32,
     ) -> (Vec<CacheEntry>, Option<EntryPos>, Option<usize>) {
         if self.prefix_cache.is_none() {
@@ -4698,45 +4766,12 @@ impl<B: Backend> Session<B> {
         if kv_max < 0 {
             return (prompt_entries, None, None);
         }
-        let kv_pos_len = (kv_max as usize) + 1;
-        let prompt_entry_len = prompt_entries.len();
-        let prompt_pos_len: usize =
-            prompt_entries.iter().map(CacheEntry::n_pos).sum();
-        let kv_generated_count = kv_pos_len.saturating_sub(prompt_pos_len);
-
-        let mut extended = prompt_entries;
-        extended
-            .extend(generated_tokens.iter().copied().map(CacheEntry::Token));
-
-        // Stop-sequence case: generated_tokens has one extra token
-        // (the recorded-but-uncommitted close marker). Tip and
-        // checkpoint both at the KV head. The "extra" token is what
-        // makes the next call's LCP exceed the tip entry so it
-        // qualifies.
-        if generated_tokens.len() == kv_generated_count + 1 && kv_pos_len >= 1 {
-            if let Some(close) = canonical_close {
-                if !close.is_empty() {
-                    // Replace the sampled stop token with the close
-                    // token(s) the canonical re-render actually
-                    // contains (see doc above).
-                    extended.truncate(prompt_entry_len + kv_generated_count);
-                    extended
-                        .extend(close.iter().copied().map(CacheEntry::Token));
-                }
-            }
-            let tip = EntryPos {
-                entry: prompt_entry_len + kv_generated_count,
-                pos: kv_pos_len,
-            };
-            return (extended, Some(tip), Some(kv_pos_len));
-        }
-        // Max-tokens / grammar-complete case: every token committed,
-        // no spare. No tip extension possible — fall through to the
-        // breakpoint-only path. Truncate extended to the KV extent so
-        // it matches engine state exactly (avoids any future LCP walk
-        // running off the end of KV).
-        extended.truncate(prompt_entry_len + kv_generated_count);
-        (extended, None, None)
+        tip_extension(
+            prompt_entries,
+            generated_tokens,
+            canonical_tail,
+            (kv_max as usize) + 1,
+        )
     }
 
     /// Stream [`Block`](crate::Block)s as they're generated.
@@ -4998,6 +5033,17 @@ impl<B: Backend> Session<B> {
         // Only populated when caching is on (see above); starts empty
         // either way.
         let mut generated_tokens: Vec<Token> = Vec::new();
+        // Bytes the FINAL loop iteration contributed to `raw_text` —
+        // the piece of the recorded-but-uncommitted token, which is
+        // the one token sitting past the KV head when the loop exits
+        // (see [`tip_extension`]). Zero when the turn ended on a stop
+        // token, because `eos_pieces` drops that piece before
+        // `raw_text` grows; NON-zero when the grammar reached accept
+        // or the budget ran out, because then the last sampled token
+        // is surfaced content that the next turn's re-render
+        // reproduces. Overwritten every iteration, so on exit it
+        // describes the last one.
+        let mut uncommitted_bytes: usize = 0;
 
         let mut predictor = if self.prefix_cache.is_some() {
             // Cache on: ALWAYS the resuming constructor — even at
@@ -5032,10 +5078,14 @@ impl<B: Backend> Session<B> {
                 }
             }
             if eos_pieces.contains(&piece) {
+                // Framing, not content: absent from `raw_text`, so the
+                // canonical tail starts at the turn close.
+                uncommitted_bytes = 0;
                 continue;
             }
             generated_count += 1;
             raw_text.push_str(&piece);
+            uncommitted_bytes = piece.len();
 
             // Break early if any active grammar / json matcher has
             // reached its accept state. Avoids burning extra decode
@@ -5105,40 +5155,57 @@ impl<B: Backend> Session<B> {
         // construction. Best-effort throughout: a render error also
         // just skips the entry.
         //
-        // The same byte-stable render also yields `canonical_close`:
-        // the token(s) the template renders AFTER the raw emission
-        // (the turn close — e.g. `<|im_end|>`, Gemma's
+        // The same byte-stable render also yields `canonical_tail`:
+        // the token(s) the re-render places at and past the KV head.
+        // That is the turn close (e.g. `<|im_end|>`, Gemma's
         // `<|tool_response>`, gpt-oss's `<|end|>` rewrite of the
-        // sampled `<|return|>`). `compute_tip_extension` records
-        // those instead of the sampled stop token so the next call's
-        // LCP walks through the close and the tip stays eligible even
-        // when the template rewrites the stop on re-ingest.
+        // sampled `<|return|>`) — and, when the turn ended on
+        // something other than a stop token, the last sampled piece
+        // ahead of it. `tip_extension` records that tail in place of
+        // the recorded-but-uncommitted token so the next call's LCP
+        // walks through it and the tip stays eligible even when the
+        // template rewrites the stop on re-ingest.
         let blocks_owned: Vec<crate::Block> = blocks.to_vec();
-        let mut canonical_close: Option<Vec<Token>> = None;
+        let mut canonical_tail: Option<Vec<Token>> = None;
         let tip_hash = match self.render_extended(
             prompt,
             &blocks_owned,
             media_sentinel.as_deref(),
         ) {
             Ok(extended_render) => {
-                let close_bytes = extended_render
+                let byte_stable = extended_render
                     .strip_prefix(rendered_prompt.as_str())
-                    .and_then(|tail| tail.strip_prefix(raw_text.as_str()));
-                if let Some(close) = close_bytes {
-                    if !close.is_empty() {
-                        // Special-token closes tokenize boundary-
-                        // stable; cap defensively — a wrong tail
-                        // token only shortens the next LCP.
+                    .is_some_and(|tail| tail.starts_with(raw_text.as_str()));
+                if byte_stable {
+                    // Everything the re-render places at and past the
+                    // KV head: the uncommitted token's own piece (zero
+                    // bytes of it on a stop-sequence ending — see
+                    // `uncommitted_bytes`) followed by the turn close.
+                    //
+                    // Tokenized JOINTLY, deliberately. The
+                    // content→close seam is precisely where BPE may
+                    // merge, and the tip's prediction has to be the
+                    // re-render's own tokenization at that position,
+                    // not the concatenation of two independent ones.
+                    let tail_start = rendered_prompt.len()
+                        + raw_text.len().saturating_sub(uncommitted_bytes);
+                    // `get`, not `[..]`: piece boundaries are codepoint
+                    // boundaries by construction, but a missed tip only
+                    // shortens the next LCP whereas a bad slice panics.
+                    let tail = extended_render.get(tail_start..).unwrap_or("");
+                    if !tail.is_empty() {
+                        // Cap defensively — a wrong tail token only
+                        // shortens the next LCP.
                         // add_special = false: `Model::tokenize`
                         // auto-prepends BOS on vocabs that request it
                         // (Gemma, Llama-3), and a BOS inside the tip
                         // stops the next call's LCP walk exactly
                         // there — silently defeating the auto-tip on
                         // every add_bos model.
-                        canonical_close = Some(
+                        canonical_tail = Some(
                             self.engine
                                 .model
-                                .tokenize_special(close, false, true)
+                                .tokenize_special(tail, false, true)
                                 .into_iter()
                                 .take(8)
                                 .collect(),
@@ -5176,15 +5243,14 @@ impl<B: Backend> Session<B> {
         };
 
         // Auto-tip: extend `prev_tokens` past the prompt with the
-        // generated content and the canonical close (falling back to
-        // the recorded-but-uncommitted stop token when the render
-        // wasn't byte-stable). See `compute_tip_extension` for the
-        // stop-condition handling.
+        // generated content and the canonical tail (falling back to
+        // the recorded-but-uncommitted token when the render wasn't
+        // byte-stable). See `compute_tip_extension`.
         let (extended_prev, internal_tip, head_for_checkpoint) = self
             .compute_tip_extension(
                 entries,
                 generated_tokens,
-                canonical_close,
+                canonical_tail,
                 active_seq,
             );
         if let Some(head) = head_for_checkpoint {
@@ -6771,6 +6837,122 @@ mod tests {
         let prev = toks(0..5);
         let new_ = toks((0..5).chain([99]));
         assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(0))), ep(0));
+    }
+
+    // -----------------------------------------------------------------
+    // `tip_extension` — the pure core of the auto-tip. Shape shared by
+    // every case below: a 5-entry all-token prompt, three recorded
+    // generated tokens, and a KV head two tokens past the prompt (the
+    // third is recorded-but-uncommitted, which is the invariant the
+    // predictor's lazy decode guarantees for EVERY ending).
+    // -----------------------------------------------------------------
+
+    /// Stop-sequence ending: the terminal token's piece never reached
+    /// the surfaced text, so the canonical tail is the turn close alone
+    /// and it REPLACES that token. Pins the gpt-oss case where the
+    /// template renders `<|end|>` over the emitted `<|return|>`.
+    #[test]
+    fn tip_extension_stop_sequence_substitutes_the_close() {
+        let (entries, tip, head) =
+            tip_extension(toks(0..5), vec![10, 11, 12], Some(vec![99]), 7);
+        assert_eq!(entries, toks([0, 1, 2, 3, 4, 10, 11, 99]));
+        assert_eq!(tip, Some(EntryPos { entry: 7, pos: 7 }));
+        assert_eq!(head, Some(7));
+    }
+
+    /// Grammar-complete ending: the last sampled token IS surfaced
+    /// content, so the canonical tail is `piece + close` and the tip
+    /// prediction must KEEP that token ahead of the close.
+    ///
+    /// The second half is the actual regression pin (#88 phase 5): with
+    /// the stop-sequence tail (close only) the content token is dropped,
+    /// the next call's LCP dies exactly AT the tip entry, and
+    /// `compute_l_hit`'s `safe = lcp - 1` disqualifies it — the tip
+    /// survived on the hash path alone, and grammar-complete is the
+    /// normal ending for a tool call.
+    #[test]
+    fn tip_extension_grammar_complete_keeps_the_last_content_token() {
+        // What the next call will render: prompt, the whole emission
+        // (10, 11, 12), the turn close (99), then a fresh user message.
+        let next = toks([0, 1, 2, 3, 4, 10, 11, 12, 99, 50, 51]);
+
+        let (entries, tip, head) =
+            tip_extension(toks(0..5), vec![10, 11, 12], Some(vec![12, 99]), 7);
+        assert_eq!(entries, toks([0, 1, 2, 3, 4, 10, 11, 12, 99]));
+        assert_eq!(tip, Some(EntryPos { entry: 7, pos: 7 }));
+        assert_eq!(head, Some(7));
+        // LCP reaches past the tip entry, so the tip is eligible.
+        assert_eq!(longest_common_prefix_len(&entries, &next), 9);
+        assert_eq!(compute_l_hit(&entries, &next, &[], tip), ep(7));
+
+        // The bug, pinned: close-only tail on this ending.
+        let (bad, bad_tip, _) =
+            tip_extension(toks(0..5), vec![10, 11, 12], Some(vec![99]), 7);
+        assert_eq!(bad, toks([0, 1, 2, 3, 4, 10, 11, 99]));
+        assert_eq!(longest_common_prefix_len(&bad, &next), 7);
+        assert_eq!(compute_l_hit(&bad, &next, &[], bad_tip), ep(0));
+    }
+
+    /// Max-tokens ending gets a tip, with or without a canonical tail.
+    /// The old doc claimed it produced none ("every recorded token was
+    /// committed"); the predictor's lazy decode means the budget check
+    /// leaves the last sampled token uncommitted just like a stop does.
+    #[test]
+    fn tip_extension_max_tokens_gets_a_tip() {
+        // Same shape as grammar-complete: the last piece is content.
+        let (entries, tip, _) =
+            tip_extension(toks(0..5), vec![10, 11, 12], Some(vec![12, 99]), 7);
+        assert_eq!(entries, toks([0, 1, 2, 3, 4, 10, 11, 12, 99]));
+        assert_eq!(tip, Some(EntryPos { entry: 7, pos: 7 }));
+
+        // No byte-stable render: fall back to the recorded token as the
+        // prediction rather than skipping the tip.
+        let (entries, tip, _) =
+            tip_extension(toks(0..5), vec![10, 11, 12], None, 7);
+        assert_eq!(entries, toks([0, 1, 2, 3, 4, 10, 11, 12]));
+        assert_eq!(tip, Some(EntryPos { entry: 7, pos: 7 }));
+    }
+
+    /// An empty canonical tail is not a substitution: keep the recorded
+    /// token. (A template that renders nothing after the emission.)
+    #[test]
+    fn tip_extension_empty_tail_keeps_the_recorded_token() {
+        let (entries, tip, _) =
+            tip_extension(toks(0..5), vec![10, 11, 12], Some(vec![]), 7);
+        assert_eq!(entries, toks([0, 1, 2, 3, 4, 10, 11, 12]));
+        assert_eq!(tip, Some(EntryPos { entry: 7, pos: 7 }));
+    }
+
+    /// The UTF-8 flush ending: `PiecePredictor` yields a piece with no
+    /// new token, the caller records the previous token twice, and the
+    /// count comes out one too high. Deliberately tip-less — the byte
+    /// accounting behind the tail is not trustworthy there — and the
+    /// entry list is truncated to the KV extent.
+    #[test]
+    fn tip_extension_flush_duplicate_yields_no_tip() {
+        let (entries, tip, head) =
+            tip_extension(toks(0..5), vec![10, 11, 12, 12], Some(vec![99]), 7);
+        assert_eq!(entries, toks([0, 1, 2, 3, 4, 10, 11]));
+        assert_eq!(tip, None);
+        assert_eq!(head, None);
+    }
+
+    /// Position space, not entry space: an M-RoPE image advances
+    /// positions by `n_pos` (16 here) while occupying one entry, so the
+    /// tip's `entry` and `pos` diverge and must not be conflated.
+    #[test]
+    fn tip_extension_media_prompt_counts_positions_not_entries() {
+        let mut prompt = toks([7]);
+        prompt.push(media(0xAB));
+        prompt.extend(toks([8]));
+        // Prompt: 3 entries, 1 + 16 + 1 = 18 positions. KV head two
+        // generated tokens past that.
+        let (entries, tip, head) =
+            tip_extension(prompt, vec![10, 11, 12], Some(vec![99]), 20);
+        assert_eq!(entries.len(), 6);
+        assert_eq!(entries[5], CacheEntry::Token(99));
+        assert_eq!(tip, Some(EntryPos { entry: 5, pos: 20 }));
+        assert_eq!(head, Some(20));
     }
 
     /// No tool_choice and no output_config → no grammar constraint.
