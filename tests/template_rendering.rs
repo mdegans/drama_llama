@@ -320,12 +320,30 @@ fn enable_thinking_derives_from_prompt_thinking() {
 /// Model-free: the pinned fixture template is the whole input.
 #[test]
 fn render_reference_matches_template_tool_call_render() {
+    render_reference_matches_template(
+        &fixtures_dir().join("cogito_14b_template.jinja"),
+    );
+}
+
+/// The same invariant against the owned `cogito-cache-stable`
+/// template (#88 phase 2), whose `json_dumps` filter renders argument
+/// interiors in the model's measured `Spaced` habit. The analyzer
+/// must detect that spacing and `render_reference` must serialize
+/// with it, or the owned template would *reintroduce* the #85 broken
+/// round-trip it exists to close.
+#[test]
+fn render_reference_matches_cache_stable_template_render() {
+    render_reference_matches_template(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("templates/cogito-cache-stable.jinja"),
+    );
+}
+
+fn render_reference_matches_template(template: &std::path::Path) {
     use drama_llama::dialect::{analyze_template, render_reference};
 
-    let source = std::fs::read_to_string(
-        fixtures_dir().join("cogito_14b_template.jinja"),
-    )
-    .expect("cogito template fixture missing");
+    let source = std::fs::read_to_string(template)
+        .unwrap_or_else(|e| panic!("read {template:?}: {e}"));
     let syntax = analyze_template(&source, "", "<|im_end|>")
         .expect("cogito template analyzes");
 
@@ -343,7 +361,12 @@ fn render_reference_matches_template_tool_call_render() {
     let reference = render_reference(&syntax, &[("create_post", &input)])
         .expect("call is representable");
 
-    let tmpl = load_template();
+    let tmpl = ChatTemplate::from_source(
+        source,
+        String::new(),
+        "<|im_end|>".to_string(),
+    )
+    .expect("template compiles");
     let prompt = Prompt {
         messages: vec![
             Message {

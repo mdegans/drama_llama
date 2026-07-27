@@ -86,10 +86,25 @@ pub static GPTOSS: BakedTemplate = BakedTemplate {
     replacement: include_str!("../templates/gptoss-cache-stable.jinja"),
 };
 
+/// Cogito (Qwen2.5-based, Hermes-style JSON calls). The stock
+/// template re-renders call arguments through `tojson` (compact)
+/// while the model's unforced habit is uniform `json.dumps` spacing
+/// (measured: `tests/probe_unforced_habit.rs`), so stock bytes force
+/// the model off-habit to stay round-trip stable. The replacement is
+/// a single filter swap to `json_dumps`; the analyzer measures it as
+/// `JsonSpacing::Spaced` and the grammar + `render_reference` follow
+/// (#88 phase 2). The 32B GGUF's template is byte-identical to the
+/// 14B's, so one detection key covers the family we've seen.
+pub static COGITO: BakedTemplate = BakedTemplate {
+    name: "cogito-cache-stable",
+    stock: include_str!("../templates/cogito-gguf.jinja"),
+    replacement: include_str!("../templates/cogito-cache-stable.jinja"),
+};
+
 /// Every baked template, in detection order. Order is cosmetic —
 /// stock templates are mutually distinct byte strings, so at most one
 /// entry can match.
-pub static ALL: &[&BakedTemplate] = &[&GEMMA4, &GPTOSS];
+pub static ALL: &[&BakedTemplate] = &[&GEMMA4, &GPTOSS, &COGITO];
 
 /// Match an embedded template against the registry. `Some` only on
 /// byte-equality with a known stock template (trailing whitespace

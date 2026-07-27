@@ -47,6 +47,26 @@ session's auto-tip records the CANONICAL close token from the
 byte-stable re-render (`compute_tip_extension`), so the next call's
 LCP walks through the rewritten `<|end|>` and splices at the tip.
 
+`cogito-gguf.jinja` is dumped from the cogito-32b GGUF
+(`tokenizer.chat_template`, via `scripts/gguf_template.py`) —
+byte-identical to the 14B fixture
+(`tests/fixtures/cogito_14b_template.jinja`), so results transfer
+across both sizes.
+
+`cogito-cache-stable.jinja` is drama_llama's cache-stability patch of
+`cogito-gguf.jinja` (#88 phase 2), and the smallest of the set: one
+filter swap, `tool_call.arguments | tojson` → `| json_dumps`. Stock
+`tojson` re-renders arguments compact while the model's unforced habit
+is uniform `json.dumps` spacing (measured greedy with no grammar,
+`tests/probe_unforced_habit.rs`), so under stock bytes the #85 fix had
+to pin generation *off* the model's habit to keep the round-trip
+stable. The dialect analyzer measures this template's spacing as
+`Spaced` and pins the grammar and `render_reference` to the same
+spelling, so the model now generates its natural bytes and the
+re-render reproduces them. The `enable_thinking` front-rewrite
+(issue #86 interaction) is deliberately untouched: partial-render
+thinking flags are `render_partial`'s bug to fix, not the template's.
+
 A `<model>.template.jinja` sidecar next to the GGUF still overrides
 any of these — baked templates removed the *need* for sidecar
 deployment on recognized models, not the mechanism.

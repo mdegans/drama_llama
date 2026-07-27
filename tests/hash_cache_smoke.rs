@@ -143,7 +143,10 @@ fn mark_last_block(content: &mut Content) {
 /// transcripts genuinely diverge at the assistant turn, and the
 /// auto-tip correctly cannot fire — reuse stops at the divergence.
 /// Byte-stable rendering is the contract the tip mechanic needs.
-fn assert_tip_survives_tool_round_trip(model: PathBuf) {
+fn assert_tip_survives_tool_round_trip(
+    model: PathBuf,
+    expected_spacing: Option<drama_llama::JsonSpacing>,
+) {
     let mut session = drama_llama::LlamaCppSession::from_path(model)
         .expect("model loads")
         .quiet()
@@ -153,6 +156,20 @@ fn assert_tip_survives_tool_round_trip(model: PathBuf) {
                 .with_extra("preserve_thinking", true),
         )
         .with_prefix_cache(true);
+
+    // Rung-2 witness: the caller knows which template tier this model
+    // should land on, and the analyzed spacing discriminates them —
+    // the tip surviving alone does not, because stock and baked
+    // templates are BOTH round-trip stable post-#85. `Spaced` here can
+    // only mean the baked replacement is actually the active template.
+    if let Some(expected) = expected_spacing {
+        assert_eq!(
+            session.dialect().arguments.json_spacing,
+            expected,
+            "active template's measured spacing is not the expected \
+             tier's — did the baked replacement (rung 2) apply?"
+        );
+    }
 
     let (round1_prompt, _tool) = build_round1();
 
@@ -264,12 +281,17 @@ fn assert_tip_survives_tool_round_trip(model: PathBuf) {
 fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
     let default =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
-    assert_tip_survives_tool_round_trip(default);
+    // No spacing expectation: which template tier fires depends on
+    // whatever model.gguf points at.
+    assert_tip_survives_tool_round_trip(default, None);
 }
 
 /// The same mechanic on a cogito-family model — a `JsonNative` dialect
-/// whose template routes arguments through `tojson`, which is where the
-/// canonical-JSON invariant actually gets tested.
+/// with a JSON argument envelope, which is where the canonical-JSON
+/// invariant actually gets tested. Under the baked
+/// `cogito-cache-stable` template (#88 phase 2) the canonical interior
+/// is the model's measured `Spaced` habit; the assertion below
+/// witnesses that rung 2 actually fired.
 ///
 /// Skips when no such model is present; cogito does not fit the CI
 /// box's 3090. The dialect-level invariant is covered without weights
@@ -286,5 +308,12 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip_cogito() {
         );
         return;
     };
-    assert_tip_survives_tool_round_trip(model);
+    // `Spaced` doubles as the rung-2 witness: cogito's stock template
+    // measures Compact, so this only holds when the baked
+    // `cogito-cache-stable` replacement is the active template (#88
+    // phase 2).
+    assert_tip_survives_tool_round_trip(
+        model,
+        Some(drama_llama::JsonSpacing::Spaced),
+    );
 }

@@ -222,6 +222,15 @@ fn reconstruct_cogito() {
     );
 }
 
+/// The owned cogito template (#88 phase 2): identical to stock except
+/// `tool_call.arguments | json_dumps`, so the argument interior
+/// round-trips in the model's measured `Spaced` habit instead of
+/// forcing `tojson`-compact bytes.
+#[test]
+fn reconstruct_cogito_cache_stable() {
+    assert_reconstruction("cogito-cache-stable.jinja", "", "<|im_end|>");
+}
+
 fn cogito_source() -> String {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -230,31 +239,50 @@ fn cogito_source() -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
-/// The #85 cache property itself, pinned FFI-free against the STOCK
-/// cogito template: the generation-prompt render is a byte PREFIX of
-/// the follow-up render, and the delta begins with the canonical
-/// emission — so the KV laid down during generation stays reusable
-/// and the auto-tip survives the turn. Uses the adversarial payload
-/// deliberately: before `368d11e` (tojson HTML-escaping) and
-/// `86c9fe4` (canonical `ws`) this failed on exactly such bytes while
-/// clean-ASCII payloads passed.
+/// The #85 cache property pinned FFI-free against the STOCK cogito
+/// template (see [`assert_prefix_continuity`] for the property).
 #[test]
 fn cogito_prefix_continuity() {
-    let source = cogito_source();
-    let syntax = analyze_template(&source, "", "<|im_end|>").expect("analyze");
+    assert_prefix_continuity(cogito_source(), "<|im_end|>");
+}
+
+/// The same continuity property against the owned
+/// `cogito-cache-stable` template (#88 phase 2): the `json_dumps`
+/// argument interior must not cost the byte-prefix property the
+/// stock template already had — canonical emission bytes (now
+/// `Spaced`) still lead the turn delta, and aging still extends the
+/// render byte-for-byte.
+#[test]
+fn cogito_cache_stable_prefix_continuity() {
+    assert_prefix_continuity(
+        fixture_source("cogito-cache-stable.jinja"),
+        "<|im_end|>",
+    );
+}
+
+/// The #85 cache property, template-parameterized: the generation-
+/// prompt render is a byte PREFIX of the follow-up render, and the
+/// delta begins with the canonical emission — so the KV laid down
+/// during generation stays reusable and the auto-tip survives the
+/// turn.
+///
+/// Uses the adversarial payload deliberately: before `368d11e`
+/// (tojson HTML-escaping) and `86c9fe4` (canonical `ws`) this failed
+/// on exactly such bytes while clean-ASCII payloads passed.
+///
+/// enable_thinking=true rewrites the FRONT of cogito's prompt, so it
+/// can't change between renders here; #86 tracks the partial-render
+/// half of that. Continuity is pinned in non-thinking mode
+/// (aged-thinking continuity is a Phase 4 owned-template decision).
+fn assert_prefix_continuity(source: String, eos: &str) {
+    let syntax = analyze_template(&source, "", eos).expect("analyze");
     let tool = test_tool();
     let (_, input) = &payloads()[1];
     let calls_ref = render_reference(&syntax, &[("get_weather", input)])
         .expect("representable");
-    let template = ChatTemplate::from_source(
-        source,
-        String::new(),
-        "<|im_end|>".to_string(),
-    )
-    .expect("template compiles");
-    // enable_thinking=true rewrites the FRONT of cogito's prompt, so
-    // it can't change between renders here; #86 tracks the partial-
-    // render half of that. Continuity is pinned in non-thinking mode.
+    let template =
+        ChatTemplate::from_source(source, String::new(), eos.to_string())
+            .expect("template compiles");
     let opts = |gen: bool| {
         RenderOptions::default()
             .with_generation_prompt(gen)
@@ -300,7 +328,7 @@ fn cogito_prefix_continuity() {
          --- want ---\n{calls_ref:?}\n--- got ---\n{suffix:?}"
     );
     assert!(
-        suffix[calls_ref.len()..].starts_with("<|im_end|>"),
+        suffix[calls_ref.len()..].starts_with(eos),
         "canonical close must follow the calls.\n{suffix:?}"
     );
 
@@ -334,86 +362,9 @@ fn cogito_prefix_continuity() {
 /// (aged-thinking continuity is a Phase 4 owned-template decision).
 #[test]
 fn qwen36_prefix_continuity() {
-    let source = fixture_source("qwen3.6-gguf.jinja");
-    let syntax = analyze_template(&source, "", "<|im_end|>").expect("analyze");
-    let tool = test_tool();
-    let (_, input) = &payloads()[1];
-    let calls_ref = render_reference(&syntax, &[("get_weather", input)])
-        .expect("representable");
-    let template = ChatTemplate::from_source(
-        source,
-        String::new(),
-        "<|im_end|>".to_string(),
-    )
-    .expect("template compiles");
-    let opts = |gen: bool| {
-        RenderOptions::default()
-            .with_generation_prompt(gen)
-            .with_extra("enable_thinking", false)
-    };
-    let base = Prompt {
-        messages: vec![Message {
-            role: Role::User,
-            content: Content::text("What's the weather in Paris?"),
-        }],
-        tools: Some(vec![tool.clone().into()]),
-        ..Default::default()
-    };
-
-    // A bare tool-call turn extends the generation prompt, leading
-    // with the canonical emission and closing with eos.
-    let p = template.render_with(&base, &opts(true)).expect("render");
-    let mut with_turn = base.clone();
-    with_turn.messages.push(Message {
-        role: Role::Assistant,
-        content: Content(vec![Block::ToolUse {
-            call: ToolUse {
-                id: Cow::Borrowed("call00001"),
-                name: Cow::Borrowed("get_weather"),
-                input: input.clone(),
-                cache_control: None,
-                caller: None,
-            },
-        }]),
-    });
-    let f = template
-        .render_with(&with_turn, &opts(false))
-        .expect("render");
-    let suffix = f.strip_prefix(&p).unwrap_or_else(|| {
-        panic!(
-            "tool-call turn must extend the generation prompt.\n\
-             --- gen ---\n{p:?}\n--- follow-up ---\n{f:?}"
-        )
-    });
-    assert!(
-        suffix.starts_with(&calls_ref),
-        "emission bytes must lead the turn delta.\n\
-         --- want ---\n{calls_ref:?}\n--- got ---\n{suffix:?}"
-    );
-    assert!(
-        suffix[calls_ref.len()..].starts_with("<|im_end|>"),
-        "canonical close must follow the calls.\n{suffix:?}"
-    );
-
-    // Aging: tool response plus the next generation prompt keeps the
-    // prior render as a byte prefix.
-    let mut aged = with_turn.clone();
-    aged.messages.push(Message {
-        role: Role::User,
-        content: Content(vec![Block::ToolResult {
-            result: drama_llama::prompt::ToolResult {
-                tool_use_id: Cow::Borrowed("call00001"),
-                content: Content::text("22C, sunny"),
-                is_error: false,
-                cache_control: None,
-            },
-        }]),
-    });
-    let f_aged = template.render_with(&aged, &opts(true)).expect("render");
-    assert!(
-        f_aged.starts_with(&f),
-        "aged render must extend the prior render byte-for-byte.\n\
-         --- prior ---\n{f:?}\n--- aged ---\n{f_aged:?}"
+    assert_prefix_continuity(
+        fixture_source("qwen3.6-gguf.jinja"),
+        "<|im_end|>",
     );
 }
 
