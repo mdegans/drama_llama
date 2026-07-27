@@ -44,7 +44,7 @@
 use std::fmt::Write;
 
 use crate::grammar_compile::{
-    emit_thought_rules, escape_for_gbnf_string, json_grammar_canonical,
+    emit_thought_rules, escape_for_gbnf_string, json_grammar_lenient,
     schema_to_gbnf, FIELD_SEP, KV_SEP,
 };
 use crate::{GrammarError, Prompt, SamplingMode, Tool, ToolChoice};
@@ -351,11 +351,10 @@ pub(crate) fn build_grammar_source(
     }
     if let Some((open, close)) = opts.wrap_tags {
         // The trained layout's newlines live in the tag literals
-        // (`"<tool_call>\n"`); `ws` between tag and brace is pinned to
-        // nothing by the canonical prelude below, so the emission is
-        // exactly `<open>{…}<close>` with whatever whitespace the tags
-        // carry. The literal tag text is escaped to survive being
-        // embedded in a GBNF string literal.
+        // (`"<tool_call>\n"`); `ws` tolerates one extra whitespace
+        // char of layout drift around the JSON on top of that. The
+        // literal tag text is escaped to survive being embedded in a
+        // GBNF string literal.
         let open_lit = escape_for_gbnf_string(open);
         let close_lit = escape_for_gbnf_string(close);
         let _ = writeln!(
@@ -408,10 +407,14 @@ pub(crate) fn build_grammar_source(
         }
     }
 
-    // Standard JSON grammar — RFC 8259-ish, enough for tool arguments.
-    // This pre-dialect path has no analyzer to measure a spacing habit
-    // from, so it keeps the compact interior it has always forced.
-    src.push_str(&json_grammar_canonical(crate::JsonSpacing::Compact));
+    // Standard JSON grammar — RFC 8259-ish, enough for tool arguments,
+    // every spelling admitted. This path has no canonical-bytes
+    // contract (nothing re-renders its emissions; Session's dialect
+    // emitter owns that invariant) and no analyzer to measure a habit
+    // from, so it constrains structure only and leaves spelling to the
+    // model — see `json_grammar_lenient` for the #85-pin regression
+    // that made this explicit.
+    src.push_str(&json_grammar_lenient());
 
     src
 }
@@ -1300,6 +1303,18 @@ mod tests {
         let tokens = engine.model.tokenize(&rendered, false);
         let mut opts = PredictOptions::default().add_model_stops(&engine.model);
         opts.n = NonZeroUsize::new(256).unwrap();
+        // Seeded, and the seed always prints: this samples
+        // (locally_typical), so a failing run without its seed is an
+        // unreproducible anecdote. `DRAMA_LLAMA_SEED` replays a
+        // specific stream; otherwise entropy, same as the default
+        // path. (Added while hunting the #85 compact-pin regression,
+        // whose original failures died with their seeds.)
+        let seed: u128 = std::env::var("DRAMA_LLAMA_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| rand::random::<u128>().max(1));
+        println!("=== sampler seed: {seed} ===");
+        opts.seed = std::num::NonZeroU128::new(seed);
         opts.sample_options = SamplerConfig {
             modes: vec![forced, SamplingMode::locally_typical()],
             ..SamplerConfig::default()

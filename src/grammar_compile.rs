@@ -914,6 +914,12 @@ const KV_SEP_PERMISSIVE: &str = r#"kv_sep ::= ws ":" ws"#;
 const ELEM_SEP_PERMISSIVE: &str = r#"elem_sep ::= ws "," ws"#;
 /// Just inside `{`/`}` and `[`/`]`.
 const PAD_PERMISSIVE: &str = r"pad ::= ws";
+/// Framing whitespace, permissive, under a name the JSON rules never
+/// reference — root rules use it for the layout *around* the JSON
+/// (e.g. the `\n\n` a thinking model puts between `</think>` and its
+/// call). Appended by both prelude builders below so roots written
+/// against one compile against the other.
+const FWS_PERMISSIVE: &str = r"fws ::= [ \t\n\r]?";
 
 /// [`JSON_GRAMMAR`] with JSON-*internal* whitespace pinned to exactly
 /// one spelling per [`JsonSpacing`], plus a separate `fws` for
@@ -970,9 +976,32 @@ pub fn json_grammar_canonical(spacing: JsonSpacing) -> String {
             &format!(r#"elem_sep ::= "{}""#, spacing.elem_sep()),
         )
         .replace(PAD_PERMISSIVE, r#"pad ::= """#);
-    // Framing whitespace, permissive, under a name the JSON rules never
-    // reference.
-    out.push_str(r"fws ::= [ \t\n\r]?");
+    out.push_str(FWS_PERMISSIVE);
+    out.push('\n');
+    out
+}
+
+/// [`JSON_GRAMMAR`] as-is (every spelling admitted) plus the `fws`
+/// framing rule — for grammars with **no canonical-bytes contract**.
+///
+/// The deprecated [`grammar_for_tool_choice`] path is the consumer:
+/// nothing re-renders its emissions (the byte-stability invariant
+/// belongs to `Session`'s dialect emitter, which never routes through
+/// it), so pinning a spelling there buys no cache property — and
+/// measurably hurts. The #85 pin made it force `{"location":"` where
+/// Qwen3.6's habit is `{"location": "`, and the model, boxed out of
+/// its trained bytes, flailed inside the string's *free* region
+/// (`"}}<|im_end|>…"` — grammar-legal garbage). Deterministic repro:
+/// `DRAMA_LLAMA_SEED=4` on
+/// `tool_choice_forces_call_against_real_model`; caught by the first
+/// full ignored-tier run after the pin landed. Constrain exactly what
+/// the contract needs, nothing more.
+///
+/// [`grammar_for_tool_choice`]: crate::grammar_for_tool_choice
+#[doc(hidden)]
+pub fn json_grammar_lenient() -> String {
+    let mut out = String::from(JSON_GRAMMAR);
+    out.push_str(FWS_PERMISSIVE);
     out.push('\n');
     out
 }
