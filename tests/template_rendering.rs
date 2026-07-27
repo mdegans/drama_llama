@@ -295,34 +295,30 @@ fn enable_thinking_derives_from_prompt_thinking() {
 /// `render_reference` is a test that compares it against itself or
 /// against the parser, never against a real template render.
 ///
-/// That gap is issue #85. Cogito's template serializes call arguments
-/// with `{{ tool_call.arguments | tojson }}`, which minijinja emits
-/// compact (`"a":1`), while `render_reference` deliberately emits the
-/// spaced separators the model actually produces (`"a": 1` — see the
-/// comment in `dialect::emit::render_reference`). The two disagree, so
-/// a replayed tool-call turn does not re-render byte-stable, the
-/// prefix cache's auto-tip is discarded, and reuse collapses to the
-/// last `cache_control` breakpoint.
+/// Written failing as the acceptance criterion for the #85 fix; if it
+/// trips again, a replayed tool-call turn no longer re-renders
+/// byte-stable, the prefix cache's auto-tip is discarded, and reuse
+/// collapses to the last `cache_control` breakpoint.
 ///
-/// Two independent divergences, both measured 2026-07-27:
+/// Two independent divergences, both measured 2026-07-27, both fixed:
 ///
-/// 1. **Whitespace.** The grammar's `ws ::= [ \t\n\r]?`
-///    (`grammar_compile.rs`'s shared JSON prelude) lets the model emit
-///    `": "` where both `render_reference` and the template emit
-///    `":"`. The emission is under-determined by our own grammar.
-/// 2. **Escaping.** minijinja's `tojson` follows Jinja2 and is
-///    HTML-safe, escaping `'`, `&`, `<`, `>` to `\u0027` etc.
-///    Neither the model nor `render_reference` does.
+/// 1. **Whitespace.** The shared JSON prelude's `ws ::= [ \t\n\r]?`
+///    let the model emit `": "` where the serializer emits `":"` —
+///    the emission was under-determined by our own grammar. Fixed by
+///    `json_grammar_canonical` pinning the argument interior, with
+///    `KV_SEP`/`FIELD_SEP` shared between the grammar emitter and
+///    `render_reference` so the envelope cannot drift either.
+/// 2. **Escaping.** minijinja's `tojson` followed Jinja2 in being
+///    HTML-safe, escaping `'`, `&`, `<`, `>` to `\u0027` etc., which
+///    neither the model nor `render_reference` does. Fixed by
+///    `tojson_unescaped`.
 ///
-/// Ignored, not deleted: this asserts the invariant we intend to hold,
-/// and un-ignoring it is the acceptance criterion for the #85 fix.
-/// Earlier payloads in this file are clean ASCII, which is why the
-/// gap survived — swap the payload for a plain string and it passes.
+/// The payload carries all of those characters deliberately — every
+/// pre-#85 payload in this suite was clean ASCII, which is why the gap
+/// survived so long.
 ///
 /// Model-free: the pinned fixture template is the whole input.
 #[test]
-#[ignore = "documents #85: render_reference disagrees with the template \
-            on whitespace and HTML escaping; un-ignore when fixed"]
 fn render_reference_matches_template_tool_call_render() {
     use drama_llama::dialect::{analyze_template, render_reference};
 

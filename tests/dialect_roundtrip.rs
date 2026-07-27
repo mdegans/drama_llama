@@ -39,22 +39,69 @@ fn test_tool() -> Tool {
         .expect("valid test tool")
 }
 
+/// The payloads every fixture is swept with. `clean` is the original
+/// harness payload; `adversarial` exists because #85 hid behind clean
+/// ASCII for two weeks — it carries the characters serializers
+/// disagree about (apostrophe, `&`, `<`, `>`, a double quote, a
+/// multi-byte arrow, an embedded newline) plus a `", "` inside the
+/// string, which is byte-identical to the JSON envelope's field
+/// separator and probes parser greediness.
+fn payloads() -> [(&'static str, serde_json::Value); 2] {
+    [
+        ("clean", json!({"city": "Paris", "days": 3})),
+        (
+            "adversarial",
+            json!({
+                "city": "José's \"B&B\", floor <2> → east\nannex",
+                "days": 3,
+            }),
+        ),
+    ]
+}
+
 /// The harness: analyze the template, produce a canonical emission,
 /// parse it back, feed the parsed calls through the real template,
 /// and assert the emission bytes survive intact in the re-render.
 fn assert_reconstruction(fixture: &str, bos: &str, eos: &str) {
     let source = fixture_source(fixture);
+    assert_reconstruction_source(fixture, &source, bos, eos);
+}
+
+/// Source-taking variant for fixtures that don't live under
+/// `tests/fixtures/templates/` (cogito). Sweeps every payload.
+fn assert_reconstruction_source(
+    fixture: &str,
+    source: &str,
+    bos: &str,
+    eos: &str,
+) {
     let syntax: CallSyntax =
-        analyze_template(&source, bos, eos).expect("analyze");
+        analyze_template(source, bos, eos).expect("analyze");
     let tool = test_tool();
 
-    let input = json!({"city": "Paris", "days": 3});
-    let emission = render_reference(&syntax, &[("get_weather", &input)])
+    for (payload, input) in payloads() {
+        let fixture = &format!("{fixture}/{payload}");
+        assert_call_round_trips(
+            fixture, source, &syntax, &tool, &input, bos, eos,
+        );
+    }
+}
+
+/// One payload through one template: emission → parse → re-render.
+fn assert_call_round_trips(
+    fixture: &str,
+    source: &str,
+    syntax: &CallSyntax,
+    tool: &Tool,
+    input: &serde_json::Value,
+    bos: &str,
+    eos: &str,
+) {
+    let emission = render_reference(syntax, &[("get_weather", input)])
         .expect("representable");
 
     // Emission → blocks.
-    let parsed =
-        parse_text(&syntax, &[&tool], &emission, false, Leniency::Final);
+    let parsed = parse_text(syntax, &[tool], &emission, false, Leniency::Final);
     assert_eq!(
         parsed.status,
         ParseStatus::Complete,
@@ -76,7 +123,7 @@ fn assert_reconstruction(fixture: &str, bos: &str, eos: &str) {
         parsed.blocks
     );
     assert_eq!(calls[0].name.as_ref(), "get_weather", "{fixture}");
-    assert_eq!(calls[0].input, input, "{fixture}");
+    assert_eq!(&calls[0].input, input, "{fixture}");
     // A clean emission parses to calls ONLY — a stray Text block
     // means the parser left marker crumbs behind.
     assert!(
@@ -111,9 +158,12 @@ fn assert_reconstruction(fixture: &str, bos: &str, eos: &str) {
         tools: Some(vec![tool.clone().into()]),
         ..Default::default()
     };
-    let template =
-        ChatTemplate::from_source(source, bos.to_string(), eos.to_string())
-            .expect("template compiles");
+    let template = ChatTemplate::from_source(
+        source.to_string(),
+        bos.to_string(),
+        eos.to_string(),
+    )
+    .expect("template compiles");
     let opts = RenderOptions::default()
         .with_generation_prompt(false)
         .with_extra("enable_thinking", true);
@@ -150,6 +200,126 @@ fn reconstruct_hermes3() {
         "NousResearch-Hermes-3-Llama-3.1-8B-tool_use.jinja",
         "",
         "<|im_end|>",
+    );
+}
+
+/// Cogito (#85's template): `JsonNative` with hardcoded spaced
+/// envelope literals (`{"name": "` / `", "arguments": `) around a
+/// `tojson` argument interior. Lives at the fixtures root because
+/// `template_rendering.rs` pins byte-exact renders against the same
+/// file; byte-identical to the 32B GGUF's embedded template.
+#[test]
+fn reconstruct_cogito() {
+    assert_reconstruction_source(
+        "cogito_14b",
+        &cogito_source(),
+        "",
+        "<|im_end|>",
+    );
+}
+
+fn cogito_source() -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/cogito_14b_template.jinja"
+    );
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// The #85 cache property itself, pinned FFI-free against the STOCK
+/// cogito template: the generation-prompt render is a byte PREFIX of
+/// the follow-up render, and the delta begins with the canonical
+/// emission — so the KV laid down during generation stays reusable
+/// and the auto-tip survives the turn. Uses the adversarial payload
+/// deliberately: before `368d11e` (tojson HTML-escaping) and
+/// `86c9fe4` (canonical `ws`) this failed on exactly such bytes while
+/// clean-ASCII payloads passed.
+#[test]
+fn cogito_prefix_continuity() {
+    let source = cogito_source();
+    let syntax = analyze_template(&source, "", "<|im_end|>").expect("analyze");
+    let tool = test_tool();
+    let (_, input) = &payloads()[1];
+    let calls_ref = render_reference(&syntax, &[("get_weather", input)])
+        .expect("representable");
+    let template = ChatTemplate::from_source(
+        source,
+        String::new(),
+        "<|im_end|>".to_string(),
+    )
+    .expect("template compiles");
+    // enable_thinking=true rewrites the FRONT of cogito's prompt, so
+    // it can't change between renders here; #86 tracks the partial-
+    // render half of that. Continuity is pinned in non-thinking mode.
+    let opts = |gen: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", false)
+    };
+    let base = Prompt {
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("What's the weather in Paris?"),
+        }],
+        tools: Some(vec![tool.clone().into()]),
+        ..Default::default()
+    };
+
+    // Case 1: a bare tool-call turn extends the generation prompt,
+    // starting with the canonical emission and closing with eos.
+    let p = template.render_with(&base, &opts(true)).expect("render");
+    let mut with_turn = base.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![Block::ToolUse {
+            call: ToolUse {
+                id: Cow::Borrowed("call00001"),
+                name: Cow::Borrowed("get_weather"),
+                input: input.clone(),
+                cache_control: None,
+                caller: None,
+            },
+        }]),
+    });
+    let f = template
+        .render_with(&with_turn, &opts(false))
+        .expect("render");
+    let suffix = f.strip_prefix(&p).unwrap_or_else(|| {
+        panic!(
+            "tool-call turn must extend the generation prompt.\n\
+             --- gen ---\n{p:?}\n--- follow-up ---\n{f:?}"
+        )
+    });
+    assert!(
+        suffix.starts_with(&calls_ref),
+        "emission bytes must lead the turn delta.\n\
+         --- want ---\n{calls_ref:?}\n--- got ---\n{suffix:?}"
+    );
+    assert!(
+        suffix[calls_ref.len()..].starts_with("<|im_end|>"),
+        "canonical close must follow the calls.\n{suffix:?}"
+    );
+
+    // Case 2: aging. The tool response and the next generation prompt
+    // must keep the whole prior render as a byte prefix — this is the
+    // LCP walk that has to cross the tool turn to reach the tip.
+    let mut aged = with_turn.clone();
+    aged.messages.push(Message {
+        role: Role::User,
+        content: Content(vec![Block::ToolResult {
+            result: drama_llama::prompt::ToolResult {
+                tool_use_id: Cow::Borrowed("call00001"),
+                content: Content::text("22C, sunny"),
+                is_error: false,
+                cache_control: None,
+            },
+        }]),
+    });
+    let f_aged = template.render_with(&aged, &opts(true)).expect("render");
+    assert!(
+        f_aged.starts_with(&f),
+        "aged render must extend the prior render byte-for-byte.\n\
+         --- prior ---\n{f:?}\n--- aged ---\n{f_aged:?}"
     );
 }
 
