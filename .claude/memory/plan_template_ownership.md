@@ -1,11 +1,147 @@
 # Plan of record: owned chat templates, loading ladder, base-model fallback
 
-> **STATUS: PHASES 0–2 LANDED** (phase 2: 2026-07-27, session 2,
-> Fable). Mike confirmed the full-commitment direction in-session
-> ("Cool. Your plan.") after the #85 arc; scope details delegated.
+> **STATUS: PHASES 0–2, 4, 5b LANDED. 5a CLOSED as not-to-do.**
+> (phases 4 + 5b: 2026-07-27, session 3, Opus 5.) Mike confirmed the
+> full-commitment direction in-session ("Cool. Your plan.") after the
+> #85 arc; scope details delegated.
 > GitHub twin: [issue #88](https://github.com/mdegans/drama_llama/issues/88).
 > Supersedes the "own templates on measured need" stance argued
 > earlier the same session, and the sidecar-only distribution model.
+>
+> **Phase 3 is the remaining work**, and it is smaller and more
+> conditional than written — see session 3's progress note. Two of
+> this plan's phase premises were wrong and were corrected by
+> measurement; if you are about to implement a phase from its bullet
+> below, read session 3 first.
+
+## Progress (2026-07-27, session 3, Opus 5) — Phases 5b + 4
+
+Headline: **two phase premises in this plan were wrong.** Both were
+written from a doc comment rather than from the code, and both were
+corrected by reading the code before implementing. The general lesson
+for this arc: *the phase bullets below are hypotheses, not
+specifications.*
+
+### Phase 5b LANDED (`83fb5d3`) — but not the bug the plan described
+
+The plan said `compute_tip_extension` "creates a tip only in the
+stop-sequence branch", so grammar-complete and max-tokens endings got
+none. **False.** The discriminator is arithmetic —
+`generated_tokens.len() == kv_generated_count + 1` — and because the
+predictor decodes lazily (the token sampled on iteration *k* is
+committed by iteration *k+1*'s `decoder.step`), the last sampled token
+is uncommitted for **every** ending. All three produced a tip already.
+The method's own doc comment asserted the opposite and is what
+misled the plan; it is now corrected in place.
+
+The real defect was one level down, in *what the tip predicted*:
+
+- **stop-sequence ending** — the terminal token's piece is dropped from
+  `raw_text` by `eos_pieces`, so `canonical_close` (the render tail
+  after `raw_text`) correctly **replaces** it. Coherent.
+- **grammar-complete / max-tokens** — that piece **is** in `raw_text`
+  (pushed before the `grammar_complete()` break). The close is the tail
+  *after* it, but the code still replaced the uncommitted token,
+  **dropping a real content token from the prediction**. Stored
+  `prev_entries` said `…t₁…t_{k-1}, close`; the next turn renders
+  `…t₁…t_{k-1}, t_k, close`. The LCP died exactly *at* the tip entry,
+  `compute_l_hit`'s `safe = lcp - 1` landed one short, tip
+  disqualified.
+
+So the tip survived grammar-complete turns **on the hash path alone** —
+which is why `hash_cache_smoke` was green throughout (byte-stable
+render ⇒ hash present). Every turn whose hash missed lost it, and
+**grammar-complete is the normal ending for a tool call**.
+
+Fix is one unifying rule, smaller than the plan's: *the entries past
+the KV head are the re-render's own tokenization of everything past
+the KV head.* `uncommitted_bytes` tracks the final loop iteration's
+contribution to `raw_text`; tail = `close` after a stop, `piece +
+close` otherwise, tokenized **jointly** (the content→close seam is
+exactly where BPE merges). The truncate-then-extend already
+implemented "replace the past-KV region" — only the caller's notion of
+where the tail began was wrong.
+
+Pure core extracted to a free `tip_extension` so it is fast-tier
+testable without a model. Six pins; the grammar-complete one asserts
+the *old* close-only tail loses the tip against the same next-call
+entries, so it cannot silently regress.
+
+**Known, unchanged, deliberately tip-less**: the UTF-8 flush ending.
+`PiecePredictor` yields a piece with no new token
+(`predictor.rs`, stream-end flush), both session loops re-push
+`last_token()`, the count comes out one high, and the arithmetic check
+fails. Rare (needs a codepoint split at stream end) and safe. It also
+inflates `generated_count` — i.e. reported `output_tokens` — by one in
+that case. Not worth machinery; noted so it is not re-diagnosed.
+
+### Phase 5a CLOSED as not-to-do — no re-render contract exists
+
+The plan wanted structured output moved to the canonical prelude, "same
+latent bug when a JSON response replays as history". Measured: **there
+is no such bug.** A structured-output answer becomes a `Block::Text`,
+and `Block::Text` renders **verbatim** (`chat_template.rs`,
+`out.push_str(text)` → `content` as a plain Jinja string). Nothing
+re-serializes it — `json_canon`/`json_dumps`/`render_reference` are all
+tool-call-only paths. The byte-stability gate therefore holds for a
+structured-output turn *whatever whitespace spelling the model chose*.
+(This also independently re-confirms #85's "not `output_config`"
+finding.)
+
+Pinning it would repeat the `grammar_for_tool_choice` regression
+exactly: bytes forced where nothing re-serializes them, which the #85
+collateral measured as *degraded generation* — see
+[[cogito_tool_turn_cache_loss]]'s collateral section. **Pin bytes only
+where a re-render contract exists.** Structured output has none.
+
+Two notes if anyone reopens this: (1) a naive prelude swap would also
+over-pin *framing* whitespace, since `output_config`'s roots reference
+`ws` directly and `json_grammar_canonical` rewrites `ws ::= ""` — they
+would need moving to `fws` first, as `dialect/emit.rs` already does;
+(2) the only normalization on such a turn is around the thought
+markers, which a prelude swap does not address.
+
+### Phase 4 LANDED (`85027b3`) — drift alarm; owned Qwen template NOT needed
+
+- **Drift alarm**: `baked::nearest_stock` analyzes an unrecognized
+  embedded template and compares its `CallSyntax` against every
+  registry entry's **stock** dialect — stock-vs-stock deliberately,
+  because a replacement diverges from its stock *by design* (Cogito's
+  spacing swap), so comparing against replacements would report drift
+  on every healthy model. A hit means "same dialect, other bytes" and
+  the rung-3 warning now names the family and says a second detection
+  key would restore rung 2. Advisory by construction: analysis failure
+  ⇒ `None`, and full `CallSyntax` equality is strict, so a miss
+  degrades to the plain warning — the only failure mode it can add is
+  silence, never a wrong name.
+  - This is the mechanism for the incoming **gpt-oss 120b** case
+    already flagged in session 1: if its template does not byte-match
+    the Unsloth 20b dump, the load warning will now say so *and* name
+    gptoss, instead of a generic "unrecognized".
+- **Owned Qwen template: not needed for the stated reason.** The plan
+  filed aged-thinking continuity as "a Phase 4 owned-template
+  decision". Measured first (probe-before-own): the Qwen3.6 template
+  **already honours `preserve_thinking`**, and `Session::from_engine`
+  already sets it on every render. New fast-tier pin
+  `qwen36_aged_thinking_continuity` builds a real `Block::Thought`,
+  ages it with a **real user query** (the case `last_query_index`
+  reacts to — the existing pin ages with a tool response, which the
+  pre-scan deliberately skips) and passes on stock. Its control half
+  pins that dropping the flag *does* strip the thought, so the flag is
+  load-bearing and the pin will fire if upstream changes that.
+  - Residual, genuinely-owned-template-shaped reasons remain if we ever
+    want one: the stock template `|trim`s content and reasoning
+    irreversibly, splits on `</think>` exactly once (a second thought
+    block or a literal `</think>` in content loses the middle), and we
+    depend on an *Unsloth patch* for `preserve_thinking` — a stock
+    Qwen dump from elsewhere may lack it. None of these is urgent and
+    none is aged thinking.
+
+### Exit gate
+
+`just test ignored` — **121/121 on the real models**, run separately
+for each commit (5b's gate ran before the phase-4 edits existed, so
+attribution is clean). Fast tier 512/512.
 
 ## Progress (2026-07-27, session 2, Fable) — Phase 2, the Cogito pilot
 
@@ -241,30 +377,58 @@ Ordered so the boring load-bearing work lands before the fun rung.
   Measure: `hash_cache_smoke` n≥3, and a seed-runner A/B on post-body
   quality (the distributional worry is checkable — same seeds,
   spaced-canonical vs compact-canonical, diff the bodies).
-- **Phase 3 — promote existing sidecars.** `gemma4-cache-stable` and
-  `gptoss-cache-stable` become baked; delete the stock accommodations
-  that go dead (`ReasoningReingest::Thinking` contortions, KNOWN
-  QUIRK LCP paths); unify re-ingest on `reasoning_content`.
+- **Phase 3 — promote existing sidecars. PARTLY DONE; residue is a
+  decision, not a deletion.** The promotion itself landed back in
+  Phase 1: `GEMMA4` and `GPTOSS` are already in `baked::ALL`. What the
+  bullet still describes as mechanical cleanup is not, per session 3's
+  survey:
+  - **`ReasoningReingest::Thinking` is not dead code.** The entire
+    behavioural delta between it and `Field` is ~14 lines in
+    `chat_template.rs` (`tool_call_message`'s content-withholding
+    arm). Under the *owned* gpt-oss template, switching to `Field` is
+    byte-neutral. But rung 3 still exists, and a gpt-oss GGUF whose
+    template does **not** byte-match ours (e.g. the incoming 120b)
+    would then render merged `content` as an analysis block via the
+    stock template. So deleting it trades a real rung-3 behaviour for
+    tidiness. **Mike's call, not a mechanical cleanup** — and worth
+    deciding *after* the 120b's template is dumped and compared.
+  - **"KNOWN QUIRK" greps to zero in `src/` and `tests/`** — the
+    phrase lives only in memory docs. The gpt-oss owned template's
+    remaining `<|return|>`/`<|end|>` quirk is an *owned-template*
+    quirk, paid for by `compute_tip_extension`'s canonical tail; it is
+    not deletable and should not be confused for a stock accommodation.
+  - **The e2e sidecar flip is safe and small**: `session_gemma4.rs` and
+    `session_gptoss.rs` copy the same crate-root `templates/*.jinja`
+    bytes that `baked` `include_str!`s, verified byte-identical on
+    disk. Dropping `install_template_sidecar()` exercises rung 2
+    end-to-end and closes session 1's "no test observes rung 2 on a
+    real model" gap. Reword the "(is the template sidecar installed?)"
+    panic messages to name rung 2 when doing it.
   **Exit gate: `just test ignored`, full tier.** Phase 2's session
   learned this the hard way — the #85 compact pin sat broken for a
   whole session because the fast tier can't see grammar-vs-model
   interaction, and the tell only surfaced when the full ignored tier
   finally ran. Template/re-ingest/grammar changes get the model tier
-  before "done", every phase.
-- **Phase 4 — Qwen owned template + drift alarm.** Smallest template
-  delta. Analyzer repurposed: at load, analyze the *embedded stock*
-  template, diff its dialect against our owned one, warn on mismatch
-  — this is how we hear that upstream moved. (Analyzer's second job:
-  bootstrap for new models.)
-- **Phase 5 — finish the #85 class.** (a) Structured output moves to
-  the canonical prelude (the "phase 4" deferred in `86c9fe4` — same
-  latent bug when a JSON response replays as history; under ownership
-  that serialization is ours too). (b) **Tip creation on
-  grammar-complete and max-tokens endings** — gap (2) in
-  [[cogito_tool_turn_cache_loss]]: `compute_tip_extension` only fires
-  in the stop-sequence branch, violating the governing requirement
-  (resume identical down to RNG position) for every model. Rung 4b
-  makes this load-bearing (grammar-complete IS its normal ending).
+  before "done", every phase. (Session 3 held to this for both of its
+  commits.)
+- **Phase 4 — drift alarm. DONE (`85027b3`), see session 3.** Landed as
+  `baked::nearest_stock` + a richer rung-3 warning. The "Qwen owned
+  template" half was **retired on measurement**: stock already honours
+  `preserve_thinking`, which is the only thing aged-thinking continuity
+  needed. (Analyzer's second job — bootstrap for new models — is
+  unchanged and still available.)
+- **Phase 5 — finish the #85 class.**
+  (a) Structured output → canonical prelude: **CLOSED as not-to-do,
+  session 3.** `Block::Text` renders verbatim; there is no re-render
+  contract, so pinning would repeat the `grammar_for_tool_choice`
+  regression. Do not reopen without new evidence of a re-serializing
+  path.
+  (b) Tip on grammar-complete / max-tokens endings: **DONE
+  (`83fb5d3`)** — though the diagnosis in gap (2) of
+  [[cogito_tool_turn_cache_loss]] was wrong about the mechanism. Those
+  endings always *made* a tip; what was broken was the tip's
+  prediction. Session 3 has the correction. Rung 4b still depends on
+  this being right, and now is.
 - **Phase 6 — rung 4 + base-model completion mode (the fun one,
   deliberately last).** Driving use case: **SOUL documents** —
   personality metadata for the Agora seed runner, generated on *base*

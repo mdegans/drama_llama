@@ -154,6 +154,23 @@ or grammar-complete — `compute_tip_extension` (`:4643`) creates a tip
 only in the stop-sequence branch. (2) is backend- and model-independent
 and affects every model.
 
+> **CORRECTION (2026-07-27, session 3): gap (2)'s mechanism above is
+> wrong, and it was wrong because it trusted `compute_tip_extension`'s
+> doc comment instead of its code.** The branch predicate is arithmetic
+> (`generated_tokens.len() == kv_generated_count + 1`), and the
+> predictor's lazy decode leaves the last sampled token uncommitted for
+> *every* ending — so grammar-complete and max-tokens always DID create
+> a tip. The real defect was the tip's *prediction*: on those endings
+> the last sampled token is surfaced content, but the code still
+> replaced it with the canonical close, so `prev_entries` omitted a
+> token the next render contains, the LCP died exactly at the tip
+> entry, and `safe = lcp - 1` disqualified it. Net effect matched the
+> symptom — tip lost on the LCP path, surviving only when its hash
+> matched — which is why the wrong mechanism looked plausible. Fixed in
+> `83fb5d3`; full write-up in [[plan_template_ownership]] session 3.
+> **Generalizable**: in this file's own idiom, the doc comment is a
+> label and the code is the predicate — trust the predicate.
+
 ## Load-bearing facts about rewind (I got this wrong once)
 
 - `Engine::restore_to` does **not** require a snapshot on attention
