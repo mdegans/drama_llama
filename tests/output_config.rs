@@ -23,6 +23,7 @@ use std::{
 };
 
 use drama_llama::{Block, Content, Prompt, RenderOptions, Role, Session};
+use misanthropic::prompt::message::CacheControl;
 
 fn model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
@@ -216,4 +217,149 @@ fn whodunit_verdict() {
         "confidence deserialized to an unexpected variant: {:?}",
         verdict.confidence,
     );
+}
+
+/// A structured-output answer must survive being replayed as history.
+///
+/// This is the claim that closes #88 phase 5a. A structured-output
+/// answer parses to a [`Block::Text`], and `Block::Text` renders
+/// **verbatim** (`chat_template.rs`: `out.push_str(text)`), so nothing
+/// re-serializes the JSON and the emission re-renders byte-identically
+/// whatever whitespace spelling the model chose. That is *why* the
+/// permissive `JSON_GRAMMAR` is correct here, and why moving structured
+/// output to the canonical prelude would repeat the
+/// `grammar_for_tool_choice` regression — pinning bytes where no
+/// re-render contract exists, which we measured as degraded generation.
+///
+/// Round 2's `cache_read` exceeding round 1's entire prompt means reuse
+/// captured the assistant turn — the structured answer round-tripped.
+///
+/// Doubles as the end-to-end witness for the phase-5b tip fix on a
+/// NON-tool-call path: a structured-output turn ends on
+/// **grammar-complete** (the JSON completes the schema), which is
+/// exactly the ending whose tip prediction used to drop its last
+/// content token.
+///
+/// # Bytes round-trip; token ids do not
+///
+/// The thing this test cost a session to learn. Measured with the
+/// assistant turn UNMARKED: the tip was created at the right position
+/// and its hash was present (so the emission genuinely re-rendered
+/// byte-stable — the claim above holds), and reuse was still **zero**,
+/// because the LCP walk died 2 entries into a 254-token emission.
+///
+/// Grammar-constrained generation is emitted in a NON-canonical BPE
+/// segmentation: the grammar masks a longer merged token whenever it
+/// would overshoot the allowed next characters, so the model's token
+/// sequence is not the one the tokenizer produces from the same bytes.
+/// `prev_entries` holds the emitted ids, `new_entries` holds the
+/// re-tokenized render, and `compute_l_hit` compares ids.
+///
+/// So the hash path is not an optimization here, it is the only path
+/// that works, and it needs a breakpoint at the tip position — i.e. the
+/// caller must mark the assistant turn's last block, which is exactly
+/// what `hash_cache_smoke`'s `mark_last_block` does. Unconstrained prose
+/// is not exposed to this (its segmentation is canonical), which is why
+/// the plain-turn suites reuse happily without marking.
+///
+/// Unseeded deliberately — a forced seed forks every call and discards
+/// the KV-paired snapshot the resume path needs (see `whodunit_verdict`
+/// above for the contrast).
+#[test]
+#[ignore = "requires model"]
+fn structured_output_round_trips_as_history() {
+    const SYSTEM: &str = "You are a brief, decisive detective. Answer \
+                          ONLY with the structured verdict as JSON \
+                          matching the given schema. Do not explain.";
+
+    let mut session = Session::from_path_with_n_ctx(model_path(), 8192)
+        .expect("session load")
+        .quiet()
+        // Thinking off so the emission is pure JSON. The thought path
+        // has its own normalization (`parse_thought` trims, the
+        // renderer re-emits bare markers) which is shared with every
+        // prose turn and is NOT what this test is about.
+        .with_render_opts(
+            RenderOptions::default()
+                .with_generation_prompt(true)
+                .with_extra("enable_thinking", false)
+                .with_extra("preserve_thinking", true),
+        )
+        .with_prefix_cache(true);
+
+    let round1 = Prompt::default()
+        .max_tokens(NonZeroU32::new(1024).unwrap())
+        .structured_output::<CaseFile>()
+        .system(SYSTEM)
+        .add_message((Role::User, Content::text(SCENARIO)))
+        .expect("add_message");
+
+    let r1 = session.complete_response(&round1).expect("round 1");
+    let r1_input = r1.usage.input_tokens;
+    eprintln!(
+        "round 1: input_tokens={}, output_tokens={}",
+        r1_input, r1.usage.output_tokens
+    );
+    let _: CaseFile = r1.json().expect("round 1 deserializes");
+
+    // Round 2 replays round 1's content VERBATIM — substituting a
+    // re-serialized value would test our serializer, not the
+    // round-trip.
+    //
+    // The assistant turn's last block carries `cache_control`, and
+    // that is load-bearing rather than decorative: it puts a
+    // *hash-keyed* breakpoint at the tip position. Grammar-constrained
+    // output is emitted in a NON-canonical BPE segmentation (the
+    // grammar masks a longer merged token whenever it would overshoot
+    // the allowed next characters), so the re-render's tokenization
+    // differs from the emitted token ids even though the bytes are
+    // identical — measured: LCP died 2 tokens into an unmarked
+    // 254-token JSON emission. The LCP walk compares token ids and
+    // cannot survive that; the hash path compares renders and can.
+    let mut assistant = r1.inner.content.clone();
+    if let Some(Block::Text { cache_control, .. }) = assistant.last_mut() {
+        *cache_control = Some(CacheControl::ephemeral());
+    }
+
+    let round2 = Prompt::default()
+        .max_tokens(NonZeroU32::new(1024).unwrap())
+        .structured_output::<CaseFile>()
+        .system(SYSTEM)
+        .add_message((Role::User, Content::text(SCENARIO)))
+        .expect("add_message")
+        .add_message((Role::Assistant, assistant))
+        .expect("add_message")
+        .add_message((
+            Role::User,
+            Content::text(
+                "Re-check that verdict against the alibis and answer \
+                 again.",
+            ),
+        ))
+        .expect("add_message");
+
+    let r2 = session.complete_response(&round2).expect("round 2");
+    let r2_read = r2.usage.cache_read_input_tokens.unwrap_or(0);
+    eprintln!(
+        "round 2: input_tokens={}, cache_read={}",
+        r2.usage.input_tokens, r2_read
+    );
+
+    assert!(
+        r2_read > r1_input,
+        "structured-output turn did not round-trip: round 2 reused \
+         {r2_read} tokens, which does not exceed round 1's whole \
+         prompt ({r1_input}). With no cache_control anywhere the tip \
+         is the only anchor, so this means the assistant turn failed \
+         to re-render byte-stably or the tip was disqualified."
+    );
+
+    // Cache stats are not a proxy for output (the 2026-07-24
+    // stale-matcher-carry regression read green on reuse while
+    // emitting nothing).
+    assert!(
+        r2.usage.output_tokens > 0,
+        "round 2 produced no tokens despite reusing {r2_read}"
+    );
+    let _: CaseFile = r2.json().expect("round 2 deserializes");
 }

@@ -94,12 +94,92 @@ collateral measured as *degraded generation* — see
 [[cogito_tool_turn_cache_loss]]'s collateral section. **Pin bytes only
 where a re-render contract exists.** Structured output has none.
 
-Two notes if anyone reopens this: (1) a naive prelude swap would also
-over-pin *framing* whitespace, since `output_config`'s roots reference
-`ws` directly and `json_grammar_canonical` rewrites `ws ::= ""` — they
-would need moving to `fws` first, as `dialect/emit.rs` already does;
-(2) the only normalization on such a turn is around the thought
-markers, which a prelude swap does not address.
+### Measured follow-up (same session, Mike's prompt: "so structured output *will* still round-trip then?")
+
+**Yes — the bytes. No — the token ids.** This distinction is the whole
+finding, and it took a real measurement to see, because the analysis
+above is correct and still predicts the wrong practical outcome.
+
+New model-backed pin `structured_output_round_trips_as_history`
+(`tests/output_config.rs`). Run first with the assistant turn
+**unmarked**, instrumented at `select_slot`:
+
+    prev_len=581 new_len=605 lcp=327
+    tip=Some(EntryPos { entry: 578, pos: 578 }) tip_hashed=true
+    n_bp_hashes=0 hit_entry=0     →  cache_read = 0
+
+Read that carefully: the tip exists, sits at the right position, and
+**its hash is present** — which means `render_extended` reproduced the
+emission byte-for-byte and the byte-stability gate passed. The
+round-trip claim is confirmed, not refuted. And reuse was still
+**zero**, because the prompt was 325 entries and the LCP died at 327 —
+*two tokens into a 254-token emission*.
+
+**Cause: grammar-constrained generation emits a NON-canonical BPE
+segmentation.** The grammar masks a longer merged token whenever it
+would overshoot the allowed next characters, so the model's token
+sequence is not what the tokenizer produces from the same bytes.
+`prev_entries` holds the emitted ids; `new_entries` holds the
+re-tokenized render; `compute_l_hit` compares ids. Identical bytes,
+different segmentation, dead walk.
+
+So for any grammar-constrained turn — structured output **and tool
+calls** — the hash path is not an optimization, it is the only path
+that works, and it needs a breakpoint at the tip position: the caller
+must mark the assistant turn's last block. That is exactly what
+`hash_cache_smoke`'s `mark_last_block` does, and why that suite has
+always passed while an unmarked equivalent gets nothing. Marking it
+here took the same test to `hit_entry=593, cache_read=593`.
+
+**Consequence for Agora / blallama** (flagged for Mike, not acted on):
+if the seed runner does not put `cache_control` on the assistant turn
+it replays, structured and tool turns will not reuse — regardless of
+everything else in this plan. Unconstrained prose is unaffected (its
+segmentation is canonical), which is why plain chat reuses happily
+without marking and hid this.
+
+**Open design question, deliberately not answered here**: the tip
+carries a hash, but `hash_keyed_l_hit` only compares it against
+breakpoint hashes the *new call declares*. We could instead hash the
+new call's prefix at the tip's own entry and compare directly, making
+tip reuse survive BPE drift with no marking required. That is a real
+improvement and a real design change — Mike's call, not a bugfix to
+slip in.
+
+---
+
+On the whitespace question specifically: **the JSON serialization
+round-trips unconditionally, because we never re-serialize it.** The
+whitespace *around* it is a separate matter, and there are two seams on
+such a turn that are not the JSON body:
+
+1. **A thought prefix** (`allow_thought` ⇒ `root ::= thought? ws
+   output_schema`) *is* normalized: `parse_thought` strips a leading
+   `\n`, `trim_end()`s the body and swallows one `\n` after the close
+   (`parse.rs:609-618`), while the renderer re-emits bare
+   `<think>`/`</think>` and lets the template lay out its own newlines
+   (`chat_template.rs:1114-1117`). Shared with every prose turn; a
+   prelude swap does not address it.
+2. **Template-level `|trim`.** `ws ::= [ \t\n\r]?`
+   (`grammar_compile.rs:878`) permits one whitespace char before the
+   JSON, and e.g. Qwen3.6's template does
+   `render_content(message.content, true)|trim`. If the model takes
+   that character, emission and render disagree by one byte, the
+   byte-stability gate fails, and the turn falls to the LCP walk.
+
+If (2) ever bites, the fix is *not* this phase: pin that single leading
+`ws` to empty (no trained habit is being fought there) rather than
+swapping the whole prelude, which would also pin the JSON interior
+where the model DOES have a habit — the exact mistake #85's collateral
+measured. A prelude swap would additionally over-pin framing
+whitespace, since these roots reference `ws` directly and
+`json_grammar_canonical` rewrites `ws ::= ""`; they would need moving
+to `fws` first, as `dialect/emit.rs` already does.
+
+Unmeasured oddity noticed in passing, pre-existing and unrelated: with
+`allow_thought` that same `ws` sits between `</think>` and the JSON and
+admits only ONE whitespace char, so the `\n\n` a thinking model is
+trained to emit there is not grammar-legal today.
 
 ### Phase 4 LANDED (`85027b3`) — drift alarm; owned Qwen template NOT needed
 

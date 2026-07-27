@@ -463,6 +463,63 @@ fn qwen36_aged_thinking_continuity() {
     );
 }
 
+/// Prefix continuity for a PLAIN TEXT assistant turn on Qwen3.6 — the
+/// structured-output shape (a JSON answer is just a `Block::Text`), and
+/// the shape `Session`'s byte-stability gate checks on every
+/// non-tool-call turn.
+///
+/// Renders exactly what the session does: generation prompt, then the
+/// same conversation with the assistant turn seated, under the extras
+/// `Session` sets by default (`preserve_thinking`) plus thinking off.
+#[test]
+fn qwen36_plain_text_turn_prefix_continuity() {
+    let template = ChatTemplate::from_source(
+        fixture_source("qwen3.6-gguf.jinja"),
+        String::new(),
+        "<|im_end|>".to_string(),
+    )
+    .expect("template compiles");
+    let opts = |gen: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", false)
+            .with_extra("preserve_thinking", true)
+    };
+    let answer = r#"{"culprit": "Mr. Crane", "confidence": "High"}"#;
+    let base = Prompt {
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("Who did it?"),
+        }],
+        ..Default::default()
+    };
+    let p = template.render_with(&base, &opts(true)).expect("render");
+    let mut with_turn = base.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![Block::Text {
+            text: Cow::Borrowed(answer),
+            cache_control: None,
+            citations: None,
+        }]),
+    });
+    let f = template
+        .render_with(&with_turn, &opts(false))
+        .expect("render");
+    let suffix = f.strip_prefix(&p).unwrap_or_else(|| {
+        panic!(
+            "a plain-text turn must extend the generation prompt \
+             (this is the session's byte-stability gate).\n\
+             --- gen ---\n{p:?}\n--- follow-up ---\n{f:?}"
+        )
+    });
+    assert!(
+        suffix.starts_with(answer),
+        "the emission must lead the turn delta verbatim.\n\
+         --- want ---\n{answer:?}\n--- got ---\n{suffix:?}"
+    );
+}
+
 #[test]
 fn reconstruct_qwen3_chat() {
     assert_reconstruction("Qwen-Qwen3-0.6B.jinja", "", "<|im_end|>");
