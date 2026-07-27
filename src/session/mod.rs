@@ -2385,13 +2385,39 @@ impl<B: Backend> Session<B> {
                         ),
                     }
                 }
-                None => tracing::warn!(
-                    "chat template: no baked replacement matches this \
-                     model's embedded template; using it as-is \
-                     (best-effort tier — round-trip byte-stability \
-                     depends on the stock template's quality). A \
-                     *.template.jinja sidecar overrides."
-                ),
+                // Drift alarm (#88 phase 4): byte-equality having
+                // failed, ask whether this is nonetheless a family we
+                // own — a template we could serve cache-stably if we
+                // had its bytes as a second detection key.
+                None => {
+                    let model = &session.engine.model;
+                    let bos = model.token_to_piece(model.bos());
+                    let eos = model.token_to_piece(model.eos());
+                    match crate::baked::nearest_stock(&embedded, &bos, &eos) {
+                        Some(near) => tracing::warn!(
+                            "chat template: this model's embedded \
+                             template is not byte-equal to any baked \
+                             stock, but analyzes to the SAME dialect as \
+                             '{}' — upstream or the quantizer edited \
+                             it. Using it as-is (best-effort tier). If \
+                             the edit is cosmetic, adding this dump as \
+                             a second detection key for '{}' restores \
+                             the cache-stable path; a *.template.jinja \
+                             sidecar overrides either way.",
+                            near.name,
+                            near.name
+                        ),
+                        None => tracing::warn!(
+                            "chat template: no baked replacement \
+                             matches this model's embedded template, \
+                             and it analyzes to no dialect we own; \
+                             using it as-is (best-effort tier — \
+                             round-trip byte-stability depends on the \
+                             stock template's quality). A \
+                             *.template.jinja sidecar overrides."
+                        ),
+                    }
+                }
             }
         }
         Ok(session)

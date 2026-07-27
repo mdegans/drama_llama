@@ -115,6 +115,46 @@ pub fn detect(embedded: &str) -> Option<&'static BakedTemplate> {
     ALL.iter().copied().find(|b| b.stock.trim_end() == embedded)
 }
 
+/// Drift alarm: did upstream move a template we own?
+///
+/// [`detect`] is byte-equality, so a vendor re-quant that touches a
+/// single comment falls all the way through to the best-effort tier.
+/// That is the right call — see the never-fuzzy rule above — but it is
+/// mute about the far more useful fact that the template is otherwise
+/// one we already own and have a cache-stable replacement for.
+///
+/// This is the second opinion: analyze the unrecognized template into a
+/// [`CallSyntax`](crate::CallSyntax) and compare it against every
+/// registry entry's *stock* dialect. A hit means "same dialect, other
+/// bytes" — upstream or the quantizer edited the template, and adding
+/// its dump as a second detection key is very likely all that is needed
+/// to restore rung 2.
+///
+/// **Stock against stock, deliberately.** A replacement diverges from
+/// its stock *by design* (Cogito's spacing swap is the entire point of
+/// #88 phase 2), so comparing an embedded template against replacements
+/// would report drift on every healthy model.
+///
+/// Best-effort and advisory: an analysis failure on either side is a
+/// `None`, never an error, and full [`CallSyntax`](crate::CallSyntax)
+/// equality is a deliberately strict predicate — a miss degrades to the
+/// plain rung-3 warning we would have printed anyway, so the only
+/// failure this can introduce is silence, never a wrong name.
+///
+/// Costs a few dozen model-free minijinja renders per registry entry,
+/// paid once at load and only on the unrecognized path.
+pub fn nearest_stock(
+    embedded: &str,
+    bos: &str,
+    eos: &str,
+) -> Option<&'static BakedTemplate> {
+    let theirs = crate::dialect::analyze_template(embedded, bos, eos).ok()?;
+    ALL.iter().copied().find(|b| {
+        crate::dialect::analyze_template(b.stock, bos, eos)
+            .is_ok_and(|ours| ours == theirs)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +171,36 @@ mod tests {
             let hit = detect(&trailing).expect("trailing newline tolerated");
             assert_eq!(hit.name, baked.name);
         }
+    }
+
+    /// The drift alarm names the family a byte-drifted template still
+    /// belongs to. A trailing Jinja comment renders to nothing, so the
+    /// dialect is untouched, but the bytes differ everywhere `detect`
+    /// looks — exactly the "vendor touched the template" shape.
+    #[test]
+    fn nearest_stock_names_the_drifted_family() {
+        for baked in ALL {
+            let drifted = format!("{}{{# vendor patch #}}", baked.stock);
+            assert!(
+                detect(&drifted).is_none(),
+                "{}: byte detection must still reject this",
+                baked.name
+            );
+            let near = nearest_stock(&drifted, "", "<|im_end|>")
+                .unwrap_or_else(|| {
+                    panic!("{}: drift alarm must recognize it", baked.name)
+                });
+            assert_eq!(near.name, baked.name);
+        }
+    }
+
+    /// The alarm stays quiet on a template that is not ours, so a
+    /// genuinely new model gets the plain best-effort warning rather
+    /// than a confidently wrong family name.
+    #[test]
+    fn nearest_stock_is_silent_on_a_foreign_template() {
+        let foreign = "{% for m in messages %}{{ m.content }}\n{% endfor %}";
+        assert!(nearest_stock(foreign, "", "</s>").is_none());
     }
 
     /// A near-miss must fall through — this is the never-fuzzy rule.

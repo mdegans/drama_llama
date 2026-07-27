@@ -368,6 +368,101 @@ fn qwen36_prefix_continuity() {
     );
 }
 
+/// Aged-*thinking* continuity for Qwen3.6 — the gap
+/// [`qwen36_prefix_continuity`] deliberately leaves open: it ages by a
+/// tool response (which the stock template's `last_query_index`
+/// pre-scan skips) and never builds a thought block at all.
+///
+/// The plan of record filed this as "a Phase 4 owned-template
+/// decision". Measured here first, per the arc's probe-before-own
+/// discipline, and the answer is that **stock is already cache-stable
+/// on this axis**: the Qwen3.6 template honours `preserve_thinking`,
+/// and `Session::from_engine` sets it on every render. Aged thinking
+/// alone does not justify an owned Qwen template — a result, not an
+/// absence of one.
+///
+/// The second half pins *why* the flag is load-bearing: without it the
+/// same history re-renders without its thought block as soon as a real
+/// user query ages it, breaking the prefix and re-prefilling
+/// everything from that turn on.
+#[test]
+fn qwen36_aged_thinking_continuity() {
+    let template = ChatTemplate::from_source(
+        fixture_source("qwen3.6-gguf.jinja"),
+        String::new(),
+        "<|im_end|>".to_string(),
+    )
+    .expect("template compiles");
+    let opts = |gen: bool, preserve: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", false)
+            .with_extra("preserve_thinking", preserve)
+    };
+    let thought = "Paris is in France, so I want European weather.";
+    let turn = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("What's the weather in Paris?"),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![
+                    Block::Thought {
+                        thought: Cow::Borrowed(thought),
+                        signature: Cow::Borrowed(""),
+                    },
+                    Block::Text {
+                        text: Cow::Borrowed("22C and sunny."),
+                        cache_control: None,
+                        citations: None,
+                    },
+                ]),
+            },
+        ],
+        ..Default::default()
+    };
+    // Age it with a REAL user query — the case `last_query_index`
+    // reacts to, unlike the tool response the other pin uses.
+    let mut aged = turn.clone();
+    aged.messages.push(Message {
+        role: Role::User,
+        content: Content::text("And in London?"),
+    });
+
+    let f = template
+        .render_with(&turn, &opts(false, true))
+        .expect("render");
+    assert!(
+        f.contains(thought),
+        "thought must survive its own turn's render.\n{f:?}"
+    );
+    let f_aged = template
+        .render_with(&aged, &opts(true, true))
+        .expect("render");
+    assert!(
+        f_aged.starts_with(&f),
+        "aged render must extend the prior render byte-for-byte.\n\
+         --- prior ---\n{f:?}\n--- aged ---\n{f_aged:?}"
+    );
+
+    // Control: drop the flag and the same history loses its thought.
+    let stripped = template
+        .render_with(&aged, &opts(true, false))
+        .expect("render");
+    assert!(
+        !stripped.contains(thought),
+        "control: stock must strip aged thinking without \
+         preserve_thinking — if this fires, the template changed and \
+         the flag may no longer be load-bearing.\n{stripped:?}"
+    );
+    assert!(
+        !stripped.starts_with(&f),
+        "control: the stripped render cannot be prefix-continuous"
+    );
+}
+
 #[test]
 fn reconstruct_qwen3_chat() {
     assert_reconstruction("Qwen-Qwen3-0.6B.jinja", "", "<|im_end|>");
