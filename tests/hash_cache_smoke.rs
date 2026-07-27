@@ -13,11 +13,10 @@
 //! input_tokens for the round-2 prefill regardless of any
 //! BPE-whitespace drift in the assistant block.
 //!
-//! Requires a real model. Set `DRAMA_LLAMA_COGITO_MODEL` to a cogito-
-//! style GGUF for the most direct repro of the original bug; falls
-//! back to `models/model.gguf` (any tool-using chat model works for
-//! the hash-side-table mechanic — cogito is just where the whitespace
-//! divergence is most pronounced).
+//! Requires a **cogito-family** model: `DRAMA_LLAMA_COGITO_MODEL`, or
+//! `models/cogito-32b.gguf`. Skips loudly when absent — it must NOT
+//! fall back to `models/model.gguf`. See `model_path` for the incident
+//! that motivated this.
 //!
 //! Ignored by default: `cargo test --test hash_cache_smoke -- --ignored`.
 
@@ -32,11 +31,29 @@ use drama_llama::{
 use misanthropic::prompt::message::CacheControl;
 use serde_json::json;
 
-fn model_path() -> PathBuf {
+/// The cogito-family model this suite needs, or `None` to skip.
+///
+/// **Deliberately does not fall back to `models/model.gguf`.** It used
+/// to, and that made this test actively misleading: the assertion below
+/// was failing for cogito while passing in CI, because the runner's
+/// `model.gguf` is a Qwen, which renders tool calls as
+/// `<parameter=…>` tags — no JSON envelope, so nothing to disagree
+/// about, so the bug this test exists to catch cannot occur there. A
+/// model-backed test that silently substitutes a different model is
+/// coverage of whichever model the runner happens to hold.
+///
+/// Cogito does not fit the CI box's 3090, so skipping is the intended
+/// outcome there; the dialect-level invariant is covered without
+/// weights by `canonical_call_grammar_admits_render_reference` and
+/// friends, which run in the fast tier.
+fn model_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("DRAMA_LLAMA_COGITO_MODEL") {
-        return PathBuf::from(p);
+        let p = PathBuf::from(p);
+        return p.exists().then_some(p);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
+    let conventional = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models/cogito-32b.gguf");
+    conventional.exists().then_some(conventional)
 }
 
 /// Build the round-1 prompt: a tool, a system prompt, and a user
@@ -125,7 +142,16 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
     // transcripts genuinely diverge at the assistant turn, and the
     // auto-tip correctly cannot fire — reuse stops at the divergence.
     // Byte-stable rendering is the contract the tip mechanic needs.
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+    let Some(model) = model_path() else {
+        eprintln!(
+            "SKIP hash_keyed_prefix_reuse_carries_across_tool_use_round_trip: \
+             no cogito-family model. Set DRAMA_LLAMA_COGITO_MODEL or place \
+             models/cogito-32b.gguf. This suite is dialect-specific — see \
+             `model_path` for why it must not fall back to models/model.gguf."
+        );
+        return;
+    };
+    let mut session = drama_llama::LlamaCppSession::from_path(model)
         .expect("model loads")
         .quiet()
         .with_render_opts(
