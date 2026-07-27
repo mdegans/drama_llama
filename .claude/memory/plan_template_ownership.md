@@ -1,11 +1,52 @@
 # Plan of record: owned chat templates, loading ladder, base-model fallback
 
-> **STATUS: APPROVED, NOT STARTED** (2026-07-27). Mike confirmed the
-> full-commitment direction in-session ("Cool. Your plan.") after the
-> #85 arc; scope details delegated. GitHub twin:
-> [issue #88](https://github.com/mdegans/drama_llama/issues/88).
+> **STATUS: PHASES 0–1 LANDED** (2026-07-27, same session as
+> approval). Mike confirmed the full-commitment direction in-session
+> ("Cool. Your plan.") after the #85 arc; scope details delegated.
+> GitHub twin: [issue #88](https://github.com/mdegans/drama_llama/issues/88).
 > Supersedes the "own templates on measured need" stance argued
 > earlier the same session, and the sidecar-only distribution model.
+
+## Progress (2026-07-27, session 1, Fable)
+
+- **Phase 0 LANDED** (`ce39ebe` + `c12ec4b`): the #85 acceptance pin
+  (`render_reference_matches_template_tool_call_render`) was still
+  `#[ignore]`d post-fix — un-ignored, doc rewritten to pin the fix.
+  `assert_reconstruction` now sweeps every fixture with a second
+  **adversarial payload** (`'`, `&`, `<`, `>`, `"`, `→`, embedded
+  newline, `", "` inside a string) — all 11 fixtures pass both.
+  Cogito joined the harness (`reconstruct_cogito`,
+  `cogito_prefix_continuity` — the #85 cache property FFI-free), and
+  Qwen3.6 got the same continuity pin (non-thinking; aged-thinking
+  continuity is a Phase 4 owned-template decision). NOTE the payload
+  sweep found **zero** live bugs — the #85 fixes hold across every
+  family, including gemma4's dict quoting and Qwen raw values.
+- **Phase 1 LANDED** (`5b447e0`): `src/baked.rs` registry
+  (`BakedTemplate { name, stock, replacement }`, `detect()` by
+  trailing-whitespace-insensitive **byte-equality** with the stock
+  dump — never fuzzy; unit-pinned incl. near-miss fall-through and
+  replacements-never-keys). Templates moved to crate-root
+  `templates/` (shipped via `include_str!`; provenance in
+  `templates/README.md`). `Session::from_engine` runs rungs 2–3:
+  baked replacement applies through `set_template_source` (dialect
+  re-analyzes in lockstep), unrecognized templates warn as the
+  best-effort tier. Sidecar appliers run after in `from_path_with`,
+  so rung 1 still wins. e2e suites keep installing sidecars —
+  deliberately, they now exercise rung 1 over identical baked bytes.
+  - **Lockstep gap found and fixed**: `with_dialect` and
+    `set_template_source` refreshed `thought_reingest` but left
+    `render_opts.reasoning_start` stale — harmless so far only
+    because every current override keeps the template's reasoning
+    markers. Both now refresh it.
+  - **Detection keys verified against the real GGUFs** (scratchpad
+    GGUF-metadata reader, no model load): gemma-4-31B and
+    gpt-oss-20b embedded templates byte-match `templates/*-gguf
+    .jinja`, and cogito-32b matches the 14b fixture. Rung 2 fires
+    for both fleet models in production.
+  - **Open verification**: no test yet loads a real model and
+    observes rung 2 end-to-end (gemma/gptoss e2e pin rung 1). The
+    Phase 3 e2e flip (drop the sidecar installs, assert baked
+    covers them) closes this on the model boxes.
 
 ## Why (the short causal chain)
 
