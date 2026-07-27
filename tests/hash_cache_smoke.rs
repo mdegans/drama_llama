@@ -133,24 +133,17 @@ fn mark_last_block(content: &mut Content) {
     }
 }
 
-#[test]
-#[ignore = "requires model; sets DRAMA_LLAMA_COGITO_MODEL or models/model.gguf"]
-fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
-    // `preserve_thinking` keeps prior-turn reasoning in re-renders.
-    // Without it, think-stripping templates (Qwen3.5/3.6) render round
-    // 2's transcript with different bytes than round 1 generated, the
-    // transcripts genuinely diverge at the assistant turn, and the
-    // auto-tip correctly cannot fire — reuse stops at the divergence.
-    // Byte-stable rendering is the contract the tip mechanic needs.
-    let Some(model) = model_path() else {
-        eprintln!(
-            "SKIP hash_keyed_prefix_reuse_carries_across_tool_use_round_trip: \
-             no cogito-family model. Set DRAMA_LLAMA_COGITO_MODEL or place \
-             models/cogito-32b.gguf. This suite is dialect-specific — see \
-             `model_path` for why it must not fall back to models/model.gguf."
-        );
-        return;
-    };
+/// The tip/hash mechanic across a tool-call round trip, on whatever
+/// model is given. Both tests below are this body — see them for what
+/// each one is actually claiming.
+///
+/// `preserve_thinking` keeps prior-turn reasoning in re-renders.
+/// Without it, think-stripping templates (Qwen3.5/3.6) render round
+/// 2's transcript with different bytes than round 1 generated, the
+/// transcripts genuinely diverge at the assistant turn, and the
+/// auto-tip correctly cannot fire — reuse stops at the divergence.
+/// Byte-stable rendering is the contract the tip mechanic needs.
+fn assert_tip_survives_tool_round_trip(model: PathBuf) {
     let mut session = drama_llama::LlamaCppSession::from_path(model)
         .expect("model loads")
         .quiet()
@@ -256,4 +249,42 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
         !round2_resp.inner.content.0.is_empty(),
         "round 2 returned an empty content array",
     );
+}
+
+/// The mechanic, on whatever `models/model.gguf` is — a Qwen on the CI
+/// box. Model-agnostic: it proves the auto-tip and hash side-table work
+/// across a tool-call round trip at all.
+///
+/// It does **not** prove #85 is fixed. Qwen renders tool calls as
+/// `<parameter=…>` tags with no JSON envelope, so the whitespace
+/// divergence that bug is about cannot occur here. This test passed
+/// throughout the entire period #85 was broken.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
+    let default =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+    assert_tip_survives_tool_round_trip(default);
+}
+
+/// The same mechanic on a cogito-family model — a `JsonNative` dialect
+/// whose template routes arguments through `tojson`, which is where the
+/// canonical-JSON invariant actually gets tested.
+///
+/// Skips when no such model is present; cogito does not fit the CI
+/// box's 3090. The dialect-level invariant is covered without weights
+/// by `canonical_call_grammar_admits_render_reference` and friends in
+/// the fast tier, so this skipping is not a coverage hole — it is the
+/// end-to-end confirmation, not the guard.
+#[test]
+#[ignore = "long running, requires a cogito-family model"]
+fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip_cogito() {
+    let Some(model) = model_path() else {
+        eprintln!(
+            "SKIP ..._cogito: no cogito-family model. Set \
+             DRAMA_LLAMA_COGITO_MODEL or place models/cogito-32b.gguf."
+        );
+        return;
+    };
+    assert_tip_survives_tool_round_trip(model);
 }
