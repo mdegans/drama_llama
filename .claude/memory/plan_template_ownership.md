@@ -61,13 +61,18 @@
 - **Deprecated `ToolChoiceOptions` path stays Compact** (explicit
   arg) — it has no analyzer to measure with, and adding a pub field
   would break 0.8 struct literals.
-- **Latent, noted not fixed** (pre-existing, out of scope):
-  (1) `fun_name_is_key` JsonNative: grammar envelope (`KV_SEP`) vs
+- **Latent, noted not fixed** (pre-existing, out of scope; filed
+  2026-07-27 at Mike's request — slated for end-of-arc or just
+  after, mid-arc only if they block):
+  (1) [issue #89](https://github.com/mdegans/drama_llama/issues/89)
+  `fun_name_is_key` JsonNative: grammar envelope (`KV_SEP`) vs
   compact render disagree under Compact — no current model hits it;
-  comment at the render site. (2) Container-valued `enum:`/`const:`
-  schema literals embed compact bytes in rules, so they'd mismatch a
-  Spaced dialect — schemars-derived tools only produce scalar
-  literals; documented on `json_grammar_canonical`.
+  comment at the render site.
+  (2) [issue #90](https://github.com/mdegans/drama_llama/issues/90)
+  Container-valued `enum:`/`const:` schema literals embed compact
+  bytes in rules, so they'd mismatch a Spaced dialect —
+  schemars-derived tools only produce scalar literals; documented on
+  `json_grammar_canonical`.
 - **Verified on the real model** (M2 Max, cogito-32b): cogito
   hash_cache_smoke n=3, deterministic — round 2 `cache_read = 196`
   vs round 1 `input_tokens = 170`, tip alive. Plus a **rung-2
