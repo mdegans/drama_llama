@@ -283,12 +283,13 @@ pub fn load_call_syntax(
 /// Discovery convention mirrors the other sidecars: sibling file at
 /// `<model>.template.jinja` for GGUF (`model.gguf` →
 /// `model.template.jinja`), `parent/template.jinja` for moeflux. No
-/// default is auto-written — the embedded template *is* the default;
-/// a sidecar exists to patch serving-side template bugs (e.g. the
-/// vendored `gemma4-cache-stable.jinja`, which fixes Gemma 4's
-/// re-ingest path dropping the thinking channel and breaking
-/// KV-cache byte-stability). The dialect analyzer re-runs against
-/// the override so grammar/parse/render stay in lockstep.
+/// default is auto-written — a recognized model gets its baked
+/// replacement automatically ([`crate::baked`], rung 2 of the
+/// loading ladder) and the embedded template is the fallback; a
+/// sidecar is the explicit per-install override (rung 1) for
+/// patching a template neither of those got right. The dialect
+/// analyzer re-runs against the override so grammar/parse/render
+/// stay in lockstep.
 pub fn load_template_source(
     path: &Path,
 ) -> Result<Option<String>, SidecarError> {

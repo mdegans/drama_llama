@@ -8,12 +8,15 @@ use drama_llama::dialect::{
 };
 
 fn analyze(fixture: &str, bos: &str, eos: &str) -> CallSyntax {
-    let path = format!(
-        "{}/tests/fixtures/templates/{fixture}",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {path}: {e}"));
+    // Vendored fixtures live under `tests/fixtures/templates/`; the
+    // fleet templates were promoted to shipped artifacts in crate-root
+    // `templates/` (the `baked` registry, #88) and resolve from there.
+    let root = env!("CARGO_MANIFEST_DIR");
+    let fixture_path = format!("{root}/tests/fixtures/templates/{fixture}");
+    let baked_path = format!("{root}/templates/{fixture}");
+    let source = std::fs::read_to_string(&fixture_path)
+        .or_else(|_| std::fs::read_to_string(&baked_path))
+        .unwrap_or_else(|e| panic!("read {fixture_path} | {baked_path}: {e}"));
     analyze_template(&source, bos, eos)
         .unwrap_or_else(|e| panic!("analyze {fixture}: {e}"))
 }

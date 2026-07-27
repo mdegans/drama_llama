@@ -85,6 +85,8 @@ pub use output_config::{
 pub mod dialect;
 pub use dialect::CallSyntax;
 
+pub mod baked;
+
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp;
 #[cfg(feature = "llama-cpp")]

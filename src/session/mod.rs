@@ -2253,6 +2253,43 @@ impl<B: Backend> Session<B> {
             rep.extend_ignored(session.engine.model.special_tokens());
         }
         session.refresh_emit_ban();
+        // Rungs 2–3 of the template loading ladder (see [`crate::baked`]).
+        // A recognized embedded template gets its baked cache-stable
+        // replacement through [`Self::set_template_source`], so the
+        // dialect re-analyzes in lockstep; the sidecar appliers in
+        // `from_path_with` run after this and still win (rung 1). An
+        // unrecognized template is the best-effort tier and says so.
+        if let Some(embedded) = session.engine.model.chat_template_source() {
+            match crate::baked::detect(&embedded) {
+                Some(baked) => {
+                    match session
+                        .set_template_source(baked.replacement.to_string())
+                    {
+                        Ok(()) => tracing::info!(
+                            "chat template: baked '{}' replaces the \
+                             recognized stock template; a \
+                             *.template.jinja sidecar still overrides",
+                            baked.name
+                        ),
+                        // Our own shipped template failing to compile
+                        // is a crate bug, not a deployment problem —
+                        // keep the stock template and say so loudly.
+                        Err(e) => tracing::warn!(
+                            "baked template '{}' failed to compile \
+                             ({e}); keeping the embedded template",
+                            baked.name
+                        ),
+                    }
+                }
+                None => tracing::warn!(
+                    "chat template: no baked replacement matches this \
+                     model's embedded template; using it as-is \
+                     (best-effort tier — round-trip byte-stability \
+                     depends on the stock template's quality). A \
+                     *.template.jinja sidecar overrides."
+                ),
+            }
+        }
         Ok(session)
     }
 
@@ -2332,8 +2369,11 @@ impl<B: Backend> Session<B> {
     pub fn with_dialect(mut self, dialect: crate::CallSyntax) -> Self {
         // The re-ingest convention rides with the dialect: it decides
         // how prior thoughts feed back through the template, which is
-        // part of the same byte-stability contract.
-        self.render_opts.thought_reingest = dialect.reasoning.reingest;
+        // part of the same byte-stability contract. So does the
+        // pre-opened-reasoning anchor.
+        self.render_opts = std::mem::take(&mut self.render_opts)
+            .with_thought_reingest(dialect.reasoning.reingest)
+            .with_reasoning_start(dialect.reasoning.start.clone());
         self.dialect = dialect;
         self.refresh_emit_ban();
         self
@@ -2345,12 +2385,14 @@ impl<B: Backend> Session<B> {
     ///
     /// This is the programmatic form of the `<model>.template.jinja`
     /// sidecar (see [`crate::sidecar::load_template_source`]), which
-    /// exists to patch serving-side template bugs — e.g. the vendored
-    /// `gemma4-cache-stable.jinja` fixes Gemma 4's re-ingest path
-    /// dropping the thinking channel, which otherwise breaks KV-cache
-    /// byte-stability on every turn. A dialect sidecar or
-    /// [`Self::with_dialect`] call applied afterwards still overrides
-    /// the re-analysis.
+    /// exists to patch serving-side template bugs — e.g.
+    /// [`crate::baked::GEMMA4`]'s replacement fixes Gemma 4's
+    /// re-ingest path dropping the thinking channel, which otherwise
+    /// breaks KV-cache byte-stability on every turn (recognized
+    /// models get that replacement automatically; see
+    /// [`crate::baked`] for the full loading ladder). A dialect
+    /// sidecar or [`Self::with_dialect`] call applied afterwards
+    /// still overrides the re-analysis.
     ///
     /// On compile failure the session is left unchanged.
     pub fn set_template_source(
@@ -2361,7 +2403,9 @@ impl<B: Backend> Session<B> {
         let eos = self.engine.model.token_to_piece(self.engine.model.eos());
         self.template = ChatTemplate::from_source(source.clone(), bos, eos)?;
         let dialect = analyze_dialect_source(&self.engine.model, &source);
-        self.render_opts.thought_reingest = dialect.reasoning.reingest;
+        self.render_opts = std::mem::take(&mut self.render_opts)
+            .with_thought_reingest(dialect.reasoning.reingest)
+            .with_reasoning_start(dialect.reasoning.start.clone());
         self.dialect = dialect;
         self.refresh_emit_ban();
         Ok(())

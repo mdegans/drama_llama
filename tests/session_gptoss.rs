@@ -22,12 +22,14 @@ fn model_path() -> PathBuf {
         .join("models/gpt-oss-20b-UD-Q8_K_XL.gguf")
 }
 
-/// Install the cache-stability template sidecar next to the model —
-/// the deployment configuration this suite validates (blallama ships
-/// the same file). Idempotent; sourced from the versioned fixture.
+/// Install the cache-stability template sidecar next to the model.
+/// The same bytes are baked into the crate (`baked::GPTOSS`, #88) and
+/// would apply without any sidecar; installing one anyway makes this
+/// suite exercise rung 1 of the loading ladder over rung 2.
+/// Idempotent; sourced from the shipped template.
 fn install_template_sidecar() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/templates/gptoss-cache-stable.jinja");
+        .join("templates/gptoss-cache-stable.jinja");
     let sidecar = model_path().with_extension("template.jinja");
     std::fs::copy(&fixture, &sidecar).expect("install template sidecar");
 }

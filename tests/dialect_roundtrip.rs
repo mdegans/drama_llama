@@ -17,11 +17,15 @@ use drama_llama::{Block, ChatTemplate, Prompt, RenderOptions, Tool};
 use serde_json::json;
 
 fn fixture_source(name: &str) -> String {
-    let path = format!(
-        "{}/tests/fixtures/templates/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    // Vendored fixtures live under `tests/fixtures/templates/`; the
+    // fleet templates were promoted to shipped artifacts in crate-root
+    // `templates/` (the `baked` registry, #88) and resolve from there.
+    let root = env!("CARGO_MANIFEST_DIR");
+    let fixture_path = format!("{root}/tests/fixtures/templates/{name}");
+    let baked_path = format!("{root}/templates/{name}");
+    std::fs::read_to_string(&fixture_path)
+        .or_else(|_| std::fs::read_to_string(&baked_path))
+        .unwrap_or_else(|e| panic!("{fixture_path} | {baked_path}: {e}"))
 }
 
 fn test_tool() -> Tool {
