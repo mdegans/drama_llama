@@ -1,11 +1,87 @@
 # Plan of record: owned chat templates, loading ladder, base-model fallback
 
-> **STATUS: PHASES 0–1 LANDED** (2026-07-27, same session as
-> approval). Mike confirmed the full-commitment direction in-session
+> **STATUS: PHASES 0–2 LANDED** (phase 2: 2026-07-27, session 2,
+> Fable). Mike confirmed the full-commitment direction in-session
 > ("Cool. Your plan.") after the #85 arc; scope details delegated.
 > GitHub twin: [issue #88](https://github.com/mdegans/drama_llama/issues/88).
 > Supersedes the "own templates on measured need" stance argued
 > earlier the same session, and the sidecar-only distribution model.
+
+## Progress (2026-07-27, session 2, Fable) — Phase 2, the Cogito pilot
+
+- **Probe first, as planned**: `tests/probe_unforced_habit.rs` (new,
+  `#[ignore]`d, cogito-gated, skip-not-substitute) renders a
+  tools-bearing prompt and predicts greedily through the raw Engine
+  path — no grammar, no Session. Measured emission: **uniform
+  `json.dumps` spacing**, exactly as predicted — `": "` after every
+  key (envelope AND interior), `", "` between fields and array
+  elements, no brace padding, raw apostrophes,
+  `<tool_call>\n{...}\n</tool_call>` framing. The #85 compact-interior
+  canonical was confirmed off-habit. (Probe lesson: raw-Engine stops
+  are opt-in — `PredictOptions::add_model_stops` — without it greedy
+  runs straight through `<|im_end|>`.)
+- **Mechanism — spacing is measured data, not a hardcode.** The chain:
+  the *active template's* probe render → analyzer
+  (`detect_json_spacing`, both separator positions must agree, mixed
+  ⇒ Compact) → `ArgumentsSyntax::json_spacing: JsonSpacing`
+  (`Compact` default = pre-existing behavior everywhere) → both the
+  grammar prelude and `render_reference` key off it. Three views, one
+  byte string, single source (the template bytes).
+  - `src/json_canon.rs` (new): `JsonSpacing` + the `json.dumps`-exact
+    serializer (`SpacedFormatter`); separator accessors shared with
+    the grammar prelude so they cannot drift.
+  - `JSON_GRAMMAR` separators are now **position-aware named
+    productions** (`kv_sep` / `elem_sep` / `pad` — one generic `ws`
+    could never express "space after `:` but not inside braces");
+    `schema_to_gbnf` emits references to them, staying
+    prelude-agnostic. `json_grammar_canonical(spacing)` pins all
+    three per profile. Fast pins updated:
+    `canonical_json_grammar_pins_separators`,
+    `canonical_prelude_admits_exactly_one_spelling` (supersede the
+    `..._pins_ws` / `..._admits_only_compact_json` names cited in
+    older memos).
+  - `json_dumps` minijinja filter (chat_template.rs) +
+    `register_template_filters` shared by ChatTemplate's two envs
+    **and the analyzer's probe env** — closing a latent gap: the
+    analyzer env previously used builtin (HTML-escaping!) `tojson`,
+    masked only by clean-ASCII sentinels.
+- **Owned template**: `templates/cogito-gguf.jinja` (detection key,
+  dumped from the 32b GGUF, byte-identical to the 14b fixture) +
+  `templates/cogito-cache-stable.jinja` = stock with ONE line changed
+  (`tool_call.arguments | tojson` → `| json_dumps`). `baked::COGITO`
+  registered. Deliberately minimal: re-ingest semantics untouched
+  (Phase 3), `enable_thinking` front-rewrite untouched (#86 is
+  render_partial's bug; owned template keeps stock structure).
+- **Pins**: `render_reference_matches_cache_stable_template_render`,
+  `reconstruct_cogito_cache_stable` (adversarial payload sweep),
+  `cogito_cache_stable_prefix_continuity` (continuity refactored into
+  `assert_prefix_continuity`, shared with stock-cogito and qwen36
+  pins). `dialect_analyzer`: `json_dumps_template_measures_spaced` +
+  Compact pin on hermes. All fast-tier, model-free.
+- **Deprecated `ToolChoiceOptions` path stays Compact** (explicit
+  arg) — it has no analyzer to measure with, and adding a pub field
+  would break 0.8 struct literals.
+- **Latent, noted not fixed** (pre-existing, out of scope):
+  (1) `fun_name_is_key` JsonNative: grammar envelope (`KV_SEP`) vs
+  compact render disagree under Compact — no current model hits it;
+  comment at the render site. (2) Container-valued `enum:`/`const:`
+  schema literals embed compact bytes in rules, so they'd mismatch a
+  Spaced dialect — schemars-derived tools only produce scalar
+  literals; documented on `json_grammar_canonical`.
+- **Verified on the real model** (M2 Max, cogito-32b): cogito
+  hash_cache_smoke n=3, deterministic — round 2 `cache_read = 196`
+  vs round 1 `input_tokens = 170`, tip alive. Plus a **rung-2
+  witness** now in the test itself:
+  `session.dialect().arguments.json_spacing == Spaced` asserted for
+  the cogito variant — the tip surviving alone does NOT discriminate
+  stock from baked (both are round-trip stable post-#85); the
+  measured spacing does. This closes session 1's "no test observes
+  rung 2 end-to-end" gap for cogito; gemma/gptoss still get theirs
+  via the Phase 3 e2e flip.
+- **Phase 2 residue for Mike**: the seed-runner A/B on post-body
+  quality (spaced-canonical vs compact-canonical, same seeds) — the
+  distributional worry from the Why chain, checkable only on the
+  Agora side.
 
 ## Progress (2026-07-27, session 1, Fable)
 
