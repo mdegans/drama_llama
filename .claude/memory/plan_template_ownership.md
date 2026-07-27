@@ -243,6 +243,12 @@ Ordered so the boring load-bearing work lands before the fun rung.
   `gptoss-cache-stable` become baked; delete the stock accommodations
   that go dead (`ReasoningReingest::Thinking` contortions, KNOWN
   QUIRK LCP paths); unify re-ingest on `reasoning_content`.
+  **Exit gate: `just test ignored`, full tier.** Phase 2's session
+  learned this the hard way — the #85 compact pin sat broken for a
+  whole session because the fast tier can't see grammar-vs-model
+  interaction, and the tell only surfaced when the full ignored tier
+  finally ran. Template/re-ingest/grammar changes get the model tier
+  before "done", every phase.
 - **Phase 4 — Qwen owned template + drift alarm.** Smallest template
   delta. Analyzer repurposed: at load, analyze the *embedded stock*
   template, diff its dialect against our owned one, warn on mismatch
