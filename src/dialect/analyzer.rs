@@ -23,6 +23,8 @@
 use minijinja::{Environment, UndefinedBehavior};
 use serde_json::{json, Value};
 
+use crate::json_canon::JsonSpacing;
+
 use super::segment::{
     after_common_suffix, calculate_diff_split, find_first_marker,
     find_last_marker, marker_after, marker_before, prune_whitespace_segments,
@@ -145,6 +147,11 @@ impl<'s> Probe<'s> {
             // Deterministic: probing must not depend on wall clock.
             "01 Jan 2026".to_string()
         });
+        // Same filter set as the real render environments: the probe
+        // measures bytes (spacing, escaping) that `ChatTemplate` must
+        // then reproduce, and an owned template's `json_dumps` filter
+        // must resolve here or its analysis fails outright.
+        crate::chat_template::register_template_filters(&mut env);
         env.add_template_owned("probe", source.to_string())?;
         Ok(Self {
             env,
@@ -761,6 +768,8 @@ fn classify_and_extract(
         }
     }
 
+    syntax.arguments.json_spacing = detect_json_spacing(&clean);
+
     if syntax.family == Family::JsonNative {
         extract_json_native(&clean, syntax);
     } else {
@@ -776,6 +785,33 @@ fn classify_and_extract(
     // whitespace-tolerantly, so keeping it costs nothing there.
     syntax.section_end = syntax.section_end.trim_end().to_string();
     syntax.per_call_end = syntax.per_call_end.trim_end().to_string();
+}
+
+/// How the template spaces JSON-serialized argument values, measured
+/// from the probe's rendered args `{ARG_FIRST: "XXXX", ARG_SECOND:
+/// "YYYY"}`: a `json.dumps`-style re-render contains
+/// `"<ARG_FIRST>": "XXXX", "<ARG_SECOND>"`, a `tojson`-style one
+/// `"<ARG_FIRST>":"XXXX","<ARG_SECOND>"`. Both separator positions
+/// must agree to classify as [`JsonSpacing::Spaced`]; anything else —
+/// mixed, indented, or a layout that never JSON-quotes its keys
+/// (tagged / dict families) — stays [`JsonSpacing::Compact`], the
+/// pinned default every dialect had before the knob existed (#88
+/// phase 2). The grammar's canonical prelude and `render_reference`
+/// both key off the result, so whichever spelling the template
+/// renders is also the one the grammar forces: three views, one byte
+/// string.
+fn detect_json_spacing(clean: &str) -> JsonSpacing {
+    let kv_spaced = clean.contains(&format!("\"{ARG_FIRST}\": "));
+    let elem_spaced = clean.contains(&format!(", \"{ARG_SECOND}\""));
+    // A compact element separator anywhere (even alongside a spaced
+    // one — a template rendering the args twice) is disqualifying:
+    // `Spaced` must mean *uniformly* spaced.
+    let elem_compact = clean.contains(&format!(",\"{ARG_SECOND}\""));
+    if kv_spaced && elem_spaced && !elem_compact {
+        JsonSpacing::Spaced
+    } else {
+        JsonSpacing::Compact
+    }
 }
 
 /// JSON_NATIVE: parse the call object out of the haystack and map

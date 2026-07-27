@@ -137,7 +137,11 @@ pub fn grammar_source(
         // The channel-block structure doesn't decompose into the
         // generic section/per-call root below — hand-built, like the
         // parser side.
-        return harmony_grammar_source(tools, opts);
+        return harmony_grammar_source(
+            tools,
+            opts,
+            syntax.arguments.json_spacing,
+        );
     }
     let mut src = String::with_capacity(2048);
     let mut until_counter = 0usize;
@@ -284,7 +288,7 @@ pub fn grammar_source(
     if syntax.family == Family::TagWithDict {
         emit_dict_value_rules(&syntax.arguments.string_quote, &mut src);
     }
-    src.push_str(&json_grammar_canonical());
+    src.push_str(&json_grammar_canonical(syntax.arguments.json_spacing));
     Ok(src)
 }
 
@@ -313,6 +317,7 @@ pub fn grammar_source(
 fn harmony_grammar_source(
     tools: &[&Tool],
     opts: &EmitOptions,
+    spacing: crate::JsonSpacing,
 ) -> Result<String, DialectError> {
     let mut src = String::with_capacity(2048);
     let start = escape_for_gbnf_string(harmony::START_ASSISTANT);
@@ -392,7 +397,7 @@ fn harmony_grammar_source(
     for (i, tool) in tools.iter().enumerate() {
         schema_to_gbnf(&tool.schema, &format!("h_args_{i}"), &mut src);
     }
-    src.push_str(&json_grammar_canonical());
+    src.push_str(&json_grammar_canonical(spacing));
     Ok(src)
 }
 
@@ -750,9 +755,10 @@ pub fn render_reference(
                 out.push_str(harmony::CONSTRAIN);
                 out.push_str("json");
                 out.push_str(harmony::MESSAGE);
-                out.push_str(
-                    &serde_json::to_string(input).expect("serializable"),
-                );
+                out.push_str(&crate::json_canon::to_string(
+                    input,
+                    syntax.arguments.json_spacing,
+                ));
             }
             Family::TagWithTagged => {
                 out.push_str(&syntax.function.name_prefix);
@@ -777,10 +783,12 @@ pub fn render_reference(
                             // else renders as JSON — the `| string` /
                             // `tojson` split templates use.
                             Value::String(s) => out.push_str(s),
-                            other => out.push_str(
-                                &serde_json::to_string(other)
-                                    .expect("serializable"),
-                            ),
+                            other => {
+                                out.push_str(&crate::json_canon::to_string(
+                                    other,
+                                    syntax.arguments.json_spacing,
+                                ))
+                            }
                         }
                         out.push_str(&syntax.arguments.value_suffix);
                     }
@@ -791,19 +799,25 @@ pub fn render_reference(
                 out.push_str(&syntax.function.name_prefix);
                 out.push_str(name);
                 out.push_str(&syntax.function.name_suffix);
-                out.push_str(
-                    &serde_json::to_string(input).expect("serializable"),
-                );
+                out.push_str(&crate::json_canon::to_string(
+                    input,
+                    syntax.arguments.json_spacing,
+                ));
                 out.push_str(&syntax.function.close);
             }
             Family::JsonNative => {
                 if syntax.json.fun_name_is_key {
+                    // NOTE: under `Compact` the grammar's envelope
+                    // (`KV_SEP` after the name key) and this render
+                    // disagree — a pre-existing latent mismatch for
+                    // fun-name-is-key templates, out of #88 phase 2's
+                    // scope. `Spaced` makes them agree.
                     let mut obj = serde_json::Map::new();
                     obj.insert((*name).to_string(), (*input).clone());
-                    out.push_str(
-                        &serde_json::to_string(&Value::Object(obj))
-                            .expect("serializable"),
-                    );
+                    out.push_str(&crate::json_canon::to_string(
+                        &Value::Object(obj),
+                        syntax.arguments.json_spacing,
+                    ));
                 } else {
                     let name_field = if syntax.json.name_field.is_empty() {
                         "name"
@@ -848,7 +862,10 @@ pub fn render_reference(
                                 out,
                                 "{}: {}",
                                 serde_json::to_string(field).unwrap(),
-                                serde_json::to_string(input).unwrap(),
+                                crate::json_canon::to_string(
+                                    input,
+                                    syntax.arguments.json_spacing,
+                                ),
                             );
                         }
                     }

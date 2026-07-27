@@ -73,6 +73,8 @@ use std::fmt::Write;
 
 use serde_json::Value;
 
+use crate::json_canon::JsonSpacing;
+
 /// Emit GBNF rules that constrain a JSON value to `schema`.
 ///
 /// The top-level rule will be named `rule_name`; anonymous helpers
@@ -251,12 +253,12 @@ fn emit_schema_rule(
             if non_empty {
                 let _ = writeln!(
                     out,
-                    r#"{rule_name} ::= "[" ws {items_rule} ( ws "," ws {items_rule} )* ws "]""#
+                    r#"{rule_name} ::= "[" pad {items_rule} ( elem_sep {items_rule} )* pad "]""#
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    r#"{rule_name} ::= "[" ws ( {items_rule} ( ws "," ws {items_rule} )* )? ws "]""#
+                    r#"{rule_name} ::= "[" pad ( {items_rule} ( elem_sep {items_rule} )* )? pad "]""#
                 );
             }
         }
@@ -327,7 +329,7 @@ fn emit_object_rule(
 
     let member = |name: &str, child: &str| {
         let lit = escape_for_gbnf_string(&serde_json::to_string(name).unwrap());
-        format!(r#""{lit}" ws ":" ws {child}"#)
+        format!(r#""{lit}" kv_sep {child}"#)
     };
 
     let first_required = slots.iter().position(|(_, _, req)| *req);
@@ -350,7 +352,7 @@ fn emit_object_rule(
                     } else {
                         let _ = write!(
                             &mut tail,
-                            r#" ( ws "," ws {} )?"#,
+                            r#" ( elem_sep {} )?"#,
                             member(name, child)
                         );
                     }
@@ -359,30 +361,32 @@ fn emit_object_rule(
                 chain_names.push(chain_name);
             }
             let alts = chain_names.join(" | ");
-            let _ =
-                writeln!(out, r#"{rule_name} ::= "{{" ws ( {alts} )? ws "}}""#);
+            let _ = writeln!(
+                out,
+                r#"{rule_name} ::= "{{" pad ( {alts} )? pad "}}""#
+            );
         }
         Some(r) => {
-            let mut body = String::from("\"{\" ws");
+            let mut body = String::from("\"{\" pad");
             for (name, child, _) in &slots[..r] {
                 let _ =
-                    write!(body, r#" ( {} ws "," ws )?"#, member(name, child));
+                    write!(body, r#" ( {} elem_sep )?"#, member(name, child));
             }
             let (name, child, _) = &slots[r];
             let _ = write!(body, " {}", member(name, child));
             for (name, child, req) in &slots[r + 1..] {
                 if *req {
                     let _ =
-                        write!(body, r#" ws "," ws {}"#, member(name, child));
+                        write!(body, r#" elem_sep {}"#, member(name, child));
                 } else {
                     let _ = write!(
                         body,
-                        r#" ( ws "," ws {} )?"#,
+                        r#" ( elem_sep {} )?"#,
                         member(name, child)
                     );
                 }
             }
-            body.push_str(" ws \"}\"");
+            body.push_str(" pad \"}\"");
             let _ = writeln!(out, "{rule_name} ::= {body}");
         }
     }
@@ -855,9 +859,9 @@ pub(crate) fn escape_for_gbnf_string(s: &str) -> String {
 #[doc(hidden)]
 pub const JSON_GRAMMAR: &str = r#"
 value ::= object | array | string | number | "true" | "false" | "null"
-object ::= "{" ws ( member ( ws "," ws member )* )? ws "}"
-member ::= string ws ":" ws value
-array ::= "[" ws ( value ( ws "," ws value )* )? ws "]"
+object ::= "{" pad ( member ( elem_sep member )* )? pad "}"
+member ::= string kv_sep value
+array ::= "[" pad ( value ( elem_sep value )* )? pad "]"
 string ::= "\"" char* "\""
 char ::= unescaped | escape
 unescaped ::= [^"\\\x00-\x1F]
@@ -872,6 +876,9 @@ integer ::= "0" | "-"? [1-9] [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0-9]? [0
 frac ::= "." [0-9]+
 exp ::= [eE] [+\-]? [0-9] [0-9]?
 ws ::= [ \t\n\r]?
+kv_sep ::= ws ":" ws
+elem_sep ::= ws "," ws
+pad ::= ws
 "#;
 
 /// The exact separators the JSON-envelope dialects put between a
@@ -890,40 +897,79 @@ pub(crate) const KV_SEP: &str = ": ";
 /// Sibling of [`KV_SEP`]; separates top-level fields.
 pub(crate) const FIELD_SEP: &str = ", ";
 
-/// The permissive whitespace production inside [`JSON_GRAMMAR`], as a
-/// literal, so [`json_grammar_canonical`] can swap it. Kept honest by
-/// `canonical_json_grammar_pins_ws`, which fails if this ever drifts
-/// out of sync with the grammar text above.
+/// The permissive separator productions inside [`JSON_GRAMMAR`], as
+/// literals, so [`json_grammar_canonical`] can swap them. Kept honest
+/// by `canonical_json_grammar_pins_separators`, which fails if any
+/// drifts out of sync with the grammar text above.
+///
+/// Separators are *position-aware* — distinct named productions
+/// rather than one generic `ws` — because a canonical spelling is not
+/// uniform: `json.dumps` puts a space after `:` and `,` but none
+/// inside braces. One `ws` rule cannot express that; three named
+/// positions can (#88 phase 2).
 const WS_PERMISSIVE: &str = r"ws ::= [ \t\n\r]?";
+/// Between a key and its value.
+const KV_SEP_PERMISSIVE: &str = r#"kv_sep ::= ws ":" ws"#;
+/// Between object members and between array elements.
+const ELEM_SEP_PERMISSIVE: &str = r#"elem_sep ::= ws "," ws"#;
+/// Just inside `{`/`}` and `[`/`]`.
+const PAD_PERMISSIVE: &str = r"pad ::= ws";
 
-/// [`JSON_GRAMMAR`] with JSON-*internal* whitespace pinned to nothing,
-/// plus a separate `fws` for framing.
+/// [`JSON_GRAMMAR`] with JSON-*internal* whitespace pinned to exactly
+/// one spelling per [`JsonSpacing`], plus a separate `fws` for
+/// framing.
 ///
-/// Tool calls must re-render byte-identically to what the model emitted
-/// or the prefix cache's auto-tip is discarded (#85): `ws` being
-/// `[ \t\n\r]?` lets the model choose `": "` where our serializer emits
-/// `":"`, and nothing downstream can know which it picked. Pinning it
-/// makes a `serde_json::Value` have exactly one legal byte spelling, so
-/// grammar and serializer become inverses.
+/// Tool calls must re-render byte-identically to what the model
+/// emitted or the prefix cache's auto-tip is discarded (#85):
+/// permissive separators let the model choose `": "` where the
+/// serializer re-renders `":"`, and nothing downstream can know which
+/// it picked. Pinning makes a `serde_json::Value` have exactly one
+/// legal byte spelling, so grammar and serializer become inverses —
+/// [`crate::json_canon::to_string`] with the same [`JsonSpacing`] is
+/// that inverse, and the pinned productions are built from the same
+/// [`JsonSpacing::kv_sep`] / [`JsonSpacing::elem_sep`] bytes it
+/// emits, so the two cannot drift.
 ///
-/// Rules generated by [`schema_to_gbnf`] reference `ws` **by name** and
-/// are therefore prelude-agnostic — the same generated text is
-/// permissive under [`JSON_GRAMMAR`] and canonical under this one. That
-/// is why pinning is a prelude swap rather than a change to the emitter.
+/// Which spelling to pin is per-dialect data: the analyzer measures
+/// how the *active* chat template spaces its re-render (stock
+/// `tojson` templates are [`Compact`](JsonSpacing::Compact); owned
+/// templates match the model's measured habit — cogito's is
+/// [`Spaced`](JsonSpacing::Spaced), `tests/probe_unforced_habit.rs`).
+///
+/// Rules generated by [`schema_to_gbnf`] reference `kv_sep` /
+/// `elem_sep` / `pad` **by name** and are therefore prelude-agnostic
+/// — the same generated text is permissive under [`JSON_GRAMMAR`] and
+/// canonical under this one. That is why pinning is a prelude swap
+/// rather than a change to the emitter. (One narrow exception:
+/// container-valued `enum:` / `const:` schema literals embed compact
+/// bytes directly in the rule, so they only match their emission
+/// under `Compact`. Schemars-derived tools only produce *scalar*
+/// literals, which are spelling-invariant.)
 ///
 /// **`fws` is the reason this isn't a one-line override.** The root
-/// rules use whitespace for *framing* — the `\n\n` a model puts between
-/// `</think>` and its call — which legitimately varies and is not part
-/// of the byte-stability problem. Pinning that too would mask tokens the
-/// model is trained to emit, for no cache benefit. Root rules use `fws`;
-/// everything inside the JSON uses `ws`.
+/// rules use whitespace for *framing* — the `\n\n` a model puts
+/// between `</think>` and its call — which legitimately varies and is
+/// not part of the byte-stability problem. Pinning that too would
+/// mask tokens the model is trained to emit, for no cache benefit.
+/// Root rules use `fws`; everything inside the JSON uses the pinned
+/// productions.
 ///
 /// Structured output keeps [`JSON_GRAMMAR`] for now — it has the same
 /// latent divergence when a JSON response is replayed as history, but
 /// that is a separate change with its own blast radius.
 #[doc(hidden)]
-pub fn json_grammar_canonical() -> String {
-    let mut out = JSON_GRAMMAR.replace(WS_PERMISSIVE, r#"ws ::= """#);
+pub fn json_grammar_canonical(spacing: JsonSpacing) -> String {
+    let mut out = JSON_GRAMMAR
+        .replace(WS_PERMISSIVE, r#"ws ::= """#)
+        .replace(
+            KV_SEP_PERMISSIVE,
+            &format!(r#"kv_sep ::= "{}""#, spacing.kv_sep()),
+        )
+        .replace(
+            ELEM_SEP_PERMISSIVE,
+            &format!(r#"elem_sep ::= "{}""#, spacing.elem_sep()),
+        )
+        .replace(PAD_PERMISSIVE, r#"pad ::= """#);
     // Framing whitespace, permissive, under a name the JSON rules never
     // reference.
     out.push_str(r"fws ::= [ \t\n\r]?");
@@ -974,73 +1020,118 @@ mod tests {
 
     /// The canonical prelude must actually differ from the permissive
     /// one. `json_grammar_canonical` works by string replacement, so if
-    /// `WS_PERMISSIVE` ever drifts out of sync with the grammar text
-    /// the replace silently no-ops and every tool call goes back to
-    /// being un-pinned — with no other symptom until a prefix cache
-    /// quietly stops matching. Fail loudly here instead.
+    /// any `*_PERMISSIVE` literal ever drifts out of sync with the
+    /// grammar text the replace silently no-ops and every tool call
+    /// goes back to being un-pinned — with no other symptom until a
+    /// prefix cache quietly stops matching. Fail loudly here instead.
     #[test]
-    fn canonical_json_grammar_pins_ws() {
-        assert!(
-            JSON_GRAMMAR.contains(WS_PERMISSIVE),
-            "WS_PERMISSIVE no longer matches JSON_GRAMMAR's ws production; \
-             json_grammar_canonical is silently a no-op",
-        );
-        let canonical = json_grammar_canonical();
-        // Line-exact: `fws ::= ...` *contains* `ws ::= ...`, so a
-        // substring check here silently passes for the wrong reason.
-        let lines: Vec<&str> = canonical
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect();
-        assert!(lines.contains(&r#"ws ::= """#));
-        assert!(
-            !lines.contains(&WS_PERMISSIVE),
-            "permissive ws survived into the canonical prelude",
-        );
-        // Framing whitespace survives, under a name the JSON rules
-        // never reference.
-        assert!(lines.contains(&r"fws ::= [ \t\n\r]?"));
+    fn canonical_json_grammar_pins_separators() {
+        const PERMISSIVE: [&str; 4] = [
+            WS_PERMISSIVE,
+            KV_SEP_PERMISSIVE,
+            ELEM_SEP_PERMISSIVE,
+            PAD_PERMISSIVE,
+        ];
+        for production in PERMISSIVE {
+            assert!(
+                JSON_GRAMMAR.contains(production),
+                "`{production}` no longer matches JSON_GRAMMAR; \
+                 json_grammar_canonical is silently a no-op for it",
+            );
+        }
+        for spacing in [JsonSpacing::Compact, JsonSpacing::Spaced] {
+            let canonical = json_grammar_canonical(spacing);
+            // Line-exact: `fws ::= ...` *contains* `ws ::= ...`, so a
+            // substring check here silently passes for the wrong
+            // reason.
+            let lines: Vec<&str> = canonical
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert!(lines.contains(&r#"ws ::= """#));
+            assert!(lines.contains(&r#"pad ::= """#));
+            let kv = format!(r#"kv_sep ::= "{}""#, spacing.kv_sep());
+            let elem = format!(r#"elem_sep ::= "{}""#, spacing.elem_sep());
+            assert!(lines.contains(&kv.as_str()), "{spacing:?}: {kv}");
+            assert!(lines.contains(&elem.as_str()), "{spacing:?}: {elem}");
+            for production in PERMISSIVE {
+                assert!(
+                    !lines.contains(&production),
+                    "permissive `{production}` survived into the \
+                     {spacing:?} canonical prelude",
+                );
+            }
+            // Framing whitespace survives, under a name the JSON rules
+            // never reference.
+            assert!(lines.contains(&r"fws ::= [ \t\n\r]?"));
+        }
     }
 
-    /// The point of the canonical prelude: exactly one legal spelling.
+    /// The point of the canonical prelude: exactly one legal spelling
+    /// per [`JsonSpacing`].
     ///
     /// `schema_to_gbnf`'s output is prelude-agnostic — it references
-    /// `ws` by name — so the *same* generated rules accept both
-    /// spellings under `JSON_GRAMMAR` and only the compact one under
-    /// `json_grammar_canonical`. That property is what lets tool calls
-    /// be pinned without touching structured output.
+    /// `kv_sep` / `elem_sep` / `pad` by name — so the *same* generated
+    /// rules accept every spelling under `JSON_GRAMMAR` and exactly
+    /// one under each `json_grammar_canonical` profile. That property
+    /// is what lets tool calls be pinned without touching structured
+    /// output, and what lets the pinned spelling follow the model's
+    /// measured habit (#88 phase 2).
     #[test]
-    fn canonical_prelude_admits_only_compact_json() {
+    fn canonical_prelude_admits_exactly_one_spelling() {
         let schema = json!({
             "type": "object",
-            "properties": {"a": {"type": "string"}},
-            "required": ["a"],
+            "properties": {
+                "a": {"type": "string"},
+                "b": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["a", "b"],
         });
         let mut rules = String::from("root ::= args\n");
         schema_to_gbnf(&schema, "args", &mut rules);
 
-        let compact = r#"{"a":"b"}"#;
-        let spaced = r#"{"a": "b"}"#;
+        let compact = r#"{"a":"x","b":[1,2]}"#;
+        let spaced = r#"{"a": "x", "b": [1, 2]}"#;
+        let mixed = r#"{"a": "x","b":[1, 2]}"#;
+        let padded = r#"{ "a": "x", "b": [1, 2] }"#;
 
         let permissive = format!("{rules}{JSON_GRAMMAR}");
-        assert!(accepts(&permissive, compact));
-        assert!(
-            accepts(&permissive, spaced),
-            "permissive prelude must keep accepting both spellings — \
-             structured output still depends on it",
-        );
+        for input in [compact, spaced, mixed, padded] {
+            assert!(
+                accepts(&permissive, input),
+                "permissive prelude must keep accepting every spelling — \
+                 structured output still depends on it: {input}",
+            );
+        }
 
-        let canonical = format!("{rules}{}", json_grammar_canonical());
+        let canonical =
+            format!("{rules}{}", json_grammar_canonical(JsonSpacing::Compact));
         assert!(
             accepts(&canonical, compact),
-            "canonical prelude must accept what our serializer emits",
+            "Compact prelude must accept what the compact serializer emits",
         );
+        for input in [spaced, mixed, padded] {
+            assert!(
+                !accepts(&canonical, input),
+                "Compact prelude must reject other spellings — this is \
+                 the divergence that cost 4705 tokens/turn in #85: {input}",
+            );
+        }
+
+        let canonical =
+            format!("{rules}{}", json_grammar_canonical(JsonSpacing::Spaced));
         assert!(
-            !accepts(&canonical, spaced),
-            "canonical prelude must reject the spaced spelling — this is \
-             the divergence that cost 4705 tokens/turn in #85",
+            accepts(&canonical, spaced),
+            "Spaced prelude must accept the model's measured habit \
+             (`json.dumps` spacing — the cogito probe)",
         );
+        for input in [compact, mixed, padded] {
+            assert!(
+                !accepts(&canonical, input),
+                "Spaced prelude must reject other spellings: {input}",
+            );
+        }
     }
 
     /// Compile `source`, feed `input` through a fresh parser, and

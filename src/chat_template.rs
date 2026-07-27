@@ -162,8 +162,7 @@ impl ChatTemplate {
         );
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
-        // Overrides minijinja's builtin. See `tojson_unescaped`.
-        env.add_filter("tojson", tojson_unescaped);
+        register_template_filters(&mut env);
         env.add_template_owned("chat", source.clone())
             .map_err(ChatTemplateError::from_jinja)?;
 
@@ -185,7 +184,7 @@ impl ChatTemplate {
         // escapes differently from the full render is not a prefix of
         // it, and `Session` silently drops such partials — costing the
         // very breakpoints this is meant to preserve.
-        env_permissive.add_filter("tojson", tojson_unescaped);
+        register_template_filters(&mut env_permissive);
         env_permissive
             .add_template_owned("chat", source)
             .map_err(ChatTemplateError::from_jinja)?;
@@ -1401,6 +1400,48 @@ fn json_err(e: &serde_json::Error) -> JinjaError {
         minijinja::ErrorKind::InvalidOperation,
         format!("tojson: {e}"),
     )
+}
+
+/// Python `json.dumps` default spacing (`": "`, `", "`), unescaped —
+/// the serializer owned chat templates render tool-call arguments
+/// through.
+///
+/// Stock templates use `tojson` (compact); tool-tuned models emit
+/// `json.dumps` spacing (cogito measured greedy-unforced,
+/// `tests/probe_unforced_habit.rs`), so a stock re-render never
+/// byte-matches the emission and #85's canonical form had to pin the
+/// model *off* its habit. An owned template renders through this
+/// filter instead; the dialect analyzer measures the resulting
+/// spacing ([`crate::JsonSpacing::Spaced`]) and the grammar and
+/// `render_reference` follow — three views, one byte string (#88).
+///
+/// Escaping matches [`tojson_unescaped`] (serde_json's), so output is
+/// byte-identical to `json.dumps(value, ensure_ascii=False)`. No
+/// kwargs — an owned template has no business asking for indent.
+fn json_dumps_filter(
+    value: JinjaValue,
+    kwargs: Kwargs,
+) -> Result<JinjaValue, JinjaError> {
+    kwargs.assert_all_used()?;
+    let json = crate::json_canon::to_spaced_string(&value)
+        .map_err(|e| json_err(&e))?;
+    // Safe-string so an autoescaping template can't re-escape the JSON
+    // we just deliberately left unescaped.
+    Ok(JinjaValue::from_safe_string(json))
+}
+
+/// Register drama_llama's template filters on `env`.
+///
+/// Every environment that renders chat templates — [`ChatTemplate`]'s
+/// strict and permissive envs and the dialect analyzer's probe env —
+/// registers the same set, or a template could render under one and
+/// fail (or render *different bytes*) under another. The analyzer
+/// measures renders that the real path must then reproduce
+/// byte-for-byte, so the environments may not diverge.
+pub(crate) fn register_template_filters(env: &mut Environment<'_>) {
+    // Overrides minijinja's builtin. See `tojson_unescaped`.
+    env.add_filter("tojson", tojson_unescaped);
+    env.add_filter("json_dumps", json_dumps_filter);
 }
 
 /// HF templates commonly call `raise_exception("msg")` to reject invalid

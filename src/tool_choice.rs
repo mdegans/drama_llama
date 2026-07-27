@@ -350,10 +350,12 @@ pub(crate) fn build_grammar_source(
         }
     }
     if let Some((open, close)) = opts.wrap_tags {
-        // LlamaCppModel emits `<open>\n{…}\n</close>` in its trained format.
-        // We accept any whitespace around the JSON to tolerate minor
-        // layout drift. The literal tag text is escaped to survive
-        // being embedded in a GBNF string literal.
+        // The trained layout's newlines live in the tag literals
+        // (`"<tool_call>\n"`); `ws` between tag and brace is pinned to
+        // nothing by the canonical prelude below, so the emission is
+        // exactly `<open>{…}<close>` with whatever whitespace the tags
+        // carry. The literal tag text is escaped to survive being
+        // embedded in a GBNF string literal.
         let open_lit = escape_for_gbnf_string(open);
         let close_lit = escape_for_gbnf_string(close);
         let _ = writeln!(
@@ -371,7 +373,7 @@ pub(crate) fn build_grammar_source(
         }
         let _ = write!(alts, "call_{i}");
     }
-    let _ = writeln!(src, r#"call ::= "{{" ws ( {alts} ) ws "}}""#);
+    let _ = writeln!(src, r#"call ::= "{{" pad ( {alts} ) pad "}}""#);
 
     // Pipeline for embedded JSON literals: `serde_json::to_string`
     // produces a JSON string literal with JSON escapes (handles control
@@ -407,7 +409,9 @@ pub(crate) fn build_grammar_source(
     }
 
     // Standard JSON grammar — RFC 8259-ish, enough for tool arguments.
-    src.push_str(&json_grammar_canonical());
+    // This pre-dialect path has no analyzer to measure a spacing habit
+    // from, so it keeps the compact interior it has always forced.
+    src.push_str(&json_grammar_canonical(crate::JsonSpacing::Compact));
 
     src
 }

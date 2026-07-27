@@ -68,6 +68,9 @@ pub(crate) mod grammar_compile;
 #[doc(hidden)]
 pub use grammar_compile::{emit_until_rules, schema_to_gbnf, JSON_GRAMMAR};
 
+mod json_canon;
+pub use json_canon::JsonSpacing;
+
 mod tool_choice;
 pub use tool_choice::{
     build_grammar_source_for_debug, deferred_grammar_for_prompt,

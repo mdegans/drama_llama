@@ -29,6 +29,8 @@ pub use emit::{
 };
 pub use parse::{parse_text, Leniency, ParseStatus, Parsed, StreamParser};
 
+use crate::json_canon::JsonSpacing;
+
 /// Tool-call format family, per llama.cpp's classification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(
@@ -239,6 +241,15 @@ pub struct ArgumentsSyntax {
     /// String-quote marker for [`Family::TagWithDict`] values
     /// (e.g. `"<|\"|>"`); empty for other families.
     pub string_quote: String,
+    /// How JSON-serialized argument values are spaced — measured from
+    /// the template's own re-render of the analysis probe, so the
+    /// grammar's canonical prelude and `render_reference`'s serializer
+    /// agree with the template by construction (#88 phase 2). Stock
+    /// `tojson` templates measure [`Compact`](JsonSpacing::Compact);
+    /// owned templates match the model's probed habit (cogito:
+    /// [`Spaced`](JsonSpacing::Spaced)). Families that never
+    /// JSON-serialize values ignore it.
+    pub json_spacing: JsonSpacing,
 }
 
 /// Call-ID markers (tagged formats).

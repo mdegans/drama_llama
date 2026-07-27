@@ -6,6 +6,7 @@
 use drama_llama::dialect::{
     analyze_template, CallSyntax, Family, ReasoningMode,
 };
+use drama_llama::JsonSpacing;
 
 fn analyze(fixture: &str, bos: &str, eos: &str) -> CallSyntax {
     // Vendored fixtures live under `tests/fixtures/templates/`; the
@@ -110,6 +111,31 @@ fn hermes3_json_in_section() {
         "trigger: {:?}\n{s:#?}",
         s.trigger()
     );
+    // Stock `tojson` re-renders arguments compact; the grammar and
+    // render_reference must pin the same spelling.
+    assert_eq!(s.arguments.json_spacing, JsonSpacing::Compact, "{s:#?}");
+}
+
+/// A template rendering arguments through the `json_dumps` filter —
+/// the owned-template shape (#88) — measures `Spaced`, and the
+/// measurement is what pins the grammar prelude and render_reference
+/// to the model's `json.dumps` habit. Minimal inline source so the
+/// property is pinned independently of any particular owned template.
+#[test]
+fn json_dumps_template_measures_spaced() {
+    let source = r#"{%- for m in messages -%}
+<|im_start|>{{ m.role }}
+{% if m.tool_calls %}{%- for tc in m.tool_calls -%}
+<tool_call>
+{"name": "{{ tc.function.name }}", "arguments": {{ tc.function.arguments | json_dumps }}}
+</tool_call>
+{%- endfor %}{% else %}{{ m.content }}{% endif %}<|im_end|>
+{% endfor -%}
+{%- if add_generation_prompt -%}<|im_start|>assistant
+{% endif -%}"#;
+    let s = analyze_template(source, "", "<|im_end|>").expect("analyze");
+    assert_eq!(s.family, Family::JsonNative, "{s:#?}");
+    assert_eq!(s.arguments.json_spacing, JsonSpacing::Spaced, "{s:#?}");
 }
 
 /// Llama 3.1: bare JSON with `parameters` as the args field.
