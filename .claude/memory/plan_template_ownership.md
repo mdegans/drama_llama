@@ -47,6 +47,19 @@
     observes rung 2 end-to-end (gemma/gptoss e2e pin rung 1). The
     Phase 3 e2e flip (drop the sidecar installs, assert baked
     covers them) closes this on the model boxes.
+  - The GGUF-metadata reader graduated to
+    `scripts/gguf_template.py` (`--compare` mirrors
+    `baked::detect`'s trailing-whitespace-insensitive equality).
+- **Incoming: gpt-oss 120b** (Mike, end of session 1) — quantizing
+  from **OpenAI's safetensors** with our llama.cpp checkout, landing
+  in `models/`. Expectation is "same template as 20b", but our
+  detection key is the *Unsloth* 20b dump and Unsloth patches
+  templates — so before assuming rung 2 fires, run
+  `python3 scripts/gguf_template.py models/<120b>.gguf --compare
+  templates/gptoss-gguf.jinja`. On MISMATCH: diff the dumped
+  `.embedded`; if semantically identical, add a second detection
+  key (another `stock` mapping to the same `GPTOSS.replacement`) —
+  by design, NOT a bug.
 
 ## Why (the short causal chain)
 
