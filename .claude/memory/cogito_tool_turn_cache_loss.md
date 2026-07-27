@@ -243,6 +243,31 @@ Two design points worth keeping:
   to emit, for no cache benefit. A global `ws ::= ""` looks like a
   one-liner and is wrong.
 
+## Collateral regression, found 2026-07-27 (session 2)
+
+`86c9fe4` also switched the **deprecated** `grammar_for_tool_choice`
+path to the canonical (compact) prelude — a path with *no
+canonical-bytes contract*: nothing re-renders its emissions, Session's
+dialect emitter never routes through it. The pin bought nothing and
+broke `tool_choice_forces_call_against_real_model`: forced
+`{"location":"` against Qwen3.6's trained `{"location": "` habit made
+the model flail inside the string's free region
+(`"}}<|im_end|>…"` — grammar-legal garbage; specials appear because
+the raw-Engine path has no `emit_ban_set`, that guard is Session's).
+Failure rate ≈ half at fixed seeds; caught only by the first full
+ignored-tier run after the pin. Bisect: pre-`86c9fe4` 2/2 pass,
+post 1/2, phase-2 HEAD 0/4 — all consistent with one post-pin rate.
+
+Fixed same day: `json_grammar_lenient()` (permissive + `fws`) for the
+contract-free path; the test now prints its sampler seed and honors
+`DRAMA_LLAMA_SEED`. Deterministic repro of the OLD failure: check out
+a pre-fix commit and `DRAMA_LLAMA_SEED=4 just test
+tool_choice_forces_call`. The generalizable lesson: **pin bytes only
+where a re-render contract exists** — off-habit forcing measurably
+degrades generation quality (this is the same distributional worry
+that motivated #88's habit-derived canonical bytes, observed as an
+outright failure).
+
 ## Why CI never caught it (read before trusting a green model tier)
 
 `tests/hash_cache_smoke.rs` describes this exact bug and was **red for
