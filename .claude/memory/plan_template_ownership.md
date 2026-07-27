@@ -86,7 +86,9 @@
 - **Phase 2 residue for Mike**: the seed-runner A/B on post-body
   quality (spaced-canonical vs compact-canonical, same seeds) — the
   distributional worry from the Why chain, checkable only on the
-  Agora side.
+  Agora side. Mike (end of session 2): deliberately deferred until
+  **Phase 3 at least** — task-switching cost outweighs the likely
+  small change; don't re-raise it before then.
 
 ## Progress (2026-07-27, session 1, Fable)
 
