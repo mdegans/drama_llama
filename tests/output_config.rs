@@ -345,13 +345,39 @@ fn structured_output_round_trips_as_history() {
         r2.usage.input_tokens, r2_read
     );
 
-    assert!(
-        r2_read > r1_input,
-        "structured-output turn did not round-trip: round 2 reused \
-         {r2_read} tokens, which does not exceed round 1's whole \
-         prompt ({r1_input}). With no cache_control anywhere the tip \
-         is the only anchor, so this means the assistant turn failed \
-         to re-render byte-stably or the tip was disqualified."
+    // The test's name still holds — the BYTES round-trip, which is
+    // what `r2.json()` below proves. What does not round-trip is the
+    // *segmentation*, and that is what the cache needs.
+    //
+    // This assertion was `r2_read > r1_input` when the test landed
+    // (#88 phase 5b), and it was green — green *on corruption*. The
+    // tip's render hash matched, so reuse proceeded at the tip's
+    // cached entry index while the same bytes ended three entries
+    // earlier in the new render; the first tokens of the new user
+    // turn were never decoded. That is #91, and this test is where it
+    // was found.
+    //
+    // Post-fix `hash_keyed_l_hit` refuses a hit whose coordinates
+    // disagree, and here there is nothing to fall back to: the LCP
+    // walk dies two tokens into the JSON (grammar-masked merges), and
+    // the only `cache_control` marker sits past that. So reuse is
+    // zero and a grammar-constrained turn replays its whole prompt.
+    //
+    // That cost is the open half of #91 — resolving the hit in
+    // new-entry space instead of refusing it. When that lands, this
+    // flips back to `r2_read > r1_input` and means it.
+    //
+    // A NON-zero value here is a signal, not a reason to relax the
+    // bound: it would mean this emission happened to be segmented
+    // canonically throughout, which a ~250-token JSON under a schema
+    // grammar should not be. Investigate before widening.
+    assert_eq!(
+        r2_read, 0,
+        "expected zero reuse on a drifted structured-output turn \
+         (#91): the tip's hash matches but its coordinates do not, \
+         and the sole cache_control marker sits past where the LCP \
+         walk dies. Got {r2_read} against round 1's prompt of \
+         {r1_input}."
     );
 
     // Cache stats are not a proxy for output (the 2026-07-24
@@ -359,7 +385,7 @@ fn structured_output_round_trips_as_history() {
     // emitting nothing).
     assert!(
         r2.usage.output_tokens > 0,
-        "round 2 produced no tokens despite reusing {r2_read}"
+        "round 2 produced no tokens (reused {r2_read})"
     );
     let _: CaseFile = r2.json().expect("round 2 deserializes");
 }

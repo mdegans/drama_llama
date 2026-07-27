@@ -553,12 +553,23 @@ struct PrefixSlot {
     /// [`Self::tip`]) and we want the next call's
     /// [`compute_l_hit`] LCP walk to extend through it.
     ///
-    /// Does NOT include the EOS / assistant-close token: the predictor's
+    /// Runs one or two entries PAST the KV cache. The predictor's
     /// stop-sequence check in [`crate::predictor::TokenPredictor::next`]
     /// fires before [`crate::predictor::CandidatePredictor::next`] would
-    /// have called `decoder.step` on the EOS, so the EOS lands in the
-    /// predictor's `tokens` vec but never in KV. We mirror that: our
-    /// `prev_entries` matches what the engine's KV cache actually holds.
+    /// have called `decoder.step` on the terminal token, so that token
+    /// lands in the predictor's `tokens` vec but never in KV — and
+    /// [`tip_extension`] then replaces it with the *canonical tail*,
+    /// the re-render's own tokenization of everything at and past the
+    /// KV head (the turn close, plus a content token when the turn
+    /// ended on something other than a stop token). That tail is a
+    /// prediction of what the next call will render there; it makes
+    /// the next LCP walk reach one past the KV head so [`Self::tip`]
+    /// stays eligible under `compute_l_hit`'s `lcp-1` margin.
+    ///
+    /// So `prev_entries[..tip.at.entry]` is what the KV holds, and
+    /// `prev_entries` in full is what [`Self::tip`]'s hash covers. Do
+    /// not conflate the two — see [`hash_keyed_l_hit`], where treating
+    /// the tip's hash as ending at `tip.at` refuses every tip.
     prev_entries: Vec<CacheEntry>,
     /// [`Breakpoint`]s where `cache_control` markers landed, sorted
     /// ascending by entry.
@@ -568,16 +579,17 @@ struct PrefixSlot {
     /// [`compute_l_hit`] as one more eligible breakpoint candidate
     /// alongside `new_breakpoints`. Separate from `breakpoints` so
     /// it never gets serialized into `cache_control` markers and never
-    /// counts against the Anthropic 4-slot budget. Its `hash` covers
-    /// the canonical render up to the auto-tip position (end of
-    /// just-generated assistant content), computed by re-rendering the
-    /// conversation with the parsed assistant block appended.
+    /// counts against the Anthropic 4-slot budget.
     ///
-    /// Placed one entry back from the KV head (for [`compute_l_hit`]'s
-    /// `lcp-1` BPE-safety margin) so the next call's LCP — which
-    /// extends exactly to `prev_entries.len()` when its tokenization
-    /// adds one more token (typically the chat template's
-    /// assistant-close marker) — leaves the tip eligible.
+    /// Placed exactly AT the KV head, which is one or two entries back
+    /// from the end of [`Self::prev_entries`] — the difference being
+    /// the canonical tail documented there. Its `hash`, however,
+    /// covers the canonical re-render of the *whole* assistant turn,
+    /// close marker included: hash-end is `prev_entries.len()`, not
+    /// `at.entry`. The gap is deliberate (the tail is predicted, not
+    /// decoded, so it cannot be a restore target) and it is the reason
+    /// [`hash_keyed_l_hit`] has to compare hash-ends rather than
+    /// breakpoint positions.
     ///
     /// **Predictor-stop coupling:** this design hinges on the
     /// `TokenPredictor` `stopped` early-return (set on the iteration
@@ -746,6 +758,24 @@ fn tripwire_violation(
     let mut report = String::new();
     for slot in slots {
         if slot.prev_entries.is_empty() {
+            continue;
+        }
+        // A slot whose hash hit was refused for segmentation drift has
+        // an explicable miss, not a violation: the bytes matched but
+        // the two lists put them at different entries, so reusing
+        // would have spliced KV the new prompt does not describe
+        // (#91). Without this the tripwire fires on every
+        // grammar-constrained turn — exactly when someone is most
+        // likely to have armed it.
+        if hash_keyed_l_hit(
+            slot,
+            new_entries,
+            new_breakpoints,
+            new_breakpoint_hashes,
+        )
+        .drifted
+        .is_some()
+        {
             continue;
         }
         let lcp = longest_common_prefix_len(&slot.prev_entries, new_entries);
@@ -1516,11 +1546,14 @@ fn hash_render_best_effort(
 /// RGB8 pixel hash — re-encodings of the same pixels rightly hit).
 ///
 /// The stored entries against this hash come from the model's
-/// original emission and may not be a bytewise-identical tokenization
-/// of the same partial — a single-token BPE drift at the
-/// JSON-whitespace boundary is acceptable; cogito's permissive
-/// grammar means the model is whitespace-tolerant and the existing
-/// `lcp-1` safety margin in [`compute_l_hit`] handles it.
+/// original emission, so they may segment the same bytes differently
+/// from the tokenizer's re-reading of the render. This hash cannot
+/// see that — it is computed over bytes — and the `lcp-1` margin in
+/// [`compute_l_hit`] does not cover it either, because the drift is
+/// not a boundary effect: it starts wherever the grammar first forced
+/// a non-canonical split and runs to the end of the emission. Equal
+/// bytes are therefore a *necessary* condition for hash-keyed reuse,
+/// never a sufficient one; [`hash_keyed_l_hit`] supplies the rest.
 fn hash_segments(segments: &[&str], ids: &[[u8; 32]]) -> [u8; 32] {
     use sha2::Digest;
     debug_assert_eq!(segments.len(), ids.len() + 1);
@@ -1540,45 +1573,127 @@ fn hash_partial_text(text: &str) -> [u8; 32] {
     hash_segments(&[text], &[])
 }
 
-/// Hash-keyed L_hit lookup. Returns the largest cached [`EntryPos`]
-/// over the prompt [`Breakpoint`]s plus the auto-tip whose stored
-/// hash also appears in `new_breakpoint_hashes`. Hashless breakpoints
-/// (LCP-only) never match here. Returns the zero position when no
-/// hash matches.
+/// What [`hash_keyed_l_hit`] found.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HashKeyedHit {
+    /// Largest cached position reusable in BOTH coordinate spaces. A
+    /// zero entry means the hash path offers nothing and the caller
+    /// should fall back to the LCP walk.
+    at: EntryPos,
+    /// The largest candidate whose hash matched but whose entries did
+    /// not — `(cached, new)`, both being where that hash's bytes *end*
+    /// in their respective lists. Observability only: this is the
+    /// segmentation-drift event of #91, and nothing else in the call
+    /// can see it (the prompt, its render, and even the final KV
+    /// length are all correct on a drifted turn).
+    drifted: Option<(EntryPos, EntryPos)>,
+}
+
+/// Hash-keyed L_hit lookup. Returns the largest position over the
+/// slot's prompt [`Breakpoint`]s plus its auto-tip whose stored hash
+/// also appears among the new call's breakpoints, **and whose bytes
+/// land at the same place in both entry lists**. Hashless breakpoints
+/// (LCP-only) never match here. Returns the zero position when nothing
+/// qualifies.
 ///
-/// `cap` bounds the result in entry space — typically the new entry
-/// count — so we never claim to reuse more than the new request has.
+/// `new_breakpoints` and `new_breakpoint_hashes` are the new call's
+/// index-parallel columns — see [`PreparedCall::partial_hashes`].
 ///
-/// The returned pair was computed against the PREVIOUS entry list,
-/// but a hash match implies the canonical renders (and mixed image
-/// ids) agree over that prefix, so the prefix entries — and therefore
-/// both coordinates — are identical in the new list. Same equality
-/// argument the token-space version relied on, now covering media.
+/// # Why bytes alone are not enough (issue #91)
 ///
-/// Pure function; lifted out of `kv_setup_and_chunk_prefill` so its
-/// "longest match wins, capped" contract is directly testable
-/// without an engine.
+/// A hash match proves the two renders agree over that prefix in
+/// **bytes**. It does not prove they agree in **segmentation**: the
+/// cached entries are the ids the model actually emitted, the new ones
+/// are the tokenizer's re-reading of the render, and the two differ
+/// wherever generation was grammar-constrained — a grammar can force a
+/// bare `"` at a point where the tokenizer merges that quote into the
+/// following word.
+///
+/// The caller spends the result in two different spaces:
+/// `restore_to(pos)` addresses the KV, which holds the **cached**
+/// tokenization, while `new_entries[entry..]` addresses the **new**
+/// one. Measured cost of ignoring the difference (Qwen3.6, schema
+/// grammar): 2322 identical bytes occupied 616 cached entries and 613
+/// new ones, and reuse at 616 silently skipped three tokens of the new
+/// user message.
+///
+/// # Where a hash ends, versus where its breakpoint sits
+///
+/// These differ, and only for the tip — the subtlety that makes this
+/// function need the entry lists at all.
+///
+/// A prompt breakpoint's hash is the hash of the partial render whose
+/// tokenization *is* `bp.at.entry` entries long, so hash-end and
+/// breakpoint coincide. The auto-tip's hash covers the canonical
+/// re-render of the whole assistant turn **including its close
+/// marker**, while `tip.at` stays back at the KV head, because the
+/// close was predicted and never decoded (see [`tip_extension`]). So
+/// the tip's hash ends at `prev_entries.len()`, one or two entries
+/// past the position it offers for reuse.
+///
+/// # The check
+///
+/// Let `H` be where the hash ends in each list and `A = bp.at.entry`
+/// the position offered. Eligible when both hold:
+///
+/// 1. the two `H` agree, in entries *and* positions; and
+/// 2. `prev_entries[A..H] == new_entries[A..H]` token-for-token — the
+///    predicted-tail region, empty for prompt breakpoints.
+///
+/// Together with the hash those give `bytes(prev[..A]) ==
+/// bytes(new[..A])` by subtraction, which is exactly what makes
+/// restoring to `bp.at.pos` and prefilling `new_entries[A..]` sound.
+/// It is exact, not conservative: nothing safe is refused.
+///
+/// No `cap` argument is needed. The old one bounded the result by the
+/// new entry count; a matched new breakpoint is a position *in* the
+/// new entry list, so that bound now holds by construction.
 fn hash_keyed_l_hit(
-    breakpoints: &[Breakpoint],
-    tip: Option<&Breakpoint>,
+    slot: &PrefixSlot,
+    new_entries: &[CacheEntry],
+    new_breakpoints: &[EntryPos],
     new_breakpoint_hashes: &[[u8; 32]],
-    cap: usize,
-) -> EntryPos {
-    let new_set: std::collections::HashSet<&[u8; 32]> =
-        new_breakpoint_hashes.iter().collect();
-    let mut picked = EntryPos::default();
-    for bp in breakpoints.iter().chain(tip) {
+) -> HashKeyedHit {
+    debug_assert_eq!(new_breakpoints.len(), new_breakpoint_hashes.len());
+    let new_end_of: std::collections::HashMap<&[u8; 32], EntryPos> =
+        new_breakpoint_hashes
+            .iter()
+            .zip(new_breakpoints.iter().copied())
+            .collect();
+    // Each candidate paired with where its hash ends in `prev_entries`
+    // (see "Where a hash ends" above).
+    let candidates = slot.breakpoints.iter().map(|bp| (bp, bp.at)).chain(
+        slot.tip.iter().map(|bp| {
+            (
+                bp,
+                entry_pos_at(&slot.prev_entries, slot.prev_entries.len()),
+            )
+        }),
+    );
+    let mut out = HashKeyedHit::default();
+    for (bp, cached_end) in candidates {
         let Some(h) = bp.hash.as_ref() else {
             continue;
         };
-        if bp.at.entry <= cap
-            && bp.at.entry > picked.entry
-            && new_set.contains(h)
+        let Some(&new_end) = new_end_of.get(h) else {
+            continue;
+        };
+        let cached_tail = slot.prev_entries.get(bp.at.entry..cached_end.entry);
+        let new_tail = new_entries.get(bp.at.entry..new_end.entry);
+        let agrees = new_end == cached_end
+            && matches!((cached_tail, new_tail), (Some(c), Some(n)) if c == n);
+        if agrees {
+            if bp.at.entry > out.at.entry {
+                out.at = bp.at;
+            }
+        } else if out
+            .drifted
+            .is_none_or(|(cached, _)| cached_end.entry > cached.entry)
         {
-            picked = bp.at;
+            out.drifted = Some((cached_end, new_end));
         }
     }
-    picked
+    out
 }
 
 /// Cache-reuse length for a call.
@@ -1636,23 +1751,43 @@ fn compute_l_hit(
 }
 
 /// One slot's reuse offer for the new call: hash-keyed lookup first
-/// ([`hash_keyed_l_hit`] — trusts render-hash equality, sidesteps BPE
-/// drift), LCP fallback ([`compute_l_hit`]) second. Zero entry = the
-/// slot offers nothing.
+/// ([`hash_keyed_l_hit`] — render-hash equality confirmed in both
+/// coordinate spaces, so it can reach past a BPE boundary the LCP walk
+/// stops at), LCP fallback ([`compute_l_hit`]) second. Zero entry =
+/// the slot offers nothing.
+///
+/// The one log site for the #91 drift event: a candidate whose bytes
+/// matched but whose segmentation did not. It is a *performance*
+/// event, not an error — the fallback below is correct — but it is
+/// invisible everywhere else, so it gets a line.
 fn slot_l_hit(
     slot: &PrefixSlot,
     new_entries: &[CacheEntry],
     new_breakpoints: &[EntryPos],
     new_breakpoint_hashes: &[[u8; 32]],
 ) -> EntryPos {
-    let hash_picked = hash_keyed_l_hit(
-        &slot.breakpoints,
-        slot.tip.as_ref(),
+    let hashed = hash_keyed_l_hit(
+        slot,
+        new_entries,
+        new_breakpoints,
         new_breakpoint_hashes,
-        new_entries.len(),
     );
-    if hash_picked.entry > 0 {
-        hash_picked
+    if let Some((_cached, _new)) = hashed.drifted {
+        #[cfg(feature = "axum")]
+        tracing::debug!(
+            target: "drama_llama::session",
+            seq_id = slot.seq_id,
+            cached_entry = _cached.entry,
+            cached_pos = _cached.pos,
+            new_entry = _new.entry,
+            new_pos = _new.pos,
+            accepted_entry = hashed.at.entry,
+            "prefix-reuse: render hash matched but the two \
+             tokenizations disagree; hash hit refused (#91)",
+        );
+    }
+    if hashed.at.entry > 0 {
+        hashed.at
     } else {
         compute_l_hit(
             &slot.prev_entries,
@@ -6247,6 +6382,47 @@ mod tests {
         }
     }
 
+    /// Test shorthand: the new call's index-parallel breakpoint
+    /// columns, from `(entry, hash)` pairs. Every hash-keyed lookup
+    /// has to state where the new render puts those bytes — that
+    /// pairing is the whole subject of [`hash_keyed_l_hit`].
+    fn new_bps(rows: &[(usize, [u8; 32])]) -> (Vec<EntryPos>, Vec<[u8; 32]>) {
+        (
+            rows.iter().map(|(e, _)| ep(*e)).collect(),
+            rows.iter().map(|(_, h)| *h).collect(),
+        )
+    }
+
+    /// Test shorthand: `n` distinct hashes matching nothing — for
+    /// tests exercising the LCP path, whose new-call columns still
+    /// have to be index-parallel with their breakpoints.
+    fn unmatched_hashes(n: usize) -> Vec<[u8; 32]> {
+        (0..n)
+            .map(|i| hash_partial_text(&format!("unmatched {i}")))
+            .collect()
+    }
+
+    /// Test shorthand: `n` sequential token entries. Two lists built
+    /// this way agree token-for-token, so a tip's predicted-tail check
+    /// passes and the test is about the *positions*.
+    fn seq_entries(n: usize) -> Vec<CacheEntry> {
+        (0..n as Token).map(CacheEntry::Token).collect()
+    }
+
+    /// Test shorthand: a cached slot holding `prev_len` sequential
+    /// token entries, with the given hashed breakpoints and tip.
+    fn hashed_slot(
+        prev_len: usize,
+        breakpoints: Vec<Breakpoint>,
+        tip: Option<Breakpoint>,
+    ) -> PrefixSlot {
+        let mut slot = PrefixSlot::new(0, std::time::Instant::now());
+        slot.prev_entries = seq_entries(prev_len);
+        slot.breakpoints = breakpoints;
+        slot.tip = tip;
+        slot
+    }
+
     /// Test shorthand: a media entry with a distinguishing id byte
     /// and an M-RoPE-shaped span (many cells, few positions).
     fn media(id_byte: u8) -> CacheEntry {
@@ -7448,7 +7624,9 @@ mod tests {
         let new_entries: Vec<CacheEntry> =
             (0..8 as Token).map(CacheEntry::Token).collect();
         let new_bps = [ep(2), ep(4)];
-        let picked = select_slot(&[a, b], &new_entries, &new_bps, &[]).unwrap();
+        let picked =
+            select_slot(&[a, b], &new_entries, &new_bps, &unmatched_hashes(2))
+                .unwrap();
         assert_eq!(picked, (1, ep(4)));
     }
 
@@ -7462,7 +7640,9 @@ mod tests {
         let new_entries: Vec<CacheEntry> =
             (0..8 as Token).map(CacheEntry::Token).collect();
         let new_bps = [ep(4)];
-        let picked = select_slot(&[a, b], &new_entries, &new_bps, &[]).unwrap();
+        let picked =
+            select_slot(&[a, b], &new_entries, &new_bps, &unmatched_hashes(1))
+                .unwrap();
         assert_eq!(picked.0, 1, "most recently used wins the tie");
     }
 
@@ -7482,8 +7662,10 @@ mod tests {
         let new_entries: Vec<CacheEntry> =
             (0..8 as Token).map(CacheEntry::Token).collect();
         let new_bps = [ep(4), ep(6)];
+        // Columns are index-parallel: `h` pairs with `ep(6)`.
+        let new_hashes = [hash_partial_text("no match"), h];
         let picked =
-            select_slot(&[a, b], &new_entries, &new_bps, &[h]).unwrap();
+            select_slot(&[a, b], &new_entries, &new_bps, &new_hashes).unwrap();
         assert_eq!(picked, (0, ep(6)));
     }
 
@@ -7497,8 +7679,13 @@ mod tests {
         slot.breakpoints = vec![bp(4, None)];
         let new_entries: Vec<CacheEntry> =
             (0..8 as Token).map(CacheEntry::Token).collect();
-        let report = tripwire_violation(&[slot], &new_entries, &[ep(6)], &[])
-            .expect("fires");
+        let report = tripwire_violation(
+            &[slot],
+            &new_entries,
+            &[ep(6)],
+            &unmatched_hashes(1),
+        )
+        .expect("fires");
         assert!(report.contains("HARD"), "{report}");
     }
 
@@ -7511,8 +7698,13 @@ mod tests {
         let slot = aged_slot(0, 10, 100, now);
         let new_entries: Vec<CacheEntry> =
             (0..100 as Token).map(CacheEntry::Token).collect();
-        let report = tripwire_violation(&[slot], &new_entries, &[ep(80)], &[])
-            .expect("fires");
+        let report = tripwire_violation(
+            &[slot],
+            &new_entries,
+            &[ep(80)],
+            &unmatched_hashes(1),
+        )
+        .expect("fires");
         assert!(report.contains("drift"), "{report}");
     }
 
@@ -7527,9 +7719,13 @@ mod tests {
         slot.breakpoints = vec![bp(4, None)];
         let new_entries: Vec<CacheEntry> =
             (0..100 as Token).map(CacheEntry::Token).collect();
-        assert!(
-            tripwire_violation(&[slot], &new_entries, &[ep(50)], &[]).is_none()
-        );
+        assert!(tripwire_violation(
+            &[slot],
+            &new_entries,
+            &[ep(50)],
+            &unmatched_hashes(1)
+        )
+        .is_none());
     }
 
     #[test]
@@ -7558,8 +7754,13 @@ mod tests {
         let mut new_entries: Vec<CacheEntry> =
             (0..100 as Token).map(CacheEntry::Token).collect();
         new_entries.extend((500..600 as Token).map(CacheEntry::Token));
-        assert!(tripwire_violation(&[slot], &new_entries, &[ep(150)], &[])
-            .is_none());
+        assert!(tripwire_violation(
+            &[slot],
+            &new_entries,
+            &[ep(150)],
+            &unmatched_hashes(1),
+        )
+        .is_none());
     }
 
     #[test]
@@ -7568,7 +7769,13 @@ mod tests {
         let slot = aged_slot(0, 10, 0, now); // empty prev_entries
         let new_entries: Vec<CacheEntry> =
             (0..4 as Token).map(CacheEntry::Token).collect();
-        assert!(select_slot(&[slot], &new_entries, &[ep(2)], &[]).is_none());
+        assert!(select_slot(
+            &[slot],
+            &new_entries,
+            &[ep(2)],
+            &unmatched_hashes(1)
+        )
+        .is_none());
     }
 
     /// TTL expiry, end to end (backdated clock — no wall sleeping):
@@ -8308,22 +8515,24 @@ mod tests {
         assert_eq!(hash_segments(&["hello"], &[]), hash_partial_text("hello"));
     }
 
-    /// Single matching breakpoint hash → returns its position.
+    /// Single matching breakpoint hash at agreeing coordinates →
+    /// returns its position.
     #[test]
     fn test_hash_keyed_l_hit_single_breakpoint_match() {
         let h_a = hash_partial_text("aaa");
         let h_b = hash_partial_text("bbb");
-        let breakpoints = vec![bp(100, Some(h_a))];
-        // New request has hash matching cached breakpoint.
-        let new_hashes = vec![h_a];
+        let slot = hashed_slot(500, vec![bp(100, Some(h_a))], None);
+        let new_entries = seq_entries(500);
+        // New request marks the same bytes, ending at the same entry.
+        let (new_eps, new_hashes) = new_bps(&[(100, h_a)]);
         assert_eq!(
-            hash_keyed_l_hit(&breakpoints, None, &new_hashes, 500),
+            hash_keyed_l_hit(&slot, &new_entries, &new_eps, &new_hashes).at,
             ep(100)
         );
         // Different hash → no match.
-        let new_hashes_no_match = vec![h_b];
+        let (miss_eps, miss_hashes) = new_bps(&[(100, h_b)]);
         assert_eq!(
-            hash_keyed_l_hit(&breakpoints, None, &new_hashes_no_match, 500),
+            hash_keyed_l_hit(&slot, &new_entries, &miss_eps, &miss_hashes).at,
             ep(0)
         );
     }
@@ -8335,12 +8544,16 @@ mod tests {
         let h_a = hash_partial_text("aaa");
         let h_b = hash_partial_text("bbb");
         let h_c = hash_partial_text("ccc");
-        let breakpoints =
-            vec![bp(100, Some(h_a)), bp(200, Some(h_b)), bp(300, Some(h_c))];
+        let slot = hashed_slot(
+            500,
+            vec![bp(100, Some(h_a)), bp(200, Some(h_b)), bp(300, Some(h_c))],
+            None,
+        );
+        let new_entries = seq_entries(500);
         // New request matches 100 and 200 only (not 300).
-        let new_hashes = vec![h_a, h_b];
+        let (new_eps, new_hashes) = new_bps(&[(100, h_a), (200, h_b)]);
         assert_eq!(
-            hash_keyed_l_hit(&breakpoints, None, &new_hashes, 500),
+            hash_keyed_l_hit(&slot, &new_entries, &new_eps, &new_hashes).at,
             ep(200),
             "should pick the largest matching cached position",
         );
@@ -8348,75 +8561,114 @@ mod tests {
 
     /// Tip hash beats breakpoint hashes when its position is larger
     /// and matches.
+    ///
+    /// Also pins the tip's hash-end offset: the tip sits at 250 (the
+    /// KV head) but `prev_entries` runs to 251, and it is *251* the
+    /// new call's breakpoint has to agree with — the extra entry being
+    /// the predicted turn close. Comparing against 250 instead refuses
+    /// every tip, which is how this was caught.
     #[test]
     fn test_hash_keyed_l_hit_tip_beats_breakpoint() {
         let h_bp = hash_partial_text("aaa");
         let h_tip = hash_partial_text("bbb");
-        let breakpoints = vec![bp(100, Some(h_bp))];
-        let tip = bp(250, Some(h_tip));
-        let new_hashes = vec![h_bp, h_tip];
+        let slot = hashed_slot(
+            251,
+            vec![bp(100, Some(h_bp))],
+            Some(bp(250, Some(h_tip))),
+        );
+        let new_entries = seq_entries(400);
+        let (new_eps, new_hashes) = new_bps(&[(100, h_bp), (251, h_tip)]);
         // Tip at 250 with matching hash should win over bp at 100.
         assert_eq!(
-            hash_keyed_l_hit(&breakpoints, Some(&tip), &new_hashes, 500),
+            hash_keyed_l_hit(&slot, &new_entries, &new_eps, &new_hashes).at,
             ep(250),
         );
     }
 
-    /// Characterization of a KNOWN DEFECT (issue #91), pinned so the
-    /// fix has something to change.
+    /// Hash-ends agree, but the predicted tail the tip staked on is
+    /// not what the new render put there — so the boundary at the KV
+    /// head is unproven and the tip must be refused.
     ///
-    /// [`hash_keyed_l_hit`] returns the position it stored against the
-    /// PREVIOUS entry list, and the caller
-    /// (`kv_setup_and_chunk_prefill`) uses it to index the NEW list —
-    /// `restore_to(cache_read.pos)` then prefill `new_entries[
-    /// cache_read.entry..]`, with no translation step. Its doc
-    /// justifies that by claiming a hash match makes "the prefix
-    /// entries … identical in the new list".
+    /// This is the second half of the check. Equal hash-ends alone
+    /// would let a differently-split tail (same bytes, same entry
+    /// count, different boundary) through, and the reuse point sits
+    /// *below* that tail where the hash says nothing.
+    #[test]
+    fn hash_keyed_l_hit_refuses_a_mispredicted_tail() {
+        let h_tip = hash_partial_text("bbb");
+        let slot = hashed_slot(251, vec![], Some(bp(250, Some(h_tip))));
+        // Same length, same hash-end — but entry 250 differs.
+        let mut new_entries = seq_entries(400);
+        new_entries[250] = CacheEntry::Token(9999);
+        let (new_eps, new_hashes) = new_bps(&[(251, h_tip)]);
+        let hit = hash_keyed_l_hit(&slot, &new_entries, &new_eps, &new_hashes);
+        assert_eq!(hit.at, ep(0), "mispredicted tail must not be reused");
+        assert_eq!(hit.drifted, Some((ep(251), ep(251))));
+    }
+
+    /// Issue #91, the fix. Equal bytes at *unequal* coordinates is the
+    /// segmentation-drift case, and it must not be reused.
     ///
-    /// A hash match implies the **bytes** agree. It does not imply the
-    /// **segmentation** agrees, and this signature cannot bridge the
-    /// gap: `new_breakpoint_hashes` is a bare set of hashes with no
-    /// entry indices attached, so the function has no way to learn
-    /// where those bytes end in the new list. It can only ever return
-    /// prev-space.
+    /// The caller spends the returned pair in two spaces:
+    /// `restore_to(pos)` addresses the KV, which holds the cached
+    /// tokenization, and `new_entries[entry..]` addresses the new one.
+    /// Before the fix the hash alone was taken as proof both spaces
+    /// agreed; it only ever proved the *bytes* did.
     ///
     /// Measured live on Qwen3.6 with a schema-grammar turn: the same
-    /// 2322 bytes occupied 616 entries in `prev` and 613 in `new`
-    /// (the grammar forces a bare `"` where the tokenizer merges the
-    /// quote into the following word), so reuse at entry 616 skipped
+    /// 2322 bytes occupied 616 entries in `prev` and 613 in `new` (the
+    /// grammar forces a bare `"` where the tokenizer merges the quote
+    /// into the following word), so reuse at entry 616 skipped
     /// `new_entries[613..616]` — three tokens of the new user message,
     /// silently never decoded.
+    ///
+    /// Note what is NOT rejected here: a cached breakpoint at 300
+    /// whose hash matches at 300 still hits. Drift disqualifies the
+    /// drifted candidate, not the whole slot.
     #[test]
-    fn hash_keyed_l_hit_result_is_prev_space_issue_91() {
-        let h = hash_partial_text("same bytes, two segmentations");
-        // The stored tip: those bytes ended at entry 616 in the list
-        // the model actually emitted.
-        let tip = bp(616, Some(h));
-        // The new call hashes the same bytes — but the only thing this
-        // function receives is the hash itself. Whether they end at
-        // 613, 616 or 620 in the new list is not expressible.
-        let new_hashes = vec![h];
+    fn hash_keyed_l_hit_refuses_drifted_coordinates_issue_91() {
+        let h_mid = hash_partial_text("earlier turn, canonical both ways");
+        let h_tip = hash_partial_text("same bytes, two segmentations");
+        // The cached tip: the KV head at 616 in the list the model
+        // actually emitted under a grammar, hash-end one past it.
+        let slot = hashed_slot(
+            617,
+            vec![bp(300, Some(h_mid))],
+            Some(bp(616, Some(h_tip))),
+        );
+        let new_entries = seq_entries(700);
+        // The new render puts the same bytes three entries earlier,
+        // because the tokenizer merges what the grammar split.
+        let (new_eps, new_hashes) = new_bps(&[(300, h_mid), (614, h_tip)]);
+        let hit = hash_keyed_l_hit(&slot, &new_entries, &new_eps, &new_hashes);
         assert_eq!(
-            hash_keyed_l_hit(&[], Some(&tip), &new_hashes, 1000),
-            ep(616),
-            "returns the PREV-space entry; the caller then indexes \
-             new_entries with it (#91)"
+            hit.at,
+            ep(300),
+            "the drifted tip must not be reused; the agreeing \
+             breakpoint below it still can",
+        );
+        assert_eq!(
+            hit.drifted,
+            Some((ep(617), ep(614))),
+            "the refusal is reported — it is the only signal this \
+             failure mode has (#91)",
         );
     }
 
-    /// `cap` argument bounds the result — a cached position > cap is
-    /// rejected even if the hash matches. Protects against claiming
-    /// to reuse more tokens than the new request has.
+    /// The old `cap` argument is gone; the bound it enforced now holds
+    /// by construction. A cached position past the end of the new
+    /// entry list cannot match, because a matched hash carries a
+    /// position *in* that list and the two must be equal.
     #[test]
-    fn test_hash_keyed_l_hit_cap_bound() {
+    fn test_hash_keyed_l_hit_cannot_exceed_the_new_list() {
         let h = hash_partial_text("aaa");
-        let breakpoints = vec![bp(100, Some(h)), bp(800, Some(h))];
-        let new_hashes = vec![h];
-        // Cap at 500 → 800 rejected, falls back to 100.
-        assert_eq!(
-            hash_keyed_l_hit(&breakpoints, None, &new_hashes, 500),
-            ep(100),
-        );
+        // Cached at 800; the new render puts those bytes at 100.
+        let slot = hashed_slot(900, vec![bp(800, Some(h))], None);
+        let new_entries = seq_entries(200);
+        let (new_eps, new_hashes) = new_bps(&[(100, h)]);
+        let hit = hash_keyed_l_hit(&slot, &new_entries, &new_eps, &new_hashes);
+        assert_eq!(hit.at, ep(0));
+        assert_eq!(hit.drifted, Some((ep(800), ep(100))));
     }
 
     /// No match at all → returns 0.
@@ -8425,34 +8677,44 @@ mod tests {
         let h_a = hash_partial_text("aaa");
         let h_b = hash_partial_text("bbb");
         let breakpoints = vec![bp(100, Some(h_a)), bp(200, Some(h_a))];
-        let new_hashes = vec![h_b];
+        let new_entries = seq_entries(400);
+        let (new_eps, new_hashes) = new_bps(&[(301, h_b)]);
+        let hit_b = hash_keyed_l_hit(
+            &hashed_slot(301, breakpoints.clone(), Some(bp(300, Some(h_b)))),
+            &new_entries,
+            &new_eps,
+            &new_hashes,
+        );
         assert_eq!(
-            hash_keyed_l_hit(
-                &breakpoints,
-                Some(&bp(300, Some(h_b))),
-                &new_hashes,
-                500,
-            ),
+            hit_b.at,
             ep(300),
             "tip with matching hash should still win even when bps miss",
         );
-        assert_eq!(
-            hash_keyed_l_hit(
-                &breakpoints,
-                Some(&bp(300, Some(h_a))),
-                &new_hashes,
-                500,
-            ),
-            ep(0),
-            "no hashes match → 0",
+        let hit_a = hash_keyed_l_hit(
+            &hashed_slot(301, breakpoints, Some(bp(300, Some(h_a)))),
+            &new_entries,
+            &new_eps,
+            &new_hashes,
         );
+        assert_eq!(hit_a.at, ep(0), "no hashes match → 0");
+        assert_eq!(hit_a.drifted, None, "a plain miss is not drift");
     }
 
     /// Empty side-table → 0, regardless of new hashes.
     #[test]
     fn test_hash_keyed_l_hit_empty_side_table() {
         let h = hash_partial_text("aaa");
-        assert_eq!(hash_keyed_l_hit(&[], None, &[h], 500), ep(0));
+        let (new_eps, new_hashes) = new_bps(&[(100, h)]);
+        assert_eq!(
+            hash_keyed_l_hit(
+                &hashed_slot(0, vec![], None),
+                &seq_entries(200),
+                &new_eps,
+                &new_hashes,
+            )
+            .at,
+            ep(0)
+        );
     }
 
     /// The emit-side ban set on a real vocab (Qwen 3.6): turn-open
