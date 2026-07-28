@@ -268,6 +268,16 @@ for the current arc:
   supplies form, pretraining supplies voice) for Agora SOUL-document
   generation; EOG-at-message-end design lives there. Read before
   touching templates, `ReasoningReingest`, or the dialect layer.
+- [`mistral4_support_and_metal_nan.md`](.claude/memory/mistral4_support_and_metal_nan.md)
+  — **read before debugging a NaN on Mistral Small 4, and before
+  re-testing flash attention or the quant — both are ruled out with
+  evidence.** Template/dialect/registry support landed (the
+  `[TOOL_CALLS]name[ARGS]{…}` format needed *zero* new code — the
+  analyzer derives it as `TagWithJson`); generation on Metal is blocked
+  by an upstream all-NaN-logits bug above 32 prefill tokens, localized
+  to `ne21_mm_id_min` (the MoE `mul_mv_id`→`mul_mm_id` switch), CPU
+  clean. Also carries `DecodeError::NonFinite` and the open question of
+  the predictor's three `.expect()` sites that still panic on it.
 - [`plan_ci_self_hosted_runner.md`](.claude/memory/plan_ci_self_hosted_runner.md)
   — **read first if this session is on the remote runner box.** CI's
   first-run state (green both OSes bar four model-needing "unignored"
