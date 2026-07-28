@@ -86,6 +86,23 @@ pub static GPTOSS: BakedTemplate = BakedTemplate {
     replacement: include_str!("../templates/gptoss-cache-stable.jinja"),
 };
 
+/// gpt-oss again, second detection key (#99): the **upstream OpenAI**
+/// template, as embedded by GGUFs converted directly from the OpenAI
+/// weights (validated against `gpt-oss-120b-MXFP4.gguf`). [`GPTOSS`]'s
+/// key is the Unsloth-patched 20b dump; the two differ structurally
+/// (developer-message handling, a `<|channel|>`-in-content guard,
+/// compact `tojson` args), so byte-equality can never match both.
+/// Same replacement — the stock defects it fixes are shared, and
+/// without this key an upstream-converted gpt-oss landed on the
+/// best-effort tier, where the stock template drops prior-turn
+/// analysis: cache broken at every turn, and the model reasons from a
+/// transcript with its own thinking amputated.
+pub static GPTOSS_UPSTREAM: BakedTemplate = BakedTemplate {
+    name: "gptoss-upstream-cache-stable",
+    stock: include_str!("../templates/gptoss-upstream-gguf.jinja"),
+    replacement: include_str!("../templates/gptoss-cache-stable.jinja"),
+};
+
 /// Cogito (Qwen2.5-based, Hermes-style JSON calls). The stock
 /// template re-renders call arguments through `tojson` (compact)
 /// while the model's unforced habit is uniform `json.dumps` spacing
@@ -124,7 +141,8 @@ pub static MISTRAL4: BakedTemplate = BakedTemplate {
 /// Every baked template, in detection order. Order is cosmetic —
 /// stock templates are mutually distinct byte strings, so at most one
 /// entry can match.
-pub static ALL: &[&BakedTemplate] = &[&GEMMA4, &GPTOSS, &COGITO, &MISTRAL4];
+pub static ALL: &[&BakedTemplate] =
+    &[&GEMMA4, &GPTOSS, &GPTOSS_UPSTREAM, &COGITO, &MISTRAL4];
 
 /// Match an embedded template against the registry. `Some` only on
 /// byte-equality with a known stock template (trailing whitespace
@@ -210,7 +228,16 @@ mod tests {
                 .unwrap_or_else(|| {
                     panic!("{}: drift alarm must recognize it", baked.name)
                 });
-            assert_eq!(near.name, baked.name);
+            // Family, not entry: two detection keys may share a
+            // dialect (the two gpt-oss stocks, #99), and the alarm's
+            // job is naming a family whose replacement would serve —
+            // which entry of it answers is unspecified.
+            assert_eq!(
+                near.replacement as *const str, baked.replacement as *const str,
+                "{}: the named family must share this entry's \
+                 replacement",
+                baked.name
+            );
         }
     }
 

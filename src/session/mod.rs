@@ -2241,11 +2241,20 @@ fn apply_template_sidecar<B: Backend>(
 ) -> Session<B> {
     match crate::sidecar::load_template_source(sidecar_path) {
         Ok(Some(source)) => {
-            if let Err(e) = session.set_template_source(source) {
-                tracing::warn!(
+            match session.set_template_source(source) {
+                // Success logs too (#99): rung 1 was the only silent
+                // rung, so a log could prove the stock path but never
+                // confirm the sidecar — and a *dangling* sidecar
+                // symlink reads as `NotFound`, i.e. as "no sidecar",
+                // making its absence from the log ambiguous three ways.
+                Ok(()) => tracing::info!(
+                    "chat template: sidecar at {sidecar_path:?} applied \
+                     (overrides any baked replacement)"
+                ),
+                Err(e) => tracing::warn!(
                     "template sidecar at {sidecar_path:?} failed to \
                      compile: {e}; using the model's embedded template"
-                );
+                ),
             }
             session
         }
