@@ -268,6 +268,16 @@ for the current arc:
   supplies form, pretraining supplies voice) for Agora SOUL-document
   generation; EOG-at-message-end design lives there. Read before
   touching templates, `ReasoningReingest`, or the dialect layer.
+- [`plan_fallible_predictors.md`](.claude/memory/plan_fallible_predictors.md)
+  — **plan-of-record ([issue #92](https://github.com/mdegans/drama_llama/issues/92)),
+  designed but deliberately NOT implemented.** The prediction iterators
+  are infallible, so every decode error becomes a panic — and in a
+  serving loop, a *panic loop*. Agreed direction: `take_error()` plus
+  `Engine::nan_policy()` (`Stop` | `RetryChunked`) now, non-breaking;
+  the full `Item = Result` at 1.0. Read before touching `predictor.rs`
+  — it carries the measured blast radius (32 sites, only 4 of them
+  production, all in `session/mod.rs`), why `RetryChunked` needs no
+  trait changes, and why `BlockStream` is the one hard site.
 - [`mistral4_support_and_metal_nan.md`](.claude/memory/mistral4_support_and_metal_nan.md)
   — **read before debugging a NaN on Mistral Small 4, and before
   re-testing flash attention or the quant — both are ruled out with
