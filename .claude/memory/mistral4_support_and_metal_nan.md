@@ -99,11 +99,19 @@ changes vs stock, each pinned in `tests/dialect_roundtrip.rs`:
 5. Role-alternation `raise_exception` dropped; mid-conversation system
    turns render in `[SYSTEM_PROMPT]` framing rather than raising.
 
-Argument interiors stay `tojson`-**compact**, matching stock, because
-the model's unforced habit is **not yet measured** — the probe is
-written (`probe_unforced_habit::mistral4_unforced_call_spelling`) but
-cannot run until decode works. If it comes back uniformly spaced, the
-fix is the cogito one-liner: `| tojson` -> `| json_dumps`.
+6. Argument interiors render with `| json_dumps`, not stock's
+   `| tojson`. **Measured** once decode worked
+   (`probe_unforced_habit::mistral4_unforced_call_spelling`, greedy, no
+   grammar): the unforced emission is
+   `[TOOL_CALLS]create_post[ARGS]{"community": "debate", "title": ...}`
+   — uniform `": "` and `", "`, including between array elements. So
+   the habit is `JsonSpacing::Spaced` and stock's compact spelling would
+   have forced the model off it to stay round-trip stable (#85's
+   lesson). The analyzer measures the swap as `Spaced` and the grammar
+   prelude plus `render_reference` follow. Same one-liner cogito took.
+   The same probe answered the `[CALL_ID]` question: the model never
+   volunteers one, so `CallIdPosition::None` is correct and the
+   re-render has nothing it cannot reproduce.
 
 **Vision needs no template or dialect work.** Images never reach the
 template layer: `Session` renders a per-call random sentinel, splits
