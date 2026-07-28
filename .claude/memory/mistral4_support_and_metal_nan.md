@@ -117,8 +117,25 @@ changes vs stock, each pinned in `tests/dialect_roundtrip.rs`:
 template layer: `Session` renders a per-call random sentinel, splits
 the render on it, and hands mtmd the image chunks out-of-band, so
 pixtral's `[IMG_END]` framing comes from mtmd. The mmproj auto-loads
-from the `<model>.mmproj.gguf` sidecar. Untested end-to-end (no vision
-test exists anywhere in `tests/` to model one on — a genuine gap).
+from the `<model>.mmproj.gguf` sidecar. **Untested on this model**, but
+vision tests DO exist — I claimed otherwise and was wrong (Mike caught
+it): five of them in `src/llama_cpp/mtmd.rs`'s `#[cfg(test)]` module
+(`tokenize_chunk_structure`, `prefill_image_smoke`,
+`segment_tokenize_differential`, `eval_loop_differential_vs_helper`,
+`mrope_kv_semantics_probe`). A subagent grepped `tests/` only and I
+generalized its miss into "none anywhere" — vision coverage lives in
+`src/`, not `tests/`.
+
+They are **single-model by construction**: `local_vision_paths()`
+(`mtmd.rs:954`) resolves `models/model.gguf`, the symlink, so they only
+ever cover whatever it points at (Qwen3.6 today). Making them
+multi-model wants the `session_mistral4.rs` pattern — env var →
+conventional path → loud skip, never substitute. Mike is taking that in
+a parallel coverage session.
+
+**Cannot run in CI**: Mistral Small 4 is 44 GB (IQ3_S) / 74 GB (Q4) and
+will not fit the self-hosted runner's 3090 (24 GB). Its vision coverage
+is M2-Max-only. See [[plan_ci_self_hosted_runner]].
 
 `tests/session_mistral4.rs` is the **first test in the repo that
 observes rung 2 end-to-end on a real model**: it deliberately installs
