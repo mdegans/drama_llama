@@ -108,6 +108,34 @@ fn mark_last_block(content: &mut Content) {
     }
 }
 
+/// One-word tag per block kind, for the per-round trace below.
+fn block_kind(block: &Block) -> &'static str {
+    match block {
+        Block::Text { .. } => "text",
+        Block::Thought { .. } => "thinking",
+        Block::ToolUse { .. } => "tool_use",
+        Block::ToolResult { .. } => "tool_result",
+        _ => "other",
+    }
+}
+
+/// Trace a round's shape to stderr: which block kinds the model
+/// produced, and the usage that the assertions run against. Quiet on
+/// green captured runs (cargo swallows stderr), decisive on red: the
+/// first triage question for a tip miss is "did this turn carry
+/// reasoning, and did it survive re-ingest?" — this answers half of
+/// it from the failure output alone.
+fn trace_round(label: &str, resp: &drama_llama::prompt::MessageResponse) {
+    let kinds: Vec<&str> =
+        resp.inner.content.0.iter().map(block_kind).collect();
+    eprintln!(
+        "{label}: blocks={kinds:?} input={} read={:?} output={}",
+        resp.usage.input_tokens,
+        resp.usage.cache_read_input_tokens,
+        resp.usage.output_tokens,
+    );
+}
+
 /// A user message whose single text block carries an ephemeral marker.
 fn marked_user(text: String) -> Message {
     Message {
@@ -172,6 +200,7 @@ pub fn assert_tip_anchors_across_tool_rounds(
         let resp = session
             .complete_response(&prompt)
             .unwrap_or_else(|e| panic!("tool round {round}: {e}"));
+        trace_round(&format!("tool round {round}"), &resp);
         if round > 0 {
             let read =
                 resp.usage.cache_read_input_tokens.unwrap_or_default() as u64;
@@ -239,6 +268,7 @@ pub fn assert_tip_anchors_across_tool_rounds(
     // a call — #88 phase 5's lesson).
     prompt.tool_choice = None;
     let resp = session.complete_response(&prompt).expect("final round");
+    trace_round("final round", &resp);
     let read = resp.usage.cache_read_input_tokens.unwrap_or_default() as u64;
     assert!(
         read > prev_input,
@@ -265,6 +295,7 @@ pub fn assert_tip_anchors_unmarked_continuation(session: LlamaCppSession) {
     };
 
     let r1 = session.complete_response(&prompt).expect("round 1");
+    trace_round("round 1", &r1);
     let input1 = r1.usage.input_tokens as u64;
 
     prompt.messages.push(Message {
@@ -277,6 +308,7 @@ pub fn assert_tip_anchors_unmarked_continuation(session: LlamaCppSession) {
     });
 
     let r2 = session.complete_response(&prompt).expect("round 2");
+    trace_round("round 2", &r2);
     let read2 = r2.usage.cache_read_input_tokens.unwrap_or_default() as u64;
     assert!(
         read2 > input1,
