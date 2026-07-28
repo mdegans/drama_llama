@@ -31,14 +31,16 @@ use drama_llama::{
 };
 use serde_json::json;
 
-/// The cogito-family model this probe needs, or `None` to skip.
-fn model_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("DRAMA_LLAMA_COGITO_MODEL") {
+/// Resolve a probe's model: `$env_var` if set and present, else the
+/// conventional path under `models/`. `None` means skip — never
+/// substitute `model.gguf`.
+fn model_path(env_var: &str, conventional: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(env_var) {
         let p = PathBuf::from(p);
         return p.exists().then_some(p);
     }
-    let conventional = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("models/cogito-32b.gguf");
+    let conventional =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(conventional);
     conventional.exists().then_some(conventional)
 }
 
@@ -49,14 +51,54 @@ fn model_path() -> Option<PathBuf> {
 #[test]
 #[ignore = "long running"]
 fn cogito_unforced_call_spelling() {
-    let Some(path) = model_path() else {
+    let Some(path) =
+        model_path("DRAMA_LLAMA_COGITO_MODEL", "models/cogito-32b.gguf")
+    else {
         eprintln!(
             "SKIP: needs a cogito model (DRAMA_LLAMA_COGITO_MODEL or \
              models/cogito-32b.gguf)"
         );
         return;
     };
+    probe_unforced_call(path);
+}
 
+/// The same measurement for Mistral Small 4, whose owned template
+/// currently keeps stock's `tojson`-compact argument interior on the
+/// grounds that nothing has measured the alternative. This is that
+/// measurement. Two things to read off the printed emission:
+///
+/// 1. **Separator spacing.** Uniform `": "` / `", "` means the habit is
+///    `JsonSpacing::Spaced` and the owned template should swap
+///    `| tojson` → `| json_dumps`, exactly as cogito did (#88 phase 2).
+///    Compact means stock's spelling was already the habit and the
+///    template is right as written.
+/// 2. **`[CALL_ID]`.** The vocab has that token but neither template
+///    emits it. If the model volunteers one unforced, the re-render
+///    cannot reproduce it and every tool turn breaks byte-stability —
+///    which would make `CallIdSyntax` a required part of this dialect
+///    rather than the `None` the analyzer derived.
+#[test]
+#[ignore = "long running"]
+fn mistral4_unforced_call_spelling() {
+    let Some(path) = model_path(
+        "DRAMA_LLAMA_MISTRAL_MODEL",
+        "models/Mistral-Small-4-119B-2603-UD-IQ3_S.gguf",
+    ) else {
+        eprintln!(
+            "SKIP: needs a Mistral Small 4 model \
+             (DRAMA_LLAMA_MISTRAL_MODEL or \
+             models/Mistral-Small-4-119B-2603-UD-IQ3_S.gguf)"
+        );
+        return;
+    };
+    probe_unforced_call(path);
+}
+
+/// The probe body: render a tools-bearing prompt through the model's
+/// *own* embedded template, predict greedily with no grammar, print
+/// every byte.
+fn probe_unforced_call(path: PathBuf) {
     drama_llama::silence_logs();
     let mut engine = LlamaCppEngine::from_path_with_n_ctx(path, 4096)
         .expect("model loads")

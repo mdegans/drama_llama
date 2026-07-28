@@ -95,6 +95,53 @@ pub enum DecodeError {
         "batch of {n_tokens} tokens exceeds the context's n_batch of {n_batch}"
     )]
     BatchTooLarge { n_tokens: usize, n_batch: u32 },
+    /// `llama_decode` reported success but the logits it produced
+    /// contain a non-finite value (NaN/Inf).
+    ///
+    /// This is a *decode* failure wearing a success return code, and
+    /// without this check it surfaces far from its cause: every
+    /// comparison against NaN is false, so the first thing to notice is
+    /// `partial_cmp(…).unwrap()` panicking inside
+    /// [`Candidates::sort`](crate::Candidates::sort) — which reads like
+    /// a sampler bug when the sampler is the one component that did
+    /// nothing wrong.
+    ///
+    /// Causes seen in practice are backend-side, not ours: a kernel
+    /// that has no correct path for the model's shapes or quantization
+    /// on the active device. The 2026-07-28 case was Mistral Small 4
+    /// (`mistral4`, DeepSeek-2 MLA graph) on Metal, where prefills of
+    /// ≥32 tokens returned an entirely NaN vocabulary while the same
+    /// prompt on CPU was clean — 32 being `ne21_mm_id_min`, the
+    /// `mul_mv_id` → `mul_mm_id` switch for the MoE matmul. When this
+    /// fires, compare against `no_gpu` / a different backend before
+    /// suspecting anything in this crate.
+    ///
+    /// Treated as KV-dirty: NaN is contagious through the KV cache, so
+    /// the cells this decode wrote must be wiped rather than reused.
+    #[error(
+        "decode produced a non-finite logit ({value}) at index {index}; \
+         the KV cache is poisoned and must be wiped. This is a backend \
+         failure, not a sampling one — try a different backend (e.g. \
+         `LlamaCppOptions::cpu_only`) to confirm"
+    )]
+    NonFinite { index: usize, value: f32 },
+}
+
+/// Locate the first non-finite value in a logit slice, or `None` when
+/// every value is finite.
+///
+/// Split out from the decode path so the predicate is testable without
+/// a model, and shaped for the hot loop: the common case is one
+/// vectorizable `all` pass, and only a slice that has already failed
+/// pays for the second pass that locates the offender.
+pub(crate) fn first_non_finite(logits: &[f32]) -> Option<(usize, f32)> {
+    if logits.iter().all(|l| l.is_finite()) {
+        return None;
+    }
+    logits
+        .iter()
+        .position(|l| !l.is_finite())
+        .map(|i| (i, logits[i]))
 }
 
 impl DecodeError {
@@ -112,7 +159,10 @@ impl DecodeError {
             Self::NoKvSlot
             | Self::InvalidBatch
             | Self::BatchTooLarge { .. } => false,
-            Self::Aborted | Self::Fatal { .. } | Self::ErrorCode { .. } => true,
+            Self::Aborted
+            | Self::Fatal { .. }
+            | Self::ErrorCode { .. }
+            | Self::NonFinite { .. } => true,
         }
     }
 }
@@ -610,6 +660,22 @@ impl LlamaCppDecoder {
         unsafe { std::slice::from_raw_parts(ptr, self.n_vocab) }
     }
 
+    /// [`Self::logits`], rejecting a row that came back non-finite.
+    ///
+    /// This is the guard on the decode path — see
+    /// [`DecodeError::NonFinite`] for why a NaN logit must be caught
+    /// here rather than allowed to reach the sampler, and what tends to
+    /// cause one.
+    pub fn logits_checked(&self, i: usize) -> Result<&[f32], DecodeError> {
+        let logits = self.logits(i);
+        match first_non_finite(logits) {
+            None => Ok(logits),
+            Some((index, value)) => {
+                Err(DecodeError::NonFinite { index, value })
+            }
+        }
+    }
+
     /// Mutable logits for the i'th token.
     ///
     /// # Panics
@@ -701,7 +767,7 @@ impl Decoder for LlamaCppDecoder {
         if tokens.is_empty() {
             Ok(&[])
         } else {
-            Ok(self.logits(tokens.len() - 1))
+            self.logits_checked(tokens.len() - 1)
         }
     }
 
@@ -718,7 +784,7 @@ impl Decoder for LlamaCppDecoder {
             .add_token(token, pos, Some(&seq_ids), true)
             .expect("step add_token failed (should be unreachable)");
         self.decode(&batch)?;
-        Ok(self.logits(0))
+        self.logits_checked(0)
     }
 
     fn n_ctx(&self) -> u32 {
@@ -840,6 +906,47 @@ mod tests {
     use crate::llama_cpp::LlamaCppEngine;
 
     const PROMPT: &str = "The quick brown fox jumps over the lazy dog.";
+
+    /// The NaN guard's pure core, pinned model-free. The fast path must
+    /// pass a clean slice through, and both flavours of non-finite must
+    /// be caught — `is_nan()` alone would let an `inf` logit reach the
+    /// sampler, where it is just as wrong and much quieter (it sorts,
+    /// it just always wins).
+    #[test]
+    fn first_non_finite_finds_both_flavours() {
+        assert_eq!(first_non_finite(&[]), None);
+        assert_eq!(first_non_finite(&[-1.0, 0.0, 21.5]), None);
+
+        let (i, v) = first_non_finite(&[1.0, f32::NAN, 3.0]).expect("nan");
+        assert_eq!(i, 1);
+        assert!(v.is_nan(), "{v}");
+
+        assert_eq!(
+            first_non_finite(&[1.0, 2.0, f32::INFINITY]),
+            Some((2, f32::INFINITY))
+        );
+        assert_eq!(
+            first_non_finite(&[f32::NEG_INFINITY, 2.0]),
+            Some((0, f32::NEG_INFINITY))
+        );
+
+        // The whole-slice case: the Mistral-on-Metal shape, where every
+        // logit is NaN. The reported index is the first, not the last.
+        let all_nan = [f32::NAN; 8];
+        let (i, _) = first_non_finite(&all_nan).expect("nan");
+        assert_eq!(i, 0);
+    }
+
+    /// A non-finite decode leaves poisoned cells behind, so callers
+    /// must wipe rather than reuse — same contract as `Aborted`.
+    #[test]
+    fn non_finite_is_kv_dirty() {
+        assert!(DecodeError::NonFinite {
+            index: 0,
+            value: f32::NAN
+        }
+        .kv_dirty());
+    }
 
     fn model() -> LlamaCppModel {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
