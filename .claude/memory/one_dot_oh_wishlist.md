@@ -29,6 +29,18 @@ in 0.8.0; this is what remains.
 
 ## Quality, non-breaking, any time
 
+- **Raise the effective default `n_ctx` to 32k** (Mike, 2026-07-28,
+  during #96). `LlamaCppOptions::n_ctx: None` inherits llama.cpp's
+  512 — reasonable once, now an ambush: the #96 e2e suite hit the KV
+  ceiling mid-tool-call on round 3 and needed explicit
+  `with_n_ctx(8192)` in four suites, and blallama once served every
+  model at 512 (the per-backend-options bug). 32k "is no longer
+  excessive." Decide the mechanism when doing it: change our default
+  when `n_ctx` is `None` (surprising for tiny-VRAM users? KV for 32k
+  on a 70B is real memory) vs. keep `None` = upstream and make every
+  constructor path in examples/bins/tests pass something sane. Either
+  way the 512 inherit should stop being the silent default a Session
+  lands on.
 - **Permutation-wide clippy.** The sweep and the gate both landed
   2026-07-24 (`test.py clippy` → `just clippy` → `just check` → CI
   job, `-D warnings`), covering the llama-cpp configuration's full
