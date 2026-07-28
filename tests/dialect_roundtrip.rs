@@ -1318,3 +1318,166 @@ fn dict_family_stays_dictsort_alphabetical() {
          {emission:?}\n--- template re-render ---\n{rendered:?}"
     );
 }
+
+/// Mistral Small 4 stock (`mistral4` arch). The call-rendering path —
+/// `[TOOL_CALLS]name[ARGS]{…}`, name outside the JSON, no wrapper
+/// object — is what the owned template leaves byte-identical, so both
+/// halves of the pair carry this pin.
+#[test]
+fn reconstruct_mistral4_gguf() {
+    assert_reconstruction("mistral4-gguf.jinja", "<s>", "</s>");
+}
+
+/// The owned Mistral template (#88): everything outside the turn-close
+/// and the reasoning channel is byte-identical to stock, and the calls
+/// must survive the rewrite untouched.
+#[test]
+fn reconstruct_mistral4_cache_stable() {
+    assert_reconstruction("mistral4-cache-stable.jinja", "<s>", "</s>");
+}
+
+/// The cache property the owned template exists for. Stock closes
+/// every assistant message with `</s>` and has no
+/// `add_generation_prompt` branch at all, so it cannot render an open
+/// turn; the replacement emits the close per message and the
+/// generation prompt is simply the render up to it.
+#[test]
+fn mistral4_cache_stable_prefix_continuity() {
+    assert_prefix_continuity(
+        fixture_source("mistral4-cache-stable.jinja"),
+        "</s>",
+    );
+}
+
+/// The `[THINK]` channel, which stock cannot round-trip at all: it
+/// accepts reasoning only as a `thinking`-typed content chunk, never
+/// as a message field, so a `ReasoningReingest::Field` transcript
+/// reaches it with empty `content` and trips its own
+/// `raise_exception`. The replacement renders `[THINK]…[/THINK]` from
+/// `reasoning_content`, and `preserve_thinking` keeps it once a later
+/// user turn has aged it.
+#[test]
+fn mistral4_cache_stable_thinking_continuity() {
+    use drama_llama::dialect::ReasoningReingest;
+
+    let source = fixture_source("mistral4-cache-stable.jinja");
+    let template = ChatTemplate::from_source(
+        source,
+        "<s>".to_string(),
+        "</s>".to_string(),
+    )
+    .expect("template compiles");
+    let opts = |gen: bool, preserve: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", true)
+            .with_extra("preserve_thinking", preserve)
+            .with_thought_reingest(ReasoningReingest::Field)
+    };
+    let thought = "Paris is in France, so I want European weather.";
+    let turn = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("What's the weather in Paris?"),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![
+                    Block::Thought {
+                        thought: Cow::Borrowed(thought),
+                        signature: Cow::Borrowed(""),
+                    },
+                    Block::Text {
+                        text: Cow::Borrowed("22C and sunny."),
+                        cache_control: None,
+                        citations: None,
+                    },
+                ]),
+            },
+        ],
+        ..Default::default()
+    };
+
+    let f = template
+        .render_with(&turn, &opts(false, true))
+        .expect("render");
+    let emission = format!("[THINK]{thought}[/THINK]22C and sunny.</s>");
+    assert!(
+        f.contains(&emission),
+        "the thought channel must re-render byte-exact.\n\
+         --- want ---\n{emission:?}\n--- got ---\n{f:?}"
+    );
+
+    // Aging: a later user turn must not disturb the prior render.
+    let mut aged = turn.clone();
+    aged.messages.push(Message {
+        role: Role::User,
+        content: Content::text("And in London?"),
+    });
+    let f_aged = template
+        .render_with(&aged, &opts(true, true))
+        .expect("render");
+    assert!(
+        f_aged.starts_with(&f),
+        "aged render must extend the prior render byte-for-byte.\n\
+         --- prior ---\n{f:?}\n--- aged ---\n{f_aged:?}"
+    );
+
+    // Control: without the flag the aged thought drops, so the flag is
+    // load-bearing here exactly as it is for Qwen and Gemma.
+    let stripped = template
+        .render_with(&aged, &opts(true, false))
+        .expect("render");
+    assert!(
+        !stripped.contains(thought),
+        "control: aged thinking must drop without preserve_thinking.\
+         \n{stripped:?}"
+    );
+}
+
+/// Why the owned template is not optional for thinking transcripts:
+/// the same `ReasoningReingest::Field` prompt the replacement renders
+/// fine reaches stock with empty `content` and no `thinking` chunk,
+/// and stock raises rather than rendering. Pinned so a future stock
+/// re-dump that fixes this upstream is noticed rather than assumed.
+#[test]
+fn mistral4_stock_cannot_render_field_reasoning() {
+    use drama_llama::dialect::ReasoningReingest;
+
+    let template = ChatTemplate::from_source(
+        fixture_source("mistral4-gguf.jinja"),
+        "<s>".to_string(),
+        "</s>".to_string(),
+    )
+    .expect("template compiles");
+    let thought = "Paris is in France.";
+    let prompt = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("What's the weather in Paris?"),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![Block::Thought {
+                    thought: Cow::Borrowed(thought),
+                    signature: Cow::Borrowed(""),
+                }]),
+            },
+        ],
+        ..Default::default()
+    };
+    let opts = RenderOptions::default()
+        .with_generation_prompt(false)
+        .with_thought_reingest(ReasoningReingest::Field);
+    match template.render_with(&prompt, &opts) {
+        Err(_) => {}
+        Ok(rendered) => assert!(
+            !rendered.contains(thought),
+            "stock gained field-reasoning support — re-check whether \
+             the owned template still needs its reasoning patch.\n\
+             {rendered:?}"
+        ),
+    }
+}

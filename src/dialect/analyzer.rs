@@ -32,7 +32,7 @@ use super::segment::{
 };
 use super::{
     CallIdPosition, CallSyntax, ContentMode, ContentSyntax, Family, JsonFields,
-    ReasoningMode, ReasoningSyntax,
+    ReasoningMode, ReasoningReingest, ReasoningSyntax,
 };
 
 // Sentinel payloads, verbatim from upstream — chosen to be
@@ -329,6 +329,24 @@ static PATCHES: &[Patch] = &[
             syntax.reasoning.end = "</think>".into();
             push_preserved(&mut syntax.preserved_tokens, "<think>");
             push_preserved(&mut syntax.preserved_tokens, "</think>");
+        }
+    },
+    // Mistral (`mistral4`): `[THINK]` is a reasoning channel the
+    // template renders from the `reasoning`/`reasoning_content`
+    // message field, not from a `<think>` block inlined in `content`.
+    // The reasoning probes see the markers but cannot see which side
+    // owns them, and the derived default is `InlineThink` — under
+    // which `build_messages` would route thoughts into `content` and
+    // the template would render none of them. Keyed on the analyzed
+    // marker rather than a raw source fragment: `[THINK]` is this
+    // family's, and the `reasoning_content` guard keeps it off any
+    // template that reconstructs reasoning from content instead (the
+    // Qwen convention, which is correctly `InlineThink`).
+    |src, syntax| {
+        if syntax.reasoning.start == "[THINK]"
+            && src.contains("reasoning_content")
+        {
+            syntax.reasoning.reingest = ReasoningReingest::Field;
         }
     },
 ];

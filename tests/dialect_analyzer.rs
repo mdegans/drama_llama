@@ -222,3 +222,68 @@ fn toolless_template_family_none() {
     let s = analyze_template(source, "", "<|end|>").expect("analyze");
     assert_eq!(s.family, Family::None, "{s:#?}");
 }
+
+/// Mistral Small 4 (`mistral4`). Structurally a family we already
+/// speak: `TagWithJson` with the function name outside the JSON and no
+/// wrapper object — `[TOOL_CALLS]get_weather[ARGS]{"city":"Paris"}` —
+/// so the differential probes derive it whole, with no `PATCHES`
+/// entry, no `sniff_hand_built` arm and no new `Family` variant. Every
+/// marker here is a single special token in the model's vocab.
+///
+/// Reasoning is `None` on stock deliberately: the stock template
+/// accepts a thought only as a `thinking`-typed content chunk, never
+/// as a message field, so there is nothing for the probes to see. That
+/// gap is the owned template's job — see [`mistral4_cache_stable`].
+#[test]
+fn mistral4_stock() {
+    let s = analyze("mistral4-gguf.jinja", "<s>", "</s>");
+    assert_eq!(s.family, Family::TagWithJson, "{s:#?}");
+    assert_eq!(s.per_call_start, "[TOOL_CALLS]", "{s:#?}");
+    assert_eq!(s.per_call_end, "", "{s:#?}");
+    assert_eq!(s.function.name_prefix, "", "{s:#?}");
+    assert_eq!(s.function.name_suffix, "[ARGS]", "{s:#?}");
+    assert_eq!(s.function.close, "", "{s:#?}");
+    assert_eq!(s.call_separator, "", "{s:#?}");
+    assert_eq!(s.arguments.json_spacing, JsonSpacing::Compact, "{s:#?}");
+    assert_eq!(s.user_start, "[INST]", "{s:#?}");
+    assert_eq!(s.tool_response_start, "", "{s:#?}");
+    assert_eq!(s.reasoning.mode, ReasoningMode::None, "{s:#?}");
+    assert_eq!(s.trigger(), "[TOOL_CALLS]", "{s:#?}");
+}
+
+/// The owned template must measure identically on the call path — the
+/// rewrite touches the turn close and the reasoning channel, nothing
+/// the grammar or `render_reference` keys on — and must additionally
+/// expose `[THINK]` as a `TagBased` channel re-ingested through the
+/// `reasoning_content` *field*.
+///
+/// The `Field` reingest is the one thing the probes cannot see: they
+/// observe the markers but not which side owns them, and the derived
+/// default (`InlineThink`) would route thoughts into `content`, where
+/// this template renders none of them. A `PATCHES` entry corrects it,
+/// keyed on the analyzed `[THINK]` marker plus a `reasoning_content`
+/// guard — narrow by design, so the Qwen templates (correctly
+/// `InlineThink`, and they do mention `reasoning_content`) are
+/// untouched.
+#[test]
+fn mistral4_cache_stable() {
+    let s = analyze("mistral4-cache-stable.jinja", "<s>", "</s>");
+    assert_eq!(s.family, Family::TagWithJson, "{s:#?}");
+    assert_eq!(s.per_call_start, "[TOOL_CALLS]", "{s:#?}");
+    assert_eq!(s.function.name_suffix, "[ARGS]", "{s:#?}");
+    assert_eq!(s.function.close, "", "{s:#?}");
+    assert_eq!(s.arguments.json_spacing, JsonSpacing::Compact, "{s:#?}");
+    assert_eq!(s.reasoning.mode, ReasoningMode::TagBased, "{s:#?}");
+    assert_eq!(s.reasoning.start, "[THINK]", "{s:#?}");
+    assert_eq!(s.reasoning.end, "[/THINK]", "{s:#?}");
+    assert_eq!(
+        s.reasoning.reingest,
+        drama_llama::dialect::ReasoningReingest::Field,
+        "{s:#?}"
+    );
+    assert!(s.preserved_tokens.iter().any(|t| t == "[THINK]"), "{s:#?}");
+    assert!(
+        s.preserved_tokens.iter().any(|t| t == "[TOOL_CALLS]"),
+        "{s:#?}"
+    );
+}

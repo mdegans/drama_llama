@@ -67,6 +67,50 @@ re-render reproduces them. The `enable_thinking` front-rewrite
 (issue #86 interaction) is deliberately untouched: partial-render
 thinking flags are `render_partial`'s bug to fix, not the template's.
 
+`mistral4-gguf.jinja` is dumped from the Mistral-Small-4-119B-2603
+Unsloth GGUF (`tokenizer.chat_template`, arch `mistral4`). Its call
+format is `[TOOL_CALLS]name[ARGS]{…}` — function name outside the
+JSON, no wrapper object, one `[TOOL_CALLS]` per call — which the
+dialect analyzer derives whole as `Family::TagWithJson`; every marker
+in it is a single special token in the model's vocab.
+
+`mistral4-cache-stable.jinja` is drama_llama's cache-stability patch
+of it (#88). Five changes, and nothing else — the call-rendering path
+is byte-identical:
+
+1. The assistant turn close (`</s>`) is emitted per *message*. Stock
+   emits it unconditionally and has no `add_generation_prompt` branch
+   at all, so it cannot render an open assistant turn and the
+   generation-prompt render is never a byte prefix of the follow-up.
+2. Reasoning round-trips as `[THINK]…[/THINK]` from the
+   `reasoning`/`reasoning_content` field, gated by `preserve_thinking`
+   for aged turns. Stock accepts a thought only as a `thinking`-typed
+   content chunk, so the analyzer measures `ReasoningMode::None`, the
+   channel is invisible to grammar/parser/re-render, and a
+   `ReasoningReingest::Field` transcript trips stock's own
+   `raise_exception` (pinned: `mistral4_stock_cannot_render_field_reasoning`).
+3. Pre-call prose renders in emission order (`content_pre` before the
+   calls, `content_post` after) rather than merged into one slot.
+4. The 140-line Unsloth date-arithmetic preamble and the default Le
+   Chat system message are removed. That block injected today's *and*
+   yesterday's date into the prompt **prefix**, so a session spanning
+   midnight lost its entire cache. Persona and dates are app content
+   under the 0.7 boundary — supply them in your own system prompt.
+   Note this is a behaviour change for callers that sent no system
+   message at all and relied on the vendor default.
+5. The `raise_exception` role-alternation guard is dropped;
+   mid-conversation system turns render in the format's own
+   `[SYSTEM_PROMPT]` framing instead of raising.
+
+Argument interiors stay `tojson`-compact, matching stock, because the
+model's unforced habit has not been measured yet — the cogito
+precedent (`json_dumps`) is a one-filter swap once
+`tests/probe_unforced_habit.rs` has run against this model.
+`[MODEL_SETTINGS]{"reasoning_effort": …}` is driven by
+`enable_thinking`; it sits in the prefix, so toggling thinking
+mid-conversation invalidates the cache — inherent to the format, the
+same way Qwen's `enable_thinking` front-rewrite is.
+
 A `<model>.template.jinja` sidecar next to the GGUF still overrides
 any of these — baked templates removed the *need* for sidecar
 deployment on recognized models, not the mechanism.

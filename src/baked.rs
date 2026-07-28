@@ -101,10 +101,30 @@ pub static COGITO: BakedTemplate = BakedTemplate {
     replacement: include_str!("../templates/cogito-cache-stable.jinja"),
 };
 
+/// Mistral Small 4 (`mistral4` arch; `[TOOL_CALLS]name[ARGS]{…}`
+/// calls, `[THINK]` reasoning, pixtral vision). The stock template
+/// closes every assistant message with `</s>` and has no
+/// `add_generation_prompt` branch at all, so it cannot render an open
+/// assistant turn and the generation prompt is never a byte prefix of
+/// the follow-up render. It also accepts reasoning only as a
+/// `thinking`-typed content chunk, so the analyzer measures
+/// `ReasoningMode::None` and the `[THINK]` channel is invisible to
+/// grammar, parser and re-render. The replacement emits the close per
+/// message, round-trips reasoning through `reasoning_content`, renders
+/// pre-call prose in emission order, and drops the Unsloth date
+/// preamble whose default system message injected today's and
+/// yesterday's date into the *prefix* — a session spanning midnight
+/// lost its whole cache. See `mistral4_cache_stable_prefix_continuity`.
+pub static MISTRAL4: BakedTemplate = BakedTemplate {
+    name: "mistral4-cache-stable",
+    stock: include_str!("../templates/mistral4-gguf.jinja"),
+    replacement: include_str!("../templates/mistral4-cache-stable.jinja"),
+};
+
 /// Every baked template, in detection order. Order is cosmetic —
 /// stock templates are mutually distinct byte strings, so at most one
 /// entry can match.
-pub static ALL: &[&BakedTemplate] = &[&GEMMA4, &GPTOSS, &COGITO];
+pub static ALL: &[&BakedTemplate] = &[&GEMMA4, &GPTOSS, &COGITO, &MISTRAL4];
 
 /// Match an embedded template against the registry. `Some` only on
 /// byte-equality with a known stock template (trailing whitespace
