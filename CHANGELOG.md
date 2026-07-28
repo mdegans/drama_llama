@@ -4,6 +4,37 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The post-generation tip anchors continuations again (#96).** The
+  prefix cache's two lookups composed as hash-keyed first, LCP only on
+  a total hash miss — and every continuation re-renders its old
+  `cache_control` markers to identical partials, so the hash path
+  always matched something and capped reuse at the last explicit
+  marker. The tip (the internal anchor at the KV head, past every
+  marker) was never consulted unless the client happened to mark the
+  re-ingested assistant turn. Every drama_llama release with hash-keyed
+  reuse re-prefilled the entire final turn on every continuation.
+  `slot_l_hit` now runs both lookups and takes the larger offer; both
+  prove their prefix in both coordinate spaces, so the max is always
+  sound. Two debug lines make future losses visible: one when a live
+  tip loses the pick, one when `tip_extension` declines to build a tip.
+
+### Added
+
+- **#96 regression suite, per model.** A shared scenario
+  (`tests/common/tip.rs`) runs the downstream agent shape — sliding
+  marker window, forced tool-call turns, honest tool results — plus
+  the issue's probe (a continuation adding no new `cache_control`
+  anywhere), asserting each call resumes past the *entire* previous
+  prompt: a read that far can only come from the tip. Wired into the
+  Qwen (`session_cache`), Gemma 4, gpt-oss, and Mistral Small 4
+  suites; green on all four. No golden text — CI runs smaller family
+  members (`session_gptoss` gained `DRAMA_LLAMA_GPTOSS_MODEL` for
+  that).
+
 ## [0.8.3] — 2026-07-25
 
 ### Added

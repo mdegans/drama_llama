@@ -38,11 +38,13 @@
 //! `cargo nextest run --features llama-cpp --test session_mistral4 \
 //!  --run-ignored all`.
 
-// This target has no `[[test]]` entry with `required-features` in
-// Cargo.toml (unlike `session`, `session_gemma4`, `session_gptoss`),
-// so the file gates itself: without `llama-cpp` it compiles to an
-// empty target rather than a wall of missing-symbol errors.
+// Double-gated: Cargo.toml carries `required-features = ["llama-cpp"]`
+// (so featureless configurations skip the build entirely, per the
+// test-topology preference) and the file also gates itself — harmless
+// belt-and-suspenders left from before the Cargo.toml entry existed.
 #![cfg(feature = "llama-cpp")]
+
+mod common;
 
 use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
@@ -618,5 +620,32 @@ fn prefix_cache_survives_tool_turn() {
         "turn 2 reused no prefix — emission/re-render drift broke the \
          cache across the tool turn (usage: {:?})",
         session.last_usage()
+    );
+}
+
+/// #96, the downstream (agentkit) shape against the `TagWithJson`
+/// dialect: sliding markers, forced tool-call turns, every
+/// continuation resuming past the entire previous prompt via the tip.
+/// This is the exact scenario the issue measured missing on this
+/// model (`l_hit` pinned at the last marker as `new_len` grew).
+#[test]
+#[ignore = "long running; needs the Mistral Small 4 model"]
+fn tip_anchors_across_tool_rounds_issue_96() {
+    let session = session_or_skip!();
+    common::tip::assert_tip_anchors_across_tool_rounds(
+        session.with_prefix_cache(true),
+        3,
+    );
+}
+
+/// #96's probe scenario on Mistral Small 4: a continuation adding no
+/// new `cache_control` anywhere may only be covered by the tip via
+/// the LCP walk.
+#[test]
+#[ignore = "long running; needs the Mistral Small 4 model"]
+fn tip_anchors_unmarked_continuation_issue_96() {
+    let session = session_or_skip!();
+    common::tip::assert_tip_anchors_unmarked_continuation(
+        session.with_prefix_cache(true),
     );
 }

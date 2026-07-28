@@ -4,9 +4,13 @@
 //! for the channel-structured Harmony format
 //! (`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`).
 //!
-//! All tests load `models/gpt-oss-20b-UD-Q8_K_XL.gguf` and are
-//! `#[ignore]`d. Run with
+//! All tests load `models/gpt-oss-20b-UD-Q8_K_XL.gguf` (override with
+//! `$DRAMA_LLAMA_GPTOSS_MODEL` — the local dev box carries the 120b
+//! instead; both are the same Harmony family, and nothing here pins
+//! golden text) and are `#[ignore]`d. Run with
 //! `cargo test --features serde,cuda --test session_gptoss -- --ignored`.
+
+mod common;
 
 use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
@@ -18,6 +22,12 @@ use drama_llama::{
 use serde_json::json;
 
 fn model_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("DRAMA_LLAMA_GPTOSS_MODEL") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return p;
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("models/gpt-oss-20b-UD-Q8_K_XL.gguf")
 }
@@ -626,4 +636,38 @@ fn prefix_cache_survives_final_turn() {
          cache_read={read}, turn-1 prompt={turn1_prompt} (usage: {:?})",
         session.last_usage()
     );
+}
+
+/// A session for the multi-round #96 scenarios: [`load_session`] plus
+/// a real context size — the default `n_ctx` (512) ends the later
+/// rounds at the KV ceiling mid-tool-call.
+fn load_session_8k() -> drama_llama::LlamaCppSession {
+    install_template_sidecar();
+    drama_llama::LlamaCppSession::from_path_with(
+        model_path(),
+        drama_llama::LlamaCppOptions::default().with_n_ctx(8192),
+    )
+    .expect("session load")
+    .quiet()
+    .with_prefix_cache(true)
+}
+
+/// #96, the downstream (agentkit) shape against Harmony: sliding
+/// markers, forced tool-call turns, every continuation resuming past
+/// the entire previous prompt via the tip. Unlike
+/// [`prefix_cache_survives_final_turn`] there ARE explicit markers
+/// here — the exact condition that shadowed the tip before the fix.
+#[test]
+#[ignore = "requires gpt-oss model"]
+fn tip_anchors_across_tool_rounds_issue_96() {
+    common::tip::assert_tip_anchors_across_tool_rounds(load_session_8k(), 3);
+}
+
+/// #96's probe scenario on gpt-oss: a continuation adding no new
+/// `cache_control` anywhere may only be covered by the tip via the
+/// LCP walk.
+#[test]
+#[ignore = "requires gpt-oss model"]
+fn tip_anchors_unmarked_continuation_issue_96() {
+    common::tip::assert_tip_anchors_unmarked_continuation(load_session_8k());
 }

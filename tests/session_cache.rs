@@ -13,6 +13,8 @@
 
 #![cfg(feature = "llama-cpp")]
 
+mod common;
+
 use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
@@ -137,6 +139,38 @@ fn shared_prefix_survives_divergent_turn() {
         "branch B shares the primed prefix and must reuse it, \
          got cache_read={read_b} (primed input was {primed_read})"
     );
+}
+
+/// A session for the multi-round #96 scenarios: same determinism as
+/// [`session`], but with a real context size — the default `n_ctx`
+/// (512) ends round 3 at the KV ceiling mid-tool-call.
+fn session_8k() -> LlamaCppSession {
+    LlamaCppSession::from_path_with(
+        model_path(),
+        LlamaCppOptions::default().with_n_ctx(8192),
+    )
+    .expect("session load")
+    .quiet()
+    .with_prefix_cache(true)
+}
+
+/// #96, the downstream (agentkit) shape: sliding markers, forced
+/// tool-call turns, every continuation resuming past the entire
+/// previous prompt via the tip. Shared scenario — the per-model
+/// suites run the same one against their own templates.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn tip_anchors_across_tool_rounds_issue_96() {
+    common::tip::assert_tip_anchors_across_tool_rounds(session_8k(), 3);
+}
+
+/// #96's probe scenario: a continuation adding no new `cache_control`
+/// anywhere may only be covered by the tip via the LCP walk. Before
+/// the fix this fell back to the last explicit marker on every model.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn tip_anchors_unmarked_continuation_issue_96() {
+    common::tip::assert_tip_anchors_unmarked_continuation(session_8k());
 }
 
 /// The cache is an optimization, not a semantic: with deterministic

@@ -8,6 +8,8 @@
 //! `#[ignore]`d. Run with
 //! `cargo test --features serde --test session_gemma4 -- --ignored`.
 
+mod common;
+
 use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
@@ -467,4 +469,36 @@ fn prefix_cache_survives_tool_turn() {
          cache across the tool turn (usage: {:?})",
         session.last_usage()
     );
+}
+
+/// A session for the multi-round #96 scenarios: [`load_session`] plus
+/// a real context size — the default `n_ctx` (512) ends the later
+/// rounds at the KV ceiling mid-tool-call.
+fn load_session_8k() -> drama_llama::LlamaCppSession {
+    install_template_sidecar();
+    drama_llama::LlamaCppSession::from_path_with(
+        model_path(),
+        drama_llama::LlamaCppOptions::default().with_n_ctx(8192),
+    )
+    .expect("session load")
+    .quiet()
+    .with_prefix_cache(true)
+}
+
+/// #96, the downstream (agentkit) shape against the Gemma 4 dict
+/// dialect: sliding markers, forced tool-call turns, every
+/// continuation resuming past the entire previous prompt via the tip.
+#[test]
+#[ignore = "requires Gemma 4 model"]
+fn tip_anchors_across_tool_rounds_issue_96() {
+    common::tip::assert_tip_anchors_across_tool_rounds(load_session_8k(), 3);
+}
+
+/// #96's probe scenario on Gemma 4: a continuation adding no new
+/// `cache_control` anywhere may only be covered by the tip via the
+/// LCP walk.
+#[test]
+#[ignore = "requires Gemma 4 model"]
+fn tip_anchors_unmarked_continuation_issue_96() {
+    common::tip::assert_tip_anchors_unmarked_continuation(load_session_8k());
 }
