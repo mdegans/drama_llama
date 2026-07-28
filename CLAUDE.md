@@ -271,13 +271,16 @@ for the current arc:
 - [`mistral4_support_and_metal_nan.md`](.claude/memory/mistral4_support_and_metal_nan.md)
   — **read before debugging a NaN on Mistral Small 4, and before
   re-testing flash attention or the quant — both are ruled out with
-  evidence.** Template/dialect/registry support landed (the
-  `[TOOL_CALLS]name[ARGS]{…}` format needed *zero* new code — the
-  analyzer derives it as `TagWithJson`); generation on Metal is blocked
-  by an upstream all-NaN-logits bug above 32 prefill tokens, localized
-  to `ne21_mm_id_min` (the MoE `mul_mv_id`→`mul_mm_id` switch), CPU
-  clean. Also carries `DecodeError::NonFinite` and the open question of
-  the predictor's three `.expect()` sites that still panic on it.
+  evidence.** Mistral Small 4 **works** (7/7 e2e on device). The
+  `[TOOL_CALLS]name[ARGS]{…}` format needed *zero* new dialect code —
+  the analyzer derives it as `TagWithJson`. The Metal all-NaN decode
+  above 32 prefill tokens is root-caused: **f16 overflow in
+  `mul_mm_id`**, because layer 32's activations run ~1000× hot and the
+  MMA path carries operands in half. Worked around with
+  `LlamaCppOptions::with_n_ubatch(31)`, which keeps prefill on the f32
+  `mul_mv_id` path. Also carries `DecodeError::NonFinite`, the open
+  question of the predictor's three `.expect()` sites that still panic
+  on it, and the untuned sampler behind an observed tool-call loop.
 - [`plan_ci_self_hosted_runner.md`](.claude/memory/plan_ci_self_hosted_runner.md)
   — **read first if this session is on the remote runner box.** CI's
   first-run state (green both OSes bar four model-needing "unignored"

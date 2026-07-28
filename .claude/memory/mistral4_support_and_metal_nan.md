@@ -1,9 +1,27 @@
-# Mistral Small 4 support, and the Metal NaN blocker
+# Mistral Small 4 support, and the Metal f16-overflow NaN
 
-**Status (2026-07-28, Opus 5):** template/dialect/registry support is
-**landed and green** (`53a07d3`, `2c4a538`). Generation on Metal is
-**blocked** by an upstream NaN bug that is not ours and not the
-template's. Mike took the llama.cpp update in a parallel session.
+**Status (2026-07-28, Opus 5): WORKING.** Support landed (`53a07d3`,
+`2c4a538`, `74cf8da`) and `just test session_mistral4` is **7/7 on the
+real model** — tool calls, thinking, prefix cache, and the repo's first
+end-to-end rung-2 witness. The Metal all-NaN decode is root-caused to
+an upstream f16-overflow bug (below) and worked around with
+`n_ubatch = 31`.
+
+Measured on device: the model's unforced call spelling is **`Spaced`**
+(`json.dumps` style), so the owned template renders arguments with
+`json_dumps`; and it never volunteers a `[CALL_ID]`, confirming
+`CallIdPosition::None`.
+
+**Open — sampler.** No tuned sidecar exists: the GGUF carries no
+`general.sampling.*`, so it fell back to `SamplerConfig::default()`
+(TopK 1024 -> LocallyTypical 0.5, **no temperature**), which is very
+wide. Observed symptom: a forced-tool-choice turn looping the same call
+26x until the budget truncated it mid-string; passed on replay, so it
+is stochastic. Contributing dialect property: `call_separator` is empty
+and parallel calls are grammar-legal, so another `[TOOL_CALLS]` is
+always a legal continuation and only EOS ends the turn — there is no
+structural "you may stop now" signal the way a closing tag gives other
+dialects. Tune the sidecar before trusting long tool-loops.
 
 Read this before re-diagnosing a NaN on this model, and before
 re-testing flash attention or the quantization — both are already
@@ -145,13 +163,44 @@ backend and *both* are now eliminated as mechanisms:
 *all* the 32s before anchoring on one; anchoring on the first cost a
 `test-backend-ops` build.
 
-**Residue:** something else in the deepseek2 graph mistral4 inherits —
-MLA attention math, the fused `gate_up` split, MoE routing
-(`noaux_tc` / `expert_weights_norm`) — or an op whose Metal path
-happens to change at 32 that neither grep found. The next step is
-`llama-eval-callback` (built in a scratchpad clone, not Mike's
-checkout) to name the first tensor that goes non-finite; that is the
-one thing that turns this into a filable upstream issue.
+## ROOT CAUSE (found) — f16 overflow in Metal's `mul_mm_id`
+
+`llama-eval-callback` (built in a scratchpad clone) named the first
+non-finite tensor in the graph:
+
+    ffn_moe_down-32 = MUL_MAT_ID(blk.32.ffn_down_exps.weight{2048,4096,128},
+                                 ffn_moe_swiglu-32{2048,4,41}) = {4096,4,41}
+
+Layers 0..31 are finite through the *identical* kernel at the same
+token count; 32..35 are poisoned downstream. So it is **data**, not
+shape or path — which is why the isolated op test (random values in
+±1) passes while the model fails.
+
+The data: **layer 32's activations are ~1000x every other layer's**
+(`ffn_moe_gate-32` sums to -311493; other layers are in the hundreds).
+The Metal MMA path carries its operands in **half**
+(`simdgroup_half8x8`), and f16 tops out at 65504. Outliers overflow to
+inf, and inf arithmetic yields NaN. The `mul_mv_id` path below 32
+tokens carries the same values in f32 and is correct.
+
+**Proved by construction:** at `n_ubatch = 31` there are zero NaNs and
+that same `ffn_moe_down-32` comes out **-138943** — enormous but
+finite. That is the value f16 cannot hold.
+
+**Workaround, shipped:** `LlamaCppOptions::with_n_ubatch(31)` keeps
+prefill on `mul_mv_id`. Costs prefill parallelism, nothing else;
+`n_batch` stays large so prompts still submit in one call.
+`tests/session_mistral4.rs` sets it (7/7 on device with it, all dead
+without it). Drop it when upstream fixes the kernel.
+
+**Still worth filing upstream**, with the reproducer already written:
+the patched `test-backend-ops` cases at `n_mats=128, n_used=4` are a
+genuine coverage gap regardless (upstream only tests 4 experts / 2
+active), though note they *pass* — a faithful repro needs activations
+that exceed f16 range, which the random-init harness never generates.
+That is arguably the real upstream bug report: **`mul_mm_id` has no
+guard for operands outside f16 range**, and its test harness cannot
+generate them.
 
 `llama_model_mistral4` is literally `llama_model_deepseek2` — same
 hparam loader, same tensor loader, same graph, one-line
