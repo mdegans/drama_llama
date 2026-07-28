@@ -272,7 +272,10 @@ fn mistral4_cache_stable() {
     assert_eq!(s.per_call_start, "[TOOL_CALLS]", "{s:#?}");
     assert_eq!(s.function.name_suffix, "[ARGS]", "{s:#?}");
     assert_eq!(s.function.close, "", "{s:#?}");
-    assert_eq!(s.arguments.json_spacing, JsonSpacing::Compact, "{s:#?}");
+    // Spaced, unlike stock: the owned template renders arguments with
+    // `json_dumps` because that is this model's measured unforced
+    // habit (`probe_unforced_habit::mistral4_unforced_call_spelling`).
+    assert_eq!(s.arguments.json_spacing, JsonSpacing::Spaced, "{s:#?}");
     assert_eq!(s.reasoning.mode, ReasoningMode::TagBased, "{s:#?}");
     assert_eq!(s.reasoning.start, "[THINK]", "{s:#?}");
     assert_eq!(s.reasoning.end, "[/THINK]", "{s:#?}");

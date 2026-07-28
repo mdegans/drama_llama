@@ -299,6 +299,14 @@ def run_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        # A test's output is not guaranteed to be valid UTF-8, and the
+        # runner must never be the thing that fails. llama.cpp's model
+        # loader dumps `tokenizer.ggml.tokens`, and a byte-level BPE
+        # vocab (pixtral/gpt2 — Mistral Small 4 is the case that found
+        # this) contains lone continuation bytes. Strict decoding
+        # raised UnicodeDecodeError out of the read loop and killed the
+        # whole run before a single test executed.
+        errors="replace",
         bufsize=1,
     ) as proc, (
         open(log, "w", encoding="utf-8") if log else _NullWriter()

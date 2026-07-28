@@ -26,8 +26,8 @@
 use std::{borrow::Cow, num::NonZeroUsize, path::PathBuf};
 
 use drama_llama::{
-    Block, ChatTemplate, Content, LlamaCppEngine, Message, PredictOptions,
-    Prompt, RenderOptions, Role, Tool,
+    Block, ChatTemplate, Content, LlamaCppEngine, LlamaCppOptions, Message,
+    PredictOptions, Prompt, RenderOptions, Role, Tool,
 };
 use serde_json::json;
 
@@ -60,7 +60,7 @@ fn cogito_unforced_call_spelling() {
         );
         return;
     };
-    probe_unforced_call(path);
+    probe_unforced_call(path, LlamaCppOptions::default().with_n_ctx(4096));
 }
 
 /// The same measurement for Mistral Small 4, whose owned template
@@ -92,15 +92,23 @@ fn mistral4_unforced_call_spelling() {
         );
         return;
     };
-    probe_unforced_call(path);
+    // n_ubatch=31 keeps prefill off Metal's half-precision
+    // `mul_mm_id`, which returns all-NaN logits for this model
+    // (see `.claude/memory/mistral4_support_and_metal_nan.md`).
+    probe_unforced_call(
+        path,
+        LlamaCppOptions::default()
+            .with_n_ctx(4096)
+            .with_n_ubatch(31),
+    );
 }
 
 /// The probe body: render a tools-bearing prompt through the model's
 /// *own* embedded template, predict greedily with no grammar, print
 /// every byte.
-fn probe_unforced_call(path: PathBuf) {
+fn probe_unforced_call(path: PathBuf, opts: LlamaCppOptions) {
     drama_llama::silence_logs();
-    let mut engine = LlamaCppEngine::from_path_with_n_ctx(path, 4096)
+    let mut engine = LlamaCppEngine::from_path_with(path, opts)
         .expect("model loads")
         .quiet();
 

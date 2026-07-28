@@ -58,6 +58,32 @@ pub struct LlamaCppOptions {
     #[cfg_attr(feature = "cli", arg(long, value_enum))]
     pub flash_attn: Option<FlashAttention>,
 
+    /// Micro-batch size (llama.cpp's `n_ubatch`) — how many tokens one
+    /// forward pass evaluates. `None` inherits the library default
+    /// (512, capped to [`Self::n_ctx`] when that is set).
+    ///
+    /// Normally you want this large: it is the prefill parallelism
+    /// knob. It is settable because it is also a **correctness escape
+    /// hatch** for backend kernels that only misbehave above a batch
+    /// threshold.
+    ///
+    /// The case that motivated exposing it: Mistral Small 4
+    /// (`mistral4`) on Metal returns an entirely NaN vocabulary for any
+    /// micro-batch of >=32 tokens. At 32 the MoE matmul switches from
+    /// `mul_mv_id` to the half-precision simdgroup-MMA `mul_mm_id`
+    /// (`ne21_mm_id_min`), and this model's layer-32 activations exceed
+    /// f16's 65504 ceiling — they overflow to inf, and inf arithmetic
+    /// yields NaN. The `mul_mv_id` path carries the same values in f32
+    /// and is correct. `n_ubatch = 31` therefore trades prefill speed
+    /// for a working model; see
+    /// `.claude/memory/mistral4_support_and_metal_nan.md`.
+    ///
+    /// Note this is the *micro*-batch: `n_batch` stays large, so a
+    /// prompt of any length still submits in one call and is simply
+    /// evaluated in smaller chunks.
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub n_ubatch: Option<u32>,
+
     /// Keep every layer on the CPU. llama.cpp offloads all layers by
     /// default (`n_gpu_layers = -1`); this forces zero. Diagnostic path
     /// for isolating GPU-kernel divergence.
@@ -90,6 +116,13 @@ impl LlamaCppOptions {
     /// Force a Flash Attention policy. See [`Self::flash_attn`].
     pub fn with_flash_attention(mut self, fa: FlashAttention) -> Self {
         self.flash_attn = Some(fa);
+        self
+    }
+
+    /// Set the micro-batch size. See [`Self::n_ubatch`] — this is a
+    /// correctness escape hatch as much as a perf knob.
+    pub fn with_n_ubatch(mut self, n_ubatch: u32) -> Self {
+        self.n_ubatch = Some(n_ubatch);
         self
     }
 
@@ -135,6 +168,12 @@ impl LlamaCppOptions {
         }
         if let Some(fa) = self.flash_attn {
             cp.flash_attn_type = fa.as_raw();
+        }
+        // Applied last so an explicit micro-batch wins over the
+        // `n_ctx` clamp above — the whole point of the knob is to force
+        // a *small* ubatch under a large context.
+        if let Some(n_ubatch) = self.n_ubatch {
+            cp.n_ubatch = n_ubatch.max(1);
         }
         cp
     }

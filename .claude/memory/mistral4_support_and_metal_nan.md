@@ -109,26 +109,55 @@ bit-identical across separate processes.
 - **Our code.** Reproduces on a bare `[INST]…[/INST]` filler prompt via
   `Engine::predict_candidates` — no tools, no grammar, no `Session`.
 
-**Localized to:** `ggml-metal-ops.cpp:2321`,
-`const int ne21_mm_id_min = 32`, gating
-`has_simdgroup_mm && ne00 >= 64 && ne21 >= 32` — the
-`mul_mv_id` -> `mul_mm_id` switch for the MoE matmul. Our threshold is
-that constant, exactly.
+- **The llama.cpp update b9754 -> b10156** (sys crate 0.8.2). Tested
+  via a local `[patch.crates-io]`. Not a fix, and *conclusively* so:
+  the sub-threshold logits are **bit-identical** across the two trees
+  (`max=25.355751` both), so the DeepSeek V4 / fused-hyper-connection
+  work that landed in `src/models/deepseek2.cpp` never touched
+  mistral4's execution path. The Metal MoE code is byte-identical
+  between the trees. (The bump itself is safe — the `unsafe impl Sync`
+  preconditions in `Cargo.toml:30-48` were re-verified at b10156: still
+  `const llama_model & model`, still no `mutable` members, still no
+  `llama_opt_init` binding.)
+- **`mul_mm_id` at this model's REAL geometry.** `test-backend-ops`
+  patched with nine cases at `n_mats=128, n_used=4` and the actual
+  tensor shapes (`ffn_gate_up_exps` = `(k=4096, m=4096, 128)` IQ2_S;
+  `ffn_down_exps` = `(k=2048, m=4096, 128)` IQ3_S), `n` in
+  {16, 32, 64}: **all OK vs the CPU reference**, and the logs confirm
+  the `kernel_mul_mm_id_*` pipelines actually ran at n>=32. So the MoE
+  matmul kernel is correct at the exact shapes/quants/expert-count this
+  model uses. IQ4_XS at the same geometry also passes, which is what
+  finally rules the **quantization** out at the real shapes and makes a
+  4-bit re-download pointless.
+- **Four Metal runtime knobs**, each A/B'd on the real model with the
+  boundary unchanged: `GGML_OP_OFFLOAD_MIN_BATCH=1000000`,
+  `GGML_METAL_FUSION_DISABLE`, `GGML_METAL_GRAPH_OPTIMIZE_DISABLE`,
+  `GGML_METAL_CONCURRENCY_DISABLE`. Op offload, kernel fusion, graph
+  optimization and concurrency are all exonerated.
 
-**Residue (untested):** the arch graph itself, or shapes the canned op
-tests never cover. `test-backend-ops` uses `n_mats=4, n_used=2`;
-mistral4 is **128 experts, 4 active**, and its experts are a *fused*
-`ffn_gate_up_exps` where Qwen has separate `ffn_gate_exps` /
-`ffn_up_exps`. That fused layout is the remaining structural
-difference from the working control. A targeted op test at
-`n_mats=128, n_used=4` would settle it and would be the right
-reproducer for an upstream issue.
+**The threshold is EXACTLY 32**, measured at 1-token resolution: 31
+tokens clean, 32 tokens all-NaN. That is a real signal, not an
+approximation — but note there are **two** independent 32s in the Metal
+backend and *both* are now eliminated as mechanisms:
+`ne21_mm_id_min = 32` (`ggml-metal-ops.cpp:2382`, the
+`mul_mv_id` -> `mul_mm_id` switch) and
+`op_offload_min_batch_size = 32` (`ggml-metal-device.m:848`). Grep for
+*all* the 32s before anchoring on one; anchoring on the first cost a
+`test-backend-ops` build.
+
+**Residue:** something else in the deepseek2 graph mistral4 inherits —
+MLA attention math, the fused `gate_up` split, MoE routing
+(`noaux_tc` / `expert_weights_norm`) — or an op whose Metal path
+happens to change at 32 that neither grep found. The next step is
+`llama-eval-callback` (built in a scratchpad clone, not Mike's
+checkout) to name the first tensor that goes non-finite; that is the
+one thing that turns this into a filable upstream issue.
 
 `llama_model_mistral4` is literally `llama_model_deepseek2` — same
 hparam loader, same tensor loader, same graph, one-line
-`build_arch_graph` override (`models.h:1125`). So anything found here
-likely applies to DeepSeek-V3-class models on Metal too, which is
-worth knowing given [[cogito_v2_architecture]].
+`build_arch_graph` override (`models.h:1275` at b10156). Note this does
+**NOT** implicate Cogito/DeepSeek work here: that runs on the moeflux
+engine, not llama.cpp (Mike, 2026-07-28).
 
 Tools left in the scratchpad pattern, cheap to recreate: a GGUF
 tensor-type dumper (expert quant types without loading weights) and a

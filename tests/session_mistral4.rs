@@ -86,10 +86,23 @@ fn load_session() -> Option<drama_llama::LlamaCppSession> {
          and re-run.",
         sidecar.display()
     );
+    // `n_ubatch = 31` is load-bearing, not tuning: on Metal this model
+    // returns an all-NaN vocabulary for any micro-batch of >=32 tokens
+    // (f16 overflow of its layer-32 activations in the half-precision
+    // `mul_mm_id` MoE matmul; the `mul_mv_id` path below 32 carries the
+    // same values in f32 and is correct). Without this, every test here
+    // dies on `DecodeError::NonFinite` before it can assert anything.
+    // See `.claude/memory/mistral4_support_and_metal_nan.md`; drop it
+    // once upstream fixes the kernel.
     Some(
-        drama_llama::LlamaCppSession::from_path(path)
-            .expect("session load")
-            .quiet(),
+        drama_llama::LlamaCppSession::from_path_with(
+            path,
+            drama_llama::LlamaCppOptions::default()
+                .with_n_ctx(8192)
+                .with_n_ubatch(31),
+        )
+        .expect("session load")
+        .quiet(),
     )
 }
 
@@ -202,7 +215,11 @@ fn rung_two_baked_template_applies_without_a_sidecar() {
     assert_eq!(d.function.name_suffix, "[ARGS]", "{d:#?}");
     assert_eq!(d.function.close, "", "{d:#?}");
     assert_eq!(d.call_separator, "", "{d:#?}");
-    assert_eq!(d.arguments.json_spacing, JsonSpacing::Compact, "{d:#?}");
+    // `Spaced` is itself a rung-2 witness: only the owned template
+    // renders arguments through `json_dumps`. Stock's `tojson` measures
+    // `Compact`, so this asserting Spaced means the baked replacement
+    // is the one in force.
+    assert_eq!(d.arguments.json_spacing, JsonSpacing::Spaced, "{d:#?}");
     assert_eq!(d.user_start, "[INST]", "{d:#?}");
     assert_eq!(d.tool_response_start, "", "{d:#?}");
     assert_eq!(d.trigger(), "[TOOL_CALLS]", "{d:#?}");

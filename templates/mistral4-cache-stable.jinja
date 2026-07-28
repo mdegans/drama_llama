@@ -111,8 +111,18 @@
             {%- for tool_call in message['tool_calls'] -%}
                 {%- set function = tool_call['function'] -%}
                 {%- set arguments = function['arguments'] -%}
+                {#- `json_dumps`, not `tojson`: measured greedily with no
+                    grammar, this model's unforced call spelling is
+                    uniform `json.dumps` spacing (`": "` after keys,
+                    `", "` between fields AND array elements) — see
+                    `probe_unforced_habit::mistral4_unforced_call_spelling`.
+                    Stock's `tojson` is compact, which would force the
+                    model off its own habit to keep the round-trip
+                    byte-stable (#85's lesson). The analyzer measures
+                    this filter as `JsonSpacing::Spaced` and the grammar
+                    prelude and `render_reference` follow it. -#}
                 {%- if arguments is not string -%}
-                    {%- set arguments = arguments | tojson -%}
+                    {%- set arguments = arguments | json_dumps -%}
                 {%- elif arguments == '' -%}
                     {%- set arguments = '{}' -%}
                 {%- endif -%}
