@@ -223,14 +223,70 @@ prefill on `mul_mv_id`. Costs prefill parallelism, nothing else;
 `tests/session_mistral4.rs` sets it (7/7 on device with it, all dead
 without it). Drop it when upstream fixes the kernel.
 
-**Still worth filing upstream**, with the reproducer already written:
-the patched `test-backend-ops` cases at `n_mats=128, n_used=4` are a
-genuine coverage gap regardless (upstream only tests 4 experts / 2
-active), though note they *pass* — a faithful repro needs activations
-that exceed f16 range, which the random-init harness never generates.
-That is arguably the real upstream bug report: **`mul_mm_id` has no
-guard for operands outside f16 range**, and its test harness cannot
-generate them.
+### Fixed upstream — PR ggml-org/llama.cpp#26223 (2026-07-28)
+
+Branch `fix/metal-mul-mm-id-f16-overflow` in the llama.cpp submodule
+(pushed to the `mdegans/llama.cpp` fork). Two commits: a reproducer,
+then the fix.
+
+**Reproducer.** This class of bug was *untestable* upstream:
+`init_mul_mat_id_tensors` inits uniform [-1, 1], so no case could drive
+an operand out of f16 range. `test_mul_mat_id` gains an `amax`
+parameter (default 1.0f = historical behaviour) scaling only the f32
+activations. Six cases; `n=16` controls stay green, `n=32/64` failed.
+Reproduces at *minimal* size (q8_0, 8 experts / 2 active, 512x256), so
+it is not model- or geometry-specific.
+
+**Fix.** Rescale src1 by a power of two on load, undo it on the f32
+accumulator at the store. Exact, not approximate: the dot product is
+linear so one tensor-wide factor commutes through accumulation, and a
+power-of-two factor is exact in binary FP. When amax already fits the
+factor is 1.0 and output is **bit-identical** — which is what makes it
+defensible to perf-conscious maintainers.
+
+**Perf matters here and nearly sank it.** The first version dispatched
+the reduction as a *single threadgroup* scanning all of src1: **+38% to
++451%** on prefill. Rewritten two-stage (256 threadgroups → partials →
+one folding pass) it is **+1.14% median overall**, +1.3–4% on prefill,
+~0% on decode (the reduction is dispatched only on the mm path). Mike's
+prompt — "upstream might accept broken code if it's faster" — is why
+this got measured at all. **Always benchmark a kernel change here.**
+
+Upstream issue **#25722** (open) is the same bug: mistral4, Metal,
+empty output above ~300 tokens, FA on *and* off, generation degenerating
+to a single control token — argmax over an all-NaN distribution. Their
+"~300" is an un-bisected 32. **#20668** (closed, "repetitive/empty
+output", same token-31 spam) is plausibly the same defect misattributed
+to a corrupt GGUF.
+
+Not covered by the PR: `kernel_mul_mm` (dense) has the identical
+narrowing and should fail the same way; and the scale could be
+per-output-column rather than per-tensor for better precision when one
+token is the hot one.
+
+### Trap: `[patch.crates-io]` is silently ignored if Cargo.lock disagrees
+
+Cost a wrong conclusion reported to Mike. Patching drama_llama's
+`Cargo.toml` to point at the local `llama-cpp-sys` does **nothing** if
+`Cargo.lock` pins the old version — cargo prints
+`warning: patch ... was not used in the crate graph` and builds the
+*published* crate anyway. The earlier "does b10156 fix it?" test was
+therefore the same 0.8.1 binary twice, and its headline evidence
+("sub-threshold logits bit-identical between trees") was worthless —
+identical code trivially gives identical output. The conclusion
+survived only because the defective conversion is visibly present in
+b10156.
+
+**Always run `cargo update -p <crate>` after adding a path patch, and
+check the build actually recompiles.** A 0.3s "build" is the tell.
+
+### `llama-cpp-sys-3` 0.8.2 is NOT a drop-in bump
+
+llama.cpp b10156 added a `text_len` field to `mtmd_input_text`, so
+`src/llama_cpp/mtmd.rs` fails to compile with `E0063` until it is set
+(`text_c.as_bytes().len()` — excludes the NUL, which is what upstream
+wants since it reads `text_len` bytes rather than scanning). Fix is
+written but uncommitted, pending the bump.
 
 `llama_model_mistral4` is literally `llama_model_deepseek2` — same
 hparam loader, same tensor loader, same graph, one-line
