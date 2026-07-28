@@ -278,6 +278,16 @@ for the current arc:
   — it carries the measured blast radius (32 sites, only 4 of them
   production, all in `session/mod.rs`), why `RetryChunked` needs no
   trait changes, and why `BlockStream` is the one hard site.
+- [`plan_grammar_canonicity.md`](.claude/memory/plan_grammar_canonicity.md)
+  — **plan-of-record ([issue #97](https://github.com/mdegans/drama_llama/issues/97)),
+  designed but not started.** Post-#96, both cache lookups rightly
+  refuse non-canonical emission, so tool-call tip hit rate ==
+  grammar canonicity. The fixable class is masking-forced splits
+  (canonical merged token overshoots → masked → model forced to
+  split); the plan adds a canonicity oracle to `grammar_fuzz.rs` and
+  treats any red in the #96 per-model suite as a finding. Read before
+  touching the GBNF emitter or "helping" tool-call turns hit by
+  widening a cache tolerance.
 - [`mistral4_support_and_metal_nan.md`](.claude/memory/mistral4_support_and_metal_nan.md)
   — **read before debugging a NaN on Mistral Small 4, and before
   re-testing flash attention or the quant — both are ruled out with
