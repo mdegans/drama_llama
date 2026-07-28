@@ -12,16 +12,38 @@ Measured on device: the model's unforced call spelling is **`Spaced`**
 `json_dumps`; and it never volunteers a `[CALL_ID]`, confirming
 `CallIdPosition::None`.
 
-**Open — sampler.** No tuned sidecar exists: the GGUF carries no
-`general.sampling.*`, so it fell back to `SamplerConfig::default()`
-(TopK 1024 -> LocallyTypical 0.5, **no temperature**), which is very
-wide. Observed symptom: a forced-tool-choice turn looping the same call
-26x until the budget truncated it mid-string; passed on replay, so it
-is stochastic. Contributing dialect property: `call_separator` is empty
-and parallel calls are grammar-legal, so another `[TOOL_CALLS]` is
-always a legal continuation and only EOS ends the turn — there is no
-structural "you may stop now" signal the way a closing tag gives other
-dialects. Tune the sidecar before trusting long tool-loops.
+**Open — one unreproduced tool-call loop.** A forced-tool-choice turn
+emitted the same call 26x until the budget truncated it mid-string.
+**Replayed unchanged and passed**, so it is stochastic and was never
+diagnosed — no fix was applied, and nothing here is established.
+
+Correcting a wrong first read (Mike caught it): I called the default
+sampler "very wide". It is not. `SamplerConfig::default()` is TopK 1024
+-> locally-typical p=0.5, and our own code documents the TopK as "a
+pre-cut, not a sampler ... behaviorally invisible" — so the effective
+sampler is locally-typical alone, which is **tight**. That inverts the
+causal story: cool/greedy decoding is *more* loop-prone, so if sampling
+contributes it is by being too cold, and the remedy is temperature, not
+tightening.
+
+Better-supported candidate, unverified: `constrained_regions = true` is
+on and is documented as "what breaks small-model loops inside always-on
+tool-call grammars" — but `ignored_categories = [English, Json,
+Punctuation]` means those tokens are never penalized, and a
+`[TOOL_CALLS]name[ARGS]{...}` sequence is almost entirely English
+identifiers plus JSON punctuation. The anti-loop mechanism is enabled
+with nearly nothing to act on.
+
+Contributing dialect property either way: `call_separator` is empty and
+parallel calls are grammar-legal, so another `[TOOL_CALLS]` is always a
+legal continuation and only EOS ends the turn — no structural "you may
+stop now" signal, unlike dialects with a closing tag.
+
+The e2e tests pin **no seed**, so run-to-run divergence is expected by
+construction; see [[qwen_flakes_correlate_with_heat]] for the
+pin-the-seed-and-replay discipline this wants before anyone tunes
+anything. The GGUF advertises no `general.sampling.*`, so a tuned
+sidecar is still worth having on its own merits.
 
 Read this before re-diagnosing a NaN on this model, and before
 re-testing flash attention or the quantization — both are already
