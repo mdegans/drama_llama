@@ -1280,7 +1280,19 @@ fn tip_extension(
     }
     // Bookkeeping disagrees (the UTF-8 flush ending). No tip; truncate
     // to the KV extent so the entry list matches engine state exactly
-    // and no future LCP walk runs off the end of KV.
+    // and no future LCP walk runs off the end of KV. Logged because
+    // "no tip was made" and "a tip was made and lost the pick" are
+    // otherwise indistinguishable from outside (#96).
+    #[cfg(feature = "axum")]
+    tracing::debug!(
+        target: "drama_llama::session",
+        recorded = generated_tokens.len(),
+        kv_generated = kv_generated_count,
+        kv_pos_len,
+        "auto-tip not constructed: recorded tokens disagree with the \
+         KV extent (expected exactly one past the head); next call \
+         falls back to explicit markers (#96)",
+    );
     extended.truncate(prompt_entry_len + kv_generated_count);
     (extended, None, None)
 }
@@ -1750,16 +1762,32 @@ fn compute_l_hit(
     }
 }
 
-/// One slot's reuse offer for the new call: hash-keyed lookup first
-/// ([`hash_keyed_l_hit`] — render-hash equality confirmed in both
-/// coordinate spaces, so it can reach past a BPE boundary the LCP walk
-/// stops at), LCP fallback ([`compute_l_hit`]) second. Zero entry =
-/// the slot offers nothing.
+/// One slot's reuse offer for the new call: the larger of the
+/// hash-keyed lookup ([`hash_keyed_l_hit`] — render-hash equality
+/// confirmed in both coordinate spaces, so it can reach past a BPE
+/// boundary the LCP walk stops at) and the LCP walk
+/// ([`compute_l_hit`] — token-for-token equality, so it can reach the
+/// tip when the new call has no marker near it). Zero entry = the
+/// slot offers nothing.
 ///
-/// The one log site for the #91 drift event: a candidate whose bytes
+/// **Neither path dominates, so both always run (#96).** The old
+/// composition was hash-first, LCP only on a total hash miss — and
+/// every continuation re-renders its old markers to identical
+/// partials, so the hash path always matched *something* and capped
+/// reuse at the last explicit marker. The tip sits past every marker
+/// and, absent a client marker on the re-ingested assistant turn, is
+/// reachable only through the LCP walk — which never ran. Measured:
+/// all four blallama models re-prefilled the entire final turn on
+/// every call. Both offers are independently sound (each proves its
+/// prefix in both coordinate spaces), so the larger is always safe.
+///
+/// The first log site is the #91 drift event: a candidate whose bytes
 /// matched but whose segmentation did not. It is a *performance*
-/// event, not an error — the fallback below is correct — but it is
-/// invisible everywhere else, so it gets a line.
+/// event, not an error — the LCP offer stands regardless — but it is
+/// invisible everywhere else, so it gets a line. The second is the
+/// tip losing the pick (#96): the only externally-visible signal that
+/// a live tip failed to anchor, and the discriminant this issue
+/// lacked when it was diagnosed.
 fn slot_l_hit(
     slot: &PrefixSlot,
     new_entries: &[CacheEntry],
@@ -1786,16 +1814,38 @@ fn slot_l_hit(
              tokenizations disagree; hash hit refused (#91)",
         );
     }
-    if hashed.at.entry > 0 {
+    let walked = compute_l_hit(
+        &slot.prev_entries,
+        new_entries,
+        new_breakpoints,
+        slot.tip.as_ref().map(|t| t.at),
+    );
+    let picked = if hashed.at.entry >= walked.entry {
         hashed.at
     } else {
-        compute_l_hit(
-            &slot.prev_entries,
-            new_entries,
-            new_breakpoints,
-            slot.tip.as_ref().map(|t| t.at),
-        )
+        walked
+    };
+    #[cfg(feature = "axum")]
+    if let Some(tip) = &slot.tip {
+        if picked.entry < tip.at.entry
+            && tracing::enabled!(tracing::Level::DEBUG)
+        {
+            let lcp =
+                longest_common_prefix_len(&slot.prev_entries, new_entries);
+            tracing::debug!(
+                target: "drama_llama::session",
+                seq_id = slot.seq_id,
+                tip_entry = tip.at.entry,
+                tip_pos = tip.at.pos,
+                tip_hashed = tip.hash.is_some(),
+                picked_entry = picked.entry,
+                lcp,
+                "prefix-reuse: tip lost the pick — LCP stopped short \
+                 of it and no new partial hash reaches it (#96)",
+            );
+        }
     }
+    picked
 }
 
 /// Pick the slot to reuse for the new call: the one offering the
@@ -8714,6 +8764,65 @@ mod tests {
             )
             .at,
             ep(0)
+        );
+    }
+
+    /// Issue #96: the tip must anchor even when an explicit marker's
+    /// hash matches. The old composition was hash-keyed *first*, LCP
+    /// only on a total hash miss — and every continuation re-renders
+    /// its old markers to identical partials, so the hash path always
+    /// returned the last explicit marker and the LCP path (the only
+    /// one that can reach a tip the new call has no marker near) never
+    /// ran. Reproduced on all four blallama models; each call
+    /// re-prefilled the entire region past the last marker.
+    ///
+    /// The tip here carries **no hash** deliberately: a hash-less tip
+    /// (the `complete_text` path, or a byte-unstable render) is
+    /// LCP-reachable only, so this pins the composition, not the hash
+    /// side-table.
+    #[test]
+    fn slot_l_hit_tip_outranks_a_matched_marker_hash_issue_96() {
+        let h_marker = hash_partial_text("the last explicit marker");
+        // 200 prompt entries, 50 committed generated entries, KV head
+        // (and tip) at 250, one predicted turn-close entry past it.
+        let slot = hashed_slot(
+            251,
+            vec![bp(100, Some(h_marker))],
+            Some(bp(250, None)),
+        );
+        // The continuation agrees entry-for-entry through the whole
+        // cached list (canonical emission), so the LCP covers the tip
+        // with the `lcp - 1` margin to spare.
+        let new_entries = seq_entries(400);
+        let (new_eps, new_hashes) = new_bps(&[(100, h_marker)]);
+        assert_eq!(
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes),
+            ep(250),
+            "a matched marker hash must not shadow the tip: the slot's \
+             offer is the larger of the two paths, and the tip at 250 \
+             outranks the marker at 100 (#96)",
+        );
+    }
+
+    /// The other direction of the #96 fix's max: when segmentation
+    /// drift stops the LCP walk *before* a marker whose hash still
+    /// matches at agreeing coordinates, the hash path's deeper offer
+    /// must win. Guards the fix from over-rotating into LCP-first.
+    #[test]
+    fn slot_l_hit_hash_reaches_past_an_lcp_stop() {
+        let h_marker = hash_partial_text("marker past the divergence");
+        let slot = hashed_slot(300, vec![bp(200, Some(h_marker))], None);
+        // Diverge at entry 50: the LCP path offers nothing (no
+        // breakpoint at or below 49), but the hash proves bytes and
+        // coordinates through 200.
+        let mut new_entries = seq_entries(400);
+        new_entries[50] = CacheEntry::Token(9999);
+        let (new_eps, new_hashes) = new_bps(&[(200, h_marker)]);
+        assert_eq!(
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes),
+            ep(200),
+            "the hash path must still reach past a boundary the LCP \
+             walk stops at",
         );
     }
 
