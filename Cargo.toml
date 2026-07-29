@@ -389,6 +389,10 @@ required-features = ["llama-cpp"]
 name = "session_mistral4"
 required-features = ["llama-cpp"]
 
+[[test]]
+name = "session_cogito"
+required-features = ["llama-cpp"]
+
 # `#![cfg(feature = "json-schema")]` inside the file already empties it
 # out without that feature; `llama-cpp` is required too, for
 # `Session::from_path_with_n_ctx` (the `Session<LlamaCppBackend>`
