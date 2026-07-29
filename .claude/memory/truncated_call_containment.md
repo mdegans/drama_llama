@@ -2,7 +2,16 @@
 
 Design session 2026-07-21 PM (Mike + Claude), settling the remaining
 half of [#38](https://github.com/mdegans/drama_llama/issues/38). Defect 1
-landed in `6ffe4ae`; defect 3 and the ingest-side upgrade are next.
+landed in `6ffe4ae`. **Defect 3, the ingest upgrade, and the
+`partial_output` restructure all landed 2026-07-29** — validated the
+same day by the in-the-wild case they were designed for:
+[#101](https://github.com/mdegans/drama_llama/issues/101), gpt-oss
+emitting off-canonical Harmony framing (`<|start|> assistant`, spaced)
+that the parser degraded to `Block::Text`, killing 3 of 40 seed agents
+one turn later at ingest. Even the Court::scan error-echo vector
+recurred on cue: the old `Display` shipped the poison bytes through
+blallama's 500 into agentkit's logs. See #101 for what remains
+(blallama's flat 500 mapping; live seed-run validation).
 
 Mike's framing question, worth preserving because the answer keeps
 coming up: *"why is the model even able to emit these in an illegal
@@ -166,17 +175,23 @@ reserved bytes must not print them.
 
 ## Remaining work
 
-- **Defect 3**: containment scan over outgoing blocks' free text in
-  `run_call`, gated on `emit_specials_ban` (respect the Qwen-VL
-  grounding opt-out via `with_emit_specials_ban(false)`).
-- **Ingest upgrade**: `find_injected_special_in_prompt`
-  (`session/mod.rs:1122-1153`) currently returns **first hit**; it needs
-  to return all hits with their `Index`. That is the actual engineering
-  here — the error type is the easy part.
-- **`GrammarViolation.partial_output`**: `String` → `Content`. It is
-  built by joining every `Block::Text` (`session/mod.rs:5133-5140`),
-  which loses structure *and* means it can carry the poison bytes while
-  its doc invites reuse. API break is fine pre-publish.
+- ~~**Defect 3**~~ **LANDED 2026-07-29** (`SessionError::EmittedSpecialToken`,
+  `scan_blocks_for_specials`): scan in `run_call` after the
+  grammar-violation check, gated on `emit_specials_ban`. One deliberate
+  divergence from the GrammarViolation arm, documented at the site: the
+  containment error does **not** `record_cache_miss_on_error` — the
+  constraint completed, the recorded slot is consistent, and the
+  poisoned extension is unreachable (a retry LCP-matches the full
+  prompt extent), so evicting would turn the near-free resample into a
+  full re-prefill. GrammarViolation still evicts because its tip
+  carries a mid-constraint sampler state.
+- ~~**Ingest upgrade**~~ **LANDED 2026-07-29**
+  (`find_injected_specials_in_prompt` → `Vec<Violation>`, all hits,
+  per-block piece dedup, repair loop pinned by a unit test that
+  round-trips `get_mut` → strip → clean rescan).
+- ~~**`GrammarViolation.partial_output`**~~ **LANDED 2026-07-29**:
+  `String` → `Content` (full parse, thoughts and parsed calls
+  included), `Display` prints a block count instead of the content.
 - **Out of scope**: #64 (EOG with an open thought on the un-grammared
   lazy span — needs a bounded escape or it manufactures #36);
   per-variant `map_session_err` in blallama (today every variant
