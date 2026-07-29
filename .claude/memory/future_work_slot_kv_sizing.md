@@ -48,9 +48,44 @@ one slot is **not** an automatic miss.
   for multi-tenant Agora), costs utilization (a conversation
   hard-caps at `target` even with idle neighbors). Same total memory.
 
-Open question for the design session: does Agora need the fairness
-guarantee, or is bigger-unified-pool + LRU good enough? Also note
-`capacity_cells` already exists as a soft-reservation knob.
+## Mike's chosen direction (2026-07-29, same day — supersedes the
+## "two routes" framing above; design session wanted before any code)
+
+His words, lightly compressed: **"one slot = one entire KV"** — but
+the slot-count problem dissolves via a **tiered disk cache**:
+
+- Every breakpoint **except the tip** is written to disk, by a
+  worker, so persistence never blocks the request path.
+- A partial miss (back to the previous turn, or to system+tools)
+  **loads the matching snapshot from disk into the single actually-
+  allocated slot** instead of keeping N conversations resident in KV.
+- Eviction means deletion; cache entries can be deleted after ~1h
+  (matches the existing TTL thinking).
+- Rationale: "the disk is fast enough to make this worth it and we
+  don't have to worry so much about number of slots then" — it
+  dodges the pool-sharing/thrash issue above entirely.
+
+He explicitly wants a design session with Claude's input before
+building. Seed material for that session:
+
+- `SnapshotStore` + the llama.cpp sequence state save/restore path
+  (`src/llama_cpp/decoder.rs`, restore call site ~:804) — the
+  primitive already exists and is production-exercised.
+- [[future_work_kv_disk_offload]] — the 2026-07-27 memo (commit
+  `332faa5`) with *measured* numbers for disk-resident KV; the
+  restore-vs-reprefill crossover decides whether "disk is fast
+  enough" per model. Read it before arguing either way.
+- Design tensions to work through: snapshot granularity (per
+  breakpoint vs per turn), what the on-disk key is (the partial-hash
+  side-table already exists — #91's refusal semantics must survive
+  the tier move), write-worker backpressure when an agent turns over
+  breakpoints faster than the disk drains, and crash-consistency
+  (a torn snapshot must read as a miss, never as a wrong restore).
+
+Open question for the design session (still relevant under the
+tiered design, for the *resident* slot): does Agora need any
+fairness guarantee, or is single-resident + disk-restore enough?
+Also note `capacity_cells` already exists as a soft-reservation knob.
 
 Related: [[plan_v0.8.0_backend_split]] (slot system landing),
 #96/#91 (lookup semantics the rework must not disturb).
