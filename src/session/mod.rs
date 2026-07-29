@@ -185,12 +185,22 @@ pub enum SessionError {
     /// grammar/JSON constraint left mid-structure at end of
     /// generation. Constraint-incomplete output is never returned
     /// silently.
-    #[error("grammar violation: generation ended without satisfying the active constraint; partial_output={partial_output:?}")]
+    #[error(
+        "grammar violation: generation ended without satisfying the \
+         active constraint; {} partial block(s) withheld from this \
+         message (see `partial_output`)",
+        partial_output.0.len()
+    )]
     GrammarViolation {
-        /// Any prose / thought blocks that streamed before the violation was
-        /// detected. Callers can surface this to the user or log it for
-        /// debugging.
-        partial_output: String,
+        /// Everything the model produced before the violation was
+        /// detected, with block structure intact (prose, thoughts, and
+        /// any calls that did parse). For diagnostics and human
+        /// display only — a truncated generation can carry a live
+        /// frame marker in its text, so seating this as a message (or
+        /// relaying it into model-visible content) re-poisons the next
+        /// ingest. That is also why `Display` prints a count, not the
+        /// content.
+        partial_output: crate::prompt::Content,
     },
     /// A backend prefill failed during the chunked prefix-cache
     /// setup. Wraps the backend's stringified error to keep
@@ -208,11 +218,57 @@ pub enum SessionError {
     /// callers who legitimately need to discuss such a string must
     /// escape it on their side. Raw-predictor users below the block
     /// layer are unaffected.
+    ///
+    /// Repairable, not just fatal: `violations` addresses every
+    /// offending block ([`Prompt::get_mut`] resolves a
+    /// [`Violation::at`]), so a caller holding poison it didn't write
+    /// — from another backend, a hand-built transcript, a relayed
+    /// message — can strip or escape the pieces in place, resubmit,
+    /// and (with breakpoints at the ends of the prompt) pay only for
+    /// the mutated message. `Display` deliberately prints counts, not
+    /// pieces: this error is routinely relayed to agents, and quoting
+    /// the reserved bytes verbatim would make the report itself a
+    /// re-injection vector (issue #38's `Court::scan` postmortem).
+    ///
+    /// [`Prompt::get_mut`]: misanthropic::prompt::Prompt::get_mut
     #[error(
-        "prompt content contains reserved special token {token} \
-         ({piece:?}); reject as possible prompt injection"
+        "prompt content contains reserved chat-framing special tokens \
+         in {} block(s); reject as possible prompt injection \
+         (offending pieces withheld from this message — see \
+         `violations` to locate and repair)",
+        violations.len()
     )]
-    InjectedSpecialToken { token: Token, piece: String },
+    InjectedSpecialToken { violations: Vec<Violation> },
+    /// The generation itself produced a reserved chat-framing special
+    /// token inside free text — containment for #38: the model emitted
+    /// a frame marker (as the real token where the dialect permits
+    /// specials mid-generation, Harmony's `<|start|>`; or byte-spelled
+    /// as ordinary content tokens) in a position the dialect parser
+    /// could only read as content. Seating that output would poison
+    /// the transcript: the very next ingest fails with
+    /// [`Self::InjectedSpecialToken`] — one turn *after* the actual
+    /// failure, at a caller who did nothing wrong. Rejected here
+    /// instead, where recovery is cheapest: the prompt is unchanged
+    /// and the prefix cache still holds its full extent, so a retry
+    /// re-prefills nothing and simply resamples.
+    ///
+    /// Gated on the same opt-out as the emission ban
+    /// ([`Session::with_emit_specials_ban`]) — callers who legitimately
+    /// want special markers in surfaced text (Qwen-VL grounding) opt
+    /// out of both. `Display` withholds the pieces for the same
+    /// relay-safety reason as [`Self::InjectedSpecialToken`].
+    #[error(
+        "generation emitted a reserved chat-framing special token in \
+         free text; resample — the prompt is unchanged and its cache \
+         extent is still warm (offending pieces withheld from this \
+         message — see `found`)"
+    )]
+    EmittedSpecialToken {
+        /// The distinct offending special pieces, in order of first
+        /// occurrence. Reserved bytes — do not relay into
+        /// model-visible content.
+        found: Vec<String>,
+    },
     /// The prompt carries an *open* thought — a reasoning block whose
     /// close marker the model never emitted, flagged with
     /// [`OPEN_THOUGHT_SIGNATURE`](crate::prompt::OPEN_THOUGHT_SIGNATURE).
@@ -283,6 +339,25 @@ pub enum SessionError {
     },
 }
 
+/// One content block whose free text carries reserved chat-framing
+/// special-token pieces — the payload of
+/// [`SessionError::InjectedSpecialToken`]. Callers repair in place:
+/// [`Prompt::get_mut`] resolves `at` to the offending block, the
+/// caller strips or escapes the pieces in `found`, and resubmits.
+///
+/// [`Prompt::get_mut`]: misanthropic::prompt::Prompt::get_mut
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Violation {
+    /// Address of the offending block. For nested content (a
+    /// tool result's inner blocks — nesting isn't separately
+    /// addressable) this is the *top-level* block containing it.
+    pub at: misanthropic::prompt::Index,
+    /// The distinct offending special pieces found in this block, in
+    /// order of first occurrence. Reserved bytes — do not relay into
+    /// model-visible content.
+    pub found: Vec<String>,
+}
+
 impl SessionError {
     /// For functions like [`complete_response`], return `true` if the
     /// [`Session`] is re-usable, else false. Inverse of [`is_fatal`].
@@ -310,6 +385,12 @@ impl SessionError {
             // retried, after pruning).
             Self::InjectedSpecialToken { .. }
             | Self::UnrenderableOpenThought { .. } => true,
+            // Containment check fires after the call's cache + usage
+            // bookkeeping, which run_call leaves in the same state as
+            // a success — deliberately, so the resample it asks for
+            // finds the prompt extent warm. Not just reusable but
+            // *cheap* to retry.
+            Self::EmittedSpecialToken { .. } => true,
             // Media capability / shape errors fire during prepare,
             // before any decode. State untouched — safe to reuse.
             Self::MediaUnsupported { .. }
@@ -1307,16 +1388,20 @@ fn tip_cursor(prompt: &Prompt) -> SeedCursor {
     }
 }
 
-/// Scan every free-text surface of `prompt` for a token that tokenizes
+/// Scan every free-text surface of `prompt` for tokens that tokenize
 /// (with `parse_special = true`, the setting every prepare path uses on
-/// the full render) to a reserved chat-framing special token. Returns
-/// the first offender `(id, piece)`, or `None` if all content is clean.
+/// the full render) to reserved chat-framing special tokens. Returns
+/// **all** offending blocks, each addressed by its
+/// [`Index`](misanthropic::prompt::Index) with the distinct offending
+/// pieces found in it — empty means clean. All-hits rather than
+/// first-hit so the caller can repair a poisoned transcript in one
+/// pass instead of resubmitting once per offender (#38).
 ///
 /// This is the pure core of [`Session::check_no_special_injection`],
 /// generic over the tokenizer so the block walk is unit-testable
 /// without a model. `specials` is the set from
 /// [`crate::backend::Model::special_tokens`]; an empty set (backend
-/// with no declared specials) short-circuits to `None`.
+/// with no declared specials) short-circuits to clean.
 ///
 /// Ordinary prose can never trip this: `parse_special` only emits a
 /// special id when the exact special *piece* (`<|im_end|>`, etc.)
@@ -1324,37 +1409,50 @@ fn tip_cursor(prompt: &Prompt) -> SeedCursor {
 /// word tokenizes into. The only content this rejects is content that
 /// literally contains a reserved framing token — i.e. an injection
 /// attempt, or a caller who must escape it app-side.
-fn find_injected_special_in_prompt(
+fn find_injected_specials_in_prompt(
     prompt: &Prompt,
     tokenize: impl Fn(&str) -> Vec<Token>,
     specials: &std::collections::HashSet<Token>,
     piece_of: impl Fn(Token) -> String,
-) -> Option<(Token, String)> {
+) -> Vec<Violation> {
+    use misanthropic::prompt::{BlockIndex, Index};
+
+    let mut violations: Vec<Violation> = Vec::new();
     if specials.is_empty() {
-        return None;
+        return violations;
     }
-    let mut texts: Vec<&str> = Vec::new();
-    if let Some(system) = prompt.system.as_ref() {
-        for b in &system.0 {
-            block_free_text(b, &mut texts);
-        }
-    }
-    for msg in &prompt.messages {
-        for b in &msg.content.0 {
-            block_free_text(b, &mut texts);
-        }
-    }
-    for text in texts {
-        if text.is_empty() {
-            continue;
-        }
-        for tok in tokenize(text) {
-            if specials.contains(&tok) {
-                return Some((tok, piece_of(tok)));
+    let mut check = |at: Index, block: &crate::Block| {
+        let mut texts: Vec<&str> = Vec::new();
+        block_free_text(block, &mut texts);
+        let mut found: Vec<String> = Vec::new();
+        for text in texts {
+            if text.is_empty() {
+                continue;
+            }
+            for tok in tokenize(text) {
+                if specials.contains(&tok) {
+                    let piece = piece_of(tok);
+                    if !found.contains(&piece) {
+                        found.push(piece);
+                    }
+                }
             }
         }
+        if !found.is_empty() {
+            violations.push(Violation { at, found });
+        }
+    };
+    if let Some(system) = prompt.system.as_ref() {
+        for (i, b) in system.0.iter().enumerate() {
+            check(Index::Block(BlockIndex::System(i)), b);
+        }
     }
-    None
+    for (m, msg) in prompt.messages.iter().enumerate() {
+        for (b, block) in msg.content.0.iter().enumerate() {
+            check(Index::Block(BlockIndex::Message((m, b))), block);
+        }
+    }
+    violations
 }
 
 /// Index of the first message carrying an **unrenderable** open thought
@@ -1384,7 +1482,7 @@ fn find_injected_special_in_prompt(
 /// pre-opens a channel in its generation prompt, and a dialect with no
 /// reasoning markers has nothing to resume.
 ///
-/// Model-free and pure, like [`find_injected_special_in_prompt`], so
+/// Model-free and pure, like [`find_injected_specials_in_prompt`], so
 /// the walk is unit-testable without loading a model.
 fn find_open_thought(
     prompt: &Prompt,
@@ -3498,6 +3596,41 @@ impl<B: Backend> Session<B> {
             .map(|tok| (tok, self.engine.model.token_to_piece(tok)))
     }
 
+    /// The containment predicate (#38 defect 3): the distinct reserved
+    /// special pieces in the free text of `blocks`, in order of first
+    /// occurrence — empty means clean. Same block walk
+    /// ([`block_free_text`]) and tokenize settings as the ingest guard
+    /// ([`Session::check_no_special_injection`]), so what emission
+    /// passes, the next ingest provably accepts: the two ends of the
+    /// round-trip share one predicate and cannot drift.
+    fn scan_blocks_for_specials(&self, blocks: &[crate::Block]) -> Vec<String> {
+        let specials: std::collections::HashSet<Token> =
+            self.engine.model.special_tokens().into_iter().collect();
+        let mut found: Vec<String> = Vec::new();
+        if specials.is_empty() {
+            return found;
+        }
+        let mut texts: Vec<&str> = Vec::new();
+        for block in blocks {
+            block_free_text(block, &mut texts);
+        }
+        for text in texts {
+            if text.is_empty() {
+                continue;
+            }
+            // add_special = false, same rationale as above.
+            for tok in self.engine.model.tokenize_special(text, false, true) {
+                if specials.contains(&tok) {
+                    let piece = self.engine.model.token_to_piece(tok);
+                    if !found.contains(&piece) {
+                        found.push(piece);
+                    }
+                }
+            }
+        }
+        found
+    }
+
     /// Reject prompts whose free-text content would inject reserved
     /// chat-framing special tokens (see
     /// [`SessionError::InjectedSpecialToken`]). Called at the top of
@@ -3514,7 +3647,7 @@ impl<B: Backend> Session<B> {
     ) -> Result<(), SessionError> {
         let specials: std::collections::HashSet<Token> =
             self.engine.model.special_tokens().into_iter().collect();
-        match find_injected_special_in_prompt(
+        let violations = find_injected_specials_in_prompt(
             prompt,
             // add_special = false: the scan must see only what the
             // CONTENT tokenizes to. `Model::tokenize` auto-prepends
@@ -3523,11 +3656,11 @@ impl<B: Backend> Session<B> {
             |t| self.engine.model.tokenize_special(t, false, true),
             &specials,
             |tok| self.engine.model.token_to_piece(tok),
-        ) {
-            Some((token, piece)) => {
-                Err(SessionError::InjectedSpecialToken { token, piece })
-            }
-            None => Ok(()),
+        );
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(SessionError::InjectedSpecialToken { violations })
         }
     }
 
@@ -5535,20 +5668,45 @@ impl<B: Backend> Session<B> {
                     .iter()
                     .any(|b| matches!(b, crate::Block::ToolUse { .. })))
         {
-            let partial = blocks
-                .iter()
-                .filter_map(|b| match b {
-                    crate::Block::Text { text, .. } => Some(text.as_ref()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
             // Grammar violation is a call failure — invalidate cache
-            // + KV to avoid stale reuse next call.
+            // + KV to avoid stale reuse next call (the recorded tip
+            // carries a mid-constraint sampler state).
             self.record_cache_miss_on_error();
+            // The whole parse, structure intact — a `.join` of the
+            // text blocks silently dropped thoughts and any calls
+            // that did parse (#38).
             return Err(SessionError::GrammarViolation {
-                partial_output: partial,
+                partial_output: crate::prompt::Content(blocks),
             });
+        }
+
+        // Containment (#38 defect 3): the generation's free text must
+        // not carry a reserved chat-framing special — as the real
+        // token (Harmony's `<|start|>` is emit-legal mid-generation,
+        // and an off-canonical framing shape like the observed
+        // `<|start|> assistant` degrades to `Block::Text`) or
+        // byte-spelled as ordinary content tokens. Keyed on the same
+        // predicate the NEXT ingest will apply, never on "did the
+        // parser degrade": degrading to prose is legal, load-bearing
+        // output for structured generation (see
+        // truncated_call_containment.md). Without this check the
+        // poison seats and the caller's next call dies at ingest with
+        // `InjectedSpecialToken` — one turn after the actual failure.
+        //
+        // Deliberately NOT `record_cache_miss_on_error` (contrast the
+        // grammar-violation arm above): the constraint completed, so
+        // the recorded slot is internally consistent, and the poisoned
+        // extension is unreachable — a well-behaved caller discards
+        // this output and retries the identical prompt, whose LCP walk
+        // matches the full prompt extent and truncates the poison. A
+        // busted caller that seats it anyway is stopped at ingest.
+        // Evicting here would turn the near-free resample this error
+        // asks for into a full re-prefill.
+        if self.emit_specials_ban {
+            let found = self.scan_blocks_for_specials(&blocks);
+            if !found.is_empty() {
+                return Err(SessionError::EmittedSpecialToken { found });
+            }
         }
 
         let (stop_reason, stop_sequence) = infer_stop_reason(
@@ -6626,14 +6784,18 @@ mod tests {
         assert!(none.is_empty(), "redacted thought yields no free text");
     }
 
-    /// `find_injected_special_in_prompt` scans system + message free
-    /// text with the injected tokenizer, flags the first special-token
-    /// hit, and short-circuits on an empty special set. Uses a fake
-    /// tokenizer (whitespace split; the literal word `EVIL` is the
-    /// "special" id) so the walk is exercised without a model.
+    /// `find_injected_specials_in_prompt` scans system + message free
+    /// text with the injected tokenizer, reports **every** offending
+    /// block with its [`Index`](misanthropic::prompt::Index) (so a
+    /// caller repairs the whole transcript in one pass), dedups pieces
+    /// within a block, and short-circuits on an empty special set.
+    /// Uses a fake tokenizer (whitespace split; the literal word
+    /// `EVIL` is the "special" id) so the walk is exercised without a
+    /// model.
     #[test]
-    fn test_find_injected_special_in_prompt() {
+    fn test_find_injected_specials_in_prompt() {
         use misanthropic::prompt::message::Role;
+        use misanthropic::prompt::{BlockIndex, Index};
 
         let specials: std::collections::HashSet<Token> =
             [999].into_iter().collect();
@@ -6651,8 +6813,8 @@ mod tests {
             .add_message((Role::Assistant, "sure thing"))
             .unwrap();
         assert!(
-            find_injected_special_in_prompt(&clean, tok, &specials, piece)
-                .is_none(),
+            find_injected_specials_in_prompt(&clean, tok, &specials, piece)
+                .is_empty(),
             "clean conversation has no injected specials",
         );
 
@@ -6660,24 +6822,83 @@ mod tests {
             .add_message((Role::User, "hello EVIL world"))
             .unwrap();
         assert_eq!(
-            find_injected_special_in_prompt(&in_text, tok, &specials, piece),
-            Some((999, "EVIL".to_string())),
-            "injection in user text is caught",
+            find_injected_specials_in_prompt(&in_text, tok, &specials, piece),
+            vec![Violation {
+                at: Index::Block(BlockIndex::Message((0, 0))),
+                found: vec!["EVIL".to_string()],
+            }],
+            "injection in user text is caught and addressed",
         );
 
         let in_system = Prompt::default().system("system says EVIL");
         assert_eq!(
-            find_injected_special_in_prompt(&in_system, tok, &specials, piece),
-            Some((999, "EVIL".to_string())),
-            "injection in system content is caught",
+            find_injected_specials_in_prompt(&in_system, tok, &specials, piece),
+            vec![Violation {
+                at: Index::Block(BlockIndex::System(0)),
+                found: vec!["EVIL".to_string()],
+            }],
+            "injection in system content is caught and addressed",
+        );
+
+        // All-hits: two poisoned messages around a clean one yield two
+        // violations in prompt order, and a piece repeated within one
+        // block is reported once (`found` is deduped per block, not
+        // dropped — the caller repairs each block exactly once).
+        let multi = Prompt::default()
+            .add_message((Role::User, "EVIL twice EVIL here"))
+            .unwrap()
+            .add_message((Role::Assistant, "clean reply"))
+            .unwrap()
+            .add_message((Role::User, "and EVIL again"))
+            .unwrap();
+        assert_eq!(
+            find_injected_specials_in_prompt(&multi, tok, &specials, piece),
+            vec![
+                Violation {
+                    at: Index::Block(BlockIndex::Message((0, 0))),
+                    found: vec!["EVIL".to_string()],
+                },
+                Violation {
+                    at: Index::Block(BlockIndex::Message((2, 0))),
+                    found: vec!["EVIL".to_string()],
+                },
+            ],
+            "every offending block is reported, in prompt order",
+        );
+
+        // The reported Index resolves: the repair loop the error's doc
+        // promises (`get_mut` → strip → resubmit) actually reaches the
+        // offending block.
+        let violations =
+            find_injected_specials_in_prompt(&multi, tok, &specials, piece);
+        let mut repaired = multi.clone();
+        for v in &violations {
+            match repaired.get_mut(v.at) {
+                Some(misanthropic::prompt::IndexMut::Block(
+                    crate::Block::Text { text, .. },
+                )) => {
+                    *text = text.replace("EVIL", "").into();
+                }
+                other => panic!(
+                    "index must resolve to a text block, got \
+                     {:?} resolving {:?}",
+                    other.is_some(),
+                    v.at
+                ),
+            }
+        }
+        assert!(
+            find_injected_specials_in_prompt(&repaired, tok, &specials, piece)
+                .is_empty(),
+            "repairing every reported block yields a clean prompt",
         );
 
         // Empty special set (backend with no declared specials) never
         // scans — moeflux-style backends pay nothing.
         let empty = std::collections::HashSet::new();
         assert!(
-            find_injected_special_in_prompt(&in_text, tok, &empty, piece)
-                .is_none(),
+            find_injected_specials_in_prompt(&in_text, tok, &empty, piece)
+                .is_empty(),
         );
     }
 
@@ -6727,11 +6948,17 @@ mod tests {
                 serde_json::json!({"a": [1, ["x", "EVIL"]]}),
             ),
         ];
+        let sole_block = vec![Violation {
+            at: misanthropic::prompt::Index::Block(
+                misanthropic::prompt::BlockIndex::Message((0, 0)),
+            ),
+            found: vec!["EVIL".to_string()],
+        }];
         for call in hostile_calls {
             let p = prompt_with(call.into(), Role::Assistant);
             assert_eq!(
-                find_injected_special_in_prompt(&p, tok, &specials, piece),
-                Some((999, "EVIL".to_string())),
+                find_injected_specials_in_prompt(&p, tok, &specials, piece),
+                sole_block,
                 "injection via a ToolUse surface is caught",
             );
         }
@@ -6745,8 +6972,8 @@ mod tests {
         };
         let p = prompt_with(result.into(), Role::User);
         assert_eq!(
-            find_injected_special_in_prompt(&p, tok, &specials, piece),
-            Some((999, "EVIL".to_string())),
+            find_injected_specials_in_prompt(&p, tok, &specials, piece),
+            sole_block,
             "injection via ToolResult.tool_use_id is caught",
         );
 
@@ -6759,8 +6986,8 @@ mod tests {
         .with_id("call_1");
         let p = prompt_with(clean.into(), Role::Assistant);
         assert!(
-            find_injected_special_in_prompt(&p, tok, &specials, piece)
-                .is_none(),
+            find_injected_specials_in_prompt(&p, tok, &specials, piece)
+                .is_empty(),
             "clean tool call is not rejected",
         );
     }
@@ -8163,9 +8390,16 @@ mod tests {
             .add_message((Role::User, injected_text.as_str()))
             .unwrap();
         match session.check_no_special_injection(&attack) {
-            Err(SessionError::InjectedSpecialToken { token, piece: p }) => {
-                assert_eq!(token, victim);
-                assert_eq!(p, piece);
+            Err(SessionError::InjectedSpecialToken { violations }) => {
+                use misanthropic::prompt::{BlockIndex, Index};
+                assert_eq!(
+                    violations,
+                    vec![Violation {
+                        at: Index::Block(BlockIndex::Message((0, 0))),
+                        found: vec![piece.clone()],
+                    }],
+                    "the sole offending block is addressed with its piece",
+                );
             }
             other => panic!("expected InjectedSpecialToken, got {other:?}"),
         }
@@ -8226,6 +8460,90 @@ mod tests {
         assert!(
             session.prepare_call(&clean, true).is_ok(),
             "clean prompt still prepares end-to-end",
+        );
+    }
+
+    /// The containment predicate (#38 defect 3) over *outgoing*
+    /// blocks: `scan_blocks_for_specials` flags a parsed generation
+    /// whose free text carries a special piece — the observed
+    /// in-the-wild shape is gpt-oss emitting off-canonical Harmony
+    /// framing (`<|start|> assistant`) that the parser degrades to
+    /// `Block::Text` — and passes clean output. Coextension with the
+    /// ingest guard is the invariant: anything this passes,
+    /// `check_no_special_injection` must accept on the next turn.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_scan_blocks_for_specials_matches_ingest_guard() {
+        use misanthropic::prompt::message::Role;
+
+        let session = crate::LlamaCppSession::from_path(model_path())
+            .unwrap()
+            .quiet();
+
+        // Same round-trippable special selection as the ingest test.
+        let specials = session.engine.model.special_tokens();
+        let victim = specials
+            .iter()
+            .copied()
+            .find(|&t| {
+                let p = session.engine.model.token_to_piece(t);
+                !p.is_empty()
+                    && session.engine.model.tokenize(&p, true).contains(&t)
+            })
+            .expect("model must expose a round-trippable special token");
+        let piece = session.engine.model.token_to_piece(victim);
+
+        // The observed poison shape: [thinking, text-with-framing,
+        // tool_use] — the text block carries the marker, the healthy
+        // blocks around it stay healthy.
+        let poisoned = vec![
+            crate::Block::Thought {
+                thought: "reasoning about the task".into(),
+                signature: "".into(),
+            },
+            crate::Block::from(format!("{piece} assistant").as_str()),
+            crate::Block::from(crate::prompt::ToolUse::new(
+                "search",
+                serde_json::json!({"q": "ok"}),
+            )),
+        ];
+        assert_eq!(
+            session.scan_blocks_for_specials(&poisoned),
+            vec![piece.clone()],
+            "a special piece in outgoing free text is flagged",
+        );
+
+        let clean = vec![
+            crate::Block::Thought {
+                thought: "reasoning".into(),
+                signature: "".into(),
+            },
+            crate::Block::from("here is the answer"),
+        ];
+        assert!(
+            session.scan_blocks_for_specials(&clean).is_empty(),
+            "clean generation passes",
+        );
+
+        // Coextension, asserted both ways: what emission flags, ingest
+        // rejects; what emission passes, ingest accepts.
+        let seat = |blocks: Vec<crate::Block>| {
+            let mut p =
+                Prompt::default().add_message((Role::User, "hi")).unwrap();
+            p.messages.push(misanthropic::prompt::message::Message {
+                role: Role::Assistant,
+                content: crate::prompt::Content(blocks),
+            });
+            p
+        };
+        assert!(
+            session.check_no_special_injection(&seat(poisoned)).is_err(),
+            "what the containment scan flags, the next ingest rejects",
+        );
+        assert!(
+            session.check_no_special_injection(&seat(clean)).is_ok(),
+            "what the containment scan passes, the next ingest accepts",
         );
     }
 

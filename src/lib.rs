@@ -169,7 +169,7 @@ pub use session::LlamaCppSession;
 ))]
 pub use session::{
     BlockStream, PrefixCacheConfig, Session, SessionError, TokenTrace,
-    TopKEntry,
+    TopKEntry, Violation,
 };
 #[cfg(all(
     feature = "tokio",
