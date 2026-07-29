@@ -5705,6 +5705,20 @@ impl<B: Backend> Session<B> {
         if self.emit_specials_ban {
             let found = self.scan_blocks_for_specials(&blocks);
             if !found.is_empty() {
+                // The pieces go in the log verbatim: tracing output is
+                // operator-facing and never model-visible, and forensics
+                // needs the exact bytes (the #101 diagnosis had to dig
+                // state files for them). The redaction discipline
+                // applies to `Display`, which is relayed to clients.
+                #[cfg(feature = "axum")]
+                tracing::error!(
+                    target: "drama_llama::session",
+                    found = ?found,
+                    "generation emitted reserved special token(s) in \
+                     free text; output rejected before it can poison \
+                     the next ingest (#101) — prompt cache extent is \
+                     warm, resample",
+                );
                 return Err(SessionError::EmittedSpecialToken { found });
             }
         }

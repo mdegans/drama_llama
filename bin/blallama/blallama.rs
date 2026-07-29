@@ -577,12 +577,47 @@ where
     // the lock — otherwise a `complete_response` error drops it and the
     // next request reloads from disk. See `is_reusable_after` for the
     // reuse-vs-reload classification.
-    let (session, result, elapsed) = spawn_blocking_or_bust(move || {
-        let start = std::time::Instant::now();
-        let result = session.complete_response_id(&prompt, id);
-        (session, result, start.elapsed())
-    })
-    .await;
+    //
+    // `EmittedSpecialToken` gets a bounded in-place resample (#101):
+    // containment deliberately leaves the prompt's cache extent warm, so
+    // the retry re-prefills nothing and simply samples a different path.
+    // Bounded because a greedy (temperature 0) request reproduces the
+    // same emission deterministically — the cap keeps that pathological
+    // case at a fixed cost instead of a loop.
+    const MAX_RESAMPLES: u32 = 2;
+    let (session, result, elapsed, resamples) =
+        spawn_blocking_or_bust(move || {
+            let start = std::time::Instant::now();
+            let mut resamples: u32 = 0;
+            let result = loop {
+                match session.complete_response_id(&prompt, id) {
+                    Err(drama_llama::SessionError::EmittedSpecialToken {
+                        found,
+                    }) if resamples < MAX_RESAMPLES => {
+                        resamples += 1;
+                        // Pieces logged verbatim: stderr is
+                        // operator-facing, never model-visible. The
+                        // redaction discipline applies to `Display`,
+                        // which is relayed to clients.
+                        error!(
+                            attempt = resamples,
+                            max = MAX_RESAMPLES,
+                            found = ?found,
+                            "generation emitted reserved special \
+                             token(s) in free text; resampling on the \
+                             warm cache (#101)",
+                        );
+                    }
+                    other => break other,
+                }
+            };
+            (session, result, start.elapsed(), resamples)
+        })
+        .await;
+
+    if resamples > 0 && result.is_ok() {
+        info!(resamples, "resample recovered a clean generation (#101)");
+    }
 
     // SessionEnd fires regardless of generation success — the probe stream
     // is a flight recorder, not a control channel.
