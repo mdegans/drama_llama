@@ -370,6 +370,13 @@ where
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    // #95 stage logging: if shutdown wedges, the last line present names
+    // the stuck stage. "draining" (from `shutdown_signal`) but no
+    // "drained" = hyper waiting on an open connection (`/probe` SSE
+    // never completes its response). "drained" but the process lives =
+    // runtime teardown waiting on the blocking pool (in-flight
+    // generation; policy is finish-then-exit).
+    tracing::info!("drained — all connections closed; dropping runtime");
     Ok(())
 }
 
@@ -999,6 +1006,10 @@ where
     };
 
     let bus = state.probe_bus.ok_or(StatusCode::NOT_FOUND)?;
+    // #95: an open SSE response never completes, and hyper's graceful
+    // drain waits for exactly that — this line in a wedged shutdown's
+    // transcript is the confirmation.
+    tracing::info!("probe stream opened");
     let rx = bus.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|res| async move {
         match res {
