@@ -81,6 +81,13 @@ building. Seed material for that session:
   the tier move), write-worker backpressure when an agent turns over
   breakpoints faster than the disk drains, and crash-consistency
   (a torn snapshot must read as a miss, never as a wrong restore).
+- Mike's two named hazards (2026-07-29, closing note): **races** and
+  **unclean shutdowns** — the latter especially, because orphaned
+  snapshots from a killed process accumulate until the disk fills.
+  Implication for the design: deletion must not depend on any live
+  process's bookkeeping — TTL keyed on on-disk mtime plus a startup
+  sweep of the cache dir reclaims orphans no matter how the previous
+  process died; in-memory eviction lists alone are disqualified.
 
 Open question for the design session (still relevant under the
 tiered design, for the *resident* slot): does Agora need any
