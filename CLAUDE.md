@@ -257,6 +257,17 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`plan_cache_restore_ladder_and_disk_tier.md`](.claude/memory/plan_cache_restore_ladder_and_disk_tier.md)
+  — **arc plan-of-record (2026-07-29), the live drama_llama arc.**
+  Five phases: restore-to-divergence ladder (pure transformers),
+  end-of-final-message auto-anchor (fixes Qwen reflect appends),
+  #95 shutdown logging, tiered disk cache for prefix slots (trait in
+  Session, impl + lifecycle in blallama), #100 gated on post-Phase-2
+  telemetry. Carries the 2026-07-29 diagnosis (all eight collapses =
+  anchor quantization; renders round-trip byte-exact; deficit == final
+  message size) and every fork decided with Mike. Read before touching
+  `compute_l_hit`, `SnapshotStore`, eviction, or proposing any cache
+  design.
 - [`plan_template_ownership.md`](.claude/memory/plan_template_ownership.md)
   — **plan-of-record ([issue #88](https://github.com/mdegans/drama_llama/issues/88)),
   the live drama_llama arc.** Commit fully to owned chat templates:
