@@ -269,6 +269,25 @@ one folding pass) it is **+1.14% median overall**, +1.3–4% on prefill,
 prompt — "upstream might accept broken code if it's faster" — is why
 this got measured at all. **Always benchmark a kernel change here.**
 
+**Review round 2 landed (2026-08-01).** ggerganov's inline suggestions
+were applied plus his concurrency question — stack `map0` with
+`amax_part` (wide dispatch hides map0's token-scaling work) instead of
+with the 32-thread `amax` reduce. Measured before adopting: A/B on
+op-level `test-backend-ops perf`, 16 interleaved order-counterbalanced
+runs per side, per-case medians, mv-path cases as a no-change control
+(±0.5%). All 18 mm-path cases favored the reorder: **mean −2.6%**,
+growing with batch (−2.3% at n=512 → −3.5% at n=2048; the n>512 cases
+were a *local* test-file edit, deliberately not committed — upstream's
+perf lists stop at 512 and 56 extra cases ≈ +1 min per sweep).
+Cold-chip and steady-state batches agree. Branch rebased on master
+(798/798 post-rebase) and force-pushed 2026-08-01; commit message is
+Mike's, with a generative-AI-disclosure Co-Authored-By. Awaiting
+merge. Protocol lesson that earned the result: the naive back-to-back
+perf comparison showed ±20% swings *in the control group* (cold-start
++ slot-order bias) — interleave and counterbalance or the numbers are
+fiction. When the PR merges into a tagged release, bump llama-cpp-sys
+and retire `with_n_ubatch(31)`.
+
 Upstream issue **#25722** (open) is the same bug: mistral4, Metal,
 empty output above ~300 tokens, FA on *and* off, generation degenerating
 to a single control token — argmax over an all-NaN distribution. Their
