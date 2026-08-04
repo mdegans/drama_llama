@@ -116,6 +116,13 @@ egui_extras = { version = "0.34", optional = true, features = ["all_loaders"] }
 image = { version = "0.25", optional = true, features = ["png"] }
 rustyline = { version = "14", optional = true }
 schemars = { version = "1", optional = true }
+# Source of truth for the Agora `Soul` type the `soul_forge` example
+# generates — a mirror struct would drift. `seed` carries the reactor
+# seed-runner types (Soul lives there); the crate's misanthropic req
+# (^1.0.0-alpha.7) unifies with ours. Example-only: nothing in src/
+# references it, and the implicit `agora-agentkit` feature gates the
+# example target.
+agora-agentkit = { version = "0.7", optional = true, features = ["seed"] }
 
 
 [features]
@@ -275,7 +282,7 @@ doc-scrape-examples = true
 
 [[example]]
 name = "soul_forge"
-required-features = ["tokio", "cli", "json-schema"]
+required-features = ["tokio", "cli", "json-schema", "agora-agentkit"]
 doc-scrape-examples = true
 
 [[example]]

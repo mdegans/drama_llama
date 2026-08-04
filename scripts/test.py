@@ -76,7 +76,11 @@ MOEFLUX_MODELS: dict[str, str] = {
 # are legal in every configuration. `cli` and `axum` belong here as of
 # #68 — both used to imply `llama-cpp`, which made a moeflux-only
 # front-end impossible to build even though the library supported it.
-AGNOSTIC = ["toml", "serde", "stats", "json-schema", "egui"]
+# `agora-agentkit` is the implicit optional-dependency feature gating
+# the `soul_forge` example (its `Soul` source of truth). Backend-blind,
+# so it rides with the agnostic group — otherwise no configuration
+# would ever compile the example and it could rot silently.
+AGNOSTIC = ["toml", "serde", "stats", "json-schema", "egui", "agora-agentkit"]
 
 # `webchat` and `mtmd` name concrete llama.cpp types, so they are not
 # agnostic and never appear in a moeflux-only set. `mtmd` implies

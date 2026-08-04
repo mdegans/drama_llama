@@ -1,9 +1,14 @@
-//! Example: generate Agora `Soul` documents on a **base** model — the
+//! Example: generate Agora [`Soul`] documents on a **base** model — the
 //! completion-scaffold mode of [issue #88] (Phase 6 / rung 4b). Instruct
 //! tunes are distillation-collapsed into Claude/GPT voice; a base model
 //! still has the whole pretraining distribution, so new personalities come
 //! out *different*. Division of labor: grammar supplies form, pretraining
 //! supplies voice.
+//!
+//! The `Soul` type is `agora-agentkit`'s own — the schema cannot drift
+//! from what the seed runner deserializes. Exemplar `evolution_log`s are
+//! cleared before prompting: history belongs to the agents that lived it,
+//! and a fresh soul starts with none.
 //!
 //! The chat template is replaced by a sidecar
 //! (`<model>.template.jinja`, copied from
@@ -19,59 +24,38 @@
 //! grammar compiler enforces `minItems` only as non-emptiness, because
 //! forcing N items manufactures filler entries.
 //!
+//! Sampling is deterministic per exemplar permutation whenever the
+//! distribution collapses inside the typical cut, so identical reruns
+//! produce identical souls. `--shuffle` permutes the exemplars for
+//! run-to-run variety, and `--names` pins each record's `name` field via
+//! a `const` schema patch — the grammar itself then guarantees the
+//! continuation can't reuse an existing name (the name is the first
+//! field generated, and everything downstream conditions on it).
+//!
 //! ```sh
-//! cargo run --example soul_forge --features "tokio,cli,json-schema" -- \
+//! cargo run --example soul_forge \
+//!     --features "tokio,cli,json-schema,agora-agentkit" -- \
 //!     --model models/Qwen3.5-35B-A3B-Base-Q8_0.gguf \
-//!     path/to/SOUL.json another/SOUL.json --n 1
+//!     path/to/SOUL.json another/SOUL.json --shuffle --names quill,ember
 //! ```
 //!
 //! [issue #88]: https://github.com/mdegans/drama_llama/issues/88
 //! [`Prompt::add_examples`]: misanthropic::Prompt::add_examples
+//! [`Soul`]: agora_agentkit::reactor::seed::Soul
 
 mod utils;
 
 use std::path::{Path, PathBuf};
 
+use agora_agentkit::reactor::seed::Soul;
 use clap::Parser;
 use drama_llama::OutputConfigOptions;
-use misanthropic::{prompt::message::Role, Prompt, Transport};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
-/// An agent's personality. Mirror of agora-agentkit's `Soul` *generation*
-/// surface: `evolution_log` is deliberately absent — the seed runner
-/// appends history entries; an agent (or a forge) never writes its own.
-/// Field order is generation order — each field is context for the next.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct Soul {
-    /// Your name as it appears on Agora. Lowercase, hyphenated.
-    name: String,
-    /// Who you are, in your own voice. A few sentences. Identity is what
-    /// makes you recognizably you across many cycles.
-    identity: String,
-    /// What you care about. Pithy bullets, one value per entry. 3-5 entries.
-    values: Vec<String>,
-    /// What you want to talk about and where.
-    interests: Interests,
-    /// How you write. A sentence or two. Tone, register, characteristic
-    /// phrases.
-    voice: String,
-    /// Hard limits on your behavior. Optional - some agents run
-    /// unconstrained.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    boundaries: Option<String>,
-}
-
-/// Communities an agent participates in plus freeform off-platform topics.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct Interests {
-    /// Slugs of Agora communities you participate in (e.g. `general`).
-    /// Two or more.
-    communities: Vec<String>,
-    /// Other topics you care about, not tied to a specific community.
-    #[serde(default)]
-    topics: Vec<String>,
-}
+use misanthropic::{
+    prompt::message::Role,
+    prompt::output::{OutputConfig, OutputFormat},
+    Prompt, Transport,
+};
+use rand::seq::SliceRandom;
 
 /// Generate new `Soul`s from exemplar SOUL.json files on a base model.
 #[derive(Parser, Debug)]
@@ -87,6 +71,19 @@ struct Cli {
     /// How many new souls to generate.
     #[arg(short, long, default_value_t = 1)]
     n: usize,
+
+    /// Generate one soul per name, with the `name` field grammar-pinned
+    /// to it (`const` in the schema). Guarantees no name collisions with
+    /// the exemplars — and since `name` is generated first, distinct
+    /// names pull the rest of the record apart too.
+    #[arg(long, conflicts_with = "n", value_delimiter = ',')]
+    names: Vec<String>,
+
+    /// Shuffle the exemplar order. Generation is deterministic per
+    /// permutation whenever the distribution collapses inside the
+    /// typical cut, so this is the cheap run-to-run diversity lever.
+    #[arg(long)]
+    shuffle: bool,
 
     /// Also write each generated soul to `<dir>/<name>.json`
     /// (never overwrites; collisions get a numeric suffix).
@@ -114,10 +111,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for path in &cli.souls {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        let soul: Soul = serde_json::from_str(&text)
+        let mut soul: Soul = serde_json::from_str(&text)
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        // History belongs to the agent that lived it; a fresh soul
+        // starts with none, and the exemplars should say so.
+        soul.evolution_log.clear();
         exemplars.push(soul);
     }
+    if cli.shuffle {
+        exemplars.shuffle(&mut rand::rng());
+    }
+
+    // The schema `add_examples` seeds, after misanthropic's sanitizer —
+    // the base for the per-name `const` patch below.
+    let base_schema = match OutputConfig::for_type::<Soul>().format {
+        Some(OutputFormat::JsonSchema(f)) => f.schema,
+        _ => unreachable!("for_type always yields a JSON Schema format"),
+    };
 
     // The empty user inputs are turn-order ballast: the completion
     // scaffold renders them as zero bytes, so the document stays a pure
@@ -127,12 +137,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .configure(Prompt::default())
         .add_examples(exemplars.into_iter().map(|soul| ("", soul)))?;
 
-    for i in 0..cli.n {
+    let slots: Vec<Option<String>> = if cli.names.is_empty() {
+        vec![None; cli.n]
+    } else {
+        cli.names.iter().cloned().map(Some).collect()
+    };
+
+    for (i, pinned) in slots.iter().enumerate() {
+        if let Some(name) = pinned {
+            let mut schema = base_schema.clone();
+            schema["properties"]["name"] = serde_json::json!({
+                "const": name,
+            });
+            prompt = prompt.json_schema(schema);
+        }
         prompt = prompt.add_message((Role::User, ""))?;
         let response = transport.send(&prompt).await?;
         let soul: Soul = response.json()?;
         if cli.common.verbose {
-            eprintln!("[{}/{}] usage: {:?}", i + 1, cli.n, response.usage);
+            eprintln!(
+                "[{}/{}] usage: {:?}",
+                i + 1,
+                slots.len(),
+                response.usage
+            );
+        }
+        for warning in soul.validate() {
+            eprintln!("[{}/{}] {warning}", i + 1, slots.len());
         }
 
         // Feed the emission back verbatim (not a re-serialization): the
@@ -145,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("{}", serde_json::to_string_pretty(&soul)?);
         if let Some(dir) = &cli.out_dir {
             let path = save(dir, &soul)?;
-            eprintln!("[{}/{}] wrote {}", i + 1, cli.n, path.display());
+            eprintln!("[{}/{}] wrote {}", i + 1, slots.len(), path.display());
         }
     }
 
