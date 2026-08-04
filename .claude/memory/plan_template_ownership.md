@@ -711,3 +711,18 @@ replaces instruct output in the exemplar pool.
   (2/8 troll-ish exemplars) generated 0/2 trolls; the base model at
   typical sampling leans agreeable. Exemplar mix is the ~20%-troll
   lever, with --names as the per-record steering wheel.
+
+### Issue #106 filed (same session): constrained-region penalty vs history
+
+Mike's Agora symptom (near-identical sequential posts from similar
+agents in one thread) traced to the same mechanism soul_forge hit:
+regime (b)'s call-local accumulator means structured-output bodies see
+ZERO repetition pressure from prompt history, and the prose fold
+excludes tool results, so tool-shaped thread context is absent even
+from the persistent corpus. Both by design (determinism linchpin;
+digit-penalty case) — the gap is the all-content-in-JSON workload.
+Fix direction in the issue: seed `constrained_ngram_stats` from the
+folded prose corpus at generation start AFTER the last breakpoint
+snapshot (determinism untouched), behind a serde-default-false
+`RepetitionOptions` flag. Read #106 before touching
+`constrained_ngram_stats`, the seeding fold, or breakpoint snapshots.
