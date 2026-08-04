@@ -602,3 +602,80 @@ Ordered so the boring load-bearing work lands before the fun rung.
   with the Cogito template front-rewrite (Phase 2 checks it).
 - `examples/few_shot_triage.rs` — the generator/test shape for
   Phase 6.
+
+## Progress (2026-08-04, Fable) — Phase 6 / rung 4b: SOUL forge on a real base model, example-side
+
+Headline: **rung 4b works today with ZERO library changes**, because the
+ladder already covers it. Qwen3.5-35B-A3B-Base (converted this session:
+`convert_hf_to_gguf.py --outtype q8_0`, `models/Qwen3.5-35B-A3B-Base-Q8_0
+.gguf`; the `blk.40 unused tensor` load warnings are the exported MTP
+layer, benign) ships a **vestigial VL-instruct `chat_template`** — the
+exact case the ladder bullet predicted — so `NoTemplate` never fires and
+a rung-1 sidecar carries the whole design. The library rung-4b work
+(explicit selection + the no-template rescue in `baked.rs`) remains open;
+what landed is the consumer:
+
+- **`templates/completion-scaffold.jinja`** (+ copy as the model's
+  `.template.jinja` sidecar): Mike's design — the render is a **bare,
+  never-closed JSON array of records**, the kind of scraped data file
+  pretraining is full of. No specials, no chat framing, no roles in the
+  bytes. Assistant turns are records (`content + ",\n  "`), user turns
+  render as ZERO bytes (turn-order ballast for the prompt API), optional
+  system text above the `[`. Generation always resumes at an open record
+  slot; canonical close is `",\n  "`.
+- **`examples/soul_forge.rs`**: exemplar SOUL.json files → 
+  `Prompt::add_examples` (schema seeded from the same exemplars, mirror
+  `Soul` struct WITHOUT `evolution_log` — the seed runner owns history)
+  → one grammar-locked completion per soul, `--n` loop feeding each
+  emission back verbatim + `.cache()` breakpoint. Per-record generation
+  chosen over a single `Vec<Soul>` completion deliberately: the grammar
+  compiler enforces `minItems` only as non-emptiness (filler-entry
+  rationale, `schema_constraint_keywords_decision.md`), so a one-shot
+  array cannot pin the count; the loop guarantees exactly n while every
+  element stays schema-guaranteed. `OutputConfigOptions { allow_thought:
+  false, phase_split: false }` is load-bearing — the default optional
+  `<think>` limb is a trap on a base model — exposed via new
+  `TransportBuilder::output_config_opts` in `examples/utils/args.rs`.
+
+### The copy attractor (measured, and the mechanism matters)
+
+First run (3 exemplars, 2 of them same-y edgy-troll souls, `tactic`
+last): the model emitted a **byte-verbatim copy of the `tactic`
+exemplar, twice**. Mechanism, not bad luck:
+
+1. Induction: in a record-series document whose records are
+   near-duplicates of each other, the copy token carries ~0.99.
+2. Default chain is TopK 1024 → **LocallyTypical p=0.5** (Mike confirmed
+   these defaults): any token above 0.5 mass leaves the typical cut a
+   **singleton** — generation is deterministic regardless of seed.
+3. The usual counterweapon can't reach: `constrained_regions` applies
+   repetition penalties inside grammar free regions with a **call-local
+   accumulator** — prompt-history n-grams are invisible during a
+   grammar-constrained emission, so cross-record copying is never
+   penalized there. (Window/decay tuning in a sampling sidecar does NOT
+   fix this; don't try.)
+
+**Fix is document-side and it worked completely**: 8 genuinely diverse
+exemplars (archivist / ethicist / economist / satirist / philosopher /
+muckraker / narrative / troll) → two novel souls ("empath", "narrative"),
+novel names, coherent field content, valid JSON, clean parse, no sampler
+changes. The exemplar set defines the file's internal pattern; a same-y
+set legitimately predicts near-duplicate records. Residual sameness
+("I am an AI agent who…" openings) is inherited from the exemplar corpus
+(instruct-generated, distillation-collapsed) — exactly the problem the
+base-model program exists to fix; expect it to fade as forge output
+replaces instruct output in the exemplar pool.
+
+### Open / next
+
+- Library rung 4b proper: explicit template selection + vocab-fingerprint
+  rescue in `baked.rs`; the scaffold graduates from sidecar to baked.
+- Cache: `.cache()` on each fed-back assistant turn should give hash-path
+  reuse across the `--n` loop (phase-5b marking rule); not yet measured —
+  the example now prints `response.usage` under `--verbose` for exactly
+  this.
+- e2e pin mirroring the example with a base GGUF (the plan's Phase 6
+  test shape) not yet written.
+- Sampling for creative diversity (typical p=0.5 is conservative for this
+  workload) deliberately untouched — defaults confirmed by Mike; revisit
+  only on evidence.
