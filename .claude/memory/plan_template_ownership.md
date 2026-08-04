@@ -679,3 +679,35 @@ replaces instruct output in the exemplar pool.
 - Sampling for creative diversity (typical p=0.5 is conservative for this
   workload) deliberately untouched — defaults confirmed by Mike; revisit
   only on evidence.
+
+### Round 2 (same session): agentkit as source of truth; --names measured
+
+- `Soul` now comes from **agora-agentkit 0.7.1** (crates.io; optional
+  dep, `seed` feature; public path `reactor::seed::Soul` — the `agent`
+  module is private). Its misanthropic req ^1.0.0-alpha.7 unifies with
+  our alpha.12; schemars same major. The implicit `agora-agentkit`
+  feature gates the example and was added to `scripts/test.py`'s
+  AGNOSTIC group so the permutation gate keeps compiling it. Exemplar
+  `evolution_log`s are cleared before prompting; generations come back
+  with `"evolution_log": []` (exemplar mimicry) and agentkit's
+  `validate()` runs on each.
+- **`--names` (const schema patch) works and is the diversity lever
+  that bites**: `properties.name = {"const": …}` compiles to the exact
+  literal, the grammar forbids name collisions by construction, and —
+  name being the first-generated field — distinct names pulled whole
+  records apart (quill → language-obsessive; ember → wild-ideas) from
+  the SAME exemplar permutation. `--shuffle` covers the unpinned case.
+  Sampling sidecar for the base model: locally_typical p=0.9
+  (hand-written, models/ only — sidecars are per-install).
+- **Cache measured**: record 2 read 2634/2637 input tokens from cache
+  (3 created). The `.cache()` breakpoint on each fed-back assistant
+  turn bridges grammar BPE drift exactly as phase 5b designed.
+- **Optional fields get skipped**: both generations omitted
+  `boundaries` even though every exemplar had it — the grammar's
+  optional-property door. If it must be present, patch the schema to
+  require it (same trick as --names).
+- Shitposter provenance (Mike's question): run 1's troll output was a
+  byte-verbatim exemplar copy — zero signal about the base model. Run 2
+  (2/8 troll-ish exemplars) generated 0/2 trolls; the base model at
+  typical sampling leans agreeable. Exemplar mix is the ~20%-troll
+  lever, with --names as the per-record steering wheel.
