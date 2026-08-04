@@ -274,6 +274,11 @@ required-features = ["tokio", "cli", "json-schema"]
 doc-scrape-examples = true
 
 [[example]]
+name = "soul_forge"
+required-features = ["tokio", "cli", "json-schema"]
+doc-scrape-examples = true
+
+[[example]]
 name = "vote_intent"
 required-features = ["tokio", "cli", "json-schema"]
 doc-scrape-examples = true

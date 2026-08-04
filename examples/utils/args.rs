@@ -105,6 +105,7 @@ impl CommonArgs {
             cache_slots: 1,
             repetition: true,
             render_opts: None,
+            output_config_opts: None,
         }
     }
 }
@@ -118,6 +119,7 @@ pub struct TransportBuilder<'a> {
     cache_slots: u32,
     repetition: bool,
     render_opts: Option<drama_llama::RenderOptions>,
+    output_config_opts: Option<drama_llama::OutputConfigOptions>,
 }
 
 #[cfg(feature = "tokio")]
@@ -142,6 +144,18 @@ impl TransportBuilder<'_> {
     /// `extra`s such as `enable_thinking`).
     pub fn render_opts(mut self, opts: drama_llama::RenderOptions) -> Self {
         self.render_opts = Some(opts);
+        self
+    }
+
+    /// Override how `Prompt::output_config` compiles to a grammar. What
+    /// `soul_forge` uses to reject the optional `<think>` preamble: a base
+    /// model has no trained habit of closing one, so the default
+    /// `allow_thought: true` limb is a trap rather than a feature there.
+    pub fn output_config_opts(
+        mut self,
+        opts: drama_llama::OutputConfigOptions,
+    ) -> Self {
+        self.output_config_opts = Some(opts);
         self
     }
 
@@ -233,6 +247,9 @@ impl TransportBuilder<'_> {
         }
         if let Some(opts) = self.render_opts.clone() {
             session = session.with_render_opts(opts);
+        }
+        if let Some(opts) = self.output_config_opts.clone() {
+            session = session.with_output_config_opts(opts);
         }
         // The `--max-tokens` override rides on the prompt via
         // [`CommonArgs::configure`], the sole generation cap since

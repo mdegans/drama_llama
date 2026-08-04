@@ -114,3 +114,16 @@ same way Qwen's `enable_thinking` front-rewrite is.
 A `<model>.template.jinja` sidecar next to the GGUF still overrides
 any of these — baked templates removed the *need* for sidecar
 deployment on recognized models, not the mechanism.
+
+## completion-scaffold.jinja
+
+Not a baked pair and not detection-keyed: the completion scaffold for
+*base* models (issue #88, Phase 6 / rung 4b). Renders the prompt as a
+bare, never-closed JSON array of records — the kind of scraped data
+file pretraining is full of — with **no special tokens** and no chat
+framing. Assistant turns are the records; user turns render as zero
+bytes (turn-order ballast only); optional system text sits above the
+array. Byte layout documented in the file. Deployed today as a
+`<model>.template.jinja` sidecar next to a base GGUF (rung 1);
+`examples/soul_forge.rs` is the driving consumer. Graduates into the
+ladder proper when rung 4b lands in `src/baked.rs`.
