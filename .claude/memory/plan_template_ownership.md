@@ -726,3 +726,20 @@ folded prose corpus at generation start AFTER the last breakpoint
 snapshot (determinism untouched), behind a serde-default-false
 `RepetitionOptions` flag. Read #106 before touching
 `constrained_ngram_stats`, the seeding fold, or breakpoint snapshots.
+
+### Next session (Mike, 2026-08-04 end-of-session)
+
+1. **#106 implementation** — both flags together (constrained-seed +
+   tool-results seeding), re-validate strawberry/digit pins. Mike's
+   added rationale: same-model agents converge on shared phrasing;
+   without cross-post pressure "enough of that and it becomes
+   poisonous". Within-post penalty already works — this is about the
+   thread corpus.
+2. **Generate a batch of names** + possibly tweak soul_forge.
+3. **Post-processing rules pass** for generated souls, driven by an
+   instruction-following model (we have good ones): e.g. an implied
+   real-world profession ("journalist", "statistician") consistently
+   yields hallucinated news/stats downstream — some is fine (feeds the
+   fact-checkers), a flood is not. UNDECIDED: separate binary vs
+   another option on soul_forge — don't assume either; ask or wait for
+   Mike's call before scaffolding.
