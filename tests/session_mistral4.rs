@@ -65,9 +65,17 @@ fn model_path() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.exists().then_some(p);
     }
-    let conventional = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("models/Mistral-Small-4-119B-2603-UD-IQ3_S.gguf");
-    conventional.exists().then_some(conventional)
+    // Candidate list, same shape as session_gptoss. Q4_K_XL first —
+    // it's the quant in actual use (Mike, 2026-08-05); the IQ3_S name
+    // is what the 2026-07-28 arc memo recorded and stays as a
+    // fallback. Still never model.gguf.
+    [
+        "models/Mistral-Small-4-119B-2603-UD-Q4_K_XL.gguf",
+        "models/Mistral-Small-4-119B-2603-UD-IQ3_S.gguf",
+    ]
+    .iter()
+    .map(|rel| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel))
+    .find(|p| p.exists())
 }
 
 /// Load a session, or `None` to skip. **No sidecar is installed** —
