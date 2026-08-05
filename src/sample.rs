@@ -622,7 +622,12 @@ impl Default for SamplerConfig {
             // NOTE: chat/tool-result flows that re-emit a short token from
             // context (e.g. a digit the tool returned) now see a gentle
             // penalty; if that proves a problem, opt back out via a sidecar
-            // or `SamplerConfig::greedy()`.
+            // or `SamplerConfig::greedy()`. As of #106 the corpus also
+            // seeds from tool results and tool-call args by default (the
+            // seeding flags on `RepetitionOptions`), with window/decay
+            // retuned for thread-corpus reach at the same additive cap;
+            // a bare digit still seeds nothing (shorter than the n-gram
+            // window) and surgical mode gates single occurrences.
             repetition: Some(RepetitionOptions::default()),
             deferred_grammar: None,
             lazy_grammar: default_lazy_grammar(),

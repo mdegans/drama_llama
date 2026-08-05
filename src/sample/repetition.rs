@@ -226,18 +226,23 @@ fn default_seeding() -> bool {
     true
 }
 
-/// Default window size — long enough to catch genuine paragraph-scale
-/// repetition, short enough that the bounded additive contribution
-/// (`window_size * penalty_freq` worst-case before decay) stays well
-/// inside the model's natural logit gradient.
+/// Default window size — thread-corpus reach (#106): with prompt
+/// history seeded into the corpus, the window is how far back the
+/// presence term can see, so it must span prior posts, not just the
+/// current paragraph. The additive contribution stays bounded because
+/// `penalty_freq` is coupled to `decay` (see the cap note in
+/// `Default`), not to the window.
 fn default_window_size() -> NonZeroU32 {
-    NonZeroU32::new(256).unwrap()
+    NonZeroU32::new(2048).unwrap()
 }
 
 /// Default per-step decay. Caps sustained-repetition effective count at
-/// `1 / (1 - 0.95) = 20` regardless of how long generation runs.
+/// `1 / (1 - 0.99) = 100` regardless of how long generation runs; the
+/// decayed-term horizon (where `0.99^d` stops mattering) is ≈460
+/// steps. Raised from 0.95 with `penalty_freq` lowered in step so the
+/// saturated additive cap is unchanged (#106).
 fn default_decay() -> f32 {
-    0.95
+    0.99
 }
 
 impl Default for RepetitionOptions {
@@ -267,11 +272,13 @@ impl Default for RepetitionOptions {
             // → `1.06^4 ≈ 1.27` was already pushing factual tokens out of
             // contention on big-model prose.
             penalty_repeat: 1.05,
-            // 0.125 (was 0.1) and 0.0625 (was 0.1) — the saturated additive
-            // contribution is bounded by `1 / (1 - decay) * penalty_freq +
-            // penalty_present` ≈ 2.6 at these defaults. Comfortable inside any
-            // model's natural top-k spread.
-            penalty_freq: 0.125,
+            // 0.025 (was 0.125, coupled to the 0.95→0.99 decay change —
+            // #106) — the saturated additive contribution is bounded by
+            // `1 / (1 - decay) * penalty_freq + penalty_present` ≈ 2.6 at
+            // these defaults, unchanged from the pre-#106 tuning: 5× the
+            // reach at the same cap. Comfortable inside any model's
+            // natural top-k spread.
+            penalty_freq: 0.025,
             penalty_present: 0.0625,
             // Surgical-on (was off): only penalises the *next- extension* token
             // of a recurring n-gram, not every trailing token of every tracked
@@ -1349,8 +1356,8 @@ mod invariant_tests {
         #[test]
         fn partial_applies_defaults() {
             let o: RepetitionOptions = ::toml::from_str(REQUIRED).unwrap();
-            assert_eq!(o.window_size().get(), 256);
-            assert_eq!(o.decay(), 0.95);
+            assert_eq!(o.window_size().get(), 2048);
+            assert_eq!(o.decay(), 0.99);
             assert!(!o.surgical());
             assert!(o.ignored().is_empty());
             assert!(o.ignored_categories().is_empty());
@@ -1690,8 +1697,9 @@ mod tests {
         }
     }
 
-    /// Long-generation regression test: with the windowed-decay
-    /// `RepetitionOptions::default()` (window_size=256, decay=0.95) the
+    /// Long-generation regression test: with windowed decay
+    /// (window_size=256, decay=0.95 — pinned explicitly; the #106
+    /// defaults retune would otherwise scale this loop 8×) the
     /// popular-vs-rare logit gap **converges** instead of growing
     /// linearly. Before the fix the additive `count * penalty_freq`
     /// term grew unboundedly with generation length (~20 logits below
@@ -1722,7 +1730,12 @@ mod tests {
         let baseline: Vec<f32> = (0..n_vocab).map(|_| 1.0).collect();
         let mut tokens: Vec<Token> = Vec::new();
 
-        let opts = RepetitionOptions::default();
+        // The pre-#106 tuning these contracts were written against,
+        // pinned so the loop length and margins are default-proof.
+        let opts = RepetitionOptions::default()
+            .set_window_size(NonZeroU32::new(256).unwrap())
+            .set_decay(0.95)
+            .set_penalty_freq(0.125);
         let window = opts.window_size().get() as usize;
         let mut freq_map = NGramStats::new();
         let ignored = opts.resolved_ignored(&model);
@@ -1817,7 +1830,11 @@ mod tests {
         let baseline: Vec<f32> = (0..n_vocab).map(|_| 1.0).collect();
         let mut tokens: Vec<Token> = Vec::new();
 
-        let opts = RepetitionOptions::default();
+        // Same explicit pre-#106 tuning as the companion above.
+        let opts = RepetitionOptions::default()
+            .set_window_size(NonZeroU32::new(256).unwrap())
+            .set_decay(0.95)
+            .set_penalty_freq(0.125);
         let window = opts.window_size().get() as usize;
         let mut freq_map = NGramStats::new();
         let ignored = opts.resolved_ignored(&model);
