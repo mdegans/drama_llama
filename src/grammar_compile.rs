@@ -714,6 +714,17 @@ fn emit_dict_object_rule(
 /// tag. GBNF has no negative lookahead, so we split into two alts.
 pub(crate) fn emit_thought_rules(out: &mut String) {
     let _ = writeln!(out, r#"thought ::= "<think>" think_body "</think>""#);
+    emit_think_body_rules(out);
+}
+
+/// The body-and-char half of [`emit_thought_rules`], for roots that
+/// anchor a *pre-opened* thought: the template already emitted the
+/// opener, so the grammar must demand close-first (`think_body
+/// "</think>" …`) and must NOT spell the opener literal — a root that
+/// offers `"<think>"` at position 0 forces the model to *duplicate*
+/// the template's tag, which is exactly the #107 duplicate-opener
+/// containment class.
+pub(crate) fn emit_think_body_rules(out: &mut String) {
     let _ = writeln!(out, r#"think_body ::= think_char*"#);
     let _ = writeln!(out, r#"think_char ::= [^<] | "<" [^/]"#);
 }

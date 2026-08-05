@@ -2300,6 +2300,15 @@ pub struct Session<B: Backend> {
     /// sibling of [`Session::emit_ban`], refreshed by the same
     /// [`Session::refresh_emit_ban`] since it has identical inputs.
     emit_ban_constrained: Vec<Token>,
+    /// Memoized [`Session::reasoning_opener_ban_set`] — same inputs and
+    /// refresh path as [`Session::emit_ban`], but unioned into
+    /// [`SamplerConfig::banned_specials`] only for calls whose turn
+    /// already has its reasoning opener supplied by the render (issue
+    /// #107); the standing set must keep the opener exempt for
+    /// self-opening dialects.
+    ///
+    /// [`SamplerConfig::banned_specials`]: crate::SamplerConfig
+    reasoning_opener_ban: Vec<Token>,
     /// Prefix-cache state. `Some` iff the caller opted in via
     /// [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
     /// `None` means every call is a full re-prefill (the pre-0.7
@@ -2787,6 +2796,7 @@ impl<B: Backend> Session<B> {
             emit_specials_ban: true,
             emit_ban: Vec::new(),
             emit_ban_constrained: Vec::new(),
+            reasoning_opener_ban: Vec::new(),
             prefix_cache: None,
             last_usage: Usage::default(),
             total_usage: Usage::default(),
@@ -3090,10 +3100,11 @@ impl<B: Backend> Session<B> {
     /// Assemble the effective per-call [`PredictOptions`]: model stop
     /// sequences, the prompt's token budget and the session's seed, and the
     /// effective sampler config — session-stable knobs plus the
-    /// call-derived `modes` / `deferred_grammar` from
-    /// [`PreparedCall`]. The single construction site for all three
-    /// `complete_*` paths ("config is the authority": the effective
-    /// config is assembled first; predictor state derives from it).
+    /// call-derived `modes` / `deferred_grammar` /
+    /// `reasoning_opener_spent` from [`PreparedCall`]. The single
+    /// construction site for all three `complete_*` paths ("config is
+    /// the authority": the effective config is assembled first;
+    /// predictor state derives from it).
     ///
     /// This is also where the request's own sampling knobs
     /// (`temperature` / `top_p` / `top_k`) fold into the chain — see
@@ -3107,6 +3118,7 @@ impl<B: Backend> Session<B> {
         prompt: &Prompt,
         modes: Vec<SamplingMode>,
         deferred_grammar: Option<crate::DeferredGrammar>,
+        reasoning_opener_spent: bool,
     ) -> Result<PredictOptions, SessionError> {
         let mut predict_opts =
             PredictOptions::default().add_model_stops(&self.engine.model);
@@ -3125,7 +3137,7 @@ impl<B: Backend> Session<B> {
         // exempts the dialect's tool-call opener (so Auto/Any/Method
         // can call), so `None` re-adds it for this call alone, leaving
         // the tool defs rendered and the prefix intact.
-        let banned_specials =
+        let mut banned_specials =
             if matches!(prompt.tool_choice.as_ref(), Some(ToolChoice::None)) {
                 let mut b = self.emit_ban.clone();
                 b.extend(self.tool_none_ban_set());
@@ -3135,6 +3147,16 @@ impl<B: Backend> Session<B> {
             } else {
                 self.emit_ban.clone()
             };
+        // Issue #107 — like `None` above, a per-call re-add of a
+        // standing exemption: once the render has supplied the turn's
+        // reasoning opener (pre-opened thought or closed stub), a
+        // model-emitted opener is never legal. The closer stays exempt
+        // — it is the phase-split trigger and the model's job to emit.
+        if reasoning_opener_spent && !self.reasoning_opener_ban.is_empty() {
+            banned_specials.extend(self.reasoning_opener_ban.iter().copied());
+            banned_specials.sort_unstable();
+            banned_specials.dedup();
+        }
         // The region-scoped set (#37) must never be *weaker* than the
         // standing one, or a token banned at frame positions would come
         // back inside a free region. Union rather than argue about set
@@ -3261,13 +3283,16 @@ impl<B: Backend> Session<B> {
         (state, bp_states)
     }
 
-    /// Recompute the [`Session::emit_ban`] memo. Called from
-    /// `from_engine` and the three setters that change its inputs
+    /// Recompute all three emit-ban memos ([`Session::emit_ban`],
+    /// [`Session::emit_ban_constrained`],
+    /// [`Session::reasoning_opener_ban`]). Called from `from_engine`
+    /// and the three setters that change their inputs
     /// ([`Session::with_dialect`], [`Session::set_template_source`],
     /// [`Session::with_emit_specials_ban`]).
     fn refresh_emit_ban(&mut self) {
         self.emit_ban = self.emit_ban_set();
         self.emit_ban_constrained = self.emit_ban_set_constrained();
+        self.reasoning_opener_ban = self.reasoning_opener_ban_set();
     }
 
     /// The emit-side special-token ban set (#31 item 9), memoized as
@@ -3284,6 +3309,11 @@ impl<B: Backend> Session<B> {
     /// ingest injection guard, same set logic as the Qwen3
     /// reserved-token grammar fix but standing rather than
     /// grammar-only. Sorted for the sampler's binary search.
+    ///
+    /// The reasoning-*opener* exemption here is unconditional so
+    /// self-opening dialects keep working; calls whose render already
+    /// supplied the turn's opener re-add it per-call via
+    /// [`Session::reasoning_opener_ban_set`] (issue #107).
     ///
     /// Returns the empty set when the ban is disabled
     /// ([`Session::with_emit_specials_ban`]).
@@ -3500,6 +3530,93 @@ impl<B: Backend> Session<B> {
             &syntax.assistant_start,
         ] {
             for t in specials_of(m) {
+                ban.remove(&t);
+            }
+        }
+        ban.into_iter().collect()
+    }
+
+    /// The reasoning-*opener* ban (issue #107), memoized as
+    /// [`Session::reasoning_opener_ban`]: the specials the model would
+    /// emit to open a thought, unioned into
+    /// [`SamplerConfig::banned_specials`] only for calls whose render
+    /// already supplied the turn's opener — a pre-opened thought, a
+    /// closed thinking-off stub, or a resumed open thought. The rule
+    /// being enforced: at most one opener and one closer per turn,
+    /// open before close. Once the render has spent the opener, a
+    /// model-emitted one is never legal — it is the duplicate that
+    /// [`Session::check_no_special_injection`] would reject as a
+    /// thought injection one turn later.
+    ///
+    /// The inverse of [`Session::tool_none_ban_set`]'s exemption:
+    /// there the reasoning tags are *removed* from a tool-opener ban;
+    /// here the reasoning opener is the target, and everything the
+    /// model must stay able to emit is removed — the closer (the
+    /// phase-split trigger and the model's job to emit), tool-call and
+    /// content framing, turn anchors. `preserved_tokens` entries are
+    /// exempted too, **except** those that are part of the opener
+    /// itself: the analyzer's `collect_preserved_tokens` pushes
+    /// `reasoning.start` verbatim (and Gemma 4 lists `<|channel>`
+    /// explicitly), so a blanket exemption would empty this set for
+    /// exactly the dialects it exists to protect.
+    ///
+    /// Empty for dialects that never render an open thought
+    /// ([`dialect_renders_open_thought`] — Harmony's channel framing
+    /// and `ReasoningMode::None` dialects fall out here), and gated on
+    /// [`Session::with_emit_specials_ban`] — unlike the
+    /// `tool_choice`-contract ban above, this is protocol integrity,
+    /// the same class that toggle governs, and the post-generation
+    /// containment guard it backstops is gated on the same flag.
+    ///
+    /// Id-level only, like the rest of the ban family: a byte-spelled
+    /// opener remains possible and containment keeps catching it.
+    ///
+    /// [`SamplerConfig::banned_specials`]: crate::SamplerConfig
+    fn reasoning_opener_ban_set(&self) -> Vec<Token> {
+        use std::collections::{BTreeSet, HashSet};
+        if !self.emit_specials_ban
+            || !dialect_renders_open_thought(&self.dialect)
+        {
+            return Vec::new();
+        }
+        let model = &self.engine.model;
+        let syntax = effective_tool_syntax(&self.dialect);
+        let special: HashSet<Token> =
+            model.special_tokens().into_iter().collect();
+        let specials_of = |s: &str| -> Vec<Token> {
+            if s.trim().is_empty() {
+                return Vec::new();
+            }
+            model
+                .tokenize(s, true)
+                .into_iter()
+                .filter(|t| special.contains(t))
+                .collect()
+        };
+        let opener = syntax.reasoning.start.trim();
+        let mut ban: BTreeSet<Token> =
+            specials_of(&syntax.reasoning.start).into_iter().collect();
+        for m in [
+            &syntax.reasoning.end,
+            &syntax.section_start,
+            &syntax.section_end,
+            &syntax.per_call_start,
+            &syntax.per_call_end,
+            &syntax.tool_response_start,
+            &syntax.content.start,
+            &syntax.content.end,
+            &syntax.user_start,
+            &syntax.assistant_start,
+        ] {
+            for t in specials_of(m) {
+                ban.remove(&t);
+            }
+        }
+        for p in &syntax.preserved_tokens {
+            if opener.contains(p.trim()) {
+                continue;
+            }
+            for t in specials_of(p) {
                 ban.remove(&t);
             }
         }
@@ -4195,6 +4312,15 @@ impl<B: Backend> Session<B> {
         let pre_opened_reasoning =
             render_ends_with_open_reasoning(&rendered_prompt, &self.dialect)
                 || prompt_resumes_open_reasoning(prompt, &self.dialect);
+        // The turn's opener is spent in three render shapes: template
+        // pre-open and resumed open thought (both folded into
+        // `pre_opened_reasoning`), or a closed thinking-off stub /
+        // closed prefilled thought at the tail (issue #107).
+        let reasoning_opener_spent = pre_opened_reasoning
+            || render_ends_with_closed_reasoning(
+                &rendered_prompt,
+                &self.dialect,
+            );
 
         let (grammar_mode, deferred_grammar) = match resolve_grammar(
             prompt,
@@ -4227,6 +4353,7 @@ impl<B: Backend> Session<B> {
             breakpoint_ids,
             breakpoint_ttls,
             pre_opened_reasoning,
+            reasoning_opener_spent,
             rendered_prompt,
             media_by_id: media.media_by_id,
             source_to_id: media.source_to_id,
@@ -5103,6 +5230,7 @@ impl<B: Backend> Session<B> {
             partial_hashes,
             breakpoint_ids,
             breakpoint_ttls,
+            reasoning_opener_spent,
             media_by_id,
             ..
         } = self.prepare_call_cached(prompt, true)?;
@@ -5119,8 +5247,12 @@ impl<B: Backend> Session<B> {
                 headroom,
             )?;
 
-        let predict_opts =
-            self.predict_options_for(prompt, modes, deferred_grammar.clone())?;
+        let predict_opts = self.predict_options_for(
+            prompt,
+            modes,
+            deferred_grammar.clone(),
+            reasoning_opener_spent,
+        )?;
         let (initial_state, bp_states) = self.build_initial_state(
             &predict_opts.sample_options,
             cached_state,
@@ -5326,6 +5458,7 @@ impl<B: Backend> Session<B> {
             breakpoint_ids,
             breakpoint_ttls,
             pre_opened_reasoning,
+            reasoning_opener_spent,
             media_by_id,
             ..
         } = self.prepare_call_cached(prompt, true)?;
@@ -5342,8 +5475,12 @@ impl<B: Backend> Session<B> {
                 headroom,
             )?;
 
-        let predict_opts =
-            self.predict_options_for(prompt, modes, deferred_grammar.clone())?;
+        let predict_opts = self.predict_options_for(
+            prompt,
+            modes,
+            deferred_grammar.clone(),
+            reasoning_opener_spent,
+        )?;
         let (initial_state, bp_states) = self.build_initial_state(
             &predict_opts.sample_options,
             cached_state,
@@ -5459,6 +5596,7 @@ impl<B: Backend> Session<B> {
             breakpoint_ids,
             breakpoint_ttls,
             pre_opened_reasoning,
+            reasoning_opener_spent,
             rendered_prompt,
             media_by_id,
             source_to_id,
@@ -5495,8 +5633,12 @@ impl<B: Backend> Session<B> {
             "run_call: modes prepared",
         );
 
-        let predict_opts =
-            self.predict_options_for(prompt, modes, deferred_grammar.clone())?;
+        let predict_opts = self.predict_options_for(
+            prompt,
+            modes,
+            deferred_grammar.clone(),
+            reasoning_opener_spent,
+        )?;
         let (initial_state, bp_states) = self.build_initial_state(
             &predict_opts.sample_options,
             cached_state,
@@ -6344,9 +6486,11 @@ fn resolve_grammar(
         );
         return Ok(Some(crate::CompiledOutputConfig::Single(g)));
     }
-    if let Some(c) =
-        output_config::compile_prompt_output_config(prompt, output_config_opts)?
-    {
+    if let Some(c) = output_config::compile_prompt_output_config(
+        prompt,
+        output_config_opts,
+        thought_pre_opened,
+    )? {
         #[cfg(feature = "axum")]
         tracing::debug!(
             target: "drama_llama::session",
@@ -6409,6 +6553,34 @@ fn render_ends_with_open_reasoning(
     !start.is_empty() && rendered.trim_end().ends_with(start)
 }
 
+/// Whether the rendered prompt ends with the reasoning *closer* — the
+/// symmetric sibling of [`render_ends_with_open_reasoning`], and the
+/// other way a render can spend the turn's opener (issue #107): a
+/// thinking-off closed stub (Qwen's `<think>\n\n</think>\n\n`, Gemma
+/// 4's `<|channel>thought\n<channel|>`) or a prefilled closed thought
+/// at the tail. Either way the turn's one thought already exists, so
+/// a model-emitted opener would be a duplicate.
+///
+/// Same deliberate narrowness as the open sniff — only the bare
+/// trailing marker, never "a closer appears somewhere". The surface
+/// is renderer-only by construction: markers in this ban family are
+/// special tokens, and special-bearing *content* is rejected at
+/// ingest ([`Session::check_no_special_injection`]), so a closer at
+/// the render tail can only have been written by the template or the
+/// renderer. The [`dialect_renders_open_thought`] gate is
+/// load-bearing for Harmony (its closer is shared message framing);
+/// the empty-closer guard prevents the vacuous `ends_with("")`.
+fn render_ends_with_closed_reasoning(
+    rendered: &str,
+    dialect: &crate::CallSyntax,
+) -> bool {
+    if !dialect_renders_open_thought(dialect) {
+        return false;
+    }
+    let end = dialect.reasoning.end.trim();
+    !end.is_empty() && rendered.trim_end().ends_with(end)
+}
+
 /// Whether the prompt itself ends inside a reasoning block, because its
 /// tail is a prefilled or resumed open thought that the renderer
 /// appends after the generation prompt.
@@ -6461,6 +6633,15 @@ struct PreparedCall {
     /// block (Qwen-style pre-opened `<think>\n`): generation starts
     /// mid-thought, and the parser must be told (issue #27).
     pre_opened_reasoning: bool,
+    /// The turn's reasoning opener has already been supplied — open
+    /// (`pre_opened_reasoning`) *or* closed (thinking-off stub,
+    /// prefilled closed thought) — so a model-emitted opener is never
+    /// legal and [`Session::reasoning_opener_ban`] applies (issue
+    /// #107). Distinct from `pre_opened_reasoning`, which means
+    /// "generation begins mid-thought" and feeds the parser: on the
+    /// closed stub they diverge, and conflating them would tell the
+    /// parser it is inside a thought that is already closed.
+    reasoning_opener_spent: bool,
     /// The full rendered generation prompt — the byte prefix the
     /// canonicalization check compares re-renders against. Contains
     /// this call's media sentinels when images are present.
@@ -8394,6 +8575,43 @@ mod tests {
         assert!(!render_ends_with_open_reasoning("...<think>", &none));
     }
 
+    /// Closed-stub detection (#107) follows the dialect's closer, with
+    /// the same narrowness as the open sniff: bare trailing marker
+    /// only, gated off for Harmony and reasoning-less dialects.
+    #[test]
+    fn test_render_ends_with_closed_reasoning_is_dialect_driven() {
+        let qwen = crate::CallSyntax::qwen_xml();
+        // The thinking-off stub — the turn's opener is spent.
+        assert!(render_ends_with_closed_reasoning(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            &qwen
+        ));
+        // A pre-opened thought is the *open* sniff's case, not this one.
+        assert!(!render_ends_with_closed_reasoning(
+            "<|im_start|>assistant\n<think>\n",
+            &qwen
+        ));
+        // Gemma 4's stub: closer trims to `<channel|>`.
+        let gemma = crate::CallSyntax::gemma4();
+        assert!(render_ends_with_closed_reasoning(
+            "<|turn>model\n<|channel>thought\n<channel|>",
+            &gemma
+        ));
+        assert!(!render_ends_with_closed_reasoning("<|turn>model\n", &gemma));
+        // Harmony is gated off even on a literal closer hit — its
+        // "closer" is shared message framing.
+        let harmony = crate::CallSyntax::gpt_oss();
+        let tail = format!("...{}", harmony.reasoning.end);
+        assert!(!render_ends_with_closed_reasoning(&tail, &harmony));
+        // No reasoning mode → never fires, even on a literal hit.
+        let none = crate::CallSyntax::hermes_json();
+        assert!(!render_ends_with_closed_reasoning("...</think>", &none));
+        // An empty closer must not fire vacuously via `ends_with("")`.
+        let mut open_only = crate::CallSyntax::qwen_xml();
+        open_only.reasoning.end = String::new();
+        assert!(!render_ends_with_closed_reasoning("anything", &open_only));
+    }
+
     /// `PrefixCache::new()` starts with every field zeroed, and
     /// `reset()` returns a populated cache to that state. This is the
     /// invariant `Session::clear_prefix_cache` relies on.
@@ -9947,6 +10165,59 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(none_ban, sorted, "ban set must be sorted and deduped");
+    }
+
+    /// The reasoning-opener ban (#107) on a real vocab: the opener is
+    /// in the set, everything the model must keep emitting is not.
+    /// This is also the regression pin for the `preserved_tokens`
+    /// trap: the analyzed Qwen dialect carries `<think>` in
+    /// `preserved_tokens` (the analyzer pushes `reasoning.start`
+    /// verbatim), so a blanket preserved-tokens exemption would empty
+    /// this set and silently un-fix #107.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "long running, requires models/model.gguf"]
+    fn test_reasoning_opener_ban_set_qwen() {
+        let session = crate::LlamaCppSession::from_path(model_path())
+            .unwrap()
+            .quiet();
+        let one = |s: &str| {
+            let toks = session.engine().model.tokenize(s, true);
+            assert_eq!(toks.len(), 1, "{s:?} must be one special token");
+            toks[0]
+        };
+        let ban = session.reasoning_opener_ban_set();
+        let in_ban = |t: Token| ban.binary_search(&t).is_ok();
+
+        assert!(
+            in_ban(one("<think>")),
+            "the opener must be banned once the render has supplied it"
+        );
+        assert!(
+            !in_ban(one("</think>")),
+            "the closer stays exempt — it is the phase-split trigger"
+        );
+        assert!(
+            !in_ban(one("<tool_call>")),
+            "tool-call framing must stay generatable"
+        );
+        assert!(!in_ban(one("<|im_end|>")), "EOG is never in a ban set");
+        assert!(
+            !in_ban(one("<|im_start|>")),
+            "turn framing belongs to the standing ban, not this one"
+        );
+        // Sorted for the sampler's binary search, no dupes.
+        let mut sorted = ban.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(ban, sorted, "ban set must be sorted and deduped");
+
+        // The opt-out disables this set like the other two.
+        let session = session.with_emit_specials_ban(false);
+        assert!(
+            session.reasoning_opener_ban_set().is_empty(),
+            "with_emit_specials_ban(false) must disable the opener ban"
+        );
     }
 
     // -----------------------------------------------------------------

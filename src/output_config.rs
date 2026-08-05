@@ -32,7 +32,7 @@ use std::fmt::Write;
 use misanthropic::prompt::output::{OutputConfig, OutputFormat};
 
 use crate::grammar_compile::{
-    emit_thought_rules, schema_to_gbnf, JSON_GRAMMAR,
+    emit_think_body_rules, emit_thought_rules, schema_to_gbnf, JSON_GRAMMAR,
 };
 use crate::{DeferredGrammar, GrammarError, Prompt, SamplingMode};
 
@@ -103,12 +103,13 @@ impl CompiledOutputConfig {
 pub fn grammar_for_output_config(
     config: &OutputConfig,
     opts: &OutputConfigOptions,
+    thought_pre_opened: bool,
 ) -> Result<SamplingMode, OutputConfigError> {
     let schema = match &config.format {
         Some(OutputFormat::JsonSchema(f)) => &f.schema,
         _ => return Err(OutputConfigError::UnsupportedFormat),
     };
-    let source = build_grammar_source(schema, opts);
+    let source = build_grammar_source(schema, opts, thought_pre_opened);
     Ok(SamplingMode::grammar(&source)?)
 }
 
@@ -116,9 +117,19 @@ pub fn grammar_for_output_config(
 /// holds a single unified grammar or a `</think>`-triggered
 /// [`DeferredGrammar`], depending on `opts.phase_split` and
 /// `opts.allow_thought`. Phase-split applies only when both are `true`.
+///
+/// `thought_pre_opened`: the rendered generation prompt already opened
+/// the thought (Qwen-style `<think>\n` scaffold, or a resumed open
+/// thought). The unified grammar's root must then anchor close-first
+/// and must not spell the opener literal — a root offering `"<think>"`
+/// at position 0 masks the model's real preference and *forces* a
+/// duplicate opener (the #107 mechanism). The deferred path is
+/// unaffected: its trigger is the closer, which the model must emit
+/// either way.
 pub fn compile_output_config(
     config: &OutputConfig,
     opts: &OutputConfigOptions,
+    thought_pre_opened: bool,
 ) -> Result<CompiledOutputConfig, OutputConfigError> {
     let schema = match &config.format {
         Some(OutputFormat::JsonSchema(f)) => &f.schema,
@@ -134,7 +145,7 @@ pub fn compile_output_config(
             feed_trigger: false,
         }))
     } else {
-        let source = build_grammar_source(schema, opts);
+        let source = build_grammar_source(schema, opts, thought_pre_opened);
         Ok(CompiledOutputConfig::Single(SamplingMode::grammar(
             &source,
         )?))
@@ -148,11 +159,16 @@ pub fn compile_output_config(
 pub fn grammar_for_prompt(
     prompt: &Prompt,
     opts: &OutputConfigOptions,
+    thought_pre_opened: bool,
 ) -> Result<Option<SamplingMode>, OutputConfigError> {
     let Some(config) = prompt.output_config.as_ref() else {
         return Ok(None);
     };
-    Ok(Some(grammar_for_output_config(config, opts)?))
+    Ok(Some(grammar_for_output_config(
+        config,
+        opts,
+        thought_pre_opened,
+    )?))
 }
 
 /// Phase-split-aware equivalent of [`grammar_for_prompt`]. Returns the
@@ -172,6 +188,7 @@ pub fn grammar_for_prompt(
 pub fn compile_prompt_output_config(
     prompt: &Prompt,
     opts: &OutputConfigOptions,
+    thought_pre_opened: bool,
 ) -> Result<Option<CompiledOutputConfig>, OutputConfigError> {
     let Some(config) = prompt.output_config.as_ref() else {
         return Ok(None);
@@ -184,7 +201,11 @@ pub fn compile_prompt_output_config(
     } else {
         opts.clone()
     };
-    Ok(Some(compile_output_config(config, &effective)?))
+    Ok(Some(compile_output_config(
+        config,
+        &effective,
+        thought_pre_opened,
+    )?))
 }
 
 /// Emit the GBNF source text for an output-config constraint. Kept
@@ -192,10 +213,21 @@ pub fn compile_prompt_output_config(
 pub(crate) fn build_grammar_source(
     schema: &serde_json::Value,
     opts: &OutputConfigOptions,
+    thought_pre_opened: bool,
 ) -> String {
     let mut src = String::with_capacity(512);
 
-    if opts.allow_thought {
+    if thought_pre_opened {
+        // The template already emitted the opener, so the tag IS open:
+        // the thought is mandatory (close-first), the opener literal
+        // must not appear (it would force a duplicate — #107), and
+        // this dominates `allow_thought = false`, mirroring the tool
+        // grammars' `EagerThoughtPreOpened` precedent — a caller
+        // cannot forbid a thought the render already started.
+        let _ =
+            writeln!(src, r#"root ::= think_body "</think>" ws output_schema"#);
+        emit_think_body_rules(&mut src);
+    } else if opts.allow_thought {
         let _ = writeln!(src, "root ::= thought? ws output_schema");
         emit_thought_rules(&mut src);
     } else {
@@ -272,6 +304,7 @@ mod tests {
         let src = build_grammar_source(
             &config.format_schema(),
             &OutputConfigOptions::default(),
+            false,
         );
         assert!(accepts(&src, r#"<think>hmm</think> {"x":1}"#));
         assert!(accepts(&src, r#"{"x":1}"#));
@@ -290,6 +323,7 @@ mod tests {
                 allow_thought: false,
                 phase_split: false,
             },
+            false,
         );
         assert!(accepts(&src, r#"{"x":1}"#));
         assert!(!accepts(&src, r#"<think>hmm</think> {"x":1}"#));
@@ -298,8 +332,9 @@ mod tests {
     #[test]
     fn grammar_for_prompt_none_when_output_config_unset() {
         let prompt = Prompt::default();
-        let mode = grammar_for_prompt(&prompt, &OutputConfigOptions::default())
-            .expect("compile");
+        let mode =
+            grammar_for_prompt(&prompt, &OutputConfigOptions::default(), false)
+                .expect("compile");
         assert!(mode.is_none());
     }
 
@@ -310,8 +345,9 @@ mod tests {
             "properties": {"ok": {"type": "boolean"}},
             "required": ["ok"],
         }));
-        let mode = grammar_for_prompt(&prompt, &OutputConfigOptions::default())
-            .expect("compile");
+        let mode =
+            grammar_for_prompt(&prompt, &OutputConfigOptions::default(), false)
+                .expect("compile");
         assert!(mode.is_some());
     }
 
@@ -322,9 +358,12 @@ mod tests {
             "properties": {"ok": {"type": "boolean"}},
             "required": ["ok"],
         }));
-        let compiled =
-            compile_output_config(&config, &OutputConfigOptions::default())
-                .expect("compile");
+        let compiled = compile_output_config(
+            &config,
+            &OutputConfigOptions::default(),
+            false,
+        )
+        .expect("compile");
         let CompiledOutputConfig::Deferred(deferred) = compiled else {
             panic!("expected Deferred variant on default options");
         };
@@ -352,7 +391,8 @@ mod tests {
             allow_thought: true,
             phase_split: false,
         };
-        let compiled = compile_output_config(&config, &opts).expect("compile");
+        let compiled =
+            compile_output_config(&config, &opts, false).expect("compile");
         let CompiledOutputConfig::Single(SamplingMode::Grammar(state)) =
             compiled
         else {
@@ -378,6 +418,7 @@ mod tests {
         let compiled = compile_prompt_output_config(
             &prompt,
             &OutputConfigOptions::default(),
+            false,
         )
         .expect("compile")
         .expect("output_config set");
@@ -410,6 +451,7 @@ mod tests {
         let compiled = compile_prompt_output_config(
             &prompt,
             &OutputConfigOptions::default(),
+            false,
         )
         .expect("compile")
         .expect("output_config set");
@@ -431,11 +473,64 @@ mod tests {
             allow_thought: false,
             phase_split: true, // ignored since allow_thought is off
         };
-        let compiled = compile_output_config(&config, &opts).expect("compile");
+        let compiled =
+            compile_output_config(&config, &opts, false).expect("compile");
         assert!(matches!(
             compiled,
             CompiledOutputConfig::Single(SamplingMode::Grammar(_))
         ));
+    }
+
+    /// #107: under a pre-opened render the root must anchor
+    /// close-first — the JSON alone is *incomplete* (the open tag must
+    /// close), and the opener literal must not appear in the source
+    /// (offering it at position 0 is what forced the duplicate).
+    /// Byte-spelled opener text inside the body remains grammar-legal
+    /// (body chars are free); the emit-side opener ban owns the
+    /// single-token form.
+    #[test]
+    fn pre_opened_root_closes_first_and_omits_opener() {
+        let config = cfg(json!({
+            "type": "object",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }));
+        let src = build_grammar_source(
+            &config.format_schema(),
+            &OutputConfigOptions::default(),
+            true,
+        );
+        assert!(
+            !src.contains(r#""<think>""#),
+            "pre-opened root must not spell the opener: {src}"
+        );
+        assert!(accepts(&src, "hmm</think> {\"x\":1}"));
+        // Empty thought body: closing immediately is legal.
+        assert!(accepts(&src, "</think>{\"x\":1}"));
+        // Bare JSON is incomplete — the open tag never closed.
+        assert!(!accepts(&src, "{\"x\":1}"));
+    }
+
+    /// #107: pre-opened dominates `allow_thought = false` — a caller
+    /// cannot forbid a thought the render already started (the tool
+    /// grammars' `EagerThoughtPreOpened` precedent).
+    #[test]
+    fn pre_opened_dominates_allow_thought_off() {
+        let config = cfg(json!({
+            "type": "object",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }));
+        let src = build_grammar_source(
+            &config.format_schema(),
+            &OutputConfigOptions {
+                allow_thought: false,
+                phase_split: false,
+            },
+            true,
+        );
+        assert!(accepts(&src, "hmm</think> {\"x\":1}"));
+        assert!(!accepts(&src, "{\"x\":1}"));
     }
 
     /// Small helper so the tests above don't each re-extract the
