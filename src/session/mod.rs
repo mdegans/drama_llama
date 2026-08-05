@@ -1307,6 +1307,79 @@ fn seed_prose_tokens(
     state.step = base + tokens.len() as u64;
 }
 
+/// The seeding-fold tail of [`Session::build_initial_state`]: fold the
+/// prompt's prose from `from`, snapshotting the state at each
+/// breakpoint boundary, then — strictly *after* the last snapshot —
+/// seed the constrained-region accumulator from the finished corpus
+/// (#106, [`RepetitionOptions::seed_constrained_regions`]).
+///
+/// Ordering is the determinism argument: breakpoint snapshots must
+/// never contain the constrained seed (a resumed call re-derives it
+/// from its own — possibly longer — corpus; `resumed_from` starts the
+/// constrained fields empty and this function repopulates them
+/// identically on the cold and resume paths, whose corpora are
+/// oracle-equal at every boundary). The seed is gated on constraint
+/// capability — without a grammar, JSON mode, or deferred grammar,
+/// regime (b) is unreachable and the clone would just bloat every
+/// cached tip.
+///
+/// The step rebase is load-bearing: [`NGramData`] positions are
+/// absolute steps and decay uses `current_step.saturating_sub(pos)`,
+/// so a zero `constrained_step` would saturate every seeded
+/// occurrence to age 0 — full weight forever, never evicted.
+/// Continuing in the prose step-space makes seeded content decay and
+/// evict by its true prose distance.
+///
+/// [`NGramData`]: crate::NGramData
+fn fold_and_snapshot<M: Model>(
+    state: &mut SamplerState,
+    prompt: &Prompt,
+    breakpoint_ids: &[PromptBreakpoint],
+    from: SeedCursor,
+    config: &SamplerConfig,
+    model: &M,
+) -> Vec<Option<SamplerState>> {
+    let mut bp_states: Vec<Option<SamplerState>> =
+        vec![None; breakpoint_ids.len()];
+    if let Some(rep) = &config.repetition {
+        let mut pos = from;
+        for (j, id) in breakpoint_ids.iter().enumerate() {
+            let cur = cursor_of(*id);
+            if cur < pos {
+                continue;
+            }
+            if cur > pos {
+                seed_prose_fold(state, prompt, pos, Some(cur), rep, model);
+                pos = cur;
+            }
+            bp_states[j] = Some(state.clone());
+        }
+        seed_prose_fold(state, prompt, pos, None, rep, model);
+        let has_constraints = config.deferred_grammar.is_some()
+            || config.modes.iter().any(|m| {
+                matches!(
+                    m,
+                    crate::SamplingMode::Grammar(_) | crate::SamplingMode::Json
+                )
+            });
+        if rep.constrained_regions()
+            && rep.seed_constrained_regions()
+            && has_constraints
+        {
+            // Behaviorally-neutral shrink before the clone: the live
+            // penalty pass evicts at this same cutoff before any
+            // recording or lookup, so this only keeps the clone
+            // proportional to the window instead of the whole prompt.
+            state
+                .ngram_stats
+                .evict_outside_window(state.step, rep.window_size().get());
+            state.constrained_ngram_stats = state.ngram_stats.clone();
+            state.constrained_step = state.step;
+        }
+    }
+    bp_states
+}
+
 /// Zip the index-parallel [`PreparedCall`] breakpoint columns with the
 /// fold's per-boundary state snapshots into cache [`Breakpoint`]s.
 fn assemble_breakpoints(
@@ -3177,30 +3250,14 @@ impl<B: Backend> Session<B> {
                 SeedCursor::default(),
             ),
         };
-        let mut bp_states: Vec<Option<SamplerState>> =
-            vec![None; breakpoint_ids.len()];
-        if let Some(rep) = &config.repetition {
-            let mut pos = from;
-            for (j, id) in breakpoint_ids.iter().enumerate() {
-                let cur = cursor_of(*id);
-                if cur < pos {
-                    continue;
-                }
-                if cur > pos {
-                    seed_prose_fold(
-                        &mut state,
-                        prompt,
-                        pos,
-                        Some(cur),
-                        rep,
-                        model,
-                    );
-                    pos = cur;
-                }
-                bp_states[j] = Some(state.clone());
-            }
-            seed_prose_fold(&mut state, prompt, pos, None, rep, model);
-        }
+        let bp_states = fold_and_snapshot(
+            &mut state,
+            prompt,
+            breakpoint_ids,
+            from,
+            config,
+            model,
+        );
         (state, bp_states)
     }
 
@@ -7508,6 +7565,159 @@ mod tests {
         assert_eq!(whole.ngram_stats(), split.ngram_stats());
         assert_eq!(whole.step(), split.step());
         assert!(whole.step() > 0, "the fold actually folded something");
+    }
+
+    /// Two-message prompt with one breakpoint boundary, for the
+    /// [`fold_and_snapshot`] battery.
+    fn constrained_seed_prompt() -> Prompt {
+        Prompt::default()
+            .add_message((crate::Role::User, "alpha beta gamma delta"))
+            .unwrap()
+            .add_message((crate::Role::Assistant, "epsilon zeta eta theta"))
+            .unwrap()
+    }
+
+    fn json_config(rep: RepetitionOptions) -> SamplerConfig {
+        SamplerConfig {
+            modes: vec![crate::SamplingMode::Json],
+            repetition: Some(rep),
+            ..SamplerConfig::default()
+        }
+    }
+
+    /// #106 Flag 2: with a constraint present, the constrained
+    /// accumulator is seeded from the finished corpus with the step
+    /// rebased — and every breakpoint snapshot stays clean (the seed
+    /// happens strictly after the last snapshot, which is what keeps
+    /// cold-prefill ≡ resume at every boundary).
+    #[test]
+    fn test_constrained_seed_after_snapshots() {
+        let rep = RepetitionOptions::default();
+        let config = json_config(rep.clone());
+        let mut state = config.init_state(42, &FoldMock);
+        let bps = [PromptBreakpoint::AfterMessage(0)];
+
+        let bp_states = fold_and_snapshot(
+            &mut state,
+            &constrained_seed_prompt(),
+            &bps,
+            SeedCursor::default(),
+            &config,
+            &FoldMock,
+        );
+
+        // Snapshot cleanliness: taken mid-fold, before the seed. Note
+        // this pins `bp_states` as *returned* — cache-resident states
+        // (the tip, hash-inherited breakpoints) may legitimately carry
+        // populated constrained fields; the resume door zeroes them.
+        let bp = bp_states[0].as_ref().expect("boundary past the cursor");
+        assert_eq!(bp.constrained_ngram_stats(), &crate::NGramStats::default());
+        assert_eq!(bp.constrained_step(), 0);
+        assert!(bp.step() > 0, "the snapshot saw the first message");
+
+        // The working state is seeded: corpus cloned, step rebased.
+        assert!(state.step() > bp.step());
+        assert_eq!(state.constrained_ngram_stats(), state.ngram_stats());
+        assert_eq!(state.constrained_step(), state.step());
+    }
+
+    /// Flag off ⇒ pre-#106 behavior: the constrained accumulator
+    /// starts the call empty even with constraints present.
+    #[test]
+    fn test_constrained_seed_flag_off() {
+        let rep =
+            RepetitionOptions::default().set_seed_constrained_regions(false);
+        let config = json_config(rep);
+        let mut state = config.init_state(42, &FoldMock);
+
+        fold_and_snapshot(
+            &mut state,
+            &constrained_seed_prompt(),
+            &[],
+            SeedCursor::default(),
+            &config,
+            &FoldMock,
+        );
+
+        assert!(state.step() > 0, "the fold ran");
+        assert_eq!(
+            state.constrained_ngram_stats(),
+            &crate::NGramStats::default()
+        );
+        assert_eq!(state.constrained_step(), 0);
+    }
+
+    /// No grammar / JSON mode / deferred grammar ⇒ regime (b) is
+    /// unreachable, so no clone is made even with the flags on — the
+    /// capability gate that keeps pure-prose calls from carrying a
+    /// dead corpus copy into every cached tip.
+    #[test]
+    fn test_constrained_seed_capability_gate() {
+        let config = SamplerConfig {
+            repetition: Some(RepetitionOptions::default()),
+            ..SamplerConfig::default()
+        };
+        assert!(
+            config.deferred_grammar.is_none(),
+            "default config must be constraint-free for this test"
+        );
+        let mut state = config.init_state(42, &FoldMock);
+
+        fold_and_snapshot(
+            &mut state,
+            &constrained_seed_prompt(),
+            &[],
+            SeedCursor::default(),
+            &config,
+            &FoldMock,
+        );
+
+        assert!(state.step() > 0, "the fold ran");
+        assert_eq!(
+            state.constrained_ngram_stats(),
+            &crate::NGramStats::default()
+        );
+        assert_eq!(state.constrained_step(), 0);
+    }
+
+    /// The step rebase pin: seeded occurrences decay by true prose
+    /// distance. The counterfactual is the bug the rebase prevents —
+    /// at `current_step = 0`, `saturating_sub` floors every age to
+    /// zero and a seeded occurrence counts at full weight forever.
+    #[test]
+    fn test_constrained_seed_step_rebase_decays() {
+        let rep = RepetitionOptions::default();
+        let decay = rep.decay();
+        let config = json_config(rep);
+        let mut state = config.init_state(42, &FoldMock);
+
+        fold_and_snapshot(
+            &mut state,
+            &constrained_seed_prompt(),
+            &[],
+            SeedCursor::default(),
+            &config,
+            &FoldMock,
+        );
+
+        // First message's 4-gram: seeded once, at a trailing position
+        // strictly before the corpus tip.
+        let ngram = four_gram(["alpha", "beta", "gamma", "delta"]);
+        let data = state
+            .constrained_ngram_stats()
+            .get(&ngram)
+            .expect("seeded from the corpus");
+        let rebased =
+            data.windowed_decayed_count(state.constrained_step(), decay);
+        assert!(
+            rebased < 1.0,
+            "rebased effective count must decay below the raw count \
+             (got {rebased})",
+        );
+        assert!(rebased > 0.0, "still in window at these sizes");
+        // Counterfactual (the un-rebased failure): age saturates to 0
+        // and the occurrence counts fully, forever.
+        assert_eq!(data.windowed_decayed_count(0, decay), 1.0);
     }
 
     /// The open-thought ingest guard: found anywhere, reported by

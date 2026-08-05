@@ -3194,6 +3194,36 @@ mod tests {
         assert_eq!(seeded(A), B);
     }
 
+    /// #106 companion to the above: the same contrast under
+    /// *seeded-corpus-shaped* pressure — occurrences at prose
+    /// positions with the step rebased past them, exactly the shape
+    /// `Session`'s `fold_and_snapshot` seeding produces. The guard,
+    /// not windowed decay, must be what protects the exit.
+    #[test]
+    fn constrained_exit_token_never_penalized_seeded_corpus() {
+        let opts = str_opts(true, false);
+
+        let seeded = |seed_tok: Token| -> Token {
+            let mut state = state_for(&opts);
+            state.advance(&opts, QUOTE, &MockModel);
+            // Corpus-shaped: 20 occurrences at prose positions
+            // 100..120, step rebased to 120 — recent enough that
+            // decay leaves heavy live pressure (effective ≈ 12 at
+            // the 0.95 default).
+            for s in 100..120 {
+                state
+                    .constrained_ngram_stats
+                    .add(crate::NGram::from(seed_tok), s);
+            }
+            state.constrained_step = 120;
+            let c = dense(&[(seed_tok, 4.0), (B, 3.9)]);
+            sample_token(&[QUOTE], c, &opts, &mut state, &MockModel).unwrap()
+        };
+
+        assert_eq!(seeded(QUOTE_COMMA), QUOTE_COMMA);
+        assert_eq!(seeded(A), B);
+    }
+
     /// Structural states skip the guarded pass entirely (build returns
     /// None): counters stay zero and the pick matches the feature-off
     /// run — exactly the pre-feature suspension.
