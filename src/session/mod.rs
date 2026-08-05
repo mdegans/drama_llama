@@ -1149,14 +1149,29 @@ fn matcher_carry_valid(messages_len: usize, cursor: SeedCursor) -> bool {
 ///
 /// Prose = [`Block::Text`] (system included — parroting the system
 /// prompt is exactly what the penalty should see) and
-/// [`Block::Thought`]. Everything else — tool-use arguments, tool
-/// results (the digit-penalty case), media, documents, server-tool
-/// blocks — is structured and excluded. Each prose block tokenizes
-/// independently (`parse_special = false`): n-grams never span
-/// template markup or block boundaries, and `state.step` advances one
-/// per prose token, so the windowed-decay math measures distance in
-/// prose. N-grams in the resolved ignore set are skipped, matching the
-/// live pass's ingestion rule.
+/// [`Block::Thought`], plus — behind the #106 seeding gates — the text
+/// inside tool *results* ([`RepetitionOptions::seed_tool_results`],
+/// how agents read thread context) and the string *values* of
+/// tool-call arguments ([`RepetitionOptions::seed_tool_args`], how
+/// agents emit; keys, numbers and booleans stay excluded). Everything
+/// else — media, documents, the `WebSearch`/`CodeExecution`-family
+/// result blocks — is structured and excluded. (Historical note: tool
+/// results were originally excluded wholesale for the digit-penalty
+/// case — a short echoed token like `"3"` must stay re-emittable.
+/// That protection now rides the apply-time mitigations instead: the
+/// region guard's exit exemption, `ignored_categories`, surgical
+/// mode's `effective > penalty_max_count` floor, and the fold's
+/// windows(max) shape, which seeds nothing from blocks shorter than
+/// `ngram_max_size`.)
+///
+/// Each prose segment tokenizes independently (`parse_special =
+/// false`; the tool arms additionally suppress auto-BOS via
+/// [`Model::tokenize_special`] — tool-heavy transcripts would
+/// otherwise seed a spurious BOS-headed n-gram per segment): n-grams
+/// never span template markup or block/leaf boundaries, and
+/// `state.step` advances one per prose token, so the windowed-decay
+/// math measures distance in prose. N-grams in the resolved ignore set
+/// are skipped, matching the live pass's ingestion rule.
 ///
 /// Cold == incremental by construction: folding `[start, end)` in one
 /// call or in cursor-split segments is the same fold.
@@ -1187,22 +1202,91 @@ fn seed_prose_fold<M: Model>(
     }
 }
 
-/// One block of [`seed_prose_fold`]: tokenize the block's prose (if it
-/// has any) and record its trailing n-grams at prose-step positions.
-/// Window shape mirrors the live penalty pass — occurrences land at
-/// their trailing token's step, sub-sizes `min..=max` per window.
+/// One block of [`seed_prose_fold`]: route the block's prose (if it
+/// has any) to [`seed_prose_tokens`]. The tool arms tokenize with
+/// auto-BOS suppressed (see the fold docs); the `Text`/`Thought` arms
+/// keep the original `tokenize(_, false)` stream so pre-#106 corpora
+/// are unchanged.
 fn seed_prose_block<M: Model>(
     state: &mut SamplerState,
     block: &crate::Block,
     rep: &RepetitionOptions,
     model: &M,
 ) {
-    let text: &str = match block {
-        crate::Block::Text { text, .. } => text.as_ref(),
-        crate::Block::Thought { thought, .. } => thought.as_ref(),
-        _ => return,
-    };
-    let tokens = model.tokenize(text, false);
+    match block {
+        crate::Block::Text { text, .. } => {
+            seed_prose_tokens(state, &model.tokenize(text, false), rep);
+        }
+        crate::Block::Thought { thought, .. } => {
+            seed_prose_tokens(state, &model.tokenize(thought, false), rep);
+        }
+        crate::Block::ToolResult { result } if rep.seed_tool_results() => {
+            // Text only: images render as markers, and nothing else
+            // in a result carries user-visible prose.
+            for block in &result.content.0 {
+                if let crate::Block::Text { text, .. } = block {
+                    seed_prose_tokens(
+                        state,
+                        &model.tokenize_special(text, false, false),
+                        rep,
+                    );
+                }
+            }
+        }
+        crate::Block::ToolUse { call }
+        | crate::Block::ServerToolUse { call }
+            if rep.seed_tool_args() =>
+        {
+            seed_arg_strings(state, &call.input, rep, model);
+        }
+        _ => {}
+    }
+}
+
+/// The string *values* of a tool-call argument tree, folded as
+/// independent prose segments in document order. Keys are structural
+/// vocabulary and numbers/booleans are the digit-penalty case — both
+/// skipped, unlike [`value_free_text`]'s injection walk, which scans
+/// keys too. Each leaf is its own segment: n-grams never span leaves,
+/// and leaves shorter than `ngram_max_size` seed nothing (ids and
+/// enum-ish values drop out naturally).
+fn seed_arg_strings<M: Model>(
+    state: &mut SamplerState,
+    v: &serde_json::Value,
+    rep: &RepetitionOptions,
+    model: &M,
+) {
+    match v {
+        serde_json::Value::String(s) => {
+            seed_prose_tokens(
+                state,
+                &model.tokenize_special(s, false, false),
+                rep,
+            );
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                seed_arg_strings(state, item, rep, model);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_key, val) in map {
+                seed_arg_strings(state, val, rep, model);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Record one tokenized prose segment's trailing n-grams at prose-step
+/// positions. Window shape mirrors the live penalty pass — occurrences
+/// land at their trailing token's step, sub-sizes `min..=max` per
+/// window — and `state.step` advances one per token.
+fn seed_prose_tokens(
+    state: &mut SamplerState,
+    tokens: &[crate::Token],
+    rep: &RepetitionOptions,
+) {
     let base = state.step;
     // CAPACITY-clamp mirrors the live pass's apply-time clamp
     // (`repetition.rs`); the setter only normalizes min ≤ max, so an
@@ -7076,6 +7160,354 @@ mod tests {
             "one two three four five six seven eight nine ten".into();
         // Panicked before the clamp.
         seed_prose_block(&mut state, &block, &rep, &SeedMock);
+    }
+
+    /// BOS-adding mock for the #106 fold arms: `tokenize` prepends BOS
+    /// the way llama.cpp does on BOS-vocabs; `tokenize_special`
+    /// honors `add_special` — exactly the asymmetry the tool arms rely
+    /// on. Words map to fixed distinct tokens so tests can assert
+    /// which n-grams were seeded.
+    struct FoldMock;
+
+    impl FoldMock {
+        const BOS: Token = 1;
+        const WORDS: &'static [&'static str] = &[
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta",
+            "theta", "iota", "kappa", "lambda", "mu", "x",
+        ];
+
+        fn tok(word: &str) -> Token {
+            Self::WORDS
+                .iter()
+                .position(|w| *w == word)
+                .map(|i| 2 + i as Token)
+                // Sink for vocabulary the tests don't assert on
+                // (ignore-category words, keys).
+                .unwrap_or(63)
+        }
+
+        fn words(input: &str) -> Vec<Token> {
+            input.split_whitespace().map(Self::tok).collect()
+        }
+    }
+
+    impl crate::backend::Model for FoldMock {
+        type Error = std::convert::Infallible;
+        fn n_vocab(&self) -> i32 {
+            64
+        }
+        fn bos(&self) -> Token {
+            Self::BOS
+        }
+        fn eos(&self) -> Token {
+            0
+        }
+        fn eot(&self) -> Token {
+            0
+        }
+        fn special_tokens(&self) -> Vec<Token> {
+            vec![0, Self::BOS]
+        }
+        fn eog_tokens(&self) -> Vec<Token> {
+            vec![0]
+        }
+        fn max_token_len(&self) -> usize {
+            8
+        }
+        fn tokenize(&self, input: &str, _special: bool) -> Vec<Token> {
+            let mut tokens = vec![Self::BOS];
+            tokens.extend(Self::words(input));
+            tokens
+        }
+        fn tokenize_special(
+            &self,
+            input: &str,
+            add_special: bool,
+            _parse_special: bool,
+        ) -> Vec<Token> {
+            if add_special {
+                self.tokenize(input, false)
+            } else {
+                Self::words(input)
+            }
+        }
+        fn token_to_piece(&self, _token: Token) -> String {
+            "x".to_string()
+        }
+        fn token_to_piece_ref(&self, _token: Token, buf: &mut Vec<u8>) {
+            buf.clear();
+            buf.push(b'x');
+        }
+        fn context_size(&self) -> i32 {
+            4096
+        }
+        fn chat_template_source(&self) -> Option<String> {
+            None
+        }
+        fn recommended_sampling(&self) -> crate::SamplingParams {
+            crate::SamplingParams::default()
+        }
+    }
+
+    fn fold_state_for(rep: &RepetitionOptions) -> SamplerState {
+        let opts = SamplerConfig {
+            repetition: Some(rep.clone()),
+            ..SamplerConfig::default()
+        };
+        opts.init_state(42, &FoldMock)
+    }
+
+    fn four_gram(words: [&str; 4]) -> crate::NGram {
+        crate::NGram::try_from_tokens(&words.map(FoldMock::tok)).unwrap()
+    }
+
+    fn assert_no_bos_ngrams(state: &SamplerState, context: &str) {
+        assert!(
+            state
+                .ngram_stats()
+                .iter()
+                .all(|(ngram, _)| !ngram.as_slice().contains(&FoldMock::BOS)),
+            "{context}: a BOS-headed n-gram leaked into the corpus",
+        );
+    }
+
+    /// #106 Flag 1: tool-result text folds into the corpus when
+    /// `seed_tool_results` is on (default), is invisible when off, and
+    /// the arm's tokenization never seeds the auto-BOS that top-level
+    /// `Text` blocks pick up on BOS-vocabs.
+    #[test]
+    fn test_seed_fold_tool_result_text_by_flag() {
+        let phrase = "alpha beta gamma delta";
+        let result_block = |text: &str| crate::Block::ToolResult {
+            result: misanthropic::tool::Result {
+                tool_use_id: "call_1".into(),
+                content: text.into(),
+                is_error: false,
+                cache_control: None,
+            },
+        };
+
+        // Default-on: the nested text seeds, without BOS.
+        let rep = RepetitionOptions::default();
+        let mut state = fold_state_for(&rep);
+        seed_prose_block(&mut state, &result_block(phrase), &rep, &FoldMock);
+        assert_eq!(state.step(), 4, "one step per nested prose token");
+        assert!(
+            state
+                .ngram_stats()
+                .get(&four_gram(["alpha", "beta", "gamma", "delta"]))
+                .is_some(),
+            "tool-result phrase is in the corpus",
+        );
+        assert_no_bos_ngrams(&state, "tool-result arm");
+
+        // Contrast: a top-level Text block DOES pick up the mock's
+        // auto-BOS — proving the arm above suppressed a real one.
+        let mut text_state = fold_state_for(&rep);
+        seed_prose_block(&mut text_state, &phrase.into(), &rep, &FoldMock);
+        assert_eq!(text_state.step(), 5, "BOS + 4 words");
+        assert!(
+            text_state
+                .ngram_stats()
+                .iter()
+                .any(|(ngram, _)| ngram.as_slice().contains(&FoldMock::BOS)),
+            "top-level Text keeps the pre-#106 BOS-bearing stream",
+        );
+
+        // Off: pre-#106 behavior — the result is invisible.
+        let rep_off = RepetitionOptions::default().set_seed_tool_results(false);
+        let mut state = fold_state_for(&rep_off);
+        seed_prose_block(
+            &mut state,
+            &result_block(phrase),
+            &rep_off,
+            &FoldMock,
+        );
+        assert_eq!(state.step(), 0);
+        assert_eq!(state.ngram_stats().total_ngram_count(), 0);
+    }
+
+    /// #106 Flag 1b: tool-call argument *string values* fold — keys,
+    /// numbers and booleans never do, nested arrays/objects are
+    /// walked, sub-`ngram_max_size` leaves seed nothing (but still
+    /// advance the step), and `ServerToolUse` folds identically.
+    #[test]
+    fn test_seed_fold_tool_args_string_values_by_flag() {
+        let call_block = || -> crate::Block {
+            crate::prompt::ToolUse::new(
+                "create_post",
+                serde_json::json!({
+                    "body": "alpha beta gamma delta",
+                    "count": 3,
+                    "ok": true,
+                    "tags": ["epsilon zeta eta theta", "x"],
+                    "nested": {"key": "iota kappa lambda mu"},
+                }),
+            )
+            .with_id("call_1")
+            .into()
+        };
+
+        let rep = RepetitionOptions::default();
+        let mut state = fold_state_for(&rep);
+        seed_prose_block(&mut state, &call_block(), &rep, &FoldMock);
+        // 4 ("body") + 4 (tags[0]) + 1 (tags[1] "x") + 4 (nested.key):
+        // every string leaf advances the step, even the sub-max one.
+        assert_eq!(state.step(), 13);
+        for phrase in [
+            ["alpha", "beta", "gamma", "delta"],
+            ["epsilon", "zeta", "eta", "theta"],
+            ["iota", "kappa", "lambda", "mu"],
+        ] {
+            assert!(
+                state.ngram_stats().get(&four_gram(phrase)).is_some(),
+                "string leaf {phrase:?} is in the corpus",
+            );
+        }
+        // The sub-max leaf ("x", 1 token < windows(4)) seeds nothing —
+        // the short-leaf hole that drops ids and enum-ish values.
+        assert!(
+            state
+                .ngram_stats()
+                .get(&crate::NGram::from(FoldMock::tok("x")))
+                .is_none(),
+            "sub-max leaf must not seed",
+        );
+        // Keys are structural vocabulary; they and the number/bool
+        // leaves map to the sink token, which must be absent.
+        assert!(
+            state
+                .ngram_stats()
+                .iter()
+                .all(|(ngram, _)| !ngram.as_slice().contains(&63)),
+            "keys / numbers / booleans must not fold",
+        );
+        assert_no_bos_ngrams(&state, "tool-args arm");
+
+        // ServerToolUse: same call, same corpus.
+        let crate::Block::ToolUse { call } = call_block() else {
+            unreachable!()
+        };
+        let server_block = crate::Block::ServerToolUse { call };
+        let mut server_state = fold_state_for(&rep);
+        seed_prose_block(&mut server_state, &server_block, &rep, &FoldMock);
+        assert_eq!(server_state.ngram_stats(), state.ngram_stats());
+        assert_eq!(server_state.step(), state.step());
+
+        // Off: pre-#106 behavior — the call is invisible.
+        let rep_off = RepetitionOptions::default().set_seed_tool_args(false);
+        let mut state = fold_state_for(&rep_off);
+        seed_prose_block(&mut state, &call_block(), &rep_off, &FoldMock);
+        assert_eq!(state.step(), 0);
+        assert_eq!(state.ngram_stats().total_ngram_count(), 0);
+    }
+
+    /// Only `Text` folds inside a tool result: images (and any other
+    /// non-Text block) contribute nothing to the corpus or the step.
+    #[test]
+    fn test_seed_fold_result_non_text_blocks_skipped() {
+        let block = crate::Block::ToolResult {
+            result: misanthropic::tool::Result {
+                tool_use_id: "call_1".into(),
+                content: misanthropic::prompt::message::Content(vec![
+                    crate::Block::Text {
+                        text: "alpha beta gamma delta".into(),
+                        cache_control: None,
+                        citations: None,
+                    },
+                    crate::Block::Image {
+                        image: misanthropic::prompt::message::Image::Base64 {
+                            media_type:
+                                misanthropic::prompt::message::MediaType::Png,
+                            data: "aGVsbG8gcGl4ZWxz".into(),
+                        },
+                        cache_control: None,
+                    },
+                ]),
+                is_error: false,
+                cache_control: None,
+            },
+        };
+
+        let rep = RepetitionOptions::default();
+        let mut state = fold_state_for(&rep);
+        seed_prose_block(&mut state, &block, &rep, &FoldMock);
+        assert_eq!(state.step(), 4, "image contributed nothing");
+        assert!(state
+            .ngram_stats()
+            .get(&four_gram(["alpha", "beta", "gamma", "delta"]))
+            .is_some(),);
+    }
+
+    /// Cold == incremental at the unit level, tool blocks included:
+    /// folding a prompt whole or split at a cursor produces the same
+    /// corpus and step. This is the invariant that lets breakpoint
+    /// resumes fold only the suffix.
+    #[test]
+    fn test_seed_fold_cursor_split_matches_whole_with_tool_blocks() {
+        use misanthropic::prompt::message::{Content, Message};
+
+        let prompt = Prompt {
+            system: Some("alpha beta gamma delta".into()),
+            messages: vec![
+                Message {
+                    role: crate::Role::User,
+                    content: "epsilon zeta eta theta".into(),
+                },
+                Message {
+                    role: crate::Role::Assistant,
+                    content: Content(vec![crate::prompt::ToolUse::new(
+                        "create_post",
+                        serde_json::json!({"body": "iota kappa lambda mu"}),
+                    )
+                    .with_id("call_1")
+                    .into()]),
+                },
+                Message {
+                    role: crate::Role::User,
+                    content: Content(vec![crate::Block::ToolResult {
+                        result: misanthropic::tool::Result {
+                            tool_use_id: "call_1".into(),
+                            content: "alpha beta gamma delta".into(),
+                            is_error: false,
+                            cache_control: None,
+                        },
+                    }]),
+                },
+            ],
+            ..Prompt::default()
+        };
+
+        let rep = RepetitionOptions::default();
+
+        let mut whole = fold_state_for(&rep);
+        seed_prose_fold(
+            &mut whole,
+            &prompt,
+            SeedCursor::default(),
+            None,
+            &rep,
+            &FoldMock,
+        );
+
+        let mut split = fold_state_for(&rep);
+        let mid = SeedCursor {
+            system_done: true,
+            msgs_done: 2,
+        };
+        seed_prose_fold(
+            &mut split,
+            &prompt,
+            SeedCursor::default(),
+            Some(mid),
+            &rep,
+            &FoldMock,
+        );
+        seed_prose_fold(&mut split, &prompt, mid, None, &rep, &FoldMock);
+
+        assert_eq!(whole.ngram_stats(), split.ngram_stats());
+        assert_eq!(whole.step(), split.step());
+        assert!(whole.step() > 0, "the fold actually folded something");
     }
 
     /// The open-thought ingest guard: found anywhere, reported by
