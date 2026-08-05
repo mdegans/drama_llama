@@ -151,9 +151,12 @@ fn whodunit_verdict() {
     // (2) Typed round-trip: the final Block::Text is valid JSON that
     // deserializes into the CaseFile schema via misanthropic's
     // Message::json() helper.
-    let verdict: CaseFile = response
-        .json()
-        .expect("structured output should deserialize into CaseFile");
+    let verdict: CaseFile = response.json().unwrap_or_else(|e| {
+        panic!(
+            "structured output should deserialize into CaseFile: {e:?}; \
+             blocks: {blocks:#?}"
+        )
+    });
 
     println!("=== verdict ===\n{verdict:#?}\n===");
 
