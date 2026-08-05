@@ -71,10 +71,35 @@ fold arms → seeding → retune) + validation:
   first token is a duplicate single-token opener (248068) inside the
   open thought; `</think>` and the JSON that follows are flawless.
   Red since #101 containment landed 2026-07-29 (test hadn't run
-  since — it always did this; nobody was looking). Fix filed as
-  **#107**: dialect-aware opener ban (opener banned when the template
-  pre-opens; closer stays exempt as the trigger). Don't re-bisect
-  this; the A/B/C/D matrix is in the issue.
+  since; silently present since ≥2026-07-20 — verified by running the
+  seeding commit 707274e, which passes green WITH the dup in the
+  thought text). **ROOT-CAUSED AND FIXED 2026-08-05 (#107)** — and the
+  original diagnosis above was wrong in an instructive way: the model
+  never wanted the duplicate (raw predictor, byte-identical prefix,
+  same chain: 0/9 seeds emit it; p("Here")≈0.98 at position 0). The
+  *eager output-config grammar* forced it: with `prompt.thinking`
+  unset (whodunit enables thinking via the `enable_thinking` render
+  extra, which the compile path never sees), phase-split
+  auto-disables and the unified root `thought? ws output_schema`
+  offers a literal `"<think>"` — masking "Here" as grammar-illegal
+  and leaving the opener as the model's best legal choice. Two fixes,
+  complementary: (1) `build_grammar_source` takes
+  `thought_pre_opened` and anchors close-first (`think_body
+  "</think>" ws output_schema`, opener literal gone, dominates
+  `allow_thought=false`) — also closes early-EOG on this path since
+  the grammar stays incomplete until the JSON exists; (2) per-call
+  `reasoning_opener_ban` unioned into `banned_specials` when the
+  render shows the opener is spent (`reasoning_opener_spent` on
+  `PreparedCall`) — the derivation must NOT blanket-exempt
+  `preserved_tokens` (the analyzer puts the opener itself in there —
+  pinned by `test_reasoning_opener_ban_set_qwen`). Bisect lessons,
+  hard-won: the prior matrix's "registry 0.8.1 ⇒ same" arm was
+  version-resolution-contaminated (caret `0.8.1` resolves to 0.8.2 =
+  the same new upstream — pin `--precise` in future matrices), and
+  its earliest commit (82a7209) postdated #101, so "always did this"
+  was extrapolation until 707274e was actually run. Config-bisecting
+  the sampler arms against the raw predictor (probe arms A–F, session
+  history 2026-08-05) is what cracked it — remember the technique.
 
 ## Open follow-ups (queue for a future session)
 

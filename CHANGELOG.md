@@ -41,6 +41,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The eager output-config grammar no longer forces a duplicate
+  `<think>` under a pre-opened render (#107).** Root cause, found by
+  arm-by-arm config bisection against the raw predictor: with
+  `prompt.thinking` unset, `compile_prompt_output_config` compiles the
+  *unified* grammar whose root was `thought? ws output_schema` — an
+  **optional `"<think>"` opener literal** — while the template (Qwen
+  3.6 with the `enable_thinking` render extra) had already pre-opened
+  the thought. At position 0 the grammar masked the model's actual
+  preference (`"Here"`, p≈0.98 raw) as illegal and offered
+  `{<think>, ws, {`}; the model picked the opener — deterministically,
+  at every seed — and #101's containment then rightly refused the
+  response (`EmittedSpecialToken(<think>)`, red since 2026-07-29,
+  silently present since at least 2026-07-20). The model never wanted
+  the duplicate: 0/9 seeds emit it through the raw predictor.
+  `build_grammar_source` now takes `thought_pre_opened` (threaded from
+  the render, same measurement the tool grammars use) and anchors the
+  pre-opened root close-first — `think_body "</think>" ws
+  output_schema`, no opener literal, thought mandatory, dominating
+  `allow_thought = false` per the `EagerThoughtPreOpened` precedent.
+  This also closes the early-stop hole on this path: the grammar is
+  incomplete until the JSON exists, so EOG is illegal mid-thought. The
+  deferred (phase-split) path is unchanged — its trigger is the
+  closer, which is the model's job to emit either way.
+- **A model-emitted duplicate `<think>` is masked at the sampler
+  whenever the turn's opener is already supplied (#107,
+  defense-in-depth).** The grammar fix above removes the *forcing*;
+  this removes the single-token *path*: the standing emit ban's
+  reasoning-opener exemption is now conditional. A per-call
+  `reasoning_opener_ban` is unioned into `banned_specials` whenever
+  the render shows the opener is spent — pre-opened thought, closed
+  thinking-off stub (Qwen's `<think>\n\n</think>\n\n`, Gemma 4's
+  default `<channel|>` stub), or a resumed open thought. The closer
+  stays exempt (it is the phase-split trigger); self-opening dialects
+  keep the exemption (the ban keys on the *render*, not the dialect —
+  gpt-oss and thinking-on Gemma are untouched);
+  `with_emit_specials_ban(false)` disables this set along with the
+  other two. Id-level only, as with the rest of the ban family: a
+  byte-spelled opener still lands in free text and containment keeps
+  rejecting it.
 - **The post-generation tip anchors continuations again (#96).** The
   prefix cache's two lookups composed as hash-keyed first, LCP only on
   a total hash miss — and every continuation re-renders its old

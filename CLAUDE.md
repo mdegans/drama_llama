@@ -490,6 +490,14 @@ regression. Tell: the failing test name changes between runs while the
 pass/fail counts stay identical. Everything below goes through
 `cargo-nextest`, which gives each test its own process.
 
+**Run `just test all` before closing out a session** — especially one that
+touched sampling, containment, dialects, or templates. CI runs the model tier
+only on main pushes/PRs; dev sessions that skip the ignored tier can land a
+visibility change whose reds surface days later looking like fresh
+regressions. (The #107 lesson: #101's containment landed 2026-07-29 without a
+full-tier run; a *long-standing invisible* model quirk then surfaced 08-05 as
+an apparent regression and cost a session of archaeology.)
+
 `just` recipes are thin wrappers over `scripts/test.py`, which owns the test
 topology so the justfile and CI cannot drift from each other (#68). Run
 `python3 scripts/test.py --help` for the full interface, or use it directly on
