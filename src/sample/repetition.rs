@@ -111,6 +111,34 @@ pub struct RepetitionOptions {
     /// incomplete. Default **on** — this is what breaks small-model
     /// loops inside always-on tool-call grammars.
     pub(crate) constrained_regions: bool,
+    /// Fold the prose inside tool *results* ([`Block::ToolResult`]'s
+    /// nested text) into the persistent corpus during `Session`'s
+    /// prompt-seeding fold. Thread context often arrives as tool
+    /// results (an agent reading a feed), and without this the penalty
+    /// never sees it. Default **on**. Consumed by `Session`; the raw
+    /// `Engine` predictors never prompt-seed.
+    ///
+    /// [`Block::ToolResult`]: crate::Block::ToolResult
+    pub(crate) seed_tool_results: bool,
+    /// Fold the string *values* of tool-call arguments
+    /// ([`Block::ToolUse`]`.input` string leaves; keys, numbers and
+    /// booleans are skipped) into the persistent corpus during
+    /// `Session`'s prompt-seeding fold. Tool calls are the majority of
+    /// what an agent emits, so without this an agent's own prior
+    /// output exerts no repetition pressure. Default **on**. Consumed
+    /// by `Session`; the raw `Engine` predictors never prompt-seed.
+    ///
+    /// [`Block::ToolUse`]: crate::Block::ToolUse
+    pub(crate) seed_tool_args: bool,
+    /// Seed the constrained-region accumulator from the persistent
+    /// corpus at generation start, so grammar-constrained free regions
+    /// (JSON string bodies) feel repetition pressure from prompt
+    /// history instead of starting from silence every call. Requires
+    /// [`Self::constrained_regions`]; no effect without it. Default
+    /// **on**. Consumed by `Session`; determinism is preserved because
+    /// the seed derives from the prompt identically on cold and
+    /// resumed calls, after every breakpoint snapshot is taken.
+    pub(crate) seed_constrained_regions: bool,
 }
 
 /// Deserialize-only mirror of [`RepetitionOptions`]. The real struct routes its
@@ -141,6 +169,12 @@ struct RepetitionOptionsShadow {
     surgical: bool,
     #[serde(default = "default_constrained_regions")]
     constrained_regions: bool,
+    #[serde(default = "default_seeding")]
+    seed_tool_results: bool,
+    #[serde(default = "default_seeding")]
+    seed_tool_args: bool,
+    #[serde(default = "default_seeding")]
+    seed_constrained_regions: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -171,6 +205,9 @@ impl TryFrom<RepetitionOptionsShadow> for RepetitionOptions {
             penalty_present: s.penalty_present,
             surgical: s.surgical,
             constrained_regions: s.constrained_regions,
+            seed_tool_results: s.seed_tool_results,
+            seed_tool_args: s.seed_tool_args,
+            seed_constrained_regions: s.seed_constrained_regions,
         })
     }
 }
@@ -178,6 +215,14 @@ impl TryFrom<RepetitionOptionsShadow> for RepetitionOptions {
 /// Default for the `constrained_regions` gate — on. A sidecar that
 /// predates the field keeps the loop-breaking behavior.
 fn default_constrained_regions() -> bool {
+    true
+}
+
+/// Default for the three seeding gates (`seed_tool_results`,
+/// `seed_tool_args`, `seed_constrained_regions`) — on. A sidecar that
+/// predates the fields gains history pressure, which is the expected
+/// behavior of a repetition penalty (#106).
+fn default_seeding() -> bool {
     true
 }
 
@@ -236,6 +281,9 @@ impl Default for RepetitionOptions {
             // per-model sidecar.
             surgical: true,
             constrained_regions: default_constrained_regions(),
+            seed_tool_results: default_seeding(),
+            seed_tool_args: default_seeding(),
+            seed_constrained_regions: default_seeding(),
         }
     }
 }
@@ -502,6 +550,47 @@ impl RepetitionOptions {
         self
     }
 
+    /// Whether tool-result prose is folded into the persistent corpus.
+    /// See the field docs.
+    pub fn seed_tool_results(&self) -> bool {
+        self.seed_tool_results
+    }
+
+    /// Enable or disable folding tool-result prose into the persistent
+    /// corpus. Off restores the pre-#106 exclusion (short tool echoes
+    /// never penalized because never seen).
+    pub fn set_seed_tool_results(mut self, on: bool) -> Self {
+        self.seed_tool_results = on;
+        self
+    }
+
+    /// Whether tool-call argument string values are folded into the
+    /// persistent corpus. See the field docs.
+    pub fn seed_tool_args(&self) -> bool {
+        self.seed_tool_args
+    }
+
+    /// Enable or disable folding tool-call argument string values into
+    /// the persistent corpus.
+    pub fn set_seed_tool_args(mut self, on: bool) -> Self {
+        self.seed_tool_args = on;
+        self
+    }
+
+    /// Whether the constrained-region accumulator is seeded from the
+    /// persistent corpus at generation start. See the field docs.
+    pub fn seed_constrained_regions(&self) -> bool {
+        self.seed_constrained_regions
+    }
+
+    /// Enable or disable seeding the constrained-region accumulator
+    /// from the persistent corpus. Off restores the pre-#106 behavior:
+    /// free regions start every call with no history pressure.
+    pub fn set_seed_constrained_regions(mut self, on: bool) -> Self {
+        self.seed_constrained_regions = on;
+        self
+    }
+
     /// Sliding-window size in generation steps. See field docs.
     pub fn window_size(&self) -> NonZeroU32 {
         self.window_size
@@ -745,6 +834,27 @@ impl RepetitionOptions {
                  the region (closing quote, delimiters) are never penalized, so the grammar \
                  always stays completable. When disabled, the penalty is fully suspended while \
                  any grammar is active.",
+            );
+
+        // Prompt-seeding gates (#106)
+        resp |= ui.checkbox(&mut self.seed_tool_results, "Seed from tool results")
+            .on_hover_text_at_pointer(
+                "Fold the text inside tool results into the repetition corpus, so context \
+                 that arrives as tool output (e.g. a thread an agent is reading) exerts \
+                 repetition pressure. When disabled, tool results are invisible to the penalty.",
+            );
+        resp |= ui.checkbox(&mut self.seed_tool_args, "Seed from tool-call arguments")
+            .on_hover_text_at_pointer(
+                "Fold the string values of prior tool-call arguments into the repetition \
+                 corpus, so an agent's own earlier output (posts, comments) exerts repetition \
+                 pressure. Keys, numbers and booleans are never folded.",
+            );
+        resp |= ui.checkbox(&mut self.seed_constrained_regions, "Seed free regions from history")
+            .on_hover_text_at_pointer(
+                "Start grammar free regions (JSON string bodies) with the repetition history \
+                 of the whole prompt instead of a blank slate. Requires the free-region \
+                 penalty above. When disabled, constrained output only feels pressure from \
+                 text generated earlier in the same call.",
             );
 
         // Close the immediate-mode one-frame lag: each ngram-size slider's
@@ -1246,6 +1356,10 @@ mod invariant_tests {
             assert!(o.ignored_categories().is_empty());
             // Pre-feature sidecars keep the loop-breaking behavior.
             assert!(o.constrained_regions());
+            // Pre-#106 sidecars gain history pressure (default on).
+            assert!(o.seed_tool_results());
+            assert!(o.seed_tool_args());
+            assert!(o.seed_constrained_regions());
         }
 
         /// The `ignored_stopwords` legacy key still maps onto
