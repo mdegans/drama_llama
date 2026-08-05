@@ -1362,10 +1362,18 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // Stats ingestion lives inside each pass: constrained-span tokens
     // never enter the PERSISTENT stats (structural markers must not
     // seed penalties against later prose, and Session's cold fold
-    // could not re-derive them — seeding excludes tool args). The
-    // call-local accumulator absorbs regime (b) and dies at the call
-    // boundary. Each corpus advances its own step counter only when
-    // its pass executes.
+    // could not re-derive the sampled stream). The call-local
+    // accumulator absorbs regime (b) and dies at the call boundary —
+    // but since #106 it is REBORN seeded: Session clones the folded
+    // corpus (which now ingests tool results and tool-call arg
+    // strings by default) into it after the last breakpoint snapshot,
+    // so free regions feel prompt-history pressure from token one
+    // while the cold≡resume invariant is untouched. One consequence
+    // worth knowing: a deferred-grammar call's thought preamble is
+    // generated AFTER the seed, so the JSON body that follows never
+    // feels pressure from its own thought — regime (a) ingests that
+    // into the persistent corpus only. Each corpus advances its own
+    // step counter only when its pass executes.
     if let Some(repetition) = &opts.repetition {
         let incomplete = state.constrained_incomplete();
         // Split borrow: the passes read the resolved ignore set and

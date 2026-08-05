@@ -8,6 +8,62 @@
 filings closed, honest cache counters, no budget burns. Remaining
 follow-ups tracked in the section below.**
 
+## #106 extension: history seeding (COMPLETE, 2026-08-05)
+
+The v1 design's "call-local accumulator starts empty; cross-call
+tool-arg repetition a non-goal" was correct for determinism but wrong
+for Agora's all-structured workload — the penalty was effectively
+disabled end-to-end (issue #106). Landed in four commits (flags →
+fold arms → seeding → retune) + validation:
+
+- **Three `RepetitionOptions` flags, all default ON (Default and
+  serde-default)**: `seed_tool_results` (ToolResult nested Text),
+  `seed_tool_args` (ToolUse/ServerToolUse arg *string values* via a
+  fold variant of `value_free_text` — keys/numbers/bools excluded),
+  `seed_constrained_regions` (clone the folded corpus into
+  `constrained_ngram_stats` in `fold_and_snapshot`, strictly after
+  the last breakpoint snapshot, `constrained_step` rebased to
+  `step`). The doors (`init_state`/`resumed_from`) still zero the
+  constrained fields — **history pressure flows through prompt
+  content, never through carried state**, which is how "never reset"
+  (Mike's original framing) was reconciled with cold≡resume.
+- **Retune**: window 256→2048, decay 0.95→0.99, penalty_freq
+  0.125→0.025 (cap ≈2.6 unchanged). The two window-scaled model tests
+  pin the old tuning explicitly. Existing sidecars pin old numbers —
+  delete/edit to adopt.
+- **Load-bearing subtleties** (the vet caught #1–2 pre-landing):
+  (1) rebase, not zero — `saturating_sub` means un-rebased seeds
+  count at full weight *forever*; pinned by
+  `test_constrained_seed_step_rebase_decays`' counterfactual.
+  (2) ProbeHook captures PRE-penalty candidates — pressure asserts
+  must be unit-level (`sample_token`) or stats-presence, never
+  probe-logit. (3) capability gate (grammar/Json/deferred) so
+  pure-prose calls don't clone corpora into cached tips. (4) new
+  fold arms tokenize via `tokenize_special(_, false, false)` — no
+  per-block auto-BOS. (5) short-block hole: `windows(max)` seeds
+  nothing from blocks < `ngram_max_size` — this is what keeps
+  digit-echo pins immune, and it drops ids/enum leaves naturally.
+- **Validation (2026-08-05, all green)**: fast suite 535;
+  `incremental_fold_matches_cold_fold_with_tools` (cold≡warm
+  bit-exact incl. constrained fields, tool blocks in suffix); digit
+  pins on all four suites (Qwen, Gemma 4, gpt-oss, Mistral 4 via
+  `DRAMA_LLAMA_MISTRAL_MODEL` — the on-disk quant is Q4_K_XL, not
+  the suite's default IQ3_S); pressure e2e
+  `seeded_history_pressures_constrained_region`: with TWO thread
+  posts sharing a phrase (surgical needs effective>1 — a once-seen
+  phrase exerts zero), seeded-on paraphrased ("majestic bison
+  gathering…") where seeded-off echoed verbatim. Exactly the Agora
+  fix, observed end-to-end.
+- **Known limitations (documented in code)**: thought-preamble gap
+  (deferred-grammar JSON body never feels its own thought — seed
+  runs pre-generation); tip resumes seed live-BPE n-grams a cold
+  fold can't derive (pre-existing tip approximation, now also shapes
+  regime (b)); fold-rule flags join `ignored_categories` in the
+  "changed mid-session ⇒ cold≢warm until slot miss" class.
+- **Tuning knob for Agora** (next): sidecar `surgical = false`
+  (broad) so *single* prior occurrences press too — matches Mike's
+  standing broad-for-text-gen preference; possibly larger window.
+
 ## Open follow-ups (queue for a future session)
 
 1. **until() delimiter protection (optional, low priority)** — the v1

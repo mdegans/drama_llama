@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The repetition penalty now sees history (#106) — three new
+  `RepetitionOptions` seeding flags, all default ON.** For an
+  all-structured workload (an agent whose every turn is tool calls
+  and `output_config` JSON) the penalty was effectively disabled
+  end-to-end: the prose fold excluded tool results and tool-call
+  args, and the constrained-region accumulator started empty every
+  call — near-identical sequential posts from similar agents were
+  the symptom. Now `seed_tool_results` folds tool-result text (how
+  agents read thread context), `seed_tool_args` folds the string
+  values of prior tool-call arguments (how agents emit; keys,
+  numbers and booleans stay excluded), and `seed_constrained_regions`
+  clones the folded corpus into the constrained accumulator at
+  generation start — after every breakpoint snapshot, step rebased —
+  so grammar free regions feel prompt-history pressure from token
+  one. Cold-prefill ≡ cache-resume is untouched (the seed re-derives
+  from the prompt identically on both paths; oracle-pinned including
+  the constrained fields). Escape hatches: `set_seed_tool_results` /
+  `set_seed_tool_args` / `set_seed_constrained_regions`, all
+  sidecar-settable per model.
+- **Penalty defaults retuned for thread-corpus reach**: `window_size`
+  256 → 2048, `decay` 0.95 → 0.99, `penalty_freq` 0.125 → 0.025. The
+  decay/freq pair moves together, so the saturated additive cap
+  (≈ 2.6) is unchanged — 5× the decayed-term reach at the same
+  ceiling. Note existing sidecars serialize the full options table
+  and therefore pin the old numbers; delete or edit
+  `<model>.sampling.toml` to pick up the new defaults. The
+  digit-echo pins (a `"3"` echoed from a tool result) stay green on
+  all four model suites: short tool echoes seed nothing (blocks
+  shorter than `ngram_max_size` produce no windows) and surgical
+  mode gates single occurrences.
+
 ### Fixed
 
 - **The post-generation tip anchors continuations again (#96).** The

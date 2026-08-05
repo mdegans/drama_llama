@@ -232,6 +232,19 @@ shipped in 1.0.0-alpha.13 (we pin alpha.12 — bump rides along).
 
 ## Standing constraints
 
+- **Phase 4 (disk tier) must key persisted SamplerStates on the
+  fold rule** (added 2026-08-05, from #106): any option that changes
+  what the seeding fold ingests — `ignored_categories` and, since
+  #106, `seed_tool_results` / `seed_tool_args` /
+  `seed_constrained_regions` — makes states folded under a different
+  rule non-interchangeable. In-memory slots are safe today only
+  because config is fixed at Session construction and slots die with
+  the process; a disk tier outlives config edits, so these options
+  (plus window/decay/freq, which shape stats content via eviction)
+  belong in the cache key or an epoch discriminator. Same class as
+  the existing "ignore-set changed mid-session ⇒ cold≢warm until the
+  slot misses" acceptance — fine to accept in RAM, not fine to
+  persist.
 - Do not weaken the non-canonical-emission refusal or #91's
   drift refusal (`plan_grammar_canonicity.md` stop sign).
 - `replay_session.py --seed 42` against the bundle is the arc's

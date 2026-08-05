@@ -94,14 +94,25 @@ pub struct SamplerState {
     /// field: anything that influences logits influences RNG
     /// consumption downstream, so it must ride a mid-call snapshot for
     /// restore-and-continue to replay the identical stream (same
-    /// rationale as serializing `rng`). But it is NEVER carried across
+    /// rationale as serializing `rng`). It is NEVER carried across
     /// call boundaries — `init_state` and `resumed_from` both start it
-    /// empty — which is what keeps (a) the incremental-vs-cold fold
-    /// equivalence intact (Session seeding deliberately excludes
-    /// tool-use args, so the *persistent* `ngram_stats` never sees
-    /// constrained tokens) and (b) cross-call tool-arg repetition a
-    /// non-goal by construction. `serde(default)` so pre-feature blobs
-    /// deserialize to the empty accumulator.
+    /// empty, which is what keeps the incremental-vs-cold fold
+    /// equivalence intact (a cold fold cannot re-derive another call's
+    /// sampled stream). Since #106 it is instead **reborn seeded**:
+    /// after the doors zero it, `Session`'s `fold_and_snapshot` clones
+    /// the folded prompt corpus into it (post-last-snapshot, step
+    /// rebased — see [`RepetitionOptions::seed_constrained_regions`]),
+    /// re-derived identically on the cold and resume paths. So
+    /// cross-call repetition pressure flows through *prompt content*,
+    /// never through carried accumulator state. Cache-resident
+    /// snapshots (the tip, hash-inherited breakpoints) may therefore
+    /// legitimately hold populated constrained fields — the resume
+    /// door zeroes them before the re-seed; that is the mechanism, not
+    /// a leak. `serde(default)` so pre-feature blobs deserialize to
+    /// the empty accumulator.
+    ///
+    /// [`RepetitionOptions::seed_constrained_regions`]:
+    ///     crate::RepetitionOptions::seed_constrained_regions
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) constrained_ngram_stats: NGramStats,
     /// Step counter for the constrained-region window/decay math —
@@ -407,7 +418,10 @@ impl SamplerState {
             // deliberately NOT cloned from `cached`. A resumed call and
             // a cold-prefill call must derive identical states at every
             // breakpoint, and cold fold cannot (and must not) recover
-            // mid-call ephemera. See the field docs.
+            // mid-call ephemera. Session re-seeds it from the folded
+            // corpus AFTER the snapshots (#106) — history pressure
+            // flows through prompt content, never through this door.
+            // See the field docs.
             constrained_ngram_stats: NGramStats::default(),
             constrained_step: 0,
         }
