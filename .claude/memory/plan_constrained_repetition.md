@@ -63,6 +63,18 @@ fold arms → seeding → retune) + validation:
 - **Tuning knob for Agora** (next): sidecar `surgical = false`
   (broad) so *single* prior occurrences press too — matches Mike's
   standing broad-for-text-gen preference; possibly larger window.
+- **Full-suite validation (677/678) — the one red is NOT #106.**
+  `whodunit_verdict` fails `EmittedSpecialToken(<think>)`; exonerated
+  by matrix (flags off ⇒ same; registry sys 0.8.1 ⇒ same; pre-arc
+  82a7209 ⇒ same, byte-identical). Instrumented probe: the Qwen3.6
+  stock template PRE-OPENS the thought, and at seed 42 the model's
+  first token is a duplicate single-token opener (248068) inside the
+  open thought; `</think>` and the JSON that follows are flawless.
+  Red since #101 containment landed 2026-07-29 (test hadn't run
+  since — it always did this; nobody was looking). Fix filed as
+  **#107**: dialect-aware opener ban (opener banned when the template
+  pre-opens; closer stays exempt as the trigger). Don't re-bisect
+  this; the A/B/C/D matrix is in the issue.
 
 ## Open follow-ups (queue for a future session)
 
