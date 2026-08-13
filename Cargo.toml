@@ -122,7 +122,7 @@ schemars = { version = "1", optional = true }
 # (^1.0.0-alpha.7) unifies with ours. Example-only: nothing in src/
 # references it, and the implicit `agora-agentkit` feature gates the
 # example target.
-agora-agentkit = { version = "0.7", optional = true, features = ["seed"] }
+agora-agentkit = { version = "0.12", optional = true, features = ["seed"] }
 
 
 [features]
