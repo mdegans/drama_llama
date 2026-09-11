@@ -41,6 +41,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A model-emitted stray `</think>` is masked at the sampler whenever
+  the render has already closed the turn's thought (#109).** The #107 opener
+  ban had no closer counterpart: the standing emit ban exempts the
+  closer unconditionally (it is the phase-split trigger), so under a
+  thinking-off render (Qwen's `<think>\n\n</think>\n\n` stub, Gemma
+  4's `<channel|>` stub, a prefilled closed thought) a thinking-native
+  model that still wants to reason — observed on Qwen 3.6 after a
+  `tool_result`, when the transcript pulls it toward a tool it was not
+  given — reasons in the open and then closes the thought it never
+  opened. #101's containment rightly rejected the bare closer, three
+  identical attempts deep, and every retry of that prompt failed the
+  same way: a deterministic 500 that wedged the calling agent for
+  good. A per-call `reasoning_closer_ban` (the closer's specials, EOG
+  excluded) is now unioned into `banned_specials` exactly when the
+  render ends with a closed stub — never on a pre-opened render, where
+  the closer is the model's job — so the reasoning simply continues as
+  prose the model finishes. Verified by A/B against the pre-rebase
+  llama.cpp: the failure predates the llama-cpp-sys update it was
+  first blamed on. Callers who want the reasoning *as* a thought
+  should enable `thinking` on the request; the stub is Anthropic's
+  `thinking: None` semantics, not a template failure.
 - **The eager output-config grammar no longer forces a duplicate
   `<think>` under a pre-opened render (#107).** Root cause, found by
   arm-by-arm config bisection against the raw predictor: with

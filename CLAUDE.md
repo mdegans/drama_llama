@@ -330,6 +330,15 @@ for the current arc:
   `just test moeflux` deliberately spans two configurations, and the
   `nextest list` count discipline that catches a backend-agnostic test
   being silently gated behind `llama-cpp`.
+- [`stray_think_closer_ban.md`](.claude/memory/stray_think_closer_ban.md)
+  — **read before blaming a llama.cpp update for a thinking regression,
+  or re-bisecting a `</think>`-in-free-text rejection.** 2026-09-11:
+  the Qwen 3.6 seed-agent wedge was A/B'd against the pre-rebase
+  llama.cpp and fails identically there; template detection, the
+  render, raw Metal inference and upstream `seq_rm` are all ruled out
+  with evidence. Cause: #107's opener ban had no closer counterpart, so
+  a thinking-off stub let the model reason in the open and close a
+  thought it never opened. Fix: the conditional closer ban.
 - [`truncated_call_containment.md`](.claude/memory/truncated_call_containment.md)
   — **read before proposing any "just ban the token" fix.** Why a
   truncated tool call cannot be prevented, only contained: the four
