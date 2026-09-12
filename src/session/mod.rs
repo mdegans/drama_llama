@@ -1130,6 +1130,21 @@ fn cursor_of(bp: PromptBreakpoint) -> SeedCursor {
     }
 }
 
+/// Tokenize a full or partial render. A template that emits the BOS
+/// piece itself (Mistral's `<s>`, Gemma's `<bos>`, Llama 3's
+/// `<|begin_of_text|>`) gets `add_special = false`, so a BOS-adding
+/// vocab does not prepend a second one (#93); `parse_special` still
+/// turns the piece into the real BOS id. A render without the piece
+/// keeps the vocab-driven auto-BOS. llama.cpp's own chat path strips
+/// the piece for the same reason (`common/chat.cpp`).
+fn tokenize_render<M: Model>(model: &M, text: &str, bos: &str) -> Vec<Token> {
+    if !bos.is_empty() && text.starts_with(bos) {
+        model.tokenize_special(text, false, true)
+    } else {
+        model.tokenize(text, true)
+    }
+}
+
 /// Whether a resumed snapshot's constraint-matcher positions are still
 /// valid for this call: true iff the cursor already covers every
 /// message, i.e. generation continues the snapshotted assistant turn
@@ -3547,7 +3562,7 @@ impl<B: Backend> Session<B> {
                 return Vec::new();
             }
             model
-                .tokenize(s, true)
+                .tokenize_special(s, false, true)
                 .into_iter()
                 .filter(|t| special.contains(t))
                 .collect()
@@ -3625,7 +3640,7 @@ impl<B: Backend> Session<B> {
                 return Vec::new();
             }
             model
-                .tokenize(s, true)
+                .tokenize_special(s, false, true)
                 .into_iter()
                 .filter(|t| special.contains(t))
                 .collect()
@@ -3707,7 +3722,7 @@ impl<B: Backend> Session<B> {
             model.special_tokens().into_iter().collect();
         let eog: HashSet<Token> = model.eog_tokens().into_iter().collect();
         let ban: BTreeSet<Token> = model
-            .tokenize(closer, true)
+            .tokenize_special(closer, false, true)
             .into_iter()
             .filter(|t| special.contains(t) && !eog.contains(t))
             .collect();
@@ -4091,7 +4106,11 @@ impl<B: Backend> Session<B> {
         // as 6 tokens instead of 1, producing a completely different
         // input for the model — diagnosed as the cause of cogito's
         // wrong-letter + loop behavior in strawberry.
-        let tokens = self.engine.model.tokenize(&rendered, true);
+        let tokens = tokenize_render(
+            &self.engine.model,
+            &rendered,
+            self.template.bos_token(),
+        );
 
         // Grammar (if any) is prepended so it runs first and narrows
         // candidates down to grammar-legal tokens before user filters
@@ -4226,7 +4245,11 @@ impl<B: Backend> Session<B> {
     ) -> Result<(Vec<CacheEntry>, Vec<[u8; 32]>, [u8; 32]), SessionError> {
         use crate::backend::Vision as _;
         let plain = |text: &str| {
-            let tokens = self.engine.model.tokenize(text, true);
+            let tokens = tokenize_render(
+                &self.engine.model,
+                text,
+                self.template.bos_token(),
+            );
             (
                 entries_from_tokens(tokens),
                 Vec::new(),
@@ -4269,7 +4292,11 @@ impl<B: Backend> Session<B> {
         for (i, segment) in split.segments.iter().enumerate() {
             if !segment.is_empty() {
                 let tokens = if i == 0 {
-                    self.engine.model.tokenize(segment, true)
+                    tokenize_render(
+                        &self.engine.model,
+                        segment,
+                        self.template.bos_token(),
+                    )
                 } else {
                     self.engine.model.tokenize_special(segment, false, true)
                 };
@@ -7505,6 +7532,28 @@ mod tests {
         seed_prose_block(&mut state, &block, &rep, &SeedMock);
     }
 
+    /// #93: a render that already starts with the BOS piece tokenizes
+    /// with `add_special` off, so a BOS-adding vocab does not prepend a
+    /// second BOS; a render without the piece keeps the auto-BOS.
+    /// `FoldMock` renders every piece as "x", so "x" is its BOS piece.
+    #[test]
+    fn test_tokenize_render_single_bos() {
+        let with = tokenize_render(&FoldMock, "x alpha beta", "x");
+        assert_eq!(
+            with,
+            FoldMock::words("x alpha beta"),
+            "template-emitted BOS must not gain an auto-BOS"
+        );
+        let without = tokenize_render(&FoldMock, "alpha beta", "x");
+        assert_eq!(
+            without[0],
+            FoldMock::BOS,
+            "auto-BOS stays without the piece"
+        );
+        let no_piece = tokenize_render(&FoldMock, "alpha beta", "");
+        assert_eq!(no_piece[0], FoldMock::BOS, "empty piece never matches");
+    }
+
     /// BOS-adding mock for the #106 fold arms: `tokenize` prepends BOS
     /// the way llama.cpp does on BOS-vocabs; `tokenize_special`
     /// honors `add_special` — exactly the asymmetry the tool arms rely
@@ -9299,6 +9348,63 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[cfg(feature = "llama-cpp")]
+    /// Mistral Small 4, resolved like `tests/session_mistral4.rs`:
+    /// `$DRAMA_LLAMA_MISTRAL_MODEL`, else the conventional quants under
+    /// `models/`. `None` skips; never `model.gguf`.
+    fn mistral_model_path() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("DRAMA_LLAMA_MISTRAL_MODEL") {
+            let p = std::path::PathBuf::from(p);
+            return p.exists().then_some(p);
+        }
+        [
+            "models/Mistral-Small-4-119B-2603-UD-Q4_K_XL.gguf",
+            "models/Mistral-Small-4-119B-2603-UD-IQ3_S.gguf",
+        ]
+        .iter()
+        .map(|rel| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+        })
+        .find(|p| p.exists())
+    }
+
+    /// #93 end to end: Mistral's template emits `<s>` and llama.cpp's
+    /// pixtral vocab has `add_bos`, so a prepared prompt used to start
+    /// with two BOS tokens. Now exactly one.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "long running, requires a Mistral Small 4 GGUF"]
+    fn test_mistral_prepared_prompt_single_bos() {
+        use misanthropic::prompt::message::Role;
+
+        let Some(path) = mistral_model_path() else {
+            eprintln!("no Mistral Small 4 GGUF found; skipping");
+            return;
+        };
+        let mut session =
+            crate::LlamaCppSession::from_path(path).unwrap().quiet();
+        let prompt = crate::Prompt {
+            system: Some(crate::Content::text("Be brief.")),
+            messages: vec![crate::Message {
+                role: Role::User,
+                content: crate::Content::text("Name a primary color."),
+            }],
+            max_tokens: std::num::NonZeroU32::new(8).unwrap(),
+            ..Default::default()
+        };
+        let rendered = session
+            .template
+            .render_with(&prompt, &session.render_opts)
+            .unwrap();
+        assert!(
+            rendered.starts_with(session.template.bos_token()),
+            "premise: the Mistral template emits BOS itself"
+        );
+        let bos = session.engine.model.bos();
+        let (tokens, _, _) = session.prepare_call(&prompt, false).unwrap();
+        assert_eq!(tokens[0], bos, "one BOS from the template");
+        assert_ne!(tokens[1], bos, "no second BOS from the vocab (#93)");
+    }
+
     fn model_path() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("models/model.gguf")

@@ -54,6 +54,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **No more double BOS on add_bos models (#93).** Mistral's template
+  emits `<s>` itself and llama.cpp's pixtral/tekken vocab has
+  `add_bos`, and every render was tokenized with `add_special = true`,
+  so each prepared prompt (and every cache-breakpoint partial) began
+  `BOS BOS` — the `check_double_bos_eos` warning that fired 3 to 5
+  times per Mistral request. Gemma 4 and Llama 3 templates have the
+  same shape. `tokenize_render` now tokenizes a render that already
+  starts with the BOS piece with `add_special` off (llama.cpp's chat
+  path strips the piece for the same reason); renders without it keep
+  the auto-BOS. The three emit-ban sites tokenize their markers the
+  same way, so BOS no longer lands in the ban sets by accident. Cached
+  Mistral prefixes change by one token, so each agent pays one cold
+  prefill after upgrade.
 - **A model-emitted stray `</think>` is masked at the sampler whenever
   the render has already closed the turn's thought (#109).** The #107 opener
   ban had no closer counterpart: the standing emit ban exempts the
