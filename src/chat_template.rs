@@ -756,9 +756,19 @@ fn render_partial(
     opts: &RenderOptions,
     up_to: PromptBreakpoint,
 ) -> Result<String, ChatTemplateError> {
+    // Everything the template can see besides `messages` must carry
+    // over, or the partial is not a prefix of the full render and
+    // gets dropped. `thinking` reaches the template as
+    // `enable_thinking`; Mistral Small 4 writes it into the prompt
+    // PREFIX (`[MODEL_SETTINGS]{"reasoning_effort": ...}`), so a
+    // partial rendered with it unset diverged from every thinking-on
+    // full render and the model lost every breakpoint (#93 follow-up,
+    // 2026-09-12). Qwen only reads it at the generation tail, which
+    // partials never render, so it never showed there.
     let truncated = match up_to {
         PromptBreakpoint::AfterTools => Prompt {
             tools: prompt.tools.clone(),
+            thinking: prompt.thinking,
             // Carry the system content too. Every modern template
             // (Qwen3, Llama 3.1, Hermes, Cogito) coalesces tools into
             // the system block, so a "tools-only, no system" truncation
@@ -776,12 +786,14 @@ fn render_partial(
             tools: prompt.tools.clone(),
             system: prompt.system.clone(),
             messages: Vec::new(),
+            thinking: prompt.thinking,
             ..Prompt::default()
         },
         PromptBreakpoint::AfterMessage(i) => Prompt {
             tools: prompt.tools.clone(),
             system: prompt.system.clone(),
             messages: prompt.messages[..=i].to_vec(),
+            thinking: prompt.thinking,
             ..Prompt::default()
         },
     };
@@ -2495,6 +2507,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(partial, expected);
+    }
+
+    /// A template that writes `enable_thinking` into the prompt
+    /// prefix (Mistral Small 4's `[MODEL_SETTINGS]` shape): every
+    /// partial must be a byte prefix of the full render when the
+    /// request enables thinking. Before the fix the partial rendered
+    /// with thinking unset and diverged at the switch.
+    #[test]
+    fn test_render_with_breakpoints_carries_thinking_into_partials() {
+        use misanthropic::prompt::thinking::Thinking;
+        let src = "[SETTINGS]{{ 'on' if enable_thinking else 'off' }}\
+                   [/SETTINGS]{% for m in messages %}[{{ m['role'] }}]\
+                   {{ m['content'] }}{% endfor %}"
+            .to_owned();
+        let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
+        let prompt = Prompt {
+            system: Some(Content(vec![Block::Text {
+                text: Cow::Borrowed("sys"),
+                cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
+            }])),
+            messages: vec![
+                cached_user_msg("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: Content::text("hello"),
+                },
+                cached_user_msg("again"),
+            ],
+            ..Prompt::default()
+        }
+        .thinking(Thinking::Enabled {
+            budget_tokens: std::num::NonZeroU32::new(64).unwrap(),
+            display: None,
+        });
+        let out = t
+            .render_with_breakpoints(&prompt, &RenderOptions::default())
+            .unwrap();
+        assert!(out.text.starts_with("[SETTINGS]on"), "{}", out.text);
+        assert_eq!(out.partials.len(), 3);
+        for (bp, _, partial) in &out.partials {
+            assert!(
+                out.text.starts_with(partial.as_str()),
+                "{bp:?} is not a byte prefix of the full render:\n  \
+                 full:    {:?}\n  partial: {:?}",
+                out.text,
+                partial
+            );
+        }
     }
 
     #[test]

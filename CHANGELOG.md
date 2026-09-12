@@ -54,6 +54,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Cache-breakpoint partials now carry the request's `thinking`.**
+  `render_partial` built its truncated prompt with `..Prompt::default()`,
+  dropping `thinking`, so every partial rendered with
+  `enable_thinking = false`. Mistral Small 4 writes that switch into
+  the prompt prefix (`[MODEL_SETTINGS]{"reasoning_effort": ...}`), so
+  under a thinking-on request no partial was a byte prefix of the full
+  render and the entry-prefix check silently dropped every breakpoint:
+  slots held only the 5-minute tip, new agents found no anchor in the
+  shared system+tools prefix, and any turn whose re-render was not
+  byte-stable re-prefilled from zero. Surfaced 2026-09-12 when the
+  Agora runner began sending `thinking`; Qwen was unaffected because
+  its switch only shapes the generation tail, which partials never
+  render. Pinned model-free with a prefix-switch template.
 - **No more double BOS on add_bos models (#93).** Mistral's template
   emits `<s>` itself and llama.cpp's pixtral/tekken vocab has
   `add_bos`, and every render was tokenized with `add_special = true`,
