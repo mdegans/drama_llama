@@ -68,9 +68,11 @@ pub struct SamplerState {
     pub(crate) deferred: Option<DeferredMatcher>,
     /// Mirostat learning value (`None` until the first mirostat step).
     pub(crate) mu: Option<f32>,
-    /// Working RNG. Serialized as its full state — a restored snapshot
-    /// continues the exact stream (resume ≠ restart; the *restart*
-    /// seed lives in config/per-call options).
+    /// Working RNG. Serialized as its full state so a snapshot
+    /// round-trips bit-exactly; the Session's unseeded resume path
+    /// reseeds it on load (a retry must be a fresh draw — see
+    /// `Session::build_initial_state`), so the exact stream only
+    /// continues where a caller restores a snapshot directly.
     pub(crate) rng: rand_pcg::Pcg64Mcg,
     /// Repetition-penalty accumulator.
     pub(crate) ngram_stats: NGramStats,

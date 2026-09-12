@@ -285,25 +285,64 @@ fn fork_with_seed_is_reproducible() {
     assert_eq!(a, b, "seeded fork must reproduce exactly");
 }
 
-/// Resume determinism at a prompt breakpoint: with no seed, an
+/// Grabs the whole sampler state at the first sampled token.
+struct StateCapture {
+    out: Arc<Mutex<Option<drama_llama::SamplerState>>>,
+}
+
+impl ProbeHook for StateCapture {
+    fn on_token(&mut self, ctx: ProbeCtx<'_>) {
+        let mut slot = self.out.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(ctx.state.clone());
+        }
+    }
+}
+
+/// Resume at a prompt breakpoint is a fresh draw: with no seed, an
 /// identical repeated prompt resumes the state snapshotted at the
-/// breakpoint — whose rng is the first call's *initial* rng (the fold
-/// never draws) — so the continuation is identical too. This pins the
-/// resume arm without relying on stochastic divergence.
+/// breakpoint but reseeds the rng, so a retry can land elsewhere.
+/// (Before 2026-09-12 the snapshot's rng carried, and a byte-identical
+/// retry replayed the byte-identical output — the Agora wedge.)
+///
+/// Pinned on the state, not the text: two resumed calls derive every
+/// other field identically from the same prompt at the same
+/// breakpoint (the cold ≡ incremental invariant above), so the
+/// captured states differ iff the rng was reseeded. Text divergence
+/// is logit-dependent (a peaked prompt under top-p can leave one
+/// candidate, which no rng can change) and is only printed.
 #[test]
 #[ignore = "long running, requires models/model.gguf"]
-fn resume_at_breakpoint_is_deterministic() {
+fn resume_at_breakpoint_resamples() {
+    let capture = |s: &mut LlamaCppSession| {
+        let out = Arc::new(Mutex::new(None));
+        s.engine_mut()
+            .set_probe_hook(Some(Box::new(StateCapture { out: out.clone() })));
+        let text = s.complete_text(&prompt_1()).expect("complete_text");
+        s.engine_mut().set_probe_hook(None);
+        let state = out.lock().unwrap().take().expect("probe saw no token");
+        (state, text)
+    };
     let mut s = session();
-    let a = s.complete_text(&prompt_1()).expect("call 1");
-    let b = s.complete_text(&prompt_1()).expect("call 2");
+    let (_, cold) = capture(&mut s);
+    let (a, text_a) = capture(&mut s);
     assert!(
         s.last_usage().cache_read_input_tokens.unwrap_or(0) > 0,
         "second call must hit the breakpoint",
     );
-    assert_eq!(
+    let (b, text_b) = capture(&mut s);
+    assert!(
+        s.last_usage().cache_read_input_tokens.unwrap_or(0) > 0,
+        "third call must hit the breakpoint",
+    );
+    println!("cold: {cold:?}\nresumed: {text_a:?}\nresumed: {text_b:?}");
+    assert_eq!(a.ngram_stats(), b.ngram_stats(), "same corpus");
+    assert_eq!(a.step(), b.step(), "same step");
+    assert_ne!(
         a, b,
-        "breakpoint resume replays the same rng position — identical \
-         prompts must produce identical continuations",
+        "two unseeded resumes at the same breakpoint carry the same \
+         sampler state at the first token: the resume arm is replaying \
+         the snapshot's rng instead of reseeding it",
     );
 }
 

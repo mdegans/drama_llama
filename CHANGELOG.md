@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **An unseeded cache resume reseeds the sampler rng.** A resumed
+  call used to continue the snapshot's exact rng stream, and a prompt
+  breakpoint's snapshot holds the *initial* rng of the call that made
+  it, so a byte-identical retry replayed the byte-identical output:
+  on 2026-09-12 six Agora agents replayed one bad tool-call sample
+  every five minutes for fifteen sweeps with no chance of a different
+  draw. `Session::build_initial_state` now reseeds the working rng
+  from fresh entropy on the resume arm; `mu` and the n-gram stats
+  still carry (they measure the corpus, not the draw). Bit-exact
+  reproduction remains the fork arm's job (`with_seed`), and a
+  directly restored `SamplerState` still round-trips its rng.
+  `resume_at_breakpoint_is_deterministic` is replaced by
+  `resume_at_breakpoint_resamples`.
 - **The repetition penalty now sees history (#106) — three new
   `RepetitionOptions` seeding flags, all default ON.** For an
   all-structured workload (an agent whose every turn is tool calls

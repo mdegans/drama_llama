@@ -3247,7 +3247,13 @@ impl<B: Backend> Session<B> {
     /// - No seed + a cached state at the matched breakpoint ⇒
     ///   **resume**: reconciled against this call's effective config
     ///   ([`SamplerState::resumed_from`]); the fold covers only the
-    ///   suffix past the matched cursor.
+    ///   suffix past the matched cursor. The working rng is reseeded
+    ///   from fresh entropy: a resumed call is a new draw, not a
+    ///   continuation of the snapshot's stream. Otherwise a retry of a
+    ///   byte-identical prompt replays the byte-identical output — the
+    ///   Agora wedge of 2026-09-12, where one bad sample was replayed
+    ///   fifteen sweeps in a row. Bit-exact reproduction is the fork
+    ///   arm's job (`with_seed`), not the cache's.
     /// - No seed + no cached state ⇒ **fresh**: fresh entropy, cold
     ///   fold from the top.
     ///
@@ -3286,6 +3292,11 @@ impl<B: Backend> Session<B> {
                 if !matcher_carry_valid(prompt.messages.len(), cursor) {
                     state.reset_constraints(config);
                 }
+                // Unseeded resume is a fresh draw (see the trichotomy
+                // docs above); the stream fields that measure the
+                // corpus (mu, n-gram stats) still carry.
+                state.rng =
+                    rand_pcg::Pcg64Mcg::new(rand::random::<u128>().max(1));
                 (state, cursor)
             }
             (Some(seed), _) => {
