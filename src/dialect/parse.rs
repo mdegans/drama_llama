@@ -671,7 +671,6 @@ impl<'a> Parser<'a> {
 
     /// Parse the call section beginning at the trigger.
     fn parse_calls(&mut self) {
-        let start = self.pos;
         let has_section = !self.syntax.section_start.is_empty();
         if has_section {
             debug_assert!(self.rest().starts_with(&self.syntax.section_start));
@@ -679,6 +678,14 @@ impl<'a> Parser<'a> {
         }
 
         loop {
+            // Where *this* call begins. Degradation below is scoped to
+            // it, not to `start`: every call parsed so far is already a
+            // `ToolUse` block, and degrading from the section start
+            // would re-emit them a second time as `Text` — under
+            // `Leniency::Final` that rendered a 25-call turn as 50
+            // (Mistral's `[TOOL_CALLS]` loop, cut by `max_tokens`
+            // mid-call, `session_mistral4::emission_round_trips_…`).
+            let call_start = self.pos;
             // Per-call opener (when distinct from the section).
             if !self.syntax.per_call_start.is_empty()
                 && !self.eat(&self.syntax.per_call_start.clone())
@@ -716,28 +723,28 @@ impl<'a> Parser<'a> {
                     // Loop continues; opener consumed at loop head.
                 }
                 CallOutcome::Incomplete => {
-                    self.incomplete(start);
+                    self.incomplete(call_start);
                     return;
                 }
                 CallOutcome::Malformed => {
-                    // Degrade the whole section from the trigger to
-                    // the next landmark (or end) into Text — nothing
-                    // silently dropped; Session decides severity.
-                    // Step one *char* past the trigger start — a
-                    // byte step slices mid-char when a derived
-                    // trigger opens with a multi-byte char.
-                    let step = self.text[start..]
+                    // Degrade this call, from its opener to the next
+                    // landmark (or end), into Text — nothing silently
+                    // dropped; Session decides severity. Step one
+                    // *char* past the opener — a byte step slices
+                    // mid-char when a derived trigger opens with a
+                    // multi-byte char.
+                    let step = self.text[call_start..]
                         .chars()
                         .next()
                         .map(char::len_utf8)
                         .unwrap_or(1);
-                    let upto = match self.text[start + step..]
+                    let upto = match self.text[call_start + step..]
                         .find(self.syntax.trigger())
                     {
-                        Some(next) => start + step + next,
+                        Some(next) => call_start + step + next,
                         None => self.text.len(),
                     };
-                    let chunk = self.text[start..upto].to_string();
+                    let chunk = self.text[call_start..upto].to_string();
                     self.push_text(&chunk);
                     self.pos = upto;
                     return;
@@ -748,8 +755,10 @@ impl<'a> Parser<'a> {
         if has_section && !self.syntax.section_end.is_empty() {
             let se = self.syntax.section_end.clone();
             if !self.eat_ws_tolerant(&se) && self.rest().trim().is_empty() {
-                // Closer not yet generated.
-                self.incomplete(start);
+                // Closer not yet generated. The calls parsed so far
+                // stand; only what follows them is incomplete.
+                let after_calls = self.pos;
+                self.incomplete(after_calls);
             }
         }
         // Swallow one trailing newline after the call section.
@@ -1816,6 +1825,72 @@ mod tests {
                 calls[0].1, &input,
                 "{:?} emission {emission:?}",
                 syntax.family
+            );
+        }
+    }
+
+    /// A multi-call section whose *last* call is cut off (the model ran
+    /// out of `max_tokens` mid-JSON — Mistral's `[TOOL_CALLS]` loop is
+    /// the production case) degrades only that call to `Text`. The
+    /// complete calls before it are `ToolUse` blocks and must not be
+    /// re-emitted inside the degraded text: degrading from the
+    /// *section* start did exactly that, and a 25-call turn re-rendered
+    /// as 50 (`session_mistral4::emission_round_trips_…`). The
+    /// truncated call itself is unrecoverable (half a JSON object has
+    /// no representation) and stays text — `Session` contains it.
+    #[test]
+    fn truncated_last_call_does_not_duplicate_the_complete_ones() {
+        let t = tool("get_weather");
+        for syntax in [CallSyntax::qwen_xml(), CallSyntax::gemma4()] {
+            let a = serde_json::json!({"city": "Paris", "days": 1});
+            let b = serde_json::json!({"city": "Oslo", "days": 2});
+            let complete = render_reference(
+                &syntax,
+                &[("get_weather", &a), ("get_weather", &b)],
+            )
+            .expect("representable");
+            // A third call, cut mid-arguments: take the two-call render
+            // and append the third's opener plus a byte-truncated
+            // prefix of a call body.
+            let third = render_reference(&syntax, &[("get_weather", &b)])
+                .expect("representable");
+            let cut = &third[..third.len() * 2 / 3];
+            let emission = format!("{complete}{cut}");
+
+            let parsed =
+                parse_text(&syntax, &[&t], &emission, false, Leniency::Final);
+            let calls = calls_of(&parsed.blocks);
+            assert_eq!(
+                calls.len(),
+                2,
+                "{:?}: {emission:?} → {:#?}",
+                syntax.family,
+                parsed.blocks
+            );
+            assert_eq!(calls[0].1, &a);
+            assert_eq!(calls[1].1, &b);
+            let texts: Vec<&str> = parsed
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text { text, .. } => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            // Exactly one degraded block, holding the cut call and
+            // nothing of the two that parsed.
+            assert_eq!(texts.len(), 1, "{:?}: {:#?}", syntax.family, texts);
+            assert!(
+                !texts[0].contains("Paris"),
+                "{:?}: degraded text re-emits a parsed call: {:?}",
+                syntax.family,
+                texts[0]
+            );
+            assert!(
+                emission.ends_with(texts[0]),
+                "{:?}: degraded text is not the emission's tail: {:?}",
+                syntax.family,
+                texts[0]
             );
         }
     }

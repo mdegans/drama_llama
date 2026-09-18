@@ -54,6 +54,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A truncated last tool call no longer re-emits the complete calls
+  before it.** `parse_calls` degraded from the *section* start on an
+  incomplete or malformed call, so under `Leniency::Final` every call
+  already parsed into a `ToolUse` block was pushed a second time inside
+  the degraded `Text` — a 25-call Mistral `[TOOL_CALLS]` turn cut by
+  `max_tokens` re-rendered as 50 calls, unreachable to any cache
+  breakpoint. Degradation is now scoped to the call it happened in; the
+  cut call itself is still unrepresentable (half a JSON object) and
+  still degrades to text for `Session` to contain. Latent since #85;
+  surfaced by `session_mistral4::emission_round_trips_through_parse_
+  and_render` once the tool-call loop there started reproducing.
 - **Cache-breakpoint partials now carry the request's `thinking`.**
   `render_partial` built its truncated prompt with `..Prompt::default()`,
   dropping `thinking`, so every partial rendered with
