@@ -17,6 +17,16 @@ emitted the same call 26x until the budget truncated it mid-string.
 **Replayed unchanged and passed**, so it is stochastic and was never
 diagnosed — no fix was applied, and nothing here is established.
 
+**2026-09-19 — `n_ubatch = 31` retired from the Mistral suite.** With
+Mike's Metal fix (llama.cpp `abd41adf5`, gating the `mul_mm_id` src1
+rescale behind `ggml_prec`; local `[patch.crates-io]` until the sys
+crate ships it) the suite runs 9/9 at the default micro-batch with no
+`NonFinite`, and faster — `auto_tool_choice` 42 s → 15 s, the suite
+119 s → 83 s — because prefill is back on the MMA path. The escape
+hatch stays available on `LlamaCppOptions` for the next kernel that
+needs it; a `NonFinite` from this suite now means the sys crate in use
+predates the fix. Bench (512 vs 1024, ABBA) is Mike's run.
+
 **2026-09-18/19 — diagnosed. Two things stacked; one was a bug.**
 
 *The bug (fixed, `912e20f`):* `parse_calls` degraded from the

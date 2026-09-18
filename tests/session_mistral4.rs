@@ -96,20 +96,22 @@ fn load_session() -> Option<drama_llama::LlamaCppSession> {
          and re-run.",
         sidecar.display()
     );
-    // `n_ubatch = 31` is load-bearing, not tuning: on Metal this model
-    // returns an all-NaN vocabulary for any micro-batch of >=32 tokens
-    // (f16 overflow of its layer-32 activations in the half-precision
-    // `mul_mm_id` MoE matmul; the `mul_mv_id` path below 32 carries the
-    // same values in f32 and is correct). Without this, every test here
-    // dies on `DecodeError::NonFinite` before it can assert anything.
-    // See `.claude/memory/mistral4_support_and_metal_nan.md`; drop it
-    // once upstream fixes the kernel.
+    // Default micro-batch. This used to be `.with_n_ubatch(31)`, and
+    // it was load-bearing: on Metal this model returned an all-NaN
+    // vocabulary for any micro-batch of >=32 tokens (f16 overflow of
+    // its layer-32 activations in the half-precision `mul_mm_id` MoE
+    // matmul; the `mul_mv_id` path below 32 carries the same values
+    // in f32). llama.cpp `abd41adf5` gates a src1 rescale behind
+    // `ggml_prec` and the overflow is gone — a 145-token prefill at
+    // the default micro-batch runs clean — so the escape hatch is
+    // retired here and the suite exercises the real prefill path. If
+    // these tests die on `DecodeError::NonFinite`, the sys crate in
+    // use predates that fix. See
+    // `.claude/memory/mistral4_support_and_metal_nan.md`.
     Some(
         drama_llama::LlamaCppSession::from_path_with(
             path,
-            drama_llama::LlamaCppOptions::default()
-                .with_n_ctx(8192)
-                .with_n_ubatch(31),
+            drama_llama::LlamaCppOptions::default().with_n_ctx(8192),
         )
         .expect("session load")
         .quiet(),
