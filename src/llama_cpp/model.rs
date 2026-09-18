@@ -1047,6 +1047,13 @@ impl crate::backend::Model for LlamaCppModel {
             .as_deref()
             .map(|s| s.to_string_lossy().into_owned())
     }
+
+    fn title(&self) -> Option<String> {
+        // Some quantizers write the key with an empty value; that is
+        // "no name", not a name.
+        self.get_meta("general.name")
+            .filter(|s| !s.trim().is_empty())
+    }
 }
 
 #[cfg(test)]

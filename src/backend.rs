@@ -660,6 +660,21 @@ pub trait Model: Send + Sync {
     fn display_name(&self) -> Option<String> {
         None
     }
+
+    /// The model's self-declared, human-readable name — GGUF
+    /// `general.name` ("Qwen3.6 35B A3B"), as opposed to
+    /// [`display_name`](Self::display_name), which is the load-path
+    /// basename a server uses as the model's API *id*. Feeds
+    /// `ModelInfo::display_name` on `/v1/models`; callers fall back to
+    /// the id when this is `None`.
+    ///
+    /// Semantic accessor rather than a key lookup, like
+    /// [`chat_template_source`](Self::chat_template_source): backends
+    /// without a notion of a declared name (moeflux's `config.json`
+    /// carries none reliably) inherit the default.
+    fn title(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Bundle of [`Decoder`] and [`Model`] implementations that together form a
