@@ -66,15 +66,26 @@ is the usual suspect — reboot and re-run before reading anything into
 it), but it changes nothing above: the production path never lets the
 loop happen, and the test path always could.
 
-*Follow-ups for Mike:* (1) decide whether `complete_text` should get
-the same `grammar_complete` halt, or the round-trip test should go
-through `complete_blocks` + render — as written, it passes today only
-because the parser fix makes a 27-call truncated turn round-trip,
-which is not what it means to test; (2) the Metal patch handled a
-145-token prefill at the default micro-batch with no NaN (blallama),
-and the test also ran clean without `with_n_ubatch(31)` — the
-workaround can likely go once the patch ships, and Mike's ABBA bench
-(512/1024 ubatch, his run) decides the default.
+*Resolved the same night (Mike: "go with your recommendation"):*
+`complete_text` now halts on `grammar_complete()` like `run_call`.
+Every `complete_text` user is green on it (Mistral 9/9, Gemma 4 10/10,
+gpt-oss 11/11, `session` 15/15, `constrained_repetition`,
+`sampler_state_cache`). Two `session.rs` round-trips that went red
+after the parser fix were the same loop on Qwen (greedy, `r`/
+`strawberry` repeated to the budget) passing by the same accident —
+Qwen's template renders content first, so the duplicated section made
+the render *start* with the emission.
+
+**New open item — parallel tool calls never happen.** The grammar for
+a parallel section is `call (sep call)*`, whose state is *accepting*
+after the first call, and `grammar_complete()` is "any accepting
+stack" — so `run_call`'s one-shot halt ends every grammar-constrained
+turn after one call, on every path, and always has.
+`disable_parallel_tool_use` is plumbed but moot. #58's separator work
+is only reachable by the render/parse side today. Whether to allow N
+calls (halt only when the model *stops* extending — e.g. treat EOG-or-
+next-opener as the decision point) is a design call, not tonight's.
+The Metal `n_ubatch` follow-up is retired above.
 
 Correcting a wrong first read (Mike caught it): I called the default
 sampler "very wide". It is not. `SamplerConfig::default()` is TopK 1024

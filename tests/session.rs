@@ -492,16 +492,21 @@ fn complete_text_round_trips_through_parse_and_render() {
     );
 }
 
-/// #58 acceptance: a **well-formed multi-tool-call** turn round-trips
-/// byte-exact — `render(parse(raw)).starts_with(raw)` — the prefix-cache
-/// invariant. Uses **greedy** sampling so emission is deterministic and
-/// well-formed: the invariant covers grammar-forced shapes, and greedy
-/// takes the distribution's mode, sidestepping the sampler-induced
-/// grammar-legal garbage that is a separate concern (#61). Regression
-/// guard for the inter-call separator (`call_separator`): before the fix
-/// the model emitted `</tool_call><tool_call>` while the template
-/// re-rendered `</tool_call>\n<tool_call>`, so every N>=2-call turn
-/// failed the byte-prefix check.
+/// #58 acceptance: a grammar-forced call turn round-trips byte-exact —
+/// `render(parse(raw)).starts_with(raw)` — the prefix-cache invariant,
+/// under **greedy** sampling so the emission is deterministic. Also the
+/// regression guard for the inter-call separator (`call_separator`):
+/// before #58 the analyzer captured none, so the grammar let the model
+/// emit `</tool_call><tool_call>` while the template re-rendered
+/// `</tool_call>\n<tool_call>`.
+///
+/// This used to demand a **multi**-call emission and got one — but only
+/// because `complete_text` ran on past the grammar's accept state and
+/// Qwen, greedy, repeated the same call until `max_tokens` cut one
+/// mid-structure (2026-09-19). `complete_text` now halts where
+/// `run_call` always has, on `grammar_complete()`, which is the first
+/// accepting state of `call (sep call)*` — one call. So the separator is
+/// checked on the analyzed dialect directly, which is what #58 fixed.
 #[test]
 #[ignore = "requires model"]
 fn multi_call_round_trips_under_greedy() {
@@ -517,6 +522,11 @@ fn multi_call_round_trips_under_greedy() {
     // The fix in one line: the analyzer must have captured the
     // template's inter-call separator.
     println!("call_separator = {:?}", session.dialect().call_separator);
+    assert_eq!(
+        session.dialect().call_separator,
+        "\n",
+        "#58: the analyzer must capture the template's inter-call separator"
+    );
 
     let render_opts = RenderOptions::default()
         .with_generation_prompt(true)
@@ -533,9 +543,10 @@ fn multi_call_round_trips_under_greedy() {
 
     let raw = session.complete_text(&prompt).expect("complete_text");
     println!("=== raw ===\n{raw}\n===");
-    assert!(
-        raw.matches("<tool_call>").count() >= 2,
-        "expected a multi-call turn to exercise the separator; got {raw:?}"
+    assert_eq!(
+        raw.matches("<tool_call>").count(),
+        1,
+        "one grammar-complete call per turn; got {raw:?}"
     );
 
     let blocks = parse_with_dialect(&session, &prompt, &raw, pre_opened);
@@ -543,10 +554,7 @@ fn multi_call_round_trips_under_greedy() {
         .iter()
         .filter(|b| matches!(b, Block::ToolUse { .. }))
         .count();
-    assert!(
-        n_calls >= 2,
-        "parser must surface the >=2 calls; got {blocks:?}"
-    );
+    assert_eq!(n_calls, 1, "parser must surface the call; got {blocks:?}");
     let assistant: AssistantMessage = blocks.into_iter().collect();
 
     let mut follow_up = prompt.clone();

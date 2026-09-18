@@ -5500,6 +5500,12 @@ impl<B: Backend> Session<B> {
     /// happens automatically whenever `prompt.tool_choice` is
     /// `Some(Method | Any)` and the tool list is non-empty.
     ///
+    /// Generation halts once any active grammar reaches its accept
+    /// state, exactly as the `complete*` family does — the "two views
+    /// of the same bytes" contract above requires the same stopping
+    /// rule on both sides. To watch what the model would do *past*
+    /// the grammar, use [`Self::top_k_trace`].
+    ///
     /// # Prefix caching
     ///
     /// Participates in prefix-cache reuse when
@@ -5593,6 +5599,19 @@ impl<B: Backend> Session<B> {
             }
             generated_count += 1;
             text.push_str(&piece);
+            // Same one-shot halt as `run_call`: once any active grammar
+            // reaches its accept state the turn is structurally over.
+            // This path used to run on to EOS / `max_tokens`, which is
+            // not "raw" so much as "post-grammar drift": with a
+            // forced tool call, Mistral emitted `[TOOL_CALLS]` over
+            // `</s>` 26 times and Qwen repeated the same call under
+            // greedy, every time, until the budget cut a call mid-JSON
+            // — behaviour no production path ever sees, because
+            // `run_call` halts here. For the post-grammar candidate
+            // picture use `top_k_trace`.
+            if predictor.grammar_complete() {
+                break;
+            }
         }
         // Capture the final sampler state for tip promotion, then drop
         // the predictor so it releases the engine borrow — we need

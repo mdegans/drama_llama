@@ -54,6 +54,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`Session::complete_text` halts on `grammar_complete()`**, exactly
+  where `run_call` (and so `complete_blocks` / `complete_response` /
+  blallama) always has. It used to run on to EOS or `max_tokens`, which
+  showed not "raw" output but post-grammar drift: a forced Mistral call
+  went `[TOOL_CALLS]` over `</s>` 26 times, and Qwen repeated the same
+  call under greedy, until the budget cut one mid-JSON — behaviour no
+  production path ever sees. The "two views of the same bytes" contract
+  between `complete_text` and `complete_response` needs the same
+  stopping rule on both sides; `top_k_trace` remains the way to look
+  past the grammar. `multi_call_round_trips_under_greedy` now asserts
+  the analyzed `call_separator` directly (#58's actual fix) and a
+  single-call byte-exact round-trip — the multi-call emission it relied
+  on was that loop.
 - **A truncated last tool call no longer re-emits the complete calls
   before it.** `parse_calls` degraded from the *section* start on an
   incomplete or malformed call, so under `Leniency::Final` every call
