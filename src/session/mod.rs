@@ -2666,6 +2666,25 @@ pub trait FromPath: Sized + Send + 'static {
         Self::from_path_with(path, Self::Options::default())
     }
 
+    /// What [`from_path_with`](Self::from_path_with)`(path, options)`
+    /// would advertise as its [`ModelInfo`] — the answer
+    /// [`Session::model_info`] gives once loaded — **without loading
+    /// weights and without writing any sidecar.** Reads only what the
+    /// backend keeps outside the tensors (llama.cpp: a `vocab_only`
+    /// load; moeflux: the tokenizer and config JSON), then walks the
+    /// same template ladder the load would (template sidecar → baked
+    /// replacement → embedded, then the dialect sidecar) so the
+    /// `thinking` capability agrees with the loaded dialect.
+    ///
+    /// Cheap enough to call per request but not free (a vocab build is
+    /// tens of milliseconds); [`Catalog`](crate::Catalog) caches it.
+    ///
+    /// [`ModelInfo`]: misanthropic::model::ModelInfo
+    fn peek(
+        path: &std::path::Path,
+        options: &Self::Options,
+    ) -> Result<misanthropic::model::ModelInfo, SessionError>;
+
     /// [`Self::from_path_with`] on the blocking pool.
     #[cfg(feature = "tokio")]
     async fn from_path_async(
@@ -2697,6 +2716,101 @@ impl FromPath for Session<LlamaCppBackend> {
             &dialect_sidecar,
         ))
     }
+
+    fn peek(
+        path: &std::path::Path,
+        options: &Self::Options,
+    ) -> Result<misanthropic::model::ModelInfo, SessionError> {
+        // `vocab_only`: header, metadata, and vocabulary — everything
+        // `Model` answers from — with the tensors never mapped in. The
+        // GPU is untouched, so this is safe beside a live session.
+        let mut params = options.model_params();
+        params.vocab_only = true;
+        let started = std::time::Instant::now();
+        let model =
+            crate::LlamaCppModel::from_file(path.to_path_buf(), Some(params))
+                .ok_or_else(|| NewError::Model {
+                path: path.to_path_buf(),
+            })?;
+        let vocab = started.elapsed();
+        let info = peek_info(
+            &model,
+            options.context_params().n_ctx,
+            crate::sidecar::mmproj_path(path).is_some(),
+            &llama_cpp_template_sidecar_path(path),
+            &llama_cpp_dialect_sidecar_path(path),
+        );
+        tracing::debug!(
+            model = %info.id,
+            vocab_ms = vocab.as_millis() as u64,
+            dialect_ms = (started.elapsed() - vocab).as_millis() as u64,
+            "peeked",
+        );
+        Ok(info)
+    }
+}
+
+/// The [`FromPath::peek`] tail shared by every backend, once the
+/// backend has produced its weightless [`Model`]: the template ladder
+/// for the dialect, the context-window sanity check, and the
+/// `Advertised` → `ModelInfo` mapping in `catalog`.
+///
+/// The ladder mirrors what the load ends up with — rung 1
+/// `*.template.jinja` sidecar, rung 2 [`crate::baked`] replacement of a
+/// recognized embedded template, rung 3 the embedded template as-is —
+/// followed by the `dialect.toml` override. (One pathological
+/// divergence is accepted: a sidecar that fails to *compile* is skipped
+/// by the load but analyzed to the default dialect here.)
+fn peek_info<M: crate::backend::Model>(
+    model: &M,
+    n_ctx: u32,
+    image_input: bool,
+    template_sidecar: &std::path::Path,
+    #[allow(unused_variables)] dialect_sidecar: &std::path::Path,
+) -> misanthropic::model::ModelInfo {
+    let source = match crate::sidecar::load_template_source(template_sidecar) {
+        Ok(Some(sidecar)) => Some(sidecar),
+        _ => model.chat_template_source().map(|embedded| {
+            match crate::baked::detect(&embedded) {
+                Some(baked) => baked.replacement.to_string(),
+                None => embedded,
+            }
+        }),
+    };
+    #[allow(unused_mut)]
+    let mut dialect = match source {
+        Some(source) => analyze_dialect_source(model, &source),
+        None => crate::CallSyntax::default(),
+    };
+    #[cfg(feature = "toml")]
+    if let Ok(Some(sidecar)) = crate::sidecar::load_call_syntax(dialect_sidecar)
+    {
+        dialect = sidecar;
+    }
+
+    let n_ctx_train = model.context_size().max(0) as u32;
+    if n_ctx_train != 0 && n_ctx > n_ctx_train {
+        tracing::warn!(
+            model = model.display_name().unwrap_or_default(),
+            n_ctx,
+            n_ctx_train,
+            "configured context exceeds the trained window; advertising \
+             the trained window",
+        );
+    }
+
+    crate::catalog::Advertised {
+        id: model
+            .display_name()
+            .unwrap_or_else(|| "unknown".to_string()),
+        title: model.title(),
+        n_ctx,
+        n_ctx_train,
+        image_input,
+        thinking: dialect.reasoning.mode != crate::dialect::ReasoningMode::None,
+        modified: None,
+    }
+    .into()
 }
 
 #[cfg(feature = "llama-cpp")]
@@ -2756,6 +2870,35 @@ impl FromPath for Session<MoefluxBackend> {
                 &template_sidecar,
             ),
             &dialect_sidecar,
+        ))
+    }
+
+    fn peek(
+        parent: &std::path::Path,
+        _options: &Self::Options,
+    ) -> Result<misanthropic::model::ModelInfo, SessionError> {
+        // The model half is tokenizer + config JSON — already weightless.
+        // Named the way `MoefluxEngine::from_path_with` names it, so the
+        // id matches what a request addresses.
+        let mut model = crate::MoefluxModel::from_mlx_dir(&parent.join("mlx"))
+            .map_err(MoefluxEngineError::from)?;
+        if let Some(name) =
+            parent.file_name().map(|s| s.to_string_lossy().into_owned())
+        {
+            model.set_name(name);
+        }
+        // Context length is a compile-time constant of the moeflux
+        // variant (see `MoefluxOptions`), the same value the decoder
+        // reports once open.
+        let n_ctx = moeflux::riir::variants::MAX_SEQ_LEN
+            .try_into()
+            .unwrap_or(u32::MAX);
+        Ok(peek_info(
+            &model,
+            n_ctx,
+            false,
+            &parent.join("template.jinja"),
+            &parent.join("dialect.toml"),
         ))
     }
 }
@@ -3029,6 +3172,35 @@ impl<B: Backend> Session<B> {
     /// overridden by a sidecar or [`Self::with_dialect`].
     pub fn dialect(&self) -> &crate::CallSyntax {
         &self.dialect
+    }
+
+    /// What this session advertises on `/v1/models`: the loaded model's
+    /// id and title, the decoder's real context size (capped to the
+    /// trained window), and the capabilities the session can actually
+    /// honor — images iff a vision projector loaded, thinking iff the
+    /// dialect has a reasoning syntax. The same mapping
+    /// [`FromPath::peek`] produces without loading, so a listing and a
+    /// load never disagree. `created_at` is the epoch: a session doesn't
+    /// know its file; a [`Catalog`](crate::Catalog) fills it in.
+    pub fn model_info(&self) -> misanthropic::model::ModelInfo {
+        use crate::backend::Vision as _;
+        let model = &self.engine.model;
+        crate::catalog::Advertised {
+            id: model
+                .display_name()
+                .unwrap_or_else(|| "unknown".to_string()),
+            title: model.title(),
+            n_ctx: self.engine.n_ctx(),
+            n_ctx_train: model.context_size().max(0) as u32,
+            image_input: self
+                .engine
+                .vision()
+                .is_some_and(|v| v.supports_images()),
+            thinking: self.dialect.reasoning.mode
+                != crate::dialect::ReasoningMode::None,
+            modified: None,
+        }
+        .into()
     }
 
     /// Override the defaults used when compiling [`ToolChoice`] into a grammar

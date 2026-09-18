@@ -38,13 +38,13 @@
 
 use std::{
     num::{NonZeroU128, NonZeroUsize},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
 use axum::{
-    extract::{Json, State},
+    extract::{Json, Path as UrlPath, State},
     http::StatusCode,
     routing::{get, post},
     Router,
@@ -54,8 +54,9 @@ use drama_llama::{
     backend::{Backend, Model},
     cli::{BackendArgs, BackendKind},
     prompt::{AnthropicError, MessageResponse, Usage},
-    FromPath, ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
+    Catalog, FromPath, ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
 };
+use misanthropic::model::{ModelInfo, Models};
 use tokio::{sync::Mutex, task::spawn_blocking};
 use tracing::{error, info, instrument};
 
@@ -135,10 +136,12 @@ where
     Session<B>: FromPath,
 {
     args: Arc<Args>,
-    /// Load-time options for `B`, narrowed from [`Args::load`] once at
-    /// startup so an inapplicable flag is a refusal to boot rather than
-    /// a surprise on the first request.
-    load_options: <Session<B> as FromPath>::Options,
+    /// The models under [`Args::model_path`], described as the load
+    /// options (narrowed from [`Args::load`] once at startup, so an
+    /// inapplicable flag is a refusal to boot rather than a surprise on
+    /// the first request) would load them. Owns the `/v1/models`
+    /// metadata cache: disk once per model, memory thereafter.
+    catalog: Arc<Catalog<B>>,
     /// Sender into the JSONL writer task. `None` if `--record-json` wasn't
     /// given. Cloned per-request when installing the [`JsonlProbeRecorder`];
     /// all clones feed the same writer task / output file.
@@ -152,68 +155,9 @@ where
     session: Arc<Mutex<Option<Session<B>>>>,
 }
 
-/// List directory entries whose followed-symlink metadata satisfies `accept`.
-/// llama-cpp wants `is_file()` (one `.gguf` per model); moeflux wants
-/// `is_dir()` (one parent dir per model).
-///
-/// Uses `fs::metadata(path)` rather than `DirEntry::metadata()` or
-/// `file_type()`. **Only the first of the three follows symlinks** — this is a
-/// genuine trap, because `DirEntry::metadata()` reads like the one that would:
-/// it does not, and returns `is_symlink() == true` / `is_file() == false`, so a
-/// symlinked model is silently dropped from the listing. Mike's test layout
-/// symlinks `mlx` / `artifacts` / `root` into a single moeflux model dir, CI
-/// symlinks every `.gguf` in from a shared read-only `/models`, and the dir
-/// itself can be a symlink — all of those forms must enumerate.
-async fn list_entries<P>(
-    path: impl AsRef<Path>,
-    accept: P,
-) -> Result<Vec<String>, std::io::Error>
-where
-    P: Fn(&str, &std::fs::Metadata) -> bool,
-{
-    let mut read_dir = tokio::fs::read_dir(path).await?;
-    let mut models = vec![];
-    while let Some(entry) = read_dir.next_entry().await? {
-        // NOT `entry.metadata()`: that one does not traverse the link (it is
-        // `symlink_metadata` in all but name). Skip entries whose target is
-        // missing or unreadable — a dangling link is not a servable model.
-        let Ok(meta) = tokio::fs::metadata(entry.path()).await else {
-            continue;
-        };
-        let model = if let Ok(model) = entry.file_name().into_string() {
-            model
-        } else {
-            continue;
-        };
-        if !accept(&model, &meta) {
-            continue;
-        }
-        models.push(model)
-    }
-    Ok(models)
-}
-
-/// Resolve a requested model id against what's on disk. `Ok(None)` means serve
-/// as-requested; `Ok(Some(d))` means substitute the `--default-model`
-/// (unmodified Anthropic-SDK clients request `claude-*` ids); `Err` is the 404
-/// payload.
-fn resolve_model(
-    requested: &str,
-    models: &[String],
-    default_model: Option<&String>,
-) -> Result<Option<String>, AnthropicError> {
-    if models.iter().any(|m| m == requested) {
-        return Ok(None);
-    }
-    if let Some(d) = default_model {
-        if models.iter().any(|m| m == d) {
-            return Ok(Some(d.clone()));
-        }
-    }
-    Err(AnthropicError::NotFound {
-        message: format!("model not found: {requested}"),
-    })
-}
+// Listing and id resolution used to live here (`list_entries`,
+// `resolve_model`); they are `Catalog::list` / `Catalog::resolve` now,
+// alongside the metadata cache that `/v1/models` needs.
 
 /// Anthropic wire envelope for errors: `{"type":"error","error":{...}}`.
 /// Real clients (misanthropic included) parse errors through this
@@ -303,35 +247,90 @@ fn init_logging() {
     Registry::default().with(filter).with(fmt_layer).init();
 }
 
+/// The 404 for a model id that isn't on disk, in the wire envelope.
+fn model_not_found(id: &str) -> (StatusCode, Json<ErrorEnvelope>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(
+            AnthropicError::NotFound {
+                message: format!("model not found: {id}"),
+            }
+            .into(),
+        ),
+    )
+}
+
+/// `GET /v1/models` — every model on disk, loaded or not, as Anthropic's
+/// `{"data": [ModelInfo, …]}`. The first call per model reads its
+/// metadata off disk (a vocab-only load for llama.cpp — no weights, no
+/// GPU); later calls are served from the [`Catalog`]'s cache until the
+/// file changes. Runs on the blocking pool: the peek is I/O.
+async fn route_models<B>(State(state): State<AppState<B>>) -> Json<Models>
+where
+    B: Backend + 'static,
+    Session<B>: FromPath,
+{
+    let catalog = state.catalog.clone();
+    Json(spawn_blocking_or_bust(move || catalog.models()).await)
+}
+
+/// `GET /v1/models/{id}` — one model's [`ModelInfo`], or the same 404
+/// `/v1/messages` gives for an unknown id. `--default-model` is *not*
+/// substituted here: a listing that answers `claude-opus-5` with a GGUF
+/// would be lying to a client that is about to trust it.
+async fn route_model<B>(
+    State(state): State<AppState<B>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<ModelInfo>, (StatusCode, Json<ErrorEnvelope>)>
+where
+    B: Backend + 'static,
+    Session<B>: FromPath,
+{
+    let catalog = state.catalog.clone();
+    let name = id.clone();
+    spawn_blocking_or_bust(move || catalog.info(&name))
+        .await
+        .map(Json)
+        .ok_or_else(|| model_not_found(&id))
+}
+
+/// `GET /api/tags` — the ollama-shaped listing, derived from the same
+/// [`ModelInfo`]s as `/v1/models` so the two never disagree on what's
+/// there. Kept for clients that discover models the ollama way; the
+/// `details` block is filled as far as the catalog knows (llama.cpp's
+/// own server leaves the same fields blank).
 async fn route_tags<B>(
     State(state): State<AppState<B>>,
 ) -> Json<serde_json::Value>
 where
-    B: Backend,
+    B: Backend + 'static,
     Session<B>: FromPath,
 {
-    let names = list_entries(&state.args.model_path, B::is_supported_model)
-        .await
-        .unwrap_or_default();
-    let models: Vec<_> = names
-        .iter()
-        .map(|name| {
-            serde_json::json!({
-                "name": name,
-                "model": name,
-                "modified_at": "1970-01-01T00:00:00.000000000Z",
-                "size": 0,
-                "digest": "",
-                "details": {
-                    "format": "gguf",
-                    "family": "",
-                    "families": [],
-                    "parameter_size": "",
-                    "quantization_level": ""
-                }
+    let catalog = state.catalog.clone();
+    let models = spawn_blocking_or_bust(move || {
+        catalog
+            .models()
+            .into_iter()
+            .map(|info| {
+                let name = info.id.name().to_string();
+                serde_json::json!({
+                    "name": name,
+                    "model": name,
+                    "modified_at": info.created_at.to_rfc3339(),
+                    "size": catalog.size(&name).unwrap_or(0),
+                    "digest": "",
+                    "details": {
+                        "format": if B::NAME == "llama-cpp" { "gguf" } else { B::NAME },
+                        "family": "",
+                        "families": [],
+                        "parameter_size": "",
+                        "quantization_level": ""
+                    }
+                })
             })
-        })
-        .collect();
+            .collect::<Vec<_>>()
+    })
+    .await;
     Json(serde_json::json!({ "models": models }))
 }
 
@@ -353,16 +352,38 @@ where
     .await?;
 
     let session: Arc<Mutex<Option<Session<B>>>> = Mutex::from(None).into();
+    let catalog = Arc::new(Catalog::<B>::new(&args.model_path, load_options));
+
+    // Warm the `/v1/models` cache off the request path: a cold listing
+    // reads every model's metadata (a second or two each for llama.cpp),
+    // and the first client shouldn't be the one to pay for it. Requests
+    // are served meanwhile — cached entries never wait on a read in
+    // flight, and `/v1/messages` only needs the directory listing.
+    {
+        let catalog = catalog.clone();
+        spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let n = catalog.models().len();
+            info!(
+                event = "catalog_warm",
+                models = n,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "model catalog warmed",
+            );
+        });
+    }
 
     let mut app = Router::new()
         .route("/v1/messages", post(route_messages))
+        .route("/v1/models", get(route_models))
+        .route("/v1/models/{id}", get(route_model))
         .route("/api/tags", get(route_tags));
     if probe_bus.is_some() {
         app = app.route("/probe", axum::routing::get(route_probe_stream));
     }
     let app = app.with_state(AppState {
         args: args.into(),
-        load_options,
+        catalog,
         record_json_tx,
         probe_bus,
         session,
@@ -425,30 +446,38 @@ async fn shutdown_signal() {
     }
 }
 
+/// Load `model` from the catalog's directory with its options, and tell
+/// the catalog what the loaded session advertises — the decoder's real
+/// context size beats the peek's estimate, and the entry is now known
+/// to load.
 async fn load_session<B>(
-    root: impl AsRef<Path>,
+    catalog: Arc<Catalog<B>>,
     model: String,
-    options: <Session<B> as FromPath>::Options,
     no_penalty: bool,
     seed: Option<u128>,
 ) -> Result<Session<B>, (StatusCode, Json<ErrorEnvelope>)>
 where
-    B: Backend,
+    B: Backend + 'static,
     Session<B>: FromPath,
 {
-    let path = root.as_ref().join(&model);
+    let path = catalog.path_of(&model);
     tracing::info!(
         event = "load_model",
         backend = B::NAME,
         model,
         path = path.to_string_lossy().as_ref()
     );
-    // `from_path_async`, not `from_path`: loading is seconds of blocking
-    // file and GPU work and this is a reactor thread.
-    Session::<B>::from_path_async(path, options)
-        .await
-        .map(|s| configure_session(s, no_penalty, seed))
-        .map_err(map_session_err)
+    // On the blocking pool: loading is seconds of blocking file and GPU
+    // work and this is a reactor thread.
+    spawn_blocking_or_bust(move || {
+        let session =
+            Session::<B>::from_path_with(path, catalog.options().clone())?;
+        catalog.refresh(&model, session.model_info());
+        Ok(session)
+    })
+    .await
+    .map(|s| configure_session(s, no_penalty, seed))
+    .map_err(map_session_err)
 }
 
 async fn route_messages<B>(
@@ -459,37 +488,24 @@ where
     B: Backend + 'static,
     Session<B>: FromPath,
 {
-    let models =
-        match list_entries(&state.args.model_path, B::is_supported_model).await
-        {
-            Ok(models) => models,
-            Err(e) => {
-                let e = AnthropicError::NotFound {
-                    message: format!("Models could not be loaded: {e}"),
-                };
-                error!(error = %e);
-                return Err((StatusCode::NOT_FOUND, Json(e.into())));
-            }
-        };
-
-    match resolve_model(
-        &prompt.model.to_string(),
-        &models,
-        state.args.default_model.as_ref(),
-    ) {
-        Ok(None) => {}
-        Ok(Some(default)) => {
-            info!(
-                requested = %prompt.model,
-                served = %default,
-                "substituting --default-model for unknown id",
-            );
-            prompt.model = default.into();
-        }
-        Err(e) => {
-            error!(error = %e);
-            return Err((StatusCode::NOT_FOUND, Json(e.into())));
-        }
+    let catalog = state.catalog.clone();
+    let requested = prompt.model.to_string();
+    let default = state.args.default_model.clone();
+    let served = spawn_blocking_or_bust(move || {
+        catalog.resolve(&requested, default.as_deref())
+    })
+    .await
+    .map_err(|e| {
+        error!(error = %e);
+        (StatusCode::NOT_FOUND, Json(e.into()))
+    })?;
+    if prompt.model != served {
+        info!(
+            requested = %prompt.model,
+            served = %served,
+            "substituting --default-model for unknown id",
+        );
+        prompt.model = served.into();
     }
 
     complete(state, prompt).await
@@ -537,9 +553,8 @@ where
                 // the lock.
                 drop(session);
                 load_session(
-                    &state.args.model_path,
+                    state.catalog.clone(),
                     prompt.model.to_string(),
-                    state.load_options.clone(),
                     state.args.no_penalty,
                     state.args.seed,
                 )
@@ -548,9 +563,8 @@ where
         }
         None => {
             load_session(
-                &state.args.model_path,
+                state.catalog.clone(),
                 prompt.model.to_string(),
-                state.load_options.clone(),
                 state.args.no_penalty,
                 state.args.seed,
             )

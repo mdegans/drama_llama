@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use misanthropic::{model, response, CachedPrompt, Prompt, Quirks, Transport};
 
-use crate::{backend::Model as _, Backend, Session, SessionError, Token};
+use crate::{Backend, Session, SessionError, Token};
 
 /// A [`misanthropic::Transport`] over a locally-owned [`Session`] — see the
 /// module docs for the concurrency model.
@@ -40,8 +40,9 @@ impl<B: Backend> Clone for SessionTransport<B> {
 }
 
 impl<B: Backend> SessionTransport<B> {
-    /// Wrap `session`. The model's display name is snapshotted here as the
-    /// transport's advertised [`ModelInfo`](model::ModelInfo).
+    /// Wrap `session`. Its [`model_info`](Session::model_info) is
+    /// snapshotted here as the transport's advertised
+    /// [`ModelInfo`](model::ModelInfo).
     ///
     /// The session's prefix cache is switched **on**: this transport's
     /// [`quirks`](Transport::quirks) advertise breakpoint-keyed prefix
@@ -49,13 +50,7 @@ impl<B: Backend> SessionTransport<B> {
     /// breakpoints. (A no-op if the caller already enabled it.)
     pub fn new(session: Session<B>) -> Self {
         let session = session.with_prefix_cache(true);
-        let display_name = session
-            .engine()
-            .model
-            .display_name()
-            .unwrap_or_else(|| "unknown".to_string());
-        let model_info =
-            model::ModelInfo::new(display_name.clone(), display_name);
+        let model_info = session.model_info();
         Self {
             session: Arc::new(tokio::sync::Mutex::new(session)),
             model_info,

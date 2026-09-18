@@ -156,6 +156,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`GET /v1/models` and `GET /v1/models/{id}` on blallama**, in
+  misanthropic's `Models` / `ModelInfo` types, for every model on
+  disk — loaded or not — with real metadata: `display_name` from
+  GGUF `general.name` (new `Model::title`), token ceilings
+  `min(served n_ctx, n_ctx_train)` (what llama.cpp reports as
+  `n_ctx`), `created_at` from the file's mtime, and the capabilities
+  a session can honor (`structured_outputs` always; `image_input` iff
+  an mmproj sidecar is present; `thinking` iff the dialect has a
+  reasoning syntax). `/api/tags` is derived from the same entries
+  instead of hand-built with blank fields. Behind it: `Catalog<B>`
+  (a directory plus a per-process metadata cache, keyed by file
+  mtime+size, misses serialized through a peek lane so cached reads
+  never wait), `FromPath::peek` (a `vocab_only` load — no weights,
+  no GPU — walking the same template ladder as a load), and
+  `Session::model_info`, all through one `Advertised → ModelInfo`
+  mapping so a listing and a load never disagree (pinned by
+  `peek_agrees_with_load`). `SessionTransport::models` now advertises
+  the same rich entry instead of a basename stub. blallama warms the
+  cache at startup off the request path, stage-logged
+  (`read_model_metadata` / `model_metadata_read`).
 - **#96 regression suite, per model.** A shared scenario
   (`tests/common/tip.rs`) runs the downstream agent shape — sliding
   marker window, forced tool-call turns, honest tool results — plus

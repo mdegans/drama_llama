@@ -177,6 +177,18 @@ pub use session::{
 ))]
 pub use session::{LocalTransport, SessionTransport};
 
+// Gated like `session`: it is `FromPath::peek` plus a cache.
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub mod catalog;
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub use catalog::Catalog;
+
 mod probability;
 pub use probability::{InvalidProbability, Probability};
 

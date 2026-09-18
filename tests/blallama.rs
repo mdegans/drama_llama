@@ -3,9 +3,9 @@
 //! `Client` pointed at the local port — the same client a real
 //! consumer uses against api.anthropic.com.
 //!
-//! Covers `/api/tags` discovery, the `/v1/messages` happy path, and
-//! cross-request prompt caching through the server's shared session
-//! (the endpoint-level analog of `tests/session_cache.rs`).
+//! Covers `/v1/models` and `/api/tags` discovery, the `/v1/messages`
+//! happy path, and cross-request prompt caching through the server's
+//! shared session (the endpoint-level analog of `tests/session_cache.rs`).
 //!
 //! All tests need a GGUF in `models/`: `cargo test --test blallama --
 //! --ignored`.
@@ -142,6 +142,76 @@ fn tags_lists_models() {
     assert!(models[0]["name"]
         .as_str()
         .is_some_and(|n| n.ends_with(".gguf")));
+}
+
+/// `/v1/models` through the real client's `models()` — the consumer
+/// path, so this also proves the wire shape parses — plus the per-id
+/// route and its 404. Every model in `models/` is listed with metadata
+/// read from disk, none of them loaded.
+#[tokio::test]
+#[ignore = "long running, requires a GGUF in models/"]
+async fn v1_models_lists_every_model_unloaded() {
+    let server = spawn_server();
+    let client = client(server.port);
+
+    let started = Instant::now();
+    let models = client.models().await.expect("GET /v1/models");
+    let cold = started.elapsed();
+    assert!(!models.is_empty(), "no models listed from models/");
+    for info in &models {
+        assert!(info.id.name().ends_with(".gguf"), "{}", info.id);
+        assert!(!info.display_name.is_empty(), "{}", info.id);
+        assert!(info.max_input_tokens > 0, "{}: no context ceiling", info.id);
+        assert_eq!(info.max_tokens, info.max_input_tokens, "{}", info.id);
+        assert!(info.capabilities.structured_outputs == true, "{}", info.id);
+    }
+    // Same set as the ollama-shaped listing, in id order.
+    let tagged: Vec<String> = {
+        let body = http_get(server.port, "/api/tags");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let listed: Vec<String> =
+        models.iter().map(|m| m.id.name().to_string()).collect();
+    assert_eq!(listed, tagged);
+    assert!(listed.windows(2).all(|w| w[0] <= w[1]), "not sorted");
+
+    // Second listing is served from the catalog's cache. Not asserted
+    // on (a one-model CI box makes both calls fast); visible with
+    // `--nocapture`.
+    let started = Instant::now();
+    let again = client.models().await.expect("second GET /v1/models");
+    eprintln!(
+        "/v1/models: {} models, cold {cold:?}, cached {:?}",
+        again.len(),
+        started.elapsed()
+    );
+    assert_eq!(again.len(), models.len());
+
+    // Per-id route round-trips the listing entry.
+    let first = &models[0];
+    let body = http_get(server.port, &format!("/v1/models/{}", first.id));
+    let one: misanthropic::model::ModelInfo =
+        serde_json::from_str(&body).expect("ModelInfo JSON");
+    assert_eq!(one.id, first.id);
+    assert_eq!(one.display_name, first.display_name);
+    assert_eq!(one.max_input_tokens, first.max_input_tokens);
+    assert_eq!(one.created_at, first.created_at);
+
+    // Unknown id: the same envelope `/v1/messages` uses.
+    let body =
+        http_get(server.port, "/v1/models/claude-definitely-not-on-disk");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["type"], "not_found_error");
+    assert!(v["error"]["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("model not found")));
 }
 
 /// Unknown model id with no `--default-model` → Anthropic-shaped 404.

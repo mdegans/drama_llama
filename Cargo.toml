@@ -87,6 +87,9 @@ minijinja-contrib = { version = "2.5", features = ["pycompat"] }
 misanthropic = { version = "1.0.0-alpha.12", default-features = false, features = [
     "partial-eq",
 ] }
+# `ModelInfo::created_at` is a `DateTime<Utc>`; misanthropic does not
+# re-export chrono, so converting a file mtime into one needs it here.
+chrono = "0.4"
 
 axum = { version = "0.8", optional = true }
 async-trait = { version = "0.1", optional = true }

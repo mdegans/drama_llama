@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/mdegans/drama_llama/graph/badge.svg)](https://codecov.io/gh/mdegans/drama_llama)
-[![tests](https://img.shields.io/badge/tests-686-blue)](#testing)
+[![tests](https://img.shields.io/badge/tests-692-blue)](#testing)
 [![license](https://img.shields.io/badge/license-RAIL--S-lightgrey)](https://github.com/mdegans/drama_llama/blob/main/LICENSE.md)
 
 `drama_llama` runs language models on your own hardware behind an API shaped
@@ -150,7 +150,7 @@ the one below it.
 | **Images** | `media`, `mtmd` | `media` is pure Rust (decode via the `image` crate, never `mtmd`'s bundled `stb_image`); `mtmd` adds llama.cpp's multimodal backend. Images render out-of-band through a per-call random sentinel — the projector never sees prompt text. |
 | **Sampling** | *(always on)* | Greedy, temperature, top-k, top-p, min-p, tail-free, locally typical, Mirostat v1/v2, plus `SplitP`/`SplitL`/`Deny` which have no llama.cpp counterpart. Chained: each mode narrows the candidate set. |
 | **Repetition penalties** | *(always on)* | N-gram based, windowed and decaying, with category exclusions so common English or JSON punctuation isn't penalized. Region-aware inside grammar free-text spans. |
-| **HTTP server** | `axum` | `blallama` — an Anthropic-compatible `/v1/messages` server over a local model, with an SSE `/probe` channel. |
+| **HTTP server** | `axum` | `blallama` — an Anthropic-compatible `/v1/messages` + `/v1/models` server over a directory of local models, with an SSE `/probe` channel. |
 | **Accelerators** | `cuda`, `cuda_f16` | Metal is automatic on macOS. |
 | **Async** | `tokio` | `SessionTransport`, `FromPath::from_path_async`. |
 | **Sidecars** | `toml` | Per-model `sampling.toml` / `dialect.toml` / template files beside the GGUF. |
@@ -207,8 +207,8 @@ sampler-settings editor).
 
 ## Testing
 
-686 tests across 30 binaries in the default configuration — 540 that run in
-seconds and 146 that load real weights onto a real accelerator. The
+692 tests across 30 binaries in the default configuration — 544 that run in
+seconds and 148 that load real weights onto a real accelerator. The
 model-backed tier is `#[ignore]`d so the fast loop stays fast, and the whole
 topology — *which features* × *which tests* — lives in one place,
 [`scripts/test.py`]. The justfile delegates to that script, the git hooks call
