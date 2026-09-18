@@ -17,17 +17,54 @@ emitted the same call 26x until the budget truncated it mid-string.
 **Replayed unchanged and passed**, so it is stochastic and was never
 diagnosed — no fix was applied, and nothing here is established.
 
-*2026-09-18 update:* it reproduced twice in a row as
-`session_mistral4::emission_round_trips_through_parse_and_render`
-(same `count_letters` loop, `r`/`R` × `strawberry`/`StrawBerry`
-variants until `max_tokens` cut a call mid-JSON) during the `/v1/models`
-session — once in the full ignored tier, once replayed with that arc
-stashed (HEAD + Mike's uncommitted `[patch.crates-io]` llama-cpp-sys,
-the mul_mm_id f16 rescale gate, `abd41adf5`). So it is **not** the
-catalog work. Whether it is the patch (Mistral's Metal numerics are
-exactly what it changes) or the untuned sampler above is undetermined:
-that needs a replay against the registry sys crate, which is the
-patch-validation arc's question, not this one's.
+**2026-09-18/19 — diagnosed. Two things stacked; one was a bug.**
+
+*The bug (fixed, `912e20f`):* `parse_calls` degraded from the
+*section* start on an incomplete last call, so under
+`Leniency::Final` the 25 complete calls parsed before the truncated
+26th were pushed a second time inside the degraded `Text` — the turn
+re-rendered as 50 calls and could not be a byte-prefix of itself.
+Pure Rust, deterministic, latent since #85. Now scoped to the call.
+The truncated call itself is still unrepresentable and still text.
+
+*The loop (not a bug in our code — a model/sampler preference the
+raw API exposes):* it reproduced **7 of 7 runs** tonight, 26–27 calls
+every time, on every configuration tried: HEAD; HEAD with the
+`/v1/models` arc stashed; pre-#93 (`8d8ad90`); the first commit that
+made Mistral work at all (`74cf8da`, July 28); llama-cpp-sys 0.8.1
+(pre-rebase), registry 0.8.2 (the rebase), and 0.8.2 + Mike's Metal
+`mul_mm_id` patch; `n_ubatch` 31 and the default. The sampling sidecar
+is unchanged since July 28. So no commit and no upstream version
+introduced it — there is nothing to bisect.
+
+What actually explains it: **`run_call` halts on
+`predictor.grammar_complete()`** (`session/mod.rs:6032`, one-shot,
+explicitly "to defend against post-grammar drift if the model wants to
+keep generating"). Every production path — `complete_blocks`,
+`complete_response`, blallama — ends the turn after the first complete
+call section. The same prompt through blallama tonight: **one call,
+19 output tokens, `stop_reason: tool_use`.** Only `complete_text`, the
+documented raw-bytes debugging view, has no such halt, and it is what
+the round-trip test drives — so it shows the model's real preference
+at the `}` boundary: another `[TOOL_CALLS]` over `</s>`, until the
+budget. Nothing in the sampler discourages that: `[TOOL_CALLS]` is a
+special (rep-penalty-ignored), the JSON/English inside is
+category-ignored, and only EOS ends a Mistral call section.
+
+Why July saw 1-of-2 and tonight 7-of-7 is still open (machine state
+is the usual suspect — reboot and re-run before reading anything into
+it), but it changes nothing above: the production path never lets the
+loop happen, and the test path always could.
+
+*Follow-ups for Mike:* (1) decide whether `complete_text` should get
+the same `grammar_complete` halt, or the round-trip test should go
+through `complete_blocks` + render — as written, it passes today only
+because the parser fix makes a 27-call truncated turn round-trip,
+which is not what it means to test; (2) the Metal patch handled a
+145-token prefill at the default micro-batch with no NaN (blallama),
+and the test also ran clean without `with_n_ubatch(31)` — the
+workaround can likely go once the patch ships, and Mike's ABBA bench
+(512/1024 ubatch, his run) decides the default.
 
 Correcting a wrong first read (Mike caught it): I called the default
 sampler "very wide". It is not. `SamplerConfig::default()` is TopK 1024
