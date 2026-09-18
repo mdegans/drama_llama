@@ -257,6 +257,16 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`v1_models_catalog.md`](.claude/memory/v1_models_catalog.md)
+  — **read before touching blallama's listing routes, `src/catalog.rs`,
+  or proposing a cross-backend metadata API.** `/v1/models` landed
+  2026-09-18: `Catalog<B>` (directory + per-process `ModelInfo` cache),
+  `FromPath::peek` (a `vocab_only` load — "use what llama.cpp exposes",
+  ~1.3 s/model, hence the cache and blallama's startup warm-up),
+  `Session::model_info`, one `Advertised → ModelInfo` mapping so a
+  listing and a load never disagree. Ceilings are
+  `min(n_ctx, n_ctx_train)` (Mike's call; matches llama.cpp's
+  `n_ctx_slot`). moeflux peek compiles but is unverified on device.
 - [`plan_cache_restore_ladder_and_disk_tier.md`](.claude/memory/plan_cache_restore_ladder_and_disk_tier.md)
   — **arc plan-of-record (2026-07-29), the live drama_llama arc.**
   Five phases: restore-to-divergence ladder (pure transformers),

@@ -17,6 +17,18 @@ emitted the same call 26x until the budget truncated it mid-string.
 **Replayed unchanged and passed**, so it is stochastic and was never
 diagnosed — no fix was applied, and nothing here is established.
 
+*2026-09-18 update:* it reproduced twice in a row as
+`session_mistral4::emission_round_trips_through_parse_and_render`
+(same `count_letters` loop, `r`/`R` × `strawberry`/`StrawBerry`
+variants until `max_tokens` cut a call mid-JSON) during the `/v1/models`
+session — once in the full ignored tier, once replayed with that arc
+stashed (HEAD + Mike's uncommitted `[patch.crates-io]` llama-cpp-sys,
+the mul_mm_id f16 rescale gate, `abd41adf5`). So it is **not** the
+catalog work. Whether it is the patch (Mistral's Metal numerics are
+exactly what it changes) or the untuned sampler above is undetermined:
+that needs a replay against the registry sys crate, which is the
+patch-validation arc's question, not this one's.
+
 Correcting a wrong first read (Mike caught it): I called the default
 sampler "very wide". It is not. `SamplerConfig::default()` is TopK 1024
 -> locally-typical p=0.5, and our own code documents the TopK as "a
