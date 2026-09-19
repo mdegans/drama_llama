@@ -743,6 +743,17 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         self.state.grammar_complete() || self.terminal_completed
     }
 
+    /// [`Self::grammar_complete`], and nothing can extend the accepting
+    /// constraint — the structured output is finished, not merely valid
+    /// so far. This is the early-halt signal: a repeating grammar (a
+    /// parallel call section) is complete after its first call but not
+    /// exhausted, and whether another follows is the model's choice of
+    /// EOG or the next opener. See
+    /// [`SamplerState::grammar_exhausted`](crate::SamplerState::grammar_exhausted).
+    pub fn grammar_exhausted(&self) -> bool {
+        self.state.grammar_exhausted() || self.terminal_completed
+    }
+
     /// True iff generation ended mid-constraint — the incomplete-at-end
     /// violation signal. Covers an eager constraint that never reached
     /// accept **and** a deferred grammar that activated and is
@@ -1152,6 +1163,11 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     /// See [`TokenPredictor::grammar_complete`].
     pub fn grammar_complete(&self) -> bool {
         self.inner.grammar_complete()
+    }
+
+    /// See [`TokenPredictor::grammar_exhausted`].
+    pub fn grammar_exhausted(&self) -> bool {
+        self.inner.grammar_exhausted()
     }
 
     /// See [`TokenPredictor::constraint_incomplete_at_end`].

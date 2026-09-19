@@ -492,48 +492,23 @@ fn complete_text_round_trips_through_parse_and_render() {
     );
 }
 
-/// #58 acceptance: a grammar-forced call turn round-trips byte-exact —
-/// `render(parse(raw)).starts_with(raw)` — the prefix-cache invariant,
-/// under **greedy** sampling so the emission is deterministic. Also the
-/// regression guard for the inter-call separator (`call_separator`):
-/// before #58 the analyzer captured none, so the grammar let the model
-/// emit `</tool_call><tool_call>` while the template re-rendered
-/// `</tool_call>\n<tool_call>`.
-///
-/// This used to demand a **multi**-call emission and got one — but only
-/// because `complete_text` ran on past the grammar's accept state and
-/// Qwen, greedy, repeated the same call until `max_tokens` cut one
-/// mid-structure (2026-09-19). `complete_text` now halts where
-/// `run_call` always has, on `grammar_complete()`, which is the first
-/// accepting state of `call (sep call)*` — one call. So the separator is
-/// checked on the analyzed dialect directly, which is what #58 fixed.
-#[test]
-#[ignore = "requires model"]
-fn multi_call_round_trips_under_greedy() {
-    use drama_llama::{AssistantMessage, SamplerConfig};
-
-    let prompt =
-        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
-        .expect("session load")
-        .quiet()
-        .with_sample_options(SamplerConfig::greedy());
-
-    // The fix in one line: the analyzer must have captured the
-    // template's inter-call separator.
-    println!("call_separator = {:?}", session.dialect().call_separator);
-    assert_eq!(
-        session.dialect().call_separator,
-        "\n",
-        "#58: the analyzer must capture the template's inter-call separator"
-    );
+/// Drive one grammar-forced turn through `complete_text` and hold it to
+/// the prefix-cache invariant: the emission ends on a complete call (the
+/// model *chose* to stop — it did not run out of budget), every emitted
+/// call parses, and the canonical re-render of the parsed turn starts
+/// with the raw emission byte for byte. Returns the number of calls.
+fn forced_calls_round_trip(
+    session: &mut drama_llama::LlamaCppSession,
+    prompt: &Prompt,
+) -> usize {
+    use drama_llama::AssistantMessage;
 
     let render_opts = RenderOptions::default()
         .with_generation_prompt(true)
         .with_extra("preserve_thinking", true);
     let rendered_original = session
         .template()
-        .render_with(&prompt, &render_opts)
+        .render_with(prompt, &render_opts)
         .expect("render original");
     let reasoning_open = session.dialect().reasoning.start.trim().to_owned();
     let pre_opened = !reasoning_open.is_empty()
@@ -541,20 +516,28 @@ fn multi_call_round_trips_under_greedy() {
             .trim_end()
             .ends_with(reasoning_open.as_str());
 
-    let raw = session.complete_text(&prompt).expect("complete_text");
+    let raw = session.complete_text(prompt).expect("complete_text");
     println!("=== raw ===\n{raw}\n===");
-    assert_eq!(
-        raw.matches("<tool_call>").count(),
-        1,
-        "one grammar-complete call per turn; got {raw:?}"
+    let per_call_start = session.dialect().per_call_start.trim().to_owned();
+    let per_call_end = session.dialect().per_call_end.trim().to_owned();
+    let n_emitted = raw.matches(per_call_start.as_str()).count();
+    assert!(n_emitted >= 1, "a forced turn must call; got {raw:?}");
+    // The turn must end because the model chose to end it — not
+    // because the budget ran out under a masked EOG (the old loop).
+    assert!(
+        raw.trim_end().ends_with(per_call_end.as_str()),
+        "emission must end on a complete call; got {raw:?}"
     );
 
-    let blocks = parse_with_dialect(&session, &prompt, &raw, pre_opened);
+    let blocks = parse_with_dialect(session, prompt, &raw, pre_opened);
     let n_calls = blocks
         .iter()
         .filter(|b| matches!(b, Block::ToolUse { .. }))
         .count();
-    assert_eq!(n_calls, 1, "parser must surface the call; got {blocks:?}");
+    assert_eq!(
+        n_calls, n_emitted,
+        "parser must surface every emitted call; got {blocks:?}"
+    );
     let assistant: AssistantMessage = blocks.into_iter().collect();
 
     let mut follow_up = prompt.clone();
@@ -578,6 +561,106 @@ fn multi_call_round_trips_under_greedy() {
         "emission is not a byte prefix of the canonical re-render.\n\
          --- emission ---\n{raw}\n--- re-rendered suffix ---\n{suffix}"
     );
+    n_calls
+}
+
+/// #58 acceptance: a grammar-forced call turn round-trips byte-exact —
+/// `render(parse(raw)).starts_with(raw)` — the prefix-cache invariant,
+/// under **greedy** sampling so the emission is deterministic. Also the
+/// regression guard for the inter-call separator (`call_separator`):
+/// before #58 the analyzer captured none, so the grammar let the model
+/// emit `</tool_call><tool_call>` while the template re-rendered
+/// `</tool_call>\n<tool_call>`.
+///
+/// This used to demand a **multi**-call emission and got one — by
+/// accident. The grammar filters judged EOG by its bytes once the
+/// grammar was accepting, so after the first call of `call (sep call)*`
+/// — accepting, but extensible — EOG was never on offer and Qwen,
+/// greedy, was *forced* to repeat the call until `max_tokens` cut one
+/// mid-structure (2026-09-19; first misread as a model preference). With
+/// EOG legal at every accept state the model decides, and for a
+/// one-question prompt it decides on one call. How many is its
+/// business here; the multi-call case proper — and the separator
+/// exercised end to end — is
+/// [`parallel_calls_follow_disable_parallel_tool_use`].
+#[test]
+#[ignore = "requires model"]
+fn multi_call_round_trips_under_greedy() {
+    use drama_llama::SamplerConfig;
+
+    let prompt =
+        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(256).unwrap());
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet()
+        .with_sample_options(SamplerConfig::greedy());
+
+    // The fix in one line: the analyzer must have captured the
+    // template's inter-call separator.
+    println!("call_separator = {:?}", session.dialect().call_separator);
+    assert_eq!(
+        session.dialect().call_separator,
+        "\n",
+        "#58: the analyzer must capture the template's inter-call separator"
+    );
+
+    let n_calls = forced_calls_round_trip(&mut session, &prompt);
+    println!("calls emitted: {n_calls}");
+}
+
+/// Parallel tool use end to end, and the wire flag that governs it. A
+/// prompt that needs two calls gets two in ONE turn — byte-stable
+/// through parse and re-render, which is #58's separator exercised by a
+/// real emission for the first time — and
+/// `disable_parallel_tool_use` holds the same prompt to exactly one.
+///
+/// Before 2026-09-19 neither half was reachable: the Session halted on
+/// the first *accepting* grammar state, so every turn was one call and
+/// the flag was moot; and had it not halted, the filters' masked EOG
+/// would have forced calls until the budget. Now the halt waits for an
+/// *exhausted* grammar, and at the extensible accept between calls the
+/// model picks EOG or the next opener.
+#[test]
+#[ignore = "requires model"]
+fn parallel_calls_follow_disable_parallel_tool_use() {
+    use drama_llama::SamplerConfig;
+
+    let mut prompt =
+        strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(512).unwrap());
+    prompt.messages = vec![Message {
+        role: Role::User,
+        content: Content::text(
+            "Count the r's in 'strawberry' and the s's in 'mississippi'. \
+             Make both tool calls in this one message.",
+        ),
+    }];
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet()
+        .with_sample_options(SamplerConfig::greedy());
+
+    // Parallel on (the wire default): both calls, one turn, and the
+    // model ends it itself.
+    prompt.tool_choice = Some(ToolChoice::any());
+    let n_calls = forced_calls_round_trip(&mut session, &prompt);
+    assert_eq!(n_calls, 2, "two questions, two calls, one turn");
+
+    // The production path agrees with the raw one.
+    let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
+    let strings: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { call } => call.input["string"].as_str(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(strings, ["strawberry", "mississippi"], "got {blocks:?}");
+
+    // Parallel off: the grammar is a single `call`, exhausted at its
+    // first accept — one call, however much the prompt wants two.
+    prompt.tool_choice = Some(ToolChoice::any().disable_parallel_tool_use());
+    let n_calls = forced_calls_round_trip(&mut session, &prompt);
+    assert_eq!(n_calls, 1, "disable_parallel_tool_use caps the turn");
 }
 
 /// #30 Phase E: under `Auto` (unforced) tool choice the model calls

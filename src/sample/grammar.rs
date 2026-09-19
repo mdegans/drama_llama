@@ -950,6 +950,16 @@ impl StackState {
         self.pending.is_empty() && self.stacks.iter().any(|s| s.is_empty())
     }
 
+    /// [`Self::is_complete`] and nothing can extend the match: every
+    /// live stack is spent. `"ab"+` after one "ab" is complete but not
+    /// exhausted — another "ab" is still legal; `"ab"` after "ab" is
+    /// both.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.pending.is_empty()
+            && !self.stacks.is_empty()
+            && self.stacks.iter().all(|s| s.is_empty())
+    }
+
     /// True iff feeding `bytes` would succeed from the current state.
     /// Clones only the matcher state — the `Arc<Grammar>` is not touched.
     pub(crate) fn accepts_bytes(
@@ -2222,6 +2232,28 @@ mod tests {
 
     fn parse_ok(src: &str) -> Grammar {
         Grammar::parse(src).expect("grammar should parse")
+    }
+
+    /// Complete-but-extensible vs exhausted: the distinction the
+    /// Session's early halt turns on. A repeating root (the parallel
+    /// call section's shape, with and without a separator) is complete
+    /// after one repetition yet never exhausted; a fixed root is both at
+    /// once; a required terminator after the repetition (Gemma 4's exit
+    /// marker) is neither until the terminator lands.
+    #[test]
+    fn exhausted_is_complete_and_inextensible() {
+        let at = |src: &str, input: &str| {
+            let mut state = GrammarState::new(Arc::new(parse_ok(src)));
+            state.advance_bytes(input.as_bytes()).expect("input legal");
+            (state.inner.is_complete(), state.inner.is_exhausted())
+        };
+        assert_eq!(at(r#"root ::= "ab""#, "a"), (false, false));
+        assert_eq!(at(r#"root ::= "ab""#, "ab"), (true, true));
+        assert_eq!(at(r#"root ::= "ab"+"#, "ab"), (true, false));
+        assert_eq!(at(r#"root ::= "ab"+"#, "abab"), (true, false));
+        assert_eq!(at(r#"root ::= "ab" ( "\n" "ab" )*"#, "ab"), (true, false));
+        assert_eq!(at(r#"root ::= "ab"+ "!""#, "ab"), (false, false));
+        assert_eq!(at(r#"root ::= "ab"+ "!""#, "abab!"), (true, true));
     }
 
     /// A mid-parse `StackState` must serde round-trip exactly (derived

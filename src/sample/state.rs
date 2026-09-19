@@ -166,6 +166,27 @@ impl SamplerState {
             .is_some_and(|d| d.active && d.matcher.is_complete())
     }
 
+    /// [`Self::grammar_complete`], and the accepting matcher has nothing
+    /// left to match — the structured output is not merely *valid* as
+    /// it stands but *finished*. The two differ exactly when a grammar
+    /// can repeat: after the first call of a parallel section (`call+`)
+    /// the constraint is complete, yet whether to stop or open another
+    /// call is the model's decision, made by sampling EOG or the next
+    /// opener. The Session halts on this, not on `grammar_complete` —
+    /// halting on mere acceptance cut every parallel section to one
+    /// call. (A complete JSON document is always exhausted: the parser
+    /// admits no trailing bytes.)
+    pub fn grammar_exhausted(&self) -> bool {
+        self.matchers.iter().any(|m| match m {
+            MatcherState::Grammar { stack, .. } => stack.is_exhausted(),
+            MatcherState::Json(s) => s.is_complete(),
+            MatcherState::Stateless => false,
+        }) || self
+            .deferred
+            .as_ref()
+            .is_some_and(|d| d.active && d.matcher.is_exhausted())
+    }
+
     /// True iff generation ended while a byte-constraint was still
     /// mid-structure — the Session's incomplete-at-end violation
     /// check. Two shapes count:

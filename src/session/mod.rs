@@ -5599,17 +5599,13 @@ impl<B: Backend> Session<B> {
             }
             generated_count += 1;
             text.push_str(&piece);
-            // Same one-shot halt as `run_call`: once any active grammar
-            // reaches its accept state the turn is structurally over.
-            // This path used to run on to EOS / `max_tokens`, which is
-            // not "raw" so much as "post-grammar drift": with a
-            // forced tool call, Mistral emitted `[TOOL_CALLS]` over
-            // `</s>` 26 times and Qwen repeated the same call under
-            // greedy, every time, until the budget cut a call mid-JSON
-            // — behaviour no production path ever sees, because
-            // `run_call` halts here. For the post-grammar candidate
-            // picture use `top_k_trace`.
-            if predictor.grammar_complete() {
+            // Same one-shot halt as `run_call`: once an active grammar
+            // is *exhausted* — accepting, with nothing left to match —
+            // the turn is structurally over, and running on to EOS is
+            // not "raw" so much as post-grammar drift. Exhausted, not
+            // merely complete: see the note there on parallel calls.
+            // For the post-grammar candidate picture use `top_k_trace`.
+            if predictor.grammar_exhausted() {
                 break;
             }
         }
@@ -6047,8 +6043,19 @@ impl<B: Backend> Session<B> {
             // model could still emit non-empty-piece junk that
             // grammars won't see). One-shot: as soon as ANY
             // matcher (including an activated deferred grammar)
-            // is_complete, halt.
-            if predictor.grammar_complete() {
+            // is exhausted, halt.
+            //
+            // Exhausted — accepting AND inextensible — not merely
+            // complete. A parallel call section (`call+`) is complete
+            // after its first call; halting there cut every turn to
+            // one call on the dialects whose section ends the grammar
+            // (Qwen, Mistral), with `disable_parallel_tool_use` moot.
+            // At an extensible accept the decision is the model's:
+            // the filters offer EOG beside the next opener, and EOG
+            // ends the turn through the ordinary stop path. With
+            // parallel calls disabled the grammar is a single `call`,
+            // whose accept is terminal — this halt, unchanged.
+            if predictor.grammar_exhausted() {
                 break;
             }
         }
