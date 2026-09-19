@@ -321,7 +321,11 @@ for the current arc:
   `LlamaCppOptions::with_n_ubatch(31)`, which keeps prefill on the f32
   `mul_mv_id` path. Also carries `DecodeError::NonFinite`, the open
   question of the predictor's three `.expect()` sites that still panic
-  on it, and the untuned sampler behind an observed tool-call loop.
+  on it, and — **read before attributing any deterministic behaviour to
+  "model preference"** — the tool-call loop that was *ours*: the grammar
+  filters masked EOG at accepting-but-extensible states, forcing call
+  after call. Fixed 2026-09-19 (`grammar_exhausted()` halt), which is
+  also what made parallel tool calls work at all.
 - [`plan_ci_self_hosted_runner.md`](.claude/memory/plan_ci_self_hosted_runner.md)
   — **read first if this session is on the remote runner box.** CI's
   first-run state (green both OSes bar four model-needing "unignored"

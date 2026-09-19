@@ -47,8 +47,55 @@ on every configuration, and greedy Qwen did the same — the uniformity
 of a mask, not of a preference. Same symptom `emit.rs` already records
 for Gemma 4 ("masking [the exit] makes the model loop emitting more
 calls"). Everything below about sampler temperature and
-`ignored_categories` is therefore moot as a *cause*. Not yet verified on
-device: that offering EOG actually ends the Mistral/Qwen turns.
+`ignored_categories` is therefore moot as a *cause*.
+
+**Fixed and confirmed on device the same day.** `b3caa2c`: EOG is legal
+by id at *every* accept state, in both filters and the lazy check
+(regression: `eog_legal_at_extensible_accept`). `a01e737`: `run_call`
+and `complete_text` halt on `grammar_exhausted()` — accepting AND
+inextensible (`StackState::is_exhausted`: every live stack spent) — not
+on `grammar_complete()`. So between calls the model picks EOG or the
+next opener, and **parallel tool calls work**, governed by
+`tool::Choice`'s `disable_parallel_tool_use` exactly as on the wire
+(flag set ⇒ grammar is a single `call` ⇒ its accept is terminal ⇒ the
+old one-call halt). Results: the two former "loop" prompts now end
+after ONE call by the model's own EOG (Qwen greedy; Mistral Small 4
+9/9, the round-trip emitting one `[TOOL_CALLS]…` where it emitted
+26–27); Qwen asked two questions emits two calls in one turn, `\n`
+separator and all, byte-stable through parse/re-render
+(`parallel_calls_follow_disable_parallel_tool_use` — #58's separator
+exercised by a real emission for the first time), and the flag holds
+the same prompt to one. No `max_parallel_calls` cap was added: with EOG
+on offer a runaway is a hypothetical model property with no evidence
+behind it, and `max_tokens` is the backstop. Add a cap only on
+evidence. `just test all` on the result: **696/696, 0 skipped, no
+retries** (Mac/Metal; Qwen, Mistral, Gemma 4, gpt-oss, whodunit) —
+which is what default-on was conditional on.
+
+Consequence for callers, same as on the wire: a forced choice
+(`Any`/`Method`) means **at least one** call. A caller that forces a
+tool to get exactly one object must say so with
+`disable_parallel_tool_use` — `examples/strawberry.rs` (answers only
+the first call) and `examples/council.rs`'s `Seat::filer` now do
+(`f5506d1`). `output_config` structured output is unaffected: it is its
+own JSON grammar, and a complete document is always exhausted. Open,
+Mike's to check with balerion: whether the real Agora Council forces a
+filing tool and relies on exactly-one without the flag — a latent bug
+against Anthropic too, which blallama used to mask by capping at one.
+
+Why it matters downstream: agora-agentkit's seed prompt tells the model
+"Each round is one message of tool calls" under a 5-round budget, and
+`default_handle` already dispatches N `tool_use` blocks per turn — so
+local agents had been held to 5 calls a session where Claude got 5
+rounds of N.
+
+The lesson, for the next "the model just prefers X" diagnosis: **a
+preference is only a preference if the alternative was on offer.**
+Check the candidate set at the decision point (`top_k_trace`, or a
+`MockModel` probe — that one took two minutes) before attributing a
+deterministic, configuration-independent behaviour to the model.
+Uniformity across seeds, samplers, quantizations and two model families
+is the signature of a mask.
 
 Also overbroad below: "parallel calls never happen … on every path".
 Only dialects whose call sequence is the *end* of the grammar (Qwen,
