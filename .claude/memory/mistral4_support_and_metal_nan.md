@@ -27,7 +27,38 @@ hatch stays available on `LlamaCppOptions` for the next kernel that
 needs it; a `NonFinite` from this suite now means the sys crate in use
 predates the fix. Bench (512 vs 1024, ABBA) is Mike's run.
 
+**2026-09-19 (later) — CORRECTION: the loop IS our bug. The "model
+preference" reading below is wrong.** `grammar_filter`
+(`sample/grammar.rs`, the `complete` branch) and `accepts_chosen`
+(`sample/state.rs`) only treat EOG by *id* while the grammar is
+incomplete. Once it is accepting they judge EOG by its piece *bytes*
+like any other token — so at an accepting-but-**extensible** state
+(after call 1 of `call+` / `call (sep call)*`) `</s>` is an empty piece
+or fails the first-byte bitmap, the opener tokens keep `kept` non-empty,
+and the force-EOS branch never fires. EOG is reachable only at a
+*terminal* accept. The model was never offered `</s>`; it was forced to
+emit another call until the budget. Proven with a throwaway unit probe
+on `MockModel` (`root ::= "ab"+`, advance through "ab", then offer EOS at
+logit +20 vs `a` at −20): both the lazy and masked paths chose `a`. The
+comment in `grammar_filter` claims llama.cpp's rule ("EOG becomes legal
+again once the grammar reaches an accept state"); the code implements
+it only for terminal accepts. That is why the loop was 7/7, 26–27 calls,
+on every configuration, and greedy Qwen did the same — the uniformity
+of a mask, not of a preference. Same symptom `emit.rs` already records
+for Gemma 4 ("masking [the exit] makes the model loop emitting more
+calls"). Everything below about sampler temperature and
+`ignored_categories` is therefore moot as a *cause*. Not yet verified on
+device: that offering EOG actually ends the Mistral/Qwen turns.
+
+Also overbroad below: "parallel calls never happen … on every path".
+Only dialects whose call sequence is the *end* of the grammar (Qwen,
+Mistral) are accepting after call 1. Gemma 4 (`call+
+"<|tool_response>"`) and any `section_end` dialect are not accepting
+until their terminator, so the one-shot halt does not cut them short
+(by reading; not checked on device).
+
 **2026-09-18/19 — diagnosed. Two things stacked; one was a bug.**
+*(Superseded in part by the correction above.)*
 
 *The bug (fixed, `912e20f`):* `parse_calls` degraded from the
 *section* start on an incomplete last call, so under
