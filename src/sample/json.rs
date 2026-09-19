@@ -21,7 +21,7 @@
 //!
 //! [`SamplingMode::Json`]: crate::SamplingMode::Json
 
-use crate::{backend::Model, Candidates, Token, TokenData};
+use crate::{backend::Model, Candidates, TokenData};
 
 /// Pushdown-automaton state for JSON parsing at the byte level.
 ///
@@ -578,18 +578,19 @@ pub(crate) fn json_filter<M: Model>(
     // lazy check share this policy: an active constraint owns
     // termination, and EOG becomes legal again at accept states.
     let complete = state.is_complete();
-    let eog: Vec<Token> = if complete {
-        Vec::new()
-    } else {
-        model.eog_tokens()
-    };
+    let eog = model.eog_tokens();
     for cand in candidates.as_slice() {
-        // Mid-parse EOG survives only when its own piece bytes finish
-        // the document — a dialect exit marker doubling as a stop
-        // token (Gemma's `<|tool_response>`). EOG whose bytes are
-        // merely *legal content* (a JSON string accepts `<|im_end|>`
+        // At accept, EOG is legal by id whatever its bytes. Mid-parse
+        // it survives only when its own piece bytes finish the
+        // document — a dialect exit marker doubling as a stop token
+        // (Gemma's `<|tool_response>`). EOG whose bytes are merely
+        // *legal content* (a JSON string accepts `<|im_end|>`
         // literally) stays rejected.
         let cand_is_eog = eog.contains(&cand.id);
+        if cand_is_eog && complete {
+            kept.push(*cand);
+            continue;
+        }
         buf.clear();
         model.token_to_piece_ref(cand.id, &mut buf);
         if buf.is_empty() {

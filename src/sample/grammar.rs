@@ -2089,21 +2089,32 @@ pub(crate) fn grammar_filter<M: Model + Sync>(
     // EOT is `<|end|>`, which is NOT EOG, and masking it mid-grammar
     // left a Harmony model unable to close its analysis channel — it
     // rambled ("Let's do. We'll call. We'll output.") to `max_tokens`.
+    //
+    // At an accept state EOG is legal BY ID, whatever its bytes — and
+    // that has to hold when the accept is *extensible*, not just
+    // terminal. After the first call of `call+` the grammar is
+    // accepting yet a next opener is still legal, so `kept` is never
+    // empty and the force-EOS branch below never fires; judged by its
+    // bytes there, EOG (an empty piece, or `</s>` against an opener's
+    // first byte) was unreachable and the model was forced into call
+    // after call until the budget — 26 of them on Mistral Small 4,
+    // read for a night as a model preference. EOG-or-next-opener is
+    // the model's decision; this is where it gets to make it.
     let complete = inner.is_complete();
-    let eog: Vec<crate::Token> = if complete {
-        Vec::new()
-    } else {
-        model.eog_tokens()
-    };
+    let eog = model.eog_tokens();
 
     let acc = candidates
         .as_slice()
         .par_iter()
         .fold(Acc::default, |mut a, cand| {
-            // `eog` is empty once complete, so this only marks
-            // mid-parse EOG candidates: kept below only when their
-            // own bytes finish the constraint (exit-marker case).
             let cand_is_eog = eog.contains(&cand.id);
+            if cand_is_eog && complete {
+                a.kept.push(*cand);
+                return a;
+            }
+            // Past this point an EOG candidate is mid-parse: kept
+            // below only when its own bytes finish the constraint
+            // (exit-marker case).
             let mut buf: Vec<u8> = Vec::with_capacity(32);
             model.token_to_piece_ref(cand.id, &mut buf);
             if buf.is_empty() {

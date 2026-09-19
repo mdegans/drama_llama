@@ -520,7 +520,9 @@ impl SamplerState {
     /// Lazy-path legality of the chosen token: its piece bytes must
     /// extend (or, for a mid-parse EOG token, *finish*) every active
     /// constraint. Mirrors the masked filters' policy — empty pieces
-    /// are illegal, EOG is judged by id while incomplete.
+    /// are illegal, and EOG is judged by id: legal at any accept state
+    /// (terminal or extensible), mid-parse only when its bytes finish
+    /// the constraint.
     pub(crate) fn accepts_chosen<M: Model>(
         &self,
         config: &SamplerConfig,
@@ -532,12 +534,12 @@ impl SamplerState {
         let chosen_is_eog = model.eog_tokens().contains(&chosen);
 
         let grammar_ok = |g: &crate::Grammar, s: &StackState| {
-            !buf.is_empty()
-                && if chosen_is_eog && !s.is_complete() {
-                    s.completes_with(g, &buf)
-                } else {
-                    s.accepts_bytes(g, &buf)
-                }
+            if chosen_is_eog {
+                s.is_complete()
+                    || (!buf.is_empty() && s.completes_with(g, &buf))
+            } else {
+                !buf.is_empty() && s.accepts_bytes(g, &buf)
+            }
         };
 
         let modes_ok = config.modes.iter().zip(self.matchers.iter()).all(
@@ -547,12 +549,12 @@ impl SamplerState {
                     MatcherState::Grammar { stack, .. },
                 ) => grammar_ok(&compiled.grammar, stack),
                 (SamplingMode::Json, MatcherState::Json(s)) => {
-                    !buf.is_empty()
-                        && if chosen_is_eog && !s.is_complete() {
-                            s.completes_with(&buf)
-                        } else {
-                            s.accepts_bytes(&buf)
-                        }
+                    if chosen_is_eog {
+                        s.is_complete()
+                            || (!buf.is_empty() && s.completes_with(&buf))
+                    } else {
+                        !buf.is_empty() && s.accepts_bytes(&buf)
+                    }
                 }
                 _ => true,
             },

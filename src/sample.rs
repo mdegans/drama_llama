@@ -2463,6 +2463,57 @@ mod tests {
         assert!(grammar_accepts(&opts, &fresh, b"a"));
     }
 
+    /// At an accepting-but-*extensible* state — after the first
+    /// repetition of `"ab"+`, the shape of a parallel call section
+    /// after its first call — EOG must be legal by id on both paths,
+    /// whatever its piece bytes: empty (`EOS`), byte-legal (`EOG_A`),
+    /// or byte-illegal (`EOG_B`). Judged by bytes it was unreachable —
+    /// the legal continuation keeps the filter's force-EOS branch from
+    /// firing — and the model was forced to extend until the budget
+    /// (Mistral Small 4: 26 identical calls, every run). A non-EOG
+    /// empty piece stays illegal, and extending stays legal.
+    #[test]
+    fn eog_legal_at_extensible_accept() {
+        for lazy in [true, false] {
+            let opts = SamplerConfig {
+                modes: vec![SamplingMode::grammar(r#"root ::= "ab"+"#)
+                    .expect("test grammar parses")],
+                repetition: None,
+                deferred_grammar: None,
+                lazy_grammar: lazy,
+                ..SamplerConfig::default()
+            };
+            let mut state = state_for(&opts);
+            assert_eq!(sample(cands(&[(A, 20.0)]), &opts, &mut state), A);
+            assert_eq!(sample(cands(&[(B, 20.0)]), &opts, &mut state), B);
+            assert!(state.grammar_complete());
+            assert!(grammar_accepts(&opts, &state, b"a"), "still extensible");
+
+            for eog in [EOS, EOG_A, EOG_B] {
+                let tok = sample(
+                    cands(&[(eog, 20.0), (A, -20.0)]),
+                    &opts,
+                    &mut state.clone(),
+                );
+                assert_eq!(tok, eog, "lazy={lazy}: dominant EOG must win");
+            }
+            // The model may equally choose to extend…
+            let tok = sample(
+                cands(&[(EOS, -20.0), (A, 20.0)]),
+                &opts,
+                &mut state.clone(),
+            );
+            assert_eq!(tok, A, "lazy={lazy}");
+            // …and a reserved empty piece is still not a way out.
+            let tok = sample(
+                cands(&[(RSV, 20.0), (A, -20.0)]),
+                &opts,
+                &mut state.clone(),
+            );
+            assert_eq!(tok, A, "lazy={lazy}");
+        }
+    }
+
     /// Empty pieces are rejected mid-grammar on both paths: an active
     /// constraint owns termination, so a dominant empty-piece token
     /// (EOS variant or reserved slot) must lose to a byte-legal
