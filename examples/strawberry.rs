@@ -128,8 +128,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Force the call. Locally this compiles to a sampling grammar, so
     // unlike the API's `tool_choice` it is a guarantee, not a request.
+    // Exactly one: a forced choice alone means "at least one" — here
+    // as on the wire — and turn 1 below answers a single call.
     let name = strawberry.definitions()[0].name().to_string();
-    chat.tool_choice = Some(ToolChoice::method(name));
+    chat.tool_choice =
+        Some(ToolChoice::method(name).disable_parallel_tool_use());
 
     // Turn 1: the grammar-forced tool call.
     let message = transport.send(&chat).await?;

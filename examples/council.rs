@@ -137,10 +137,13 @@ struct Seat {
 }
 
 impl Seat {
-    /// A filing seat: persona system prompt, the `file` tool, forced.
+    /// A filing seat: persona system prompt, the `file` tool, forced —
+    /// and forced to exactly one call. A seat files once per round; a
+    /// forced choice alone means "at least one".
     fn filer(name: &'static str, system: String) -> Self {
         let mut prompt = Prompt::default().system(system).add_tool(file_tool());
-        prompt.tool_choice = Some(tool::Choice::method(FILE_TOOL));
+        prompt.tool_choice =
+            Some(tool::Choice::method(FILE_TOOL).disable_parallel_tool_use());
         Seat {
             name,
             prompt,
