@@ -54,7 +54,9 @@ use super::DELETE_ICON;
 #[cfg_attr(feature = "serde", serde(try_from = "RepetitionOptionsShadow"))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepetitionOptions {
-    /// Sets of tokens to ignore, by language. These are never penalized.
+    /// Categories of text to ignore. The word-list categories resolve to
+    /// tokens that are never penalized; [`IgnoreCategory::Uuids`]
+    /// suspends the pass while a UUID is being emitted.
     pub(crate) ignored_categories: BTreeSet<IgnoreCategory>,
     /// [`NGram`]s to ignore. These are never penalized.
     pub(crate) ignored: BTreeSet<NGram>,
@@ -254,12 +256,17 @@ impl Default for RepetitionOptions {
             // structured output for no anti-loop benefit. Punctuation is also
             // default-on for the same reason — prose `. , ; : ! ?` have no
             // lexical variety, so accumulating penalty on `.` biases toward
-            // run-ons. Users can override by calling
-            // `set_ignored_categories(vec![])`.
+            // run-ons. UUIDs likewise: an id must be re-emitted verbatim,
+            // and stacked penalties push the model off it after a few
+            // sightings. Users can override by calling
+            // `set_ignored_categories(vec![])`. Note the serde shadow
+            // defaults the set to EMPTY, so a sidecar that lists
+            // categories must name each one.
             ignored_categories: BTreeSet::from([
                 IgnoreCategory::English,
                 IgnoreCategory::Json,
                 IgnoreCategory::Punctuation,
+                IgnoreCategory::Uuids,
             ]),
             ignored: BTreeSet::new(),
             window_size: default_window_size(),
@@ -328,6 +335,13 @@ impl RepetitionOptions {
     /// [`IgnoreCategory`]s of tokens. These are never penalized.
     pub fn ignored_categories(&self) -> &BTreeSet<IgnoreCategory> {
         &self.ignored_categories
+    }
+
+    /// Whether [`IgnoreCategory::Uuids`] is on: the pass is suspended
+    /// while the generated tail is an unfinished UUID. The one
+    /// category that resolves to no tokens — see `sample::uuid`.
+    pub fn ignores_uuids(&self) -> bool {
+        self.ignored_categories.contains(&IgnoreCategory::Uuids)
     }
 
     /// The effective ignore set: [`Self::ignored`] plus every
@@ -628,7 +642,7 @@ impl RepetitionOptions {
         // FIXME: for internationalization, we should put all the strings in a
         // separate file and use gettext or similar. There may be something
         // better from the Rust ecosystem, but I'm not aware of it.
-        const IGNORE_CATEGORY_HELP: &str = "Common tokens that are often ignored in NLP tasks. These options allow you to ignore sets of tokens for the purpose of penalizing repetition. The idea is to allow a higher repetition penalty without penalizing common words. This is experimental.";
+        const IGNORE_CATEGORY_HELP: &str = "Categories of text the repetition penalty ignores: common-word lists (stopwords, JSON syntax, punctuation) and UUIDs, which are matched by shape as they stream. The idea is to allow a higher repetition penalty without penalizing what has to repeat. This is experimental.";
 
         // IgnoreCategories
         if !self.ignored_categories.is_empty() {
@@ -1388,6 +1402,19 @@ mod invariant_tests {
             let s = ::toml::to_string(&RepetitionOptions::default()).unwrap();
             let o: RepetitionOptions = ::toml::from_str(&s).unwrap();
             assert_eq!(o, RepetitionOptions::default());
+        }
+
+        /// The pattern category is spelled `"Uuids"` in a sidecar and is
+        /// on by default; a sidecar listing categories must name it.
+        #[test]
+        fn uuids_category() {
+            assert!(RepetitionOptions::default().ignores_uuids());
+            let doc = format!("{REQUIRED}ignored_categories = [\"Uuids\"]\n");
+            let o: RepetitionOptions = ::toml::from_str(&doc).unwrap();
+            assert!(o.ignores_uuids());
+            let doc = format!("{REQUIRED}ignored_categories = [\"English\"]\n");
+            let o: RepetitionOptions = ::toml::from_str(&doc).unwrap();
+            assert!(!o.ignores_uuids());
         }
     }
 }

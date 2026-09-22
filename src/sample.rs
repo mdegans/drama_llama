@@ -12,6 +12,7 @@ mod json;
 pub(crate) mod region;
 mod repetition;
 pub(crate) mod state;
+pub(crate) mod uuid;
 
 pub use grammar::{
     grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
@@ -1319,6 +1320,7 @@ impl SamplerConfig {
                 .unwrap_or_default(),
             constrained_ngram_stats: NGramStats::new(),
             constrained_step: 0,
+            uuid: Default::default(),
         }
     }
 }
@@ -1374,7 +1376,17 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // feels pressure from its own thought — regime (a) ingests that
     // into the persistent corpus only. Each corpus advances its own
     // step counter only when its pass executes.
-    if let Some(repetition) = &opts.repetition {
+    //
+    // (d) UUID — orthogonal to the three regimes: while the generated
+    //     tail is an unfinished UUID (`IgnoreCategory::Uuids`, see
+    //     `sample::uuid`), the whole pass is skipped in whichever regime
+    //     applies. UUID tokens enter neither corpus and consume no
+    //     window, exactly like a constrained span. The tracker is fed
+    //     by `SamplerState::advance`, after this call, so it reflects
+    //     the trailing token Phase 1 would record.
+    if let Some(repetition) =
+        opts.repetition.as_ref().filter(|_| !state.uuid.suspended())
+    {
         let incomplete = state.constrained_incomplete();
         // Split borrow: the passes read the resolved ignore set and
         // the matcher positions, and mutate one stats accumulator —
@@ -1745,8 +1757,26 @@ mod tests {
     // append-only. 8+ serve the constrained-repetition battery: a bare
     // quote and the merged close `",` — the token shape the bare-char
     // ignore list can never cover.
-    const PIECES: &[&str] =
-        &["", "a", "b", "c", "x", "", "a", "b", "\"", "\","];
+    const PIECES: &[&str] = &[
+        "",
+        "a",
+        "b",
+        "c",
+        "x",
+        "",
+        "a",
+        "b",
+        "\"",
+        "\",",
+        // 10+: the UUID battery — hex chunks and the dash, spelling
+        // `deadbeef-cafe-f00d-cafe-0123456789ab`.
+        "-",
+        "dead",
+        "beef",
+        "cafe",
+        "f00d",
+        "0123456789ab",
+    ];
     const EOS: Token = 0;
     const A: Token = 1;
     const B: Token = 2;
@@ -1754,6 +1784,15 @@ mod tests {
     const X: Token = 4;
     const QUOTE: Token = 8;
     const QUOTE_COMMA: Token = 9;
+    const DASH: Token = 10;
+    const DEAD: Token = 11;
+    const BEEF: Token = 12;
+    const CAFE: Token = 13;
+    const F00D: Token = 14;
+    const HEX12: Token = 15;
+    /// One canonical UUID as the mock spells it: `8-4-4-4-12`.
+    const UUID_TOKENS: [Token; 10] =
+        [DEAD, BEEF, DASH, CAFE, DASH, F00D, DASH, CAFE, DASH, HEX12];
     /// A reserved-style token whose piece is empty but which is NOT
     /// EOS — the Qwen3.6 shape behind the post-complete budget-burn
     /// loop.
@@ -3364,5 +3403,188 @@ mod tests {
         let (off_tokens, off_state) = run(false);
         assert_eq!(on_tokens, off_tokens);
         assert_eq!(on_state, off_state);
+    }
+
+    // ── UUID battery (`IgnoreCategory::Uuids`) ───────────────────────
+
+    /// Greedy, heavy repetition, no grammar. `uuids` toggles the one
+    /// category under test (the word-list categories would tokenize,
+    /// which the mock can't).
+    fn uuid_opts(uuids: bool) -> SamplerConfig {
+        let categories = uuids
+            .then_some(crate::data::ignore_category::IgnoreCategory::Uuids);
+        SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: Some(
+                RepetitionOptions::default()
+                    .set_ignored_categories(categories)
+                    .set_penalty_repeat(1.1)
+                    .set_penalty_freq(0.5)
+                    .set_penalty_present(0.5),
+            ),
+            deferred_grammar: None,
+            lazy_grammar: false,
+            ..SamplerConfig::default()
+        }
+    }
+
+    /// Emit `X`, then the UUID twice with `X` between, each intended
+    /// token narrowly ahead of the decoy `X`. Returns the chosen
+    /// stream, the intended stream, `step` after every sample, and the
+    /// final state.
+    fn drive_uuid_twice(
+        opts: &SamplerConfig,
+    ) -> (Vec<Token>, Vec<Token>, Vec<u64>, SamplerState) {
+        let mut intended = vec![X];
+        intended.extend_from_slice(&UUID_TOKENS);
+        intended.push(X);
+        intended.extend_from_slice(&UUID_TOKENS);
+
+        let mut state = state_for(opts);
+        let mut tokens: Vec<Token> = Vec::new();
+        let mut steps = Vec::new();
+        for &want in &intended {
+            let c = if want == X {
+                dense(&[(X, 4.0)])
+            } else {
+                dense(&[(want, 4.0), (X, 3.9)])
+            };
+            let tok =
+                sample_token(&tokens, c, opts, &mut state, &MockModel).unwrap();
+            steps.push(state.step());
+            state.advance(opts, tok, &MockModel);
+            tokens.push(tok);
+        }
+        (tokens, intended, steps, state)
+    }
+
+    /// The headline: with the category on, the second emission of the
+    /// UUID is byte-exact — no post-dash token is ever penalized — and
+    /// the pass ran only where the trailing token was outside an open
+    /// UUID: `X`, the first group, and the closing twelve.
+    #[test]
+    fn uuid_reemitted_verbatim_with_category_on() {
+        let (tokens, intended, steps, state) =
+            drive_uuid_twice(&uuid_opts(true));
+        assert_eq!(tokens, intended, "no decoy may win");
+
+        // Per emission, the pass runs at trailing X, DEAD, BEEF (the
+        // first group is exposed by design), skips the seven tokens
+        // from the first dash through the last, and runs again once
+        // the tail is a complete UUID (HEX12).
+        let expected: Vec<u64> = [
+            1, // trailing: nothing yet (first sample)
+            2, // X
+            3, // DEAD
+            4, // BEEF
+            4, 4, 4, 4, 4, 4, 4, // DASH .. DASH — suspended
+            5, // HEX12 — complete, pass resumes
+            6, // X
+            7, // DEAD
+            8, // BEEF
+            8, 8, 8, 8, 8, 8, 8, // suspended again
+        ]
+        .into();
+        assert_eq!(steps, expected);
+
+        // Nothing inside the UUID was recorded as a trailing token.
+        for inside in [DASH, CAFE, F00D] {
+            assert!(
+                state
+                    .ngram_stats()
+                    .get(&crate::NGram::from(inside))
+                    .is_none(),
+                "{inside} must never enter the corpus"
+            );
+        }
+        // The first group and the closing chunk were.
+        for exposed in [DEAD, BEEF, HEX12] {
+            assert!(state
+                .ngram_stats()
+                .get(&crate::NGram::from(exposed))
+                .is_some());
+        }
+    }
+
+    /// Counterfactual: category off, the same drive penalizes the
+    /// repeated inner chunks (even one UUID repeats its dashes) and the
+    /// decoy wins past the first dash — the gate, not the tuning, is
+    /// what protects the UUID.
+    #[test]
+    fn uuid_drifts_with_category_off() {
+        let (tokens, intended, steps, state) =
+            drive_uuid_twice(&uuid_opts(false));
+        let diverged = tokens
+            .iter()
+            .zip(&intended)
+            .position(|(a, b)| a != b)
+            .expect("the penalty must bite somewhere");
+        assert_eq!(tokens[diverged], X);
+        assert!(
+            diverged > 3,
+            "drift lands inside the region the gate would protect: \
+             {tokens:?}"
+        );
+        // Every sample ran the pass.
+        assert_eq!(steps, (1..=intended.len() as u64).collect::<Vec<_>>());
+        assert!(state.ngram_stats().get(&crate::NGram::from(CAFE)).is_some());
+    }
+
+    /// The tracker is turn-structure state: `reset_constraints` zeroes
+    /// it, `resumed_from` carries it, and a blob without the field
+    /// deserializes to the default (pre-feature snapshots).
+    #[test]
+    fn uuid_tracker_lifecycle() {
+        let opts = uuid_opts(true);
+        let mut state = state_for(&opts);
+        for &t in &UUID_TOKENS[..4] {
+            state.advance(&opts, t, &MockModel);
+        }
+        assert!(state.uuid.suspended(), "mid-UUID after `deadbeef-cafe`");
+
+        let resumed = SamplerState::resumed_from(&state, &opts, &MockModel);
+        assert_eq!(resumed.uuid, state.uuid, "stream state carries");
+
+        state.reset_constraints(&opts);
+        assert!(
+            !state.uuid.suspended(),
+            "a fresh turn cannot start mid-UUID"
+        );
+
+        // Off: `advance` never feeds it, whatever the pieces spell.
+        let off = uuid_opts(false);
+        let mut state = state_for(&off);
+        for &t in &UUID_TOKENS {
+            state.advance(&off, t, &MockModel);
+        }
+        assert_eq!(state.uuid, Default::default());
+    }
+
+    /// A mid-UUID tracker rides a snapshot bit-exactly, and a blob
+    /// without the field (pre-feature) deserializes to the default.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn uuid_tracker_serde() {
+        let opts = uuid_opts(true);
+        let mut state = state_for(&opts);
+        for &t in &UUID_TOKENS[..4] {
+            state.advance(&opts, t, &MockModel);
+        }
+        assert!(state.uuid.suspended());
+
+        let blob = serde_json::to_string(&state).unwrap();
+        let restored: SamplerState = serde_json::from_str(&blob).unwrap();
+        assert_eq!(restored, state);
+
+        // Textual surgery rather than a `Value` round-trip: `Value`
+        // can't carry the rng's u128.
+        let field = format!(
+            ",\"uuid\":{}",
+            serde_json::to_string(&state.uuid).unwrap()
+        );
+        assert!(blob.contains(&field), "{blob}");
+        let legacy: SamplerState =
+            serde_json::from_str(&blob.replace(&field, "")).unwrap();
+        assert!(!legacy.uuid.suspended(), "absent field ⇒ default");
     }
 }
