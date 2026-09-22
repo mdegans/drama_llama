@@ -64,6 +64,12 @@ fn model_path() -> Option<PathBuf> {
 /// A session for the multi-round #96 scenarios: rung 2, prefix cache
 /// on, and a real context size (the default `n_ctx` ends later rounds
 /// at the KV ceiling mid-tool-call).
+///
+/// Seeded via `common::test_seed()`: random by default (free fuzzing),
+/// printed on failure so the trajectory is replayable with
+/// `DRAMA_LLAMA_TEST_SEED=<n>`. The session seed selects the sampler
+/// fork branch (fresh state per call); these suites assert on
+/// emissions and the KV cache, never on the carried sampler stream.
 fn load_session_8k() -> Option<drama_llama::LlamaCppSession> {
     let path = model_path()?;
     let sidecar = path.with_extension("template.jinja");
@@ -81,7 +87,8 @@ fn load_session_8k() -> Option<drama_llama::LlamaCppSession> {
         )
         .expect("session load")
         .quiet()
-        .with_prefix_cache(true),
+        .with_prefix_cache(true)
+        .with_seed(Some(common::test_seed())),
     )
 }
 

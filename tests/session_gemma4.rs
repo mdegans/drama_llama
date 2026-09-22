@@ -36,11 +36,17 @@ fn install_template_sidecar() {
     std::fs::copy(&fixture, &sidecar).expect("install template sidecar");
 }
 
+/// Seeded via `common::test_seed()`: random by default (free fuzzing),
+/// printed on failure so the trajectory is replayable with
+/// `DRAMA_LLAMA_TEST_SEED=<n>`. The session seed selects the sampler
+/// fork branch (fresh state per call); these suites assert on
+/// emissions and the KV cache, never on the carried sampler stream.
 fn load_session() -> drama_llama::LlamaCppSession {
     install_template_sidecar();
     drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
+        .with_seed(Some(common::test_seed()))
 }
 
 fn count_letters_prompt() -> Prompt {
@@ -483,6 +489,7 @@ fn load_session_8k() -> drama_llama::LlamaCppSession {
     .expect("session load")
     .quiet()
     .with_prefix_cache(true)
+    .with_seed(Some(common::test_seed()))
 }
 
 /// #96, the downstream (agentkit) shape against the Gemma 4 dict

@@ -86,6 +86,12 @@ fn model_path() -> Option<PathBuf> {
 /// paper over: fail loudly and let the human delete it, because a
 /// green run under a stray sidecar is the failure this whole file
 /// exists to prevent.
+///
+/// Seeded via `common::test_seed()`: random by default (free fuzzing),
+/// printed on failure so the trajectory is replayable with
+/// `DRAMA_LLAMA_TEST_SEED=<n>`. The session seed selects the sampler
+/// fork branch (fresh state per call); these suites assert on
+/// emissions and the KV cache, never on the carried sampler stream.
 fn load_session() -> Option<drama_llama::LlamaCppSession> {
     let path = model_path()?;
     let sidecar = path.with_extension("template.jinja");
@@ -114,7 +120,8 @@ fn load_session() -> Option<drama_llama::LlamaCppSession> {
             drama_llama::LlamaCppOptions::default().with_n_ctx(8192),
         )
         .expect("session load")
-        .quiet(),
+        .quiet()
+        .with_seed(Some(common::test_seed())),
     )
 }
 
