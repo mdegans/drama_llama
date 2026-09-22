@@ -257,6 +257,16 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`known_id_exemption.md`](.claude/memory/known_id_exemption.md)
+  — **read before touching `sample::ids`, proposing a shape/regex
+  detector on the *emission* for identifiers, or "fixing" the seeding
+  fold to mirror the live pass.** 2026-09-22: the repetition penalty
+  spares *faithful copies of ids the prompt contains*
+  (`id_patterns` → per-call `known_ids` → `IdGuard` on the
+  `RegionGuard` hook), not id shapes — a shape tracker shipped and was
+  removed the same day because agents cite by bare 8-hex prefix. Carries
+  the documented edges and why live ≠ fold is not an invariant. Next:
+  multi-word ids / dates (#113), and #112 (Qwen3.8 tip never anchors).
 - [`v1_models_catalog.md`](.claude/memory/v1_models_catalog.md)
   — **read before touching blallama's listing routes, `src/catalog.rs`,
   or proposing a cross-backend metadata API.** `/v1/models` landed
