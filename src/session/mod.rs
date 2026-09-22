@@ -1096,6 +1096,42 @@ fn value_free_text<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
     }
 }
 
+/// The call's known identifiers: every match of every
+/// [`RepetitionOptions::id_patterns`] entry in the prompt's text — the
+/// system prompt, user turns, tool results, tool-call arguments (via
+/// [`block_free_text`]). **Not the model's prior thoughts**: that is
+/// where its own miscopied ids live, and protecting them would launder
+/// last turn's mistake into this turn's "known" set. Tool results and
+/// user content are ground truth; tool-call arguments are what was
+/// actually sent. The seeding gates (`seed_tool_results`, …) do not
+/// apply — an id in an unseeded tool result is still what the model
+/// copies. See `sample::ids`.
+fn prompt_known_ids(
+    prompt: &Prompt,
+    patterns: &[crate::IdPattern],
+) -> std::collections::BTreeSet<Vec<u8>> {
+    let mut ids = std::collections::BTreeSet::new();
+    if patterns.is_empty() {
+        return ids;
+    }
+    let mut leaves: Vec<&str> = Vec::new();
+    let blocks = prompt
+        .system
+        .iter()
+        .flat_map(|c| c.0.iter())
+        .chain(prompt.messages.iter().flat_map(|m| m.content.0.iter()));
+    for block in blocks {
+        if matches!(block, crate::Block::Thought { .. }) {
+            continue;
+        }
+        block_free_text(block, &mut leaves);
+    }
+    for text in leaves {
+        crate::sample::ids::collect_ids(patterns, text, &mut ids);
+    }
+    ids
+}
+
 /// Position in the prompt's prose fold: everything strictly before the
 /// cursor has been ingested into the n-gram stats. Ordered by prompt
 /// coverage (derived `Ord`: tools-only < system-done < message counts).
@@ -3411,9 +3447,17 @@ impl<B: Backend> Session<B> {
             self.engine.model.recommended_sampling(),
         );
 
+        // Known-id exemption (`sample::ids`): the per-call id set is
+        // derived from the prompt here, before any fold, so cold and
+        // resumed calls see the same set.
+        let repetition = self.sample_options.repetition.clone().map(|rep| {
+            let known = prompt_known_ids(prompt, rep.id_patterns());
+            rep.with_known_ids(known)
+        });
+
         predict_opts.sample_options = SamplerConfig {
             modes,
-            repetition: self.sample_options.repetition.clone(),
+            repetition,
             deferred_grammar,
             lazy_grammar: self.sample_options.lazy_grammar,
             banned_specials,
@@ -7990,6 +8034,71 @@ mod tests {
         seed_prose_block(&mut state, &call_block(), &rep_off, &FoldMock);
         assert_eq!(state.step(), 0);
         assert_eq!(state.ngram_stats().total_ngram_count(), 0);
+    }
+
+    /// Known-id extraction (`sample::ids`): every pattern match in the
+    /// system prompt, user text, tool-result text and tool-call
+    /// argument strings is a known id; a match inside the model's own
+    /// prior *thought* is not (that is where miscopied ids live); no
+    /// patterns ⇒ no ids and the options are untouched.
+    #[test]
+    fn test_prompt_known_ids_walks_leaves_but_not_thoughts() {
+        use misanthropic::prompt::message::{Content, Message};
+        use std::collections::BTreeSet;
+
+        const A: &str = "05676b9d-8aa7-430e-9138-444080e34065";
+        const B: &str = "2e875139-81de-44b5-b985-5dba63a04203";
+        const C: &str = "44dd7c9b-e1f2-4a3c-9d8e-5f6a7b8c9d00";
+        const WRONG: &str = "c966b99d-8aa7-430e-9138-444080e34065";
+        let patterns = [crate::IdPattern::new(
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        )
+        .unwrap()];
+
+        let prompt = Prompt {
+            system: Some(format!("Session GOV-2026.7; see {A}").into()),
+            messages: vec![
+                Message {
+                    role: crate::Role::User,
+                    content: format!("read post {B} please").into(),
+                },
+                Message {
+                    role: crate::Role::Assistant,
+                    content: Content(vec![
+                        crate::Block::Thought {
+                            thought: format!("the id is {WRONG}, I think")
+                                .into(),
+                            signature: "".into(),
+                        },
+                        crate::prompt::ToolUse::new(
+                            "get_content",
+                            serde_json::json!({ "id": B }),
+                        )
+                        .with_id("call_1")
+                        .into(),
+                    ]),
+                },
+                Message {
+                    role: crate::Role::User,
+                    content: Content(vec![crate::Block::ToolResult {
+                        result: misanthropic::tool::Result {
+                            tool_use_id: "call_1".into(),
+                            content: format!("comment {C} on {B}").into(),
+                            is_error: false,
+                            cache_control: None,
+                        },
+                    }]),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let ids = prompt_known_ids(&prompt, &patterns);
+        let want: BTreeSet<Vec<u8>> =
+            [A, B, C].iter().map(|s| s.as_bytes().to_vec()).collect();
+        assert_eq!(ids, want, "thought-only id {WRONG} must be absent");
+
+        assert!(prompt_known_ids(&prompt, &[]).is_empty());
     }
 
     /// Only `Text` folds inside a tool result: images (and any other

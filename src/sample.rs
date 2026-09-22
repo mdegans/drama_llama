@@ -1,23 +1,25 @@
 use crate::{ngram::NGramStats, Candidates, Probability, Token};
 // `is_protected` — the region-exit walk shared with the constrained
-// repetition penalty, reused by the region-scoped emit ban (#37).
-use crate::sample::region::RegionGuard as _;
+// repetition penalty, reused by the region-scoped emit ban (#37) and
+// composed with the known-id guard.
+use crate::sample::region::RegionGuard;
 
 use rand::RngExt as _;
 
 use std::num::NonZeroUsize;
 
 pub(crate) mod grammar;
+pub(crate) mod ids;
 mod json;
 pub(crate) mod region;
 mod repetition;
 pub(crate) mod state;
-pub(crate) mod uuid;
 
 pub use grammar::{
     grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
     CompiledGrammar, Grammar, GrammarError, GrammarState, GrammarStats,
 };
+pub use ids::IdPattern;
 pub use json::{JsonError, JsonState};
 pub use repetition::{
     apply_sample_repetition_ngram, RepetitionError, RepetitionOptions,
@@ -1320,7 +1322,6 @@ impl SamplerConfig {
                 .unwrap_or_default(),
             constrained_ngram_stats: NGramStats::new(),
             constrained_step: 0,
-            uuid: Default::default(),
         }
     }
 }
@@ -1377,17 +1378,16 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // into the persistent corpus only. Each corpus advances its own
     // step counter only when its pass executes.
     //
-    // (d) UUID — orthogonal to the three regimes: while the generated
-    //     tail is an unfinished UUID (`IgnoreCategory::Uuids`, see
-    //     `sample::uuid`), the whole pass is skipped in whichever regime
-    //     applies. UUID tokens enter neither corpus and consume no
-    //     window, exactly like a constrained span. The tracker is fed
-    //     by `SamplerState::advance`, after this call, so it reflects
-    //     the trailing token Phase 1 would record.
-    if let Some(repetition) =
-        opts.repetition.as_ref().filter(|_| !state.uuid.suspended())
-    {
+    // Orthogonal to the regimes: the known-id guard (`sample::ids`).
+    // A token that faithfully copies an identifier from the prompt is
+    // exempt from the logit reduction in (a) and (b) alike — recorded,
+    // never penalized. Built per step from the token history; nothing
+    // in `state`.
+    if let Some(repetition) = &opts.repetition {
         let incomplete = state.constrained_incomplete();
+        let id_guard =
+            ids::IdGuard::build(tokens, repetition.known_ids(), model);
+        let id_guard = id_guard.as_ref().map(|g| g as &dyn RegionGuard);
         // Split borrow: the passes read the resolved ignore set and
         // the matcher positions, and mutate one stats accumulator —
         // disjoint state fields.
@@ -1402,13 +1402,14 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
             ..
         } = &mut *state;
         if !incomplete {
-            candidates = apply_sample_repetition_ngram(
+            candidates = repetition::apply_sample_repetition_ngram_guarded(
                 candidates,
                 tokens,
                 *step,
                 repetition,
                 resolved_ignored,
                 ngram_stats,
+                id_guard,
             )?;
             *step += 1;
         } else if repetition.constrained_regions() {
@@ -1422,6 +1423,12 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                 opts.deferred_grammar.as_ref(),
                 model,
             ) {
+                let region_guard: &dyn RegionGuard = &guard;
+                let both = id_guard.map(|g| region::Either(region_guard, g));
+                let guard: &dyn RegionGuard = match &both {
+                    Some(both) => both,
+                    None => region_guard,
+                };
                 candidates = repetition::apply_sample_repetition_ngram_guarded(
                     candidates,
                     tokens,
@@ -1429,7 +1436,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                     repetition,
                     resolved_ignored,
                     constrained_ngram_stats,
-                    Some(&guard),
+                    Some(guard),
                 )?;
                 *constrained_step += 1;
             }
@@ -1776,6 +1783,8 @@ mod tests {
         "cafe",
         "f00d",
         "0123456789ab",
+        // 16: a boundary piece — separates identifier words.
+        " ",
     ];
     const EOS: Token = 0;
     const A: Token = 1;
@@ -1790,6 +1799,7 @@ mod tests {
     const CAFE: Token = 13;
     const F00D: Token = 14;
     const HEX12: Token = 15;
+    const SPACE: Token = 16;
     /// One canonical UUID as the mock spells it: `8-4-4-4-12`.
     const UUID_TOKENS: [Token; 10] =
         [DEAD, BEEF, DASH, CAFE, DASH, F00D, DASH, CAFE, DASH, HEX12];
@@ -3405,186 +3415,149 @@ mod tests {
         assert_eq!(on_state, off_state);
     }
 
-    // ── UUID battery (`IgnoreCategory::Uuids`) ───────────────────────
+    // ── Known-id battery (`sample::ids`) ─────────────────────────────
 
-    /// Greedy, heavy repetition, no grammar. `uuids` toggles the one
-    /// category under test (the word-list categories would tokenize,
-    /// which the mock can't).
-    fn uuid_opts(uuids: bool) -> SamplerConfig {
-        let categories = uuids
-            .then_some(crate::data::ignore_category::IgnoreCategory::Uuids);
+    /// The mock's one UUID, as the pieces spell it.
+    const UUID_TEXT: &str = "deadbeef-cafe-f00d-cafe-0123456789ab";
+
+    /// Greedy, heavy repetition, no grammar; `known` installs the UUID
+    /// as the call's one known id (or nothing).
+    fn id_opts(known: bool) -> SamplerConfig {
+        let mut rep = RepetitionOptions::default()
+            .set_ignored_categories(std::iter::empty())
+            .set_penalty_repeat(1.1)
+            .set_penalty_freq(0.5)
+            .set_penalty_present(0.5);
+        if known {
+            rep = rep.with_known_ids(std::collections::BTreeSet::from([
+                UUID_TEXT.as_bytes().to_vec(),
+            ]));
+        }
         SamplerConfig {
             modes: vec![SamplingMode::Greedy],
-            repetition: Some(
-                RepetitionOptions::default()
-                    .set_ignored_categories(categories)
-                    .set_penalty_repeat(1.1)
-                    .set_penalty_freq(0.5)
-                    .set_penalty_present(0.5),
-            ),
+            repetition: Some(rep),
             deferred_grammar: None,
             lazy_grammar: false,
             ..SamplerConfig::default()
         }
     }
 
-    /// Emit `X`, then the UUID twice with `X` between, each intended
-    /// token narrowly ahead of the decoy `X`. Returns the chosen
-    /// stream, the intended stream, `step` after every sample, and the
-    /// final state.
-    fn drive_uuid_twice(
+    /// Emit ` `, then the UUID twice with ` ` between, each intended
+    /// token narrowly ahead of the decoy ` ` (a boundary piece — `x`
+    /// would glue onto the partial word). Returns the chosen and the
+    /// intended streams and the final state.
+    fn drive_id_twice(
         opts: &SamplerConfig,
-    ) -> (Vec<Token>, Vec<Token>, Vec<u64>, SamplerState) {
-        let mut intended = vec![X];
+    ) -> (Vec<Token>, Vec<Token>, SamplerState) {
+        let mut intended = vec![SPACE];
         intended.extend_from_slice(&UUID_TOKENS);
-        intended.push(X);
+        intended.push(SPACE);
         intended.extend_from_slice(&UUID_TOKENS);
 
         let mut state = state_for(opts);
         let mut tokens: Vec<Token> = Vec::new();
-        let mut steps = Vec::new();
         for &want in &intended {
-            let c = if want == X {
-                dense(&[(X, 4.0)])
+            let c = if want == SPACE {
+                dense(&[(SPACE, 4.0)])
             } else {
-                dense(&[(want, 4.0), (X, 3.9)])
+                dense(&[(want, 4.0), (SPACE, 3.9)])
             };
             let tok =
                 sample_token(&tokens, c, opts, &mut state, &MockModel).unwrap();
-            steps.push(state.step());
             state.advance(opts, tok, &MockModel);
             tokens.push(tok);
         }
-        (tokens, intended, steps, state)
+        (tokens, intended, state)
     }
 
-    /// The headline: with the category on, the second emission of the
-    /// UUID is byte-exact — no post-dash token is ever penalized — and
-    /// the pass ran only where the trailing token was outside an open
-    /// UUID: `X`, the first group, and the closing twelve.
+    /// The headline: a known id is re-emitted byte-exact under heavy
+    /// penalty — **every** token, the first group included — while the
+    /// corpus still records it (exempt at apply time, not invisible).
     #[test]
-    fn uuid_reemitted_verbatim_with_category_on() {
-        let (tokens, intended, steps, state) =
-            drive_uuid_twice(&uuid_opts(true));
+    fn known_id_reemitted_verbatim() {
+        let (tokens, intended, state) = drive_id_twice(&id_opts(true));
         assert_eq!(tokens, intended, "no decoy may win");
-
-        // Per emission, the pass runs at trailing X, DEAD, BEEF (the
-        // first group is exposed by design), skips the seven tokens
-        // from the first dash through the last, and runs again once
-        // the tail is a complete UUID (HEX12).
-        let expected: Vec<u64> = [
-            1, // trailing: nothing yet (first sample)
-            2, // X
-            3, // DEAD
-            4, // BEEF
-            4, 4, 4, 4, 4, 4, 4, // DASH .. DASH — suspended
-            5, // HEX12 — complete, pass resumes
-            6, // X
-            7, // DEAD
-            8, // BEEF
-            8, 8, 8, 8, 8, 8, 8, // suspended again
-        ]
-        .into();
-        assert_eq!(steps, expected);
-
-        // Nothing inside the UUID was recorded as a trailing token.
-        for inside in [DASH, CAFE, F00D] {
+        assert_eq!(state.step(), intended.len() as u64, "every pass ran");
+        for inside in [DEAD, DASH, CAFE, HEX12] {
             assert!(
                 state
                     .ngram_stats()
                     .get(&crate::NGram::from(inside))
-                    .is_none(),
-                "{inside} must never enter the corpus"
+                    .is_some(),
+                "{inside} is recorded, just never penalized"
             );
-        }
-        // The first group and the closing chunk were.
-        for exposed in [DEAD, BEEF, HEX12] {
-            assert!(state
-                .ngram_stats()
-                .get(&crate::NGram::from(exposed))
-                .is_some());
         }
     }
 
-    /// Counterfactual: category off, the same drive penalizes the
-    /// repeated inner chunks (even one UUID repeats its dashes) and the
-    /// decoy wins past the first dash — the gate, not the tuning, is
-    /// what protects the UUID.
+    /// Counterfactual: no known ids, the same drive drifts — the
+    /// dashes repeat within one UUID and the decoy wins past the first.
     #[test]
-    fn uuid_drifts_with_category_off() {
-        let (tokens, intended, steps, state) =
-            drive_uuid_twice(&uuid_opts(false));
+    fn unknown_id_drifts() {
+        let (tokens, intended, _) = drive_id_twice(&id_opts(false));
         let diverged = tokens
             .iter()
             .zip(&intended)
             .position(|(a, b)| a != b)
             .expect("the penalty must bite somewhere");
-        assert_eq!(tokens[diverged], X);
-        assert!(
-            diverged > 3,
-            "drift lands inside the region the gate would protect: \
-             {tokens:?}"
-        );
-        // Every sample ran the pass.
-        assert_eq!(steps, (1..=intended.len() as u64).collect::<Vec<_>>());
-        assert!(state.ngram_stats().get(&crate::NGram::from(CAFE)).is_some());
+        assert_eq!(tokens[diverged], SPACE);
+        assert!(diverged > 3, "{tokens:?}");
     }
 
-    /// The tracker is turn-structure state: `reset_constraints` zeroes
-    /// it, `resumed_from` carries it, and a blob without the field
-    /// deserializes to the default (pre-feature snapshots).
+    /// Steering: after two emissions, at a word boundary, the faithful
+    /// first token beats a heavily-favoured wrong start with the id
+    /// known, and loses to it without — only copies of known ids are
+    /// exempt; everything else keeps its full penalty.
     #[test]
-    fn uuid_tracker_lifecycle() {
-        let opts = uuid_opts(true);
-        let mut state = state_for(&opts);
-        for &t in &UUID_TOKENS[..4] {
-            state.advance(&opts, t, &MockModel);
-        }
-        assert!(state.uuid.suspended(), "mid-UUID after `deadbeef-cafe`");
-
-        let resumed = SamplerState::resumed_from(&state, &opts, &MockModel);
-        assert_eq!(resumed.uuid, state.uuid, "stream state carries");
-
-        state.reset_constraints(&opts);
-        assert!(
-            !state.uuid.suspended(),
-            "a fresh turn cannot start mid-UUID"
-        );
-
-        // Off: `advance` never feeds it, whatever the pieces spell.
-        let off = uuid_opts(false);
-        let mut state = state_for(&off);
-        for &t in &UUID_TOKENS {
-            state.advance(&off, t, &MockModel);
-        }
-        assert_eq!(state.uuid, Default::default());
+    fn known_id_steers_toward_faithful_start() {
+        let pick = |known: bool| -> Token {
+            let opts = id_opts(known);
+            let (tokens, _, mut state) = drive_id_twice(&opts);
+            let mut tokens = tokens;
+            // Open a new word.
+            let sp = sample_token(
+                &tokens,
+                dense(&[(SPACE, 4.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap();
+            state.advance(&opts, sp, &MockModel);
+            tokens.push(sp);
+            // `cafe` has been seen four times, `dead` twice; `cafe` is
+            // not how any known id starts.
+            sample_token(
+                &tokens,
+                dense(&[(CAFE, 6.0), (DEAD, 4.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap()
+        };
+        assert_eq!(pick(true), DEAD, "exempt from its first byte");
+        assert_eq!(pick(false), CAFE, "no known ids: raw logits + penalty");
     }
 
-    /// A mid-UUID tracker rides a snapshot bit-exactly, and a blob
-    /// without the field (pre-feature) deserializes to the default.
-    #[cfg(feature = "serde")]
+    /// Regime (b): inside a grammar string body the id guard composes
+    /// with the region guard (`Either`). With `aaaaaaaa` known, the
+    /// content token `a` is a faithful copy for exactly eight steps and
+    /// is penalized on the ninth — at which point the protected exit
+    /// `",` wins and the grammar completes.
     #[test]
-    fn uuid_tracker_serde() {
-        let opts = uuid_opts(true);
-        let mut state = state_for(&opts);
-        for &t in &UUID_TOKENS[..4] {
-            state.advance(&opts, t, &MockModel);
-        }
-        assert!(state.uuid.suspended());
-
-        let blob = serde_json::to_string(&state).unwrap();
-        let restored: SamplerState = serde_json::from_str(&blob).unwrap();
-        assert_eq!(restored, state);
-
-        // Textual surgery rather than a `Value` round-trip: `Value`
-        // can't carry the rng's u128.
-        let field = format!(
-            ",\"uuid\":{}",
-            serde_json::to_string(&state.uuid).unwrap()
-        );
-        assert!(blob.contains(&field), "{blob}");
-        let legacy: SamplerState =
-            serde_json::from_str(&blob.replace(&field, "")).unwrap();
-        assert!(!legacy.uuid.suspended(), "absent field ⇒ default");
+    fn known_id_exempt_inside_free_region() {
+        let mut opts = str_opts(true, false);
+        let rep = opts.repetition.take().unwrap();
+        opts.repetition =
+            Some(rep.with_known_ids(std::collections::BTreeSet::from([
+                b"aaaaaaaa".to_vec(),
+            ])));
+        let (state, tokens, completed) = drive_string_island(&opts, 16);
+        assert!(completed, "{tokens:?}");
+        let mut want = vec![QUOTE];
+        want.extend(std::iter::repeat_n(A, 8));
+        want.push(QUOTE_COMMA);
+        assert_eq!(tokens, want);
+        assert!(state.constrained_step() > 0);
     }
 }

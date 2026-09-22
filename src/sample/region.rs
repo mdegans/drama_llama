@@ -46,6 +46,19 @@ pub(crate) trait RegionGuard {
     fn is_protected(&self, token: Token) -> bool;
 }
 
+/// Two guards, either of which protects: the region guard and the
+/// known-id guard (`sample::ids`) both apply inside a free region.
+pub(crate) struct Either<'a>(
+    pub(crate) &'a dyn RegionGuard,
+    pub(crate) &'a dyn RegionGuard,
+);
+
+impl RegionGuard for Either<'_> {
+    fn is_protected(&self, token: Token) -> bool {
+        self.0.is_protected(token) || self.1.is_protected(token)
+    }
+}
+
 /// One active, incomplete, currently-permissive constraint.
 enum GuardEntry<'a> {
     Grammar {

@@ -11,6 +11,8 @@ use crate::{
     Candidates, Token,
 };
 
+pub use super::ids::IdPattern;
+
 use std::{
     collections::BTreeSet,
     num::{NonZeroU32, NonZeroU8},
@@ -54,12 +56,30 @@ use super::DELETE_ICON;
 #[cfg_attr(feature = "serde", serde(try_from = "RepetitionOptionsShadow"))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepetitionOptions {
-    /// Categories of text to ignore. The word-list categories resolve to
-    /// tokens that are never penalized; [`IgnoreCategory::Uuids`]
-    /// suspends the pass while a UUID is being emitted.
+    /// Sets of tokens to ignore, by language. These are never penalized.
     pub(crate) ignored_categories: BTreeSet<IgnoreCategory>,
     /// [`NGram`]s to ignore. These are never penalized.
     pub(crate) ignored: BTreeSet<NGram>,
+    /// Identifier patterns. Per call, `Session` runs each over the
+    /// prompt's text (tool results, user turns, tool-call arguments —
+    /// not the model's prior thoughts) and every match becomes a
+    /// *known id*; a token that faithfully copies one, from its first
+    /// byte, is never penalized (see [`IdGuard`]). An id must be
+    /// re-emitted verbatim, and stacked n-gram penalties otherwise push
+    /// the model off it after a few sightings. Only faithful copies
+    /// are exempt: a string that is a prefix of no known id keeps its
+    /// full penalty. Default empty — which strings are identifiers is
+    /// the consumer's knowledge. A pattern as loose as `\w+` makes
+    /// every word a known id and disables the penalty; keep them
+    /// specific.
+    ///
+    /// [`IdGuard`]: super::ids::IdGuard
+    pub(crate) id_patterns: Vec<IdPattern>,
+    /// The call's known ids, derived from the prompt by `Session`
+    /// (`session::prompt_known_ids`) — per-call data, never written to
+    /// a sidecar or carried in a cached snapshot.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) known_ids: BTreeSet<Vec<u8>>,
     /// Sliding-window size. Only n-gram occurrences within the last
     /// `window_size` generation steps contribute to the penalty. Older
     /// occurrences are evicted by [`NGramStats::evict_outside_window`].
@@ -157,6 +177,8 @@ struct RepetitionOptionsShadow {
     ignored_categories: BTreeSet<IgnoreCategory>,
     #[serde(default)]
     ignored: BTreeSet<NGram>,
+    #[serde(default)]
+    id_patterns: Vec<IdPattern>,
     #[serde(default = "default_window_size")]
     window_size: NonZeroU32,
     #[serde(default = "default_decay")]
@@ -197,6 +219,9 @@ impl TryFrom<RepetitionOptionsShadow> for RepetitionOptions {
         Ok(Self {
             ignored_categories: s.ignored_categories,
             ignored: s.ignored,
+            id_patterns: s.id_patterns,
+            // Per-call data; a sidecar never carries it.
+            known_ids: BTreeSet::new(),
             window_size: s.window_size,
             decay: s.decay,
             penalty_max_count: s.penalty_max_count,
@@ -256,19 +281,19 @@ impl Default for RepetitionOptions {
             // structured output for no anti-loop benefit. Punctuation is also
             // default-on for the same reason — prose `. , ; : ! ?` have no
             // lexical variety, so accumulating penalty on `.` biases toward
-            // run-ons. UUIDs likewise: an id must be re-emitted verbatim,
-            // and stacked penalties push the model off it after a few
-            // sightings. Users can override by calling
-            // `set_ignored_categories(vec![])`. Note the serde shadow
-            // defaults the set to EMPTY, so a sidecar that lists
-            // categories must name each one.
+            // run-ons. Users can override by calling
+            // `set_ignored_categories(vec![])`.
             ignored_categories: BTreeSet::from([
                 IgnoreCategory::English,
                 IgnoreCategory::Json,
                 IgnoreCategory::Punctuation,
-                IgnoreCategory::Uuids,
             ]),
             ignored: BTreeSet::new(),
+            // Opt-in per model: which strings count as identifiers is
+            // the consumer's knowledge (Agora's UUIDs and GOV ids), not
+            // the crate's.
+            id_patterns: Vec::new(),
+            known_ids: BTreeSet::new(),
             window_size: default_window_size(),
             decay: default_decay(),
             penalty_max_count: NonZeroU8::new(1).unwrap(),
@@ -337,11 +362,36 @@ impl RepetitionOptions {
         &self.ignored_categories
     }
 
-    /// Whether [`IgnoreCategory::Uuids`] is on: the pass is suspended
-    /// while the generated tail is an unfinished UUID. The one
-    /// category that resolves to no tokens — see `sample::uuid`.
-    pub fn ignores_uuids(&self) -> bool {
-        self.ignored_categories.contains(&IgnoreCategory::Uuids)
+    /// Identifier patterns (see [`IdPattern`]). Every match of every
+    /// pattern in the prompt becomes a known id for the call, and a
+    /// token that faithfully extends one is never penalized.
+    pub fn id_patterns(&self) -> &[IdPattern] {
+        &self.id_patterns
+    }
+
+    /// Set the identifier patterns. Compiled already (an [`IdPattern`]
+    /// is a compiled regex), so this cannot fail.
+    pub fn set_id_patterns<It>(mut self, patterns: It) -> Self
+    where
+        It: IntoIterator<Item = IdPattern>,
+    {
+        self.id_patterns = patterns.into_iter().collect();
+        self
+    }
+
+    /// Install the call's known-id set (`Session` derives it from the
+    /// prompt with [`Self::id_patterns`] — see `session::prompt_known_ids`).
+    pub(crate) fn with_known_ids(
+        mut self,
+        known_ids: BTreeSet<Vec<u8>>,
+    ) -> Self {
+        self.known_ids = known_ids;
+        self
+    }
+
+    /// The call's known-id set. Empty unless a `Session` filled it.
+    pub(crate) fn known_ids(&self) -> &BTreeSet<Vec<u8>> {
+        &self.known_ids
     }
 
     /// The effective ignore set: [`Self::ignored`] plus every
@@ -642,7 +692,7 @@ impl RepetitionOptions {
         // FIXME: for internationalization, we should put all the strings in a
         // separate file and use gettext or similar. There may be something
         // better from the Rust ecosystem, but I'm not aware of it.
-        const IGNORE_CATEGORY_HELP: &str = "Categories of text the repetition penalty ignores: common-word lists (stopwords, JSON syntax, punctuation) and UUIDs, which are matched by shape as they stream. The idea is to allow a higher repetition penalty without penalizing what has to repeat. This is experimental.";
+        const IGNORE_CATEGORY_HELP: &str = "Common tokens that are often ignored in NLP tasks. These options allow you to ignore sets of tokens for the purpose of penalizing repetition. The idea is to allow a higher repetition penalty without penalizing common words. This is experimental.";
 
         // IgnoreCategories
         if !self.ignored_categories.is_empty() {
@@ -704,6 +754,18 @@ impl RepetitionOptions {
 
             if let Some(ngram) = to_remove {
                 self.ignored.remove(&ngram);
+            }
+        }
+
+        // Identifier patterns — read-only, like the regex stop sequences
+        // in `PredictOptions`: a sidecar concern, not a live knob.
+        if !self.id_patterns.is_empty() {
+            ui.label("Identifier patterns").on_hover_text_at_pointer(
+                "Regexes for identifiers in the prompt (ids, UUIDs). A token \
+                 that faithfully copies one is never penalized.",
+            );
+            for pattern in &self.id_patterns {
+                ui.monospace(pattern.as_str());
             }
         }
 
@@ -1404,17 +1466,34 @@ mod invariant_tests {
             assert_eq!(o, RepetitionOptions::default());
         }
 
-        /// The pattern category is spelled `"Uuids"` in a sidecar and is
-        /// on by default; a sidecar listing categories must name it.
+        /// `id_patterns` round-trips as regex source strings; the
+        /// per-call `known_ids` never reaches the sidecar.
         #[test]
-        fn uuids_category() {
-            assert!(RepetitionOptions::default().ignores_uuids());
-            let doc = format!("{REQUIRED}ignored_categories = [\"Uuids\"]\n");
+        fn id_patterns_roundtrip_known_ids_skipped() {
+            const UUID: &str =
+                "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+            let doc = format!("{REQUIRED}id_patterns = [{UUID:?}]\n");
             let o: RepetitionOptions = ::toml::from_str(&doc).unwrap();
-            assert!(o.ignores_uuids());
-            let doc = format!("{REQUIRED}ignored_categories = [\"English\"]\n");
-            let o: RepetitionOptions = ::toml::from_str(&doc).unwrap();
-            assert!(!o.ignores_uuids());
+            assert_eq!(o.id_patterns().len(), 1);
+            assert_eq!(o.id_patterns()[0].as_str(), UUID);
+
+            let o = o.with_known_ids(BTreeSet::from([b"deadbeef".to_vec()]));
+            let s = ::toml::to_string(&o).unwrap();
+            assert!(s.contains("id_patterns"), "{s}");
+            assert!(!s.contains("known_ids"), "{s}");
+            let back: RepetitionOptions = ::toml::from_str(&s).unwrap();
+            assert_eq!(back.id_patterns(), o.id_patterns());
+            assert!(back.known_ids().is_empty(), "per-call data, not config");
+        }
+
+        /// An invalid pattern is rejected at the door, like an inverted
+        /// n-gram range — a sidecar is read every run and never
+        /// rewritten, so a silent skip would hide the breakage forever.
+        #[test]
+        fn invalid_id_pattern_rejected() {
+            let doc = format!("{REQUIRED}id_patterns = [\"[0-9\"]\n");
+            let err = ::toml::from_str::<RepetitionOptions>(&doc).unwrap_err();
+            assert!(err.to_string().contains("regex"), "{err}");
         }
     }
 }

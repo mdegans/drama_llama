@@ -123,19 +123,6 @@ pub struct SamplerState {
     /// serialization rationale as [`Self::constrained_ngram_stats`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) constrained_step: u64,
-    /// UUID shape scanner for [`IgnoreCategory::Uuids`]: fed each
-    /// accepted token's piece by [`Self::advance`] (only when the
-    /// category is on), consulted by `sample_token` to suspend the
-    /// whole repetition pass — either regime — while the generated
-    /// tail is an unfinished UUID. Stream state: carried by
-    /// `resumed_from` like `ngram_stats`, but *turn-structure* state
-    /// too, so [`Self::reset_constraints`] zeroes it alongside the
-    /// matchers (a fresh assistant turn cannot start mid-UUID).
-    /// `serde(default)` so pre-feature blobs deserialize.
-    ///
-    /// [`IgnoreCategory::Uuids`]: crate::data::ignore_category::IgnoreCategory::Uuids
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub(crate) uuid: super::uuid::UuidTracker,
 }
 
 impl SamplerState {
@@ -368,18 +355,6 @@ impl SamplerState {
                 let _ = d.matcher.advance_bytes(&spec.grammar.grammar, &buf);
             }
         }
-        // UUID scan (`IgnoreCategory::Uuids`): this runs AFTER
-        // `sample_token` for the token it sampled, so at the next
-        // sample the tracker reflects exactly the trailing token whose
-        // n-grams the pass would record.
-        if config
-            .repetition
-            .as_ref()
-            .is_some_and(|r| r.ignores_uuids())
-        {
-            piece(&mut buf, &mut computed);
-            self.uuid.feed(&buf);
-        }
     }
 
     /// Build the working state for a call that resumes `cached` under
@@ -400,7 +375,7 @@ impl SamplerState {
     ///   grammar, no identity to mismatch).
     /// - The deferred matcher carries (flag + position) iff the spec's
     ///   grammar identity matches; else fresh inactive root.
-    /// - `mu`, the working rng, `ngram_stats` and the UUID tracker carry
+    /// - `mu`, the working rng, and `ngram_stats` carry
     ///   unconditionally — they are the stream being resumed.
     /// - `resolved_ignored` is recomputed from `config` × `model`: it
     ///   is a config memo riding the state, and repetition knobs are a
@@ -472,14 +447,12 @@ impl SamplerState {
             // See the field docs.
             constrained_ngram_stats: NGramStats::default(),
             constrained_step: 0,
-            uuid: cached.uuid,
         }
     }
 
     /// Reset every constraint matcher (eager, JSON, deferred) to its
-    /// grammar's root — and the UUID tracker, which is turn-structure
-    /// state by the same argument — keeping the stream fields (`mu`,
-    /// rng, n-gram stats, `step`) intact.
+    /// grammar's root, keeping the stream fields (`mu`, rng, n-gram
+    /// stats, `step`) intact.
     ///
     /// [`resumed_from`](Self::resumed_from) carries matcher positions
     /// whenever the grammar identity matches, which is correct only
@@ -493,13 +466,7 @@ impl SamplerState {
     /// an immediate EOS: the 0-output-token second-round bug. The
     /// session decides continuity (`matcher_carry_valid` in
     /// `session::build_initial_state`); this is the reset half.
-    ///
-    /// The UUID tracker rides along for the same reason: a resume whose
-    /// suffix folds no prose (tool-result-only message with seeding
-    /// off, image-only turn) would otherwise open the new turn with a
-    /// stale tail from a reply truncated mid-UUID.
     pub(crate) fn reset_constraints(&mut self, config: &SamplerConfig) {
-        self.uuid.reset();
         self.matchers = config
             .modes
             .iter()
