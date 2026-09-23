@@ -1,10 +1,17 @@
 /target
-# Everything in models/ is local (weights, symlinks, per-model deploy
-# config — sampling/dialect/template sidecars) except the README.
+# Everything in models/ is local (weights, symlinks, dialect/template
+# sidecars) except the README and the sampling sidecars: those are what
+# blallama actually serves with, so they are versioned — a diff shows a
+# missing id_patterns block before an agent cohort runs without it.
+# `model.sampling.toml` stays local: `model.gguf` is a per-machine link
+# (a different quant on each box), and the model tests load through it.
+# Backups (`*.sampling.toml.bak*`) do not match and stay local.
 # Canonical patched templates live versioned under
 # tests/fixtures/templates/.
 models/*
 !models/README.md
+!models/*.sampling.toml
+models/model.sampling.toml
 /Cargo.lock
 .claude/scheduled_tasks.lock
 model.sampling.toml

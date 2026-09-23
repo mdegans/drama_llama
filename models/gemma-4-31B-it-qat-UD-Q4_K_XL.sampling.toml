@@ -1,0 +1,48 @@
+# drama_llama per-model sampling sidecar.
+# Edit to tune sampling for this model. Delete to reset; the
+# next load will rewrite this file.
+#
+# The mode chain below was seeded from this model's own
+# `general.sampling.*` metadata — what the model asks for.
+#
+# See drama_llama::sidecar module docs for the precedence
+# ladder and what's intentionally excluded (Json, Grammar,
+# Deny modes — those are per-request runtime, not per-model
+# defaults).
+
+lazy_grammar = true
+banned_specials = []
+
+[[modes]]
+
+[modes.TopK]
+k = 64
+
+[[modes]]
+
+[modes.TopP]
+p = 0.95
+min_keep = 1
+
+[[modes]]
+
+[modes.Temperature]
+t = 1.0
+
+[repetition]
+ignored_categories = [
+    "English",
+    "Json",
+    "Punctuation",
+]
+ignored = []
+window_size = 256
+decay = 0.949999988079071
+penalty_max_count = 1
+ngram_min_size = 1
+ngram_max_size = 4
+penalty_repeat = 1.0499999523162842
+penalty_freq = 0.125
+penalty_present = 0.0625
+surgical = true
+constrained_regions = true
