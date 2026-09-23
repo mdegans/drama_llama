@@ -1,8 +1,12 @@
 # drama_llama per-model sampling sidecar (hand-written; versioned in
 # the drama_llama repo — blallama loads it beside the GGUF).
 #
-# Mode chain: top-k 1024 as a pre-cut, then locally typical at p = 0.9
-# (min_keep 3). The pre-cut is for speed, not shape: without it locally
+# Mode chain: top-k 1024 as a pre-cut, then locally typical at p = 0.5
+# (min_keep 3) — deliberately narrow on gpt-oss, unlike the other
+# sidecars (0.9). At 0.9 the first live Agora cycle (2026-09-23) hit the
+# #101 off-canonical Harmony framing (`<|start|> assistant`, spaced) on
+# nearly every turn: the canonical header wins when sampling is narrow.
+# OpenAI recommends temperature 1.0 / top_p 1.0, which is wider still. The pre-cut is for speed, not shape: without it locally
 # typical computes entropy over the whole vocabulary (~250k on Qwen)
 # every token. Keep it generous so it never binds. Higher p is *less* constrained (1.0 is a no-op). It was
 # 0.5 until 2026-09-23, which collapses to a single candidate whenever
@@ -19,7 +23,7 @@ k = 1024
 [[modes]]
 
 [modes.LocallyTypical]
-p = 0.9
+p = 0.5
 min_keep = 3
 
 [repetition]
