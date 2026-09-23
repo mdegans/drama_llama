@@ -420,12 +420,15 @@ def selection(
         # A named test is asked for by name, so run it whichever list it
         # is on rather than making the caller remember — and uncaptured,
         # so the suites' block/emission dumps are visible on a pass and
-        # not only on a failure.
-        tier, extra = TIERS["all"], ["--no-capture"]
+        # not only on a failure. An explicit `--tier` still wins: a
+        # substring can match model tests the caller did not mean to
+        # load (e.g. while another model job holds the GPU).
+        tier = TIERS[effective_tier(args)]
+        extra = ["--no-capture"]
         name = f"{config.name}-{sanitize(args.filter)}"
     else:
-        tier, extra = TIERS[args.tier], []
-        name = f"{config.name}-{args.tier}"
+        tier, extra = TIERS[effective_tier(args)], []
+        name = f"{config.name}-{effective_tier(args)}"
 
     if args.filter or args.exclude:
         extra += ["-E", filterset(args.filter, args.exclude)]
@@ -478,14 +481,19 @@ def preflight_gpu(features: list[str]) -> int:
     return 0
 
 
+def effective_tier(args: argparse.Namespace) -> str:
+    """`--tier` if given; else `all` under `--filter`, `unignored` without."""
+    if args.tier is not None:
+        return args.tier
+    return "all" if args.filter else "unignored"
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not DRY_RUN:
         require_nextest()
     config = resolve_config(args.config)
     # `--filter` implies the `all` tier, so it warns too.
-    warn_slow_variant(
-        config, "all" if args.filter else args.tier, args.moeflux_model
-    )
+    warn_slow_variant(config, effective_tier(args), args.moeflux_model)
     features = config.feature_list(args.moeflux_model)
     if not DRY_RUN:
         rc = preflight_gpu(features)
@@ -613,9 +621,7 @@ def cmd_coverage(args: argparse.Namespace) -> int:
         if args.doctests:
             require_nightly()
     config = resolve_config(args.config)
-    warn_slow_variant(
-        config, "all" if args.filter else args.tier, args.moeflux_model
-    )
+    warn_slow_variant(config, effective_tier(args), args.moeflux_model)
     features = config.feature_list(args.moeflux_model)
     tier, extra, name = selection(config, args)
     name = f"coverage-{name}"
@@ -1139,16 +1145,16 @@ def main() -> int:
     p_run.add_argument(
         "-t",
         "--tier",
-        default="unignored",
+        default=None,
         choices=list(TIERS),
-        help="which tests (default: %(default)s). `ignored` is the "
-        "model-loading set; `all` is genuinely everything",
+        help="which tests (default: unignored, or all under --filter). "
+        "`ignored` is the model-loading set; `all` is genuinely everything",
     )
     p_run.add_argument(
         "-f",
         "--filter",
         help="substring matched against test AND binary names; implies "
-        "the `all` tier and uncaptured output",
+        "the `all` tier (unless --tier is given) and uncaptured output",
     )
     p_run.add_argument(
         "-x",
