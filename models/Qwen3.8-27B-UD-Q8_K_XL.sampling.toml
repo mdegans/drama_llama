@@ -2,7 +2,9 @@
 # the drama_llama repo — blallama loads it beside the GGUF).
 #
 # Mode chain: top-k 1024 as a pre-cut, then locally typical at p = 0.9
-# (min_keep 3). Higher p is *less* constrained (1.0 is a no-op). It was
+# (min_keep 3). The pre-cut is for speed, not shape: without it locally
+# typical computes entropy over the whole vocabulary (~250k on Qwen)
+# every token. Keep it generous so it never binds. Higher p is *less* constrained (1.0 is a no-op). It was
 # 0.5 until 2026-09-23, which collapses to a single candidate whenever
 # one token holds half the mass: different seeds gave identical output.
 # Under review (#113): Qwen's model card recommends, for thinking mode,
