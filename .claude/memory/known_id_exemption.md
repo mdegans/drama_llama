@@ -54,10 +54,42 @@ wrong start keeps its full penalty, so the exemption steers toward the
 set of ids the context holds; ids are still *recorded* in the corpus,
 just never penalized.
 
+## #113 (2026-09-23): multi-word ids, and numbers as a category
+
+**Multi-word ids.** The first cut derived "the partial word" by walking
+back to the last byte outside `[A-Za-z0-9._-]`, so a space ended every
+copy and `Sept. 7` / `September 22, 2026` could never be exempt past
+their first word. Now the guard keeps *copies in progress*: every suffix
+of the last `min(64, longest id)` history bytes that begins at a word
+start and is a prefix of some known id (plus the empty copy at a word
+start). A piece is exempt iff it extends one of them, starts a fresh
+copy at a word start inside itself (` 05`), or completes one exactly
+and then crosses only non-word bytes (`9d]`, `7,`). The word class now
+only decides where a copy may *begin*; the ids decide where it ends.
+
+**Numbers were the bigger bug.** A tokenizer probe (Qwen3.8, Gemma 4,
+Mistral Small 4, gpt-oss — all four) showed ` 22` is always a bare ` `
+token + digit tokens (single digits; gpt-oss groups ≤3). So eleven
+tokens carry *every* number in the context, and in surgical mode the
+bare ` ` accumulates penalty from every n-gram that starts with it —
+the mock battery drove it down by ~40 logits in 20 steps. #113's
+"today is Sept. Sept." is exactly the model unable to emit the space
+that begins the day number. Fix: `IgnoreCategory::Numbers` (` `, the
+digits, every 1–3 digit spelling with and without a leading space),
+**default on**. Numbers are facts; words do the loop-breaking.
+
+Sidecar patterns (Agora, matching agora-agentkit's renderer — note the
+old `GOV-2026.7` pattern was stale; agentkit renders `GOV-2026-0006`
+and also AMD/KEY/REC): UUID, `(?:GOV|APP|AMD|KEY|REC)-\d{4}[-.]\d+`,
+ISO date/RFC 3339 timestamp, English dates, kebab-case handles/slugs.
+Pinned by `ids::tests::agora_sidecar_patterns`. balerion's sidecar is
+separate — copy the `[repetition]` block over.
+
 ## Edges, documented, accepted
 
-- At a word boundary, any token whose piece starts some known id is
-  exempt: with dozens of UUIDs in context that is every space-prefixed
+- At a word start, any token whose piece starts some known id is
+  exempt (now including word starts *inside* a multi-word copy — after
+  `Sept. `, `Sept` is exempt as the start of a fresh copy): with dozens of UUIDs in context that is every space-prefixed
   hex digit and short hex word (` 1`, ` be`, ` bad`) as the *first*
   token of a word. The next token is judged against the longer word and
   re-penalized; surgical mode already spares single digits. Bounded, not

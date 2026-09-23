@@ -274,8 +274,11 @@ for the current arc:
   (`id_patterns` → per-call `known_ids` → `IdGuard` on the
   `RegionGuard` hook), not id shapes — a shape tracker shipped and was
   removed the same day because agents cite by bare 8-hex prefix. Carries
-  the documented edges and why live ≠ fold is not an invariant. Next:
-  multi-word ids / dates (#113), and #112 (Qwen3.8 tip never anchors).
+  the documented edges and why live ≠ fold is not an invariant.
+  2026-09-23 (#113): copies follow multi-word ids across spaces, and
+  `IgnoreCategory::Numbers` (default on) — every probed tokenizer
+  spells a number as a bare ` ` + digit tokens, so penalizing them
+  rewrote facts. Read before tuning digits or spaces back in.
 - [`v1_models_catalog.md`](.claude/memory/v1_models_catalog.md)
   — **read before touching blallama's listing routes, `src/catalog.rs`,
   or proposing a cross-backend metadata API.** `/v1/models` landed
