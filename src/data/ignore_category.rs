@@ -14,6 +14,18 @@ pub enum IgnoreCategory {
     /// grammar allows multiple valid closures and repetition penalty on
     /// `}` would bias the walker toward extending rather than closing.
     Json,
+    /// Numerals, and the lone space that introduces them. Every
+    /// tokenizer probed (Qwen3.8, Gemma 4, Mistral Small 4, gpt-oss)
+    /// spells ` 22` as a bare ` ` token followed by digit tokens
+    /// (single digits, or groups of up to three on gpt-oss), so eleven
+    /// tokens carry every number in the context and accumulate penalty
+    /// from all of them at once. A number has no lexical variety to
+    /// steer toward: penalizing its digits turns `September 22` into
+    /// `September 23`, and penalizing the space that precedes it
+    /// makes the model unable to *start* a number at all (#113:
+    /// "today is Sept. Sept. Wait, today is September."). Numbers
+    /// are facts; the penalty's loop-breaking work is done by words.
+    Numbers,
     /// Prose punctuation (`.`, `,`, `;`, `:`, `!`, `?`). These tokens have
     /// no lexical variety, so the "avoid repetition" signal is
     /// structurally wrong for them — penalty accumulating on `.` biases
@@ -22,9 +34,10 @@ pub enum IgnoreCategory {
 }
 
 impl IgnoreCategory {
-    pub const ALL: [IgnoreCategory; 3] = [
+    pub const ALL: [IgnoreCategory; 4] = [
         IgnoreCategory::English,
         IgnoreCategory::Json,
+        IgnoreCategory::Numbers,
         IgnoreCategory::Punctuation,
     ];
 
@@ -32,6 +45,7 @@ impl IgnoreCategory {
         match self {
             IgnoreCategory::English => "English",
             IgnoreCategory::Json => "JSON",
+            IgnoreCategory::Numbers => "Numbers",
             IgnoreCategory::Punctuation => "Punctuation",
         }
     }
@@ -40,6 +54,7 @@ impl IgnoreCategory {
         match self {
             IgnoreCategory::English => ENGLISH,
             IgnoreCategory::Json => JSON_SYNTAX,
+            IgnoreCategory::Numbers => NUMBERS,
             IgnoreCategory::Punctuation => PUNCTUATION,
         }
     }
@@ -49,18 +64,41 @@ impl IgnoreCategory {
         self,
         model: &'a M,
     ) -> impl Iterator<Item = Token> + 'a {
-        self.words()
-            .iter()
-            // TODO: there is allocation here that can be avoided by turning the
-            // tokenize function into a method returning an iterator, however
-            // it's not a big deal since this is only done once.
-            .flat_map(|word| model.tokenize(word, false).into_iter())
+        // TODO: there is allocation here that can be avoided by turning the
+        // tokenize function into a method returning an iterator, however
+        // it's not a big deal since this is only done once.
+        let words = self.words().iter().map(|&w| w.to_owned());
+        // Tokenizers that group digits (gpt-oss: `202`, `09`, `056`) or
+        // merge a leading space into them have multi-digit tokens the
+        // ten digits don't name; every 1–3 digit spelling does.
+        let numerals = matches!(self, IgnoreCategory::Numbers)
+            .then(|| {
+                (0..1000).flat_map(|n| {
+                    [
+                        format!("{n}"),
+                        format!("{n:02}"),
+                        format!("{n:03}"),
+                        format!(" {n}"),
+                    ]
+                })
+            })
+            .into_iter()
+            .flatten();
+        words
+            .chain(numerals)
+            .flat_map(|word| model.tokenize(&word, false).into_iter())
     }
 }
 
 /// JSON structural tokens. `"` is included so string-delimiter repetition
 /// across keys and values doesn't accumulate penalty.
 pub const JSON_SYNTAX: &[&str] = &["{", "}", "[", "]", ",", ":", "\""];
+
+/// Numerals and the bare space before them — see
+/// [`IgnoreCategory::Numbers`]. `into_tokens` adds every 1–3 digit
+/// spelling for tokenizers that group digits.
+pub const NUMBERS: &[&str] =
+    &[" ", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
 /// Prose punctuation. Narrow set of sentence terminators and separators
 /// that shouldn't be penalized for repetition — they lack the lexical
@@ -204,7 +242,8 @@ mod tests {
 
     #[test]
     fn all_contains_every_variant() {
-        assert_eq!(IgnoreCategory::ALL.len(), 3);
+        assert_eq!(IgnoreCategory::ALL.len(), 4);
+        assert!(IgnoreCategory::ALL.contains(&IgnoreCategory::Numbers));
         assert!(IgnoreCategory::ALL.contains(&IgnoreCategory::English));
         assert!(IgnoreCategory::ALL.contains(&IgnoreCategory::Json));
         assert!(IgnoreCategory::ALL.contains(&IgnoreCategory::Punctuation));
@@ -224,6 +263,13 @@ mod tests {
         assert!(IgnoreCategory::Json.words().contains(&"]"));
         assert!(IgnoreCategory::Punctuation.words().contains(&"."));
         assert!(IgnoreCategory::Punctuation.words().contains(&"?"));
+        assert!(IgnoreCategory::Numbers.words().contains(&" "));
+        assert!(IgnoreCategory::Numbers.words().contains(&"7"));
+    }
+
+    #[test]
+    fn all_is_sorted_like_the_enum() {
+        assert!(IgnoreCategory::ALL.is_sorted());
     }
 
     #[test]

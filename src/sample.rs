@@ -1785,6 +1785,12 @@ mod tests {
         "0123456789ab",
         // 16: a boundary piece — separates identifier words.
         " ",
+        // 17+: a multi-word id (#113), spelled the digit-splitting way
+        // (`Sept`, `.`, ` `, `7`) every probed tokenizer uses.
+        "Sept",
+        ".",
+        "7",
+        "8",
     ];
     const EOS: Token = 0;
     const A: Token = 1;
@@ -1800,6 +1806,10 @@ mod tests {
     const F00D: Token = 14;
     const HEX12: Token = 15;
     const SPACE: Token = 16;
+    const SEPT: Token = 17;
+    const DOT: Token = 18;
+    const SEVEN: Token = 19;
+    const EIGHT: Token = 20;
     /// One canonical UUID as the mock spells it: `8-4-4-4-12`.
     const UUID_TOKENS: [Token; 10] =
         [DEAD, BEEF, DASH, CAFE, DASH, F00D, DASH, CAFE, DASH, HEX12];
@@ -3537,6 +3547,60 @@ mod tests {
         };
         assert_eq!(pick(true), DEAD, "exempt from its first byte");
         assert_eq!(pick(false), CAFE, "no known ids: raw logits + penalty");
+    }
+
+    /// #113: a date is an id with a space in it. Re-emit `Sept. 7`
+    /// four times under heavy penalty, each id token narrowly ahead of
+    /// the wrong digit. Known, it is copied verbatim across its space;
+    /// unknown, the penalty pushes the model onto `8`.
+    #[test]
+    fn multi_word_known_id_reemitted_verbatim() {
+        let run = |known: bool| -> (Vec<Token>, Vec<Token>) {
+            let mut rep = RepetitionOptions::default()
+                .set_ignored_categories(std::iter::empty())
+                .set_penalty_repeat(1.1)
+                .set_penalty_freq(0.5)
+                .set_penalty_present(0.5);
+            if known {
+                rep = rep.with_known_ids(std::collections::BTreeSet::from([
+                    b"Sept. 7".to_vec(),
+                ]));
+            }
+            let opts = SamplerConfig {
+                modes: vec![SamplingMode::Greedy],
+                repetition: Some(rep),
+                deferred_grammar: None,
+                lazy_grammar: false,
+                ..SamplerConfig::default()
+            };
+            let mut intended = Vec::new();
+            for _ in 0..4 {
+                intended.extend([SPACE, SEPT, DOT, SPACE, SEVEN]);
+            }
+            let mut state = state_for(&opts);
+            let mut tokens: Vec<Token> = Vec::new();
+            for (i, &want) in intended.iter().enumerate() {
+                // The separator between copies is not part of the id
+                // and is penalized like any repeat, so it gets a wide
+                // margin; every token of the id itself gets a rival.
+                let c = if i % 5 == 0 {
+                    dense(&[(want, 100.0)])
+                } else {
+                    dense(&[(want, 4.0), (EIGHT, 3.9)])
+                };
+                let tok =
+                    sample_token(&tokens, c, &opts, &mut state, &MockModel)
+                        .unwrap();
+                state.advance(&opts, tok, &MockModel);
+                tokens.push(tok);
+            }
+            (tokens, intended)
+        };
+        let (tokens, intended) = run(true);
+        assert_eq!(tokens, intended, "the known date is copied verbatim");
+        let (tokens, intended) = run(false);
+        assert_ne!(tokens, intended, "unknown, the penalty must bite");
+        assert!(tokens.contains(&EIGHT), "{tokens:?}");
     }
 
     /// Regime (b): inside a grammar string body the id guard composes

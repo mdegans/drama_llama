@@ -68,8 +68,10 @@ pub struct RepetitionOptions {
     /// re-emitted verbatim, and stacked n-gram penalties otherwise push
     /// the model off it after a few sightings. Only faithful copies
     /// are exempt: a string that is a prefix of no known id keeps its
-    /// full penalty. Default empty — which strings are identifiers is
-    /// the consumer's knowledge. A pattern as loose as `\w+` makes
+    /// full penalty. An id may span words (`Sept. 7`, `September 22,
+    /// 2026`); the exemption follows the copy across its spaces.
+    /// Default empty — which strings are identifiers is the consumer's
+    /// knowledge. A pattern as loose as `\w+` makes
     /// every word a known id and disables the penalty; keep them
     /// specific.
     ///
@@ -281,11 +283,15 @@ impl Default for RepetitionOptions {
             // structured output for no anti-loop benefit. Punctuation is also
             // default-on for the same reason — prose `. , ; : ! ?` have no
             // lexical variety, so accumulating penalty on `.` biases toward
-            // run-ons. Users can override by calling
+            // run-ons. Numbers likewise (#113): a number is a fact, and
+            // every tokenizer we ship for spells it with a bare ` ` and
+            // digit tokens that the whole context's numbers share.
+            // Users can override by calling
             // `set_ignored_categories(vec![])`.
             ignored_categories: BTreeSet::from([
                 IgnoreCategory::English,
                 IgnoreCategory::Json,
+                IgnoreCategory::Numbers,
                 IgnoreCategory::Punctuation,
             ]),
             ignored: BTreeSet::new(),
