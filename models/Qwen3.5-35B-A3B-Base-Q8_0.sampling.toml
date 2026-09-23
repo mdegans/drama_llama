@@ -1,13 +1,12 @@
 # drama_llama per-model sampling sidecar (hand-written; versioned in
 # the drama_llama repo — blallama loads it beside the GGUF).
 #
-# Mode chain: top-k 1024 as a pre-cut, then locally typical at p = 0.5
-# (min_keep 3). p = 0.5 is narrow: it collapses to a single candidate
-# whenever one token holds half the probability mass, so different
-# seeds often give identical output (observed on Qwen3.8, 2026-09-23).
-# Base model (soul_forge). An earlier note here recommended p = 0.9 for
-# run-to-run variety, with `soul_forge --shuffle` and `--names`; the
-# value below is 0.5.
+# Mode chain: top-k 1024 as a pre-cut, then locally typical at p = 0.9
+# (min_keep 3). Higher p is *less* constrained (1.0 is a no-op). It was
+# 0.5 until 2026-09-23, which collapses to a single candidate whenever
+# one token holds half the mass: different seeds gave identical output.
+# Base model (soul_forge): pair p = 0.9 with `soul_forge --shuffle` and
+# `--names` for run-to-run variety.
 
 lazy_grammar = true
 banned_specials = []
@@ -20,7 +19,7 @@ k = 1024
 [[modes]]
 
 [modes.LocallyTypical]
-p = 0.5
+p = 0.9
 min_keep = 3
 
 [repetition]

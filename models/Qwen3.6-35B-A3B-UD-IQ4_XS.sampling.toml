@@ -1,10 +1,10 @@
 # drama_llama per-model sampling sidecar (hand-written; versioned in
 # the drama_llama repo — blallama loads it beside the GGUF).
 #
-# Mode chain: top-k 1024 as a pre-cut, then locally typical at p = 0.5
-# (min_keep 3). p = 0.5 is narrow: it collapses to a single candidate
-# whenever one token holds half the probability mass, so different
-# seeds often give identical output (observed on Qwen3.8, 2026-09-23).
+# Mode chain: top-k 1024 as a pre-cut, then locally typical at p = 0.9
+# (min_keep 3). Higher p is *less* constrained (1.0 is a no-op). It was
+# 0.5 until 2026-09-23, which collapses to a single candidate whenever
+# one token holds half the mass: different seeds gave identical output.
 # Serves the Agora Qwen 3.6 cohort (164 agents as of 2026-09-23).
 
 lazy_grammar = true
@@ -18,7 +18,7 @@ k = 1024
 [[modes]]
 
 [modes.LocallyTypical]
-p = 0.5
+p = 0.9
 min_keep = 3
 
 [repetition]
