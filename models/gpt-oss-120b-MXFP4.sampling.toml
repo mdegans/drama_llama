@@ -28,7 +28,20 @@ min_keep = 3
 
 [repetition]
 ignored_categories = ["English", "Json", "Punctuation"]
-ignored = []
+# Harmony header words, exempt from the penalty (token ids, o200k):
+# 173781 `assistant` (the role, unspaced — distinct from prose
+# ` assistant` 29186), 35644 `analysis`, 12606 + 815 `comment`+`ary`,
+# 17196 `final` (channels). Every message of a Harmony turn starts
+# `<|start|>assistant<|channel|>…`, so surgical mode penalized the role
+# name as the bigram's continuation, pushing the model to the spaced
+# ` assistant` — #101's off-canonical frame (2026-09-23 live run).
+ignored = [
+    { data = [173781] },
+    { data = [35644] },
+    { data = [12606] },
+    { data = [815] },
+    { data = [17196] },
+]
 window_size = 2048
 decay = 0.99375
 penalty_max_count = 1
