@@ -109,6 +109,12 @@ struct Args {
     #[arg(long, default_value_os_t = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models"))]
     models: PathBuf,
 
+    /// Replay on this model instead of the one each request names (e.g.
+    /// a Qwen3.8 transcript on Qwen3.6). Use a separate `--out`: output
+    /// file names do not include the model.
+    #[arg(long)]
+    model: Option<String>,
+
     /// Sampling sidecar every variant starts from. Defaults to the model's
     /// own `<model>.sampling.toml`.
     #[arg(long)]
@@ -651,7 +657,11 @@ fn generate(
     prompt: &Prompt,
     (sampler, penalty, seed): (Sampler, Penalty, NonZeroU128),
 ) -> Result<(Output, Meta), Box<dyn std::error::Error>> {
-    let model = prompt.model.to_string();
+    let model = lazy
+        .args
+        .model
+        .clone()
+        .unwrap_or_else(|| prompt.model.to_string());
     lazy.session(&model)?;
     let mut config = lazy.base.clone();
     config.modes = sampler.modes(&lazy.base);
