@@ -6852,9 +6852,14 @@ fn resolve_grammar(
         );
         return Ok(Some(crate::CompiledOutputConfig::Single(g)));
     }
+    // The separator is the template's, never the caller's to choose.
+    let output_config_opts = OutputConfigOptions {
+        thought_separator: dialect.reasoning.separator.clone(),
+        ..output_config_opts.clone()
+    };
     if let Some(c) = output_config::compile_prompt_output_config(
         prompt,
-        output_config_opts,
+        &output_config_opts,
         thought_pre_opened,
     )? {
         #[cfg(feature = "axum")]
@@ -8818,6 +8823,7 @@ mod tests {
             &OutputConfigOptions {
                 allow_thought: true,
                 phase_split: false,
+                ..Default::default()
             },
             false,
         )

@@ -32,7 +32,8 @@ use std::fmt::Write;
 use misanthropic::prompt::output::{OutputConfig, OutputFormat};
 
 use crate::grammar_compile::{
-    emit_think_body_rules, emit_thought_rules, schema_to_gbnf, JSON_GRAMMAR,
+    emit_think_body_rules, emit_thought_rules, escape_for_gbnf_string,
+    schema_to_gbnf, JSON_GRAMMAR,
 };
 use crate::{DeferredGrammar, GrammarError, Prompt, SamplingMode};
 
@@ -60,6 +61,14 @@ pub struct OutputConfigOptions {
     /// to keep the old unified-grammar behaviour (useful for callers that
     /// need the matcher to also guard the thought structure itself).
     pub phase_split: bool,
+    /// The bytes between `</think>` and the JSON body, spelled
+    /// literally so the constrained turn re-renders byte-for-byte —
+    /// a fact about the template, not a preference: `Session` fills it
+    /// from the dialect's measured
+    /// [`ReasoningSyntax::separator`](crate::dialect::ReasoningSyntax::separator)
+    /// on every call. `None` keeps the permissive single-byte `ws` gap,
+    /// which cannot express Qwen's `\n\n` (#112).
+    pub thought_separator: Option<String>,
 }
 
 impl Default for OutputConfigOptions {
@@ -67,6 +76,19 @@ impl Default for OutputConfigOptions {
         Self {
             allow_thought: true,
             phase_split: true,
+            thought_separator: None,
+        }
+    }
+}
+
+impl OutputConfigOptions {
+    /// The GBNF fragment that follows a closed thought: the literal
+    /// separator when known, else the permissive `ws`.
+    fn after_thought(&self) -> String {
+        match &self.thought_separator {
+            Some(sep) if sep.is_empty() => String::new(),
+            Some(sep) => format!(r#" "{}""#, escape_for_gbnf_string(sep)),
+            None => " ws".to_string(),
         }
     }
 }
@@ -136,7 +158,7 @@ pub fn compile_output_config(
         _ => return Err(OutputConfigError::UnsupportedFormat),
     };
     if opts.phase_split && opts.allow_thought {
-        let source = build_json_only_grammar_source(schema);
+        let source = build_json_only_grammar_source(schema, opts);
         Ok(CompiledOutputConfig::Deferred(DeferredGrammar {
             grammar: crate::CompiledGrammar::parse(&source)?,
             activate_after: vec![THINK_CLOSE_TRIGGER.to_vec()],
@@ -224,11 +246,15 @@ pub(crate) fn build_grammar_source(
         // this dominates `allow_thought = false`, mirroring the tool
         // grammars' `EagerThoughtPreOpened` precedent — a caller
         // cannot forbid a thought the render already started.
-        let _ =
-            writeln!(src, r#"root ::= think_body "</think>" ws output_schema"#);
+        let after = opts.after_thought();
+        let _ = writeln!(
+            src,
+            r#"root ::= think_body "</think>"{after} output_schema"#
+        );
         emit_think_body_rules(&mut src);
     } else if opts.allow_thought {
-        let _ = writeln!(src, "root ::= thought? ws output_schema");
+        let after = opts.after_thought();
+        let _ = writeln!(src, "root ::= ( thought{after} | ws ) output_schema");
         emit_thought_rules(&mut src);
     } else {
         let _ = writeln!(src, "root ::= ws output_schema");
@@ -240,14 +266,15 @@ pub(crate) fn build_grammar_source(
 }
 
 /// Emit the JSON-only grammar used by the deferred / phase-split path.
-/// Root starts at the JSON body (leading whitespace tolerated); thought
-/// rules are omitted entirely because `TokenPredictor` doesn't run the
-/// matcher during the thought preamble.
+/// Root starts right after the `</think>` trigger, so it opens with the
+/// thought separator; thought rules are omitted entirely because
+/// `TokenPredictor` doesn't run the matcher during the thought preamble.
 pub(crate) fn build_json_only_grammar_source(
     schema: &serde_json::Value,
+    opts: &OutputConfigOptions,
 ) -> String {
     let mut src = String::with_capacity(512);
-    let _ = writeln!(src, "root ::= ws output_schema");
+    let _ = writeln!(src, "root ::={} output_schema", opts.after_thought());
     schema_to_gbnf(schema, "output_schema", &mut src);
     src.push_str(JSON_GRAMMAR);
     src
@@ -294,6 +321,52 @@ mod tests {
         OutputConfig::json_schema(schema)
     }
 
+    /// #112: with the template's separator known, every root that
+    /// follows a thought spells it — and only it. The permissive `ws`
+    /// is at most one byte, so Qwen's `</think>\n\n{…}` was
+    /// unreachable and the model wrote `</think>\n{…}`, `</think> {…}`
+    /// or `</think>{…}` instead; each re-rendered differently and lost
+    /// the tip.
+    #[test]
+    fn thought_separator_is_spelled_after_every_thought() {
+        let schema = cfg(json!({
+            "type": "object",
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }))
+        .format_schema();
+        let opts = OutputConfigOptions {
+            thought_separator: Some("\n\n".into()),
+            ..Default::default()
+        };
+        let body = r#"{"x":1}"#;
+
+        // Deferred: the grammar starts right after the `</think>` trigger.
+        let deferred = build_json_only_grammar_source(&schema, &opts);
+        assert!(accepts(&deferred, &format!("\n\n{body}")));
+        for bad in ["", " ", "\n", "\n\n\n"] {
+            assert!(!accepts(&deferred, &format!("{bad}{body}")), "{bad:?}");
+        }
+        // Without the separator: the single permissive byte, unchanged.
+        let loose = build_json_only_grammar_source(
+            &schema,
+            &OutputConfigOptions::default(),
+        );
+        assert!(accepts(&loose, &format!("\n{body}")));
+        assert!(!accepts(&loose, &format!("\n\n{body}")));
+
+        // Unified, pre-opened (Qwen's `<think>\n` scaffold).
+        let pre = build_grammar_source(&schema, &opts, true);
+        assert!(accepts(&pre, &format!("hmm\n</think>\n\n{body}")));
+        assert!(!accepts(&pre, &format!("hmm\n</think>\n{body}")));
+
+        // Unified, optional thought: forced after one, free without.
+        let optional = build_grammar_source(&schema, &opts, false);
+        assert!(accepts(&optional, &format!("<think>hmm</think>\n\n{body}")));
+        assert!(!accepts(&optional, &format!("<think>hmm</think>{body}")));
+        assert!(accepts(&optional, body));
+    }
+
     #[test]
     fn flat_schema_allows_thought_by_default() {
         let config = cfg(json!({
@@ -322,6 +395,7 @@ mod tests {
             &OutputConfigOptions {
                 allow_thought: false,
                 phase_split: false,
+                ..Default::default()
             },
             false,
         );
@@ -390,6 +464,7 @@ mod tests {
         let opts = OutputConfigOptions {
             allow_thought: true,
             phase_split: false,
+            ..Default::default()
         };
         let compiled =
             compile_output_config(&config, &opts, false).expect("compile");
@@ -472,6 +547,7 @@ mod tests {
         let opts = OutputConfigOptions {
             allow_thought: false,
             phase_split: true, // ignored since allow_thought is off
+            ..Default::default()
         };
         let compiled =
             compile_output_config(&config, &opts, false).expect("compile");
@@ -526,6 +602,7 @@ mod tests {
             &OutputConfigOptions {
                 allow_thought: false,
                 phase_split: false,
+                ..Default::default()
             },
             true,
         );

@@ -104,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .output_config_opts(OutputConfigOptions {
             allow_thought: false,
             phase_split: false,
+            ..Default::default()
         })
         .build()?;
 

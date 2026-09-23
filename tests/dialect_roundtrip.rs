@@ -1481,3 +1481,147 @@ fn mistral4_stock_cannot_render_field_reasoning() {
         ),
     }
 }
+
+/// #112: a Qwen3.8 *thinking* turn must re-render byte-stable, or the
+/// session's canonicalization gate skips the tip and every turn
+/// re-prefills the one before it.
+///
+/// Mirrors the session gate exactly: thinking on (the generation
+/// prompt pre-opens `<think>\n`), the emission parsed with
+/// `pre_opened_reasoning`, the turn re-rendered under the analyzed
+/// reingest, and the emission required verbatim at the head of the
+/// turn delta. The emission is the logged 2026-09-22 Agora shape:
+/// thought, announce-then-call prose, parallel calls, and the literal
+/// `null` the model writes for an optional parameter (#115) — which
+/// parses as a string and re-renders unchanged.
+///
+/// The control pins why the analyzer's reingest probe is
+/// load-bearing: 3.8's template no longer splits `<think>` out of
+/// `content`, so the old `InlineThink` default renders the thought as
+/// content behind an empty `<think>\n\n</think>`.
+#[test]
+fn qwen38_thinking_turn_round_trips() {
+    use drama_llama::dialect::ReasoningReingest;
+
+    let source = fixture_source("qwen3.8-gguf.jinja");
+    let syntax = analyze_template(&source, "", "<|im_end|>").expect("analyze");
+    let template =
+        ChatTemplate::from_source(source, String::new(), "<|im_end|>".into())
+            .expect("template compiles");
+    let tool = Tool::builder("get_content")
+        .description("Read a post, comment, or document.")
+        .schema(json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "detail": {"type": "string", "enum": ["summary", "full"]},
+            },
+            "required": ["id"],
+        }))
+        .build()
+        .expect("valid tool");
+    let base = Prompt {
+        system: Some(Content::text("You are aegis.")),
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("Check the agenda thread."),
+        }],
+        tools: Some(vec![tool.clone().into()]),
+        ..Default::default()
+    };
+    let opts = |gen: bool, reingest: ReasoningReingest| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", true)
+            .with_extra("preserve_thinking", true)
+            .with_thought_reingest(reingest)
+    };
+    let emission = "The agenda thread is 05676b9d. I'll read it, and the \
+                    summary of the proposal too.\n</think>\n\n\
+                    Reading both now.\n\n\
+                    <tool_call>\n<function=get_content>\n\
+                    <parameter=id>\n05676b9d-8aa7-430e-9138-444080e34065\n</parameter>\n\
+                    <parameter=detail>\nnull\n</parameter>\n\
+                    </function>\n</tool_call>\n\
+                    <tool_call>\n<function=get_content>\n\
+                    <parameter=id>\nca210776-eb26-4037-bb00-391d3d55d1a6\n</parameter>\n\
+                    </function>\n</tool_call>";
+
+    let gen = template
+        .render_with(&base, &opts(true, syntax.reasoning.reingest))
+        .expect("render");
+    assert!(gen.ends_with("<think>\n"), "thinking pre-opens: {gen:?}");
+
+    let parsed = parse_text(&syntax, &[&tool], emission, true, Leniency::Final);
+    assert_eq!(parsed.status, ParseStatus::Complete, "{:#?}", parsed.blocks);
+    let turn = |reingest| {
+        let mut with_turn = base.clone();
+        with_turn.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(parsed.blocks.clone()),
+        });
+        template
+            .render_with(&with_turn, &opts(false, reingest))
+            .expect("render")
+    };
+
+    let rendered = turn(syntax.reasoning.reingest);
+    let suffix = rendered.strip_prefix(&gen).unwrap_or_else(|| {
+        panic!("turn must extend the generation prompt.\n{rendered:?}")
+    });
+    assert!(
+        suffix.starts_with(emission),
+        "emission must lead the turn delta verbatim.\n\
+         --- want ---\n{emission:?}\n--- got ---\n{suffix:?}"
+    );
+
+    // Control: the pre-#112 default.
+    let inline = turn(ReasoningReingest::InlineThink);
+    assert!(
+        !inline
+            .strip_prefix(&gen)
+            .is_some_and(|s| s.starts_with(emission)),
+        "control: InlineThink must NOT round-trip on 3.8 — if this \
+         fires, the template changed and the probe may be moot.\n{inline:?}"
+    );
+}
+
+/// #112, the constrained half: under a forced call the post-thought
+/// gap is the grammar's to decide, and it used to be `fws` — at most
+/// one whitespace byte. Qwen3.8's template re-renders `</think>\n\n`,
+/// so the model was *unable* to emit its canonical bytes and every
+/// forced thinking turn missed the tip (observed on device:
+/// `</think>\n<tool_call>`). The analyzer now measures the separator
+/// and the emitter spells it.
+#[test]
+fn qwen38_forced_call_grammar_spells_the_thought_separator() {
+    use drama_llama::dialect::{grammar_source, Anchor, EmitOptions};
+    use drama_llama::{Grammar, GrammarState};
+    use std::sync::Arc;
+
+    let source = fixture_source("qwen3.8-gguf.jinja");
+    let syntax = analyze_template(&source, "", "<|im_end|>").expect("analyze");
+    assert_eq!(syntax.reasoning.separator.as_deref(), Some("\n\n"));
+
+    let tool = test_tool();
+    let (_, input) = &payloads()[0];
+    let calls = render_reference(&syntax, &[("get_weather", input)])
+        .expect("representable");
+    let mut opts = EmitOptions::default();
+    opts.anchor = Anchor::EagerThoughtPreOpened;
+    let grammar = grammar_source(&syntax, &[&tool], &opts).expect("grammar");
+    let grammar = Arc::new(Grammar::parse(&grammar).expect("parses"));
+    let accepts = |text: &str| {
+        let mut state = GrammarState::new(grammar.clone());
+        state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+    };
+
+    assert!(accepts(&format!("Paris.\n</think>\n\n{calls}")));
+    for bad in ["", " ", "\n", "\n\n\n"] {
+        assert!(
+            !accepts(&format!("Paris.\n</think>{bad}{calls}")),
+            "gap {bad:?} must be rejected — only the template's bytes \
+             re-render"
+        );
+    }
+}

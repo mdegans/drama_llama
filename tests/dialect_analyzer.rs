@@ -4,7 +4,7 @@
 //! newlines here are the trained format, not formatting accidents.
 
 use drama_llama::dialect::{
-    analyze_template, CallSyntax, Family, ReasoningMode,
+    analyze_template, CallSyntax, Family, ReasoningMode, ReasoningReingest,
 };
 use drama_llama::JsonSpacing;
 
@@ -60,6 +60,33 @@ fn qwen36_gguf_xml() {
     assert_eq!(s.arguments.name_suffix, ">\n", "{s:#?}");
     assert_eq!(s.arguments.value_suffix, "\n</parameter>\n", "{s:#?}");
     assert_eq!(s.call_separator, "\n", "{s:#?}"); // #58, see above
+
+    // This template reconstructs reasoning by splitting `content` on
+    // `</think>`, so inlining renders identically to the field.
+    assert_eq!(s.reasoning.reingest, ReasoningReingest::InlineThink);
+    assert_eq!(s.reasoning.separator.as_deref(), Some("\n\n"), "{s:#?}");
+}
+
+/// Qwen3.8 (Unsloth GGUF dump): the same XML call dialect as 3.6, but
+/// the template dropped 3.6's `content.split('</think>')` and reads
+/// reasoning from `reasoning_content` alone. Under the old
+/// `InlineThink` default every thinking turn re-rendered its thought as
+/// *content* after an empty `<think>\n\n</think>`, so no emission was
+/// byte-stable and the tip never anchored (#112). The reingest probe
+/// measures the difference.
+#[test]
+fn qwen38_gguf_field_reasoning() {
+    let s = analyze("qwen3.8-gguf.jinja", "", "<|im_end|>");
+    assert_eq!(s.family, Family::TagWithTagged, "{s:#?}");
+    assert_eq!(s.per_call_start, "<tool_call>\n", "{s:#?}");
+    assert_eq!(s.arguments.value_suffix, "\n</parameter>\n", "{s:#?}");
+    assert_eq!(s.call_separator, "\n", "{s:#?}");
+    assert_eq!(s.reasoning.mode, ReasoningMode::TagBased, "{s:#?}");
+    assert_eq!(s.reasoning.start, "<think>\n", "{s:#?}");
+    assert_eq!(s.reasoning.end, "\n</think>", "{s:#?}");
+    assert_eq!(s.reasoning.reingest, ReasoningReingest::Field, "{s:#?}");
+    // What follows `\n</think>` — the grammars spell it (#112).
+    assert_eq!(s.reasoning.separator.as_deref(), Some("\n\n"), "{s:#?}");
 }
 
 /// Qwen3 chat (0.6B template): Hermes-style JSON inside <tool_call>
@@ -257,14 +284,11 @@ fn mistral4_stock() {
 /// expose `[THINK]` as a `TagBased` channel re-ingested through the
 /// `reasoning_content` *field*.
 ///
-/// The `Field` reingest is the one thing the probes cannot see: they
-/// observe the markers but not which side owns them, and the derived
-/// default (`InlineThink`) would route thoughts into `content`, where
-/// this template renders none of them. A `PATCHES` entry corrects it,
-/// keyed on the analyzed `[THINK]` marker plus a `reasoning_content`
-/// guard — narrow by design, so the Qwen templates (correctly
-/// `InlineThink`, and they do mention `reasoning_content`) are
-/// untouched.
+/// `Field` is measured by the reingest probe: an inlined
+/// `<think>…</think>` renders here as literal content, while the
+/// `reasoning_content` field renders inside `[THINK]…[/THINK]`. (This
+/// used to take a source-sniffing `PATCHES` entry; the probe that
+/// fixed Qwen3.8, #112, subsumes it.)
 #[test]
 fn mistral4_cache_stable() {
     let s = analyze("mistral4-cache-stable.jinja", "<s>", "</s>");
@@ -279,11 +303,9 @@ fn mistral4_cache_stable() {
     assert_eq!(s.reasoning.mode, ReasoningMode::TagBased, "{s:#?}");
     assert_eq!(s.reasoning.start, "[THINK]", "{s:#?}");
     assert_eq!(s.reasoning.end, "[/THINK]", "{s:#?}");
-    assert_eq!(
-        s.reasoning.reingest,
-        drama_llama::dialect::ReasoningReingest::Field,
-        "{s:#?}"
-    );
+    assert_eq!(s.reasoning.reingest, ReasoningReingest::Field, "{s:#?}");
+    // Nothing between `[/THINK]` and what follows.
+    assert_eq!(s.reasoning.separator.as_deref(), Some(""), "{s:#?}");
     assert!(s.preserved_tokens.iter().any(|t| t == "[THINK]"), "{s:#?}");
     assert!(
         s.preserved_tokens.iter().any(|t| t == "[TOOL_CALLS]"),

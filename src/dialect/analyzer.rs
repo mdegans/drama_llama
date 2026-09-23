@@ -331,24 +331,6 @@ static PATCHES: &[Patch] = &[
             push_preserved(&mut syntax.preserved_tokens, "</think>");
         }
     },
-    // Mistral (`mistral4`): `[THINK]` is a reasoning channel the
-    // template renders from the `reasoning`/`reasoning_content`
-    // message field, not from a `<think>` block inlined in `content`.
-    // The reasoning probes see the markers but cannot see which side
-    // owns them, and the derived default is `InlineThink` — under
-    // which `build_messages` would route thoughts into `content` and
-    // the template would render none of them. Keyed on the analyzed
-    // marker rather than a raw source fragment: `[THINK]` is this
-    // family's, and the `reasoning_content` guard keeps it off any
-    // template that reconstructs reasoning from content instead (the
-    // Qwen convention, which is correctly `InlineThink`).
-    |src, syntax| {
-        if syntax.reasoning.start == "[THINK]"
-            && src.contains("reasoning_content")
-        {
-            syntax.reasoning.reingest = ReasoningReingest::Field;
-        }
-    },
 ];
 
 /// Source sniffs selecting hand-built dialects wholesale, checked
@@ -418,6 +400,8 @@ fn analyze_reasoning(probe: &Probe) -> ReasoningSyntax {
     compare_reasoning_presence(probe, &mut r);
     compare_thinking_enabled(probe, &mut r);
     compare_reasoning_scope(probe, &mut r);
+    compare_reasoning_reingest(probe, &mut r);
+    measure_reasoning_separator(probe, &mut r);
     r
 }
 
@@ -603,6 +587,95 @@ fn compare_reasoning_scope(probe: &Probe, r: &mut ReasoningSyntax) {
                 r.mode = ReasoningMode::None;
             }
         }
+    }
+}
+
+/// Thought inlined in `content` vs carried in `reasoning_content`:
+/// which re-ingest convention does this template actually honour?
+///
+/// [`ReasoningReingest::InlineThink`] is only correct for templates
+/// that reconstruct reasoning by splitting `content` on `</think>`
+/// (Qwen3.5/3.6). Qwen3.8's template dropped that split and reads the
+/// field alone, so an inlined thought renders as *content* after an
+/// empty `<think>\n\n</think>` — the re-render never reproduces the
+/// emission and the auto-tip never anchors (#112). Measured rather
+/// than sniffed: if both conventions render the same bytes, the
+/// template reconstructs inline reasoning and the default stands;
+/// otherwise, if the field render carries the thought, the field is
+/// the convention. A template that renders neither (old Qwen3 chat
+/// ignores the field) keeps the default.
+///
+/// The inline spelling mirrors `chat_template::append_block_text`.
+fn compare_reasoning_reingest(probe: &Probe, r: &mut ReasoningSyntax) {
+    if r.mode != ReasoningMode::TagBased {
+        return;
+    }
+    let params = Params {
+        messages: json!([user_msg(), {
+            "role": "assistant",
+            "content": format!("<think>{THINKING_CONTENT}</think>{ASSISTANT_MSG}"),
+        }]),
+        ..Params::default()
+    };
+    let Some(cmp) = probe.compare(&params, |p| {
+        p.messages = json!([user_msg(), {
+            "role": "assistant",
+            "content": ASSISTANT_MSG,
+            "reasoning_content": THINKING_CONTENT,
+        }]);
+    }) else {
+        return;
+    };
+    if cmp.output_a != cmp.output_b && cmp.output_b.contains(THINKING_CONTENT) {
+        r.reingest = ReasoningReingest::Field;
+    }
+}
+
+/// The bytes the template renders between the reasoning close and the
+/// content that follows (Qwen3.6/3.8: `"\n\n"`), read off one turn
+/// rendered under the reingest convention just measured.
+///
+/// Grammars spell this literally after a thought. Without it the
+/// post-thought gap was a free `[ \t\n\r]?` — at most *one* byte of
+/// whitespace — so under a forced tool call or an output_config grammar
+/// Qwen could emit `</think>\n{` but never the `</think>\n\n{` its
+/// template re-renders: every constrained thinking turn failed the
+/// canonicalization gate (#112). Left `None` unless the close is found
+/// verbatim right after the thought and the gap is pure whitespace.
+fn measure_reasoning_separator(probe: &Probe, r: &mut ReasoningSyntax) {
+    if r.mode != ReasoningMode::TagBased || r.end.is_empty() {
+        return;
+    }
+    let message = match r.reingest {
+        ReasoningReingest::InlineThink => json!({
+            "role": "assistant",
+            "content": format!("<think>{THINKING_CONTENT}</think>{ASSISTANT_MSG}"),
+        }),
+        _ => json!({
+            "role": "assistant",
+            "content": ASSISTANT_MSG,
+            "reasoning_content": THINKING_CONTENT,
+        }),
+    };
+    let params = Params {
+        messages: json!([user_msg(), message]),
+        ..Params::default()
+    };
+    let Some(out) = probe.apply(&params) else {
+        return;
+    };
+    let Some(pos) = out.find(THINKING_CONTENT) else {
+        return;
+    };
+    let after = &out[pos + THINKING_CONTENT.len()..];
+    let Some(after) = after.strip_prefix(r.end.as_str()) else {
+        return;
+    };
+    let Some(gap) = after.find(ASSISTANT_MSG).map(|at| &after[..at]) else {
+        return;
+    };
+    if gap.chars().all(char::is_whitespace) {
+        r.separator = Some(gap.to_string());
     }
 }
 

@@ -161,6 +161,15 @@ pub fn grammar_source(
     // non-canonical close now costs a one-turn canonicalization
     // repair instead, same as the parse side always did.
     let thought_delim = syntax.reasoning.end.trim();
+    // What follows the close. A measured separator is spelled
+    // literally: `fws` admits at most one whitespace byte, so a
+    // template rendering `</think>\n\n` could never be matched under
+    // the grammar and every forced thinking turn missed the tip (#112).
+    let after_thought = match &syntax.reasoning.separator {
+        Some(sep) if sep.is_empty() => String::new(),
+        Some(sep) => format!(r#" "{}""#, escape_for_gbnf_string(sep)),
+        None => " fws".to_string(),
+    };
     match (opts.anchor, has_reasoning) {
         (Anchor::Lazy, _) => {
             let _ = writeln!(src, "root ::= calls");
@@ -168,19 +177,21 @@ pub fn grammar_source(
         (Anchor::EagerThoughtPreOpened, _) => {
             // Close tag required; body is raw-until-close.
             emit_until_rules("thought_close", thought_delim, &mut src);
-            let _ = writeln!(src, "root ::= thought_close fws calls");
+            let _ =
+                writeln!(src, "root ::= thought_close{after_thought} calls");
         }
         (Anchor::Eager, true) => {
             let start_lit = escape_for_gbnf_string(&syntax.reasoning.start);
             emit_until_rules("thought_close", thought_delim, &mut src);
-            if syntax.reasoning.start.is_empty() {
-                let _ = writeln!(src, "root ::= thought_close? fws calls");
+            let open = if syntax.reasoning.start.is_empty() {
+                String::new()
             } else {
-                let _ = writeln!(
-                    src,
-                    r#"root ::= ( "{start_lit}" thought_close )? fws calls"#
-                );
-            }
+                format!(r#""{start_lit}" "#)
+            };
+            let _ = writeln!(
+                src,
+                "root ::= ( {open}thought_close{after_thought} | fws ) calls"
+            );
         }
         (Anchor::Eager, false) => {
             let _ = writeln!(src, "root ::= fws calls");

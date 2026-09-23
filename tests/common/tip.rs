@@ -39,7 +39,7 @@ use drama_llama::{
     prompt::ToolResult, Block, Content, LlamaCppSession, Message, Prompt, Role,
     SamplingMode, Tool, ToolChoice,
 };
-use misanthropic::prompt::message::CacheControl;
+use misanthropic::prompt::{message::CacheControl, thinking::Thinking};
 use serde_json::json;
 
 /// The tool every scenario calls: small schema, deterministic ask.
@@ -158,6 +158,30 @@ pub fn assert_tip_anchors_across_tool_rounds(
     session: LlamaCppSession,
     tool_rounds: usize,
 ) {
+    tool_rounds_scenario(session, tool_rounds, None)
+}
+
+/// [`assert_tip_anchors_across_tool_rounds`] with thinking enabled on
+/// every round. `prompt.thinking: None` renders `enable_thinking =
+/// false`, so the plain scenario never exercises a reasoning turn's
+/// re-ingest — which is exactly where Qwen3.8 lost the tip on every
+/// turn (#112) while this suite stayed green.
+pub fn assert_tip_anchors_across_thinking_tool_rounds(
+    session: LlamaCppSession,
+    tool_rounds: usize,
+) {
+    let thinking = Thinking::Enabled {
+        budget_tokens: NonZeroU32::new(1024).unwrap(),
+        display: None,
+    };
+    tool_rounds_scenario(session, tool_rounds, Some(thinking))
+}
+
+fn tool_rounds_scenario(
+    session: LlamaCppSession,
+    tool_rounds: usize,
+    thinking: Option<Thinking>,
+) {
     const WORDS: [&str; 6] = [
         "strawberry",
         "raspberry",
@@ -186,6 +210,7 @@ pub fn assert_tip_anchors_across_tool_rounds(
         // ends generation mid-call as a constraint violation (seen on
         // Qwen3.6 at 1024 in round 3).
         max_tokens: NonZeroU32::new(4096).unwrap(),
+        thinking,
         ..Default::default()
     };
     // The static marker: the tool definitions. Never slides.

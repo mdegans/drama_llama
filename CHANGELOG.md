@@ -54,6 +54,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Qwen3.8 thinking turns re-render byte-stable; the tip anchors
+  (#112).** Two causes, both in how a dialect describes reasoning.
+  (1) The analyzer never *measured* the thought re-ingest convention:
+  every `<think>` dialect defaulted to `InlineThink`, but Qwen3.8's
+  template dropped 3.6's `content.split('</think>')` and reads
+  `reasoning_content` alone, so every thinking turn re-rendered its
+  thought as content behind an empty `<think></think>`. The analyzer
+  now renders both conventions and picks the one the template honours
+  (subsuming the Mistral `[THINK]` source patch). (2) Under a grammar
+  (forced tool call, `output_config`), the gap after `</think>` was a
+  free `[ \t\n\r]?` — one byte at most — so Qwen's canonical
+  `</think>\n\n` was unreachable. The analyzer now measures
+  `ReasoningSyntax::separator` and the tool and JSON grammars spell it;
+  unmeasured dialects keep the old gap. Also fixes the same gap on
+  Qwen3.5/3.6 and pins Mistral 4's to empty.
+  **API:** `OutputConfigOptions` gains `thought_separator` (Session
+  fills it from the dialect); full struct literals need
+  `..Default::default()`.
+
 - **`Session::complete_text` halts on `grammar_complete()`**, exactly
   where `run_call` (and so `complete_blocks` / `complete_response` /
   blallama) always has. It used to run on to EOS or `max_tokens`, which

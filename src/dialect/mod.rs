@@ -182,6 +182,11 @@ pub struct ReasoningSyntax {
     pub end: String,
     /// Re-ingest convention (drives `RenderOptions` in `Session`).
     pub reingest: ReasoningReingest,
+    /// The bytes the template renders between [`Self::end`] and what
+    /// follows it (Qwen: `"\n\n"`). Grammars spell it literally after a
+    /// thought, so a constrained turn re-renders byte-for-byte (#112).
+    /// `None` = unmeasured: grammars keep their permissive gap.
+    pub separator: Option<String>,
 }
 
 /// Content-block markers.
@@ -524,6 +529,7 @@ impl CallSyntax {
                 start: "<think>".into(),
                 end: "</think>".into(),
                 reingest: ReasoningReingest::InlineThink,
+                separator: None,
             },
             ..Self::default()
         }
@@ -567,6 +573,7 @@ impl CallSyntax {
                 // canonicalization repair.
                 end: "\n<channel|>".into(),
                 reingest: ReasoningReingest::Field,
+                separator: None,
             },
             user_start: "<|turn>user\n".into(),
             assistant_start: "<|turn>model\n".into(),
@@ -617,6 +624,7 @@ impl CallSyntax {
                 start: harmony::ANALYSIS_OPEN.into(),
                 end: harmony::END.into(),
                 reingest: ReasoningReingest::Thinking,
+                separator: None,
             },
             content: ContentSyntax {
                 mode: ContentMode::AlwaysWrapped,

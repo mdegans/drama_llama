@@ -257,6 +257,15 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`qwen38_reingest_probe.md`](.claude/memory/qwen38_reingest_probe.md)
+  — **read before touching `ReasoningReingest`, the post-thought gap in
+  any grammar, or adding a thinking model.** 2026-09-23, #112: the
+  analyzer now *measures* the reingest convention (Qwen3.8 reads
+  `reasoning_content` only) and the post-thought `separator`, which the
+  tool and output_config grammars spell literally — the old gap was one
+  optional byte, so Qwen's `</think>\n\n` was unreachable under any
+  grammar. Also: the shared #96 tip scenarios ran thinking OFF; use
+  `assert_tip_anchors_across_thinking_tool_rounds` for thinking models.
 - [`known_id_exemption.md`](.claude/memory/known_id_exemption.md)
   — **read before touching `sample::ids`, proposing a shape/regex
   detector on the *emission* for identifiers, or "fixing" the seeding
