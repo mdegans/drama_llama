@@ -350,6 +350,9 @@ impl Mtmd {
         let text_c = CString::new(text)?;
         let input = mtmd_input_text {
             text: text_c.as_ptr(),
+            // Excludes the NUL terminator: upstream reads exactly
+            // `text_len` bytes (llama-cpp-sys-3 0.8.2+).
+            text_len: text_c.as_bytes().len(),
             add_special,
             parse_special,
         };

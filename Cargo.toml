@@ -46,7 +46,7 @@ exclude = [
 # actually happens: mdegans/llama-cpp-sys#6. Until that lands, this
 # comment is the only thing standing between a routine version bump and
 # an unsound `Sync`.
-llama-cpp-sys-3 = { version = "0.8.1", optional = true }
+llama-cpp-sys-3 = { version = "0.8.4", optional = true }
 
 # moeflux (Metal-backed streaming-MoE decoder). macOS-only; drama_llama's
 # own `moeflux` feature wraps the platform gate so cross-platform builds
@@ -78,11 +78,7 @@ sha2 = "0.10"
 # hazard where a downstream crate flips serde_json's Map under us
 # (#60). The dict/Gemma family is pinned alphabetical separately —
 # its templates `dictsort`.
-minijinja = { version = "2.5", features = [
-    "loader",
-    "json",
-    "preserve_order",
-] }
+minijinja = { version = "2.5", features = ["loader", "json", "preserve_order"] }
 minijinja-contrib = { version = "2.5", features = ["pycompat"] }
 misanthropic = { version = "1.0.0-alpha.18", default-features = false, features = [
     "partial-eq",
