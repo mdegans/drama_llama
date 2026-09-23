@@ -3299,11 +3299,15 @@ impl<B: Backend> Session<B> {
     /// The reasoning open marker is likewise forced from the analyzed
     /// dialect: it is a fact about the model, not a preference, and
     /// without it a prompt ending in an open thought would fail to
-    /// render ([`ChatTemplateError::OpenThoughtUnsupported`]).
+    /// render ([`ChatTemplateError::OpenThoughtUnsupported`]). So is
+    /// the thought re-ingest convention (#112): replacing the options
+    /// to add one template extra must not silently change how prior
+    /// thoughts render (Qwen3.8 reads `reasoning_content` only).
     pub fn with_render_opts(mut self, opts: RenderOptions) -> Self {
         let mut opts = opts
             .with_generation_prompt(true)
-            .with_reasoning_start(&self.dialect.reasoning.start);
+            .with_reasoning_start(&self.dialect.reasoning.start)
+            .with_thought_reingest(self.dialect.reasoning.reingest);
         if !opts.extras.iter().any(|(k, _)| k == "preserve_thinking") {
             opts = opts.with_extra("preserve_thinking", true);
         }
