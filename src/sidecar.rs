@@ -377,6 +377,34 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
+    /// Measured effort levels survive the TOML round-trip, and a
+    /// sidecar written before the field existed still loads (as "no
+    /// knob").
+    #[test]
+    fn call_syntax_efforts_roundtrip() {
+        let dir = tempfile_dir();
+        let path = dir.join("dialect.toml");
+
+        let syntax = crate::CallSyntax::gpt_oss();
+        assert!(!syntax.reasoning.efforts.is_empty());
+        write_call_syntax(&path, &syntax).unwrap();
+        let loaded = load_call_syntax(&path).unwrap().expect("written");
+        assert_eq!(loaded, syntax);
+
+        // An empty set is not written at all — which is exactly what an
+        // older sidecar looks like.
+        let syntax = crate::CallSyntax::qwen_xml();
+        assert!(syntax.reasoning.efforts.is_empty());
+        write_call_syntax(&path, &syntax).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("efforts"), "{body}");
+        let loaded = load_call_syntax(&path).unwrap().expect("written");
+        assert_eq!(loaded, syntax);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     /// Round-trip the default through `write_default → load`. Catches
     /// any field that can't be serialized (e.g. an `f32::NaN` slipping
     /// into a default) or any deserialize-side schema drift.

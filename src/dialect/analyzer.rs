@@ -105,6 +105,9 @@ struct Params {
     tools: Value,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    /// `None` leaves `reasoning_effort` undefined (the template's
+    /// default applies).
+    reasoning_effort: Option<&'static str>,
 }
 
 impl Default for Params {
@@ -114,6 +117,7 @@ impl Default for Params {
             tools: Value::Null,
             add_generation_prompt: false,
             enable_thinking: true,
+            reasoning_effort: None,
         }
     }
 }
@@ -171,6 +175,13 @@ impl<'s> Probe<'s> {
             add_generation_prompt => params.add_generation_prompt,
             enable_thinking => params.enable_thinking,
             date_string => "01 Jan 2026",
+        };
+        let ctx = match params.reasoning_effort {
+            Some(effort) => minijinja::context! {
+                reasoning_effort => effort,
+                ..ctx
+            },
+            None => ctx,
         };
         // `catch_unwind` in addition to `.ok()`: some templates index
         // `messages[0]` unconditionally and minijinja *panics* (not
@@ -286,7 +297,12 @@ pub fn analyze_template(
     // the differential probes can't segment — and whose guard
     // `raise_exception`s the probe payloads may trip — so any probe
     // result would be discarded noise anyway.
-    if let Some(hand_built) = sniff_hand_built(source) {
+    if let Some(mut hand_built) = sniff_hand_built(source) {
+        // The effort knob is measured, not hand-built: gpt-oss reads
+        // `reasoning_effort` into its system prefix.
+        if let Ok(probe) = Probe::new(source, bos, eos) {
+            hand_built.reasoning.efforts = measure_reasoning_efforts(&probe);
+        }
         return Ok(hand_built);
     }
 
@@ -402,6 +418,7 @@ fn analyze_reasoning(probe: &Probe) -> ReasoningSyntax {
     compare_reasoning_scope(probe, &mut r);
     compare_reasoning_reingest(probe, &mut r);
     measure_reasoning_separator(probe, &mut r);
+    r.efforts = measure_reasoning_efforts(probe);
     r
 }
 
@@ -677,6 +694,56 @@ fn measure_reasoning_separator(probe: &Probe, r: &mut ReasoningSyntax) {
     if gap.chars().all(char::is_whitespace) {
         r.separator = Some(gap.to_string());
     }
+}
+
+/// A value no template could mean: if it renders, the template does
+/// not validate `reasoning_effort`.
+const EFFORT_NONSENSE: &str = "drama-llama-probe";
+
+/// What a non-validating template gets: the levels effort-trained
+/// models (gpt-oss) actually saw. Anything above is a string the model
+/// never trained on, however happily the template renders it.
+const EFFORT_CONVENTIONAL: [&str; 3] = ["low", "medium", "high"];
+
+/// The `reasoning_effort` values the template accepts, lowest first.
+///
+/// Each level on [`crate::chat_template::EFFORT_SCALE`] renders a
+/// thinking-on generation prompt; accepted iff it renders (Qwen3.8 and
+/// stock Mistral Small 4 `raise_exception` on anything else). A
+/// template that also renders [`EFFORT_NONSENSE`] validates nothing,
+/// so it gets [`EFFORT_CONVENTIONAL`]. Empty when nothing renders, or
+/// when every accepted value renders the same bytes as leaving the
+/// variable undefined — a template that overrides it (the Mistral
+/// cache-stable template derives it from `enable_thinking`) or never
+/// reads it has no knob to turn.
+fn measure_reasoning_efforts(probe: &Probe) -> Vec<String> {
+    let render = |effort| {
+        probe.apply(&Params {
+            messages: json!([user_msg()]),
+            add_generation_prompt: true,
+            enable_thinking: true,
+            reasoning_effort: effort,
+            ..Params::default()
+        })
+    };
+    let baseline = render(None);
+    let accepted: Vec<(&str, String)> = crate::chat_template::EFFORT_SCALE
+        .iter()
+        .filter_map(|&e| render(Some(e)).map(|out| (e, out)))
+        .collect();
+    if accepted
+        .iter()
+        .all(|(_, out)| Some(out) == baseline.as_ref())
+    {
+        return Vec::new();
+    }
+    let validates = render(Some(EFFORT_NONSENSE)).is_none();
+    accepted
+        .into_iter()
+        .map(|(e, _)| e)
+        .filter(|e| validates || EFFORT_CONVENTIONAL.contains(e))
+        .map(String::from)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1776,4 +1843,73 @@ fn detect_user_start(probe: &Probe) -> String {
         result.push_str(seg.value());
     }
     result.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn efforts(source: &str) -> Vec<String> {
+        analyze_template(source, "", "").unwrap().reasoning.efforts
+    }
+
+    /// Qwen3.8's shape: validates, rewrites `high` to `xhigh`, rejects
+    /// `max`. `high` is still *accepted* — it renders.
+    #[test]
+    fn efforts_validating_template() {
+        let src = "\
+            {%- set ri = '' %}\
+            {%- if enable_thinking is undefined or enable_thinking is true %}\
+            {%- set e = reasoning_effort|default('xhigh') %}\
+            {%- if e == 'high' %}{%- set e = 'xhigh' %}{%- endif %}\
+            {%- if e not in ('xhigh', 'medium', 'low') %}\
+            {{- raise_exception('bad effort ' ~ e) }}{%- endif %}\
+            {%- if e == 'xhigh' %}{%- set ri = 'THINK HARD.' %}\
+            {%- elif e == 'low' %}{%- set ri = 'THINK BRIEFLY.' %}{%- endif %}\
+            {%- endif %}\
+            <|im_start|>system\n{{ ri }}<|im_end|>\n\
+            {%- for m in messages %}<|im_start|>{{ m.role }}\n\
+            {{- m.content }}<|im_end|>\n{% endfor %}\
+            {%- if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        assert_eq!(efforts(src), ["low", "medium", "high", "xhigh"]);
+    }
+
+    /// Stock Mistral Small 4's shape: `none`/`high` only, so only
+    /// `high` from the scale renders.
+    #[test]
+    fn efforts_mistral_like() {
+        let src = "\
+            {%- set reasoning_effort = reasoning_effort if reasoning_effort \
+            is defined and reasoning_effort is not none else 'none' %}\
+            {%- if reasoning_effort not in ['none', 'high'] %}\
+            {{- raise_exception('bad effort') }}{%- endif %}\
+            [MODEL_SETTINGS]{\"reasoning_effort\": \"{{ reasoning_effort }}\"}\
+            [/MODEL_SETTINGS]\
+            {%- for m in messages %}[INST]{{ m.content }}[/INST]{% endfor %}";
+        assert_eq!(efforts(src), ["high"]);
+    }
+
+    /// gpt-oss's shape: renders anything, so the set falls back to the
+    /// trained `low`/`medium`/`high`.
+    #[test]
+    fn efforts_non_validating_template() {
+        let src = "\
+            {%- if reasoning_effort is not defined %}\
+            {%- set reasoning_effort = 'medium' %}{%- endif %}\
+            <|start|>system<|message|>Reasoning: {{ reasoning_effort }}<|end|>\
+            {%- for m in messages %}<|start|>{{ m.role }}<|message|>\
+            {{- m.content }}<|end|>{% endfor %}\
+            {%- if add_generation_prompt %}<|start|>assistant{% endif %}";
+        assert_eq!(efforts(src), ["low", "medium", "high"]);
+    }
+
+    /// A template that never reads the variable has no knob.
+    #[test]
+    fn efforts_absent() {
+        let src = "\
+            {%- for m in messages %}<|im_start|>{{ m.role }}\n\
+            {{- m.content }}<|im_end|>\n{% endfor %}\
+            {%- if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        assert!(efforts(src).is_empty());
+    }
 }

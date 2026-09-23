@@ -2980,6 +2980,7 @@ impl<B: Backend> Session<B> {
         let dialect = analyze_dialect(&engine.model);
         let thought_reingest = dialect.reasoning.reingest;
         let reasoning_start = dialect.reasoning.start.clone();
+        let efforts = dialect.reasoning.efforts.clone();
         let mut session = Self {
             engine,
             template,
@@ -2993,7 +2994,8 @@ impl<B: Backend> Session<B> {
                 .with_generation_prompt(true)
                 .with_extra("preserve_thinking", true)
                 .with_thought_reingest(thought_reingest)
-                .with_reasoning_start(reasoning_start),
+                .with_reasoning_start(reasoning_start)
+                .with_efforts(efforts),
             sample_options: SamplerConfig::default(),
             seed: None,
             emit_specials_ban: true,
@@ -3166,7 +3168,8 @@ impl<B: Backend> Session<B> {
         // pre-opened-reasoning anchor.
         self.render_opts = std::mem::take(&mut self.render_opts)
             .with_thought_reingest(dialect.reasoning.reingest)
-            .with_reasoning_start(dialect.reasoning.start.clone());
+            .with_reasoning_start(dialect.reasoning.start.clone())
+            .with_efforts(dialect.reasoning.efforts.clone());
         self.dialect = dialect;
         self.refresh_emit_ban();
         self
@@ -3198,7 +3201,8 @@ impl<B: Backend> Session<B> {
         let dialect = analyze_dialect_source(&self.engine.model, &source);
         self.render_opts = std::mem::take(&mut self.render_opts)
             .with_thought_reingest(dialect.reasoning.reingest)
-            .with_reasoning_start(dialect.reasoning.start.clone());
+            .with_reasoning_start(dialect.reasoning.start.clone())
+            .with_efforts(dialect.reasoning.efforts.clone());
         self.dialect = dialect;
         self.refresh_emit_ban();
         Ok(())
@@ -3302,12 +3306,17 @@ impl<B: Backend> Session<B> {
     /// render ([`ChatTemplateError::OpenThoughtUnsupported`]). So is
     /// the thought re-ingest convention (#112): replacing the options
     /// to add one template extra must not silently change how prior
-    /// thoughts render (Qwen3.8 reads `reasoning_content` only).
+    /// thoughts render (Qwen3.8 reads `reasoning_content` only). And so
+    /// are the template's accepted effort levels
+    /// ([`RenderOptions::efforts`]): dropping them would silently stop
+    /// `output_config.effort` reaching the template. To pin an effort
+    /// regardless of the prompt, set a `reasoning_effort` extra instead.
     pub fn with_render_opts(mut self, opts: RenderOptions) -> Self {
         let mut opts = opts
             .with_generation_prompt(true)
             .with_reasoning_start(&self.dialect.reasoning.start)
-            .with_thought_reingest(self.dialect.reasoning.reingest);
+            .with_thought_reingest(self.dialect.reasoning.reingest)
+            .with_efforts(self.dialect.reasoning.efforts.clone());
         if !opts.extras.iter().any(|(k, _)| k == "preserve_thinking") {
             opts = opts.with_extra("preserve_thinking", true);
         }
@@ -9720,6 +9729,75 @@ mod tests {
         let (tokens, _, _) = session.prepare_call(&prompt, false).unwrap();
         assert_eq!(tokens[0], bos, "one BOS from the template");
         assert_ne!(tokens[1], bos, "no second BOS from the vocab (#93)");
+    }
+
+    /// Qwen3.8 end to end: `output_config.effort` reaches the model's
+    /// own template through the analyzed dialect. `Low` renders the
+    /// low instruction, `Max` (which the template would reject) renders
+    /// the `xhigh` default, and with the effort in the system prefix
+    /// every cache breakpoint's tokens are still a prefix of the full
+    /// render's.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "long running, requires a Qwen3.8 models/model.gguf"]
+    fn test_qwen38_effort_reaches_template() {
+        use misanthropic::prompt::{message::Role, Effort, Thinking};
+
+        // Qwen3.8 specifically: `models/model.gguf` is usually a model
+        // with no effort knob, and a skip on "no knob" would pass
+        // without testing anything.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models/Qwen3.8-27B-UD-Q8_K_XL.gguf");
+        if !path.exists() {
+            eprintln!("SKIP: needs {}", path.display());
+            return;
+        }
+        let session = crate::LlamaCppSession::from_path(path).unwrap().quiet();
+        let efforts = &session.dialect().reasoning.efforts;
+        assert_eq!(efforts, &["low", "medium", "high", "xhigh"]);
+        let cached = |text: &'static str| {
+            crate::Content(vec![crate::Block::Text {
+                text: text.into(),
+                cache_control: Some(
+                    misanthropic::prompt::message::CacheControl::ephemeral(),
+                ),
+                citations: None,
+            }])
+        };
+        let prompt = |effort| {
+            crate::Prompt {
+                system: Some(cached("Be brief.")),
+                messages: vec![crate::Message {
+                    role: Role::User,
+                    content: cached("Why is the sky blue?"),
+                }],
+                ..Default::default()
+            }
+            .thinking(Thinking::adaptive())
+            .effort(effort)
+        };
+        let render = |p: &crate::Prompt| {
+            session
+                .template
+                .render_with(p, &session.render_opts)
+                .unwrap()
+        };
+        let low = render(&prompt(Effort::Low));
+        assert!(low.contains("Reasoning effort is set to low"), "{low}");
+        let max = render(&prompt(Effort::Max));
+        assert!(max.contains("Reasoning effort is set to xhigh"), "{max}");
+
+        let with_bps = session
+            .template
+            .render_with_breakpoints(&prompt(Effort::Low), &session.render_opts)
+            .unwrap();
+        // Non-prefix partials are silently dropped here, so the count is
+        // the assertion.
+        let (_, bps) = crate::chat_template::tokenize_with_breakpoints(
+            &session.engine.model,
+            &with_bps,
+        );
+        assert_eq!(bps.len(), 2, "both breakpoints survive: {bps:?}");
     }
 
     fn model_path() -> std::path::PathBuf {

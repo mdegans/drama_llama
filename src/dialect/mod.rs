@@ -187,6 +187,18 @@ pub struct ReasoningSyntax {
     /// thought, so a constrained turn re-renders byte-for-byte (#112).
     /// `None` = unmeasured: grammars keep their permissive gap.
     pub separator: Option<String>,
+    /// The `reasoning_effort` values the template accepts, lowest
+    /// first, from the scale `low < medium < high < xhigh < max`
+    /// (Qwen3.8: `low`, `medium`, `high`, `xhigh`; stock Mistral Small
+    /// 4: `high`; gpt-oss, which validates nothing: its trained `low`,
+    /// `medium`, `high`). Empty = the template has no effort knob.
+    /// Rendering maps a prompt's `output_config.effort` onto this set
+    /// (see [`RenderOptions::efforts`](crate::RenderOptions::efforts)).
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Vec::is_empty")
+    )]
+    pub efforts: Vec<String>,
 }
 
 /// Content-block markers.
@@ -530,6 +542,7 @@ impl CallSyntax {
                 end: "</think>".into(),
                 reingest: ReasoningReingest::InlineThink,
                 separator: None,
+                efforts: Vec::new(),
             },
             ..Self::default()
         }
@@ -574,6 +587,7 @@ impl CallSyntax {
                 end: "\n<channel|>".into(),
                 reingest: ReasoningReingest::Field,
                 separator: None,
+                efforts: Vec::new(),
             },
             user_start: "<|turn>user\n".into(),
             assistant_start: "<|turn>model\n".into(),
@@ -625,6 +639,9 @@ impl CallSyntax {
                 end: harmony::END.into(),
                 reingest: ReasoningReingest::Thinking,
                 separator: None,
+                // The levels gpt-oss trained on. The analyzer measures
+                // the same set (the template validates nothing).
+                efforts: ["low", "medium", "high"].map(String::from).into(),
             },
             content: ContentSyntax {
                 mode: ContentMode::AlwaysWrapped,

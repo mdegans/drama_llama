@@ -51,7 +51,10 @@ use minijinja::{
 };
 use serde::Serialize;
 
-use misanthropic::prompt::message::{CacheControl, CacheTtl};
+use misanthropic::prompt::{
+    message::{CacheControl, CacheTtl},
+    Effort, OutputConfig, Thinking,
+};
 
 use crate::{
     backend::Model, prompt::Tool, Block, Content, Prompt, Role, Token,
@@ -301,8 +304,7 @@ impl ChatTemplate {
         // means thinking disabled, `Some(_)` means enabled. Caller-set
         // `extras.with_extra("enable_thinking", _)` always wins, so we
         // only add the derived value when the caller hasn't.
-        let extras_has_thinking =
-            opts.extras.iter().any(|(k, _)| k == "enable_thinking");
+        let has_extra = |key: &str| opts.extras.iter().any(|(k, _)| k == key);
         // An open trailing thought IS a generation prompt: the model
         // resumes *inside* the reasoning block, so the render must end
         // at the assistant header (plus the withheld body) and never
@@ -311,25 +313,32 @@ impl ChatTemplate {
         // — both of which pass `false` — consistent with the full one.
         let add_generation_prompt =
             opts.add_generation_prompt || open_tail.is_some();
-        let base_ctx = if extras_has_thinking {
-            minijinja::context! {
-                bos_token => &self.bos_token,
-                eos_token => &self.eos_token,
-                messages => messages,
-                tools => tools_value,
-                add_generation_prompt => add_generation_prompt,
-                date_string => date_string,
+        // Values derived from the prompt, each added only when the
+        // caller didn't set it: context merges are left-wins, so a
+        // derived key would otherwise shadow the caller's extra.
+        // `reasoning_effort` follows `output_config.effort` (see
+        // `derive_reasoning_effort`).
+        let mut derived: BTreeMap<&str, JinjaValue> = BTreeMap::new();
+        if !has_extra("enable_thinking") {
+            derived.insert(
+                "enable_thinking",
+                JinjaValue::from(thinking_enabled(prompt)),
+            );
+        }
+        if !has_extra("reasoning_effort") {
+            if let Some(effort) = derive_reasoning_effort(prompt, &opts.efforts)
+            {
+                derived.insert("reasoning_effort", JinjaValue::from(effort));
             }
-        } else {
-            minijinja::context! {
-                bos_token => &self.bos_token,
-                eos_token => &self.eos_token,
-                messages => messages,
-                tools => tools_value,
-                add_generation_prompt => add_generation_prompt,
-                date_string => date_string,
-                enable_thinking => prompt.thinking.is_some(),
-            }
+        }
+        let base_ctx = minijinja::context! {
+            bos_token => &self.bos_token,
+            eos_token => &self.eos_token,
+            messages => messages,
+            tools => tools_value,
+            add_generation_prompt => add_generation_prompt,
+            date_string => date_string,
+            ..JinjaValue::from_serialize(&derived)
         };
         // Merge caller-supplied extras on top of the base context.
         let ctx = if opts.extras.is_empty() {
@@ -529,6 +538,18 @@ pub struct RenderOptions {
     ///
     /// [`OPEN_THOUGHT_SIGNATURE`]: crate::prompt::OPEN_THOUGHT_SIGNATURE
     pub reasoning_start: Option<String>,
+    /// The `reasoning_effort` values the template accepts, lowest
+    /// first ([`ReasoningSyntax::efforts`]). When a thinking-enabled
+    /// prompt carries `output_config.effort`, the render sets
+    /// `reasoning_effort` to that level if accepted, else to the
+    /// nearest accepted one (the lower on a tie): Qwen3.8 has no `max`,
+    /// so `Max` renders `xhigh`. Empty (the default) = no knob; the
+    /// effort is ignored. A caller's `reasoning_effort` extra always
+    /// wins. `Session` sets this from the analyzed dialect, beside
+    /// [`Self::thought_reingest`].
+    ///
+    /// [`ReasoningSyntax::efforts`]: crate::dialect::ReasoningSyntax::efforts
+    pub efforts: Vec<String>,
 }
 
 impl RenderOptions {
@@ -591,6 +612,100 @@ impl RenderOptions {
         let start = start.as_ref().trim();
         self.reasoning_start = (!start.is_empty()).then(|| start.to_string());
         self
+    }
+
+    /// Builder: set the template's accepted effort levels (see
+    /// [`RenderOptions::efforts`]).
+    pub fn with_efforts<I, S>(mut self, efforts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.efforts = efforts.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// The ordered effort scale, lowest first — Anthropic's
+/// [`Effort`] levels, which are also the chat-template spellings.
+/// Nearest-level mapping and the analyzer's effort probe both walk it.
+pub(crate) const EFFORT_SCALE: [&str; 5] =
+    ["low", "medium", "high", "xhigh", "max"];
+
+/// Map a requested [`Effort`] onto the levels a template `accepted`:
+/// the level itself if accepted, else the nearest accepted one on
+/// [`EFFORT_SCALE`], the lower on a tie. `None` for an unknown
+/// ([`Effort::Custom`]) level or an empty set.
+pub(crate) fn resolve_effort<'a>(
+    requested: &Effort,
+    accepted: &'a [String],
+) -> Option<&'a str> {
+    let rank = |level: &str| EFFORT_SCALE.iter().position(|&l| l == level);
+    let want = rank(requested.as_str())?;
+    accepted
+        .iter()
+        .filter_map(|level| Some((rank(level)?, level.as_str())))
+        .min_by_key(|&(r, _)| (want.abs_diff(r), r))
+        .map(|(_, level)| level)
+}
+
+/// Whether `prompt` asks for thinking. `Some(Thinking::Disabled)` is
+/// an explicit *off*: checking `thinking.is_some()` instead rendered it
+/// as `enable_thinking = true`.
+pub(crate) fn thinking_enabled(prompt: &Prompt) -> bool {
+    !matches!(prompt.thinking, None | Some(Thinking::Disabled))
+}
+
+/// The `reasoning_effort` a render passes the template, if any: only
+/// for a thinking-enabled prompt that requests an effort, mapped onto
+/// the template's accepted levels by [`resolve_effort`]. Thinking off
+/// never sets it, so a thinking-off render is unchanged.
+fn derive_reasoning_effort<'a>(
+    prompt: &Prompt,
+    accepted: &'a [String],
+) -> Option<&'a str> {
+    if !thinking_enabled(prompt) {
+        return None;
+    }
+    let requested = prompt.output_config.as_ref()?.effort.as_ref()?;
+    if accepted.is_empty() {
+        debug_once(format!(
+            "effort `{requested}` requested, but the chat template has \
+             no reasoning_effort knob; ignoring it"
+        ));
+        return None;
+    }
+    let chosen = resolve_effort(requested, accepted);
+    match chosen {
+        Some(level) if level != requested.as_str() => debug_once(format!(
+            "effort `{requested}` isn't accepted by the chat template \
+             ({accepted:?}); rendering reasoning_effort `{level}`"
+        )),
+        None => debug_once(format!(
+            "effort `{requested}` is not a known level; leaving \
+             reasoning_effort unset"
+        )),
+        Some(_) => {}
+    }
+    chosen
+}
+
+/// Log `message` at debug level the first time it occurs. Every call
+/// renders the prompt several times (full plus one partial per cache
+/// breakpoint), so a per-render log would repeat itself.
+fn debug_once(message: String) {
+    use std::{
+        collections::BTreeSet,
+        sync::{Mutex, OnceLock},
+    };
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let first = seen
+        .lock()
+        .map(|mut seen| seen.insert(message.clone()))
+        .unwrap_or(true);
+    if first {
+        tracing::debug!("{message}");
     }
 }
 
@@ -765,10 +880,22 @@ fn render_partial(
     // full render and the model lost every breakpoint (#93 follow-up,
     // 2026-09-12). Qwen only reads it at the generation tail, which
     // partials never render, so it never showed there.
+    //
+    // `output_config.effort` reaches the template as
+    // `reasoning_effort`, which Qwen3.8, Mistral and gpt-oss all write
+    // into the system PREFIX — same failure, same fix. Only the effort
+    // is carried: the render never reads `format`, and a partial has no
+    // business depending on it.
+    let output_config = prompt
+        .output_config
+        .as_ref()
+        .and_then(|c| c.effort.clone())
+        .map(OutputConfig::effort);
     let truncated = match up_to {
         PromptBreakpoint::AfterTools => Prompt {
             tools: prompt.tools.clone(),
             thinking: prompt.thinking,
+            output_config: output_config.clone(),
             // Carry the system content too. Every modern template
             // (Qwen3, Llama 3.1, Hermes, Cogito) coalesces tools into
             // the system block, so a "tools-only, no system" truncation
@@ -787,6 +914,7 @@ fn render_partial(
             system: prompt.system.clone(),
             messages: Vec::new(),
             thinking: prompt.thinking,
+            output_config: output_config.clone(),
             ..Prompt::default()
         },
         PromptBreakpoint::AfterMessage(i) => Prompt {
@@ -794,6 +922,7 @@ fn render_partial(
             system: prompt.system.clone(),
             messages: prompt.messages[..=i].to_vec(),
             thinking: prompt.thinking,
+            output_config,
             ..Prompt::default()
         },
     };
@@ -2547,6 +2676,224 @@ mod tests {
             .unwrap();
         assert!(out.text.starts_with("[SETTINGS]on"), "{}", out.text);
         assert_eq!(out.partials.len(), 3);
+        for (bp, _, partial) in &out.partials {
+            assert!(
+                out.text.starts_with(partial.as_str()),
+                "{bp:?} is not a byte prefix of the full render:\n  \
+                 full:    {:?}\n  partial: {:?}",
+                out.text,
+                partial
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // output_config.effort → reasoning_effort
+    // ----------------------------------------------------------------
+
+    /// Qwen3.8's effort shape, trimmed: `high` is rewritten to
+    /// `xhigh`, anything outside `xhigh`/`medium`/`low` raises, and the
+    /// instruction lands in the system block — the prompt *prefix*.
+    const QWEN_EFFORT_SRC: &str = "\
+        {%- set ri = '' %}\
+        {%- if enable_thinking is undefined or enable_thinking is true %}\
+        {%- set e = reasoning_effort|default('xhigh') %}\
+        {%- if e == 'high' %}{%- set e = 'xhigh' %}{%- endif %}\
+        {%- if e not in ('xhigh', 'medium', 'low') %}\
+        {{- raise_exception('bad effort ' ~ e) }}{%- endif %}\
+        {%- if e == 'xhigh' %}{%- set ri = 'THINK HARD.' %}\
+        {%- elif e == 'low' %}{%- set ri = 'THINK BRIEFLY.' %}{%- endif %}\
+        {%- endif %}\
+        <|im_start|>system\n\
+        {%- for t in tools or [] %}{{ t.function.name }};{% endfor %}\
+        {{- ri }}<|im_end|>\n\
+        {%- for m in messages %}<|im_start|>{{ m.role }}\n\
+        {{- m.content }}<|im_end|>\n{% endfor %}\
+        {%- if add_generation_prompt %}<|im_start|>assistant\n<think>\n\
+        {%- endif %}";
+
+    fn qwen_efforts() -> RenderOptions {
+        RenderOptions::default()
+            .with_generation_prompt(true)
+            .with_efforts(["low", "medium", "high", "xhigh"])
+    }
+
+    fn thinking_on() -> Thinking {
+        Thinking::Enabled {
+            budget_tokens: std::num::NonZeroU32::new(1024).unwrap(),
+            display: None,
+        }
+    }
+
+    fn user_prompt() -> Prompt {
+        Prompt::default().add_message((Role::User, "hi")).unwrap()
+    }
+
+    /// Nearest accepted level, the lower on a tie; an unknown level or
+    /// an empty set maps to nothing.
+    #[test]
+    fn test_resolve_effort_table() {
+        let qwen = ["low", "medium", "high", "xhigh"].map(String::from);
+        let mistral = ["high".to_string()];
+        let gptoss = ["low", "medium", "high"].map(String::from);
+        let ends = ["low", "max"].map(String::from);
+        let custom = Effort::Custom(Cow::Borrowed("ultra"));
+        let cases: &[(&Effort, &[String], Option<&str>)] = &[
+            (&Effort::Low, &qwen, Some("low")),
+            (&Effort::Medium, &qwen, Some("medium")),
+            (&Effort::High, &qwen, Some("high")),
+            (&Effort::XHigh, &qwen, Some("xhigh")),
+            (&Effort::Max, &qwen, Some("xhigh")),
+            (&Effort::Low, &mistral, Some("high")),
+            (&Effort::Max, &mistral, Some("high")),
+            (&Effort::XHigh, &gptoss, Some("high")),
+            (&Effort::Max, &gptoss, Some("high")),
+            (&Effort::Medium, &gptoss, Some("medium")),
+            // `high` is two from `low` and two from `max`: the lower wins.
+            (&Effort::High, &ends, Some("low")),
+            (&Effort::XHigh, &ends, Some("max")),
+            (&custom, &qwen, None),
+            (&Effort::Low, &[], None),
+        ];
+        for (requested, accepted, want) in cases {
+            assert_eq!(
+                resolve_effort(requested, accepted),
+                *want,
+                "{requested:?} over {accepted:?}"
+            );
+        }
+    }
+
+    /// `Thinking::Disabled` is an explicit *off*: it must render as
+    /// `enable_thinking = false`, like an absent `thinking`, not as on.
+    #[test]
+    fn test_thinking_disabled_renders_off() {
+        let src = "T={{ enable_thinking }}".to_owned();
+        let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
+        let opts = RenderOptions::default();
+        let render = |p: &Prompt| t.render_with(p, &opts).unwrap();
+        assert_eq!(render(&user_prompt()), "T=false");
+        assert_eq!(
+            render(&user_prompt().thinking(Thinking::Disabled)),
+            "T=false"
+        );
+        assert_eq!(render(&user_prompt().thinking(thinking_on())), "T=true");
+    }
+
+    /// Which `reasoning_effort` reaches the template, read back
+    /// directly: set only for thinking-on prompts that request an
+    /// effort, never over a caller extra, never for an unknown level
+    /// or a template without the knob.
+    #[test]
+    fn test_render_reasoning_effort_derivation() {
+        let src = "E={{ reasoning_effort|default('unset') }}".to_owned();
+        let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
+        let render = |prompt: &Prompt, opts: &RenderOptions| {
+            t.render_with(prompt, opts).unwrap()
+        };
+        let opts = qwen_efforts();
+        let on = user_prompt().thinking(thinking_on());
+
+        assert_eq!(render(&on.clone().effort(Effort::Low), &opts), "E=low");
+        assert_eq!(render(&on.clone().effort(Effort::Max), &opts), "E=xhigh");
+        // No effort requested: the template's default.
+        assert_eq!(render(&on, &opts), "E=unset");
+        // Thinking off — absent or explicitly disabled — never sets it.
+        assert_eq!(
+            render(&user_prompt().effort(Effort::Low), &opts),
+            "E=unset"
+        );
+        assert_eq!(
+            render(
+                &user_prompt()
+                    .thinking(Thinking::Disabled)
+                    .effort(Effort::Low),
+                &opts
+            ),
+            "E=unset"
+        );
+        // A caller extra wins.
+        let pinned = opts.clone().with_extra("reasoning_effort", "medium");
+        assert_eq!(
+            render(&on.clone().effort(Effort::Low), &pinned),
+            "E=medium"
+        );
+        // No knob, or a level we can't place: left alone.
+        let low = on.clone().effort(Effort::Low);
+        assert_eq!(render(&low, &RenderOptions::default()), "E=unset");
+        let custom = on.effort(Effort::Custom(Cow::Borrowed("ultra")));
+        assert_eq!(render(&custom, &opts), "E=unset");
+    }
+
+    /// Against the Qwen3.8 shape: `Low` renders the low instruction,
+    /// no effort renders the template's `xhigh` default, and `Max`
+    /// (which the template would reject) renders `xhigh` rather than
+    /// failing.
+    #[test]
+    fn test_render_effort_qwen_like() {
+        let t = ChatTemplate::from_source(
+            QWEN_EFFORT_SRC.to_owned(),
+            "".into(),
+            "".into(),
+        )
+        .unwrap();
+        let on = user_prompt().thinking(thinking_on());
+        let opts = qwen_efforts();
+
+        let low = t.render_with(&on.clone().effort(Effort::Low), &opts);
+        let low = low.unwrap();
+        assert!(low.contains("THINK BRIEFLY."), "{low}");
+        assert!(!low.contains("THINK HARD."), "{low}");
+
+        let default = t.render_with(&on, &opts).unwrap();
+        assert!(default.contains("THINK HARD."), "{default}");
+
+        let max = t.render_with(&on.effort(Effort::Max), &opts).unwrap();
+        assert_eq!(max, default, "Max maps to xhigh, the default");
+    }
+
+    /// The effort lands in the prompt PREFIX (system block), so every
+    /// partial must carry it or none is a prefix of the full render and
+    /// the cache loses every breakpoint — the #93 thinking bug again.
+    #[test]
+    fn test_render_with_breakpoints_carries_effort_into_partials() {
+        let t = ChatTemplate::from_source(
+            QWEN_EFFORT_SRC.to_owned(),
+            "".into(),
+            "".into(),
+        )
+        .unwrap();
+        let prompt = Prompt {
+            tools: Some(vec![tool_cached("ping").into()]),
+            system: Some(Content(vec![Block::Text {
+                text: Cow::Borrowed("sys"),
+                cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
+            }])),
+            messages: vec![
+                cached_user_msg("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: Content::text("hello"),
+                },
+                cached_user_msg("again"),
+            ],
+            ..Prompt::default()
+        }
+        .thinking(thinking_on())
+        .effort(Effort::Low);
+        let out = t.render_with_breakpoints(&prompt, &qwen_efforts()).unwrap();
+        assert!(out.text.contains("THINK BRIEFLY."), "{}", out.text);
+        let kinds: Vec<_> = out.partials.iter().map(|(bp, ..)| *bp).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                PromptBreakpoint::AfterTools,
+                PromptBreakpoint::AfterSystem,
+                PromptBreakpoint::AfterMessage(0),
+                PromptBreakpoint::AfterMessage(2),
+            ]
+        );
         for (bp, _, partial) in &out.partials {
             assert!(
                 out.text.starts_with(partial.as_str()),

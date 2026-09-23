@@ -199,6 +199,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`output_config.effort` reaches the chat template as
+  `reasoning_effort`.** It used to be dropped, so Qwen3.8 always
+  rendered its `xhigh` default ("think carefully… validate key
+  assumptions…") and thoughts ran 4–8k tokens. The analyzer now
+  measures the levels a template accepts (`ReasoningSyntax::efforts`):
+  each of `low`/`medium`/`high`/`xhigh`/`max` is probed thinking-on
+  and accepted iff it renders; a template that also renders a nonsense
+  value validates nothing and gets the trained `low`/`medium`/`high`
+  (gpt-oss); one whose output never changes has no knob (the Mistral
+  cache-stable template, which derives it from `enable_thinking`).
+  Measured: Qwen3.8 `low`–`xhigh`, stock Mistral Small 4 `high`,
+  gpt-oss `low`–`high`. For a thinking-enabled prompt the render maps
+  the requested level onto that set — exact if accepted, else the
+  nearest, the lower on a tie (Qwen3.8 `Max` → `xhigh`) — through the
+  new `RenderOptions::efforts`, which `Session` fills from the dialect
+  and `with_render_opts` forces like the re-ingest convention. Thinking
+  off never sets it; a caller's `reasoning_effort` extra still wins.
+  The effort is written into the prompt *prefix*, so `render_partial`
+  now carries it into every truncated prompt — without it no partial
+  would be a prefix of the full render and every cache breakpoint
+  would be lost (the #93 `thinking` bug, again). Remaps and "no knob"
+  are logged once at debug level.
 - **`GET /v1/models` and `GET /v1/models/{id}` on blallama**, in
   misanthropic's `Models` / `ModelInfo` types, for every model on
   disk — loaded or not — with real metadata: `display_name` from

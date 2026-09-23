@@ -198,7 +198,7 @@ pub fn grammar_for_prompt(
 /// `prompt.output_config` is set.
 ///
 /// `phase_split` is auto-disabled for this call when the prompt has
-/// no thinking enabled (`prompt.thinking.is_none()`). Phase-split is
+/// no thinking enabled (absent or `Thinking::Disabled`). Phase-split is
 /// a performance optimization that defers the JSON grammar until
 /// `</think>` appears in the output — with thinking off, `</think>`
 /// never appears, so the deferred grammar would never activate and
@@ -215,7 +215,7 @@ pub fn compile_prompt_output_config(
     let Some(config) = prompt.output_config.as_ref() else {
         return Ok(None);
     };
-    let effective = if prompt.thinking.is_none() {
+    let effective = if !crate::chat_template::thinking_enabled(prompt) {
         OutputConfigOptions {
             phase_split: false,
             ..opts.clone()

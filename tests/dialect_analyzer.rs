@@ -312,3 +312,39 @@ fn mistral4_cache_stable() {
         "{s:#?}"
     );
 }
+
+/// `reasoning_effort` levels measured against the shipped and fixture
+/// templates. Qwen3.8 rejects `max`; stock Mistral accepts only `high`
+/// (`none` is off the scale); the Mistral cache-stable template derives
+/// the value from `enable_thinking`, so the variable has no effect;
+/// gpt-oss validates nothing and gets its trained three.
+#[test]
+fn reasoning_efforts_measured() {
+    let cases: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "qwen3.8-gguf.jinja",
+            "",
+            "<|im_end|>",
+            &["low", "medium", "high", "xhigh"],
+        ),
+        ("mistral4-gguf.jinja", "<s>", "</s>", &["high"]),
+        ("mistral4-cache-stable.jinja", "<s>", "</s>", &[]),
+        (
+            "gptoss-gguf.jinja",
+            "<|startoftext|>",
+            "<|return|>",
+            &["low", "medium", "high"],
+        ),
+        (
+            "gptoss-cache-stable.jinja",
+            "<|startoftext|>",
+            "<|return|>",
+            &["low", "medium", "high"],
+        ),
+        ("qwen3.6-gguf.jinja", "", "<|im_end|>", &[]),
+    ];
+    for (fixture, bos, eos, want) in cases {
+        let s = analyze(fixture, bos, eos);
+        assert_eq!(s.reasoning.efforts, *want, "{fixture}");
+    }
+}
