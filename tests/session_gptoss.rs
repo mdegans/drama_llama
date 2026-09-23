@@ -55,6 +55,11 @@ fn install_template_sidecar(model: &std::path::Path) {
     std::fs::copy(&fixture, &sidecar).expect("install template sidecar");
 }
 
+/// A real context size: the default `n_ctx` (512) is smaller than one
+/// turn's `max_tokens` (1024), so a seed whose first turn reasons at
+/// length overflows the second (`ContextOverflow { needed_cells: 517 }`
+/// under seed 175391396439738032250350131245834857259).
+///
 /// Seeded via `common::test_seed()`: random by default (free fuzzing),
 /// printed on failure so the trajectory is replayable with
 /// `DRAMA_LLAMA_TEST_SEED=<n>`. The session seed selects the sampler
@@ -64,10 +69,13 @@ fn load_session() -> Option<drama_llama::LlamaCppSession> {
     let path = model_path()?;
     install_template_sidecar(&path);
     Some(
-        drama_llama::LlamaCppSession::from_path(path)
-            .expect("session load")
-            .quiet()
-            .with_seed(Some(common::test_seed())),
+        drama_llama::LlamaCppSession::from_path_with(
+            path,
+            drama_llama::LlamaCppOptions::default().with_n_ctx(4096),
+        )
+        .expect("session load")
+        .quiet()
+        .with_seed(Some(common::test_seed())),
     )
 }
 
