@@ -174,6 +174,20 @@ pub fn compile_output_config(
     }
 }
 
+/// The prompt's `output_config` iff it asks for structured output. An
+/// `output_config` carrying only an [`effort`](OutputConfig::effort)
+/// (`format: None`) constrains nothing — the effort reaches the chat
+/// template instead — so it must not claim the grammar slot. Treating it
+/// as a format request failed every effort-only request with
+/// [`OutputConfigError::UnsupportedFormat`] (the first Agora run with
+/// `thinking_effort`, 2026-09-23).
+fn structured(prompt: &Prompt) -> Option<&OutputConfig> {
+    prompt
+        .output_config
+        .as_ref()
+        .filter(|config| config.format.is_some())
+}
+
 /// Derive the output-config grammar directly from a [`Prompt`]. Reads
 /// `prompt.output_config`; returns `Ok(None)` when unset. Legacy entry
 /// point — ignores `phase_split`. Use [`compile_prompt_output_config`] for
@@ -183,7 +197,7 @@ pub fn grammar_for_prompt(
     opts: &OutputConfigOptions,
     thought_pre_opened: bool,
 ) -> Result<Option<SamplingMode>, OutputConfigError> {
-    let Some(config) = prompt.output_config.as_ref() else {
+    let Some(config) = structured(prompt) else {
         return Ok(None);
     };
     Ok(Some(grammar_for_output_config(
@@ -212,7 +226,7 @@ pub fn compile_prompt_output_config(
     opts: &OutputConfigOptions,
     thought_pre_opened: bool,
 ) -> Result<Option<CompiledOutputConfig>, OutputConfigError> {
-    let Some(config) = prompt.output_config.as_ref() else {
+    let Some(config) = structured(prompt) else {
         return Ok(None);
     };
     let effective = if !crate::chat_template::thinking_enabled(prompt) {
@@ -327,6 +341,24 @@ mod tests {
     /// unreachable and the model wrote `</think>\n{…}`, `</think> {…}`
     /// or `</think>{…}` instead; each re-rendered differently and lost
     /// the tip.
+    /// An effort-only `output_config` (`format: None`) requests no
+    /// grammar: it must fall through to the tool grammar, not fail the
+    /// request as an unsupported format (2026-09-23 Agora outage).
+    #[test]
+    fn effort_only_output_config_compiles_to_nothing() {
+        use misanthropic::prompt::Effort;
+        let prompt = Prompt::default()
+            .add_message((misanthropic::prompt::message::Role::User, "hi"))
+            .unwrap()
+            .effort(Effort::Medium);
+        assert!(prompt.output_config.is_some(), "precondition");
+        let opts = OutputConfigOptions::default();
+        assert!(compile_prompt_output_config(&prompt, &opts, false)
+            .unwrap()
+            .is_none());
+        assert!(grammar_for_prompt(&prompt, &opts, false).unwrap().is_none());
+    }
+
     #[test]
     fn thought_separator_is_spelled_after_every_thought() {
         let schema = cfg(json!({
