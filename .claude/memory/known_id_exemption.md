@@ -85,6 +85,32 @@ ISO date/RFC 3339 timestamp, English dates, kebab-case handles/slugs.
 Pinned by `ids::tests::agora_sidecar_patterns`. balerion's sidecar is
 separate — copy the `[repetition]` block over.
 
+## #113 part 3 (2026-09-23): the ids were fine — the *close* was penalized
+
+The 2026-09-22 Agora trial transcripts (five Qwen3.8 agents; private
+data, never in the repo) showed the dominant "id failure" was not a
+miscopy at all: the UUID is exact, then the value **does not end** —
+`…e2f5\n】\n\n</invoke>…`, `…4a0b3a8d6f7e1b2c…`, `…\nWait — recheck…`.
+It clusters by call position within a turn: broken on 7 of 11 *third*
+calls vs 2 of 18 second calls (and those two are the stale-GOV-pattern
+class). Cause: the region guard protected only tokens that *leave* the
+free region, and Qwen3.8's string values are `until("\n</parameter>")`,
+a multi-token exit whose middle states are still permissive. The
+delimiter's n-grams repeat once per call, so by call three the close was
+suppressed and the model reached for lookalike closers. region.rs had
+documented this as a "v1 limitation, bounded". It was not bounded enough.
+
+Fix (`65cc608`): each grammar region finds its *home* (the permissive
+fixed point a plain content byte returns to) and any token whose walk
+ends elsewhere is protected. Also covers `until("</think>")` thought
+regions under a tool grammar — which may be part of why thoughts ran
+4–8k tokens against a 4096 "budget".
+
+Lesson for next time: when a copy failure looks like a miscopy, check
+whether the copy was *right and unterminated* first. Tabulate failures
+by call index within the turn — position-dependence points at
+per-call-repeated structure (delimiters), not at the content.
+
 ## Edges, documented, accepted
 
 - At a word start, any token whose piece starts some known id is
