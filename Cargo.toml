@@ -352,6 +352,14 @@ name = "chat"
 required-features = ["tokio", "repl"]
 doc-scrape-examples = true
 
+# Backend-concrete: swaps the sampler config per variant on one loaded
+# `LlamaCppSession`, which the erased transport cannot do. `toml` reads
+# the sampling sidecar every variant starts from.
+[[example]]
+name = "id_fidelity"
+required-features = ["cli", "llama-cpp", "toml"]
+doc-scrape-examples = true
+
 [[example]]
 name = "whodunit"
 required-features = ["json-schema", "llama-cpp"]
