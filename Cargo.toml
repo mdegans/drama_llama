@@ -360,6 +360,22 @@ name = "id_fidelity"
 required-features = ["cli", "llama-cpp", "toml"]
 doc-scrape-examples = true
 
+# Long-form degeneration and id fidelity under penalty × sampler variants:
+# a digest, a short story, and an essay inside a forced tool call's string.
+# Shares `examples/utils/fidelity.rs` with id_fidelity.
+[[example]]
+name = "longform"
+required-features = ["cli", "llama-cpp", "toml"]
+doc-scrape-examples = true
+
+# Replays a recorded `/v1/messages` request body turn by turn through
+# blallama's path, scoring id copying in tool-call arguments by call
+# index. Shares `examples/utils/fidelity.rs` for the penalty variants.
+[[example]]
+name = "replay"
+required-features = ["cli", "llama-cpp", "toml"]
+doc-scrape-examples = true
+
 [[example]]
 name = "whodunit"
 required-features = ["json-schema", "llama-cpp"]
