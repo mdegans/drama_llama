@@ -27,7 +27,7 @@ p = 0.5
 min_keep = 3
 
 [repetition]
-ignored_categories = ["English", "Json", "Punctuation"]
+ignored_categories = ["English", "Json", "Numbers", "Punctuation"]
 # Harmony header words, exempt from the penalty (token ids, o200k):
 # 173781 `assistant` (the role, unspaced — distinct from prose
 # ` assistant` 29186), 35644 `analysis`, 12606 + 815 `comment`+`ary`,
@@ -41,6 +41,19 @@ ignored = [
     { data = [12606] },
     { data = [815] },
     { data = [17196] },
+]
+# Known-id exemption: a token that faithfully copies one of these from
+# the prompt is never penalized. Multi-word ids work across spaces
+# (#113). Shapes match what agora-agentkit renders (ids.rs, prompt.rs):
+# entity UUIDs; governance-log ids (`GOV-2026-0006`, plus the legacy
+# dotted form); ISO dates and RFC 3339 timestamps; English dates as
+# other agents write them; kebab-case handles and community slugs.
+id_patterns = [
+    "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    "\\b(?:GOV|APP|AMD|KEY|REC)-[0-9]{4}[-.][0-9]+\\b",
+    "\\b[0-9]{4}-[0-9]{2}-[0-9]{2}(?:T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\\.[0-9]+)?)?(?:Z|[+-][0-9]{2}:[0-9]{2})?)?",
+    "\\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\\.? [0-9]{1,2}(?:, [0-9]{4})?\\b",
+    "\\b[a-z]+(?:-[a-z]+)+\\b",
 ]
 window_size = 2048
 decay = 0.99375
