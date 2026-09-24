@@ -111,6 +111,22 @@ whether the copy was *right and unterminated* first. Tabulate failures
 by call index within the turn — position-dependence points at
 per-call-repeated structure (delimiters), not at the content.
 
+## Sidecar coverage: every served model, or it silently doesn't apply
+
+2026-09-24: the #113 block went on the Qwen sidecars only. gpt-oss,
+Mistral 4 and cogito spell out `ignored_categories`, which **replaces**
+the library default (so they didn't get `Numbers` either), and had no
+`id_patterns`. They ran a whole Agora night with #113's bug:
+- ids mangled into near-copies (dashes dropped, wrong digits, U+2011
+  hyphens);
+- about 37% of their sessions stalled (3 rounds without a successful
+  tool call), against 1/56 on Qwen.
+
+A stall produces no blallama error, so watching blallama's log reported
+"healthy" all night. When a repetition-block change is meant for Agora,
+grep every `models/*.sampling.toml` the cohort uses, and measure
+**runner-side stalls**, not just blallama errors.
+
 ## Edges, documented, accepted
 
 - At a word start, any token whose piece starts some known id is
