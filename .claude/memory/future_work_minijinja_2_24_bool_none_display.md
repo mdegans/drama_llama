@@ -1,9 +1,14 @@
-# `minijinja` 2.24.0 renders bare `{{ bool }}` / `{{ none }}` as `True`/`False`/`None`, not `true`/`false`/`none` — 3 unignored tests red on `dev`
+# `minijinja` 2.24.0 renders bare `{{ bool }}` / `{{ none }}` as `True`/`False`/`None`, not `true`/`false`/`none` — 3 unignored tests red on a fresh resolve
 
 **Found 2026-09-25, incidentally, while running `just test`/`just check`
 for the `/v1/models` catalog-capabilities work — unrelated to that
-task, not fixed here.** Confirmed pre-existing on `dev` at `381d476`
-(committed `Cargo.lock` unmodified, fresh worktree, reproduces cold):
+task, not fixed here.** Reproduces on `dev` at `381d476` in a fresh
+worktree. **Correction (main thread, same day):** `Cargo.lock` is
+*gitignored* (`.gitignore:15`), not committed. The main checkout's
+local lock still pins 2.19.0 and is green; any *fresh* resolve (a new
+worktree, CI, every crates.io consumer of drama_llama) gets 2.24.0
+and is red. So CI and downstream users are exposed, and the local dev
+box hides it:
 
 ```
 just test
@@ -15,8 +20,8 @@ FAIL tests/template_rendering.rs::enable_thinking_derives_from_prompt_thinking
 
 ## Root cause, confirmed by reading both versions' source
 
-`Cargo.toml` pins `minijinja = "2.5"` (loose) and the committed
-`Cargo.lock` resolves `2.24.0`. Diffed against `2.19.0` (also cached
+`Cargo.toml` pins `minijinja = "2.5"` (loose), so a fresh resolve
+picks `2.24.0`. Diffed against `2.19.0` (also cached
 locally) in `~/.cargo/registry/src/.../minijinja-{2.19.0,2.24.0}/src/value/mod.rs`:
 
 - **2.19.0**, `impl fmt::Display for Value`: `ValueRepr::Bool(val) =>
