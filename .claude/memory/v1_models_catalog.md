@@ -93,3 +93,68 @@ load (falls back to embedded) but analyzed to the default dialect by the
 peek — `thinking` could differ for that one pathological case. Fixing it
 means threading the compile result through `analyze_dialect_source`;
 not done because the load-side warning already names the broken sidecar.
+
+An mmproj sidecar that supports *audio only* (no vision) would make the
+peek say `image_input: true` (file exists) while a real `mtmd`-enabled
+load says `false` (`Mtmd::supports_images()` queries the actual
+projector). Not fixed: telling them apart needs a real `mtmd_init`,
+which is the weight-touching work the peek exists to avoid. Every mmproj
+in this fleet today is vision-capable, so unmeasured, not un-noticed.
+
+## Capability-correctness pass (2026-09-25, #v1-models follow-up)
+
+- **`image_input` peek/load mismatch under a non-`mtmd` build, fixed.**
+  `LlamaCppEngine::new` only ever populates `engine.vision` inside
+  `#[cfg(feature = "mtmd")]`; `mtmd` is not a default feature and
+  blallama's own `required-features` (`axum, cli, toml`) doesn't imply
+  it. Peek's `image_input` was plain `sidecar::mmproj_path(path).is_some()`
+  — true whenever the sidecar file exists, regardless of whether the
+  binary could ever load it. A `--no-default-features --features
+  llama-cpp` (or any binary that doesn't opt into `mtmd`) build next to
+  a model with an mmproj sidecar broke the `peek_agrees_with_load`
+  invariant. Fixed at the one call site
+  (`Session<LlamaCppBackend>::peek` in `session/mod.rs`):
+  `image_input = cfg!(feature = "mtmd") && mmproj_path(path).is_some()`.
+- **`is_supported_model` now excludes both mmproj naming conventions.**
+  `<model>.mmproj.gguf` (ours) was already excluded; added
+  `mmproj-*.gguf` (case-insensitive — upstream llama.cpp/mtmd's and most
+  HuggingFace quantizers' convention, e.g. `mmproj-model.gguf`,
+  `mmproj-F16.gguf`). Both keep the projector off `/v1/models` and out
+  of default-model selection.
+- **`Catalog::models()` now dedupes aliased listings.** The motivating
+  case: `models/model.gguf` on the dev box is a **hardlink**
+  (`ln`/`cp -l`), not a symlink, to the quant it aliases — same
+  `(dev, ino)`, no `readlink` target to canonicalize. Dedup keys on
+  `fs::metadata`'s `(dev, ino)` (unix; follows symlinks, so a symlink
+  and its target collapse the same way a hardlink pair does), preferring
+  a non-symlink name, then a name other than the conventional
+  `model.gguf` alias, then alphabetical. **Only `models()` is
+  deduped** — `list()` and `resolve()` are untouched, so a hidden alias
+  still resolves and loads by name (tests and `models/model.gguf`
+  defaults depend on this). Non-unix has no portable inode: only true
+  symlinks dedupe there (via `fs::canonicalize`); two hardlinks stay
+  two listings.
+- **Base vs. instruct: investigated, nothing added.** Checked three
+  candidate signals: `general.type` (real GGUF key, but its only values
+  are `model`/`adapter`/`mmproj` — llama.cpp's own `gguf_writer.add_type`
+  call sites confirm it's an artifact-kind tag, unrelated to
+  base/instruct); `general.finetune` (real key, but
+  `convert_hf_to_gguf.py`'s `gguf-py/gguf/metadata.py` derives it by
+  regex-splitting the HF repo name — only `chat|instruct|vision|lora`
+  are explicitly recognized as finetune tokens, "base" is not one of
+  them, and the field is absent whenever a GGUF wasn't produced by that
+  exact converter path, which is common); and `chat_template_source()
+  .is_none()` (unreliable both ways — `plan_template_ownership.md`'s
+  rung 4 already found "many 'base' GGUFs carry a vestigial converted
+  template", and this crate's own loading ladder is *designed* to make
+  "no template" rare: `Qwen3.5-35B-A3B-Base-Q8_0` in this fleet has a
+  `.template.jinja` sidecar installed specifically so it renders, which
+  means the peek's post-ladder `source` is `Some` for it regardless of
+  what the raw GGUF embeds). `misanthropic::model::{ModelInfo,
+  Capabilities}` (1.0.0-alpha.18) has no field this could go in — it's
+  an Anthropic-API-shaped type we don't own, and Anthropic never serves
+  raw completion models, so the wire shape has no concept of "base" to
+  begin with. Recommendation: don't invent a field. If an Agora seed
+  runner genuinely needs this, the honest path is a drama_llama-owned
+  extension point (a second field alongside `ModelInfo`, not inside it),
+  designed against a real consumer need rather than guessed now.
