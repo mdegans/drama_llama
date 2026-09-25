@@ -127,6 +127,17 @@ struct Cached {
     info: ModelInfo,
 }
 
+/// On-disk identity used by [`Catalog::dedup_aliases`] to spot two
+/// listed names that are really the same file. See
+/// [`Catalog::identity`] for which variant is built on which platform.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Identity {
+    #[cfg(unix)]
+    Inode(u64, u64),
+    #[cfg(not(unix))]
+    Canonical(PathBuf),
+}
+
 /// The models under one directory, with a per-process cache of their
 /// [`ModelInfo`]. See the [module docs](self).
 ///
@@ -206,6 +217,97 @@ where
     /// The path a listed `name` loads from.
     pub fn path_of(&self, name: &str) -> PathBuf {
         self.root.join(name)
+    }
+
+    /// The on-disk identity of a listed file, for spotting duplicate
+    /// listings — two directory entries that are really the same bytes.
+    ///
+    /// On unix this is `(dev, ino)` from `fs::metadata`, which *follows*
+    /// symlinks: a symlink and its target collapse to the target's
+    /// identity, and two hardlinks of the same inode collapse to each
+    /// other too. The latter matters here — `models/model.gguf` is
+    /// conventionally a **hardlink**, not a symlink, to the quant it
+    /// aliases (`ln` without `-s`, or `cp -l`), so a symlink-only check
+    /// would miss the exact case this exists for. On non-unix targets
+    /// there is no portable inode; only the symlink form is caught, via
+    /// the resolved canonical path (a hardlink stays undeduped there).
+    fn identity(path: &Path) -> Option<Identity> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(path).ok()?;
+            Some(Identity::Inode(meta.dev(), meta.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::canonicalize(path).ok().map(Identity::Canonical)
+        }
+    }
+
+    /// Collapse duplicate-alias listings: when several listed names
+    /// share one [`identity`](Self::identity), keep exactly one
+    /// representative so `/v1/models` doesn't advertise the same model
+    /// twice (the motivating case: `models/model.gguf`, a hardlink
+    /// alongside the file it aliases). [`list`](Self::list) and
+    /// [`resolve`](Self::resolve) are untouched — an aliased name must
+    /// still resolve and load by name; only the advertised *listing*
+    /// collapses.
+    ///
+    /// Preference within a group, most to least preferred:
+    /// 1. a non-symlink entry (the "real" name, or another hardlink to
+    ///    it) over a symlink alias,
+    /// 2. a name other than the conventional `model.gguf` test/default
+    ///    alias,
+    /// 3. the alphabetically first name — deterministic either way.
+    ///
+    /// A file whose identity can't be determined (raced with a delete,
+    /// unreadable, ...) is kept as-is: don't dedupe what can't be
+    /// compared.
+    fn dedup_aliases(&self, mut names: Vec<String>) -> Vec<String> {
+        names.sort_unstable();
+        let mut groups: HashMap<Identity, Vec<String>> = HashMap::new();
+        let mut kept = Vec::with_capacity(names.len());
+        for name in names {
+            match Self::identity(&self.path_of(&name)) {
+                Some(id) => groups.entry(id).or_default().push(name),
+                None => kept.push(name),
+            }
+        }
+        let is_symlink = |name: &str| {
+            std::fs::symlink_metadata(self.path_of(name))
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        };
+        for group in groups.into_values() {
+            if group.len() == 1 {
+                kept.extend(group);
+                continue;
+            }
+            // Tier 1: narrow to non-symlink entries — but only when that
+            // actually discriminates. A group of hardlinks has *no*
+            // symlinks at all, so "not a symlink" is true of every
+            // member and must not short-circuit the pick; only fall
+            // through to the non-symlink subset when it's non-empty.
+            let non_symlinks: Vec<&String> =
+                group.iter().filter(|n| !is_symlink(n)).collect();
+            let candidates: Vec<&String> = if non_symlinks.is_empty() {
+                group.iter().collect()
+            } else {
+                non_symlinks
+            };
+            // Tier 2 + 3: prefer a name other than the conventional
+            // `model.gguf` alias; `candidates` is still in the
+            // already-sorted order, so the fallback is alphabetical.
+            let winner = candidates
+                .iter()
+                .find(|n| n.as_str() != "model.gguf")
+                .copied()
+                .unwrap_or(candidates[0])
+                .clone();
+            kept.push(winner);
+        }
+        kept.sort_unstable();
+        kept
     }
 
     /// Directory entries the backend accepts as models, per
@@ -363,14 +465,17 @@ where
         Some(info)
     }
 
-    /// Every listed model's [`ModelInfo`], sorted by id. An unreadable
-    /// directory lists as empty (the failure is logged).
+    /// Every listed model's [`ModelInfo`], sorted by id and with
+    /// duplicate aliases of the same file collapsed to one entry —
+    /// `models/model.gguf` aliasing a real quant is the motivating case,
+    /// covered whether it's a symlink or (as on the dev box) a hardlink.
+    /// An unreadable directory lists as empty (the failure is logged).
     ///
     /// Also the warm-up: called once at startup, off the request path,
     /// it fills the cache so the first client listing is served from
     /// memory.
     pub fn models(&self) -> Models {
-        let mut names = match self.list() {
+        let names = match self.list() {
             Ok(names) => names,
             Err(e) => {
                 tracing::error!(
@@ -381,7 +486,7 @@ where
                 Vec::new()
             }
         };
-        names.sort_unstable();
+        let names = self.dedup_aliases(names);
         names.iter().filter_map(|name| self.info(name)).collect()
     }
 
@@ -480,6 +585,8 @@ mod tests {
 
         /// Empty files are enough for listing: `is_supported_model` is
         /// name + `is_file`. Symlinks must enumerate; projector sidecars
+        /// — both naming conventions, `<model>.mmproj.gguf` (ours) and
+        /// `mmproj-*.gguf` (upstream llama.cpp/mtmd, case-insensitive) —
         /// and dangling links must not.
         #[test]
         fn list_and_resolve() {
@@ -488,6 +595,8 @@ mod tests {
             std::fs::write(root.join("a.gguf"), b"").unwrap();
             std::fs::write(root.join("b.gguf"), b"").unwrap();
             std::fs::write(root.join("b.mmproj.gguf"), b"").unwrap();
+            std::fs::write(root.join("mmproj-model.gguf"), b"").unwrap();
+            std::fs::write(root.join("MMPROJ-f16.gguf"), b"").unwrap();
             std::fs::write(root.join("notes.txt"), b"").unwrap();
             std::fs::create_dir(root.join("dir.gguf")).unwrap();
             #[cfg(unix)]
@@ -525,13 +634,129 @@ mod tests {
                 catalog.resolve("claude-opus-5", Some("nope.gguf")),
                 Err(AnthropicError::NotFound { .. })
             ));
-            // Sidecars and non-models are not resolvable even by name.
+            // Sidecars and non-models are not resolvable even by name,
+            // under either projector naming convention.
             assert!(catalog.resolve("b.mmproj.gguf", None).is_err());
+            assert!(catalog.resolve("mmproj-model.gguf", None).is_err());
+            assert!(catalog.resolve("MMPROJ-f16.gguf", None).is_err());
             assert!(catalog.resolve("notes.txt", None).is_err());
 
             assert_eq!(catalog.size("a.gguf"), Some(0));
             assert_eq!(catalog.size("notes.txt"), None);
             assert_eq!(catalog.size("../a.gguf"), None);
+        }
+
+        /// `models()` — the advertised `/v1/models` listing — collapses
+        /// duplicate aliases of the same file to one entry: a symlink to
+        /// an in-dir target (the general case) and, on unix, a hardlink
+        /// (the actual on-disk shape of `models/model.gguf` on the dev
+        /// box: `ln`/`cp -l`, not `ln -s`). `list`/`resolve` stay
+        /// undeduped, so the alias is still a valid request target — a
+        /// hidden name is not an unresolvable one.
+        #[test]
+        fn models_dedupes_aliases_but_resolve_still_finds_them() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::write(root.join("real.gguf"), b"weights").unwrap();
+            // A symlink alias, conventionally named — must be hidden from
+            // the listing in favor of the real (non-symlink) name.
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                root.join("real.gguf"),
+                root.join("model.gguf"),
+            )
+            .unwrap();
+            #[cfg(not(unix))]
+            std::fs::write(root.join("model.gguf"), b"weights").unwrap();
+
+            // A symlink to a target *outside* this directory (CI's
+            // per-model symlink-in from a shared read-only store): no
+            // in-dir duplicate exists, so it must stay listed. `_outside`
+            // is bound at function scope (not the block below) so it
+            // isn't cleaned up until the whole test returns.
+            #[cfg(unix)]
+            let _outside = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                let external = _outside.path().join("elsewhere.gguf");
+                std::fs::write(&external, b"weights").unwrap();
+                std::os::unix::fs::symlink(
+                    &external,
+                    root.join("ci-linked.gguf"),
+                )
+                .unwrap();
+            }
+
+            let catalog = catalog(root);
+            let listed: Vec<String> = catalog
+                .models()
+                .data
+                .iter()
+                .map(|m| m.id.name().to_string())
+                .collect();
+            #[cfg(unix)]
+            {
+                assert_eq!(listed, ["ci-linked.gguf", "real.gguf"]);
+            }
+            #[cfg(not(unix))]
+            {
+                // No portable inode: two distinct regular files never
+                // dedupe on non-unix, only true symlinks would.
+                assert_eq!(listed, ["model.gguf", "real.gguf"]);
+            }
+
+            // Hidden from the listing, but still a legal request target.
+            assert_eq!(
+                catalog.resolve("model.gguf", None).unwrap(),
+                "model.gguf"
+            );
+            assert!(catalog.info("model.gguf").is_some());
+
+            // `list()` itself is never deduped.
+            let mut raw = catalog.list().unwrap();
+            raw.sort();
+            #[cfg(unix)]
+            assert_eq!(raw, ["ci-linked.gguf", "model.gguf", "real.gguf"]);
+            #[cfg(not(unix))]
+            assert_eq!(raw, ["model.gguf", "real.gguf"]);
+        }
+
+        /// Two hardlinks of the same inode (unix only — `models/model.gguf`
+        /// and `models/model.mmproj.gguf`'s actual on-disk shape on
+        /// machines that use `cp -l`/`ln` rather than `ln -s`) dedupe by
+        /// `(dev, ino)` exactly like a symlink does, and prefer the
+        /// non-alias name.
+        #[cfg(unix)]
+        #[test]
+        fn models_dedupes_hardlinks() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::write(root.join("real.gguf"), b"weights").unwrap();
+            std::fs::hard_link(root.join("real.gguf"), root.join("model.gguf"))
+                .unwrap();
+            // Neither hardlink is a symlink, so tier 1 (non-symlink) does
+            // not disambiguate — tier 2 (not the `model.gguf` alias) must.
+            let meta_a = std::fs::metadata(root.join("real.gguf")).unwrap();
+            let meta_b = std::fs::metadata(root.join("model.gguf")).unwrap();
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                meta_a.ino(),
+                meta_b.ino(),
+                "test setup: not hardlinked"
+            );
+
+            let catalog = catalog(root);
+            let listed: Vec<String> = catalog
+                .models()
+                .data
+                .iter()
+                .map(|m| m.id.name().to_string())
+                .collect();
+            assert_eq!(listed, ["real.gguf"]);
+            assert_eq!(
+                catalog.resolve("model.gguf", None).unwrap(),
+                "model.gguf"
+            );
         }
 
         /// A file that isn't a GGUF peeks to an error: it lists by name

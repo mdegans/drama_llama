@@ -82,13 +82,23 @@ impl Backend for LlamaCppBackend {
     type Vision = crate::NoVision;
 
     fn is_supported_model(name: &str, meta: &std::fs::Metadata) -> bool {
-        // `<model>.mmproj.gguf` is a vision *projector* sidecar, not a
-        // standalone model — it auto-loads alongside its base model and
-        // fails if asked to load on its own. Exclude it so it never
-        // surfaces in `/api/tags` (or gets picked as a default).
+        // A vision *projector* is not a standalone model — it auto-loads
+        // alongside its base model (`sidecar::mmproj_path`) and fails if
+        // asked to load on its own. Exclude it so it never surfaces in
+        // `/v1/models` / `/api/tags` (or gets picked as a default). Two
+        // naming conventions exist in the wild for the projector itself:
+        // our own sidecar suffix (`<model>.mmproj.gguf`) and upstream
+        // llama.cpp / mtmd's `mmproj-*.gguf` prefix (e.g. what
+        // `convert_hf_to_gguf.py` and most quantizers on HuggingFace
+        // produce, `mmproj-model.gguf`, `mmproj-F16.gguf`).
+        const PREFIX: &str = "mmproj-";
+        let has_prefix = name
+            .get(..PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(PREFIX));
         meta.is_file()
             && name.ends_with(".gguf")
             && !name.ends_with(".mmproj.gguf")
+            && !has_prefix
     }
 
     /// Routes both llama.cpp's and ggml's sinks — they are separate

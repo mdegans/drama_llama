@@ -2773,10 +2773,19 @@ impl FromPath for Session<LlamaCppBackend> {
                 path: path.to_path_buf(),
             })?;
         let vocab = started.elapsed();
+        // Mirror what a real load can actually deliver: `LlamaCppEngine::new`
+        // only attempts mtmd (and therefore only ever populates
+        // `engine.vision`) under `#[cfg(feature = "mtmd")]`. Without that
+        // feature compiled in, an mmproj sidecar sitting next to the model
+        // is inert — a load reports `image_input: false` regardless of the
+        // file's presence — so the peek must agree rather than advertise a
+        // capability the same binary cannot serve.
+        let image_input = cfg!(feature = "mtmd")
+            && crate::sidecar::mmproj_path(path).is_some();
         let info = peek_info(
             &model,
             options.context_params().n_ctx,
-            crate::sidecar::mmproj_path(path).is_some(),
+            image_input,
             &llama_cpp_template_sidecar_path(path),
             &llama_cpp_dialect_sidecar_path(path),
         );
