@@ -2331,6 +2331,10 @@ pub struct Session<B: Backend> {
     /// matches (the conversation continues its stream), fresh random
     /// state otherwise.
     seed: Option<std::num::NonZeroU128>,
+    /// Strict context fit ([`Session::with_strict_context_fit`]): the
+    /// full `max_tokens` must fit beside the prompt, rather than the
+    /// position-capped remainder. Off by default.
+    strict_context_fit: bool,
     /// Emit-side special-token ban (on by default): the sampled token
     /// is checked against [`Session::emit_ban_set`] each step, and
     /// chat-framing specials the dialect never legitimately emits are
@@ -2998,6 +3002,7 @@ impl<B: Backend> Session<B> {
                 .with_efforts(efforts),
             sample_options: SamplerConfig::default(),
             seed: None,
+            strict_context_fit: false,
             emit_specials_ban: true,
             emit_ban: Vec::new(),
             emit_ban_constrained: Vec::new(),
@@ -4007,7 +4012,11 @@ impl<B: Backend> Session<B> {
         let needed_cells = entries_cell_len(entries);
         let prompt_pos: usize = entries.iter().map(CacheEntry::n_pos).sum();
         let n_ctx = self.engine.n_ctx() as usize;
-        let worst_generated = max_tokens.min(n_ctx.saturating_sub(prompt_pos));
+        let worst_generated = if self.strict_context_fit {
+            max_tokens
+        } else {
+            max_tokens.min(n_ctx.saturating_sub(prompt_pos))
+        };
         if needed_cells + worst_generated > n_ctx {
             return Err(SessionError::ContextOverflow {
                 needed_cells,
@@ -4016,6 +4025,54 @@ impl<B: Backend> Session<B> {
             });
         }
         Ok(())
+    }
+
+    /// Require the full `max_tokens` to fit beside the prompt.
+    ///
+    /// By default a text prompt whose `max_tokens` overruns the context
+    /// is soft-truncated: generation simply stops at `n_ctx`. Strict
+    /// mode rejects it up front, before any prefill, with
+    /// [`SessionError::ContextOverflow`] — the rule the Anthropic API
+    /// applies (input + `max_tokens` > window is a 400), so a server
+    /// speaking that API can answer the same way.
+    pub fn with_strict_context_fit(mut self, on: bool) -> Self {
+        self.strict_context_fit = on;
+        self
+    }
+
+    /// Count the KV cells `prompt` would occupy if completed now: the
+    /// full render (chat template, tools, thinking scaffold) tokenized
+    /// exactly as the `complete*` family prefills it, images included
+    /// at their encoded extent. Touches no KV state, so it is cheap
+    /// relative to a prefill and safe between calls. `max_tokens` is
+    /// ignored.
+    ///
+    /// This is the number [`SessionError::ContextOverflow`] calls
+    /// `needed_cells`, and what an Anthropic-style `count_tokens`
+    /// endpoint reports as `input_tokens`.
+    pub fn count_tokens(
+        &mut self,
+        prompt: &Prompt,
+    ) -> Result<usize, SessionError> {
+        self.check_no_special_injection(prompt)?;
+        self.check_no_open_thought(prompt)?;
+        let media = self.prepare_media(prompt)?;
+        let rendered = self
+            .template
+            .render_with(prompt, &self.render_opts_for(&media))?;
+        let (entries, _, _) = self.tokenize_split(&rendered, &media)?;
+        Ok(entries_cell_len(&entries))
+    }
+
+    /// The session's render options, plus the call's media sentinel
+    /// when the prompt carries images.
+    fn render_opts_for(&self, media: &MediaContext) -> RenderOptions {
+        match media.sentinel.as_deref() {
+            Some(sentinel) => {
+                self.render_opts.clone().with_media_sentinel(sentinel)
+            }
+            None => self.render_opts.clone(),
+        }
     }
 
     /// Enable (or disable) the emit-side special-token ban. On by
@@ -4575,12 +4632,7 @@ impl<B: Backend> Session<B> {
         self.check_no_special_injection(prompt)?;
         self.check_no_open_thought(prompt)?;
         let media = self.prepare_media(prompt)?;
-        let opts = match media.sentinel.as_deref() {
-            Some(sentinel) => {
-                self.render_opts.clone().with_media_sentinel(sentinel)
-            }
-            None => self.render_opts.clone(),
-        };
+        let opts = self.render_opts_for(&media);
         let (
             rendered_prompt,
             entries,

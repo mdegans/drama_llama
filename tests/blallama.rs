@@ -285,3 +285,79 @@ async fn messages_completes_and_caches_across_requests() {
     );
     assert!(read < r2.usage.input_tokens);
 }
+
+/// `count_tokens` counts exactly what `/v1/messages` prefills: for the
+/// same body, the count equals the completion's `input_tokens`, which in
+/// blallama is the whole prompt (the cache read and write are breakdowns
+/// of it, unlike Anthropic's usage, where they are added on top).
+/// Pinned to `model.gguf` so it loads the test model rather than
+/// whichever file lists first.
+#[tokio::test]
+#[ignore = "long running, requires a GGUF in models/"]
+async fn count_tokens_matches_messages_input() {
+    let server = spawn_server();
+    let client = client(server.port);
+    let prompt = Prompt::default()
+        .model("model.gguf")
+        .max_tokens(16.try_into().unwrap())
+        .system("You are a concise assistant.")
+        .add_message((Role::User, "Name a primary color."))
+        .unwrap()
+        .cache();
+
+    let counted = client.count_tokens(&prompt).await.expect("count_tokens");
+    let response = client.message(&prompt).await.expect("messages");
+    assert!(counted > 0);
+    assert_eq!(
+        u64::from(counted),
+        response.usage.input_tokens,
+        "usage: {:?}",
+        response.usage
+    );
+}
+
+/// A request whose input + `max_tokens` overruns the context is refused
+/// up front with Anthropic's exact 400, which clients match on: the
+/// reported number is input + `max_tokens`. The session survives, so
+/// the next request that fits completes.
+#[tokio::test]
+#[ignore = "long running, requires a GGUF in models/"]
+async fn context_overflow_is_anthropic_400() {
+    use misanthropic::client::{AnthropicError, Error};
+
+    let server = spawn_server();
+    let client = client(server.port);
+    let prompt = Prompt::default()
+        .model("model.gguf")
+        .add_message((Role::User, "Name a primary color."))
+        .unwrap();
+
+    // Load the model, so the listing reports the live context size.
+    let input = client.count_tokens(&prompt).await.expect("count_tokens");
+    let v: serde_json::Value =
+        serde_json::from_str(&http_get(server.port, "/v1/models/model.gguf"))
+            .expect("model JSON");
+    let n_ctx = v["max_input_tokens"].as_u64().expect("max_input_tokens");
+
+    let too_long = prompt
+        .clone()
+        .max_tokens(u32::try_from(n_ctx).unwrap().try_into().unwrap());
+    match client.message(&too_long).await {
+        Err(Error::Anthropic(AnthropicError::InvalidRequest { message })) => {
+            assert_eq!(
+                message,
+                format!(
+                    "prompt is too long: {} tokens > {n_ctx} maximum",
+                    input as u64 + n_ctx
+                )
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+
+    let fits = prompt.max_tokens(8.try_into().unwrap());
+    client
+        .message(&fits)
+        .await
+        .expect("a fitting request completes");
+}

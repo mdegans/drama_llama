@@ -375,6 +375,7 @@ where
 
     let mut app = Router::new()
         .route("/v1/messages", post(route_messages))
+        .route("/v1/messages/count_tokens", post(route_count_tokens))
         .route("/v1/models", get(route_models))
         .route("/v1/models/{id}", get(route_model))
         .route("/api/tags", get(route_tags));
@@ -488,6 +489,51 @@ where
     B: Backend + 'static,
     Session<B>: FromPath,
 {
+    resolve_model(&state, &mut prompt).await?;
+    complete(state, prompt).await
+}
+
+/// `POST /v1/messages/count_tokens`: what `/v1/messages` would prefill
+/// for this body — chat template, tools and thinking scaffold included —
+/// as Anthropic's `{"input_tokens": N}`. The body is a `/v1/messages`
+/// body without `max_tokens`. Counting needs the model's tokenizer and
+/// template, so it loads the model like a completion would (and answers
+/// 529 while a generation holds the session).
+#[instrument(skip(state, prompt), fields(model = %prompt.model))]
+async fn route_count_tokens<B>(
+    State(state): State<AppState<B>>,
+    Json(mut prompt): Json<Prompt>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorEnvelope>)>
+where
+    B: Backend + 'static,
+    Session<B>: FromPath,
+{
+    resolve_model(&state, &mut prompt).await?;
+    let (mut lock, session) =
+        checkout(&state, &prompt.model.to_string()).await?;
+    let (session, result) = spawn_blocking_or_bust(move || {
+        let mut session = session;
+        let result = session.count_tokens(&prompt);
+        (session, result)
+    })
+    .await;
+    // Counting never touches KV state, so the session survives any
+    // error it can return.
+    lock.replace(session);
+    let input_tokens = result.map_err(map_session_err)?;
+    Ok(Json(serde_json::json!({ "input_tokens": input_tokens })))
+}
+
+/// Resolve `prompt.model` against the catalog, substituting
+/// `--default-model` for an unknown id.
+async fn resolve_model<B>(
+    state: &AppState<B>,
+    prompt: &mut Prompt,
+) -> Result<(), (StatusCode, Json<ErrorEnvelope>)>
+where
+    B: Backend + 'static,
+    Session<B>: FromPath,
+{
     let catalog = state.catalog.clone();
     let requested = prompt.model.to_string();
     let default = state.args.default_model.clone();
@@ -507,8 +553,60 @@ where
         );
         prompt.model = served.into();
     }
+    Ok(())
+}
 
-    complete(state, prompt).await
+/// Take the session out of its lock, loaded with `model`: the resident
+/// session when it already serves `model`, else a fresh load. The caller
+/// owns both and puts the session back (or drops it, to force a reload)
+/// when done. A busy session is Anthropic's 529 `overloaded_error`.
+async fn checkout<'s, B>(
+    state: &'s AppState<B>,
+    model: &str,
+) -> Result<
+    (tokio::sync::MutexGuard<'s, Option<Session<B>>>, Session<B>),
+    (StatusCode, Json<ErrorEnvelope>),
+>
+where
+    B: Backend + 'static,
+    Session<B>: FromPath,
+{
+    let Ok(mut lock) = state.session.try_lock() else {
+        return Err((
+            StatusCode::from_u16(529).unwrap(),
+            Json(
+                AnthropicError::Overloaded {
+                    message: "Session is busy.".into(),
+                    retry_after: None,
+                }
+                .into(),
+            ),
+        ));
+    };
+
+    if let Some(session) = lock.take() {
+        let display =
+            session.engine().model().display_name().unwrap_or_default();
+        if model == display {
+            return Ok((lock, session));
+        }
+        // Free the outgoing model BEFORE loading the incoming one.
+        // Without this the old session stays bound across the `.await`,
+        // so a model switch peaks at both models resident — ~38 GB for a
+        // pair of 19 GB models, which a 24 GB card does not survive.
+        // Nothing is lost by dropping early: on the `?` path below the
+        // session is gone either way, having already been `take`n out of
+        // the lock.
+        drop(session);
+    }
+    let session = load_session(
+        state.catalog.clone(),
+        model.to_string(),
+        state.args.no_penalty,
+        state.args.seed,
+    )
+    .await?;
+    Ok((lock, session))
 }
 
 #[instrument(skip(state, prompt), fields(model = %prompt.model))]
@@ -520,57 +618,8 @@ where
     B: Backend + 'static,
     Session<B>: FromPath,
 {
-    let mut lock = match state.session.try_lock() {
-        Ok(lock) => lock,
-        Err(_) => {
-            return Err((
-                StatusCode::from_u16(529).unwrap(),
-                Json(
-                    AnthropicError::Overloaded {
-                        message: "Session is busy.".into(),
-                        retry_after: None,
-                    }
-                    .into(),
-                ),
-            ))
-        }
-    };
-
-    let mut session = match lock.take() {
-        Some(session) => {
-            let display =
-                session.engine().model().display_name().unwrap_or_default();
-            if prompt.model == display {
-                session
-            } else {
-                // Free the outgoing model BEFORE loading the incoming
-                // one. Without this the old session stays bound across
-                // the `.await`, so a model switch peaks at both models
-                // resident — ~38 GB for a pair of 19 GB models, which
-                // a 24 GB card does not survive. Nothing is lost by
-                // dropping early: on the `?` path below the session is
-                // gone either way, having already been `take`n out of
-                // the lock.
-                drop(session);
-                load_session(
-                    state.catalog.clone(),
-                    prompt.model.to_string(),
-                    state.args.no_penalty,
-                    state.args.seed,
-                )
-                .await?
-            }
-        }
-        None => {
-            load_session(
-                state.catalog.clone(),
-                prompt.model.to_string(),
-                state.args.no_penalty,
-                state.args.seed,
-            )
-            .await?
-        }
-    };
+    let (mut lock, mut session) =
+        checkout(&state, &prompt.model.to_string()).await?;
 
     // Per-request UUID — same id ends up on `Message.id` and on every
     // `StreamProbeMsg` emitted while this request runs.
@@ -629,6 +678,24 @@ where
                              warm cache (#101)",
                         );
                     }
+                    // Same bargain: an unsatisfied constraint is one
+                    // unlucky path, and a fresh draw can satisfy it.
+                    // The session invalidates its own cache here, so
+                    // this retry re-prefills; still cheaper than the
+                    // client's round trip.
+                    Err(
+                        e @ drama_llama::SessionError::GrammarViolation {
+                            ..
+                        },
+                    ) if resamples < MAX_RESAMPLES => {
+                        resamples += 1;
+                        error!(
+                            attempt = resamples,
+                            max = MAX_RESAMPLES,
+                            error = %e,
+                            "resampling after grammar violation",
+                        );
+                    }
                     other => break other,
                 }
             };
@@ -637,7 +704,7 @@ where
         .await;
 
     if resamples > 0 && result.is_ok() {
-        info!(resamples, "resample recovered a clean generation (#101)");
+        info!(resamples, "resample recovered a clean generation");
     }
 
     // SessionEnd fires regardless of generation success — the probe stream
@@ -682,12 +749,16 @@ fn configure_session<B: Backend>(
     };
     // NOTE: there is no server-side generation ceiling. `prompt.max_tokens`
     // is the sole generation authority (the Session-level cap was removed);
-    // a request is honored as long as context remains, and one that asks for
-    // more than fits simply fails at generation — we don't babysit a magic
-    // ceiling constant that would need bumping as context windows grow.
+    // a request is honored when prompt + max_tokens fits the context, and
+    // one that doesn't is rejected up front (strict fit, below) — we don't
+    // babysit a magic ceiling constant that would need bumping as context
+    // windows grow.
     let configured = with_penalty
         .with_seed(seed.and_then(NonZeroU128::new))
-        .with_prefix_cache(true);
+        .with_prefix_cache(true)
+        // An Anthropic-API server answers an overrun `max_tokens` with
+        // Anthropic's 400, before prefill, not a silent truncation.
+        .with_strict_context_fit(true);
     // ProbeHook installation moved to per-request handlers — each /v1/messages
     // request gets a fresh hook bound to its UUID, so the hook can fan out to
     // JSONL, the broadcast bus, or both, with a recorder lifetime that exactly
@@ -1047,19 +1118,54 @@ where
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+/// Map a [`SessionError`] onto the status and error type Anthropic sends
+/// for the same situation, so an Anthropic client's own retry policy
+/// works unchanged against blallama: 400 `invalid_request_error` for a
+/// request that will fail the same way on every retry, 500 `api_error`
+/// for a transient failure a retry can clear (the SDKs retry it).
+///
+/// [`SessionError`]: drama_llama::SessionError
 fn map_session_err(
     e: drama_llama::SessionError,
 ) -> (StatusCode, Json<ErrorEnvelope>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(
-            AnthropicError::Unknown {
-                code: Some(500.try_into().unwrap()),
-                message: e.to_string(),
-            }
-            .into(),
-        ),
-    )
+    use drama_llama::SessionError as E;
+    let error = match e {
+        // Anthropic's exact wording, which clients match on: the sum is
+        // input + max_tokens, checked against the window before prefill.
+        E::ContextOverflow {
+            needed_cells,
+            max_tokens,
+            n_ctx,
+        } => AnthropicError::InvalidRequest {
+            message: format!(
+                "prompt is too long: {} tokens > {n_ctx} maximum",
+                needed_cells + max_tokens
+            ),
+        },
+        // The request itself is the problem; retrying resends it.
+        E::ChatTemplate(_)
+        | E::ToolChoice(_)
+        | E::OutputConfig(_)
+        | E::RequestTopP(_)
+        | E::Dialect(_)
+        | E::InjectedSpecialToken { .. }
+        | E::UnrenderableOpenThought { .. }
+        | E::MediaUnsupported { .. }
+        | E::Media(_)
+        | E::TrailingMedia => AnthropicError::InvalidRequest {
+            message: e.to_string(),
+        },
+        // Sampling failures (a fresh seed resamples them), decode
+        // failures and engine trouble: all worth a retry.
+        _ => AnthropicError::API {
+            message: e.to_string(),
+        },
+    };
+    let status = error
+        .status()
+        .and_then(|code| StatusCode::from_u16(code.get()).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(error.into()))
 }
 
 #[tokio::main]
