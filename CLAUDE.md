@@ -257,6 +257,11 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`handoff_2026_09_25.md`](.claude/memory/handoff_2026_09_25.md)
+  — **read first next session.** End of the #113 arc and the first live
+  Agora run on the fixed stack: what landed, the prioritized open list
+  (#119 count_tokens/400, cogito stall replays, #101 structural, #116–#118),
+  and how to reach balerion's Claude.
 - [`qwen38_reingest_probe.md`](.claude/memory/qwen38_reingest_probe.md)
   — **read before touching `ReasoningReingest`, the post-thought gap in
   any grammar, or adding a thinking model.** 2026-09-23, #112: the
