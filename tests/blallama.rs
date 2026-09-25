@@ -24,6 +24,16 @@ fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models")
 }
 
+/// A response's prompt total: `cache_read_input_tokens` plus
+/// `cache_creation_input_tokens` plus `input_tokens`. `input_tokens`
+/// alone is only the tail after the last `cache_control` breakpoint,
+/// not the whole prompt.
+fn prompt_total(u: &misanthropic::response::TokenCounts) -> u64 {
+    u.cache_read_input_tokens.unwrap_or(0)
+        + u.cache_creation_input_tokens.unwrap_or(0)
+        + u.input_tokens
+}
+
 /// Kills the server on drop so a failing assertion doesn't leak a
 /// GPU-resident process into the next test.
 struct Server {
@@ -259,7 +269,13 @@ async fn messages_completes_and_caches_across_requests() {
     let r1 = client.message(&chat).await.expect("request 1");
     assert_eq!(r1.model.to_string(), model);
     assert!(!r1.inner.content.to_string().trim().is_empty());
-    assert!(r1.usage.input_tokens > 0);
+    // NOT `r1.usage.input_tokens > 0`: `.cache()` marks the tail of the
+    // last (and only) message, so the breakpoint sits at the very end
+    // of the prompt and nothing is left over for `input_tokens` to
+    // report — `cache_creation_input_tokens` legitimately absorbs the
+    // whole thing on this shape. `prompt_total` is what should be
+    // nonzero.
+    assert!(prompt_total(&r1.usage) > 0);
     assert_eq!(
         r1.usage.cache_read_input_tokens,
         Some(0),
@@ -276,22 +292,26 @@ async fn messages_completes_and_caches_across_requests() {
 
     let r2 = client.message(&chat).await.expect("request 2");
     let read = r2.usage.cache_read_input_tokens.unwrap_or(0);
+    let total2 = prompt_total(&r2.usage);
     assert!(
         read > 0,
         "request 2 extends request 1's conversation; the server \
          session must reuse its prefix (cache_read={read}, \
-         input={})",
-        r2.usage.input_tokens
+         total={total2})",
     );
-    assert!(read < r2.usage.input_tokens);
+    assert!(read < total2);
 }
 
 /// `count_tokens` counts exactly what `/v1/messages` prefills: for the
-/// same body, the count equals the completion's `input_tokens`, which in
-/// blallama is the whole prompt (the cache read and write are breakdowns
-/// of it, unlike Anthropic's usage, where they are added on top).
-/// Pinned to `model.gguf` so it loads the test model rather than
-/// whichever file lists first.
+/// same body, the count equals the completion's prompt total — the sum
+/// of `cache_read_input_tokens` + `cache_creation_input_tokens` +
+/// `input_tokens`, which the wire reports disjoint (Anthropic's own
+/// split, checked live 2026-09-25): `input_tokens` alone is only the
+/// remainder after the last `cache_control` breakpoint, not the whole
+/// prompt. `/v1/messages/count_tokens` itself reports a single flat
+/// total, matching Anthropic's `count_tokens` endpoint (no cache
+/// breakdown there either). Pinned to `model.gguf` so it loads the
+/// test model rather than whichever file lists first.
 #[tokio::test]
 #[ignore = "long running, requires a GGUF in models/"]
 async fn count_tokens_matches_messages_input() {
@@ -310,7 +330,7 @@ async fn count_tokens_matches_messages_input() {
     assert!(counted > 0);
     assert_eq!(
         u64::from(counted),
-        response.usage.input_tokens,
+        prompt_total(&response.usage),
         "usage: {:?}",
         response.usage
     );

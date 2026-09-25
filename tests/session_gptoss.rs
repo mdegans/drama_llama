@@ -663,6 +663,11 @@ fn prefix_cache_survives_final_turn() {
         blocks.iter().any(|b| matches!(b, Block::Text { .. })),
         "turn 1 must produce a final answer: {blocks:#?}"
     );
+    // No `cache_control` marker exists on turn 1, so `breakpoint_cells`
+    // is 0 and the whole turn-1 prompt lands in `input_tokens` (the
+    // three-way read/creation/input split only pulls cells out of
+    // `input_tokens` when a breakpoint exists to pull them up to) —
+    // that's what makes this usable as "the whole first turn" below.
     let turn1_prompt = session.last_usage().input_tokens;
 
     let assistant: AssistantMessage = blocks.into_iter().collect();

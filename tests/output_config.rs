@@ -298,6 +298,13 @@ fn structured_output_round_trips_as_history() {
         .expect("add_message");
 
     let r1 = session.complete_response(&round1).expect("round 1");
+    // `round1` carries no `cache_control` marker anywhere, so
+    // `breakpoint_cells` is 0 and the whole prompt lands in
+    // `input_tokens` (the three-way split — read / creation / input —
+    // only pulls cells out of `input_tokens` when a breakpoint exists
+    // to pull them up to). That's what makes `r1_input` usable below
+    // as "round 1's whole prompt" rather than just its post-breakpoint
+    // tail.
     let r1_input = r1.usage.input_tokens;
     eprintln!(
         "round 1: input_tokens={}, output_tokens={}",

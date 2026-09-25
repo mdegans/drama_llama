@@ -21,7 +21,18 @@ use drama_llama::{
     Block, Content, FromPath, LlamaCppOptions, LlamaCppSession, Message,
     Prompt, Role, SamplingMode,
 };
-use misanthropic::prompt::message::CacheControl;
+use misanthropic::{prompt::message::CacheControl, response::TokenCounts};
+
+/// A [`misanthropic::response::Usage`]'s prompt total: the sum of its
+/// three disjoint input counters (`cache_read_input_tokens` +
+/// `cache_creation_input_tokens` + `input_tokens`). `input_tokens`
+/// alone is only the tail after the last `cache_control` breakpoint,
+/// not the whole prompt — see `Session::last_usage`'s doc.
+fn prompt_total(u: &TokenCounts) -> u64 {
+    u.cache_read_input_tokens.unwrap_or(0)
+        + u.cache_creation_input_tokens.unwrap_or(0)
+        + u.input_tokens
+}
 
 fn model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
@@ -74,7 +85,7 @@ fn extend(prompt: &mut Prompt, reply: Content, next_user: &'static str) {
 /// Across a growing conversation, `cache_read_input_tokens` must
 /// start at zero, become nonzero once a breakpoint exists, and keep
 /// growing as the reusable prefix grows — while always staying below
-/// the request's `input_tokens`.
+/// the request's total prompt size (`prompt_total`).
 #[test]
 #[ignore = "long running, requires models/model.gguf"]
 fn cache_read_grows_across_rounds() {
@@ -96,9 +107,9 @@ fn cache_read_grows_across_rounds() {
         "round 2 must reuse the round-1 prefix, got cache_read={read2}"
     );
     assert!(
-        read2 < r2.usage.input_tokens,
-        "cache_read ({read2}) must be a strict prefix of input_tokens ({})",
-        r2.usage.input_tokens
+        read2 < prompt_total(&r2.usage),
+        "cache_read ({read2}) must be a strict prefix of the prompt total ({})",
+        prompt_total(&r2.usage)
     );
 
     extend(&mut prompt, r2.inner.content.clone(), "And name an animal.");
@@ -109,7 +120,7 @@ fn cache_read_grows_across_rounds() {
         "round 3 should reuse a longer prefix than round 2 \
          (read2={read2}, read3={read3})"
     );
-    assert!(read3 < r3.usage.input_tokens);
+    assert!(read3 < prompt_total(&r3.usage));
 }
 
 /// A conversation that returns to a previously-cached prefix after a
@@ -122,7 +133,7 @@ fn shared_prefix_survives_divergent_turn() {
 
     let shared = base_prompt();
     let r1 = session.complete_response(&shared).expect("prime");
-    let primed_read = r1.usage.input_tokens;
+    let primed_total = prompt_total(&r1.usage);
 
     // Divergent continuation A.
     let mut branch_a = shared.clone();
@@ -137,7 +148,7 @@ fn shared_prefix_survives_divergent_turn() {
     assert!(
         read_b > 0,
         "branch B shares the primed prefix and must reuse it, \
-         got cache_read={read_b} (primed input was {primed_read})"
+         got cache_read={read_b} (primed total was {primed_total})"
     );
 }
 

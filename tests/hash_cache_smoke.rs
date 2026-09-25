@@ -9,9 +9,11 @@
 //!
 //! With this PR's hash side-table, round 2's `partial_text` for the
 //! conversation prefix matches the auto-tip hash drama_llama saved at
-//! the end of round 1's generation, so cache_read jumps to ≈
-//! input_tokens for the round-2 prefill regardless of any
-//! BPE-whitespace drift in the assistant block.
+//! the end of round 1's generation, so cache_read jumps to ≈ round 1's
+//! total prompt size (`cache_read_input_tokens` +
+//! `cache_creation_input_tokens` + `input_tokens` — the three are
+//! disjoint) for the round-2 prefill regardless of any BPE-whitespace
+//! drift in the assistant block.
 //!
 //! Requires a **cogito-family** model: `DRAMA_LLAMA_COGITO_MODEL`, or
 //! `models/cogito-32b.gguf`. Skips loudly when absent — it must NOT
@@ -28,8 +30,19 @@ use drama_llama::{
     prompt::ToolResult, Block, Content, FromPath, Message, Prompt,
     RenderOptions, Role, Tool,
 };
-use misanthropic::prompt::message::CacheControl;
+use misanthropic::{prompt::message::CacheControl, response::TokenCounts};
 use serde_json::json;
+
+/// A [`misanthropic::response::Usage`]'s prompt total: the sum of its
+/// three disjoint input counters (`cache_read_input_tokens` +
+/// `cache_creation_input_tokens` + `input_tokens`). `input_tokens`
+/// alone is only the tail after the last `cache_control` breakpoint,
+/// not the whole prompt — see `Session::last_usage`'s doc.
+fn prompt_total(u: &TokenCounts) -> u64 {
+    u.cache_read_input_tokens.unwrap_or(0)
+        + u.cache_creation_input_tokens.unwrap_or(0)
+        + u.input_tokens
+}
 
 /// The cogito-family model this suite needs, or `None` to skip.
 ///
@@ -179,11 +192,11 @@ fn assert_tip_survives_tool_round_trip(
     let round1_resp = session
         .complete_response(&round1_prompt)
         .expect("round 1 completes");
-    let round1_input_tokens = round1_resp.usage.input_tokens;
+    let round1_total = prompt_total(&round1_resp.usage);
     let round1_cache_read = round1_resp.usage.cache_read_input_tokens;
     eprintln!(
-        "round 1: input_tokens={}, cache_read={}",
-        round1_input_tokens,
+        "round 1: prompt_total={}, cache_read={}",
+        round1_total,
         round1_cache_read.unwrap_or(0),
     );
 
@@ -221,32 +234,32 @@ fn assert_tip_survives_tool_round_trip(
     let round2_resp = session
         .complete_response(&round2_prompt)
         .expect("round 2 completes");
-    let round2_input_tokens = round2_resp.usage.input_tokens;
+    let round2_total = prompt_total(&round2_resp.usage);
     let round2_cache_read =
         round2_resp.usage.cache_read_input_tokens.unwrap_or(0);
     eprintln!(
-        "round 2: input_tokens={}, cache_read={}",
-        round2_input_tokens, round2_cache_read,
+        "round 2: prompt_total={}, cache_read={}",
+        round2_total, round2_cache_read,
     );
 
     // The minimal floor: round 2 must cache-read at least the
     // round-1 input prefix (the first cache_control marker's
     // breakpoint). That's already true today via the breakpoint
     // path. The interesting assertion: cache_read should reach the
-    // auto-tip — i.e., should exceed round-1's *full* input length
+    // auto-tip — i.e., should exceed round-1's *full* prompt size
     // (system + tools + first_user_msg + assistant + tool_result),
     // capturing the assistant content as well. We pick a permissive
-    // threshold (round-1 input + 50% of round-1 generation tokens,
-    // floored at round-1 input + 1) so the test passes whenever the
+    // threshold (round-1 total + 50% of round-1 generation tokens,
+    // floored at round-1 total + 1) so the test passes whenever the
     // tip mechanism is live, even with single-token BPE drift.
     let round1_gen = round1_resp.usage.output_tokens;
-    let tip_floor = (round1_input_tokens + (round1_gen / 2).max(1))
-        .max(round1_input_tokens + 1);
+    let tip_floor =
+        (round1_total + (round1_gen / 2).max(1)).max(round1_total + 1);
     assert!(
         round2_cache_read >= tip_floor,
         "round 2 cache_read ({round2_cache_read}) should reach the auto-tip ({tip_floor}); \
          hash-keyed reuse appears not to be firing. \
-         (input_tokens={round2_input_tokens}, round1_input={round1_input_tokens}, \
+         (prompt_total={round2_total}, round1_total={round1_total}, \
          round1_gen={round1_gen})",
     );
 

@@ -19,9 +19,12 @@
 //!   marker on every model.
 //!
 //! Both assert `cache_read` strictly exceeds the *previous* call's
-//! entire `input_tokens`: a resume past the whole previous prompt can
-//! only come from the tip. No golden text anywhere — the models differ
-//! per machine (CI runs smaller family members) and the tip contract
+//! entire prompt total (`cache_read_input_tokens` +
+//! `cache_creation_input_tokens` + `input_tokens` — disjoint, see
+//! `Session::last_usage`'s doc): a resume past the whole previous
+//! prompt can only come from the tip. No golden text anywhere — the
+//! models differ per machine (CI runs smaller family members) and the
+//! tip contract
 //! doesn't care what was said, only that it round-trips. Sessions are
 //! forced greedy with repetition penalties off: this suite pins cache
 //! mechanics, and a penalty steering the model into a non-canonical
@@ -39,8 +42,25 @@ use drama_llama::{
     prompt::ToolResult, Block, Content, LlamaCppSession, Message, Prompt, Role,
     SamplingMode, Tool, ToolChoice,
 };
-use misanthropic::prompt::{message::CacheControl, thinking::Thinking};
+use misanthropic::{
+    prompt::{message::CacheControl, thinking::Thinking},
+    response::TokenCounts,
+};
 use serde_json::json;
+
+/// A [`misanthropic::response::Usage`]'s prompt total: the sum of its
+/// three disjoint input counters (`cache_read_input_tokens` +
+/// `cache_creation_input_tokens` + `input_tokens`). `input_tokens`
+/// alone is only the tail after the last `cache_control` breakpoint,
+/// not the whole prompt — see `Session::last_usage`'s doc. Every
+/// scenario here marks the newest turn, so without this helper a
+/// "previous prompt" comparison would silently shrink to just that
+/// tail.
+fn prompt_total(u: &TokenCounts) -> u64 {
+    u.cache_read_input_tokens.unwrap_or(0)
+        + u.cache_creation_input_tokens.unwrap_or(0)
+        + u.input_tokens
+}
 
 /// The tool every scenario calls: small schema, deterministic ask.
 fn count_letters_tool() -> Tool {
@@ -129,9 +149,12 @@ fn trace_round(label: &str, resp: &drama_llama::prompt::MessageResponse) {
     let kinds: Vec<&str> =
         resp.inner.content.0.iter().map(block_kind).collect();
     eprintln!(
-        "{label}: blocks={kinds:?} input={} read={:?} output={}",
+        "{label}: blocks={kinds:?} input={} read={:?} creation={:?} \
+         total={} output={}",
         resp.usage.input_tokens,
         resp.usage.cache_read_input_tokens,
+        resp.usage.cache_creation_input_tokens,
+        prompt_total(&resp.usage),
         resp.usage.output_tokens,
     );
 }
@@ -220,7 +243,7 @@ fn tool_rounds_scenario(
         }
     }
 
-    let mut prev_input: u64 = 0;
+    let mut prev_total: u64 = 0;
     for round in 0..tool_rounds {
         let resp = session
             .complete_response(&prompt)
@@ -230,15 +253,15 @@ fn tool_rounds_scenario(
             let read =
                 resp.usage.cache_read_input_tokens.unwrap_or_default() as u64;
             assert!(
-                read > prev_input,
+                read > prev_total,
                 "tool round {round}: tip missed — cache_read ({read}) \
-                 did not clear the previous prompt ({prev_input}); the \
+                 did not clear the previous prompt ({prev_total}); the \
                  call fell back to an explicit marker (#96). \
                  usage: {:?}",
                 resp.usage,
             );
         }
-        prev_input = resp.usage.input_tokens as u64;
+        prev_total = prompt_total(&resp.usage);
 
         let call = resp
             .inner
@@ -296,9 +319,9 @@ fn tool_rounds_scenario(
     trace_round("final round", &resp);
     let read = resp.usage.cache_read_input_tokens.unwrap_or_default() as u64;
     assert!(
-        read > prev_input,
+        read > prev_total,
         "final round: tip missed — cache_read ({read}) did not clear \
-         the previous prompt ({prev_input}) (#96). usage: {:?}",
+         the previous prompt ({prev_total}) (#96). usage: {:?}",
         resp.usage,
     );
 }
@@ -321,7 +344,7 @@ pub fn assert_tip_anchors_unmarked_continuation(session: LlamaCppSession) {
 
     let r1 = session.complete_response(&prompt).expect("round 1");
     trace_round("round 1", &r1);
-    let input1 = r1.usage.input_tokens as u64;
+    let total1 = prompt_total(&r1.usage);
 
     prompt.messages.push(Message {
         role: Role::Assistant,
@@ -336,14 +359,14 @@ pub fn assert_tip_anchors_unmarked_continuation(session: LlamaCppSession) {
     trace_round("round 2", &r2);
     let read2 = r2.usage.cache_read_input_tokens.unwrap_or_default() as u64;
     assert!(
-        read2 > input1,
+        read2 > total1,
         "unmarked continuation: tip missed — cache_read ({read2}) did \
-         not clear round 1's whole prompt ({input1}); the call fell \
+         not clear round 1's whole prompt ({total1}); the call fell \
          back to the marker inside it (#96). usage: {:?}",
         r2.usage,
     );
     assert!(
-        (read2 as usize) < r2.usage.input_tokens as usize,
+        read2 < prompt_total(&r2.usage),
         "cache_read must remain a strict prefix of the new prompt",
     );
 }

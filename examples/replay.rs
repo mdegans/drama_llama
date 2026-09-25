@@ -464,6 +464,12 @@ struct Meta {
     thought_tokens: u64,
     stop: String,
     secs: f64,
+    /// The prompt's total cell count — `cache_read_input_tokens` +
+    /// `cache_creation_input_tokens` + `input_tokens`, disjoint (see
+    /// `Session::last_usage`'s doc). NOT the bare `Usage::input_tokens`
+    /// field alone: that's only the tail after the last `cache_control`
+    /// breakpoint, and would make the "in" column shrink to near-zero
+    /// on any turn that's mostly cache reuse.
     input_tokens: u64,
     cache_read: u64,
 }
@@ -712,12 +718,19 @@ fn generate(
     let out = Output::from_blocks(blocks);
     let thought_tokens =
         session.engine().model().tokenize(&out.thought, false).len() as u64;
+    // The three input counters are disjoint (read + creation + input);
+    // `input_tokens` alone is only the post-breakpoint tail, so sum all
+    // three for "the prompt's total size" — what this table's "in"
+    // column means.
+    let prompt_total = usage.cache_read_input_tokens.unwrap_or(0)
+        + usage.cache_creation_input_tokens.unwrap_or(0)
+        + usage.input_tokens;
     let meta = Meta {
         output_tokens: usage.output_tokens,
         thought_tokens,
         stop,
         secs,
-        input_tokens: usage.input_tokens,
+        input_tokens: prompt_total,
         cache_read: usage.cache_read_input_tokens.unwrap_or(0),
     };
     Ok((out, meta))

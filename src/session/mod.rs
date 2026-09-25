@@ -4057,8 +4057,12 @@ impl<B: Backend> Session<B> {
     /// ignored.
     ///
     /// This is the number [`SessionError::ContextOverflow`] calls
-    /// `needed_cells`, and what an Anthropic-style `count_tokens`
-    /// endpoint reports as `input_tokens`.
+    /// `needed_cells` — the prompt's total cell count. A `complete_*`
+    /// call's [`Usage`] reports this same total split three ways
+    /// (`cache_read_input_tokens` + `cache_creation_input_tokens` +
+    /// `input_tokens`, disjoint; see [`Self::last_usage`]), so this
+    /// number is the *sum* of those three counters, not `input_tokens`
+    /// alone.
     pub fn count_tokens(
         &mut self,
         prompt: &Prompt,
@@ -4176,16 +4180,19 @@ impl<B: Backend> Session<B> {
     /// The [`Usage`] from the most recent `complete_*` call. Zeroed
     /// at [`Session`] construction; overwritten on every call.
     ///
-    /// Cache counters follow the Anthropic field semantics and are
-    /// reported iff the prefix cache is enabled:
-    /// `cache_read_input_tokens` is the prompt tokens restored from a
-    /// cached prefix (`Some(0)` on a cache-on miss / cold call), and
-    /// `cache_creation_input_tokens` is the prompt tokens newly
-    /// decoded into the cache this call (`input − read`; every decoded
-    /// token lands in the slot's tip/breakpoint snapshots). With the
-    /// prefix cache disabled both are `None` — not reported, rather
-    /// than a `Some(0)` indistinguishable from a healthy cold call.
-    /// `input_tokens` is always the full prompt.
+    /// The three input counters are reported iff the prefix cache is
+    /// enabled, and are disjoint — they sum to the prompt's total cell
+    /// count (what [`Self::count_tokens`] reports), the way
+    /// Anthropic's own API splits it: `cache_read_input_tokens` is the
+    /// prompt tokens restored from a cached prefix (`Some(0)` on a
+    /// cache-on miss / cold call); `cache_creation_input_tokens` is
+    /// the tokens from there up to the last `cache_control`
+    /// breakpoint — the part a caller asked to have cached, zero once
+    /// the read already reaches past it; `input_tokens` is the rest,
+    /// after the last breakpoint. With the prefix cache disabled both
+    /// cache counters are `None` — not reported, rather than a
+    /// `Some(0)` indistinguishable from a healthy cold call — and
+    /// `input_tokens` alone is the whole prompt.
     pub fn last_usage(&self) -> &Usage {
         &self.last_usage
     }
@@ -5331,37 +5338,51 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    /// Build a [`Usage`] for one `complete_*` call.
+    /// Build a [`Usage`] for one `complete_*` call, split the way the
+    /// Anthropic API splits it (checked on the wire, 2026-09-25): the
+    /// three input counters are disjoint and sum to the whole prompt,
+    /// which is what `count_tokens` reports.
     ///
-    /// The cache counters follow the Anthropic field semantics and are
-    /// populated **iff the prefix cache is enabled** (`cache_read` is
-    /// `Some`): `cache_read_input_tokens` is the prompt cells restored
-    /// from a slot, and `cache_creation_input_tokens` is the remainder
-    /// — every newly decoded prompt token lands in the slot's tip /
-    /// breakpoint snapshots, so it is a token "used to create the
-    /// cache entry". `input_tokens` stays the **full** prompt (local
-    /// convention; `read + creation == input` when the cache is on —
-    /// switch here if downstream ever needs API-billing-style input).
-    /// With the cache disabled both counters stay `None` ("not
-    /// reported"), which misanthropic's `AddAssign` (`.or(rhs)`)
-    /// accumulates sanely against `Some` calls.
+    /// - `cache_read_input_tokens`: prompt cells restored from a slot.
+    /// - `cache_creation_input_tokens`: cells from there up to the last
+    ///   cache breakpoint (`breakpoint_cells`), the part a caller asked
+    ///   to have cached. Zero when the read already reaches past it.
+    /// - `input_tokens`: the rest, after the last breakpoint. The tip
+    ///   caches that part too, but Anthropic bills it as plain input,
+    ///   and clients compute totals as the sum of all three.
+    ///
+    /// With the prefix cache disabled (`cache_read` is `None`) the cache
+    /// counters stay `None` ("not reported") and `input_tokens` is the
+    /// whole prompt; misanthropic's `AddAssign` (`.or(rhs)`) accumulates
+    /// that sanely against `Some` calls.
     fn make_usage(
         prompt_tokens: usize,
         cache_read: Option<usize>,
+        breakpoint_cells: usize,
         output_tokens: usize,
     ) -> Usage {
+        let Some(cache_read) = cache_read else {
+            return misanthropic::response::TokenCounts::new(
+                prompt_tokens as u64,
+                output_tokens as u64,
+            )
+            .into();
+        };
+        // Saturating throughout: the read is a prefix of the same entry
+        // list, and a breakpoint lies inside it, so none of these can
+        // underflow short of a bookkeeping bug. Clamp rather than wrap.
+        let creation = breakpoint_cells
+            .min(prompt_tokens)
+            .saturating_sub(cache_read);
+        let input = prompt_tokens
+            .saturating_sub(cache_read)
+            .saturating_sub(creation);
         let mut counts = misanthropic::response::TokenCounts::new(
-            prompt_tokens as u64,
+            input as u64,
             output_tokens as u64,
         );
-        if let Some(cache_read) = cache_read {
-            // A prefix of the same entry list whose full length is
-            // `prompt_tokens`, so underflow is impossible; saturate
-            // anyway rather than wrap on a future bookkeeping bug.
-            counts.cache_creation_input_tokens =
-                Some(prompt_tokens.saturating_sub(cache_read) as u64);
-            counts.cache_read_input_tokens = Some(cache_read as u64);
-        }
+        counts.cache_creation_input_tokens = Some(creation as u64);
+        counts.cache_read_input_tokens = Some(cache_read as u64);
         counts.into()
     }
 
@@ -5650,6 +5671,9 @@ impl<B: Backend> Session<B> {
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
+        let breakpoint_cells = breakpoints
+            .last()
+            .map_or(0, |bp| entries_cell_len(&entries[..bp.entry]));
         let headroom = prompt.max_tokens.get() as usize;
         self.check_context_fit(&entries, headroom)?;
 
@@ -5785,6 +5809,7 @@ impl<B: Backend> Session<B> {
         let usage = Self::make_usage(
             prompt_tokens,
             self.prefix_cache.is_some().then_some(cache_read),
+            breakpoint_cells,
             generated_count,
         );
         self.record_usage(usage);
@@ -5889,6 +5914,9 @@ impl<B: Backend> Session<B> {
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
+        let breakpoint_cells = breakpoints
+            .last()
+            .map_or(0, |bp| entries_cell_len(&entries[..bp.entry]));
         let headroom = prompt.max_tokens.get() as usize;
         self.check_context_fit(&entries, headroom)?;
 
@@ -5945,6 +5973,7 @@ impl<B: Backend> Session<B> {
         let usage = Self::make_usage(
             prompt_tokens,
             self.prefix_cache.is_some().then_some(cache_read),
+            breakpoint_cells,
             0,
         );
         self.record_usage(usage);
@@ -6031,6 +6060,9 @@ impl<B: Backend> Session<B> {
             media_sentinel,
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
+        let breakpoint_cells = breakpoints
+            .last()
+            .map_or(0, |bp| entries_cell_len(&entries[..bp.entry]));
         let headroom = prompt.max_tokens.get() as usize;
         self.check_context_fit(&entries, headroom)?;
 
@@ -6358,6 +6390,7 @@ impl<B: Backend> Session<B> {
         let usage = Self::make_usage(
             prompt_tokens,
             self.prefix_cache.is_some().then_some(cache_read),
+            breakpoint_cells,
             generated_count,
         );
         self.record_usage(usage.clone());
@@ -7374,6 +7407,18 @@ mod tests {
     /// entry index and position coincide.
     fn ep(entry: usize) -> EntryPos {
         EntryPos { entry, pos: entry }
+    }
+
+    /// A [`Usage`]'s prompt total: `cache_read_input_tokens` plus
+    /// `cache_creation_input_tokens` plus `input_tokens` — the three
+    /// are disjoint, and together sum to the same total
+    /// [`Session::count_tokens`] reports. Cache-disabled calls report
+    /// `None` for both cache counters, so this still collapses to
+    /// plain `input_tokens`.
+    fn prompt_total(u: &Usage) -> u64 {
+        u.cache_read_input_tokens.unwrap_or(0)
+            + u.cache_creation_input_tokens.unwrap_or(0)
+            + u.input_tokens
     }
 
     /// Test shorthand: a [`Breakpoint`] at [`ep`]`(entry)` with an
@@ -9499,7 +9544,7 @@ mod tests {
             .unwrap()
             .cache();
 
-        let _ = session.complete_response(&prompt).unwrap();
+        let first = session.complete_response(&prompt).unwrap();
         // Backdate every slot 10 minutes: all-5m breakpoints expire.
         for slot in session.prefix_cache.as_mut().unwrap().slots.iter_mut() {
             slot.last_used -= std::time::Duration::from_secs(600);
@@ -9512,8 +9557,9 @@ mod tests {
         );
         assert_eq!(
             after.usage.cache_creation_input_tokens,
-            Some(after.usage.input_tokens),
-            "an expired-miss call re-creates the whole prompt",
+            first.usage.cache_creation_input_tokens,
+            "an expired-miss call re-creates exactly as much as the \
+             original cold call (same prompt, same breakpoint)",
         );
         // The sweep evicted it wholesale, and the call re-established
         // a fresh slot: an immediate repeat hits again.
@@ -9521,9 +9567,10 @@ mod tests {
         let read = again.usage.cache_read_input_tokens.unwrap_or(0);
         assert!(read > 0, "re-established slot must hit");
         assert_eq!(
-            again.usage.cache_creation_input_tokens,
-            Some(again.usage.input_tokens - read),
-            "read + creation must partition the prompt",
+            prompt_total(&again.usage),
+            prompt_total(&first.usage),
+            "read + creation + input must still sum to the same \
+             (identical) prompt now that the slot is warm again",
         );
     }
 
@@ -9554,10 +9601,18 @@ mod tests {
             Some(0),
             "cold call: reported, zero",
         );
-        assert_eq!(
-            first.usage.cache_creation_input_tokens,
-            Some(first.usage.input_tokens),
-            "cold call creates the whole prompt",
+        // This prompt has only one breakpoint (`AfterSystem`), so a
+        // cold call must create the cached system prefix AND leave a
+        // nonzero remainder in plain `input_tokens` — the user turn +
+        // generation scaffold, which sit after the last breakpoint.
+        assert!(
+            first.usage.cache_creation_input_tokens.unwrap_or(0) > 0,
+            "cold call creates at least the cached system prefix",
+        );
+        assert!(
+            first.usage.input_tokens > 0,
+            "the user turn + scaffold land in plain input_tokens, \
+             past the one (system) breakpoint",
         );
 
         // Append-only continuation: seat the assistant turn, add a
@@ -9573,14 +9628,9 @@ mod tests {
         // Never assert an exact read count — the lcp-1 BPE safety
         // margin may shave up to one entry off the reused prefix.
         assert!(read > 0, "append-only follow-up must hit the cache");
-        assert_eq!(
-            second.usage.cache_creation_input_tokens,
-            Some(second.usage.input_tokens - read),
-            "read + creation must partition the prompt",
-        );
         assert!(
-            second.usage.cache_creation_input_tokens.unwrap()
-                < second.usage.input_tokens,
+            second.usage.cache_creation_input_tokens.unwrap_or(0)
+                < prompt_total(&second.usage),
             "follow-up must not re-create the whole prompt",
         );
 
@@ -9699,18 +9749,36 @@ mod tests {
     }
 
     /// `make_usage` is the one function every `complete_*` path uses
-    /// to stamp [`Usage`] values. With the prefix cache on
-    /// (`cache_read: Some`), both cache counters are populated and
-    /// partition the prompt: `read + creation == input`.
+    /// to stamp [`Usage`] values. With the prefix cache on, the three
+    /// input counters partition the prompt as Anthropic's do: read, then
+    /// creation up to the last breakpoint, then plain input after it.
     #[cfg(feature = "llama-cpp")]
     #[test]
     fn test_make_usage_populates_cache_counters() {
-        let u =
-            Session::<crate::LlamaCppBackend>::make_usage(100, Some(42), 10);
-        assert_eq!(u.input_tokens, 100);
-        assert_eq!(u.cache_read_input_tokens, Some(42));
-        assert_eq!(u.cache_creation_input_tokens, Some(58));
+        type S = Session<crate::LlamaCppBackend>;
+        // Cold, breakpoint at 90 of 100: the wire's first request.
+        let u = S::make_usage(100, Some(0), 90, 10);
+        assert_eq!(u.cache_read_input_tokens, Some(0));
+        assert_eq!(u.cache_creation_input_tokens, Some(90));
+        assert_eq!(u.input_tokens, 10);
         assert_eq!(u.output_tokens, 10);
+        // Warm up to the breakpoint: the wire's second request.
+        let u = S::make_usage(100, Some(90), 90, 10);
+        assert_eq!(u.cache_read_input_tokens, Some(90));
+        assert_eq!(u.cache_creation_input_tokens, Some(0));
+        assert_eq!(u.input_tokens, 10);
+        // Partial read below the breakpoint.
+        let u = S::make_usage(100, Some(42), 90, 10);
+        assert_eq!(u.cache_creation_input_tokens, Some(48));
+        assert_eq!(u.input_tokens, 10);
+        // The tip read past the breakpoint: nothing is created.
+        let u = S::make_usage(100, Some(95), 90, 10);
+        assert_eq!(u.cache_creation_input_tokens, Some(0));
+        assert_eq!(u.input_tokens, 5);
+        // No breakpoints at all: everything unread is plain input.
+        let u = S::make_usage(100, Some(0), 0, 10);
+        assert_eq!(u.cache_creation_input_tokens, Some(0));
+        assert_eq!(u.input_tokens, 100);
     }
 
     /// With the prefix cache disabled (`cache_read: None`), the cache
@@ -9721,7 +9789,8 @@ mod tests {
     #[cfg(feature = "llama-cpp")]
     #[test]
     fn test_make_usage_none_when_cache_disabled() {
-        let u = Session::<crate::LlamaCppBackend>::make_usage(100, None, 10);
+        let u =
+            Session::<crate::LlamaCppBackend>::make_usage(100, None, 90, 10);
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.cache_read_input_tokens, None);
         assert_eq!(u.cache_creation_input_tokens, None);
@@ -11097,11 +11166,12 @@ mod tests {
             );
             let (before, media_cells, media_id) = media_entry_stats(&session);
             assert!(media_cells > 1, "image occupies many KV cells");
-            // Usage counts cells, not entries: prompt_tokens must
-            // include the image's full cell footprint.
+            // Usage counts cells, not entries: the prompt total (read +
+            // creation + input) must include the image's full cell
+            // footprint.
             assert!(
-                first.usage.input_tokens as usize > before + media_cells,
-                "input_tokens is cell-space"
+                prompt_total(&first.usage) as usize > before + media_cells,
+                "usage total is cell-space"
             );
 
             // Call 2: identical prompt — reuse must cover the media
