@@ -984,7 +984,7 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             // piece is the tail.
             if let Some(real) = provenance
                 .reserved
-                .piece(next_token)
+                .emitted_piece(next_token)
                 .filter(|real| piece.ends_with(real))
             {
                 let end = self.text.len();

@@ -72,7 +72,7 @@ impl Provenance {
     /// ordinary text, in which any reserved piece is spelled.
     pub(crate) fn push(&mut self, piece: &str, token: Option<Token>) -> String {
         let real = token
-            .and_then(|t| self.reserved.piece(t))
+            .and_then(|t| self.reserved.emitted_piece(t))
             .filter(|p| piece.ends_with(p))
             .map(str::len);
         match real {
@@ -406,6 +406,25 @@ mod tests {
             ),
         );
         assert_eq!(p.restore(&marked), "see <tool_call> then <tool_call>");
+    }
+
+    /// A special sharing a reserved piece's text, emitted, is framing
+    /// like the reserved one.
+    #[test]
+    fn an_aliased_special_is_real_framing() {
+        let mut p = Provenance::new(
+            Arc::new(
+                LiteralNeutralizer::new([(TOOL_CALL, "<tool_call>")])
+                    .with_aliases([(9, "<tool_call>"), (10, "<nope>")]),
+            ),
+            SENTINEL,
+        );
+        assert_eq!(p.push("<tool_call>", Some(9)), "<tool_call>");
+        assert_eq!(p.push("<nope>", Some(10)), "<nope>");
+        assert_eq!(
+            feed(&mut p, &[("<tool_call>", Some(11))]),
+            literal_marker(SENTINEL, TOOL_CALL),
+        );
     }
 
     /// Settled text only grows by appending: a tail that could still

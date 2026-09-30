@@ -1899,6 +1899,9 @@ pub struct LiteralNeutralizer {
     by_id: std::collections::HashMap<Token, usize>,
     /// Pattern indices in piece order, for [`Self::could_grow`].
     sorted: Vec<usize>,
+    /// Special id → pattern index, for a special whose piece is
+    /// reserved under another id; see [`Self::emitted_piece`].
+    aliases: std::collections::HashMap<Token, usize>,
 }
 
 impl std::fmt::Debug for LiteralNeutralizer {
@@ -1946,7 +1949,46 @@ impl LiteralNeutralizer {
             pieces,
             by_id,
             sorted,
+            aliases: std::collections::HashMap::new(),
         }
+    }
+
+    /// Also read each special in `specials` whose piece is reserved
+    /// under another id as that piece when the model emits it
+    /// ([`Self::emitted_piece`]). A vocabulary can hold two specials
+    /// with one text; content spelling it tokenizes to one of them, the
+    /// one reserved, but the model can emit either as framing.
+    pub(crate) fn with_aliases<I, S>(mut self, specials: I) -> Self
+    where
+        I: IntoIterator<Item = (Token, S)>,
+        S: AsRef<str>,
+    {
+        let by_piece: std::collections::HashMap<&str, usize> = self
+            .pieces
+            .iter()
+            .enumerate()
+            .map(|(i, (_, piece))| (piece.as_str(), i))
+            .collect();
+        let aliases = specials
+            .into_iter()
+            .filter(|(id, _)| !self.by_id.contains_key(id))
+            .filter_map(|(id, piece)| {
+                by_piece.get(piece.as_ref()).map(|&i| (id, i))
+            })
+            .collect();
+        self.aliases = aliases;
+        self
+    }
+
+    /// The piece a real emission of `id` reads as, when that piece is
+    /// reserved: [`Self::piece`], or the piece of a special sharing its
+    /// text (see [`Self::with_aliases`]). Emission provenance asks
+    /// this, content neutralization never does.
+    pub(crate) fn emitted_piece(&self, id: Token) -> Option<&str> {
+        self.by_id
+            .get(&id)
+            .or_else(|| self.aliases.get(&id))
+            .map(|&i| self.pieces[i].1.as_str())
     }
 
     /// Whether there is nothing to neutralize.

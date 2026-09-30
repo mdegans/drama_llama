@@ -45,22 +45,28 @@ impl LiteralTable {
     pub(super) fn build<M: Model>(model: &M) -> Self {
         let specials: BTreeSet<Token> =
             model.special_tokens().into_iter().collect();
-        let reserved: Vec<(Token, String, Vec<Token>)> = specials
+        let pieces: Vec<(Token, String)> = specials
             .iter()
-            .filter_map(|&id| {
-                let piece = model.token_to_piece(id);
-                if piece.is_empty()
-                    || model.tokenize_special(&piece, false, true) != [id]
-                {
-                    return None;
-                }
-                let plain = spell(model, &piece, &specials);
-                (!plain.contains(&id)).then_some((id, piece, plain))
+            .map(|&id| (id, model.token_to_piece(id)))
+            .filter(|(_, piece)| !piece.is_empty())
+            .collect();
+        let reserved: Vec<(Token, String, Vec<Token>)> = pieces
+            .iter()
+            .filter(|(id, piece)| {
+                model.tokenize_special(piece, false, true) == [*id]
+            })
+            .filter_map(|(id, piece)| {
+                let plain = spell(model, piece, &specials);
+                (!plain.contains(id)).then(|| (*id, piece.clone(), plain))
             })
             .collect();
+        // A special sharing a reserved piece's text is dropped above
+        // (its text tokenizes to the other id) but is still framing
+        // when the model emits it.
         let neutralizer = LiteralNeutralizer::new(
             reserved.iter().map(|(id, piece, _)| (*id, piece.as_str())),
-        );
+        )
+        .with_aliases(pieces.iter().map(|(id, piece)| (*id, piece)));
         let plain = reserved
             .into_iter()
             .filter(|(id, _, _)| neutralizer.contains(*id))
@@ -471,6 +477,9 @@ mod tests {
     /// A `USER_DEFINED` piece holding [`SECTION`]: reserved, spelled
     /// around it.
     const BRACKETED: Token = 308;
+    /// A second special spelled `<tool_call>`: text tokenizes to
+    /// [`TOOL_CALL`], so it is not reserved, but it is framing emitted.
+    const TOOL_CALL_ALIAS: Token = 309;
     const N_VOCAB: i32 = 310;
 
     /// `(id, piece, control)` — `control = false` is `USER_DEFINED`.
@@ -484,6 +493,7 @@ mod tests {
         (BOS, "<s>", true),
         (SECTION, "§", false),
         (BRACKETED, "<§>", false),
+        (TOOL_CALL_ALIAS, "<tool_call>", false),
     ];
 
     const TEMPLATE: &str = "\
@@ -1250,6 +1260,20 @@ mod tests {
         let script = real(&call_bytes());
         assert!(script.contains(&TOOL_CALL) && script.contains(&TOOL_CALL_END));
         let blocks = run(script);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(is_call(&blocks[0]), "{blocks:?}");
+    }
+
+    /// A call opened by a special that shares `<tool_call>`'s text but
+    /// is not the id the text tokenizes to is still a real call: the
+    /// token is framing the model emitted, not a spelling.
+    #[test]
+    fn a_call_opened_by_a_duplicate_special_is_a_call() {
+        let table = LiteralTable::build(&LitModel);
+        assert!(!table.neutralizer.contains(TOOL_CALL_ALIAS));
+        let call = call_bytes();
+        let rest = call.strip_prefix("<tool_call>").expect("hermes opener");
+        let blocks = run([vec![TOOL_CALL_ALIAS], real(rest)].concat());
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         assert!(is_call(&blocks[0]), "{blocks:?}");
     }
