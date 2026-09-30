@@ -484,10 +484,10 @@ fn main() -> Result<(), BoxError> {
     // `max_tokens` default (4096) as the generation budget — 1024 truncated
     // a jester rebuttal, 2048 an engineer reaction (runs five and six), and
     // on the forced path that is a clipped call (`max_tokens`, no tool use)
-    // that adjourns the council. Not 8192: `check_context_fit` reserves `max_tokens` of
-    // headroom per call out of the shared `--n-ctx` budget above. The
-    // Session-level cap was removed, so this budget now lives on the seat
-    // prompts (`Prompt::default().max_tokens` == 4096).
+    // that adjourns the council. Not 8192: `check_context_fit` reserves
+    // `max_tokens` of headroom per call out of the shared `--n-ctx` budget
+    // above. The Session-level cap was removed, so this budget now lives on
+    // the seat prompts (`Prompt::default().max_tokens` == 4096).
 
     let mut advisors: Vec<Seat> = ADVISORS
         .iter()
