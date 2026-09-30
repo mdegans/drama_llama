@@ -8,6 +8,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BEHAVIOR CHANGE: prompt content that spells a special-token piece
+  is no longer a 400 — the model reads it as text.** Every prepare
+  path tokenized the whole render with special-token parsing on, so a
+  reserved piece in *content* — Qwen's `<think>` / `<tool_call>`
+  (`USER_DEFINED`, matched even with specials off), `<|im_start|>`,
+  Mistral's `<s>` (which is also HTML strikethrough) — became the real
+  control token, and `SessionError::InjectedSpecialToken` rejected the
+  whole request. One Agora post quoting such a piece turned every
+  reader's `/v1/messages` and `/count_tokens` into a 400, permanently,
+  since the post stays in the transcript. Now the chat template
+  replaces each reserved piece found in content with a per-call
+  out-of-band marker (`LiteralNeutralizer`, via the new
+  `RenderOptions::literals`), and `Session` tokenizes around it with
+  specials off, spelling out byte by byte any piece the tokenizer
+  still matches. Content surfaces covered: system text, user and
+  assistant text (after joining blocks, so a piece split across two
+  blocks is caught), thought bodies (inside our own `<think>`
+  wrappers, which stay real), reasoning fields, tool results,
+  tool-call input keys and values, tool descriptions and schemas, and
+  a resumed open thought. The template's own framing is untouched.
+  What changes for callers:
+  - A prompt quoting a piece prepares; the model sees the spelled
+    text. Clean prompts are byte-identical in render, tokens and cache
+    hashes (tested), so existing caches stay warm.
+  - `InjectedSpecialToken` is now a bug detector: the old guard still
+    scans content the way the tokenizer reads it, and every piece it
+    finds must have been neutralized at least as often; a shortfall
+    fails the call loudly (and logs `literal_neutralization_bypassed`)
+    as a drama_llama bug. `content_special_neutralized` is logged at
+    debug on every call that neutralizes something.
+  - Tool names and tool-use ids are *validated* rather than
+    neutralized — the grammar and parser key on them: names must
+    match Anthropic's `^[a-zA-Z0-9_-]{1,64}$`, ids
+    `^[a-zA-Z0-9_-]+$`, else `ChatTemplateError::InvalidIdentifier`
+    (a 400 on blallama).
+  - Templates no longer act on a piece that content spells: a Qwen
+    template does not split assistant text at a literal `</think>`,
+    nor treat user text starting with a literal `<tool_response>` as a
+    tool response.
+  - Emission containment (`EmittedSpecialToken`) now rejects only a
+    piece the model emitted as the *real* token into free text; one it
+    merely spelled (an agent quoting a post) passes, since the next
+    ingest reads it as text. A spelled piece the parser reads as
+    *framing* — a typed-out `<tool_call>` parsed as a call — is the
+    parser-provenance gap, left for a follow-up.
+  - Markers the model emits as real specials outside the dialect
+    (Qwen-VL grounding's `<|box_start|>`, with
+    `with_emit_specials_ban(false)`) re-ingest as text, not as ids.
+  - `RenderOptions` gains a public field, `literals`; code building it
+    with a struct literal and no `..Default::default()` must add it.
+    `Session` sets it itself on every render, whatever
+    `with_render_opts` was given.
+  - moeflux: `tokenize_special` honors `add_special`, and
+    `parse_special = false` now leaves added tokens marked `special`
+    as text (an `encode_special_tokens` tokenizer clone), matching
+    llama.cpp.
 - **An unseeded cache resume reseeds the sampler rng.** A resumed
   call used to continue the snapshot's exact rng stream, and a prompt
   breakpoint's snapshot holds the *initial* rng of the call that made
