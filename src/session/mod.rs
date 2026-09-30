@@ -119,6 +119,7 @@ use crate::{
 };
 
 #[cfg(feature = "tokio")]
+mod stop;
 mod transport;
 #[cfg(feature = "tokio")]
 pub use transport::{LocalTransport, SessionTransport};
@@ -3397,19 +3398,10 @@ impl<B: Backend> Session<B> {
         predict_opts.n =
             NonZeroUsize::new(prompt.max_tokens.get() as usize).unwrap();
         predict_opts.seed = self.seed;
-        // The request's `stop_sequences` (#122). These were once only
-        // read *after* generation, to label a turn that happened to end
-        // on one — so a prompt relying on them ran on to EOG here while
-        // Anthropic stopped. Stopping is the predictor's job; excluding
-        // the match from the output and reporting it is the caller's
-        // (`Cut::StopSequence`).
-        predict_opts.stop_strings = prompt
-            .stop_sequences
-            .iter()
-            .flatten()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
+        // Not the request's `stop_sequences`: the predictor would match
+        // them against raw text, framing and all. Each completion path
+        // matches them against text output instead (`stop::StopFilter`,
+        // #122).
         // `ToolChoice::None` — "must not use any tool" (issue #44) — is
         // enforced here rather than by a grammar: the standing emit-ban
         // exempts the dialect's tool-call opener (so Auto/Any/Method
@@ -5681,6 +5673,7 @@ impl<B: Backend> Session<B> {
             partial_hashes,
             breakpoint_ids,
             breakpoint_ttls,
+            pre_opened_reasoning,
             reasoning_opener_spent,
             reasoning_closed_by_render,
             media_by_id,
@@ -5715,6 +5708,30 @@ impl<B: Backend> Session<B> {
             prompt,
             &breakpoint_ids,
         );
+
+        // Stop sequences stop here exactly as in `run_call` — matched
+        // against text output, never framing (#122) — so the two views
+        // of the same bytes stop on the same token.
+        let parse_syntax = effective_tool_syntax(&self.dialect).into_owned();
+        let parse_tools: Vec<Tool> = prompt
+            .tools
+            .iter()
+            .flatten()
+            .filter_map(|def| def.as_method())
+            .cloned()
+            .collect();
+        let stops = stop::request_stops(prompt);
+        let eos_pieces = self.eog_pieces();
+        let mut stop_filter = (!stops.is_empty()).then(|| {
+            stop::StopFilter::new(
+                crate::dialect::StreamParser::new(
+                    parse_syntax.clone(),
+                    parse_tools.clone(),
+                    pre_opened_reasoning,
+                ),
+                stops.clone(),
+            )
+        });
 
         // Count pieces as we consume them — one piece equals one
         // generated token before any post-hoc stop-string trimming
@@ -5757,6 +5774,14 @@ impl<B: Backend> Session<B> {
             }
             generated_count += 1;
             text.push_str(&piece);
+            if let Some(filter) = stop_filter.as_mut() {
+                if !eos_pieces.contains(&piece) {
+                    filter.push(&piece);
+                }
+                if filter.hit().is_some() {
+                    break;
+                }
+            }
             // Same one-shot halt as `run_call`: once an active grammar
             // is *exhausted* — accepting, with nothing left to match —
             // the turn is structurally over, and running on to EOS is
@@ -5771,19 +5796,35 @@ impl<B: Backend> Session<B> {
         // the predictor so it releases the engine borrow — we need
         // `&self.engine` for `trim_eos` below.
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
-        let stop = predictor.stop_string().map(str::to_owned);
         drop(predictor);
 
         // A stop sequence is never part of the output (#122), here as
-        // in `run_call`. The recorded tip below stays LCP-only (no
-        // hash), which compares token ids, so the stop's leading tokens
-        // sitting in KV cannot be spliced under a render without them.
-        if let Some((at, _)) =
-            stop.and_then(|s| crate::predictor::first_stop_string(&text, &[s]))
-        {
-            text.truncate(at);
+        // in `run_call`: the raw bytes end just before it. The recorded
+        // tip below stays LCP-only (no hash), which compares token ids,
+        // so the stop's leading tokens sitting in KV cannot be spliced
+        // under a render without them.
+        let mut trimmed = trim_eos(&text, &self.engine).to_string();
+        if let Some(filter) = &stop_filter {
+            let hit = filter.hit().map(str::to_owned);
+            let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
+            let visible = |prefix: &str| {
+                let parsed = crate::dialect::parse_text(
+                    &parse_syntax,
+                    &tool_refs,
+                    prefix,
+                    pre_opened_reasoning,
+                    crate::dialect::Leniency::Clipped,
+                );
+                let blocks = merge_adjacent_prose(parsed.blocks);
+                match &hit {
+                    Some(hit) => stop::cut_at_stop(blocks, &[hit]).1,
+                    None => stop::cut_at_stop(blocks, &stops).1,
+                }
+            };
+            if let Some(at) = stop::raw_stop_cut(&trimmed, visible) {
+                trimmed.truncate(at);
+            }
         }
-        let trimmed = trim_eos(&text, &self.engine).to_string();
 
         // Auto-tip: extend `prev_tokens` past the prompt with the
         // generated content **including the recorded-but-uncommitted
@@ -6020,10 +6061,6 @@ impl<B: Backend> Session<B> {
             .filter_map(|def| def.as_method())
             .cloned()
             .collect();
-        // The stream holds these back and cuts at them itself (#122);
-        // the predictor already has them (`predict_options_for`) and
-        // is what stops.
-        let stop_strings = predict_opts.stop_strings.clone();
         let max_tokens = predict_opts.n;
 
         let predictor = if self.prefix_cache.is_some() {
@@ -6048,15 +6085,17 @@ impl<B: Backend> Session<B> {
         };
         Ok(BlockStream {
             predictor,
-            parser: crate::dialect::StreamParser::new(
-                syntax,
-                tools,
-                pre_opened_reasoning,
+            filter: stop::StopFilter::new(
+                crate::dialect::StreamParser::new(
+                    syntax,
+                    tools,
+                    pre_opened_reasoning,
+                ),
+                stop::request_stops(prompt),
             ),
             pending: std::collections::VecDeque::new(),
             eos_pieces,
             drained: false,
-            stops: StopCutter::new(stop_strings),
             generated: 0,
             max_tokens,
             tool_use: false,
@@ -6183,6 +6222,29 @@ impl<B: Backend> Session<B> {
         // describes the last one.
         let mut uncommitted_bytes: usize = 0;
 
+        // The parse dialect and tool schemas: the request's stop
+        // sequences are matched against the text output they parse to
+        // (#122), during generation as well as after it.
+        let parse_syntax = effective_tool_syntax(&self.dialect).into_owned();
+        let parse_tools: Vec<Tool> = prompt
+            .tools
+            .iter()
+            .flatten()
+            .filter_map(|def| def.as_method())
+            .cloned()
+            .collect();
+        let stops = stop::request_stops(prompt);
+        let mut stop_filter = (!stops.is_empty()).then(|| {
+            stop::StopFilter::new(
+                crate::dialect::StreamParser::new(
+                    parse_syntax.clone(),
+                    parse_tools.clone(),
+                    pre_opened_reasoning,
+                ),
+                stops.clone(),
+            )
+        });
+
         let mut predictor = if self.prefix_cache.is_some() {
             // Cache on: ALWAYS the resuming constructor — even at
             // prefill_start == 0 — because the non-resuming one calls
@@ -6225,6 +6287,14 @@ impl<B: Backend> Session<B> {
             raw_text.push_str(&piece);
             uncommitted_bytes = piece.len();
 
+            // A stop sequence in text output ends the turn (#122).
+            if let Some(filter) = stop_filter.as_mut() {
+                filter.push(&piece);
+                if filter.hit().is_some() {
+                    break;
+                }
+            }
+
             // Break early if any active grammar / json matcher has
             // reached its accept state. Avoids burning extra decode
             // steps waiting for EOS once the structured output is
@@ -6254,18 +6324,8 @@ impl<B: Backend> Session<B> {
         // sampler state (tip promotion) before the predictor drops.
         let constraint_incomplete = predictor.constraint_incomplete_at_end();
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
-        let cut = Cut::of(&predictor);
+        let budget = Cut::of(&predictor);
         drop(predictor);
-        // A stop sequence is never part of the output (#122). Found
-        // again in `raw_text` rather than trusting the predictor's
-        // offset: its text also carries the EOG pieces this one drops.
-        if let Some(Cut::StopSequence(stop)) = &cut {
-            if let Some((at, _)) =
-                crate::predictor::first_stop_string(&raw_text, &[stop])
-            {
-                raw_text.truncate(at);
-            }
-        }
         // Parse the whole generation through the dialect envelope
         // parser. `Final` leniency: a truncated trailing structure
         // degrades to Text (or Thought for an unclosed reasoning
@@ -6280,32 +6340,55 @@ impl<B: Backend> Session<B> {
         // call is *withheld* — never dispatchable, never seated as
         // prose with its frame marker — while an unclosed thought
         // still surfaces open.
-        let parse_syntax = effective_tool_syntax(&self.dialect);
-        let parse_tools: Vec<Tool> = prompt
-            .tools
-            .iter()
-            .flatten()
-            .filter_map(|def| def.as_method())
-            .cloned()
-            .collect();
+        //
+        // Adjacent same-kind prose is collapsed so `[Text, Text]`
+        // becomes `[Text]` — lets a lone `Text` output serialize to
+        // the string wire form downstream.
         let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
-        let parsed = crate::dialect::parse_text(
-            &parse_syntax,
-            &tool_refs,
-            &raw_text,
-            pre_opened_reasoning,
-            if cut.is_some() {
-                crate::dialect::Leniency::Clipped
-            } else {
-                crate::dialect::Leniency::Final
-            },
-        );
-        let withheld =
-            parsed.status == crate::dialect::ParseStatus::NeedMoreInput;
-        // Collapse adjacent same-kind prose so `[Text, Text]` becomes
-        // `[Text]` — lets a lone `Text` output serialize to the
-        // string wire form downstream.
-        let blocks = merge_adjacent_prose(parsed.blocks);
+        let parse = |leniency| {
+            let parsed = crate::dialect::parse_text(
+                &parse_syntax,
+                &tool_refs,
+                &raw_text,
+                pre_opened_reasoning,
+                leniency,
+            );
+            let withheld =
+                parsed.status == crate::dialect::ParseStatus::NeedMoreInput;
+            (merge_adjacent_prose(parsed.blocks), withheld)
+        };
+        // A stop sequence (#122) is found in the text output of the
+        // clipped parse: the one the filter stopped on, or — when the
+        // turn ended first — any in the prose the end flushed. The
+        // output is cut there, everything after it gone.
+        let hit = stop_filter
+            .as_ref()
+            .and_then(|f| f.hit())
+            .map(str::to_owned);
+        let stopped = (!stops.is_empty())
+            .then(|| {
+                let (blocks, _) = parse(crate::dialect::Leniency::Clipped);
+                let (blocks, found) = match &hit {
+                    Some(hit) => stop::cut_at_stop(blocks, &[hit]),
+                    None => stop::cut_at_stop(blocks, &stops),
+                };
+                found.or(hit).map(|stop| (blocks, stop))
+            })
+            .flatten();
+        let (blocks, cut, withheld) = match stopped {
+            // Its KV no longer matches the output either way.
+            Some((blocks, stop)) => {
+                (blocks, Some(Cut::StopSequence(stop)), true)
+            }
+            None => {
+                let (blocks, withheld) = parse(if budget.is_some() {
+                    crate::dialect::Leniency::Clipped
+                } else {
+                    crate::dialect::Leniency::Final
+                });
+                (blocks, budget, withheld)
+            }
+        };
 
         // Whether this turn may leave an auto-tip. A clipped turn whose
         // KV no longer matches its own output must not: a stop sequence
@@ -7277,39 +7360,30 @@ struct CallOutcome {
 enum Cut {
     /// `max_tokens` (or the context window) ran out.
     Budget,
-    /// A request stop sequence matched: the matched string, already
-    /// cut out of the output.
+    /// A request stop sequence matched in text output: the matched
+    /// string, already cut out of the output.
     StopSequence(String),
 }
 
 impl Cut {
-    /// Read the cut off a predictor whose iteration has ended (or that
-    /// the caller halted on an exhausted grammar). Both completion
+    /// Read a budget cut off a predictor whose iteration has ended (or
+    /// that the caller halted on an exhausted grammar). Both completion
     /// paths read it here, so batch and stream agree on every ending.
     fn of<B: Backend>(
         predictor: &crate::PiecePredictor<'_, B>,
     ) -> Option<Self> {
         Self::classify(
-            predictor.stop_string(),
             predictor.grammar_exhausted(),
             predictor.hit_token_limit(),
         )
     }
 
-    /// A stop string is a cut; so is running out of budget, unless the
-    /// grammar was exhausted — that turn *finished*, even on the
-    /// budget's last token, so a forced call that fits exactly still
-    /// reads `ToolUse`.
-    fn classify(
-        stop: Option<&str>,
-        grammar_exhausted: bool,
-        out_of_budget: bool,
-    ) -> Option<Self> {
-        match stop {
-            Some(stop) => Some(Self::StopSequence(stop.to_owned())),
-            None if out_of_budget && !grammar_exhausted => Some(Self::Budget),
-            None => None,
-        }
+    /// Running out of budget is a cut, unless the grammar was exhausted
+    /// — that turn *finished*, even on the budget's last token, so a
+    /// forced call that fits exactly still reads `ToolUse`. (A stop
+    /// sequence is the other cut; the [`stop::StopFilter`] reports it.)
+    fn classify(grammar_exhausted: bool, out_of_budget: bool) -> Option<Self> {
+        (out_of_budget && !grammar_exhausted).then_some(Self::Budget)
     }
 }
 
@@ -7462,7 +7536,9 @@ fn infer_stop_reason(
 ///
 /// Endings match the batch path's. A request stop sequence ends the
 /// stream and never appears in it — prose that could still grow into
-/// one is held back until it can't (#122). A generation cut short
+/// one is held back until it can't (#122). Only text output is matched,
+/// never framing, a call or a thought (see `stop::StopFilter`). A
+/// generation cut short
 /// (`max_tokens`, a stop sequence) withholds an incomplete trailing
 /// call instead of yielding its bytes as text (#121). Like the batch
 /// path, it halts once the grammar is exhausted. Once drained,
@@ -7471,8 +7547,9 @@ pub struct BlockStream<'engine, B: Backend> {
     predictor: crate::PiecePredictor<'engine, B>,
     /// Re-parse-per-tick streaming parser over the session dialect
     /// (owned — the session borrow is held by `predictor` for the
-    /// stream's lifetime).
-    parser: crate::dialect::StreamParser,
+    /// stream's lifetime), with the request's stop sequences matched
+    /// against the prose it releases (#122).
+    filter: stop::StopFilter,
     pending: std::collections::VecDeque<crate::Block>,
     /// Piece texts of the model's end-of-generation tokens
     /// (`Model::eog_tokens`) — filtered out of the stream since they
@@ -7481,8 +7558,6 @@ pub struct BlockStream<'engine, B: Backend> {
     /// this vocab's `eot()` but not EOG, and the parser needs it.
     eos_pieces: std::collections::BTreeSet<String>,
     drained: bool,
-    /// Keeps the request's stop sequences out of the stream (#122).
-    stops: StopCutter,
     /// Pieces of content generated, for the `MaxTokens` fallback.
     generated: usize,
     max_tokens: NonZeroUsize,
@@ -7507,30 +7582,24 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
             .map(|(reason, seq)| (*reason, seq.as_deref()))
     }
 
-    /// Hand `text` to the parser, queueing whatever it resolves.
-    fn feed(&mut self, text: &str) {
-        if !text.is_empty() {
-            let blocks = self.parser.push(text);
-            self.pending.extend(blocks);
-        }
-    }
-
     /// End of generation: flush, pick the leniency, settle the ending.
     fn drain(&mut self) {
         self.drained = true;
-        let rest = self.stops.finish();
-        self.feed(&rest);
-        let cut = Cut::of(&self.predictor);
+        let budget = Cut::of(&self.predictor);
         // Final pass. Cut short: an incomplete trailing call is
         // withheld (`Leniency::Clipped`). Otherwise partial trailing
         // structures degrade to Text / Thought per the Final-leniency
-        // contract. Held-back marker-prefix bytes flush either way.
-        let rest = if cut.is_some() {
-            self.parser.finish_clipped()
-        } else {
-            self.parser.finish()
-        };
+        // contract. Held-back marker-prefix bytes flush either way —
+        // and may themselves complete a stop sequence.
+        let clipped = budget.is_some() || self.filter.hit().is_some();
+        let rest = self.filter.finish(clipped);
         self.pending.extend(rest);
+        // A stop outranks the budget: the text reached it first.
+        let cut = self
+            .filter
+            .hit()
+            .map(|s| Cut::StopSequence(s.to_owned()))
+            .or(budget);
         // The ending needs the yields still queued, not just the
         // yielded ones.
         let tool_use = self.tool_use
@@ -7570,70 +7639,20 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                         continue;
                     }
                     self.generated += 1;
-                    let ready = self.stops.push(&piece);
-                    self.feed(&ready);
-                    // `run_call`'s one-shot halt, so both paths stop on
-                    // the same token: an exhausted grammar ends the turn.
-                    if self.predictor.grammar_exhausted() {
+                    let blocks = self.filter.push(&piece);
+                    self.pending.extend(blocks);
+                    // A stop sequence ends the turn; so does `run_call`'s
+                    // one-shot halt on an exhausted grammar, so both
+                    // paths stop on the same token.
+                    if self.filter.hit().is_some()
+                        || self.predictor.grammar_exhausted()
+                    {
                         self.drain();
                     }
                 }
                 None => self.drain(),
             }
         }
-    }
-}
-
-/// The streaming half of stop-sequence exclusion (#122): a stop
-/// sequence is never part of the output, but a stream cannot take back
-/// text it has yielded — so text that could still grow into one is held
-/// until the next piece settles it.
-#[derive(Debug, Default)]
-struct StopCutter {
-    stops: Vec<String>,
-    /// Admitted text not yet passed on: the tail that could still grow
-    /// into a stop sequence.
-    held: String,
-    /// A stop sequence completed and was cut out. Everything after it
-    /// is past the stop.
-    cut: bool,
-}
-
-impl StopCutter {
-    fn new(stops: Vec<String>) -> Self {
-        Self {
-            stops,
-            ..Self::default()
-        }
-    }
-
-    /// Admit one piece; returns the text now safe to pass on. Once a
-    /// stop sequence completes, the text before it and nothing more.
-    fn push(&mut self, piece: &str) -> String {
-        if self.cut {
-            return String::new();
-        }
-        self.held.push_str(piece);
-        let mut held = std::mem::take(&mut self.held);
-        if let Some((at, _)) =
-            crate::predictor::first_stop_string(&held, &self.stops)
-        {
-            self.cut = true;
-            held.truncate(at);
-            return held;
-        }
-        let keep = crate::predictor::stop_string_holdback(&held, &self.stops);
-        self.held = held.split_off(held.len() - keep);
-        held
-    }
-
-    /// End of stream: the held tail never completed a stop sequence, so
-    /// it is output after all. (The predictor's stop condition is the
-    /// authority on whether generation *stopped*; a match it saw that
-    /// this missed — one straddling a dropped EOG piece — leaves
-    /// nothing to cut.)
-    fn finish(&mut self) -> String {
-        std::mem::take(&mut self.held)
     }
 }
 
@@ -9963,34 +9982,6 @@ mod tests {
         assert_eq!(seq, None);
     }
 
-    /// #122, streaming: a stop sequence split across pieces is held
-    /// until it completes, then cut with everything after it; text that
-    /// only looked like the start of one is released.
-    #[test]
-    fn stop_cutter_holds_back_and_cuts() {
-        let mut c = StopCutter::new(vec!["</answer>".into()]);
-        assert_eq!(c.push("The answer is 42"), "The answer is 42");
-        assert_eq!(c.push(" </"), " ");
-        assert_eq!(c.push("ans"), "");
-        assert_eq!(c.push("wer> and more"), "");
-        // Past the stop: nothing, ever.
-        assert_eq!(c.push("still more"), "");
-        assert_eq!(c.finish(), "");
-
-        // A false start is released once it diverges.
-        let mut c = StopCutter::new(vec!["</answer>".into()]);
-        assert_eq!(c.push("a </a"), "a ");
-        assert_eq!(c.push("bbr>"), "</abbr>");
-        // A dangling prefix at the end of the stream is output.
-        assert_eq!(c.push(" </an"), " ");
-        assert_eq!(c.finish(), "</an");
-
-        // No stops: a pass-through.
-        let mut c = StopCutter::new(Vec::new());
-        assert_eq!(c.push("x"), "x");
-        assert_eq!(c.finish(), "");
-    }
-
     /// A cut outranks a tool call (#121): a turn clipped mid-way through
     /// its second call — the first one complete and emitted — is
     /// unfinished, and a client that dispatches on `ToolUse` must not
@@ -10021,13 +10012,9 @@ mod tests {
     /// path reported `ToolUse`.
     #[test]
     fn cut_classify_exhausted_grammar_is_not_a_clip() {
-        assert_eq!(Cut::classify(None, true, true), None);
-        assert_eq!(Cut::classify(None, false, true), Some(Cut::Budget));
-        assert_eq!(Cut::classify(None, false, false), None);
-        assert_eq!(
-            Cut::classify(Some("###"), true, false),
-            Some(Cut::StopSequence("###".into())),
-        );
+        assert_eq!(Cut::classify(true, true), None);
+        assert_eq!(Cut::classify(false, true), Some(Cut::Budget));
+        assert_eq!(Cut::classify(false, false), None);
     }
 
     /// Stop sequence matching — the matched string is returned as the

@@ -98,7 +98,7 @@ pub struct Parsed {
 /// appending (partial structures are suppressed under
 /// [`Leniency::Streaming`], and degraded ones append). The regression
 /// tests below pin both.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StreamParser {
     syntax: CallSyntax,
     tools: Vec<crate::Tool>,

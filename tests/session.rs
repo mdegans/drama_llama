@@ -441,22 +441,11 @@ fn counting_prompt() -> Prompt {
     }
 }
 
-/// All the text a response carries, thoughts included — a stop sequence
-/// may fire mid-reasoning, and it must be absent there too.
-fn all_text(blocks: &[Block]) -> String {
-    blocks
-        .iter()
-        .filter_map(|b| match b {
-            Block::Text { text, .. } => Some(text.as_ref()),
-            Block::Thought { thought, .. } => Some(thought.as_ref()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// #122: a request stop sequence stops generation at its first match,
-/// reports `stop_reason: stop_sequence` with the match, and is not part
-/// of the output — batch and streaming alike.
+/// #122: a request stop sequence stops generation at its first match in
+/// text output, reports `stop_reason: stop_sequence` with the match, and
+/// is not part of the output — batch and streaming alike. Thoughts are
+/// not text output (a thinking model may count to 5 while reasoning), so
+/// only the prose is checked.
 #[test]
 #[ignore = "requires model"]
 fn stop_sequence_stops_generation_and_is_excluded() {
@@ -470,17 +459,43 @@ fn stop_sequence_stops_generation_and_is_excluded() {
     assert_eq!(response.stop_reason, Some(StopReason::StopSequence));
     assert_eq!(response.stop_sequence.as_deref(), Some("5"));
     let message: Message = response.inner.into();
-    let text = all_text(&message.content.0);
+    let text = texts_of(&message.content.0);
     assert!(!text.contains('5'), "the match must be cut: {text:?}");
     assert!(text.contains('4'), "generation stopped too early: {text:?}");
 
     let mut stream = session.complete_stream(&prompt).expect("stream");
     let streamed: Vec<Block> = stream.by_ref().collect();
-    let text = all_text(&streamed);
+    let text = texts_of(&streamed);
     assert!(!text.contains('5'), "the match must be cut: {text:?}");
     assert_eq!(
         stream.stop_reason(),
         Some((Some(StopReason::StopSequence), Some("5"))),
+    );
+}
+
+/// #122: stop sequences match text output, never dialect framing. A stop
+/// of `"\n"` matched against raw bytes killed a Qwen call at its opener
+/// (`<tool_call>\n`); the forced call now completes and dispatches.
+#[test]
+#[ignore = "requires model"]
+fn newline_stop_sequence_does_not_cut_a_tool_call() {
+    use misanthropic::response::StopReason;
+    let mut prompt = strawberry_turn_1_prompt();
+    prompt.stop_sequences = Some(vec![Cow::Borrowed("\n")]);
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
+
+    let response = session.complete_response(&prompt).expect("complete");
+    assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+    let message: Message = response.inner.into();
+    assert!(
+        message
+            .content
+            .0
+            .iter()
+            .any(|b| matches!(b, Block::ToolUse { .. })),
+        "{message:#?}",
     );
 }
 

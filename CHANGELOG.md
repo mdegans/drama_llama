@@ -89,16 +89,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the call in flight, Harmony blocks included.
 - **Request `stop_sequences` stop generation (#122).** They were read
   only after the fact, to label a turn that happened to end on one.
-  Generation now stops at the first match, the match is cut from the
-  output, and the response reports `stop_reason: stop_sequence` with
-  `stop_sequence` set — batch, `complete_text` and `complete_stream`
-  alike (the stream holds back text that could still grow into a
-  stop sequence). A stop sequence inside a tool call is treated as a
-  clip: the incomplete call is withheld. The predictor's stop-string
-  window is now sized from the stop strings' byte lengths too; it was
+  Generation now stops at the first match **in text output**, the
+  match is cut from the output, and the response reports
+  `stop_reason: stop_sequence` with `stop_sequence` set — batch,
+  `complete_text` and `complete_stream` alike (the stream holds back
+  text that could still grow into a stop sequence). Only prose
+  (`Block::Text`) is matched, through the dialect parser: never
+  framing (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`/`[ARGS]`,
+  Harmony headers, EOG pieces), never a tool call's input, never
+  thinking — a stop of `"\n"` matched against raw bytes killed every
+  Qwen call at its opener. (Anthropic's behavior inside `thinking` and
+  `tool_use` input is uncaptured; a stop never withholds a call.) The
+  predictor no longer carries a request's stops; its own stop-string
+  window is now sized from the stop strings' byte lengths too — it was
   sized from token-sequence lengths alone and missed any stop string
   longer than a token. New: `TokenPredictor::stop_string` /
-  `hit_token_limit` (and on `PiecePredictor`), `BlockStream::stop_reason`.
+  `hit_token_limit` (and on `PiecePredictor`),
+  `BlockStream::stop_reason`, `StreamParser: Clone`.
 - **blallama answers an undeserializable body with Anthropic's 400
   (#123).** `/v1/messages` and `/v1/messages/count_tokens` returned
   axum's plain-text 422 (or 415), which no Anthropic client parses; they

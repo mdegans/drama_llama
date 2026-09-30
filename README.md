@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/mdegans/drama_llama/graph/badge.svg)](https://codecov.io/gh/mdegans/drama_llama)
-[![tests](https://img.shields.io/badge/tests-761-blue)](#testing)
+[![tests](https://img.shields.io/badge/tests-769-blue)](#testing)
 [![license](https://img.shields.io/badge/license-RAIL--S-lightgrey)](https://github.com/mdegans/drama_llama/blob/main/LICENSE.md)
 
 `drama_llama` runs language models on your own hardware behind an API shaped
@@ -207,8 +207,8 @@ sampler-settings editor).
 
 ## Testing
 
-761 tests across 31 binaries in the default configuration — 602 that run in
-seconds and 159 that load real weights onto a real accelerator. The
+769 tests across 31 binaries in the default configuration — 609 that run in
+seconds and 160 that load real weights onto a real accelerator. The
 model-backed tier is `#[ignore]`d so the fast loop stays fast, and the whole
 topology — *which features* × *which tests* — lives in one place,
 [`scripts/test.py`]. The justfile delegates to that script, the git hooks call

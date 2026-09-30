@@ -17,7 +17,7 @@
 //! | `messages`         | [`ChatTemplate`] rendering               |
 //! | `tools`            | [`ChatTemplate`] (tools) + tool_choice   |
 //! | `tool_choice`      | [`grammar_for_prompt`] grammar compiler  |
-//! | `stop_sequences`   | [`Session`] — stops at the first match, cut from the output |
+//! | `stop_sequences`   | [`Session`] — first match in text output; cut from it |
 //! | `thinking`         | [`ChatTemplate`] — drives `enable_thinking` extra |
 //! | `max_tokens`       | [`Session`] — the sole generation cap    |
 //! | `signature` (on [`Block::Thought`]) | *repurposed* — see [`OPEN_THOUGHT_SIGNATURE`] |
