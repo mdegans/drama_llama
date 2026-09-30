@@ -375,8 +375,9 @@ fn texts_of(blocks: &[Block]) -> String {
 
 /// #121: a grammar-forced call cut off by `max_tokens` is a 200-shaped
 /// response, as on Anthropic — `stop_reason: max_tokens`, usage filled —
-/// not a `GrammarViolation`. The partial call is withheld: no `ToolUse`
-/// a client could dispatch, and none of its bytes seated as prose.
+/// not a `GrammarViolation`. The partial call is withheld (Anthropic
+/// returns it partial; deliberately not parity): no `ToolUse` a client
+/// could dispatch, and none of its bytes seated as prose.
 #[test]
 #[ignore = "requires model"]
 fn truncated_tool_call_is_max_tokens_with_the_call_withheld() {

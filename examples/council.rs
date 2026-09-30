@@ -330,7 +330,8 @@ fn file_call(
     let call = message.tool_use().ok_or_else(|| {
         // On the forced path, reached when the budget cut the call: the
         // turn comes back `max_tokens` with the partial call withheld
-        // (#121), as on Anthropic. Never silently absent.
+        // (#121) — Anthropic would return it partial. Never silently
+        // absent.
         format!(
             "☠ {}: forced call produced no tool use (stop reason: {:?})",
             seat.name, message.stop_reason,

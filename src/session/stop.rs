@@ -11,6 +11,19 @@
 //!   them.
 //! - Either way the turn reads `stop_reason: stop_sequence`.
 //!
+//! **Withholding the call is a deliberate deviation from Anthropic.**
+//! Anthropic *keeps* a call whose input a stop matched, its input cut at
+//! the match and then closed into valid JSON: with `stop_sequences:
+//! ["print("]` and a forced `write_file`, claude-haiku-4-5 answered
+//! `{"path":"hello.py","contents":"import datetime\n"}` under
+//! `stop_reason: stop_sequence` (captured 2026-09-30; streamed, the block
+//! gets its `content_block_stop` and the last `input_json_delta` closes
+//! the object; under `tool_choice: auto`, the same after a text block).
+//! That call looks complete and is not, which is a trap for any client
+//! that dispatches on a `tool_use` block rather than on `stop_reason`.
+//! The session (and so blallama) withholds it instead — better than
+//! parity. The stop reason and `stop_sequence` stay exactly Anthropic's.
+//!
 //! Never matched: **framing** and **thinking**. Framing is the dialect's
 //! markers (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`/`[ARGS]`,
 //! Harmony headers, EOG pieces) *and the whitespace that separates prose

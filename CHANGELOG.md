@@ -63,7 +63,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   clip handling on that stop reason. Now so does `Session`: the turn
   comes back `MaxTokens` with usage filled, and the incomplete call is
   **withheld** — no `ToolUse` a client could dispatch, none of its
-  bytes seated as prose (calls that closed before the cut stand). A cut
+  bytes seated as prose (calls that closed before the cut stand).
+  **Withholding is a deliberate deviation from Anthropic**, which
+  returns the cut call (captured 2026-09-30, claude-haiku-4-5, raw
+  bytes): unstreamed, partial input that is valid JSON missing a
+  required field (`{"path":"hello.py"}` for a `write_file` requiring
+  `contents`); streamed, a `tool_use` block that never gets
+  `content_block_stop`, its last `input_json_delta` unclosed. A call
+  that looks complete and isn't is a trap for any client that doesn't
+  gate on the stop reason; the stop reason stays Anthropic's. A cut
   outranks `ToolUse` in the stop reason, so a turn clipped mid-way
   through its second parallel call never reads as a finished call
   turn. **A `max_tokens` turn can therefore carry complete calls:
@@ -105,7 +113,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   through the dialect parser and sees only prose (`Block::Text`) and
   the string values of a tool call's input; a match in a call's input
   **withholds that call**, as a clip does, and the prose before it
-  stands. Never matched: thinking, and framing — the dialect's markers
+  stands. That too deliberately deviates from Anthropic, which keeps the
+  call with its input cut at the match but closed into valid JSON —
+  `stop_sequences: ["print("]` on a forced `write_file` gave
+  `{"path":"hello.py","contents":"import datetime\n"}` under
+  `stop_reason: stop_sequence`, streamed with a normal
+  `content_block_stop` (captured 2026-09-30, claude-haiku-4-5) — a
+  truncated call that looks finished. `stop_reason` and
+  `stop_sequence` match Anthropic's exactly. Never matched: thinking, and framing — the dialect's markers
   (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`/`[ARGS]`, Harmony
   headers, EOG pieces) and the whitespace between prose and a
   structure (`"Sure, checking.\n\n<tool_call>"`, `"</think>\n\n"`).
@@ -113,7 +128,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its opener, and matched against the prose the parser seats before a
   call, it still did. Whitespace inside prose, or ending a turn that
   finished cleanly, is text and matches. (Anthropic's behavior inside
-  `thinking` and `tool_use` input is uncaptured.) The
+  `thinking` is uncaptured.) The
   predictor no longer carries a request's stops; its own stop-string
   window is now sized from the stop strings' byte lengths too — it was
   sized from token-sequence lengths alone and missed any stop string

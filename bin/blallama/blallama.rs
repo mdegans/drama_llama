@@ -27,10 +27,10 @@
 //! unclosed one is representable, renders without its close marker, and
 //! the next request continues it. A truncated *tool call* is not: its
 //! arguments are a JSON value, and half an object has no representation.
-//! Such a turn comes back as Anthropic's does — `stop_reason: max_tokens`
-//! (or `stop_sequence`) — with the partial call withheld, so no client can
-//! dispatch it. It never round-trips, and no amount of future work changes
-//! that.
+//! Such a turn comes back with Anthropic's stop reason — `max_tokens` (or
+//! `stop_sequence`) — but with the partial call withheld, so no client can
+//! dispatch it (Anthropic returns it; see below). It never round-trips,
+//! and no amount of future work changes that.
 //!
 //! Practical consequence for clients: put **two cache breakpoints at the
 //! end of the prompt** rather than one. A mismatch then costs a single
@@ -51,6 +51,31 @@
 //! other unlucky draws, and answers `max_tokens` only if every draw
 //! loops. Anthropic has no such loop to guard against; here it is
 //! better than parity.
+//!
+//! # A cut call is withheld — Anthropic returns it
+//!
+//! A deliberate deviation. When a turn is cut *inside* a call, Anthropic
+//! still returns that call (captured 2026-09-30, claude-haiku-4-5, raw
+//! bytes, `write_file` requiring `path` and `contents`):
+//!
+//! - **Stop sequence matched in the input** (`stop_sequences:
+//!   ["print("]`): `stop_reason: stop_sequence`, `stop_sequence:
+//!   "print("`, and a `tool_use` whose input is cut at the match yet
+//!   closed, valid JSON — `{"path":"hello.py","contents":"import
+//!   datetime\n"}`. Streamed, the block ends with `content_block_stop`
+//!   like any other; under `tool_choice: auto`, the same after a text
+//!   block.
+//! - **`max_tokens` mid-input**: `stop_reason: max_tokens` and partial
+//!   input — unstreamed, valid JSON missing the required field
+//!   (`{"path":"hello.py"}`); streamed, the block never gets
+//!   `content_block_stop`, its last `input_json_delta` unclosed.
+//!
+//! blallama withholds such a call instead: the prose before it and any
+//! calls that closed before the cut stand; the stop reason (and
+//! `stop_sequence`) is exactly Anthropic's. A call that looks complete
+//! and isn't is a trap for any client that dispatches on a `tool_use`
+//! block rather than on `stop_reason` — which is what the section above
+//! tells clients not to do, but not all of them listen.
 
 use std::{
     num::{NonZeroU128, NonZeroUsize},

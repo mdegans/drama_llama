@@ -70,6 +70,18 @@ pub enum Leniency {
     /// the cut stand. A call the cut left malformed-looking, running to
     /// the end of input, is the call in flight and is withheld too.
     ///
+    /// **Not Anthropic parity, on purpose.** Anthropic returns the cut
+    /// call (captured 2026-09-30, claude-haiku-4-5, raw bytes): under
+    /// `stop_reason: max_tokens`, partial input — unstreamed, valid JSON
+    /// missing a required field (`{"path":"hello.py"}` for a
+    /// `write_file` that requires `contents`); streamed, a `tool_use`
+    /// block that never gets `content_block_stop`, its last
+    /// `input_json_delta` unclosed — and under `stop_reason:
+    /// stop_sequence`, input truncated at the match but closed, valid
+    /// JSON. A call that looks complete and is not is a trap for any
+    /// client that does not gate dispatch on `stop_reason`, so it is
+    /// withheld. The stop reason itself stays exactly Anthropic's.
+    ///
     /// One exception: a trigger-less dialect (bare-JSON, Llama 3.1)
     /// cannot tell a clipped call from clipped prose JSON — its call
     /// landmark is any `{` — so there the tail degrades as under

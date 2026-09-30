@@ -187,8 +187,10 @@ pub enum SessionError {
     ///
     /// *Not* raised for a turn cut short by `max_tokens`, the context
     /// limit, or a stop sequence (#121): that is an unfinished turn, not
-    /// a violation, and comes back `Ok` with that stop reason and the
-    /// incomplete call withheld — as Anthropic answers it.
+    /// a violation, and comes back `Ok` with that stop reason — as
+    /// Anthropic answers it — and the incomplete call withheld, which
+    /// Anthropic deliberately does not do (see
+    /// [`Leniency::Clipped`](crate::dialect::Leniency::Clipped)).
     #[error(
         "grammar violation: generation ended without satisfying the \
          active constraint; {} partial block(s) withheld from this \
@@ -7356,6 +7358,16 @@ struct CallOutcome {
 /// #122). Drives the `Clipped` parse (an incomplete call is withheld),
 /// exempts the turn from the grammar-violation check, and outranks
 /// every other signal in [`infer_stop_reason`].
+///
+/// The stop reason is Anthropic's; the content deliberately is not.
+/// Anthropic returns the call it cut (captured 2026-09-30,
+/// claude-haiku-4-5): on a stop sequence, input truncated at the match
+/// but closed, valid JSON; on `max_tokens`, partial input — valid JSON
+/// missing required fields unstreamed (`{"path":"hello.py"}` for a tool
+/// that requires `contents`), and a block that never gets its
+/// `content_block_stop` streamed. A cut call that looks complete is a
+/// trap for a client that doesn't gate on `stop_reason`, so both cuts
+/// withhold it instead — see `stop` for the stop-sequence capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Cut {
     /// `max_tokens` (or the context window) ran out.
