@@ -1454,6 +1454,47 @@ mod tests {
         assert!(!loops_a_call(&finished));
     }
 
+    /// #123: a body over the limit is Anthropic's 413
+    /// `request_too_large` in the error envelope, through the real
+    /// `DefaultBodyLimit` layer (shrunk to 16 bytes on a one-route
+    /// router, so a tiny body is oversized) on an ephemeral local port.
+    #[tokio::test]
+    async fn oversized_body_is_anthropic_413_envelope() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn accept(_: AnthropicJson<Prompt>) -> StatusCode {
+            StatusCode::OK
+        }
+        let app = Router::new()
+            .route("/v1/messages", post(accept))
+            .layer(DefaultBodyLimit::max(16));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let body = r#"{"model": "m", "max_tokens": 8, "messages": []}"#;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+
+        let (head, payload) =
+            response.split_once("\r\n\r\n").expect("an HTTP response");
+        assert!(head.starts_with("HTTP/1.1 413"), "{head}");
+        let value: serde_json::Value =
+            serde_json::from_str(payload).expect("a JSON envelope");
+        assert_eq!(value["type"], "error", "{value}");
+        assert_eq!(value["error"]["type"], "request_too_large", "{value}");
+    }
+
     /// #123: a tool whose schema interleaves required and optional
     /// properties (`zulu` required, `alpha` optional, `mike` required)
     /// deserializes. Anthropic keeps optionals in place and accepts this
