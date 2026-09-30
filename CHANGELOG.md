@@ -42,7 +42,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     neutralized — the grammar and parser key on them: names must
     match Anthropic's `^[a-zA-Z0-9_-]{1,64}$`, ids
     `^[a-zA-Z0-9_-]+$`, else `ChatTemplateError::InvalidIdentifier`
-    (a 400 on blallama).
+    (a 400 on blallama). **An empty tool-use id is now an error** on
+    every model with reserved pieces — every real one. A `ToolUse`
+    built with `ToolUse::new` and no `.with_id(..)` rendered fine
+    before and now fails; Anthropic rejects it too. Set an id on any
+    call echoed back as history, and the same id on its result.
+  - The dialect parser holds the names the *model* emits to the same
+    pattern: a call named `foo.bar` (Harmony keeps whatever follows
+    `functions.`), `get weather` or longer than 64 bytes degrades to
+    text like any malformed call (or is withheld when cut) instead of
+    seating a `ToolUse`. Seated, its name and `call_{n}_{name}` id
+    would have failed every later request on the transcript once the
+    client echoed it. The degraded text is then subject to containment
+    like any other free text.
   - Templates no longer act on a piece that content spells: a Qwen
     template does not split assistant text at a literal `</think>`,
     nor treat user text starting with a literal `<tool_response>` as a

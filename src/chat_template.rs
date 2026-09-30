@@ -2023,8 +2023,13 @@ impl Literals {
     }
 }
 
-/// Anthropic's pattern for a tool name, `^[a-zA-Z0-9_-]{1,64}$`.
-fn is_tool_name(s: &str) -> bool {
+/// Anthropic's pattern for a tool name, `^[a-zA-Z0-9_-]{1,64}$`. The
+/// dialect parser holds model-emitted names to it too, so a call the
+/// model names badly degrades to text instead of seating a name the
+/// next ingest would reject. (It cannot see the vocabulary, so a name
+/// of these characters that spells a reserved piece would still seat;
+/// no fleet vocabulary has such a piece — theirs are bracketed tags.)
+pub(crate) fn is_tool_name(s: &str) -> bool {
     (1..=64).contains(&s.len()) && is_identifier(s)
 }
 
