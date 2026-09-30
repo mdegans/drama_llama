@@ -69,6 +69,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A nullable-string tool argument on a tagged (Qwen XML) dialect
+  parses as the string the model wrote.** The grammar generates an
+  `Option<String>` parameter (`"type": ["string", "null"]`) raw, like
+  any string, but the parser JSON-parsed it: a `5` or `true` the model
+  wrote as text came back a number or boolean, `None` came back
+  `null`, and a `"quoted"` value or `{"a": 1}` lost its spelling, so
+  the turn re-rendered differently than it was generated. It is now
+  read raw, with JSON `null` its one non-string value. Enum-constrained
+  parameters are unchanged. Pinned in
+  `qwen_cache_stable_round_trips_scalar_args`.
 - **A Qwen3.6 tool call with a `null` or boolean argument re-renders
   as written.** The grammar has the model write a non-string
   parameter as JSON and the parser types it from that, but stock 3.6

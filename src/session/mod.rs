@@ -12426,8 +12426,8 @@ mod tests {
     /// `True`/`False`, drama_llama#120). The baked templates render
     /// every non-string value with `tojson`, the spelling the grammar
     /// makes the model emit, so the round trip is exact for each JSON
-    /// scalar — and a string-typed value that merely *looks* like one
-    /// stays the string the model wrote.
+    /// scalar — and a string-typed (or nullable-string) value that
+    /// merely *looks* like one stays the string the model wrote.
     #[test]
     fn qwen_cache_stable_round_trips_scalar_args() {
         use crate::Tool;
@@ -12485,6 +12485,13 @@ mod tests {
             city("1.0"),
             city("[1, 2]"),
             city("\"quoted\""),
+            // So does a nullable one — the grammar generates it raw
+            // too — bar JSON `null`, its one non-string value.
+            arg("detail", "true", "true".into()),
+            arg("detail", "5", "5".into()),
+            arg("detail", "None", "None".into()),
+            arg("detail", "\"quoted\"", "\"quoted\"".into()),
+            arg("detail", "{\"a\": 1}", "{\"a\": 1}".into()),
         ];
         for baked in [&crate::baked::QWEN36, &crate::baked::QWEN38] {
             let served = crate::baked::detect(baked.stock)
