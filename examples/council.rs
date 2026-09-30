@@ -327,16 +327,23 @@ fn file_call(
     assert_cache_hit(seat, &counts, first_call);
     seat.usage += counts;
     log::debug!("{} ▸ {message}", seat.name);
-    let call = message.tool_use().ok_or_else(|| {
-        // On the forced path, reached when the budget cut the call: the
-        // turn comes back `max_tokens` with the partial call withheld
-        // (#121) — Anthropic would return it partial. Never silently
-        // absent.
-        format!(
-            "☠ {}: forced call produced no tool use (stop reason: {:?})",
-            seat.name, message.stop_reason,
-        )
-    })?;
+    // Dispatch only a finished call. A turn the budget cut (#121)
+    // comes back `max_tokens` carrying the call it cut, if its name was
+    // whole — the members that completed and no more, as on Anthropic.
+    // Never silently absent, never filed half-written.
+    let call = message
+        .tool_use()
+        .filter(|_| {
+            message.stop_reason
+                == Some(misanthropic::response::StopReason::ToolUse)
+        })
+        .ok_or_else(|| {
+            format!(
+                "☠ {}: forced call produced no finished tool use (stop \
+                 reason: {:?})",
+                seat.name, message.stop_reason,
+            )
+        })?;
     let filing: Filing = serde_json::from_value(call.input.clone())
         .map_err(|e| format!("☠ {}: unparseable filing: {e}", seat.name))?;
     // Relay guard (#37 residual): the grammar forces the call's

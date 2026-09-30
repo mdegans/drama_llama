@@ -27,10 +27,10 @@
 //! unclosed one is representable, renders without its close marker, and
 //! the next request continues it. A truncated *tool call* is not: its
 //! arguments are a JSON value, and half an object has no representation.
-//! Such a turn comes back with Anthropic's stop reason — `max_tokens` (or
-//! `stop_sequence`) — but with the partial call withheld, so no client can
-//! dispatch it (Anthropic returns it; see below). It never round-trips,
-//! and no amount of future work changes that.
+//! Such a turn comes back as Anthropic's does — `stop_reason: max_tokens`
+//! (or `stop_sequence`) with the call cut short (see below) — and the call
+//! re-renders closed, which its KV never was. It never round-trips, and no
+//! amount of future work changes that.
 //!
 //! Practical consequence for clients: put **two cache breakpoints at the
 //! end of the prompt** rather than one. A mismatch then costs a single
@@ -52,30 +52,35 @@
 //! loops. Anthropic has no such loop to guard against; here it is
 //! better than parity.
 //!
-//! # A cut call is withheld — Anthropic returns it
+//! # A cut call comes back cut, as on Anthropic
 //!
-//! A deliberate deviation. When a turn is cut *inside* a call, Anthropic
-//! still returns that call (captured 2026-09-30, claude-haiku-4-5, raw
-//! bytes, `write_file` requiring `path` and `contents`):
+//! When a turn is cut *inside* a call, Anthropic still returns that call,
+//! and so does blallama — the same prompt drives a client the same way on
+//! both. Captured 2026-09-30 on claude-haiku-4-5, raw bytes, a `write_file`
+//! requiring `path` and `contents` (misanthropic's
+//! `misanthropic/test/data/stop/`):
 //!
-//! - **Stop sequence matched in the input** (`stop_sequences:
-//!   ["print("]`): `stop_reason: stop_sequence`, `stop_sequence:
-//!   "print("`, and a `tool_use` whose input is cut at the match yet
-//!   closed, valid JSON — `{"path":"hello.py","contents":"import
-//!   datetime\n"}`. Streamed, the block ends with `content_block_stop`
-//!   like any other; under `tool_choice: auto`, the same after a text
-//!   block.
-//! - **`max_tokens` mid-input**: `stop_reason: max_tokens` and partial
-//!   input — unstreamed, valid JSON missing the required field
-//!   (`{"path":"hello.py"}`); streamed, the block never gets
-//!   `content_block_stop`, its last `input_json_delta` unclosed.
+//! - **`max_tokens` mid-input** (`clip*.*`): `stop_reason: max_tokens`,
+//!   and the input holds only the members that *completed* — the one
+//!   being generated is dropped whole, however far it got
+//!   (`{"path":"hello.py"}`; 140 output tokens into a 200-word
+//!   `contents`, still `{"path":"story.txt"}`). Streamed, the
+//!   `input_json_delta` chunks stop at the last completed member and the
+//!   block never gets `content_block_stop`
+//!   ([`drama_llama::BlockStream::open_call_json`]).
+//! - **A stop sequence matched in the input** (`stop_sequence_tool.*`):
+//!   `stop_reason: stop_sequence`, `stop_sequence: "print("`, and a
+//!   `tool_use` whose string is cut right before the match, the JSON
+//!   closed — `{"path":"hello.py","contents":"import datetime\n"}`.
+//!   Generation stops at the match. Streamed, the block ends with
+//!   `content_block_stop` like any other; under `tool_choice: auto`, the
+//!   same after a text block.
 //!
-//! blallama withholds such a call instead: the prose before it and any
-//! calls that closed before the cut stand; the stop reason (and
-//! `stop_sequence`) is exactly Anthropic's. A call that looks complete
-//! and isn't is a trap for any client that dispatches on a `tool_use`
-//! block rather than on `stop_reason` — which is what the section above
-//! tells clients not to do, but not all of them listen.
+//! Either call looks complete and isn't, which is why clients gate
+//! dispatch on `stop_reason` (above). Nested containers keep their
+//! completed members at every depth — inferred; only the top level is
+//! captured. A call cut before its *name* is whole has nothing to return
+//! (Anthropic's block carries its name whole) and is left out.
 
 use std::{
     num::{NonZeroU128, NonZeroUsize},
@@ -919,7 +924,9 @@ fn resample_reason(
 
 /// The loop signature the Phase G postmortem found: a turn the budget
 /// cut (`max_tokens`) that had already repeated one call verbatim — same
-/// tool, same input. See the module docs.
+/// tool, same input. See the module docs. The call the cut truncated
+/// counts too, by the members it completed: equal to an earlier call's
+/// input, it was repeating it.
 fn loops_a_call(response: &MessageResponse) -> bool {
     let calls: Vec<_> = response
         .inner

@@ -20,6 +20,7 @@
 mod analyzer;
 mod emit;
 mod parse;
+mod partial;
 mod segment;
 
 pub use analyzer::{analyze_template, vocab_cross_check, AnalyzeError};
@@ -28,6 +29,9 @@ pub use emit::{
     DialectError, EmitOptions,
 };
 pub use parse::{parse_text, Leniency, ParseStatus, Parsed, StreamParser};
+pub(crate) use parse::{parse_text_open, OpenCall};
+pub(crate) use partial::cut_value;
+pub use partial::truncate_partial_object;
 
 use crate::json_canon::JsonSpacing;
 

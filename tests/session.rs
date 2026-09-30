@@ -375,12 +375,14 @@ fn texts_of(blocks: &[Block]) -> String {
 
 /// #121: a grammar-forced call cut off by `max_tokens` is a 200-shaped
 /// response, as on Anthropic — `stop_reason: max_tokens`, usage filled —
-/// not a `GrammarViolation`. The partial call is withheld (Anthropic
-/// returns it partial; deliberately not parity): no `ToolUse` a client
-/// could dispatch, and none of its bytes seated as prose.
+/// not a `GrammarViolation`. The call comes back as Anthropic returns
+/// one a clip cut: once its name is whole, a `ToolUse` whose input is
+/// an object of the members that completed (`{}` before any); none of
+/// its bytes seated as prose. Streamed, it is the last block, left open
+/// (`open_call_json`) — no `content_block_stop` on Anthropic.
 #[test]
 #[ignore = "requires model"]
-fn truncated_tool_call_is_max_tokens_with_the_call_withheld() {
+fn truncated_tool_call_is_max_tokens_with_its_completed_members() {
     use misanthropic::response::StopReason;
     // truncate hard
     let prompt =
@@ -389,6 +391,15 @@ fn truncated_tool_call_is_max_tokens_with_the_call_withheld() {
         .expect("session load")
         .quiet();
     let trigger = session.dialect().trigger().trim().to_string();
+    let inputs = |blocks: &[Block]| -> Vec<serde_json::Value> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolUse { call } => Some(call.input.clone()),
+                _ => None,
+            })
+            .collect()
+    };
 
     let response = session
         .complete_response(&prompt)
@@ -397,10 +408,9 @@ fn truncated_tool_call_is_max_tokens_with_the_call_withheld() {
     assert!(response.usage.output_tokens > 0, "usage must be filled");
     let message: Message = response.inner.into();
     let blocks = &message.content.0;
-    assert!(
-        !blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })),
-        "a clipped call must be withheld: {blocks:#?}",
-    );
+    let cut = inputs(blocks);
+    assert!(cut.len() <= 1, "{blocks:#?}");
+    assert!(cut.iter().all(serde_json::Value::is_object), "{blocks:#?}");
     let text = texts_of(blocks);
     assert!(
         trigger.is_empty() || !text.contains(&trigger),
@@ -410,10 +420,8 @@ fn truncated_tool_call_is_max_tokens_with_the_call_withheld() {
     // Streaming ends the same way.
     let mut stream = session.complete_stream(&prompt).expect("stream");
     let streamed: Vec<Block> = stream.by_ref().collect();
-    assert!(
-        !streamed.iter().any(|b| matches!(b, Block::ToolUse { .. })),
-        "{streamed:#?}",
-    );
+    let cut = inputs(&streamed);
+    assert!(cut.len() <= 1, "{streamed:#?}");
     let text = texts_of(&streamed);
     assert!(
         trigger.is_empty() || !text.contains(&trigger),
@@ -423,6 +431,20 @@ fn truncated_tool_call_is_max_tokens_with_the_call_withheld() {
         stream.stop_reason().and_then(|(reason, _)| reason),
         Some(StopReason::MaxTokens),
     );
+    if let Some(input) = cut.first() {
+        assert!(
+            matches!(streamed.last(), Some(Block::ToolUse { .. })),
+            "{streamed:#?}",
+        );
+        let open = stream.open_call_json().expect("the cut call is open");
+        let depth =
+            open.matches(['{', '[']).count() - open.matches(['}', ']']).count();
+        let closed = format!("{open}{}", "}".repeat(depth));
+        assert_eq!(
+            &serde_json::from_str::<serde_json::Value>(&closed).unwrap(),
+            input,
+        );
+    }
 }
 
 /// A prompt whose answer runs through "5" before it can end.

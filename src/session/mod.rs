@@ -187,10 +187,8 @@ pub enum SessionError {
     ///
     /// *Not* raised for a turn cut short by `max_tokens`, the context
     /// limit, or a stop sequence (#121): that is an unfinished turn, not
-    /// a violation, and comes back `Ok` with that stop reason — as
-    /// Anthropic answers it — and the incomplete call withheld.
-    /// Anthropic returns the partial call; withholding it is blallama's
-    /// deliberate deviation (see
+    /// a violation, and comes back `Ok` with that stop reason and the
+    /// call it cut, as Anthropic answers it (see
     /// [`Leniency::Clipped`](crate::dialect::Leniency::Clipped)).
     #[error(
         "grammar violation: generation ended without satisfying the \
@@ -5804,10 +5802,12 @@ impl<B: Backend> Session<B> {
 
         // A stop sequence is never part of the output (#122), here as
         // in `run_call`: the raw bytes end where the cut output does —
-        // before the stop, or before the call whose input matched. The
-        // recorded tip below stays LCP-only (no hash), which compares
-        // token ids, so the stop's leading tokens sitting in KV cannot
-        // be spliced under a render without them.
+        // before the stop, in prose or inside the call whose input
+        // matched (whose bytes then stop mid-value, unclosed: a cut call
+        // has no closed spelling). The recorded tip below stays LCP-only
+        // (no hash), which compares token ids, so the stop's leading
+        // tokens sitting in KV cannot be spliced under a render without
+        // them.
         let mut trimmed = trim_eos(&text, &self.engine).to_string();
         let hit = stop_filter.as_mut().and_then(|f| {
             f.finish(clipped);
@@ -5816,7 +5816,7 @@ impl<B: Backend> Session<B> {
         if let Some(hit) = hit {
             let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
             let parse = |prefix: &str| {
-                crate::dialect::parse_text(
+                crate::dialect::parse_text_open(
                     &parse_syntax,
                     &tool_refs,
                     prefix,
@@ -5824,12 +5824,16 @@ impl<B: Backend> Session<B> {
                     crate::dialect::Leniency::Clipped,
                 )
             };
+            // A prefix withholding a structure in flight, with no call
+            // to show for it, is not where any stop fell.
             let view = |prefix: &str| {
-                let parsed = parse(prefix);
-                (parsed.status == crate::dialect::ParseStatus::Complete)
-                    .then(|| merge_adjacent_prose(parsed.blocks))
+                let (parsed, open) = parse(prefix);
+                let complete =
+                    parsed.status == crate::dialect::ParseStatus::Complete;
+                (complete || open.is_some())
+                    .then(|| stop::stop_view((parsed, open), true))
             };
-            let blocks = merge_adjacent_prose(parse(&trimmed).blocks);
+            let blocks = stop::stop_view(parse(&trimmed), false);
             let (kept, _) = stop::cut_at_stop(blocks, &[&hit]);
             if let Some(at) = stop::raw_stop_cut(&trimmed, &kept, view) {
                 trimmed.truncate(at);
@@ -5973,9 +5977,11 @@ impl<B: Backend> Session<B> {
     /// Grammar-violation checks live on the batch methods — streaming callers
     /// see whatever partial output the model produced, with one exception
     /// shared with the batch path: a generation cut short (`max_tokens`, a
-    /// stop sequence) withholds an incomplete trailing call rather than
-    /// yielding its bytes as text. [`BlockStream::stop_reason`] reports
-    /// the ending once the stream is drained.
+    /// stop sequence) yields an incomplete trailing call cut short, as
+    /// Anthropic returns it, rather than its bytes as text.
+    /// [`BlockStream::stop_reason`] reports the ending once the stream is
+    /// drained, and [`BlockStream::open_call_json`] whether a clip left
+    /// the last call open.
     pub fn complete_stream<'s>(
         &'s mut self,
         prompt: &Prompt,
@@ -6348,9 +6354,9 @@ impl<B: Backend> Session<B> {
         //
         // `Clipped` when the generation was cut short (#121, #122): the
         // turn is legitimately unfinished, so an incomplete trailing
-        // call is *withheld* — never dispatchable, never seated as
-        // prose with its frame marker — while an unclosed thought
-        // still surfaces open.
+        // call comes back as Anthropic returns it — its input the
+        // members that completed, never seated as prose with its frame
+        // marker — while an unclosed thought still surfaces open.
         //
         // Adjacent same-kind prose is collapsed so `[Text, Text]`
         // becomes `[Text]` — lets a lone `Text` output serialize to
@@ -6364,39 +6370,48 @@ impl<B: Backend> Session<B> {
                 pre_opened_reasoning,
                 leniency,
             );
-            let withheld =
+            let in_flight =
                 parsed.status == crate::dialect::ParseStatus::NeedMoreInput;
-            (merge_adjacent_prose(parsed.blocks), withheld)
+            (merge_adjacent_prose(parsed.blocks), in_flight)
         };
         // A stop sequence (#122): the one the filter stopped on, or —
         // when the turn ended first — one in what the end flushed. The
-        // clipped parse is cut there by the same rules, everything
-        // after it gone (a call whose input matched included).
+        // clipped parse, a call in flight with its string kept, is cut
+        // there by the same rules, everything after it gone (a call
+        // whose input matched cut at the match).
         let hit = stop_filter.as_mut().and_then(|f| {
             f.finish(budget.is_some());
             f.hit().map(str::to_owned)
         });
-        let (blocks, cut, withheld) = match hit {
+        let (blocks, cut, in_flight) = match hit {
             // Its KV no longer matches the output either way.
             Some(stop) => {
-                let (blocks, _) = parse(crate::dialect::Leniency::Clipped);
+                let parsed = crate::dialect::parse_text_open(
+                    &parse_syntax,
+                    &tool_refs,
+                    &raw_text,
+                    pre_opened_reasoning,
+                    crate::dialect::Leniency::Clipped,
+                );
+                let blocks = stop::stop_view(parsed, false);
                 let (blocks, _) = stop::cut_at_stop(blocks, &[&stop]);
                 (blocks, Some(Cut::StopSequence(stop)), true)
             }
             None => {
-                let (blocks, withheld) = parse(if budget.is_some() {
+                let (blocks, in_flight) = parse(if budget.is_some() {
                     crate::dialect::Leniency::Clipped
                 } else {
                     crate::dialect::Leniency::Final
                 });
-                (blocks, budget, withheld)
+                (blocks, budget, in_flight)
             }
         };
 
         // Whether this turn may leave an auto-tip. A clipped turn whose
         // KV no longer matches its own output must not: a stop sequence
         // was cut out of `raw_text` but its leading tokens are in KV; a
-        // withheld call's bytes are in KV but in no block; and a turn
+        // cut call's bytes are in KV but no render reproduces them (half
+        // a value has no spelling, and a closed one closes); and a turn
         // cut mid-constraint carries a mid-structure sampler state the
         // next call would resume from. Such a turn still records its
         // prompt extent (breakpoints and all) — only the generated span
@@ -6406,7 +6421,7 @@ impl<B: Backend> Session<B> {
         // thought included — see `OPEN_THOUGHT_SIGNATURE`).
         let keep_tip = match &cut {
             None => true,
-            Some(Cut::Budget) => !constraint_incomplete && !withheld,
+            Some(Cut::Budget) => !constraint_incomplete && !in_flight,
             Some(Cut::StopSequence(_)) => false,
         };
 
@@ -6598,7 +6613,7 @@ impl<B: Backend> Session<B> {
         // hitting a stop sequence mid-structure is not a violation but
         // an unfinished turn, which Anthropic answers with a 200 and
         // `stop_reason: max_tokens` / `stop_sequence`, and the partial
-        // call is already withheld by the `Clipped` parse above. As an
+        // call is already cut short by the `Clipped` parse above. As an
         // error it cost two resamples that fail the same way (the
         // budget is the budget) and then a 500 on blallama, so clients
         // keying their clip handling on the stop reason never saw one.
@@ -6733,8 +6748,9 @@ impl<B: Backend> Session<B> {
     /// [`ToolChoice`] is `Method | Any` (grammar-forced) but the resulting
     /// block stream contains no [`Block::ToolUse`](crate::Block::ToolUse)
     /// though the budget did not run out. A call cut off by `max_tokens`
-    /// or a stop sequence is not an error: it is withheld, and
-    /// [`Self::complete_response`] reports the stop reason (#121).
+    /// or a stop sequence is not an error: it comes back cut short, as
+    /// Anthropic returns it, and [`Self::complete_response`] reports the
+    /// stop reason (#121).
     ///
     /// [`ToolChoice`]: crate::ToolChoice
     pub fn complete_blocks(
@@ -7356,27 +7372,25 @@ struct CallOutcome {
 
 /// Why a generation was *cut short* rather than finished — the two
 /// endings Anthropic answers with a 200 and an unfinished turn (#121,
-/// #122). Drives the `Clipped` parse (an incomplete call is withheld),
-/// exempts the turn from the grammar-violation check, and outranks
-/// every other signal in [`infer_stop_reason`].
+/// #122). Drives the `Clipped` parse (an incomplete call comes back cut
+/// short), exempts the turn from the grammar-violation check, and
+/// outranks every other signal in [`infer_stop_reason`].
 ///
-/// The stop reason is Anthropic's; the content deliberately is not.
-/// Anthropic returns the call it cut (captured 2026-09-30,
+/// Stop reason and content are both Anthropic's (captured 2026-09-30,
 /// claude-haiku-4-5; misanthropic's `misanthropic/test/data/stop/`
-/// `clip_tool.*` and `stop_sequence_tool.*`): on a stop sequence, input truncated at the match
-/// but closed, valid JSON; on `max_tokens`, partial input — valid JSON
-/// missing required fields unstreamed (`{"path":"hello.py"}` for a tool
-/// that requires `contents`), and a block that never gets its
-/// `content_block_stop` streamed. A cut call that looks complete is a
-/// trap for a client that doesn't gate on `stop_reason`, so both cuts
-/// withhold it instead — see `stop` for the stop-sequence capture.
+/// `clip*.*` and `stop_sequence_tool.*`). On `max_tokens` the call in
+/// flight keeps only its completed members (`{"path":"hello.py"}` for a
+/// `write_file` cut mid-`contents`) and, streamed, never gets its
+/// `content_block_stop` ([`BlockStream::open_call_json`]); on a stop
+/// sequence it keeps the string the match fell in, cut before the
+/// match, and closes (see `stop`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Cut {
     /// `max_tokens` (or the context window) ran out.
     Budget,
     /// A request stop sequence matched in client-visible text — prose,
-    /// or a call's input, which withholds the call: the matched string,
-    /// the output already cut at it.
+    /// or a call's input, which cuts the call there: the matched
+    /// string, the output already cut at it.
     StopSequence(String),
 }
 
@@ -7549,16 +7563,18 @@ fn infer_stop_reason(
 /// the whole character arrives with the token that closes it
 /// (issue #55).
 ///
-/// Endings match the batch path's. A request stop sequence ends the
-/// stream and never appears in it — prose that could still grow into
-/// one is held back until it can't (#122). Only text is matched — prose
-/// and a call's input values, a match there withholding the call —
-/// never framing (whitespace beside a structure included) or a thought
-/// (see `stop::StopFilter`). A generation cut short (`max_tokens`, a
-/// stop sequence) withholds an incomplete trailing call instead of
-/// yielding its bytes as text (#121). Like the batch
-/// path, it halts once the grammar is exhausted. Once drained,
-/// [`Self::stop_reason`] reports the ending the batch path would.
+/// Endings match the batch path's, block for block. A request stop
+/// sequence ends the stream and never appears in it — prose that could
+/// still grow into one is held back until it can't (#122). Only text is
+/// matched — prose and a call's input values, the call in flight's
+/// included, a match there cutting the call at it — never framing
+/// (whitespace beside a structure included) or a thought (see
+/// `stop::StopFilter`). A generation cut short (`max_tokens`, a stop
+/// sequence) yields an incomplete trailing call cut short, as Anthropic
+/// returns it, instead of its bytes as text (#121). Like the batch path,
+/// it halts once the grammar is exhausted. Once drained,
+/// [`Self::stop_reason`] reports the ending the batch path would, and
+/// [`Self::open_call_json`] whether the last call was left open.
 pub struct BlockStream<'engine, B: Backend> {
     predictor: crate::PiecePredictor<'engine, B>,
     /// Re-parse-per-tick streaming parser over the session dialect
@@ -7598,12 +7614,26 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
             .map(|(reason, seq)| (*reason, seq.as_deref()))
     }
 
+    /// Once drained, when the budget cut the turn inside a call: that
+    /// call — the last block yielded, its input the members that
+    /// completed — as JSON left open where the cut fell
+    /// (`{"path":"story.txt"`). An Anthropic stream sends exactly that
+    /// as the block's `input_json_delta` and never sends its
+    /// `content_block_stop` (captured 2026-09-30, claude-haiku-4-5;
+    /// misanthropic's `misanthropic/test/data/stop/clip_long_tool.*`), so an
+    /// SSE bridge leaves this block open. `None` otherwise — a call cut
+    /// by a stop sequence is closed, and gets its `content_block_stop`
+    /// on Anthropic too.
+    pub fn open_call_json(&self) -> Option<&str> {
+        self.drained.then(|| self.filter.open_call_json()).flatten()
+    }
+
     /// End of generation: flush, pick the leniency, settle the ending.
     fn drain(&mut self) {
         self.drained = true;
         let budget = Cut::of(&self.predictor);
-        // Final pass. Cut short: an incomplete trailing call is
-        // withheld (`Leniency::Clipped`). Otherwise partial trailing
+        // Final pass. Cut short: an incomplete trailing call comes back
+        // cut short (`Leniency::Clipped`). Otherwise partial trailing
         // structures degrade to Text / Thought per the Final-leniency
         // contract. Held-back marker-prefix bytes flush either way —
         // and may themselves complete a stop sequence.

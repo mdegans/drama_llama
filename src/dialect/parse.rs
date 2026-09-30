@@ -22,7 +22,8 @@
 //! `BlockParser::finish` contract; Session decides whether that is a
 //! grammar violation. [`Leniency::Clipped`] is the end of a generation
 //! that was *cut short* (`max_tokens`, a stop sequence): an incomplete
-//! call is withheld, an incomplete thought surfaces open.
+//! call comes back as Anthropic returns one — its input the members
+//! that completed — and an incomplete thought surfaces open.
 //!
 //! ## Coercion & healing (llama.cpp mapper parity)
 //!
@@ -40,6 +41,9 @@ use serde_json::Value;
 use crate::prompt::{Block, ToolUse};
 use crate::Tool;
 
+use super::partial::{
+    marker_holdback, read_partial, unclosed_json, Flavor, OpenStrings,
+};
 use super::{harmony, CallSyntax, Family, ReasoningMode};
 
 /// Whether the parse saw a complete structure or ran out of input
@@ -58,32 +62,32 @@ pub enum Leniency {
     /// End of generation: partials degrade to [`Block::Text`].
     Final,
     /// End of a generation that was cut short — `max_tokens` ran out
-    /// or a stop sequence fired (#121, #122). An incomplete **call** is
-    /// withheld, exactly as under [`Self::Streaming`] (and reported as
-    /// [`ParseStatus::NeedMoreInput`]); an incomplete **thought**
-    /// surfaces as an open thought, exactly as under [`Self::Final`].
+    /// or a stop sequence fired (#121, #122). An incomplete **call**
+    /// comes back as Anthropic returns one a clip cut: a
+    /// [`Block::ToolUse`] whose input holds only the members that
+    /// *completed*, the one in flight dropped whole ([`Parsed::status`]
+    /// still [`ParseStatus::NeedMoreInput`]: the call never closed). An
+    /// incomplete **thought** surfaces as an open thought, exactly as
+    /// under [`Self::Final`].
     ///
-    /// Withheld rather than degraded because a half-emitted call has
-    /// no representation (half a JSON value is not a value) and must
-    /// never be dispatchable — nor seated as prose, where its frame
-    /// marker poisons the next ingest. The calls that *closed* before
-    /// the cut stand. A call the cut left malformed-looking, running to
-    /// the end of input, is the call in flight and is withheld too.
+    /// This is Anthropic parity, captured 2026-09-30 on
+    /// claude-haiku-4-5 (raw bytes; misanthropic's
+    /// `misanthropic/test/data/stop/` `clip*.*`): a forced `write_file`
+    /// cut mid-`contents` came back `{"path":"hello.py"}` under
+    /// `stop_reason: max_tokens`, and 140 output tokens into a 200-word
+    /// `contents` string, still `{"path":"story.txt"}`. The same prompt
+    /// must drive a client the same way on both backends, and a client
+    /// that gates dispatch on `stop_reason` (as it must) never
+    /// dispatches it. Nested containers keep their completed members at
+    /// every depth, the one in progress dropped — inferred, as only the
+    /// top level is captured. The calls that closed before the cut
+    /// stand unchanged.
     ///
-    /// **Not Anthropic parity, on purpose.** Anthropic returns the cut
-    /// call (captured 2026-09-30, claude-haiku-4-5, raw bytes; see
-    /// misanthropic's `misanthropic/test/data/stop/` `clip_tool.*`,
-    /// `stop_sequence_tool.*`, `stop_sequence_text_tool.*`, and the
-    /// requests in `misanthropic/test/data/requests/`): under
-    /// `stop_reason: max_tokens`, partial input — unstreamed, valid JSON
-    /// missing a required field (`{"path":"hello.py"}` for a
-    /// `write_file` that requires `contents`); streamed, a `tool_use`
-    /// block that never gets `content_block_stop`, its last
-    /// `input_json_delta` unclosed — and under `stop_reason:
-    /// stop_sequence`, input truncated at the match but closed, valid
-    /// JSON. A call that looks complete and is not is a trap for any
-    /// client that does not gate dispatch on `stop_reason`, so it is
-    /// withheld. The stop reason itself stays exactly Anthropic's.
+    /// Withheld instead: a call whose *name* the cut left incomplete
+    /// (Anthropic's `tool_use` block carries its name whole, so there
+    /// is nothing to return), and one the cut left unreadable, running
+    /// to the end of input. Neither is seated as prose, where its frame
+    /// marker would poison the next ingest.
     ///
     /// One exception: a trigger-less dialect (bare-JSON, Llama 3.1)
     /// cannot tell a clipped call from clipped prose JSON — its call
@@ -97,6 +101,30 @@ pub enum Leniency {
 pub struct Parsed {
     pub blocks: Vec<Block>,
     pub status: ParseStatus,
+}
+
+/// The call section a parse ran out of input inside, with a name to
+/// show for it — what a cut leaves of a call in flight (#121, #122; see
+/// [`Leniency::Clipped`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OpenCall {
+    /// What a clip returns: any calls the unclosed section completed
+    /// that a streaming parse holds back with it (array-wrapped JSON),
+    /// then the call cut short, its input the members that completed.
+    pub calls: Vec<ToolUse>,
+    /// The last call's input with the string value in flight kept as
+    /// far as it is known to be text ([`OpenStrings::Held`]) — what a
+    /// stop sequence is matched against.
+    pub held_input: Value,
+    /// The same, every byte of that string kept ([`OpenStrings::Raw`])
+    /// — what locates a stop's cut in the raw generation.
+    pub raw_input: Value,
+    /// The last call's input as JSON left open where the cut fell
+    /// (`{"path":"story.txt"`): what Anthropic streams as a clipped
+    /// call's `input_json_delta`, with no `content_block_stop` after it.
+    /// `None` when the last call closed (an array-wrapped section cut
+    /// between calls).
+    pub partial_json: Option<String>,
 }
 
 /// Streaming adapter over [`parse_text`]: accumulate pieces, re-parse
@@ -125,6 +153,8 @@ pub struct StreamParser {
     /// Bytes of `blocks[stable_blocks]` (a still-growing trailing
     /// `Text`) already yielded as deltas.
     text_bytes_emitted: usize,
+    /// The call the last re-parse ended inside, if any.
+    open: Option<OpenCall>,
 }
 
 impl StreamParser {
@@ -140,6 +170,7 @@ impl StreamParser {
             text: String::new(),
             stable_blocks: 0,
             text_bytes_emitted: 0,
+            open: None,
         }
     }
 
@@ -159,15 +190,23 @@ impl StreamParser {
 
     /// Flush a generation that was cut short (`max_tokens`, a stop
     /// sequence) per [`Leniency::Clipped`]: an incomplete trailing
-    /// call is withheld instead of degrading to text; everything else
-    /// flushes as [`Self::finish`] would.
+    /// call comes back with the members of its input that completed,
+    /// instead of degrading to text; everything else flushes as
+    /// [`Self::finish`] would.
     pub fn finish_clipped(&mut self) -> Vec<Block> {
         self.reparse(Leniency::Clipped)
     }
 
-    /// Whether the text so far ends in a structure a clipped flush
-    /// withholds ([`Leniency::Clipped`]): framing in flight, not prose.
-    pub(crate) fn withholds(&self) -> bool {
+    /// The call the text so far ends inside, as of the last push or
+    /// flush — a streaming parse yields nothing of it until it closes.
+    pub(crate) fn open(&self) -> Option<&OpenCall> {
+        self.open.as_ref()
+    }
+
+    /// Whether the text so far ends in a structure in flight
+    /// ([`Leniency::Clipped`] reports it unfinished): framing, not
+    /// prose.
+    pub(crate) fn in_flight(&self) -> bool {
         let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
         parse_text(
             &self.syntax,
@@ -245,13 +284,14 @@ impl StreamParser {
 
     fn reparse(&mut self, leniency: Leniency) -> Vec<Block> {
         let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
-        let parsed = parse_text(
+        let (parsed, open) = parse_text_open(
             &self.syntax,
             &tool_refs,
             &self.text,
             self.pre_opened_reasoning,
             leniency,
         );
+        self.open = open;
         let blocks = parsed.blocks;
         let last = blocks.len().saturating_sub(1);
         let mut out = Vec::new();
@@ -313,6 +353,19 @@ pub fn parse_text(
     pre_opened_reasoning: bool,
     leniency: Leniency,
 ) -> Parsed {
+    parse_text_open(syntax, tools, text, pre_opened_reasoning, leniency).0
+}
+
+/// [`parse_text`], plus the call the text ends inside when there is one
+/// with a name to show for it (under [`Leniency::Streaming`] and
+/// [`Leniency::Clipped`]; `Final` degrades it instead).
+pub(crate) fn parse_text_open(
+    syntax: &CallSyntax,
+    tools: &[&Tool],
+    text: &str,
+    pre_opened_reasoning: bool,
+    leniency: Leniency,
+) -> (Parsed, Option<OpenCall>) {
     let mut p = Parser {
         syntax,
         tools,
@@ -322,12 +375,14 @@ pub fn parse_text(
         next_id: 0,
         status: ParseStatus::Complete,
         leniency,
+        open: None,
     };
     p.run(pre_opened_reasoning);
-    Parsed {
+    let parsed = Parsed {
         blocks: p.blocks,
         status: p.status,
-    }
+    };
+    (parsed, p.open)
 }
 
 struct Parser<'a> {
@@ -339,6 +394,9 @@ struct Parser<'a> {
     next_id: usize,
     status: ParseStatus,
     leniency: Leniency,
+    /// The call the input ended inside ([`OpenCall`]), read just before
+    /// [`Self::incomplete`] handles it.
+    open: Option<OpenCall>,
 }
 
 impl<'a> Parser<'a> {
@@ -427,23 +485,33 @@ impl<'a> Parser<'a> {
         });
     }
 
-    /// The incomplete tail starting at `from`: suppress or degrade
-    /// per leniency.
+    /// Whether the dialect is trigger-less bare JSON, whose call
+    /// landmark is any `{` (see [`Leniency::Clipped`]). Scoped to the
+    /// family, not to `trigger()` alone: Harmony has no single trigger
+    /// either, but its landmarks are all frame markers.
+    fn bare_json(&self) -> bool {
+        self.syntax.family == Family::JsonNative
+            && self.syntax.trigger().is_empty()
+    }
+
+    /// The incomplete tail starting at `from`: suppress or degrade per
+    /// leniency. Under `Clipped`, a call in flight ([`Self::open`])
+    /// comes back cut short.
     fn incomplete(&mut self, from: usize) {
         let withhold = match self.leniency {
             Leniency::Streaming => true,
             Leniency::Final => false,
-            // See `Leniency::Clipped` for the bare-JSON exception.
-            // Scoped to the family, not to `trigger()` alone: Harmony
-            // has no single trigger either, but its landmarks are all
-            // frame markers.
-            Leniency::Clipped => {
-                !(self.syntax.family == Family::JsonNative
-                    && self.syntax.trigger().is_empty())
-            }
+            Leniency::Clipped => !self.bare_json(),
         };
         if withhold {
             self.status = ParseStatus::NeedMoreInput;
+            if self.leniency == Leniency::Clipped {
+                let calls = self.open.iter().flat_map(|open| &open.calls);
+                let calls: Vec<Block> = calls
+                    .map(|call| Block::ToolUse { call: call.clone() })
+                    .collect();
+                self.blocks.extend(calls);
+            }
         } else {
             let tail = self.text[from..].to_string();
             self.push_text(&tail);
@@ -791,6 +859,7 @@ impl<'a> Parser<'a> {
                     // Loop continues; opener consumed at loop head.
                 }
                 CallOutcome::Incomplete => {
+                    self.open = self.read_open_call(call_start);
                     self.incomplete(call_start);
                     return;
                 }
@@ -814,7 +883,8 @@ impl<'a> Parser<'a> {
                     };
                     // A cut can leave a call malformed-looking (the
                     // clip, not the model, broke it); running to the
-                    // end of input it is the call in flight, withheld.
+                    // end of input it is the call in flight — with
+                    // nothing readable to return, withheld.
                     if upto == self.text.len()
                         && self.leniency == Leniency::Clipped
                     {
@@ -1089,14 +1159,17 @@ impl<'a> Parser<'a> {
             return CallOutcome::Malformed;
         }
         self.skip_ws();
-        let Some((json_len, complete)) = balanced_json_len(self.rest()) else {
-            return if self.rest().trim().is_empty() {
+        let body = self.rest();
+        let Some((json_len, complete)) = balanced_json_len(body) else {
+            return if body.trim().is_empty() {
+                self.open = self.open_input(&name, body, Flavor::Json);
                 CallOutcome::Incomplete
             } else {
                 CallOutcome::Malformed
             };
         };
         if !complete {
+            self.open = self.open_input(&name, body, Flavor::Json);
             return CallOutcome::Incomplete;
         }
         let body = &self.rest()[..json_len];
@@ -1120,6 +1193,12 @@ impl<'a> Parser<'a> {
     }
 
     fn push_call(&mut self, name: String, input: Value) {
+        let call = self.make_call(name, input);
+        self.blocks.push(Block::ToolUse { call });
+    }
+
+    /// A call with the next id in parse order.
+    fn make_call(&mut self, name: String, input: Value) -> ToolUse {
         let call = ToolUse {
             id: Cow::Owned(format!("call_{}_{}", self.next_id, name)),
             name: Cow::Owned(name),
@@ -1128,7 +1207,7 @@ impl<'a> Parser<'a> {
             caller: None,
         };
         self.next_id += 1;
-        self.blocks.push(Block::ToolUse { call });
+        call
     }
 
     fn parse_tagged_call(&mut self) -> CallOutcome {
@@ -1219,12 +1298,7 @@ impl<'a> Parser<'a> {
     /// otherwise parse as JSON after pythonism normalization with
     /// bounded brace healing; fall back to a raw string.
     fn coerce_value(&self, tool: &str, param: &str, raw: &str) -> Value {
-        let schema = self.schema_for(tool, param);
-        let is_string = match &schema {
-            Some(s) => s.get("type").and_then(|t| t.as_str()) == Some("string"),
-            None => true,
-        };
-        if is_string {
+        if self.is_string_param(tool, param) {
             return Value::String(raw.to_string());
         }
         let trimmed = raw.trim();
@@ -1236,6 +1310,278 @@ impl<'a> Parser<'a> {
             return v;
         }
         Value::String(raw.to_string())
+    }
+
+    /// Whether `param` of `tool` takes its raw text as a string: typed
+    /// `string`, or unknown.
+    fn is_string_param(&self, tool: &str, param: &str) -> bool {
+        match self.schema_for(tool, param) {
+            Some(s) => s.get("type").and_then(|t| t.as_str()) == Some("string"),
+            None => true,
+        }
+    }
+
+    /// Read the call the input ended inside, starting at its opener
+    /// (`call_start`): what a cut leaves of it ([`OpenCall`]). `None`
+    /// when its name is incomplete or its input unreadable — withheld —
+    /// and under [`Leniency::Final`], which degrades it instead.
+    fn read_open_call(&mut self, call_start: usize) -> Option<OpenCall> {
+        if self.leniency == Leniency::Final || self.bare_json() {
+            return None;
+        }
+        // `Copy` the borrow out of `self`, so the slices outlive `&mut`.
+        let text: &'a str = &self.text[call_start..];
+        let opener = self.syntax.per_call_start.as_str();
+        let text = text
+            .strip_prefix(opener)
+            .or_else(|| text.trim_start().strip_prefix(opener))?;
+        let f = &self.syntax.function;
+        match self.syntax.family {
+            Family::TagWithTagged => self.open_tagged(text),
+            Family::TagWithJson => {
+                let (name, args) = named(text, &f.name_prefix, &f.name_suffix)?;
+                self.open_input(name, args, Flavor::Json)
+            }
+            Family::TagWithDict => {
+                let args_open = match self.syntax.arguments.start.as_str() {
+                    "" => "{",
+                    start => start,
+                };
+                let (name, _) = named(text, &f.name_prefix, args_open)?;
+                let args = &text[f.name_prefix.len() + name.len()..];
+                let quote = self.syntax.arguments.string_quote.clone();
+                self.open_input(name, args, Flavor::Dict { quote: &quote })
+            }
+            Family::JsonNative => self.open_json_native(text),
+            Family::None | Family::Harmony => None,
+        }
+    }
+
+    /// A call with its name read and its input `args` in flight — JSON
+    /// or Gemma's dict, empty when not begun.
+    fn open_input(
+        &mut self,
+        name: &str,
+        args: &str,
+        flavor: Flavor<'_>,
+    ) -> Option<OpenCall> {
+        if self.leniency == Leniency::Final {
+            return None;
+        }
+        let empty = || Value::Object(serde_json::Map::new());
+        let (input, held_input, raw_input, open) = if args.trim().is_empty() {
+            (empty(), empty(), empty(), 1)
+        } else {
+            let read = |strings| read_partial(args, flavor, strings);
+            let kept =
+                read(OpenStrings::Drop).filter(|t| t.value.is_object())?;
+            (
+                kept.value,
+                read(OpenStrings::Held)?.value,
+                read(OpenStrings::Raw)?.value,
+                kept.open,
+            )
+        };
+        let partial_json = Some(unclosed_json(&input, open));
+        let call = self.make_call(name.to_owned(), input);
+        Some(OpenCall {
+            calls: vec![call],
+            held_input,
+            raw_input,
+            partial_json,
+        })
+    }
+
+    /// TAG_WITH_TAGGED (Qwen XML): the parameters whose close marker
+    /// arrived, coerced as a closed call's are; the one in flight kept
+    /// (held, raw) only when it is a string parameter.
+    fn open_tagged(&mut self, text: &'a str) -> Option<OpenCall> {
+        let f = &self.syntax.function;
+        let a = self.syntax.arguments.clone();
+        let (name, mut rest) = named(text, &f.name_prefix, &f.name_suffix)?;
+        let mut members = serde_json::Map::new();
+        let mut in_flight: Option<(&str, &str)> = None;
+        loop {
+            let before = rest.len();
+            let Some(after) = rest.strip_prefix(a.name_prefix.as_str()) else {
+                break;
+            };
+            let Some((key, after)) = split_marker(after, &a.name_suffix) else {
+                break;
+            };
+            let Some(value) = after.strip_prefix(a.value_prefix.as_str())
+            else {
+                break;
+            };
+            let Some((raw, after)) = split_marker(value, &a.value_suffix)
+            else {
+                if self.is_string_param(name, key) {
+                    in_flight = Some((key, value));
+                }
+                break;
+            };
+            members.insert(key.to_owned(), self.coerce_value(name, key, raw));
+            rest = after.strip_prefix(a.separator.as_str()).unwrap_or(after);
+            // Progress guard: degenerate markers can match nothing.
+            if rest.len() == before {
+                break;
+            }
+        }
+        let with = |value: Option<&str>| {
+            let mut members = members.clone();
+            if let (Some((key, _)), Some(value)) = (in_flight, value) {
+                members.insert(key.to_owned(), Value::String(value.into()));
+            }
+            Value::Object(members)
+        };
+        let raw = in_flight.map(|(_, v)| v);
+        let held =
+            raw.map(|v| &v[..v.len() - marker_holdback(v, &a.value_suffix)]);
+        let (held_input, raw_input) = (with(held), with(raw));
+        let input = Value::Object(members);
+        let partial_json = Some(unclosed_json(&input, 1));
+        let call = self.make_call(name.to_owned(), input);
+        Some(OpenCall {
+            calls: vec![call],
+            held_input,
+            raw_input,
+            partial_json,
+        })
+    }
+
+    /// JSON_NATIVE with a trigger (Hermes): the envelope in flight,
+    /// `{"name": …, "arguments": {…}}` — or an array of them, whose
+    /// completed elements come back whole.
+    fn open_json_native(&mut self, text: &str) -> Option<OpenCall> {
+        let read = |strings| read_partial(text, Flavor::Json, strings);
+        let kept = read(OpenStrings::Drop)?;
+        let (held, raw) = (
+            read(OpenStrings::Held)?.value,
+            read(OpenStrings::Raw)?.value,
+        );
+        let Value::Array(envelopes) = kept.value else {
+            let (name, input, open) =
+                self.open_envelope(&kept.value, kept.open, &kept.path)?;
+            return Some(self.open_native_call(
+                Vec::new(),
+                name,
+                input,
+                open,
+                &held,
+                &raw,
+            ));
+        };
+        // Array-wrapped: the last element is in flight when a container
+        // inside it is still open.
+        let in_flight = kept.open >= 2;
+        let closed = envelopes.len() - usize::from(in_flight);
+        let calls = envelopes[..closed]
+            .iter()
+            .map(|env| self.map_json_call(env))
+            .collect::<Option<Vec<_>>>()?;
+        let calls: Vec<ToolUse> = calls
+            .into_iter()
+            .map(|(name, input)| self.make_call(name, input))
+            .collect();
+        let at =
+            |value: &Value| value.get(closed).cloned().unwrap_or(Value::Null);
+        let envelope = in_flight
+            .then(|| {
+                self.open_envelope(
+                    &envelopes[closed],
+                    kept.open - 1,
+                    &kept.path[1..],
+                )
+            })
+            .flatten();
+        if let Some((name, input, open)) = envelope {
+            return Some(self.open_native_call(
+                calls,
+                name,
+                input,
+                open,
+                &at(&held),
+                &at(&raw),
+            ));
+        }
+        // Cut between calls, or before the next one's name is whole:
+        // the calls that closed stand, and nothing is open.
+        let last = calls.last()?.input.clone();
+        Some(OpenCall {
+            calls,
+            held_input: last.clone(),
+            raw_input: last,
+            partial_json: None,
+        })
+    }
+
+    /// One envelope in flight: its name (which must have completed),
+    /// its arguments so far, and how many of their containers are open.
+    fn open_envelope(
+        &self,
+        envelope: &Value,
+        open: usize,
+        path: &[String],
+    ) -> Option<(String, Value, usize)> {
+        let (name, input) = self.map_json_call(envelope)?;
+        let args_field = leaf(&self.syntax.json.args_field, "arguments");
+        let function_field = &self.syntax.json.function_field;
+        // The keys leading from the envelope to its arguments.
+        let to_args: Vec<&str> = if self.syntax.json.fun_name_is_key {
+            vec![name.as_str()]
+        } else if !function_field.is_empty()
+            && envelope.get(function_field).is_some_and(Value::is_object)
+        {
+            vec![function_field.as_str(), args_field]
+        } else {
+            vec![args_field]
+        };
+        let begun = to_args
+            .iter()
+            .try_fold(envelope, |v, key| v.get(key))
+            .is_some();
+        let open = if !begun {
+            // Not begun: `{}`, still to come.
+            1
+        } else if path.len() >= to_args.len()
+            && path.iter().zip(&to_args).all(|(p, k)| p == k)
+        {
+            open - to_args.len()
+        } else {
+            0
+        };
+        Some((name, input, open))
+    }
+
+    /// The [`OpenCall`] for an envelope read by [`Self::open_envelope`];
+    /// `held`/`raw` are the same envelope read with its string in
+    /// flight kept.
+    fn open_native_call(
+        &mut self,
+        mut calls: Vec<ToolUse>,
+        name: String,
+        input: Value,
+        open: usize,
+        held: &Value,
+        raw: &Value,
+    ) -> OpenCall {
+        // The arguments with the string in flight — unless it is not
+        // arguments at all (double-encoded, say): then as they stand.
+        let args = |envelope: &Value| {
+            self.map_json_call(envelope)
+                .map(|(_, args)| args)
+                .filter(Value::is_object)
+                .unwrap_or_else(|| input.clone())
+        };
+        let (held_input, raw_input) = (args(held), args(raw));
+        let partial_json = Some(unclosed_json(&input, open));
+        calls.push(self.make_call(name, input));
+        OpenCall {
+            calls,
+            held_input,
+            raw_input,
+            partial_json,
+        }
     }
 
     /// TAG_WITH_DICT (Gemma 4): `call:name{key:value,…}` after the
@@ -1563,6 +1909,34 @@ impl<'a> Parser<'a> {
         };
         Some((name, args))
     }
+}
+
+/// `text` past `prefix`, split at `suffix` into a call's name and what
+/// follows it (see [`split_marker`]). `None` until the name is whole:
+/// non-empty, at most 256 bytes, its suffix arrived.
+fn named<'t>(
+    text: &'t str,
+    prefix: &str,
+    suffix: &str,
+) -> Option<(&'t str, &'t str)> {
+    let (name, rest) = split_marker(text.strip_prefix(prefix)?, suffix)?;
+    (!name.is_empty() && name.len() <= 256).then_some((name, rest))
+}
+
+/// Split `text` at the first `marker`: what precedes it and what
+/// follows. A marker whose trailing whitespace the input has not
+/// reached yet (`">"` of `">\n"`, at the end) counts as arrived — that
+/// whitespace is framing, not content.
+fn split_marker<'t>(text: &'t str, marker: &str) -> Option<(&'t str, &'t str)> {
+    if let Some(at) = text.find(marker) {
+        return Some((&text[..at], &text[at + marker.len()..]));
+    }
+    let core = marker.trim_end();
+    let at = text.rfind(core).filter(|_| !core.is_empty())?;
+    let tail = &text[at + core.len()..];
+    marker[core.len()..]
+        .starts_with(tail)
+        .then(|| (&text[..at], ""))
 }
 
 enum CallOutcome {
@@ -3613,132 +3987,387 @@ mod tests {
         }
     }
 
-    /// Cut anywhere inside a call, the call is withheld — no
-    /// `ToolUse`, and none of its bytes seated as prose (the frame
-    /// marker would poison the next ingest) — while the prose before it
-    /// stands. `Final` on the same input is the contrast: it degrades
-    /// the partial call into `Text`. A call that does parse at a cut
-    /// (only its close marker missing) must be the whole call.
+    /// Every dialect with tool calls, as a test names it.
+    fn call_dialects() -> [(&'static str, CallSyntax); 5] {
+        [
+            ("qwen_xml", CallSyntax::qwen_xml()),
+            ("hermes_json", CallSyntax::hermes_json()),
+            ("mistral", mistral_tag_json()),
+            ("gemma4", CallSyntax::gemma4()),
+            ("harmony", CallSyntax::gpt_oss()),
+        ]
+    }
+
+    /// Prose to put before a call: Harmony carries none beside one.
+    fn prose_for(syntax: &CallSyntax) -> &'static str {
+        match syntax.family {
+            Family::Harmony => "",
+            _ => "Let me check. ",
+        }
+    }
+
+    /// Parse `text` clipped, and stream it a char at a time then flush
+    /// clipped: the two must agree block for block (prose merged), and
+    /// on the call left open. Returns the batch parse and its open call.
+    fn clipped_both_ways(
+        syntax: &CallSyntax,
+        tool: &Tool,
+        text: &str,
+    ) -> (Parsed, Option<OpenCall>) {
+        let (parsed, open) =
+            parse_text_open(syntax, &[tool], text, false, Leniency::Clipped);
+        let mut p =
+            StreamParser::new(syntax.clone(), vec![tool.clone()], false);
+        let mut streamed: Vec<Block> = text
+            .chars()
+            .flat_map(|c| p.push(c.encode_utf8(&mut [0; 4])))
+            .collect();
+        streamed.extend(p.finish_clipped());
+        assert_eq!(
+            merge_text(streamed),
+            merge_text(parsed.blocks.clone()),
+            "{:?}: stream != batch on {text:?}",
+            syntax.family,
+        );
+        assert_eq!(p.open(), open.as_ref(), "{:?}: {text:?}", syntax.family);
+        (parsed, open)
+    }
+
+    /// Cut anywhere inside a call, the call comes back as Anthropic
+    /// returns one a clip cut (#121): its input holds exactly the members
+    /// that completed, in order, the one in flight dropped whole — or,
+    /// before its name is whole, it is withheld. None of its bytes are
+    /// ever seated as prose (the frame marker would poison the next
+    /// ingest), the prose before it stands, and the stream agrees.
     #[test]
-    fn clipped_withholds_a_partial_call_and_keeps_the_prose() {
-        let input = json!({"city": "Paris", "days": 3, "detail": "x"});
+    fn clipped_returns_the_completed_members_of_a_cut_call() {
+        let input = json!({"city": "Paris", "days": 3, "detail": "sunny"});
+        let members: Vec<_> = input.as_object().unwrap().iter().collect();
         let t = tool("get_weather");
-        let prose = "Let me check. ";
-        for syntax in [
-            CallSyntax::hermes_json(),
-            CallSyntax::qwen_xml(),
-            CallSyntax::gemma4(),
-            mistral_tag_json(),
-        ] {
+        for (name, syntax) in call_dialects() {
+            let prose = prose_for(&syntax);
             let call =
                 render_reference(&syntax, &[("get_weather", &input)]).unwrap();
             let full = format!("{prose}{call}");
+            let closers = [
+                syntax.per_call_end.trim(),
+                syntax.section_end.trim(),
+                syntax.function.close.trim(),
+            ]
+            .into_iter()
+            .filter(|m| !m.is_empty())
+            .collect::<Vec<_>>();
+            let mut seen = [false; 4];
+            let mut last_count = 0;
             // From the whole trigger on: a trigger is one special token,
             // so a clip never leaves half of one.
-            let from = prose.len() + syntax.trigger().len();
-            let mut degraded_somewhere = false;
-            for i in from..full.len() {
+            let from = prose.len() + syntax.trigger().len().max(1);
+            for i in from..=full.len() {
                 if !full.is_char_boundary(i) {
                     continue;
                 }
                 let cut = &full[..i];
-                let clipped =
-                    parse_text(&syntax, &[&t], cut, false, Leniency::Clipped);
-                let calls = calls_of(&clipped.blocks);
-                if !calls.is_empty() {
-                    // The call's value closed before the cut (only its
-                    // close marker is missing): it stands, exactly as
-                    // under Final — but only whole.
-                    assert_eq!(
-                        calls,
-                        [("get_weather", &input)],
-                        "{:?} cut at {i}: a partial call was dispatchable",
-                        syntax.family,
-                    );
+                let (parsed, open) = clipped_both_ways(&syntax, &t, cut);
+                // At most a close marker's first byte: markers are one
+                // special token each, so no real clip leaves that.
+                let text = texts_of(&parsed.blocks);
+                let extra = text.trim_end().strip_prefix(prose.trim_end());
+                let extra = extra.map(str::trim).unwrap_or("?");
+                assert!(
+                    extra.is_empty()
+                        || closers.iter().any(|m| m.starts_with(extra)),
+                    "{name} cut at {i}: call bytes leaked into prose: {text:?}",
+                );
+                let calls = calls_of(&parsed.blocks);
+                assert!(calls.len() <= 1, "{name} cut at {i}: {calls:?}");
+                let Some((call_name, got)) = calls.first() else {
+                    assert!(open.is_none(), "{name} cut at {i}");
+                    assert_eq!(last_count, 0, "{name} cut at {i}: call lost");
                     continue;
+                };
+                assert_eq!(*call_name, "get_weather", "{name} cut at {i}");
+                let got = got.as_object().expect("an object");
+                // A prefix of the members, each whole.
+                assert!(got.len() >= last_count, "{name} cut at {i}");
+                for ((k, v), (want_k, want_v)) in got.iter().zip(&members) {
+                    assert_eq!((k, v), (*want_k, *want_v), "{name} cut at {i}");
                 }
-                assert_eq!(
-                    clipped.status,
-                    ParseStatus::NeedMoreInput,
-                    "{:?} cut at {i}: {:#?}",
-                    syntax.family,
-                    clipped.blocks,
-                );
-                assert_eq!(
-                    texts_of(&clipped.blocks).trim_end(),
-                    prose.trim_end(),
-                    "{:?} cut at {i}: partial call leaked into prose",
-                    syntax.family,
-                );
-                let fin =
-                    parse_text(&syntax, &[&t], cut, false, Leniency::Final);
-                // (Not necessarily the marker itself: a dialect with a
-                // section opener consumes it before the call degrades.)
-                degraded_somewhere |=
-                    texts_of(&fin.blocks).trim_end() != prose.trim_end();
+                last_count = got.len();
+                seen[got.len()] = true;
+                match (parsed.status, &open) {
+                    (ParseStatus::NeedMoreInput, Some(open)) => {
+                        // What the stream would send before the cut
+                        // parses, closed, to the same input.
+                        let partial = open.partial_json.as_deref().unwrap();
+                        let closers = "}".repeat(
+                            partial.matches('{').count()
+                                - partial.matches('}').count(),
+                        );
+                        let closed: Value = serde_json::from_str(&format!(
+                            "{partial}{closers}"
+                        ))
+                        .unwrap();
+                        assert_eq!(&closed, calls[0].1, "{name} cut at {i}");
+                    }
+                    // Closed, or only a section closer to come.
+                    (_, None) => {
+                        assert_eq!(got.len(), 3, "{name} cut at {i}");
+                    }
+                    other => panic!("{name} cut at {i}: {other:?}"),
+                }
             }
-            assert!(
-                degraded_somewhere,
-                "{:?}: Final never degraded a partial call — the contrast \
-                 this test leans on is gone",
-                syntax.family,
-            );
+            assert_eq!(seen, [true; 4], "{name}: every member count occurs");
         }
     }
 
-    /// Harmony has no single trigger — its call landmark is a
-    /// recipient-bearing header — but every one is a frame marker, so a
-    /// clipped Harmony call is withheld like any other (the bare-JSON
-    /// exception is scoped to that family, not to an empty `trigger()`).
+    /// The captured points, per dialect: cut before any member, the
+    /// input is `{}`; mid the first, still `{}`; mid the second after a
+    /// complete first, the first alone.
     #[test]
-    fn clipped_withholds_a_partial_harmony_call() {
-        let syntax = CallSyntax::gpt_oss();
+    fn clipped_at_the_captured_points() {
+        let input = json!({"city": "Paris", "detail": "sunny spells"});
+        let t = tool("get_weather");
+        for (name, syntax) in call_dialects() {
+            let full = format!(
+                "{}{}",
+                prose_for(&syntax),
+                render_reference(&syntax, &[("get_weather", &input)]).unwrap(),
+            );
+            let at =
+                |needle: &str, past: usize| full.find(needle).unwrap() + past;
+            for (i, want) in [
+                (at("city", 0), json!({})),
+                (at("Paris", 3), json!({})),
+                (at("sunny", 3), json!({"city": "Paris"})),
+            ] {
+                let (parsed, _) = clipped_both_ways(&syntax, &t, &full[..i]);
+                assert_eq!(
+                    calls_of(&parsed.blocks),
+                    [("get_weather", &want)],
+                    "{name}: cut {:?}",
+                    &full[..i],
+                );
+                assert_eq!(parsed.status, ParseStatus::NeedMoreInput);
+            }
+        }
+    }
+
+    /// Nested containers (inferred): the completed members kept at every
+    /// depth, the one in flight dropped. Qwen XML carries a non-string
+    /// parameter as one JSON value, so there the whole member is in
+    /// flight until its close marker.
+    #[test]
+    fn clipped_nested_input_keeps_completed_members_at_every_depth() {
+        let t = Tool::builder("get_weather")
+            .description("test")
+            .schema(json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "opts": {"type": "object"},
+                },
+            }))
+            .build()
+            .unwrap();
+        // Keys in sorted order: Gemma's dict renders nested maps sorted.
+        let input = json!({
+            "city": "Paris",
+            "opts": {"lang": "french", "units": "metric"},
+        });
+        for (name, syntax) in call_dialects() {
+            let full = format!(
+                "{}{}",
+                prose_for(&syntax),
+                render_reference(&syntax, &[("get_weather", &input)]).unwrap(),
+            );
+            let cut = &full[..full.find("metric").unwrap() + 3];
+            let (parsed, open) = clipped_both_ways(&syntax, &t, cut);
+            let want = match syntax.family {
+                Family::TagWithTagged => json!({"city": "Paris"}),
+                _ => json!({"city": "Paris", "opts": {"lang": "french"}}),
+            };
+            assert_eq!(
+                calls_of(&parsed.blocks),
+                [("get_weather", &want)],
+                "{name}"
+            );
+            let open = open.expect("open");
+            let partial = open.partial_json.unwrap();
+            match syntax.family {
+                Family::TagWithTagged => {
+                    assert_eq!(partial, r#"{"city":"Paris""#, "{name}")
+                }
+                _ => assert_eq!(
+                    partial, r#"{"city":"Paris","opts":{"lang":"french""#,
+                    "{name}",
+                ),
+            }
+            // A stop is matched against the string in flight.
+            let units = open.held_input.pointer("/opts/units");
+            match syntax.family {
+                Family::TagWithTagged => assert_eq!(units, None, "{name}"),
+                _ => assert_eq!(units, Some(&json!("met")), "{name}"),
+            }
+        }
+    }
+
+    /// Parallel calls: the ones that closed before the cut stand
+    /// unchanged; only the one in flight is cut short.
+    #[test]
+    fn clipped_parallel_calls_cut_only_the_last() {
+        let t = tool("get_weather");
+        let a = json!({"city": "Paris", "detail": "one"});
+        let b = json!({"city": "Oslo", "detail": "two"});
+        for (name, syntax) in call_dialects() {
+            let render = |calls: &[(&str, &Value)]| {
+                render_reference(&syntax, calls).unwrap()
+            };
+            // Hermes has no per-call opener: one section per call.
+            let calls = match syntax.family {
+                Family::JsonNative => format!(
+                    "{}\n{}",
+                    render(&[("get_weather", &a)]),
+                    render(&[("get_weather", &b)]),
+                ),
+                _ => render(&[("get_weather", &a), ("get_weather", &b)]),
+            };
+            let full = format!("{}{calls}", prose_for(&syntax));
+            let cut = &full[..full.find("two").unwrap() + 1];
+            let (parsed, _) = clipped_both_ways(&syntax, &t, cut);
+            assert_eq!(
+                calls_of(&parsed.blocks),
+                [
+                    ("get_weather", &a),
+                    ("get_weather", &json!({"city": "Oslo"}))
+                ],
+                "{name}: {parsed:#?}",
+            );
+            // The ids are the parse order's, cut call included.
+            let ids: Vec<_> = parsed
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolUse { call } => Some(call.id.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ids, ["call_0_get_weather", "call_1_get_weather"]);
+        }
+    }
+
+    /// A call whose input closed but whose dialect close marker the cut
+    /// took keeps its full input.
+    #[test]
+    fn clipped_before_the_close_marker_keeps_the_whole_input() {
         let t = tool("get_weather");
         let input = json!({"city": "Paris", "days": 3});
-        let full =
+        let mut syntax = mistral_tag_json();
+        syntax.function.close = "</fn>".into();
+        let text = r#"[TOOL_CALLS]get_weather[ARGS]{"city":"Paris","days":3}"#;
+        let (parsed, open) = clipped_both_ways(&syntax, &t, text);
+        assert_eq!(calls_of(&parsed.blocks), [("get_weather", &input)]);
+        assert_eq!(
+            open.unwrap().partial_json.as_deref(),
+            Some(r#"{"city":"Paris","days":3}"#),
+        );
+        // Qwen XML, cut inside `</function>`.
+        let syntax = CallSyntax::qwen_xml();
+        let call =
             render_reference(&syntax, &[("get_weather", &input)]).unwrap();
-        for i in 1..full.len() {
-            if !full.is_char_boundary(i) {
-                continue;
-            }
-            let clipped = parse_text(
-                &syntax,
-                &[&t],
-                &full[..i],
-                false,
-                Leniency::Clipped,
+        let cut = &call[..call.find("</function>").unwrap() + 4];
+        let (parsed, _) = clipped_both_ways(&syntax, &t, cut);
+        assert_eq!(calls_of(&parsed.blocks), [("get_weather", &input)]);
+    }
+
+    /// Array-wrapped JSON calls hold every element back until the array
+    /// closes; cut, the elements that closed come back whole, the one in
+    /// flight cut short — or, cut between elements, nothing is left open.
+    #[test]
+    fn clipped_array_wrapped_calls() {
+        let syntax = CallSyntax {
+            family: Family::JsonNative,
+            section_start: "[TOOL_CALLS]".into(),
+            json: crate::dialect::JsonFields {
+                tools_array_wrapped: true,
+                ..Default::default()
+            },
+            ..CallSyntax::default()
+        };
+        let t = tool("get_weather");
+        let one = r#"{"name": "get_weather", "arguments": {"city": "Paris"}}"#;
+        let text = format!(
+            r#"[TOOL_CALLS][{one}, {{"name": "get_weather", "arguments": {{"city": "Oslo", "detail": "cl"#
+        );
+        let (parsed, open) = clipped_both_ways(&syntax, &t, &text);
+        assert_eq!(
+            calls_of(&parsed.blocks),
+            [
+                ("get_weather", &json!({"city": "Paris"})),
+                ("get_weather", &json!({"city": "Oslo"})),
+            ],
+        );
+        let open = open.unwrap();
+        assert_eq!(open.partial_json.as_deref(), Some(r#"{"city":"Oslo""#));
+        assert_eq!(open.held_input, json!({"city": "Oslo", "detail": "cl"}));
+
+        for text in [
+            format!("[TOOL_CALLS][{one}, "),
+            format!(r#"[TOOL_CALLS][{one}, {{"name": "get_wea"#),
+        ] {
+            let (parsed, open) = clipped_both_ways(&syntax, &t, &text);
+            assert_eq!(
+                calls_of(&parsed.blocks),
+                [("get_weather", &json!({"city": "Paris"}))],
+                "{text:?}",
             );
-            let calls = calls_of(&clipped.blocks);
-            if !calls.is_empty() {
-                assert_eq!(
-                    calls,
-                    [("get_weather", &input)],
-                    "cut at {i}: a partial call was dispatchable",
-                );
-                continue;
-            }
-            assert_eq!(clipped.status, ParseStatus::NeedMoreInput, "cut {i}");
-            let text = texts_of(&clipped.blocks);
-            assert!(
-                !text.contains("<|") && !text.contains("functions."),
-                "cut at {i}: partial call leaked into prose: {text:?}",
-            );
+            assert_eq!(open.unwrap().partial_json, None, "{text:?}");
         }
+    }
+
+    /// Qwen XML: the string parameter in flight is kept for matching as
+    /// far as it is known to be text — a tail that could be the start of
+    /// its close marker is held back — and raw, every byte.
+    #[test]
+    fn qwen_open_string_holds_back_a_close_marker_prefix() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        let text = "<tool_call>\n<function=get_weather>\n<parameter=city>\n\
+                    Paris\n<parameter=detail>\nimport datetime\n</para";
+        // `city` never closed its value: the text runs on into what
+        // looks like another parameter, so all of it is the value.
+        let (_, open) = clipped_both_ways(&syntax, &t, text);
+        let open = open.unwrap();
+        assert_eq!(open.calls[0].input, json!({}));
+        let text = "<tool_call>\n<function=get_weather>\n<parameter=city>\n\
+                    Paris\n</parameter>\n<parameter=detail>\nimport datetime\n</para";
+        let (_, open) = clipped_both_ways(&syntax, &t, text);
+        let open = open.unwrap();
+        assert_eq!(open.calls[0].input, json!({"city": "Paris"}));
+        assert_eq!(
+            open.held_input,
+            json!({"city": "Paris", "detail": "import datetime"}),
+        );
+        assert_eq!(
+            open.raw_input,
+            json!({"city": "Paris", "detail": "import datetime\n</para"}),
+        );
     }
 
     /// `[TOOL_CALLS]name[ARGS]` with nothing after it is a call whose
     /// arguments are still coming, not a malformed one: the streaming
     /// parser waits instead of yielding the frame as prose, and a clip
-    /// there withholds it.
+    /// there returns the call with no members.
     #[test]
     fn tag_json_call_at_its_args_marker_is_incomplete() {
         let syntax = mistral_tag_json();
         let t = tool("get_weather");
         for head in ["[TOOL_CALLS]get_weather[ARGS]", "[TOOL_CALLS]x[ARGS] "] {
-            let clipped =
-                parse_text(&syntax, &[&t], head, false, Leniency::Clipped);
+            let (clipped, _) = clipped_both_ways(&syntax, &t, head);
             assert_eq!(clipped.status, ParseStatus::NeedMoreInput, "{head:?}");
-            assert!(clipped.blocks.is_empty(), "{head:?}: {clipped:#?}");
+            let calls = calls_of(&clipped.blocks);
+            assert_eq!(calls.len(), 1, "{head:?}: {clipped:#?}");
+            assert_eq!(calls[0].1, &json!({}), "{head:?}");
+            assert!(texts_of(&clipped.blocks).is_empty(), "{head:?}");
         }
 
         let mut p = StreamParser::new(syntax, vec![t], false);
@@ -3751,45 +4380,6 @@ mod tests {
             calls_of(&out),
             [("get_weather", &json!({"city": "Paris", "days": 3}))],
         );
-    }
-
-    /// Calls that closed before the cut stand; only the one in flight is
-    /// withheld. A turn cut mid-way through its second parallel call
-    /// still carries the first.
-    #[test]
-    fn clipped_keeps_the_calls_that_closed() {
-        let t = tool("get_weather");
-        let a = json!({"city": "Paris", "days": 3});
-        let b = json!({"city": "Oslo", "days": 5});
-        for syntax in [
-            CallSyntax::hermes_json(),
-            CallSyntax::qwen_xml(),
-            mistral_tag_json(),
-        ] {
-            let first =
-                render_reference(&syntax, &[("get_weather", &a)]).unwrap();
-            let second =
-                render_reference(&syntax, &[("get_weather", &b)]).unwrap();
-            // Past the second trigger, short of the second value's close.
-            let cut_at = first.len() + syntax.trigger().len() + 4;
-            let cut = format!("{first}{second}");
-            let parsed = parse_text(
-                &syntax,
-                &[&t],
-                &cut[..cut_at],
-                false,
-                Leniency::Clipped,
-            );
-            let calls = calls_of(&parsed.blocks);
-            assert_eq!(calls.len(), 1, "{:?}: {:#?}", syntax.family, parsed);
-            assert_eq!(calls[0].1, &a);
-            assert!(
-                !texts_of(&parsed.blocks).contains(syntax.trigger().trim()),
-                "{:?}: {:#?}",
-                syntax.family,
-                parsed.blocks,
-            );
-        }
     }
 
     /// An unclosed thought is not withheld: a clip mid-reasoning
@@ -3833,29 +4423,5 @@ mod tests {
         let fin = parse_text(&syntax, &[&t], text, false, Leniency::Final);
         assert_eq!(clipped.blocks, fin.blocks);
         assert_eq!(texts_of(&clipped.blocks), text);
-    }
-
-    /// The streaming flush agrees with the batch parse: pieces of prose
-    /// and a partial call, then `finish_clipped`, yield the prose and
-    /// never the call's bytes.
-    #[test]
-    fn stream_finish_clipped_withholds_the_partial_call() {
-        let syntax = CallSyntax::hermes_json();
-        let t = tool("get_weather");
-        let call = render_reference(
-            &syntax,
-            &[("get_weather", &json!({"city": "Paris", "days": 3}))],
-        )
-        .unwrap();
-        let text = format!("Checking. {}", &call[..call.len() / 2]);
-        let mut p = StreamParser::new(syntax.clone(), vec![t], false);
-        let mut out = Vec::new();
-        for chunk in text.as_bytes().chunks(3) {
-            // ASCII fixture, so byte chunks are char chunks.
-            out.extend(p.push(std::str::from_utf8(chunk).unwrap()));
-        }
-        out.extend(p.finish_clipped());
-        assert!(calls_of(&out).is_empty(), "{out:#?}");
-        assert_eq!(texts_of(&out).trim_end(), "Checking.");
     }
 }

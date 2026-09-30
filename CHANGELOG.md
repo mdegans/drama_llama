@@ -61,49 +61,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and answered HTTP 500 `api_error`. Anthropic answers 200 with
   `stop_reason: max_tokens` and the partial turn, and clients key their
   clip handling on that stop reason. Now so does `Session`: the turn
-  comes back `MaxTokens` with usage filled, and the incomplete call is
-  **withheld** — no `ToolUse` a client could dispatch, none of its
-  bytes seated as prose (calls that closed before the cut stand).
-  **Withholding is a deliberate deviation from Anthropic**, which
-  returns the cut call (captured 2026-09-30, claude-haiku-4-5, raw
-  bytes; see misanthropic's
-  `misanthropic/test/data/stop/clip_tool.*`, requests in `misanthropic/test/data/requests/`): unstreamed, partial input that is valid JSON missing a
-  required field (`{"path":"hello.py"}` for a `write_file` requiring
-  `contents`); streamed, a `tool_use` block that never gets
-  `content_block_stop`, its last `input_json_delta` unclosed. A call
-  that looks complete and isn't is a trap for any client that doesn't
-  gate on the stop reason; the stop reason stays Anthropic's. A cut
+  comes back `MaxTokens` with usage filled, and the incomplete call
+  comes back **as Anthropic returns it**: a `ToolUse` whose input holds
+  only the members that *completed* — the one being generated dropped
+  whole, however far it got — and none of its bytes seated as prose;
+  calls that closed before the cut stand unchanged. Captured
+  2026-09-30 on claude-haiku-4-5, raw bytes (misanthropic's
+  `misanthropic/test/data/stop/clip*.*`, requests in
+  `misanthropic/test/data/requests/`): a `write_file` cut mid-`contents`
+  came back `{"path":"hello.py"}`, and 140 output tokens into a
+  200-word `contents` string still `{"path":"story.txt"}`; streamed,
+  the `input_json_delta` chunks stop at the last completed member and
+  the block never gets `content_block_stop`. `{}` when no member
+  completed. Nested containers keep their completed members at every
+  depth, the one in progress dropped (inferred — only the top level is
+  captured). A call whose input closed but whose dialect close marker
+  was cut keeps its whole input. A call cut before its *name* is whole
+  has nothing to return and is left out. The same prompt must drive a
+  client the same way on both backends. A cut
   outranks `ToolUse` in the stop reason, so a turn clipped mid-way
   through its second parallel call never reads as a finished call
-  turn. **A `max_tokens` turn can therefore carry complete calls:
-  clients must gate dispatch on `stop_reason: tool_use`, never on the
-  presence of a `ToolUse` block** — as on Anthropic. One exception in
-  blallama, deliberately better than parity: a cut turn that had
-  already repeated a call verbatim (same tool, same input — the
-  identical-call loop the old grammar-violation check caught, plan
-  Phase G) is resampled on the warm cache like the other unlucky
-  draws, and answered `max_tokens` only if every draw loops. The
-  mechanism is a third parse leniency,
+  turn. **A `max_tokens` turn can therefore carry complete calls, and
+  a cut one that looks complete: clients must gate dispatch on
+  `stop_reason: tool_use`, never on the presence of a `ToolUse`
+  block** — as on Anthropic. One exception in blallama, deliberately
+  better than parity: a cut turn that had already repeated a call
+  verbatim (same tool, same input — the identical-call loop the old
+  grammar-violation check caught, plan Phase G) is resampled on the
+  warm cache like the other unlucky draws, and answered `max_tokens`
+  only if every draw loops. The mechanism is a third parse leniency,
   `dialect::Leniency::Clipped` (and `StreamParser::finish_clipped`):
-  incomplete calls withheld as under `Streaming`, unclosed thoughts
-  surfaced open as under `Final`. Bare-JSON dialects are exempt — any
-  `{` is their call landmark, so a clipped structured output keeps its
-  text. A forced call that finishes on the budget's last token still
-  reports `ToolUse` — streamed too: `complete_stream` now halts on an
-  exhausted grammar as the batch path does, and reads the ending by
-  the same rule. `GrammarViolation` remains for a constraint that
-  failed with budget to spare. A clipped turn whose KV no longer
-  matches its output (call withheld, or cut mid-constraint) records
-  its prompt extent but no auto-tip, leaving the generated span to the
-  next call's LCP walk.
+  incomplete calls cut short, unclosed thoughts surfaced open as under
+  `Final`. Bare-JSON dialects are exempt — any `{` is their call
+  landmark, so a clipped structured output keeps its text. A forced
+  call that finishes on the budget's last token still reports
+  `ToolUse` — streamed too: `complete_stream` now halts on an exhausted
+  grammar as the batch path does, and reads the ending by the same
+  rule; `BlockStream::open_call_json` reports the cut call's input as
+  the JSON an Anthropic stream leaves open (`{"path":"story.txt"`), for
+  an SSE bridge that must not send its `content_block_stop`.
+  `GrammarViolation` remains for a constraint that failed with budget
+  to spare. A clipped turn whose KV no longer matches its output (a cut
+  call, which re-renders closed, or a cut mid-constraint) records its
+  prompt extent but no auto-tip, leaving the generated span to the
+  next call's LCP walk — a cache miss on that turn, which two
+  breakpoints at the end of the prompt contain. The JSON repair is a
+  pure helper, `dialect::truncate_partial_object`.
 - **A Mistral call at its `[ARGS]` marker is incomplete, not
   malformed.** `[TOOL_CALLS]name[ARGS]` with nothing after it (the
   arguments not yet generated) parsed as malformed, so the streaming
   parser yielded the frame as prose and a clip there seated it in a
-  `Text` block. It now waits (streaming) or is withheld (clipped).
-  Under `Leniency::Clipped`, any call that the cut left
-  malformed-looking and that runs to the end of input is withheld as
-  the call in flight, Harmony blocks included.
+  `Text` block. It now waits (streaming) or comes back with input `{}`
+  (clipped). Under `Leniency::Clipped`, a call that the cut left
+  unreadable and that runs to the end of input is withheld as the call
+  in flight, Harmony blocks included.
 - **Request `stop_sequences` stop generation (#122).** They were read
   only after the fact, to label a turn that happened to end on one.
   Generation now stops at the first match **in client-visible
@@ -112,19 +123,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `complete_text` and `complete_stream` alike (the stream holds back
   text that could still grow into a stop sequence). Matching goes
   through the dialect parser and sees only prose (`Block::Text`) and
-  the string values of a tool call's input; a match in a call's input
-  **withholds that call**, as a clip does, and the prose before it
-  stands. That too deliberately deviates from Anthropic, which keeps the
-  call with its input cut at the match but closed into valid JSON —
-  `stop_sequences: ["print("]` on a forced `write_file` gave
-  `{"path":"hello.py","contents":"import datetime\n"}` under
-  `stop_reason: stop_sequence`, streamed with a normal
-  `content_block_stop` (captured 2026-09-30, claude-haiku-4-5; see
-  misanthropic's `misanthropic/test/data/stop/stop_sequence_tool.*`
-  and `stop_sequence_text_tool.*`) — a truncated call that looks
-  finished. `stop_reason` and `stop_sequence` match Anthropic's
-  exactly. Never matched: thinking, and framing — the dialect's markers
-  (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`/`[ARGS]`, Harmony
+  the string values of a tool call's input — the call still being
+  generated included, so generation stops at the match, not when the
+  call closes. A match in a call's input **cuts the call there**, as
+  Anthropic does: the string is cut right before the match, the
+  members before it stand, the JSON is closed, and nothing after the
+  match exists — `stop_sequences: ["print("]` on a forced `write_file`
+  gives `{"path":"hello.py","contents":"import datetime\n"}` under
+  `stop_reason: stop_sequence`, as claude-haiku-4-5 did (captured
+  2026-09-30; misanthropic's
+  `misanthropic/test/data/stop/stop_sequence_tool.*` and
+  `stop_sequence_text_tool.*`; streamed, with a normal
+  `content_block_stop`). `complete_text`'s raw bytes then end inside the
+  call, right before the match. Never matched: thinking, and framing —
+  the dialect's markers (`<tool_call>`, `<function=…>`,
+  `[TOOL_CALLS]`/`[ARGS]`, Harmony
   headers, EOG pieces) and the whitespace between prose and a
   structure (`"Sure, checking.\n\n<tool_call>"`, `"</think>\n\n"`).
   A stop of `"\n"` matched against raw bytes killed every Qwen call at
@@ -137,7 +150,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sized from token-sequence lengths alone and missed any stop string
   longer than a token. New: `TokenPredictor::stop_string` /
   `hit_token_limit` (and on `PiecePredictor`),
-  `BlockStream::stop_reason`, `StreamParser: Clone`.
+  `BlockStream::stop_reason` / `open_call_json`, `StreamParser: Clone`,
+  `dialect::truncate_partial_object`.
 - **blallama answers an undeserializable body with Anthropic's 400
   (#123).** `/v1/messages` and `/v1/messages/count_tokens` returned
   axum's plain-text 422 (or 415), which no Anthropic client parses; they

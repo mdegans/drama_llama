@@ -4,27 +4,27 @@
 //!
 //! - A match in prose ends the turn there: the text before it stands,
 //!   everything after it goes.
-//! - A match in a call's input **withholds that call**, as a clip does
-//!   (#121): the prose before it stands; the call and everything after
-//!   it go. Only whole string values are matched, each on its own —
-//!   never the keys, the JSON around them, or the dialect's spelling of
-//!   them.
+//! - A match in a call's input ends the turn there too, and the call
+//!   comes back **cut at the match**, as Anthropic returns it: the
+//!   string is cut right before the match, the members before it stand,
+//!   and the JSON is closed. The members after it never existed — the
+//!   match is found while the call is still being generated, and
+//!   generation stops there. Only string values are matched, each on
+//!   its own — never the keys, the JSON around them, or the dialect's
+//!   spelling of them.
 //! - Either way the turn reads `stop_reason: stop_sequence`.
 //!
-//! **Withholding the call is a deliberate deviation from Anthropic.**
-//! Anthropic *keeps* a call whose input a stop matched, its input cut at
-//! the match and then closed into valid JSON: with `stop_sequences:
-//! ["print("]` and a forced `write_file`, claude-haiku-4-5 answered
+//! That is Anthropic's behavior, captured 2026-09-30 on
+//! claude-haiku-4-5: with `stop_sequences: ["print("]` and a forced
+//! `write_file`, it answered
 //! `{"path":"hello.py","contents":"import datetime\n"}` under
-//! `stop_reason: stop_sequence` (captured 2026-09-30 — misanthropic's
-//! `misanthropic/test/data/stop/stop_sequence_tool.*` and
-//! `stop_sequence_text_tool.*`; streamed, the block
+//! `stop_reason: stop_sequence`, `stop_sequence: "print("` (misanthropic's
+//! `misanthropic/test/data/stop/stop_sequence_tool.*`; streamed, the block
 //! gets its `content_block_stop` and the last `input_json_delta` closes
-//! the object; under `tool_choice: auto`, the same after a text block).
-//! That call looks complete and is not, which is a trap for any client
-//! that dispatches on a `tool_use` block rather than on `stop_reason`.
-//! The session (and so blallama) withholds it instead — better than
-//! parity. The stop reason and `stop_sequence` stay exactly Anthropic's.
+//! the object; `stop_sequence_text_tool.*`: the same after a text block
+//! under `tool_choice: auto`). The same prompt must drive a client the
+//! same way on both backends. The call looks complete and is not; a
+//! client must gate dispatch on `stop_reason`, as it must for a clip.
 //!
 //! Never matched: **framing** and **thinking**. Framing is the dialect's
 //! markers (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`/`[ARGS]`,
@@ -57,7 +57,7 @@
 use serde_json::Value;
 
 use crate::{
-    dialect::StreamParser,
+    dialect::{cut_value, OpenCall, Parsed, StreamParser},
     predictor::{first_stop_string, stop_string_holdback},
     Block,
 };
@@ -120,12 +120,20 @@ impl StopCutter {
         held
     }
 
-    /// Match a call's input (see [`input_stop`]); a match is a hit.
-    fn check_input(&mut self, input: &Value) -> bool {
-        if self.hit.is_none() {
-            self.hit = input_stop(input, &self.stops).map(str::to_owned);
+    /// Cut a call's input at the first stop in it ([`cut_value`]); a
+    /// match is a hit.
+    fn cut_input(&mut self, input: &Value) -> Option<Value> {
+        if self.hit.is_some() {
+            return None;
         }
-        self.hit.is_some()
+        let (cut, i) = cut_value(input, &self.stops)?;
+        self.hit = Some(self.stops[i].clone());
+        Some(cut)
+    }
+
+    /// Whether any stop sequence is in one of `inputs`' string values.
+    fn in_any<'v>(&self, mut inputs: impl Iterator<Item = &'v Value>) -> bool {
+        inputs.any(|input| cut_value(input, &self.stops).is_some())
     }
 
     /// End of the run: the held tail never completed a stop sequence,
@@ -135,30 +143,15 @@ impl StopCutter {
     }
 }
 
-/// The first stop sequence found in a call's input: in its string
-/// values, each matched on its own, keys and JSON syntax never.
-fn input_stop<'s, S: AsRef<str>>(
-    value: &Value,
-    stops: &'s [S],
-) -> Option<&'s str> {
-    match value {
-        Value::String(s) => {
-            first_stop_string(s, stops).map(|(_, i)| stops[i].as_ref())
-        }
-        Value::Array(items) => items.iter().find_map(|v| input_stop(v, stops)),
-        Value::Object(map) => map.values().find_map(|v| input_stop(v, stops)),
-        _ => None,
-    }
-}
-
 /// Stop sequences over a generation in flight: pieces go through the
-/// dialect's [`StreamParser`], and only what it releases as text — prose
-/// and, once a call closes, its input's string values — is matched;
-/// never framing held back as a possible marker, never whitespace
-/// between prose and a structure, never a thought. Yields the parser's
-/// blocks with everything past a stop dropped (a call whose input
-/// matched included), so [`super::BlockStream`] streams from it directly
-/// and the batch paths use it to know when to stop.
+/// dialect's [`StreamParser`], and only what it releases as text —
+/// prose, and the string values of a call's input, the call in flight
+/// included — is matched; never framing held back as a possible marker,
+/// never whitespace between prose and a structure, never a thought.
+/// Yields the parser's blocks with everything past a stop dropped (a
+/// call whose input matched is cut there), so [`super::BlockStream`]
+/// streams from it directly and the batch paths use it to know when to
+/// stop.
 #[derive(Debug, Clone)]
 pub(super) struct StopFilter {
     parser: StreamParser,
@@ -192,21 +185,62 @@ impl StopFilter {
             return Vec::new();
         }
         let blocks = self.parser.push(piece);
+        let mut out = self.admit(blocks);
+        if self.hit().is_none() {
+            out.extend(self.stop_in_flight());
+        }
+        out
+    }
+
+    /// Once the budget cut a turn inside a call and the flush returned
+    /// it ([`Self::finish`] with `clipped`): that call's input as JSON
+    /// left open where the cut fell — what an Anthropic stream sends as
+    /// its `input_json_delta`, with no `content_block_stop` after
+    /// ([`OpenCall::partial_json`]). A call a stop sequence cut is
+    /// closed, so `None` then.
+    pub(super) fn open_call_json(&self) -> Option<&str> {
+        self.hit()
+            .is_none()
+            .then(|| self.parser.open()?.partial_json.as_deref())
+            .flatten()
+    }
+
+    /// A stop in the input of the call still being generated ends the
+    /// turn now, as on Anthropic — not when (or whether) the call
+    /// closes. The flush returns what the parser holds: prose it held
+    /// back (which may match first), and the call with its string in
+    /// flight, which [`Self::admit`] cuts at the match.
+    fn stop_in_flight(&mut self) -> Vec<Block> {
+        let Some(open) = self.parser.open() else {
+            return Vec::new();
+        };
+        let (last, before) = open.calls.split_last().expect("a call");
+        let inputs = before.iter().map(|call| &call.input);
+        if !self.cutter.in_any(inputs.chain([&open.held_input])) {
+            return Vec::new();
+        }
+        let (id, held) = (last.id.clone(), open.held_input.clone());
+        let mut blocks = self.parser.finish_clipped();
+        if let Some(Block::ToolUse { call }) = blocks.last_mut() {
+            if call.id == id {
+                call.input = held;
+            }
+        }
         self.admit(blocks)
     }
 
     /// End of generation. `clipped`: the generation was cut short, so
-    /// an incomplete trailing call is withheld
-    /// ([`StreamParser::finish_clipped`]) and the run's trailing
-    /// whitespace is not matched.
+    /// an incomplete trailing call comes back with the members that
+    /// completed ([`StreamParser::finish_clipped`]) and the run's
+    /// trailing whitespace is not matched.
     ///
     /// Otherwise the flush degrades an incomplete structure to text
     /// ([`StreamParser::finish`]) — framing, not prose the model
     /// finished, so it is never matched. Only the prose the flush
     /// releases (the tail held back as a possible marker) and the
     /// whitespace that ended the answer are: a stop found there, with
-    /// calls withheld, stops the turn as though it had matched
-    /// mid-stream.
+    /// any call in flight cut short, stops the turn as though it had
+    /// matched mid-stream.
     pub(super) fn finish(&mut self, clipped: bool) -> Vec<Block> {
         if clipped || self.hit().is_some() {
             return self.flush_matching(false);
@@ -227,7 +261,7 @@ impl StopFilter {
     fn flush_matching(&mut self, turn_end: bool) -> Vec<Block> {
         let blocks = self.parser.finish_clipped();
         let mut out = self.admit(blocks);
-        if turn_end && self.hit().is_none() && !self.parser.withholds() {
+        if turn_end && self.hit().is_none() && !self.parser.in_flight() {
             let ws = std::mem::take(&mut self.trailing_ws);
             out.extend(prose(self.cutter.push(&ws)));
             self.clear_on_hit();
@@ -284,14 +318,16 @@ impl StopFilter {
                         self.clear_on_hit();
                     }
                 }
-                other => {
+                mut other => {
                     // The run's held tail never completed a stop, and
                     // its trailing whitespace is framing.
                     out.extend(self.release());
                     self.after_structure = true;
-                    if let Block::ToolUse { call } = &other {
-                        if self.cutter.check_input(&call.input) {
-                            // Withheld, as a clip withholds a call.
+                    if let Block::ToolUse { call } = &mut other {
+                        if let Some(cut) = self.cutter.cut_input(&call.input) {
+                            // Cut at the match; nothing follows it.
+                            call.input = cut;
+                            out.push(other);
                             break;
                         }
                     }
@@ -308,11 +344,34 @@ fn prose(text: String) -> Option<Block> {
     (!text.is_empty()).then(|| text.into())
 }
 
+/// A clipped parse's blocks as a stop sequence sees them: the call in
+/// flight with its string value kept — every byte when `raw`
+/// ([`OpenCall::raw_input`]), else as far as it is known to be text
+/// ([`OpenCall::held_input`], what [`StopFilter`] matched) — and
+/// adjacent prose merged. The batch paths cut this with
+/// [`cut_at_stop`].
+pub(super) fn stop_view(
+    (parsed, open): (Parsed, Option<OpenCall>),
+    raw: bool,
+) -> Vec<Block> {
+    let mut blocks = parsed.blocks;
+    if let (Some(open), Some(Block::ToolUse { call })) =
+        (open, blocks.last_mut())
+    {
+        if open.calls.last().is_some_and(|last| last.id == call.id) {
+            call.input = if raw { open.raw_input } else { open.held_input };
+        }
+    }
+    super::merge_adjacent_prose(blocks)
+}
+
 /// Cut `blocks` (adjacent prose already merged) at the first stop
 /// sequence, by [`StopFilter`]'s rules — the batch half of the same
 /// policy. A match in prose keeps the text before it (the block dropped
-/// when nothing is left); a match in a call's input drops the call.
-/// Every block after the cut goes. Returns the matched stop, if any.
+/// when nothing is left); a match in a call's input keeps the call, its
+/// input cut at the match ([`cut_value`]). Every block after the cut
+/// goes. Returns the matched stop, if any. Pass a call in flight as
+/// [`stop_view`] leaves it.
 ///
 /// The last block's trailing whitespace is matched: `blocks` is taken
 /// to end a turn that finished cleanly. A caller holding the stop the
@@ -324,6 +383,11 @@ pub(super) fn cut_at_stop<S: AsRef<str>>(
 ) -> (Vec<Block>, Option<String>) {
     let is_structure =
         |b: Option<&Block>| b.is_some_and(|b| !matches!(b, Block::Text { .. }));
+    /// Where a stop matched: at a byte of prose, or in a call's input.
+    enum Match {
+        Prose(usize),
+        Input(Value),
+    }
     let hit = blocks.iter().enumerate().find_map(|(i, b)| match b {
         Block::Text { text, .. } => {
             // Whitespace touching a structure is framing.
@@ -339,25 +403,28 @@ pub(super) fn cut_at_stop<S: AsRef<str>>(
             };
             let body = text.get(start..end.max(start)).unwrap_or("");
             first_stop_string(body, stops)
-                .map(|(at, s)| (i, Some(start + at), s))
+                .map(|(at, s)| (i, Match::Prose(start + at), s))
         }
-        Block::ToolUse { call } => input_stop(&call.input, stops).map(|hit| {
-            let s = stops.iter().position(|s| s.as_ref() == hit);
-            (i, None, s.expect("the stop came from `stops`"))
-        }),
+        Block::ToolUse { call } => cut_value(&call.input, stops)
+            .map(|(cut, s)| (i, Match::Input(cut), s)),
         _ => None,
     });
     let Some((i, at, s)) = hit else {
         return (blocks, None);
     };
     match at {
-        // In a call's input: the call goes.
-        None => blocks.truncate(i),
-        Some(0) => blocks.truncate(i),
-        Some(at) => {
+        Match::Prose(0) => blocks.truncate(i),
+        Match::Prose(at) => {
             blocks.truncate(i + 1);
             if let Some(Block::Text { text, .. }) = blocks.last_mut() {
                 text.to_mut().truncate(at);
+            }
+        }
+        // In a call's input: the call stands, cut at the match.
+        Match::Input(cut) => {
+            blocks.truncate(i + 1);
+            if let Some(Block::ToolUse { call }) = blocks.last_mut() {
+                call.input = cut;
             }
         }
     }
@@ -366,30 +433,43 @@ pub(super) fn cut_at_stop<S: AsRef<str>>(
 
 /// Byte offset at which to cut `raw` — the generation's raw bytes,
 /// framing and all — so that it parses to `kept`, the output
-/// [`cut_at_stop`] left. `view` is a prefix's parse (adjacent prose
-/// merged), or `None` when it withholds a structure in flight.
+/// [`cut_at_stop`] left. `view` is a prefix's parse as [`stop_view`]
+/// leaves it with `raw` (every byte of a string in flight kept), or
+/// `None` when it leaves out a structure in flight.
 ///
-/// The longest such prefix: the walk back from the end is short, since
-/// generation stops within a piece, a held-back marker, or (a match in
-/// a call's input) the call of the match.
+/// The shortest of the run of such prefixes nearest the end: a match in
+/// a call's input leaves the call's raw bytes up to the match, and an
+/// escape the match began with (`\n` of `"a\nb"`) decodes to nothing
+/// until complete, so the prefix ending mid-escape parses the same —
+/// its dangling byte is not kept. The walk back from the end is short,
+/// since generation stops within a piece or a held-back marker of the
+/// match.
 pub(super) fn raw_stop_cut(
     raw: &str,
     kept: &[Block],
     view: impl Fn(&str) -> Option<Vec<Block>>,
 ) -> Option<usize> {
-    raw.char_indices()
+    let mut prefixes = raw
+        .char_indices()
         .map(|(i, _)| i)
         .chain([raw.len()])
         .rev()
-        .find(|&i| view(&raw[..i]).as_deref() == Some(kept))
+        .skip_while(|&i| view(&raw[..i]).as_deref() != Some(kept));
+    let longest = prefixes.next()?;
+    Some(
+        prefixes
+            .take_while(|&i| view(&raw[..i]).as_deref() == Some(kept))
+            .last()
+            .unwrap_or(longest),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dialect::{
-        parse_text, render_reference, CallSyntax, Family, FunctionSyntax,
-        Leniency, StreamParser,
+        parse_text, parse_text_open, render_reference, CallSyntax, Family,
+        FunctionSyntax, Leniency, StreamParser,
     };
     use crate::Tool;
     use serde_json::json;
@@ -455,14 +535,28 @@ mod tests {
     }
 
     /// Feed `text` a char at a time — every piece boundary a tokenizer
-    /// could produce — then finish a turn that ended cleanly (EOG).
-    fn run(f: &mut StopFilter, text: &str) -> Vec<Block> {
-        let mut out: Vec<Block> = text
-            .chars()
-            .flat_map(|c| f.push(c.encode_utf8(&mut [0; 4])))
-            .collect();
+    /// could produce — until a stop fires (generation stops there, as
+    /// in the session), then finish a turn that ended cleanly (EOG).
+    /// Returns the output and the bytes generated.
+    fn run_to_stop<'t>(
+        f: &mut StopFilter,
+        text: &'t str,
+    ) -> (Vec<Block>, &'t str) {
+        let mut out = Vec::new();
+        let mut generated = text.len();
+        for (i, c) in text.char_indices() {
+            out.extend(f.push(c.encode_utf8(&mut [0; 4])));
+            if f.hit().is_some() {
+                generated = i + c.len_utf8();
+                break;
+            }
+        }
         out.extend(f.finish(false));
-        super::super::merge_adjacent_prose(out)
+        (super::super::merge_adjacent_prose(out), &text[..generated])
+    }
+
+    fn run(f: &mut StopFilter, text: &str) -> Vec<Block> {
+        run_to_stop(f, text).0
     }
 
     fn calls(blocks: &[Block]) -> usize {
@@ -473,26 +567,43 @@ mod tests {
     }
 
     /// Stream `text` through the filter, then check the batch half
-    /// agrees: the clipped parse cut at the stop the filter reported
-    /// is the streamed output, block for block. Returns the output.
+    /// agrees, as the session runs it: the clipped parse of what was
+    /// generated — a call in flight with its string kept — cut at the
+    /// stop the filter reported, is the streamed output, block for
+    /// block. Returns the output.
     fn stream_and_batch(
         syntax: CallSyntax,
         stops: &[&str],
         text: &str,
     ) -> (Vec<Block>, Option<String>) {
         let mut f = filter(syntax.clone(), stops);
-        let streamed = run(&mut f, text);
+        let (streamed, generated) = run_to_stop(&mut f, text);
         let hit = f.hit().map(str::to_owned);
         if let Some(hit) = &hit {
             let t = tool();
-            let parsed =
-                parse_text(&syntax, &[&t], text, false, Leniency::Clipped);
-            let blocks = super::super::merge_adjacent_prose(parsed.blocks);
-            let (cut, found) = cut_at_stop(blocks, &[hit]);
+            let parsed = parse_text_open(
+                &syntax,
+                &[&t],
+                generated,
+                false,
+                Leniency::Clipped,
+            );
+            let (cut, found) = cut_at_stop(stop_view(parsed, false), &[hit]);
             assert_eq!(found.as_ref(), Some(hit), "{text:?}");
             assert_eq!(cut, streamed, "batch vs stream on {text:?}");
         }
         (streamed, hit)
+    }
+
+    /// The input of the one call in `blocks`.
+    fn input_of(blocks: &[Block]) -> &serde_json::Value {
+        let mut inputs = blocks.iter().filter_map(|b| match b {
+            Block::ToolUse { call } => Some(&call.input),
+            _ => None,
+        });
+        let input = inputs.next().expect("a call");
+        assert!(inputs.next().is_none(), "one call: {blocks:#?}");
+        input
     }
 
     /// The review's case: models put a blank line between their prose
@@ -604,29 +715,158 @@ mod tests {
         }
     }
 
-    /// A call's input values are text: a stop in one withholds that
-    /// call, as a clip does, and the turn stops there. The prose before
-    /// it stands; keys and JSON syntax are never matched.
+    /// Every dialect with calls, Harmony included (no prose beside its
+    /// calls).
+    fn call_dialects() -> [(&'static str, CallSyntax, &'static str); 5] {
+        let [qwen, hermes, mistral, gemma] = dialects()
+            .map(|(name, syntax)| (name, syntax, "Sure, checking.\n\n"));
+        [
+            qwen,
+            hermes,
+            mistral,
+            gemma,
+            ("harmony", CallSyntax::gpt_oss(), ""),
+        ]
+    }
+
+    /// A call's input values are text: a stop in one ends the turn, and
+    /// the call comes back cut at the match — Anthropic's captured
+    /// behavior (`{"path":"hello.py","contents":"import datetime\n"}` for
+    /// `["print("]`). The prose before it stands; keys and JSON syntax
+    /// are never matched.
     #[test]
-    fn stop_in_a_call_input_withholds_the_call() {
-        for (name, syntax) in dialects() {
+    fn stop_in_a_call_input_cuts_the_call_there() {
+        for (name, syntax, prose) in call_dialects() {
             let text = format!(
-                "Sure, checking.\n\n{}",
+                "{prose}{}",
                 call(&syntax, json!({"city": "Paris\nFrance"})),
             );
             let (out, hit) = stream_and_batch(syntax.clone(), &["\n"], &text);
             assert_eq!(hit.as_deref(), Some("\n"), "{name}");
-            assert_eq!(calls(&out), 0, "{name}: {out:#?}");
-            assert_eq!(texts(&out), "Sure, checking.\n\n", "{name}");
+            assert_eq!(input_of(&out), &json!({"city": "Paris"}), "{name}");
+            assert_eq!(texts(&out), prose, "{name}");
 
             let (out, hit) =
                 stream_and_batch(syntax.clone(), &["France"], &text);
             assert_eq!(hit.as_deref(), Some("France"), "{name}");
-            assert_eq!(calls(&out), 0, "{name}: {out:#?}");
+            assert_eq!(input_of(&out), &json!({"city": "Paris\n"}), "{name}");
 
             let (out, hit) = stream_and_batch(syntax, &["city"], &text);
             assert_eq!(hit, None, "{name}: a key is not text");
             assert_eq!(calls(&out), 1, "{name}: {out:#?}");
+        }
+    }
+
+    /// The captured case, in every dialect: the stop fires *while the
+    /// call is generated* — generation stops there, not when the call
+    /// closes — the members before the match stand, the string it fell
+    /// in is cut before it, and what would have followed never exists.
+    #[test]
+    fn stop_in_a_call_input_fires_before_the_call_closes() {
+        let input = json!({
+            "path": "hello.py",
+            "contents": "import datetime\nprint(datetime.now())\n",
+            "mode": "w",
+        });
+        for (name, syntax, prose) in call_dialects() {
+            let text = format!("{prose}{}", call(&syntax, input.clone()));
+            let mut f = filter(syntax.clone(), &["print("]);
+            let (_, generated) = run_to_stop(&mut f, &text);
+            assert!(
+                generated.ends_with("print("),
+                "{name}: the stop waited for more: {generated:?}",
+            );
+            let (out, hit) =
+                stream_and_batch(syntax.clone(), &["print("], &text);
+            assert_eq!(hit.as_deref(), Some("print("), "{name}");
+            // Generation order: Gemma's dict renders keys sorted, so
+            // `contents` comes before `path` there.
+            let want = match syntax.family {
+                Family::TagWithDict => r#"{"contents":"import datetime\n"}"#,
+                _ => r#"{"path":"hello.py","contents":"import datetime\n"}"#,
+            };
+            let cut = serde_json::to_string(input_of(&out)).unwrap();
+            assert_eq!(cut, want, "{name}");
+        }
+    }
+
+    /// Nested input: the cut keeps the containers around the match
+    /// with the members before it. (Qwen XML carries a non-string
+    /// parameter as one JSON value, matched only once it closes.)
+    #[test]
+    fn stop_in_nested_input_cuts_at_every_depth() {
+        let input = json!({
+            "a": 1,
+            "b": {"x": ["keep", "cut STOP here", "gone"], "y": "gone"},
+            "c": "gone",
+        });
+        for (name, syntax, prose) in call_dialects() {
+            if syntax.family == Family::TagWithTagged {
+                continue;
+            }
+            let text = format!("{prose}{}", call(&syntax, input.clone()));
+            let (out, hit) = stream_and_batch(syntax, &["STOP"], &text);
+            assert_eq!(hit.as_deref(), Some("STOP"), "{name}");
+            assert_eq!(
+                input_of(&out),
+                &json!({"a": 1, "b": {"x": ["keep", "cut "]}}),
+                "{name}",
+            );
+        }
+    }
+
+    /// Parallel calls: a stop in the second cuts it; the first, which
+    /// closed before it, stands unchanged.
+    #[test]
+    fn stop_in_a_later_call_keeps_the_earlier_one() {
+        for (name, syntax) in dialects() {
+            let paris = call(&syntax, json!({"city": "Paris"}));
+            let oslo = call(&syntax, json!({"city": "Oslo STOP x"}));
+            let text = format!("Both.\n\n{paris}\n{oslo}");
+            let (out, hit) = stream_and_batch(syntax, &["STOP"], &text);
+            assert_eq!(hit.as_deref(), Some("STOP"), "{name}");
+            let inputs: Vec<_> = out
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolUse { call } => Some(&call.input),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                inputs,
+                [&json!({"city": "Paris"}), &json!({"city": "Oslo "})],
+                "{name}",
+            );
+        }
+    }
+
+    /// A clip inside a call returns it with the members that completed
+    /// and leaves it open for a stream (no `content_block_stop`); a stop
+    /// closes the call it cuts.
+    #[test]
+    fn a_clipped_call_is_left_open_and_a_stopped_one_closed() {
+        for (name, syntax, prose) in call_dialects() {
+            let text = format!(
+                "{prose}{}",
+                call(&syntax, json!({"city": "Paris", "detail": "sunny"})),
+            );
+            let clip = &text[..text.find("sunny").unwrap() + 2];
+            let mut f = filter(syntax.clone(), &["zzz"]);
+            let mut out: Vec<Block> =
+                clip.chars().flat_map(|c| f.push(&c.to_string())).collect();
+            out.extend(f.finish(true));
+            assert_eq!(f.hit(), None, "{name}");
+            assert_eq!(input_of(&out), &json!({"city": "Paris"}), "{name}");
+            assert_eq!(
+                f.open_call_json(),
+                Some(r#"{"city":"Paris""#),
+                "{name}"
+            );
+
+            let mut f = filter(syntax, &["un"]);
+            let _ = run(&mut f, &text);
+            assert_eq!(f.hit(), Some("un"), "{name}");
+            assert_eq!(f.open_call_json(), None, "{name}");
         }
     }
 
@@ -702,36 +942,58 @@ mod tests {
         let blocks = parse(&text);
         let (cut, hit) = cut_at_stop(blocks.clone(), &["\n"]);
         assert_eq!(hit.as_deref(), Some("\n"));
-        assert_eq!(cut, blocks[..1], "the call goes, the prose stands");
+        assert_eq!(cut[..1], blocks[..1], "the prose stands");
+        assert_eq!(input_of(&cut), &json!({"city": "x"}), "the call is cut");
     }
 
     /// The raw cut lands where the cut output ends: just before a stop
-    /// in prose (a copy of it in framing before that intact), or before
-    /// the call whose input matched.
+    /// in prose (a copy of it in framing before that intact), or inside
+    /// the call whose input matched, just before the match — before an
+    /// escape the match began with, never after its dangling backslash.
     #[test]
     fn raw_stop_cut_ends_where_the_output_does() {
-        let syntax = CallSyntax::qwen_xml();
         let t = tool();
-        let view = |prefix: &str| {
-            let parsed =
-                parse_text(&syntax, &[&t], prefix, false, Leniency::Clipped);
-            (parsed.status == crate::dialect::ParseStatus::Complete)
-                .then(|| super::super::merge_adjacent_prose(parsed.blocks))
-        };
-        let cut = |raw: &str| {
-            let blocks = view(raw).expect("complete");
-            let (kept, hit) = cut_at_stop(blocks, &["\n"]);
+        let cut = |syntax: &CallSyntax, raw: &str, stop: &str| {
+            let parse = |prefix: &str| {
+                parse_text_open(syntax, &[&t], prefix, false, Leniency::Clipped)
+            };
+            let view = |prefix: &str| {
+                let (parsed, open) = parse(prefix);
+                let complete =
+                    parsed.status == crate::dialect::ParseStatus::Complete;
+                (complete || open.is_some())
+                    .then(|| stop_view((parsed, open), true))
+            };
+            let (kept, hit) =
+                cut_at_stop(stop_view(parse(raw), false), &[stop]);
             hit.and_then(|_| raw_stop_cut(raw, &kept, view))
         };
 
-        let call_ok = call(&syntax, json!({"city": "Paris"}));
+        let qwen = CallSyntax::qwen_xml();
+        let call_ok = call(&qwen, json!({"city": "Paris"}));
         let raw = format!("A\n\n{call_ok}done\nlater");
-        assert_eq!(cut(&raw), Some(format!("A\n\n{call_ok}done").len()));
+        let want = format!("A\n\n{call_ok}done").len();
+        assert_eq!(cut(&qwen, &raw, "\n"), Some(want));
+        assert_eq!(cut(&qwen, "no stop", "\n"), None);
 
-        let raw = format!("A\n\n{}", call(&syntax, json!({"city": "a\nb"})));
-        assert_eq!(cut(&raw), Some("A\n\n".len()));
-
-        assert_eq!(cut("no stop"), None);
+        // Generation stopped at the match, inside the call.
+        for syntax in [qwen, CallSyntax::hermes_json()] {
+            let full =
+                call(&syntax, json!({"city": "import datetime\nprint(x)"}));
+            let at = full.find("print(").unwrap();
+            let raw = &full[..at + "print(".len()];
+            assert_eq!(
+                cut(&syntax, raw, "print("),
+                Some(at),
+                "{:?}",
+                syntax.family
+            );
+        }
+        // An escaped match: `\n` in JSON is two raw bytes.
+        let syntax = CallSyntax::hermes_json();
+        let full = call(&syntax, json!({"city": "Paris\nFrance"}));
+        let at = full.find("\\n").unwrap();
+        assert_eq!(cut(&syntax, &full[..at + 2], "\n"), Some(at));
     }
 
     /// #122, streaming: a stop sequence split across deltas is held
