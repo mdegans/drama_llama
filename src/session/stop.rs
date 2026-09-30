@@ -25,6 +25,15 @@
 //! answer; matched there, a stop would end a turn before the answer
 //! began. (Anthropic's behavior inside `thinking` is uncaptured.)
 //!
+//! A *whitespace-only* stop (`"\n"`) never reaches this through
+//! blallama: Anthropic rejects one with a 400 (`stop_sequences: each
+//! stop sequence must contain non-whitespace`, captured 2026-09-30), and
+//! so does blallama. The framing rule stays for two reasons: a library
+//! caller can still pass one to [`Session`](super::Session) directly,
+//! and a stop that merely *begins or ends* with whitespace
+//! (`"\nObservation:"`) must not match across the whitespace beside a
+//! structure either.
+//!
 //! A match is per prose *run*: a structure between two stretches of
 //! text ends one run and starts the next, so a stop never straddles one.
 

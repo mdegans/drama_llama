@@ -258,6 +258,53 @@ fn map_json_rejection(
     })
 }
 
+/// A request body as `/v1/messages` and `count_tokens` take it:
+/// [`AnthropicJson`], then the checks Anthropic makes on a well-formed
+/// body before it reaches a model ([`validate_prompt`]), each a 400.
+struct AnthropicPrompt(Prompt);
+
+impl<S: Send + Sync> FromRequest<S> for AnthropicPrompt {
+    type Rejection = (StatusCode, Json<ErrorEnvelope>);
+
+    async fn from_request(
+        req: Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let AnthropicJson(prompt) =
+            AnthropicJson::<Prompt>::from_request(req, state).await?;
+        validate_prompt(&prompt).map_err(error_response)?;
+        Ok(Self(prompt))
+    }
+}
+
+/// Anthropic's exact wording, which clients may match on.
+const BLANK_STOP_MESSAGE: &str =
+    "stop_sequences: each stop sequence must contain non-whitespace";
+
+/// Anthropic's request checks that deserializing alone lets through.
+///
+/// A stop sequence with no non-whitespace character (`"\n"`, `" "`) is a
+/// 400 `invalid_request_error` on Anthropic — captured 2026-09-30 on
+/// claude-haiku-4-5 for `stream: false` and `stream: true` alike (the
+/// streaming request gets the same plain JSON body, not an SSE `error`
+/// event). The empty string falls under the rule as worded; that case is
+/// uncaptured. Applied to `count_tokens` too, on the (uncaptured)
+/// assumption that Anthropic validates the shared body the same way on
+/// both routes.
+fn validate_prompt(prompt: &Prompt) -> Result<(), AnthropicError> {
+    let blank_stop = prompt
+        .stop_sequences
+        .iter()
+        .flatten()
+        .any(|stop| stop.chars().all(char::is_whitespace));
+    if blank_stop {
+        return Err(AnthropicError::InvalidRequest {
+            message: BLANK_STOP_MESSAGE.into(),
+        });
+    }
+    Ok(())
+}
+
 async fn spawn_blocking_or_bust<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
@@ -561,7 +608,7 @@ where
 
 async fn route_messages<B>(
     State(state): State<AppState<B>>,
-    AnthropicJson(mut prompt): AnthropicJson<Prompt>,
+    AnthropicPrompt(mut prompt): AnthropicPrompt,
 ) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend + 'static,
@@ -580,7 +627,7 @@ where
 #[instrument(skip(state, prompt), fields(model = %prompt.model))]
 async fn route_count_tokens<B>(
     State(state): State<AppState<B>>,
-    AnthropicJson(mut prompt): AnthropicJson<Prompt>,
+    AnthropicPrompt(mut prompt): AnthropicPrompt,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend + 'static,
@@ -1379,9 +1426,9 @@ mod tests {
     async fn extract(
         req: Request,
     ) -> Result<Prompt, (StatusCode, serde_json::Value)> {
-        AnthropicJson::<Prompt>::from_request(req, &())
+        AnthropicPrompt::from_request(req, &())
             .await
-            .map(|AnthropicJson(p)| p)
+            .map(|AnthropicPrompt(p)| p)
             .map_err(|(status, Json(envelope))| {
                 (status, serde_json::to_value(envelope).unwrap())
             })
@@ -1505,30 +1552,28 @@ mod tests {
         assert_eq!(reason(Err(SessionError::TrailingMedia)), None);
     }
 
-    /// #123: a body over the limit is Anthropic's 413
-    /// `request_too_large` in the error envelope, through the real
-    /// `DefaultBodyLimit` layer (shrunk to 16 bytes on a one-route
-    /// router, so a tiny body is oversized) on an ephemeral local port.
-    #[tokio::test]
-    async fn oversized_body_is_anthropic_413_envelope() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        async fn accept(_: AnthropicJson<Prompt>) -> StatusCode {
-            StatusCode::OK
-        }
-        let app = Router::new()
-            .route("/v1/messages", post(accept))
-            .layer(DefaultBodyLimit::max(16));
+    /// Serve `app` on an ephemeral local port.
+    async fn serve(app: Router) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("ephemeral port");
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
+        addr
+    }
 
-        let body = r#"{"model": "m", "max_tokens": 8, "messages": []}"#;
+    /// `POST` `body` as JSON to `path` over a raw socket, as a client
+    /// would; returns the response head and payload.
+    async fn post_raw(
+        addr: std::net::SocketAddr,
+        path: &str,
+        body: &str,
+    ) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = format!(
-            "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n\
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n{body}",
             body.len(),
@@ -1536,14 +1581,79 @@ mod tests {
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
-
         let (head, payload) =
             response.split_once("\r\n\r\n").expect("an HTTP response");
+        (head.to_owned(), payload.to_owned())
+    }
+
+    /// #123: a body over the limit is Anthropic's 413
+    /// `request_too_large` in the error envelope, through the real
+    /// `DefaultBodyLimit` layer (shrunk to 16 bytes on a one-route
+    /// router, so a tiny body is oversized) on an ephemeral local port.
+    #[tokio::test]
+    async fn oversized_body_is_anthropic_413_envelope() {
+        async fn accept(_: AnthropicJson<Prompt>) -> StatusCode {
+            StatusCode::OK
+        }
+        let addr = serve(
+            Router::new()
+                .route("/v1/messages", post(accept))
+                .layer(DefaultBodyLimit::max(16)),
+        )
+        .await;
+
+        let body = r#"{"model": "m", "max_tokens": 8, "messages": []}"#;
+        let (head, payload) = post_raw(addr, "/v1/messages", body).await;
         assert!(head.starts_with("HTTP/1.1 413"), "{head}");
         let value: serde_json::Value =
-            serde_json::from_str(payload).expect("a JSON envelope");
+            serde_json::from_str(&payload).expect("a JSON envelope");
         assert_eq!(value["type"], "error", "{value}");
         assert_eq!(value["error"]["type"], "request_too_large", "{value}");
+    }
+
+    /// A stop sequence with no non-whitespace character is Anthropic's
+    /// 400, envelope and message byte-for-byte as captured (2026-09-30,
+    /// claude-haiku-4-5, `stream` false and true alike) — on both routes
+    /// that take a request body, through [`AnthropicPrompt`] on a real
+    /// router. A stop that merely *contains* whitespace is fine.
+    #[tokio::test]
+    async fn whitespace_only_stop_sequence_is_anthropic_400() {
+        async fn accept(_: AnthropicPrompt) -> StatusCode {
+            StatusCode::OK
+        }
+        let addr = serve(
+            Router::new()
+                .route("/v1/messages", post(accept))
+                .route("/v1/messages/count_tokens", post(accept)),
+        )
+        .await;
+        let body = |stops: &str| {
+            format!(
+                r#"{{"model": "m", "max_tokens": 8, "stream": true,
+                    "messages": [{{"role": "user", "content": "hi"}}],
+                    "stop_sequences": {stops}}}"#
+            )
+        };
+        let expected: serde_json::Value = serde_json::from_str(concat!(
+            r#"{"type":"error","error":{"type":"invalid_request_error","#,
+            r#""message":"stop_sequences: each stop sequence must "#,
+            r#"contain non-whitespace"}}"#,
+        ))
+        .unwrap();
+
+        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+            for stops in [r#"["\n"]"#, r#"[" \t\r\n"]"#, r#"["STOP", "\n"]"#] {
+                let (head, payload) = post_raw(addr, path, &body(stops)).await;
+                assert!(head.starts_with("HTTP/1.1 400"), "{path} {stops}");
+                let value: serde_json::Value =
+                    serde_json::from_str(&payload).expect("a JSON envelope");
+                assert_eq!(value, expected, "{path} {stops}");
+            }
+            for stops in [r#"["\nObservation:"]"#, r#"[" STOP "]"#, "[]"] {
+                let (head, _) = post_raw(addr, path, &body(stops)).await;
+                assert!(head.starts_with("HTTP/1.1 200"), "{path} {stops}");
+            }
+        }
     }
 
     /// #123: a tool whose schema interleaves required and optional

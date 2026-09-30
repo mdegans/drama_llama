@@ -127,6 +127,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with status 400 (413 `request_too_large` for an oversized body). The
   body limit is raised from axum's 2 MB to Anthropic's 32 MB, which a
   single base64 image could exceed.
+- **blallama rejects a whitespace-only stop sequence, as Anthropic
+  does.** A `stop_sequences` entry with no non-whitespace character
+  (`"\n"`, `" "`) is a 400 `invalid_request_error` on Anthropic,
+  message `stop_sequences: each stop sequence must contain
+  non-whitespace` (captured 2026-09-30 on claude-haiku-4-5, for
+  `stream: false` and `stream: true` alike — the streaming request gets
+  the plain JSON body too). blallama accepted it and generated; it now
+  answers the same envelope, status and message, on `/v1/messages` and
+  (assumed, uncaptured) `/v1/messages/count_tokens`. The session's
+  whitespace-framing rule for stop sequences (#122) is unchanged: it
+  still governs library callers and stops that merely begin or end with
+  whitespace (`"\nObservation:"`).
 - **Docs:** `grammar_compile`'s claim that Anthropic hoists required
   properties ahead of optional ones is dropped; probed live, it keeps
   optionals in place, exactly as the grammar does (misanthropic
