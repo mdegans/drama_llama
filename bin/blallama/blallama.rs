@@ -726,74 +726,51 @@ where
     // next request reloads from disk. See `is_reusable_after` for the
     // reuse-vs-reload classification.
     //
-    // `EmittedSpecialToken` gets a bounded in-place resample (#101):
-    // containment deliberately leaves the prompt's cache extent warm, so
-    // the retry re-prefills nothing and simply samples a different path.
-    // Bounded because a greedy (temperature 0) request reproduces the
-    // same emission deterministically — the cap keeps that pathological
-    // case at a fixed cost instead of a loop.
+    // An unlucky draw (`resample_reason`) gets a bounded in-place
+    // resample: a fresh draw usually takes a different path. Bounded
+    // because a greedy (temperature 0) request reproduces the same
+    // emission deterministically — the cap keeps that pathological case
+    // at a fixed cost instead of a loop.
     const MAX_RESAMPLES: u32 = 2;
     let (session, result, elapsed, resamples) =
         spawn_blocking_or_bust(move || {
             let start = std::time::Instant::now();
             let mut resamples: u32 = 0;
             let result = loop {
-                match session.complete_response_id(&prompt, id) {
-                    Err(drama_llama::SessionError::EmittedSpecialToken {
-                        found,
-                    }) if resamples < MAX_RESAMPLES => {
-                        resamples += 1;
-                        // Pieces logged verbatim: stderr is
-                        // operator-facing, never model-visible. The
-                        // redaction discipline applies to `Display`,
-                        // which is relayed to clients.
-                        error!(
-                            attempt = resamples,
-                            max = MAX_RESAMPLES,
-                            found = ?found,
-                            "generation emitted reserved special \
-                             token(s) in free text; resampling on the \
-                             warm cache (#101)",
-                        );
-                    }
-                    // Same bargain: an unsatisfied constraint is one
-                    // unlucky path, and a fresh draw can satisfy it.
-                    // (A turn merely *cut short* — `max_tokens`, a stop
-                    // sequence — is not one of these: it succeeds with
-                    // that stop reason, as on Anthropic. #121.)
-                    // The session invalidates its own cache here, so
-                    // this retry re-prefills; still cheaper than the
-                    // client's round trip.
-                    Err(
-                        e @ drama_llama::SessionError::GrammarViolation {
-                            ..
-                        },
-                    ) if resamples < MAX_RESAMPLES => {
-                        resamples += 1;
-                        error!(
-                            attempt = resamples,
-                            max = MAX_RESAMPLES,
-                            error = %e,
-                            "resampling after grammar violation",
-                        );
-                    }
-                    // A cut turn is a 200 (#121) — except one that was
-                    // looping identical calls into the budget, which a
-                    // fresh draw usually escapes. Once the resamples run
-                    // out, it is answered as the cut turn it is.
-                    Ok(response)
-                        if resamples < MAX_RESAMPLES
-                            && loops_a_call(&response) =>
-                    {
-                        resamples += 1;
-                        error!(
-                            attempt = resamples,
-                            max = MAX_RESAMPLES,
-                            "turn cut by max_tokens after repeating a \
-                             tool call verbatim; resampling (Phase G loop)",
-                        );
-                    }
-                    other => break other,
+                let result = session.complete_response_id(&prompt, id);
+                let Some(reason) = resample_reason(&result)
+                    .filter(|_| resamples < MAX_RESAMPLES)
+                else {
+                    break result;
+                };
+                resamples += 1;
+                // A discarded draw's usage stays in the session's
+                // `total_usage` — the work was done, as for any failed
+                // call — but the client and `log_stats` see only the
+                // draw that is answered.
+                match reason {
+                    // Pieces logged verbatim: stderr is operator-facing,
+                    // never model-visible. The redaction discipline
+                    // applies to `Display`, which is relayed to clients.
+                    Resample::SpecialToken(found) => error!(
+                        attempt = resamples,
+                        max = MAX_RESAMPLES,
+                        found = ?found,
+                        "generation emitted reserved special token(s) in \
+                         free text; resampling on the warm cache (#101)",
+                    ),
+                    Resample::GrammarViolation(e) => error!(
+                        attempt = resamples,
+                        max = MAX_RESAMPLES,
+                        error = %e,
+                        "resampling after grammar violation",
+                    ),
+                    Resample::CallLoop => error!(
+                        attempt = resamples,
+                        max = MAX_RESAMPLES,
+                        "turn cut by max_tokens after repeating a tool \
+                         call verbatim; resampling (Phase G loop)",
+                    ),
                 }
             };
             (session, result, start.elapsed(), resamples)
@@ -827,6 +804,42 @@ where
     let response = result.map_err(map_session_err)?;
     log_stats(&response.id, response.usage.clone(), elapsed);
     Ok(Json(response))
+}
+
+/// Why a draw is resampled on the warm cache instead of answered — each
+/// an unlucky path a fresh draw usually escapes — or `None` to answer
+/// it. The caller bounds the retries (`MAX_RESAMPLES`).
+#[derive(Debug)]
+enum Resample<'r> {
+    /// Reserved special token(s) in free text (#101). Containment
+    /// leaves the prompt's cache extent warm, so the retry re-prefills
+    /// nothing.
+    SpecialToken(&'r [String]),
+    /// An unsatisfied constraint. The session invalidates its own cache
+    /// here, so the retry re-prefills; still cheaper than the client's
+    /// round trip.
+    GrammarViolation(&'r drama_llama::SessionError),
+    /// A cut turn looping identical calls into the budget
+    /// ([`loops_a_call`]). Any other cut turn — `max_tokens`, a stop
+    /// sequence — is not one of these: it succeeds with that stop
+    /// reason, as on Anthropic (#121).
+    CallLoop,
+}
+
+fn resample_reason(
+    result: &Result<MessageResponse, drama_llama::SessionError>,
+) -> Option<Resample<'_>> {
+    use drama_llama::SessionError;
+    match result {
+        Err(SessionError::EmittedSpecialToken { found }) => {
+            Some(Resample::SpecialToken(found))
+        }
+        Err(e @ SessionError::GrammarViolation { .. }) => {
+            Some(Resample::GrammarViolation(e))
+        }
+        Ok(response) if loops_a_call(response) => Some(Resample::CallLoop),
+        _ => None,
+    }
 }
 
 /// The loop signature the Phase G postmortem found: a turn the budget
@@ -1452,6 +1465,44 @@ mod tests {
         let mut finished = cut_response(&[a, a]);
         finished.stop_reason = Some(StopReason::ToolUse);
         assert!(!loops_a_call(&finished));
+    }
+
+    /// The resample arms, the Phase G one included: a looping cut
+    /// turn is redrawn, an ordinary one (or a finished one) answered;
+    /// a special token or a grammar violation is redrawn, any other
+    /// error answered.
+    #[test]
+    fn resample_reason_redraws_only_the_unlucky_paths() {
+        use drama_llama::SessionError;
+        let a = ("get_weather", r#"{"city": "Paris"}"#);
+        let b = ("get_weather", r#"{"city": "Oslo"}"#);
+        let reason = |r| resample_reason(&r).map(|r| format!("{r:?}"));
+
+        let looping = Ok(cut_response(&[a, a]));
+        assert!(matches!(
+            resample_reason(&looping),
+            Some(Resample::CallLoop)
+        ));
+        assert_eq!(reason(Ok(cut_response(&[a, b]))), None);
+        let mut finished = cut_response(&[a, a]);
+        finished.stop_reason = Some(StopReason::ToolUse);
+        assert_eq!(reason(Ok(finished)), None);
+
+        let special = Err(SessionError::EmittedSpecialToken {
+            found: vec!["<|im_end|>".into()],
+        });
+        assert!(matches!(
+            resample_reason(&special),
+            Some(Resample::SpecialToken([found])) if found == "<|im_end|>"
+        ));
+        let violation = Err(SessionError::GrammarViolation {
+            partial_output: drama_llama::prompt::Content(Vec::new()),
+        });
+        assert!(matches!(
+            resample_reason(&violation),
+            Some(Resample::GrammarViolation(_))
+        ));
+        assert_eq!(reason(Err(SessionError::TrailingMedia)), None);
     }
 
     /// #123: a body over the limit is Anthropic's 413
