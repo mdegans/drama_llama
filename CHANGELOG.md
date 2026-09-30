@@ -97,17 +97,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the call in flight, Harmony blocks included.
 - **Request `stop_sequences` stop generation (#122).** They were read
   only after the fact, to label a turn that happened to end on one.
-  Generation now stops at the first match **in text output**, the
-  match is cut from the output, and the response reports
+  Generation now stops at the first match **in client-visible
+  text**, the match is cut from the output, and the response reports
   `stop_reason: stop_sequence` with `stop_sequence` set — batch,
   `complete_text` and `complete_stream` alike (the stream holds back
-  text that could still grow into a stop sequence). Only prose
-  (`Block::Text`) is matched, through the dialect parser: never
-  framing (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`/`[ARGS]`,
-  Harmony headers, EOG pieces), never a tool call's input, never
-  thinking — a stop of `"\n"` matched against raw bytes killed every
-  Qwen call at its opener. (Anthropic's behavior inside `thinking` and
-  `tool_use` input is uncaptured; a stop never withholds a call.) The
+  text that could still grow into a stop sequence). Matching goes
+  through the dialect parser and sees only prose (`Block::Text`) and
+  the string values of a tool call's input; a match in a call's input
+  **withholds that call**, as a clip does, and the prose before it
+  stands. Never matched: thinking, and framing — the dialect's markers
+  (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`/`[ARGS]`, Harmony
+  headers, EOG pieces) and the whitespace between prose and a
+  structure (`"Sure, checking.\n\n<tool_call>"`, `"</think>\n\n"`).
+  A stop of `"\n"` matched against raw bytes killed every Qwen call at
+  its opener, and matched against the prose the parser seats before a
+  call, it still did. Whitespace inside prose, or ending a turn that
+  finished cleanly, is text and matches. (Anthropic's behavior inside
+  `thinking` and `tool_use` input is uncaptured.) The
   predictor no longer carries a request's stops; its own stop-string
   window is now sized from the stop strings' byte lengths too — it was
   sized from token-sequence lengths alone and missed any stop string

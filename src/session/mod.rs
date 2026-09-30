@@ -5796,32 +5796,39 @@ impl<B: Backend> Session<B> {
         // the predictor so it releases the engine borrow — we need
         // `&self.engine` for `trim_eos` below.
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
+        let clipped = Cut::of(&predictor).is_some();
         drop(predictor);
 
         // A stop sequence is never part of the output (#122), here as
-        // in `run_call`: the raw bytes end just before it. The recorded
-        // tip below stays LCP-only (no hash), which compares token ids,
-        // so the stop's leading tokens sitting in KV cannot be spliced
-        // under a render without them.
+        // in `run_call`: the raw bytes end where the cut output does —
+        // before the stop, or before the call whose input matched. The
+        // recorded tip below stays LCP-only (no hash), which compares
+        // token ids, so the stop's leading tokens sitting in KV cannot
+        // be spliced under a render without them.
         let mut trimmed = trim_eos(&text, &self.engine).to_string();
-        if let Some(filter) = &stop_filter {
-            let hit = filter.hit().map(str::to_owned);
+        let hit = stop_filter.as_mut().and_then(|f| {
+            f.finish(clipped);
+            f.hit().map(str::to_owned)
+        });
+        if let Some(hit) = hit {
             let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
-            let visible = |prefix: &str| {
-                let parsed = crate::dialect::parse_text(
+            let parse = |prefix: &str| {
+                crate::dialect::parse_text(
                     &parse_syntax,
                     &tool_refs,
                     prefix,
                     pre_opened_reasoning,
                     crate::dialect::Leniency::Clipped,
-                );
-                let blocks = merge_adjacent_prose(parsed.blocks);
-                match &hit {
-                    Some(hit) => stop::cut_at_stop(blocks, &[hit]).1,
-                    None => stop::cut_at_stop(blocks, &stops).1,
-                }
+                )
             };
-            if let Some(at) = stop::raw_stop_cut(&trimmed, visible) {
+            let view = |prefix: &str| {
+                let parsed = parse(prefix);
+                (parsed.status == crate::dialect::ParseStatus::Complete)
+                    .then(|| merge_adjacent_prose(parsed.blocks))
+            };
+            let blocks = merge_adjacent_prose(parse(&trimmed).blocks);
+            let (kept, _) = stop::cut_at_stop(blocks, &[&hit]);
+            if let Some(at) = stop::raw_stop_cut(&trimmed, &kept, view) {
                 trimmed.truncate(at);
             }
         }
@@ -6287,7 +6294,8 @@ impl<B: Backend> Session<B> {
             raw_text.push_str(&piece);
             uncommitted_bytes = piece.len();
 
-            // A stop sequence in text output ends the turn (#122).
+            // A stop sequence in client-visible text ends the turn
+            // (#122).
             if let Some(filter) = stop_filter.as_mut() {
                 filter.push(&piece);
                 if filter.hit().is_some() {
@@ -6357,27 +6365,19 @@ impl<B: Backend> Session<B> {
                 parsed.status == crate::dialect::ParseStatus::NeedMoreInput;
             (merge_adjacent_prose(parsed.blocks), withheld)
         };
-        // A stop sequence (#122) is found in the text output of the
-        // clipped parse: the one the filter stopped on, or — when the
-        // turn ended first — any in the prose the end flushed. The
-        // output is cut there, everything after it gone.
-        let hit = stop_filter
-            .as_ref()
-            .and_then(|f| f.hit())
-            .map(str::to_owned);
-        let stopped = (!stops.is_empty())
-            .then(|| {
-                let (blocks, _) = parse(crate::dialect::Leniency::Clipped);
-                let (blocks, found) = match &hit {
-                    Some(hit) => stop::cut_at_stop(blocks, &[hit]),
-                    None => stop::cut_at_stop(blocks, &stops),
-                };
-                found.or(hit).map(|stop| (blocks, stop))
-            })
-            .flatten();
-        let (blocks, cut, withheld) = match stopped {
+        // A stop sequence (#122): the one the filter stopped on, or —
+        // when the turn ended first — one in what the end flushed. The
+        // clipped parse is cut there by the same rules, everything
+        // after it gone (a call whose input matched included).
+        let hit = stop_filter.as_mut().and_then(|f| {
+            f.finish(budget.is_some());
+            f.hit().map(str::to_owned)
+        });
+        let (blocks, cut, withheld) = match hit {
             // Its KV no longer matches the output either way.
-            Some((blocks, stop)) => {
+            Some(stop) => {
+                let (blocks, _) = parse(crate::dialect::Leniency::Clipped);
+                let (blocks, _) = stop::cut_at_stop(blocks, &[&stop]);
                 (blocks, Some(Cut::StopSequence(stop)), true)
             }
             None => {
@@ -7360,8 +7360,9 @@ struct CallOutcome {
 enum Cut {
     /// `max_tokens` (or the context window) ran out.
     Budget,
-    /// A request stop sequence matched in text output: the matched
-    /// string, already cut out of the output.
+    /// A request stop sequence matched in client-visible text — prose,
+    /// or a call's input, which withholds the call: the matched string,
+    /// the output already cut at it.
     StopSequence(String),
 }
 
@@ -7536,11 +7537,12 @@ fn infer_stop_reason(
 ///
 /// Endings match the batch path's. A request stop sequence ends the
 /// stream and never appears in it — prose that could still grow into
-/// one is held back until it can't (#122). Only text output is matched,
-/// never framing, a call or a thought (see `stop::StopFilter`). A
-/// generation cut short
-/// (`max_tokens`, a stop sequence) withholds an incomplete trailing
-/// call instead of yielding its bytes as text (#121). Like the batch
+/// one is held back until it can't (#122). Only text is matched — prose
+/// and a call's input values, a match there withholding the call —
+/// never framing (whitespace beside a structure included) or a thought
+/// (see `stop::StopFilter`). A generation cut short (`max_tokens`, a
+/// stop sequence) withholds an incomplete trailing call instead of
+/// yielding its bytes as text (#121). Like the batch
 /// path, it halts once the grammar is exhausted. Once drained,
 /// [`Self::stop_reason`] reports the ending the batch path would.
 pub struct BlockStream<'engine, B: Backend> {
@@ -7548,7 +7550,7 @@ pub struct BlockStream<'engine, B: Backend> {
     /// Re-parse-per-tick streaming parser over the session dialect
     /// (owned — the session borrow is held by `predictor` for the
     /// stream's lifetime), with the request's stop sequences matched
-    /// against the prose it releases (#122).
+    /// against the text it releases (#122).
     filter: stop::StopFilter,
     pending: std::collections::VecDeque<crate::Block>,
     /// Piece texts of the model's end-of-generation tokens

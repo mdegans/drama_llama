@@ -150,6 +150,21 @@ impl StreamParser {
         self.reparse(Leniency::Clipped)
     }
 
+    /// Whether the text so far ends in a structure a clipped flush
+    /// withholds ([`Leniency::Clipped`]): framing in flight, not prose.
+    pub(crate) fn withholds(&self) -> bool {
+        let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
+        parse_text(
+            &self.syntax,
+            &tool_refs,
+            &self.text,
+            self.pre_opened_reasoning,
+            Leniency::Clipped,
+        )
+        .status
+            == ParseStatus::NeedMoreInput
+    }
+
     /// Longest tail of `text` that is a proper prefix of a dialect
     /// marker the prose scanner could re-classify — the open
     /// landmarks (call trigger, reasoning open) *and* the close
