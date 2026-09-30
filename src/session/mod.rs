@@ -118,8 +118,8 @@ use crate::{
     ToolChoice, ToolChoiceError, ToolChoiceOptions,
 };
 
-#[cfg(feature = "tokio")]
 mod stop;
+#[cfg(feature = "tokio")]
 mod transport;
 #[cfg(feature = "tokio")]
 pub use transport::{LocalTransport, SessionTransport};
