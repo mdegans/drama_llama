@@ -67,7 +67,8 @@ pub enum Leniency {
     /// no representation (half a JSON value is not a value) and must
     /// never be dispatchable — nor seated as prose, where its frame
     /// marker poisons the next ingest. The calls that *closed* before
-    /// the cut stand.
+    /// the cut stand. A call the cut left malformed-looking, running to
+    /// the end of input, is the call in flight and is withheld too.
     ///
     /// One exception: a trigger-less dialect (bare-JSON, Llama 3.1)
     /// cannot tell a clipped call from clipped prose JSON — its call
@@ -781,6 +782,15 @@ impl<'a> Parser<'a> {
                         Some(next) => call_start + step + next,
                         None => self.text.len(),
                     };
+                    // A cut can leave a call malformed-looking (the
+                    // clip, not the model, broke it); running to the
+                    // end of input it is the call in flight, withheld.
+                    if upto == self.text.len()
+                        && self.leniency == Leniency::Clipped
+                    {
+                        self.incomplete(call_start);
+                        return;
+                    }
                     let chunk = self.text[call_start..upto].to_string();
                     self.push_text(&chunk);
                     self.pos = upto;
@@ -859,6 +869,14 @@ impl<'a> Parser<'a> {
                         Some(next) => block_start + 1 + next,
                         None => self.text.len(),
                     };
+                    // Cut short mid-block: withheld, as a malformed call
+                    // running to the end is in the generic loop.
+                    if upto == self.text.len()
+                        && self.leniency == Leniency::Clipped
+                    {
+                        self.incomplete(block_start);
+                        return;
+                    }
                     let chunk = self.text[block_start..upto].to_string();
                     self.push_text(&chunk);
                     self.pos = upto;
@@ -1414,6 +1432,11 @@ impl<'a> Parser<'a> {
         let name = self.rest()[..name_end].to_string();
         self.pos += name_end + f.name_suffix.len();
 
+        // Nothing past the name yet (`[TOOL_CALLS]name[ARGS]` and a
+        // cut): the arguments are still coming, not malformed.
+        if self.rest().trim().is_empty() {
+            return CallOutcome::Incomplete;
+        }
         let Some((json_len, complete)) = balanced_json_len(self.rest()) else {
             return CallOutcome::Malformed;
         };
@@ -3545,11 +3568,27 @@ mod tests {
             .collect()
     }
 
+    /// Mistral Small 4's `[TOOL_CALLS]name[ARGS]{…}` — what the
+    /// analyzer derives for it (`tests/dialect_analyzer.rs`).
+    fn mistral_tag_json() -> CallSyntax {
+        CallSyntax {
+            family: Family::TagWithJson,
+            per_call_start: "[TOOL_CALLS]".into(),
+            function: crate::dialect::FunctionSyntax {
+                name_prefix: String::new(),
+                name_suffix: "[ARGS]".into(),
+                close: String::new(),
+            },
+            ..CallSyntax::default()
+        }
+    }
+
     /// Cut anywhere inside a call, the call is withheld — no
     /// `ToolUse`, and none of its bytes seated as prose (the frame
     /// marker would poison the next ingest) — while the prose before it
     /// stands. `Final` on the same input is the contrast: it degrades
-    /// the partial call into `Text`.
+    /// the partial call into `Text`. A call that does parse at a cut
+    /// (only its close marker missing) must be the whole call.
     #[test]
     fn clipped_withholds_a_partial_call_and_keeps_the_prose() {
         let input = json!({"city": "Paris", "days": 3, "detail": "x"});
@@ -3559,6 +3598,7 @@ mod tests {
             CallSyntax::hermes_json(),
             CallSyntax::qwen_xml(),
             CallSyntax::gemma4(),
+            mistral_tag_json(),
         ] {
             let call =
                 render_reference(&syntax, &[("get_weather", &input)]).unwrap();
@@ -3574,10 +3614,17 @@ mod tests {
                 let cut = &full[..i];
                 let clipped =
                     parse_text(&syntax, &[&t], cut, false, Leniency::Clipped);
-                if !calls_of(&clipped.blocks).is_empty() {
+                let calls = calls_of(&clipped.blocks);
+                if !calls.is_empty() {
                     // The call's value closed before the cut (only its
-                    // close marker is missing): it parsed whole and
-                    // stands, exactly as under Final.
+                    // close marker is missing): it stands, exactly as
+                    // under Final — but only whole.
+                    assert_eq!(
+                        calls,
+                        [("get_weather", &input)],
+                        "{:?} cut at {i}: a partial call was dispatchable",
+                        syntax.family,
+                    );
                     continue;
                 }
                 assert_eq!(
@@ -3631,15 +3678,49 @@ mod tests {
                 false,
                 Leniency::Clipped,
             );
-            if !calls_of(&clipped.blocks).is_empty() {
+            let calls = calls_of(&clipped.blocks);
+            if !calls.is_empty() {
+                assert_eq!(
+                    calls,
+                    [("get_weather", &input)],
+                    "cut at {i}: a partial call was dispatchable",
+                );
                 continue;
             }
+            assert_eq!(clipped.status, ParseStatus::NeedMoreInput, "cut {i}");
             let text = texts_of(&clipped.blocks);
             assert!(
                 !text.contains("<|") && !text.contains("functions."),
                 "cut at {i}: partial call leaked into prose: {text:?}",
             );
         }
+    }
+
+    /// `[TOOL_CALLS]name[ARGS]` with nothing after it is a call whose
+    /// arguments are still coming, not a malformed one: the streaming
+    /// parser waits instead of yielding the frame as prose, and a clip
+    /// there withholds it.
+    #[test]
+    fn tag_json_call_at_its_args_marker_is_incomplete() {
+        let syntax = mistral_tag_json();
+        let t = tool("get_weather");
+        for head in ["[TOOL_CALLS]get_weather[ARGS]", "[TOOL_CALLS]x[ARGS] "] {
+            let clipped =
+                parse_text(&syntax, &[&t], head, false, Leniency::Clipped);
+            assert_eq!(clipped.status, ParseStatus::NeedMoreInput, "{head:?}");
+            assert!(clipped.blocks.is_empty(), "{head:?}: {clipped:#?}");
+        }
+
+        let mut p = StreamParser::new(syntax, vec![t], false);
+        let mut out = p.push("[TOOL_CALLS]get_weather[ARGS]");
+        assert!(out.is_empty(), "frame yielded as prose: {out:#?}");
+        out.extend(p.push(r#"{"city": "Paris", "days": 3}"#));
+        out.extend(p.finish());
+        assert!(texts_of(&out).is_empty(), "{out:#?}");
+        assert_eq!(
+            calls_of(&out),
+            [("get_weather", &json!({"city": "Paris", "days": 3}))],
+        );
     }
 
     /// Calls that closed before the cut stand; only the one in flight is
@@ -3650,7 +3731,11 @@ mod tests {
         let t = tool("get_weather");
         let a = json!({"city": "Paris", "days": 3});
         let b = json!({"city": "Oslo", "days": 5});
-        for syntax in [CallSyntax::hermes_json(), CallSyntax::qwen_xml()] {
+        for syntax in [
+            CallSyntax::hermes_json(),
+            CallSyntax::qwen_xml(),
+            mistral_tag_json(),
+        ] {
             let first =
                 render_reference(&syntax, &[("get_weather", &a)]).unwrap();
             let second =

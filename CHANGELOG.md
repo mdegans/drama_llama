@@ -77,6 +77,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   matches its output (call withheld, or cut mid-constraint) records
   its prompt extent but no auto-tip, leaving the generated span to the
   next call's LCP walk.
+- **A Mistral call at its `[ARGS]` marker is incomplete, not
+  malformed.** `[TOOL_CALLS]name[ARGS]` with nothing after it (the
+  arguments not yet generated) parsed as malformed, so the streaming
+  parser yielded the frame as prose and a clip there seated it in a
+  `Text` block. It now waits (streaming) or is withheld (clipped).
+  Under `Leniency::Clipped`, any call that the cut left
+  malformed-looking and that runs to the end of input is withheld as
+  the call in flight, Harmony blocks included.
 - **Request `stop_sequences` stop generation (#122).** They were read
   only after the fact, to label a turn that happened to end on one.
   Generation now stops at the first match, the match is cut from the
