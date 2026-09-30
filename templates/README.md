@@ -151,11 +151,22 @@ the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
    thought and cannot be byte-stable anyway; it renders exactly as
    stock, 3.6's `lstrip('\n')` of the answer included
    (`qwen_cache_stable_aged_turn_renders_as_stock`).
+5. A **system turn after the leading run** renders as its own
+   `<|im_start|>system\n…<|im_end|>` block, content trimmed like the
+   leading system text, where it was seated. Stock 3.8 raises
+   ("System message must be at the beginning.", live on
+   Qwen3.8-27B 2026-09-30) and stock 3.6 drops it silently — so a
+   misanthropic `Chat` in-conversation System note either failed the
+   request or never reached the model. Anthropic's Messages API seats
+   such turns on some models; Mistral 4's bake made the same call
+   (its point 5). Pinned, with both stock behaviours as controls:
+   `qwen_cache_stable_renders_mid_conversation_system`.
 
-System, user and tool turns, the reasoning-effort block (3.8), tool
-declarations, tool-call bodies and the generation prompt are
-byte-identical to stock, and the dialect analyzer measures the same
-`CallSyntax` for each pair (`qwen_cache_stable_analyzes_like_stock`).
+The leading system/tools header, user and tool turns, the
+reasoning-effort block (3.8), tool declarations, tool-call bodies and
+the generation prompt are byte-identical to stock, and the dialect
+analyzer measures the same `CallSyntax` for each pair
+(`qwen_cache_stable_analyzes_like_stock`).
 Round-trip pins: `session::tests::qwen_cache_stable_round_trips`.
 
 Irreducible, and pinned there so an improvement flips them

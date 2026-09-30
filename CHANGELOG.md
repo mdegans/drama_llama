@@ -95,6 +95,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   generation prompt's trailing newline token under BPE (`\n\n` + `\n`
   → `\n\n\n`), so such a turn still re-prefills unless its tip is
   reached by hash.
+- **A mid-conversation system turn renders on Qwen3.6 and Qwen3.8.**
+  misanthropic's `Chat` seats in-conversation System notes (Anthropic
+  accepts them on some models), and stock Qwen3.8 raises on any system
+  turn past the leading run — "chat template raised: System message
+  must be at the beginning." (live, Qwen3.8-27B `UD-Q8_K_XL`,
+  2026-09-30) failed the whole request. Stock Qwen3.6 accepted the
+  same request only by dropping the note without a word, so the model
+  never saw it. Both baked cache-stable templates now render such a
+  turn as its own `<|im_start|>system\n…<|im_end|>` block where it was
+  seated, content trimmed like the leading system text; the leading
+  system/tools header is byte-identical to stock and the analyzed
+  dialect is unchanged
+  (`qwen_cache_stable_renders_mid_conversation_system`, deviation 5 in
+  `templates/README.md`). blallama already answered a template raise
+  with Anthropic's 400 `invalid_request_error`, not a 500; that is now
+  pinned (`template_raise_is_anthropic_400_envelope`).
 - **A forced Harmony call can no longer run to `max_tokens` in
   analysis and commentary.** The eager (`tool_choice` `any` / `tool`)
   gpt-oss grammar admitted any number of analysis and commentary

@@ -386,6 +386,85 @@ fn qwen_cache_stable_prefix_continuity() {
     }
 }
 
+/// A system turn after the leading one — misanthropic's `Chat` seats
+/// in-conversation System notes, as Anthropic's API allows on some
+/// models — renders in the format's own `<|im_start|>system` framing
+/// in both owned Qwen templates. Stock 3.8 raises on it ("System
+/// message must be at the beginning.", live on Qwen3.8-27B 2026-09-30)
+/// and stock 3.6 drops it without a word; both controls are pinned.
+/// Everything around the note — the leading system/tools header
+/// included — renders exactly as it does without the note, and exactly
+/// as stock renders that note-free conversation.
+#[test]
+fn qwen_cache_stable_renders_mid_conversation_system() {
+    let eos = "<|im_end|>";
+    let text = |role, text: &'static str| Message {
+        role,
+        content: Content::text(text),
+    };
+    let prompt = |note: bool| Prompt {
+        system: Some(Content::text("You keep the lighthouse.")),
+        messages: [
+            Some(text(Role::User, "Who checks the fog signal?")),
+            Some(text(Role::Assistant, "Ada checks it.")),
+            note.then(|| text(Role::System, "  The lamp is out.\n")),
+            Some(text(Role::User, "And the lamp?")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        tools: Some(vec![test_tool().into()]),
+        ..Prompt::default()
+    };
+    let render = |name: &str, prompt: &Prompt| {
+        ChatTemplate::from_source(
+            fixture_source(name),
+            String::new(),
+            eos.to_owned(),
+        )
+        .expect("template compiles")
+        .render_with(
+            prompt,
+            &RenderOptions::default().with_generation_prompt(true),
+        )
+    };
+    let block = "<|im_start|>system\nThe lamp is out.<|im_end|>\n";
+    for (stock, owned) in [
+        ("qwen3.6-gguf.jinja", "qwen3.6-cache-stable.jinja"),
+        ("qwen3.8-gguf.jinja", "qwen3.8-cache-stable.jinja"),
+    ] {
+        let without = render(owned, &prompt(false)).expect("render");
+        assert_eq!(
+            without,
+            render(stock, &prompt(false)).expect("stock render"),
+            "{owned}: a note-free conversation must render as stock",
+        );
+        let with = render(owned, &prompt(true)).expect("render");
+        let at = without
+            .find("<|im_start|>user\nAnd the lamp?")
+            .expect("final user turn");
+        assert_eq!(
+            with,
+            format!("{}{block}{}", &without[..at], &without[at..]),
+            "{owned}: the note renders as its own system block between \
+             the turns it was seated between",
+        );
+        // Stock's handling, which motivated the patch.
+        match render(stock, &prompt(true)) {
+            Err(e) => assert!(
+                stock.starts_with("qwen3.8")
+                    && e.to_string()
+                        .contains("System message must be at the beginning"),
+                "{stock}: {e}",
+            ),
+            Ok(dropped) => assert!(
+                stock.starts_with("qwen3.6") && dropped == without,
+                "{stock}: stock 3.6 drops the note silently",
+            ),
+        }
+    }
+}
+
 /// Aged-*thinking* continuity for Qwen3.6 — the gap
 /// [`qwen36_prefix_continuity`] deliberately leaves open: it ages by a
 /// tool response (which the stock template's `last_query_index`

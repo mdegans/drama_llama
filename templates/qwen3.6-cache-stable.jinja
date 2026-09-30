@@ -11,11 +11,13 @@
     of the whole turn (the auto-tip) is lost on the next request.
 
     What this template changes, and nothing else: the ASSISTANT turn
-    renders verbatim (see the patch comment in the message loop), and
-    the prose-to-call gap is supplied only when the prose does not end
-    in whitespace. System, user and tool turns, `preserve_thinking`,
-    tool-call rendering and the generation prompt are byte-identical to
-    stock.
+    renders verbatim (see the patch comment in the message loop), the
+    prose-to-call gap is supplied only when the prose does not end in
+    whitespace, and a system turn after the leading run renders as its
+    own `<|im_start|>system` block where stock silently drops it. The
+    leading system/tools header, user and tool turns,
+    `preserve_thinking`, tool-call rendering and the generation prompt
+    are byte-identical to stock.
 -#}
 {%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
@@ -104,10 +106,21 @@
     {%- endif %}
 {%- endfor %}
 {%- for message in messages %}
-    {%- if loop.index0 >= num_sys and message.role != "system" and message.role != "developer" %}
+    {%- if loop.index0 >= num_sys %}
     {%- set raw_content = render_content(message.content, true) %}
     {%- set content = raw_content|trim %}
-    {%- if message.role == "user" %}
+    {%- if message.role == "system" or message.role == "developer" %}
+        {#- Mid-conversation system patch (drama_llama): stock skips
+            every system turn but the leading one or two (merged
+            above) without a word, so the model never sees it.
+            Anthropic's Messages API seats system turns
+            mid-conversation on some models, so it renders in the
+            format's own framing instead, its content trimmed like the
+            leading system text. Leading system turns still merge into
+            the header above, byte-identical to stock. -#}
+        {%- set sys_content = render_content(message.content, false, true)|trim %}
+        {{- '<|im_start|>system\n' + sys_content + '<|im_end|>\n' }}
+    {%- elif message.role == "user" %}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
     {%- elif message.role == "assistant" %}
         {#- Cache-stability patch (drama_llama): the model's own turn is

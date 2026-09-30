@@ -1542,6 +1542,58 @@ mod tests {
         assert_eq!(value["error"]["type"], "invalid_request_error");
     }
 
+    /// A chat template that raises on the request's content — here the
+    /// stock Qwen3.8 template's "System message must be at the
+    /// beginning." on a mid-conversation system turn, live 2026-09-30 —
+    /// is the request's fault: Anthropic's 400 `invalid_request_error`
+    /// in the error envelope, not a retryable 500, and the session
+    /// survives it.
+    #[test]
+    fn template_raise_is_anthropic_400_envelope() {
+        use drama_llama::{
+            prompt::{Message, Role},
+            ChatTemplate, Content, RenderOptions,
+        };
+        let template = ChatTemplate::from_source(
+            drama_llama::baked::QWEN38.stock.to_owned(),
+            String::new(),
+            "<|im_end|>".to_owned(),
+        )
+        .expect("template compiles");
+        let text = |role, text: &str| Message {
+            role,
+            content: Content::text(text.to_owned()),
+        };
+        let prompt = Prompt {
+            messages: vec![
+                text(Role::User, "Who checks the fog signal?"),
+                text(Role::Assistant, "Ada checks it."),
+                text(Role::System, "The lamp is out."),
+                text(Role::User, "And the lamp?"),
+            ],
+            ..Prompt::default()
+        };
+        let error = drama_llama::SessionError::from(
+            template
+                .render_with(&prompt, &RenderOptions::default())
+                .expect_err(
+                    "stock Qwen3.8 raises on a mid-conversation system",
+                ),
+        );
+        assert!(error.is_reusable_after(), "{error}");
+        let (status, Json(envelope)) = map_session_err(error);
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("System message must be at")),
+            "{value}",
+        );
+    }
+
     /// A response as the wire carries it, cut by `max_tokens` after
     /// `calls` (name, input JSON).
     fn cut_response(calls: &[(&str, &str)]) -> MessageResponse {

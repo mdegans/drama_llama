@@ -11,9 +11,11 @@
     the next request.
 
     What this template changes, and nothing else: the ASSISTANT turn
-    renders verbatim (see the patch comment in the message loop), and
-    the prose-to-call gap is supplied only when the prose does not end
-    in whitespace. System, user and tool turns, reasoning effort,
+    renders verbatim (see the patch comment in the message loop), the
+    prose-to-call gap is supplied only when the prose does not end in
+    whitespace, and a system turn after the leading run renders as its
+    own `<|im_start|>system` block where stock raises. The leading
+    system/tools header, user and tool turns, reasoning effort,
     `preserve_thinking`, tool-call rendering and the generation prompt
     are byte-identical to stock.
 -#}
@@ -127,7 +129,15 @@
     {%- set raw_content = render_content(message.content, true) %}
     {%- set content = raw_content|trim %}
     {%- if message.role == "system" or message.role == "developer" %}
-        {{- raise_exception('System message must be at the beginning.') }}
+        {#- Mid-conversation system patch (drama_llama): stock raises
+            'System message must be at the beginning.' Anthropic's
+            Messages API seats system turns mid-conversation on some
+            models, so a non-leading system turn renders in the
+            format's own framing instead, its content trimmed like the
+            leading system text. Leading system turns still merge into
+            the header above, byte-identical to stock. -#}
+        {%- set sys_content = render_content(message.content, false, true)|trim %}
+        {{- '<|im_start|>system\n' + sys_content + '<|im_end|>\n' }}
     {%- elif message.role == "user" %}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
     {%- elif message.role == "assistant" %}
