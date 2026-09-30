@@ -20,7 +20,9 @@
 //! [`ParseStatus::NeedMoreInput`]. [`Leniency::Final`] converts the
 //! incomplete tail into a [`Block::Text`] fallback — the historic
 //! `BlockParser::finish` contract; Session decides whether that is a
-//! grammar violation.
+//! grammar violation. [`Leniency::Clipped`] is the end of a generation
+//! that was *cut short* (`max_tokens`, a stop sequence): an incomplete
+//! call is withheld, an incomplete thought surfaces open.
 //!
 //! ## Coercion & healing (llama.cpp mapper parity)
 //!
@@ -55,6 +57,24 @@ pub enum Leniency {
     Streaming,
     /// End of generation: partials degrade to [`Block::Text`].
     Final,
+    /// End of a generation that was cut short — `max_tokens` ran out
+    /// or a stop sequence fired (#121, #122). An incomplete **call** is
+    /// withheld, exactly as under [`Self::Streaming`] (and reported as
+    /// [`ParseStatus::NeedMoreInput`]); an incomplete **thought**
+    /// surfaces as an open thought, exactly as under [`Self::Final`].
+    ///
+    /// Withheld rather than degraded because a half-emitted call has
+    /// no representation (half a JSON value is not a value) and must
+    /// never be dispatchable — nor seated as prose, where its frame
+    /// marker poisons the next ingest. The calls that *closed* before
+    /// the cut stand.
+    ///
+    /// One exception: a trigger-less dialect (bare-JSON, Llama 3.1)
+    /// cannot tell a clipped call from clipped prose JSON — its call
+    /// landmark is any `{` — so there the tail degrades as under
+    /// `Final`, and structured output clipped mid-object keeps its
+    /// text.
+    Clipped,
 }
 
 #[derive(Debug)]
@@ -119,6 +139,14 @@ impl StreamParser {
     /// bytes are released.
     pub fn finish(&mut self) -> Vec<Block> {
         self.reparse(Leniency::Final)
+    }
+
+    /// Flush a generation that was cut short (`max_tokens`, a stop
+    /// sequence) per [`Leniency::Clipped`]: an incomplete trailing
+    /// call is withheld instead of degrading to text; everything else
+    /// flushes as [`Self::finish`] would.
+    pub fn finish_clipped(&mut self) -> Vec<Block> {
+        self.reparse(Leniency::Clipped)
     }
 
     /// Longest tail of `text` that is a proper prefix of a dialect
@@ -371,14 +399,23 @@ impl<'a> Parser<'a> {
     /// The incomplete tail starting at `from`: suppress or degrade
     /// per leniency.
     fn incomplete(&mut self, from: usize) {
-        match self.leniency {
-            Leniency::Streaming => {
-                self.status = ParseStatus::NeedMoreInput;
+        let withhold = match self.leniency {
+            Leniency::Streaming => true,
+            Leniency::Final => false,
+            // See `Leniency::Clipped` for the bare-JSON exception.
+            // Scoped to the family, not to `trigger()` alone: Harmony
+            // has no single trigger either, but its landmarks are all
+            // frame markers.
+            Leniency::Clipped => {
+                !(self.syntax.family == Family::JsonNative
+                    && self.syntax.trigger().is_empty())
             }
-            Leniency::Final => {
-                let tail = self.text[from..].to_string();
-                self.push_text(&tail);
-            }
+        };
+        if withhold {
+            self.status = ParseStatus::NeedMoreInput;
+        } else {
+            let tail = self.text[from..].to_string();
+            self.push_text(&tail);
         }
         self.pos = self.text.len();
     }
@@ -437,7 +474,7 @@ impl<'a> Parser<'a> {
                                     self.status = ParseStatus::NeedMoreInput;
                                     self.pos = self.text.len();
                                 }
-                                Leniency::Final => {
+                                Leniency::Final | Leniency::Clipped => {
                                     // Unclosed thought at end of generation:
                                     // surface what we have as an *open*
                                     // Thought — the model was cut off
@@ -658,7 +695,7 @@ impl<'a> Parser<'a> {
                             self.status = ParseStatus::NeedMoreInput;
                             self.pos = self.text.len();
                         }
-                        Leniency::Final => {
+                        Leniency::Final | Leniency::Clipped => {
                             let body = self.rest().to_string();
                             self.push_open_thought(&body);
                             self.pos = self.text.len();
@@ -941,7 +978,7 @@ impl<'a> Parser<'a> {
             }
             None => match self.leniency {
                 Leniency::Streaming => CallOutcome::Incomplete,
-                Leniency::Final => {
+                Leniency::Final | Leniency::Clipped => {
                     let body = strip_harmony_eog(self.rest()).to_string();
                     // Open: the analysis channel never closed. Harmony
                     // can't *render* an open thought (its generation
@@ -1341,8 +1378,9 @@ impl<'a> Parser<'a> {
         if len == 0 {
             return DictOutcome::Malformed;
         }
-        // A number at end-of-input could still grow more digits.
-        if len == rest.len() && self.leniency == Leniency::Streaming {
+        // A number at end-of-input could still grow more digits — and
+        // on a clip, would have: the cut is not the number's end.
+        if len == rest.len() && self.leniency != Leniency::Final {
             return DictOutcome::Incomplete;
         }
         match serde_json::from_str::<Value>(&rest[..len]) {
@@ -3491,5 +3529,218 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Leniency::Clipped — a generation cut short (#121, #122).
+    // -----------------------------------------------------------------
+
+    fn texts_of(blocks: &[Block]) -> String {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Cut anywhere inside a call, the call is withheld — no
+    /// `ToolUse`, and none of its bytes seated as prose (the frame
+    /// marker would poison the next ingest) — while the prose before it
+    /// stands. `Final` on the same input is the contrast: it degrades
+    /// the partial call into `Text`.
+    #[test]
+    fn clipped_withholds_a_partial_call_and_keeps_the_prose() {
+        let input = json!({"city": "Paris", "days": 3, "detail": "x"});
+        let t = tool("get_weather");
+        let prose = "Let me check. ";
+        for syntax in [
+            CallSyntax::hermes_json(),
+            CallSyntax::qwen_xml(),
+            CallSyntax::gemma4(),
+        ] {
+            let call =
+                render_reference(&syntax, &[("get_weather", &input)]).unwrap();
+            let full = format!("{prose}{call}");
+            // From the whole trigger on: a trigger is one special token,
+            // so a clip never leaves half of one.
+            let from = prose.len() + syntax.trigger().len();
+            let mut degraded_somewhere = false;
+            for i in from..full.len() {
+                if !full.is_char_boundary(i) {
+                    continue;
+                }
+                let cut = &full[..i];
+                let clipped =
+                    parse_text(&syntax, &[&t], cut, false, Leniency::Clipped);
+                if !calls_of(&clipped.blocks).is_empty() {
+                    // The call's value closed before the cut (only its
+                    // close marker is missing): it parsed whole and
+                    // stands, exactly as under Final.
+                    continue;
+                }
+                assert_eq!(
+                    clipped.status,
+                    ParseStatus::NeedMoreInput,
+                    "{:?} cut at {i}: {:#?}",
+                    syntax.family,
+                    clipped.blocks,
+                );
+                assert_eq!(
+                    texts_of(&clipped.blocks).trim_end(),
+                    prose.trim_end(),
+                    "{:?} cut at {i}: partial call leaked into prose",
+                    syntax.family,
+                );
+                let fin =
+                    parse_text(&syntax, &[&t], cut, false, Leniency::Final);
+                // (Not necessarily the marker itself: a dialect with a
+                // section opener consumes it before the call degrades.)
+                degraded_somewhere |=
+                    texts_of(&fin.blocks).trim_end() != prose.trim_end();
+            }
+            assert!(
+                degraded_somewhere,
+                "{:?}: Final never degraded a partial call — the contrast \
+                 this test leans on is gone",
+                syntax.family,
+            );
+        }
+    }
+
+    /// Harmony has no single trigger — its call landmark is a
+    /// recipient-bearing header — but every one is a frame marker, so a
+    /// clipped Harmony call is withheld like any other (the bare-JSON
+    /// exception is scoped to that family, not to an empty `trigger()`).
+    #[test]
+    fn clipped_withholds_a_partial_harmony_call() {
+        let syntax = CallSyntax::gpt_oss();
+        let t = tool("get_weather");
+        let input = json!({"city": "Paris", "days": 3});
+        let full =
+            render_reference(&syntax, &[("get_weather", &input)]).unwrap();
+        for i in 1..full.len() {
+            if !full.is_char_boundary(i) {
+                continue;
+            }
+            let clipped = parse_text(
+                &syntax,
+                &[&t],
+                &full[..i],
+                false,
+                Leniency::Clipped,
+            );
+            if !calls_of(&clipped.blocks).is_empty() {
+                continue;
+            }
+            let text = texts_of(&clipped.blocks);
+            assert!(
+                !text.contains("<|") && !text.contains("functions."),
+                "cut at {i}: partial call leaked into prose: {text:?}",
+            );
+        }
+    }
+
+    /// Calls that closed before the cut stand; only the one in flight is
+    /// withheld. A turn cut mid-way through its second parallel call
+    /// still carries the first.
+    #[test]
+    fn clipped_keeps_the_calls_that_closed() {
+        let t = tool("get_weather");
+        let a = json!({"city": "Paris", "days": 3});
+        let b = json!({"city": "Oslo", "days": 5});
+        for syntax in [CallSyntax::hermes_json(), CallSyntax::qwen_xml()] {
+            let first =
+                render_reference(&syntax, &[("get_weather", &a)]).unwrap();
+            let second =
+                render_reference(&syntax, &[("get_weather", &b)]).unwrap();
+            // Past the second trigger, short of the second value's close.
+            let cut_at = first.len() + syntax.trigger().len() + 4;
+            let cut = format!("{first}{second}");
+            let parsed = parse_text(
+                &syntax,
+                &[&t],
+                &cut[..cut_at],
+                false,
+                Leniency::Clipped,
+            );
+            let calls = calls_of(&parsed.blocks);
+            assert_eq!(calls.len(), 1, "{:?}: {:#?}", syntax.family, parsed);
+            assert_eq!(calls[0].1, &a);
+            assert!(
+                !texts_of(&parsed.blocks).contains(syntax.trigger().trim()),
+                "{:?}: {:#?}",
+                syntax.family,
+                parsed.blocks,
+            );
+        }
+    }
+
+    /// An unclosed thought is not withheld: a clip mid-reasoning
+    /// surfaces an open thought, byte-for-byte what `Final` gives, so the
+    /// next request can continue it.
+    #[test]
+    fn clipped_surfaces_an_open_thought_like_final() {
+        let syntax = CallSyntax::qwen_xml();
+        let t = tool("get_weather");
+        for (text, pre_opened) in [
+            ("still reasoning about the", true),
+            ("<think>\nstill reasoning about the", false),
+        ] {
+            let clipped =
+                parse_text(&syntax, &[&t], text, pre_opened, Leniency::Clipped);
+            let fin =
+                parse_text(&syntax, &[&t], text, pre_opened, Leniency::Final);
+            assert_eq!(clipped.blocks, fin.blocks, "{text:?}");
+            assert!(
+                clipped
+                    .blocks
+                    .last()
+                    .is_some_and(crate::prompt::is_open_thought),
+                "{text:?}: {:#?}",
+                clipped.blocks,
+            );
+        }
+    }
+
+    /// Trigger-less bare JSON cannot tell a clipped call from clipped
+    /// structured output (any `{` is its landmark), so the exception
+    /// holds: the partial object degrades to `Text` exactly as under
+    /// `Final` rather than vanishing.
+    #[test]
+    fn clipped_bare_json_degrades_like_final() {
+        let syntax = CallSyntax::llama31_json();
+        let t = tool("get_weather");
+        let text = r#"{"verdict": "guilty", "confidence": 0."#;
+        let clipped =
+            parse_text(&syntax, &[&t], text, false, Leniency::Clipped);
+        let fin = parse_text(&syntax, &[&t], text, false, Leniency::Final);
+        assert_eq!(clipped.blocks, fin.blocks);
+        assert_eq!(texts_of(&clipped.blocks), text);
+    }
+
+    /// The streaming flush agrees with the batch parse: pieces of prose
+    /// and a partial call, then `finish_clipped`, yield the prose and
+    /// never the call's bytes.
+    #[test]
+    fn stream_finish_clipped_withholds_the_partial_call() {
+        let syntax = CallSyntax::hermes_json();
+        let t = tool("get_weather");
+        let call = render_reference(
+            &syntax,
+            &[("get_weather", &json!({"city": "Paris", "days": 3}))],
+        )
+        .unwrap();
+        let text = format!("Checking. {}", &call[..call.len() / 2]);
+        let mut p = StreamParser::new(syntax.clone(), vec![t], false);
+        let mut out = Vec::new();
+        for chunk in text.as_bytes().chunks(3) {
+            // ASCII fixture, so byte chunks are char chunks.
+            out.extend(p.push(std::str::from_utf8(chunk).unwrap()));
+        }
+        out.extend(p.finish_clipped());
+        assert!(calls_of(&out).is_empty(), "{out:#?}");
+        assert_eq!(texts_of(&out).trim_end(), "Checking.");
     }
 }
