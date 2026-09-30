@@ -1416,6 +1416,122 @@ impl<'engine, B: Backend> Iterator for Predictor<'engine, B> {
     }
 }
 
+/// The stop-string helpers are pure: no model, no backend, so their
+/// tests run in every configuration.
+#[cfg(test)]
+mod stop_string_tests {
+    use crate::PredictOptions;
+
+    /// #65: the window is sized in **bytes off the generated text**. It
+    /// used to be sized off a prompt-inclusive token count, so on any
+    /// prompt longer than the window the offset ran past the end of the
+    /// text and early stop-string termination silently never fired.
+    ///
+    /// The regression shape to keep in mind: the offset must never
+    /// depend on how long the prompt was. These cases pin that by
+    /// construction — nothing here knows about a prompt at all.
+    #[test]
+    fn stop_window_start_is_sized_in_bytes_not_tokens() {
+        // Text shorter than the window: scan all of it.
+        assert_eq!(super::stop_window_start("short", 8, 16), 0);
+
+        // Text longer than the window: scan exactly the trailing
+        // `max_stop_len + max_token_len` bytes.
+        let text = "a".repeat(100);
+        assert_eq!(super::stop_window_start(&text, 8, 16), 76);
+
+        // A stop string ending at the very end of the text is always
+        // inside the window, which is the property the sizing exists
+        // for.
+        let text = format!("{}STOP", "x".repeat(500));
+        let end = super::stop_window_start(&text, 4, 16);
+        assert!(text[end..].contains("STOP"));
+    }
+
+    /// The walk-back is not cosmetic: `str` indexing rejects a
+    /// non-boundary offset, so landing mid-codepoint would reintroduce
+    /// #65's silent failure intermittently. Terminates at 0, which is a
+    /// boundary by definition.
+    #[test]
+    fn stop_window_start_lands_on_a_char_boundary() {
+        // Multi-byte throughout, so a naive offset lands mid-codepoint.
+        let text = "é".repeat(50); // 100 bytes, 2 bytes per char
+        for max_stop_len in 0..12 {
+            let end = super::stop_window_start(&text, max_stop_len, 5);
+            assert!(
+                text.is_char_boundary(end),
+                "offset {end} splits a codepoint (max_stop_len={max_stop_len})",
+            );
+            // Must not panic, and must be usable as a slice start.
+            let _ = &text[end..];
+        }
+
+        // Degenerate: empty text, huge window.
+        assert_eq!(super::stop_window_start("", 1000, 1000), 0);
+    }
+
+    /// #122: a stop string longer than the longest token is still
+    /// found. The window used to be sized from token sequences alone —
+    /// here the one-token EOG stop — and so reached back only a token's
+    /// worth of bytes, never the whole string.
+    #[test]
+    fn stop_window_covers_a_stop_longer_than_a_token() {
+        let stop = "\n\nHuman: and then";
+        let max_token_len = 4;
+        assert!(stop.len() > max_token_len);
+        let opts = PredictOptions::default()
+            .add_stop_sequence(vec![2])
+            .add_stop(stop.to_string());
+        assert_eq!(super::max_stop_len(&opts), stop.len());
+
+        let text = format!("{}{stop}", "lorem ipsum ".repeat(20));
+        let start =
+            super::stop_window_start(&text, super::max_stop_len(&opts), 4);
+        assert!(text[start..].contains(stop), "window: {:?}", &text[start..]);
+
+        // The old sizing: token sequences only.
+        let old = PredictOptions::default().add_stop_sequence(vec![2]);
+        let start =
+            super::stop_window_start(&text, super::max_stop_len(&old), 4);
+        assert!(!text[start..].contains(stop));
+    }
+
+    /// #122: the stop that ended generation is the one the text reached
+    /// first — not the first listed — and empty strings never match.
+    #[test]
+    fn first_stop_string_is_earliest_in_the_text() {
+        let stops = ["END", "", "\n\nHuman:", "Human"];
+        assert_eq!(super::first_stop_string("no stop here", &stops), None);
+        // Listed second-to-last, reached first.
+        assert_eq!(
+            super::first_stop_string("hi\n\nHuman: yo END", &stops),
+            Some((2, 2)),
+        );
+        // Same start: the longer one wins, so the whole match is cut.
+        assert_eq!(
+            super::first_stop_string("x Human: y", &["Human", "Human:"]),
+            Some((2, 1)),
+        );
+        assert_eq!(super::first_stop_string("anything", &[""]), None);
+    }
+
+    /// #122: a streaming caller holds back exactly the tail that could
+    /// still grow into a stop string, never a complete one's worth.
+    #[test]
+    fn stop_string_holdback_is_the_longest_live_prefix() {
+        let stops = ["</answer>", "###"];
+        assert_eq!(super::stop_string_holdback("plain", &stops), 0);
+        assert_eq!(super::stop_string_holdback("the </ans", &stops), 5);
+        assert_eq!(super::stop_string_holdback("so ##", &stops), 2);
+        assert_eq!(super::stop_string_holdback("a#", &["###"]), 1);
+        // Multi-byte: the held tail starts on a char boundary.
+        let text = "caf\u{e9} \u{2192}";
+        let held = super::stop_string_holdback(text, &["\u{2192}!"]);
+        assert!(text.is_char_boundary(text.len() - held));
+        assert_eq!(&text[text.len() - held..], "\u{2192}");
+    }
+}
+
 #[cfg(all(test, feature = "llama-cpp"))]
 mod tests {
     use crate::{
@@ -1576,115 +1692,6 @@ mod tests {
         let hay = b"anything";
         let got = super::find_deferred_trigger_end(hay, b"", 64);
         assert_eq!(got, None);
-    }
-
-    /// #65: the window is sized in **bytes off the generated text**. It
-    /// used to be sized off a prompt-inclusive token count, so on any
-    /// prompt longer than the window the offset ran past the end of the
-    /// text and early stop-string termination silently never fired.
-    ///
-    /// The regression shape to keep in mind: the offset must never
-    /// depend on how long the prompt was. These cases pin that by
-    /// construction — nothing here knows about a prompt at all.
-    #[test]
-    fn stop_window_start_is_sized_in_bytes_not_tokens() {
-        // Text shorter than the window: scan all of it.
-        assert_eq!(super::stop_window_start("short", 8, 16), 0);
-
-        // Text longer than the window: scan exactly the trailing
-        // `max_stop_len + max_token_len` bytes.
-        let text = "a".repeat(100);
-        assert_eq!(super::stop_window_start(&text, 8, 16), 76);
-
-        // A stop string ending at the very end of the text is always
-        // inside the window, which is the property the sizing exists
-        // for.
-        let text = format!("{}STOP", "x".repeat(500));
-        let end = super::stop_window_start(&text, 4, 16);
-        assert!(text[end..].contains("STOP"));
-    }
-
-    /// The walk-back is not cosmetic: `str` indexing rejects a
-    /// non-boundary offset, so landing mid-codepoint would reintroduce
-    /// #65's silent failure intermittently. Terminates at 0, which is a
-    /// boundary by definition.
-    #[test]
-    fn stop_window_start_lands_on_a_char_boundary() {
-        // Multi-byte throughout, so a naive offset lands mid-codepoint.
-        let text = "é".repeat(50); // 100 bytes, 2 bytes per char
-        for max_stop_len in 0..12 {
-            let end = super::stop_window_start(&text, max_stop_len, 5);
-            assert!(
-                text.is_char_boundary(end),
-                "offset {end} splits a codepoint (max_stop_len={max_stop_len})",
-            );
-            // Must not panic, and must be usable as a slice start.
-            let _ = &text[end..];
-        }
-
-        // Degenerate: empty text, huge window.
-        assert_eq!(super::stop_window_start("", 1000, 1000), 0);
-    }
-
-    /// #122: a stop string longer than the longest token is still
-    /// found. The window used to be sized from token sequences alone —
-    /// here the one-token EOG stop — and so reached back only a token's
-    /// worth of bytes, never the whole string.
-    #[test]
-    fn stop_window_covers_a_stop_longer_than_a_token() {
-        let stop = "\n\nHuman: and then";
-        let max_token_len = 4;
-        assert!(stop.len() > max_token_len);
-        let opts = PredictOptions::default()
-            .add_stop_sequence(vec![2])
-            .add_stop(stop.to_string());
-        assert_eq!(super::max_stop_len(&opts), stop.len());
-
-        let text = format!("{}{stop}", "lorem ipsum ".repeat(20));
-        let start =
-            super::stop_window_start(&text, super::max_stop_len(&opts), 4);
-        assert!(text[start..].contains(stop), "window: {:?}", &text[start..]);
-
-        // The old sizing: token sequences only.
-        let old = PredictOptions::default().add_stop_sequence(vec![2]);
-        let start =
-            super::stop_window_start(&text, super::max_stop_len(&old), 4);
-        assert!(!text[start..].contains(stop));
-    }
-
-    /// #122: the stop that ended generation is the one the text reached
-    /// first — not the first listed — and empty strings never match.
-    #[test]
-    fn first_stop_string_is_earliest_in_the_text() {
-        let stops = ["END", "", "\n\nHuman:", "Human"];
-        assert_eq!(super::first_stop_string("no stop here", &stops), None);
-        // Listed second-to-last, reached first.
-        assert_eq!(
-            super::first_stop_string("hi\n\nHuman: yo END", &stops),
-            Some((2, 2)),
-        );
-        // Same start: the longer one wins, so the whole match is cut.
-        assert_eq!(
-            super::first_stop_string("x Human: y", &["Human", "Human:"]),
-            Some((2, 1)),
-        );
-        assert_eq!(super::first_stop_string("anything", &[""]), None);
-    }
-
-    /// #122: a streaming caller holds back exactly the tail that could
-    /// still grow into a stop string, never a complete one's worth.
-    #[test]
-    fn stop_string_holdback_is_the_longest_live_prefix() {
-        let stops = ["</answer>", "###"];
-        assert_eq!(super::stop_string_holdback("plain", &stops), 0);
-        assert_eq!(super::stop_string_holdback("the </ans", &stops), 5);
-        assert_eq!(super::stop_string_holdback("so ##", &stops), 2);
-        assert_eq!(super::stop_string_holdback("a#", &["###"]), 1);
-        // Multi-byte: the held tail starts on a char boundary.
-        let text = "caf\u{e9} \u{2192}";
-        let held = super::stop_string_holdback(text, &["\u{2192}!"]);
-        assert!(text.is_char_boundary(text.len() - held));
-        assert_eq!(&text[text.len() - held..], "\u{2192}");
     }
 
     #[test]
