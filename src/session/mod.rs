@@ -11275,10 +11275,14 @@ mod tests {
                 signature: "".into(),
             },
             crate::Block::from(text.as_str()),
-            crate::Block::from(crate::prompt::ToolUse::new(
-                "search",
-                serde_json::json!({"q": "ok"}),
-            )),
+            // An id: ingest rejects an empty one, as Anthropic does.
+            crate::Block::from(
+                crate::prompt::ToolUse::new(
+                    "search",
+                    serde_json::json!({"q": "ok"}),
+                )
+                .with_id("call_1"),
+            ),
         ];
         let spelled = crate::chat_template::LiteralCounts::new();
         let real: crate::chat_template::LiteralCounts =
