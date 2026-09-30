@@ -328,9 +328,13 @@ fn file_call(
     seat.usage += counts;
     log::debug!("{} ▸ {message}", seat.name);
     let call = message.tool_use().ok_or_else(|| {
-        // Unreachable on the forced path (the session reports a
-        // grammar violation instead) — but never silently absent.
-        format!("☠ {}: forced call produced no tool use", seat.name)
+        // On the forced path, reached when the budget cut the call: the
+        // turn comes back `max_tokens` with the partial call withheld
+        // (#121), as on Anthropic. Never silently absent.
+        format!(
+            "☠ {}: forced call produced no tool use (stop reason: {:?})",
+            seat.name, message.stop_reason,
+        )
     })?;
     let filing: Filing = serde_json::from_value(call.input.clone())
         .map_err(|e| format!("☠ {}: unparseable filing: {e}", seat.name))?;
@@ -479,8 +483,8 @@ fn main() -> Result<(), BoxError> {
     // Filings and rulings are long-form; the seats rely on the prompt's
     // `max_tokens` default (4096) as the generation budget — 1024 truncated
     // a jester rebuttal, 2048 an engineer reaction (runs five and six), and
-    // on the forced path that is a typed GrammarViolation that adjourns the
-    // council. Not 8192: `check_context_fit` reserves `max_tokens` of
+    // on the forced path that is a clipped call (`max_tokens`, no tool use)
+    // that adjourns the council. Not 8192: `check_context_fit` reserves `max_tokens` of
     // headroom per call out of the shared `--n-ctx` budget above. The
     // Session-level cap was removed, so this budget now lives on the seat
     // prompts (`Prompt::default().max_tokens` == 4096).

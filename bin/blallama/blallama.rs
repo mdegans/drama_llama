@@ -27,8 +27,9 @@
 //! unclosed one is representable, renders without its close marker, and
 //! the next request continues it. A truncated *tool call* is not: its
 //! arguments are a JSON value, and half an object has no representation.
-//! Such a turn surfaces as an error or is salvaged with the partial call
-//! stripped — it never round-trips, and no amount of future work changes
+//! Such a turn comes back as Anthropic's does — `stop_reason: max_tokens`
+//! (or `stop_sequence`) — with the partial call withheld, so no client can
+//! dispatch it. It never round-trips, and no amount of future work changes
 //! that.
 //!
 //! Practical consequence for clients: put **two cache breakpoints at the
@@ -739,6 +740,9 @@ where
                     }
                     // Same bargain: an unsatisfied constraint is one
                     // unlucky path, and a fresh draw can satisfy it.
+                    // (A turn merely *cut short* — `max_tokens`, a stop
+                    // sequence — is not one of these: it succeeds with
+                    // that stop reason, as on Anthropic. #121.)
                     // The session invalidates its own cache here, so
                     // this retry re-prefills; still cheaper than the
                     // client's round trip.

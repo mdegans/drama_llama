@@ -362,29 +362,126 @@ fn complete_returns_message_with_tool_use() {
     );
 }
 
-/// Phase 3: `complete_blocks` surfaces `SessionError::GrammarViolation`
-/// when grammar-forced generation truncates before closing the
-/// tool_call tag. We reproduce the truncation by capping max_tokens
-/// low enough that the model can't finish.
+/// Text of every prose block, for asserting what a clip left behind.
+fn texts_of(blocks: &[Block]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text { text, .. } => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// #121: a grammar-forced call cut off by `max_tokens` is a 200-shaped
+/// response, as on Anthropic — `stop_reason: max_tokens`, usage filled —
+/// not a `GrammarViolation`. The partial call is withheld: no `ToolUse`
+/// a client could dispatch, and none of its bytes seated as prose.
 #[test]
 #[ignore = "requires model"]
-fn grammar_violation_on_truncated_tool_call() {
+fn truncated_tool_call_is_max_tokens_with_the_call_withheld() {
+    use misanthropic::response::StopReason;
     // truncate hard
     let prompt =
         strawberry_turn_1_prompt().max_tokens(NonZeroU32::new(4).unwrap());
     let mut session = drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet();
+    let trigger = session.dialect().trigger().trim().to_string();
 
-    let err = session
-        .complete_blocks(&prompt)
-        .expect_err("should have returned GrammarViolation");
-    match err {
-        SessionError::GrammarViolation { partial_output } => {
-            println!("partial_output: {partial_output:?}");
-        }
-        other => panic!("expected GrammarViolation, got {other:?}"),
+    let response = session
+        .complete_response(&prompt)
+        .expect("a clipped call is not an error");
+    assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+    assert!(response.usage.output_tokens > 0, "usage must be filled");
+    let message: Message = response.inner.into();
+    let blocks = &message.content.0;
+    assert!(
+        !blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })),
+        "a clipped call must be withheld: {blocks:#?}",
+    );
+    let text = texts_of(blocks);
+    assert!(
+        trigger.is_empty() || !text.contains(&trigger),
+        "partial call leaked into prose: {text:?}",
+    );
+
+    // Streaming ends the same way.
+    let mut stream = session.complete_stream(&prompt).expect("stream");
+    let streamed: Vec<Block> = stream.by_ref().collect();
+    assert!(
+        !streamed.iter().any(|b| matches!(b, Block::ToolUse { .. })),
+        "{streamed:#?}",
+    );
+    let text = texts_of(&streamed);
+    assert!(
+        trigger.is_empty() || !text.contains(&trigger),
+        "partial call leaked into the stream: {text:?}",
+    );
+    assert_eq!(
+        stream.stop_reason().and_then(|(reason, _)| reason),
+        Some(StopReason::MaxTokens),
+    );
+}
+
+/// A prompt whose answer runs through "5" before it can end.
+fn counting_prompt() -> Prompt {
+    Prompt {
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text(
+                "Count from 1 to 10, separated by commas. Reply with the \
+                 numbers only.",
+            ),
+        }],
+        max_tokens: NonZeroU32::new(512).unwrap(),
+        temperature: Some(0.0),
+        stop_sequences: Some(vec![Cow::Borrowed("5")]),
+        ..Default::default()
     }
+}
+
+/// All the text a response carries, thoughts included — a stop sequence
+/// may fire mid-reasoning, and it must be absent there too.
+fn all_text(blocks: &[Block]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text { text, .. } => Some(text.as_ref()),
+            Block::Thought { thought, .. } => Some(thought.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// #122: a request stop sequence stops generation at its first match,
+/// reports `stop_reason: stop_sequence` with the match, and is not part
+/// of the output — batch and streaming alike.
+#[test]
+#[ignore = "requires model"]
+fn stop_sequence_stops_generation_and_is_excluded() {
+    use misanthropic::response::StopReason;
+    let prompt = counting_prompt();
+    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+        .expect("session load")
+        .quiet();
+
+    let response = session.complete_response(&prompt).expect("complete");
+    assert_eq!(response.stop_reason, Some(StopReason::StopSequence));
+    assert_eq!(response.stop_sequence.as_deref(), Some("5"));
+    let message: Message = response.inner.into();
+    let text = all_text(&message.content.0);
+    assert!(!text.contains('5'), "the match must be cut: {text:?}");
+    assert!(text.contains('4'), "generation stopped too early: {text:?}");
+
+    let mut stream = session.complete_stream(&prompt).expect("stream");
+    let streamed: Vec<Block> = stream.by_ref().collect();
+    let text = all_text(&streamed);
+    assert!(!text.contains('5'), "the match must be cut: {text:?}");
+    assert_eq!(
+        stream.stop_reason(),
+        Some((Some(StopReason::StopSequence), Some("5"))),
+    );
 }
 
 /// Round-trip byte-stability — the #30 cache-correctness invariant,

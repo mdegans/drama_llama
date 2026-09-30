@@ -54,6 +54,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A turn cut short is a response, not an error (#121).** When
+  `max_tokens` (or the context window) ran out mid tool call, the
+  batch path returned `SessionError::GrammarViolation`, blallama
+  resampled twice — failing identically, the budget being the budget —
+  and answered HTTP 500 `api_error`. Anthropic answers 200 with
+  `stop_reason: max_tokens` and the partial turn, and clients key their
+  clip handling on that stop reason. Now so does `Session`: the turn
+  comes back `MaxTokens` with usage filled, and the incomplete call is
+  **withheld** — no `ToolUse` a client could dispatch, none of its
+  bytes seated as prose (calls that closed before the cut stand). A cut
+  outranks `ToolUse` in the stop reason, so a turn clipped mid-way
+  through its second parallel call never reads as a finished call
+  turn. The mechanism is a third parse leniency,
+  `dialect::Leniency::Clipped` (and `StreamParser::finish_clipped`):
+  incomplete calls withheld as under `Streaming`, unclosed thoughts
+  surfaced open as under `Final`. Bare-JSON dialects are exempt — any
+  `{` is their call landmark, so a clipped structured output keeps its
+  text. A forced call that finishes on the budget's last token still
+  reports `ToolUse`. `GrammarViolation` remains for a constraint that
+  failed with budget to spare. A clipped turn whose KV no longer
+  matches its output (call withheld, or cut mid-constraint) records
+  its prompt extent but no auto-tip, leaving the generated span to the
+  next call's LCP walk.
+- **Request `stop_sequences` stop generation (#122).** They were read
+  only after the fact, to label a turn that happened to end on one.
+  Generation now stops at the first match, the match is cut from the
+  output, and the response reports `stop_reason: stop_sequence` with
+  `stop_sequence` set — batch, `complete_text` and `complete_stream`
+  alike (the stream holds back text that could still grow into a
+  stop sequence). A stop sequence inside a tool call is treated as a
+  clip: the incomplete call is withheld. The predictor's stop-string
+  window is now sized from the stop strings' byte lengths too; it was
+  sized from token-sequence lengths alone and missed any stop string
+  longer than a token. New: `TokenPredictor::stop_string` /
+  `hit_token_limit` (and on `PiecePredictor`), `BlockStream::stop_reason`.
+- **blallama answers an undeserializable body with Anthropic's 400
+  (#123).** `/v1/messages` and `/v1/messages/count_tokens` returned
+  axum's plain-text 422 (or 415), which no Anthropic client parses; they
+  now return `{"type":"error","error":{"type":"invalid_request_error",…}}`
+  with status 400 (413 `request_too_large` for an oversized body). The
+  body limit is raised from axum's 2 MB to Anthropic's 32 MB, which a
+  single base64 image could exceed.
+- **Docs:** `grammar_compile`'s claim that Anthropic hoists required
+  properties ahead of optional ones is dropped; probed live, it keeps
+  optionals in place, exactly as the grammar does (misanthropic
+  `9be105f`).
 - **Qwen3.8 thinking turns re-render byte-stable; the tip anchors
   (#112).** Two causes, both in how a dialect describes reasoning.
   (1) The analyzer never *measured* the thought re-ingest convention:

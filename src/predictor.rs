@@ -665,6 +665,10 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// [`Self::constraint_incomplete_at_end`]; the state itself stays
     /// pure.
     terminal_completed: bool,
+    /// Index into [`PredictOptions::stop_strings`] of the stop string
+    /// that ended generation, if one did. Set on the same step as
+    /// `stopped`. See [`Self::stop_string`].
+    stop_string_hit: Option<usize>,
     /// Carries the incomplete tail of a codepoint split across
     /// byte-fallback tokens (issue #55). Owned *here*, alongside
     /// `text`, on purpose: the stop-string, regex and deferred-trigger
@@ -695,6 +699,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             max_stop_len,
             stopped: false,
             terminal_completed: false,
+            stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
             inner,
         }
@@ -722,6 +727,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             max_stop_len,
             stopped: false,
             terminal_completed: false,
+            stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
             inner,
         }
@@ -769,6 +775,29 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         self.state.constraint_incomplete_at_end() && !self.terminal_completed
     }
 
+    /// The [`PredictOptions::stop_strings`] entry that ended generation,
+    /// or `None` when something else did (or it has not ended). When
+    /// several complete on the same token, the one that starts first in
+    /// the text.
+    pub fn stop_string(&self) -> Option<&str> {
+        self.stop_string_hit
+            .and_then(|i| self.options.stop_strings.get(i))
+            .map(String::as_str)
+    }
+
+    /// True when generation ran out of budget — [`PredictOptions::n`]
+    /// tokens, or the context window — rather than stopping on a stop
+    /// condition. Meaningful once iteration has returned `None`; a
+    /// caller that broke out of the loop itself (say, on
+    /// [`Self::grammar_exhausted`]) must not read a budget-sized
+    /// generation as a clip.
+    pub fn hit_token_limit(&self) -> bool {
+        !self.stopped
+            && (self.inner.n_decode >= self.inner.n.get()
+                || self.inner.n_cur
+                    >= self.inner.engine.decoder.n_ctx() as usize)
+    }
+
     /// Close out the UTF-8 reassembler at stream end (issue #55).
     ///
     /// Bytes still held are a codepoint the generation cut in half, so
@@ -799,10 +828,16 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         mut options: PredictOptions,
         initial_state: Option<crate::SamplerState>,
     ) -> (crate::SamplerState, PredictOptions, usize) {
+        // Sizes the stop-string search window (`stop_window_start`) as
+        // well as the token-sequence one, so it has to cover the longest
+        // stop *string* in bytes: a window sized from token sequences
+        // alone (often just the one-token EOG stops) silently missed any
+        // stop string longer than `max_token_len` (#122).
         let max_stop_len = options
             .stop_sequences
             .iter()
             .map(|s| s.len())
+            .chain(options.stop_strings.iter().map(|s| s.len()))
             .max()
             .unwrap_or(0);
 
@@ -925,11 +960,10 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             self.max_stop_len,
             self.inner.engine.model.max_token_len(),
         );
-        let stopped_by_string = self
-            .options
-            .stop_strings
-            .iter()
-            .any(|s| self.text[end..].contains(s));
+        self.stop_string_hit =
+            first_stop_string(&self.text[end..], &self.options.stop_strings)
+                .map(|(_, i)| i);
+        let stopped_by_string = self.stop_string_hit.is_some();
         let stopped_by_regex = self
             .options
             .regex_stop_sequences
@@ -1040,6 +1074,51 @@ fn stop_window_start(
         end -= 1;
     }
     end
+}
+
+/// `(byte offset, index into stops)` of the stop string that occurs
+/// *first* in `text` — earliest start, ties to the longer string — or
+/// `None`. Empty strings never match (they would stop on the first
+/// token).
+///
+/// "First", not "any": when two stop strings complete on the same
+/// token, the one the text reached first is the one that stopped it,
+/// and that is the one a caller reports (Anthropic's
+/// `stop_sequence`) and cuts at (#122).
+pub(crate) fn first_stop_string<S: AsRef<str>>(
+    text: &str,
+    stops: &[S],
+) -> Option<(usize, usize)> {
+    stops
+        .iter()
+        .map(AsRef::as_ref)
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty())
+        .filter_map(|(i, s)| text.find(s).map(|at| (at, s.len(), i)))
+        .min_by_key(|&(at, len, _)| (at, std::cmp::Reverse(len)))
+        .map(|(at, _, i)| (at, i))
+}
+
+/// Bytes at the end of `text` that are a proper prefix of some stop
+/// string — text a streaming caller must hold back, because the next
+/// piece may complete the match and a stop sequence is never part of
+/// the output (#122). Always a char boundary: a byte-equal prefix
+/// starts on a lead byte.
+pub(crate) fn stop_string_holdback<S: AsRef<str>>(
+    text: &str,
+    stops: &[S],
+) -> usize {
+    let tail = text.as_bytes();
+    stops
+        .iter()
+        .map(|s| s.as_ref().as_bytes())
+        .filter_map(|s| {
+            (1..s.len())
+                .rev()
+                .find(|&k| k <= tail.len() && tail.ends_with(&s[..k]))
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Window-bounded search: returns the byte offset one past the last byte of
@@ -1173,6 +1252,16 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     /// See [`TokenPredictor::constraint_incomplete_at_end`].
     pub fn constraint_incomplete_at_end(&self) -> bool {
         self.inner.constraint_incomplete_at_end()
+    }
+
+    /// See [`TokenPredictor::stop_string`].
+    pub fn stop_string(&self) -> Option<&str> {
+        self.inner.stop_string()
+    }
+
+    /// See [`TokenPredictor::hit_token_limit`].
+    pub fn hit_token_limit(&self) -> bool {
+        self.inner.hit_token_limit()
     }
 }
 
@@ -1530,6 +1619,41 @@ mod tests {
 
         // Degenerate: empty text, huge window.
         assert_eq!(super::stop_window_start("", 1000, 1000), 0);
+    }
+
+    /// #122: the stop that ended generation is the one the text reached
+    /// first — not the first listed — and empty strings never match.
+    #[test]
+    fn first_stop_string_is_earliest_in_the_text() {
+        let stops = ["END", "", "\n\nHuman:", "Human"];
+        assert_eq!(super::first_stop_string("no stop here", &stops), None);
+        // Listed second-to-last, reached first.
+        assert_eq!(
+            super::first_stop_string("hi\n\nHuman: yo END", &stops),
+            Some((2, 2)),
+        );
+        // Same start: the longer one wins, so the whole match is cut.
+        assert_eq!(
+            super::first_stop_string("x Human: y", &["Human", "Human:"]),
+            Some((2, 1)),
+        );
+        assert_eq!(super::first_stop_string("anything", &[""]), None);
+    }
+
+    /// #122: a streaming caller holds back exactly the tail that could
+    /// still grow into a stop string, never a complete one's worth.
+    #[test]
+    fn stop_string_holdback_is_the_longest_live_prefix() {
+        let stops = ["</answer>", "###"];
+        assert_eq!(super::stop_string_holdback("plain", &stops), 0);
+        assert_eq!(super::stop_string_holdback("the </ans", &stops), 5);
+        assert_eq!(super::stop_string_holdback("so ##", &stops), 2);
+        assert_eq!(super::stop_string_holdback("a#", &["###"]), 1);
+        // Multi-byte: the held tail starts on a char boundary.
+        let text = "caf\u{e9} \u{2192}";
+        let held = super::stop_string_holdback(text, &["\u{2192}!"]);
+        assert!(text.is_char_boundary(text.len() - held));
+        assert_eq!(&text[text.len() - held..], "\u{2192}");
     }
 
     #[test]
