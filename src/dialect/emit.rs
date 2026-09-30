@@ -307,15 +307,25 @@ pub fn grammar_source(
 ///
 /// Eager (`Any`/`Method`): the generation prompt ends at
 /// `<|start|>assistant`, and every Harmony message is a channel
-/// block, so the grammar covers the *whole* emission — any number of
-/// analysis / commentary-preamble blocks (each closed by `<|end|>`
-/// and reopened by `<|start|>assistant`), then the forced call in its
-/// canonical trained shape:
+/// block, so the grammar covers the *whole* emission — at most one
+/// analysis block, then at most one commentary preamble (each closed
+/// by `<|end|>` and reopened by `<|start|>assistant`), then the forced
+/// call in its canonical trained shape:
 /// `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}`.
 /// After the args complete nothing further is legal, so the sampler's
 /// complete-constraint logic admits only EOG — the model's `<|call|>`
 /// (see [`Model::eog_tokens`]), a deterministic stop that is also the
 /// canonical re-render byte.
+///
+/// At most one of each, never `(analysis | commentary)*`: EOG is
+/// illegal until the call completes and `final` is not a channel this
+/// grammar offers, so every extra block it admits is somewhere a model
+/// that does not want to call can go instead — indefinitely. A forced
+/// call after the model had already answered (gpt-oss-120b, 2026-09-30)
+/// alternated analysis and commentary blocks ("Now final.", "pong",
+/// "We need to stop.", "[END]") to `max_tokens`. Bounded, the call is
+/// at most two blocks away: the shape every other dialect's eager root
+/// already has (one optional thought, then the calls).
 ///
 /// [`Model::eog_tokens`]: crate::backend::Model::eog_tokens
 ///
@@ -391,10 +401,17 @@ fn harmony_grammar_source(
                 .map(|i| format!("h_call_{i}"))
                 .collect::<Vec<_>>()
                 .join(" | ");
-            let _ = writeln!(src, "root ::= h_seg* ( {call_alts} )");
             let _ = writeln!(
                 src,
-                r#"h_seg ::= ( "{analysis_open}" | "{commentary_open}" ) h_end "{start}""#
+                "root ::= h_analysis? h_preamble? ( {call_alts} )"
+            );
+            let _ = writeln!(
+                src,
+                r#"h_analysis ::= "{analysis_open}" h_end "{start}""#
+            );
+            let _ = writeln!(
+                src,
+                r#"h_preamble ::= "{commentary_open}" h_end "{start}""#
             );
             for (i, tool) in tools.iter().enumerate() {
                 let name_lit = escape_for_gbnf_string(tool.name.as_ref());

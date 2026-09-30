@@ -54,6 +54,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A forced Harmony call can no longer run to `max_tokens` in
+  analysis and commentary.** The eager (`tool_choice` `any` / `tool`)
+  gpt-oss grammar admitted any number of analysis and commentary
+  blocks before the call, and under it EOG is illegal and `final` is
+  not a channel — so gpt-oss-120b, forced to call again after it had
+  already answered, alternated "Now final." / "pong" / "We need to
+  stop." / "[END]" blocks for 16384 tokens. The root is now one
+  optional analysis block, one optional commentary preamble, then the
+  call: the one-thought-then-calls shape every other dialect's eager
+  grammar already had. `tool_choice: none` was never the cause — on
+  Harmony it resolves no grammar and bans nothing, so the final
+  channel's `<|return|>` ends the turn as it does without tools.
 - **A turn cut short is a response, not an error (#121).** When
   `max_tokens` (or the context window) ran out mid tool call, the
   batch path returned `SessionError::GrammarViolation`, blallama

@@ -3713,6 +3713,161 @@ mod tests {
         );
     }
 
+    /// The eager (`Any`/`Method`) Harmony grammar admits at most one
+    /// analysis block and one preamble before the forced call. EOG is
+    /// illegal until the call completes and `final` is never offered,
+    /// so an unbounded block loop let gpt-oss-120b — forced to call
+    /// after it had already answered — alternate analysis and
+    /// commentary to `max_tokens` (2026-09-30, the live shape below).
+    #[test]
+    fn harmony_eager_grammar_bounds_blocks_before_the_call() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        use crate::{Grammar, GrammarState};
+        use std::sync::Arc;
+
+        let syntax = CallSyntax::gpt_oss();
+        let t = special_function();
+        let call = render_reference(
+            &syntax,
+            &[("special_function", &json!({"arg1": 1}))],
+        )
+        .expect("representable");
+        for anchor in [Anchor::Eager, Anchor::EagerThoughtPreOpened] {
+            let src = grammar_source(
+                &syntax,
+                &[&t],
+                &EmitOptions {
+                    anchor,
+                    parallel: false,
+                },
+            )
+            .expect("emit eager");
+            let grammar = Arc::new(
+                Grammar::parse(&src)
+                    .unwrap_or_else(|e| panic!("eager grammar: {e}\n{src}")),
+            );
+            let accepts = |text: &str| {
+                let mut state = GrammarState::new(grammar.clone());
+                state.advance_bytes(text.as_bytes()).is_ok()
+            };
+            let analysis = "<|channel|>analysis<|message|>Now say pong.\
+                            <|end|><|start|>assistant";
+            let preamble = "<|channel|>commentary<|message|>pong\
+                            <|end|><|start|>assistant";
+
+            // The runaway, block by block: each prefix up to the
+            // second block of either kind is refused.
+            for text in [
+                format!("{analysis}{preamble}{analysis}"),
+                format!("{analysis}{preamble}{preamble}"),
+                format!("{analysis}{analysis}"),
+                format!("{preamble}{preamble}"),
+                format!("{preamble}{analysis}"),
+            ] {
+                assert!(!accepts(&text), "{anchor:?}: must refuse {text:?}");
+            }
+            // `final` was never a way out under a forced call, and
+            // still isn't — the call is the only exit.
+            assert!(!accepts(&format!(
+                "{analysis}<|channel|>final<|message|>pong"
+            )));
+            // What it may do: each block at most once, in trained
+            // order, then the call — the whole of it complete.
+            for text in [
+                format!("{analysis}{preamble}{call}"),
+                format!("{analysis}{call}"),
+                format!("{preamble}{call}"),
+                call.clone(),
+            ] {
+                let mut state = GrammarState::new(grammar.clone());
+                assert!(
+                    state.advance_bytes(text.as_bytes()).is_ok()
+                        && state.is_complete(),
+                    "{anchor:?}: must accept {text:?}\n{src}"
+                );
+            }
+        }
+    }
+
+    /// The class, across every call dialect that reasons (Qwen XML,
+    /// Gemma 4, Harmony): under a forced call (eager anchor) a closed
+    /// thought is followed by the calls, never by another thought — or
+    /// the model can reopen one forever instead of calling, and no end
+    /// of turn is ever legal.
+    #[test]
+    fn eager_grammar_admits_one_thought_before_the_calls() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        use crate::{Grammar, GrammarState};
+        use std::sync::Arc;
+
+        let t = tool("get_weather");
+        for (name, syntax) in call_dialects() {
+            let (open, close) =
+                (syntax.reasoning.start.as_str(), syntax.reasoning.end.trim());
+            if open.trim().is_empty() || close.is_empty() {
+                continue;
+            }
+            let src = grammar_source(
+                &syntax,
+                &[&t],
+                &EmitOptions {
+                    anchor: Anchor::Eager,
+                    parallel: true,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let grammar = Arc::new(
+                Grammar::parse(&src)
+                    .unwrap_or_else(|e| panic!("{name}: {e}\n{src}")),
+            );
+            // Harmony reopens with its role header between blocks.
+            let reopen = match syntax.family {
+                Family::Harmony => harmony::START_ASSISTANT,
+                _ => "",
+            };
+            let sep = syntax.reasoning.separator.as_deref().unwrap_or("");
+            let text = format!("{open}one{close}{sep}{reopen}{open}two");
+            let mut state = GrammarState::new(grammar);
+            assert!(
+                state.advance_bytes(text.as_bytes()).is_err(),
+                "{name}: a second thought must be refused: {text:?}\n{src}"
+            );
+        }
+    }
+
+    /// `ToolChoice::None` never constrains a Harmony turn: no grammar
+    /// resolves (the dialect has no opener special to ban either), so
+    /// the final channel's `<|return|>` — EOG — stays reachable and a
+    /// final answer parses to a closed thought and the text, the turn
+    /// complete (`end_turn`).
+    #[test]
+    fn harmony_final_message_ends_the_turn() {
+        let text = "<|channel|>analysis<|message|>The budget is spent; \
+                    answer in words.<|end|><|start|>assistant\
+                    <|channel|>final<|message|>pong<|return|>";
+        let parsed = parse_text(
+            &CallSyntax::gpt_oss(),
+            &[&special_function()],
+            text,
+            false,
+            Leniency::Final,
+        );
+        assert_eq!(parsed.status, ParseStatus::Complete, "{parsed:#?}");
+        match parsed.blocks.as_slice() {
+            [Block::Thought { thought, signature }, Block::Text { text, .. }] =>
+            {
+                assert_eq!(thought, "The budget is spent; answer in words.");
+                assert_ne!(
+                    signature.as_ref(),
+                    crate::prompt::OPEN_THOUGHT_SIGNATURE,
+                    "the thought closed"
+                );
+                assert_eq!(text, "pong");
+            }
+            other => panic!("expected [Thought, Text], got {other:#?}"),
+        }
+    }
+
     /// Streaming chunking invariance for the Harmony envelope
     /// (mirrors the Gemma/Qwen invariance pins), plus prefix-chop
     /// atomicity for a call emission.
