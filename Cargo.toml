@@ -347,6 +347,17 @@ name = "whoami"
 required-features = ["cli", "llama-cpp"]
 doc-scrape-examples = true
 
+# Bitwise prefill-determinism probe below `Session`: bare
+# `LlamaCppDecoder` contexts and the `Decoder` calls Session makes
+# (per-chunk prefill, step, checkpoint_pos / restore_to), plus ubatch
+# alignment, tip-reuse and KV-neighbor (n_kv) experiments. Separates
+# upstream nondeterminism from anything our cache does (not from the
+# thin decode wrapper every call still goes through).
+[[example]]
+name = "logits_determinism"
+required-features = ["cli", "llama-cpp"]
+doc-scrape-examples = true
+
 [[example]]
 name = "chat"
 required-features = ["tokio", "repl"]
