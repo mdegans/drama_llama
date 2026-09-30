@@ -36,7 +36,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     scans content the way the tokenizer reads it, and every piece it
     finds must have been neutralized at least as often; a shortfall
     fails the call loudly (and logs `literal_neutralization_bypassed`)
-    as a drama_llama bug. `content_special_neutralized` is logged at
+    as a drama_llama bug. blallama answers it with a 500 `api_error`
+    instead of a 400, since the client's request is not at fault. `content_special_neutralized` is logged at
     debug on every call that neutralizes something.
   - Tool names and tool-use ids are *validated* rather than
     neutralized — the grammar and parser key on them: names must

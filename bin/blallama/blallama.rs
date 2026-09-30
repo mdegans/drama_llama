@@ -1397,11 +1397,17 @@ fn map_session_err(
         | E::OutputConfig(_)
         | E::RequestTopP(_)
         | E::Dialect(_)
-        | E::InjectedSpecialToken { .. }
         | E::UnrenderableOpenThought { .. }
         | E::MediaUnsupported { .. }
         | E::Media(_)
         | E::TrailingMedia => AnthropicError::InvalidRequest {
+            message: e.to_string(),
+        },
+        // The ingest guard now fires only when a content surface
+        // bypassed neutralization: our bug, not the client's request,
+        // so a 400 would tell them to fix what they did nothing wrong
+        // in. An SDK retry fails the same way, but at prepare, cheaply.
+        E::InjectedSpecialToken { .. } => AnthropicError::API {
             message: e.to_string(),
         },
         // Sampling failures (a fresh seed resamples them), decode
@@ -1592,6 +1598,19 @@ mod tests {
                 .is_some_and(|m| m.contains("System message must be at")),
             "{value}",
         );
+    }
+
+    /// The ingest guard is a bug detector now: a shortfall is a 500
+    /// `api_error`, not a 400 blaming the client's request.
+    #[test]
+    fn neutralization_bypass_is_anthropic_500() {
+        let error = drama_llama::SessionError::InjectedSpecialToken {
+            violations: Vec::new(),
+        };
+        let (status, Json(envelope)) = map_session_err(error);
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{value}");
+        assert_eq!(value["error"]["type"], "api_error");
     }
 
     /// A response as the wire carries it, cut by `max_tokens` after
