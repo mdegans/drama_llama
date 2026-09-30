@@ -7,11 +7,47 @@
 
 use std::collections::{HashMap, VecDeque};
 
-/// Default cap on retained snapshots. Anthropic's cache budget is 4
-/// explicit breakpoints; `Session` adds one internal tip per cache
-/// slot. 16 leaves generous slack for multi-sequence use before the
-/// LRU starts evicting.
+/// Floor on retained snapshots, and the cap for a decoder that cannot
+/// size one from its sequence count (moeflux, whose `n_seq_max` is a
+/// namespace bound, not a slot count).
 pub(crate) const MAX_SEQ_SNAPSHOTS: usize = 16;
+
+/// Snapshots one prefix-cache slot can hold at its peak: one per
+/// `cache_control` breakpoint ([`MAX_CACHE_CONTROLS`], the automatic
+/// one included) plus two tips — the outgoing one, still restorable
+/// while the turn it anchored generates, and the incoming one taken at
+/// that turn's end.
+///
+/// [`MAX_CACHE_CONTROLS`]: crate::MAX_CACHE_CONTROLS
+pub(crate) const SNAPSHOTS_PER_SLOT: usize =
+    crate::chat_template::MAX_CACHE_CONTROLS + 2;
+
+/// The snapshot cap for a decoder serving `n_seq` sequences: a full
+/// [`SNAPSHOTS_PER_SLOT`] set for every slot, never below
+/// [`MAX_SEQ_SNAPSHOTS`].
+///
+/// The LRU is shared by every sequence, so a flat cap below this lets
+/// one slot's newest snapshot evict *another* slot's oldest — its
+/// system anchor, the most valuable one. A flat 16 held three slots
+/// before automatic caching added a fourth anchor per slot; with
+/// `--cache-slots 4` on a hybrid model it sat exactly at the cap, and
+/// the next anchor cost a conversation its prefix.
+///
+/// The trade-off is host RAM. A hybrid model's snapshot is the whole
+/// sequence state — its attention KV up to that position as well as
+/// the recurrent layers — so the bound is `cap × (largest state)`, and
+/// eviction logs each dropped snapshot's size. No byte budget yet:
+/// evicting by size would drop exactly the long-prefix anchors worth
+/// keeping, and choosing among them needs the session's view.
+///
+/// llama.cpp-only (moeflux keeps [`MAX_SEQ_SNAPSHOTS`]), hence the cfg
+/// on the lint.
+#[cfg_attr(not(feature = "llama-cpp"), allow(dead_code))]
+pub(crate) fn cap_for_sequences(n_seq: usize) -> usize {
+    n_seq
+        .saturating_mul(SNAPSHOTS_PER_SLOT)
+        .max(MAX_SEQ_SNAPSHOTS)
+}
 
 /// Bounded LRU of serialized decoder states.
 ///
@@ -28,21 +64,26 @@ pub(crate) struct SnapshotStore {
     /// Insertion order, oldest first. Re-inserting an existing key
     /// refreshes its position.
     order: VecDeque<(i32, i32)>,
-    /// Eviction cap. See [`MAX_SEQ_SNAPSHOTS`].
+    /// Eviction cap. See [`cap_for_sequences`].
     cap: usize,
 }
 
 impl Default for SnapshotStore {
     fn default() -> Self {
-        Self {
-            map: HashMap::new(),
-            order: VecDeque::new(),
-            cap: MAX_SEQ_SNAPSHOTS,
-        }
+        Self::with_cap(MAX_SEQ_SNAPSHOTS)
     }
 }
 
 impl SnapshotStore {
+    /// An empty store holding at most `cap` snapshots (at least one).
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
     /// Insert (or replace) the snapshot at `key`, evicting the oldest
     /// entries beyond the cap.
     pub(crate) fn insert(&mut self, key: (i32, i32), bytes: Vec<u8>) {
@@ -54,22 +95,26 @@ impl SnapshotStore {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            self.map.remove(&oldest);
-            // A restore target is gone: the cache anchor that sat here
-            // now restores only through a lower one (Session's restore
-            // ladder), so this is a future miss worth a line.
-            tracing::warn!(
+            let bytes = self.map.remove(&oldest).map_or(0, |b| b.len());
+            // A restore target is gone, but not necessarily a reuse:
+            // the anchor that sat here restores through a lower one
+            // (Session's restore ladder), and Session logs what that
+            // cost if a request ever asks for it (`restore_failed`,
+            // WARN past a few hundred tokens). So INFO here.
+            tracing::info!(
                 target: "drama_llama::snapshot_store",
                 event = "cache_degrade",
                 reason = "snapshot_evicted",
                 seq_id = oldest.0,
                 pos = oldest.1,
+                bytes,
                 cap = self.cap,
                 "snapshot store over its cap of {}; dropped the oldest \
-                 snapshot (seq {}, pos {})",
+                 snapshot (seq {}, pos {}, {} bytes)",
                 self.cap,
                 oldest.0,
                 oldest.1,
+                bytes,
             );
         }
     }
@@ -199,6 +244,32 @@ mod tests {
         assert_eq!(s.take((0, 1)), None);
         assert_eq!(s.take((0, 2)), None);
         assert!(s.take((0, MAX_SEQ_SNAPSHOTS as i32 + 2)).is_some());
+    }
+
+    /// A full set of anchors on every slot fits: one slot's newest
+    /// snapshot never evicts another slot's system anchor. Four slots
+    /// of a hybrid model (the live Qwen3.6 `--cache-slots 4` setup)
+    /// used to sit exactly at the flat cap of 16.
+    #[test]
+    fn snapshot_store_cap_holds_every_slots_anchors() {
+        assert_eq!(cap_for_sequences(0), MAX_SEQ_SNAPSHOTS);
+        assert_eq!(cap_for_sequences(1), MAX_SEQ_SNAPSHOTS);
+        assert_eq!(cap_for_sequences(4), 4 * SNAPSHOTS_PER_SLOT);
+        assert!(cap_for_sequences(4) > MAX_SEQ_SNAPSHOTS);
+
+        let slots = 4;
+        let mut s = SnapshotStore::with_cap(cap_for_sequences(slots));
+        // Every slot: its system anchor first, then the other
+        // breakpoints and both tips, round-robin as agents interleave.
+        for pos in 1..=SNAPSHOTS_PER_SLOT as i32 {
+            for seq in 0..slots as i32 {
+                s.insert((seq, pos * 100), vec![0u8; 4]);
+            }
+        }
+        assert_eq!(s.len(), slots * SNAPSHOTS_PER_SLOT);
+        for seq in 0..slots as i32 {
+            assert!(s.get((seq, 100)).is_some(), "seq {seq} lost its anchor");
+        }
     }
 
     #[test]

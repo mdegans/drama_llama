@@ -70,11 +70,16 @@
 //!   [`tool::Result`](misanthropic::tool::Result) — or asked for with the
 //!   request-level [`Prompt::cache_control`](misanthropic::Prompt::cache_control),
 //!   Anthropic's automatic caching, whose breakpoint lands after the last
-//!   cacheable block — plus the session's own post-generation tip. As on
-//!   Anthropic, an anchor an *earlier* call placed is still read when the
-//!   new prompt reproduces everything before it (lookback), so automatic
-//!   caching reads the previous request's prompt back each turn. Without
-//!   breakpoints, every call is a full re-prefill.
+//!   cacheable block — plus the session's own post-generation tip. An
+//!   anchor an *earlier* call placed is still read when the new prompt
+//!   reproduces everything before it (lookback), so automatic caching
+//!   reads the previous request's prompt back each turn. This lookback
+//!   reads anchors Anthropic's would not: theirs walks back at most 20
+//!   blocks from each of the new request's markers, ours reads an anchor
+//!   the slot's last call placed however far back it sits — so it can
+//!   hit where Anthropic would miss. Anthropic can also hit an older
+//!   call's entry within those 20 blocks, which the slot no longer
+//!   keeps. Without breakpoints, every call is a full re-prefill.
 //! * **Multi-slot.** The cache holds up to
 //!   [`PrefixCacheConfig::max_slots`] cached prefixes (clamped to the
 //!   backend's sequence capacity), each pinned to its own KV sequence — N
@@ -102,16 +107,23 @@
 //! with a full cache-state dump instead of silently re-prefilling. Genuine
 //! first turns and post-eviction misses don't trip it.
 //!
-//! Every reuse decision is logged (`tracing`, target
-//! `drama_llama::session`): one `event = "cache_reuse"` per call — `hit`
-//! with its `source` (`tip`, `breakpoint`, `lookback`, `hash`) and token
-//! counts, or `miss` with its `reason` — and an `event = "cache_degrade"`
-//! or `"cache_evict"` for each thing that cost reuse, with its `reason`
-//! (`tip_diverged` with the first diverging entry and the decoded text on
-//! both sides, `emission_not_byte_stable`, `breakpoint_dropped`,
+//! Every reuse decision is logged through `tracing`, under two targets:
+//! `drama_llama::session` for everything the session decides and
+//! `drama_llama::snapshot_store` for snapshots the backend's store drops
+//! at its cap. One `event = "cache_reuse"` per call — `hit` with its
+//! `source` (`tip`, `breakpoint`, `lookback`, `hash`) and token counts,
+//! at `DEBUG` since a hit is the normal case, or `miss` with its
+//! `reason` — and an `event = "cache_degrade"` or `"cache_evict"` for
+//! each thing that cost reuse, with its `reason` (`tip_diverged` or
+//! `history_changed` with the first diverging entry and the decoded text
+//! on both sides, `emission_not_byte_stable`, `breakpoint_dropped`,
 //! `hash_drift`, `restore_failed`, `snapshot_evicted`, `ttl`,
-//! `capacity`, `slot_capacity`, …). Losses above a few hundred tokens are
-//! `WARN`; the rest `INFO`.
+//! `capacity`, `slot_capacity`, …). Misses and losses above a few
+//! hundred tokens are `WARN`, the rest `INFO`; a dropped snapshot is
+//! `INFO` with its size, because it costs reuse only if a request later
+//! needs it, and that shows as `restore_failed`. So
+//! `RUST_LOG=info,drama_llama::session=debug` shows every decision, and
+//! the default `info` only what cost something.
 //!
 //! Usage statistics matching the Anthropic API shape are tracked on every
 //! `complete_*` call: see [`Session::last_usage`] and [`Session::total_usage`].
@@ -1681,6 +1693,14 @@ fn around(s: &str, at: usize, n: usize) -> (&str, &str) {
 /// (Qwen3.6's stock template `trim`s the answer and the thought, so a
 /// trailing newline is enough) or a parse that normalizes. `WARN` when
 /// the turn is longer than [`MISS_WARN_TOKENS`].
+///
+/// `part` says which side of the turn boundary they part on: `turn`
+/// (`diverge_byte` is into the emission; `emitted` is what the model
+/// wrote there and `rerendered` what the template writes instead) or
+/// `prompt` — seating the turn changes how the prompt *before* it
+/// renders, so `diverge_byte` is into the rendered prompt and the two
+/// sides are the prompt as rendered for this call and as re-rendered
+/// with the turn seated. Both texts are aligned at the same byte.
 fn log_unstable_emission(
     extended: &str,
     rendered_prompt: &str,
@@ -1690,14 +1710,28 @@ fn log_unstable_emission(
     let Some(at) = emission_divergence(extended, rendered_prompt, raw) else {
         return;
     };
-    let rendered = extended.get(rendered_prompt.len()..).unwrap_or(extended);
-    let (before, emitted) = around(raw, at, 40);
-    let (_, rerendered) = around(rendered, at, 40);
+    // `(part, byte, what the KV holds, what the next render says)`,
+    // with the byte valid in both texts.
+    let (part, at, held, rerender) =
+        match extended.strip_prefix(rendered_prompt) {
+            Some(turn) => ("turn", at, raw, turn),
+            None => {
+                let at = extended
+                    .bytes()
+                    .zip(rendered_prompt.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                ("prompt", at, rendered_prompt, extended)
+            }
+        };
+    let (before, emitted) = around(held, at, 40);
+    let (_, rerendered) = around(rerender, at, 40);
     cache_event!(
         generated_tokens,
         target: "drama_llama::session",
         event = "cache_degrade",
         reason = "emission_not_byte_stable",
+        part,
         emission_bytes = raw.len(),
         diverge_byte = at,
         generated_tokens,
@@ -1705,9 +1739,8 @@ fn log_unstable_emission(
         emitted,
         rerendered,
         "prefix cache: this turn does not re-render as generated (they \
-         part at byte {at} of {}), so the next request cannot reuse its \
-         tip and re-prefills the turn",
-        raw.len(),
+         part in the {part} at byte {at}), so the next request cannot \
+         reuse its tip and re-prefills the turn",
     );
 }
 
@@ -2278,31 +2311,13 @@ fn slot_l_hit(
     new_breakpoints: &[EntryPos],
     new_breakpoint_hashes: &[[u8; 32]],
 ) -> Option<Reuse> {
-    let hashed = hash_keyed_l_hit(
+    let (picked, hashed) = slot_offer(
         slot,
         new_entries,
         new_breakpoints,
         new_breakpoint_hashes,
-    );
-    let old_breakpoints: Vec<EntryPos> =
-        slot.breakpoints.iter().map(|bp| bp.at).collect();
-    let walked = compute_l_hit(
-        &slot.prev_entries,
-        new_entries,
-        new_breakpoints,
-        &old_breakpoints,
-        slot.tip.as_ref().map(|t| t.at),
         usize::MAX,
     );
-    let hashed_hit = (hashed.at.entry > 0).then_some(Reuse {
-        at: hashed.at,
-        source: ReuseSource::Hash,
-    });
-    let picked = match (hashed_hit, walked) {
-        (Some(h), Some(w)) if w.at.entry > h.at.entry => Some(w),
-        (Some(h), _) => Some(h),
-        (None, w) => w,
-    };
     if let Some((cached, new)) = hashed.drifted {
         let reused = picked.map_or(0, |r| r.at.entry);
         let lost = cached.entry.saturating_sub(reused);
@@ -2323,6 +2338,51 @@ fn slot_l_hit(
         }
     }
     picked
+}
+
+/// [`slot_l_hit`]'s offer, strictly below entry `below` — the bound
+/// the empty-suffix backoff and the restore ladder search under
+/// (`usize::MAX` for none) — plus the raw hash-path result for the
+/// drift diagnostics. Pure; logs nothing, so the backoff and the ladder
+/// can re-ask without repeating [`slot_l_hit`]'s `hash_drift` event.
+fn slot_offer(
+    slot: &PrefixSlot,
+    new_entries: &[CacheEntry],
+    new_breakpoints: &[EntryPos],
+    new_breakpoint_hashes: &[[u8; 32]],
+    below: usize,
+) -> (Option<Reuse>, HashKeyedHit) {
+    // A hash hit lands at (or, for the tip, before) the new breakpoint
+    // its hash names, so bounding the new breakpoints bounds it.
+    let (bounded, bounded_hashes): (Vec<EntryPos>, Vec<[u8; 32]>) =
+        new_breakpoints
+            .iter()
+            .zip(new_breakpoint_hashes)
+            .filter(|(bp, _)| bp.entry < below)
+            .map(|(bp, hash)| (*bp, *hash))
+            .unzip();
+    let hashed = hash_keyed_l_hit(slot, new_entries, &bounded, &bounded_hashes);
+    let old_breakpoints: Vec<EntryPos> =
+        slot.breakpoints.iter().map(|bp| bp.at).collect();
+    let walked = compute_l_hit(
+        &slot.prev_entries,
+        new_entries,
+        new_breakpoints,
+        &old_breakpoints,
+        slot.tip.as_ref().map(|t| t.at),
+        below,
+    );
+    let hashed_hit = (hashed.at.entry > 0 && hashed.at.entry < below)
+        .then_some(Reuse {
+            at: hashed.at,
+            source: ReuseSource::Hash,
+        });
+    let picked = match (hashed_hit, walked) {
+        (Some(h), Some(w)) if w.at.entry > h.at.entry => Some(w),
+        (Some(h), _) => Some(h),
+        (None, w) => w,
+    };
+    (picked, hashed)
 }
 
 /// Pick the slot to reuse for the new call: the one offering the
@@ -5186,22 +5246,34 @@ impl<B: Backend> Session<B> {
                         "prefix-reuse: slot selected",
                     );
                     // Empty-suffix guard: if the slot covers the
-                    // entire new prompt, the predictor would receive
-                    // an empty token slice (panic on construction).
-                    // Back off to the next-smaller breakpoint so at
-                    // least one token survives for the predictor.
-                    let mut reuse = if hit.at.entry == new_entries.len() {
-                        Reuse {
-                            at: new_breakpoints
-                                .iter()
-                                .rev()
-                                .find(|bp| {
-                                    bp.entry < hit.at.entry && bp.entry > 0
-                                })
-                                .copied()
-                                .unwrap_or_default(),
-                            source: ReuseSource::Breakpoint,
-                        }
+                    // entire new prompt (only the hash path can — the
+                    // LCP walk stops an entry short), the predictor
+                    // would receive an empty token slice (panic on
+                    // construction). Back off to the best anchor
+                    // strictly below it — a lower breakpoint, an
+                    // earlier call's, or the tip — so at least one
+                    // token survives for the predictor.
+                    let offer_below = |this: &Self, below: usize| {
+                        this.prefix_cache
+                            .as_ref()
+                            .and_then(|c| c.slot(seq))
+                            .and_then(|slot| {
+                                slot_offer(
+                                    slot,
+                                    new_entries,
+                                    new_breakpoints,
+                                    new_breakpoint_hashes,
+                                    below,
+                                )
+                                .0
+                            })
+                    };
+                    let nothing = Reuse {
+                        at: EntryPos::default(),
+                        source: ReuseSource::Breakpoint,
+                    };
+                    let mut reuse = if hit.at.entry >= new_entries.len() {
+                        offer_below(self, new_entries.len()).unwrap_or(nothing)
                     } else {
                         hit
                     };
@@ -5237,25 +5309,7 @@ impl<B: Backend> Session<B> {
                                 break (seq, reuse.at);
                             }
                             Err(e) => {
-                                let next = self
-                                    .prefix_cache
-                                    .as_ref()
-                                    .and_then(|c| c.slot(seq))
-                                    .and_then(|slot| {
-                                        let old: Vec<EntryPos> = slot
-                                            .breakpoints
-                                            .iter()
-                                            .map(|bp| bp.at)
-                                            .collect();
-                                        compute_l_hit(
-                                            &slot.prev_entries,
-                                            new_entries,
-                                            new_breakpoints,
-                                            &old,
-                                            slot.tip.as_ref().map(|t| t.at),
-                                            reuse.at.entry,
-                                        )
-                                    });
+                                let next = offer_below(self, reuse.at.entry);
                                 let fallback = next.map_or(0, |r| r.at.entry);
                                 let lost = entries_cell_len(
                                     &new_entries[fallback..reuse.at.entry],
@@ -5277,10 +5331,7 @@ impl<B: Backend> Session<B> {
                                      the next anchor below it",
                                 );
                                 miss_reason = "restore_failed";
-                                reuse = next.unwrap_or(Reuse {
-                                    at: EntryPos::default(),
-                                    source: ReuseSource::Breakpoint,
-                                });
+                                reuse = next.unwrap_or(nothing);
                             }
                         }
                     }
@@ -5546,7 +5597,7 @@ impl<B: Backend> Session<B> {
 
     /// The `cache_reuse` event for a call that restored `reuse` on slot
     /// `seq`: where the reused prefix came from, and how much of the
-    /// prompt is left to prefill.
+    /// prompt is left to prefill. `DEBUG`, unlike the misses.
     fn log_reuse_hit(
         &self,
         seq: i32,
@@ -5555,7 +5606,9 @@ impl<B: Backend> Session<B> {
     ) {
         let reused = entries_cell_len(&new_entries[..reuse.at.entry]);
         let prompt = entries_cell_len(new_entries);
-        tracing::info!(
+        // DEBUG: a hit is the normal case, one per request. What is
+        // left to prefill is on the request's own stats line.
+        tracing::debug!(
             target: "drama_llama::session",
             event = "cache_reuse",
             outcome = "hit",
@@ -5573,7 +5626,8 @@ impl<B: Backend> Session<B> {
     /// The `cache_reuse` event for a call that reuses nothing: `reason`
     /// is `no_slot` (no slot shares an anchor with the prompt),
     /// `restore_failed` (every anchor's checkpoint was gone) or
-    /// `backoff_zero` (the only anchor covered the whole prompt).
+    /// `backoff_zero` (an anchor covered the whole prompt and none
+    /// below it was left to back off to).
     /// `offered` is the entry the selected slot offered (0 for
     /// `no_slot`), which sets the level; the longest prefix any slot
     /// shares with the prompt is reported alongside.
@@ -5626,7 +5680,10 @@ impl<B: Backend> Session<B> {
     /// `WARN` when it costs more than [`MISS_WARN_TOKENS`].
     /// `history_changed` — it is before that turn: the client sent a
     /// different history, or this is another conversation sharing a
-    /// prefix; always `INFO`.
+    /// prefix. `WARN` past [`MISS_WARN_TOKENS`] only when the slot was
+    /// selected — it shared an anchor with the request, so this is
+    /// plausibly the same conversation with its history edited — and
+    /// `INFO` when no slot was (plausibly a different conversation).
     fn log_tip_miss(
         &self,
         selection: Option<(i32, Reuse)>,
@@ -5661,11 +5718,18 @@ impl<B: Backend> Session<B> {
         } else {
             "history_changed"
         };
-        // Only an in-turn divergence proves the call continues this
-        // slot's conversation (it reproduced the whole previous prompt
-        // first); an earlier one may be another conversation sharing a
-        // prefix, so it never warns.
-        let severity = if miss.in_turn { lost } else { 0 };
+        // An in-turn divergence proves the call continues this slot's
+        // conversation (it reproduced the whole previous prompt first).
+        // An earlier one on a *selected* slot shared an anchor with the
+        // request, so it is likely the same conversation too (an edited
+        // or reordered history) and warns by size; on the
+        // longest-prefix fallback it may be another conversation
+        // sharing boilerplate, so it never warns.
+        let severity = if miss.in_turn || selection.is_some() {
+            lost
+        } else {
+            0
+        };
         cache_event!(
             severity,
             target: "drama_llama::session",
@@ -11784,6 +11848,345 @@ mod tests {
         );
     }
 
+    /// A weightless [`Backend`] for driving `Session`'s cache plumbing
+    /// end to end: a byte tokenizer, a ChatML template, and a decoder
+    /// whose `restore_to` records every rung it is asked for and fails
+    /// at the positions it is told to — the evicted-snapshot case.
+    mod mock {
+        use crate::backend::{Backend, Decoder, MemoryRmError, Model};
+        use crate::Token;
+
+        pub(super) struct MockBackend;
+
+        impl Backend for MockBackend {
+            const NAME: &'static str = "mock";
+            type Decoder = MockDecoder;
+            type Model = MockModel;
+            type Vision = crate::NoVision;
+
+            fn is_supported_model(_: &str, _: &std::fs::Metadata) -> bool {
+                false
+            }
+        }
+
+        const N_VOCAB: usize = 258;
+        const BOS: Token = 256;
+        const EOS: Token = 257;
+
+        #[derive(Default)]
+        pub(super) struct MockDecoder {
+            logits: Vec<f32>,
+            /// Positions whose snapshot is gone.
+            pub(super) missing: Vec<i32>,
+            /// Every `(seq, pos)` restore asked for, in order.
+            pub(super) restores: Vec<(i32, i32)>,
+        }
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("mock decode error")]
+        pub(super) struct MockError;
+
+        impl Decoder for MockDecoder {
+            type Error = MockError;
+
+            fn prefill(
+                &mut self,
+                _: &[Token],
+                _: usize,
+                _: i32,
+            ) -> Result<&[f32], MockError> {
+                self.logits.resize(N_VOCAB, 0.0);
+                Ok(&self.logits)
+            }
+            fn step(
+                &mut self,
+                _: Token,
+                _: usize,
+                _: i32,
+            ) -> Result<&[f32], MockError> {
+                self.logits.resize(N_VOCAB, 0.0);
+                Ok(&self.logits)
+            }
+            fn n_ctx(&self) -> u32 {
+                4096
+            }
+            fn n_seq_max(&self) -> u32 {
+                4
+            }
+            fn memory_clear(&mut self) {}
+            fn memory_seq_rm(&mut self, _: i32, _: i32, _: i32) -> bool {
+                true
+            }
+            fn memory_seq_cp(&mut self, _: i32, _: i32, _: i32, _: i32) {}
+            fn memory_seq_keep(&mut self, _: i32) {}
+            fn memory_seq_pos_max(&mut self, _: i32) -> i32 {
+                -1
+            }
+            fn checkpoint_pos(&mut self, _: i32, _: i32) {}
+            fn restore_to(
+                &mut self,
+                seq_id: i32,
+                pos: i32,
+            ) -> Result<(), MemoryRmError> {
+                self.restores.push((seq_id, pos));
+                if self.missing.contains(&pos) {
+                    Err(MemoryRmError::NoCheckpoint { pos })
+                } else {
+                    Ok(())
+                }
+            }
+            fn forget_pos(
+                &mut self,
+                _: i32,
+                _: i32,
+            ) -> Result<(), MemoryRmError> {
+                Ok(())
+            }
+        }
+
+        pub(super) struct MockModel;
+
+        impl Model for MockModel {
+            type Error = std::convert::Infallible;
+
+            fn n_vocab(&self) -> i32 {
+                N_VOCAB as i32
+            }
+            fn bos(&self) -> Token {
+                BOS
+            }
+            fn eos(&self) -> Token {
+                EOS
+            }
+            fn eot(&self) -> Token {
+                EOS
+            }
+            fn special_tokens(&self) -> Vec<Token> {
+                vec![BOS, EOS]
+            }
+            fn max_token_len(&self) -> usize {
+                5
+            }
+            fn tokenize(&self, input: &str, _: bool) -> Vec<Token> {
+                input.bytes().map(Token::from).collect()
+            }
+            fn token_to_piece(&self, token: Token) -> String {
+                let mut buf = Vec::new();
+                self.token_to_piece_ref(token, &mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            }
+            fn token_to_piece_ref(&self, token: Token, buf: &mut Vec<u8>) {
+                buf.clear();
+                match token {
+                    BOS => buf.extend_from_slice(b"<s>"),
+                    EOS => buf.extend_from_slice(b"</s>"),
+                    byte => buf.push(byte as u8),
+                }
+            }
+            fn context_size(&self) -> i32 {
+                4096
+            }
+            fn chat_template_source(&self) -> Option<String> {
+                Some(
+                    "{% for m in messages %}<|im_start|>{{ m.role }}\n\
+                     {{ m.content }}<|im_end|>\n{% endfor %}\
+                     {% if add_generation_prompt %}<|im_start|>assistant\n\
+                     {% endif %}"
+                        .into(),
+                )
+            }
+            fn recommended_sampling(&self) -> crate::SamplingParams {
+                crate::SamplingParams::default()
+            }
+            fn eog_tokens(&self) -> Vec<Token> {
+                vec![EOS]
+            }
+        }
+
+        /// A cache-enabled session over the mock, its restores
+        /// failing at `missing`.
+        pub(super) fn session(missing: &[i32]) -> super::Session<MockBackend> {
+            let engine = crate::Engine::<MockBackend> {
+                vision: None,
+                decoder: MockDecoder {
+                    missing: missing.to_vec(),
+                    ..MockDecoder::default()
+                },
+                model: MockModel,
+                probe_hook: None,
+            };
+            super::Session::from_engine(engine)
+                .expect("mock session")
+                .with_prefix_cache(true)
+        }
+    }
+
+    /// Seat `slot` in `session`'s cache as a live slot on its seq id.
+    fn seat_slot(session: &mut Session<mock::MockBackend>, slot: PrefixSlot) {
+        let cache = session.prefix_cache.as_mut().expect("cache on");
+        cache.free_seq_ids.retain(|&seq| seq != slot.seq_id);
+        cache.slots.push(slot);
+    }
+
+    /// The restore ladder, through `Session`: the best anchor's
+    /// snapshot is gone, so the session restores the next one below it
+    /// that the new prompt still shares — never straight to a full
+    /// re-prefill — and logs what the fallback cost.
+    #[test]
+    fn restore_ladder_falls_to_the_next_anchor_through_the_session() {
+        let mut session = mock::session(&[180, 120]);
+        // Anchors at 60 (the system marker), 120 (an earlier call's
+        // automatic one) and the tip at 180; 180 and 120 are evicted.
+        seat_slot(
+            &mut session,
+            hashed_slot(
+                200,
+                vec![bp(60, None), bp(120, None)],
+                Some(bp(180, None)),
+            ),
+        );
+        let mut new_entries = seq_entries(190);
+        new_entries.extend(toks(9000..9010));
+        let (new_eps, new_hashes) = (vec![ep(60)], unmatched_hashes(1));
+
+        let mut result = None;
+        let events = capture_events(|| {
+            result = Some(
+                session
+                    .kv_setup_and_chunk_prefill(
+                        &new_entries,
+                        &new_eps,
+                        &new_hashes,
+                        &Default::default(),
+                        0,
+                    )
+                    .expect("kv setup"),
+            );
+        });
+        let (suffix, cache_read, prefill_start, _, seq) = result.unwrap();
+
+        assert_eq!(
+            session.engine.decoder.restores,
+            [(0, 180), (0, 120), (0, 60)],
+            "tip, then the lookback anchor, then the system marker",
+        );
+        assert_eq!((seq, cache_read, prefill_start), (0, 60, 60));
+        assert_eq!(suffix.len(), new_entries.len() - 60);
+
+        let reasons: Vec<_> = events
+            .iter()
+            .filter_map(|(_, fields)| field(fields, "reason"))
+            .collect();
+        assert_eq!(reasons, ["restore_failed", "restore_failed"]);
+        let (level, hit) = events
+            .iter()
+            .find(|(_, fields)| field(fields, "outcome") == Some("hit"))
+            .expect("a cache_reuse hit");
+        assert_eq!(*level, tracing::Level::DEBUG);
+        assert_eq!(field(hit, "source"), Some("breakpoint"));
+        assert_eq!(field(hit, "reused_tokens"), Some("60"));
+    }
+
+    /// The empty-suffix backoff: a hash hit covering the whole prompt
+    /// (a resent request) backs off to the best anchor below it — here
+    /// the previous call's own lower breakpoint, which the new request
+    /// does not mark. It used to consider only the new request's lower
+    /// markers, find none, and re-prefill everything (`backoff_zero`).
+    #[test]
+    fn a_whole_prompt_hit_backs_off_to_a_lookback_anchor() {
+        let mut session = mock::session(&[]);
+        let h100 = hash_partial_text("the whole prompt");
+        seat_slot(
+            &mut session,
+            hashed_slot(
+                140,
+                vec![bp(60, None), bp(100, Some(h100))],
+                Some(bp(138, None)),
+            ),
+        );
+        let new_entries = seq_entries(100);
+        let (new_eps, new_hashes) = new_bps(&[(100, h100)]);
+        let slot = session
+            .prefix_cache
+            .as_ref()
+            .and_then(|c| c.slot(0))
+            .unwrap();
+        // The premise: the pick covers every entry.
+        assert_eq!(
+            slot_l_hit(slot, &new_entries, &new_eps, &new_hashes),
+            Some(Reuse {
+                at: ep(100),
+                source: ReuseSource::Hash
+            })
+        );
+
+        let (suffix, cache_read, prefill_start, _, _) = session
+            .kv_setup_and_chunk_prefill(
+                &new_entries,
+                &new_eps,
+                &new_hashes,
+                &Default::default(),
+                0,
+            )
+            .expect("kv setup");
+        assert_eq!(session.engine.decoder.restores, [(0, 60)]);
+        assert_eq!((cache_read, prefill_start), (60, 60));
+        assert_eq!(suffix.len(), 40);
+    }
+
+    /// [`slot_offer`]'s bound applies to both paths: a hash hit at or
+    /// past `below` is not offered, and the LCP walk's is.
+    #[test]
+    fn slot_offer_bounds_the_hash_path_too() {
+        let h100 = hash_partial_text("the whole prompt");
+        let slot =
+            hashed_slot(140, vec![bp(60, None), bp(100, Some(h100))], None);
+        let new_entries = seq_entries(100);
+        let (new_eps, new_hashes) = new_bps(&[(100, h100)]);
+        let offer = |below| {
+            slot_offer(&slot, &new_entries, &new_eps, &new_hashes, below).0
+        };
+        assert_eq!(offer(usize::MAX).map(|r| r.at), Some(ep(100)));
+        assert_eq!(
+            offer(100),
+            Some(Reuse {
+                at: ep(60),
+                source: ReuseSource::Lookback
+            })
+        );
+        assert_eq!(offer(60), None);
+    }
+
+    /// A history change warns by its size when the slot shared an
+    /// anchor with the request (it was selected: plausibly the same
+    /// conversation, edited), and stays `INFO` when no slot was (the
+    /// longest-prefix fallback: plausibly another conversation).
+    #[test]
+    fn history_changed_warns_only_on_the_selected_slot() {
+        let mut session = mock::session(&[]);
+        let mut slot =
+            hashed_slot(1000, vec![bp(60, None)], Some(bp(999, None)));
+        slot.turn_start = 900;
+        seat_slot(&mut session, slot);
+        let mut new_entries = seq_entries(1100);
+        new_entries[500] = CacheEntry::Token(9999);
+        let selected = Reuse {
+            at: ep(60),
+            source: ReuseSource::Breakpoint,
+        };
+        let events = capture_events(|| {
+            session.log_tip_miss(Some((0, selected)), &new_entries);
+            session.log_tip_miss(None, &new_entries);
+        });
+        let levels: Vec<_> = events.iter().map(|(level, _)| *level).collect();
+        assert_eq!(levels, [tracing::Level::WARN, tracing::Level::INFO]);
+        for (_, fields) in &events {
+            assert_eq!(field(fields, "reason"), Some("history_changed"));
+            assert_eq!(field(fields, "diverge_at"), Some("500"));
+        }
+        assert_eq!(field(&events[0].1, "lost_tokens"), Some("939"));
+    }
+
     /// The divergence context: shared text before, then each side.
     #[test]
     fn divergence_context_shows_both_sides() {
@@ -11986,9 +12389,36 @@ mod tests {
         let (_, fields) = &events[0];
         assert_eq!(field(fields, "event"), Some("cache_degrade"));
         assert_eq!(field(fields, "reason"), Some("emission_not_byte_stable"));
+        assert_eq!(field(fields, "part"), Some("turn"));
         assert_eq!(field(fields, "diverge_byte"), Some("3"));
         assert_eq!(field(fields, "emitted"), Some("\n"));
         assert_eq!(field(fields, "rerendered"), Some("<end>"));
+    }
+
+    /// When seating the turn re-renders the prompt *before* it
+    /// differently, the reported context is aligned on the prompt, not
+    /// read from an offset into the wrong text: `emission_divergence`
+    /// says byte 0 of the emission, and the old slice started the
+    /// "re-rendered" side a prompt's length into the extended render.
+    #[test]
+    fn unstable_emission_in_the_prompt_is_logged_aligned() {
+        let events = capture_events(|| {
+            log_unstable_emission(
+                "<s>SYS: be terse|abc<end>",
+                "<s>SYS: be brief|",
+                "abc",
+                7364,
+            );
+        });
+        let [(level, fields)] = events.as_slice() else {
+            panic!("one event, got {events:?}");
+        };
+        assert_eq!(*level, tracing::Level::WARN);
+        assert_eq!(field(fields, "part"), Some("prompt"));
+        assert_eq!(field(fields, "diverge_byte"), Some("11"));
+        assert_eq!(field(fields, "before"), Some("<s>SYS: be "));
+        assert_eq!(field(fields, "emitted"), Some("brief|"));
+        assert_eq!(field(fields, "rerendered"), Some("terse|abc<end>"));
     }
 
     /// The emit-side ban set on a real vocab (Qwen 3.6): turn-open

@@ -334,7 +334,14 @@ impl LlamaCppDecoder {
                 llama_model_n_embd_out(model.as_ptr())
             } as usize,
             model: model.clone(),
-            seq_snapshots: SnapshotStore::default(),
+            // A full set of anchors per sequence, so one cache slot's
+            // snapshots never evict another's.
+            seq_snapshots: SnapshotStore::with_cap(
+                crate::snapshot_store::cap_for_sequences(
+                    // SAFETY: `context` was checked non-null above.
+                    unsafe { llama_n_seq_max(context) } as usize,
+                ),
+            ),
             seq_snapshots_enabled: needs_snapshots,
         })
     }
@@ -882,8 +889,11 @@ impl Decoder for LlamaCppDecoder {
         } else {
             // llama.cpp rejected bytes we serialized ourselves — a
             // llama.cpp-internal inconsistency. The sequence is left
-            // cleared; BackendUnsupported routes Session to its
-            // memory_clear + full-reprefill fallback.
+            // cleared; Session's restore ladder then tries the next
+            // anchor below this one on the same sequence (a snapshot
+            // restore replaces the sequence wholesale, so a cleared
+            // one is fine), and re-prefills the whole prompt only
+            // when no rung restores.
             Err(MemoryRmError::BackendUnsupported { pos })
         }
     }

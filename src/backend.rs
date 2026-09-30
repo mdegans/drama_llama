@@ -156,10 +156,17 @@ pub trait Decoder: Send {
     /// already lossless).
     ///
     /// Returns [`MemoryRmError::NoCheckpoint`] when no snapshot
-    /// exists at exactly `pos` (caller should fall back to
-    /// `memory_clear` + full reprefill), or
+    /// exists at exactly `pos`, or
     /// [`MemoryRmError::BackendUnsupported`] when the backend cannot
-    /// honor the request at all.
+    /// honor the request at all. Either error may leave `seq_id`
+    /// truncated or cleared; `Session` treats both alike, as one rung
+    /// of its *restore ladder*: it retries on the same sequence at the
+    /// next-best anchor below `pos` that the new prompt still shares
+    /// (an earlier breakpoint, an earlier call's breakpoint, or the
+    /// tip), and resets the slot for a full re-prefill only when no
+    /// rung restores. So an implementation must keep lower positions
+    /// restorable after a failed call — never drop snapshots below
+    /// `pos` on the error path.
     fn restore_to(
         &mut self,
         seq_id: i32,
@@ -195,18 +202,19 @@ pub trait Decoder: Send {
 }
 
 /// Errors from [`Decoder::restore_to`]. Surfaced by the
-/// prefix-cache machinery in `Session` so it can fall back to a full
-/// re-prefill when a snapshot is missing.
+/// prefix-cache machinery in `Session`, which falls back to the next
+/// anchor below the failed one (its restore ladder) and to a full
+/// re-prefill only when none restores.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum MemoryRmError {
-    /// No snapshot at the requested position. Caller should
-    /// `memory_clear` and full-reprefill.
+    /// No snapshot at the requested position. `Session` tries a lower
+    /// anchor next.
     #[error("no checkpoint stored at position {pos}")]
     NoCheckpoint { pos: i32 },
     /// The backend cannot honor a rewind to this position at all
     /// (invalid seq_id, unsupported semantics, etc.). Treated the
-    /// same as `NoCheckpoint` by the cache fallback path.
+    /// same as `NoCheckpoint` by `Session`'s restore ladder.
     #[error("backend cannot restore to position {pos}")]
     BackendUnsupported { pos: i32 },
 }

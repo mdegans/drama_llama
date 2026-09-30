@@ -44,19 +44,26 @@
 //! toward the four-marker limit — a fifth marker, the automatic one
 //! included, is Anthropic's 400, as is an automatic TTL that disagrees
 //! with the markers ([`validate_prompt`]). Each request then reads back
-//! the previous one's prompt (Anthropic's lookback) and, beyond parity,
-//! the previous turn's generated KV when the turn round-trips (the tip).
+//! the previous one's prompt (lookback, which reads anchors Anthropic's
+//! would not: theirs walks back at most 20 blocks, ours reads any anchor
+//! the previous call placed — though Anthropic can also hit an older
+//! call's entry within those 20 blocks, which the slot no longer keeps)
+//! and, beyond parity, the previous turn's generated KV when the turn
+//! round-trips (the tip).
 //! So an explicit marker on the system plus automatic caching — the
 //! combination Anthropic recommends for agent loops — is also the right
 //! setup here: a turn that does not round-trip costs only itself.
 //!
 //! # Seeing a cache miss
 //!
-//! Every request logs one `cache_reuse` event (`hit` with its source, or
-//! `miss` with its reason), and every loss gets a `cache_degrade` or
-//! `cache_evict` event naming why — for a lost tip, the entry where the
-//! new prompt diverges from the cached tokens and the text on both
-//! sides. Losses past a few hundred tokens are logged at `WARN`.
+//! Every request logs one `cache_reuse` event (`hit` with its source at
+//! `DEBUG`, or `miss` with its reason), and every loss gets a
+//! `cache_degrade` or `cache_evict` event naming why — for a lost tip,
+//! the entry where the new prompt diverges from the cached tokens and
+//! the text on both sides. Losses past a few hundred tokens are logged
+//! at `WARN`, the rest at `INFO`. The targets are
+//! `drama_llama::session` and `drama_llama::snapshot_store`, so
+//! `RUST_LOG=info,drama_llama::session=debug` adds the hits.
 //!
 //! # A `max_tokens` turn can carry complete calls
 //!

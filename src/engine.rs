@@ -174,8 +174,8 @@ impl<B: Backend> Engine<B> {
     }
 
     /// Rewind decoder state to a previously-snapshotted position.
-    /// See [`Decoder::restore_to`] — `Err(NoCheckpoint)` signals the
-    /// caller should fall back to `memory_clear` + full re-prefill.
+    /// See [`Decoder::restore_to`] — an `Err` sends `Session` down its
+    /// restore ladder to the next anchor below `pos`.
     pub fn restore_to(
         &mut self,
         seq_id: i32,

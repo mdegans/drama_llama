@@ -339,17 +339,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `auto_cache`) now places a breakpoint after the last cacheable block,
   walking back past thoughts, with its own TTL. An anchor an earlier
   call placed is read again when the new prompt reproduces everything
-  before it (Anthropic's lookback), so each request reads back the
-  previous one's prompt: a turn that does not round-trip costs only
-  itself instead of everything back to the system marker. A candidate
-  whose snapshot is gone falls to the next anchor below it rather than
-  to zero. blallama answers Anthropic's 400s for the combination
-  (captured 2026-09-30 on claude-haiku-4-5, both routes): a fifth
-  marker counting the automatic one — even on an already-marked block
-  with the same TTL, which the docs call a no-op — an automatic TTL
-  that disagrees with the target block's marker, and a 1-hour
-  automatic marker after a 5-minute one. `check_cache_controls` and
-  `MAX_CACHE_CONTROLS` are public.
+  before it (lookback), so each request reads back the previous one's
+  prompt: a turn that does not round-trip costs only itself instead of
+  everything back to the system marker. The lookback is not a copy of
+  Anthropic's: it reads anchors Anthropic's would not, and misses some
+  Anthropic's would hit. Anthropic reads an earlier request's entry
+  only within 20 blocks of one of the new request's markers, while this
+  reads the anchors the slot's last request placed at any distance; but
+  Anthropic can also hit an older request's entry within those 20
+  blocks, which the slot no longer keeps. A candidate whose snapshot
+  is gone falls to the next anchor below it rather than to zero, and so
+  does a hit covering the whole prompt, which used to consider only the
+  new call's own lower markers. blallama answers Anthropic's 400s for
+  the markers word for word, checked in Anthropic's order (captured
+  2026-09-30 on claude-haiku-4-5): a fifth marker counting the
+  automatic one — even on an already-marked block with the same TTL,
+  which the docs call a no-op — answered even when the markers are
+  also out of order; then a 1-hour marker after a 5-minute one, named
+  by its path (`messages.0.content.1.cache_control.ttl: …`); then an
+  automatic TTL that disagrees with the target block's marker; then a
+  1-hour automatic marker after a 5-minute one. `check_cache_controls`
+  and `MAX_CACHE_CONTROLS` are public.
+- **The llama.cpp snapshot store holds a full set of anchors per
+  sequence.** Its cap was a flat 16 shared by every cache slot; with
+  automatic caching a hybrid model's slot holds up to six snapshots
+  (four markers and two tips), so `--cache-slots 4` on Qwen3.6 sat at
+  the cap and one slot's newest snapshot could evict another's system
+  anchor. The cap is now six per sequence (`n_seq_max`), never below
+  16. The cost is host RAM — a hybrid snapshot carries the sequence's
+  attention KV too — and each eviction logs the dropped snapshot's
+  size.
 - **Every cache reuse decision is logged.** One `cache_reuse` event
   per call (`hit` with `source` = `tip` / `breakpoint` / `lookback` /
   `hash` and token counts, or `miss` with its `reason`), plus a
@@ -359,7 +378,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   emission does not re-render byte-for-byte, a breakpoint dropped for
   not being a token prefix, a #91 hash refusal, a failed restore, a
   snapshot evicted at the store's cap, and TTL, capacity, slot-thrash
-  and error evictions. Losses over 256 tokens log at `WARN`. The
+  and error evictions. Hits log at `DEBUG`; misses and losses over 256
+  tokens at `WARN`, the rest at `INFO` — a history change on the slot
+  that shared an anchor with the request included, since that is
+  plausibly the same conversation edited. Filter on the targets
+  `drama_llama::session` and `drama_llama::snapshot_store`. The
   2026-09-30 Qwen3.6 run lost a 7364-token turn's tip with nothing
   but an ordinary stats line to show for it.
 - **`output_config.effort` reaches the chat template as

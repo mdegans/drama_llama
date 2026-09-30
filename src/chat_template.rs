@@ -843,7 +843,9 @@ fn control_ttl_of(control: &CacheControl) -> CacheTtl {
 struct AutoCacheTarget {
     /// The section the breakpoint lands after.
     at: PromptBreakpoint,
-    /// The TTL of an explicit marker already on the target block.
+    /// The TTL of an explicit marker already on the target block;
+    /// `None` too for a cached server-tool definition, whose TTL is
+    /// not readable upstream.
     marker: Option<CacheTtl>,
 }
 
@@ -874,67 +876,168 @@ fn auto_cache_target(prompt: &Prompt) -> Option<AutoCacheTarget> {
         })
     };
     let in_tools = || {
+        use misanthropic::tool::MethodDef;
         let tool = prompt.tools.as_ref()?.last()?;
+        // A server definition's TTL is not readable upstream: no marker
+        // to compare, as in [`check_cache_controls`].
+        let marker = match tool {
+            MethodDef::Custom(c) => control_ttl(&c.cache_control),
+            MethodDef::Server(_) => None,
+        };
         Some(AutoCacheTarget {
             at: PromptBreakpoint::AfterTools,
-            marker: method_cache_ttl(tool),
+            marker,
         })
     };
     in_messages.or_else(in_system).or_else(in_tools)
 }
 
-/// Whether `block` can carry a `cache_control` marker — the variant
-/// arms [`block_cache_ttl`] reads.
-fn block_is_cacheable(block: &Block) -> bool {
-    matches!(
-        block,
-        Block::Text { .. }
-            | Block::Image { .. }
-            | Block::Document { .. }
-            | Block::ToolUse { .. }
-            | Block::ToolResult { .. }
-            | Block::ServerToolUse { .. }
-    )
+/// `block`'s `cache_control` field — `Some` for the kinds that can
+/// carry a marker (holding the marker, if set), `None` for those that
+/// cannot (thoughts, server-tool results, tool references). The one
+/// place that knows which is which: [`block_is_cacheable`] and
+/// [`block_cache_ttl`] both read it.
+///
+/// Every variant is named, as in misanthropic's `Block::is_cached`.
+/// `Block` is `#[non_exhaustive]`, so a downstream match needs the
+/// trailing wildcard and a new upstream variant still compiles — but
+/// the `clippy::wildcard_enum_match_arm` denial below fires the moment
+/// the wildcard would match a variant not named here, so `just check`
+/// fails until someone decides which side it belongs on.
+#[deny(clippy::wildcard_enum_match_arm)]
+fn block_cache_control(block: &Block) -> Option<&Option<CacheControl>> {
+    use misanthropic::tool;
+    match block {
+        Block::Text { cache_control, .. }
+        | Block::Image { cache_control, .. }
+        | Block::Document { cache_control, .. }
+        | Block::ToolUse {
+            call: tool::Use { cache_control, .. },
+        }
+        | Block::ToolResult {
+            result: tool::Result { cache_control, .. },
+        }
+        | Block::ServerToolUse {
+            call: tool::Use { cache_control, .. },
+        } => Some(cache_control),
+        Block::Thought { .. }
+        | Block::RedactedThought { .. }
+        | Block::WebSearchToolResult { .. }
+        | Block::WebFetchToolResult { .. }
+        | Block::ToolSearchToolResult { .. }
+        | Block::CodeExecutionToolResult { .. }
+        | Block::BashCodeExecutionToolResult { .. }
+        | Block::TextEditorCodeExecutionToolResult { .. }
+        | Block::ToolReference { .. } => None,
+        // Unreachable today; see the lint note above.
+        _ => None,
+    }
 }
 
-/// Every explicit `cache_control` marker in `prompt`, as its TTL, in
-/// processing order (`tools`, `system`, `messages`).
-fn explicit_markers(prompt: &Prompt) -> Vec<CacheTtl> {
-    let tools = prompt.tools.iter().flatten().filter_map(method_cache_ttl);
-    let blocks = prompt
+/// Whether `block` can carry a `cache_control` marker
+/// ([`block_cache_control`]).
+fn block_is_cacheable(block: &Block) -> bool {
+    block_cache_control(block).is_some()
+}
+
+/// One explicit `cache_control` marker, as Anthropic addresses it in
+/// an error: its JSON path (`tools.1`, `system.0`,
+/// `messages.2.content.0`) and its TTL. `ttl` is `None` for a server
+/// tool definition, whose marker misanthropic does not expose — it
+/// counts toward the limit but takes no part in the TTL rules, rather
+/// than guessing and answering a valid request with a 400.
+#[derive(Debug)]
+struct Marker {
+    path: String,
+    ttl: Option<CacheTtl>,
+}
+
+/// Every explicit `cache_control` marker in `prompt`, in processing
+/// order (`tools`, `system`, `messages`).
+fn explicit_markers(prompt: &Prompt) -> Vec<Marker> {
+    use misanthropic::tool::MethodDef;
+    let tools =
+        prompt
+            .tools
+            .iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(i, def)| {
+                let ttl = match def {
+                    MethodDef::Custom(c) => {
+                        Some(control_ttl(&c.cache_control)?)
+                    }
+                    MethodDef::Server(s) => s.is_cached().then_some(None)?,
+                };
+                Some(Marker {
+                    path: format!("tools.{i}"),
+                    ttl,
+                })
+            });
+    let blocks_of = |prefix: String, content: &Content| {
+        content
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(i, block)| {
+                Some(Marker {
+                    path: format!("{prefix}{i}"),
+                    ttl: Some(block_cache_ttl(block)?),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let system = prompt
         .system
         .iter()
-        .flat_map(|system| system.0.iter())
-        .chain(prompt.messages.iter().flat_map(|m| m.content.0.iter()))
-        .filter_map(block_cache_ttl);
-    tools.chain(blocks).collect()
+        .flat_map(|system| blocks_of("system.".into(), system));
+    let messages = prompt.messages.iter().enumerate().flat_map(|(m, msg)| {
+        blocks_of(format!("messages.{m}.content."), &msg.content)
+    });
+    tools.chain(system).chain(messages).collect()
 }
 
 /// Anthropic's per-request limit on `cache_control` markers, the
 /// automatic one ([`Prompt::cache_control`]) included.
 pub const MAX_CACHE_CONTROLS: usize = 4;
 
+/// Anthropic's message for a 1-hour marker after a 5-minute one, at
+/// `path` — the offending explicit marker's `….cache_control.ttl`, or
+/// `cache_control` for the request-level automatic one.
+fn ttl_order_error(path: &str) -> String {
+    format!(
+        "{path}: a ttl='1h' cache_control block must not come after a \
+         ttl='5m' cache_control block. Note that blocks are processed in \
+         the following order: `tools`, `system`, `messages`."
+    )
+}
+
 /// The checks Anthropic makes on a request's `cache_control` markers,
 /// each an `invalid_request_error` whose message this returns in
-/// Anthropic's exact wording (captured 2026-09-30 on claude-haiku-4-5,
-/// `/v1/messages` and `count_tokens` alike):
+/// Anthropic's exact wording (captured 2026-09-30 on claude-haiku-4-5
+/// via `count_tokens`; rules 1, 3 and 4 on `/v1/messages` too):
 ///
 /// 1. At most [`MAX_CACHE_CONTROLS`] markers, and the automatic one
 ///    always counts — even on a block that already carries an explicit
 ///    marker with the same TTL, which the docs call a no-op but the
 ///    wire counts: `A maximum of 4 blocks with cache_control may be
 ///    provided. Found 5.`
-/// 2. The automatic marker's TTL must match an explicit marker on the
-///    block it lands on.
-/// 3. A 1-hour automatic marker must not follow a 5-minute explicit
-///    one: longer TTLs come first.
+/// 2. Longer TTLs come first: a 1-hour explicit marker must not follow
+///    a 5-minute one. Anthropic names the first offender by path —
+///    `messages.0.content.1.cache_control.ttl: a ttl='1h' …`.
+/// 3. The automatic marker's TTL must match an explicit marker on the
+///    block it lands on (not checked when that block is a cached
+///    server-tool definition).
+/// 4. The same ordering rule for the automatic marker, which comes
+///    last: a 1-hour automatic marker after any 5-minute explicit one,
+///    reported at the path `cache_control`.
 ///
-/// Checked in that order; which one Anthropic names first when a
-/// request breaks several is uncaptured. The ordering rule between two
-/// *explicit* markers is not modeled (Anthropic's message there names
-/// the offending block's path). A cached server-tool definition counts,
-/// but its TTL is not readable upstream, so it reads as five minutes,
-/// as it does for breakpoints.
+/// Checked in that order, which is Anthropic's: for each rule, a
+/// request breaking it and every later one was captured answering
+/// with that rule's message. A cached server-tool definition counts
+/// toward rule 1, but its TTL is not readable upstream, so it takes
+/// no part in rules 2–4 rather than guessing a TTL and answering a
+/// valid request with a 400.
 pub fn check_cache_controls(prompt: &Prompt) -> Result<(), String> {
     let explicit = explicit_markers(prompt);
     let found = explicit.len() + usize::from(prompt.cache_control.is_some());
@@ -943,6 +1046,22 @@ pub fn check_cache_controls(prompt: &Prompt) -> Result<(), String> {
             "A maximum of {MAX_CACHE_CONTROLS} blocks with cache_control \
              may be provided. Found {found}."
         ));
+    }
+    let is_hour =
+        |ttl: &CacheTtl| ttl_duration(ttl) == ttl_duration(&CacheTtl::OneHour);
+    let first_five = explicit
+        .iter()
+        .position(|m| m.ttl.as_ref().is_some_and(|ttl| !is_hour(ttl)));
+    let hour_after_five = first_five.and_then(|at| {
+        explicit[at..]
+            .iter()
+            .find(|m| m.ttl.as_ref().is_some_and(is_hour))
+    });
+    if let Some(marker) = hour_after_five {
+        return Err(ttl_order_error(&format!(
+            "{}.cache_control.ttl",
+            marker.path
+        )));
     }
     let Some(auto) = prompt.cache_control.as_ref().map(control_ttl_of) else {
         return Ok(());
@@ -958,45 +1077,23 @@ pub fn check_cache_controls(prompt: &Prompt) -> Result<(), String> {
             ));
         }
     }
-    // Two TTLs exist, so "an explicit marker shorter than the automatic
-    // one" is exactly a 5-minute marker ahead of a 1-hour automatic one.
-    let shorter = |ttl: &CacheTtl| ttl_duration(ttl) < ttl_duration(&auto);
-    if explicit.iter().any(shorter) {
-        return Err("cache_control: a ttl='1h' cache_control block must not \
-             come after a ttl='5m' cache_control block. Note that blocks \
-             are processed in the following order: `tools`, `system`, \
-             `messages`."
-            .into());
+    if is_hour(&auto) && first_five.is_some() {
+        return Err(ttl_order_error("cache_control"));
     }
     Ok(())
 }
 
-/// The TTL of `block`'s cache marker, if it carries one. Mirrors the
-/// variant arms of [`Block::is_cached`] — the block kinds that cannot
-/// carry a marker return `None`.
+/// The TTL of `block`'s cache marker, if it carries one
+/// ([`block_cache_control`]).
 fn block_cache_ttl(block: &Block) -> Option<CacheTtl> {
-    use misanthropic::tool;
-    match block {
-        Block::Text { cache_control, .. }
-        | Block::Image { cache_control, .. }
-        | Block::Document { cache_control, .. }
-        | Block::ToolUse {
-            call: tool::Use { cache_control, .. },
-        }
-        | Block::ToolResult {
-            result: tool::Result { cache_control, .. },
-        }
-        | Block::ServerToolUse {
-            call: tool::Use { cache_control, .. },
-        } => control_ttl(cache_control),
-        _ => None,
-    }
+    block_cache_control(block).and_then(control_ttl)
 }
 
-/// The TTL of a tool definition's cache marker, if any. Server-side
-/// definitions don't expose their `cache_control` upstream (private
-/// accessor), so a marked server def contributes the conservative
-/// 5-minute default.
+/// The TTL of a tool definition's cache marker, if any, for placing
+/// breakpoints. Server-side definitions don't expose their
+/// `cache_control` upstream (private accessor), so a marked server def
+/// keeps its breakpoint for the conservative 5-minute default; the
+/// 400 checks ([`check_cache_controls`]) give it no TTL at all.
 fn method_cache_ttl(def: &misanthropic::tool::MethodDef) -> Option<CacheTtl> {
     use misanthropic::tool::MethodDef;
     match def {
@@ -2878,6 +2975,141 @@ mod tests {
             ..Prompt::default()
         };
         assert_eq!(check_cache_controls(&five_after_hour), Ok(()));
+
+        // Two explicit markers out of order: Anthropic names the first
+        // 1-hour marker after a 5-minute one by its path, and checks
+        // this before everything but the count (captured 2026-09-30,
+        // count_tokens, claude-haiku-4-5).
+        let order_at = |path: &str| {
+            Err(format!(
+                "{path}.cache_control.ttl: a ttl='1h' cache_control block \
+                 must not come after a ttl='5m' cache_control block. Note \
+                 that blocks are processed in the following order: \
+                 `tools`, `system`, `messages`."
+            ))
+        };
+        let explicit = |controls, auto| Prompt {
+            messages: msgs(controls),
+            cache_control: auto,
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&explicit(vec![five(), hour()], None)),
+            order_at("messages.0.content.1")
+        );
+        // The first offender, not the last.
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![hour(), five(), hour(), hour()],
+                None
+            )),
+            order_at("messages.0.content.2")
+        );
+        // Before the automatic marker's own TTL checks: a 1h automatic
+        // marker on a target already out of order, and a 5m one whose
+        // target's 1h marker it disagrees with.
+        assert_eq!(
+            check_cache_controls(&explicit(vec![five(), hour()], hour())),
+            order_at("messages.0.content.1")
+        );
+        assert_eq!(
+            check_cache_controls(&explicit(vec![five(), hour()], five())),
+            order_at("messages.0.content.1")
+        );
+        // After the count: five markers, one out of order, answer
+        // with the count — five explicit, or four and the automatic
+        // one (both captured 2026-09-30, count_tokens).
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![five(), hour(), five(), five(), five()],
+                None
+            )),
+            Err(found_5.into())
+        );
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![five(), hour(), five(), five(), None],
+                five()
+            )),
+            Err(found_5.into())
+        );
+        // Across sections, in processing order.
+        let across = Prompt {
+            system: system(five()),
+            messages: msgs(vec![None, hour()]),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&across),
+            order_at("messages.0.content.1")
+        );
+        let tools_first = Prompt {
+            tools: Some(vec![tool_cached("t").into()]),
+            system: system(hour()),
+            messages: msgs(vec![None]),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&tools_first), order_at("system.0"));
+        // The count before the automatic marker's TTL checks: five
+        // markers whose automatic one also disagrees with its target,
+        // or also follows a 5m marker.
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![hour(), hour(), hour(), five()],
+                hour()
+            )),
+            Err(found_5.into())
+        );
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![five(), five(), five(), five(), None],
+                hour()
+            )),
+            Err(found_5.into())
+        );
+        // An explicit order that holds leaves the target mismatch as
+        // the answer: [1h, 5m] under a 1h automatic marker.
+        assert_eq!(
+            check_cache_controls(&explicit(vec![hour(), five()], hour())),
+            Err("Top-level cache_control has ttl='1h' but the target block \
+                 already has cache_control with ttl='5m'. When both are \
+                 specified on the same block, they must have matching TTLs."
+                .into())
+        );
+
+        // A cached server-tool definition counts toward the limit
+        // (captured 2026-09-30, count_tokens), but its TTL is not
+        // readable upstream, so as the automatic marker's target it is
+        // no mismatch here — our choice, not a capture — where a
+        // custom tool's marker is.
+        let server = || {
+            let mut def: misanthropic::tool::MethodDef =
+                misanthropic::tool::ServerMethodDef::web_search(
+                    Default::default(),
+                )
+                .into();
+            def.cache_with(CacheControl::one_hour());
+            def
+        };
+        let tools_only = |def, auto| Prompt {
+            tools: Some(vec![def]),
+            cache_control: auto,
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&tools_only(server(), five())), Ok(()));
+        assert_eq!(
+            check_cache_controls(&tools_only(tool_cached("t").into(), hour())),
+            Err("Top-level cache_control has ttl='1h' but the target block \
+                 already has cache_control with ttl='5m'. When both are \
+                 specified on the same block, they must have matching TTLs."
+                .into())
+        );
+        let server_and_four = Prompt {
+            tools: Some(vec![server()]),
+            messages: msgs(vec![five(), five(), five(), five()]),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&server_and_four), Err(found_5.into()));
     }
 
     #[test]
