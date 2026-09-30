@@ -36,6 +36,21 @@
 //! end of the prompt** rather than one. A mismatch then costs a single
 //! re-prefilled message instead of everything back to the previous
 //! structural boundary.
+//!
+//! # A `max_tokens` turn can carry complete calls
+//!
+//! As on Anthropic, a turn the budget cut short is a 200 with
+//! `stop_reason: max_tokens` — and the calls that closed before the cut
+//! are in it, as `tool_use` blocks. Clients must gate dispatch on
+//! `stop_reason: tool_use`, never on the presence of a `tool_use` block.
+//!
+//! One cut turn is not answered that way: one that had already repeated
+//! a call verbatim (same tool, same input) — a model looping identical
+//! calls to the budget, the loop the old grammar-violation check caught
+//! (plan Phase G). blallama resamples it on the warm cache, like the
+//! other unlucky draws, and answers `max_tokens` only if every draw
+//! loops. Anthropic has no such loop to guard against; here it is
+//! better than parity.
 
 use std::{
     num::{NonZeroU128, NonZeroUsize},
@@ -60,7 +75,10 @@ use drama_llama::{
     prompt::{AnthropicError, MessageResponse, Usage},
     Catalog, FromPath, ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
 };
-use misanthropic::model::{ModelInfo, Models};
+use misanthropic::{
+    model::{ModelInfo, Models},
+    response::StopReason,
+};
 use tokio::{sync::Mutex, task::spawn_blocking};
 use tracing::{error, info, instrument};
 
@@ -759,6 +777,22 @@ where
                             "resampling after grammar violation",
                         );
                     }
+                    // A cut turn is a 200 (#121) — except one that was
+                    // looping identical calls into the budget, which a
+                    // fresh draw usually escapes. Once the resamples run
+                    // out, it is answered as the cut turn it is.
+                    Ok(response)
+                        if resamples < MAX_RESAMPLES
+                            && loops_a_call(&response) =>
+                    {
+                        resamples += 1;
+                        error!(
+                            attempt = resamples,
+                            max = MAX_RESAMPLES,
+                            "turn cut by max_tokens after repeating a \
+                             tool call verbatim; resampling (Phase G loop)",
+                        );
+                    }
                     other => break other,
                 }
             };
@@ -793,6 +827,29 @@ where
     let response = result.map_err(map_session_err)?;
     log_stats(&response.id, response.usage.clone(), elapsed);
     Ok(Json(response))
+}
+
+/// The loop signature the Phase G postmortem found: a turn the budget
+/// cut (`max_tokens`) that had already repeated one call verbatim — same
+/// tool, same input. See the module docs.
+fn loops_a_call(response: &MessageResponse) -> bool {
+    let calls: Vec<_> = response
+        .inner
+        .content
+        .0
+        .iter()
+        .filter_map(|block| match block {
+            drama_llama::Block::ToolUse { call } => {
+                Some((&call.name, &call.input))
+            }
+            _ => None,
+        })
+        .collect();
+    response.stop_reason == Some(StopReason::MaxTokens)
+        && calls
+            .iter()
+            .enumerate()
+            .any(|(i, call)| calls[..i].contains(call))
 }
 
 fn configure_session<B: Backend>(
@@ -1354,6 +1411,47 @@ mod tests {
         let (status, value) = extract(req).await.expect_err("no content type");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(value["error"]["type"], "invalid_request_error");
+    }
+
+    /// A response as the wire carries it, cut by `max_tokens` after
+    /// `calls` (name, input JSON).
+    fn cut_response(calls: &[(&str, &str)]) -> MessageResponse {
+        let content: Vec<String> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, input))| {
+                format!(
+                    r#"{{"type": "tool_use", "id": "toolu_{i}",
+                        "name": "{name}", "input": {input}}}"#
+                )
+            })
+            .collect();
+        serde_json::from_str(&format!(
+            r#"{{"id": "msg_0", "type": "message", "role": "assistant",
+                "model": "m", "content": [{}],
+                "stop_reason": "max_tokens", "stop_sequence": null,
+                "usage": {{"input_tokens": 1, "output_tokens": 1}}}}"#,
+            content.join(", "),
+        ))
+        .expect("wire-shaped response")
+    }
+
+    /// The Phase G safeguard keys on a *verbatim* repeat in a cut turn:
+    /// the same call twice resamples; distinct calls, or the same tool
+    /// with different input, are an ordinary cut turn (200
+    /// `max_tokens`, #121), and so is any turn that was not cut.
+    #[test]
+    fn loops_a_call_is_a_verbatim_repeat_in_a_cut_turn() {
+        let a = ("get_weather", r#"{"city": "Paris"}"#);
+        let b = ("get_weather", r#"{"city": "Oslo"}"#);
+        assert!(loops_a_call(&cut_response(&[a, b, a])));
+        assert!(!loops_a_call(&cut_response(&[a, b])));
+        assert!(!loops_a_call(&cut_response(&[a])));
+        assert!(!loops_a_call(&cut_response(&[])));
+
+        let mut finished = cut_response(&[a, a]);
+        finished.stop_reason = Some(StopReason::ToolUse);
+        assert!(!loops_a_call(&finished));
     }
 
     /// #123: a tool whose schema interleaves required and optional

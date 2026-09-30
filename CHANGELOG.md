@@ -66,7 +66,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bytes seated as prose (calls that closed before the cut stand). A cut
   outranks `ToolUse` in the stop reason, so a turn clipped mid-way
   through its second parallel call never reads as a finished call
-  turn. The mechanism is a third parse leniency,
+  turn. **A `max_tokens` turn can therefore carry complete calls:
+  clients must gate dispatch on `stop_reason: tool_use`, never on the
+  presence of a `ToolUse` block** — as on Anthropic. One exception in
+  blallama, deliberately better than parity: a cut turn that had
+  already repeated a call verbatim (same tool, same input — the
+  identical-call loop the old grammar-violation check caught, plan
+  Phase G) is resampled on the warm cache like the other unlucky
+  draws, and answered `max_tokens` only if every draw loops. The
+  mechanism is a third parse leniency,
   `dialect::Leniency::Clipped` (and `StreamParser::finish_clipped`):
   incomplete calls withheld as under `Streaming`, unclosed thoughts
   surfaced open as under `Final`. Bare-JSON dialects are exempt — any
