@@ -21,13 +21,14 @@
 //!   all-optional case (no `required`) emits N "chain" alternatives
 //!   so all 2^N inclusion patterns are reachable.
 //!
-//!   Anthropic's structured outputs order the same way with one
-//!   caveat: "required properties appear first, followed by optional
-//!   properties". Locally the grammar *forces* our order, so there is
-//!   no force-EOS risk — but a schema that interleaves optionals
-//!   before required fields will render in different orders on the
-//!   two engines. Declare required fields first when a tool serves
-//!   both and the difference matters.
+//!   Anthropic's structured outputs order the same way: optionals stay
+//!   in place, in `properties` order. Its docs say "required properties
+//!   appear first, followed by optional properties", but the wire
+//!   disagrees — probed live with `zulu` required, `alpha` optional,
+//!   `mike` required, every sample on four models emitted
+//!   `zulu → alpha → mike`, never the hoisted order (misanthropic
+//!   `9be105f`). An interleaved schema renders the same on both
+//!   engines.
 //! * `type: array` with `items` → array of the item schema.
 //!   `minItems >= 1` additionally forces non-emptiness — matching
 //!   what Anthropic's structured outputs enforce (its sanitizer
