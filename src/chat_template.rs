@@ -243,6 +243,18 @@ impl ChatTemplate {
         opts: &RenderOptions,
     ) -> Result<String, ChatTemplateError> {
         self.render_with_env(&self.env, prompt, opts)
+            .map(|(text, _)| text)
+    }
+
+    /// [`Self::render_with`], plus how many times each reserved piece
+    /// was neutralized in the prompt's content (empty without
+    /// [`RenderOptions::literals`]).
+    pub(crate) fn render_counted(
+        &self,
+        prompt: &Prompt,
+        opts: &RenderOptions,
+    ) -> Result<(String, LiteralCounts), ChatTemplateError> {
+        self.render_with_env(&self.env, prompt, opts)
     }
 
     /// Shared render path. `env` selects strict vs. permissive raise
@@ -253,7 +265,7 @@ impl ChatTemplate {
         env: &Environment<'static>,
         prompt: &Prompt,
         opts: &RenderOptions,
-    ) -> Result<String, ChatTemplateError> {
+    ) -> Result<(String, LiteralCounts), ChatTemplateError> {
         // Images require a media sentinel to render into — anything
         // else is the silent drop this check exists to kill.
         if opts.media_sentinel.is_none() && prompt_has_images(prompt) {
@@ -269,12 +281,13 @@ impl ChatTemplate {
             }
             (_, start) => start.as_deref().unwrap_or_default(),
         };
+        let surfaces = Surfaces::new(opts);
         let messages = build_messages(
             prompt,
             opts.thought_reingest,
-            opts.media_sentinel.as_deref(),
+            &surfaces,
             open_tail.is_some(),
-        );
+        )?;
         // Only custom (client-executed) tool defs render into the
         // template; server tools execute on Anthropic's side and their
         // schemas aren't even visible to us.
@@ -287,9 +300,18 @@ impl ChatTemplate {
         let tools_value = if custom_tools.is_empty() {
             JinjaValue::from(()) // renders as None / null
         } else {
-            let wire: Vec<serde_json::Value> =
-                custom_tools.iter().map(|t| tool_wire_value(t)).collect();
-            JinjaValue::from_serialize(&wire)
+            for (i, tool) in custom_tools.iter().enumerate() {
+                surfaces.identifier(&tool.name, is_tool_name, || {
+                    format!("tool definition {i}: name")
+                })?;
+            }
+            let wire = serde_json::Value::Array(
+                custom_tools.iter().map(|t| tool_wire_value(t)).collect(),
+            );
+            // Descriptions and schemas are content — a third-party
+            // tool's description is as untrusted as its results. Not
+            // counted: `Session`'s scan walks messages, not tools.
+            surfaces.value(&wire, false)
         };
         // Default `date_string` to today in HF's "%d %b %Y" format when
         // the caller didn't supply one. The template unconditionally
@@ -377,9 +399,9 @@ impl ChatTemplate {
             if !out.trim_end().ends_with(reasoning_start) {
                 out.push_str(reasoning_start);
             }
-            out.push_str(body);
+            out.push_str(&surfaces.text(body, true));
         }
-        Ok(out)
+        Ok((out, surfaces.counts.into_inner()))
     }
 
     /// Render the prompt plus one partial render per `cache_control`
@@ -411,7 +433,19 @@ impl ChatTemplate {
         prompt: &Prompt,
         opts: &RenderOptions,
     ) -> Result<RenderedWithBreakpoints, ChatTemplateError> {
-        let text = self.render_with(prompt, opts)?;
+        self.render_with_breakpoints_counted(prompt, opts)
+            .map(|(rendered, _)| rendered)
+    }
+
+    /// [`Self::render_with_breakpoints`], plus the full render's
+    /// neutralization counts (see [`Self::render_counted`]).
+    pub(crate) fn render_with_breakpoints_counted(
+        &self,
+        prompt: &Prompt,
+        opts: &RenderOptions,
+    ) -> Result<(RenderedWithBreakpoints, LiteralCounts), ChatTemplateError>
+    {
+        let (text, counts) = self.render_counted(prompt, opts)?;
         let breakpoints = collect_breakpoints(prompt);
         let mut partials = Vec::with_capacity(breakpoints.len());
         for (bp, ttl) in breakpoints {
@@ -438,7 +472,7 @@ impl ChatTemplate {
                 }
             }
         }
-        Ok(RenderedWithBreakpoints { text, partials })
+        Ok((RenderedWithBreakpoints { text, partials }, counts))
     }
 }
 
@@ -553,6 +587,15 @@ pub struct RenderOptions {
     ///
     /// [`ReasoningSyntax::efforts`]: crate::dialect::ReasoningSyntax::efforts
     pub efforts: Vec<String>,
+    /// Content-literal neutralization (see [`LiteralNeutralizer`]).
+    /// When set, every content string the template sees has its
+    /// reserved pieces replaced by markers, and tool names and
+    /// tool-use ids must match Anthropic's patterns
+    /// ([`ChatTemplateError::InvalidIdentifier`]). `Session` sets this
+    /// on every render itself, whatever
+    /// [`Session::with_render_opts`](crate::Session::with_render_opts)
+    /// was given.
+    pub literals: Option<Literals>,
 }
 
 impl RenderOptions {
@@ -625,6 +668,13 @@ impl RenderOptions {
         S: Into<String>,
     {
         self.efforts = efforts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Builder: neutralize content literals (see
+    /// [`RenderOptions::literals`]).
+    pub fn with_literals(mut self, literals: Literals) -> Self {
+        self.literals = Some(literals);
         self
     }
 }
@@ -1193,11 +1243,9 @@ fn render_partial(
         },
     };
     let partial_opts = opts.clone().with_generation_prompt(false);
-    template.render_with_env(
-        &template.env_permissive,
-        &truncated,
-        &partial_opts,
-    )
+    template
+        .render_with_env(&template.env_permissive, &truncated, &partial_opts)
+        .map(|(text, _)| text)
 }
 
 /// Tokenize the full render and each partial in `rendered`, returning
@@ -1212,18 +1260,15 @@ fn render_partial(
 /// uncached behavior for that call rather than erroring, so cache
 /// oddities degrade performance rather than correctness.
 ///
-/// Tokenizes with `parse_special=true` so chat markers
-/// (`<|im_start|>`, `<|eot_id|>`, …) resolve to their single
-/// special-token IDs — the same convention `Session::prepare_call`
-/// uses.
+/// Tokenizes the whole render with `parse_special=true` so chat
+/// markers (`<|im_start|>`, `<|eot_id|>`, …) resolve to their single
+/// special-token IDs. A diagnostic helper, not what [`Session`]
+/// feeds the model: this knows nothing of images or content literals
+/// ([`RenderOptions::literals`]), so a special piece spelled by
+/// content tokenizes here as the real special, and a render made with
+/// markers is not split. `Session` tokenizes marker-aware.
 ///
-/// Used internally by `Session::prepare_call_cached` for the
-/// prefix-cache lookup, and exposed publicly so callers can build
-/// inspection / diagnostic tools that reproduce exactly the same
-/// tokenization the cache machinery sees (see
-/// `examples/inspect_prompt.rs`).
-///
-/// [`Session::prepare_call`]: crate::Session
+/// [`Session`]: crate::Session
 pub fn tokenize_with_breakpoints<M: Model>(
     model: &M,
     rendered: &RenderedWithBreakpoints,
@@ -1269,16 +1314,21 @@ pub fn tokenize_with_breakpoints<M: Model>(
 ///   each tool result emits a separate `{role: "tool", content: ...}`
 ///   message. Any remaining text in the same user turn follows as a
 ///   normal user message.
+///
+/// Every content string passes through `surfaces` on its way in (see
+/// [`LiteralNeutralizer`]); tool names and tool-use ids are validated
+/// there instead.
 fn build_messages(
     prompt: &Prompt,
     reingest: crate::dialect::ReasoningReingest,
-    media_sentinel: Option<&str>,
+    surfaces: &Surfaces<'_>,
     withhold_tail: bool,
-) -> Vec<JinjaValue> {
+) -> Result<Vec<JinjaValue>, ChatTemplateError> {
     let mut out: Vec<JinjaValue> =
         Vec::with_capacity(prompt.messages.len() + 1);
     if let Some(system) = prompt.system.as_ref() {
-        out.push(text_message("system", flatten_text(system, media_sentinel)));
+        let system = flatten_text(system, surfaces.media_sentinel);
+        out.push(text_message("system", system.render(surfaces, true)));
     }
     let messages = match withhold_tail {
         // The trailing open-thought message is rendered by the caller,
@@ -1286,7 +1336,7 @@ fn build_messages(
         true => &prompt.messages[..prompt.messages.len() - 1],
         false => &prompt.messages[..],
     };
-    for m in messages {
+    for (index, m) in messages.iter().enumerate() {
         let role = match m.role {
             Role::User => "user",
             Role::Assistant => "assistant",
@@ -1294,29 +1344,38 @@ fn build_messages(
             // HF templates broadly accept repeated system messages.
             Role::System => "system",
         };
-        append_message(&mut out, role, &m.content, reingest, media_sentinel);
+        append_message(&mut out, role, index, &m.content, reingest, surfaces)?;
     }
-    out
+    Ok(out)
 }
 
-/// Emit one or more Jinja messages for a single misanthropic Message.
+/// Emit one or more Jinja messages for a single misanthropic Message
+/// (the prompt's `index`th).
 fn append_message(
     out: &mut Vec<JinjaValue>,
     role: &str,
+    index: usize,
     content: &Content,
     reingest: crate::dialect::ReasoningReingest,
-    media_sentinel: Option<&str>,
-) {
+    surfaces: &Surfaces<'_>,
+) -> Result<(), ChatTemplateError> {
     let blocks: Vec<&Block> = content.0.iter().collect();
+    let media_sentinel = surfaces.media_sentinel;
 
     // User turn: split ToolResult blocks into their own "tool" messages,
     // collect remaining text/thought into a trailing user message.
     if role == "user" {
-        let mut residual = String::new();
-        for b in &blocks {
-            match b {
+        let mut residual = Flat::default();
+        for (b, block) in blocks.iter().enumerate() {
+            match block {
                 Block::ToolResult { result } => {
-                    let content = flatten_text(&result.content, media_sentinel);
+                    surfaces.identifier(
+                        &result.tool_use_id,
+                        is_identifier,
+                        || format!("message {index} block {b}: tool_use_id"),
+                    )?;
+                    let content = flatten_text(&result.content, media_sentinel)
+                        .render(surfaces, true);
                     out.push(tool_result_message(&result.tool_use_id, content));
                 }
                 other => {
@@ -1325,9 +1384,9 @@ fn append_message(
             }
         }
         if !residual.is_empty() {
-            out.push(text_message(role, residual));
+            out.push(text_message(role, residual.render(surfaces, true)));
         }
-        return;
+        return Ok(());
     }
 
     // Assistant turn. Thoughts route by convention: inline
@@ -1336,10 +1395,11 @@ fn append_message(
     // `reasoning`/`reasoning_content` fields (Gemma 4/DeepSeek-style
     // templates own the markers; inlining would pollute content).
     use crate::dialect::ReasoningReingest;
-    let calls: Vec<&crate::prompt::ToolUse> = blocks
+    let calls: Vec<(usize, &crate::prompt::ToolUse)> = blocks
         .iter()
-        .filter_map(|b| match b {
-            Block::ToolUse { call } => Some(call),
+        .enumerate()
+        .filter_map(|(b, block)| match block {
+            Block::ToolUse { call } => Some((b, call)),
             _ => None,
         })
         .collect();
@@ -1349,8 +1409,8 @@ fn append_message(
     // causality-aware templates get both halves; stock templates read
     // the merged `content` and keep their own layout.
     let mut reasoning = String::new();
-    let mut content_pre = String::new();
-    let mut content_post = String::new();
+    let mut content_pre = Flat::default();
+    let mut content_post = Flat::default();
     let mut seen_call = false;
     for b in &blocks {
         match b {
@@ -1374,20 +1434,55 @@ fn append_message(
             ),
         }
     }
+    // Consecutive thoughts concatenate with nothing between them, so
+    // the joined string is what gets neutralized.
+    let reasoning = surfaces.text(&reasoning, true);
 
     // One message carrying every call: the shape template
     // `tool_calls` loops iterate, so parallel calls re-render intact.
     if !calls.is_empty() {
+        let tool_calls = calls
+            .iter()
+            .map(|&(b, call)| {
+                let at = || format!("message {index} block {b}: tool_use");
+                surfaces.identifier(&call.id, is_identifier, || {
+                    format!("{} id", at())
+                })?;
+                surfaces.identifier(&call.name, is_tool_name, || {
+                    format!("{} name", at())
+                })?;
+                Ok(minijinja::context! {
+                    id => call.id.as_ref(),
+                    function => minijinja::context! {
+                        name => call.name.as_ref(),
+                        arguments => surfaces.value(&call.input, true),
+                    },
+                })
+            })
+            .collect::<Result<Vec<JinjaValue>, ChatTemplateError>>()?;
+        // The merged `content` joins the halves with nothing between
+        // them, so it is the counted form; the halves are what
+        // causality-aware templates render around the calls.
+        let content = content_pre.join(&content_post).render(surfaces, true);
         out.push(tool_call_message(
             role,
-            (&content_pre, &content_post),
-            &calls,
+            content,
+            (
+                &content_pre.render(surfaces, false),
+                &content_post.render(surfaces, false),
+            ),
+            tool_calls,
             &reasoning,
             reingest,
         ));
-        return;
+        return Ok(());
     }
-    out.push(assistant_text_message(role, content_pre, &reasoning));
+    out.push(assistant_text_message(
+        role,
+        content_pre.render(surfaces, true),
+        &reasoning,
+    ));
+    Ok(())
 }
 
 fn text_message(role: &str, content: String) -> JinjaValue {
@@ -1415,24 +1510,12 @@ fn text_message(role: &str, content: String) -> JinjaValue {
 /// render announce-then-call in emission order.
 fn tool_call_message(
     role: &str,
+    content: String,
     (content_pre, content_post): (&str, &str),
-    calls: &[&crate::prompt::ToolUse],
+    tool_calls: Vec<JinjaValue>,
     reasoning: &str,
     reingest: crate::dialect::ReasoningReingest,
 ) -> JinjaValue {
-    let tool_calls: Vec<JinjaValue> = calls
-        .iter()
-        .map(|call| {
-            minijinja::context! {
-                id => call.id.as_ref(),
-                function => minijinja::context! {
-                    name => call.name.as_ref(),
-                    arguments => JinjaValue::from_serialize(&call.input),
-                },
-            }
-        })
-        .collect();
-    let content = format!("{content_pre}{content_post}");
     if reasoning.is_empty() {
         minijinja::context! {
             role => role,
@@ -1498,10 +1581,9 @@ fn tool_result_message(tool_use_id: &str, content: String) -> JinjaValue {
     }
 }
 
-/// Flatten any [`Content`] to a single string using [`append_block_text`]
-/// for each part.
-fn flatten_text(content: &Content, media_sentinel: Option<&str>) -> String {
-    let mut out = String::new();
+/// Flatten any [`Content`] using [`append_block_text`] for each part.
+fn flatten_text(content: &Content, media_sentinel: Option<&str>) -> Flat {
+    let mut out = Flat::default();
     for b in &content.0 {
         append_block_text(&mut out, b, media_sentinel);
     }
@@ -1512,16 +1594,18 @@ fn flatten_text(content: &Content, media_sentinel: Option<&str>) -> String {
 /// tool-result blocks are handled at the message level (see
 /// [`append_message`]); here they contribute nothing.
 fn append_block_text(
-    out: &mut String,
+    out: &mut Flat,
     block: &Block,
     media_sentinel: Option<&str>,
 ) {
     match block {
-        Block::Text { text, .. } => out.push_str(text),
+        Block::Text { text, .. } => out.content(text),
+        // The wrappers are ours — framing, never neutralized; the body
+        // is content.
         Block::Thought { thought, .. } => {
-            out.push_str("<think>");
-            out.push_str(thought);
-            out.push_str("</think>");
+            out.framing("<think>");
+            out.content(thought);
+            out.framing("</think>");
         }
         // Sentinel emission: `<{R}:{source_hash_hex}>`. The caller
         // splits the render on this and resolves each occurrence
@@ -1533,10 +1617,7 @@ fn append_block_text(
         // unreachable rather than a silent drop.
         Block::Image { image, .. } => {
             if let Some(sentinel) = media_sentinel {
-                out.push_str(&media_marker(
-                    sentinel,
-                    &image_source_hash(image),
-                ));
+                out.framing(&media_marker(sentinel, &image_source_hash(image)));
             }
         }
         // Tool-use / tool-result blocks are handled at the message
@@ -1648,9 +1729,21 @@ pub(crate) fn media_marker(sentinel: &str, source_hash: &[u8; 32]) -> String {
     s
 }
 
-/// A media-bearing render split on its sentinel: `n + 1` text
-/// segments interleaved with `n` image source hashes, in render
-/// order. Imageless renders come back as one segment and no hashes.
+/// One out-of-band marker in a render: an image, or a reserved piece
+/// that content spelled (see [`LiteralNeutralizer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenderMarker {
+    /// `<{sentinel}:{hex64}>` — the image's source hash (see
+    /// [`image_source_hash`]).
+    Media([u8; 32]),
+    /// `<{sentinel}:t{id}>` — content that spelled the piece of
+    /// special token `id`.
+    Literal(Token),
+}
+
+/// A render split on its sentinel: `n + 1` text segments interleaved
+/// with `n` markers, in render order. A render without markers comes
+/// back as one segment.
 ///
 /// Consumed by `Session` (the only splitter); dead-code-allowed for
 /// builds without a session backend, where emission still exists but
@@ -1664,15 +1757,15 @@ pub(crate) fn media_marker(sentinel: &str, source_hash: &[u8; 32]) -> String {
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SplitRender<'a> {
-    /// Text between (around) media markers;
-    /// `segments.len() == source_hashes.len() + 1`.
+    /// Text between (around) markers;
+    /// `segments.len() == markers.len() + 1`.
     pub segments: Vec<&'a str>,
-    /// Source hash of the image at each marker (see
-    /// [`image_source_hash`]).
-    pub source_hashes: Vec<[u8; 32]>,
+    /// The marker after each segment but the last.
+    pub markers: Vec<RenderMarker>,
 }
 
-/// Split `text` on `<{sentinel}:{hex64}>` markers.
+/// Split `text` on `<{sentinel}:…>` markers: `{hex64}` for an image,
+/// `t{id}` for a content literal.
 ///
 /// The sentinel is per-call random and never surfaced, so content
 /// cannot contain it — every occurrence is one of our own emissions.
@@ -1687,44 +1780,397 @@ pub(crate) struct SplitRender<'a> {
     )),
     allow(dead_code)
 )]
-pub(crate) fn split_media_render<'a>(
+pub(crate) fn split_render<'a>(
     text: &'a str,
     sentinel: &str,
 ) -> Result<SplitRender<'a>, usize> {
     let pattern = format!("<{sentinel}:");
     let mut segments = Vec::new();
-    let mut source_hashes = Vec::new();
+    let mut markers = Vec::new();
     let mut rest = text;
     let mut base = 0usize;
     while let Some(at) = rest.find(&pattern) {
-        let hex_start = at + pattern.len();
-        let hex_end = hex_start + 64;
-        let ok = rest.len() > hex_end
-            && rest.as_bytes()[hex_end] == b'>'
-            && rest[hex_start..hex_end]
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit());
-        if !ok {
-            return Err(base + at);
-        }
-        let mut hash = [0u8; 32];
-        for (i, byte) in hash.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(
-                &rest[hex_start + i * 2..hex_start + i * 2 + 2],
-                16,
-            )
-            .expect("checked hexdigit above");
-        }
+        let body_start = at + pattern.len();
+        let (marker, end) = parse_marker(&rest[body_start..])
+            .ok_or(base + at)
+            .map(|(marker, len)| (marker, body_start + len))?;
         segments.push(&rest[..at]);
-        source_hashes.push(hash);
-        rest = &rest[hex_end + 1..];
-        base += hex_end + 1;
+        markers.push(marker);
+        rest = &rest[end..];
+        base += end;
     }
     segments.push(rest);
-    Ok(SplitRender {
-        segments,
-        source_hashes,
-    })
+    Ok(SplitRender { segments, markers })
+}
+
+/// Parse one marker body (what follows `<{sentinel}:`), returning the
+/// marker and the byte length consumed including the closing `>`.
+fn parse_marker(body: &str) -> Option<(RenderMarker, usize)> {
+    let close = body.find('>')?;
+    let inner = &body[..close];
+    let marker = match inner.strip_prefix('t') {
+        Some(id) => {
+            // Canonical decimal only: `t007` is not a marker we wrote.
+            let canonical = !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && (id == "0" || !id.starts_with('0'));
+            RenderMarker::Literal(canonical.then(|| id.parse().ok()).flatten()?)
+        }
+        None if inner.len() == 64
+            && inner.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            let mut hash = [0u8; 32];
+            for (i, byte) in hash.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&inner[i * 2..i * 2 + 2], 16)
+                    .expect("checked hexdigit above");
+            }
+            RenderMarker::Media(hash)
+        }
+        None => return None,
+    };
+    Some((marker, close + 1))
+}
+
+// ===========================================================================
+// Content literals
+// ===========================================================================
+
+/// How many times each reserved piece was neutralized, by token id.
+pub(crate) type LiteralCounts = BTreeMap<Token, usize>;
+
+/// The reserved special-token pieces of a vocabulary, matched in prompt
+/// *content* so they reach the model as spelled text instead of as the
+/// control tokens they spell.
+///
+/// Every prepare path tokenizes the render with special-token parsing
+/// on, which the chat framing needs: `<|im_start|>` in the template
+/// must become one control token. Without this, the same piece in a
+/// tool result, a user message or a tool description would become one
+/// too, and the content could restructure the conversation. So each
+/// piece found in a content surface is replaced before the template
+/// sees it with an out-of-band marker, `<{sentinel}:t{id}>`, which
+/// `Session` splits back out and tokenizes as text. The template's own
+/// framing is never touched.
+///
+/// Matching is leftmost-longest (Aho-Corasick), so overlapping pieces
+/// resolve the way the longer one reads and no piece survives
+/// neutralization. `Session` builds one per model at construction and
+/// injects it into every render through [`RenderOptions::literals`];
+/// a caller rendering with a [`ChatTemplate`] directly can do the same
+/// with [`RenderOptions::with_literals`].
+#[derive(Clone)]
+pub struct LiteralNeutralizer {
+    /// `None` when there are no pieces.
+    matcher: Option<aho_corasick::AhoCorasick>,
+    /// Pattern index → `(token id, piece)`.
+    pieces: Vec<(Token, String)>,
+    /// Token id → pattern index.
+    by_id: std::collections::HashMap<Token, usize>,
+}
+
+impl std::fmt::Debug for LiteralNeutralizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Counts, not pieces: the pieces are reserved bytes.
+        f.debug_struct("LiteralNeutralizer")
+            .field("pieces", &self.pieces.len())
+            .finish()
+    }
+}
+
+impl LiteralNeutralizer {
+    /// Build from `(token id, piece)` pairs. Empty pieces are skipped,
+    /// and a duplicate piece or id keeps its first entry.
+    pub fn new<I, S>(pieces: I) -> Self
+    where
+        I: IntoIterator<Item = (Token, S)>,
+        S: Into<String>,
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut by_id = std::collections::HashMap::new();
+        let pieces: Vec<(Token, String)> = pieces
+            .into_iter()
+            .map(|(id, piece)| (id, piece.into()))
+            .filter(|(id, piece)| {
+                !piece.is_empty()
+                    && !by_id.contains_key(id)
+                    && seen.insert(piece.clone())
+                    && by_id.insert(*id, by_id.len()).is_none()
+            })
+            .collect();
+        let matcher = (!pieces.is_empty()).then(|| {
+            aho_corasick::AhoCorasick::builder()
+                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                .build(pieces.iter().map(|(_, piece)| piece))
+                // Only a pattern set past the automaton's size limits
+                // fails to build; a vocabulary's specials are a few
+                // thousand short strings at most.
+                .expect("reserved pieces fit an Aho-Corasick automaton")
+        });
+        Self {
+            matcher,
+            pieces,
+            by_id,
+        }
+    }
+
+    /// Whether there is nothing to neutralize.
+    pub fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    /// Number of reserved pieces.
+    pub fn len(&self) -> usize {
+        self.pieces.len()
+    }
+
+    /// Whether `id` is one of the reserved tokens.
+    pub fn contains(&self, id: Token) -> bool {
+        self.by_id.contains_key(&id)
+    }
+
+    /// The piece of reserved token `id`.
+    pub fn piece(&self, id: Token) -> Option<&str> {
+        self.by_id.get(&id).map(|&i| self.pieces[i].1.as_str())
+    }
+
+    /// The reserved token ids.
+    pub fn ids(&self) -> impl Iterator<Item = Token> + '_ {
+        self.pieces.iter().map(|(id, _)| *id)
+    }
+
+    /// Every reserved piece in `text`, leftmost-longest, as
+    /// `(byte range, token id)`.
+    pub fn find_iter<'t>(
+        &'t self,
+        text: &'t str,
+    ) -> impl Iterator<Item = (std::ops::Range<usize>, Token)> + 't {
+        self.matcher.iter().flat_map(move |ac| {
+            ac.find_iter(text).map(move |m| {
+                (m.start()..m.end(), self.pieces[m.pattern().as_usize()].0)
+            })
+        })
+    }
+
+    /// Replace every reserved piece in `text` with its marker under
+    /// `sentinel`, adding each replacement to `counts`. Borrows when
+    /// there is nothing to replace, so clean text is untouched.
+    fn neutralize<'t>(
+        &self,
+        text: &'t str,
+        sentinel: &str,
+        mut counts: Option<&mut LiteralCounts>,
+    ) -> Cow<'t, str> {
+        let mut out: Option<String> = None;
+        let mut last = 0;
+        for (range, id) in self.find_iter(text) {
+            let buf =
+                out.get_or_insert_with(|| String::with_capacity(text.len()));
+            buf.push_str(&text[last..range.start]);
+            buf.push_str(&literal_marker(sentinel, id));
+            last = range.end;
+            if let Some(counts) = counts.as_deref_mut() {
+                *counts.entry(id).or_default() += 1;
+            }
+        }
+        match out {
+            None => Cow::Borrowed(text),
+            Some(mut buf) => {
+                buf.push_str(&text[last..]);
+                Cow::Owned(buf)
+            }
+        }
+    }
+}
+
+/// The rendered form of one content literal: `<{sentinel}:t{id}>`.
+pub(crate) fn literal_marker(sentinel: &str, id: Token) -> String {
+    format!("<{sentinel}:t{id}>")
+}
+
+/// Per-render content-literal configuration: the vocabulary's
+/// [`LiteralNeutralizer`] and the sentinel its markers render under.
+///
+/// The sentinel must be something no content can contain — `Session`
+/// draws a fresh random one per call, the same way it does for images
+/// (see [`RenderOptions::media_sentinel`]), and shares it with the
+/// image markers when both are present.
+#[derive(Clone, Debug)]
+pub struct Literals {
+    sentinel: String,
+    neutralizer: Arc<LiteralNeutralizer>,
+}
+
+impl Literals {
+    /// Neutralize with `neutralizer`, marking under `sentinel`.
+    pub fn new<S>(sentinel: S, neutralizer: Arc<LiteralNeutralizer>) -> Self
+    where
+        S: Into<String>,
+    {
+        Self {
+            sentinel: sentinel.into(),
+            neutralizer,
+        }
+    }
+
+    /// The marker sentinel.
+    pub fn sentinel(&self) -> &str {
+        &self.sentinel
+    }
+
+    /// The neutralizer.
+    pub fn neutralizer(&self) -> &LiteralNeutralizer {
+        &self.neutralizer
+    }
+}
+
+/// Anthropic's pattern for a tool name, `^[a-zA-Z0-9_-]{1,64}$`.
+fn is_tool_name(s: &str) -> bool {
+    (1..=64).contains(&s.len()) && is_identifier(s)
+}
+
+/// Anthropic's pattern for a tool-use id, `^[a-zA-Z0-9_-]+$` — no
+/// length cap, since our own ids (`call_{n}_{name}`) outgrow 64 bytes
+/// for long tool names.
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The content surfaces of one render: where every string the template
+/// can see is neutralized, counted and, for identifiers, validated.
+struct Surfaces<'a> {
+    media_sentinel: Option<&'a str>,
+    literals: Option<&'a Literals>,
+    /// Replacements in the counted surfaces — one count per content
+    /// string, so `Session` can check it against its own scan.
+    counts: std::cell::RefCell<LiteralCounts>,
+}
+
+impl<'a> Surfaces<'a> {
+    fn new(opts: &'a RenderOptions) -> Self {
+        Self {
+            media_sentinel: opts.media_sentinel.as_deref(),
+            literals: opts.literals.as_ref(),
+            counts: Default::default(),
+        }
+    }
+
+    /// Neutralize content `text`; `counted` adds its replacements to
+    /// [`Self::counts`]. A string the template sees twice (the merged
+    /// assistant `content` and its `content_pre`/`content_post`
+    /// halves) is counted once.
+    fn text<'t>(&self, text: &'t str, counted: bool) -> Cow<'t, str> {
+        let Some(lit) = self.literals else {
+            return Cow::Borrowed(text);
+        };
+        let mut counts = self.counts.borrow_mut();
+        lit.neutralizer.neutralize(
+            text,
+            &lit.sentinel,
+            counted.then_some(&mut *counts),
+        )
+    }
+
+    /// Neutralize every key and string leaf of `value`.
+    fn value(&self, value: &serde_json::Value, counted: bool) -> JinjaValue {
+        use serde_json::Value;
+        fn walk(s: &Surfaces<'_>, v: &Value, counted: bool) -> Value {
+            match v {
+                Value::String(t) => {
+                    Value::String(s.text(t, counted).into_owned())
+                }
+                Value::Array(items) => Value::Array(
+                    items.iter().map(|i| walk(s, i, counted)).collect(),
+                ),
+                Value::Object(map) => Value::Object(
+                    map.iter()
+                        .map(|(k, v)| {
+                            (
+                                s.text(k, counted).into_owned(),
+                                walk(s, v, counted),
+                            )
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            }
+        }
+        match self.literals {
+            None => JinjaValue::from_serialize(value),
+            Some(_) => JinjaValue::from_serialize(walk(self, value, counted)),
+        }
+    }
+
+    /// Reject an identifier the model would see verbatim: tool names
+    /// and tool-use ids are not neutralized (the grammar and parser key
+    /// on them), so they must hold Anthropic's character set and no
+    /// reserved piece. Only checked when neutralizing.
+    fn identifier(
+        &self,
+        value: &str,
+        valid: fn(&str) -> bool,
+        what: impl FnOnce() -> String,
+    ) -> Result<(), ChatTemplateError> {
+        let Some(lit) = self.literals else {
+            return Ok(());
+        };
+        if valid(value) && lit.neutralizer.find_iter(value).next().is_none() {
+            Ok(())
+        } else {
+            Err(ChatTemplateError::InvalidIdentifier { what: what() })
+        }
+    }
+}
+
+/// Template-visible text assembled from content and our own framing
+/// (thought wrappers, image markers). Adjacent content joins into one
+/// run before it is neutralized, so a piece split across two blocks
+/// the template sees concatenated is still caught; framing is never
+/// neutralized.
+#[derive(Default, Clone)]
+struct Flat {
+    /// `(is_content, text)`, adjacent content merged.
+    spans: Vec<(bool, String)>,
+}
+
+impl Flat {
+    fn content(&mut self, text: &str) {
+        match self.spans.last_mut() {
+            Some((true, run)) => run.push_str(text),
+            _ => self.spans.push((true, text.to_string())),
+        }
+    }
+
+    fn framing(&mut self, text: &str) {
+        self.spans.push((false, text.to_string()));
+    }
+
+    /// `self` followed by `other`, content runs joined at the seam.
+    fn join(&self, other: &Flat) -> Flat {
+        let mut out = self.clone();
+        for (is_content, text) in &other.spans {
+            match is_content {
+                true => out.content(text),
+                false => out.framing(text),
+            }
+        }
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spans.iter().all(|(_, text)| text.is_empty())
+    }
+
+    fn render(&self, surfaces: &Surfaces<'_>, counted: bool) -> String {
+        self.spans
+            .iter()
+            .map(|(is_content, text)| match is_content {
+                true => surfaces.text(text, counted),
+                false => Cow::Borrowed(text.as_str()),
+            })
+            .collect()
+    }
 }
 
 // ===========================================================================
@@ -2013,6 +2459,22 @@ pub enum ChatTemplateError {
          is configured; set `RenderOptions::with_reasoning_start`"
     )]
     OpenThoughtUnsupported,
+    /// A tool name or tool-use id the model would read verbatim does
+    /// not match Anthropic's pattern (`^[a-zA-Z0-9_-]{1,64}$` for a
+    /// name, `^[a-zA-Z0-9_-]+$` for an id), or contains a reserved
+    /// special-token piece. Content is neutralized (see
+    /// [`LiteralNeutralizer`]); identifiers are rejected instead,
+    /// because the tool-call grammar and parser key on them. Only
+    /// checked when [`RenderOptions::literals`] is set. The value is
+    /// withheld from the message, which is relayed to clients.
+    #[error(
+        "{what} is not a valid tool identifier (letters, digits, `_` \
+         and `-` only; names at most 64 bytes)"
+    )]
+    InvalidIdentifier {
+        /// Where the identifier sits in the prompt.
+        what: String,
+    },
 }
 
 impl ChatTemplateError {
@@ -2185,6 +2647,69 @@ mod tests {
         assert!(out.contains(
             "<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"
         ));
+    }
+
+    fn literals(sentinel: &str) -> Literals {
+        Literals::new(
+            sentinel,
+            Arc::new(LiteralNeutralizer::new([
+                (1, "<|eot_id|>"),
+                (2, "<think>"),
+                (3, "</think>"),
+                // Duplicates keep the first entry.
+                (4, "<think>"),
+                (2, "<other>"),
+            ])),
+        )
+    }
+
+    /// Content literals: clean renders are byte-identical, a thought's
+    /// body is neutralized inside our own (kept) wrappers, a piece
+    /// split across blocks is caught once joined, and the counts cover
+    /// what was replaced.
+    #[test]
+    fn content_literals_neutralize_content_not_framing() {
+        let sentinel = "0123456789abcdef0123456789abcdef";
+        let opts = RenderOptions::default().with_literals(literals(sentinel));
+        assert_eq!(opts.literals.as_ref().unwrap().neutralizer().len(), 3);
+
+        let clean = simple_prompt();
+        assert_eq!(
+            tmpl().render_counted(&clean, &opts).unwrap(),
+            (tmpl().render(&clean, false).unwrap(), LiteralCounts::new()),
+            "a clean prompt renders byte-identically",
+        );
+
+        let p = Prompt {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: Content(vec![
+                    Block::Thought {
+                        thought: "no <think> here".into(),
+                        signature: "sig".into(),
+                    },
+                    Block::text("split <|eot"),
+                    Block::text("_id|> joined"),
+                ]),
+            }],
+            ..Default::default()
+        };
+        let (out, counts) = tmpl().render_counted(&p, &opts).unwrap();
+        let think = literal_marker(sentinel, 2);
+        let eot = literal_marker(sentinel, 1);
+        assert!(
+            out.contains(&format!(
+                "<think>no {think} here</think>split {eot} joined"
+            )),
+            "{out}",
+        );
+        assert_eq!(counts, [(1, 1), (2, 1)].into_iter().collect());
+        // Every marker splits back out.
+        let split = split_render(&out, sentinel).unwrap();
+        assert_eq!(
+            split.markers,
+            [RenderMarker::Literal(2), RenderMarker::Literal(1)]
+        );
     }
 
     #[test]
@@ -3858,8 +4383,8 @@ mod tests {
         let marker = media_marker(sentinel, &src_hash);
         assert!(out.contains(&marker), "render carries the marker");
 
-        let split = split_media_render(&out, sentinel).unwrap();
-        assert_eq!(split.source_hashes, vec![src_hash]);
+        let split = split_render(&out, sentinel).unwrap();
+        assert_eq!(split.markers, vec![RenderMarker::Media(src_hash)]);
         assert_eq!(split.segments.len(), 2);
         assert!(split.segments[0].ends_with("What breed is "));
         assert!(split.segments[1].starts_with(" shown here?"));
@@ -3884,8 +4409,8 @@ mod tests {
             .unwrap();
         let opts = RenderOptions::default().with_media_sentinel(sentinel);
         let out = tmpl().render_with(&p, &opts).unwrap();
-        let split = split_media_render(&out, sentinel).unwrap();
-        assert!(split.source_hashes.is_empty());
+        let split = split_render(&out, sentinel).unwrap();
+        assert!(split.markers.is_empty());
         assert_eq!(split.segments.len(), 1);
         assert!(split.segments[0].contains(&evil), "content round-trips");
     }
@@ -3896,9 +4421,23 @@ mod tests {
         // Truncated mid-hash: parse must fail loudly, never fall back
         // to treating the mangled marker as content.
         let mangled = format!("text <{sentinel}:abc123 more");
-        assert!(split_media_render(&mangled, sentinel).is_err());
+        assert!(split_render(&mangled, sentinel).is_err());
+        // Literal markers: truncated, non-canonical, or out of range.
+        for bad in ["t12", "t", "t007", "tx>", "t99999999999>"] {
+            let mangled = format!("a <{sentinel}:{bad} b");
+            assert_eq!(
+                split_render(&mangled, sentinel),
+                Err(2),
+                "{bad:?} must fail at the marker's offset",
+            );
+        }
+        // A well-formed literal marker splits out.
+        let lit = format!("a {} b", literal_marker(sentinel, 42));
+        let split = split_render(&lit, sentinel).unwrap();
+        assert_eq!(split.segments, vec!["a ", " b"]);
+        assert_eq!(split.markers, vec![RenderMarker::Literal(42)]);
         // Sentinel-free text is one segment.
-        let clean = split_media_render("no media here", sentinel).unwrap();
+        let clean = split_render("no media here", sentinel).unwrap();
         assert_eq!(clean.segments, vec!["no media here"]);
     }
 
@@ -3947,9 +4486,9 @@ mod tests {
         };
         let opts = RenderOptions::default().with_media_sentinel(sentinel);
         let out = tmpl().render_with(&p, &opts).unwrap();
-        let split = split_media_render(&out, sentinel).unwrap();
+        let split = split_render(&out, sentinel).unwrap();
         assert_eq!(
-            split.source_hashes.len(),
+            split.markers.len(),
             1,
             "tool-result images render markers too"
         );
