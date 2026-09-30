@@ -310,10 +310,13 @@ const BLANK_STOP_MESSAGE: &str =
 ///
 /// A stop sequence with no non-whitespace character (`"\n"`, `" "`) is a
 /// 400 `invalid_request_error` on Anthropic — captured 2026-09-30 on
-/// claude-haiku-4-5 for `stream: false` and `stream: true` alike (the
+/// claude-haiku-4-5 (misanthropic's
+/// `misanthropic/test/data/stop/whitespace_stop.error.json`) for `stream: false` and `stream: true` alike (the
 /// streaming request gets the same plain JSON body, not an SSE `error`
-/// event). The empty string falls under the rule as worded; that case is
-/// uncaptured. Applied to `count_tokens` too, on the (uncaptured)
+/// event). "Whitespace" here is Rust's [`char::is_whitespace`] (Unicode
+/// `White_Space`); Anthropic's exact character class is an uncaptured
+/// assumption, as is its handling of `""`, which this rejects (vacuously
+/// all-whitespace) because the rule as worded covers it. Applied to `count_tokens` too, on the (uncaptured)
 /// assumption that Anthropic validates the shared body the same way on
 /// both routes.
 fn validate_prompt(prompt: &Prompt) -> Result<(), AnthropicError> {

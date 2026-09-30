@@ -71,7 +71,10 @@ pub enum Leniency {
     /// the end of input, is the call in flight and is withheld too.
     ///
     /// **Not Anthropic parity, on purpose.** Anthropic returns the cut
-    /// call (captured 2026-09-30, claude-haiku-4-5, raw bytes): under
+    /// call (captured 2026-09-30, claude-haiku-4-5, raw bytes; see
+    /// misanthropic's `misanthropic/test/data/stop/` `clip_tool.*`,
+    /// `stop_sequence_tool.*`, `stop_sequence_text_tool.*`, and the
+    /// requests in `misanthropic/test/data/requests/`): under
     /// `stop_reason: max_tokens`, partial input — unstreamed, valid JSON
     /// missing a required field (`{"path":"hello.py"}` for a
     /// `write_file` that requires `contents`); streamed, a `tool_use`

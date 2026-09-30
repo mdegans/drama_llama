@@ -16,7 +16,9 @@
 //! the match and then closed into valid JSON: with `stop_sequences:
 //! ["print("]` and a forced `write_file`, claude-haiku-4-5 answered
 //! `{"path":"hello.py","contents":"import datetime\n"}` under
-//! `stop_reason: stop_sequence` (captured 2026-09-30; streamed, the block
+//! `stop_reason: stop_sequence` (captured 2026-09-30 — misanthropic's
+//! `misanthropic/test/data/stop/stop_sequence_tool.*` and
+//! `stop_sequence_text_tool.*`; streamed, the block
 //! gets its `content_block_stop` and the last `input_json_delta` closes
 //! the object; under `tool_choice: auto`, the same after a text block).
 //! That call looks complete and is not, which is a trap for any client
@@ -40,7 +42,9 @@
 //!
 //! A *whitespace-only* stop (`"\n"`) never reaches this through
 //! blallama: Anthropic rejects one with a 400 (`stop_sequences: each
-//! stop sequence must contain non-whitespace`, captured 2026-09-30), and
+//! stop sequence must contain non-whitespace`, captured 2026-09-30 in
+//! misanthropic's `misanthropic/test/data/stop/whitespace_stop.error.json`),
+//! and
 //! so does blallama. The framing rule stays for two reasons: a library
 //! caller can still pass one to [`Session`](super::Session) directly,
 //! and a stop that merely *begins or ends* with whitespace

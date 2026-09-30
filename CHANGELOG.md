@@ -66,7 +66,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bytes seated as prose (calls that closed before the cut stand).
   **Withholding is a deliberate deviation from Anthropic**, which
   returns the cut call (captured 2026-09-30, claude-haiku-4-5, raw
-  bytes): unstreamed, partial input that is valid JSON missing a
+  bytes; see misanthropic's
+  `misanthropic/test/data/stop/clip_tool.*`, requests in `misanthropic/test/data/requests/`): unstreamed, partial input that is valid JSON missing a
   required field (`{"path":"hello.py"}` for a `write_file` requiring
   `contents`); streamed, a `tool_use` block that never gets
   `content_block_stop`, its last `input_json_delta` unclosed. A call
@@ -118,9 +119,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `stop_sequences: ["print("]` on a forced `write_file` gave
   `{"path":"hello.py","contents":"import datetime\n"}` under
   `stop_reason: stop_sequence`, streamed with a normal
-  `content_block_stop` (captured 2026-09-30, claude-haiku-4-5) — a
-  truncated call that looks finished. `stop_reason` and
-  `stop_sequence` match Anthropic's exactly. Never matched: thinking, and framing — the dialect's markers
+  `content_block_stop` (captured 2026-09-30, claude-haiku-4-5; see
+  misanthropic's `misanthropic/test/data/stop/stop_sequence_tool.*`
+  and `stop_sequence_text_tool.*`) — a truncated call that looks
+  finished. `stop_reason` and `stop_sequence` match Anthropic's
+  exactly. Never matched: thinking, and framing — the dialect's markers
   (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`/`[ARGS]`, Harmony
   headers, EOG pieces) and the whitespace between prose and a
   structure (`"Sure, checking.\n\n<tool_call>"`, `"</think>\n\n"`).
@@ -146,7 +149,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   does.** A `stop_sequences` entry with no non-whitespace character
   (`"\n"`, `" "`) is a 400 `invalid_request_error` on Anthropic,
   message `stop_sequences: each stop sequence must contain
-  non-whitespace` (captured 2026-09-30 on claude-haiku-4-5, for
+  non-whitespace` (captured 2026-09-30 on claude-haiku-4-5 — see
+  misanthropic's `misanthropic/test/data/stop/whitespace_stop.error.json`
+  — for
   `stream: false` and `stream: true` alike — the streaming request gets
   the plain JSON body too). blallama accepted it and generated; it now
   answers the same envelope, status and message, on `/v1/messages` and

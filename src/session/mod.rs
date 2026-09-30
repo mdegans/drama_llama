@@ -188,8 +188,9 @@ pub enum SessionError {
     /// *Not* raised for a turn cut short by `max_tokens`, the context
     /// limit, or a stop sequence (#121): that is an unfinished turn, not
     /// a violation, and comes back `Ok` with that stop reason — as
-    /// Anthropic answers it — and the incomplete call withheld, which
-    /// Anthropic deliberately does not do (see
+    /// Anthropic answers it — and the incomplete call withheld.
+    /// Anthropic returns the partial call; withholding it is blallama's
+    /// deliberate deviation (see
     /// [`Leniency::Clipped`](crate::dialect::Leniency::Clipped)).
     #[error(
         "grammar violation: generation ended without satisfying the \
@@ -7361,7 +7362,8 @@ struct CallOutcome {
 ///
 /// The stop reason is Anthropic's; the content deliberately is not.
 /// Anthropic returns the call it cut (captured 2026-09-30,
-/// claude-haiku-4-5): on a stop sequence, input truncated at the match
+/// claude-haiku-4-5; misanthropic's `misanthropic/test/data/stop/`
+/// `clip_tool.*` and `stop_sequence_tool.*`): on a stop sequence, input truncated at the match
 /// but closed, valid JSON; on `max_tokens`, partial input — valid JSON
 /// missing required fields unstreamed (`{"path":"hello.py"}` for a tool
 /// that requires `contents`), and a block that never gets its
