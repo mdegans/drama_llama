@@ -312,7 +312,10 @@ impl Provenance {
     }
 
     /// `open` with its markers restored — its partial JSON with each
-    /// piece escaped as the string it sits in.
+    /// piece escaped as the string it sits in. Every marker there sits
+    /// in a string: the partial JSON is the parsed input re-serialized
+    /// (`unclosed_json`), and a marker outside a string parses to no
+    /// input at all.
     pub(crate) fn restore_open(&self, open: OpenCall) -> OpenCall {
         OpenCall {
             calls: open
@@ -476,6 +479,25 @@ mod tests {
             Some(r#"{"a":"x<\"q\">"#),
             "a piece in partial JSON is escaped as the string it sits in",
         );
+
+        // Outside a string, a marker is not JSON: no partial call, so
+        // no partial JSON to restore it in.
+        let mut p = provenance();
+        let mut marked = p.push("<tool_call>", Some(TOOL_CALL));
+        marked.push_str(&p.push(
+            "\n{\"name\": \"lookup\", \"arguments\": {\"q\": <think>",
+            Some(ORD),
+        ));
+        marked.push_str(&p.finish());
+        let tool = tool();
+        let (_, open) = p.restore_parse(super::super::parse_text_open(
+            &super::super::CallSyntax::hermes_json(),
+            &[&tool],
+            &marked,
+            false,
+            super::super::Leniency::Clipped,
+        ));
+        assert!(open.is_none(), "{open:?}");
     }
 
     /// An ordinary token id: anything not reserved.
