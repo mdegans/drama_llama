@@ -29,16 +29,19 @@ use crate::{
 /// Built once per session; see the module docs.
 pub(super) struct LiteralTable {
     pub(super) neutralizer: Arc<LiteralNeutralizer>,
-    /// Reserved id → its piece as plain tokens, containing no special
-    /// id.
+    /// Reserved id → its piece as plain tokens, containing no reserved
+    /// id (only, at most, an unreserved single-character special).
     plain: HashMap<Token, Vec<Token>>,
 }
 
 impl LiteralTable {
     /// Every special whose piece is non-empty, tokenizes (specials on)
-    /// back to exactly itself, and has a plain spelling. A piece with no
-    /// plain spelling is one the tokenizer reads as a special even as a
-    /// single character — ordinary text by definition, so not reserved.
+    /// back to exactly itself, and spells as something else. A piece
+    /// that spells only as itself is a single character the tokenizer
+    /// reads as a special even alone — ordinary text by definition, the
+    /// only way to write that character, so not reserved. A longer
+    /// piece holding one stays reserved, spelled around it (see
+    /// [`spell`]).
     pub(super) fn build<M: Model>(model: &M) -> Self {
         let specials: BTreeSet<Token> =
             model.special_tokens().into_iter().collect();
@@ -51,8 +54,8 @@ impl LiteralTable {
                 {
                     return None;
                 }
-                let plain = spell(model, &piece, &specials)?;
-                Some((id, piece, plain))
+                let plain = spell(model, &piece, &specials);
+                (!plain.contains(&id)).then_some((id, piece, plain))
             })
             .collect();
         let neutralizer = LiteralNeutralizer::new(
@@ -288,21 +291,36 @@ impl LiteralTable {
 
 /// Spell `s` in plain tokens: specials off, and wherever the tokenizer
 /// still reads a special (llama.cpp's `USER_DEFINED`, HF's non-special
-/// added tokens), split off the first character and recurse. `None`
-/// when a single character still reads as a special.
+/// added tokens), split off the first character and recurse. A single
+/// character that still reads as a special keeps that special: there
+/// is no other way to write it. So `<§>` over a `USER_DEFINED` `§`
+/// spells as `<`, `§`, `>` and stays reserved; dropping it instead
+/// would leave content free to reach the model as its id, uncounted.
+///
+/// Each part is tokenized standalone. On an SPM vocabulary with
+/// `add_space_prefix`, that prefixes a space the running text would
+/// not have, and llama.cpp likewise prefixes the raw fragment after a
+/// `USER_DEFINED` match: a spelled piece could gain phantom spaces
+/// around it. No fleet model is affected (Gemma sets
+/// `add_space_prefix = false`); a vocabulary that is would need the
+/// prefix stripped here.
 fn spell<M: Model>(
     model: &M,
     s: &str,
     specials: &BTreeSet<Token>,
-) -> Option<Vec<Token>> {
+) -> Vec<Token> {
     let tokens = model.tokenize_special(s, false, false);
     if !tokens.iter().any(|t| specials.contains(t)) {
-        return Some(tokens);
+        return tokens;
     }
-    let (cut, _) = s.char_indices().nth(1)?;
-    let mut out = spell(model, &s[..cut], specials)?;
-    out.extend(spell(model, &s[cut..], specials)?);
-    Some(out)
+    match s.char_indices().nth(1) {
+        None => tokens,
+        Some((cut, _)) => [
+            spell(model, &s[..cut], specials),
+            spell(model, &s[cut..], specials),
+        ]
+        .concat(),
+    }
 }
 
 /// One literal's place in a [`Restored`] text and in the marked one.
@@ -477,6 +495,9 @@ mod tests {
     /// A single-character `USER_DEFINED` piece: no plain spelling, so
     /// ordinary text, never reserved.
     const SECTION: Token = 307;
+    /// A `USER_DEFINED` piece holding [`SECTION`]: reserved, spelled
+    /// around it.
+    const BRACKETED: Token = 308;
     const N_VOCAB: i32 = 310;
 
     /// `(id, piece, control)` — `control = false` is `USER_DEFINED`.
@@ -489,6 +510,7 @@ mod tests {
         (TOOL_CALL_END, "</tool_call>", false),
         (BOS, "<s>", true),
         (SECTION, "§", false),
+        (BRACKETED, "<§>", false),
     ];
 
     const TEMPLATE: &str = "\
@@ -795,9 +817,15 @@ mod tests {
                 THINK_END,
                 TOOL_CALL,
                 TOOL_CALL_END,
-                BOS
+                BOS,
+                BRACKETED,
             ],
             "every special but the unspellable single character",
+        );
+        // One holding that character is spelled around it.
+        assert_eq!(
+            table.plain[&BRACKETED],
+            [bytes("<"), vec![SECTION], bytes(">")].concat()
         );
         // A USER_DEFINED piece still matches with specials off, so its
         // plain spelling is byte-split; a CONTROL one tokenizes as text.
@@ -960,6 +988,28 @@ mod tests {
             Err(999),
             "an unknown literal is refused",
         );
+    }
+
+    /// A piece holding an unspellable single-character special is still
+    /// neutralized: content quoting `<§>` reaches the model as `<`,
+    /// `§`, `>` — never as the `<§>` id — and the guard agrees.
+    #[test]
+    fn a_piece_holding_an_unspellable_character_stays_reserved() {
+        let mut s = session();
+        let with = |t: &str| Prompt {
+            messages: vec![message(crate::Role::User, vec![text(t)])],
+            ..Prompt::default()
+        };
+        let tokens = s.prepare_call(&with("a <§> b"), true).expect("prepare").0;
+        assert!(!tokens.contains(&BRACKETED), "{tokens:?}");
+        let spelled = [bytes("<"), vec![SECTION], bytes(">")].concat();
+        assert!(
+            tokens.windows(spelled.len()).any(|w| w == spelled),
+            "{tokens:?}",
+        );
+        // The bare character is text: it is the only way to write it.
+        let tokens = s.prepare_call(&with("a § b"), true).expect("prepare").0;
+        assert!(tokens.contains(&SECTION));
     }
 
     /// Warm and cold tokenize identically: tokens and hashes depend on
