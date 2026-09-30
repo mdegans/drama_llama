@@ -334,6 +334,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Automatic prompt caching, as on Anthropic.** A request-level
+  `cache_control` (`Prompt::cache_control`, misanthropic's
+  `auto_cache`) now places a breakpoint after the last cacheable block,
+  walking back past thoughts, with its own TTL. An anchor an earlier
+  call placed is read again when the new prompt reproduces everything
+  before it (Anthropic's lookback), so each request reads back the
+  previous one's prompt: a turn that does not round-trip costs only
+  itself instead of everything back to the system marker. A candidate
+  whose snapshot is gone falls to the next anchor below it rather than
+  to zero. blallama answers Anthropic's 400s for the combination
+  (captured 2026-09-30 on claude-haiku-4-5, both routes): a fifth
+  marker counting the automatic one — even on an already-marked block
+  with the same TTL, which the docs call a no-op — an automatic TTL
+  that disagrees with the target block's marker, and a 1-hour
+  automatic marker after a 5-minute one. `check_cache_controls` and
+  `MAX_CACHE_CONTROLS` are public.
+- **Every cache reuse decision is logged.** One `cache_reuse` event
+  per call (`hit` with `source` = `tip` / `breakpoint` / `lookback` /
+  `hash` and token counts, or `miss` with its `reason`), plus a
+  `cache_degrade` or `cache_evict` event for everything that cost
+  reuse: a tip the call continues past but cannot use (the first
+  diverging entry and the decoded text on both sides), a turn whose
+  emission does not re-render byte-for-byte, a breakpoint dropped for
+  not being a token prefix, a #91 hash refusal, a failed restore, a
+  snapshot evicted at the store's cap, and TTL, capacity, slot-thrash
+  and error evictions. Losses over 256 tokens log at `WARN`. The
+  2026-09-30 Qwen3.6 run lost a 7364-token turn's tip with nothing
+  but an ordinary stats line to show for it.
 - **`output_config.effort` reaches the chat template as
   `reasoning_effort`.** It used to be dropped, so Qwen3.8 always
   rendered its `xhigh` default ("think carefully… validate key

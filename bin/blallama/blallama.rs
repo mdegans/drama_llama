@@ -37,6 +37,27 @@
 //! re-prefilled message instead of everything back to the previous
 //! structural boundary.
 //!
+//! # Automatic caching, as on Anthropic
+//!
+//! A request-level `cache_control` (Anthropic's automatic caching) places
+//! a breakpoint after the last cacheable block, with its TTL, and counts
+//! toward the four-marker limit — a fifth marker, the automatic one
+//! included, is Anthropic's 400, as is an automatic TTL that disagrees
+//! with the markers ([`validate_prompt`]). Each request then reads back
+//! the previous one's prompt (Anthropic's lookback) and, beyond parity,
+//! the previous turn's generated KV when the turn round-trips (the tip).
+//! So an explicit marker on the system plus automatic caching — the
+//! combination Anthropic recommends for agent loops — is also the right
+//! setup here: a turn that does not round-trip costs only itself.
+//!
+//! # Seeing a cache miss
+//!
+//! Every request logs one `cache_reuse` event (`hit` with its source, or
+//! `miss` with its reason), and every loss gets a `cache_degrade` or
+//! `cache_evict` event naming why — for a lost tip, the entry where the
+//! new prompt diverges from the cached tokens and the text on both
+//! sides. Losses past a few hundred tokens are logged at `WARN`.
+//!
 //! # A `max_tokens` turn can carry complete calls
 //!
 //! As on Anthropic, a turn the budget cut short is a 200 with
@@ -324,6 +345,11 @@ const BLANK_STOP_MESSAGE: &str =
 /// all-whitespace) because the rule as worded covers it. Applied to `count_tokens` too, on the (uncaptured)
 /// assumption that Anthropic validates the shared body the same way on
 /// both routes.
+///
+/// The `cache_control` markers get Anthropic's checks too
+/// ([`drama_llama::check_cache_controls`]): at most four, the
+/// request-level automatic one included, its TTL agreeing with the
+/// explicit markers. Those were captured on both routes.
 fn validate_prompt(prompt: &Prompt) -> Result<(), AnthropicError> {
     let blank_stop = prompt
         .stop_sequences
@@ -335,7 +361,8 @@ fn validate_prompt(prompt: &Prompt) -> Result<(), AnthropicError> {
             message: BLANK_STOP_MESSAGE.into(),
         });
     }
-    Ok(())
+    drama_llama::check_cache_controls(prompt)
+        .map_err(|message| AnthropicError::InvalidRequest { message })
 }
 
 async fn spawn_blocking_or_bust<F, R>(f: F) -> R
@@ -1688,6 +1715,49 @@ mod tests {
                 let (head, _) = post_raw(addr, path, &body(stops)).await;
                 assert!(head.starts_with("HTTP/1.1 200"), "{path} {stops}");
             }
+        }
+    }
+
+    /// Anthropic's 400 for a fifth `cache_control` marker, where the
+    /// fifth is the request-level automatic one (captured 2026-09-30 on
+    /// claude-haiku-4-5, both routes). Four in all is accepted.
+    #[tokio::test]
+    async fn fifth_cache_marker_counting_the_automatic_one_is_anthropic_400() {
+        async fn accept(_: AnthropicPrompt) -> StatusCode {
+            StatusCode::OK
+        }
+        let addr = serve(
+            Router::new()
+                .route("/v1/messages", post(accept))
+                .route("/v1/messages/count_tokens", post(accept)),
+        )
+        .await;
+        let body = |explicit: usize| {
+            let block = r#"{"type": "text", "text": "a",
+                "cache_control": {"type": "ephemeral"}}"#;
+            let blocks = vec![block; explicit].join(",");
+            format!(
+                r#"{{"model": "m", "max_tokens": 8,
+                    "cache_control": {{"type": "ephemeral"}},
+                    "messages": [{{"role": "user", "content": [{blocks},
+                        {{"type": "text", "text": "tail"}}]}}]}}"#
+            )
+        };
+        let expected: serde_json::Value = serde_json::from_str(concat!(
+            r#"{"type":"error","error":{"type":"invalid_request_error","#,
+            r#""message":"A maximum of 4 blocks with cache_control may be "#,
+            r#"provided. Found 5."}}"#,
+        ))
+        .unwrap();
+
+        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+            let (head, payload) = post_raw(addr, path, &body(4)).await;
+            assert!(head.starts_with("HTTP/1.1 400"), "{path}: {head}");
+            let value: serde_json::Value =
+                serde_json::from_str(&payload).expect("a JSON envelope");
+            assert_eq!(value, expected, "{path}");
+            let (head, _) = post_raw(addr, path, &body(3)).await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{path}: {head}");
         }
     }
 

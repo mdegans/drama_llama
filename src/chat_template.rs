@@ -415,7 +415,7 @@ impl ChatTemplate {
         for (bp, ttl) in breakpoints {
             match render_partial(self, prompt, opts, bp) {
                 Ok(s) => partials.push((bp, ttl, s)),
-                Err(_e) => {
+                Err(e) => {
                     // Drop this breakpoint — same fail-open posture
                     // tokenize_with_breakpoints uses for non-prefix-
                     // safe partials. A breakpoint we can't render
@@ -424,11 +424,12 @@ impl ChatTemplate {
                     // default level — losing a breakpoint silently
                     // is a cache-correctness signal, not a debug
                     // nicety.
-                    #[cfg(feature = "axum")]
                     tracing::warn!(
                         target: "drama_llama::chat_template",
+                        event = "cache_degrade",
+                        reason = "partial_render_failed",
                         breakpoint = ?bp,
-                        error = %_e,
+                        error = %e,
                         "partial render failed; breakpoint dropped from \
                          partial_texts (cache reuse lost at this position)",
                     );
@@ -769,7 +770,33 @@ pub enum PromptBreakpoint {
 /// per-*block*, a section with several cached blocks resolves to the
 /// **max** TTL among them — the generous reading: any block asking for
 /// an hour keeps the whole section's prefix alive for an hour.
+///
+/// The request-level [`Prompt::cache_control`] (Anthropic's automatic
+/// caching) contributes one more breakpoint, on the section holding
+/// the last cacheable block, with its own TTL. Explicit markers only
+/// sit on cacheable blocks, so that section is never before the last
+/// explicit one: the automatic breakpoint either extends the list or
+/// merges into its last entry (max TTL again).
 fn collect_breakpoints(prompt: &Prompt) -> Vec<(PromptBreakpoint, CacheTtl)> {
+    let mut out = explicit_breakpoints(prompt);
+    let auto = prompt
+        .cache_control
+        .as_ref()
+        .zip(auto_cache_target(prompt))
+        .map(|(control, target)| (target.at, control_ttl_of(control)));
+    match (auto, out.last_mut()) {
+        (Some((at, ttl)), Some((last, last_ttl))) if *last == at => {
+            *last_ttl = max_ttl(last_ttl.clone(), ttl);
+        }
+        (Some(auto), _) => out.push(auto),
+        (None, _) => {}
+    }
+    out
+}
+
+/// [`collect_breakpoints`] without the automatic breakpoint: the
+/// sections the markers on tools and blocks declare.
+fn explicit_breakpoints(prompt: &Prompt) -> Vec<(PromptBreakpoint, CacheTtl)> {
     let mut out = Vec::new();
 
     let tools_ttl = prompt.tools.as_ref().and_then(|defs| {
@@ -797,11 +824,151 @@ fn collect_breakpoints(prompt: &Prompt) -> Vec<(PromptBreakpoint, CacheTtl)> {
 /// five minutes when the marker omits it (Anthropic semantics —
 /// `{type: "ephemeral"}` alone means 5m).
 fn control_ttl(control: &Option<CacheControl>) -> Option<CacheTtl> {
-    control.as_ref().map(|cc| match cc {
+    control.as_ref().map(control_ttl_of)
+}
+
+/// [`control_ttl`] for a marker known to be present.
+fn control_ttl_of(control: &CacheControl) -> CacheTtl {
+    match control {
         CacheControl::Ephemeral { ttl } => {
             ttl.clone().unwrap_or(CacheTtl::FiveMinutes)
         }
-    })
+    }
+}
+
+/// Where Anthropic's automatic caching ([`Prompt::cache_control`])
+/// places its breakpoint: the section holding the prompt's last
+/// cacheable block, and that block's own explicit marker, if any.
+#[derive(Clone, Debug)]
+struct AutoCacheTarget {
+    /// The section the breakpoint lands after.
+    at: PromptBreakpoint,
+    /// The TTL of an explicit marker already on the target block.
+    marker: Option<CacheTtl>,
+}
+
+/// The last cacheable block of `prompt` in processing order (`tools`,
+/// `system`, `messages`), walking backward past blocks that cannot
+/// carry a marker (thoughts, server-tool results) as Anthropic does.
+/// `None` when nothing can carry one; Anthropic then caches nothing.
+fn auto_cache_target(prompt: &Prompt) -> Option<AutoCacheTarget> {
+    fn last_cacheable(content: &Content) -> Option<&Block> {
+        content
+            .0
+            .iter()
+            .rev()
+            .find(|block| block_is_cacheable(block))
+    }
+    let in_messages =
+        prompt.messages.iter().enumerate().rev().find_map(|(i, m)| {
+            last_cacheable(&m.content).map(|block| AutoCacheTarget {
+                at: PromptBreakpoint::AfterMessage(i),
+                marker: block_cache_ttl(block),
+            })
+        });
+    let in_system = || {
+        let block = last_cacheable(prompt.system.as_ref()?)?;
+        Some(AutoCacheTarget {
+            at: PromptBreakpoint::AfterSystem,
+            marker: block_cache_ttl(block),
+        })
+    };
+    let in_tools = || {
+        let tool = prompt.tools.as_ref()?.last()?;
+        Some(AutoCacheTarget {
+            at: PromptBreakpoint::AfterTools,
+            marker: method_cache_ttl(tool),
+        })
+    };
+    in_messages.or_else(in_system).or_else(in_tools)
+}
+
+/// Whether `block` can carry a `cache_control` marker — the variant
+/// arms [`block_cache_ttl`] reads.
+fn block_is_cacheable(block: &Block) -> bool {
+    matches!(
+        block,
+        Block::Text { .. }
+            | Block::Image { .. }
+            | Block::Document { .. }
+            | Block::ToolUse { .. }
+            | Block::ToolResult { .. }
+            | Block::ServerToolUse { .. }
+    )
+}
+
+/// Every explicit `cache_control` marker in `prompt`, as its TTL, in
+/// processing order (`tools`, `system`, `messages`).
+fn explicit_markers(prompt: &Prompt) -> Vec<CacheTtl> {
+    let tools = prompt.tools.iter().flatten().filter_map(method_cache_ttl);
+    let blocks = prompt
+        .system
+        .iter()
+        .flat_map(|system| system.0.iter())
+        .chain(prompt.messages.iter().flat_map(|m| m.content.0.iter()))
+        .filter_map(block_cache_ttl);
+    tools.chain(blocks).collect()
+}
+
+/// Anthropic's per-request limit on `cache_control` markers, the
+/// automatic one ([`Prompt::cache_control`]) included.
+pub const MAX_CACHE_CONTROLS: usize = 4;
+
+/// The checks Anthropic makes on a request's `cache_control` markers,
+/// each an `invalid_request_error` whose message this returns in
+/// Anthropic's exact wording (captured 2026-09-30 on claude-haiku-4-5,
+/// `/v1/messages` and `count_tokens` alike):
+///
+/// 1. At most [`MAX_CACHE_CONTROLS`] markers, and the automatic one
+///    always counts — even on a block that already carries an explicit
+///    marker with the same TTL, which the docs call a no-op but the
+///    wire counts: `A maximum of 4 blocks with cache_control may be
+///    provided. Found 5.`
+/// 2. The automatic marker's TTL must match an explicit marker on the
+///    block it lands on.
+/// 3. A 1-hour automatic marker must not follow a 5-minute explicit
+///    one: longer TTLs come first.
+///
+/// Checked in that order; which one Anthropic names first when a
+/// request breaks several is uncaptured. The ordering rule between two
+/// *explicit* markers is not modeled (Anthropic's message there names
+/// the offending block's path). A cached server-tool definition counts,
+/// but its TTL is not readable upstream, so it reads as five minutes,
+/// as it does for breakpoints.
+pub fn check_cache_controls(prompt: &Prompt) -> Result<(), String> {
+    let explicit = explicit_markers(prompt);
+    let found = explicit.len() + usize::from(prompt.cache_control.is_some());
+    if found > MAX_CACHE_CONTROLS {
+        return Err(format!(
+            "A maximum of {MAX_CACHE_CONTROLS} blocks with cache_control \
+             may be provided. Found {found}."
+        ));
+    }
+    let Some(auto) = prompt.cache_control.as_ref().map(control_ttl_of) else {
+        return Ok(());
+    };
+    let marker = auto_cache_target(prompt).and_then(|target| target.marker);
+    if let Some(marker) = marker {
+        if ttl_duration(&marker) != ttl_duration(&auto) {
+            return Err(format!(
+                "Top-level cache_control has ttl='{auto}' but the target \
+                 block already has cache_control with ttl='{marker}'. When \
+                 both are specified on the same block, they must have \
+                 matching TTLs."
+            ));
+        }
+    }
+    // Two TTLs exist, so "an explicit marker shorter than the automatic
+    // one" is exactly a 5-minute marker ahead of a 1-hour automatic one.
+    let shorter = |ttl: &CacheTtl| ttl_duration(ttl) < ttl_duration(&auto);
+    if explicit.iter().any(shorter) {
+        return Err("cache_control: a ttl='1h' cache_control block must not \
+             come after a ttl='5m' cache_control block. Note that blocks \
+             are processed in the following order: `tools`, `system`, \
+             `messages`."
+            .into());
+    }
+    Ok(())
 }
 
 /// The TTL of `block`'s cache marker, if it carries one. Mirrors the
@@ -2461,6 +2628,256 @@ mod tests {
                 (PromptBreakpoint::AfterMessage(0), CacheTtl::OneHour),
             ]
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Automatic caching: the request-level `cache_control`
+    // ----------------------------------------------------------------
+
+    /// A `Role::User` text message, cached with `control` when given.
+    fn user_text(text: &'static str, control: Option<CacheControl>) -> Message {
+        Message {
+            role: Role::User,
+            content: Content(vec![Block::Text {
+                text: Cow::Borrowed(text),
+                cache_control: control,
+                citations: None,
+            }]),
+        }
+    }
+
+    /// An assistant message holding only a thought — a block that can
+    /// carry no marker.
+    fn thought_only() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Content(vec![Block::Thought {
+                thought: Cow::Borrowed("hmm"),
+                signature: Cow::Borrowed(""),
+            }]),
+        }
+    }
+
+    /// The automatic breakpoint lands after the message holding the
+    /// last cacheable block, with the request-level TTL — alongside,
+    /// not instead of, the explicit markers.
+    #[test]
+    fn auto_cache_breakpoint_lands_on_the_last_message() {
+        let prompt = Prompt {
+            system: Some(Content(vec![Block::Text {
+                text: Cow::Borrowed("You are helpful."),
+                cache_control: Some(CacheControl::one_hour()),
+                citations: None,
+            }])),
+            messages: simple_prompt().messages,
+            cache_control: Some(CacheControl::ephemeral()),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            collect_breakpoints(&prompt),
+            vec![
+                (PromptBreakpoint::AfterSystem, CacheTtl::OneHour),
+                (PromptBreakpoint::AfterMessage(2), CacheTtl::FiveMinutes),
+            ]
+        );
+        assert_eq!(
+            explicit_breakpoints(&prompt),
+            vec![(PromptBreakpoint::AfterSystem, CacheTtl::OneHour)],
+            "the automatic breakpoint is not an explicit marker",
+        );
+    }
+
+    /// Past a trailing block that cannot carry a marker (a thought),
+    /// the breakpoint walks back to the nearest one that can; with no
+    /// messages it falls to the system, then the tools; with nothing
+    /// cacheable at all there is none, as on Anthropic.
+    #[test]
+    fn auto_cache_walks_back_to_a_cacheable_block() {
+        let auto = |prompt: Prompt| Prompt {
+            cache_control: Some(CacheControl::ephemeral()),
+            ..prompt
+        };
+        let at = |prompt: &Prompt| auto_cache_target(prompt).map(|t| t.at);
+
+        let past_thought = auto(Prompt {
+            messages: vec![user_text("q", None), thought_only()],
+            ..Prompt::default()
+        });
+        assert_eq!(at(&past_thought), Some(PromptBreakpoint::AfterMessage(0)));
+
+        let system_only = auto(Prompt::default().system("You are helpful."));
+        assert_eq!(at(&system_only), Some(PromptBreakpoint::AfterSystem));
+
+        let tools_only = auto(Prompt {
+            tools: Some(vec![tool_plain("a").into()]),
+            messages: vec![thought_only()],
+            ..Prompt::default()
+        });
+        assert_eq!(at(&tools_only), Some(PromptBreakpoint::AfterTools));
+        assert_eq!(
+            collect_breakpoints(&tools_only),
+            vec![(PromptBreakpoint::AfterTools, CacheTtl::FiveMinutes)]
+        );
+
+        let nothing = auto(Prompt {
+            messages: vec![thought_only()],
+            ..Prompt::default()
+        });
+        assert_eq!(at(&nothing), None);
+        assert!(collect_breakpoints(&nothing).is_empty());
+    }
+
+    /// On a section that already carries an explicit marker the
+    /// automatic breakpoint merges into it (one anchor, max TTL).
+    #[test]
+    fn auto_cache_merges_into_an_explicit_marker_on_its_section() {
+        let prompt = Prompt {
+            messages: vec![user_text("q", Some(CacheControl::ephemeral()))],
+            cache_control: Some(CacheControl::one_hour()),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            collect_breakpoints(&prompt),
+            vec![(PromptBreakpoint::AfterMessage(0), CacheTtl::OneHour)]
+        );
+    }
+
+    /// The automatic breakpoint gets a partial render like any other,
+    /// ending exactly where the generation prompt begins — the anchor
+    /// the next request reads back.
+    #[test]
+    fn auto_cache_partial_ends_before_the_generation_prompt() {
+        let template = tmpl();
+        let prompt = Prompt {
+            cache_control: Some(CacheControl::ephemeral()),
+            ..simple_prompt()
+        };
+        let opts = RenderOptions::default().with_generation_prompt(true);
+        let rendered = template
+            .render_with_breakpoints(&prompt, &opts)
+            .expect("render");
+        let [(bp, ttl, partial)] = &rendered.partials[..] else {
+            panic!("one breakpoint: {:?}", rendered.partials);
+        };
+        assert_eq!(
+            (bp, ttl),
+            (&PromptBreakpoint::AfterMessage(2), &CacheTtl::FiveMinutes)
+        );
+        let generation_prompt = rendered
+            .text
+            .strip_prefix(partial.as_str())
+            .expect("the partial is a prefix of the full render");
+        assert!(
+            !generation_prompt.is_empty()
+                && !generation_prompt.contains("What is 2+2?"),
+            "only the generation prompt follows: {generation_prompt:?}"
+        );
+    }
+
+    /// Anthropic's cache_control checks, with its exact messages
+    /// (captured 2026-09-30, claude-haiku-4-5).
+    #[test]
+    fn check_cache_controls_matches_anthropic() {
+        let five = || Some(CacheControl::ephemeral());
+        let hour = || Some(CacheControl::one_hour());
+        let msgs = |controls: Vec<Option<CacheControl>>| {
+            let blocks = controls
+                .into_iter()
+                .map(|cache_control| Block::Text {
+                    text: Cow::Borrowed("x"),
+                    cache_control,
+                    citations: None,
+                })
+                .collect();
+            vec![Message {
+                role: Role::User,
+                content: Content(blocks),
+            }]
+        };
+        let found_5 = "A maximum of 4 blocks with cache_control may be \
+                       provided. Found 5.";
+
+        let explicit_5 = Prompt {
+            messages: msgs(vec![five(), five(), five(), five(), five()]),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&explicit_5), Err(found_5.into()));
+
+        // Four explicit plus the automatic one: five, on the wire.
+        let four_and_auto = Prompt {
+            messages: msgs(vec![five(), five(), five(), five(), None]),
+            cache_control: five(),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&four_and_auto), Err(found_5.into()));
+
+        // Even when the automatic marker lands on an explicitly marked
+        // block with the same TTL (the docs' "no-op"): still five.
+        let four_marked_last = Prompt {
+            messages: msgs(vec![five(), five(), five(), five()]),
+            cache_control: five(),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&four_marked_last),
+            Err(found_5.into())
+        );
+
+        let three_marked_last = Prompt {
+            messages: msgs(vec![five(), five(), five()]),
+            cache_control: five(),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&three_marked_last), Ok(()));
+
+        let mismatch = |auto, marker| Prompt {
+            messages: msgs(vec![marker]),
+            cache_control: auto,
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&mismatch(five(), hour())),
+            Err("Top-level cache_control has ttl='5m' but the target block \
+                 already has cache_control with ttl='1h'. When both are \
+                 specified on the same block, they must have matching TTLs."
+                .into())
+        );
+        assert_eq!(
+            check_cache_controls(&mismatch(hour(), five())),
+            Err("Top-level cache_control has ttl='1h' but the target block \
+                 already has cache_control with ttl='5m'. When both are \
+                 specified on the same block, they must have matching TTLs."
+                .into())
+        );
+
+        let system = |control| {
+            Some(Content(vec![Block::Text {
+                text: Cow::Borrowed("sys"),
+                cache_control: control,
+                citations: None,
+            }]))
+        };
+        let hour_after_five = Prompt {
+            system: system(five()),
+            messages: msgs(vec![None]),
+            cache_control: hour(),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&hour_after_five),
+            Err("cache_control: a ttl='1h' cache_control block must not \
+                 come after a ttl='5m' cache_control block. Note that \
+                 blocks are processed in the following order: `tools`, \
+                 `system`, `messages`."
+                .into())
+        );
+        let five_after_hour = Prompt {
+            system: system(hour()),
+            messages: msgs(vec![None]),
+            cache_control: five(),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&five_after_hour), Ok(()));
     }
 
     #[test]

@@ -65,10 +65,16 @@
 //! * **Opt-in.** Default is off — existing callers are unaffected. Enable with
 //!   [`Session::with_prefix_cache(true)`](Session::with_prefix_cache).
 //! * **Breakpoint-driven.** The cache only honors positions the caller
-//!   explicitly marked with a `cache_control` on a [`Block`], [`Tool`], or
+//!   marked with a `cache_control` on a [`Block`], [`Tool`], or
 //!   [`tool::Use`](misanthropic::tool::Use) /
-//!   [`tool::Result`](misanthropic::tool::Result). Without breakpoints, every
-//!   call is a full re-prefill.
+//!   [`tool::Result`](misanthropic::tool::Result) — or asked for with the
+//!   request-level [`Prompt::cache_control`](misanthropic::Prompt::cache_control),
+//!   Anthropic's automatic caching, whose breakpoint lands after the last
+//!   cacheable block — plus the session's own post-generation tip. As on
+//!   Anthropic, an anchor an *earlier* call placed is still read when the
+//!   new prompt reproduces everything before it (lookback), so automatic
+//!   caching reads the previous request's prompt back each turn. Without
+//!   breakpoints, every call is a full re-prefill.
 //! * **Multi-slot.** The cache holds up to
 //!   [`PrefixCacheConfig::max_slots`] cached prefixes (clamped to the
 //!   backend's sequence capacity), each pinned to its own KV sequence — N
@@ -96,6 +102,17 @@
 //! with a full cache-state dump instead of silently re-prefilling. Genuine
 //! first turns and post-eviction misses don't trip it.
 //!
+//! Every reuse decision is logged (`tracing`, target
+//! `drama_llama::session`): one `event = "cache_reuse"` per call — `hit`
+//! with its `source` (`tip`, `breakpoint`, `lookback`, `hash`) and token
+//! counts, or `miss` with its `reason` — and an `event = "cache_degrade"`
+//! or `"cache_evict"` for each thing that cost reuse, with its `reason`
+//! (`tip_diverged` with the first diverging entry and the decoded text on
+//! both sides, `emission_not_byte_stable`, `breakpoint_dropped`,
+//! `hash_drift`, `restore_failed`, `snapshot_evicted`, `ttl`,
+//! `capacity`, `slot_capacity`, …). Losses above a few hundred tokens are
+//! `WARN`; the rest `INFO`.
+//!
 //! Usage statistics matching the Anthropic API shape are tracked on every
 //! `complete_*` call: see [`Session::last_usage`] and [`Session::total_usage`].
 //!
@@ -104,6 +121,19 @@
 //! [`ToolChoice`]: crate::ToolChoice
 //! [`Block`]: crate::Block
 //! [`Tool`]: crate::Tool
+
+/// A `tracing` event at `WARN` when the miss it reports costs more
+/// than [`MISS_WARN_TOKENS`] tokens of re-prefill, else at `INFO`.
+/// (`tracing`'s level must be a constant, hence the macro.)
+macro_rules! cache_event {
+    ($lost:expr, $($event:tt)+) => {
+        if $lost > MISS_WARN_TOKENS {
+            tracing::warn!($($event)+)
+        } else {
+            tracing::info!($($event)+)
+        }
+    };
+}
 
 use std::{num::NonZeroUsize, path::PathBuf};
 
@@ -691,6 +721,11 @@ struct PrefixSlot {
     /// describe the same stream position (rng/`mu` exempt — they
     /// advanced to *sample* the terminal token; unobservable).
     tip: Option<Breakpoint>,
+    /// Where the last call's generation began in [`Self::prev_entries`]
+    /// — the entry count of its prompt. Entries from here on are the
+    /// model's own output, so a divergence past it is a round-trip
+    /// failure rather than a changed history ([`tip_miss`]).
+    turn_start: usize,
     /// Last touch — read (selected for reuse) or write
     /// (`record_cache_hit`). Anthropic refresh-on-read semantics: TTL
     /// expiry (enforced by the bounds commit) measures from here, and
@@ -710,6 +745,7 @@ impl PrefixSlot {
             prev_entries: Vec::new(),
             breakpoints: Vec::new(),
             tip: None,
+            turn_start: 0,
             last_used: now,
             created: now,
         }
@@ -1577,9 +1613,10 @@ fn tip_extension(
     // and no future LCP walk runs off the end of KV. Logged because
     // "no tip was made" and "a tip was made and lost the pick" are
     // otherwise indistinguishable from outside (#96).
-    #[cfg(feature = "axum")]
-    tracing::debug!(
+    tracing::info!(
         target: "drama_llama::session",
+        event = "cache_degrade",
+        reason = "tip_not_recorded",
         recorded = generated_tokens.len(),
         kv_generated = kv_generated_count,
         kv_pos_len,
@@ -1589,6 +1626,89 @@ fn tip_extension(
     );
     extended.truncate(prompt_entry_len + kv_generated_count);
     (extended, None, None)
+}
+
+/// Where the re-render of a turn first departs from what was generated:
+/// the byte offset into `raw` (the emission) at which `extended` (the
+/// canonical render of the prompt plus the parsed turn) stops matching
+/// `rendered_prompt` + `raw`, or `None` when it reproduces all of it.
+/// Pure.
+fn emission_divergence(
+    extended: &str,
+    rendered_prompt: &str,
+    raw: &str,
+) -> Option<usize> {
+    let Some(turn) = extended.strip_prefix(rendered_prompt) else {
+        // The prompt itself re-renders differently with the turn seated
+        // — the divergence is before the emission.
+        return Some(0);
+    };
+    let common = turn
+        .bytes()
+        .zip(raw.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    (common < raw.len()).then_some(common)
+}
+
+/// About `n` bytes of `s` on each side of `at`, as `s[at - n .. at]` and
+/// `s[at .. at + n]` widened outward to char boundaries.
+fn around(s: &str, at: usize, n: usize) -> (&str, &str) {
+    let floor = |mut i: usize| {
+        i = i.min(s.len());
+        while !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let ceil = |mut i: usize| {
+        i = i.min(s.len());
+        while !s.is_char_boundary(i) {
+            i += 1;
+        }
+        i
+    };
+    let at = floor(at);
+    (&s[floor(at.saturating_sub(n))..at], &s[at..ceil(at + n)])
+}
+
+/// The `cache_degrade` event for a turn whose emission does not
+/// survive the round trip — `render(parse(emission)) != emission`, the
+/// invariant the tip depends on. The KV holds the emission, the next
+/// request renders the parsed turn, and the two part at the byte this
+/// reports: everything generated from there on re-prefills next turn.
+/// Typical causes are a chat template that rewrites what it re-renders
+/// (Qwen3.6's stock template `trim`s the answer and the thought, so a
+/// trailing newline is enough) or a parse that normalizes. `WARN` when
+/// the turn is longer than [`MISS_WARN_TOKENS`].
+fn log_unstable_emission(
+    extended: &str,
+    rendered_prompt: &str,
+    raw: &str,
+    generated_tokens: usize,
+) {
+    let Some(at) = emission_divergence(extended, rendered_prompt, raw) else {
+        return;
+    };
+    let rendered = extended.get(rendered_prompt.len()..).unwrap_or(extended);
+    let (before, emitted) = around(raw, at, 40);
+    let (_, rerendered) = around(rendered, at, 40);
+    cache_event!(
+        generated_tokens,
+        target: "drama_llama::session",
+        event = "cache_degrade",
+        reason = "emission_not_byte_stable",
+        emission_bytes = raw.len(),
+        diverge_byte = at,
+        generated_tokens,
+        before,
+        emitted,
+        rerendered,
+        "prefix cache: this turn does not re-render as generated (they \
+         part at byte {at} of {}), so the next request cannot reuse its \
+         tip and re-prefills the turn",
+        raw.len(),
+    );
 }
 
 /// The auto-tip's fold cursor: the assistant reply (message index
@@ -2019,67 +2139,122 @@ fn hash_keyed_l_hit(
     out
 }
 
-/// Cache-reuse length for a call.
+/// Which anchor a reuse position came from — what the
+/// `cache_reuse` log event reports as its `source`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReuseSource {
+    /// A breakpoint of the new call whose partial-render hash matched
+    /// one the slot holds, in both coordinate spaces
+    /// ([`hash_keyed_l_hit`]).
+    Hash,
+    /// A breakpoint of the new call, inside the common prefix.
+    Breakpoint,
+    /// A breakpoint of an *earlier* call that the slot still holds,
+    /// inside the common prefix — Anthropic's lookback: a cache entry
+    /// written at a position the new request no longer marks is still
+    /// read. This is what makes automatic caching
+    /// ([`Prompt::cache_control`](misanthropic::Prompt::cache_control))
+    /// pay off: its breakpoint moves to the end of every request, and
+    /// the previous request's is what the next one reads.
+    Lookback,
+    /// The slot's post-generation tip ([`PrefixSlot::tip`]).
+    Tip,
+}
+
+impl ReuseSource {
+    /// The name the logs use.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hash => "hash",
+            Self::Breakpoint => "breakpoint",
+            Self::Lookback => "lookback",
+            Self::Tip => "tip",
+        }
+    }
+
+    /// Tie-break when two sources offer the same entry: the new call's
+    /// own marker, then an old one, then the tip — the order the
+    /// breakpoint-before-tip rule always had.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Hash | Self::Breakpoint => 2,
+            Self::Lookback => 1,
+            Self::Tip => 0,
+        }
+    }
+}
+
+/// A reusable position and the anchor that offered it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reuse {
+    at: EntryPos,
+    source: ReuseSource,
+}
+
+/// Cache-reuse length for a call, by the LCP walk.
 ///
 /// Given the previously-cached `prev_entries`, the newly-rendered
-/// `new_entries`, the new call's breakpoints (sorted ascending by
-/// entry), and an optional `internal_tip` from the prior generation's
-/// post-content position, compute `L_hit`: the largest [`EntryPos`]
-/// whose entry index is
+/// `new_entries`, and the candidate anchors — the new call's
+/// breakpoints, the slot's breakpoints from the call that wrote it
+/// (`old_breakpoints`, Anthropic's lookback), and the slot's
+/// `internal_tip` — pick the largest whose entry index is
 ///
 /// 1. less than or equal to the common-prefix length of the two entry
 ///    streams, with one entry of BPE-boundary safety (to avoid
 ///    reusing a position whose successor might tokenize differently);
-///    and
-/// 2. strictly greater than zero (we only reuse at breakpoints).
+/// 2. strictly greater than zero (we only reuse at anchors); and
+/// 3. strictly below `below` — the restore ladder's bound after a
+///    candidate failed to restore (`usize::MAX` otherwise).
 ///
-/// Both `new_breakpoints` and `internal_tip` are eligible candidates. The
-/// `internal_tip` is `Session`'s private post-generation cache anchor —
-/// independent of user-facing `cache_control` markers, so it doesn't count
-/// against the Anthropic 4-slot budget. See [`PrefixSlot::tip`].
+/// The `internal_tip` is `Session`'s private post-generation cache
+/// anchor — independent of user-facing `cache_control` markers, so it
+/// doesn't count against the Anthropic 4-slot budget. See
+/// [`PrefixSlot::tip`].
 ///
-/// The tip was computed against `prev_entries`; within the common
-/// prefix the two lists are identical entry-for-entry, so its `.pos`
-/// is valid against `new_entries` too (the eligibility check
-/// guarantees the winner sits inside the prefix).
+/// The tip and the old breakpoints were computed against
+/// `prev_entries`; within the common prefix the two lists are
+/// identical entry-for-entry, so their `.pos` is valid against
+/// `new_entries` too (the eligibility check guarantees the winner sits
+/// inside the prefix). Every one of them was checkpointed when it was
+/// made, so each is a restore target.
 ///
-/// Returns the zero position when no candidate is eligible — the
-/// caller should treat that as a full re-prefill. Pure function,
-/// tested directly.
+/// Returns `None` when no candidate is eligible — the caller should
+/// treat that as a full re-prefill. Pure function, tested directly.
 fn compute_l_hit(
     prev_entries: &[CacheEntry],
     new_entries: &[CacheEntry],
     new_breakpoints: &[EntryPos],
+    old_breakpoints: &[EntryPos],
     internal_tip: Option<EntryPos>,
-) -> EntryPos {
+    below: usize,
+) -> Option<Reuse> {
     let lcp = longest_common_prefix_len(prev_entries, new_entries);
     // BPE-boundary safety: back off by one entry so a breakpoint falling
     // exactly at the prefix end can't reuse a position whose successor might
     // re-tokenize differently once more context is added.
-    let safe = if lcp == 0 { 0 } else { lcp - 1 };
-    let user_best = new_breakpoints
+    let safe = lcp.saturating_sub(1);
+    let tagged = |source| move |at: &EntryPos| Reuse { at: *at, source };
+    new_breakpoints
         .iter()
-        .rev()
-        .find(|bp| bp.entry <= safe && bp.entry > 0)
-        .copied()
-        .unwrap_or_default();
-    let tip_best = internal_tip
-        .filter(|t| t.entry <= safe && t.entry > 0)
-        .unwrap_or_default();
-    if user_best.entry >= tip_best.entry {
-        user_best
-    } else {
-        tip_best
-    }
+        .map(tagged(ReuseSource::Breakpoint))
+        .chain(old_breakpoints.iter().map(tagged(ReuseSource::Lookback)))
+        .chain(internal_tip.iter().map(tagged(ReuseSource::Tip)))
+        .filter(|r| r.at.entry > 0 && r.at.entry <= safe && r.at.entry < below)
+        .max_by_key(|r| (r.at.entry, r.source.rank()))
 }
+
+/// Tokens a lost reuse costs before a miss is logged at `WARN` rather
+/// than `INFO`: a few hundred tokens of re-prefill is noise, a lost
+/// turn or prefix is what the operator needs to see.
+const MISS_WARN_TOKENS: usize = 256;
 
 /// One slot's reuse offer for the new call: the larger of the
 /// hash-keyed lookup ([`hash_keyed_l_hit`] — render-hash equality
 /// confirmed in both coordinate spaces, so it can reach past a BPE
 /// boundary the LCP walk stops at) and the LCP walk
 /// ([`compute_l_hit`] — token-for-token equality, so it can reach the
-/// tip when the new call has no marker near it). Zero entry = the
-/// slot offers nothing.
+/// tip, or an earlier call's breakpoint, when the new call has no
+/// marker near it). `None` = the slot offers nothing.
 ///
 /// **Neither path dominates, so both always run (#96).** The old
 /// composition was hash-first, LCP only on a total hash miss — and
@@ -2092,67 +2267,58 @@ fn compute_l_hit(
 /// every call. Both offers are independently sound (each proves its
 /// prefix in both coordinate spaces), so the larger is always safe.
 ///
-/// The first log site is the #91 drift event: a candidate whose bytes
-/// matched but whose segmentation did not. It is a *performance*
-/// event, not an error — the LCP offer stands regardless — but it is
-/// invisible everywhere else, so it gets a line. The second is the
-/// tip losing the pick (#96): the only externally-visible signal that
-/// a live tip failed to anchor, and the discriminant this issue
-/// lacked when it was diagnosed.
+/// Logs the #91 drift event: a candidate whose bytes matched but whose
+/// segmentation did not, refused. It is a *performance* event, not an
+/// error — the LCP offer stands regardless — but it is invisible
+/// everywhere else. Whether the *tip* lost the pick is diagnosed by
+/// the caller, which can decode the divergence ([`tip_miss`]).
 fn slot_l_hit(
     slot: &PrefixSlot,
     new_entries: &[CacheEntry],
     new_breakpoints: &[EntryPos],
     new_breakpoint_hashes: &[[u8; 32]],
-) -> EntryPos {
+) -> Option<Reuse> {
     let hashed = hash_keyed_l_hit(
         slot,
         new_entries,
         new_breakpoints,
         new_breakpoint_hashes,
     );
-    if let Some((_cached, _new)) = hashed.drifted {
-        #[cfg(feature = "axum")]
-        tracing::debug!(
-            target: "drama_llama::session",
-            seq_id = slot.seq_id,
-            cached_entry = _cached.entry,
-            cached_pos = _cached.pos,
-            new_entry = _new.entry,
-            new_pos = _new.pos,
-            accepted_entry = hashed.at.entry,
-            "prefix-reuse: render hash matched but the two \
-             tokenizations disagree; hash hit refused (#91)",
-        );
-    }
+    let old_breakpoints: Vec<EntryPos> =
+        slot.breakpoints.iter().map(|bp| bp.at).collect();
     let walked = compute_l_hit(
         &slot.prev_entries,
         new_entries,
         new_breakpoints,
+        &old_breakpoints,
         slot.tip.as_ref().map(|t| t.at),
+        usize::MAX,
     );
-    let picked = if hashed.at.entry >= walked.entry {
-        hashed.at
-    } else {
-        walked
+    let hashed_hit = (hashed.at.entry > 0).then_some(Reuse {
+        at: hashed.at,
+        source: ReuseSource::Hash,
+    });
+    let picked = match (hashed_hit, walked) {
+        (Some(h), Some(w)) if w.at.entry > h.at.entry => Some(w),
+        (Some(h), _) => Some(h),
+        (None, w) => w,
     };
-    #[cfg(feature = "axum")]
-    if let Some(tip) = &slot.tip {
-        if picked.entry < tip.at.entry
-            && tracing::enabled!(tracing::Level::DEBUG)
-        {
-            let lcp =
-                longest_common_prefix_len(&slot.prev_entries, new_entries);
-            tracing::debug!(
+    if let Some((cached, new)) = hashed.drifted {
+        let reused = picked.map_or(0, |r| r.at.entry);
+        let lost = cached.entry.saturating_sub(reused);
+        if lost > 0 {
+            cache_event!(
+                lost,
                 target: "drama_llama::session",
+                event = "cache_degrade",
+                reason = "hash_drift",
                 seq_id = slot.seq_id,
-                tip_entry = tip.at.entry,
-                tip_pos = tip.at.pos,
-                tip_hashed = tip.hash.is_some(),
-                picked_entry = picked.entry,
-                lcp,
-                "prefix-reuse: tip lost the pick — LCP stopped short \
-                 of it and no new partial hash reaches it (#96)",
+                cached_entry = cached.entry,
+                new_entry = new.entry,
+                reused_entry = reused,
+                lost_tokens = lost,
+                "prefix cache: a render hash matched but the two \
+                 tokenizations disagree, so the hash hit was refused (#91)",
             );
         }
     }
@@ -2171,26 +2337,26 @@ fn select_slot(
     new_entries: &[CacheEntry],
     new_breakpoints: &[EntryPos],
     new_breakpoint_hashes: &[[u8; 32]],
-) -> Option<(i32, EntryPos)> {
-    let mut best: Option<(&PrefixSlot, EntryPos)> = None;
+) -> Option<(i32, Reuse)> {
+    let mut best: Option<(&PrefixSlot, Reuse)> = None;
     for slot in slots {
         if slot.prev_entries.is_empty() {
             continue;
         }
-        let hit = slot_l_hit(
+        let Some(hit) = slot_l_hit(
             slot,
             new_entries,
             new_breakpoints,
             new_breakpoint_hashes,
-        );
-        if hit.entry == 0 {
+        ) else {
             continue;
-        }
+        };
         let better = match &best {
             None => true,
             Some((b, bhit)) => {
-                hit.entry > bhit.entry
-                    || (hit.entry == bhit.entry && slot.last_used > b.last_used)
+                hit.at.entry > bhit.at.entry
+                    || (hit.at.entry == bhit.at.entry
+                        && slot.last_used > b.last_used)
             }
         };
         if better {
@@ -2198,6 +2364,82 @@ fn select_slot(
         }
     }
     best.map(|(slot, hit)| (slot.seq_id, hit))
+}
+
+/// Why a slot's tip went unused although the new call continues past
+/// it — the event behind "that turn re-prefilled". See [`tip_miss`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TipMiss {
+    /// The tip that was not reused.
+    tip: EntryPos,
+    /// Where the new call's entries first differ from the slot's.
+    diverge_at: usize,
+    /// Whether that is inside the turn the tip closed (past the
+    /// prompt it was generated from): the re-rendered turn does not
+    /// reproduce what was generated — the round-trip failure — rather
+    /// than the client having changed earlier history.
+    in_turn: bool,
+}
+
+/// The tip `slot` offered and the new call could not use, if the call
+/// is a continuation of it: its entries run past the tip, yet what was
+/// reused (`reused_entry`) stops short of it. A call that ends at or
+/// before the tip — a resample, a rewind — is not a miss.
+///
+/// Pure; the caller decodes the context around
+/// [`TipMiss::diverge_at`] for the log.
+fn tip_miss(
+    slot: &PrefixSlot,
+    new_entries: &[CacheEntry],
+    reused_entry: usize,
+) -> Option<TipMiss> {
+    let tip = slot.tip.as_ref()?.at;
+    if reused_entry >= tip.entry || new_entries.len() <= tip.entry {
+        return None;
+    }
+    let diverge_at = longest_common_prefix_len(&slot.prev_entries, new_entries);
+    Some(TipMiss {
+        tip,
+        diverge_at,
+        in_turn: diverge_at >= slot.turn_start,
+    })
+}
+
+/// How many entries of context a divergence log shows on each side.
+const DIVERGENCE_CONTEXT: usize = 12;
+
+/// The text of `entries`, one piece per token, media as `<media>`.
+fn entries_text(
+    entries: &[CacheEntry],
+    piece: impl Fn(Token) -> String,
+) -> String {
+    entries
+        .iter()
+        .map(|entry| match entry {
+            CacheEntry::Token(token) => piece(*token),
+            CacheEntry::Media { .. } => "<media>".to_owned(),
+        })
+        .collect()
+}
+
+/// A divergence at `at` between two entry lists, for a log line: the
+/// shared text just before it, then each side's text from it on,
+/// [`DIVERGENCE_CONTEXT`] entries apiece.
+fn divergence_context(
+    cached: &[CacheEntry],
+    new: &[CacheEntry],
+    at: usize,
+    piece: impl Fn(Token) -> String,
+) -> (String, String, String) {
+    let window = |entries: &[CacheEntry]| {
+        let from = at.min(entries.len());
+        let to = (at + DIVERGENCE_CONTEXT).min(entries.len());
+        entries_text(&entries[from..to], &piece)
+    };
+    let before = at.saturating_sub(DIVERGENCE_CONTEXT);
+    let shared =
+        entries_text(&new[before.min(new.len())..at.min(new.len())], &piece);
+    (shared, window(cached), window(new))
 }
 
 /// One generated-position entry in a [`Session::top_k_trace`] dump.
@@ -4636,6 +4878,38 @@ impl<B: Backend> Session<B> {
         Ok((entries, ids, hash))
     }
 
+    /// The `cache_degrade` event for a `cache_control` breakpoint that
+    /// cannot be honored: its partial render does not tokenize to a
+    /// prefix of the full prompt (the template renders the truncated
+    /// prompt differently, or BPE merges across the cut), so no anchor
+    /// is made there — and whatever the client meant to cache at it is
+    /// re-prefilled from the anchor below.
+    fn log_breakpoint_dropped(
+        &self,
+        breakpoint: PromptBreakpoint,
+        partial: &[CacheEntry],
+        full: &[CacheEntry],
+    ) {
+        let diverge_at = longest_common_prefix_len(partial, full);
+        let piece = |token| self.engine.model.token_to_piece(token);
+        let (shared, partial_text, full_text) =
+            divergence_context(partial, full, diverge_at, piece);
+        tracing::warn!(
+            target: "drama_llama::session",
+            event = "cache_degrade",
+            reason = "breakpoint_dropped",
+            breakpoint = ?breakpoint,
+            partial_entries = partial.len(),
+            diverge_at,
+            shared = shared.as_str(),
+            partial = partial_text.as_str(),
+            full = full_text.as_str(),
+            "prefix cache: breakpoint {breakpoint:?} dropped — its partial \
+             render is not a token prefix of the prompt (they diverge at \
+             entry {diverge_at})",
+        );
+    }
+
     /// Cache-aware superset of [`Self::prepare_call`]: renders the
     /// prompt **with** cache breakpoints, tokenizes both the full
     /// render and each partial media-aware via
@@ -4703,6 +4977,12 @@ impl<B: Backend> Session<B> {
                         *bp_id,
                         ttl.clone(),
                     ));
+                } else {
+                    self.log_breakpoint_dropped(
+                        *bp_id,
+                        &p_entries,
+                        &full_entries,
+                    );
                 }
             }
             rows.sort_by_key(|(ep, _, _, _)| ep.entry);
@@ -4892,13 +5172,16 @@ impl<B: Backend> Session<B> {
                     new_breakpoint_hashes,
                 )
             };
+            // Before anything below mutates the slots: a tip this call
+            // continues past but cannot reuse.
+            self.log_tip_miss(selection, new_entries);
             match selection {
-                Some((seq, l_hit_raw)) => {
-                    #[cfg(feature = "axum")]
+                Some((seq, hit)) => {
                     tracing::debug!(
                         seq_id = seq,
-                        l_hit_entry = l_hit_raw.entry,
-                        l_hit_pos = l_hit_raw.pos,
+                        l_hit_entry = hit.at.entry,
+                        l_hit_pos = hit.at.pos,
+                        source = hit.source.as_str(),
                         new_len = new_entries.len(),
                         "prefix-reuse: slot selected",
                     );
@@ -4907,21 +5190,39 @@ impl<B: Backend> Session<B> {
                     // an empty token slice (panic on construction).
                     // Back off to the next-smaller breakpoint so at
                     // least one token survives for the predictor.
-                    let cache_read = if l_hit_raw.entry == new_entries.len() {
-                        new_breakpoints
-                            .iter()
-                            .rev()
-                            .find(|bp| {
-                                bp.entry < l_hit_raw.entry && bp.entry > 0
-                            })
-                            .copied()
-                            .unwrap_or_default()
+                    let mut reuse = if hit.at.entry == new_entries.len() {
+                        Reuse {
+                            at: new_breakpoints
+                                .iter()
+                                .rev()
+                                .find(|bp| {
+                                    bp.entry < hit.at.entry && bp.entry > 0
+                                })
+                                .copied()
+                                .unwrap_or_default(),
+                            source: ReuseSource::Breakpoint,
+                        }
                     } else {
-                        l_hit_raw
+                        hit
                     };
-                    if cache_read.entry > 0 {
-                        match self.engine.restore_to(seq, cache_read.pos as i32)
-                        {
+                    let mut miss_reason = "backoff_zero";
+                    // The restore ladder: a candidate whose snapshot is
+                    // gone (evicted, never taken) hands over to the
+                    // best LCP candidate below it, never straight to
+                    // zero — every rung is an anchor the walk proved.
+                    loop {
+                        if reuse.at.entry == 0 {
+                            // Nothing reusable after all. Reuse the
+                            // selected slot as the pending one, emptied.
+                            self.reset_slot(seq, now);
+                            self.log_reuse_miss(
+                                miss_reason,
+                                new_entries,
+                                hit.at.entry,
+                            );
+                            break (seq, EntryPos::default());
+                        }
+                        match self.engine.restore_to(seq, reuse.at.pos as i32) {
                             Ok(()) => {
                                 if let Some(slot) = self
                                     .prefix_cache
@@ -4932,28 +5233,56 @@ impl<B: Backend> Session<B> {
                                     // the slot's TTL/LRU clock.
                                     slot.last_used = now;
                                 }
-                                (seq, cache_read)
+                                self.log_reuse_hit(seq, reuse, new_entries);
+                                break (seq, reuse.at);
                             }
-                            Err(_e) => {
-                                #[cfg(feature = "axum")]
-                                tracing::debug!(
-                                    seq_id = seq,
-                                    cache_read_entry = cache_read.entry,
-                                    cache_read_pos = cache_read.pos,
-                                    error = %_e,
-                                    "checkpoint missing; wiping slot and \
-                                     falling back to full reprefill",
+                            Err(e) => {
+                                let next = self
+                                    .prefix_cache
+                                    .as_ref()
+                                    .and_then(|c| c.slot(seq))
+                                    .and_then(|slot| {
+                                        let old: Vec<EntryPos> = slot
+                                            .breakpoints
+                                            .iter()
+                                            .map(|bp| bp.at)
+                                            .collect();
+                                        compute_l_hit(
+                                            &slot.prev_entries,
+                                            new_entries,
+                                            new_breakpoints,
+                                            &old,
+                                            slot.tip.as_ref().map(|t| t.at),
+                                            reuse.at.entry,
+                                        )
+                                    });
+                                let fallback = next.map_or(0, |r| r.at.entry);
+                                let lost = entries_cell_len(
+                                    &new_entries[fallback..reuse.at.entry],
                                 );
-                                self.reset_slot(seq, now);
-                                (seq, EntryPos::default())
+                                cache_event!(
+                                    lost,
+                                    target: "drama_llama::session",
+                                    event = "cache_degrade",
+                                    reason = "restore_failed",
+                                    seq_id = seq,
+                                    source = reuse.source.as_str(),
+                                    entry = reuse.at.entry,
+                                    pos = reuse.at.pos,
+                                    fallback_entry = fallback,
+                                    lost_tokens = lost,
+                                    error = %e,
+                                    "prefix cache: no checkpoint to restore \
+                                     at the reuse point; falling back to \
+                                     the next anchor below it",
+                                );
+                                miss_reason = "restore_failed";
+                                reuse = next.unwrap_or(Reuse {
+                                    at: EntryPos::default(),
+                                    source: ReuseSource::Breakpoint,
+                                });
                             }
                         }
-                    } else {
-                        // Backoff landed at zero: nothing reusable
-                        // after all. Reuse the selected slot as the
-                        // pending one, emptied.
-                        self.reset_slot(seq, now);
-                        (seq, EntryPos::default())
                     }
                 }
                 None => {
@@ -4970,6 +5299,7 @@ impl<B: Backend> Session<B> {
                             panic!("prefix-cache tripwire: unexpected miss");
                         }
                     }
+                    self.log_reuse_miss("no_slot", new_entries, 0);
                     let seq = self.allocate_slot(now);
                     (seq, EntryPos::default())
                 }
@@ -4995,11 +5325,7 @@ impl<B: Backend> Session<B> {
                 )
             };
             for seq in plan {
-                #[cfg(feature = "axum")]
-                tracing::debug!(
-                    seq_id = seq,
-                    "prefix-cache over cell budget; evicting LRU slot",
-                );
+                self.log_eviction(seq, "capacity", now);
                 self.evict_slot(seq);
             }
         }
@@ -5218,6 +5544,182 @@ impl<B: Backend> Session<B> {
         Ok((suffix, cache_read_cells, pos, cached_state, active_seq))
     }
 
+    /// The `cache_reuse` event for a call that restored `reuse` on slot
+    /// `seq`: where the reused prefix came from, and how much of the
+    /// prompt is left to prefill.
+    fn log_reuse_hit(
+        &self,
+        seq: i32,
+        reuse: Reuse,
+        new_entries: &[CacheEntry],
+    ) {
+        let reused = entries_cell_len(&new_entries[..reuse.at.entry]);
+        let prompt = entries_cell_len(new_entries);
+        tracing::info!(
+            target: "drama_llama::session",
+            event = "cache_reuse",
+            outcome = "hit",
+            source = reuse.source.as_str(),
+            seq_id = seq,
+            reused_tokens = reused,
+            prefill_tokens = prompt - reused,
+            prompt_tokens = prompt,
+            "prefix cache: reusing {reused} of {prompt} prompt tokens \
+             from the {}",
+            reuse.source.as_str(),
+        );
+    }
+
+    /// The `cache_reuse` event for a call that reuses nothing: `reason`
+    /// is `no_slot` (no slot shares an anchor with the prompt),
+    /// `restore_failed` (every anchor's checkpoint was gone) or
+    /// `backoff_zero` (the only anchor covered the whole prompt).
+    /// `offered` is the entry the selected slot offered (0 for
+    /// `no_slot`), which sets the level; the longest prefix any slot
+    /// shares with the prompt is reported alongside.
+    fn log_reuse_miss(
+        &self,
+        reason: &'static str,
+        new_entries: &[CacheEntry],
+        offered: usize,
+    ) {
+        let shared = self.prefix_cache.as_ref().map_or(0, |cache| {
+            cache
+                .slots
+                .iter()
+                .map(|s| {
+                    longest_common_prefix_len(&s.prev_entries, new_entries)
+                })
+                .max()
+                .unwrap_or(0)
+        });
+        // Level by what the selected slot offered and could not
+        // deliver. A prefix merely *shared* with another slot is not a
+        // loss: without an anchor inside it (a first turn with no
+        // marker) nothing could have been reused — the tripwire's
+        // 2026-07-17 false positive.
+        let lost =
+            entries_cell_len(&new_entries[..offered.min(new_entries.len())]);
+        cache_event!(
+            lost,
+            target: "drama_llama::session",
+            event = "cache_reuse",
+            outcome = "miss",
+            reason,
+            shared_entries = shared,
+            lost_tokens = lost,
+            prompt_tokens = entries_cell_len(new_entries),
+            "prefix cache: nothing reused ({reason}); prefilling the \
+             whole prompt",
+        );
+    }
+
+    /// The `cache_degrade` event for a slot tip this call continues past
+    /// but does not reuse ([`tip_miss`]), with the first diverging entry
+    /// and the decoded text on both sides of it. The slot diagnosed is
+    /// the one selected, else the one sharing the longest prefix.
+    ///
+    /// `tip_diverged` — the divergence is inside the turn the tip
+    /// closed: the re-rendered turn does not tokenize to what the model
+    /// generated (a chat template that rewrites the emission, e.g. by
+    /// trimming whitespace, or a non-canonical token the model sampled).
+    /// `WARN` when it costs more than [`MISS_WARN_TOKENS`].
+    /// `history_changed` — it is before that turn: the client sent a
+    /// different history, or this is another conversation sharing a
+    /// prefix; always `INFO`.
+    fn log_tip_miss(
+        &self,
+        selection: Option<(i32, Reuse)>,
+        new_entries: &[CacheEntry],
+    ) {
+        let Some(cache) = self.prefix_cache.as_ref() else {
+            return;
+        };
+        let slot = match selection {
+            Some((seq, _)) => cache.slot(seq),
+            None => cache.slots.iter().max_by_key(|slot| {
+                longest_common_prefix_len(&slot.prev_entries, new_entries)
+            }),
+        };
+        let Some(slot) = slot else { return };
+        let reused = selection.map_or(0, |(_, r)| r.at.entry);
+        let Some(miss) = tip_miss(slot, new_entries, reused) else {
+            return;
+        };
+        let lost = entries_cell_len(
+            &slot.prev_entries[reused.min(miss.tip.entry)..miss.tip.entry],
+        );
+        let piece = |token| self.engine.model.token_to_piece(token);
+        let (shared, cached, new) = divergence_context(
+            &slot.prev_entries,
+            new_entries,
+            miss.diverge_at,
+            piece,
+        );
+        let reason = if miss.in_turn {
+            "tip_diverged"
+        } else {
+            "history_changed"
+        };
+        // Only an in-turn divergence proves the call continues this
+        // slot's conversation (it reproduced the whole previous prompt
+        // first); an earlier one may be another conversation sharing a
+        // prefix, so it never warns.
+        let severity = if miss.in_turn { lost } else { 0 };
+        cache_event!(
+            severity,
+            target: "drama_llama::session",
+            event = "cache_degrade",
+            reason,
+            seq_id = slot.seq_id,
+            tip_entry = miss.tip.entry,
+            reused_entry = reused,
+            diverge_at = miss.diverge_at,
+            turn_start = slot.turn_start,
+            lost_tokens = lost,
+            shared = shared.as_str(),
+            cached = cached.as_str(),
+            new = new.as_str(),
+            "prefix cache: the last turn's tip is not reusable — the new \
+             prompt diverges from the cached tokens at entry {} ({reason})",
+            miss.diverge_at,
+        );
+    }
+
+    /// The `cache_evict` event for a whole slot about to be dropped:
+    /// `ttl` (every anchor expired), `capacity` (the KV cell budget
+    /// needs its cells), `slot_capacity` (every slot is taken and this
+    /// is the least recently used — slot thrash: more live
+    /// conversations than `--cache-slots`), or `error` (a failed call
+    /// left its KV untrustworthy). A cached prefix evicted for room is a
+    /// future miss of that size, hence `WARN` past
+    /// [`MISS_WARN_TOKENS`]; an expired one is what its TTL asked for.
+    fn log_eviction(
+        &self,
+        seq: i32,
+        reason: &'static str,
+        now: std::time::Instant,
+    ) {
+        let Some(slot) = self.prefix_cache.as_ref().and_then(|c| c.slot(seq))
+        else {
+            return;
+        };
+        let cells = slot.cells();
+        let idle_secs = now.saturating_duration_since(slot.last_used).as_secs();
+        let lost = if reason == "ttl" { 0 } else { cells };
+        cache_event!(
+            lost,
+            target: "drama_llama::session",
+            event = "cache_evict",
+            reason,
+            seq_id = seq,
+            cached_tokens = cells,
+            idle_secs,
+            "prefix cache: evicting slot {seq} ({reason}), dropping \
+             {cells} cached tokens",
+        );
+    }
+
     /// Empty a live slot in place — engine footprint freed, metadata
     /// reset — keeping its `seq_id` claimed for the in-flight call.
     fn reset_slot(&mut self, seq_id: i32, now: std::time::Instant) {
@@ -5267,11 +5769,7 @@ impl<B: Backend> Session<B> {
                     .map(|s| s.seq_id)
             });
             if let Some(seq) = lru_seq {
-                #[cfg(feature = "axum")]
-                tracing::debug!(
-                    seq_id = seq,
-                    "prefix-cache at slot capacity; evicting LRU slot",
-                );
+                self.log_eviction(seq, "slot_capacity", now);
                 self.evict_slot(seq);
             }
         }
@@ -5315,17 +5813,21 @@ impl<B: Backend> Session<B> {
             _ => return,
         };
         for action in actions {
-            #[cfg(feature = "axum")]
-            tracing::debug!(
-                seq_id = action.seq,
-                forget = action.forget.len(),
-                evict = action.evict,
-                "prefix-cache TTL sweep",
-            );
             if action.evict {
+                self.log_eviction(action.seq, "ttl", now);
                 self.evict_slot(action.seq);
                 continue;
             }
+            tracing::info!(
+                target: "drama_llama::session",
+                event = "cache_evict",
+                reason = "ttl",
+                seq_id = action.seq,
+                forgotten = action.forget.len(),
+                "prefix cache: {} anchor(s) of slot {} expired",
+                action.forget.len(),
+                action.seq,
+            );
             for &pos in &action.forget {
                 let _ = self.engine.forget_pos(action.seq, pos as i32);
             }
@@ -5488,10 +5990,14 @@ impl<B: Backend> Session<B> {
     /// outgoing cache here (the prefix identity that justified the
     /// reuse also makes the old state valid at the same boundary).
     ///
+    /// `turn_start` is the prompt's entry count: where in
+    /// `new_entries` this call's generation began ([`PrefixSlot::turn_start`]).
+    ///
     /// No-op when caching is off.
     fn record_cache_hit(
         &mut self,
         new_entries: Vec<CacheEntry>,
+        turn_start: usize,
         mut new_breakpoints: Vec<Breakpoint>,
         reused_cells: usize,
         tip: Option<Breakpoint>,
@@ -5551,6 +6057,7 @@ impl<B: Backend> Session<B> {
                     .and_then(|old| old.state.clone());
             }
             slot.prev_entries = new_entries;
+            slot.turn_start = turn_start;
             slot.breakpoints = new_breakpoints;
             slot.tip = tip;
             slot.last_used = now;
@@ -5603,6 +6110,7 @@ impl<B: Backend> Session<B> {
             .and_then(|c| c.pending.take().or(c.last_active.take()));
         match seq {
             Some(seq) if self.prefix_cache.is_some() => {
+                self.log_eviction(seq, "error", std::time::Instant::now());
                 self.evict_slot(seq);
             }
             _ => {
@@ -5850,6 +6358,7 @@ impl<B: Backend> Session<B> {
         // tip lands at `kv_len`, the checkpoint at `kv_len`, and
         // the next call's LCP can extend to `kv_len + 1` so the tip
         // qualifies under the `lcp-1` BPE-safety check.
+        let turn_start = entries.len();
         let (extended_prev, internal_tip, head_for_checkpoint) = self
             .compute_tip_extension(
                 entries,
@@ -5877,6 +6386,7 @@ impl<B: Backend> Session<B> {
         });
         self.record_cache_hit(
             extended_prev,
+            turn_start,
             assemble_breakpoints(
                 breakpoints,
                 partial_hashes,
@@ -6045,8 +6555,10 @@ impl<B: Backend> Session<B> {
         // path (whose fold-snapshot states ARE recorded, below) still
         // works exactly as before. (See plan: streaming tip extension
         // is a v2 follow-up.)
+        let turn_start = entries.len();
         self.record_cache_hit(
             entries,
+            turn_start,
             assemble_breakpoints(
                 breakpoints,
                 partial_hashes,
@@ -6518,12 +7030,11 @@ impl<B: Backend> Session<B> {
                         &source_to_id,
                     )
                 } else {
-                    #[cfg(feature = "axum")]
-                    tracing::debug!(
-                        target: "drama_llama::session",
-                        emission_bytes = raw_text.len(),
-                        "emission does not re-render byte-stable; \
-                         auto-tip hash skipped (LCP fallback)",
+                    log_unstable_emission(
+                        &extended_render,
+                        &rendered_prompt,
+                        &raw_text,
+                        generated_count,
                     );
                     None
                 }
@@ -6541,6 +7052,7 @@ impl<B: Backend> Session<B> {
         // generated content and the canonical tail (falling back to
         // the recorded-but-uncommitted token when the render wasn't
         // byte-stable). See `compute_tip_extension`.
+        let turn_start = entries.len();
         let (extended_prev, internal_tip, head_for_checkpoint) = if keep_tip {
             self.compute_tip_extension(
                 entries,
@@ -6567,6 +7079,7 @@ impl<B: Backend> Session<B> {
         });
         self.record_cache_hit(
             extended_prev,
+            turn_start,
             assemble_breakpoints(
                 breakpoints,
                 partial_hashes,
@@ -7732,6 +8245,19 @@ fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`compute_l_hit`] over the new call's breakpoints and the tip
+    /// alone (no lookback, no ladder bound), as a bare position — the
+    /// shape these tests were written against.
+    fn l_hit(
+        prev: &[CacheEntry],
+        new: &[CacheEntry],
+        breakpoints: &[EntryPos],
+        tip: Option<EntryPos>,
+    ) -> EntryPos {
+        compute_l_hit(prev, new, breakpoints, &[], tip, usize::MAX)
+            .map_or_else(EntryPos::default, |hit| hit.at)
+    }
     use std::num::NonZeroU32;
 
     // -----------------------------------------------------------------
@@ -8951,7 +9477,7 @@ mod tests {
         let prev = toks(0..20);
         let new_ = toks((0..10).chain(100..110));
         assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
-        assert_eq!(compute_l_hit(&prev, &new_, &[], None), ep(0));
+        assert_eq!(l_hit(&prev, &new_, &[], None), ep(0));
     }
 
     /// With breakpoints at [5, 8, 12] and a common prefix of 10, the
@@ -8963,7 +9489,7 @@ mod tests {
         let new_ = toks((0..10).chain(100..110));
         let breakpoints = vec![ep(5), ep(8), ep(12)];
         assert_eq!(longest_common_prefix_len(&prev, &new_), 10);
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), ep(8));
+        assert_eq!(l_hit(&prev, &new_, &breakpoints, None), ep(8));
     }
 
     /// Eligibility is decided in ENTRY space while the winner carries
@@ -8980,7 +9506,7 @@ mod tests {
         let bp = entry_pos_at(&new_, 4);
         assert_eq!(bp, EntryPos { entry: 4, pos: 19 });
         assert_eq!(
-            compute_l_hit(&prev, &new_[..5], &[bp], None),
+            l_hit(&prev, &new_[..5], &[bp], None),
             bp,
             "winner is the carried pair, not a re-derived position"
         );
@@ -8996,7 +9522,7 @@ mod tests {
         let new_ = toks((0..5).chain(200..205).chain(300..305));
         let breakpoints = vec![ep(5)];
         assert_eq!(longest_common_prefix_len(&prev, &new_), 5);
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), ep(0));
+        assert_eq!(l_hit(&prev, &new_, &breakpoints, None), ep(0));
     }
 
     /// When the common prefix is zero, `L_hit` must also be zero,
@@ -9006,7 +9532,7 @@ mod tests {
         let prev = toks([10, 20, 30]);
         let new_ = toks([40, 50, 60]);
         let breakpoints = vec![ep(1), ep(2), ep(3)];
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), ep(0));
+        assert_eq!(l_hit(&prev, &new_, &breakpoints, None), ep(0));
     }
 
     /// Empty previous tokens — first call against a cold cache —
@@ -9016,7 +9542,7 @@ mod tests {
         let prev = toks([]);
         let new_ = toks([1, 2, 3, 4, 5]);
         let breakpoints = vec![ep(1), ep(3)];
-        assert_eq!(compute_l_hit(&prev, &new_, &breakpoints, None), ep(0));
+        assert_eq!(l_hit(&prev, &new_, &breakpoints, None), ep(0));
     }
 
     /// Internal tip eligible: tip at `lcp - 1` (the BPE-safe boundary)
@@ -9031,7 +9557,7 @@ mod tests {
         let prev = toks(0..8);
         let new_ = toks((0..8).chain([99, 50, 51, 52]));
         assert_eq!(longest_common_prefix_len(&prev, &new_), 8);
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(7))), ep(7));
+        assert_eq!(l_hit(&prev, &new_, &[], Some(ep(7))), ep(7));
     }
 
     /// Internal tip blocked by a short LCP: tip at 7 but LCP is only
@@ -9042,7 +9568,7 @@ mod tests {
         let prev = toks(0..8);
         let new_ = toks([0, 1, 2, 99, 99, 99, 99, 99]);
         assert_eq!(longest_common_prefix_len(&prev, &new_), 3);
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(7))), ep(0));
+        assert_eq!(l_hit(&prev, &new_, &[], Some(ep(7))), ep(0));
     }
 
     /// Tip and a larger user breakpoint both eligible → user breakpoint
@@ -9054,10 +9580,7 @@ mod tests {
         let breakpoints = vec![ep(8)];
         // LCP = 10, safe = 9. Tip at 4 eligible (≤9). User BP at 8 also
         // eligible. Largest wins: 8.
-        assert_eq!(
-            compute_l_hit(&prev, &new_, &breakpoints, Some(ep(4))),
-            ep(8)
-        );
+        assert_eq!(l_hit(&prev, &new_, &breakpoints, Some(ep(4))), ep(8));
     }
 
     /// Tip exactly at `lcp - 1` is eligible (BPE-safety boundary,
@@ -9067,7 +9590,7 @@ mod tests {
         let prev = toks(0..5);
         let new_ = toks((0..5).chain([99, 50]));
         // LCP = 5, safe = 4. Tip at 4 (= safe) eligible.
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(4))), ep(4));
+        assert_eq!(l_hit(&prev, &new_, &[], Some(ep(4))), ep(4));
     }
 
     /// Tip exactly at `lcp` is ineligible (one past safe).
@@ -9077,7 +9600,7 @@ mod tests {
         let prev = toks(0..5);
         let new_ = toks((0..5).chain([99, 50]));
         // LCP = 5, safe = 4. Tip at 5 (= lcp, > safe) ineligible.
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(5))), ep(0));
+        assert_eq!(l_hit(&prev, &new_, &[], Some(ep(5))), ep(0));
     }
 
     /// Tip at zero is rejected (we only reuse at positions > 0,
@@ -9086,7 +9609,7 @@ mod tests {
     fn test_l_hit_internal_tip_zero_rejected() {
         let prev = toks(0..5);
         let new_ = toks((0..5).chain([99]));
-        assert_eq!(compute_l_hit(&prev, &new_, &[], Some(ep(0))), ep(0));
+        assert_eq!(l_hit(&prev, &new_, &[], Some(ep(0))), ep(0));
     }
 
     // -----------------------------------------------------------------
@@ -9133,14 +9656,14 @@ mod tests {
         assert_eq!(head, Some(7));
         // LCP reaches past the tip entry, so the tip is eligible.
         assert_eq!(longest_common_prefix_len(&entries, &next), 9);
-        assert_eq!(compute_l_hit(&entries, &next, &[], tip), ep(7));
+        assert_eq!(l_hit(&entries, &next, &[], tip), ep(7));
 
         // The bug, pinned: close-only tail on this ending.
         let (bad, bad_tip, _) =
             tip_extension(toks(0..5), vec![10, 11, 12], Some(vec![99]), 7);
         assert_eq!(bad, toks([0, 1, 2, 3, 4, 10, 11, 99]));
         assert_eq!(longest_common_prefix_len(&bad, &next), 7);
-        assert_eq!(compute_l_hit(&bad, &next, &[], bad_tip), ep(0));
+        assert_eq!(l_hit(&bad, &next, &[], bad_tip), ep(0));
     }
 
     /// Max-tokens ending gets a tip, with or without a canonical tail.
@@ -9712,6 +10235,7 @@ mod tests {
         let new_bps = [ep(2), ep(4)];
         let picked =
             select_slot(&[a, b], &new_entries, &new_bps, &unmatched_hashes(2))
+                .map(|(seq, hit)| (seq, hit.at))
                 .unwrap();
         assert_eq!(picked, (1, ep(4)));
     }
@@ -9750,8 +10274,9 @@ mod tests {
         let new_bps = [ep(4), ep(6)];
         // Columns are index-parallel: `h` pairs with `ep(6)`.
         let new_hashes = [hash_partial_text("no match"), h];
-        let picked =
-            select_slot(&[a, b], &new_entries, &new_bps, &new_hashes).unwrap();
+        let picked = select_slot(&[a, b], &new_entries, &new_bps, &new_hashes)
+            .map(|(seq, hit)| (seq, hit.at))
+            .unwrap();
         assert_eq!(picked, (0, ep(6)));
     }
 
@@ -11114,7 +11639,8 @@ mod tests {
         let new_entries = seq_entries(400);
         let (new_eps, new_hashes) = new_bps(&[(100, h_marker)]);
         assert_eq!(
-            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes),
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes)
+                .map_or_else(EntryPos::default, |hit| hit.at),
             ep(250),
             "a matched marker hash must not shadow the tip: the slot's \
              offer is the larger of the two paths, and the tip at 250 \
@@ -11137,11 +11663,332 @@ mod tests {
         new_entries[50] = CacheEntry::Token(9999);
         let (new_eps, new_hashes) = new_bps(&[(200, h_marker)]);
         assert_eq!(
-            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes),
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes)
+                .map_or_else(EntryPos::default, |hit| hit.at),
             ep(200),
             "the hash path must still reach past a boundary the LCP \
              walk stops at",
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Lookback, the restore ladder, and the cache miss diagnostics
+    // ----------------------------------------------------------------
+
+    /// Anthropic's lookback: a breakpoint the *previous* call placed —
+    /// the automatic one at the end of its prompt — is read by the next
+    /// call although the next call no longer marks it.
+    #[test]
+    fn lookback_reads_an_earlier_calls_breakpoint() {
+        let prev = seq_entries(200);
+        let mut new_ = seq_entries(150);
+        new_.extend(toks(9000..9100));
+        let hit = compute_l_hit(
+            &prev,
+            &new_,
+            &[ep(50), ep(240)],
+            &[ep(50), ep(100)],
+            Some(ep(199)),
+            usize::MAX,
+        );
+        assert_eq!(
+            hit,
+            Some(Reuse {
+                at: ep(100),
+                source: ReuseSource::Lookback
+            })
+        );
+        // Tied with a marker of the new call, the new call's wins.
+        let tied = compute_l_hit(
+            &prev,
+            &new_,
+            &[ep(100)],
+            &[ep(100)],
+            None,
+            usize::MAX,
+        );
+        assert_eq!(tied.map(|r| r.source), Some(ReuseSource::Breakpoint));
+    }
+
+    /// The restore ladder's bound: once the rung at 100 failed to
+    /// restore, the walk offers the best anchor strictly below it.
+    #[test]
+    fn ladder_bound_excludes_the_failed_rung() {
+        let prev = seq_entries(200);
+        let new_ = seq_entries(180);
+        let hit = compute_l_hit(&prev, &new_, &[ep(50)], &[ep(100)], None, 100);
+        assert_eq!(hit.map(|r| r.at), Some(ep(50)));
+        let none = compute_l_hit(&prev, &new_, &[ep(50)], &[], None, 50);
+        assert_eq!(none, None);
+    }
+
+    /// The live shape (Qwen3.6, 2026-09-30): the last turn's tip is
+    /// lost because the re-rendered turn departs from the generated
+    /// one near its end. The previous call's automatic breakpoint (at
+    /// the end of its prompt, entry 200) is what saves everything but
+    /// that turn — the system marker at 60 is the only anchor the new
+    /// call itself places below the divergence.
+    #[test]
+    fn a_lost_tip_falls_back_to_the_previous_calls_auto_breakpoint() {
+        let mut slot = hashed_slot(
+            260,
+            vec![bp(60, None), bp(200, None)],
+            Some(bp(259, None)),
+        );
+        slot.turn_start = 200;
+        // The re-render drops the turn's last generated token (a
+        // trailing newline the template trims), then the new beat.
+        let mut new_entries = seq_entries(258);
+        new_entries.extend(toks(9000..9042));
+        let (new_eps, new_hashes) =
+            (vec![ep(60), ep(290)], unmatched_hashes(2));
+        let hit = slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes);
+        assert_eq!(
+            hit,
+            Some(Reuse {
+                at: ep(200),
+                source: ReuseSource::Lookback
+            }),
+            "the previous call's end-of-prompt anchor, not the system",
+        );
+        assert_eq!(
+            tip_miss(&slot, &new_entries, 200),
+            Some(TipMiss {
+                tip: ep(259),
+                diverge_at: 258,
+                in_turn: true
+            }),
+        );
+    }
+
+    /// A tip is only missed by a call that continues past it: a
+    /// resample (same prompt) or a rewind is not a miss, and a
+    /// divergence before the turn is a changed history.
+    #[test]
+    fn tip_miss_needs_a_continuation() {
+        let mut slot = hashed_slot(260, vec![], Some(bp(259, None)));
+        slot.turn_start = 200;
+        let resample = seq_entries(200);
+        assert_eq!(tip_miss(&slot, &resample, 0), None);
+        let reached = seq_entries(300);
+        assert_eq!(tip_miss(&slot, &reached, 259), None);
+        let mut edited = seq_entries(300);
+        edited[120] = CacheEntry::Token(9999);
+        assert_eq!(
+            tip_miss(&slot, &edited, 0),
+            Some(TipMiss {
+                tip: ep(259),
+                diverge_at: 120,
+                in_turn: false
+            }),
+        );
+    }
+
+    /// The divergence context: shared text before, then each side.
+    #[test]
+    fn divergence_context_shows_both_sides() {
+        let cached = toks([1, 2, 3, 4]);
+        let new_ = toks([1, 2, 7, 8, 9]);
+        let piece = |t: Token| format!("<{t}>");
+        assert_eq!(
+            divergence_context(&cached, &new_, 2, piece),
+            ("<1><2>".into(), "<3><4>".into(), "<7><8><9>".into()),
+        );
+    }
+
+    /// [`emission_divergence`]: where a re-render parts from the
+    /// generated bytes.
+    #[test]
+    fn emission_divergence_finds_the_first_differing_byte() {
+        let prompt = "P|";
+        assert_eq!(emission_divergence("P|abc<end>", prompt, "abc"), None);
+        assert_eq!(emission_divergence("P|abc<end>", prompt, "abc\n"), Some(3));
+        assert_eq!(emission_divergence("Q|abc<end>", prompt, "abc"), Some(0));
+        let (before, after) = around("héllo", 2, 1);
+        assert_eq!((before, after), ("h", "é"));
+    }
+
+    /// Regression for the 2026-09-30 live tip drop (Qwen3.6-35B-A3B,
+    /// stock template — no baked replacement): the stock template
+    /// `trim`s an assistant turn's answer and thought when it
+    /// re-renders them, so any turn the model ends with whitespace, or
+    /// whose thought ends in a blank line, re-renders shorter than it
+    /// was generated. The KV holds the emission; the next request's
+    /// render lacks those bytes; the LCP stops just short of the tip
+    /// and the whole turn re-prefills. Pinned against the dumped
+    /// template (byte-identical to the served GGUF's), through the same
+    /// parse the session runs, so a baked Qwen template that fixes it
+    /// flips these assertions rather than passing silently.
+    #[test]
+    fn qwen36_stock_template_trims_the_emission_it_reingests() {
+        use crate::{
+            prompt::{Message, Role},
+            ChatTemplate, Content, RenderOptions,
+        };
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/templates/qwen3.6-gguf.jinja"
+        ));
+        let eos = "<|im_end|>";
+        let template = ChatTemplate::from_source(
+            source.to_owned(),
+            String::new(),
+            eos.to_owned(),
+        )
+        .expect("template compiles");
+        let syntax =
+            crate::dialect::analyze_template(source, "", eos).expect("analyze");
+        let base = Prompt {
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::text("Who checks the fog signal?"),
+            }],
+            ..Prompt::default()
+        };
+        // Where the round trip parts, for one emission, as the session
+        // measures it: the generation prompt, the emission parsed to
+        // blocks, the turn re-rendered.
+        let diverge = |thinking: bool, emission: &str| {
+            let opts = RenderOptions::default()
+                .with_extra("preserve_thinking", true)
+                .with_extra("enable_thinking", thinking)
+                .with_thought_reingest(syntax.reasoning.reingest)
+                .with_reasoning_start(syntax.reasoning.start.clone());
+            let prompt = template
+                .render_with(&base, &opts.clone().with_generation_prompt(true))
+                .expect("render");
+            let blocks = crate::dialect::parse_text(
+                &syntax,
+                &[],
+                emission,
+                thinking,
+                crate::dialect::Leniency::Final,
+            )
+            .blocks;
+            let mut turn = base.clone();
+            turn.messages.push(Message {
+                role: Role::Assistant,
+                content: Content(blocks),
+            });
+            let extended = template
+                .render_with(&turn, &opts.with_generation_prompt(false))
+                .expect("render");
+            emission_divergence(&extended, &prompt, emission)
+        };
+        // Controls: the habitual shapes round-trip.
+        assert_eq!(diverge(false, "Ada checks it."), None);
+        assert_eq!(
+            diverge(true, "The user asks.\n</think>\n\nAda checks it."),
+            None
+        );
+        // A trailing newline on the answer: trimmed away.
+        assert_eq!(diverge(false, "Ada checks it.\n"), Some(14));
+        assert_eq!(
+            diverge(true, "Thinking.\n</think>\n\nAda checks it.\n"),
+            Some(34)
+        );
+        // A leading newline on the answer: trimmed away.
+        assert_eq!(diverge(false, "\nAda checks it."), Some(0));
+        // A blank line closing the thought: one newline survives.
+        assert_eq!(
+            diverge(true, "The user asks.\n\n</think>\n\nAda."),
+            Some(15)
+        );
+    }
+
+    /// Every event emitted on this thread while `f` runs, as its level
+    /// and its fields, `Debug`-formatted.
+    fn capture_events(
+        f: impl FnOnce(),
+    ) -> Vec<(tracing::Level, Vec<(String, String)>)> {
+        use std::sync::{Arc, Mutex};
+        type Events = Arc<Mutex<Vec<(tracing::Level, Vec<(String, String)>)>>>;
+        struct Capture(Events);
+        struct Fields(Vec<(String, String)>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                self.0.push((field.name().to_owned(), format!("{value:?}")));
+            }
+            fn record_str(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &str,
+            ) {
+                self.0.push((field.name().to_owned(), value.to_owned()));
+            }
+        }
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(
+                &self,
+                _: &tracing::span::Attributes<'_>,
+            ) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(
+                &self,
+                _: &tracing::span::Id,
+                _: &tracing::span::Record<'_>,
+            ) {
+            }
+            fn record_follows_from(
+                &self,
+                _: &tracing::span::Id,
+                _: &tracing::span::Id,
+            ) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut fields = Fields(Vec::new());
+                event.record(&mut fields);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), fields.0));
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let events: Events = Arc::default();
+        tracing::subscriber::with_default(Capture(Arc::clone(&events)), f);
+        let events = events.lock().unwrap().clone();
+        events
+    }
+
+    /// The value of `field` in a captured event's fields.
+    fn field<'e>(
+        fields: &'e [(String, String)],
+        name: &str,
+    ) -> Option<&'e str> {
+        fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// An unstable emission is logged as a `cache_degrade`, with the
+    /// byte it parts at and both sides of it — `WARN` when the turn is
+    /// long enough to matter, `INFO` otherwise; a stable one is silent.
+    #[test]
+    fn unstable_emission_is_logged_at_a_level_by_its_cost() {
+        let events = capture_events(|| {
+            log_unstable_emission("P|abc<end>", "P|", "abc\n", 7364);
+            log_unstable_emission("P|abc<end>", "P|", "abc\n", 3);
+            log_unstable_emission("P|abc<end>", "P|", "abc", 7364);
+        });
+        let levels: Vec<_> = events.iter().map(|(level, _)| *level).collect();
+        assert_eq!(levels, [tracing::Level::WARN, tracing::Level::INFO]);
+        let (_, fields) = &events[0];
+        assert_eq!(field(fields, "event"), Some("cache_degrade"));
+        assert_eq!(field(fields, "reason"), Some("emission_not_byte_stable"));
+        assert_eq!(field(fields, "diverge_byte"), Some("3"));
+        assert_eq!(field(fields, "emitted"), Some("\n"));
+        assert_eq!(field(fields, "rerendered"), Some("<end>"));
     }
 
     /// The emit-side ban set on a real vocab (Qwen 3.6): turn-open

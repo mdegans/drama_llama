@@ -55,6 +55,22 @@ impl SnapshotStore {
                 break;
             };
             self.map.remove(&oldest);
+            // A restore target is gone: the cache anchor that sat here
+            // now restores only through a lower one (Session's restore
+            // ladder), so this is a future miss worth a line.
+            tracing::warn!(
+                target: "drama_llama::snapshot_store",
+                event = "cache_degrade",
+                reason = "snapshot_evicted",
+                seq_id = oldest.0,
+                pos = oldest.1,
+                cap = self.cap,
+                "snapshot store over its cap of {}; dropped the oldest \
+                 snapshot (seq {}, pos {})",
+                self.cap,
+                oldest.0,
+                oldest.1,
+            );
         }
     }
 
