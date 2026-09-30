@@ -349,7 +349,8 @@ fn file_call(
     // Relay guard (#37 residual): the grammar forces the call's
     // SHAPE, but frame-marker bytes are legal inside argument
     // strings, and this text is about to be rendered into other
-    // seats' prompts — where ingest would reject it. Scan at the
+    // seats' prompts. Ingest would read it as text, but a filing that
+    // spells framing is still a malformed filing here: scan at the
     // source and adjourn naming the author.
     for (field, text) in
         [("analysis", &filing.analysis), ("verdict", &filing.verdict)]
