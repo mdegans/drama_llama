@@ -244,7 +244,8 @@ same-session control.
 `<tool_call>` inside a string. Ingest re-tokenizes with `parse_special`
 and rejects it identically, so relay boundaries still need their own
 policy. The ban removes the single-token path, which is the one the
-model actually takes.
+model actually takes. (2026-10-01: ingest now reads a spelled piece as
+text, and the parser does too — `emission_provenance.md`.)
 
 **Also ruled out while diagnosing this** — recorded so nobody re-derives
 it. #61's "Options" section proposes aligning the parser's value

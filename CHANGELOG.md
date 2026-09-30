@@ -64,15 +64,56 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Emission containment (`EmittedSpecialToken`) now rejects only a
     piece the model emitted as the *real* token into free text; one it
     merely spelled (an agent quoting a post) passes, since the next
-    ingest reads it as text. A spelled piece the parser reads as
-    *framing* — a typed-out `<tool_call>` parsed as a call — is the
-    parser-provenance gap, left for a follow-up. **This change makes
-    that gap reachable:** a transcript quoting
+    ingest reads it as text.
+  - **The model's output is parsed with emission provenance**, which
+    closes the hole the change above opens. A transcript quoting
     `<tool_call>{…}</tool_call>` used to be a 400, so the model never
-    read it; now it reads the spelled markup, can copy it into its own
-    output, and the text-level parser can seat the copy as a real
-    `ToolUse`. The count in containment cannot see it, since the
-    parser consumes the spelled piece as framing.
+    read it; now it reads the spelled markup and can copy it into its
+    own output, where a text-level parse would seat the copy as a real
+    `ToolUse` (or a copied `<think>` as a `Thought`) — tool-call
+    injection from content. `Session` knows the id behind every
+    emitted piece, so every reserved piece the model *spelled* in
+    ordinary tokens is swapped for an opaque marker before the dialect
+    parser sees it and swapped back in the parsed blocks: only framing
+    emitted as the real reserved token is structure. That covers
+    `complete_blocks` / `complete` / `complete_response`,
+    `complete_stream` (a piece spelled across several tokens is held
+    back until it completes or cannot), the stop-sequence parse of all
+    of them and `complete_text`'s. The lazy tool-call grammar arms
+    only on a trigger whose reserved pieces are real tokens
+    (`PiecePredictor::with_reserved`), so a spelled `<tool_call>` no
+    longer drags the rest of the turn into call syntax; the same goes
+    for `output_config`'s `</think>` trigger. Containment reads the
+    unrestored parse, so it is exact now rather than a count. A spelled
+    piece re-renders byte-identically (it is a content literal on the
+    next ingest), so the auto-tip is unaffected.
+
+    **Protected** wherever the framing is a reserved special in the
+    loaded vocabulary, which is per vocabulary, not per dialect.
+    Measured 2026-10-01 (vocab-only loads): Qwen 3.6 / 3.8 call and
+    reasoning markers (`<tool_call>`, `</tool_call>`, `<think>`,
+    `</think>`); every gpt-oss Harmony header token; Gemma 4's
+    `<|tool_call>`, `<tool_call|>`, `<|"|>` and channel markers;
+    Mistral 4's `[TOOL_CALLS]`, `[ARGS]`, `[THINK]`, `[/THINK]`; and
+    cogito-32b's `<tool_call>` / `</tool_call>`. **Not protected**
+    where framing is ordinary text: cogito-32b's `<think>` /
+    `</think>` (plain text in its Qwen 2.5 vocabulary), trigger-less
+    bare-JSON Llama 3.1, Hermes on a vocabulary without a `<tool_call>`
+    special, and markup *inside* a real call that is plain text (Qwen
+    XML's `<function=` / `<parameter=`, JSON's quotes), which reads by
+    bytes — as the grammar reads it. There, grammar-constrained
+    generation and `tool_choice` are the defense.
+    Two limits remain. The grammar is byte-level, so under an armed
+    grammar the model *can* spell a piece the grammar requires, and the
+    parse reads that piece as text: a forced call whose opener is
+    spelled is a `GrammarViolation` (a retry is warm), and a real
+    opener whose close is spelled either still parses, the close left
+    as text, or degrades and is contained — never a call the model did
+    not open with the real token. Models emit their own framing as the
+    token, so this is rare. And
+    `dialect::parse_text` / `StreamParser::push`, which see only text,
+    stay provenance-free: a caller parsing emission itself gets the
+    text reading.
   - Markers the model emits as real specials outside the dialect
     (Qwen-VL grounding's `<|box_start|>`, with
     `with_emit_specials_ban(false)`) re-ingest as text, not as ids.
