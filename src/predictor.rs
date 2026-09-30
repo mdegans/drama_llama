@@ -828,18 +828,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         mut options: PredictOptions,
         initial_state: Option<crate::SamplerState>,
     ) -> (crate::SamplerState, PredictOptions, usize) {
-        // Sizes the stop-string search window (`stop_window_start`) as
-        // well as the token-sequence one, so it has to cover the longest
-        // stop *string* in bytes: a window sized from token sequences
-        // alone (often just the one-token EOG stops) silently missed any
-        // stop string longer than `max_token_len` (#122).
-        let max_stop_len = options
-            .stop_sequences
-            .iter()
-            .map(|s| s.len())
-            .chain(options.stop_strings.iter().map(|s| s.len()))
-            .max()
-            .unwrap_or(0);
+        let max_stop_len = max_stop_len(&options);
 
         // A caller-provided state is authoritative: it resumes (or
         // freshly seeds) a prior stream — rng mid-sequence, carried
@@ -1046,6 +1035,22 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
 
         Some(next_token)
     }
+}
+
+/// How far back the stop searches must reach past the newest token: the
+/// longest stop, token sequences and stop strings alike. Sizes the
+/// stop-string window ([`stop_window_start`]), so it has to cover the
+/// longest stop *string* in bytes: a window sized from token sequences
+/// alone (often just the one-token EOG stops) silently missed any stop
+/// string longer than `max_token_len` (#122).
+fn max_stop_len(options: &PredictOptions) -> usize {
+    options
+        .stop_sequences
+        .iter()
+        .map(Vec::len)
+        .chain(options.stop_strings.iter().map(String::len))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Byte offset at which a stop-string search over `text` may begin: the
@@ -1619,6 +1624,32 @@ mod tests {
 
         // Degenerate: empty text, huge window.
         assert_eq!(super::stop_window_start("", 1000, 1000), 0);
+    }
+
+    /// #122: a stop string longer than the longest token is still
+    /// found. The window used to be sized from token sequences alone —
+    /// here the one-token EOG stop — and so reached back only a token's
+    /// worth of bytes, never the whole string.
+    #[test]
+    fn stop_window_covers_a_stop_longer_than_a_token() {
+        let stop = "\n\nHuman: and then";
+        let max_token_len = 4;
+        assert!(stop.len() > max_token_len);
+        let opts = PredictOptions::default()
+            .add_stop_sequence(vec![2])
+            .add_stop(stop.to_string());
+        assert_eq!(super::max_stop_len(&opts), stop.len());
+
+        let text = format!("{}{stop}", "lorem ipsum ".repeat(20));
+        let start =
+            super::stop_window_start(&text, super::max_stop_len(&opts), 4);
+        assert!(text[start..].contains(stop), "window: {:?}", &text[start..]);
+
+        // The old sizing: token sequences only.
+        let old = PredictOptions::default().add_stop_sequence(vec![2]);
+        let start =
+            super::stop_window_start(&text, super::max_stop_len(&old), 4);
+        assert!(!text[start..].contains(stop));
     }
 
     /// #122: the stop that ended generation is the one the text reached
