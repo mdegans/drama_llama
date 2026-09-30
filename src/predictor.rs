@@ -675,7 +675,36 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// scans all read `text`, so reassembling into it makes the bytes
     /// they scan the same bytes the model actually emitted.
     reassembler: Utf8Reassembler,
+    /// Emission provenance for the deferred-grammar trigger scan (see
+    /// [`Self::set_reserved`]); `None` scans bytes alone.
+    provenance: Option<TriggerProvenance>,
     pub(crate) inner: CandidatePredictor<'engine, B>,
+}
+
+/// What the trigger scan needs to tell a trigger the model emitted
+/// through real reserved tokens from one it spelled.
+struct TriggerProvenance {
+    reserved: std::sync::Arc<crate::LiteralNeutralizer>,
+    /// Byte ranges in `text` of the reserved tokens emitted, in order.
+    real: Vec<std::ops::Range<usize>>,
+    /// Per deferred trigger, the reserved pieces it contains, as byte
+    /// ranges within the trigger. Each must be a real token.
+    trigger_pieces: Vec<Vec<std::ops::Range<usize>>>,
+}
+
+impl TriggerProvenance {
+    /// Whether the occurrence of trigger `i` at `start` spells none of
+    /// its reserved pieces: each is exactly a real token's bytes.
+    fn is_real(&self, i: usize, start: usize) -> bool {
+        self.trigger_pieces.get(i).is_none_or(|pieces| {
+            pieces.iter().all(|piece| {
+                let span = start + piece.start..start + piece.end;
+                self.real
+                    .binary_search_by_key(&span.start, |r| r.start)
+                    .is_ok_and(|at| self.real[at] == span)
+            })
+        })
+    }
 }
 
 impl<'engine, B: Backend> TokenPredictor<'engine, B> {
@@ -701,6 +730,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             terminal_completed: false,
             stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
+            provenance: None,
             inner,
         }
     }
@@ -729,6 +759,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             terminal_completed: false,
             stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
+            provenance: None,
             inner,
         }
     }
@@ -738,6 +769,37 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     /// matcher progress through shared `Arc<Mutex<…>>` handles.
     pub fn sampler_state(&self) -> &crate::SamplerState {
         &self.state
+    }
+
+    /// Activate the deferred grammar only on a trigger whose reserved
+    /// pieces the model emitted as their real tokens — never on one it
+    /// spelled in ordinary tokens (a copy of markup it read in a post,
+    /// say), which is text. `reserved` is the vocabulary's reserved
+    /// pieces, as `Session` builds them. A trigger holding no reserved
+    /// piece matches on bytes alone, as without this: there is no
+    /// token to tell a spelling from. Call before the first token.
+    pub fn set_reserved(
+        &mut self,
+        reserved: std::sync::Arc<crate::LiteralNeutralizer>,
+    ) {
+        let trigger_pieces = self
+            .options
+            .sample_options
+            .deferred_grammar
+            .iter()
+            .flat_map(|spec| &spec.activate_after)
+            .map(|trigger| match std::str::from_utf8(trigger) {
+                Ok(trigger) => {
+                    reserved.find_iter(trigger).map(|(r, _)| r).collect()
+                }
+                Err(_) => Vec::new(),
+            })
+            .collect();
+        self.provenance = Some(TriggerProvenance {
+            reserved,
+            real: Vec::new(),
+            trigger_pieces,
+        });
     }
 
     /// True iff any constraint matcher — including an activated
@@ -916,6 +978,19 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         // and `into_text()` cannot disagree.
         let piece = self.reassembler.push(&self.inner.engine.model, next_token);
         self.text.push_str(&piece);
+        if let Some(provenance) = self.provenance.as_mut() {
+            // A reassembled piece can carry an earlier token's
+            // unfinished bytes ahead of this one's; the token's own
+            // piece is the tail.
+            if let Some(real) = provenance
+                .reserved
+                .piece(next_token)
+                .filter(|real| piece.ends_with(real))
+            {
+                let end = self.text.len();
+                provenance.real.push(end - real.len()..end);
+            }
+        }
 
         // Evaluate every stop condition against the just-sampled token,
         // BEFORE advancing the constraint matchers: a token that
@@ -996,11 +1071,13 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             self.options.sample_options.deferred_grammar.as_ref(),
             self.state.deferred_inactive(),
         ) {
+            let provenance = self.provenance.as_ref();
             if let Some((trigger_end, trigger_len)) =
                 find_any_deferred_trigger_end(
                     self.text.as_bytes(),
                     &spec.activate_after,
                     self.max_stop_len + self.inner.engine.model.max_token_len(),
+                    |i, start| provenance.is_none_or(|p| p.is_real(i, start)),
                 )
             {
                 // Lazy-pattern grammars start their root at the trigger
@@ -1130,10 +1207,22 @@ pub(crate) fn stop_string_holdback<S: AsRef<str>>(
 /// the first occurrence of `trigger` within the trailing `window` bytes of
 /// `haystack`. Mirrors the window sizing used for stop-strings so the
 /// per-step cost stays bounded even as `text` grows.
+#[cfg(test)]
 fn find_deferred_trigger_end(
     haystack: &[u8],
     trigger: &[u8],
     window: usize,
+) -> Option<usize> {
+    find_deferred_trigger_end_where(haystack, trigger, window, |_| true)
+}
+
+/// [`find_deferred_trigger_end`] over the occurrences `accept` takes,
+/// by start offset — the first occurrence may be one it refuses.
+fn find_deferred_trigger_end_where(
+    haystack: &[u8],
+    trigger: &[u8],
+    window: usize,
+    accept: impl Fn(usize) -> bool,
 ) -> Option<usize> {
     if trigger.is_empty() || trigger.len() > haystack.len() {
         return None;
@@ -1143,24 +1232,32 @@ fn find_deferred_trigger_end(
         .saturating_sub(window.saturating_add(trigger.len()));
     haystack[search_start..]
         .windows(trigger.len())
-        .position(|w| w == trigger)
-        .map(|rel| search_start + rel + trigger.len())
+        .enumerate()
+        .filter(|(_, w)| *w == trigger)
+        .map(|(rel, _)| search_start + rel)
+        .find(|&start| accept(start))
+        .map(|start| start + trigger.len())
 }
 
 /// Any-of variant over a trigger set: the earliest match wins (ties
 /// go to the longer trigger, so `<x> to=` beats ` to=`-style overlaps
 /// feeding the right byte count). Returns `(trigger_end,
-/// trigger_len)` for the winner.
+/// trigger_len)` for the winner. `accept` takes a trigger's index and
+/// an occurrence's start ([`TriggerProvenance::is_real`]).
 fn find_any_deferred_trigger_end(
     haystack: &[u8],
     triggers: &[Vec<u8>],
     window: usize,
+    accept: impl Fn(usize, usize) -> bool,
 ) -> Option<(usize, usize)> {
     triggers
         .iter()
-        .filter_map(|t| {
-            find_deferred_trigger_end(haystack, t, window)
-                .map(|end| (end, t.len()))
+        .enumerate()
+        .filter_map(|(i, t)| {
+            find_deferred_trigger_end_where(haystack, t, window, |start| {
+                accept(i, start)
+            })
+            .map(|end| (end, t.len()))
         })
         .min_by_key(|&(end, len)| (end - len, std::cmp::Reverse(len)))
 }
@@ -1237,6 +1334,15 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     /// Get the last token that was predicted.
     pub fn last_token(&self) -> Option<Token> {
         self.inner.inner.tokens.last().copied()
+    }
+
+    /// See [`TokenPredictor::set_reserved`].
+    pub fn with_reserved(
+        mut self,
+        reserved: std::sync::Arc<crate::LiteralNeutralizer>,
+    ) -> Self {
+        self.inner.set_reserved(reserved);
+        self
     }
 
     /// The live sampler run-state. See [`TokenPredictor::sampler_state`].
@@ -1678,6 +1784,25 @@ mod tests {
         let hay = b"<think>bla</think>\n  ";
         let got = super::find_deferred_trigger_end(hay, b"</think>", 64);
         assert_eq!(got, Some(b"<think>bla</think>".len()));
+    }
+
+    /// A refused occurrence (a spelled trigger) does not hide a later
+    /// one the scan accepts (the real trigger).
+    #[test]
+    fn find_deferred_trigger_end_skips_a_refused_occurrence() {
+        let hay = b"quote <x> then <x>{";
+        let got =
+            super::find_deferred_trigger_end_where(hay, b"<x>", 64, |at| {
+                at > 6
+            });
+        assert_eq!(got, Some(18));
+        let none = super::find_any_deferred_trigger_end(
+            hay,
+            &[b"<x>".to_vec()],
+            64,
+            |_, _| false,
+        );
+        assert_eq!(none, None);
     }
 
     #[test]
