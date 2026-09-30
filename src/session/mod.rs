@@ -4975,6 +4975,18 @@ impl<B: Backend> Session<B> {
                      the template corrupted a sentinel"
                 ))
             })?;
+        if crate::chat_template::has_transformed_marker(&split, sentinel) {
+            // Not an error: nothing special reaches the model, only the
+            // marker's text. But that text holds the per-call sentinel,
+            // so the prefix around it misses the cache on every call.
+            tracing::warn!(
+                target: "drama_llama::session",
+                event = "render_marker_transformed",
+                "a chat-template filter transformed a render marker (an \
+                 `| upper` on a schema value, say); the model reads the \
+                 marker as text and that prefix will never hit the cache",
+            );
+        }
         if split.markers.is_empty() {
             return Ok(plain(text));
         }

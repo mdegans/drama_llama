@@ -1803,6 +1803,37 @@ pub(crate) fn split_render<'a>(
     Ok(SplitRender { segments, markers })
 }
 
+/// Whether `split`'s text still holds `sentinel` in any letter case:
+/// a marker a template filter transformed so [`split_render`] could not
+/// see it (Gemma 4's cache-stable template applies `| upper` to schema
+/// `type` values, turning a marker there into `<HEX:T123>`; `| e` would
+/// escape its `<`). Safety holds — no special is emitted, the guard
+/// still passes — but the marker reaches the model as text, and since
+/// the sentinel is per call, that prefix misses the cache every call.
+#[cfg_attr(
+    not(any(
+        feature = "llama-cpp",
+        all(feature = "moeflux", target_os = "macos")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn has_transformed_marker(
+    split: &SplitRender<'_>,
+    sentinel: &str,
+) -> bool {
+    let needle = sentinel.as_bytes();
+    let Some(&first) = needle.first() else {
+        return false;
+    };
+    split.segments.iter().any(|segment| {
+        let hay = segment.as_bytes();
+        (0..hay.len().saturating_sub(needle.len() - 1)).any(|at| {
+            hay[at].eq_ignore_ascii_case(&first)
+                && hay[at..at + needle.len()].eq_ignore_ascii_case(needle)
+        })
+    })
+}
+
 /// Parse one marker body (what follows `<{sentinel}:`), returning the
 /// marker and the byte length consumed including the closing `>`.
 fn parse_marker(body: &str) -> Option<(RenderMarker, usize)> {
@@ -4444,6 +4475,30 @@ mod tests {
         // Sentinel-free text is one segment.
         let clean = split_render("no media here", sentinel).unwrap();
         assert_eq!(clean.segments, vec!["no media here"]);
+    }
+
+    /// A marker a template filter transformed is caught case-blind; a
+    /// clean split and a real marker are not.
+    #[test]
+    fn transformed_markers_are_detected() {
+        let sentinel = "0123456789abcdef0123456789abcdef";
+        let marker = literal_marker(sentinel, 302);
+        let clean = format!("{{\"type\": \"{marker}\"}}");
+        let split = split_render(&clean, sentinel).unwrap();
+        assert_eq!(split.markers.len(), 1);
+        assert!(!has_transformed_marker(&split, sentinel));
+        for render in [
+            clean.to_uppercase(),
+            clean.replace('<', "&lt;"),
+            format!("x {}", &sentinel.to_uppercase()[..]),
+        ] {
+            let split = split_render(&render, sentinel).unwrap();
+            assert!(split.markers.is_empty(), "{render}");
+            assert!(has_transformed_marker(&split, sentinel), "{render}");
+        }
+        let plain = split_render("no markers", sentinel).unwrap();
+        assert!(!has_transformed_marker(&plain, sentinel));
+        assert!(!has_transformed_marker(&plain, ""));
     }
 
     #[test]
