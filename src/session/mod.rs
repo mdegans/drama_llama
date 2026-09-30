@@ -6182,10 +6182,6 @@ impl<B: Backend> Session<B> {
         // reproduces. Overwritten every iteration, so on exit it
         // describes the last one.
         let mut uncommitted_bytes: usize = 0;
-        // Set when the loop below breaks on an exhausted grammar — a
-        // turn that *finished*, even if it did so on the last token of
-        // the budget, so `hit_token_limit` must not read it as a clip.
-        let mut halted = false;
 
         let mut predictor = if self.prefix_cache.is_some() {
             // Cache on: ALWAYS the resuming constructor — even at
@@ -6251,7 +6247,6 @@ impl<B: Backend> Session<B> {
             // parallel calls disabled the grammar is a single `call`,
             // whose accept is terminal — this halt, unchanged.
             if predictor.grammar_exhausted() {
-                halted = true;
                 break;
             }
         }
@@ -6259,7 +6254,7 @@ impl<B: Backend> Session<B> {
         // sampler state (tip promotion) before the predictor drops.
         let constraint_incomplete = predictor.constraint_incomplete_at_end();
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
-        let cut = Cut::of(&predictor, halted);
+        let cut = Cut::of(&predictor);
         drop(predictor);
         // A stop sequence is never part of the output (#122). Found
         // again in `raw_text` rather than trusting the predictor's
@@ -7288,18 +7283,31 @@ enum Cut {
 }
 
 impl Cut {
-    /// Read the cut off a predictor whose iteration has ended.
-    /// `halted`: the caller broke out on an exhausted grammar, so the
-    /// turn finished — even when it did so on the budget's last token.
+    /// Read the cut off a predictor whose iteration has ended (or that
+    /// the caller halted on an exhausted grammar). Both completion
+    /// paths read it here, so batch and stream agree on every ending.
     fn of<B: Backend>(
         predictor: &crate::PiecePredictor<'_, B>,
-        halted: bool,
     ) -> Option<Self> {
-        match predictor.stop_string() {
+        Self::classify(
+            predictor.stop_string(),
+            predictor.grammar_exhausted(),
+            predictor.hit_token_limit(),
+        )
+    }
+
+    /// A stop string is a cut; so is running out of budget, unless the
+    /// grammar was exhausted — that turn *finished*, even on the
+    /// budget's last token, so a forced call that fits exactly still
+    /// reads `ToolUse`.
+    fn classify(
+        stop: Option<&str>,
+        grammar_exhausted: bool,
+        out_of_budget: bool,
+    ) -> Option<Self> {
+        match stop {
             Some(stop) => Some(Self::StopSequence(stop.to_owned())),
-            None if !halted && predictor.hit_token_limit() => {
-                Some(Self::Budget)
-            }
+            None if out_of_budget && !grammar_exhausted => Some(Self::Budget),
             None => None,
         }
     }
@@ -7456,7 +7464,8 @@ fn infer_stop_reason(
 /// stream and never appears in it — prose that could still grow into
 /// one is held back until it can't (#122). A generation cut short
 /// (`max_tokens`, a stop sequence) withholds an incomplete trailing
-/// call instead of yielding its bytes as text (#121). Once drained,
+/// call instead of yielding its bytes as text (#121). Like the batch
+/// path, it halts once the grammar is exhausted. Once drained,
 /// [`Self::stop_reason`] reports the ending the batch path would.
 pub struct BlockStream<'engine, B: Backend> {
     predictor: crate::PiecePredictor<'engine, B>,
@@ -7511,9 +7520,7 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         self.drained = true;
         let rest = self.stops.finish();
         self.feed(&rest);
-        // `halted` is false: nothing here breaks out early — the
-        // predictor's own end is the stream's.
-        let cut = Cut::of(&self.predictor, false);
+        let cut = Cut::of(&self.predictor);
         // Final pass. Cut short: an incomplete trailing call is
         // withheld (`Leniency::Clipped`). Otherwise partial trailing
         // structures degrade to Text / Thought per the Final-leniency
@@ -7565,6 +7572,11 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                     self.generated += 1;
                     let ready = self.stops.push(&piece);
                     self.feed(&ready);
+                    // `run_call`'s one-shot halt, so both paths stop on
+                    // the same token: an exhausted grammar ends the turn.
+                    if self.predictor.grammar_exhausted() {
+                        self.drain();
+                    }
                 }
                 None => self.drain(),
             }
@@ -10001,6 +10013,21 @@ mod tests {
         );
         assert_eq!(reason, Some(StopReason::StopSequence));
         assert_eq!(seq.as_deref(), Some("###"));
+    }
+
+    /// The ending both paths read (`Cut::of`): a grammar exhausted on
+    /// the budget's last token is a finished turn, not a clip — the
+    /// stream used to miss that and report `MaxTokens` where the batch
+    /// path reported `ToolUse`.
+    #[test]
+    fn cut_classify_exhausted_grammar_is_not_a_clip() {
+        assert_eq!(Cut::classify(None, true, true), None);
+        assert_eq!(Cut::classify(None, false, true), Some(Cut::Budget));
+        assert_eq!(Cut::classify(None, false, false), None);
+        assert_eq!(
+            Cut::classify(Some("###"), true, false),
+            Some(Cut::StopSequence("###".into())),
+        );
     }
 
     /// Stop sequence matching — the matched string is returned as the

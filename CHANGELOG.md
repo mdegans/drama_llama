@@ -72,7 +72,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   surfaced open as under `Final`. Bare-JSON dialects are exempt — any
   `{` is their call landmark, so a clipped structured output keeps its
   text. A forced call that finishes on the budget's last token still
-  reports `ToolUse`. `GrammarViolation` remains for a constraint that
+  reports `ToolUse` — streamed too: `complete_stream` now halts on an
+  exhausted grammar as the batch path does, and reads the ending by
+  the same rule. `GrammarViolation` remains for a constraint that
   failed with budget to spare. A clipped turn whose KV no longer
   matches its output (call withheld, or cut mid-constraint) records
   its prompt extent but no auto-tip, leaving the generated span to the
