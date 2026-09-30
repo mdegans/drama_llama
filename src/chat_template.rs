@@ -1897,6 +1897,8 @@ pub struct LiteralNeutralizer {
     pieces: Vec<(Token, String)>,
     /// Token id → pattern index.
     by_id: std::collections::HashMap<Token, usize>,
+    /// Pattern indices in piece order, for [`Self::could_grow`].
+    sorted: Vec<usize>,
 }
 
 impl std::fmt::Debug for LiteralNeutralizer {
@@ -1937,10 +1939,13 @@ impl LiteralNeutralizer {
                 // thousand short strings at most.
                 .expect("reserved pieces fit an Aho-Corasick automaton")
         });
+        let mut sorted: Vec<usize> = (0..pieces.len()).collect();
+        sorted.sort_by(|&a, &b| pieces[a].1.cmp(&pieces[b].1));
         Self {
             matcher,
             pieces,
             by_id,
+            sorted,
         }
     }
 
@@ -1980,6 +1985,19 @@ impl LiteralNeutralizer {
                 (m.start()..m.end(), self.pieces[m.pattern().as_usize()].0)
             })
         })
+    }
+
+    /// Whether `tail` is a proper prefix of a reserved piece: text that
+    /// more bytes could still turn into one. The pieces starting with
+    /// `tail` sort contiguously from where `tail` itself would, and at
+    /// most the first of them equals it.
+    pub(crate) fn could_grow(&self, tail: &str) -> bool {
+        let piece = |i: usize| self.pieces[i].1.as_str();
+        let at = self.sorted.partition_point(|&i| piece(i) < tail);
+        self.sorted[at..]
+            .iter()
+            .take(2)
+            .any(|&i| piece(i).len() > tail.len() && piece(i).starts_with(tail))
     }
 
     /// Replace every reserved piece in `text` with its marker under

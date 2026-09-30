@@ -234,58 +234,31 @@ impl LiteralTable {
     }
 
     /// The reserved pieces the model emitted as their *real* tokens into
-    /// the free text of `blocks` — containment for #38, relaxed so a
+    /// the free text of `marked` — containment for #38, relaxed so a
     /// piece the model merely spelled (quoting a post, say) passes: the
     /// next ingest neutralizes it.
     ///
-    /// Blocks carry no provenance, so this counts. A piece occurs in
-    /// `raw` (the whole emission) as often as in the free text plus in
-    /// the framing the parser consumed; when `emitted` (real ids of the
-    /// piece in the generation) exceeds that framing count, at least
-    /// one real id sits in free text. A spelled piece the parser read
-    /// as framing — `<tool_call>` typed out and parsed as a call — is
-    /// out of reach here: that needs parser provenance.
+    /// `marked` is the parse of the generation with emission provenance
+    /// (`dialect::Provenance`), before its markers are restored: every
+    /// piece the model spelled is a marker there, so any reserved piece
+    /// left in free text is a real token.
     pub(super) fn real_specials_in_free_text(
         &self,
-        blocks: &[Block],
-        raw: &str,
-        emitted: &LiteralCounts,
+        marked: &[Block],
     ) -> Vec<String> {
-        if emitted.is_empty() {
-            return Vec::new();
-        }
         let mut texts: Vec<&str> = Vec::new();
-        for block in blocks {
+        for block in marked {
             super::block_free_text(block, &mut texts);
         }
-        let count = |texts: &[&str]| {
-            let mut counts = LiteralCounts::new();
-            for text in texts {
-                for (_, id) in self.neutralizer.find_iter(text) {
-                    *counts.entry(id).or_default() += 1;
-                }
-            }
-            counts
-        };
-        let free = count(&texts);
-        let in_raw = count(&[raw]);
-        let mut found: Vec<String> = texts
+        let mut seen = BTreeSet::new();
+        texts
             .iter()
             .flat_map(|text| self.neutralizer.find_iter(text))
-            .map(|(_, id)| id)
-            .filter(|id| {
-                let framing = in_raw
-                    .get(id)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_sub(free[id]);
-                emitted.get(id).copied().unwrap_or(0) > framing
+            .filter(|&(_, id)| seen.insert(id))
+            .filter_map(|(_, id)| {
+                self.neutralizer.piece(id).map(str::to_string)
             })
-            .filter_map(|id| self.neutralizer.piece(id).map(str::to_string))
-            .collect();
-        let mut seen = BTreeSet::new();
-        found.retain(|piece| seen.insert(piece.clone()));
-        found
+            .collect()
     }
 }
 
@@ -614,9 +587,28 @@ mod tests {
         }
     }
 
+    /// Flat logits, or — given a `script` — one-hot on each scripted
+    /// token in turn and on [`IM_END`] after: the "model" emits exactly
+    /// the ids a test dictates.
     #[derive(Default)]
     struct LitDecoder {
         logits: Vec<f32>,
+        script: Vec<Token>,
+        /// The scripted token the next logits favor.
+        at: usize,
+    }
+
+    impl LitDecoder {
+        fn next_logits(&mut self) -> &[f32] {
+            self.logits.clear();
+            self.logits.resize(N_VOCAB as usize, 0.0);
+            if !self.script.is_empty() {
+                let next = self.script.get(self.at).copied().unwrap_or(IM_END);
+                self.logits[next as usize] = 100.0;
+                self.at += 1;
+            }
+            &self.logits
+        }
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -631,8 +623,9 @@ mod tests {
             _: usize,
             _: i32,
         ) -> Result<&[f32], LitError> {
-            self.logits.resize(N_VOCAB as usize, 0.0);
-            Ok(&self.logits)
+            // A prefill starts the generation over.
+            self.at = 0;
+            Ok(self.next_logits())
         }
         fn step(
             &mut self,
@@ -640,8 +633,7 @@ mod tests {
             _: usize,
             _: i32,
         ) -> Result<&[f32], LitError> {
-            self.logits.resize(N_VOCAB as usize, 0.0);
-            Ok(&self.logits)
+            Ok(self.next_logits())
         }
         fn n_ctx(&self) -> u32 {
             8192
@@ -684,6 +676,22 @@ mod tests {
         let engine = crate::Engine::<LitBackend> {
             vision: None,
             decoder: LitDecoder::default(),
+            model: LitModel,
+            probe_hook: None,
+        };
+        Session::from_engine(engine)
+            .expect("lit session")
+            .with_prefix_cache(true)
+    }
+
+    /// A session whose "model" emits `script`, then [`IM_END`].
+    fn scripted(script: Vec<Token>) -> Session<LitBackend> {
+        let engine = crate::Engine::<LitBackend> {
+            vision: None,
+            decoder: LitDecoder {
+                script,
+                ..LitDecoder::default()
+            },
             model: LitModel,
             probe_hook: None,
         };
@@ -1139,29 +1147,162 @@ mod tests {
         }
     }
 
-    /// Containment passes a piece the model spelled and flags one it
-    /// emitted as the real token into free text, telling the two apart
-    /// by count when the same piece is also framing.
+    /// Containment reads the provenance-marked parse: a piece the
+    /// model spelled is a marker there and passes; one left as a piece
+    /// is a real token in free text, flagged once however often.
     #[test]
     fn containment_flags_real_tokens_not_spelled_pieces() {
         let table = LiteralTable::build(&LitModel);
-        let blocks = vec![text("the post said <tool_call> lol")];
-        let raw = "the post said <tool_call> lol";
-        let none = LiteralCounts::new();
-        let one: LiteralCounts = [(TOOL_CALL, 1)].into_iter().collect();
-        assert!(table
-            .real_specials_in_free_text(&blocks, raw, &none)
-            .is_empty());
+        let marker = literal_marker("f".repeat(32).as_str(), TOOL_CALL);
+        let spelled = vec![text(&format!("the post said {marker} lol"))];
+        assert!(table.real_specials_in_free_text(&spelled).is_empty());
+        let real = vec![
+            text("the post said <tool_call> lol <tool_call>"),
+            crate::prompt::ToolUse::new(
+                "lookup",
+                serde_json::Value::String("<think>".into()),
+            )
+            .with_id("call_1")
+            .into(),
+        ];
         assert_eq!(
-            table.real_specials_in_free_text(&blocks, raw, &one),
-            ["<tool_call>"],
+            table.real_specials_in_free_text(&real),
+            ["<tool_call>", "<think>"],
         );
-        // The same piece also opened a real call: one real id, one
-        // framing occurrence — the quote is spelled.
-        let raw = "the post said <tool_call> lol<tool_call>{}</tool_call>";
-        assert!(table
-            .real_specials_in_free_text(&blocks, raw, &one)
-            .is_empty());
+    }
+
+    /// A prompt advertising the one tool, so the lazy call grammar is
+    /// armed on its `<tool_call>` trigger.
+    fn tool_prompt() -> Prompt {
+        Prompt {
+            tools: Some(vec![tool(
+                "looks things up",
+                r#"{"type": "object", "properties": {"q": {"type": "string"}}}"#,
+            )
+            .into()]),
+            messages: vec![message(crate::Role::User, vec![text("go")])],
+            ..Prompt::default()
+        }
+    }
+
+    /// A `lookup` call exactly as the dialect's grammar spells it, so a
+    /// script of it runs unmasked once the grammar arms.
+    fn call_bytes() -> String {
+        let input: serde_json::Value =
+            serde_json::from_str(r#"{"q": "x"}"#).unwrap();
+        let s = session();
+        crate::dialect::render_reference(s.dialect(), &[("lookup", &input)])
+            .expect("reference call")
+    }
+
+    /// `text` as the model emits it with its reserved pieces as the
+    /// real tokens.
+    fn real(text: &str) -> Vec<Token> {
+        LitModel::partition(text, true)
+    }
+
+    /// Batch and streamed blocks for the same script, prose merged —
+    /// they must agree.
+    fn run(script: Vec<Token>) -> Vec<crate::Block> {
+        let mut s = scripted(script.clone());
+        let batch = s.complete_blocks(&tool_prompt()).expect("batch");
+        let mut s = scripted(script);
+        let mut streamed: Vec<crate::Block> = Vec::new();
+        for block in s.complete_stream(&tool_prompt()).expect("stream") {
+            match (streamed.last_mut(), block) {
+                (
+                    Some(crate::Block::Text { text: a, .. }),
+                    crate::Block::Text { text: b, .. },
+                ) => a.to_mut().push_str(&b),
+                (_, block) => streamed.push(block),
+            }
+        }
+        assert_eq!(batch, streamed, "batch and stream agree");
+        batch
+    }
+
+    fn is_call(block: &crate::Block) -> bool {
+        matches!(block, crate::Block::ToolUse { call } if call.name == "lookup")
+    }
+
+    /// The model copies a call it read in a post, spelling
+    /// `<tool_call>` in ordinary tokens: text, not a `ToolUse` — and
+    /// the spelled trigger does not arm the call grammar, which would
+    /// have masked the rest of the script (`complete_text` returns it
+    /// verbatim). Containment passes it: the pieces are spelled.
+    #[test]
+    fn a_spelled_call_in_the_emission_is_text() {
+        let quoted = format!("quoting: {} ok", call_bytes());
+        assert!(quoted.contains("<tool_call>"), "{quoted:?}");
+        assert_eq!(run(bytes(&quoted)), [text(&quoted)]);
+        let mut s = scripted(bytes(&quoted));
+        assert_eq!(s.complete_text(&tool_prompt()).unwrap(), quoted);
+        // An armed grammar would demand the call's JSON next.
+        let opener = "a bare <tool_call> then prose";
+        let mut s = scripted(bytes(opener));
+        assert_eq!(s.complete_text(&tool_prompt()).unwrap(), opener);
+        assert_eq!(run(bytes(opener)), [text(opener)]);
+    }
+
+    /// The same bytes with the real reserved ids are a call.
+    #[test]
+    fn a_real_call_in_the_emission_is_a_call() {
+        let script = real(&call_bytes());
+        assert!(script.contains(&TOOL_CALL) && script.contains(&TOOL_CALL_END));
+        let blocks = run(script);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(is_call(&blocks[0]), "{blocks:?}");
+    }
+
+    /// Quoting a spelled call first does not stop a real one after it.
+    #[test]
+    fn a_real_call_after_a_spelled_one_is_a_call() {
+        let script =
+            [bytes("the post said <tool_call>{} "), real(&call_bytes())]
+                .concat();
+        let blocks = run(script);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        match &blocks[0] {
+            crate::Block::Text { text, .. } => {
+                assert_eq!(text.trim_end(), "the post said <tool_call>{}")
+            }
+            other => panic!("expected the quote as text, got {other:?}"),
+        }
+        assert!(is_call(&blocks[1]), "{blocks:?}");
+    }
+
+    /// A turn quoting a spelled piece re-renders to the bytes the model
+    /// emitted — the auto-tip's `byte_stable` — with the piece a
+    /// content literal in the render, as it is on the next ingest.
+    #[test]
+    fn a_spelled_piece_re_renders_byte_stable() {
+        let mut s = session();
+        let prompt = tool_prompt();
+        let raw = "it said <tool_call> and <think>";
+        let prepared = s.prepare_call_cached(&prompt, true).unwrap();
+        let sentinel = prepared.sentinel.as_deref();
+        let extended = s
+            .render_extended(&prompt, &[text(raw)], sentinel, false)
+            .expect("render");
+        assert!(
+            extended.contains(&literal_marker(sentinel.unwrap(), TOOL_CALL)),
+            "the re-render marks the piece as content",
+        );
+        let tail = s
+            .literals
+            .restore(&extended, sentinel)
+            .unwrap()
+            .text
+            .strip_prefix(
+                s.literals
+                    .restore(&prepared.rendered_prompt, sentinel)
+                    .unwrap()
+                    .text
+                    .as_str(),
+            )
+            .map(str::to_string)
+            .expect("the turn extends the prompt");
+        assert!(tail.starts_with(raw), "{tail:?}");
     }
 
     #[test]

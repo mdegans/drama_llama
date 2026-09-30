@@ -45,6 +45,7 @@ use crate::Tool;
 use super::partial::{
     marker_holdback, read_partial, unclosed_json, Flavor, OpenStrings,
 };
+use super::provenance::Provenance;
 use super::{harmony, CallSyntax, Family, ReasoningMode};
 
 /// Whether the parse saw a complete structure or ran out of input
@@ -156,6 +157,10 @@ pub struct StreamParser {
     text_bytes_emitted: usize,
     /// The call the last re-parse ended inside, if any.
     open: Option<OpenCall>,
+    /// When set, `text` is the generation with every reserved piece it
+    /// *spelled* marked (see [`Provenance`]); what the parser yields is
+    /// restored. `None` parses the text as it stands.
+    provenance: Option<Provenance>,
 }
 
 impl StreamParser {
@@ -172,13 +177,40 @@ impl StreamParser {
             stable_blocks: 0,
             text_bytes_emitted: 0,
             open: None,
+            provenance: None,
         }
+    }
+
+    /// Parse with emission provenance: only framing the model emitted
+    /// as a real reserved token is structure, and a reserved piece it
+    /// spelled in ordinary tokens is text (see [`Provenance`]). Feed it
+    /// with [`Self::push_token`]; [`Self::push`] then reads every piece
+    /// as ordinary.
+    pub(crate) fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 
     /// Feed one decoded piece; returns every block (or prose delta)
     /// newly resolved by it.
     pub fn push(&mut self, piece: &str) -> Vec<Block> {
-        self.text.push_str(piece);
+        self.push_token(piece, None)
+    }
+
+    /// [`Self::push`], with the token that produced `piece` — what
+    /// provenance keys on. Without provenance the token is ignored.
+    pub(crate) fn push_token(
+        &mut self,
+        piece: &str,
+        token: Option<crate::Token>,
+    ) -> Vec<Block> {
+        match self.provenance.as_mut() {
+            Some(provenance) => {
+                let settled = provenance.push(piece, token);
+                self.text.push_str(&settled);
+            }
+            None => self.text.push_str(piece),
+        }
         self.reparse(Leniency::Streaming)
     }
 
@@ -186,7 +218,17 @@ impl StreamParser {
     /// degrade per [`Leniency::Final`] and held-back marker-prefix
     /// bytes are released.
     pub fn finish(&mut self) -> Vec<Block> {
+        self.settle();
         self.reparse(Leniency::Final)
+    }
+
+    /// End of input: provenance's held tail can no longer grow into a
+    /// spelled piece, so it joins the text as it stands.
+    fn settle(&mut self) {
+        if let Some(provenance) = self.provenance.as_mut() {
+            let tail = provenance.finish();
+            self.text.push_str(&tail);
+        }
     }
 
     /// Flush a generation that was cut short (`max_tokens`, a stop
@@ -195,6 +237,7 @@ impl StreamParser {
     /// instead of degrading to text; everything else flushes as
     /// [`Self::finish`] would.
     pub fn finish_clipped(&mut self) -> Vec<Block> {
+        self.settle();
         self.reparse(Leniency::Clipped)
     }
 
@@ -292,7 +335,10 @@ impl StreamParser {
             self.pre_opened_reasoning,
             leniency,
         );
-        self.open = open;
+        self.open = match &self.provenance {
+            Some(provenance) => open.map(|o| provenance.restore_open(o)),
+            None => open,
+        };
         let blocks = parsed.blocks;
         let last = blocks.len().saturating_sub(1);
         let mut out = Vec::new();
@@ -307,17 +353,22 @@ impl StreamParser {
                     // grow (or its tail may become a marker), so under
                     // Streaming yield only the safe delta and keep the
                     // block open; under Final flush it whole.
-                    let end = if open_tail {
+                    let mut end = if open_tail {
                         text.len() - self.landmark_holdback(&text)
                     } else {
                         text.len()
                     };
+                    // A delta is restored on its own, so it must hold
+                    // whole markers.
+                    if let Some(provenance) = &self.provenance {
+                        end = provenance.cut_before_marker(&text, end);
+                    }
                     if end > self.text_bytes_emitted {
-                        out.push(
-                            text[self.text_bytes_emitted..end]
-                                .to_string()
-                                .into(),
-                        );
+                        let delta = &text[self.text_bytes_emitted..end];
+                        out.push(match &self.provenance {
+                            Some(p) => p.restore(delta).into_owned().into(),
+                            None => delta.to_string().into(),
+                        });
                         self.text_bytes_emitted = end;
                     }
                     if !open_tail {
@@ -329,7 +380,10 @@ impl StreamParser {
                 // marker has been consumed — they cannot change on a
                 // longer re-parse. Yield immediately.
                 other => {
-                    out.push(other);
+                    out.push(match &self.provenance {
+                        Some(provenance) => provenance.restore_block(other),
+                        None => other,
+                    });
                     self.stable_blocks = i + 1;
                     self.text_bytes_emitted = 0;
                 }

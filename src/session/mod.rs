@@ -4644,19 +4644,23 @@ impl<B: Backend> Session<B> {
 
     /// The containment predicate (#38 defect 3): the distinct reserved
     /// pieces the model emitted *as their real token* into the free
-    /// text of `blocks`, in order of first occurrence — empty means
-    /// clean. `raw` is the whole emission and `emitted` the reserved
-    /// ids among its tokens; see
-    /// `LiteralTable::real_specials_in_free_text`. A piece the model
-    /// only spelled passes: the next ingest neutralizes it.
-    fn scan_blocks_for_specials(
-        &self,
-        blocks: &[crate::Block],
-        raw: &str,
-        emitted: &crate::chat_template::LiteralCounts,
-    ) -> Vec<String> {
-        self.literals
-            .real_specials_in_free_text(blocks, raw, emitted)
+    /// text of `marked`, in order of first occurrence — empty means
+    /// clean. `marked` is the provenance-marked parse, before restoring
+    /// (see `LiteralTable::real_specials_in_free_text`). A piece the
+    /// model only spelled passes: the next ingest neutralizes it.
+    fn scan_blocks_for_specials(&self, marked: &[crate::Block]) -> Vec<String> {
+        self.literals.real_specials_in_free_text(marked)
+    }
+
+    /// Emission provenance for one generation: which reserved pieces
+    /// the model *spelled* rather than emitted as their tokens, so the
+    /// parse reads those as text (see [`crate::dialect`]'s
+    /// `Provenance`). Its markers use a fresh sentinel.
+    fn provenance(&self) -> crate::dialect::Provenance {
+        crate::dialect::Provenance::new(
+            self.literals.neutralizer.clone(),
+            generate_call_sentinel(),
+        )
     }
 
     /// The ingest guard, as a bug detector (see
@@ -6461,10 +6465,18 @@ impl<B: Backend> Session<B> {
                     parse_syntax.clone(),
                     parse_tools.clone(),
                     pre_opened_reasoning,
-                ),
+                )
+                .with_provenance(self.provenance()),
                 stops.clone(),
             )
         });
+        // The generation, with every reserved piece it spelled marked:
+        // what the stop cut parses, so a spelled `<tool_call>` reads as
+        // text there as it does in `run_call` (see `Provenance`). The
+        // output is its restoration — the raw bytes.
+        let mut provenance = self.provenance();
+        let mut marked = String::new();
+        let reserved = self.literals.neutralizer.clone();
 
         // Count pieces as we consume them — one piece equals one
         // generated token before any post-hoc stop-string trimming
@@ -6473,7 +6485,6 @@ impl<B: Backend> Session<B> {
         // prompt for the next call's `compute_l_hit` walk; see
         // [`PrefixSlot::tip`] for the design.
         let mut generated_count: usize = 0;
-        let mut text = String::new();
         let cache_on = self.prefix_cache.is_some();
         // Only populated when caching is on (see above); starts empty
         // either way.
@@ -6497,7 +6508,8 @@ impl<B: Backend> Session<B> {
                 predict_opts,
                 Some(initial_state),
             )
-        };
+        }
+        .with_reserved(reserved);
         while let Some(piece) = predictor.next() {
             if cache_on {
                 let token = predictor.last_token().unwrap_or(-1);
@@ -6506,10 +6518,10 @@ impl<B: Backend> Session<B> {
                 }
             }
             generated_count += 1;
-            text.push_str(&piece);
+            marked.push_str(&provenance.push(&piece, predictor.last_token()));
             if let Some(filter) = stop_filter.as_mut() {
                 if !eos_pieces.contains(&piece) {
-                    filter.push(&piece);
+                    filter.push(&piece, predictor.last_token());
                 }
                 if filter.hit().is_some() {
                     break;
@@ -6540,7 +6552,12 @@ impl<B: Backend> Session<B> {
         // (no hash), which compares token ids, so the stop's leading
         // tokens sitting in KV cannot be spliced under a render without
         // them.
-        let mut trimmed = trim_eos(&text, &self.engine).to_string();
+        //
+        // The cut is found in the marked generation, whose markers never
+        // split (a prefix ending inside one parses to other text), and
+        // the output is its restoration: the raw bytes, cut.
+        marked.push_str(&provenance.finish());
+        let mut trimmed = trim_eos(&marked, &self.engine).to_string();
         let hit = stop_filter.as_mut().and_then(|f| {
             f.finish(clipped);
             f.hit().map(str::to_owned)
@@ -6548,13 +6565,13 @@ impl<B: Backend> Session<B> {
         if let Some(hit) = hit {
             let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
             let parse = |prefix: &str| {
-                crate::dialect::parse_text_open(
+                provenance.restore_parse(crate::dialect::parse_text_open(
                     &parse_syntax,
                     &tool_refs,
                     prefix,
                     pre_opened_reasoning,
                     crate::dialect::Leniency::Clipped,
-                )
+                ))
             };
             // A prefix withholding a structure in flight, with no call
             // to show for it, is not where any stop fell.
@@ -6571,6 +6588,7 @@ impl<B: Backend> Session<B> {
                 trimmed.truncate(at);
             }
         }
+        let trimmed = provenance.restore(&trimmed).into_owned();
 
         // Auto-tip: extend `prev_tokens` past the prompt with the
         // generated content **including the recorded-but-uncommitted
@@ -6814,6 +6832,8 @@ impl<B: Backend> Session<B> {
             .cloned()
             .collect();
         let max_tokens = predict_opts.n;
+        let provenance = self.provenance();
+        let reserved = self.literals.neutralizer.clone();
 
         let predictor = if self.prefix_cache.is_some() {
             // Cache on: ALWAYS the resuming constructor — even at
@@ -6834,7 +6854,8 @@ impl<B: Backend> Session<B> {
                 predict_opts,
                 Some(initial_state),
             )
-        };
+        }
+        .with_reserved(reserved);
         Ok(BlockStream {
             predictor,
             filter: stop::StopFilter::new(
@@ -6842,7 +6863,8 @@ impl<B: Backend> Session<B> {
                     syntax,
                     tools,
                     pre_opened_reasoning,
-                ),
+                )
+                .with_provenance(provenance),
                 stop::request_stops(prompt),
             ),
             pending: std::collections::VecDeque::new(),
@@ -6973,10 +6995,12 @@ impl<B: Backend> Session<B> {
         // reproduces. Overwritten every iteration, so on exit it
         // describes the last one.
         let mut uncommitted_bytes: usize = 0;
-        // Reserved ids among the tokens whose pieces reached
-        // `raw_text` — what containment weighs against the pieces the
-        // parse leaves in free text (`scan_blocks_for_specials`).
-        let mut emitted_reserved = crate::chat_template::LiteralCounts::new();
+        // `raw_text` with every reserved piece the model *spelled* in
+        // ordinary tokens marked: what the dialect parser reads, so only
+        // framing emitted as a real reserved token is structure (see
+        // `Provenance`). The parse is restored before anything sees it.
+        let mut provenance = self.provenance();
+        let mut marked_text = String::new();
 
         // The parse dialect and tool schemas: the request's stop
         // sequences are matched against the text output they parse to
@@ -6996,11 +7020,13 @@ impl<B: Backend> Session<B> {
                     parse_syntax.clone(),
                     parse_tools.clone(),
                     pre_opened_reasoning,
-                ),
+                )
+                .with_provenance(self.provenance()),
                 stops.clone(),
             )
         });
 
+        let reserved = self.literals.neutralizer.clone();
         let mut predictor = if self.prefix_cache.is_some() {
             // Cache on: ALWAYS the resuming constructor — even at
             // prefill_start == 0 — because the non-resuming one calls
@@ -7020,7 +7046,8 @@ impl<B: Backend> Session<B> {
                 predict_opts,
                 Some(initial_state),
             )
-        };
+        }
+        .with_reserved(reserved);
 
         while let Some(piece) = predictor.next() {
             if collect_token_dump {
@@ -7042,16 +7069,13 @@ impl<B: Backend> Session<B> {
             generated_count += 1;
             raw_text.push_str(&piece);
             uncommitted_bytes = piece.len();
-            if let Some(token) = predictor.last_token() {
-                if self.literals.neutralizer.contains(token) {
-                    *emitted_reserved.entry(token).or_default() += 1;
-                }
-            }
+            let token = predictor.last_token();
+            marked_text.push_str(&provenance.push(&piece, token));
 
             // A stop sequence in client-visible text ends the turn
             // (#122).
             if let Some(filter) = stop_filter.as_mut() {
-                filter.push(&piece);
+                filter.push(&piece, token);
                 if filter.hit().is_some() {
                     break;
                 }
@@ -7088,6 +7112,7 @@ impl<B: Backend> Session<B> {
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
         let budget = Cut::of(&predictor);
         drop(predictor);
+        marked_text.push_str(&provenance.finish());
         // Parse the whole generation through the dialect envelope
         // parser. `Final` leniency: a truncated trailing structure
         // degrades to Text (or Thought for an unclosed reasoning
@@ -7106,18 +7131,19 @@ impl<B: Backend> Session<B> {
         // Adjacent same-kind prose is collapsed so `[Text, Text]`
         // becomes `[Text]` — lets a lone `Text` output serialize to
         // the string wire form downstream.
+        //
+        // The parse reads `marked_text`: a reserved piece the model
+        // spelled is text, never framing. `marked` keeps that parse
+        // unrestored for containment, which reads provenance off it.
         let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
         let parse = |leniency| {
-            let parsed = crate::dialect::parse_text(
+            crate::dialect::parse_text_open(
                 &parse_syntax,
                 &tool_refs,
-                &raw_text,
+                &marked_text,
                 pre_opened_reasoning,
                 leniency,
-            );
-            let in_flight =
-                parsed.status == crate::dialect::ParseStatus::NeedMoreInput;
-            (merge_adjacent_prose(parsed.blocks), in_flight)
+            )
         };
         // A stop sequence (#122): the one the filter stopped on, or —
         // when the turn ended first — one in what the end flushed. The
@@ -7128,27 +7154,28 @@ impl<B: Backend> Session<B> {
             f.finish(budget.is_some());
             f.hit().map(str::to_owned)
         });
-        let (blocks, cut, in_flight) = match hit {
+        let (marked, blocks, cut, in_flight) = match hit {
             // Its KV no longer matches the output either way.
             Some(stop) => {
-                let parsed = crate::dialect::parse_text_open(
-                    &parse_syntax,
-                    &tool_refs,
-                    &raw_text,
-                    pre_opened_reasoning,
-                    crate::dialect::Leniency::Clipped,
-                );
-                let blocks = stop::stop_view(parsed, false);
+                let (parsed, open) = parse(crate::dialect::Leniency::Clipped);
+                let marked = parsed.blocks.clone();
+                let restored = provenance.restore_parse((parsed, open));
+                let blocks = stop::stop_view(restored, false);
                 let (blocks, _) = stop::cut_at_stop(blocks, &[&stop]);
-                (blocks, Some(Cut::StopSequence(stop)), true)
+                (marked, blocks, Some(Cut::StopSequence(stop)), true)
             }
             None => {
-                let (blocks, in_flight) = parse(if budget.is_some() {
+                let (parsed, _) = parse(if budget.is_some() {
                     crate::dialect::Leniency::Clipped
                 } else {
                     crate::dialect::Leniency::Final
                 });
-                (blocks, budget, in_flight)
+                let in_flight =
+                    parsed.status == crate::dialect::ParseStatus::NeedMoreInput;
+                let blocks = merge_adjacent_prose(
+                    provenance.restore_blocks(parsed.blocks.clone()),
+                );
+                (parsed.blocks, blocks, budget, in_flight)
             }
         };
 
@@ -7414,9 +7441,12 @@ impl<B: Backend> Session<B> {
         // the real token and failed; ingest now neutralizes content
         // literals, so a spelled piece re-reads as the text it is, and
         // rejecting it only made an agent quoting a post resample
-        // forever. (A spelled piece the parser read as *framing* — a
-        // typed-out `<tool_call>` parsed as a call — is the parser-
-        // provenance gap, a separate follow-up.)
+        // forever. The parse read the spelling as text too (emission
+        // provenance), so it is in free text here, as a marker in
+        // `marked`: what is left there as a piece is a real token.
+        // (Read off the parse before a stop sequence cuts it; the loop
+        // breaks on the piece that completes the stop, so little lies
+        // past it.)
         //
         // Deliberately NOT `record_cache_miss_on_error` (contrast the
         // grammar-violation arm above): the constraint completed, so
@@ -7427,11 +7457,7 @@ impl<B: Backend> Session<B> {
         // here would turn the near-free resample this error asks for
         // into a full re-prefill.
         if self.emit_specials_ban {
-            let found = self.scan_blocks_for_specials(
-                &blocks,
-                &raw_text,
-                &emitted_reserved,
-            );
+            let found = self.scan_blocks_for_specials(&marked);
             if !found.is_empty() {
                 // The pieces go in the log verbatim: tracing output is
                 // operator-facing and never model-visible, and forensics
@@ -8349,6 +8375,11 @@ fn infer_stop_reason(
 /// it halts once the grammar is exhausted. Once drained,
 /// [`Self::stop_reason`] reports the ending the batch path would, and
 /// [`Self::open_call_json`] whether the last call was left open.
+///
+/// As on the batch path, only framing the model emitted as a real
+/// reserved token is structure: a `<tool_call>` or `<think>` it spelled
+/// in ordinary tokens (copying markup it read) streams as text. A tail
+/// that could still complete such a spelling is held until it settles.
 pub struct BlockStream<'engine, B: Backend> {
     predictor: crate::PiecePredictor<'engine, B>,
     /// Re-parse-per-tick streaming parser over the session dialect
@@ -8459,7 +8490,8 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                         continue;
                     }
                     self.generated += 1;
-                    let blocks = self.filter.push(&piece);
+                    let token = self.predictor.last_token();
+                    let blocks = self.filter.push(&piece, token);
                     self.pending.extend(blocks);
                     // A stop sequence ends the turn; so does `run_call`'s
                     // one-shot halt on an exhausted grammar, so both
@@ -11297,17 +11329,25 @@ mod tests {
                 .with_id("call_1"),
             ),
         ];
-        let spelled = crate::chat_template::LiteralCounts::new();
-        let real: crate::chat_template::LiteralCounts =
-            [(victim, 1)].into_iter().collect();
+        // Containment reads the provenance-marked parse, where the
+        // model's spelling of the piece is a marker.
+        let mut spelled = poisoned.clone();
+        spelled[1] = crate::Block::from(
+            format!(
+                "{} assistant",
+                crate::chat_template::literal_marker(
+                    "0123456789abcdef0123456789abcdef",
+                    victim,
+                )
+            )
+            .as_str(),
+        );
         assert!(
-            session
-                .scan_blocks_for_specials(&poisoned, &text, &spelled)
-                .is_empty(),
+            session.scan_blocks_for_specials(&spelled).is_empty(),
             "a spelled piece in free text passes",
         );
         assert_eq!(
-            session.scan_blocks_for_specials(&poisoned, &text, &real),
+            session.scan_blocks_for_specials(&poisoned),
             vec![piece.clone()],
             "the real token in free text is flagged",
         );

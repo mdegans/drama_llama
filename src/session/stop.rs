@@ -179,12 +179,18 @@ impl StopFilter {
         self.cutter.hit()
     }
 
-    /// Feed one piece; returns the blocks (or prose deltas) it resolved.
-    pub(super) fn push(&mut self, piece: &str) -> Vec<Block> {
+    /// Feed one piece and the token behind it (what the parser's
+    /// emission provenance keys on); returns the blocks (or prose
+    /// deltas) it resolved.
+    pub(super) fn push(
+        &mut self,
+        piece: &str,
+        token: Option<crate::Token>,
+    ) -> Vec<Block> {
         if self.hit().is_some() {
             return Vec::new();
         }
-        let blocks = self.parser.push(piece);
+        let blocks = self.parser.push_token(piece, token);
         let mut out = self.admit(blocks);
         if self.hit().is_none() {
             out.extend(self.stop_in_flight());
@@ -545,7 +551,7 @@ mod tests {
         let mut out = Vec::new();
         let mut generated = text.len();
         for (i, c) in text.char_indices() {
-            out.extend(f.push(c.encode_utf8(&mut [0; 4])));
+            out.extend(f.push(c.encode_utf8(&mut [0; 4]), None));
             if f.hit().is_some() {
                 generated = i + c.len_utf8();
                 break;
@@ -691,7 +697,7 @@ mod tests {
             let mut f = filter(syntax, &["\n"]);
             let mut out: Vec<Block> = "Hi!\n"
                 .chars()
-                .flat_map(|c| f.push(&c.to_string()))
+                .flat_map(|c| f.push(&c.to_string(), None))
                 .collect();
             out.extend(f.finish(true));
             assert_eq!(f.hit(), None, "{name}: clipped");
@@ -852,8 +858,10 @@ mod tests {
             );
             let clip = &text[..text.find("sunny").unwrap() + 2];
             let mut f = filter(syntax.clone(), &["zzz"]);
-            let mut out: Vec<Block> =
-                clip.chars().flat_map(|c| f.push(&c.to_string())).collect();
+            let mut out: Vec<Block> = clip
+                .chars()
+                .flat_map(|c| f.push(&c.to_string(), None))
+                .collect();
             out.extend(f.finish(true));
             assert_eq!(f.hit(), None, "{name}");
             assert_eq!(input_of(&out), &json!({"city": "Paris"}), "{name}");
