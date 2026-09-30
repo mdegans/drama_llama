@@ -39,8 +39,13 @@ text.
   `push_token` does the same per tick and never cuts a prose delta
   inside a marker (`cut_before_marker`).
 - Wired into `run_call`, `complete_stream`/`BlockStream`, the
-  `StopFilter` parser on every path, and `complete_text`'s stop cut
-  (cut found in marked text, output = restoration).
+  `StopFilter` parser on every path, and `complete_text`'s stop cut.
+  That cut is searched in the *restored* bytes, each prefix parsed as
+  the marked text it restores from (`Provenance::marked_prefix`): a
+  stop can start inside a spelled piece (`_call` in a spelled
+  `<tool_call>`), where no marked prefix ends, so a marked-coordinate
+  search found no cut and kept the stop (caught in review; regression
+  test `a_stop_inside_a_spelled_piece_is_cut`).
 - Trigger: `PiecePredictor::with_reserved` → `TokenPredictor` records
   byte spans of real reserved tokens; a trigger occurrence is accepted
   only if each reserved piece *inside the trigger* is exactly a real

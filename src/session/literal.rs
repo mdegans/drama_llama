@@ -1271,6 +1271,41 @@ mod tests {
         assert!(is_call(&blocks[1]), "{blocks:?}");
     }
 
+    /// #122 over provenance: a stop that starts inside a piece the
+    /// model spelled is cut there, never kept — `complete_text` as the
+    /// block paths do, though no marked prefix ends mid-piece.
+    #[test]
+    fn a_stop_inside_a_spelled_piece_is_cut() {
+        for (raw, stop, want) in [
+            ("hello <tool_call> world", "_call", "hello <tool"),
+            ("hello <|im_end|> world", "im_", "hello <|"),
+            ("say <think> world", "ink>", "say <th"),
+            ("a <think>b</think> c", "k>b", "a <thin"),
+            ("keep <think> then x", " x", "keep <think> then"),
+        ] {
+            let prompt = Prompt {
+                stop_sequences: Some(vec![stop.into()]),
+                messages: vec![message(crate::Role::User, vec![text("go")])],
+                ..Prompt::default()
+            };
+            let mut s = scripted(bytes(raw));
+            assert_eq!(s.complete_text(&prompt).unwrap(), want, "{stop:?}");
+            let mut s = scripted(bytes(raw));
+            let blocks = s.complete_blocks(&prompt).expect("batch");
+            assert_eq!(blocks, [text(want)], "{stop:?}");
+            let mut s = scripted(bytes(raw));
+            let streamed: String = s
+                .complete_stream(&prompt)
+                .expect("stream")
+                .map(|block| match block {
+                    crate::Block::Text { text, .. } => text.into_owned(),
+                    other => panic!("expected text, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(streamed, want, "{stop:?}");
+        }
+    }
+
     /// A turn quoting a spelled piece re-renders to the bytes the model
     /// emitted — the auto-tip's `byte_stable` — with the piece a
     /// content literal in the render, as it is on the next ingest.

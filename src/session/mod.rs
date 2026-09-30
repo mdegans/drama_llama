@@ -6553,22 +6553,24 @@ impl<B: Backend> Session<B> {
         // tokens sitting in KV cannot be spliced under a render without
         // them.
         //
-        // The cut is found in the marked generation, whose markers never
-        // split (a prefix ending inside one parses to other text), and
-        // the output is its restoration: the raw bytes, cut.
+        // The cut is found in the raw bytes, each prefix parsed as the
+        // marked text it restores from: a stop can start inside a piece
+        // the model spelled, where no marked prefix ends, and the part
+        // of the piece before it is then text like the rest.
         marked.push_str(&provenance.finish());
-        let mut trimmed = trim_eos(&marked, &self.engine).to_string();
+        let marked = trim_eos(&marked, &self.engine).to_string();
+        let mut trimmed = provenance.restore(&marked).into_owned();
         let hit = stop_filter.as_mut().and_then(|f| {
             f.finish(clipped);
             f.hit().map(str::to_owned)
         });
         if let Some(hit) = hit {
             let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
-            let parse = |prefix: &str| {
+            let parse = |end: usize| {
                 provenance.restore_parse(crate::dialect::parse_text_open(
                     &parse_syntax,
                     &tool_refs,
-                    prefix,
+                    &provenance.marked_prefix(&marked, end),
                     pre_opened_reasoning,
                     crate::dialect::Leniency::Clipped,
                 ))
@@ -6576,19 +6578,18 @@ impl<B: Backend> Session<B> {
             // A prefix withholding a structure in flight, with no call
             // to show for it, is not where any stop fell.
             let view = |prefix: &str| {
-                let (parsed, open) = parse(prefix);
+                let (parsed, open) = parse(prefix.len());
                 let complete =
                     parsed.status == crate::dialect::ParseStatus::Complete;
                 (complete || open.is_some())
                     .then(|| stop::stop_view((parsed, open), true))
             };
-            let blocks = stop::stop_view(parse(&trimmed), false);
+            let blocks = stop::stop_view(parse(trimmed.len()), false);
             let (kept, _) = stop::cut_at_stop(blocks, &[&hit]);
             if let Some(at) = stop::raw_stop_cut(&trimmed, &kept, view) {
                 trimmed.truncate(at);
             }
         }
-        let trimmed = provenance.restore(&trimmed).into_owned();
 
         // Auto-tip: extend `prev_tokens` past the prompt with the
         // generated content **including the recorded-but-uncommitted

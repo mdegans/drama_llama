@@ -193,6 +193,52 @@ impl Provenance {
         }
     }
 
+    /// `marked` cut at `end` bytes of its restoration: the marked text
+    /// that restores to `restore(marked)[..end]`. A cut inside a spelled
+    /// piece keeps the part of it before the cut as text — spelled
+    /// still, so marked again (a shorter piece can sit in it whole).
+    /// `end` must be a char boundary of the restoration.
+    pub(crate) fn marked_prefix<'t>(
+        &self,
+        marked: &'t str,
+        end: usize,
+    ) -> Cow<'t, str> {
+        // `restored` is the restoration's length up to marked byte
+        // `last`: the two advance together outside markers.
+        let mut restored = 0;
+        let mut last = 0;
+        for (range, id) in self.markers(marked) {
+            let plain = range.start - last;
+            if end <= restored + plain {
+                break;
+            }
+            restored += plain;
+            let piece = self.reserved.piece(id).expect("markers checks ids");
+            if end < restored + piece.len() {
+                let mut out = marked[..range.start].to_string();
+                out.push_str(&self.mark(&piece[..end - restored]));
+                return Cow::Owned(out);
+            }
+            restored += piece.len();
+            last = range.end;
+        }
+        Cow::Borrowed(&marked[..last + (end - restored)])
+    }
+
+    /// `text`, all of it spelled, with every reserved piece in it
+    /// marked.
+    fn mark(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        for (range, id) in self.reserved.find_iter(text) {
+            out.push_str(&text[last..range.start]);
+            out.push_str(&literal_marker(&self.sentinel, id));
+            last = range.end;
+        }
+        out.push_str(&text[last..]);
+        out
+    }
+
     /// Where a cut of `text` at `end` may fall without splitting a
     /// marker: `end`, or the start of the marker it lands inside.
     pub(crate) fn cut_before_marker(&self, text: &str, end: usize) -> usize {
@@ -648,6 +694,36 @@ mod tests {
         assert!(
             matches!(&blocks[0], Block::Thought { thought, .. } if thought == "hmm"),
             "{blocks:?}",
+        );
+    }
+
+    /// A cut in restored bytes maps back to marked text, whole markers
+    /// kept, a cut piece's head spelled — marked again where it holds a
+    /// shorter piece whole.
+    #[test]
+    fn a_marked_prefix_restores_to_the_cut() {
+        let p = provenance();
+        let m = literal_marker(SENTINEL, TOOL_CALL);
+        let marked = format!("ab{m}cd<tool_call>e");
+        let restored = p.restore(&marked).into_owned();
+        assert_eq!(restored, "ab<tool_call>cd<tool_call>e");
+        for end in 0..=restored.len() {
+            let prefix = p.marked_prefix(&marked, end);
+            assert_eq!(p.restore(&prefix), &restored[..end], "at {end}");
+        }
+        assert_eq!(p.marked_prefix(&marked, 2), "ab");
+        assert_eq!(p.marked_prefix(&marked, 7), "ab<tool");
+        assert_eq!(p.marked_prefix(&marked, 13), format!("ab{m}"));
+        assert_eq!(p.marked_prefix(&marked, 20), format!("ab{m}cd<tool"));
+
+        let nested = Provenance::new(
+            Arc::new(LiteralNeutralizer::new([(7, "<a>"), (8, "<a><b>")])),
+            SENTINEL,
+        );
+        let marked = format!("x{}", literal_marker(SENTINEL, 8));
+        assert_eq!(
+            nested.marked_prefix(&marked, 5),
+            format!("x{}<", literal_marker(SENTINEL, 7)),
         );
     }
 
