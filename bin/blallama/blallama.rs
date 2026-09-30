@@ -44,7 +44,10 @@ use std::{
 };
 
 use axum::{
-    extract::{Json, Path as UrlPath, State},
+    extract::{
+        rejection::JsonRejection, DefaultBodyLimit, FromRequest, Json,
+        Path as UrlPath, Request, State,
+    },
     http::StatusCode,
     routing::{get, post},
     Router,
@@ -179,6 +182,61 @@ impl From<AnthropicError> for ErrorEnvelope {
             error,
         }
     }
+}
+
+/// An error response in the wire envelope, with the status Anthropic
+/// sends for that error type (500 when it has none).
+fn error_response(error: AnthropicError) -> (StatusCode, Json<ErrorEnvelope>) {
+    let status = error
+        .status()
+        .and_then(|code| StatusCode::from_u16(code.get()).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(error.into()))
+}
+
+/// Anthropic's request-size ceiling for the Messages API. axum's own
+/// default is 2 MB, which a single base64 image can exceed.
+const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
+/// [`Json`] whose rejection is Anthropic's error envelope (#123).
+///
+/// A body that fails to deserialize used to get axum's own answer — a
+/// plain-text 422 — which no Anthropic client parses: the SDKs expect
+/// `{"type":"error","error":{…}}` and decide retry vs. give-up on the
+/// status. Anthropic answers a malformed body with 400
+/// `invalid_request_error` (never retried), and an oversized one with
+/// 413 `request_too_large`; so does this.
+struct AnthropicJson<T>(T);
+
+impl<S, T> FromRequest<S> for AnthropicJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, Json<ErrorEnvelope>);
+
+    async fn from_request(
+        req: Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Json::<T>::from_request(req, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(map_json_rejection)
+    }
+}
+
+/// See [`AnthropicJson`]. The message is axum's description of what was
+/// wrong with the body, which names the offending field.
+fn map_json_rejection(
+    rejection: JsonRejection,
+) -> (StatusCode, Json<ErrorEnvelope>) {
+    let message = rejection.body_text();
+    error_response(if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AnthropicError::RequestTooLarge { message }
+    } else {
+        AnthropicError::InvalidRequest { message }
+    })
 }
 
 async fn spawn_blocking_or_bust<F, R>(f: F) -> R
@@ -378,7 +436,8 @@ where
         .route("/v1/messages/count_tokens", post(route_count_tokens))
         .route("/v1/models", get(route_models))
         .route("/v1/models/{id}", get(route_model))
-        .route("/api/tags", get(route_tags));
+        .route("/api/tags", get(route_tags))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
     if probe_bus.is_some() {
         app = app.route("/probe", axum::routing::get(route_probe_stream));
     }
@@ -483,7 +542,7 @@ where
 
 async fn route_messages<B>(
     State(state): State<AppState<B>>,
-    Json(mut prompt): Json<Prompt>,
+    AnthropicJson(mut prompt): AnthropicJson<Prompt>,
 ) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend + 'static,
@@ -502,7 +561,7 @@ where
 #[instrument(skip(state, prompt), fields(model = %prompt.model))]
 async fn route_count_tokens<B>(
     State(state): State<AppState<B>>,
-    Json(mut prompt): Json<Prompt>,
+    AnthropicJson(mut prompt): AnthropicJson<Prompt>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend + 'static,
@@ -1161,11 +1220,7 @@ fn map_session_err(
             message: e.to_string(),
         },
     };
-    let status = error
-        .status()
-        .and_then(|code| StatusCode::from_u16(code.get()).ok())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(error.into()))
+    error_response(error)
 }
 
 #[tokio::main]
@@ -1234,6 +1289,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `POST` with `body` as JSON, as the routes receive it.
+    fn json_request(body: &'static str) -> Request {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    /// Extract a [`Prompt`] the way `/v1/messages` and `count_tokens`
+    /// do, returning the rejection as the wire would carry it.
+    async fn extract(
+        req: Request,
+    ) -> Result<Prompt, (StatusCode, serde_json::Value)> {
+        AnthropicJson::<Prompt>::from_request(req, &())
+            .await
+            .map(|AnthropicJson(p)| p)
+            .map_err(|(status, Json(envelope))| {
+                (status, serde_json::to_value(envelope).unwrap())
+            })
+    }
+
+    /// #123: a body that doesn't deserialize is Anthropic's 400
+    /// `invalid_request_error` in the error envelope — not axum's
+    /// plain-text 422 — whether it is malformed JSON or well-formed JSON
+    /// of the wrong shape.
+    #[tokio::test]
+    async fn body_rejection_is_anthropic_400_envelope() {
+        for body in [
+            // Syntax error.
+            r#"{"model": "m", "max_tokens": 8, "messages": ["#,
+            // Well-formed, wrong type (axum: 422). Not a missing field:
+            // misanthropic's `Prompt` defaults every field.
+            r#"{"model": "m", "max_tokens": "eight", "messages": []}"#,
+            r#"{"model": "m", "max_tokens": 8, "messages": "hi"}"#,
+        ] {
+            let (status, value) = extract(json_request(body))
+                .await
+                .expect_err("body must be rejected");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(value["type"], "error", "{body}");
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| !m.is_empty()),
+                "{body}: {value}",
+            );
+        }
+
+        // No JSON content type (axum: 415) is a malformed request too.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let (status, value) = extract(req).await.expect_err("no content type");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+    }
+
+    /// #123: a tool whose schema interleaves required and optional
+    /// properties (`zulu` required, `alpha` optional, `mike` required)
+    /// deserializes. Anthropic keeps optionals in place and accepts this
+    /// shape; a schema-order check on misanthropic's deserialize path,
+    /// if feature unification ever turned one on here, would 400 it.
+    #[tokio::test]
+    async fn interleaved_required_optional_tool_deserializes() {
+        let prompt = extract(json_request(
+            r#"{
+                "model": "m",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "name": "zam",
+                    "description": "interleaved required/optional",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "zulu": {"type": "string"},
+                            "alpha": {"type": "string"},
+                            "mike": {"type": "integer"}
+                        },
+                        "required": ["zulu", "mike"]
+                    }
+                }]
+            }"#,
+        ))
+        .await
+        .expect("interleaved schema must deserialize");
+
+        let tool = prompt
+            .tools
+            .iter()
+            .flatten()
+            .find_map(|def| def.as_method())
+            .expect("the custom tool survives");
+        assert_eq!(tool.name, "zam");
+        // Declaration order intact — the grammar lays fields out in it.
+        let order: Vec<&str> = tool.schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["zulu", "alpha", "mike"]);
+    }
 
     /// `StreamProbeMsg` wire format check — SessionStart / Token / SessionEnd
     /// serialize to the schema documented on the type. The /probe consumer
