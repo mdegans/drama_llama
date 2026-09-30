@@ -8021,9 +8021,10 @@ fn render_ends_with_open_reasoning(
 /// special tokens, and special-bearing *content* is neutralized to an
 /// out-of-band marker before the template sees it
 /// ([`crate::LiteralNeutralizer`]), so a closer at the render tail can
-/// only have been written by the template or the renderer. The [`dialect_renders_open_thought`] gate is
-/// load-bearing for Harmony (its closer is shared message framing);
-/// the empty-closer guard prevents the vacuous `ends_with("")`.
+/// only have been written by the template or the renderer. The
+/// [`dialect_renders_open_thought`] gate is load-bearing for Harmony
+/// (its closer is shared message framing); the empty-closer guard
+/// prevents the vacuous `ends_with("")`.
 fn render_ends_with_closed_reasoning(
     rendered: &str,
     dialect: &crate::CallSyntax,

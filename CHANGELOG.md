@@ -37,8 +37,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     finds must have been neutralized at least as often; a shortfall
     fails the call loudly (and logs `literal_neutralization_bypassed`)
     as a drama_llama bug. blallama answers it with a 500 `api_error`
-    instead of a 400, since the client's request is not at fault. `content_special_neutralized` is logged at
-    debug on every call that neutralizes something.
+    instead of a 400, since the client's request is not at fault.
+    `content_special_neutralized` is logged at debug on every call
+    that neutralizes something.
   - Tool names and tool-use ids are *validated* rather than
     neutralized — the grammar and parser key on them: names must
     match Anthropic's `^[a-zA-Z0-9_-]{1,64}$`, ids
@@ -65,7 +66,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     merely spelled (an agent quoting a post) passes, since the next
     ingest reads it as text. A spelled piece the parser reads as
     *framing* — a typed-out `<tool_call>` parsed as a call — is the
-    parser-provenance gap, left for a follow-up.
+    parser-provenance gap, left for a follow-up. **This change makes
+    that gap reachable:** a transcript quoting
+    `<tool_call>{…}</tool_call>` used to be a 400, so the model never
+    read it; now it reads the spelled markup, can copy it into its own
+    output, and the text-level parser can seat the copy as a real
+    `ToolUse`. The count in containment cannot see it, since the
+    parser consumes the spelled piece as framing.
   - Markers the model emits as real specials outside the dialect
     (Qwen-VL grounding's `<|box_start|>`, with
     `with_emit_specials_ban(false)`) re-ingest as text, not as ids.
