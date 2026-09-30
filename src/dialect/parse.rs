@@ -443,6 +443,57 @@ impl<'a> Parser<'a> {
         self.blocks.push(text.to_string().into());
     }
 
+    /// A closed thought's body as the chat template re-renders it: the
+    /// bytes before the close marker, minus exactly the whitespace the
+    /// marker is canonically spelled with (the `"\n"` of Qwen's
+    /// `"\n</think>"`, Gemma 4's `"\n<channel|>"`) and nothing more.
+    ///
+    /// Not `trim_end`: a thought the model closes on a blank line keeps
+    /// its extra `"\n"`, because a template that renders the thought
+    /// verbatim (every baked one) puts the marker's own `"\n"` back and
+    /// needs the rest from the block to reproduce the emission. A
+    /// trimming stock template trims either way.
+    fn closed_thought_body(&self, body: &'a str) -> &'a str {
+        let end = &self.syntax.reasoning.end;
+        let lead = &end[..end.len() - end.trim_start().len()];
+        body.strip_suffix(lead).unwrap_or(body)
+    }
+
+    /// After an *empty* pre-opened thought, consume the reasoning
+    /// separator. An empty thought is no thought at all to the
+    /// re-render, which then spells the thinking-off scaffold — Qwen's
+    /// `<think>\n\n</think>\n\n` — so the separator the model wrote is
+    /// the scaffold's, and left in the answer it would render twice.
+    ///
+    /// `true` when the rest of the input is withheld under
+    /// [`Leniency::Streaming`]: a proper prefix of the separator may
+    /// still grow into it, and a streamed `"\n"` cannot be taken back.
+    ///
+    /// Known residual: a *continued* open thought whose completion
+    /// closes at once is merged with its seed on re-render, so the
+    /// thought is no longer empty there, and a non-canonical gap after
+    /// it (`"\n\n\n"`) re-renders one separator short. Stock trims
+    /// every gap, so this is never worse than it.
+    fn eat_scaffold_separator(&mut self) -> bool {
+        let Some(sep) = self.syntax.reasoning.separator.as_deref() else {
+            return false;
+        };
+        let rest = self.rest();
+        if sep.is_empty() || rest.is_empty() {
+            return false;
+        }
+        if rest.starts_with(sep) {
+            self.pos += sep.len();
+            return false;
+        }
+        if self.leniency == Leniency::Streaming && sep.starts_with(rest) {
+            self.status = ParseStatus::NeedMoreInput;
+            self.pos = self.text.len();
+            return true;
+        }
+        false
+    }
+
     fn push_thought(&mut self, body: &str) {
         // Empty thoughts carry no signal and some dialects emit them
         // as pure noise (Gemma 4's pre-closed / trailing channel
@@ -461,12 +512,12 @@ impl<'a> Parser<'a> {
     ///
     /// Two differences from [`Self::push_thought`], both load-bearing:
     ///
-    /// * The body is stored **raw**. The closed path can normalize
-    ///   whitespace because a canonical close marker re-supplies it on
-    ///   render (and the chat template applies the mirror-image
-    ///   `lstrip`/`rstrip` of its own); an open thought has no close,
-    ///   so trimmed bytes are gone for good and the re-render no longer
-    ///   matches the KV.
+    /// * The body is stored **raw**. The closed path strips the close
+    ///   marker's canonical leading whitespace (the `"\n"` of
+    ///   `"\n</think>"`, see `closed_thought_body`) because the
+    ///   template's close marker re-supplies it on render; an open
+    ///   thought has no close, so any stripped byte would be gone for
+    ///   good and the re-render would no longer match the KV.
     /// * It carries [`OPEN_THOUGHT_SIGNATURE`], which is what stops the
     ///   renderer from inventing a close marker the model never wrote.
     ///
@@ -536,9 +587,15 @@ impl<'a> Parser<'a> {
             let end = self.syntax.reasoning.end.trim_start();
             match self.rest().find(end) {
                 Some(at) => {
-                    let body = &self.rest()[..at];
-                    self.push_thought(body.trim_end());
+                    let body = self.closed_thought_body(&self.rest()[..at]);
                     self.pos += at + end.len();
+                    if body.is_empty() {
+                        if self.eat_scaffold_separator() {
+                            return;
+                        }
+                    } else {
+                        self.push_thought(body);
+                    }
                 }
                 None => {
                     // No reasoning close anywhere. Before treating the
@@ -742,12 +799,9 @@ impl<'a> Parser<'a> {
         match self.rest().find(end) {
             Some(at) => {
                 let body = &self.rest()[..at];
-                let body = body
-                    .strip_prefix('\n')
-                    .unwrap_or(body)
-                    .trim_end()
-                    .to_string();
-                self.push_thought(&body);
+                let body = body.strip_prefix('\n').unwrap_or(body);
+                let body = self.closed_thought_body(body);
+                self.push_thought(body);
                 self.pos += at + end.len();
                 // Swallow one newline after the close, mirroring how
                 // templates lay the tag out.
@@ -768,8 +822,14 @@ impl<'a> Parser<'a> {
                 match call_at {
                     Some(at) => {
                         // `open` was already eaten, so `rest()` is the
-                        // body; mirror the closed branch's leading-`\n`
-                        // strip + `trim_end` for byte-identical thoughts.
+                        // body. Strip the leading `\n` as the closed
+                        // branch does, but `trim_end` the tail (as the
+                        // pre-opened split does) rather than
+                        // `closed_thought_body`: the model wrote no
+                        // close, so the re-render's close marker is
+                        // invented and cannot reproduce the emission
+                        // anyway, and whitespace before the trigger is
+                        // the gap to the call, not the thought's.
                         let body = &self.rest()[..at];
                         let body = body
                             .strip_prefix('\n')
@@ -2522,10 +2582,10 @@ mod tests {
 
     /// A pre-opened reasoning block cut off by `max_tokens` surfaces as
     /// an **open** Thought whose body is byte-exact — trailing
-    /// whitespace included. The whitespace is the point: the closed
-    /// path may trim it because a canonical close marker re-supplies it
-    /// on render, but an open thought has no close, so a trim would
-    /// silently lose bytes the KV cache holds.
+    /// whitespace included. The closed path strips only the close
+    /// marker's canonical leading `"\n"`, which the re-rendered marker
+    /// puts back; an open thought has no close, so stripping anything
+    /// would lose bytes the KV cache holds.
     #[test]
     fn pre_opened_unclosed_thought_is_open_and_byte_exact() {
         let syntax = CallSyntax::qwen_xml();
@@ -2547,10 +2607,12 @@ mod tests {
     }
 
     /// The same emission with its close marker present takes the closed
-    /// path: empty signature, and the whitespace normalization that
-    /// mirrors what the chat template does on re-render.
+    /// path: empty signature, and exactly the close marker's canonical
+    /// whitespace comes off the body — the `"\n"` of the analyzed
+    /// `"\n</think>"`, which the template puts back — and nothing else,
+    /// so a thought closed on blank lines re-renders them.
     #[test]
-    fn closed_thought_keeps_empty_signature_and_normalization() {
+    fn closed_thought_keeps_empty_signature_and_its_own_whitespace() {
         let syntax = CallSyntax::qwen_xml();
         let t = tool("get_weather");
         let parsed = parse_text(
@@ -2563,9 +2625,73 @@ mod tests {
         let Block::Thought { thought, signature } = &parsed.blocks[0] else {
             panic!("expected a Thought: {:#?}", parsed.blocks);
         };
-        assert_eq!(thought, "Weighing the two options.");
+        assert_eq!(thought, "Weighing the two options.\n\n");
         assert!(signature.is_empty(), "closed thoughts carry no signature");
         assert!(!crate::prompt::is_open_thought(&parsed.blocks[0]));
+
+        // The spontaneous (not pre-opened) path agrees.
+        let parsed = parse_text(
+            &syntax,
+            &[&t],
+            "<think>\nWeighing.\n\n</think>\n\nDone.",
+            false,
+            Leniency::Final,
+        );
+        let Block::Thought { thought, .. } = &parsed.blocks[0] else {
+            panic!("expected a Thought: {:#?}", parsed.blocks);
+        };
+        assert_eq!(thought, "Weighing.\n");
+    }
+
+    /// An empty pre-opened thought is the thinking-off scaffold to the
+    /// re-render, so the separator after it is the scaffold's and not
+    /// the answer's — and a streamed prefix of it is held back rather
+    /// than yielded as prose it would later have to take back.
+    #[test]
+    fn empty_pre_opened_thought_consumes_the_scaffold_separator() {
+        let mut syntax = CallSyntax::qwen_xml();
+        syntax.reasoning.separator = Some("\n\n".into());
+        let t = tool("get_weather");
+        let text = |emission| {
+            merge_text(
+                parse_text(&syntax, &[&t], emission, true, Leniency::Final)
+                    .blocks,
+            )
+        };
+        assert_eq!(
+            text("\n</think>\n\nDone."),
+            [Block::from("Done.".to_string())]
+        );
+        assert_eq!(
+            text("\n</think>\n\n\nDone."),
+            [Block::from("\nDone.".to_string())]
+        );
+        // Not the separator: nothing is consumed.
+        assert_eq!(
+            text("\n</think>\nDone."),
+            [Block::from("\nDone.".to_string())]
+        );
+        // A real thought keeps the gap in its answer, as it always has.
+        assert_eq!(
+            text("Hm.\n</think>\n\nDone.")[1],
+            Block::from("\n\nDone.".to_string())
+        );
+
+        for chunk in 1..=4usize {
+            let mut p =
+                StreamParser::new(syntax.clone(), vec![t.clone()], true);
+            let emission = "\n</think>\n\nDone.";
+            let mut out = Vec::new();
+            for piece in emission.as_bytes().chunks(chunk) {
+                out.extend(p.push(std::str::from_utf8(piece).unwrap()));
+            }
+            out.extend(p.finish());
+            assert_eq!(
+                merge_text(out),
+                [Block::from("Done.".to_string())],
+                "chunk={chunk}"
+            );
+        }
     }
 
     /// A *spontaneous* `<think>` (not pre-opened) that never closes used

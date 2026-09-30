@@ -42,7 +42,7 @@ honest version. The error message names `prune_open_thoughts`.
 ## Why divert-and-append, not strip-the-close
 
 **Do not "render it closed and strip the `</think>`".** Verified from
-the Qwen3.6 template (`tests/fixtures/templates/qwen3.6-gguf.jinja:89`):
+the Qwen3.6 template (`templates/qwen3.6-gguf.jinja:89`):
 
 ```jinja
 {%- set content = render_content(message.content, true)|trim %}
@@ -56,11 +56,11 @@ whitespace irrecoverably — `\n` and `\n\n\n` become indistinguishable —
 and no post-hoc stripping gets them back. Diverting means the template
 never sees those bytes.
 
-Corollary, load-bearing in both directions: **closed** thoughts
-round-trip precisely *because* the parser's `strip_prefix('\n')` +
-`trim_end()` mirrors that normalization. Keep the two in lockstep. Open
-thoughts store the body **raw** (`Parser::push_open_thought`) for the
-same reason inverted — nothing re-supplies what a trim eats.
+Corollary: **closed** thoughts round-trip because the parser strips
+only the leading `\n` and the close marker's canonical leading `\n`
+(`closed_thought_body`), and baked templates (Qwen) render the thought
+verbatim, re-supplying that `\n`. Open thoughts store the body **raw**
+(`Parser::push_open_thought`) — no close exists to re-supply anything.
 
 ## Three parser sites stamp openness
 

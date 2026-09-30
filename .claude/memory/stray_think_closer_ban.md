@@ -30,11 +30,14 @@ straight at `/v1/messages`.
   ~1000 upstream commits), same failure class.
 - **Not template detection.** `dump_template` through the rebased
   sys crate returns the Qwen3.6 template byte-identical to
-  `tests/fixtures/templates/qwen3.6-gguf.jinja`. The load-time warning
+  `templates/qwen3.6-gguf.jinja`. The load-time warning
   "no baked replacement matches … analyzes to no dialect we own" is the
   best-effort tier Qwen3.6 has *always* been on: there is no baked Qwen
   template and never was (`templates/` has cogito, gemma4, gptoss,
   mistral4). Balerion's "first domino" was wrong on this point.
+  (Since 2026-09-30 there *is* one, `baked::QWEN36`, for turn
+  byte-stability only: it analyzes to the stock dialect, so nothing
+  above changes.)
 - **Not the render.** `inspect_prompt` on the failing request ends in
   `<|im_start|>assistant\n<think>\n\n</think>\n\n` — the closed
   thinking-off stub, exactly what `thinking: None` asks for

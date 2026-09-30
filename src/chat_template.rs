@@ -361,8 +361,10 @@ impl ChatTemplate {
         // Append the withheld open thought, raw. Byte-exactness is the
         // whole point: the KV cache holds these bytes verbatim, and
         // anything routed through Jinja would come back normalized
-        // (Qwen3.6 `|trim`s message content and lstrip/rstrip's the
-        // halves it splits on `</think>`), making `\n` and `\n\n\n`
+        // (Qwen3.6's stock template `|trim`s message content and
+        // lstrip/rstrip's the halves it splits on `</think>`; the baked
+        // replacement renders a *closed* turn verbatim, but has no
+        // spelling for an unclosed one), making `\n` and `\n\n\n`
         // indistinguishable.
         if let Some(body) = open_tail {
             // The open marker comes from whichever side actually emits
@@ -3140,9 +3142,9 @@ mod tests {
     ///
     /// The body deliberately ends in `\n\n\n`. Whitespace is the entire
     /// game — the KV cache holds the model's bytes verbatim, and any
-    /// path through Jinja would normalize them away (Qwen3.6 `|trim`s
-    /// message content), making `\n` and `\n\n\n` indistinguishable and
-    /// the re-render a silent cache miss.
+    /// path through Jinja may normalize them away (Qwen3.6's stock
+    /// template `|trim`s message content), making `\n` and `\n\n\n`
+    /// indistinguishable and the re-render a silent cache miss.
     #[test]
     fn open_thought_tail_appends_raw_after_generation_prompt() {
         let base = Prompt::default().add_message((Role::User, "why?")).unwrap();

@@ -3,7 +3,8 @@
 //! Stock GGUF templates are of mixed quality: gpt-oss's renders only
 //! `tool_calls[0]` and misattributes tool responses after parallel
 //! calls; Gemma 4's drops the thinking channel the model itself
-//! emits. Both break the round-trip byte-stability the prefix cache
+//! emits; Qwen's trims the whitespace the model itself generated.
+//! All of these break the round-trip byte-stability the prefix cache
 //! is built on (see `.claude/memory/plan_template_ownership.md` and
 //! issue #88). For models we support first-class, the fix is an
 //! *owned* template, shipped in the crate — consumers like blallama
@@ -138,11 +139,44 @@ pub static MISTRAL4: BakedTemplate = BakedTemplate {
     replacement: include_str!("../templates/mistral4-cache-stable.jinja"),
 };
 
+/// Qwen3.6 (35B-A3B, Unsloth GGUF; XML `<tool_call>` calls, `<think>`
+/// reasoning inlined in `content`). The stock template `|trim`s an
+/// assistant turn's answer and thought, `lstrip`/`rstrip`s the halves
+/// it splits on `</think>`, and prints a fixed `\n\n` after the close,
+/// so any turn the model ends in whitespace — or whose thought closes
+/// on a blank line — re-renders shorter than it was generated and the
+/// turn's KV is lost on the next request (measured live 2026-09-30: a
+/// 7364-token tip). The replacement renders the assistant turn
+/// verbatim and supplies the canonical gaps only where the content
+/// carries none; everything else is byte-identical to stock, so the
+/// analyzed dialect is too. See `qwen_cache_stable_round_trips`.
+pub static QWEN36: BakedTemplate = BakedTemplate {
+    name: "qwen3.6-cache-stable",
+    stock: include_str!("../templates/qwen3.6-gguf.jinja"),
+    replacement: include_str!("../templates/qwen3.6-cache-stable.jinja"),
+};
+
+/// Qwen3.8 (27B, Unsloth GGUF). Same XML dialect and the same trims
+/// as [`QWEN36`], but reasoning re-ingests through `reasoning_content`
+/// alone (#112). Same patch, same property.
+pub static QWEN38: BakedTemplate = BakedTemplate {
+    name: "qwen3.8-cache-stable",
+    stock: include_str!("../templates/qwen3.8-gguf.jinja"),
+    replacement: include_str!("../templates/qwen3.8-cache-stable.jinja"),
+};
+
 /// Every baked template, in detection order. Order is cosmetic —
 /// stock templates are mutually distinct byte strings, so at most one
 /// entry can match.
-pub static ALL: &[&BakedTemplate] =
-    &[&GEMMA4, &GPTOSS, &GPTOSS_UPSTREAM, &COGITO, &MISTRAL4];
+pub static ALL: &[&BakedTemplate] = &[
+    &GEMMA4,
+    &GPTOSS,
+    &GPTOSS_UPSTREAM,
+    &COGITO,
+    &MISTRAL4,
+    &QWEN36,
+    &QWEN38,
+];
 
 /// Match an embedded template against the registry. `Some` only on
 /// byte-equality with a known stock template (trailing whitespace

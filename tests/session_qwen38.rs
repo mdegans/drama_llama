@@ -19,10 +19,12 @@
 //! throughout #112. The thinking variants below are the ones that
 //! would have caught it.
 //!
-//! **Stock template (rung 3).** Qwen3.8 has no baked replacement: its
-//! embedded template is used as-is, and it is cache-stable once the
-//! reingest is measured. A stray sidecar would silently swap in other
-//! bytes, so it fails the suite loudly, as in the sibling suites.
+//! **Baked template (rung 2).** Qwen3.8's embedded template is
+//! recognized and replaced by `baked::QWEN38`, which re-renders the
+//! assistant turn verbatim where stock `|trim`s it (2026-09-30); the
+//! reingest convention is unchanged, so the analyzed dialect is the
+//! stock one. A stray sidecar would silently swap in other bytes, so it
+//! fails the suite loudly, as in the sibling suites.
 //!
 //! All tests load `models/Qwen3.8-27B-UD-Q8_K_XL.gguf` (override with
 //! `$DRAMA_LLAMA_QWEN38_MODEL`) and are `#[ignore]`d. Absent that
@@ -63,7 +65,7 @@ fn load_session() -> Option<drama_llama::LlamaCppSession> {
     let sidecar = path.with_extension("template.jinja");
     assert!(
         !sidecar.exists(),
-        "a template sidecar exists at {}, which would replace the stock \
+        "a template sidecar exists at {}, which would replace the baked \
          template this suite pins. Delete it and re-run.",
         sidecar.display()
     );

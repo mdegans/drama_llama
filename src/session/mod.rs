@@ -1691,8 +1691,9 @@ fn around(s: &str, at: usize, n: usize) -> (&str, &str) {
 /// reports: everything generated from there on re-prefills next turn.
 /// Typical causes are a chat template that rewrites what it re-renders
 /// (Qwen3.6's stock template `trim`s the answer and the thought, so a
-/// trailing newline is enough) or a parse that normalizes. `WARN` when
-/// the turn is longer than [`MISS_WARN_TOKENS`].
+/// trailing newline was enough, until [`crate::baked::QWEN36`]) or a
+/// parse that normalizes. `WARN` when the turn is longer than
+/// [`MISS_WARN_TOKENS`].
 ///
 /// `part` says which side of the turn boundary they part on: `turn`
 /// (`diverge_byte` is into the emission; `emitted` is what the model
@@ -1831,8 +1832,8 @@ fn find_injected_specials_in_prompt(
 /// [`chat_template::open_thought_tail`] withholds from the template and
 /// appends to the finished generation prompt. Anywhere else, the
 /// template would have to lay out bytes around it, and it normalizes
-/// whitespace irreversibly (Qwen3.6 `|trim`s content and
-/// `lstrip`/`rstrip`s the halves it splits on `</think>`) — so the
+/// whitespace irreversibly (Qwen3.6's stock template `|trim`s content
+/// and `lstrip`/`rstrip`s the halves it splits on `</think>`) — so the
 /// re-rendered prefix could not match the KV the thought was generated
 /// against. That is a silent prefix-cache miss, minutes of prefill on a
 /// long prompt, so it is a hard error instead: prune and resubmit
@@ -12211,47 +12212,56 @@ mod tests {
         assert_eq!((before, after), ("h", "é"));
     }
 
-    /// Regression for the 2026-09-30 live tip drop (Qwen3.6-35B-A3B,
-    /// stock template — no baked replacement): the stock template
-    /// `trim`s an assistant turn's answer and thought when it
-    /// re-renders them, so any turn the model ends with whitespace, or
-    /// whose thought ends in a blank line, re-renders shorter than it
-    /// was generated. The KV holds the emission; the next request's
-    /// render lacks those bytes; the LCP stops just short of the tip
-    /// and the whole turn re-prefills. Pinned against the dumped
-    /// template (byte-identical to the served GGUF's), through the same
-    /// parse the session runs, so a baked Qwen template that fixes it
-    /// flips these assertions rather than passing silently.
+    /// Regression for the 2026-09-30 live tip drop (Qwen3.6-35B-A3B):
+    /// the stock template `trim`s an assistant turn's answer and thought
+    /// when it re-renders them, so any turn the model ends with
+    /// whitespace, or whose thought ends in a blank line, re-rendered
+    /// shorter than it was generated. The KV holds the emission; the
+    /// next request's render lacked those bytes; the LCP stopped just
+    /// short of the tip and the whole turn re-prefilled (7364 tokens,
+    /// live).
+    ///
+    /// Pinned through what a session serves — the baked replacement
+    /// [`crate::baked::detect`] picks for each stock dump (byte-identical
+    /// to the served GGUFs' embedded templates) — and through the same
+    /// parse and render options the session runs, measured the way the
+    /// session's canonicalization gate measures it.
     #[test]
-    fn qwen36_stock_template_trims_the_emission_it_reingests() {
+    fn qwen_cache_stable_round_trips() {
         use crate::{
             prompt::{Message, Role},
-            ChatTemplate, Content, RenderOptions,
+            ChatTemplate, Content, RenderOptions, Tool,
         };
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/templates/qwen3.6-gguf.jinja"
-        ));
         let eos = "<|im_end|>";
-        let template = ChatTemplate::from_source(
-            source.to_owned(),
-            String::new(),
-            eos.to_owned(),
-        )
-        .expect("template compiles");
-        let syntax =
-            crate::dialect::analyze_template(source, "", eos).expect("analyze");
-        let base = Prompt {
-            messages: vec![Message {
-                role: Role::User,
-                content: Content::text("Who checks the fog signal?"),
-            }],
-            ..Prompt::default()
-        };
+        let tool = Tool::builder("get_weather")
+            .description("Get the weather for a city.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }))
+            .build()
+            .expect("valid tool");
         // Where the round trip parts, for one emission, as the session
         // measures it: the generation prompt, the emission parsed to
         // blocks, the turn re-rendered.
-        let diverge = |thinking: bool, emission: &str| {
+        let diverge = |source: &str, thinking: bool, emission: &str| {
+            let template = ChatTemplate::from_source(
+                source.to_owned(),
+                String::new(),
+                eos.to_owned(),
+            )
+            .expect("template compiles");
+            let syntax = crate::dialect::analyze_template(source, "", eos)
+                .expect("analyze");
+            let base = Prompt {
+                messages: vec![Message {
+                    role: Role::User,
+                    content: Content::text("Who checks the fog signal?"),
+                }],
+                tools: Some(vec![tool.clone().into()]),
+                ..Prompt::default()
+            };
             let opts = RenderOptions::default()
                 .with_extra("preserve_thinking", true)
                 .with_extra("enable_thinking", thinking)
@@ -12262,7 +12272,7 @@ mod tests {
                 .expect("render");
             let blocks = crate::dialect::parse_text(
                 &syntax,
-                &[],
+                &[&tool],
                 emission,
                 thinking,
                 crate::dialect::Leniency::Final,
@@ -12271,32 +12281,217 @@ mod tests {
             let mut turn = base.clone();
             turn.messages.push(Message {
                 role: Role::Assistant,
-                content: Content(blocks),
+                content: Content(merge_adjacent_prose(blocks)),
             });
             let extended = template
                 .render_with(&turn, &opts.with_generation_prompt(false))
                 .expect("render");
             emission_divergence(&extended, &prompt, emission)
         };
-        // Controls: the habitual shapes round-trip.
-        assert_eq!(diverge(false, "Ada checks it."), None);
-        assert_eq!(
-            diverge(true, "The user asks.\n</think>\n\nAda checks it."),
-            None
-        );
-        // A trailing newline on the answer: trimmed away.
-        assert_eq!(diverge(false, "Ada checks it.\n"), Some(14));
-        assert_eq!(
-            diverge(true, "Thinking.\n</think>\n\nAda checks it.\n"),
-            Some(34)
-        );
-        // A leading newline on the answer: trimmed away.
-        assert_eq!(diverge(false, "\nAda checks it."), Some(0));
-        // A blank line closing the thought: one newline survives.
-        assert_eq!(
-            diverge(true, "The user asks.\n\n</think>\n\nAda."),
-            Some(15)
-        );
+        let call = "<tool_call>\n<function=get_weather>\n\
+                    <parameter=city>\nParis\n</parameter>\n\
+                    </function>\n</tool_call>";
+        // `(thinking, emission)`: the habitual shapes first, then every
+        // shape the stock template broke.
+        let shapes: Vec<(bool, String)> = vec![
+            (false, "Ada checks it.".into()),
+            (true, "The user asks.\n</think>\n\nAda checks it.".into()),
+            (false, call.into()),
+            (false, format!("Checking.\n\n{call}")),
+            (true, format!("Needs a call.\n</think>\n\n{call}")),
+            (true, format!("Plan.\n</think>\n\nChecking.\n\n{call}")),
+            // The answer ends in whitespace.
+            (false, "Ada checks it.\n".into()),
+            (false, "Ada checks it.\n\n".into()),
+            (false, "Ada checks it. ".into()),
+            (true, "Thinking.\n</think>\n\nAda checks it.\n".into()),
+            (true, "Thinking.\n</think>\n\nAda checks it.\n\n".into()),
+            (true, "Thinking.\n</think>\n\nAda checks it. ".into()),
+            // The answer starts with a newline.
+            (false, "\nAda checks it.".into()),
+            (true, "Thinking.\n</think>\n\n\nAda checks it.".into()),
+            // The thought ends in a blank line.
+            (true, "The user asks.\n\n</think>\n\nAda.".into()),
+            (true, "The user asks.\n\n\n</think>\n\nAda.".into()),
+            // One newline, not two, after the close.
+            (true, "The user asks.\n</think>\nAda.".into()),
+            (true, format!("Needs a call.\n</think>\n{call}")),
+            // Prose one newline, not two, before a call.
+            (false, format!("Checking.\n{call}")),
+            (true, format!("Plan.\n</think>\n\nChecking.\n{call}")),
+            // An empty thought is the thinking-off scaffold.
+            (true, "\n</think>\n\nAda checks it.".into()),
+        ];
+        for baked in [&crate::baked::QWEN36, &crate::baked::QWEN38] {
+            let served = crate::baked::detect(baked.stock)
+                .expect("stock dump detects")
+                .replacement;
+            for (thinking, emission) in &shapes {
+                assert_eq!(
+                    diverge(served, *thinking, emission),
+                    None,
+                    "{}: thinking={thinking}: {emission:?}",
+                    baked.name
+                );
+            }
+            // Irreducible, and pinned so an improvement flips them
+            // deliberately (listed in `templates/README.md`):
+            for (emission, at) in [
+                // No block can carry a byte the model did not write, so
+                // a gap it omitted re-renders as the canonical one.
+                ("Thinking.\n</think>Ada.", 18),
+                // An empty thought is the thinking-off scaffold, whose
+                // `\n\n` the template supplies; a lone `\n` after it
+                // stays in the answer and renders after that gap
+                // (`\n</think>\n\n\nAda.`).
+                ("\n</think>\nAda.", 10),
+                // A thought closed without its newline gets the
+                // canonical `\n</think>` back: the parser only strips
+                // that `\n`, it cannot record its absence.
+                ("Thought.</think>\n\nAda.", 8),
+            ] {
+                assert_eq!(
+                    diverge(served, true, emission),
+                    Some(at),
+                    "{}: {emission:?}",
+                    baked.name
+                );
+            }
+            // Whitespace after the last call has no block to ride: the
+            // template closes the turn at `</tool_call>`, so the tail
+            // is dropped. Stock drops it too.
+            for (thinking, emission, at) in [
+                (false, format!("{call}\n"), call.len()),
+                (
+                    true,
+                    format!("Plan.\n</think>\n\n{call}\n"),
+                    16 + call.len(),
+                ),
+            ] {
+                for source in [served, baked.stock] {
+                    assert_eq!(
+                        diverge(source, thinking, &emission),
+                        Some(at),
+                        "{}: {emission:?}",
+                        baked.name
+                    );
+                }
+            }
+            // 3.6 only, and stock too: the inlined thought is recovered
+            // with `split('<think>')[-1]`, so a thought containing a
+            // literal `<think>` loses everything before it. 3.8 reads
+            // `reasoning_content` and round-trips it.
+            let emission = "A <think> B.\n</think>\n\nAda.";
+            let at = std::ptr::eq(baked, &crate::baked::QWEN36).then_some(0);
+            for source in [served, baked.stock] {
+                assert_eq!(
+                    diverge(source, true, emission),
+                    at,
+                    "{}: {emission:?}",
+                    baked.name
+                );
+            }
+            // Control: the stock template breaks the shapes that
+            // motivated the bake — if these pass, the bake is moot.
+            for (thinking, emission, at) in [
+                (false, "Ada checks it.\n", 14),
+                (false, "\nAda checks it.", 0),
+                (true, "The user asks.\n\n</think>\n\nAda.", 15),
+            ] {
+                assert_eq!(
+                    diverge(baked.stock, thinking, emission),
+                    Some(at),
+                    "{} stock: thinking={thinking}: {emission:?}",
+                    baked.name
+                );
+            }
+        }
+    }
+
+    /// An assistant turn aged out with `preserve_thinking` off drops its
+    /// thought, so it can never be byte-stable; there the baked Qwen
+    /// templates must render exactly as stock — including 3.6's
+    /// `lstrip('\n')` of the answer after `</think>`, which keeps a
+    /// leading space or tab where `|trim` would not.
+    #[test]
+    fn qwen_cache_stable_aged_turn_renders_as_stock() {
+        use crate::{
+            prompt::{Message, Role},
+            ChatTemplate, Content, RenderOptions,
+        };
+        let eos = "<|im_end|>";
+        let user = |text: &'static str| Message {
+            role: Role::User,
+            content: Content::text(text),
+        };
+        let emissions = [
+            "Thinking.\n</think>\n\nAda checks it.",
+            "Thinking.\n</think>\n\n \tAda checks it.\n",
+            "Thinking.\n\n</think>\n\t\nAda checks it. ",
+            "\n</think>\n\nAda checks it.",
+            "Ada checks it.\n\n",
+        ];
+        for baked in [&crate::baked::QWEN36, &crate::baked::QWEN38] {
+            // The session analyzes the template it renders with — the
+            // baked one — and threads the dialect's reingest and
+            // reasoning start into every render. Both templates get the
+            // same options (`qwen_cache_stable_analyzes_like_stock`
+            // pins the two analyses equal).
+            let syntax =
+                crate::dialect::analyze_template(baked.replacement, "", eos)
+                    .expect("analyze");
+            // Explicitly off: the session defaults it on, and 3.8
+            // preserves by default besides.
+            let opts = RenderOptions::default()
+                .with_extra("preserve_thinking", false)
+                .with_extra("enable_thinking", true)
+                .with_thought_reingest(syntax.reasoning.reingest)
+                .with_reasoning_start(&syntax.reasoning.start);
+            let render = |source: &str, content: Content| {
+                let template = ChatTemplate::from_source(
+                    source.to_owned(),
+                    String::new(),
+                    eos.to_owned(),
+                )
+                .expect("template compiles");
+                let prompt = Prompt {
+                    messages: vec![
+                        user("Who checks the fog signal?"),
+                        Message {
+                            role: Role::Assistant,
+                            content,
+                        },
+                        user("And the lamp?"),
+                    ],
+                    ..Prompt::default()
+                };
+                template.render_with(&prompt, &opts).expect("render")
+            };
+            for emission in emissions {
+                let parsed = crate::dialect::parse_text(
+                    &syntax,
+                    &[],
+                    emission,
+                    true,
+                    crate::dialect::Leniency::Final,
+                )
+                .blocks;
+                // The parsed blocks, merged as the session seats a
+                // response, and the same turn as one Text block with
+                // the thought inlined, as a client might send it back.
+                for content in [
+                    Content(merge_adjacent_prose(parsed)),
+                    Content::text(format!("<think>\n{emission}")),
+                ] {
+                    assert_eq!(
+                        render(baked.replacement, content.clone()),
+                        render(baked.stock, content),
+                        "{}: {emission:?}",
+                        baked.name
+                    );
+                }
+            }
+        }
     }
 
     /// Every event emitted on this thread while `f` runs, as its level

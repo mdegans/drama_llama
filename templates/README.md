@@ -111,6 +111,85 @@ precedent (`json_dumps`) is a one-filter swap once
 mid-conversation invalidates the cache — inherent to the format, the
 same way Qwen's `enable_thinking` front-rewrite is.
 
+`qwen3.6-gguf.jinja` is dumped from the Qwen3.6-35B-A3B Unsloth GGUF
+(`tokenizer.chat_template`) — byte-identical, modulo the trailing
+newline, across the `UD-Q4_K_S` and `UD-IQ4_XS` quants we serve.
+`qwen3.8-gguf.jinja` is dumped from Qwen3.8-27B `UD-Q8_K_XL`. Both
+moved here from `tests/fixtures/templates/` when they became detection
+keys.
+
+`qwen3.6-cache-stable.jinja` / `qwen3.8-cache-stable.jinja` are
+drama_llama's cache-stability patches of those. The deviation from
+stock, and why: stock `|trim`s an assistant turn's content and its
+reasoning (3.6 also `lstrip`/`rstrip`s the halves it splits on
+`</think>`), then prints a fixed `\n\n` after the close and before the
+first call. The model does not always write exactly that — an answer
+ending in `\n` or a space, one starting with `\n`, a thought closed on
+a blank line, a single `\n` after `</think>` or before `<tool_call>` —
+and every such turn re-rendered differently than it was generated, so
+the next request lost the turn's whole KV (#88's round-trip invariant;
+the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
+
+1. The **assistant** turn renders verbatim — no trim of the answer or
+   the reasoning, and the 3.6 `</think>` split is exact (drama_llama
+   inlines a thought as `<think>…</think>` with no padding, so the
+   split recovers the parsed blocks byte-for-byte). The flip side: the
+   split no longer normalizes a *padded* `<think>\n…\n</think>` a
+   client inlined into a Text block itself — its padding renders
+   inside the thought, doubling the template's own. drama_llama never
+   writes one (`append_block_text` inlines unpadded), so its own
+   turns are unaffected.
+2. The gap after `</think>` is carried by the parsed answer (the
+   parser leaves it there). The template prints its canonical `\n\n`
+   only when there is no thought (the gap then belongs to the
+   thinking-off generation prompt's closed scaffold) or when the
+   answer starts with no whitespace (a client that trimmed it).
+3. Likewise the prose-to-call gap: `\n\n` before the first
+   `<tool_call>` only when the prose does not already end in
+   whitespace.
+4. An aged turn rendered with `preserve_thinking` off drops its
+   thought and cannot be byte-stable anyway; it renders exactly as
+   stock, 3.6's `lstrip('\n')` of the answer included
+   (`qwen_cache_stable_aged_turn_renders_as_stock`).
+
+System, user and tool turns, the reasoning-effort block (3.8), tool
+declarations, tool-call bodies and the generation prompt are
+byte-identical to stock, and the dialect analyzer measures the same
+`CallSyntax` for each pair (`qwen_cache_stable_analyzes_like_stock`).
+Round-trip pins: `session::tests::qwen_cache_stable_round_trips`.
+
+Irreducible, and pinned there so an improvement flips them
+deliberately. The first three because no block can record a byte the
+model *didn't* write; the last two because the template's own
+structure drops bytes, as stock's does:
+
+- A gap after the close the model omitted (`…\n</think>Ada`)
+  re-renders as the canonical `\n\n`.
+- An empty thought followed by a lone `\n` (thinking on,
+  `\n</think>\nAda`): an empty thought is the thinking-off scaffold,
+  whose `\n\n` the template supplies, so the `\n` stays in the answer
+  and renders after it — `\n</think>\n\n\nAda`.
+- A thought closed without its newline (`Thought.</think>\n\nAda`)
+  gets the canonical `\n</think>` back: the parser strips that `\n`
+  when present but cannot record its absence.
+- Whitespace after the last call (`…</tool_call>\n`) is dropped: the
+  template closes the turn right after `</tool_call>`, and no block
+  carries the tail.
+- Qwen3.6 only: a thought containing a literal `<think>` loses
+  everything before it. The inlined thought is recovered with
+  `split('<think>')[-1]`; 3.8 reads `reasoning_content` and
+  round-trips it.
+
+Byte-stable is not token-stable at the prompt seam. An emission that
+*starts* with `\n` was generated as its own token after the generation
+prompt's trailing newline, but when the next request re-tokenizes the
+turn, BPE merges the two (`…\n\n` + `\n` → one `\n\n\n` token). The
+bytes match; the token sequences part at the seam, so the LCP walk
+stops there and the turn re-prefills. Only a tip reached by the
+hash-keyed lookup (`hash_keyed_l_hit`, render-hash equality, which
+reaches past BPE boundaries) survives it. Outside the template's reach
+— a tokenizer property, not a rendering one.
+
 A `<model>.template.jinja` sidecar next to the GGUF still overrides
 any of these — baked templates removed the *need* for sidecar
 deployment on recognized models, not the mechanism.

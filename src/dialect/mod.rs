@@ -543,7 +543,11 @@ impl CallSyntax {
             reasoning: ReasoningSyntax {
                 mode: ReasoningMode::TagBased,
                 start: "<think>".into(),
-                end: "</think>".into(),
+                // Leading newline is canonical, as the analyzer
+                // measures it: the template renders `…\n</think>`, so
+                // the parser takes exactly that `\n` off a thought's
+                // body and keeps any further whitespace in it.
+                end: "\n</think>".into(),
                 reingest: ReasoningReingest::InlineThink,
                 separator: None,
                 efforts: Vec::new(),

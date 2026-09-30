@@ -64,7 +64,26 @@ fn qwen36_gguf_xml() {
     // This template reconstructs reasoning by splitting `content` on
     // `</think>`, so inlining renders identically to the field.
     assert_eq!(s.reasoning.reingest, ReasoningReingest::InlineThink);
+    assert_eq!(s.reasoning.end, "\n</think>", "{s:#?}");
     assert_eq!(s.reasoning.separator.as_deref(), Some("\n\n"), "{s:#?}");
+}
+
+/// The owned Qwen templates change only how an assistant turn's
+/// whitespace re-renders, so they must analyze to exactly the stock
+/// dialect — the grammars, the parser and `render_reference` are
+/// unchanged by the bake.
+#[test]
+fn qwen_cache_stable_analyzes_like_stock() {
+    for (stock, owned) in [
+        ("qwen3.6-gguf.jinja", "qwen3.6-cache-stable.jinja"),
+        ("qwen3.8-gguf.jinja", "qwen3.8-cache-stable.jinja"),
+    ] {
+        assert_eq!(
+            analyze(owned, "", "<|im_end|>"),
+            analyze(stock, "", "<|im_end|>"),
+            "{owned}"
+        );
+    }
 }
 
 /// Qwen3.8 (Unsloth GGUF dump): the same XML call dialect as 3.6, but

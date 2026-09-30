@@ -51,9 +51,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   all four model suites: short tool echoes seed nothing (blocks
   shorter than `ngram_max_size` produce no windows) and surgical
   mode gates single occurrences.
+- **Tag-based reasoning dialects (Qwen, Gemma 4, Mistral 4…) keep a
+  thought's own trailing whitespace.** A closed thought lost
+  everything `trim_end` could take; now only the close marker's
+  canonical leading whitespace comes off (the `\n` of `\n</think>` /
+  `\n<channel|>`; Mistral 4's `[/THINK]` has none, so nothing does),
+  so `Thought.\n\n</think>` parses to `Thought.\n` and re-renders
+  exactly under a verbatim template — every baked one. Harmony already
+  kept its analysis verbatim and is unchanged. An *empty* pre-opened
+  thought now consumes the reasoning separator after it (it is the
+  thinking-off scaffold to the re-render), and `CallSyntax::qwen_xml()`
+  spells its close `\n</think>`, as the analyzer measures it. Visible
+  to API clients: a `thinking` block's text can now end in the
+  model's own blank lines (`"Thought.\n"` where it was `"Thought."`),
+  including under an *unbaked* template that trims them away again on
+  re-render.
 
 ### Fixed
 
+- **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
+  baked cache-stable template.** Their stock templates `|trim` an
+  assistant turn's answer and thought (3.6 also `lstrip`/`rstrip`s the
+  halves it splits on `</think>`) and print a fixed `\n\n` after the
+  close, so a turn the model ended with whitespace, began with a
+  newline, or whose thought closed on a blank line re-rendered shorter
+  than it was generated, and the next request lost the whole turn's KV
+  (the 2026-09-30 Qwen3.6 run's 7364-token tip). The embedded
+  templates of every Qwen3.6 GGUF we serve (35B-A3B `UD-Q4_K_S`,
+  `UD-IQ4_XS`) and of Qwen3.8-27B now detect and are replaced
+  (`baked::QWEN36`, `baked::QWEN38`): the assistant turn renders
+  verbatim, and the template supplies its `\n\n` after the thought and
+  before the first call only where the content carries no whitespace
+  there. Everything else is byte-identical to stock and analyzes to the
+  same dialect. An aged turn (`preserve_thinking` off) still renders
+  exactly as stock. Irreducible and pinned (listed in
+  `templates/README.md`): a gap the model omitted entirely
+  (`</think>Ada`) re-renders as the canonical one; an empty thought's
+  lone `\n` answer gap renders after the scaffold's `\n\n`; a thought
+  closed without its `\n` gets it back; whitespace after the last call
+  is dropped; and (3.6 only) a thought containing a literal `<think>`
+  loses everything before it. Byte-stable is not token-stable at the
+  prompt seam: an emission *starting* with `\n` merges with the
+  generation prompt's trailing newline token under BPE (`\n\n` + `\n`
+  → `\n\n\n`), so such a turn still re-prefills unless its tip is
+  reached by hash.
 - **A forced Harmony call can no longer run to `max_tokens` in
   analysis and commentary.** The eager (`tool_choice` `any` / `tool`)
   gpt-oss grammar admitted any number of analysis and commentary

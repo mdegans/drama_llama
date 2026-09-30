@@ -180,10 +180,10 @@ such a turn that are not the JSON body:
 
 1. **A thought prefix** (`allow_thought` ⇒ `root ::= thought? ws
    output_schema`) *is* normalized: `parse_thought` strips a leading
-   `\n`, `trim_end()`s the body and swallows one `\n` after the close
-   (`parse.rs:609-618`), while the renderer re-emits bare
-   `<think>`/`</think>` and lets the template lay out its own newlines
-   (`chat_template.rs:1114-1117`). Shared with every prose turn; a
+   `\n`, strips only the close marker's canonical leading `\n` from
+   the body (`closed_thought_body`) and swallows one `\n` after the
+   close; baked templates render the thought verbatim and re-supply
+   that `\n`. Shared with every prose turn; a
    prelude swap does not address it.
 2. **Template-level `|trim`.** `ws ::= [ \t\n\r]?`
    (`grammar_compile.rs:878`) permits one whitespace char before the

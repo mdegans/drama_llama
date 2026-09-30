@@ -193,6 +193,14 @@ fn reconstruct_qwen36_gguf() {
     assert_reconstruction("qwen3.6-gguf.jinja", "", "<|im_end|>");
 }
 
+/// The owned Qwen templates (#88): the call-rendering path must be
+/// untouched by the verbatim-assistant-turn patch.
+#[test]
+fn reconstruct_qwen_cache_stable() {
+    assert_reconstruction("qwen3.6-cache-stable.jinja", "", "<|im_end|>");
+    assert_reconstruction("qwen3.8-cache-stable.jinja", "", "<|im_end|>");
+}
+
 #[test]
 fn reconstruct_qwen35() {
     assert_reconstruction("Qwen3.5-4B.jinja", "", "<|im_end|>");
@@ -366,6 +374,16 @@ fn qwen36_prefix_continuity() {
         fixture_source("qwen3.6-gguf.jinja"),
         "<|im_end|>",
     );
+}
+
+/// The same continuity property against the owned Qwen templates:
+/// rendering the assistant turn verbatim must not cost the byte-prefix
+/// property stock already had on tool turns.
+#[test]
+fn qwen_cache_stable_prefix_continuity() {
+    for name in ["qwen3.6-cache-stable.jinja", "qwen3.8-cache-stable.jinja"] {
+        assert_prefix_continuity(fixture_source(name), "<|im_end|>");
+    }
 }
 
 /// Aged-*thinking* continuity for Qwen3.6 — the gap
