@@ -457,8 +457,10 @@ impl CallSyntax {
     /// generated text activates the lazy tool-call grammar and is where
     /// the parser starts a call section.
     ///
-    /// Trimmed because the whitespace is the *call's* first bytes, not
-    /// the opener's. A trigger that includes it never fires on a real
+    /// Trimmed at the end only: the grammar starts at the full marker
+    /// and is fed the trigger, so the trigger must be a prefix of it.
+    /// The trailing whitespace is the *call's* first bytes, not the
+    /// opener's. A trigger that includes it never fires on a real
     /// opener the model follows with anything else (`{`, a space,
     /// `\r\n`, EOG): the call runs unconstrained, the parser leaves
     /// the special in prose, and the session rejects the turn
@@ -470,9 +472,9 @@ impl CallSyntax {
     /// bytes the grammar forces and the re-render reproduces.
     pub fn trigger(&self) -> &str {
         if !self.section_start.is_empty() {
-            self.section_start.trim()
+            self.section_start.trim_end()
         } else {
-            self.per_call_start.trim()
+            self.per_call_start.trim_end()
         }
     }
 

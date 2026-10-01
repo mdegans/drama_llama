@@ -78,8 +78,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   containment rejected the turn (`EmittedSpecialToken`): ~10% of
   cogito-32b attempts in the live Agora cohort, each a resample.
   `CallSyntax::trigger` (and so `triggers`, and the legacy
-  `deferred_grammar_for_prompt`) is now the trimmed marker — the
-  special itself; the grammar, which starts at the full opener, takes
+  `deferred_grammar_for_prompt`) is now the marker with its trailing
+  whitespace trimmed — the special itself, still a prefix of the
+  opener; the grammar, which starts at the full opener, takes
   over one token earlier and forces the canonical newline, so a real
   opener is seated as a call or surfaces as a `GrammarViolation`,
   never as prose. The parser reads openers whitespace-tolerantly
@@ -104,11 +105,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   request (19 live events). The cogito bake now prints the
   prose-to-call gap only when the prose carries none — as the Qwen
   bakes do — and renders content-less turns and trimmed client prose
-  exactly as before. Parallel calls agree too: the analyzer read
-  cogito's inter-call `\n` as no separator (its two probe calls share
-  arguments, and the diff came back rotated), so the grammar forced
-  `</tool_call><tool_call>` against the template's
+  exactly as before. Parallel calls agree too: the analyzer read the
+  inter-call `\n` of per-call JSON templates as no separator (the two
+  probe calls share arguments, and the diff came back rotated), so the
+  grammar forced `</tool_call><tool_call>` against the template's
   `</tool_call>\n<tool_call>`; it now measures `call_separator: "\n"`.
+  Not cogito-only: the NousResearch-Hermes-3 and Qwen3-0.6B templates
+  measure the same `"\n"` now, and their parallel calls change the
+  same way.
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
   assistant turn's answer and thought (3.6 also `lstrip`/`rstrip`s the

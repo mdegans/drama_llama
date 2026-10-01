@@ -160,6 +160,22 @@ fn cogito_parallel_calls_separator() {
     }
 }
 
+/// The same rotated diff, outside cogito: the Hermes 3 and Qwen3 0.6B
+/// per-call JSON templates measured no separator before the cogito fix,
+/// and measure the `\n` they render between calls now.
+#[test]
+fn per_call_json_parallel_calls_separator() {
+    for fixture in [
+        "NousResearch-Hermes-3-Llama-3.1-8B-tool_use.jinja",
+        "Qwen-Qwen3-0.6B.jinja",
+    ] {
+        let s = analyze(fixture, "", "<|im_end|>");
+        assert_eq!(s.family, Family::JsonNative, "{fixture}: {s:#?}");
+        assert_eq!(s.per_call_start, "<tool_call>\n", "{fixture}: {s:#?}");
+        assert_eq!(s.call_separator, "\n", "{fixture}: {s:#?}");
+    }
+}
+
 /// Hermes 3: the original <tool_call>{json}</tool_call> shape —
 /// JSON_NATIVE with section markers.
 #[test]

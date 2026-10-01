@@ -235,8 +235,10 @@ pub fn deferred_grammar_for_prompt(
     if tools.is_empty() {
         return Ok(None);
     }
-    // The bare tag, not its layout newline: see `CallSyntax::trigger`.
-    let Some(open) = opts.wrap_tags.map(|(open, _)| open.trim()) else {
+    // The bare tag, not its layout newline — trimmed at the end only, so
+    // it stays a prefix of the opener the grammar starts at: see
+    // `CallSyntax::trigger`.
+    let Some(open) = opts.wrap_tags.map(|(open, _)| open.trim_end()) else {
         return Ok(None);
     };
     if open.is_empty() {
