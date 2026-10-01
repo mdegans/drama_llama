@@ -580,6 +580,7 @@ impl Mtmd {
             }
             offset += len;
         }
+        decoder.note_media_head(seq_id, start_pos as i32 + n_pos as i32);
 
         Ok(MediaSpan {
             n_tokens: n_tokens as u32,
@@ -639,6 +640,7 @@ impl Mtmd {
             start_pos as llama_pos + n_pos as llama_pos,
             "helper position advance disagrees with chunk n_pos"
         );
+        decoder.note_media_head(seq_id, new_n_past);
 
         Ok(MediaSpan { n_tokens, n_pos })
     }
@@ -1265,10 +1267,13 @@ mod tests {
     ///   derived from pos_max when the tip is a media chunk.
     /// * Boundaries the walk wants to rewind to MUST be
     ///   checkpointed at prefill time (Session already does this) —
-    ///   including a boundary at image-end, which works via
-    ///   snapshot even though the truncate-based path would fail
-    ///   its dense-position check there (pure-attention M-RoPE
-    ///   models fall back to full reprefill at such a boundary).
+    ///   including a boundary at image-end. There `pos_max + 1` is
+    ///   not the head, so the vision path reports the chunk's end
+    ///   (`LlamaCppDecoder::note_media_head`) and the checkpoint
+    ///   rules take the head from it; without that report the
+    ///   image-end checkpoint is skipped as off-head and the rewind
+    ///   fails closed. Both rewinds below re-extend to logits
+    ///   bit-identical to the cold prefill.
     /// * A restore to an uncheckpointed position fails closed; on
     ///   this hybrid the KV is left untouched (truncate refused
     ///   up front), while on pure-attention models the truncate
@@ -1350,6 +1355,16 @@ mod tests {
             .expect("trail prefill (tail)");
         let full_end = after + trail.len();
         assert_eq!(engine.memory_seq_pos_max(0), full_end as i32 - 1);
+        // The next-token logits over the whole prompt, prefilled cold:
+        // what every rewind-and-re-extend below must reproduce.
+        let last = trail.len() - 3;
+        let cold = engine.decoder.logits(last).to_vec();
+        let max_diff = |warm: &[f32]| {
+            cold.iter()
+                .zip(warm)
+                .map(|(c, w)| (c - w).abs())
+                .fold(0f32, f32::max)
+        };
 
         // Rewind to the checkpointed text boundary and re-extend:
         // the core prefix-cache maneuver, now with an image in the
@@ -1362,6 +1377,9 @@ mod tests {
             .prefill_chunk(&trail[2..], b_text, 0)
             .expect("re-extend after restore");
         assert_eq!(engine.memory_seq_pos_max(0), full_end as i32 - 1);
+        let diff = max_diff(engine.decoder.logits(last));
+        eprintln!("probe: text-boundary rewind, max |logit diff| {diff}");
+        assert_eq!(diff, 0.0, "a text-boundary rewind is not the cold run");
 
         // Rewind to the image-end boundary. On this hybrid it rides
         // the snapshot; the retained tip is the media chunk, so
@@ -1371,10 +1389,19 @@ mod tests {
             .restore_to(0, after as i32)
             .expect("restore to the checkpointed image-end boundary");
         assert_eq!(engine.memory_seq_pos_max(0), t as i32);
+        // Re-extended over the same chunking as the cold run, so the
+        // logits must match it bit for bit: the image's attention KV
+        // and the recurrent state after it are the ones it decoded.
         engine
-            .prefill_chunk(&trail, after, 0)
-            .expect("re-extend from image-end boundary");
+            .prefill_chunk(&trail[..2], after, 0)
+            .expect("re-extend from image-end boundary (head)");
+        engine
+            .prefill_chunk(&trail[2..], b_text, 0)
+            .expect("re-extend from image-end boundary (tail)");
         assert_eq!(engine.memory_seq_pos_max(0), full_end as i32 - 1);
+        let diff = max_diff(engine.decoder.logits(last));
+        eprintln!("probe: image-end rewind, max |logit diff| {diff}");
+        assert_eq!(diff, 0.0, "an image-end rewind is not the cold run");
 
         // Uncheckpointed position (mid-gap, worst case) fails closed.
         let mid_gap = t + (span.n_pos as usize / 2);

@@ -284,8 +284,9 @@ impl SnapshotStore {
     }
 
     /// Whether a snapshot is stored at `key`. Does not touch the LRU
-    /// order — asking is not a use.
-    #[cfg(test)]
+    /// order — asking is not a use. Read by llama.cpp's media-tip
+    /// bookkeeping, so it is dead in a moeflux-only build.
+    #[cfg_attr(not(any(test, feature = "llama-cpp")), allow(dead_code))]
     pub(crate) fn contains(&self, key: (i32, i32)) -> bool {
         self.map.contains_key(&key)
     }

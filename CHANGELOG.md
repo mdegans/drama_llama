@@ -265,6 +265,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An image-end boundary checkpoints and rewinds again on M-RoPE
+  models (Qwen3.6 with an image).** The checkpoint rules took a
+  sequence's head as `pos_max + 1`, but every cell of an M-RoPE image
+  carries the chunk's *start* position while the counter advances by
+  `n_pos`, so a checkpoint at image-end was skipped as off-head and the
+  restore there failed with `NoCheckpoint` (caught by
+  `mtmd::tests::mrope_kv_semantics_probe`). The vision path now reports
+  each media chunk's end to the decoder, the head comes from it while
+  the chunk is the tip, and each checkpoint records the `pos_max` it
+  was taken over so a restore checks it landed there. The report is
+  dropped by anything that touches the cells below its end (a
+  truncate, a checkpoint load, `memory_*`), so text decoded later at
+  the image's old start never inherits its end. A pure-attention
+  M-RoPE model now also rewinds to image-end by truncation. Verified
+  on Qwen3.6: both a text-boundary and an image-end rewind re-extend
+  to logits bit-identical to the cold prefill.
 - **A turn the model wrote in a split its tokenizer would not produce
   keeps its tip ("trust the emission").** A model does not always emit
   the tokenizer's own segmentation of its text — a grammar forces a

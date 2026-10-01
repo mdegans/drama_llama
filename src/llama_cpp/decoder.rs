@@ -527,6 +527,19 @@ impl LlamaCppDecoder {
         unsafe { llama_set_n_threads(self.context, n_gen, n_batch) }
     }
 
+    /// Record that `seq_id` just decoded a media chunk whose positions
+    /// run up to `head` (start + `n_pos`). An M-RoPE image's cells all
+    /// sit at its start, so `pos_max + 1` falls short of the head; this
+    /// lets [`Decoder::checkpoint_pos`] / [`Decoder::restore_to`] treat
+    /// the image-end boundary as one. See `llama_cpp::checkpoint`.
+    pub(crate) fn note_media_head(&mut self, seq_id: llama_seq_id, head: i32) {
+        self.checkpoints.note_media(
+            &mut ContextMemory(self.context),
+            seq_id,
+            head,
+        );
+    }
+
     /// Clear the KV cache, and every checkpoint with it.
     ///
     /// This and the other `memory_*` mutators take `&mut self` and keep
@@ -908,17 +921,15 @@ impl Decoder for LlamaCppDecoder {
     /// truncate. Checkpoints above `pos` are dropped per the trait
     /// contract.
     ///
-    /// Position-density caveat (media, #31): the head check assumes a
-    /// cell exists at `pos - 1`. M-RoPE images break density — all
+    /// Media (#31): M-RoPE images break position density — all
     /// ~n_tokens cells share the chunk's start position and positions
-    /// (start, start + n_pos) are a gap — so a truncate to a boundary
-    /// just past an M-RoPE image sees `pos_max == image_start != pos -
-    /// 1` and fails closed even though the prefix is intact (validated
-    /// by `mtmd::tests::mrope_kv_semantics_probe`). That is acceptable:
-    /// Session boundaries land in text (breakpoints are
-    /// message-granular and message-close text follows every image),
-    /// and a false failure only costs the checkpoint / full-reprefill
-    /// fallback, never correctness.
+    /// (start, start + n_pos) are a gap — so `pos_max + 1` is not the
+    /// head after one. The vision path reports each chunk it decodes
+    /// (`note_media_head`), and the image-end boundary then
+    /// checkpoints and rewinds like a text one (validated by
+    /// `mtmd::tests::mrope_kv_semantics_probe`). Should that report be
+    /// lost, the boundary fails closed: a checkpoint / full-reprefill
+    /// fallback, never corruption.
     fn restore_to(
         &mut self,
         seq_id: i32,

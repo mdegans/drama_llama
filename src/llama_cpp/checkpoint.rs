@@ -40,8 +40,20 @@
 //! reports it here. Loading a stale one would hand the model the
 //! window or recurrent state of a different history (#91's cardinal
 //! sin), so invalidation errs wide.
+//!
+//! # Media tips
+//!
+//! The rules above find a sequence's head — the position its next
+//! token takes — as `pos_max + 1`. An M-RoPE image (Qwen-VL, Qwen3.6)
+//! breaks that: all of its cells carry the chunk's *start* position
+//! `P`, while it advances the position counter by `n_pos`. After one,
+//! `pos_max` reads `P` and the head is `P + n_pos`. The decoder reports
+//! each media chunk it decodes ([`Checkpoints::note_media`]), so a
+//! sequence whose tip is such a chunk still checkpoints and rewinds at
+//! its image-end boundary, and every checkpoint remembers the `pos_max`
+//! it was taken over, so a restore checks it landed on that tip.
 
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 use crate::{backend::MemoryRmError, snapshot_store::SnapshotStore};
 
@@ -181,6 +193,20 @@ pub(crate) struct Checkpoints {
     /// `llama_model_n_swa`: how far back a position's attention reaches
     /// (`0` = unbounded, dense).
     n_swa: u32,
+    /// The sequences whose tip is a media chunk that spans more
+    /// positions than its cells report (see [Media tips](self#media-tips)).
+    media_tips: HashMap<i32, MediaTip>,
+    /// For each stored checkpoint taken at a media tip, the `pos_max`
+    /// its sequence reported then (`pos - 1` for every other one).
+    tip_of: HashMap<(i32, i32), i32>,
+}
+
+/// A sequence's tip is a media chunk whose cells all sit at `cells_at`
+/// and whose positions run up to `head`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MediaTip {
+    cells_at: i32,
+    head: i32,
 }
 
 impl Checkpoints {
@@ -193,6 +219,8 @@ impl Checkpoints {
             mode,
             native: mode,
             n_swa,
+            media_tips: HashMap::new(),
+            tip_of: HashMap::new(),
         };
         this.set_budget(CheckpointBudget::default());
         this
@@ -247,7 +275,7 @@ impl Checkpoints {
         if self.mode == Checkpointing::Off {
             return;
         }
-        let head = mem.seq_pos_max(seq) + 1;
+        let head = self.head(mem, seq);
         if head != pos {
             tracing::warn!(
                 target: "drama_llama::snapshot_store",
@@ -284,7 +312,14 @@ impl Checkpoints {
             return;
         }
         let len = bytes.len();
+        let tip = mem.seq_pos_max(seq);
         if self.store.insert((seq, pos), bytes) {
+            if tip == pos - 1 {
+                self.tip_of.remove(&(seq, pos));
+            } else {
+                self.tip_of.insert((seq, pos), tip);
+            }
+            self.prune_tips();
             tracing::debug!(
                 target: "drama_llama::snapshot_store",
                 event = "checkpoint_taken",
@@ -321,6 +356,7 @@ impl Checkpoints {
         if truncated {
             // The KV above `pos` is gone whatever happens next.
             self.invalidate_partial(|s, p| s == seq && p > pos);
+            self.drop_media_tips(|s, tip| s == seq && pos < tip.head);
         }
         if truncated && self.window_intact(mem, seq, pos) {
             self.store.invalidate_after(seq, pos);
@@ -342,6 +378,12 @@ impl Checkpoints {
         let Some(bytes) = self.store.take((seq, pos)) else {
             return Err(MemoryRmError::NoCheckpoint { pos });
         };
+        // Where the sequence's cells end once it is back at `pos`: the
+        // media chunk's start when the checkpoint was taken at one.
+        let tip = self.tip_of.get(&(seq, pos)).copied().unwrap_or(pos - 1);
+        // The load rewrites the sequence below its current media tip, if
+        // it has one; a success sets the checkpoint's own back.
+        self.media_tips.remove(&seq);
         let len = bytes.len();
         let loaded = match self.mode {
             // The checkpoint first: a recurrent layer refuses the
@@ -354,7 +396,18 @@ impl Checkpoints {
                 mem.load(seq, &bytes, false)
             }
         };
-        if loaded && mem.seq_pos_max(seq) == pos - 1 {
+        if loaded && mem.seq_pos_max(seq) == tip {
+            if tip == pos - 1 {
+                self.media_tips.remove(&seq);
+            } else {
+                self.media_tips.insert(
+                    seq,
+                    MediaTip {
+                        cells_at: tip,
+                        head: pos,
+                    },
+                );
+            }
             // Still valid — it survives its own restore so `Session` can
             // rewind to the same anchor again.
             self.store.insert((seq, pos), bytes);
@@ -400,7 +453,7 @@ impl Checkpoints {
         seq: i32,
         pos: i32,
     ) -> bool {
-        if mem.seq_pos_max(seq) != pos - 1 {
+        if self.head(mem, seq) != pos {
             return false;
         }
         if self.n_swa == 0 || pos == 0 {
@@ -410,15 +463,63 @@ impl Checkpoints {
         (0..=floor).contains(&mem.seq_pos_min(seq))
     }
 
+    /// `seq` just decoded a media chunk whose positions run up to
+    /// `head`. When its cells report less — an M-RoPE image, every cell
+    /// at the chunk's start — remember where its head really is, so the
+    /// image-end boundary checkpoints and rewinds like any other (see
+    /// [Media tips](self#media-tips)).
+    pub(crate) fn note_media(
+        &mut self,
+        mem: &mut impl SeqMemory,
+        seq: i32,
+        head: i32,
+    ) {
+        let cells_at = mem.seq_pos_max(seq);
+        if (0..head - 1).contains(&cells_at) {
+            self.media_tips.insert(seq, MediaTip { cells_at, head });
+        } else {
+            self.media_tips.remove(&seq);
+        }
+    }
+
+    /// The position `seq`'s next token takes: one past its last cell,
+    /// or the end of the media chunk at its tip.
+    fn head(&self, mem: &mut impl SeqMemory, seq: i32) -> i32 {
+        let pos_max = mem.seq_pos_max(seq);
+        match self.media_tips.get(&seq) {
+            Some(tip) if tip.cells_at == pos_max => tip.head,
+            _ => pos_max + 1,
+        }
+    }
+
+    /// Drop the media tips matching `stale`: the cells under them may
+    /// be gone. Errs wide, like checkpoint invalidation — a tip dropped
+    /// while its cells survive only costs a checkpoint at image-end.
+    fn drop_media_tips(
+        &mut self,
+        mut stale: impl FnMut(i32, MediaTip) -> bool,
+    ) {
+        self.media_tips.retain(|&s, &mut tip| !stale(s, tip));
+    }
+
+    /// Forget the media tips of checkpoints no longer stored.
+    fn prune_tips(&mut self) {
+        let store = &self.store;
+        self.tip_of.retain(|&key, _| store.contains(key));
+    }
+
     /// Drop the checkpoint at `(seq, pos)`, if any.
     pub(crate) fn forget(&mut self, seq: i32, pos: i32) {
         self.store.forget((seq, pos));
+        self.tip_of.remove(&(seq, pos));
     }
 
     /// Drop every checkpoint: the whole KV was cleared or replaced.
     pub(crate) fn clear(&mut self) {
         let count = self.store.len();
         self.store.clear();
+        self.tip_of.clear();
+        self.media_tips.clear();
         log_invalidated(count, 0);
     }
 
@@ -428,6 +529,7 @@ impl Checkpoints {
     /// over. One *at* `p0` still does — `[0, p0)` is untouched.
     pub(crate) fn invalidate_from(&mut self, seq: i32, p0: i32) {
         let p0 = p0.max(0);
+        self.drop_media_tips(|s, tip| (seq < 0 || s == seq) && p0 < tip.head);
         self.invalidate_partial(|s, p| (seq < 0 || s == seq) && p > p0);
     }
 
@@ -448,6 +550,7 @@ impl Checkpoints {
 
     /// Every sequence but `seq` was dropped.
     pub(crate) fn keep_only(&mut self, seq: i32) {
+        self.drop_media_tips(|s, _| s != seq);
         self.invalidate_partial(|s, _| s != seq);
     }
 
@@ -461,6 +564,7 @@ impl Checkpoints {
         }
         let before = self.store.len();
         self.store.retain(|s, p| !stale(s, p));
+        self.prune_tips();
         log_invalidated(before - self.store.len(), self.store.len());
     }
 
@@ -559,6 +663,21 @@ mod tests {
                     }
                     Layers::Dense => {}
                 }
+            }
+        }
+
+        /// Decode an M-RoPE image onto `seq` at `at`: its cells all carry
+        /// `at`, the position counter moves on to `at + n_pos`. One cell
+        /// stands for them all; the recurrent state folds it in and
+        /// takes the counter's position, as llama.cpp's does.
+        fn decode_mrope_image(&mut self, seq: i32, at: i32, n_pos: i32) {
+            let image = u32::MAX;
+            self.dense.entry(seq).or_default().insert(at, image);
+            if self.layers == Layers::Hybrid {
+                let (last, folded) =
+                    self.recurrent.entry(seq).or_insert((-1, Vec::new()));
+                *last = at + n_pos - 1;
+                folded.push(image);
             }
         }
 
@@ -1045,6 +1164,86 @@ mod tests {
         let mut ckpt = fresh();
         ckpt.invalidate_div(0, -1, 2);
         assert_eq!(held(&ckpt), [false; 3], "the whole sequence");
+    }
+
+    /// An M-RoPE image leaves `pos_max` at its start, short of the head.
+    /// Reported by the decoder, its end boundary checkpoints and rewinds
+    /// on the hybrid the way a text one does (the live Qwen3.6 path:
+    /// `mtmd::tests::mrope_kv_semantics_probe`).
+    #[test]
+    fn an_mrope_image_end_checkpoints_and_restores() {
+        let (mut mem, mut ckpt) = rig(Layers::Hybrid, 4);
+        mem.decode_mrope_image(0, 4, 16);
+        assert_eq!(mem.seq_pos_max(0), 4);
+        ckpt.checkpoint(&mut mem, 0, 20);
+        assert!(!ckpt.contains(0, 20), "unreported, 20 is not the head");
+
+        ckpt.note_media(&mut mem, 0, 20);
+        ckpt.checkpoint(&mut mem, 0, 20);
+        assert!(ckpt.contains(0, 20));
+        mem.decode(0, 20, &tokens(25)[20..]);
+        ckpt.checkpoint(&mut mem, 0, 25);
+        assert!(ckpt.contains(0, 25), "text after the image is dense");
+
+        assert_eq!(ckpt.restore(&mut mem, 0, 20), Ok(()));
+        assert_eq!(mem.seq_pos_max(0), 4);
+        assert_eq!(mem.recurrent[&0].0, 19, "state after the image");
+        assert_eq!(ckpt.head(&mut mem, 0), 20);
+        // And again, after a different continuation.
+        mem.decode(0, 20, &[7, 8]);
+        assert_eq!(ckpt.restore(&mut mem, 0, 20), Ok(()));
+        assert_eq!(ckpt.head(&mut mem, 0), 20);
+
+        // A pure-attention M-RoPE model rewinds there by truncation.
+        let (mut mem, mut ckpt) = rig(Layers::Dense, 4);
+        mem.decode_mrope_image(0, 4, 16);
+        ckpt.note_media(&mut mem, 0, 20);
+        mem.decode(0, 20, &tokens(25)[20..]);
+        assert_eq!(ckpt.restore(&mut mem, 0, 20), Ok(()));
+        assert_eq!(ckpt.head(&mut mem, 0), 20);
+    }
+
+    /// A media tip lives only as long as its cells: once anything below
+    /// its end is removed or rewritten, `pos_max + 1` is the head again —
+    /// text decoded back up to the image's old start must not inherit
+    /// the image's end.
+    #[test]
+    fn a_media_tip_dies_with_its_cells() {
+        // Removed through the decoder.
+        let (mut mem, mut ckpt) = rig(Layers::Dense, 4);
+        mem.decode_mrope_image(0, 4, 16);
+        ckpt.note_media(&mut mem, 0, 20);
+        ckpt.invalidate_from(0, 4);
+        mem.seq_rm(0, 4, -1);
+        mem.decode(0, 4, &[7]);
+        assert_eq!(ckpt.head(&mut mem, 0), 5);
+
+        // Rewound below it by truncation.
+        let (mut mem, mut ckpt) = rig(Layers::Dense, 4);
+        mem.decode_mrope_image(0, 4, 16);
+        ckpt.note_media(&mut mem, 0, 20);
+        assert_eq!(ckpt.restore(&mut mem, 0, 4), Ok(()));
+        mem.decode(0, 4, &[7]);
+        assert_eq!(ckpt.head(&mut mem, 0), 5);
+
+        // Rewound below it through a checkpoint, whose load rewrites the
+        // KV without a truncate the tip would hear about.
+        let (mut mem, mut ckpt) = rig(Layers::Hybrid, 2);
+        ckpt.checkpoint(&mut mem, 0, 2);
+        mem.decode(0, 2, &tokens(4)[2..]);
+        mem.decode_mrope_image(0, 4, 16);
+        ckpt.note_media(&mut mem, 0, 20);
+        assert_eq!(ckpt.restore(&mut mem, 0, 2), Ok(()));
+        mem.decode(0, 2, &[7, 8, 9]);
+        assert_eq!(mem.seq_pos_max(0), 4);
+        assert_eq!(ckpt.head(&mut mem, 0), 5);
+
+        // Another sequence's tip is not this one's.
+        let (mut mem, mut ckpt) = rig(Layers::Dense, 4);
+        mem.decode_mrope_image(0, 4, 16);
+        ckpt.note_media(&mut mem, 0, 20);
+        ckpt.keep_only(1);
+        assert_eq!(ckpt.head(&mut mem, 0), 5);
     }
 
     /// A checkpoint is taken at the head or not at all: filing another
