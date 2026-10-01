@@ -57,7 +57,9 @@
 use serde_json::Value;
 
 use crate::{
-    dialect::{cut_value, OpenCall, Parsed, StreamParser},
+    dialect::{
+        cut_value, OpenCall, ParseStatus, Parsed, Provenance, StreamParser,
+    },
     predictor::{first_stop_string, stop_string_holdback},
     Block,
 };
@@ -468,6 +470,35 @@ pub(super) fn raw_stop_cut(
             .last()
             .unwrap_or(longest),
     )
+}
+
+/// A stop cut of a generation read with emission provenance: the
+/// output [`cut_at_stop`] keeps, and where [`raw_stop_cut`] cuts the
+/// raw bytes — `provenance.restore(marked)` — to match it. `parse` is
+/// the clipped parse of marked text. Each raw prefix is parsed as the
+/// marked text it restores from (`Provenance::marked_prefix`): a stop
+/// can start inside a piece the model spelled, where no marked prefix
+/// ends.
+pub(super) fn marked_stop_cut(
+    provenance: &Provenance,
+    marked: &str,
+    stop: &str,
+    parse: impl Fn(&str) -> (Parsed, Option<OpenCall>),
+) -> (Vec<Block>, Option<usize>) {
+    let raw = provenance.restore(marked);
+    let parse_to = |end: usize| {
+        provenance.restore_parse(parse(&provenance.marked_prefix(marked, end)))
+    };
+    // A prefix withholding a structure in flight, with no call to show
+    // for it, is not where any stop fell.
+    let view = |prefix: &str| {
+        let (parsed, open) = parse_to(prefix.len());
+        let complete = parsed.status == ParseStatus::Complete;
+        (complete || open.is_some()).then(|| stop_view((parsed, open), true))
+    };
+    let (kept, _) = cut_at_stop(stop_view(parse_to(raw.len()), false), &[stop]);
+    let at = raw_stop_cut(&raw, &kept, view);
+    (kept, at)
 }
 
 #[cfg(test)]

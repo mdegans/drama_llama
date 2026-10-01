@@ -1330,6 +1330,28 @@ mod tests {
         }
     }
 
+    /// A stop that ends in a tail provenance holds back (`<` could
+    /// still become a spelled piece) is seen a token late; a real
+    /// special in that token lies past the cut, in nothing the caller
+    /// sees, so containment does not reject the turn for it. (A real
+    /// `<tool_call>` there is an opener in flight, never free text;
+    /// the real close is the case that was rejected.)
+    #[test]
+    fn containment_reads_only_what_the_stop_keeps() {
+        for real in [TOOL_CALL, TOOL_CALL_END] {
+            let script =
+                [bytes("hello <"), vec![real], bytes(" more")].concat();
+            let prompt = Prompt {
+                stop_sequences: Some(vec![" <".into()]),
+                messages: vec![message(crate::Role::User, vec![text("go")])],
+                ..Prompt::default()
+            };
+            let mut s = scripted(script);
+            let blocks = s.complete_blocks(&prompt).expect("batch");
+            assert_eq!(blocks, [text("hello")], "{real}");
+        }
+    }
+
     /// A turn quoting a spelled piece re-renders to the bytes the model
     /// emitted — the auto-tip's `byte_stable` — with the piece a
     /// content literal in the render, as it is on the next ingest.

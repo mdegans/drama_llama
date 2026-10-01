@@ -6566,27 +6566,18 @@ impl<B: Backend> Session<B> {
         });
         if let Some(hit) = hit {
             let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
-            let parse = |end: usize| {
-                provenance.restore_parse(crate::dialect::parse_text_open(
+            let parse = |text: &str| {
+                crate::dialect::parse_text_open(
                     &parse_syntax,
                     &tool_refs,
-                    &provenance.marked_prefix(&marked, end),
+                    text,
                     pre_opened_reasoning,
                     crate::dialect::Leniency::Clipped,
-                ))
+                )
             };
-            // A prefix withholding a structure in flight, with no call
-            // to show for it, is not where any stop fell.
-            let view = |prefix: &str| {
-                let (parsed, open) = parse(prefix.len());
-                let complete =
-                    parsed.status == crate::dialect::ParseStatus::Complete;
-                (complete || open.is_some())
-                    .then(|| stop::stop_view((parsed, open), true))
-            };
-            let blocks = stop::stop_view(parse(trimmed.len()), false);
-            let (kept, _) = stop::cut_at_stop(blocks, &[&hit]);
-            if let Some(at) = stop::raw_stop_cut(&trimmed, &kept, view) {
+            if let (_, Some(at)) =
+                stop::marked_stop_cut(&provenance, &marked, &hit, parse)
+            {
                 trimmed.truncate(at);
             }
         }
@@ -7158,11 +7149,27 @@ impl<B: Backend> Session<B> {
         let (marked, blocks, cut, in_flight) = match hit {
             // Its KV no longer matches the output either way.
             Some(stop) => {
-                let (parsed, open) = parse(crate::dialect::Leniency::Clipped);
-                let marked = parsed.blocks.clone();
-                let restored = provenance.restore_parse((parsed, open));
-                let blocks = stop::stop_view(restored, false);
-                let (blocks, _) = stop::cut_at_stop(blocks, &[&stop]);
+                let clipped = |text: &str| {
+                    crate::dialect::parse_text_open(
+                        &parse_syntax,
+                        &tool_refs,
+                        text,
+                        pre_opened_reasoning,
+                        crate::dialect::Leniency::Clipped,
+                    )
+                };
+                let (blocks, at) = stop::marked_stop_cut(
+                    &provenance,
+                    &marked_text,
+                    &stop,
+                    clipped,
+                );
+                // Containment reads what the cut keeps (see there).
+                let kept = match at {
+                    Some(at) => provenance.marked_prefix(&marked_text, at),
+                    None => std::borrow::Cow::Borrowed(marked_text.as_str()),
+                };
+                let marked = clipped(&kept).0.blocks;
                 (marked, blocks, Some(Cut::StopSequence(stop)), true)
             }
             None => {
@@ -7445,9 +7452,10 @@ impl<B: Backend> Session<B> {
         // forever. The parse read the spelling as text too (emission
         // provenance), so it is in free text here, as a marker in
         // `marked`: what is left there as a piece is a real token.
-        // (Read off the parse before a stop sequence cuts it; the loop
-        // breaks on the piece that completes the stop, so little lies
-        // past it.)
+        // Of a turn a stop sequence cut, `marked` is only what the cut
+        // keeps: the stop is seen a piece late, or later while
+        // provenance holds back a tail that could still grow into a
+        // piece, and a real special past it reaches no one.
         //
         // Deliberately NOT `record_cache_miss_on_error` (contrast the
         // grammar-violation arm above): the constraint completed, so
