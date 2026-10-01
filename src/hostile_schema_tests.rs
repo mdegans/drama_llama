@@ -1120,3 +1120,184 @@ fn schema_check_at_the_limits_stays_in_budget() {
         assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
     }
 }
+
+/// The most resident memory, in MB, the footprint guards allow the test
+/// process: the hostile rechecks' line for "exhausts memory".
+pub(crate) const FOOTPRINT_LIMIT_MB: u64 = 1200;
+
+/// The most any one step of a footprint guard may take. The rechecks'
+/// line is a second; this leaves room for a slower machine.
+pub(crate) const FOOTPRINT_STEP_SECS: f64 = 2.0;
+
+/// This process's resident set, in MB, as `ps` reports it (Linux and
+/// macOS alike, no `unsafe`), or 0 when `ps` is unavailable.
+pub(crate) fn rss_mb() -> u64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .map_or(0, |kib| kib / 1024)
+}
+
+/// Run `step`, then hold it to [`FOOTPRINT_STEP_SECS`] and the process
+/// to [`FOOTPRINT_LIMIT_MB`], logging both.
+pub(crate) fn guarded<T>(name: &str, step: impl FnOnce() -> T) -> T {
+    let start = Instant::now();
+    let out = step();
+    let (took, rss) = (start.elapsed(), rss_mb());
+    eprintln!("footprint: {name}: {took:?}, {rss} MB resident");
+    assert!(took.as_secs_f64() < FOOTPRINT_STEP_SECS, "{name}: {took:?}");
+    assert!(rss < FOOTPRINT_LIMIT_MB, "{name}: {rss} MB resident");
+    out
+}
+
+/// Footprint guard for the schema pipelines — the hostile rechecks'
+/// probes (`adv`, `guard.sh`), committed. Requests at the default
+/// [`SchemaLimits`] and past them go through every pipeline a client's
+/// schema reaches: the up-front measure, each dialect's compile (with
+/// the tagged dialect's classifier) and the grammar parse, the parse of
+/// a large call, the schema check over ~32k tokens of output, and the
+/// matcher over a value naming the last alternative. Each step must
+/// finish in [`FOOTPRINT_STEP_SECS`] and the process stay under
+/// [`FOOTPRINT_LIMIT_MB`] resident. Its matcher counterpart, which
+/// feeds adversarial byte streams through a vocabulary filter, is
+/// `sample::grammar::tests::footprint_guard_matcher`.
+///
+/// Ignored because it measures the whole process, so it must run
+/// alone: under nextest (a process per test), e.g. in the nightly/GPU
+/// window, `cargo nextest run --run-ignored only -E
+/// 'test(footprint_guard)'`; under `cargo test`, with
+/// `--test-threads=1`. CPU only, no model.
+#[test]
+#[ignore = "footprint guard: measures process RSS, so run it alone"]
+fn footprint_guard_pipelines() {
+    use crate::schema_check::check_counted;
+    let limits = SchemaLimits::default();
+    let wide = {
+        let inner: Map<String, Value> =
+            (0..2_000).map(|i| (format!("k{i}"), json!({}))).collect();
+        json!({"type": "object", "properties": {
+            "o": {"type": "object", "properties": inner},
+        }})
+    };
+    let many: Vec<Tool> = (0..512)
+        .map(|i| {
+            Tool::builder(format!("t{i}"))
+                .description("d")
+                .schema(json!({
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"enum": ["x", "y"]}},
+                    "required": ["a"],
+                }))
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let enum_tool = tool(json!({
+        "type": "object",
+        "properties": {"x": {"enum": (0..2040)
+            .map(|i| format!("m{i:05}"))
+            .collect::<Vec<_>>()}},
+        "required": ["x"],
+    }));
+    let requests: Vec<(&str, Vec<Tool>)> = vec![
+        (
+            "512 params x 8 shared defs",
+            vec![tool(shared_defs_schema())],
+        ),
+        ("2,000 nested optionals", vec![tool(wide)]),
+        ("512 tools", many),
+        ("a 2,040-member enum", vec![enum_tool]),
+        (
+            "nested anyOf at the width limit",
+            vec![tool(json!({
+                "type": "object",
+                "properties": {"x": nested_any_of(4, 119)},
+                "required": ["x"],
+            }))],
+        ),
+    ];
+    for (name, tools) in &requests {
+        let refs: Vec<&Tool> = tools.iter().collect();
+        guarded(&format!("{name}: measure"), || {
+            check_schemas(refs.iter().copied(), None, &limits).expect(name)
+        });
+        for syntax in syntaxes() {
+            let family = syntax.family;
+            let src = guarded(&format!("{name}: {family:?} compile"), || {
+                grammar_source(&syntax, &refs, &lazy())
+            });
+            if let Ok(src) = src {
+                guarded(&format!("{name}: {family:?} grammar parse"), || {
+                    Grammar::parse(&src).expect(name)
+                });
+            }
+        }
+    }
+
+    // A Qwen call naming all 512 parameters, ~100 KB, parsed.
+    let shared = tool(shared_defs_schema());
+    let params: Vec<(String, String)> = (0..512)
+        .map(|p| (format!("p{p}"), format!("member_{}_{:03}", p % 8, p % 100)))
+        .collect();
+    let refs: Vec<(&str, &str)> = params
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let call = qwen_call(&refs).repeat(8);
+    let parsed = guarded("512-param Qwen calls x 8: parse", || {
+        parse_text(
+            &CallSyntax::qwen_xml(),
+            &[&shared],
+            &call,
+            false,
+            Leniency::Final,
+        )
+    });
+    assert_eq!(
+        parsed
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::ToolUse { .. }))
+            .count(),
+        8
+    );
+
+    // The schema check and the matcher over ~32k tokens of output for
+    // the widest nested anyOf: 3,200 values each naming the last
+    // alternative (~40 bytes apiece, ~128 KB), the check's last wrong.
+    let schema = json!({"type": "array", "items": nested_any_of(4, 119)});
+    check_schemas([], Some(&schema), &limits).expect("inside the limits");
+    let item = json!({"a": {"b": "m0118", "b3": 1}, "a3": 2});
+    let mut items = vec![item; 3_200];
+    let text = Value::Array(items.clone()).to_string();
+    let mut state =
+        GrammarState::new(Arc::new(Grammar::parse(&compile(&schema)).unwrap()));
+    // A step is 4 KB (~1k tokens), each token's advance its own.
+    for (i, chunk) in text.as_bytes().chunks(4 << 10).enumerate() {
+        guarded(&format!("nested anyOf: match 4 KB #{i}"), || {
+            state.advance_bytes(chunk).expect("admitted")
+        });
+    }
+    assert!(state.is_complete());
+    *items.last_mut().unwrap() = json!({"a": {"b": "zz", "b3": 1}, "a3": 2});
+    let (verdict, steps, budget) =
+        guarded("nested anyOf: schema check", || {
+            check_counted(&schema, &Value::Array(items))
+        });
+    assert!(verdict.is_err() && steps <= budget, "{steps} of {budget}");
+
+    // Past the limits: refused up front, cheaply.
+    let props: Map<String, Value> =
+        (0..400_000).map(|i| (format!("p{i}"), json!({}))).collect();
+    let hostile = tool(json!({"type": "object", "properties": props}));
+    guarded("400,000 properties: refused", || {
+        check_schemas([&hostile], None, &limits).unwrap_err()
+    });
+}

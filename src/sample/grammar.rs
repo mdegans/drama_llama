@@ -2601,6 +2601,164 @@ mod tests {
         Arc::new(parse_ok(&src))
     }
 
+    /// A synthetic vocabulary the size of a real one (~120k pieces):
+    /// every byte, every printable pair, and every string of up to five
+    /// of the JSON-ish bytes the guard's streams are made of.
+    fn footprint_vocab() -> Vec<Vec<u8>> {
+        let mut vocab: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
+        vocab.extend(
+            (0x20u8..0x7f)
+                .flat_map(|a| (0x20u8..0x7f).map(move |b| vec![a, b])),
+        );
+        let alphabet = br#"{}":c ,[]0"#;
+        let mut layer: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..5 {
+            layer = layer
+                .iter()
+                .flat_map(|p| {
+                    alphabet.iter().map(move |&c| {
+                        let mut q = p.clone();
+                        q.push(c);
+                        q
+                    })
+                })
+                .collect();
+            vocab.extend(layer.iter().cloned());
+        }
+        vocab
+    }
+
+    /// One `grammar_filter` step over `vocab` by hand (the same cache
+    /// walk, without a model): how many pieces the state admits.
+    fn filter_step(
+        cache: &DfaCache,
+        grammar: &Grammar,
+        state: &StackState,
+        vocab: &[Vec<u8>],
+    ) -> usize {
+        let base = cache.intern_base(state);
+        let bitmap = match base {
+            UNCACHED_STATE => state.first_byte_bitmap(grammar),
+            base => cache.first_byte_bitmap(grammar, base),
+        };
+        vocab
+            .par_iter()
+            .filter(|piece| {
+                let first = piece[0];
+                if bitmap[(first as usize) >> 6] & (1u64 << (first & 63)) == 0 {
+                    return false;
+                }
+                if base == UNCACHED_STATE {
+                    return state.accepts_bytes(grammar, piece);
+                }
+                let mut id = base;
+                for &b in piece.iter() {
+                    id = cache.transition(grammar, id, b);
+                    if id == REJECT_STATE {
+                        return false;
+                    }
+                    if id == UNCACHED_STATE {
+                        return state.accepts_bytes(grammar, piece);
+                    }
+                }
+                cache.terminal_valid(grammar, id)
+            })
+            .count()
+    }
+
+    /// Footprint guard for the matcher and its DFA cache — the hostile
+    /// rechecks' `adv2` probes, committed. Each grammar is fed ~32k
+    /// tokens' worth of adversarial bytes (128 KB, or until it refuses
+    /// one), with a vocabulary filter step over ~120k pieces every 256
+    /// bytes, as sampling runs one per token: two interchangeable
+    /// recursive defs (the stacks double every level, to the cap),
+    /// brackets nested as deep as an untyped array allows, an array of
+    /// an `enum` at the width limit, and an object of 2,000 optional
+    /// integers. Every step must finish in
+    /// [`FOOTPRINT_STEP_SECS`](crate::hostile_schema_tests::FOOTPRINT_STEP_SECS)
+    /// and the process stay under
+    /// [`FOOTPRINT_LIMIT_MB`](crate::hostile_schema_tests::FOOTPRINT_LIMIT_MB)
+    /// resident.
+    ///
+    /// Ignored because it measures the whole process, so it must run
+    /// alone: under nextest (a process per test), e.g. in the
+    /// nightly/GPU window, `cargo nextest run --run-ignored only -E
+    /// 'test(footprint_guard)'` (which also runs
+    /// `hostile_schema_tests::footprint_guard_pipelines`); under
+    /// `cargo test`, with `--test-threads=1`. CPU only, no model.
+    #[test]
+    #[ignore = "footprint guard: measures process RSS, so run it alone"]
+    fn footprint_guard_matcher() {
+        use crate::hostile_schema_tests::guarded;
+        use serde_json::{json, Map, Value};
+        const STREAM: usize = 128 << 10;
+        const EVERY: usize = 256;
+        let compile = |schema: &Value| {
+            let mut src = String::from("root ::= s\n");
+            crate::schema_to_gbnf(schema, "s", &mut src).unwrap();
+            src.push_str(crate::JSON_GRAMMAR);
+            Arc::new(parse_ok(&src))
+        };
+        let members: Vec<String> =
+            (0..2040).map(|i| format!("m{i:05}")).collect();
+        let optionals: Map<String, Value> = (0..2000)
+            .map(|i| (format!("k{i:05}"), json!({"type": "integer"})))
+            .collect();
+        let enum_items: String = std::iter::once("[".to_string())
+            .chain((0..).map(|i| format!("\"m{:05}\",", 2039 - i % 2040)))
+            .take(STREAM / 9)
+            .collect();
+        let object: String = std::iter::once("{".to_string())
+            .chain((0..2000).map(|i| format!("\"k{i:05}\":{i},")))
+            .collect();
+        let streams: [(&str, Arc<Grammar>, Vec<u8>); 4] = [
+            (
+                "ambiguous recursion",
+                ambiguous_recursive_grammar(),
+                br#"{"c":"#.repeat(STREAM / 5),
+            ),
+            (
+                "nested brackets",
+                compile(&json!({"type": "array", "items": {}})),
+                b"[".repeat(STREAM),
+            ),
+            (
+                "array of a 2,040-member enum",
+                compile(&json!({"type": "array", "items": {"enum": members}})),
+                enum_items.into_bytes(),
+            ),
+            (
+                "2,000 optional integers",
+                compile(&json!({"type": "object", "properties": optionals})),
+                object.into_bytes(),
+            ),
+        ];
+        let vocab = footprint_vocab();
+        for (name, grammar, stream) in streams {
+            let cache = DfaCache::new();
+            let mut state = GrammarState::new(grammar.clone());
+            let mut fed = 0;
+            let mut widest = 0;
+            for chunk in stream.chunks(EVERY) {
+                let kept = guarded(&format!("{name}: filter at {fed}"), || {
+                    filter_step(&cache, &grammar, &state.inner, &vocab)
+                });
+                assert!(kept > 0, "{name}: nothing admitted at {fed}");
+                if state.advance_bytes(chunk).is_err() {
+                    break;
+                }
+                fed += chunk.len();
+                widest = widest.max(state.stack_depth());
+            }
+            eprintln!(
+                "footprint: {name}: fed {fed} bytes, widest {widest} stacks, \
+                 {} cached states",
+                cache.state_count()
+            );
+            assert!(widest <= MAX_STACKS, "{name}: {widest}");
+        }
+    }
+
     #[test]
     fn ambiguous_recursion_keeps_stacks_capped() {
         let mut state = GrammarState::new(ambiguous_recursive_grammar());

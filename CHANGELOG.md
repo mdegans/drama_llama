@@ -962,6 +962,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--schema-max-member-bytes`, `--schema-max-total-member-bytes`,
   `--schema-max-width`).
 
+- **Footprint guards for the schema pipelines and the matcher**
+  (`footprint_guard_pipelines`, `footprint_guard_matcher`, both
+  `#[ignore]`d): the hostile rechecks' probes, committed. Requests at
+  the default schema limits and past them go through the measure,
+  every dialect's compile and grammar parse, a 512-parameter Qwen
+  call's parse, the schema check and the matcher over ~128 KB (~32k
+  tokens) of output; and four adversarial byte streams of up to 128 KB
+  (ambiguous recursion, nested brackets, an array of an `enum` at the
+  width limit, 2,000 optional integers) are fed through the matcher
+  with a filter step over a ~120k-piece synthetic vocabulary every 256
+  bytes. Each step must take under 2 s and the process stay under
+  1.2 GB resident (`ps`, no `unsafe`). They measure the whole process,
+  so they run alone: under nextest in the nightly/GPU window, `cargo
+  nextest run --run-ignored only -E 'test(footprint_guard)'` (or as
+  part of `just test ignored`); CPU only, no model. Measured
+  (2026-10-01, M-series, test profile): at most 52 ms a step but one
+  (a 432 ms filter step 2,560 brackets deep, where the state is past
+  the DFA cache's threshold and runs uncached), 434 MB peak.
+
 - **Constrained output is checked against its schema before it is
   answered** (`SessionError::SchemaViolation`). A finished
   json_schema `output_config` answer must be exactly one JSON document
