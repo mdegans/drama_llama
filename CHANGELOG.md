@@ -117,6 +117,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that already closed the turn's thought (a prefilled closed thought,
   thinking on) now gets the unified grammar, since its closer can never
   be written and the deferred one would never fire.
+- **A Qwen XML tool's string `enum` argument reads as its value.** The
+  grammar writes such a value as JSON (`"full"`, quoted) but the parser
+  read it raw, so the tool got `"\"full\""` — and, for a `strict`
+  tool, the schema backstop refused it on every draw and blallama
+  answered 500. The parser now reads a string `enum` as JSON, matching
+  the emitter. The quoted spelling is not what the template re-renders
+  (`full`), so such a turn's tip does not re-render byte-for-byte.
 
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
@@ -454,11 +461,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cache warm, `Display` names the schema location but never the value,
   and blallama resamples it on the warm cache like a grammar violation,
   then answers 500 `api_error` — never a 200 carrying the invalid
-  value. `SchemaMismatch` / `MismatchKind` are public. One known
-  consequence: a `strict` tool with a plain string `enum` parameter on
-  the tagged (Qwen XML) dialect is now refused rather than handed the
-  JSON-quoted value (`"\"full\""`) the parser reads there — a
-  pre-existing parser bug the backstop surfaces.
+  value. `SchemaMismatch` / `MismatchKind` are public.
 - **`BlockStream::violation`**: once drained, a stream reports the
   `GrammarViolation` or `SchemaViolation` the batch path would have
   returned for the same turn, by the same rules (one `TurnContract`

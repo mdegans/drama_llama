@@ -28,7 +28,8 @@
 //! ## Coercion & healing (llama.cpp mapper parity)
 //!
 //! Tagged raw values are schema-coerced: params typed `string` (or
-//! unknown) stay raw strings; anything else is parsed as JSON after
+//! unknown) stay raw strings, bar a string `enum`, which the grammar
+//! generates as JSON; anything else is parsed as JSON after
 //! normalizing pythonisms (`True`/`False`/`None`, single-quoted
 //! strings) with bounded brace-healing, falling back to a JSON
 //! string of the raw bytes when parsing still fails. Parse never
@@ -1373,10 +1374,17 @@ impl<'a> Parser<'a> {
     }
 
     /// Whether `param` of `tool` takes its raw text as a string: typed
-    /// `string`, or unknown.
+    /// `string` without an `enum`, or unknown. A string `enum` is not
+    /// raw: the grammar generates it as JSON (`"full"`, quotes and all —
+    /// `dialect::emit`'s `schema_is_string`), so reading it raw handed
+    /// the tool `"\"full\""` and failed the schema backstop on every
+    /// draw.
     fn is_string_param(&self, tool: &str, param: &str) -> bool {
         match self.schema_for(tool, param) {
-            Some(s) => s.get("type").and_then(|t| t.as_str()) == Some("string"),
+            Some(s) => {
+                s.get("type").and_then(|t| t.as_str()) == Some("string")
+                    && s.get("enum").is_none()
+            }
             None => true,
         }
     }
@@ -2418,6 +2426,59 @@ mod tests {
                 texts[0]
             );
         }
+    }
+
+    /// A string `enum` parameter on Qwen XML: the grammar generates its
+    /// value as JSON (`"full"`, quoted), so the parser must read it as
+    /// JSON too. Read raw, the tool got `"\"full\""`, which no draw can
+    /// fix — the schema backstop refused it every time, and blallama
+    /// answered 500 after its resamples. A plain string stays raw.
+    #[test]
+    fn qwen_xml_string_enum_reads_what_the_grammar_writes() {
+        let syntax = CallSyntax::qwen_xml();
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["full", "lite"]},
+                "note": {"type": "string"},
+            },
+            "required": ["mode", "note"],
+        });
+        let mut t = Tool::builder("set_mode")
+            .description("test")
+            .schema(schema.clone())
+            .build()
+            .expect("valid test tool");
+        t.strict = Some(true);
+        let emission = "<tool_call>\n<function=set_mode>\n\
+                        <parameter=mode>\n\"full\"\n</parameter>\n\
+                        <parameter=note>\n\"quoted\" note\n</parameter>\n\
+                        </function>\n</tool_call>";
+
+        // What the grammar admits: the enum quoted, never raw.
+        let source = crate::dialect::grammar_source(
+            &syntax,
+            &[&t],
+            &crate::dialect::EmitOptions::default(),
+        )
+        .expect("grammar");
+        let admits = |text: &str| {
+            let mut state = crate::GrammarState::from_source(&source)
+                .expect("grammar parses");
+            state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+        };
+        assert!(admits(emission), "{source}");
+        assert!(!admits(&emission.replacen("\"full\"", "full", 1)));
+
+        let parsed =
+            parse_text(&syntax, &[&t], emission, false, Leniency::Final);
+        let calls = calls_of(&parsed.blocks);
+        assert_eq!(calls.len(), 1, "{parsed:#?}");
+        assert_eq!(
+            calls[0].1,
+            &json!({"mode": "full", "note": "\"quoted\" note"})
+        );
+        assert_eq!(crate::schema_check::check(&schema, calls[0].1), Ok(()));
     }
 
     /// Adversarial raw values (plan amendments): trailing newlines
