@@ -378,8 +378,11 @@ def warn_slow_variant(config: Config, tier: str, model: str) -> None:
         )
 
 
-def filterset(include: str | None, exclude: list[str]) -> str:
-    """The nextest filterset for one include substring and N excludes.
+def filterset(
+    include: str | None, exclude: list[str], binary: str | None = None
+) -> str:
+    """The nextest filterset for one include substring and N excludes,
+    within the test binaries named like `binary` when one is given.
 
     A substring is matched against test AND binary names, because the
     thing a caller names may be either — `session_gemma4` is a binary,
@@ -394,10 +397,20 @@ def filterset(include: str | None, exclude: list[str]) -> str:
     exactly the silent coverage loss #68 exists to prevent, whereas an
     excluded one shows up in nextest's own "N tests run, M skipped" line
     and in the printed command.
+
+    With `binary`, `include` narrows the tests *inside* it (test names
+    only): `just test swa_checkpoint hybrid_` is the swa_checkpoint
+    suite's hybrid tests, where matching `hybrid_` against binary names
+    too would be no narrowing at all.
     """
-    expr = (
-        f"test(~{include}) + binary(~{include})" if include else "all()"
-    )
+    if binary:
+        expr = f"binary(~{binary})"
+        if include:
+            expr += f" & test(~{include})"
+    elif include:
+        expr = f"test(~{include}) + binary(~{include})"
+    else:
+        expr = "all()"
     if exclude:
         dropped = " + ".join(
             f"test(~{name}) + binary(~{name})" for name in exclude
@@ -416,7 +429,8 @@ def selection(
     returned rather than rendered because its profile has to travel
     differently for each; see `Tier`.
     """
-    if args.filter:
+    binary = getattr(args, "binary", None)
+    if args.filter or binary:
         # A named test is asked for by name, so run it whichever list it
         # is on rather than making the caller remember — and uncaptured,
         # so the suites' block/emission dumps are visible on a pass and
@@ -425,13 +439,14 @@ def selection(
         # load (e.g. while another model job holds the GPU).
         tier = TIERS[effective_tier(args)]
         extra = ["--no-capture"]
-        name = f"{config.name}-{sanitize(args.filter)}"
+        named = "-".join(n for n in (binary, args.filter) if n)
+        name = f"{config.name}-{sanitize(named)}"
     else:
         tier, extra = TIERS[effective_tier(args)], []
         name = f"{config.name}-{effective_tier(args)}"
 
-    if args.filter or args.exclude:
-        extra += ["-E", filterset(args.filter, args.exclude)]
+    if args.filter or args.exclude or binary:
+        extra += ["-E", filterset(args.filter, args.exclude, binary)]
 
     return tier, extra, name
 
@@ -485,7 +500,8 @@ def effective_tier(args: argparse.Namespace) -> str:
     """`--tier` if given; else `all` under `--filter`, `unignored` without."""
     if args.tier is not None:
         return args.tier
-    return "all" if args.filter else "unignored"
+    named = args.filter or getattr(args, "binary", None)
+    return "all" if named else "unignored"
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1155,6 +1171,13 @@ def main() -> int:
         "--filter",
         help="substring matched against test AND binary names; implies "
         "the `all` tier (unless --tier is given) and uncaptured output",
+    )
+    p_run.add_argument(
+        "-b",
+        "--binary",
+        help="only the test binaries whose name contains this; --filter "
+        "then narrows by test name alone. Implies the `all` tier (unless "
+        "--tier is given) and uncaptured output, like --filter",
     )
     p_run.add_argument(
         "-x",

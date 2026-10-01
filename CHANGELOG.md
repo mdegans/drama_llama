@@ -19,9 +19,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cells alone, so after a raw clear a stale window checkpoint loaded
   over empty dense layers and the restore reported success. Every
   mutator now drops the partial checkpoints the change invalidates
-  (`memory_clear` all of them), and the trait methods are thin
-  wrappers. Only `context_ptr_mut` still reaches the memory around
-  them, and says so.
+  (`memory_clear` all of them; `memory_seq_add` and `memory_seq_div`
+  from the lowest position a cell lands on, `p0 + delta` for a shift
+  back and `p0 / d`, since cells move below `p0`), and the trait
+  methods are thin wrappers. Only the raw context pointer still reaches
+  the memory around them, and its docs say so.
 - **`LlamaCppEngine::default_context_params` sets `swa_full = false`**,
   so `LlamaCppEngine::new(path, None, None, …)` sizes the
   sliding-window cache at the window, as `LlamaCppOptions` already did
@@ -270,9 +272,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   window checkpoints of ≈ 800 MiB — ≈ 19 GiB of unified memory next to
   the weights and KV. Past either bound the least recently used
   checkpoint is evicted (a per-slot overrun only evicts that slot's),
-  and one larger than a bound on its own is not stored; each logs
-  `snapshot_evicted` with the `bound` it hit, or
-  `snapshot_over_budget`.
+  but each slot's first anchor (its lowest checkpoint — the system
+  prompt and tools) goes last: restores refresh only the anchor they
+  land on, so pure LRU evicted that one first. One larger than a bound
+  on its own is not stored; each logs `snapshot_evicted` with the
+  `bound` it hit, or `snapshot_over_budget`. The budget is per decoder,
+  not per process, and peak host RAM is the budget plus one
+  checkpoint, which is serialized before the store evicts to fit it.
 - **An anchor restored by truncation is checkpointed on the way.** A
   window-sized cache recycles the window below an anchor soon after,
   so an anchor whose checkpoint was evicted (or never taken) restored
@@ -283,7 +289,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `drama_llama::snapshot_store`): `checkpoint_restore` with
   `restore_via = truncate | checkpoint`, `bytes` and `ms`;
   `checkpoint_taken` with `bytes` and `ms`; `checkpoint_invalidated`
-  with a `count`. `checkpoint_skipped` now says whether the position
+  with a `count` (a `memory_clear` included). `checkpoint_skipped` now says whether the position
   was off the head (`cause = off_head`) or llama.cpp failed to
   serialize it (`save_failed`), where it blamed the head for both.
 - **Sliding-window models (gpt-oss, Gemma 4) restore their prefix

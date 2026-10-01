@@ -149,8 +149,8 @@ pub struct BackendArgs {
     pub swa_full: bool,
 
     /// Host RAM, in MiB, the prefix-cache checkpoints of all slots may
-    /// hold (sliding-window and hybrid models). Default 8192.
-    /// llama-cpp only.
+    /// hold (sliding-window and hybrid models). Default 8192. Peaks one
+    /// checkpoint over it while a new one is taken. llama-cpp only.
     #[arg(long)]
     pub checkpoint_mib: Option<u32>,
 
@@ -333,27 +333,38 @@ mod tests {
     #[cfg(all(feature = "moeflux", target_os = "macos"))]
     #[test]
     fn moeflux_refuses_llama_cpp_knobs_by_name() {
-        let err = crate::MoefluxOptions::try_from(&BackendArgs {
-            n_ctx: 4096,
-            cache_slots: Some(5),
-            ..args()
-        })
-        .expect_err("moeflux has neither");
-        assert_eq!(err.flags, ["--n-ctx", "--cache-slots"]);
-        let err = crate::MoefluxOptions::try_from(&BackendArgs {
-            swa_full: true,
-            ..args()
-        })
-        .expect_err("moeflux has no sliding-window cache");
-        assert_eq!(err.flags, ["--swa-full"]);
-        let err = crate::MoefluxOptions::try_from(&BackendArgs {
-            checkpoint_mib: Some(1),
-            checkpoint_slot_mib: Some(1),
-            ..args()
-        })
-        .expect_err("moeflux keeps its own snapshot cap");
-        assert_eq!(err.flags, ["--checkpoint-mib", "--checkpoint-slot-mib"]);
-        assert_eq!(err.backend, "moeflux");
-        assert!(err.to_string().contains("--n-ctx --cache-slots"));
+        let refused = |given: BackendArgs, flags: &[&str]| {
+            let err = crate::MoefluxOptions::try_from(&given)
+                .expect_err("moeflux has no such knob");
+            assert_eq!(err.flags, flags);
+            assert_eq!(err.backend, "moeflux");
+            assert!(err.to_string().contains(&flags.join(" ")), "{err}");
+        };
+        // Neither a context size nor slots.
+        refused(
+            BackendArgs {
+                n_ctx: 4096,
+                cache_slots: Some(5),
+                ..args()
+            },
+            &["--n-ctx", "--cache-slots"],
+        );
+        // No sliding-window cache.
+        refused(
+            BackendArgs {
+                swa_full: true,
+                ..args()
+            },
+            &["--swa-full"],
+        );
+        // Its own snapshot cap, not a checkpoint budget.
+        refused(
+            BackendArgs {
+                checkpoint_mib: Some(1),
+                checkpoint_slot_mib: Some(1),
+                ..args()
+            },
+            &["--checkpoint-mib", "--checkpoint-slot-mib"],
+        );
     }
 }

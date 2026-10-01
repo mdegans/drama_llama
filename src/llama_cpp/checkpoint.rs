@@ -106,6 +106,15 @@ impl Checkpointing {
 /// and
 /// [`LlamaCppOptions::checkpoint_slot_mib`](crate::LlamaCppOptions::checkpoint_slot_mib),
 /// or [`LlamaCppDecoder::set_checkpoint_budget`](crate::LlamaCppDecoder::set_checkpoint_budget).
+///
+/// Each slot's first anchor (its lowest checkpoint: the system prompt
+/// and tools) is evicted last, so a slot over its share loses its later
+/// anchors first.
+///
+/// The bounds are **per decoder** (one llama.cpp context), not per
+/// process, and **peak** host RAM is the budget plus one checkpoint: a
+/// checkpoint is serialized in full before the store evicts to make
+/// room for it — on Gemma 4, 8 GiB + ≈ 800 MiB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CheckpointBudget {
@@ -217,7 +226,7 @@ impl Checkpoints {
             (true, native) => native,
         };
         if !enabled {
-            self.store.clear();
+            self.clear();
         }
     }
 
@@ -408,7 +417,9 @@ impl Checkpoints {
 
     /// Drop every checkpoint: the whole KV was cleared or replaced.
     pub(crate) fn clear(&mut self) {
+        let count = self.store.len();
         self.store.clear();
+        log_invalidated(count, 0);
     }
 
     /// The KV of `seq` (every sequence when negative) changed from
@@ -420,6 +431,21 @@ impl Checkpoints {
         self.invalidate_partial(|s, p| (seq < 0 || s == seq) && p > p0);
     }
 
+    /// The cells of `seq` from `p0` on moved by `delta`
+    /// (`llama_memory_seq_add`): the KV changed from the lowest
+    /// position a cell left or landed on — `p0 + delta` for a shift
+    /// back, below `p0`.
+    pub(crate) fn invalidate_shift(&mut self, seq: i32, p0: i32, delta: i32) {
+        self.invalidate_from(seq, p0.max(0).saturating_add(delta.min(0)));
+    }
+
+    /// The positions of `seq` from `p0` on were divided by `d`
+    /// (`llama_memory_seq_div`): the lowest a moved cell lands on is
+    /// `p0 / d`.
+    pub(crate) fn invalidate_div(&mut self, seq: i32, p0: i32, d: i32) {
+        self.invalidate_from(seq, p0.max(0) / d.max(1));
+    }
+
     /// Every sequence but `seq` was dropped.
     pub(crate) fn keep_only(&mut self, seq: i32) {
         self.invalidate_partial(|s, _| s != seq);
@@ -427,31 +453,36 @@ impl Checkpoints {
 
     /// Drop the checkpoints matching `stale` — partial ones only. A
     /// whole-sequence snapshot restores wholesale, so it outlives any
-    /// change to the KV under it.
+    /// change to the KV under it: in [`Checkpointing::Whole`] mode
+    /// nothing is dropped, so no `checkpoint_invalidated` is logged.
     fn invalidate_partial(&mut self, mut stale: impl FnMut(i32, i32) -> bool) {
         if self.mode != Checkpointing::Partial {
             return;
         }
         let before = self.store.len();
         self.store.retain(|s, p| !stale(s, p));
-        let count = before - self.store.len();
-        if count > 0 {
-            // DEBUG: the KV under them changed, which a rewind or a
-            // slot reset does on every call. An anchor dropped here
-            // shows up later as a `restore_failed`; this says why.
-            tracing::debug!(
-                target: "drama_llama::snapshot_store",
-                event = "checkpoint_invalidated",
-                count,
-                held = self.store.len(),
-                "dropped {count} partial checkpoint(s) whose KV changed",
-            );
-        }
+        log_invalidated(before - self.store.len(), self.store.len());
     }
 
     #[cfg(test)]
     fn contains(&self, seq: i32, pos: i32) -> bool {
         self.store.contains((seq, pos))
+    }
+}
+
+/// The `checkpoint_invalidated` event for `count` checkpoints dropped
+/// because the KV under them changed, `held` left. DEBUG: a rewind or a
+/// slot reset does it on every call. An anchor dropped here shows up
+/// later as a `restore_failed`; this says why.
+fn log_invalidated(count: usize, held: usize) {
+    if count > 0 {
+        tracing::debug!(
+            target: "drama_llama::snapshot_store",
+            event = "checkpoint_invalidated",
+            count,
+            held,
+            "dropped {count} checkpoint(s) whose KV changed",
+        );
     }
 }
 
@@ -978,6 +1009,42 @@ mod tests {
         whole.checkpoint(&mut mem, 0, 10);
         whole.invalidate_from(0, -1);
         assert!(whole.contains(0, 10), "a whole snapshot stands alone");
+    }
+
+    /// A shift or a division moves cells *below* `p0`: back by `delta`,
+    /// or down to `p0 / d` (llama.cpp's `seq_add` / `seq_div`). The KV
+    /// changes from there, so a checkpoint between there and `p0` would
+    /// restore over cells that moved under it — self-extend's
+    /// `seq_div(seq, 100, -1, 2)` puts cells into `[50, 100)`.
+    #[test]
+    fn a_move_invalidates_from_where_the_cells_land() {
+        let fresh = || {
+            let mut ckpt = Checkpoints::new(Checkpointing::Partial, 0, 16);
+            let mut mem = SimMemory::new(Layers::Hybrid);
+            for pos in [10, 20, 30] {
+                mem.seq_rm(0, -1, -1);
+                mem.decode(0, 0, &tokens(pos as u32));
+                ckpt.checkpoint(&mut mem, 0, pos);
+            }
+            ckpt
+        };
+        let held =
+            |ckpt: &Checkpoints| [10, 20, 30].map(|pos| ckpt.contains(0, pos));
+        let mut ckpt = fresh();
+        ckpt.invalidate_shift(0, 30, -15);
+        assert_eq!(held(&ckpt), [true, false, false], "shifted back to 15");
+        let mut ckpt = fresh();
+        ckpt.invalidate_shift(0, 20, 5);
+        assert_eq!(held(&ckpt), [true, true, false], "shifted on from 20");
+        let mut ckpt = fresh();
+        ckpt.invalidate_shift(0, 10, -20);
+        assert_eq!(held(&ckpt), [false; 3], "past the start");
+        let mut ckpt = fresh();
+        ckpt.invalidate_div(0, 30, 2);
+        assert_eq!(held(&ckpt), [true, false, false], "divided down to 15");
+        let mut ckpt = fresh();
+        ckpt.invalidate_div(0, -1, 2);
+        assert_eq!(held(&ckpt), [false; 3], "the whole sequence");
     }
 
     /// A checkpoint is taken at the head or not at all: filing another

@@ -217,8 +217,9 @@ impl LlamaCppOptions {
     }
 
     /// Build the `llama_context_params` these options describe, on top
-    /// of [`LlamaCppEngine::default_context_params`] (which is the
-    /// library default plus a usable thread count).
+    /// of [`LlamaCppEngine::default_context_params`] (the library
+    /// default plus a usable thread count, with a window-sized
+    /// sliding-window cache: `swa_full` off).
     pub fn context_params(&self) -> llama_context_params {
         let mut cp = LlamaCppEngine::default_context_params();
         if let Some(n_ctx) = self.n_ctx {

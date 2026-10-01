@@ -290,8 +290,10 @@ fn swa_checkpoints_are_window_sized_and_budgeted() {
 /// Dense attention keeps every position, so the dense fleet models
 /// take no checkpoints on a real load — the decoder's own `n_swa`,
 /// `is_hybrid` and `is_recurrent`, not GGUF metadata, decide that.
+/// CPU-only, so the weights stay memory-mapped rather than resident on
+/// Metal: Mistral 4 alone is 74 GB, and nothing here runs the model.
 #[test]
-#[ignore = "loads the dense fleet models (cogito, Mistral 4)"]
+#[ignore = "loads the dense fleet models (cogito, Mistral 4), CPU-only"]
 fn dense_models_stay_off() {
     let mut checked = 0;
     for file in [
@@ -305,7 +307,7 @@ fn dense_models_stay_off() {
         }
         let engine = LlamaCppEngine::from_path_with(
             path,
-            LlamaCppOptions::default().with_n_ctx(512),
+            LlamaCppOptions::default().cpu_only().with_n_ctx(512),
         )
         .expect("engine loads");
         assert_eq!(engine.model().n_swa(), 0, "{file}");

@@ -362,7 +362,9 @@ impl LlamaCppDecoder {
         &self.model
     }
 
-    /// Raw pointer to the underlying llama.cpp context (const).
+    /// Raw pointer to the underlying llama.cpp context (const). Cast to
+    /// `*mut` to change memory and it bypasses the checkpoint
+    /// bookkeeping as [`Self::context_ptr_mut`] does.
     pub fn context_ptr(&self) -> *const llama_context {
         self.context
     }
@@ -532,8 +534,9 @@ impl LlamaCppDecoder {
     /// restores on top of the KV below it, so one left behind a change
     /// to that KV would load another history's window or recurrent
     /// state on the next [`Decoder::restore_to`]. They are what the
-    /// [`Decoder`] impl calls; only [`Self::context_ptr_mut`] reaches
-    /// the memory around them.
+    /// [`Decoder`] impl calls; only the raw context pointer
+    /// ([`Self::context_ptr_mut`], or [`Self::context_ptr`] cast to
+    /// `*mut`, unsafe either way) reaches the memory around them.
     pub fn memory_clear(&mut self) {
         self.checkpoints.clear();
         let mem = unsafe { llama_get_memory(self.context) };
@@ -582,7 +585,8 @@ impl LlamaCppDecoder {
     }
 
     /// Add `delta` to positions of `seq_id` in `[p0, p1)`. Drops the
-    /// partial checkpoints above `p0`, whose KV moved.
+    /// partial checkpoints above the lowest position a cell left or
+    /// landed on — `p0 + delta` for a shift back, `p0` otherwise.
     pub fn memory_seq_add(
         &mut self,
         seq_id: llama_seq_id,
@@ -590,13 +594,14 @@ impl LlamaCppDecoder {
         p1: llama_pos,
         delta: llama_pos,
     ) {
-        self.checkpoints.invalidate_from(seq_id, p0);
+        self.checkpoints.invalidate_shift(seq_id, p0, delta);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_add(mem, seq_id, p0, p1, delta) }
     }
 
     /// Integer-divide positions of `seq_id` in `[p0, p1)` by `d > 1`.
-    /// Drops the partial checkpoints above `p0`, whose KV moved.
+    /// Drops the partial checkpoints above `p0 / d`, the lowest
+    /// position a moved cell lands on.
     pub fn memory_seq_div(
         &mut self,
         seq_id: llama_seq_id,
@@ -604,7 +609,7 @@ impl LlamaCppDecoder {
         p1: llama_pos,
         d: i32,
     ) {
-        self.checkpoints.invalidate_from(seq_id, p0);
+        self.checkpoints.invalidate_div(seq_id, p0, d);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_div(mem, seq_id, p0, p1, d) }
     }

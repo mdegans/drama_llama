@@ -67,6 +67,13 @@ pub(crate) fn cap_for_sequences(n_seq: usize) -> usize {
 /// Three bounds, each enforced by evicting the least recently used
 /// snapshot it covers: a count ([`cap_for_sequences`]), a byte total,
 /// and bytes per sequence (unbounded until [`Self::set_byte_limits`]).
+/// Each sequence's lowest snapshot goes last, though: it is the slot's
+/// first anchor — the system prompt and tools every later request of
+/// its conversation shares — and the most valuable, yet the LRU order
+/// alone ranks it lowest, since a restore refreshes only the anchor it
+/// lands on and later anchors are taken after it. Under Gemma 4's
+/// ≈ 800 MiB checkpoints a slot's byte share holds five, one fewer than
+/// a full set, so pure LRU evicted exactly that anchor first.
 #[derive(Debug)]
 pub(crate) struct SnapshotStore {
     map: HashMap<(i32, i32), Vec<u8>>,
@@ -158,13 +165,22 @@ impl SnapshotStore {
     }
 
     /// Evict the least recently used snapshot whose sequence matches
-    /// `seq`, logging which `bound` forced it. `false` when none does.
+    /// `seq` — any but a sequence's lowest while one is left (see
+    /// [`SnapshotStore`]) — logging which `bound` forced it. `false`
+    /// when none matches.
     fn evict_oldest(
         &mut self,
         mut seq: impl FnMut(i32) -> bool,
         bound: &'static str,
     ) -> bool {
-        let Some(at) = self.order.iter().position(|k| seq(k.0)) else {
+        let floor =
+            |s: i32| self.map.keys().filter(|k| k.0 == s).map(|k| k.1).min();
+        let Some(at) = self
+            .order
+            .iter()
+            .position(|k| seq(k.0) && floor(k.0) != Some(k.1))
+            .or_else(|| self.order.iter().position(|k| seq(k.0)))
+        else {
             return false;
         };
         let oldest = self.order.remove(at).expect("position is in range");
@@ -347,10 +363,12 @@ mod tests {
             .collect();
         let mut s = store_with(&keys);
         assert_eq!(s.len(), MAX_SEQ_SNAPSHOTS);
-        // The three oldest are gone; the newest three are present.
-        assert_eq!(s.take((0, 0)), None);
+        // The three oldest past the sequence's first anchor are gone;
+        // that anchor and the newest three are present.
         assert_eq!(s.take((0, 1)), None);
         assert_eq!(s.take((0, 2)), None);
+        assert_eq!(s.take((0, 3)), None);
+        assert!(s.take((0, 0)).is_some(), "the first anchor goes last");
         assert!(s.take((0, MAX_SEQ_SNAPSHOTS as i32 + 2)).is_some());
     }
 
@@ -406,8 +424,11 @@ mod tests {
             s.insert((3, pos), vec![0]);
         }
         assert_eq!(s.len(), MAX_SEQ_SNAPSHOTS);
-        assert!(!s.contains((1, 5)), "the oldest survivor is evicted first");
-        assert!(s.contains((1, 9)));
+        assert!(
+            !s.contains((1, 9)),
+            "the oldest survivor but a first anchor"
+        );
+        assert!(s.contains((1, 5)), "seq 1's first anchor");
     }
 
     /// The byte total evicts least recently used first, across
@@ -427,7 +448,7 @@ mod tests {
     }
 
     /// One slot over its share evicts only its own snapshots — never
-    /// another slot's system anchor.
+    /// another slot's system anchor, nor its own while another is left.
     #[test]
     fn snapshot_store_seq_budget_spares_other_slots() {
         let mut s = SnapshotStore::with_cap(64);
@@ -436,10 +457,32 @@ mod tests {
         for pos in 1..=3 {
             s.insert((0, pos), vec![0; 40]);
         }
-        assert!(!s.contains((0, 1)), "seq 0's oldest");
-        assert!(s.contains((0, 2)) && s.contains((0, 3)));
+        assert!(!s.contains((0, 2)), "seq 0's oldest past its first");
+        assert!(s.contains((0, 1)) && s.contains((0, 3)));
         assert!(s.contains((1, 1)), "older, but another slot's");
         assert_eq!(s.seq_bytes(0), 80);
+    }
+
+    /// The live Gemma 4 shape: a slot's byte share holds one fewer
+    /// checkpoint than a full set of anchors, and restores refresh only
+    /// the anchor they land on. The first anchor survives every later
+    /// one the slot takes; with no other left, it goes too.
+    #[test]
+    fn snapshot_store_keeps_each_slots_first_anchor_last() {
+        let mut s = SnapshotStore::with_cap(64);
+        s.set_byte_limits(1000, 5 * 10);
+        for pos in 1..=SNAPSHOTS_PER_SLOT as i32 + 3 {
+            s.insert((0, pos * 100), vec![0; 10]);
+            // A restore to the latest anchor refreshes it alone.
+            s.refresh((0, pos * 100));
+        }
+        assert!(s.contains((0, 100)), "the system anchor");
+        assert_eq!(s.seq_bytes(0), 50);
+        s.set_byte_limits(1000, 10);
+        assert_eq!(s.len(), 1);
+        assert!(s.contains((0, 100)), "the last to go");
+        s.set_byte_limits(1000, 0);
+        assert_eq!(s.len(), 0, "and it goes when nothing else is left");
     }
 
     /// A snapshot over a limit on its own is refused, and costs the
@@ -455,15 +498,16 @@ mod tests {
         assert_eq!((s.len(), s.bytes()), (1, 60));
     }
 
-    /// Lowering the limits evicts down to them at once.
+    /// Lowering the limits evicts down to them at once — each slot's
+    /// first anchor last.
     #[test]
     fn snapshot_store_lowered_limits_apply_now() {
         let mut s = store_with(&[(0, 1), (0, 2), (1, 1), (1, 2)]);
         s.set_byte_limits(usize::MAX, 4);
-        assert!(!s.contains((0, 1)) && !s.contains((1, 1)));
+        assert!(!s.contains((0, 2)) && !s.contains((1, 2)));
         s.set_byte_limits(4, 4);
         assert_eq!(s.len(), 1);
-        assert!(s.contains((1, 2)), "the most recent survives");
+        assert!(s.contains((1, 1)), "the most recent first anchor survives");
     }
 
     #[test]

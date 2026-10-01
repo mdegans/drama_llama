@@ -80,9 +80,17 @@ plain hybrid memory omits attention from a PARTIAL state entirely).
   seq; `--checkpoint-mib` / `--checkpoint-slot-mib`): LRU by bytes, a
   per-seq overrun evicts only that seq, an oversized single checkpoint
   is refused (`snapshot_over_budget`). Gemma 4 ⇒ ≤ 10 checkpoints.
+  Each seq's LOWEST snapshot (the system/tools anchor) is evicted last,
+  under every bound (`SnapshotStore::evict_oldest`): restores refresh
+  only the anchor they land on, so pure LRU evicted it first. Peak =
+  budget + one checkpoint (serialized before the store evicts), and
+  the budget is per decoder, not per process.
+- `memory_seq_add` / `memory_seq_div` invalidate from where cells land
+  (`p0 + delta` for a shift back, `p0 / d`), not `p0`.
 - DEBUG logs under `drama_llama::snapshot_store`: `checkpoint_restore`
   (`restore_via` truncate|checkpoint, bytes, ms), `checkpoint_taken`
-  (bytes, ms), `checkpoint_invalidated` (count).
+  (bytes, ms), `checkpoint_invalidated` (count; `memory_clear` and
+  `force(false)` too; Whole mode drops nothing, so logs nothing).
 - `default_context_params()` sets `swa_full = false` too, so
   `LlamaCppEngine::new(path, None, None, …)` agrees with the options.
 
@@ -118,6 +126,11 @@ evicted but cells survived" case — for 4.5 GiB. `--swa-full` is the escape.
 
 ## Open — GPU window (all `#[ignore]`d, `tests/swa_checkpoint.rs`)
 
+Run one family with `just test swa_checkpoint <test filter>` (the second
+argument narrows by test name inside the suite; it used to be dropped,
+so every run loaded every default model): e.g.
+`DRAMA_LLAMA_SWA_MODEL=… ~/.local/bin/serial -n gpu just test swa_checkpoint swa_`.
+
 - `swa_rewind_survives_a_neighbour_recycling_the_window`,
   `swa_truncate_never_claims_a_partial_window`,
   `swa_rewind_to_the_head_is_a_plain_truncate`,
@@ -125,7 +138,8 @@ evicted but cells survived" case — for 4.5 GiB. `--swa-full` is the escape.
   `swa_checkpoints_are_window_sized_and_budgeted` (gpt-oss; rerun with
   `DRAMA_LLAMA_SWA_MODEL=…/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf` — n_ctx
   is now sized from the GGUF window, 12288 for Gemma),
-  `dense_models_stay_off` (cogito + Mistral 4 real loads),
+  `dense_models_stay_off` (cogito + Mistral 4 loads, CPU-only so the
+  74 GB stays mmapped, not on Metal),
   `hybrid_partial_checkpoints_rewind_each_anchor`,
   `hybrid_checkpoint_dies_with_its_sequence` (Qwen3.6; rerun with
   `DRAMA_LLAMA_HYBRID_MODEL=models/Qwen3.8-27B-UD-Q8_K_XL.gguf`).
