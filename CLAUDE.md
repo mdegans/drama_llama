@@ -423,6 +423,11 @@ for the current arc:
   returns are unchecked and release builds take the UB path while debug
   aborts. Carries the checked-and-clean list so a future pass doesn't
   re-litigate settled ground.
+- [`llama_cpp_determinism.md`](.claude/memory/llama_cpp_determinism.md)
+  — #126: logits differ with KV layout (neighbor slots, off-grid
+  ubatch boundaries), so a seed printed under load may not reproduce.
+  Root cause, fork branches (`mdegans/llama.cpp` `determinism/*`), the
+  measured cost, and why production stays on stock.
 - [`logit_comparability_across_backends.md`](.claude/memory/logit_comparability_across_backends.md)
   — how far logits are comparable across backends, measured. Greedy
   streams and prefill logits port; the deep-context top-K tail does not
