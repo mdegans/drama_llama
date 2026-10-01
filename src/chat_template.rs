@@ -1515,13 +1515,20 @@ fn unfold_thought_gaps(blocks: &[Block]) -> Vec<Cow<'_, Block>> {
 
 /// An assistant message's blocks in emission order, as the `chunks`
 /// list templates may read in place of the merged fields: `{type:
-/// "text", text}` for a run of prose, `{type: "thinking", thinking}`
-/// for each thought, and one `{type: "tool_calls"}` where the first
-/// call sits (the calls themselves are the message's `tool_calls`).
-/// A text chunk right after a thought whose signature records the
-/// Harmony final's content type (`ThoughtTail::constrain`) carries it
-/// as `constrain`, for the template to spell the header the model
-/// wrote.
+/// "text", text}` for each text block (with any media after it),
+/// `{type: "thinking", thinking}` for each thought, and one `{type:
+/// "tool_calls"}` where the first call sits (the calls themselves are
+/// the message's `tool_calls`). A thought whose signature records the
+/// content type of the Harmony final after it (`ThoughtTail::constrain`)
+/// carries it as `constrain`, for the template to spell the header the
+/// model wrote — on the thought, so a final with an empty body, which
+/// has no text chunk, still gets it.
+///
+/// Text blocks stay apart because two may be two answers: gpt-oss's
+/// commentary preamble then its final are a text block each, and the
+/// gpt-oss bake renders all but the last of a turn without calls as
+/// preambles. Templates that render text chunks in turn (Mistral 4)
+/// render the same bytes either way.
 ///
 /// The merged `content` and `reasoning` fields lose two things the
 /// model wrote, and a template that renders the turn from them cannot
@@ -1536,44 +1543,43 @@ fn assistant_chunks(blocks: &[&Block], surfaces: &Surfaces<'_>) -> JinjaValue {
     let mut chunks: Vec<JinjaValue> = Vec::new();
     let mut prose = Flat::default();
     let mut seen_call = false;
-    // The content type the next text chunk's header declared, recorded
-    // on the thought before it.
-    let mut constrain: Option<String> = None;
-    let flush = |prose: &mut Flat,
-                 chunks: &mut Vec<JinjaValue>,
-                 constrain: &mut Option<String>| {
-        let constrain = constrain.take();
+    let flush = |prose: &mut Flat, chunks: &mut Vec<JinjaValue>| {
         if prose.is_empty() {
             return;
         }
         let text = std::mem::take(prose).render(surfaces, false);
-        chunks.push(match constrain {
-            Some(c) => minijinja::context! {
-                type => "text", text => text, constrain => c,
-            },
-            None => minijinja::context! { type => "text", text => text },
-        });
+        chunks.push(minijinja::context! { type => "text", text => text });
     };
     for block in blocks {
         match block {
             Block::Thought { thought, signature } => {
-                flush(&mut prose, &mut chunks, &mut constrain);
-                chunks.push(minijinja::context! {
-                    type => "thinking",
-                    thinking => surfaces.text(thought, false),
+                flush(&mut prose, &mut chunks);
+                let thinking = surfaces.text(thought, false);
+                let tail = crate::prompt::ThoughtTail::of(signature);
+                chunks.push(match tail.constrain {
+                    Some(c) => minijinja::context! {
+                        type => "thinking", thinking => thinking,
+                        constrain => c,
+                    },
+                    None => minijinja::context! {
+                        type => "thinking", thinking => thinking,
+                    },
                 });
-                constrain = crate::prompt::ThoughtTail::of(signature).constrain;
             }
             Block::ToolUse { .. } => {
-                flush(&mut prose, &mut chunks, &mut constrain);
+                flush(&mut prose, &mut chunks);
                 if !std::mem::replace(&mut seen_call, true) {
                     chunks.push(minijinja::context! { type => "tool_calls" });
                 }
             }
+            Block::Text { .. } => {
+                flush(&mut prose, &mut chunks);
+                append_block_text(&mut prose, block, media_sentinel);
+            }
             other => append_block_text(&mut prose, other, media_sentinel),
         }
     }
-    flush(&mut prose, &mut chunks, &mut constrain);
+    flush(&mut prose, &mut chunks);
     JinjaValue::from(chunks)
 }
 

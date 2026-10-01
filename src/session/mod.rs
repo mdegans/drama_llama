@@ -6991,6 +6991,8 @@ impl<B: Backend> Session<B> {
         // The parse dialect + tool schemas outlive the engine borrow
         // the predictor takes, so clone them out of `self` first.
         let syntax = parse_syntax;
+        let contract = TurnContract::of(prompt, deferred_grammar.as_ref())
+            .in_channels(&syntax);
         let tools: Vec<Tool> = prompt
             .tools
             .iter()
@@ -7043,7 +7045,7 @@ impl<B: Backend> Session<B> {
             yielded: Vec::new(),
             calls: TurnCalls::default(),
             stop: None,
-            contract: TurnContract::of(prompt, deferred_grammar.as_ref()),
+            contract,
             violation: None,
         })
     }
@@ -7361,9 +7363,11 @@ impl<B: Backend> Session<B> {
                 });
                 let in_flight =
                     parsed.status == crate::dialect::ParseStatus::NeedMoreInput;
-                let blocks = merge_adjacent_prose(
-                    provenance.restore_blocks(parsed.blocks.clone()),
-                );
+                // Not `merge_adjacent_prose`: a parse merges its own
+                // prose, so two text blocks side by side are two Harmony
+                // channels (a preamble, then the final), and merging
+                // them would make one answer of both.
+                let blocks = provenance.restore_blocks(parsed.blocks.clone());
                 (parsed.blocks, blocks, budget, in_flight)
             }
         };
@@ -7637,6 +7641,7 @@ impl<B: Backend> Session<B> {
         // violation too, though checked last (below): the answer it was
         // to constrain ran free (see `TurnContract::deferred_answer`).
         let breach = TurnContract::of(prompt, deferred_grammar.as_ref())
+            .in_channels(&parse_syntax)
             .breach(
                 &blocks,
                 TurnEnd {
@@ -8231,6 +8236,11 @@ struct TurnContract {
     /// one, which never firing just means no call — an output_config
     /// grammar that never activated left the answer unconstrained.
     deferred_answer: bool,
+    /// The answer is the turn's last text alone: Harmony's final
+    /// channel. A commentary preamble before it is its own text block,
+    /// which the deferred grammar leaves free like the analysis, and is
+    /// no part of the value (`TurnContract::in_channels`).
+    final_channel: bool,
 }
 
 /// How a turn broke its [`TurnContract`], in the order `run_call` checks.
@@ -8282,6 +8292,16 @@ impl TurnContract {
             // Auto lazy grammar, so a deferred grammar beside one is its.
             deferred_answer: deferred.is_some() && output_schema.is_some(),
             output_schema,
+            final_channel: false,
+        }
+    }
+
+    /// The contract for a turn `syntax` parses: on Harmony the answer is
+    /// the final channel, the last text block.
+    fn in_channels(self, syntax: &crate::CallSyntax) -> Self {
+        Self {
+            final_channel: syntax.family == crate::dialect::Family::Harmony,
+            ..self
         }
     }
 
@@ -8332,13 +8352,14 @@ impl TurnContract {
             return None;
         }
         let schema = self.output_schema.as_ref()?;
-        let text: String = blocks
-            .iter()
-            .filter_map(|block| match block {
-                crate::Block::Text { text, .. } => Some(text.as_ref()),
-                _ => None,
-            })
-            .collect();
+        let mut texts = blocks.iter().filter_map(|block| match block {
+            crate::Block::Text { text, .. } => Some(text.as_ref()),
+            _ => None,
+        });
+        let text: String = match self.final_channel {
+            true => texts.next_back().unwrap_or_default().to_owned(),
+            false => texts.collect(),
+        };
         crate::schema_check::check_text(schema, &text).err()
     }
 }
@@ -8728,10 +8749,11 @@ impl Cut {
     }
 }
 
-/// Collapse runs of adjacent [`Block::Text`] blocks. The parser can
-/// emit one per resolved prose chunk; batch callers want those
-/// coalesced before the [`FromIterator<Block>`] collection path, so a
-/// lone `Text` output serializes to the string wire form.
+/// Collapse runs of adjacent [`Block::Text`] blocks: the streaming
+/// parser's prose deltas, or the prose either side of a dropped call.
+/// Not a batch parse's blocks — a parse merges its own prose, so two
+/// text blocks side by side there are two Harmony channels (gpt-oss's
+/// preamble, then its final), which must stay apart.
 ///
 /// Thoughts never coalesce. The parser emits one [`Block::Thought`]
 /// per closed-and-reopened reasoning block, so two adjacent ones mean
@@ -8918,8 +8940,10 @@ fn infer_stop_reason(
 /// Prose is **not** merged: a run of plain text yields one
 /// [`Block::Text`] per resolved chunk (bytes that can no longer be
 /// the start of a dialect marker). Concatenate adjacent `Text` yields
-/// if you need the whole body as one string (the batch `complete_*`
-/// methods do this for you via `merge_adjacent_prose`).
+/// if you need the whole body as one string. The yields cannot mark
+/// where one text block ends and the next begins, so gpt-oss's
+/// commentary preamble and its final, two blocks from the batch
+/// `complete_*` methods, stream as adjacent text.
 ///
 /// Reasoning streams as one [`Block::Thought`] once its close marker
 /// and the start of what follows have arrived (its signature records
@@ -9090,7 +9114,13 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
                 .deferred_inactive()
                 == Some(true),
         };
-        let breach = self.contract.breach(&turn, end);
+        // On Harmony the answer is the final channel alone, and text
+        // yields cannot say where a preamble ended and the final began:
+        // the check reads the parse, which keeps them apart.
+        let breach = match self.contract.final_channel {
+            true => self.contract.breach(&self.filter.parser().blocks(), end),
+            false => self.contract.breach(&turn, end),
+        };
         self.stop = Some(infer_stop_reason(
             turn.iter()
                 .any(|b| matches!(b, crate::Block::ToolUse { .. })),
@@ -11050,13 +11080,19 @@ mod tests {
                         constrain,
                         ROLE_CONSENT_VALID,
                     );
-                    // Both headers: the parse records which the model
-                    // wrote, and the re-render spells that one.
+                    // Both headers after the analysis: the parse records
+                    // which the model wrote, and the re-render spells
+                    // that one. A final opening the turn has nowhere to
+                    // record it and re-renders plain, so only the plain
+                    // header is admitted there.
+                    let admitted = match (analysis, constrain) {
+                        (false, true) => None,
+                        _ => Some(true),
+                    };
                     assert_eq!(
                         constraint_admits(&compiled, &good),
-                        Some(true),
-                        "{at}: valid body must be admitted and complete: \
-                         {good}"
+                        admitted,
+                        "{at}: valid body: {good}"
                     );
                 }
             }
@@ -14706,9 +14742,11 @@ mod tests {
             })
             .collect();
         let mut turn = base.clone();
+        // As the batch path returns them: unmerged, a parse having
+        // merged its own prose (Harmony channels stay apart).
         turn.messages.push(Message {
             role: Role::Assistant,
-            content: Content(merge_adjacent_prose(blocks)),
+            content: Content(blocks),
         });
         let user = |text: &'static str| Message {
             role: Role::User,
@@ -15170,6 +15208,9 @@ mod tests {
     /// shape, which cannot tell `[1, 2, 3]` the prose from `[1, 2, 3]`
     /// the answer, nor see a structured answer whose schema root is a
     /// string or a number.
+    ///
+    /// An empty final records its header too, on the same thought, and
+    /// the bake renders it from there.
     #[test]
     fn gptoss_cache_stable_round_trips_json_final() {
         let tokens = ("<|startoftext|>", "<|return|>");
@@ -15211,14 +15252,19 @@ mod tests {
                 }
                 // With no analysis before it a final has nowhere to
                 // record its header: plain round-trips, and a constrained
-                // one re-renders plain (pinned, irreducible — Harmony
-                // finals almost always follow an analysis block).
+                // one re-renders plain (pinned, irreducible — which is
+                // why the `output_config` grammars admit the constraint
+                // only after another block).
                 assert_eq!(diverge(&format!("{plain}{body}")), None, "{body}");
                 assert_eq!(
                     diverge(&format!("{constrained}{body}")),
                     Some("<|channel|>final".len()),
                     "{body}"
                 );
+            }
+            for header in [plain, constrained] {
+                let emission = format!("{analysis}{header}");
+                assert_eq!(diverge(&emission), None, "{emission:?}");
             }
         }
     }
@@ -15258,6 +15304,144 @@ mod tests {
                 None,
                 "{emission:?}"
             );
+        }
+    }
+
+    /// gpt-oss may write a commentary preamble and then its final with
+    /// no call between (2026-10-01 probe). The parse merged the two into
+    /// one text, `Hi.{"a":1}`: neither the visible answer nor a value an
+    /// `output_config` schema could accept, and a final the bake could
+    /// not re-render. Each channel is now its own text block, the bake
+    /// renders every text but the last of a turn without calls as a
+    /// preamble, and the schema reads the final alone.
+    #[test]
+    fn gptoss_cache_stable_keeps_a_preamble_apart_from_its_final() {
+        use crate::Block;
+        let tokens = ("<|startoftext|>", "<|return|>");
+        let analysis = "<|channel|>analysis<|message|>Plan.<|end|>\
+                        <|start|>assistant";
+        let preamble = "<|channel|>commentary<|message|>Hi.<|end|>\
+                        <|start|>assistant";
+        let fin = "<|channel|>final<|message|>";
+        let fin_json = "<|channel|>final <|constrain|>json<|message|>";
+        let json = r#"{"a":1}"#;
+        let syntax = crate::CallSyntax::gpt_oss();
+        let parse = |emission: &str| {
+            crate::dialect::parse_text(
+                &syntax,
+                &[],
+                emission,
+                false,
+                crate::dialect::Leniency::Final,
+            )
+            .blocks
+        };
+        let blocks = parse(&format!("{analysis}{preamble}{fin_json}{json}"));
+        let [Block::Thought { .. }, Block::Text { text: hi, .. }, Block::Text { text: answer, .. }] =
+            blocks.as_slice()
+        else {
+            panic!("a thought, the preamble, the final: {blocks:?}");
+        };
+        assert_eq!((hi.as_ref(), answer.as_ref()), ("Hi.", json));
+
+        // The schema reads the final; elsewhere prose beside the JSON
+        // still breaks it.
+        let prompt = Prompt::default().json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "required": ["a"],
+        }));
+        let contract = TurnContract::of(&prompt, None);
+        assert!(contract.schema_mismatch(&blocks).is_some());
+        let harmony = contract.in_channels(&syntax);
+        assert_eq!(harmony.schema_mismatch(&blocks), None);
+
+        for baked in [&crate::baked::GPTOSS, &crate::baked::GPTOSS_UPSTREAM] {
+            let served = crate::baked::detect(baked.stock)
+                .expect("stock dump detects")
+                .replacement;
+            let diverge = |emission: &str| {
+                fleet_divergence(served, tokens, &[], true, emission)
+            };
+            for emission in [
+                format!("{analysis}{preamble}{fin}{json}"),
+                format!("{analysis}{preamble}{fin}Ada."),
+                format!("{preamble}{fin}Ada."),
+                format!("{preamble}{preamble}{fin}Ada."),
+            ] {
+                assert_eq!(
+                    diverge(&emission),
+                    None,
+                    "{}: {emission:?}",
+                    baked.name
+                );
+            }
+            // Pinned: a preamble between the analysis and a constrained
+            // final leaves the header nowhere to be recorded (a stream
+            // has released the thought before the final's header comes),
+            // so it re-renders plain. The deferred `output_config`
+            // grammar cannot tell this preamble from an analysis.
+            let emission = format!("{analysis}{preamble}{fin_json}{json}");
+            assert_eq!(
+                diverge(&emission),
+                emission.find(" <|constrain|>"),
+                "{}",
+                baked.name
+            );
+        }
+    }
+
+    /// Qwen may reason again after its prose
+    /// (`…</think>\n\nChecking.<think>\nMore.\n</think>…`). The merged
+    /// fields could not place the second thought — 3.6 inlined it
+    /// without its markers' newlines (parting at 32), 3.8 joined both
+    /// thoughts into `reasoning_content` (parting at 5) — so the bakes
+    /// render such a turn from `chunks`, each later thought where it sat.
+    #[test]
+    fn qwen_cache_stable_round_trips_a_second_thought() {
+        let tool = weather_tool();
+        let input = serde_json::json!({"city": "Paris"});
+        let tokens = ("", "<|im_end|>");
+        for baked in [&crate::baked::QWEN36, &crate::baked::QWEN38] {
+            let served = crate::baked::detect(baked.stock)
+                .expect("stock dump detects")
+                .replacement;
+            let syntax =
+                crate::dialect::analyze_template(served, tokens.0, tokens.1)
+                    .expect("analyze");
+            let one = crate::dialect::render_reference(
+                &syntax,
+                &[("get_weather", &input)],
+            )
+            .expect("representable");
+            let first = "Plan.\n</think>\n\n";
+            let second = "<think>\nMore.\n</think>\n\n";
+            for emission in [
+                format!("{first}Checking.{second}Ada."),
+                format!("{first}Checking.\n{second}Ada."),
+                format!("{first}Checking.{second}{one}"),
+                format!("{first}A.{second}B.{second}Ada."),
+            ] {
+                let blocks = crate::dialect::parse_text(
+                    &syntax,
+                    &[&tool],
+                    &emission,
+                    true,
+                    crate::dialect::Leniency::Final,
+                )
+                .blocks;
+                let thoughts = blocks
+                    .iter()
+                    .filter(|b| matches!(b, crate::Block::Thought { .. }))
+                    .count();
+                assert!(thoughts >= 2, "{}: {blocks:?}", baked.name);
+                assert_eq!(
+                    fleet_divergence(served, tokens, &[&tool], true, &emission),
+                    None,
+                    "{}: {emission:?}",
+                    baked.name
+                );
+            }
         }
     }
 
@@ -15394,14 +15578,22 @@ mod tests {
                             // the analysis before it; with none, it has
                             // nowhere to (pinned in
                             // `gptoss_cache_stable_round_trips_json_final`).
-                            // So does a final of only whitespace.
+                            // So does a final of only whitespace, and an
+                            // empty one.
                             if !thought.is_empty() {
                                 v.extend([
                                     format!("{thought}{fin_json}{compact}"),
                                     format!("{thought}{fin_json}\"Ada\""),
                                     format!("{thought}{fin}\n"),
+                                    format!("{thought}{fin_json}"),
+                                    format!("{thought}{fin}"),
                                 ]);
                             }
+                            // A preamble, then the final: two blocks.
+                            v.extend([
+                                format!("{thought}{pre}{fin}Ada."),
+                                format!("{thought}{pre}{fin}{compact}"),
+                            ]);
                         }
                         // An open analysis has no rendering (Harmony's
                         // generation prompt never opens a channel).
@@ -15504,6 +15696,12 @@ mod tests {
                                 (true, "Plan.\n</think>\n\n"),
                                 (true, "Plan.\n\n</think>\n\n"),
                                 (true, "Plan.\n</think>\n"),
+                                // Reasoning again after prose.
+                                (
+                                    true,
+                                    "Plan.\n</think>\n\nSo.<think>\nMore.\n\
+                                     </think>\n\n",
+                                ),
                             ],
                         };
                         let mut v = Vec::new();
@@ -15580,16 +15778,14 @@ mod tests {
                     .expect("render");
                 let pre_opened =
                     render_ends_with_open_reasoning(&prompt, &syntax);
-                let batch = merge_adjacent_prose(
-                    crate::dialect::parse_text(
-                        &syntax,
-                        &[&tool],
-                        &emission,
-                        pre_opened,
-                        crate::dialect::Leniency::Final,
-                    )
-                    .blocks,
-                );
+                let batch = crate::dialect::parse_text(
+                    &syntax,
+                    &[&tool],
+                    &emission,
+                    pre_opened,
+                    crate::dialect::Leniency::Final,
+                )
+                .blocks;
                 let has_thought = batch
                     .iter()
                     .any(|b| matches!(b, crate::Block::Thought { .. }));
@@ -15612,9 +15808,12 @@ mod tests {
                         baked.name
                     ));
                 }
+                // A stream's text yields cannot mark where one text block
+                // ends and the next begins (two Harmony channels), so
+                // the two compare as a client assembles them.
                 let streamed =
                     stream_parse(&syntax, &[&tool], &emission, pre_opened);
-                if streamed != batch {
+                if streamed != merge_adjacent_prose(batch.clone()) {
                     failures.push(format!(
                         "{}: streamed {streamed:?} != batch {batch:?}: \
                          {emission:?}",
@@ -15772,6 +15971,65 @@ mod tests {
         )
         .blocks;
         assert!(blocks.is_empty(), "{blocks:?}");
+    }
+
+    /// Pinned, with the reason it is not fixed: whitespace after Qwen's
+    /// last call (`…</tool_call>\n`) has no block to ride — a call has no
+    /// signature — so it is dropped and the turn parts there. No
+    /// constrained call turn can write it: once the tool grammar fires,
+    /// a newline after a call is only the separator to the next call,
+    /// which the grammar then forces, and the turn cannot end on it.
+    #[test]
+    fn qwen_whitespace_after_the_last_call_is_unreachable() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        let tool = weather_tool();
+        let input = serde_json::json!({"city": "Paris"});
+        let tokens = ("", "<|im_end|>");
+        for baked in [&crate::baked::QWEN36, &crate::baked::QWEN38] {
+            let served = crate::baked::detect(baked.stock)
+                .expect("stock dump detects")
+                .replacement;
+            let syntax =
+                crate::dialect::analyze_template(served, tokens.0, tokens.1)
+                    .expect("analyze");
+            let one = crate::dialect::render_reference(
+                &syntax,
+                &[("get_weather", &input)],
+            )
+            .expect("representable");
+            let emission = format!("Plan.\n</think>\n\n{one}\n");
+            assert_eq!(
+                fleet_divergence(served, tokens, &[&tool], true, &emission),
+                Some(emission.len() - 1),
+                "{}",
+                baked.name
+            );
+            let grammar = std::sync::Arc::new(
+                crate::Grammar::parse(
+                    &grammar_source(
+                        &syntax,
+                        &[&tool],
+                        &EmitOptions {
+                            anchor: Anchor::Lazy,
+                            parallel: true,
+                        },
+                    )
+                    .expect("emit"),
+                )
+                .expect("grammar"),
+            );
+            let state = |text: &str| {
+                let mut state = crate::GrammarState::new(grammar.clone());
+                state.advance_bytes(text.as_bytes()).map(|_| state)
+            };
+            assert!(state(&one).expect("a call").is_complete());
+            let after = state(&format!("{one}\n")).expect("a separator");
+            assert!(
+                !after.is_complete(),
+                "{}: a next call is owed",
+                baked.name
+            );
+        }
     }
 
     /// An assistant turn aged out with `preserve_thinking` off drops its

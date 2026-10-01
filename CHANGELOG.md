@@ -228,13 +228,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not `{…}`). The parser now records the content type the header
   declared in the signature of the analysis block before the final
   (`drama_llama:tail;constrain=json`, see the whitespace entry below),
-  and the baked template renders exactly that. The `output_config`
-  grammar keeps the constraint optional — both spellings are the
-  model's, and both now round-trip. Pinned as irreducible: a final
-  that declares a content type with no analysis block before it has
-  nowhere to record it and re-renders plain (Harmony finals all but
-  always follow an analysis block). Pinned in
-  `gptoss_cache_stable_round_trips_json_final`. **Deployments that
+  and the baked template renders exactly that — an empty final too,
+  from the thought alone. The `output_config` grammar keeps the
+  constraint optional after another block — both spellings are the
+  model's, and both round-trip — and **forbids it on a final that opens
+  the turn**, which has nowhere to record it and would re-render plain
+  (the unified grammar sees the analysis; the deferred one now reads its
+  trigger, `<|end|><|start|>assistant<|channel|>final` before the bare
+  `<|channel|>final`). Pinned as irreducible: a constrained final with
+  no thought right before it — none, or a commentary preamble between,
+  which the deferred grammar cannot tell from an analysis — re-renders
+  plain; free generation can still write one. Pinned in
+  `gptoss_cache_stable_round_trips_json_final` and
+  `gptoss_cache_stable_keeps_a_preamble_apart_from_its_final`.
+  **Deployments that
   copied the baked template to a `<model>.template.jinja` sidecar must
   delete it** — it wins over the bake; a sidecar that is a known old
   bake now logs a `WARN` at load (see *Added*).
@@ -257,6 +264,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `mistral4_cache_stable_round_trips_back_to_back_thoughts`,
   `gptoss_cache_stable_round_trips_each_analysis_block` and the fleet
   sweep.
+- **A gpt-oss preamble and final are two text blocks, and the answer is
+  the final.** A turn with a commentary preamble and then a final, no
+  call between (`…<|channel|>commentary<|message|>Hi.<|end|>
+  <|start|>assistant<|channel|>final<|message|>{"a":1}`), parsed to one
+  text, `Hi.{"a":1}`: not the visible answer, a value no `output_config`
+  schema could accept (`SchemaViolation` on a well-formed answer), and
+  a turn the bake re-rendered as one final, losing its tip. Each Harmony
+  channel's body is now its own text block, the batch path no longer
+  merges adjacent text (a parse merges its own prose, so side by side
+  they are channels), `chunks` carries each text block as its own
+  chunk, and the gpt-oss bake renders every text but the last of a turn
+  without calls as a preamble. The `output_config` schema check reads
+  the final alone on Harmony. **A streamed turn cannot mark the
+  boundary**: `BlockStream`'s text yields are deltas, so the preamble
+  and the final stream as adjacent text (its schema check reads the
+  parse). An assistant message a client sends with several text blocks
+  now renders on gpt-oss as preambles then a final, where it rendered
+  one final.
+- **A Qwen turn that reasons again after its prose re-renders.**
+  `…</think>\n\nChecking.<think>\nMore.\n</think>…` parsed to two
+  thoughts, but the merged fields could not place the second: 3.6
+  inlined it without its markers' newlines, 3.8 joined both thoughts in
+  `reasoning_content`, and the turn lost its tip. The Qwen bakes render
+  such a turn from `chunks`, each later thought where the model wrote
+  it. Pinned in `qwen_cache_stable_round_trips_a_second_thought` and
+  the fleet sweep. Pinned as unfixed, with the reason: whitespace after
+  Qwen's last call (`…</tool_call>\n`) has no block to ride and is
+  dropped, but no constrained call turn can write it — the tool grammar
+  reads a newline after a call as the separator to the next
+  (`qwen_whitespace_after_the_last_call_is_unreachable`).
 - **An empty thought re-renders.** Mistral 4's `[THINK][/THINK]` and
   an empty gpt-oss analysis block were dropped by the parser, so the
   re-render lacked their markers and the turn lost its tip. A closed

@@ -212,6 +212,10 @@ static SUPERSEDED: &[(&str, &BakedTemplate)] = &[
     ), // b2da92e
     // gptoss-cache-stable
     (
+        "9401909540317cf6237689e8c21f18630f9e8378388400530611b44b18f9d6af",
+        &GPTOSS,
+    ), // e83b0ba
+    (
         "1c02859e9fcc5dbb1ecbd066f8650f7d74e1b9d0becc09927139d582719f1bd1",
         &GPTOSS,
     ), // f1a5eb4
@@ -239,6 +243,10 @@ static SUPERSEDED: &[(&str, &BakedTemplate)] = &[
     ), // 53a07d3
     // qwen3.6-cache-stable
     (
+        "b6de2277ea5727f9b832063706f0ae768538255f6de24a5f9ab248e0e64974fb",
+        &QWEN36,
+    ), // 5283044
+    (
         "53e26ec9bb33a50ed70fa7773e2f94af23fd5c94bf431576e0dd936e8f6dfe9a",
         &QWEN36,
     ), // 1d3fea1
@@ -251,6 +259,10 @@ static SUPERSEDED: &[(&str, &BakedTemplate)] = &[
         &QWEN36,
     ), // 8fb8088
     // qwen3.8-cache-stable
+    (
+        "b0f8ade1dac8479bb972cd6ad85e78c0456d4aeb9a5ed3535c9f85ed793d3630",
+        &QWEN38,
+    ), // 1d3fea1
     (
         "e9c93685dd9faea1ec9f9b79c2213e1b6c5c4ad4991e6e124fbd427a98f787d1",
         &QWEN38,

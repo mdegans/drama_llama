@@ -54,25 +54,32 @@ preamble, and tool responses render by forward-scan with
 A turn renders from the `chunks` drama_llama supplies on every
 assistant message — its blocks in emission order — so two analysis
 blocks render as two (they used to merge into one) and a thought after
-the preamble renders after it. Without `chunks` the turn is rebuilt
-from the merged fields as before.
+the preamble renders after it. Each text block is its own chunk, and in
+a turn without calls every text but the last renders as a commentary
+preamble: a preamble then a final come back from the parse as two text
+blocks, and only the last is the final. Without `chunks` the turn is
+rebuilt from the merged fields as before.
 
 A final answer renders under the header the model wrote:
-`<|channel|>final <|constrain|>json<|message|>` when its text chunk
-carries `constrain` (the content type the model declared, which the
-parser records in the signature of the analysis block before the final
-— `drama_llama:tail;constrain=json`), plain otherwise. That content
+`<|channel|>final <|constrain|>json<|message|>` when the thinking chunk
+before it carries `constrain` (the content type the model declared,
+which the parser records in the signature of the analysis block right
+before the final — `drama_llama:tail;constrain=json`), plain otherwise;
+an empty final renders from the thought alone. That content
 type is what gpt-oss writes for structured output, unforced (every JSON
 final in the 2026-10-01 Agora run carried it); stock renders every
 final channel plain, so each one re-rendered a constraint short and
 lost its tip (470..1111 tokens a turn, live). The content's shape
 cannot stand in for the header — `[1, 2, 3]` may be prose, and a
 structured answer whose schema root is a string or a number is not
-`{…}` — so both spellings round-trip, and the `output_config` grammar
-leaves the choice to the model. Irreducible, pinned in
-`gptoss_cache_stable_round_trips_json_final`: a constrained final with
-no analysis block before it has nowhere to record its header, and
-re-renders plain. Harmony does not document a final-channel content
+`{…}` — so both spellings round-trip, and after another block the
+`output_config` grammar leaves the choice to the model; opening the
+turn it admits only the plain header. Irreducible, pinned in
+`gptoss_cache_stable_round_trips_json_final` and
+`gptoss_cache_stable_keeps_a_preamble_apart_from_its_final`: a
+constrained final with no thought right before it — none, or a
+preamble between — has nowhere to record its header, and re-renders
+plain. Harmony does not document a final-channel content
 type (its guide shows `<|constrain|>` only on commentary calls); this
 follows the model.
 The `<|return|>`/`<|end|>` re-ingest rewrite (upstream issue #15417)
@@ -240,6 +247,14 @@ the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
    stock 3.8's own rule, so the 3.8 bake needs no change here. Pinned,
    stock 3.6 as the control:
    `session::tests::qwen_cache_stable_round_trips_scalar_args`.
+7. A turn that **reasons again after its prose**
+   (`…</think>\n\nChecking.<think>\nMore.\n</think>…`) renders from
+   the `chunks` drama_llama supplies: the first thought opens the turn
+   as before, and each later one renders inline where the model wrote
+   it, `<think>\n…\n</think>`. The merged fields cannot place it — 3.6
+   inlined it unpadded, 3.8 joined both thoughts in `reasoning_content`
+   — so the turn lost its tip
+   (`session::tests::qwen_cache_stable_round_trips_a_second_thought`).
 
 The leading system/tools header, user and tool turns, the
 reasoning-effort block (3.8), tool declarations, the rest of the
@@ -266,7 +281,9 @@ number keeps no spelling:
   when present but cannot record its absence.
 - Whitespace after the last call (`…</tool_call>\n`) is dropped: the
   template closes the turn right after `</tool_call>`, and no block
-  carries the tail.
+  carries the tail. No constrained call turn writes it: the tool
+  grammar reads a newline after a call as the separator to the next
+  (`qwen_whitespace_after_the_last_call_is_unreachable`).
 - Qwen3.6 only: a thought containing a literal `<think>` loses
   everything before it. The inlined thought is recovered with
   `split('<think>')[-1]`; 3.8 reads `reasoning_content` and

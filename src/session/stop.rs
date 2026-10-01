@@ -167,6 +167,11 @@ pub(super) struct StopFilter {
 }
 
 impl StopFilter {
+    /// The parser the filter reads.
+    pub(super) fn parser(&self) -> &StreamParser {
+        &self.parser
+    }
+
     pub(super) fn new(parser: StreamParser, stops: Vec<String>) -> Self {
         Self {
             parser,
@@ -355,8 +360,8 @@ fn prose(text: String) -> Option<Block> {
 /// A clipped parse's blocks as a stop sequence sees them: the call in
 /// flight with its string value kept — every byte when `raw`
 /// ([`OpenCall::raw_input`]), else as far as it is known to be text
-/// ([`OpenCall::held_input`], what [`StopFilter`] matched) — and
-/// adjacent prose merged. The batch paths cut this with
+/// ([`OpenCall::held_input`], what [`StopFilter`] matched). The batch
+/// paths cut this with
 /// [`cut_at_stop`].
 pub(super) fn stop_view(
     (parsed, open): (Parsed, Option<OpenCall>),
@@ -370,10 +375,12 @@ pub(super) fn stop_view(
             call.input = if raw { open.raw_input } else { open.held_input };
         }
     }
-    super::merge_adjacent_prose(blocks)
+    // Not merged: a parse merges its own prose, so text blocks side by
+    // side are Harmony channels, each cut on its own.
+    blocks
 }
 
-/// Cut `blocks` (adjacent prose already merged) at the first stop
+/// Cut `blocks` (as [`stop_view`] leaves them) at the first stop
 /// sequence, by [`StopFilter`]'s rules — the batch half of the same
 /// policy. A match in prose keeps the text before it (the block dropped
 /// when nothing is left); a match in a call's input keeps the call, its

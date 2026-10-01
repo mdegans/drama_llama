@@ -252,6 +252,26 @@ impl StreamParser {
         self.open.as_ref()
     }
 
+    /// The text so far as a batch parse reads it ([`Leniency::Final`]):
+    /// its blocks whole, where the yields are deltas that cannot say
+    /// where one text block ended and the next began — two Harmony
+    /// channels, a preamble then the final, stream as adjacent text.
+    pub(crate) fn blocks(&self) -> Vec<Block> {
+        let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
+        let blocks = parse_text(
+            &self.syntax,
+            &tool_refs,
+            &self.text,
+            self.pre_opened_reasoning,
+            Leniency::Final,
+        )
+        .blocks;
+        match &self.provenance {
+            Some(provenance) => provenance.restore_blocks(blocks),
+            None => blocks,
+        }
+    }
+
     /// Whether the text so far ends in a structure in flight
     /// ([`Leniency::Clipped`] reports it unfinished): framing, not
     /// prose.
@@ -1326,12 +1346,10 @@ impl<'a> Parser<'a> {
             (None, Some("analysis")) => self.harmony_analysis(),
             (None, Some("commentary")) => self.harmony_text_body(false),
             (None, Some("final")) => {
-                let before = self.blocks.len();
-                let outcome = self.harmony_text_body(true);
                 if let Some(constrain) = constrain {
-                    self.note_final_constrain(before, constrain);
+                    self.note_final_constrain(constrain);
                 }
-                outcome
+                self.harmony_text_body(true)
             }
             _ => CallOutcome::Malformed,
         }
@@ -1375,46 +1393,46 @@ impl<'a> Parser<'a> {
     /// the part of a Harmony generation users watch stream, and the
     /// StreamParser's landmark holdback keeps partial markers out of
     /// the deltas. `is_final` only affects trailing-EOG stripping.
+    ///
+    /// Each channel's body is its own block, never merged into the
+    /// prose before it: a preamble (`Hi.`) then a final (`{"a":1}`) are
+    /// two answers to the template — commentary, then final — and one
+    /// merged `Hi.{"a":1}` was neither the visible answer nor a value
+    /// an `output_config` schema could accept.
     fn harmony_text_body(&mut self, is_final: bool) -> CallOutcome {
-        match self.rest().find(harmony::END) {
+        let (body, end) = match self.rest().find(harmony::END) {
             Some(at) => {
-                let body = self.rest()[..at].to_string();
-                self.push_text(&body);
-                self.pos += at + harmony::END.len();
-                CallOutcome::Parsed
+                (&self.rest()[..at], self.pos + at + harmony::END.len())
             }
-            None => {
-                let body = if is_final {
-                    strip_harmony_eog(self.rest())
-                } else {
-                    self.rest()
-                }
-                .to_string();
-                self.push_text(&body);
-                self.pos = self.text.len();
-                CallOutcome::Parsed
+            None if is_final => {
+                (strip_harmony_eog(self.rest()), self.text.len())
             }
+            None => (self.rest(), self.text.len()),
+        };
+        if !body.is_empty() {
+            self.blocks.push(body.to_string().into());
         }
+        self.pos = end;
+        CallOutcome::Parsed
     }
 
     /// Record a final channel's declared content type (` <|constrain|>
-    /// json`) in the thought right before it, when its body began a new
-    /// block after one (`ThoughtTail::constrain`): the header is
-    /// framing, so its `Text` cannot say which spelling the model wrote,
-    /// and gpt-oss writes either — unforced, ` <|constrain|>json` on
-    /// structured answers, plain on prose, and its content shape does
-    /// not tell them apart (`[1, 2, 3]` may be prose; a schema whose
-    /// root is a string is not `{…}`). With no thought before it there
-    /// is nowhere to record it, and the final re-renders plain.
-    fn note_final_constrain(&mut self, before: usize, constrain: String) {
+    /// json`) in the thought right before it (`ThoughtTail::constrain`),
+    /// whatever its body — an empty one too, which the template renders
+    /// from the thought alone: the header is framing, so its `Text`
+    /// cannot say which spelling the model wrote, and gpt-oss writes
+    /// either — unforced, ` <|constrain|>json` on structured answers,
+    /// plain on prose, and its content shape does not tell them apart
+    /// (`[1, 2, 3]` may be prose; a schema whose root is a string is not
+    /// `{…}`). With no thought right before it — none at all, or a
+    /// preamble between — there is nowhere to record it, and the final
+    /// re-renders plain: a stream has already released a thought a
+    /// preamble follows, so it could not carry the header after it. The
+    /// `output_config` grammar keeps the constraint where it would be
+    /// lost (see `output_config::emit_harmony_final_header`).
+    fn note_final_constrain(&mut self, constrain: String) {
         use crate::prompt::{ThoughtTail, OPEN_THOUGHT_SIGNATURE};
-        let new_text = self.blocks.len() == before + 1
-            && matches!(self.blocks.last(), Some(Block::Text { .. }));
-        let thought = before
-            .checked_sub(1)
-            .and_then(|at| self.blocks.get_mut(at))
-            .filter(|_| new_text);
-        if let Some(Block::Thought { signature, .. }) = thought {
+        if let Some(Block::Thought { signature, .. }) = self.blocks.last_mut() {
             if signature != OPEN_THOUGHT_SIGNATURE {
                 let mut tail = ThoughtTail::of(signature);
                 tail.constrain = Some(constrain);
