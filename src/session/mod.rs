@@ -3174,6 +3174,9 @@ pub type LlamaCppSession = Session<LlamaCppBackend>;
 /// writing the default if none exists so there is something to edit.
 /// Chat-template and dialect sidecars are picked up the same way.
 /// Requires the `toml` feature; without it, sidecars are ignored.
+// `async_trait` marks each method `#[must_use]` on a boxed future that
+// already is; clippy 1.99 flags the pair in the expansion.
+#[allow(clippy::double_must_use)]
 #[cfg_attr(feature = "tokio", async_trait::async_trait)]
 pub trait FromPath: Sized + Send + 'static {
     /// Load-time options for this backend. `Default` must mean "load the
