@@ -12307,10 +12307,11 @@ mod tests {
                         constrain,
                         ROLE_CONSENT_VALID,
                     );
-                    if !constrain {
-                        // The plain header is refused before any body:
-                        // the template re-renders a JSON final with its
-                        // constraint.
+                    if !analysis && constrain {
+                        // A final opening the turn has nowhere to record
+                        // its header and re-renders plain, so only the
+                        // plain header is admitted there (as in
+                        // `harmony_output_config_constrains_the_final_body`).
                         let prefix = refused_at(&good);
                         assert!(
                             prefix.ends_with("<|channel|>final"),
@@ -12318,12 +12319,16 @@ mod tests {
                         );
                         continue;
                     }
+                    // Both spellings after the analysis (the parse records
+                    // which), and the plain one opening the turn: each is
+                    // held to the same body.
                     for bad in
                         [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
                     {
                         // Refused inside the body, past `"soul_text":""`.
-                        let prefix =
-                            refused_at(&harmony_emission(analysis, true, bad));
+                        let prefix = refused_at(&harmony_emission(
+                            analysis, constrain, bad,
+                        ));
                         assert!(
                             prefix.contains(r#""soul_text":"""#),
                             "{at}: refused too early, after {prefix:?}"
