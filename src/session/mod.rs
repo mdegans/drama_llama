@@ -7238,7 +7238,13 @@ impl<B: Backend> Session<B> {
         //
         // Content literals are markers in both renders but pieces in
         // the emission, so the comparison runs on the renders restored
-        // to pieces — what the model read and wrote.
+        // to pieces — what the model read and wrote. Bytes are not
+        // tokens there, though: the render spells every reserved piece
+        // in content, so one the model emitted as the *real* token
+        // (`marked` still holds it as a piece; containment rejects it,
+        // unless `with_emit_specials_ban(false)` let it stand) sits in
+        // KV as an id the re-render never produces. No hash then.
+        let token_stable = self.scan_blocks_for_specials(&marked).is_empty();
         let blocks_owned: Vec<crate::Block> = blocks.to_vec();
         let mut canonical_tail: Option<Vec<Token>> = None;
         let rendered = keep_tip.then(|| {
@@ -7263,7 +7269,14 @@ impl<B: Backend> Session<B> {
                         .is_some_and(|tail| {
                             tail.starts_with(raw_text.as_str())
                         });
-                    if byte_stable {
+                    if byte_stable && !token_stable {
+                        #[cfg(feature = "axum")]
+                        tracing::debug!(
+                            "a real reserved token in the turn's content \
+                             re-renders spelled; tip hash skipped"
+                        );
+                        None
+                    } else if byte_stable {
                         // Everything the re-render places at and past
                         // the KV head: the uncommitted token's own
                         // piece (zero bytes of it on a stop-sequence

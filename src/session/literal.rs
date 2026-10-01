@@ -606,6 +606,10 @@ mod tests {
         script: Vec<Token>,
         /// The scripted token the next logits favor.
         at: usize,
+        /// Report the KV head, so `Session` records an auto-tip;
+        /// otherwise the KV reads as empty.
+        track_kv: bool,
+        kv_max: i32,
     }
 
     impl LitDecoder {
@@ -629,20 +633,22 @@ mod tests {
         type Error = LitError;
         fn prefill(
             &mut self,
-            _: &[Token],
-            _: usize,
+            tokens: &[Token],
+            start: usize,
             _: i32,
         ) -> Result<&[f32], LitError> {
             // A prefill starts the generation over.
             self.at = 0;
+            self.kv_max = (start + tokens.len()) as i32 - 1;
             Ok(self.next_logits())
         }
         fn step(
             &mut self,
             _: Token,
-            _: usize,
+            pos: usize,
             _: i32,
         ) -> Result<&[f32], LitError> {
+            self.kv_max = pos as i32;
             Ok(self.next_logits())
         }
         fn n_ctx(&self) -> u32 {
@@ -658,7 +664,11 @@ mod tests {
         fn memory_seq_cp(&mut self, _: i32, _: i32, _: i32, _: i32) {}
         fn memory_seq_keep(&mut self, _: i32) {}
         fn memory_seq_pos_max(&mut self, _: i32) -> i32 {
-            -1
+            if self.track_kv {
+                self.kv_max
+            } else {
+                -1
+            }
         }
         fn checkpoint_pos(&mut self, _: i32, _: i32) {}
         fn restore_to(&mut self, _: i32, _: i32) -> Result<(), MemoryRmError> {
@@ -700,6 +710,23 @@ mod tests {
             vision: None,
             decoder: LitDecoder {
                 script,
+                ..LitDecoder::default()
+            },
+            model: LitModel,
+            probe_hook: None,
+        };
+        Session::from_engine(engine)
+            .expect("lit session")
+            .with_prefix_cache(true)
+    }
+
+    /// [`scripted`], with the KV head reported so an auto-tip is kept.
+    fn scripted_tip(script: Vec<Token>) -> Session<LitBackend> {
+        let engine = crate::Engine::<LitBackend> {
+            vision: None,
+            decoder: LitDecoder {
+                script,
+                track_kv: true,
                 ..LitDecoder::default()
             },
             model: LitModel,
@@ -1350,6 +1377,26 @@ mod tests {
             let blocks = s.complete_blocks(&prompt).expect("batch");
             assert_eq!(blocks, [text("hello")], "{real}");
         }
+    }
+
+    /// The auto-tip's hash says the KV is the re-render's tokens. A
+    /// spelled piece re-renders spelled, so a turn quoting one keeps
+    /// it; a real reserved token in content (emission ban off) is an
+    /// id the render spells, so that turn gets none — the bytes alone
+    /// would match.
+    #[test]
+    fn a_real_token_in_content_keeps_no_tip_hash() {
+        let tip_hash = |script: Vec<Token>| {
+            let mut s = scripted_tip(script).with_emit_specials_ban(false);
+            let blocks = s.complete_blocks(&tool_prompt()).expect("batch");
+            assert_eq!(blocks, [text("a </tool_call> b")]);
+            let cache = s.prefix_cache.as_ref().expect("cache on");
+            let tip = cache.slots.iter().find_map(|slot| slot.tip.as_ref());
+            tip.expect("a tip").hash.is_some()
+        };
+        assert!(tip_hash(bytes("a </tool_call> b")), "spelled: re-renders");
+        let real = [bytes("a "), vec![TOOL_CALL_END], bytes(" b")].concat();
+        assert!(!tip_hash(real), "real: the render spells it");
     }
 
     /// A turn quoting a spelled piece re-renders to the bytes the model
