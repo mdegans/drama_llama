@@ -1867,6 +1867,50 @@ fn find_open_thought(
     })
 }
 
+/// The specials a dialect marker is framed by, for the id-level ban
+/// sets: those the marker tokenizes to (`parse_special`), and every
+/// other special sharing one of their pieces. A vocabulary can hold
+/// two specials with one text; the text tokenizes to one, but the
+/// model emitting the other is the same framing
+/// ([`crate::LiteralNeutralizer`]'s `emitted_piece`), so banning only
+/// the first leaves the marker generatable.
+struct MarkerSpecials<'m, M: Model> {
+    model: &'m M,
+    /// Every special with a non-empty piece, by that piece.
+    by_piece: std::collections::HashMap<String, Vec<Token>>,
+}
+
+impl<'m, M: Model> MarkerSpecials<'m, M> {
+    fn new(model: &'m M) -> Self {
+        let mut by_piece = std::collections::HashMap::<_, Vec<_>>::new();
+        for t in model.special_tokens() {
+            let piece = model.token_to_piece(t);
+            if !piece.is_empty() {
+                by_piece.entry(piece).or_default().push(t);
+            }
+        }
+        Self { model, by_piece }
+    }
+
+    /// The specials framing `marker`; empty for a blank marker.
+    fn of(&self, marker: &str) -> Vec<Token> {
+        if marker.trim().is_empty() {
+            return Vec::new();
+        }
+        self.model
+            .tokenize_special(marker, false, true)
+            .into_iter()
+            .filter_map(|t| {
+                self.by_piece
+                    .get(&self.model.token_to_piece(t))
+                    .filter(|same| same.contains(&t))
+            })
+            .flatten()
+            .copied()
+            .collect()
+    }
+}
+
 /// Can this dialect express a *resumed* reasoning block — i.e. can a
 /// render end inside an open reasoning region the model will continue?
 ///
@@ -4104,9 +4148,10 @@ impl<B: Backend> Session<B> {
     ///
     /// Derived by tokenizing the dialect's call-opener markers
     /// (`section_start` / `per_call_start`) with `parse_special` and
-    /// keeping the *special* tokens among the pieces: precisely the
-    /// tokens the model must emit to begin a call, and the same bytes
-    /// the parser keys on to recognize one. Specials shared with a
+    /// keeping the *special* tokens among the pieces, plus any special
+    /// sharing one's text (`MarkerSpecials`): precisely the tokens
+    /// the model must emit to begin a call, and the same bytes the
+    /// parser keys on to recognize one. Specials shared with a
     /// non-tool structural marker (reasoning tags, turn openers) are
     /// exempt, so a marker the model legitimately emits in prose is
     /// never banned. These opener specials are deliberately *exempt*
@@ -4133,24 +4178,12 @@ impl<B: Backend> Session<B> {
     /// [`SamplerConfig::banned_specials`]: crate::SamplerConfig
     /// [`BTreeSet`]: std::collections::BTreeSet
     fn tool_none_ban_set(&self) -> Vec<Token> {
-        use std::collections::{BTreeSet, HashSet};
-        let model = &self.engine.model;
+        use std::collections::BTreeSet;
         let syntax = effective_tool_syntax(&self.dialect);
-        let special: HashSet<Token> =
-            model.special_tokens().into_iter().collect();
-        // Special tokens the tokenizer produces for `s` (parse_special),
-        // i.e. the specials the model must emit to reproduce `s`. Empty
-        // for whitespace-only / empty markers.
-        let specials_of = |s: &str| -> Vec<Token> {
-            if s.trim().is_empty() {
-                return Vec::new();
-            }
-            model
-                .tokenize_special(s, false, true)
-                .into_iter()
-                .filter(|t| special.contains(t))
-                .collect()
-        };
+        // The specials the model must emit to reproduce a marker,
+        // duplicates of their text included.
+        let specials = MarkerSpecials::new(&self.engine.model);
+        let specials_of = |s: &str| specials.of(s);
         let mut ban: BTreeSet<Token> = BTreeSet::new();
         for opener in [&syntax.section_start, &syntax.per_call_start] {
             ban.extend(specials_of(opener));
@@ -4208,26 +4241,15 @@ impl<B: Backend> Session<B> {
     ///
     /// [`SamplerConfig::banned_specials`]: crate::SamplerConfig
     fn reasoning_opener_ban_set(&self) -> Vec<Token> {
-        use std::collections::{BTreeSet, HashSet};
+        use std::collections::BTreeSet;
         if !self.emit_specials_ban
             || !dialect_renders_open_thought(&self.dialect)
         {
             return Vec::new();
         }
-        let model = &self.engine.model;
         let syntax = effective_tool_syntax(&self.dialect);
-        let special: HashSet<Token> =
-            model.special_tokens().into_iter().collect();
-        let specials_of = |s: &str| -> Vec<Token> {
-            if s.trim().is_empty() {
-                return Vec::new();
-            }
-            model
-                .tokenize_special(s, false, true)
-                .into_iter()
-                .filter(|t| special.contains(t))
-                .collect()
-        };
+        let specials = MarkerSpecials::new(&self.engine.model);
+        let specials_of = |s: &str| specials.of(s);
         let opener = syntax.reasoning.start.trim();
         let mut ban: BTreeSet<Token> =
             specials_of(&syntax.reasoning.start).into_iter().collect();
@@ -4301,13 +4323,11 @@ impl<B: Backend> Session<B> {
         if closer.is_empty() {
             return Vec::new();
         }
-        let special: HashSet<Token> =
-            model.special_tokens().into_iter().collect();
         let eog: HashSet<Token> = model.eog_tokens().into_iter().collect();
-        let ban: BTreeSet<Token> = model
-            .tokenize_special(closer, false, true)
+        let ban: BTreeSet<Token> = MarkerSpecials::new(model)
+            .of(closer)
             .into_iter()
-            .filter(|t| special.contains(t) && !eog.contains(t))
+            .filter(|t| !eog.contains(t))
             .collect();
         ban.into_iter().collect()
     }

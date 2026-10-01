@@ -463,6 +463,7 @@ mod tests {
     };
     use misanthropic::prompt::message::{CacheControl, Content, Message};
     use std::borrow::Cow;
+    use std::num::NonZeroU128;
 
     const IM_START: Token = 300;
     const IM_END: Token = 301;
@@ -480,7 +481,9 @@ mod tests {
     /// A second special spelled `<tool_call>`: text tokenizes to
     /// [`TOOL_CALL`], so it is not reserved, but it is framing emitted.
     const TOOL_CALL_ALIAS: Token = 309;
-    const N_VOCAB: i32 = 310;
+    /// A second special spelled `<think>`, like [`TOOL_CALL_ALIAS`].
+    const THINK_ALIAS: Token = 310;
+    const N_VOCAB: i32 = 311;
 
     /// `(id, piece, control)` — `control = false` is `USER_DEFINED`.
     const SPECIALS: &[(Token, &str, bool)] = &[
@@ -494,6 +497,7 @@ mod tests {
         (SECTION, "§", false),
         (BRACKETED, "<§>", false),
         (TOOL_CALL_ALIAS, "<tool_call>", false),
+        (THINK_ALIAS, "<think>", false),
     ];
 
     const TEMPLATE: &str = "\
@@ -1303,6 +1307,66 @@ mod tests {
         let blocks = run([vec![TOOL_CALL_ALIAS], real(rest)].concat());
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         assert!(is_call(&blocks[0]), "{blocks:?}");
+    }
+
+    /// `ToolChoice::None` bans the call opener; a special sharing its
+    /// text opens a call just the same, so it is banned with it. Both
+    /// scripts then run identically: whatever the sampler picks in the
+    /// opener's place, no call.
+    #[test]
+    fn tool_choice_none_bans_a_duplicate_opener() {
+        let call = call_bytes();
+        let rest = call.strip_prefix("<tool_call>").expect("hermes opener");
+        let prompt = Prompt {
+            tool_choice: Some(crate::ToolChoice::None),
+            ..tool_prompt()
+        };
+        let outcome = |opener: Token| {
+            let script = [vec![opener], real(rest)].concat();
+            let mut s = scripted(script).with_seed(NonZeroU128::new(7));
+            format!("{:?}", s.complete_blocks(&prompt))
+        };
+        let canonical = outcome(TOOL_CALL);
+        assert!(!canonical.contains("ToolUse"), "{canonical}");
+        assert_eq!(outcome(TOOL_CALL_ALIAS), canonical);
+        let ban = session().tool_none_ban_set();
+        assert_eq!(ban, [TOOL_CALL, TOOL_CALL_ALIAS]);
+    }
+
+    /// The reasoning-opener ban (#107), for a render that already
+    /// opened the turn's thought, holds a special sharing the opener's
+    /// text too: a second `<think>` either way is a duplicate.
+    #[test]
+    fn a_spent_opener_bans_its_duplicate() {
+        let mut dialect = session().dialect().clone();
+        dialect.reasoning.mode = crate::dialect::ReasoningMode::TagBased;
+        dialect.reasoning.start = "<think>".into();
+        dialect.reasoning.end = "</think>".into();
+        let prompt = Prompt {
+            messages: vec![
+                message(crate::Role::User, vec![text("go")]),
+                message(
+                    crate::Role::Assistant,
+                    vec![crate::Block::Thought {
+                        thought: "hmm".into(),
+                        signature: crate::prompt::OPEN_THOUGHT_SIGNATURE.into(),
+                    }],
+                ),
+            ],
+            ..Prompt::default()
+        };
+        let outcome = |opener: Token| {
+            let script =
+                [vec![opener], bytes("x"), vec![THINK_END], bytes("y")]
+                    .concat();
+            let mut s = scripted(script)
+                .with_dialect(dialect.clone())
+                .with_seed(NonZeroU128::new(7));
+            format!("{:?}", s.complete_blocks(&prompt))
+        };
+        assert_eq!(outcome(THINK_ALIAS), outcome(THINK));
+        let ban = session().with_dialect(dialect).reasoning_opener_ban_set();
+        assert_eq!(ban, [THINK, THINK_ALIAS]);
     }
 
     /// Quoting a spelled call first does not stop a real one after it.
