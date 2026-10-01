@@ -22,7 +22,11 @@
 //! [`Session`]: crate::Session
 //! [`schema_to_gbnf`]: crate::schema_to_gbnf
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value};
+
+use crate::grammar_compile::Defs;
 
 /// Where a value departs from its schema, and how. The path is a JSON
 /// pointer built from schema-declared property names and array indices
@@ -152,20 +156,60 @@ pub(crate) fn check(
     schema: &Value,
     value: &Value,
 ) -> Result<(), SchemaMismatch> {
-    let defs = schema.get("$defs").and_then(Value::as_object);
-    Checker { defs }.at(schema, value, &mut String::new())
+    let defs = Defs::new(schema.get("$defs").and_then(Value::as_object));
+    Checker {
+        defs,
+        memo: HashMap::new(),
+        depth: 0,
+    }
+    .at(schema, value, &mut String::new(), None)
 }
 
+/// How deep [`Checker::at`] may nest before it stops judging. A value
+/// is at most serde_json's 128 levels, but each level can also descend
+/// a def's `anyOf`s and a chain of `$ref`s, and the checker must never
+/// overflow the stack on a client's schema. Past the cap a value
+/// passes: the backstop goes lenient, never wrong.
+const MAX_DEPTH: usize = 256;
+
 struct Checker<'s> {
-    defs: Option<&'s Map<String, Value>>,
+    defs: Defs<'s>,
+    /// A def's verdict on a value, by `(def, the value's address)`:
+    /// the same value always sits at the same path, so the verdict is
+    /// reusable whole. Without it, `anyOf`s of `$ref`s fan out
+    /// exponentially in the chain's length.
+    memo: HashMap<(usize, usize), Result<(), SchemaMismatch>>,
+    /// The current nesting of [`Self::at`].
+    depth: usize,
 }
 
 impl Checker<'_> {
+    /// Check `value` at `path` against `schema`. `left_of` is the def
+    /// whose body `schema` is at the left of — no byte of `value`
+    /// consumed since — which decides whether a `$ref` closes a cycle
+    /// (see [`Defs`]).
     fn at(
-        &self,
+        &mut self,
         schema: &Value,
         value: &Value,
         path: &mut String,
+        left_of: Option<usize>,
+    ) -> Result<(), SchemaMismatch> {
+        if self.depth >= MAX_DEPTH {
+            return Ok(());
+        }
+        self.depth += 1;
+        let result = self.at_inner(schema, value, path, left_of);
+        self.depth -= 1;
+        result
+    }
+
+    fn at_inner(
+        &mut self,
+        schema: &Value,
+        value: &Value,
+        path: &mut String,
+        left_of: Option<usize>,
     ) -> Result<(), SchemaMismatch> {
         let fail = |path: &str, kind| {
             Err(SchemaMismatch {
@@ -176,20 +220,25 @@ impl Checker<'_> {
 
         // Same `$ref` shape the grammar compiler resolves; anything else
         // falls through to the schema's other keywords, as it does there.
-        if let Some(target) = schema
-            .get("$ref")
-            .and_then(Value::as_str)
-            .and_then(|r| r.strip_prefix("#/$defs/"))
-            .and_then(|name| self.defs.and_then(|d| d.get(name)))
-        {
-            return self.at(target, value, path);
+        // A reference closing a left cycle is `value` there: anything.
+        if let Some(id) = self.defs.target(schema) {
+            let Some(id) = self.defs.resolve(left_of, id) else {
+                return Ok(());
+            };
+            let key = (id, value as *const Value as usize);
+            if let Some(verdict) = self.memo.get(&key) {
+                return verdict.clone();
+            }
+            let verdict = self.at(self.defs.schema(id), value, path, Some(id));
+            self.memo.insert(key, verdict.clone());
+            return verdict;
         }
 
         if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
             if !variants.is_empty()
-                && !variants
-                    .iter()
-                    .any(|v| self.at(v, value, &mut path.clone()).is_ok())
+                && !variants.iter().any(|v| {
+                    self.at(v, value, &mut path.clone(), left_of).is_ok()
+                })
             {
                 return fail(path, MismatchKind::AnyOf);
             }
@@ -237,7 +286,7 @@ impl Checker<'_> {
     }
 
     fn object(
-        &self,
+        &mut self,
         schema: &Value,
         object: &Map<String, Value>,
         path: &mut String,
@@ -265,7 +314,7 @@ impl Checker<'_> {
             let result = match (declared, additional) {
                 (Some(sub), _) => {
                     push_pointer(path, key);
-                    self.at(sub, child, path)
+                    self.at(sub, child, path, None)
                 }
                 // A required name with no `properties` entry: the
                 // grammar gives it a permissive slot.
@@ -276,7 +325,7 @@ impl Checker<'_> {
                 }),
                 (None, Some(sub @ Value::Object(_))) => {
                     // Not a schema name: point at the object, not the key.
-                    self.at(sub, child, &mut path.clone())
+                    self.at(sub, child, &mut path.clone(), None)
                 }
                 (None, _) => Ok(()),
             };
@@ -287,7 +336,7 @@ impl Checker<'_> {
     }
 
     fn array(
-        &self,
+        &mut self,
         schema: &Value,
         items: &[Value],
         path: &mut String,
@@ -309,7 +358,7 @@ impl Checker<'_> {
             let len = path.len();
             path.push('/');
             path.push_str(&i.to_string());
-            let result = self.at(item_schema, item, path);
+            let result = self.at(item_schema, item, path, None);
             path.truncate(len);
             result
         })

@@ -45,7 +45,7 @@ use serde_json::Value;
 use crate::grammar_compile::{
     dict_encode_value, emit_dict_value_rules, emit_until_rules,
     escape_for_gbnf_string, json_grammar_canonical, schema_to_dict_gbnf,
-    schema_to_gbnf, schema_to_gbnf_in, FIELD_SEP, KV_SEP,
+    schema_to_gbnf, schema_to_gbnf_in, Defs, FIELD_SEP, KV_SEP,
 };
 use crate::Tool;
 
@@ -502,13 +502,17 @@ pub(crate) fn tagged_value(
     tool_schema: &Value,
     param: &Value,
 ) -> TaggedValue {
-    let defs = tool_schema.get("$defs").and_then(Value::as_object);
-    let mut admits = Admits::default();
-    admits.collect(param, defs, 0);
+    let defs = Defs::new(tool_schema.get("$defs").and_then(Value::as_object));
+    let mut admits = Admits {
+        visits: vec![Visit::Unseen; defs.len()],
+        ..Admits::default()
+    };
+    admits.collect(param, &defs, 0);
     let Admits {
         any_string,
         any_other,
         members,
+        ..
     } = admits;
     let nullable = members.contains(&Value::Null);
     if any_other {
@@ -565,29 +569,44 @@ struct Admits {
     /// Finitely many values (`enum`, `const`, `"type": "null"`), in
     /// declaration order, without duplicates.
     members: Vec<Value>,
+    /// Each def's progress, by id: a def collected once adds nothing
+    /// the second time (without this, `anyOf`s of `$ref`s fan out
+    /// exponentially), and one met again while still open is a cycle.
+    visits: Vec<Visit>,
+}
+
+/// How far [`Admits::collect`] has got through a def.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Visit {
+    #[default]
+    Unseen,
+    Open,
+    Done,
 }
 
 impl Admits {
-    fn collect(
-        &mut self,
-        schema: &Value,
-        defs: Option<&serde_json::Map<String, Value>>,
-        depth: usize,
-    ) {
-        // A `$ref` cycle cannot be finite; give up on it as JSON.
-        if depth > 32 {
+    fn collect(&mut self, schema: &Value, defs: &Defs<'_>, depth: usize) {
+        // Once anything non-string goes, the answer is JSON whatever
+        // else turns up. Too deep (a chain of thousands of aliases)
+        // gives up as JSON too, rather than nest that far.
+        if self.any_other || depth > 32 {
             self.any_other = true;
             return;
         }
         // The `$ref` shape the grammar compiler resolves; anything else
         // falls through to the schema's other keywords, as it does there.
-        if let Some(target) = schema
-            .get("$ref")
-            .and_then(Value::as_str)
-            .and_then(|r| r.strip_prefix("#/$defs/"))
-            .and_then(|name| defs.and_then(|d| d.get(name)))
-        {
-            return self.collect(target, defs, depth + 1);
+        if let Some(id) = defs.target(schema) {
+            match self.visits[id] {
+                // A `$ref` cycle is unconstrained (see `Defs`): JSON.
+                Visit::Open => self.any_other = true,
+                Visit::Done => {}
+                Visit::Unseen => {
+                    self.visits[id] = Visit::Open;
+                    self.collect(defs.schema(id), defs, depth + 1);
+                    self.visits[id] = Visit::Done;
+                }
+            }
+            return;
         }
         let union = schema
             .get("anyOf")

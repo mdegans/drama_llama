@@ -541,6 +541,47 @@ mod tests {
         ));
     }
 
+    /// Strict schemas with recursive `$ref`s compile, and two tools'
+    /// same-named defs (`Node`) stay two rules: each tool's tree
+    /// follows its own `Node`.
+    #[test]
+    fn strict_recursive_refs_keep_each_tools_defs() {
+        let tree = |leaf: &str| {
+            json!({
+                "type": "object",
+                "properties": {"root": {"$ref": "#/$defs/Node"}},
+                "required": ["root"],
+                "$defs": {"Node": {
+                    "type": "object",
+                    "properties": {
+                        "v": {"type": leaf},
+                        "kids": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/Node"},
+                        },
+                    },
+                    "required": ["v", "kids"],
+                }},
+            })
+        };
+        let words = tool_with_schema("words", tree("string"));
+        let numbers = tool_with_schema("numbers", tree("integer"));
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..bare_opts()
+        };
+        let src = eager_src(&[&words, &numbers], &opts);
+        let call = |name: &str, leaf: &str| {
+            format!(
+                r#"{{"name": "{name}", "parameters": {{"root":{{"v":{leaf},"kids":[{{"v":{leaf},"kids":[{{"v":{leaf},"kids":[]}}]}}]}}}}}}"#
+            )
+        };
+        assert!(accepts(&src, &call("words", r#""a""#)));
+        assert!(accepts(&src, &call("numbers", "1")));
+        assert!(!accepts(&src, &call("words", "1")));
+        assert!(!accepts(&src, &call("numbers", r#""a""#)));
+    }
+
     #[test]
     fn any_grammar_accepts_any_listed_name() {
         let a = tool("a");

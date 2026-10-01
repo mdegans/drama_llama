@@ -2930,6 +2930,158 @@ mod tests {
         }
     }
 
+    /// A recursive `$ref` on every dialect: a tree (as schemars emits
+    /// one), mutual recursion, and alias chains with a self-alias
+    /// among them each compile to a grammar that admits a valid call,
+    /// refuses an invalid one, and parses back to the input, which the
+    /// schema check passes. The tree used to inline without end and
+    /// abort the server on a stack overflow.
+    #[test]
+    fn recursive_refs_compile_on_every_dialect() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        use crate::{Grammar, GrammarState};
+        use std::sync::Arc;
+
+        let node = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "children": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/Node"},
+                },
+            },
+        });
+        let tree = (
+            json!({
+                "type": "object",
+                "properties": {"root": {"$ref": "#/$defs/Node"}},
+                "required": ["root"],
+                "$defs": {"Node": node},
+            }),
+            json!({"root": {"name": "a", "children": [
+                {"name": "b", "children": [{"name": "c", "children": []}]},
+                {"name": "d"},
+            ]}}),
+            json!({"root": {"name": "a", "children": [
+                {"name": "b", "children": [{"name": 3}]},
+            ]}}),
+        );
+        let mutual = (
+            json!({
+                "type": "object",
+                "properties": {"a": {"$ref": "#/$defs/A"}},
+                "required": ["a"],
+                "$defs": {
+                    "A": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "b": {"anyOf": [
+                                {"$ref": "#/$defs/B"},
+                                {"type": "null"},
+                            ]},
+                        },
+                        "required": ["label", "b"],
+                    },
+                    "B": {
+                        "type": "object",
+                        "properties": {"a": {"$ref": "#/$defs/A"}},
+                        "required": ["a"],
+                    },
+                },
+            }),
+            json!({"a": {"label": "x", "b": {"a": {"label": "y", "b": null}}}}),
+            json!({"a": {"label": "x", "b": {"a": {"label": 5, "b": null}}}}),
+        );
+        let aliases = (
+            json!({
+                "type": "object",
+                "properties": {
+                    "count": {"$ref": "#/$defs/Count"},
+                    "extra": {"$ref": "#/$defs/Me"},
+                },
+                "required": ["count", "extra"],
+                "$defs": {
+                    "Count": {"$ref": "#/$defs/Int"},
+                    "Int": {"$ref": "#/$defs/Integer"},
+                    "Integer": {"type": "integer"},
+                    "Me": {"$ref": "#/$defs/Me"},
+                },
+            }),
+            json!({"count": 3, "extra": {"any": [1, true]}}),
+            json!({"count": "three", "extra": 1}),
+        );
+        let options = EmitOptions {
+            anchor: Anchor::Lazy,
+            parallel: false,
+        };
+        for (case, (schema, valid, invalid)) in
+            [("tree", tree), ("mutual", mutual), ("aliases", aliases)]
+        {
+            let tool = Tool::builder("grow")
+                .description("test")
+                .schema(schema)
+                .build()
+                .expect("valid test tool");
+            assert!(crate::schema_check::check(&tool.schema, &valid).is_ok());
+            assert!(crate::schema_check::check(&tool.schema, &invalid).is_err());
+            for (name, syntax) in call_dialects() {
+                let at = format!("{name}, {case}");
+                let src = grammar_source(&syntax, &[&tool], &options)
+                    .unwrap_or_else(|e| panic!("{at}: {e}"));
+                let grammar = Arc::new(
+                    Grammar::parse(&src)
+                        .unwrap_or_else(|e| panic!("{at}: {e}\n{src}")),
+                );
+                // Plus the turn-exit marker the grammar ends on, where the
+                // dialect has one (Gemma's `<|tool_response>`).
+                let admits = |input: &Value| {
+                    let call = render_reference(&syntax, &[("grow", input)])
+                        .unwrap_or_else(|e| panic!("{at}: {e}"));
+                    let framed =
+                        format!("{call}{}", syntax.tool_response_start);
+                    let mut state = GrammarState::new(grammar.clone());
+                    (state.advance_bytes(framed.as_bytes()).is_ok()
+                        && state.is_complete())
+                    .then_some(call)
+                };
+                let call = admits(&valid)
+                    .unwrap_or_else(|| panic!("{at}: valid refused\n{src}"));
+                let parsed = parse_text(
+                    &syntax,
+                    &[&tool],
+                    &call,
+                    false,
+                    Leniency::Final,
+                );
+                assert_eq!(
+                    calls_of(&parsed.blocks),
+                    [("grow", &valid)],
+                    "{at}: {call}"
+                );
+                assert!(admits(&invalid).is_none(), "{at}: invalid admitted");
+            }
+        }
+    }
+
+    /// The tagged-value classifier walks a wide diamond of `anyOf`s
+    /// (`D_i = anyOf[D_{i+1} × 50]`) once per def, not 50^n times, and
+    /// still finds the string set at its end.
+    #[test]
+    fn qwen_xml_ref_diamond_is_linear() {
+        let n = 10;
+        let mut defs = serde_json::Map::new();
+        for i in 0..n {
+            let next = json!({"$ref": format!("#/$defs/D{}", i + 1)});
+            defs.insert(format!("D{i}"), json!({"anyOf": vec![next; 50]}));
+        }
+        defs.insert(format!("D{n}"), json!({"enum": ["lite", "full"]}));
+        let tool = mode_tool(json!({"$ref": "#/$defs/D0"}), Some(defs.into()));
+        assert!(qwen_admits(&tool, &qwen_mode_call("full")));
+        assert!(!qwen_admits(&tool, &qwen_mode_call("fullest")));
+    }
+
     /// The raw spelling is the tagged dialects' alone: a JSON dialect
     /// still quotes a string enum, as JSON must.
     #[test]

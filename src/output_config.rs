@@ -622,6 +622,45 @@ mod tests {
         assert!(accepts(&src, r#"{"x":1}"#));
     }
 
+    /// A recursive `$ref` (a tree, as schemars emits one) compiles as
+    /// a structured-output schema — unified and deferred grammars both
+    /// admit a valid three-level tree and refuse an invalid one, as
+    /// the schema check does — where it used to overflow the stack.
+    #[test]
+    fn recursive_ref_schema_compiles() {
+        let config = cfg(json!({
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/Node"}},
+            "required": ["root"],
+            "$defs": {"Node": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "children": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/Node"},
+                    },
+                },
+            }},
+        }));
+        let schema = config.format_schema();
+        assert!(schema.pointer("/$defs/Node").is_some(), "{schema}");
+        let opts = OutputConfigOptions::default();
+        let unified = build_grammar_source(&schema, &opts, false);
+        let deferred = build_json_only_grammar_source(&schema, &opts);
+        let valid = r#"{"root":{"name":"a","children":[{"name":"b","children":[{"name":"c","children":[]}]},{"name":"d"}]}}"#;
+        let invalid = r#"{"root":{"name":"a","children":[{"name":"b","children":[{"name":3}]}]}}"#;
+        assert!(accepts(&unified, valid));
+        assert!(accepts(&unified, &format!("<think>hmm</think>{valid}")));
+        assert!(accepts(&deferred, valid));
+        assert!(crate::schema_check::check_text(&schema, valid).is_ok());
+        for src in [&unified, &deferred] {
+            assert!(!accepts(src, invalid));
+        }
+        assert!(crate::schema_check::check_text(&schema, invalid).is_err());
+        assert!(grammar_for_output_config(&config, &opts, false).is_ok());
+    }
+
     #[test]
     fn allow_thought_false_rejects_prefix() {
         let config = cfg(json!({

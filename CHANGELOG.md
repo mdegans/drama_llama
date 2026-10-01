@@ -205,6 +205,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A recursive `$ref` no longer aborts the server.** The schema
+  compiler inlined every `$ref` it met, with no cycle guard, so a
+  recursive schema — `{"$ref": "#/$defs/Node"}` whose `Node` has
+  `children: {items: {"$ref": "#/$defs/Node"}}`, exactly what
+  schemars emits for a tree type — recursed until `fatal runtime
+  error: stack overflow, aborting`: an abort, not a panic, so one such
+  tool or `output_config` schema took down the whole blallama process
+  and every request in it. Every dialect was exposed (Hermes/JSON-
+  native, Mistral, Gemma's dict encoding, gpt-oss Harmony, and Qwen
+  XML since its per-parameter schemas began resolving the tool's
+  `$defs`), as were strict `tool_choice` grammars and structured
+  output. Each referenced def now compiles once, to its own named rule
+  (`<root>__def<n>_<Name>`) that every `$ref` to it names, so recursion
+  lives in the grammar; defs come off a worklist, not nested calls, and
+  alias chains (`A → B → C`) resolve in a loop to their end. A
+  reference that loops back before any byte of the value — a
+  self-alias, an alias cycle, a left-recursive `anyOf` — would be left
+  recursion, and is unconstrained instead (`value`), as it is to the
+  schema check. That check, and the tagged-value classifier, follow
+  the same rule; the check memoizes each def's verdict per value and
+  caps its nesting (past it, a value passes rather than overflow), and
+  the classifier visits each def once, so neither a chain thousands of
+  defs long nor a diamond of `anyOf`s (`D_i = anyOf[D_{i+1}, …]`, 2^n
+  paths) can overflow or stall them. Everything else the schema
+  walkers recurse on is bounded by serde_json's 128-level nesting
+  limit on the request. Pinned on every dialect with a tree, mutual
+  recursion and alias chains (`recursive_refs_compile_on_every_dialect`)
+  and on `output_config` and strict `tool_choice`; chain, diamond and
+  depth bounds on small thread stacks in `grammar_compile`.
+
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like
