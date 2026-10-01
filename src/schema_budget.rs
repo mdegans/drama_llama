@@ -44,7 +44,7 @@
 //! [`grammar_for_tool_choice`](crate::grammar_for_tool_choice) and the
 //! `output_config` ones — against their options' `schema_limits`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
@@ -804,20 +804,30 @@ fn own_width(node: &Value, parts: &Parts, target: Option<usize>) -> usize {
     let Value::Object(map) = node else {
         return W_ANY;
     };
+    // Each name once, here as in the compiler and the check: a name a
+    // `type` or `required` array repeats is no wider.
     let types: Vec<&str> = match map.get("type") {
         Some(Value::String(t)) => vec![t.as_str()],
-        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        Some(Value::Array(ts)) => {
+            let mut seen = HashSet::new();
+            ts.iter()
+                .filter_map(Value::as_str)
+                .filter(|t| seen.insert(*t))
+                .collect()
+        }
         _ => Vec::new(),
     };
     let props = map.get("properties").and_then(Value::as_object);
     let required = map.get("required").and_then(Value::as_array);
     let object = (props.is_some() || types.contains(&"object")).then(|| {
         let declared = props.map_or(0, Map::len);
-        let undeclared = required.into_iter().flatten().filter(|name| {
-            name.as_str()
-                .is_some_and(|n| !props.is_some_and(|p| p.contains_key(n)))
-        });
-        match declared + undeclared.count() {
+        let undeclared: HashSet<&str> = required
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|n| !props.is_some_and(|p| p.contains_key(*n)))
+            .collect();
+        match declared + undeclared.len() {
             0 => W_ANY,
             slots => slots
                 .saturating_add(W_CONTAINER)

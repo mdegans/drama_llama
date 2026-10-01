@@ -690,17 +690,19 @@ impl<'a> Compiler<'a> {
             .get("properties")
             .and_then(|v| v.as_object())
             .unwrap_or(&no_props);
-        let required_vec: Vec<String> = schema
+        // Each name once: a name `required` lists twice is one slot,
+        // not two — an undeclared one written twice was a key the
+        // grammar forced the model to repeat.
+        let mut required_set: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        let required_vec: Vec<&str> = schema
             .get("required")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let required_set: std::collections::HashSet<&String> =
-            required_vec.iter().collect();
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|name| required_set.insert(name))
+            .collect();
 
         // Empty `properties` (and therefore no slots) → permissive object.
         if props.is_empty() && required_vec.is_empty() {
@@ -725,8 +727,8 @@ impl<'a> Compiler<'a> {
         // arbitrary — no schema entry defines one).
         let mut slots: Vec<(String, String, bool)> = Vec::new();
         for name in &required_vec {
-            if !props.contains_key(name) {
-                slots.push((name.clone(), "value".to_string(), true));
+            if !props.contains_key(*name) {
+                slots.push((name.to_string(), "value".to_string(), true));
             }
         }
         for (name, prop_schema) in props.iter() {
@@ -736,7 +738,8 @@ impl<'a> Compiler<'a> {
             self.counter += 1;
             let child_rule = format!("{rule_name}__{c}", c = self.counter);
             self.rule(prop_schema, &child_rule, None, out);
-            slots.push((name.clone(), child_rule, required_set.contains(name)));
+            let required = required_set.contains(name.as_str());
+            slots.push((name.clone(), child_rule, required));
         }
 
         let member = |name: &str, child: &str| {
@@ -1033,12 +1036,13 @@ pub(crate) fn effective_type(schema: &Value) -> Option<&str> {
             if !arr.iter().all(|v| v.is_string()) {
                 return None;
             }
+            // Each name once: `["integer", "integer"]` is an integer.
             let mut non_null = arr
                 .iter()
                 .filter_map(|v| v.as_str())
                 .filter(|s| *s != "null");
             let first = non_null.next()?;
-            non_null.next().is_none().then_some(first)
+            non_null.all(|t| t == first).then_some(first)
         }
         _ => None,
     }

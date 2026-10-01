@@ -1485,3 +1485,57 @@ fn depth_budget_fits_the_parsers() {
     assert!(accepts(&compile(&schema), &text));
     assert_eq!(crate::schema_check::check_text(&schema, &text), Ok(()));
 }
+
+/// A `required` naming one property 100,000 times, or a `type` listing
+/// `"object"` as often, is inside every limit (one property, one type),
+/// and must cost as little to judge: the check rebuilt and walked the
+/// whole list for every object it judged — 4.4 s on 64 KB of output,
+/// 8.4 s on 128 KB, past its step budget, which no request inside the
+/// limits may reach. The names are gathered once per check. The
+/// compilers read each name once too: an undeclared name listed twice
+/// was a key the grammar made the model write twice, and a type listed
+/// twice a union that compiled to any value at all.
+#[test]
+fn duplicate_names_cost_once() {
+    use crate::schema_check::check_counted;
+    let n = 100_000;
+    let required: Vec<Value> = (0..n).map(|_| json!("a")).collect();
+    let item = json!({
+        "type": "object",
+        "properties": {"a": {"type": "integer"}},
+        "required": required,
+    });
+    let mut types: Vec<Value> = (0..n).map(|_| json!("object")).collect();
+    types.push(json!("array"));
+    for item in [item, json!({"type": types})] {
+        let schema = json!({
+            "type": "object",
+            "properties": {"xs": {"type": "array", "items": item}},
+            "required": ["xs"],
+        });
+        check_schemas([&tool(schema.clone())], None, &SchemaLimits::default())
+            .expect("inside the limits");
+        // ~128 KB of output, ~32k tokens; the last element wrong.
+        let mut xs: Vec<Value> = (0..16_000).map(|i| json!({"a": i})).collect();
+        *xs.last_mut().unwrap() = json!({"b": 1});
+        let start = Instant::now();
+        let (verdict, steps, budget) =
+            check_counted(&schema, &json!({"xs": xs}));
+        let elapsed = start.elapsed();
+        assert!(steps <= budget, "{steps} of {budget}");
+        assert!(elapsed.as_secs() < 2, "{elapsed:?}");
+        // The `type` list admits `{"b": 1}`; `required` does not.
+        let typed = schema["properties"]["xs"]["items"].get("required");
+        assert_eq!(verdict.is_err(), typed.is_some());
+    }
+
+    // Undeclared, twice: one slot.
+    let twice = json!({"type": "object", "required": ["x", "x"]});
+    let src = compile(&twice);
+    assert!(accepts(&src, r#"{"x":1}"#));
+    assert!(!accepts(&src, r#"{"x":1,"x":1}"#));
+    // A type, twice: still that type.
+    let src = compile(&json!({"type": ["string", "string", "null"]}));
+    assert!(accepts(&src, r#""s""#));
+    assert!(!accepts(&src, "1"));
+}

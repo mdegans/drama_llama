@@ -224,6 +224,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deep as the model takes it, and a value past 127 levels is refused
   by the parse, as before.
 
+- **`required` and `type` arrays count each name once.** A `required`
+  listing an undeclared name twice was a key the grammar made the
+  model write twice, and a `type` naming one type twice
+  (`["string", "string"]`) compiled to any value, which the schema
+  check then refused. The compilers, the width measure and the check
+  now read each name once; the check gathers a schema's names once per
+  check, where it rebuilt the whole list for every object it judged: a
+  `required` naming one property 100,000 times (inside every limit)
+  took 8.4 s to check over 128 KB of output, past the step budget no
+  request inside the limits may reach.
+
 - **A nullable Qwen XML parameter takes a bare `null`; a non-nullable
   one never comes back `null`.** A JSON-spelled parameter whose type
   is nullable through a `type` array (`["integer", "null"]`, schemars'
@@ -1032,8 +1043,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   value. `SchemaMismatch` / `MismatchKind` are public.
 
   The check's work is bounded: a step per subschema judged and per
-  `enum` member, `required` name or `type` compared, at most 2^20 plus
-  2^14 per JSON value of the output. Inside the schema limits every
+  `enum` member, distinct `required` name or distinct `type` compared,
+  plus a step per entry of a schema's `required` and `type` arrays the
+  once their names are gathered, at most 2^20 plus 2^14 per JSON value
+  of the output. Inside the schema limits every
   way a value can be judged — `anyOf` variants tried in turn and nested
   to multiply, object variants that all declare the property, `enum`
   members, each alternation itself — is counted by the width (at most
