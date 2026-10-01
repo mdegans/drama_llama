@@ -1540,6 +1540,32 @@ fn duplicate_names_cost_once() {
     assert!(!accepts(&src, "1"));
 }
 
+/// A string `enum` as wide as the measure lets one be is spelled raw on
+/// Qwen XML, as the template writes it — not JSON-quoted, as one of
+/// 1025 to 2048 members was while the raw spelling stopped at 1024.
+#[test]
+fn qwen_widest_string_set_is_raw() {
+    let members: Vec<String> =
+        (0..2040).map(|i| format!("Zone_{i:05}")).collect();
+    let schema = json!({
+        "type": "object",
+        "properties": {"tz": {"enum": members}},
+        "required": ["tz"],
+    });
+    let t = tool(schema.clone());
+    check_schemas([&t], None, &SchemaLimits::default()).expect("inside");
+    let syntax = CallSyntax::qwen_xml();
+    assert!(matches!(
+        tagged_values(&syntax, &schema)[0].1,
+        TaggedValue::Choice(_)
+    ));
+    let src = grammar_source(&syntax, &[&t], &lazy()).unwrap();
+    let raw = qwen_call(&[("tz", "Zone_02039")]);
+    assert!(accepts(&src, &raw));
+    assert!(!accepts(&src, &qwen_call(&[("tz", "\"Zone_02039\"")])));
+    assert_eq!(first_input(&syntax, &t, &raw), json!({"tz": "Zone_02039"}));
+}
+
 /// A generation that floods its call trigger — 384 KB of it, ~32k
 /// tokens, alone or inside an unclosed thought — parses in linear time,
 /// in every dialect. Each trigger is a malformed call and a block

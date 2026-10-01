@@ -31,10 +31,24 @@ pub use emit::{
 };
 #[cfg(test)]
 pub(crate) use parse::parse_text_open;
+pub(crate) use parse::OpenCall;
 pub use parse::{parse_text, Leniency, ParseStatus, Parsed, StreamParser};
-pub(crate) use parse::{parse_text_cached, OpenCall, Spellings};
+// What only `Session` reaches for, so only where it is built.
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub(crate) use parse::{parse_text_cached, Spellings};
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
 pub(crate) use partial::cut_value;
 pub use partial::truncate_partial_object;
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
 pub(crate) use provenance::Provenance;
 
 use crate::json_canon::JsonSpacing;

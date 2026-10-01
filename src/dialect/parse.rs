@@ -2737,7 +2737,8 @@ mod tests {
     /// `null` is admitted and reads back as the *string* `"null"`. A
     /// nullable string, a `["integer", "null"]` and an `anyOf` with a
     /// `null` variant (Agora's `Option<DetailLevel>` shape) each take
-    /// a bare `null` as JSON `null`.
+    /// a bare `null` as JSON `null` — and so does a `$ref` to a nullable
+    /// def, as its inline form does.
     #[test]
     fn qwen_xml_null_only_where_the_schema_allows_it() {
         let schema = json!({
@@ -2756,6 +2757,14 @@ mod tests {
                     {"oneOf": [{"const": "summary"}, {"const": "full"}]},
                     {"type": "null"},
                 ]},
+                "rn": {"$ref": "#/$defs/N"},
+                "ra": {"$ref": "#/$defs/Alias"},
+                "ri": {"$ref": "#/$defs/I"},
+            },
+            "$defs": {
+                "N": {"type": ["integer", "null"]},
+                "Alias": {"$ref": "#/$defs/N"},
+                "I": {"type": "integer"},
             },
         });
         let mut tool = Tool::builder("t")
@@ -2791,6 +2800,7 @@ mod tests {
             ("o", r#"{"x":1}"#),
             ("a", "[1,2]"),
             ("e", "fast"),
+            ("ri", "3"),
         ] {
             assert_ne!(read(param, valid), Value::Null, "{param}");
             assert!(!qwen_admits(&tool, &call(param, "null")), "{param}");
@@ -2804,6 +2814,11 @@ mod tests {
         assert_eq!(read("an", "full"), json!("full"));
         assert_eq!(read("ni", "7"), json!(7));
         assert_eq!(read("ni", "null"), Value::Null);
+        // Through a `$ref` (an alias chain too), as inline.
+        for param in ["rn", "ra"] {
+            assert_eq!(read(param, "7"), json!(7), "{param}");
+            assert_eq!(read(param, "null"), Value::Null, "{param}");
+        }
     }
 
     /// A stop cut parses the output prefix after prefix, each a fresh

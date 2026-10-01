@@ -553,8 +553,14 @@ pub(crate) struct Member {
 const TAGGED_BUDGET: usize = 1 << 20;
 
 /// Most distinct members a finite set may have and still be spelled
-/// raw ([`TaggedValue::Choice`]); a larger one is JSON.
-const TAGGED_MAX_MEMBERS: usize = 1024;
+/// raw ([`TaggedValue::Choice`]); a larger one is JSON. The matcher's
+/// cap on stacks alive at once (`MAX_STACKS`), which a set past it
+/// would reach anyway: so every set inside
+/// [`SchemaLimits::max_width`](crate::SchemaLimits::max_width) is raw,
+/// as the template writes it. At 1024 a set of 1025–2048 members passed
+/// the measure and came out JSON — `"Zone_01024"` where the template
+/// writes `Zone_01024` — a spelling the cache could not match.
+const TAGGED_MAX_MEMBERS: usize = crate::sample::grammar::MAX_STACKS;
 
 /// Deepest a classification nests (`$ref` chains, unions in unions)
 /// before it gives up as JSON rather than recurse further.
@@ -931,9 +937,22 @@ impl<'s> Classifier<'s> {
 /// Whether a JSON-spelled tagged parameter's `schema` allows `null`
 /// only through a `type` array the compiler collapses to its one other
 /// type (`effective_type`): no `enum` or `const` (whose members decide,
-/// null among them or not), `$ref` or `anyOf` (compiled whole, a `null`
-/// variant included).
-fn bare_nullable(schema: &Value) -> bool {
+/// null among them or not) or `anyOf` (compiled whole, a `null` variant
+/// included). A `$ref` is read as the def it names in `defs`, as the
+/// compiler reads it — through an alias chain, a cycle reading as no.
+fn bare_nullable(
+    defs: Option<&serde_json::Map<String, Value>>,
+    schema: &Value,
+) -> bool {
+    let mut schema = schema;
+    let mut hops = 0;
+    while let Some((_, def)) = def_target(defs, schema) {
+        hops += 1;
+        if hops > defs.map_or(0, |d| d.len()) {
+            return false;
+        }
+        schema = def;
+    }
     let decided_elsewhere = ["enum", "const", "$ref", "anyOf"]
         .iter()
         .any(|k| schema.get(k).is_some());
@@ -1032,7 +1051,7 @@ fn emit_tagged_call(
                     });
                 format!(r#"{rule} "{val_suf_lit}""#)
             }
-            TaggedValue::Json if bare_nullable(schema) => {
+            TaggedValue::Json if bare_nullable(defs, schema) => {
                 // A nullable type (`["integer", "null"]`, schemars'
                 // `Option<T>`) compiles to its base type
                 // (`effective_type`); as a parameter it takes the bare

@@ -256,8 +256,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `null` in its grammar; a plain string parameter is raw, so the text
   `null` is admitted and reads back as the *string* `"null"`; a
   nullable string and an `anyOf` with a `null` variant (Agora's
-  `Option<DetailLevel>`) take a bare `null` as `null`. Nested fields
-  and the JSON dialects keep collapsing a nullable type to its base.
+  `Option<DetailLevel>`) take a bare `null` as `null`, and so does a
+  parameter that `$ref`s a nullable def (through an alias chain too),
+  as its inline form does. Nested fields and the JSON dialects keep
+  collapsing a nullable type to its base.
 
 - **A matcher state over its caps refuses alternatives, not the
   close.** Past `MAX_STACKS` (4096) stacks a state kept a prefix of its
@@ -355,7 +357,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     that makes every parameter walk a thousand-member union costs at
     most that: a parameter past it is spelled as JSON (always correct,
     merely not the raw spelling) by both sides. A finite set of more
-    than 1024 members is JSON too.
+    than 4096 members (the matcher's stack cap) is JSON too, so every
+    set inside the schema width limit is written raw, as the template
+    writes it; at the first cap, 1024, a string `enum` of 1025–2048
+    members passed the measure and was quoted where the template writes
+    it bare.
 
 - **An all-optional object compiles to a linear grammar.** Both the
   JSON and the dict (Gemma 4) encodings wrote, for each property, the
