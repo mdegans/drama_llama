@@ -205,6 +205,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A matcher state over its caps refuses alternatives, not the
+  close.** Past `MAX_STACKS` (4096) stacks a state kept a prefix of its
+  sorted stacks, and the stack that closes a structure sorts after its
+  alternatives: after the `{` of an object of more than 4096 optional
+  members, the `}` was cut, so the object could not be empty, and a
+  required member after them could not follow `{` alone. A capped state
+  now keeps one stack per distinct grammar position first (the
+  shallowest, shallowest first), then the rest in sorted order, so
+  every way to go on survives the cut and what is dropped is extra
+  derivations of a kept position or, past 4096 positions, the deepest
+  ones: members, not the close. Below the caps nothing changes.
+  (Keeping the shallowest stacks outright would not do: an ambiguous
+  recursive schema doubles its stacks at every level, and keeping each
+  level's closes first leaves no room to go deeper.)
+
 - **Qwen's tagged-value classifier reads each `$def` once per tool,
   and the streaming parser classifies each tool once per
   generation.** Two thousand parameters naming one def whose `enum`

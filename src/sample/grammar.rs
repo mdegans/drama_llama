@@ -1333,23 +1333,70 @@ impl StackState {
         // sort short-circuits on len < 2.
         result.sort();
         result.dedup();
-        // Over a cap: keep a deterministic subset (the sort's prefix),
-        // so the DFA cache's interned states stay canonical. A stack
-        // deeper than the frame cap on its own is dropped too, so a
-        // state's size has a bound however deep the output nests (see
-        // `MAX_STATE_FRAMES`); with nothing left, the byte is refused.
-        let mut frames = 0usize;
-        let keep = result
-            .iter()
-            .take_while(|stack| {
-                frames += stack.len();
-                frames <= MAX_STATE_FRAMES
-            })
-            .count()
-            .min(MAX_STACKS);
-        result.truncate(keep);
-        self.stacks = result;
+        self.stacks = keep_within_caps(result);
     }
+}
+
+/// `stacks` (sorted, deduped) cut to [`MAX_STACKS`] and
+/// [`MAX_STATE_FRAMES`]: unchanged within both, else a deterministic
+/// subset, still in sorted order, so the DFA cache's interned states
+/// stay canonical.
+///
+/// The subset keeps, first, one stack per distinct grammar position on
+/// top — the shallowest, shallowest first — and then the rest in sorted
+/// order. Every way to go on survives the cut, if not every way of
+/// having got here: the stacks it drops are extra derivations of a
+/// position it keeps, or, past [`MAX_STACKS`] positions, the deepest.
+/// That protects the continuation that *closes* a structure, which is
+/// one position under thousands of alternatives and a frame or more
+/// above them: after the `{` of an object of more optional members than
+/// the cap, sorted order put the `}` stack after every member's and cut
+/// it, so the object could not be empty. Alternatives are refused, not
+/// the close. (Shallowest-first alone is no better: two interchangeable
+/// recursive rules double their stacks at every level, and keeping
+/// every level's closes first leaves no room to go deeper.)
+///
+/// A stack deeper than the frame cap on its own is dropped too, so a
+/// state's size has a bound however deep the output nests (see
+/// [`MAX_STATE_FRAMES`]); with nothing left, the byte is refused.
+fn keep_within_caps(mut stacks: Vec<Stack>) -> Vec<Stack> {
+    let frames: usize = stacks.iter().map(|s| s.len()).sum();
+    if stacks.len() <= MAX_STACKS && frames <= MAX_STATE_FRAMES {
+        return stacks;
+    }
+    // The shallowest stack at each top, the first in sorted order on a
+    // tie; then those, shallowest first.
+    let mut shallowest: FxHashMap<Option<Position>, usize> =
+        FxHashMap::default();
+    for (i, stack) in stacks.iter().enumerate() {
+        shallowest
+            .entry(stack.last().copied())
+            .and_modify(|best| {
+                if stack.len() < stacks[*best].len() {
+                    *best = i;
+                }
+            })
+            .or_insert(i);
+    }
+    let mut firsts: Vec<usize> = shallowest.into_values().collect();
+    firsts.sort_by_key(|&i| (stacks[i].len(), i));
+
+    let mut kept = vec![false; stacks.len()];
+    let (mut count, mut frames) = (0usize, 0usize);
+    for i in firsts.into_iter().chain(0..stacks.len()) {
+        if count == MAX_STACKS {
+            break;
+        }
+        if kept[i] || frames + stacks[i].len() > MAX_STATE_FRAMES {
+            continue;
+        }
+        kept[i] = true;
+        count += 1;
+        frames += stacks[i].len();
+    }
+    let mut kept = kept.into_iter();
+    stacks.retain(|_| kept.next() == Some(true));
+    stacks
 }
 
 /// Most stacks a matcher state keeps. Ambiguity multiplies stacks:
@@ -1358,7 +1405,8 @@ impl StackState {
 /// stacks differ in which rule each frame is in — so 18 levels of a
 /// client's schema held 393,216 stacks and took over a second a
 /// byte (the hostile-schema recheck). Past the cap the extra stacks are
-/// dropped: each stack is one way the input so far can continue, so a
+/// dropped (`keep_within_caps` picks which, keeping every position on
+/// top): each stack is one way the input so far can continue, so a
 /// subset only ever admits *fewer* continuations — never a byte the
 /// full set would reject. At worst it over-restricts, which surfaces
 /// as the existing grammar-violation path.
@@ -2615,6 +2663,49 @@ mod tests {
         for outsider in outsiders.chain([r#""m""#.into(), r#""m99999""#.into()])
         {
             assert!(!accepted(&outsider), "{outsider}");
+        }
+    }
+
+    /// Truncation refuses alternatives before it refuses a close: an
+    /// object of more optional members than [`MAX_STACKS`] can still be
+    /// empty (its `}` sorted after every member and was cut), and one
+    /// whose required member follows them can still be just that
+    /// member. Members past the cap are what is refused.
+    #[test]
+    fn capped_state_keeps_the_close() {
+        let n = MAX_STACKS + 1000;
+        let optional: serde_json::Map<String, serde_json::Value> = (0..n)
+            .map(|i| (format!("k{i:05}"), serde_json::json!({})))
+            .collect();
+        let mut with_required = optional.clone();
+        with_required.insert("zz".into(), serde_json::json!({}));
+        let schemas = [
+            serde_json::json!({"type": "object", "properties": optional}),
+            serde_json::json!({
+                "type": "object",
+                "properties": with_required,
+                "required": ["zz"],
+            }),
+        ];
+        for (schema, tail) in schemas.iter().zip(["", r#","zz":1"#]) {
+            let mut src = String::from("root ::= s\n");
+            crate::schema_to_gbnf(schema, "s", &mut src).unwrap();
+            src.push_str(crate::JSON_GRAMMAR);
+            let root = GrammarState::new(Arc::new(parse_ok(&src)));
+            let accepted = |text: &str| {
+                let mut state = root.clone();
+                state.advance_bytes(text.as_bytes()).is_ok()
+                    && state.is_complete()
+            };
+            let mut opened = root.clone();
+            opened.advance_bytes(b"{").unwrap();
+            assert!(opened.stack_depth() <= MAX_STACKS);
+            let close = format!("{{{}}}", tail.trim_start_matches(','));
+            assert!(accepted(&close), "{close}");
+            let members = (0..n)
+                .filter(|i| accepted(&format!(r#"{{"k{i:05}":1{tail}}}"#)))
+                .count();
+            assert!(members > 0 && members < n, "{members} of {n}");
         }
     }
 
