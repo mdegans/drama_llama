@@ -216,22 +216,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `reasoning_content` and was never affected. Pinned in
   `qwen_cache_stable_round_trips` and
   `qwen_cache_stable_aged_turn_renders_as_stock`.
-- **A gpt-oss JSON answer re-renders with its `<|constrain|>json`.**
+- **A gpt-oss final re-renders under the header the model wrote.**
   gpt-oss writes a structured answer under
   `<|channel|>final <|constrain|>json<|message|>`, unforced, but the
   baked template rendered every final channel plain, so each JSON final
   parted from the KV at the constraint and the next request
   re-prefilled the turn (470..1111 tokens, four times live on Agora
-  2026-10-01). The baked template now renders the constraint on a final
-  whose content is a JSON object or array, and **the `output_config`
-  grammar requires it** (it was optional), so a constrained answer and
-  its re-render cannot part. A JSON final written without it (free
-  generation) and prose that merely starts and ends with braces are
-  pinned as irreducible. **Deployments that copied the baked template
-  to a `<model>.template.jinja` sidecar must refresh or delete the
-  sidecar** — it wins over the bake. Pinned in
-  `gptoss_cache_stable_round_trips_json_final` and the Harmony
-  `output_config` tests.
+  2026-10-01). The header is framing, so the final's `Text` cannot say
+  which spelling it had, and its content does not either (`[1, 2, 3]`
+  may be prose; a structured answer whose schema root is a string is
+  not `{…}`). The parser now records the content type the header
+  declared in the signature of the analysis block before the final
+  (`drama_llama:tail;constrain=json`, see the whitespace entry below),
+  and the baked template renders exactly that. The `output_config`
+  grammar keeps the constraint optional — both spellings are the
+  model's, and both now round-trip. Pinned as irreducible: a final
+  that declares a content type with no analysis block before it has
+  nowhere to record it and re-renders plain (Harmony finals all but
+  always follow an analysis block). Pinned in
+  `gptoss_cache_stable_round_trips_json_final`. **Deployments that
+  copied the baked template to a `<model>.template.jinja` sidecar must
+  delete it** — it wins over the bake.
 - **Back-to-back thoughts stay two thoughts.** A model that closes a
   thought and opens another (`…[/THINK][THINK]…`, live on Mistral Small
   4, 2026-10-01, ~1.6k tokens lost) was parsed into two
@@ -243,12 +248,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reaches the template with **`chunks`**, its blocks in emission order
   (`{type: "text", text}`, `{type: "thinking", thinking}`, one
   `{type: "tool_calls"}` where the first call sat) — stock Mistral's
-  own content-chunk shape. The baked Mistral 4 and gpt-oss templates
-  render from it, so each `[THINK]` block and each analysis block
-  renders as its own, with prose where the model wrote it; without
-  `chunks` they render from the merged fields as before. Pinned in
-  `mistral4_cache_stable_round_trips_back_to_back_thoughts` and
-  `gptoss_cache_stable_round_trips_each_analysis_block`.
+  own content-chunk shape. The baked Mistral 4, gpt-oss and Gemma 4
+  templates render from it, so each `[THINK]` block, each analysis
+  block and each Gemma thought channel renders as its own, with prose
+  where the model wrote it; without `chunks` they render from the
+  merged fields as before. Pinned in
+  `mistral4_cache_stable_round_trips_back_to_back_thoughts`,
+  `gptoss_cache_stable_round_trips_each_analysis_block` and the fleet
+  sweep.
+- **An empty thought re-renders.** Mistral 4's `[THINK][/THINK]` and
+  an empty gpt-oss analysis block were dropped by the parser, so the
+  re-render lacked their markers and the turn lost its tip. A closed
+  thought is now kept even when empty (Anthropic returns empty thinking
+  blocks too), except on Gemma 4, whose empty channel is its own
+  thinking-off scaffold, and on dialects that re-ingest thoughts
+  inline, where it would put a bare `<think></think>` into content.
 - **Whitespace around a Mistral 4 or Gemma 4 thought re-renders as
   written.** A fleet-wide sweep (`fleet_bakes_round_trip_every_admitted_shape`:
   every baked template through the session's parse and re-render, over
@@ -267,6 +281,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   verbatim. `CallSyntax::qwen_xml()`'s reasoning start is now
   `"<think>\n"`, as the analyzer measures it. Neither shape has been
   seen live; Gemma 4 served no turns in the 2026-10-01 run.
+- **No response carries a whitespace-only text block.** Anthropic
+  never returns one and rejects one on ingest ("text content blocks
+  must contain non-whitespace text"), so a transcript replayed from
+  blallama to Anthropic failed on it — and the parser produced one for
+  the whitespace between a thought and a call (`[/THINK]\n[TOOL_CALLS]`
+  on Mistral 4, `<channel|>\n<|tool_call>` on Gemma 4,
+  `</think>\n\n<tool_call>` on Qwen). That whitespace is in the KV and
+  the next render needs it, so it now rides in the thought's
+  `signature` (`drama_llama:tail;gap=%0A`, alongside the
+  `OPEN_THOUGHT_SIGNATURE` overload) and the renderer puts it back where
+  it sat: every template sees the turn exactly as before. A closed
+  thought with nothing to record keeps the empty signature. Whitespace
+  with no thought before it (the turn's first bytes before a call,
+  after the last call) has nothing to ride and is dropped — the turn
+  re-renders without it, losing its tip rather than the client's
+  ingest; pinned in `blank_text_is_never_returned`. A stream withholds
+  a thought until what follows it starts, and never yields a run of
+  text that is only whitespace (the batch path drops what a stop
+  sequence cut leaves the same way). The fleet sweep now also renders
+  every shape followed by the next request (its tool results, or a
+  user turn), aged with `preserve_thinking` off (only a thought — or
+  Qwen's thinking-off scaffold, as stock — may be lost), streamed a
+  char at a time against the batch parse, and every thought the budget
+  can cut continued as an open thought.
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like

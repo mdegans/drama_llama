@@ -1395,6 +1395,10 @@ fn append_message(
     // `reasoning`/`reasoning_content` fields (Gemma 4/DeepSeek-style
     // templates own the markers; inlining would pollute content).
     use crate::dialect::ReasoningReingest;
+    // The whitespace a closed thought's signature carries
+    // (`ThoughtTail::gap`) is prose the model wrote after it. Put back
+    // as text, every template sees the turn as the parse first read it.
+    let unfolded = unfold_thought_gaps(&content.0);
     let calls: Vec<(usize, &crate::prompt::ToolUse)> = blocks
         .iter()
         .enumerate()
@@ -1412,6 +1416,7 @@ fn append_message(
     let mut content_pre = Flat::default();
     let mut content_post = Flat::default();
     let mut seen_call = false;
+    let blocks: Vec<&Block> = unfolded.iter().map(AsRef::as_ref).collect();
     for b in &blocks {
         match b {
             Block::ToolUse { .. } => seen_call = true,
@@ -1488,11 +1493,35 @@ fn append_message(
     Ok(())
 }
 
+/// An assistant turn's blocks with the whitespace each closed thought
+/// carries in its signature (`ThoughtTail::gap`, which the parse folds
+/// there because Anthropic rejects a whitespace-only text block) put
+/// back after the thought as the `Text` it was. Borrowed but for those.
+fn unfold_thought_gaps(blocks: &[Block]) -> Vec<Cow<'_, Block>> {
+    blocks
+        .iter()
+        .flat_map(|block| {
+            let gap = match block {
+                Block::Thought { signature, .. } => {
+                    crate::prompt::ThoughtTail::of(signature).gap
+                }
+                _ => String::new(),
+            };
+            let gap = (!gap.is_empty()).then(|| Cow::Owned(gap.into()));
+            std::iter::once(Cow::Borrowed(block)).chain(gap)
+        })
+        .collect()
+}
+
 /// An assistant message's blocks in emission order, as the `chunks`
 /// list templates may read in place of the merged fields: `{type:
 /// "text", text}` for a run of prose, `{type: "thinking", thinking}`
 /// for each thought, and one `{type: "tool_calls"}` where the first
 /// call sits (the calls themselves are the message's `tool_calls`).
+/// A text chunk right after a thought whose signature records the
+/// Harmony final's content type (`ThoughtTail::constrain`) carries it
+/// as `constrain`, for the template to spell the header the model
+/// wrote.
 ///
 /// The merged `content` and `reasoning` fields lose two things the
 /// model wrote, and a template that renders the turn from them cannot
@@ -1507,23 +1536,36 @@ fn assistant_chunks(blocks: &[&Block], surfaces: &Surfaces<'_>) -> JinjaValue {
     let mut chunks: Vec<JinjaValue> = Vec::new();
     let mut prose = Flat::default();
     let mut seen_call = false;
-    let flush = |prose: &mut Flat, chunks: &mut Vec<JinjaValue>| {
-        if !prose.is_empty() {
-            let text = std::mem::take(prose).render(surfaces, false);
-            chunks.push(minijinja::context! { type => "text", text => text });
+    // The content type the next text chunk's header declared, recorded
+    // on the thought before it.
+    let mut constrain: Option<String> = None;
+    let flush = |prose: &mut Flat,
+                 chunks: &mut Vec<JinjaValue>,
+                 constrain: &mut Option<String>| {
+        let constrain = constrain.take();
+        if prose.is_empty() {
+            return;
         }
+        let text = std::mem::take(prose).render(surfaces, false);
+        chunks.push(match constrain {
+            Some(c) => minijinja::context! {
+                type => "text", text => text, constrain => c,
+            },
+            None => minijinja::context! { type => "text", text => text },
+        });
     };
     for block in blocks {
         match block {
-            Block::Thought { thought, .. } => {
-                flush(&mut prose, &mut chunks);
+            Block::Thought { thought, signature } => {
+                flush(&mut prose, &mut chunks, &mut constrain);
                 chunks.push(minijinja::context! {
                     type => "thinking",
                     thinking => surfaces.text(thought, false),
                 });
+                constrain = crate::prompt::ThoughtTail::of(signature).constrain;
             }
             Block::ToolUse { .. } => {
-                flush(&mut prose, &mut chunks);
+                flush(&mut prose, &mut chunks, &mut constrain);
                 if !std::mem::replace(&mut seen_call, true) {
                     chunks.push(minijinja::context! { type => "tool_calls" });
                 }
@@ -1531,7 +1573,7 @@ fn assistant_chunks(blocks: &[&Block], surfaces: &Surfaces<'_>) -> JinjaValue {
             other => append_block_text(&mut prose, other, media_sentinel),
         }
     }
-    flush(&mut prose, &mut chunks);
+    flush(&mut prose, &mut chunks, &mut constrain);
     JinjaValue::from(chunks)
 }
 

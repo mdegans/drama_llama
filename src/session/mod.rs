@@ -7017,6 +7017,7 @@ impl<B: Backend> Session<B> {
                 stop::request_stops(prompt),
             ),
             pending: std::collections::VecDeque::new(),
+            prose_run: ProseRun::default(),
             eos_pieces,
             drained: false,
             generated: 0,
@@ -7354,8 +7355,19 @@ impl<B: Backend> Session<B> {
         // members, so it may match a call it would not have, and it
         // comes back cut, as on Anthropic. Streaming drops the same
         // calls (`BlockStream`).
-        let (blocks, dropped_repeat) =
+        let (mut blocks, dropped_repeat) =
             drop_repeated_calls(blocks, cut.is_some() || in_flight);
+        // No whitespace-only text block reaches a client: Anthropic never
+        // returns one, and rejects one on ingest. The parse folds such a
+        // run into the thought before it, or drops it
+        // (`fold_blank_text`); what a stop sequence cuts can still leave
+        // one, and goes here, as the stream drops it (`BlockStream`).
+        blocks.retain(|block| {
+            !matches!(
+                block,
+                crate::Block::Text { text, .. } if text.trim().is_empty()
+            )
+        });
 
         // Whether this turn may leave an auto-tip. A turn whose KV no
         // longer matches its own output must not: a stop sequence was
@@ -8891,9 +8903,11 @@ fn infer_stop_reason(
 /// if you need the whole body as one string (the batch `complete_*`
 /// methods do this for you via `merge_adjacent_prose`).
 ///
-/// Reasoning streams as one [`Block::Thought`] when its close marker
-/// arrives — including Qwen-style pre-opened reasoning, which the old
-/// parser mislabeled as streaming `Text` (issue #27).
+/// Reasoning streams as one [`Block::Thought`] once its close marker
+/// and the start of what follows have arrived (its signature records
+/// the framing between them) — including Qwen-style pre-opened
+/// reasoning, which the old parser mislabeled as streaming `Text`
+/// (issue #27). No run of text yields is only whitespace.
 ///
 /// [`Block::Text`]: crate::Block::Text
 /// [`Block::Thought`]: crate::Block::Thought
@@ -8934,6 +8948,8 @@ pub struct BlockStream<'engine, B: Backend> {
     /// against the text it releases (#122).
     filter: stop::StopFilter,
     pending: std::collections::VecDeque<crate::Block>,
+    /// Keeps a whitespace-only run of text yields from the client.
+    prose_run: ProseRun,
     /// Piece texts of the model's end-of-generation tokens
     /// (`Model::eog_tokens`) — filtered out of the stream since they
     /// are sentinels, not content the caller wants to see. Framing
@@ -9019,7 +9035,8 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
             })
             .map(|(_, b)| b)
             .collect();
-        self.pending.extend(kept);
+        let admitted = kept.into_iter().filter_map(|b| self.prose_run.admit(b));
+        self.pending.extend(admitted);
     }
 
     /// End of generation: flush, pick the leniency, settle the ending.
@@ -9111,6 +9128,42 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                     }
                 }
                 None => self.drain(),
+            }
+        }
+    }
+}
+
+/// A stream's runs of text yields — each one text block to a client —
+/// kept from being whitespace only: Anthropic never returns such a
+/// block, and rejects one on ingest. Whitespace that would open a run
+/// is held until prose follows it (then it leads that prose) or a
+/// structure or the end of the turn does (then it was framing, and
+/// goes). The parse already keeps such runs out
+/// ([`crate::dialect::parse_text`] folds one after a thought into the
+/// thought, and drops the rest); what a stop sequence cuts can still
+/// leave one, which the batch path drops too.
+#[derive(Debug, Default)]
+struct ProseRun {
+    /// Whitespace held at the start of the current run.
+    lead: String,
+    /// The run has yielded prose that was not only whitespace.
+    open: bool,
+}
+
+impl ProseRun {
+    /// `block` as the stream may yield it, or nothing yet.
+    fn admit(&mut self, block: crate::Block) -> Option<crate::Block> {
+        match block {
+            crate::Block::Text { text, .. } if !self.open => {
+                self.lead.push_str(&text);
+                self.open = !self.lead.trim().is_empty();
+                self.open.then(|| std::mem::take(&mut self.lead).into())
+            }
+            block @ crate::Block::Text { .. } => Some(block),
+            block => {
+                self.lead.clear();
+                self.open = false;
+                Some(block)
             }
         }
     }
@@ -10979,13 +11032,13 @@ mod tests {
                         constrain,
                         ROLE_CONSENT_VALID,
                     );
-                    // The plain header is refused: the template
-                    // re-renders a JSON final with its constraint.
+                    // Both headers: the parse records which the model
+                    // wrote, and the re-render spells that one.
                     assert_eq!(
                         constraint_admits(&compiled, &good),
-                        constrain.then_some(true),
-                        "{at}: valid body must be admitted and complete \
-                         under the constrained header only: {good}"
+                        Some(true),
+                        "{at}: valid body must be admitted and complete: \
+                         {good}"
                     );
                 }
             }
@@ -14486,6 +14539,38 @@ mod tests {
         );
     }
 
+    /// A stream never yields a run of text that is only whitespace:
+    /// one opening a run is held until prose follows it, and dropped
+    /// when a structure or the end does (a stop sequence cut right
+    /// after a thought, `[/THINK]\nSTOP…`).
+    #[test]
+    fn prose_run_never_yields_a_blank_run() {
+        let thought = || crate::Block::Thought {
+            thought: "Plan.".into(),
+            signature: "".into(),
+        };
+        let run = |blocks: Vec<crate::Block>| {
+            let mut guard = ProseRun::default();
+            merge_adjacent_prose(
+                blocks.into_iter().filter_map(|b| guard.admit(b)).collect(),
+            )
+        };
+        let text = |t: &'static str| crate::Block::from(t);
+        assert_eq!(run(vec![thought(), text("\n")]), vec![thought()]);
+        assert_eq!(
+            run(vec![text(" "), text("\n"), thought(), text("\n")]),
+            vec![thought()]
+        );
+        assert_eq!(
+            run(vec![thought(), text("\n"), text("Ada."), text("\n")]),
+            vec![thought(), text("\nAda.\n")]
+        );
+        assert_eq!(
+            run(vec![text("Ada."), thought(), text(" "), thought()]),
+            vec![text("Ada."), thought(), thought()]
+        );
+    }
+
     /// [`emission_divergence`]: where a re-render parts from the
     /// generated bytes.
     #[test]
@@ -14498,6 +14583,22 @@ mod tests {
         assert_eq!((before, after), ("h", "é"));
     }
 
+    /// What follows a swept turn in the render that measures it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Next {
+        /// Nothing: the turn closes the render, as in the session's own
+        /// canonicalization gate.
+        Nothing,
+        /// The next request: the turn's tool results when it called
+        /// (one per call, by id), else a user turn; the generation
+        /// prompt after.
+        Reply,
+        /// A later request, rendered with `preserve_thinking` off: the
+        /// turn's reply, then (after a call turn) an answer to the
+        /// results, then a user turn, so the swept turn has aged.
+        AgedUnpreserved,
+    }
+
     /// Where a round trip through `source` parts, for one emission, as
     /// the session measures it: the generation prompt (one user turn,
     /// `tools` declared), the emission parsed to blocks the way the
@@ -14506,10 +14607,30 @@ mod tests {
     /// re-rendered. `(bos, eos)` are the model's, for the analyzer.
     fn fleet_divergence(
         source: &str,
+        tokens: (&str, &str),
+        tools: &[&crate::Tool],
+        thinking: bool,
+        emission: &str,
+    ) -> Option<usize> {
+        fleet_divergence_then(
+            source,
+            tokens,
+            tools,
+            thinking,
+            emission,
+            Next::Nothing,
+        )
+    }
+
+    /// [`fleet_divergence`], with `next` after the turn: where the
+    /// emission parts from the render of a later request.
+    fn fleet_divergence_then(
+        source: &str,
         (bos, eos): (&str, &str),
         tools: &[&crate::Tool],
         thinking: bool,
         emission: &str,
+        next: Next,
     ) -> Option<usize> {
         use crate::{
             prompt::{Message, Role},
@@ -14532,13 +14653,15 @@ mod tests {
                 .then(|| tools.iter().map(|&t| t.clone().into()).collect()),
             ..Prompt::default()
         };
-        let opts = RenderOptions::default()
-            .with_extra("preserve_thinking", true)
-            .with_extra("enable_thinking", thinking)
-            .with_thought_reingest(syntax.reasoning.reingest)
-            .with_reasoning_start(syntax.reasoning.start.clone());
+        let opts = |preserve: bool| {
+            RenderOptions::default()
+                .with_extra("preserve_thinking", preserve)
+                .with_extra("enable_thinking", thinking)
+                .with_thought_reingest(syntax.reasoning.reingest)
+                .with_reasoning_start(syntax.reasoning.start.clone())
+        };
         let prompt = template
-            .render_with(&base, &opts.clone().with_generation_prompt(true))
+            .render_with(&base, &opts(true).with_generation_prompt(true))
             .expect("render");
         let blocks = crate::dialect::parse_text(
             &syntax,
@@ -14548,15 +14671,143 @@ mod tests {
             crate::dialect::Leniency::Final,
         )
         .blocks;
+        let results: Vec<crate::Block> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                crate::Block::ToolUse { call } => {
+                    Some(crate::Block::ToolResult {
+                        result: misanthropic::tool::Result {
+                            tool_use_id: call.id.clone(),
+                            content: "Fog, 4°C.".into(),
+                            is_error: false,
+                            cache_control: None,
+                        },
+                    })
+                }
+                _ => None,
+            })
+            .collect();
         let mut turn = base.clone();
         turn.messages.push(Message {
             role: Role::Assistant,
             content: Content(merge_adjacent_prose(blocks)),
         });
+        let user = |text: &'static str| Message {
+            role: Role::User,
+            content: Content::text(text),
+        };
+        let called = !results.is_empty();
+        let reply = match called {
+            true => Message {
+                role: Role::User,
+                content: Content(results),
+            },
+            false => user("And the lamp?"),
+        };
+        let (preserve, generation_prompt) = match next {
+            Next::Nothing => (true, false),
+            Next::Reply => {
+                turn.messages.push(reply);
+                (true, true)
+            }
+            Next::AgedUnpreserved => {
+                turn.messages.push(reply);
+                if called {
+                    turn.messages.push(Message {
+                        role: Role::Assistant,
+                        content: Content::text("Foggy."),
+                    });
+                    turn.messages.push(user("And the lamp?"));
+                }
+                (false, true)
+            }
+        };
         let extended = template
-            .render_with(&turn, &opts.with_generation_prompt(false))
+            .render_with(
+                &turn,
+                &opts(preserve).with_generation_prompt(generation_prompt),
+            )
             .expect("render");
         emission_divergence(&extended, &prompt, emission)
+    }
+
+    /// Where a turn the budget cut inside its thought parts from the
+    /// request that continues it: the clipped parse's open thought sent
+    /// back as the trailing assistant message, which the renderer
+    /// appends raw after the generation prompt (`open_thought_tail`).
+    fn fleet_clipped_divergence(
+        source: &str,
+        (bos, eos): (&str, &str),
+        thinking: bool,
+        emission: &str,
+    ) -> Option<usize> {
+        use crate::{
+            prompt::{Message, Role},
+            ChatTemplate, Content, RenderOptions,
+        };
+        let template = ChatTemplate::from_source(
+            source.to_owned(),
+            bos.to_owned(),
+            eos.to_owned(),
+        )
+        .expect("template compiles");
+        let syntax = crate::dialect::analyze_template(source, bos, eos)
+            .expect("analyze");
+        let base = Prompt {
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::text("Who checks the fog signal?"),
+            }],
+            ..Prompt::default()
+        };
+        let opts = RenderOptions::default()
+            .with_extra("preserve_thinking", true)
+            .with_extra("enable_thinking", thinking)
+            .with_thought_reingest(syntax.reasoning.reingest)
+            .with_reasoning_start(syntax.reasoning.start.clone())
+            .with_generation_prompt(true);
+        let prompt = template.render_with(&base, &opts).expect("render");
+        let blocks = crate::dialect::parse_text(
+            &syntax,
+            &[],
+            emission,
+            render_ends_with_open_reasoning(&prompt, &syntax),
+            crate::dialect::Leniency::Clipped,
+        )
+        .blocks;
+        assert!(
+            matches!(blocks.as_slice(), [b] if crate::prompt::is_open_thought(b)),
+            "{emission:?} -> {blocks:?}"
+        );
+        let mut turn = base;
+        turn.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(blocks),
+        });
+        let extended = template.render_with(&turn, &opts).expect("render");
+        emission_divergence(&extended, &prompt, emission)
+    }
+
+    /// `emission` through the streaming parser a piece at a time (one
+    /// char), flushed, adjacent prose merged: what a stream's client
+    /// assembles, to hold against the batch parse.
+    fn stream_parse(
+        syntax: &crate::CallSyntax,
+        tools: &[&crate::Tool],
+        emission: &str,
+        pre_opened: bool,
+    ) -> Vec<crate::Block> {
+        let mut parser = crate::dialect::StreamParser::new(
+            syntax.clone(),
+            tools.iter().map(|&t| t.clone()).collect(),
+            pre_opened,
+        );
+        let mut out: Vec<crate::Block> = emission
+            .chars()
+            .flat_map(|c| parser.push(c.encode_utf8(&mut [0; 4])))
+            .collect();
+        out.extend(parser.finish());
+        merge_adjacent_prose(out)
     }
 
     /// The one-argument tool the round-trip tests call.
@@ -14895,70 +15146,63 @@ mod tests {
     /// answer under `<|channel|>final <|constrain|>json<|message|>`, its
     /// content type, unforced; the template re-rendered every final
     /// channel plain, so each JSON final parted from the KV at the
-    /// constraint. The bake renders the constraint on a JSON final (and
-    /// the output_config grammar requires it, so the two cannot part);
-    /// a prose final stays plain.
+    /// constraint. The parse records the header the model wrote in the
+    /// analysis block before the final (`ThoughtTail::constrain`), and
+    /// the bake spells exactly that — never a guess from the content's
+    /// shape, which cannot tell `[1, 2, 3]` the prose from `[1, 2, 3]`
+    /// the answer, nor see a structured answer whose schema root is a
+    /// string or a number.
     #[test]
     fn gptoss_cache_stable_round_trips_json_final() {
         let tokens = ("<|startoftext|>", "<|return|>");
         let analysis = "<|channel|>analysis<|message|>Plan.<|end|>\
                         <|start|>assistant";
-        let json_final = r#"<|channel|>final <|constrain|>json<|message|>{"content":"Memory: A\nB","n":[1,2]}"#;
-        let array_final =
-            r#"<|channel|>final <|constrain|>json<|message|>[{"a":1}]"#;
-        let prose_final = "<|channel|>final<|message|>It is {not} JSON.";
-        let short_final = "<|channel|>final<|message|>Ada.";
+        let plain = "<|channel|>final<|message|>";
+        let constrained = "<|channel|>final <|constrain|>json<|message|>";
+        let bodies = [
+            r#"{"content":"Memory: A\nB","n":[1,2]}"#,
+            r#"[{"a":1}]"#,
+            // Scalar roots an output_config schema may have.
+            r#""Ada""#,
+            "42",
+            "true",
+            // Prose that merely looks like JSON at its ends.
+            "[1, 2, 3]",
+            r#"{"a": 1}"#,
+            "[citation needed]",
+            "{x} or {y}",
+            "It is {not} JSON.",
+            "Ada.",
+        ];
         for baked in [&crate::baked::GPTOSS, &crate::baked::GPTOSS_UPSTREAM] {
             let served = crate::baked::detect(baked.stock)
                 .expect("stock dump detects")
                 .replacement;
-            for body in [json_final, array_final, prose_final, short_final] {
-                for thinking in [false, true] {
-                    let emission = match thinking {
-                        true => format!("{analysis}{body}"),
-                        false => body.to_owned(),
-                    };
+            let diverge = |emission: &str| {
+                fleet_divergence(served, tokens, &[], true, emission)
+            };
+            for body in bodies {
+                for header in [plain, constrained] {
+                    let emission = format!("{analysis}{header}{body}");
                     assert_eq!(
-                        fleet_divergence(
-                            served,
-                            tokens,
-                            &[],
-                            thinking,
-                            &emission
-                        ),
+                        diverge(&emission),
                         None,
                         "{}: {emission:?}",
                         baked.name
                     );
                 }
+                // With no analysis before it a final has nowhere to
+                // record its header: plain round-trips, and a constrained
+                // one re-renders plain (pinned, irreducible — Harmony
+                // finals almost always follow an analysis block).
+                assert_eq!(diverge(&format!("{plain}{body}")), None, "{body}");
+                assert_eq!(
+                    diverge(&format!("{constrained}{body}")),
+                    Some("<|channel|>final".len()),
+                    "{body}"
+                );
             }
         }
-        // Irreducible, and pinned: a final the model wrote as JSON
-        // without the constraint (only free generation can — the
-        // grammar requires it) re-renders with it.
-        let plain_json = r#"<|channel|>final<|message|>{"a":1}"#;
-        assert_eq!(
-            fleet_divergence(
-                crate::baked::GPTOSS.replacement,
-                tokens,
-                &[],
-                false,
-                plain_json
-            ),
-            Some("<|channel|>final".len())
-        );
-        // So does prose that merely starts and ends like JSON.
-        let braced = "<|channel|>final<|message|>{x} or {y}";
-        assert_eq!(
-            fleet_divergence(
-                crate::baked::GPTOSS.replacement,
-                tokens,
-                &[],
-                false,
-                braced
-            ),
-            Some("<|channel|>final".len())
-        );
     }
 
     /// Regression for the 2026-10-01 live tip drop (Mistral Small 4 on
@@ -15037,15 +15281,29 @@ mod tests {
 
     /// The fleet sweep: every baked template, through the session's own
     /// parse and re-render, over the emission shapes its grammars admit
-    /// — with and without a thought (two back to back where the format
-    /// has a closer), prose alone, a JSON answer, a call alone, prose
-    /// then a call, parallel calls. Calls are spelled by
-    /// [`crate::dialect::render_reference`], the bytes the tool grammar
-    /// forces; the thought, prose and answer framing is each dialect's
-    /// habitual one, as its own round-trip tests pin it. Any shape here
-    /// that re-renders differently loses its turn's tip on the next
-    /// request. Known irreducible shapes are pinned in the per-model
-    /// tests, not here.
+    /// — with and without a thought (two back to back, an empty one,
+    /// and whitespace after one, where the format has a closer), prose
+    /// alone, a JSON answer, a call alone, prose then a call, parallel
+    /// calls. Calls are spelled by [`crate::dialect::render_reference`],
+    /// the bytes the tool grammar forces; the thought, prose and answer
+    /// framing is each dialect's habitual one, as its own round-trip
+    /// tests pin it. Every shape must:
+    ///
+    /// * re-render as generated, closing the render (the session's
+    ///   canonicalization gate) and followed by the next request's
+    ///   reply — its tool results, or a user turn. Either miss loses the
+    ///   turn's tip on the next request;
+    /// * once aged with `preserve_thinking` off, re-render as generated
+    ///   unless it carried a thought, which that setting drops (or, on
+    ///   Qwen, the thinking-off scaffold, which its aged turn drops like
+    ///   stock): pinned, so a template cannot lose more than that;
+    /// * parse to no whitespace-only `Text` — Anthropic never returns
+    ///   one and rejects one on ingest — and stream to the same blocks
+    ///   as the batch parse, a char at a time.
+    ///
+    /// Then every thought the budget can cut, sent back as the open
+    /// thought it parses to, continues byte-exactly. Known irreducible
+    /// shapes are pinned in the per-model tests, not here.
     #[test]
     fn fleet_bakes_round_trip_every_admitted_shape() {
         let tool = weather_tool();
@@ -15081,141 +15339,421 @@ mod tests {
                 &[("get_weather", &input), ("get_weather", &input)],
             )
             .expect("representable");
-            // `(thinking, emission)` per family.
-            let shapes: Vec<(bool, String)> = match syntax.family {
-                crate::dialect::Family::Harmony => {
-                    let a = |t: &str| {
-                        format!(
-                            "<|channel|>analysis<|message|>{t}<|end|>\
-                             <|start|>assistant"
-                        )
-                    };
-                    let pre = "<|channel|>commentary<|message|>Checking.\
-                               <|end|><|start|>assistant";
-                    let fin = "<|channel|>final<|message|>";
-                    let fin_json = "<|channel|>final <|constrain|>json\
-                                    <|message|>";
-                    let mut v = Vec::new();
-                    for thought in
-                        ["".to_owned(), a("Plan."), a("A.") + &a("B.")]
-                    {
-                        v.extend([
-                            format!("{thought}{fin}Ada."),
-                            format!("{thought}{fin}Ada.\n"),
-                            format!("{thought}{fin_json}{compact}"),
-                            format!("{thought}{one}"),
-                            format!("{thought}{pre}{one}"),
-                            format!("{thought}{two}"),
-                        ]);
-                    }
-                    v.into_iter().map(|e| (true, e)).collect()
-                }
-                crate::dialect::Family::TagWithJson => {
-                    // Mistral 4: `[THINK]…[/THINK]`, not pre-opened.
-                    let mut v = Vec::new();
-                    for (thinking, thought) in [
-                        (false, ""),
-                        (true, "[THINK]Plan.[/THINK]"),
-                        (true, "[THINK]A.[/THINK][THINK]B.[/THINK]"),
-                        (true, "[THINK]\nPlan.\n\n[/THINK]"),
-                    ] {
-                        for body in [
-                            "Ada.".to_owned(),
-                            "Ada.\n".to_owned(),
-                            "Ada. ".to_owned(),
-                            "\nAda.".to_owned(),
-                            "Ada.\n\n".to_owned(),
-                            json.to_owned(),
-                            one.clone(),
-                            format!("Checking.{one}"),
-                            format!("Checking.\n\n{one}"),
-                            two.clone(),
+            let qwen = baked.name.starts_with("qwen");
+            // `(thinking, emission)` per family, and the thoughts the
+            // budget can cut (`thinking` on).
+            let (shapes, clipped): (Vec<(bool, String)>, Vec<&str>) =
+                match syntax.family {
+                    crate::dialect::Family::Harmony => {
+                        let a = |t: &str| {
+                            format!(
+                                "<|channel|>analysis<|message|>{t}<|end|>\
+                                 <|start|>assistant"
+                            )
+                        };
+                        let pre = "<|channel|>commentary<|message|>\
+                                   Checking.<|end|><|start|>assistant";
+                        let fin = "<|channel|>final<|message|>";
+                        let fin_json = "<|channel|>final <|constrain|>json\
+                                        <|message|>";
+                        let mut v = Vec::new();
+                        for thought in [
+                            "".to_owned(),
+                            a("Plan."),
+                            a("A.") + &a("B."),
+                            a(""),
                         ] {
-                            v.push((thinking, format!("{thought}{body}")));
+                            v.extend([
+                                format!("{thought}{fin}Ada."),
+                                format!("{thought}{fin}Ada.\n"),
+                                format!("{thought}{fin}{compact}"),
+                                format!("{thought}{fin}[1, 2, 3]"),
+                                format!("{thought}{one}"),
+                                format!("{thought}{pre}{one}"),
+                                format!("{thought}{two}"),
+                            ]);
+                            // A constrained final records its header in
+                            // the analysis before it; with none, it has
+                            // nowhere to (pinned in
+                            // `gptoss_cache_stable_round_trips_json_final`).
+                            // So does a final of only whitespace.
+                            if !thought.is_empty() {
+                                v.extend([
+                                    format!("{thought}{fin_json}{compact}"),
+                                    format!("{thought}{fin_json}\"Ada\""),
+                                    format!("{thought}{fin}\n"),
+                                ]);
+                            }
                         }
+                        // An open analysis has no rendering (Harmony's
+                        // generation prompt never opens a channel).
+                        (v.into_iter().map(|e| (true, e)).collect(), vec![])
                     }
-                    v
-                }
-                crate::dialect::Family::TagWithDict => {
-                    // Gemma 4: the thought channel when thinking is on;
-                    // the render's closed scaffold when it is off. A
-                    // call turn exits on the tool-response opener.
-                    let exit = &syntax.tool_response_start;
-                    let mut v = Vec::new();
-                    for (thinking, thought) in [
-                        (false, ""),
-                        (true, "<|channel>thought\nPlan.\n<channel|>"),
-                        (true, "<|channel>thought\nPlan.\n\n<channel|>"),
-                    ] {
-                        for body in [
-                            "Ada.".to_owned(),
-                            "Ada.\n".to_owned(),
-                            "Ada. ".to_owned(),
-                            "\nAda.".to_owned(),
-                            "Ada.\n\n".to_owned(),
-                            json.to_owned(),
-                            format!("{one}{exit}"),
-                            format!("Checking.{one}{exit}"),
-                            format!("Checking.\n\n{one}{exit}"),
-                            format!("{two}{exit}"),
-                        ] {
-                            v.push((thinking, format!("{thought}{body}")));
-                        }
-                    }
-                    v
-                }
-                _ => {
-                    // Qwen (pre-opened `<think>\n` when on) and cogito
-                    // (no reasoning channel: its thought is prose).
-                    let thoughts: &[(bool, &str)] = match syntax.reasoning.mode
-                    {
-                        crate::dialect::ReasoningMode::None => &[
+                    crate::dialect::Family::TagWithJson => {
+                        // Mistral 4: `[THINK]…[/THINK]`, not pre-opened.
+                        let mut v = Vec::new();
+                        for (thinking, thought) in [
                             (false, ""),
-                            (true, "<think>\nPlan.\n</think>\n\n"),
-                        ],
-                        _ => &[
-                            (false, ""),
-                            (true, "Plan.\n</think>\n\n"),
-                            (true, "Plan.\n\n</think>\n\n"),
-                        ],
-                    };
-                    let mut v = Vec::new();
-                    for &(thinking, thought) in thoughts {
-                        for body in [
-                            "Ada.".to_owned(),
-                            "Ada.\n".to_owned(),
-                            "Ada. ".to_owned(),
-                            "\nAda.".to_owned(),
-                            "Ada.\n\n".to_owned(),
-                            json.to_owned(),
-                            one.clone(),
-                            format!("Checking.\n\n{one}"),
-                            format!("Checking.\n{one}"),
-                            format!("Checking. {one}"),
-                            two.clone(),
+                            (true, "[THINK]Plan.[/THINK]"),
+                            (true, "[THINK]A.[/THINK][THINK]B.[/THINK]"),
+                            (true, "[THINK]A.[/THINK]\n[THINK]B.[/THINK]"),
+                            (true, "[THINK]\nPlan.\n\n[/THINK]"),
+                            (true, "[THINK][/THINK]"),
                         ] {
-                            v.push((thinking, format!("{thought}{body}")));
+                            let mut bodies = vec![
+                                "Ada.".to_owned(),
+                                "Ada.\n".to_owned(),
+                                "Ada. ".to_owned(),
+                                "\nAda.".to_owned(),
+                                "Ada.\n\n".to_owned(),
+                                json.to_owned(),
+                                one.clone(),
+                                format!("Checking.{one}"),
+                                format!("Checking.\n\n{one}"),
+                                two.clone(),
+                            ];
+                            // Whitespace after a thought rides in it; with
+                            // no thought, before the first call, it has no
+                            // block to ride (pinned in
+                            // `blank_text_is_never_returned`).
+                            if thinking {
+                                bodies.extend([
+                                    format!("\n{one}"),
+                                    format!("\n\n{two}"),
+                                    "\n".to_owned(),
+                                ]);
+                            }
+                            for body in bodies {
+                                v.push((thinking, format!("{thought}{body}")));
+                            }
                         }
+                        (v, vec!["[THINK]Plan, th", "[THINK]\nPlan.\n\n"])
                     }
-                    v
-                }
-            };
+                    crate::dialect::Family::TagWithDict => {
+                        // Gemma 4: the thought channel when thinking is on;
+                        // the render's closed scaffold when it is off. A
+                        // call turn exits on the tool-response opener.
+                        let exit = &syntax.tool_response_start;
+                        let mut v = Vec::new();
+                        for (thinking, thought) in [
+                            (false, ""),
+                            (true, "<|channel>thought\nPlan.\n<channel|>"),
+                            (true, "<|channel>thought\nPlan.\n\n<channel|>"),
+                            (
+                                true,
+                                "<|channel>thought\nA\n<channel|>\
+                                 <|channel>thought\nB\n<channel|>",
+                            ),
+                            (
+                                true,
+                                "<|channel>thought\nA\n<channel|>\n\
+                                 <|channel>thought\nB\n<channel|>",
+                            ),
+                        ] {
+                            let mut bodies = vec![
+                                "Ada.".to_owned(),
+                                "Ada.\n".to_owned(),
+                                "Ada. ".to_owned(),
+                                "\nAda.".to_owned(),
+                                "Ada.\n\n".to_owned(),
+                                json.to_owned(),
+                                format!("{one}{exit}"),
+                                format!("Checking.{one}{exit}"),
+                                format!("Checking.\n\n{one}{exit}"),
+                                format!("{two}{exit}"),
+                            ];
+                            if thinking {
+                                bodies.push(format!("\n{one}{exit}"));
+                            }
+                            for body in bodies {
+                                v.push((thinking, format!("{thought}{body}")));
+                            }
+                        }
+                        (v, vec!["<|channel>thought\nPlan, th"])
+                    }
+                    _ => {
+                        // Qwen (pre-opened `<think>\n` when on) and cogito
+                        // (no reasoning channel: its thought is prose).
+                        let reasoning = syntax.reasoning.mode
+                            != crate::dialect::ReasoningMode::None;
+                        let thoughts: &[(bool, &str)] = match reasoning {
+                            false => &[
+                                (false, ""),
+                                (true, "<think>\nPlan.\n</think>\n\n"),
+                            ],
+                            true => &[
+                                (false, ""),
+                                (true, "Plan.\n</think>\n\n"),
+                                (true, "Plan.\n\n</think>\n\n"),
+                                (true, "Plan.\n</think>\n"),
+                            ],
+                        };
+                        let mut v = Vec::new();
+                        for &(thinking, thought) in thoughts {
+                            for body in [
+                                "Ada.".to_owned(),
+                                "Ada.\n".to_owned(),
+                                "Ada. ".to_owned(),
+                                "\nAda.".to_owned(),
+                                "Ada.\n\n".to_owned(),
+                                json.to_owned(),
+                                one.clone(),
+                                format!("Checking.\n\n{one}"),
+                                format!("Checking.\n{one}"),
+                                format!("Checking. {one}"),
+                                two.clone(),
+                            ] {
+                                v.push((thinking, format!("{thought}{body}")));
+                            }
+                        }
+                        let clipped = match reasoning {
+                            true => vec!["Plan, th", "Plan.\n\n", "\nPlan"],
+                            false => vec![],
+                        };
+                        (v, clipped)
+                    }
+                };
+            let template = crate::ChatTemplate::from_source(
+                served.to_owned(),
+                tokens.0.to_owned(),
+                tokens.1.to_owned(),
+            )
+            .expect("template compiles");
             for (thinking, emission) in shapes {
-                if let Some(at) = fleet_divergence(
-                    served,
-                    tokens,
-                    &[&tool],
-                    thinking,
-                    &emission,
-                ) {
+                let fail = |what: &str, at: usize| {
+                    format!(
+                        "{}: thinking={thinking} {what} at {at}: \
+                         {emission:?}",
+                        baked.name
+                    )
+                };
+                let diverge = |next| {
+                    fleet_divergence_then(
+                        served,
+                        tokens,
+                        &[&tool],
+                        thinking,
+                        &emission,
+                        next,
+                    )
+                };
+                for (next, what) in [
+                    (Next::Nothing, "round trip"),
+                    (Next::Reply, "next request"),
+                ] {
+                    if let Some(at) = diverge(next) {
+                        failures.push(fail(what, at));
+                    }
+                }
+                // The blocks as the session parses them.
+                let prompt = template
+                    .render_with(
+                        &Prompt {
+                            messages: vec![crate::prompt::Message {
+                                role: crate::prompt::Role::User,
+                                content: crate::Content::text("Who?"),
+                            }],
+                            ..Prompt::default()
+                        },
+                        &crate::RenderOptions::default()
+                            .with_extra("enable_thinking", thinking)
+                            .with_generation_prompt(true),
+                    )
+                    .expect("render");
+                let pre_opened =
+                    render_ends_with_open_reasoning(&prompt, &syntax);
+                let batch = merge_adjacent_prose(
+                    crate::dialect::parse_text(
+                        &syntax,
+                        &[&tool],
+                        &emission,
+                        pre_opened,
+                        crate::dialect::Leniency::Final,
+                    )
+                    .blocks,
+                );
+                let has_thought = batch
+                    .iter()
+                    .any(|b| matches!(b, crate::Block::Thought { .. }));
+                let aged = diverge(Next::AgedUnpreserved);
+                if aged.is_some() != (has_thought || (qwen && !thinking)) {
                     failures.push(format!(
-                        "{}: thinking={thinking} at {at}: {emission:?}",
+                        "{}: thinking={thinking} aged, preserve off: \
+                         {aged:?} (thought: {has_thought}): {emission:?}",
+                        baked.name
+                    ));
+                }
+                if batch.iter().any(|b| {
+                    matches!(
+                        b,
+                        crate::Block::Text { text, .. } if text.trim().is_empty()
+                    )
+                }) {
+                    failures.push(format!(
+                        "{}: whitespace-only text: {emission:?} -> {batch:?}",
+                        baked.name
+                    ));
+                }
+                let streamed =
+                    stream_parse(&syntax, &[&tool], &emission, pre_opened);
+                if streamed != batch {
+                    failures.push(format!(
+                        "{}: streamed {streamed:?} != batch {batch:?}: \
+                         {emission:?}",
+                        baked.name
+                    ));
+                }
+            }
+            for emission in clipped {
+                if let Some(at) =
+                    fleet_clipped_divergence(served, tokens, true, emission)
+                {
+                    failures.push(format!(
+                        "{}: clipped thought at {at}: {emission:?}",
                         baked.name
                     ));
                 }
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Anthropic never returns a whitespace-only text block, and rejects
+    /// one on ingest, so neither may a parse — yet the whitespace a model
+    /// writes between its thought and its call (Mistral 4's
+    /// `[/THINK]\n[TOOL_CALLS]`, Gemma 4's `<channel|>\n<|tool_call>`,
+    /// Qwen's `</think>\n\n<tool_call>`) is in the KV and must
+    /// re-render. It rides in the thought's signature
+    /// (`ThoughtTail::gap`) and the renderer puts it back. Pinned too:
+    /// with no thought before it (the turn's first bytes, after a call)
+    /// it has nothing to ride and is dropped — the turn re-renders
+    /// without it, at the cost of its tip, never of the client's ingest.
+    #[test]
+    fn blank_text_is_never_returned() {
+        use crate::prompt::ThoughtTail;
+        let tool = weather_tool();
+        let input = serde_json::json!({"city": "Paris"});
+        let blank = |blocks: &[crate::Block]| {
+            blocks.iter().any(|b| {
+                matches!(b, crate::Block::Text { text, .. } if text.trim().is_empty())
+            })
+        };
+        for (baked, tokens, thought, gap, tail) in [
+            (
+                &crate::baked::MISTRAL4,
+                ("<s>", "</s>"),
+                "[THINK]Plan.[/THINK]",
+                "\n",
+                "",
+            ),
+            (
+                &crate::baked::GEMMA4,
+                ("<bos>", "<turn|>"),
+                "<|channel>thought\nPlan.\n<channel|>",
+                "\n",
+                "<|tool_response>",
+            ),
+            (
+                &crate::baked::QWEN36,
+                ("", "<|im_end|>"),
+                "Plan.\n</think>",
+                "\n\n",
+                "",
+            ),
+            (
+                &crate::baked::QWEN38,
+                ("", "<|im_end|>"),
+                "Plan.\n</think>",
+                "\n",
+                "",
+            ),
+        ] {
+            let served = crate::baked::detect(baked.stock)
+                .expect("stock dump detects")
+                .replacement;
+            let syntax =
+                crate::dialect::analyze_template(served, tokens.0, tokens.1)
+                    .expect("analyze");
+            let one = crate::dialect::render_reference(
+                &syntax,
+                &[("get_weather", &input)],
+            )
+            .expect("representable");
+            let pre_opened = baked.name.starts_with("qwen");
+            for emission in [
+                format!("{thought}{gap}{one}{tail}"),
+                format!("{thought}{gap}"),
+            ] {
+                let blocks = crate::dialect::parse_text(
+                    &syntax,
+                    &[&tool],
+                    &emission,
+                    pre_opened,
+                    crate::dialect::Leniency::Final,
+                )
+                .blocks;
+                assert!(!blank(&blocks), "{}: {blocks:?}", baked.name);
+                let Some(crate::Block::Thought { signature, .. }) =
+                    blocks.first()
+                else {
+                    panic!("{}: a thought first: {blocks:?}", baked.name);
+                };
+                assert_eq!(
+                    ThoughtTail::of(signature).gap,
+                    gap,
+                    "{}",
+                    baked.name
+                );
+                assert_eq!(
+                    fleet_divergence(served, tokens, &[&tool], true, &emission),
+                    None,
+                    "{}: {emission:?}",
+                    baked.name
+                );
+            }
+        }
+
+        // Nothing to ride: Mistral 4's whitespace before its first call,
+        // or after its last, and a Harmony final of only whitespace with
+        // no analysis before it. Dropped; the turn parts where it was.
+        let tokens = ("<s>", "</s>");
+        let served = crate::baked::MISTRAL4.replacement;
+        let syntax =
+            crate::dialect::analyze_template(served, tokens.0, tokens.1)
+                .expect("analyze");
+        let one = crate::dialect::render_reference(
+            &syntax,
+            &[("get_weather", &input)],
+        )
+        .expect("representable");
+        for (emission, at) in
+            [(format!("\n{one}"), 0), (format!("{one}\n\n"), one.len())]
+        {
+            let blocks = crate::dialect::parse_text(
+                &syntax,
+                &[&tool],
+                &emission,
+                false,
+                crate::dialect::Leniency::Final,
+            )
+            .blocks;
+            assert!(!blank(&blocks), "{blocks:?}");
+            assert_eq!(
+                fleet_divergence(served, tokens, &[&tool], false, &emission),
+                Some(at),
+                "{emission:?}"
+            );
+        }
+        let emission = "<|channel|>final<|message|>\n";
+        let blocks = crate::dialect::parse_text(
+            &crate::CallSyntax::gpt_oss(),
+            &[],
+            emission,
+            false,
+            crate::dialect::Leniency::Final,
+        )
+        .blocks;
+        assert!(blocks.is_empty(), "{blocks:?}");
     }
 
     /// An assistant turn aged out with `preserve_thinking` off drops its

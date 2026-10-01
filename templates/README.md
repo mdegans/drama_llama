@@ -26,8 +26,14 @@ turn's answer also renders verbatim: stock `| trim`s it, so an answer
 the model ended in whitespace, or began with a newline after its
 thought, re-rendered shorter than it was generated (found by the
 fleet sweep, `fleet_bakes_round_trip_every_admitted_shape`; not yet
-seen live). Everything else outside the thinking-channel block is
-byte-identical to `gemma4-gguf.jinja`.
+seen live). A model turn renders from the `chunks` drama_llama
+supplies (its blocks in emission order, see the gpt-oss notes below):
+the first thought opens the turn as before, and a second thought —
+`<|channel>thought\nA\n<channel|><|channel>thought\nB\n<channel|>` —
+renders as its own channel block where the model wrote it instead of
+merging into one `reasoning` (the fleet sweep pins it). Everything
+else outside the thinking-channel block is byte-identical to
+`gemma4-gguf.jinja`.
 
 `gptoss-gguf.jinja` is dumped from the gpt-oss-20b Unsloth GGUF
 (`tokenizer.chat_template`, Apache 2.0 per its own footer) — the
@@ -51,19 +57,24 @@ blocks render as two (they used to merge into one) and a thought after
 the preamble renders after it. Without `chunks` the turn is rebuilt
 from the merged fields as before.
 
-A final answer that is JSON — content starting `{` and ending `}`, or
-`[` … `]` — renders under `<|channel|>final <|constrain|>json<|message|>`.
-That content type is what gpt-oss writes for structured output,
-unforced (every JSON final in the 2026-10-01 Agora run carried it);
-stock renders every final channel plain, so each one re-rendered a
-constraint short and lost its tip (470..1111 tokens a turn, live). The
-`output_config` grammar requires the constraint, so a constrained
-answer and its re-render cannot part. Irreducible, pinned in
-`gptoss_cache_stable_round_trips_json_final`: a final the model writes
-as JSON *without* the constraint (free generation only) and prose that
-merely starts and ends with braces both re-render with it. Harmony does
-not document a final-channel content type (its guide shows
-`<|constrain|>` only on commentary calls); this follows the model.
+A final answer renders under the header the model wrote:
+`<|channel|>final <|constrain|>json<|message|>` when its text chunk
+carries `constrain` (the content type the model declared, which the
+parser records in the signature of the analysis block before the final
+— `drama_llama:tail;constrain=json`), plain otherwise. That content
+type is what gpt-oss writes for structured output, unforced (every JSON
+final in the 2026-10-01 Agora run carried it); stock renders every
+final channel plain, so each one re-rendered a constraint short and
+lost its tip (470..1111 tokens a turn, live). The content's shape
+cannot stand in for the header — `[1, 2, 3]` may be prose, and a
+structured answer whose schema root is a string or a number is not
+`{…}` — so both spellings round-trip, and the `output_config` grammar
+leaves the choice to the model. Irreducible, pinned in
+`gptoss_cache_stable_round_trips_json_final`: a constrained final with
+no analysis block before it has nowhere to record its header, and
+re-renders plain. Harmony does not document a final-channel content
+type (its guide shows `<|constrain|>` only on commentary calls); this
+follows the model.
 The `<|return|>`/`<|end|>` re-ingest rewrite (upstream issue #15417)
 costs nothing: the sampled EOG is never committed to KV, and the
 session's auto-tip records the CANONICAL close token from the
@@ -277,6 +288,21 @@ reaches past BPE boundaries) survives it. Outside the template's reach
 A `<model>.template.jinja` sidecar next to the GGUF still overrides
 any of these — baked templates removed the *need* for sidecar
 deployment on recognized models, not the mechanism.
+
+## Framing no block carries: the thought tail
+
+Anthropic never returns a whitespace-only text block and rejects one on
+ingest, so the parse never yields one — yet the whitespace a model
+writes between a thought and its call (`[/THINK]\n[TOOL_CALLS]`,
+`<channel|>\n<|tool_call>`, `</think>\n\n<tool_call>`) is in the KV.
+It rides in the closed thought's `signature`
+(`drama_llama:tail;gap=%0A`), and the renderer (`chat_template.rs`,
+before any template sees the turn) puts it back as the text it was, so
+every template here renders the turn exactly as if it were a block.
+The same tail carries the content type of a Harmony final right after
+the thought (`;constrain=json`, above). Whitespace with no thought
+before it — a turn's first bytes before a call, after the last call —
+has nothing to ride and is dropped (`blank_text_is_never_returned`).
 
 ## completion-scaffold.jinja
 

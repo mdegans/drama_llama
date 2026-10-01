@@ -133,10 +133,13 @@ pub(crate) struct OpenCall {
 
 /// Streaming adapter over [`parse_text`]: accumulate pieces, re-parse
 /// the whole text per tick, and diff against what has already been
-/// yielded. Structured blocks (thought, tool call) emerge whole when
-/// their close marker arrives; trailing prose streams incrementally
-/// as byte deltas, holding back any tail that could still grow into a
-/// dialect marker.
+/// yielded. A tool call emerges whole when its close marker arrives,
+/// a thought once whatever follows it does (its signature records the
+/// whitespace after it, and on Harmony the header of the final after
+/// it — see [`parse_text`]); trailing prose streams incrementally as
+/// byte deltas, holding back any tail that could still grow into a
+/// dialect marker, and any prose that is so far only whitespace (a
+/// parse never returns a whitespace-only `Text`).
 ///
 /// The diff is sound because of two properties of [`parse_text`] on a
 /// growing input: the parsed block *prefix* is stable (landmarks are
@@ -328,6 +331,42 @@ impl StreamParser {
         best
     }
 
+    /// `end`, pulled back so that `text[..end]` holds whole spelled
+    /// pieces: a delta is restored on its own, so it must hold whole
+    /// markers.
+    fn whole_markers(&self, text: &str, end: usize) -> usize {
+        match &self.provenance {
+            Some(provenance) => provenance.cut_before_marker(text, end),
+            None => end,
+        }
+    }
+
+    /// How many trailing blocks a streaming parse withholds this tick,
+    /// so that nothing yielded can change — or be a whitespace-only
+    /// `Text`, which a parse never returns ([`fold_blank_text`]):
+    ///
+    /// * a trailing `Text` whose yieldable part is whitespace: it may
+    ///   yet be the framing before a structure (`[/THINK]\n[TOOL_CA`),
+    ///   folded into a thought or dropped once the structure lands;
+    /// * a closed thought with nothing after it but such text: its
+    ///   signature records what follows it (`ThoughtTail`), which is
+    ///   not known until something does.
+    fn held_tail(&self, blocks: &[Block]) -> usize {
+        let blank_text = match blocks.last() {
+            Some(Block::Text { text, .. }) => {
+                let end = text.len() - self.landmark_holdback(text);
+                text[..self.whole_markers(text, end)].trim().is_empty()
+            }
+            _ => false,
+        };
+        let before = blocks.len() - usize::from(blank_text);
+        let thought = matches!(
+            before.checked_sub(1).map(|at| &blocks[at]),
+            Some(Block::Thought { .. })
+        );
+        usize::from(blank_text) + usize::from(thought)
+    }
+
     fn reparse(&mut self, leniency: Leniency) -> Vec<Block> {
         let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
         let (parsed, open) = parse_text_open(
@@ -341,7 +380,11 @@ impl StreamParser {
             Some(provenance) => open.map(|o| provenance.restore_open(o)),
             None => open,
         };
-        let blocks = parsed.blocks;
+        let mut blocks = parsed.blocks;
+        if leniency == Leniency::Streaming {
+            let held = self.held_tail(&blocks);
+            blocks.truncate(blocks.len() - held);
+        }
         let last = blocks.len().saturating_sub(1);
         let mut out = Vec::new();
         for (i, block) in blocks.into_iter().enumerate() {
@@ -355,16 +398,11 @@ impl StreamParser {
                     // grow (or its tail may become a marker), so under
                     // Streaming yield only the safe delta and keep the
                     // block open; under Final flush it whole.
-                    let mut end = if open_tail {
-                        text.len() - self.landmark_holdback(&text)
-                    } else {
-                        text.len()
+                    let end = match open_tail {
+                        true => text.len() - self.landmark_holdback(&text),
+                        false => text.len(),
                     };
-                    // A delta is restored on its own, so it must hold
-                    // whole markers.
-                    if let Some(provenance) = &self.provenance {
-                        end = provenance.cut_before_marker(&text, end);
-                    }
+                    let end = self.whole_markers(&text, end);
                     if end > self.text_bytes_emitted {
                         let delta = &text[self.text_bytes_emitted..end];
                         out.push(match &self.provenance {
@@ -397,6 +435,15 @@ impl StreamParser {
 
 /// Parse `text` (the full accumulated generation) into blocks per
 /// `syntax`.
+///
+/// No block is a whitespace-only [`Block::Text`]: Anthropic never
+/// returns one and rejects one on ingest. Whitespace the model wrote
+/// between a closed thought and what follows it is recorded in that
+/// thought's `signature` instead (`drama_llama:tail;gap=…`), which the
+/// chat template renderer puts back where it sat; anywhere else such a
+/// run is dropped. A closed thought's signature also records the
+/// content type of a Harmony final channel right after it
+/// (`;constrain=json`, from `<|channel|>final <|constrain|>json`).
 ///
 /// `pre_opened_reasoning`: the rendered generation prompt ended with
 /// the open reasoning tag, so `text` *begins inside* the reasoning
@@ -436,10 +483,40 @@ pub(crate) fn parse_text_open(
     };
     p.run(pre_opened_reasoning);
     let parsed = Parsed {
-        blocks: p.blocks,
+        blocks: fold_blank_text(p.blocks),
         status: p.status,
     };
     (parsed, p.open)
+}
+
+/// `blocks` without a whitespace-only [`Block::Text`]: Anthropic never
+/// returns one and rejects one on ingest, so neither may a parse. Such a
+/// run is framing between structures — Mistral 4's
+/// `[/THINK]\n[TOOL_CALLS]`, Gemma 4's `<channel|>\n<|tool_call>`,
+/// Qwen's `</think>\n\n<tool_call>` — and the next render needs it
+/// back, so after a closed thought it rides in that thought's
+/// signature (`ThoughtTail::gap`, which the renderer re-inserts where
+/// it sat). Anywhere else (before the turn's first structure, after a
+/// call) it has no block to ride and is dropped: the one place a turn's
+/// whitespace no longer re-renders.
+pub(crate) fn fold_blank_text(blocks: Vec<Block>) -> Vec<Block> {
+    use crate::prompt::{is_blank, ThoughtTail, OPEN_THOUGHT_SIGNATURE};
+    let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        match block {
+            Block::Text { text, .. } if text.trim().is_empty() => {
+                if let Some(Block::Thought { signature, .. }) = out.last_mut() {
+                    if is_blank(&text) && signature != OPEN_THOUGHT_SIGNATURE {
+                        let mut tail = ThoughtTail::of(signature);
+                        tail.gap.push_str(&text);
+                        *signature = tail.signature();
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 struct Parser<'a> {
@@ -589,6 +666,26 @@ impl<'a> Parser<'a> {
         // as pure noise (Gemma 4's pre-closed / trailing channel
         // blocks) — drop rather than surface an empty block.
         if body.is_empty() {
+            return;
+        }
+        self.push_closed_thought(body);
+    }
+
+    /// A thought the model wrote both markers of, kept even when empty
+    /// (Mistral 4's `[THINK][/THINK]`, an empty Harmony analysis):
+    /// the templates that render each thought render an empty one as
+    /// the model wrote it, so dropping it lost the markers from the
+    /// re-render. Anthropic returns empty thinking blocks too (display
+    /// `omitted`). Two exceptions keep dropping it: Gemma 4, whose empty
+    /// channel is the template's own thinking-off scaffold — or noise
+    /// around content — and renders from no thought at all; and a
+    /// dialect that re-ingests thoughts inline, where an empty one would
+    /// put a bare `<think></think>` into the turn's content.
+    fn push_closed_thought(&mut self, body: &str) {
+        let drop_empty = self.syntax.family == Family::TagWithDict
+            || self.syntax.reasoning.reingest
+                == super::ReasoningReingest::InlineThink;
+        if body.is_empty() && drop_empty {
             return;
         }
         self.blocks.push(Block::Thought {
@@ -891,7 +988,7 @@ impl<'a> Parser<'a> {
                 let body = &self.rest()[..at];
                 let body = self.opened_thought_body(body);
                 let body = self.closed_thought_body(body);
-                self.push_thought(body);
+                self.push_closed_thought(body);
                 // Whatever follows the close is the answer's: the baked
                 // templates render it verbatim after the marker (Mistral
                 // 4 writes `[/THINK]` then the answer; a `\n` there was
@@ -1188,6 +1285,7 @@ impl<'a> Parser<'a> {
         // `self.text` and the body readers below need `&mut self`.
         let mut recipient: Option<String> = None;
         let mut channel: Option<String> = None;
+        let mut constrain: Option<String> = None;
         let mut h = header;
         if let Some(r) = h.strip_prefix(" to=") {
             let end = r.find(harmony::CHANNEL).unwrap_or(r.len());
@@ -1203,7 +1301,14 @@ impl<'a> Parser<'a> {
                 recipient = Some(r2[..e2].trim().to_string());
             }
             // Whatever trails (` [<|constrain|>]TYPE`) is the
-            // constraint clause — parsed leniently by ignoring it.
+            // constraint clause — parsed leniently by ignoring it, bar
+            // the content type a final channel declares, which its
+            // re-render must spell (see `note_final_constrain`).
+            constrain = tail
+                .strip_prefix(' ')
+                .and_then(|t| t.strip_prefix(harmony::CONSTRAIN))
+                .filter(|t| crate::prompt::is_content_type(t))
+                .map(str::to_string);
         }
 
         self.pos += msg_rel + harmony::MESSAGE.len();
@@ -1220,7 +1325,14 @@ impl<'a> Parser<'a> {
             }
             (None, Some("analysis")) => self.harmony_analysis(),
             (None, Some("commentary")) => self.harmony_text_body(false),
-            (None, Some("final")) => self.harmony_text_body(true),
+            (None, Some("final")) => {
+                let before = self.blocks.len();
+                let outcome = self.harmony_text_body(true);
+                if let Some(constrain) = constrain {
+                    self.note_final_constrain(before, constrain);
+                }
+                outcome
+            }
             _ => CallOutcome::Malformed,
         }
     }
@@ -1235,7 +1347,7 @@ impl<'a> Parser<'a> {
         match self.rest().find(harmony::END) {
             Some(at) => {
                 let body = self.rest()[..at].to_string();
-                self.push_thought(&body);
+                self.push_closed_thought(&body);
                 self.pos += at + harmony::END.len();
                 CallOutcome::Parsed
             }
@@ -1281,6 +1393,32 @@ impl<'a> Parser<'a> {
                 self.push_text(&body);
                 self.pos = self.text.len();
                 CallOutcome::Parsed
+            }
+        }
+    }
+
+    /// Record a final channel's declared content type (` <|constrain|>
+    /// json`) in the thought right before it, when its body began a new
+    /// block after one (`ThoughtTail::constrain`): the header is
+    /// framing, so its `Text` cannot say which spelling the model wrote,
+    /// and gpt-oss writes either — unforced, ` <|constrain|>json` on
+    /// structured answers, plain on prose, and its content shape does
+    /// not tell them apart (`[1, 2, 3]` may be prose; a schema whose
+    /// root is a string is not `{…}`). With no thought before it there
+    /// is nowhere to record it, and the final re-renders plain.
+    fn note_final_constrain(&mut self, before: usize, constrain: String) {
+        use crate::prompt::{ThoughtTail, OPEN_THOUGHT_SIGNATURE};
+        let new_text = self.blocks.len() == before + 1
+            && matches!(self.blocks.last(), Some(Block::Text { .. }));
+        let thought = before
+            .checked_sub(1)
+            .and_then(|at| self.blocks.get_mut(at))
+            .filter(|_| new_text);
+        if let Some(Block::Thought { signature, .. }) = thought {
+            if signature != OPEN_THOUGHT_SIGNATURE {
+                let mut tail = ThoughtTail::of(signature);
+                tail.constrain = Some(constrain);
+                *signature = tail.signature();
             }
         }
     }
