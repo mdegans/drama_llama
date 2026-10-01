@@ -106,6 +106,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Reproduced at the byte level on the live gpt-oss bodies
   (`tagged_reasoning_output_config_constrains_the_body`, red on the old
   trigger).
+- **A deferred output_config grammar that never activated is a grammar
+  violation.** When the model never writes the trigger (it skipped the
+  thought, or wrote a closer the grammar did not know), the answer ran
+  unconstrained and was returned as if constrained. It is now
+  `SessionError::GrammarViolation` — or `SchemaViolation` when the free
+  body also breaks the schema — with the cache left warm, since no
+  constraint ever started; blallama resamples it. The Auto tool-call
+  lazy grammar keeps its exemption: never calling is legal. A render
+  that already closed the turn's thought (a prefilled closed thought,
+  thinking on) now gets the unified grammar, since its closer can never
+  be written and the deferred one would never fire.
 
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
@@ -439,8 +450,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   non-empty `minItems`) — never the validator-only ones it deliberately
   leaves to the model (`pattern`, `minLength`, `maximum`, …), which
   would turn every such request into a resample loop. A turn cut by
-  `max_tokens` or a stop sequence is exempt (#121), and streaming stays
-  unchecked like the grammar-violation check. The error leaves the
+  `max_tokens` or a stop sequence is exempt (#121). The error leaves the
   cache warm, `Display` names the schema location but never the value,
   and blallama resamples it on the warm cache like a grammar violation,
   then answers 500 `api_error` — never a 200 carrying the invalid
@@ -449,6 +459,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tagged (Qwen XML) dialect is now refused rather than handed the
   JSON-quoted value (`"\"full\""`) the parser reads there — a
   pre-existing parser bug the backstop surfaces.
+- **`BlockStream::violation`**: once drained, a stream reports the
+  `GrammarViolation` or `SchemaViolation` the batch path would have
+  returned for the same turn, by the same rules (one `TurnContract`
+  for both). The blocks are already out, so discarding them is the
+  caller's call. The batch path's special-token containment
+  (`EmittedSpecialToken`) is not checked there.
 
 - **Automatic prompt caching, as on Anthropic.** A request-level
   `cache_control` (`Prompt::cache_control`, misanthropic's

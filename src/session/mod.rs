@@ -225,7 +225,10 @@ pub enum SessionError {
     /// — a forced call missing its `tool_use` block, or an eager
     /// grammar/JSON constraint left mid-structure at end of generation —
     /// with budget to spare. Constraint-incomplete output is never
-    /// returned silently.
+    /// returned silently, and neither is an answer the constraint never
+    /// saw: a deferred (phase-split) `output_config` grammar whose trigger
+    /// never came, which leaves the cache warm, as nothing was
+    /// mid-constraint.
     ///
     /// *Not* raised for a turn cut short by `max_tokens`, the context
     /// limit, or a stop sequence (#121): that is an unfinished turn, not
@@ -5121,10 +5124,19 @@ impl<B: Backend> Session<B> {
         let reasoning_opener_spent =
             pre_opened_reasoning || reasoning_closed_by_render;
 
+        // A render that already closed the turn's thought (a prefilled
+        // closed thought with thinking on) leaves no closer for a
+        // phase-split trigger to see — the closer ban makes sure of it —
+        // so its grammar would never fire. Constrain from the start.
+        let output_config_opts = OutputConfigOptions {
+            phase_split: self.output_config_opts.phase_split
+                && !reasoning_closed_by_render,
+            ..self.output_config_opts.clone()
+        };
         let (grammar_mode, deferred_grammar) = match resolve_grammar(
             prompt,
             &self.dialect,
-            &self.output_config_opts,
+            &output_config_opts,
             pre_opened_reasoning,
         )? {
             None => (None, None),
@@ -6584,10 +6596,12 @@ impl<B: Backend> Session<B> {
     ///
     /// Iteration itself doesn't produce per-item errors; all setup failures
     /// (template render, grammar compile) surface as the outer `Err`.
-    /// Grammar-violation checks live on the batch methods — streaming callers
-    /// see whatever partial output the model produced, with one exception
-    /// shared with the batch path: a generation cut short (`max_tokens`, a
-    /// stop sequence) yields an incomplete trailing call cut short, as
+    /// Streaming callers see whatever output the model produced, and once
+    /// the stream is drained [`BlockStream::violation`] reports the
+    /// grammar or schema violation the batch methods would have returned
+    /// instead — the bytes are out by then, so discarding them is the
+    /// caller's call. A generation cut short (`max_tokens`, a stop
+    /// sequence) yields an incomplete trailing call cut short, as
     /// Anthropic returns it, rather than its bytes as text.
     /// [`BlockStream::stop_reason`] reports the ending once the stream is
     /// drained, and [`BlockStream::open_call_json`] whether a clip left
@@ -6726,9 +6740,10 @@ impl<B: Backend> Session<B> {
             drained: false,
             generated: 0,
             max_tokens,
-            tool_use: false,
-            last: None,
+            yielded: Vec::new(),
             stop: None,
+            contract: TurnContract::of(prompt, deferred_grammar.as_ref()),
+            violation: None,
         })
     }
 
@@ -6745,12 +6760,6 @@ impl<B: Backend> Session<B> {
         &mut self,
         prompt: &Prompt,
     ) -> Result<CallOutcome, SessionError> {
-        use crate::ToolChoice;
-        let forced_tool_call = matches!(
-            prompt.tool_choice,
-            Some(ToolChoice::Method { .. }) | Some(ToolChoice::Any { .. })
-        );
-
         let PreparedCall {
             entries,
             breakpoints,
@@ -6952,6 +6961,8 @@ impl<B: Backend> Session<B> {
         // Capture the incomplete-at-end violation signal and the final
         // sampler state (tip promotion) before the predictor drops.
         let constraint_incomplete = predictor.constraint_incomplete_at_end();
+        let deferred_unfired =
+            predictor.sampler_state().deferred_inactive() == Some(true);
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
         let budget = Cut::of(&predictor);
         drop(predictor);
@@ -7209,16 +7220,17 @@ impl<B: Backend> Session<B> {
         // as the typed error instead.
         //
         // This covers the *activated* deferred grammar too (#38 defect
-        // 1). A deferred grammar that never triggered stays exempt —
-        // never calling a tool is legal on the Auto path — but one
-        // whose trigger fired is a live constraint like any other, and
+        // 1). An Auto tool-call grammar that never triggered stays
+        // exempt — never calling a tool is legal — but one whose
+        // trigger fired is a live constraint like any other, and
         // leaving it unflagged is what let a truncated Auto call get
         // seated as plain `Block::Text`, with its `<tool_call>` frame
         // marker intact. The next ingest of that transcript trips
         // `check_no_special_injection` and the caller's loop dies one
         // turn after the actual failure, permanently.
         //
-        // Streaming stays permissive by documented contract.
+        // A stream yields its blocks regardless and reports the same
+        // verdict once drained (`BlockStream::violation`).
         // `constraint_incomplete` was captured from the predictor's
         // SamplerState before drop.
         //
@@ -7230,13 +7242,20 @@ impl<B: Backend> Session<B> {
         // error it cost two resamples that fail the same way (the
         // budget is the budget) and then a 500 on blallama, so clients
         // keying their clip handling on the stop reason never saw one.
-        if cut.is_none()
-            && (constraint_incomplete
-                || (forced_tool_call
-                    && !blocks
-                        .iter()
-                        .any(|b| matches!(b, crate::Block::ToolUse { .. }))))
-        {
+        //
+        // A deferred *output_config* grammar that never fired is a
+        // violation too, though checked last (below): the answer it was
+        // to constrain ran free (see `TurnContract::deferred_answer`).
+        let breach = TurnContract::of(prompt, deferred_grammar.as_ref())
+            .breach(
+                &blocks,
+                TurnEnd {
+                    cut: cut.is_some(),
+                    constraint_incomplete,
+                    deferred_unfired,
+                },
+            );
+        if matches!(breach, Some(Breach::Incomplete)) {
             // Grammar violation is a call failure — invalidate cache
             // + KV to avoid stale reuse next call (the recorded tip
             // carries a mid-constraint sampler state).
@@ -7303,10 +7322,16 @@ impl<B: Backend> Session<B> {
         // wrong one (#121). No cache invalidation, as for containment:
         // the constraint either completed or never activated, so the
         // recorded state is consistent and the retry finds the prompt
-        // extent warm. Streaming stays unchecked by the same contract
-        // as the violation check — its bytes are already out.
-        if cut.is_none() {
-            if let Some(mismatch) = schema_mismatch(prompt, &blocks) {
+        // extent warm. A stream reports the same verdict once drained
+        // (`BlockStream::violation`) — its bytes are already out.
+        //
+        // Then the deferred output_config grammar that never fired, as a
+        // grammar violation but with the cache left warm like this one:
+        // no constraint ever started, so the recorded state is plain
+        // unconstrained generation. Checked after the schema, so a body
+        // that ran free *and* broke the schema says where.
+        match breach {
+            Some(Breach::Schema(mismatch)) => {
                 #[cfg(feature = "axum")]
                 tracing::error!(
                     target: "drama_llama::session",
@@ -7320,6 +7345,19 @@ impl<B: Backend> Session<B> {
                     partial_output: crate::prompt::Content(blocks),
                 });
             }
+            Some(Breach::Unfired) => {
+                #[cfg(feature = "axum")]
+                tracing::error!(
+                    target: "drama_llama::session",
+                    "output_config grammar never activated (its trigger \
+                     was never written), so the answer ran unconstrained; \
+                     rejected — prompt cache extent is warm, resample",
+                );
+                return Err(SessionError::GrammarViolation {
+                    partial_output: crate::prompt::Content(blocks),
+                });
+            }
+            Some(Breach::Incomplete) | None => {}
         }
 
         let (stop_reason, stop_sequence) = infer_stop_reason(
@@ -7754,59 +7792,141 @@ fn dialect_deferred_grammar_for_prompt(
     }))
 }
 
-/// The first way `blocks` break a schema their constraint promised —
-/// the post-generation backstop behind [`SessionError::SchemaViolation`].
-///
-/// Two promises are checked. A `strict` tool's call input must match the
-/// tool's schema (non-strict tools promise nothing, as on Anthropic).
-/// And a turn that answers a json_schema [`output_config`] — no call,
-/// and no forced `tool_choice`, which outranks it at grammar resolution
-/// ([`resolve_grammar`]) — must be exactly one JSON document matching
-/// it, across all its text: prose beside the JSON is a violation too,
-/// since the grammar admits none.
-///
-/// [`output_config`]: misanthropic::Prompt::output_config
-fn schema_mismatch(
-    prompt: &Prompt,
-    blocks: &[crate::Block],
-) -> Option<crate::SchemaMismatch> {
-    let calls = || {
-        blocks.iter().filter_map(|block| match block {
-            crate::Block::ToolUse { call } => Some(call),
-            _ => None,
-        })
-    };
-    let strict_tool = |name: &str| {
-        prompt
-            .tools
-            .iter()
-            .flatten()
-            .filter_map(|def| def.as_method())
-            .find(|tool| tool.name == name && tool.strict == Some(true))
-    };
-    if let Some(mismatch) = calls().find_map(|call| {
-        let tool = strict_tool(&call.name)?;
-        crate::schema_check::check(&tool.schema, &call.input).err()
-    }) {
-        return Some(mismatch);
+/// What a finished turn owes its constraints beyond the grammar's own
+/// token-by-token checks — read off the prompt before generation, judged
+/// on the parsed blocks after it. One contract for `run_call` and a
+/// drained [`BlockStream`], so both paths refuse the same turns.
+#[derive(Clone, Debug, Default)]
+struct TurnContract {
+    /// A forced `tool_choice`: the turn must call.
+    forced_call: bool,
+    /// `(name, schema)` of every `strict` tool: a call's input must match
+    /// (non-strict tools promise nothing, as on Anthropic).
+    strict_tools: Vec<(String, serde_json::Value)>,
+    /// The json_schema [`output_config`]'s schema. A turn that answers it
+    /// — no call, and no forced call, which outranks it at grammar
+    /// resolution ([`resolve_grammar`]) — must be exactly one JSON
+    /// document matching it, across all its text: prose beside the JSON
+    /// breaks it too, since the grammar admits none.
+    ///
+    /// [`output_config`]: misanthropic::Prompt::output_config
+    output_schema: Option<serde_json::Value>,
+    /// The output_config grammar is deferred (phase-split), so its
+    /// trigger must fire: the body runs under it or under nothing.
+    /// Unlike the Auto tool-call lazy grammar — the only other deferred
+    /// one, which never firing just means no call — an output_config
+    /// grammar that never activated left the answer unconstrained.
+    deferred_answer: bool,
+}
+
+/// How a turn broke its [`TurnContract`], in the order `run_call` checks.
+#[derive(Debug)]
+enum Breach {
+    /// A constraint was left mid-structure, or a forced call never came:
+    /// a [`SessionError::GrammarViolation`] whose cache must go cold (the
+    /// recorded state is mid-constraint).
+    Incomplete,
+    /// [`SessionError::SchemaViolation`].
+    Schema(crate::SchemaMismatch),
+    /// The deferred output_config grammar never fired: a
+    /// [`SessionError::GrammarViolation`] with the cache left warm, since
+    /// no constraint ever started.
+    Unfired,
+}
+
+/// How generation ended, as far as [`TurnContract::breach`] cares.
+#[derive(Clone, Copy, Debug)]
+struct TurnEnd {
+    /// Cut short by the budget or a stop sequence (#121): an unfinished
+    /// turn, which breaks nothing.
+    cut: bool,
+    /// [`crate::TokenPredictor::constraint_incomplete_at_end`].
+    constraint_incomplete: bool,
+    /// A deferred grammar was installed and never activated.
+    deferred_unfired: bool,
+}
+
+impl TurnContract {
+    /// The contract `prompt` sets, given the call's resolved `deferred`
+    /// grammar.
+    fn of(prompt: &Prompt, deferred: Option<&crate::DeferredGrammar>) -> Self {
+        let output_schema = output_config::json_schema(prompt).cloned();
+        Self {
+            forced_call: matches!(
+                prompt.tool_choice,
+                Some(ToolChoice::Any { .. } | ToolChoice::Method { .. })
+            ),
+            strict_tools: prompt
+                .tools
+                .iter()
+                .flatten()
+                .filter_map(|def| def.as_method())
+                .filter(|tool| tool.strict == Some(true))
+                .map(|tool| (tool.name.to_string(), tool.schema.clone()))
+                .collect(),
+            // `resolve_grammar` ranks a structured output_config above the
+            // Auto lazy grammar, so a deferred grammar beside one is its.
+            deferred_answer: deferred.is_some() && output_schema.is_some(),
+            output_schema,
+        }
     }
 
-    let forced = matches!(
-        prompt.tool_choice,
-        Some(ToolChoice::Any { .. } | ToolChoice::Method { .. })
-    );
-    if forced || calls().next().is_some() {
-        return None;
+    /// The first way a turn that ended as `end` with `blocks` breaks the
+    /// contract, if any.
+    fn breach(&self, blocks: &[crate::Block], end: TurnEnd) -> Option<Breach> {
+        if end.cut {
+            return None;
+        }
+        let called = || {
+            blocks
+                .iter()
+                .any(|b| matches!(b, crate::Block::ToolUse { .. }))
+        };
+        if end.constraint_incomplete || (self.forced_call && !called()) {
+            return Some(Breach::Incomplete);
+        }
+        if let Some(mismatch) = self.schema_mismatch(blocks) {
+            return Some(Breach::Schema(mismatch));
+        }
+        (self.deferred_answer && end.deferred_unfired && !called())
+            .then_some(Breach::Unfired)
     }
-    let schema = output_config::json_schema(prompt)?;
-    let text: String = blocks
-        .iter()
-        .filter_map(|block| match block {
-            crate::Block::Text { text, .. } => Some(text.as_ref()),
-            _ => None,
-        })
-        .collect();
-    crate::schema_check::check_text(schema, &text).err()
+
+    /// The first way `blocks` break a schema their constraint promised —
+    /// the post-generation backstop behind
+    /// [`SessionError::SchemaViolation`].
+    fn schema_mismatch(
+        &self,
+        blocks: &[crate::Block],
+    ) -> Option<crate::SchemaMismatch> {
+        let calls = || {
+            blocks.iter().filter_map(|block| match block {
+                crate::Block::ToolUse { call } => Some(call),
+                _ => None,
+            })
+        };
+        if let Some(mismatch) = calls().find_map(|call| {
+            let (_, schema) = self
+                .strict_tools
+                .iter()
+                .find(|(name, _)| *name == call.name)?;
+            crate::schema_check::check(schema, &call.input).err()
+        }) {
+            return Some(mismatch);
+        }
+        if self.forced_call || calls().next().is_some() {
+            return None;
+        }
+        let schema = self.output_schema.as_ref()?;
+        let text: String = blocks
+            .iter()
+            .filter_map(|block| match block {
+                crate::Block::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        crate::schema_check::check_text(schema, &text).err()
+    }
 }
 
 /// Resolve the single grammar (if any) that should constrain
@@ -8294,8 +8414,9 @@ fn infer_stop_reason(
 /// sequence) yields an incomplete trailing call cut short, as Anthropic
 /// returns it, instead of its bytes as text (#121). Like the batch path,
 /// it halts once the grammar is exhausted. Once drained,
-/// [`Self::stop_reason`] reports the ending the batch path would, and
-/// [`Self::open_call_json`] whether the last call was left open.
+/// [`Self::stop_reason`] reports the ending the batch path would,
+/// [`Self::open_call_json`] whether the last call was left open, and
+/// [`Self::violation`] the error the batch path would have returned.
 pub struct BlockStream<'engine, B: Backend> {
     predictor: crate::PiecePredictor<'engine, B>,
     /// Re-parse-per-tick streaming parser over the session dialect
@@ -8314,12 +8435,15 @@ pub struct BlockStream<'engine, B: Backend> {
     /// Pieces of content generated, for the `MaxTokens` fallback.
     generated: usize,
     max_tokens: NonZeroUsize,
-    /// Whether a [`Block::ToolUse`](crate::Block::ToolUse) was yielded.
-    tool_use: bool,
-    /// The last block yielded.
-    last: Option<crate::Block>,
+    /// Every block yielded so far: the ending and the end-of-turn checks
+    /// judge the whole turn.
+    yielded: Vec<crate::Block>,
     /// Set once drained: see [`Self::stop_reason`].
     stop: Option<(Option<misanthropic::response::StopReason>, Option<String>)>,
+    /// What the turn owes its constraints, judged once drained.
+    contract: TurnContract,
+    /// Set once drained: see [`Self::violation`].
+    violation: Option<SessionError>,
 }
 
 impl<'engine, B: Backend> BlockStream<'engine, B> {
@@ -8349,6 +8473,20 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         self.drained.then(|| self.filter.open_call_json()).flatten()
     }
 
+    /// Once drained, the error the batch path would have returned
+    /// instead of this turn — a [`SessionError::GrammarViolation`] (a
+    /// constraint left mid-structure, a forced call that never came, or a
+    /// deferred output_config grammar that never activated) or a
+    /// [`SessionError::SchemaViolation`] — judged by the same rules, a
+    /// cut turn included (#121). `None` before then, and for a turn that
+    /// stands. The blocks have been yielded either way: a caller holding
+    /// a structured-output or `strict` promise discards them on `Some`
+    /// and resamples, as for the batch error. Not checked here: the
+    /// batch path's [`SessionError::EmittedSpecialToken`] containment.
+    pub fn violation(&self) -> Option<&SessionError> {
+        self.violation.as_ref()
+    }
+
     /// End of generation: flush, pick the leniency, settle the ending.
     fn drain(&mut self) {
         self.drained = true;
@@ -8367,21 +8505,40 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
             .hit()
             .map(|s| Cut::StopSequence(s.to_owned()))
             .or(budget);
-        // The ending needs the yields still queued, not just the
-        // yielded ones.
-        let tool_use = self.tool_use
-            || self
-                .pending
-                .iter()
-                .any(|b| matches!(b, crate::Block::ToolUse { .. }));
-        let last = self.pending.back().or(self.last.as_ref());
+        // The ending and the checks need the yields still queued, not
+        // just the yielded ones.
+        let turn: Vec<crate::Block> =
+            self.yielded.iter().chain(&self.pending).cloned().collect();
+        let end = TurnEnd {
+            cut: cut.is_some(),
+            constraint_incomplete: self
+                .predictor
+                .constraint_incomplete_at_end(),
+            deferred_unfired: self
+                .predictor
+                .sampler_state()
+                .deferred_inactive()
+                == Some(true),
+        };
+        let breach = self.contract.breach(&turn, end);
         self.stop = Some(infer_stop_reason(
-            tool_use,
-            last,
+            turn.iter()
+                .any(|b| matches!(b, crate::Block::ToolUse { .. })),
+            turn.last(),
             cut,
             self.generated,
             self.max_tokens,
         ));
+        let partial_output = crate::prompt::Content(turn);
+        self.violation = breach.map(|breach| match breach {
+            Breach::Incomplete | Breach::Unfired => {
+                SessionError::GrammarViolation { partial_output }
+            }
+            Breach::Schema(mismatch) => SessionError::SchemaViolation {
+                mismatch,
+                partial_output,
+            },
+        });
     }
 }
 
@@ -8391,8 +8548,7 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(block) = self.pending.pop_front() {
-                self.tool_use |= matches!(block, crate::Block::ToolUse { .. });
-                self.last = Some(block.clone());
+                self.yielded.push(block.clone());
                 return Some(block);
             }
             if self.drained {
@@ -10296,6 +10452,14 @@ mod tests {
         }
     }
 
+    /// [`TurnContract::schema_mismatch`] for `prompt`.
+    fn schema_mismatch(
+        prompt: &Prompt,
+        blocks: &[crate::Block],
+    ) -> Option<crate::SchemaMismatch> {
+        TurnContract::of(prompt, None).schema_mismatch(blocks)
+    }
+
     /// The schema backstop (`schema_mismatch`) on the 2026-10-01 bodies,
     /// as `run_call` sees them parsed: whatever let them through the
     /// grammar, they must not come back as an answer.
@@ -10386,6 +10550,109 @@ mod tests {
         };
         assert!(schema_mismatch(&forced, &[Block::text("prose".to_owned())])
             .is_none());
+    }
+
+    /// A deferred grammar that never fired breaks the contract only when
+    /// it is the output_config's — the answer ran free — never the Auto
+    /// tool-call lazy grammar's, where not calling is legal. A cut turn
+    /// breaks nothing (#121), and a call is not the structured answer.
+    #[test]
+    fn unfired_deferred_grammar_breaks_only_an_output_config_turn() {
+        use crate::Block;
+        let deferred = crate::DeferredGrammar {
+            grammar: crate::CompiledGrammar::parse(r#"root ::= "x""#).unwrap(),
+            activate_after: vec![b"</think>".to_vec()],
+            feed_trigger: false,
+        };
+        let unfired = TurnEnd {
+            cut: false,
+            constraint_incomplete: false,
+            deferred_unfired: true,
+        };
+        let answer = [Block::text(ROLE_CONSENT_VALID.to_owned())];
+        let structured = Prompt::default().json_schema(role_consent_schema());
+        let contract = TurnContract::of(&structured, Some(&deferred));
+        assert!(matches!(
+            contract.breach(&answer, unfired),
+            Some(Breach::Unfired)
+        ));
+        // The schema says where, when the free body broke it too.
+        let broken = [Block::text(ROLE_CONSENT_STRAY_DOLLAR.to_owned())];
+        assert!(matches!(
+            contract.breach(&broken, unfired),
+            Some(Breach::Schema(_))
+        ));
+        let cut = TurnEnd {
+            cut: true,
+            ..unfired
+        };
+        assert!(contract.breach(&answer, cut).is_none());
+        let fired = TurnEnd {
+            deferred_unfired: false,
+            ..unfired
+        };
+        assert!(contract.breach(&answer, fired).is_none());
+        // The Auto lazy grammar: no output_config, no promise to fire.
+        let auto = TurnContract::of(&Prompt::default(), Some(&deferred));
+        assert!(auto.breach(&answer, unfired).is_none());
+        // The unified output_config grammar has no trigger to miss.
+        let unified = TurnContract::of(&structured, None);
+        assert!(unified.breach(&answer, unfired).is_none());
+    }
+
+    /// End to end over the scripted mock (ChatML, thinking in
+    /// `<think>…</think>`): with thinking on, an output_config
+    /// answer written without the thought never activates its deferred
+    /// grammar, so it ran unconstrained — refused by `complete_response`
+    /// and reported by the drained stream, as a schema violation when the
+    /// free body breaks the schema and a grammar violation when it
+    /// happens not to. The same answer after a thought stands on both
+    /// paths.
+    #[test]
+    fn unconstrained_output_config_answers_are_refused_on_both_paths() {
+        use misanthropic::prompt::thinking::Thinking;
+        let prompt = Prompt::default()
+            .add_message((misanthropic::prompt::message::Role::User, "x?"))
+            .unwrap()
+            .json_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"],
+            }))
+            .thinking(Thinking::Enabled {
+                budget_tokens: NonZeroU32::new(1024).unwrap(),
+                display: None,
+            });
+        type Verdict = Option<&'static str>;
+        let name = |e: &SessionError| match e {
+            SessionError::GrammarViolation { .. } => "grammar",
+            SessionError::SchemaViolation { .. } => "schema",
+            other => panic!("unexpected error: {other}"),
+        };
+        let cases: [(&str, Verdict); 3] = [
+            (r#"{"x":1}"#, Some("grammar")),
+            (r#"{"y":1}"#, Some("schema")),
+            (r#"<think>hm</think>{"x":1}"#, None),
+        ];
+        for (script, want) in cases {
+            let batch = mock::scripted(script).complete_response(&prompt);
+            assert_eq!(
+                batch.as_ref().err().map(name),
+                want,
+                "batch, {script:?}: {:?}",
+                batch.as_ref().ok()
+            );
+
+            let mut session = mock::scripted(script);
+            let mut stream = session.complete_stream(&prompt).expect("stream");
+            assert!(stream.violation().is_none(), "nothing judged yet");
+            let blocks: Vec<_> = stream.by_ref().collect();
+            assert_eq!(
+                stream.violation().map(name),
+                want,
+                "stream, {script:?}: {blocks:?}"
+            );
+        }
     }
 
     /// The output_config grammar for `prompt` on `dialect`, as `Session`
@@ -12557,6 +12824,26 @@ mod tests {
             pub(super) missing: Vec<i32>,
             /// Every `(seq, pos)` restore asked for, in order.
             pub(super) restores: Vec<(i32, i32)>,
+            /// The generation to script, byte by byte, then EOS: each
+            /// prefill restarts it and each step advances it. Empty:
+            /// flat logits.
+            pub(super) script: Vec<Token>,
+            cursor: usize,
+        }
+
+        impl MockDecoder {
+            /// Logits for the scripted token at the cursor, or flat ones
+            /// when nothing is scripted.
+            fn scripted(&mut self) -> &[f32] {
+                self.logits.clear();
+                self.logits.resize(N_VOCAB, 0.0);
+                if !self.script.is_empty() {
+                    let next =
+                        self.script.get(self.cursor).copied().unwrap_or(EOS);
+                    self.logits[next as usize] = 30.0;
+                }
+                &self.logits
+            }
         }
 
         #[derive(Debug, thiserror::Error)]
@@ -12572,8 +12859,8 @@ mod tests {
                 _: usize,
                 _: i32,
             ) -> Result<&[f32], MockError> {
-                self.logits.resize(N_VOCAB, 0.0);
-                Ok(&self.logits)
+                self.cursor = 0;
+                Ok(self.scripted())
             }
             fn step(
                 &mut self,
@@ -12581,8 +12868,8 @@ mod tests {
                 _: usize,
                 _: i32,
             ) -> Result<&[f32], MockError> {
-                self.logits.resize(N_VOCAB, 0.0);
-                Ok(&self.logits)
+                self.cursor += 1;
+                Ok(self.scripted())
             }
             fn n_ctx(&self) -> u32 {
                 4096
@@ -12678,6 +12965,23 @@ mod tests {
             fn eog_tokens(&self) -> Vec<Token> {
                 vec![EOS]
             }
+        }
+
+        /// A cache-enabled session over the mock that generates
+        /// `script`'s bytes, then EOS, in a dialect that thinks in
+        /// `<think>…</think>` (as cogito does on ChatML).
+        pub(super) fn scripted(script: &str) -> super::Session<MockBackend> {
+            use crate::dialect::{ReasoningMode, ReasoningSyntax};
+            let mut session = session(&[]);
+            session.engine.decoder.script =
+                script.bytes().map(Token::from).collect();
+            session.dialect.reasoning = ReasoningSyntax {
+                mode: ReasoningMode::TagBased,
+                start: "<think>".into(),
+                end: "</think>".into(),
+                ..ReasoningSyntax::default()
+            };
+            session
         }
 
         /// A cache-enabled session over the mock, its restores
