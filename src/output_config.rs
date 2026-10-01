@@ -28,12 +28,16 @@
 //! Where the JSON body sits is the chat format's business, so the
 //! grammar follows [`OutputConfigOptions::framing`], which `Session`
 //! fills from its dialect on every call. [`ResponseFraming::Bare`] is
-//! the `<think>…</think>`-then-JSON shape above;
+//! the thought-then-JSON shape above, its thought spelled with the
+//! dialect's own markers ([`OutputConfigOptions::thought_open`] /
+//! [`OutputConfigOptions::thought_close`]: `<think>…</think>`, Gemma 4's
+//! `<|channel>thought…<channel|>`, Mistral 4's `[THINK]…[/THINK]`);
 //! [`ResponseFraming::Harmony`] puts the body in gpt-oss's final
 //! channel. A grammar framed for the wrong format does not merely
 //! constrain badly — a phase-split trigger the model never writes
 //! leaves the body unconstrained (2026-10-01: gpt-oss returned invalid
-//! JSON with a 200, because `</think>` never fired).
+//! JSON with a 200, because `</think>` never fired; Gemma 4 and
+//! Mistral 4 never write it either).
 //!
 //! [`OutputConfig`]: misanthropic::prompt::output::OutputConfig
 //! [`Prompt`]: crate::Prompt
@@ -45,15 +49,17 @@ use misanthropic::prompt::output::{OutputConfig, OutputFormat};
 
 use crate::dialect::harmony;
 use crate::grammar_compile::{
-    emit_think_body_rules, emit_thought_rules, emit_until_rules,
-    escape_for_gbnf_string, schema_to_gbnf, JSON_GRAMMAR,
+    emit_until_rules, escape_for_gbnf_string, schema_to_gbnf, JSON_GRAMMAR,
 };
 use crate::{DeferredGrammar, GrammarError, Prompt, SamplingMode};
 
-/// Byte sequence that triggers deferred-grammar promotion when
-/// [`OutputConfigOptions::phase_split`] is on. Matches the closing tag of
-/// the thought preamble emitted by reasoning models.
+/// The default [`OutputConfigOptions::thought_close`], and so the default
+/// [`ResponseFraming::Bare`] phase-split trigger: the `</think>` that
+/// cogito, Qwen and DeepSeek-R1 close their thoughts with.
 pub const THINK_CLOSE_TRIGGER: &[u8] = b"</think>";
+
+/// The default [`OutputConfigOptions::thought_open`].
+pub const THINK_OPEN: &str = "<think>";
 
 /// The [`ResponseFraming::Harmony`] phase-split trigger: the final
 /// channel's header up to the channel name. What follows it — an
@@ -65,8 +71,10 @@ pub const HARMONY_FINAL_TRIGGER: &str = "<|channel|>final";
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResponseFraming {
-    /// The body follows an optional `<think>…</think>` thought (cogito,
-    /// Qwen, DeepSeek-R1) or starts the response.
+    /// The body follows an optional thought (cogito, Qwen and
+    /// DeepSeek-R1's `<think>…</think>`, or the dialect's own markers —
+    /// see [`OutputConfigOptions::thought_close`]) or starts the
+    /// response.
     #[default]
     Bare,
     /// OpenAI Harmony (gpt-oss): the generation prompt ends at
@@ -88,7 +96,8 @@ pub struct OutputConfigOptions {
     pub allow_thought: bool,
     /// When `true` *and* `allow_thought` is also `true`, compile the
     /// grammar as a JSON-only body and return a [`DeferredGrammar`]
-    /// triggered by `</think>` instead of a single unified grammar. The
+    /// triggered by the thought's close ([`Self::thought_close`], or
+    /// Harmony's final channel) instead of a single unified grammar. The
     /// caller (typically `TokenPredictor`) runs unconstrained during the
     /// thought preamble and only activates the JSON grammar once the
     /// trigger fires — which restores pure-inference tok/s during the
@@ -108,6 +117,21 @@ pub struct OutputConfigOptions {
     /// format, filled by `Session` from its dialect on every call, like
     /// [`Self::thought_separator`].
     pub framing: ResponseFraming,
+    /// How a [`ResponseFraming::Bare`] thought opens (default `<think>`)
+    /// — the dialect's measured
+    /// [`ReasoningSyntax::start`](crate::dialect::ReasoningSyntax::start)
+    /// when it has one, filled by `Session` like [`Self::thought_separator`].
+    /// Empty: the format only closes thoughts. Unused by
+    /// [`ResponseFraming::Harmony`], whose channels are its own.
+    pub thought_open: String,
+    /// How a [`ResponseFraming::Bare`] thought closes (default
+    /// `</think>`), whitespace-trimmed as the parser reads it: the
+    /// dialect's [`ReasoningSyntax::end`](crate::dialect::ReasoningSyntax::end)
+    /// when it has one, filled by `Session`. It is also the phase-split
+    /// trigger, so it must be the closer the model writes — `</think>`
+    /// for a Gemma 4 or Mistral 4 left their bodies unconstrained. Empty
+    /// stands for the default.
+    pub thought_close: String,
 }
 
 impl Default for OutputConfigOptions {
@@ -117,6 +141,9 @@ impl Default for OutputConfigOptions {
             phase_split: true,
             thought_separator: None,
             framing: ResponseFraming::Bare,
+            thought_open: THINK_OPEN.to_string(),
+            thought_close: String::from_utf8_lossy(THINK_CLOSE_TRIGGER)
+                .into_owned(),
         }
     }
 }
@@ -130,6 +157,22 @@ impl OutputConfigOptions {
             Some(sep) => format!(r#" "{}""#, escape_for_gbnf_string(sep)),
             None => " ws".to_string(),
         }
+    }
+
+    /// [`Self::thought_close`], the default standing in for an empty
+    /// one: a thought must close on *something*.
+    fn close(&self) -> &str {
+        match self.thought_close.as_str() {
+            "" => "</think>",
+            close => close,
+        }
+    }
+
+    /// Emit `thought_close`: a thought's body through [`Self::close`],
+    /// which it contains nowhere else — the shape the tool grammars give
+    /// a thought (`dialect::emit`).
+    fn emit_thought_close(&self, out: &mut String) {
+        emit_until_rules("thought_close", self.close(), out);
     }
 }
 
@@ -176,7 +219,7 @@ pub fn grammar_for_output_config(
 }
 
 /// Compile an [`OutputConfig`] into a [`CompiledOutputConfig`] that either
-/// holds a single unified grammar or a `</think>`-triggered
+/// holds a single unified grammar or a thought-close-triggered
 /// [`DeferredGrammar`], depending on `opts.phase_split` and
 /// `opts.allow_thought`. Phase-split applies only when both are `true`.
 ///
@@ -200,7 +243,7 @@ pub fn compile_output_config(
     if opts.phase_split && opts.allow_thought {
         let source = build_json_only_grammar_source(schema, opts);
         let trigger = match opts.framing {
-            ResponseFraming::Bare => THINK_CLOSE_TRIGGER,
+            ResponseFraming::Bare => opts.close().as_bytes(),
             ResponseFraming::Harmony => HARMONY_FINAL_TRIGGER.as_bytes(),
         };
         Ok(CompiledOutputConfig::Deferred(DeferredGrammar {
@@ -336,15 +379,19 @@ pub(crate) fn build_grammar_source(
         // grammars' `EagerThoughtPreOpened` precedent — a caller
         // cannot forbid a thought the render already started.
         let after = opts.after_thought();
-        let _ = writeln!(
-            src,
-            r#"root ::= think_body "</think>"{after} output_schema"#
-        );
-        emit_think_body_rules(&mut src);
+        let _ = writeln!(src, "root ::= thought_close{after} output_schema");
+        opts.emit_thought_close(&mut src);
     } else if opts.allow_thought {
         let after = opts.after_thought();
-        let _ = writeln!(src, "root ::= ( thought{after} | ws ) output_schema");
-        emit_thought_rules(&mut src);
+        let open = match opts.thought_open.as_str() {
+            "" => String::new(),
+            open => format!(r#""{}" "#, escape_for_gbnf_string(open)),
+        };
+        let _ = writeln!(
+            src,
+            "root ::= ( {open}thought_close{after} | ws ) output_schema"
+        );
+        opts.emit_thought_close(&mut src);
     } else {
         let _ = writeln!(src, "root ::= ws output_schema");
     }
@@ -355,7 +402,7 @@ pub(crate) fn build_grammar_source(
 }
 
 /// Emit the JSON-only grammar used by the deferred / phase-split path.
-/// Root starts right after the `</think>` trigger, so it opens with the
+/// Root starts right after the thought-close trigger, so it opens with the
 /// thought separator; thought rules are omitted entirely because
 /// `TokenPredictor` doesn't run the matcher during the thought preamble.
 pub(crate) fn build_json_only_grammar_source(
@@ -583,7 +630,7 @@ mod tests {
         let source = state.source().to_string();
         assert!(source.contains("output_schema"));
         assert!(
-            !source.contains("think_body"),
+            !source.contains("thought_close"),
             "phase-split grammar must omit thought rules: {source}"
         );
         // …and indeed parses bare JSON as a sanity check.
@@ -610,7 +657,7 @@ mod tests {
             panic!("expected Single(Grammar) variant");
         };
         let source = state.source().to_string();
-        assert!(source.contains("think_body"));
+        assert!(source.contains("thought_close"));
     }
 
     #[test]

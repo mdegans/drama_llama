@@ -89,10 +89,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `harmony_output_config_rejects_the_live_bodies_by_token`, which
   drives the sampler's own legality checks over gpt-oss's real
   tokenizer (`vocab_only`, `#[ignore]`d) and fails on the old framing.
-  Other dialects keep the `</think>` trigger; one whose model writes a
-  different closer (Gemma 4's `<channel|>`, Mistral 4's `[/THINK]`) is
-  still unconstrained with thinking on; its *invalid* output is now
-  caught by the schema backstop (Added) rather than answered.
+- **Gemma 4 and Mistral 4 structured output is constrained with
+  thinking on.** The same hole as gpt-oss's, one dialect over: the
+  phase-split trigger was `</think>` for every non-Harmony dialect, and
+  Gemma 4 closes its thought with `<channel|>`, Mistral 4 with
+  `[/THINK]`, so their json_schema bodies ran unconstrained. The
+  trigger is now the dialect's own closer, whitespace-trimmed as the
+  parser reads it (`OutputConfigOptions::thought_open` /
+  `thought_close`, filled by `Session` from the dialect's reasoning
+  markers like the separator), and the unified grammar's optional
+  thought is spelled in the same markers — its body now runs to the
+  closer, so a thought may contain a `</` that is not one. Qwen and
+  cogito keep `</think>`; a dialect that measured no reasoning markers
+  keeps `<think>…</think>`. Thinking off needed no fix: neither format
+  frames its content, so the unified grammar's `{` first is right.
+  Reproduced at the byte level on the live gpt-oss bodies
+  (`tagged_reasoning_output_config_constrains_the_body`, red on the old
+  trigger).
 
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an

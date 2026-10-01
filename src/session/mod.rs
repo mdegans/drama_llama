@@ -7861,16 +7861,31 @@ fn resolve_grammar(
         );
         return Ok(Some(crate::CompiledOutputConfig::Single(g)));
     }
-    // The separator and the framing are the template's, never the
-    // caller's to choose. A framing that misses the dialect is not a
-    // loose constraint but none at all: Harmony never writes the Bare
-    // phase-split trigger (`</think>`), so its JSON ran unconstrained
-    // and came back invalid with a 200 (Agora, 2026-10-01).
+    // The separator, the framing and the thought markers are the
+    // template's, never the caller's to choose. A framing that misses
+    // the dialect is not a loose constraint but none at all: Harmony
+    // never writes the Bare phase-split trigger (`</think>`), so its
+    // JSON ran unconstrained and came back invalid with a 200 (Agora,
+    // 2026-10-01) — and neither do Gemma 4 (`<channel|>`) or Mistral 4
+    // (`[/THINK]`). A dialect that measured no reasoning markers keeps
+    // `<think>…</think>`, the habit of the models behind it (cogito).
+    let reasoning = &dialect.reasoning;
+    let tagged = reasoning.mode != crate::dialect::ReasoningMode::None
+        && !reasoning.end.trim().is_empty();
+    let defaults = OutputConfigOptions::default();
     let output_config_opts = OutputConfigOptions {
-        thought_separator: dialect.reasoning.separator.clone(),
+        thought_separator: reasoning.separator.clone(),
         framing: match dialect.family {
             crate::dialect::Family::Harmony => crate::ResponseFraming::Harmony,
             _ => crate::ResponseFraming::Bare,
+        },
+        thought_open: match tagged {
+            true => reasoning.start.clone(),
+            false => defaults.thought_open,
+        },
+        thought_close: match tagged {
+            true => reasoning.end.trim().to_string(),
+            false => defaults.thought_close,
         },
         ..output_config_opts.clone()
     };
@@ -10010,7 +10025,7 @@ mod tests {
         };
         let source = state.source().to_string();
         assert!(source.contains("output_schema"));
-        assert!(source.contains("think_body"));
+        assert!(source.contains("thought_close"));
     }
 
     /// Both tool_choice and output_config set → tool_choice wins.
@@ -10371,6 +10386,121 @@ mod tests {
         };
         assert!(schema_mismatch(&forced, &[Block::text("prose".to_owned())])
             .is_none());
+    }
+
+    /// The output_config grammar for `prompt` on `dialect`, as `Session`
+    /// resolves it (no forced tool, render not pre-opened).
+    fn output_config_grammar(
+        prompt: &Prompt,
+        dialect: &crate::CallSyntax,
+    ) -> crate::CompiledOutputConfig {
+        resolve_grammar(prompt, dialect, &OutputConfigOptions::default(), false)
+            .expect("resolve")
+            .expect("output_config grammar")
+    }
+
+    /// The role-consent prompt with thinking on and off.
+    fn role_consent_prompts() -> [(&'static str, Prompt); 2] {
+        use misanthropic::prompt::thinking::Thinking;
+        let off = Prompt::default().json_schema(role_consent_schema());
+        let on = off.clone().thinking(Thinking::Enabled {
+            budget_tokens: NonZeroU32::new(1024).unwrap(),
+            display: None,
+        });
+        [("on", on), ("off", off)]
+    }
+
+    /// [`harmony_output_config_constrains_the_final_body`]'s sibling hole:
+    /// every reasoning dialect whose thought does not close with
+    /// `</think>` got the same hardcoded `</think>` trigger, so with
+    /// thinking on Gemma 4 (`…\n<channel|>`) and Mistral 4 (`[/THINK]`)
+    /// wrote their json_schema bodies unconstrained. The trigger is the
+    /// dialect's own closer now. The live gpt-oss bodies stand in for
+    /// what an unconstrained body can be: unreachable after a thought in
+    /// the dialect's markers, thinking on (deferred) and off (unified,
+    /// where the body may also come first — neither format frames
+    /// content), while the valid body stays reachable and complete.
+    #[test]
+    fn tagged_reasoning_output_config_constrains_the_body() {
+        let mistral = crate::dialect::analyze_template(
+            crate::baked::MISTRAL4.replacement,
+            "<s>",
+            "</s>",
+        )
+        .expect("analyze the baked Mistral 4 template");
+        assert_eq!(
+            (
+                mistral.reasoning.start.as_str(),
+                mistral.reasoning.end.as_str()
+            ),
+            ("[THINK]", "[/THINK]"),
+            "precondition: {mistral:#?}"
+        );
+        let cases = [
+            (
+                "gemma4",
+                crate::CallSyntax::gemma4(),
+                "<|channel>thought\nNothing to change.\n<channel|>",
+            ),
+            ("mistral4", mistral, "[THINK]Nothing to change.[/THINK]"),
+        ];
+        for (name, dialect, thought) in cases {
+            for (label, prompt) in role_consent_prompts() {
+                let compiled = output_config_grammar(&prompt, &dialect);
+                let prefixes: &[&str] = match label {
+                    "on" => &[thought],
+                    _ => &["", thought],
+                };
+                for prefix in prefixes {
+                    let at = format!("{name}, thinking {label}, {prefix:?}");
+                    for bad in
+                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
+                    {
+                        let emission = format!("{prefix}{bad}");
+                        assert_eq!(
+                            constraint_admits(&compiled, &emission),
+                            None,
+                            "{at}: invalid body must be rejected: {emission}"
+                        );
+                    }
+                    let good = format!("{prefix}{ROLE_CONSENT_VALID}");
+                    assert_eq!(
+                        constraint_admits(&compiled, &good),
+                        Some(true),
+                        "{at}: valid body must be admitted and complete: \
+                         {good}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `</think>` dialects keep `</think>`: Qwen 3.8 (whose measured
+    /// end is `\n</think>`, trimmed as the parser reads it) and cogito,
+    /// whose template measures no reasoning markers at all.
+    #[test]
+    fn think_dialects_keep_the_think_close_trigger() {
+        let qwen = crate::dialect::analyze_template(
+            crate::baked::QWEN38.replacement,
+            "",
+            "<|im_end|>",
+        )
+        .expect("analyze Qwen 3.8");
+        let cogito = crate::dialect::analyze_template(
+            crate::baked::COGITO.replacement,
+            "",
+            "<|im_end|>",
+        )
+        .expect("analyze cogito");
+        let [(_, thinking_on), _] = role_consent_prompts();
+        for (name, dialect) in [("qwen3.8", qwen), ("cogito", cogito)] {
+            let crate::CompiledOutputConfig::Deferred(d) =
+                output_config_grammar(&thinking_on, &dialect)
+            else {
+                panic!("{name}: thinking on defers");
+            };
+            assert_eq!(d.activate_after, [b"</think>".to_vec()], "{name}");
+        }
     }
 
     /// Drive `emission` through `compiled` token by token the way
