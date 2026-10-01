@@ -5768,6 +5768,11 @@ impl<B: Backend> Session<B> {
             .unwrap_or(effective_cache_read.entry);
         let suffix_start = last_bp_entry.max(trailing_start);
 
+        // Strictly above the restored anchor: `restore_to` leaves the
+        // anchor it landed on restorable (llama.cpp re-checkpoints one
+        // it rewound to by truncation), and checkpointing it here again
+        // would cost moeflux, or a forced whole snapshot, a copy of the
+        // whole state on every call.
         let checkpoint_at: std::collections::BTreeMap<usize, usize> =
             new_breakpoints
                 .iter()
@@ -13921,7 +13926,16 @@ mod tests {
                     self.kv_end as i32 - 1
                 }
             }
+            /// Only the head can be checkpointed — llama.cpp skips any
+            /// other position (see `llama_cpp::checkpoint`), so a
+            /// `Session` change that checkpoints off the head must fail
+            /// here, not pass the mock and lose the anchor live.
             fn checkpoint_pos(&mut self, seq_id: i32, pos: i32) {
+                assert_eq!(
+                    pos as usize, self.kv_end,
+                    "checkpoint at {pos} off the head {}",
+                    self.kv_end,
+                );
                 self.checkpoints.push((seq_id, pos));
             }
             fn restore_to(
@@ -13933,6 +13947,7 @@ mod tests {
                 if self.missing.contains(&pos) {
                     Err(MemoryRmError::NoCheckpoint { pos })
                 } else {
+                    self.kv_end = pos as usize;
                     Ok(())
                 }
             }

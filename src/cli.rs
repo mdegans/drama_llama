@@ -148,6 +148,17 @@ pub struct BackendArgs {
     #[arg(long)]
     pub swa_full: bool,
 
+    /// Host RAM, in MiB, the prefix-cache checkpoints of all slots may
+    /// hold (sliding-window and hybrid models). Default 8192.
+    /// llama-cpp only.
+    #[arg(long)]
+    pub checkpoint_mib: Option<u32>,
+
+    /// Host RAM, in MiB, any one slot's checkpoints may hold. Default
+    /// 4096. llama-cpp only.
+    #[arg(long)]
+    pub checkpoint_slot_mib: Option<u32>,
+
     /// Read the experts as the 2-bit packed layout. moeflux only.
     #[arg(long)]
     pub use_2bit: bool,
@@ -164,6 +175,8 @@ impl Default for BackendArgs {
             n_ctx: DEFAULT_N_CTX,
             cache_slots: None,
             swa_full: false,
+            checkpoint_mib: None,
+            checkpoint_slot_mib: None,
             use_2bit: false,
         }
     }
@@ -205,6 +218,8 @@ impl TryFrom<&BackendArgs> for crate::LlamaCppOptions {
             n_ctx: Some(args.n_ctx),
             cache_slots: args.cache_slots,
             swa_full: args.swa_full.then_some(true),
+            checkpoint_mib: args.checkpoint_mib,
+            checkpoint_slot_mib: args.checkpoint_slot_mib,
             ..Self::default()
         })
     }
@@ -232,6 +247,12 @@ impl TryFrom<&BackendArgs> for crate::MoefluxOptions {
         if args.swa_full {
             flags.push("--swa-full");
         }
+        if args.checkpoint_mib.is_some() {
+            flags.push("--checkpoint-mib");
+        }
+        if args.checkpoint_slot_mib.is_some() {
+            flags.push("--checkpoint-slot-mib");
+        }
         if !flags.is_empty() {
             return Err(UnsupportedOptions {
                 backend: <crate::MoefluxBackend as crate::Backend>::NAME,
@@ -254,6 +275,8 @@ mod tests {
             n_ctx: DEFAULT_N_CTX,
             cache_slots: None,
             swa_full: false,
+            checkpoint_mib: None,
+            checkpoint_slot_mib: None,
             use_2bit: false,
         }
     }
@@ -281,12 +304,18 @@ mod tests {
             n_ctx: 4096,
             cache_slots: Some(3),
             swa_full: true,
+            checkpoint_mib: Some(2048),
+            checkpoint_slot_mib: Some(512),
             ..args()
         })
         .expect("all are llama.cpp knobs");
         assert_eq!(opts.n_ctx, Some(4096));
         assert_eq!(opts.cache_slots, Some(3));
         assert_eq!(opts.swa_full, Some(true));
+        assert_eq!(
+            opts.checkpoint_budget(),
+            crate::CheckpointBudget::from_mib(2048, 512),
+        );
         // Unset stays unset — the options' own default decides.
         let opts = crate::LlamaCppOptions::try_from(&args()).unwrap();
         assert_eq!(opts.swa_full, None);
@@ -317,6 +346,13 @@ mod tests {
         })
         .expect_err("moeflux has no sliding-window cache");
         assert_eq!(err.flags, ["--swa-full"]);
+        let err = crate::MoefluxOptions::try_from(&BackendArgs {
+            checkpoint_mib: Some(1),
+            checkpoint_slot_mib: Some(1),
+            ..args()
+        })
+        .expect_err("moeflux keeps its own snapshot cap");
+        assert_eq!(err.flags, ["--checkpoint-mib", "--checkpoint-slot-mib"]);
         assert_eq!(err.backend, "moeflux");
         assert!(err.to_string().contains("--n-ctx --cache-slots"));
     }

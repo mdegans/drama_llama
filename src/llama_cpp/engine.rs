@@ -22,14 +22,19 @@ use llama_cpp_sys_3::{
 pub type LlamaCppEngine = Engine<LlamaCppBackend>;
 
 impl LlamaCppEngine {
-    /// llama.cpp's `llama_context_default_params()` with a usable
-    /// thread count. The upstream library default is a hard-coded 4
-    /// threads (ggml's `GGML_DEFAULT_N_THREADS`, marked "TODO: better
-    /// default" upstream), which cripples CPU inference on larger
-    /// machines — every llama.cpp *runner* overrides it, and so do we.
-    /// Uses all available logical cores for both generation and batch
-    /// processing; tune after construction with
-    /// [`Self::set_n_threads`].
+    /// llama.cpp's `llama_context_default_params()` with the two
+    /// defaults every llama.cpp *runner* overrides, and so do we:
+    ///
+    /// - a usable thread count. The upstream library default is a
+    ///   hard-coded 4 threads (ggml's `GGML_DEFAULT_N_THREADS`, marked
+    ///   "TODO: better default" upstream), which cripples CPU inference
+    ///   on larger machines. Uses all available logical cores for both
+    ///   generation and batch processing; tune after construction with
+    ///   [`Self::set_n_threads`].
+    /// - a window-sized sliding-window cache (`swa_full = false`), as
+    ///   llama.cpp's server and CLI ship; the library's full-size one
+    ///   would size Gemma 4's window layers at the whole context. See
+    ///   [`LlamaCppOptions::swa_full`].
     pub fn default_context_params() -> llama_context_params {
         let mut cp = unsafe { llama_context_default_params() };
         if let Ok(n) = std::thread::available_parallelism() {
@@ -37,6 +42,7 @@ impl LlamaCppEngine {
             cp.n_threads = n;
             cp.n_threads_batch = n;
         }
+        cp.swa_full = false;
         cp
     }
 
@@ -97,12 +103,14 @@ impl LlamaCppEngine {
         path: PathBuf,
         options: LlamaCppOptions,
     ) -> Result<Self, NewError> {
-        Self::new(
+        let mut engine = Self::new(
             path,
             Some(options.model_params()),
             Some(options.context_params()),
             options.numa,
-        )
+        )?;
+        engine.set_checkpoint_budget(options.checkpoint_budget());
+        Ok(engine)
     }
 
     /// Create a new engine from a model `path`. Default model and
@@ -226,6 +234,17 @@ impl LlamaCppEngine {
     /// Number of per-sequence snapshots currently held.
     pub fn seq_snapshot_count(&self) -> usize {
         self.decoder.seq_snapshot_count()
+    }
+
+    /// Host RAM the per-sequence snapshots currently hold, in bytes.
+    pub fn seq_snapshot_bytes(&self) -> usize {
+        self.decoder.seq_snapshot_bytes()
+    }
+
+    /// Bound the host RAM the checkpoints may hold. See
+    /// [`LlamaCppDecoder::set_checkpoint_budget`](crate::LlamaCppDecoder::set_checkpoint_budget).
+    pub fn set_checkpoint_budget(&mut self, budget: crate::CheckpointBudget) {
+        self.decoder.set_checkpoint_budget(budget)
     }
 
     /// Performance information.

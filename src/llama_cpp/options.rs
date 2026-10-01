@@ -13,14 +13,17 @@
 //! where the library default (a full-size sliding-window cache) costs a
 //! sliding-window model a whole second KV cache and buys nothing the
 //! checkpoints don't. Unset there means what llama.cpp's own server and
-//! CLI ship instead. Otherwise a `Default::default()` load is
-//! byte-for-byte the load you would have got from the old `from_path`.
+//! CLI ship instead (as in [`LlamaCppEngine::default_context_params`]).
+//! The checkpoint budget fields have no llama.cpp counterpart; unset
+//! means [`CheckpointBudget::default`]. Otherwise a
+//! `Default::default()` load is byte-for-byte the load you would have
+//! got from the old `from_path`.
 
 use llama_cpp_sys_3::{
     llama_context_params, llama_model_default_params, llama_model_params,
 };
 
-use crate::llama_cpp::{FlashAttention, LlamaCppEngine};
+use crate::llama_cpp::{CheckpointBudget, FlashAttention, LlamaCppEngine};
 
 /// Load-time configuration for [`LlamaCppEngine`] and
 /// [`Session<LlamaCppBackend>`](crate::Session).
@@ -111,6 +114,19 @@ pub struct LlamaCppOptions {
     #[cfg_attr(feature = "cli", arg(long))]
     pub swa_full: Option<bool>,
 
+    /// Host RAM, in MiB, the prefix-cache checkpoints of every sequence
+    /// may hold together (sliding-window and recurrent / hybrid
+    /// models). `None` means
+    /// [`CheckpointBudget::DEFAULT_TOTAL_MIB`]. See [`CheckpointBudget`].
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub checkpoint_mib: Option<u32>,
+
+    /// Host RAM, in MiB, any one sequence's checkpoints may hold.
+    /// `None` means [`CheckpointBudget::DEFAULT_PER_SEQ_MIB`]. See
+    /// [`CheckpointBudget`].
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub checkpoint_slot_mib: Option<u32>,
+
     /// Keep every layer on the CPU. llama.cpp offloads all layers by
     /// default (`n_gpu_layers = -1`); this forces zero. Diagnostic path
     /// for isolating GPU-kernel divergence.
@@ -157,6 +173,24 @@ impl LlamaCppOptions {
     pub fn with_swa_full(mut self, swa_full: bool) -> Self {
         self.swa_full = Some(swa_full);
         self
+    }
+
+    /// Bound the checkpoints' host RAM, in MiB: `total` across every
+    /// sequence, `per_slot` for any one. See [`Self::checkpoint_mib`].
+    pub fn with_checkpoint_mib(mut self, total: u32, per_slot: u32) -> Self {
+        self.checkpoint_mib = Some(total);
+        self.checkpoint_slot_mib = Some(per_slot);
+        self
+    }
+
+    /// The [`CheckpointBudget`] these options describe.
+    pub fn checkpoint_budget(&self) -> CheckpointBudget {
+        CheckpointBudget::from_mib(
+            self.checkpoint_mib
+                .unwrap_or(CheckpointBudget::DEFAULT_TOTAL_MIB),
+            self.checkpoint_slot_mib
+                .unwrap_or(CheckpointBudget::DEFAULT_PER_SEQ_MIB),
+        )
     }
 
     /// Keep every layer on the CPU. See [`Self::no_gpu`].
@@ -245,8 +279,12 @@ mod tests {
     /// window layers at the full context (≈ 110 GiB at 131k).
     #[test]
     fn swa_cache_is_window_sized_unless_asked() {
-        let library_default = LlamaCppEngine::default_context_params();
+        // SAFETY: POD, no allocation.
+        let library_default =
+            unsafe { llama_cpp_sys_3::llama_context_default_params() };
         assert!(library_default.swa_full, "llama.cpp changed its default");
+        // `LlamaCppEngine::new(path, None, None, …)` takes these.
+        assert!(!LlamaCppEngine::default_context_params().swa_full);
         let opts = LlamaCppOptions::default();
         assert!(!opts.context_params().swa_full);
         assert!(opts.with_swa_full(true).context_params().swa_full);
@@ -278,6 +316,25 @@ mod tests {
             .context_params();
         assert_eq!(big.n_ubatch, default_ubatch);
         assert_eq!(big.n_batch, 32768);
+    }
+
+    /// Unset is the default budget; set, each bound is the caller's.
+    #[test]
+    fn checkpoint_budget_defaults_and_overrides() {
+        assert_eq!(
+            LlamaCppOptions::default().checkpoint_budget(),
+            CheckpointBudget::default(),
+        );
+        assert_eq!(
+            CheckpointBudget::default(),
+            CheckpointBudget::new(8 << 30, 4 << 30),
+        );
+        assert_eq!(
+            LlamaCppOptions::default()
+                .with_checkpoint_mib(1024, 256)
+                .checkpoint_budget(),
+            CheckpointBudget::new(1 << 30, 256 << 20),
+        );
     }
 
     #[test]

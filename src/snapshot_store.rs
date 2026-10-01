@@ -36,12 +36,14 @@ pub(crate) const SNAPSHOTS_PER_SLOT: usize =
 ///
 /// The trade-off is host RAM, `cap × (largest snapshot)`. On llama.cpp
 /// a snapshot holds only what a KV truncate cannot rewind, so its size
-/// does not grow with the prefix and the count cap is a byte cap too:
-/// the recurrent state (Qwen3.6 ≈ 63 MiB, Qwen3.8 ≈ 150 MiB) or the
-/// sliding-window cells (gpt-oss ≈ 4.5 MiB, Gemma 4 ≈ 800 MiB). At
-/// four slots that is at most 24 snapshots — ≈ 19 GiB on Gemma 4, the
-/// one model where the bound is worth watching. Eviction logs each
-/// dropped snapshot's size.
+/// does not grow with the prefix: the recurrent state (Qwen3.6 ≈ 63 MiB,
+/// Qwen3.8 ≈ 150 MiB) or the sliding-window cells (gpt-oss ≈ 4.5 MiB,
+/// Gemma 4 ≈ 800 MiB). At four slots that is at most 24 snapshots —
+/// ≈ 19 GiB on Gemma 4, more than a unified-memory Mac can spare next
+/// to the weights, so llama.cpp's store also has a byte budget
+/// ([`SnapshotStore::set_byte_limits`],
+/// [`crate::llama_cpp::checkpoint::CheckpointBudget`]). Eviction logs
+/// each dropped snapshot's size and which bound it hit.
 ///
 /// llama.cpp-only (moeflux keeps [`MAX_SEQ_SNAPSHOTS`]), hence the cfg
 /// on the lint.
@@ -61,6 +63,10 @@ pub(crate) fn cap_for_sequences(n_seq: usize) -> usize {
 /// restorable regardless of later KV mutations, while a llama.cpp
 /// *partial* checkpoint restores on top of the KV below `pos` and must
 /// be dropped as soon as that KV changes ([`Self::retain`]).
+///
+/// Three bounds, each enforced by evicting the least recently used
+/// snapshot it covers: a count ([`cap_for_sequences`]), a byte total,
+/// and bytes per sequence (unbounded until [`Self::set_byte_limits`]).
 #[derive(Debug)]
 pub(crate) struct SnapshotStore {
     map: HashMap<(i32, i32), Vec<u8>>,
@@ -69,6 +75,11 @@ pub(crate) struct SnapshotStore {
     order: VecDeque<(i32, i32)>,
     /// Eviction cap. See [`cap_for_sequences`].
     cap: usize,
+    /// Bytes across every sequence.
+    max_bytes: usize,
+    /// Bytes for any one sequence, so one busy slot cannot take the
+    /// whole budget from the others.
+    max_seq_bytes: usize,
 }
 
 impl Default for SnapshotStore {
@@ -84,42 +95,116 @@ impl SnapshotStore {
             map: HashMap::new(),
             order: VecDeque::new(),
             cap: cap.max(1),
+            max_bytes: usize::MAX,
+            max_seq_bytes: usize::MAX,
         }
     }
 
-    /// Insert (or replace) the snapshot at `key`, evicting the oldest
-    /// entries beyond the cap.
-    pub(crate) fn insert(&mut self, key: (i32, i32), bytes: Vec<u8>) {
-        if self.map.insert(key, bytes).is_some() {
-            self.order.retain(|k| *k != key);
+    /// Bound the bytes held in total and per sequence, evicting the
+    /// least recently used snapshots now if the store is already over.
+    #[cfg_attr(not(feature = "llama-cpp"), allow(dead_code))]
+    pub(crate) fn set_byte_limits(&mut self, total: usize, per_seq: usize) {
+        self.max_bytes = total;
+        self.max_seq_bytes = per_seq;
+        let seqs: Vec<i32> = self.order.iter().map(|k| k.0).collect();
+        for seq in seqs {
+            while self.seq_bytes(seq) > self.max_seq_bytes
+                && self.evict_oldest(|s| s == seq, "seq_bytes")
+            {}
         }
-        self.order.push_back(key);
-        while self.map.len() > self.cap {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            let bytes = self.map.remove(&oldest).map_or(0, |b| b.len());
-            // A restore target is gone, but not necessarily a reuse:
-            // the anchor that sat here restores through a lower one
-            // (Session's restore ladder), and Session logs what that
-            // cost if a request ever asks for it (`restore_failed`,
-            // WARN past a few hundred tokens). So INFO here.
-            tracing::info!(
+        while self.bytes() > self.max_bytes
+            && self.evict_oldest(|_| true, "bytes")
+        {}
+    }
+
+    /// Insert (or replace) the snapshot at `key`, evicting the least
+    /// recently used ones until it fits every bound. `false` when it
+    /// cannot fit at all — larger than a byte limit on its own — and
+    /// was dropped (and logged) instead; nothing else is evicted then.
+    pub(crate) fn insert(&mut self, key: (i32, i32), bytes: Vec<u8>) -> bool {
+        // A replaced snapshot's bytes stop counting against the new one.
+        self.forget(key);
+        let len = bytes.len();
+        let limit = self.max_seq_bytes.min(self.max_bytes);
+        if len > limit {
+            tracing::warn!(
                 target: "drama_llama::snapshot_store",
                 event = "cache_degrade",
-                reason = "snapshot_evicted",
-                seq_id = oldest.0,
-                pos = oldest.1,
-                bytes,
-                cap = self.cap,
-                "snapshot store over its cap of {}; dropped the oldest \
-                 snapshot (seq {}, pos {}, {} bytes)",
-                self.cap,
-                oldest.0,
-                oldest.1,
-                bytes,
+                reason = "snapshot_over_budget",
+                seq_id = key.0,
+                pos = key.1,
+                bytes = len,
+                limit,
+                "snapshot (seq {}, pos {}) is {len} bytes, over the {limit} \
+                 byte budget on its own; not stored, so a rewind there \
+                 falls to a lower anchor",
+                key.0,
+                key.1,
             );
+            return false;
         }
+        while self.seq_bytes(key.0) + len > self.max_seq_bytes
+            && self.evict_oldest(|s| s == key.0, "seq_bytes")
+        {}
+        while self.bytes() + len > self.max_bytes
+            && self.evict_oldest(|_| true, "bytes")
+        {}
+        self.map.insert(key, bytes);
+        self.order.push_back(key);
+        while self.map.len() > self.cap && self.evict_oldest(|_| true, "count")
+        {
+        }
+        true
+    }
+
+    /// Evict the least recently used snapshot whose sequence matches
+    /// `seq`, logging which `bound` forced it. `false` when none does.
+    fn evict_oldest(
+        &mut self,
+        mut seq: impl FnMut(i32) -> bool,
+        bound: &'static str,
+    ) -> bool {
+        let Some(at) = self.order.iter().position(|k| seq(k.0)) else {
+            return false;
+        };
+        let oldest = self.order.remove(at).expect("position is in range");
+        let bytes = self.map.remove(&oldest).map_or(0, |b| b.len());
+        // A restore target is gone, but not necessarily a reuse: the
+        // anchor that sat here restores through a lower one (Session's
+        // restore ladder), and Session logs what that cost if a request
+        // ever asks for it (`restore_failed`, WARN past a few hundred
+        // tokens). So INFO here.
+        tracing::info!(
+            target: "drama_llama::snapshot_store",
+            event = "cache_degrade",
+            reason = "snapshot_evicted",
+            seq_id = oldest.0,
+            pos = oldest.1,
+            bytes,
+            bound,
+            cap = self.cap,
+            max_bytes = self.max_bytes,
+            max_seq_bytes = self.max_seq_bytes,
+            "snapshot store over its {bound} bound; dropped the least \
+             recently used snapshot (seq {}, pos {}, {bytes} bytes)",
+            oldest.0,
+            oldest.1,
+        );
+        true
+    }
+
+    /// Bytes held across every sequence.
+    pub(crate) fn bytes(&self) -> usize {
+        self.map.values().map(Vec::len).sum()
+    }
+
+    /// Bytes held for `seq`.
+    fn seq_bytes(&self, seq: i32) -> usize {
+        self.map
+            .iter()
+            .filter(|((s, _), _)| *s == seq)
+            .map(|(_, b)| b.len())
+            .sum()
     }
 
     /// Borrow the snapshot at `key`, if any, refreshing its LRU
@@ -134,11 +219,19 @@ impl SnapshotStore {
         allow(dead_code)
     )]
     pub(crate) fn get(&mut self, key: (i32, i32)) -> Option<&Vec<u8>> {
-        if self.map.contains_key(&key) {
-            self.order.retain(|k| *k != key);
-            self.order.push_back(key);
-        }
+        self.refresh(key);
         self.map.get(&key)
+    }
+
+    /// Mark the snapshot at `key` most recently used. `false` when
+    /// there is none.
+    pub(crate) fn refresh(&mut self, key: (i32, i32)) -> bool {
+        if !self.map.contains_key(&key) {
+            return false;
+        }
+        self.order.retain(|k| *k != key);
+        self.order.push_back(key);
+        true
     }
 
     /// Remove and return the snapshot at `key`, if any.
@@ -315,6 +408,62 @@ mod tests {
         assert_eq!(s.len(), MAX_SEQ_SNAPSHOTS);
         assert!(!s.contains((1, 5)), "the oldest survivor is evicted first");
         assert!(s.contains((1, 9)));
+    }
+
+    /// The byte total evicts least recently used first, across
+    /// sequences: Gemma 4's ≈ 800 MiB checkpoints would otherwise fill
+    /// a count cap of 24 with ≈ 19 GiB.
+    #[test]
+    fn snapshot_store_evicts_by_bytes_lru_first() {
+        let mut s = SnapshotStore::with_cap(64);
+        s.set_byte_limits(100, 100);
+        assert!(s.insert((0, 1), vec![0; 40]));
+        assert!(s.insert((1, 1), vec![0; 40]));
+        assert!(s.get((0, 1)).is_some(), "a read is a use");
+        assert!(s.insert((2, 1), vec![0; 40]));
+        assert!(!s.contains((1, 1)), "the least recently used goes");
+        assert!(s.contains((0, 1)) && s.contains((2, 1)));
+        assert_eq!(s.bytes(), 80);
+    }
+
+    /// One slot over its share evicts only its own snapshots — never
+    /// another slot's system anchor.
+    #[test]
+    fn snapshot_store_seq_budget_spares_other_slots() {
+        let mut s = SnapshotStore::with_cap(64);
+        s.set_byte_limits(1000, 100);
+        s.insert((1, 1), vec![0; 50]);
+        for pos in 1..=3 {
+            s.insert((0, pos), vec![0; 40]);
+        }
+        assert!(!s.contains((0, 1)), "seq 0's oldest");
+        assert!(s.contains((0, 2)) && s.contains((0, 3)));
+        assert!(s.contains((1, 1)), "older, but another slot's");
+        assert_eq!(s.seq_bytes(0), 80);
+    }
+
+    /// A snapshot over a limit on its own is refused, and costs the
+    /// others nothing; replacing a key never counts its old bytes.
+    #[test]
+    fn snapshot_store_refuses_what_cannot_fit() {
+        let mut s = SnapshotStore::with_cap(64);
+        s.set_byte_limits(100, 60);
+        s.insert((0, 1), vec![0; 50]);
+        assert!(!s.insert((1, 1), vec![0; 61]), "over the per-slot limit");
+        assert!(s.contains((0, 1)));
+        assert!(s.insert((0, 1), vec![0; 60]), "a replacement fits");
+        assert_eq!((s.len(), s.bytes()), (1, 60));
+    }
+
+    /// Lowering the limits evicts down to them at once.
+    #[test]
+    fn snapshot_store_lowered_limits_apply_now() {
+        let mut s = store_with(&[(0, 1), (0, 2), (1, 1), (1, 2)]);
+        s.set_byte_limits(usize::MAX, 4);
+        assert!(!s.contains((0, 1)) && !s.contains((1, 1)));
+        s.set_byte_limits(4, 4);
+        assert_eq!(s.len(), 1);
+        assert!(s.contains((1, 2)), "the most recent survives");
     }
 
     #[test]

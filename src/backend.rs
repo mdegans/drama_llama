@@ -162,6 +162,12 @@ pub trait Decoder: Send {
     /// a sliding-window one while the window below `pos` survives —
     /// and must fall back to the checkpoint otherwise.
     ///
+    /// On success `pos` stays restorable: a stored checkpoint survives
+    /// its own restore, and a backend that needs one there but rewound
+    /// without it takes it on the way (llama.cpp's partial checkpoints:
+    /// the head is `pos` right then). So `Session` never checkpoints
+    /// the anchor it restored to.
+    ///
     /// Returns [`MemoryRmError::NoCheckpoint`] when no snapshot
     /// exists at exactly `pos`, or
     /// [`MemoryRmError::BackendUnsupported`] when the backend cannot

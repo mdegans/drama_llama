@@ -1,6 +1,8 @@
 use crate::{
     backend::{Decoder, MemoryRmError},
-    llama_cpp::checkpoint::{Checkpointing, Checkpoints, SeqMemory},
+    llama_cpp::checkpoint::{
+        CheckpointBudget, Checkpointing, Checkpoints, SeqMemory,
+    },
     Batch, LlamaCppModel, Token,
 };
 
@@ -369,6 +371,12 @@ impl LlamaCppDecoder {
     ///
     /// Takes `&mut self` so the exclusivity the pointer implies is
     /// actually held — the same reason [`Self::decode`] does.
+    ///
+    /// Bypasses the checkpoint bookkeeping: change a sequence's memory
+    /// through it, and its partial checkpoints may describe a different
+    /// history. Follow such a change with [`Self::memory_seq_rm`] over
+    /// the range it touched (or [`Self::set_seq_snapshots`]`(false)`),
+    /// which drops them.
     pub fn context_ptr_mut(&mut self) -> *mut llama_context {
         self.context
     }
@@ -490,6 +498,18 @@ impl LlamaCppDecoder {
         self.checkpoints.len()
     }
 
+    /// Host RAM the checkpoints currently hold, in bytes.
+    pub fn seq_snapshot_bytes(&self) -> usize {
+        self.checkpoints.bytes()
+    }
+
+    /// Bound the host RAM the checkpoints may hold, evicting the least
+    /// recently used ones now if they are over it. See
+    /// [`CheckpointBudget`] for the default.
+    pub fn set_checkpoint_budget(&mut self, budget: CheckpointBudget) {
+        self.checkpoints.set_budget(budget);
+    }
+
     /// Performance information.
     pub fn get_timings(&self) -> llama_perf_context_data {
         unsafe { llama_perf_context(self.context) }
@@ -505,65 +525,86 @@ impl LlamaCppDecoder {
         unsafe { llama_set_n_threads(self.context, n_gen, n_batch) }
     }
 
-    /// Clear the KV cache.
-    pub fn memory_clear(&self) {
+    /// Clear the KV cache, and every checkpoint with it.
+    ///
+    /// This and the other `memory_*` mutators take `&mut self` and keep
+    /// the checkpoints in step with the KV: a partial checkpoint
+    /// restores on top of the KV below it, so one left behind a change
+    /// to that KV would load another history's window or recurrent
+    /// state on the next [`Decoder::restore_to`]. They are what the
+    /// [`Decoder`] impl calls; only [`Self::context_ptr_mut`] reaches
+    /// the memory around them.
+    pub fn memory_clear(&mut self) {
+        self.checkpoints.clear();
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_clear(mem, true) }
     }
 
-    /// Remove KV entries for `seq_id` in position range `[p0, p1)`.
+    /// Remove KV entries for `seq_id` in position range `[p0, p1)`
+    /// (negative bounds are unbounded; `seq_id < 0` matches every
+    /// sequence). `false` when llama.cpp refuses the range.
     ///
-    /// The raw call: it does not drop the checkpoints this removal
-    /// invalidates. Go through [`Decoder::memory_seq_rm`] (what
-    /// [`crate::Engine`] calls) on a sliding-window or recurrent model.
+    /// Drops the partial checkpoints above `p0` first — even when the
+    /// range is refused: that costs at most a checkpoint, a stale one
+    /// could cost #91.
     pub fn memory_seq_rm(
-        &self,
+        &mut self,
         seq_id: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
     ) -> bool {
+        self.checkpoints.invalidate_from(seq_id, p0);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_rm(mem, seq_id, p0, p1) }
     }
 
-    /// Copy KV entries between sequences in `[p0, p1)`.
+    /// Copy KV entries between sequences in `[p0, p1)`. Drops `dst`'s
+    /// partial checkpoints above `p0`: its KV there is no longer the one
+    /// they were taken over.
     pub fn memory_seq_cp(
-        &self,
+        &mut self,
         src: llama_seq_id,
         dst: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
     ) {
+        self.checkpoints.invalidate_from(dst, p0);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_cp(mem, src, dst, p0, p1) }
     }
 
-    /// Keep only `seq_id`'s entries, drop all others.
-    pub fn memory_seq_keep(&self, seq_id: llama_seq_id) {
+    /// Keep only `seq_id`'s entries, drop all others — and every other
+    /// sequence's partial checkpoints.
+    pub fn memory_seq_keep(&mut self, seq_id: llama_seq_id) {
+        self.checkpoints.keep_only(seq_id);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_keep(mem, seq_id) }
     }
 
-    /// Add `delta` to positions of `seq_id` in `[p0, p1)`.
+    /// Add `delta` to positions of `seq_id` in `[p0, p1)`. Drops the
+    /// partial checkpoints above `p0`, whose KV moved.
     pub fn memory_seq_add(
-        &self,
+        &mut self,
         seq_id: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
         delta: llama_pos,
     ) {
+        self.checkpoints.invalidate_from(seq_id, p0);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_add(mem, seq_id, p0, p1, delta) }
     }
 
     /// Integer-divide positions of `seq_id` in `[p0, p1)` by `d > 1`.
+    /// Drops the partial checkpoints above `p0`, whose KV moved.
     pub fn memory_seq_div(
-        &self,
+        &mut self,
         seq_id: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
         d: i32,
     ) {
+        self.checkpoints.invalidate_from(seq_id, p0);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_div(mem, seq_id, p0, p1, d) }
     }
@@ -814,32 +855,27 @@ impl Decoder for LlamaCppDecoder {
         unsafe { llama_n_seq_max(self.context) }
     }
 
+    /// [`LlamaCppDecoder::memory_clear`]: the checkpoints go with the
+    /// KV.
     fn memory_clear(&mut self) {
         LlamaCppDecoder::memory_clear(self);
-        // Session clears on full re-prefill; the old positions are
-        // never referenced again, so free the snapshots with the KV.
-        self.checkpoints.clear();
     }
 
-    /// Also drops the partial checkpoints above `p0` (on every
-    /// sequence when `seq_id < 0`), which no longer sit on the KV they
-    /// were taken over. Even when llama.cpp refuses the range: that
-    /// costs at most a checkpoint, a stale one could cost #91.
+    /// [`LlamaCppDecoder::memory_seq_rm`]: also drops the partial
+    /// checkpoints above `p0`.
     fn memory_seq_rm(&mut self, seq_id: i32, p0: i32, p1: i32) -> bool {
-        self.checkpoints.invalidate_from(seq_id, p0);
         LlamaCppDecoder::memory_seq_rm(self, seq_id, p0, p1)
     }
 
-    /// Also drops `dst`'s partial checkpoints above `p0`: its KV there
-    /// is no longer the one they were taken over.
+    /// [`LlamaCppDecoder::memory_seq_cp`]: also drops `dst`'s partial
+    /// checkpoints above `p0`.
     fn memory_seq_cp(&mut self, src: i32, dst: i32, p0: i32, p1: i32) {
-        self.checkpoints.invalidate_from(dst, p0);
         LlamaCppDecoder::memory_seq_cp(self, src, dst, p0, p1);
     }
 
-    /// Also drops every other sequence's partial checkpoints.
+    /// [`LlamaCppDecoder::memory_seq_keep`]: also drops every other
+    /// sequence's partial checkpoints.
     fn memory_seq_keep(&mut self, seq_id: i32) {
-        self.checkpoints.keep_only(seq_id);
         LlamaCppDecoder::memory_seq_keep(self, seq_id);
     }
 

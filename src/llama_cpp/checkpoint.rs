@@ -41,7 +41,12 @@
 //! window or recurrent state of a different history (#91's cardinal
 //! sin), so invalidation errs wide.
 
+use std::time::Instant;
+
 use crate::{backend::MemoryRmError, snapshot_store::SnapshotStore};
+
+/// One mebibyte, the unit the budget's options and flags are given in.
+const MIB: usize = 1 << 20;
 
 /// How a llama.cpp sequence rewinds to an earlier position — what
 /// [`Decoder::checkpoint_pos`](crate::Decoder::checkpoint_pos) stores
@@ -84,6 +89,57 @@ impl Checkpointing {
     }
 }
 
+/// The host RAM a decoder's checkpoints may hold — they live outside
+/// the KV cache, and on a unified-memory Mac they compete with the
+/// weights and the KV for the same memory. Past either bound the least
+/// recently used checkpoints are evicted (the anchors they held then
+/// restore through a lower one), and a checkpoint larger than a bound
+/// on its own is not taken.
+///
+/// The default, 8 GiB in all and 4 GiB per sequence (prefix-cache
+/// slot), is sized for a 96 GB Mac serving a 30 – 70 GB model with its
+/// KV. Only Gemma 4 comes near it: ≈ 800 MiB a checkpoint, ten in all
+/// and five per slot, where the count cap alone would allow ≈ 19 GiB at
+/// four slots. Everything else in the fleet fits far below it (gpt-oss
+/// 4.5 MiB, Qwen3.6 63 MiB, Qwen3.8 150 MiB a checkpoint). Set it with
+/// [`LlamaCppOptions::checkpoint_mib`](crate::LlamaCppOptions::checkpoint_mib)
+/// and
+/// [`LlamaCppOptions::checkpoint_slot_mib`](crate::LlamaCppOptions::checkpoint_slot_mib),
+/// or [`LlamaCppDecoder::set_checkpoint_budget`](crate::LlamaCppDecoder::set_checkpoint_budget).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CheckpointBudget {
+    /// Bytes across every sequence.
+    pub total: usize,
+    /// Bytes for any one sequence, so one busy slot cannot evict every
+    /// other slot's anchors.
+    pub per_seq: usize,
+}
+
+impl CheckpointBudget {
+    /// The default total, in MiB: 8 GiB.
+    pub const DEFAULT_TOTAL_MIB: u32 = 8 * 1024;
+    /// The default per-sequence bound, in MiB: 4 GiB.
+    pub const DEFAULT_PER_SEQ_MIB: u32 = 4 * 1024;
+
+    /// A budget of `total` bytes, at most `per_seq` of them for any one
+    /// sequence.
+    pub fn new(total: usize, per_seq: usize) -> Self {
+        Self { total, per_seq }
+    }
+
+    /// [`Self::new`], in MiB.
+    pub fn from_mib(total: u32, per_seq: u32) -> Self {
+        Self::new(total as usize * MIB, per_seq as usize * MIB)
+    }
+}
+
+impl Default for CheckpointBudget {
+    fn default() -> Self {
+        Self::from_mib(Self::DEFAULT_TOTAL_MIB, Self::DEFAULT_PER_SEQ_MIB)
+    }
+}
+
 /// The slice of a llama.cpp context's sequence memory that
 /// [`Checkpoints`] drives. One method per `llama_memory_*` /
 /// `llama_state_seq_*_ext` call, with llama.cpp's semantics.
@@ -120,14 +176,22 @@ pub(crate) struct Checkpoints {
 
 impl Checkpoints {
     /// Checkpoints for a model that needs `mode`, at most `cap` of them
-    /// (see [`crate::snapshot_store::cap_for_sequences`]).
+    /// (see [`crate::snapshot_store::cap_for_sequences`]) within the
+    /// default [`CheckpointBudget`].
     pub(crate) fn new(mode: Checkpointing, n_swa: u32, cap: usize) -> Self {
-        Self {
+        let mut this = Self {
             store: SnapshotStore::with_cap(cap),
             mode,
             native: mode,
             n_swa,
-        }
+        };
+        this.set_budget(CheckpointBudget::default());
+        this
+    }
+
+    /// Bound the bytes held, evicting down to the new bounds now.
+    pub(crate) fn set_budget(&mut self, budget: CheckpointBudget) {
+        self.store.set_byte_limits(budget.total, budget.per_seq);
     }
 
     pub(crate) fn mode(&self) -> Checkpointing {
@@ -136,6 +200,11 @@ impl Checkpoints {
 
     pub(crate) fn len(&self) -> usize {
         self.store.len()
+    }
+
+    /// Bytes held across every sequence.
+    pub(crate) fn bytes(&self) -> usize {
+        self.store.bytes()
     }
 
     /// Force checkpointing on or off. On, a dense model takes
@@ -156,6 +225,10 @@ impl Checkpoints {
     /// the sequence holds exactly `[0, pos)`. Anything else would file
     /// another position's state under `pos`, so it is skipped (and
     /// logged): the anchor then restores through a lower one.
+    ///
+    /// A partial checkpoint already stored at `(seq, pos)` is kept as
+    /// is: it survived invalidation, so the KV under it is the one it
+    /// was taken over, and saving again would copy the same state.
     pub(crate) fn checkpoint(
         &mut self,
         mem: &mut impl SeqMemory,
@@ -166,25 +239,55 @@ impl Checkpoints {
             return;
         }
         let head = mem.seq_pos_max(seq) + 1;
-        let bytes = if head == pos {
-            mem.save(seq, self.mode == Checkpointing::Partial)
-        } else {
-            Vec::new()
-        };
+        if head != pos {
+            tracing::warn!(
+                target: "drama_llama::snapshot_store",
+                event = "cache_degrade",
+                reason = "checkpoint_skipped",
+                cause = "off_head",
+                seq_id = seq,
+                pos,
+                head,
+                "prefix cache: no checkpoint taken at {pos}: the sequence's \
+                 head is {head}, and only the head can be saved; a rewind \
+                 there falls to a lower anchor",
+            );
+            return;
+        }
+        if self.mode == Checkpointing::Partial && self.store.refresh((seq, pos))
+        {
+            return;
+        }
+        let started = Instant::now();
+        let bytes = mem.save(seq, self.mode == Checkpointing::Partial);
         if bytes.is_empty() {
             tracing::warn!(
                 target: "drama_llama::snapshot_store",
                 event = "cache_degrade",
                 reason = "checkpoint_skipped",
+                cause = "save_failed",
                 seq_id = seq,
                 pos,
-                head,
-                "prefix cache: no checkpoint taken at {pos} (the sequence's \
-                 head is {head}); a rewind there falls to a lower anchor",
+                "prefix cache: no checkpoint taken at {pos}: llama.cpp \
+                 failed to serialize the sequence; a rewind there falls to \
+                 a lower anchor",
             );
             return;
         }
-        self.store.insert((seq, pos), bytes);
+        let len = bytes.len();
+        if self.store.insert((seq, pos), bytes) {
+            tracing::debug!(
+                target: "drama_llama::snapshot_store",
+                event = "checkpoint_taken",
+                seq_id = seq,
+                pos,
+                bytes = len,
+                ms = started.elapsed().as_secs_f64() * 1e3,
+                held_bytes = self.store.bytes(),
+                held = self.store.len(),
+                "checkpoint taken",
+            );
+        }
     }
 
     /// Rewind `seq` to `pos`: a truncate when that alone restores the
@@ -192,12 +295,19 @@ impl Checkpoints {
     /// On success every checkpoint above `pos` is dropped (its future
     /// is gone); on failure lower ones stay restorable, which is what
     /// `Session`'s restore ladder relies on.
+    ///
+    /// A partial checkpoint the truncate made unnecessary is taken
+    /// there and then if none is stored, since the head is `pos`: with
+    /// a window-sized cache the neighbours recycle the window below an
+    /// anchor soon after, and without one the anchor would restore
+    /// once and then fail.
     pub(crate) fn restore(
         &mut self,
         mem: &mut impl SeqMemory,
         seq: i32,
         pos: i32,
     ) -> Result<(), MemoryRmError> {
+        let started = Instant::now();
         let truncated = mem.seq_rm(seq, pos, -1);
         if truncated {
             // The KV above `pos` is gone whatever happens next.
@@ -205,11 +315,25 @@ impl Checkpoints {
         }
         if truncated && self.window_intact(mem, seq, pos) {
             self.store.invalidate_after(seq, pos);
+            tracing::debug!(
+                target: "drama_llama::snapshot_store",
+                event = "checkpoint_restore",
+                restore_via = "truncate",
+                seq_id = seq,
+                pos,
+                bytes = 0,
+                ms = started.elapsed().as_secs_f64() * 1e3,
+                "rewound by truncation",
+            );
+            if self.mode == Checkpointing::Partial {
+                self.checkpoint(mem, seq, pos);
+            }
             return Ok(());
         }
         let Some(bytes) = self.store.take((seq, pos)) else {
             return Err(MemoryRmError::NoCheckpoint { pos });
         };
+        let len = bytes.len();
         let loaded = match self.mode {
             // The checkpoint first: a recurrent layer refuses the
             // truncate until its state is back at `pos`.
@@ -226,6 +350,16 @@ impl Checkpoints {
             // rewind to the same anchor again.
             self.store.insert((seq, pos), bytes);
             self.store.invalidate_after(seq, pos);
+            tracing::debug!(
+                target: "drama_llama::snapshot_store",
+                event = "checkpoint_restore",
+                restore_via = "checkpoint",
+                seq_id = seq,
+                pos,
+                bytes = len,
+                ms = started.elapsed().as_secs_f64() * 1e3,
+                "rewound by loading a checkpoint",
+            );
             Ok(())
         } else {
             // llama.cpp rejected bytes we serialized ourselves, or the
@@ -240,10 +374,17 @@ impl Checkpoints {
     /// sliding window, every position the next token attends to is
     /// still there.
     ///
-    /// The window check keeps one cell of margin, as llama.cpp's own
-    /// server does, and is conservative for chunked and symmetric
-    /// windows, which reach back less far than a standard one. A miss
-    /// costs a checkpoint load, never correctness.
+    /// The token at `pos` attends to the cells `p` with
+    /// `pos - p < n_swa` (`llama_hparams::is_masked_swa`, standard
+    /// window), so the window is `[pos - n_swa + 1, pos)`, and llama.cpp
+    /// keeps a sequence's cells contiguous from `pos_min`. The cell at
+    /// `pos - n_swa` is masked for that token, and `find_slot` recycles
+    /// it (`llama-kv-cache.cpp`, "SWA mask") as soon as a neighbour
+    /// needs a cell, so it is not required: llama-server's one cell of
+    /// margin would send every idle slot's rewind to its own head to a
+    /// checkpoint load once a neighbour took that one cell. Conservative
+    /// for chunked and symmetric windows, which reach back less far. A
+    /// miss costs a checkpoint load, never correctness.
     fn window_intact(
         &self,
         mem: &mut impl SeqMemory,
@@ -256,7 +397,7 @@ impl Checkpoints {
         if self.n_swa == 0 || pos == 0 {
             return true;
         }
-        let floor = (pos - self.n_swa as i32).max(0);
+        let floor = (pos - self.n_swa as i32 + 1).max(0);
         (0..=floor).contains(&mem.seq_pos_min(seq))
     }
 
@@ -288,8 +429,23 @@ impl Checkpoints {
     /// whole-sequence snapshot restores wholesale, so it outlives any
     /// change to the KV under it.
     fn invalidate_partial(&mut self, mut stale: impl FnMut(i32, i32) -> bool) {
-        if self.mode == Checkpointing::Partial {
-            self.store.retain(|s, p| !stale(s, p));
+        if self.mode != Checkpointing::Partial {
+            return;
+        }
+        let before = self.store.len();
+        self.store.retain(|s, p| !stale(s, p));
+        let count = before - self.store.len();
+        if count > 0 {
+            // DEBUG: the KV under them changed, which a rewind or a
+            // slot reset does on every call. An anchor dropped here
+            // shows up later as a `restore_failed`; this says why.
+            tracing::debug!(
+                target: "drama_llama::snapshot_store",
+                event = "checkpoint_invalidated",
+                count,
+                held = self.store.len(),
+                "dropped {count} partial checkpoint(s) whose KV changed",
+            );
         }
     }
 
@@ -377,14 +533,15 @@ mod tests {
 
         /// Recycle `seq`'s window cells below `keep_from` the way
         /// llama.cpp's `find_slot` does for a neighbour's decode: only
-        /// masked cells (outside the window of the sequence's head).
+        /// cells masked for the sequence's head, `head - p >= n_swa`
+        /// (`is_masked_swa`) — so up to and including `head - n_swa`.
         fn recycle(&mut self, seq: i32, keep_from: i32) {
             let Layers::Iswa { n_swa } = self.layers else {
                 panic!("only a sliding window recycles");
             };
             let cells = self.swa.entry(seq).or_default();
             let head = cells.keys().max().copied().unwrap_or(-1) + 1;
-            assert!(keep_from <= head - n_swa, "would recycle live cells");
+            assert!(keep_from <= head - n_swa + 1, "would recycle live cells");
             cells.retain(|&p, _| p >= keep_from);
         }
 
@@ -607,6 +764,110 @@ mod tests {
         let (mut mem, mut ckpt) = rig(Layers::Iswa { n_swa: 8 }, 40);
         assert_eq!(ckpt.restore(&mut mem, 0, 20), Ok(()));
         assert_eq!(mem.sees(0), Some(tokens(20)));
+    }
+
+    /// The window boundary is llama.cpp's: the token at `pos` reads
+    /// `[pos - n_swa + 1, pos)`, and the cell at `pos - n_swa` is masked
+    /// for it — recyclable by any neighbour. An idle slot that lost
+    /// only that cell still rewinds to its own head by truncation; one
+    /// cell more and the window has a hole, which fails closed.
+    #[test]
+    fn the_window_ends_where_llama_cpp_masks_it() {
+        let n_swa = 8;
+        // Idle at its head (40): a neighbour took the masked cell 32.
+        let (mut mem, mut ckpt) = rig(Layers::Iswa { n_swa }, 40);
+        mem.recycle(0, 40 - n_swa + 1);
+        assert_eq!(ckpt.restore(&mut mem, 0, 40), Ok(()));
+        assert_eq!(mem.sees(0), Some(tokens(40)));
+
+        // Rewinding to 20 needs [13, 20): 13 is the last cell it may
+        // lose to the neighbours' recycling.
+        let (mut mem, mut ckpt) = rig(Layers::Iswa { n_swa }, 40);
+        mem.recycle(0, 20 - n_swa + 1);
+        assert_eq!(ckpt.restore(&mut mem, 0, 20), Ok(()));
+        assert_eq!(mem.sees(0), Some(tokens(20)));
+
+        let (mut mem, mut ckpt) = rig(Layers::Iswa { n_swa }, 40);
+        mem.recycle(0, 20 - n_swa + 2);
+        assert_eq!(
+            ckpt.restore(&mut mem, 0, 20),
+            Err(MemoryRmError::NoCheckpoint { pos: 20 }),
+        );
+        assert_eq!(mem.sees(0), None, "cell 13 is read at 20");
+    }
+
+    /// An anchor restored by truncation — its checkpoint LRU-evicted,
+    /// or never taken — is checkpointed on the way, since its head is
+    /// right there: with a window-sized cache the neighbours recycle
+    /// that window soon after, and the anchor would otherwise restore
+    /// once and then fail.
+    #[test]
+    fn a_truncated_anchor_is_checkpointed_for_next_time() {
+        let (mut mem, mut ckpt) = rig(Layers::Iswa { n_swa: 8 }, 40);
+        assert_eq!(ckpt.restore(&mut mem, 0, 20), Ok(()));
+        assert!(ckpt.contains(0, 20));
+
+        mem.decode(0, 20, &tokens(60)[20..]);
+        mem.recycle(0, 50);
+        assert_eq!(ckpt.restore(&mut mem, 0, 20), Ok(()));
+        assert_eq!(mem.sees(0), Some(tokens(20)));
+    }
+
+    /// Taking a checkpoint that is already stored copies nothing: it
+    /// survived invalidation, so it is the state at the head.
+    #[test]
+    fn a_stored_partial_checkpoint_is_not_taken_twice() {
+        let (mut mem, mut ckpt) = rig(Layers::Hybrid, 10);
+        ckpt.checkpoint(&mut mem, 0, 10);
+        ckpt.checkpoint(&mut mem, 0, 10);
+        assert_eq!(mem.saved.len(), 1);
+    }
+
+    /// The byte budget bounds what is held, least recently used first:
+    /// a restore is a use, so the anchor a slot just rewound to outlives
+    /// an idle slot's older one.
+    #[test]
+    fn checkpoints_stay_within_their_byte_budget() {
+        let (mut mem, mut ckpt) = rig(Layers::Hybrid, 10);
+        mem.decode(1, 0, &tokens(10));
+        // The sim's states are 4 bytes each: room for two.
+        ckpt.set_budget(CheckpointBudget::new(8, 8));
+        ckpt.checkpoint(&mut mem, 0, 10);
+        ckpt.checkpoint(&mut mem, 1, 10);
+        assert_eq!(ckpt.restore(&mut mem, 0, 10), Ok(()));
+        mem.decode(1, 10, &tokens(20)[10..]);
+        ckpt.checkpoint(&mut mem, 1, 20);
+        assert_eq!((ckpt.len(), ckpt.bytes()), (2, 8));
+        assert!(ckpt.contains(0, 10), "restored, so recently used");
+        assert!(!ckpt.contains(1, 10), "the least recently used goes");
+        assert!(ckpt.contains(1, 20));
+    }
+
+    /// A whole-sequence snapshot (a dense model with snapshots forced
+    /// on; a hybrid whose attention slides) restores wholesale through
+    /// `restore`: it outlives a wipe of the KV under it, and replaces
+    /// both caches of a sliding-window model.
+    #[test]
+    fn a_whole_snapshot_restores_through_restore() {
+        let (mut mem, mut ckpt) = rig(Layers::Dense, 20);
+        ckpt.force(true);
+        assert_eq!(ckpt.mode(), Checkpointing::Whole);
+        ckpt.checkpoint(&mut mem, 0, 20);
+        mem.decode(0, 20, &tokens(30)[20..]);
+        mem.seq_rm(0, -1, -1);
+        ckpt.invalidate_from(0, -1);
+        assert_eq!(ckpt.restore(&mut mem, 0, 20), Ok(()));
+        assert_eq!(mem.sees(0), Some(tokens(20)));
+
+        let mut mem = SimMemory::new(Layers::Iswa { n_swa: 8 });
+        mem.decode(0, 0, &tokens(20));
+        let mut ckpt = Checkpoints::new(Checkpointing::Whole, 8, 16);
+        ckpt.checkpoint(&mut mem, 0, 20);
+        mem.decode(0, 20, &tokens(60)[20..]);
+        mem.recycle(0, 50);
+        assert_eq!(ckpt.restore(&mut mem, 0, 20), Ok(()));
+        assert_eq!(mem.sees(0), Some(tokens(20)));
+        assert!(ckpt.contains(0, 20), "kept for the next rewind");
     }
 
     /// Dense models are untouched: nothing is stored, the truncate is

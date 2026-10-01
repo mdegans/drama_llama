@@ -12,7 +12,7 @@ pub mod mtmd;
 pub mod options;
 
 pub use crate::Backend;
-pub use checkpoint::Checkpointing;
+pub use checkpoint::{CheckpointBudget, Checkpointing};
 pub use decoder::{DecodeError, FlashAttention, LlamaCppDecoder, NewError};
 pub use engine::LlamaCppEngine;
 pub use model::{llama_quantize, LlamaCppModel};
