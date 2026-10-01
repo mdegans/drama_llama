@@ -205,6 +205,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A schema that has no grammar is a 400, and compiling one is
+  bounded.** A client's schema (any tool's `input_schema` in any
+  dialect, a strict `tool_choice`, an `output_config` `json_schema`)
+  could make the compiler build an arbitrarily large grammar before
+  anything looked at its size, and `{"enum": []}` compiled to an empty
+  rule body that failed as a GBNF syntax error (`compiled grammar is
+  invalid: …`), reading as our bug. Now:
+  - The compiler stops once the grammar passes 8 MiB and fails the
+    schema as `SchemaError::TooComplex`; `Grammar::parse` refuses any
+    source over 8 MiB or 2^18 rules (`GrammarError::TooLarge`) as a
+    backstop. Real grammars are far smaller (a large tool set compiles
+    to a few hundred KiB).
+  - An empty `enum` admits no value: `SchemaError::EmptyEnum`, wherever
+    in the schema it sits.
+  - The errors surface as `DialectError::Schema`, `ToolChoiceError::Schema`
+    and `OutputConfigError::Schema` (each naming the tool where there
+    is one), all 400 `invalid_request_error` on blallama. Anthropic's
+    own wording for these was not captured; the messages are plain.
+  - `schema_to_gbnf` (doc-hidden, the fuzzer's entry) returns
+    `Result<(), SchemaError>`.
+
 - **A recursive `$ref` no longer aborts the server.** The schema
   compiler inlined every `$ref` it met, with no cycle guard, so a
   recursive schema — `{"$ref": "#/$defs/Node"}` whose `Node` has

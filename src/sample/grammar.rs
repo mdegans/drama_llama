@@ -98,11 +98,40 @@ impl CharSet {
     }
 }
 
+/// Most bytes of GBNF [`Grammar::parse`] takes, and what the schema
+/// compiler stops at: a schema-derived grammar grows with the schema,
+/// and a client's schema must not be able to make one large enough
+/// to exhaust memory or stall compilation (the hostile-schema recheck).
+/// Real grammars are far smaller — a large tool set compiles to a few
+/// hundred KiB.
+pub(crate) const MAX_GRAMMAR_BYTES: usize = 8 << 20;
+
+/// Most rules [`Grammar::parse`] builds, anonymous ones (groups,
+/// repetitions) included. Bounds the rule table where
+/// [`MAX_GRAMMAR_BYTES`] bounds the source.
+pub(crate) const MAX_GRAMMAR_RULES: usize = 1 << 18;
+
 impl Grammar {
     /// Parse GBNF source text into a compiled grammar.
+    ///
+    /// A source past 8 MiB (`MAX_GRAMMAR_BYTES`), or one that builds
+    /// more than 2^18 rules (`MAX_GRAMMAR_RULES`), is
+    /// [`GrammarError::TooLarge`].
     pub fn parse(source: &str) -> Result<Self, GrammarError> {
+        if source.len() > MAX_GRAMMAR_BYTES {
+            return Err(GrammarError::TooLarge {
+                what: "bytes",
+                limit: MAX_GRAMMAR_BYTES,
+            });
+        }
         let mut builder = GrammarBuilder::new(source);
         builder.parse_document()?;
+        if builder.rules.len() > MAX_GRAMMAR_RULES {
+            return Err(GrammarError::TooLarge {
+                what: "rules",
+                limit: MAX_GRAMMAR_RULES,
+            });
+        }
         builder.finish()
     }
 
@@ -1732,6 +1761,13 @@ pub enum GrammarError {
     },
     #[error("internal matcher inconsistency")]
     Internal,
+    /// The grammar is past [`Grammar::parse`]'s size limit. From a
+    /// compiled JSON Schema, the schema is too complex to constrain.
+    #[error(
+        "grammar is too large (over {limit} {what}); the schema it was \
+         compiled from is too complex"
+    )]
+    TooLarge { what: &'static str, limit: usize },
 }
 
 static_assertions::assert_impl_all!(GrammarError: Send, Sync);
@@ -2232,6 +2268,34 @@ mod tests {
 
     fn parse_ok(src: &str) -> Grammar {
         Grammar::parse(src).expect("grammar should parse")
+    }
+
+    /// [`Grammar::parse`]'s size guard.
+    #[test]
+    fn oversized_grammar_is_rejected() {
+        let mut src = String::from("root ::= \"a\"\n");
+        while src.len() <= MAX_GRAMMAR_BYTES {
+            src.push_str("# padding padding padding padding padding\n");
+        }
+        assert_eq!(
+            Grammar::parse(&src),
+            Err(GrammarError::TooLarge {
+                what: "bytes",
+                limit: MAX_GRAMMAR_BYTES
+            })
+        );
+        let rules: String = (0..=MAX_GRAMMAR_RULES)
+            .map(|i| format!("r{i} ::= \"a\"\n"))
+            .collect();
+        let src = format!("root ::= r0\n{rules}");
+        assert!(src.len() <= MAX_GRAMMAR_BYTES);
+        assert_eq!(
+            Grammar::parse(&src),
+            Err(GrammarError::TooLarge {
+                what: "rules",
+                limit: MAX_GRAMMAR_RULES
+            })
+        );
     }
 
     /// Complete-but-extensible vs exhausted: the distinction the
@@ -3024,7 +3088,8 @@ char ::= [\x00-\x7F] | [\x80-\xFF]"#;
             }),
             "root",
             &mut src,
-        );
+        )
+        .unwrap();
         src.push_str(crate::JSON_GRAMMAR);
 
         let in_value = walked(&src, "{\"msg\":\"h");

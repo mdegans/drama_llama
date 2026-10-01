@@ -245,7 +245,7 @@ pub fn grammar_for_output_config(
         Some(OutputFormat::JsonSchema(f)) => &f.schema,
         _ => return Err(OutputConfigError::UnsupportedFormat),
     };
-    let source = build_grammar_source(schema, opts, thought_pre_opened);
+    let source = build_grammar_source(schema, opts, thought_pre_opened)?;
     Ok(SamplingMode::grammar(&source)?)
 }
 
@@ -280,7 +280,7 @@ pub fn compile_output_config(
     let trigger_certain =
         thought_pre_opened || opts.framing == ResponseFraming::Harmony;
     if opts.phase_split && opts.allow_thought && trigger_certain {
-        let source = build_json_only_grammar_source(schema, opts);
+        let source = build_json_only_grammar_source(schema, opts)?;
         let trigger = match opts.framing {
             ResponseFraming::Bare => opts.close().as_bytes(),
             ResponseFraming::Harmony => HARMONY_FINAL_TRIGGER.as_bytes(),
@@ -293,7 +293,7 @@ pub fn compile_output_config(
             feed_trigger: false,
         }))
     } else {
-        let source = build_grammar_source(schema, opts, thought_pre_opened);
+        let source = build_grammar_source(schema, opts, thought_pre_opened)?;
         Ok(CompiledOutputConfig::Single(SamplingMode::grammar(
             &source,
         )?))
@@ -386,7 +386,7 @@ pub(crate) fn build_grammar_source(
     schema: &serde_json::Value,
     opts: &OutputConfigOptions,
     thought_pre_opened: bool,
-) -> String {
+) -> Result<String, OutputConfigError> {
     let mut src = String::with_capacity(512);
 
     if opts.framing == ResponseFraming::Harmony {
@@ -436,9 +436,9 @@ pub(crate) fn build_grammar_source(
         let _ = writeln!(src, "root ::= ws output_schema");
     }
 
-    schema_to_gbnf(schema, "output_schema", &mut src);
+    schema_to_gbnf(schema, "output_schema", &mut src)?;
     src.push_str(JSON_GRAMMAR);
-    src
+    Ok(src)
 }
 
 /// Emit the JSON-only grammar used by the deferred / phase-split path.
@@ -448,7 +448,7 @@ pub(crate) fn build_grammar_source(
 pub(crate) fn build_json_only_grammar_source(
     schema: &serde_json::Value,
     opts: &OutputConfigOptions,
-) -> String {
+) -> Result<String, OutputConfigError> {
     let mut src = String::with_capacity(512);
     match opts.framing {
         ResponseFraming::Bare => {
@@ -462,9 +462,9 @@ pub(crate) fn build_json_only_grammar_source(
             emit_harmony_final_header("h_final", "", &mut src);
         }
     }
-    schema_to_gbnf(schema, "output_schema", &mut src);
+    schema_to_gbnf(schema, "output_schema", &mut src)?;
     src.push_str(JSON_GRAMMAR);
-    src
+    Ok(src)
 }
 
 /// The Harmony final-channel header, from `lead` (what of
@@ -499,6 +499,9 @@ pub enum OutputConfigError {
     /// The compiled GBNF source failed to parse.
     #[error("compiled grammar is invalid: {0}")]
     Grammar(#[from] GrammarError),
+    /// The JSON Schema has no grammar: too complex, or unsatisfiable.
+    #[error("output_config.format.schema: {0}")]
+    Schema(#[from] crate::grammar_compile::SchemaError),
 }
 
 static_assertions::assert_impl_all!(OutputConfigError: Send, Sync);
@@ -565,9 +568,10 @@ mod tests {
                 thought_separator: sep.map(str::to_string),
                 ..Default::default()
             };
-            let deferred = build_json_only_grammar_source(&schema, &opts);
-            let pre = build_grammar_source(&schema, &opts, true);
-            let optional = build_grammar_source(&schema, &opts, false);
+            let deferred =
+                build_json_only_grammar_source(&schema, &opts).unwrap();
+            let pre = build_grammar_source(&schema, &opts, true).unwrap();
+            let optional = build_grammar_source(&schema, &opts, false).unwrap();
             for gap in good {
                 let at = format!("{sep:?}, {gap:?}");
                 assert!(accepts(&deferred, &format!("{gap}{body}")), "{at}");
@@ -600,7 +604,7 @@ mod tests {
             thought_separator: Some("\n\n\n".into()),
             ..Default::default()
         };
-        let deferred = build_json_only_grammar_source(&schema, &long);
+        let deferred = build_json_only_grammar_source(&schema, &long).unwrap();
         assert!(accepts(&deferred, &format!("\n\n\n{body}")));
         assert!(accepts(&deferred, &format!("\n{body}")));
         assert!(!accepts(&deferred, &format!("\n\n\n\n{body}")));
@@ -617,7 +621,8 @@ mod tests {
             &config.format_schema(),
             &OutputConfigOptions::default(),
             false,
-        );
+        )
+        .unwrap();
         assert!(accepts(&src, r#"<think>hmm</think> {"x":1}"#));
         assert!(accepts(&src, r#"{"x":1}"#));
     }
@@ -646,8 +651,8 @@ mod tests {
         let schema = config.format_schema();
         assert!(schema.pointer("/$defs/Node").is_some(), "{schema}");
         let opts = OutputConfigOptions::default();
-        let unified = build_grammar_source(&schema, &opts, false);
-        let deferred = build_json_only_grammar_source(&schema, &opts);
+        let unified = build_grammar_source(&schema, &opts, false).unwrap();
+        let deferred = build_json_only_grammar_source(&schema, &opts).unwrap();
         let valid = r#"{"root":{"name":"a","children":[{"name":"b","children":[{"name":"c","children":[]}]},{"name":"d"}]}}"#;
         let invalid = r#"{"root":{"name":"a","children":[{"name":"b","children":[{"name":3}]}]}}"#;
         assert!(accepts(&unified, valid));
@@ -676,7 +681,8 @@ mod tests {
                 ..Default::default()
             },
             false,
-        );
+        )
+        .unwrap();
         assert!(accepts(&src, r#"{"x":1}"#));
         assert!(!accepts(&src, r#"<think>hmm</think> {"x":1}"#));
     }
@@ -882,7 +888,8 @@ mod tests {
             &config.format_schema(),
             &OutputConfigOptions::default(),
             true,
-        );
+        )
+        .unwrap();
         assert!(
             !src.contains(r#""<think>""#),
             "pre-opened root must not spell the opener: {src}"
@@ -912,7 +919,8 @@ mod tests {
                 ..Default::default()
             },
             true,
-        );
+        )
+        .unwrap();
         assert!(accepts(&src, "hmm</think> {\"x\":1}"));
         assert!(!accepts(&src, "{\"x\":1}"));
     }
@@ -950,7 +958,8 @@ mod tests {
                         <|start|>assistant";
         let body = r#"<|channel|>final<|message|>{"x":1}"#;
         let unified =
-            build_grammar_source(&config.format_schema(), &harmony, false);
+            build_grammar_source(&config.format_schema(), &harmony, false)
+                .unwrap();
         assert!(accepts(&unified, body));
         assert!(accepts(&unified, &format!("{analysis}{body}")));
         assert!(!accepts(&unified, &format!("{analysis}{analysis}{body}")));
@@ -965,7 +974,8 @@ mod tests {
                 ..harmony.clone()
             },
             false,
-        );
+        )
+        .unwrap();
         assert!(accepts(&no_thought, body));
         assert!(!accepts(&no_thought, &format!("{analysis}{body}")));
     }

@@ -66,6 +66,7 @@ pub use chat_template::{
 pub use minijinja;
 
 pub(crate) mod grammar_compile;
+pub use grammar_compile::SchemaError;
 #[doc(hidden)]
 pub use grammar_compile::{emit_until_rules, schema_to_gbnf, JSON_GRAMMAR};
 
@@ -91,6 +92,9 @@ pub use schema_check::{MismatchKind, SchemaMismatch};
 
 pub mod dialect;
 pub use dialect::CallSyntax;
+
+#[cfg(test)]
+mod hostile_schema_tests;
 
 pub mod baked;
 

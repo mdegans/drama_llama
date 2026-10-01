@@ -36,7 +36,8 @@
 //!   are ignored like other value-bound keywords (see below).
 //! * `type: string | integer | number | boolean | null` → the
 //!   corresponding JSON grammar rule.
-//! * `enum` (any JSON value) → alternation of literals.
+//! * `enum` (any JSON value) → alternation of literals. An empty
+//!   `enum` admits nothing and is a [`SchemaError`].
 //! * `const: <value>` → exactly the JSON-encoded literal.
 //! * `anyOf` → alternation of sub-schemas.
 //! * `$ref: "#/$defs/<Name>"` → a reference to the definition's own
@@ -48,6 +49,11 @@
 //! falls through to the permissive `value` rule, which accepts any
 //! JSON. Callers lose strictness in those spots but generation does
 //! not fail.
+//!
+//! A schema is a client's input, so its grammar is bounded: past 8
+//! MiB (`MAX_GRAMMAR_BYTES`) compilation stops and the schema is
+//! [`SchemaError::TooComplex`] — a 400, as Anthropic answers a schema
+//! its own grammar compiler refuses.
 //!
 //! # What's intentionally NOT supported
 //!
@@ -77,6 +83,27 @@ use std::{collections::HashMap, fmt::Write};
 use serde_json::{Map, Value};
 
 use crate::json_canon::JsonSpacing;
+pub(crate) use crate::sample::grammar::MAX_GRAMMAR_BYTES;
+
+/// Why a JSON Schema has no grammar. Each is the request's fault — a
+/// 400 `invalid_request_error`, the answer Anthropic gives a schema
+/// its own compiler refuses — never a retryable server error.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SchemaError {
+    /// The grammar would pass `limit` bytes (8 MiB): compilation stops
+    /// there rather than build it.
+    #[error(
+        "schema is too complex: its compiled grammar would exceed \
+         {limit} bytes"
+    )]
+    TooComplex { limit: usize },
+    /// An `enum` with no members: no value satisfies it.
+    #[error("schema has an empty `enum`, which no value can satisfy")]
+    EmptyEnum,
+}
+
+static_assertions::assert_impl_all!(SchemaError: Send, Sync);
 
 /// Emit GBNF rules that constrain a JSON value to `schema`.
 ///
@@ -86,6 +113,9 @@ use crate::json_canon::JsonSpacing;
 /// compiles to one named rule (see `Defs`), so a recursive type
 /// is a recursive grammar.
 ///
+/// Fails, writing a partial grammar, when the schema has no grammar
+/// ([`SchemaError`]); `out` past [`MAX_GRAMMAR_BYTES`] fails it too.
+///
 /// Exposed as `#[doc(hidden)] pub` (re-exported at the crate root)
 /// so the in-tree fuzzer can compile schemas directly without going
 /// through the tool-choice wrapper rules. Not part of the stable
@@ -93,23 +123,15 @@ use crate::json_canon::JsonSpacing;
 /// [`grammar_for_tool_choice`](crate::grammar_for_tool_choice) or
 /// [`output_config::grammar_for_output_config`](crate::output_config::grammar_for_output_config).
 #[doc(hidden)]
-pub fn schema_to_gbnf(schema: &Value, rule_name: &str, out: &mut String) {
-    let defs = schema.get("$defs").and_then(Value::as_object);
-    Compiler::new(defs, rule_name, None, out).run(schema, rule_name);
-}
-
-/// [`schema_to_gbnf`] for a subschema of a larger document, whose
-/// `$ref`s resolve against `defs` — the root's `$defs` table, which a
-/// tagged dialect's per-parameter schema does not carry. A `$defs` of
-/// the subschema's own is the fallback.
-pub(crate) fn schema_to_gbnf_in(
+pub fn schema_to_gbnf(
     schema: &Value,
-    defs: Option<&Map<String, Value>>,
     rule_name: &str,
     out: &mut String,
-) {
-    let defs = defs.or_else(|| schema.get("$defs").and_then(Value::as_object));
-    Compiler::new(defs, rule_name, None, out).run(schema, rule_name);
+) -> Result<(), SchemaError> {
+    let defs = schema.get("$defs").and_then(Value::as_object);
+    let mut compiler = Compiler::new(defs, rule_name, None);
+    compiler.add(schema, rule_name, out);
+    compiler.finish(out)
 }
 
 /// A `$defs` table as the compiler, the checker and the tagged-value
@@ -169,8 +191,7 @@ impl<'s> Defs<'s> {
 
     /// The id of the def `schema`'s `$ref` names, if it names one.
     pub(crate) fn target(&self, schema: &Value) -> Option<usize> {
-        let name = schema.get("$ref")?.as_str()?.strip_prefix("#/$defs/")?;
-        self.ids.get(name).copied()
+        self.ids.get(ref_name(schema)?).copied()
     }
 
     /// Def `id`'s schema.
@@ -228,6 +249,12 @@ impl<'s> Defs<'s> {
             variants.iter().for_each(|v| self.left_refs(v, targets));
         }
     }
+}
+
+/// The def name `schema`'s `$ref` spells, in the one shape [`Defs`]
+/// resolves (`#/$defs/<Name>`).
+fn ref_name(schema: &Value) -> Option<&str> {
+    schema.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
 }
 
 /// Each node's strongly connected component (Tarjan), iteratively: a
@@ -297,8 +324,15 @@ fn components(edges: &[Vec<usize>]) -> Vec<usize> {
 /// rules come off a worklist rather than out of the reference that
 /// first meets them: a chain of defs each naming the next would
 /// otherwise nest the compiler as deep as the chain is long.
-struct Compiler<'a> {
-    out: &'a mut String,
+///
+/// One compiler can write several schemas that share a `$defs` table:
+/// [`Self::add`] each, then [`Self::finish`].
+///
+/// Every rule is written into the caller's `out`, the whole grammar
+/// so far, and the compiler stops once that passes
+/// [`MAX_GRAMMAR_BYTES`] ([`SchemaError::TooComplex`]): a schema can't
+/// make it build a grammar much larger than the limit first.
+pub(crate) struct Compiler<'a> {
     /// Uniquifies child rule names.
     counter: usize,
     defs: Defs<'a>,
@@ -312,33 +346,70 @@ struct Compiler<'a> {
     prefix: &'a str,
     /// The dict encoding's string quote (Gemma 4), or `None` for JSON.
     quote: Option<&'a str>,
+    /// The first reason this schema has no grammar. Once set, nothing
+    /// more is written.
+    error: Option<SchemaError>,
 }
 
 impl<'a> Compiler<'a> {
-    fn new(
+    /// A compiler for schemas whose `$ref`s resolve against `defs`,
+    /// naming its def rules `<prefix>__def…` and writing the dict
+    /// encoding when `quote` is set.
+    pub(crate) fn new(
         defs: Option<&'a Map<String, Value>>,
         prefix: &'a str,
         quote: Option<&'a str>,
-        out: &'a mut String,
     ) -> Self {
         let defs = Defs::new(defs);
         Self {
-            out,
             counter: 0,
             def_rules: vec![None; defs.len()],
             defs,
             pending: Vec::new(),
             prefix,
             quote,
+            error: None,
         }
     }
 
-    /// Write `schema` as `rule_name`, then every def it reaches.
-    fn run(mut self, schema: &Value, rule_name: &str) {
-        self.rule(schema, rule_name, None);
+    /// Write `schema` as `rule_name`. The defs it reaches wait for
+    /// [`Self::finish`].
+    pub(crate) fn add(
+        &mut self,
+        schema: &Value,
+        rule_name: &str,
+        out: &mut String,
+    ) {
+        self.rule(schema, rule_name, None, out);
+    }
+
+    /// Write every def the added schemas reach; the first reason one
+    /// of them has no grammar, if any.
+    pub(crate) fn finish(
+        mut self,
+        out: &mut String,
+    ) -> Result<(), SchemaError> {
         while let Some((id, name)) = self.pending.pop() {
-            self.rule(self.defs.schema(id), &name, Some(id));
+            self.rule(self.defs.schema(id), &name, Some(id), out);
         }
+        self.halted(out);
+        self.error.map_or(Ok(()), Err)
+    }
+
+    /// Whether to write nothing more: a schema already failed, or the
+    /// grammar so far is past [`MAX_GRAMMAR_BYTES`], which fails it.
+    pub(crate) fn halted(&mut self, out: &str) -> bool {
+        if self.error.is_none() && out.len() > MAX_GRAMMAR_BYTES {
+            self.error = Some(SchemaError::TooComplex {
+                limit: MAX_GRAMMAR_BYTES,
+            });
+        }
+        self.error.is_some()
+    }
+
+    /// Record why the schema has no grammar (the first reason wins).
+    fn fail(&mut self, error: SchemaError) {
+        self.error.get_or_insert(error);
     }
 
     /// The permissive fallback: any value, in this encoding.
@@ -351,37 +422,47 @@ impl<'a> Compiler<'a> {
 
     /// Write `name ::= …` for `schema`. `left_of` is the def whose
     /// body this position is at the left of (see [`Defs`]).
-    fn rule(&mut self, schema: &Value, name: &str, left_of: Option<usize>) {
+    fn rule(
+        &mut self,
+        schema: &Value,
+        name: &str,
+        left_of: Option<usize>,
+        out: &mut String,
+    ) {
+        if self.halted(out) {
+            return;
+        }
         if let Some(id) = self.defs.target(schema) {
             let target = self.def_rule(id, left_of);
-            let _ = writeln!(self.out, "{name} ::= {target}");
+            let _ = writeln!(out, "{name} ::= {target}");
             return;
         }
 
         // `anyOf`: alternation over sub-schemas, each still at the left.
         if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
-            let alts: Vec<String> = variants
-                .iter()
-                .map(|sub| {
-                    self.counter += 1;
-                    let sub_name = format!("{name}__any_{c}", c = self.counter);
-                    self.rule(sub, &sub_name, left_of);
-                    sub_name
-                })
-                .collect();
+            let mut alts: Vec<String> = Vec::with_capacity(variants.len());
+            for sub in variants {
+                if self.halted(out) {
+                    return;
+                }
+                self.counter += 1;
+                let sub_name = format!("{name}__any_{c}", c = self.counter);
+                self.rule(sub, &sub_name, left_of, out);
+                alts.push(sub_name);
+            }
             // Empty anyOf: accept nothing meaningful — fall back to
             // permissive value to avoid an unrepresentable grammar.
             let alts = match alts.is_empty() {
                 true => self.any().to_string(),
                 false => alts.join(" | "),
             };
-            let _ = writeln!(self.out, "{name} ::= {alts}");
+            let _ = writeln!(out, "{name} ::= {alts}");
             return;
         }
 
         match self.quote {
-            None => self.json_rule(schema, name),
-            Some(quote) => self.dict_rule(schema, name, quote),
+            None => self.json_rule(schema, name, out),
+            Some(quote) => self.dict_rule(schema, name, quote, out),
         }
     }
 
@@ -410,9 +491,12 @@ impl<'a> Compiler<'a> {
     }
 
     /// The JSON rule for a schema past `$ref` and `anyOf`.
-    fn json_rule(&mut self, schema: &Value, rule_name: &str) {
+    fn json_rule(&mut self, schema: &Value, rule_name: &str, out: &mut String) {
         // `enum` → alternation of JSON-encoded literals.
         if let Some(variants) = schema.get("enum").and_then(|v| v.as_array()) {
+            if variants.is_empty() {
+                return self.fail(SchemaError::EmptyEnum);
+            }
             let mut alt = String::new();
             for (i, v) in variants.iter().enumerate() {
                 if i > 0 {
@@ -426,7 +510,7 @@ impl<'a> Compiler<'a> {
                 let gbnf_lit = escape_for_gbnf_string(&json_lit);
                 let _ = write!(alt, r#""{gbnf_lit}""#);
             }
-            let _ = writeln!(self.out, "{rule_name} ::= {alt}");
+            let _ = writeln!(out, "{rule_name} ::= {alt}");
             return;
         }
 
@@ -442,33 +526,32 @@ impl<'a> Compiler<'a> {
             let json_lit =
                 serde_json::to_string(v).unwrap_or_else(|_| "null".into());
             let gbnf_lit = escape_for_gbnf_string(&json_lit);
-            let _ = writeln!(self.out, r#"{rule_name} ::= "{gbnf_lit}""#);
+            let _ = writeln!(out, r#"{rule_name} ::= "{gbnf_lit}""#);
             return;
         }
 
         match effective_type(schema) {
-            Some("object") => self.object_rule(schema, rule_name),
+            Some("object") => self.object_rule(schema, rule_name, out),
             Some("string") => {
-                let _ = writeln!(self.out, "{rule_name} ::= string");
+                let _ = writeln!(out, "{rule_name} ::= string");
             }
             Some("integer") => {
                 // JSON grammar's `number` also permits decimals; reject
                 // those for integer fields by referencing `int` directly
                 // (defined in JSON_GRAMMAR, no frac/exp trailer).
-                let _ = writeln!(self.out, "{rule_name} ::= integer");
+                let _ = writeln!(out, "{rule_name} ::= integer");
             }
             Some("number") => {
-                let _ = writeln!(self.out, "{rule_name} ::= number");
+                let _ = writeln!(out, "{rule_name} ::= number");
             }
             Some("boolean") => {
-                let _ =
-                    writeln!(self.out, r#"{rule_name} ::= "true" | "false""#);
+                let _ = writeln!(out, r#"{rule_name} ::= "true" | "false""#);
             }
             Some("null") => {
-                let _ = writeln!(self.out, r#"{rule_name} ::= "null""#);
+                let _ = writeln!(out, r#"{rule_name} ::= "null""#);
             }
             Some("array") => {
-                let items_rule = self.items_rule(schema, rule_name);
+                let items_rule = self.items_rule(schema, rule_name, out);
                 // `minItems >= 1` forces a non-empty array — exactly as
                 // much as Anthropic's own structured outputs enforce (the
                 // misanthropic sanitizer passes `minItems: 0 | 1` through
@@ -481,31 +564,36 @@ impl<'a> Compiler<'a> {
                 // reason.
                 if non_empty(schema) {
                     let _ = writeln!(
-                        self.out,
+                        out,
                         r#"{rule_name} ::= "[" pad {items_rule} ( elem_sep {items_rule} )* pad "]""#
                     );
                 } else {
                     let _ = writeln!(
-                        self.out,
+                        out,
                         r#"{rule_name} ::= "[" pad ( {items_rule} ( elem_sep {items_rule} )* )? pad "]""#
                     );
                 }
             }
             _ => {
                 // Unknown / unsupported — accept any JSON value.
-                let _ = writeln!(self.out, "{rule_name} ::= value");
+                let _ = writeln!(out, "{rule_name} ::= value");
             }
         }
     }
 
     /// The rule an array's elements match: its `items` schema, written
     /// behind the `[` (no longer at the left), or any value.
-    fn items_rule(&mut self, schema: &Value, rule_name: &str) -> String {
+    fn items_rule(
+        &mut self,
+        schema: &Value,
+        rule_name: &str,
+        out: &mut String,
+    ) -> String {
         match schema.get("items") {
             Some(items) => {
                 self.counter += 1;
                 let name = format!("{rule_name}__item_{c}", c = self.counter);
-                self.rule(items, &name, None);
+                self.rule(items, &name, None, out);
                 name
             }
             None => self.any().to_string(),
@@ -513,7 +601,12 @@ impl<'a> Compiler<'a> {
     }
 
     /// JSON object layout: see the comments inside.
-    fn object_rule(&mut self, schema: &Value, rule_name: &str) {
+    fn object_rule(
+        &mut self,
+        schema: &Value,
+        rule_name: &str,
+        out: &mut String,
+    ) {
         let no_props = Map::new();
         let props = schema
             .get("properties")
@@ -533,7 +626,7 @@ impl<'a> Compiler<'a> {
 
         // Empty `properties` (and therefore no slots) → permissive object.
         if props.is_empty() && required_vec.is_empty() {
-            let _ = writeln!(self.out, "{rule_name} ::= object");
+            let _ = writeln!(out, "{rule_name} ::= object");
             return;
         }
 
@@ -559,9 +652,12 @@ impl<'a> Compiler<'a> {
             }
         }
         for (name, prop_schema) in props.iter() {
+            if self.halted(out) {
+                return;
+            }
             self.counter += 1;
             let child_rule = format!("{rule_name}__{c}", c = self.counter);
-            self.rule(prop_schema, &child_rule, None);
+            self.rule(prop_schema, &child_rule, None, out);
             slots.push((name.clone(), child_rule, required_set.contains(name)));
         }
 
@@ -583,6 +679,9 @@ impl<'a> Compiler<'a> {
                 let n = slots.len();
                 let mut chain_names: Vec<String> = Vec::with_capacity(n);
                 for k in 0..n {
+                    if self.halted(out) {
+                        return;
+                    }
                     let chain_name = format!("{rule_name}__chain_{k}");
                     let mut tail = String::new();
                     for (i, (name, child, _)) in
@@ -598,12 +697,12 @@ impl<'a> Compiler<'a> {
                             );
                         }
                     }
-                    let _ = writeln!(self.out, "{chain_name} ::= {tail}");
+                    let _ = writeln!(out, "{chain_name} ::= {tail}");
                     chain_names.push(chain_name);
                 }
                 let alts = chain_names.join(" | ");
                 let _ = writeln!(
-                    self.out,
+                    out,
                     r#"{rule_name} ::= "{{" pad ( {alts} )? pad "}}""#
                 );
             }
@@ -634,14 +733,23 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 body.push_str(" pad \"}\"");
-                let _ = writeln!(self.out, "{rule_name} ::= {body}");
+                let _ = writeln!(out, "{rule_name} ::= {body}");
             }
         }
     }
 
     /// The dict-encoded rule for a schema past `$ref` and `anyOf`.
-    fn dict_rule(&mut self, schema: &Value, rule_name: &str, quote: &str) {
+    fn dict_rule(
+        &mut self,
+        schema: &Value,
+        rule_name: &str,
+        quote: &str,
+        out: &mut String,
+    ) {
         if let Some(variants) = schema.get("enum").and_then(|v| v.as_array()) {
+            if variants.is_empty() {
+                return self.fail(SchemaError::EmptyEnum);
+            }
             let mut alt = String::new();
             for (i, v) in variants.iter().enumerate() {
                 if i > 0 {
@@ -651,7 +759,7 @@ impl<'a> Compiler<'a> {
                 dict_encode_value(v, quote, &mut lit);
                 let _ = write!(alt, r#""{}""#, escape_for_gbnf_string(&lit));
             }
-            let _ = writeln!(self.out, "{rule_name} ::= {alt}");
+            let _ = writeln!(out, "{rule_name} ::= {alt}");
             return;
         }
 
@@ -659,7 +767,7 @@ impl<'a> Compiler<'a> {
             let mut lit = String::new();
             dict_encode_value(v, quote, &mut lit);
             let _ = writeln!(
-                self.out,
+                out,
                 r#"{rule_name} ::= "{}""#,
                 escape_for_gbnf_string(&lit)
             );
@@ -667,39 +775,38 @@ impl<'a> Compiler<'a> {
         }
 
         match effective_type(schema) {
-            Some("object") => self.dict_object_rule(schema, rule_name),
+            Some("object") => self.dict_object_rule(schema, rule_name, out),
             Some("string") => {
-                let _ = writeln!(self.out, "{rule_name} ::= dstring");
+                let _ = writeln!(out, "{rule_name} ::= dstring");
             }
             Some("integer") => {
-                let _ = writeln!(self.out, "{rule_name} ::= integer");
+                let _ = writeln!(out, "{rule_name} ::= integer");
             }
             Some("number") => {
-                let _ = writeln!(self.out, "{rule_name} ::= number");
+                let _ = writeln!(out, "{rule_name} ::= number");
             }
             Some("boolean") => {
-                let _ =
-                    writeln!(self.out, r#"{rule_name} ::= "true" | "false""#);
+                let _ = writeln!(out, r#"{rule_name} ::= "true" | "false""#);
             }
             Some("null") => {
-                let _ = writeln!(self.out, "{rule_name} ::= dnull");
+                let _ = writeln!(out, "{rule_name} ::= dnull");
             }
             Some("array") => {
-                let items_rule = self.items_rule(schema, rule_name);
+                let items_rule = self.items_rule(schema, rule_name, out);
                 if non_empty(schema) {
                     let _ = writeln!(
-                        self.out,
+                        out,
                         r#"{rule_name} ::= "[" {items_rule} ( "," {items_rule} )* "]""#
                     );
                 } else {
                     let _ = writeln!(
-                        self.out,
+                        out,
                         r#"{rule_name} ::= "[" ( {items_rule} ( "," {items_rule} )* )? "]""#
                     );
                 }
             }
             _ => {
-                let _ = writeln!(self.out, "{rule_name} ::= dvalue");
+                let _ = writeln!(out, "{rule_name} ::= dvalue");
             }
         }
     }
@@ -713,7 +820,12 @@ impl<'a> Compiler<'a> {
     /// subsets containing every required key are reachable with correct
     /// commas, and — unlike a trailing-optionals layout — the accepted
     /// order is exactly the re-render order.
-    fn dict_object_rule(&mut self, schema: &Value, rule_name: &str) {
+    fn dict_object_rule(
+        &mut self,
+        schema: &Value,
+        rule_name: &str,
+        out: &mut String,
+    ) {
         let no_props = Map::new();
         let props = schema
             .get("properties")
@@ -730,7 +842,7 @@ impl<'a> Compiler<'a> {
             .unwrap_or_default();
 
         if props.is_empty() {
-            let _ = writeln!(self.out, "{rule_name} ::= dobject");
+            let _ = writeln!(out, "{rule_name} ::= dobject");
             return;
         }
 
@@ -740,9 +852,12 @@ impl<'a> Compiler<'a> {
         entries.sort_unstable_by_key(|(k, _)| *k);
         let mut slots: Vec<(String, String, bool)> = Vec::new();
         for (key, prop_schema) in entries {
+            if self.halted(out) {
+                return;
+            }
             self.counter += 1;
             let child = format!("{rule_name}__{c}", c = self.counter);
-            self.rule(prop_schema, &child, None);
+            self.rule(prop_schema, &child, None, out);
             slots.push((key.clone(), child, required.contains(key)));
         }
 
@@ -766,8 +881,7 @@ impl<'a> Compiler<'a> {
                         let _ = write!(body, r#" ( "," {} )?"#, kv(key, child));
                     }
                 }
-                let _ =
-                    writeln!(self.out, r#"{rule_name} ::= "{{" {body} "}}""#);
+                let _ = writeln!(out, r#"{rule_name} ::= "{{" {body} "}}""#);
             }
             None => {
                 // All optional: chain alternatives so every subset (in
@@ -775,6 +889,9 @@ impl<'a> Compiler<'a> {
                 let n = slots.len();
                 let mut chain_names: Vec<String> = Vec::with_capacity(n);
                 for k in 0..n {
+                    if self.halted(out) {
+                        return;
+                    }
                     let chain_name = format!("{rule_name}__chain_{k}");
                     let mut tail = String::new();
                     for (i, (key, child, _)) in slots.iter().enumerate().skip(k)
@@ -786,14 +903,12 @@ impl<'a> Compiler<'a> {
                                 write!(tail, r#" ( "," {} )?"#, kv(key, child));
                         }
                     }
-                    let _ = writeln!(self.out, "{chain_name} ::= {tail}");
+                    let _ = writeln!(out, "{chain_name} ::= {tail}");
                     chain_names.push(chain_name);
                 }
                 let alts = chain_names.join(" | ");
-                let _ = writeln!(
-                    self.out,
-                    r#"{rule_name} ::= "{{" ( {alts} )? "}}""#
-                );
+                let _ =
+                    writeln!(out, r#"{rule_name} ::= "{{" ( {alts} )? "}}""#);
             }
         }
     }
@@ -937,9 +1052,11 @@ pub(crate) fn schema_to_dict_gbnf(
     rule_name: &str,
     quote: &str,
     out: &mut String,
-) {
+) -> Result<(), SchemaError> {
     let defs = schema.get("$defs").and_then(Value::as_object);
-    Compiler::new(defs, rule_name, Some(quote), out).run(schema, rule_name);
+    let mut compiler = Compiler::new(defs, rule_name, Some(quote));
+    compiler.add(schema, rule_name, out);
+    compiler.finish(out)
 }
 
 /// Append GBNF rules for an optional `<think>...</think>` prefix.
@@ -1367,7 +1484,7 @@ mod tests {
             "required": ["a", "b"],
         });
         let mut rules = String::from("root ::= args\n");
-        schema_to_gbnf(&schema, "args", &mut rules);
+        schema_to_gbnf(&schema, "args", &mut rules).unwrap();
 
         let compact = r#"{"a":"x","b":[1,2]}"#;
         let spaced = r#"{"a": "x", "b": [1, 2]}"#;
@@ -1461,7 +1578,7 @@ mod tests {
             "required": ["name", "count"],
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "obj", &mut rules);
+        schema_to_gbnf(&schema, "obj", &mut rules).unwrap();
         let src = wrap_with_root("obj", rules);
         assert!(accepts(&src, r#"{"name":"ok","count":3}"#));
         assert!(!accepts(&src, r#"{"count":3}"#));
@@ -1484,7 +1601,7 @@ mod tests {
             }
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "root_obj", &mut rules);
+        schema_to_gbnf(&schema, "root_obj", &mut rules).unwrap();
         let src = wrap_with_root("root_obj", rules);
         assert!(accepts(&src, r#"{"inner":{"x":1}}"#));
         assert!(!accepts(&src, r#"{"inner":{}}"#));
@@ -1522,7 +1639,7 @@ mod tests {
             }
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "case", &mut rules);
+        schema_to_gbnf(&schema, "case", &mut rules).unwrap();
         let src = wrap_with_root("case", rules);
         assert!(
             accepts(
@@ -1549,7 +1666,7 @@ mod tests {
             "minItems": 1,
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "arr1", &mut rules);
+        schema_to_gbnf(&schema, "arr1", &mut rules).unwrap();
         let src = wrap_with_root("arr1", rules);
         assert!(!accepts(&src, "[]"), "empty must be rejected");
         assert!(accepts(&src, r#"["a"]"#));
@@ -1564,7 +1681,7 @@ mod tests {
             "minItems": 3,
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "arr3", &mut rules);
+        schema_to_gbnf(&schema, "arr3", &mut rules).unwrap();
         let src = wrap_with_root("arr3", rules);
         assert!(!accepts(&src, "[]"));
         assert!(accepts(&src, "[1]"), "counts beyond 1 are permissive");
@@ -1576,7 +1693,7 @@ mod tests {
             "minItems": 0,
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "arr0", &mut rules);
+        schema_to_gbnf(&schema, "arr0", &mut rules).unwrap();
         let src = wrap_with_root("arr0", rules);
         assert!(accepts(&src, "[]"));
     }
@@ -1590,7 +1707,7 @@ mod tests {
             ]
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "conf", &mut rules);
+        schema_to_gbnf(&schema, "conf", &mut rules).unwrap();
         let src = wrap_with_root("conf", rules);
         assert!(accepts(&src, r#""Low""#));
         assert!(accepts(&src, r#""High""#));
@@ -1612,7 +1729,7 @@ mod tests {
             ]
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "conf", &mut rules);
+        schema_to_gbnf(&schema, "conf", &mut rules).unwrap();
         let src = wrap_with_root("conf", rules);
         assert!(accepts(&src, r#""Low""#));
         assert!(accepts(&src, r#""Medium""#));
@@ -1811,7 +1928,7 @@ mod tests {
             "required": ["name"]
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "obj", &mut rules);
+        schema_to_gbnf(&schema, "obj", &mut rules).unwrap();
         let src = wrap_with_root("obj", rules);
         // Required-only — optional omitted.
         assert!(accepts(&src, r#"{"name":"x"}"#));
@@ -1830,6 +1947,54 @@ mod tests {
     /// All-optional schema: every 2^N inclusion combination must be
     /// reachable, including the empty object. Wrong types rejected
     /// when present.
+    /// A schema whose grammar would pass [`MAX_GRAMMAR_BYTES`] fails as
+    /// [`SchemaError::TooComplex`] once the grammar gets there, without
+    /// building the rest: a 400,000-way `anyOf` (17 MB of grammar).
+    #[test]
+    fn too_complex_schema_stops_at_the_limit() {
+        let n = 400_000;
+        let variants: Vec<Value> =
+            (0..n).map(|_| json!({"$ref": "#/$defs/A"})).collect();
+        let schema =
+            json!({"anyOf": variants, "$defs": {"A": {"type": "string"}}});
+        let mut out = String::new();
+        assert_eq!(
+            schema_to_gbnf(&schema, "s", &mut out),
+            Err(SchemaError::TooComplex {
+                limit: MAX_GRAMMAR_BYTES
+            })
+        );
+        assert!(out.len() < MAX_GRAMMAR_BYTES + (1 << 16), "{}", out.len());
+        let mut dict = String::new();
+        assert!(schema_to_dict_gbnf(&schema, "s", "'", &mut dict).is_err());
+    }
+
+    /// `{"enum": []}` admits no value. It used to compile to an empty
+    /// rule body, a GBNF syntax error; now it is a schema error, as deep
+    /// in the schema as it sits.
+    #[test]
+    fn empty_enum_is_a_schema_error() {
+        for schema in [
+            json!({"enum": []}),
+            json!({"type": "object", "properties": {"x": {"enum": []}}}),
+            json!({"anyOf": [{"type": "string"}, {"enum": []}]}),
+            json!({"$ref": "#/$defs/E", "$defs": {"E": {"enum": []}}}),
+        ] {
+            let mut out = String::new();
+            assert_eq!(
+                schema_to_gbnf(&schema, "s", &mut out),
+                Err(SchemaError::EmptyEnum),
+                "{schema}"
+            );
+            let mut dict = String::new();
+            assert_eq!(
+                schema_to_dict_gbnf(&schema, "s", "'", &mut dict),
+                Err(SchemaError::EmptyEnum),
+                "{schema}"
+            );
+        }
+    }
+
     #[test]
     fn all_optional_object_permits_every_subset() {
         let schema = json!({
@@ -1840,7 +2005,7 @@ mod tests {
             }
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "obj", &mut rules);
+        schema_to_gbnf(&schema, "obj", &mut rules).unwrap();
         let src = wrap_with_root("obj", rules);
         // All four combinations of include/skip — empty, a, b, both.
         assert!(accepts(&src, "{}"));
@@ -1874,7 +2039,7 @@ mod tests {
             "required": ["action"]
         });
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "obj", &mut rules);
+        schema_to_gbnf(&schema, "obj", &mut rules).unwrap();
         let src = wrap_with_root("obj", rules);
         // Both true and false accepted when included.
         assert!(accepts(&src, r#"{"action":"go","verbose":true}"#));
@@ -1942,7 +2107,7 @@ mod tests {
     /// schema check, which must agree.
     fn judge(schema: &Value, input: &str) -> bool {
         let mut rules = String::new();
-        schema_to_gbnf(schema, "s", &mut rules);
+        schema_to_gbnf(schema, "s", &mut rules).unwrap();
         let grammar = accepts(&wrap_with_root("s", rules), input);
         let checked = crate::schema_check::check_text(schema, input).is_ok();
         assert_eq!(grammar, checked, "grammar and check disagree: {input}");
@@ -1974,7 +2139,7 @@ mod tests {
             let schema = schema.clone();
             move || {
                 let mut rules = String::new();
-                schema_to_gbnf(&schema, "s", &mut rules);
+                schema_to_gbnf(&schema, "s", &mut rules).unwrap();
                 rules
             }
         });
@@ -2059,7 +2224,7 @@ mod tests {
         }
         // The chain names `C`'s rule directly: no alias rule for `A`/`B`.
         let mut rules = String::new();
-        schema_to_gbnf(&schema, "s", &mut rules);
+        schema_to_gbnf(&schema, "s", &mut rules).unwrap();
         assert!(!rules.contains("_A ::="), "{rules}");
         assert!(rules.contains("s__def2_C ::= integer"), "{rules}");
     }
@@ -2090,7 +2255,7 @@ mod tests {
         on_small_stack(256, move || {
             for schema in [&nested, &alias, &long_diamond] {
                 let mut rules = String::new();
-                schema_to_gbnf(schema, "s", &mut rules);
+                schema_to_gbnf(schema, "s", &mut rules).unwrap();
                 assert!(rules.len() < 200 * N, "{} bytes", rules.len());
             }
             assert!(judge(&nested, r#"{"n":{"n":{}}}"#));

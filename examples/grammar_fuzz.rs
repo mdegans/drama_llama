@@ -480,7 +480,10 @@ fn build_schema_grammar_source(schema: &Value) -> String {
     use std::fmt::Write;
     let mut src = String::with_capacity(512);
     let _ = writeln!(&mut src, "root ::= args");
-    schema_to_gbnf(schema, "args", &mut src);
+    // The generator never writes an empty `enum` or a schema near the
+    // size limit, so a schema error here is a finding.
+    schema_to_gbnf(schema, "args", &mut src)
+        .expect("generated schema has a grammar");
     src.push_str(JSON_GRAMMAR);
     src
 }

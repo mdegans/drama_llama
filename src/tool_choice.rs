@@ -190,7 +190,7 @@ pub fn grammar_for_tool_choice(
         &chosen,
         opts,
         RootShape::Eager { thought_pre_opened },
-    );
+    )?;
     let mode = SamplingMode::grammar(&source)?;
     Ok(Some(mode))
 }
@@ -238,7 +238,7 @@ pub fn deferred_grammar_for_prompt(
         return Ok(None);
     };
     let chosen: Vec<&Tool> = tools.iter().collect();
-    let source = build_grammar_source(&chosen, opts, RootShape::Lazy);
+    let source = build_grammar_source(&chosen, opts, RootShape::Lazy)?;
     Ok(Some(crate::DeferredGrammar {
         grammar: crate::CompiledGrammar::parse(&source)?,
         activate_after: vec![open.as_bytes().to_vec()],
@@ -291,6 +291,7 @@ pub fn build_grammar_source_for_debug(
             thought_pre_opened: false,
         },
     )
+    .unwrap_or_else(|e| format!("# no grammar: {e}\n"))
 }
 
 /// Emit the GBNF source text for a tool-choice constraint.
@@ -310,7 +311,7 @@ pub(crate) fn build_grammar_source(
     tools: &[&Tool],
     opts: &ToolChoiceOptions,
     shape: RootShape,
-) -> String {
+) -> Result<String, ToolChoiceError> {
     let mut src = String::with_capacity(1024);
 
     // Root rule: reasoning prefix per `shape`, then the (optionally
@@ -403,7 +404,11 @@ pub(crate) fn build_grammar_source(
     // case.
     if opts.strict_schema {
         for (i, tool) in tools.iter().enumerate() {
-            schema_to_gbnf(&tool.schema, &format!("args_{i}"), &mut src);
+            schema_to_gbnf(&tool.schema, &format!("args_{i}"), &mut src)
+                .map_err(|source| ToolChoiceError::Schema {
+                    tool: tool.name.to_string(),
+                    source,
+                })?;
         }
     }
 
@@ -416,7 +421,7 @@ pub(crate) fn build_grammar_source(
     // that made this explicit.
     src.push_str(&json_grammar_lenient());
 
-    src
+    Ok(src)
 }
 
 /// Errors from [`grammar_for_tool_choice`].
@@ -429,6 +434,14 @@ pub enum ToolChoiceError {
     UnknownTool(String),
     #[error("compiled grammar is invalid: {0}")]
     Grammar(#[from] GrammarError),
+    /// A tool's `input_schema` has no grammar: too complex, or
+    /// unsatisfiable.
+    #[error("tool {tool:?}: {source}")]
+    Schema {
+        tool: String,
+        #[source]
+        source: crate::grammar_compile::SchemaError,
+    },
 }
 
 static_assertions::assert_impl_all!(ToolChoiceError: Send, Sync);
@@ -447,6 +460,7 @@ mod tests {
                 thought_pre_opened: false,
             },
         )
+        .unwrap()
     }
     use crate::{Grammar, GrammarState};
     use serde_json::json;
@@ -1184,7 +1198,8 @@ mod tests {
             RootShape::Eager {
                 thought_pre_opened: true,
             },
-        );
+        )
+        .unwrap();
         // Reasoning body, close, then the wrapped call.
         assert!(accepts(
             &src,
@@ -1220,7 +1235,7 @@ mod tests {
             allow_thought: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts, RootShape::Lazy);
+        let src = build_grammar_source(&[&t], &opts, RootShape::Lazy).unwrap();
         assert!(accepts(
             &src,
             "<tool_call>\n{\"name\": \"get_weather\", \"parameters\": {}}\n</tool_call>"

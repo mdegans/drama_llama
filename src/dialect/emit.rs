@@ -45,7 +45,7 @@ use serde_json::Value;
 use crate::grammar_compile::{
     dict_encode_value, emit_dict_value_rules, emit_until_rules,
     escape_for_gbnf_string, json_grammar_canonical, schema_to_dict_gbnf,
-    schema_to_gbnf, schema_to_gbnf_in, Defs, FIELD_SEP, KV_SEP,
+    schema_to_gbnf, Compiler, Defs, SchemaError, FIELD_SEP, KV_SEP,
 };
 use crate::Tool;
 
@@ -83,6 +83,22 @@ pub enum DialectError {
         source_err: crate::GrammarError,
         gbnf: String,
     },
+    /// A tool's `input_schema` has no grammar ([`SchemaError`]): the
+    /// request's fault, like a 400 from Anthropic.
+    #[error("tool {tool:?}: {source}")]
+    Schema {
+        tool: String,
+        #[source]
+        source: SchemaError,
+    },
+}
+
+/// Tag a tool's [`SchemaError`] with the tool's name.
+fn schema_err(tool: &Tool) -> impl FnOnce(SchemaError) -> DialectError + '_ {
+    move |source| DialectError::Schema {
+        tool: tool.name.to_string(),
+        source,
+    }
 }
 
 static_assertions::assert_impl_all!(DialectError: Send, Sync);
@@ -265,35 +281,29 @@ pub fn grammar_source(
                 &mut src,
                 &mut until_counter,
             ),
-            Family::TagWithJson => {
-                emit_tag_json_call(
-                    syntax,
-                    tool,
-                    i,
-                    (&per_open, &per_close),
-                    &mut src,
-                );
-            }
-            Family::JsonNative => {
-                emit_json_native_call(
-                    syntax,
-                    tool,
-                    i,
-                    (&per_open, &per_close),
-                    &mut src,
-                );
-            }
-            Family::TagWithDict => {
-                emit_dict_call(
-                    syntax,
-                    tool,
-                    i,
-                    (&per_open, &per_close),
-                    &mut src,
-                );
-            }
+            Family::TagWithJson => emit_tag_json_call(
+                syntax,
+                tool,
+                i,
+                (&per_open, &per_close),
+                &mut src,
+            ),
+            Family::JsonNative => emit_json_native_call(
+                syntax,
+                tool,
+                i,
+                (&per_open, &per_close),
+                &mut src,
+            ),
+            Family::TagWithDict => emit_dict_call(
+                syntax,
+                tool,
+                i,
+                (&per_open, &per_close),
+                &mut src,
+            ),
             Family::None | Family::Harmony => unreachable!("checked above"),
-        }
+        }?;
     }
 
     if syntax.family == Family::TagWithDict {
@@ -423,7 +433,8 @@ fn harmony_grammar_source(
         }
     }
     for (i, tool) in tools.iter().enumerate() {
-        schema_to_gbnf(&tool.schema, &format!("h_args_{i}"), &mut src);
+        schema_to_gbnf(&tool.schema, &format!("h_args_{i}"), &mut src)
+            .map_err(schema_err(tool))?;
     }
     src.push_str(&json_grammar_canonical(spacing));
     Ok(src)
@@ -665,7 +676,7 @@ fn emit_tagged_call(
     (per_open, per_close): (&str, &str),
     src: &mut String,
     until_counter: &mut usize,
-) {
+) -> Result<(), DialectError> {
     let name_lit = escape_for_gbnf_string(tool.name.as_ref());
     let fn_pre = escape_for_gbnf_string(&syntax.function.name_prefix);
     let fn_suf = escape_for_gbnf_string(&syntax.function.name_suffix);
@@ -710,7 +721,9 @@ fn emit_tagged_call(
                 // The tool's `$defs`: a parameter's schema has none of
                 // its own, so a `$ref` in it resolves only from here.
                 let defs = tool.schema.get("$defs").and_then(Value::as_object);
-                schema_to_gbnf_in(schema, defs, &typed_rule, src);
+                let mut compiler = Compiler::new(defs, &typed_rule, None);
+                compiler.add(schema, &typed_rule, src);
+                compiler.finish(src).map_err(schema_err(tool))?;
                 format!(r#"{typed_rule} "{val_suf_lit}""#)
             }
         };
@@ -736,6 +749,7 @@ fn emit_tagged_call(
         src,
         r#"call_{i} ::= "{per_open}{fn_pre}{name_lit}{fn_suf}"{body} "{fn_close}{per_close}""#,
     );
+    Ok(())
 }
 
 /// TAG_WITH_DICT (Gemma 4): literal `call:` + name, then the whole
@@ -752,7 +766,7 @@ fn emit_dict_call(
     i: usize,
     (per_open, per_close): (&str, &str),
     src: &mut String,
-) {
+) -> Result<(), DialectError> {
     let name_lit = escape_for_gbnf_string(tool.name.as_ref());
     let fn_pre = escape_for_gbnf_string(&syntax.function.name_prefix);
     let args_rule = format!("args_{i}");
@@ -761,11 +775,13 @@ fn emit_dict_call(
         &args_rule,
         &syntax.arguments.string_quote,
         src,
-    );
+    )
+    .map_err(schema_err(tool))?;
     let _ = writeln!(
         src,
         r#"call_{i} ::= "{per_open}{fn_pre}{name_lit}" {args_rule} "{per_close}""#,
     );
+    Ok(())
 }
 
 /// TAG_WITH_JSON: tagged name, JSON args object.
@@ -775,17 +791,18 @@ fn emit_tag_json_call(
     i: usize,
     (per_open, per_close): (&str, &str),
     src: &mut String,
-) {
+) -> Result<(), DialectError> {
     let name_lit = escape_for_gbnf_string(tool.name.as_ref());
     let fn_pre = escape_for_gbnf_string(&syntax.function.name_prefix);
     let fn_suf = escape_for_gbnf_string(&syntax.function.name_suffix);
     let fn_close = escape_for_gbnf_string(&syntax.function.close);
     let args_rule = format!("args_{i}");
-    schema_to_gbnf(&tool.schema, &args_rule, src);
+    schema_to_gbnf(&tool.schema, &args_rule, src).map_err(schema_err(tool))?;
     let _ = writeln!(
         src,
         r#"call_{i} ::= "{per_open}{fn_pre}{name_lit}{fn_suf}" {args_rule} "{fn_close}{per_close}""#,
     );
+    Ok(())
 }
 
 /// JSON_NATIVE: the call is a JSON object; field order follows the
@@ -796,19 +813,19 @@ fn emit_json_native_call(
     i: usize,
     (per_open, per_close): (&str, &str),
     src: &mut String,
-) {
+) -> Result<(), DialectError> {
     let name_lit = escape_for_gbnf_string(
         &serde_json::to_string(tool.name.as_ref()).expect("string"),
     );
     let args_rule = format!("args_{i}");
-    schema_to_gbnf(&tool.schema, &args_rule, src);
+    schema_to_gbnf(&tool.schema, &args_rule, src).map_err(schema_err(tool))?;
 
     if syntax.json.fun_name_is_key {
         let _ = writeln!(
             src,
             r#"call_{i} ::= "{per_open}" "{{" "{name_lit}" "{KV_SEP}" {args_rule} "}}" "{per_close}""#,
         );
-        return;
+        return Ok(());
     }
 
     let name_field = if syntax.json.name_field.is_empty() {
@@ -852,6 +869,7 @@ fn emit_json_native_call(
         src,
         r#"call_{i} ::= "{per_open}" "{{"{fields} "}}" "{per_close}""#,
     );
+    Ok(())
 }
 
 /// Verify every argument of `input` is representable in `syntax` —

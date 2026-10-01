@@ -1614,6 +1614,52 @@ mod tests {
         );
     }
 
+    /// A schema with no grammar — here an empty `enum`, in a tool and in
+    /// an `output_config` — is the request's fault: 400
+    /// `invalid_request_error`, never a retryable 500.
+    #[test]
+    fn schema_without_grammar_is_anthropic_400_envelope() {
+        use drama_llama::{
+            dialect::{grammar_source, EmitOptions},
+            grammar_for_output_config, CallSyntax, OutputConfigOptions,
+            SessionError, Tool,
+        };
+        use misanthropic::prompt::output::OutputConfig;
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"enum": []}},
+        });
+        let tool = Tool::builder("t")
+            .description("d")
+            .schema(schema.clone())
+            .build()
+            .unwrap();
+        let dialect = grammar_source(
+            &CallSyntax::qwen_xml(),
+            &[&tool],
+            &EmitOptions::default(),
+        )
+        .unwrap_err();
+        let output = grammar_for_output_config(
+            &OutputConfig::json_schema(schema),
+            &OutputConfigOptions::default(),
+            false,
+        )
+        .unwrap_err();
+        for error in [SessionError::from(dialect), SessionError::from(output)] {
+            let (status, Json(envelope)) = map_session_err(error);
+            let value = serde_json::to_value(envelope).unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("empty `enum`")),
+                "{value}",
+            );
+        }
+    }
+
     /// The ingest guard is a bug detector now: a shortfall is a 500
     /// `api_error`, not a 400 blaming the client's request.
     #[test]
