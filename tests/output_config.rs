@@ -22,7 +22,9 @@ use std::{
     path::PathBuf,
 };
 
-use drama_llama::{Block, Content, Prompt, RenderOptions, Role, Session};
+use drama_llama::{
+    Block, Content, Prompt, RenderOptions, Role, SamplingMode, Session,
+};
 use misanthropic::prompt::message::CacheControl;
 
 fn model_path() -> PathBuf {
@@ -258,19 +260,27 @@ fn whodunit_verdict() {
 /// `prev_entries` holds the emitted ids, `new_entries` holds the
 /// re-tokenized render, and `compute_l_hit` compares ids.
 ///
-/// So the hash path is not an optimization here, it is the only path
-/// that works, and it needs a breakpoint at the tip position — i.e. the
-/// caller must mark the assistant turn's last block, which is exactly
-/// what `hash_cache_smoke`'s `mark_last_block` does. Unconstrained prose
-/// is not exposed to this (its segmentation is canonical), which is why
-/// the plain-turn suites reuse happily without marking.
+/// Since "trust the emission" (`PrefixCacheConfig::adopt_emitted_tokens`,
+/// on by default) the next call reads round 1's turn in the slot's own
+/// ids wherever they spell the same bytes as the render, so the walk
+/// no longer dies in the JSON: round 2 reuses round 1's whole prompt
+/// and its emission. That reuse is only sound if the KV it keeps holds
+/// exactly the ids round 2 then feeds, so the test checks it two ways:
+/// the cache tripwire is armed (a spliced prompt that does not read as
+/// its render panics), and round 2 is re-run *cold* — the KV wiped
+/// under the session, so the restore fails and the same ids are
+/// prefilled from position 0 — and must produce the warm output under
+/// greedy sampling.
 ///
-/// Unseeded deliberately — a forced seed forks every call and discards
-/// the KV-paired snapshot the resume path needs (see `whodunit_verdict`
-/// above for the contrast).
+/// Greedy rather than a seed — a forced seed forks every call and
+/// discards the KV-paired snapshot the resume path needs (see
+/// `whodunit_verdict` above for the contrast).
 #[test]
 #[ignore = "requires model"]
 fn structured_output_round_trips_as_history() {
+    // OnceLock reads this on first use; nextest's process-per-test
+    // isolation keeps it scoped to this test.
+    std::env::set_var("DRAMA_LLAMA_CACHE_TRIPWIRE", "1");
     const SYSTEM: &str = "You are a brief, decisive detective. Answer \
                           ONLY with the structured verdict as JSON \
                           matching the given schema. Do not explain.";
@@ -278,6 +288,8 @@ fn structured_output_round_trips_as_history() {
     let mut session = Session::from_path_with_n_ctx(model_path(), 8192)
         .expect("session load")
         .quiet()
+        .without_repetition()
+        .with_sampling([SamplingMode::Greedy])
         // Thinking off so the emission is pure JSON. The thought path
         // has its own normalization (`parse_thought` trims, the
         // renderer re-emits bare markers) which is shared with every
@@ -306,9 +318,10 @@ fn structured_output_round_trips_as_history() {
     // as "round 1's whole prompt" rather than just its post-breakpoint
     // tail.
     let r1_input = r1.usage.input_tokens;
+    let r1_output = r1.usage.output_tokens;
     eprintln!(
         "round 1: input_tokens={}, output_tokens={}",
-        r1_input, r1.usage.output_tokens
+        r1_input, r1_output
     );
     let _: CaseFile = r1.json().expect("round 1 deserializes");
 
@@ -357,37 +370,33 @@ fn structured_output_round_trips_as_history() {
 
     // The test's name still holds — the BYTES round-trip, which is
     // what `r2.json()` below proves. What does not round-trip is the
-    // *segmentation*, and that is what the cache needs.
+    // *segmentation*: the grammar masks merged tokens, so the
+    // tokenizer re-reads the emission in a different split.
     //
-    // This assertion was `r2_read > r1_input` when the test landed
-    // (#88 phase 5b), and it was green — green *on corruption*. The
-    // tip's render hash matched, so reuse proceeded at the tip's
-    // cached entry index while the same bytes ended three entries
-    // earlier in the new render; the first tokens of the new user
-    // turn were never decoded. That is #91, and this test is where it
-    // was found.
+    // History of this bound. It was `r2_read > r1_input` when the test
+    // landed (#88 phase 5b), green *on corruption*: the tip's render
+    // hash matched, so reuse proceeded at the tip's cached entry index
+    // while the same bytes ended three entries earlier in the new
+    // render, and the first tokens of the new user turn were never
+    // decoded (#91, found here). The #91 fix refused that hit, and with
+    // the LCP walk dying two tokens into the JSON this pinned zero
+    // reuse. Adoption resolves the hit the other way: the prompt is
+    // read in the slot's own ids up to the edit, so the ids before the
+    // tip are equal and the reuse is real again.
     //
-    // Post-fix `hash_keyed_l_hit` refuses a hit whose coordinates
-    // disagree, and here there is nothing to fall back to: the LCP
-    // walk dies two tokens into the JSON (grammar-masked merges), and
-    // the only `cache_control` marker sits past that. So reuse is
-    // zero and a grammar-constrained turn replays its whole prompt.
-    //
-    // That cost is the open half of #91 — resolving the hit in
-    // new-entry space instead of refusing it. When that lands, this
-    // flips back to `r2_read > r1_input` and means it.
-    //
-    // A NON-zero value here is a signal, not a reason to relax the
-    // bound: it would mean this emission happened to be segmented
-    // canonically throughout, which a ~250-token JSON under a schema
-    // grammar should not be. Investigate before widening.
+    // So: everything round 1 left in the KV is reused — its prompt and
+    // its emission. The tip is the emission's last token, which was
+    // sampled but never decoded, so the KV ends one short of it. More
+    // than that would reach into the new user turn round 1 never saw.
     assert_eq!(
-        r2_read, 0,
-        "expected zero reuse on a drifted structured-output turn \
-         (#91): the tip's hash matches but its coordinates do not, \
-         and the sole cache_control marker sits past where the LCP \
-         walk dies. Got {r2_read} against round 1's prompt of \
-         {r1_input}."
+        r2_read,
+        r1_input + r1_output - 1,
+        "round 2 should reuse round 1's prompt ({r1_input}) and every \
+         decoded token of its {r1_output}-token emission"
+    );
+    assert!(
+        r2.usage.input_tokens > 0,
+        "the new user turn must be prefilled, not reused"
     );
 
     // Cache stats are not a proxy for output (the 2026-07-24
@@ -398,4 +407,35 @@ fn structured_output_round_trips_as_history() {
         "round 2 produced no tokens (reused {r2_read})"
     );
     let _: CaseFile = r2.json().expect("round 2 deserializes");
+
+    // Warm == cold. Wipe the KV under the session: its slot still
+    // records round 2's prompt, so the call reads the same ids, the
+    // restore fails (no KV, no checkpoint), and the whole prompt is
+    // prefilled from position 0. Greedy output must match the warm
+    // call's — the reused KV was the KV of the ids it claimed.
+    session.engine_mut().memory_clear();
+    let cold = session.complete_response(&round2).expect("round 2, cold");
+    assert_eq!(
+        cold.usage.cache_read_input_tokens.unwrap_or(0),
+        0,
+        "the wiped KV must not be reused"
+    );
+    // Read + written + fresh is the whole prompt, in the ids it was
+    // read in: the same total both ways.
+    let prompt_len = |u: &misanthropic::response::TokenCounts| {
+        u.input_tokens
+            + u.cache_read_input_tokens.unwrap_or(0)
+            + u.cache_creation_input_tokens.unwrap_or(0)
+    };
+    assert_eq!(
+        prompt_len(&cold.usage),
+        prompt_len(&r2.usage),
+        "the cold call must prefill the same prompt the warm one read"
+    );
+    assert_eq!(
+        cold.inner.content.to_string(),
+        r2.inner.content.to_string(),
+        "warm round 2 (reused {r2_read}) diverged from the same ids \
+         prefilled cold"
+    );
 }
