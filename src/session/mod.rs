@@ -10942,18 +10942,40 @@ mod tests {
         assert_eq!(call_parse_syntax(&on, &qwen, &opts), qwen);
     }
 
-    /// Drive `emission` through `compiled` token by token the way
-    /// `TokenPredictor::next` does — both legality checks the sampler
-    /// applies to a pick (the lazy single-token check and the masked
-    /// `grammar_filter` sweep), then `advance`, then the deferred
-    /// trigger scan — with the real tokenizer. `Err(i)` names the first
-    /// token either check refuses; `Ok(complete)` otherwise.
+    /// How a token-level drive ([`drive_token_ids`]) ended.
     #[cfg(feature = "llama-cpp")]
-    fn drive_tokens(
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Drive {
+        /// Every constraint reached its accept state.
+        complete: bool,
+        /// End-of-generation is legal after the last token.
+        eos_ok: bool,
+        /// A deferred grammar was installed and never woke.
+        unfired: bool,
+    }
+
+    /// Where a token-level drive stopped short.
+    #[cfg(feature = "llama-cpp")]
+    #[derive(Debug, PartialEq)]
+    enum Refused {
+        /// The sampler masks token `i`: generation is steered elsewhere.
+        Masked(usize),
+        /// Token `i` passed every check, then woke the deferred grammar
+        /// on bytes it refused — the predictor ends the turn there.
+        Fatal(usize),
+    }
+
+    /// Drive `tokens` through `compiled` the way `TokenPredictor::next`
+    /// does — every legality check the sampler applies to a pick (the
+    /// lazy single-token check, the masked `grammar_filter` sweep, the
+    /// deferred-trigger wake check), then `advance`, then the deferred
+    /// trigger scan and activation — with the real tokenizer.
+    #[cfg(feature = "llama-cpp")]
+    fn drive_token_ids(
         compiled: &crate::CompiledOutputConfig,
         model: &crate::LlamaCppModel,
-        emission: &str,
-    ) -> Result<bool, usize> {
+        tokens: &[Token],
+    ) -> Result<Drive, Refused> {
         use crate::backend::Model as _;
         use crate::sample::state::MatcherState;
         let config = match compiled {
@@ -10969,11 +10991,7 @@ mod tests {
         };
         let mut state = config.init_state(0, model);
         let mut text: Vec<u8> = Vec::new();
-        for (i, &token) in model
-            .tokenize_special(emission, false, true)
-            .iter()
-            .enumerate()
-        {
+        for (i, &token) in tokens.iter().enumerate() {
             let lazy_ok = state.accepts_chosen(&config, token, model);
             let single = || {
                 crate::Candidates::from_vec(vec![crate::TokenData {
@@ -11011,8 +11029,10 @@ mod tests {
                 }
                 _ => true,
             };
-            if !(lazy_ok && eager_ok && deferred_ok) {
-                return Err(i);
+            let wake_ok =
+                !state.wakes_deferred_illegally(&config, &text, token, model);
+            if !(lazy_ok && eager_ok && deferred_ok && wake_ok) {
+                return Err(Refused::Masked(i));
             }
             state.advance(&config, token, model);
             let mut piece = Vec::new();
@@ -11030,12 +11050,29 @@ mod tests {
                 {
                     let from = if spec.feed_trigger { end - len } else { end };
                     if state.activate_deferred(spec, &text[from..]).is_err() {
-                        return Err(i);
+                        return Err(Refused::Fatal(i));
                     }
                 }
             }
         }
-        Ok(state.grammar_complete())
+        Ok(Drive {
+            complete: state.grammar_complete(),
+            eos_ok: state.accepts_chosen(&config, model.eos(), model),
+            unfired: state.deferred_inactive() == Some(true),
+        })
+    }
+
+    /// [`drive_token_ids`] over `emission` as the model's tokenizer
+    /// spells it, specials included.
+    #[cfg(feature = "llama-cpp")]
+    fn drive_tokens(
+        compiled: &crate::CompiledOutputConfig,
+        model: &crate::LlamaCppModel,
+        emission: &str,
+    ) -> Result<Drive, Refused> {
+        use crate::backend::Model as _;
+        let tokens = model.tokenize_special(emission, false, true);
+        drive_token_ids(compiled, model, &tokens)
     }
 
     /// [`harmony_output_config_constrains_the_final_body`] at the
@@ -11095,9 +11132,9 @@ mod tests {
                         // Refused inside the body, past `"soul_text":""`.
                         let tokens =
                             model.tokenize_special(&emission, false, true);
-                        let refused_at = got.err().unwrap_or_else(|| {
-                            panic!("{at}: invalid body admitted: {emission}")
-                        });
+                        let Err(Refused::Masked(refused_at)) = got else {
+                            panic!("{at}: invalid body not masked: {got:?}")
+                        };
                         let prefix: String = tokens[..refused_at]
                             .iter()
                             .map(|&t| model.token_to_piece(t))
@@ -11114,12 +11151,318 @@ mod tests {
                     );
                     assert_eq!(
                         drive_tokens(&compiled, &model, &good),
-                        Ok(true),
+                        Ok(Drive {
+                            complete: true,
+                            eos_ok: true,
+                            unfired: false,
+                        }),
                         "{at}: valid body must be admitted and complete"
                     );
                 }
             }
         }
+    }
+
+    /// One fleet model under [`fleet_output_config_by_token`]: where its
+    /// GGUF is, what its answers look like, and the tokens that close
+    /// its thought and carry bytes past the closer.
+    #[cfg(feature = "llama-cpp")]
+    struct FleetSpec {
+        /// The env var naming the GGUF, else `models/{file}`.
+        env: &'static str,
+        file: &'static str,
+        /// What precedes the body, thinking on and off: a thought,
+        /// written as the model writes it after the render, or `""`.
+        on: &'static [&'static str],
+        off: &'static [&'static str],
+        /// The closer up to its last byte, spelled as text — where a
+        /// trigger-crossing token takes over.
+        close_prefix: &'static str,
+        /// Thinking-on emissions (`{J}` the body) whose closer finishes
+        /// in one text token carrying more bytes — that token's piece —
+        /// and whether the gap it carries is one the grammar admits.
+        crossings: &'static [(&'static str, &'static str, bool)],
+    }
+
+    /// The vocab-only model, its effective template and its dialect, as
+    /// a server loads them: a `.template.jinja` sidecar beside the GGUF,
+    /// else the baked replacement, else the embedded template.
+    #[cfg(feature = "llama-cpp")]
+    fn load_fleet_model(
+        spec: &FleetSpec,
+    ) -> Option<(crate::LlamaCppModel, ChatTemplate, crate::CallSyntax)> {
+        use crate::backend::Model as _;
+        let path = std::env::var_os(spec.env)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("models")
+                    .join(spec.file)
+            });
+        if !path.exists() {
+            eprintln!("SKIP: no GGUF at {} (set {})", path.display(), spec.env);
+            return None;
+        }
+        let mut params = crate::LlamaCppOptions::default().model_params();
+        params.vocab_only = true;
+        params.n_gpu_layers = 0;
+        let model = crate::LlamaCppModel::from_file(path.clone(), Some(params))
+            .expect("vocab-only load");
+        let embedded = model.chat_template_source().expect("template");
+        let source = crate::sidecar::load_template_source(
+            &path.with_extension("template.jinja"),
+        )
+        .expect("read sidecar")
+        .or_else(|| {
+            crate::baked::detect(&embedded).map(|b| b.replacement.to_string())
+        })
+        .unwrap_or(embedded);
+        let dialect = analyze_dialect_source(&model, &source);
+        let template = ChatTemplate::from_source(
+            source,
+            model.token_to_piece(model.bos()),
+            model.token_to_piece(model.eos()),
+        )
+        .expect("compile template");
+        Some((model, template, dialect))
+    }
+
+    /// The one token whose piece is exactly `piece`.
+    #[cfg(feature = "llama-cpp")]
+    fn token_for_piece(model: &crate::LlamaCppModel, piece: &str) -> Token {
+        (0..model.n_vocab())
+            .find(|&t| model.token_to_piece(t) == piece)
+            .unwrap_or_else(|| panic!("no token spells {piece:?}"))
+    }
+
+    /// The output_config contract of one fleet model, token by token
+    /// through its real tokenizer (a `vocab_only` load: CPU, no
+    /// tensors), thinking on and off, with the grammar and the parser
+    /// derived as `Session` derives them for the rendered prompt:
+    ///
+    /// - the live gpt-oss bodies are masked inside the body, after any
+    ///   thought and without one;
+    /// - the valid body is admitted, complete and EOS-legal after each
+    ///   thought with each natural gap (`""`, `" "`, `"\n"`, `"\n\n"`),
+    ///   and without a thought wherever the render leaves it optional —
+    ///   and parses to an answer that keeps the contract;
+    /// - a token that finishes the closer and carries the gap is
+    ///   admitted when the gap is legal and masked when it is not —
+    ///   steered either way, never a turn ended mid-structure.
+    #[cfg(feature = "llama-cpp")]
+    fn fleet_output_config_by_token(spec: &FleetSpec) {
+        use crate::backend::Model as _;
+        let Some((model, template, dialect)) = load_fleet_model(spec) else {
+            return;
+        };
+        let render_opts = RenderOptions::default()
+            .with_generation_prompt(true)
+            .with_extra("preserve_thinking", true)
+            .with_thought_reingest(dialect.reasoning.reingest)
+            .with_reasoning_start(dialect.reasoning.start.clone())
+            .with_efforts(dialect.reasoning.efforts.clone());
+        let complete = Drive {
+            complete: true,
+            eos_ok: true,
+            unfired: false,
+        };
+        for (label, prompt) in role_consent_prompts() {
+            let prompt = prompt
+                .add_message((
+                    misanthropic::prompt::message::Role::User,
+                    "Do you consent?",
+                ))
+                .unwrap();
+            // As `Session::prepare_call_cached` derives them.
+            let rendered =
+                template.render_with(&prompt, &render_opts).expect("render");
+            let pre_opened =
+                render_ends_with_open_reasoning(&rendered, &dialect)
+                    || prompt_resumes_open_reasoning(&prompt, &dialect);
+            let closed = render_ends_with_closed_reasoning(&rendered, &dialect);
+            let opts = OutputConfigOptions {
+                phase_split: !closed,
+                ..OutputConfigOptions::default()
+            };
+            let compiled =
+                resolve_grammar(&prompt, &dialect, &opts, pre_opened)
+                    .expect("resolve")
+                    .expect("output_config grammar");
+            let deferred = match &compiled {
+                crate::CompiledOutputConfig::Deferred(d) => Some(d),
+                crate::CompiledOutputConfig::Single(_) => None,
+            };
+            let syntax = call_parse_syntax(&prompt, &dialect, &opts);
+            let keeps_contract = |emission: &str, drive: &Drive| {
+                let parsed = crate::dialect::parse_text(
+                    &syntax,
+                    &[],
+                    emission,
+                    pre_opened,
+                    crate::dialect::Leniency::Final,
+                );
+                let blocks = merge_adjacent_prose(parsed.blocks);
+                let end = TurnEnd {
+                    cut: false,
+                    constraint_incomplete: !drive.complete,
+                    deferred_unfired: drive.unfired,
+                };
+                let breach =
+                    TurnContract::of(&prompt, deferred).breach(&blocks, end);
+                assert!(breach.is_none(), "{emission:?}: {blocks:?}");
+            };
+            let prefixes = match label {
+                "on" => spec.on,
+                _ => spec.off,
+            };
+            for prefix in prefixes {
+                let gaps: &[&str] = match *prefix {
+                    "" => &[""],
+                    _ => &["", " ", "\n", "\n\n"],
+                };
+                for gap in gaps {
+                    let at = format!("thinking {label}, {prefix:?}{gap:?}");
+                    for bad in
+                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
+                    {
+                        let emission = format!("{prefix}{gap}{bad}");
+                        let tokens =
+                            model.tokenize_special(&emission, false, true);
+                        let got = drive_token_ids(&compiled, &model, &tokens);
+                        let Err(Refused::Masked(i)) = got else {
+                            panic!("{at}: invalid body not masked: {got:?}")
+                        };
+                        let before: String = tokens[..i]
+                            .iter()
+                            .map(|&t| model.token_to_piece(t))
+                            .collect();
+                        assert!(
+                            before.contains(r#""soul_text":"""#),
+                            "{at}: masked too early, after {before:?}"
+                        );
+                    }
+                    let good = format!("{prefix}{gap}{ROLE_CONSENT_VALID}");
+                    let drive = drive_tokens(&compiled, &model, &good);
+                    assert_eq!(drive, Ok(complete), "{at}: {good:?}");
+                    keeps_contract(&good, &drive.unwrap());
+                }
+            }
+            if label != "on" {
+                continue;
+            }
+            for &(emission, piece, legal) in spec.crossings {
+                let emission = emission.replace("{J}", ROLE_CONSENT_VALID);
+                let at = format!("thinking on, crossing {piece:?}");
+                let split = emission.find(spec.close_prefix).expect("closer")
+                    + spec.close_prefix.len();
+                let (before, after) = emission.split_at(split);
+                let after = after.strip_prefix(piece).expect("piece");
+                let mut tokens = model.tokenize_special(before, false, true);
+                let crossing = tokens.len();
+                tokens.push(token_for_piece(&model, piece));
+                tokens.extend(model.tokenize_special(after, false, true));
+                let got = drive_token_ids(&compiled, &model, &tokens);
+                if legal {
+                    assert_eq!(got, Ok(complete), "{at}: {emission:?}");
+                    keeps_contract(&emission, &got.unwrap());
+                } else {
+                    assert_eq!(
+                        got,
+                        Err(Refused::Masked(crossing)),
+                        "{at}: {emission:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Qwen 3.8: thinking on pre-opens the thought, so the body defers
+    /// to `</think>` — the one fleet model whose crossing tokens meet
+    /// the sampler's wake check rather than an eager grammar. An answer
+    /// without a thought is not well-behaved here: it is still inside
+    /// the render's open thought.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the Qwen 3.8 GGUF (vocab-only load, CPU)"]
+    fn qwen38_output_config_by_token() {
+        fleet_output_config_by_token(&FleetSpec {
+            env: "DRAMA_LLAMA_QWEN38_MODEL",
+            file: "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+            on: &["Let me think.\n</think>"],
+            off: &[""],
+            close_prefix: "</think",
+            crossings: &[
+                ("Let me think.\n</think>{J}", ">{", true),
+                ("Let me think.\n</think>.{J}", ">.", false),
+            ],
+        });
+    }
+
+    /// Gemma 4: `<|channel>thought…<channel|>`, never pre-opened.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the Gemma 4 GGUF (vocab-only load, CPU)"]
+    fn gemma4_output_config_by_token() {
+        fleet_output_config_by_token(&FleetSpec {
+            env: "DRAMA_LLAMA_GEMMA4_MODEL",
+            file: "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+            on: &[
+                "",
+                "<|channel>thought\nHmm.\n<channel|>",
+                "<|channel>thought\nHmm.<channel|>",
+                "<|channel>thought\n<channel|>",
+            ],
+            off: &["", "<|channel>thought\n<channel|>"],
+            close_prefix: "<channel|",
+            crossings: &[
+                ("<|channel>thought\nHmm.\n<channel|>{J}", ">{", true),
+                ("<|channel>thought\nHmm.\n<channel|> </{J}", "> </", false),
+            ],
+        });
+    }
+
+    /// Mistral 4: `[THINK]…[/THINK]`, never pre-opened, its measured
+    /// gap empty — yet it writes `[/THINK]\n{` and `[/THINK] {`, and its
+    /// text-spelled closer ends in tokens like `]\n\n`.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the Mistral Small 4 GGUF (vocab-only load, CPU)"]
+    fn mistral4_output_config_by_token() {
+        fleet_output_config_by_token(&FleetSpec {
+            env: "DRAMA_LLAMA_MISTRAL_MODEL",
+            file: "Mistral-Small-4-119B-2603-UD-Q4_K_XL.gguf",
+            on: &["", "[THINK]Hmm.[/THINK]"],
+            off: &["", "[THINK]Hmm.[/THINK]"],
+            close_prefix: "[/THINK",
+            crossings: &[
+                ("[THINK]Hmm.[/THINK]\n{J}", "]\n", true),
+                ("[THINK]Hmm.[/THINK]\n\n{J}", "]\n\n", true),
+                ("[THINK]Hmm.[/THINK]{J}", "]{", true),
+                ("[THINK]Hmm.[/THINK]\n\n\n{J}", "]\n\n\n", false),
+            ],
+        });
+    }
+
+    /// cogito: no reasoning markers measured, so the grammar offers
+    /// `<think>…</think>` — spelled in text tokens, `</`, `think`, then a
+    /// `>`-led token that usually carries the gap.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the cogito GGUF (vocab-only load, CPU)"]
+    fn cogito_output_config_by_token() {
+        fleet_output_config_by_token(&FleetSpec {
+            env: "DRAMA_LLAMA_COGITO_MODEL",
+            file: "cogito-32b.gguf",
+            on: &["", "<think>\nHmm.\n</think>"],
+            off: &["", "<think>\nHmm.\n</think>"],
+            close_prefix: "</think",
+            crossings: &[
+                ("<think>\nHmm.\n</think>\n\n{J}", ">\n\n", true),
+                ("<think>\nHmm.\n</think>\n{J}", ">\n", true),
+                ("<think>\nHmm.\n</think>{J}", ">{", true),
+                ("<think>\nHmm.\n</think>\n\n\n{J}", ">\n\n\n", false),
+            ],
+        });
     }
 
     /// Method + pre-opened reasoning → eager grammar anchored on the

@@ -156,7 +156,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before accepting it and resamples without it, like any other
   grammar-illegal pick (`sample_token_in`, given the generated text so
   far; the public `Candidates::sample_token` judges what one piece
-  spells).
+  spells). Pinned by the vocab-only token-level tests
+  `qwen38_output_config_by_token`, `gemma4_output_config_by_token`,
+  `mistral4_output_config_by_token` and `cogito_output_config_by_token`
+  (`#[ignore]`d; `DRAMA_LLAMA_{QWEN38,GEMMA4,MISTRAL,COGITO}_MODEL`):
+  the live invalid bodies are masked inside the body, the valid body
+  with each natural gap is admitted, complete and EOS-legal and keeps
+  the turn contract, and the trigger-crossing tokens are admitted or
+  masked — never fatal.
 - **A Qwen XML tool's string `enum` argument reads as its value.** The
   grammar writes such a value as JSON (`"full"`, quoted) but the parser
   read it raw, so the tool got `"\"full\""` — and, for a `strict`
