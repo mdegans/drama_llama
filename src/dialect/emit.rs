@@ -45,7 +45,7 @@ use serde_json::Value;
 use crate::grammar_compile::{
     dict_encode_value, emit_dict_value_rules, emit_until_rules,
     escape_for_gbnf_string, json_grammar_canonical, schema_to_dict_gbnf,
-    schema_to_gbnf, FIELD_SEP, KV_SEP,
+    schema_to_gbnf, schema_to_gbnf_in, FIELD_SEP, KV_SEP,
 };
 use crate::Tool;
 
@@ -460,20 +460,185 @@ fn schema_args(tool: &Tool) -> Vec<(String, Value, bool)> {
         .collect()
 }
 
-fn schema_is_string(schema: &Value) -> bool {
-    // Sees through nullability: `Option<String>` renders as
-    // `"type": ["string", "null"]` (schemars 1.x) and must take the
-    // raw until-rule path like any other string — the JSON-value
-    // fallthrough inside an XML parameter is a generation dead-end
-    // (see `effective_type`).
-    crate::grammar_compile::effective_type(schema) == Some("string")
-        && schema.get("enum").is_none()
+/// How a TAG_WITH_TAGGED parameter's value is spelled between its
+/// tags: what [`grammar_source`] generates and what the parser reads
+/// back, decided in one place so the two agree by construction.
+///
+/// The rule is the template's: Qwen renders a string argument raw
+/// (`args_value | string if args_value is string else tojson`), so a
+/// string value is never JSON-quoted at the top of a parameter — the
+/// model was trained on `<parameter=detail>\nfull\n</parameter>`, and
+/// a quoted `"full"` re-renders without its quotes, a tip miss on
+/// every such call.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TaggedValue {
+    /// Any string, raw until the close tag. When `nullable`, a bare
+    /// `null` is JSON null — its one non-string value.
+    Raw { nullable: bool },
+    /// One of finitely many values, at least one a string (an `enum`,
+    /// a `const`, or a union of them, nullable or not): each spelled
+    /// as the template re-renders it — a string raw, anything else
+    /// as JSON — and read back by exact match. `(spelling, value)`.
+    Choice(Vec<(String, Value)>),
+    /// Schema-compiled JSON: no string in it, or no raw spelling that
+    /// reads back unambiguously.
+    Json,
+}
+
+/// Classify `param`, a property of `tool_schema`, for `syntax`.
+///
+/// `$ref`s resolve against the tool schema's `$defs`; `anyOf` and
+/// `oneOf` are read as unions (their members are disjoint in every
+/// shape schemars emits — a `oneOf` of unit-variant `const`s). A
+/// finite set falls back to [`TaggedValue::Json`] when its raw
+/// spellings collide (the string `"1"` beside the number `1`, `"null"`
+/// beside `null`) or a member would end its own value early (it
+/// contains the close tag); a mixed set (`["a", 1, null]`) spells its
+/// strings raw and the rest as JSON. Leading or trailing whitespace is
+/// kept: the template renders it verbatim and the parser reads the
+/// value byte-exact, so such a member round-trips as written.
+pub(crate) fn tagged_value(
+    syntax: &CallSyntax,
+    tool_schema: &Value,
+    param: &Value,
+) -> TaggedValue {
+    let defs = tool_schema.get("$defs").and_then(Value::as_object);
+    let mut admits = Admits::default();
+    admits.collect(param, defs, 0);
+    let Admits {
+        any_string,
+        any_other,
+        members,
+    } = admits;
+    let nullable = members.contains(&Value::Null);
+    if any_other {
+        return TaggedValue::Json;
+    }
+    if any_string {
+        return match members.iter().all(|m| m.is_string() || m.is_null()) {
+            true => TaggedValue::Raw { nullable },
+            false => TaggedValue::Json,
+        };
+    }
+    if !members.iter().any(Value::is_string) {
+        return TaggedValue::Json;
+    }
+    let choice: Vec<(String, Value)> = members
+        .into_iter()
+        .map(|m| match m {
+            Value::String(s) => (s.clone(), Value::String(s)),
+            other => (
+                crate::json_canon::to_string(
+                    &other,
+                    syntax.arguments.json_spacing,
+                ),
+                other,
+            ),
+        })
+        .collect();
+    let close = syntax.arguments.value_suffix.as_str();
+    let distinct = choice
+        .iter()
+        .enumerate()
+        .all(|(i, (s, _))| choice[..i].iter().all(|(t, _)| t != s));
+    // The parser ends a value at the first close tag, so the close
+    // after a member must be the first one: none inside the member, and
+    // none that starts in its tail (`a\n</parameter>` + the close).
+    let delimited = !close.is_empty()
+        && choice
+            .iter()
+            .all(|(s, _)| format!("{s}{close}").find(close) == Some(s.len()));
+    match distinct && delimited {
+        true => TaggedValue::Choice(choice),
+        false => TaggedValue::Json,
+    }
+}
+
+/// What a schema admits, as far as a tagged value's spelling cares.
+#[derive(Default)]
+struct Admits {
+    /// Any string (`"type": "string"`).
+    any_string: bool,
+    /// Unboundedly many non-string values: a non-string type, or an
+    /// unconstrained schema.
+    any_other: bool,
+    /// Finitely many values (`enum`, `const`, `"type": "null"`), in
+    /// declaration order, without duplicates.
+    members: Vec<Value>,
+}
+
+impl Admits {
+    fn collect(
+        &mut self,
+        schema: &Value,
+        defs: Option<&serde_json::Map<String, Value>>,
+        depth: usize,
+    ) {
+        // A `$ref` cycle cannot be finite; give up on it as JSON.
+        if depth > 32 {
+            self.any_other = true;
+            return;
+        }
+        // The `$ref` shape the grammar compiler resolves; anything else
+        // falls through to the schema's other keywords, as it does there.
+        if let Some(target) = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix("#/$defs/"))
+            .and_then(|name| defs.and_then(|d| d.get(name)))
+        {
+            return self.collect(target, defs, depth + 1);
+        }
+        let union = schema
+            .get("anyOf")
+            .or_else(|| schema.get("oneOf"))
+            .and_then(Value::as_array);
+        if let Some(variants) = union {
+            match variants.is_empty() {
+                true => self.any_other = true,
+                false => variants
+                    .iter()
+                    .for_each(|v| self.collect(v, defs, depth + 1)),
+            }
+            return;
+        }
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            values.iter().for_each(|v| self.member(v));
+            return;
+        }
+        if let Some(value) = schema.get("const") {
+            return self.member(value);
+        }
+        match schema.get("type") {
+            Some(Value::String(t)) => self.of_type(t),
+            Some(Value::Array(types)) => types.iter().for_each(|t| match t {
+                Value::String(t) => self.of_type(t),
+                _ => self.any_other = true,
+            }),
+            _ => self.any_other = true,
+        }
+    }
+
+    fn of_type(&mut self, t: &str) {
+        match t {
+            "string" => self.any_string = true,
+            "null" => self.member(&Value::Null),
+            _ => self.any_other = true,
+        }
+    }
+
+    fn member(&mut self, value: &Value) {
+        if !self.members.contains(value) {
+            self.members.push(value.clone());
+        }
+    }
 }
 
 /// TAG_WITH_TAGGED: literal name; args in schema declaration order
-/// in place (optionals wrapped in `( ... )?`); string values
-/// raw-until-close,
-/// other values schema-compiled JSON + literal close.
+/// in place (optionals wrapped in `( ... )?`); each value spelled as
+/// [`tagged_value`] decides — a string raw-until-close, a finite set
+/// of strings raw by alternation, anything else schema-compiled JSON —
+/// then the literal close.
 fn emit_tagged_call(
     syntax: &CallSyntax,
     tool: &Tool,
@@ -499,23 +664,41 @@ fn emit_tagged_call(
         *until_counter += 1;
         let key_lit = escape_for_gbnf_string(key);
         let arg_rule = format!("arg_{i}_{c}", c = *until_counter);
-        if schema_is_string(schema) {
-            // Raw value: the until-rule consumes value bytes AND the
-            // closing delimiter.
-            let until_rule = format!("val_{i}_{c}", c = *until_counter);
-            emit_until_rules(&until_rule, &syntax.arguments.value_suffix, src);
-            let _ = writeln!(
-                src,
-                r#"{arg_rule} ::= "{arg_pre}{key_lit}{arg_suf}{val_pre}" {until_rule}"#,
-            );
-        } else {
-            let typed_rule = format!("typed_{i}_{c}", c = *until_counter);
-            schema_to_gbnf(schema, &typed_rule, src);
-            let _ = writeln!(
-                src,
-                r#"{arg_rule} ::= "{arg_pre}{key_lit}{arg_suf}{val_pre}" {typed_rule} "{val_suf_lit}""#,
-            );
-        }
+        let typed_rule = format!("typed_{i}_{c}", c = *until_counter);
+        let value = match tagged_value(syntax, &tool.schema, schema) {
+            TaggedValue::Raw { .. } => {
+                // Raw value: the until-rule consumes value bytes AND
+                // the closing delimiter. A nullable string's `null` is
+                // one such value.
+                let until_rule = format!("val_{i}_{c}", c = *until_counter);
+                emit_until_rules(
+                    &until_rule,
+                    &syntax.arguments.value_suffix,
+                    src,
+                );
+                until_rule
+            }
+            TaggedValue::Choice(choice) => {
+                let alts = choice
+                    .iter()
+                    .map(|(s, _)| format!(r#""{}""#, escape_for_gbnf_string(s)))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let _ = writeln!(src, "{typed_rule} ::= {alts}");
+                format!(r#"{typed_rule} "{val_suf_lit}""#)
+            }
+            TaggedValue::Json => {
+                // The tool's `$defs`: a parameter's schema has none of
+                // its own, so a `$ref` in it resolves only from here.
+                let defs = tool.schema.get("$defs").and_then(Value::as_object);
+                schema_to_gbnf_in(schema, defs, &typed_rule, src);
+                format!(r#"{typed_rule} "{val_suf_lit}""#)
+            }
+        };
+        let _ = writeln!(
+            src,
+            r#"{arg_rule} ::= "{arg_pre}{key_lit}{arg_suf}{val_pre}" {value}"#,
+        );
         if !body.is_empty() && !sep.is_empty() {
             let _ = write!(body, r#" "{sep}""#);
         }

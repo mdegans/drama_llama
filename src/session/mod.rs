@@ -11670,6 +11670,146 @@ mod tests {
         });
     }
 
+    /// A string `enum` on Qwen 3.8, token by token through its real
+    /// tokenizer (a `vocab_only` load: CPU, no tensors): the raw member
+    /// — the template's spelling — is admitted whichever way the
+    /// tokenizer splits it, forced (`Any`) and lazily after prose
+    /// (`Auto`), parses to the member and passes the strict backstop;
+    /// the quoted spelling the grammar once forced is masked at the
+    /// token carrying its quote. The shape is Agora's `get_content`
+    /// `detail` (`Option<DetailLevel>`), as schemars emits it.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the Qwen 3.8 GGUF (vocab-only load, CPU)"]
+    fn qwen38_string_enum_raw_by_token() {
+        use crate::backend::Model as _;
+        let spec = FleetSpec {
+            env: "DRAMA_LLAMA_QWEN38_MODEL",
+            file: "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+            on: &[],
+            off: &[],
+            close_prefix: "",
+            crossings: &[],
+        };
+        let Some((model, _, dialect)) = load_fleet_model(&spec) else {
+            return;
+        };
+        assert_eq!(dialect.family, crate::dialect::Family::TagWithTagged);
+        let mut tool = Tool::builder("get_content")
+            .description("Read one piece of content.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "detail": {"anyOf": [
+                        {"oneOf": [
+                            {"type": "string", "const": "summary"},
+                            {"type": "string", "const": "full"},
+                        ]},
+                        {"type": "null"},
+                    ]},
+                },
+                "required": ["id"],
+            }))
+            .build()
+            .expect("valid tool");
+        tool.strict = Some(true);
+        let call = |detail: &str| {
+            format!(
+                "<tool_call>\n<function=get_content>\n\
+                 <parameter=id>\nconstitution\n</parameter>\n\
+                 <parameter=detail>\n{detail}\n</parameter>\n\
+                 </function>\n</tool_call>"
+            )
+        };
+        let prompt = |choice| Prompt {
+            tools: Some(vec![tool.clone().into()]),
+            tool_choice: Some(choice),
+            ..Prompt::default()
+        };
+        let forced = dialect_grammar_for_prompt(
+            &prompt(ToolChoice::Any {
+                disable_parallel_tool_use: true,
+            }),
+            &dialect,
+            false,
+        )
+        .expect("compiles")
+        .expect("forced grammar");
+        let lazy = dialect_deferred_grammar_for_prompt(
+            &prompt(ToolChoice::Auto {
+                disable_parallel_tool_use: true,
+            }),
+            &dialect,
+        )
+        .expect("compiles")
+        .expect("lazy grammar");
+        let grammars = [
+            ("forced", "", crate::CompiledOutputConfig::Single(forced)),
+            (
+                "lazy",
+                "I'll read it.\n\n",
+                crate::CompiledOutputConfig::Deferred(lazy),
+            ),
+        ];
+        let complete = Drive {
+            complete: true,
+            eos_ok: true,
+            unfired: false,
+        };
+        for (label, prose, grammar) in &grammars {
+            for (detail, want) in [
+                ("full", serde_json::json!("full")),
+                ("summary", serde_json::json!("summary")),
+                ("null", serde_json::Value::Null),
+            ] {
+                let emission = format!("{prose}{}", call(detail));
+                let tokens = model.tokenize_special(&emission, false, true);
+                let pieces: Vec<String> =
+                    tokens.iter().map(|&t| model.token_to_piece(t)).collect();
+                assert!(
+                    pieces.concat().contains(&format!(">\n{detail}\n</")),
+                    "{label}: {pieces:?}"
+                );
+                assert_eq!(
+                    drive_token_ids(grammar, &model, &tokens),
+                    Ok(complete),
+                    "{label}: {detail:?} as {pieces:?}"
+                );
+                let blocks = crate::dialect::parse_text(
+                    &dialect,
+                    &[&tool],
+                    &emission,
+                    false,
+                    crate::dialect::Leniency::Final,
+                )
+                .blocks;
+                let input = blocks
+                    .iter()
+                    .find_map(|b| match b {
+                        crate::Block::ToolUse { call } => Some(&call.input),
+                        _ => None,
+                    })
+                    .expect("a call");
+                assert_eq!(input["detail"], want, "{label}");
+                assert_eq!(
+                    crate::schema_check::check(&tool.schema, input),
+                    Ok(()),
+                    "{label}"
+                );
+            }
+            let emission = format!("{prose}{}", call("\"full\""));
+            let tokens = model.tokenize_special(&emission, false, true);
+            let Err(Refused::Masked(i)) =
+                drive_token_ids(grammar, &model, &tokens)
+            else {
+                panic!("{label}: quoted member not masked");
+            };
+            let piece = model.token_to_piece(tokens[i]);
+            assert!(piece.contains('"'), "{label}: masked at {piece:?}");
+        }
+    }
+
     /// Gemma 4: `<|channel>thought…<channel|>`, never pre-opened.
     #[cfg(feature = "llama-cpp")]
     #[test]
@@ -14203,6 +14343,12 @@ mod tests {
     /// makes the model emit, so the round trip is exact for each JSON
     /// scalar — and a string-typed (or nullable-string) value that
     /// merely *looks* like one stays the string the model wrote.
+    ///
+    /// A finite set of strings (`enum`, `const`, nullable, behind a
+    /// `$ref`) is generated raw, the way the template renders any
+    /// string, so its round trip is exact too; the JSON-quoted spelling
+    /// the grammar once forced lost the tip on every such call (Agora's
+    /// `detail`, 2026-10-01).
     #[test]
     fn qwen_cache_stable_round_trips_scalar_args() {
         use crate::Tool;
@@ -14218,8 +14364,22 @@ mod tests {
                     "verbose": {"type": "boolean"},
                     "days": {"type": "integer"},
                     "scale": {"type": "number"},
+                    "mode": {"type": "string", "enum": ["summary", "full"]},
+                    // Agora's `Option<DetailLevel>`, as schemars emits it.
+                    "level": {"anyOf": [
+                        {"oneOf": [
+                            {"type": "string", "const": "summary"},
+                            {"type": "string", "const": "full"},
+                        ]},
+                        {"type": "null"},
+                    ]},
+                    "units": {"type": "string", "const": "metric"},
+                    "tier": {"$ref": "#/$defs/Tier"},
                 },
                 "required": ["city"],
+                "$defs": {
+                    "Tier": {"type": "string", "enum": ["free", "pro"]},
+                },
             }))
             .build()
             .expect("valid tool");
@@ -14267,6 +14427,13 @@ mod tests {
             arg("detail", "None", "None".into()),
             arg("detail", "\"quoted\"", "\"quoted\"".into()),
             arg("detail", "{\"a\": 1}", "{\"a\": 1}".into()),
+            // A finite set of strings: raw, as the template renders it.
+            arg("mode", "full", "full".into()),
+            arg("mode", "summary", "summary".into()),
+            arg("level", "full", "full".into()),
+            arg("level", "null", Value::Null),
+            arg("units", "metric", "metric".into()),
+            arg("tier", "pro", "pro".into()),
         ];
         for baked in [&crate::baked::QWEN36, &crate::baked::QWEN38] {
             let served = crate::baked::detect(baked.stock)
@@ -14274,7 +14441,20 @@ mod tests {
                 .replacement;
             let syntax = crate::dialect::analyze_template(served, "", eos)
                 .expect("analyze");
+            let grammar = crate::dialect::grammar_source(
+                &syntax,
+                &[&tool],
+                &crate::dialect::EmitOptions::default(),
+            )
+            .expect("grammar");
+            let admits = |emission: &str| {
+                let mut state = crate::GrammarState::from_source(&grammar)
+                    .expect("grammar parses");
+                state.advance_bytes(emission.as_bytes()).is_ok()
+                    && state.is_complete()
+            };
             for (emission, value) in &cases {
+                assert!(admits(emission), "{}: {emission:?}", baked.name);
                 let blocks = crate::dialect::parse_text(
                     &syntax,
                     &[&tool],
@@ -14295,6 +14475,26 @@ mod tests {
                 assert_eq!(
                     qwen_divergence(served, &tool, false, emission),
                     None,
+                    "{}: {emission:?}",
+                    baked.name
+                );
+            }
+            // Control: the quoted spelling the grammar once forced on a
+            // set of strings is no longer admitted — re-rendered, it
+            // parts at its opening quote.
+            for key in ["mode", "level", "units", "tier"] {
+                let member = match key {
+                    "units" => "metric",
+                    "tier" => "pro",
+                    _ => "full",
+                };
+                let emission =
+                    call("Paris", Some((key, &format!("\"{member}\""))));
+                assert!(!admits(&emission), "{}: {emission:?}", baked.name);
+                let at = emission.find('"').expect("quote in emission");
+                assert_eq!(
+                    qwen_divergence(served, &tool, false, &emission),
+                    Some(at),
                     "{}: {emission:?}",
                     baked.name
                 );

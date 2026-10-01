@@ -29,8 +29,9 @@
 //!
 //! Tagged raw values are schema-coerced: params typed `string` (or
 //! unknown) stay raw strings, as do nullable strings bar a literal
-//! `null` — never a string `enum`, which the grammar generates as
-//! JSON; anything else is parsed as JSON after
+//! `null`; a finite set of strings (`enum`, `const`, nullable or not)
+//! reads by exact match on its members' raw spellings, as the grammar
+//! generates it; anything else is parsed as JSON after
 //! normalizing pythonisms (`True`/`False`/`None`, single-quoted
 //! strings) with bounded brace-healing, falling back to a JSON
 //! string of the raw bytes when parsing still fails. Parse never
@@ -44,6 +45,7 @@ use crate::chat_template::is_tool_name;
 use crate::prompt::{Block, ToolUse};
 use crate::Tool;
 
+use super::emit::{tagged_value, TaggedValue};
 use super::partial::{
     marker_holdback, read_partial, unclosed_json, Flavor, OpenStrings,
 };
@@ -1299,16 +1301,6 @@ impl<'a> Parser<'a> {
         CallOutcome::Parsed
     }
 
-    fn schema_for(&self, tool: &str, param: &str) -> Option<Value> {
-        self.tools
-            .iter()
-            .find(|t| t.name.as_ref() == tool)?
-            .schema
-            .get("properties")?
-            .get(param)
-            .cloned()
-    }
-
     fn push_call(&mut self, name: String, input: Value) {
         let call = self.make_call(name, input);
         self.blocks.push(Block::ToolUse { call });
@@ -1416,26 +1408,41 @@ impl<'a> Parser<'a> {
     }
 
     /// Schema-guided coercion of a raw tagged value (llama.cpp
-    /// mapper parity): `string`-typed (or unknown) params stay raw;
-    /// otherwise parse as JSON after pythonism normalization with
-    /// bounded brace healing; fall back to a raw string.
+    /// mapper parity), spelled as [`tagged_value`] says the grammar
+    /// generates it: a string param (or an unknown one) stays raw; a
+    /// nullable string too, bar `null`; a finite set of strings is
+    /// matched exactly against its members' spellings; anything else
+    /// is parsed as JSON after pythonism normalization with bounded
+    /// brace healing, falling back to a raw string.
     ///
-    /// A nullable string (`"type": ["string", "null"]`, no `enum`) is
-    /// generated raw, like any string (the grammar sees through
-    /// nullability), so it is read raw too: JSON `null` is its one
-    /// non-string value. Parsing it as JSON would type a `5` or `true`
-    /// the model wrote as text, and unquote a `"quoted"` one, which
-    /// then re-renders without its quotes.
+    /// Parsing a raw string as JSON would type a `5` or `true` the
+    /// model wrote as text, and unquote a `"quoted"` one, which then
+    /// re-renders without its quotes.
+    ///
+    /// [`tagged_value`]: super::emit::tagged_value
     fn coerce_value(&self, tool: &str, param: &str, raw: &str) -> Value {
-        if self.is_string_param(tool, param) {
-            return Value::String(raw.to_string());
-        }
         let trimmed = raw.trim();
-        if self.is_nullable_string_param(tool, param) {
-            return match trimmed {
-                "null" => Value::Null,
-                _ => Value::String(raw.to_string()),
-            };
+        match self.tagged_value(tool, param) {
+            None | Some(TaggedValue::Raw { nullable: false }) => {
+                return Value::String(raw.to_string());
+            }
+            Some(TaggedValue::Raw { nullable: true }) => {
+                return match trimmed {
+                    "null" => Value::Null,
+                    _ => Value::String(raw.to_string()),
+                };
+            }
+            Some(TaggedValue::Choice(choice)) => {
+                // Exact under the grammar; trimmed, or quoted (read as
+                // JSON below), only from a model writing unconstrained.
+                let found = [raw, trimmed].into_iter().find_map(|text| {
+                    choice.iter().find(|(s, _)| s == text).map(|(_, v)| v)
+                });
+                if let Some(value) = found {
+                    return value.clone();
+                }
+            }
+            Some(TaggedValue::Json) => {}
         }
         if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
             return v;
@@ -1447,30 +1454,24 @@ impl<'a> Parser<'a> {
         Value::String(raw.to_string())
     }
 
-    /// Whether `param` of `tool` takes its raw text as a string: typed
-    /// `string` without an `enum`, or unknown. A string `enum` is not
-    /// raw: the grammar generates it as JSON (`"full"`, quotes and all —
-    /// `dialect::emit`'s `schema_is_string`), so reading it raw handed
-    /// the tool `"\"full\""` and failed the schema backstop on every
-    /// draw.
-    fn is_string_param(&self, tool: &str, param: &str) -> bool {
-        match self.schema_for(tool, param) {
-            Some(s) => {
-                s.get("type").and_then(|t| t.as_str()) == Some("string")
-                    && s.get("enum").is_none()
-            }
-            None => true,
-        }
+    /// How `param` of `tool` is spelled ([`tagged_value`]); `None`
+    /// when the schema does not declare it, which reads as a string.
+    ///
+    /// [`tagged_value`]: super::emit::tagged_value
+    fn tagged_value(&self, tool: &str, param: &str) -> Option<TaggedValue> {
+        let schema =
+            &self.tools.iter().find(|t| t.name.as_ref() == tool)?.schema;
+        let param = schema.get("properties")?.get(param)?;
+        Some(tagged_value(self.syntax, schema, param))
     }
 
-    /// Whether `param` of `tool` is a nullable string the grammar
-    /// generates raw: a string once `null` is set aside, with no
-    /// `enum` (an enum is generated as JSON).
-    fn is_nullable_string_param(&self, tool: &str, param: &str) -> bool {
-        self.schema_for(tool, param).is_some_and(|s| {
-            crate::grammar_compile::effective_type(&s) == Some("string")
-                && s.get("enum").is_none()
-        })
+    /// Whether `param` of `tool` takes its raw text as a string, so the
+    /// value in flight is one too: a non-nullable string, or unknown.
+    fn is_string_param(&self, tool: &str, param: &str) -> bool {
+        matches!(
+            self.tagged_value(tool, param),
+            None | Some(TaggedValue::Raw { nullable: false })
+        )
     }
 
     /// Read the call the input ended inside, starting at its opener
@@ -2586,57 +2587,434 @@ mod tests {
         }
     }
 
-    /// A string `enum` parameter on Qwen XML: the grammar generates its
-    /// value as JSON (`"full"`, quoted), so the parser must read it as
-    /// JSON too. Read raw, the tool got `"\"full\""`, which no draw can
-    /// fix — the schema backstop refused it every time, and blallama
-    /// answered 500 after its resamples. A plain string stays raw.
-    #[test]
-    fn qwen_xml_string_enum_reads_what_the_grammar_writes() {
-        let syntax = CallSyntax::qwen_xml();
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "mode": {"type": "string", "enum": ["full", "lite"]},
-                "note": {"type": "string"},
-            },
-            "required": ["mode", "note"],
-        });
-        let mut t = Tool::builder("set_mode")
-            .description("test")
-            .schema(schema.clone())
-            .build()
-            .expect("valid test tool");
-        t.strict = Some(true);
-        let emission = "<tool_call>\n<function=set_mode>\n\
-                        <parameter=mode>\n\"full\"\n</parameter>\n\
-                        <parameter=note>\n\"quoted\" note\n</parameter>\n\
-                        </function>\n</tool_call>";
-
-        // What the grammar admits: the enum quoted, never raw.
+    /// Whether `tool`'s Qwen XML grammar admits `emission` whole.
+    fn qwen_admits(tool: &Tool, emission: &str) -> bool {
         let source = crate::dialect::grammar_source(
-            &syntax,
-            &[&t],
+            &CallSyntax::qwen_xml(),
+            &[tool],
             &crate::dialect::EmitOptions::default(),
         )
         .expect("grammar");
-        let admits = |text: &str| {
+        let mut state =
+            crate::GrammarState::from_source(&source).expect("grammar parses");
+        state.advance_bytes(emission.as_bytes()).is_ok() && state.is_complete()
+    }
+
+    /// A one-parameter Qwen XML call to `set_mode` with `raw` between
+    /// the tags.
+    fn qwen_mode_call(raw: &str) -> String {
+        format!(
+            "<tool_call>\n<function=set_mode>\n\
+             <parameter=mode>\n{raw}\n</parameter>\n\
+             </function>\n</tool_call>"
+        )
+    }
+
+    /// A strict `set_mode` tool whose one required parameter is `mode`.
+    fn mode_tool(mode: Value, defs: Option<Value>) -> Tool {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"mode": mode},
+            "required": ["mode"],
+        });
+        if let Some(defs) = defs {
+            schema["$defs"] = defs;
+        }
+        let mut tool = Tool::builder("set_mode")
+            .description("test")
+            .schema(schema)
+            .build()
+            .expect("valid test tool");
+        tool.strict = Some(true);
+        tool
+    }
+
+    /// The Agora `get_content` `detail` parameter, as schemars 1.x emits
+    /// `Option<DetailLevel>` for an `inline` enum whose variants carry
+    /// docs (descriptions shortened): a `oneOf` of `const`s, made
+    /// nullable by an outer `anyOf`.
+    fn agora_detail() -> Value {
+        json!({
+            "description": "How much to return.",
+            "anyOf": [
+                {
+                    "description": "How much of a piece of content.",
+                    "oneOf": [
+                        {
+                            "description": "The short form.",
+                            "type": "string",
+                            "const": "summary",
+                        },
+                        {
+                            "description": "The verbatim record.",
+                            "type": "string",
+                            "const": "full",
+                        },
+                    ],
+                },
+                {"type": "null"},
+            ],
+        })
+    }
+
+    /// A finite set of strings on Qwen XML is generated raw, the way
+    /// the template re-renders it (`args_value | string`): the model
+    /// was trained on `<parameter=detail>\nfull\n</parameter>`. Quoted,
+    /// as the grammar once forced it, the value re-rendered without its
+    /// quotes and the turn missed the tip on every such call (seen live
+    /// on Agora: `detail` = `"summary"`). Every shape a finite string
+    /// set reaches the grammar in — `enum`, `const`, nullable, through
+    /// `$ref`, `anyOf` and schemars' `oneOf` — admits the raw member
+    /// and no other spelling, parses to the member, passes the strict
+    /// schema backstop, and renders back byte for byte.
+    #[test]
+    fn qwen_xml_string_set_is_generated_and_read_raw() {
+        let level = Some(
+            json!({"Level": {"type": "string", "enum": ["lite", "full"]}}),
+        );
+        let level_ref = json!({"$ref": "#/$defs/Level"});
+        // `(name, schema, $defs, nullable)`.
+        let shapes: Vec<(&str, Value, Option<Value>, bool)> = vec![
+            (
+                "enum",
+                json!({"type": "string", "enum": ["lite", "full"]}),
+                None,
+                false,
+            ),
+            (
+                "nullable enum",
+                json!({"type": ["string", "null"], "enum": ["lite", "full", null]}),
+                None,
+                true,
+            ),
+            (
+                "anyOf[enum, null]",
+                json!({"anyOf": [
+                    {"type": "string", "enum": ["lite", "full"]},
+                    {"type": "null"},
+                ]}),
+                None,
+                true,
+            ),
+            (
+                "const",
+                json!({"type": "string", "const": "full"}),
+                None,
+                false,
+            ),
+            (
+                "anyOf[const, const]",
+                json!({"anyOf": [{"const": "lite"}, {"const": "full"}]}),
+                None,
+                false,
+            ),
+            ("$ref", level_ref.clone(), level.clone(), false),
+            (
+                "anyOf[$ref, null]",
+                json!({"anyOf": [level_ref, {"type": "null"}]}),
+                level,
+                true,
+            ),
+            ("Agora Option<DetailLevel>", agora_detail(), None, true),
+        ];
+        let syntax = CallSyntax::qwen_xml();
+        for (name, schema, defs, nullable) in shapes {
+            let tool = mode_tool(schema, defs);
+            let emission = qwen_mode_call("full");
+            assert!(qwen_admits(&tool, &emission), "{name}: raw member");
+            for wrong in ["\"full\"", "fullest", "ful", "Full", " full", ""] {
+                assert!(
+                    !qwen_admits(&tool, &qwen_mode_call(wrong)),
+                    "{name}: admits {wrong:?}"
+                );
+            }
+            let null = qwen_mode_call("null");
+            assert_eq!(qwen_admits(&tool, &null), nullable, "{name}: null");
+
+            let mut cases = vec![(emission, json!("full"))];
+            if nullable {
+                cases.push((null, Value::Null));
+            }
+            for (emission, want) in cases {
+                let parsed = parse_text(
+                    &syntax,
+                    &[&tool],
+                    &emission,
+                    false,
+                    Leniency::Final,
+                );
+                let calls = calls_of(&parsed.blocks);
+                assert_eq!(calls.len(), 1, "{name}: {parsed:#?}");
+                assert_eq!(calls[0].1, &json!({"mode": want}), "{name}");
+                assert_eq!(
+                    crate::schema_check::check(&tool.schema, calls[0].1),
+                    Ok(()),
+                    "{name}"
+                );
+                let rendered =
+                    render_reference(&syntax, &[("set_mode", calls[0].1)])
+                        .expect("renders");
+                assert_eq!(rendered, emission, "{name}: byte-stable");
+            }
+        }
+    }
+
+    /// A quoted member — what the grammar wrote before the set went raw,
+    /// or what a model writes unconstrained — still reads as the member,
+    /// so a transcript from either side of the change parses; so does a
+    /// padded one. Text that is no member falls through to the JSON read.
+    #[test]
+    fn qwen_xml_string_set_reads_leniently() {
+        let syntax = CallSyntax::qwen_xml();
+        let tool = mode_tool(
+            json!({"type": "string", "enum": ["lite", "full"]}),
+            None,
+        );
+        for (raw, want) in [
+            ("\"full\"", json!("full")),
+            (" full ", json!("full")),
+            ("other", json!("other")),
+        ] {
+            let parsed = parse_text(
+                &syntax,
+                &[&tool],
+                &qwen_mode_call(raw),
+                false,
+                Leniency::Final,
+            );
+            let calls = calls_of(&parsed.blocks);
+            assert_eq!(calls[0].1, &json!({"mode": want}), "{raw:?}");
+        }
+    }
+
+    /// The edges of the raw spelling. A mixed set spells its strings raw
+    /// and the rest as JSON, which is what the template renders for each.
+    /// A set whose spellings would collide (`"1"` beside `1`, `"null"`
+    /// beside `null`) or whose member contains the close tag stays JSON:
+    /// raw, it could not be read back. A member with surrounding
+    /// whitespace stays raw: the template renders it verbatim and the
+    /// read is byte-exact.
+    #[test]
+    fn qwen_xml_string_set_edges() {
+        let syntax = CallSyntax::qwen_xml();
+        let close = syntax.arguments.value_suffix.clone();
+        let tagged = |mode: Value| {
+            let tool = mode_tool(mode, None);
+            crate::dialect::emit::tagged_value(
+                &syntax,
+                &tool.schema,
+                &tool.schema["properties"]["mode"],
+            )
+        };
+        let raw = |pairs: &[(&str, Value)]| {
+            TaggedValue::Choice(
+                pairs
+                    .iter()
+                    .map(|(s, v)| (s.to_string(), v.clone()))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            tagged(json!({"enum": ["a", 1, null]})),
+            raw(&[("a", json!("a")), ("1", json!(1)), ("null", Value::Null)])
+        );
+        assert_eq!(
+            tagged(json!({"enum": [" padded "]})),
+            raw(&[(" padded ", json!(" padded "))])
+        );
+        // The empty string is a spelling too: nothing between the tags.
+        assert_eq!(
+            tagged(json!({"enum": ["", "a"]})),
+            raw(&[("", json!("")), ("a", json!("a"))])
+        );
+        for json_only in [
+            json!({"enum": ["1", 1]}),
+            json!({"enum": ["null", null]}),
+            json!({"enum": ["true", true]}),
+            json!({"enum": [format!("a{close}b")]}),
+            // Ends with the close tag's prefix, so the first close tag
+            // in `member + close` starts inside the member.
+            json!({"enum": ["a\n</parameter>"]}),
+            // No string in it: JSON as ever.
+            json!({"enum": [1, 2]}),
+            json!({"type": "null"}),
+            // A free string beside a non-string set.
+            json!({"anyOf": [{"type": "string"}, {"const": 1}]}),
+            json!({"anyOf": [{"enum": ["a"]}, {"type": "integer"}]}),
+        ] {
+            assert_eq!(
+                tagged(json_only.clone()),
+                TaggedValue::Json,
+                "{json_only}"
+            );
+        }
+        for (string, nullable) in [
+            (json!({"type": "string"}), false),
+            (json!({"type": ["string", "null"]}), true),
+            (
+                json!({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+                true,
+            ),
+            // A free string swallows a set of strings.
+            (
+                json!({"anyOf": [{"type": "string"}, {"const": "a"}]}),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                tagged(string.clone()),
+                TaggedValue::Raw { nullable },
+                "{string}"
+            );
+        }
+
+        // The mixed set end to end: admitted raw, read typed, rendered
+        // back byte for byte.
+        let tool = mode_tool(json!({"enum": ["a", 1, null]}), None);
+        assert!(!qwen_admits(&tool, &qwen_mode_call("\"a\"")));
+        for (raw, want) in
+            [("a", json!("a")), ("1", json!(1)), ("null", Value::Null)]
+        {
+            let emission = qwen_mode_call(raw);
+            assert!(qwen_admits(&tool, &emission), "{raw:?}");
+            let parsed = parse_text(
+                &syntax,
+                &[&tool],
+                &emission,
+                false,
+                Leniency::Final,
+            );
+            let calls = calls_of(&parsed.blocks);
+            assert_eq!(calls[0].1, &json!({"mode": want}), "{raw:?}");
+            assert_eq!(
+                crate::schema_check::check(&tool.schema, calls[0].1),
+                Ok(())
+            );
+            assert_eq!(
+                render_reference(&syntax, &[("set_mode", calls[0].1)]).unwrap(),
+                emission
+            );
+        }
+
+        // A colliding set is JSON on both sides: quoted admitted, read
+        // as the string.
+        let tool = mode_tool(json!({"enum": ["1", 1]}), None);
+        assert!(qwen_admits(&tool, &qwen_mode_call("\"1\"")));
+        assert!(qwen_admits(&tool, &qwen_mode_call("1")));
+        let parsed = parse_text(
+            &syntax,
+            &[&tool],
+            &qwen_mode_call("\"1\""),
+            false,
+            Leniency::Final,
+        );
+        assert_eq!(calls_of(&parsed.blocks)[0].1, &json!({"mode": "1"}));
+    }
+
+    /// A tagged parameter's `$ref` resolves against the tool's `$defs`:
+    /// the parameter's own schema carries none, and an unresolved ref
+    /// compiled to any JSON value.
+    #[test]
+    fn qwen_xml_ref_param_resolves_against_the_tool_defs() {
+        let tool = mode_tool(
+            json!({"$ref": "#/$defs/Point"}),
+            Some(json!({"Point": {
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"],
+            }})),
+        );
+        assert!(qwen_admits(&tool, &qwen_mode_call(r#"{"x":1}"#)));
+        for wrong in [r#"{"y":1}"#, r#"{"x":"1"}"#, "[]", "1"] {
+            assert!(!qwen_admits(&tool, &qwen_mode_call(wrong)), "{wrong}");
+        }
+    }
+
+    /// The raw spelling is the tagged dialects' alone: a JSON dialect
+    /// still quotes a string enum, as JSON must.
+    #[test]
+    fn json_dialects_keep_quoting_a_string_set() {
+        let tool = mode_tool(
+            json!({"type": "string", "enum": ["lite", "full"]}),
+            None,
+        );
+        let syntax = CallSyntax::hermes_json();
+        let source = crate::dialect::grammar_source(
+            &syntax,
+            &[&tool],
+            &crate::dialect::EmitOptions::default(),
+        )
+        .expect("grammar");
+        let admits = |mode: &str| {
+            let call = render_reference(
+                &syntax,
+                &[("set_mode", &json!({"mode": mode}))],
+            )
+            .expect("renders");
             let mut state = crate::GrammarState::from_source(&source)
                 .expect("grammar parses");
-            state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+            (state.advance_bytes(call.as_bytes()).is_ok()
+                && state.is_complete())
+            .then_some(call)
         };
-        assert!(admits(emission), "{source}");
-        assert!(!admits(&emission.replacen("\"full\"", "full", 1)));
+        let call = admits("full").expect("quoted member admitted");
+        assert!(call.contains(r#""mode":"full""#), "{call}");
+        assert!(admits("fullest").is_none());
+    }
 
-        let parsed =
-            parse_text(&syntax, &[&t], emission, false, Leniency::Final);
-        let calls = calls_of(&parsed.blocks);
-        assert_eq!(calls.len(), 1, "{parsed:#?}");
-        assert_eq!(
-            calls[0].1,
-            &json!({"mode": "full", "note": "\"quoted\" note"})
-        );
-        assert_eq!(crate::schema_check::check(&schema, calls[0].1), Ok(()));
+    /// The schemars derive itself, not a transcription of its output:
+    /// Agora's `Option<DetailLevel>`, `inline` with documented variants.
+    #[cfg(feature = "json-schema")]
+    #[test]
+    fn qwen_xml_reads_a_derived_option_enum_raw() {
+        /// How much of a piece of content to return.
+        #[derive(schemars::JsonSchema)]
+        #[schemars(inline)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum DetailLevel {
+            /// The short form.
+            Summary,
+            /// The verbatim record.
+            Full,
+        }
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct GetContentInput {
+            /// How much to return.
+            detail: Option<DetailLevel>,
+        }
+        let schema =
+            serde_json::to_value(schemars::schema_for!(GetContentInput))
+                .expect("schema");
+        let mut tool = Tool::builder("set_mode")
+            .description("test")
+            .schema(json!({
+                "type": "object",
+                "properties": {"mode": schema["properties"]["detail"]},
+            }))
+            .build()
+            .expect("valid test tool");
+        tool.strict = Some(true);
+        let syntax = CallSyntax::qwen_xml();
+        for (raw, want) in [("full", json!("full")), ("null", Value::Null)] {
+            let emission = qwen_mode_call(raw);
+            assert!(qwen_admits(&tool, &emission), "{raw}: {schema:#}");
+            let parsed = parse_text(
+                &syntax,
+                &[&tool],
+                &emission,
+                false,
+                Leniency::Final,
+            );
+            let calls = calls_of(&parsed.blocks);
+            assert_eq!(calls[0].1, &json!({"mode": want}));
+            assert_eq!(
+                crate::schema_check::check(&tool.schema, calls[0].1),
+                Ok(())
+            );
+        }
+        assert!(!qwen_admits(&tool, &qwen_mode_call("\"full\"")));
     }
 
     /// Adversarial raw values (plan amendments): trailing newlines

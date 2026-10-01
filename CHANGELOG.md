@@ -327,13 +327,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with each natural gap is admitted, complete and EOS-legal and keeps
   the turn contract, and the trigger-crossing tokens are admitted or
   masked — never fatal.
-- **A Qwen XML tool's string `enum` argument reads as its value.** The
-  grammar writes such a value as JSON (`"full"`, quoted) but the parser
-  read it raw, so the tool got `"\"full\""` — and, for a `strict`
-  tool, the schema backstop refused it on every draw and blallama
-  answered 500. The parser now reads a string `enum` as JSON, matching
-  the emitter. The quoted spelling is not what the template re-renders
-  (`full`), so such a turn's tip does not re-render byte-for-byte.
+- **A Qwen XML tool's string `enum` argument is written raw, as the
+  template renders it.** The grammar wrote such a value as JSON
+  (`"full"`, quoted) but the parser read it raw, so the tool got
+  `"\"full\""` — and, for a `strict` tool, the schema backstop refused
+  it on every draw and blallama answered 500. Qwen's template renders
+  any string argument raw (`args_value | string`), so the model was
+  trained on `<parameter=detail>\nfull\n</parameter>`, and a quoted
+  value re-rendered without its quotes: a tip miss on every such call
+  (Agora's `detail`). In a tagged dialect (`Family::TagWithTagged`;
+  of the fleet, Qwen 3.6 and 3.8) a string value is now never
+  JSON-quoted at the top of a parameter: a parameter that admits only
+  finitely many values, at least one a string — `enum`, `const`,
+  nullable or not, through `$ref`, `anyOf` or schemars' `oneOf` of
+  `const`s (`Option<DetailLevel>`) — is generated as an alternation of
+  its members' raw spellings (`full`, `null`) and read back by exact
+  match, so the round trip is byte-for-byte and a member passes the
+  `strict` backstop. A mixed set (`["a", 1, null]`) spells its strings
+  raw and the rest as JSON, as the template renders each; a set whose
+  spellings would collide (`"1"` beside `1`, `"null"` beside `null`) or
+  whose member contains the close tag stays JSON. A union of a free
+  string and `null` (`anyOf: [{"type": "string"}, {"type": "null"}]`)
+  is now raw like `"type": ["string", "null"]` already was. A quoted
+  member from an unconstrained model still reads as the member. JSON
+  dialects (Hermes/cogito, Mistral, gpt-oss, Gemma) are unchanged.
+  Also: a tagged parameter's `$ref` now resolves against the tool's
+  `$defs` (it compiled to any JSON value before).
 - **The schema backstop reads every number the grammar can write.** The
   grammar's `number` has an unbounded integer part, and serde_json
   refuses one too large for `f64` ("number out of range"), so such an

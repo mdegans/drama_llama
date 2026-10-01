@@ -96,6 +96,21 @@ pub fn schema_to_gbnf(schema: &Value, rule_name: &str, out: &mut String) {
     emit_schema_rule(schema, rule_name, out, &mut counter, defs);
 }
 
+/// [`schema_to_gbnf`] for a subschema of a larger document, whose
+/// `$ref`s resolve against `defs` — the root's `$defs` table, which a
+/// tagged dialect's per-parameter schema does not carry. A `$defs` of
+/// the subschema's own is the fallback.
+pub(crate) fn schema_to_gbnf_in(
+    schema: &Value,
+    defs: Option<&serde_json::Map<String, Value>>,
+    rule_name: &str,
+    out: &mut String,
+) {
+    let defs = defs.or_else(|| schema.get("$defs").and_then(|v| v.as_object()));
+    let mut counter: usize = 0;
+    emit_schema_rule(schema, rule_name, out, &mut counter, defs);
+}
+
 /// The schema's effective type, seeing through nullability: a bare
 /// `"type": "T"`, or a type array whose non-`"null"` entries collapse
 /// to exactly one `T` — schemars 1.x renders `Option<T>` as
