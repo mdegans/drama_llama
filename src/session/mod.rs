@@ -10999,11 +10999,13 @@ mod tests {
                         constrain,
                         ROLE_CONSENT_VALID,
                     );
+                    // The plain header is refused: the template
+                    // re-renders a JSON final with its constraint.
                     assert_eq!(
                         constraint_admits(&compiled, &good),
-                        Some(true),
-                        "{at}: valid body must be admitted and complete: \
-                         {good}"
+                        constrain.then_some(true),
+                        "{at}: valid body must be admitted and complete \
+                         under the constrained header only: {good}"
                     );
                 }
             }
@@ -11620,32 +11622,45 @@ mod tests {
                         "thinking {label}, analysis {analysis}, \
                          constrain {constrain}"
                     );
-                    for bad in
-                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
-                    {
-                        let emission =
-                            harmony_emission(analysis, constrain, bad);
-                        let got = drive_tokens(&compiled, &model, &emission);
-                        // Refused inside the body, past `"soul_text":""`.
+                    let refused_at = |emission: &str| {
+                        let got = drive_tokens(&compiled, &model, emission);
                         let tokens =
-                            model.tokenize_special(&emission, false, true);
-                        let Err(Refused::Masked(refused_at)) = got else {
-                            panic!("{at}: invalid body not masked: {got:?}")
+                            model.tokenize_special(emission, false, true);
+                        let Err(Refused::Masked(at_token)) = got else {
+                            panic!("{at}: not masked: {got:?}: {emission}")
                         };
-                        let prefix: String = tokens[..refused_at]
+                        tokens[..at_token]
                             .iter()
                             .map(|&t| model.token_to_piece(t))
-                            .collect();
-                        assert!(
-                            prefix.contains(r#""soul_text":"""#),
-                            "{at}: refused too early, after {prefix:?}"
-                        );
-                    }
+                            .collect::<String>()
+                    };
                     let good = harmony_emission(
                         analysis,
                         constrain,
                         ROLE_CONSENT_VALID,
                     );
+                    if !constrain {
+                        // The plain header is refused before any body:
+                        // the template re-renders a JSON final with its
+                        // constraint.
+                        let prefix = refused_at(&good);
+                        assert!(
+                            prefix.ends_with("<|channel|>final"),
+                            "{at}: refused at {prefix:?}"
+                        );
+                        continue;
+                    }
+                    for bad in
+                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
+                    {
+                        // Refused inside the body, past `"soul_text":""`.
+                        let prefix =
+                            refused_at(&harmony_emission(analysis, true, bad));
+                        assert!(
+                            prefix.contains(r#""soul_text":"""#),
+                            "{at}: refused too early, after {prefix:?}"
+                        );
+                    }
                     assert_eq!(
                         drive_tokens(&compiled, &model, &good),
                         Ok(Drive {
@@ -14503,12 +14518,16 @@ mod tests {
         assert_eq!((before, after), ("h", "é"));
     }
 
-    /// Where a Qwen round trip parts, for one emission, as the session
-    /// measures it: the generation prompt, the emission parsed to
-    /// blocks against `tool`, the turn re-rendered.
-    fn qwen_divergence(
+    /// Where a round trip through `source` parts, for one emission, as
+    /// the session measures it: the generation prompt (one user turn,
+    /// `tools` declared), the emission parsed to blocks the way the
+    /// session parses it (pre-opened when the render ends in the
+    /// reasoning opener), merged as it seats a response, and the turn
+    /// re-rendered. `(bos, eos)` are the model's, for the analyzer.
+    fn fleet_divergence(
         source: &str,
-        tool: &crate::Tool,
+        (bos, eos): (&str, &str),
+        tools: &[&crate::Tool],
         thinking: bool,
         emission: &str,
     ) -> Option<usize> {
@@ -14516,21 +14535,21 @@ mod tests {
             prompt::{Message, Role},
             ChatTemplate, Content, RenderOptions,
         };
-        let eos = "<|im_end|>";
         let template = ChatTemplate::from_source(
             source.to_owned(),
-            String::new(),
+            bos.to_owned(),
             eos.to_owned(),
         )
         .expect("template compiles");
-        let syntax =
-            crate::dialect::analyze_template(source, "", eos).expect("analyze");
+        let syntax = crate::dialect::analyze_template(source, bos, eos)
+            .expect("analyze");
         let base = Prompt {
             messages: vec![Message {
                 role: Role::User,
                 content: Content::text("Who checks the fog signal?"),
             }],
-            tools: Some(vec![tool.clone().into()]),
+            tools: (!tools.is_empty())
+                .then(|| tools.iter().map(|&t| t.clone().into()).collect()),
             ..Prompt::default()
         };
         let opts = RenderOptions::default()
@@ -14543,9 +14562,9 @@ mod tests {
             .expect("render");
         let blocks = crate::dialect::parse_text(
             &syntax,
-            &[tool],
+            tools,
             emission,
-            thinking,
+            render_ends_with_open_reasoning(&prompt, &syntax),
             crate::dialect::Leniency::Final,
         )
         .blocks;
@@ -14558,6 +14577,22 @@ mod tests {
             .render_with(&turn, &opts.with_generation_prompt(false))
             .expect("render");
         emission_divergence(&extended, &prompt, emission)
+    }
+
+    /// [`fleet_divergence`] for a Qwen template and one tool.
+    fn qwen_divergence(
+        source: &str,
+        tool: &crate::Tool,
+        thinking: bool,
+        emission: &str,
+    ) -> Option<usize> {
+        fleet_divergence(
+            source,
+            ("", "<|im_end|>"),
+            &[tool],
+            thinking,
+            emission,
+        )
     }
 
     /// Regression for the 2026-09-30 live tip drop (Qwen3.6-35B-A3B):
@@ -14860,6 +14895,77 @@ mod tests {
             "stock 3.6 should re-render null as none"
         );
         assert_eq!(stock(crate::baked::QWEN38.stock), None);
+    }
+
+    /// Regression for the 2026-10-01 live tip drops (gpt-oss-120b on
+    /// Agora, 470..1111 tokens a turn): gpt-oss writes a structured
+    /// answer under `<|channel|>final <|constrain|>json<|message|>`, its
+    /// content type, unforced; the template re-rendered every final
+    /// channel plain, so each JSON final parted from the KV at the
+    /// constraint. The bake renders the constraint on a JSON final (and
+    /// the output_config grammar requires it, so the two cannot part);
+    /// a prose final stays plain.
+    #[test]
+    fn gptoss_cache_stable_round_trips_json_final() {
+        let tokens = ("<|startoftext|>", "<|return|>");
+        let analysis = "<|channel|>analysis<|message|>Plan.<|end|>\
+                        <|start|>assistant";
+        let json_final = r#"<|channel|>final <|constrain|>json<|message|>{"content":"Memory: A\nB","n":[1,2]}"#;
+        let array_final =
+            r#"<|channel|>final <|constrain|>json<|message|>[{"a":1}]"#;
+        let prose_final = "<|channel|>final<|message|>It is {not} JSON.";
+        let short_final = "<|channel|>final<|message|>Ada.";
+        for baked in [&crate::baked::GPTOSS, &crate::baked::GPTOSS_UPSTREAM] {
+            let served = crate::baked::detect(baked.stock)
+                .expect("stock dump detects")
+                .replacement;
+            for body in [json_final, array_final, prose_final, short_final] {
+                for thinking in [false, true] {
+                    let emission = match thinking {
+                        true => format!("{analysis}{body}"),
+                        false => body.to_owned(),
+                    };
+                    assert_eq!(
+                        fleet_divergence(
+                            served,
+                            tokens,
+                            &[],
+                            thinking,
+                            &emission
+                        ),
+                        None,
+                        "{}: {emission:?}",
+                        baked.name
+                    );
+                }
+            }
+        }
+        // Irreducible, and pinned: a final the model wrote as JSON
+        // without the constraint (only free generation can — the
+        // grammar requires it) re-renders with it.
+        let plain_json = r#"<|channel|>final<|message|>{"a":1}"#;
+        assert_eq!(
+            fleet_divergence(
+                crate::baked::GPTOSS.replacement,
+                tokens,
+                &[],
+                false,
+                plain_json
+            ),
+            Some("<|channel|>final".len())
+        );
+        // So does prose that merely starts and ends like JSON.
+        let braced = "<|channel|>final<|message|>{x} or {y}";
+        assert_eq!(
+            fleet_divergence(
+                crate::baked::GPTOSS.replacement,
+                tokens,
+                &[],
+                false,
+                braced
+            ),
+            Some("<|channel|>final".len())
+        );
     }
 
     /// An assistant turn aged out with `preserve_thinking` off drops its

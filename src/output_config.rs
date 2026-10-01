@@ -67,8 +67,8 @@ pub const THINK_OPEN: &str = "<think>";
 pub const THOUGHT_GAP_MAX: usize = 2;
 
 /// The [`ResponseFraming::Harmony`] phase-split trigger: the final
-/// channel's header up to the channel name. What follows it — an
-/// optional ` <|constrain|>json`, then `<|message|>` — is the grammar's.
+/// channel's header up to the channel name. What follows it —
+/// ` <|constrain|>json`, then `<|message|>` — is the grammar's.
 pub const HARMONY_FINAL_TRIGGER: &str = "<|channel|>final";
 
 /// How the chat format frames a structured response — where the JSON
@@ -84,7 +84,7 @@ pub enum ResponseFraming {
     Bare,
     /// OpenAI Harmony (gpt-oss): the generation prompt ends at
     /// `<|start|>assistant`, so the body lives in the final channel —
-    /// `<|channel|>final<|message|>{…}`, or with the ` <|constrain|>json`
+    /// `<|channel|>final <|constrain|>json<|message|>{…}`, the header
     /// gpt-oss writes for JSON — after at most one analysis block
     /// (closed by `<|end|>`, reopened by `<|start|>assistant`).
     Harmony,
@@ -469,9 +469,14 @@ pub(crate) fn build_json_only_grammar_source(
 
 /// The Harmony final-channel header, from `lead` (what of
 /// `<|channel|>final` the rule still has to spell) through
-/// `<|message|>`, with the ` <|constrain|>json` gpt-oss writes for JSON
-/// optional: both spellings are the model's, and the parser reads both.
-/// The body follows `<|message|>` directly, as the template renders it.
+/// `<|message|>`, with the ` <|constrain|>json` gpt-oss writes for JSON.
+///
+/// The constraint is required, not optional: it is the model's own
+/// habit (every live JSON final, unforced, carried it), and the baked
+/// gpt-oss template re-renders it on a final channel whose content is
+/// JSON — so a body written without it would re-render a byte longer
+/// and lose the turn's tip. The body follows `<|message|>` directly,
+/// as the template renders it.
 fn emit_harmony_final_header(rule: &str, lead: &str, out: &mut String) {
     let lead = match lead {
         "" => String::new(),
@@ -479,7 +484,7 @@ fn emit_harmony_final_header(rule: &str, lead: &str, out: &mut String) {
     };
     let _ = writeln!(
         out,
-        r#"{rule} ::= {lead}( " {constrain}json" )? "{msg}""#,
+        r#"{rule} ::= {lead}" {constrain}json{msg}""#,
         constrain = escape_for_gbnf_string(harmony::CONSTRAIN),
         msg = escape_for_gbnf_string(harmony::MESSAGE),
     );
@@ -902,17 +907,19 @@ mod tests {
         assert_eq!(d.activate_after, vec![b"<|channel|>final".to_vec()]);
         assert!(!d.feed_trigger);
         let tail = d.grammar.source();
-        assert!(accepts(tail, r#"<|message|>{"x":1}"#));
         assert!(accepts(tail, r#" <|constrain|>json<|message|>{"x":1}"#));
-        assert!(!accepts(tail, r#"<|message|> {"x":1}"#));
-        assert!(!accepts(tail, r#"<|message|>{"y":1}"#));
+        // The constraint is required: the template re-renders it.
+        assert!(!accepts(tail, r#"<|message|>{"x":1}"#));
+        assert!(!accepts(tail, r#" <|constrain|>json<|message|> {"x":1}"#));
+        assert!(!accepts(tail, r#" <|constrain|>json<|message|>{"y":1}"#));
 
         let analysis = "<|channel|>analysis<|message|>hmm<|end|>\
                         <|start|>assistant";
-        let body = r#"<|channel|>final<|message|>{"x":1}"#;
+        let body = r#"<|channel|>final <|constrain|>json<|message|>{"x":1}"#;
         let unified =
             build_grammar_source(&config.format_schema(), &harmony, false);
         assert!(accepts(&unified, body));
+        assert!(!accepts(&unified, r#"<|channel|>final<|message|>{"x":1}"#));
         assert!(accepts(&unified, &format!("{analysis}{body}")));
         assert!(!accepts(&unified, &format!("{analysis}{analysis}{body}")));
         let preamble = "<|channel|>commentary<|message|>hi<|end|>\

@@ -246,6 +246,10 @@
       emission order — the causal announce-then-call shape. After-call
       text (`content_post`, unreachable by emission) renders after the
       turn's tool responses.
+    * A final answer that is JSON (an object or array) renders under
+      `<|channel|>final <|constrain|>json<|message|>`, the header the
+      model writes for structured output; stock renders every final
+      channel plain.
     * Tool responses render by forward-scan from their call message,
       names resolved via tool_call_id (the stock last_tool_call
       inference misattributes every result after a parallel call).
@@ -303,6 +307,16 @@
     {%- endif -%}
 {%- endfor -%}
 
+{#- A final answer. A JSON one (an object or array) renders with the
+    content type gpt-oss writes for it, unforced (` <|constrain|>json`,
+    its structured-output header; the output_config grammar requires
+    it). Stock renders every final channel plain, so a JSON final
+    re-rendered a constraint short and lost its tip. -#}
+{%- macro render_final(text) -%}
+    {%- set is_json = (text.startswith('{') and text.endswith('}')) or (text.startswith('[') and text.endswith(']')) -%}
+    {{- "<|start|>assistant<|channel|>final" + (" <|constrain|>json" if is_json else "") + "<|message|>" + text + "<|end|>" }}
+{%- endmacro -%}
+
 {#- Render messages #}
 {%- for message in loop_messages -%}
     {%- if message.role == 'assistant' -%}
@@ -353,7 +367,7 @@
                 {{- "<|start|>assistant<|channel|>commentary<|message|>" + message.content_post + "<|end|>" }}
             {%- endif -%}
         {%- else -%}
-            {{- "<|start|>assistant<|channel|>final<|message|>" + (message.get('content') or '') + "<|end|>" }}
+            {{- render_final(message.get('content') or '') }}
         {%- endif -%}
     {%- elif message.role == 'tool' -%}
         {#- Rendered by the forward-scan above. -#}

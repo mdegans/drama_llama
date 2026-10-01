@@ -216,6 +216,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `reasoning_content` and was never affected. Pinned in
   `qwen_cache_stable_round_trips` and
   `qwen_cache_stable_aged_turn_renders_as_stock`.
+- **A gpt-oss JSON answer re-renders with its `<|constrain|>json`.**
+  gpt-oss writes a structured answer under
+  `<|channel|>final <|constrain|>json<|message|>`, unforced, but the
+  baked template rendered every final channel plain, so each JSON final
+  parted from the KV at the constraint and the next request
+  re-prefilled the turn (470..1111 tokens, four times live on Agora
+  2026-10-01). The baked template now renders the constraint on a final
+  whose content is a JSON object or array, and **the `output_config`
+  grammar requires it** (it was optional), so a constrained answer and
+  its re-render cannot part. A JSON final written without it (free
+  generation) and prose that merely starts and ends with braces are
+  pinned as irreducible. **Deployments that copied the baked template
+  to a `<model>.template.jinja` sidecar must refresh or delete the
+  sidecar** — it wins over the bake. Pinned in
+  `gptoss_cache_stable_round_trips_json_final` and the Harmony
+  `output_config` tests.
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like

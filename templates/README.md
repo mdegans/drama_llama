@@ -41,6 +41,19 @@ for ALL `tool_calls` (stock renders only the first, in the role-header
 re-ingest shape), pre-call prose renders as a causal commentary
 preamble, and tool responses render by forward-scan with
 `tool_call_id`-resolved names.
+A final answer that is JSON — content starting `{` and ending `}`, or
+`[` … `]` — renders under `<|channel|>final <|constrain|>json<|message|>`.
+That content type is what gpt-oss writes for structured output,
+unforced (every JSON final in the 2026-10-01 Agora run carried it);
+stock renders every final channel plain, so each one re-rendered a
+constraint short and lost its tip (470..1111 tokens a turn, live). The
+`output_config` grammar requires the constraint, so a constrained
+answer and its re-render cannot part. Irreducible, pinned in
+`gptoss_cache_stable_round_trips_json_final`: a final the model writes
+as JSON *without* the constraint (free generation only) and prose that
+merely starts and ends with braces both re-render with it. Harmony does
+not document a final-channel content type (its guide shows
+`<|constrain|>` only on commentary calls); this follows the model.
 The `<|return|>`/`<|end|>` re-ingest rewrite (upstream issue #15417)
 costs nothing: the sampled EOG is never committed to KV, and the
 session's auto-tip records the CANONICAL close token from the
