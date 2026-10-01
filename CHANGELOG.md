@@ -124,6 +124,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answered 500. The parser now reads a string `enum` as JSON, matching
   the emitter. The quoted spelling is not what the template re-renders
   (`full`), so such a turn's tip does not re-render byte-for-byte.
+- **The schema backstop reads every number the grammar can write.** The
+  grammar's `number` has an unbounded integer part, and serde_json
+  refuses one too large for `f64` ("number out of range"), so such an
+  answer was `NotJson` on every draw; it now reads as a number. (Lone
+  surrogate escapes and three-digit exponents, serde_json's other
+  refusals, are already unwritable under the grammar — now pinned.)
 
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an

@@ -76,12 +76,74 @@ pub(crate) fn check_text(
     schema: &Value,
     text: &str,
 ) -> Result<(), SchemaMismatch> {
-    let value: Value =
-        serde_json::from_str(text).map_err(|_| SchemaMismatch {
-            path: String::new(),
-            kind: MismatchKind::NotJson,
-        })?;
+    let value = parse_document(text).ok_or(SchemaMismatch {
+        path: String::new(),
+        kind: MismatchKind::NotJson,
+    })?;
     check(schema, &value)
+}
+
+/// `text` as one JSON document, read no stricter than the grammar writes
+/// it. serde_json refuses a number whose magnitude overflows `f64`
+/// ("number out of range"), and [`JSON_GRAMMAR`]'s `number` admits one:
+/// its integer part is unbounded (only the exponent, at two digits, and
+/// `integer`, at eighteen, are capped), so a long enough run of digits is
+/// grammar-legal and would be a `NotJson` on every draw. Such a number
+/// reads as `0` — the checker judges only its type, and a number it
+/// stays. The grammar's other refusals match serde_json's (a lone
+/// surrogate escape is unwritable: `\uD800` must pair with a low
+/// surrogate), so nothing else needs reading around.
+///
+/// [`JSON_GRAMMAR`]: crate::grammar_compile::JSON_GRAMMAR
+fn parse_document(text: &str) -> Option<Value> {
+    serde_json::from_str(text).ok().or_else(|| {
+        // Syntax first: serde's skip-parse checks structure, not ranges.
+        serde_json::from_str::<serde::de::IgnoredAny>(text).ok()?;
+        serde_json::from_str(&finite_numbers(text)).ok()
+    })
+}
+
+/// `text` with every number outside a string that overflows `f64`
+/// replaced by `0`. Assumes `text` is syntactically JSON.
+fn finite_numbers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) =
+        rest.find(|c: char| c == '"' || c == '-' || c.is_ascii_digit())
+    {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let len = match rest.as_bytes()[0] {
+            b'"' => string_len(rest),
+            _ => rest
+                .find(|c: char| {
+                    !(c.is_ascii_digit()
+                        || matches!(c, '-' | '+' | '.' | 'e' | 'E'))
+                })
+                .unwrap_or(rest.len()),
+        };
+        let (token, tail) = rest.split_at(len);
+        let overflows = !token.starts_with('"')
+            && token.parse::<f64>().is_ok_and(|n| n.is_infinite());
+        out.push_str(if overflows { "0" } else { token });
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The length of the JSON string `text` opens with, quotes included.
+fn string_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// Check `value` against `schema` — the subset of JSON Schema described
@@ -328,6 +390,71 @@ mod tests {
                 .kind,
             MismatchKind::NotJson
         );
+    }
+
+    /// What the grammar can write, the checker must read: an integer part
+    /// too long for `f64` is legal in [`crate::grammar_compile::JSON_GRAMMAR`]'s
+    /// `number` (serde_json: "number out of range"), and was a `NotJson`
+    /// on every draw — a deterministic 500. Still judged by type; real
+    /// syntax errors and the out-of-grammar forms stay refused.
+    #[test]
+    fn grammar_legal_overflowing_numbers_are_json() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "n": {"type": "number"},
+                "s": {"type": "string"},
+            },
+            "required": ["n", "s"],
+        });
+        let big = format!("1{}", "0".repeat(400));
+        for n in [big.clone(), format!("-{big}.5"), format!("{big}e99")] {
+            let text = format!(r#"{{"n": {n}, "s": "1{big} \"x\""}}"#);
+            assert_eq!(check_text(&schema, &text), Ok(()), "{n:.12}");
+        }
+        // Inside a string it is text, untouched.
+        let as_string = json!({"type": "string"});
+        assert_eq!(check_text(&as_string, &format!(r#""{big}""#)), Ok(()));
+        // Still a number, so still not a string.
+        let wrong = format!(r#"{{"n": 1, "s": {big}}}"#);
+        assert_eq!(
+            check_text(&schema, &wrong).unwrap_err(),
+            SchemaMismatch {
+                path: "/s".into(),
+                kind: MismatchKind::Type("string".into()),
+            }
+        );
+        // Broken syntax is still not JSON.
+        assert_eq!(
+            check_text(&schema, &format!(r#"{{"n": {big},}}"#))
+                .unwrap_err()
+                .kind,
+            MismatchKind::NotJson
+        );
+        // A lone surrogate is not grammar-legal, and stays refused.
+        assert_eq!(
+            check_text(&as_string, r#""\ud800""#).unwrap_err().kind,
+            MismatchKind::NotJson
+        );
+    }
+
+    /// The grammar refuses what serde_json does, for the forms that
+    /// matter: a lone surrogate escape and a three-digit exponent are
+    /// unwritable, while a surrogate pair is fine.
+    #[test]
+    fn the_grammar_cannot_write_a_lone_surrogate_or_1e999() {
+        let source =
+            format!("root ::= value\n{}", crate::grammar_compile::JSON_GRAMMAR);
+        let admits = |text: &str| {
+            let mut state = crate::GrammarState::from_source(&source)
+                .expect("grammar parses");
+            state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+        };
+        assert!(admits(r#""\ud83c\udf53""#));
+        assert!(!admits(r#""\ud800""#));
+        assert!(!admits(r#""\udc00""#));
+        assert!(!admits("1e999"));
+        assert!(admits("1e99"));
     }
 
     #[test]
