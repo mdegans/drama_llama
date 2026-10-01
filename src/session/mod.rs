@@ -14692,6 +14692,24 @@ mod tests {
                     baked.name
                 );
             }
+            // A second `</think>` in the answer (live, Qwen3.6,
+            // 2026-10-01): the bake recovers the inlined thought by
+            // splitting on the *first* close, so the prose before the
+            // stray one survives. Stock 3.6 keeps only what follows the
+            // last, and loses it.
+            let emission = "Plan.\n</think>\n\nProse.</think>\n\nMore.";
+            assert_eq!(
+                diverge(served, true, emission),
+                None,
+                "{}: {emission:?}",
+                baked.name
+            );
+            if std::ptr::eq(baked, &crate::baked::QWEN36) {
+                assert!(
+                    diverge(baked.stock, true, emission).is_some(),
+                    "stock 3.6 should drop the prose before the last close"
+                );
+            }
             // Control: the stock template breaks the shapes that
             // motivated the bake — if these pass, the bake is moot.
             for (thinking, emission, at) in [
@@ -14926,6 +14944,24 @@ mod tests {
                         baked.name
                     );
                 }
+            }
+            // The one deviation: a second `</think>` in the answer.
+            // Stock 3.6 keeps what follows the last close; the bake
+            // keeps the whole answer after the first. (Content the
+            // session renders has such a close neutralized to text, so
+            // only an un-neutralized render reaches this.)
+            if std::ptr::eq(baked, &crate::baked::QWEN36) {
+                let content = || {
+                    Content::text(
+                        "<think>\nPlan.\n</think>\n\nProse.</think>More.",
+                    )
+                };
+                let (bake, stock) = (
+                    render(baked.replacement, content()),
+                    render(baked.stock, content()),
+                );
+                assert!(bake.contains("Prose.</think>More."), "{bake:?}");
+                assert!(!stock.contains("Prose."), "{stock:?}");
             }
         }
     }

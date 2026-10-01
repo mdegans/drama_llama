@@ -142,8 +142,12 @@
         {%- if message.reasoning_content is string %}
             {%- set reasoning_content = message.reasoning_content %}
         {%- elif '</think>' in content %}
+            {#- Split on the FIRST `</think>`, the one closing the
+                inlined thought (stock keeps only what follows the
+                last, so a second `</think>` in the answer dropped
+                every byte of prose before it). -#}
             {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}
-            {%- set content = content.split('</think>')[-1] %}
+            {%- set content = content.split('</think>', 1)[-1] %}
         {%- endif %}
         {%- if (preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index) %}
             {#- No thought: the `\n\n` belongs to the generation
@@ -155,10 +159,12 @@
                 dropped, so the turn cannot be byte-stable anyway —
                 render it exactly as stock does, from the untrimmed
                 content: trim, then take the answer after `</think>`
-                with only its leading newlines stripped. -#}
+                with only its leading newlines stripped. The one
+                deviation: the answer follows the FIRST `</think>`, as
+                above, so a second one in the answer keeps its prose. -#}
             {%- set content = raw_content|trim %}
             {%- if message.reasoning_content is not string and '</think>' in content %}
-                {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+                {%- set content = content.split('</think>', 1)[-1].lstrip('\n') %}
             {%- endif %}
             {{- '<|im_start|>' + message.role + '\n' + content }}
         {%- endif %}

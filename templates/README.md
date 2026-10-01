@@ -150,7 +150,11 @@ the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
 1. The **assistant** turn renders verbatim — no trim of the answer or
    the reasoning, and the 3.6 `</think>` split is exact (drama_llama
    inlines a thought as `<think>…</think>` with no padding, so the
-   split recovers the parsed blocks byte-for-byte). The flip side: the
+   split recovers the parsed blocks byte-for-byte). 3.6 splits on the
+   *first* `</think>`, the one closing the inlined thought; stock keeps
+   only what follows the last, so a second `</think>` in the answer
+   dropped all the prose before it (the aged branch below follows the
+   bake here too — the one place it parts from stock). The flip side: the
    split no longer normalizes a *padded* `<think>\n…\n</think>` a
    client inlined into a Text block itself — its padding renders
    inside the thought, doubling the template's own. drama_llama never

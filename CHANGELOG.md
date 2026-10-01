@@ -205,6 +205,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The baked Qwen3.6 template keeps the prose before a second
+  `</think>`.** It recovered an inlined thought by splitting content on
+  `</think>` and kept only what followed the *last* one, as stock does,
+  so an answer containing a stray `</think>` re-rendered without the
+  prose before it (live on Agora 2026-10-01, in the session's own
+  round-trip check: a false `emission_not_byte_stable`; the rendered
+  content of a real request has such a close neutralized to text). It
+  now splits on the first, in the aged-turn branch too. Qwen3.8 reads
+  `reasoning_content` and was never affected. Pinned in
+  `qwen_cache_stable_round_trips` and
+  `qwen_cache_stable_aged_turn_renders_as_stock`.
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like
