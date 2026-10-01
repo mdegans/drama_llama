@@ -205,6 +205,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An all-optional object compiles to a linear grammar.** Both the
+  JSON and the dict (Gemma 4) encodings wrote, for each property, the
+  whole tail of later properties: quadratic, so 4000 optional
+  properties were over 300 MB of grammar (now past the 8 MiB limit,
+  but a legitimately wide object should not be anywhere near it). They
+  now share suffix rules (`pick_k ::= member_k rest_{k+1} | pick_{k+1}`,
+  `rest_k ::= ( sep pick_k )?`): each member written once, the
+  separator matched once before the choice of the next member, and the
+  accepted language unchanged — same fixed order, same separators,
+  checked against the old encoding on random member sets.
+
 - **An ambiguous recursive schema can no longer stall or exhaust the
   grammar matcher.** Two interchangeable recursive defs (`N1 = N2 =
   {"c": N1 | N2}`) double the matcher's live stacks at every nesting

@@ -18,8 +18,8 @@
 //!   `preserve_order`), required-ness by membership in `required:`.
 //!   Optionals sit *in place*, wrapped in `( ... )?`, so they may be
 //!   omitted but must match the declared type when present. The
-//!   all-optional case (no `required`) emits N "chain" alternatives
-//!   so all 2^N inclusion patterns are reachable.
+//!   all-optional case (no `required`) reaches all 2^N inclusion
+//!   patterns with a grammar linear in N (`optional_subsets`).
 //!
 //!   Anthropic's structured outputs order the same way: optionals stay
 //!   in place, in `properties` order. Its docs say "required properties
@@ -670,40 +670,18 @@ impl<'a> Compiler<'a> {
         let first_required = slots.iter().position(|(_, _, req)| *req);
         match first_required {
             None => {
-                // All-optional case. Emit chain alternatives so all 2^N
-                // include/skip combinations are reachable: for each
-                // starting position K, emit slot[K] followed by
-                // `(",", slot[K+1])?` ... `(",", slot[N-1])?`. The outer
-                // wrapping is `(chain_0 | chain_1 | ... | chain_{N-1})?`
-                // so the empty-object case is also matched.
-                let n = slots.len();
-                let mut chain_names: Vec<String> = Vec::with_capacity(n);
-                for k in 0..n {
-                    if self.halted(out) {
-                        return;
-                    }
-                    let chain_name = format!("{rule_name}__chain_{k}");
-                    let mut tail = String::new();
-                    for (i, (name, child, _)) in
-                        slots.iter().enumerate().skip(k)
-                    {
-                        if i == k {
-                            tail.push_str(&member(name, child));
-                        } else {
-                            let _ = write!(
-                                &mut tail,
-                                r#" ( elem_sep {} )?"#,
-                                member(name, child)
-                            );
-                        }
-                    }
-                    let _ = writeln!(out, "{chain_name} ::= {tail}");
-                    chain_names.push(chain_name);
-                }
-                let alts = chain_names.join(" | ");
+                // All-optional: every subset of the slots, in slot
+                // order, the empty one included — linear in the slots
+                // (see `optional_subsets`).
+                let members: Vec<String> = slots
+                    .iter()
+                    .map(|(name, child, _)| member(name, child))
+                    .collect();
+                let subsets =
+                    optional_subsets(rule_name, &members, "elem_sep", out);
                 let _ = writeln!(
                     out,
-                    r#"{rule_name} ::= "{{" pad ( {alts} )? pad "}}""#
+                    r#"{rule_name} ::= "{{" pad {subsets}? pad "}}""#
                 );
             }
             Some(r) => {
@@ -884,34 +862,69 @@ impl<'a> Compiler<'a> {
                 let _ = writeln!(out, r#"{rule_name} ::= "{{" {body} "}}""#);
             }
             None => {
-                // All optional: chain alternatives so every subset (in
-                // sorted order) is reachable, including the empty dict.
-                let n = slots.len();
-                let mut chain_names: Vec<String> = Vec::with_capacity(n);
-                for k in 0..n {
-                    if self.halted(out) {
-                        return;
-                    }
-                    let chain_name = format!("{rule_name}__chain_{k}");
-                    let mut tail = String::new();
-                    for (i, (key, child, _)) in slots.iter().enumerate().skip(k)
-                    {
-                        if i == k {
-                            tail.push_str(&kv(key, child));
-                        } else {
-                            let _ =
-                                write!(tail, r#" ( "," {} )?"#, kv(key, child));
-                        }
-                    }
-                    let _ = writeln!(out, "{chain_name} ::= {tail}");
-                    chain_names.push(chain_name);
-                }
-                let alts = chain_names.join(" | ");
+                // All optional: every subset in sorted order, the empty
+                // dict included — linear, as in `object_rule`.
+                let members: Vec<String> = slots
+                    .iter()
+                    .map(|(key, child, _)| kv(key, child))
+                    .collect();
+                let subsets =
+                    optional_subsets(rule_name, &members, r#"",""#, out);
                 let _ =
-                    writeln!(out, r#"{rule_name} ::= "{{" ( {alts} )? "}}""#);
+                    writeln!(out, r#"{rule_name} ::= "{{" {subsets}? "}}""#);
             }
         }
     }
+}
+
+/// Write the rules for a non-empty run of optional `members` (GBNF
+/// sequences, in their fixed order) joined by `sep`, and return the
+/// rule that matches any non-empty subset of them in order:
+///
+/// ```text
+/// pick_k ::= member_k rest_{k+1} | pick_{k+1}    (pick_{n-1} ::= member_{n-1})
+/// rest_k ::= ( sep pick_k )?
+/// ```
+///
+/// `pick_k` is "the first member present is one of `k..`", `rest_k`
+/// "maybe a separator and another, past the last one present". Each
+/// member is written once, so the grammar is linear in the members —
+/// writing each subset's tail in full was quadratic: 4000 optional
+/// properties compiled to half a gigabyte. The separator is matched
+/// once, before the choice of the next member, so after a member the
+/// matcher holds a handful of stacks rather than one per later member
+/// (each with its own separator in flight). Stops early once `out` is
+/// past [`MAX_GRAMMAR_BYTES`], leaving the compiler to fail the schema.
+fn optional_subsets(
+    rule_name: &str,
+    members: &[String],
+    sep: &str,
+    out: &mut String,
+) -> String {
+    let n = members.len();
+    for (k, member) in members.iter().enumerate() {
+        if out.len() > MAX_GRAMMAR_BYTES {
+            break;
+        }
+        match k + 1 < n {
+            true => {
+                let next = k + 1;
+                let _ = writeln!(
+                    out,
+                    "{rule_name}__pick_{k} ::= {member} {rule_name}__rest_{next} \
+                     | {rule_name}__pick_{next}"
+                );
+                let _ = writeln!(
+                    out,
+                    "{rule_name}__rest_{next} ::= ( {sep} {rule_name}__pick_{next} )?"
+                );
+            }
+            false => {
+                let _ = writeln!(out, "{rule_name}__pick_{k} ::= {member}");
+            }
+        }
+    }
+    format!("{rule_name}__pick_0")
 }
 
 /// Whether an array schema's `minItems` asks for at least one element.
@@ -1947,26 +1960,168 @@ mod tests {
     /// All-optional schema: every 2^N inclusion combination must be
     /// reachable, including the empty object. Wrong types rejected
     /// when present.
+    /// The all-optional encoding `optional_subsets` replaced: `chain_k`
+    /// writes member `k` and every later one in full — quadratic.
+    fn quadratic_chains(
+        rule_name: &str,
+        members: &[String],
+        sep: &str,
+        out: &mut String,
+    ) -> String {
+        (0..members.len())
+            .map(|k| {
+                let mut tail = members[k].clone();
+                for member in &members[k + 1..] {
+                    let _ = write!(tail, " ( {sep} {member} )?");
+                }
+                let _ = writeln!(out, "{rule_name}__chain_{k} ::= {tail}");
+                format!("{rule_name}__chain_{k}")
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// The linear all-optional encoding admits exactly the quadratic
+    /// one's language: random member sets (overlapping, duplicated, one
+    /// a prefix of another), every input over their alphabet up to 7
+    /// bytes, and every in-order subset.
+    #[test]
+    fn optional_subsets_match_quadratic_encoding() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut inputs: Vec<String> = vec![String::new()];
+        let mut frontier = inputs.clone();
+        for _ in 0..7 {
+            frontier = frontier
+                .iter()
+                .flat_map(|s| ["a", "b", ","].map(|c| format!("{s}{c}")))
+                .collect();
+            inputs.extend(frontier.iter().cloned());
+        }
+        let grammar = |encode: &dyn Fn(&mut String) -> String| {
+            let mut rules = String::new();
+            let alts = encode(&mut rules);
+            let src = format!("root ::= \"{{\" ( {alts} )? \"}}\"\n{rules}");
+            GrammarState::new(Arc::new(Grammar::parse(&src).unwrap()))
+        };
+        let accepts = |root: &GrammarState, text: &str| {
+            let mut state = root.clone();
+            state
+                .advance_bytes(format!("{{{text}}}").as_bytes())
+                .is_ok()
+                && state.is_complete()
+        };
+        for _ in 0..60 {
+            let n = 1 + (next() % 5) as usize;
+            let spelled: Vec<String> = (0..n)
+                .map(|_| {
+                    (0..1 + next() % 2)
+                        .map(|_| if next() % 2 == 0 { 'a' } else { 'b' })
+                        .collect()
+                })
+                .collect();
+            let members: Vec<String> =
+                spelled.iter().map(|m| format!("\"{m}\"")).collect();
+            let sep = r#"",""#;
+            let linear =
+                grammar(&|out| optional_subsets("o", &members, sep, out));
+            let quadratic =
+                grammar(&|out| quadratic_chains("o", &members, sep, out));
+            let subsets = (1..1u32 << n).map(|mask| {
+                spelled
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, m)| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            });
+            for input in inputs.iter().cloned().chain(subsets) {
+                assert_eq!(
+                    accepts(&linear, &input),
+                    accepts(&quadratic, &input),
+                    "members {spelled:?}, input {input:?}"
+                );
+            }
+        }
+    }
+
+    /// All-optional objects compile linearly in both encodings: 4000
+    /// optional properties were ~530 MB of grammar.
+    #[test]
+    fn all_optional_object_is_linear() {
+        let n = 4000;
+        let props: Map<String, Value> =
+            (0..n).map(|i| (format!("p{i}"), json!({}))).collect();
+        let schema = json!({"type": "object", "properties": props});
+        let mut rules = String::new();
+        schema_to_gbnf(&schema, "obj", &mut rules).unwrap();
+        assert!(rules.len() < 1 << 20, "{} bytes", rules.len());
+        let src = wrap_with_root("obj", rules);
+        assert!(accepts(&src, "{}"));
+        assert!(accepts(&src, r#"{"p0":1,"p17":true,"p3999":null}"#));
+        assert!(!accepts(&src, r#"{"p17":true,"p0":1}"#));
+
+        let mut dict = String::new();
+        schema_to_dict_gbnf(&schema, "obj", "<|\"|>", &mut dict).unwrap();
+        assert!(dict.len() < 1 << 20, "{} bytes", dict.len());
+    }
+
+    /// The dict encoding's all-optional object: every subset in sorted
+    /// order, nothing out of it.
+    #[test]
+    fn dict_all_optional_object_permits_every_sorted_subset() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "c": {"type": "integer"},
+                "a": {"type": "integer"},
+                "b": {"type": "integer"},
+            }
+        });
+        let mut rules = String::new();
+        schema_to_dict_gbnf(&schema, "obj", "'", &mut rules).unwrap();
+        emit_dict_value_rules("'", &mut rules);
+        let src = wrap_with_root("obj", rules);
+        for ok in ["{}", "{a:1}", "{c:3}", "{a:1,c:3}", "{a:1,b:2,c:3}"] {
+            assert!(accepts(&src, ok), "{ok}");
+        }
+        for bad in ["{c:3,a:1}", "{a:1,}", "{,a:1}", "{a:1,a:1}", "{a:1b:2}"] {
+            assert!(!accepts(&src, bad), "{bad}");
+        }
+    }
+
     /// A schema whose grammar would pass [`MAX_GRAMMAR_BYTES`] fails as
     /// [`SchemaError::TooComplex`] once the grammar gets there, without
-    /// building the rest: a 400,000-way `anyOf` (17 MB of grammar).
+    /// building the rest: a 400,000-way `anyOf` (17 MB of grammar) and
+    /// a 400,000-property object.
     #[test]
     fn too_complex_schema_stops_at_the_limit() {
         let n = 400_000;
         let variants: Vec<Value> =
             (0..n).map(|_| json!({"$ref": "#/$defs/A"})).collect();
-        let schema =
+        let fanout =
             json!({"anyOf": variants, "$defs": {"A": {"type": "string"}}});
-        let mut out = String::new();
-        assert_eq!(
-            schema_to_gbnf(&schema, "s", &mut out),
-            Err(SchemaError::TooComplex {
-                limit: MAX_GRAMMAR_BYTES
-            })
-        );
-        assert!(out.len() < MAX_GRAMMAR_BYTES + (1 << 16), "{}", out.len());
-        let mut dict = String::new();
-        assert!(schema_to_dict_gbnf(&schema, "s", "'", &mut dict).is_err());
+        let props: Map<String, Value> =
+            (0..n).map(|i| (format!("p{i}"), json!({}))).collect();
+        let wide = json!({"type": "object", "properties": props});
+        for schema in [fanout, wide] {
+            let mut out = String::new();
+            assert_eq!(
+                schema_to_gbnf(&schema, "s", &mut out),
+                Err(SchemaError::TooComplex {
+                    limit: MAX_GRAMMAR_BYTES
+                })
+            );
+            assert!(out.len() < MAX_GRAMMAR_BYTES + (1 << 16), "{}", out.len());
+            let mut dict = String::new();
+            assert!(schema_to_dict_gbnf(&schema, "s", "'", &mut dict).is_err());
+        }
     }
 
     /// `{"enum": []}` admits no value. It used to compile to an empty
