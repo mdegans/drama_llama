@@ -164,8 +164,10 @@
             and each later one sits inline where the model wrote it, in
             its markers. The merged fields cannot place it (3.6 inlines
             it without the markers' newlines, 3.8 joins both thoughts in
-            `reasoning_content`). -#}
-        {%- set ns_chunks = namespace(thoughts=0, first=true, calls=false, reasoning='', content='') %}
+            `reasoning_content`). Text after the calls is rendered
+            before them, with the rest, as stock renders the merged
+            content; `text` is the prose alone, for an aged turn. -#}
+        {%- set ns_chunks = namespace(thoughts=0, first=true, reasoning='', content='', text='') %}
         {%- set chunks = message.chunks if message.chunks is defined else none %}
         {%- if chunks is not none %}
             {%- for chunk in chunks %}
@@ -176,9 +178,7 @@
         {%- endif %}
         {%- if ns_chunks.thoughts > 1 %}
             {%- for chunk in chunks %}
-                {%- if ns_chunks.calls %}
-                {%- elif chunk.type == 'tool_calls' %}
-                    {%- set ns_chunks.calls = true %}
+                {%- if chunk.type == 'tool_calls' %}
                 {%- elif chunk.type == 'thinking' and ns_chunks.first %}
                     {%- set ns_chunks.first = false %}
                     {%- set ns_chunks.reasoning = chunk.thinking %}
@@ -186,6 +186,7 @@
                     {%- set ns_chunks.content = ns_chunks.content + '<think>\n' + chunk.thinking + '\n</think>' %}
                 {%- else %}
                     {%- set ns_chunks.content = ns_chunks.content + chunk.text %}
+                    {%- set ns_chunks.text = ns_chunks.text + chunk.text %}
                 {%- endif %}
             {%- endfor %}
             {%- set reasoning_content = ns_chunks.reasoning %}
@@ -199,8 +200,9 @@
         {%- else %}
             {#- Aged out without `preserve_thinking`: the thought is
                 dropped, so the turn cannot be byte-stable anyway —
-                render it as stock does. -#}
-            {%- set content = content|trim %}
+                render it as stock does: every thought dropped, the
+                later ones too. -#}
+            {%- set content = (ns_chunks.text if ns_chunks.thoughts > 1 else content)|trim %}
             {{- '<|im_start|>' + message.role + '\n' + content }}
         {%- endif %}
         {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}

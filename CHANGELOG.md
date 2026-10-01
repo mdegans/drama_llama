@@ -308,8 +308,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inlined it without its markers' newlines, 3.8 joined both thoughts in
   `reasoning_content`, and the turn lost its tip. The Qwen bakes render
   such a turn from `chunks`, each later thought where the model wrote
-  it. Pinned in `qwen_cache_stable_round_trips_a_second_thought` and
-  the fleet sweep. Pinned as unfixed, with the reason: whitespace after
+  it. Aged out with `preserve_thinking` off, such a turn drops every
+  thought, the later ones too, and a client's text after the calls
+  renders before them with the rest, as stock renders merged content.
+  Pinned in `qwen_cache_stable_round_trips_a_second_thought`,
+  `qwen_cache_stable_chunks_age_and_keep_late_text` and the fleet
+  sweep. Pinned as unfixed, with the reason: whitespace after
   Qwen's last call (`…</tool_call>\n`) has no block to ride and is
   dropped, but no constrained call turn can write it — the tool grammar
   reads a newline after a call as the separator to the next

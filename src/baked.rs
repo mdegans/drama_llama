@@ -243,6 +243,10 @@ static SUPERSEDED: &[(&str, &BakedTemplate)] = &[
     ), // 53a07d3
     // qwen3.6-cache-stable
     (
+        "f1fa63ebc27d325e784062d71012f8006e807e61d7bccc5d97df9dffdedb0187",
+        &QWEN36,
+    ), // da629e6
+    (
         "b6de2277ea5727f9b832063706f0ae768538255f6de24a5f9ab248e0e64974fb",
         &QWEN36,
     ), // 5283044
@@ -259,6 +263,10 @@ static SUPERSEDED: &[(&str, &BakedTemplate)] = &[
         &QWEN36,
     ), // 8fb8088
     // qwen3.8-cache-stable
+    (
+        "6702f051a25bf887e9cfd4a6cb6202bbd929f5756b5dd1aaeb2dccf5374352a3",
+        &QWEN38,
+    ), // da629e6
     (
         "b0f8ade1dac8479bb972cd6ad85e78c0456d4aeb9a5ed3535c9f85ed793d3630",
         &QWEN38,

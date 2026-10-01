@@ -256,6 +256,10 @@ the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
    inlined it unpadded, 3.8 joined both thoughts in `reasoning_content`
    — so the turn lost its tip
    (`session::tests::qwen_cache_stable_round_trips_a_second_thought`).
+   Aged out with `preserve_thinking` off, such a turn renders its prose
+   alone, every thought dropped as stock drops the merged ones, and a
+   client's text after the calls renders before them with the rest
+   (`session::tests::qwen_cache_stable_chunks_age_and_keep_late_text`).
 
 The leading system/tools header, user and tool turns, the
 reasoning-effort block (3.8), tool declarations, the rest of the

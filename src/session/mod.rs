@@ -16242,6 +16242,122 @@ mod tests {
         }
     }
 
+    /// A Qwen turn with more than one thought renders from `chunks`.
+    /// Aged out with `preserve_thinking` off, every thought goes, the
+    /// later ones too, as stock drops the merged `reasoning_content`
+    /// (3.8 renders the prose exactly as stock; 3.6 keeps the prose
+    /// before a later thought, its one deviation). And a client's text
+    /// after the calls is rendered before them with the rest, as stock
+    /// renders the merged content, never dropped.
+    #[test]
+    fn qwen_cache_stable_chunks_age_and_keep_late_text() {
+        use crate::{
+            prompt::{Message, Role},
+            Block, ChatTemplate, Content, RenderOptions,
+        };
+        let eos = "<|im_end|>";
+        let tool = weather_tool();
+        let user = |text: &'static str| Message {
+            role: Role::User,
+            content: Content::text(text),
+        };
+        for baked in [&crate::baked::QWEN36, &crate::baked::QWEN38] {
+            let syntax =
+                crate::dialect::analyze_template(baked.replacement, "", eos)
+                    .expect("analyze");
+            let render = |source: &str, content: Content, preserve: bool| {
+                let template = ChatTemplate::from_source(
+                    source.to_owned(),
+                    String::new(),
+                    eos.to_owned(),
+                )
+                .expect("template compiles");
+                let opts = RenderOptions::default()
+                    .with_extra("preserve_thinking", preserve)
+                    .with_extra("enable_thinking", true)
+                    .with_thought_reingest(syntax.reasoning.reingest)
+                    .with_reasoning_start(&syntax.reasoning.start);
+                let prompt = Prompt {
+                    messages: vec![
+                        user("Who checks the fog signal?"),
+                        Message {
+                            role: Role::Assistant,
+                            content,
+                        },
+                        user("And the lamp?"),
+                    ],
+                    ..Prompt::default()
+                };
+                template.render_with(&prompt, &opts).expect("render")
+            };
+            let emission =
+                "Plan.\n</think>\n\nChecking.<think>\nMore.\n</think>\n\nAda.";
+            let parsed = crate::dialect::parse_text(
+                &syntax,
+                &[&tool],
+                emission,
+                true,
+                crate::dialect::Leniency::Final,
+            )
+            .blocks;
+            let content = Content(merge_adjacent_prose(parsed));
+            let aged = render(baked.replacement, content.clone(), false);
+            let turn = aged
+                .split("<|im_start|>assistant\n")
+                .nth(1)
+                .and_then(|t| t.split(eos).next())
+                .expect("the aged turn");
+            assert_eq!(turn, "Checking.\n\nAda.", "{}: {aged:?}", baked.name);
+            if std::ptr::eq(baked, &crate::baked::QWEN38) {
+                assert_eq!(
+                    aged,
+                    render(baked.stock, content, false),
+                    "{}",
+                    baked.name
+                );
+            }
+
+            // A client's turn with text after its call.
+            let call = crate::Block::ToolUse {
+                call: misanthropic::tool::Use {
+                    id: "toolu_1".into(),
+                    name: "get_weather".into(),
+                    input: serde_json::json!({"city": "Paris"}),
+                    cache_control: None,
+                    caller: None,
+                },
+            };
+            let late: Vec<Block> = vec![
+                Block::Thought {
+                    thought: "Plan.".into(),
+                    signature: String::new().into(),
+                },
+                "Checking.".to_string().into(),
+                Block::Thought {
+                    thought: "More.".into(),
+                    signature: String::new().into(),
+                },
+                call,
+                "Then the lamp.".to_string().into(),
+            ];
+            for preserve in [true, false] {
+                let rendered =
+                    render(baked.replacement, Content(late.clone()), preserve);
+                assert!(
+                    rendered.contains("Then the lamp."),
+                    "{} preserve={preserve}: {rendered:?}",
+                    baked.name
+                );
+                assert_eq!(
+                    rendered.contains("More."),
+                    preserve,
+                    "{} preserve={preserve}: {rendered:?}",
+                    baked.name
+                );
+            }
+        }
+    }
+
     /// Cogito's tool turns lost their tip on every call (19 live
     /// events, 2026-10-01): the model ends its prose in whitespace and
     /// opens the call (`…\n\n<tool_call>`), the parser leaves that gap
