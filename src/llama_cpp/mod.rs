@@ -3,6 +3,7 @@
 //! [`Decoder`]: crate::Decoder
 //! [`Model`]: crate::Model
 
+pub mod checkpoint;
 pub mod decoder;
 pub mod engine;
 pub mod model;
@@ -11,6 +12,7 @@ pub mod mtmd;
 pub mod options;
 
 pub use crate::Backend;
+pub use checkpoint::{CheckpointBudget, Checkpointing};
 pub use decoder::{DecodeError, FlashAttention, LlamaCppDecoder, NewError};
 pub use engine::LlamaCppEngine;
 pub use model::{llama_quantize, LlamaCppModel};

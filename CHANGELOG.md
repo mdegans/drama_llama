@@ -8,6 +8,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BREAKING: `LlamaCppDecoder`'s `memory_clear`, `memory_seq_rm`,
+  `memory_seq_cp`, `memory_seq_keep`, `memory_seq_add` and
+  `memory_seq_div` take `&mut self` and keep the checkpoints in step.**
+  They were `&self` raw FFI calls that shadowed the `Decoder` trait's
+  methods at a call site, so `decoder.memory_clear()` — reachable from
+  `Engine::vision_and_decoder` — skipped the checkpoint invalidation
+  the trait methods do. On a sliding-window model that is silent
+  corruption: llama.cpp's iSWA cache reports positions from the window
+  cells alone, so after a raw clear a stale window checkpoint loaded
+  over empty dense layers and the restore reported success. Every
+  mutator now drops the partial checkpoints the change invalidates
+  (`memory_clear` all of them; `memory_seq_add` and `memory_seq_div`
+  from the lowest position a cell lands on, `p0 + delta` for a shift
+  back and `p0 / d`, since cells move below `p0`), and the trait
+  methods are thin wrappers. Only the raw context pointer still reaches
+  the memory around them, and its docs say so.
+- **`LlamaCppEngine::default_context_params` sets `swa_full = false`**,
+  so `LlamaCppEngine::new(path, None, None, …)` sizes the
+  sliding-window cache at the window, as `LlamaCppOptions` already did
+  (Gemma 4 OOMs at 131k with the library's full-size one).
+- **A sliding-window rewind accepts the window llama.cpp reads, not
+  one cell more.** The truncate check asked for `pos_min <= pos -
+  n_swa` (llama-server's margin), but the cell at `pos - n_swa` is
+  masked for the token at `pos` and `find_slot` recycles it as soon as
+  a neighbour needs a cell, so an idle slot's rewind to its own head
+  went to a checkpoint load (≈ 800 MiB on Gemma 4) or, with the
+  checkpoint evicted, failed. Now `pos_min <= pos - n_swa + 1`,
+  `is_masked_swa`'s boundary; still fail-closed on any hole in the
+  window.
+
+- **BEHAVIOR CHANGE: sliding-window models get a window-sized SWA KV
+  cache** (`LlamaCppOptions::swa_full`, unset = `false`; blallama
+  `--swa-full` restores the old size). llama.cpp's library default
+  sizes every sliding-window layer at the full context: Gemma 4 31B
+  pays 880 KiB per token across its 50 window layers, ≈ 110 GiB of KV
+  at 131k (an OOM, #125), and gpt-oss half its 72 KiB, ≈ 4.5 GiB. The
+  window-sized cache is what llama.cpp's own server and CLI default
+  to: at 131k / 4 slots, Gemma 4's KV drops to ≈ 13.5 GiB (10 GiB
+  dense + 3.5 GiB window) and gpt-oss's to ≈ 4.5 GiB. The full-size
+  cache bought nothing: llama.cpp recycles a window's masked cells
+  whichever its size (below), so prefix reuse on these models now goes
+  through window checkpoints either way. This is the one field where
+  an unset `LlamaCppOptions` no longer means llama.cpp's library
+  default. llama.h warns the small cache "can cause bad performance in
+  some cases" with several sequences — unmeasured here; `--swa-full`
+  is the way back if a workload shows it.
+- **Hybrid models (Qwen3.6, Qwen3.8) checkpoint only their recurrent
+  state.** A prefix-cache checkpoint was the whole sequence — the
+  attention KV for the entire prefix again, ≈ 650 MiB at 30k tokens on
+  Qwen3.6 and ≈ 2 GiB on Qwen3.8, up to 24 of them at four slots. It is
+  now llama.cpp's partial state (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`,
+  as its server's context checkpoints use): the recurrent layers only,
+  ≈ 63 MiB (Qwen3.6) / ≈ 150 MiB (Qwen3.8) regardless of position,
+  restored on top of the truncated attention KV. Because a partial
+  checkpoint depends on the KV below it, every `Decoder::memory_*` call
+  that changes that KV now drops the checkpoints above the change, and
+  a checkpoint is only ever taken at the sequence's head.
+  `LlamaCppDecoder::checkpointing` / `LlamaCppEngine::checkpointing`
+  report the mode (`Checkpointing::{Off, Partial, Whole}`); dense models
+  (cogito, Mistral 4) stay `Off` — truncation alone, unchanged.
 - **BEHAVIOR CHANGE: prompt content that spells a special-token piece
   is no longer a 400 — the model reads it as text.** Every prepare
   path tokenized the whole render with special-token parsing on, so a
@@ -262,7 +322,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   schema backstop or a grammar check rejects reaches neither the
   client nor the next request, and its re-render cost was noise that
   read as a cache bug in the operator log (cohort item 13).
-
+- **Checkpoints have a host-RAM budget** (`CheckpointBudget`, default
+  8 GiB in all and 4 GiB per slot; `LlamaCppOptions::{checkpoint_mib,
+  checkpoint_slot_mib}`, blallama `--checkpoint-mib` /
+  `--checkpoint-slot-mib`). The count cap alone let Gemma 4 hold 24
+  window checkpoints of ≈ 800 MiB — ≈ 19 GiB of unified memory next to
+  the weights and KV. Past either bound the least recently used
+  checkpoint is evicted (a per-slot overrun only evicts that slot's),
+  but each slot's first anchor (its lowest checkpoint — the system
+  prompt and tools) goes last: restores refresh only the anchor they
+  land on, so pure LRU evicted that one first. One larger than a bound
+  on its own is not stored; each logs `snapshot_evicted` with the
+  `bound` it hit, or `snapshot_over_budget`. The budget is per decoder,
+  not per process, and peak host RAM is the budget plus one
+  checkpoint, which is serialized before the store evicts to fit it.
+- **An anchor restored by truncation is checkpointed on the way.** A
+  window-sized cache recycles the window below an anchor soon after,
+  so an anchor whose checkpoint was evicted (or never taken) restored
+  once and then failed with `restore_failed`. `restore_to`'s truncate
+  path now takes the missing partial checkpoint there, where the head
+  is; a stored one is only refreshed, never copied again.
+- **Checkpoint restores and invalidations are logged** (DEBUG, under
+  `drama_llama::snapshot_store`): `checkpoint_restore` with
+  `restore_via = truncate | checkpoint`, `bytes` and `ms`;
+  `checkpoint_taken` with `bytes` and `ms`; `checkpoint_invalidated`
+  with a `count` (a `memory_clear` included). `checkpoint_skipped` now says whether the position
+  was off the head (`cause = off_head`) or llama.cpp failed to
+  serialize it (`save_failed`), where it blamed the head for both.
+- **Sliding-window models (gpt-oss, Gemma 4) restore their prefix
+  cache from window checkpoints — and never from half a window.** A
+  KV truncate rewinds a sliding-window layer only while the window
+  below the anchor is still there, and llama.cpp recycles masked
+  window cells of *any* sequence whenever it places a batch, even with
+  a full-size SWA cache. These models were treated as dense, so
+  nothing was checkpointed: live on gpt-oss (2026-10-01, twice) an idle
+  slot's window under its 10,088-token anchor was recycled by its
+  neighbours, `restore_failed` found no checkpoint, and the request
+  re-prefilled all 14k tokens. Worse, the restore checked only that the
+  sequence's head landed on the anchor, so a truncate that left *part*
+  of the window would have been reported lossless and generated over a
+  window with a hole in it (#91's class: KV that is not what the model
+  should see). Now `checkpoint_pos` stores the window cells (gpt-oss
+  ≈ 4.5 MiB, Gemma 4 ≈ 800 MiB per anchor), `restore_to` takes the
+  truncate only when the head *and* the whole window below it survive,
+  and loads the checkpoint otherwise; with neither, the anchor reports
+  `NoCheckpoint` and the session's restore ladder falls to the next
+  anchor below. The rules live in `llama_cpp::checkpoint`, FFI-free
+  and pinned against a simulated cache
+  (`a_recycled_window_restores_from_its_checkpoint`,
+  `a_truncate_that_leaves_half_a_window_is_not_a_rewind`); the
+  ladder's live shape
+  (`a_hash_hit_without_a_checkpoint_falls_to_the_anchor_below`) and
+  the invariant that every anchor a call leaves was checkpointed
+  (`every_anchor_a_call_leaves_is_checkpointed`) through `Session`;
+  real-weights checks in `tests/swa_checkpoint.rs` (`#[ignore]`d).
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like
@@ -816,7 +929,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `history_changed`: same text, different split — what adoption
   exists to prevent, so it means adoption was off. A prompt read in a
   slot's own split logs `cache_adopt` at `DEBUG`.
-
+- **`CheckpointBudget`, `LlamaCppDecoder::set_checkpoint_budget` /
+  `seq_snapshot_bytes`** (and the `LlamaCppEngine` forwards) — bound and
+  read the host RAM a decoder's checkpoints hold.
+- **`LlamaCppModel::{n_swa, is_hybrid, is_recurrent}`** and
+  **`LlamaCppDecoder::memory_seq_pos_min`** — what llama.cpp reports
+  about a model's sliding window and recurrent layers, readable from a
+  `vocab_only` load, and the lowest position a sequence still holds.
 - **Constrained output is checked against its schema before it is
   answered** (`SessionError::SchemaViolation`). A finished
   json_schema `output_config` answer must be exactly one JSON document

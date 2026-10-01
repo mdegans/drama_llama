@@ -166,9 +166,9 @@ impl<B: Backend> Engine<B> {
     }
 
     /// Snapshot decoder state at sequence position `pos`. See
-    /// [`Decoder::checkpoint_pos`] — backends like moeflux capture
-    /// recurrent state for later lossless rewind; backends with
-    /// per-cell preserved state (llama.cpp) no-op.
+    /// [`Decoder::checkpoint_pos`] — moeflux, and llama.cpp on
+    /// sliding-window or recurrent / hybrid models, capture what a KV
+    /// truncate cannot rewind; llama.cpp on a dense model no-ops.
     pub fn checkpoint_pos(&mut self, seq_id: i32, pos: i32) {
         self.decoder.checkpoint_pos(seq_id, pos);
     }

@@ -98,9 +98,9 @@ pub mod baked;
 mod llama_cpp;
 #[cfg(feature = "llama-cpp")]
 pub use llama_cpp::{
-    gpu_device_names, llama_quantize, DecodeError, FlashAttention,
-    LlamaCppBackend, LlamaCppDecoder, LlamaCppEngine, LlamaCppModel,
-    LlamaCppOptions, NewError,
+    gpu_device_names, llama_quantize, CheckpointBudget, Checkpointing,
+    DecodeError, FlashAttention, LlamaCppBackend, LlamaCppDecoder,
+    LlamaCppEngine, LlamaCppModel, LlamaCppOptions, NewError,
 };
 #[cfg(feature = "mtmd")]
 pub use llama_cpp::{Mtmd, MtmdParams};

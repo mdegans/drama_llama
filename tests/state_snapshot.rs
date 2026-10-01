@@ -2,10 +2,12 @@
 //! per-sequence snapshot path behind [`Decoder::checkpoint_pos`] /
 //! [`Decoder::restore_to`].
 //!
-//! The snapshot path exists for recurrent / hybrid models (whose layer
-//! state cannot be rewound by KV truncation) but is testable on any
-//! model by forcing it on via `set_seq_snapshots(true)` — snapshots
-//! are architecture-agnostic serialized sequence state.
+//! The snapshot path exists for sliding-window and recurrent / hybrid
+//! models (whose state a KV truncate cannot rewind) but is testable on
+//! any model by forcing it on via `set_seq_snapshots(true)` — a dense
+//! model then takes whole-sequence snapshots. See also
+//! `tests/swa_checkpoint.rs` for the partial checkpoints those models
+//! take natively.
 //!
 //! All tests load a real model: `cargo test --test state_snapshot --
 //! --ignored`.
@@ -99,13 +101,20 @@ fn state_seq_roundtrip_resumes_generation_identically() {
 }
 
 /// With snapshots forced on, `checkpoint_pos` stores a restorable
-/// snapshot: after the sequence is wiped outright (simulating exactly
-/// the case where a KV truncate cannot rewind — recurrent memory, or
-/// unexpected KV loss), `restore_to` falls back to the snapshot and
-/// generation resumes identically.
+/// snapshot: when a KV truncate cannot rewind, `restore_to` falls back
+/// to the snapshot and generation resumes identically.
+///
+/// A dense model takes whole-sequence snapshots, so the sequence is
+/// wiped outright first (unexpected KV loss — the pos_max guard must
+/// catch the truncate and reload the snapshot). A hybrid or
+/// sliding-window model takes *partial* checkpoints, which a wipe
+/// rightly destroys (`hybrid_checkpoint_dies_with_its_sequence`); its
+/// recurrent / window state is what forces the snapshot path instead.
 #[test]
 #[ignore = "long running, requires models/model.gguf"]
 fn forced_snapshot_restores_after_kv_wipe() {
+    use drama_llama::Checkpointing;
+
     let mut engine = engine();
     engine.set_seq_snapshots(true);
     assert!(engine.seq_snapshots_enabled());
@@ -120,10 +129,12 @@ fn forced_snapshot_restores_after_kv_wipe() {
 
     let a = greedy_continuation(&mut engine, tail.clone(), head_len, 24);
 
-    // Wipe the whole sequence. A plain truncate to head_len can no
-    // longer produce a valid prefix — the pos_max guard in restore_to
-    // must detect that and reload the snapshot instead.
-    engine.memory_seq_rm(0, -1, -1);
+    if engine.checkpointing() == Checkpointing::Whole {
+        // A plain truncate to head_len can no longer produce a valid
+        // prefix — the pos_max guard in restore_to must detect that
+        // and reload the snapshot instead.
+        engine.memory_seq_rm(0, -1, -1);
+    }
     engine
         .restore_to(0, head_len as i32)
         .expect("restore_to should succeed via the stored snapshot");

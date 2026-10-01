@@ -49,6 +49,7 @@ default: test
 #   just test moeflux-quick   moeflux unit tests only — no weights, seconds
 #   just test both       unignored tests with BOTH backends linked
 #   just test NAME       tests/suites matching NAME, any tier, uncaptured
+#   just test NAME FILTER   the tests matching FILTER in the suites NAME
 #
 # `just test moeflux` loads real weights (`--run-ignored all`) and takes
 # ~12 minutes on the default a3b variant. On `qwen3-5-a17b` (~2 tok/s) it
@@ -105,7 +106,15 @@ test mode="" filter="" *args:
         echo "  AND ignored) use 'just test all'." >&2
         exit 2
         ;;
-      *)         run -c llama-cpp --filter "{{mode}}" ;;
+      # `just test NAME FILTER`: the tests matching FILTER inside the
+      # suites named like NAME (`just test swa_checkpoint hybrid_`).
+      *)
+        if [ -n "$filter" ]; then
+          run -c llama-cpp --binary "{{mode}}" --filter "$filter"
+        else
+          run -c llama-cpp --filter "{{mode}}"
+        fi
+        ;;
     esac
 
 # Coverage, via cargo-llvm-cov (`just setup` installs it).

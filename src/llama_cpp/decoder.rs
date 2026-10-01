@@ -1,6 +1,8 @@
 use crate::{
     backend::{Decoder, MemoryRmError},
-    snapshot_store::SnapshotStore,
+    llama_cpp::checkpoint::{
+        CheckpointBudget, Checkpointing, Checkpoints, SeqMemory,
+    },
     Batch, LlamaCppModel, Token,
 };
 
@@ -15,16 +17,21 @@ use llama_cpp_sys_3::{
     llama_get_embeddings_ith, llama_get_logits_ith, llama_get_memory,
     llama_init_from_model, llama_memory_clear, llama_memory_seq_add,
     llama_memory_seq_cp, llama_memory_seq_div, llama_memory_seq_keep,
-    llama_memory_seq_pos_max, llama_memory_seq_rm, llama_model_is_hybrid,
-    llama_model_is_recurrent, llama_model_n_embd_out, llama_n_batch,
-    llama_n_ctx, llama_n_seq_max, llama_numa_init, llama_perf_context,
-    llama_perf_context_data, llama_perf_context_reset, llama_pos, llama_seq_id,
-    llama_set_n_threads, llama_state_get_data, llama_state_get_size,
-    llama_state_seq_get_data, llama_state_seq_get_size,
-    llama_state_seq_set_data, llama_state_set_data,
+    llama_memory_seq_pos_max, llama_memory_seq_pos_min, llama_memory_seq_rm,
+    llama_model_n_embd_out, llama_n_batch, llama_n_ctx, llama_n_seq_max,
+    llama_numa_init, llama_perf_context, llama_perf_context_data,
+    llama_perf_context_reset, llama_pos, llama_seq_id, llama_set_n_threads,
+    llama_state_get_data, llama_state_get_size, llama_state_seq_flags,
+    llama_state_seq_get_data_ext, llama_state_seq_get_size_ext,
+    llama_state_seq_set_data_ext, llama_state_set_data,
 };
 
 use thiserror::Error;
+
+/// `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` (llama.h): serialize only the
+/// state a KV truncate cannot rewind — sliding-window cells, recurrent
+/// state. A `#define`, so bindgen does not carry it.
+const STATE_SEQ_PARTIAL_ONLY: llama_state_seq_flags = 1;
 
 /// Global engine count. When this drops to 0, the llama backend is freed in
 /// the last [`LlamaCppDecoder`]'s `Drop` implementation.
@@ -238,18 +245,14 @@ pub struct LlamaCppDecoder {
     /// it, e.g. WavTokenizer-dec). llama.cpp indexes `embd.data` by
     /// this, so sizing slices with `embedding_size` would over-read.
     embedding_size_out: usize,
-    /// Host-RAM per-sequence state snapshots backing
-    /// [`Decoder::checkpoint_pos`] / [`Decoder::restore_to`]. Only
-    /// populated when [`Self::seq_snapshots_enabled`].
-    seq_snapshots: SnapshotStore,
-    /// Whether [`Decoder::checkpoint_pos`] takes real snapshots.
-    /// Defaults to `llama_model_is_recurrent || llama_model_is_hybrid`
-    /// at construction: pure-attention KV truncates losslessly at any
-    /// position, so snapshots are redundant there, but recurrent /
-    /// hybrid layer state cannot be unwound by position and needs
-    /// them. Force on via [`Self::set_seq_snapshots`] (tests, or
-    /// callers wanting rewind insurance on attention models).
-    seq_snapshots_enabled: bool,
+    /// Host-RAM checkpoints backing [`Decoder::checkpoint_pos`] /
+    /// [`Decoder::restore_to`], in the [`Checkpointing`] mode the model
+    /// needs: none for dense attention, which truncates losslessly at
+    /// any position; partial ones for sliding-window and recurrent /
+    /// hybrid layers, which a truncate cannot rewind. Force on via
+    /// [`Self::set_seq_snapshots`] (tests, or callers wanting rewind
+    /// insurance on a dense model).
+    checkpoints: Checkpoints,
 }
 
 unsafe impl Send for LlamaCppDecoder {}
@@ -316,13 +319,14 @@ impl LlamaCppDecoder {
             return Err(NewError::Context);
         }
 
-        // Recurrent / hybrid layer state (Mamba-style SSM, RWKV, ...)
-        // cannot be rewound by KV-position truncation, so those
-        // architectures need real snapshots at cache breakpoints.
-        let needs_snapshots = unsafe {
-            llama_model_is_recurrent(model.as_ptr())
-                || llama_model_is_hybrid(model.as_ptr())
-        };
+        // Sliding-window cells and recurrent layer state cannot be
+        // rewound by a KV truncate alone, so those models checkpoint
+        // what it cannot rewind at every cache anchor.
+        let checkpointing = Checkpointing::for_model(
+            model.is_recurrent(),
+            model.is_hybrid(),
+            model.n_swa(),
+        );
 
         Ok(Self {
             context,
@@ -335,14 +339,15 @@ impl LlamaCppDecoder {
             } as usize,
             model: model.clone(),
             // A full set of anchors per sequence, so one cache slot's
-            // snapshots never evict another's.
-            seq_snapshots: SnapshotStore::with_cap(
+            // checkpoints never evict another's.
+            checkpoints: Checkpoints::new(
+                checkpointing,
+                model.n_swa(),
                 crate::snapshot_store::cap_for_sequences(
                     // SAFETY: `context` was checked non-null above.
                     unsafe { llama_n_seq_max(context) } as usize,
                 ),
             ),
-            seq_snapshots_enabled: needs_snapshots,
         })
     }
 
@@ -357,7 +362,9 @@ impl LlamaCppDecoder {
         &self.model
     }
 
-    /// Raw pointer to the underlying llama.cpp context (const).
+    /// Raw pointer to the underlying llama.cpp context (const). Cast to
+    /// `*mut` to change memory and it bypasses the checkpoint
+    /// bookkeeping as [`Self::context_ptr_mut`] does.
     pub fn context_ptr(&self) -> *const llama_context {
         self.context
     }
@@ -366,6 +373,12 @@ impl LlamaCppDecoder {
     ///
     /// Takes `&mut self` so the exclusivity the pointer implies is
     /// actually held — the same reason [`Self::decode`] does.
+    ///
+    /// Bypasses the checkpoint bookkeeping: change a sequence's memory
+    /// through it, and its partial checkpoints may describe a different
+    /// history. Follow such a change with [`Self::memory_seq_rm`] over
+    /// the range it touched (or [`Self::set_seq_snapshots`]`(false)`),
+    /// which drops them.
     pub fn context_ptr_mut(&mut self) -> *mut llama_context {
         self.context
     }
@@ -407,6 +420,7 @@ impl LlamaCppDecoder {
     }
 
     /// Deserialize the global state (bytes from [`Self::get_state`]).
+    /// Replaces every sequence, so partial checkpoints are dropped.
     ///
     /// Note [`Self::state_size`] is *content-dependent* — the KV
     /// portion grows with what the cache holds — so a valid saved
@@ -418,6 +432,7 @@ impl LlamaCppDecoder {
     /// * If llama.cpp does not consume `state` fully — corrupt bytes
     ///   or a state saved from a different model / context shape.
     pub fn set_state(&mut self, state: &[u8]) {
+        self.checkpoints.invalidate_from(-1, -1);
         let read = unsafe {
             llama_state_set_data(self.context, state.as_ptr(), state.len())
         };
@@ -426,7 +441,7 @@ impl LlamaCppDecoder {
 
     /// Size of the serialized state for a single sequence.
     pub fn state_seq_size(&self, seq_id: llama_seq_id) -> usize {
-        unsafe { llama_state_seq_get_size(self.context, seq_id) }
+        ContextMemory(self.context).state_size(seq_id, 0)
     }
 
     /// Serialize the state of a single sequence (its KV cells plus any
@@ -434,17 +449,11 @@ impl LlamaCppDecoder {
     /// [`Self::set_state_seq`] — into this context or another one on
     /// the same model.
     pub fn get_state_seq(&self, seq_id: llama_seq_id) -> Vec<u8> {
-        let len = self.state_seq_size(seq_id);
-        let mut buf = vec![0u8; len];
-        let copied = unsafe {
-            llama_state_seq_get_data(
-                self.context,
-                buf.as_mut_ptr(),
-                len,
-                seq_id,
-            )
-        };
-        assert_eq!(copied, len);
+        let buf = ContextMemory(self.context).state(seq_id, 0);
+        assert!(
+            !buf.is_empty(),
+            "llama.cpp failed to serialize seq {seq_id}"
+        );
         buf
     }
 
@@ -452,42 +461,55 @@ impl LlamaCppDecoder {
     /// [`Self::get_state_seq`], loading them as `dest_seq_id`. Returns
     /// `false` if llama.cpp rejects the payload (wrong model, corrupt
     /// bytes, insufficient KV room) — the destination sequence is left
-    /// cleared in that case.
+    /// cleared in that case. Either way the sequence's partial
+    /// checkpoints are dropped: the KV they sat on is gone.
     pub fn set_state_seq(
         &mut self,
         state: &[u8],
         dest_seq_id: llama_seq_id,
     ) -> bool {
-        let copied = unsafe {
-            llama_state_seq_set_data(
-                self.context,
-                state.as_ptr(),
-                state.len(),
-                dest_seq_id,
-            )
-        };
-        copied != 0
+        self.checkpoints.invalidate_from(dest_seq_id, -1);
+        ContextMemory(self.context).load_state(state, dest_seq_id, 0)
     }
 
-    /// Whether [`Decoder::checkpoint_pos`] takes real per-sequence
-    /// snapshots (recurrent / hybrid models: on by default; pure
-    /// attention: off, truncation already rewinds losslessly).
+    /// How [`Decoder::checkpoint_pos`] / [`Decoder::restore_to`] rewind
+    /// this model's sequences: [`Checkpointing::Off`] for dense
+    /// attention, [`Checkpointing::Partial`] for sliding-window and
+    /// recurrent / hybrid models.
+    pub fn checkpointing(&self) -> Checkpointing {
+        self.checkpoints.mode()
+    }
+
+    /// Whether [`Decoder::checkpoint_pos`] stores anything — see
+    /// [`Self::checkpointing`].
     pub fn seq_snapshots_enabled(&self) -> bool {
-        self.seq_snapshots_enabled
+        self.checkpoints.mode() != Checkpointing::Off
     }
 
-    /// Force per-sequence snapshotting on or off. Disabling drops all
-    /// stored snapshots.
+    /// Force checkpointing on or off. On, a dense model stores
+    /// [`Checkpointing::Whole`] snapshots; a model that needs
+    /// checkpoints keeps its own mode. Disabling drops all stored
+    /// checkpoints — and on a sliding-window or recurrent model, the
+    /// ability to rewind anywhere but the head.
     pub fn set_seq_snapshots(&mut self, enabled: bool) {
-        self.seq_snapshots_enabled = enabled;
-        if !enabled {
-            self.seq_snapshots.clear();
-        }
+        self.checkpoints.force(enabled);
     }
 
-    /// Number of per-sequence snapshots currently held.
+    /// Number of per-sequence checkpoints currently held.
     pub fn seq_snapshot_count(&self) -> usize {
-        self.seq_snapshots.len()
+        self.checkpoints.len()
+    }
+
+    /// Host RAM the checkpoints currently hold, in bytes.
+    pub fn seq_snapshot_bytes(&self) -> usize {
+        self.checkpoints.bytes()
+    }
+
+    /// Bound the host RAM the checkpoints may hold, evicting the least
+    /// recently used ones now if they are over it. See
+    /// [`CheckpointBudget`] for the default.
+    pub fn set_checkpoint_budget(&mut self, budget: CheckpointBudget) {
+        self.checkpoints.set_budget(budget);
     }
 
     /// Performance information.
@@ -505,61 +527,89 @@ impl LlamaCppDecoder {
         unsafe { llama_set_n_threads(self.context, n_gen, n_batch) }
     }
 
-    /// Clear the KV cache.
-    pub fn memory_clear(&self) {
+    /// Clear the KV cache, and every checkpoint with it.
+    ///
+    /// This and the other `memory_*` mutators take `&mut self` and keep
+    /// the checkpoints in step with the KV: a partial checkpoint
+    /// restores on top of the KV below it, so one left behind a change
+    /// to that KV would load another history's window or recurrent
+    /// state on the next [`Decoder::restore_to`]. They are what the
+    /// [`Decoder`] impl calls; only the raw context pointer
+    /// ([`Self::context_ptr_mut`], or [`Self::context_ptr`] cast to
+    /// `*mut`, unsafe either way) reaches the memory around them.
+    pub fn memory_clear(&mut self) {
+        self.checkpoints.clear();
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_clear(mem, true) }
     }
 
-    /// Remove KV entries for `seq_id` in position range `[p0, p1)`.
+    /// Remove KV entries for `seq_id` in position range `[p0, p1)`
+    /// (negative bounds are unbounded; `seq_id < 0` matches every
+    /// sequence). `false` when llama.cpp refuses the range.
+    ///
+    /// Drops the partial checkpoints above `p0` first — even when the
+    /// range is refused: that costs at most a checkpoint, a stale one
+    /// could cost #91.
     pub fn memory_seq_rm(
-        &self,
+        &mut self,
         seq_id: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
     ) -> bool {
+        self.checkpoints.invalidate_from(seq_id, p0);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_rm(mem, seq_id, p0, p1) }
     }
 
-    /// Copy KV entries between sequences in `[p0, p1)`.
+    /// Copy KV entries between sequences in `[p0, p1)`. Drops `dst`'s
+    /// partial checkpoints above `p0`: its KV there is no longer the one
+    /// they were taken over.
     pub fn memory_seq_cp(
-        &self,
+        &mut self,
         src: llama_seq_id,
         dst: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
     ) {
+        self.checkpoints.invalidate_from(dst, p0);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_cp(mem, src, dst, p0, p1) }
     }
 
-    /// Keep only `seq_id`'s entries, drop all others.
-    pub fn memory_seq_keep(&self, seq_id: llama_seq_id) {
+    /// Keep only `seq_id`'s entries, drop all others — and every other
+    /// sequence's partial checkpoints.
+    pub fn memory_seq_keep(&mut self, seq_id: llama_seq_id) {
+        self.checkpoints.keep_only(seq_id);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_keep(mem, seq_id) }
     }
 
-    /// Add `delta` to positions of `seq_id` in `[p0, p1)`.
+    /// Add `delta` to positions of `seq_id` in `[p0, p1)`. Drops the
+    /// partial checkpoints above the lowest position a cell left or
+    /// landed on — `p0 + delta` for a shift back, `p0` otherwise.
     pub fn memory_seq_add(
-        &self,
+        &mut self,
         seq_id: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
         delta: llama_pos,
     ) {
+        self.checkpoints.invalidate_shift(seq_id, p0, delta);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_add(mem, seq_id, p0, p1, delta) }
     }
 
     /// Integer-divide positions of `seq_id` in `[p0, p1)` by `d > 1`.
+    /// Drops the partial checkpoints above `p0 / d`, the lowest
+    /// position a moved cell lands on.
     pub fn memory_seq_div(
-        &self,
+        &mut self,
         seq_id: llama_seq_id,
         p0: llama_pos,
         p1: llama_pos,
         d: i32,
     ) {
+        self.checkpoints.invalidate_div(seq_id, p0, d);
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_div(mem, seq_id, p0, p1, d) }
     }
@@ -568,6 +618,14 @@ impl LlamaCppDecoder {
     pub fn memory_seq_pos_max(&self, seq_id: llama_seq_id) -> llama_pos {
         let mem = unsafe { llama_get_memory(self.context) };
         unsafe { llama_memory_seq_pos_max(mem, seq_id) }
+    }
+
+    /// Smallest position present in KV for `seq_id`, `-1` when empty.
+    /// Above `0` once a sliding window's masked cells were recycled;
+    /// on a hybrid model, the recurrent state's last position.
+    pub fn memory_seq_pos_min(&self, seq_id: llama_seq_id) -> llama_pos {
+        let mem = unsafe { llama_get_memory(self.context) };
+        unsafe { llama_memory_seq_pos_min(mem, seq_id) }
     }
 
     /// Run one batch through `llama_decode`.
@@ -802,21 +860,26 @@ impl Decoder for LlamaCppDecoder {
         unsafe { llama_n_seq_max(self.context) }
     }
 
+    /// [`LlamaCppDecoder::memory_clear`]: the checkpoints go with the
+    /// KV.
     fn memory_clear(&mut self) {
         LlamaCppDecoder::memory_clear(self);
-        // Session clears on full re-prefill; the old positions are
-        // never referenced again, so free the snapshots with the KV.
-        self.seq_snapshots.clear();
     }
 
+    /// [`LlamaCppDecoder::memory_seq_rm`]: also drops the partial
+    /// checkpoints above `p0`.
     fn memory_seq_rm(&mut self, seq_id: i32, p0: i32, p1: i32) -> bool {
         LlamaCppDecoder::memory_seq_rm(self, seq_id, p0, p1)
     }
 
+    /// [`LlamaCppDecoder::memory_seq_cp`]: also drops `dst`'s partial
+    /// checkpoints above `p0`.
     fn memory_seq_cp(&mut self, src: i32, dst: i32, p0: i32, p1: i32) {
         LlamaCppDecoder::memory_seq_cp(self, src, dst, p0, p1);
     }
 
+    /// [`LlamaCppDecoder::memory_seq_keep`]: also drops every other
+    /// sequence's partial checkpoints.
     fn memory_seq_keep(&mut self, seq_id: i32) {
         LlamaCppDecoder::memory_seq_keep(self, seq_id);
     }
@@ -825,88 +888,142 @@ impl Decoder for LlamaCppDecoder {
         LlamaCppDecoder::memory_seq_pos_max(self, seq_id)
     }
 
-    /// Snapshot the sequence state at `pos` when
-    /// [`seq_snapshots_enabled`](LlamaCppDecoder::seq_snapshots_enabled)
-    /// — required for recurrent / hybrid models, whose layer state
-    /// cannot be rewound by KV truncation. A no-op for pure-attention
-    /// models (the default there), where truncation is already a
-    /// lossless rewind to any position.
+    /// Checkpoint the sequence at `pos`, its head, in the model's
+    /// [`Checkpointing`] mode: a no-op on a dense model, where a
+    /// truncate is already a lossless rewind to any position; the
+    /// sliding-window cells or recurrent state otherwise — see
+    /// `llama_cpp::checkpoint`.
     fn checkpoint_pos(&mut self, seq_id: i32, pos: i32) {
-        if !self.seq_snapshots_enabled {
-            return;
-        }
-        let bytes = self.get_state_seq(seq_id);
-        self.seq_snapshots.insert((seq_id, pos), bytes);
+        self.checkpoints.checkpoint(
+            &mut ContextMemory(self.context),
+            seq_id,
+            pos,
+        );
     }
 
-    /// Rewind `seq_id` to `pos`. Tries the plain KV truncate
-    /// (`llama_memory_seq_rm(seq_id, pos, -1)`) first — lossless and
-    /// copy-free on attention models. llama.cpp refuses partial-range
-    /// removal on recurrent / hybrid memory, and then a stored
-    /// snapshot (if any) is reloaded instead: the sequence is dropped
-    /// wholesale (whole-sequence removal is supported everywhere) and
-    /// re-populated via `llama_state_seq_set_data`. Either way,
-    /// snapshots at positions `> pos` are dropped per the trait
+    /// Rewind `seq_id` to `pos`: the plain KV truncate when that alone
+    /// leaves the state the model had at `pos` — always on a dense
+    /// model; on a sliding-window one while the window below `pos`
+    /// survives — else the checkpoint stored at `pos`, loaded under the
+    /// truncate. Checkpoints above `pos` are dropped per the trait
     /// contract.
+    ///
+    /// Position-density caveat (media, #31): the head check assumes a
+    /// cell exists at `pos - 1`. M-RoPE images break density — all
+    /// ~n_tokens cells share the chunk's start position and positions
+    /// (start, start + n_pos) are a gap — so a truncate to a boundary
+    /// just past an M-RoPE image sees `pos_max == image_start != pos -
+    /// 1` and fails closed even though the prefix is intact (validated
+    /// by `mtmd::tests::mrope_kv_semantics_probe`). That is acceptable:
+    /// Session boundaries land in text (breakpoints are
+    /// message-granular and message-close text follows every image),
+    /// and a false failure only costs the checkpoint / full-reprefill
+    /// fallback, never correctness.
     fn restore_to(
         &mut self,
         seq_id: i32,
         pos: i32,
     ) -> Result<(), MemoryRmError> {
-        // The pos_max check catches truncates that "succeed" without
-        // the sequence actually holding [0, pos) — removing an empty
-        // range is a success to llama.cpp, but reporting it as a
-        // lossless rewind would resume generation over missing KV.
-        //
-        // Position-density caveat (media, #31): the check assumes a
-        // cell exists at `pos - 1`. M-RoPE images break density —
-        // all ~n_tokens cells share the chunk's start position and
-        // positions (start, start + n_pos) are a gap — so a truncate
-        // to a boundary just past an M-RoPE image sees `pos_max ==
-        // image_start != pos - 1` and fails closed here even though
-        // the prefix is intact (validated by
-        // `mtmd::tests::mrope_kv_semantics_probe`). That is
-        // acceptable: Session boundaries land in text (breakpoints
-        // are message-granular and message-close text follows every
-        // image), and a false failure only costs the snapshot /
-        // full-reprefill fallback, never correctness.
-        if LlamaCppDecoder::memory_seq_rm(self, seq_id, pos, -1)
-            && LlamaCppDecoder::memory_seq_pos_max(self, seq_id) == pos - 1
-        {
-            self.seq_snapshots.invalidate_after(seq_id, pos);
-            return Ok(());
-        }
-        let Some(bytes) = self.seq_snapshots.take((seq_id, pos)) else {
-            return Err(MemoryRmError::NoCheckpoint { pos });
-        };
-        LlamaCppDecoder::memory_seq_rm(self, seq_id, -1, -1);
-        if self.set_state_seq(&bytes, seq_id) {
-            // Still valid — the snapshot survives its own restore so
-            // Session can rewind to the same breakpoint repeatedly.
-            self.seq_snapshots.insert((seq_id, pos), bytes);
-            self.seq_snapshots.invalidate_after(seq_id, pos);
-            Ok(())
-        } else {
-            // llama.cpp rejected bytes we serialized ourselves — a
-            // llama.cpp-internal inconsistency. The sequence is left
-            // cleared; Session's restore ladder then tries the next
-            // anchor below this one on the same sequence (a snapshot
-            // restore replaces the sequence wholesale, so a cleared
-            // one is fine), and re-prefills the whole prompt only
-            // when no rung restores.
-            Err(MemoryRmError::BackendUnsupported { pos })
-        }
+        self.checkpoints
+            .restore(&mut ContextMemory(self.context), seq_id, pos)
     }
 
-    /// Drop the snapshot at `(seq_id, pos)`, if one exists. Idempotent;
-    /// a no-op (and trivially `Ok`) when snapshotting is disabled.
+    /// Drop the checkpoint at `(seq_id, pos)`, if one exists.
+    /// Idempotent; trivially `Ok` when nothing is stored.
     fn forget_pos(
         &mut self,
         seq_id: i32,
         pos: i32,
     ) -> Result<(), MemoryRmError> {
-        self.seq_snapshots.forget((seq_id, pos));
+        self.checkpoints.forget(seq_id, pos);
         Ok(())
+    }
+}
+
+/// A llama.cpp context's sequence memory, as
+/// [`Checkpoints`](crate::llama_cpp::checkpoint) drives it. Borrows
+/// nothing: it is the decoder's context pointer, so the decoder can
+/// lend it out while it mutates its own checkpoint store.
+#[derive(Clone, Copy)]
+struct ContextMemory(*mut llama_context);
+
+impl ContextMemory {
+    fn flags(partial: bool) -> llama_state_seq_flags {
+        if partial {
+            STATE_SEQ_PARTIAL_ONLY
+        } else {
+            0
+        }
+    }
+
+    fn state_size(self, seq: i32, flags: llama_state_seq_flags) -> usize {
+        // SAFETY: the context is live for the decoder's lifetime, and
+        // llama.cpp only reads it here.
+        unsafe { llama_state_seq_get_size_ext(self.0, seq, flags) }
+    }
+
+    /// The serialized state; empty when llama.cpp fails to write it.
+    fn state(self, seq: i32, flags: llama_state_seq_flags) -> Vec<u8> {
+        let len = self.state_size(seq, flags);
+        let mut buf = vec![0u8; len];
+        // SAFETY: `buf` is `len` writable bytes, which llama.cpp never
+        // writes past (it returns 0 instead).
+        let copied = unsafe {
+            llama_state_seq_get_data_ext(
+                self.0,
+                buf.as_mut_ptr(),
+                len,
+                seq,
+                flags,
+            )
+        };
+        buf.truncate(if copied == len { len } else { 0 });
+        buf
+    }
+
+    fn load_state(
+        self,
+        state: &[u8],
+        seq: i32,
+        flags: llama_state_seq_flags,
+    ) -> bool {
+        // SAFETY: `state` is a valid slice for the call; llama.cpp
+        // reads at most `state.len()` bytes of it.
+        let read = unsafe {
+            llama_state_seq_set_data_ext(
+                self.0,
+                state.as_ptr(),
+                state.len(),
+                seq,
+                flags,
+            )
+        };
+        read != 0
+    }
+}
+
+impl SeqMemory for ContextMemory {
+    fn seq_rm(&mut self, seq: i32, p0: i32, p1: i32) -> bool {
+        // SAFETY: as for every `memory_*` call on the decoder.
+        unsafe { llama_memory_seq_rm(llama_get_memory(self.0), seq, p0, p1) }
+    }
+
+    fn seq_pos_min(&mut self, seq: i32) -> i32 {
+        // SAFETY: as above.
+        unsafe { llama_memory_seq_pos_min(llama_get_memory(self.0), seq) }
+    }
+
+    fn seq_pos_max(&mut self, seq: i32) -> i32 {
+        // SAFETY: as above.
+        unsafe { llama_memory_seq_pos_max(llama_get_memory(self.0), seq) }
+    }
+
+    fn save(&mut self, seq: i32, partial: bool) -> Vec<u8> {
+        self.state(seq, Self::flags(partial))
+    }
+
+    fn load(&mut self, seq: i32, bytes: &[u8], partial: bool) -> bool {
+        self.load_state(bytes, seq, Self::flags(partial))
     }
 }
 
