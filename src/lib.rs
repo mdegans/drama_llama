@@ -86,6 +86,9 @@ pub use output_config::{
     OutputConfigOptions, ResponseFraming,
 };
 
+mod schema_check;
+pub use schema_check::{MismatchKind, SchemaMismatch};
+
 pub mod dialect;
 pub use dialect::CallSyntax;
 

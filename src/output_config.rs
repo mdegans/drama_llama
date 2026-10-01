@@ -232,6 +232,16 @@ fn structured(prompt: &Prompt) -> Option<&OutputConfig> {
         .filter(|config| config.format.is_some())
 }
 
+/// The JSON Schema the prompt's structured output must satisfy, if it
+/// asks for any — what the post-generation schema check validates
+/// against.
+pub(crate) fn json_schema(prompt: &Prompt) -> Option<&serde_json::Value> {
+    match &structured(prompt)?.format {
+        Some(OutputFormat::JsonSchema(f)) => Some(&f.schema),
+        _ => None,
+    }
+}
+
 /// Derive the output-config grammar directly from a [`Prompt`]. Reads
 /// `prompt.output_config`; returns `Ok(None)` when unset. Legacy entry
 /// point — ignores `phase_split`. Use [`compile_prompt_output_config`] for

@@ -91,7 +91,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tokenizer (`vocab_only`, `#[ignore]`d) and fails on the old framing.
   Other dialects keep the `</think>` trigger; one whose model writes a
   different closer (Gemma 4's `<channel|>`, Mistral 4's `[/THINK]`) is
-  still unconstrained with thinking on.
+  still unconstrained with thinking on; its *invalid* output is now
+  caught by the schema backstop (Added) rather than answered.
 
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
@@ -414,6 +415,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tip loses the pick, one when `tip_extension` declines to build a tip.
 
 ### Added
+
+- **Constrained output is checked against its schema before it is
+  answered** (`SessionError::SchemaViolation`). A finished
+  json_schema `output_config` answer must be exactly one JSON document
+  across the turn's text, matching the schema; a `strict` tool call's
+  input must match its tool's. Checked are the keywords the grammar
+  compiler enforces (`type`, `properties`, `required`,
+  `additionalProperties`, `enum`, `const`, `anyOf`, `items`, `$ref`,
+  non-empty `minItems`) — never the validator-only ones it deliberately
+  leaves to the model (`pattern`, `minLength`, `maximum`, …), which
+  would turn every such request into a resample loop. A turn cut by
+  `max_tokens` or a stop sequence is exempt (#121), and streaming stays
+  unchecked like the grammar-violation check. The error leaves the
+  cache warm, `Display` names the schema location but never the value,
+  and blallama resamples it on the warm cache like a grammar violation,
+  then answers 500 `api_error` — never a 200 carrying the invalid
+  value. `SchemaMismatch` / `MismatchKind` are public. One known
+  consequence: a `strict` tool with a plain string `enum` parameter on
+  the tagged (Qwen XML) dialect is now refused rather than handed the
+  JSON-quoted value (`"\"full\""`) the parser reads there — a
+  pre-existing parser bug the backstop surfaces.
 
 - **Automatic prompt caching, as on Anthropic.** A request-level
   `cache_control` (`Prompt::cache_control`, misanthropic's

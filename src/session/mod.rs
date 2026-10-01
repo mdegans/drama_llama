@@ -316,6 +316,38 @@ pub enum SessionError {
         /// model-visible content.
         found: Vec<String>,
     },
+    /// A constrained completion finished, but its JSON does not satisfy
+    /// the schema it was constrained by — the structured output of a
+    /// json_schema [`output_config`], or the input of a `strict` tool
+    /// call. Constrained decoding is supposed to make this impossible;
+    /// this is the backstop for when the grammar has a hole (a
+    /// phase-split trigger the model never wrote left gpt-oss's JSON
+    /// unconstrained, and two invalid answers went out as 200s —
+    /// Agora, 2026-10-01). Never returned for a turn cut short by
+    /// `max_tokens` or a stop sequence: an unfinished value is not a
+    /// violation (#121).
+    ///
+    /// Retry as for [`Self::EmittedSpecialToken`]: the constraint either
+    /// completed or never activated, so the recorded cache is
+    /// consistent, and resending the identical prompt resamples on the
+    /// warm cache. `Display` names the schema location, never the
+    /// value.
+    ///
+    /// [`output_config`]: misanthropic::Prompt::output_config
+    #[error(
+        "constrained output does not match its schema {mismatch}; \
+         resample — the prompt is unchanged and its cache extent is \
+         still warm ({} block(s) withheld from this message — see \
+         `partial_output`)",
+        partial_output.0.len()
+    )]
+    SchemaViolation {
+        /// Where and how the output departs from its schema.
+        mismatch: crate::SchemaMismatch,
+        /// The whole parse, structure intact. Diagnostics only, as for
+        /// [`Self::GrammarViolation`]'s `partial_output`.
+        partial_output: crate::prompt::Content,
+    },
     /// The prompt carries an *open* thought — a reasoning block whose
     /// close marker the model never emitted, flagged with
     /// [`OPEN_THOUGHT_SIGNATURE`](crate::prompt::OPEN_THOUGHT_SIGNATURE).
@@ -438,6 +470,9 @@ impl SessionError {
             // finds the prompt extent warm. Not just reusable but
             // *cheap* to retry.
             Self::EmittedSpecialToken { .. } => true,
+            // Same bookkeeping as the containment check: the cache is
+            // left as on success, so the resample finds it warm.
+            Self::SchemaViolation { .. } => true,
             // Media capability / shape errors fire during prepare,
             // before any decode. State untouched — safe to reuse.
             Self::MediaUnsupported { .. }
@@ -7257,6 +7292,36 @@ impl<B: Backend> Session<B> {
             }
         }
 
+        // Schema backstop: a finished constrained value must satisfy the
+        // schema it was constrained by. The grammar is supposed to make
+        // this unreachable; when it has a hole — a phase-split trigger
+        // the dialect never writes left gpt-oss's JSON unconstrained,
+        // and `"soul_text":"", ""}` went out as a 200 (Agora,
+        // 2026-10-01) — the output becomes a typed error to resample
+        // instead of an answer. A cut turn is exempt like the
+        // grammar-violation check above: an unfinished value is not a
+        // wrong one (#121). No cache invalidation, as for containment:
+        // the constraint either completed or never activated, so the
+        // recorded state is consistent and the retry finds the prompt
+        // extent warm. Streaming stays unchecked by the same contract
+        // as the violation check — its bytes are already out.
+        if cut.is_none() {
+            if let Some(mismatch) = schema_mismatch(prompt, &blocks) {
+                #[cfg(feature = "axum")]
+                tracing::error!(
+                    target: "drama_llama::session",
+                    %mismatch,
+                    "constrained output does not match its schema; \
+                     rejected before it reaches the caller — prompt \
+                     cache extent is warm, resample",
+                );
+                return Err(SessionError::SchemaViolation {
+                    mismatch,
+                    partial_output: crate::prompt::Content(blocks),
+                });
+            }
+        }
+
         let (stop_reason, stop_sequence) = infer_stop_reason(
             blocks
                 .iter()
@@ -7687,6 +7752,61 @@ fn dialect_deferred_grammar_for_prompt(
         grammar,
         feed_trigger: true,
     }))
+}
+
+/// The first way `blocks` break a schema their constraint promised —
+/// the post-generation backstop behind [`SessionError::SchemaViolation`].
+///
+/// Two promises are checked. A `strict` tool's call input must match the
+/// tool's schema (non-strict tools promise nothing, as on Anthropic).
+/// And a turn that answers a json_schema [`output_config`] — no call,
+/// and no forced `tool_choice`, which outranks it at grammar resolution
+/// ([`resolve_grammar`]) — must be exactly one JSON document matching
+/// it, across all its text: prose beside the JSON is a violation too,
+/// since the grammar admits none.
+///
+/// [`output_config`]: misanthropic::Prompt::output_config
+fn schema_mismatch(
+    prompt: &Prompt,
+    blocks: &[crate::Block],
+) -> Option<crate::SchemaMismatch> {
+    let calls = || {
+        blocks.iter().filter_map(|block| match block {
+            crate::Block::ToolUse { call } => Some(call),
+            _ => None,
+        })
+    };
+    let strict_tool = |name: &str| {
+        prompt
+            .tools
+            .iter()
+            .flatten()
+            .filter_map(|def| def.as_method())
+            .find(|tool| tool.name == name && tool.strict == Some(true))
+    };
+    if let Some(mismatch) = calls().find_map(|call| {
+        let tool = strict_tool(&call.name)?;
+        crate::schema_check::check(&tool.schema, &call.input).err()
+    }) {
+        return Some(mismatch);
+    }
+
+    let forced = matches!(
+        prompt.tool_choice,
+        Some(ToolChoice::Any { .. } | ToolChoice::Method { .. })
+    );
+    if forced || calls().next().is_some() {
+        return None;
+    }
+    let schema = output_config::json_schema(prompt)?;
+    let text: String = blocks
+        .iter()
+        .filter_map(|block| match block {
+            crate::Block::Text { text, .. } => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect();
+    crate::schema_check::check_text(schema, &text).err()
 }
 
 /// Resolve the single grammar (if any) that should constrain
@@ -10159,6 +10279,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The schema backstop (`schema_mismatch`) on the 2026-10-01 bodies,
+    /// as `run_call` sees them parsed: whatever let them through the
+    /// grammar, they must not come back as an answer.
+    #[test]
+    fn schema_backstop_rejects_the_live_bodies() {
+        use crate::{Block, MismatchKind};
+        let prompt = Prompt::default().json_schema(role_consent_schema());
+        let answer = |text: &str| {
+            vec![
+                Block::Thought {
+                    thought: "Nothing to change.".into(),
+                    signature: "".into(),
+                },
+                Block::text(text.to_owned()),
+            ]
+        };
+        let kind = |blocks: Vec<Block>| {
+            schema_mismatch(&prompt, &blocks).map(|m| m.kind)
+        };
+        assert_eq!(
+            kind(answer(ROLE_CONSENT_STRAY_DOLLAR)),
+            Some(MismatchKind::MissingProperty("memory_note".into()))
+        );
+        assert_eq!(
+            kind(answer(ROLE_CONSENT_EMPTY_KEY)),
+            Some(MismatchKind::NotJson)
+        );
+        assert_eq!(kind(answer(ROLE_CONSENT_VALID)), None);
+        // One JSON document across all text: prose beside it, or no
+        // text at all, is not the answer the schema promised.
+        let mut prose = answer(ROLE_CONSENT_VALID);
+        prose.insert(1, Block::text("Here you go: ".to_owned()));
+        assert_eq!(kind(prose), Some(MismatchKind::NotJson));
+        assert_eq!(kind(Vec::new()), Some(MismatchKind::NotJson));
+        // No structured output requested: nothing to check.
+        let free = Prompt::default();
+        assert!(schema_mismatch(&free, &answer("not json")).is_none());
+    }
+
+    /// Strict tool inputs share the backstop; non-strict ones promise
+    /// nothing (as on Anthropic), and a turn that calls a tool is not
+    /// the structured answer — nor is any turn under a forced
+    /// `tool_choice`, which outranks `output_config`.
+    #[test]
+    fn schema_backstop_covers_strict_tool_inputs() {
+        use crate::{Block, MismatchKind};
+        let tool = |strict| {
+            let mut tool = crate::Tool::builder("consent")
+                .description("Answer the consent question.")
+                .schema(role_consent_schema())
+                .build()
+                .expect("valid test tool");
+            tool.strict = strict;
+            tool
+        };
+        let call = |input: &str| {
+            let input: serde_json::Value = serde_json::from_str(input).unwrap();
+            let call: crate::prompt::ToolUse =
+                serde_json::from_value(serde_json::json!({
+                    "id": "toolu_1",
+                    "name": "consent",
+                    "input": input,
+                }))
+                .unwrap();
+            vec![Block::ToolUse { call }]
+        };
+        let bad = r#"{"reason":"r","choice":"nothing","soul_text":""}"#;
+        let with = |strict| Prompt {
+            tools: Some(vec![tool(strict).into()]),
+            ..Prompt::default().json_schema(role_consent_schema())
+        };
+        assert_eq!(
+            schema_mismatch(&with(Some(true)), &call(bad)).map(|m| m.kind),
+            Some(MismatchKind::MissingProperty("memory_note".into()))
+        );
+        assert!(
+            schema_mismatch(&with(Some(true)), &call(ROLE_CONSENT_VALID))
+                .is_none()
+        );
+        // Non-strict: the call is not checked, and the turn called a
+        // tool, so the output_config text check does not apply either.
+        assert!(schema_mismatch(&with(None), &call(bad)).is_none());
+        // Forced tool_choice outranks output_config: free text is not
+        // held to its schema.
+        let forced = Prompt {
+            tool_choice: Some(ToolChoice::method("consent")),
+            ..with(None)
+        };
+        assert!(schema_mismatch(&forced, &[Block::text("prose".to_owned())])
+            .is_none());
     }
 
     /// Drive `emission` through `compiled` token by token the way
