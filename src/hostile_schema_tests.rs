@@ -401,6 +401,30 @@ fn hostile_requests_are_refused_up_front() {
             SchemaLimit::Nodes,
         ),
         (
+            "an enum of 3000",
+            vec![],
+            Some(json!({"enum": (0..3000).collect::<Vec<_>>()})),
+            SchemaLimit::Width,
+        ),
+        (
+            "100 objects in an anyOf, each alive through an integer",
+            vec![],
+            Some(json!({"anyOf": (0..100).map(|i| json!({
+                "type": "object",
+                "properties": {"a": {"type": "integer"}, format!("z{i}"): {}},
+            })).collect::<Vec<_>>()})),
+            SchemaLimit::Width,
+        ),
+        (
+            "16 x 16 nested anyOf objects over 16 members",
+            vec![tool(json!({
+                "type": "object",
+                "properties": {"x": nested_any_of(16, 16)},
+            }))],
+            None,
+            SchemaLimit::Width,
+        ),
+        (
             "5000 defs",
             vec![tool(json!({
                 "type": "object",
@@ -633,10 +657,10 @@ fn schema_check_diamond_stays_bounded() {
 #[test]
 fn requests_at_the_limits_stay_cheap() {
     let limits = SchemaLimits::default();
-    // 20,000 optional properties in one nested object.
+    // 2,000 optional properties in one nested object.
     let wide = {
         let inner: Map<String, Value> =
-            (0..20_000).map(|i| (format!("k{i}"), json!({}))).collect();
+            (0..2_000).map(|i| (format!("k{i}"), json!({}))).collect();
         json!({"type": "object", "properties": {
             "o": {"type": "object", "properties": inner},
         }})
@@ -664,7 +688,7 @@ fn requests_at_the_limits_stay_cheap() {
             "512 params x 8 shared defs",
             vec![tool(shared_defs_schema())],
         ),
-        ("20,000 nested optionals", vec![tool(wide.clone())]),
+        ("2,000 nested optionals", vec![tool(wide.clone())]),
         ("512 tools", many),
     ];
     for (name, tools) in cases {
@@ -705,9 +729,8 @@ fn requests_at_the_limits_stay_cheap() {
     eprintln!("shared tagged end to end: {:?}", start.elapsed());
     assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
     // A wide object's matcher: 2,000 ways to go on after `{` and after
-    // each member. (Past ~`MAX_STACKS` / 2 members the matcher keeps
-    // only some of them — its own cap, which over-restricts and never
-    // admits a wrong byte.)
+    // each member, inside [`SchemaLimits::max_width`] and so under the
+    // matcher's own cap.
     let inner: Map<String, Value> =
         (0..2000).map(|i| (format!("k{i}"), json!({}))).collect();
     let src = compile(&json!({"type": "object", "properties": {
@@ -741,4 +764,168 @@ fn shared_defs_schema() -> Value {
         })
         .collect();
     json!({"type": "object", "properties": props, "$defs": defs})
+}
+
+/// `{"anyOf": k objects {"a": {"anyOf": k objects {"b": enum of m}}}}`,
+/// each object with a property of its own beside: every variant at a
+/// level shares the prefix `{"a":` (`{"b":`), so all k × k × m members
+/// are alive at once inside — nested alternatives multiply.
+fn nested_any_of(k: usize, m: usize) -> Value {
+    let members: Vec<String> = (0..m).map(|i| format!("m{i:04}")).collect();
+    let level = |key: &str, inner: Value| -> Value {
+        let variants: Vec<Value> = (0..k)
+            .map(|i| {
+                json!({
+                    "type": "object",
+                    "properties": {key: inner, format!("{key}{i}"): {"type": "integer"}},
+                    "required": [key],
+                })
+            })
+            .collect();
+        json!({"anyOf": variants})
+    };
+    level("a", level("b", json!({"enum": members})))
+}
+
+/// The most matcher stacks alive at once while `src` reads `input`,
+/// and whether it accepts it.
+fn peak_stacks(src: &str, input: &str) -> (usize, bool) {
+    let mut state = GrammarState::new(Arc::new(Grammar::parse(src).unwrap()));
+    let mut peak = state.stack_depth();
+    for b in input.bytes() {
+        if state.advance_bytes(&[b]).is_err() {
+            return (peak, false);
+        }
+        peak = peak.max(state.stack_depth());
+    }
+    (peak, state.is_complete())
+}
+
+/// The width limit keeps every grammar under the matcher's stack cap,
+/// so a request inside [`SchemaLimits`] is never truncated (over-
+/// restricted) by it. Each shape is filled to the default limit — the
+/// widest an `enum`, an object, an `anyOf` of objects alive through an
+/// integer (the most stacks per counted alternative measured), an
+/// `anyOf` of arrays, and `anyOf`s nested to multiply — as a tool
+/// parameter in every dialect and as structured output, and read with
+/// a value naming the *last* alternative: never past `MAX_STACKS`, and
+/// never past the width counted for it.
+#[test]
+fn width_limit_keeps_the_matcher_under_its_cap() {
+    use crate::dialect::render_reference;
+    use crate::sample::grammar::MAX_STACKS;
+    use crate::schema_budget::width;
+    let limit = SchemaLimits::default().max_width;
+    assert!(2 * limit <= MAX_STACKS);
+    // `(name, shape(n), the value naming the last alternative)`.
+    type Shape = (&'static str, fn(usize) -> Value, fn(usize) -> Value);
+    let shapes: [Shape; 6] = [
+        (
+            "enum",
+            |n| json!({"enum": (0..n).map(|i| format!("m{i:05}")).collect::<Vec<_>>()}),
+            |n| json!(format!("m{:05}", n - 1)),
+        ),
+        (
+            "optional integers",
+            |n| {
+                json!({"type": "object", "properties": (0..n)
+                .map(|i| (format!("k{i:05}"), json!({"type": "integer"})))
+                .collect::<Map<String, Value>>()})
+            },
+            |n| json!({format!("k{:05}", n - 1): 12}),
+        ),
+        (
+            "required strings",
+            |n| {
+                let keys: Vec<String> =
+                    (0..n).map(|i| format!("k{i:05}")).collect();
+                json!({"type": "object", "required": keys, "properties": keys
+                    .iter()
+                    .map(|k| (k.clone(), json!({"type": "string"})))
+                    .collect::<Map<String, Value>>()})
+            },
+            |n| {
+                Value::Object(
+                    (0..n).map(|i| (format!("k{i:05}"), json!("v"))).collect(),
+                )
+            },
+        ),
+        (
+            "anyOf of optional-integer objects",
+            |n| {
+                json!({"anyOf": (0..n).map(|i| json!({
+                "type": "object",
+                "properties": {"a": {"type": "integer"}, format!("z{i}"): {"type": "integer"}},
+            })).collect::<Vec<_>>()})
+            },
+            |n| json!({"a": 1234, format!("z{}", n - 1): 5}),
+        ),
+        (
+            "anyOf of integer arrays",
+            |n| {
+                json!({"anyOf": (0..n).map(|i| json!({
+                "type": "array", "items": {"type": "integer"}, "description": i,
+            })).collect::<Vec<_>>()})
+            },
+            |_| json!([12, 345]),
+        ),
+        (
+            "nested anyOf, k = 4",
+            |m| nested_any_of(4, m),
+            |m| json!({"a": {"b": format!("m{:04}", m - 1), "b3": 1}, "a3": 2}),
+        ),
+    ];
+    // The widest `n` whose `wrap`ped schema is within the limit.
+    let fill = |shape: fn(usize) -> Value, wrap: &dyn Fn(Value) -> Value| {
+        let (mut lo, mut hi) = (1, 2 * limit);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            match width(&wrap(shape(mid))) <= limit {
+                true => lo = mid,
+                false => hi = mid - 1,
+            }
+        }
+        lo
+    };
+    for (name, shape, value) in shapes {
+        // Structured output: the schema as it is.
+        let n = fill(shape, &|s| s);
+        let schema = shape(n);
+        check_schemas([], Some(&schema), &SchemaLimits::default()).expect(name);
+        let counted = width(&schema);
+        let (peak, ok) = peak_stacks(&compile(&schema), &value(n).to_string());
+        eprintln!("{name} (n = {n}) as output: {peak} stacks of {counted}");
+        assert!(ok, "{name}: output refused");
+        assert!(peak <= counted && peak < MAX_STACKS, "{name}: {peak}");
+
+        // A tool parameter, in every dialect.
+        let wrap = |s: Value| json!({"type": "object", "properties": {"x": s}, "required": ["x"]});
+        let n = fill(shape, &wrap);
+        let t = tool(wrap(shape(n)));
+        check_schemas([&t], None, &SchemaLimits::default()).expect(name);
+        let counted = width(&t.schema);
+        let input = json!({"x": value(n)});
+        for syntax in syntaxes() {
+            let family = syntax.family;
+            let src = grammar_source(&syntax, &[&t], &lazy()).unwrap();
+            let mut text = render_reference(&syntax, &[("t", &input)]).unwrap();
+            if family == crate::dialect::Family::TagWithDict {
+                text.push_str("<|tool_response>");
+            }
+            let (mut peak, mut ok) = peak_stacks(&src, &text);
+            if !ok && family == crate::dialect::Family::TagWithTagged {
+                // A set past 1024 members is spelled as JSON, not raw.
+                let json = value(n).to_string();
+                (peak, ok) = peak_stacks(&src, &qwen_call(&[("x", &json)]));
+            }
+            eprintln!(
+                "{name} (n = {n}) in {family:?}: {peak} stacks of {counted}"
+            );
+            assert!(ok, "{name} / {family:?}: call refused");
+            assert!(
+                peak <= counted && peak < MAX_STACKS,
+                "{name} / {family:?}: {peak}"
+            );
+        }
+    }
 }

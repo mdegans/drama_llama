@@ -24,6 +24,10 @@
 //!   at its target's size per reference — so a large `enum` behind a
 //!   `$ref` that two thousand parameters name is two thousand copies of
 //!   it, not one.
+//! * **width**: how many ways a schema's grammar can go on at once —
+//!   the matcher's stacks at one position, which it caps at 4096 by
+//!   refusing the excess ([`SchemaLimits::max_width`] says how it is
+//!   counted). A request inside the limit never reaches that cap.
 //!
 //! The defaults ([`SchemaLimits::default`]) leave real schemas far
 //! inside every limit: see each field for what was measured.
@@ -43,9 +47,9 @@ use crate::Tool;
 /// structured-output schema in misanthropic's captured request fixtures,
 /// Anthropic's documented tool examples, and a heavier synthetic tool (a
 /// 600-member time-zone `enum` behind a `$ref` four parameters name,
-/// beside a 249-member country `enum`): the largest of them is 21× inside
-/// every limit, Agora's request at least 34×. Each field says what the
-/// largest measured.
+/// beside a 249-member country `enum`): the synthetic tool is 3× inside
+/// [`Self::max_width`] and 21× inside the rest, Agora's request at least
+/// 29× inside every limit. Each field says what the largest measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SchemaLimits {
@@ -70,6 +74,36 @@ pub struct SchemaLimits {
     /// counted at its target's size once per reference. Default 1 MiB;
     /// Agora's request has 304 bytes, the synthetic tool ~49 KB.
     pub max_total_member_bytes: usize,
+    /// How wide one schema's grammar can branch: an upper bound on the
+    /// matcher stacks alive at once inside it, which the matcher caps at
+    /// 4096 by refusing the excess (`MAX_STACKS`). Counted per schema
+    /// from the shape, bottom up:
+    ///
+    /// * an `enum` member or `const` is 1 (a literal, one stack until
+    ///   its first distinguishing byte); `boolean` and `null` 4,
+    ///   `number` 8, `string` 16, `integer` 24, anything untyped 16 —
+    ///   each the most measured in any dialect, with margin;
+    /// * an object its properties (required ones included) + 4, plus
+    ///   its widest property; an array 4 plus its `items`;
+    /// * an `anyOf` or `oneOf` the *sum* of its variants — variants
+    ///   sharing a prefix (objects all opening with `{"a":`) are all
+    ///   alive inside it, so nested ones multiply;
+    /// * a `$ref` its target's width, each def counted once; a
+    ///   reference back into its own cycle counts as untyped. (So
+    ///   ambiguity *through* recursion — two interchangeable recursive
+    ///   defs, doubling at every level of output — is not bounded by
+    ///   this, only by the matcher's cap, which then refuses
+    ///   alternatives and keeps the close.)
+    ///
+    /// Default 2048, half the matcher's cap. Every shape filled to it
+    /// (an `enum`, optional and required properties, `anyOf`s of objects
+    /// and of arrays alive through an integer, `anyOf`s nested to
+    /// multiply) peaked at or under its count in every dialect — an
+    /// `enum` exactly at it, the `anyOf`s at 60–95% — so a request
+    /// inside the limit never reaches the cap, with room for the
+    /// dialect's own framing. Agora's widest schema counts 70, the
+    /// synthetic tool 613.
+    pub max_width: usize,
 }
 
 impl Default for SchemaLimits {
@@ -81,6 +115,7 @@ impl Default for SchemaLimits {
             max_defs: 1024,
             max_member_bytes: 16 << 10,
             max_total_member_bytes: 1 << 20,
+            max_width: 2048,
         }
     }
 }
@@ -96,6 +131,7 @@ impl SchemaLimits {
             max_defs: usize::MAX,
             max_member_bytes: usize::MAX,
             max_total_member_bytes: usize::MAX,
+            max_width: usize::MAX,
         }
     }
 
@@ -134,6 +170,12 @@ impl SchemaLimits {
         self.max_total_member_bytes = n;
         self
     }
+
+    /// Set [`Self::max_width`].
+    pub fn with_max_width(mut self, n: usize) -> Self {
+        self.max_width = n;
+        self
+    }
 }
 
 /// Which of the [`SchemaLimits`] a request is past.
@@ -152,6 +194,8 @@ pub enum SchemaLimit {
     MemberBytes,
     /// [`SchemaLimits::max_total_member_bytes`].
     TotalMemberBytes,
+    /// [`SchemaLimits::max_width`].
+    Width,
 }
 
 impl SchemaLimit {
@@ -169,6 +213,10 @@ impl SchemaLimit {
             Self::TotalMemberBytes => {
                 "bytes of `enum` members and `const` values across the \
                  request's schemas, each `$ref` counted at its target's size"
+            }
+            Self::Width => {
+                "ways to continue at once (`enum` members, properties and \
+                 `anyOf`/`oneOf` variants, nested variants multiplying)"
             }
         }
     }
@@ -307,6 +355,15 @@ pub fn check_schemas<'a>(
                 SchemaLimit::Nodes,
                 expanded,
                 limits.max_nodes,
+            ));
+        }
+        let width = units.width(&measured);
+        if width > limits.max_width {
+            return Err(over(
+                location.clone(),
+                SchemaLimit::Width,
+                width,
+                limits.max_width,
             ));
         }
     }
@@ -478,6 +535,82 @@ impl<'s> Units<'s> {
             order,
         })
     }
+
+    /// The root's width ([`SchemaLimits::max_width`]): each unit's in
+    /// `measured`'s order, so a `$ref` reads its target's, done — or,
+    /// back into a cycle still open, counts as untyped.
+    fn width(&self, measured: &Measured) -> usize {
+        let mut widths: Vec<Option<usize>> = vec![None; self.units.len()];
+        for &unit in &measured.order {
+            widths[unit] = Some(self.unit_width(unit, &widths));
+        }
+        widths[0].expect("the order ends at the root")
+    }
+
+    /// One unit's width, given those of the units done before it: an
+    /// iterative post-order over the unit's subschemas.
+    fn unit_width(&self, unit: usize, widths: &[Option<usize>]) -> usize {
+        // Pre-order, so children follow their parent: `(schema, parent,
+        // how the parent combines it)`.
+        let root = self.units[unit].1;
+        let mut nodes: Vec<(&Value, usize, Part)> =
+            vec![(root, usize::MAX, Part::Other)];
+        let mut i = 0;
+        while i < nodes.len() {
+            if let Value::Object(map) = nodes[i].0 {
+                for (key, value) in map {
+                    if DATA_KEYS.contains(&key.as_str())
+                        || self.is_root_table(unit, nodes[i].0, key)
+                    {
+                        continue;
+                    }
+                    let part = match key.as_str() {
+                        "anyOf" => Part::AnyOf,
+                        "oneOf" => Part::OneOf,
+                        "properties" => Part::Property,
+                        "items" => Part::Items,
+                        _ => Part::Other,
+                    };
+                    let children: Box<dyn Iterator<Item = &Value>> =
+                        match (part, value) {
+                            (Part::Property, Value::Object(props)) => {
+                                Box::new(props.values())
+                            }
+                            (_, Value::Array(items)) => Box::new(items.iter()),
+                            (_, value) => Box::new(std::iter::once(value)),
+                        };
+                    // Elsewhere only objects are schemas worth a look
+                    // (`required`'s names, a `description`, are not).
+                    nodes.extend(
+                        children
+                            .filter(|c| part != Part::Other || c.is_object())
+                            .map(|c| (c, i, part)),
+                    );
+                }
+            }
+            i += 1;
+        }
+        let mut parts = vec![Parts::default(); nodes.len()];
+        let mut width = 0;
+        for i in (0..nodes.len()).rev() {
+            let (node, parent, part) = nodes[i];
+            let target = self.target(node).map(|t| widths[t].unwrap_or(W_ANY));
+            let w = own_width(node, &parts[i], target);
+            match parts.get_mut(parent) {
+                Some(p) => p.add(part, w),
+                None => width = w,
+            }
+        }
+        width
+    }
+}
+
+/// `schema`'s width ([`SchemaLimits::max_width`]), for the tests that
+/// fill shapes to the limit.
+#[cfg(test)]
+pub(crate) fn width(schema: &Value) -> usize {
+    let units = Units::new(schema);
+    units.width(&units.measure(usize::MAX).expect("no member limit"))
 }
 
 /// The units the root reaches, in depth-first finish order
@@ -505,6 +638,131 @@ fn finish_order(refs: &[Vec<(usize, usize)>]) -> Vec<usize> {
         }
     }
     order
+}
+
+/// Width of an untyped (any JSON value) or unknown schema: the most
+/// stacks the generic value grammar holds at once, measured 12, plus
+/// margin. See [`SchemaLimits::max_width`] for the rest.
+const W_ANY: usize = 16;
+/// `string`: 4 in JSON, 11 as a raw tagged (Qwen) value.
+const W_STRING: usize = 16;
+/// `integer`: its 18 optional digits are a stack each (19 measured).
+const W_INTEGER: usize = 24;
+/// `number` (5 measured).
+const W_NUMBER: usize = 8;
+/// `boolean` or `null` (2 measured, 3 in Harmony).
+const W_LITERAL: usize = 4;
+/// An object's or array's own continuations: a separator, the close,
+/// whitespace (3 measured).
+const W_CONTAINER: usize = 4;
+
+/// How a subschema's width combines into its parent's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// An `anyOf` variant: summed.
+    AnyOf,
+    /// A `oneOf` variant: summed.
+    OneOf,
+    /// A property's schema: the widest counts.
+    Property,
+    /// `items` (or a tuple's): the widest counts.
+    Items,
+    /// Anything else (`additionalProperties`, `allOf`, …): the widest
+    /// counts.
+    Other,
+}
+
+/// A schema's subschemas' widths, combined per [`Part`].
+#[derive(Clone, Copy, Default)]
+struct Parts {
+    any_of: Option<usize>,
+    one_of: Option<usize>,
+    property: usize,
+    items: Option<usize>,
+    other: usize,
+}
+
+impl Parts {
+    fn add(&mut self, part: Part, w: usize) {
+        let sum = |acc: &mut Option<usize>| {
+            *acc = Some(acc.unwrap_or(0).saturating_add(w));
+        };
+        match part {
+            Part::AnyOf => sum(&mut self.any_of),
+            Part::OneOf => sum(&mut self.one_of),
+            Part::Property => self.property = self.property.max(w),
+            Part::Items => self.items = Some(self.items.unwrap_or(0).max(w)),
+            Part::Other => self.other = self.other.max(w),
+        }
+    }
+}
+
+/// A schema's width from its own keywords and its subschemas' `parts`
+/// (`target`: its `$ref`'s): the widest reading of it, so a schema
+/// that is several things at once (an `anyOf` beside `properties`)
+/// counts as the widest of them.
+fn own_width(node: &Value, parts: &Parts, target: Option<usize>) -> usize {
+    let Value::Object(map) = node else {
+        return W_ANY;
+    };
+    let types: Vec<&str> = match map.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let props = map.get("properties").and_then(Value::as_object);
+    let required = map.get("required").and_then(Value::as_array);
+    let object = (props.is_some() || types.contains(&"object")).then(|| {
+        let declared = props.map_or(0, Map::len);
+        let undeclared = required.into_iter().flatten().filter(|name| {
+            name.as_str()
+                .is_some_and(|n| !props.is_some_and(|p| p.contains_key(n)))
+        });
+        match declared + undeclared.count() {
+            0 => W_ANY,
+            slots => slots
+                .saturating_add(W_CONTAINER)
+                .saturating_add(parts.property),
+        }
+    });
+    let array =
+        (map.contains_key("items") || types.contains(&"array")).then(|| {
+            match parts.items {
+                Some(items) => items.saturating_add(W_CONTAINER),
+                None => W_ANY,
+            }
+        });
+    let scalars = types
+        .iter()
+        .map(|t| match *t {
+            "object" | "array" => 0,
+            "string" => W_STRING,
+            "integer" => W_INTEGER,
+            "number" => W_NUMBER,
+            "boolean" | "null" => W_LITERAL,
+            _ => W_ANY,
+        })
+        .fold(0usize, usize::saturating_add);
+    let alternatives = |key: &str, sum: Option<usize>| {
+        map.get(key)
+            .and_then(Value::as_array)
+            .map(|_| sum.unwrap_or(W_ANY))
+    };
+    let readings = [
+        target,
+        alternatives("anyOf", parts.any_of),
+        alternatives("oneOf", parts.one_of),
+        map.get("enum")
+            .and_then(Value::as_array)
+            .map(|members| members.len().max(1)),
+        map.contains_key("const").then_some(1),
+        object,
+        array,
+        (scalars > 0).then_some(scalars),
+    ];
+    let typed = readings.iter().flatten().copied().max();
+    // Untyped: any value, unless something above says otherwise.
+    typed.unwrap_or(W_ANY).max(parts.other)
 }
 
 /// `value`'s length as compact JSON, as `serde_json` writes it, without
@@ -634,6 +892,89 @@ mod tests {
         );
     }
 
+    /// The width of each shape, as [`SchemaLimits::max_width`] counts it.
+    #[test]
+    fn width_counts_alternatives() {
+        let members: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
+        assert_eq!(width(&json!({"enum": members})), 100);
+        assert_eq!(width(&json!({"const": "x"})), 1);
+        assert_eq!(width(&json!({})), W_ANY);
+        assert_eq!(width(&json!(true)), W_ANY);
+        assert_eq!(width(&json!({"type": "integer"})), W_INTEGER);
+        assert_eq!(
+            width(&json!({"type": ["string", "null"]})),
+            W_STRING + W_LITERAL
+        );
+        // Properties (required ones without a schema too) + 4, plus
+        // the widest property.
+        let object = json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"enum": [1, 2]}},
+            "required": ["a", "c"],
+        });
+        assert_eq!(width(&object), 3 + W_CONTAINER + W_INTEGER);
+        assert_eq!(width(&json!({"type": "object"})), W_ANY);
+        let array = json!({"type": "array", "items": {"enum": [1, 2, 3]}});
+        assert_eq!(width(&array), 3 + W_CONTAINER);
+        // Variants add up, so nested ones multiply.
+        let inner = json!({"anyOf": [array, {"const": 0}]});
+        assert_eq!(width(&inner), 3 + W_CONTAINER + 1);
+        let outer = json!({"oneOf": [inner, inner, inner]});
+        assert_eq!(width(&outer), 3 * (3 + W_CONTAINER + 1));
+        assert_eq!(width(&json!({"anyOf": []})), W_ANY);
+        // A schema that is several things counts as the widest.
+        let both = json!({"anyOf": [{"const": 1}], "enum": [1, 2, 3]});
+        assert_eq!(width(&both), 3);
+        // Data never counts; neither do unreferenced defs.
+        let data = json!({
+            "type": "string",
+            "default": {"anyOf": [{}, {}, {}]},
+            "$defs": {"Wide": {"enum": members}},
+        });
+        assert_eq!(width(&data), W_STRING);
+    }
+
+    /// A `$ref` is its target's width, each def counted once; one back
+    /// into its cycle counts as untyped, so a tree is finite.
+    #[test]
+    fn width_follows_refs_and_cuts_cycles() {
+        let members: Vec<usize> = (0..50).collect();
+        let shared = json!({
+            "type": "object",
+            "properties": {
+                "a": {"$ref": "#/$defs/E"},
+                "b": {"anyOf": [{"$ref": "#/$defs/E"}, {"$ref": "#/$defs/E"}]},
+            },
+            "$defs": {"E": {"enum": members}},
+        });
+        assert_eq!(width(&shared), 2 + W_CONTAINER + 2 * 50);
+        let tree = json!({
+            "$ref": "#/$defs/Node",
+            "$defs": {"Node": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}},
+                },
+            }},
+        });
+        assert_eq!(width(&tree), 2 + W_CONTAINER + (W_ANY + W_CONTAINER));
+        let root =
+            json!({"type": "object", "properties": {"x": {"$ref": "#"}}});
+        assert_eq!(width(&root), 1 + W_CONTAINER + W_ANY);
+        // An exponential fan-out saturates in O(defs).
+        let n = 200;
+        let mut defs: Map<String, Value> = (0..n)
+            .map(|i| {
+                let next = json!({"$ref": format!("#/$defs/D{}", i + 1)});
+                (format!("D{i}"), json!({"anyOf": [next.clone(), next]}))
+            })
+            .collect();
+        defs.insert(format!("D{n}"), json!({"type": "string"}));
+        let schema = json!({"$ref": "#/$defs/D0", "$defs": defs});
+        assert_eq!(width(&schema), usize::MAX);
+    }
+
     #[test]
     fn ref_counts_at_target_size_per_reference() {
         let schema = json!({
@@ -712,7 +1053,8 @@ mod tests {
             .with_max_nodes(64)
             .with_max_defs(2)
             .with_max_member_bytes(8)
-            .with_max_total_member_bytes(20);
+            .with_max_total_member_bytes(20)
+            .with_max_width(30);
         let ok =
             json!({"type": "object", "properties": {"a": {"enum": ["x"]}}});
         assert_eq!(check(ok.clone(), &limits), Ok(()));
@@ -755,6 +1097,15 @@ mod tests {
                 .unwrap_err();
         assert_eq!(err.limit, SchemaLimit::TotalMemberBytes);
         assert_eq!(err.location, "request");
+
+        // Width is per schema: an `enum` of 31.
+        let wide: Vec<u8> = (0..31).collect();
+        let limits = limits.with_max_total_member_bytes(usize::MAX);
+        let output = json!({"enum": wide});
+        let err = check_schemas([&tool("t", ok)], Some(&output), &limits)
+            .unwrap_err();
+        assert_eq!(err.limit, SchemaLimit::Width);
+        assert_eq!(err.location, "output_config.format.schema");
     }
 
     /// A prompt is measured on its custom tools and its structured

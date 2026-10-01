@@ -879,12 +879,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   | `$defs` + `definitions` per schema | 1,024 | 5 |
   | bytes of one `enum` member / `const` | 16 KiB | 24 |
   | member bytes across the request, each `$ref` at its target's size | 1 MiB | ~49 KB |
+  | width: ways one schema's grammar can go on at once | 2,048 | 613 |
 
   Measured on Agora's seed-agent request (15 tools and the `Soul`
   output schema), misanthropic's captured request fixtures, Anthropic's
   documented tool examples and a heavier synthetic tool (a 600-member
   time-zone `enum` behind a `$ref` four parameters name); the largest
-  is 21× inside every limit. The `$ref`-expanded total is the work a
+  is 3× inside the width and 21× inside every other limit, Agora's
+  request at least 29× inside all. The `$ref`-expanded total is the work a
   per-parameter pipeline would do: a large `enum` behind a `$ref` two
   thousand parameters name is two thousand copies of it, and a `$ref`
   fan-out with no members at all (a doubling chain of defs ending in
@@ -892,12 +894,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bytes are its compact JSON's, control characters at their escaped
   length (`\u001f` is six). Every hostile
   shape the rechecks found is refused in milliseconds, while requests
-  at the limits (512 parameters over shared defs, 512 tools, 20,000
+  at the limits (512 parameters over shared defs, 512 tools, 2,000
   nested optional properties) compile in every dialect in under 110 ms.
+
+  The width bounds the grammar matcher's stacks, which it caps at 4096
+  by refusing the excess — over-restricting the output — so a request
+  inside the limit never reaches that cap. It is counted from the
+  shape: an `enum` member or `const` 1; `boolean`/`null` 4, `number`
+  8, `string` 16, `integer` 24 (its 18 optional digits are a stack
+  each) and an untyped value 16, each the most measured in any dialect
+  plus margin; an object its properties + 4 plus its widest property;
+  an array 4 plus its items; an `anyOf`/`oneOf` the *sum* of its
+  variants, since variants sharing a prefix (objects all opening
+  `{"a":`) are alive at once and nested ones multiply; a `$ref` its
+  target's width, each def once, a reference back into its own cycle
+  as untyped. Every shape filled to the default (an `enum`, optional
+  and required properties, `anyOf`s of objects and arrays alive through
+  an integer, `anyOf`s nested to multiply), as a tool parameter in
+  every dialect and as structured output, peaks at or under its count:
+  an `enum` exactly, the `anyOf`s at 60–95%, so under 2,048 stacks.
+  Ambiguity *through* recursion — two interchangeable recursive defs
+  doubling at every level of output — is not bounded by the count, only
+  by the matcher's cap, which keeps every way to go on (see Fixed).
+  Agora's widest schema counts 70.
+
   The pipelines keep their own caps for callers that skip the measure.
   blallama takes each as a flag (`--schema-max-tools`,
   `--schema-max-params`, `--schema-max-nodes`, `--schema-max-defs`,
-  `--schema-max-member-bytes`, `--schema-max-total-member-bytes`).
+  `--schema-max-member-bytes`, `--schema-max-total-member-bytes`,
+  `--schema-max-width`).
 
 - **Constrained output is checked against its schema before it is
   answered** (`SessionError::SchemaViolation`). A finished

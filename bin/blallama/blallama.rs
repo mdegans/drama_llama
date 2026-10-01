@@ -245,6 +245,11 @@ struct SchemaLimitArgs {
         default_value_t = SchemaLimits::default().max_total_member_bytes
     )]
     schema_max_total_member_bytes: usize,
+    /// How many ways one schema's grammar can go on at once (`enum`
+    /// members, properties, `anyOf`/`oneOf` variants, nested variants
+    /// multiplying); see `SchemaLimits::max_width`.
+    #[arg(long, default_value_t = SchemaLimits::default().max_width)]
+    schema_max_width: usize,
 }
 
 impl SchemaLimitArgs {
@@ -256,6 +261,7 @@ impl SchemaLimitArgs {
             .with_max_defs(self.schema_max_defs)
             .with_max_member_bytes(self.schema_max_member_bytes)
             .with_max_total_member_bytes(self.schema_max_total_member_bytes)
+            .with_max_width(self.schema_max_width)
     }
 }
 
@@ -1748,6 +1754,9 @@ mod tests {
         let args =
             Args::parse_from(["blallama", "models", "--schema-max-tools", "3"]);
         assert_eq!(args.schema_limits.limits().max_tools, 3);
+        let args =
+            Args::parse_from(["blallama", "models", "--schema-max-width", "9"]);
+        assert_eq!(args.schema_limits.limits().max_width, 9);
     }
 
     /// The ingest guard is a bug detector now: a shortfall is a 500
