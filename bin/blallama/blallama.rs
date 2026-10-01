@@ -109,6 +109,44 @@
 //! completed members at every depth — inferred; only the top level is
 //! captured. A call cut before its *name* is whole has nothing to return
 //! (Anthropic's block carries its name whole) and is left out.
+//!
+//! # Run it under a supervisor
+//!
+//! blallama exits on purpose when it can no longer trust its own
+//! process, and expects to be restarted:
+//!
+//! - **a panic**, on any thread — exit code **70** (`EX_SOFTWARE`);
+//! - **a backend failure** llama.cpp does not recover from in-process —
+//!   a failed `llama_decode`, a Metal context left "in error state …
+//!   recreate the backend" by an out-of-memory command buffer, or a
+//!   model load that fails after the backend began allocating (out of
+//!   memory loading the weights or creating the KV cache, or any load
+//!   failure llama.cpp leaves unexplained) — exit code **75**
+//!   (`EX_TEMPFAIL`).
+//!
+//! A load that fails *before* anything is allocated — a missing or
+//! unreadable file, metadata llama.cpp cannot read (not a GGUF, an
+//! unsupported architecture), a bad template — is answered with an
+//! error and the server serves on.
+//!
+//! Recovering in-process would mean unwinding through, or dropping,
+//! llama.cpp state that failed mid-operation, and llama.cpp does not
+//! promise its destructors clean that up; serving on is worse (one
+//! Metal OOM on 2026-10-01 failed every later request until a manual
+//! restart). So the process logs one `ERROR` line (`event: "fatal"`,
+//! with `kind`, `exit_code` and `cause`), answers the requests in
+//! flight and any that arrive meanwhile with a 500 `api_error` (which
+//! the SDKs retry), and `_exit`s half a second later — skipping
+//! llama.cpp's static destructors, which on Metal would turn the exit
+//! into a `SIGABRT`. See the `fatal` module.
+//!
+//! Run it under launchd, systemd (`Restart=on-failure`), or the restart
+//! loop in `scripts/blallama-supervise.sh`, which keeps the arguments,
+//! backs off when it crash-loops, and logs each restart with its exit
+//! code. A clean exit (SIGTERM, Ctrl-C: code 0) is not restarted by any
+//! of them.
+
+mod fatal;
 
 use std::{
     num::{NonZeroU128, NonZeroUsize},
@@ -131,8 +169,10 @@ use drama_llama::{
     backend::{Backend, Model},
     cli::{BackendArgs, BackendKind},
     prompt::{AnthropicError, MessageResponse, Usage},
-    Catalog, FromPath, ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
+    Catalog, FromPath, ProbeCtx, ProbeHook, Prompt, SchemaLimits, Session,
+    SnapshotOpts,
 };
+use fatal::Fatal;
 use misanthropic::{
     model::{ModelInfo, Models},
     response::StopReason,
@@ -208,6 +248,68 @@ struct Args {
     /// convention is to open `/probe` before sending `/v1/messages`.
     #[arg(long, default_value_t = false)]
     probe_stream: bool,
+    /// Limits on a request's tool and `output_config` schemas.
+    #[command(flatten)]
+    schema_limits: SchemaLimitArgs,
+}
+
+/// The most a request's client-supplied schemas — every custom tool's
+/// `input_schema`, an `output_config` `json_schema` — may measure,
+/// checked before anything compiles them. A request past one is a 400
+/// `invalid_request_error` naming it. The defaults are
+/// `drama_llama::SchemaLimits::default()`, generous for real tools
+/// (Agora's are 15 tools of at most 5 parameters, ~400 schema nodes);
+/// raise one if a legitimate request trips it.
+#[derive(clap::Args)]
+struct SchemaLimitArgs {
+    /// Custom tools in one request.
+    #[arg(long, default_value_t = SchemaLimits::default().max_tools)]
+    schema_max_tools: usize,
+    /// Top-level properties of one tool's `input_schema`.
+    #[arg(long, default_value_t = SchemaLimits::default().max_params)]
+    schema_max_params: usize,
+    /// JSON values across all of a request's schemas.
+    #[arg(long, default_value_t = SchemaLimits::default().max_nodes)]
+    schema_max_nodes: usize,
+    /// `$defs` (and `definitions`) entries of one schema.
+    #[arg(long, default_value_t = SchemaLimits::default().max_defs)]
+    schema_max_defs: usize,
+    /// Bytes of one `enum` member or `const` value, as compact JSON.
+    #[arg(long, default_value_t = SchemaLimits::default().max_member_bytes)]
+    schema_max_member_bytes: usize,
+    /// Bytes of every `enum` member and `const` value across a request,
+    /// each `$ref` counted at its target's size once per reference.
+    #[arg(
+        long,
+        default_value_t = SchemaLimits::default().max_total_member_bytes
+    )]
+    schema_max_total_member_bytes: usize,
+    /// How many ways one schema's grammar can go on at once (`enum`
+    /// members, properties, `anyOf`/`oneOf` variants, nested variants
+    /// multiplying); see `SchemaLimits::max_width`.
+    #[arg(long, default_value_t = SchemaLimits::default().max_width)]
+    schema_max_width: usize,
+    /// Levels of objects and arrays a value one schema's grammar writes
+    /// may nest, each `$ref` at its target's depth; see
+    /// `SchemaLimits::max_depth`. Past 93, a value (an untyped one adds
+    /// up to 32 levels, a call envelope two) can nest deeper than the 127
+    /// levels the parsers read.
+    #[arg(long, default_value_t = SchemaLimits::default().max_depth)]
+    schema_max_depth: usize,
+}
+
+impl SchemaLimitArgs {
+    fn limits(&self) -> SchemaLimits {
+        SchemaLimits::default()
+            .with_max_tools(self.schema_max_tools)
+            .with_max_params(self.schema_max_params)
+            .with_max_nodes(self.schema_max_nodes)
+            .with_max_defs(self.schema_max_defs)
+            .with_max_member_bytes(self.schema_max_member_bytes)
+            .with_max_total_member_bytes(self.schema_max_total_member_bytes)
+            .with_max_width(self.schema_max_width)
+            .with_max_depth(self.schema_max_depth)
+    }
 }
 
 #[derive(Clone)]
@@ -372,18 +474,32 @@ fn validate_prompt(prompt: &Prompt) -> Result<(), AnthropicError> {
         .map_err(|message| AnthropicError::InvalidRequest { message })
 }
 
-async fn spawn_blocking_or_bust<F, R>(f: F) -> R
+/// A route's error answer, in the wire envelope.
+type Reply = (StatusCode, Json<ErrorEnvelope>);
+
+/// Run `f` on the blocking pool — every call into llama.cpp goes
+/// through here — or answer 500 once the process is declared fatal
+/// ([`fatal`]): by a panic in `f` (which parks its thread rather than
+/// unwind it, see [`fatal::install`]), or anything else meanwhile. A
+/// panic that does unwind into a `JoinError` (one inside
+/// [`fatal::caught_by_caller`] that nothing caught) is declared here.
+async fn spawn_blocking_or_bust<F, R>(f: F) -> Result<R, Reply>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    match spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!(error = %e);
-            std::process::exit(1); // We don't trust llama.cpp's destructors to
-                                   // clean up so this is fatal.
-        }
+    tokio::select! {
+        joined = spawn_blocking(f) => match joined {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                // Cancelled only at runtime shutdown; a panic otherwise.
+                if e.is_panic() {
+                    fatal::declare(Fatal::Panic, &e);
+                }
+                Err(fatal::reply(fatal::current().unwrap_or(Fatal::Panic)))
+            }
+        },
+        fatal = fatal::declared() => Err(fatal::reply(fatal)),
     }
 }
 
@@ -456,13 +572,16 @@ fn model_not_found(id: &str) -> (StatusCode, Json<ErrorEnvelope>) {
 /// metadata off disk (a vocab-only load for llama.cpp — no weights, no
 /// GPU); later calls are served from the [`Catalog`]'s cache until the
 /// file changes. Runs on the blocking pool: the peek is I/O.
-async fn route_models<B>(State(state): State<AppState<B>>) -> Json<Models>
+async fn route_models<B>(
+    State(state): State<AppState<B>>,
+) -> Result<Json<Models>, Reply>
 where
     B: Backend + 'static,
     Session<B>: FromPath,
 {
     let catalog = state.catalog.clone();
-    Json(spawn_blocking_or_bust(move || catalog.models()).await)
+    let read = move || fatal::caught_by_caller(|| catalog.models());
+    spawn_blocking_or_bust(read).await.map(Json)
 }
 
 /// `GET /v1/models/{id}` — one model's [`ModelInfo`], or the same 404
@@ -479,8 +598,9 @@ where
 {
     let catalog = state.catalog.clone();
     let name = id.clone();
-    spawn_blocking_or_bust(move || catalog.info(&name))
-        .await
+    let read = move || fatal::caught_by_caller(|| catalog.info(&name));
+    spawn_blocking_or_bust(read)
+        .await?
         .map(Json)
         .ok_or_else(|| model_not_found(&id))
 }
@@ -492,15 +612,14 @@ where
 /// own server leaves the same fields blank).
 async fn route_tags<B>(
     State(state): State<AppState<B>>,
-) -> Json<serde_json::Value>
+) -> Result<Json<serde_json::Value>, Reply>
 where
     B: Backend + 'static,
     Session<B>: FromPath,
 {
     let catalog = state.catalog.clone();
     let models = spawn_blocking_or_bust(move || {
-        catalog
-            .models()
+        fatal::caught_by_caller(|| catalog.models())
             .into_iter()
             .map(|info| {
                 let name = info.id.name().to_string();
@@ -521,8 +640,8 @@ where
             })
             .collect::<Vec<_>>()
     })
-    .await;
-    Json(serde_json::json!({ "models": models }))
+    .await?;
+    Ok(Json(serde_json::json!({ "models": models })))
 }
 
 async fn run<B>(
@@ -552,16 +671,16 @@ where
     // flight, and `/v1/messages` only needs the directory listing.
     {
         let catalog = catalog.clone();
-        spawn_blocking(move || {
+        tokio::spawn(spawn_blocking_or_bust(move || {
             let started = std::time::Instant::now();
-            let n = catalog.models().len();
+            let n = fatal::caught_by_caller(|| catalog.models()).len();
             info!(
                 event = "catalog_warm",
                 models = n,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "model catalog warmed",
             );
-        });
+        }));
     }
 
     let mut app = Router::new()
@@ -574,6 +693,9 @@ where
     if probe_bus.is_some() {
         app = app.route("/probe", axum::routing::get(route_probe_stream));
     }
+    // Last, so it covers every route: once the process is declared
+    // fatal, nothing more is served from it.
+    let app = app.layer(axum::middleware::from_fn(fatal::refuse_when_fatal));
     let app = app.with_state(AppState {
         args: args.into(),
         catalog,
@@ -648,6 +770,7 @@ async fn load_session<B>(
     model: String,
     no_penalty: bool,
     seed: Option<u128>,
+    schema_limits: SchemaLimits,
 ) -> Result<Session<B>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend + 'static,
@@ -660,17 +783,56 @@ where
         model,
         path = path.to_string_lossy().as_ref()
     );
+    let session =
+        load_with(catalog, model, path, Session::<B>::from_path_with).await?;
+    Ok(configure_session(session, no_penalty, seed, schema_limits))
+}
+
+/// [`load_session`]'s load, with the loader passed in so a test can
+/// stand in for a load that fails. A failure that may have left the
+/// backend half-allocated ([`SessionError::is_resource`]: out of memory
+/// loading the weights or creating the KV cache) is fatal, like any
+/// other backend failure; one found before anything was allocated (a
+/// missing file, unreadable metadata, a bad template) is answered and
+/// the server serves on.
+///
+/// [`SessionError::is_resource`]: drama_llama::SessionError::is_resource
+async fn load_with<B, L>(
+    catalog: Arc<Catalog<B>>,
+    model: String,
+    path: PathBuf,
+    load: L,
+) -> Result<Session<B>, Reply>
+where
+    B: Backend + 'static,
+    Session<B>: FromPath,
+    L: FnOnce(
+            PathBuf,
+            <Session<B> as FromPath>::Options,
+        ) -> Result<Session<B>, drama_llama::SessionError>
+        + Send
+        + 'static,
+{
     // On the blocking pool: loading is seconds of blocking file and GPU
     // work and this is a reactor thread.
     spawn_blocking_or_bust(move || {
-        let session =
-            Session::<B>::from_path_with(path, catalog.options().clone())?;
-        catalog.refresh(&model, session.model_info());
-        Ok(session)
+        fatal::caught_by_caller(|| {
+            let session = load(path, catalog.options().clone())?;
+            catalog.refresh(&model, session.model_info());
+            Ok(session)
+        })
     })
-    .await
-    .map(|s| configure_session(s, no_penalty, seed))
-    .map_err(map_session_err)
+    .await?
+    .map_err(|e: drama_llama::SessionError| match e.is_resource() {
+        true => {
+            fatal::declare(Fatal::Backend, &e);
+            fatal::reply(Fatal::Backend)
+        }
+        false => {
+            error!(event = "load_failed", error = %e);
+            map_session_err(e)
+        }
+    })
 }
 
 async fn route_messages<B>(
@@ -708,7 +870,7 @@ where
         let result = session.count_tokens(&prompt);
         (session, result)
     })
-    .await;
+    .await?;
     // Counting never touches KV state, so the session survives any
     // error it can return.
     lock.replace(session);
@@ -732,7 +894,7 @@ where
     let served = spawn_blocking_or_bust(move || {
         catalog.resolve(&requested, default.as_deref())
     })
-    .await
+    .await?
     .map_err(|e| {
         error!(error = %e);
         (StatusCode::NOT_FOUND, Json(e.into()))
@@ -796,6 +958,7 @@ where
         model.to_string(),
         state.args.no_penalty,
         state.args.seed,
+        state.args.schema_limits.limits(),
     )
     .await?;
     Ok((lock, session))
@@ -896,7 +1059,7 @@ where
             };
             (session, result, start.elapsed(), resamples)
         })
-        .await;
+        .await?;
 
     if resamples > 0 && result.is_ok() {
         info!(resamples, "resample recovered a clean generation");
@@ -912,13 +1075,16 @@ where
         Ok(_) => {
             lock.replace(session);
         }
-        Err(e) if !e.is_fatal() => {
-            error!(error = %e);
-            lock.replace(session);
+        Err(e) if fatal::is_backend_failure(e) => {
+            fatal::declare(Fatal::Backend, e);
+            // Never through llama.cpp's destructors: the backend just
+            // failed, and the process exits in a moment anyway.
+            std::mem::forget(session);
+            return Err(fatal::reply(Fatal::Backend));
         }
         Err(e) => {
-            error!(erorr = %e);
-            // Drop session; next request will reload.
+            error!(error = %e);
+            lock.replace(session);
         }
     }
 
@@ -999,6 +1165,7 @@ fn configure_session<B: Backend>(
     s: Session<B>,
     no_penalty: bool,
     seed: Option<u128>,
+    schema_limits: SchemaLimits,
 ) -> Session<B> {
     // Sampling configuration is loaded from the per-model sidecar
     // (`<model>.sampling.toml` for gguf, `parent/sampling.toml` for moeflux)
@@ -1021,7 +1188,8 @@ fn configure_session<B: Backend>(
         .with_prefix_cache(true)
         // An Anthropic-API server answers an overrun `max_tokens` with
         // Anthropic's 400, before prefill, not a silent truncation.
-        .with_strict_context_fit(true);
+        .with_strict_context_fit(true)
+        .with_schema_limits(schema_limits);
     // ProbeHook installation moved to per-request handlers — each /v1/messages
     // request gets a fresh hook bound to its UUID, so the hook can fan out to
     // JSONL, the broadcast bus, or both, with a recorder lifetime that exactly
@@ -1411,6 +1579,7 @@ fn map_session_err(
         | E::OutputConfig(_)
         | E::RequestTopP(_)
         | E::Dialect(_)
+        | E::SchemaBudget(_)
         | E::UnrenderableOpenThought { .. }
         | E::MediaUnsupported { .. }
         | E::Media(_)
@@ -1436,6 +1605,7 @@ fn map_session_err(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
+    fatal::install();
     let args = Args::parse();
 
     // If --record-json is set, spin up the JSONL writer task before any request
@@ -1612,6 +1782,94 @@ mod tests {
                 .is_some_and(|m| m.contains("System message must be at")),
             "{value}",
         );
+    }
+
+    /// A schema with no grammar — here an empty `enum`, in a tool and in
+    /// an `output_config` — is the request's fault: 400
+    /// `invalid_request_error`, never a retryable 500.
+    #[test]
+    fn schema_without_grammar_is_anthropic_400_envelope() {
+        use drama_llama::{
+            dialect::{grammar_source, EmitOptions},
+            grammar_for_output_config, CallSyntax, OutputConfigOptions,
+            SessionError, Tool,
+        };
+        use misanthropic::prompt::output::OutputConfig;
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"enum": []}},
+        });
+        let tool = Tool::builder("t")
+            .description("d")
+            .schema(schema.clone())
+            .build()
+            .unwrap();
+        let dialect = grammar_source(
+            &CallSyntax::qwen_xml(),
+            &[&tool],
+            &EmitOptions::default(),
+        )
+        .unwrap_err();
+        let output = grammar_for_output_config(
+            &OutputConfig::json_schema(schema),
+            &OutputConfigOptions::default(),
+            false,
+        )
+        .unwrap_err();
+        for error in [SessionError::from(dialect), SessionError::from(output)] {
+            let (status, Json(envelope)) = map_session_err(error);
+            let value = serde_json::to_value(envelope).unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("empty `enum`")),
+                "{value}",
+            );
+        }
+    }
+
+    /// A request whose schemas measure past the server's limits is the
+    /// request's fault too: 400 `invalid_request_error`, naming the
+    /// limit and where.
+    #[test]
+    fn schema_past_limits_is_anthropic_400_envelope() {
+        use drama_llama::{schema_budget::check_schemas, SessionError, Tool};
+        let tool = Tool::builder("lookup")
+            .description("d")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {"a": {}, "b": {}},
+            }))
+            .build()
+            .unwrap();
+        let limits = SchemaLimits::default().with_max_params(1);
+        let error = check_schemas([&tool], None, &limits).unwrap_err();
+        let (status, Json(envelope)) =
+            map_session_err(SessionError::from(error));
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("tool `lookup`"), "{message}");
+        assert!(message.contains("more than 1 top-level"), "{message}");
+    }
+
+    /// The flags default to the library's limits.
+    #[test]
+    fn schema_limit_flags_default_to_the_library() {
+        let args = Args::parse_from(["blallama", "models"]);
+        assert_eq!(args.schema_limits.limits(), SchemaLimits::default());
+        let args =
+            Args::parse_from(["blallama", "models", "--schema-max-tools", "3"]);
+        assert_eq!(args.schema_limits.limits().max_tools, 3);
+        let args =
+            Args::parse_from(["blallama", "models", "--schema-max-width", "9"]);
+        assert_eq!(args.schema_limits.limits().max_width, 9);
+        let args =
+            Args::parse_from(["blallama", "models", "--schema-max-depth", "8"]);
+        assert_eq!(args.schema_limits.limits().max_depth, 8);
     }
 
     /// The ingest guard is a bug detector now: a shortfall is a 500

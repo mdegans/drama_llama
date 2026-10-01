@@ -52,11 +52,36 @@ fn engine_count() -> std::sync::MutexGuard<'static, usize> {
 
 /// Possible errors when creating a new [`crate::Engine`] or
 /// [`LlamaCppDecoder`].
+///
+/// [`Self::is_resource`] splits them in two: failures found before the
+/// backend allocated anything (a missing file, an unsupported
+/// architecture), after which the process is as it was, and failures
+/// after it began to (out of memory loading the weights or creating
+/// the KV cache), after which llama.cpp's state may be partial.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum NewError {
+    /// The model file could not be opened: missing, a directory, or
+    /// not readable. Checked before llama.cpp sees the path.
+    #[error("Could not open model file {path}: {source}")]
+    Unreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// llama.cpp could not read the model's header, metadata or
+    /// vocabulary — not a GGUF, an unsupported architecture, a
+    /// malformed vocabulary — in a vocab-only pass that allocates no
+    /// backend memory.
+    #[error("Could not read model metadata from {path}")]
+    Metadata { path: PathBuf },
+    /// The full load failed after the vocab-only pass succeeded: while
+    /// the backend was allocating and filling the weights. Out of
+    /// memory, most likely; llama.cpp does not say.
     #[error("Could not load model from file: {path}")]
     Model { path: PathBuf },
+    /// `llama_init_from_model` failed: most likely the KV cache or
+    /// compute buffers could not be allocated; llama.cpp does not say.
     #[error("Could not create context")]
     Context,
     /// An mmproj sidecar exists next to the model but failed to load.
@@ -69,6 +94,26 @@ pub enum NewError {
         #[source]
         source: crate::llama_cpp::mtmd::MtmdNewError,
     },
+}
+
+impl NewError {
+    /// Whether the failure came after the backend began allocating, so
+    /// that llama.cpp may be left with partial state: a resource
+    /// failure, out of memory most likely. `false` only for failures
+    /// found before any backend allocation ([`Self::Unreadable`],
+    /// [`Self::Metadata`], an mmproj path C cannot take); where
+    /// llama.cpp does not say why, the answer is `true`.
+    pub fn is_resource(&self) -> bool {
+        match self {
+            Self::Unreadable { .. } | Self::Metadata { .. } => false,
+            Self::Model { .. } | Self::Context => true,
+            #[cfg(feature = "mtmd")]
+            Self::Mtmd { source, .. } => matches!(
+                source,
+                crate::llama_cpp::mtmd::MtmdNewError::LoadFailed { .. }
+            ),
+        }
+    }
 }
 
 static_assertions::assert_impl_all!(NewError: Send, Sync);

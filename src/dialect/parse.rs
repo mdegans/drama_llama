@@ -29,21 +29,27 @@
 //!
 //! Tagged raw values are schema-coerced: params typed `string` (or
 //! unknown) stay raw strings, as do nullable strings bar a literal
-//! `null` — never a string `enum`, which the grammar generates as
-//! JSON; anything else is parsed as JSON after
+//! `null`; a finite set of strings (`enum`, `const`, nullable or not)
+//! reads by exact match on its members' raw spellings, as the grammar
+//! generates it; anything else is parsed as JSON after
 //! normalizing pythonisms (`True`/`False`/`None`, single-quoted
 //! strings) with bounded brace-healing, falling back to a JSON
 //! string of the raw bytes when parsing still fails. Parse never
 //! hard-errors on content — worst case a call degrades to text.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::chat_template::is_tool_name;
+use crate::grammar_compile::MAX_NESTING;
 use crate::prompt::{Block, ToolUse};
 use crate::Tool;
 
+use super::emit::{tagged_values, TaggedValue};
 use super::partial::{
     marker_holdback, read_partial, unclosed_json, Flavor, OpenStrings,
 };
@@ -166,7 +172,14 @@ pub struct StreamParser {
     /// *spelled* marked (see [`Provenance`]); what the parser yields is
     /// restored. `None` parses the text as it stands.
     provenance: Option<Provenance>,
+    /// Each tool's parameter spellings, classified once for the whole
+    /// generation rather than once per re-parse — every token.
+    spellings: Spellings,
 }
+
+/// Each tool's parameter spellings ([`tagged_values`]), by index into
+/// the parse's tools.
+pub(crate) type Spellings = HashMap<usize, Arc<HashMap<String, TaggedValue>>>;
 
 impl StreamParser {
     pub fn new(
@@ -183,6 +196,7 @@ impl StreamParser {
             text_bytes_emitted: 0,
             open: None,
             provenance: None,
+            spellings: Spellings::new(),
         }
     }
 
@@ -277,13 +291,16 @@ impl StreamParser {
     /// prose.
     pub(crate) fn in_flight(&self) -> bool {
         let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
-        parse_text(
+        let mut spellings = self.spellings.clone();
+        parse_text_cached(
             &self.syntax,
             &tool_refs,
             &self.text,
             self.pre_opened_reasoning,
             Leniency::Clipped,
+            &mut spellings,
         )
+        .0
         .status
             == ParseStatus::NeedMoreInput
     }
@@ -389,12 +406,13 @@ impl StreamParser {
 
     fn reparse(&mut self, leniency: Leniency) -> Vec<Block> {
         let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
-        let (parsed, open) = parse_text_open(
+        let (parsed, open) = parse_text_cached(
             &self.syntax,
             &tool_refs,
             &self.text,
             self.pre_opened_reasoning,
             leniency,
+            &mut self.spellings,
         );
         self.open = match &self.provenance {
             Some(provenance) => open.map(|o| provenance.restore_open(o)),
@@ -423,8 +441,21 @@ impl StreamParser {
                         false => text.len(),
                     };
                     let end = self.whole_markers(&text, end);
-                    if end > self.text_bytes_emitted {
-                        let delta = &text[self.text_bytes_emitted..end];
+                    // What was yielded is a prefix of this text unless
+                    // a longer re-parse re-cut the block under it (a
+                    // call opened inside an open thought that a later
+                    // close turns back into thought) — model output
+                    // reaches that, so the slice must not land
+                    // mid-char.
+                    let from = text.ceil_char_boundary(self.text_bytes_emitted);
+                    if from != self.text_bytes_emitted.min(text.len()) {
+                        tracing::warn!(
+                            emitted = self.text_bytes_emitted,
+                            "stream parser: trailing text re-cut mid-char"
+                        );
+                    }
+                    if end > from {
+                        let delta = &text[from..end];
                         out.push(match &self.provenance {
                             Some(p) => p.restore(delta).into_owned().into(),
                             None => delta.to_string().into(),
@@ -490,6 +521,27 @@ pub(crate) fn parse_text_open(
     pre_opened_reasoning: bool,
     leniency: Leniency,
 ) -> (Parsed, Option<OpenCall>) {
+    parse_text_cached(
+        syntax,
+        tools,
+        text,
+        pre_opened_reasoning,
+        leniency,
+        &mut Spellings::new(),
+    )
+}
+
+/// [`parse_text_open`], reading and filling `spellings`, so a caller that
+/// parses the same tools again and again (the streaming re-parse)
+/// classifies each tool once.
+pub(crate) fn parse_text_cached(
+    syntax: &CallSyntax,
+    tools: &[&Tool],
+    text: &str,
+    pre_opened_reasoning: bool,
+    leniency: Leniency,
+    spellings: &mut Spellings,
+) -> (Parsed, Option<OpenCall>) {
     let mut p = Parser {
         syntax,
         tools,
@@ -500,8 +552,11 @@ pub(crate) fn parse_text_open(
         status: ParseStatus::Complete,
         leniency,
         open: None,
+        spellings: RefCell::new(std::mem::take(spellings)),
+        landmarks: HashMap::new(),
     };
     p.run(pre_opened_reasoning);
+    *spellings = p.spellings.into_inner();
     let parsed = Parsed {
         blocks: fold_blank_text(p.blocks),
         status: p.status,
@@ -551,11 +606,43 @@ struct Parser<'a> {
     /// The call the input ended inside ([`OpenCall`]), read just before
     /// [`Self::incomplete`] handles it.
     open: Option<OpenCall>,
+    /// Each tool's parameter spellings ([`tagged_values`]) by tool
+    /// index, classified the first time a call to the tool needs one —
+    /// not once per parameter read — and kept across re-parses by a
+    /// caller that lends its own ([`parse_text_cached`]).
+    spellings: RefCell<Spellings>,
+    /// Each landmark's next occurrence ([`Self::find_landmark`]):
+    /// `marker → (searched from, found at)`, absolute.
+    landmarks: HashMap<String, (usize, Option<usize>)>,
 }
 
 impl<'a> Parser<'a> {
     fn rest(&self) -> &'a str {
         &self.text[self.pos..]
+    }
+
+    /// Where `marker` next occurs in [`Self::rest`], as
+    /// `rest().find(marker)` — remembered in `landmarks`, so the scan for
+    /// a landmark the text no longer holds runs to its end once, not
+    /// again from every block boundary after it. Those rescans made a
+    /// parse quadratic in its boundaries: 384 KB of Gemma 4's
+    /// `<|tool_call>` alone (32k tokens, each a malformed call and a
+    /// boundary) took 10 s to parse, and a stream re-parses on every
+    /// token.
+    fn find_landmark(&mut self, marker: &str) -> Option<usize> {
+        let pos = self.pos;
+        // `(from, at)`: `marker` first occurs at or after `from` at `at`
+        // — so first at or after `pos` there too, for `from <= pos <=
+        // at`, and nowhere after `pos` when `at` is `None`.
+        if let Some(&(from, at)) = self.landmarks.get(marker) {
+            if from <= pos && at.is_none_or(|at| at >= pos) {
+                return at.map(|at| at - pos);
+            }
+        }
+        let at = self.rest().find(marker);
+        self.landmarks
+            .insert(marker.to_string(), (pos, at.map(|at| at + pos)));
+        at
     }
 
     fn eat(&mut self, literal: &str) -> bool {
@@ -873,13 +960,13 @@ impl<'a> Parser<'a> {
             .is_some()
             .then(|| self.syntax.reasoning.end.trim().to_string())
             .filter(|s| !s.is_empty());
+        let exit = self.syntax.tool_response_start.clone();
 
         while self.pos < self.text.len() {
             // Next structural landmark: reasoning open or call
             // trigger, whichever comes first.
-            let rest = self.rest();
             let think_at = if reasoning_on && !reasoning_start.is_empty() {
-                rest.find(&reasoning_start)
+                self.find_landmark(&reasoning_start)
             } else {
                 None
             };
@@ -890,34 +977,47 @@ impl<'a> Parser<'a> {
                 // prose `{` costs a parse attempt that degrades back
                 // to Text on failure — same trade upstream makes.
                 if self.syntax.family == Family::JsonNative {
-                    rest.find(['{', '['])
+                    self.rest().find(['{', '['])
                 } else {
                     None
                 }
             } else {
-                rest.find(trigger.as_str())
+                self.find_landmark(&trigger)
             };
 
+            // The turn-exit marker before the next thought / call
+            // landmark, consumed below.
+            let exit_at = (!exit.is_empty())
+                .then(|| self.find_landmark(&exit))
+                .flatten()
+                .filter(|&p| {
+                    think_at.is_none_or(|t| p < t)
+                        && trigger_at.is_none_or(|t| p < t)
+                });
+
             // Channel noise strictly before the next thought / call
-            // landmark is consumed first. A bare open is only *noise*
-            // when it is not the thought open itself: the open marker
-            // is a prefix of the thought marker, so `open_at ≤
-            // think_at` always, with equality meaning "this IS the
-            // thought open".
+            // landmark — and before the turn-exit marker, which would
+            // otherwise land in the prose before it — is consumed
+            // first. A bare open is only *noise* when it is not the
+            // thought open itself: the open marker is a prefix of the
+            // thought marker, so `open_at ≤ think_at` always, with
+            // equality meaning "this IS the thought open".
             if let Some(open) = &channel_open {
                 let before_structs = |&p: &usize| {
                     think_at.is_none_or(|t| p < t)
                         && trigger_at.is_none_or(|t| p < t)
+                        && exit_at.is_none_or(|e| p < e)
                 };
-                let open_at = rest
-                    .find(open.as_str())
+                let open_at = self
+                    .find_landmark(open)
                     .filter(|&o| think_at != Some(o))
                     .filter(before_structs);
                 let close_at = channel_close
                     .as_deref()
-                    .and_then(|c| rest.find(c))
+                    .and_then(|c| self.find_landmark(c))
                     .filter(before_structs)
                     .filter(|&c| open_at.is_none_or(|o| c < o));
+                let rest = self.rest();
                 if let Some(c) = close_at {
                     let prose = rest[..c].to_string();
                     self.push_text(&prose);
@@ -946,20 +1046,14 @@ impl<'a> Parser<'a> {
             // requires after the last call — swallow it silently
             // wherever it appears outside a call; it is never
             // content.
-            let exit = &self.syntax.tool_response_start;
-            if !exit.is_empty() {
-                let exit_at = rest.find(exit.as_str()).filter(|&p| {
-                    think_at.is_none_or(|t| p < t)
-                        && trigger_at.is_none_or(|t| p < t)
-                });
-                if let Some(p) = exit_at {
-                    let prose = rest[..p].to_string();
-                    self.push_text(&prose);
-                    self.pos += p + exit.len();
-                    continue;
-                }
+            if let Some(p) = exit_at {
+                let prose = self.rest()[..p].to_string();
+                self.push_text(&prose);
+                self.pos += p + exit.len();
+                continue;
             }
 
+            let rest = self.rest();
             match (think_at, trigger_at) {
                 (Some(t), None) => {
                     let prose = rest[..t].to_string();
@@ -1132,17 +1226,11 @@ impl<'a> Parser<'a> {
                     // *char* past the opener — a byte step slices
                     // mid-char when a derived trigger opens with a
                     // multi-byte char.
-                    let step = self.text[call_start..]
-                        .chars()
-                        .next()
-                        .map(char::len_utf8)
-                        .unwrap_or(1);
-                    let upto = match self.text[call_start + step..]
-                        .find(self.syntax.trigger())
-                    {
-                        Some(next) => call_start + step + next,
-                        None => self.text.len(),
-                    };
+                    let upto = call_start
+                        + past_first_char(
+                            &self.text[call_start..],
+                            self.syntax.trigger(),
+                        );
                     // A cut can leave a call malformed-looking (the
                     // clip, not the model, broke it); running to the
                     // end of input it is the call in flight — with
@@ -1227,10 +1315,8 @@ impl<'a> Parser<'a> {
                 CallOutcome::Malformed => {
                     // Degrade to prose up to the next possible marker
                     // byte — nothing silently dropped.
-                    let upto = match self.text[block_start + 1..].find("<|") {
-                        Some(next) => block_start + 1 + next,
-                        None => self.text.len(),
-                    };
+                    let upto = block_start
+                        + past_first_char(&self.text[block_start..], "<|");
                     // Cut short mid-block: withheld, as a malformed call
                     // running to the end is in the generic loop.
                     if upto == self.text.len()
@@ -1270,8 +1356,7 @@ impl<'a> Parser<'a> {
         if !header_ish {
             // Prose outside any block structure (grammarless model
             // drift): consume up to the next possible marker.
-            let upto =
-                rest[1..].find("<|").map(|i| i + 1).unwrap_or(rest.len());
+            let upto = past_first_char(rest, "<|");
             let prose = rest[..upto].to_string();
             self.push_text(&prose);
             self.pos += upto;
@@ -1483,16 +1568,6 @@ impl<'a> Parser<'a> {
         CallOutcome::Parsed
     }
 
-    fn schema_for(&self, tool: &str, param: &str) -> Option<Value> {
-        self.tools
-            .iter()
-            .find(|t| t.name.as_ref() == tool)?
-            .schema
-            .get("properties")?
-            .get(param)
-            .cloned()
-    }
-
     fn push_call(&mut self, name: String, input: Value) {
         let call = self.make_call(name, input);
         self.blocks.push(Block::ToolUse { call });
@@ -1584,7 +1659,9 @@ impl<'a> Parser<'a> {
             let raw = self.rest()[..val_end].to_string();
             self.pos += val_end + a.value_suffix.len();
 
-            let value = self.coerce_value(&name, &key, &raw);
+            let Some(value) = self.coerce_value(&name, &key, &raw) else {
+                return CallOutcome::Malformed;
+            };
             args.insert(key, value);
 
             if !a.separator.is_empty() {
@@ -1600,61 +1677,88 @@ impl<'a> Parser<'a> {
     }
 
     /// Schema-guided coercion of a raw tagged value (llama.cpp
-    /// mapper parity): `string`-typed (or unknown) params stay raw;
-    /// otherwise parse as JSON after pythonism normalization with
-    /// bounded brace healing; fall back to a raw string.
+    /// mapper parity), spelled as [`tagged_values`] says the grammar
+    /// generates it: a string param (or an unknown one) stays raw; a
+    /// nullable string too, bar `null`; a finite set of strings is
+    /// matched exactly against its members' spellings, and a value
+    /// outside it (a model writing unconstrained) is read as JSON or
+    /// kept raw, a string beside the set's own; anything else is
+    /// parsed as JSON after pythonism normalization with bounded brace
+    /// healing.
     ///
-    /// A nullable string (`"type": ["string", "null"]`, no `enum`) is
-    /// generated raw, like any string (the grammar sees through
-    /// nullability), so it is read raw too: JSON `null` is its one
-    /// non-string value. Parsing it as JSON would type a `5` or `true`
-    /// the model wrote as text, and unquote a `"quoted"` one, which
-    /// then re-renders without its quotes.
-    fn coerce_value(&self, tool: &str, param: &str, raw: &str) -> Value {
-        if self.is_string_param(tool, param) {
-            return Value::String(raw.to_string());
-        }
+    /// `None` when a JSON-spelled value reads as no JSON at all — the
+    /// call is malformed. Not the raw text as a string: that retyped a
+    /// value the grammar admitted but serde refuses (nested past
+    /// `MAX_NESTING` through a recursive `$ref`, a number past `f64`)
+    /// into a string, which a union admitting strings even passed the
+    /// schema check as.
+    ///
+    /// Parsing a raw string as JSON would type a `5` or `true` the
+    /// model wrote as text, and unquote a `"quoted"` one, which then
+    /// re-renders without its quotes.
+    ///
+    /// [`tagged_values`]: super::emit::tagged_values
+    fn coerce_value(
+        &self,
+        tool: &str,
+        param: &str,
+        raw: &str,
+    ) -> Option<Value> {
         let trimmed = raw.trim();
-        if self.is_nullable_string_param(tool, param) {
-            return match trimmed {
+        let json = || {
+            serde_json::from_str::<Value>(trimmed)
+                .or_else(|_| serde_json::from_str(&heal_json(trimmed)))
+                .ok()
+        };
+        match self.tagged_value(tool, param) {
+            None | Some(TaggedValue::Raw { nullable: false }) => {
+                Some(Value::String(raw.to_string()))
+            }
+            Some(TaggedValue::Raw { nullable: true }) => Some(match trimmed {
                 "null" => Value::Null,
                 _ => Value::String(raw.to_string()),
-            };
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-            return v;
-        }
-        let healed = heal_json(trimmed);
-        if let Ok(v) = serde_json::from_str::<Value>(&healed) {
-            return v;
-        }
-        Value::String(raw.to_string())
-    }
-
-    /// Whether `param` of `tool` takes its raw text as a string: typed
-    /// `string` without an `enum`, or unknown. A string `enum` is not
-    /// raw: the grammar generates it as JSON (`"full"`, quotes and all —
-    /// `dialect::emit`'s `schema_is_string`), so reading it raw handed
-    /// the tool `"\"full\""` and failed the schema backstop on every
-    /// draw.
-    fn is_string_param(&self, tool: &str, param: &str) -> bool {
-        match self.schema_for(tool, param) {
-            Some(s) => {
-                s.get("type").and_then(|t| t.as_str()) == Some("string")
-                    && s.get("enum").is_none()
+            }),
+            Some(TaggedValue::Choice(choice)) => {
+                // Exact under the grammar; trimmed, or quoted (read as
+                // JSON), only from a model writing unconstrained.
+                let found = [raw, trimmed].into_iter().find_map(|text| {
+                    choice.iter().find(|m| m.spelling == text).map(|m| &m.value)
+                });
+                let unlisted = || json().unwrap_or_else(|| raw.into());
+                Some(found.cloned().unwrap_or_else(unlisted))
             }
-            None => true,
+            Some(TaggedValue::Json) => json(),
         }
     }
 
-    /// Whether `param` of `tool` is a nullable string the grammar
-    /// generates raw: a string once `null` is set aside, with no
-    /// `enum` (an enum is generated as JSON).
-    fn is_nullable_string_param(&self, tool: &str, param: &str) -> bool {
-        self.schema_for(tool, param).is_some_and(|s| {
-            crate::grammar_compile::effective_type(&s) == Some("string")
-                && s.get("enum").is_none()
-        })
+    /// How `param` of `tool` is spelled ([`tagged_values`]); `None`
+    /// when the schema does not declare it, which reads as a string.
+    ///
+    /// [`tagged_values`]: super::emit::tagged_values
+    fn tagged_value(&self, tool: &str, param: &str) -> Option<TaggedValue> {
+        let index = self.tools.iter().position(|t| t.name.as_ref() == tool)?;
+        // A `Choice` is shared, so the clone is a reference count.
+        self.spellings
+            .borrow_mut()
+            .entry(index)
+            .or_insert_with(|| {
+                Arc::new(
+                    tagged_values(self.syntax, &self.tools[index].schema)
+                        .into_iter()
+                        .collect(),
+                )
+            })
+            .get(param)
+            .cloned()
+    }
+
+    /// Whether `param` of `tool` takes its raw text as a string, so the
+    /// value in flight is one too: a non-nullable string, or unknown.
+    fn is_string_param(&self, tool: &str, param: &str) -> bool {
+        matches!(
+            self.tagged_value(tool, param),
+            None | Some(TaggedValue::Raw { nullable: false })
+        )
     }
 
     /// Read the call the input ended inside, starting at its opener
@@ -1758,7 +1862,9 @@ impl<'a> Parser<'a> {
                 }
                 break;
             };
-            members.insert(key.to_owned(), self.coerce_value(name, key, raw));
+            // A member that closed unreadable makes the call malformed,
+            // as it will be once it closes: nothing to show for it.
+            members.insert(key.to_owned(), self.coerce_value(name, key, raw)?);
             rest = after.strip_prefix(a.separator.as_str()).unwrap_or(after);
             // Progress guard: degenerate markers can match nothing.
             if rest.len() == before {
@@ -1812,7 +1918,7 @@ impl<'a> Parser<'a> {
         // Array-wrapped: the last element is in flight when a container
         // inside it is still open.
         let in_flight = kept.open >= 2;
-        let closed = envelopes.len() - usize::from(in_flight);
+        let closed = envelopes.len().checked_sub(usize::from(in_flight))?;
         let calls = envelopes[..closed]
             .iter()
             .map(|env| self.map_json_call(env))
@@ -1957,7 +2063,7 @@ impl<'a> Parser<'a> {
         // Leave the opening brace for the value reader.
         self.pos += name_end;
 
-        match self.parse_dict_value() {
+        match self.parse_dict_value(0) {
             DictOutcome::Value(input) => {
                 self.push_call(name, input);
                 CallOutcome::Parsed
@@ -1968,8 +2074,11 @@ impl<'a> Parser<'a> {
     }
 
     /// Read one dict-encoded value at `pos` (whitespace-lenient like
-    /// upstream's PEG; canonical output is compact).
-    fn parse_dict_value(&mut self) -> DictOutcome {
+    /// upstream's PEG; canonical output is compact), inside `depth`
+    /// containers. A container past [`MAX_NESTING`] is malformed — as
+    /// serde_json refuses one in the JSON dialects — rather than a
+    /// recursion as deep as the model's brackets.
+    fn parse_dict_value(&mut self, depth: usize) -> DictOutcome {
         self.skip_ws();
         let quote = self.syntax.arguments.string_quote.clone();
         let rest = self.rest();
@@ -1991,13 +2100,15 @@ impl<'a> Parser<'a> {
             return DictOutcome::Value(Value::String(s));
         }
         match rest.as_bytes()[0] {
-            b'{' => self.parse_dict_object(),
-            b'[' => self.parse_dict_array(),
+            b'{' | b'[' if depth >= MAX_NESTING => DictOutcome::Malformed,
+            b'{' => self.parse_dict_object(depth + 1),
+            b'[' => self.parse_dict_array(depth + 1),
             _ => self.parse_dict_scalar(),
         }
     }
 
-    fn parse_dict_object(&mut self) -> DictOutcome {
+    /// The object at `pos`, itself the `depth`th container.
+    fn parse_dict_object(&mut self, depth: usize) -> DictOutcome {
         // Consume first, assert second — see `parse_thought` (#62).
         let ate = self.eat("{");
         debug_assert!(ate, "parse_dict_object: `{{` not at self.pos");
@@ -2022,7 +2133,7 @@ impl<'a> Parser<'a> {
                 return DictOutcome::Malformed;
             }
             self.pos += colon + 1;
-            let value = match self.parse_dict_value() {
+            let value = match self.parse_dict_value(depth) {
                 DictOutcome::Value(v) => v,
                 other => return other,
             };
@@ -2042,7 +2153,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_dict_array(&mut self) -> DictOutcome {
+    /// The array at `pos`, itself the `depth`th container.
+    fn parse_dict_array(&mut self, depth: usize) -> DictOutcome {
         // Consume first, assert second — see `parse_thought` (#62).
         let ate = self.eat("[");
         debug_assert!(ate, "parse_dict_array: `[` not at self.pos");
@@ -2055,7 +2167,7 @@ impl<'a> Parser<'a> {
             if self.rest().is_empty() {
                 return DictOutcome::Incomplete;
             }
-            let value = match self.parse_dict_value() {
+            let value = match self.parse_dict_value(depth) {
                 DictOutcome::Value(v) => v,
                 other => return other,
             };
@@ -2265,6 +2377,16 @@ fn named<'t>(
 ) -> Option<(&'t str, &'t str)> {
     let (name, rest) = split_marker(text.strip_prefix(prefix)?, suffix)?;
     is_tool_name(name).then_some((name, rest))
+}
+
+/// Where `marker` next occurs in `text` past its first char — model
+/// output, so that char may be any width — or `text.len()`. What a
+/// scan that must make progress resumes from.
+fn past_first_char(text: &str, marker: &str) -> usize {
+    let first = text.chars().next().map_or(0, char::len_utf8);
+    text[first..]
+        .find(marker)
+        .map_or(text.len(), |at| first + at)
 }
 
 /// Split `text` at the first `marker`: what precedes it and what
@@ -2576,6 +2698,7 @@ mod tests {
                 &EmitOptions {
                     anchor: Anchor::Lazy,
                     parallel: false,
+                    ..Default::default()
                 },
             )
             .expect("emit");
@@ -2772,57 +2895,817 @@ mod tests {
         }
     }
 
-    /// A string `enum` parameter on Qwen XML: the grammar generates its
-    /// value as JSON (`"full"`, quoted), so the parser must read it as
-    /// JSON too. Read raw, the tool got `"\"full\""`, which no draw can
-    /// fix — the schema backstop refused it every time, and blallama
-    /// answered 500 after its resamples. A plain string stays raw.
+    /// Whether `tool`'s Qwen XML grammar admits `emission` whole.
+    /// Unmeasured ([`crate::SchemaLimits::unlimited`]): the callers
+    /// are about the grammar, some of them past the limits on purpose.
+    fn qwen_admits(tool: &Tool, emission: &str) -> bool {
+        let source = crate::dialect::grammar_source(
+            &CallSyntax::qwen_xml(),
+            &[tool],
+            &crate::dialect::EmitOptions {
+                schema_limits: crate::SchemaLimits::unlimited(),
+                ..Default::default()
+            },
+        )
+        .expect("grammar");
+        let mut state =
+            crate::GrammarState::from_source(&source).expect("grammar parses");
+        state.advance_bytes(emission.as_bytes()).is_ok() && state.is_complete()
+    }
+
+    /// A one-parameter Qwen XML call to `set_mode` with `raw` between
+    /// the tags.
+    fn qwen_mode_call(raw: &str) -> String {
+        format!(
+            "<tool_call>\n<function=set_mode>\n\
+             <parameter=mode>\n{raw}\n</parameter>\n\
+             </function>\n</tool_call>"
+        )
+    }
+
+    /// The streaming parser re-parses the whole generation on every
+    /// token; each tool's spellings are classified once for all of
+    /// them, not once a token.
     #[test]
-    fn qwen_xml_string_enum_reads_what_the_grammar_writes() {
-        let syntax = CallSyntax::qwen_xml();
+    fn stream_parser_classifies_each_tool_once() {
+        let tool = mode_tool(json!({"enum": ["fast", "slow"]}), None);
+        let mut parser =
+            StreamParser::new(CallSyntax::qwen_xml(), vec![tool], false);
+        let call = qwen_mode_call("fast");
+        let mut first: Option<Arc<HashMap<String, TaggedValue>>> = None;
+        let mut blocks = Vec::new();
+        for c in call.chars() {
+            blocks.extend(parser.push(&c.to_string()));
+            if let Some(spellings) = parser.spellings.get(&0) {
+                let first = first.get_or_insert_with(|| spellings.clone());
+                assert!(Arc::ptr_eq(first, spellings), "reclassified");
+            }
+        }
+        blocks.extend(parser.finish());
+        assert!(first.is_some(), "never classified");
+        let calls = calls_of(&blocks);
+        assert_eq!(calls[0].1, &json!({"mode": "fast"}));
+    }
+
+    /// On Qwen XML a parameter the schema does not make nullable can
+    /// never come back JSON `null`, and one it does takes a bare
+    /// `null`. A non-string type is written as JSON and its grammar has
+    /// no `null` at all; a plain string is written raw, so the text
+    /// `null` is admitted and reads back as the *string* `"null"`. A
+    /// nullable string, a `["integer", "null"]` and an `anyOf` with a
+    /// `null` variant (Agora's `Option<DetailLevel>` shape) each take
+    /// a bare `null` as JSON `null` — and so does a `$ref` to a nullable
+    /// def, as its inline form does.
+    #[test]
+    fn qwen_xml_null_only_where_the_schema_allows_it() {
         let schema = json!({
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["full", "lite"]},
-                "note": {"type": "string"},
+                "i": {"type": "integer"},
+                "n": {"type": "number"},
+                "b": {"type": "boolean"},
+                "o": {"type": "object", "properties": {"x": {"type": "integer"}}},
+                "a": {"type": "array", "items": {"type": "integer"}},
+                "e": {"enum": ["fast", "slow"]},
+                "s": {"type": "string"},
+                "ns": {"type": ["string", "null"]},
+                "ni": {"type": ["integer", "null"]},
+                "an": {"anyOf": [
+                    {"oneOf": [{"const": "summary"}, {"const": "full"}]},
+                    {"type": "null"},
+                ]},
+                "rn": {"$ref": "#/$defs/N"},
+                "ra": {"$ref": "#/$defs/Alias"},
+                "ri": {"$ref": "#/$defs/I"},
             },
-            "required": ["mode", "note"],
+            "$defs": {
+                "N": {"type": ["integer", "null"]},
+                "Alias": {"$ref": "#/$defs/N"},
+                "I": {"type": "integer"},
+            },
         });
-        let mut t = Tool::builder("set_mode")
+        let mut tool = Tool::builder("t")
             .description("test")
-            .schema(schema.clone())
+            .schema(schema)
+            .build()
+            .expect("valid tool");
+        tool.strict = Some(true);
+        let call = |param: &str, raw: &str| {
+            format!(
+                "<tool_call>\n<function=t>\n<parameter={param}>\n{raw}\n\
+                 </parameter>\n</function>\n</tool_call>"
+            )
+        };
+        let read = |param: &str, raw: &str| -> Value {
+            let text = call(param, raw);
+            assert!(qwen_admits(&tool, &text), "{param} = {raw} refused");
+            let parsed = parse_text(
+                &CallSyntax::qwen_xml(),
+                &[&tool],
+                &text,
+                false,
+                Leniency::Final,
+            );
+            calls_of(&parsed.blocks)[0].1[param].clone()
+        };
+        // Non-nullable, not a string: no `null` in the grammar, though
+        // a value of the type is admitted.
+        for (param, valid) in [
+            ("i", "5"),
+            ("n", "1.5"),
+            ("b", "true"),
+            ("o", r#"{"x":1}"#),
+            ("a", "[1,2]"),
+            ("e", "fast"),
+            ("ri", "3"),
+        ] {
+            assert_ne!(read(param, valid), Value::Null, "{param}");
+            assert!(!qwen_admits(&tool, &call(param, "null")), "{param}");
+        }
+        // A plain string: the text `null` is that string.
+        assert_eq!(read("s", "null"), json!("null"));
+        // Nullable: a bare `null` is null, and a value is still a value.
+        assert_eq!(read("ns", "null"), Value::Null);
+        assert_eq!(read("ns", "text"), json!("text"));
+        assert_eq!(read("an", "null"), Value::Null);
+        assert_eq!(read("an", "full"), json!("full"));
+        assert_eq!(read("ni", "7"), json!(7));
+        assert_eq!(read("ni", "null"), Value::Null);
+        // Through a `$ref` (an alias chain too), as inline.
+        for param in ["rn", "ra"] {
+            assert_eq!(read(param, "7"), json!(7), "{param}");
+            assert_eq!(read(param, "null"), Value::Null, "{param}");
+        }
+    }
+
+    /// A stop cut parses the output prefix after prefix, each a fresh
+    /// parse; lent one [`Spellings`] (as `Session` does, per call) they
+    /// classify each tool once between them.
+    #[test]
+    fn cached_parses_share_one_classification() {
+        let tool = mode_tool(json!({"enum": ["fast", "slow"]}), None);
+        let call = qwen_mode_call("fast");
+        let mut spellings = Spellings::new();
+        let mut first: Option<Arc<HashMap<String, TaggedValue>>> = None;
+        for end in (1..=call.len()).filter(|&i| call.is_char_boundary(i)) {
+            let (parsed, _) = parse_text_cached(
+                &CallSyntax::qwen_xml(),
+                &[&tool],
+                &call[..end],
+                false,
+                Leniency::Clipped,
+                &mut spellings,
+            );
+            if let Some(s) = spellings.get(&0) {
+                let first = first.get_or_insert_with(|| s.clone());
+                assert!(Arc::ptr_eq(first, s), "reclassified at {end}");
+            }
+            if end == call.len() {
+                assert_eq!(
+                    calls_of(&parsed.blocks)[0].1,
+                    &json!({"mode": "fast"})
+                );
+            }
+        }
+        assert!(first.is_some(), "never classified");
+    }
+
+    /// A strict `set_mode` tool whose one required parameter is `mode`.
+    fn mode_tool(mode: Value, defs: Option<Value>) -> Tool {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"mode": mode},
+            "required": ["mode"],
+        });
+        if let Some(defs) = defs {
+            schema["$defs"] = defs;
+        }
+        let mut tool = Tool::builder("set_mode")
+            .description("test")
+            .schema(schema)
             .build()
             .expect("valid test tool");
-        t.strict = Some(true);
-        let emission = "<tool_call>\n<function=set_mode>\n\
-                        <parameter=mode>\n\"full\"\n</parameter>\n\
-                        <parameter=note>\n\"quoted\" note\n</parameter>\n\
-                        </function>\n</tool_call>";
+        tool.strict = Some(true);
+        tool
+    }
 
-        // What the grammar admits: the enum quoted, never raw.
+    /// The Agora `get_content` `detail` parameter, as schemars 1.x emits
+    /// `Option<DetailLevel>` for an `inline` enum whose variants carry
+    /// docs (descriptions shortened): a `oneOf` of `const`s, made
+    /// nullable by an outer `anyOf`.
+    fn agora_detail() -> Value {
+        json!({
+            "description": "How much to return.",
+            "anyOf": [
+                {
+                    "description": "How much of a piece of content.",
+                    "oneOf": [
+                        {
+                            "description": "The short form.",
+                            "type": "string",
+                            "const": "summary",
+                        },
+                        {
+                            "description": "The verbatim record.",
+                            "type": "string",
+                            "const": "full",
+                        },
+                    ],
+                },
+                {"type": "null"},
+            ],
+        })
+    }
+
+    /// A finite set of strings on Qwen XML is generated raw, the way
+    /// the template re-renders it (`args_value | string`): the model
+    /// was trained on `<parameter=detail>\nfull\n</parameter>`. Quoted,
+    /// as the grammar once forced it, the value re-rendered without its
+    /// quotes and the turn missed the tip on every such call (seen live
+    /// on Agora: `detail` = `"summary"`). Every shape a finite string
+    /// set reaches the grammar in — `enum`, `const`, nullable, through
+    /// `$ref`, `anyOf` and schemars' `oneOf` — admits the raw member
+    /// and no other spelling, parses to the member, passes the strict
+    /// schema backstop, and renders back byte for byte.
+    #[test]
+    fn qwen_xml_string_set_is_generated_and_read_raw() {
+        let level = Some(
+            json!({"Level": {"type": "string", "enum": ["lite", "full"]}}),
+        );
+        let level_ref = json!({"$ref": "#/$defs/Level"});
+        // `(name, schema, $defs, nullable)`.
+        let shapes: Vec<(&str, Value, Option<Value>, bool)> = vec![
+            (
+                "enum",
+                json!({"type": "string", "enum": ["lite", "full"]}),
+                None,
+                false,
+            ),
+            (
+                "nullable enum",
+                json!({"type": ["string", "null"], "enum": ["lite", "full", null]}),
+                None,
+                true,
+            ),
+            (
+                "anyOf[enum, null]",
+                json!({"anyOf": [
+                    {"type": "string", "enum": ["lite", "full"]},
+                    {"type": "null"},
+                ]}),
+                None,
+                true,
+            ),
+            (
+                "const",
+                json!({"type": "string", "const": "full"}),
+                None,
+                false,
+            ),
+            (
+                "anyOf[const, const]",
+                json!({"anyOf": [{"const": "lite"}, {"const": "full"}]}),
+                None,
+                false,
+            ),
+            ("$ref", level_ref.clone(), level.clone(), false),
+            (
+                "anyOf[$ref, null]",
+                json!({"anyOf": [level_ref, {"type": "null"}]}),
+                level,
+                true,
+            ),
+            ("Agora Option<DetailLevel>", agora_detail(), None, true),
+        ];
+        let syntax = CallSyntax::qwen_xml();
+        for (name, schema, defs, nullable) in shapes {
+            let tool = mode_tool(schema, defs);
+            let emission = qwen_mode_call("full");
+            assert!(qwen_admits(&tool, &emission), "{name}: raw member");
+            for wrong in ["\"full\"", "fullest", "ful", "Full", " full", ""] {
+                assert!(
+                    !qwen_admits(&tool, &qwen_mode_call(wrong)),
+                    "{name}: admits {wrong:?}"
+                );
+            }
+            let null = qwen_mode_call("null");
+            assert_eq!(qwen_admits(&tool, &null), nullable, "{name}: null");
+
+            let mut cases = vec![(emission, json!("full"))];
+            if nullable {
+                cases.push((null, Value::Null));
+            }
+            for (emission, want) in cases {
+                let parsed = parse_text(
+                    &syntax,
+                    &[&tool],
+                    &emission,
+                    false,
+                    Leniency::Final,
+                );
+                let calls = calls_of(&parsed.blocks);
+                assert_eq!(calls.len(), 1, "{name}: {parsed:#?}");
+                assert_eq!(calls[0].1, &json!({"mode": want}), "{name}");
+                assert_eq!(
+                    crate::schema_check::check(&tool.schema, calls[0].1),
+                    Ok(()),
+                    "{name}"
+                );
+                let rendered =
+                    render_reference(&syntax, &[("set_mode", calls[0].1)])
+                        .expect("renders");
+                assert_eq!(rendered, emission, "{name}: byte-stable");
+            }
+        }
+    }
+
+    /// A quoted member — what the grammar wrote before the set went raw,
+    /// or what a model writes unconstrained — still reads as the member,
+    /// so a transcript from either side of the change parses; so does a
+    /// padded one. Text that is no member falls through to the JSON read.
+    #[test]
+    fn qwen_xml_string_set_reads_leniently() {
+        let syntax = CallSyntax::qwen_xml();
+        let tool = mode_tool(
+            json!({"type": "string", "enum": ["lite", "full"]}),
+            None,
+        );
+        for (raw, want) in [
+            ("\"full\"", json!("full")),
+            (" full ", json!("full")),
+            ("other", json!("other")),
+        ] {
+            let parsed = parse_text(
+                &syntax,
+                &[&tool],
+                &qwen_mode_call(raw),
+                false,
+                Leniency::Final,
+            );
+            let calls = calls_of(&parsed.blocks);
+            assert_eq!(calls[0].1, &json!({"mode": want}), "{raw:?}");
+        }
+    }
+
+    /// What a Qwen XML parameter reads leniently, and what it refuses.
+    /// A JSON-spelled parameter that reads as no JSON at all makes the
+    /// call malformed — degraded to text (which the session then
+    /// rejects as a real `<tool_call>` in free text, a resample) —
+    /// never the raw text as a string: that retyped a value the grammar
+    /// admitted but serde refuses, and a union admitting strings even
+    /// passed the schema check as.
+    #[test]
+    fn qwen_xml_unreadable_json_is_malformed_not_a_string() {
+        let syntax = CallSyntax::qwen_xml();
+        let read = |mode: Value, raw: &str| {
+            let tool = mode_tool(mode, None);
+            let parsed = parse_text(
+                &syntax,
+                &[&tool],
+                &qwen_mode_call(raw),
+                false,
+                Leniency::Final,
+            );
+            calls_of(&parsed.blocks).first().map(|(_, input)| {
+                let input: &Value = input;
+                input["mode"].clone()
+            })
+        };
+        let huge = "9".repeat(401);
+        let number = json!({"type": "number"});
+        let number_or_string = json!({"type": ["number", "string"]});
+        let any_of = json!({"anyOf": [{"type": "number"}, {"type": "string"}]});
+
+        // Lenient, and kept: a raw string reads as written, JSON-looking
+        // or not; a nullable one takes a bare `null`; an unlisted member
+        // of a set stays a string; pythonisms and unclosed brackets of a
+        // JSON value heal.
+        let string = json!({"type": "string"});
+        let nullable = json!({"type": ["string", "null"]});
+        let set = json!({"enum": ["lite", "full"]});
+        let object = json!({"type": "object"});
+        for (mode, raw, want) in [
+            (&string, "{\"a\": 1", json!("{\"a\": 1")),
+            (&string, huge.as_str(), json!(huge)),
+            (&nullable, "null", Value::Null),
+            (&nullable, "nil", json!("nil")),
+            (&set, "other", json!("other")),
+            (&json!({"type": "boolean"}), "True", json!(true)),
+            (&object, "{'a': None}", json!({"a": null})),
+            (&object, "{\"a\": [1", json!({"a": [1]})),
+            (&number, "1e308", json!(1e308)),
+        ] {
+            assert_eq!(read(mode.clone(), raw), Some(want), "{mode} {raw:?}");
+        }
+
+        // Refused: no JSON reads out of it, so no call — whether the
+        // schema admits a string or not.
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        for mode in [&number, &number_or_string, &any_of, &json!({})] {
+            for raw in [huge.as_str(), "1e999", "-1e999", deep.as_str()] {
+                assert_eq!(read(mode.clone(), raw), None, "{mode} {raw:?}");
+            }
+        }
+        assert_eq!(read(number.clone(), "five"), None);
+        assert_eq!(read(number_or_string.clone(), "five"), None);
+
+        // A call in flight whose closed member is unreadable has nothing
+        // to show either: no open call, under any leniency.
+        let tool = mode_tool(number.clone(), None);
+        let cut = qwen_mode_call(&huge);
+        let cut = &cut[..cut.find("</function>").unwrap()];
+        let (parsed, open) =
+            parse_text_open(&syntax, &[&tool], cut, false, Leniency::Clipped);
+        assert!(calls_of(&parsed.blocks).is_empty(), "{parsed:#?}");
+        assert!(open.is_none(), "{open:#?}");
+    }
+
+    /// The edges of the raw spelling. A mixed set spells its strings raw
+    /// and the rest as JSON, which is what the template renders for each.
+    /// A set whose spellings would collide (`"1"` beside `1`, `"null"`
+    /// beside `null`) or whose member contains the close tag stays JSON:
+    /// raw, it could not be read back. A member with surrounding
+    /// whitespace stays raw: the template renders it verbatim and the
+    /// read is byte-exact.
+    #[test]
+    fn qwen_xml_string_set_edges() {
+        let syntax = CallSyntax::qwen_xml();
+        let close = syntax.arguments.value_suffix.clone();
+        let tagged = |mode: Value| {
+            let tool = mode_tool(mode, None);
+            crate::dialect::emit::tagged_value(
+                &syntax,
+                &tool.schema,
+                &tool.schema["properties"]["mode"],
+            )
+        };
+        let raw = |pairs: &[(&str, Value)]| {
+            TaggedValue::Choice(
+                pairs
+                    .iter()
+                    .map(|(s, v)| {
+                        Arc::new(crate::dialect::emit::Member {
+                            spelling: s.to_string(),
+                            value: v.clone(),
+                        })
+                    })
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            tagged(json!({"enum": ["a", 1, null]})),
+            raw(&[("a", json!("a")), ("1", json!(1)), ("null", Value::Null)])
+        );
+        assert_eq!(
+            tagged(json!({"enum": [" padded "]})),
+            raw(&[(" padded ", json!(" padded "))])
+        );
+        // The empty string is a spelling too: nothing between the tags.
+        assert_eq!(
+            tagged(json!({"enum": ["", "a"]})),
+            raw(&[("", json!("")), ("a", json!("a"))])
+        );
+        for json_only in [
+            json!({"enum": ["1", 1]}),
+            json!({"enum": ["null", null]}),
+            json!({"enum": ["true", true]}),
+            json!({"enum": [format!("a{close}b")]}),
+            // Ends with the close tag's prefix, so the first close tag
+            // in `member + close` starts inside the member.
+            json!({"enum": ["a\n</parameter>"]}),
+            // No string in it: JSON as ever.
+            json!({"enum": [1, 2]}),
+            json!({"type": "null"}),
+            // A free string beside a non-string set.
+            json!({"anyOf": [{"type": "string"}, {"const": 1}]}),
+            json!({"anyOf": [{"enum": ["a"]}, {"type": "integer"}]}),
+        ] {
+            assert_eq!(
+                tagged(json_only.clone()),
+                TaggedValue::Json,
+                "{json_only}"
+            );
+        }
+        for (string, nullable) in [
+            (json!({"type": "string"}), false),
+            (json!({"type": ["string", "null"]}), true),
+            (
+                json!({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+                true,
+            ),
+            // A free string swallows a set of strings.
+            (
+                json!({"anyOf": [{"type": "string"}, {"const": "a"}]}),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                tagged(string.clone()),
+                TaggedValue::Raw { nullable },
+                "{string}"
+            );
+        }
+
+        // The mixed set end to end: admitted raw, read typed, rendered
+        // back byte for byte.
+        let tool = mode_tool(json!({"enum": ["a", 1, null]}), None);
+        assert!(!qwen_admits(&tool, &qwen_mode_call("\"a\"")));
+        for (raw, want) in
+            [("a", json!("a")), ("1", json!(1)), ("null", Value::Null)]
+        {
+            let emission = qwen_mode_call(raw);
+            assert!(qwen_admits(&tool, &emission), "{raw:?}");
+            let parsed = parse_text(
+                &syntax,
+                &[&tool],
+                &emission,
+                false,
+                Leniency::Final,
+            );
+            let calls = calls_of(&parsed.blocks);
+            assert_eq!(calls[0].1, &json!({"mode": want}), "{raw:?}");
+            assert_eq!(
+                crate::schema_check::check(&tool.schema, calls[0].1),
+                Ok(())
+            );
+            assert_eq!(
+                render_reference(&syntax, &[("set_mode", calls[0].1)]).unwrap(),
+                emission
+            );
+        }
+
+        // A colliding set is JSON on both sides: quoted admitted, read
+        // as the string.
+        let tool = mode_tool(json!({"enum": ["1", 1]}), None);
+        assert!(qwen_admits(&tool, &qwen_mode_call("\"1\"")));
+        assert!(qwen_admits(&tool, &qwen_mode_call("1")));
+        let parsed = parse_text(
+            &syntax,
+            &[&tool],
+            &qwen_mode_call("\"1\""),
+            false,
+            Leniency::Final,
+        );
+        assert_eq!(calls_of(&parsed.blocks)[0].1, &json!({"mode": "1"}));
+    }
+
+    /// A tagged parameter's `$ref` resolves against the tool's `$defs`:
+    /// the parameter's own schema carries none, and an unresolved ref
+    /// compiled to any JSON value.
+    #[test]
+    fn qwen_xml_ref_param_resolves_against_the_tool_defs() {
+        let tool = mode_tool(
+            json!({"$ref": "#/$defs/Point"}),
+            Some(json!({"Point": {
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"],
+            }})),
+        );
+        assert!(qwen_admits(&tool, &qwen_mode_call(r#"{"x":1}"#)));
+        for wrong in [r#"{"y":1}"#, r#"{"x":"1"}"#, "[]", "1"] {
+            assert!(!qwen_admits(&tool, &qwen_mode_call(wrong)), "{wrong}");
+        }
+    }
+
+    /// A recursive `$ref` on every dialect: a tree (as schemars emits
+    /// one), mutual recursion, and alias chains with a self-alias
+    /// among them each compile to a grammar that admits a valid call,
+    /// refuses an invalid one, and parses back to the input, which the
+    /// schema check passes. The tree used to inline without end and
+    /// abort the server on a stack overflow.
+    #[test]
+    fn recursive_refs_compile_on_every_dialect() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        use crate::{Grammar, GrammarState};
+        use std::sync::Arc;
+
+        let node = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "children": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/Node"},
+                },
+            },
+        });
+        let tree = (
+            json!({
+                "type": "object",
+                "properties": {"root": {"$ref": "#/$defs/Node"}},
+                "required": ["root"],
+                "$defs": {"Node": node},
+            }),
+            json!({"root": {"name": "a", "children": [
+                {"name": "b", "children": [{"name": "c", "children": []}]},
+                {"name": "d"},
+            ]}}),
+            json!({"root": {"name": "a", "children": [
+                {"name": "b", "children": [{"name": 3}]},
+            ]}}),
+        );
+        let mutual = (
+            json!({
+                "type": "object",
+                "properties": {"a": {"$ref": "#/$defs/A"}},
+                "required": ["a"],
+                "$defs": {
+                    "A": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "b": {"anyOf": [
+                                {"$ref": "#/$defs/B"},
+                                {"type": "null"},
+                            ]},
+                        },
+                        "required": ["label", "b"],
+                    },
+                    "B": {
+                        "type": "object",
+                        "properties": {"a": {"$ref": "#/$defs/A"}},
+                        "required": ["a"],
+                    },
+                },
+            }),
+            json!({"a": {"label": "x", "b": {"a": {"label": "y", "b": null}}}}),
+            json!({"a": {"label": "x", "b": {"a": {"label": 5, "b": null}}}}),
+        );
+        let aliases = (
+            json!({
+                "type": "object",
+                "properties": {
+                    "count": {"$ref": "#/$defs/Count"},
+                    "extra": {"$ref": "#/$defs/Me"},
+                },
+                "required": ["count", "extra"],
+                "$defs": {
+                    "Count": {"$ref": "#/$defs/Int"},
+                    "Int": {"$ref": "#/$defs/Integer"},
+                    "Integer": {"type": "integer"},
+                    "Me": {"$ref": "#/$defs/Me"},
+                },
+            }),
+            json!({"count": 3, "extra": {"any": [1, true]}}),
+            json!({"count": "three", "extra": 1}),
+        );
+        let options = EmitOptions {
+            anchor: Anchor::Lazy,
+            parallel: false,
+            ..Default::default()
+        };
+        for (case, (schema, valid, invalid)) in
+            [("tree", tree), ("mutual", mutual), ("aliases", aliases)]
+        {
+            let tool = Tool::builder("grow")
+                .description("test")
+                .schema(schema)
+                .build()
+                .expect("valid test tool");
+            assert!(crate::schema_check::check(&tool.schema, &valid).is_ok());
+            assert!(crate::schema_check::check(&tool.schema, &invalid).is_err());
+            for (name, syntax) in call_dialects() {
+                let at = format!("{name}, {case}");
+                let src = grammar_source(&syntax, &[&tool], &options)
+                    .unwrap_or_else(|e| panic!("{at}: {e}"));
+                let grammar = Arc::new(
+                    Grammar::parse(&src)
+                        .unwrap_or_else(|e| panic!("{at}: {e}\n{src}")),
+                );
+                // Plus the turn-exit marker the grammar ends on, where the
+                // dialect has one (Gemma's `<|tool_response>`).
+                let admits = |input: &Value| {
+                    let call = render_reference(&syntax, &[("grow", input)])
+                        .unwrap_or_else(|e| panic!("{at}: {e}"));
+                    let framed =
+                        format!("{call}{}", syntax.tool_response_start);
+                    let mut state = GrammarState::new(grammar.clone());
+                    (state.advance_bytes(framed.as_bytes()).is_ok()
+                        && state.is_complete())
+                    .then_some(call)
+                };
+                let call = admits(&valid)
+                    .unwrap_or_else(|| panic!("{at}: valid refused\n{src}"));
+                let parsed = parse_text(
+                    &syntax,
+                    &[&tool],
+                    &call,
+                    false,
+                    Leniency::Final,
+                );
+                assert_eq!(
+                    calls_of(&parsed.blocks),
+                    [("grow", &valid)],
+                    "{at}: {call}"
+                );
+                assert!(admits(&invalid).is_none(), "{at}: invalid admitted");
+            }
+        }
+    }
+
+    /// The tagged-value classifier walks a wide diamond of `anyOf`s
+    /// (`D_i = anyOf[D_{i+1} × 50]`) once per def, not 50^n times, and
+    /// still finds the string set at its end.
+    #[test]
+    fn qwen_xml_ref_diamond_is_linear() {
+        let n = 10;
+        let mut defs = serde_json::Map::new();
+        for i in 0..n {
+            let next = json!({"$ref": format!("#/$defs/D{}", i + 1)});
+            defs.insert(format!("D{i}"), json!({"anyOf": vec![next; 50]}));
+        }
+        defs.insert(format!("D{n}"), json!({"enum": ["lite", "full"]}));
+        let tool = mode_tool(json!({"$ref": "#/$defs/D0"}), Some(defs.into()));
+        assert!(qwen_admits(&tool, &qwen_mode_call("full")));
+        assert!(!qwen_admits(&tool, &qwen_mode_call("fullest")));
+    }
+
+    /// The raw spelling is the tagged dialects' alone: a JSON dialect
+    /// still quotes a string enum, as JSON must.
+    #[test]
+    fn json_dialects_keep_quoting_a_string_set() {
+        let tool = mode_tool(
+            json!({"type": "string", "enum": ["lite", "full"]}),
+            None,
+        );
+        let syntax = CallSyntax::hermes_json();
         let source = crate::dialect::grammar_source(
             &syntax,
-            &[&t],
+            &[&tool],
             &crate::dialect::EmitOptions::default(),
         )
         .expect("grammar");
-        let admits = |text: &str| {
+        let admits = |mode: &str| {
+            let call = render_reference(
+                &syntax,
+                &[("set_mode", &json!({"mode": mode}))],
+            )
+            .expect("renders");
             let mut state = crate::GrammarState::from_source(&source)
                 .expect("grammar parses");
-            state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+            (state.advance_bytes(call.as_bytes()).is_ok()
+                && state.is_complete())
+            .then_some(call)
         };
-        assert!(admits(emission), "{source}");
-        assert!(!admits(&emission.replacen("\"full\"", "full", 1)));
+        let call = admits("full").expect("quoted member admitted");
+        assert!(call.contains(r#""mode":"full""#), "{call}");
+        assert!(admits("fullest").is_none());
+    }
 
-        let parsed =
-            parse_text(&syntax, &[&t], emission, false, Leniency::Final);
-        let calls = calls_of(&parsed.blocks);
-        assert_eq!(calls.len(), 1, "{parsed:#?}");
-        assert_eq!(
-            calls[0].1,
-            &json!({"mode": "full", "note": "\"quoted\" note"})
-        );
-        assert_eq!(crate::schema_check::check(&schema, calls[0].1), Ok(()));
+    /// The schemars derive itself, not a transcription of its output:
+    /// Agora's `Option<DetailLevel>`, `inline` with documented variants.
+    #[cfg(feature = "json-schema")]
+    #[test]
+    fn qwen_xml_reads_a_derived_option_enum_raw() {
+        /// How much of a piece of content to return.
+        #[derive(schemars::JsonSchema)]
+        #[schemars(inline)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum DetailLevel {
+            /// The short form.
+            Summary,
+            /// The verbatim record.
+            Full,
+        }
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct GetContentInput {
+            /// How much to return.
+            detail: Option<DetailLevel>,
+        }
+        let schema =
+            serde_json::to_value(schemars::schema_for!(GetContentInput))
+                .expect("schema");
+        let mut tool = Tool::builder("set_mode")
+            .description("test")
+            .schema(json!({
+                "type": "object",
+                "properties": {"mode": schema["properties"]["detail"]},
+            }))
+            .build()
+            .expect("valid test tool");
+        tool.strict = Some(true);
+        let syntax = CallSyntax::qwen_xml();
+        for (raw, want) in [("full", json!("full")), ("null", Value::Null)] {
+            let emission = qwen_mode_call(raw);
+            assert!(qwen_admits(&tool, &emission), "{raw}: {schema:#}");
+            let parsed = parse_text(
+                &syntax,
+                &[&tool],
+                &emission,
+                false,
+                Leniency::Final,
+            );
+            let calls = calls_of(&parsed.blocks);
+            assert_eq!(calls[0].1, &json!({"mode": want}));
+            assert_eq!(
+                crate::schema_check::check(&tool.schema, calls[0].1),
+                Ok(())
+            );
+        }
+        assert!(!qwen_admits(&tool, &qwen_mode_call("\"full\"")));
     }
 
     /// Adversarial raw values (plan amendments): trailing newlines
@@ -3479,6 +4362,7 @@ mod tests {
                 &EmitOptions {
                     anchor: Anchor::Lazy,
                     parallel: false,
+                    ..Default::default()
                 },
             )
             .expect("emit");
@@ -3522,6 +4406,7 @@ mod tests {
             &EmitOptions {
                 anchor: Anchor::Eager,
                 parallel: true,
+                ..Default::default()
             },
         )
         .expect("emit");
@@ -4182,6 +5067,7 @@ mod tests {
             &EmitOptions {
                 anchor: Anchor::Lazy,
                 parallel: false,
+                ..Default::default()
             },
         )
         .expect("emit lazy");
@@ -4217,6 +5103,7 @@ mod tests {
             &EmitOptions {
                 anchor: Anchor::Eager,
                 parallel: false,
+                ..Default::default()
             },
         )
         .expect("emit eager");
@@ -4270,6 +5157,7 @@ mod tests {
                 &EmitOptions {
                     anchor,
                     parallel: false,
+                    ..Default::default()
                 },
             )
             .expect("emit eager");
@@ -4344,6 +5232,7 @@ mod tests {
                 &EmitOptions {
                     anchor: Anchor::Eager,
                     parallel: true,
+                    ..Default::default()
                 },
             )
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -5154,6 +6043,7 @@ mod tests {
         let opts = EmitOptions {
             anchor: Anchor::Lazy,
             parallel: !syntax.per_call_start.is_empty(),
+            ..EmitOptions::default()
         };
         let src = grammar_source(syntax, tools, &opts).expect("emit");
         std::sync::Arc::new(

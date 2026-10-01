@@ -164,6 +164,12 @@ pub struct OutputConfigOptions {
     /// for a Gemma 4 or Mistral 4 left their bodies unconstrained. Empty
     /// stands for the default.
     pub thought_close: String,
+    /// The most the schema may measure, checked before anything
+    /// compiles it ([`OutputConfigError::SchemaBudget`]). Default
+    /// [`SchemaLimits::default`](crate::SchemaLimits::default); `Session`
+    /// fills in its own
+    /// ([`Session::with_schema_limits`](crate::Session::with_schema_limits)).
+    pub schema_limits: crate::SchemaLimits,
 }
 
 impl Default for OutputConfigOptions {
@@ -176,6 +182,7 @@ impl Default for OutputConfigOptions {
             thought_open: THINK_OPEN.to_string(),
             thought_close: String::from_utf8_lossy(THINK_CLOSE_TRIGGER)
                 .into_owned(),
+            schema_limits: crate::SchemaLimits::default(),
         }
     }
 }
@@ -257,7 +264,7 @@ pub fn grammar_for_output_config(
         Some(OutputFormat::JsonSchema(f)) => &f.schema,
         _ => return Err(OutputConfigError::UnsupportedFormat),
     };
-    let source = build_grammar_source(schema, opts, thought_pre_opened);
+    let source = build_grammar_source(schema, opts, thought_pre_opened)?;
     Ok(SamplingMode::grammar(&source)?)
 }
 
@@ -292,7 +299,7 @@ pub fn compile_output_config(
     let trigger_certain =
         thought_pre_opened || opts.framing == ResponseFraming::Harmony;
     if opts.phase_split && opts.allow_thought && trigger_certain {
-        let source = build_json_only_grammar_source(schema, opts);
+        let source = build_json_only_grammar_source(schema, opts)?;
         let (triggers, feed_trigger) = match opts.framing {
             // The JSON-body grammar starts *after* the trigger, which
             // itself stays outside the constrained span.
@@ -314,7 +321,7 @@ pub fn compile_output_config(
             feed_trigger,
         }))
     } else {
-        let source = build_grammar_source(schema, opts, thought_pre_opened);
+        let source = build_grammar_source(schema, opts, thought_pre_opened)?;
         Ok(CompiledOutputConfig::Single(SamplingMode::grammar(
             &source,
         )?))
@@ -407,7 +414,8 @@ pub(crate) fn build_grammar_source(
     schema: &serde_json::Value,
     opts: &OutputConfigOptions,
     thought_pre_opened: bool,
-) -> String {
+) -> Result<String, OutputConfigError> {
+    crate::schema_budget::check_schemas([], Some(schema), &opts.schema_limits)?;
     let mut src = String::with_capacity(512);
 
     if opts.framing == ResponseFraming::Harmony {
@@ -470,9 +478,9 @@ pub(crate) fn build_grammar_source(
         let _ = writeln!(src, "root ::= ws output_schema");
     }
 
-    schema_to_gbnf(schema, "output_schema", &mut src);
+    schema_to_gbnf(schema, "output_schema", &mut src)?;
     src.push_str(JSON_GRAMMAR);
-    src
+    Ok(src)
 }
 
 /// Emit the JSON-only grammar used by the deferred / phase-split path.
@@ -482,7 +490,8 @@ pub(crate) fn build_grammar_source(
 pub(crate) fn build_json_only_grammar_source(
     schema: &serde_json::Value,
     opts: &OutputConfigOptions,
-) -> String {
+) -> Result<String, OutputConfigError> {
+    crate::schema_budget::check_schemas([], Some(schema), &opts.schema_limits)?;
     let mut src = String::with_capacity(512);
     match opts.framing {
         ResponseFraming::Bare => {
@@ -511,9 +520,9 @@ pub(crate) fn build_json_only_grammar_source(
             );
         }
     }
-    schema_to_gbnf(schema, "output_schema", &mut src);
+    schema_to_gbnf(schema, "output_schema", &mut src)?;
     src.push_str(JSON_GRAMMAR);
-    src
+    Ok(src)
 }
 
 /// The Harmony final-channel header, from `lead` (the header up to the
@@ -568,6 +577,13 @@ pub enum OutputConfigError {
     /// The compiled GBNF source failed to parse.
     #[error("compiled grammar is invalid: {0}")]
     Grammar(#[from] GrammarError),
+    /// The JSON Schema has no grammar: too complex, or unsatisfiable.
+    #[error("output_config.format.schema: {0}")]
+    Schema(#[from] crate::grammar_compile::SchemaError),
+    /// The schema measures past [`OutputConfigOptions::schema_limits`],
+    /// so nothing compiled it: the request's fault, a 400.
+    #[error("schema limits: {0}")]
+    SchemaBudget(#[from] crate::SchemaBudgetError),
 }
 
 static_assertions::assert_impl_all!(OutputConfigError: Send, Sync);
@@ -643,9 +659,10 @@ mod tests {
                 thought_separator: sep.map(str::to_string),
                 ..Default::default()
             };
-            let deferred = build_json_only_grammar_source(&schema, &opts);
-            let pre = build_grammar_source(&schema, &opts, true);
-            let optional = build_grammar_source(&schema, &opts, false);
+            let deferred =
+                build_json_only_grammar_source(&schema, &opts).unwrap();
+            let pre = build_grammar_source(&schema, &opts, true).unwrap();
+            let optional = build_grammar_source(&schema, &opts, false).unwrap();
             for gap in good {
                 let at = format!("{sep:?}, {gap:?}");
                 assert!(accepts(&deferred, &format!("{gap}{body}")), "{at}");
@@ -678,7 +695,7 @@ mod tests {
             thought_separator: Some("\n\n\n".into()),
             ..Default::default()
         };
-        let deferred = build_json_only_grammar_source(&schema, &long);
+        let deferred = build_json_only_grammar_source(&schema, &long).unwrap();
         assert!(accepts(&deferred, &format!("\n\n\n{body}")));
         assert!(accepts(&deferred, &format!("\n{body}")));
         assert!(!accepts(&deferred, &format!("\n\n\n\n{body}")));
@@ -695,9 +712,49 @@ mod tests {
             &config.format_schema(),
             &OutputConfigOptions::default(),
             false,
-        );
+        )
+        .unwrap();
         assert!(accepts(&src, r#"<think>hmm</think> {"x":1}"#));
         assert!(accepts(&src, r#"{"x":1}"#));
+    }
+
+    /// A recursive `$ref` (a tree, as schemars emits one) compiles as
+    /// a structured-output schema — unified and deferred grammars both
+    /// admit a valid three-level tree and refuse an invalid one, as
+    /// the schema check does — where it used to overflow the stack.
+    #[test]
+    fn recursive_ref_schema_compiles() {
+        let config = cfg(json!({
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/Node"}},
+            "required": ["root"],
+            "$defs": {"Node": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "children": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/Node"},
+                    },
+                },
+            }},
+        }));
+        let schema = config.format_schema();
+        assert!(schema.pointer("/$defs/Node").is_some(), "{schema}");
+        let opts = OutputConfigOptions::default();
+        let unified = build_grammar_source(&schema, &opts, false).unwrap();
+        let deferred = build_json_only_grammar_source(&schema, &opts).unwrap();
+        let valid = r#"{"root":{"name":"a","children":[{"name":"b","children":[{"name":"c","children":[]}]},{"name":"d"}]}}"#;
+        let invalid = r#"{"root":{"name":"a","children":[{"name":"b","children":[{"name":3}]}]}}"#;
+        assert!(accepts(&unified, valid));
+        assert!(accepts(&unified, &format!("<think>hmm</think>{valid}")));
+        assert!(accepts(&deferred, valid));
+        assert!(crate::schema_check::check_text(&schema, valid).is_ok());
+        for src in [&unified, &deferred] {
+            assert!(!accepts(src, invalid));
+        }
+        assert!(crate::schema_check::check_text(&schema, invalid).is_err());
+        assert!(grammar_for_output_config(&config, &opts, false).is_ok());
     }
 
     #[test]
@@ -715,7 +772,8 @@ mod tests {
                 ..Default::default()
             },
             false,
-        );
+        )
+        .unwrap();
         assert!(accepts(&src, r#"{"x":1}"#));
         assert!(!accepts(&src, r#"<think>hmm</think> {"x":1}"#));
     }
@@ -921,7 +979,8 @@ mod tests {
             &config.format_schema(),
             &OutputConfigOptions::default(),
             true,
-        );
+        )
+        .unwrap();
         assert!(
             !src.contains(r#""<think>""#),
             "pre-opened root must not spell the opener: {src}"
@@ -951,7 +1010,8 @@ mod tests {
                 ..Default::default()
             },
             true,
-        );
+        )
+        .unwrap();
         assert!(accepts(&src, "hmm</think> {\"x\":1}"));
         assert!(!accepts(&src, "{\"x\":1}"));
     }
@@ -1030,7 +1090,8 @@ mod tests {
         let json_body =
             r#"<|channel|>final <|constrain|>json<|message|>{"x":1}"#;
         let unified =
-            build_grammar_source(&config.format_schema(), &harmony, false);
+            build_grammar_source(&config.format_schema(), &harmony, false)
+                .unwrap();
         assert!(accepts(&unified, body));
         assert!(accepts(&unified, &format!("{analysis}{body}")));
         assert!(accepts(&unified, &format!("{analysis}{json_body}")));
@@ -1047,7 +1108,8 @@ mod tests {
                 ..harmony.clone()
             },
             false,
-        );
+        )
+        .unwrap();
         assert!(accepts(&no_thought, body));
         assert!(!accepts(&no_thought, json_body));
         assert!(!accepts(&no_thought, &format!("{analysis}{body}")));

@@ -232,6 +232,12 @@ pub enum SessionError {
     /// Fires before any decode work; the session stays reusable.
     #[error("dialect: {0}")]
     Dialect(#[from] crate::dialect::DialectError),
+    /// The prompt's tool and `output_config` schemas measure past the
+    /// session's [`SchemaLimits`](crate::SchemaLimits) (see
+    /// [`Session::with_schema_limits`]). Checked first, before anything
+    /// renders, classifies or compiles them; the session stays reusable.
+    #[error("schema limits: {0}")]
+    SchemaBudget(#[from] crate::SchemaBudgetError),
     /// Grammar-forced generation ended without producing a parseable tool call
     /// — a forced call missing its `tool_use` block, or an eager
     /// grammar/JSON constraint left mid-structure at end of generation —
@@ -465,7 +471,8 @@ impl SessionError {
             Self::ChatTemplate(_)
             | Self::ToolChoice(_)
             | Self::OutputConfig(_)
-            | Self::Dialect(_) => true,
+            | Self::Dialect(_)
+            | Self::SchemaBudget(_) => true,
             // Request validation fires while assembling the sampler
             // config, before any decode work. State untouched.
             Self::RequestTopP(_) => true,
@@ -522,6 +529,25 @@ impl SessionError {
     /// [`is_fatal`]: Self::is_fatal
     pub fn is_fatal(&self) -> bool {
         !self.is_reusable_after()
+    }
+
+    /// For a failed load ([`FromPath::from_path_with`]), `true` if the
+    /// backend had begun allocating — out of memory loading weights or
+    /// creating the KV cache, most likely — so its state may be
+    /// partial, and the process may not be safe to load into again.
+    /// `false` for failures found before any allocation (a missing
+    /// file, unreadable metadata, a bad template) and for every error
+    /// that is not a load failure. See [`NewError::is_resource`].
+    // A build with no backend has only the fallback arm.
+    #[allow(clippy::match_single_binding)]
+    pub fn is_resource(&self) -> bool {
+        match self {
+            #[cfg(feature = "llama-cpp")]
+            Self::LlamaCppEngine(e) => e.is_resource(),
+            #[cfg(all(feature = "moeflux", target_os = "macos"))]
+            Self::MoefluxEngine(e) => e.is_resource(),
+            _ => false,
+        }
     }
 }
 
@@ -3052,6 +3078,8 @@ pub struct Session<B: Backend> {
     /// enforce/parse/re-ingest cannot drift apart.
     dialect: crate::CallSyntax,
     output_config_opts: OutputConfigOptions,
+    /// The most a request's schemas may measure ([`Self::with_schema_limits`]).
+    schema_limits: crate::SchemaLimits,
     render_opts: RenderOptions,
     /// The model's reserved special-token pieces, neutralized in every
     /// render's content and tokenized back as text (see
@@ -3534,7 +3562,7 @@ impl FromPath for Session<LlamaCppBackend> {
         let started = std::time::Instant::now();
         let model =
             crate::LlamaCppModel::from_file(path.to_path_buf(), Some(params))
-                .ok_or_else(|| NewError::Model {
+                .ok_or_else(|| NewError::Metadata {
                 path: path.to_path_buf(),
             })?;
         let vocab = started.elapsed();
@@ -3766,6 +3794,7 @@ impl<B: Backend> Session<B> {
             dialect,
             literals,
             output_config_opts: OutputConfigOptions::default(),
+            schema_limits: crate::SchemaLimits::default(),
             // `preserve_thinking` default: byte-stable transcripts are
             // the prefix cache's contract, and current Anthropic
             // models keep prior-turn thinking. See
@@ -4066,6 +4095,26 @@ impl<B: Backend> Session<B> {
     ) -> Self {
         self.output_config_opts = opts;
         self
+    }
+
+    /// The most a request's client-supplied schemas — every custom
+    /// tool's `input_schema`, an `output_config` `json_schema` — may
+    /// measure before this session compiles them. A prompt past any of
+    /// them fails up front with [`SessionError::SchemaBudget`] — from
+    /// every `complete*` call and [`Self::count_tokens`] — before
+    /// rendering or compiling anything, and the grammars the session
+    /// compiles are held to these limits, not the library default (the
+    /// options' `schema_limits`). Defaults to
+    /// [`SchemaLimits::default`](crate::SchemaLimits::default), generous
+    /// for real tools; see [`crate::schema_budget`].
+    pub fn with_schema_limits(mut self, limits: crate::SchemaLimits) -> Self {
+        self.schema_limits = limits;
+        self
+    }
+
+    /// The limits set by [`Self::with_schema_limits`].
+    pub fn schema_limits(&self) -> &crate::SchemaLimits {
+        &self.schema_limits
     }
 
     /// Override the defaults used when rendering the prompt through the chat
@@ -4824,6 +4873,9 @@ impl<B: Backend> Session<B> {
         prompt: &Prompt,
     ) -> Result<usize, SessionError> {
         self.check_no_open_thought(prompt)?;
+        // The render writes the tools' schemas, and the tagged dialects
+        // classify them: measured first, as for a completion.
+        crate::schema_budget::check_prompt(prompt, &self.schema_limits)?;
         let media = self.call_context(prompt)?;
         let (rendered, neutralized) = self
             .template
@@ -5217,6 +5269,7 @@ impl<B: Backend> Session<B> {
         SessionError,
     > {
         self.check_no_open_thought(prompt)?;
+        crate::schema_budget::check_prompt(prompt, &self.schema_limits)?;
         // A literal sentinel but no images: `render_opts_for` sets no
         // media sentinel, so an image-bearing prompt fails typed.
         let media = MediaContext {
@@ -5251,10 +5304,14 @@ impl<B: Backend> Session<B> {
         // further shape the distribution. A deferred grammar is carried
         // separately (not in `modes`) — it stays suspended until
         // `TokenPredictor` sees its trigger in the output.
+        let output_config_opts = OutputConfigOptions {
+            schema_limits: self.schema_limits,
+            ..self.output_config_opts.clone()
+        };
         let (grammar_mode, deferred) = match resolve_grammar(
             prompt,
             &self.dialect,
-            &self.output_config_opts,
+            &output_config_opts,
             render_ends_with_open_reasoning(&rendered, &self.dialect)
                 || prompt_resumes_open_reasoning(prompt, &self.dialect),
         )? {
@@ -5619,6 +5676,7 @@ impl<B: Backend> Session<B> {
         include_user_sampling: bool,
     ) -> Result<PreparedCall, SessionError> {
         self.check_no_open_thought(prompt)?;
+        crate::schema_budget::check_prompt(prompt, &self.schema_limits)?;
         let media = self.call_context(prompt)?;
         let opts = self.render_opts_for(&media);
         let (
@@ -5749,6 +5807,7 @@ impl<B: Backend> Session<B> {
         let output_config_opts = OutputConfigOptions {
             phase_split: self.output_config_opts.phase_split
                 && !reasoning_closed_by_render,
+            schema_limits: self.schema_limits,
             ..self.output_config_opts.clone()
         };
         let (grammar_mode, deferred_grammar) = match resolve_grammar(
@@ -7199,13 +7258,18 @@ impl<B: Backend> Session<B> {
         });
         if let Some(hit) = hit {
             let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
+            // The cut parses prefix after prefix: the tools are
+            // classified once for all of them.
+            let spellings =
+                std::cell::RefCell::new(crate::dialect::Spellings::new());
             let parse = |text: &str| {
-                crate::dialect::parse_text_open(
+                crate::dialect::parse_text_cached(
                     &parse_syntax,
                     &tool_refs,
                     text,
                     pre_opened_reasoning,
                     crate::dialect::Leniency::Clipped,
+                    &mut spellings.borrow_mut(),
                 )
             };
             if let (_, Some(at)) =
@@ -7797,13 +7861,18 @@ impl<B: Backend> Session<B> {
         // spelled is text, never framing. `marked` keeps that parse
         // unrestored for containment, which reads provenance off it.
         let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
+        // Every parse below (a stop cut parses prefix after prefix)
+        // shares one classification of the tools.
+        let spellings =
+            std::cell::RefCell::new(crate::dialect::Spellings::new());
         let parse = |leniency| {
-            crate::dialect::parse_text_open(
+            crate::dialect::parse_text_cached(
                 &parse_syntax,
                 &tool_refs,
                 &marked_text,
                 pre_opened_reasoning,
                 leniency,
+                &mut spellings.borrow_mut(),
             )
         };
         // A stop sequence (#122): the one the filter stopped on, or —
@@ -7819,12 +7888,13 @@ impl<B: Backend> Session<B> {
             // Its KV no longer matches the output either way.
             Some(stop) => {
                 let clipped = |text: &str| {
-                    crate::dialect::parse_text_open(
+                    crate::dialect::parse_text_cached(
                         &parse_syntax,
                         &tool_refs,
                         text,
                         pre_opened_reasoning,
                         crate::dialect::Leniency::Clipped,
+                        &mut spellings.borrow_mut(),
                     )
                 };
                 let (blocks, at) = stop::marked_stop_cut(
@@ -8601,6 +8671,7 @@ fn dialect_grammar_for_prompt(
     prompt: &Prompt,
     dialect: &crate::CallSyntax,
     thought_pre_opened: bool,
+    schema_limits: &crate::SchemaLimits,
 ) -> Result<Option<SamplingMode>, SessionError> {
     use crate::dialect::{Anchor, EmitOptions};
     let Some(choice) = prompt.tool_choice.as_ref() else {
@@ -8653,6 +8724,7 @@ fn dialect_grammar_for_prompt(
         // section-only dialects (Hermes) stay single-call regardless
         // of the wire flag.
         parallel: parallel && !syntax.per_call_start.is_empty(),
+        schema_limits: *schema_limits,
     };
     let source = crate::dialect::grammar_source(&syntax, &chosen, &opts)?;
     let mode = SamplingMode::grammar(&source).map_err(ToolChoiceError::from)?;
@@ -8671,6 +8743,7 @@ fn dialect_grammar_for_prompt(
 fn dialect_deferred_grammar_for_prompt(
     prompt: &Prompt,
     dialect: &crate::CallSyntax,
+    schema_limits: &crate::SchemaLimits,
 ) -> Result<Option<crate::DeferredGrammar>, SessionError> {
     use crate::dialect::{Anchor, EmitOptions};
     let disable_parallel = match prompt.tool_choice.as_ref() {
@@ -8704,6 +8777,7 @@ fn dialect_deferred_grammar_for_prompt(
     let opts = EmitOptions {
         anchor: Anchor::Lazy,
         parallel: !disable_parallel && !syntax.per_call_start.is_empty(),
+        schema_limits: *schema_limits,
     };
     let chosen: Vec<&Tool> = tools.iter().collect();
     let source = crate::dialect::grammar_source(&syntax, &chosen, &opts)?;
@@ -8921,9 +8995,12 @@ fn resolve_grammar(
             "resolve_grammar: input",
         );
     }
-    if let Some(g) =
-        dialect_grammar_for_prompt(prompt, dialect, thought_pre_opened)?
-    {
+    if let Some(g) = dialect_grammar_for_prompt(
+        prompt,
+        dialect,
+        thought_pre_opened,
+        &output_config_opts.schema_limits,
+    )? {
         #[cfg(feature = "axum")]
         tracing::debug!(
             target: "drama_llama::session",
@@ -8972,7 +9049,11 @@ fn resolve_grammar(
     // output_config outranks the speculative auto grammar (only one
     // deferred slot exists, and output_config is the caller's direct
     // ask).
-    if let Some(d) = dialect_deferred_grammar_for_prompt(prompt, dialect)? {
+    if let Some(d) = dialect_deferred_grammar_for_prompt(
+        prompt,
+        dialect,
+        &output_config_opts.schema_limits,
+    )? {
         #[cfg(feature = "axum")]
         tracing::debug!(
             target: "drama_llama::session",
@@ -12581,6 +12662,148 @@ mod tests {
                 ("Let me think.\n</think>.{J}", ">.", false),
             ],
         });
+    }
+
+    /// A string `enum` on Qwen 3.8, token by token through its real
+    /// tokenizer (a `vocab_only` load: CPU, no tensors): the raw member
+    /// — the template's spelling — is admitted whichever way the
+    /// tokenizer splits it, forced (`Any`) and lazily after prose
+    /// (`Auto`), parses to the member and passes the strict backstop;
+    /// the quoted spelling the grammar once forced is masked at the
+    /// token carrying its quote. The shape is Agora's `get_content`
+    /// `detail` (`Option<DetailLevel>`), as schemars emits it.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the Qwen 3.8 GGUF (vocab-only load, CPU)"]
+    fn qwen38_string_enum_raw_by_token() {
+        use crate::backend::Model as _;
+        let spec = FleetSpec {
+            env: "DRAMA_LLAMA_QWEN38_MODEL",
+            file: "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+            on: &[],
+            off: &[],
+            close_prefix: "",
+            crossings: &[],
+        };
+        let Some((model, _, dialect)) = load_fleet_model(&spec) else {
+            return;
+        };
+        assert_eq!(dialect.family, crate::dialect::Family::TagWithTagged);
+        let mut tool = Tool::builder("get_content")
+            .description("Read one piece of content.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "detail": {"anyOf": [
+                        {"oneOf": [
+                            {"type": "string", "const": "summary"},
+                            {"type": "string", "const": "full"},
+                        ]},
+                        {"type": "null"},
+                    ]},
+                },
+                "required": ["id"],
+            }))
+            .build()
+            .expect("valid tool");
+        tool.strict = Some(true);
+        let call = |detail: &str| {
+            format!(
+                "<tool_call>\n<function=get_content>\n\
+                 <parameter=id>\nconstitution\n</parameter>\n\
+                 <parameter=detail>\n{detail}\n</parameter>\n\
+                 </function>\n</tool_call>"
+            )
+        };
+        let prompt = |choice| Prompt {
+            tools: Some(vec![tool.clone().into()]),
+            tool_choice: Some(choice),
+            ..Prompt::default()
+        };
+        let forced = dialect_grammar_for_prompt(
+            &prompt(ToolChoice::Any {
+                disable_parallel_tool_use: true,
+            }),
+            &dialect,
+            false,
+            &crate::SchemaLimits::default(),
+        )
+        .expect("compiles")
+        .expect("forced grammar");
+        let lazy = dialect_deferred_grammar_for_prompt(
+            &prompt(ToolChoice::Auto {
+                disable_parallel_tool_use: true,
+            }),
+            &dialect,
+            &crate::SchemaLimits::default(),
+        )
+        .expect("compiles")
+        .expect("lazy grammar");
+        let grammars = [
+            ("forced", "", crate::CompiledOutputConfig::Single(forced)),
+            (
+                "lazy",
+                "I'll read it.\n\n",
+                crate::CompiledOutputConfig::Deferred(lazy),
+            ),
+        ];
+        let complete = Drive {
+            complete: true,
+            eos_ok: true,
+            unfired: false,
+        };
+        for (label, prose, grammar) in &grammars {
+            for (detail, want) in [
+                ("full", serde_json::json!("full")),
+                ("summary", serde_json::json!("summary")),
+                ("null", serde_json::Value::Null),
+            ] {
+                let emission = format!("{prose}{}", call(detail));
+                let tokens = model.tokenize_special(&emission, false, true);
+                let pieces: Vec<String> =
+                    tokens.iter().map(|&t| model.token_to_piece(t)).collect();
+                assert!(
+                    pieces.concat().contains(&format!(">\n{detail}\n</")),
+                    "{label}: {pieces:?}"
+                );
+                assert_eq!(
+                    drive_token_ids(grammar, &model, &tokens),
+                    Ok(complete),
+                    "{label}: {detail:?} as {pieces:?}"
+                );
+                let blocks = crate::dialect::parse_text(
+                    &dialect,
+                    &[&tool],
+                    &emission,
+                    false,
+                    crate::dialect::Leniency::Final,
+                )
+                .blocks;
+                let input = blocks
+                    .iter()
+                    .find_map(|b| match b {
+                        crate::Block::ToolUse { call } => Some(&call.input),
+                        _ => None,
+                    })
+                    .expect("a call");
+                assert_eq!(input["detail"], want, "{label}");
+                assert_eq!(
+                    crate::schema_check::check(&tool.schema, input),
+                    Ok(()),
+                    "{label}"
+                );
+            }
+            let emission = format!("{prose}{}", call("\"full\""));
+            let tokens = model.tokenize_special(&emission, false, true);
+            let Err(Refused::Masked(i)) =
+                drive_token_ids(grammar, &model, &tokens)
+            else {
+                panic!("{label}: quoted member not masked");
+            };
+            let piece = model.token_to_piece(tokens[i]);
+            assert!(piece.contains('"'), "{label}: masked at {piece:?}");
+        }
     }
 
     /// Gemma 4: `<|channel>thought…<channel|>`, never pre-opened.
@@ -16305,6 +16528,89 @@ mod tests {
         assert_eq!(drop_repeated_calls(cut.clone(), true), (cut, false));
     }
 
+    /// A tool past the default limits (600 top-level properties), as
+    /// the forced call a prompt asks for.
+    fn over_the_limits_prompt() -> Prompt {
+        let props: serde_json::Map<String, serde_json::Value> = (0..600)
+            .map(|i| (format!("p{i}"), serde_json::json!({"type": "integer"})))
+            .collect();
+        let tool = Tool::builder("wide")
+            .description("Too many parameters.")
+            .schema(serde_json::json!({"type": "object", "properties": props}))
+            .build()
+            .expect("valid tool");
+        Prompt {
+            tools: Some(vec![tool.into()]),
+            tool_choice: Some(ToolChoice::Any {
+                disable_parallel_tool_use: true,
+            }),
+            ..Prompt::default()
+        }
+        .add_message((misanthropic::prompt::message::Role::User, "hi"))
+        .expect("a user turn")
+    }
+
+    /// `count_tokens` renders the tools' schemas, so it measures them
+    /// first, like a completion: past the session's limits it is the
+    /// same 400, before any render; inside them it counts.
+    #[test]
+    fn count_tokens_measures_the_schemas_first() {
+        let prompt = over_the_limits_prompt();
+        let mut session = mock::session(&[]);
+        for error in [
+            session.count_tokens(&prompt).unwrap_err(),
+            session.complete_response(&prompt).unwrap_err(),
+        ] {
+            let SessionError::SchemaBudget(e) = error else {
+                panic!("{error}");
+            };
+            assert_eq!(e.limit, crate::schema_budget::SchemaLimit::Params);
+        }
+        let mut session = mock::session(&[])
+            .with_schema_limits(crate::SchemaLimits::unlimited());
+        assert!(session.count_tokens(&prompt).expect("counts") > 0);
+    }
+
+    /// The grammar a session compiles is held to the session's limits,
+    /// not the library default: lifted, a request past the default
+    /// compiles; at the default, the compile itself refuses it.
+    #[test]
+    fn resolve_grammar_compiles_under_the_sessions_limits() {
+        let prompt = over_the_limits_prompt();
+        let dialect = crate::CallSyntax::qwen_xml();
+        let opts = |schema_limits| OutputConfigOptions {
+            schema_limits,
+            ..OutputConfigOptions::default()
+        };
+        let lifted = resolve_grammar(
+            &prompt,
+            &dialect,
+            &opts(crate::SchemaLimits::unlimited()),
+            false,
+        )
+        .expect("compiles past the default limits");
+        assert!(matches!(
+            lifted,
+            Some(crate::CompiledOutputConfig::Single(_))
+        ));
+        let refused = resolve_grammar(
+            &prompt,
+            &dialect,
+            &opts(crate::SchemaLimits::default()),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                SessionError::Dialect(
+                    crate::dialect::DialectError::SchemaBudget(_)
+                )
+            ),
+            "{refused}"
+        );
+    }
+
     /// The divergence context: shared text before, then each side.
     #[test]
     fn divergence_context_shows_both_sides() {
@@ -16796,6 +17102,12 @@ mod tests {
     /// makes the model emit, so the round trip is exact for each JSON
     /// scalar — and a string-typed (or nullable-string) value that
     /// merely *looks* like one stays the string the model wrote.
+    ///
+    /// A finite set of strings (`enum`, `const`, nullable, behind a
+    /// `$ref`) is generated raw, the way the template renders any
+    /// string, so its round trip is exact too; the JSON-quoted spelling
+    /// the grammar once forced lost the tip on every such call (Agora's
+    /// `detail`, 2026-10-01).
     #[test]
     fn qwen_cache_stable_round_trips_scalar_args() {
         use crate::Tool;
@@ -16811,8 +17123,22 @@ mod tests {
                     "verbose": {"type": "boolean"},
                     "days": {"type": "integer"},
                     "scale": {"type": "number"},
+                    "mode": {"type": "string", "enum": ["summary", "full"]},
+                    // Agora's `Option<DetailLevel>`, as schemars emits it.
+                    "level": {"anyOf": [
+                        {"oneOf": [
+                            {"type": "string", "const": "summary"},
+                            {"type": "string", "const": "full"},
+                        ]},
+                        {"type": "null"},
+                    ]},
+                    "units": {"type": "string", "const": "metric"},
+                    "tier": {"$ref": "#/$defs/Tier"},
                 },
                 "required": ["city"],
+                "$defs": {
+                    "Tier": {"type": "string", "enum": ["free", "pro"]},
+                },
             }))
             .build()
             .expect("valid tool");
@@ -16860,6 +17186,13 @@ mod tests {
             arg("detail", "None", "None".into()),
             arg("detail", "\"quoted\"", "\"quoted\"".into()),
             arg("detail", "{\"a\": 1}", "{\"a\": 1}".into()),
+            // A finite set of strings: raw, as the template renders it.
+            arg("mode", "full", "full".into()),
+            arg("mode", "summary", "summary".into()),
+            arg("level", "full", "full".into()),
+            arg("level", "null", Value::Null),
+            arg("units", "metric", "metric".into()),
+            arg("tier", "pro", "pro".into()),
         ];
         for baked in [&crate::baked::QWEN36, &crate::baked::QWEN38] {
             let served = crate::baked::detect(baked.stock)
@@ -16867,7 +17200,20 @@ mod tests {
                 .replacement;
             let syntax = crate::dialect::analyze_template(served, "", eos)
                 .expect("analyze");
+            let grammar = crate::dialect::grammar_source(
+                &syntax,
+                &[&tool],
+                &crate::dialect::EmitOptions::default(),
+            )
+            .expect("grammar");
+            let admits = |emission: &str| {
+                let mut state = crate::GrammarState::from_source(&grammar)
+                    .expect("grammar parses");
+                state.advance_bytes(emission.as_bytes()).is_ok()
+                    && state.is_complete()
+            };
             for (emission, value) in &cases {
+                assert!(admits(emission), "{}: {emission:?}", baked.name);
                 let blocks = crate::dialect::parse_text(
                     &syntax,
                     &[&tool],
@@ -16888,6 +17234,26 @@ mod tests {
                 assert_eq!(
                     qwen_divergence(served, &tool, false, emission),
                     None,
+                    "{}: {emission:?}",
+                    baked.name
+                );
+            }
+            // Control: the quoted spelling the grammar once forced on a
+            // set of strings is no longer admitted — re-rendered, it
+            // parts at its opening quote.
+            for key in ["mode", "level", "units", "tier"] {
+                let member = match key {
+                    "units" => "metric",
+                    "tier" => "pro",
+                    _ => "full",
+                };
+                let emission =
+                    call("Paris", Some((key, &format!("\"{member}\""))));
+                assert!(!admits(&emission), "{}: {emission:?}", baked.name);
+                let at = emission.find('"').expect("quote in emission");
+                assert_eq!(
+                    qwen_divergence(served, &tool, false, &emission),
+                    Some(at),
                     "{}: {emission:?}",
                     baked.name
                 );
@@ -17771,6 +18137,7 @@ mod tests {
                         &EmitOptions {
                             anchor: Anchor::Lazy,
                             parallel: true,
+                            ..EmitOptions::default()
                         },
                     )
                     .expect("emit"),
@@ -18111,6 +18478,7 @@ mod tests {
                     &EmitOptions {
                         anchor: Anchor::Lazy,
                         parallel: true,
+                        ..EmitOptions::default()
                     },
                 )
                 .expect("emit"),

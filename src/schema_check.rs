@@ -22,7 +22,12 @@
 //! [`Session`]: crate::Session
 //! [`schema_to_gbnf`]: crate::schema_to_gbnf
 
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
 use serde_json::{Map, Value};
+
+use crate::grammar_compile::Defs;
 
 /// Where a value departs from its schema, and how. The path is a JSON
 /// pointer built from schema-declared property names and array indices
@@ -148,88 +153,288 @@ fn string_len(text: &str) -> usize {
 
 /// Check `value` against `schema` — the subset of JSON Schema described
 /// in the module docs. `$defs` resolve from the root `schema`.
+///
+/// Bounded by [`step_budget`]: a check that runs out passes, with a
+/// warning — the grammar already constrained the bytes, and a false
+/// mismatch would be a resample loop and a 500 for valid output.
 pub(crate) fn check(
     schema: &Value,
     value: &Value,
 ) -> Result<(), SchemaMismatch> {
-    let defs = schema.get("$defs").and_then(Value::as_object);
-    Checker { defs }.at(schema, value, &mut String::new())
+    let (verdict, steps, budget) = check_counted(schema, value);
+    if steps <= budget {
+        return verdict;
+    }
+    tracing::warn!(
+        target: "drama_llama::schema_check",
+        event = "schema_check_budget",
+        steps,
+        budget,
+        "schema check ran out of steps; accepting the value, which the \
+         grammar constrained",
+    );
+    Ok(())
 }
 
+/// [`check`]'s verdict before the budget is applied, the steps it took
+/// (past the budget, it stopped judging there) and the budget.
+pub(crate) fn check_counted(
+    schema: &Value,
+    value: &Value,
+) -> (Result<(), SchemaMismatch>, usize, usize) {
+    let defs = Defs::new(schema.get("$defs").and_then(Value::as_object));
+    let mut checker = Checker {
+        defs,
+        memo: HashMap::new(),
+        names: HashMap::new(),
+        depth: 0,
+        steps: 0,
+        budget: step_budget(value),
+        speculative: 0,
+    };
+    let verdict = checker.at(schema, value, &mut String::new(), None);
+    (verdict, checker.steps, checker.budget)
+}
+
+/// The most steps [`check`] takes on `value` — one per subschema judged
+/// and per `enum` member, distinct `required` name or distinct `type`
+/// compared, and one per entry of a schema's `required` and `type`
+/// arrays, the once their distinct names are gathered: 2^20, plus 2^14
+/// per JSON value in it.
+///
+/// A value is judged by the subschemas that can reach it, and inside
+/// [`SchemaLimits`](crate::SchemaLimits) those are few. An `anyOf`'s
+/// variants are tried in turn, nested ones multiplying, an object's
+/// property is judged by every object variant that declares it, and an
+/// `enum`'s members are compared one by one — but every one of those is
+/// counted by [`SchemaLimits::max_width`](crate::SchemaLimits::max_width),
+/// as is each alternation itself, so they are at most 2048 per value;
+/// and each def is judged at most twice per value (its verdict is
+/// memoized, inside an `anyOf` and out), at most 1024 defs. Under 8192
+/// per value, then: 2^14 is room to spare. A `required` or `type` array
+/// is gathered once per check, whatever its duplicates: its entries are
+/// values the schema counts toward
+/// [`SchemaLimits::max_nodes`](crate::SchemaLimits::max_nodes), 2^17 at
+/// most, inside the 2^20. Its distinct names are what each value is
+/// judged against, and those the width counts (a `required` name is a
+/// property; an `"object"` named a hundred thousand times is one). So a
+/// request inside the limits never runs out
+/// (`schema_check_at_the_limits_stays_in_budget`), while a schema past
+/// them (only a caller that skips the measure can send one) costs
+/// seconds, not hours.
+fn step_budget(value: &Value) -> usize {
+    let mut nodes = 0usize;
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        nodes += 1;
+        match v {
+            Value::Array(items) => stack.extend(items),
+            Value::Object(map) => stack.extend(map.values()),
+            _ => {}
+        }
+    }
+    (1 << 20) + nodes.saturating_mul(1 << 14)
+}
+
+/// How deep [`Checker::at`] may nest before it stops judging. A value
+/// is at most serde_json's 128 levels, but each level can also descend
+/// a def's `anyOf`s and a chain of `$ref`s, and the checker must never
+/// overflow the stack on a client's schema. Past the cap a value
+/// passes: the backstop goes lenient, never wrong.
+const MAX_DEPTH: usize = 256;
+
 struct Checker<'s> {
-    defs: Option<&'s Map<String, Value>>,
+    defs: Defs<'s>,
+    /// A def's verdict on a value, by `(def, the value's address)`:
+    /// the same value always sits at the same path, so the verdict is
+    /// reusable whole. Without it, `anyOf`s of `$ref`s fan out
+    /// exponentially in the chain's length.
+    memo: HashMap<(usize, usize, bool), Result<(), SchemaMismatch>>,
+    /// Each schema's distinct `type` and `required` names, by the
+    /// schema's address, gathered the first time a value meets it — a
+    /// `required` naming one property a hundred thousand times was a
+    /// hundred thousand lookups for every object judged.
+    names: HashMap<usize, Rc<Names>>,
+    /// The current nesting of [`Self::at`].
+    depth: usize,
+    /// Steps taken ([`step_budget`]).
+    steps: usize,
+    /// Past this many steps every judgement passes.
+    budget: usize,
+    /// How many `anyOf`s the current judgement is a variant of. Inside
+    /// one a mismatch is only ever discarded (the `anyOf` reports its
+    /// own), so it is built without its path or names: a failing
+    /// variant costs a step, not a copy of a path as long as the
+    /// schema's keys.
+    speculative: usize,
+}
+
+/// A schema's distinct `type` and `required` names, in order.
+struct Names {
+    /// `None` when the schema has no `type` (or a malformed one).
+    types: Option<Vec<String>>,
+    required: Vec<String>,
+    /// `required`, for lookups.
+    required_set: HashSet<String>,
+}
+
+impl Names {
+    /// `schema`'s names, and the entries read to gather them.
+    fn gather(schema: &Value) -> (Self, usize) {
+        let distinct = |names: &[Value]| {
+            let mut seen = HashSet::new();
+            let names: Vec<String> = names
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|n| seen.insert(*n))
+                .map(str::to_string)
+                .collect();
+            names
+        };
+        let (types, typed) = match schema.get("type") {
+            Some(Value::String(t)) => (Some(vec![t.clone()]), 1),
+            Some(Value::Array(ts)) => (Some(distinct(ts)), ts.len()),
+            _ => (None, 0),
+        };
+        let listed = schema.get("required").and_then(Value::as_array);
+        let required = listed.map_or_else(Vec::new, |r| distinct(r));
+        let read = typed + listed.map_or(0, Vec::len);
+        let required_set = required.iter().cloned().collect();
+        let names = Self {
+            types,
+            required,
+            required_set,
+        };
+        (names, read)
+    }
 }
 
 impl Checker<'_> {
+    /// `schema`'s [`Names`], gathered once per check.
+    fn names(&mut self, schema: &Value) -> Rc<Names> {
+        let key = schema as *const Value as usize;
+        if let Some(names) = self.names.get(&key) {
+            return names.clone();
+        }
+        let (names, read) = Names::gather(schema);
+        self.steps = self.steps.saturating_add(read);
+        let names = Rc::new(names);
+        self.names.insert(key, names.clone());
+        names
+    }
+
+    /// A mismatch of `kind` at `path` — or, speculative, at none.
+    fn mismatch(&self, path: &str, kind: MismatchKind) -> SchemaMismatch {
+        SchemaMismatch {
+            path: match self.speculative {
+                0 => path.to_string(),
+                _ => String::new(),
+            },
+            kind,
+        }
+    }
+}
+
+impl Checker<'_> {
+    /// Check `value` at `path` against `schema`. `left_of` is the def
+    /// whose body `schema` is at the left of — no byte of `value`
+    /// consumed since — which decides whether a `$ref` closes a cycle
+    /// (see [`Defs`]).
     fn at(
-        &self,
+        &mut self,
         schema: &Value,
         value: &Value,
         path: &mut String,
+        left_of: Option<usize>,
     ) -> Result<(), SchemaMismatch> {
-        let fail = |path: &str, kind| {
-            Err(SchemaMismatch {
-                path: path.to_string(),
-                kind,
-            })
+        if self.depth >= MAX_DEPTH || self.steps > self.budget {
+            return Ok(());
+        }
+        self.steps += 1;
+        self.depth += 1;
+        let result = self.at_inner(schema, value, path, left_of);
+        self.depth -= 1;
+        result
+    }
+
+    fn at_inner(
+        &mut self,
+        schema: &Value,
+        value: &Value,
+        path: &mut String,
+        left_of: Option<usize>,
+    ) -> Result<(), SchemaMismatch> {
+        let fail = |checker: &Self, path: &str, kind| {
+            Err(checker.mismatch(path, kind))
         };
 
         // Same `$ref` shape the grammar compiler resolves; anything else
         // falls through to the schema's other keywords, as it does there.
-        if let Some(target) = schema
-            .get("$ref")
-            .and_then(Value::as_str)
-            .and_then(|r| r.strip_prefix("#/$defs/"))
-            .and_then(|name| self.defs.and_then(|d| d.get(name)))
-        {
-            return self.at(target, value, path);
+        // A reference closing a left cycle is `value` there: anything.
+        if let Some(id) = self.defs.target(schema) {
+            let Some(id) = self.defs.resolve(left_of, id) else {
+                return Ok(());
+            };
+            // Keyed by mode too: a speculative verdict has no path.
+            let key =
+                (id, value as *const Value as usize, self.speculative > 0);
+            if let Some(verdict) = self.memo.get(&key) {
+                return verdict.clone();
+            }
+            let verdict = self.at(self.defs.schema(id), value, path, Some(id));
+            self.memo.insert(key, verdict.clone());
+            return verdict;
         }
 
         if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
-            if !variants.is_empty()
-                && !variants
+            // Each variant leaves `path` as it found it.
+            self.speculative += 1;
+            let any = variants.is_empty()
+                || variants
                     .iter()
-                    .any(|v| self.at(v, value, &mut path.clone()).is_ok())
-            {
-                return fail(path, MismatchKind::AnyOf);
-            }
-            return Ok(());
+                    .any(|v| self.at(v, value, path, left_of).is_ok());
+            self.speculative -= 1;
+            return match any {
+                true => Ok(()),
+                false => fail(self, path, MismatchKind::AnyOf),
+            };
         }
 
         if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
+            self.steps = self.steps.saturating_add(variants.len());
             return match variants.contains(value) {
                 true => Ok(()),
-                false => fail(path, MismatchKind::Enum),
+                false => fail(self, path, MismatchKind::Enum),
             };
         }
 
         if let Some(expected) = schema.get("const") {
             return match expected == value {
                 true => Ok(()),
-                false => fail(path, MismatchKind::Const),
+                false => fail(self, path, MismatchKind::Const),
             };
         }
 
-        let types: Vec<&str> = match schema.get("type") {
-            Some(Value::String(t)) => vec![t.as_str()],
-            Some(Value::Array(ts)) => {
-                ts.iter().filter_map(Value::as_str).collect()
-            }
-            // No type: the grammar compiles to any JSON value.
-            _ => return Ok(()),
-        };
-        if types.is_empty() {
+        let names = self.names(schema);
+        // No type: the grammar compiles to any JSON value.
+        let Some(types) = names.types.as_ref().filter(|t| !t.is_empty()) else {
             return Ok(());
-        }
+        };
+        self.steps = self.steps.saturating_add(types.len());
         if !types.iter().any(|t| type_matches(t, value)) {
-            return fail(path, MismatchKind::Type(types.join(" or ")));
+            let expected = match self.speculative {
+                0 => types.join(" or "),
+                _ => String::new(),
+            };
+            return fail(self, path, MismatchKind::Type(expected));
         }
+        let names_type = |name: &str| types.iter().any(|t| t == name);
 
         match value {
-            Value::Object(object) if types.contains(&"object") => {
-                self.object(schema, object, path)
+            Value::Object(object) if names_type("object") => {
+                self.object(schema, &names, object, path)
             }
-            Value::Array(items) if types.contains(&"array") => {
+            Value::Array(items) if names_type("array") => {
                 self.array(schema, items, path)
             }
             _ => Ok(()),
@@ -237,27 +442,31 @@ impl Checker<'_> {
     }
 
     fn object(
-        &self,
+        &mut self,
         schema: &Value,
+        names: &Names,
         object: &Map<String, Value>,
         path: &mut String,
     ) -> Result<(), SchemaMismatch> {
         let props = schema.get("properties").and_then(Value::as_object);
-        let required: Vec<&str> = schema
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|r| r.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
+        let required = &names.required;
+        self.steps = self.steps.saturating_add(required.len());
 
-        if let Some(missing) =
-            required.iter().find(|name| !object.contains_key(**name))
+        if let Some(missing) = required
+            .iter()
+            .find(|name| !object.contains_key(name.as_str()))
         {
-            return Err(SchemaMismatch {
-                path: path.clone(),
-                kind: MismatchKind::MissingProperty(missing.to_string()),
-            });
+            let missing = match self.speculative {
+                0 => missing.to_string(),
+                _ => String::new(),
+            };
+            return Err(
+                self.mismatch(path, MismatchKind::MissingProperty(missing))
+            );
         }
 
+        // Each undeclared key looks itself up here, not in the list.
+        let required_set = &names.required_set;
         let additional = schema.get("additionalProperties");
         for (key, child) in object {
             let declared = props.and_then(|p| p.get(key));
@@ -265,18 +474,17 @@ impl Checker<'_> {
             let result = match (declared, additional) {
                 (Some(sub), _) => {
                     push_pointer(path, key);
-                    self.at(sub, child, path)
+                    self.at(sub, child, path, None)
                 }
                 // A required name with no `properties` entry: the
                 // grammar gives it a permissive slot.
-                (None, _) if required.contains(&key.as_str()) => Ok(()),
-                (None, Some(Value::Bool(false))) => Err(SchemaMismatch {
-                    path: path.clone(),
-                    kind: MismatchKind::UnexpectedProperty,
-                }),
+                (None, _) if required_set.contains(key.as_str()) => Ok(()),
+                (None, Some(Value::Bool(false))) => {
+                    Err(self.mismatch(path, MismatchKind::UnexpectedProperty))
+                }
                 (None, Some(sub @ Value::Object(_))) => {
                     // Not a schema name: point at the object, not the key.
-                    self.at(sub, child, &mut path.clone())
+                    self.at(sub, child, path, None)
                 }
                 (None, _) => Ok(()),
             };
@@ -287,7 +495,7 @@ impl Checker<'_> {
     }
 
     fn array(
-        &self,
+        &mut self,
         schema: &Value,
         items: &[Value],
         path: &mut String,
@@ -297,10 +505,7 @@ impl Checker<'_> {
         let non_empty =
             schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) >= 1;
         if non_empty && items.is_empty() {
-            return Err(SchemaMismatch {
-                path: path.clone(),
-                kind: MismatchKind::Empty,
-            });
+            return Err(self.mismatch(path, MismatchKind::Empty));
         }
         let Some(item_schema) = schema.get("items") else {
             return Ok(());
@@ -309,7 +514,7 @@ impl Checker<'_> {
             let len = path.len();
             path.push('/');
             path.push_str(&i.to_string());
-            let result = self.at(item_schema, item, path);
+            let result = self.at(item_schema, item, path, None);
             path.truncate(len);
             result
         })
@@ -564,6 +769,31 @@ mod tests {
             kind: MismatchKind::Type("integer".into()),
         };
         assert_eq!(nested.to_string(), "at `/items/1/n`: expected integer");
+    }
+
+    /// Past its step budget the check stops judging and passes the
+    /// value, valid or not: 300 values each compared against a
+    /// 30,000-member `enum` (far past the width limit) are nine million
+    /// steps against a budget of six million.
+    #[test]
+    fn over_its_budget_the_check_passes() {
+        let members: Vec<usize> = (0..30_000).collect();
+        let schema = json!({"type": "array", "items": {"enum": members}});
+        let mut items = vec![json!(29_999); 300];
+        let (verdict, steps, budget) =
+            check_counted(&schema, &Value::Array(items.clone()));
+        assert!(verdict.is_ok() && steps > budget, "{steps} of {budget}");
+        items[299] = json!(-1);
+        let invalid = Value::Array(items);
+        let (_, steps, budget) = check_counted(&schema, &invalid);
+        assert!(steps > budget);
+        assert_eq!(check(&schema, &invalid), Ok(()));
+        // Within it, the same invalid value is caught.
+        let short = Value::Array(vec![json!(-1)]);
+        assert_eq!(
+            check(&schema, &short).unwrap_err().kind,
+            MismatchKind::Enum
+        );
     }
 
     #[test]

@@ -261,6 +261,15 @@ the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
    client's text after the calls renders before them with the rest
    (`session::tests::qwen_cache_stable_chunks_age_and_keep_late_text`).
 
+The grammar keeps the same split, so no template change is needed for
+it: a string argument is generated raw, and so is one drawn from a
+finite set — a string `enum` or `const`, nullable or not
+(`<parameter=detail>\nfull\n</parameter>`, never `"full"`). Before,
+such a member was generated JSON-quoted and re-rendered without its
+quotes (Agora's `detail`, 2026-10-01), a tip miss on every such call.
+A set whose raw spellings would collide (`"1"` beside `1`) stays
+JSON. Pinned in the same test, the quoted spelling as the control.
+
 The leading system/tools header, user and tool turns, the
 reasoning-effort block (3.8), tool declarations, the rest of the
 tool-call bodies and the generation prompt are byte-identical to

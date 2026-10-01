@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use llama_cpp_sys_3::{
     llama_context, llama_context_default_params, llama_context_params,
-    llama_model_params, llama_perf_context_data, llama_seq_id,
-    llama_supports_gpu_offload, llama_supports_mlock, llama_supports_mmap,
-    llama_token,
+    llama_model_default_params, llama_model_params, llama_perf_context_data,
+    llama_seq_id, llama_supports_gpu_offload, llama_supports_mlock,
+    llama_supports_mmap, llama_token,
 };
 
 /// Convenience alias for the llama.cpp-backed pair. Use
@@ -55,10 +55,7 @@ impl LlamaCppEngine {
         context_params: Option<llama_context_params>,
         numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
-        let model = match LlamaCppModel::from_file(path.clone(), model_params) {
-            Some(m) => m,
-            None => return Err(NewError::Model { path }),
-        };
+        let model = Self::load_model(path.clone(), model_params)?;
         let context_params =
             context_params.unwrap_or_else(Self::default_context_params);
         let decoder =
@@ -91,6 +88,45 @@ impl LlamaCppEngine {
             }
         }
         Ok(engine)
+    }
+
+    /// Load the model at `path`, classifying a failure
+    /// ([`NewError::is_resource`]) by when it came. llama.cpp answers
+    /// every failed load with the same null, so the file is first
+    /// opened and then read vocab-only — header, metadata, vocabulary,
+    /// no backend allocation — and only then loaded in full: a file
+    /// that fails either check is [`NewError::Unreadable`] or
+    /// [`NewError::Metadata`], and a full load that fails after both
+    /// passed failed allocating ([`NewError::Model`]).
+    fn load_model(
+        path: PathBuf,
+        params: Option<llama_model_params>,
+    ) -> Result<LlamaCppModel, NewError> {
+        let unreadable = |source| NewError::Unreadable {
+            path: path.clone(),
+            source,
+        };
+        let meta = std::fs::File::open(&path)
+            .and_then(|file| file.metadata())
+            .map_err(unreadable)?;
+        if meta.is_dir() {
+            return Err(unreadable(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "is a directory",
+            )));
+        }
+        // SAFETY: returns a plain struct by value; no preconditions.
+        let params =
+            params.unwrap_or_else(|| unsafe { llama_model_default_params() });
+        let vocab_only = llama_model_params {
+            vocab_only: true,
+            ..params
+        };
+        // Dropped at once: it only proves the metadata reads.
+        LlamaCppModel::from_file(path.clone(), Some(vocab_only))
+            .ok_or_else(|| NewError::Metadata { path: path.clone() })?;
+        LlamaCppModel::from_file(path.clone(), Some(params))
+            .ok_or(NewError::Model { path })
     }
 
     /// Create a new engine from a model `path` and load-time
@@ -322,6 +358,63 @@ impl LlamaCppEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The failures a load finds before the backend allocates anything
+    /// are not resource failures: a missing path, a directory, a file
+    /// llama.cpp cannot read as a model. Real llama.cpp calls; no
+    /// weights.
+    #[test]
+    fn load_failures_before_allocation_are_not_resource_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.gguf");
+        let garbage = dir.path().join("garbage.gguf");
+        std::fs::write(&garbage, b"not a gguf, not even close").expect("write");
+
+        let error = |path: PathBuf| match LlamaCppEngine::from_path(path) {
+            Ok(_) => panic!("loaded a model that isn't one"),
+            Err(e) => e,
+        };
+        let not_found = error(missing);
+        assert!(
+            matches!(&not_found, NewError::Unreadable { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound),
+            "{not_found:?}"
+        );
+        let directory = error(dir.path().to_path_buf());
+        assert!(
+            matches!(directory, NewError::Unreadable { .. }),
+            "{directory:?}"
+        );
+        let metadata = error(garbage);
+        assert!(
+            matches!(metadata, NewError::Metadata { .. }),
+            "{metadata:?}"
+        );
+        for e in [not_found, directory, metadata] {
+            assert!(!e.is_resource(), "{e}");
+        }
+    }
+
+    /// Failures after the backend began allocating are resource
+    /// failures — and so is every one llama.cpp leaves unexplained.
+    #[test]
+    fn load_failures_after_allocation_are_resource_failures() {
+        let path = PathBuf::from("model.gguf");
+        assert!(NewError::Model { path: path.clone() }.is_resource());
+        assert!(NewError::Context.is_resource());
+        #[cfg(feature = "mtmd")]
+        {
+            use crate::llama_cpp::mtmd::MtmdNewError;
+            let mtmd = |source| NewError::Mtmd {
+                path: path.clone(),
+                source,
+            };
+            let load_failed = MtmdNewError::LoadFailed { path: path.clone() };
+            assert!(mtmd(load_failed).is_resource());
+            let bad_path = MtmdNewError::BadPath { path: path.clone() };
+            assert!(!mtmd(bad_path).is_resource());
+        }
+    }
 
     /// Resident set size of this process in bytes (via `ps`, so KiB
     /// granularity). On Apple Silicon, Metal buffers are unified-memory

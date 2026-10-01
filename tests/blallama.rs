@@ -7,8 +7,8 @@
 //! happy path, and cross-request prompt caching through the server's
 //! shared session (the endpoint-level analog of `tests/session_cache.rs`).
 //!
-//! All tests need a GGUF in `models/`: `cargo test --test blallama --
-//! --ignored`.
+//! All but one need a GGUF in `models/`: `cargo test --test blallama --
+//! --ignored`. The exception serves a directory holding a garbage file.
 
 use std::{
     io::{Read as _, Write as _},
@@ -78,6 +78,11 @@ impl Drop for Server {
 }
 
 fn spawn_server() -> Server {
+    spawn_server_in(&models_dir())
+}
+
+/// [`spawn_server`] over `dir` instead of `models/`.
+fn spawn_server_in(dir: &std::path::Path) -> Server {
     // Bind-then-drop to pick a free port. Racy in principle; fine for
     // a test that runs alone on a dev box.
     let port = TcpListener::bind("127.0.0.1:0")
@@ -86,7 +91,7 @@ fn spawn_server() -> Server {
         .unwrap()
         .port();
     let child = Command::new(env!("CARGO_BIN_EXE_blallama"))
-        .arg(models_dir())
+        .arg(dir)
         .args(["--port", &port.to_string(), "--seed", "42", "--no-penalty"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -118,6 +123,72 @@ fn http_get(port: u16, path: &str) -> String {
         .split_once("\r\n\r\n")
         .map(|(_, body)| body.to_string())
         .unwrap_or_default()
+}
+
+/// Minimal HTTP/1.0 POST of a JSON `body`; returns the status code and
+/// the response body.
+fn http_post(port: u16, path: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.0\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or_default();
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_default();
+    (status, body.to_string())
+}
+
+/// A model that fails to load *before* the backend allocates anything —
+/// here a `.gguf` llama.cpp cannot read the metadata of — is answered
+/// with an error, and the server serves on: it is not one of the
+/// failures blallama exits on (`bin/blallama/fatal.rs`). No model
+/// needed; the file is garbage.
+#[cfg(feature = "llama-cpp")]
+#[test]
+fn unloadable_model_is_answered_and_the_server_serves_on() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("garbage.gguf"), b"not a gguf")
+        .expect("write");
+    let mut server = spawn_server_in(dir.path());
+    let body = |model: &str| {
+        format!(
+            r#"{{"model":"{model}","max_tokens":8,
+                "messages":[{{"role":"user","content":"Hi"}}]}}"#
+        )
+    };
+
+    for _ in 0..2 {
+        let (status, payload) =
+            http_post(server.port, "/v1/messages", &body("garbage.gguf"));
+        let v: serde_json::Value =
+            serde_json::from_str(&payload).expect("a JSON envelope");
+        assert_eq!(status, 500, "{payload}");
+        assert_eq!(v["error"]["type"], "api_error", "{payload}");
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("metadata"), "{payload}");
+    }
+    // A nonexistent id is a 404, from the same live process.
+    let (status, payload) =
+        http_post(server.port, "/v1/messages", &body("no-such-model.gguf"));
+    assert_eq!(status, 404, "{payload}");
+
+    // Past the fatal grace period, the process is still up and serving.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        matches!(server.child.try_wait(), Ok(None)),
+        "blallama exited on a benign load failure"
+    );
+    let tags = http_get(server.port, "/api/tags");
+    assert!(tags.contains(r#""models""#), "{tags}");
 }
 
 /// Discover a servable model name from `/api/tags` (entry names in

@@ -95,6 +95,10 @@ pub struct ToolChoiceOptions {
     /// required fields under sampling pressure (observed: Cogito
     /// emitting `{"comment": "…"}` when `reply_to` was required).
     pub strict_schema: bool,
+    /// The most the tools' schemas may measure, checked before anything
+    /// compiles them ([`ToolChoiceError::SchemaBudget`]). Default
+    /// [`SchemaLimits::default`](crate::SchemaLimits::default).
+    pub schema_limits: crate::SchemaLimits,
 }
 
 impl Default for ToolChoiceOptions {
@@ -109,6 +113,7 @@ impl Default for ToolChoiceOptions {
             arguments_field: "arguments",
             wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
             strict_schema: true,
+            schema_limits: crate::SchemaLimits::default(),
         }
     }
 }
@@ -190,7 +195,7 @@ pub fn grammar_for_tool_choice(
         &chosen,
         opts,
         RootShape::Eager { thought_pre_opened },
-    );
+    )?;
     let mode = SamplingMode::grammar(&source)?;
     Ok(Some(mode))
 }
@@ -245,7 +250,7 @@ pub fn deferred_grammar_for_prompt(
         return Ok(None);
     }
     let chosen: Vec<&Tool> = tools.iter().collect();
-    let source = build_grammar_source(&chosen, opts, RootShape::Lazy);
+    let source = build_grammar_source(&chosen, opts, RootShape::Lazy)?;
     Ok(Some(crate::DeferredGrammar {
         grammar: crate::CompiledGrammar::parse(&source)?,
         activate_after: vec![open.as_bytes().to_vec()],
@@ -298,6 +303,7 @@ pub fn build_grammar_source_for_debug(
             thought_pre_opened: false,
         },
     )
+    .unwrap_or_else(|e| format!("# no grammar: {e}\n"))
 }
 
 /// Emit the GBNF source text for a tool-choice constraint.
@@ -317,7 +323,12 @@ pub(crate) fn build_grammar_source(
     tools: &[&Tool],
     opts: &ToolChoiceOptions,
     shape: RootShape,
-) -> String {
+) -> Result<String, ToolChoiceError> {
+    crate::schema_budget::check_schemas(
+        tools.iter().copied(),
+        None,
+        &opts.schema_limits,
+    )?;
     let mut src = String::with_capacity(1024);
 
     // Root rule: reasoning prefix per `shape`, then the (optionally
@@ -409,8 +420,15 @@ pub(crate) fn build_grammar_source(
     // schema is off — `object` from JSON_GRAMMAR covers the permissive
     // case.
     if opts.strict_schema {
+        // Rules across every tool, as `dialect::grammar_source` counts.
+        let mut tally = crate::grammar_compile::RuleTally::default();
         for (i, tool) in tools.iter().enumerate() {
-            schema_to_gbnf(&tool.schema, &format!("args_{i}"), &mut src);
+            schema_to_gbnf(&tool.schema, &format!("args_{i}"), &mut src)
+                .and_then(|()| tally.update(&src))
+                .map_err(|source| ToolChoiceError::Schema {
+                    tool: tool.name.to_string(),
+                    source,
+                })?;
         }
     }
 
@@ -423,7 +441,7 @@ pub(crate) fn build_grammar_source(
     // that made this explicit.
     src.push_str(&json_grammar_lenient());
 
-    src
+    Ok(src)
 }
 
 /// Errors from [`grammar_for_tool_choice`].
@@ -436,6 +454,19 @@ pub enum ToolChoiceError {
     UnknownTool(String),
     #[error("compiled grammar is invalid: {0}")]
     Grammar(#[from] GrammarError),
+    /// A tool's `input_schema` has no grammar: too complex, or
+    /// unsatisfiable.
+    #[error("tool {tool:?}: {source}")]
+    Schema {
+        tool: String,
+        #[source]
+        source: crate::grammar_compile::SchemaError,
+    },
+    /// The tools' schemas measure past
+    /// [`ToolChoiceOptions::schema_limits`], so nothing compiled them:
+    /// the request's fault, a 400.
+    #[error("schema limits: {0}")]
+    SchemaBudget(#[from] crate::SchemaBudgetError),
 }
 
 static_assertions::assert_impl_all!(ToolChoiceError: Send, Sync);
@@ -454,6 +485,7 @@ mod tests {
                 thought_pre_opened: false,
             },
         )
+        .unwrap()
     }
     use crate::{Grammar, GrammarState};
     use serde_json::json;
@@ -486,6 +518,7 @@ mod tests {
             arguments_field: "parameters",
             wrap_tags: None,
             strict_schema: false,
+            schema_limits: crate::SchemaLimits::default(),
         }
     }
 
@@ -546,6 +579,47 @@ mod tests {
             &src,
             r#"{"name": "send_email", "parameters": {}}"#
         ));
+    }
+
+    /// Strict schemas with recursive `$ref`s compile, and two tools'
+    /// same-named defs (`Node`) stay two rules: each tool's tree
+    /// follows its own `Node`.
+    #[test]
+    fn strict_recursive_refs_keep_each_tools_defs() {
+        let tree = |leaf: &str| {
+            json!({
+                "type": "object",
+                "properties": {"root": {"$ref": "#/$defs/Node"}},
+                "required": ["root"],
+                "$defs": {"Node": {
+                    "type": "object",
+                    "properties": {
+                        "v": {"type": leaf},
+                        "kids": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/Node"},
+                        },
+                    },
+                    "required": ["v", "kids"],
+                }},
+            })
+        };
+        let words = tool_with_schema("words", tree("string"));
+        let numbers = tool_with_schema("numbers", tree("integer"));
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..bare_opts()
+        };
+        let src = eager_src(&[&words, &numbers], &opts);
+        let call = |name: &str, leaf: &str| {
+            format!(
+                r#"{{"name": "{name}", "parameters": {{"root":{{"v":{leaf},"kids":[{{"v":{leaf},"kids":[{{"v":{leaf},"kids":[]}}]}}]}}}}}}"#
+            )
+        };
+        assert!(accepts(&src, &call("words", r#""a""#)));
+        assert!(accepts(&src, &call("numbers", "1")));
+        assert!(!accepts(&src, &call("words", "1")));
+        assert!(!accepts(&src, &call("numbers", r#""a""#)));
     }
 
     #[test]
@@ -1150,7 +1224,8 @@ mod tests {
             RootShape::Eager {
                 thought_pre_opened: true,
             },
-        );
+        )
+        .unwrap();
         // Reasoning body, close, then the wrapped call.
         assert!(accepts(
             &src,
@@ -1186,7 +1261,7 @@ mod tests {
             allow_thought: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts, RootShape::Lazy);
+        let src = build_grammar_source(&[&t], &opts, RootShape::Lazy).unwrap();
         assert!(accepts(
             &src,
             "<tool_call>\n{\"name\": \"get_weather\", \"parameters\": {}}\n</tool_call>"

@@ -18,21 +18,39 @@
 //! this struct instead).
 
 mod analyzer;
-mod emit;
+pub(crate) mod emit;
 mod parse;
 mod partial;
 mod provenance;
 mod segment;
+#[cfg(test)]
+mod utf8_tests;
 
 pub use analyzer::{analyze_template, vocab_cross_check, AnalyzeError};
 pub use emit::{
     grammar_source, render_reference, validate_representable, Anchor,
     DialectError, EmitOptions,
 };
+#[cfg(test)]
+pub(crate) use parse::parse_text_open;
+pub(crate) use parse::OpenCall;
 pub use parse::{parse_text, Leniency, ParseStatus, Parsed, StreamParser};
-pub(crate) use parse::{parse_text_open, OpenCall};
+// What only `Session` reaches for, so only where it is built.
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub(crate) use parse::{parse_text_cached, Spellings};
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
 pub(crate) use partial::cut_value;
 pub use partial::truncate_partial_object;
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
 pub(crate) use provenance::Provenance;
 
 use crate::json_canon::JsonSpacing;

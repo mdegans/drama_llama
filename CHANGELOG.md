@@ -554,6 +554,361 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Qwen's thinking-off scaffold, as stock — may be lost), streamed a
   char at a time against the batch parse, and every thought the budget
   can cut continued as an open thought.
+- **blallama exits on every fatal fault, reliably, with a code saying
+  which — and no longer serves on a failed backend.** Its policy is
+  unchanged: when the process can no longer be trusted it exits rather
+  than recover in-process, because llama.cpp does not promise its
+  destructors clean up after a failure, and a supervisor restarts it.
+  It was not reliable or complete:
+  - Only a panic in a request's blocking session task exited. A panic
+    in a handler, a hyper connection task, the probe writer or the
+    catalog warm-up was caught by tokio and the server kept running —
+    having unwound, and dropped, whatever that task owned (a `Session`
+    between checkout and its blocking call included). A panic hook now
+    covers every thread: it declares the process fatal and parks the
+    panicking thread instead of unwinding it (a tokio worker hands its
+    scheduler on first), so nothing it owns is dropped. Model loads and
+    catalog reads are the exception the chat-template analyzer needs
+    (it catches the panics minijinja raises on some templates); a panic
+    that escapes one still exits, through its `JoinError`.
+  - A failed prefill (`SessionError::Decode`) was "reusable", so a
+    backend llama.cpp leaves broken kept serving: on 2026-10-01 one
+    Metal out-of-memory command buffer left its context "in error state
+    … recreate the backend", and every later request failed until a
+    manual restart. Every decode error, and every error after which the
+    session is not reusable (which used to be dropped and reloaded),
+    now exits; the session is leaked, not dropped. The predictor's
+    decode-failure panics (#92) count as backend failures too.
+  - The exit was `std::process::exit(1)`, which runs C++ static
+    destructors: ggml-metal's asserts every buffer was freed
+    (`ggml_metal_rsets_free`), so with a model loaded the exit became a
+    `SIGABRT`. It is now `_exit`, after the cause is logged as one
+    `ERROR` line (`event: "fatal"`, `kind`, `exit_code`, `cause`) and
+    flushed, and after a 500 ms grace in which requests in flight —
+    and any that arrive — are answered 500 `api_error`, which SDKs
+    retry. The exit runs on its own timer thread, so nothing waits on
+    those answers.
+  - Exit codes: **70** after a panic, **75** after a backend failure.
+    The policy is documented in `bin/blallama` ("Run it under a
+    supervisor") and the README, with a minimal restart loop in
+    `scripts/blallama-supervise.sh` (keeps the arguments, backs off on a
+    crash loop, logs each restart, stops on a clean exit). Tests run the
+    test binary as a child process: a panic in the session task, a
+    panic in a handler, a caught and an escaping panic in a model read,
+    and a fatal decode error each exit with their code, log one fatal
+    line and answer 500.
+
+- **blallama exits on a model load that fails while allocating, and
+  serves on after one that fails before.** A failed load used to be
+  answered and served past, whatever the cause — including an
+  out-of-memory load that died with the backend half-allocated, which
+  is exactly the state the exit-and-restart policy exists not to serve
+  from. llama.cpp answers every failed load with the same null, so
+  `LlamaCppEngine` now finds the benign failures first: it opens the
+  file (`NewError::Unreadable` — missing, a directory, unreadable),
+  then reads it vocab-only, which allocates no backend memory
+  (`NewError::Metadata` — not a GGUF, an unsupported architecture, a
+  malformed vocabulary), and only then loads it in full. A full load
+  that fails after both passed (`NewError::Model`), a failed context
+  creation (`NewError::Context`: the KV cache and compute buffers), and
+  a failed mmproj load are resource failures. The class is
+  `NewError::is_resource`, `MoefluxEngineError::is_resource`
+  (`mf_init_model`'s bare null is a resource failure; the tokenizer and
+  config parse, a path C cannot take and weights for another variant
+  are not) and `SessionError::is_resource`; where the backend does not
+  say why, it answers `true`. blallama declares a resource failure
+  fatal and exits **75** with its one `ERROR` line; a benign one is
+  answered as before (and now logged, `event: "load_failed"`). The
+  vocab-only pass adds tens of milliseconds to each load, and the
+  catalog's metadata peek now fails as `Metadata`, not `Model`. Tests:
+  real llama.cpp classification of a missing path, a directory and a
+  garbage file; a child process whose load fails with a stand-in
+  context-creation failure exits 75 with one fatal line and answers
+  500; the real binary, serving a directory holding a garbage `.gguf`,
+  answers the load with an error, a nonexistent id with a 404, and is
+  still up and serving past the fatal grace period.
+
+- **Non-ASCII model output can no longer panic a dialect parser.** The
+  gpt-oss Harmony parser stepped one *byte* past a block boundary
+  (`rest[1..]`) before looking for the next marker, so prose outside a
+  channel block that began with a multibyte char (`"Über alles"`, an
+  `é` after `<|end|>` or `<|start|>assistant`) sliced mid-char and
+  panicked — in blallama, the blocking session task, so the process
+  exited. Every scan that must make progress now steps one *char*. A
+  fuzz over each dialect's markers, their prefixes and multibyte chars
+  found two more: Gemma 4 read a turn-exit marker (`<|tool_response>`)
+  ahead of a channel open as prose once the open arrived, re-cutting
+  the streamed text under what it had already yielded (now consumed as
+  envelope, as it is everywhere else); and the stream parser sliced its
+  trailing text at the byte count it had yielded, which a re-cut of
+  that block (also reachable when a call opens inside an open thought
+  that a later close turns back into thought) puts mid-char — it now
+  resumes at the next char boundary and logs a warning. Tests put é,
+  🦀 and CJK at every char boundary of each dialect's reference turn,
+  batch under every leniency and streamed in uneven pieces
+  (`dialect::utf8_tests`), and through stop sequences and emission
+  provenance.
+
+- **A Qwen XML parameter whose JSON does not read is a malformed call,
+  not a string.** A JSON-spelled parameter (a number, an object, a
+  union, `{}`) whose text serde_json refused came back as the raw text,
+  a *string* — silently retyped. The grammar admits two such values: a
+  tree nested past serde's 127 levels through a recursive `$ref` (a
+  back-reference costs no depth), and a number past `f64` (a 310-digit
+  integer, `1e999`). Every other dialect refused those calls; Qwen
+  returned `{"x": "999…"}`, which a union admitting strings even passed
+  the schema check as. Now the call is malformed like theirs: it
+  degrades to text, which the session rejects as a real `<tool_call>`
+  in free text (or, under a forced call, as a grammar violation) — a
+  resample. Kept lenient, and pinned: raw string parameters (any text,
+  JSON-looking or not), a nullable string's bare `null`, an unlisted
+  member of a string set, pythonisms (`True`, `None`, single quotes)
+  and unclosed brackets in a JSON value. One behavior change for a
+  model writing unconstrained: a JSON-spelled union that admits
+  strings (`["number", "string"]`) no longer takes an unquoted word as
+  a string; the grammar always quotes it.
+
+- **Deeply nested output can no longer abort the process.** The Gemma
+  4 dict-value reader and the readers of a call cut short (every
+  dialect's streaming and clipped parse) recursed once per bracket, so
+  an untyped parameter nested ~2,500 deep (Gemma 4, inside what its
+  grammar admitted) or ~3,800 (the rest) overflowed a 2 MiB stack —
+  tokio's, which blallama runs `Session` on — and aborted the server
+  with every request on it. Each reader now refuses nesting past 127
+  levels as malformed, exactly as serde_json (which the JSON dialects
+  parse with) refuses it. And the grammars no longer admit it: an
+  untyped value (`{}`, `{"type": "object"}` without properties, …)
+  nests at most 32 levels of objects and arrays, in the JSON and dict
+  encodings alike, and the schema around it at most 64
+  (`SchemaLimits::max_depth`, see Added), so with the call envelope a
+  constrained value stays under 127 and every dialect reads back what
+  its grammar admits (`depth_budget_fits_the_parsers`). Recursion
+  through `$ref`s is the one way past it: a tree schema still nests as
+  deep as the model takes it, and a value past 127 levels is refused
+  by the parse, as before.
+
+- **A generation that floods its call trigger parses in linear time.**
+  The dialect parser rescanned the rest of the text for each of its
+  landmarks (reasoning open, call trigger, Gemma's channel markers and
+  turn exit) from every block boundary, so 384 KB of Gemma 4's
+  `<|tool_call>` — 32k tokens, each a malformed call — took 10 s to
+  parse once (Qwen's flood 0.9 s), and the streaming parser re-parses
+  on every token. A landmark's next occurrence is now remembered for
+  the parse: the same floods take 160 ms.
+
+- **`required` and `type` arrays count each name once.** A `required`
+  listing an undeclared name twice was a key the grammar made the
+  model write twice, and a `type` naming one type twice
+  (`["string", "string"]`) compiled to any value, which the schema
+  check then refused. The compilers, the width measure and the check
+  now read each name once; the check gathers a schema's names once per
+  check, where it rebuilt the whole list for every object it judged: a
+  `required` naming one property 100,000 times (inside every limit)
+  took 8.4 s to check over 128 KB of output, past the step budget no
+  request inside the limits may reach.
+
+- **A nullable Qwen XML parameter takes a bare `null`; a non-nullable
+  one never comes back `null`.** A JSON-spelled parameter whose type
+  is nullable through a `type` array (`["integer", "null"]`, schemars'
+  `Option<T>` for a non-string `T`) compiled to its base type alone, so
+  the `null` its schema allows was unwritable — a required `Option<i64>`
+  could not be null at all. It now takes `T | null`, and `null` reads
+  back JSON `null`. The rest, now pinned together
+  (`qwen_xml_null_only_where_the_schema_allows_it`): a non-nullable
+  integer, number, boolean, object, array or enum parameter has no
+  `null` in its grammar; a plain string parameter is raw, so the text
+  `null` is admitted and reads back as the *string* `"null"`; a
+  nullable string and an `anyOf` with a `null` variant (Agora's
+  `Option<DetailLevel>`) take a bare `null` as `null`, and so does a
+  parameter that `$ref`s a nullable def (through an alias chain too),
+  as its inline form does. Nested fields and the JSON dialects keep
+  collapsing a nullable type to its base.
+
+- **A matcher state over its caps refuses alternatives, not the
+  close.** Past `MAX_STACKS` (4096) stacks a state kept a prefix of its
+  sorted stacks, and the stack that closes a structure sorts after its
+  alternatives: after the `{` of an object of more than 4096 optional
+  members, the `}` was cut, so the object could not be empty, and a
+  required member after them could not follow `{` alone. A capped state
+  now keeps one stack per distinct grammar position first (the
+  shallowest, shallowest first), then the rest in sorted order, so
+  every way to go on survives the cut and what is dropped is extra
+  derivations of a kept position or, past 4096 positions, the deepest
+  ones: members, not the close. Below the caps nothing changes.
+  (Keeping the shallowest stacks outright would not do: an ambiguous
+  recursive schema doubles its stacks at every level, and keeping each
+  level's closes first leaves no room to go deeper.)
+
+- **Qwen's tagged-value classifier reads each `$def` once per tool,
+  and the streaming parser classifies each tool once per
+  generation.** Two thousand parameters naming one def whose `enum`
+  holds a 100 KB string spelled that member two thousand times (200
+  MB of `to_string`) and kept a copy per parameter (400 MB), in the
+  emitter and again in the parser; and the streaming parser, which
+  re-parses the whole generation on every token, re-classified the
+  tool on every one. Now:
+  - A def's class is computed once per tool (unless cut short by
+    depth or budget) and each member spelled once; a parameter that
+    `$ref`s it takes its members as shared ids, and parameters with
+    the same member set share one `Choice` (`Arc`), which the grammar
+    writes as one rule for all of them.
+  - The per-tool budget is charged by member bytes spelled, plus a
+    step per schema visited and per member taken from a def, at 2^20
+    (about a mebibyte of member text per tool) where it was 2^16
+    steps of any size.
+  - `StreamParser` keeps each tool's spellings across re-parses, and a
+    lookup clones a reference count, not the member list.
+  Grammars and parses are identical to before on two random corpora
+  (3,000 schemas, and 2,000 with `$defs`, `$ref`s and nullable refs),
+  in every dialect.
+
+- **The grammar matcher's memory is bounded however a hostile schema
+  nests its output.** Measured on the hostile recheck's ambiguous
+  recursive schema (`N1 = N2 = {"c": N1 | N2}`) and on `[` nested
+  thousands deep, over a 75,000-token vocabulary:
+  - A matcher state keeps at most 2^16 frames (`MAX_STATE_FRAMES`,
+    was 2^18), and a lone stack deeper than that is no longer exempt:
+    output nested past it (~32,000 levels of `[`) is refused through
+    the usual violation path instead of copying an ever-deeper stack
+    on every byte. 2^16 is `MAX_STACKS` stacks 16 frames deep; the
+    widest real states (a 2,000-member `enum` three objects deep in a
+    tool call) are under 9 frames a stack, so the cap still binds only
+    where `MAX_STACKS` already does. (2^15 would over-restrict that
+    `enum` in the Hermes dialect.)
+  - The DFA cache's weight cap drops from 256 MiB to 32 MiB, and holds
+    *within* a sampling step: `intern` refuses a state that would take
+    the cache past twice the cap, or one heavier than a quarter of it,
+    with `UNCACHED_STATE`, and the grammar filter and the repetition
+    region guard walk the matcher for that input instead. Previously
+    only the next step's base intern could clear it.
+  - Spilled matcher stacks get power-of-two capacities: exact-length
+    copies, one block size larger per nesting level, left freed blocks
+    too small to reuse, and the process held over a gigabyte resident
+    above ~50 MB live.
+  Filtering every level of the ambiguous schema to 1,000 deep went
+  from ~1.45 GB resident to ~580 MB at the same speed, and to 6,000
+  deep holds ~800 MB resident (under 300 MB physical footprint) at
+  10–25 ms a step; at 2^18 it held 1.3 GB filtering only every 50th
+  level to 400.
+
+- **A grammar with too many rules is `SchemaError::TooComplex`, like
+  one with too many bytes.** The compiler stopped at 8 MiB of source,
+  but `Grammar::parse`'s 2^18-rule limit was only met later, as a
+  `GrammarError::TooLarge` that read like our bug: a 400,000-property
+  object passes it long before 8 MiB. The compiler now counts the rules
+  it writes (`rule_count`, which mirrors the parser: one per
+  definition, string literal, group and `*`/`+`/`?`) and stops at the
+  limit; the dialect emitters and strict `tool_choice` count across
+  tools too, since many tools under the limit can pass it together.
+  `SchemaError::TooComplex` gains `what` (`"bytes"` or `"rules"`).
+
+- **Qwen's tagged dialect writes each `$def` once per tool, and
+  classifies a tool's parameters once.** Each JSON-valued parameter
+  had its own compiler, so a tool whose P parameters all `$ref` the
+  head of a D-long chain of defs wrote all D defs P times: 800 × 800
+  was 143 MB of grammar and 5 million rules. One compiler per tool
+  (def rules `tool_<i>__def…`) writes each once. Alongside:
+  - Every raw (string) parameter shares one until-rule, `val_raw`; a
+    ~1.5 KB copy per parameter made a string-heavy tool's grammar
+    mostly duplicates (6000 string parameters passed the 8 MiB limit).
+  - The raw-vs-JSON spelling classifier resolves `$ref`s straight from
+    the `$defs` table instead of building `Defs` (a strongly-connected-
+    components pass over every def) per parameter, and the parser
+    classifies a tool once per parse instead of once per parameter it
+    reads. A tool's parameters share one step budget (2^16), in
+    declaration order, for the emitter and parser alike, so a schema
+    that makes every parameter walk a thousand-member union costs at
+    most that: a parameter past it is spelled as JSON (always correct,
+    merely not the raw spelling) by both sides. A finite set of more
+    than 4096 members (the matcher's stack cap) is JSON too, so every
+    set inside the schema width limit is written raw, as the template
+    writes it; at the first cap, 1024, a string `enum` of 1025–2048
+    members passed the measure and was quoted where the template writes
+    it bare.
+
+- **An all-optional object compiles to a linear grammar.** Both the
+  JSON and the dict (Gemma 4) encodings wrote, for each property, the
+  whole tail of later properties: quadratic, so 4000 optional
+  properties were over 300 MB of grammar (now past the 8 MiB limit,
+  but a legitimately wide object should not be anywhere near it). They
+  now share suffix rules (`pick_k ::= member_k rest_{k+1} | pick_{k+1}`,
+  `rest_k ::= ( sep pick_k )?`): each member written once, the
+  separator matched once before the choice of the next member, and the
+  accepted language unchanged — same fixed order, same separators,
+  checked against the old encoding on random member sets.
+
+- **An ambiguous recursive schema can no longer stall or exhaust the
+  grammar matcher.** Two interchangeable recursive defs (`N1 = N2 =
+  {"c": N1 | N2}`) double the matcher's live stacks at every nesting
+  level — they differ in which rule each frame is in, so no dedup
+  merges them: 18 levels held 393,216 stacks at over a second a byte,
+  and a deeper document never finished. A matcher state now keeps at
+  most 4096 stacks and 2^18 frames across them (a deterministic
+  prefix of its sorted stacks, and always at least one). Dropping
+  stacks only drops continuations, so the cap can over-restrict —
+  surfacing as the existing grammar-violation path — but never admit
+  a byte the full state would refuse. Real grammars peak under 40
+  stacks. Alongside:
+  - The epsilon walk is bounded by frames copied (2^22) and steps
+    (2^20) instead of 4096 steps per starting stack, which cut wide
+    alternations short: a 4000-property all-optional object refused
+    even `{}`, and an `enum` past ~2000 members lost members
+    unpredictably (now it keeps 4096).
+  - The session-lifetime DFA cache also restarts cold past ~256 MiB of
+    interned states, not only past 65,536 of them — capped states can
+    still be megabytes each.
+
+- **A schema that has no grammar is a 400, and compiling one is
+  bounded.** A client's schema (any tool's `input_schema` in any
+  dialect, a strict `tool_choice`, an `output_config` `json_schema`)
+  could make the compiler build an arbitrarily large grammar before
+  anything looked at its size, and `{"enum": []}` compiled to an empty
+  rule body that failed as a GBNF syntax error (`compiled grammar is
+  invalid: …`), reading as our bug. Now:
+  - The compiler stops once the grammar passes 8 MiB and fails the
+    schema as `SchemaError::TooComplex`; `Grammar::parse` refuses any
+    source over 8 MiB or 2^18 rules (`GrammarError::TooLarge`) as a
+    backstop. Real grammars are far smaller (a large tool set compiles
+    to a few hundred KiB).
+  - An empty `enum` admits no value: `SchemaError::EmptyEnum`, wherever
+    in the schema it sits.
+  - The errors surface as `DialectError::Schema`, `ToolChoiceError::Schema`
+    and `OutputConfigError::Schema` (each naming the tool where there
+    is one), all 400 `invalid_request_error` on blallama. Anthropic's
+    own wording for these was not captured; the messages are plain.
+  - `schema_to_gbnf` (doc-hidden, the fuzzer's entry) returns
+    `Result<(), SchemaError>`.
+
+- **A recursive `$ref` no longer aborts the server.** The schema
+  compiler inlined every `$ref` it met, with no cycle guard, so a
+  recursive schema — `{"$ref": "#/$defs/Node"}` whose `Node` has
+  `children: {items: {"$ref": "#/$defs/Node"}}`, exactly what
+  schemars emits for a tree type — recursed until `fatal runtime
+  error: stack overflow, aborting`: an abort, not a panic, so one such
+  tool or `output_config` schema took down the whole blallama process
+  and every request in it. Every dialect was exposed (Hermes/JSON-
+  native, Mistral, Gemma's dict encoding, gpt-oss Harmony, and Qwen
+  XML since its per-parameter schemas began resolving the tool's
+  `$defs`), as were strict `tool_choice` grammars and structured
+  output. Each referenced def now compiles once, to its own named rule
+  (`<root>__def<n>_<Name>`) that every `$ref` to it names, so recursion
+  lives in the grammar; defs come off a worklist, not nested calls, and
+  alias chains (`A → B → C`) resolve in a loop to their end. A
+  reference that loops back before any byte of the value — a
+  self-alias, an alias cycle, a left-recursive `anyOf` — would be left
+  recursion, and is unconstrained instead (`value`), as it is to the
+  schema check. That check, and the tagged-value classifier, follow
+  the same rule; the check memoizes each def's verdict per value and
+  caps its nesting (past it, a value passes rather than overflow), and
+  the classifier visits each def once, so neither a chain thousands of
+  defs long nor a diamond of `anyOf`s (`D_i = anyOf[D_{i+1}, …]`, 2^n
+  paths) can overflow or stall them. Everything else the schema
+  walkers recurse on is bounded by serde_json's 128-level nesting
+  limit on the request. Pinned on every dialect with a tree, mutual
+  recursion and alias chains (`recursive_refs_compile_on_every_dialect`)
+  and on `output_config` and strict `tool_choice`; chain, diamond and
+  depth bounds on small thread stacks in `grammar_compile`.
+
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like
@@ -676,13 +1031,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with each natural gap is admitted, complete and EOS-legal and keeps
   the turn contract, and the trigger-crossing tokens are admitted or
   masked — never fatal.
-- **A Qwen XML tool's string `enum` argument reads as its value.** The
-  grammar writes such a value as JSON (`"full"`, quoted) but the parser
-  read it raw, so the tool got `"\"full\""` — and, for a `strict`
-  tool, the schema backstop refused it on every draw and blallama
-  answered 500. The parser now reads a string `enum` as JSON, matching
-  the emitter. The quoted spelling is not what the template re-renders
-  (`full`), so such a turn's tip does not re-render byte-for-byte.
+- **A Qwen XML tool's string `enum` argument is written raw, as the
+  template renders it.** The grammar wrote such a value as JSON
+  (`"full"`, quoted) but the parser read it raw, so the tool got
+  `"\"full\""` — and, for a `strict` tool, the schema backstop refused
+  it on every draw and blallama answered 500. Qwen's template renders
+  any string argument raw (`args_value | string`), so the model was
+  trained on `<parameter=detail>\nfull\n</parameter>`, and a quoted
+  value re-rendered without its quotes: a tip miss on every such call
+  (Agora's `detail`). In a tagged dialect (`Family::TagWithTagged`;
+  of the fleet, Qwen 3.6 and 3.8) a string value is now never
+  JSON-quoted at the top of a parameter: a parameter that admits only
+  finitely many values, at least one a string — `enum`, `const`,
+  nullable or not, through `$ref`, `anyOf` or schemars' `oneOf` of
+  `const`s (`Option<DetailLevel>`) — is generated as an alternation of
+  its members' raw spellings (`full`, `null`) and read back by exact
+  match, so the round trip is byte-for-byte and a member passes the
+  `strict` backstop. A mixed set (`["a", 1, null]`) spells its strings
+  raw and the rest as JSON, as the template renders each; a set whose
+  spellings would collide (`"1"` beside `1`, `"null"` beside `null`) or
+  whose member contains the close tag stays JSON. A union of a free
+  string and `null` (`anyOf: [{"type": "string"}, {"type": "null"}]`)
+  is now raw like `"type": ["string", "null"]` already was. A quoted
+  member from an unconstrained model still reads as the member. JSON
+  dialects (Hermes/cogito, Mistral, gpt-oss, Gemma) are unchanged.
+  Also: a tagged parameter's `$ref` now resolves against the tool's
+  `$defs` (it compiled to any JSON value before).
 - **The schema backstop reads every number the grammar can write.** The
   grammar's `number` has an unbounded integer part, and serde_json
   refuses one too large for `f64` ("number out of range"), so such an
@@ -1122,6 +1496,124 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every superseded replacement, and loading a sidecar that matches one
   logs `stale_template_sidecar` at `WARN`, naming the bake and saying to
   delete the file.
+- **A request's schemas are measured before anything compiles them**
+  (`SchemaLimits`, `Session::with_schema_limits`,
+  `SessionError::SchemaBudget`, a 400 `invalid_request_error` on
+  blallama). Every custom tool's `input_schema` and an `output_config`
+  `json_schema` are walked once, iteratively, before rendering,
+  classification or compilation, and the request is refused, naming
+  the limit and where, when it has more than:
+
+  | limit | default | largest measured |
+  |---|---|---|
+  | custom tools | 512 | 15 (Agora) |
+  | top-level properties per tool | 512 | 5 |
+  | JSON values across the request's schemas, as written and with each `$ref` at its target's size | 131,072 | 882 (2,690) |
+  | `$defs` + `definitions` per schema | 1,024 | 5 |
+  | bytes of one `enum` member / `const` | 16 KiB | 24 |
+  | member bytes across the request, each `$ref` at its target's size | 1 MiB | ~49 KB |
+  | width: ways one schema's grammar can go on at once | 2,048 | 613 |
+  | depth: levels of objects and arrays a value nests, each `$ref` at its target's | 64 | 3 |
+
+  Measured on Agora's seed-agent request (15 tools and the `Soul`
+  output schema), misanthropic's captured request fixtures, Anthropic's
+  documented tool examples and a heavier synthetic tool (a 600-member
+  time-zone `enum` behind a `$ref` four parameters name); the largest
+  is 3× inside the width and 21× inside every other limit, Agora's
+  request at least 29× inside all. The `$ref`-expanded total is the work a
+  per-parameter pipeline would do: a large `enum` behind a `$ref` two
+  thousand parameters name is two thousand copies of it, and a `$ref`
+  fan-out with no members at all (a doubling chain of defs ending in
+  `{"type": "string"}`) is as many copies of its values. A member's
+  bytes are its compact JSON's, control characters at their escaped
+  length (`\u001f` is six). Every hostile
+  shape the rechecks found is refused in milliseconds, while requests
+  at the limits (512 parameters over shared defs, 512 tools, 2,000
+  nested optional properties) compile in every dialect in under 110 ms.
+
+  The width bounds the grammar matcher's stacks, which it caps at 4096
+  by refusing the excess — over-restricting the output — so a request
+  inside the limit never reaches that cap. It is counted from the
+  shape: an `enum` member or `const` 1; `boolean`/`null` 4, `number`
+  8, `string` 16, `integer` 24 (its 18 optional digits are a stack
+  each) and an untyped value 16, each the most measured in any dialect
+  plus margin; an object its properties + 4 plus its widest property;
+  an array 4 plus its items; an `anyOf`/`oneOf` the *sum* of its
+  variants plus one, since variants sharing a prefix (objects all
+  opening `{"a":`) are alive at once and nested ones multiply (the one
+  is the alternation's own step in the schema check below, so a chain
+  of one-variant `anyOf`s costs its length there too); a `$ref` its
+  target's width, each def once, a reference back into its own cycle
+  as untyped. Every shape filled to the default (an `enum`, optional
+  and required properties, `anyOf`s of objects and arrays alive through
+  an integer, `anyOf`s nested to multiply), as a tool parameter in
+  every dialect and as structured output, peaks at or under its count:
+  an `enum` exactly, the `anyOf`s at 60–95%, so under 2,048 stacks.
+  Ambiguity *through* recursion — two interchangeable recursive defs
+  doubling at every level of output — is not bounded by the count, only
+  by the matcher's cap, which keeps every way to go on (see Fixed).
+  Agora's widest schema counts 70.
+
+  Every entry point that takes client schemas measures them first.
+  `Session` checks the prompt in every `complete*` call and in
+  `count_tokens` (which renders the schemas, and on the tagged
+  dialects classifies them) against `Session::with_schema_limits`, and
+  the grammars it then compiles are held to those limits too. The
+  public compilers measure against a new `schema_limits` field
+  (default `SchemaLimits::default()`) on their options:
+  `dialect::grammar_source` (`EmitOptions::schema_limits`,
+  `DialectError::SchemaBudget`), `grammar_for_tool_choice` and
+  `deferred_grammar_for_prompt` (`ToolChoiceOptions::schema_limits`,
+  `ToolChoiceError::SchemaBudget`), and `grammar_for_output_config` /
+  `compile_output_config` / `compile_prompt_output_config`
+  (`OutputConfigOptions::schema_limits`,
+  `OutputConfigError::SchemaBudget`); `SchemaLimits::unlimited()` opts
+  out. **Breaking** for code that builds `ToolChoiceOptions` or
+  `OutputConfigOptions` as a full struct literal: add the field or
+  `..Default::default()`. The non-streaming paths now classify a
+  tagged dialect's tools once per call: a stop-sequence cut parses the
+  output prefix after prefix, and each parse used to classify every
+  tool again.
+
+  The pipelines keep their own caps for callers that skip the measure.
+  blallama takes each as a flag (`--schema-max-tools`,
+  `--schema-max-params`, `--schema-max-nodes`, `--schema-max-defs`,
+  `--schema-max-member-bytes`, `--schema-max-total-member-bytes`,
+  `--schema-max-width`, `--schema-max-depth`).
+
+  The depth keeps every constrained value readable. serde_json — and
+  every dialect parser with it — reads at most 127 levels of nesting,
+  and a chain of `$ref`s, one `required` object per def, spells a
+  value of any depth in a request a few levels deep: at 127 levels the
+  schema compiled in every dialect to a grammar whose every value no
+  parser could read back, so each draw failed and the request ended in
+  resampling and a 500. It is counted from the shape: an object or
+  array one level more than its deepest property or `items`, an
+  `anyOf`/`oneOf` variant at its schema's level, an `enum` member or
+  `const` at its own depth as JSON, a `$ref` at its target's depth, one
+  back into its own cycle at none. With the 32 levels an untyped value
+  may add and the call envelope's two, a value inside the default
+  stays under 127.
+
+- **Footprint guards for the schema pipelines and the matcher**
+  (`footprint_guard_pipelines`, `footprint_guard_matcher`, both
+  `#[ignore]`d): the hostile rechecks' probes, committed. Requests at
+  the default schema limits and past them go through the measure,
+  every dialect's compile and grammar parse, a 512-parameter Qwen
+  call's parse, the schema check and the matcher over ~128 KB (~32k
+  tokens) of output; and four adversarial byte streams of up to 128 KB
+  (ambiguous recursion, nested brackets, an array of an `enum` at the
+  width limit, 2,000 optional integers) are fed through the matcher
+  with a filter step over a ~120k-piece synthetic vocabulary every 256
+  bytes. Each step must take under 2 s and the process stay under
+  1.2 GB resident (`ps`, no `unsafe`). They measure the whole process,
+  so they run alone: under nextest in the nightly/GPU window, `cargo
+  nextest run --run-ignored only -E 'test(footprint_guard)'` (or as
+  part of `just test ignored`); CPU only, no model. Measured
+  (2026-10-01, M-series, test profile): at most 52 ms a step but one
+  (a 432 ms filter step 2,560 brackets deep, where the state is past
+  the DFA cache's threshold and runs uncached), 434 MB peak.
+
 - **Constrained output is checked against its schema before it is
   answered** (`SessionError::SchemaViolation`). A finished
   json_schema `output_config` answer must be exactly one JSON document
@@ -1137,6 +1629,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and blallama resamples it on the warm cache like a grammar violation,
   then answers 500 `api_error` — never a 200 carrying the invalid
   value. `SchemaMismatch` / `MismatchKind` are public.
+
+  The check's work is bounded: a step per subschema judged and per
+  `enum` member, distinct `required` name or distinct `type` compared,
+  plus a step per entry of a schema's `required` and `type` arrays the
+  once their names are gathered, at most 2^20 plus 2^14 per JSON value
+  of the output. Inside the schema limits every
+  way a value can be judged — `anyOf` variants tried in turn and nested
+  to multiply, object variants that all declare the property, `enum`
+  members, each alternation itself — is counted by the width (at most
+  2,048), and each def is judged at most twice per value (memoized
+  inside an `anyOf` and out), so a request inside them stays far under
+  the budget: each worst shape filled to the width limit and checked
+  over 2,000 values takes at most ~2,050 steps a value, under 75 ms.
+  Past the budget (a schema past the limits, from a caller that skips
+  the measure) the check stops judging, logs a `schema_check_budget`
+  warning and passes the value, which the grammar already constrained,
+  rather than turning valid output into a resample loop and a 500. A
+  failing `anyOf` variant no longer copies the path or builds its
+  message, and an object's undeclared keys look `required` up in a
+  set.
 - **`BlockStream::violation`**: once drained, a stream reports the
   `GrammarViolation` or `SchemaViolation` the batch path would have
   returned for the same turn, by the same rules (one `TurnContract`

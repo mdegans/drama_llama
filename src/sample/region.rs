@@ -42,6 +42,7 @@
 
 use super::grammar::{
     dfa_cache_enabled, DfaCache, Grammar, StackState, StateId, REJECT_STATE,
+    UNCACHED_STATE,
 };
 use super::json::JsonState;
 use super::state::{DeferredMatcher, MatcherState};
@@ -111,11 +112,20 @@ impl Home {
         HOME_PROBES.iter().find_map(|&c| {
             let s = dfa.transition(grammar, base, c);
             (s != REJECT_STATE
+                && s != UNCACHED_STATE
                 && !dfa.is_complete(s)
                 && dfa.is_permissive(grammar, s)
                 && dfa.transition(grammar, s, c) == s)
                 .then_some(Home::Interned(s))
         })
+    }
+
+    /// The home as a matcher state, for the clone-walk path.
+    fn state(&self, dfa: &DfaCache) -> StackState {
+        match self {
+            Home::Interned(sid) => dfa.state_of(*sid),
+            Home::Stack(state) => state.clone(),
+        }
     }
 
     /// Find the home of the region `matcher` sits in (clone-walk path).
@@ -141,14 +151,20 @@ impl GuardEntry<'_> {
                 grammar,
                 dfa,
                 base: Some(base),
+                matcher,
                 home,
-                ..
             } => {
                 let mut sid = *base;
                 for &b in piece {
                     sid = dfa.transition(grammar, sid, b);
                     if sid == REJECT_STATE {
                         return false;
+                    }
+                    if sid == UNCACHED_STATE {
+                        // The cache is full this step: the same walk on
+                        // the matcher itself.
+                        let home = home.as_ref().map(|h| h.state(dfa));
+                        return walk(grammar, matcher, piece, home.as_ref());
                     }
                     if dfa.is_complete(sid) || !dfa.is_permissive(grammar, sid)
                     {
@@ -159,26 +175,37 @@ impl GuardEntry<'_> {
             }
             GuardEntry::Grammar {
                 grammar,
+                dfa,
                 base: None,
                 matcher,
                 home,
-                ..
             } => {
-                let mut scratch = (*matcher).clone();
-                for &b in piece {
-                    if scratch.feed_byte(grammar, b).is_err() {
-                        return false;
-                    }
-                    if scratch.is_complete() || !scratch.is_permissive(grammar)
-                    {
-                        return true;
-                    }
-                }
-                matches!(home, Some(Home::Stack(h)) if scratch != *h)
+                let home = home.as_ref().map(|h| h.state(dfa));
+                walk(grammar, matcher, piece, home.as_ref())
             }
             GuardEntry::Json { state } => state.exit_protects(piece),
         }
     }
+}
+
+/// The region-exit walk (module docs) on the matcher itself: clone
+/// `matcher` and feed it `piece`, against the region's `home`.
+fn walk(
+    grammar: &Grammar,
+    matcher: &StackState,
+    piece: &[u8],
+    home: Option<&StackState>,
+) -> bool {
+    let mut scratch = matcher.clone();
+    for &b in piece {
+        if scratch.feed_byte(grammar, b).is_err() {
+            return false;
+        }
+        if scratch.is_complete() || !scratch.is_permissive(grammar) {
+            return true;
+        }
+    }
+    home.is_some_and(|h| scratch != *h)
 }
 
 /// The live guard for one sampling step: every active incomplete
@@ -216,14 +243,13 @@ impl<'a, M: Model> ConstraintGuard<'a, M> {
             if stack.is_complete() {
                 return true; // not incomplete — no entry, no veto
             }
-            let (permissive, base) = if cache_on {
-                let sid = compiled.dfa.intern_base(stack);
-                (
-                    compiled.dfa.is_permissive(&compiled.grammar, sid),
-                    Some(sid),
-                )
-            } else {
-                (stack.is_permissive(&compiled.grammar), None)
+            // A base the cache won't hold walks uncached.
+            let base = cache_on
+                .then(|| compiled.dfa.intern_base(stack))
+                .filter(|&sid| sid != UNCACHED_STATE);
+            let permissive = match base {
+                Some(sid) => compiled.dfa.is_permissive(&compiled.grammar, sid),
+                None => stack.is_permissive(&compiled.grammar),
             };
             if !permissive {
                 return false; // structural state vetoes the whole pass
@@ -450,6 +476,55 @@ mod tests {
                 "cached/uncached divergence on token {token} ({piece:?})"
             );
         }
+    }
+
+    /// A cache full for the step answers [`UNCACHED_STATE`] mid-walk;
+    /// the cached walk then finishes on the matcher, against its home,
+    /// and agrees with the uncached walk token for token.
+    #[test]
+    fn full_cache_walk_matches_uncached() {
+        let compiled =
+            CompiledGrammar::parse(STR_GRAMMAR).expect("grammar parses");
+        let mut stack = compiled.root_state();
+        stack.advance_bytes(&compiled.grammar, b"\"x").unwrap();
+        let dfa = DfaCache::new();
+        let sid = dfa.intern_base(&stack);
+        let home = Home::find_interned(&compiled.grammar, &dfa, sid);
+        assert!(home.is_some());
+        dfa.saturate();
+        let cached = GuardEntry::Grammar {
+            grammar: &compiled.grammar,
+            dfa: &dfa,
+            base: Some(sid),
+            matcher: &stack,
+            home,
+        };
+        let uncached = GuardEntry::Grammar {
+            grammar: &compiled.grammar,
+            dfa: &dfa,
+            base: None,
+            matcher: &stack,
+            home: Home::find_stack(&compiled.grammar, &stack),
+        };
+        let mut fell_back = false;
+        for token in 0..PIECES.len() as Token {
+            let piece = PIECES[token as usize].as_bytes();
+            if piece.is_empty() {
+                continue;
+            }
+            fell_back |= piece.iter().try_fold(sid, |s, &b| {
+                match dfa.transition(&compiled.grammar, s, b) {
+                    REJECT_STATE => None,
+                    next => Some(next),
+                }
+            }) == Some(UNCACHED_STATE);
+            assert_eq!(
+                cached.protects(piece),
+                uncached.protects(piece),
+                "cached/uncached divergence on token {token} ({piece:?})"
+            );
+        }
+        assert!(fell_back, "no walk left the cache");
     }
 
     /// Both walks over a region, from `prefix`: (cached, uncached).
