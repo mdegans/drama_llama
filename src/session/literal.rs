@@ -1443,6 +1443,29 @@ mod tests {
         }
     }
 
+    /// A stop that starts inside a real reserved token's piece keeps
+    /// the part before it as text, like any cut: that part is no
+    /// reserved piece, so containment does not count it, though the
+    /// whole token was real. Uncut, the same turn is contained.
+    #[test]
+    fn a_real_token_a_stop_splits_is_not_contained() {
+        let script =
+            [bytes("hello "), vec![TOOL_CALL_END], bytes(" world")].concat();
+        let prompt = |stop: &'static str| Prompt {
+            stop_sequences: Some(vec![stop.into()]),
+            messages: vec![message(crate::Role::User, vec![text("go")])],
+            ..Prompt::default()
+        };
+        let mut s = scripted(script.clone());
+        let blocks = s.complete_blocks(&prompt("ool_")).expect("kept text");
+        assert_eq!(blocks, [text("hello </t")]);
+        let mut s = scripted(script);
+        assert!(matches!(
+            s.complete_blocks(&prompt("absent")),
+            Err(SessionError::EmittedSpecialToken { .. })
+        ));
+    }
+
     /// The auto-tip's hash says the KV is the re-render's tokens. A
     /// spelled piece re-renders spelled, so a turn quoting one keeps
     /// it; a real reserved token in content (emission ban off) is an

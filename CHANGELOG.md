@@ -85,10 +85,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     longer drags the rest of the turn into call syntax; the same goes
     for `output_config`'s `</think>` trigger. A special whose text
     duplicates a reserved piece's (dropped from the reserved set, since
-    the text tokenizes to the other id) is framing too when emitted.
+    the text tokenizes to the other id) is framing too when emitted,
+    and the id-level bans (`ToolChoice::None`'s opener ban, #107's
+    reasoning opener and closer bans) hold it with the reserved id.
     Containment reads the unrestored parse, so it is exact now rather
     than a count, and of a turn a stop sequence cut it reads only what
-    the cut keeps. A spelled piece re-renders byte-identically (it is a
+    the cut keeps. A real token the cut splits (a stop starting inside
+    its piece) is not counted: what stays is the part of the piece
+    before the stop, which is text, not the piece, and the caller sees
+    it as text. A spelled piece re-renders byte-identically (it is a
     content literal on the next ingest), so the auto-tip is
     unaffected; a *real* reserved token left in content (only possible
     with `with_emit_specials_ban(false)`) re-renders spelled, so that
