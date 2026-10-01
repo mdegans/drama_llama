@@ -299,7 +299,7 @@ impl Provenance {
         blocks.into_iter().map(|b| self.restore_block(b)).collect()
     }
 
-    /// A parse of marked text ([`super::parse_text_open`]), restored.
+    /// A parse of marked text ([`super::parse_text_cached`]), restored.
     pub(crate) fn restore_parse(
         &self,
         (parsed, open): (Parsed, Option<OpenCall>),

@@ -152,6 +152,12 @@ pub struct OutputConfigOptions {
     /// for a Gemma 4 or Mistral 4 left their bodies unconstrained. Empty
     /// stands for the default.
     pub thought_close: String,
+    /// The most the schema may measure, checked before anything
+    /// compiles it ([`OutputConfigError::SchemaBudget`]). Default
+    /// [`SchemaLimits::default`](crate::SchemaLimits::default); `Session`
+    /// fills in its own
+    /// ([`Session::with_schema_limits`](crate::Session::with_schema_limits)).
+    pub schema_limits: crate::SchemaLimits,
 }
 
 impl Default for OutputConfigOptions {
@@ -164,6 +170,7 @@ impl Default for OutputConfigOptions {
             thought_open: THINK_OPEN.to_string(),
             thought_close: String::from_utf8_lossy(THINK_CLOSE_TRIGGER)
                 .into_owned(),
+            schema_limits: crate::SchemaLimits::default(),
         }
     }
 }
@@ -387,6 +394,7 @@ pub(crate) fn build_grammar_source(
     opts: &OutputConfigOptions,
     thought_pre_opened: bool,
 ) -> Result<String, OutputConfigError> {
+    crate::schema_budget::check_schemas([], Some(schema), &opts.schema_limits)?;
     let mut src = String::with_capacity(512);
 
     if opts.framing == ResponseFraming::Harmony {
@@ -449,6 +457,7 @@ pub(crate) fn build_json_only_grammar_source(
     schema: &serde_json::Value,
     opts: &OutputConfigOptions,
 ) -> Result<String, OutputConfigError> {
+    crate::schema_budget::check_schemas([], Some(schema), &opts.schema_limits)?;
     let mut src = String::with_capacity(512);
     match opts.framing {
         ResponseFraming::Bare => {
@@ -502,6 +511,10 @@ pub enum OutputConfigError {
     /// The JSON Schema has no grammar: too complex, or unsatisfiable.
     #[error("output_config.format.schema: {0}")]
     Schema(#[from] crate::grammar_compile::SchemaError),
+    /// The schema measures past [`OutputConfigOptions::schema_limits`],
+    /// so nothing compiled it: the request's fault, a 400.
+    #[error("schema limits: {0}")]
+    SchemaBudget(#[from] crate::SchemaBudgetError),
 }
 
 static_assertions::assert_impl_all!(OutputConfigError: Send, Sync);

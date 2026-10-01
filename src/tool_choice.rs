@@ -95,6 +95,10 @@ pub struct ToolChoiceOptions {
     /// required fields under sampling pressure (observed: Cogito
     /// emitting `{"comment": "…"}` when `reply_to` was required).
     pub strict_schema: bool,
+    /// The most the tools' schemas may measure, checked before anything
+    /// compiles them ([`ToolChoiceError::SchemaBudget`]). Default
+    /// [`SchemaLimits::default`](crate::SchemaLimits::default).
+    pub schema_limits: crate::SchemaLimits,
 }
 
 impl Default for ToolChoiceOptions {
@@ -109,6 +113,7 @@ impl Default for ToolChoiceOptions {
             arguments_field: "arguments",
             wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
             strict_schema: true,
+            schema_limits: crate::SchemaLimits::default(),
         }
     }
 }
@@ -312,6 +317,11 @@ pub(crate) fn build_grammar_source(
     opts: &ToolChoiceOptions,
     shape: RootShape,
 ) -> Result<String, ToolChoiceError> {
+    crate::schema_budget::check_schemas(
+        tools.iter().copied(),
+        None,
+        &opts.schema_limits,
+    )?;
     let mut src = String::with_capacity(1024);
 
     // Root rule: reasoning prefix per `shape`, then the (optionally
@@ -445,6 +455,11 @@ pub enum ToolChoiceError {
         #[source]
         source: crate::grammar_compile::SchemaError,
     },
+    /// The tools' schemas measure past
+    /// [`ToolChoiceOptions::schema_limits`], so nothing compiled them:
+    /// the request's fault, a 400.
+    #[error("schema limits: {0}")]
+    SchemaBudget(#[from] crate::SchemaBudgetError),
 }
 
 static_assertions::assert_impl_all!(ToolChoiceError: Send, Sync);
@@ -496,6 +511,7 @@ mod tests {
             arguments_field: "parameters",
             wrap_tags: None,
             strict_schema: false,
+            schema_limits: crate::SchemaLimits::default(),
         }
     }
 

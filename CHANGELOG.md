@@ -920,6 +920,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by the matcher's cap, which keeps every way to go on (see Fixed).
   Agora's widest schema counts 70.
 
+  Every entry point that takes client schemas measures them first.
+  `Session` checks the prompt in every `complete*` call and in
+  `count_tokens` (which renders the schemas, and on the tagged
+  dialects classifies them) against `Session::with_schema_limits`, and
+  the grammars it then compiles are held to those limits too. The
+  public compilers measure against a new `schema_limits` field
+  (default `SchemaLimits::default()`) on their options:
+  `dialect::grammar_source` (`EmitOptions::schema_limits`,
+  `DialectError::SchemaBudget`), `grammar_for_tool_choice` and
+  `deferred_grammar_for_prompt` (`ToolChoiceOptions::schema_limits`,
+  `ToolChoiceError::SchemaBudget`), and `grammar_for_output_config` /
+  `compile_output_config` / `compile_prompt_output_config`
+  (`OutputConfigOptions::schema_limits`,
+  `OutputConfigError::SchemaBudget`); `SchemaLimits::unlimited()` opts
+  out. **Breaking** for code that builds `ToolChoiceOptions` or
+  `OutputConfigOptions` as a full struct literal: add the field or
+  `..Default::default()`. The non-streaming paths now classify a
+  tagged dialect's tools once per call: a stop-sequence cut parses the
+  output prefix after prefix, and each parse used to classify every
+  tool again.
+
   The pipelines keep their own caps for callers that skip the measure.
   blallama takes each as a flag (`--schema-max-tools`,
   `--schema-max-params`, `--schema-max-nodes`, `--schema-max-defs`,

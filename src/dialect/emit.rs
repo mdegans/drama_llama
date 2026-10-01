@@ -93,6 +93,10 @@ pub enum DialectError {
         #[source]
         source: SchemaError,
     },
+    /// The tools' schemas measure past [`EmitOptions::schema_limits`],
+    /// so nothing compiled them: the request's fault, a 400.
+    #[error("schema limits: {0}")]
+    SchemaBudget(#[from] crate::SchemaBudgetError),
 }
 
 /// Tag a tool's [`SchemaError`] with the tool's name.
@@ -130,6 +134,12 @@ pub struct EmitOptions {
     /// Allow more than one call per turn. Gated on the caller's
     /// parallel-tool-calls setting.
     pub parallel: bool,
+    /// The most the tools' schemas may measure, checked before anything
+    /// classifies or compiles them ([`DialectError::SchemaBudget`]).
+    /// Default [`SchemaLimits::default`](crate::SchemaLimits::default);
+    /// `Session` passes its own
+    /// ([`Session::with_schema_limits`](crate::Session::with_schema_limits)).
+    pub schema_limits: crate::SchemaLimits,
 }
 
 impl Default for EmitOptions {
@@ -137,12 +147,14 @@ impl Default for EmitOptions {
         Self {
             anchor: Anchor::Eager,
             parallel: false,
+            schema_limits: crate::SchemaLimits::default(),
         }
     }
 }
 
 /// Build the GBNF source constraining generation to `syntax`'s call
-/// shape over `tools`.
+/// shape over `tools`, once their schemas measure inside
+/// [`EmitOptions::schema_limits`].
 pub fn grammar_source(
     syntax: &CallSyntax,
     tools: &[&Tool],
@@ -151,6 +163,11 @@ pub fn grammar_source(
     if syntax.family == Family::None {
         return Err(DialectError::NoToolFormat);
     }
+    crate::schema_budget::check_schemas(
+        tools.iter().copied(),
+        None,
+        &opts.schema_limits,
+    )?;
     if syntax.family == Family::Harmony {
         // The channel-block structure doesn't decompose into the
         // generic section/per-call root below — hand-built, like the

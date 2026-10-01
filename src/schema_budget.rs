@@ -31,6 +31,15 @@
 //!
 //! The defaults ([`SchemaLimits::default`]) leave real schemas far
 //! inside every limit: see each field for what was measured.
+//!
+//! Every entry point that takes client schemas measures them first:
+//! [`Session`](crate::Session)'s `complete*` calls and
+//! [`count_tokens`](crate::Session::count_tokens) against
+//! [`Session::with_schema_limits`](crate::Session::with_schema_limits),
+//! and the public compilers —
+//! [`dialect::grammar_source`](crate::dialect::grammar_source),
+//! [`grammar_for_tool_choice`](crate::grammar_for_tool_choice) and the
+//! `output_config` ones — against their options' `schema_limits`.
 
 use std::collections::{BTreeMap, HashMap};
 

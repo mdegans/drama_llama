@@ -2444,6 +2444,7 @@ mod tests {
                 &EmitOptions {
                     anchor: Anchor::Lazy,
                     parallel: false,
+                    ..Default::default()
                 },
             )
             .expect("emit");
@@ -2641,11 +2642,16 @@ mod tests {
     }
 
     /// Whether `tool`'s Qwen XML grammar admits `emission` whole.
+    /// Unmeasured ([`crate::SchemaLimits::unlimited`]): the callers
+    /// are about the grammar, some of them past the limits on purpose.
     fn qwen_admits(tool: &Tool, emission: &str) -> bool {
         let source = crate::dialect::grammar_source(
             &CallSyntax::qwen_xml(),
             &[tool],
-            &crate::dialect::EmitOptions::default(),
+            &crate::dialect::EmitOptions {
+                schema_limits: crate::SchemaLimits::unlimited(),
+                ..Default::default()
+            },
         )
         .expect("grammar");
         let mut state =
@@ -2685,6 +2691,38 @@ mod tests {
         assert!(first.is_some(), "never classified");
         let calls = calls_of(&blocks);
         assert_eq!(calls[0].1, &json!({"mode": "fast"}));
+    }
+
+    /// A stop cut parses the output prefix after prefix, each a fresh
+    /// parse; lent one [`Spellings`] (as `Session` does, per call) they
+    /// classify each tool once between them.
+    #[test]
+    fn cached_parses_share_one_classification() {
+        let tool = mode_tool(json!({"enum": ["fast", "slow"]}), None);
+        let call = qwen_mode_call("fast");
+        let mut spellings = Spellings::new();
+        let mut first: Option<Arc<HashMap<String, TaggedValue>>> = None;
+        for end in (1..=call.len()).filter(|&i| call.is_char_boundary(i)) {
+            let (parsed, _) = parse_text_cached(
+                &CallSyntax::qwen_xml(),
+                &[&tool],
+                &call[..end],
+                false,
+                Leniency::Clipped,
+                &mut spellings,
+            );
+            if let Some(s) = spellings.get(&0) {
+                let first = first.get_or_insert_with(|| s.clone());
+                assert!(Arc::ptr_eq(first, s), "reclassified at {end}");
+            }
+            if end == call.len() {
+                assert_eq!(
+                    calls_of(&parsed.blocks)[0].1,
+                    &json!({"mode": "fast"})
+                );
+            }
+        }
+        assert!(first.is_some(), "never classified");
     }
 
     /// A strict `set_mode` tool whose one required parameter is `mode`.
@@ -3097,6 +3135,7 @@ mod tests {
         let options = EmitOptions {
             anchor: Anchor::Lazy,
             parallel: false,
+            ..Default::default()
         };
         for (case, (schema, valid, invalid)) in
             [("tree", tree), ("mutual", mutual), ("aliases", aliases)]
@@ -3905,6 +3944,7 @@ mod tests {
                 &EmitOptions {
                     anchor: Anchor::Lazy,
                     parallel: false,
+                    ..Default::default()
                 },
             )
             .expect("emit");
@@ -3948,6 +3988,7 @@ mod tests {
             &EmitOptions {
                 anchor: Anchor::Eager,
                 parallel: true,
+                ..Default::default()
             },
         )
         .expect("emit");
@@ -4608,6 +4649,7 @@ mod tests {
             &EmitOptions {
                 anchor: Anchor::Lazy,
                 parallel: false,
+                ..Default::default()
             },
         )
         .expect("emit lazy");
@@ -4643,6 +4685,7 @@ mod tests {
             &EmitOptions {
                 anchor: Anchor::Eager,
                 parallel: false,
+                ..Default::default()
             },
         )
         .expect("emit eager");
@@ -4696,6 +4739,7 @@ mod tests {
                 &EmitOptions {
                     anchor,
                     parallel: false,
+                    ..Default::default()
                 },
             )
             .expect("emit eager");
@@ -4770,6 +4814,7 @@ mod tests {
                 &EmitOptions {
                     anchor: Anchor::Eager,
                     parallel: true,
+                    ..Default::default()
                 },
             )
             .unwrap_or_else(|e| panic!("{name}: {e}"));

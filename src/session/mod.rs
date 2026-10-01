@@ -3734,8 +3734,11 @@ impl<B: Backend> Session<B> {
     /// The most a request's client-supplied schemas — every custom
     /// tool's `input_schema`, an `output_config` `json_schema` — may
     /// measure before this session compiles them. A prompt past any of
-    /// them fails up front with [`SessionError::SchemaBudget`], before
-    /// rendering or compiling anything. Defaults to
+    /// them fails up front with [`SessionError::SchemaBudget`] — from
+    /// every `complete*` call and [`Self::count_tokens`] — before
+    /// rendering or compiling anything, and the grammars the session
+    /// compiles are held to these limits, not the library default (the
+    /// options' `schema_limits`). Defaults to
     /// [`SchemaLimits::default`](crate::SchemaLimits::default), generous
     /// for real tools; see [`crate::schema_budget`].
     pub fn with_schema_limits(mut self, limits: crate::SchemaLimits) -> Self {
@@ -4496,6 +4499,9 @@ impl<B: Backend> Session<B> {
         prompt: &Prompt,
     ) -> Result<usize, SessionError> {
         self.check_no_open_thought(prompt)?;
+        // The render writes the tools' schemas, and the tagged dialects
+        // classify them: measured first, as for a completion.
+        crate::schema_budget::check_prompt(prompt, &self.schema_limits)?;
         let media = self.call_context(prompt)?;
         let (rendered, neutralized) = self
             .template
@@ -4920,10 +4926,14 @@ impl<B: Backend> Session<B> {
         // further shape the distribution. A deferred grammar is carried
         // separately (not in `modes`) — it stays suspended until
         // `TokenPredictor` sees its trigger in the output.
+        let output_config_opts = OutputConfigOptions {
+            schema_limits: self.schema_limits,
+            ..self.output_config_opts.clone()
+        };
         let (grammar_mode, deferred) = match resolve_grammar(
             prompt,
             &self.dialect,
-            &self.output_config_opts,
+            &output_config_opts,
             render_ends_with_open_reasoning(&rendered, &self.dialect)
                 || prompt_resumes_open_reasoning(prompt, &self.dialect),
         )? {
@@ -5313,6 +5323,7 @@ impl<B: Backend> Session<B> {
         let output_config_opts = OutputConfigOptions {
             phase_split: self.output_config_opts.phase_split
                 && !reasoning_closed_by_render,
+            schema_limits: self.schema_limits,
             ..self.output_config_opts.clone()
         };
         let (grammar_mode, deferred_grammar) = match resolve_grammar(
@@ -6670,13 +6681,18 @@ impl<B: Backend> Session<B> {
         });
         if let Some(hit) = hit {
             let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
+            // The cut parses prefix after prefix: the tools are
+            // classified once for all of them.
+            let spellings =
+                std::cell::RefCell::new(crate::dialect::Spellings::new());
             let parse = |text: &str| {
-                crate::dialect::parse_text_open(
+                crate::dialect::parse_text_cached(
                     &parse_syntax,
                     &tool_refs,
                     text,
                     pre_opened_reasoning,
                     crate::dialect::Leniency::Clipped,
+                    &mut spellings.borrow_mut(),
                 )
             };
             if let (_, Some(at)) =
@@ -7232,13 +7248,18 @@ impl<B: Backend> Session<B> {
         // spelled is text, never framing. `marked` keeps that parse
         // unrestored for containment, which reads provenance off it.
         let tool_refs: Vec<&Tool> = parse_tools.iter().collect();
+        // Every parse below (a stop cut parses prefix after prefix)
+        // shares one classification of the tools.
+        let spellings =
+            std::cell::RefCell::new(crate::dialect::Spellings::new());
         let parse = |leniency| {
-            crate::dialect::parse_text_open(
+            crate::dialect::parse_text_cached(
                 &parse_syntax,
                 &tool_refs,
                 &marked_text,
                 pre_opened_reasoning,
                 leniency,
+                &mut spellings.borrow_mut(),
             )
         };
         // A stop sequence (#122): the one the filter stopped on, or —
@@ -7254,12 +7275,13 @@ impl<B: Backend> Session<B> {
             // Its KV no longer matches the output either way.
             Some(stop) => {
                 let clipped = |text: &str| {
-                    crate::dialect::parse_text_open(
+                    crate::dialect::parse_text_cached(
                         &parse_syntax,
                         &tool_refs,
                         text,
                         pre_opened_reasoning,
                         crate::dialect::Leniency::Clipped,
+                        &mut spellings.borrow_mut(),
                     )
                 };
                 let (blocks, at) = stop::marked_stop_cut(
@@ -7977,6 +7999,7 @@ fn dialect_grammar_for_prompt(
     prompt: &Prompt,
     dialect: &crate::CallSyntax,
     thought_pre_opened: bool,
+    schema_limits: &crate::SchemaLimits,
 ) -> Result<Option<SamplingMode>, SessionError> {
     use crate::dialect::{Anchor, EmitOptions};
     let Some(choice) = prompt.tool_choice.as_ref() else {
@@ -8029,6 +8052,7 @@ fn dialect_grammar_for_prompt(
         // section-only dialects (Hermes) stay single-call regardless
         // of the wire flag.
         parallel: parallel && !syntax.per_call_start.is_empty(),
+        schema_limits: *schema_limits,
     };
     let source = crate::dialect::grammar_source(&syntax, &chosen, &opts)?;
     let mode = SamplingMode::grammar(&source).map_err(ToolChoiceError::from)?;
@@ -8047,6 +8071,7 @@ fn dialect_grammar_for_prompt(
 fn dialect_deferred_grammar_for_prompt(
     prompt: &Prompt,
     dialect: &crate::CallSyntax,
+    schema_limits: &crate::SchemaLimits,
 ) -> Result<Option<crate::DeferredGrammar>, SessionError> {
     use crate::dialect::{Anchor, EmitOptions};
     let disable_parallel = match prompt.tool_choice.as_ref() {
@@ -8080,6 +8105,7 @@ fn dialect_deferred_grammar_for_prompt(
     let opts = EmitOptions {
         anchor: Anchor::Lazy,
         parallel: !disable_parallel && !syntax.per_call_start.is_empty(),
+        schema_limits: *schema_limits,
     };
     let chosen: Vec<&Tool> = tools.iter().collect();
     let source = crate::dialect::grammar_source(&syntax, &chosen, &opts)?;
@@ -8270,9 +8296,12 @@ fn resolve_grammar(
             "resolve_grammar: input",
         );
     }
-    if let Some(g) =
-        dialect_grammar_for_prompt(prompt, dialect, thought_pre_opened)?
-    {
+    if let Some(g) = dialect_grammar_for_prompt(
+        prompt,
+        dialect,
+        thought_pre_opened,
+        &output_config_opts.schema_limits,
+    )? {
         #[cfg(feature = "axum")]
         tracing::debug!(
             target: "drama_llama::session",
@@ -8321,7 +8350,11 @@ fn resolve_grammar(
     // output_config outranks the speculative auto grammar (only one
     // deferred slot exists, and output_config is the caller's direct
     // ask).
-    if let Some(d) = dialect_deferred_grammar_for_prompt(prompt, dialect)? {
+    if let Some(d) = dialect_deferred_grammar_for_prompt(
+        prompt,
+        dialect,
+        &output_config_opts.schema_limits,
+    )? {
         #[cfg(feature = "axum")]
         tracing::debug!(
             target: "drama_llama::session",
@@ -11765,6 +11798,7 @@ mod tests {
             }),
             &dialect,
             false,
+            &crate::SchemaLimits::default(),
         )
         .expect("compiles")
         .expect("forced grammar");
@@ -11773,6 +11807,7 @@ mod tests {
                 disable_parallel_tool_use: true,
             }),
             &dialect,
+            &crate::SchemaLimits::default(),
         )
         .expect("compiles")
         .expect("lazy grammar");
@@ -14133,6 +14168,89 @@ mod tests {
             assert_eq!(field(fields, "diverge_at"), Some("500"));
         }
         assert_eq!(field(&events[0].1, "lost_tokens"), Some("939"));
+    }
+
+    /// A tool past the default limits (600 top-level properties), as
+    /// the forced call a prompt asks for.
+    fn over_the_limits_prompt() -> Prompt {
+        let props: serde_json::Map<String, serde_json::Value> = (0..600)
+            .map(|i| (format!("p{i}"), serde_json::json!({"type": "integer"})))
+            .collect();
+        let tool = Tool::builder("wide")
+            .description("Too many parameters.")
+            .schema(serde_json::json!({"type": "object", "properties": props}))
+            .build()
+            .expect("valid tool");
+        Prompt {
+            tools: Some(vec![tool.into()]),
+            tool_choice: Some(ToolChoice::Any {
+                disable_parallel_tool_use: true,
+            }),
+            ..Prompt::default()
+        }
+        .add_message((misanthropic::prompt::message::Role::User, "hi"))
+        .expect("a user turn")
+    }
+
+    /// `count_tokens` renders the tools' schemas, so it measures them
+    /// first, like a completion: past the session's limits it is the
+    /// same 400, before any render; inside them it counts.
+    #[test]
+    fn count_tokens_measures_the_schemas_first() {
+        let prompt = over_the_limits_prompt();
+        let mut session = mock::session(&[]);
+        for error in [
+            session.count_tokens(&prompt).unwrap_err(),
+            session.complete_response(&prompt).unwrap_err(),
+        ] {
+            let SessionError::SchemaBudget(e) = error else {
+                panic!("{error}");
+            };
+            assert_eq!(e.limit, crate::schema_budget::SchemaLimit::Params);
+        }
+        let mut session = mock::session(&[])
+            .with_schema_limits(crate::SchemaLimits::unlimited());
+        assert!(session.count_tokens(&prompt).expect("counts") > 0);
+    }
+
+    /// The grammar a session compiles is held to the session's limits,
+    /// not the library default: lifted, a request past the default
+    /// compiles; at the default, the compile itself refuses it.
+    #[test]
+    fn resolve_grammar_compiles_under_the_sessions_limits() {
+        let prompt = over_the_limits_prompt();
+        let dialect = crate::CallSyntax::qwen_xml();
+        let opts = |schema_limits| OutputConfigOptions {
+            schema_limits,
+            ..OutputConfigOptions::default()
+        };
+        let lifted = resolve_grammar(
+            &prompt,
+            &dialect,
+            &opts(crate::SchemaLimits::unlimited()),
+            false,
+        )
+        .expect("compiles past the default limits");
+        assert!(matches!(
+            lifted,
+            Some(crate::CompiledOutputConfig::Single(_))
+        ));
+        let refused = resolve_grammar(
+            &prompt,
+            &dialect,
+            &opts(crate::SchemaLimits::default()),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                SessionError::Dialect(
+                    crate::dialect::DialectError::SchemaBudget(_)
+                )
+            ),
+            "{refused}"
+        );
     }
 
     /// The divergence context: shared text before, then each side.

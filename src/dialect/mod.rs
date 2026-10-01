@@ -29,8 +29,10 @@ pub use emit::{
     grammar_source, render_reference, validate_representable, Anchor,
     DialectError, EmitOptions,
 };
+#[cfg(test)]
+pub(crate) use parse::parse_text_open;
 pub use parse::{parse_text, Leniency, ParseStatus, Parsed, StreamParser};
-pub(crate) use parse::{parse_text_open, OpenCall};
+pub(crate) use parse::{parse_text_cached, OpenCall, Spellings};
 pub(crate) use partial::cut_value;
 pub use partial::truncate_partial_object;
 pub(crate) use provenance::Provenance;

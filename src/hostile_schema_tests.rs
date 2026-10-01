@@ -54,6 +54,16 @@ fn lazy() -> EmitOptions {
     EmitOptions {
         anchor: Anchor::Lazy,
         parallel: false,
+        ..Default::default()
+    }
+}
+
+/// [`lazy`] without the up-front measure ([`SchemaLimits::unlimited`]):
+/// a caller that skips it, whom the pipelines' own caps still bound.
+fn unmeasured() -> EmitOptions {
+    EmitOptions {
+        schema_limits: SchemaLimits::unlimited(),
+        ..lazy()
     }
 }
 
@@ -106,9 +116,12 @@ fn qwen_writes_each_def_once_per_tool() {
         .collect();
     defs.insert(format!("D{d}"), json!({"type": "integer"}));
     let schema = json!({"type": "object", "properties": props, "$defs": defs});
-    let src =
-        grammar_source(&CallSyntax::qwen_xml(), &[&tool(schema)], &lazy())
-            .unwrap();
+    let src = grammar_source(
+        &CallSyntax::qwen_xml(),
+        &[&tool(schema)],
+        &unmeasured(),
+    )
+    .unwrap();
     assert!(src.len() < 1 << 20, "{} bytes", src.len());
     for i in 0..=d {
         let head = format!("tool_0__def{i}_D{i} ::=");
@@ -130,8 +143,8 @@ fn qwen_many_params_and_defs_compile_and_parse_quickly() {
     let tool =
         tool(json!({"type": "object", "properties": props, "$defs": defs}));
     let start = Instant::now();
-    let src =
-        grammar_source(&CallSyntax::qwen_xml(), &[&tool], &lazy()).unwrap();
+    let src = grammar_source(&CallSyntax::qwen_xml(), &[&tool], &unmeasured())
+        .unwrap();
     Grammar::parse(&src).unwrap();
 
     let params: String = (0..n)
@@ -208,7 +221,7 @@ fn tagged_budget_agrees_between_grammar_and_parser() {
     assert!(matches!(values[99].1, TaggedValue::Json));
 
     let tool = tool(schema);
-    let src = grammar_source(&syntax, &[&tool], &lazy()).unwrap();
+    let src = grammar_source(&syntax, &[&tool], &unmeasured()).unwrap();
     let (first, last) = (format!("{pad}0_7"), format!("{pad}99_7"));
     let quoted = format!("\"{last}\"");
     let raw_then_json = qwen_call(&[("p0", &first), ("p99", &quoted)]);
@@ -254,7 +267,7 @@ fn qwen_shared_def_is_classified_and_written_once() {
         }
     }
     let tool = tool(schema);
-    let src = grammar_source(&syntax, &[&tool], &lazy()).unwrap();
+    let src = grammar_source(&syntax, &[&tool], &unmeasured()).unwrap();
     assert_eq!(src.matches(member.as_str()).count(), 1);
     Grammar::parse(&src).unwrap();
     let text = qwen_call(&[("p0", &member), ("p1999", &member)]);
@@ -283,7 +296,7 @@ fn qwen_shared_object_def_is_compiled_once() {
         .iter()
         .all(|(_, v)| *v == TaggedValue::Json));
     let tool = tool(schema);
-    let src = grammar_source(&syntax, &[&tool], &lazy()).unwrap();
+    let src = grammar_source(&syntax, &[&tool], &unmeasured()).unwrap();
     assert_eq!(src.matches(long.as_str()).count(), 1);
     let value = format!(r#"{{"k":"{long}"}}"#);
     let text = qwen_call(&[("p7", &value)]);
@@ -456,19 +469,34 @@ fn hostile_requests_are_refused_up_front() {
     }
 }
 
-/// A schema too complex for a grammar is a schema error on every path
-/// a client reaches — each dialect, strict `tool_choice`, and
-/// `output_config` — never a half-gigabyte grammar.
+/// A schema too complex for a grammar never reaches a compiler from a
+/// public entry point: each one — every dialect's `grammar_source`,
+/// strict `tool_choice`, `output_config`, unified and phase-split —
+/// measures it against its options' [`SchemaLimits`] first and refuses
+/// it as a budget error. A caller that lifts the limits gets a schema
+/// error from the compiler's own caps instead — never a half-gigabyte
+/// grammar.
 #[test]
 fn too_complex_schema_fails_cleanly_everywhere() {
+    use crate::output_config::compile_output_config;
     let n = 400_000;
     let props: Map<String, Value> =
         (0..n).map(|i| (format!("p{i}"), json!({}))).collect();
     let schema = json!({"type": "object", "properties": props});
     let tool = tool(schema.clone());
+    let config = OutputConfig::json_schema(schema);
+    let unlimited = SchemaLimits::unlimited();
+    // Phase-split needs a trigger it is sure of: a pre-opened thought.
+    let split = OutputConfigOptions::default();
     for syntax in syntaxes() {
         let family = syntax.family;
         match grammar_source(&syntax, &[&tool], &lazy()) {
+            Err(DialectError::SchemaBudget(e)) => {
+                assert_eq!(e.limit, SchemaLimit::Nodes, "{family:?}")
+            }
+            other => panic!("{family:?}: {:?}", other.map(|s| s.len())),
+        }
+        match grammar_source(&syntax, &[&tool], &unmeasured()) {
             Err(DialectError::Schema {
                 source: SchemaError::TooComplex { what, limit },
                 ..
@@ -480,23 +508,51 @@ fn too_complex_schema_fails_cleanly_everywhere() {
             other => panic!("{family:?}: {:?}", other.map(|s| s.len())),
         }
     }
-    let err = grammar_for_tool_choice(
-        &ToolChoice::any(),
-        &[tool],
-        &ToolChoiceOptions::default(),
-        false,
-    )
-    .unwrap_err();
+    let choice = |schema_limits| {
+        grammar_for_tool_choice(
+            &ToolChoice::any(),
+            std::slice::from_ref(&tool),
+            &ToolChoiceOptions {
+                schema_limits,
+                ..ToolChoiceOptions::default()
+            },
+            false,
+        )
+        .unwrap_err()
+    };
+    let err = choice(SchemaLimits::default());
+    assert!(matches!(err, ToolChoiceError::SchemaBudget(_)), "{err}");
+    let err = choice(unlimited);
     assert!(matches!(err, ToolChoiceError::Schema { .. }), "{err}");
     assert!(err.to_string().contains("too complex"), "{err}");
-    let err = grammar_for_output_config(
-        &OutputConfig::json_schema(schema),
-        &OutputConfigOptions::default(),
-        false,
-    )
-    .unwrap_err();
-    assert!(matches!(err, OutputConfigError::Schema(_)), "{err}");
-    assert!(err.to_string().contains("too complex"), "{err}");
+    let output = |schema_limits| OutputConfigOptions {
+        schema_limits,
+        ..split.clone()
+    };
+    for pre_opened in [false, true] {
+        let err = grammar_for_output_config(
+            &config,
+            &output(SchemaLimits::default()),
+            pre_opened,
+        )
+        .unwrap_err();
+        assert!(matches!(err, OutputConfigError::SchemaBudget(_)), "{err}");
+        let Err(err) = compile_output_config(
+            &config,
+            &output(SchemaLimits::default()),
+            pre_opened,
+        ) else {
+            panic!("compiled");
+        };
+        assert!(matches!(err, OutputConfigError::SchemaBudget(_)), "{err}");
+        let Err(err) =
+            compile_output_config(&config, &output(unlimited), pre_opened)
+        else {
+            panic!("compiled");
+        };
+        assert!(matches!(err, OutputConfigError::Schema(_)), "{err}");
+        assert!(err.to_string().contains("too complex"), "{err}");
+    }
 }
 
 /// `{"enum": []}` admits nothing: a schema error on every path, not a
