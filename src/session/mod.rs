@@ -110,7 +110,8 @@
 //! Every reuse decision is logged through `tracing`, under two targets:
 //! `drama_llama::session` for everything the session decides and
 //! `drama_llama::snapshot_store` for snapshots the backend's store drops
-//! at its cap. One `event = "cache_reuse"` per call — `hit` with its
+//! at its cap or declines to take (`checkpoint_skipped`). One `event =
+//! "cache_reuse"` per call — `hit` with its
 //! `source` (`tip`, `breakpoint`, `lookback`, `hash`) and token counts,
 //! at `DEBUG` since a hit is the normal case, or `miss` with its
 //! `reason` — and an `event = "cache_degrade"` or `"cache_evict"` for
@@ -13843,6 +13844,8 @@ mod tests {
             pub(super) missing: Vec<i32>,
             /// Every `(seq, pos)` restore asked for, in order.
             pub(super) restores: Vec<(i32, i32)>,
+            /// Every `(seq, pos)` checkpoint asked for, in order.
+            pub(super) checkpoints: Vec<(i32, i32)>,
             /// The tokens a generation emits, in order, then EOS. Empty:
             /// flat logits, and no KV extent reported (`-1`).
             pub(super) script: Vec<Token>,
@@ -13918,7 +13921,9 @@ mod tests {
                     self.kv_end as i32 - 1
                 }
             }
-            fn checkpoint_pos(&mut self, _: i32, _: i32) {}
+            fn checkpoint_pos(&mut self, seq_id: i32, pos: i32) {
+                self.checkpoints.push((seq_id, pos));
+            }
             fn restore_to(
                 &mut self,
                 seq_id: i32,
@@ -14101,6 +14106,108 @@ mod tests {
         assert_eq!(*level, tracing::Level::DEBUG);
         assert_eq!(field(hit, "source"), Some("breakpoint"));
         assert_eq!(field(hit, "reused_tokens"), Some("60"));
+    }
+
+    /// The live gpt-oss shape (2026-10-01): the best rung is a render
+    /// hash hit whose checkpoint is missing. The ladder must land on
+    /// the anchor below it that the prompt still shares — never on a
+    /// full re-prefill while one is there — and say what the fall cost.
+    #[test]
+    fn a_hash_hit_without_a_checkpoint_falls_to_the_anchor_below() {
+        let mut session = mock::session(&[100]);
+        let h100 = hash_partial_text("system, tools and the first turns");
+        seat_slot(
+            &mut session,
+            hashed_slot(140, vec![bp(60, None), bp(100, Some(h100))], None),
+        );
+        let new_entries = seq_entries(130);
+        let (new_eps, new_hashes) = new_bps(&[(100, h100)]);
+
+        let mut result = None;
+        let events = capture_events(|| {
+            result = Some(
+                session
+                    .kv_setup_and_chunk_prefill(
+                        &new_entries,
+                        &new_eps,
+                        &new_hashes,
+                        &Default::default(),
+                        0,
+                    )
+                    .expect("kv setup"),
+            );
+        });
+        let (_, cache_read, prefill_start, _, _) = result.unwrap();
+        assert_eq!(session.engine.decoder.restores, [(0, 100), (0, 60)]);
+        // Reused to 60, then prefilled past the marker at 100 — which
+        // is checkpointed again on the way, so it holds next time.
+        assert_eq!((cache_read, prefill_start), (60, 100));
+        assert_eq!(session.engine.decoder.checkpoints, [(0, 100)]);
+        let failed = events
+            .iter()
+            .find(|(_, f)| field(f, "reason") == Some("restore_failed"))
+            .map(|(_, f)| f)
+            .expect("the failed rung is logged");
+        assert_eq!(field(failed, "source"), Some("hash"));
+        assert_eq!(field(failed, "fallback_entry"), Some("60"));
+        assert_eq!(field(failed, "lost_tokens"), Some("40"));
+    }
+
+    /// The anchors a call leaves — its breakpoints, crossed by the
+    /// prefill, and the tip at the head after generation — are exactly
+    /// the rungs the next call's ladder can ask for, so each must have
+    /// been checkpointed. On a dense model that is a no-op; on a
+    /// sliding-window or recurrent one an anchor without a checkpoint
+    /// cannot be restored at all. And the next call's restore lands on
+    /// one of them.
+    #[test]
+    fn every_anchor_a_call_leaves_is_checkpointed() {
+        let mut session = mock::scripted("Seven.");
+        let prompt = Prompt::default()
+            .system("You are terse.")
+            .cache()
+            .add_message((crate::Role::User, "Pick a number."))
+            .unwrap()
+            .cache();
+        let anchors = |session: &Session<mock::MockBackend>| {
+            let cache = session.prefix_cache.as_ref().expect("cache on");
+            let slot = cache.last_slot().expect("a recorded slot");
+            let mut anchors: Vec<(i32, i32)> = slot
+                .breakpoints
+                .iter()
+                .chain(slot.tip.as_ref())
+                .map(|bp| (slot.seq_id, bp.at.pos as i32))
+                .collect();
+            anchors.sort();
+            anchors
+        };
+
+        let first = session.complete_response(&prompt).expect("first");
+        let left = anchors(&session);
+        assert_eq!(left.len(), 3, "two markers and a tip: {left:?}");
+        let taken = &session.engine.decoder.checkpoints;
+        assert!(
+            left.iter().all(|a| taken.contains(a)),
+            "anchors {left:?}, checkpoints {taken:?}",
+        );
+
+        let reply: crate::prompt::Message = first.inner.into();
+        let next = prompt
+            .add_message(reply)
+            .unwrap()
+            .add_message((crate::Role::User, "Another."))
+            .unwrap()
+            .cache();
+        session.complete_response(&next).expect("second");
+        let restores = &session.engine.decoder.restores;
+        assert_eq!(restores.len(), 1, "one rung, and it held");
+        assert!(left.contains(&restores[0]), "{restores:?} not in {left:?}");
+        let left = anchors(&session);
+        let taken = &session.engine.decoder.checkpoints;
+        assert!(
+            left.iter().all(|a| taken.contains(a)),
+            "anchors {left:?}, checkpoints {taken:?}",
+        );
     }
 
     /// The empty-suffix backoff: a hash hit covering the whole prompt

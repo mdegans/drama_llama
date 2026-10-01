@@ -412,8 +412,9 @@ struct Rig {
     /// CPU-resident weights on the GPU.
     op_offload: bool,
     force_snapshots: bool,
-    /// Whether the model takes sequence snapshots without forcing — a
-    /// hybrid or recurrent model, which `restore_to` cannot truncate.
+    /// Whether the model takes sequence checkpoints without forcing — a
+    /// sliding-window, hybrid or recurrent model, which a KV truncate
+    /// alone cannot always rewind.
     native_snapshots: bool,
     continue_tokens: usize,
 }
@@ -579,8 +580,9 @@ impl Rig {
             "rewind       : {}",
             match (self.native_snapshots, self.force_snapshots) {
                 (true, _) => {
-                    "restore_to reloads sequence snapshots (hybrid/recurrent \
-                     model refuses a KV truncate)"
+                    "restore_to reloads partial checkpoints when a KV \
+                     truncate cannot rewind (sliding-window, hybrid or \
+                     recurrent model)"
                 }
                 (false, true) => {
                     "restore_to truncates the KV (pure attention); \

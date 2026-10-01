@@ -1,11 +1,12 @@
 use derive_more::From;
 use llama_cpp_sys_3::{
     llama_model, llama_model_default_params, llama_model_desc,
-    llama_model_free, llama_model_get_vocab, llama_model_load_from_file,
+    llama_model_free, llama_model_get_vocab, llama_model_is_hybrid,
+    llama_model_is_recurrent, llama_model_load_from_file,
     llama_model_meta_count, llama_model_meta_key_by_index,
     llama_model_meta_val_str, llama_model_meta_val_str_by_index,
     llama_model_n_ctx_train, llama_model_n_embd, llama_model_n_params,
-    llama_model_params, llama_model_quantize,
+    llama_model_n_swa, llama_model_params, llama_model_quantize,
     llama_model_quantize_default_params, llama_model_quantize_params,
     llama_model_rope_freq_scale_train, llama_model_rope_type, llama_model_size,
     llama_token, llama_token_attr_LLAMA_TOKEN_ATTR_CONTROL,
@@ -487,6 +488,32 @@ impl LlamaCppModel {
     /// RoPE frequency scaling factor.
     pub fn rope_freq_scale(&self) -> f32 {
         unsafe { llama_model_rope_freq_scale_train(self.0.inner) }
+    }
+
+    /// Sliding-window size: how many positions a sliding-window layer
+    /// attends to (gpt-oss 128, Gemma 4 1024), `0` for a model without
+    /// one. A hyperparameter, which a `vocab_only` load skips: there it
+    /// is always `0` — read `{arch}.attention.sliding_window` from
+    /// [`Self::get_meta`] instead.
+    pub fn n_swa(&self) -> u32 {
+        // A negative window is not a window.
+        let n = unsafe { llama_model_n_swa(self.0.inner) };
+        n.max(0) as u32
+    }
+
+    /// Whether every layer is recurrent (Mamba, RWKV): one state per
+    /// sequence, which a KV truncate cannot rewind. Decided by the
+    /// architecture, so a `vocab_only` load answers.
+    pub fn is_recurrent(&self) -> bool {
+        unsafe { llama_model_is_recurrent(self.0.inner) }
+    }
+
+    /// Whether the model mixes attention with recurrent layers
+    /// (Qwen3.6, Qwen3.8, Jamba): its recurrent state, too, cannot be
+    /// rewound by a KV truncate. Decided by the architecture, so a
+    /// `vocab_only` load answers.
+    pub fn is_hybrid(&self) -> bool {
+        unsafe { llama_model_is_hybrid(self.0.inner) }
     }
 
     /// Get the number of metadata entries.

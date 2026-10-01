@@ -204,9 +204,15 @@ impl LlamaCppEngine {
         self.decoder.set_state_seq(state, dest_seq_id)
     }
 
+    /// How this model's sequences rewind — see
+    /// [`LlamaCppDecoder::checkpointing`](crate::LlamaCppDecoder::checkpointing).
+    pub fn checkpointing(&self) -> crate::Checkpointing {
+        self.decoder.checkpointing()
+    }
+
     /// Whether checkpointing takes real per-sequence snapshots. On by
-    /// default for recurrent / hybrid models (whose layer state cannot
-    /// be rewound by KV truncation); off for pure attention.
+    /// default for sliding-window and recurrent / hybrid models (whose
+    /// state a KV truncate cannot rewind); off for dense attention.
     pub fn seq_snapshots_enabled(&self) -> bool {
         self.decoder.seq_snapshots_enabled()
     }

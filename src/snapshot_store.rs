@@ -1,9 +1,10 @@
 //! Bounded LRU of serialized per-sequence decoder states, keyed by
 //! `(seq_id, pos)`. Pure bookkeeping — FFI-free, so the eviction /
 //! invalidation logic is unit-testable without a model. Shared by the
-//! llama.cpp decoder (recurrent / hybrid models, `get_state_seq`
-//! blobs) and the moeflux decoder (whole-`Ctx` `state_save` blobs
-//! realizing `(seq, pos)` keying over a physically single stream).
+//! llama.cpp decoder (sliding-window, recurrent and hybrid models — see
+//! `llama_cpp::checkpoint`) and the moeflux decoder (whole-`Ctx`
+//! `state_save` blobs realizing `(seq, pos)` keying over a physically
+//! single stream).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -33,12 +34,14 @@ pub(crate) const SNAPSHOTS_PER_SLOT: usize =
 /// `--cache-slots 4` on a hybrid model it sat exactly at the cap, and
 /// the next anchor cost a conversation its prefix.
 ///
-/// The trade-off is host RAM. A hybrid model's snapshot is the whole
-/// sequence state — its attention KV up to that position as well as
-/// the recurrent layers — so the bound is `cap × (largest state)`, and
-/// eviction logs each dropped snapshot's size. No byte budget yet:
-/// evicting by size would drop exactly the long-prefix anchors worth
-/// keeping, and choosing among them needs the session's view.
+/// The trade-off is host RAM, `cap × (largest snapshot)`. On llama.cpp
+/// a snapshot holds only what a KV truncate cannot rewind, so its size
+/// does not grow with the prefix and the count cap is a byte cap too:
+/// the recurrent state (Qwen3.6 ≈ 63 MiB, Qwen3.8 ≈ 150 MiB) or the
+/// sliding-window cells (gpt-oss ≈ 4.5 MiB, Gemma 4 ≈ 800 MiB). At
+/// four slots that is at most 24 snapshots — ≈ 19 GiB on Gemma 4, the
+/// one model where the bound is worth watching. Eviction logs each
+/// dropped snapshot's size.
 ///
 /// llama.cpp-only (moeflux keeps [`MAX_SEQ_SNAPSHOTS`]), hence the cfg
 /// on the lint.
@@ -51,13 +54,13 @@ pub(crate) fn cap_for_sequences(n_seq: usize) -> usize {
 
 /// Bounded LRU of serialized decoder states.
 ///
-/// A stored value is the *entire* serialized state for its key's
-/// sequence, taken when that sequence held exactly positions
-/// `[0, pos)`. Restoring one replaces the sequence wholesale, so
-/// entries stay restorable regardless of later KV mutations;
-/// invalidation exists to keep the `Decoder` trait's rewind semantics
-/// ("futures are dropped") uniform across backends, not because the
-/// bytes go stale.
+/// A stored value is serialized state for its key's sequence, taken
+/// when that sequence held exactly positions `[0, pos)`. Whether it
+/// goes stale is the owner's concern: a whole-sequence blob (moeflux,
+/// or llama.cpp's forced snapshots) restores wholesale and stays
+/// restorable regardless of later KV mutations, while a llama.cpp
+/// *partial* checkpoint restores on top of the KV below `pos` and must
+/// be dropped as soon as that KV changes ([`Self::retain`]).
 #[derive(Debug)]
 pub(crate) struct SnapshotStore {
     map: HashMap<(i32, i32), Vec<u8>>,
@@ -162,8 +165,20 @@ impl SnapshotStore {
     /// than `pos` — the "futures are invalid after a rewind" rule from
     /// [`crate::backend::Decoder::restore_to`].
     pub(crate) fn invalidate_after(&mut self, seq_id: i32, pos: i32) {
-        self.map.retain(|&(s, p), _| s != seq_id || p <= pos);
-        self.order.retain(|&(s, p)| s != seq_id || p <= pos);
+        self.retain(|s, p| s != seq_id || p <= pos);
+    }
+
+    /// Keep only the snapshots whose `(seq_id, pos)` satisfies `keep`.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(i32, i32) -> bool) {
+        self.map.retain(|&(s, p), _| keep(s, p));
+        self.order.retain(|&(s, p)| keep(s, p));
+    }
+
+    /// Whether a snapshot is stored at `key`. Does not touch the LRU
+    /// order — asking is not a use.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, key: (i32, i32)) -> bool {
+        self.map.contains_key(&key)
     }
 
     /// Drop everything.
@@ -283,6 +298,23 @@ mod tests {
         assert!(s.take((0, 5)).is_some());
         // Other sequences untouched.
         assert!(s.take((1, 15)).is_some());
+    }
+
+    #[test]
+    fn snapshot_store_retain_filters_map_and_order_together() {
+        let mut s = store_with(&[(0, 5), (1, 5), (1, 9), (2, 1)]);
+        s.retain(|seq, _| seq == 1);
+        assert_eq!(s.len(), 2);
+        assert!(!s.contains((0, 5)) && !s.contains((2, 1)));
+        assert!(s.contains((1, 5)) && s.contains((1, 9)));
+        // The LRU order lost the same keys: filling to the cap evicts
+        // only what is still stored, oldest first.
+        for pos in 100..(100 + MAX_SEQ_SNAPSHOTS as i32 - 1) {
+            s.insert((3, pos), vec![0]);
+        }
+        assert_eq!(s.len(), MAX_SEQ_SNAPSHOTS);
+        assert!(!s.contains((1, 5)), "the oldest survivor is evicted first");
+        assert!(s.contains((1, 9)));
     }
 
     #[test]
