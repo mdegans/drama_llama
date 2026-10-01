@@ -145,6 +145,10 @@
         {{- argument -}}
     {%- endif -%}
 {%- endmacro -%}
+{#- Cache-stability patch (drama_llama): a model turn's answer renders
+    VERBATIM — no `| trim` (stock trims) — so an answer the model ended
+    in whitespace, or began with a newline after its thought, re-renders
+    as generated and the KV stays a byte prefix of the next request. -#}
 {%- macro strip_thinking(text) -%}
     {%- set ns = namespace(result='') -%}
     {%- for part in text.split('<channel|>') -%}
@@ -154,7 +158,7 @@
             {%- set ns.result = ns.result + part -%}
         {%- endif -%}
     {%- endfor -%}
-    {{- ns.result | trim -}}
+    {{- ns.result -}}
 {%- endmacro -%}
 
 {%- macro format_tool_response_block(tool_name, response) -%}

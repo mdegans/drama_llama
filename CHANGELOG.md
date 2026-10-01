@@ -249,6 +249,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `chunks` they render from the merged fields as before. Pinned in
   `mistral4_cache_stable_round_trips_back_to_back_thoughts` and
   `gptoss_cache_stable_round_trips_each_analysis_block`.
+- **Whitespace around a Mistral 4 or Gemma 4 thought re-renders as
+  written.** A fleet-wide sweep (`fleet_bakes_round_trip_every_admitted_shape`:
+  every baked template through the session's parse and re-render, over
+  the shapes its grammars admit — thought or none, two back to back,
+  prose, a JSON answer, a call, prose then a call, parallel calls,
+  answers with leading or trailing whitespace) found two more shapes
+  that lost their tip. The parser swallowed one `\n` after a thought
+  the model opened itself, and one at the start of its body, whatever
+  the template renders there: right for Qwen's `<think>\n`, wrong for
+  Mistral 4, whose `[THINK]…[/THINK]` has no layout newlines, so
+  `[/THINK]\n{…}` (an `output_config` answer the grammar admits) came
+  back without the `\n`. It now takes off exactly the whitespace the
+  dialect's markers are spelled with and leaves the rest to the answer,
+  as the pre-opened path already did. And the baked Gemma 4 template
+  `| trim`med a model turn's answer, as stock does; it now renders it
+  verbatim. `CallSyntax::qwen_xml()`'s reasoning start is now
+  `"<think>\n"`, as the analyzer measures it. Neither shape has been
+  seen live; Gemma 4 served no turns in the 2026-10-01 run.
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like

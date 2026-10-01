@@ -21,9 +21,13 @@ path is byte-identical, so upstream's pinned expectations
 model actually generated against (real reasoning, gated by
 `preserve_thinking` for aged turns; the empty
 `<|channel>thought\n<channel|>` scaffold otherwise), so the KV cache
-stays a byte prefix of the next render across tool turns. Everything
-outside the thinking-channel block is byte-identical to
-`gemma4-gguf.jinja`.
+stays a byte prefix of the next render across tool turns. A model
+turn's answer also renders verbatim: stock `| trim`s it, so an answer
+the model ended in whitespace, or began with a newline after its
+thought, re-rendered shorter than it was generated (found by the
+fleet sweep, `fleet_bakes_round_trip_every_admitted_shape`; not yet
+seen live). Everything else outside the thinking-channel block is
+byte-identical to `gemma4-gguf.jinja`.
 
 `gptoss-gguf.jinja` is dumped from the gpt-oss-20b Unsloth GGUF
 (`tokenizer.chat_template`, Apache 2.0 per its own footer) — the

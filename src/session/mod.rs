@@ -15035,6 +15035,189 @@ mod tests {
         }
     }
 
+    /// The fleet sweep: every baked template, through the session's own
+    /// parse and re-render, over the emission shapes its grammars admit
+    /// — with and without a thought (two back to back where the format
+    /// has a closer), prose alone, a JSON answer, a call alone, prose
+    /// then a call, parallel calls. Calls are spelled by
+    /// [`crate::dialect::render_reference`], the bytes the tool grammar
+    /// forces; the thought, prose and answer framing is each dialect's
+    /// habitual one, as its own round-trip tests pin it. Any shape here
+    /// that re-renders differently loses its turn's tip on the next
+    /// request. Known irreducible shapes are pinned in the per-model
+    /// tests, not here.
+    #[test]
+    fn fleet_bakes_round_trip_every_admitted_shape() {
+        let tool = weather_tool();
+        let input = serde_json::json!({"city": "Paris"});
+        let json = r#"{"answer": "Ada", "n": [1, 2]}"#;
+        let compact = r#"{"answer":"Ada","n":[1,2]}"#;
+        let mut failures: Vec<String> = Vec::new();
+        for (baked, tokens) in [
+            (&crate::baked::GEMMA4, ("<bos>", "<turn|>")),
+            (&crate::baked::GPTOSS, ("<|startoftext|>", "<|return|>")),
+            (
+                &crate::baked::GPTOSS_UPSTREAM,
+                ("<|startoftext|>", "<|return|>"),
+            ),
+            (&crate::baked::COGITO, ("", "<|im_end|>")),
+            (&crate::baked::MISTRAL4, ("<s>", "</s>")),
+            (&crate::baked::QWEN36, ("", "<|im_end|>")),
+            (&crate::baked::QWEN38, ("", "<|im_end|>")),
+        ] {
+            let served = crate::baked::detect(baked.stock)
+                .expect("stock dump detects")
+                .replacement;
+            let syntax =
+                crate::dialect::analyze_template(served, tokens.0, tokens.1)
+                    .expect("analyze");
+            let one = crate::dialect::render_reference(
+                &syntax,
+                &[("get_weather", &input)],
+            )
+            .expect("representable");
+            let two = crate::dialect::render_reference(
+                &syntax,
+                &[("get_weather", &input), ("get_weather", &input)],
+            )
+            .expect("representable");
+            // `(thinking, emission)` per family.
+            let shapes: Vec<(bool, String)> = match syntax.family {
+                crate::dialect::Family::Harmony => {
+                    let a = |t: &str| {
+                        format!(
+                            "<|channel|>analysis<|message|>{t}<|end|>\
+                             <|start|>assistant"
+                        )
+                    };
+                    let pre = "<|channel|>commentary<|message|>Checking.\
+                               <|end|><|start|>assistant";
+                    let fin = "<|channel|>final<|message|>";
+                    let fin_json = "<|channel|>final <|constrain|>json\
+                                    <|message|>";
+                    let mut v = Vec::new();
+                    for thought in
+                        ["".to_owned(), a("Plan."), a("A.") + &a("B.")]
+                    {
+                        v.extend([
+                            format!("{thought}{fin}Ada."),
+                            format!("{thought}{fin}Ada.\n"),
+                            format!("{thought}{fin_json}{compact}"),
+                            format!("{thought}{one}"),
+                            format!("{thought}{pre}{one}"),
+                            format!("{thought}{two}"),
+                        ]);
+                    }
+                    v.into_iter().map(|e| (true, e)).collect()
+                }
+                crate::dialect::Family::TagWithJson => {
+                    // Mistral 4: `[THINK]…[/THINK]`, not pre-opened.
+                    let mut v = Vec::new();
+                    for (thinking, thought) in [
+                        (false, ""),
+                        (true, "[THINK]Plan.[/THINK]"),
+                        (true, "[THINK]A.[/THINK][THINK]B.[/THINK]"),
+                        (true, "[THINK]\nPlan.\n\n[/THINK]"),
+                    ] {
+                        for body in [
+                            "Ada.".to_owned(),
+                            "Ada.\n".to_owned(),
+                            "Ada. ".to_owned(),
+                            "\nAda.".to_owned(),
+                            "Ada.\n\n".to_owned(),
+                            json.to_owned(),
+                            one.clone(),
+                            format!("Checking.{one}"),
+                            format!("Checking.\n\n{one}"),
+                            two.clone(),
+                        ] {
+                            v.push((thinking, format!("{thought}{body}")));
+                        }
+                    }
+                    v
+                }
+                crate::dialect::Family::TagWithDict => {
+                    // Gemma 4: the thought channel when thinking is on;
+                    // the render's closed scaffold when it is off. A
+                    // call turn exits on the tool-response opener.
+                    let exit = &syntax.tool_response_start;
+                    let mut v = Vec::new();
+                    for (thinking, thought) in [
+                        (false, ""),
+                        (true, "<|channel>thought\nPlan.\n<channel|>"),
+                        (true, "<|channel>thought\nPlan.\n\n<channel|>"),
+                    ] {
+                        for body in [
+                            "Ada.".to_owned(),
+                            "Ada.\n".to_owned(),
+                            "Ada. ".to_owned(),
+                            "\nAda.".to_owned(),
+                            "Ada.\n\n".to_owned(),
+                            json.to_owned(),
+                            format!("{one}{exit}"),
+                            format!("Checking.{one}{exit}"),
+                            format!("Checking.\n\n{one}{exit}"),
+                            format!("{two}{exit}"),
+                        ] {
+                            v.push((thinking, format!("{thought}{body}")));
+                        }
+                    }
+                    v
+                }
+                _ => {
+                    // Qwen (pre-opened `<think>\n` when on) and cogito
+                    // (no reasoning channel: its thought is prose).
+                    let thoughts: &[(bool, &str)] = match syntax.reasoning.mode
+                    {
+                        crate::dialect::ReasoningMode::None => &[
+                            (false, ""),
+                            (true, "<think>\nPlan.\n</think>\n\n"),
+                        ],
+                        _ => &[
+                            (false, ""),
+                            (true, "Plan.\n</think>\n\n"),
+                            (true, "Plan.\n\n</think>\n\n"),
+                        ],
+                    };
+                    let mut v = Vec::new();
+                    for &(thinking, thought) in thoughts {
+                        for body in [
+                            "Ada.".to_owned(),
+                            "Ada.\n".to_owned(),
+                            "Ada. ".to_owned(),
+                            "\nAda.".to_owned(),
+                            "Ada.\n\n".to_owned(),
+                            json.to_owned(),
+                            one.clone(),
+                            format!("Checking.\n\n{one}"),
+                            format!("Checking.\n{one}"),
+                            format!("Checking. {one}"),
+                            two.clone(),
+                        ] {
+                            v.push((thinking, format!("{thought}{body}")));
+                        }
+                    }
+                    v
+                }
+            };
+            for (thinking, emission) in shapes {
+                if let Some(at) = fleet_divergence(
+                    served,
+                    tokens,
+                    &[&tool],
+                    thinking,
+                    &emission,
+                ) {
+                    failures.push(format!(
+                        "{}: thinking={thinking} at {at}: {emission:?}",
+                        baked.name
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// An assistant turn aged out with `preserve_thinking` off drops its
     /// thought, so it can never be byte-stable; there the baked Qwen
     /// templates must render exactly as stock — including 3.6's

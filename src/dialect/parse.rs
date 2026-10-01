@@ -538,6 +538,17 @@ impl<'a> Parser<'a> {
         body.strip_suffix(lead).unwrap_or(body)
     }
 
+    /// A thought's body after its open marker as the chat template
+    /// re-renders it: minus exactly the whitespace the marker is
+    /// canonically spelled with (the `"\n"` of Qwen's `"<think>\n"`,
+    /// Gemma 4's `"<|channel>thought\n"`; nothing for Mistral 4's
+    /// `"[THINK]"`, whose thought may itself start with a newline).
+    fn opened_thought_body(&self, body: &'a str) -> &'a str {
+        let start = &self.syntax.reasoning.start;
+        let trail = &start[start.trim_end().len()..];
+        body.strip_prefix(trail).unwrap_or(body)
+    }
+
     /// After an *empty* pre-opened thought, consume the reasoning
     /// separator. An empty thought is no thought at all to the
     /// re-render, which then spells the thinking-off scaffold — Qwen's
@@ -878,13 +889,15 @@ impl<'a> Parser<'a> {
         match self.rest().find(end) {
             Some(at) => {
                 let body = &self.rest()[..at];
-                let body = body.strip_prefix('\n').unwrap_or(body);
+                let body = self.opened_thought_body(body);
                 let body = self.closed_thought_body(body);
                 self.push_thought(body);
+                // Whatever follows the close is the answer's: the baked
+                // templates render it verbatim after the marker (Mistral
+                // 4 writes `[/THINK]` then the answer; a `\n` there was
+                // swallowed and never re-rendered), and a trimming stock
+                // template trims it either way.
                 self.pos += at + end.len();
-                // Swallow one newline after the close, mirroring how
-                // templates lay the tag out.
-                let _ = self.eat("\n");
             }
             None => {
                 // No reasoning close. Did the model emit a tool call
@@ -910,9 +923,8 @@ impl<'a> Parser<'a> {
                         // anyway, and whitespace before the trigger is
                         // the gap to the call, not the thought's.
                         let body = &self.rest()[..at];
-                        let body = body
-                            .strip_prefix('\n')
-                            .unwrap_or(body)
+                        let body = self
+                            .opened_thought_body(body)
                             .trim_end()
                             .to_string();
                         self.push_thought(&body);
