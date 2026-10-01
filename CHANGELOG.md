@@ -205,6 +205,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The grammar matcher's memory is bounded however a hostile schema
+  nests its output.** Measured on the hostile recheck's ambiguous
+  recursive schema (`N1 = N2 = {"c": N1 | N2}`) and on `[` nested
+  thousands deep, over a 75,000-token vocabulary:
+  - A matcher state keeps at most 2^16 frames (`MAX_STATE_FRAMES`,
+    was 2^18), and a lone stack deeper than that is no longer exempt:
+    output nested past it (~32,000 levels of `[`) is refused through
+    the usual violation path instead of copying an ever-deeper stack
+    on every byte. 2^16 is `MAX_STACKS` stacks 16 frames deep; the
+    widest real states (a 2,000-member `enum` three objects deep in a
+    tool call) are under 9 frames a stack, so the cap still binds only
+    where `MAX_STACKS` already does. (2^15 would over-restrict that
+    `enum` in the Hermes dialect.)
+  - The DFA cache's weight cap drops from 256 MiB to 32 MiB, and holds
+    *within* a sampling step: `intern` refuses a state that would take
+    the cache past twice the cap, or one heavier than a quarter of it,
+    with `UNCACHED_STATE`, and the grammar filter and the repetition
+    region guard walk the matcher for that input instead. Previously
+    only the next step's base intern could clear it.
+  - Spilled matcher stacks get power-of-two capacities: exact-length
+    copies, one block size larger per nesting level, left freed blocks
+    too small to reuse, and the process held over a gigabyte resident
+    above ~50 MB live.
+  Filtering every level of the ambiguous schema to 1,000 deep went
+  from ~1.45 GB resident to ~580 MB at the same speed, and to 6,000
+  deep holds ~800 MB resident (under 300 MB physical footprint) at
+  10–25 ms a step; at 2^18 it held 1.3 GB filtering only every 50th
+  level to 400.
+
 - **A grammar with too many rules is `SchemaError::TooComplex`, like
   one with too many bytes.** The compiler stopped at 8 MiB of source,
   but `Grammar::parse`'s 2^18-rule limit was only met later, as a
