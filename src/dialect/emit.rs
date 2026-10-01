@@ -40,6 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -499,25 +500,48 @@ pub(crate) enum TaggedValue {
     /// One of finitely many values, at least one a string (an `enum`,
     /// a `const`, or a union of them, nullable or not): each spelled
     /// as the template re-renders it — a string raw, anything else
-    /// as JSON — and read back by exact match. `(spelling, value)`.
-    Choice(Vec<(String, Value)>),
+    /// as JSON — and read back by exact match. Shared: parameters
+    /// with the same members (every one that `$ref`s the same def)
+    /// hold the same set, which the grammar writes once.
+    Choice(Choice),
     /// Schema-compiled JSON: no string in it, or no raw spelling that
     /// reads back unambiguously.
     Json,
 }
 
-/// Most [`Admits::collect`] steps (schemas visited, `enum` members
-/// read) classifying one tool's parameters, all of them together. A
-/// parameter met once the budget is spent is [`TaggedValue::Json`],
-/// which is always a correct spelling, merely not the raw one. Real
-/// tools take a few steps a parameter; without the bound a client's
-/// schema could make every parameter walk the same thousand-member
-/// union, P × D work from a P + D request (the hostile-schema recheck).
-const TAGGED_BUDGET: usize = 1 << 16;
+/// A [`TaggedValue::Choice`]'s members, in declaration order.
+pub(crate) type Choice = Arc<[Arc<Member>]>;
+
+/// One member of a finite set, as a tagged value spells it.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Member {
+    /// The template's rendering: a string raw, anything else as JSON.
+    pub(crate) spelling: String,
+    pub(crate) value: Value,
+}
+
+/// Most work classifying one tool's parameters, all of them together:
+/// a step per schema visited, a member's bytes for each member spelled,
+/// a step per member a parameter takes from a `$ref`'d def. A parameter
+/// met once the budget is spent is [`TaggedValue::Json`], which is
+/// always a correct spelling, merely not the raw one.
+///
+/// Each def is classified once per tool and its members spelled once,
+/// so a parameter that `$ref`s one costs a step a member, not a walk of
+/// it: two thousand parameters naming a 100 KB `enum` spell it once
+/// (they took 200 MB of spelling and 400 MB of members, the hostile
+/// recheck). The budget bounds what is left — every parameter with an
+/// inline set of its own, or a union of defs — at about a mebibyte of
+/// member text per tool. Real tools take a few steps a parameter.
+const TAGGED_BUDGET: usize = 1 << 20;
 
 /// Most distinct members a finite set may have and still be spelled
 /// raw ([`TaggedValue::Choice`]); a larger one is JSON.
 const TAGGED_MAX_MEMBERS: usize = 1024;
+
+/// Deepest a classification nests (`$ref` chains, unions in unions)
+/// before it gives up as JSON rather than recurse further.
+const TAGGED_MAX_DEPTH: usize = 32;
 
 /// Every parameter of `tool_schema`, in `properties` order, with how
 /// it is spelled for `syntax` ([`TaggedValue`]).
@@ -540,16 +564,13 @@ pub(crate) fn tagged_values(
     syntax: &CallSyntax,
     tool_schema: &Value,
 ) -> Vec<(String, TaggedValue)> {
-    let defs = tool_schema.get("$defs").and_then(Value::as_object);
-    let mut budget = TAGGED_BUDGET;
+    let mut classifier = Classifier::new(syntax, tool_schema);
     tool_schema
         .get("properties")
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
-        .map(|(name, param)| {
-            (name.clone(), classify(syntax, defs, param, &mut budget))
-        })
+        .map(|(name, param)| (name.clone(), classifier.classify(param)))
         .collect()
 }
 
@@ -561,138 +582,152 @@ pub(crate) fn tagged_value(
     tool_schema: &Value,
     param: &Value,
 ) -> TaggedValue {
-    let defs = tool_schema.get("$defs").and_then(Value::as_object);
-    classify(syntax, defs, param, &mut TAGGED_BUDGET.clone())
-}
-
-/// How [`tagged_values`] spells `param`, its `$ref`s resolving in
-/// `defs`, spending `budget`.
-fn classify(
-    syntax: &CallSyntax,
-    defs: Option<&serde_json::Map<String, Value>>,
-    param: &Value,
-    budget: &mut usize,
-) -> TaggedValue {
-    let mut admits = Admits {
-        defs,
-        budget,
-        any_string: false,
-        any_other: false,
-        members: Vec::new(),
-        spellings: HashSet::new(),
-        visits: HashMap::new(),
-    };
-    admits.collect(param, 0);
-    let Admits {
-        any_string,
-        any_other,
-        members,
-        ..
-    } = admits;
-    let nullable = members.contains(&Value::Null);
-    if any_other {
-        return TaggedValue::Json;
-    }
-    if any_string {
-        return match members.iter().all(|m| m.is_string() || m.is_null()) {
-            true => TaggedValue::Raw { nullable },
-            false => TaggedValue::Json,
-        };
-    }
-    if !members.iter().any(Value::is_string) {
-        return TaggedValue::Json;
-    }
-    let choice: Vec<(String, Value)> = members
-        .into_iter()
-        .map(|m| match m {
-            Value::String(s) => (s.clone(), Value::String(s)),
-            other => (
-                crate::json_canon::to_string(
-                    &other,
-                    syntax.arguments.json_spacing,
-                ),
-                other,
-            ),
-        })
-        .collect();
-    let close = syntax.arguments.value_suffix.as_str();
-    let mut seen = HashSet::new();
-    let distinct = choice.iter().all(|(s, _)| seen.insert(s.as_str()));
-    // The parser ends a value at the first close tag, so the close
-    // after a member must be the first one: none inside the member, and
-    // none that starts in its tail (`a\n</parameter>` + the close).
-    let delimited = !close.is_empty()
-        && choice
-            .iter()
-            .all(|(s, _)| format!("{s}{close}").find(close) == Some(s.len()));
-    match distinct && delimited {
-        true => TaggedValue::Choice(choice),
-        false => TaggedValue::Json,
-    }
+    Classifier::new(syntax, tool_schema).classify(param)
 }
 
 /// What a schema admits, as far as a tagged value's spelling cares.
-struct Admits<'s, 'b> {
-    /// The tool's `$defs`, which `$ref`s resolve in.
-    defs: Option<&'s serde_json::Map<String, Value>>,
-    /// Steps left of the tool's [`TAGGED_BUDGET`].
-    budget: &'b mut usize,
+#[derive(Clone, Default)]
+struct Class {
     /// Any string (`"type": "string"`).
     any_string: bool,
     /// Unboundedly many non-string values: a non-string type, or an
-    /// unconstrained schema.
+    /// unconstrained schema — or the classification gave up.
     any_other: bool,
-    /// Finitely many values (`enum`, `const`, `"type": "null"`), in
-    /// declaration order, without duplicates.
-    members: Vec<Value>,
-    /// `members`' JSON spellings, which dedupe them in O(1).
-    spellings: HashSet<String>,
-    /// Each def's progress, by name: a def collected once adds nothing
-    /// the second time (without this, `anyOf`s of `$ref`s fan out
-    /// exponentially), and one met again while still open is a cycle.
-    visits: HashMap<&'s str, Visit>,
+    /// Finitely many values (`enum`, `const`, `"type": "null"`), as
+    /// [`Classifier`] member ids, in declaration order, distinct.
+    members: Vec<usize>,
+    /// `members`, for O(1) dedup.
+    seen: HashSet<usize>,
+    /// Deepest nesting the walk reached below where it started.
+    height: usize,
+    /// The walk hit [`TAGGED_MAX_DEPTH`]: the answer depends on where
+    /// it started, so a def's is not memoized.
+    truncated: bool,
+    /// The tool's budget ran out during the walk: likewise.
+    starved: bool,
 }
 
-/// How far [`Admits::collect`] has got through a def.
+impl Class {
+    fn add(&mut self, member: usize) {
+        if self.seen.insert(member) {
+            self.members.push(member);
+        }
+        if self.members.len() > TAGGED_MAX_MEMBERS {
+            self.any_other = true;
+        }
+    }
+}
+
+/// A spelled member and what [`Classifier::finish`] checks of it,
+/// computed once per tool.
+struct Spelled {
+    member: Arc<Member>,
+    /// The spelling's id: two members of one set that share one
+    /// collide.
+    spelling: usize,
+    /// The close tag right after the member is the first one.
+    delimited: bool,
+    /// A JSON string (or `null`, the nullable case).
+    is_string: bool,
+    is_null: bool,
+}
+
+/// One tool's classifier: each def's [`Class`] once, each member's
+/// spelling once, each distinct member set's [`Choice`] once.
+struct Classifier<'s> {
+    syntax: &'s CallSyntax,
+    defs: Option<&'s serde_json::Map<String, Value>>,
+    /// Work left of the tool's [`TAGGED_BUDGET`].
+    budget: usize,
+    /// Every member met, deduped by JSON spelling.
+    members: Vec<Spelled>,
+    /// JSON spelling → member id.
+    by_json: HashMap<String, usize>,
+    /// Template spelling → spelling id.
+    by_spelling: HashMap<String, usize>,
+    /// Member value (by address in the schema) → member id, so a
+    /// member is spelled once however often it is reached.
+    by_node: HashMap<*const Value, usize>,
+    /// Each def's class, once computed (and not truncated).
+    def_classes: HashMap<&'s str, Arc<Class>>,
+    /// Each distinct member set's choice, so parameters share one.
+    choices: HashMap<Vec<usize>, Choice>,
+}
+
+/// How far a classification has got through a def.
 #[derive(Clone, Copy, PartialEq)]
 enum Visit {
     Open,
     Done,
 }
 
-impl<'s> Admits<'s, '_> {
-    /// Spend one step; out of steps, the answer is JSON.
-    fn step(&mut self) -> bool {
-        if !self.any_other {
-            match *self.budget {
-                0 => self.any_other = true,
-                _ => *self.budget -= 1,
-            }
+impl<'s> Classifier<'s> {
+    fn new(syntax: &'s CallSyntax, tool_schema: &'s Value) -> Self {
+        Self {
+            syntax,
+            defs: tool_schema.get("$defs").and_then(Value::as_object),
+            budget: TAGGED_BUDGET,
+            members: Vec::new(),
+            by_json: HashMap::new(),
+            by_spelling: HashMap::new(),
+            by_node: HashMap::new(),
+            def_classes: HashMap::new(),
+            choices: HashMap::new(),
         }
-        !self.any_other
     }
 
-    fn collect(&mut self, schema: &'s Value, depth: usize) {
+    /// How `param` is spelled.
+    fn classify(&mut self, param: &'s Value) -> TaggedValue {
+        let mut class = Class::default();
+        self.collect(param, 0, &mut class, &mut HashMap::new());
+        self.finish(class)
+    }
+
+    /// Spend `cost`; out of budget, `class` is JSON.
+    fn spend(&mut self, class: &mut Class, cost: usize) -> bool {
+        if !class.any_other {
+            match self.budget.checked_sub(cost) {
+                Some(left) => self.budget = left,
+                None => {
+                    self.budget = 0;
+                    class.any_other = true;
+                    class.starved = true;
+                }
+            }
+        }
+        !class.any_other
+    }
+
+    fn collect(
+        &mut self,
+        schema: &'s Value,
+        depth: usize,
+        class: &mut Class,
+        visits: &mut HashMap<&'s str, Visit>,
+    ) {
         // Once anything non-string goes, the answer is JSON whatever
         // else turns up. Too deep (a chain of thousands of aliases)
         // gives up as JSON too, rather than nest that far.
-        if depth > 32 {
-            self.any_other = true;
+        class.height = class.height.max(depth);
+        if depth > TAGGED_MAX_DEPTH {
+            class.any_other = true;
+            class.truncated = true;
         }
-        if !self.step() {
+        if !self.spend(class, 1) {
             return;
         }
         // The `$ref` shape the grammar compiler resolves; anything else
         // falls through to the schema's other keywords, as it does there.
         if let Some((name, def)) = def_target(self.defs, schema) {
-            match self.visits.get(name) {
+            match visits.get(name) {
                 // A `$ref` cycle is unconstrained (see `Defs`): JSON.
-                Some(Visit::Open) => self.any_other = true,
+                Some(Visit::Open) => class.any_other = true,
                 Some(Visit::Done) => {}
                 None => {
-                    self.visits.insert(name, Visit::Open);
-                    self.collect(def, depth + 1);
-                    self.visits.insert(name, Visit::Done);
+                    visits.insert(name, Visit::Open);
+                    let sub = self.def_class(name, def, visits);
+                    visits.insert(name, Visit::Done);
+                    self.merge(class, &sub, depth + 1);
                 }
             }
             return;
@@ -703,48 +738,176 @@ impl<'s> Admits<'s, '_> {
             .and_then(Value::as_array);
         if let Some(variants) = union {
             match variants.is_empty() {
-                true => self.any_other = true,
-                false => {
-                    variants.iter().for_each(|v| self.collect(v, depth + 1))
-                }
+                true => class.any_other = true,
+                false => variants
+                    .iter()
+                    .for_each(|v| self.collect(v, depth + 1, class, visits)),
             }
             return;
         }
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-            values.iter().for_each(|v| self.member(v));
+            values.iter().for_each(|v| self.member(class, v));
             return;
         }
         if let Some(value) = schema.get("const") {
-            return self.member(value);
+            return self.member(class, value);
         }
         match schema.get("type") {
-            Some(Value::String(t)) => self.of_type(t),
+            Some(Value::String(t)) => self.of_type(class, t),
             Some(Value::Array(types)) => types.iter().for_each(|t| match t {
-                Value::String(t) => self.of_type(t),
-                _ => self.any_other = true,
+                Value::String(t) => self.of_type(class, t),
+                _ => class.any_other = true,
             }),
-            _ => self.any_other = true,
+            _ => class.any_other = true,
         }
     }
 
-    fn of_type(&mut self, t: &str) {
-        match t {
-            "string" => self.any_string = true,
-            "null" => self.member(&Value::Null),
-            _ => self.any_other = true,
+    /// `def`'s class, from the memo or walked on its own. Its own walk
+    /// keeps only the defs open around it (`visits`' `Open`s), so a
+    /// cycle is still a cycle, and drops the caller's finished ones, so
+    /// the class holds everything the def reaches. That is the same
+    /// wherever the def is reached — a def that reaches an open one is
+    /// on a cycle, which is JSON from anywhere — unless the walk was cut
+    /// short by depth or budget, so only those are not kept.
+    fn def_class(
+        &mut self,
+        name: &'s str,
+        def: &'s Value,
+        visits: &HashMap<&'s str, Visit>,
+    ) -> Arc<Class> {
+        if let Some(class) = self.def_classes.get(name) {
+            return class.clone();
         }
+        let mut own: HashMap<&'s str, Visit> = visits
+            .iter()
+            .filter(|(_, v)| **v == Visit::Open)
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let mut sub = Class::default();
+        self.collect(def, 0, &mut sub, &mut own);
+        let sub = Arc::new(sub);
+        if !sub.truncated && !sub.starved {
+            self.def_classes.insert(name, sub.clone());
+        }
+        sub
     }
 
-    fn member(&mut self, value: &Value) {
-        if !self.step() {
+    /// Fold a def's class into `class`, as if walked from `depth`.
+    fn merge(&mut self, class: &mut Class, sub: &Class, depth: usize) {
+        class.height = class.height.max(depth + sub.height);
+        class.truncated |= sub.truncated;
+        class.starved |= sub.starved;
+        if depth + sub.height > TAGGED_MAX_DEPTH {
+            class.any_other = true;
+            class.truncated = true;
+        }
+        class.any_string |= sub.any_string;
+        class.any_other |= sub.any_other;
+        if !self.spend(class, sub.members.len()) {
             return;
         }
-        if self.spellings.insert(value.to_string()) {
-            self.members.push(value.clone());
+        sub.members.iter().for_each(|&m| class.add(m));
+    }
+
+    fn of_type(&mut self, class: &mut Class, t: &str) {
+        match t {
+            "string" => class.any_string = true,
+            "null" => self.member(class, &Value::Null),
+            _ => class.any_other = true,
         }
-        if self.members.len() > TAGGED_MAX_MEMBERS {
-            self.any_other = true;
+    }
+
+    fn member(&mut self, class: &mut Class, value: &Value) {
+        if class.any_other {
+            return;
         }
+        let id = match self.by_node.get(&(value as *const Value)) {
+            Some(&id) => {
+                if !self.spend(class, 1) {
+                    return;
+                }
+                id
+            }
+            None => {
+                let json = value.to_string();
+                if !self.spend(class, json.len()) {
+                    return;
+                }
+                let id = self.spell(json, value);
+                // `Value::Null` from `"type": "null"` is not in the
+                // schema; it costs one spelling all the same.
+                self.by_node.insert(value as *const Value, id);
+                id
+            }
+        };
+        class.add(id);
+    }
+
+    /// The member id of `value`, whose JSON spelling is `json`.
+    fn spell(&mut self, json: String, value: &Value) -> usize {
+        if let Some(&id) = self.by_json.get(&json) {
+            return id;
+        }
+        let spelling = match value {
+            Value::String(s) => s.clone(),
+            other => crate::json_canon::to_string(
+                other,
+                self.syntax.arguments.json_spacing,
+            ),
+        };
+        let close = self.syntax.arguments.value_suffix.as_str();
+        // The parser ends a value at the first close tag, so the close
+        // after a member must be the first one: none inside the member,
+        // and none that starts in its tail (`a\n</parameter>` + the
+        // close).
+        let delimited = !close.is_empty()
+            && format!("{spelling}{close}").find(close) == Some(spelling.len());
+        let next = self.by_spelling.len();
+        let spelling_id =
+            *self.by_spelling.entry(spelling.clone()).or_insert(next);
+        let id = self.members.len();
+        self.members.push(Spelled {
+            member: Arc::new(Member {
+                spelling,
+                value: value.clone(),
+            }),
+            spelling: spelling_id,
+            delimited,
+            is_string: value.is_string(),
+            is_null: value.is_null(),
+        });
+        self.by_json.insert(json, id);
+        id
+    }
+
+    /// The spelling `class` comes to.
+    fn finish(&mut self, class: Class) -> TaggedValue {
+        if class.any_other {
+            return TaggedValue::Json;
+        }
+        let members: Vec<&Spelled> =
+            class.members.iter().map(|&m| &self.members[m]).collect();
+        if class.any_string {
+            let nullable = members.iter().any(|m| m.is_null);
+            return match members.iter().all(|m| m.is_string || m.is_null) {
+                true => TaggedValue::Raw { nullable },
+                false => TaggedValue::Json,
+            };
+        }
+        if let Some(choice) = self.choices.get(&class.members) {
+            return TaggedValue::Choice(choice.clone());
+        }
+        if !members.iter().any(|m| m.is_string) {
+            return TaggedValue::Json;
+        }
+        let mut seen = HashSet::new();
+        let distinct = members.iter().all(|m| seen.insert(m.spelling));
+        if !(distinct && members.iter().all(|m| m.delimited)) {
+            return TaggedValue::Json;
+        }
+        let choice: Choice = members.iter().map(|m| m.member.clone()).collect();
+        self.choices.insert(class.members, choice.clone());
+        TaggedValue::Choice(choice)
     }
 }
 
@@ -784,6 +947,9 @@ fn emit_tagged_call(
     let prefix = format!("tool_{i}");
     let defs = tool.schema.get("$defs").and_then(Value::as_object);
     let mut compiler = Compiler::new(defs, &prefix, None);
+    // Each distinct set's alternation, written once for every parameter
+    // holding it (the classifier shares one `Choice` among them).
+    let mut choice_rules: HashMap<*const Arc<Member>, String> = HashMap::new();
 
     let mut body = String::new();
     for ((key, schema, required), (_, value)) in all.iter().zip(values) {
@@ -813,13 +979,22 @@ fn emit_tagged_call(
                 RAW_VALUE_RULE.to_string()
             }
             TaggedValue::Choice(choice) => {
-                let alts = choice
-                    .iter()
-                    .map(|(s, _)| format!(r#""{}""#, escape_for_gbnf_string(s)))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let _ = writeln!(src, "{typed_rule} ::= {alts}");
-                format!(r#"{typed_rule} "{val_suf_lit}""#)
+                let rule =
+                    choice_rules.entry(choice.as_ptr()).or_insert_with(|| {
+                        let alts = choice
+                            .iter()
+                            .map(|m| {
+                                format!(
+                                    r#""{}""#,
+                                    escape_for_gbnf_string(&m.spelling)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        let _ = writeln!(src, "{typed_rule} ::= {alts}");
+                        typed_rule.clone()
+                    });
+                format!(r#"{rule} "{val_suf_lit}""#)
             }
             TaggedValue::Json => {
                 compiler.add(schema, &typed_rule, src);

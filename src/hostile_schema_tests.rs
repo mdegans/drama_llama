@@ -2,9 +2,9 @@
 //! `input_schema` (strict or not, any dialect) or an `output_config`
 //! `json_schema` — can abort, hang, or exhaust memory compiling,
 //! constraining, or parsing. Each test started as a probe in the
-//! hostile recheck; the engine-level ones (stack and state caps) live
-//! beside the matcher in `sample::grammar`, the encoder-level ones in
-//! `grammar_compile`.
+//! hostile recheck; the engine-level ones (stack, state and cache caps)
+//! live beside the matcher in `sample::grammar`, the encoder-level ones
+//! in `grammar_compile`.
 
 use std::{sync::Arc, time::Instant};
 
@@ -151,22 +151,49 @@ fn qwen_many_params_and_defs_compile_and_parse_quickly() {
     assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
 }
 
-/// A tool's parameters are classified on one shared step budget, in
-/// declaration order, by the emitter and the parser alike — so when a
-/// schema makes every parameter walk a thousand-member union, the
-/// budget runs out at the same parameter for both: the early ones are
-/// spelled raw, the late ones JSON, and each reads back as written.
+/// The first input of a tagged call, as `parse_text` reads it.
+fn first_input(syntax: &CallSyntax, tool: &Tool, text: &str) -> Value {
+    let parsed = parse_text(syntax, &[tool], text, false, Leniency::Final);
+    parsed
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::ToolUse { call } => Some(call.input.clone()),
+            _ => None,
+        })
+        .expect("a call")
+}
+
+/// A Qwen call to `t` with `params` in order.
+fn qwen_call(params: &[(&str, &str)]) -> String {
+    let params: String = params
+        .iter()
+        .map(|(k, v)| format!("<parameter={k}>\n{v}\n</parameter>\n"))
+        .collect();
+    format!("<tool_call>\n<function=t>\n{params}</function>\n</tool_call>")
+}
+
+/// A tool's parameters are classified on one shared budget, in
+/// declaration order, by the emitter and the parser alike — so when
+/// every parameter has a large set of its own, the budget runs out at
+/// the same parameter for both: the early ones are spelled raw, the
+/// late ones JSON, and each reads back as written.
 #[test]
 fn tagged_budget_agrees_between_grammar_and_parser() {
-    let members: Vec<String> = (0..1000).map(|i| format!("m{i}")).collect();
+    // 100 sets of 50 members ~300 bytes each: 1.5 MB, half again the
+    // budget.
+    let pad = "x".repeat(300);
     let props: Map<String, Value> = (0..100)
-        .map(|i| (format!("p{i}"), json!({"$ref": "#/$defs/U"})))
+        .map(|p| {
+            let members: Vec<String> =
+                (0..50).map(|m| format!("{pad}{p}_{m}")).collect();
+            (format!("p{p}"), json!({"enum": members}))
+        })
         .collect();
     let schema = json!({
         "type": "object",
         "properties": props,
         "required": ["p0", "p99"],
-        "$defs": {"U": {"enum": members}},
     });
     let syntax = CallSyntax::qwen_xml();
     let values = tagged_values(&syntax, &schema);
@@ -175,29 +202,87 @@ fn tagged_budget_agrees_between_grammar_and_parser() {
 
     let tool = tool(schema);
     let src = grammar_source(&syntax, &[&tool], &lazy()).unwrap();
-    let call = |p0: &str, p99: &str| {
-        format!(
-            "<tool_call>\n<function=t>\n\
-             <parameter=p0>\n{p0}\n</parameter>\n\
-             <parameter=p99>\n{p99}\n</parameter>\n\
-             </function>\n</tool_call>"
-        )
-    };
-    let raw_then_json = call("m7", r#""m7""#);
+    let (first, last) = (format!("{pad}0_7"), format!("{pad}99_7"));
+    let quoted = format!("\"{last}\"");
+    let raw_then_json = qwen_call(&[("p0", &first), ("p99", &quoted)]);
     assert!(accepts(&src, &raw_then_json));
-    assert!(!accepts(&src, &call(r#""m7""#, r#""m7""#)));
-    assert!(!accepts(&src, &call("m7", "m7")));
-    let parsed =
-        parse_text(&syntax, &[&tool], &raw_then_json, false, Leniency::Final);
-    let input = parsed
-        .blocks
+    let both_json =
+        qwen_call(&[("p0", &format!("\"{first}\"")), ("p99", &quoted)]);
+    assert!(!accepts(&src, &both_json));
+    assert!(!accepts(
+        &src,
+        &qwen_call(&[("p0", &first), ("p99", &last)])
+    ));
+    assert_eq!(
+        first_input(&syntax, &tool, &raw_then_json),
+        json!({"p0": first, "p99": last})
+    );
+}
+
+/// 2000 parameters naming one def whose one member is 100 KB (the
+/// hostile recheck): classified once and shared, the member spelled
+/// once — it was 200 MB of spelling and 400 MB of copies — and the
+/// grammar writes its alternation once.
+#[test]
+fn qwen_shared_def_is_classified_and_written_once() {
+    let member = "x".repeat(100_000);
+    let props: Map<String, Value> = (0..2000)
+        .map(|i| (format!("p{i}"), json!({"$ref": "#/$defs/E"})))
+        .collect();
+    let schema = json!({
+        "type": "object",
+        "properties": props,
+        "$defs": {"E": {"enum": [member]}},
+    });
+    let syntax = CallSyntax::qwen_xml();
+    let start = Instant::now();
+    let values = tagged_values(&syntax, &schema);
+    let TaggedValue::Choice(shared) = &values[0].1 else {
+        panic!("{:?}", values[0].1);
+    };
+    for (name, value) in &values {
+        match value {
+            TaggedValue::Choice(c) => assert!(Arc::ptr_eq(c, shared), "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    let tool = tool(schema);
+    let src = grammar_source(&syntax, &[&tool], &lazy()).unwrap();
+    assert_eq!(src.matches(member.as_str()).count(), 1);
+    Grammar::parse(&src).unwrap();
+    let text = qwen_call(&[("p0", &member), ("p1999", &member)]);
+    assert!(accepts(&src, &text));
+    let input = first_input(&syntax, &tool, &text);
+    assert_eq!(input["p1999"], json!(member));
+    assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
+}
+
+/// The same, with an object member, which is JSON: one def rule for
+/// every parameter, its 100 KB written once.
+#[test]
+fn qwen_shared_object_def_is_compiled_once() {
+    let long = "x".repeat(100_000);
+    let props: Map<String, Value> = (0..2000)
+        .map(|i| (format!("p{i}"), json!({"$ref": "#/$defs/E"})))
+        .collect();
+    let schema = json!({
+        "type": "object",
+        "properties": props,
+        "$defs": {"E": {"enum": [{"k": long}]}},
+    });
+    let syntax = CallSyntax::qwen_xml();
+    let start = Instant::now();
+    assert!(tagged_values(&syntax, &schema)
         .iter()
-        .find_map(|b| match b {
-            Block::ToolUse { call } => Some(&call.input),
-            _ => None,
-        })
-        .expect("a call");
-    assert_eq!(input, &json!({"p0": "m7", "p99": "m7"}));
+        .all(|(_, v)| *v == TaggedValue::Json));
+    let tool = tool(schema);
+    let src = grammar_source(&syntax, &[&tool], &lazy()).unwrap();
+    assert_eq!(src.matches(long.as_str()).count(), 1);
+    let value = format!(r#"{{"k":"{long}"}}"#);
+    let text = qwen_call(&[("p7", &value)]);
+    assert!(accepts(&src, &text));
+    assert_eq!(first_input(&syntax, &tool, &text)["p7"], json!({"k": long}));
+    assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
 }
 
 /// A schema too complex for a grammar is a schema error on every path

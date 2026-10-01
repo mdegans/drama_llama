@@ -205,6 +205,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Qwen's tagged-value classifier reads each `$def` once per tool,
+  and the streaming parser classifies each tool once per
+  generation.** Two thousand parameters naming one def whose `enum`
+  holds a 100 KB string spelled that member two thousand times (200
+  MB of `to_string`) and kept a copy per parameter (400 MB), in the
+  emitter and again in the parser; and the streaming parser, which
+  re-parses the whole generation on every token, re-classified the
+  tool on every one. Now:
+  - A def's class is computed once per tool (unless cut short by
+    depth or budget) and each member spelled once; a parameter that
+    `$ref`s it takes its members as shared ids, and parameters with
+    the same member set share one `Choice` (`Arc`), which the grammar
+    writes as one rule for all of them.
+  - The per-tool budget is charged by member bytes spelled, plus a
+    step per schema visited and per member taken from a def, at 2^20
+    (about a mebibyte of member text per tool) where it was 2^16
+    steps of any size.
+  - `StreamParser` keeps each tool's spellings across re-parses, and a
+    lookup clones a reference count, not the member list.
+  Grammars and parses are identical to before on two random corpora
+  (3,000 schemas, and 2,000 with `$defs`, `$ref`s and nullable refs),
+  in every dialect.
+
 - **The grammar matcher's memory is bounded however a hostile schema
   nests its output.** Measured on the hostile recheck's ambiguous
   recursive schema (`N1 = N2 = {"c": N1 | N2}`) and on `[` nested

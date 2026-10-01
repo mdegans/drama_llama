@@ -40,6 +40,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -167,7 +168,14 @@ pub struct StreamParser {
     /// *spelled* marked (see [`Provenance`]); what the parser yields is
     /// restored. `None` parses the text as it stands.
     provenance: Option<Provenance>,
+    /// Each tool's parameter spellings, classified once for the whole
+    /// generation rather than once per re-parse — every token.
+    spellings: Spellings,
 }
+
+/// Each tool's parameter spellings ([`tagged_values`]), by index into
+/// the parse's tools.
+pub(crate) type Spellings = HashMap<usize, Arc<HashMap<String, TaggedValue>>>;
 
 impl StreamParser {
     pub fn new(
@@ -184,6 +192,7 @@ impl StreamParser {
             text_bytes_emitted: 0,
             open: None,
             provenance: None,
+            spellings: Spellings::new(),
         }
     }
 
@@ -258,13 +267,16 @@ impl StreamParser {
     /// prose.
     pub(crate) fn in_flight(&self) -> bool {
         let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
-        parse_text(
+        let mut spellings = self.spellings.clone();
+        parse_text_cached(
             &self.syntax,
             &tool_refs,
             &self.text,
             self.pre_opened_reasoning,
             Leniency::Clipped,
+            &mut spellings,
         )
+        .0
         .status
             == ParseStatus::NeedMoreInput
     }
@@ -334,12 +346,13 @@ impl StreamParser {
 
     fn reparse(&mut self, leniency: Leniency) -> Vec<Block> {
         let tool_refs: Vec<&crate::Tool> = self.tools.iter().collect();
-        let (parsed, open) = parse_text_open(
+        let (parsed, open) = parse_text_cached(
             &self.syntax,
             &tool_refs,
             &self.text,
             self.pre_opened_reasoning,
             leniency,
+            &mut self.spellings,
         );
         self.open = match &self.provenance {
             Some(provenance) => open.map(|o| provenance.restore_open(o)),
@@ -427,6 +440,27 @@ pub(crate) fn parse_text_open(
     pre_opened_reasoning: bool,
     leniency: Leniency,
 ) -> (Parsed, Option<OpenCall>) {
+    parse_text_cached(
+        syntax,
+        tools,
+        text,
+        pre_opened_reasoning,
+        leniency,
+        &mut Spellings::new(),
+    )
+}
+
+/// [`parse_text_open`], reading and filling `spellings`, so a caller that
+/// parses the same tools again and again (the streaming re-parse)
+/// classifies each tool once.
+pub(crate) fn parse_text_cached(
+    syntax: &CallSyntax,
+    tools: &[&Tool],
+    text: &str,
+    pre_opened_reasoning: bool,
+    leniency: Leniency,
+    spellings: &mut Spellings,
+) -> (Parsed, Option<OpenCall>) {
     let mut p = Parser {
         syntax,
         tools,
@@ -437,9 +471,10 @@ pub(crate) fn parse_text_open(
         status: ParseStatus::Complete,
         leniency,
         open: None,
-        spellings: RefCell::default(),
+        spellings: RefCell::new(std::mem::take(spellings)),
     };
     p.run(pre_opened_reasoning);
+    *spellings = p.spellings.into_inner();
     let parsed = Parsed {
         blocks: p.blocks,
         status: p.status,
@@ -460,9 +495,10 @@ struct Parser<'a> {
     /// [`Self::incomplete`] handles it.
     open: Option<OpenCall>,
     /// Each tool's parameter spellings ([`tagged_values`]) by tool
-    /// index, classified once for the whole parse the first time a call
-    /// to the tool needs one — not once per parameter read.
-    spellings: RefCell<HashMap<usize, HashMap<String, TaggedValue>>>,
+    /// index, classified the first time a call to the tool needs one —
+    /// not once per parameter read — and kept across re-parses by a
+    /// caller that lends its own ([`parse_text_cached`]).
+    spellings: RefCell<Spellings>,
 }
 
 impl<'a> Parser<'a> {
@@ -1443,7 +1479,7 @@ impl<'a> Parser<'a> {
                 // Exact under the grammar; trimmed, or quoted (read as
                 // JSON below), only from a model writing unconstrained.
                 let found = [raw, trimmed].into_iter().find_map(|text| {
-                    choice.iter().find(|(s, _)| s == text).map(|(_, v)| v)
+                    choice.iter().find(|m| m.spelling == text).map(|m| &m.value)
                 });
                 if let Some(value) = found {
                     return value.clone();
@@ -1467,13 +1503,16 @@ impl<'a> Parser<'a> {
     /// [`tagged_values`]: super::emit::tagged_values
     fn tagged_value(&self, tool: &str, param: &str) -> Option<TaggedValue> {
         let index = self.tools.iter().position(|t| t.name.as_ref() == tool)?;
+        // A `Choice` is shared, so the clone is a reference count.
         self.spellings
             .borrow_mut()
             .entry(index)
             .or_insert_with(|| {
-                tagged_values(self.syntax, &self.tools[index].schema)
-                    .into_iter()
-                    .collect()
+                Arc::new(
+                    tagged_values(self.syntax, &self.tools[index].schema)
+                        .into_iter()
+                        .collect(),
+                )
             })
             .get(param)
             .cloned()
@@ -2624,6 +2663,30 @@ mod tests {
         )
     }
 
+    /// The streaming parser re-parses the whole generation on every
+    /// token; each tool's spellings are classified once for all of
+    /// them, not once a token.
+    #[test]
+    fn stream_parser_classifies_each_tool_once() {
+        let tool = mode_tool(json!({"enum": ["fast", "slow"]}), None);
+        let mut parser =
+            StreamParser::new(CallSyntax::qwen_xml(), vec![tool], false);
+        let call = qwen_mode_call("fast");
+        let mut first: Option<Arc<HashMap<String, TaggedValue>>> = None;
+        let mut blocks = Vec::new();
+        for c in call.chars() {
+            blocks.extend(parser.push(&c.to_string()));
+            if let Some(spellings) = parser.spellings.get(&0) {
+                let first = first.get_or_insert_with(|| spellings.clone());
+                assert!(Arc::ptr_eq(first, spellings), "reclassified");
+            }
+        }
+        blocks.extend(parser.finish());
+        assert!(first.is_some(), "never classified");
+        let calls = calls_of(&blocks);
+        assert_eq!(calls[0].1, &json!({"mode": "fast"}));
+    }
+
     /// A strict `set_mode` tool whose one required parameter is `mode`.
     fn mode_tool(mode: Value, defs: Option<Value>) -> Tool {
         let mut schema = json!({
@@ -2824,7 +2887,12 @@ mod tests {
             TaggedValue::Choice(
                 pairs
                     .iter()
-                    .map(|(s, v)| (s.to_string(), v.clone()))
+                    .map(|(s, v)| {
+                        Arc::new(crate::dialect::emit::Member {
+                            spelling: s.to_string(),
+                            value: v.clone(),
+                        })
+                    })
                     .collect(),
             )
         };
