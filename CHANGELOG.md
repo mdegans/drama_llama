@@ -205,6 +205,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A grammar with too many rules is `SchemaError::TooComplex`, like
+  one with too many bytes.** The compiler stopped at 8 MiB of source,
+  but `Grammar::parse`'s 2^18-rule limit was only met later, as a
+  `GrammarError::TooLarge` that read like our bug: a 400,000-property
+  object passes it long before 8 MiB. The compiler now counts the rules
+  it writes (`rule_count`, which mirrors the parser: one per
+  definition, string literal, group and `*`/`+`/`?`) and stops at the
+  limit; the dialect emitters and strict `tool_choice` count across
+  tools too, since many tools under the limit can pass it together.
+  `SchemaError::TooComplex` gains `what` (`"bytes"` or `"rules"`).
+
 - **Qwen's tagged dialect writes each `$def` once per tool, and
   classifies a tool's parameters once.** Each JSON-valued parameter
   had its own compiler, so a tool whose P parameters all `$ref` the

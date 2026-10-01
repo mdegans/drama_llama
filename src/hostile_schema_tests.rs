@@ -14,7 +14,9 @@ use crate::dialect::emit::{tagged_values, TaggedValue};
 use crate::dialect::{
     grammar_source, parse_text, Anchor, DialectError, EmitOptions, Leniency,
 };
-use crate::grammar_compile::{SchemaError, JSON_GRAMMAR, MAX_GRAMMAR_BYTES};
+use crate::grammar_compile::{
+    SchemaError, JSON_GRAMMAR, MAX_GRAMMAR_BYTES, MAX_GRAMMAR_RULES,
+};
 use crate::{
     grammar_for_tool_choice, output_config::grammar_for_output_config,
     schema_to_gbnf, Block, CallSyntax, Grammar, GrammarState,
@@ -212,9 +214,13 @@ fn too_complex_schema_fails_cleanly_everywhere() {
         let family = syntax.family;
         match grammar_source(&syntax, &[&tool], &lazy()) {
             Err(DialectError::Schema {
-                source: SchemaError::TooComplex { limit },
+                source: SchemaError::TooComplex { what, limit },
                 ..
-            }) => assert_eq!(limit, MAX_GRAMMAR_BYTES),
+            }) => assert!(
+                (what, limit) == ("bytes", MAX_GRAMMAR_BYTES)
+                    || (what, limit) == ("rules", MAX_GRAMMAR_RULES),
+                "{what} {limit}"
+            ),
             other => panic!("{family:?}: {:?}", other.map(|s| s.len())),
         }
     }

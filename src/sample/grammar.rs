@@ -111,6 +111,47 @@ pub(crate) const MAX_GRAMMAR_BYTES: usize = 8 << 20;
 /// [`MAX_GRAMMAR_BYTES`] bounds the source.
 pub(crate) const MAX_GRAMMAR_RULES: usize = 1 << 18;
 
+/// How many rules [`Grammar::parse`] builds from `source`: one per
+/// definition, plus an anonymous one per string literal, group and
+/// `*` / `+` / `?`. A scan, not a parse — what the schema compiler
+/// checks its output against [`MAX_GRAMMAR_RULES`] with as it writes.
+/// Never more than `source.len()`: each rule costs at least a byte.
+pub(crate) fn rule_count(source: &str) -> usize {
+    let bytes = source.as_bytes();
+    // Skip a `"…"` literal or `[…]` class from its opener at `i`.
+    let skip = |mut i: usize, close: u8| {
+        i += 1;
+        while i < bytes.len() && bytes[i] != close {
+            i += 1 + usize::from(bytes[i] == b'\\');
+        }
+        i + 1
+    };
+    let (mut i, mut rules) = (0, 0);
+    while i < bytes.len() {
+        i = match bytes[i] {
+            b'"' => {
+                rules += 1;
+                skip(i, b'"')
+            }
+            b'[' => skip(i, b']'),
+            b'#' => bytes[i..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |n| i + n + 1),
+            b'(' | b'*' | b'+' | b'?' => {
+                rules += 1;
+                i + 1
+            }
+            b':' if bytes[i..].starts_with(b"::=") => {
+                rules += 1;
+                i + 3
+            }
+            _ => i + 1,
+        };
+    }
+    rules
+}
+
 impl Grammar {
     /// Parse GBNF source text into a compiled grammar.
     ///

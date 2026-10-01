@@ -83,7 +83,9 @@ use std::{collections::HashMap, fmt::Write};
 use serde_json::{Map, Value};
 
 use crate::json_canon::JsonSpacing;
-pub(crate) use crate::sample::grammar::MAX_GRAMMAR_BYTES;
+pub(crate) use crate::sample::grammar::{
+    rule_count, MAX_GRAMMAR_BYTES, MAX_GRAMMAR_RULES,
+};
 
 /// Why a JSON Schema has no grammar. Each is the request's fault — a
 /// 400 `invalid_request_error`, the answer Anthropic gives a schema
@@ -91,19 +93,67 @@ pub(crate) use crate::sample::grammar::MAX_GRAMMAR_BYTES;
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SchemaError {
-    /// The grammar would pass `limit` bytes (8 MiB): compilation stops
-    /// there rather than build it.
+    /// The grammar would pass `limit` `what`s — 8 MiB of source, or
+    /// 2^18 rules: compilation stops there rather than build it.
     #[error(
         "schema is too complex: its compiled grammar would exceed \
-         {limit} bytes"
+         {limit} {what}"
     )]
-    TooComplex { limit: usize },
+    TooComplex { what: &'static str, limit: usize },
     /// An `enum` with no members: no value satisfies it.
     #[error("schema has an empty `enum`, which no value can satisfy")]
     EmptyEnum,
 }
 
 static_assertions::assert_impl_all!(SchemaError: Send, Sync);
+
+/// The rules a grammar's source has grown by, counted as it grows: a
+/// scan of each new stretch ([`rule_count`]), so a long grammar is
+/// counted once, not once per check.
+#[derive(Debug, Default)]
+pub(crate) struct RuleTally {
+    /// Bytes of the source already counted.
+    scanned: usize,
+    rules: usize,
+}
+
+impl RuleTally {
+    /// A tally that counts from byte `start` of the source on.
+    pub(crate) fn from(start: usize) -> Self {
+        Self {
+            scanned: start,
+            rules: 0,
+        }
+    }
+
+    /// Count `src` up to its end, which must not split a rule (a tool's
+    /// rules, written whole); [`SchemaError::TooComplex`] past
+    /// [`MAX_GRAMMAR_RULES`].
+    pub(crate) fn update(&mut self, src: &str) -> Result<(), SchemaError> {
+        self.count(src, src.len())
+    }
+
+    /// Count `src` up to its last newline — a rule's end, where a
+    /// grammar still being written may be cut.
+    fn lines(&mut self, src: &str) -> Result<(), SchemaError> {
+        match src[self.scanned..].rfind('\n') {
+            Some(end) => self.count(src, self.scanned + end + 1),
+            None => Ok(()),
+        }
+    }
+
+    fn count(&mut self, src: &str, end: usize) -> Result<(), SchemaError> {
+        self.rules += rule_count(&src[self.scanned..end]);
+        self.scanned = end;
+        match self.rules > MAX_GRAMMAR_RULES {
+            true => Err(SchemaError::TooComplex {
+                what: "rules",
+                limit: MAX_GRAMMAR_RULES,
+            }),
+            false => Ok(()),
+        }
+    }
+}
 
 /// Emit GBNF rules that constrain a JSON value to `schema`.
 ///
@@ -362,6 +412,9 @@ pub(crate) struct Compiler<'a> {
     /// The first reason this schema has no grammar. Once set, nothing
     /// more is written.
     error: Option<SchemaError>,
+    /// The rules this compiler has written ([`MAX_GRAMMAR_RULES`]),
+    /// from its first write on.
+    tally: Option<RuleTally>,
 }
 
 impl<'a> Compiler<'a> {
@@ -382,6 +435,7 @@ impl<'a> Compiler<'a> {
             prefix,
             quote,
             error: None,
+            tally: None,
         }
     }
 
@@ -409,13 +463,24 @@ impl<'a> Compiler<'a> {
         self.error.map_or(Ok(()), Err)
     }
 
-    /// Whether to write nothing more: a schema already failed, or the
-    /// grammar so far is past [`MAX_GRAMMAR_BYTES`], which fails it.
+    /// Whether to write nothing more: a schema already failed, the
+    /// grammar so far is past [`MAX_GRAMMAR_BYTES`], or what this
+    /// compiler wrote would build more than [`MAX_GRAMMAR_RULES`] — each
+    /// fails it. Counting rules here, not leaving them to
+    /// [`Grammar::parse`](crate::Grammar::parse), makes a grammar too
+    /// big either way the same [`SchemaError::TooComplex`].
     pub(crate) fn halted(&mut self, out: &str) -> bool {
         if self.error.is_none() && out.len() > MAX_GRAMMAR_BYTES {
             self.error = Some(SchemaError::TooComplex {
+                what: "bytes",
                 limit: MAX_GRAMMAR_BYTES,
             });
+        }
+        if self.error.is_none() {
+            let tally = self.tally.get_or_insert(RuleTally::from(out.len()));
+            if let Err(e) = tally.lines(out) {
+                self.error = Some(e);
+            }
         }
         self.error.is_some()
     }
@@ -2109,10 +2174,12 @@ mod tests {
         }
     }
 
-    /// A schema whose grammar would pass [`MAX_GRAMMAR_BYTES`] fails as
-    /// [`SchemaError::TooComplex`] once the grammar gets there, without
-    /// building the rest: a 400,000-way `anyOf` (17 MB of grammar) and
-    /// a 400,000-property object.
+    /// A schema whose grammar would pass [`MAX_GRAMMAR_BYTES`] or
+    /// [`MAX_GRAMMAR_RULES`] fails as [`SchemaError::TooComplex`] once the
+    /// grammar gets there, without building the rest: a 400,000-way
+    /// `anyOf` (17 MB of grammar), a 400,000-property object — both
+    /// pass the rule limit first — and a 1,500,000-way `anyOf` of one
+    /// short name, which passes the byte limit first.
     #[test]
     fn too_complex_schema_stops_at_the_limit() {
         let n = 400_000;
@@ -2128,12 +2195,69 @@ mod tests {
             assert_eq!(
                 schema_to_gbnf(&schema, "s", &mut out),
                 Err(SchemaError::TooComplex {
-                    limit: MAX_GRAMMAR_BYTES
+                    what: "rules",
+                    limit: MAX_GRAMMAR_RULES
                 })
             );
-            assert!(out.len() < MAX_GRAMMAR_BYTES + (1 << 16), "{}", out.len());
+            // Stopped near the limit: what one rule line can add past it.
+            assert!(rule_count(&out) < MAX_GRAMMAR_RULES + 64);
+            assert!(out.len() < MAX_GRAMMAR_BYTES, "{}", out.len());
             let mut dict = String::new();
             assert!(schema_to_dict_gbnf(&schema, "s", "'", &mut dict).is_err());
+        }
+    }
+
+    /// Long rules pass the byte limit before the rule limit: still
+    /// [`SchemaError::TooComplex`], stopped there.
+    #[test]
+    fn too_many_bytes_stops_at_the_limit() {
+        let long = "x".repeat(4096);
+        let variants: Vec<Value> = (0..4096)
+            .map(|i| json!({"const": format!("{long}{i}")}))
+            .collect();
+        let schema = json!({"anyOf": variants});
+        let mut out = String::new();
+        assert_eq!(
+            schema_to_gbnf(&schema, "s", &mut out),
+            Err(SchemaError::TooComplex {
+                what: "bytes",
+                limit: MAX_GRAMMAR_BYTES
+            })
+        );
+        assert!(out.len() < MAX_GRAMMAR_BYTES + (1 << 16), "{}", out.len());
+    }
+
+    /// [`rule_count`] is the number of rules [`Grammar::parse`]
+    /// builds — literals, groups, repetitions and comments included —
+    /// so the compiler's rule limit is the parser's.
+    #[test]
+    fn rule_count_matches_the_parser() {
+        let schemas = [
+            json!({"type": "object", "properties": {
+                "a": {"type": "string"},
+                "b": {"type": "array", "items": {"enum": ["x\"y", 1, null]}},
+                "c": {"anyOf": [{"type": "integer"}, {"const": "(?*+)"}]},
+            }, "required": ["a"]}),
+            json!({"$ref": "#/$defs/N", "$defs": {"N": {"type": "object",
+                "properties": {"kids": {"type": "array",
+                    "items": {"$ref": "#/$defs/N"}}}}}}),
+        ];
+        for schema in schemas {
+            for dict in [false, true] {
+                let mut src = String::from("# a comment: \"(\n");
+                src.push_str("root ::= s [\\]\"(]?\n");
+                match dict {
+                    false => schema_to_gbnf(&schema, "s", &mut src),
+                    true => schema_to_dict_gbnf(&schema, "s", "'", &mut src),
+                }
+                .unwrap();
+                if dict {
+                    emit_dict_value_rules("'", &mut src);
+                }
+                src.push_str(JSON_GRAMMAR);
+                let grammar = crate::Grammar::parse(&src).unwrap();
+                assert_eq!(rule_count(&src), grammar.rule_count(), "{src}");
+            }
         }
     }
 

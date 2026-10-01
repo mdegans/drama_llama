@@ -403,8 +403,11 @@ pub(crate) fn build_grammar_source(
     // schema is off — `object` from JSON_GRAMMAR covers the permissive
     // case.
     if opts.strict_schema {
+        // Rules across every tool, as `dialect::grammar_source` counts.
+        let mut tally = crate::grammar_compile::RuleTally::default();
         for (i, tool) in tools.iter().enumerate() {
             schema_to_gbnf(&tool.schema, &format!("args_{i}"), &mut src)
+                .and_then(|()| tally.update(&src))
                 .map_err(|source| ToolChoiceError::Schema {
                     tool: tool.name.to_string(),
                     source,

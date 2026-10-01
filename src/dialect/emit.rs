@@ -46,7 +46,7 @@ use serde_json::Value;
 use crate::grammar_compile::{
     def_target, dict_encode_value, emit_dict_value_rules, emit_until_rules,
     escape_for_gbnf_string, json_grammar_canonical, schema_to_dict_gbnf,
-    schema_to_gbnf, Compiler, SchemaError, FIELD_SEP, KV_SEP,
+    schema_to_gbnf, Compiler, RuleTally, SchemaError, FIELD_SEP, KV_SEP,
 };
 use crate::Tool;
 
@@ -274,6 +274,9 @@ pub fn grammar_source(
     let per_open = escape_for_gbnf_string(&syntax.per_call_start);
     let per_close = escape_for_gbnf_string(&syntax.per_call_end);
 
+    // Rules across every tool: each tool's compiler counts its own, and
+    // many tools under the limit can still pass it together.
+    let mut tally = RuleTally::default();
     for (i, tool) in tools.iter().enumerate() {
         match syntax.family {
             Family::TagWithTagged => emit_tagged_call(
@@ -308,6 +311,7 @@ pub fn grammar_source(
             ),
             Family::None | Family::Harmony => unreachable!("checked above"),
         }?;
+        tally.update(&src).map_err(schema_err(tool))?;
     }
 
     if syntax.family == Family::TagWithDict {
@@ -436,9 +440,11 @@ fn harmony_grammar_source(
             }
         }
     }
+    let mut tally = RuleTally::default();
     for (i, tool) in tools.iter().enumerate() {
         schema_to_gbnf(&tool.schema, &format!("h_args_{i}"), &mut src)
             .map_err(schema_err(tool))?;
+        tally.update(&src).map_err(schema_err(tool))?;
     }
     src.push_str(&json_grammar_canonical(spacing));
     Ok(src)
