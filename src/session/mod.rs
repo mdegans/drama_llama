@@ -6775,6 +6775,8 @@ impl<B: Backend> Session<B> {
             max_tokens,
             tool_use: false,
             last: None,
+            calls: TurnCalls::default(),
+            dropped_last: false,
             stop: None,
         })
     }
@@ -7072,24 +7074,33 @@ impl<B: Backend> Session<B> {
                 (blocks, budget, in_flight)
             }
         };
+        // A call repeating an earlier one in this turn is dropped (see
+        // `TurnCalls`) — after any stop-sequence cut, so a cut call is
+        // compared as the client will see it. Streaming drops the same
+        // calls (`BlockStream`).
+        let (blocks, dropped_repeat) = drop_repeated_calls(blocks);
 
-        // Whether this turn may leave an auto-tip. A clipped turn whose
-        // KV no longer matches its own output must not: a stop sequence
-        // was cut out of `raw_text` but its leading tokens are in KV; a
+        // Whether this turn may leave an auto-tip. A turn whose KV no
+        // longer matches its own output must not: a stop sequence was
+        // cut out of `raw_text` but its leading tokens are in KV; a
         // cut call's bytes are in KV but no render reproduces them (half
-        // a value has no spelling, and a closed one closes); and a turn
-        // cut mid-constraint carries a mid-structure sampler state the
-        // next call would resume from. Such a turn still records its
-        // prompt extent (breakpoints and all) — only the generated span
-        // is left to the next call's LCP walk, which compares token ids
-        // and is safe by construction. A plain `max_tokens` cut in free
-        // text keeps its tip: its bytes all re-render (an unclosed
-        // thought included — see `OPEN_THOUGHT_SIGNATURE`).
-        let keep_tip = match &cut {
-            None => true,
-            Some(Cut::Budget) => !constraint_incomplete && !in_flight,
-            Some(Cut::StopSequence(_)) => false,
-        };
+        // a value has no spelling, and a closed one closes); a dropped
+        // repeat call's bytes are in KV but not in the turn the client
+        // holds, so no re-render of that turn reproduces the emission;
+        // and a turn cut mid-constraint carries a mid-structure sampler
+        // state the next call would resume from. Such a turn still
+        // records its prompt extent (breakpoints and all) — only the
+        // generated span is left to the next call's LCP walk, which
+        // compares token ids and is safe by construction. A plain
+        // `max_tokens` cut in free text keeps its tip: its bytes all
+        // re-render (an unclosed thought included — see
+        // `OPEN_THOUGHT_SIGNATURE`).
+        let keep_tip = !dropped_repeat
+            && match &cut {
+                None => true,
+                Some(Cut::Budget) => !constraint_incomplete && !in_flight,
+                Some(Cut::StopSequence(_)) => false,
+            };
 
         // Compute the auto-tip hash from the parsed assistant blocks
         // — `run_call` is the only completion path with parsed
@@ -7416,6 +7427,10 @@ impl<B: Backend> Session<B> {
 
     /// Batch variant of [`Self::complete_stream`]: collect every emitted block
     /// into a `Vec`, then run the grammar-violation check.
+    ///
+    /// A tool call identical (name and input) to an earlier one in the
+    /// same turn is dropped, as the stream drops it — see
+    /// [`BlockStream`].
     ///
     /// # Errors
     ///
@@ -8141,6 +8156,70 @@ fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
     out
 }
 
+/// The client tool calls one turn has produced so far, by identity —
+/// name and input — so a call that repeats one exactly can be dropped.
+///
+/// The lazy grammar arms on the bare opener special, so a stray real
+/// `<tool_call>` after a *finished* call (`{call}\n<tool_call>`, then
+/// end of turn) is seated as a forced second call, and a model with
+/// nothing more to say likely fills it with the call it just made: a
+/// duplicate `create_post` or `vote`, which the client would dispatch
+/// twice. Anthropic never emits identical parallel calls, so dropping
+/// the repeat is parity-safe.
+///
+/// Identity is `serde_json::Value` equality on the input — member
+/// order is not significant, and a number spelled differently (`1`,
+/// `1.0`) is a different value, so a call that differs at all is kept.
+/// Server tool calls cannot occur in local inference and are not
+/// tracked.
+#[derive(Debug, Default)]
+struct TurnCalls(Vec<(String, serde_json::Value)>);
+
+impl TurnCalls {
+    /// Whether `block` is a [`Block::ToolUse`](crate::Block::ToolUse)
+    /// repeating one already seen this turn; any other call is
+    /// remembered. Logs the drop at `WARN`, by tool name only — the
+    /// trace is operator-facing, and the input is the agent's content.
+    fn is_repeat(&mut self, block: &crate::Block) -> bool {
+        let crate::Block::ToolUse { call } = block else {
+            return false;
+        };
+        let seen = self
+            .0
+            .iter()
+            .any(|(name, input)| name == &call.name && input == &call.input);
+        if seen {
+            tracing::warn!(
+                target: "drama_llama::session",
+                event = "tool_call_dropped",
+                reason = "duplicate",
+                tool = %call.name,
+                "dropped a tool call identical to an earlier one in the \
+                 same turn (name and input): a call forced after a stray \
+                 opener",
+            );
+        } else {
+            self.0.push((call.name.to_string(), call.input.clone()));
+        }
+        seen
+    }
+}
+
+/// The batch half of [`TurnCalls`]: `blocks` without the calls that
+/// repeat an earlier one, and whether any were dropped. Prose either
+/// side of a dropped call is re-merged.
+fn drop_repeated_calls(blocks: Vec<crate::Block>) -> (Vec<crate::Block>, bool) {
+    let mut calls = TurnCalls::default();
+    let n = blocks.len();
+    let kept: Vec<crate::Block> =
+        blocks.into_iter().filter(|b| !calls.is_repeat(b)).collect();
+    if kept.len() == n {
+        (kept, false)
+    } else {
+        (merge_adjacent_prose(kept), true)
+    }
+}
+
 /// Infer a [`StopReason`](misanthropic::response::StopReason) for a
 /// finished generation, plus the matched stop sequence when that is
 /// the reason. Takes the output's shape rather than its blocks so the
@@ -8247,7 +8326,10 @@ fn infer_stop_reason(
 /// `stop::StopFilter`). A generation cut short (`max_tokens`, a stop
 /// sequence) yields an incomplete trailing call cut short, as Anthropic
 /// returns it, instead of its bytes as text (#121). Like the batch path,
-/// it halts once the grammar is exhausted. Once drained,
+/// it halts once the grammar is exhausted, and never yields a tool call
+/// identical (name and input) to one it already yielded this turn —
+/// the forced call a stray opener after a finished call arms; a call is
+/// released only whole, so none of a dropped one is seen. Once drained,
 /// [`Self::stop_reason`] reports the ending the batch path would, and
 /// [`Self::open_call_json`] whether the last call was left open.
 pub struct BlockStream<'engine, B: Backend> {
@@ -8272,6 +8354,13 @@ pub struct BlockStream<'engine, B: Backend> {
     tool_use: bool,
     /// The last block yielded.
     last: Option<crate::Block>,
+    /// The turn's calls so far, to drop one that repeats an earlier
+    /// one (see `TurnCalls`).
+    calls: TurnCalls,
+    /// Whether the last block the parser released was a dropped
+    /// repeat: then the call a clip left open was never yielded, and
+    /// [`Self::open_call_json`] has nothing to report.
+    dropped_last: bool,
     /// Set once drained: see [`Self::stop_reason`].
     stop: Option<(Option<misanthropic::response::StopReason>, Option<String>)>,
 }
@@ -8300,7 +8389,23 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
     /// by a stop sequence is closed, and gets its `content_block_stop`
     /// on Anthropic too.
     pub fn open_call_json(&self) -> Option<&str> {
-        self.drained.then(|| self.filter.open_call_json()).flatten()
+        (self.drained && !self.dropped_last)
+            .then(|| self.filter.open_call_json())
+            .flatten()
+    }
+
+    /// Queue what the parser released, less any call that repeats an
+    /// earlier one this turn — the batch path's `drop_repeated_calls`,
+    /// a block at a time. The parser releases a call only whole (closed,
+    /// or cut short at the end), so judging it here, before it is
+    /// queued, means no part of a dropped call is ever yielded.
+    fn admit(&mut self, blocks: Vec<crate::Block>) {
+        for block in blocks {
+            self.dropped_last = self.calls.is_repeat(&block);
+            if !self.dropped_last {
+                self.pending.push_back(block);
+            }
+        }
     }
 
     /// End of generation: flush, pick the leniency, settle the ending.
@@ -8314,7 +8419,7 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         // and may themselves complete a stop sequence.
         let clipped = budget.is_some() || self.filter.hit().is_some();
         let rest = self.filter.finish(clipped);
-        self.pending.extend(rest);
+        self.admit(rest);
         // A stop outranks the budget: the text reached it first.
         let cut = self
             .filter
@@ -8361,7 +8466,7 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                     }
                     self.generated += 1;
                     let blocks = self.filter.push(&piece);
-                    self.pending.extend(blocks);
+                    self.admit(blocks);
                     // A stop sequence ends the turn; so does `run_call`'s
                     // one-shot halt on an exhausted grammar, so both
                     // paths stop on the same token.
@@ -11950,7 +12055,9 @@ mod tests {
     /// A weightless [`Backend`] for driving `Session`'s cache plumbing
     /// end to end: a byte tokenizer, a ChatML template, and a decoder
     /// whose `restore_to` records every rung it is asked for and fails
-    /// at the positions it is told to — the evicted-snapshot case.
+    /// at the positions it is told to — the evicted-snapshot case. Given
+    /// a `script`, the decoder also *generates*: each decode makes the
+    /// script's next token (then EOS) the only plausible one.
     mod mock {
         use crate::backend::{Backend, Decoder, MemoryRmError, Model};
         use crate::Token;
@@ -11979,6 +12086,28 @@ mod tests {
             pub(super) missing: Vec<i32>,
             /// Every `(seq, pos)` restore asked for, in order.
             pub(super) restores: Vec<(i32, i32)>,
+            /// The tokens a generation emits, in order, then EOS. Empty:
+            /// flat logits, and no KV extent reported (`-1`).
+            pub(super) script: Vec<Token>,
+            /// Script tokens decoded since the last prefill.
+            cursor: usize,
+            /// One past the last position decoded.
+            kv_end: usize,
+        }
+
+        impl MockDecoder {
+            /// Logits for the next token: the script's, far above the
+            /// rest, when there is a script.
+            fn next_logits(&mut self) -> &[f32] {
+                self.logits.clear();
+                self.logits.resize(N_VOCAB, 0.0);
+                if !self.script.is_empty() {
+                    let next =
+                        self.script.get(self.cursor).copied().unwrap_or(EOS);
+                    self.logits[next as usize] = 100.0;
+                }
+                &self.logits
+            }
         }
 
         #[derive(Debug, thiserror::Error)]
@@ -11990,21 +12119,23 @@ mod tests {
 
             fn prefill(
                 &mut self,
-                _: &[Token],
-                _: usize,
+                tokens: &[Token],
+                start_pos: usize,
                 _: i32,
             ) -> Result<&[f32], MockError> {
-                self.logits.resize(N_VOCAB, 0.0);
-                Ok(&self.logits)
+                self.cursor = 0;
+                self.kv_end = start_pos + tokens.len();
+                Ok(self.next_logits())
             }
             fn step(
                 &mut self,
                 _: Token,
-                _: usize,
+                pos: usize,
                 _: i32,
             ) -> Result<&[f32], MockError> {
-                self.logits.resize(N_VOCAB, 0.0);
-                Ok(&self.logits)
+                self.cursor += 1;
+                self.kv_end = pos + 1;
+                Ok(self.next_logits())
             }
             fn n_ctx(&self) -> u32 {
                 4096
@@ -12012,14 +12143,23 @@ mod tests {
             fn n_seq_max(&self) -> u32 {
                 4
             }
-            fn memory_clear(&mut self) {}
-            fn memory_seq_rm(&mut self, _: i32, _: i32, _: i32) -> bool {
+            fn memory_clear(&mut self) {
+                self.kv_end = 0;
+            }
+            fn memory_seq_rm(&mut self, _: i32, p0: i32, p1: i32) -> bool {
+                if p1 < 0 {
+                    self.kv_end = self.kv_end.min(p0.max(0) as usize);
+                }
                 true
             }
             fn memory_seq_cp(&mut self, _: i32, _: i32, _: i32, _: i32) {}
             fn memory_seq_keep(&mut self, _: i32) {}
             fn memory_seq_pos_max(&mut self, _: i32) -> i32 {
-                -1
+                if self.script.is_empty() {
+                    -1
+                } else {
+                    self.kv_end as i32 - 1
+                }
             }
             fn checkpoint_pos(&mut self, _: i32, _: i32) {}
             fn restore_to(
@@ -12284,6 +12424,225 @@ mod tests {
             assert_eq!(field(fields, "diverge_at"), Some("500"));
         }
         assert_eq!(field(&events[0].1, "lost_tokens"), Some("939"));
+    }
+
+    /// Cogito's shape: per-call JSON markers and a `\n` between calls,
+    /// so a second call after a finished one is grammar-legal.
+    fn per_call_json() -> crate::CallSyntax {
+        crate::CallSyntax {
+            section_start: String::new(),
+            section_end: String::new(),
+            per_call_start: "<tool_call>\n".into(),
+            per_call_end: "\n</tool_call>".into(),
+            call_separator: "\n".into(),
+            ..crate::CallSyntax::hermes_json()
+        }
+    }
+
+    /// A user turn with one tool, `vote`, on offer (`tool_choice`
+    /// absent: the lazy grammar).
+    fn vote_prompt() -> Prompt {
+        let tool = crate::Tool::builder("vote")
+            .description("Vote on a post.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": { "post_id": { "type": "string" } },
+                "required": ["post_id"],
+            }))
+            .build()
+            .expect("valid test tool");
+        Prompt {
+            tools: Some(vec![tool.into()]),
+            ..Prompt::default()
+        }
+        .add_message((crate::Role::User, "Upvote 7ad26ccd."))
+        .unwrap()
+    }
+
+    /// A cache-on mock session whose generation is `vote` called with
+    /// each of `inputs`, in the canonical bytes the grammar forces, then
+    /// EOS.
+    fn scripted_votes(
+        inputs: &[serde_json::Value],
+    ) -> Session<mock::MockBackend> {
+        let dialect = per_call_json();
+        let calls: Vec<(&str, &serde_json::Value)> =
+            inputs.iter().map(|input| ("vote", input)).collect();
+        let emission = crate::dialect::render_reference(&dialect, &calls)
+            .expect("canonical calls");
+        let mut session = mock::session(&[])
+            .with_dialect(dialect)
+            .without_repetition();
+        session.engine.decoder.script =
+            emission.bytes().map(Token::from).collect();
+        session
+    }
+
+    fn call_inputs(blocks: &[crate::Block]) -> Vec<&serde_json::Value> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                crate::Block::ToolUse { call } => Some(&call.input),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dropped_calls(
+        events: &[(tracing::Level, Vec<(String, String)>)],
+    ) -> Vec<(tracing::Level, &str)> {
+        events
+            .iter()
+            .filter(|(_, f)| field(f, "event") == Some("tool_call_dropped"))
+            .map(|(level, f)| (*level, field(f, "tool").unwrap_or("")))
+            .collect()
+    }
+
+    fn tip_of(session: &Session<mock::MockBackend>) -> Option<&Breakpoint> {
+        let cache = session.prefix_cache.as_ref().expect("cache on");
+        cache.last_slot().expect("a recorded slot").tip.as_ref()
+    }
+
+    /// A stray opener after a finished call forces a second call, and
+    /// the model fills it with the one it just made: the repeat is
+    /// dropped (logged at `WARN`, by tool name), and the turn leaves no
+    /// tip — its KV holds a call the returned turn does not.
+    #[test]
+    fn a_repeated_call_is_dropped_and_leaves_no_tip() {
+        let input = serde_json::json!({ "post_id": "7ad26ccd" });
+        let mut session = scripted_votes(&[input.clone(), input.clone()]);
+        let mut response = None;
+        let events = capture_events(|| {
+            response = Some(
+                session.complete_response(&vote_prompt()).expect("complete"),
+            );
+        });
+        let response = response.unwrap();
+        assert_eq!(
+            response.stop_reason,
+            Some(misanthropic::response::StopReason::ToolUse),
+        );
+        let message: crate::prompt::Message = response.inner.into();
+        assert_eq!(call_inputs(&message.content.0), [&input]);
+        assert_eq!(dropped_calls(&events), [(tracing::Level::WARN, "vote")],);
+        assert!(tip_of(&session).is_none(), "the dropped call is in KV");
+    }
+
+    /// The control: a second call that differs is a parallel call, kept,
+    /// and the turn keeps its tip.
+    #[test]
+    fn a_different_second_call_is_kept_with_its_tip() {
+        let first = serde_json::json!({ "post_id": "7ad26ccd" });
+        let second = serde_json::json!({ "post_id": "1f2e3d4c" });
+        let mut session = scripted_votes(&[first.clone(), second.clone()]);
+        let mut blocks = None;
+        let events = capture_events(|| {
+            blocks = Some(
+                session.complete_blocks(&vote_prompt()).expect("complete"),
+            );
+        });
+        assert_eq!(call_inputs(&blocks.unwrap()), [&first, &second]);
+        assert!(dropped_calls(&events).is_empty());
+        assert!(tip_of(&session).is_some());
+    }
+
+    /// Streamed, the repeat is never yielded — the parser releases a
+    /// call only whole, and it is judged before it is queued — and the
+    /// ending reads as the batch path's.
+    #[test]
+    fn a_repeated_call_is_never_streamed() {
+        let input = serde_json::json!({ "post_id": "7ad26ccd" });
+        let mut session = scripted_votes(&[input.clone(), input.clone()]);
+        let prompt = vote_prompt();
+        let events = capture_events(|| {
+            let mut stream = session.complete_stream(&prompt).expect("stream");
+            let streamed: Vec<crate::Block> = stream.by_ref().collect();
+            assert_eq!(call_inputs(&streamed), [&input]);
+            assert_eq!(
+                stream.stop_reason(),
+                Some((Some(misanthropic::response::StopReason::ToolUse), None)),
+            );
+            assert_eq!(stream.open_call_json(), None);
+        });
+        assert_eq!(dropped_calls(&events), [(tracing::Level::WARN, "vote")],);
+    }
+
+    /// A repeat the budget cuts once its input is whole is still a
+    /// repeat: dropped from both paths, so the stream has no open call
+    /// to report — the last call it yielded is closed.
+    #[test]
+    fn a_clipped_repeat_is_dropped_and_not_left_open() {
+        use misanthropic::response::StopReason;
+        let input = serde_json::json!({ "post_id": "7ad26ccd" });
+        let emission = crate::dialect::render_reference(
+            &per_call_json(),
+            &[("vote", &input), ("vote", &input)],
+        )
+        .unwrap();
+        // Cut after the second call's arguments close, before its own.
+        let budget = emission.len() - "}\n</tool_call>".len();
+        let prompt = vote_prompt()
+            .max_tokens(std::num::NonZeroU32::new(budget as u32).unwrap());
+
+        let mut session = scripted_votes(&[input.clone(), input.clone()]);
+        let response = session.complete_response(&prompt).expect("complete");
+        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        let message: crate::prompt::Message = response.inner.into();
+        assert_eq!(call_inputs(&message.content.0), [&input]);
+
+        let mut stream = session.complete_stream(&prompt).expect("stream");
+        let streamed: Vec<crate::Block> = stream.by_ref().collect();
+        assert_eq!(call_inputs(&streamed), [&input]);
+        assert_eq!(
+            stream.stop_reason(),
+            Some((Some(StopReason::MaxTokens), None)),
+        );
+        assert_eq!(stream.open_call_json(), None);
+    }
+
+    /// Identity is the input *value*: member order is not significant,
+    /// any other difference is (a different tool, a different value, a
+    /// number spelled differently). Prose either side of a dropped call
+    /// re-merges.
+    #[test]
+    fn drop_repeated_calls_compares_name_and_input_value() {
+        use crate::prompt::ToolUse;
+        let call = |name: &'static str, input: serde_json::Value| {
+            crate::Block::from(ToolUse::new(name, input))
+        };
+        let text = |t: &'static str| crate::Block::from(t);
+        let (kept, dropped) = drop_repeated_calls(vec![
+            call("vote", serde_json::json!({ "a": 1, "b": "x" })),
+            text("one "),
+            call("vote", serde_json::json!({ "b": "x", "a": 1 })),
+            text("two"),
+            call("post", serde_json::json!({ "a": 1, "b": "x" })),
+            call("vote", serde_json::json!({ "a": 1.0, "b": "x" })),
+            call("vote", serde_json::json!({ "a": 2, "b": "x" })),
+        ]);
+        assert!(dropped);
+        let shape: Vec<String> = kept
+            .iter()
+            .map(|b| match b {
+                crate::Block::ToolUse { call } => {
+                    format!("{}{}", call.name, call.input)
+                }
+                crate::Block::Text { text, .. } => text.to_string(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                r#"vote{"a":1,"b":"x"}"#,
+                "one two",
+                r#"post{"a":1,"b":"x"}"#,
+                r#"vote{"a":1.0,"b":"x"}"#,
+                r#"vote{"a":2,"b":"x"}"#,
+            ],
+        );
+        let unique = vec![call("vote", serde_json::json!({}))];
+        assert_eq!(drop_repeated_calls(unique.clone()), (unique, false));
     }
 
     /// The divergence context: shared text before, then each side.

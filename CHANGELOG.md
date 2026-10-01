@@ -92,6 +92,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `section_start` / `per_call_start` remain the canonical bytes. A
   model naming its own opener in prose now gets a call forced — the
   special was rejected from free text anyway.
+- **A tool call that repeats an earlier one in the same turn is
+  dropped.** Arming on the bare special has one risky shape: a stray
+  real opener after a *finished* call (`{call}\n<tool_call>`, then end
+  of turn) gets a second call forced, and a model with nothing more to
+  say fills it with the call it just made — a duplicate `create_post`
+  or `vote` the client would dispatch twice. A call with the same name
+  and an identical input (JSON value equality: member order aside,
+  `1` and `1.0` differ) is now dropped from the turn, batch and
+  streamed alike, and logged at `WARN` (`event = "tool_call_dropped"`,
+  the tool name only). Anthropic never emits identical parallel calls,
+  so a parity client never sees one; a call that differs in anything
+  is a parallel call and stays. The stream judges a call before
+  yielding it, and the parser releases calls only whole, so no part of
+  a dropped one is ever seen; a clipped repeat is dropped too, and
+  `BlockStream::open_call_json` then reports no open call. The batch
+  turn leaves no auto-tip: its KV holds the dropped call, which no
+  re-render of the returned turn reproduces.
 - **The #101 containment log says where.** The `EmittedSpecialToken`
   error event now carries up to three `hits` (block index and kind,
   offset in the block and in the emission, ~96 bytes of context each
