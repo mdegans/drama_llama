@@ -117,6 +117,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that already closed the turn's thought (a prefilled closed thought,
   thinking on) now gets the unified grammar, since its closer can never
   be written and the deferred one would never fire.
+- **The gap after a thought is bounded whitespace.** Every
+  output_config grammar admits the measured separator after a thought
+  *and* any other run of up to two whitespace bytes
+  (`OutputConfigOptions::thought_separator`, `THOUGHT_GAP_MAX`). A
+  literal gap masked what models write — `[/THINK]\n{` and
+  `[/THINK] {` against Mistral 4's measured empty gap, `<channel|>\n\n{`
+  against Gemma 4's single byte — and where the gap rode in on the
+  closer's own token (cogito's `>\n\n` after `</`, a text-spelled
+  `]\n` after `[/THINK`) the deferred body woke on bytes it refused,
+  which ends the turn. The bound keeps whitespace from running on.
 - **A token that would wake a deferred grammar illegally is masked.**
   While a deferred grammar sleeps nothing masks the vocab, so a token
   that finished its trigger and carried bytes the grammar refuses was

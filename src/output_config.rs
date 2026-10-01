@@ -61,6 +61,11 @@ pub const THINK_CLOSE_TRIGGER: &[u8] = b"</think>";
 /// The default [`OutputConfigOptions::thought_open`].
 pub const THINK_OPEN: &str = "<think>";
 
+/// The most whitespace the gap after a thought admits besides the
+/// measured separator (see [`OutputConfigOptions::thought_separator`]):
+/// enough for `""`, `" "`, `"\n"` and `"\n\n"`.
+pub const THOUGHT_GAP_MAX: usize = 2;
+
 /// The [`ResponseFraming::Harmony`] phase-split trigger: the final
 /// channel's header up to the channel name. What follows it — an
 /// optional ` <|constrain|>json`, then `<|message|>` — is the grammar's.
@@ -105,13 +110,19 @@ pub struct OutputConfigOptions {
     /// to keep the old unified-grammar behaviour (useful for callers that
     /// need the matcher to also guard the thought structure itself).
     pub phase_split: bool,
-    /// The bytes between `</think>` and the JSON body, spelled
-    /// literally so the constrained turn re-renders byte-for-byte —
-    /// a fact about the template, not a preference: `Session` fills it
-    /// from the dialect's measured
+    /// The bytes the template renders between `</think>` and the JSON
+    /// body — a fact about the template, not a preference: `Session`
+    /// fills it from the dialect's measured
     /// [`ReasoningSyntax::separator`](crate::dialect::ReasoningSyntax::separator)
-    /// on every call. `None` keeps the permissive single-byte `ws` gap,
-    /// which cannot express Qwen's `\n\n` (#112).
+    /// on every call. The gap after a thought always admits it, plus
+    /// any other run of up to [`THOUGHT_GAP_MAX`] whitespace bytes:
+    /// bounded, so the model cannot idle in whitespace, but permissive,
+    /// because a literal gap masks the spellings a model really writes
+    /// (`[/THINK]\n{` against Mistral 4's measured empty gap), and a
+    /// token that closes the thought *and* carries the gap
+    /// (`>\n\n` after `</`) wakes a deferred body grammar mid-token —
+    /// where a refused gap ends the turn instead of steering it. A
+    /// single-byte gap could not express Qwen's `\n\n` (#112).
     pub thought_separator: Option<String>,
     /// Where the JSON body sits in the response — a fact about the chat
     /// format, filled by `Session` from its dialect on every call, like
@@ -149,14 +160,25 @@ impl Default for OutputConfigOptions {
 }
 
 impl OutputConfigOptions {
-    /// The GBNF fragment that follows a closed thought: the literal
-    /// separator when known, else the permissive `ws`.
-    fn after_thought(&self) -> String {
-        match &self.thought_separator {
-            Some(sep) if sep.is_empty() => String::new(),
-            Some(sep) => format!(r#" "{}""#, escape_for_gbnf_string(sep)),
-            None => " ws".to_string(),
-        }
+    /// Emit `thought_gap`, the whitespace that follows a closed
+    /// thought: up to [`THOUGHT_GAP_MAX`] bytes of it, or the measured
+    /// separator when that is longer or spelled outside `[ \t\n\r]`.
+    fn emit_thought_gap(&self, out: &mut String) {
+        let ws = r"[ \t\n\r]";
+        let bounded = (0..THOUGHT_GAP_MAX)
+            .fold(String::new(), |inner, _| format!("( {ws} {inner})? "));
+        let measured = self.thought_separator.as_deref().filter(|sep| {
+            sep.len() > THOUGHT_GAP_MAX
+                || !sep.bytes().all(|b| b" \t\n\r".contains(&b))
+        });
+        let _ = match measured {
+            Some(sep) => writeln!(
+                out,
+                r#"thought_gap ::= {bounded}| "{}""#,
+                escape_for_gbnf_string(sep)
+            ),
+            None => writeln!(out, "thought_gap ::= {}", bounded.trim_end()),
+        };
     }
 
     /// [`Self::thought_close`], the default standing in for an empty
@@ -378,20 +400,21 @@ pub(crate) fn build_grammar_source(
         // this dominates `allow_thought = false`, mirroring the tool
         // grammars' `EagerThoughtPreOpened` precedent — a caller
         // cannot forbid a thought the render already started.
-        let after = opts.after_thought();
-        let _ = writeln!(src, "root ::= thought_close{after} output_schema");
+        let _ =
+            writeln!(src, "root ::= thought_close thought_gap output_schema");
         opts.emit_thought_close(&mut src);
+        opts.emit_thought_gap(&mut src);
     } else if opts.allow_thought {
-        let after = opts.after_thought();
         let open = match opts.thought_open.as_str() {
             "" => String::new(),
             open => format!(r#""{}" "#, escape_for_gbnf_string(open)),
         };
         let _ = writeln!(
             src,
-            "root ::= ( {open}thought_close{after} | ws ) output_schema"
+            "root ::= ( {open}thought_close thought_gap | ws ) output_schema"
         );
         opts.emit_thought_close(&mut src);
+        opts.emit_thought_gap(&mut src);
     } else {
         let _ = writeln!(src, "root ::= ws output_schema");
     }
@@ -412,8 +435,8 @@ pub(crate) fn build_json_only_grammar_source(
     let mut src = String::with_capacity(512);
     match opts.framing {
         ResponseFraming::Bare => {
-            let _ =
-                writeln!(src, "root ::={} output_schema", opts.after_thought());
+            let _ = writeln!(src, "root ::= thought_gap output_schema");
+            opts.emit_thought_gap(&mut src);
         }
         ResponseFraming::Harmony => {
             // The trigger consumed `<|channel|>final`; the rest of the
@@ -486,12 +509,6 @@ mod tests {
         OutputConfig::json_schema(schema)
     }
 
-    /// #112: with the template's separator known, every root that
-    /// follows a thought spells it — and only it. The permissive `ws`
-    /// is at most one byte, so Qwen's `</think>\n\n{…}` was
-    /// unreachable and the model wrote `</think>\n{…}`, `</think> {…}`
-    /// or `</think>{…}` instead; each re-rendered differently and lost
-    /// the tip.
     /// An effort-only `output_config` (`format: None`) requests no
     /// grammar: it must fall through to the tool grammar, not fail the
     /// request as an unsupported format (2026-09-23 Agora outage).
@@ -510,44 +527,66 @@ mod tests {
         assert!(grammar_for_prompt(&prompt, &opts, false).unwrap().is_none());
     }
 
+    /// The gap after a thought, in every root that follows one: the
+    /// measured separator (Qwen's `\n\n`, #112 — once unreachable
+    /// behind a single-byte `ws`) and the spellings a model really
+    /// writes beside it (`[/THINK]\n{` against Mistral 4's measured
+    /// empty gap), but bounded, so whitespace cannot run on.
     #[test]
-    fn thought_separator_is_spelled_after_every_thought() {
+    fn thought_gap_is_bounded_whitespace() {
         let schema = cfg(json!({
             "type": "object",
             "properties": {"x": {"type": "integer"}},
             "required": ["x"],
         }))
         .format_schema();
-        let opts = OutputConfigOptions {
-            thought_separator: Some("\n\n".into()),
+        let body = r#"{"x":1}"#;
+        let good = ["", " ", "\n", "\n\n", " \n", "\r\n"];
+        let bad = ["\n\n\n", "   ", "\n \n"];
+        for sep in [None, Some(""), Some("\n\n")] {
+            let opts = OutputConfigOptions {
+                thought_separator: sep.map(str::to_string),
+                ..Default::default()
+            };
+            let deferred = build_json_only_grammar_source(&schema, &opts);
+            let pre = build_grammar_source(&schema, &opts, true);
+            let optional = build_grammar_source(&schema, &opts, false);
+            for gap in good {
+                let at = format!("{sep:?}, {gap:?}");
+                assert!(accepts(&deferred, &format!("{gap}{body}")), "{at}");
+                assert!(
+                    accepts(&pre, &format!("hmm\n</think>{gap}{body}")),
+                    "{at}"
+                );
+                assert!(
+                    accepts(
+                        &optional,
+                        &format!("<think>hmm</think>{gap}{body}")
+                    ),
+                    "{at}"
+                );
+            }
+            for gap in bad {
+                let at = format!("{sep:?}, {gap:?}");
+                assert!(!accepts(&deferred, &format!("{gap}{body}")), "{at}");
+                assert!(
+                    !accepts(&pre, &format!("hmm\n</think>{gap}{body}")),
+                    "{at}"
+                );
+            }
+            // Without a thought, the body's own single `ws` as before.
+            assert!(accepts(&optional, body));
+            assert!(!accepts(&optional, &format!("\n\n{body}")));
+        }
+        // A measured gap the bound cannot express stays reachable.
+        let long = OutputConfigOptions {
+            thought_separator: Some("\n\n\n".into()),
             ..Default::default()
         };
-        let body = r#"{"x":1}"#;
-
-        // Deferred: the grammar starts right after the `</think>` trigger.
-        let deferred = build_json_only_grammar_source(&schema, &opts);
-        assert!(accepts(&deferred, &format!("\n\n{body}")));
-        for bad in ["", " ", "\n", "\n\n\n"] {
-            assert!(!accepts(&deferred, &format!("{bad}{body}")), "{bad:?}");
-        }
-        // Without the separator: the single permissive byte, unchanged.
-        let loose = build_json_only_grammar_source(
-            &schema,
-            &OutputConfigOptions::default(),
-        );
-        assert!(accepts(&loose, &format!("\n{body}")));
-        assert!(!accepts(&loose, &format!("\n\n{body}")));
-
-        // Unified, pre-opened (Qwen's `<think>\n` scaffold).
-        let pre = build_grammar_source(&schema, &opts, true);
-        assert!(accepts(&pre, &format!("hmm\n</think>\n\n{body}")));
-        assert!(!accepts(&pre, &format!("hmm\n</think>\n{body}")));
-
-        // Unified, optional thought: forced after one, free without.
-        let optional = build_grammar_source(&schema, &opts, false);
-        assert!(accepts(&optional, &format!("<think>hmm</think>\n\n{body}")));
-        assert!(!accepts(&optional, &format!("<think>hmm</think>{body}")));
-        assert!(accepts(&optional, body));
+        let deferred = build_json_only_grammar_source(&schema, &long);
+        assert!(accepts(&deferred, &format!("\n\n\n{body}")));
+        assert!(accepts(&deferred, &format!("\n{body}")));
+        assert!(!accepts(&deferred, &format!("\n\n\n\n{body}")));
     }
 
     #[test]
