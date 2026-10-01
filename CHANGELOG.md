@@ -91,6 +91,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `section_start` / `per_call_start` remain the canonical bytes. A
   model naming its own opener in prose now gets a call forced — the
   special was rejected from free text anyway.
+- **The #101 containment log says where.** The `EmittedSpecialToken`
+  error event now carries up to three `hits` (block index and kind,
+  offset in the block and in the emission, ~96 bytes of context each
+  side, and the 8 bytes after the special), whether a deferred grammar
+  ever activated, `emission_bytes` and `generated_tokens`. Operator
+  trace only; the error's `Display` still withholds the pieces.
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
   assistant turn's answer and thought (3.6 also `lstrip`/`rstrip`s the

@@ -1745,6 +1745,88 @@ fn log_unstable_emission(
     );
 }
 
+/// Where one reserved special sits in a rejected generation — the
+/// #101 containment log's forensics. Operator trace only: carries the
+/// reserved bytes verbatim, so never relay it into model-visible text.
+#[cfg(feature = "axum")]
+#[derive(Debug, PartialEq)]
+struct SpecialHit<'a> {
+    /// Index into the parsed blocks.
+    block: usize,
+    /// `Text`, `Thought`, `ToolUse`, ...
+    kind: &'static str,
+    /// Byte offset of the special in the block's free text.
+    offset: usize,
+    /// Byte offset in the emission, when the special's surroundings
+    /// appear there verbatim (a parsed call's input is re-serialized,
+    /// so its strings may not).
+    emission_offset: Option<usize>,
+    piece: &'a str,
+    /// The 8 bytes after the special, escaped — what the trigger needed
+    /// to see (`\n` for the marker dialects' old `<tool_call>\n`).
+    next8: String,
+    before: &'a str,
+    after: &'a str,
+}
+
+/// The first `limit` occurrences of the `found` pieces in the free text
+/// of `blocks`, in block order, with about `context` bytes each side.
+#[cfg(feature = "axum")]
+fn special_hits<'a>(
+    blocks: &'a [crate::Block],
+    raw: &str,
+    found: &'a [String],
+    limit: usize,
+    context: usize,
+) -> Vec<SpecialHit<'a>> {
+    let kind = |block: &crate::Block| match block {
+        crate::Block::Text { .. } => "Text",
+        crate::Block::Thought { .. } => "Thought",
+        crate::Block::ToolUse { .. } => "ToolUse",
+        crate::Block::ServerToolUse { .. } => "ServerToolUse",
+        crate::Block::ToolResult { .. } => "ToolResult",
+        _ => "other",
+    };
+    blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(block, b)| {
+            let mut texts = Vec::new();
+            block_free_text(b, &mut texts);
+            texts.into_iter().map(move |text| (block, b, text))
+        })
+        .flat_map(|(block, b, text)| {
+            let mut hits: Vec<(usize, &'a str)> = found
+                .iter()
+                .flat_map(|piece| {
+                    text.match_indices(piece.as_str())
+                        .map(|(at, _)| (at, piece.as_str()))
+                })
+                .collect();
+            hits.sort_unstable();
+            hits.into_iter().map(move |(offset, piece)| {
+                let end = offset + piece.len();
+                let (before, _) = around(text, offset, context);
+                let (_, after) = around(text, end, context);
+                let next = &text.as_bytes()[end..(end + 8).min(text.len())];
+                SpecialHit {
+                    block,
+                    kind: kind(b),
+                    offset,
+                    emission_offset: raw
+                        .find(&text[offset - before.len()..end])
+                        .map(|at| at + before.len()),
+                    piece,
+                    next8: next.escape_ascii().to_string(),
+                    before,
+                    after,
+                }
+            })
+        })
+        .take(limit)
+        .collect()
+}
+
 /// The auto-tip's fold cursor: the assistant reply (message index
 /// `messages.len()` once appended) was accumulated live during
 /// generation, so the next call's fold resumes after it.
@@ -6917,6 +6999,13 @@ impl<B: Backend> Session<B> {
         // Capture the incomplete-at-end violation signal and the final
         // sampler state (tip promotion) before the predictor drops.
         let constraint_incomplete = predictor.constraint_incomplete_at_end();
+        // `Some(true)` once a deferred grammar's trigger fired; `None`
+        // when none was configured. Forensics for the #101 log below.
+        #[cfg(feature = "axum")]
+        let deferred_activated = predictor
+            .sampler_state()
+            .deferred_inactive()
+            .map(|inactive| !inactive);
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
         let budget = Cut::of(&predictor);
         drop(predictor);
@@ -7244,10 +7333,18 @@ impl<B: Backend> Session<B> {
                 // needs the exact bytes (the #101 diagnosis had to dig
                 // state files for them). The redaction discipline
                 // applies to `Display`, which is relayed to clients.
+                // `hits`: where (≤3), in which block, the bytes around
+                // each, and the 8 after — a marker dialect's opener
+                // followed by anything but its trigger's whitespace
+                // never armed the grammar (`deferred_activated`).
                 #[cfg(feature = "axum")]
                 tracing::error!(
                     target: "drama_llama::session",
                     found = ?found,
+                    hits = ?special_hits(&blocks, &raw_text, &found, 3, 96),
+                    deferred_activated = ?deferred_activated,
+                    emission_bytes = raw_text.len(),
+                    generated_tokens = generated_count,
                     "generation emitted reserved special token(s) in \
                      free text; output rejected before it can poison \
                      the next ingest (#101) — prompt cache extent is \
@@ -12493,6 +12590,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The #101 containment log's forensics: every hit (up to the
+    /// limit) in block order, with its block, its offset in the block
+    /// and in the emission, the bytes around it, and the 8 after it.
+    #[test]
+    #[cfg(feature = "axum")]
+    fn special_hits_locate_each_special() {
+        let raw = "ok\n\n<tool_call>{\"name\": \"x\"}\nthen <tool_call>";
+        let blocks = [crate::Block::Text {
+            text: raw.into(),
+            cache_control: None,
+            citations: None,
+        }];
+        let found = vec!["<tool_call>".to_string()];
+        let hits = special_hits(&blocks, raw, &found, 3, 4);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0],
+            SpecialHit {
+                block: 0,
+                kind: "Text",
+                offset: 4,
+                emission_offset: Some(4),
+                piece: "<tool_call>",
+                next8: "{\\\"name\\\":".into(),
+                before: "ok\n\n",
+                after: "{\"na",
+            }
+        );
+        assert_eq!(hits[1].offset, 34);
+        assert_eq!(hits[1].next8, "");
+        assert_eq!(special_hits(&blocks, raw, &found, 1, 4).len(), 1);
     }
 
     /// Every event emitted on this thread while `f` runs, as its level
