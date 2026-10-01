@@ -199,7 +199,15 @@ fn cached_output_matches_uncached_output() {
     let mut prompt2 = prompt.clone();
 
     let (cached_text_1, cached_text_2, cached_read_2) = {
-        let mut cached = session(true);
+        // Adoption off: with it, round 2 reads round 1's turn in the
+        // split the model emitted, while the fresh session reads the
+        // tokenizer's — a different input whenever the two differ, and
+        // so not the comparison this test makes.
+        let mut cached = session(true).with_prefix_cache_config({
+            let mut config = drama_llama::PrefixCacheConfig::default();
+            config.adopt_emitted_tokens = false;
+            config
+        });
         let r1 = cached.complete_response(&prompt).expect("cached r1");
         // Round 2 extends with the cached session's assistant turn;
         // the fresh session will replay the identical transcript, so
@@ -231,6 +239,45 @@ fn cached_output_matches_uncached_output() {
         cached_text_2,
         out_fresh_2.inner.content.to_string(),
         "cache-path output diverged from fresh-session output"
+    );
+}
+
+/// The default configuration on real output, which the warm-vs-cold
+/// comparison above turns off: reading round 1's turn in the model's
+/// own split (`adopt_emitted_tokens`), round 2 reuses at least what the
+/// tokenizer's split reuses — strictly more whenever the model wrote a
+/// split its tokenizer would not. The tripwire is armed, so a spliced
+/// prompt that does not read as its render panics. Round 1 runs the
+/// same path either way, so its outputs must agree.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn adoption_reuses_at_least_the_canonical_split() {
+    // OnceLock reads this on first use; nextest's process-per-test
+    // isolation keeps it scoped to this test.
+    std::env::set_var("DRAMA_LLAMA_CACHE_TRIPWIRE", "1");
+    let run = |adopt: bool| {
+        let mut session = session(true).with_prefix_cache_config({
+            let mut config = drama_llama::PrefixCacheConfig::default();
+            config.adopt_emitted_tokens = adopt;
+            config
+        });
+        let prompt = base_prompt();
+        let r1 = session.complete_response(&prompt).expect("r1");
+        let mut prompt2 = prompt.clone();
+        extend(&mut prompt2, r1.inner.content.clone(), "Now name a shape.");
+        let r2 = session.complete_response(&prompt2).expect("r2");
+        (
+            r1.inner.content.to_string(),
+            r2.usage.cache_read_input_tokens.unwrap_or(0),
+        )
+    };
+    let (text_on, read_on) = run(true);
+    let (text_off, read_off) = run(false);
+    assert_eq!(text_on, text_off, "round 1 runs the same path either way");
+    assert!(read_off > 0, "round 2 must reuse — test would be vacuous");
+    assert!(
+        read_on >= read_off,
+        "adoption reused {read_on} tokens, the canonical split {read_off}"
     );
 }
 

@@ -205,6 +205,64 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A turn the model wrote in a split its tokenizer would not produce
+  keeps its tip ("trust the emission").** A model does not always emit
+  the tokenizer's own segmentation of its text — a grammar forces a
+  piece, sampling picks a rarer one — and the next call re-tokenized
+  the byte-identical re-render, disagreed with the cached ids partway
+  through the turn, and re-prefilled from the last anchor before it.
+  The hash path saw the same bytes and refused them, rightly (#91:
+  reuse positions would be measured in the wrong tokenization). Live
+  on the cohort run (2026-10-01), a Qwen3.8 agent lost 19,340 tokens
+  to one such turn (`hash_drift`, then `tip_diverged` with equal text
+  on both sides), and eight `hash_drift` events cost 297–21,143 tokens
+  each. Each call now reads its prompt in a cached slot's own ids as
+  far as the two read alike, and in the tokenizer's from there on: it
+  walks the slot's ids against its plain tokenization, through
+  stretches where they agree (an id comparison each) and across those
+  where they spell the same bytes in different tokens, up to the last
+  token boundary both share before the first byte the client actually
+  changed. A respelled stretch may hold only ordinary tokens — never a
+  special, a duplicate of one, an empty piece or an image — so a span
+  the model *spelled* is never read where the tokenizer would see a
+  special. The tail is the plain tokenization's own ids, so there is
+  no second tokenization, no BOS mid-stream and no split that neither
+  list already has. It chains across turns (older turns in the
+  model's split stay matched), survives an edit or a truncated or
+  resent history (everything before the edit stays matched, where
+  hash-matched records lost back to the earliest respelled span), and
+  works across content literals and images, which compare as ids
+  rather than as render bytes under a per-call sentinel. Breakpoint
+  partials are checked against the plain tokenization as before, then
+  placed in the spliced list; one ending inside a respelled stretch
+  keeps the anchor the slot recorded for its hash. `count_tokens` reads
+  the same splice, so the three usage counters still sum to it. The
+  splice comes from the slot reaching furthest into the prompt; when
+  that slot already reads it in the tokenizer's split, nothing is
+  spliced. Safety is tightened, not just kept: the hash path now also
+  requires the ids before its anchor to be equal. A turn the model
+  wrote `a|bc` re-tokenizes `ab|c` — the same bytes in the same number
+  of entries — and a hash hit there used to restore KV holding the
+  model's ids while the slot recorded the tokenizer's (reachable with
+  adoption off, and with it on wherever the walk stops short, e.g. at a
+  duplicate special). Reuse now needs the token-id walk or a hash hit
+  over equal ids, so the KV is the ids the slot records. The walk
+  itself is the proof that the spliced ids read as the render;
+  `DRAMA_LLAMA_CACHE_TRIPWIRE=1` re-checks it (the same bytes, the same
+  specials and images in the same places) and panics on a walk bug.
+  On a 96,628-token Qwen3.8 prompt with 833 respelled stretches the
+  walk took 0.21–0.25 ms per slot against ~190 ms for the plain
+  tokenization each call already pays; a contrived worst case, every
+  multi-character token respelled, takes ~8 ms per slot. On by
+  default; see `PrefixCacheConfig::adopt_emitted_tokens` below for the
+  one behaviour change.
+- **A rejected turn no longer logs cache diagnostics for itself.** A
+  turn's `emission_not_byte_stable` and `tip_not_recorded` events are
+  now logged only once the turn stands: one that #101 containment, the
+  schema backstop or a grammar check rejects reaches neither the
+  client nor the next request, and its re-render cost was noise that
+  read as a cache bug in the operator log (cohort item 13).
+
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like
@@ -726,6 +784,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tip loses the pick, one when `tip_extension` declines to build a tip.
 
 ### Added
+
+- **`PrefixCacheConfig::adopt_emitted_tokens`** (default `true`): the
+  switch for the fix above. Its one behaviour change is that a warm
+  call can read a turn in the model's own split where a cold session
+  reads the tokenizer's, so warm and cold output can differ under
+  greedy sampling; `cached_output_matches_uncached_output` turns it
+  off for that comparison, and `adoption_reuses_at_least_the_canonical_split`
+  runs the default on real output with the tripwire armed.
+  `count_tokens` with the cache on now depends on slot state the way
+  the call does: the same prompt can count a few tokens differently
+  before and after the slot it continues is evicted (documented there
+  and tested).
+- **Cache logging an operator can act on.** A `cache_reuse` miss —
+  nothing reused, the whole prompt prefilled — is now always `WARN`,
+  with `lost_tokens`, `prompt_tokens` and `cold` (nothing was lost: no
+  slot offered anything, and the call neither missed a tip it
+  continues nor refused a hash for its split — a new conversation's
+  first turn, or one whose slot is gone), so a filter on `cold=false`
+  leaves the misses that lost something; a hit
+  stays `DEBUG`. `hash_drift` carries `diverge_at` and the `shared` /
+  `cached` / `new` text around the first entry where the two
+  tokenizations part, like `tip_diverged` (the live events could not
+  say *which* boundary retokenized). A tip miss now also names where
+  the *text* parts (`text_diverge_at`, `text_cached`, `text_new`) and
+  sets `resplit` when that is past where the ids part — a stretch
+  spelled in different tokens before the real edit, which used to put
+  the operator at a spot where both sides read the same. One whose new
+  prompt reads every byte the slot holds to the tip is reported as
+  `segmentation_drift` (with `in_turn`) instead of `tip_diverged` or
+  `history_changed`: same text, different split — what adoption
+  exists to prevent, so it means adoption was off. A prompt read in a
+  slot's own split logs `cache_adopt` at `DEBUG`.
 
 - **Constrained output is checked against its schema before it is
   answered** (`SessionError::SchemaViolation`). A finished
