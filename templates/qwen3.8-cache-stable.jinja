@@ -17,7 +17,10 @@
     own `<|im_start|>system` block where stock raises. The leading
     system/tools header, user and tool turns, reasoning effort,
     `preserve_thinking`, tool-call rendering and the generation prompt
-    are byte-identical to stock.
+    are byte-identical to stock. (Stock 3.8 already renders every
+    non-string tool-call argument with `tojson`, so a JSON `null` or
+    boolean the model wrote round-trips; the 3.6 bake had to adopt
+    that rule.)
 -#}
 {%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
@@ -187,6 +190,11 @@
                 {%- if tool_call.arguments is mapping %}
                     {%- for args_name, args_value in tool_call.arguments|items %}
                         {{- '<parameter=' + args_name + '>\n' }}
+                        {#- Stock, and load-bearing: every non-string
+                            value renders as JSON, so a `null`/`true`/
+                            `false` the model wrote renders back as
+                            written (`| string` spells null `none`). The
+                            3.6 bake adopts this rule. -#}
                         {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
                         {{- args_value }}
                         {{- '\n</parameter>\n' }}

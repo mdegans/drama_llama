@@ -69,9 +69,10 @@ fn qwen36_gguf_xml() {
 }
 
 /// The owned Qwen templates change only how an assistant turn's
-/// whitespace re-renders, so they must analyze to exactly the stock
-/// dialect — the grammars, the parser and `render_reference` are
-/// unchanged by the bake.
+/// whitespace, a mid-conversation system turn and (3.6) a non-string
+/// tool-call argument re-render, so they must analyze to exactly the
+/// stock dialect — the grammars, the parser and `render_reference`
+/// are unchanged by the bake.
 #[test]
 fn qwen_cache_stable_analyzes_like_stock() {
     for (stock, owned) in [

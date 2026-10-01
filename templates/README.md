@@ -161,18 +161,35 @@ the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
    such turns on some models; Mistral 4's bake made the same call
    (its point 5). Pinned, with both stock behaviours as controls:
    `qwen_cache_stable_renders_mid_conversation_system`.
+6. Qwen3.6 only: every **non-string tool-call argument** renders with
+   `tojson`. Stock 3.6 `tojson`s only mappings and sequences and
+   prints every other value `| string`, which minijinja spells
+   Python-style — `null` as `none`, and from 2.24 booleans as
+   `True`/`False` (drama_llama#120). The grammar has the model write
+   JSON, and the parser types a non-string parameter's value from it,
+   so a `<parameter=detail>\nnull\n</parameter>` the model wrote
+   re-rendered as `none` and the next request lost the turn's KV
+   (live, Qwen3.6 on Agora, 2026-10-01: 359..6909 tokens a turn).
+   Strings are untouched (`| string`, raw — a string-typed value that
+   merely looks like `null`, `true` or `5` stays the string it is);
+   integers and floats spell the same either way (`5`, `1.0`). This is
+   stock 3.8's own rule, so the 3.8 bake needs no change here. Pinned,
+   stock 3.6 as the control:
+   `session::tests::qwen_cache_stable_round_trips_scalar_args`.
 
 The leading system/tools header, user and tool turns, the
-reasoning-effort block (3.8), tool declarations, tool-call bodies and
-the generation prompt are byte-identical to stock, and the dialect
-analyzer measures the same `CallSyntax` for each pair
-(`qwen_cache_stable_analyzes_like_stock`).
-Round-trip pins: `session::tests::qwen_cache_stable_round_trips`.
+reasoning-effort block (3.8), tool declarations, the rest of the
+tool-call bodies and the generation prompt are byte-identical to
+stock, and the dialect analyzer measures the same `CallSyntax` for
+each pair (`qwen_cache_stable_analyzes_like_stock`).
+Round-trip pins: `session::tests::qwen_cache_stable_round_trips` and
+`qwen_cache_stable_round_trips_scalar_args`.
 
 Irreducible, and pinned there so an improvement flips them
 deliberately. The first three because no block can record a byte the
-model *didn't* write; the last two because the template's own
-structure drops bytes, as stock's does:
+model *didn't* write; the next two because the template's own
+structure drops bytes, as stock's does; the last because a parsed
+number keeps no spelling:
 
 - A gap after the close the model omitted (`…\n</think>Ada`)
   re-renders as the canonical `\n\n`.
@@ -190,6 +207,9 @@ structure drops bytes, as stock's does:
   everything before it. The inlined thought is recovered with
   `split('<think>')[-1]`; 3.8 reads `reasoning_content` and
   round-trips it.
+- A number argument in a non-canonical spelling (`1.50`, `1e3`)
+  re-renders canonically (`1.5`, `1000.0`): the parsed value keeps no
+  spelling. The grammar's `number` rule admits both forms.
 
 Byte-stable is not token-stable at the prompt seam. An emission that
 *starts* with `\n` was generated as its own token after the generation

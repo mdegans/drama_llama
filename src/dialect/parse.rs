@@ -28,7 +28,8 @@
 //! ## Coercion & healing (llama.cpp mapper parity)
 //!
 //! Tagged raw values are schema-coerced: params typed `string` (or
-//! unknown) stay raw strings; anything else is parsed as JSON after
+//! unknown) stay raw strings, as do nullable strings bar a literal
+//! `null`; anything else is parsed as JSON after
 //! normalizing pythonisms (`True`/`False`/`None`, single-quoted
 //! strings) with bounded brace-healing, falling back to a JSON
 //! string of the raw bytes when parsing still fails. Parse never
@@ -1357,11 +1358,24 @@ impl<'a> Parser<'a> {
     /// mapper parity): `string`-typed (or unknown) params stay raw;
     /// otherwise parse as JSON after pythonism normalization with
     /// bounded brace healing; fall back to a raw string.
+    ///
+    /// A nullable string (`"type": ["string", "null"]`, no `enum`) is
+    /// generated raw, like any string (the grammar sees through
+    /// nullability), so it is read raw too: JSON `null` is its one
+    /// non-string value. Parsing it as JSON would type a `5` or `true`
+    /// the model wrote as text, and unquote a `"quoted"` one, which
+    /// then re-renders without its quotes.
     fn coerce_value(&self, tool: &str, param: &str, raw: &str) -> Value {
         if self.is_string_param(tool, param) {
             return Value::String(raw.to_string());
         }
         let trimmed = raw.trim();
+        if self.is_nullable_string_param(tool, param) {
+            return match trimmed {
+                "null" => Value::Null,
+                _ => Value::String(raw.to_string()),
+            };
+        }
         if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
             return v;
         }
@@ -1379,6 +1393,16 @@ impl<'a> Parser<'a> {
             Some(s) => s.get("type").and_then(|t| t.as_str()) == Some("string"),
             None => true,
         }
+    }
+
+    /// Whether `param` of `tool` is a nullable string the grammar
+    /// generates raw: a string once `null` is set aside, with no
+    /// `enum` (an enum is generated as JSON).
+    fn is_nullable_string_param(&self, tool: &str, param: &str) -> bool {
+        self.schema_for(tool, param).is_some_and(|s| {
+            crate::grammar_compile::effective_type(&s) == Some("string")
+                && s.get("enum").is_none()
+        })
     }
 
     /// Read the call the input ended inside, starting at its opener

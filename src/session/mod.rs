@@ -12212,6 +12212,63 @@ mod tests {
         assert_eq!((before, after), ("h", "é"));
     }
 
+    /// Where a Qwen round trip parts, for one emission, as the session
+    /// measures it: the generation prompt, the emission parsed to
+    /// blocks against `tool`, the turn re-rendered.
+    fn qwen_divergence(
+        source: &str,
+        tool: &crate::Tool,
+        thinking: bool,
+        emission: &str,
+    ) -> Option<usize> {
+        use crate::{
+            prompt::{Message, Role},
+            ChatTemplate, Content, RenderOptions,
+        };
+        let eos = "<|im_end|>";
+        let template = ChatTemplate::from_source(
+            source.to_owned(),
+            String::new(),
+            eos.to_owned(),
+        )
+        .expect("template compiles");
+        let syntax =
+            crate::dialect::analyze_template(source, "", eos).expect("analyze");
+        let base = Prompt {
+            messages: vec![Message {
+                role: Role::User,
+                content: Content::text("Who checks the fog signal?"),
+            }],
+            tools: Some(vec![tool.clone().into()]),
+            ..Prompt::default()
+        };
+        let opts = RenderOptions::default()
+            .with_extra("preserve_thinking", true)
+            .with_extra("enable_thinking", thinking)
+            .with_thought_reingest(syntax.reasoning.reingest)
+            .with_reasoning_start(syntax.reasoning.start.clone());
+        let prompt = template
+            .render_with(&base, &opts.clone().with_generation_prompt(true))
+            .expect("render");
+        let blocks = crate::dialect::parse_text(
+            &syntax,
+            &[tool],
+            emission,
+            thinking,
+            crate::dialect::Leniency::Final,
+        )
+        .blocks;
+        let mut turn = base.clone();
+        turn.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(merge_adjacent_prose(blocks)),
+        });
+        let extended = template
+            .render_with(&turn, &opts.with_generation_prompt(false))
+            .expect("render");
+        emission_divergence(&extended, &prompt, emission)
+    }
+
     /// Regression for the 2026-09-30 live tip drop (Qwen3.6-35B-A3B):
     /// the stock template `trim`s an assistant turn's answer and thought
     /// when it re-renders them, so any turn the model ends with
@@ -12228,11 +12285,7 @@ mod tests {
     /// session's canonicalization gate measures it.
     #[test]
     fn qwen_cache_stable_round_trips() {
-        use crate::{
-            prompt::{Message, Role},
-            ChatTemplate, Content, RenderOptions, Tool,
-        };
-        let eos = "<|im_end|>";
+        use crate::Tool;
         let tool = Tool::builder("get_weather")
             .description("Get the weather for a city.")
             .schema(serde_json::json!({
@@ -12242,51 +12295,8 @@ mod tests {
             }))
             .build()
             .expect("valid tool");
-        // Where the round trip parts, for one emission, as the session
-        // measures it: the generation prompt, the emission parsed to
-        // blocks, the turn re-rendered.
         let diverge = |source: &str, thinking: bool, emission: &str| {
-            let template = ChatTemplate::from_source(
-                source.to_owned(),
-                String::new(),
-                eos.to_owned(),
-            )
-            .expect("template compiles");
-            let syntax = crate::dialect::analyze_template(source, "", eos)
-                .expect("analyze");
-            let base = Prompt {
-                messages: vec![Message {
-                    role: Role::User,
-                    content: Content::text("Who checks the fog signal?"),
-                }],
-                tools: Some(vec![tool.clone().into()]),
-                ..Prompt::default()
-            };
-            let opts = RenderOptions::default()
-                .with_extra("preserve_thinking", true)
-                .with_extra("enable_thinking", thinking)
-                .with_thought_reingest(syntax.reasoning.reingest)
-                .with_reasoning_start(syntax.reasoning.start.clone());
-            let prompt = template
-                .render_with(&base, &opts.clone().with_generation_prompt(true))
-                .expect("render");
-            let blocks = crate::dialect::parse_text(
-                &syntax,
-                &[&tool],
-                emission,
-                thinking,
-                crate::dialect::Leniency::Final,
-            )
-            .blocks;
-            let mut turn = base.clone();
-            turn.messages.push(Message {
-                role: Role::Assistant,
-                content: Content(merge_adjacent_prose(blocks)),
-            });
-            let extended = template
-                .render_with(&turn, &opts.with_generation_prompt(false))
-                .expect("render");
-            emission_divergence(&extended, &prompt, emission)
+            qwen_divergence(source, &tool, thinking, emission)
         };
         let call = "<tool_call>\n<function=get_weather>\n\
                     <parameter=city>\nParis\n</parameter>\n\
@@ -12406,6 +12416,141 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression for the 2026-10-01 live tip drops (Qwen3.6 on Agora,
+    /// 359..6909 tokens a turn): the model wrote JSON `null` for an
+    /// optional argument, the parser typed it `Value::Null`, and stock
+    /// 3.6 re-rendered every non-container scalar with `| string` —
+    /// minijinja spells `None` as `none` (and 2.24+ spells booleans
+    /// `True`/`False`, drama_llama#120). The baked templates render
+    /// every non-string value with `tojson`, the spelling the grammar
+    /// makes the model emit, so the round trip is exact for each JSON
+    /// scalar — and a string-typed (or nullable-string) value that
+    /// merely *looks* like one stays the string the model wrote.
+    #[test]
+    fn qwen_cache_stable_round_trips_scalar_args() {
+        use crate::Tool;
+        use serde_json::Value;
+        let eos = "<|im_end|>";
+        let tool = Tool::builder("get_weather")
+            .description("Get the weather for a city.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "detail": {"type": ["string", "null"]},
+                    "verbose": {"type": "boolean"},
+                    "days": {"type": "integer"},
+                    "scale": {"type": "number"},
+                },
+                "required": ["city"],
+            }))
+            .build()
+            .expect("valid tool");
+        let call = |city: &str, param: Option<(&str, &str)>| {
+            let extra = param
+                .map(|(key, raw)| {
+                    format!("<parameter={key}>\n{raw}\n</parameter>\n")
+                })
+                .unwrap_or_default();
+            format!(
+                "<tool_call>\n<function=get_weather>\n\
+                 <parameter=city>\n{city}\n</parameter>\n\
+                 {extra}</function>\n</tool_call>"
+            )
+        };
+        // `(emission, the value the parser must type)`.
+        let arg = |key, raw, value| (call("Paris", Some((key, raw))), value);
+        let city = |raw: &str| (call(raw, None), Value::String(raw.into()));
+        let cases: Vec<(String, Value)> = vec![
+            // The live shape.
+            arg("detail", "null", Value::Null),
+            arg("verbose", "true", Value::Bool(true)),
+            arg("verbose", "false", Value::Bool(false)),
+            arg("days", "5", 5.into()),
+            arg("days", "-3", (-3).into()),
+            arg("days", "0", 0.into()),
+            arg("scale", "1.0", 1.0.into()),
+            arg("scale", "1.5", 1.5.into()),
+            arg("scale", "2", 2.into()),
+            arg("scale", "-0.25", (-0.25).into()),
+            // A string-typed parameter keeps its raw bytes, however
+            // much they look like another JSON value.
+            city("null"),
+            city("None"),
+            city("true"),
+            city("False"),
+            city("5"),
+            city("1.0"),
+            city("[1, 2]"),
+            city("\"quoted\""),
+            // So does a nullable one — the grammar generates it raw
+            // too — bar JSON `null`, its one non-string value.
+            arg("detail", "true", "true".into()),
+            arg("detail", "5", "5".into()),
+            arg("detail", "None", "None".into()),
+            arg("detail", "\"quoted\"", "\"quoted\"".into()),
+            arg("detail", "{\"a\": 1}", "{\"a\": 1}".into()),
+        ];
+        for baked in [&crate::baked::QWEN36, &crate::baked::QWEN38] {
+            let served = crate::baked::detect(baked.stock)
+                .expect("stock dump detects")
+                .replacement;
+            let syntax = crate::dialect::analyze_template(served, "", eos)
+                .expect("analyze");
+            for (emission, value) in &cases {
+                let blocks = crate::dialect::parse_text(
+                    &syntax,
+                    &[&tool],
+                    emission,
+                    false,
+                    crate::dialect::Leniency::Final,
+                )
+                .blocks;
+                let [crate::Block::ToolUse { call }] = blocks.as_slice() else {
+                    panic!(
+                        "{}: one call: {emission:?} -> {blocks:?}",
+                        baked.name
+                    );
+                };
+                let parsed = call.input.as_object().expect("object");
+                let key = parsed.keys().next_back().expect("an argument");
+                assert_eq!(&parsed[key], value, "{}: {emission:?}", baked.name);
+                assert_eq!(
+                    qwen_divergence(served, &tool, false, emission),
+                    None,
+                    "{}: {emission:?}",
+                    baked.name
+                );
+            }
+            // Irreducible, and pinned: a number's spelling is not in its
+            // value, so one the model wrote in a non-canonical form
+            // re-renders canonically (`1.5`, `1000.0`).
+            for raw in ["1.50", "1e3"] {
+                let emission = call("Paris", Some(("scale", raw)));
+                let at = emission.find(raw).expect("raw in emission");
+                assert!(
+                    qwen_divergence(served, &tool, false, &emission)
+                        .is_some_and(|d| d >= at && d <= at + raw.len()),
+                    "{}: {emission:?}",
+                    baked.name
+                );
+            }
+        }
+        // Control: stock 3.6 re-renders `null` through `| string`, so
+        // the live shape parts inside the value (`none` before
+        // minijinja 2.24, `None` after). Stock 3.8 already renders
+        // every non-string with `tojson`.
+        let emission = call("Paris", Some(("detail", "null")));
+        let at = emission.find("null").expect("null in emission");
+        let stock = |source| qwen_divergence(source, &tool, false, &emission);
+        assert!(
+            stock(crate::baked::QWEN36.stock)
+                .is_some_and(|d| (at..at + 4).contains(&d)),
+            "stock 3.6 should re-render null as none"
+        );
+        assert_eq!(stock(crate::baked::QWEN38.stock), None);
     }
 
     /// An assistant turn aged out with `preserve_thinking` off drops its

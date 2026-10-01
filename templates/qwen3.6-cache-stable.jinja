@@ -14,10 +14,14 @@
     renders verbatim (see the patch comment in the message loop), the
     prose-to-call gap is supplied only when the prose does not end in
     whitespace, and a system turn after the leading run renders as its
-    own `<|im_start|>system` block where stock silently drops it. The
-    leading system/tools header, user and tool turns,
-    `preserve_thinking`, tool-call rendering and the generation prompt
-    are byte-identical to stock.
+    own `<|im_start|>system` block where stock silently drops it, and
+    every non-string tool-call argument renders with `tojson` where
+    stock renders scalars `| string` (null spelled `none`, and
+    minijinja 2.24+ spells booleans `True`/`False`), so the JSON
+    `null`/`true`/`false` the grammar has the model write renders back
+    as written. The leading system/tools header, user and tool turns,
+    `preserve_thinking`, the rest of tool-call rendering and the
+    generation prompt are byte-identical to stock.
 -#}
 {%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
@@ -176,7 +180,12 @@
                     {%- for args_name in tool_call.arguments %}
                         {%- set args_value = tool_call.arguments[args_name] %}
                         {{- '<parameter=' + args_name + '>\n' }}
-                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}
+                        {#- Patch: every non-string value renders as JSON
+                            (stock: only mappings and sequences, the rest
+                            `| string`, which spells null `none`), so a
+                            `null`/`true`/`false` the model wrote renders
+                            back as written. Stock 3.8's rule. -#}
+                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
                         {{- args_value }}
                         {{- '\n</parameter>\n' }}
                     {%- endfor %}
