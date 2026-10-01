@@ -222,6 +222,12 @@ pub enum SessionError {
     /// Fires before any decode work; the session stays reusable.
     #[error("dialect: {0}")]
     Dialect(#[from] crate::dialect::DialectError),
+    /// The prompt's tool and `output_config` schemas measure past the
+    /// session's [`SchemaLimits`](crate::SchemaLimits) (see
+    /// [`Session::with_schema_limits`]). Checked first, before anything
+    /// renders, classifies or compiles them; the session stays reusable.
+    #[error("schema limits: {0}")]
+    SchemaBudget(#[from] crate::SchemaBudgetError),
     /// Grammar-forced generation ended without producing a parseable tool call
     /// — a forced call missing its `tool_use` block, or an eager
     /// grammar/JSON constraint left mid-structure at end of generation —
@@ -455,7 +461,8 @@ impl SessionError {
             Self::ChatTemplate(_)
             | Self::ToolChoice(_)
             | Self::OutputConfig(_)
-            | Self::Dialect(_) => true,
+            | Self::Dialect(_)
+            | Self::SchemaBudget(_) => true,
             // Request validation fires while assembling the sampler
             // config, before any decode work. State untouched.
             Self::RequestTopP(_) => true,
@@ -2720,6 +2727,8 @@ pub struct Session<B: Backend> {
     /// enforce/parse/re-ingest cannot drift apart.
     dialect: crate::CallSyntax,
     output_config_opts: OutputConfigOptions,
+    /// The most a request's schemas may measure ([`Self::with_schema_limits`]).
+    schema_limits: crate::SchemaLimits,
     render_opts: RenderOptions,
     /// The model's reserved special-token pieces, neutralized in every
     /// render's content and tokenized back as text (see
@@ -3416,6 +3425,7 @@ impl<B: Backend> Session<B> {
             dialect,
             literals,
             output_config_opts: OutputConfigOptions::default(),
+            schema_limits: crate::SchemaLimits::default(),
             // `preserve_thinking` default: byte-stable transcripts are
             // the prefix cache's contract, and current Anthropic
             // models keep prior-turn thinking. See
@@ -3716,6 +3726,23 @@ impl<B: Backend> Session<B> {
     ) -> Self {
         self.output_config_opts = opts;
         self
+    }
+
+    /// The most a request's client-supplied schemas — every custom
+    /// tool's `input_schema`, an `output_config` `json_schema` — may
+    /// measure before this session compiles them. A prompt past any of
+    /// them fails up front with [`SessionError::SchemaBudget`], before
+    /// rendering or compiling anything. Defaults to
+    /// [`SchemaLimits::default`](crate::SchemaLimits::default), generous
+    /// for real tools; see [`crate::schema_budget`].
+    pub fn with_schema_limits(mut self, limits: crate::SchemaLimits) -> Self {
+        self.schema_limits = limits;
+        self
+    }
+
+    /// The limits set by [`Self::with_schema_limits`].
+    pub fn schema_limits(&self) -> &crate::SchemaLimits {
+        &self.schema_limits
     }
 
     /// Override the defaults used when rendering the prompt through the chat
@@ -4855,6 +4882,7 @@ impl<B: Backend> Session<B> {
         SessionError,
     > {
         self.check_no_open_thought(prompt)?;
+        crate::schema_budget::check_prompt(prompt, &self.schema_limits)?;
         // A literal sentinel but no images: `render_opts_for` sets no
         // media sentinel, so an image-bearing prompt fails typed.
         let media = MediaContext {
@@ -5175,6 +5203,7 @@ impl<B: Backend> Session<B> {
         include_user_sampling: bool,
     ) -> Result<PreparedCall, SessionError> {
         self.check_no_open_thought(prompt)?;
+        crate::schema_budget::check_prompt(prompt, &self.schema_limits)?;
         let media = self.call_context(prompt)?;
         let opts = self.render_opts_for(&media);
         let (

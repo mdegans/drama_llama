@@ -131,7 +131,8 @@ use drama_llama::{
     backend::{Backend, Model},
     cli::{BackendArgs, BackendKind},
     prompt::{AnthropicError, MessageResponse, Usage},
-    Catalog, FromPath, ProbeCtx, ProbeHook, Prompt, Session, SnapshotOpts,
+    Catalog, FromPath, ProbeCtx, ProbeHook, Prompt, SchemaLimits, Session,
+    SnapshotOpts,
 };
 use misanthropic::{
     model::{ModelInfo, Models},
@@ -208,6 +209,54 @@ struct Args {
     /// convention is to open `/probe` before sending `/v1/messages`.
     #[arg(long, default_value_t = false)]
     probe_stream: bool,
+    /// Limits on a request's tool and `output_config` schemas.
+    #[command(flatten)]
+    schema_limits: SchemaLimitArgs,
+}
+
+/// The most a request's client-supplied schemas — every custom tool's
+/// `input_schema`, an `output_config` `json_schema` — may measure,
+/// checked before anything compiles them. A request past one is a 400
+/// `invalid_request_error` naming it. The defaults are
+/// `drama_llama::SchemaLimits::default()`, generous for real tools
+/// (Agora's are 15 tools of at most 5 parameters, ~400 schema nodes);
+/// raise one if a legitimate request trips it.
+#[derive(clap::Args)]
+struct SchemaLimitArgs {
+    /// Custom tools in one request.
+    #[arg(long, default_value_t = SchemaLimits::default().max_tools)]
+    schema_max_tools: usize,
+    /// Top-level properties of one tool's `input_schema`.
+    #[arg(long, default_value_t = SchemaLimits::default().max_params)]
+    schema_max_params: usize,
+    /// JSON values across all of a request's schemas.
+    #[arg(long, default_value_t = SchemaLimits::default().max_nodes)]
+    schema_max_nodes: usize,
+    /// `$defs` (and `definitions`) entries of one schema.
+    #[arg(long, default_value_t = SchemaLimits::default().max_defs)]
+    schema_max_defs: usize,
+    /// Bytes of one `enum` member or `const` value, as compact JSON.
+    #[arg(long, default_value_t = SchemaLimits::default().max_member_bytes)]
+    schema_max_member_bytes: usize,
+    /// Bytes of every `enum` member and `const` value across a request,
+    /// each `$ref` counted at its target's size once per reference.
+    #[arg(
+        long,
+        default_value_t = SchemaLimits::default().max_total_member_bytes
+    )]
+    schema_max_total_member_bytes: usize,
+}
+
+impl SchemaLimitArgs {
+    fn limits(&self) -> SchemaLimits {
+        SchemaLimits::default()
+            .with_max_tools(self.schema_max_tools)
+            .with_max_params(self.schema_max_params)
+            .with_max_nodes(self.schema_max_nodes)
+            .with_max_defs(self.schema_max_defs)
+            .with_max_member_bytes(self.schema_max_member_bytes)
+            .with_max_total_member_bytes(self.schema_max_total_member_bytes)
+    }
 }
 
 #[derive(Clone)]
@@ -648,6 +697,7 @@ async fn load_session<B>(
     model: String,
     no_penalty: bool,
     seed: Option<u128>,
+    schema_limits: SchemaLimits,
 ) -> Result<Session<B>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend + 'static,
@@ -669,7 +719,7 @@ where
         Ok(session)
     })
     .await
-    .map(|s| configure_session(s, no_penalty, seed))
+    .map(|s| configure_session(s, no_penalty, seed, schema_limits))
     .map_err(map_session_err)
 }
 
@@ -796,6 +846,7 @@ where
         model.to_string(),
         state.args.no_penalty,
         state.args.seed,
+        state.args.schema_limits.limits(),
     )
     .await?;
     Ok((lock, session))
@@ -999,6 +1050,7 @@ fn configure_session<B: Backend>(
     s: Session<B>,
     no_penalty: bool,
     seed: Option<u128>,
+    schema_limits: SchemaLimits,
 ) -> Session<B> {
     // Sampling configuration is loaded from the per-model sidecar
     // (`<model>.sampling.toml` for gguf, `parent/sampling.toml` for moeflux)
@@ -1021,7 +1073,8 @@ fn configure_session<B: Backend>(
         .with_prefix_cache(true)
         // An Anthropic-API server answers an overrun `max_tokens` with
         // Anthropic's 400, before prefill, not a silent truncation.
-        .with_strict_context_fit(true);
+        .with_strict_context_fit(true)
+        .with_schema_limits(schema_limits);
     // ProbeHook installation moved to per-request handlers — each /v1/messages
     // request gets a fresh hook bound to its UUID, so the hook can fan out to
     // JSONL, the broadcast bus, or both, with a recorder lifetime that exactly
@@ -1411,6 +1464,7 @@ fn map_session_err(
         | E::OutputConfig(_)
         | E::RequestTopP(_)
         | E::Dialect(_)
+        | E::SchemaBudget(_)
         | E::UnrenderableOpenThought { .. }
         | E::MediaUnsupported { .. }
         | E::Media(_)
@@ -1658,6 +1712,42 @@ mod tests {
                 "{value}",
             );
         }
+    }
+
+    /// A request whose schemas measure past the server's limits is the
+    /// request's fault too: 400 `invalid_request_error`, naming the
+    /// limit and where.
+    #[test]
+    fn schema_past_limits_is_anthropic_400_envelope() {
+        use drama_llama::{schema_budget::check_schemas, SessionError, Tool};
+        let tool = Tool::builder("lookup")
+            .description("d")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {"a": {}, "b": {}},
+            }))
+            .build()
+            .unwrap();
+        let limits = SchemaLimits::default().with_max_params(1);
+        let error = check_schemas([&tool], None, &limits).unwrap_err();
+        let (status, Json(envelope)) =
+            map_session_err(SessionError::from(error));
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("tool `lookup`"), "{message}");
+        assert!(message.contains("more than 1 top-level"), "{message}");
+    }
+
+    /// The flags default to the library's limits.
+    #[test]
+    fn schema_limit_flags_default_to_the_library() {
+        let args = Args::parse_from(["blallama", "models"]);
+        assert_eq!(args.schema_limits.limits(), SchemaLimits::default());
+        let args =
+            Args::parse_from(["blallama", "models", "--schema-max-tools", "3"]);
+        assert_eq!(args.schema_limits.limits().max_tools, 3);
     }
 
     /// The ingest guard is a bug detector now: a shortfall is a 500

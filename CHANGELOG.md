@@ -848,6 +848,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A request's schemas are measured before anything compiles them**
+  (`SchemaLimits`, `Session::with_schema_limits`,
+  `SessionError::SchemaBudget`, a 400 `invalid_request_error` on
+  blallama). Every custom tool's `input_schema` and an `output_config`
+  `json_schema` are walked once, iteratively, before rendering,
+  classification or compilation, and the request is refused, naming
+  the limit and where, when it has more than:
+
+  | limit | default | largest measured |
+  |---|---|---|
+  | custom tools | 512 | 15 (Agora) |
+  | top-level properties per tool | 512 | 5 |
+  | JSON values across the request's schemas | 131,072 | 882 |
+  | `$defs` + `definitions` per schema | 1,024 | 5 |
+  | bytes of one `enum` member / `const` | 16 KiB | 24 |
+  | member bytes across the request, each `$ref` at its target's size | 1 MiB | ~49 KB |
+
+  Measured on Agora's seed-agent request (15 tools and the `Soul`
+  output schema), misanthropic's captured request fixtures, Anthropic's
+  documented tool examples and a heavier synthetic tool (a 600-member
+  time-zone `enum` behind a `$ref` four parameters name); the largest
+  is 21× inside every limit. The `$ref`-expanded total is the work a
+  per-parameter pipeline would do: a large `enum` behind a `$ref` two
+  thousand parameters name is two thousand copies of it. Every hostile
+  shape the rechecks found is refused in milliseconds, while requests
+  at the limits (512 parameters over shared defs, 512 tools, 20,000
+  nested optional properties) compile in every dialect in under 110 ms.
+  The pipelines keep their own caps for callers that skip the measure.
+  blallama takes each as a flag (`--schema-max-tools`,
+  `--schema-max-params`, `--schema-max-nodes`, `--schema-max-defs`,
+  `--schema-max-member-bytes`, `--schema-max-total-member-bytes`).
+
 - **Constrained output is checked against its schema before it is
   answered** (`SessionError::SchemaViolation`). A finished
   json_schema `output_config` answer must be exactly one JSON document

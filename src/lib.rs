@@ -90,6 +90,9 @@ pub use output_config::{
 mod schema_check;
 pub use schema_check::{MismatchKind, SchemaMismatch};
 
+pub mod schema_budget;
+pub use schema_budget::{SchemaBudgetError, SchemaLimits};
+
 pub mod dialect;
 pub use dialect::CallSyntax;
 

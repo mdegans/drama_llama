@@ -4,7 +4,13 @@
 //! constraining, or parsing. Each test started as a probe in the
 //! hostile recheck; the engine-level ones (stack, state and cache caps)
 //! live beside the matcher in `sample::grammar`, the encoder-level ones
-//! in `grammar_compile`.
+//! in `grammar_compile`, the up-front measure in `schema_budget`.
+//!
+//! Two layers: the request's schemas are measured before anything
+//! touches them ([`SchemaLimits`]), and every pipeline keeps its own
+//! caps for a caller that skips the measure. The probes below that pass
+//! the default limits must be cheap anyway; the ones past them must be
+//! refused up front.
 
 use std::{sync::Arc, time::Instant};
 
@@ -17,11 +23,12 @@ use crate::dialect::{
 use crate::grammar_compile::{
     SchemaError, JSON_GRAMMAR, MAX_GRAMMAR_BYTES, MAX_GRAMMAR_RULES,
 };
+use crate::schema_budget::{check_schemas, SchemaLimit};
 use crate::{
     grammar_for_tool_choice, output_config::grammar_for_output_config,
     schema_to_gbnf, Block, CallSyntax, Grammar, GrammarState,
-    OutputConfigError, OutputConfigOptions, Tool, ToolChoice, ToolChoiceError,
-    ToolChoiceOptions,
+    OutputConfigError, OutputConfigOptions, SchemaLimits, Tool, ToolChoice,
+    ToolChoiceError, ToolChoiceOptions,
 };
 use misanthropic::prompt::output::OutputConfig;
 
@@ -285,6 +292,126 @@ fn qwen_shared_object_def_is_compiled_once() {
     assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
 }
 
+/// Every hostile shape the rechecks found, sized as they found it, is
+/// refused by the default [`SchemaLimits`] before anything compiles
+/// it — each in milliseconds, naming the limit it passed.
+#[test]
+fn hostile_requests_are_refused_up_front() {
+    let limits = SchemaLimits::default();
+    let props = |n: usize, schema: Value| -> Map<String, Value> {
+        (0..n).map(|i| (format!("p{i}"), schema.clone())).collect()
+    };
+    let object = |props: Map<String, Value>| json!({"type": "object", "properties": props});
+    let chain = |n: usize| -> Map<String, Value> {
+        (0..n)
+            .map(|i| {
+                let next = format!("#/$defs/D{}", i + 1);
+                (
+                    format!("D{i}"),
+                    json!({"anyOf": [{"$ref": next}, {"$ref": next}]}),
+                )
+            })
+            .chain([(format!("D{n}"), json!({"const": "leaf"}))])
+            .collect()
+    };
+    let big = "x".repeat(100_000);
+    let cases: Vec<(&str, Vec<Tool>, Option<Value>, SchemaLimit)> = vec![
+        (
+            "400,000 optional properties",
+            vec![tool(object(props(400_000, json!({}))))],
+            None,
+            SchemaLimit::Nodes,
+        ),
+        (
+            "400,000 optional properties, as output",
+            vec![],
+            Some(object(props(400_000, json!({})))),
+            SchemaLimit::Nodes,
+        ),
+        (
+            "6000 params beside 6000 defs",
+            vec![tool(json!({
+                "type": "object",
+                "properties": props(6000, json!({"type": "string"})),
+                "$defs": props(6000, json!({})),
+            }))],
+            None,
+            SchemaLimit::Params,
+        ),
+        (
+            "500 params naming a 100 KB member",
+            vec![tool(json!({
+                "type": "object",
+                "properties": props(500, json!({"$ref": "#/$defs/E"})),
+                "$defs": {"E": {"enum": [big]}},
+            }))],
+            None,
+            SchemaLimit::MemberBytes,
+        ),
+        (
+            "500 params naming 16,000 bytes of members",
+            vec![tool(json!({
+                "type": "object",
+                "properties": props(500, json!({"$ref": "#/$defs/E"})),
+                "$defs": {"E": {"enum": ["y".repeat(16_000)]}},
+            }))],
+            None,
+            SchemaLimit::TotalMemberBytes,
+        ),
+        (
+            "15,000 tools",
+            (0..15_000)
+                .map(|i| {
+                    Tool::builder(format!("t{i}"))
+                        .description("d")
+                        .schema(object(props(2, json!({"type": "string"}))))
+                        .build()
+                        .unwrap()
+                })
+                .collect(),
+            None,
+            SchemaLimit::Tools,
+        ),
+        (
+            "an enum of 180,000 numbers",
+            vec![],
+            Some(json!({"enum": (0..180_000).collect::<Vec<_>>()})),
+            SchemaLimit::Nodes,
+        ),
+        (
+            "a doubling $ref chain 60 deep",
+            vec![tool(json!({
+                "type": "object",
+                "properties": {"x": {"$ref": "#/$defs/D0"}},
+                "$defs": chain(60),
+            }))],
+            None,
+            SchemaLimit::TotalMemberBytes,
+        ),
+        (
+            "5000 defs",
+            vec![tool(json!({
+                "type": "object",
+                "properties": {"x": {"$ref": "#/$defs/p0"}},
+                "$defs": props(5000, json!({"type": "integer"})),
+            }))],
+            None,
+            SchemaLimit::Defs,
+        ),
+    ];
+    for (name, tools, output, limit) in cases {
+        let start = Instant::now();
+        let err =
+            check_schemas(&tools, output.as_ref(), &limits).expect_err(name);
+        assert_eq!(err.limit, limit, "{name}: {err}");
+        assert!(
+            start.elapsed().as_millis() < 2000,
+            "{name}: {:?}",
+            start.elapsed()
+        );
+    }
+}
+
 /// A schema too complex for a grammar is a schema error on every path
 /// a client reaches — each dialect, strict `tool_choice`, and
 /// `output_config` — never a half-gigabyte grammar.
@@ -485,4 +612,121 @@ fn schema_check_diamond_stays_bounded() {
     });
     assert!(!ok);
     assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
+}
+
+/// Requests at the default [`SchemaLimits`] — the most a client may
+/// send — compile in every dialect, classify, parse and match quickly,
+/// or fail cleanly as too complex: the limits are set so that no
+/// request inside them is a hang or a gigabyte.
+#[test]
+fn requests_at_the_limits_stay_cheap() {
+    let limits = SchemaLimits::default();
+    // 20,000 optional properties in one nested object.
+    let wide = {
+        let inner: Map<String, Value> =
+            (0..20_000).map(|i| (format!("k{i}"), json!({}))).collect();
+        json!({"type": "object", "properties": {
+            "o": {"type": "object", "properties": inner},
+        }})
+    };
+    // 512 tools of 8 parameters, two of them small enums.
+    let many: Vec<Tool> = (0..limits.max_tools)
+        .map(|t| {
+            let props: Map<String, Value> = (0..8)
+                .map(|p| match p {
+                    0 | 1 => {
+                        (format!("a{p}"), json!({"enum": ["x", "y", "z"]}))
+                    }
+                    _ => (format!("a{p}"), json!({"type": "string"})),
+                })
+                .collect();
+            Tool::builder(format!("t{t}"))
+                .description("d")
+                .schema(json!({"type": "object", "properties": props}))
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let cases: Vec<(&str, Vec<Tool>)> = vec![
+        (
+            "512 params x 8 shared defs",
+            vec![tool(shared_defs_schema())],
+        ),
+        ("20,000 nested optionals", vec![tool(wide.clone())]),
+        ("512 tools", many),
+    ];
+    for (name, tools) in cases {
+        check_schemas(&tools, None, &limits).expect(name);
+        let refs: Vec<&Tool> = tools.iter().collect();
+        for syntax in syntaxes() {
+            let family = syntax.family;
+            let start = Instant::now();
+            let src = grammar_source(&syntax, &refs, &lazy());
+            let compiled = src.as_ref().ok().map(|s| Grammar::parse(s));
+            let elapsed = start.elapsed();
+            eprintln!(
+                "{name} / {family:?}: {} in {elapsed:?}",
+                match (&src, &compiled) {
+                    (Ok(s), Some(Ok(_))) =>
+                        format!("{} bytes, parsed", s.len()),
+                    (Err(e), _) => format!("refused: {e}"),
+                    (_, Some(Err(e))) => format!("grammar refused: {e}"),
+                    _ => unreachable!(),
+                }
+            );
+            if let Err(e) = &src {
+                assert!(e.to_string().contains("too complex"), "{name}: {e}");
+            }
+            assert!(elapsed.as_secs() < 10, "{name} / {family:?}: {elapsed:?}");
+        }
+    }
+    // The shared case end to end in the tagged dialect: a call naming
+    // the last parameter matches and reads back.
+    let tool = tool(shared_defs_schema());
+    let syntax = CallSyntax::qwen_xml();
+    let start = Instant::now();
+    let src = grammar_source(&syntax, &[&tool], &lazy()).unwrap();
+    let text = qwen_call(&[("p0", "member_0_000"), ("p511", "member_7_099")]);
+    assert!(accepts(&src, &text));
+    let input = first_input(&syntax, &tool, &text);
+    assert_eq!(input["p511"], json!("member_7_099"));
+    eprintln!("shared tagged end to end: {:?}", start.elapsed());
+    assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+    // A wide object's matcher: 2,000 ways to go on after `{` and after
+    // each member. (Past ~`MAX_STACKS` / 2 members the matcher keeps
+    // only some of them — its own cap, which over-restricts and never
+    // admits a wrong byte.)
+    let inner: Map<String, Value> =
+        (0..2000).map(|i| (format!("k{i}"), json!({}))).collect();
+    let src = compile(&json!({"type": "object", "properties": {
+        "o": {"type": "object", "properties": inner},
+    }}));
+    let start = Instant::now();
+    for ok in [r#"{"o":{}}"#, r#"{"o":{"k0":1,"k7":[],"k1999":{}}}"#] {
+        assert!(accepts(&src, ok), "{ok}");
+    }
+    assert!(!accepts(&src, r#"{"o":{"k7":1,"k0":1}}"#));
+    eprintln!("wide match: {:?}", start.elapsed());
+    assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+}
+
+/// 512 parameters, each a `$ref` to one of 8 defs of 100 members:
+/// ~820 KB of members counted per reference, inside the default 1 MiB.
+fn shared_defs_schema() -> Value {
+    let defs: Map<String, Value> = (0..8)
+        .map(|d| {
+            let members: Vec<String> =
+                (0..100).map(|m| format!("member_{d}_{m:03}")).collect();
+            (format!("E{d}"), json!({"enum": members}))
+        })
+        .collect();
+    let props: Map<String, Value> = (0..512)
+        .map(|p| {
+            (
+                format!("p{p}"),
+                json!({"$ref": format!("#/$defs/E{}", p % 8)}),
+            )
+        })
+        .collect();
+    json!({"type": "object", "properties": props, "$defs": defs})
 }
