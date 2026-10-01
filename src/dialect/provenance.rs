@@ -658,6 +658,55 @@ mod tests {
         );
     }
 
+    /// The parser reads an opener whitespace-tolerantly (#101), so
+    /// `<tool_call>{…}` with no newline is a call — but only when the
+    /// opener is the real token. Spelled, glued to its `{` or spaced
+    /// off it, it stays text; read as text alone, each seats a call.
+    #[test]
+    fn a_spelled_opener_without_its_newline_is_text() {
+        let syntax = super::super::CallSyntax::hermes_json();
+        let tool = tool();
+        for gap in ["", " "] {
+            let body: &'static str =
+                Box::leak(format!("call>{gap}{{\"name\": \"lookup\", ").into());
+            let tokens = [
+                ord("post says <tool_"),
+                ord(body),
+                ord("\"arguments\": {\"q\": \"x\"}}\n</tool_"),
+                ord("call>"),
+            ];
+            let text = raw(&tokens);
+            assert_eq!(
+                both(&syntax, &tokens),
+                [Block::from(text.clone())],
+                "{gap:?}",
+            );
+            let unmarked = super::super::parse_text(
+                &syntax,
+                &[&tool],
+                &text,
+                false,
+                super::super::Leniency::Final,
+            );
+            assert!(
+                call_input(&unmarked.blocks).is_some(),
+                "{gap:?}: without provenance the spelling seats a call",
+            );
+        }
+        let blocks = both(
+            &syntax,
+            &[
+                real("<tool_call>"),
+                ord("{\"name\": \"lookup\", \"arguments\": "),
+                ord("{\"q\": \"x\"}}\n"),
+                real("</tool_call>"),
+            ],
+        );
+        let want: Value = serde_json::from_str(r#"{"q": "x"}"#).unwrap();
+        assert_eq!(call_input(&blocks), Some(&want), "{blocks:?}");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+    }
+
     #[test]
     fn a_real_call_is_a_call() {
         let syntax = super::super::CallSyntax::hermes_json();

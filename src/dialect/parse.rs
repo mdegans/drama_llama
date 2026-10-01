@@ -485,6 +485,28 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consume a call opener whitespace-tolerantly: leading whitespace,
+    /// the marker's trimmed core (the special — [`CallSyntax::trigger`]
+    /// is the same core), then any whitespace after it. The canonical
+    /// trailing `\n` the template lays out is *forced* by the grammar
+    /// once the trigger fires, so drift here only ever comes from an
+    /// unconstrained generation — and a real opener must still parse
+    /// as a call, never be left in prose as a reserved special. An
+    /// empty marker is vacuously consumed.
+    fn eat_opener(&mut self, marker: &str) -> bool {
+        let core = marker.trim();
+        if core.is_empty() {
+            return true;
+        }
+        let ws = self.rest().len() - self.rest().trim_start().len();
+        if !self.text[self.pos + ws..].starts_with(core) {
+            return false;
+        }
+        self.pos += ws + core.len();
+        self.pos += self.rest().len() - self.rest().trim_start().len();
+        true
+    }
+
     fn push_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -926,8 +948,10 @@ impl<'a> Parser<'a> {
     fn parse_calls(&mut self) {
         let has_section = !self.syntax.section_start.is_empty();
         if has_section {
-            debug_assert!(self.rest().starts_with(&self.syntax.section_start));
-            self.pos += self.syntax.section_start.len();
+            // NOT `debug_assert!(self.eat_opener(..))` — see
+            // `parse_thought` (#62).
+            let ate = self.eat_opener(&self.syntax.section_start.clone());
+            debug_assert!(ate, "parse_calls: opener not at self.pos");
         }
 
         loop {
@@ -939,21 +963,12 @@ impl<'a> Parser<'a> {
             // (Mistral's `[TOOL_CALLS]` loop, cut by `max_tokens`
             // mid-call, `session_mistral4::emission_round_trips_…`).
             let call_start = self.pos;
-            // Per-call opener (when distinct from the section).
-            if !self.syntax.per_call_start.is_empty()
-                && !self.eat(&self.syntax.per_call_start.clone())
-            {
-                // For repeat calls the trigger may re-occur with
-                // leading whitespace between calls.
-                let ws = self.rest().len() - self.rest().trim_start().len();
-                let after_ws = self.pos + ws;
-                if self.text[after_ws..]
-                    .starts_with(&self.syntax.per_call_start)
-                {
-                    self.pos = after_ws + self.syntax.per_call_start.len();
-                } else {
-                    break;
-                }
+            // Per-call opener (when distinct from the section). For
+            // repeat calls it may re-occur after the inter-call
+            // whitespace; `eat_opener` tolerates that and any layout
+            // drift after the special.
+            if !self.eat_opener(&self.syntax.per_call_start.clone()) {
+                break;
             }
 
             match self.parse_one_call() {
@@ -967,9 +982,10 @@ impl<'a> Parser<'a> {
                     if self.syntax.per_call_start.is_empty() {
                         break;
                     }
-                    let ws = self.rest().len() - self.rest().trim_start().len();
-                    if !self.text[self.pos + ws..]
-                        .starts_with(&self.syntax.per_call_start)
+                    if !self
+                        .rest()
+                        .trim_start()
+                        .starts_with(self.syntax.per_call_start.trim())
                     {
                         break;
                     }
@@ -1483,10 +1499,12 @@ impl<'a> Parser<'a> {
         }
         // `Copy` the borrow out of `self`, so the slices outlive `&mut`.
         let text: &'a str = &self.text[call_start..];
-        let opener = self.syntax.per_call_start.as_str();
-        let text = text
-            .strip_prefix(opener)
-            .or_else(|| text.trim_start().strip_prefix(opener))?;
+        // Whitespace-tolerant, as `eat_opener` reads it.
+        let opener = self.syntax.per_call_start.trim();
+        let text = match opener {
+            "" => text,
+            _ => text.trim_start().strip_prefix(opener)?.trim_start(),
+        };
         let f = &self.syntax.function;
         match self.syntax.family {
             Family::TagWithTagged => self.open_tagged(text),
@@ -2975,33 +2993,38 @@ mod tests {
         assert!(parsed.blocks.is_empty(), "{:#?}", parsed.blocks);
     }
 
-    /// Guard: a `<tool_call>`-like substring that is NOT the real
-    /// trigger (`<tool_call>\n`) must not cause an over-eager split.
-    /// The unclosed reasoning block surfaces as an *open* Thought
-    /// carrying the substring verbatim — no spurious ToolUse, no
-    /// dropped bytes, and (unlike the old `incomplete` fallback) no
-    /// `<think>` marker seated in a Text block.
+    /// A bare `<tool_call>` mention in an unclosed thought. The bare
+    /// special is the call landmark now ([`CallSyntax::trigger`]; it
+    /// used to be `<tool_call>\n`, so a mention followed by a space was
+    /// no landmark at all), so the thought splits there and what follows
+    /// — not a call — degrades to Text: no spurious ToolUse, no dropped
+    /// bytes, no `<think>` marker seated as Text (#38). A session never
+    /// emits this shape: the special arms the grammar, which forces a
+    /// call from there (`real_opener_shapes_never_reach_containment`).
     #[test]
-    fn unclosed_think_fake_trigger_substring_is_not_a_call() {
+    fn unclosed_think_opener_mention_is_not_a_call() {
         let syntax = CallSyntax::qwen_xml();
         let t = tool("get_weather");
-        // "<tool_call>" followed by a space, not the "<tool_call>\n"
-        // trigger.
+        let preserved = |blocks: &[Block]| {
+            blocks.iter().any(|b| match b {
+                Block::Thought { thought, .. } => {
+                    thought.contains("<tool_call>")
+                }
+                Block::Text { text, .. } => text.contains("<tool_call>"),
+                _ => false,
+            })
+        };
         let midstream = "<think>\nI could emit a <tool_call> but not yet";
         let parsed =
             parse_text(&syntax, &[&t], midstream, false, Leniency::Final);
         assert!(
             calls_of(&parsed.blocks).is_empty(),
-            "fake trigger must not become a call: {:#?}",
+            "a mention must not become a call: {:#?}",
             parsed.blocks
         );
         assert!(
-            parsed
-                .blocks
-                .iter()
-                .any(|b| matches!(b, Block::Thought { thought, .. }
-                if thought.contains("<tool_call>"))),
-            "the substring is preserved, not dropped: {:#?}",
+            preserved(&parsed.blocks),
+            "the mention is preserved, not dropped: {:#?}",
             parsed.blocks
         );
         // And the reasoning open marker stays framing, not content.
@@ -3015,16 +3038,11 @@ mod tests {
             parsed.blocks
         );
 
-        // Same shape, pre-opened: preserved as a Thought instead.
+        // Same shape, pre-opened.
         let pre = "reasoning with a <tool_call> mention only";
         let parsed = parse_text(&syntax, &[&t], pre, true, Leniency::Final);
         assert!(calls_of(&parsed.blocks).is_empty(), "{:#?}", parsed.blocks);
-        assert!(
-            matches!(&parsed.blocks[0], Block::Thought { thought, .. }
-                if thought.contains("<tool_call>")),
-            "{:#?}",
-            parsed.blocks
-        );
+        assert!(preserved(&parsed.blocks), "{:#?}", parsed.blocks);
     }
 
     /// Regression: a properly-*closed* `</think>` then a call still
@@ -4923,5 +4941,221 @@ mod tests {
         let fin = parse_text(&syntax, &[&t], text, false, Leniency::Final);
         assert_eq!(clipped.blocks, fin.blocks);
         assert_eq!(texts_of(&clipped.blocks), text);
+    }
+
+    /// Every served dialect, as the session analyzes it: the stock and
+    /// baked template of each [`crate::baked`] pair, plus the
+    /// hand-built constructors (Hermes is the `Family::None` fallback).
+    fn served_dialects() -> Vec<(String, CallSyntax)> {
+        let eos = |name: &str| match name {
+            n if n.starts_with("gemma4") => ("<bos>", "<turn|>"),
+            n if n.starts_with("mistral4") => ("<s>", "</s>"),
+            n if n.starts_with("gptoss") => ("<|startoftext|>", "<|return|>"),
+            _ => ("", "<|im_end|>"),
+        };
+        let built = [
+            ("hermes_json", CallSyntax::hermes_json()),
+            ("qwen_xml", CallSyntax::qwen_xml()),
+            ("gemma4", CallSyntax::gemma4()),
+            ("gpt_oss", CallSyntax::gpt_oss()),
+        ]
+        .map(|(name, syntax)| (name.to_string(), syntax));
+        let baked = crate::baked::ALL.iter().flat_map(|b| {
+            let (bos, eos) = eos(b.name);
+            [("stock", b.stock), ("baked", b.replacement)].map(
+                |(which, source)| {
+                    let syntax =
+                        crate::dialect::analyze_template(source, bos, eos)
+                            .unwrap_or_else(|e| {
+                                panic!("{} {which}: {e}", b.name)
+                            });
+                    (format!("{} ({which})", b.name), syntax)
+                },
+            )
+        });
+        built.into_iter().chain(baked).collect()
+    }
+
+    /// The lazy grammar for `syntax` over `tools`, as the session
+    /// builds it (parallel wherever there is a per-call opener).
+    fn lazy_grammar(
+        syntax: &CallSyntax,
+        tools: &[&Tool],
+    ) -> std::sync::Arc<crate::Grammar> {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        let opts = EmitOptions {
+            anchor: Anchor::Lazy,
+            parallel: !syntax.per_call_start.is_empty(),
+        };
+        let src = grammar_source(syntax, tools, &opts).expect("emit");
+        std::sync::Arc::new(
+            crate::Grammar::parse(&src)
+                .unwrap_or_else(|e| panic!("grammar: {e}\n{src}")),
+        )
+    }
+
+    /// #101, live on cogito-32b (~10% of attempts rejected): the marker
+    /// dialects triggered on the whole opener, `<tool_call>\n`, so a
+    /// real `<tool_call>` the model followed with anything else — `{`,
+    /// a space, `\r\n`, EOG — never armed the grammar, the parser left
+    /// it in prose, and containment rejected the turn. Every marker
+    /// dialect now triggers on the bare special, and the lazy grammar —
+    /// which starts at the full opener — takes it as a strict prefix
+    /// (so EOG right after it is masked) and goes on to accept the
+    /// canonical call. Harmony's recipient-header triggers are
+    /// untouched.
+    #[test]
+    fn trigger_is_the_bare_opener_and_arms_the_lazy_grammar() {
+        use crate::GrammarState;
+        let t = tool("get_weather");
+        let input = json!({"city": "Paris", "days": 3});
+        for (name, syntax) in served_dialects() {
+            if syntax.family == Family::Harmony {
+                assert_eq!(
+                    syntax.triggers(),
+                    [
+                        "<|start|>assistant to=functions.",
+                        "<|channel|>commentary to=functions.",
+                        "<|channel|>analysis to=functions.",
+                    ],
+                    "{name}"
+                );
+                continue;
+            }
+            let trigger = syntax.trigger();
+            assert!(!trigger.is_empty(), "{name}");
+            assert_eq!(trigger, trigger.trim(), "{name}");
+            assert_eq!(syntax.triggers(), [trigger], "{name}");
+            let opener = match syntax.section_start.as_str() {
+                "" => syntax.per_call_start.as_str(),
+                section => section,
+            };
+            assert!(opener.starts_with(trigger), "{name}: {opener:?}");
+
+            let mut state = GrammarState::new(lazy_grammar(&syntax, &[&t]));
+            assert!(
+                state.advance_bytes(trigger.as_bytes()).is_ok(),
+                "{name}: the grammar must take the bare trigger"
+            );
+            assert!(
+                !state.is_complete(),
+                "{name}: a bare opener must leave the call open"
+            );
+            let call = render_reference(&syntax, &[("get_weather", &input)])
+                .expect("representable");
+            let rest = call.strip_prefix(trigger).unwrap_or_else(|| {
+                panic!("{name}: {call:?} must open with {trigger:?}")
+            });
+            // Gemma 4's grammar requires its turn exit after the call.
+            let rest = format!("{rest}{}", syntax.tool_response_start);
+            assert!(
+                state.advance_bytes(rest.as_bytes()).is_ok()
+                    && state.is_complete(),
+                "{name}: canonical call after the trigger: {call:?}"
+            );
+        }
+    }
+
+    /// The live #101 shapes (cogito-32b; the same opener on the Qwen
+    /// XML dialect), each through what the session does with it: the
+    /// first trigger arms the lazy grammar, and from there the sampler
+    /// only emits bytes the grammar accepts. So every shape with a real
+    /// opener ends one of two ways — a complete call, seated by the
+    /// parser as `ToolUse` with no special left in prose, or a
+    /// constraint the grammar does not complete (`GrammarViolation`, or
+    /// bytes it masks and the model could not have emitted) — never as
+    /// a special in free text (`EmittedSpecialToken`). Shapes whose
+    /// call is well-formed after layout drift also seat without any
+    /// grammar: a real opener is never prose.
+    #[test]
+    fn real_opener_shapes_never_reach_containment() {
+        use crate::GrammarState;
+        let t = Tool::builder("get_inbox")
+            .description("x")
+            .schema(json!({
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            }))
+            .build()
+            .expect("valid tool");
+        let cogito = crate::dialect::analyze_template(
+            crate::baked::COGITO.replacement,
+            "",
+            "<|im_end|>",
+        )
+        .expect("analyze");
+        let json_call = "<tool_call>\n{\"name\": \"get_inbox\", \
+                         \"arguments\": {}}\n</tool_call>";
+        let json_body = "{\"name\": \"get_inbox\", \"arguments\": {}}\
+                         \n</tool_call>";
+        let xml_call = "<tool_call>\n<function=get_inbox>\n</function>\n\
+                        </tool_call>";
+        let xml_body = "<function=get_inbox>\n</function>\n</tool_call>";
+        let poisoned = |blocks: &[Block], marker: &str| {
+            blocks.iter().any(|b| match b {
+                Block::Text { text, .. } => text.contains(marker),
+                Block::Thought { thought, .. } => thought.contains(marker),
+                _ => false,
+            })
+        };
+        for (syntax, call, body) in [
+            (cogito, json_call, json_body),
+            (CallSyntax::qwen_xml(), xml_call, xml_body),
+        ] {
+            let opener = syntax.trigger();
+            // `(label, emission, seats without a grammar)`.
+            let shapes: Vec<(&str, String, bool)> = vec![
+                ("canonical", format!("ok\n\n{call}"), true),
+                ("call only", call.to_string(), true),
+                ("two calls", format!("ok\n\n{call}\n{call}"), true),
+                ("no newline", format!("ok\n\n{opener}{body}"), true),
+                ("space", format!("ok\n\n{opener} {body}"), true),
+                ("crlf", format!("ok\n\n{opener}\r\n{body}"), true),
+                ("double newline", format!("ok\n\n{opener}\n\n{body}"), true),
+                ("mention", format!("I will use {opener} tags."), false),
+                ("opener at EOG", format!("{call}\n{opener}"), false),
+                ("opener+nl at EOG", format!("{call}\n{opener}\n"), false),
+                ("bare opener", format!("ok\n\n{opener}"), false),
+                ("malformed", format!("{opener}\n{{\"name\": }}"), false),
+            ];
+            let grammar = lazy_grammar(&syntax, &[&t]);
+            for (label, emission, seats) in shapes {
+                let what = format!("{:?} {label}: {emission:?}", syntax.family);
+                let parsed = parse_text(
+                    &syntax,
+                    &[&t],
+                    &emission,
+                    false,
+                    Leniency::Final,
+                );
+                let seated = !poisoned(&parsed.blocks, opener)
+                    && parsed
+                        .blocks
+                        .iter()
+                        .any(|b| matches!(b, Block::ToolUse { .. }));
+                if seats {
+                    assert!(seated, "{what} → {:#?}", parsed.blocks);
+                }
+                // Under the session: armed at the first trigger.
+                let at = emission.find(opener).expect("has an opener");
+                let mut state = GrammarState::new(grammar.clone());
+                assert!(
+                    state.advance_bytes(opener.as_bytes()).is_ok(),
+                    "{what}: the opener must arm the grammar"
+                );
+                let rest = &emission.as_bytes()[at + opener.len()..];
+                let completes =
+                    state.advance_bytes(rest).is_ok() && state.is_complete();
+                // A grammar-complete turn is the only one the session
+                // returns `Ok`; it must seat.
+                if completes {
+                    assert!(seated, "{what} → {:#?}", parsed.blocks);
+                }
+                assert!(
+                    completes || !matches!(label, "canonical" | "call only"),
+                    "{what}: canonical shapes complete the grammar"
+                );
+            }
+        }
     }
 }

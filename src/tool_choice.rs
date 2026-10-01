@@ -199,10 +199,11 @@ pub fn grammar_for_tool_choice(
 /// prompt whose `tool_choice` is `Auto` — or absent, which the
 /// Anthropic API treats as auto — with tools advertised.
 ///
-/// Returns a [`crate::DeferredGrammar`] that sleeps until the wrap-tag open
-/// (e.g. `<tool_call>\n`) appears in the output, then activates with
-/// the trigger bytes fed into the matcher, constraining the remainder
-/// of the call to the tool schemas. Thought and prose before the
+/// Returns a [`crate::DeferredGrammar`] that sleeps until the wrap-tag
+/// open (e.g. `<tool_call>`, its layout newline trimmed) appears in the
+/// output, then activates with the trigger bytes fed into the matcher,
+/// constraining the remainder of the call — its layout newline
+/// included — to the tool schemas. Thought and prose before the
 /// trigger run unconstrained at full speed.
 ///
 /// Returns `Ok(None)` when there is nothing to defer: a non-auto
@@ -234,9 +235,15 @@ pub fn deferred_grammar_for_prompt(
     if tools.is_empty() {
         return Ok(None);
     }
-    let Some((open, _)) = opts.wrap_tags else {
+    // The bare tag, not its layout newline — trimmed at the end only, so
+    // it stays a prefix of the opener the grammar starts at: see
+    // `CallSyntax::trigger`.
+    let Some(open) = opts.wrap_tags.map(|(open, _)| open.trim_end()) else {
         return Ok(None);
     };
+    if open.is_empty() {
+        return Ok(None);
+    }
     let chosen: Vec<&Tool> = tools.iter().collect();
     let source = build_grammar_source(&chosen, opts, RootShape::Lazy);
     Ok(Some(crate::DeferredGrammar {
@@ -1211,7 +1218,7 @@ mod tests {
         let d = deferred_grammar_for_prompt(&auto_with_tools, &opts)
             .unwrap()
             .expect("auto + tools must defer");
-        assert_eq!(d.activate_after, vec![b"<tool_call>\n".to_vec()]);
+        assert_eq!(d.activate_after, vec![b"<tool_call>".to_vec()]);
         assert!(d.feed_trigger);
 
         // Absent tool_choice counts as auto.

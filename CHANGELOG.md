@@ -340,7 +340,71 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answer was `NotJson` on every draw; it now reads as a number. (Lone
   surrogate escapes and three-digit exponents, serde_json's other
   refusals, are already unwritable under the grammar — now pinned.)
-
+- **A real `<tool_call>` always arms the grammar (#101).** The marker
+  dialects (Hermes, cogito, Qwen's XML) triggered the lazy tool-call
+  grammar on the whole opener, `<tool_call>\n`, and the parser looked
+  for the same bytes. A real `<tool_call>` the model followed with
+  anything else — `{`, a space, `\r\n`, EOG — never armed the
+  grammar, was not parsed as a call, and landed in prose, where
+  containment rejected the turn (`EmittedSpecialToken`): ~10% of
+  cogito-32b attempts in the live Agora cohort, each a resample.
+  `CallSyntax::trigger` (and so `triggers`, and the legacy
+  `deferred_grammar_for_prompt`) is now the marker with its trailing
+  whitespace trimmed — the special itself, still a prefix of the
+  opener; the grammar, which starts at the full opener, takes
+  over one token earlier and forces the canonical newline, so a real
+  opener is seated as a call or surfaces as a `GrammarViolation`,
+  never as prose. The parser reads openers whitespace-tolerantly
+  (`<tool_call>{…}` is a call), canonical shapes are unchanged
+  byte-for-byte, and dialects whose trigger was already a bare marker
+  (Gemma 4, Mistral 4's `[TOOL_CALLS]`) and Harmony's recipient
+  headers are untouched. Behaviour change: `trigger()` returns
+  `"<tool_call>"` where it returned `"<tool_call>\n"`; the untrimmed
+  `section_start` / `per_call_start` remain the canonical bytes. A
+  model naming its own opener in prose now gets a call forced — the
+  special was rejected from free text anyway.
+- **A tool call that repeats an earlier one in the same turn is
+  dropped.** Arming on the bare special has one risky shape: a stray
+  real opener after a *finished* call (`{call}\n<tool_call>`, then end
+  of turn) gets a second call forced, and a model with nothing more to
+  say fills it with the call it just made — a duplicate `create_post`
+  or `vote` the client would dispatch twice. A call with the same name
+  and an identical input (JSON value equality: member order aside,
+  `1` and `1.0` differ) is now dropped from the turn, batch and
+  streamed alike, and logged at `WARN` (`event = "tool_call_dropped"`,
+  the tool name only). Identical parallel calls are not observed from
+  Anthropic, so one is treated as never intended; a call that differs
+  in anything is a parallel call and stays. Only a *complete* call is
+  judged: a call cut by `max_tokens` or a stop sequence holds only the
+  members that completed, so it could match a call it would not have,
+  and it comes back cut (and, streamed, left open by
+  `BlockStream::open_call_json`) as on Anthropic — a client runs no
+  call of a turn that ended that way anyway. The stream judges a call
+  before yielding it, and the parser releases calls only whole, so no
+  part of a dropped one is ever seen. The batch turn leaves no
+  auto-tip: its KV holds the dropped call, which no re-render of the
+  returned turn reproduces.
+- **The #101 containment log says where.** The `EmittedSpecialToken`
+  error event now carries up to three `hits` (block index and kind,
+  offset in the block and in the emission, ~96 bytes of context each
+  side, and the 8 bytes after the special), whether a deferred grammar
+  ever activated, `emission_bytes` and `generated_tokens`. Operator
+  trace only; the error's `Display` still withholds the pieces.
+- **Cogito tool turns keep their tip.** Cogito's stock template prints
+  `\n` before every call, and the model ends its prose in whitespace
+  (`…\n\n<tool_call>`), so a prose-then-call turn re-rendered one
+  newline longer than it was generated and lost its tip on every
+  request (19 live events). The cogito bake now prints the
+  prose-to-call gap only when the prose carries none — as the Qwen
+  bakes do — and renders content-less turns and trimmed client prose
+  exactly as before. Parallel calls agree too: the analyzer read the
+  inter-call `\n` of per-call JSON templates as no separator (the two
+  probe calls share arguments, and the diff came back rotated), so the
+  grammar forced `</tool_call><tool_call>` against the template's
+  `</tool_call>\n<tool_call>`; it now measures `call_separator: "\n"`.
+  Not cogito-only: the NousResearch-Hermes-3 and Qwen3-0.6B templates
+  measure the same `"\n"` now, and their parallel calls change the
+  same way.
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
   assistant turn's answer and thought (3.6 also `lstrip`/`rstrip`s the

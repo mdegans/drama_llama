@@ -1785,6 +1785,88 @@ fn log_unstable_emission(
     );
 }
 
+/// Where one reserved special sits in a rejected generation — the
+/// #101 containment log's forensics. Operator trace only: carries the
+/// reserved bytes verbatim, so never relay it into model-visible text.
+#[cfg(feature = "axum")]
+#[derive(Debug, PartialEq)]
+struct SpecialHit<'a> {
+    /// Index into the parsed blocks.
+    block: usize,
+    /// `Text`, `Thought`, `ToolUse`, ...
+    kind: &'static str,
+    /// Byte offset of the special in the block's free text.
+    offset: usize,
+    /// Byte offset in the emission, when the special's surroundings
+    /// appear there verbatim (a parsed call's input is re-serialized,
+    /// so its strings may not).
+    emission_offset: Option<usize>,
+    piece: &'a str,
+    /// The 8 bytes after the special, escaped — what the trigger needed
+    /// to see (`\n` for the marker dialects' old `<tool_call>\n`).
+    next8: String,
+    before: &'a str,
+    after: &'a str,
+}
+
+/// The first `limit` occurrences of the `found` pieces in the free text
+/// of `blocks`, in block order, with about `context` bytes each side.
+#[cfg(feature = "axum")]
+fn special_hits<'a>(
+    blocks: &'a [crate::Block],
+    raw: &str,
+    found: &'a [String],
+    limit: usize,
+    context: usize,
+) -> Vec<SpecialHit<'a>> {
+    let kind = |block: &crate::Block| match block {
+        crate::Block::Text { .. } => "Text",
+        crate::Block::Thought { .. } => "Thought",
+        crate::Block::ToolUse { .. } => "ToolUse",
+        crate::Block::ServerToolUse { .. } => "ServerToolUse",
+        crate::Block::ToolResult { .. } => "ToolResult",
+        _ => "other",
+    };
+    blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(block, b)| {
+            let mut texts = Vec::new();
+            block_free_text(b, &mut texts);
+            texts.into_iter().map(move |text| (block, b, text))
+        })
+        .flat_map(|(block, b, text)| {
+            let mut hits: Vec<(usize, &'a str)> = found
+                .iter()
+                .flat_map(|piece| {
+                    text.match_indices(piece.as_str())
+                        .map(|(at, _)| (at, piece.as_str()))
+                })
+                .collect();
+            hits.sort_unstable();
+            hits.into_iter().map(move |(offset, piece)| {
+                let end = offset + piece.len();
+                let (before, _) = around(text, offset, context);
+                let (_, after) = around(text, end, context);
+                let next = &text.as_bytes()[end..(end + 8).min(text.len())];
+                SpecialHit {
+                    block,
+                    kind: kind(b),
+                    offset,
+                    emission_offset: raw
+                        .find(&text[offset - before.len()..end])
+                        .map(|at| at + before.len()),
+                    piece,
+                    next8: next.escape_ascii().to_string(),
+                    before,
+                    after,
+                }
+            })
+        })
+        .take(limit)
+        .collect()
+}
+
 /// The auto-tip's fold cursor: the assistant reply (message index
 /// `messages.len()` once appended) was accumulated live during
 /// generation, so the next call's fold resumes after it.
@@ -6940,6 +7022,7 @@ impl<B: Backend> Session<B> {
             generated: 0,
             max_tokens,
             yielded: Vec::new(),
+            calls: TurnCalls::default(),
             stop: None,
             contract: TurnContract::of(prompt, deferred_grammar.as_ref()),
             violation: None,
@@ -7173,6 +7256,13 @@ impl<B: Backend> Session<B> {
         let constraint_incomplete = predictor.constraint_incomplete_at_end();
         let deferred_unfired =
             predictor.sampler_state().deferred_inactive() == Some(true);
+        // `Some(true)` once a deferred grammar's trigger fired; `None`
+        // when none was configured. Forensics for the #101 log below.
+        #[cfg(feature = "axum")]
+        let deferred_activated = predictor
+            .sampler_state()
+            .deferred_inactive()
+            .map(|inactive| !inactive);
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
         let budget = Cut::of(&predictor);
         drop(predictor);
@@ -7258,24 +7348,36 @@ impl<B: Backend> Session<B> {
                 (parsed.blocks, blocks, budget, in_flight)
             }
         };
+        // A call repeating an earlier one in this turn is dropped (see
+        // `TurnCalls`) — only a complete one: a trailing call a cut
+        // (`max_tokens`, a stop sequence) left holds only its completed
+        // members, so it may match a call it would not have, and it
+        // comes back cut, as on Anthropic. Streaming drops the same
+        // calls (`BlockStream`).
+        let (blocks, dropped_repeat) =
+            drop_repeated_calls(blocks, cut.is_some() || in_flight);
 
-        // Whether this turn may leave an auto-tip. A clipped turn whose
-        // KV no longer matches its own output must not: a stop sequence
-        // was cut out of `raw_text` but its leading tokens are in KV; a
+        // Whether this turn may leave an auto-tip. A turn whose KV no
+        // longer matches its own output must not: a stop sequence was
+        // cut out of `raw_text` but its leading tokens are in KV; a
         // cut call's bytes are in KV but no render reproduces them (half
-        // a value has no spelling, and a closed one closes); and a turn
-        // cut mid-constraint carries a mid-structure sampler state the
-        // next call would resume from. Such a turn still records its
-        // prompt extent (breakpoints and all) — only the generated span
-        // is left to the next call's LCP walk, which compares token ids
-        // and is safe by construction. A plain `max_tokens` cut in free
-        // text keeps its tip: its bytes all re-render (an unclosed
-        // thought included — see `OPEN_THOUGHT_SIGNATURE`).
-        let keep_tip = match &cut {
-            None => true,
-            Some(Cut::Budget) => !constraint_incomplete && !in_flight,
-            Some(Cut::StopSequence(_)) => false,
-        };
+        // a value has no spelling, and a closed one closes); a dropped
+        // repeat call's bytes are in KV but not in the turn the client
+        // holds, so no re-render of that turn reproduces the emission;
+        // and a turn cut mid-constraint carries a mid-structure sampler
+        // state the next call would resume from. Such a turn still
+        // records its prompt extent (breakpoints and all) — only the
+        // generated span is left to the next call's LCP walk, which
+        // compares token ids and is safe by construction. A plain
+        // `max_tokens` cut in free text keeps its tip: its bytes all
+        // re-render (an unclosed thought included — see
+        // `OPEN_THOUGHT_SIGNATURE`).
+        let keep_tip = !dropped_repeat
+            && match &cut {
+                None => true,
+                Some(Cut::Budget) => !constraint_incomplete && !in_flight,
+                Some(Cut::StopSequence(_)) => false,
+            };
 
         // Compute the auto-tip hash from the parsed assistant blocks
         // — `run_call` is the only completion path with parsed
@@ -7566,10 +7668,20 @@ impl<B: Backend> Session<B> {
                 // needs the exact bytes (the #101 diagnosis had to dig
                 // state files for them). The redaction discipline
                 // applies to `Display`, which is relayed to clients.
+                // `hits`: where (≤3), in which block, the bytes around
+                // each, and the 8 after — a marker dialect's opener
+                // followed by anything but its trigger's whitespace
+                // never armed the grammar (`deferred_activated`). Read
+                // off `marked`, where a spelled piece is a marker, so
+                // only real tokens take the hit slots.
                 #[cfg(feature = "axum")]
                 tracing::error!(
                     target: "drama_llama::session",
                     found = ?found,
+                    hits = ?special_hits(&marked, &raw_text, &found, 3, 96),
+                    deferred_activated = ?deferred_activated,
+                    emission_bytes = raw_text.len(),
+                    generated_tokens = generated_count,
                     "generation emitted reserved special token(s) in \
                      free text; output rejected before it can poison \
                      the next ingest (#101) — prompt cache extent is \
@@ -7690,6 +7802,10 @@ impl<B: Backend> Session<B> {
 
     /// Batch variant of [`Self::complete_stream`]: collect every emitted block
     /// into a `Vec`, then run the grammar-violation check.
+    ///
+    /// A tool call identical (name and input) to an earlier one in the
+    /// same turn is dropped, as the stream drops it — see
+    /// [`BlockStream`].
     ///
     /// # Errors
     ///
@@ -8632,6 +8748,84 @@ fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
     out
 }
 
+/// The client tool calls one turn has produced so far, by identity —
+/// name and input — so a call that repeats one exactly can be dropped.
+///
+/// The lazy grammar arms on the bare opener special, so a stray real
+/// `<tool_call>` after a *finished* call (`{call}\n<tool_call>`, then
+/// end of turn) is seated as a forced second call, and a model with
+/// nothing more to say likely fills it with the call it just made: a
+/// duplicate `create_post` or `vote`, which the client would dispatch
+/// twice. Identical parallel calls are not observed from Anthropic, so
+/// one is treated as never intended and the repeat dropped.
+///
+/// Only a *complete* call is judged: a call a cut (`max_tokens`, a stop
+/// sequence) left holds only the members that completed, so it can
+/// match a call it would not have, and it comes back cut, as Anthropic
+/// returns it. Dropping it would gain nothing — a client does not run
+/// the calls of a turn that ended that way.
+///
+/// Identity is `serde_json::Value` equality on the input — member
+/// order is not significant, and a number spelled differently (`1`,
+/// `1.0`) is a different value, so a call that differs at all is kept.
+/// Server tool calls cannot occur in local inference and are not
+/// tracked.
+#[derive(Debug, Default)]
+struct TurnCalls(Vec<(String, serde_json::Value)>);
+
+impl TurnCalls {
+    /// Whether `block` is a [`Block::ToolUse`](crate::Block::ToolUse)
+    /// repeating one already seen this turn; any other call is
+    /// remembered. Logs the drop at `WARN`, by tool name only — the
+    /// trace is operator-facing, and the input is the agent's content.
+    fn is_repeat(&mut self, block: &crate::Block) -> bool {
+        let crate::Block::ToolUse { call } = block else {
+            return false;
+        };
+        let seen = self
+            .0
+            .iter()
+            .any(|(name, input)| name == &call.name && input == &call.input);
+        if seen {
+            tracing::warn!(
+                target: "drama_llama::session",
+                event = "tool_call_dropped",
+                reason = "duplicate",
+                tool = %call.name,
+                "dropped a tool call identical to an earlier one in the \
+                 same turn (name and input): a call forced after a stray \
+                 opener",
+            );
+        } else {
+            self.0.push((call.name.to_string(), call.input.clone()));
+        }
+        seen
+    }
+}
+
+/// The batch half of [`TurnCalls`]: `blocks` without the calls that
+/// repeat an earlier one, and whether any were dropped. `cut_last`: the
+/// last block may be a call the turn's cut left, so it is not judged.
+/// Prose either side of a dropped call is re-merged.
+fn drop_repeated_calls(
+    blocks: Vec<crate::Block>,
+    cut_last: bool,
+) -> (Vec<crate::Block>, bool) {
+    let mut calls = TurnCalls::default();
+    let n = blocks.len();
+    let kept: Vec<crate::Block> = blocks
+        .into_iter()
+        .enumerate()
+        .filter(|(i, b)| (cut_last && i + 1 == n) || !calls.is_repeat(b))
+        .map(|(_, b)| b)
+        .collect();
+    if kept.len() == n {
+        (kept, false)
+    } else {
+        (merge_adjacent_prose(kept), true)
+    }
+}
+
 /// Infer a [`StopReason`](misanthropic::response::StopReason) for a
 /// finished generation, plus the matched stop sequence when that is
 /// the reason. Takes the output's shape rather than its blocks so the
@@ -8738,7 +8932,10 @@ fn infer_stop_reason(
 /// `stop::StopFilter`). A generation cut short (`max_tokens`, a stop
 /// sequence) yields an incomplete trailing call cut short, as Anthropic
 /// returns it, instead of its bytes as text (#121). Like the batch path,
-/// it halts once the grammar is exhausted. Once drained,
+/// it halts once the grammar is exhausted, and never yields a tool call
+/// identical (name and input) to one it already yielded this turn —
+/// the forced call a stray opener after a finished call arms; a call is
+/// released only whole, so none of a dropped one is seen. Once drained,
 /// [`Self::stop_reason`] reports the ending the batch path would,
 /// [`Self::open_call_json`] whether the last call was left open, and
 /// [`Self::violation`] the error the batch path would have returned.
@@ -8768,6 +8965,9 @@ pub struct BlockStream<'engine, B: Backend> {
     /// Every block yielded so far: the ending and the end-of-turn checks
     /// judge the whole turn.
     yielded: Vec<crate::Block>,
+    /// The turn's calls so far, to drop one that repeats an earlier
+    /// one (see `TurnCalls`).
+    calls: TurnCalls,
     /// Set once drained: see [`Self::stop_reason`].
     stop: Option<(Option<misanthropic::response::StopReason>, Option<String>)>,
     /// What the turn owes its constraints, judged once drained.
@@ -8817,6 +9017,29 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         self.violation.as_ref()
     }
 
+    /// Queue what the parser released, less any call that repeats an
+    /// earlier one this turn — the batch path's `drop_repeated_calls`,
+    /// a block at a time. The parser releases a call only whole (closed,
+    /// or cut short at the end), so judging it here, before it is
+    /// queued, means no part of a dropped call is ever yielded.
+    ///
+    /// `cut_last`: the last block may be a call the turn's cut left
+    /// (the release that hit a stop sequence, or the clipped flush) —
+    /// only its completed members, so it is not judged (see
+    /// `TurnCalls`).
+    fn admit(&mut self, blocks: Vec<crate::Block>, cut_last: bool) {
+        let n = blocks.len();
+        let kept: Vec<crate::Block> = blocks
+            .into_iter()
+            .enumerate()
+            .filter(|(i, b)| {
+                (cut_last && i + 1 == n) || !self.calls.is_repeat(b)
+            })
+            .map(|(_, b)| b)
+            .collect();
+        self.pending.extend(kept);
+    }
+
     /// End of generation: flush, pick the leniency, settle the ending.
     fn drain(&mut self) {
         self.drained = true;
@@ -8828,7 +9051,7 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         // and may themselves complete a stop sequence.
         let clipped = budget.is_some() || self.filter.hit().is_some();
         let rest = self.filter.finish(clipped);
-        self.pending.extend(rest);
+        self.admit(rest, clipped || self.filter.hit().is_some());
         // A stop outranks the budget: the text reached it first.
         let cut = self
             .filter
@@ -8894,7 +9117,8 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                     self.generated += 1;
                     let token = self.predictor.last_token();
                     let blocks = self.filter.push(&piece, token);
-                    self.pending.extend(blocks);
+                    let hit = self.filter.hit().is_some();
+                    self.admit(blocks, hit);
                     // A stop sequence ends the turn; so does `run_call`'s
                     // one-shot halt on an exhausted grammar, so both
                     // paths stop on the same token.
@@ -10585,7 +10809,8 @@ mod tests {
         else {
             panic!("expected Deferred (auto-lazy) variant");
         };
-        assert_eq!(deferred.activate_after, vec![b"<tool_call>\n".to_vec()]);
+        // The bare special: the layout newline is the grammar's to force.
+        assert_eq!(deferred.activate_after, vec![b"<tool_call>".to_vec()]);
         assert!(deferred.feed_trigger);
         let state = deferred.grammar;
         let source = state.source().to_string();
@@ -13587,7 +13812,9 @@ mod tests {
     /// A weightless [`Backend`] for driving `Session`'s cache plumbing
     /// end to end: a byte tokenizer, a ChatML template, and a decoder
     /// whose `restore_to` records every rung it is asked for and fails
-    /// at the positions it is told to — the evicted-snapshot case.
+    /// at the positions it is told to — the evicted-snapshot case. Given
+    /// a `script`, the decoder also *generates*: each decode makes the
+    /// script's next token (then EOS) the only plausible one.
     mod mock {
         use crate::backend::{Backend, Decoder, MemoryRmError, Model};
         use crate::Token;
@@ -13616,23 +13843,25 @@ mod tests {
             pub(super) missing: Vec<i32>,
             /// Every `(seq, pos)` restore asked for, in order.
             pub(super) restores: Vec<(i32, i32)>,
-            /// The generation to script, byte by byte, then EOS: each
-            /// prefill restarts it and each step advances it. Empty:
-            /// flat logits.
+            /// The tokens a generation emits, in order, then EOS. Empty:
+            /// flat logits, and no KV extent reported (`-1`).
             pub(super) script: Vec<Token>,
+            /// Script tokens decoded since the last prefill.
             cursor: usize,
+            /// One past the last position decoded.
+            kv_end: usize,
         }
 
         impl MockDecoder {
-            /// Logits for the scripted token at the cursor, or flat ones
-            /// when nothing is scripted.
-            fn scripted(&mut self) -> &[f32] {
+            /// Logits for the next token: the script's, far above the
+            /// rest, when there is a script.
+            fn next_logits(&mut self) -> &[f32] {
                 self.logits.clear();
                 self.logits.resize(N_VOCAB, 0.0);
                 if !self.script.is_empty() {
                     let next =
                         self.script.get(self.cursor).copied().unwrap_or(EOS);
-                    self.logits[next as usize] = 30.0;
+                    self.logits[next as usize] = 100.0;
                 }
                 &self.logits
             }
@@ -13647,21 +13876,23 @@ mod tests {
 
             fn prefill(
                 &mut self,
-                _: &[Token],
-                _: usize,
+                tokens: &[Token],
+                start_pos: usize,
                 _: i32,
             ) -> Result<&[f32], MockError> {
                 self.cursor = 0;
-                Ok(self.scripted())
+                self.kv_end = start_pos + tokens.len();
+                Ok(self.next_logits())
             }
             fn step(
                 &mut self,
                 _: Token,
-                _: usize,
+                pos: usize,
                 _: i32,
             ) -> Result<&[f32], MockError> {
                 self.cursor += 1;
-                Ok(self.scripted())
+                self.kv_end = pos + 1;
+                Ok(self.next_logits())
             }
             fn n_ctx(&self) -> u32 {
                 4096
@@ -13669,14 +13900,23 @@ mod tests {
             fn n_seq_max(&self) -> u32 {
                 4
             }
-            fn memory_clear(&mut self) {}
-            fn memory_seq_rm(&mut self, _: i32, _: i32, _: i32) -> bool {
+            fn memory_clear(&mut self) {
+                self.kv_end = 0;
+            }
+            fn memory_seq_rm(&mut self, _: i32, p0: i32, p1: i32) -> bool {
+                if p1 < 0 {
+                    self.kv_end = self.kv_end.min(p0.max(0) as usize);
+                }
                 true
             }
             fn memory_seq_cp(&mut self, _: i32, _: i32, _: i32, _: i32) {}
             fn memory_seq_keep(&mut self, _: i32) {}
             fn memory_seq_pos_max(&mut self, _: i32) -> i32 {
-                -1
+                if self.script.is_empty() {
+                    -1
+                } else {
+                    self.kv_end as i32 - 1
+                }
             }
             fn checkpoint_pos(&mut self, _: i32, _: i32) {}
             fn restore_to(
@@ -13961,6 +14201,282 @@ mod tests {
             assert_eq!(field(fields, "diverge_at"), Some("500"));
         }
         assert_eq!(field(&events[0].1, "lost_tokens"), Some("939"));
+    }
+
+    /// Cogito's shape: per-call JSON markers and a `\n` between calls,
+    /// so a second call after a finished one is grammar-legal.
+    fn per_call_json() -> crate::CallSyntax {
+        crate::CallSyntax {
+            section_start: String::new(),
+            section_end: String::new(),
+            per_call_start: "<tool_call>\n".into(),
+            per_call_end: "\n</tool_call>".into(),
+            call_separator: "\n".into(),
+            ..crate::CallSyntax::hermes_json()
+        }
+    }
+
+    /// A user turn with one tool, `vote`, on offer (`tool_choice`
+    /// absent: the lazy grammar).
+    fn vote_prompt() -> Prompt {
+        let tool = crate::Tool::builder("vote")
+            .description("Vote on a post.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "post_id": { "type": "string" },
+                    "weight": { "type": "string" },
+                },
+                "required": ["post_id"],
+            }))
+            .build()
+            .expect("valid test tool");
+        Prompt {
+            tools: Some(vec![tool.into()]),
+            ..Prompt::default()
+        }
+        .add_message((crate::Role::User, "Upvote 7ad26ccd."))
+        .unwrap()
+    }
+
+    /// A cache-on mock session whose generation is `vote` called with
+    /// each of `inputs`, in the canonical bytes the grammar forces, then
+    /// EOS.
+    fn scripted_votes(
+        inputs: &[serde_json::Value],
+    ) -> Session<mock::MockBackend> {
+        let dialect = per_call_json();
+        let calls: Vec<(&str, &serde_json::Value)> =
+            inputs.iter().map(|input| ("vote", input)).collect();
+        let emission = crate::dialect::render_reference(&dialect, &calls)
+            .expect("canonical calls");
+        let mut session = mock::session(&[])
+            .with_dialect(dialect)
+            .without_repetition();
+        session.engine.decoder.script =
+            emission.bytes().map(Token::from).collect();
+        session
+    }
+
+    fn call_inputs(blocks: &[crate::Block]) -> Vec<&serde_json::Value> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                crate::Block::ToolUse { call } => Some(&call.input),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dropped_calls(
+        events: &[(tracing::Level, Vec<(String, String)>)],
+    ) -> Vec<(tracing::Level, &str)> {
+        events
+            .iter()
+            .filter(|(_, f)| field(f, "event") == Some("tool_call_dropped"))
+            .map(|(level, f)| (*level, field(f, "tool").unwrap_or("")))
+            .collect()
+    }
+
+    fn tip_of(session: &Session<mock::MockBackend>) -> Option<&Breakpoint> {
+        let cache = session.prefix_cache.as_ref().expect("cache on");
+        cache.last_slot().expect("a recorded slot").tip.as_ref()
+    }
+
+    /// A stray opener after a finished call forces a second call, and
+    /// the model fills it with the one it just made: the repeat is
+    /// dropped (logged at `WARN`, by tool name), and the turn leaves no
+    /// tip — its KV holds a call the returned turn does not.
+    #[test]
+    fn a_repeated_call_is_dropped_and_leaves_no_tip() {
+        let input = serde_json::json!({ "post_id": "7ad26ccd" });
+        let mut session = scripted_votes(&[input.clone(), input.clone()]);
+        let mut response = None;
+        let events = capture_events(|| {
+            response = Some(
+                session.complete_response(&vote_prompt()).expect("complete"),
+            );
+        });
+        let response = response.unwrap();
+        assert_eq!(
+            response.stop_reason,
+            Some(misanthropic::response::StopReason::ToolUse),
+        );
+        let message: crate::prompt::Message = response.inner.into();
+        assert_eq!(call_inputs(&message.content.0), [&input]);
+        assert_eq!(dropped_calls(&events), [(tracing::Level::WARN, "vote")],);
+        assert!(tip_of(&session).is_none(), "the dropped call is in KV");
+    }
+
+    /// The control: a second call that differs is a parallel call, kept,
+    /// and the turn keeps its tip.
+    #[test]
+    fn a_different_second_call_is_kept_with_its_tip() {
+        let first = serde_json::json!({ "post_id": "7ad26ccd" });
+        let second = serde_json::json!({ "post_id": "1f2e3d4c" });
+        let mut session = scripted_votes(&[first.clone(), second.clone()]);
+        let mut blocks = None;
+        let events = capture_events(|| {
+            blocks = Some(
+                session.complete_blocks(&vote_prompt()).expect("complete"),
+            );
+        });
+        assert_eq!(call_inputs(&blocks.unwrap()), [&first, &second]);
+        assert!(dropped_calls(&events).is_empty());
+        assert!(tip_of(&session).is_some());
+    }
+
+    /// Streamed, the repeat is never yielded — the parser releases a
+    /// call only whole, and it is judged before it is queued — and the
+    /// ending reads as the batch path's.
+    #[test]
+    fn a_repeated_call_is_never_streamed() {
+        let input = serde_json::json!({ "post_id": "7ad26ccd" });
+        let mut session = scripted_votes(&[input.clone(), input.clone()]);
+        let prompt = vote_prompt();
+        let events = capture_events(|| {
+            let mut stream = session.complete_stream(&prompt).expect("stream");
+            let streamed: Vec<crate::Block> = stream.by_ref().collect();
+            assert_eq!(call_inputs(&streamed), [&input]);
+            assert_eq!(
+                stream.stop_reason(),
+                Some((Some(misanthropic::response::StopReason::ToolUse), None)),
+            );
+            assert_eq!(stream.open_call_json(), None);
+        });
+        assert_eq!(dropped_calls(&events), [(tracing::Level::WARN, "vote")],);
+    }
+
+    /// Cut `vote` calls with `inputs` short `tail` bytes before their
+    /// emission ends, and run the turn batch and streamed: the call
+    /// inputs each returns, and the stream's open call.
+    fn clipped_votes(
+        inputs: &[serde_json::Value],
+        tail: impl Fn(&str) -> usize,
+    ) -> (
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+        Option<String>,
+    ) {
+        use misanthropic::response::StopReason;
+        let calls: Vec<(&str, &serde_json::Value)> =
+            inputs.iter().map(|input| ("vote", input)).collect();
+        let emission =
+            crate::dialect::render_reference(&per_call_json(), &calls).unwrap();
+        let budget = emission.len() - tail(&emission);
+        let prompt = vote_prompt()
+            .max_tokens(std::num::NonZeroU32::new(budget as u32).unwrap());
+
+        let mut session = scripted_votes(inputs);
+        let response = session.complete_response(&prompt).expect("complete");
+        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        let message: crate::prompt::Message = response.inner.into();
+        let batch = call_inputs(&message.content.0)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let mut stream = session.complete_stream(&prompt).expect("stream");
+        let streamed: Vec<crate::Block> = stream.by_ref().collect();
+        assert_eq!(
+            stream.stop_reason(),
+            Some((Some(StopReason::MaxTokens), None)),
+        );
+        let streamed = call_inputs(&streamed).into_iter().cloned().collect();
+        (batch, streamed, stream.open_call_json().map(str::to_owned))
+    }
+
+    /// A repeat the budget cuts, even once its input is whole, is a cut
+    /// call, not a repeat: kept on both paths, as Anthropic returns it,
+    /// and the stream leaves it open.
+    #[test]
+    fn a_clipped_repeat_is_kept_and_left_open() {
+        let input = serde_json::json!({ "post_id": "7ad26ccd" });
+        let inputs = [input.clone(), input.clone()];
+        let mut run = None;
+        let events = capture_events(|| {
+            // Cut after the second call's arguments close, before its own.
+            run = Some(clipped_votes(&inputs, |_| "}\n</tool_call>".len()));
+        });
+        let (batch, streamed, open) = run.unwrap();
+        assert_eq!(batch, inputs);
+        assert_eq!(streamed, inputs);
+        assert!(open.is_some_and(|json| json.contains("7ad26ccd")));
+        assert!(dropped_calls(&events).is_empty());
+    }
+
+    /// A cut call holds only the members that completed, so it can
+    /// match an earlier call it would not have: `weight` cut mid-key
+    /// leaves `{post_id}`, the first call's input. It is kept and left
+    /// open, as on Anthropic.
+    #[test]
+    fn a_cut_call_matching_only_by_its_completed_members_is_kept() {
+        let first = serde_json::json!({ "post_id": "7ad26ccd" });
+        let second =
+            serde_json::json!({ "post_id": "7ad26ccd", "weight": "high" });
+        let mut run = None;
+        let events = capture_events(|| {
+            // Cut inside the `weight` key.
+            run = Some(clipped_votes(&[first.clone(), second], |e| {
+                e.len() - e.rfind("weight").unwrap() - "wei".len()
+            }));
+        });
+        let (batch, streamed, open) = run.unwrap();
+        assert_eq!(batch, [first.clone(), first.clone()]);
+        assert_eq!(streamed, [first.clone(), first]);
+        assert!(open.is_some_and(|json| json.contains("7ad26ccd")));
+        assert!(dropped_calls(&events).is_empty());
+    }
+
+    /// Identity is the input *value*: member order is not significant,
+    /// any other difference is (a different tool, a different value, a
+    /// number spelled differently). Prose either side of a dropped call
+    /// re-merges.
+    #[test]
+    fn drop_repeated_calls_compares_name_and_input_value() {
+        use crate::prompt::ToolUse;
+        let call = |name: &'static str, input: serde_json::Value| {
+            crate::Block::from(ToolUse::new(name, input))
+        };
+        let text = |t: &'static str| crate::Block::from(t);
+        let (kept, dropped) = drop_repeated_calls(
+            vec![
+                call("vote", serde_json::json!({ "a": 1, "b": "x" })),
+                text("one "),
+                call("vote", serde_json::json!({ "b": "x", "a": 1 })),
+                text("two"),
+                call("post", serde_json::json!({ "a": 1, "b": "x" })),
+                call("vote", serde_json::json!({ "a": 1.0, "b": "x" })),
+                call("vote", serde_json::json!({ "a": 2, "b": "x" })),
+            ],
+            false,
+        );
+        assert!(dropped);
+        let shape: Vec<String> = kept
+            .iter()
+            .map(|b| match b {
+                crate::Block::ToolUse { call } => {
+                    format!("{}{}", call.name, call.input)
+                }
+                crate::Block::Text { text, .. } => text.to_string(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                r#"vote{"a":1,"b":"x"}"#,
+                "one two",
+                r#"post{"a":1,"b":"x"}"#,
+                r#"vote{"a":1.0,"b":"x"}"#,
+                r#"vote{"a":2,"b":"x"}"#,
+            ],
+        );
+        let unique = vec![call("vote", serde_json::json!({}))];
+        assert_eq!(drop_repeated_calls(unique.clone(), false), (unique, false));
+        // A trailing call the turn's cut left is not judged.
+        let cut = vec![call("vote", serde_json::json!({})); 2];
+        assert_eq!(drop_repeated_calls(cut.clone(), true), (cut, false));
     }
 
     /// The divergence context: shared text before, then each side.
@@ -14412,6 +14928,261 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Cogito's tool turns lost their tip on every call (19 live
+    /// events, 2026-10-01): the model ends its prose in whitespace and
+    /// opens the call (`…\n\n<tool_call>`), the parser leaves that gap
+    /// in the prose, and the stock template prints its own `\n` before
+    /// every call on top of it — `…\n\n\n<tool_call>`. The bake prints
+    /// that gap only when the prose carries none. Parallel calls needed
+    /// the other half: the template separates calls with `\n`, which the
+    /// analyzer now measures, so the grammar forces the same byte.
+    ///
+    /// Pinned like `qwen_cache_stable_round_trips`: through what a
+    /// session serves for the stock dump, measured the way the
+    /// canonicalization gate measures it.
+    #[test]
+    fn cogito_cache_stable_round_trips() {
+        use crate::{
+            dialect::{grammar_source, Anchor, EmitOptions},
+            prompt::{Message, Role},
+            ChatTemplate, Content, GrammarState, RenderOptions, Tool,
+        };
+        let eos = "<|im_end|>";
+        let tool = Tool::builder("get_inbox")
+            .description("Read the inbox.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            }))
+            .build()
+            .expect("valid tool");
+        let baked = &crate::baked::COGITO;
+        let served = crate::baked::detect(baked.stock)
+            .expect("stock dump detects")
+            .replacement;
+        let syntax =
+            crate::dialect::analyze_template(served, "", eos).expect("analyze");
+        let diverge = |source: &str, emission: &str| {
+            let template = ChatTemplate::from_source(
+                source.to_owned(),
+                String::new(),
+                eos.to_owned(),
+            )
+            .expect("template compiles");
+            let base = Prompt {
+                messages: vec![Message {
+                    role: Role::User,
+                    content: Content::text("Anything new?"),
+                }],
+                tools: Some(vec![tool.clone().into()]),
+                ..Prompt::default()
+            };
+            let opts = RenderOptions::default()
+                .with_extra("enable_thinking", false)
+                .with_thought_reingest(syntax.reasoning.reingest)
+                .with_reasoning_start(syntax.reasoning.start.clone());
+            let prompt = template
+                .render_with(&base, &opts.clone().with_generation_prompt(true))
+                .expect("render");
+            let blocks = crate::dialect::parse_text(
+                &syntax,
+                &[&tool],
+                emission,
+                false,
+                crate::dialect::Leniency::Final,
+            )
+            .blocks;
+            let mut turn = base.clone();
+            turn.messages.push(Message {
+                role: Role::Assistant,
+                content: Content(merge_adjacent_prose(blocks)),
+            });
+            let extended = template
+                .render_with(&turn, &opts.with_generation_prompt(false))
+                .expect("render");
+            emission_divergence(&extended, &prompt, emission)
+        };
+        let call = "<tool_call>\n{\"name\": \"get_inbox\", \"arguments\": \
+                    {\"limit\": 5}}\n</tool_call>";
+        let call2 = "<tool_call>\n{\"name\": \"get_inbox\", \"arguments\": \
+                     {}}\n</tool_call>";
+        let shapes: Vec<String> = vec![
+            "Nothing new.".into(),
+            "Nothing new.\n".into(),
+            call.into(),
+            // The live habit.
+            format!("Checking.\n\n{call}"),
+            format!("Checking.\n{call}"),
+            format!("Checking. {call}"),
+            // Parallel calls, with and without prose.
+            format!("{call}\n{call2}"),
+            format!("Checking.\n\n{call}\n{call2}"),
+        ];
+        // Each shape is one the lazy grammar forces from the trigger on
+        // — the parallel ones included, separator and all.
+        let grammar = std::sync::Arc::new(
+            crate::Grammar::parse(
+                &grammar_source(
+                    &syntax,
+                    &[&tool],
+                    &EmitOptions {
+                        anchor: Anchor::Lazy,
+                        parallel: true,
+                    },
+                )
+                .expect("emit"),
+            )
+            .expect("grammar"),
+        );
+        let forced = |emission: &str| {
+            let at = emission.find(syntax.trigger())?;
+            let mut state = GrammarState::new(grammar.clone());
+            Some(
+                state.advance_bytes(&emission.as_bytes()[at..]).is_ok()
+                    && state.is_complete(),
+            )
+        };
+        for emission in &shapes {
+            assert_ne!(forced(emission), Some(false), "{emission:?}");
+            assert_eq!(diverge(served, emission), None, "{emission:?}");
+        }
+        // Back to back is no longer what the grammar forces.
+        assert_eq!(forced(&format!("{call}{call2}")), Some(false));
+
+        // Irreducible, and pinned (listed in `templates/README.md`): no
+        // block records a gap the model omitted, so prose run straight
+        // into the call gets the template's `\n`; and whitespace after
+        // the last call has no block to ride.
+        for (emission, at) in [
+            (format!("Checking.{call}"), 9),
+            (format!("{call}\n"), call.len()),
+        ] {
+            assert_eq!(diverge(served, &emission), Some(at), "{emission:?}");
+        }
+
+        // Control: the bake before this patch (stock but for the
+        // `json_dumps` swap) loses the live habit's tip at the gap.
+        let previous = baked.stock.replace(
+            "tool_call.arguments | tojson",
+            "tool_call.arguments | json_dumps",
+        );
+        assert_ne!(previous, baked.stock, "the swap must apply");
+        assert_eq!(
+            diverge(&previous, &format!("Checking.\n\n{call}")),
+            Some(11)
+        );
+    }
+
+    /// An aged cogito turn as a client sends it back — trimmed prose,
+    /// or none, one call or several, as a string or as parts — renders
+    /// exactly as the bake did before the gap patch (stock, but for the
+    /// `json_dumps` argument interior): the gap is printed whenever the
+    /// prose carries none, so model input is unchanged for every turn
+    /// that was not generated with its own gap.
+    #[test]
+    fn cogito_cache_stable_aged_turn_renders_as_stock() {
+        use crate::{
+            prompt::{Message, Role},
+            ChatTemplate, Content, RenderOptions,
+        };
+        let eos = "<|im_end|>";
+        let baked = &crate::baked::COGITO;
+        let previous = baked.stock.replace(
+            "tool_call.arguments | tojson",
+            "tool_call.arguments | json_dumps",
+        );
+        let call = |id: &'static str| crate::Block::ToolUse {
+            call: misanthropic::tool::Use {
+                id: id.into(),
+                name: "get_inbox".into(),
+                input: serde_json::json!({"limit": 5}),
+                cache_control: None,
+                caller: None,
+            },
+        };
+        let text = |t: &'static str| crate::Block::Text {
+            text: t.into(),
+            cache_control: None,
+            citations: None,
+        };
+        let turns = [
+            vec![call("a")],
+            vec![call("a"), call("b")],
+            vec![text("Checking."), call("a")],
+            vec![text("Checking."), call("a"), call("b")],
+            vec![text("Checking."), text("Still."), call("a")],
+        ];
+        let render = |source: &str, content: Content| {
+            let template = ChatTemplate::from_source(
+                source.to_owned(),
+                String::new(),
+                eos.to_owned(),
+            )
+            .expect("template compiles");
+            let prompt = Prompt {
+                messages: vec![
+                    Message {
+                        role: Role::User,
+                        content: Content::text("Anything new?"),
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        content,
+                    },
+                    Message {
+                        role: Role::User,
+                        content: Content::text("And now?"),
+                    },
+                ],
+                ..Prompt::default()
+            };
+            template
+                .render_with(&prompt, &RenderOptions::default())
+                .expect("render")
+        };
+        for blocks in turns {
+            let content = Content(blocks);
+            assert_eq!(
+                render(baked.replacement, content.clone()),
+                render(&previous, content.clone()),
+                "{content:?}"
+            );
+        }
+    }
+
+    /// The #101 containment log's forensics: every hit (up to the
+    /// limit) in block order, with its block, its offset in the block
+    /// and in the emission, the bytes around it, and the 8 after it.
+    #[test]
+    #[cfg(feature = "axum")]
+    fn special_hits_locate_each_special() {
+        let raw = "ok\n\n<tool_call>{\"name\": \"x\"}\nthen <tool_call>";
+        let blocks = [crate::Block::Text {
+            text: raw.into(),
+            cache_control: None,
+            citations: None,
+        }];
+        let found = vec!["<tool_call>".to_string()];
+        let hits = special_hits(&blocks, raw, &found, 3, 4);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0],
+            SpecialHit {
+                block: 0,
+                kind: "Text",
+                offset: 4,
+                emission_offset: Some(4),
+                piece: "<tool_call>",
+                next8: "{\\\"name\\\":".into(),
+                before: "ok\n\n",
+                after: "{\"na",
+            }
+        );
+        assert_eq!(hits[1].offset, 34);
+        assert_eq!(hits[1].next8, "");
+        assert_eq!(special_hits(&blocks, raw, &found, 1, 4).len(), 1);
     }
 
     /// Every event emitted on this thread while `f` runs, as its level

@@ -111,8 +111,13 @@ pub static GPTOSS_UPSTREAM: BakedTemplate = BakedTemplate {
 /// the model off-habit to stay round-trip stable. The replacement is
 /// a single filter swap to `json_dumps`; the analyzer measures it as
 /// `JsonSpacing::Spaced` and the grammar + `render_reference` follow
-/// (#88 phase 2). The 32B GGUF's template is byte-identical to the
-/// 14B's, so one detection key covers the family we've seen.
+/// (#88 phase 2). It also prints the prose-to-call `\n` only when the
+/// prose does not already end in whitespace: stock prints it before
+/// every call, so the model's `…\n\n<tool_call>` re-rendered a byte
+/// long and the tool turn lost its tip (see
+/// `cogito_cache_stable_round_trips`). The 32B GGUF's template is
+/// byte-identical to the 14B's, so one detection key covers the family
+/// we've seen.
 pub static COGITO: BakedTemplate = BakedTemplate {
     name: "cogito-cache-stable",
     stock: include_str!("../templates/cogito-gguf.jinja"),

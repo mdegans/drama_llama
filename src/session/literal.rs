@@ -1285,6 +1285,25 @@ mod tests {
         assert_eq!(run(bytes(opener)), [text(opener)]);
     }
 
+    /// The bare-opener trigger (#101) over provenance. A real
+    /// `<tool_call>` arms the call grammar, which takes over at the
+    /// opener: an off-canonical byte straight after it (a space, where
+    /// this dialect writes `{`) is masked — steered, not fatal, the
+    /// sampler's wake check passing the real opener — and the call
+    /// seats. Spelled, the same bare opener arms nothing (see
+    /// `a_spelled_call_in_the_emission_is_text`, whose quote is this
+    /// dialect's `<tool_call>{…}`).
+    #[test]
+    fn a_real_bare_opener_arms_and_steers() {
+        let call = call_bytes();
+        let body = call.strip_prefix("<tool_call>{").expect(&call);
+        // The masked space's slot is filled by the forced `{`.
+        let script = [vec![TOOL_CALL], bytes(" "), real(body)].concat();
+        let blocks = run(script);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(is_call(&blocks[0]), "{blocks:?}");
+    }
+
     /// The same bytes with the real reserved ids are a call.
     #[test]
     fn a_real_call_in_the_emission_is_a_call() {

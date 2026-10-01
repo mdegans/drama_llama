@@ -452,26 +452,50 @@ pub mod harmony {
 }
 
 impl CallSyntax {
-    /// The byte sequence whose appearance in generated text activates
-    /// the lazy tool-call grammar: the outermost call-opening marker.
+    /// The call landmark: the outermost call-opening marker
+    /// ([`Self::section_start`], else [`Self::per_call_start`]) with
+    /// the template's layout whitespace trimmed — the special token
+    /// itself (`<tool_call>`, not `<tool_call>\n`). Its appearance in
+    /// generated text activates the lazy tool-call grammar and is where
+    /// the parser starts a call section.
+    ///
+    /// Trimmed at the end only: the grammar starts at the full marker
+    /// and is fed the trigger, so the trigger must be a prefix of it.
+    /// The trailing whitespace is the *call's* first bytes, not the
+    /// opener's. A trigger that includes it never fires on a real
+    /// opener the model follows with anything else (`{`, a space,
+    /// `\r\n`, EOG): the call runs unconstrained, the parser leaves
+    /// the special in prose, and the session rejects the turn
+    /// (`SessionError::EmittedSpecialToken`, #101). On the bare
+    /// special the grammar — which starts at the full marker — takes
+    /// over one token earlier and forces the canonical whitespace, so a
+    /// real opener is always seated as a call or surfaces as a
+    /// `GrammarViolation`. The untrimmed fields stay the canonical
+    /// bytes the grammar forces and the re-render reproduces.
     pub fn trigger(&self) -> &str {
         if !self.section_start.is_empty() {
-            &self.section_start
+            self.section_start.trim_end()
         } else {
-            &self.per_call_start
+            self.per_call_start.trim_end()
         }
     }
 
     /// All lazy-activation byte sequences. Most dialects have exactly
     /// one ([`Self::trigger`]); Harmony's tool-call header has no
     /// single distinctive marker, so it triggers on any of the
-    /// recipient-bearing header shapes. Deliberately conservative — a
-    /// false activation derails generation (the grammar starts
-    /// forcing call bytes mid-thought), while a miss only loses
-    /// enforcement for that call: the parser still recognizes it and
-    /// the canonicalization gate covers the bytes. Upstream uses
-    /// anchored regexes for the same reason (`chat.cpp` gpt-oss
-    /// `grammar_triggers`).
+    /// recipient-bearing header shapes. Those are deliberately
+    /// conservative — a false activation derails generation (the
+    /// grammar starts forcing call bytes mid-thought), while a miss
+    /// only loses enforcement for that call: the parser still
+    /// recognizes it and the canonicalization gate covers the bytes.
+    /// Upstream uses anchored regexes for the same reason (`chat.cpp`
+    /// gpt-oss `grammar_triggers`).
+    ///
+    /// The marker dialects' bare special has no such trade: a miss is
+    /// the costly side (see [`Self::trigger`]), and a "false"
+    /// activation — the model naming its own opener in prose or a
+    /// thought — forces a call where the special would otherwise be
+    /// rejected from free text anyway.
     pub fn triggers(&self) -> Vec<String> {
         match self.family {
             Family::Harmony => vec![
