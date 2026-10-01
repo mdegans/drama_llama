@@ -54,7 +54,22 @@ text.
 - Containment reads the unrestored parse: any reserved piece left in
   its free text is a real token (spelled ones are markers). Exact now;
   the old count-based `real_specials_in_free_text(blocks, raw, emitted)`
-  is gone.
+  is gone. On a stop turn it reads only the parse of what the cut keeps
+  (`stop::marked_stop_cut`, shared with `complete_text`): the stop is
+  seen late while provenance holds a growable tail (`<`), and a real
+  `</tool_call>` past the cut used to reject a turn whose output was
+  clean.
+- Duplicate-text specials: `LiteralTable::build` keeps only the id a
+  piece tokenizes back to; any other special with the same text is an
+  *alias* (`LiteralNeutralizer::with_aliases` / `emitted_piece`) — real
+  framing when emitted, for provenance and the trigger scan. Content
+  marking never uses aliases. Without them a call opened by the alias
+  came back as text (fail-closed).
+- Auto-tip: `byte_stable` compares restored bytes, which cannot see a
+  real reserved token in content (the render spells it). `run_call`
+  stores no tip hash when the marked parse holds one — reachable only
+  with `with_emit_specials_ban(false)`, since containment rejects it
+  otherwise.
 
 ## Coverage — measured, per vocabulary (vocab-only loads, 2026-10-01)
 
@@ -62,7 +77,11 @@ Protection is per *vocabulary*, not per dialect: it exists where the
 framing piece is a reserved special.
 
 - Protected: Qwen 3.6 / 3.8 `<tool_call>` `</tool_call>` `<think>`
-  `</think>`; all gpt-oss Harmony header tokens; Gemma 4 `<|tool_call>`
+  `</think>`; all gpt-oss Harmony header tokens — but the recipient is
+  text, and `harmony_block` accepts a header starting with a plain
+  ` to=…` at the turn's start and after every real `<|end|>`, so the
+  only real token gating a gpt-oss call is `<|message|>` (`<|call|>`
+  optional). Inherent to Harmony; Gemma 4 `<|tool_call>`
   `<tool_call|>` `<|"|>` channel markers; Mistral 4 `[TOOL_CALLS]`
   `[ARGS]` `[THINK]` `[/THINK]`; cogito-32b `<tool_call>`.
 - **Not** protected: cogito-32b `<think>`/`</think>` (plain text in Qwen
@@ -73,6 +92,16 @@ framing piece is a reserved special.
 
 ## Limits left open (deliberately)
 
+- **A copy can be real.** Provenance separates a spelling from a real
+  token, not a copy from an intent: a model that read spelled
+  `<tool_call>…` in a post can emit the *real* ids when it repeats it,
+  and nothing at the parse level can tell that from a genuine call.
+  Defense: `tool_choice`, grammar, model tier.
+- `BlockStream` runs no emission containment (a stream cannot take back
+  what it yielded). Pre-dates provenance: a spelled opener with a real
+  close streams as Text holding the real `</tool_call>`, where the
+  batch path returns `EmittedSpecialToken`. The next ingest reads it as
+  text, so it is a KV/containment gap, not a structure one.
 - **The grammar is byte-level.** Under an armed grammar the model can
   spell a piece the grammar requires. Parse reads it as text: a forced
   call with a spelled opener → `GrammarViolation` (warm retry); a real

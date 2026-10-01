@@ -83,16 +83,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     only on a trigger whose reserved pieces are real tokens
     (`PiecePredictor::with_reserved`), so a spelled `<tool_call>` no
     longer drags the rest of the turn into call syntax; the same goes
-    for `output_config`'s `</think>` trigger. Containment reads the
-    unrestored parse, so it is exact now rather than a count. A spelled
-    piece re-renders byte-identically (it is a content literal on the
-    next ingest), so the auto-tip is unaffected.
+    for `output_config`'s `</think>` trigger. A special whose text
+    duplicates a reserved piece's (dropped from the reserved set, since
+    the text tokenizes to the other id) is framing too when emitted.
+    Containment reads the unrestored parse, so it is exact now rather
+    than a count, and of a turn a stop sequence cut it reads only what
+    the cut keeps. A spelled piece re-renders byte-identically (it is a
+    content literal on the next ingest), so the auto-tip is
+    unaffected; a *real* reserved token left in content (only possible
+    with `with_emit_specials_ban(false)`) re-renders spelled, so that
+    turn stores no tip hash.
 
     **Protected** wherever the framing is a reserved special in the
     loaded vocabulary, which is per vocabulary, not per dialect.
     Measured 2026-10-01 (vocab-only loads): Qwen 3.6 / 3.8 call and
     reasoning markers (`<tool_call>`, `</tool_call>`, `<think>`,
-    `</think>`); every gpt-oss Harmony header token; Gemma 4's
+    `</think>`); every gpt-oss Harmony header token (but Harmony's
+    recipient is text — a header may start with a plain ` to=…` after
+    a real `<|end|>` or at the turn's start — so what gates a gpt-oss
+    call is the real `<|message|>` alone, `<|call|>` optional); Gemma 4's
     `<|tool_call>`, `<tool_call|>`, `<|"|>` and channel markers;
     Mistral 4's `[TOOL_CALLS]`, `[ARGS]`, `[THINK]`, `[/THINK]`; and
     cogito-32b's `<tool_call>` / `</tool_call>`. **Not protected**
@@ -103,7 +112,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     XML's `<function=` / `<parameter=`, JSON's quotes), which reads by
     bytes — as the grammar reads it. There, grammar-constrained
     generation and `tool_choice` are the defense.
-    Two limits remain. The grammar is byte-level, so under an armed
+    Three limits remain. Provenance tells a spelling from a real
+    token, not a copy from a call: a model that read spelled markup can
+    still emit the *real* framing ids when it repeats it, and that is a
+    call at every level of the parse. There, as for the unprotected
+    vocabularies, `tool_choice`, the grammar and the model are the
+    defense. The grammar is byte-level, so under an armed
     grammar the model *can* spell a piece the grammar requires, and the
     parse reads that piece as text: a forced call whose opener is
     spelled is a `GrammarViolation` (a retry is warm), and a real
