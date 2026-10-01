@@ -305,6 +305,14 @@ for the current arc:
   message size) and every fork decided with Mike. Read before touching
   `compute_l_hit`, `SnapshotStore`, eviction, or proposing any cache
   design.
+- [`swa_checkpoints.md`](.claude/memory/swa_checkpoints.md)
+  — **read before touching `llama_cpp::checkpoint`, `restore_to`,
+  `swa_full`, or the snapshot cap.** 2026-10-01: llama.cpp recycles a
+  sliding window's masked cells for any sequence (full-size cache or
+  not), so gpt-oss / Gemma 4 rewind through partial window checkpoints,
+  hybrids through partial recurrent ones, and a truncate counts only
+  when the whole window survived. Per-model KV / checkpoint memory, the
+  `swa_full = false` default, and the GPU-window test list.
 - [`plan_template_ownership.md`](.claude/memory/plan_template_ownership.md)
   — **plan-of-record ([issue #88](https://github.com/mdegans/drama_llama/issues/88)),
   the live drama_llama arc.** Commit fully to owned chat templates:
