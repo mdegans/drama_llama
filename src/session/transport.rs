@@ -68,11 +68,11 @@ impl<B: Backend> SessionTransport<B> {
     /// scan `text` for content that would tokenize to a reserved
     /// chat-framing special, returning the first offender's
     /// `(id, piece)`. For relay tools (mail, docket filings) holding a
-    /// transport clone — check at send time and bounce the message
-    /// back to its author as a recoverable `is_error` tool result,
-    /// instead of poisoning the recipient's prompt and killing their
-    /// loop at ingest. Briefly awaits the session lock (a completion
-    /// in flight holds it).
+    /// transport clone that choose to bounce such a message back to its
+    /// author as a recoverable `is_error` tool result — the recipient's
+    /// session would read it as text (see
+    /// [`Session::scan_text_for_specials`]). Briefly awaits the session
+    /// lock (a completion in flight holds it).
     pub async fn scan_text_for_specials(
         &self,
         text: &str,
@@ -182,9 +182,9 @@ where
 ///
 /// This trait exists because erasing to a bare `dyn Transport` would drop
 /// [`SessionTransport::scan_text_for_specials`], which has no API-side
-/// counterpart — a remote endpoint cannot be prompt-injected with *its own*
-/// framing tokens, and a local one can. Relay tools need that guard after
-/// erasure, so it rides along as the trait's one method.
+/// counterpart — a remote endpoint's framing tokens are its own business,
+/// while a local one's are this crate's. Relay tools that check need it
+/// after erasure, so it rides along as the trait's one method.
 ///
 /// Both prompt-type supertraits are listed because [`SessionTransport`]
 /// serves both and callers use both ([`CachedPrompt`] for frozen-prefix

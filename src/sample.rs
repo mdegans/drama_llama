@@ -93,7 +93,7 @@ pub struct SamplerConfig {
     /// (O(log n) per token, the accept-then-mask shape) with a full
     /// masked resample only on a hit, so free prose can't smuggle
     /// chat-framing tokens into the transcript (the emission-side
-    /// sibling of `Session`'s ingest injection guard). The banned
+    /// sibling of `Session`'s ingest-side literal neutralization). The banned
     /// token's byte *text* stays expressible through ordinary
     /// tokenization — this bans the control token id, not the
     /// characters. Empty (the default) disables the check. Runtime
@@ -112,9 +112,10 @@ pub struct SamplerConfig {
     /// those are grammar *literals* — so inside a free region the
     /// exemption buys nothing and costs everything: `<tool_call>` is
     /// byte-legal string content, ban-exempt, and therefore committed as
-    /// the real special id inside an argument value. Relaying that text
-    /// into another session's prompt trips the ingest injection guard
-    /// and kills the receiving loop.
+    /// the real special id inside an argument value — framing where the
+    /// grammar meant content. (Relayed into another session's prompt,
+    /// the text is neutralized at ingest; the id in *this* KV is the
+    /// problem.)
     ///
     /// So this set carries **no marker exemption** (every special except
     /// the EOG family) and is consulted only where frames are never

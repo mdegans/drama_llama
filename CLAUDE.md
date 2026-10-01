@@ -384,13 +384,22 @@ for the current arc:
   — **read before proposing any "just ban the token" fix.** Why a
   truncated tool call cannot be prevented, only contained: the four
   classes (model-bails — already closed; opener-in-free-region — legal
-  by construction; byte-spelling — mostly not a vector, the trigger scan
-  is byte-based; budget exhaustion — irreducible). Carries the
+  by construction; byte-spelling — superseded by emission provenance,
+  below; budget exhaustion — irreducible). Carries the
   *reason* 0.7 tore out the ban set (banning `r` broke
   `count_letters("strawberry")`), why containment must key on "does this
   text contain a special" rather than "did the parser degrade" (keying
   on degradation breaks every structured generation on Llama 3.1), and
   the two-errors decision for #38.
+- [`emission_provenance.md`](.claude/memory/emission_provenance.md)
+  — **read before touching the parse paths in `Session`,
+  `StreamParser`, or the deferred-trigger scan.** 2026-10-01: only
+  framing the model emitted as a real reserved token is structure; a
+  piece it *spelled* (copying markup from content) is swapped for a
+  marker before parsing and restored after, and a spelled trigger does
+  not arm the lazy grammar. Carries the measured per-vocabulary
+  coverage (cogito-32b's `<think>` is plain text — unprotected) and the
+  open limit: grammars are byte-level.
 - [`one_dot_oh_wishlist.md`](.claude/memory/one_dot_oh_wishlist.md)
   — deferred items from the 0.8.0 pre-publish review (2026-07-23):
   breaking-later decisions (Token associated type, root-vs-modules,
@@ -615,7 +624,7 @@ symlink). `just test moeflux` additionally wants the expert shards mounted.
 - "Code is poetry. Make it pretty." Use `rustfmt`.
 - The Eric Hartford uncensored model check in `Model::from_file` is intentional — keep it.
 - Vocab / VocabKind were removed in 0.7. Content filtering belongs in the consuming app, not in the library. If tempted to add token-ban logic back, don't.
-- **Content filtering ≠ protocol integrity.** The rule above is about *content* policy (banning words/ideas — an app concern). It does **not** forbid guarding the tokens and substrings that constitute the chat *format* itself — the special/control tokens (`<|im_end|>`, etc.) and media markers (`<__media__>`) that the KV cache, the block parser, and the marker-count contract all depend on. A `Block::Text` is content by definition; a framing token appearing inside one is either an accident or an injection, never meaning. So `Session` rejects special-token-bearing content at ingest (`check_no_special_injection`), renders images out-of-band via a per-call random sentinel (mtmd never sees prompt text at all — `Vision::tokenize_image` takes only image placeholders), and masks dialect-illegal specials at emission (`emit_ban_set` / `SampleOptions::banned_specials`, opt-out via `with_emit_specials_ban(false)` for e.g. Qwen-VL grounding markers) — all format integrity, not content filtering. The boundary that keeps this principled: **`Session` enforces it, `Engine`/the raw predictor does not.** Callers who legitimately want to hand-feed control tokens drop below the block abstraction. (Historical note: the thing 0.7 removed was word/token *content* banning; this is a different concern with a different owner.)
+- **Content filtering ≠ protocol integrity.** The rule above is about *content* policy (banning words/ideas — an app concern). It does **not** forbid guarding the tokens and substrings that constitute the chat *format* itself — the special/control tokens (`<|im_end|>`, etc.) and media markers (`<__media__>`) that the KV cache, the block parser, and the marker-count contract all depend on. A `Block::Text` is content by definition; a framing token appearing inside one is either an accident or an injection, never meaning. So `Session` reads special-token pieces that content spells as text — the chat template swaps each for a per-call out-of-band marker (`LiteralNeutralizer`) that `Session` tokenizes with specials off, and validates tool names and ids it cannot neutralize — while `check_no_special_injection` stays as a loud bug detector for any content surface that bypassed that; parses the model's output with emission provenance, so a reserved piece the model *spelled* in ordinary tokens (copying such content) is text and only a real reserved token is framing — the lazy grammar's trigger included (`dialect::Provenance`, `PiecePredictor::with_reserved`, opt-in below `Session`); renders images out-of-band via a per-call random sentinel (mtmd never sees prompt text at all — `Vision::tokenize_image` takes only image placeholders), and masks dialect-illegal specials at emission (`emit_ban_set` / `SampleOptions::banned_specials`, opt-out via `with_emit_specials_ban(false)` for e.g. Qwen-VL grounding markers) — all format integrity, not content filtering. The boundary that keeps this principled: **`Session` enforces it, `Engine`/the raw predictor does not.** Callers who legitimately want to hand-feed control tokens drop below the block abstraction. (Historical note: the thing 0.7 removed was word/token *content* banning; this is a different concern with a different owner.)
 
 ## Key Design Decisions
 

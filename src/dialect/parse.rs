@@ -40,12 +40,14 @@ use std::borrow::Cow;
 
 use serde_json::Value;
 
+use crate::chat_template::is_tool_name;
 use crate::prompt::{Block, ToolUse};
 use crate::Tool;
 
 use super::partial::{
     marker_holdback, read_partial, unclosed_json, Flavor, OpenStrings,
 };
+use super::provenance::Provenance;
 use super::{harmony, CallSyntax, Family, ReasoningMode};
 
 /// Whether the parse saw a complete structure or ran out of input
@@ -157,6 +159,10 @@ pub struct StreamParser {
     text_bytes_emitted: usize,
     /// The call the last re-parse ended inside, if any.
     open: Option<OpenCall>,
+    /// When set, `text` is the generation with every reserved piece it
+    /// *spelled* marked (see [`Provenance`]); what the parser yields is
+    /// restored. `None` parses the text as it stands.
+    provenance: Option<Provenance>,
 }
 
 impl StreamParser {
@@ -173,13 +179,40 @@ impl StreamParser {
             stable_blocks: 0,
             text_bytes_emitted: 0,
             open: None,
+            provenance: None,
         }
+    }
+
+    /// Parse with emission provenance: only framing the model emitted
+    /// as a real reserved token is structure, and a reserved piece it
+    /// spelled in ordinary tokens is text (see [`Provenance`]). Feed it
+    /// with [`Self::push_token`]; [`Self::push`] then reads every piece
+    /// as ordinary.
+    pub(crate) fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 
     /// Feed one decoded piece; returns every block (or prose delta)
     /// newly resolved by it.
     pub fn push(&mut self, piece: &str) -> Vec<Block> {
-        self.text.push_str(piece);
+        self.push_token(piece, None)
+    }
+
+    /// [`Self::push`], with the token that produced `piece` — what
+    /// provenance keys on. Without provenance the token is ignored.
+    pub(crate) fn push_token(
+        &mut self,
+        piece: &str,
+        token: Option<crate::Token>,
+    ) -> Vec<Block> {
+        match self.provenance.as_mut() {
+            Some(provenance) => {
+                let settled = provenance.push(piece, token);
+                self.text.push_str(&settled);
+            }
+            None => self.text.push_str(piece),
+        }
         self.reparse(Leniency::Streaming)
     }
 
@@ -187,7 +220,17 @@ impl StreamParser {
     /// degrade per [`Leniency::Final`] and held-back marker-prefix
     /// bytes are released.
     pub fn finish(&mut self) -> Vec<Block> {
+        self.settle();
         self.reparse(Leniency::Final)
+    }
+
+    /// End of input: provenance's held tail can no longer grow into a
+    /// spelled piece, so it joins the text as it stands.
+    fn settle(&mut self) {
+        if let Some(provenance) = self.provenance.as_mut() {
+            let tail = provenance.finish();
+            self.text.push_str(&tail);
+        }
     }
 
     /// Flush a generation that was cut short (`max_tokens`, a stop
@@ -196,6 +239,7 @@ impl StreamParser {
     /// instead of degrading to text; everything else flushes as
     /// [`Self::finish`] would.
     pub fn finish_clipped(&mut self) -> Vec<Block> {
+        self.settle();
         self.reparse(Leniency::Clipped)
     }
 
@@ -293,7 +337,10 @@ impl StreamParser {
             self.pre_opened_reasoning,
             leniency,
         );
-        self.open = open;
+        self.open = match &self.provenance {
+            Some(provenance) => open.map(|o| provenance.restore_open(o)),
+            None => open,
+        };
         let blocks = parsed.blocks;
         let last = blocks.len().saturating_sub(1);
         let mut out = Vec::new();
@@ -308,17 +355,22 @@ impl StreamParser {
                     // grow (or its tail may become a marker), so under
                     // Streaming yield only the safe delta and keep the
                     // block open; under Final flush it whole.
-                    let end = if open_tail {
+                    let mut end = if open_tail {
                         text.len() - self.landmark_holdback(&text)
                     } else {
                         text.len()
                     };
+                    // A delta is restored on its own, so it must hold
+                    // whole markers.
+                    if let Some(provenance) = &self.provenance {
+                        end = provenance.cut_before_marker(&text, end);
+                    }
                     if end > self.text_bytes_emitted {
-                        out.push(
-                            text[self.text_bytes_emitted..end]
-                                .to_string()
-                                .into(),
-                        );
+                        let delta = &text[self.text_bytes_emitted..end];
+                        out.push(match &self.provenance {
+                            Some(p) => p.restore(delta).into_owned().into(),
+                            None => delta.to_string().into(),
+                        });
                         self.text_bytes_emitted = end;
                     }
                     if !open_tail {
@@ -330,7 +382,10 @@ impl StreamParser {
                 // marker has been consumed — they cannot change on a
                 // longer re-parse. Yield immediately.
                 other => {
-                    out.push(other);
+                    out.push(match &self.provenance {
+                        Some(provenance) => provenance.restore_block(other),
+                        None => other,
+                    });
                     self.stable_blocks = i + 1;
                     self.text_bytes_emitted = 0;
                 }
@@ -1217,7 +1272,7 @@ impl<'a> Parser<'a> {
     /// Tool-call body: one JSON value, optionally terminated by the
     /// `<|call|>` piece (EOG — usually absent from surfaced text).
     fn harmony_call(&mut self, name: String) -> CallOutcome {
-        if name.is_empty() || name.len() > 256 {
+        if !is_tool_name(&name) {
             return CallOutcome::Malformed;
         }
         self.skip_ws();
@@ -1259,8 +1314,13 @@ impl<'a> Parser<'a> {
         self.blocks.push(Block::ToolUse { call });
     }
 
-    /// A call with the next id in parse order.
+    /// A call with the next id in parse order. Every reader checks the
+    /// name first ([`is_tool_name`]): the model's calls are echoed back
+    /// as history, and a name or id that ingest rejects would fail
+    /// every later request on the transcript. A valid name makes a
+    /// valid id.
     fn make_call(&mut self, name: String, input: Value) -> ToolUse {
+        debug_assert!(is_tool_name(&name), "unchecked tool name {name:?}");
         let call = ToolUse {
             id: Cow::Owned(format!("call_{}_{}", self.next_id, name)),
             name: Cow::Owned(name),
@@ -1289,7 +1349,7 @@ impl<'a> Parser<'a> {
             return CallOutcome::Incomplete;
         };
         let name = self.rest()[..name_end].to_string();
-        if name.is_empty() || name.len() > 256 {
+        if !is_tool_name(&name) {
             return CallOutcome::Malformed;
         }
         self.pos += name_end + f.name_suffix.len();
@@ -1705,7 +1765,7 @@ impl<'a> Parser<'a> {
             };
         };
         let name = self.rest()[..name_end].to_string();
-        if name.is_empty() || name.len() > 256 {
+        if !is_tool_name(&name) {
             return CallOutcome::Malformed;
         }
         // Leave the opening brace for the value reader.
@@ -1898,6 +1958,9 @@ impl<'a> Parser<'a> {
             return CallOutcome::Incomplete;
         };
         let name = self.rest()[..name_end].to_string();
+        if !is_tool_name(&name) {
+            return CallOutcome::Malformed;
+        }
         self.pos += name_end + f.name_suffix.len();
 
         // Nothing past the name yet (`[TOOL_CALLS]name[ARGS]` and a
@@ -1966,12 +2029,13 @@ impl<'a> Parser<'a> {
 
     /// Map a parsed JSON call object to (name, args) via the
     /// dialect's field names, handling one-level `function` nesting
-    /// and the name-is-key shape.
+    /// and the name-is-key shape. `None` for a name ingest would
+    /// reject (see [`is_tool_name`]).
     fn map_json_call(&self, call: &Value) -> Option<(String, Value)> {
         let obj = call.as_object()?;
         if self.syntax.json.fun_name_is_key {
             let (name, args) = obj.iter().next()?;
-            return Some((name.clone(), args.clone()));
+            return is_tool_name(name).then(|| (name.clone(), args.clone()));
         }
         let inner = if !self.syntax.json.function_field.is_empty() {
             obj.get(&self.syntax.json.function_field)
@@ -1985,7 +2049,8 @@ impl<'a> Parser<'a> {
         let name = inner
             .get(name_field)
             .or_else(|| obj.get(name_field))
-            .and_then(|v| v.as_str())?
+            .and_then(|v| v.as_str())
+            .filter(|name| is_tool_name(name))?
             .to_string();
         let args = inner
             .get(args_field)
@@ -2004,15 +2069,16 @@ impl<'a> Parser<'a> {
 }
 
 /// `text` past `prefix`, split at `suffix` into a call's name and what
-/// follows it (see [`split_marker`]). `None` until the name is whole:
-/// non-empty, at most 256 bytes, its suffix arrived.
+/// follows it (see [`split_marker`]). `None` until the name is whole
+/// (its suffix arrived) and for a name ingest would reject (see
+/// [`is_tool_name`]).
 fn named<'t>(
     text: &'t str,
     prefix: &str,
     suffix: &str,
 ) -> Option<(&'t str, &'t str)> {
     let (name, rest) = split_marker(text.strip_prefix(prefix)?, suffix)?;
-    (!name.is_empty() && name.len() <= 256).then_some((name, rest))
+    is_tool_name(name).then_some((name, rest))
 }
 
 /// Split `text` at the first `marker`: what precedes it and what
@@ -2383,6 +2449,74 @@ mod tests {
                 "{:?} emission {emission:?}",
                 syntax.family
             );
+        }
+    }
+
+    /// A call whose name ingest would reject (Anthropic's
+    /// `^[a-zA-Z0-9_-]{1,64}$`) degrades to text in every family, whole
+    /// or cut: seated as a `ToolUse`, its name and its `call_{n}_{name}`
+    /// id would fail every later request on the transcript once the
+    /// client echoed it back.
+    #[test]
+    fn invalid_tool_name_degrades_instead_of_seating() {
+        let input = serde_json::json!({"city": "Paris", "days": 3});
+        let t = tool("get_weather");
+        let long = "x".repeat(65);
+        for syntax in [
+            CallSyntax::qwen_xml(),
+            CallSyntax::hermes_json(),
+            CallSyntax::llama31_json(),
+            CallSyntax::gemma4(),
+        ] {
+            let emission =
+                render_reference(&syntax, &[("get_weather", &input)])
+                    .expect("representable");
+            for bad in ["get.weather", "get weather", long.as_str()] {
+                let text = emission.replace("get_weather", bad);
+                for leniency in [Leniency::Final, Leniency::Clipped] {
+                    let parsed =
+                        parse_text(&syntax, &[&t], &text, false, leniency);
+                    assert!(
+                        calls_of(&parsed.blocks).is_empty(),
+                        "{:?} {leniency:?}: {text:?} → {:#?}",
+                        syntax.family,
+                        parsed.blocks,
+                    );
+                }
+                // Cut mid-arguments: the open call is withheld too.
+                let cut = &text[..text.find("Paris").expect("city")];
+                let parsed =
+                    parse_text(&syntax, &[&t], cut, false, Leniency::Clipped);
+                assert!(
+                    calls_of(&parsed.blocks).is_empty(),
+                    "{:?} cut: {cut:?} → {:#?}",
+                    syntax.family,
+                    parsed.blocks,
+                );
+            }
+            // Final keeps the bytes as text: nothing silently dropped.
+            let text = emission.replace("get_weather", "get.weather");
+            let parsed =
+                parse_text(&syntax, &[&t], &text, false, Leniency::Final);
+            assert!(
+                parsed.blocks.iter().any(|b| matches!(
+                    b,
+                    Block::Text { text, .. } if text.contains("get.weather")
+                )),
+                "{:?}: {:#?}",
+                syntax.family,
+                parsed.blocks,
+            );
+        }
+
+        // Harmony keeps whatever follows `functions.`, to the space.
+        for recipient in ["functions.get.weather", "functions.a:b"] {
+            let text = format!(
+                "<|channel|>commentary to={recipient} \
+                 <|constrain|>json<|message|>{{\"arg1\": 1}}<|call|>"
+            );
+            let blocks = harmony_parse(&text, Leniency::Final);
+            assert!(calls_of(&blocks).is_empty(), "{text:?}: {blocks:#?}");
         }
     }
 

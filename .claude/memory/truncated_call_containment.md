@@ -56,6 +56,13 @@ It only bites where no deferred grammar is armed (no tools advertised,
 `ToolChoice::None`, empty-trigger dialect) — and there, there is no
 legal call to protect, so prevention buys nothing containment doesn't.
 
+> **Superseded 2026-10-01** (`emission_provenance.md`): once content
+> literals let the model *read* spelled markup, a byte-spelled marker
+> became a content-injection vector, not the model's own choice. The
+> trigger scan now arms only on reserved pieces emitted as real tokens,
+> and the parser reads a spelled piece as text — wherever the framing
+> is a reserved special in the vocabulary.
+
 **(d) Budget exhaustion mid-call — IRREDUCIBLE.** `max_tokens` or
 context-full. A grammar constrains what is **legal**, never whether the
 model **finishes**. No emission-side mechanism reaches this.

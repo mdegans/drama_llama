@@ -57,7 +57,9 @@
 use serde_json::Value;
 
 use crate::{
-    dialect::{cut_value, OpenCall, Parsed, StreamParser},
+    dialect::{
+        cut_value, OpenCall, ParseStatus, Parsed, Provenance, StreamParser,
+    },
     predictor::{first_stop_string, stop_string_holdback},
     Block,
 };
@@ -179,12 +181,18 @@ impl StopFilter {
         self.cutter.hit()
     }
 
-    /// Feed one piece; returns the blocks (or prose deltas) it resolved.
-    pub(super) fn push(&mut self, piece: &str) -> Vec<Block> {
+    /// Feed one piece and the token behind it (what the parser's
+    /// emission provenance keys on); returns the blocks (or prose
+    /// deltas) it resolved.
+    pub(super) fn push(
+        &mut self,
+        piece: &str,
+        token: Option<crate::Token>,
+    ) -> Vec<Block> {
         if self.hit().is_some() {
             return Vec::new();
         }
-        let blocks = self.parser.push(piece);
+        let blocks = self.parser.push_token(piece, token);
         let mut out = self.admit(blocks);
         if self.hit().is_none() {
             out.extend(self.stop_in_flight());
@@ -441,19 +449,26 @@ pub(super) fn cut_at_stop<S: AsRef<str>>(
 /// a call's input leaves the call's raw bytes up to the match, and an
 /// escape the match began with (`\n` of `"a\nb"`) decodes to nothing
 /// until complete, so the prefix ending mid-escape parses the same —
-/// its dangling byte is not kept. The walk back from the end is short,
-/// since generation stops within a piece or a held-back marker of the
-/// match.
+/// its dangling byte is not kept.
+///
+/// Each step parses a prefix, so the walk is bounded: it starts at the
+/// end, where generation stopped (within a piece or a held-back marker
+/// of the match), and goes no lower than [`text_floor`] — a prefix
+/// shorter than the text `kept` shows cannot parse to it. A walk that
+/// finds no match then costs the framing and what followed the match,
+/// not every byte.
 pub(super) fn raw_stop_cut(
     raw: &str,
     kept: &[Block],
     view: impl Fn(&str) -> Option<Vec<Block>>,
 ) -> Option<usize> {
+    let floor = text_floor(kept);
     let mut prefixes = raw
         .char_indices()
         .map(|(i, _)| i)
         .chain([raw.len()])
         .rev()
+        .take_while(|&i| i >= floor)
         .skip_while(|&i| view(&raw[..i]).as_deref() != Some(kept));
     let longest = prefixes.next()?;
     Some(
@@ -462,6 +477,63 @@ pub(super) fn raw_stop_cut(
             .last()
             .unwrap_or(longest),
     )
+}
+
+/// Bytes of `blocks` that each come from a distinct raw byte of the
+/// text they were parsed from: prose and thoughts verbatim, and a
+/// call's input keys and string values, which decode to no more bytes
+/// than their spelling. Ids, names and numbers are left out (an id is
+/// made up, a number can re-serialize longer), so this never exceeds
+/// the length of a raw prefix that parses to `blocks`.
+fn text_floor(blocks: &[Block]) -> usize {
+    fn strings(v: &Value) -> usize {
+        match v {
+            Value::String(s) => s.len(),
+            Value::Array(items) => items.iter().map(strings).sum(),
+            Value::Object(members) => {
+                members.iter().map(|(k, v)| k.len() + strings(v)).sum()
+            }
+            _ => 0,
+        }
+    }
+    blocks
+        .iter()
+        .map(|b| match b {
+            Block::Text { text, .. } => text.len(),
+            Block::Thought { thought, .. } => thought.len(),
+            Block::ToolUse { call } => strings(&call.input),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// A stop cut of a generation read with emission provenance: the
+/// output [`cut_at_stop`] keeps, and where [`raw_stop_cut`] cuts the
+/// raw bytes — `provenance.restore(marked)` — to match it. `parse` is
+/// the clipped parse of marked text. Each raw prefix is parsed as the
+/// marked text it restores from (`Provenance::marked_prefix`): a stop
+/// can start inside a piece the model spelled, where no marked prefix
+/// ends.
+pub(super) fn marked_stop_cut(
+    provenance: &Provenance,
+    marked: &str,
+    stop: &str,
+    parse: impl Fn(&str) -> (Parsed, Option<OpenCall>),
+) -> (Vec<Block>, Option<usize>) {
+    let raw = provenance.restore(marked);
+    let parse_to = |end: usize| {
+        provenance.restore_parse(parse(&provenance.marked_prefix(marked, end)))
+    };
+    // A prefix withholding a structure in flight, with no call to show
+    // for it, is not where any stop fell.
+    let view = |prefix: &str| {
+        let (parsed, open) = parse_to(prefix.len());
+        let complete = parsed.status == ParseStatus::Complete;
+        (complete || open.is_some()).then(|| stop_view((parsed, open), true))
+    };
+    let (kept, _) = cut_at_stop(stop_view(parse_to(raw.len()), false), &[stop]);
+    let at = raw_stop_cut(&raw, &kept, view);
+    (kept, at)
 }
 
 #[cfg(test)]
@@ -545,7 +617,7 @@ mod tests {
         let mut out = Vec::new();
         let mut generated = text.len();
         for (i, c) in text.char_indices() {
-            out.extend(f.push(c.encode_utf8(&mut [0; 4])));
+            out.extend(f.push(c.encode_utf8(&mut [0; 4]), None));
             if f.hit().is_some() {
                 generated = i + c.len_utf8();
                 break;
@@ -691,7 +763,7 @@ mod tests {
             let mut f = filter(syntax, &["\n"]);
             let mut out: Vec<Block> = "Hi!\n"
                 .chars()
-                .flat_map(|c| f.push(&c.to_string()))
+                .flat_map(|c| f.push(&c.to_string(), None))
                 .collect();
             out.extend(f.finish(true));
             assert_eq!(f.hit(), None, "{name}: clipped");
@@ -852,8 +924,10 @@ mod tests {
             );
             let clip = &text[..text.find("sunny").unwrap() + 2];
             let mut f = filter(syntax.clone(), &["zzz"]);
-            let mut out: Vec<Block> =
-                clip.chars().flat_map(|c| f.push(&c.to_string())).collect();
+            let mut out: Vec<Block> = clip
+                .chars()
+                .flat_map(|c| f.push(&c.to_string(), None))
+                .collect();
             out.extend(f.finish(true));
             assert_eq!(f.hit(), None, "{name}");
             assert_eq!(input_of(&out), &json!({"city": "Paris"}), "{name}");
@@ -994,6 +1068,23 @@ mod tests {
         let full = call(&syntax, json!({"city": "Paris\nFrance"}));
         let at = full.find("\\n").unwrap();
         assert_eq!(cut(&syntax, &full[..at + 2], "\n"), Some(at));
+    }
+
+    /// The walk parses one prefix a step, so it stops at the text the
+    /// cut output shows: no shorter prefix can parse to it. Without a
+    /// match that is where it ends, not at the first byte.
+    #[test]
+    fn raw_stop_cut_walks_no_lower_than_the_kept_text() {
+        let kept: Vec<Block> = vec!["a".repeat(1000).into()];
+        let raw = format!("{}<junk>", "a".repeat(1000));
+        let steps = std::cell::Cell::new(0);
+        let never = |_: &str| {
+            steps.set(steps.get() + 1);
+            None
+        };
+        assert_eq!(raw_stop_cut(&raw, &kept, never), None);
+        assert_eq!(steps.get(), "<junk>".len() + 1);
+        assert_eq!(text_floor(&kept), 1000);
     }
 
     /// #122, streaming: a stop sequence split across deltas is held

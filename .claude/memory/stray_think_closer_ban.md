@@ -81,5 +81,8 @@ on the warm cache.
   pre-vacation binary predates #101/#107 (Jul 29 / Aug 5), before which
   the stray closer was silently seated as text and only surfaced as odd
   transcripts. Nobody has checked that binary's commit.
-- Byte-spelled closers remain possible and containment still catches
-  them; that is the documented id-level limit of the whole ban family.
+- Byte-spelled closers remain possible; that is the documented
+  id-level limit of the whole ban family. (2026-10-01: containment no
+  longer rejects them — ingest and the parser both read a spelled
+  closer as text, so it is harmless prose; see
+  `emission_provenance.md`.)

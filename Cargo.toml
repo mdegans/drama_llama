@@ -63,6 +63,10 @@ uuid = { version = "1", features = ["v4"] }
 partial_sort = { version = "0.2.0" }
 rand = { version = "0.10" }
 regex = "1.10"
+# Leftmost-longest matching of reserved special-token pieces in prompt
+# content (`chat_template::LiteralNeutralizer`). Already in the tree via
+# `regex`; named here because the matcher is part of our contract.
+aho-corasick = "1.1"
 static_assertions = "1.1.0"
 thiserror = "1.0"
 tinyvec = { version = "1.6", features = ["alloc"] }

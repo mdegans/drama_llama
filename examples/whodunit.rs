@@ -106,8 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         LlamaCppSession::from_path_with_n_ctx(path, 8192)?.quiet();
 
     // No literal `<think>` / `</think>` in the prompt text: those are
-    // control tokens in reasoning vocabs, and `Session` rejects blocks
-    // that tokenize to specials (`SessionError::InjectedSpecialToken`) —
+    // control tokens in reasoning vocabs, and `Session` reads content
+    // that spells them as plain text, so they would not open anything —
     // the reasoning envelope is the dialect's to emit, not content's to
     // spell. Asking for the *behaviour* is dialect-neutral and works on
     // models whose tags aren't spelled `<think>` at all.

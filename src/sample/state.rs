@@ -311,10 +311,16 @@ impl SamplerState {
             .chain(piece.iter())
             .copied()
             .collect();
+        // Every occurrence counts, spelled or real: the sampler has no
+        // emission provenance, so a trigger the model spelled in
+        // ordinary tokens (which `TokenPredictor` never wakes on) is
+        // judged as if real. Conservative — it can steer a quote of
+        // the trigger off a refused tail, never let a real wake through.
         let Some((end, len)) = crate::predictor::find_any_deferred_trigger_end(
             &hay,
             &spec.activate_after,
             hay.len(),
+            |_, _| true,
         ) else {
             return false;
         };

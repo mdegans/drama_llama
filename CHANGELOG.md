@@ -8,6 +8,142 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BEHAVIOR CHANGE: prompt content that spells a special-token piece
+  is no longer a 400 — the model reads it as text.** Every prepare
+  path tokenized the whole render with special-token parsing on, so a
+  reserved piece in *content* — Qwen's `<think>` / `<tool_call>`
+  (`USER_DEFINED`, matched even with specials off), `<|im_start|>`,
+  Mistral's `<s>` (which is also HTML strikethrough) — became the real
+  control token, and `SessionError::InjectedSpecialToken` rejected the
+  whole request. One Agora post quoting such a piece turned every
+  reader's `/v1/messages` and `/count_tokens` into a 400, permanently,
+  since the post stays in the transcript. Now the chat template
+  replaces each reserved piece found in content with a per-call
+  out-of-band marker (`LiteralNeutralizer`, via the new
+  `RenderOptions::literals`), and `Session` tokenizes around it with
+  specials off, spelling out byte by byte any piece the tokenizer
+  still matches. Content surfaces covered: system text, user and
+  assistant text (after joining blocks, so a piece split across two
+  blocks is caught), thought bodies (inside our own `<think>`
+  wrappers, which stay real), reasoning fields, tool results,
+  tool-call input keys and values, tool descriptions and schemas, and
+  a resumed open thought. The template's own framing is untouched.
+  What changes for callers:
+  - A prompt quoting a piece prepares; the model sees the spelled
+    text. Clean prompts are byte-identical in render, tokens and cache
+    hashes (tested), so existing caches stay warm.
+  - `InjectedSpecialToken` is now a bug detector: the old guard still
+    scans content the way the tokenizer reads it, and every piece it
+    finds must have been neutralized at least as often; a shortfall
+    fails the call loudly (and logs `literal_neutralization_bypassed`)
+    as a drama_llama bug. blallama answers it with a 500 `api_error`
+    instead of a 400, since the client's request is not at fault.
+    `content_special_neutralized` is logged at debug on every call
+    that neutralizes something.
+  - Tool names and tool-use ids are *validated* rather than
+    neutralized — the grammar and parser key on them: names must
+    match Anthropic's `^[a-zA-Z0-9_-]{1,64}$`, ids
+    `^[a-zA-Z0-9_-]+$`, else `ChatTemplateError::InvalidIdentifier`
+    (a 400 on blallama). **An empty tool-use id is now an error** on
+    every model with reserved pieces — every real one. A `ToolUse`
+    built with `ToolUse::new` and no `.with_id(..)` rendered fine
+    before and now fails; Anthropic rejects it too. Set an id on any
+    call echoed back as history, and the same id on its result.
+  - The dialect parser holds the names the *model* emits to the same
+    pattern: a call named `foo.bar` (Harmony keeps whatever follows
+    `functions.`), `get weather` or longer than 64 bytes degrades to
+    text like any malformed call (or is withheld when cut) instead of
+    seating a `ToolUse`. Seated, its name and `call_{n}_{name}` id
+    would have failed every later request on the transcript once the
+    client echoed it. The degraded text is then subject to containment
+    like any other free text.
+  - Templates no longer act on a piece that content spells: a Qwen
+    template does not split assistant text at a literal `</think>`,
+    nor treat user text starting with a literal `<tool_response>` as a
+    tool response.
+  - Emission containment (`EmittedSpecialToken`) now rejects only a
+    piece the model emitted as the *real* token into free text; one it
+    merely spelled (an agent quoting a post) passes, since the next
+    ingest reads it as text.
+  - **The model's output is parsed with emission provenance**, which
+    closes the hole the change above opens. A transcript quoting
+    `<tool_call>{…}</tool_call>` used to be a 400, so the model never
+    read it; now it reads the spelled markup and can copy it into its
+    own output, where a text-level parse would seat the copy as a real
+    `ToolUse` (or a copied `<think>` as a `Thought`) — tool-call
+    injection from content. `Session` knows the id behind every
+    emitted piece, so every reserved piece the model *spelled* in
+    ordinary tokens is swapped for an opaque marker before the dialect
+    parser sees it and swapped back in the parsed blocks: only framing
+    emitted as the real reserved token is structure. That covers
+    `complete_blocks` / `complete` / `complete_response`,
+    `complete_stream` (a piece spelled across several tokens is held
+    back until it completes or cannot), the stop-sequence parse of all
+    of them and `complete_text`'s. The lazy tool-call grammar arms
+    only on a trigger whose reserved pieces are real tokens
+    (`PiecePredictor::with_reserved`), so a spelled `<tool_call>` no
+    longer drags the rest of the turn into call syntax; the same goes
+    for `output_config`'s `</think>` trigger. A special whose text
+    duplicates a reserved piece's (dropped from the reserved set, since
+    the text tokenizes to the other id) is framing too when emitted,
+    and the id-level bans (`ToolChoice::None`'s opener ban, #107's
+    reasoning opener and closer bans) hold it with the reserved id.
+    Containment reads the unrestored parse, so it is exact now rather
+    than a count, and of a turn a stop sequence cut it reads only what
+    the cut keeps. A real token the cut splits (a stop starting inside
+    its piece) is not counted: what stays is the part of the piece
+    before the stop, which is text, not the piece, and the caller sees
+    it as text. A spelled piece re-renders byte-identically (it is a
+    content literal on the next ingest), so the auto-tip is
+    unaffected; a *real* reserved token left in content (only possible
+    with `with_emit_specials_ban(false)`) re-renders spelled, so that
+    turn stores no tip hash.
+
+    **Protected** wherever the framing is a reserved special in the
+    loaded vocabulary, which is per vocabulary, not per dialect.
+    Measured 2026-10-01 (vocab-only loads): Qwen 3.6 / 3.8 call and
+    reasoning markers (`<tool_call>`, `</tool_call>`, `<think>`,
+    `</think>`); every gpt-oss Harmony header token (but Harmony's
+    recipient is text — a header may start with a plain ` to=…` after
+    a real `<|end|>` or at the turn's start — so what gates a gpt-oss
+    call is the real `<|message|>` alone, `<|call|>` optional); Gemma 4's
+    `<|tool_call>`, `<tool_call|>`, `<|"|>` and channel markers;
+    Mistral 4's `[TOOL_CALLS]`, `[ARGS]`, `[THINK]`, `[/THINK]`; and
+    cogito-32b's `<tool_call>` / `</tool_call>`. **Not protected**
+    where framing is ordinary text: cogito-32b's `<think>` /
+    `</think>` (plain text in its Qwen 2.5 vocabulary), trigger-less
+    bare-JSON Llama 3.1, Hermes on a vocabulary without a `<tool_call>`
+    special, and markup *inside* a real call that is plain text (Qwen
+    XML's `<function=` / `<parameter=`, JSON's quotes), which reads by
+    bytes — as the grammar reads it. There, grammar-constrained
+    generation and `tool_choice` are the defense.
+    Three limits remain. Provenance tells a spelling from a real
+    token, not a copy from a call: a model that read spelled markup can
+    still emit the *real* framing ids when it repeats it, and that is a
+    call at every level of the parse. There, as for the unprotected
+    vocabularies, `tool_choice`, the grammar and the model are the
+    defense. The grammar is byte-level, so under an armed
+    grammar the model *can* spell a piece the grammar requires, and the
+    parse reads that piece as text: a forced call whose opener is
+    spelled is a `GrammarViolation` (a retry is warm), and a real
+    opener whose close is spelled either still parses, the close left
+    as text, or degrades and is contained — never a call the model did
+    not open with the real token. Models emit their own framing as the
+    token, so this is rare. And
+    `dialect::parse_text` / `StreamParser::push`, which see only text,
+    stay provenance-free: a caller parsing emission itself gets the
+    text reading.
+  - Markers the model emits as real specials outside the dialect
+    (Qwen-VL grounding's `<|box_start|>`, with
+    `with_emit_specials_ban(false)`) re-ingest as text, not as ids.
+  - `RenderOptions` gains a public field, `literals`; code building it
+    with a struct literal and no `..Default::default()` must add it.
+    `Session` sets it itself on every render, whatever
+    `with_render_opts` was given.
+  - moeflux: `tokenize_special` honors `add_special`, and
+    `parse_special = false` now leaves added tokens marked `special`
+    as text (an `encode_special_tokens` tokenizer clone), matching
+    llama.cpp.
 - **An unseeded cache resume reseeds the sampler rng.** A resumed
   call used to continue the snapshot's exact rng stream, and a prompt
   breakpoint's snapshot holds the *initial* rng of the call that made
