@@ -116,7 +116,7 @@
 //! at its cap. One `event = "cache_reuse"` per call — `hit` with its
 //! `source` (`tip`, `breakpoint`, `lookback`, `hash`) and token counts,
 //! at `DEBUG` since a hit is the normal case, or `miss` with its
-//! `reason`, always at `WARN` (`cold` when nothing was offered) — an
+//! `reason`, always at `WARN` (`cold` when nothing was lost) — an
 //! `event = "cache_adopt"` at `DEBUG` when a prompt is read in a slot's
 //! own split, and an `event = "cache_degrade"` or `"cache_evict"` for
 //! each thing that cost reuse, with its `reason` (`tip_diverged`,
@@ -2293,9 +2293,10 @@ struct Splice {
     /// Entries of the plain list they stand in for.
     plain: usize,
     /// Stretches where the two lists hold the same entries, as
-    /// `(plain start, cached start, len)`, ascending. A plain boundary
-    /// in one has a place among the slot's ids; one inside a stretch
-    /// between them, which the two spell in different tokens, has none.
+    /// `(plain start, cached start, len)`, ascending — empty where two
+    /// respelled stretches meet. A plain boundary in one has a place
+    /// among the slot's ids; one inside a stretch between them, which
+    /// the two spell in different tokens, has none.
     runs: Vec<(usize, usize, usize)>,
     /// Whether every byte of the slot's list reads as the plain list
     /// does — its whole list, perhaps ending inside a plain token that
@@ -2368,7 +2369,10 @@ fn spelling_walk(
             .zip(&plain[j..])
             .take_while(|(a, b)| a == b)
             .count();
-        if same > 0 {
+        // Past the start, `(i, j)` is where a respelled stretch closed:
+        // a boundary both share even when no equal run follows it, as
+        // between two stretches back to back.
+        if same > 0 || i > 0 {
             splice.runs.push((j, i, same));
             (i, j) = (i + same, j + same);
         }
@@ -2519,13 +2523,20 @@ struct HashKeyedHit {
 /// the position offered. Eligible when both hold:
 ///
 /// 1. the two `H` agree, in entries *and* positions; and
-/// 2. `prev_entries[A..H] == new_entries[A..H]` token-for-token — the
-///    predicted-tail region, empty for prompt breakpoints.
+/// 2. `prev_entries[..H] == new_entries[..H]` token-for-token.
 ///
-/// Together with the hash those give `bytes(prev[..A]) ==
-/// bytes(new[..A])` by subtraction, which is exactly what makes
-/// restoring to `bp.at.pos` and prefilling `new_entries[A..]` sound.
-/// It is exact, not conservative: nothing safe is refused.
+/// Equal bytes at an equal entry count are not equal ids: `a|bc` and
+/// `ab|c` spell the same bytes in two entries each. Without the ids
+/// before `A`, such a hit restored KV holding the model's split while
+/// the slot went on to record the tokenizer's, so the next call's walk
+/// read ids the KV never held. The full comparison closes that: the KV
+/// is exactly the ids the slot records. A respelled prefix reaches the
+/// hash path only through adoption (`Session::adopt`), which hands it
+/// the slot's own ids.
+///
+/// The hash still earns its place: equal ids up to `H` let a prompt
+/// breakpoint reach the end of the shared prefix itself, where the
+/// LCP walk's `lcp-1` margin stops one entry short.
 ///
 /// No `cap` argument is needed. The old one bounded the result by the
 /// new entry count; a matched new breakpoint is a position *in* the
@@ -2552,6 +2563,9 @@ fn hash_keyed_l_hit(
             )
         }),
     );
+    // Equal ids through a hash's end is one bound on it, so one walk
+    // serves every candidate.
+    let lcp = longest_common_prefix_len(&slot.prev_entries, new_entries);
     let mut out = HashKeyedHit::default();
     for (bp, cached_end) in candidates {
         let Some(h) = bp.hash.as_ref() else {
@@ -2560,10 +2574,7 @@ fn hash_keyed_l_hit(
         let Some(&new_end) = new_end_of.get(h) else {
             continue;
         };
-        let cached_tail = slot.prev_entries.get(bp.at.entry..cached_end.entry);
-        let new_tail = new_entries.get(bp.at.entry..new_end.entry);
-        let agrees = new_end == cached_end
-            && matches!((cached_tail, new_tail), (Some(c), Some(n)) if c == n);
+        let agrees = new_end == cached_end && cached_end.entry <= lcp;
         if agrees {
             if bp.at.entry > out.at.entry {
                 out.at = bp.at;
@@ -5461,8 +5472,8 @@ impl<B: Backend> Session<B> {
 
     /// The call's plain tokenization `plain` read in a slot's own ids as
     /// far as [`spelling_walk`] reaches, from the slot it reaches
-    /// furthest into (ties to the most recently used); `None` when no
-    /// slot respells any of it, with the prefix cache off, or with
+    /// furthest into (ties to the most recently used); `None` when that
+    /// slot respells none of it, with the prefix cache off, or with
     /// [`PrefixCacheConfig::adopt_emitted_tokens`] unset.
     ///
     /// Under `DRAMA_LLAMA_CACHE_TRIPWIRE` the result is checked against
@@ -5488,8 +5499,11 @@ impl<B: Backend> Session<B> {
                 );
                 (slot, splice)
             })
-            .filter(|(_, splice)| splice.respells())
-            .max_by_key(|(slot, splice)| (splice.plain, slot.last_used))?;
+            .max_by_key(|(slot, splice)| (splice.plain, slot.last_used))
+            // A slot that reads further in the tokenizer's own split
+            // wins as it is: splicing a shorter one's split in would
+            // part the call from it.
+            .filter(|(_, splice)| splice.respells())?;
         let entries =
             [&slot.prev_entries[..splice.cached], &plain[splice.plain..]]
                 .concat();
@@ -5876,7 +5890,7 @@ impl<B: Backend> Session<B> {
             };
             // Before anything below mutates the slots: a tip this call
             // continues past but cannot reuse.
-            self.log_tip_miss(selection, new_entries);
+            let tip_lost = self.log_tip_miss(selection, new_entries);
             match selection {
                 Some((seq, hit)) => {
                     tracing::debug!(
@@ -5933,6 +5947,7 @@ impl<B: Backend> Session<B> {
                                 miss_reason,
                                 new_entries,
                                 hit.at.entry,
+                                tip_lost,
                             );
                             break (seq, EntryPos::default());
                         }
@@ -5992,7 +6007,27 @@ impl<B: Backend> Session<B> {
                             panic!("prefix-cache tripwire: unexpected miss");
                         }
                     }
-                    self.log_reuse_miss("no_slot", new_entries, 0);
+                    // A render hash some slot matched but refused for
+                    // its split: an offer lost, however the walk did.
+                    let drifted =
+                        self.prefix_cache.as_ref().is_some_and(|cache| {
+                            cache.slots.iter().any(|slot| {
+                                hash_keyed_l_hit(
+                                    slot,
+                                    new_entries,
+                                    new_breakpoints,
+                                    new_breakpoint_hashes,
+                                )
+                                .drifted
+                                .is_some()
+                            })
+                        });
+                    self.log_reuse_miss(
+                        "no_slot",
+                        new_entries,
+                        0,
+                        tip_lost || drifted,
+                    );
                     let seq = self.allocate_slot(now);
                     (seq, EntryPos::default())
                 }
@@ -6278,15 +6313,20 @@ impl<B: Backend> Session<B> {
     /// event an operator watching cache health needs to see, and at
     /// `INFO` a cold seat looked like a quiet one. A partial hit is a
     /// `hit` at `DEBUG` ([`Self::log_reuse_hit`]); what it lost is its
-    /// own `cache_degrade` event. `cold` marks a miss where no slot
-    /// offered anything (`lost_tokens` 0) — a new conversation's first
-    /// turn, or one whose slot is gone (its `cache_evict` said so) — so
-    /// a filter on `cold=false` leaves the misses that lost an offer.
+    /// own `cache_degrade` event. `cold` marks a miss that lost nothing
+    /// it could have had: no slot offered anything (`lost_tokens` 0),
+    /// and this call neither missed a tip it continues nor refused a
+    /// hash for its split (`lost_elsewhere`) — a new conversation's
+    /// first turn, or one whose slot is gone (its `cache_evict` said
+    /// so). A `no_slot` after a lost tip is not cold, however much
+    /// `shared_entries` says, so a filter on `cold=false` leaves every
+    /// miss that lost something.
     fn log_reuse_miss(
         &self,
         reason: &'static str,
         new_entries: &[CacheEntry],
         offered: usize,
+        lost_elsewhere: bool,
     ) {
         let shared = self.prefix_cache.as_ref().map_or(0, |cache| {
             cache
@@ -6310,7 +6350,7 @@ impl<B: Backend> Session<B> {
             event = "cache_reuse",
             outcome = "miss",
             reason,
-            cold = lost == 0,
+            cold = lost == 0 && !lost_elsewhere,
             shared_entries = shared,
             lost_tokens = lost,
             prompt_tokens = entries_cell_len(new_entries),
@@ -6349,13 +6389,17 @@ impl<B: Backend> Session<B> {
     /// does. They differ — `resplit` — when the lists spell a stretch
     /// in different tokens before the real change: the text fields are
     /// then the edit, and the id fields only the split before it.
+    ///
+    /// Returns whether it logged a miss that shows the call continues
+    /// the slot's conversation — one that warns by size — so a
+    /// `cache_reuse` miss can say it was not `cold`.
     fn log_tip_miss(
         &self,
         selection: Option<(i32, Reuse)>,
         new_entries: &[CacheEntry],
-    ) {
+    ) -> bool {
         let Some(cache) = self.prefix_cache.as_ref() else {
-            return;
+            return false;
         };
         let slot = match selection {
             Some((seq, _)) => cache.slot(seq),
@@ -6363,10 +6407,10 @@ impl<B: Backend> Session<B> {
                 longest_common_prefix_len(&slot.prev_entries, new_entries)
             }),
         };
-        let Some(slot) = slot else { return };
+        let Some(slot) = slot else { return false };
         let reused = selection.map_or(0, |(_, r)| r.at.entry);
         let Some(miss) = tip_miss(slot, new_entries, reused) else {
-            return;
+            return false;
         };
         let lost = entries_cell_len(
             &slot.prev_entries[reused.min(miss.tip.entry)..miss.tip.entry],
@@ -6419,11 +6463,8 @@ impl<B: Backend> Session<B> {
         // or reordered history) and warns by size; on the
         // longest-prefix fallback it may be another conversation
         // sharing boilerplate, so it never warns.
-        let severity = if miss.in_turn || selection.is_some() {
-            lost
-        } else {
-            0
-        };
+        let continues = miss.in_turn || selection.is_some();
+        let severity = if continues { lost } else { 0 };
         cache_event!(
             severity,
             target: "drama_llama::session",
@@ -6449,6 +6490,7 @@ impl<B: Backend> Session<B> {
             miss.diverge_at,
             text_at,
         );
+        continues
     }
 
     /// The `cache_evict` event for a whole slot about to be dropped:
@@ -12753,16 +12795,19 @@ mod tests {
 
     #[test]
     fn test_select_slot_hash_beats_lcp() {
-        // Slot 0's entries diverge from the new prompt immediately
-        // (LCP 0) but its breakpoint hash matches a new partial hash
-        // at entry 6; slot 1 offers only an LCP hit at entry 4. The
-        // hash-keyed match wins because it names the larger prefix.
+        // Slot 0's entries part from the new prompt right after its
+        // breakpoint (LCP 6), whose hash matches a new partial hash at
+        // entry 6: the LCP walk's margin stops it at 4, the hash path
+        // reaches 6. Slot 1 parts at 5 and offers only an LCP hit at
+        // entry 4. The hash-keyed match wins because it names the
+        // larger prefix.
         let now = std::time::Instant::now();
         let h = [7u8; 32];
         let mut a = aged_slot(0, 10, 8, now);
-        a.prev_entries = (100..108 as Token).map(CacheEntry::Token).collect();
+        a.prev_entries[6..].fill(CacheEntry::Token(100));
         a.breakpoints = vec![bp(6, Some(h))];
         let mut b = aged_slot(1, 10, 8, now);
+        b.prev_entries[5..].fill(CacheEntry::Token(100));
         b.breakpoints = vec![bp(4, None)];
         let new_entries: Vec<CacheEntry> =
             (0..8 as Token).map(CacheEntry::Token).collect();
@@ -14150,27 +14195,48 @@ mod tests {
         );
     }
 
-    /// The other direction of the #96 fix's max: when segmentation
-    /// drift stops the LCP walk *before* a marker whose hash still
-    /// matches at agreeing coordinates, the hash path's deeper offer
-    /// must win. Guards the fix from over-rotating into LCP-first.
+    /// The other direction of the #96 fix's max: where the LCP walk's
+    /// `lcp - 1` margin stops one entry short of a marker whose hash
+    /// matches, the hash path's offer at the marker itself must win.
+    /// Guards the fix from over-rotating into LCP-first.
     #[test]
-    fn slot_l_hit_hash_reaches_past_an_lcp_stop() {
+    fn slot_l_hit_hash_reaches_the_lcp_itself() {
+        let h_marker = hash_partial_text("marker at the divergence");
+        let slot = hashed_slot(300, vec![bp(200, Some(h_marker))], None);
+        // Diverge at entry 200, right after the marker: the LCP walk
+        // offers nothing (no breakpoint at or below 199), but the ids
+        // and the hash agree through 200.
+        let mut new_entries = seq_entries(400);
+        new_entries[200] = CacheEntry::Token(9999);
+        let (new_eps, new_hashes) = new_bps(&[(200, h_marker)]);
+        assert_eq!(
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, &ids)
+                .map_or_else(EntryPos::default, |hit| hit.at),
+            ep(200),
+            "the hash path reaches the marker the LCP margin stops short of",
+        );
+    }
+
+    /// A hash match never reaches past ids that differ, though the
+    /// bytes agree and the marker lands at the same entry: the KV would
+    /// hold the slot's ids where the slot then records the new ones (a
+    /// turn the model wrote `a|bc` re-tokenized `ab|c`). The refusal is
+    /// reported as drift.
+    #[test]
+    fn slot_l_hit_hash_never_reaches_past_an_id_divergence() {
         let h_marker = hash_partial_text("marker past the divergence");
         let slot = hashed_slot(300, vec![bp(200, Some(h_marker))], None);
-        // Diverge at entry 50: the LCP path offers nothing (no
-        // breakpoint at or below 49), but the hash proves bytes and
-        // coordinates through 200.
         let mut new_entries = seq_entries(400);
         new_entries[50] = CacheEntry::Token(9999);
         let (new_eps, new_hashes) = new_bps(&[(200, h_marker)]);
         assert_eq!(
             slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, &ids)
                 .map_or_else(EntryPos::default, |hit| hit.at),
-            ep(200),
-            "the hash path must still reach past a boundary the LCP \
-             walk stops at",
+            ep(0),
         );
+        let hashed =
+            hash_keyed_l_hit(&slot, &new_entries, &new_eps, &new_hashes);
+        assert_eq!(hashed.drifted, Some((ep(200), ep(200))));
     }
 
     // ----------------------------------------------------------------
@@ -14831,14 +14897,24 @@ mod tests {
     /// ids, the next call restores the tip, and the three usage counters
     /// still add up to `count_tokens`. Adoption off reproduces the live
     /// failure, now reported as `segmentation_drift` with the text on
-    /// both sides of the `hash_drift`.
+    /// both sides of the `hash_drift`, and its miss is not `cold`.
     #[test]
     fn a_non_canonical_turn_keeps_its_tip_by_adoption() {
+        let cold = |events: &[(tracing::Level, Vec<(String, String)>)]| {
+            events
+                .iter()
+                .find(|(_, f)| field(f, "reason") == Some("no_slot"))
+                .and_then(|(_, f)| field(f, "cold"))
+                .map(str::to_owned)
+        };
         for adopt in [true, false] {
             let mut session = split_session(adopt);
-            session
-                .complete_response(&split_conversation(0, false))
-                .expect("turn 1");
+            let first = capture_events(|| {
+                session
+                    .complete_response(&split_conversation(0, false))
+                    .expect("turn 1");
+            });
+            assert_eq!(cold(&first).as_deref(), Some("true"), "a first turn");
             let slot = only_slot(&session);
             let tip = slot.tip.as_ref().expect("a tip").at;
             // The premise: the turn is the line, in the model's split.
@@ -14877,6 +14953,11 @@ mod tests {
                     reasons,
                     ["hash_drift", "segmentation_drift", "no_slot"],
                 );
+                assert_eq!(
+                    cold(&events).as_deref(),
+                    Some("false"),
+                    "a miss that lost a tip is not cold",
+                );
                 let drift = events
                     .iter()
                     .find(|(_, f)| field(f, "reason") == Some("hash_drift"))
@@ -14892,6 +14973,122 @@ mod tests {
                 assert!(new.starts_with(cached), "{new:?} vs {cached:?}");
             }
         }
+    }
+
+    /// A turn the model wrote `a|bc` re-tokenizes `ab|c`: the same bytes
+    /// in the same number of entries, so the turn's render hash lands
+    /// where it did before. A hash hit there restored KV holding the
+    /// model's ids while the slot went on to record the tokenizer's —
+    /// the next walk read ids the KV never held. The hash path now
+    /// compares the ids before its anchor too; with adoption the call
+    /// reads the turn in the model's split instead, and either way the
+    /// slot records what the KV holds.
+    #[test]
+    fn an_equal_count_respell_never_desyncs_the_slot() {
+        for adopt in [false, true] {
+            let mut session = split_session(adopt);
+            session.engine.model.merges.push(("ab", 261));
+            session.engine.model.merges.push(("bc", 262));
+            session.engine.decoder.script = vec![Token::from(b'a'), 262];
+            let mut first =
+                Prompt::default().max_tokens(NonZeroU32::new(64).unwrap());
+            first.messages.push(text_message(
+                crate::Role::User,
+                "Speak.",
+                false,
+            ));
+            session.complete_response(&first).expect("turn 1");
+            let slot = only_slot(&session);
+            let tip = slot.tip.as_ref().expect("tip").at;
+            let kv: Vec<CacheEntry> = slot.prev_entries[..tip.entry].to_vec();
+            // The premise: the model's split, which the tokenizer's
+            // reading of the same bytes does not reproduce.
+            assert_eq!(kv[slot.turn_start..], toks([Token::from(b'a'), 262]),);
+            assert_eq!(
+                session.engine.model.tokenize("abc", false),
+                [261, Token::from(b'c')],
+            );
+            let mut second = first.clone();
+            second.messages.push(text_message(
+                crate::Role::Assistant,
+                "abc",
+                true,
+            ));
+            second.messages.push(text_message(
+                crate::Role::User,
+                "Go on.",
+                false,
+            ));
+            let mut usage = None;
+            let events = capture_events(|| {
+                usage = Some(
+                    session.complete_response(&second).expect("turn 2").usage,
+                );
+            });
+            let read = usage.unwrap().cache_read_input_tokens.unwrap() as usize;
+            let cache = session.prefix_cache.as_ref().unwrap();
+            let slot = cache.slots.iter().max_by_key(|s| s.last_used).unwrap();
+            let n = read.min(kv.len());
+            assert_eq!(
+                slot.prev_entries[..n],
+                kv[..n],
+                "adopt={adopt}: the slot records the KV it reused; {:?}",
+                reasons(&events),
+            );
+            let sources: Vec<_> = events
+                .iter()
+                .filter_map(|(_, f)| field(f, "source"))
+                .collect();
+            if adopt {
+                assert_eq!(read, kv.len(), "the whole turn, adopted");
+            } else {
+                assert!(!sources.contains(&"hash"), "{sources:?}");
+                assert!(read < tip.pos, "the turn re-prefills: {read}");
+            }
+        }
+    }
+
+    /// A slot that reads further in the tokenizer's split outranks a
+    /// shorter one that respells: adopting the shorter one's split
+    /// would part the call from the longer one at the respelled
+    /// stretch, so the call takes neither and reuses the long slot as
+    /// it would with adoption off.
+    #[test]
+    fn a_canonical_slot_outreaching_a_respelled_one_wins() {
+        let mut reads = Vec::new();
+        for adopt in [true, false] {
+            let mut session = split_session(adopt);
+            let head: Vec<Token> = (b'a'..b'k').map(Token::from).collect();
+            let tail = std::iter::repeat_n(Token::from(b'x'), 100);
+            let plain = toks(head.iter().copied().chain([CIVIL]).chain(tail));
+            let mut canonical = PrefixSlot::new(0, std::time::Instant::now());
+            canonical.prev_entries = plain[..111].to_vec();
+            canonical.breakpoints = vec![bp(105, None)];
+            let mut respelled = PrefixSlot::new(1, std::time::Instant::now());
+            respelled.prev_entries = toks(
+                head.iter()
+                    .copied()
+                    .chain(" civil".bytes().map(Token::from))
+                    .chain(std::iter::repeat_n(Token::from(b'z'), 20)),
+            );
+            respelled.breakpoints = vec![bp(14, None)];
+            seat_slot(&mut session, canonical);
+            seat_slot(&mut session, respelled);
+            let adopted = session.adopt(&plain);
+            assert!(adopted.is_none(), "{:?}", adopted.map(|a| a.splice));
+            let (_, cache_read, _, _, seq) = session
+                .kv_setup_and_chunk_prefill(
+                    &plain,
+                    &[],
+                    &[],
+                    &Default::default(),
+                    0,
+                )
+                .expect("kv setup");
+            assert_eq!(seq, 0, "the canonical slot");
+            reads.push(cache_read);
+        }
+        assert_eq!(reads[0], reads[1], "adoption costs nothing here");
     }
 
     /// Adoption chains: the third call reads both earlier turns in the
@@ -15047,6 +15244,15 @@ mod tests {
         assert_eq!(s.place(1), None, "inside the respelled stretch");
         assert_eq!(s.place(2), Some(2));
         assert_eq!(s.place(4), Some(4), "past the splice: the plain ids");
+
+        // Two stretches back to back, `a|bc|a|bc` against `ab|c|ab|c`:
+        // the boundary between them has a place though no equal run
+        // follows it.
+        let s = w(&[0, 4, 0, 4], &[3, 2, 3, 2]);
+        assert_eq!((s.cached, s.plain), (4, 4));
+        assert_eq!(s.runs, [(2, 2, 0), (4, 4, 0)]);
+        assert_eq!(s.place(1), None, "inside the first stretch");
+        assert_eq!(s.place(2), Some(2), "between the stretches");
 
         // Unequal counts: `abc|a` against `a|b|c|a|b`, the cached list
         // ending first.

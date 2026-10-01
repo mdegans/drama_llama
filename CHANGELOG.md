@@ -236,16 +236,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   partials are checked against the plain tokenization as before, then
   placed in the spliced list; one ending inside a respelled stretch
   keeps the anchor the slot recorded for its hash. `count_tokens` reads
-  the same splice, so the three usage counters still sum to it. Safety
-  is unchanged — reuse still needs the token-id walk or the both-sides
-  hash check, so the KV is always the ids it is said to be — and the
-  walk itself is the proof that the spliced ids read as the render;
+  the same splice, so the three usage counters still sum to it. The
+  splice comes from the slot reaching furthest into the prompt; when
+  that slot already reads it in the tokenizer's split, nothing is
+  spliced. Safety is tightened, not just kept: the hash path now also
+  requires the ids before its anchor to be equal. A turn the model
+  wrote `a|bc` re-tokenizes `ab|c` — the same bytes in the same number
+  of entries — and a hash hit there used to restore KV holding the
+  model's ids while the slot recorded the tokenizer's (reachable with
+  adoption off, and with it on wherever the walk stops short, e.g. at a
+  duplicate special). Reuse now needs the token-id walk or a hash hit
+  over equal ids, so the KV is the ids the slot records. The walk
+  itself is the proof that the spliced ids read as the render;
   `DRAMA_LLAMA_CACHE_TRIPWIRE=1` re-checks it (the same bytes, the same
   specials and images in the same places) and panics on a walk bug.
-  On a 96,628-token prompt with 833 respelled stretches the walk took
-  0.25 ms against 362 ms for the plain tokenization each call already
-  pays. On by default; see `PrefixCacheConfig::adopt_emitted_tokens`
-  below for the one behaviour change.
+  On a 96,628-token Qwen3.8 prompt with 833 respelled stretches the
+  walk took 0.21–0.25 ms per slot against ~190 ms for the plain
+  tokenization each call already pays; a contrived worst case, every
+  multi-character token respelled, takes ~8 ms per slot. On by
+  default; see `PrefixCacheConfig::adopt_emitted_tokens` below for the
+  one behaviour change.
 - **A rejected turn no longer logs cache diagnostics for itself.** A
   turn's `emission_not_byte_stable` and `tip_not_recorded` events are
   now logged only once the turn stands: one that #101 containment, the
@@ -788,9 +798,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and tested).
 - **Cache logging an operator can act on.** A `cache_reuse` miss —
   nothing reused, the whole prompt prefilled — is now always `WARN`,
-  with `lost_tokens`, `prompt_tokens` and `cold` (nothing was offered:
-  a new conversation's first turn, or one whose slot is gone), so a
-  filter on `cold=false` leaves the misses that lost something; a hit
+  with `lost_tokens`, `prompt_tokens` and `cold` (nothing was lost: no
+  slot offered anything, and the call neither missed a tip it
+  continues nor refused a hash for its split — a new conversation's
+  first turn, or one whose slot is gone), so a filter on `cold=false`
+  leaves the misses that lost something; a hit
   stays `DEBUG`. `hash_drift` carries `diverge_at` and the `shared` /
   `cached` / `new` text around the first entry where the two
   tokenizations part, like `tip_diverged` (the live events could not
