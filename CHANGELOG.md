@@ -97,6 +97,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   side, and the 8 bytes after the special), whether a deferred grammar
   ever activated, `emission_bytes` and `generated_tokens`. Operator
   trace only; the error's `Display` still withholds the pieces.
+- **Cogito tool turns keep their tip.** Cogito's stock template prints
+  `\n` before every call, and the model ends its prose in whitespace
+  (`…\n\n<tool_call>`), so a prose-then-call turn re-rendered one
+  newline longer than it was generated and lost its tip on every
+  request (19 live events). The cogito bake now prints the
+  prose-to-call gap only when the prose carries none — as the Qwen
+  bakes do — and renders content-less turns and trimmed client prose
+  exactly as before. Parallel calls agree too: the analyzer read
+  cogito's inter-call `\n` as no separator (its two probe calls share
+  arguments, and the diff came back rotated), so the grammar forced
+  `</tool_call><tool_call>` against the template's
+  `</tool_call>\n<tool_call>`; it now measures `call_separator: "\n"`.
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
   assistant turn's answer and thought (3.6 also `lstrip`/`rstrip`s the

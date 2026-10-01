@@ -1,3 +1,13 @@
+{#- drama_llama's cache-stable replacement for the cogito stock
+    template — see `templates/cogito-gguf.jinja` for the detection key
+    it replaces, and `src/baked.rs` for the loading ladder.
+
+    What this template changes, and nothing else: call arguments render
+    through `json_dumps` (the model's own spacing) instead of `tojson`,
+    and the prose-to-call gap before the first call is printed only when
+    the prose does not already end in whitespace (see the patch comment
+    in the message loop). Everything else is byte-identical to stock.
+-#}
 {%- if not enable_thinking is defined %}
     {%- set enable_thinking = false %}
 {%- endif %}
@@ -90,13 +100,37 @@ For each function call, return a json object with function name and arguments wi
                 {%- endfor %}
             {%- endif %}
         {%- endif %}
+        {#- Cache-stability patch (drama_llama): stock prints `\n` before
+            EVERY call, the first included, so a turn whose prose the
+            model ended in whitespace (its habit: `…\n\n<tool_call>`)
+            re-rendered one newline longer than it was generated and the
+            turn's KV was lost on the next request. The prose-to-call gap
+            is printed only when the prose does not already end in
+            whitespace; between calls it stays (the grammar forces the
+            same `\n`). A content-less turn and trimmed client prose
+            render exactly as stock. -#}
+        {%- set ns = namespace(prose='') %}
+        {%- if message.content is string %}
+            {%- set ns.prose = message.content %}
+        {%- elif message.content is iterable and message.content is not string %}
+            {%- for content_item in message.content %}
+                {%- if content_item.type == 'text' %}
+                    {%- set ns.prose = ns.prose + content_item.text %}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
         {%- for tool_call in message.tool_calls %}
             {%- if tool_call.function is defined %}
                 {%- set tool_call = tool_call.function %}
             {%- endif %}
-            {{- '
+            {%- if loop.first and message.content and ns.prose.rstrip() != ns.prose %}
+                {{- '<tool_call>
+{"name": "' }}
+            {%- else %}
+                {{- '
 <tool_call>
 {"name": "' }}
+            {%- endif %}
             {{- tool_call.name }}
             {{- '", "arguments": ' }}
             {{- tool_call.arguments | json_dumps }}

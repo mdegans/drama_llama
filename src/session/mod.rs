@@ -12592,6 +12592,228 @@ mod tests {
         }
     }
 
+    /// Cogito's tool turns lost their tip on every call (19 live
+    /// events, 2026-10-01): the model ends its prose in whitespace and
+    /// opens the call (`…\n\n<tool_call>`), the parser leaves that gap
+    /// in the prose, and the stock template prints its own `\n` before
+    /// every call on top of it — `…\n\n\n<tool_call>`. The bake prints
+    /// that gap only when the prose carries none. Parallel calls needed
+    /// the other half: the template separates calls with `\n`, which the
+    /// analyzer now measures, so the grammar forces the same byte.
+    ///
+    /// Pinned like `qwen_cache_stable_round_trips`: through what a
+    /// session serves for the stock dump, measured the way the
+    /// canonicalization gate measures it.
+    #[test]
+    fn cogito_cache_stable_round_trips() {
+        use crate::{
+            dialect::{grammar_source, Anchor, EmitOptions},
+            prompt::{Message, Role},
+            ChatTemplate, Content, GrammarState, RenderOptions, Tool,
+        };
+        let eos = "<|im_end|>";
+        let tool = Tool::builder("get_inbox")
+            .description("Read the inbox.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            }))
+            .build()
+            .expect("valid tool");
+        let baked = &crate::baked::COGITO;
+        let served = crate::baked::detect(baked.stock)
+            .expect("stock dump detects")
+            .replacement;
+        let syntax =
+            crate::dialect::analyze_template(served, "", eos).expect("analyze");
+        let diverge = |source: &str, emission: &str| {
+            let template = ChatTemplate::from_source(
+                source.to_owned(),
+                String::new(),
+                eos.to_owned(),
+            )
+            .expect("template compiles");
+            let base = Prompt {
+                messages: vec![Message {
+                    role: Role::User,
+                    content: Content::text("Anything new?"),
+                }],
+                tools: Some(vec![tool.clone().into()]),
+                ..Prompt::default()
+            };
+            let opts = RenderOptions::default()
+                .with_extra("enable_thinking", false)
+                .with_thought_reingest(syntax.reasoning.reingest)
+                .with_reasoning_start(syntax.reasoning.start.clone());
+            let prompt = template
+                .render_with(&base, &opts.clone().with_generation_prompt(true))
+                .expect("render");
+            let blocks = crate::dialect::parse_text(
+                &syntax,
+                &[&tool],
+                emission,
+                false,
+                crate::dialect::Leniency::Final,
+            )
+            .blocks;
+            let mut turn = base.clone();
+            turn.messages.push(Message {
+                role: Role::Assistant,
+                content: Content(merge_adjacent_prose(blocks)),
+            });
+            let extended = template
+                .render_with(&turn, &opts.with_generation_prompt(false))
+                .expect("render");
+            emission_divergence(&extended, &prompt, emission)
+        };
+        let call = "<tool_call>\n{\"name\": \"get_inbox\", \"arguments\": \
+                    {\"limit\": 5}}\n</tool_call>";
+        let call2 = "<tool_call>\n{\"name\": \"get_inbox\", \"arguments\": \
+                     {}}\n</tool_call>";
+        let shapes: Vec<String> = vec![
+            "Nothing new.".into(),
+            "Nothing new.\n".into(),
+            call.into(),
+            // The live habit.
+            format!("Checking.\n\n{call}"),
+            format!("Checking.\n{call}"),
+            format!("Checking. {call}"),
+            // Parallel calls, with and without prose.
+            format!("{call}\n{call2}"),
+            format!("Checking.\n\n{call}\n{call2}"),
+        ];
+        // Each shape is one the lazy grammar forces from the trigger on
+        // — the parallel ones included, separator and all.
+        let grammar = std::sync::Arc::new(
+            crate::Grammar::parse(
+                &grammar_source(
+                    &syntax,
+                    &[&tool],
+                    &EmitOptions {
+                        anchor: Anchor::Lazy,
+                        parallel: true,
+                    },
+                )
+                .expect("emit"),
+            )
+            .expect("grammar"),
+        );
+        let forced = |emission: &str| {
+            let at = emission.find(syntax.trigger())?;
+            let mut state = GrammarState::new(grammar.clone());
+            Some(
+                state.advance_bytes(&emission.as_bytes()[at..]).is_ok()
+                    && state.is_complete(),
+            )
+        };
+        for emission in &shapes {
+            assert_ne!(forced(emission), Some(false), "{emission:?}");
+            assert_eq!(diverge(served, emission), None, "{emission:?}");
+        }
+        // Back to back is no longer what the grammar forces.
+        assert_eq!(forced(&format!("{call}{call2}")), Some(false));
+
+        // Irreducible, and pinned (listed in `templates/README.md`): no
+        // block records a gap the model omitted, so prose run straight
+        // into the call gets the template's `\n`; and whitespace after
+        // the last call has no block to ride.
+        for (emission, at) in [
+            (format!("Checking.{call}"), 9),
+            (format!("{call}\n"), call.len()),
+        ] {
+            assert_eq!(diverge(served, &emission), Some(at), "{emission:?}");
+        }
+
+        // Control: the bake before this patch (stock but for the
+        // `json_dumps` swap) loses the live habit's tip at the gap.
+        let previous = baked.stock.replace(
+            "tool_call.arguments | tojson",
+            "tool_call.arguments | json_dumps",
+        );
+        assert_ne!(previous, baked.stock, "the swap must apply");
+        assert_eq!(
+            diverge(&previous, &format!("Checking.\n\n{call}")),
+            Some(11)
+        );
+    }
+
+    /// An aged cogito turn as a client sends it back — trimmed prose,
+    /// or none, one call or several, as a string or as parts — renders
+    /// exactly as the bake did before the gap patch (stock, but for the
+    /// `json_dumps` argument interior): the gap is printed whenever the
+    /// prose carries none, so model input is unchanged for every turn
+    /// that was not generated with its own gap.
+    #[test]
+    fn cogito_cache_stable_aged_turn_renders_as_stock() {
+        use crate::{
+            prompt::{Message, Role},
+            ChatTemplate, Content, RenderOptions,
+        };
+        let eos = "<|im_end|>";
+        let baked = &crate::baked::COGITO;
+        let previous = baked.stock.replace(
+            "tool_call.arguments | tojson",
+            "tool_call.arguments | json_dumps",
+        );
+        let call = |id: &'static str| crate::Block::ToolUse {
+            call: misanthropic::tool::Use {
+                id: id.into(),
+                name: "get_inbox".into(),
+                input: serde_json::json!({"limit": 5}),
+                cache_control: None,
+                caller: None,
+            },
+        };
+        let text = |t: &'static str| crate::Block::Text {
+            text: t.into(),
+            cache_control: None,
+            citations: None,
+        };
+        let turns = [
+            vec![call("a")],
+            vec![call("a"), call("b")],
+            vec![text("Checking."), call("a")],
+            vec![text("Checking."), call("a"), call("b")],
+            vec![text("Checking."), text("Still."), call("a")],
+        ];
+        let render = |source: &str, content: Content| {
+            let template = ChatTemplate::from_source(
+                source.to_owned(),
+                String::new(),
+                eos.to_owned(),
+            )
+            .expect("template compiles");
+            let prompt = Prompt {
+                messages: vec![
+                    Message {
+                        role: Role::User,
+                        content: Content::text("Anything new?"),
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        content,
+                    },
+                    Message {
+                        role: Role::User,
+                        content: Content::text("And now?"),
+                    },
+                ],
+                ..Prompt::default()
+            };
+            template
+                .render_with(&prompt, &RenderOptions::default())
+                .expect("render")
+        };
+        for blocks in turns {
+            let content = Content(blocks);
+            assert_eq!(
+                render(baked.replacement, content.clone()),
+                render(&previous, content.clone()),
+                "{content:?}"
+            );
+        }
+    }
+
     /// The #101 containment log's forensics: every hit (up to the
     /// limit) in block order, with its block, its offset in the block
     /// and in the emission, the bytes around it, and the 8 after it.

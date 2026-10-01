@@ -142,6 +142,24 @@ fn qwen35_xml() {
     );
 }
 
+/// Cogito (stock and bake): per-call `<tool_call>` markers, and the
+/// template's `\n` between consecutive calls measured as the separator.
+/// The two probe calls share their arguments, so the analyzer's diff
+/// comes back rotated (`</tool_call>\n<tool_call>…`); it read as no
+/// separator at all, and the grammar forced calls back to back
+/// against the template's re-render.
+#[test]
+fn cogito_parallel_calls_separator() {
+    for fixture in ["cogito-gguf.jinja", "cogito-cache-stable.jinja"] {
+        let s = analyze(fixture, "", "<|im_end|>");
+        assert_eq!(s.family, Family::JsonNative, "{fixture}: {s:#?}");
+        assert_eq!(s.per_call_start, "<tool_call>\n", "{fixture}: {s:#?}");
+        assert_eq!(s.per_call_end, "\n</tool_call>", "{fixture}: {s:#?}");
+        assert_eq!(s.call_separator, "\n", "{fixture}: {s:#?}");
+        assert_eq!(s.trigger(), "<tool_call>", "{fixture}: {s:#?}");
+    }
+}
+
 /// Hermes 3: the original <tool_call>{json}</tool_call> shape —
 /// JSON_NATIVE with section markers.
 #[test]

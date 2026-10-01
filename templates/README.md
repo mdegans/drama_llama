@@ -67,6 +67,23 @@ re-render reproduces them. The `enable_thinking` front-rewrite
 (issue #86 interaction) is deliberately untouched: partial-render
 thinking flags are `render_partial`'s bug to fix, not the template's.
 
+A second change (2026-10-01): the **prose-to-call gap**. Stock prints
+`\n` before *every* call, the first included. The model's habit is to
+end its prose in whitespace and open the call (`Checking.\n\n<tool_call>`);
+the parser leaves that gap in the prose, so stock re-rendered
+`Checking.\n\n\n<tool_call>` — one newline more than was generated —
+and every cogito tool turn after prose lost its tip (19 live events).
+The bake prints the gap before the first call only when the prose does
+not already end in whitespace, the same rule as the Qwen bakes' point 3
+below. A content-less turn and trimmed client prose render exactly as
+before (`cogito_cache_stable_aged_turn_renders_as_stock`). Between
+calls the `\n` stays: the analyzer now measures it as the dialect's
+`call_separator`, so the grammar forces the same byte (it used to force
+calls back to back). Round-trip pins:
+`session::tests::cogito_cache_stable_round_trips`. Irreducible, as for
+Qwen: prose run straight into the call (`Checking.<tool_call>`) gets the
+template's `\n`, and whitespace after the last call is dropped.
+
 `mistral4-gguf.jinja` is dumped from the Mistral-Small-4-119B-2603
 Unsloth GGUF (`tokenizer.chat_template`, arch `mistral4`). Its call
 format is `[TOOL_CALLS]name[ARGS]{…}` — function name outside the

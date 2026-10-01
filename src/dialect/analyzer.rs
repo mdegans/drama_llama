@@ -1223,8 +1223,19 @@ fn analyze_json_native_parallel_calls(probe: &Probe, syntax: &mut CallSyntax) {
             // Bytes before the second call's start marker are the
             // inter-call separator, when they're pure whitespace
             // (#58); anything else means the diff isn't a clean call
-            // boundary, so leave the separator empty.
+            // boundary, so leave the separator empty. The two calls
+            // share their arguments, so the diff may come back rotated
+            // — `</tool_call>\n<tool_call>\n{…second…}\n`, the first
+            // call's close leading the middle (cogito: the separator
+            // read as empty, so the grammar forced
+            // `</tool_call><tool_call>` against the template's
+            // `</tool_call>\n<tool_call>`). Look past that close.
             let lead = &cmp.diff.right[..pos];
+            let close = syntax.section_end.trim();
+            let lead = match close {
+                "" => lead,
+                close => lead.strip_prefix(close).unwrap_or(lead),
+            };
             if !lead.is_empty() && lead.chars().all(char::is_whitespace) {
                 syntax.call_separator = lead.to_string();
             }
