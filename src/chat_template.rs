@@ -1437,6 +1437,7 @@ fn append_message(
     // Consecutive thoughts concatenate with nothing between them, so
     // the joined string is what gets neutralized.
     let reasoning = surfaces.text(&reasoning, true);
+    let chunks = assistant_chunks(&blocks, surfaces);
 
     // One message carrying every call: the shape template
     // `tool_calls` loops iterate, so parallel calls re-render intact.
@@ -1464,7 +1465,7 @@ fn append_message(
         // them, so it is the counted form; the halves are what
         // causality-aware templates render around the calls.
         let content = content_pre.join(&content_post).render(surfaces, true);
-        out.push(tool_call_message(
+        let message = tool_call_message(
             role,
             content,
             (
@@ -1474,15 +1475,64 @@ fn append_message(
             tool_calls,
             &reasoning,
             reingest,
-        ));
+        );
+        out.push(minijinja::context! { chunks => chunks, ..message });
         return Ok(());
     }
-    out.push(assistant_text_message(
+    let message = assistant_text_message(
         role,
         content_pre.render(surfaces, true),
         &reasoning,
-    ));
+    );
+    out.push(minijinja::context! { chunks => chunks, ..message });
     Ok(())
+}
+
+/// An assistant message's blocks in emission order, as the `chunks`
+/// list templates may read in place of the merged fields: `{type:
+/// "text", text}` for a run of prose, `{type: "thinking", thinking}`
+/// for each thought, and one `{type: "tool_calls"}` where the first
+/// call sits (the calls themselves are the message's `tool_calls`).
+///
+/// The merged `content` and `reasoning` fields lose two things the
+/// model wrote, and a template that renders the turn from them cannot
+/// reproduce it: where each thought sat relative to the prose, and
+/// that two back-to-back thoughts were two (Mistral 4's
+/// `…[/THINK][THINK]…`, live 2026-10-01). Stock Mistral templates read
+/// exactly this shape (`content` as a list of text and thinking
+/// chunks), and the baked Mistral 4 and gpt-oss templates render from
+/// it. Neutralized uncounted: the merged fields carry the count.
+fn assistant_chunks(blocks: &[&Block], surfaces: &Surfaces<'_>) -> JinjaValue {
+    let media_sentinel = surfaces.media_sentinel;
+    let mut chunks: Vec<JinjaValue> = Vec::new();
+    let mut prose = Flat::default();
+    let mut seen_call = false;
+    let flush = |prose: &mut Flat, chunks: &mut Vec<JinjaValue>| {
+        if !prose.is_empty() {
+            let text = std::mem::take(prose).render(surfaces, false);
+            chunks.push(minijinja::context! { type => "text", text => text });
+        }
+    };
+    for block in blocks {
+        match block {
+            Block::Thought { thought, .. } => {
+                flush(&mut prose, &mut chunks);
+                chunks.push(minijinja::context! {
+                    type => "thinking",
+                    thinking => surfaces.text(thought, false),
+                });
+            }
+            Block::ToolUse { .. } => {
+                flush(&mut prose, &mut chunks);
+                if !std::mem::replace(&mut seen_call, true) {
+                    chunks.push(minijinja::context! { type => "tool_calls" });
+                }
+            }
+            other => append_block_text(&mut prose, other, media_sentinel),
+        }
+    }
+    flush(&mut prose, &mut chunks);
+    JinjaValue::from(chunks)
 }
 
 fn text_message(role: &str, content: String) -> JinjaValue {
@@ -2829,6 +2879,62 @@ mod tests {
         };
         let out = tmpl().render(&p, false).unwrap();
         assert!(out.contains("<think>I should be concise.</think>Hello!"));
+    }
+
+    /// An assistant message's `chunks` are its blocks in emission order:
+    /// each thought its own chunk (back-to-back ones included), prose
+    /// runs between them, and one `tool_calls` chunk where the first
+    /// call sat, whatever the reasoning re-ingest convention.
+    #[test]
+    fn assistant_chunks_keep_emission_order() {
+        use crate::prompt::ToolUse;
+        let src = "{% for m in messages %}{% for c in m.chunks or [] %}\
+                   {{ c.type }}:{{ c.text or c.thinking or '' }}|\
+                   {% endfor %}{% endfor %}"
+            .to_owned();
+        let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
+        let thought = |t: &'static str| Block::Thought {
+            thought: t.into(),
+            signature: "".into(),
+        };
+        let call = |id: &'static str| Block::ToolUse {
+            call: ToolUse::new("get_weather", serde_json::json!({}))
+                .with_id(id),
+        };
+        let p = Prompt {
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: Content::text("Hi"),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: Content(vec![
+                        thought("A."),
+                        thought("B."),
+                        "Checking.".into(),
+                        thought("C."),
+                        call("call1"),
+                        call("call2"),
+                        "Done.".into(),
+                    ]),
+                },
+            ],
+            ..Default::default()
+        };
+        for reingest in [
+            crate::dialect::ReasoningReingest::Field,
+            crate::dialect::ReasoningReingest::Thinking,
+            crate::dialect::ReasoningReingest::InlineThink,
+        ] {
+            let opts = RenderOptions::default().with_thought_reingest(reingest);
+            assert_eq!(
+                t.render_with(&p, &opts).unwrap(),
+                "thinking:A.|thinking:B.|text:Checking.|thinking:C.|\
+                 tool_calls:|text:Done.|",
+                "{reingest:?}"
+            );
+        }
     }
 
     #[test]

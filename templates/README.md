@@ -41,6 +41,12 @@ for ALL `tool_calls` (stock renders only the first, in the role-header
 re-ingest shape), pre-call prose renders as a causal commentary
 preamble, and tool responses render by forward-scan with
 `tool_call_id`-resolved names.
+A turn renders from the `chunks` drama_llama supplies on every
+assistant message — its blocks in emission order — so two analysis
+blocks render as two (they used to merge into one) and a thought after
+the preamble renders after it. Without `chunks` the turn is rebuilt
+from the merged fields as before.
+
 A final answer that is JSON — content starting `{` and ending `}`, or
 `[` … `]` — renders under `<|channel|>final <|constrain|>json<|message|>`.
 That content type is what gpt-oss writes for structured output,
@@ -112,15 +118,24 @@ is byte-identical:
    emits it unconditionally and has no `add_generation_prompt` branch
    at all, so it cannot render an open assistant turn and the
    generation-prompt render is never a byte prefix of the follow-up.
-2. Reasoning round-trips as `[THINK]…[/THINK]` from the
+2. Reasoning round-trips as `[THINK]…[/THINK]`, one block per thought,
+   from the
    `reasoning`/`reasoning_content` field, gated by `preserve_thinking`
    for aged turns. Stock accepts a thought only as a `thinking`-typed
    content chunk, so the analyzer measures `ReasoningMode::None`, the
    channel is invisible to grammar/parser/re-render, and a
    `ReasoningReingest::Field` transcript trips stock's own
    `raise_exception` (pinned: `mistral4_stock_cannot_render_field_reasoning`).
-3. Pre-call prose renders in emission order (`content_pre` before the
-   calls, `content_post` after) rather than merged into one slot.
+3. The turn renders in emission order from the `chunks` drama_llama
+   supplies on every assistant message — stock Mistral's own chunk
+   shape (`text` / `thinking`), plus a `tool_calls` marker where the
+   first call sat — rather than merging prose into one slot and
+   thoughts into one block. Back-to-back thoughts
+   (`…[/THINK][THINK]…`, live 2026-10-01: ~1.6k tokens lost when they
+   merged) keep their markers, and prose between thoughts stays where
+   the model wrote it. Without `chunks` (the analyzer's probes) the
+   turn renders from `reasoning` / `reasoning_content` and
+   `content_pre` / `content_post`.
 4. The 140-line Unsloth date-arithmetic preamble and the default Le
    Chat system message are removed. That block injected today's *and*
    yesterday's date into the prompt **prefix**, so a session spanning

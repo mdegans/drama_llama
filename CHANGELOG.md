@@ -232,6 +232,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sidecar** — it wins over the bake. Pinned in
   `gptoss_cache_stable_round_trips_json_final` and the Harmony
   `output_config` tests.
+- **Back-to-back thoughts stay two thoughts.** A model that closes a
+  thought and opens another (`…[/THINK][THINK]…`, live on Mistral Small
+  4, 2026-10-01, ~1.6k tokens lost) was parsed into two
+  `Block::Thought`s, which the session then merged into one, and the
+  template rendered one block — the markers between them were gone, the
+  turn no longer matched the KV, and its tip was lost. Adjacent thoughts
+  no longer merge in a response (Anthropic returns consecutive thinking
+  blocks too; clients now see each one), and every assistant message
+  reaches the template with **`chunks`**, its blocks in emission order
+  (`{type: "text", text}`, `{type: "thinking", thinking}`, one
+  `{type: "tool_calls"}` where the first call sat) — stock Mistral's
+  own content-chunk shape. The baked Mistral 4 and gpt-oss templates
+  render from it, so each `[THINK]` block and each analysis block
+  renders as its own, with prose where the model wrote it; without
+  `chunks` they render from the merged fields as before. Pinned in
+  `mistral4_cache_stable_round_trips_back_to_back_thoughts` and
+  `gptoss_cache_stable_round_trips_each_analysis_block`.
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like

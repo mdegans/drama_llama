@@ -8698,20 +8698,23 @@ impl Cut {
     }
 }
 
-/// Collapse runs of adjacent same-kind prose blocks. The parser can
-/// emit one [`Block::Text`] per resolved prose chunk and one
-/// [`Block::Thought`] per tagged chunk; batch callers want those
+/// Collapse runs of adjacent [`Block::Text`] blocks. The parser can
+/// emit one per resolved prose chunk; batch callers want those
 /// coalesced before the [`FromIterator<Block>`] collection path, so a
 /// lone `Text` output serializes to the string wire form.
 ///
-/// Tool-use and tool-result blocks are discrete units and pass through
-/// unchanged, as do any other non-prose variants.
+/// Thoughts never coalesce. The parser emits one [`Block::Thought`]
+/// per closed-and-reopened reasoning block, so two adjacent ones mean
+/// the model wrote the markers between them (`…</think>…<think>`,
+/// Mistral 4's `…[/THINK][THINK]…`), and merging would swallow those
+/// bytes: the turn would re-render one thought, no longer match the
+/// KV, and lose its tip (live, Mistral 4, 2026-10-01). Anthropic
+/// returns consecutive thinking blocks too. Tool-use and tool-result
+/// blocks are discrete units and pass through unchanged, as do any
+/// other non-prose variants.
 fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
     use crate::Block;
     use std::borrow::Cow;
-    fn is_open(signature: &str) -> bool {
-        signature == crate::prompt::OPEN_THOUGHT_SIGNATURE
-    }
     let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
     for block in blocks {
         match (out.last_mut(), block) {
@@ -8719,27 +8722,6 @@ fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
                 Some(Block::Text { text: prev, .. }),
                 Block::Text { text: new, .. },
             ) => {
-                *prev = Cow::Owned(format!("{prev}{new}"));
-            }
-            // Only same-openness runs coalesce. A closed thought
-            // followed by an open one means the model emitted
-            // `</think>…<think>` between them (`parse_thought` eats
-            // exactly one `\n` after the close), so merging would
-            // silently swallow those marker bytes and hand back a
-            // legal-looking sole *open* thought whose re-render no
-            // longer matches the KV — a silent cache miss, which is
-            // the one outcome the open-thought machinery exists to
-            // prevent. See [`crate::prompt::OPEN_THOUGHT_SIGNATURE`].
-            (
-                Some(Block::Thought {
-                    thought: prev,
-                    signature: prev_sig,
-                }),
-                Block::Thought {
-                    thought: new,
-                    signature: new_sig,
-                },
-            ) if is_open(prev_sig) == is_open(&new_sig) => {
                 *prev = Cow::Owned(format!("{prev}{new}"));
             }
             (_, block) => out.push(block),
@@ -10331,13 +10313,14 @@ mod tests {
         assert_eq!(sole.messages.len(), 1);
     }
 
-    /// Adjacent thoughts coalesce only when they agree on openness.
-    /// A closed→open pair means the model emitted `</think>…<think>`
-    /// between them; merging would swallow those marker bytes and hand
-    /// back a legal-looking sole open thought whose re-render no longer
-    /// matches the KV — a silent cache miss.
+    /// Adjacent thoughts never coalesce: two mean the model wrote the
+    /// close and open markers between them (`</think>…<think>`, Mistral
+    /// 4's `[/THINK][THINK]`), and merging would swallow those bytes —
+    /// a closed→open pair would even come back a legal-looking sole open
+    /// thought. Either way the re-render no longer matches the KV.
+    /// Adjacent text still does.
     #[test]
-    fn test_merge_adjacent_prose_respects_openness() {
+    fn test_merge_adjacent_prose_keeps_thoughts_apart() {
         use crate::prompt::open_thought;
 
         let closed = |s: &str| crate::Block::Thought {
@@ -10345,23 +10328,20 @@ mod tests {
             signature: "".into(),
         };
 
-        let merged = merge_adjacent_prose(vec![closed("one "), closed("two")]);
-        assert_eq!(merged.len(), 1, "{merged:#?}");
+        for pair in [
+            vec![closed("one "), closed("two")],
+            vec![closed("one"), open_thought("two")],
+        ] {
+            let merged = merge_adjacent_prose(pair.clone());
+            assert_eq!(merged, pair, "thoughts must NOT merge");
+        }
 
         let merged = merge_adjacent_prose(vec![
-            open_thought("one "),
-            open_thought("two"),
+            "one ".into(),
+            "two".into(),
+            closed("three"),
         ]);
-        assert_eq!(merged.len(), 1, "{merged:#?}");
-        assert!(crate::prompt::is_open_thought(&merged[0]));
-
-        let merged =
-            merge_adjacent_prose(vec![closed("one"), open_thought("two")]);
-        assert_eq!(
-            merged.len(),
-            2,
-            "mixed openness must NOT merge: {merged:#?}"
-        );
+        assert_eq!(merged, vec!["one two".into(), closed("three")]);
     }
 
     /// A trailing *open* thought is the opposite of an ended turn.
@@ -14579,6 +14559,19 @@ mod tests {
         emission_divergence(&extended, &prompt, emission)
     }
 
+    /// The one-argument tool the round-trip tests call.
+    fn weather_tool() -> crate::Tool {
+        crate::Tool::builder("get_weather")
+            .description("Get the weather for a city.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }))
+            .build()
+            .expect("valid tool")
+    }
+
     /// [`fleet_divergence`] for a Qwen template and one tool.
     fn qwen_divergence(
         source: &str,
@@ -14966,6 +14959,80 @@ mod tests {
             ),
             Some("<|channel|>final".len())
         );
+    }
+
+    /// Regression for the 2026-10-01 live tip drop (Mistral Small 4 on
+    /// Agora, ~1.6k tokens): the model closed a thought and opened
+    /// another straight away (`…[/THINK][THINK]I need to…`). The parser
+    /// read two thoughts, the session merged them into one, and the
+    /// template rendered one `[THINK]` block, so the turn parted from
+    /// the KV at the dropped `[/THINK][THINK]`. Thoughts now stay apart
+    /// and the bake renders each, and every block where it sat, from
+    /// the message's `chunks`.
+    #[test]
+    fn mistral4_cache_stable_round_trips_back_to_back_thoughts() {
+        let tool = weather_tool();
+        let tokens = ("<s>", "</s>");
+        let call = r#"[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}"#;
+        let served = crate::baked::detect(crate::baked::MISTRAL4.stock)
+            .expect("stock dump detects")
+            .replacement;
+        for emission in [
+            // The live shape.
+            "[THINK]Plan.[/THINK][THINK]I need to say more.[/THINK]Ada.".into(),
+            format!("[THINK]Plan.[/THINK][THINK]Then call.[/THINK]{call}"),
+            // Prose between two thoughts, and before the call.
+            format!("[THINK]Plan.[/THINK]Checking.[THINK]Hm.[/THINK]{call}"),
+            format!(
+                "[THINK]A.[/THINK][THINK]B.[/THINK][THINK]C.[/THINK]{call}"
+            ),
+            // The habitual shapes stay stable.
+            "[THINK]Plan.[/THINK]Ada.".into(),
+            format!("[THINK]Plan.[/THINK]Checking.{call}"),
+            format!("{call}{call}"),
+        ] {
+            assert_eq!(
+                fleet_divergence(served, tokens, &[&tool], true, &emission),
+                None,
+                "{emission:?}"
+            );
+        }
+    }
+
+    /// Harmony's form of the same: gpt-oss may write two analysis
+    /// blocks in one turn, or reason again after its preamble. The bake
+    /// renders each block it was given, in order, from `chunks`.
+    #[test]
+    fn gptoss_cache_stable_round_trips_each_analysis_block() {
+        let tool = weather_tool();
+        let tokens = ("<|startoftext|>", "<|return|>");
+        let analysis = |t: &str| {
+            format!(
+                "<|channel|>analysis<|message|>{t}<|end|><|start|>assistant"
+            )
+        };
+        let call = "<|channel|>commentary to=functions.get_weather \
+                    <|constrain|>json<|message|>{\"city\":\"Paris\"}";
+        let preamble = "<|channel|>commentary<|message|>Checking.<|end|>\
+                        <|start|>assistant";
+        let served = crate::baked::GPTOSS.replacement;
+        for emission in [
+            format!(
+                "{}{}<|channel|>final<|message|>Ada.",
+                analysis("A."),
+                analysis("B.")
+            ),
+            format!("{}{}{call}", analysis("A."), analysis("B.")),
+            format!("{}{preamble}{}{call}", analysis("A."), analysis("B.")),
+            format!("{}{preamble}{call}", analysis("A.")),
+            format!("{}<|channel|>final<|message|>Ada.", analysis("A.")),
+        ] {
+            assert_eq!(
+                fleet_divergence(served, tokens, &[&tool], true, &emission),
+                None,
+                "{emission:?}"
+            );
+        }
     }
 
     /// An assistant turn aged out with `preserve_thinking` off drops its
