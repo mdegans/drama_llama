@@ -28,6 +28,9 @@
 //!   the matcher's stacks at one position, which it caps at 4096 by
 //!   refusing the excess ([`SchemaLimits::max_width`] says how it is
 //!   counted). A request inside the limit never reaches that cap.
+//! * **depth**: how many levels of objects and arrays a value the
+//!   schema's grammar writes nests, through `$ref`s — what the parsers
+//!   must read back ([`SchemaLimits::max_depth`]).
 //!
 //! The defaults ([`SchemaLimits::default`]) leave real schemas far
 //! inside every limit: see each field for what was measured.
@@ -58,7 +61,7 @@ use crate::Tool;
 /// 600-member time-zone `enum` behind a `$ref` four parameters name,
 /// beside a 249-member country `enum`): the synthetic tool is 3× inside
 /// [`Self::max_width`] and 21× inside the rest, Agora's request at least
-/// 29× inside every limit. Each field says what the largest measured.
+/// 21× inside every limit. Each field says what the largest measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SchemaLimits {
@@ -115,6 +118,26 @@ pub struct SchemaLimits {
     /// dialect's own framing. Agora's widest schema counts 70, the
     /// synthetic tool 613.
     pub max_width: usize,
+    /// How many levels of objects and arrays a value the schema's
+    /// grammar writes may nest — through `$ref`s, each reference at its
+    /// target's depth (one back into its own cycle at none: recursion
+    /// goes as deep as the model takes it, see below). Counted from the
+    /// shape: an object or array is one level more than its deepest
+    /// property or `items`, an `anyOf`/`oneOf` variant or `allOf` part
+    /// the same level as its schema, an `enum` member or `const` its own
+    /// depth as JSON. An untyped value counts nothing here: the grammar
+    /// nests it at most 32 levels on its own.
+    ///
+    /// Default 64. With the 32 an untyped value may add and the two the
+    /// dialects' call envelopes do, a value stays under the 127 levels
+    /// serde_json reads (its recursion limit, which every dialect parser
+    /// shares) — a deeper `required` chain, which a `$ref` per level
+    /// spells in a shallow request, compiled to a grammar whose every
+    /// value no parser could read: each draw failed, and the request
+    /// ended in resampling and a 500. Raised past 93, a value can nest
+    /// past what the parsers read. The deepest schema measured is 3
+    /// levels (Agora's, and 40 real MCP and Claude Code tools).
+    pub max_depth: usize,
 }
 
 impl Default for SchemaLimits {
@@ -127,6 +150,7 @@ impl Default for SchemaLimits {
             max_member_bytes: 16 << 10,
             max_total_member_bytes: 1 << 20,
             max_width: 2048,
+            max_depth: 64,
         }
     }
 }
@@ -143,6 +167,7 @@ impl SchemaLimits {
             max_member_bytes: usize::MAX,
             max_total_member_bytes: usize::MAX,
             max_width: usize::MAX,
+            max_depth: usize::MAX,
         }
     }
 
@@ -187,6 +212,12 @@ impl SchemaLimits {
         self.max_width = n;
         self
     }
+
+    /// Set [`Self::max_depth`].
+    pub fn with_max_depth(mut self, n: usize) -> Self {
+        self.max_depth = n;
+        self
+    }
 }
 
 /// Which of the [`SchemaLimits`] a request is past.
@@ -207,6 +238,8 @@ pub enum SchemaLimit {
     TotalMemberBytes,
     /// [`SchemaLimits::max_width`].
     Width,
+    /// [`SchemaLimits::max_depth`].
+    Depth,
 }
 
 impl SchemaLimit {
@@ -228,6 +261,10 @@ impl SchemaLimit {
             Self::Width => {
                 "ways to continue at once (`enum` members, properties and \
                  `anyOf`/`oneOf` variants, nested variants multiplying)"
+            }
+            Self::Depth => {
+                "levels of objects and arrays nested in a value, each \
+                 `$ref` at its target's depth"
             }
         }
     }
@@ -375,6 +412,15 @@ pub fn check_schemas<'a>(
                 SchemaLimit::Width,
                 width,
                 limits.max_width,
+            ));
+        }
+        let depth = units.depth(&measured);
+        if depth > limits.max_depth {
+            return Err(over(
+                location.clone(),
+                SchemaLimit::Depth,
+                depth,
+                limits.max_depth,
             ));
         }
     }
@@ -558,11 +604,10 @@ impl<'s> Units<'s> {
         widths[0].expect("the order ends at the root")
     }
 
-    /// One unit's width, given those of the units done before it: an
-    /// iterative post-order over the unit's subschemas.
-    fn unit_width(&self, unit: usize, widths: &[Option<usize>]) -> usize {
-        // Pre-order, so children follow their parent: `(schema, parent,
-        // how the parent combines it)`.
+    /// One unit's subschemas in pre-order, so children follow their
+    /// parent: `(schema, parent, how the parent combines it)`, the root's
+    /// parent `usize::MAX`.
+    fn subschemas(&self, unit: usize) -> Vec<(&'s Value, usize, Part)> {
         let root = self.units[unit].1;
         let mut nodes: Vec<(&Value, usize, Part)> =
             vec![(root, usize::MAX, Part::Other)];
@@ -601,6 +646,13 @@ impl<'s> Units<'s> {
             }
             i += 1;
         }
+        nodes
+    }
+
+    /// One unit's width, given those of the units done before it: an
+    /// iterative post-order over the unit's subschemas.
+    fn unit_width(&self, unit: usize, widths: &[Option<usize>]) -> usize {
+        let nodes = self.subschemas(unit);
         let mut parts = vec![Parts::default(); nodes.len()];
         let mut width = 0;
         for i in (0..nodes.len()).rev() {
@@ -613,6 +665,42 @@ impl<'s> Units<'s> {
             }
         }
         width
+    }
+
+    /// The root's depth ([`SchemaLimits::max_depth`]), as
+    /// [`Self::width`] its width: each unit's in `measured`'s order, so a
+    /// `$ref` reads its target's — or, back into a cycle still open,
+    /// counts nothing.
+    fn depth(&self, measured: &Measured) -> usize {
+        let mut depths: Vec<Option<usize>> = vec![None; self.units.len()];
+        for &unit in &measured.order {
+            depths[unit] = Some(self.unit_depth(unit, &depths));
+        }
+        depths[0].expect("the order ends at the root")
+    }
+
+    /// One unit's depth, given those of the units done before it: an
+    /// iterative post-order over the unit's subschemas.
+    fn unit_depth(&self, unit: usize, depths: &[Option<usize>]) -> usize {
+        let nodes = self.subschemas(unit);
+        // Per subschema, the deepest of its children a level down (a
+        // property, `items`) and of those at its own level.
+        let mut below: Vec<Option<usize>> = vec![None; nodes.len()];
+        let mut level = vec![0usize; nodes.len()];
+        let mut depth = 0;
+        for i in (0..nodes.len()).rev() {
+            let (node, parent, part) = nodes[i];
+            let target = self.target(node).map(|t| depths[t].unwrap_or(0));
+            let d = own_depth(node, below[i], level[i], target);
+            if parent == usize::MAX {
+                depth = d;
+            } else if matches!(part, Part::Property | Part::Items) {
+                below[parent] = Some(below[parent].unwrap_or(0).max(d));
+            } else {
+                level[parent] = level[parent].max(d);
+            }
+        }
+        depth
     }
 }
 
@@ -776,6 +864,64 @@ fn own_width(node: &Value, parts: &Parts, target: Option<usize>) -> usize {
     let typed = readings.iter().flatten().copied().max();
     // Untyped: any value, unless something above says otherwise.
     typed.unwrap_or(W_ANY).max(parts.other)
+}
+
+/// A schema's depth ([`SchemaLimits::max_depth`]) from its children's:
+/// the deepest a level `below` it (`None`: no such child), the deepest
+/// at its own `level`, and its `$ref`'s `target`'s.
+fn own_depth(
+    node: &Value,
+    below: Option<usize>,
+    level: usize,
+    target: Option<usize>,
+) -> usize {
+    let Value::Object(map) = node else {
+        return 0;
+    };
+    let typed_container = match map.get("type") {
+        Some(Value::String(t)) => t == "object" || t == "array",
+        Some(Value::Array(ts)) => {
+            ts.iter().any(|t| t == "object" || t == "array")
+        }
+        _ => false,
+    };
+    let container = below.is_some()
+        || typed_container
+        || map.contains_key("properties")
+        || map.contains_key("items");
+    let literals = map
+        .get("enum")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(map.get("const"))
+        .map(json_depth)
+        .max()
+        .unwrap_or(0);
+    let own = match container {
+        true => below.unwrap_or(0).saturating_add(1),
+        false => 0,
+    };
+    [target.unwrap_or(0), level, literals, own]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+}
+
+/// Levels of arrays and objects in `value` (a scalar is 0).
+fn json_depth(value: &Value) -> usize {
+    let mut deepest = 0;
+    let mut stack = vec![(value, 0usize)];
+    while let Some((v, depth)) = stack.pop() {
+        let children: Box<dyn Iterator<Item = &Value>> = match v {
+            Value::Array(items) => Box::new(items.iter()),
+            Value::Object(map) => Box::new(map.values()),
+            _ => continue,
+        };
+        deepest = deepest.max(depth + 1);
+        stack.extend(children.map(|c| (c, depth + 1)));
+    }
+    deepest
 }
 
 /// `value`'s length as compact JSON, as `serde_json` writes it, without
@@ -993,6 +1139,100 @@ mod tests {
         assert_eq!(width(&schema), usize::MAX);
     }
 
+    fn depth(schema: &Value) -> usize {
+        let units = Units::new(schema);
+        units.depth(&units.measure(usize::MAX).expect("no member limit"))
+    }
+
+    /// The depth of each shape, as [`SchemaLimits::max_depth`] counts it.
+    #[test]
+    fn depth_counts_nested_containers() {
+        assert_eq!(depth(&json!({})), 0);
+        assert_eq!(depth(&json!(true)), 0);
+        assert_eq!(depth(&json!({"type": "integer"})), 0);
+        // An object or array is a level, with or without its insides.
+        assert_eq!(depth(&json!({"type": "object"})), 1);
+        assert_eq!(depth(&json!({"type": ["array", "null"]})), 1);
+        let object = json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {
+                "type": "array",
+                "items": {"type": "object", "properties": {}},
+            }},
+        });
+        assert_eq!(depth(&object), 3);
+        // Variants are at their schema's level.
+        let any = json!({"anyOf": [object, {"type": "string"}]});
+        assert_eq!(depth(&any), 3);
+        // Literals are as deep as their JSON.
+        assert_eq!(depth(&json!({"enum": [1, [[2]], {"k": [3]}]})), 2);
+        assert_eq!(depth(&json!({"const": [[[0]]]})), 3);
+        // Data never counts.
+        assert_eq!(depth(&json!({"default": [[[[0]]]]})), 0);
+    }
+
+    /// A `$ref` is its target's depth; one back into its cycle counts
+    /// nothing, so a tree is finite.
+    #[test]
+    fn depth_follows_refs_and_cuts_cycles() {
+        let tree = json!({
+            "$ref": "#/$defs/Node",
+            "$defs": {"Node": {
+                "type": "object",
+                "properties": {
+                    "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}},
+                },
+            }},
+        });
+        assert_eq!(depth(&tree), 2);
+        let chain = required_chain(10);
+        assert_eq!(depth(&chain), 11);
+    }
+
+    /// `{"root": D0}`, each `D<i>` an object requiring its one property,
+    /// a `$ref` to the next, `D<n>` an integer: a value `n + 1` levels
+    /// deep, spelled in a request a few levels deep.
+    fn required_chain(n: usize) -> Value {
+        let mut defs: Map<String, Value> = (0..n)
+            .map(|i| {
+                let next = format!("#/$defs/D{}", i + 1);
+                (
+                    format!("D{i}"),
+                    json!({
+                        "type": "object",
+                        "properties": {"a": {"$ref": next}},
+                        "required": ["a"],
+                    }),
+                )
+            })
+            .collect();
+        defs.insert(format!("D{n}"), json!({"type": "integer"}));
+        json!({
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/D0"}},
+            "required": ["root"],
+            "$defs": defs,
+        })
+    }
+
+    /// A `required` chain deeper than any parser reads back — 127 levels
+    /// past serde_json's limit — is a 400, not a grammar whose every
+    /// value fails to parse. Inside the default it passes.
+    #[test]
+    fn depth_past_the_limit_is_refused() {
+        let limits = SchemaLimits::default();
+        assert_eq!(check(required_chain(63), &limits), Ok(()));
+        for n in [64, 126, 127, 300] {
+            let err =
+                check_schemas([&tool("t", required_chain(n))], None, &limits)
+                    .unwrap_err();
+            assert_eq!(
+                (err.limit, err.actual, err.max),
+                (SchemaLimit::Depth, n + 1, 64),
+            );
+        }
+    }
+
     #[test]
     fn ref_counts_at_target_size_per_reference() {
         let schema = json!({
@@ -1072,7 +1312,8 @@ mod tests {
             .with_max_defs(2)
             .with_max_member_bytes(8)
             .with_max_total_member_bytes(20)
-            .with_max_width(30);
+            .with_max_width(30)
+            .with_max_depth(3);
         let ok =
             json!({"type": "object", "properties": {"a": {"enum": ["x"]}}});
         assert_eq!(check(ok.clone(), &limits), Ok(()));
@@ -1124,6 +1365,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.limit, SchemaLimit::Width);
         assert_eq!(err.location, "output_config.format.schema");
+
+        let deep = json!({"type": "array", "items": {"type": "array", "items": {
+            "type": "array", "items": {"type": "array"},
+        }}});
+        assert_eq!(check(deep, &limits), Err(SchemaLimit::Depth));
     }
 
     /// A prompt is measured on its custom tools and its structured

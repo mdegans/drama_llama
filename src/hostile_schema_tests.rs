@@ -1301,3 +1301,187 @@ fn footprint_guard_pipelines() {
         check_schemas([&hostile], None, &limits).unwrap_err()
     });
 }
+
+/// A call to `t` whose untyped parameter `p` is the text `value`,
+/// spliced into `render_reference`'s bytes — a value too deep to build
+/// as a [`Value`] (serializing one recurses) still reaches the parser.
+fn call_with_raw_param(syntax: &CallSyntax, value: &str) -> String {
+    let call = crate::dialect::render_reference(
+        syntax,
+        &[("t", &json!({"p": 12345}))],
+    )
+    .unwrap();
+    call.replacen("12345", value, 1)
+}
+
+/// `levels` containers around `1`: arrays, or objects keyed `k` in
+/// `syntax`'s spelling (bare keys in the dict encoding).
+fn nested_text(syntax: &CallSyntax, levels: usize, objects: bool) -> String {
+    let (open, close) = match (objects, syntax.family) {
+        (false, _) => ("[", "]"),
+        (true, crate::dialect::Family::TagWithDict) => ("{k:", "}"),
+        (true, _) => (r#"{"k":"#, "}"),
+    };
+    format!("{}1{}", open.repeat(levels), close.repeat(levels))
+}
+
+/// Brackets nested far past what any reader takes, in an untyped
+/// parameter: every dialect's batch, streamed and clipped parses, on a
+/// tokio worker's 2 MiB stack, refuse it rather than recurse. The Gemma
+/// 4 dict reader overflowed at about 2,500 levels — inside what its
+/// grammar then admitted — and the readers of a call cut short at about
+/// 3,800; an overflow aborts the process, every request on the server
+/// with it. Nesting the grammar admits still reads back exactly.
+#[test]
+fn deep_nesting_never_overflows_a_parser() {
+    use crate::dialect::StreamParser;
+    use crate::grammar_compile::UNTYPED_DEPTH;
+    let syntaxes = [
+        CallSyntax::qwen_xml(),
+        CallSyntax::hermes_json(),
+        CallSyntax::llama31_json(),
+        CallSyntax::gemma4(),
+        CallSyntax::gpt_oss(),
+    ];
+    let t = tool(json!({
+        "type": "object",
+        "properties": {"p": {}},
+        "required": ["p"],
+    }));
+    for syntax in syntaxes {
+        for objects in [false, true] {
+            // Exactly what the grammar admits, and no deeper: read back
+            // whole.
+            let grammar = Arc::new(
+                Grammar::parse(
+                    &grammar_source(&syntax, &[&t], &lazy()).unwrap(),
+                )
+                .unwrap(),
+            );
+            let admits = |levels| {
+                let value = nested_text(&syntax, levels, objects);
+                let text = call_with_raw_param(&syntax, &value);
+                // Gemma's grammar goes on past the call (its turn exit),
+                // so admitted is all a call can be.
+                let mut state = GrammarState::new(grammar.clone());
+                state.advance_bytes(text.as_bytes()).is_ok()
+            };
+            assert!(admits(UNTYPED_DEPTH), "{:?}", syntax.family);
+            assert!(!admits(UNTYPED_DEPTH + 1), "{:?}", syntax.family);
+            let text = call_with_raw_param(
+                &syntax,
+                &nested_text(&syntax, UNTYPED_DEPTH, objects),
+            );
+            let mut expected = json!(1);
+            for _ in 0..UNTYPED_DEPTH {
+                expected = match objects {
+                    false => json!([expected]),
+                    true => json!({"k": expected}),
+                };
+            }
+            assert_eq!(
+                first_input(&syntax, &t, &text),
+                json!({"p": expected}),
+                "{:?}",
+                syntax.family
+            );
+
+            let deep = call_with_raw_param(
+                &syntax,
+                &nested_text(&syntax, 5_000, objects),
+            );
+            let (syntax, t) = (syntax.clone(), t.clone());
+            on_small_stack(2048, move || {
+                for leniency in [Leniency::Final, Leniency::Clipped] {
+                    for text in [&deep[..], &deep[..deep.len() / 2]] {
+                        parse_text(&syntax, &[&t], text, false, leniency);
+                    }
+                }
+                let mut stream =
+                    StreamParser::new(syntax.clone(), vec![t.clone()], false);
+                let half = deep.len() / 2;
+                for chunk in deep.as_bytes()[..half].chunks(1024) {
+                    stream.push(std::str::from_utf8(chunk).unwrap());
+                }
+                stream.clone().finish_clipped();
+                stream.push(&deep[half..]);
+                stream.finish();
+            });
+        }
+    }
+}
+
+/// The depth bounds add up: a schema at
+/// [`SchemaLimits::max_depth`](crate::SchemaLimits::max_depth), an
+/// untyped value at its deepest point nested as deep as the grammar
+/// lets it ([`UNTYPED_DEPTH`](crate::grammar_compile::UNTYPED_DEPTH)),
+/// and the call envelope around it (two levels at most: an array of
+/// `{"name", "arguments"}` objects) stay inside what every parser reads
+/// ([`MAX_NESTING`](crate::grammar_compile::MAX_NESTING), serde_json's
+/// own limit) — so whatever the grammar of a schema inside the limits
+/// admits, every dialect reads back.
+#[test]
+fn depth_budget_fits_the_parsers() {
+    use crate::grammar_compile::{MAX_NESTING, UNTYPED_DEPTH};
+    const ENVELOPE: usize = 2;
+    let max_depth = SchemaLimits::default().max_depth;
+    assert!(max_depth + UNTYPED_DEPTH + ENVELOPE <= MAX_NESTING);
+    // serde_json's limit is MAX_NESTING, as the parsers assume.
+    let nested = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+    assert!(serde_json::from_str::<Value>(&nested(MAX_NESTING)).is_ok());
+    assert!(serde_json::from_str::<Value>(&nested(MAX_NESTING + 1)).is_err());
+
+    // `{"root": D0}`, `D0`…`D62` objects each requiring the next, `D63`
+    // untyped: 64 levels of schema.
+    let n = max_depth - 1;
+    let mut defs: Map<String, Value> = (0..n)
+        .map(|i| {
+            let next = format!("#/$defs/D{}", i + 1);
+            let def = json!({
+                "type": "object",
+                "properties": {"a": {"$ref": next}},
+                "required": ["a"],
+            });
+            (format!("D{i}"), def)
+        })
+        .collect();
+    defs.insert(format!("D{n}"), json!({}));
+    let schema = json!({
+        "type": "object",
+        "properties": {"root": {"$ref": "#/$defs/D0"}},
+        "required": ["root"],
+        "$defs": defs,
+    });
+    let t = tool(schema.clone());
+    check_schemas([&t], None, &SchemaLimits::default()).expect("at the limit");
+    let mut deepest = json!(1);
+    for _ in 0..UNTYPED_DEPTH {
+        deepest = json!([deepest]);
+    }
+    for _ in 0..n {
+        deepest = json!({"a": deepest});
+    }
+    let value = json!({"root": deepest});
+    let wrapped = json!([{"name": "t", "arguments": value}]).to_string();
+    assert!(serde_json::from_str::<Value>(&wrapped).is_ok());
+
+    for syntax in [
+        CallSyntax::qwen_xml(),
+        CallSyntax::hermes_json(),
+        CallSyntax::llama31_json(),
+        CallSyntax::gemma4(),
+        CallSyntax::gpt_oss(),
+    ] {
+        let family = syntax.family;
+        let src = grammar_source(&syntax, &[&t], &lazy()).unwrap();
+        let mut state =
+            GrammarState::new(Arc::new(Grammar::parse(&src).unwrap()));
+        let text = crate::dialect::render_reference(&syntax, &[("t", &value)])
+            .unwrap();
+        state.advance_bytes(text.as_bytes()).expect("admitted");
+        assert_eq!(first_input(&syntax, &t, &text), value, "{family:?}");
+    }
+    let text = value.to_string();
+    assert!(accepts(&compile(&schema), &text));
+    assert_eq!(crate::schema_check::check_text(&schema, &text), Ok(()));
+}

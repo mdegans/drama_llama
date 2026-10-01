@@ -45,6 +45,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::chat_template::is_tool_name;
+use crate::grammar_compile::MAX_NESTING;
 use crate::prompt::{Block, ToolUse};
 use crate::Tool;
 
@@ -1825,7 +1826,7 @@ impl<'a> Parser<'a> {
         // Leave the opening brace for the value reader.
         self.pos += name_end;
 
-        match self.parse_dict_value() {
+        match self.parse_dict_value(0) {
             DictOutcome::Value(input) => {
                 self.push_call(name, input);
                 CallOutcome::Parsed
@@ -1836,8 +1837,11 @@ impl<'a> Parser<'a> {
     }
 
     /// Read one dict-encoded value at `pos` (whitespace-lenient like
-    /// upstream's PEG; canonical output is compact).
-    fn parse_dict_value(&mut self) -> DictOutcome {
+    /// upstream's PEG; canonical output is compact), inside `depth`
+    /// containers. A container past [`MAX_NESTING`] is malformed — as
+    /// serde_json refuses one in the JSON dialects — rather than a
+    /// recursion as deep as the model's brackets.
+    fn parse_dict_value(&mut self, depth: usize) -> DictOutcome {
         self.skip_ws();
         let quote = self.syntax.arguments.string_quote.clone();
         let rest = self.rest();
@@ -1859,13 +1863,15 @@ impl<'a> Parser<'a> {
             return DictOutcome::Value(Value::String(s));
         }
         match rest.as_bytes()[0] {
-            b'{' => self.parse_dict_object(),
-            b'[' => self.parse_dict_array(),
+            b'{' | b'[' if depth >= MAX_NESTING => DictOutcome::Malformed,
+            b'{' => self.parse_dict_object(depth + 1),
+            b'[' => self.parse_dict_array(depth + 1),
             _ => self.parse_dict_scalar(),
         }
     }
 
-    fn parse_dict_object(&mut self) -> DictOutcome {
+    /// The object at `pos`, itself the `depth`th container.
+    fn parse_dict_object(&mut self, depth: usize) -> DictOutcome {
         // Consume first, assert second — see `parse_thought` (#62).
         let ate = self.eat("{");
         debug_assert!(ate, "parse_dict_object: `{{` not at self.pos");
@@ -1890,7 +1896,7 @@ impl<'a> Parser<'a> {
                 return DictOutcome::Malformed;
             }
             self.pos += colon + 1;
-            let value = match self.parse_dict_value() {
+            let value = match self.parse_dict_value(depth) {
                 DictOutcome::Value(v) => v,
                 other => return other,
             };
@@ -1910,7 +1916,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_dict_array(&mut self) -> DictOutcome {
+    /// The array at `pos`, itself the `depth`th container.
+    fn parse_dict_array(&mut self, depth: usize) -> DictOutcome {
         // Consume first, assert second — see `parse_thought` (#62).
         let ate = self.eat("[");
         debug_assert!(ate, "parse_dict_array: `[` not at self.pos");
@@ -1923,7 +1930,7 @@ impl<'a> Parser<'a> {
             if self.rest().is_empty() {
                 return DictOutcome::Incomplete;
             }
-            let value = match self.parse_dict_value() {
+            let value = match self.parse_dict_value(depth) {
                 DictOutcome::Value(v) => v,
                 other => return other,
             };

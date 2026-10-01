@@ -250,6 +250,13 @@ struct SchemaLimitArgs {
     /// multiplying); see `SchemaLimits::max_width`.
     #[arg(long, default_value_t = SchemaLimits::default().max_width)]
     schema_max_width: usize,
+    /// Levels of objects and arrays a value one schema's grammar writes
+    /// may nest, each `$ref` at its target's depth; see
+    /// `SchemaLimits::max_depth`. Past 93, a value (an untyped one adds
+    /// up to 32 levels, a call envelope two) can nest deeper than the 127
+    /// levels the parsers read.
+    #[arg(long, default_value_t = SchemaLimits::default().max_depth)]
+    schema_max_depth: usize,
 }
 
 impl SchemaLimitArgs {
@@ -262,6 +269,7 @@ impl SchemaLimitArgs {
             .with_max_member_bytes(self.schema_max_member_bytes)
             .with_max_total_member_bytes(self.schema_max_total_member_bytes)
             .with_max_width(self.schema_max_width)
+            .with_max_depth(self.schema_max_depth)
     }
 }
 
@@ -1757,6 +1765,9 @@ mod tests {
         let args =
             Args::parse_from(["blallama", "models", "--schema-max-width", "9"]);
         assert_eq!(args.schema_limits.limits().max_width, 9);
+        let args =
+            Args::parse_from(["blallama", "models", "--schema-max-depth", "8"]);
+        assert_eq!(args.schema_limits.limits().max_depth, 8);
     }
 
     /// The ingest guard is a bug detector now: a shortfall is a 500

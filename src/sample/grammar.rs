@@ -2718,8 +2718,13 @@ mod tests {
                 br#"{"c":"#.repeat(STREAM / 5),
             ),
             (
+                // Through a recursive `$ref`: an untyped value stops at
+                // `UNTYPED_DEPTH`, recursion goes as deep as the input.
                 "nested brackets",
-                compile(&json!({"type": "array", "items": {}})),
+                compile(&json!({
+                    "$ref": "#/$defs/A",
+                    "$defs": {"A": {"type": "array", "items": {"$ref": "#/$defs/A"}}},
+                })),
                 b"[".repeat(STREAM),
             ),
             (

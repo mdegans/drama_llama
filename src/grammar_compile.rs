@@ -1112,21 +1112,41 @@ pub(crate) fn dict_encode_value(v: &Value, quote: &str, out: &mut String) {
 /// `dobject`, `darray`, `dstring`, `dnull`. References `number` from
 /// [`JSON_GRAMMAR`], which callers append separately. Emit at most
 /// once per grammar.
+///
+/// Like [`JSON_GRAMMAR`]'s `value`, `dvalue` nests at most
+/// [`UNTYPED_DEPTH`] levels: a set of rules per level (`dvalue_1` …),
+/// the last level's values scalars only.
 pub(crate) fn emit_dict_value_rules(quote: &str, out: &mut String) {
+    // Level `k`'s rule names end in this; the top level's in nothing.
+    let level = |k: usize| match k {
+        0 => String::new(),
+        k => format!("_{k}"),
+    };
+    for k in 0..UNTYPED_DEPTH {
+        let (this, next) = (level(k), level(k + 1));
+        let _ = writeln!(
+            out,
+            r#"dvalue{this} ::= dstring | dobject{this} | darray{this} | number | "true" | "false" | dnull"#
+        );
+        let _ = writeln!(
+            out,
+            r#"dobject{this} ::= "{{" ( dmember{this} ( "," dmember{this} )* )? "}}""#
+        );
+        let _ = writeln!(out, r#"dmember{this} ::= dkey ":" dvalue{next}"#);
+        let _ = writeln!(
+            out,
+            r#"darray{this} ::= "[" ( dvalue{next} ( "," dvalue{next} )* )? "]""#
+        );
+    }
     let _ = writeln!(
         out,
-        r#"dvalue ::= dstring | dobject | darray | number | "true" | "false" | dnull"#
+        r#"dvalue{} ::= dstring | number | "true" | "false" | dnull"#,
+        level(UNTYPED_DEPTH)
     );
     let _ = writeln!(out, r#"dnull ::= "null" | "none" | "None""#);
-    let _ = writeln!(
-        out,
-        r#"dobject ::= "{{" ( dmember ( "," dmember )* )? "}}""#
-    );
-    let _ = writeln!(out, r#"dmember ::= dkey ":" dvalue"#);
     // Bare keys: anything but the key/dict terminators (upstream
     // parity: `chars("[^:}]", 1, -1)`).
     let _ = writeln!(out, r#"dkey ::= [^:}}]+"#);
-    let _ = writeln!(out, r#"darray ::= "[" ( dvalue ( "," dvalue )* )? "]""#);
     let quote_lit = escape_for_gbnf_string(quote);
     // The until-rule consumes string content AND the closing quote.
     let _ = writeln!(out, r#"dstring ::= "{quote_lit}" dstring__body"#);
@@ -1303,23 +1323,58 @@ pub(crate) fn escape_for_gbnf_string(s: &str) -> String {
     out
 }
 
-/// Shared JSON value grammar appended to every schema-derived GBNF.
+/// How many levels of objects and arrays an *untyped* value may nest:
+/// one whose schema says nothing of its shape (`{}`, an unknown
+/// `type`, `{"type": "object"}` without properties), which every
+/// grammar writes with [`JSON_GRAMMAR`]'s `value` (or the dict
+/// encoding's `dvalue`). Past it, an untyped value takes only scalars.
 ///
-/// Handles object / array / string / number / literal, with permissive
-/// intra-structure whitespace. Not strict about number formatting edge
-/// cases (e.g. `01` is rejected as JSON would); good enough for
-/// downstream deserializers to validate.
-/// Standard JSON grammar appended to every schema-derived GBNF.
-///
-/// Exposed as `#[doc(hidden)] pub` for the fuzzer (paired with
-/// [`schema_to_gbnf`]). Not part of the stable surface.
-#[doc(hidden)]
-pub const JSON_GRAMMAR: &str = r#"
+/// Unbounded, a degenerate bracket loop in an untyped parameter was
+/// grammar-legal thousands of levels deep, past what any parser reads:
+/// serde_json refuses nesting past [`MAX_NESTING`], and the recursive
+/// readers overflowed the stack and aborted the process. With this bound
+/// and [`SchemaLimits::max_depth`](crate::SchemaLimits::max_depth) on the
+/// schema around it, no value the grammar of a schema inside the default
+/// limits admits nests past [`MAX_NESTING`], wrapper levels included
+/// (`depth_budget_fits_the_parsers`). Recursion through `$ref`s is the
+/// exception: it nests as deep as the model takes it, and a value past
+/// [`MAX_NESTING`] is refused by the parsers, never read.
+pub(crate) const UNTYPED_DEPTH: usize = 32;
+
+/// The most levels of objects and arrays a parsed value may nest:
+/// serde_json's own limit (it refuses the 128th), which the dialect
+/// parsers that read values themselves (the dict encoding, a call's
+/// input read up to a cut) share, so that every reader refuses the
+/// same values — and none recurses deeper than this on model output.
+pub(crate) const MAX_NESTING: usize = 127;
+
+/// [`JSON_GRAMMAR`]: the generic value rules unrolled one set per level
+/// (`value_1` … `value_N`), each level's containers holding the next
+/// level's values and the last level scalars only — GBNF has no depth
+/// counter, so the bound ([`UNTYPED_DEPTH`]) is the rule names.
+macro_rules! json_grammar {
+    (last $last:literal; $($level:literal => $next:literal),* $(,)?) => {
+        concat!(
+            r#"
 value ::= object | array | string | number | "true" | "false" | "null"
 object ::= "{" pad ( member ( elem_sep member )* )? pad "}"
-member ::= string kv_sep value
-array ::= "[" pad ( value ( elem_sep value )* )? pad "]"
-string ::= "\"" char* "\""
+member ::= string kv_sep value_1
+array ::= "[" pad ( value_1 ( elem_sep value_1 )* )? pad "]"
+"#,
+            $(
+                "value_", $level, " ::= object_", $level, " | array_",
+                $level, r#" | string | number | "true" | "false" | "null""#,
+                "\n",
+                "object_", $level, r#" ::= "{" pad ( member_"#, $level,
+                " ( elem_sep member_", $level, r#" )* )? pad "}""#, "\n",
+                "member_", $level, " ::= string kv_sep value_", $next, "\n",
+                "array_", $level, r#" ::= "[" pad ( value_"#, $next,
+                " ( elem_sep value_", $next, r#" )* )? pad "]""#, "\n",
+            )*
+            "value_", $last,
+            r#" ::= string | number | "true" | "false" | "null""#,
+            "\n",
+            r#"string ::= "\"" char* "\""
 char ::= unescaped | escape
 unescaped ::= [^"\\\x00-\x1F]
 escape ::= "\\" ( ["\\/bfnrt] | "u" non_surrogate_hex4 | "u" high_surrogate "\\u" low_surrogate )
@@ -1336,7 +1391,56 @@ ws ::= [ \t\n\r]?
 kv_sep ::= ws ":" ws
 elem_sep ::= ws "," ws
 pad ::= ws
-"#;
+"#
+        )
+    };
+}
+
+/// Standard JSON grammar appended to every schema-derived GBNF.
+///
+/// Handles object / array / string / number / literal, with permissive
+/// intra-structure whitespace. Not strict about number formatting edge
+/// cases (e.g. `01` is rejected as JSON would); good enough for
+/// downstream deserializers to validate. `value` nests at most 32
+/// levels of objects and arrays (`UNTYPED_DEPTH`).
+///
+/// Exposed as `#[doc(hidden)] pub` for the fuzzer (paired with
+/// [`schema_to_gbnf`]). Not part of the stable surface.
+#[doc(hidden)]
+pub const JSON_GRAMMAR: &str = json_grammar! {
+    last 32;
+    1 => 2,
+    2 => 3,
+    3 => 4,
+    4 => 5,
+    5 => 6,
+    6 => 7,
+    7 => 8,
+    8 => 9,
+    9 => 10,
+    10 => 11,
+    11 => 12,
+    12 => 13,
+    13 => 14,
+    14 => 15,
+    15 => 16,
+    16 => 17,
+    17 => 18,
+    18 => 19,
+    19 => 20,
+    20 => 21,
+    21 => 22,
+    22 => 23,
+    23 => 24,
+    24 => 25,
+    25 => 26,
+    26 => 27,
+    27 => 28,
+    28 => 29,
+    29 => 30,
+    30 => 31,
+    31 => 32,
+};
 
 /// The exact separators the JSON-envelope dialects put between a
 /// call's top-level fields, shared by the grammar emitter and

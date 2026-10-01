@@ -25,6 +25,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::grammar_compile::MAX_NESTING;
+
 /// What becomes of a string value the input ended inside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenStrings {
@@ -81,6 +83,7 @@ pub(crate) fn read_partial(
     let mut reader = Reader {
         text,
         pos: 0,
+        depth: 0,
         flavor,
         strings,
     };
@@ -226,6 +229,10 @@ enum Str {
 struct Reader<'t, 'q> {
     text: &'t str,
     pos: usize,
+    /// Containers the value being read is inside. One past
+    /// [`MAX_NESTING`] is malformed, as serde_json refuses it, rather
+    /// than a recursion as deep as the model's brackets.
+    depth: usize,
     flavor: Flavor<'q>,
     strings: OpenStrings,
 }
@@ -274,11 +281,18 @@ impl<'t> Reader<'t, '_> {
                 Str::Malformed => Read::Malformed,
             };
         }
-        match rest.as_bytes()[0] {
-            b'{' => self.object(),
-            b'[' => self.array(),
-            _ => self.scalar(),
+        let container = match rest.as_bytes()[0] {
+            b'{' => Self::object,
+            b'[' => Self::array,
+            _ => return self.scalar(),
+        };
+        if self.depth >= MAX_NESTING {
+            return Read::Malformed;
         }
+        self.depth += 1;
+        let read = container(self);
+        self.depth -= 1;
+        read
     }
 
     fn object(&mut self) -> Read {

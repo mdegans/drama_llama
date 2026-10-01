@@ -205,6 +205,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Deeply nested output can no longer abort the process.** The Gemma
+  4 dict-value reader and the readers of a call cut short (every
+  dialect's streaming and clipped parse) recursed once per bracket, so
+  an untyped parameter nested ~2,500 deep (Gemma 4, inside what its
+  grammar admitted) or ~3,800 (the rest) overflowed a 2 MiB stack —
+  tokio's, which blallama runs `Session` on — and aborted the server
+  with every request on it. Each reader now refuses nesting past 127
+  levels as malformed, exactly as serde_json (which the JSON dialects
+  parse with) refuses it. And the grammars no longer admit it: an
+  untyped value (`{}`, `{"type": "object"}` without properties, …)
+  nests at most 32 levels of objects and arrays, in the JSON and dict
+  encodings alike, and the schema around it at most 64
+  (`SchemaLimits::max_depth`, see Added), so with the call envelope a
+  constrained value stays under 127 and every dialect reads back what
+  its grammar admits (`depth_budget_fits_the_parsers`). Recursion
+  through `$ref`s is the one way past it: a tree schema still nests as
+  deep as the model takes it, and a value past 127 levels is refused
+  by the parse, as before.
+
 - **A nullable Qwen XML parameter takes a bare `null`; a non-nullable
   one never comes back `null`.** A JSON-spelled parameter whose type
   is nullable through a `type` array (`["integer", "null"]`, schemars'
@@ -895,6 +914,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   | bytes of one `enum` member / `const` | 16 KiB | 24 |
   | member bytes across the request, each `$ref` at its target's size | 1 MiB | ~49 KB |
   | width: ways one schema's grammar can go on at once | 2,048 | 613 |
+  | depth: levels of objects and arrays a value nests, each `$ref` at its target's | 64 | 3 |
 
   Measured on Agora's seed-agent request (15 tools and the `Soul`
   output schema), misanthropic's captured request fixtures, Anthropic's
@@ -960,7 +980,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   blallama takes each as a flag (`--schema-max-tools`,
   `--schema-max-params`, `--schema-max-nodes`, `--schema-max-defs`,
   `--schema-max-member-bytes`, `--schema-max-total-member-bytes`,
-  `--schema-max-width`).
+  `--schema-max-width`, `--schema-max-depth`).
+
+  The depth keeps every constrained value readable. serde_json — and
+  every dialect parser with it — reads at most 127 levels of nesting,
+  and a chain of `$ref`s, one `required` object per def, spells a
+  value of any depth in a request a few levels deep: at 127 levels the
+  schema compiled in every dialect to a grammar whose every value no
+  parser could read back, so each draw failed and the request ended in
+  resampling and a 500. It is counted from the shape: an object or
+  array one level more than its deepest property or `items`, an
+  `anyOf`/`oneOf` variant at its schema's level, an `enum` member or
+  `const` at its own depth as JSON, a `$ref` at its target's depth, one
+  back into its own cycle at none. With the 32 levels an untyped value
+  may add and the call envelope's two, a value inside the default
+  stays under 127.
 
 - **Footprint guards for the schema pipelines and the matcher**
   (`footprint_guard_pipelines`, `footprint_guard_matcher`, both
