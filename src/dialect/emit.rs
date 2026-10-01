@@ -928,6 +928,25 @@ impl<'s> Classifier<'s> {
     }
 }
 
+/// Whether a JSON-spelled tagged parameter's `schema` allows `null`
+/// only through a `type` array the compiler collapses to its one other
+/// type (`effective_type`): no `enum` or `const` (whose members decide,
+/// null among them or not), `$ref` or `anyOf` (compiled whole, a `null`
+/// variant included).
+fn bare_nullable(schema: &Value) -> bool {
+    let decided_elsewhere = ["enum", "const", "$ref", "anyOf"]
+        .iter()
+        .any(|k| schema.get(k).is_some());
+    let null_in_types = schema
+        .get("type")
+        .and_then(Value::as_array)
+        .is_some_and(|ts| ts.iter().any(|t| t == "null"));
+    !decided_elsewhere
+        && null_in_types
+        && crate::grammar_compile::effective_type(schema)
+            .is_some_and(|t| t != "null")
+}
+
 /// The until-rule every raw tagged value shares ([`emit_tagged_call`]).
 const RAW_VALUE_RULE: &str = "val_raw";
 
@@ -1012,6 +1031,16 @@ fn emit_tagged_call(
                         typed_rule.clone()
                     });
                 format!(r#"{rule} "{val_suf_lit}""#)
+            }
+            TaggedValue::Json if bare_nullable(schema) => {
+                // A nullable type (`["integer", "null"]`, schemars'
+                // `Option<T>`) compiles to its base type
+                // (`effective_type`); as a parameter it takes the bare
+                // `null` its schema allows too, which reads back null.
+                let base = format!("{typed_rule}_base");
+                compiler.add(schema, &base, src);
+                let _ = writeln!(src, r#"{typed_rule} ::= {base} | "null""#);
+                format!(r#"{typed_rule} "{val_suf_lit}""#)
             }
             TaggedValue::Json => {
                 compiler.add(schema, &typed_rule, src);

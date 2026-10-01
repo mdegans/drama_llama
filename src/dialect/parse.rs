@@ -2693,6 +2693,82 @@ mod tests {
         assert_eq!(calls[0].1, &json!({"mode": "fast"}));
     }
 
+    /// On Qwen XML a parameter the schema does not make nullable can
+    /// never come back JSON `null`, and one it does takes a bare
+    /// `null`. A non-string type is written as JSON and its grammar has
+    /// no `null` at all; a plain string is written raw, so the text
+    /// `null` is admitted and reads back as the *string* `"null"`. A
+    /// nullable string, a `["integer", "null"]` and an `anyOf` with a
+    /// `null` variant (Agora's `Option<DetailLevel>` shape) each take
+    /// a bare `null` as JSON `null`.
+    #[test]
+    fn qwen_xml_null_only_where_the_schema_allows_it() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "i": {"type": "integer"},
+                "n": {"type": "number"},
+                "b": {"type": "boolean"},
+                "o": {"type": "object", "properties": {"x": {"type": "integer"}}},
+                "a": {"type": "array", "items": {"type": "integer"}},
+                "e": {"enum": ["fast", "slow"]},
+                "s": {"type": "string"},
+                "ns": {"type": ["string", "null"]},
+                "ni": {"type": ["integer", "null"]},
+                "an": {"anyOf": [
+                    {"oneOf": [{"const": "summary"}, {"const": "full"}]},
+                    {"type": "null"},
+                ]},
+            },
+        });
+        let mut tool = Tool::builder("t")
+            .description("test")
+            .schema(schema)
+            .build()
+            .expect("valid tool");
+        tool.strict = Some(true);
+        let call = |param: &str, raw: &str| {
+            format!(
+                "<tool_call>\n<function=t>\n<parameter={param}>\n{raw}\n\
+                 </parameter>\n</function>\n</tool_call>"
+            )
+        };
+        let read = |param: &str, raw: &str| -> Value {
+            let text = call(param, raw);
+            assert!(qwen_admits(&tool, &text), "{param} = {raw} refused");
+            let parsed = parse_text(
+                &CallSyntax::qwen_xml(),
+                &[&tool],
+                &text,
+                false,
+                Leniency::Final,
+            );
+            calls_of(&parsed.blocks)[0].1[param].clone()
+        };
+        // Non-nullable, not a string: no `null` in the grammar, though
+        // a value of the type is admitted.
+        for (param, valid) in [
+            ("i", "5"),
+            ("n", "1.5"),
+            ("b", "true"),
+            ("o", r#"{"x":1}"#),
+            ("a", "[1,2]"),
+            ("e", "fast"),
+        ] {
+            assert_ne!(read(param, valid), Value::Null, "{param}");
+            assert!(!qwen_admits(&tool, &call(param, "null")), "{param}");
+        }
+        // A plain string: the text `null` is that string.
+        assert_eq!(read("s", "null"), json!("null"));
+        // Nullable: a bare `null` is null, and a value is still a value.
+        assert_eq!(read("ns", "null"), Value::Null);
+        assert_eq!(read("ns", "text"), json!("text"));
+        assert_eq!(read("an", "null"), Value::Null);
+        assert_eq!(read("an", "full"), json!("full"));
+        assert_eq!(read("ni", "7"), json!(7));
+        assert_eq!(read("ni", "null"), Value::Null);
+    }
+
     /// A stop cut parses the output prefix after prefix, each a fresh
     /// parse; lent one [`Spellings`] (as `Session` does, per call) they
     /// classify each tool once between them.

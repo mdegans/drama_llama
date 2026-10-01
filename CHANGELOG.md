@@ -205,6 +205,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A nullable Qwen XML parameter takes a bare `null`; a non-nullable
+  one never comes back `null`.** A JSON-spelled parameter whose type
+  is nullable through a `type` array (`["integer", "null"]`, schemars'
+  `Option<T>` for a non-string `T`) compiled to its base type alone, so
+  the `null` its schema allows was unwritable — a required `Option<i64>`
+  could not be null at all. It now takes `T | null`, and `null` reads
+  back JSON `null`. The rest, now pinned together
+  (`qwen_xml_null_only_where_the_schema_allows_it`): a non-nullable
+  integer, number, boolean, object, array or enum parameter has no
+  `null` in its grammar; a plain string parameter is raw, so the text
+  `null` is admitted and reads back as the *string* `"null"`; a
+  nullable string and an `anyOf` with a `null` variant (Agora's
+  `Option<DetailLevel>`) take a bare `null` as `null`. Nested fields
+  and the JSON dialects keep collapsing a nullable type to its base.
+
 - **A matcher state over its caps refuses alternatives, not the
   close.** Past `MAX_STACKS` (4096) stacks a state kept a prefix of its
   sorted stacks, and the stack that closes a structure sorts after its
