@@ -905,8 +905,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each) and an untyped value 16, each the most measured in any dialect
   plus margin; an object its properties + 4 plus its widest property;
   an array 4 plus its items; an `anyOf`/`oneOf` the *sum* of its
-  variants, since variants sharing a prefix (objects all opening
-  `{"a":`) are alive at once and nested ones multiply; a `$ref` its
+  variants plus one, since variants sharing a prefix (objects all
+  opening `{"a":`) are alive at once and nested ones multiply (the one
+  is the alternation's own step in the schema check below, so a chain
+  of one-variant `anyOf`s costs its length there too); a `$ref` its
   target's width, each def once, a reference back into its own cycle
   as untyped. Every shape filled to the default (an `enum`, optional
   and required properties, `anyOf`s of objects and arrays alive through
@@ -939,6 +941,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and blallama resamples it on the warm cache like a grammar violation,
   then answers 500 `api_error` — never a 200 carrying the invalid
   value. `SchemaMismatch` / `MismatchKind` are public.
+
+  The check's work is bounded: a step per subschema judged and per
+  `enum` member, `required` name or `type` compared, at most 2^20 plus
+  2^14 per JSON value of the output. Inside the schema limits every
+  way a value can be judged — `anyOf` variants tried in turn and nested
+  to multiply, object variants that all declare the property, `enum`
+  members, each alternation itself — is counted by the width (at most
+  2,048), and each def is judged at most twice per value (memoized
+  inside an `anyOf` and out), so a request inside them stays far under
+  the budget: each worst shape filled to the width limit and checked
+  over 2,000 values takes at most ~2,050 steps a value, under 75 ms.
+  Past the budget (a schema past the limits, from a caller that skips
+  the measure) the check stops judging, logs a `schema_check_budget`
+  warning and passes the value, which the grammar already constrained,
+  rather than turning valid output into a resample loop and a 500. A
+  failing `anyOf` variant no longer copies the path or builds its
+  message, and an object's undeclared keys look `required` up in a
+  set.
 - **`BlockStream::violation`**: once drained, a stream reports the
   `GrammarViolation` or `SchemaViolation` the batch path would have
   returned for the same turn, by the same rules (one `TurnContract`

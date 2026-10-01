@@ -425,6 +425,14 @@ fn hostile_requests_are_refused_up_front() {
             SchemaLimit::Width,
         ),
         (
+            "200 one-variant anyOf chains, 200 deep",
+            vec![],
+            Some(json!({"anyOf": (0..200).map(|i| (0..200)
+                .fold(json!({"const": i}), |s, _| json!({"anyOf": [s]})))
+                .collect::<Vec<_>>()})),
+            SchemaLimit::Width,
+        ),
+        (
             "5000 defs",
             vec![tool(json!({
                 "type": "object",
@@ -779,6 +787,7 @@ fn nested_any_of(k: usize, m: usize) -> Value {
                     "type": "object",
                     "properties": {key: inner, format!("{key}{i}"): {"type": "integer"}},
                     "required": [key],
+                    "additionalProperties": false,
                 })
             })
             .collect();
@@ -927,5 +936,131 @@ fn width_limit_keeps_the_matcher_under_its_cap() {
                 "{name} / {family:?}: {peak}"
             );
         }
+    }
+}
+
+/// The schema check's step budget never binds a request inside
+/// [`SchemaLimits`]: its worst cases — an `enum`, `anyOf`s nested to
+/// multiply, a wide `anyOf` of one-variant chains, a chain of defs each
+/// an alternation, objects that all declare the property being judged
+/// — filled to the width limit and checked over 2,000 values each, stay
+/// well inside it, valid output passing and invalid output (only the
+/// last value wrong) caught, so the check judged every value.
+#[test]
+fn schema_check_at_the_limits_stays_in_budget() {
+    use crate::schema_budget::width;
+    use crate::schema_check::check_counted;
+    let limit = SchemaLimits::default().max_width;
+    // An array of `items`, its `$defs` hoisted to the root they resolve
+    // from.
+    let array_of = |mut items: Value| {
+        let defs = items.as_object_mut().and_then(|o| o.remove("$defs"));
+        let mut array = json!({"type": "array", "items": items});
+        if let Some(defs) = defs {
+            array["$defs"] = defs;
+        }
+        array
+    };
+    // `(name, shape(n), a value naming its last alternative, a value
+    // matching none)`.
+    type Shape = (
+        &'static str,
+        fn(usize) -> Value,
+        fn(usize) -> Value,
+        fn(usize) -> Value,
+    );
+    let shapes: [Shape; 5] = [
+        (
+            "enum",
+            |n| json!({"enum": (0..n).map(|i| format!("m{i:05}")).collect::<Vec<_>>()}),
+            |n| json!(format!("m{:05}", n - 1)),
+            |_| json!("zz"),
+        ),
+        (
+            "nested anyOf, k = 4",
+            |m| nested_any_of(4, m),
+            |m| json!({"a": {"b": format!("m{:04}", m - 1), "b3": 1}, "a3": 2}),
+            |_| json!({"a": {"b": "zz", "b3": 1}, "a3": 2}),
+        ),
+        (
+            "anyOf of one-variant chains 50 deep",
+            |n| {
+                let chain = |i: usize| {
+                    (0..50)
+                        .fold(json!({"const": i}), |s, _| json!({"anyOf": [s]}))
+                };
+                json!({"anyOf": (0..n).map(chain).collect::<Vec<_>>()})
+            },
+            |n| json!(n - 1),
+            |_| json!(-1),
+        ),
+        (
+            // 18 members a level, so the chain fills the width before
+            // the check's depth cap (where it stops judging) is near.
+            "defs chained through anyOf",
+            |n| {
+                let mut defs: Map<String, Value> = (0..n)
+                    .map(|i| {
+                        let next = format!("#/$defs/D{}", i + 1);
+                        let members: Vec<usize> = (i * 18..i * 18 + 18).collect();
+                        (
+                            format!("D{i}"),
+                            json!({"anyOf": [{"$ref": next}, {"enum": members}]}),
+                        )
+                    })
+                    .collect();
+                defs.insert(format!("D{n}"), json!({"const": "end"}));
+                json!({"$ref": "#/$defs/D0", "$defs": defs})
+            },
+            |_| json!("end"),
+            |_| json!("x"),
+        ),
+        (
+            "objects all declaring the judged property",
+            |n| {
+                json!({"anyOf": (0..n).map(|i| json!({
+                    "type": "object",
+                    "properties": {
+                        "a": {"enum": [0, 1, 2, 3, 4, 5, 6, 7]},
+                        format!("z{i}"): {"type": "integer"},
+                    },
+                    "required": ["a", format!("z{i}")],
+                    "additionalProperties": false,
+                })).collect::<Vec<_>>()})
+            },
+            |n| json!({"a": 7, format!("z{}", n - 1): 1}),
+            |_| json!({"a": 7, "zz": 1}),
+        ),
+    ];
+    for (name, shape, valid, invalid) in shapes {
+        let (mut lo, mut hi) = (1, 2 * limit);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            match width(&array_of(shape(mid))) <= limit {
+                true => lo = mid,
+                false => hi = mid - 1,
+            }
+        }
+        let schema = array_of(shape(lo));
+        check_schemas([], Some(&schema), &SchemaLimits::default()).expect(name);
+        let mut items = vec![valid(lo); 2000];
+        let start = Instant::now();
+        let (verdict, steps, budget) =
+            check_counted(&schema, &Value::Array(items.clone()));
+        eprintln!(
+            "{name} (n = {lo}, width {}): {steps} steps of {budget}, {} per \
+             value, in {:?}",
+            width(&schema),
+            steps / items.len(),
+            start.elapsed(),
+        );
+        assert_eq!(verdict, Ok(()), "{name}");
+        assert!(steps <= budget / 2, "{name}: {steps} of {budget}");
+        *items.last_mut().unwrap() = invalid(lo);
+        let (verdict, steps, budget) =
+            check_counted(&schema, &Value::Array(items));
+        assert!(steps <= budget / 2, "{name}: {steps} of {budget}");
+        assert_eq!(verdict.unwrap_err().path, "/1999", "{name}");
+        assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
     }
 }

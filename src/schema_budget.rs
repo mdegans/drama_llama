@@ -85,9 +85,11 @@ pub struct SchemaLimits {
     ///   each the most measured in any dialect, with margin;
     /// * an object its properties (required ones included) + 4, plus
     ///   its widest property; an array 4 plus its `items`;
-    /// * an `anyOf` or `oneOf` the *sum* of its variants — variants
-    ///   sharing a prefix (objects all opening with `{"a":`) are all
-    ///   alive inside it, so nested ones multiply;
+    /// * an `anyOf` or `oneOf` the *sum* of its variants, plus one —
+    ///   variants sharing a prefix (objects all opening with `{"a":`)
+    ///   are all alive inside it, so nested ones multiply, and the one
+    ///   is the alternation's own step in the schema check, so a chain
+    ///   of one-variant alternations costs its length;
     /// * a `$ref` its target's width, each def counted once; a
     ///   reference back into its own cycle counts as untyped. (So
     ///   ambiguity *through* recursion — two interchangeable recursive
@@ -743,10 +745,12 @@ fn own_width(node: &Value, parts: &Parts, target: Option<usize>) -> usize {
             _ => W_ANY,
         })
         .fold(0usize, usize::saturating_add);
+    // One more than the variants: the alternation's own step in the
+    // schema check, so a chain of them is no free depth there.
     let alternatives = |key: &str, sum: Option<usize>| {
         map.get(key)
             .and_then(Value::as_array)
-            .map(|_| sum.unwrap_or(W_ANY))
+            .map(|_| sum.map_or(W_ANY, |sum| sum.saturating_add(1)))
     };
     let readings = [
         target,
@@ -916,11 +920,16 @@ mod tests {
         assert_eq!(width(&json!({"type": "object"})), W_ANY);
         let array = json!({"type": "array", "items": {"enum": [1, 2, 3]}});
         assert_eq!(width(&array), 3 + W_CONTAINER);
-        // Variants add up, so nested ones multiply.
+        // Variants add up, so nested ones multiply; the alternation
+        // itself is one more.
         let inner = json!({"anyOf": [array, {"const": 0}]});
-        assert_eq!(width(&inner), 3 + W_CONTAINER + 1);
+        assert_eq!(width(&inner), 3 + W_CONTAINER + 1 + 1);
         let outer = json!({"oneOf": [inner, inner, inner]});
-        assert_eq!(width(&outer), 3 * (3 + W_CONTAINER + 1));
+        assert_eq!(width(&outer), 3 * (3 + W_CONTAINER + 2) + 1);
+        // So a chain of one-variant alternations is as long as it is.
+        let chain =
+            (0..10).fold(json!({"const": 0}), |s, _| json!({"anyOf": [s]}));
+        assert_eq!(width(&chain), 1 + 10);
         assert_eq!(width(&json!({"anyOf": []})), W_ANY);
         // A schema that is several things counts as the widest.
         let both = json!({"anyOf": [{"const": 1}], "enum": [1, 2, 3]});
@@ -947,7 +956,7 @@ mod tests {
             },
             "$defs": {"E": {"enum": members}},
         });
-        assert_eq!(width(&shared), 2 + W_CONTAINER + 2 * 50);
+        assert_eq!(width(&shared), 2 + W_CONTAINER + 2 * 50 + 1);
         let tree = json!({
             "$ref": "#/$defs/Node",
             "$defs": {"Node": {
