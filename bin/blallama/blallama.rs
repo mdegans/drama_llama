@@ -109,6 +109,36 @@
 //! completed members at every depth — inferred; only the top level is
 //! captured. A call cut before its *name* is whole has nothing to return
 //! (Anthropic's block carries its name whole) and is left out.
+//!
+//! # Run it under a supervisor
+//!
+//! blallama exits on purpose when it can no longer trust its own
+//! process, and expects to be restarted:
+//!
+//! - **a panic**, on any thread — exit code **70** (`EX_SOFTWARE`);
+//! - **a backend failure** llama.cpp does not recover from in-process —
+//!   a failed `llama_decode`, a Metal context left "in error state …
+//!   recreate the backend" by an out-of-memory command buffer — exit
+//!   code **75** (`EX_TEMPFAIL`).
+//!
+//! Recovering in-process would mean unwinding through, or dropping,
+//! llama.cpp state that failed mid-operation, and llama.cpp does not
+//! promise its destructors clean that up; serving on is worse (one
+//! Metal OOM on 2026-10-01 failed every later request until a manual
+//! restart). So the process logs one `ERROR` line (`event: "fatal"`,
+//! with `kind`, `exit_code` and `cause`), answers the requests in
+//! flight and any that arrive meanwhile with a 500 `api_error` (which
+//! the SDKs retry), and `_exit`s half a second later — skipping
+//! llama.cpp's static destructors, which on Metal would turn the exit
+//! into a `SIGABRT`. See the `fatal` module.
+//!
+//! Run it under launchd, systemd (`Restart=on-failure`), or the restart
+//! loop in `scripts/blallama-supervise.sh`, which keeps the arguments,
+//! backs off when it crash-loops, and logs each restart with its exit
+//! code. A clean exit (SIGTERM, Ctrl-C: code 0) is not restarted by any
+//! of them.
+
+mod fatal;
 
 use std::{
     num::{NonZeroU128, NonZeroUsize},
@@ -134,6 +164,7 @@ use drama_llama::{
     Catalog, FromPath, ProbeCtx, ProbeHook, Prompt, SchemaLimits, Session,
     SnapshotOpts,
 };
+use fatal::Fatal;
 use misanthropic::{
     model::{ModelInfo, Models},
     response::StopReason,
@@ -435,18 +466,32 @@ fn validate_prompt(prompt: &Prompt) -> Result<(), AnthropicError> {
         .map_err(|message| AnthropicError::InvalidRequest { message })
 }
 
-async fn spawn_blocking_or_bust<F, R>(f: F) -> R
+/// A route's error answer, in the wire envelope.
+type Reply = (StatusCode, Json<ErrorEnvelope>);
+
+/// Run `f` on the blocking pool — every call into llama.cpp goes
+/// through here — or answer 500 once the process is declared fatal
+/// ([`fatal`]): by a panic in `f` (which parks its thread rather than
+/// unwind it, see [`fatal::install`]), or anything else meanwhile. A
+/// panic that does unwind into a `JoinError` (one inside
+/// [`fatal::caught_by_caller`] that nothing caught) is declared here.
+async fn spawn_blocking_or_bust<F, R>(f: F) -> Result<R, Reply>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    match spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!(error = %e);
-            std::process::exit(1); // We don't trust llama.cpp's destructors to
-                                   // clean up so this is fatal.
-        }
+    tokio::select! {
+        joined = spawn_blocking(f) => match joined {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                // Cancelled only at runtime shutdown; a panic otherwise.
+                if e.is_panic() {
+                    fatal::declare(Fatal::Panic, &e);
+                }
+                Err(fatal::reply(fatal::current().unwrap_or(Fatal::Panic)))
+            }
+        },
+        fatal = fatal::declared() => Err(fatal::reply(fatal)),
     }
 }
 
@@ -519,13 +564,16 @@ fn model_not_found(id: &str) -> (StatusCode, Json<ErrorEnvelope>) {
 /// metadata off disk (a vocab-only load for llama.cpp — no weights, no
 /// GPU); later calls are served from the [`Catalog`]'s cache until the
 /// file changes. Runs on the blocking pool: the peek is I/O.
-async fn route_models<B>(State(state): State<AppState<B>>) -> Json<Models>
+async fn route_models<B>(
+    State(state): State<AppState<B>>,
+) -> Result<Json<Models>, Reply>
 where
     B: Backend + 'static,
     Session<B>: FromPath,
 {
     let catalog = state.catalog.clone();
-    Json(spawn_blocking_or_bust(move || catalog.models()).await)
+    let read = move || fatal::caught_by_caller(|| catalog.models());
+    spawn_blocking_or_bust(read).await.map(Json)
 }
 
 /// `GET /v1/models/{id}` — one model's [`ModelInfo`], or the same 404
@@ -542,8 +590,9 @@ where
 {
     let catalog = state.catalog.clone();
     let name = id.clone();
-    spawn_blocking_or_bust(move || catalog.info(&name))
-        .await
+    let read = move || fatal::caught_by_caller(|| catalog.info(&name));
+    spawn_blocking_or_bust(read)
+        .await?
         .map(Json)
         .ok_or_else(|| model_not_found(&id))
 }
@@ -555,15 +604,14 @@ where
 /// own server leaves the same fields blank).
 async fn route_tags<B>(
     State(state): State<AppState<B>>,
-) -> Json<serde_json::Value>
+) -> Result<Json<serde_json::Value>, Reply>
 where
     B: Backend + 'static,
     Session<B>: FromPath,
 {
     let catalog = state.catalog.clone();
     let models = spawn_blocking_or_bust(move || {
-        catalog
-            .models()
+        fatal::caught_by_caller(|| catalog.models())
             .into_iter()
             .map(|info| {
                 let name = info.id.name().to_string();
@@ -584,8 +632,8 @@ where
             })
             .collect::<Vec<_>>()
     })
-    .await;
-    Json(serde_json::json!({ "models": models }))
+    .await?;
+    Ok(Json(serde_json::json!({ "models": models })))
 }
 
 async fn run<B>(
@@ -615,16 +663,16 @@ where
     // flight, and `/v1/messages` only needs the directory listing.
     {
         let catalog = catalog.clone();
-        spawn_blocking(move || {
+        tokio::spawn(spawn_blocking_or_bust(move || {
             let started = std::time::Instant::now();
-            let n = catalog.models().len();
+            let n = fatal::caught_by_caller(|| catalog.models()).len();
             info!(
                 event = "catalog_warm",
                 models = n,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "model catalog warmed",
             );
-        });
+        }));
     }
 
     let mut app = Router::new()
@@ -637,6 +685,9 @@ where
     if probe_bus.is_some() {
         app = app.route("/probe", axum::routing::get(route_probe_stream));
     }
+    // Last, so it covers every route: once the process is declared
+    // fatal, nothing more is served from it.
+    let app = app.layer(axum::middleware::from_fn(fatal::refuse_when_fatal));
     let app = app.with_state(AppState {
         args: args.into(),
         catalog,
@@ -727,12 +778,14 @@ where
     // On the blocking pool: loading is seconds of blocking file and GPU
     // work and this is a reactor thread.
     spawn_blocking_or_bust(move || {
-        let session =
-            Session::<B>::from_path_with(path, catalog.options().clone())?;
-        catalog.refresh(&model, session.model_info());
-        Ok(session)
+        fatal::caught_by_caller(|| {
+            let session =
+                Session::<B>::from_path_with(path, catalog.options().clone())?;
+            catalog.refresh(&model, session.model_info());
+            Ok(session)
+        })
     })
-    .await
+    .await?
     .map(|s| configure_session(s, no_penalty, seed, schema_limits))
     .map_err(map_session_err)
 }
@@ -772,7 +825,7 @@ where
         let result = session.count_tokens(&prompt);
         (session, result)
     })
-    .await;
+    .await?;
     // Counting never touches KV state, so the session survives any
     // error it can return.
     lock.replace(session);
@@ -796,7 +849,7 @@ where
     let served = spawn_blocking_or_bust(move || {
         catalog.resolve(&requested, default.as_deref())
     })
-    .await
+    .await?
     .map_err(|e| {
         error!(error = %e);
         (StatusCode::NOT_FOUND, Json(e.into()))
@@ -961,7 +1014,7 @@ where
             };
             (session, result, start.elapsed(), resamples)
         })
-        .await;
+        .await?;
 
     if resamples > 0 && result.is_ok() {
         info!(resamples, "resample recovered a clean generation");
@@ -977,13 +1030,16 @@ where
         Ok(_) => {
             lock.replace(session);
         }
-        Err(e) if !e.is_fatal() => {
-            error!(error = %e);
-            lock.replace(session);
+        Err(e) if fatal::is_backend_failure(e) => {
+            fatal::declare(Fatal::Backend, e);
+            // Never through llama.cpp's destructors: the backend just
+            // failed, and the process exits in a moment anyway.
+            std::mem::forget(session);
+            return Err(fatal::reply(Fatal::Backend));
         }
         Err(e) => {
-            error!(erorr = %e);
-            // Drop session; next request will reload.
+            error!(error = %e);
+            lock.replace(session);
         }
     }
 
@@ -1504,6 +1560,7 @@ fn map_session_err(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
+    fatal::install();
     let args = Args::parse();
 
     // If --record-json is set, spin up the JSONL writer task before any request

@@ -205,6 +205,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **blallama exits on every fatal fault, reliably, with a code saying
+  which — and no longer serves on a failed backend.** Its policy is
+  unchanged: when the process can no longer be trusted it exits rather
+  than recover in-process, because llama.cpp does not promise its
+  destructors clean up after a failure, and a supervisor restarts it.
+  It was not reliable or complete:
+  - Only a panic in a request's blocking session task exited. A panic
+    in a handler, a hyper connection task, the probe writer or the
+    catalog warm-up was caught by tokio and the server kept running —
+    having unwound, and dropped, whatever that task owned (a `Session`
+    between checkout and its blocking call included). A panic hook now
+    covers every thread: it declares the process fatal and parks the
+    panicking thread instead of unwinding it (a tokio worker hands its
+    scheduler on first), so nothing it owns is dropped. Model loads and
+    catalog reads are the exception the chat-template analyzer needs
+    (it catches the panics minijinja raises on some templates); a panic
+    that escapes one still exits, through its `JoinError`.
+  - A failed prefill (`SessionError::Decode`) was "reusable", so a
+    backend llama.cpp leaves broken kept serving: on 2026-10-01 one
+    Metal out-of-memory command buffer left its context "in error state
+    … recreate the backend", and every later request failed until a
+    manual restart. Every decode error, and every error after which the
+    session is not reusable (which used to be dropped and reloaded),
+    now exits; the session is leaked, not dropped. The predictor's
+    decode-failure panics (#92) count as backend failures too.
+  - The exit was `std::process::exit(1)`, which runs C++ static
+    destructors: ggml-metal's asserts every buffer was freed
+    (`ggml_metal_rsets_free`), so with a model loaded the exit became a
+    `SIGABRT`. It is now `_exit`, after the cause is logged as one
+    `ERROR` line (`event: "fatal"`, `kind`, `exit_code`, `cause`) and
+    flushed, and after a 500 ms grace in which requests in flight —
+    and any that arrive — are answered 500 `api_error`, which SDKs
+    retry. The exit runs on its own timer thread, so nothing waits on
+    those answers.
+  - Exit codes: **70** after a panic, **75** after a backend failure.
+    The policy is documented in `bin/blallama` ("Run it under a
+    supervisor") and the README, with a minimal restart loop in
+    `scripts/blallama-supervise.sh` (keeps the arguments, backs off on a
+    crash loop, logs each restart, stops on a clean exit). Tests run the
+    test binary as a child process: a panic in the session task, a
+    panic in a handler, a caught and an escaping panic in a model read,
+    and a fatal decode error each exit with their code, log one fatal
+    line and answer 500.
+
 - **Non-ASCII model output can no longer panic a dialect parser.** The
   gpt-oss Harmony parser stepped one *byte* past a block boundary
   (`rest[1..]`) before looking for the next marker, so prose outside a

@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/mdegans/drama_llama/graph/badge.svg)](https://codecov.io/gh/mdegans/drama_llama)
-[![tests](https://img.shields.io/badge/tests-978-blue)](#testing)
+[![tests](https://img.shields.io/badge/tests-983-blue)](#testing)
 [![license](https://img.shields.io/badge/license-RAIL--S-lightgrey)](https://github.com/mdegans/drama_llama/blob/main/LICENSE.md)
 
 `drama_llama` runs language models on your own hardware behind an API shaped
@@ -205,9 +205,32 @@ sampler-settings editor).
 
 [memorized content]: https://github.com/mdegans/drama_llama/blob/main/bin/regurgitater/README.md
 
+### Running `blallama`
+
+Run `blallama` under a supervisor. It exits on purpose when it can no longer
+trust its own process — code **70** after a panic on any thread, **75** after a
+backend failure llama.cpp does not recover from in-process (a failed
+`llama_decode`, a Metal context left in error state by an out-of-memory
+command buffer) — rather than unwind through llama.cpp state or keep serving a
+wedged backend. Before it goes it logs one `ERROR` line (`"event":"fatal"`,
+with the `kind`, `exit_code` and `cause`) and answers the requests in flight
+with a 500 `api_error`, which Anthropic's SDKs retry. launchd, systemd
+(`Restart=on-failure`) or the restart loop in
+[`scripts/blallama-supervise.sh`] all do; the script keeps the arguments, backs
+off when it crash-loops, and logs each restart:
+
+```sh
+BLALLAMA=target/release/blallama scripts/blallama-supervise.sh models/ --port 11435
+```
+
+A clean exit (SIGTERM or Ctrl-C drains in-flight work, code 0) is not
+restarted.
+
+[`scripts/blallama-supervise.sh`]: https://github.com/mdegans/drama_llama/blob/main/scripts/blallama-supervise.sh
+
 ## Testing
 
-978 tests across 31 binaries in the default configuration — 810 that run in
+983 tests across 31 binaries in the default configuration — 815 that run in
 seconds and 168 that load real weights onto a real accelerator. The
 model-backed tier is `#[ignore]`d so the fast loop stays fast, and the whole
 topology — *which features* × *which tests* — lives in one place,
@@ -265,7 +288,8 @@ what is actively broken.
 ## Known issues
 
 - A KV-dirty `llama_decode` failure leaves the cache unreconciled
-  ([#52](https://github.com/mdegans/drama_llama/issues/52)).
+  ([#52](https://github.com/mdegans/drama_llama/issues/52)); `blallama`
+  exits on one for its supervisor to restart.
 - A context-full stop is reported as a grammar violation
   ([#36](https://github.com/mdegans/drama_llama/issues/36)).
 - moeflux's `memory_seq_cp` / `memory_seq_keep` silently no-op and report

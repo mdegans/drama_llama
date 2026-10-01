@@ -96,6 +96,11 @@ async-trait = { version = "0.1", optional = true }
 tokio = { version = "1", optional = true }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 futures-util = { version = "0.3", optional = true }
+# blallama's fatal exit (`bin/blallama/fatal.rs`) is `_exit`: no atexit
+# handlers or C++ static destructors, which on Metal assert every
+# buffer was freed and turn the exit into a SIGABRT. std has no
+# `_exit`. Already in the graph via tokio.
+libc = { version = "0.2", optional = true }
 # Non-optional: this crate's own diagnostics (sidecar read/write
 # failures, mostly) have to go *somewhere*, and gating each call site on
 # a feature is more moving parts than the dependency is worth. The `log`
@@ -189,6 +194,7 @@ repl = ["dep:rustyline", "cli"]
 tokio = ["tokio/full", "dep:async-trait"]
 axum = [
     "dep:axum",
+    "dep:libc",
     "dep:tokio-stream",
     "dep:futures-util",
     "tokio",
