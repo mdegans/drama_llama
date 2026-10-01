@@ -23,6 +23,8 @@ mod parse;
 mod partial;
 mod provenance;
 mod segment;
+#[cfg(test)]
+mod utf8_tests;
 
 pub use analyzer::{analyze_template, vocab_cross_check, AnalyzeError};
 pub use emit::{

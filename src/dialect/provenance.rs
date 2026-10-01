@@ -768,6 +768,38 @@ mod tests {
         );
     }
 
+    /// Multibyte text beside spelled pieces, and multibyte pieces
+    /// (DeepSeek's `<｜tool▁calls▁begin｜>` shape): marking, restoring
+    /// and every cut stay on char boundaries, fed a char at a time.
+    #[test]
+    fn multibyte_text_and_pieces_mark_and_cut_whole() {
+        let p = Provenance::new(
+            Arc::new(LiteralNeutralizer::new([
+                (TOOL_CALL, "<tool_call>"),
+                (5, "<｜tool▁begin｜>"),
+                (6, "🦀"),
+            ])),
+            SENTINEL,
+        );
+        let text = "é<tool_call>日本<｜tool▁begin｜>🦀ü<｜tool▁beg🦀";
+        let mut fed = p.clone();
+        let mut marked: String = text
+            .chars()
+            .map(|c| fed.push(c.encode_utf8(&mut [0; 4]), None))
+            .collect();
+        marked.push_str(&fed.finish());
+        assert_eq!(p.restore(&marked), text);
+        assert!(marked.contains(&literal_marker(SENTINEL, 5)), "{marked}");
+        for (end, _) in text.char_indices().chain([(text.len(), ' ')]) {
+            let prefix = p.marked_prefix(&marked, end);
+            assert_eq!(p.restore(&prefix), &text[..end], "at {end}");
+        }
+        for (end, _) in marked.char_indices() {
+            let cut = p.cut_before_marker(&marked, end);
+            assert!(marked.is_char_boundary(cut), "at {end}");
+        }
+    }
+
     #[test]
     fn a_cut_never_splits_a_marker() {
         let p = provenance();

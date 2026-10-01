@@ -383,8 +383,21 @@ impl StreamParser {
                     if let Some(provenance) = &self.provenance {
                         end = provenance.cut_before_marker(&text, end);
                     }
-                    if end > self.text_bytes_emitted {
-                        let delta = &text[self.text_bytes_emitted..end];
+                    // What was yielded is a prefix of this text unless
+                    // a longer re-parse re-cut the block under it (a
+                    // call opened inside an open thought that a later
+                    // close turns back into thought) — model output
+                    // reaches that, so the slice must not land
+                    // mid-char.
+                    let from = text.ceil_char_boundary(self.text_bytes_emitted);
+                    if from != self.text_bytes_emitted.min(text.len()) {
+                        tracing::warn!(
+                            emitted = self.text_bytes_emitted,
+                            "stream parser: trailing text re-cut mid-char"
+                        );
+                    }
+                    if end > from {
+                        let delta = &text[from..end];
                         out.push(match &self.provenance {
                             Some(p) => p.restore(delta).into_owned().into(),
                             None => delta.to_string().into(),
@@ -797,6 +810,7 @@ impl<'a> Parser<'a> {
             .is_some()
             .then(|| self.syntax.reasoning.end.trim().to_string())
             .filter(|s| !s.is_empty());
+        let exit = self.syntax.tool_response_start.clone();
 
         while self.pos < self.text.len() {
             // Next structural landmark: reasoning open or call
@@ -821,16 +835,28 @@ impl<'a> Parser<'a> {
                 self.find_landmark(&trigger)
             };
 
+            // The turn-exit marker before the next thought / call
+            // landmark, consumed below.
+            let exit_at = (!exit.is_empty())
+                .then(|| self.find_landmark(&exit))
+                .flatten()
+                .filter(|&p| {
+                    think_at.is_none_or(|t| p < t)
+                        && trigger_at.is_none_or(|t| p < t)
+                });
+
             // Channel noise strictly before the next thought / call
-            // landmark is consumed first. A bare open is only *noise*
-            // when it is not the thought open itself: the open marker
-            // is a prefix of the thought marker, so `open_at ≤
-            // think_at` always, with equality meaning "this IS the
-            // thought open".
+            // landmark — and before the turn-exit marker, which would
+            // otherwise land in the prose before it — is consumed
+            // first. A bare open is only *noise* when it is not the
+            // thought open itself: the open marker is a prefix of the
+            // thought marker, so `open_at ≤ think_at` always, with
+            // equality meaning "this IS the thought open".
             if let Some(open) = &channel_open {
                 let before_structs = |&p: &usize| {
                     think_at.is_none_or(|t| p < t)
                         && trigger_at.is_none_or(|t| p < t)
+                        && exit_at.is_none_or(|e| p < e)
                 };
                 let open_at = self
                     .find_landmark(open)
@@ -870,19 +896,11 @@ impl<'a> Parser<'a> {
             // requires after the last call — swallow it silently
             // wherever it appears outside a call; it is never
             // content.
-            let exit = &self.syntax.tool_response_start;
-            if !exit.is_empty() {
-                let exit_at = self.find_landmark(exit).filter(|&p| {
-                    think_at.is_none_or(|t| p < t)
-                        && trigger_at.is_none_or(|t| p < t)
-                });
-                let rest = self.rest();
-                if let Some(p) = exit_at {
-                    let prose = rest[..p].to_string();
-                    self.push_text(&prose);
-                    self.pos += p + exit.len();
-                    continue;
-                }
+            if let Some(p) = exit_at {
+                let prose = self.rest()[..p].to_string();
+                self.push_text(&prose);
+                self.pos += p + exit.len();
+                continue;
             }
 
             let rest = self.rest();
@@ -1063,17 +1081,11 @@ impl<'a> Parser<'a> {
                     // *char* past the opener — a byte step slices
                     // mid-char when a derived trigger opens with a
                     // multi-byte char.
-                    let step = self.text[call_start..]
-                        .chars()
-                        .next()
-                        .map(char::len_utf8)
-                        .unwrap_or(1);
-                    let upto = match self.text[call_start + step..]
-                        .find(self.syntax.trigger())
-                    {
-                        Some(next) => call_start + step + next,
-                        None => self.text.len(),
-                    };
+                    let upto = call_start
+                        + past_first_char(
+                            &self.text[call_start..],
+                            self.syntax.trigger(),
+                        );
                     // A cut can leave a call malformed-looking (the
                     // clip, not the model, broke it); running to the
                     // end of input it is the call in flight — with
@@ -1158,10 +1170,8 @@ impl<'a> Parser<'a> {
                 CallOutcome::Malformed => {
                     // Degrade to prose up to the next possible marker
                     // byte — nothing silently dropped.
-                    let upto = match self.text[block_start + 1..].find("<|") {
-                        Some(next) => block_start + 1 + next,
-                        None => self.text.len(),
-                    };
+                    let upto = block_start
+                        + past_first_char(&self.text[block_start..], "<|");
                     // Cut short mid-block: withheld, as a malformed call
                     // running to the end is in the generic loop.
                     if upto == self.text.len()
@@ -1201,8 +1211,7 @@ impl<'a> Parser<'a> {
         if !header_ish {
             // Prose outside any block structure (grammarless model
             // drift): consume up to the next possible marker.
-            let upto =
-                rest[1..].find("<|").map(|i| i + 1).unwrap_or(rest.len());
+            let upto = past_first_char(rest, "<|");
             let prose = rest[..upto].to_string();
             self.push_text(&prose);
             self.pos += upto;
@@ -1711,7 +1720,7 @@ impl<'a> Parser<'a> {
         // Array-wrapped: the last element is in flight when a container
         // inside it is still open.
         let in_flight = kept.open >= 2;
-        let closed = envelopes.len() - usize::from(in_flight);
+        let closed = envelopes.len().checked_sub(usize::from(in_flight))?;
         let calls = envelopes[..closed]
             .iter()
             .map(|env| self.map_json_call(env))
@@ -2170,6 +2179,16 @@ fn named<'t>(
 ) -> Option<(&'t str, &'t str)> {
     let (name, rest) = split_marker(text.strip_prefix(prefix)?, suffix)?;
     is_tool_name(name).then_some((name, rest))
+}
+
+/// Where `marker` next occurs in `text` past its first char — model
+/// output, so that char may be any width — or `text.len()`. What a
+/// scan that must make progress resumes from.
+fn past_first_char(text: &str, marker: &str) -> usize {
+    let first = text.chars().next().map_or(0, char::len_utf8);
+    text[first..]
+        .find(marker)
+        .map_or(text.len(), |at| first + at)
 }
 
 /// Split `text` at the first `marker`: what precedes it and what

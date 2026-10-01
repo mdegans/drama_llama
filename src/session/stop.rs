@@ -222,7 +222,9 @@ impl StopFilter {
         let Some(open) = self.parser.open() else {
             return Vec::new();
         };
-        let (last, before) = open.calls.split_last().expect("a call");
+        let Some((last, before)) = open.calls.split_last() else {
+            return Vec::new();
+        };
         let inputs = before.iter().map(|call| &call.input);
         if !self.cutter.in_any(inputs.chain([&open.held_input])) {
             return Vec::new();
@@ -826,6 +828,49 @@ mod tests {
             let (out, hit) = stream_and_batch(syntax, &["city"], &text);
             assert_eq!(hit, None, "{name}: a key is not text");
             assert_eq!(calls(&out), 1, "{name}: {out:#?}");
+        }
+    }
+
+    /// Multibyte text on both sides of a stop, and multibyte stops, in
+    /// prose and in a call's input: the stream holds back and cuts on
+    /// char boundaries, and agrees with the batch cut, in every
+    /// dialect.
+    #[test]
+    fn multibyte_stops_cut_on_char_boundaries() {
+        for (name, syntax, prose) in call_dialects() {
+            let text = format!(
+                "{prose}{}",
+                call(&syntax, json!({"city": "Zürich🦀日本é"})),
+            );
+            for (stop, want) in [
+                ("🦀", "Zürich"),
+                ("日本", "Zürich🦀"),
+                ("é", "Zürich🦀日本"),
+            ] {
+                let (out, hit) =
+                    stream_and_batch(syntax.clone(), &[stop], &text);
+                assert_eq!(hit.as_deref(), Some(stop), "{name} {stop}");
+                assert_eq!(
+                    input_of(&out),
+                    &json!({"city": want}),
+                    "{name} {stop}"
+                );
+            }
+            // A stop sharing a lead byte with the text (`ü` vs `é`,
+            // both `C3 …`) never matches half a char.
+            let (out, hit) = stream_and_batch(syntax.clone(), &["è"], &text);
+            assert_eq!(hit, None, "{name}");
+            assert_eq!(calls(&out), 1, "{name}");
+        }
+        for (name, syntax) in dialects() {
+            let text = format!(
+                "Grüße 🦀 日本語 done.\n\n{}",
+                call(&syntax, json!({"city": "Paris"})),
+            );
+            let (out, hit) = stream_and_batch(syntax, &["日本"], &text);
+            assert_eq!(hit.as_deref(), Some("日本"), "{name}");
+            assert_eq!(texts(&out), "Grüße 🦀 ", "{name}");
+            assert_eq!(calls(&out), 0, "{name}");
         }
     }
 

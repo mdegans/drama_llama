@@ -205,6 +205,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Non-ASCII model output can no longer panic a dialect parser.** The
+  gpt-oss Harmony parser stepped one *byte* past a block boundary
+  (`rest[1..]`) before looking for the next marker, so prose outside a
+  channel block that began with a multibyte char (`"Über alles"`, an
+  `é` after `<|end|>` or `<|start|>assistant`) sliced mid-char and
+  panicked — in blallama, the blocking session task, so the process
+  exited. Every scan that must make progress now steps one *char*. A
+  fuzz over each dialect's markers, their prefixes and multibyte chars
+  found two more: Gemma 4 read a turn-exit marker (`<|tool_response>`)
+  ahead of a channel open as prose once the open arrived, re-cutting
+  the streamed text under what it had already yielded (now consumed as
+  envelope, as it is everywhere else); and the stream parser sliced its
+  trailing text at the byte count it had yielded, which a re-cut of
+  that block (also reachable when a call opens inside an open thought
+  that a later close turns back into thought) puts mid-char — it now
+  resumes at the next char boundary and logs a warning. Tests put é,
+  🦀 and CJK at every char boundary of each dialect's reference turn,
+  batch under every leniency and streamed in uneven pieces
+  (`dialect::utf8_tests`), and through stop sequences and emission
+  provenance.
+
 - **Deeply nested output can no longer abort the process.** The Gemma
   4 dict-value reader and the readers of a call cut short (every
   dialect's streaming and clipped parse) recursed once per bracket, so
