@@ -1539,3 +1539,38 @@ fn duplicate_names_cost_once() {
     assert!(accepts(&src, r#""s""#));
     assert!(!accepts(&src, "1"));
 }
+
+/// A generation that floods its call trigger — 384 KB of it, ~32k
+/// tokens, alone or inside an unclosed thought — parses in linear time,
+/// in every dialect. Each trigger is a malformed call and a block
+/// boundary, and the parser rescanned the rest of the text for every
+/// landmark from each: quadratic, 10 s for one parse of Gemma 4's
+/// `<|tool_call>` flood, and a stream re-parses per token.
+#[test]
+fn trigger_flood_parses_in_linear_time() {
+    let t = tool(json!({
+        "type": "object",
+        "properties": {"p": {"type": "string"}},
+        "required": ["p"],
+    }));
+    for syntax in [
+        CallSyntax::qwen_xml(),
+        CallSyntax::hermes_json(),
+        CallSyntax::llama31_json(),
+        CallSyntax::gemma4(),
+        CallSyntax::gpt_oss(),
+    ] {
+        let trigger = syntax.trigger();
+        if trigger.is_empty() {
+            continue;
+        }
+        let flood = trigger.repeat((384 << 10) / trigger.len());
+        let thought = format!("{}{flood}", syntax.reasoning.start);
+        for text in [&flood, &thought] {
+            let start = Instant::now();
+            parse_text(&syntax, &[&t], text, false, Leniency::Final);
+            let elapsed = start.elapsed();
+            assert!(elapsed.as_secs() < 1, "{:?}: {elapsed:?}", syntax.family);
+        }
+    }
+}

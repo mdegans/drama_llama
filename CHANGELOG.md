@@ -224,6 +224,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deep as the model takes it, and a value past 127 levels is refused
   by the parse, as before.
 
+- **A generation that floods its call trigger parses in linear time.**
+  The dialect parser rescanned the rest of the text for each of its
+  landmarks (reasoning open, call trigger, Gemma's channel markers and
+  turn exit) from every block boundary, so 384 KB of Gemma 4's
+  `<|tool_call>` — 32k tokens, each a malformed call — took 10 s to
+  parse once (Qwen's flood 0.9 s), and the streaming parser re-parses
+  on every token. A landmark's next occurrence is now remembered for
+  the parse: the same floods take 160 ms.
+
 - **`required` and `type` arrays count each name once.** A `required`
   listing an undeclared name twice was a key the grammar made the
   model write twice, and a `type` naming one type twice

@@ -473,6 +473,7 @@ pub(crate) fn parse_text_cached(
         leniency,
         open: None,
         spellings: RefCell::new(std::mem::take(spellings)),
+        landmarks: HashMap::new(),
     };
     p.run(pre_opened_reasoning);
     *spellings = p.spellings.into_inner();
@@ -500,11 +501,38 @@ struct Parser<'a> {
     /// not once per parameter read — and kept across re-parses by a
     /// caller that lends its own ([`parse_text_cached`]).
     spellings: RefCell<Spellings>,
+    /// Each landmark's next occurrence ([`Self::find_landmark`]):
+    /// `marker → (searched from, found at)`, absolute.
+    landmarks: HashMap<String, (usize, Option<usize>)>,
 }
 
 impl<'a> Parser<'a> {
     fn rest(&self) -> &'a str {
         &self.text[self.pos..]
+    }
+
+    /// Where `marker` next occurs in [`Self::rest`], as
+    /// `rest().find(marker)` — remembered in `landmarks`, so the scan for
+    /// a landmark the text no longer holds runs to its end once, not
+    /// again from every block boundary after it. Those rescans made a
+    /// parse quadratic in its boundaries: 384 KB of Gemma 4's
+    /// `<|tool_call>` alone (32k tokens, each a malformed call and a
+    /// boundary) took 10 s to parse, and a stream re-parses on every
+    /// token.
+    fn find_landmark(&mut self, marker: &str) -> Option<usize> {
+        let pos = self.pos;
+        // `(from, at)`: `marker` first occurs at or after `from` at `at`
+        // — so first at or after `pos` there too, for `from <= pos <=
+        // at`, and nowhere after `pos` when `at` is `None`.
+        if let Some(&(from, at)) = self.landmarks.get(marker) {
+            if from <= pos && at.is_none_or(|at| at >= pos) {
+                return at.map(|at| at - pos);
+            }
+        }
+        let at = self.rest().find(marker);
+        self.landmarks
+            .insert(marker.to_string(), (pos, at.map(|at| at + pos)));
+        at
     }
 
     fn eat(&mut self, literal: &str) -> bool {
@@ -773,9 +801,8 @@ impl<'a> Parser<'a> {
         while self.pos < self.text.len() {
             // Next structural landmark: reasoning open or call
             // trigger, whichever comes first.
-            let rest = self.rest();
             let think_at = if reasoning_on && !reasoning_start.is_empty() {
-                rest.find(&reasoning_start)
+                self.find_landmark(&reasoning_start)
             } else {
                 None
             };
@@ -786,12 +813,12 @@ impl<'a> Parser<'a> {
                 // prose `{` costs a parse attempt that degrades back
                 // to Text on failure — same trade upstream makes.
                 if self.syntax.family == Family::JsonNative {
-                    rest.find(['{', '['])
+                    self.rest().find(['{', '['])
                 } else {
                     None
                 }
             } else {
-                rest.find(trigger.as_str())
+                self.find_landmark(&trigger)
             };
 
             // Channel noise strictly before the next thought / call
@@ -805,15 +832,16 @@ impl<'a> Parser<'a> {
                     think_at.is_none_or(|t| p < t)
                         && trigger_at.is_none_or(|t| p < t)
                 };
-                let open_at = rest
-                    .find(open.as_str())
+                let open_at = self
+                    .find_landmark(open)
                     .filter(|&o| think_at != Some(o))
                     .filter(before_structs);
                 let close_at = channel_close
                     .as_deref()
-                    .and_then(|c| rest.find(c))
+                    .and_then(|c| self.find_landmark(c))
                     .filter(before_structs)
                     .filter(|&c| open_at.is_none_or(|o| c < o));
+                let rest = self.rest();
                 if let Some(c) = close_at {
                     let prose = rest[..c].to_string();
                     self.push_text(&prose);
@@ -844,10 +872,11 @@ impl<'a> Parser<'a> {
             // content.
             let exit = &self.syntax.tool_response_start;
             if !exit.is_empty() {
-                let exit_at = rest.find(exit.as_str()).filter(|&p| {
+                let exit_at = self.find_landmark(exit).filter(|&p| {
                     think_at.is_none_or(|t| p < t)
                         && trigger_at.is_none_or(|t| p < t)
                 });
+                let rest = self.rest();
                 if let Some(p) = exit_at {
                     let prose = rest[..p].to_string();
                     self.push_text(&prose);
@@ -856,6 +885,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            let rest = self.rest();
             match (think_at, trigger_at) {
                 (Some(t), None) => {
                     let prose = rest[..t].to_string();
