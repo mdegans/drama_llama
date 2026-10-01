@@ -192,6 +192,9 @@ where
 /// `Arc<dyn LocalTransport>` is a valid `T: Transport` for anything generic
 /// over one — the [`Chat`](misanthropic::chat::Chat) driver included — while
 /// still carrying the scan. One erased type, not two.
+// async_trait marks each boxed future `#[must_use]`, which clippy
+// 1.99 flags as doubled (`double_must_use`); the expansion is not ours.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait LocalTransport:
     Transport<Prompt, Error = SessionError>
