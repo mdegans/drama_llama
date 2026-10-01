@@ -101,14 +101,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and an identical input (JSON value equality: member order aside,
   `1` and `1.0` differ) is now dropped from the turn, batch and
   streamed alike, and logged at `WARN` (`event = "tool_call_dropped"`,
-  the tool name only). Anthropic never emits identical parallel calls,
-  so a parity client never sees one; a call that differs in anything
-  is a parallel call and stays. The stream judges a call before
-  yielding it, and the parser releases calls only whole, so no part of
-  a dropped one is ever seen; a clipped repeat is dropped too, and
-  `BlockStream::open_call_json` then reports no open call. The batch
-  turn leaves no auto-tip: its KV holds the dropped call, which no
-  re-render of the returned turn reproduces.
+  the tool name only). Identical parallel calls are not observed from
+  Anthropic, so one is treated as never intended; a call that differs
+  in anything is a parallel call and stays. Only a *complete* call is
+  judged: a call cut by `max_tokens` or a stop sequence holds only the
+  members that completed, so it could match a call it would not have,
+  and it comes back cut (and, streamed, left open by
+  `BlockStream::open_call_json`) as on Anthropic — a client runs no
+  call of a turn that ended that way anyway. The stream judges a call
+  before yielding it, and the parser releases calls only whole, so no
+  part of a dropped one is ever seen. The batch turn leaves no
+  auto-tip: its KV holds the dropped call, which no re-render of the
+  returned turn reproduces.
 - **The #101 containment log says where.** The `EmittedSpecialToken`
   error event now carries up to three `hits` (block index and kind,
   offset in the block and in the emission, ~96 bytes of context each

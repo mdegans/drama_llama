@@ -6776,7 +6776,6 @@ impl<B: Backend> Session<B> {
             tool_use: false,
             last: None,
             calls: TurnCalls::default(),
-            dropped_last: false,
             stop: None,
         })
     }
@@ -7075,10 +7074,13 @@ impl<B: Backend> Session<B> {
             }
         };
         // A call repeating an earlier one in this turn is dropped (see
-        // `TurnCalls`) — after any stop-sequence cut, so a cut call is
-        // compared as the client will see it. Streaming drops the same
+        // `TurnCalls`) — only a complete one: a trailing call a cut
+        // (`max_tokens`, a stop sequence) left holds only its completed
+        // members, so it may match a call it would not have, and it
+        // comes back cut, as on Anthropic. Streaming drops the same
         // calls (`BlockStream`).
-        let (blocks, dropped_repeat) = drop_repeated_calls(blocks);
+        let (blocks, dropped_repeat) =
+            drop_repeated_calls(blocks, cut.is_some() || in_flight);
 
         // Whether this turn may leave an auto-tip. A turn whose KV no
         // longer matches its own output must not: a stop sequence was
@@ -8164,8 +8166,14 @@ fn merge_adjacent_prose(blocks: Vec<crate::Block>) -> Vec<crate::Block> {
 /// end of turn) is seated as a forced second call, and a model with
 /// nothing more to say likely fills it with the call it just made: a
 /// duplicate `create_post` or `vote`, which the client would dispatch
-/// twice. Anthropic never emits identical parallel calls, so dropping
-/// the repeat is parity-safe.
+/// twice. Identical parallel calls are not observed from Anthropic, so
+/// one is treated as never intended and the repeat dropped.
+///
+/// Only a *complete* call is judged: a call a cut (`max_tokens`, a stop
+/// sequence) left holds only the members that completed, so it can
+/// match a call it would not have, and it comes back cut, as Anthropic
+/// returns it. Dropping it would gain nothing — a client does not run
+/// the calls of a turn that ended that way.
 ///
 /// Identity is `serde_json::Value` equality on the input — member
 /// order is not significant, and a number spelled differently (`1`,
@@ -8206,13 +8214,21 @@ impl TurnCalls {
 }
 
 /// The batch half of [`TurnCalls`]: `blocks` without the calls that
-/// repeat an earlier one, and whether any were dropped. Prose either
-/// side of a dropped call is re-merged.
-fn drop_repeated_calls(blocks: Vec<crate::Block>) -> (Vec<crate::Block>, bool) {
+/// repeat an earlier one, and whether any were dropped. `cut_last`: the
+/// last block may be a call the turn's cut left, so it is not judged.
+/// Prose either side of a dropped call is re-merged.
+fn drop_repeated_calls(
+    blocks: Vec<crate::Block>,
+    cut_last: bool,
+) -> (Vec<crate::Block>, bool) {
     let mut calls = TurnCalls::default();
     let n = blocks.len();
-    let kept: Vec<crate::Block> =
-        blocks.into_iter().filter(|b| !calls.is_repeat(b)).collect();
+    let kept: Vec<crate::Block> = blocks
+        .into_iter()
+        .enumerate()
+        .filter(|(i, b)| (cut_last && i + 1 == n) || !calls.is_repeat(b))
+        .map(|(_, b)| b)
+        .collect();
     if kept.len() == n {
         (kept, false)
     } else {
@@ -8357,10 +8373,6 @@ pub struct BlockStream<'engine, B: Backend> {
     /// The turn's calls so far, to drop one that repeats an earlier
     /// one (see `TurnCalls`).
     calls: TurnCalls,
-    /// Whether the last block the parser released was a dropped
-    /// repeat: then the call a clip left open was never yielded, and
-    /// [`Self::open_call_json`] has nothing to report.
-    dropped_last: bool,
     /// Set once drained: see [`Self::stop_reason`].
     stop: Option<(Option<misanthropic::response::StopReason>, Option<String>)>,
 }
@@ -8389,9 +8401,7 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
     /// by a stop sequence is closed, and gets its `content_block_stop`
     /// on Anthropic too.
     pub fn open_call_json(&self) -> Option<&str> {
-        (self.drained && !self.dropped_last)
-            .then(|| self.filter.open_call_json())
-            .flatten()
+        self.drained.then(|| self.filter.open_call_json()).flatten()
     }
 
     /// Queue what the parser released, less any call that repeats an
@@ -8399,13 +8409,22 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
     /// a block at a time. The parser releases a call only whole (closed,
     /// or cut short at the end), so judging it here, before it is
     /// queued, means no part of a dropped call is ever yielded.
-    fn admit(&mut self, blocks: Vec<crate::Block>) {
-        for block in blocks {
-            self.dropped_last = self.calls.is_repeat(&block);
-            if !self.dropped_last {
-                self.pending.push_back(block);
-            }
-        }
+    ///
+    /// `cut_last`: the last block may be a call the turn's cut left
+    /// (the release that hit a stop sequence, or the clipped flush) —
+    /// only its completed members, so it is not judged (see
+    /// `TurnCalls`).
+    fn admit(&mut self, blocks: Vec<crate::Block>, cut_last: bool) {
+        let n = blocks.len();
+        let kept: Vec<crate::Block> = blocks
+            .into_iter()
+            .enumerate()
+            .filter(|(i, b)| {
+                (cut_last && i + 1 == n) || !self.calls.is_repeat(b)
+            })
+            .map(|(_, b)| b)
+            .collect();
+        self.pending.extend(kept);
     }
 
     /// End of generation: flush, pick the leniency, settle the ending.
@@ -8419,7 +8438,7 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         // and may themselves complete a stop sequence.
         let clipped = budget.is_some() || self.filter.hit().is_some();
         let rest = self.filter.finish(clipped);
-        self.admit(rest);
+        self.admit(rest, clipped || self.filter.hit().is_some());
         // A stop outranks the budget: the text reached it first.
         let cut = self
             .filter
@@ -8466,7 +8485,8 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
                     }
                     self.generated += 1;
                     let blocks = self.filter.push(&piece);
-                    self.admit(blocks);
+                    let hit = self.filter.hit().is_some();
+                    self.admit(blocks, hit);
                     // A stop sequence ends the turn; so does `run_call`'s
                     // one-shot halt on an exhausted grammar, so both
                     // paths stop on the same token.
@@ -12446,7 +12466,10 @@ mod tests {
             .description("Vote on a post.")
             .schema(serde_json::json!({
                 "type": "object",
-                "properties": { "post_id": { "type": "string" } },
+                "properties": {
+                    "post_id": { "type": "string" },
+                    "weight": { "type": "string" },
+                },
                 "required": ["post_id"],
             }))
             .build()
@@ -12567,37 +12590,85 @@ mod tests {
         assert_eq!(dropped_calls(&events), [(tracing::Level::WARN, "vote")],);
     }
 
-    /// A repeat the budget cuts once its input is whole is still a
-    /// repeat: dropped from both paths, so the stream has no open call
-    /// to report — the last call it yielded is closed.
-    #[test]
-    fn a_clipped_repeat_is_dropped_and_not_left_open() {
+    /// Cut `vote` calls with `inputs` short `tail` bytes before their
+    /// emission ends, and run the turn batch and streamed: the call
+    /// inputs each returns, and the stream's open call.
+    fn clipped_votes(
+        inputs: &[serde_json::Value],
+        tail: impl Fn(&str) -> usize,
+    ) -> (
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+        Option<String>,
+    ) {
         use misanthropic::response::StopReason;
-        let input = serde_json::json!({ "post_id": "7ad26ccd" });
-        let emission = crate::dialect::render_reference(
-            &per_call_json(),
-            &[("vote", &input), ("vote", &input)],
-        )
-        .unwrap();
-        // Cut after the second call's arguments close, before its own.
-        let budget = emission.len() - "}\n</tool_call>".len();
+        let calls: Vec<(&str, &serde_json::Value)> =
+            inputs.iter().map(|input| ("vote", input)).collect();
+        let emission =
+            crate::dialect::render_reference(&per_call_json(), &calls).unwrap();
+        let budget = emission.len() - tail(&emission);
         let prompt = vote_prompt()
             .max_tokens(std::num::NonZeroU32::new(budget as u32).unwrap());
 
-        let mut session = scripted_votes(&[input.clone(), input.clone()]);
+        let mut session = scripted_votes(inputs);
         let response = session.complete_response(&prompt).expect("complete");
         assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
         let message: crate::prompt::Message = response.inner.into();
-        assert_eq!(call_inputs(&message.content.0), [&input]);
+        let batch = call_inputs(&message.content.0)
+            .into_iter()
+            .cloned()
+            .collect();
 
         let mut stream = session.complete_stream(&prompt).expect("stream");
         let streamed: Vec<crate::Block> = stream.by_ref().collect();
-        assert_eq!(call_inputs(&streamed), [&input]);
         assert_eq!(
             stream.stop_reason(),
             Some((Some(StopReason::MaxTokens), None)),
         );
-        assert_eq!(stream.open_call_json(), None);
+        let streamed = call_inputs(&streamed).into_iter().cloned().collect();
+        (batch, streamed, stream.open_call_json().map(str::to_owned))
+    }
+
+    /// A repeat the budget cuts, even once its input is whole, is a cut
+    /// call, not a repeat: kept on both paths, as Anthropic returns it,
+    /// and the stream leaves it open.
+    #[test]
+    fn a_clipped_repeat_is_kept_and_left_open() {
+        let input = serde_json::json!({ "post_id": "7ad26ccd" });
+        let inputs = [input.clone(), input.clone()];
+        let mut run = None;
+        let events = capture_events(|| {
+            // Cut after the second call's arguments close, before its own.
+            run = Some(clipped_votes(&inputs, |_| "}\n</tool_call>".len()));
+        });
+        let (batch, streamed, open) = run.unwrap();
+        assert_eq!(batch, inputs);
+        assert_eq!(streamed, inputs);
+        assert!(open.is_some_and(|json| json.contains("7ad26ccd")));
+        assert!(dropped_calls(&events).is_empty());
+    }
+
+    /// A cut call holds only the members that completed, so it can
+    /// match an earlier call it would not have: `weight` cut mid-key
+    /// leaves `{post_id}`, the first call's input. It is kept and left
+    /// open, as on Anthropic.
+    #[test]
+    fn a_cut_call_matching_only_by_its_completed_members_is_kept() {
+        let first = serde_json::json!({ "post_id": "7ad26ccd" });
+        let second =
+            serde_json::json!({ "post_id": "7ad26ccd", "weight": "high" });
+        let mut run = None;
+        let events = capture_events(|| {
+            // Cut inside the `weight` key.
+            run = Some(clipped_votes(&[first.clone(), second], |e| {
+                e.len() - e.rfind("weight").unwrap() - "wei".len()
+            }));
+        });
+        let (batch, streamed, open) = run.unwrap();
+        assert_eq!(batch, [first.clone(), first.clone()]);
+        assert_eq!(streamed, [first.clone(), first]);
+        assert!(open.is_some_and(|json| json.contains("7ad26ccd")));
+        assert!(dropped_calls(&events).is_empty());
     }
 
     /// Identity is the input *value*: member order is not significant,
@@ -12611,15 +12682,18 @@ mod tests {
             crate::Block::from(ToolUse::new(name, input))
         };
         let text = |t: &'static str| crate::Block::from(t);
-        let (kept, dropped) = drop_repeated_calls(vec![
-            call("vote", serde_json::json!({ "a": 1, "b": "x" })),
-            text("one "),
-            call("vote", serde_json::json!({ "b": "x", "a": 1 })),
-            text("two"),
-            call("post", serde_json::json!({ "a": 1, "b": "x" })),
-            call("vote", serde_json::json!({ "a": 1.0, "b": "x" })),
-            call("vote", serde_json::json!({ "a": 2, "b": "x" })),
-        ]);
+        let (kept, dropped) = drop_repeated_calls(
+            vec![
+                call("vote", serde_json::json!({ "a": 1, "b": "x" })),
+                text("one "),
+                call("vote", serde_json::json!({ "b": "x", "a": 1 })),
+                text("two"),
+                call("post", serde_json::json!({ "a": 1, "b": "x" })),
+                call("vote", serde_json::json!({ "a": 1.0, "b": "x" })),
+                call("vote", serde_json::json!({ "a": 2, "b": "x" })),
+            ],
+            false,
+        );
         assert!(dropped);
         let shape: Vec<String> = kept
             .iter()
@@ -12642,7 +12716,10 @@ mod tests {
             ],
         );
         let unique = vec![call("vote", serde_json::json!({}))];
-        assert_eq!(drop_repeated_calls(unique.clone()), (unique, false));
+        assert_eq!(drop_repeated_calls(unique.clone(), false), (unique, false));
+        // A trailing call the turn's cut left is not judged.
+        let cut = vec![call("vote", serde_json::json!({})); 2];
+        assert_eq!(drop_repeated_calls(cut.clone(), true), (cut, false));
     }
 
     /// The divergence context: shared text before, then each side.
