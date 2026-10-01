@@ -9954,7 +9954,8 @@ mod tests {
         else {
             panic!("expected Deferred (auto-lazy) variant");
         };
-        assert_eq!(deferred.activate_after, vec![b"<tool_call>\n".to_vec()]);
+        // The bare special: the layout newline is the grammar's to force.
+        assert_eq!(deferred.activate_after, vec![b"<tool_call>".to_vec()]);
         assert!(deferred.feed_trigger);
         let state = deferred.grammar;
         let source = state.source().to_string();

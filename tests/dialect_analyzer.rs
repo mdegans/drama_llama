@@ -37,7 +37,9 @@ fn qwen3_coder_xml() {
     assert_eq!(s.arguments.name_prefix, "<parameter=", "{s:#?}");
     assert_eq!(s.arguments.name_suffix, ">\n", "{s:#?}");
     assert_eq!(s.arguments.value_suffix, "\n</parameter>\n", "{s:#?}");
-    assert_eq!(s.trigger(), "<tool_call>\n", "{s:#?}");
+    // The bare special: the opener's newline is the grammar's to force
+    // (#101 — a trigger that included it missed every other follow-up).
+    assert_eq!(s.trigger(), "<tool_call>", "{s:#?}");
     // #58: the `loop.first`-gated newline the template weaves between
     // consecutive calls. Without it a multi-call turn re-renders as
     // `</tool_call>\n<tool_call>` but the grammar forces

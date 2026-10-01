@@ -69,6 +69,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A real `<tool_call>` always arms the grammar (#101).** The marker
+  dialects (Hermes, cogito, Qwen's XML) triggered the lazy tool-call
+  grammar on the whole opener, `<tool_call>\n`, and the parser looked
+  for the same bytes. A real `<tool_call>` the model followed with
+  anything else — `{`, a space, `\r\n`, EOG — never armed the
+  grammar, was not parsed as a call, and landed in prose, where
+  containment rejected the turn (`EmittedSpecialToken`): ~10% of
+  cogito-32b attempts in the live Agora cohort, each a resample.
+  `CallSyntax::trigger` (and so `triggers`, and the legacy
+  `deferred_grammar_for_prompt`) is now the trimmed marker — the
+  special itself; the grammar, which starts at the full opener, takes
+  over one token earlier and forces the canonical newline, so a real
+  opener is seated as a call or surfaces as a `GrammarViolation`,
+  never as prose. The parser reads openers whitespace-tolerantly
+  (`<tool_call>{…}` is a call), canonical shapes are unchanged
+  byte-for-byte, and dialects whose trigger was already a bare marker
+  (Gemma 4, Mistral 4's `[TOOL_CALLS]`) and Harmony's recipient
+  headers are untouched. Behaviour change: `trigger()` returns
+  `"<tool_call>"` where it returned `"<tool_call>\n"`; the untrimmed
+  `section_start` / `per_call_start` remain the canonical bytes. A
+  model naming its own opener in prose now gets a call forced — the
+  special was rejected from free text anyway.
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
   assistant turn's answer and thought (3.6 also `lstrip`/`rstrip`s the
