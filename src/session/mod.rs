@@ -5156,6 +5156,11 @@ impl<B: Backend> Session<B> {
             grammar_mode.into_iter().collect()
         };
         Ok(PreparedCall {
+            parse_syntax: call_parse_syntax(
+                prompt,
+                &self.dialect,
+                &output_config_opts,
+            ),
             entries,
             breakpoints,
             modes,
@@ -6298,6 +6303,7 @@ impl<B: Backend> Session<B> {
             reasoning_opener_spent,
             reasoning_closed_by_render,
             media_by_id,
+            parse_syntax,
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
@@ -6333,7 +6339,6 @@ impl<B: Backend> Session<B> {
         // Stop sequences stop here exactly as in `run_call` — matched
         // against text output, never framing (#122) — so the two views
         // of the same bytes stop on the same token.
-        let parse_syntax = effective_tool_syntax(&self.dialect).into_owned();
         let parse_tools: Vec<Tool> = prompt
             .tools
             .iter()
@@ -6622,6 +6627,7 @@ impl<B: Backend> Session<B> {
             reasoning_opener_spent,
             reasoning_closed_by_render,
             media_by_id,
+            parse_syntax,
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
@@ -6695,7 +6701,7 @@ impl<B: Backend> Session<B> {
 
         // The parse dialect + tool schemas outlive the engine borrow
         // the predictor takes, so clone them out of `self` first.
-        let syntax = effective_tool_syntax(&self.dialect).into_owned();
+        let syntax = parse_syntax;
         let tools: Vec<Tool> = prompt
             .tools
             .iter()
@@ -6775,6 +6781,7 @@ impl<B: Backend> Session<B> {
             media_by_id,
             source_to_id,
             media_sentinel,
+            parse_syntax,
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
         let breakpoint_cells = breakpoints
@@ -6862,7 +6869,6 @@ impl<B: Backend> Session<B> {
         // The parse dialect and tool schemas: the request's stop
         // sequences are matched against the text output they parse to
         // (#122), during generation as well as after it.
-        let parse_syntax = effective_tool_syntax(&self.dialect).into_owned();
         let parse_tools: Vec<Tool> = prompt
             .tools
             .iter()
@@ -7987,26 +7993,17 @@ fn resolve_grammar(
     // never writes the Bare phase-split trigger (`</think>`), so its
     // JSON ran unconstrained and came back invalid with a 200 (Agora,
     // 2026-10-01) — and neither do Gemma 4 (`<channel|>`) or Mistral 4
-    // (`[/THINK]`). A dialect that measured no reasoning markers keeps
-    // `<think>…</think>`, the habit of the models behind it (cogito).
-    let reasoning = &dialect.reasoning;
-    let tagged = reasoning.mode != crate::dialect::ReasoningMode::None
-        && !reasoning.end.trim().is_empty();
-    let defaults = OutputConfigOptions::default();
+    // (`[/THINK]`). The markers are `output_config_thought`'s, which the
+    // call's parser reads too (`call_parse_syntax`).
+    let thought = output_config_thought(dialect);
     let output_config_opts = OutputConfigOptions {
-        thought_separator: reasoning.separator.clone(),
+        thought_separator: thought.separator,
         framing: match dialect.family {
             crate::dialect::Family::Harmony => crate::ResponseFraming::Harmony,
             _ => crate::ResponseFraming::Bare,
         },
-        thought_open: match tagged {
-            true => reasoning.start.clone(),
-            false => defaults.thought_open,
-        },
-        thought_close: match tagged {
-            true => reasoning.end.trim().to_string(),
-            false => defaults.thought_close,
-        },
+        thought_open: thought.start,
+        thought_close: thought.end.trim().to_string(),
         ..output_config_opts.clone()
     };
     if let Some(c) = output_config::compile_prompt_output_config(
@@ -8045,6 +8042,68 @@ fn resolve_grammar(
         "resolve_grammar: returning None (no grammar applied)",
     );
     Ok(None)
+}
+
+/// Whether `dialect` measured reasoning markers of its own — the
+/// markers its parser reads a thought by.
+fn reasoning_tagged(dialect: &crate::CallSyntax) -> bool {
+    dialect.reasoning.mode != crate::dialect::ReasoningMode::None
+        && !dialect.reasoning.end.trim().is_empty()
+}
+
+/// The thought a [`ResponseFraming::Bare`](crate::ResponseFraming)
+/// output_config grammar offers on `dialect`: the dialect's own markers,
+/// or — when its template measured none — `<think>…</think>`, the habit
+/// of the models behind such templates (cogito thinks in it when its
+/// template asks for deep thinking). The grammar spells these markers
+/// and the call's parser reads them ([`call_parse_syntax`]); the two
+/// disagreeing is what left cogito's `</think>\n{…}` thought inside the
+/// answer's text, failing the schema on every draw.
+fn output_config_thought(
+    dialect: &crate::CallSyntax,
+) -> crate::dialect::ReasoningSyntax {
+    let own = &dialect.reasoning;
+    match reasoning_tagged(dialect) {
+        true => own.clone(),
+        false => crate::dialect::ReasoningSyntax {
+            mode: crate::dialect::ReasoningMode::TagBased,
+            start: crate::output_config::THINK_OPEN.to_string(),
+            end: String::from_utf8_lossy(
+                crate::output_config::THINK_CLOSE_TRIGGER,
+            )
+            .into_owned(),
+            reingest: own.reingest,
+            separator: None,
+            efforts: own.efforts.clone(),
+        },
+    }
+}
+
+/// The syntax a call's output parses with: [`effective_tool_syntax`],
+/// except that a call whose output_config grammar offers the
+/// [`output_config_thought`] fallback — no forced tool outranking it, a
+/// Bare framing, `allow_thought`, and a dialect with no markers of its
+/// own — reads a thought in exactly those markers. Only then: on any
+/// other call such a dialect's `<think>` is text, as it always was.
+fn call_parse_syntax(
+    prompt: &Prompt,
+    dialect: &crate::CallSyntax,
+    opts: &OutputConfigOptions,
+) -> crate::CallSyntax {
+    let mut syntax = effective_tool_syntax(dialect).into_owned();
+    let forced = matches!(
+        prompt.tool_choice,
+        Some(ToolChoice::Any { .. } | ToolChoice::Method { .. })
+    );
+    let fallback = !forced
+        && !reasoning_tagged(dialect)
+        && dialect.family != crate::dialect::Family::Harmony
+        && opts.allow_thought
+        && output_config::json_schema(prompt).is_some();
+    if fallback {
+        syntax.reasoning = output_config_thought(dialect);
+    }
+    syntax
 }
 
 /// Whether a rendered generation prompt ends with a *pre-opened*
@@ -8128,6 +8187,8 @@ fn prompt_resumes_open_reasoning(
 /// metadata, the effective sampling chain, and the render-derived
 /// facts the parse / canonicalization stages need afterwards.
 struct PreparedCall {
+    /// The syntax this call's output parses with ([`call_parse_syntax`]).
+    parse_syntax: crate::CallSyntax,
     /// Full prompt entries (`parse_special = true` for text; media
     /// entries from the vision tokenizer's placeholder pass).
     entries: Vec<CacheEntry>,
@@ -10111,8 +10172,9 @@ mod tests {
     /// `output_schema` rule name the output_config builder emits.
     /// Default `OutputConfigOptions` has `phase_split=true`; since
     /// `compile_prompt_output_config` auto-disables phase_split when
-    /// `prompt.thinking.is_none()`, the prompt here opts into
-    /// thinking so the Deferred path is exercised.
+    /// `prompt.thinking.is_none()`, and defers only where the trigger is
+    /// certain, the prompt here opts into thinking and the render is
+    /// pre-opened so the Deferred path is exercised.
     #[test]
     fn test_resolve_grammar_output_config_when_no_tool_choice() {
         use misanthropic::prompt::thinking::Thinking;
@@ -10130,7 +10192,7 @@ mod tests {
             &prompt,
             &crate::CallSyntax::hermes_json(),
             &OutputConfigOptions::default(),
-            false,
+            true,
         )
         .expect("resolve");
         let crate::CompiledOutputConfig::Deferred(deferred) =
@@ -10601,18 +10663,20 @@ mod tests {
     }
 
     /// End to end over the scripted mock (ChatML, thinking in
-    /// `<think>…</think>`): with thinking on, an output_config
-    /// answer written without the thought never activates its deferred
-    /// grammar, so it ran unconstrained — refused by `complete_response`
-    /// and reported by the drained stream, as a schema violation when the
-    /// free body breaks the schema and a grammar violation when it
-    /// happens not to. The same answer after a thought stands on both
-    /// paths.
+    /// `<think>…</think>`), thinking on. A render that leaves the thought
+    /// optional constrains from the start, so an answer written without
+    /// a thought stands like one written after a thought — it used to
+    /// wake no deferred grammar and be refused on every draw. A render
+    /// that opened the thought (here a resumed open thought) still
+    /// defers the body to the closer, and an answer that never closes
+    /// it ran free: refused by `complete_response` and reported by the
+    /// drained stream.
     #[test]
-    fn unconstrained_output_config_answers_are_refused_on_both_paths() {
+    fn output_config_answers_with_and_without_a_thought_on_both_paths() {
+        use misanthropic::prompt::message::Role;
         use misanthropic::prompt::thinking::Thinking;
-        let prompt = Prompt::default()
-            .add_message((misanthropic::prompt::message::Role::User, "x?"))
+        let optional = Prompt::default()
+            .add_message((Role::User, "x?"))
             .unwrap()
             .json_schema(serde_json::json!({
                 "type": "object",
@@ -10623,19 +10687,26 @@ mod tests {
                 budget_tokens: NonZeroU32::new(1024).unwrap(),
                 display: None,
             });
+        let mut opened = optional.clone();
+        opened.messages.push(crate::Message {
+            role: crate::Role::Assistant,
+            content: crate::Content(vec![crate::prompt::open_thought("hm")]),
+        });
         type Verdict = Option<&'static str>;
         let name = |e: &SessionError| match e {
             SessionError::GrammarViolation { .. } => "grammar",
             SessionError::SchemaViolation { .. } => "schema",
             other => panic!("unexpected error: {other}"),
         };
-        let cases: [(&str, Verdict); 3] = [
-            (r#"{"x":1}"#, Some("grammar")),
-            (r#"{"y":1}"#, Some("schema")),
-            (r#"<think>hm</think>{"x":1}"#, None),
+        let cases: [(&Prompt, &str, Verdict); 5] = [
+            (&optional, r#"{"x":1}"#, None),
+            (&optional, r#"<think>hm</think>{"x":1}"#, None),
+            (&optional, "<think>hm</think>\n\n{\"x\":1}", None),
+            (&opened, r#"</think>{"x":1}"#, None),
+            (&opened, r#"{"x":1}"#, Some("schema")),
         ];
-        for (script, want) in cases {
-            let batch = mock::scripted(script).complete_response(&prompt);
+        for (prompt, script, want) in cases {
+            let batch = mock::scripted(script).complete_response(prompt);
             assert_eq!(
                 batch.as_ref().err().map(name),
                 want,
@@ -10644,7 +10715,7 @@ mod tests {
             );
 
             let mut session = mock::scripted(script);
-            let mut stream = session.complete_stream(&prompt).expect("stream");
+            let mut stream = session.complete_stream(prompt).expect("stream");
             assert!(stream.violation().is_none(), "nothing judged yet");
             let blocks: Vec<_> = stream.by_ref().collect();
             assert_eq!(
@@ -10681,12 +10752,14 @@ mod tests {
     /// every reasoning dialect whose thought does not close with
     /// `</think>` got the same hardcoded `</think>` trigger, so with
     /// thinking on Gemma 4 (`…\n<channel|>`) and Mistral 4 (`[/THINK]`)
-    /// wrote their json_schema bodies unconstrained. The trigger is the
-    /// dialect's own closer now. The live gpt-oss bodies stand in for
-    /// what an unconstrained body can be: unreachable after a thought in
-    /// the dialect's markers, thinking on (deferred) and off (unified,
-    /// where the body may also come first — neither format frames
-    /// content), while the valid body stays reachable and complete.
+    /// wrote their json_schema bodies unconstrained. The thought is
+    /// spelled in the dialect's own markers now. The live gpt-oss bodies
+    /// stand in for what an unconstrained body can be: unreachable after
+    /// a thought in the dialect's markers or without one, thinking on
+    /// and off (neither render opens the thought, so both constrain from
+    /// the start — a body without a thought must be steered too, not
+    /// left to a trigger it never writes), while the valid body stays
+    /// reachable and complete.
     #[test]
     fn tagged_reasoning_output_config_constrains_the_body() {
         let mistral = crate::dialect::analyze_template(
@@ -10714,11 +10787,11 @@ mod tests {
         for (name, dialect, thought) in cases {
             for (label, prompt) in role_consent_prompts() {
                 let compiled = output_config_grammar(&prompt, &dialect);
-                let prefixes: &[&str] = match label {
-                    "on" => &[thought],
-                    _ => &["", thought],
-                };
-                for prefix in prefixes {
+                assert!(
+                    matches!(compiled, crate::CompiledOutputConfig::Single(_)),
+                    "{name}, thinking {label}: the thought is optional"
+                );
+                for prefix in ["", thought] {
                     let at = format!("{name}, thinking {label}, {prefix:?}");
                     for bad in
                         [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
@@ -10743,8 +10816,10 @@ mod tests {
     }
 
     /// The `</think>` dialects keep `</think>`: Qwen 3.8 (whose measured
-    /// end is `\n</think>`, trimmed as the parser reads it) and cogito,
-    /// whose template measures no reasoning markers at all.
+    /// end is `\n</think>`, trimmed as the parser reads it) defers its
+    /// body to it under the render's pre-opened thought, and cogito,
+    /// whose template measures no reasoning markers at all, gets it as
+    /// the fallback thought of a unified grammar.
     #[test]
     fn think_dialects_keep_the_think_close_trigger() {
         let qwen = crate::dialect::analyze_template(
@@ -10753,21 +10828,118 @@ mod tests {
             "<|im_end|>",
         )
         .expect("analyze Qwen 3.8");
+        let [(_, thinking_on), _] = role_consent_prompts();
+        let crate::CompiledOutputConfig::Deferred(d) = resolve_grammar(
+            &thinking_on,
+            &qwen,
+            &OutputConfigOptions::default(),
+            true,
+        )
+        .expect("resolve")
+        .expect("output_config grammar") else {
+            panic!("qwen3.8: a pre-opened thought defers the body");
+        };
+        assert_eq!(d.activate_after, [b"</think>".to_vec()]);
+
+        let cogito = cogito_dialect();
+        let compiled = output_config_grammar(&thinking_on, &cogito);
+        assert!(matches!(compiled, crate::CompiledOutputConfig::Single(_)));
+        let thought =
+            format!("<think>\nHmm.\n</think>\n\n{ROLE_CONSENT_VALID}");
+        assert_eq!(constraint_admits(&compiled, &thought), Some(true));
+        assert_eq!(
+            constraint_admits(&compiled, ROLE_CONSENT_VALID),
+            Some(true)
+        );
+    }
+
+    /// cogito's dialect, analyzed from its baked template: no reasoning
+    /// markers of its own.
+    fn cogito_dialect() -> crate::CallSyntax {
         let cogito = crate::dialect::analyze_template(
             crate::baked::COGITO.replacement,
             "",
             "<|im_end|>",
         )
         .expect("analyze cogito");
-        let [(_, thinking_on), _] = role_consent_prompts();
-        for (name, dialect) in [("qwen3.8", qwen), ("cogito", cogito)] {
-            let crate::CompiledOutputConfig::Deferred(d) =
-                output_config_grammar(&thinking_on, &dialect)
-            else {
-                panic!("{name}: thinking on defers");
-            };
-            assert_eq!(d.activate_after, [b"</think>".to_vec()], "{name}");
+        assert_eq!(
+            cogito.reasoning.mode,
+            crate::dialect::ReasoningMode::None,
+            "precondition: {cogito:#?}"
+        );
+        cogito
+    }
+
+    /// cogito's output_config grammar offers the `<think>…</think>`
+    /// fallback thought, so the call's parser must read it too: before,
+    /// a thought the grammar admitted stayed in the answer's text and
+    /// failed the schema on every draw (`</think>\n{…}`, recheck
+    /// 2026-10-01). Only that call: without a structured output, or
+    /// under a forced tool, cogito's `<think>` is still text.
+    #[test]
+    fn cogito_parses_the_thought_its_output_config_grammar_admits() {
+        use crate::Block;
+        let cogito = cogito_dialect();
+        let opts = OutputConfigOptions::default();
+        let end = TurnEnd {
+            cut: false,
+            constraint_incomplete: false,
+            deferred_unfired: false,
+        };
+        for (label, prompt) in role_consent_prompts() {
+            let compiled = output_config_grammar(&prompt, &cogito);
+            let syntax = call_parse_syntax(&prompt, &cogito, &opts);
+            for gap in ["", "\n", "\n\n", " "] {
+                let emission =
+                    format!("<think>\nHmm.\n</think>{gap}{ROLE_CONSENT_VALID}");
+                let at = format!("thinking {label}, {gap:?}");
+                assert_eq!(
+                    constraint_admits(&compiled, &emission),
+                    Some(true),
+                    "{at}"
+                );
+                let parsed = crate::dialect::parse_text(
+                    &syntax,
+                    &[],
+                    &emission,
+                    false,
+                    crate::dialect::Leniency::Final,
+                );
+                let blocks = merge_adjacent_prose(parsed.blocks);
+                assert!(
+                    matches!(blocks.first(), Some(Block::Thought { .. })),
+                    "{at}: {blocks:?}"
+                );
+                assert!(
+                    TurnContract::of(&prompt, None)
+                        .breach(&blocks, end)
+                        .is_none(),
+                    "{at}: {blocks:?}"
+                );
+            }
         }
+        // Nothing structured to answer: the dialect's syntax, unchanged.
+        let plain = Prompt::default();
+        assert_eq!(call_parse_syntax(&plain, &cogito, &opts), cogito);
+        // A forced tool outranks the output_config grammar.
+        let tool = crate::Tool::builder("foo")
+            .description("Test tool.")
+            .schema(serde_json::json!({"type": "object"}))
+            .build()
+            .expect("valid test tool");
+        let forced = Prompt {
+            tools: Some(vec![tool.into()]),
+            tool_choice: Some(crate::ToolChoice::method("foo")),
+            ..role_consent_prompts()[0].1.clone()
+        };
+        assert_eq!(
+            call_parse_syntax(&forced, &cogito, &opts).reasoning,
+            cogito.reasoning
+        );
+        // A dialect with markers of its own reads them, always.
+        let qwen = crate::CallSyntax::qwen_xml();
+        let [(_, on), _] = role_consent_prompts();
+        assert_eq!(call_parse_syntax(&on, &qwen, &opts), qwen);
     }
 
     /// Drive `emission` through `compiled` token by token the way
@@ -12981,6 +13153,9 @@ mod tests {
                 end: "</think>".into(),
                 ..ReasoningSyntax::default()
             };
+            // So a resumed open thought renders after its opener.
+            session.render_opts = std::mem::take(&mut session.render_opts)
+                .with_reasoning_start("<think>");
             session
         }
 

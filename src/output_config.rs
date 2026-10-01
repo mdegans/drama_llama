@@ -109,6 +109,15 @@ pub struct OutputConfigOptions {
     /// otherwise-permissive `<think>` body. Defaults to `true`; flip off
     /// to keep the old unified-grammar behaviour (useful for callers that
     /// need the matcher to also guard the thought structure itself).
+    ///
+    /// Honoured only where the trigger is certain to come: a render that
+    /// pre-opened the thought (the model must close it) or
+    /// [`ResponseFraming::Harmony`] (the body lives in the final
+    /// channel). A [`ResponseFraming::Bare`] thought the render did not
+    /// open is optional, and a model that answers without one never
+    /// writes the trigger — its body would run unconstrained, a refusal
+    /// on every draw for a greedy or seeded caller. Those calls get the
+    /// unified `( thought | ws ) body` grammar, which steers instead.
     pub phase_split: bool,
     /// The bytes the template renders between `</think>` and the JSON
     /// body — a fact about the template, not a preference: `Session`
@@ -243,7 +252,9 @@ pub fn grammar_for_output_config(
 /// Compile an [`OutputConfig`] into a [`CompiledOutputConfig`] that either
 /// holds a single unified grammar or a thought-close-triggered
 /// [`DeferredGrammar`], depending on `opts.phase_split` and
-/// `opts.allow_thought`. Phase-split applies only when both are `true`.
+/// `opts.allow_thought`. Phase-split applies only when both are `true`
+/// and the trigger is certain: `thought_pre_opened`, or
+/// [`ResponseFraming::Harmony`] (see [`OutputConfigOptions::phase_split`]).
 ///
 /// `thought_pre_opened`: the rendered generation prompt already opened
 /// the thought (Qwen-style `<think>\n` scaffold, or a resumed open
@@ -262,7 +273,13 @@ pub fn compile_output_config(
         Some(OutputFormat::JsonSchema(f)) => &f.schema,
         _ => return Err(OutputConfigError::UnsupportedFormat),
     };
-    if opts.phase_split && opts.allow_thought {
+    // A deferred body waits for a trigger the model is sure to write:
+    // the closer of a thought the render opened, or Harmony's final
+    // channel. An optional Bare thought is not that — see
+    // `OutputConfigOptions::phase_split`.
+    let trigger_certain =
+        thought_pre_opened || opts.framing == ResponseFraming::Harmony;
+    if opts.phase_split && opts.allow_thought && trigger_certain {
         let source = build_json_only_grammar_source(schema, opts);
         let trigger = match opts.framing {
             ResponseFraming::Bare => opts.close().as_bytes(),
@@ -657,7 +674,7 @@ mod tests {
         let compiled = compile_output_config(
             &config,
             &OutputConfigOptions::default(),
-            false,
+            true,
         )
         .expect("compile");
         let CompiledOutputConfig::Deferred(deferred) = compiled else {
@@ -674,6 +691,34 @@ mod tests {
         );
         // …and indeed parses bare JSON as a sanity check.
         assert!(accepts(&source, r#"{"ok":true}"#));
+    }
+
+    /// A Bare thought the render did not open is optional, so a model
+    /// may answer without the trigger: a deferred body would then run
+    /// unconstrained and refuse every greedy draw. Unified instead, the
+    /// grammar steers a thought-less answer into the schema.
+    #[test]
+    fn compile_output_config_unified_when_thought_is_optional() {
+        let config = cfg(json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }));
+        let compiled = compile_output_config(
+            &config,
+            &OutputConfigOptions::default(),
+            false,
+        )
+        .expect("compile");
+        let CompiledOutputConfig::Single(SamplingMode::Grammar(state)) =
+            compiled
+        else {
+            panic!("an optional thought must not defer the body");
+        };
+        let source = state.source();
+        assert!(accepts(source, r#"{"ok":true}"#));
+        assert!(accepts(source, "<think>hmm</think>\n\n{\"ok\":true}"));
+        assert!(!accepts(source, r#"{"ok":1}"#));
     }
 
     #[test]
@@ -730,8 +775,9 @@ mod tests {
 
     #[test]
     fn compile_prompt_deferred_when_thinking_enabled() {
-        // When thinking IS enabled on the prompt, Session-level
-        // phase_split=true is honored and the grammar is deferred.
+        // When thinking IS enabled on the prompt and the render opened
+        // the thought, Session-level phase_split=true is honored and
+        // the grammar is deferred.
         use misanthropic::prompt::thinking::Thinking;
         use std::num::NonZeroU32;
         let prompt = Prompt::default()
@@ -748,7 +794,7 @@ mod tests {
         let compiled = compile_prompt_output_config(
             &prompt,
             &OutputConfigOptions::default(),
-            false,
+            true,
         )
         .expect("compile")
         .expect("output_config set");

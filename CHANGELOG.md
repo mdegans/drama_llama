@@ -117,6 +117,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that already closed the turn's thought (a prefilled closed thought,
   thinking on) now gets the unified grammar, since its closer can never
   be written and the deferred one would never fire.
+- **A structured answer written without a thought is steered, not
+  refused (Gemma 4, Mistral 4, cogito).** With thinking on, these
+  renders leave the thought optional, but the body still waited for the
+  thought's closer — so a model that answered `{…}` straight away woke
+  nothing, ran free, and drew the never-activated `GrammarViolation`
+  above on every greedy or seeded draw. The body now defers only where
+  the trigger is certain to come: a render that opened the thought
+  (Qwen) or Harmony's final channel. Every other call gets the unified
+  `( thought gap | ws ) body` grammar from the first token.
+  `OutputConfigOptions::phase_split` documents the rule.
+- **cogito's structured-output thought parses as a thought.** cogito's
+  template has no reasoning markers, so its `output_config` grammar
+  offers `<think>…</think>` (the model thinks in it when its template
+  asks for deep thinking), but the parser read no thought at all: the
+  thought stayed in the answer's text, and `</think>\n{…}` failed the
+  schema on every draw. A call whose output_config grammar offers that
+  fallback thought now parses with the same markers; other calls (no
+  structured output, or a forced tool) still read cogito's `<think>` as
+  text. Known cost: the parser trims whitespace beside the markers
+  (`<think>\n…</think>\n\n{` re-renders as `<think>…</think>\n{`),
+  so such a turn's tip is not byte-stable — a one-turn cache miss.
 - **The gap after a thought is bounded whitespace.** Every
   output_config grammar admits the measured separator after a thought
   *and* any other run of up to two whitespace bytes
