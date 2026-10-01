@@ -64,7 +64,14 @@ text.
   *alias* (`LiteralNeutralizer::with_aliases` / `emitted_piece`) — real
   framing when emitted, for provenance and the trigger scan. Content
   marking never uses aliases. Without them a call opened by the alias
-  came back as text (fail-closed).
+  came back as text (fail-closed). The id-level bans (`ToolChoice::None`
+  opener, #107 reasoning opener/closer) take specials through
+  `MarkerSpecials`, which adds every special sharing a marker piece's
+  text; before that a `None` turn could open a real call with the alias.
+  Fleet scan (vocab-only, CPU, 2026-10-01): Qwen 3.5/3.6/3.8, cogito-32b,
+  Gemma 4, gpt-oss, Mistral 4 have **no** duplicate-text specials (and no
+  normal token shares a special's text), so the alias path is
+  defense-in-depth, exercised only by the scripted `LitModel` vocab.
 - Auto-tip: `byte_stable` compares restored bytes, which cannot see a
   real reserved token in content (the render spells it). `run_call`
   stores no tip hash when the marked parse holds one — reachable only
