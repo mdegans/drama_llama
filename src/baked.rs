@@ -183,6 +183,130 @@ pub static ALL: &[&BakedTemplate] = &[
     &QWEN38,
 ];
 
+/// Every replacement template a later one has superseded, as the
+/// SHA-256 (hex) of its bytes with trailing whitespace trimmed, and the
+/// entry whose replacement superseded it. Read by [`superseded`].
+///
+/// A copy of a bake saved as a sidecar (`<model>.template.jinja`) wins
+/// over the bake on every load (rung 1 of the ladder), so once the bake
+/// moves on, the copy silently holds every fix since back. Two did in
+/// the 2026-10-01 cohort run: the gpt-oss and Gemma 4 sidecars were the
+/// 2026-07-27 bakes, byte for byte. **When a replacement changes, add
+/// the hash of the version it replaces here** (`git show
+/// <rev>:templates/<name>.jinja`, trailing whitespace trimmed, through
+/// `shasum -a 256`); `current_replacements_are_not_superseded` catches
+/// a hash added for the version still shipping.
+static SUPERSEDED: &[(&str, &BakedTemplate)] = &[
+    // gemma4-cache-stable
+    (
+        "bdc8afec6ff9c4874cfabc713b4442ff89b13540f8bc7d77994729fa671054a6",
+        &GEMMA4,
+    ), // 717231a
+    (
+        "227d6edb211679e45ea2463e3a5a2f85f109f96c4a519203790e96805c55af44",
+        &GEMMA4,
+    ), // 5b447e0
+    (
+        "12923c7cbb59bbf9e3d7bf426aba06d6602a2d482b7eb3e28c2f4e7d53594a1f",
+        &GEMMA4,
+    ), // b2da92e
+    // gptoss-cache-stable
+    (
+        "9401909540317cf6237689e8c21f18630f9e8378388400530611b44b18f9d6af",
+        &GPTOSS,
+    ), // e83b0ba
+    (
+        "1c02859e9fcc5dbb1ecbd066f8650f7d74e1b9d0becc09927139d582719f1bd1",
+        &GPTOSS,
+    ), // f1a5eb4
+    (
+        "62beb3f4a56e9882bd2094ce73ea0342f876657d82b8e48355cea73d1b44d604",
+        &GPTOSS,
+    ), // 6e7219a
+    (
+        "2cabdeda6c0a9d2b2c835bfc24d027baa8c3309cdc6b58b6878f31c721b48ed7",
+        &GPTOSS,
+    ), // 5b447e0
+    // cogito-cache-stable
+    (
+        "533183fc7ca0eb625e4cc8d0c3a7eb37586662d1aa37655e33ee7d67be0c9a93",
+        &COGITO,
+    ), // bf8cbdf
+    // mistral4-cache-stable
+    (
+        "4de54a3024964e5c9f0c41831cd418caaa04351a10addf8e45ebdcaa07d229d0",
+        &MISTRAL4,
+    ), // 74cf8da
+    (
+        "96d0b806a4c07b24606a7ff3365882baf85f807d83708f273c3b0bd1ae0c65b3",
+        &MISTRAL4,
+    ), // 53a07d3
+    // qwen3.6-cache-stable
+    (
+        "f1fa63ebc27d325e784062d71012f8006e807e61d7bccc5d97df9dffdedb0187",
+        &QWEN36,
+    ), // da629e6
+    (
+        "b6de2277ea5727f9b832063706f0ae768538255f6de24a5f9ab248e0e64974fb",
+        &QWEN36,
+    ), // 5283044
+    (
+        "53e26ec9bb33a50ed70fa7773e2f94af23fd5c94bf431576e0dd936e8f6dfe9a",
+        &QWEN36,
+    ), // 1d3fea1
+    (
+        "19de7499e09242ba434df8c9f7974455560726ecdae6f469a7e31b19353a6551",
+        &QWEN36,
+    ), // 904a9f5
+    (
+        "cde4091ed7558645e33cfd91958ec0c3c92e79c8dade68b22d785d3d0c34b90b",
+        &QWEN36,
+    ), // 8fb8088
+    // qwen3.8-cache-stable
+    (
+        "6702f051a25bf887e9cfd4a6cb6202bbd929f5756b5dd1aaeb2dccf5374352a3",
+        &QWEN38,
+    ), // da629e6
+    (
+        "b0f8ade1dac8479bb972cd6ad85e78c0456d4aeb9a5ed3535c9f85ed793d3630",
+        &QWEN38,
+    ), // 1d3fea1
+    (
+        "e9c93685dd9faea1ec9f9b79c2213e1b6c5c4ad4991e6e124fbd427a98f787d1",
+        &QWEN38,
+    ), // 904a9f5
+    (
+        "2992d2ec8ead86990153597796953ecac7f12965e2d06af2b1eab292a9ab6141",
+        &QWEN38,
+    ), // 8fb8088
+];
+
+/// Is `source` — a template sidecar, say — a byte-identical copy of a
+/// baked replacement a later version has superseded? `Some(entry)` names
+/// the entry whose current replacement it is an old copy of: such a
+/// sidecar overrides that replacement and holds back every fix to it
+/// since, so it is better deleted. Trailing whitespace is ignored, as by
+/// [`detect`].
+pub fn superseded(source: &str) -> Option<&'static BakedTemplate> {
+    superseded_in(source, SUPERSEDED)
+}
+
+fn superseded_in(
+    source: &str,
+    list: &[(&str, &'static BakedTemplate)],
+) -> Option<&'static BakedTemplate> {
+    use sha2::Digest;
+    use std::fmt::Write;
+    let digest = sha2::Sha256::digest(source.trim_end().as_bytes());
+    let hex = digest.iter().fold(String::new(), |mut hex, b| {
+        let _ = write!(hex, "{b:02x}");
+        hex
+    });
+    list.iter()
+        .find(|(hash, _)| *hash == hex)
+        .map(|&(_, baked)| baked)
+}
+
 /// Match an embedded template against the registry. `Some` only on
 /// byte-equality with a known stock template (trailing whitespace
 /// ignored — GGUF metadata and dumped files may disagree on a final
@@ -303,6 +427,44 @@ mod tests {
                 baked.name
             );
         }
+    }
+
+    /// A superseded bake is found by its bytes (trailing whitespace
+    /// ignored); anything else, by none.
+    #[test]
+    fn superseded_finds_an_old_copy() {
+        let old = "{# an old bake #}\n";
+        // `printf '{# an old bake #}' | shasum -a 256`.
+        let list = [(
+            "6db4eb13ecda1bf08c1e3d48d59ea1b4ed664d38f021f321b4ba505c35677788",
+            &GEMMA4,
+        )];
+        let hit = superseded_in(old, &list).expect("an old copy");
+        assert_eq!(hit.name, GEMMA4.name);
+        assert!(superseded_in(&format!("{old}\n\n"), &list).is_some());
+        assert!(superseded_in("{# another #}", &list).is_none());
+    }
+
+    /// No current replacement is listed as superseded — the warning
+    /// would fire on a sidecar that is today's bake — and every entry is
+    /// a SHA-256, listed once.
+    #[test]
+    fn current_replacements_are_not_superseded() {
+        for baked in ALL {
+            assert!(
+                superseded(baked.replacement).is_none(),
+                "{}: its current replacement is listed as superseded",
+                baked.name
+            );
+        }
+        let mut hashes: Vec<&str> =
+            SUPERSEDED.iter().map(|&(hash, _)| hash).collect();
+        assert!(hashes.iter().all(|h| h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))));
+        hashes.sort_unstable();
+        hashes.dedup();
+        assert_eq!(hashes.len(), SUPERSEDED.len(), "a hash listed twice");
     }
 
     /// Replacements must never *be* detection keys: applying a baked

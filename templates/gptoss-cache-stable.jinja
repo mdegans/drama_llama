@@ -230,6 +230,10 @@
     message loop below is rewritten so that render(parse(emission))
     reproduces the emission byte-for-byte:
 
+    * The turn renders from drama_llama's `chunks` — its blocks in
+      emission order — so each analysis block renders as its own and
+      prose where it sat (the merged `thinking` / `content_pre` /
+      `content_post` fields when `chunks` is absent).
     * Analysis (CoT) renders on EVERY assistant message that carries
       reasoning (`reasoning_content`), gated on `preserve_thinking`
       (drama_llama sets it true by default) — the stock template drops
@@ -245,7 +249,16 @@
       by block order) renders as a commentary preamble message in
       emission order — the causal announce-then-call shape. After-call
       text (`content_post`, unreachable by emission) renders after the
-      turn's tool responses.
+      turn's tool responses. In a turn without calls, every text chunk
+      but the last is a preamble too: drama_llama keeps each channel's
+      body its own text block, so a preamble then a final come back as
+      two, and only the last is the final.
+    * A final answer renders under the header the model wrote for
+      it: `<|channel|>final <|constrain|>json<|message|>` when the
+      thinking chunk before it carries `constrain` (drama_llama
+      records the content type the model declared, `json` for
+      structured output), plain otherwise — an empty final too. Stock
+      renders every final channel plain.
     * Tool responses render by forward-scan from their call message,
       names resolved via tool_call_id (the stock last_tool_call
       inference misattributes every result after a parallel call).
@@ -303,57 +316,104 @@
     {%- endif -%}
 {%- endfor -%}
 
+{#- A final answer, under the header the model wrote for it: with the
+    content type it declared (` <|constrain|>json`, gpt-oss's unforced
+    structured-output header), which drama_llama supplies as the
+    `constrain` of the thinking chunk before it, or plain. Its content does not say which:
+    `[1, 2, 3]` may be prose, and a structured answer need not be an
+    object. Stock renders every final channel plain, so a constrained
+    final re-rendered a constraint short and lost its tip. -#}
+{%- macro render_final(text, constrain=none) -%}
+    {{- "<|start|>assistant<|channel|>final" + (" <|constrain|>" + constrain if constrain else "") + "<|message|>" + text + "<|end|>" }}
+{%- endmacro -%}
+
 {#- Render messages #}
 {%- for message in loop_messages -%}
     {%- if message.role == 'assistant' -%}
-        {%- set thinking_text = message.get('reasoning_content') or message.get('thinking') -%}
-        {%- if thinking_text and ((preserve_thinking is defined and preserve_thinking is true) or loop.index0 > ns_turn.last_user_idx) -%}
-            {{- "<|start|>assistant<|channel|>analysis<|message|>" + thinking_text + "<|end|>" }}
+        {#- The turn renders from `chunks`, its blocks in emission order
+            (drama_llama supplies them), so each analysis block the model
+            wrote renders as its own, and prose where it sat. Without
+            `chunks` the turn is rebuilt from the merged fields: the
+            reasoning, then the pre-call prose, the calls, the rest. -#}
+        {%- set keep_thinking = (preserve_thinking is defined and preserve_thinking is true) or loop.index0 > ns_turn.last_user_idx -%}
+        {%- set has_calls = message.get('tool_calls') and true -%}
+        {%- set chunks = message.get('chunks') -%}
+        {%- if chunks is none -%}
+            {%- set thinking_text = message.get('reasoning_content') or message.get('thinking') -%}
+            {%- set chunks = [{'type': 'thinking', 'thinking': thinking_text}] if thinking_text else [] -%}
+            {%- if has_calls -%}
+                {%- if message.get('content_pre') -%}
+                    {%- set chunks = chunks + [{'type': 'text', 'text': message.content_pre}] -%}
+                {%- endif -%}
+                {%- set chunks = chunks + [{'type': 'tool_calls'}] -%}
+                {%- if message.get('content_post') -%}
+                    {%- set chunks = chunks + [{'type': 'text', 'text': message.content_post}] -%}
+                {%- endif -%}
+            {%- elif message.get('content') -%}
+                {%- set chunks = chunks + [{'type': 'text', 'text': message.content}] -%}
+            {%- endif -%}
         {%- endif -%}
-        {%- if message.get('tool_calls') -%}
-            {%- if message.get('content_pre') -%}
-                {{- "<|start|>assistant<|channel|>commentary<|message|>" + message.content_pre + "<|end|>" }}
+        {%- set ns_final = namespace(done=false, constrain=none, last_text=-1) -%}
+        {%- for chunk in chunks -%}
+            {%- if chunk.type == 'text' -%}
+                {%- set ns_final.last_text = loop.index0 -%}
             {%- endif -%}
-            {%- for tool_call in message.tool_calls -%}
-                {%- set fn = tool_call.function if tool_call.get('function') else tool_call -%}
-                {{- "<|start|>assistant<|channel|>commentary to=functions." + fn.name + " <|constrain|>json<|message|>" }}
-                {%- if fn.arguments is string -%}
-                    {{- fn.arguments }}
-                {%- else -%}
-                    {{- fn.arguments | tojson }}
+        {%- endfor -%}
+        {%- set message_index = loop.index0 -%}
+        {%- for chunk in chunks -%}
+            {%- if chunk.type == 'thinking' -%}
+                {%- set ns_final.constrain = chunk.get('constrain') -%}
+                {%- if keep_thinking -%}
+                    {{- "<|start|>assistant<|channel|>analysis<|message|>" + chunk.thinking + "<|end|>" }}
                 {%- endif -%}
-                {{- "<|call|>" }}
-            {%- endfor -%}
-            {#- Forward-scan consecutive tool messages: responses render
-                right after their calls, names resolved by id. -#}
-            {%- set ns_scan = namespace(stopped=false) -%}
-            {%- set call_msg = message -%}
-            {%- for k in range(loop.index0 + 1, loop_messages | length) -%}
-                {%- if ns_scan.stopped -%}
-                {%- elif loop_messages[k].role != 'tool' -%}
-                    {%- set ns_scan.stopped = true -%}
-                {%- else -%}
-                    {%- set follow = loop_messages[k] -%}
-                    {%- set ns_name = namespace(v='unknown') -%}
-                    {%- for tc in call_msg.tool_calls -%}
-                        {%- set tcf = tc.function if tc.get('function') else tc -%}
-                        {%- if tc.get('id') == follow.get('tool_call_id') -%}
-                            {%- set ns_name.v = tcf.name -%}
-                        {%- endif -%}
-                    {%- endfor -%}
-                    {{- "<|start|>functions." + ns_name.v }}
-                    {%- if follow.content is string %}
-                        {{- " to=assistant<|channel|>commentary<|message|>" + follow.content + "<|end|>" }}
-                    {%- else %}
-                        {{- " to=assistant<|channel|>commentary<|message|>" + follow.content|tojson + "<|end|>" }}
-                    {%- endif %}
-                {%- endif -%}
-            {%- endfor -%}
-            {%- if message.get('content_post') -%}
-                {{- "<|start|>assistant<|channel|>commentary<|message|>" + message.content_post + "<|end|>" }}
+            {%- elif chunk.type == 'text' and (has_calls or loop.index0 != ns_final.last_text) -%}
+                {#- Prose around calls is a commentary preamble; after
+                    the calls (unreachable by emission) it follows the
+                    turn's tool responses. Without calls, so is every
+                    text before the last. -#}
+                {{- "<|start|>assistant<|channel|>commentary<|message|>" + chunk.text + "<|end|>" }}
+            {%- elif chunk.type == 'text' -%}
+                {{- render_final(chunk.text, ns_final.constrain) }}
+                {%- set ns_final.done = true -%}
+            {%- elif chunk.type == 'tool_calls' -%}
+                {%- for tool_call in message.tool_calls -%}
+                    {%- set fn = tool_call.function if tool_call.get('function') else tool_call -%}
+                    {{- "<|start|>assistant<|channel|>commentary to=functions." + fn.name + " <|constrain|>json<|message|>" }}
+                    {%- if fn.arguments is string -%}
+                        {{- fn.arguments }}
+                    {%- else -%}
+                        {{- fn.arguments | tojson }}
+                    {%- endif -%}
+                    {{- "<|call|>" }}
+                {%- endfor -%}
+                {#- Forward-scan consecutive tool messages: responses render
+                    right after their calls, names resolved by id. -#}
+                {%- set ns_scan = namespace(stopped=false) -%}
+                {%- for k in range(message_index + 1, loop_messages | length) -%}
+                    {%- if ns_scan.stopped -%}
+                    {%- elif loop_messages[k].role != 'tool' -%}
+                        {%- set ns_scan.stopped = true -%}
+                    {%- else -%}
+                        {%- set follow = loop_messages[k] -%}
+                        {%- set ns_name = namespace(v='unknown') -%}
+                        {%- for tc in message.tool_calls -%}
+                            {%- set tcf = tc.function if tc.get('function') else tc -%}
+                            {%- if tc.get('id') == follow.get('tool_call_id') -%}
+                                {%- set ns_name.v = tcf.name -%}
+                            {%- endif -%}
+                        {%- endfor -%}
+                        {{- "<|start|>functions." + ns_name.v }}
+                        {%- if follow.content is string %}
+                            {{- " to=assistant<|channel|>commentary<|message|>" + follow.content + "<|end|>" }}
+                        {%- else %}
+                            {{- " to=assistant<|channel|>commentary<|message|>" + follow.content|tojson + "<|end|>" }}
+                        {%- endif %}
+                    {%- endif -%}
+                {%- endfor -%}
             {%- endif -%}
-        {%- else -%}
-            {{- "<|start|>assistant<|channel|>final<|message|>" + (message.get('content') or '') + "<|end|>" }}
+        {%- endfor -%}
+        {%- if not has_calls and not ns_final.done -%}
+            {{- render_final('', ns_final.constrain) }}
         {%- endif -%}
     {%- elif message.role == 'tool' -%}
         {#- Rendered by the forward-scan above. -#}

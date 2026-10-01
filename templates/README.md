@@ -21,8 +21,18 @@ path is byte-identical, so upstream's pinned expectations
 model actually generated against (real reasoning, gated by
 `preserve_thinking` for aged turns; the empty
 `<|channel>thought\n<channel|>` scaffold otherwise), so the KV cache
-stays a byte prefix of the next render across tool turns. Everything
-outside the thinking-channel block is byte-identical to
+stays a byte prefix of the next render across tool turns. A model
+turn's answer also renders verbatim: stock `| trim`s it, so an answer
+the model ended in whitespace, or began with a newline after its
+thought, re-rendered shorter than it was generated (found by the
+fleet sweep, `fleet_bakes_round_trip_every_admitted_shape`; not yet
+seen live). A model turn renders from the `chunks` drama_llama
+supplies (its blocks in emission order, see the gpt-oss notes below):
+the first thought opens the turn as before, and a second thought —
+`<|channel>thought\nA\n<channel|><|channel>thought\nB\n<channel|>` —
+renders as its own channel block where the model wrote it instead of
+merging into one `reasoning` (the fleet sweep pins it). Everything
+else outside the thinking-channel block is byte-identical to
 `gemma4-gguf.jinja`.
 
 `gptoss-gguf.jinja` is dumped from the gpt-oss-20b Unsloth GGUF
@@ -41,6 +51,38 @@ for ALL `tool_calls` (stock renders only the first, in the role-header
 re-ingest shape), pre-call prose renders as a causal commentary
 preamble, and tool responses render by forward-scan with
 `tool_call_id`-resolved names.
+A turn renders from the `chunks` drama_llama supplies on every
+assistant message — its blocks in emission order — so two analysis
+blocks render as two (they used to merge into one) and a thought after
+the preamble renders after it. Each text block is its own chunk, and in
+a turn without calls every text but the last renders as a commentary
+preamble: a preamble then a final come back from the parse as two text
+blocks, and only the last is the final. Without `chunks` the turn is
+rebuilt from the merged fields as before.
+
+A final answer renders under the header the model wrote:
+`<|channel|>final <|constrain|>json<|message|>` when the thinking chunk
+before it carries `constrain` (the content type the model declared,
+which the parser records in the signature of the analysis block right
+before the final — `drama_llama:tail;constrain=json`), plain otherwise;
+an empty final renders from the thought alone. That content
+type is what gpt-oss writes for structured output, unforced (every JSON
+final in the 2026-10-01 Agora run carried it); stock renders every
+final channel plain, so each one re-rendered a constraint short and
+lost its tip (470..1111 tokens a turn, live). The content's shape
+cannot stand in for the header — `[1, 2, 3]` may be prose, and a
+structured answer whose schema root is a string or a number is not
+`{…}` — so both spellings round-trip, and after another block the
+`output_config` grammar leaves the choice to the model; opening the
+turn it admits only the plain header. Irreducible, pinned in
+`gptoss_cache_stable_round_trips_json_final` and
+`gptoss_cache_stable_keeps_a_preamble_apart_from_its_final`: a
+constrained final with no thought right before it — none, or a
+preamble between — has nowhere to record its header, and re-renders
+plain. Under `output_config` the grammar refuses that preamble after
+the analysis, and a turn that opens with one is a schema violation. Harmony does not document a final-channel content
+type (its guide shows `<|constrain|>` only on commentary calls); this
+follows the model.
 The `<|return|>`/`<|end|>` re-ingest rewrite (upstream issue #15417)
 costs nothing: the sampled EOG is never committed to KV, and the
 session's auto-tip records the CANONICAL close token from the
@@ -99,15 +141,24 @@ is byte-identical:
    emits it unconditionally and has no `add_generation_prompt` branch
    at all, so it cannot render an open assistant turn and the
    generation-prompt render is never a byte prefix of the follow-up.
-2. Reasoning round-trips as `[THINK]…[/THINK]` from the
+2. Reasoning round-trips as `[THINK]…[/THINK]`, one block per thought,
+   from the
    `reasoning`/`reasoning_content` field, gated by `preserve_thinking`
    for aged turns. Stock accepts a thought only as a `thinking`-typed
    content chunk, so the analyzer measures `ReasoningMode::None`, the
    channel is invisible to grammar/parser/re-render, and a
    `ReasoningReingest::Field` transcript trips stock's own
    `raise_exception` (pinned: `mistral4_stock_cannot_render_field_reasoning`).
-3. Pre-call prose renders in emission order (`content_pre` before the
-   calls, `content_post` after) rather than merged into one slot.
+3. The turn renders in emission order from the `chunks` drama_llama
+   supplies on every assistant message — stock Mistral's own chunk
+   shape (`text` / `thinking`), plus a `tool_calls` marker where the
+   first call sat — rather than merging prose into one slot and
+   thoughts into one block. Back-to-back thoughts
+   (`…[/THINK][THINK]…`, live 2026-10-01: ~1.6k tokens lost when they
+   merged) keep their markers, and prose between thoughts stays where
+   the model wrote it. Without `chunks` (the analyzer's probes) the
+   turn renders from `reasoning` / `reasoning_content` and
+   `content_pre` / `content_post`.
 4. The 140-line Unsloth date-arithmetic preamble and the default Le
    Chat system message are removed. That block injected today's *and*
    yesterday's date into the prompt **prefix**, so a session spanning
@@ -150,7 +201,11 @@ the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
 1. The **assistant** turn renders verbatim — no trim of the answer or
    the reasoning, and the 3.6 `</think>` split is exact (drama_llama
    inlines a thought as `<think>…</think>` with no padding, so the
-   split recovers the parsed blocks byte-for-byte). The flip side: the
+   split recovers the parsed blocks byte-for-byte). 3.6 splits on the
+   *first* `</think>`, the one closing the inlined thought; stock keeps
+   only what follows the last, so a second `</think>` in the answer
+   dropped all the prose before it (the aged branch below follows the
+   bake here too — the one place it parts from stock). The flip side: the
    split no longer normalizes a *padded* `<think>\n…\n</think>` a
    client inlined into a Text block itself — its padding renders
    inside the thought, doubling the template's own. drama_llama never
@@ -193,6 +248,18 @@ the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
    stock 3.8's own rule, so the 3.8 bake needs no change here. Pinned,
    stock 3.6 as the control:
    `session::tests::qwen_cache_stable_round_trips_scalar_args`.
+7. A turn that **reasons again after its prose**
+   (`…</think>\n\nChecking.<think>\nMore.\n</think>…`) renders from
+   the `chunks` drama_llama supplies: the first thought opens the turn
+   as before, and each later one renders inline where the model wrote
+   it, `<think>\n…\n</think>`. The merged fields cannot place it — 3.6
+   inlined it unpadded, 3.8 joined both thoughts in `reasoning_content`
+   — so the turn lost its tip
+   (`session::tests::qwen_cache_stable_round_trips_a_second_thought`).
+   Aged out with `preserve_thinking` off, such a turn renders its prose
+   alone, every thought dropped as stock drops the merged ones, and a
+   client's text after the calls renders before them with the rest
+   (`session::tests::qwen_cache_stable_chunks_age_and_keep_late_text`).
 
 The leading system/tools header, user and tool turns, the
 reasoning-effort block (3.8), tool declarations, the rest of the
@@ -219,7 +286,9 @@ number keeps no spelling:
   when present but cannot record its absence.
 - Whitespace after the last call (`…</tool_call>\n`) is dropped: the
   template closes the turn right after `</tool_call>`, and no block
-  carries the tail.
+  carries the tail. No constrained call turn writes it: the tool
+  grammar reads a newline after a call as the separator to the next
+  (`qwen_whitespace_after_the_last_call_is_unreachable`).
 - Qwen3.6 only: a thought containing a literal `<think>` loses
   everything before it. The inlined thought is recovered with
   `split('<think>')[-1]`; 3.8 reads `reasoning_content` and
@@ -240,7 +309,27 @@ reaches past BPE boundaries) survives it. Outside the template's reach
 
 A `<model>.template.jinja` sidecar next to the GGUF still overrides
 any of these — baked templates removed the *need* for sidecar
-deployment on recognized models, not the mechanism.
+deployment on recognized models, not the mechanism. A sidecar that is
+a byte-identical copy of an *old* bake holds back every fix since, so
+`src/baked.rs` keeps the SHA-256 of every superseded replacement
+(`SUPERSEDED`) and a match logs `stale_template_sidecar` at `WARN` on
+load. **When you change a replacement here, add the hash of the version
+it replaces to that list.**
+
+## Framing no block carries: the thought tail
+
+Anthropic never returns a whitespace-only text block and rejects one on
+ingest, so the parse never yields one — yet the whitespace a model
+writes between a thought and its call (`[/THINK]\n[TOOL_CALLS]`,
+`<channel|>\n<|tool_call>`, `</think>\n\n<tool_call>`) is in the KV.
+It rides in the closed thought's `signature`
+(`drama_llama:tail;gap=%0A`), and the renderer (`chat_template.rs`,
+before any template sees the turn) puts it back as the text it was, so
+every template here renders the turn exactly as if it were a block.
+The same tail carries the content type of a Harmony final right after
+the thought (`;constrain=json`, above). Whitespace with no thought
+before it — a turn's first bytes before a call, after the last call —
+has nothing to ride and is dropped (`blank_text_is_never_returned`).
 
 ## completion-scaffold.jinja
 

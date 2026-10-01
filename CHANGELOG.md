@@ -376,6 +376,168 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the invariant that every anchor a call leaves was checkpointed
   (`every_anchor_a_call_leaves_is_checkpointed`) through `Session`;
   real-weights checks in `tests/swa_checkpoint.rs` (`#[ignore]`d).
+- **The baked Qwen3.6 template keeps the prose before a second
+  `</think>`.** It recovered an inlined thought by splitting content on
+  `</think>` and kept only what followed the *last* one, as stock does,
+  so an answer containing a stray `</think>` re-rendered without the
+  prose before it (live on Agora 2026-10-01, in the session's own
+  round-trip check: a false `emission_not_byte_stable`; the rendered
+  content of a real request has such a close neutralized to text). It
+  now splits on the first, in the aged-turn branch too. Qwen3.8 reads
+  `reasoning_content` and was never affected. Pinned in
+  `qwen_cache_stable_round_trips` and
+  `qwen_cache_stable_aged_turn_renders_as_stock`.
+- **A gpt-oss final re-renders under the header the model wrote.**
+  gpt-oss writes a structured answer under
+  `<|channel|>final <|constrain|>json<|message|>`, unforced, but the
+  baked template rendered every final channel plain, so each JSON final
+  parted from the KV at the constraint and the next request
+  re-prefilled the turn (470..1111 tokens, four times live on Agora
+  2026-10-01). The header is framing, so the final's `Text` cannot say
+  which spelling it had, and its content does not either (`[1, 2, 3]`
+  may be prose; a structured answer whose schema root is a string is
+  not `{…}`). The parser now records the content type the header
+  declared in the signature of the analysis block before the final
+  (`drama_llama:tail;constrain=json`, see the whitespace entry below),
+  and the baked template renders exactly that — an empty final too,
+  from the thought alone. The `output_config` grammar keeps the
+  constraint optional after another block — both spellings are the
+  model's, and both round-trip — and **forbids it on a final that opens
+  the turn**, which has nowhere to record it and would re-render plain
+  (the unified grammar sees the analysis; the deferred one now reads its
+  trigger, `<|end|><|start|>assistant<|channel|>final` before the bare
+  `<|channel|>final`). Pinned as irreducible: a constrained final with
+  no thought right before it — none, or a commentary preamble between —
+  re-renders plain; free generation can still write one (the
+  `output_config` grammars refuse that preamble, see the preamble entry
+  below). Pinned in
+  `gptoss_cache_stable_round_trips_json_final` and
+  `gptoss_cache_stable_keeps_a_preamble_apart_from_its_final`.
+  **Deployments that
+  copied the baked template to a `<model>.template.jinja` sidecar must
+  delete it** — it wins over the bake; a sidecar that is a known old
+  bake now logs a `WARN` at load (see *Added*).
+- **Back-to-back thoughts stay two thoughts.** A model that closes a
+  thought and opens another (`…[/THINK][THINK]…`, live on Mistral Small
+  4, 2026-10-01, ~1.6k tokens lost) was parsed into two
+  `Block::Thought`s, which the session then merged into one, and the
+  template rendered one block — the markers between them were gone, the
+  turn no longer matched the KV, and its tip was lost. Adjacent thoughts
+  no longer merge in a response (Anthropic returns consecutive thinking
+  blocks too; clients now see each one), and every assistant message
+  reaches the template with **`chunks`**, its blocks in emission order
+  (`{type: "text", text}`, `{type: "thinking", thinking}`, one
+  `{type: "tool_calls"}` where the first call sat) — stock Mistral's
+  own content-chunk shape. The baked Mistral 4, gpt-oss and Gemma 4
+  templates render from it, so each `[THINK]` block, each analysis
+  block and each Gemma thought channel renders as its own, with prose
+  where the model wrote it; without `chunks` they render from the
+  merged fields as before. Pinned in
+  `mistral4_cache_stable_round_trips_back_to_back_thoughts`,
+  `gptoss_cache_stable_round_trips_each_analysis_block` and the fleet
+  sweep.
+- **A gpt-oss preamble and final are two text blocks, and the answer is
+  the final.** A turn with a commentary preamble and then a final, no
+  call between (`…<|channel|>commentary<|message|>Hi.<|end|>
+  <|start|>assistant<|channel|>final<|message|>{"a":1}`), parsed to one
+  text, `Hi.{"a":1}`: not the visible answer, a value no `output_config`
+  schema could accept (`SchemaViolation` on a well-formed answer), and
+  a turn the bake re-rendered as one final, losing its tip. Each Harmony
+  channel's body is now its own text block, the batch path no longer
+  merges adjacent text (a parse merges its own prose, so side by side
+  they are channels), `chunks` carries each text block as its own
+  chunk, and the gpt-oss bake renders every text but the last of a turn
+  without calls as a preamble. **A streamed turn cannot mark the
+  boundary**: `BlockStream`'s text yields are deltas, so the preamble
+  and the final stream as adjacent text. Both paths therefore treat
+  them as one run where the client cannot tell them apart: a request
+  stop sequence matches across the two on the batch path as on the
+  stream (the batch keeps the blocks apart and cuts the one the match
+  starts in), so both stop at the same text and report the same
+  `stop_sequence`. An assistant message a client sends with several
+  text blocks now renders on gpt-oss as preambles then a final, where
+  it rendered one final.
+- **Under `output_config` a gpt-oss answer is one text block.**
+  Anthropic (and misanthropic's `json_items` and kin) promise a
+  json_schema answer as exactly one text block holding the JSON. The
+  output_config grammars now refuse whatever gpt-oss would write
+  between its analysis and its final — a commentary preamble, a call, a
+  second analysis — as the unified grammar always did: the deferred
+  (phase-split) grammar's trigger is now the end of the turn's first
+  block, `<|end|><|start|>assistant`, and its header rule admits only
+  the final there. A preamble that *opens* the turn runs before any
+  trigger and cannot be refused up front; such a turn (two text blocks)
+  is a `SchemaViolation` on both paths, as is any turn whose answer is
+  more than one text block — the batch judges its parse, a drained
+  `BlockStream` the parse its yields cannot split — never a 200 with the
+  preamble run into the JSON. Pinned in
+  `harmony_output_config_refuses_a_detour` and
+  `gptoss_cache_stable_keeps_a_preamble_apart_from_its_final`.
+- **A Qwen turn that reasons again after its prose re-renders.**
+  `…</think>\n\nChecking.<think>\nMore.\n</think>…` parsed to two
+  thoughts, but the merged fields could not place the second: 3.6
+  inlined it without its markers' newlines, 3.8 joined both thoughts in
+  `reasoning_content`, and the turn lost its tip. The Qwen bakes render
+  such a turn from `chunks`, each later thought where the model wrote
+  it. Aged out with `preserve_thinking` off, such a turn drops every
+  thought, the later ones too, and a client's text after the calls
+  renders before them with the rest, as stock renders merged content.
+  Pinned in `qwen_cache_stable_round_trips_a_second_thought`,
+  `qwen_cache_stable_chunks_age_and_keep_late_text` and the fleet
+  sweep. Pinned as unfixed, with the reason: whitespace after
+  Qwen's last call (`…</tool_call>\n`) has no block to ride and is
+  dropped, but no constrained call turn can write it — the tool grammar
+  reads a newline after a call as the separator to the next
+  (`qwen_whitespace_after_the_last_call_is_unreachable`).
+- **An empty thought re-renders.** Mistral 4's `[THINK][/THINK]` and
+  an empty gpt-oss analysis block were dropped by the parser, so the
+  re-render lacked their markers and the turn lost its tip. A closed
+  thought is now kept even when empty (Anthropic returns empty thinking
+  blocks too), except on Gemma 4, whose empty channel is its own
+  thinking-off scaffold, and on dialects that re-ingest thoughts
+  inline, where it would put a bare `<think></think>` into content.
+- **Whitespace around a Mistral 4 or Gemma 4 thought re-renders as
+  written.** A fleet-wide sweep (`fleet_bakes_round_trip_every_admitted_shape`:
+  every baked template through the session's parse and re-render, over
+  the shapes its grammars admit — thought or none, two back to back,
+  prose, a JSON answer, a call, prose then a call, parallel calls,
+  answers with leading or trailing whitespace) found two more shapes
+  that lost their tip. The parser swallowed one `\n` after a thought
+  the model opened itself, and one at the start of its body, whatever
+  the template renders there: right for Qwen's `<think>\n`, wrong for
+  Mistral 4, whose `[THINK]…[/THINK]` has no layout newlines, so
+  `[/THINK]\n{…}` (an `output_config` answer the grammar admits) came
+  back without the `\n`. It now takes off exactly the whitespace the
+  dialect's markers are spelled with and leaves the rest to the answer,
+  as the pre-opened path already did. And the baked Gemma 4 template
+  `| trim`med a model turn's answer, as stock does; it now renders it
+  verbatim. `CallSyntax::qwen_xml()`'s reasoning start is now
+  `"<think>\n"`, as the analyzer measures it. Neither shape has been
+  seen live; Gemma 4 served no turns in the 2026-10-01 run.
+- **No response carries a whitespace-only text block.** Anthropic
+  never returns one and rejects one on ingest ("text content blocks
+  must contain non-whitespace text"), so a transcript replayed from
+  blallama to Anthropic failed on it — and the parser produced one for
+  the whitespace between a thought and a call (`[/THINK]\n[TOOL_CALLS]`
+  on Mistral 4, `<channel|>\n<|tool_call>` on Gemma 4,
+  `</think>\n\n<tool_call>` on Qwen). That whitespace is in the KV and
+  the next render needs it, so it now rides in the thought's
+  `signature` (`drama_llama:tail;gap=%0A`, alongside the
+  `OPEN_THOUGHT_SIGNATURE` overload) and the renderer puts it back where
+  it sat: every template sees the turn exactly as before. A closed
+  thought with nothing to record keeps the empty signature. Whitespace
+  with no thought before it (the turn's first bytes before a call,
+  after the last call) has nothing to ride and is dropped — the turn
+  re-renders without it, losing its tip rather than the client's
+  ingest; pinned in `blank_text_is_never_returned`. A stream withholds
+  a thought until what follows it starts, and never yields a run of
+  text that is only whitespace (the batch path drops what a stop
+  sequence cut leaves the same way). The fleet sweep now also renders
+  every shape followed by the next request (its tool results, or a
+  user turn), aged with `preserve_thinking` off (only a thought — or
+  Qwen's thinking-off scaffold, as stock — may be lost), streamed a
+  char at a time against the batch parse, and every thought the budget
+  can cut continued as an open thought.
 - **A nullable-string tool argument on a tagged (Qwen XML) dialect
   parses as the string the model wrote.** The grammar generates an
   `Option<String>` parameter (`"type": ["string", "null"]`) raw, like
@@ -936,6 +1098,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   **`LlamaCppDecoder::memory_seq_pos_min`** — what llama.cpp reports
   about a model's sliding window and recurrent layers, readable from a
   `vocab_only` load, and the lowest position a sequence still holds.
+- **`baked::superseded` and a `WARN` for a stale template sidecar.** A
+  `<model>.template.jinja` sidecar wins over the baked template, so a
+  copy of an old bake silently holds back every fix to it since — the
+  gpt-oss and Gemma 4 sidecars of the 2026-10-01 cohort run were the
+  2026-07-27 bakes, byte for byte. The registry now keeps the SHA-256 of
+  every superseded replacement, and loading a sidecar that matches one
+  logs `stale_template_sidecar` at `WARN`, naming the bake and saying to
+  delete the file.
 - **Constrained output is checked against its schema before it is
   answered** (`SessionError::SchemaViolation`). A finished
   json_schema `output_config` answer must be exactly one JSON document

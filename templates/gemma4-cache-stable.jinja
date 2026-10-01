@@ -145,6 +145,10 @@
         {{- argument -}}
     {%- endif -%}
 {%- endmacro -%}
+{#- Cache-stability patch (drama_llama): a model turn's answer renders
+    VERBATIM — no `| trim` (stock trims) — so an answer the model ended
+    in whitespace, or began with a newline after its thought, re-renders
+    as generated and the KV stays a byte prefix of the next request. -#}
 {%- macro strip_thinking(text) -%}
     {%- set ns = namespace(result='') -%}
     {%- for part in text.split('<channel|>') -%}
@@ -154,7 +158,7 @@
             {%- set ns.result = ns.result + part -%}
         {%- endif -%}
     {%- endfor -%}
-    {{- ns.result | trim -}}
+    {{- ns.result -}}
 {%- endmacro -%}
 
 {%- macro format_tool_response_block(tool_name, response) -%}
@@ -243,9 +247,53 @@
         keeps aged reasoning (Qwen-template convention); without it,
         aged turns fall back to the scaffold and pay a one-turn
         re-prefill. -#}
+    {%- set keep_thinking = (preserve_thinking is defined and preserve_thinking is true) or loop.index0 > ns_turn.last_user_idx -%}
+    {%- set chunks = message.get('chunks') if role == 'model' else none -%}
+    {%- if chunks is not none -%}
+        {#- Emission-order patch (drama_llama): the turn renders from
+            drama_llama's `chunks`, its blocks in emission order, so
+            each thought renders as its own channel block — two back to
+            back stay two, instead of merging into one `reasoning` —
+            and the whitespace and prose between them where the model
+            wrote it. The first thought opens the turn, as the model's
+            own emission always does (the empty scaffold when there is
+            none); everything before the calls renders here VERBATIM;
+            what follows them (unreachable by emission) keeps the
+            native slot below. -#}
+        {%- set ns_chunks = namespace(pre=[], post=[], calls=false) -%}
+        {%- for chunk in chunks -%}
+            {%- if chunk['type'] == 'tool_calls' -%}
+                {%- set ns_chunks.calls = true -%}
+            {%- elif ns_chunks.calls -%}
+                {%- set ns_chunks.post = ns_chunks.post + [chunk] -%}
+            {%- else -%}
+                {%- set ns_chunks.pre = ns_chunks.pre + [chunk] -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- set pre = ns_chunks.pre -%}
+        {%- if pre and pre[0]['type'] == 'thinking' and keep_thinking -%}
+            {{- '<|channel>thought\n' + pre[0]['thinking'] + '\n<channel|>' -}}
+        {%- else -%}
+            {{- '<|channel>thought\n<channel|>' -}}
+        {%- endif -%}
+        {%- for chunk in pre -%}
+            {%- if chunk['type'] == 'text' -%}
+                {{- strip_thinking(chunk['text']) -}}
+            {%- elif chunk['type'] == 'thinking' and not loop.first and keep_thinking -%}
+                {{- '<|channel>thought\n' + chunk['thinking'] + '\n<channel|>' -}}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- set ns_post = namespace(text='') -%}
+        {%- for chunk in ns_chunks.post -%}
+            {%- if chunk['type'] == 'text' -%}
+                {%- set ns_post.text = ns_post.text + chunk['text'] -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- set chunk_content = ns_post.text -%}
+    {%- else -%}
     {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}
     {%- if role == 'model' -%}
-        {%- if thinking_text and ((preserve_thinking is defined and preserve_thinking is true) or loop.index0 > ns_turn.last_user_idx) -%}
+        {%- if thinking_text and keep_thinking -%}
             {{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}
         {%- else -%}
             {{- '<|channel>thought\n<channel|>' -}}
@@ -260,6 +308,7 @@
         slot below. -#}
     {%- if message.get('content_pre') -%}
         {{- message['content_pre'] -}}
+    {%- endif -%}
     {%- endif -%}
 
             {%- if message['tool_calls'] -%}
@@ -330,7 +379,11 @@
                 split is present, the native content slot carries only
                 the AFTER-call text; the before-call text already
                 rendered above the calls. -#}
-            {%- set native_content = message.get('content_post') if message.get('content_pre') is not none else message.get('content') -%}
+            {%- if chunks is not none -%}
+                {%- set native_content = chunk_content -%}
+            {%- else -%}
+                {%- set native_content = message.get('content_post') if message.get('content_pre') is not none else message.get('content') -%}
+            {%- endif -%}
             {%- set captured_content -%}
             {%- if native_content is string -%}
                 {%- if role == 'model' -%}

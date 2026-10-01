@@ -66,10 +66,20 @@ pub const THINK_OPEN: &str = "<think>";
 /// enough for `""`, `" "`, `"\n"` and `"\n\n"`.
 pub const THOUGHT_GAP_MAX: usize = 2;
 
-/// The [`ResponseFraming::Harmony`] phase-split trigger: the final
-/// channel's header up to the channel name. What follows it — an
-/// optional ` <|constrain|>json`, then `<|message|>` — is the grammar's.
+/// The [`ResponseFraming::Harmony`] phase-split trigger for a final
+/// that opens the turn: the final channel's header up to the channel
+/// name. What follows it — `<|message|>`, plain — is the grammar's.
 pub const HARMONY_FINAL_TRIGGER: &str = "<|channel|>final";
+
+/// The [`ResponseFraming::Harmony`] phase-split trigger after the
+/// turn's first block (the analysis, as a rule): its close and the next
+/// message's start. What follows it is the grammar's — the final's
+/// header (`<|channel|>final`, an optional ` <|constrain|>json`, then
+/// `<|message|>`) and nothing else: no commentary preamble and no call
+/// after the analysis, as the unified grammar admits none, so the
+/// answer is the final alone. Ends earlier than
+/// [`HARMONY_FINAL_TRIGGER`] there, so it fires first.
+pub const HARMONY_NEXT_BLOCK_TRIGGER: &str = "<|end|><|start|>assistant";
 
 /// How the chat format frames a structured response — where the JSON
 /// body starts, and what reasoning may precede it.
@@ -84,9 +94,11 @@ pub enum ResponseFraming {
     Bare,
     /// OpenAI Harmony (gpt-oss): the generation prompt ends at
     /// `<|start|>assistant`, so the body lives in the final channel —
-    /// `<|channel|>final<|message|>{…}`, or with the ` <|constrain|>json`
-    /// gpt-oss writes for JSON — after at most one analysis block
-    /// (closed by `<|end|>`, reopened by `<|start|>assistant`).
+    /// `<|channel|>final<|message|>{…}`, or after another block with the
+    /// ` <|constrain|>json` gpt-oss writes for JSON — after at most one
+    /// analysis block (closed by `<|end|>`, reopened by
+    /// `<|start|>assistant`). A commentary preamble or a call after
+    /// that block is refused: the answer is one text block.
     Harmony,
 }
 
@@ -281,16 +293,25 @@ pub fn compile_output_config(
         thought_pre_opened || opts.framing == ResponseFraming::Harmony;
     if opts.phase_split && opts.allow_thought && trigger_certain {
         let source = build_json_only_grammar_source(schema, opts);
-        let trigger = match opts.framing {
-            ResponseFraming::Bare => opts.close().as_bytes(),
-            ResponseFraming::Harmony => HARMONY_FINAL_TRIGGER.as_bytes(),
+        let (triggers, feed_trigger) = match opts.framing {
+            // The JSON-body grammar starts *after* the trigger, which
+            // itself stays outside the constrained span.
+            ResponseFraming::Bare => (vec![opts.close()], false),
+            // The header grammar reads the trigger: after the first
+            // block only the final, which may carry the constraint (see
+            // `emit_harmony_final_header`).
+            ResponseFraming::Harmony => (
+                vec![HARMONY_NEXT_BLOCK_TRIGGER, HARMONY_FINAL_TRIGGER],
+                true,
+            ),
         };
         Ok(CompiledOutputConfig::Deferred(DeferredGrammar {
             grammar: crate::CompiledGrammar::parse(&source)?,
-            activate_after: vec![trigger.to_vec()],
-            // The JSON-body grammar starts *after* the trigger, which
-            // itself stays outside the constrained span.
-            feed_trigger: false,
+            activate_after: triggers
+                .iter()
+                .map(|t| t.as_bytes().to_vec())
+                .collect(),
+            feed_trigger,
         }))
     } else {
         let source = build_grammar_source(schema, opts, thought_pre_opened);
@@ -396,12 +417,14 @@ pub(crate) fn build_grammar_source(
         // `(analysis | commentary)*`: every extra block the grammar
         // admits is somewhere a model can go instead of answering
         // (see the forced-call grammar in `dialect::emit`).
-        let analysis = if opts.allow_thought {
-            "h_analysis? "
+        // The constraint only after the analysis, which records it (see
+        // `emit_harmony_final_header`).
+        let header = if opts.allow_thought {
+            "( h_analysis h_final | h_final_plain )"
         } else {
-            ""
+            "h_final_plain"
         };
-        let _ = writeln!(src, "root ::= {analysis}h_final output_schema");
+        let _ = writeln!(src, "root ::= {header} output_schema");
         let _ = writeln!(
             src,
             r#"h_analysis ::= "{open}" h_end "{start}""#,
@@ -409,7 +432,18 @@ pub(crate) fn build_grammar_source(
             start = escape_for_gbnf_string(harmony::START_ASSISTANT),
         );
         emit_until_rules("h_end", harmony::END, &mut src);
-        emit_harmony_final_header("h_final", HARMONY_FINAL_TRIGGER, &mut src);
+        emit_harmony_final_header(
+            "h_final",
+            HARMONY_FINAL_TRIGGER,
+            true,
+            &mut src,
+        );
+        emit_harmony_final_header(
+            "h_final_plain",
+            HARMONY_FINAL_TRIGGER,
+            false,
+            &mut src,
+        );
     } else if thought_pre_opened {
         // The template already emitted the opener, so the tag IS open:
         // the thought is mandatory (close-first), the opener literal
@@ -456,10 +490,25 @@ pub(crate) fn build_json_only_grammar_source(
             opts.emit_thought_gap(&mut src);
         }
         ResponseFraming::Harmony => {
-            // The trigger consumed `<|channel|>final`; the rest of the
-            // header is constrained.
-            let _ = writeln!(src, "root ::= h_final output_schema");
-            emit_harmony_final_header("h_final", "", &mut src);
+            // The grammar reads the trigger: after the first block the
+            // final comes next — no preamble, no call, no second
+            // analysis — and its header may carry the constraint;
+            // opening the turn it may not (see
+            // `emit_harmony_final_header`).
+            let _ =
+                writeln!(src, "root ::= ( h_after | h_first ) output_schema");
+            emit_harmony_final_header(
+                "h_after",
+                &format!("{HARMONY_NEXT_BLOCK_TRIGGER}{HARMONY_FINAL_TRIGGER}"),
+                true,
+                &mut src,
+            );
+            emit_harmony_final_header(
+                "h_first",
+                HARMONY_FINAL_TRIGGER,
+                false,
+                &mut src,
+            );
         }
     }
     schema_to_gbnf(schema, "output_schema", &mut src);
@@ -467,20 +516,40 @@ pub(crate) fn build_json_only_grammar_source(
     src
 }
 
-/// The Harmony final-channel header, from `lead` (what of
-/// `<|channel|>final` the rule still has to spell) through
-/// `<|message|>`, with the ` <|constrain|>json` gpt-oss writes for JSON
-/// optional: both spellings are the model's, and the parser reads both.
-/// The body follows `<|message|>` directly, as the template renders it.
-fn emit_harmony_final_header(rule: &str, lead: &str, out: &mut String) {
-    let lead = match lead {
-        "" => String::new(),
-        lead => format!(r#""{}" "#, escape_for_gbnf_string(lead)),
+/// The Harmony final-channel header, from `lead` (the header up to the
+/// channel name, and whatever precedes it the rule must spell) through
+/// `<|message|>`. With `constrain`, the ` <|constrain|>json` gpt-oss
+/// writes for JSON is optional: both spellings are the model's, and the
+/// parser reads both and records which in the analysis block before
+/// the final, so the re-render spells the one written. A final with no
+/// analysis before it has nowhere to record it and re-renders plain,
+/// so there the rule is plain: a constrained final the grammar let
+/// through would lose its turn's tip on the next request. The body
+/// follows `<|message|>` directly, as the template renders it.
+///
+/// The deferred grammar cannot see past its trigger, which ends a
+/// preamble as it does an analysis (`<|end|><|start|>assistant`): a
+/// preamble that opens the turn, before the trigger, runs free, and a
+/// constrained final after it still parts there. Such a turn is two
+/// text blocks, which the session refuses as a schema violation
+/// whatever its header (pinned in the session's gpt-oss tests).
+fn emit_harmony_final_header(
+    rule: &str,
+    lead: &str,
+    constrain: bool,
+    out: &mut String,
+) {
+    let constraint = match constrain {
+        true => format!(
+            r#"( " {}json" )? "#,
+            escape_for_gbnf_string(harmony::CONSTRAIN)
+        ),
+        false => String::new(),
     };
     let _ = writeln!(
         out,
-        r#"{rule} ::= {lead}( " {constrain}json" )? "{msg}""#,
-        constrain = escape_for_gbnf_string(harmony::CONSTRAIN),
+        r#"{rule} ::= "{lead}" {constraint}"{msg}""#,
+        lead = escape_for_gbnf_string(lead),
         msg = escape_for_gbnf_string(harmony::MESSAGE),
     );
 }
@@ -520,6 +589,15 @@ mod tests {
             return false;
         }
         state.is_complete()
+    }
+
+    /// Whether `source` refuses `input` before its end: no continuation
+    /// of it could complete.
+    fn refuses(source: &str, input: &str) -> bool {
+        let grammar = Grammar::parse(source).expect("grammar parses");
+        GrammarState::new(Arc::new(grammar))
+            .advance_bytes(input.as_bytes())
+            .is_err()
     }
 
     fn cfg(schema: serde_json::Value) -> OutputConfig {
@@ -879,10 +957,13 @@ mod tests {
     }
 
     /// Harmony framing: the deferred grammar waits for the final
-    /// channel (never `</think>`, which gpt-oss does not write) and
-    /// constrains the rest of its header; the unified grammar admits at
-    /// most one analysis block — none with `allow_thought` off — and no
-    /// commentary detour.
+    /// channel or the end of the turn's first block (never `</think>`,
+    /// which gpt-oss does not write); the unified grammar admits at most
+    /// one analysis block — none with `allow_thought` off. Neither
+    /// admits a commentary detour after it, a preamble or a call: the
+    /// answer is the final alone. Either admits ` <|constrain|>json`
+    /// only where the parse can record it: after another block. A final
+    /// opening the turn is plain, so it re-renders as written.
     #[test]
     fn harmony_framing_puts_the_body_in_the_final_channel() {
         let config = cfg(json!({
@@ -899,21 +980,61 @@ mod tests {
         else {
             panic!("thinking on defers");
         };
-        assert_eq!(d.activate_after, vec![b"<|channel|>final".to_vec()]);
-        assert!(!d.feed_trigger);
+        let (next, first) = ("<|end|><|start|>assistant", "<|channel|>final");
+        let after = format!("{next}{first}");
+        assert_eq!(
+            d.activate_after,
+            vec![next.as_bytes().to_vec(), first.as_bytes().to_vec()]
+        );
+        assert!(d.feed_trigger, "the header grammar reads its trigger");
         let tail = d.grammar.source();
-        assert!(accepts(tail, r#"<|message|>{"x":1}"#));
-        assert!(accepts(tail, r#" <|constrain|>json<|message|>{"x":1}"#));
-        assert!(!accepts(tail, r#"<|message|> {"x":1}"#));
-        assert!(!accepts(tail, r#"<|message|>{"y":1}"#));
+        let body = |header: &str, value: &str| format!("{header}{value}");
+        let constrained = " <|constrain|>json<|message|>";
+        assert!(accepts(tail, &body(&after, r#"<|message|>{"x":1}"#)));
+        assert!(accepts(
+            tail,
+            &body(&after, &format!(r#"{constrained}{{"x":1}}"#))
+        ));
+        assert!(accepts(tail, &body(first, r#"<|message|>{"x":1}"#)));
+        assert!(
+            !accepts(tail, &body(first, &format!(r#"{constrained}{{"x":1}}"#))),
+            "opening the turn, a constrained final would re-render plain"
+        );
+        assert!(!accepts(tail, &body(&after, r#"<|message|> {"x":1}"#)));
+        assert!(!accepts(tail, &body(&after, r#"<|message|>{"y":1}"#)));
+        // After the first block the final, and nothing else, comes next.
+        for detour in [
+            "<|channel|>commentary<|message|>Hi.",
+            "<|channel|>commentary to=functions.f <|constrain|>json\
+             <|message|>{}",
+            " to=functions.f<|channel|>commentary json<|message|>{}",
+            "<|channel|>analysis<|message|>More.",
+        ] {
+            let text = format!("{next}{detour}");
+            assert!(refuses(tail, &text), "{text}");
+        }
+        // After a block the trigger ends before the final's header, so
+        // it fires first, and the grammar reads it.
+        let text = format!("<|channel|>analysis<|message|>hmm{next}");
+        let fired = crate::predictor::find_any_deferred_trigger_end(
+            text.as_bytes(),
+            &d.activate_after,
+            text.len(),
+            |_, _| true,
+        );
+        assert_eq!(fired, Some((text.len(), next.len())));
 
         let analysis = "<|channel|>analysis<|message|>hmm<|end|>\
                         <|start|>assistant";
         let body = r#"<|channel|>final<|message|>{"x":1}"#;
+        let json_body =
+            r#"<|channel|>final <|constrain|>json<|message|>{"x":1}"#;
         let unified =
             build_grammar_source(&config.format_schema(), &harmony, false);
         assert!(accepts(&unified, body));
         assert!(accepts(&unified, &format!("{analysis}{body}")));
+        assert!(accepts(&unified, &format!("{analysis}{json_body}")));
+        assert!(!accepts(&unified, json_body), "nowhere to record it");
         assert!(!accepts(&unified, &format!("{analysis}{analysis}{body}")));
         let preamble = "<|channel|>commentary<|message|>hi<|end|>\
                         <|start|>assistant";
@@ -928,6 +1049,7 @@ mod tests {
             false,
         );
         assert!(accepts(&no_thought, body));
+        assert!(!accepts(&no_thought, json_body));
         assert!(!accepts(&no_thought, &format!("{analysis}{body}")));
     }
 
