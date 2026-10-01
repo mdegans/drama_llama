@@ -1560,4 +1560,53 @@ mod tests {
             .restore("x <ffffffffffffffffffffffffffffffff:t", Some(sentinel))
             .is_none());
     }
+
+    /// A turn's own cache diagnostics wait for its verdict. Over a
+    /// template that heads the render with its message count, no turn
+    /// re-renders as emitted — seating it changes the prompt before it.
+    /// The turn that stands logs `emission_not_byte_stable`; the one
+    /// containment rejects (a real reserved token in its prose, #101)
+    /// logs nothing: it reaches neither the client nor the next
+    /// request, and the operator log used to read it as a cache loss.
+    #[test]
+    fn a_contained_turn_logs_no_emission_diagnostics() {
+        use crate::session::tests::{capture_events, reasons};
+        let counting = crate::ChatTemplate::from_source(
+            format!("<|im_start|>system\n{{{{ messages | length }}}}<|im_end|>\n{TEMPLATE}"),
+            "<s>".into(),
+            "<|im_end|>".into(),
+        )
+        .expect("template");
+        let prompt = Prompt {
+            messages: vec![message(crate::Role::User, vec![text("go")])],
+            ..Prompt::default()
+        };
+        for (script, rejected) in [
+            (bytes("hello world"), false),
+            (
+                [bytes("hello "), vec![TOOL_CALL_END], bytes(" world")]
+                    .concat(),
+                true,
+            ),
+        ] {
+            let mut s = scripted_tip(script);
+            s.template = counting.clone();
+            let mut result = None;
+            let events = capture_events(|| {
+                result = Some(s.complete_blocks(&prompt));
+            });
+            let result = result.unwrap();
+            assert_eq!(
+                matches!(result, Err(SessionError::EmittedSpecialToken { .. })),
+                rejected,
+                "{result:?}",
+            );
+            assert_eq!(
+                reasons(&events).contains(&"emission_not_byte_stable"),
+                !rejected,
+                "{:?}",
+                reasons(&events),
+            );
+        }
+    }
 }

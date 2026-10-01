@@ -199,7 +199,15 @@ fn cached_output_matches_uncached_output() {
     let mut prompt2 = prompt.clone();
 
     let (cached_text_1, cached_text_2, cached_read_2) = {
-        let mut cached = session(true);
+        // Adoption off: with it, round 2 reads round 1's turn in the
+        // split the model emitted, while the fresh session reads the
+        // tokenizer's — a different input whenever the two differ, and
+        // so not the comparison this test makes.
+        let mut cached = session(true).with_prefix_cache_config({
+            let mut config = drama_llama::PrefixCacheConfig::default();
+            config.adopt_emitted_tokens = false;
+            config
+        });
         let r1 = cached.complete_response(&prompt).expect("cached r1");
         // Round 2 extends with the cached session's assistant turn;
         // the fresh session will replay the identical transcript, so
