@@ -205,6 +205,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An ambiguous recursive schema can no longer stall or exhaust the
+  grammar matcher.** Two interchangeable recursive defs (`N1 = N2 =
+  {"c": N1 | N2}`) double the matcher's live stacks at every nesting
+  level — they differ in which rule each frame is in, so no dedup
+  merges them: 18 levels held 393,216 stacks at over a second a byte,
+  and a deeper document never finished. A matcher state now keeps at
+  most 4096 stacks and 2^18 frames across them (a deterministic
+  prefix of its sorted stacks, and always at least one). Dropping
+  stacks only drops continuations, so the cap can over-restrict —
+  surfacing as the existing grammar-violation path — but never admit
+  a byte the full state would refuse. Real grammars peak under 40
+  stacks. Alongside:
+  - The epsilon walk is bounded by frames copied (2^22) and steps
+    (2^20) instead of 4096 steps per starting stack, which cut wide
+    alternations short: a 4000-property all-optional object refused
+    even `{}`, and an `enum` past ~2000 members lost members
+    unpredictably (now it keeps 4096).
+  - The session-lifetime DFA cache also restarts cold past ~256 MiB of
+    interned states, not only past 65,536 of them — capped states can
+    still be megabytes each.
+
 - **A schema that has no grammar is a 400, and compiling one is
   bounded.** A client's schema (any tool's `input_schema` in any
   dialect, a strict `tool_choice`, an `output_config` `json_schema`)

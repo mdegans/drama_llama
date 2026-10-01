@@ -979,6 +979,19 @@ impl StackState {
         self.pending.is_empty() && self.stacks.iter().any(|s| s.is_empty())
     }
 
+    /// Approximate heap bytes this state holds, as the DFA cache
+    /// interns it twice (key and table): each stack inline, plus the
+    /// frames of a stack spilled past [`STACK_INLINE`].
+    pub(crate) fn weight(&self) -> usize {
+        let spilled: usize = self
+            .stacks
+            .iter()
+            .filter(|s| s.len() > STACK_INLINE)
+            .map(|s| s.len() * std::mem::size_of::<Position>())
+            .sum();
+        2 * (self.stacks.len() * std::mem::size_of::<Stack>() + spilled)
+    }
+
     /// [`Self::is_complete`] and nothing can extend the match: every
     /// live stack is spent. `"ab"+` after one "ab" is complete but not
     /// exhausted — another "ab" is still legal; `"ab"` after "ab" is
@@ -1185,10 +1198,18 @@ impl StackState {
 
         let mut queue: Vec<Stack> = std::mem::take(&mut self.stacks);
         let mut result: Vec<Stack> = Vec::with_capacity(queue.len());
-        // Bound iterations to guard against pathological left-recursive
-        // grammars. 4096 * initial stack count is ample for sane GBNF.
-        let budget = 4096usize.saturating_mul(queue.len().max(1));
-        for _ in 0..budget {
+        // Bound the walk: a left-recursive grammar (`a ::= a "x"`) never
+        // runs out of epsilon steps, each one a stack a frame deeper.
+        // The bound is on frames copied, the walk's real cost, not on
+        // steps: a step-per-starting-stack budget (4096 each) cut a
+        // wide alternation's expansion short — a 4000-property
+        // all-optional object lost the stack that closes `{}`.
+        let mut work = 0usize;
+        for _ in 0..EXPAND_MAX_STEPS {
+            // Far past the cap: the rest could only be truncated away.
+            if result.len() >= 4 * MAX_STACKS || work > EXPAND_MAX_WORK {
+                break;
+            }
             let Some(mut stack) = queue.pop() else {
                 break;
             };
@@ -1228,6 +1249,7 @@ impl StackState {
                             alt_idx: a_idx as u32,
                             atom_idx: 0,
                         };
+                        work += stack.len();
                         let mut branched = stack.clone();
                         if is_tail {
                             *branched.last_mut().unwrap() = new_pos;
@@ -1244,9 +1266,58 @@ impl StackState {
         // sort short-circuits on len < 2.
         result.sort();
         result.dedup();
+        // Over a cap: keep a deterministic subset (the sort's prefix),
+        // so the DFA cache's interned states stay canonical — and at
+        // least one stack, however deep, so a lone legitimately deep
+        // stack is never what the cap drops.
+        let mut frames = 0usize;
+        let keep = result
+            .iter()
+            .take_while(|stack| {
+                frames += stack.len();
+                frames <= MAX_STATE_FRAMES
+            })
+            .count()
+            .clamp(1, MAX_STACKS);
+        result.truncate(keep);
         self.stacks = result;
     }
 }
+
+/// Most stacks a matcher state keeps. Ambiguity multiplies stacks:
+/// two interchangeable recursive rules (`N1 = N2 = {"c": N1 | N2}`)
+/// double them at every nesting level, which no dedup can merge — the
+/// stacks differ in which rule each frame is in — so 18 levels of a
+/// client's schema held 393,216 stacks and took over a second a
+/// byte (the hostile-schema recheck). Past the cap the extra stacks are
+/// dropped: each stack is one way the input so far can continue, so a
+/// subset only ever admits *fewer* continuations — never a byte the
+/// full set would reject. At worst it over-restricts, which surfaces
+/// as the existing grammar-violation path.
+///
+/// Real grammars stay far below it (the test suite peaks under 40);
+/// the one legitimate shape near it is a single `enum` or all-optional
+/// object of thousands of members, each member one stack until its
+/// first distinguishing byte.
+pub(crate) const MAX_STACKS: usize = 4096;
+
+/// Most frames, summed over its stacks, a matcher state keeps — the
+/// same cap as [`MAX_STACKS`] (and the same over-restriction) on the
+/// other axis. Capped stacks still deepen with the output's nesting:
+/// 4096 of them 200 levels into an ambiguous recursive schema are
+/// ~20 MB, copied on every byte, and a long enough generation would
+/// reach gigabytes. A single stack is kept however deep.
+pub(crate) const MAX_STATE_FRAMES: usize = 1 << 18;
+
+/// Most queue steps one [`StackState::expand`] takes.
+const EXPAND_MAX_STEPS: usize = 1 << 20;
+
+/// Most stack frames one [`StackState::expand`] copies branching
+/// stacks — the walk's cost in time and memory. A left-recursive
+/// grammar spends it in a few thousand steps (each copy a frame
+/// deeper); a real grammar's widest expansion (thousands of
+/// alternatives a few frames deep) spends well under 1%.
+const EXPAND_MAX_WORK: usize = 1 << 22;
 
 // ===========================================================================
 // Lazy-DFA cache
@@ -1277,6 +1348,8 @@ struct DfaInterned {
     /// Id → canonical `StackState`. Needed on transition misses to
     /// reconstitute the matcher, feed a byte, and re-intern the result.
     states: Vec<StackState>,
+    /// Approximate bytes the interned states hold ([`StackState::weight`]).
+    weight: usize,
 }
 
 /// Lazy-DFA memoization layer over the NFA matcher.
@@ -1291,6 +1364,8 @@ struct DfaInterned {
 /// Shared across clones of [`GrammarState`] via `Arc`.
 pub(crate) struct DfaCache {
     interned: RwLock<DfaInterned>,
+    /// [`DFA_CACHE_MAX_WEIGHT`], lowered by tests.
+    max_weight: usize,
     /// `(state, byte)` → next state. `DashMap` for lock-striped access under
     /// the rayon fold in `grammar_filter`.
     transitions: DashMap<(StateId, u8), StateId>,
@@ -1318,13 +1393,22 @@ pub(crate) struct DfaCache {
 /// step may overshoot by its own transitions, which is noise.
 const DFA_CACHE_MAX_STATES: usize = 65_536;
 
+/// Interned-state *weight* cap ([`StackState::weight`], ~bytes) for
+/// the same cache. The state cap alone assumed small states, but a
+/// state can hold up to [`MAX_STACKS`] stacks, each as deep as the
+/// output's nesting: 65,536 of those is tens of GiB. Same soft-cap
+/// rules as [`DFA_CACHE_MAX_STATES`].
+const DFA_CACHE_MAX_WEIGHT: usize = 256 << 20;
+
 impl DfaCache {
     pub(crate) fn new() -> Self {
         Self {
             interned: RwLock::new(DfaInterned {
                 intern: FxHashMap::default(),
                 states: Vec::new(),
+                weight: 0,
             }),
+            max_weight: DFA_CACHE_MAX_WEIGHT,
             transitions: DashMap::new(),
             bitmaps: DashMap::new(),
             complete: DashMap::new(),
@@ -1344,12 +1428,13 @@ impl DfaCache {
     pub(crate) fn intern_base(&self, state: &StackState) -> StateId {
         let over = {
             let g = self.interned.read().unwrap();
-            g.states.len() > DFA_CACHE_MAX_STATES
+            g.states.len() > DFA_CACHE_MAX_STATES || g.weight > self.max_weight
         };
         if over {
             let mut g = self.interned.write().unwrap();
             g.intern.clear();
             g.states.clear();
+            g.weight = 0;
             self.transitions.clear();
             self.bitmaps.clear();
             self.complete.clear();
@@ -1371,9 +1456,26 @@ impl DfaCache {
         }
         let id = g.states.len() as StateId;
         debug_assert!(id != REJECT_STATE, "state id overflow");
+        g.weight += state.weight();
         g.states.push(state.clone());
         g.intern.insert(state.clone(), id);
         id
+    }
+
+    /// A cache whose weight cap is `max_weight`, not
+    /// [`DFA_CACHE_MAX_WEIGHT`].
+    #[cfg(test)]
+    pub(crate) fn with_max_weight(max_weight: usize) -> Self {
+        Self {
+            max_weight,
+            ..Self::new()
+        }
+    }
+
+    /// The interned states' weight ([`StackState::weight`]).
+    #[cfg(test)]
+    pub(crate) fn weight(&self) -> usize {
+        self.interned.read().unwrap().weight
     }
 
     /// Reconstitute the `StackState` for a given id. Used only on cache
@@ -2268,6 +2370,116 @@ mod tests {
 
     fn parse_ok(src: &str) -> Grammar {
         Grammar::parse(src).expect("grammar should parse")
+    }
+
+    /// Two interchangeable recursive defs (`N1 = N2 = {"c": N1 | N2}`):
+    /// every `{"c":` level doubles the ways the input so far can
+    /// continue. 18 levels used to hold 393,216 stacks (over a second a
+    /// byte); 40 would never finish. Capped, the matcher stays within
+    /// [`MAX_STACKS`] and [`MAX_STATE_FRAMES`] and still accepts the
+    /// whole document — every stack it dropped was interchangeable with
+    /// one it kept.
+    fn ambiguous_recursive_grammar() -> Arc<Grammar> {
+        let node = serde_json::json!({
+            "type": "object",
+            "properties": {"c": {"anyOf": [
+                {"$ref": "#/$defs/N1"},
+                {"$ref": "#/$defs/N2"},
+            ]}},
+        });
+        let schema = serde_json::json!({
+            "$ref": "#/$defs/N1",
+            "$defs": {"N1": node.clone(), "N2": node},
+        });
+        let mut src = String::from("root ::= s\n");
+        crate::schema_to_gbnf(&schema, "s", &mut src).unwrap();
+        src.push_str(crate::JSON_GRAMMAR);
+        Arc::new(parse_ok(&src))
+    }
+
+    #[test]
+    fn ambiguous_recursion_keeps_stacks_capped() {
+        let mut state = GrammarState::new(ambiguous_recursive_grammar());
+        let depth = 120;
+        let start = Instant::now();
+        for level in 1..=depth {
+            state.advance_bytes(br#"{"c":"#).unwrap();
+            assert!(
+                state.stack_depth() <= MAX_STACKS,
+                "level {level}: {} stacks",
+                state.stack_depth()
+            );
+            let frames: usize =
+                state.inner.stacks.iter().map(|s| s.len()).sum();
+            assert!(frames <= MAX_STATE_FRAMES, "level {level}: {frames}");
+        }
+        state.advance_bytes(b"{}").unwrap();
+        for _ in 0..depth {
+            state.advance_bytes(b"}").unwrap();
+        }
+        assert!(state.is_complete());
+        // Generous: capped, this takes milliseconds; uncapped it does
+        // not finish.
+        assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
+    }
+
+    /// Truncation only removes continuations. An `enum` wider than
+    /// [`MAX_STACKS`] keeps some of its members' stacks (the old expand
+    /// budget, 4096 steps a starting stack, already cut one past ~2000
+    /// members short, less predictably): those members still match,
+    /// the rest are over-restricted away, and nothing outside the enum
+    /// is ever admitted.
+    #[test]
+    fn capped_state_admits_only_valid_bytes() {
+        let n = MAX_STACKS + 1000;
+        let members: Vec<String> = (0..n).map(|i| format!("m{i:05}")).collect();
+        let schema = serde_json::json!({"enum": members});
+        let mut src = String::from("root ::= s\n");
+        crate::schema_to_gbnf(&schema, "s", &mut src).unwrap();
+        src.push_str(crate::JSON_GRAMMAR);
+        let grammar = Arc::new(parse_ok(&src));
+        let root = GrammarState::new(grammar);
+        assert!(root.stack_depth() <= MAX_STACKS);
+        let accepted = |text: &str| {
+            let mut state = root.clone();
+            state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+        };
+        let kept = members
+            .iter()
+            .filter(|m| accepted(&format!("\"{m}\"")))
+            .count();
+        assert_eq!(kept, MAX_STACKS);
+        let outsiders = (0..n).flat_map(|i| {
+            [
+                format!("\"m{i:05}x\""),
+                format!("\"m{i:04}\""),
+                format!("\"n{i:05}\""),
+            ]
+        });
+        for outsider in outsiders.chain([r#""m""#.into(), r#""m99999""#.into()])
+        {
+            assert!(!accepted(&outsider), "{outsider}");
+        }
+    }
+
+    /// The DFA cache's weight cap: interning one heavy state after
+    /// another, the cache restarts cold at the base intern instead of
+    /// holding them all (65,536 capped states of a deep ambiguous
+    /// grammar would be tens of GiB).
+    #[test]
+    fn dfa_cache_weight_capped() {
+        let grammar = ambiguous_recursive_grammar();
+        let max = 4 << 20;
+        let cache = DfaCache::with_max_weight(max);
+        let mut state = StackState::new_rooted(&grammar);
+        let mut heaviest = 0;
+        for _ in 0..120 {
+            state.advance_bytes(&grammar, br#"{"c":"#).unwrap();
+            heaviest = heaviest.max(state.weight());
+            cache.intern_base(&state);
+            assert!(cache.weight() <= max + heaviest, "{}", cache.weight());
+        }
+        assert!(heaviest > 0);
     }
 
     /// [`Grammar::parse`]'s size guard.
