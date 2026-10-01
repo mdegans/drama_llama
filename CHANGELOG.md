@@ -69,6 +69,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **gpt-oss structured output is constrained again — it never was.**
+  The `output_config` grammar was dialect-blind: its phase-split
+  trigger was a hardcoded `</think>`, which a Harmony model never
+  writes, so with thinking on the JSON body ran entirely unconstrained,
+  and with thinking off the unified grammar demanded `{` where gpt-oss
+  writes its channel header. On 2026-10-01 an Agora consent question
+  came back as `"soul_text":"", "$memory_note":""}` and as
+  `"soul_text":"", ""}` — each a 200 `end_turn`, and a mis-read
+  consent. `OutputConfigOptions::framing` (`ResponseFraming::Bare` |
+  `Harmony`, filled by `Session` from the dialect on every call, like
+  the thought separator) now puts the body in the final channel: the
+  deferred grammar triggers on `<|channel|>final` and constrains the
+  rest of the header (` <|constrain|>json` optional, as gpt-oss writes
+  it) and the body; the unified one admits at most one analysis block
+  before it. The token-level hypotheses — a multi-byte token such as
+  `""` or `", "` judged without walking it, a reset after an empty
+  string — are ruled out by
+  `harmony_output_config_rejects_the_live_bodies_by_token`, which
+  drives the sampler's own legality checks over gpt-oss's real
+  tokenizer (`vocab_only`, `#[ignore]`d) and fails on the old framing.
+  Other dialects keep the `</think>` trigger; one whose model writes a
+  different closer (Gemma 4's `<channel|>`, Mistral 4's `[/THINK]`) is
+  still unconstrained with thinking on.
+
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
   assistant turn's answer and thought (3.6 also `lstrip`/`rstrip`s the

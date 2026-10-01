@@ -83,7 +83,7 @@ pub mod output_config;
 pub use output_config::{
     compile_output_config, compile_prompt_output_config,
     grammar_for_output_config, CompiledOutputConfig, OutputConfigError,
-    OutputConfigOptions,
+    OutputConfigOptions, ResponseFraming,
 };
 
 pub mod dialect;

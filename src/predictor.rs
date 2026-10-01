@@ -1151,7 +1151,7 @@ fn find_deferred_trigger_end(
 /// go to the longer trigger, so `<x> to=` beats ` to=`-style overlaps
 /// feeding the right byte count). Returns `(trigger_end,
 /// trigger_len)` for the winner.
-fn find_any_deferred_trigger_end(
+pub(crate) fn find_any_deferred_trigger_end(
     haystack: &[u8],
     triggers: &[Vec<u8>],
     window: usize,

@@ -7741,9 +7741,17 @@ fn resolve_grammar(
         );
         return Ok(Some(crate::CompiledOutputConfig::Single(g)));
     }
-    // The separator is the template's, never the caller's to choose.
+    // The separator and the framing are the template's, never the
+    // caller's to choose. A framing that misses the dialect is not a
+    // loose constraint but none at all: Harmony never writes the Bare
+    // phase-split trigger (`</think>`), so its JSON ran unconstrained
+    // and came back invalid with a 200 (Agora, 2026-10-01).
     let output_config_opts = OutputConfigOptions {
         thought_separator: dialect.reasoning.separator.clone(),
+        framing: match dialect.family {
+            crate::dialect::Family::Harmony => crate::ResponseFraming::Harmony,
+            _ => crate::ResponseFraming::Bare,
+        },
         ..output_config_opts.clone()
     };
     if let Some(c) = output_config::compile_prompt_output_config(
@@ -10005,6 +10013,332 @@ mod tests {
             source.contains("h_role_form") && source.contains("h_chan_form"),
             "expected Harmony lazy grammar, got: {source}"
         );
+    }
+
+    /// The Agora role-consent schema (2026-10-01 live bug): four
+    /// required properties, closed object, no `$ref`/`pattern`.
+    fn role_consent_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string"},
+                "choice": {
+                    "type": "string",
+                    "enum": ["accept", "change", "nothing"],
+                },
+                "soul_text": {"type": "string"},
+                "memory_note": {"type": "string"},
+            },
+            "required": ["reason", "choice", "soul_text", "memory_note"],
+            "additionalProperties": false,
+        })
+    }
+
+    /// The JSON bodies gpt-oss-120b sent back with a 200: each breaks
+    /// right after an empty string value. The third is the body it
+    /// should have written.
+    const ROLE_CONSENT_STRAY_DOLLAR: &str = r#"{"reason":"I am content.","choice":"nothing", "soul_text":"", "$memory_note":""}"#;
+    const ROLE_CONSENT_EMPTY_KEY: &str =
+        r#"{"reason":"I am content.","choice":"nothing", "soul_text":"", ""}"#;
+    const ROLE_CONSENT_VALID: &str = r#"{"reason":"I am content.","choice":"nothing", "soul_text":"", "memory_note":""}"#;
+
+    /// A Harmony emission around `body`: an optional analysis block,
+    /// then the final channel header in the form gpt-oss writes for
+    /// JSON (`<|constrain|>json`) or the plain one.
+    fn harmony_emission(analysis: bool, constrain: bool, body: &str) -> String {
+        let mut s = String::new();
+        if analysis {
+            s.push_str(
+                "<|channel|>analysis<|message|>Nothing to change.<|end|>\
+                 <|start|>assistant",
+            );
+        }
+        s.push_str("<|channel|>final");
+        if constrain {
+            s.push_str(" <|constrain|>json");
+        }
+        s.push_str("<|message|>");
+        s.push_str(body);
+        s
+    }
+
+    /// Whether `compiled` admits `emission` as a whole, judged the way
+    /// generation applies it: an eager grammar from the first byte; a
+    /// deferred one only past its trigger, as `TokenPredictor` scans
+    /// for it — and a deferred grammar whose trigger never appears
+    /// constrains nothing. `Some(complete)` when admitted.
+    fn constraint_admits(
+        compiled: &crate::CompiledOutputConfig,
+        emission: &str,
+    ) -> Option<bool> {
+        let bytes = emission.as_bytes();
+        let (grammar, tail) = match compiled {
+            crate::CompiledOutputConfig::Single(SamplingMode::Grammar(g)) => {
+                (g, bytes)
+            }
+            crate::CompiledOutputConfig::Single(other) => {
+                panic!("not a grammar: {other:?}")
+            }
+            crate::CompiledOutputConfig::Deferred(d) => {
+                let Some((end, len)) =
+                    crate::predictor::find_any_deferred_trigger_end(
+                        bytes,
+                        &d.activate_after,
+                        bytes.len(),
+                    )
+                else {
+                    // Never activated: the whole emission ran free.
+                    return Some(false);
+                };
+                let from = if d.feed_trigger { end - len } else { end };
+                (&d.grammar, &bytes[from..])
+            }
+        };
+        let mut state = crate::GrammarState::from_source(grammar.source())
+            .expect("compiled grammar re-parses");
+        state.advance_bytes(tail).ok()?;
+        Some(state.is_complete())
+    }
+
+    /// Live bug (Agora cohort, 2026-10-01): gpt-oss answered a
+    /// json_schema `output_config` with `"soul_text":"",
+    /// "$memory_note":""}` and `"soul_text":"", ""}` — a 200 with
+    /// invalid JSON. The output_config grammar was dialect-blind: its
+    /// phase-split trigger was a hardcoded `</think>`, which a Harmony
+    /// model never writes, so the JSON body was never constrained at
+    /// all (and the unified grammar demanded `{` where Harmony writes
+    /// its channel header). Both bodies must be unreachable, with
+    /// thinking on (deferred) and off (unified), in every framing
+    /// gpt-oss uses; the valid body must stay reachable and complete.
+    #[test]
+    fn harmony_output_config_constrains_the_final_body() {
+        use misanthropic::prompt::thinking::Thinking;
+        let thinking_off = Prompt::default().json_schema(role_consent_schema());
+        let thinking_on = thinking_off.clone().thinking(Thinking::Enabled {
+            budget_tokens: NonZeroU32::new(1024).unwrap(),
+            display: None,
+        });
+        for (label, prompt) in [("on", thinking_on), ("off", thinking_off)] {
+            let compiled = resolve_grammar(
+                &prompt,
+                &crate::CallSyntax::gpt_oss(),
+                &OutputConfigOptions::default(),
+                false,
+            )
+            .expect("resolve")
+            .expect("output_config grammar");
+            for analysis in [false, true] {
+                for constrain in [false, true] {
+                    let at = format!(
+                        "thinking {label}, analysis {analysis}, \
+                         constrain {constrain}"
+                    );
+                    for bad in
+                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
+                    {
+                        let emission =
+                            harmony_emission(analysis, constrain, bad);
+                        assert_eq!(
+                            constraint_admits(&compiled, &emission),
+                            None,
+                            "{at}: invalid body must be rejected: \
+                             {emission}"
+                        );
+                    }
+                    let good = harmony_emission(
+                        analysis,
+                        constrain,
+                        ROLE_CONSENT_VALID,
+                    );
+                    assert_eq!(
+                        constraint_admits(&compiled, &good),
+                        Some(true),
+                        "{at}: valid body must be admitted and complete: \
+                         {good}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drive `emission` through `compiled` token by token the way
+    /// `TokenPredictor::next` does — both legality checks the sampler
+    /// applies to a pick (the lazy single-token check and the masked
+    /// `grammar_filter` sweep), then `advance`, then the deferred
+    /// trigger scan — with the real tokenizer. `Err(i)` names the first
+    /// token either check refuses; `Ok(complete)` otherwise.
+    #[cfg(feature = "llama-cpp")]
+    fn drive_tokens(
+        compiled: &crate::CompiledOutputConfig,
+        model: &crate::LlamaCppModel,
+        emission: &str,
+    ) -> Result<bool, usize> {
+        use crate::backend::Model as _;
+        use crate::sample::state::MatcherState;
+        let config = match compiled {
+            crate::CompiledOutputConfig::Single(g) => SamplerConfig {
+                modes: vec![g.clone()],
+                ..SamplerConfig::default()
+            },
+            crate::CompiledOutputConfig::Deferred(d) => SamplerConfig {
+                modes: Vec::new(),
+                deferred_grammar: Some(d.clone()),
+                ..SamplerConfig::default()
+            },
+        };
+        let mut state = config.init_state(0, model);
+        let mut text: Vec<u8> = Vec::new();
+        for (i, &token) in model
+            .tokenize_special(emission, false, true)
+            .iter()
+            .enumerate()
+        {
+            let lazy_ok = state.accepts_chosen(&config, token, model);
+            let single = || {
+                crate::Candidates::from_vec(vec![crate::TokenData {
+                    id: token,
+                    logit: 0.0,
+                    p: 0.0,
+                }])
+            };
+            let kept = |c: crate::Candidates| {
+                c.as_slice().iter().any(|td| td.id == token)
+            };
+            let eager_ok = config.modes.iter().zip(&state.matchers).all(
+                |(mode, matcher)| match (mode, matcher) {
+                    (
+                        SamplingMode::Grammar(g),
+                        MatcherState::Grammar { stack, .. },
+                    ) => kept(crate::sample::grammar::grammar_filter(
+                        single(),
+                        g,
+                        stack,
+                        model,
+                    )),
+                    _ => true,
+                },
+            );
+            let deferred_ok = match (&state.deferred, &config.deferred_grammar)
+            {
+                (Some(d), Some(spec)) if d.active => {
+                    kept(crate::sample::grammar::grammar_filter(
+                        single(),
+                        &spec.grammar,
+                        &d.matcher,
+                        model,
+                    ))
+                }
+                _ => true,
+            };
+            if !(lazy_ok && eager_ok && deferred_ok) {
+                return Err(i);
+            }
+            state.advance(&config, token, model);
+            let mut piece = Vec::new();
+            model.token_to_piece_ref(token, &mut piece);
+            text.extend_from_slice(&piece);
+            if let (Some(spec), Some(true)) =
+                (config.deferred_grammar.as_ref(), state.deferred_inactive())
+            {
+                if let Some((end, len)) =
+                    crate::predictor::find_any_deferred_trigger_end(
+                        &text,
+                        &spec.activate_after,
+                        text.len(),
+                    )
+                {
+                    let from = if spec.feed_trigger { end - len } else { end };
+                    if state.activate_deferred(spec, &text[from..]).is_err() {
+                        return Err(i);
+                    }
+                }
+            }
+        }
+        Ok(state.grammar_complete())
+    }
+
+    /// [`harmony_output_config_constrains_the_final_body`] at the
+    /// token level, through gpt-oss's own tokenizer (a `vocab_only`
+    /// load: CPU, no tensors). The byte-level test cannot see a token
+    /// that spans the failure point — `""`, `", "`, `"$` and friends —
+    /// or a check that judges a multi-byte token without walking it;
+    /// this drives the sampler's actual legality checks over the
+    /// token stream gpt-oss would emit. Skips loudly without the GGUF.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the gpt-oss GGUF (vocab-only load, CPU)"]
+    fn harmony_output_config_rejects_the_live_bodies_by_token() {
+        use misanthropic::prompt::thinking::Thinking;
+        let path = std::env::var_os("DRAMA_LLAMA_GPTOSS_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("models/gpt-oss-120b-MXFP4.gguf")
+            });
+        if !path.exists() {
+            eprintln!("SKIP: no gpt-oss GGUF at {}", path.display());
+            return;
+        }
+        let mut params = crate::LlamaCppOptions::default().model_params();
+        params.vocab_only = true;
+        params.n_gpu_layers = 0;
+        let model = crate::LlamaCppModel::from_file(path, Some(params))
+            .expect("vocab-only load");
+
+        let thinking_off = Prompt::default().json_schema(role_consent_schema());
+        let thinking_on = thinking_off.clone().thinking(Thinking::Enabled {
+            budget_tokens: NonZeroU32::new(1024).unwrap(),
+            display: None,
+        });
+        for (label, prompt) in [("on", thinking_on), ("off", thinking_off)] {
+            let compiled = resolve_grammar(
+                &prompt,
+                &crate::CallSyntax::gpt_oss(),
+                &OutputConfigOptions::default(),
+                false,
+            )
+            .expect("resolve")
+            .expect("output_config grammar");
+            for analysis in [false, true] {
+                for constrain in [false, true] {
+                    let at = format!(
+                        "thinking {label}, analysis {analysis}, \
+                         constrain {constrain}"
+                    );
+                    for bad in
+                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
+                    {
+                        let emission =
+                            harmony_emission(analysis, constrain, bad);
+                        let got = drive_tokens(&compiled, &model, &emission);
+                        // Refused inside the body, past `"soul_text":""`.
+                        let tokens =
+                            model.tokenize_special(&emission, false, true);
+                        let refused_at = got.err().unwrap_or_else(|| {
+                            panic!("{at}: invalid body admitted: {emission}")
+                        });
+                        let prefix: String = tokens[..refused_at]
+                            .iter()
+                            .map(|&t| model.token_to_piece(t))
+                            .collect();
+                        assert!(
+                            prefix.contains(r#""soul_text":"""#),
+                            "{at}: refused too early, after {prefix:?}"
+                        );
+                    }
+                    let good = harmony_emission(
+                        analysis,
+                        constrain,
+                        ROLE_CONSENT_VALID,
+                    );
+                    assert_eq!(
+                        drive_tokens(&compiled, &model, &good),
+                        Ok(true),
+                        "{at}: valid body must be admitted and complete"
+                    );
+                }
+            }
+        }
     }
 
     /// Method + pre-opened reasoning → eager grammar anchored on the
