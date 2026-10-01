@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BEHAVIOR CHANGE: sliding-window models get a window-sized SWA KV
+  cache** (`LlamaCppOptions::swa_full`, unset = `false`; blallama
+  `--swa-full` restores the old size). llama.cpp's library default
+  sizes every sliding-window layer at the full context: Gemma 4 31B
+  pays 880 KiB per token across its 50 window layers, ≈ 110 GiB of KV
+  at 131k (an OOM, #125), and gpt-oss half its 72 KiB, ≈ 4.5 GiB. The
+  window-sized cache is what llama.cpp's own server and CLI default
+  to: at 131k / 4 slots, Gemma 4's KV drops to ≈ 13.5 GiB (10 GiB
+  dense + 3.5 GiB window) and gpt-oss's to ≈ 4.5 GiB. The full-size
+  cache bought nothing: llama.cpp recycles a window's masked cells
+  whichever its size (below), so prefix reuse on these models now goes
+  through window checkpoints either way. This is the one field where
+  an unset `LlamaCppOptions` no longer means llama.cpp's library
+  default. llama.h warns the small cache "can cause bad performance in
+  some cases" with several sequences — unmeasured here; `--swa-full`
+  is the way back if a workload shows it.
 - **Hybrid models (Qwen3.6, Qwen3.8) checkpoint only their recurrent
   state.** A prefix-cache checkpoint was the whole sequence — the
   attention KV for the entire prefix again, ≈ 650 MiB at 30k tokens on

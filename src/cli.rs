@@ -141,6 +141,13 @@ pub struct BackendArgs {
     #[arg(long)]
     pub cache_slots: Option<u32>,
 
+    /// Size sliding-window layers' KV cache at the full context rather
+    /// than at the window (gpt-oss, Gemma 4). Costs memory and buys no
+    /// cache hits; the way back if the window-sized cache measures
+    /// slower. llama-cpp only.
+    #[arg(long)]
+    pub swa_full: bool,
+
     /// Read the experts as the 2-bit packed layout. moeflux only.
     #[arg(long)]
     pub use_2bit: bool,
@@ -156,6 +163,7 @@ impl Default for BackendArgs {
             backend: default_backend_kind(),
             n_ctx: DEFAULT_N_CTX,
             cache_slots: None,
+            swa_full: false,
             use_2bit: false,
         }
     }
@@ -196,6 +204,7 @@ impl TryFrom<&BackendArgs> for crate::LlamaCppOptions {
         Ok(Self {
             n_ctx: Some(args.n_ctx),
             cache_slots: args.cache_slots,
+            swa_full: args.swa_full.then_some(true),
             ..Self::default()
         })
     }
@@ -220,6 +229,9 @@ impl TryFrom<&BackendArgs> for crate::MoefluxOptions {
         if args.cache_slots.is_some() {
             flags.push("--cache-slots");
         }
+        if args.swa_full {
+            flags.push("--swa-full");
+        }
         if !flags.is_empty() {
             return Err(UnsupportedOptions {
                 backend: <crate::MoefluxBackend as crate::Backend>::NAME,
@@ -241,6 +253,7 @@ mod tests {
             backend: default_backend_kind(),
             n_ctx: DEFAULT_N_CTX,
             cache_slots: None,
+            swa_full: false,
             use_2bit: false,
         }
     }
@@ -267,11 +280,16 @@ mod tests {
         let opts = crate::LlamaCppOptions::try_from(&BackendArgs {
             n_ctx: 4096,
             cache_slots: Some(3),
+            swa_full: true,
             ..args()
         })
-        .expect("both are llama.cpp knobs");
+        .expect("all are llama.cpp knobs");
         assert_eq!(opts.n_ctx, Some(4096));
         assert_eq!(opts.cache_slots, Some(3));
+        assert_eq!(opts.swa_full, Some(true));
+        // Unset stays unset — the options' own default decides.
+        let opts = crate::LlamaCppOptions::try_from(&args()).unwrap();
+        assert_eq!(opts.swa_full, None);
 
         let err = crate::LlamaCppOptions::try_from(&BackendArgs {
             use_2bit: true,
@@ -293,6 +311,12 @@ mod tests {
         })
         .expect_err("moeflux has neither");
         assert_eq!(err.flags, ["--n-ctx", "--cache-slots"]);
+        let err = crate::MoefluxOptions::try_from(&BackendArgs {
+            swa_full: true,
+            ..args()
+        })
+        .expect_err("moeflux has no sliding-window cache");
+        assert_eq!(err.flags, ["--swa-full"]);
         assert_eq!(err.backend, "moeflux");
         assert!(err.to_string().contains("--n-ctx --cache-slots"));
     }

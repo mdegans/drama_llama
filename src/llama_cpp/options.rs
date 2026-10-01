@@ -9,8 +9,12 @@
 //! inherent constructor.
 //!
 //! Every field is "unset" by default and unset means *llama.cpp's*
-//! default, not ours. A `Default::default()` load is byte-for-byte the
-//! load you would have got from the old `from_path`.
+//! default, not ours — with one exception, [`LlamaCppOptions::swa_full`],
+//! where the library default (a full-size sliding-window cache) costs a
+//! sliding-window model a whole second KV cache and buys nothing the
+//! checkpoints don't. Unset there means what llama.cpp's own server and
+//! CLI ship instead. Otherwise a `Default::default()` load is
+//! byte-for-byte the load you would have got from the old `from_path`.
 
 use llama_cpp_sys_3::{
     llama_context_params, llama_model_default_params, llama_model_params,
@@ -84,6 +88,29 @@ pub struct LlamaCppOptions {
     #[cfg_attr(feature = "cli", arg(long))]
     pub n_ubatch: Option<u32>,
 
+    /// Size the sliding-window layers' KV cache at the full context
+    /// (`true`, llama.cpp's library default) or at the window (`false`,
+    /// what llama.cpp's server and CLI default to). `None` means
+    /// `false`. Moot for a model without a sliding window.
+    ///
+    /// A full-size window cache costs the window layers a cell for
+    /// every context position — Gemma 4 31B: 50 of 60 layers, so
+    /// 880 KiB per token and ≈ 110 GiB at 131k, which does not fit;
+    /// gpt-oss: half its 72 KiB per token, ≈ 4.5 GiB at 131k. What it
+    /// was meant to buy is a sequence that can be truncated back to any
+    /// position. It does not: llama.cpp recycles a window's masked
+    /// cells whenever it places a batch, full-size cache or not, so an
+    /// idle prefix-cache slot loses the window below its anchors either
+    /// way (live on gpt-oss, 2026-10-01). Rewinds on these models go
+    /// through checkpoints of the window instead (see
+    /// [`crate::Checkpointing`]), which work at either size.
+    ///
+    /// llama.h warns that `false` "can cause bad performance in some
+    /// cases" with several sequences; `Some(true)` is the way back if a
+    /// workload measures that.
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub swa_full: Option<bool>,
+
     /// Keep every layer on the CPU. llama.cpp offloads all layers by
     /// default (`n_gpu_layers = -1`); this forces zero. Diagnostic path
     /// for isolating GPU-kernel divergence.
@@ -123,6 +150,12 @@ impl LlamaCppOptions {
     /// correctness escape hatch as much as a perf knob.
     pub fn with_n_ubatch(mut self, n_ubatch: u32) -> Self {
         self.n_ubatch = Some(n_ubatch);
+        self
+    }
+
+    /// Choose the sliding-window cache size. See [`Self::swa_full`].
+    pub fn with_swa_full(mut self, swa_full: bool) -> Self {
+        self.swa_full = Some(swa_full);
         self
     }
 
@@ -169,6 +202,7 @@ impl LlamaCppOptions {
         if let Some(fa) = self.flash_attn {
             cp.flash_attn_type = fa.as_raw();
         }
+        cp.swa_full = self.swa_full.unwrap_or(false);
         // Applied last so an explicit micro-batch wins over the
         // `n_ctx` clamp above — the whole point of the knob is to force
         // a *small* ubatch under a large context.
@@ -203,6 +237,20 @@ mod tests {
         assert_eq!(cp.n_seq_max, default_cp.n_seq_max);
         assert_eq!(cp.kv_unified, default_cp.kv_unified);
         assert_eq!(cp.flash_attn_type, default_cp.flash_attn_type);
+    }
+
+    /// The one documented exception to "unset means llama.cpp's
+    /// default": a window-sized sliding-window cache, as llama.cpp's
+    /// server ships. The library default would size Gemma 4's 50
+    /// window layers at the full context (≈ 110 GiB at 131k).
+    #[test]
+    fn swa_cache_is_window_sized_unless_asked() {
+        let library_default = LlamaCppEngine::default_context_params();
+        assert!(library_default.swa_full, "llama.cpp changed its default");
+        let opts = LlamaCppOptions::default();
+        assert!(!opts.context_params().swa_full);
+        assert!(opts.with_swa_full(true).context_params().swa_full);
+        assert!(!opts.with_swa_full(false).context_params().swa_full);
     }
 
     /// `cache_slots: Some(1)` is not the identity — it flips the KV
