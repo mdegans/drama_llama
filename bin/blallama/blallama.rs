@@ -879,6 +879,13 @@ where
                         error = %e,
                         "resampling after grammar violation",
                     ),
+                    Resample::SchemaViolation(e) => error!(
+                        attempt = resamples,
+                        max = MAX_RESAMPLES,
+                        error = %e,
+                        "constrained output broke its schema; resampling \
+                         on the warm cache",
+                    ),
                     Resample::CallLoop => error!(
                         attempt = resamples,
                         max = MAX_RESAMPLES,
@@ -933,6 +940,10 @@ enum Resample<'r> {
     /// here, so the retry re-prefills; still cheaper than the client's
     /// round trip.
     GrammarViolation(&'r drama_llama::SessionError),
+    /// Constrained output that finished but does not match its schema —
+    /// the backstop behind the grammar. Never answered with a 200:
+    /// resampled warm, and a 500 `api_error` if every draw breaks it.
+    SchemaViolation(&'r drama_llama::SessionError),
     /// A cut turn looping identical calls into the budget
     /// ([`loops_a_call`]). Any other cut turn — `max_tokens`, a stop
     /// sequence — is not one of these: it succeeds with that stop
@@ -950,6 +961,9 @@ fn resample_reason(
         }
         Err(e @ SessionError::GrammarViolation { .. }) => {
             Some(Resample::GrammarViolation(e))
+        }
+        Err(e @ SessionError::SchemaViolation { .. }) => {
+            Some(Resample::SchemaViolation(e))
         }
         Ok(response) if loops_a_call(response) => Some(Resample::CallLoop),
         _ => None,
@@ -1637,8 +1651,8 @@ mod tests {
 
     /// The resample arms, the Phase G one included: a looping cut
     /// turn is redrawn, an ordinary one (or a finished one) answered;
-    /// a special token or a grammar violation is redrawn, any other
-    /// error answered.
+    /// a special token, a grammar violation or a schema violation is
+    /// redrawn, any other error answered.
     #[test]
     fn resample_reason_redraws_only_the_unlucky_paths() {
         use drama_llama::SessionError;
@@ -1670,7 +1684,45 @@ mod tests {
             resample_reason(&violation),
             Some(Resample::GrammarViolation(_))
         ));
+        let schema = Err(schema_violation());
+        assert!(matches!(
+            resample_reason(&schema),
+            Some(Resample::SchemaViolation(_))
+        ));
         assert_eq!(reason(Err(SessionError::TrailingMedia)), None);
+    }
+
+    /// A schema violation as `Session` raises it for the 2026-10-01
+    /// consent answer (`"soul_text":"", "$memory_note":""}`).
+    fn schema_violation() -> drama_llama::SessionError {
+        drama_llama::SessionError::SchemaViolation {
+            mismatch: drama_llama::SchemaMismatch {
+                path: String::new(),
+                kind: drama_llama::MismatchKind::MissingProperty(
+                    "memory_note".into(),
+                ),
+            },
+            partial_output: drama_llama::prompt::Content(Vec::new()),
+        }
+    }
+
+    /// When every draw breaks its schema, the client gets what Anthropic
+    /// sends for a transient server fault — a 500 `api_error` its SDK
+    /// retries — never a 200 carrying the invalid value.
+    #[test]
+    fn schema_violation_answers_500_api_error() {
+        let error = schema_violation();
+        assert!(error.is_reusable_after(), "{error}");
+        let (status, Json(envelope)) = map_session_err(error);
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{value}");
+        assert_eq!(value["error"]["type"], "api_error");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("missing required property")),
+            "{value}",
+        );
     }
 
     /// Serve `app` on an ephemeral local port.

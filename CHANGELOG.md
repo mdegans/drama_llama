@@ -96,6 +96,115 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`qwen_cache_stable_round_trips_scalar_args`); a number in a
   non-canonical spelling (`1.50`, `1e3`) re-renders canonically and is
   pinned as irreducible (deviation 6 in `templates/README.md`).
+- **gpt-oss structured output is constrained again — it never was.**
+  The `output_config` grammar was dialect-blind: its phase-split
+  trigger was a hardcoded `</think>`, which a Harmony model never
+  writes, so with thinking on the JSON body ran entirely unconstrained,
+  and with thinking off the unified grammar demanded `{` where gpt-oss
+  writes its channel header. On 2026-10-01 an Agora consent question
+  came back as `"soul_text":"", "$memory_note":""}` and as
+  `"soul_text":"", ""}` — each a 200 `end_turn`, and a mis-read
+  consent. `OutputConfigOptions::framing` (`ResponseFraming::Bare` |
+  `Harmony`, filled by `Session` from the dialect on every call, like
+  the thought separator) now puts the body in the final channel: the
+  deferred grammar triggers on `<|channel|>final` and constrains the
+  rest of the header (` <|constrain|>json` optional, as gpt-oss writes
+  it) and the body; the unified one admits at most one analysis block
+  before it. The token-level hypotheses — a multi-byte token such as
+  `""` or `", "` judged without walking it, a reset after an empty
+  string — are ruled out by
+  `harmony_output_config_rejects_the_live_bodies_by_token`, which
+  drives the sampler's own legality checks over gpt-oss's real
+  tokenizer (`vocab_only`, `#[ignore]`d) and fails on the old framing.
+- **Gemma 4 and Mistral 4 structured output is constrained with
+  thinking on.** The same hole as gpt-oss's, one dialect over: the
+  phase-split trigger was `</think>` for every non-Harmony dialect, and
+  Gemma 4 closes its thought with `<channel|>`, Mistral 4 with
+  `[/THINK]`, so their json_schema bodies ran unconstrained. The
+  trigger is now the dialect's own closer, whitespace-trimmed as the
+  parser reads it (`OutputConfigOptions::thought_open` /
+  `thought_close`, filled by `Session` from the dialect's reasoning
+  markers like the separator), and the unified grammar's optional
+  thought is spelled in the same markers — its body now runs to the
+  closer, so a thought may contain a `</` that is not one. Qwen and
+  cogito keep `</think>`; a dialect that measured no reasoning markers
+  keeps `<think>…</think>`. Thinking off needed no fix: neither format
+  frames its content, so the unified grammar's `{` first is right.
+  Reproduced at the byte level on the live gpt-oss bodies
+  (`tagged_reasoning_output_config_constrains_the_body`, red on the old
+  trigger).
+- **A deferred output_config grammar that never activated is a grammar
+  violation.** When the model never writes the trigger (it skipped the
+  thought, or wrote a closer the grammar did not know), the answer ran
+  unconstrained and was returned as if constrained. It is now
+  `SessionError::GrammarViolation` — or `SchemaViolation` when the free
+  body also breaks the schema — with the cache left warm, since no
+  constraint ever started; blallama resamples it. The Auto tool-call
+  lazy grammar keeps its exemption: never calling is legal. A render
+  that already closed the turn's thought (a prefilled closed thought,
+  thinking on) now gets the unified grammar, since its closer can never
+  be written and the deferred one would never fire.
+- **A structured answer written without a thought is steered, not
+  refused (Gemma 4, Mistral 4, cogito).** With thinking on, these
+  renders leave the thought optional, but the body still waited for the
+  thought's closer — so a model that answered `{…}` straight away woke
+  nothing, ran free, and drew the never-activated `GrammarViolation`
+  above on every greedy or seeded draw. The body now defers only where
+  the trigger is certain to come: a render that opened the thought
+  (Qwen) or Harmony's final channel. Every other call gets the unified
+  `( thought gap | ws ) body` grammar from the first token.
+  `OutputConfigOptions::phase_split` documents the rule.
+- **cogito's structured-output thought parses as a thought.** cogito's
+  template has no reasoning markers, so its `output_config` grammar
+  offers `<think>…</think>` (the model thinks in it when its template
+  asks for deep thinking), but the parser read no thought at all: the
+  thought stayed in the answer's text, and `</think>\n{…}` failed the
+  schema on every draw. A call whose output_config grammar offers that
+  fallback thought now parses with the same markers; other calls (no
+  structured output, or a forced tool) still read cogito's `<think>` as
+  text. Known cost: the parser trims whitespace beside the markers
+  (`<think>\n…</think>\n\n{` re-renders as `<think>…</think>\n{`),
+  so such a turn's tip is not byte-stable — a one-turn cache miss.
+- **The gap after a thought is bounded whitespace.** Every
+  output_config grammar admits the measured separator after a thought
+  *and* any other run of up to two whitespace bytes
+  (`OutputConfigOptions::thought_separator`, `THOUGHT_GAP_MAX`). A
+  literal gap masked what models write — `[/THINK]\n{` and
+  `[/THINK] {` against Mistral 4's measured empty gap, `<channel|>\n\n{`
+  against Gemma 4's single byte — and where the gap rode in on the
+  closer's own token (cogito's `>\n\n` after `</`, a text-spelled
+  `]\n` after `[/THINK`) the deferred body woke on bytes it refused,
+  which ends the turn. The bound keeps whitespace from running on.
+- **A token that would wake a deferred grammar illegally is masked.**
+  While a deferred grammar sleeps nothing masks the vocab, so a token
+  that finished its trigger and carried bytes the grammar refuses was
+  sampled, woke it, and the predictor ended the turn mid-structure. The
+  sampler now checks such a token's tail against the sleeping grammar
+  before accepting it and resamples without it, like any other
+  grammar-illegal pick (`sample_token_in`, given the generated text so
+  far; the public `Candidates::sample_token` judges what one piece
+  spells). Pinned by the vocab-only token-level tests
+  `qwen38_output_config_by_token`, `gemma4_output_config_by_token`,
+  `mistral4_output_config_by_token` and `cogito_output_config_by_token`
+  (`#[ignore]`d; `DRAMA_LLAMA_{QWEN38,GEMMA4,MISTRAL,COGITO}_MODEL`):
+  the live invalid bodies are masked inside the body, the valid body
+  with each natural gap is admitted, complete and EOS-legal and keeps
+  the turn contract, and the trigger-crossing tokens are admitted or
+  masked — never fatal.
+- **A Qwen XML tool's string `enum` argument reads as its value.** The
+  grammar writes such a value as JSON (`"full"`, quoted) but the parser
+  read it raw, so the tool got `"\"full\""` — and, for a `strict`
+  tool, the schema backstop refused it on every draw and blallama
+  answered 500. The parser now reads a string `enum` as JSON, matching
+  the emitter. The quoted spelling is not what the template re-renders
+  (`full`), so such a turn's tip does not re-render byte-for-byte.
+- **The schema backstop reads every number the grammar can write.** The
+  grammar's `number` has an unbounded integer part, and serde_json
+  refuses one too large for `f64` ("number out of range"), so such an
+  answer was `NotJson` on every draw; it now reads as a number. (Lone
+  surrogate escapes and three-digit exponents, serde_json's other
+  refusals, are already unwritable under the grammar — now pinned.)
+
 - **Qwen3.6 and Qwen3.8 turns re-render byte-for-byte: both get a
   baked cache-stable template.** Their stock templates `|trim` an
   assistant turn's answer and thought (3.6 also `lstrip`/`rstrip`s the
@@ -417,6 +526,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tip loses the pick, one when `tip_extension` declines to build a tip.
 
 ### Added
+
+- **Constrained output is checked against its schema before it is
+  answered** (`SessionError::SchemaViolation`). A finished
+  json_schema `output_config` answer must be exactly one JSON document
+  across the turn's text, matching the schema; a `strict` tool call's
+  input must match its tool's. Checked are the keywords the grammar
+  compiler enforces (`type`, `properties`, `required`,
+  `additionalProperties`, `enum`, `const`, `anyOf`, `items`, `$ref`,
+  non-empty `minItems`) — never the validator-only ones it deliberately
+  leaves to the model (`pattern`, `minLength`, `maximum`, …), which
+  would turn every such request into a resample loop. A turn cut by
+  `max_tokens` or a stop sequence is exempt (#121). The error leaves the
+  cache warm, `Display` names the schema location but never the value,
+  and blallama resamples it on the warm cache like a grammar violation,
+  then answers 500 `api_error` — never a 200 carrying the invalid
+  value. `SchemaMismatch` / `MismatchKind` are public.
+- **`BlockStream::violation`**: once drained, a stream reports the
+  `GrammarViolation` or `SchemaViolation` the batch path would have
+  returned for the same turn, by the same rules (one `TurnContract`
+  for both). The blocks are already out, so discarding them is the
+  caller's call. The batch path's special-token containment
+  (`EmittedSpecialToken`) is not checked there.
 
 - **Automatic prompt caching, as on Anthropic.** A request-level
   `cache_control` (`Prompt::cache_control`, misanthropic's

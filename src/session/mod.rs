@@ -225,7 +225,10 @@ pub enum SessionError {
     /// — a forced call missing its `tool_use` block, or an eager
     /// grammar/JSON constraint left mid-structure at end of generation —
     /// with budget to spare. Constraint-incomplete output is never
-    /// returned silently.
+    /// returned silently, and neither is an answer the constraint never
+    /// saw: a deferred (phase-split) `output_config` grammar whose trigger
+    /// never came, which leaves the cache warm, as nothing was
+    /// mid-constraint.
     ///
     /// *Not* raised for a turn cut short by `max_tokens`, the context
     /// limit, or a stop sequence (#121): that is an unfinished turn, not
@@ -315,6 +318,38 @@ pub enum SessionError {
         /// occurrence. Reserved bytes — do not relay into
         /// model-visible content.
         found: Vec<String>,
+    },
+    /// A constrained completion finished, but its JSON does not satisfy
+    /// the schema it was constrained by — the structured output of a
+    /// json_schema [`output_config`], or the input of a `strict` tool
+    /// call. Constrained decoding is supposed to make this impossible;
+    /// this is the backstop for when the grammar has a hole (a
+    /// phase-split trigger the model never wrote left gpt-oss's JSON
+    /// unconstrained, and two invalid answers went out as 200s —
+    /// Agora, 2026-10-01). Never returned for a turn cut short by
+    /// `max_tokens` or a stop sequence: an unfinished value is not a
+    /// violation (#121).
+    ///
+    /// Retry as for [`Self::EmittedSpecialToken`]: the constraint either
+    /// completed or never activated, so the recorded cache is
+    /// consistent, and resending the identical prompt resamples on the
+    /// warm cache. `Display` names the schema location, never the
+    /// value.
+    ///
+    /// [`output_config`]: misanthropic::Prompt::output_config
+    #[error(
+        "constrained output does not match its schema {mismatch}; \
+         resample — the prompt is unchanged and its cache extent is \
+         still warm ({} block(s) withheld from this message — see \
+         `partial_output`)",
+        partial_output.0.len()
+    )]
+    SchemaViolation {
+        /// Where and how the output departs from its schema.
+        mismatch: crate::SchemaMismatch,
+        /// The whole parse, structure intact. Diagnostics only, as for
+        /// [`Self::GrammarViolation`]'s `partial_output`.
+        partial_output: crate::prompt::Content,
     },
     /// The prompt carries an *open* thought — a reasoning block whose
     /// close marker the model never emitted, flagged with
@@ -438,6 +473,9 @@ impl SessionError {
             // finds the prompt extent warm. Not just reusable but
             // *cheap* to retry.
             Self::EmittedSpecialToken { .. } => true,
+            // Same bookkeeping as the containment check: the cache is
+            // left as on success, so the resample finds it warm.
+            Self::SchemaViolation { .. } => true,
             // Media capability / shape errors fire during prepare,
             // before any decode. State untouched — safe to reuse.
             Self::MediaUnsupported { .. }
@@ -5086,10 +5124,19 @@ impl<B: Backend> Session<B> {
         let reasoning_opener_spent =
             pre_opened_reasoning || reasoning_closed_by_render;
 
+        // A render that already closed the turn's thought (a prefilled
+        // closed thought with thinking on) leaves no closer for a
+        // phase-split trigger to see — the closer ban makes sure of it —
+        // so its grammar would never fire. Constrain from the start.
+        let output_config_opts = OutputConfigOptions {
+            phase_split: self.output_config_opts.phase_split
+                && !reasoning_closed_by_render,
+            ..self.output_config_opts.clone()
+        };
         let (grammar_mode, deferred_grammar) = match resolve_grammar(
             prompt,
             &self.dialect,
-            &self.output_config_opts,
+            &output_config_opts,
             pre_opened_reasoning,
         )? {
             None => (None, None),
@@ -5109,6 +5156,11 @@ impl<B: Backend> Session<B> {
             grammar_mode.into_iter().collect()
         };
         Ok(PreparedCall {
+            parse_syntax: call_parse_syntax(
+                prompt,
+                &self.dialect,
+                &output_config_opts,
+            ),
             entries,
             breakpoints,
             modes,
@@ -6251,6 +6303,7 @@ impl<B: Backend> Session<B> {
             reasoning_opener_spent,
             reasoning_closed_by_render,
             media_by_id,
+            parse_syntax,
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
@@ -6286,7 +6339,6 @@ impl<B: Backend> Session<B> {
         // Stop sequences stop here exactly as in `run_call` — matched
         // against text output, never framing (#122) — so the two views
         // of the same bytes stop on the same token.
-        let parse_syntax = effective_tool_syntax(&self.dialect).into_owned();
         let parse_tools: Vec<Tool> = prompt
             .tools
             .iter()
@@ -6549,10 +6601,12 @@ impl<B: Backend> Session<B> {
     ///
     /// Iteration itself doesn't produce per-item errors; all setup failures
     /// (template render, grammar compile) surface as the outer `Err`.
-    /// Grammar-violation checks live on the batch methods — streaming callers
-    /// see whatever partial output the model produced, with one exception
-    /// shared with the batch path: a generation cut short (`max_tokens`, a
-    /// stop sequence) yields an incomplete trailing call cut short, as
+    /// Streaming callers see whatever output the model produced, and once
+    /// the stream is drained [`BlockStream::violation`] reports the
+    /// grammar or schema violation the batch methods would have returned
+    /// instead — the bytes are out by then, so discarding them is the
+    /// caller's call. A generation cut short (`max_tokens`, a stop
+    /// sequence) yields an incomplete trailing call cut short, as
     /// Anthropic returns it, rather than its bytes as text.
     /// [`BlockStream::stop_reason`] reports the ending once the stream is
     /// drained, and [`BlockStream::open_call_json`] whether a clip left
@@ -6573,6 +6627,7 @@ impl<B: Backend> Session<B> {
             reasoning_opener_spent,
             reasoning_closed_by_render,
             media_by_id,
+            parse_syntax,
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
@@ -6646,7 +6701,7 @@ impl<B: Backend> Session<B> {
 
         // The parse dialect + tool schemas outlive the engine borrow
         // the predictor takes, so clone them out of `self` first.
-        let syntax = effective_tool_syntax(&self.dialect).into_owned();
+        let syntax = parse_syntax;
         let tools: Vec<Tool> = prompt
             .tools
             .iter()
@@ -6691,9 +6746,10 @@ impl<B: Backend> Session<B> {
             drained: false,
             generated: 0,
             max_tokens,
-            tool_use: false,
-            last: None,
+            yielded: Vec::new(),
             stop: None,
+            contract: TurnContract::of(prompt, deferred_grammar.as_ref()),
+            violation: None,
         })
     }
 
@@ -6710,12 +6766,6 @@ impl<B: Backend> Session<B> {
         &mut self,
         prompt: &Prompt,
     ) -> Result<CallOutcome, SessionError> {
-        use crate::ToolChoice;
-        let forced_tool_call = matches!(
-            prompt.tool_choice,
-            Some(ToolChoice::Method { .. }) | Some(ToolChoice::Any { .. })
-        );
-
         let PreparedCall {
             entries,
             breakpoints,
@@ -6731,6 +6781,7 @@ impl<B: Backend> Session<B> {
             media_by_id,
             source_to_id,
             media_sentinel,
+            parse_syntax,
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
         let breakpoint_cells = breakpoints
@@ -6818,7 +6869,6 @@ impl<B: Backend> Session<B> {
         // The parse dialect and tool schemas: the request's stop
         // sequences are matched against the text output they parse to
         // (#122), during generation as well as after it.
-        let parse_syntax = effective_tool_syntax(&self.dialect).into_owned();
         let parse_tools: Vec<Tool> = prompt
             .tools
             .iter()
@@ -6917,6 +6967,8 @@ impl<B: Backend> Session<B> {
         // Capture the incomplete-at-end violation signal and the final
         // sampler state (tip promotion) before the predictor drops.
         let constraint_incomplete = predictor.constraint_incomplete_at_end();
+        let deferred_unfired =
+            predictor.sampler_state().deferred_inactive() == Some(true);
         let final_state = cache_on.then(|| predictor.sampler_state().clone());
         let budget = Cut::of(&predictor);
         drop(predictor);
@@ -7174,16 +7226,17 @@ impl<B: Backend> Session<B> {
         // as the typed error instead.
         //
         // This covers the *activated* deferred grammar too (#38 defect
-        // 1). A deferred grammar that never triggered stays exempt —
-        // never calling a tool is legal on the Auto path — but one
-        // whose trigger fired is a live constraint like any other, and
+        // 1). An Auto tool-call grammar that never triggered stays
+        // exempt — never calling a tool is legal — but one whose
+        // trigger fired is a live constraint like any other, and
         // leaving it unflagged is what let a truncated Auto call get
         // seated as plain `Block::Text`, with its `<tool_call>` frame
         // marker intact. The next ingest of that transcript trips
         // `check_no_special_injection` and the caller's loop dies one
         // turn after the actual failure, permanently.
         //
-        // Streaming stays permissive by documented contract.
+        // A stream yields its blocks regardless and reports the same
+        // verdict once drained (`BlockStream::violation`).
         // `constraint_incomplete` was captured from the predictor's
         // SamplerState before drop.
         //
@@ -7195,13 +7248,20 @@ impl<B: Backend> Session<B> {
         // error it cost two resamples that fail the same way (the
         // budget is the budget) and then a 500 on blallama, so clients
         // keying their clip handling on the stop reason never saw one.
-        if cut.is_none()
-            && (constraint_incomplete
-                || (forced_tool_call
-                    && !blocks
-                        .iter()
-                        .any(|b| matches!(b, crate::Block::ToolUse { .. }))))
-        {
+        //
+        // A deferred *output_config* grammar that never fired is a
+        // violation too, though checked last (below): the answer it was
+        // to constrain ran free (see `TurnContract::deferred_answer`).
+        let breach = TurnContract::of(prompt, deferred_grammar.as_ref())
+            .breach(
+                &blocks,
+                TurnEnd {
+                    cut: cut.is_some(),
+                    constraint_incomplete,
+                    deferred_unfired,
+                },
+            );
+        if matches!(breach, Some(Breach::Incomplete)) {
             // Grammar violation is a call failure — invalidate cache
             // + KV to avoid stale reuse next call (the recorded tip
             // carries a mid-constraint sampler state).
@@ -7255,6 +7315,55 @@ impl<B: Backend> Session<B> {
                 );
                 return Err(SessionError::EmittedSpecialToken { found });
             }
+        }
+
+        // Schema backstop: a finished constrained value must satisfy the
+        // schema it was constrained by. The grammar is supposed to make
+        // this unreachable; when it has a hole — a phase-split trigger
+        // the dialect never writes left gpt-oss's JSON unconstrained,
+        // and `"soul_text":"", ""}` went out as a 200 (Agora,
+        // 2026-10-01) — the output becomes a typed error to resample
+        // instead of an answer. A cut turn is exempt like the
+        // grammar-violation check above: an unfinished value is not a
+        // wrong one (#121). No cache invalidation, as for containment:
+        // the constraint either completed or never activated, so the
+        // recorded state is consistent and the retry finds the prompt
+        // extent warm. A stream reports the same verdict once drained
+        // (`BlockStream::violation`) — its bytes are already out.
+        //
+        // Then the deferred output_config grammar that never fired, as a
+        // grammar violation but with the cache left warm like this one:
+        // no constraint ever started, so the recorded state is plain
+        // unconstrained generation. Checked after the schema, so a body
+        // that ran free *and* broke the schema says where.
+        match breach {
+            Some(Breach::Schema(mismatch)) => {
+                #[cfg(feature = "axum")]
+                tracing::error!(
+                    target: "drama_llama::session",
+                    %mismatch,
+                    "constrained output does not match its schema; \
+                     rejected before it reaches the caller — prompt \
+                     cache extent is warm, resample",
+                );
+                return Err(SessionError::SchemaViolation {
+                    mismatch,
+                    partial_output: crate::prompt::Content(blocks),
+                });
+            }
+            Some(Breach::Unfired) => {
+                #[cfg(feature = "axum")]
+                tracing::error!(
+                    target: "drama_llama::session",
+                    "output_config grammar never activated (its trigger \
+                     was never written), so the answer ran unconstrained; \
+                     rejected — prompt cache extent is warm, resample",
+                );
+                return Err(SessionError::GrammarViolation {
+                    partial_output: crate::prompt::Content(blocks),
+                });
+            }
+            Some(Breach::Incomplete) | None => {}
         }
 
         let (stop_reason, stop_sequence) = infer_stop_reason(
@@ -7689,6 +7798,143 @@ fn dialect_deferred_grammar_for_prompt(
     }))
 }
 
+/// What a finished turn owes its constraints beyond the grammar's own
+/// token-by-token checks — read off the prompt before generation, judged
+/// on the parsed blocks after it. One contract for `run_call` and a
+/// drained [`BlockStream`], so both paths refuse the same turns.
+#[derive(Clone, Debug, Default)]
+struct TurnContract {
+    /// A forced `tool_choice`: the turn must call.
+    forced_call: bool,
+    /// `(name, schema)` of every `strict` tool: a call's input must match
+    /// (non-strict tools promise nothing, as on Anthropic).
+    strict_tools: Vec<(String, serde_json::Value)>,
+    /// The json_schema [`output_config`]'s schema. A turn that answers it
+    /// — no call, and no forced call, which outranks it at grammar
+    /// resolution ([`resolve_grammar`]) — must be exactly one JSON
+    /// document matching it, across all its text: prose beside the JSON
+    /// breaks it too, since the grammar admits none.
+    ///
+    /// [`output_config`]: misanthropic::Prompt::output_config
+    output_schema: Option<serde_json::Value>,
+    /// The output_config grammar is deferred (phase-split), so its
+    /// trigger must fire: the body runs under it or under nothing.
+    /// Unlike the Auto tool-call lazy grammar — the only other deferred
+    /// one, which never firing just means no call — an output_config
+    /// grammar that never activated left the answer unconstrained.
+    deferred_answer: bool,
+}
+
+/// How a turn broke its [`TurnContract`], in the order `run_call` checks.
+#[derive(Debug)]
+enum Breach {
+    /// A constraint was left mid-structure, or a forced call never came:
+    /// a [`SessionError::GrammarViolation`] whose cache must go cold (the
+    /// recorded state is mid-constraint).
+    Incomplete,
+    /// [`SessionError::SchemaViolation`].
+    Schema(crate::SchemaMismatch),
+    /// The deferred output_config grammar never fired: a
+    /// [`SessionError::GrammarViolation`] with the cache left warm, since
+    /// no constraint ever started.
+    Unfired,
+}
+
+/// How generation ended, as far as [`TurnContract::breach`] cares.
+#[derive(Clone, Copy, Debug)]
+struct TurnEnd {
+    /// Cut short by the budget or a stop sequence (#121): an unfinished
+    /// turn, which breaks nothing.
+    cut: bool,
+    /// [`crate::TokenPredictor::constraint_incomplete_at_end`].
+    constraint_incomplete: bool,
+    /// A deferred grammar was installed and never activated.
+    deferred_unfired: bool,
+}
+
+impl TurnContract {
+    /// The contract `prompt` sets, given the call's resolved `deferred`
+    /// grammar.
+    fn of(prompt: &Prompt, deferred: Option<&crate::DeferredGrammar>) -> Self {
+        let output_schema = output_config::json_schema(prompt).cloned();
+        Self {
+            forced_call: matches!(
+                prompt.tool_choice,
+                Some(ToolChoice::Any { .. } | ToolChoice::Method { .. })
+            ),
+            strict_tools: prompt
+                .tools
+                .iter()
+                .flatten()
+                .filter_map(|def| def.as_method())
+                .filter(|tool| tool.strict == Some(true))
+                .map(|tool| (tool.name.to_string(), tool.schema.clone()))
+                .collect(),
+            // `resolve_grammar` ranks a structured output_config above the
+            // Auto lazy grammar, so a deferred grammar beside one is its.
+            deferred_answer: deferred.is_some() && output_schema.is_some(),
+            output_schema,
+        }
+    }
+
+    /// The first way a turn that ended as `end` with `blocks` breaks the
+    /// contract, if any.
+    fn breach(&self, blocks: &[crate::Block], end: TurnEnd) -> Option<Breach> {
+        if end.cut {
+            return None;
+        }
+        let called = || {
+            blocks
+                .iter()
+                .any(|b| matches!(b, crate::Block::ToolUse { .. }))
+        };
+        if end.constraint_incomplete || (self.forced_call && !called()) {
+            return Some(Breach::Incomplete);
+        }
+        if let Some(mismatch) = self.schema_mismatch(blocks) {
+            return Some(Breach::Schema(mismatch));
+        }
+        (self.deferred_answer && end.deferred_unfired && !called())
+            .then_some(Breach::Unfired)
+    }
+
+    /// The first way `blocks` break a schema their constraint promised —
+    /// the post-generation backstop behind
+    /// [`SessionError::SchemaViolation`].
+    fn schema_mismatch(
+        &self,
+        blocks: &[crate::Block],
+    ) -> Option<crate::SchemaMismatch> {
+        let calls = || {
+            blocks.iter().filter_map(|block| match block {
+                crate::Block::ToolUse { call } => Some(call),
+                _ => None,
+            })
+        };
+        if let Some(mismatch) = calls().find_map(|call| {
+            let (_, schema) = self
+                .strict_tools
+                .iter()
+                .find(|(name, _)| *name == call.name)?;
+            crate::schema_check::check(schema, &call.input).err()
+        }) {
+            return Some(mismatch);
+        }
+        if self.forced_call || calls().next().is_some() {
+            return None;
+        }
+        let schema = self.output_schema.as_ref()?;
+        let text: String = blocks
+            .iter()
+            .filter_map(|block| match block {
+                crate::Block::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        crate::schema_check::check_text(schema, &text).err()
+    }
+}
+
 /// Resolve the single grammar (if any) that should constrain
 /// generation for `prompt`. Priority:
 ///
@@ -7741,9 +7987,23 @@ fn resolve_grammar(
         );
         return Ok(Some(crate::CompiledOutputConfig::Single(g)));
     }
-    // The separator is the template's, never the caller's to choose.
+    // The separator, the framing and the thought markers are the
+    // template's, never the caller's to choose. A framing that misses
+    // the dialect is not a loose constraint but none at all: Harmony
+    // never writes the Bare phase-split trigger (`</think>`), so its
+    // JSON ran unconstrained and came back invalid with a 200 (Agora,
+    // 2026-10-01) — and neither do Gemma 4 (`<channel|>`) or Mistral 4
+    // (`[/THINK]`). The markers are `output_config_thought`'s, which the
+    // call's parser reads too (`call_parse_syntax`).
+    let thought = output_config_thought(dialect);
     let output_config_opts = OutputConfigOptions {
-        thought_separator: dialect.reasoning.separator.clone(),
+        thought_separator: thought.separator,
+        framing: match dialect.family {
+            crate::dialect::Family::Harmony => crate::ResponseFraming::Harmony,
+            _ => crate::ResponseFraming::Bare,
+        },
+        thought_open: thought.start,
+        thought_close: thought.end.trim().to_string(),
         ..output_config_opts.clone()
     };
     if let Some(c) = output_config::compile_prompt_output_config(
@@ -7782,6 +8042,68 @@ fn resolve_grammar(
         "resolve_grammar: returning None (no grammar applied)",
     );
     Ok(None)
+}
+
+/// Whether `dialect` measured reasoning markers of its own — the
+/// markers its parser reads a thought by.
+fn reasoning_tagged(dialect: &crate::CallSyntax) -> bool {
+    dialect.reasoning.mode != crate::dialect::ReasoningMode::None
+        && !dialect.reasoning.end.trim().is_empty()
+}
+
+/// The thought a [`ResponseFraming::Bare`](crate::ResponseFraming)
+/// output_config grammar offers on `dialect`: the dialect's own markers,
+/// or — when its template measured none — `<think>…</think>`, the habit
+/// of the models behind such templates (cogito thinks in it when its
+/// template asks for deep thinking). The grammar spells these markers
+/// and the call's parser reads them ([`call_parse_syntax`]); the two
+/// disagreeing is what left cogito's `</think>\n{…}` thought inside the
+/// answer's text, failing the schema on every draw.
+fn output_config_thought(
+    dialect: &crate::CallSyntax,
+) -> crate::dialect::ReasoningSyntax {
+    let own = &dialect.reasoning;
+    match reasoning_tagged(dialect) {
+        true => own.clone(),
+        false => crate::dialect::ReasoningSyntax {
+            mode: crate::dialect::ReasoningMode::TagBased,
+            start: crate::output_config::THINK_OPEN.to_string(),
+            end: String::from_utf8_lossy(
+                crate::output_config::THINK_CLOSE_TRIGGER,
+            )
+            .into_owned(),
+            reingest: own.reingest,
+            separator: None,
+            efforts: own.efforts.clone(),
+        },
+    }
+}
+
+/// The syntax a call's output parses with: [`effective_tool_syntax`],
+/// except that a call whose output_config grammar offers the
+/// [`output_config_thought`] fallback — no forced tool outranking it, a
+/// Bare framing, `allow_thought`, and a dialect with no markers of its
+/// own — reads a thought in exactly those markers. Only then: on any
+/// other call such a dialect's `<think>` is text, as it always was.
+fn call_parse_syntax(
+    prompt: &Prompt,
+    dialect: &crate::CallSyntax,
+    opts: &OutputConfigOptions,
+) -> crate::CallSyntax {
+    let mut syntax = effective_tool_syntax(dialect).into_owned();
+    let forced = matches!(
+        prompt.tool_choice,
+        Some(ToolChoice::Any { .. } | ToolChoice::Method { .. })
+    );
+    let fallback = !forced
+        && !reasoning_tagged(dialect)
+        && dialect.family != crate::dialect::Family::Harmony
+        && opts.allow_thought
+        && output_config::json_schema(prompt).is_some();
+    if fallback {
+        syntax.reasoning = output_config_thought(dialect);
+    }
+    syntax
 }
 
 /// Whether a rendered generation prompt ends with a *pre-opened*
@@ -7865,6 +8187,8 @@ fn prompt_resumes_open_reasoning(
 /// metadata, the effective sampling chain, and the render-derived
 /// facts the parse / canonicalization stages need afterwards.
 struct PreparedCall {
+    /// The syntax this call's output parses with ([`call_parse_syntax`]).
+    parse_syntax: crate::CallSyntax,
     /// Full prompt entries (`parse_special = true` for text; media
     /// entries from the vision tokenizer's placeholder pass).
     entries: Vec<CacheEntry>,
@@ -8151,8 +8475,9 @@ fn infer_stop_reason(
 /// sequence) yields an incomplete trailing call cut short, as Anthropic
 /// returns it, instead of its bytes as text (#121). Like the batch path,
 /// it halts once the grammar is exhausted. Once drained,
-/// [`Self::stop_reason`] reports the ending the batch path would, and
-/// [`Self::open_call_json`] whether the last call was left open.
+/// [`Self::stop_reason`] reports the ending the batch path would,
+/// [`Self::open_call_json`] whether the last call was left open, and
+/// [`Self::violation`] the error the batch path would have returned.
 pub struct BlockStream<'engine, B: Backend> {
     predictor: crate::PiecePredictor<'engine, B>,
     /// Re-parse-per-tick streaming parser over the session dialect
@@ -8171,12 +8496,15 @@ pub struct BlockStream<'engine, B: Backend> {
     /// Pieces of content generated, for the `MaxTokens` fallback.
     generated: usize,
     max_tokens: NonZeroUsize,
-    /// Whether a [`Block::ToolUse`](crate::Block::ToolUse) was yielded.
-    tool_use: bool,
-    /// The last block yielded.
-    last: Option<crate::Block>,
+    /// Every block yielded so far: the ending and the end-of-turn checks
+    /// judge the whole turn.
+    yielded: Vec<crate::Block>,
     /// Set once drained: see [`Self::stop_reason`].
     stop: Option<(Option<misanthropic::response::StopReason>, Option<String>)>,
+    /// What the turn owes its constraints, judged once drained.
+    contract: TurnContract,
+    /// Set once drained: see [`Self::violation`].
+    violation: Option<SessionError>,
 }
 
 impl<'engine, B: Backend> BlockStream<'engine, B> {
@@ -8206,6 +8534,20 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         self.drained.then(|| self.filter.open_call_json()).flatten()
     }
 
+    /// Once drained, the error the batch path would have returned
+    /// instead of this turn — a [`SessionError::GrammarViolation`] (a
+    /// constraint left mid-structure, a forced call that never came, or a
+    /// deferred output_config grammar that never activated) or a
+    /// [`SessionError::SchemaViolation`] — judged by the same rules, a
+    /// cut turn included (#121). `None` before then, and for a turn that
+    /// stands. The blocks have been yielded either way: a caller holding
+    /// a structured-output or `strict` promise discards them on `Some`
+    /// and resamples, as for the batch error. Not checked here: the
+    /// batch path's [`SessionError::EmittedSpecialToken`] containment.
+    pub fn violation(&self) -> Option<&SessionError> {
+        self.violation.as_ref()
+    }
+
     /// End of generation: flush, pick the leniency, settle the ending.
     fn drain(&mut self) {
         self.drained = true;
@@ -8224,21 +8566,40 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
             .hit()
             .map(|s| Cut::StopSequence(s.to_owned()))
             .or(budget);
-        // The ending needs the yields still queued, not just the
-        // yielded ones.
-        let tool_use = self.tool_use
-            || self
-                .pending
-                .iter()
-                .any(|b| matches!(b, crate::Block::ToolUse { .. }));
-        let last = self.pending.back().or(self.last.as_ref());
+        // The ending and the checks need the yields still queued, not
+        // just the yielded ones.
+        let turn: Vec<crate::Block> =
+            self.yielded.iter().chain(&self.pending).cloned().collect();
+        let end = TurnEnd {
+            cut: cut.is_some(),
+            constraint_incomplete: self
+                .predictor
+                .constraint_incomplete_at_end(),
+            deferred_unfired: self
+                .predictor
+                .sampler_state()
+                .deferred_inactive()
+                == Some(true),
+        };
+        let breach = self.contract.breach(&turn, end);
         self.stop = Some(infer_stop_reason(
-            tool_use,
-            last,
+            turn.iter()
+                .any(|b| matches!(b, crate::Block::ToolUse { .. })),
+            turn.last(),
             cut,
             self.generated,
             self.max_tokens,
         ));
+        let partial_output = crate::prompt::Content(turn);
+        self.violation = breach.map(|breach| match breach {
+            Breach::Incomplete | Breach::Unfired => {
+                SessionError::GrammarViolation { partial_output }
+            }
+            Breach::Schema(mismatch) => SessionError::SchemaViolation {
+                mismatch,
+                partial_output,
+            },
+        });
     }
 }
 
@@ -8248,8 +8609,7 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(block) = self.pending.pop_front() {
-                self.tool_use |= matches!(block, crate::Block::ToolUse { .. });
-                self.last = Some(block.clone());
+                self.yielded.push(block.clone());
                 return Some(block);
             }
             if self.drained {
@@ -9812,8 +10172,9 @@ mod tests {
     /// `output_schema` rule name the output_config builder emits.
     /// Default `OutputConfigOptions` has `phase_split=true`; since
     /// `compile_prompt_output_config` auto-disables phase_split when
-    /// `prompt.thinking.is_none()`, the prompt here opts into
-    /// thinking so the Deferred path is exercised.
+    /// `prompt.thinking.is_none()`, and defers only where the trigger is
+    /// certain, the prompt here opts into thinking and the render is
+    /// pre-opened so the Deferred path is exercised.
     #[test]
     fn test_resolve_grammar_output_config_when_no_tool_choice() {
         use misanthropic::prompt::thinking::Thinking;
@@ -9831,7 +10192,7 @@ mod tests {
             &prompt,
             &crate::CallSyntax::hermes_json(),
             &OutputConfigOptions::default(),
-            false,
+            true,
         )
         .expect("resolve");
         let crate::CompiledOutputConfig::Deferred(deferred) =
@@ -9882,7 +10243,7 @@ mod tests {
         };
         let source = state.source().to_string();
         assert!(source.contains("output_schema"));
-        assert!(source.contains("think_body"));
+        assert!(source.contains("thought_close"));
     }
 
     /// Both tool_choice and output_config set → tool_choice wins.
@@ -10005,6 +10366,1103 @@ mod tests {
             source.contains("h_role_form") && source.contains("h_chan_form"),
             "expected Harmony lazy grammar, got: {source}"
         );
+    }
+
+    /// The Agora role-consent schema (2026-10-01 live bug): four
+    /// required properties, closed object, no `$ref`/`pattern`.
+    fn role_consent_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string"},
+                "choice": {
+                    "type": "string",
+                    "enum": ["accept", "change", "nothing"],
+                },
+                "soul_text": {"type": "string"},
+                "memory_note": {"type": "string"},
+            },
+            "required": ["reason", "choice", "soul_text", "memory_note"],
+            "additionalProperties": false,
+        })
+    }
+
+    /// The JSON bodies gpt-oss-120b sent back with a 200: each breaks
+    /// right after an empty string value. The third is the body it
+    /// should have written.
+    const ROLE_CONSENT_STRAY_DOLLAR: &str = r#"{"reason":"I am content.","choice":"nothing", "soul_text":"", "$memory_note":""}"#;
+    const ROLE_CONSENT_EMPTY_KEY: &str =
+        r#"{"reason":"I am content.","choice":"nothing", "soul_text":"", ""}"#;
+    const ROLE_CONSENT_VALID: &str = r#"{"reason":"I am content.","choice":"nothing", "soul_text":"", "memory_note":""}"#;
+
+    /// A Harmony emission around `body`: an optional analysis block,
+    /// then the final channel header in the form gpt-oss writes for
+    /// JSON (`<|constrain|>json`) or the plain one.
+    fn harmony_emission(analysis: bool, constrain: bool, body: &str) -> String {
+        let mut s = String::new();
+        if analysis {
+            s.push_str(
+                "<|channel|>analysis<|message|>Nothing to change.<|end|>\
+                 <|start|>assistant",
+            );
+        }
+        s.push_str("<|channel|>final");
+        if constrain {
+            s.push_str(" <|constrain|>json");
+        }
+        s.push_str("<|message|>");
+        s.push_str(body);
+        s
+    }
+
+    /// Whether `compiled` admits `emission` as a whole, judged the way
+    /// generation applies it: an eager grammar from the first byte; a
+    /// deferred one only past its trigger, as `TokenPredictor` scans
+    /// for it — and a deferred grammar whose trigger never appears
+    /// constrains nothing. `Some(complete)` when admitted.
+    fn constraint_admits(
+        compiled: &crate::CompiledOutputConfig,
+        emission: &str,
+    ) -> Option<bool> {
+        let bytes = emission.as_bytes();
+        let (grammar, tail) = match compiled {
+            crate::CompiledOutputConfig::Single(SamplingMode::Grammar(g)) => {
+                (g, bytes)
+            }
+            crate::CompiledOutputConfig::Single(other) => {
+                panic!("not a grammar: {other:?}")
+            }
+            crate::CompiledOutputConfig::Deferred(d) => {
+                let Some((end, len)) =
+                    crate::predictor::find_any_deferred_trigger_end(
+                        bytes,
+                        &d.activate_after,
+                        bytes.len(),
+                    )
+                else {
+                    // Never activated: the whole emission ran free.
+                    return Some(false);
+                };
+                let from = if d.feed_trigger { end - len } else { end };
+                (&d.grammar, &bytes[from..])
+            }
+        };
+        let mut state = crate::GrammarState::from_source(grammar.source())
+            .expect("compiled grammar re-parses");
+        state.advance_bytes(tail).ok()?;
+        Some(state.is_complete())
+    }
+
+    /// Live bug (Agora cohort, 2026-10-01): gpt-oss answered a
+    /// json_schema `output_config` with `"soul_text":"",
+    /// "$memory_note":""}` and `"soul_text":"", ""}` — a 200 with
+    /// invalid JSON. The output_config grammar was dialect-blind: its
+    /// phase-split trigger was a hardcoded `</think>`, which a Harmony
+    /// model never writes, so the JSON body was never constrained at
+    /// all (and the unified grammar demanded `{` where Harmony writes
+    /// its channel header). Both bodies must be unreachable, with
+    /// thinking on (deferred) and off (unified), in every framing
+    /// gpt-oss uses; the valid body must stay reachable and complete.
+    #[test]
+    fn harmony_output_config_constrains_the_final_body() {
+        use misanthropic::prompt::thinking::Thinking;
+        let thinking_off = Prompt::default().json_schema(role_consent_schema());
+        let thinking_on = thinking_off.clone().thinking(Thinking::Enabled {
+            budget_tokens: NonZeroU32::new(1024).unwrap(),
+            display: None,
+        });
+        for (label, prompt) in [("on", thinking_on), ("off", thinking_off)] {
+            let compiled = resolve_grammar(
+                &prompt,
+                &crate::CallSyntax::gpt_oss(),
+                &OutputConfigOptions::default(),
+                false,
+            )
+            .expect("resolve")
+            .expect("output_config grammar");
+            for analysis in [false, true] {
+                for constrain in [false, true] {
+                    let at = format!(
+                        "thinking {label}, analysis {analysis}, \
+                         constrain {constrain}"
+                    );
+                    for bad in
+                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
+                    {
+                        let emission =
+                            harmony_emission(analysis, constrain, bad);
+                        assert_eq!(
+                            constraint_admits(&compiled, &emission),
+                            None,
+                            "{at}: invalid body must be rejected: \
+                             {emission}"
+                        );
+                    }
+                    let good = harmony_emission(
+                        analysis,
+                        constrain,
+                        ROLE_CONSENT_VALID,
+                    );
+                    assert_eq!(
+                        constraint_admits(&compiled, &good),
+                        Some(true),
+                        "{at}: valid body must be admitted and complete: \
+                         {good}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`TurnContract::schema_mismatch`] for `prompt`.
+    fn schema_mismatch(
+        prompt: &Prompt,
+        blocks: &[crate::Block],
+    ) -> Option<crate::SchemaMismatch> {
+        TurnContract::of(prompt, None).schema_mismatch(blocks)
+    }
+
+    /// The schema backstop (`schema_mismatch`) on the 2026-10-01 bodies,
+    /// as `run_call` sees them parsed: whatever let them through the
+    /// grammar, they must not come back as an answer.
+    #[test]
+    fn schema_backstop_rejects_the_live_bodies() {
+        use crate::{Block, MismatchKind};
+        let prompt = Prompt::default().json_schema(role_consent_schema());
+        let answer = |text: &str| {
+            vec![
+                Block::Thought {
+                    thought: "Nothing to change.".into(),
+                    signature: "".into(),
+                },
+                Block::text(text.to_owned()),
+            ]
+        };
+        let kind = |blocks: Vec<Block>| {
+            schema_mismatch(&prompt, &blocks).map(|m| m.kind)
+        };
+        assert_eq!(
+            kind(answer(ROLE_CONSENT_STRAY_DOLLAR)),
+            Some(MismatchKind::MissingProperty("memory_note".into()))
+        );
+        assert_eq!(
+            kind(answer(ROLE_CONSENT_EMPTY_KEY)),
+            Some(MismatchKind::NotJson)
+        );
+        assert_eq!(kind(answer(ROLE_CONSENT_VALID)), None);
+        // One JSON document across all text: prose beside it, or no
+        // text at all, is not the answer the schema promised.
+        let mut prose = answer(ROLE_CONSENT_VALID);
+        prose.insert(1, Block::text("Here you go: ".to_owned()));
+        assert_eq!(kind(prose), Some(MismatchKind::NotJson));
+        assert_eq!(kind(Vec::new()), Some(MismatchKind::NotJson));
+        // No structured output requested: nothing to check.
+        let free = Prompt::default();
+        assert!(schema_mismatch(&free, &answer("not json")).is_none());
+    }
+
+    /// Strict tool inputs share the backstop; non-strict ones promise
+    /// nothing (as on Anthropic), and a turn that calls a tool is not
+    /// the structured answer — nor is any turn under a forced
+    /// `tool_choice`, which outranks `output_config`.
+    #[test]
+    fn schema_backstop_covers_strict_tool_inputs() {
+        use crate::{Block, MismatchKind};
+        let tool = |strict| {
+            let mut tool = crate::Tool::builder("consent")
+                .description("Answer the consent question.")
+                .schema(role_consent_schema())
+                .build()
+                .expect("valid test tool");
+            tool.strict = strict;
+            tool
+        };
+        let call = |input: &str| {
+            let input: serde_json::Value = serde_json::from_str(input).unwrap();
+            let call: crate::prompt::ToolUse =
+                serde_json::from_value(serde_json::json!({
+                    "id": "toolu_1",
+                    "name": "consent",
+                    "input": input,
+                }))
+                .unwrap();
+            vec![Block::ToolUse { call }]
+        };
+        let bad = r#"{"reason":"r","choice":"nothing","soul_text":""}"#;
+        let with = |strict| Prompt {
+            tools: Some(vec![tool(strict).into()]),
+            ..Prompt::default().json_schema(role_consent_schema())
+        };
+        assert_eq!(
+            schema_mismatch(&with(Some(true)), &call(bad)).map(|m| m.kind),
+            Some(MismatchKind::MissingProperty("memory_note".into()))
+        );
+        assert!(
+            schema_mismatch(&with(Some(true)), &call(ROLE_CONSENT_VALID))
+                .is_none()
+        );
+        // Non-strict: the call is not checked, and the turn called a
+        // tool, so the output_config text check does not apply either.
+        assert!(schema_mismatch(&with(None), &call(bad)).is_none());
+        // Forced tool_choice outranks output_config: free text is not
+        // held to its schema.
+        let forced = Prompt {
+            tool_choice: Some(ToolChoice::method("consent")),
+            ..with(None)
+        };
+        assert!(schema_mismatch(&forced, &[Block::text("prose".to_owned())])
+            .is_none());
+    }
+
+    /// A deferred grammar that never fired breaks the contract only when
+    /// it is the output_config's — the answer ran free — never the Auto
+    /// tool-call lazy grammar's, where not calling is legal. A cut turn
+    /// breaks nothing (#121), and a call is not the structured answer.
+    #[test]
+    fn unfired_deferred_grammar_breaks_only_an_output_config_turn() {
+        use crate::Block;
+        let deferred = crate::DeferredGrammar {
+            grammar: crate::CompiledGrammar::parse(r#"root ::= "x""#).unwrap(),
+            activate_after: vec![b"</think>".to_vec()],
+            feed_trigger: false,
+        };
+        let unfired = TurnEnd {
+            cut: false,
+            constraint_incomplete: false,
+            deferred_unfired: true,
+        };
+        let answer = [Block::text(ROLE_CONSENT_VALID.to_owned())];
+        let structured = Prompt::default().json_schema(role_consent_schema());
+        let contract = TurnContract::of(&structured, Some(&deferred));
+        assert!(matches!(
+            contract.breach(&answer, unfired),
+            Some(Breach::Unfired)
+        ));
+        // The schema says where, when the free body broke it too.
+        let broken = [Block::text(ROLE_CONSENT_STRAY_DOLLAR.to_owned())];
+        assert!(matches!(
+            contract.breach(&broken, unfired),
+            Some(Breach::Schema(_))
+        ));
+        let cut = TurnEnd {
+            cut: true,
+            ..unfired
+        };
+        assert!(contract.breach(&answer, cut).is_none());
+        let fired = TurnEnd {
+            deferred_unfired: false,
+            ..unfired
+        };
+        assert!(contract.breach(&answer, fired).is_none());
+        // The Auto lazy grammar: no output_config, no promise to fire.
+        let auto = TurnContract::of(&Prompt::default(), Some(&deferred));
+        assert!(auto.breach(&answer, unfired).is_none());
+        // The unified output_config grammar has no trigger to miss.
+        let unified = TurnContract::of(&structured, None);
+        assert!(unified.breach(&answer, unfired).is_none());
+    }
+
+    /// End to end over the scripted mock (ChatML, thinking in
+    /// `<think>…</think>`), thinking on. A render that leaves the thought
+    /// optional constrains from the start, so an answer written without
+    /// a thought stands like one written after a thought — it used to
+    /// wake no deferred grammar and be refused on every draw. A render
+    /// that opened the thought (here a resumed open thought) still
+    /// defers the body to the closer, and an answer that never closes
+    /// it ran free: refused by `complete_response` and reported by the
+    /// drained stream.
+    #[test]
+    fn output_config_answers_with_and_without_a_thought_on_both_paths() {
+        use misanthropic::prompt::message::Role;
+        use misanthropic::prompt::thinking::Thinking;
+        let optional = Prompt::default()
+            .add_message((Role::User, "x?"))
+            .unwrap()
+            .json_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"],
+            }))
+            .thinking(Thinking::Enabled {
+                budget_tokens: NonZeroU32::new(1024).unwrap(),
+                display: None,
+            });
+        let mut opened = optional.clone();
+        opened.messages.push(crate::Message {
+            role: crate::Role::Assistant,
+            content: crate::Content(vec![crate::prompt::open_thought("hm")]),
+        });
+        type Verdict = Option<&'static str>;
+        let name = |e: &SessionError| match e {
+            SessionError::GrammarViolation { .. } => "grammar",
+            SessionError::SchemaViolation { .. } => "schema",
+            other => panic!("unexpected error: {other}"),
+        };
+        let cases: [(&Prompt, &str, Verdict); 5] = [
+            (&optional, r#"{"x":1}"#, None),
+            (&optional, r#"<think>hm</think>{"x":1}"#, None),
+            (&optional, "<think>hm</think>\n\n{\"x\":1}", None),
+            (&opened, r#"</think>{"x":1}"#, None),
+            (&opened, r#"{"x":1}"#, Some("schema")),
+        ];
+        for (prompt, script, want) in cases {
+            let batch = mock::scripted(script).complete_response(prompt);
+            assert_eq!(
+                batch.as_ref().err().map(name),
+                want,
+                "batch, {script:?}: {:?}",
+                batch.as_ref().ok()
+            );
+
+            let mut session = mock::scripted(script);
+            let mut stream = session.complete_stream(prompt).expect("stream");
+            assert!(stream.violation().is_none(), "nothing judged yet");
+            let blocks: Vec<_> = stream.by_ref().collect();
+            assert_eq!(
+                stream.violation().map(name),
+                want,
+                "stream, {script:?}: {blocks:?}"
+            );
+        }
+    }
+
+    /// The output_config grammar for `prompt` on `dialect`, as `Session`
+    /// resolves it (no forced tool, render not pre-opened).
+    fn output_config_grammar(
+        prompt: &Prompt,
+        dialect: &crate::CallSyntax,
+    ) -> crate::CompiledOutputConfig {
+        resolve_grammar(prompt, dialect, &OutputConfigOptions::default(), false)
+            .expect("resolve")
+            .expect("output_config grammar")
+    }
+
+    /// The role-consent prompt with thinking on and off.
+    fn role_consent_prompts() -> [(&'static str, Prompt); 2] {
+        use misanthropic::prompt::thinking::Thinking;
+        let off = Prompt::default().json_schema(role_consent_schema());
+        let on = off.clone().thinking(Thinking::Enabled {
+            budget_tokens: NonZeroU32::new(1024).unwrap(),
+            display: None,
+        });
+        [("on", on), ("off", off)]
+    }
+
+    /// [`harmony_output_config_constrains_the_final_body`]'s sibling hole:
+    /// every reasoning dialect whose thought does not close with
+    /// `</think>` got the same hardcoded `</think>` trigger, so with
+    /// thinking on Gemma 4 (`…\n<channel|>`) and Mistral 4 (`[/THINK]`)
+    /// wrote their json_schema bodies unconstrained. The thought is
+    /// spelled in the dialect's own markers now. The live gpt-oss bodies
+    /// stand in for what an unconstrained body can be: unreachable after
+    /// a thought in the dialect's markers or without one, thinking on
+    /// and off (neither render opens the thought, so both constrain from
+    /// the start — a body without a thought must be steered too, not
+    /// left to a trigger it never writes), while the valid body stays
+    /// reachable and complete.
+    #[test]
+    fn tagged_reasoning_output_config_constrains_the_body() {
+        let mistral = crate::dialect::analyze_template(
+            crate::baked::MISTRAL4.replacement,
+            "<s>",
+            "</s>",
+        )
+        .expect("analyze the baked Mistral 4 template");
+        assert_eq!(
+            (
+                mistral.reasoning.start.as_str(),
+                mistral.reasoning.end.as_str()
+            ),
+            ("[THINK]", "[/THINK]"),
+            "precondition: {mistral:#?}"
+        );
+        let cases = [
+            (
+                "gemma4",
+                crate::CallSyntax::gemma4(),
+                "<|channel>thought\nNothing to change.\n<channel|>",
+            ),
+            ("mistral4", mistral, "[THINK]Nothing to change.[/THINK]"),
+        ];
+        for (name, dialect, thought) in cases {
+            for (label, prompt) in role_consent_prompts() {
+                let compiled = output_config_grammar(&prompt, &dialect);
+                assert!(
+                    matches!(compiled, crate::CompiledOutputConfig::Single(_)),
+                    "{name}, thinking {label}: the thought is optional"
+                );
+                for prefix in ["", thought] {
+                    let at = format!("{name}, thinking {label}, {prefix:?}");
+                    for bad in
+                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
+                    {
+                        let emission = format!("{prefix}{bad}");
+                        assert_eq!(
+                            constraint_admits(&compiled, &emission),
+                            None,
+                            "{at}: invalid body must be rejected: {emission}"
+                        );
+                    }
+                    let good = format!("{prefix}{ROLE_CONSENT_VALID}");
+                    assert_eq!(
+                        constraint_admits(&compiled, &good),
+                        Some(true),
+                        "{at}: valid body must be admitted and complete: \
+                         {good}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `</think>` dialects keep `</think>`: Qwen 3.8 (whose measured
+    /// end is `\n</think>`, trimmed as the parser reads it) defers its
+    /// body to it under the render's pre-opened thought, and cogito,
+    /// whose template measures no reasoning markers at all, gets it as
+    /// the fallback thought of a unified grammar.
+    #[test]
+    fn think_dialects_keep_the_think_close_trigger() {
+        let qwen = crate::dialect::analyze_template(
+            crate::baked::QWEN38.replacement,
+            "",
+            "<|im_end|>",
+        )
+        .expect("analyze Qwen 3.8");
+        let [(_, thinking_on), _] = role_consent_prompts();
+        let crate::CompiledOutputConfig::Deferred(d) = resolve_grammar(
+            &thinking_on,
+            &qwen,
+            &OutputConfigOptions::default(),
+            true,
+        )
+        .expect("resolve")
+        .expect("output_config grammar") else {
+            panic!("qwen3.8: a pre-opened thought defers the body");
+        };
+        assert_eq!(d.activate_after, [b"</think>".to_vec()]);
+
+        let cogito = cogito_dialect();
+        let compiled = output_config_grammar(&thinking_on, &cogito);
+        assert!(matches!(compiled, crate::CompiledOutputConfig::Single(_)));
+        let thought =
+            format!("<think>\nHmm.\n</think>\n\n{ROLE_CONSENT_VALID}");
+        assert_eq!(constraint_admits(&compiled, &thought), Some(true));
+        assert_eq!(
+            constraint_admits(&compiled, ROLE_CONSENT_VALID),
+            Some(true)
+        );
+    }
+
+    /// cogito's dialect, analyzed from its baked template: no reasoning
+    /// markers of its own.
+    fn cogito_dialect() -> crate::CallSyntax {
+        let cogito = crate::dialect::analyze_template(
+            crate::baked::COGITO.replacement,
+            "",
+            "<|im_end|>",
+        )
+        .expect("analyze cogito");
+        assert_eq!(
+            cogito.reasoning.mode,
+            crate::dialect::ReasoningMode::None,
+            "precondition: {cogito:#?}"
+        );
+        cogito
+    }
+
+    /// cogito's output_config grammar offers the `<think>…</think>`
+    /// fallback thought, so the call's parser must read it too: before,
+    /// a thought the grammar admitted stayed in the answer's text and
+    /// failed the schema on every draw (`</think>\n{…}`, recheck
+    /// 2026-10-01). Only that call: without a structured output, or
+    /// under a forced tool, cogito's `<think>` is still text.
+    #[test]
+    fn cogito_parses_the_thought_its_output_config_grammar_admits() {
+        use crate::Block;
+        let cogito = cogito_dialect();
+        let opts = OutputConfigOptions::default();
+        let end = TurnEnd {
+            cut: false,
+            constraint_incomplete: false,
+            deferred_unfired: false,
+        };
+        for (label, prompt) in role_consent_prompts() {
+            let compiled = output_config_grammar(&prompt, &cogito);
+            let syntax = call_parse_syntax(&prompt, &cogito, &opts);
+            for gap in ["", "\n", "\n\n", " "] {
+                let emission =
+                    format!("<think>\nHmm.\n</think>{gap}{ROLE_CONSENT_VALID}");
+                let at = format!("thinking {label}, {gap:?}");
+                assert_eq!(
+                    constraint_admits(&compiled, &emission),
+                    Some(true),
+                    "{at}"
+                );
+                let parsed = crate::dialect::parse_text(
+                    &syntax,
+                    &[],
+                    &emission,
+                    false,
+                    crate::dialect::Leniency::Final,
+                );
+                let blocks = merge_adjacent_prose(parsed.blocks);
+                assert!(
+                    matches!(blocks.first(), Some(Block::Thought { .. })),
+                    "{at}: {blocks:?}"
+                );
+                assert!(
+                    TurnContract::of(&prompt, None)
+                        .breach(&blocks, end)
+                        .is_none(),
+                    "{at}: {blocks:?}"
+                );
+            }
+        }
+        // Nothing structured to answer: the dialect's syntax, unchanged.
+        let plain = Prompt::default();
+        assert_eq!(call_parse_syntax(&plain, &cogito, &opts), cogito);
+        // A forced tool outranks the output_config grammar.
+        let tool = crate::Tool::builder("foo")
+            .description("Test tool.")
+            .schema(serde_json::json!({"type": "object"}))
+            .build()
+            .expect("valid test tool");
+        let forced = Prompt {
+            tools: Some(vec![tool.into()]),
+            tool_choice: Some(crate::ToolChoice::method("foo")),
+            ..role_consent_prompts()[0].1.clone()
+        };
+        assert_eq!(
+            call_parse_syntax(&forced, &cogito, &opts).reasoning,
+            cogito.reasoning
+        );
+        // A dialect with markers of its own reads them, always.
+        let qwen = crate::CallSyntax::qwen_xml();
+        let [(_, on), _] = role_consent_prompts();
+        assert_eq!(call_parse_syntax(&on, &qwen, &opts), qwen);
+    }
+
+    /// How a token-level drive ([`drive_token_ids`]) ended.
+    #[cfg(feature = "llama-cpp")]
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Drive {
+        /// Every constraint reached its accept state.
+        complete: bool,
+        /// End-of-generation is legal after the last token.
+        eos_ok: bool,
+        /// A deferred grammar was installed and never woke.
+        unfired: bool,
+    }
+
+    /// Where a token-level drive stopped short.
+    #[cfg(feature = "llama-cpp")]
+    #[derive(Debug, PartialEq)]
+    enum Refused {
+        /// The sampler masks token `i`: generation is steered elsewhere.
+        Masked(usize),
+        /// Token `i` passed every check, then woke the deferred grammar
+        /// on bytes it refused — the predictor ends the turn there.
+        Fatal(usize),
+    }
+
+    /// Drive `tokens` through `compiled` the way `TokenPredictor::next`
+    /// does — every legality check the sampler applies to a pick (the
+    /// lazy single-token check, the masked `grammar_filter` sweep, the
+    /// deferred-trigger wake check), then `advance`, then the deferred
+    /// trigger scan and activation — with the real tokenizer.
+    #[cfg(feature = "llama-cpp")]
+    fn drive_token_ids(
+        compiled: &crate::CompiledOutputConfig,
+        model: &crate::LlamaCppModel,
+        tokens: &[Token],
+    ) -> Result<Drive, Refused> {
+        use crate::backend::Model as _;
+        use crate::sample::state::MatcherState;
+        let config = match compiled {
+            crate::CompiledOutputConfig::Single(g) => SamplerConfig {
+                modes: vec![g.clone()],
+                ..SamplerConfig::default()
+            },
+            crate::CompiledOutputConfig::Deferred(d) => SamplerConfig {
+                modes: Vec::new(),
+                deferred_grammar: Some(d.clone()),
+                ..SamplerConfig::default()
+            },
+        };
+        let mut state = config.init_state(0, model);
+        let mut text: Vec<u8> = Vec::new();
+        for (i, &token) in tokens.iter().enumerate() {
+            let lazy_ok = state.accepts_chosen(&config, token, model);
+            let single = || {
+                crate::Candidates::from_vec(vec![crate::TokenData {
+                    id: token,
+                    logit: 0.0,
+                    p: 0.0,
+                }])
+            };
+            let kept = |c: crate::Candidates| {
+                c.as_slice().iter().any(|td| td.id == token)
+            };
+            let eager_ok = config.modes.iter().zip(&state.matchers).all(
+                |(mode, matcher)| match (mode, matcher) {
+                    (
+                        SamplingMode::Grammar(g),
+                        MatcherState::Grammar { stack, .. },
+                    ) => kept(crate::sample::grammar::grammar_filter(
+                        single(),
+                        g,
+                        stack,
+                        model,
+                    )),
+                    _ => true,
+                },
+            );
+            let deferred_ok = match (&state.deferred, &config.deferred_grammar)
+            {
+                (Some(d), Some(spec)) if d.active => {
+                    kept(crate::sample::grammar::grammar_filter(
+                        single(),
+                        &spec.grammar,
+                        &d.matcher,
+                        model,
+                    ))
+                }
+                _ => true,
+            };
+            let wake_ok =
+                !state.wakes_deferred_illegally(&config, &text, token, model);
+            if !(lazy_ok && eager_ok && deferred_ok && wake_ok) {
+                return Err(Refused::Masked(i));
+            }
+            state.advance(&config, token, model);
+            let mut piece = Vec::new();
+            model.token_to_piece_ref(token, &mut piece);
+            text.extend_from_slice(&piece);
+            if let (Some(spec), Some(true)) =
+                (config.deferred_grammar.as_ref(), state.deferred_inactive())
+            {
+                if let Some((end, len)) =
+                    crate::predictor::find_any_deferred_trigger_end(
+                        &text,
+                        &spec.activate_after,
+                        text.len(),
+                    )
+                {
+                    let from = if spec.feed_trigger { end - len } else { end };
+                    if state.activate_deferred(spec, &text[from..]).is_err() {
+                        return Err(Refused::Fatal(i));
+                    }
+                }
+            }
+        }
+        Ok(Drive {
+            complete: state.grammar_complete(),
+            eos_ok: state.accepts_chosen(&config, model.eos(), model),
+            unfired: state.deferred_inactive() == Some(true),
+        })
+    }
+
+    /// [`drive_token_ids`] over `emission` as the model's tokenizer
+    /// spells it, specials included.
+    #[cfg(feature = "llama-cpp")]
+    fn drive_tokens(
+        compiled: &crate::CompiledOutputConfig,
+        model: &crate::LlamaCppModel,
+        emission: &str,
+    ) -> Result<Drive, Refused> {
+        use crate::backend::Model as _;
+        let tokens = model.tokenize_special(emission, false, true);
+        drive_token_ids(compiled, model, &tokens)
+    }
+
+    /// [`harmony_output_config_constrains_the_final_body`] at the
+    /// token level, through gpt-oss's own tokenizer (a `vocab_only`
+    /// load: CPU, no tensors). The byte-level test cannot see a token
+    /// that spans the failure point — `""`, `", "`, `"$` and friends —
+    /// or a check that judges a multi-byte token without walking it;
+    /// this drives the sampler's actual legality checks over the
+    /// token stream gpt-oss would emit. Skips loudly without the GGUF.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the gpt-oss GGUF (vocab-only load, CPU)"]
+    fn harmony_output_config_rejects_the_live_bodies_by_token() {
+        use misanthropic::prompt::thinking::Thinking;
+        let path = std::env::var_os("DRAMA_LLAMA_GPTOSS_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("models/gpt-oss-120b-MXFP4.gguf")
+            });
+        if !path.exists() {
+            eprintln!("SKIP: no gpt-oss GGUF at {}", path.display());
+            return;
+        }
+        let mut params = crate::LlamaCppOptions::default().model_params();
+        params.vocab_only = true;
+        params.n_gpu_layers = 0;
+        let model = crate::LlamaCppModel::from_file(path, Some(params))
+            .expect("vocab-only load");
+
+        let thinking_off = Prompt::default().json_schema(role_consent_schema());
+        let thinking_on = thinking_off.clone().thinking(Thinking::Enabled {
+            budget_tokens: NonZeroU32::new(1024).unwrap(),
+            display: None,
+        });
+        for (label, prompt) in [("on", thinking_on), ("off", thinking_off)] {
+            let compiled = resolve_grammar(
+                &prompt,
+                &crate::CallSyntax::gpt_oss(),
+                &OutputConfigOptions::default(),
+                false,
+            )
+            .expect("resolve")
+            .expect("output_config grammar");
+            for analysis in [false, true] {
+                for constrain in [false, true] {
+                    let at = format!(
+                        "thinking {label}, analysis {analysis}, \
+                         constrain {constrain}"
+                    );
+                    for bad in
+                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
+                    {
+                        let emission =
+                            harmony_emission(analysis, constrain, bad);
+                        let got = drive_tokens(&compiled, &model, &emission);
+                        // Refused inside the body, past `"soul_text":""`.
+                        let tokens =
+                            model.tokenize_special(&emission, false, true);
+                        let Err(Refused::Masked(refused_at)) = got else {
+                            panic!("{at}: invalid body not masked: {got:?}")
+                        };
+                        let prefix: String = tokens[..refused_at]
+                            .iter()
+                            .map(|&t| model.token_to_piece(t))
+                            .collect();
+                        assert!(
+                            prefix.contains(r#""soul_text":"""#),
+                            "{at}: refused too early, after {prefix:?}"
+                        );
+                    }
+                    let good = harmony_emission(
+                        analysis,
+                        constrain,
+                        ROLE_CONSENT_VALID,
+                    );
+                    assert_eq!(
+                        drive_tokens(&compiled, &model, &good),
+                        Ok(Drive {
+                            complete: true,
+                            eos_ok: true,
+                            unfired: false,
+                        }),
+                        "{at}: valid body must be admitted and complete"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One fleet model under [`fleet_output_config_by_token`]: where its
+    /// GGUF is, what its answers look like, and the tokens that close
+    /// its thought and carry bytes past the closer.
+    #[cfg(feature = "llama-cpp")]
+    struct FleetSpec {
+        /// The env var naming the GGUF, else `models/{file}`.
+        env: &'static str,
+        file: &'static str,
+        /// What precedes the body, thinking on and off: a thought,
+        /// written as the model writes it after the render, or `""`.
+        on: &'static [&'static str],
+        off: &'static [&'static str],
+        /// The closer up to its last byte, spelled as text — where a
+        /// trigger-crossing token takes over.
+        close_prefix: &'static str,
+        /// Thinking-on emissions (`{J}` the body) whose closer finishes
+        /// in one text token carrying more bytes — that token's piece —
+        /// and whether the gap it carries is one the grammar admits.
+        crossings: &'static [(&'static str, &'static str, bool)],
+    }
+
+    /// The vocab-only model, its effective template and its dialect, as
+    /// a server loads them: a `.template.jinja` sidecar beside the GGUF,
+    /// else the baked replacement, else the embedded template.
+    #[cfg(feature = "llama-cpp")]
+    fn load_fleet_model(
+        spec: &FleetSpec,
+    ) -> Option<(crate::LlamaCppModel, ChatTemplate, crate::CallSyntax)> {
+        use crate::backend::Model as _;
+        let path = std::env::var_os(spec.env)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("models")
+                    .join(spec.file)
+            });
+        if !path.exists() {
+            eprintln!("SKIP: no GGUF at {} (set {})", path.display(), spec.env);
+            return None;
+        }
+        let mut params = crate::LlamaCppOptions::default().model_params();
+        params.vocab_only = true;
+        params.n_gpu_layers = 0;
+        let model = crate::LlamaCppModel::from_file(path.clone(), Some(params))
+            .expect("vocab-only load");
+        let embedded = model.chat_template_source().expect("template");
+        let source = crate::sidecar::load_template_source(
+            &path.with_extension("template.jinja"),
+        )
+        .expect("read sidecar")
+        .or_else(|| {
+            crate::baked::detect(&embedded).map(|b| b.replacement.to_string())
+        })
+        .unwrap_or(embedded);
+        let dialect = analyze_dialect_source(&model, &source);
+        let template = ChatTemplate::from_source(
+            source,
+            model.token_to_piece(model.bos()),
+            model.token_to_piece(model.eos()),
+        )
+        .expect("compile template");
+        Some((model, template, dialect))
+    }
+
+    /// The one token whose piece is exactly `piece`.
+    #[cfg(feature = "llama-cpp")]
+    fn token_for_piece(model: &crate::LlamaCppModel, piece: &str) -> Token {
+        (0..model.n_vocab())
+            .find(|&t| model.token_to_piece(t) == piece)
+            .unwrap_or_else(|| panic!("no token spells {piece:?}"))
+    }
+
+    /// The output_config contract of one fleet model, token by token
+    /// through its real tokenizer (a `vocab_only` load: CPU, no
+    /// tensors), thinking on and off, with the grammar and the parser
+    /// derived as `Session` derives them for the rendered prompt:
+    ///
+    /// - the live gpt-oss bodies are masked inside the body, after any
+    ///   thought and without one;
+    /// - the valid body is admitted, complete and EOS-legal after each
+    ///   thought with each natural gap (`""`, `" "`, `"\n"`, `"\n\n"`),
+    ///   and without a thought wherever the render leaves it optional —
+    ///   and parses to an answer that keeps the contract;
+    /// - a token that finishes the closer and carries the gap is
+    ///   admitted when the gap is legal and masked when it is not —
+    ///   steered either way, never a turn ended mid-structure.
+    #[cfg(feature = "llama-cpp")]
+    fn fleet_output_config_by_token(spec: &FleetSpec) {
+        use crate::backend::Model as _;
+        let Some((model, template, dialect)) = load_fleet_model(spec) else {
+            return;
+        };
+        let render_opts = RenderOptions::default()
+            .with_generation_prompt(true)
+            .with_extra("preserve_thinking", true)
+            .with_thought_reingest(dialect.reasoning.reingest)
+            .with_reasoning_start(dialect.reasoning.start.clone())
+            .with_efforts(dialect.reasoning.efforts.clone());
+        let complete = Drive {
+            complete: true,
+            eos_ok: true,
+            unfired: false,
+        };
+        for (label, prompt) in role_consent_prompts() {
+            let prompt = prompt
+                .add_message((
+                    misanthropic::prompt::message::Role::User,
+                    "Do you consent?",
+                ))
+                .unwrap();
+            // As `Session::prepare_call_cached` derives them.
+            let rendered =
+                template.render_with(&prompt, &render_opts).expect("render");
+            let pre_opened =
+                render_ends_with_open_reasoning(&rendered, &dialect)
+                    || prompt_resumes_open_reasoning(&prompt, &dialect);
+            let closed = render_ends_with_closed_reasoning(&rendered, &dialect);
+            let opts = OutputConfigOptions {
+                phase_split: !closed,
+                ..OutputConfigOptions::default()
+            };
+            let compiled =
+                resolve_grammar(&prompt, &dialect, &opts, pre_opened)
+                    .expect("resolve")
+                    .expect("output_config grammar");
+            let deferred = match &compiled {
+                crate::CompiledOutputConfig::Deferred(d) => Some(d),
+                crate::CompiledOutputConfig::Single(_) => None,
+            };
+            let syntax = call_parse_syntax(&prompt, &dialect, &opts);
+            let keeps_contract = |emission: &str, drive: &Drive| {
+                let parsed = crate::dialect::parse_text(
+                    &syntax,
+                    &[],
+                    emission,
+                    pre_opened,
+                    crate::dialect::Leniency::Final,
+                );
+                let blocks = merge_adjacent_prose(parsed.blocks);
+                let end = TurnEnd {
+                    cut: false,
+                    constraint_incomplete: !drive.complete,
+                    deferred_unfired: drive.unfired,
+                };
+                let breach =
+                    TurnContract::of(&prompt, deferred).breach(&blocks, end);
+                assert!(breach.is_none(), "{emission:?}: {blocks:?}");
+            };
+            let prefixes = match label {
+                "on" => spec.on,
+                _ => spec.off,
+            };
+            for prefix in prefixes {
+                let gaps: &[&str] = match *prefix {
+                    "" => &[""],
+                    _ => &["", " ", "\n", "\n\n"],
+                };
+                for gap in gaps {
+                    let at = format!("thinking {label}, {prefix:?}{gap:?}");
+                    for bad in
+                        [ROLE_CONSENT_STRAY_DOLLAR, ROLE_CONSENT_EMPTY_KEY]
+                    {
+                        let emission = format!("{prefix}{gap}{bad}");
+                        let tokens =
+                            model.tokenize_special(&emission, false, true);
+                        let got = drive_token_ids(&compiled, &model, &tokens);
+                        let Err(Refused::Masked(i)) = got else {
+                            panic!("{at}: invalid body not masked: {got:?}")
+                        };
+                        let before: String = tokens[..i]
+                            .iter()
+                            .map(|&t| model.token_to_piece(t))
+                            .collect();
+                        assert!(
+                            before.contains(r#""soul_text":"""#),
+                            "{at}: masked too early, after {before:?}"
+                        );
+                    }
+                    let good = format!("{prefix}{gap}{ROLE_CONSENT_VALID}");
+                    let drive = drive_tokens(&compiled, &model, &good);
+                    assert_eq!(drive, Ok(complete), "{at}: {good:?}");
+                    keeps_contract(&good, &drive.unwrap());
+                }
+            }
+            if label != "on" {
+                continue;
+            }
+            for &(emission, piece, legal) in spec.crossings {
+                let emission = emission.replace("{J}", ROLE_CONSENT_VALID);
+                let at = format!("thinking on, crossing {piece:?}");
+                let split = emission.find(spec.close_prefix).expect("closer")
+                    + spec.close_prefix.len();
+                let (before, after) = emission.split_at(split);
+                let after = after.strip_prefix(piece).expect("piece");
+                let mut tokens = model.tokenize_special(before, false, true);
+                let crossing = tokens.len();
+                tokens.push(token_for_piece(&model, piece));
+                tokens.extend(model.tokenize_special(after, false, true));
+                let got = drive_token_ids(&compiled, &model, &tokens);
+                if legal {
+                    assert_eq!(got, Ok(complete), "{at}: {emission:?}");
+                    keeps_contract(&emission, &got.unwrap());
+                } else {
+                    assert_eq!(
+                        got,
+                        Err(Refused::Masked(crossing)),
+                        "{at}: {emission:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Qwen 3.8: thinking on pre-opens the thought, so the body defers
+    /// to `</think>` — the one fleet model whose crossing tokens meet
+    /// the sampler's wake check rather than an eager grammar. An answer
+    /// without a thought is not well-behaved here: it is still inside
+    /// the render's open thought.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the Qwen 3.8 GGUF (vocab-only load, CPU)"]
+    fn qwen38_output_config_by_token() {
+        fleet_output_config_by_token(&FleetSpec {
+            env: "DRAMA_LLAMA_QWEN38_MODEL",
+            file: "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+            on: &["Let me think.\n</think>"],
+            off: &[""],
+            close_prefix: "</think",
+            crossings: &[
+                ("Let me think.\n</think>{J}", ">{", true),
+                ("Let me think.\n</think>.{J}", ">.", false),
+            ],
+        });
+    }
+
+    /// Gemma 4: `<|channel>thought…<channel|>`, never pre-opened.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the Gemma 4 GGUF (vocab-only load, CPU)"]
+    fn gemma4_output_config_by_token() {
+        fleet_output_config_by_token(&FleetSpec {
+            env: "DRAMA_LLAMA_GEMMA4_MODEL",
+            file: "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+            on: &[
+                "",
+                "<|channel>thought\nHmm.\n<channel|>",
+                "<|channel>thought\nHmm.<channel|>",
+                "<|channel>thought\n<channel|>",
+            ],
+            off: &["", "<|channel>thought\n<channel|>"],
+            close_prefix: "<channel|",
+            crossings: &[
+                ("<|channel>thought\nHmm.\n<channel|>{J}", ">{", true),
+                ("<|channel>thought\nHmm.\n<channel|> </{J}", "> </", false),
+            ],
+        });
+    }
+
+    /// Mistral 4: `[THINK]…[/THINK]`, never pre-opened, its measured
+    /// gap empty — yet it writes `[/THINK]\n{` and `[/THINK] {`, and its
+    /// text-spelled closer ends in tokens like `]\n\n`.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the Mistral Small 4 GGUF (vocab-only load, CPU)"]
+    fn mistral4_output_config_by_token() {
+        fleet_output_config_by_token(&FleetSpec {
+            env: "DRAMA_LLAMA_MISTRAL_MODEL",
+            file: "Mistral-Small-4-119B-2603-UD-Q4_K_XL.gguf",
+            on: &["", "[THINK]Hmm.[/THINK]"],
+            off: &["", "[THINK]Hmm.[/THINK]"],
+            close_prefix: "[/THINK",
+            crossings: &[
+                ("[THINK]Hmm.[/THINK]\n{J}", "]\n", true),
+                ("[THINK]Hmm.[/THINK]\n\n{J}", "]\n\n", true),
+                ("[THINK]Hmm.[/THINK]{J}", "]{", true),
+                ("[THINK]Hmm.[/THINK]\n\n\n{J}", "]\n\n\n", false),
+            ],
+        });
+    }
+
+    /// cogito: no reasoning markers measured, so the grammar offers
+    /// `<think>…</think>` — spelled in text tokens, `</`, `think`, then a
+    /// `>`-led token that usually carries the gap.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the cogito GGUF (vocab-only load, CPU)"]
+    fn cogito_output_config_by_token() {
+        fleet_output_config_by_token(&FleetSpec {
+            env: "DRAMA_LLAMA_COGITO_MODEL",
+            file: "cogito-32b.gguf",
+            on: &["", "<think>\nHmm.\n</think>"],
+            off: &["", "<think>\nHmm.\n</think>"],
+            close_prefix: "</think",
+            crossings: &[
+                ("<think>\nHmm.\n</think>\n\n{J}", ">\n\n", true),
+                ("<think>\nHmm.\n</think>\n{J}", ">\n", true),
+                ("<think>\nHmm.\n</think>{J}", ">{", true),
+                ("<think>\nHmm.\n</think>\n\n\n{J}", ">\n\n\n", false),
+            ],
+        });
     }
 
     /// Method + pre-opened reasoning → eager grammar anchored on the
@@ -11881,6 +13339,26 @@ mod tests {
             pub(super) missing: Vec<i32>,
             /// Every `(seq, pos)` restore asked for, in order.
             pub(super) restores: Vec<(i32, i32)>,
+            /// The generation to script, byte by byte, then EOS: each
+            /// prefill restarts it and each step advances it. Empty:
+            /// flat logits.
+            pub(super) script: Vec<Token>,
+            cursor: usize,
+        }
+
+        impl MockDecoder {
+            /// Logits for the scripted token at the cursor, or flat ones
+            /// when nothing is scripted.
+            fn scripted(&mut self) -> &[f32] {
+                self.logits.clear();
+                self.logits.resize(N_VOCAB, 0.0);
+                if !self.script.is_empty() {
+                    let next =
+                        self.script.get(self.cursor).copied().unwrap_or(EOS);
+                    self.logits[next as usize] = 30.0;
+                }
+                &self.logits
+            }
         }
 
         #[derive(Debug, thiserror::Error)]
@@ -11896,8 +13374,8 @@ mod tests {
                 _: usize,
                 _: i32,
             ) -> Result<&[f32], MockError> {
-                self.logits.resize(N_VOCAB, 0.0);
-                Ok(&self.logits)
+                self.cursor = 0;
+                Ok(self.scripted())
             }
             fn step(
                 &mut self,
@@ -11905,8 +13383,8 @@ mod tests {
                 _: usize,
                 _: i32,
             ) -> Result<&[f32], MockError> {
-                self.logits.resize(N_VOCAB, 0.0);
-                Ok(&self.logits)
+                self.cursor += 1;
+                Ok(self.scripted())
             }
             fn n_ctx(&self) -> u32 {
                 4096
@@ -12002,6 +13480,26 @@ mod tests {
             fn eog_tokens(&self) -> Vec<Token> {
                 vec![EOS]
             }
+        }
+
+        /// A cache-enabled session over the mock that generates
+        /// `script`'s bytes, then EOS, in a dialect that thinks in
+        /// `<think>…</think>` (as cogito does on ChatML).
+        pub(super) fn scripted(script: &str) -> super::Session<MockBackend> {
+            use crate::dialect::{ReasoningMode, ReasoningSyntax};
+            let mut session = session(&[]);
+            session.engine.decoder.script =
+                script.bytes().map(Token::from).collect();
+            session.dialect.reasoning = ReasoningSyntax {
+                mode: ReasoningMode::TagBased,
+                start: "<think>".into(),
+                end: "</think>".into(),
+                ..ReasoningSyntax::default()
+            };
+            // So a resumed open thought renders after its opener.
+            session.render_opts = std::mem::take(&mut session.render_opts)
+                .with_reasoning_start("<think>");
+            session
         }
 
         /// A cache-enabled session over the mock, its restores

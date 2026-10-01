@@ -83,8 +83,11 @@ pub mod output_config;
 pub use output_config::{
     compile_output_config, compile_prompt_output_config,
     grammar_for_output_config, CompiledOutputConfig, OutputConfigError,
-    OutputConfigOptions,
+    OutputConfigOptions, ResponseFraming,
 };
+
+mod schema_check;
+pub use schema_check::{MismatchKind, SchemaMismatch};
 
 pub mod dialect;
 pub use dialect::CallSyntax;

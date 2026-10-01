@@ -1,0 +1,580 @@
+//! The backstop behind constrained decoding: does a finished value
+//! actually satisfy the schema its grammar was compiled from?
+//!
+//! A grammar is only as good as its activation, its compilation and its
+//! sampler; when any of them has a hole, the output is wrong *and looks
+//! constrained*. The 2026-10-01 Agora consent answer was exactly that:
+//! the Harmony output_config grammar never activated, and gpt-oss
+//! returned `"soul_text":"", ""}` with a 200. [`Session`] runs this check
+//! on every constrained completion so such output becomes a typed error
+//! (resampled by blallama) instead of an answer.
+//!
+//! Checked: the keywords [`schema_to_gbnf`] enforces — `type`,
+//! `properties`, `required`, `additionalProperties`, `enum`, `const`,
+//! `anyOf`, `items`, `$ref` into `$defs` — plus `minItems` only as far
+//! as the grammar enforces it (non-empty). Never stricter than the
+//! schema, and deliberately blind to the validator-only keywords the
+//! grammar does not enforce (`pattern`, `minLength`, `maximum`, …; see
+//! `.claude/memory/schema_constraint_keywords_decision.md`): rejecting a
+//! value the grammar was *designed* to admit would turn every such
+//! request into a resample loop and a 500.
+//!
+//! [`Session`]: crate::Session
+//! [`schema_to_gbnf`]: crate::schema_to_gbnf
+
+use serde_json::{Map, Value};
+
+/// Where a value departs from its schema, and how. The path is a JSON
+/// pointer built from schema-declared property names and array indices
+/// only, and the kind never quotes the value, so `Display` carries no
+/// model output (the redaction discipline of `SessionError`).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("at {}: {kind}", match path.as_str() {
+    "" => "the root".to_string(),
+    path => format!("`{path}`"),
+})]
+pub struct SchemaMismatch {
+    /// JSON pointer to the offending value (`""` is the root).
+    pub path: String,
+    /// What is wrong there.
+    pub kind: MismatchKind,
+}
+
+/// The ways a value can fail the schema check. See [`SchemaMismatch`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum MismatchKind {
+    /// The text is not one JSON document.
+    #[error("not a single JSON document")]
+    NotJson,
+    /// The value's JSON type is not one the schema allows.
+    #[error("expected {0}")]
+    Type(String),
+    /// Not one of the `enum` values.
+    #[error("not one of the enum values")]
+    Enum,
+    /// Not the `const` value.
+    #[error("not the const value")]
+    Const,
+    /// Matches no `anyOf` variant.
+    #[error("matches no anyOf variant")]
+    AnyOf,
+    /// A `required` property is absent.
+    #[error("missing required property `{0}`")]
+    MissingProperty(String),
+    /// A property the schema closes out with `additionalProperties:
+    /// false`. Unnamed: the name is model output.
+    #[error("property not allowed by additionalProperties: false")]
+    UnexpectedProperty,
+    /// An empty array where `minItems` asks for at least one.
+    #[error("array must not be empty")]
+    Empty,
+}
+
+/// Parse `text` as one JSON document and [`check`] it against `schema`.
+pub(crate) fn check_text(
+    schema: &Value,
+    text: &str,
+) -> Result<(), SchemaMismatch> {
+    let value = parse_document(text).ok_or(SchemaMismatch {
+        path: String::new(),
+        kind: MismatchKind::NotJson,
+    })?;
+    check(schema, &value)
+}
+
+/// `text` as one JSON document, read no stricter than the grammar writes
+/// it. serde_json refuses a number whose magnitude overflows `f64`
+/// ("number out of range"), and [`JSON_GRAMMAR`]'s `number` admits one:
+/// its integer part is unbounded (only the exponent, at two digits, and
+/// `integer`, at eighteen, are capped), so a long enough run of digits is
+/// grammar-legal and would be a `NotJson` on every draw. Such a number
+/// reads as `0` — the checker judges only its type, and a number it
+/// stays. The grammar's other refusals match serde_json's (a lone
+/// surrogate escape is unwritable: `\uD800` must pair with a low
+/// surrogate), so nothing else needs reading around.
+///
+/// [`JSON_GRAMMAR`]: crate::grammar_compile::JSON_GRAMMAR
+fn parse_document(text: &str) -> Option<Value> {
+    serde_json::from_str(text).ok().or_else(|| {
+        // Syntax first: serde's skip-parse checks structure, not ranges.
+        serde_json::from_str::<serde::de::IgnoredAny>(text).ok()?;
+        serde_json::from_str(&finite_numbers(text)).ok()
+    })
+}
+
+/// `text` with every number outside a string that overflows `f64`
+/// replaced by `0`. Assumes `text` is syntactically JSON.
+fn finite_numbers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) =
+        rest.find(|c: char| c == '"' || c == '-' || c.is_ascii_digit())
+    {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let len = match rest.as_bytes()[0] {
+            b'"' => string_len(rest),
+            _ => rest
+                .find(|c: char| {
+                    !(c.is_ascii_digit()
+                        || matches!(c, '-' | '+' | '.' | 'e' | 'E'))
+                })
+                .unwrap_or(rest.len()),
+        };
+        let (token, tail) = rest.split_at(len);
+        let overflows = !token.starts_with('"')
+            && token.parse::<f64>().is_ok_and(|n| n.is_infinite());
+        out.push_str(if overflows { "0" } else { token });
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The length of the JSON string `text` opens with, quotes included.
+fn string_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Check `value` against `schema` — the subset of JSON Schema described
+/// in the module docs. `$defs` resolve from the root `schema`.
+pub(crate) fn check(
+    schema: &Value,
+    value: &Value,
+) -> Result<(), SchemaMismatch> {
+    let defs = schema.get("$defs").and_then(Value::as_object);
+    Checker { defs }.at(schema, value, &mut String::new())
+}
+
+struct Checker<'s> {
+    defs: Option<&'s Map<String, Value>>,
+}
+
+impl Checker<'_> {
+    fn at(
+        &self,
+        schema: &Value,
+        value: &Value,
+        path: &mut String,
+    ) -> Result<(), SchemaMismatch> {
+        let fail = |path: &str, kind| {
+            Err(SchemaMismatch {
+                path: path.to_string(),
+                kind,
+            })
+        };
+
+        // Same `$ref` shape the grammar compiler resolves; anything else
+        // falls through to the schema's other keywords, as it does there.
+        if let Some(target) = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix("#/$defs/"))
+            .and_then(|name| self.defs.and_then(|d| d.get(name)))
+        {
+            return self.at(target, value, path);
+        }
+
+        if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
+            if !variants.is_empty()
+                && !variants
+                    .iter()
+                    .any(|v| self.at(v, value, &mut path.clone()).is_ok())
+            {
+                return fail(path, MismatchKind::AnyOf);
+            }
+            return Ok(());
+        }
+
+        if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
+            return match variants.contains(value) {
+                true => Ok(()),
+                false => fail(path, MismatchKind::Enum),
+            };
+        }
+
+        if let Some(expected) = schema.get("const") {
+            return match expected == value {
+                true => Ok(()),
+                false => fail(path, MismatchKind::Const),
+            };
+        }
+
+        let types: Vec<&str> = match schema.get("type") {
+            Some(Value::String(t)) => vec![t.as_str()],
+            Some(Value::Array(ts)) => {
+                ts.iter().filter_map(Value::as_str).collect()
+            }
+            // No type: the grammar compiles to any JSON value.
+            _ => return Ok(()),
+        };
+        if types.is_empty() {
+            return Ok(());
+        }
+        if !types.iter().any(|t| type_matches(t, value)) {
+            return fail(path, MismatchKind::Type(types.join(" or ")));
+        }
+
+        match value {
+            Value::Object(object) if types.contains(&"object") => {
+                self.object(schema, object, path)
+            }
+            Value::Array(items) if types.contains(&"array") => {
+                self.array(schema, items, path)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn object(
+        &self,
+        schema: &Value,
+        object: &Map<String, Value>,
+        path: &mut String,
+    ) -> Result<(), SchemaMismatch> {
+        let props = schema.get("properties").and_then(Value::as_object);
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+
+        if let Some(missing) =
+            required.iter().find(|name| !object.contains_key(**name))
+        {
+            return Err(SchemaMismatch {
+                path: path.clone(),
+                kind: MismatchKind::MissingProperty(missing.to_string()),
+            });
+        }
+
+        let additional = schema.get("additionalProperties");
+        for (key, child) in object {
+            let declared = props.and_then(|p| p.get(key));
+            let len = path.len();
+            let result = match (declared, additional) {
+                (Some(sub), _) => {
+                    push_pointer(path, key);
+                    self.at(sub, child, path)
+                }
+                // A required name with no `properties` entry: the
+                // grammar gives it a permissive slot.
+                (None, _) if required.contains(&key.as_str()) => Ok(()),
+                (None, Some(Value::Bool(false))) => Err(SchemaMismatch {
+                    path: path.clone(),
+                    kind: MismatchKind::UnexpectedProperty,
+                }),
+                (None, Some(sub @ Value::Object(_))) => {
+                    // Not a schema name: point at the object, not the key.
+                    self.at(sub, child, &mut path.clone())
+                }
+                (None, _) => Ok(()),
+            };
+            path.truncate(len);
+            result?;
+        }
+        Ok(())
+    }
+
+    fn array(
+        &self,
+        schema: &Value,
+        items: &[Value],
+        path: &mut String,
+    ) -> Result<(), SchemaMismatch> {
+        // Only as much of `minItems` as the grammar enforces (non-empty);
+        // larger counts are described, not enforced (see module docs).
+        let non_empty =
+            schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) >= 1;
+        if non_empty && items.is_empty() {
+            return Err(SchemaMismatch {
+                path: path.clone(),
+                kind: MismatchKind::Empty,
+            });
+        }
+        let Some(item_schema) = schema.get("items") else {
+            return Ok(());
+        };
+        items.iter().enumerate().try_for_each(|(i, item)| {
+            let len = path.len();
+            path.push('/');
+            path.push_str(&i.to_string());
+            let result = self.at(item_schema, item, path);
+            path.truncate(len);
+            result
+        })
+    }
+}
+
+fn type_matches(t: &str, value: &Value) -> bool {
+    match t {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        "number" => value.is_number(),
+        // JSON Schema's integer is the mathematical one: `1.0` counts.
+        "integer" => {
+            value.is_i64()
+                || value.is_u64()
+                || value.as_f64().is_some_and(|f| f.fract() == 0.0)
+        }
+        // A type name this checker does not know constrains nothing it
+        // can judge; the grammar compiles it to any value too.
+        _ => true,
+    }
+}
+
+/// Append `key` to a JSON pointer, escaped per RFC 6901.
+fn push_pointer(path: &mut String, key: &str) {
+    path.push('/');
+    path.push_str(&key.replace('~', "~0").replace('/', "~1"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn role_consent() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string"},
+                "choice": {"type": "string", "enum": ["accept", "nothing"]},
+                "soul_text": {"type": "string"},
+                "memory_note": {"type": "string"},
+            },
+            "required": ["reason", "choice", "soul_text", "memory_note"],
+            "additionalProperties": false,
+        })
+    }
+
+    /// The two bodies gpt-oss returned with a 200 on 2026-10-01.
+    #[test]
+    fn live_role_consent_bodies_fail() {
+        let schema = role_consent();
+        let stray = r#"{"reason":"r","choice":"nothing", "soul_text":"", "$memory_note":""}"#;
+        assert_eq!(
+            check_text(&schema, stray),
+            Err(SchemaMismatch {
+                path: String::new(),
+                kind: MismatchKind::MissingProperty("memory_note".into()),
+            })
+        );
+        let empty_key =
+            r#"{"reason":"r","choice":"nothing", "soul_text":"", ""}"#;
+        assert_eq!(
+            check_text(&schema, empty_key).unwrap_err().kind,
+            MismatchKind::NotJson
+        );
+        let valid = r#"{"reason":"r","choice":"nothing", "soul_text":"", "memory_note":""}"#;
+        assert_eq!(check_text(&schema, valid), Ok(()));
+        // Leading/trailing whitespace is JSON's own business.
+        assert_eq!(check_text(&schema, &format!("\n{valid}\n")), Ok(()));
+        // Two documents are not one.
+        assert_eq!(
+            check_text(&schema, &format!("{valid}{valid}"))
+                .unwrap_err()
+                .kind,
+            MismatchKind::NotJson
+        );
+    }
+
+    /// What the grammar can write, the checker must read: an integer part
+    /// too long for `f64` is legal in [`crate::grammar_compile::JSON_GRAMMAR`]'s
+    /// `number` (serde_json: "number out of range"), and was a `NotJson`
+    /// on every draw — a deterministic 500. Still judged by type; real
+    /// syntax errors and the out-of-grammar forms stay refused.
+    #[test]
+    fn grammar_legal_overflowing_numbers_are_json() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "n": {"type": "number"},
+                "s": {"type": "string"},
+            },
+            "required": ["n", "s"],
+        });
+        let big = format!("1{}", "0".repeat(400));
+        for n in [big.clone(), format!("-{big}.5"), format!("{big}e99")] {
+            let text = format!(r#"{{"n": {n}, "s": "1{big} \"x\""}}"#);
+            assert_eq!(check_text(&schema, &text), Ok(()), "{n:.12}");
+        }
+        // Inside a string it is text, untouched.
+        let as_string = json!({"type": "string"});
+        assert_eq!(check_text(&as_string, &format!(r#""{big}""#)), Ok(()));
+        // Still a number, so still not a string.
+        let wrong = format!(r#"{{"n": 1, "s": {big}}}"#);
+        assert_eq!(
+            check_text(&schema, &wrong).unwrap_err(),
+            SchemaMismatch {
+                path: "/s".into(),
+                kind: MismatchKind::Type("string".into()),
+            }
+        );
+        // Broken syntax is still not JSON.
+        assert_eq!(
+            check_text(&schema, &format!(r#"{{"n": {big},}}"#))
+                .unwrap_err()
+                .kind,
+            MismatchKind::NotJson
+        );
+        // A lone surrogate is not grammar-legal, and stays refused.
+        assert_eq!(
+            check_text(&as_string, r#""\ud800""#).unwrap_err().kind,
+            MismatchKind::NotJson
+        );
+    }
+
+    /// The grammar refuses what serde_json does, for the forms that
+    /// matter: a lone surrogate escape and a three-digit exponent are
+    /// unwritable, while a surrogate pair is fine.
+    #[test]
+    fn the_grammar_cannot_write_a_lone_surrogate_or_1e999() {
+        let source =
+            format!("root ::= value\n{}", crate::grammar_compile::JSON_GRAMMAR);
+        let admits = |text: &str| {
+            let mut state = crate::GrammarState::from_source(&source)
+                .expect("grammar parses");
+            state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+        };
+        assert!(admits(r#""\ud83c\udf53""#));
+        assert!(!admits(r#""\ud800""#));
+        assert!(!admits(r#""\udc00""#));
+        assert!(!admits("1e999"));
+        assert!(admits("1e99"));
+    }
+
+    #[test]
+    fn closed_object_rejects_extras_open_one_admits_them() {
+        let closed = role_consent();
+        let extra = json!({
+            "reason": "r", "choice": "accept", "soul_text": "",
+            "memory_note": "", "mood": "fine",
+        });
+        assert_eq!(
+            check(&closed, &extra).unwrap_err().kind,
+            MismatchKind::UnexpectedProperty
+        );
+        let mut open = role_consent();
+        open.as_object_mut().unwrap().remove("additionalProperties");
+        assert_eq!(check(&open, &extra), Ok(()));
+        // A schema-valued additionalProperties checks the extras.
+        open["additionalProperties"] = json!({"type": "integer"});
+        assert!(check(&open, &extra).is_err());
+    }
+
+    #[test]
+    fn nested_paths_name_schema_keys_and_indices() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"$ref": "#/$defs/Item"},
+                },
+            },
+            "required": ["items"],
+            "$defs": {
+                "Item": {
+                    "type": "object",
+                    "properties": {"n": {"type": "integer"}},
+                    "required": ["n"],
+                },
+            },
+        });
+        assert_eq!(check(&schema, &json!({"items": [{"n": 1}]})), Ok(()));
+        assert_eq!(
+            check(&schema, &json!({"items": [{"n": 1}, {"n": "2"}]})),
+            Err(SchemaMismatch {
+                path: "/items/1/n".into(),
+                kind: MismatchKind::Type("integer".into()),
+            })
+        );
+        assert_eq!(
+            check(&schema, &json!({"items": []})).unwrap_err().kind,
+            MismatchKind::Empty
+        );
+    }
+
+    /// Validator-only keywords are the grammar's deliberate blind spot;
+    /// the backstop must not reject what the grammar is designed to
+    /// admit, or every such request becomes a resample loop.
+    #[test]
+    fn validator_only_keywords_are_not_enforced() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "pattern": "^[A-Z]{2}$",
+                         "minLength": 2},
+                "n": {"type": "integer", "maximum": 3},
+                "xs": {"type": "array", "minItems": 3},
+            },
+        });
+        assert_eq!(
+            check(&schema, &json!({"code": "x", "n": 10, "xs": [1]})),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn any_of_const_and_nullable() {
+        let schema = json!({
+            "anyOf": [{"const": "Low"}, {"const": "High"}],
+        });
+        assert_eq!(check(&schema, &json!("Low")), Ok(()));
+        assert_eq!(
+            check(&schema, &json!("Mid")).unwrap_err().kind,
+            MismatchKind::AnyOf
+        );
+        let nullable = json!({"type": ["string", "null"]});
+        assert_eq!(check(&nullable, &Value::Null), Ok(()));
+        assert!(check(&nullable, &json!(1)).is_err());
+        let integer = json!({"type": "integer"});
+        assert_eq!(check(&integer, &json!(3)), Ok(()));
+        assert_eq!(check(&integer, &json!(3.0)), Ok(()));
+        assert!(check(&integer, &json!(3.5)).is_err());
+        // No `type`: any value, as in the grammar.
+        assert_eq!(check(&json!({}), &json!([1, "a"])), Ok(()));
+    }
+
+    /// `Display` locates the failure by schema-side facts only.
+    #[test]
+    fn display_names_the_location_not_the_value() {
+        let at_root = check_text(&role_consent(), r#"{"$x": 1}"#).unwrap_err();
+        assert_eq!(
+            at_root.to_string(),
+            "at the root: missing required property `reason`"
+        );
+        let nested = SchemaMismatch {
+            path: "/items/1/n".into(),
+            kind: MismatchKind::Type("integer".into()),
+        };
+        assert_eq!(nested.to_string(), "at `/items/1/n`: expected integer");
+    }
+
+    #[test]
+    fn pointer_escapes_schema_keys() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"a/b~c": {"type": "string"}},
+        });
+        assert_eq!(
+            check(&schema, &json!({"a/b~c": 1})).unwrap_err().path,
+            "/a~1b~0c"
+        );
+    }
+}

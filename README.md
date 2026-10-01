@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/mdegans/drama_llama/graph/badge.svg)](https://codecov.io/gh/mdegans/drama_llama)
-[![tests](https://img.shields.io/badge/tests-825-blue)](#testing)
+[![tests](https://img.shields.io/badge/tests-852-blue)](#testing)
 [![license](https://img.shields.io/badge/license-RAIL--S-lightgrey)](https://github.com/mdegans/drama_llama/blob/main/LICENSE.md)
 
 `drama_llama` runs language models on your own hardware behind an API shaped
@@ -142,7 +142,7 @@ the one below it.
 
 | | Feature flag | |
 |---|---|---|
-| **Structured output** | `json-schema` | A `schemars`-derived type becomes a sampling grammar. Optional `<think>…</think>` preamble, phase-split so the thought runs unconstrained at full speed. |
+| **Structured output** | `json-schema` | A `schemars`-derived type becomes a sampling grammar. Optional `<think>…</think>` preamble (in the model's own thought markers), phase-split where the render opens the thought so it runs unconstrained at full speed. |
 | **Tool calling** | *(always on)* | Per-model dialects derived by analyzing each model's own chat template, driving both the grammar emitter and the response parser. `ToolChoice::method` is *guaranteed* locally, not requested. Validated for Qwen 3.5/3.6, Gemma 4, gpt-oss (Harmony). |
 | **GBNF grammars** | *(always on)* | Pure-Rust parser, matcher and lazy-DFA cache. Sampling checks the one sampled token first and only falls back to an O(vocab) mask on rejection. |
 | **Prefix caching** | *(always on, opt-in at runtime)* | Multi-slot, breakpoint-driven, LRU with TTL. Honors Anthropic `cache_control` ephemeral markers. One slot per agent, so an N-agent workload caches N prefixes instead of thrashing one. |
@@ -207,8 +207,8 @@ sampler-settings editor).
 
 ## Testing
 
-825 tests across 31 binaries in the default configuration — 665 that run in
-seconds and 160 that load real weights onto a real accelerator. The
+852 tests across 31 binaries in the default configuration — 687 that run in
+seconds and 165 that load real weights onto a real accelerator. The
 model-backed tier is `#[ignore]`d so the fast loop stays fast, and the whole
 topology — *which features* × *which tests* — lives in one place,
 [`scripts/test.py`]. The justfile delegates to that script, the git hooks call

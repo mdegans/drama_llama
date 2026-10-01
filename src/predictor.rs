@@ -899,14 +899,17 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             .and_then(|h| h.snapshot_opts())
             .map(|opts| candidates.capture_snapshot(&opts));
 
-        let next_token = candidates
-            .sample_token(
-                &self.inner.tokens,
-                &self.options.sample_options,
-                &mut self.state,
-                &self.inner.engine.model,
-            )
-            .unwrap();
+        // The generated text rides along for the deferred-trigger wake
+        // check: a trigger may have started tokens ago.
+        let next_token = crate::sample::sample_token_in(
+            &self.inner.tokens,
+            self.text.as_bytes(),
+            candidates,
+            &self.options.sample_options,
+            &mut self.state,
+            &self.inner.engine.model,
+        )
+        .unwrap();
 
         // Reassembled, not converted in isolation: a token that is
         // only part of a codepoint yields nothing here and its bytes
@@ -1151,7 +1154,7 @@ fn find_deferred_trigger_end(
 /// go to the longer trigger, so `<x> to=` beats ` to=`-style overlaps
 /// feeding the right byte count). Returns `(trigger_end,
 /// trigger_len)` for the winner.
-fn find_any_deferred_trigger_end(
+pub(crate) fn find_any_deferred_trigger_end(
     haystack: &[u8],
     triggers: &[Vec<u8>],
     window: usize,

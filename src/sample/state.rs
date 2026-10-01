@@ -261,6 +261,75 @@ impl SamplerState {
         d.matcher.advance_bytes(&spec.grammar.grammar, tail)
     }
 
+    /// Would `token`, sampled while the deferred grammar sleeps, wake
+    /// it with bytes it refuses? A token can finish the trigger and
+    /// carry more bytes past it (cogito's `>\n\n\n` after `</`, a
+    /// text-spelled `]\n{` after `[/THINK`): the predictor activates
+    /// the grammar on the bytes after the trigger, and when the grammar
+    /// refuses them it ends the turn — mid-structure, a violation on
+    /// every draw that picks the token. Judged before the pick commits,
+    /// the same token is masked and the draw steered, like any other
+    /// grammar-illegal token.
+    ///
+    /// `generated` is the text generated so far, as the predictor scans
+    /// it for the trigger; only its last trigger's-length bytes matter.
+    /// A token that ends generation never activates anything, so an EOG
+    /// token is never refused here.
+    pub(crate) fn wakes_deferred_illegally<M: Model>(
+        &self,
+        config: &SamplerConfig,
+        generated: &[u8],
+        token: Token,
+        model: &M,
+    ) -> bool {
+        let (Some(d), Some(spec)) =
+            (self.deferred.as_ref(), config.deferred_grammar.as_ref())
+        else {
+            return false;
+        };
+        if d.active {
+            return false;
+        }
+        let mut piece: Vec<u8> = Vec::with_capacity(32);
+        model.token_to_piece_ref(token, &mut piece);
+        // Cheap reject first: a trigger can only end inside the piece
+        // if the piece holds some trigger's last byte.
+        let ends_one = spec
+            .activate_after
+            .iter()
+            .filter_map(|t| t.last())
+            .any(|b| piece.contains(b));
+        if !ends_one {
+            return false;
+        }
+        let longest = spec.activate_after.iter().map(Vec::len).max();
+        let keep = generated
+            .len()
+            .saturating_sub(longest.unwrap_or(0).saturating_sub(1));
+        let hay: Vec<u8> = generated[keep..]
+            .iter()
+            .chain(piece.iter())
+            .copied()
+            .collect();
+        let Some((end, len)) = crate::predictor::find_any_deferred_trigger_end(
+            &hay,
+            &spec.activate_after,
+            hay.len(),
+        ) else {
+            return false;
+        };
+        // A trigger wholly inside `generated` fired already, or never
+        // will (the predictor scans only after a token commits).
+        if end <= hay.len() - piece.len() {
+            return false;
+        }
+        let from = if spec.feed_trigger { end - len } else { end };
+        let tail = &hay[from..];
+        !tail.is_empty()
+            && !d.matcher.accepts_bytes(&spec.grammar.grammar, tail)
+            && !model.eog_tokens().contains(&token)
+    }
+
     /// The repetition-penalty n-gram accumulator (read-only
     /// observability — probes and tests compare fold results;
     /// [`crate::NGramStats`] derives `PartialEq` for exactly that).
