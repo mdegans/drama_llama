@@ -236,9 +236,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (the unified grammar sees the analysis; the deferred one now reads its
   trigger, `<|end|><|start|>assistant<|channel|>final` before the bare
   `<|channel|>final`). Pinned as irreducible: a constrained final with
-  no thought right before it — none, or a commentary preamble between,
-  which the deferred grammar cannot tell from an analysis — re-renders
-  plain; free generation can still write one. Pinned in
+  no thought right before it — none, or a commentary preamble between —
+  re-renders plain; free generation can still write one (the
+  `output_config` grammars refuse that preamble, see the preamble entry
+  below). Pinned in
   `gptoss_cache_stable_round_trips_json_final` and
   `gptoss_cache_stable_keeps_a_preamble_apart_from_its_final`.
   **Deployments that
@@ -275,13 +276,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   merges adjacent text (a parse merges its own prose, so side by side
   they are channels), `chunks` carries each text block as its own
   chunk, and the gpt-oss bake renders every text but the last of a turn
-  without calls as a preamble. The `output_config` schema check reads
-  the final alone on Harmony. **A streamed turn cannot mark the
+  without calls as a preamble. **A streamed turn cannot mark the
   boundary**: `BlockStream`'s text yields are deltas, so the preamble
-  and the final stream as adjacent text (its schema check reads the
-  parse). An assistant message a client sends with several text blocks
-  now renders on gpt-oss as preambles then a final, where it rendered
-  one final.
+  and the final stream as adjacent text. Both paths therefore treat
+  them as one run where the client cannot tell them apart: a request
+  stop sequence matches across the two on the batch path as on the
+  stream (the batch keeps the blocks apart and cuts the one the match
+  starts in), so both stop at the same text and report the same
+  `stop_sequence`. An assistant message a client sends with several
+  text blocks now renders on gpt-oss as preambles then a final, where
+  it rendered one final.
+- **Under `output_config` a gpt-oss answer is one text block.**
+  Anthropic (and misanthropic's `json_items` and kin) promise a
+  json_schema answer as exactly one text block holding the JSON. The
+  output_config grammars now refuse whatever gpt-oss would write
+  between its analysis and its final — a commentary preamble, a call, a
+  second analysis — as the unified grammar always did: the deferred
+  (phase-split) grammar's trigger is now the end of the turn's first
+  block, `<|end|><|start|>assistant`, and its header rule admits only
+  the final there. A preamble that *opens* the turn runs before any
+  trigger and cannot be refused up front; such a turn (two text blocks)
+  is a `SchemaViolation` on both paths, as is any turn whose answer is
+  more than one text block — the batch judges its parse, a drained
+  `BlockStream` the parse its yields cannot split — never a 200 with the
+  preamble run into the JSON. Pinned in
+  `harmony_output_config_refuses_a_detour` and
+  `gptoss_cache_stable_keeps_a_preamble_apart_from_its_final`.
 - **A Qwen turn that reasons again after its prose re-renders.**
   `…</think>\n\nChecking.<think>\nMore.\n</think>…` parsed to two
   thoughts, but the merged fields could not place the second: 3.6

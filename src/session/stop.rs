@@ -376,7 +376,8 @@ pub(super) fn stop_view(
         }
     }
     // Not merged: a parse merges its own prose, so text blocks side by
-    // side are Harmony channels, each cut on its own.
+    // side are Harmony channels, which stay two blocks; `cut_at_stop`
+    // matches across them, as the stream does.
     blocks
 }
 
@@ -388,6 +389,12 @@ pub(super) fn stop_view(
 /// goes. Returns the matched stop, if any. Pass a call in flight as
 /// [`stop_view`] leaves it.
 ///
+/// Prose is matched per run, as the filter matches it: text blocks side
+/// by side (Harmony channels — a preamble, then the final) are one run,
+/// since a stream's text yields cannot mark where one ended and the
+/// next began, so a stop the client sees across them matches here too.
+/// The blocks stay apart; a match is cut in the block it starts in.
+///
 /// The last block's trailing whitespace is matched: `blocks` is taken
 /// to end a turn that finished cleanly. A caller holding the stop the
 /// filter reported can pass just that one — the filter found it first,
@@ -396,29 +403,50 @@ pub(super) fn cut_at_stop<S: AsRef<str>>(
     mut blocks: Vec<Block>,
     stops: &[S],
 ) -> (Vec<Block>, Option<String>) {
-    let is_structure =
-        |b: Option<&Block>| b.is_some_and(|b| !matches!(b, Block::Text { .. }));
+    fn text(b: &Block) -> Option<&str> {
+        match b {
+            Block::Text { text, .. } => Some(text.as_ref()),
+            _ => None,
+        }
+    }
     /// Where a stop matched: at a byte of prose, or in a call's input.
     enum Match {
         Prose(usize),
         Input(Value),
     }
-    let hit = blocks.iter().enumerate().find_map(|(i, b)| match b {
-        Block::Text { text, .. } => {
+    let n = blocks.len();
+    let hit = (0..n).find_map(|i| match &blocks[i] {
+        // Inside a run: its first block matched the whole of it.
+        Block::Text { .. } if i > 0 && text(&blocks[i - 1]).is_some() => None,
+        Block::Text { .. } => {
+            let run: Vec<&str> = blocks[i..].iter().map_while(text).collect();
+            let end = i + run.len();
+            let joined = run.concat();
             // Whitespace touching a structure is framing.
-            let start = if i > 0 && is_structure(blocks.get(i - 1)) {
-                text.len() - text.trim_start().len()
-            } else {
-                0
+            let start = match i {
+                0 => 0,
+                _ => joined.len() - joined.trim_start().len(),
             };
-            let end = if is_structure(blocks.get(i + 1)) {
-                text.trim_end().len()
-            } else {
-                text.len()
+            let stop = match end < n {
+                true => joined.trim_end().len(),
+                false => joined.len(),
             };
-            let body = text.get(start..end.max(start)).unwrap_or("");
-            first_stop_string(body, stops)
-                .map(|(at, s)| (i, Match::Prose(start + at), s))
+            let body = joined.get(start..stop.max(start)).unwrap_or("");
+            let (at, s) = first_stop_string(body, stops)?;
+            let at = start + at;
+            // The block the match starts in: the last to start at or
+            // before it.
+            let (k, from) = run
+                .iter()
+                .scan(0, |pos, t| {
+                    let from = *pos;
+                    *pos += t.len();
+                    Some(from)
+                })
+                .enumerate()
+                .take_while(|&(_, from)| from <= at)
+                .last()?;
+            Some((i + k, Match::Prose(at - from), s))
         }
         Block::ToolUse { call } => cut_value(&call.input, stops)
             .map(|(cut, s)| (i, Match::Input(cut), s)),
@@ -649,7 +677,9 @@ mod tests {
     /// agrees, as the session runs it: the clipped parse of what was
     /// generated — a call in flight with its string kept — cut at the
     /// stop the filter reported, is the streamed output, block for
-    /// block. Returns the output.
+    /// block (as a client assembles a stream's text yields: two Harmony
+    /// channels side by side are one run there). With no stop hit, the
+    /// batch finds none either. Returns the output.
     fn stream_and_batch(
         syntax: CallSyntax,
         stops: &[&str],
@@ -658,18 +688,29 @@ mod tests {
         let mut f = filter(syntax.clone(), stops);
         let (streamed, generated) = run_to_stop(&mut f, text);
         let hit = f.hit().map(str::to_owned);
-        if let Some(hit) = &hit {
-            let t = tool();
-            let parsed = parse_text_open(
-                &syntax,
-                &[&t],
-                generated,
-                false,
-                Leniency::Clipped,
-            );
-            let (cut, found) = cut_at_stop(stop_view(parsed, false), &[hit]);
-            assert_eq!(found.as_ref(), Some(hit), "{text:?}");
-            assert_eq!(cut, streamed, "batch vs stream on {text:?}");
+        let t = tool();
+        let parsed = parse_text_open(
+            &syntax,
+            &[&t],
+            generated,
+            false,
+            Leniency::Clipped,
+        );
+        let view = stop_view(parsed, false);
+        match &hit {
+            Some(hit) => {
+                let (cut, found) = cut_at_stop(view, &[hit]);
+                assert_eq!(found.as_ref(), Some(hit), "{text:?}");
+                assert_eq!(
+                    super::super::merge_adjacent_prose(cut),
+                    streamed,
+                    "batch vs stream on {text:?}"
+                );
+            }
+            None => {
+                let (_, found) = cut_at_stop(view, stops);
+                assert_eq!(found, None, "batch only on {text:?}");
+            }
         }
         (streamed, hit)
     }
@@ -731,6 +772,67 @@ mod tests {
         let (out, hit) = stream_and_batch(syntax, &["\n"], &text);
         assert_eq!(hit, None, "{out:#?}");
         assert_eq!(calls(&out), 1, "{out:#?}");
+    }
+
+    /// gpt-oss may write a commentary preamble, then its final, with no
+    /// call between: two text blocks in a batch, one run of text yields
+    /// in a stream, which cannot mark where one ended. A stop matches
+    /// what the client sees on either path — across the two as well —
+    /// and the batch cut keeps the channels apart.
+    #[test]
+    fn stop_matches_across_a_harmony_preamble_and_its_final() {
+        let syntax = CallSyntax::gpt_oss();
+        let text = "<|channel|>commentary<|message|>Hi.<|end|>\
+                    <|start|>assistant<|channel|>final<|message|>Ok then.";
+        let t = tool();
+        let blocks =
+            parse_text(&syntax, &[&t], text, false, Leniency::Final).blocks;
+        assert_eq!(blocks.len(), 2, "two channels: {blocks:#?}");
+        for (stop, want, n) in [
+            // Across the boundary: cut in the preamble.
+            (".O", "Hi", 1),
+            // At the boundary: the preamble stands whole.
+            ("Ok", "Hi.", 1),
+            // Inside the final: both channels, the final cut.
+            ("then", "Hi.Ok ", 2),
+        ] {
+            let (out, hit) = stream_and_batch(syntax.clone(), &[stop], text);
+            assert_eq!(hit.as_deref(), Some(stop));
+            assert_eq!(texts(&out), want, "{stop:?}");
+            let (cut, found) = cut_at_stop(blocks.clone(), &[stop]);
+            assert_eq!(found.as_deref(), Some(stop));
+            assert_eq!(cut.len(), n, "{stop:?}: {cut:#?}");
+            assert_eq!(texts(&cut), want, "{stop:?}");
+        }
+        let (out, hit) = stream_and_batch(syntax, &["absent"], text);
+        assert_eq!((texts(&out).as_str(), hit), ("Hi.Ok then.", None));
+    }
+
+    /// The raw cut of a stop across two Harmony channels ends inside the
+    /// preamble, where the kept output does: the session cuts the
+    /// response there, not the stop bytes left in place.
+    #[test]
+    fn raw_stop_cut_across_harmony_channels() {
+        let syntax = CallSyntax::gpt_oss();
+        let preamble = "<|channel|>commentary<|message|>Hi";
+        let raw = format!(
+            "{preamble}.<|end|><|start|>assistant<|channel|>final\
+             <|message|>O"
+        );
+        let parse = |prefix: &str| {
+            parse_text_open(&syntax, &[], prefix, false, Leniency::Clipped)
+        };
+        let view = |prefix: &str| {
+            let (parsed, open) = parse(prefix);
+            let complete =
+                parsed.status == crate::dialect::ParseStatus::Complete;
+            (complete || open.is_some())
+                .then(|| stop_view((parsed, open), true))
+        };
+        let (kept, hit) = cut_at_stop(stop_view(parse(&raw), false), &[".O"]);
+        assert_eq!(hit.as_deref(), Some(".O"));
+        assert_eq!(texts(&kept), "Hi");
+        assert_eq!(raw_stop_cut(&raw, &kept, view), Some(preamble.len()));
     }
 
     /// The separator after a thought (`"</think>\n\n"`) is framing too:

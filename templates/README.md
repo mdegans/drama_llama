@@ -79,7 +79,8 @@ turn it admits only the plain header. Irreducible, pinned in
 `gptoss_cache_stable_keeps_a_preamble_apart_from_its_final`: a
 constrained final with no thought right before it — none, or a
 preamble between — has nowhere to record its header, and re-renders
-plain. Harmony does not document a final-channel content
+plain. Under `output_config` the grammar refuses that preamble after
+the analysis, and a turn that opens with one is a schema violation. Harmony does not document a final-channel content
 type (its guide shows `<|constrain|>` only on commentary calls); this
 follows the model.
 The `<|return|>`/`<|end|>` re-ingest rewrite (upstream issue #15417)

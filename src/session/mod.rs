@@ -8224,9 +8224,12 @@ struct TurnContract {
     strict_tools: Vec<(String, serde_json::Value)>,
     /// The json_schema [`output_config`]'s schema. A turn that answers it
     /// — no call, and no forced call, which outranks it at grammar
-    /// resolution ([`resolve_grammar`]) — must be exactly one JSON
-    /// document matching it, across all its text: prose beside the JSON
-    /// breaks it too, since the grammar admits none.
+    /// resolution ([`resolve_grammar`]) — must be exactly one text block,
+    /// one JSON document matching it, as Anthropic returns it: prose
+    /// beside the JSON breaks it too, since the grammar admits none, and
+    /// so does a gpt-oss commentary preamble that opened the turn before
+    /// a deferred grammar could refuse it — two text blocks, never one
+    /// answer, on either path.
     ///
     /// [`output_config`]: misanthropic::Prompt::output_config
     output_schema: Option<serde_json::Value>,
@@ -8236,11 +8239,11 @@ struct TurnContract {
     /// one, which never firing just means no call — an output_config
     /// grammar that never activated left the answer unconstrained.
     deferred_answer: bool,
-    /// The answer is the turn's last text alone: Harmony's final
-    /// channel. A commentary preamble before it is its own text block,
-    /// which the deferred grammar leaves free like the analysis, and is
-    /// no part of the value (`TurnContract::in_channels`).
-    final_channel: bool,
+    /// The turn's text may be several blocks side by side: Harmony's
+    /// channels, a preamble then the final. A stream's text yields
+    /// cannot mark where one ended, so a drained [`BlockStream`] judges
+    /// the parse, as `run_call` does (`TurnContract::in_channels`).
+    channels: bool,
 }
 
 /// How a turn broke its [`TurnContract`], in the order `run_call` checks.
@@ -8292,15 +8295,15 @@ impl TurnContract {
             // Auto lazy grammar, so a deferred grammar beside one is its.
             deferred_answer: deferred.is_some() && output_schema.is_some(),
             output_schema,
-            final_channel: false,
+            channels: false,
         }
     }
 
-    /// The contract for a turn `syntax` parses: on Harmony the answer is
-    /// the final channel, the last text block.
+    /// The contract for a turn `syntax` parses: on Harmony each channel
+    /// is its own text block.
     fn in_channels(self, syntax: &crate::CallSyntax) -> Self {
         Self {
-            final_channel: syntax.family == crate::dialect::Family::Harmony,
+            channels: syntax.family == crate::dialect::Family::Harmony,
             ..self
         }
     }
@@ -8352,15 +8355,23 @@ impl TurnContract {
             return None;
         }
         let schema = self.output_schema.as_ref()?;
-        let mut texts = blocks.iter().filter_map(|block| match block {
-            crate::Block::Text { text, .. } => Some(text.as_ref()),
-            _ => None,
-        });
-        let text: String = match self.final_channel {
-            true => texts.next_back().unwrap_or_default().to_owned(),
-            false => texts.collect(),
-        };
-        crate::schema_check::check_text(schema, &text).err()
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                crate::Block::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        match texts.as_slice() {
+            [] => crate::schema_check::check_text(schema, "").err(),
+            [text] => crate::schema_check::check_text(schema, text).err(),
+            // A preamble and an answer, or prose either side of a
+            // thought: not one document, whatever each holds.
+            _ => Some(crate::SchemaMismatch {
+                path: String::new(),
+                kind: crate::MismatchKind::NotJson,
+            }),
+        }
     }
 }
 
@@ -9114,13 +9125,15 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
                 .deferred_inactive()
                 == Some(true),
         };
-        // On Harmony the answer is the final channel alone, and text
-        // yields cannot say where a preamble ended and the final began:
-        // the check reads the parse, which keeps them apart.
-        let breach = match self.contract.final_channel {
-            true => self.contract.breach(&self.filter.parser().blocks(), end),
-            false => self.contract.breach(&turn, end),
+        // The answer is one text block. Text yields are deltas, one
+        // block to a client per run; on Harmony a run may be two
+        // channels, which only the parse keeps apart — so the check
+        // reads the blocks `run_call` would.
+        let judged = match self.contract.channels {
+            true => self.filter.parser().blocks(),
+            false => merge_adjacent_prose(turn.clone()),
         };
+        let breach = self.contract.breach(&judged, end);
         self.stop = Some(infer_stop_reason(
             turn.iter()
                 .any(|b| matches!(b, crate::Block::ToolUse { .. })),
@@ -11095,6 +11108,64 @@ mod tests {
                         "{at}: valid body: {good}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Under a json_schema `output_config` a gpt-oss answer is one text
+    /// block, the final (Anthropic's contract). With thinking on or off,
+    /// deferred or unified, the grammar refuses whatever would come
+    /// between the analysis and the final instead: a commentary
+    /// preamble (which parses as a second text block), a call, or a
+    /// second analysis. A preamble opening the turn runs before a
+    /// deferred grammar's trigger, and is refused after the fact
+    /// (`gptoss_cache_stable_keeps_a_preamble_apart_from_its_final`).
+    #[test]
+    fn harmony_output_config_refuses_a_detour() {
+        use misanthropic::prompt::thinking::Thinking;
+        let thinking_off = Prompt::default().json_schema(role_consent_schema());
+        let thinking_on = thinking_off.clone().thinking(Thinking::Enabled {
+            budget_tokens: NonZeroU32::new(1024).unwrap(),
+            display: None,
+        });
+        let analysis = "<|channel|>analysis<|message|>Plan.<|end|>\
+                        <|start|>assistant";
+        let fin = format!("<|channel|>final<|message|>{ROLE_CONSENT_VALID}");
+        for (label, prompt, phase_split) in [
+            ("on", thinking_on.clone(), true),
+            ("on, unified", thinking_on, false),
+            ("off", thinking_off, true),
+        ] {
+            let compiled = resolve_grammar(
+                &prompt,
+                &crate::CallSyntax::gpt_oss(),
+                &OutputConfigOptions {
+                    phase_split,
+                    ..OutputConfigOptions::default()
+                },
+                false,
+            )
+            .expect("resolve")
+            .expect("output_config grammar");
+            assert_eq!(
+                constraint_admits(&compiled, &format!("{analysis}{fin}")),
+                Some(true),
+                "thinking {label}"
+            );
+            for detour in [
+                "<|channel|>commentary<|message|>Checking.<|end|>\
+                 <|start|>assistant",
+                "<|channel|>commentary to=functions.f <|constrain|>json\
+                 <|message|>{}<|call|>",
+                "<|channel|>analysis<|message|>More.<|end|>\
+                 <|start|>assistant",
+            ] {
+                let emission = format!("{analysis}{detour}{fin}");
+                assert_eq!(
+                    constraint_admits(&compiled, &emission),
+                    None,
+                    "thinking {label}: {emission}"
+                );
             }
         }
     }
@@ -15309,11 +15380,14 @@ mod tests {
 
     /// gpt-oss may write a commentary preamble and then its final with
     /// no call between (2026-10-01 probe). The parse merged the two into
-    /// one text, `Hi.{"a":1}`: neither the visible answer nor a value an
-    /// `output_config` schema could accept, and a final the bake could
-    /// not re-render. Each channel is now its own text block, the bake
-    /// renders every text but the last of a turn without calls as a
-    /// preamble, and the schema reads the final alone.
+    /// one text, `Hi.{"a":1}`: not the visible answer, and a final the
+    /// bake could not re-render. Each channel is now its own text block,
+    /// and the bake renders every text but the last of a turn without
+    /// calls as a preamble. Under `output_config` the answer must be one
+    /// text block (Anthropic's contract), so such a turn is a schema
+    /// violation — on the stream too, which judges the parse its yields
+    /// cannot split — and the grammar refuses a preamble after the
+    /// analysis (`harmony_output_config_refuses_a_detour`).
     #[test]
     fn gptoss_cache_stable_keeps_a_preamble_apart_from_its_final() {
         use crate::Block;
@@ -15344,17 +15418,49 @@ mod tests {
         };
         assert_eq!((hi.as_ref(), answer.as_ref()), ("Hi.", json));
 
-        // The schema reads the final; elsewhere prose beside the JSON
-        // still breaks it.
+        // Two text blocks are no one answer, on either path: the batch
+        // parse, and the stream's, which a drained `BlockStream` judges.
         let prompt = Prompt::default().json_schema(serde_json::json!({
             "type": "object",
             "properties": {"a": {"type": "integer"}},
             "required": ["a"],
         }));
-        let contract = TurnContract::of(&prompt, None);
-        assert!(contract.schema_mismatch(&blocks).is_some());
-        let harmony = contract.in_channels(&syntax);
-        assert_eq!(harmony.schema_mismatch(&blocks), None);
+        let contract = TurnContract::of(&prompt, None).in_channels(&syntax);
+        let not_json = Some(crate::SchemaMismatch {
+            path: String::new(),
+            kind: crate::MismatchKind::NotJson,
+        });
+        let streamed = |emission: &str| {
+            let mut parser = crate::dialect::StreamParser::new(
+                syntax.clone(),
+                Vec::new(),
+                false,
+            );
+            let mut yields = Vec::new();
+            for c in emission.chars() {
+                yields.extend(parser.push(c.encode_utf8(&mut [0; 4])));
+            }
+            yields.extend(parser.finish());
+            (merge_adjacent_prose(yields), parser.blocks())
+        };
+        for (emission, want) in [
+            (format!("{analysis}{preamble}{fin_json}{json}"), &not_json),
+            (format!("{preamble}{fin}{json}"), &not_json),
+            (format!("{analysis}{fin_json}{json}"), &None),
+            (format!("{fin}{json}"), &None),
+        ] {
+            let batch = parse(&emission);
+            let (yields, judged) = streamed(&emission);
+            assert_eq!(judged, batch, "{emission:?}");
+            assert_eq!(&contract.schema_mismatch(&batch), want, "{emission:?}");
+            // The yields merge the channels: judged on them, the
+            // preamble would read as part of the value.
+            let texts = yields
+                .iter()
+                .filter(|b| matches!(b, Block::Text { .. }))
+                .count();
+            assert_eq!(texts, 1, "{emission:?}: {yields:?}");
+        }
 
         for baked in [&crate::baked::GPTOSS, &crate::baked::GPTOSS_UPSTREAM] {
             let served = crate::baked::detect(baked.stock)
@@ -15379,8 +15485,8 @@ mod tests {
             // Pinned: a preamble between the analysis and a constrained
             // final leaves the header nowhere to be recorded (a stream
             // has released the thought before the final's header comes),
-            // so it re-renders plain. The deferred `output_config`
-            // grammar cannot tell this preamble from an analysis.
+            // so it re-renders plain. Free generation only: the
+            // `output_config` grammars refuse the preamble.
             let emission = format!("{analysis}{preamble}{fin_json}{json}");
             assert_eq!(
                 diverge(&emission),
