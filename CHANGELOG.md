@@ -117,6 +117,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that already closed the turn's thought (a prefilled closed thought,
   thinking on) now gets the unified grammar, since its closer can never
   be written and the deferred one would never fire.
+- **A token that would wake a deferred grammar illegally is masked.**
+  While a deferred grammar sleeps nothing masks the vocab, so a token
+  that finished its trigger and carried bytes the grammar refuses was
+  sampled, woke it, and the predictor ended the turn mid-structure. The
+  sampler now checks such a token's tail against the sleeping grammar
+  before accepting it and resamples without it, like any other
+  grammar-illegal pick (`sample_token_in`, given the generated text so
+  far; the public `Candidates::sample_token` judges what one piece
+  spells).
 - **A Qwen XML tool's string `enum` argument reads as its value.** The
   grammar writes such a value as JSON (`"full"`, quoted) but the parser
   read it raw, so the tool got `"\"full\""` — and, for a `strict`

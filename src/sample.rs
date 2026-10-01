@@ -1332,8 +1332,27 @@ impl SamplerConfig {
 /// continues generation is the caller's call, and a token that
 /// terminates it must never mutate `state` (tip invariant). Callers
 /// that keep generating follow up with [`SamplerState::advance`].
+///
+/// [`sample_token_in`] with no generated text: a sleeping deferred
+/// grammar's trigger is judged only where a single piece spells all
+/// of it.
 pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     tokens: &[Token],
+    candidates: Candidates,
+    opts: &SamplerConfig,
+    state: &mut SamplerState,
+    model: &M,
+) -> Result<Token, SampleError> {
+    sample_token_in(tokens, &[], candidates, opts, state, model)
+}
+
+/// [`sample_token`], given `generated` — the text generated so far,
+/// which a sleeping deferred grammar's trigger may have started in.
+/// A token that would finish the trigger and wake the grammar on bytes
+/// it refuses is masked (`SamplerState::wakes_deferred_illegally`).
+pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
+    tokens: &[Token],
+    generated: &[u8],
     mut candidates: Candidates,
     opts: &SamplerConfig,
     state: &mut SamplerState,
@@ -1446,15 +1465,19 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     let lazy = opts.lazy_grammar && state.has_active_constraint();
     let banned = opts.banned_specials.as_slice();
     let banned_in_region = opts.banned_specials_constrained.as_slice();
+    let sleeping = state.deferred_inactive() == Some(true);
 
-    // Fallback snapshots (lazy-grammar check and/or emit-side specials
-    // ban): `Pcg64Mcg` is a single `u128` of state (Clone), `mu` is a
-    // plain `Option<f32>`, and the pre-fold candidates clone is a
-    // straight memcpy of the vector. Restoring these and replaying the
-    // fold consumes the identical RNG draw sequence on either path, so
-    // a fixed seed yields the same stream every run regardless of how
-    // many checks fall back.
-    let snapshot = if lazy || !banned.is_empty() || !banned_in_region.is_empty()
+    // Fallback snapshots (lazy-grammar check, emit-side specials ban,
+    // and/or a sleeping deferred grammar's wake check): `Pcg64Mcg` is a
+    // single `u128` of state (Clone), `mu` is a plain `Option<f32>`, and
+    // the pre-fold candidates clone is a straight memcpy of the vector.
+    // Restoring these and replaying the fold consumes the identical RNG
+    // draw sequence on either path, so a fixed seed yields the same
+    // stream every run regardless of how many checks fall back.
+    let snapshot = if lazy
+        || sleeping
+        || !banned.is_empty()
+        || !banned_in_region.is_empty()
     {
         Some((state.rng.clone(), state.mu, candidates.clone()))
     } else {
@@ -1549,13 +1572,54 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     if region_ban
         || (!banned.is_empty() && banned.binary_search(&chosen).is_ok())
     {
+        if let Some((rng_snap, mu_snap, saved)) = snapshot.as_ref() {
+            state.rng = rng_snap.clone();
+            state.mu = *mu_snap;
+            let kept: Vec<crate::TokenData> = saved
+                .as_slice()
+                .iter()
+                .filter(|td| banned.binary_search(&td.id).is_err())
+                .copied()
+                .collect();
+            let cleaned = if kept.is_empty() {
+                Candidates::from_vec(vec![crate::TokenData {
+                    id: model.eos(),
+                    logit: 0.0,
+                    p: 0.0,
+                }])
+            } else {
+                Candidates::from_vec_unchecked(kept)
+            };
+            let filtered = apply_modes(cleaned, opts, state, model, false);
+            chosen = choose_candidate(&mut state.rng, filtered.softmax(None))
+                .is_one()
+                .unwrap()
+                .id;
+        }
+    }
+
+    // Wake check, accept-then-mask once more: while a deferred grammar
+    // sleeps nothing masks the vocab, so a token that finishes its
+    // trigger and carries bytes the grammar refuses would wake it on
+    // them — and the predictor ends the turn there. On a hit (rare:
+    // only trigger-finishing tokens are examined) restore the pre-fold
+    // state and drop every such token, alongside the ban above, before
+    // the masked rerun.
+    if sleeping
+        && state.wakes_deferred_illegally(opts, generated, chosen, model)
+    {
         if let Some((rng_snap, mu_snap, saved)) = snapshot {
             state.rng = rng_snap;
             state.mu = mu_snap;
             let kept: Vec<crate::TokenData> = saved
                 .as_slice()
                 .iter()
-                .filter(|td| banned.binary_search(&td.id).is_err())
+                .filter(|td| {
+                    banned.binary_search(&td.id).is_err()
+                        && !state.wakes_deferred_illegally(
+                            opts, generated, td.id, model,
+                        )
+                })
                 .copied()
                 .collect();
             let cleaned = if kept.is_empty() {
@@ -3131,6 +3195,74 @@ mod tests {
                 "lazy={lazy}: force-EOS while a legal token existed is the \
                  #76 failure — generation dies mid-structure"
             );
+        }
+    }
+
+    /// A token that finishes a sleeping deferred grammar's trigger and
+    /// carries bytes the grammar refuses past it (cogito's `>\n\n\n`
+    /// after `</`) is masked, not sampled: the predictor would wake the
+    /// grammar on those bytes and end the turn there. Here the trigger
+    /// is `a"` and the grammar `"x"`: `",` after `a` would wake it on
+    /// `,`, while a bare `"` wakes it on nothing. The trigger may have
+    /// started tokens ago, so the check reads the generated text; a
+    /// sampler shown none judges only what one piece spells.
+    #[test]
+    fn a_token_that_wakes_the_deferred_grammar_illegally_is_masked() {
+        for lazy in [false, true] {
+            let opts = SamplerConfig {
+                modes: Vec::new(),
+                repetition: None,
+                deferred_grammar: Some(crate::DeferredGrammar {
+                    grammar: CompiledGrammar::parse(r#"root ::= "x""#).unwrap(),
+                    activate_after: vec![b"a\"".to_vec()],
+                    feed_trigger: false,
+                }),
+                lazy_grammar: lazy,
+                ..SamplerConfig::default()
+            };
+            let pick = |generated: &[u8]| {
+                let mut state = state_for(&opts);
+                let picked = sample_token_in(
+                    &[],
+                    generated,
+                    cands(&[(QUOTE_COMMA, 10.0), (QUOTE, 5.0), (B, 1.0)]),
+                    &opts,
+                    &mut state,
+                    &MockModel,
+                )
+                .expect("sample_token_in");
+                assert_eq!(
+                    state.deferred_inactive(),
+                    Some(true),
+                    "sampling never wakes the grammar"
+                );
+                picked
+            };
+            assert_eq!(pick(b"thinking a"), QUOTE, "lazy={lazy}");
+            assert_eq!(pick(b"thinking b"), QUOTE_COMMA, "lazy={lazy}");
+            assert_eq!(pick(b""), QUOTE_COMMA, "lazy={lazy}");
+
+            // Wake legally or not at all: every trigger-finishing token
+            // refused, the rest stay.
+            let mut state = state_for(&opts);
+            let picked = sample_token_in(
+                &[],
+                b"a",
+                cands(&[(QUOTE_COMMA, 10.0), (B, 1.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap();
+            assert_eq!(picked, B, "lazy={lazy}");
+            // An active grammar is the matcher's business, not this check's.
+            state.deferred.as_mut().unwrap().active = true;
+            assert!(!state.wakes_deferred_illegally(
+                &opts,
+                b"a",
+                QUOTE_COMMA,
+                &MockModel
+            ));
         }
     }
 
