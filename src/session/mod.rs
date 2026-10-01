@@ -3066,6 +3066,21 @@ fn apply_template_sidecar<B: Backend>(
 ) -> Session<B> {
     match crate::sidecar::load_template_source(sidecar_path) {
         Ok(Some(source)) => {
+            // A sidecar that is an old copy of a bake holds back every
+            // fix to that bake since, silently: it wins over the bake.
+            if let Some(baked) = crate::baked::superseded(&source) {
+                tracing::warn!(
+                    event = "stale_template_sidecar",
+                    sidecar = ?sidecar_path,
+                    baked = baked.name,
+                    "chat template: sidecar at {sidecar_path:?} is a \
+                     byte-identical copy of a SUPERSEDED version of the \
+                     baked `{}` template; it overrides the current bake, \
+                     so every fix to the bake since is not applied. \
+                     Delete it to use the current bake.",
+                    baked.name,
+                );
+            }
             match session.set_template_source(source) {
                 // Success logs too (#99): rung 1 was the only silent
                 // rung, so a log could prove the stock path but never

@@ -287,7 +287,12 @@ reaches past BPE boundaries) survives it. Outside the template's reach
 
 A `<model>.template.jinja` sidecar next to the GGUF still overrides
 any of these — baked templates removed the *need* for sidecar
-deployment on recognized models, not the mechanism.
+deployment on recognized models, not the mechanism. A sidecar that is
+a byte-identical copy of an *old* bake holds back every fix since, so
+`src/baked.rs` keeps the SHA-256 of every superseded replacement
+(`SUPERSEDED`) and a match logs `stale_template_sidecar` at `WARN` on
+load. **When you change a replacement here, add the hash of the version
+it replaces to that list.**
 
 ## Framing no block carries: the thought tail
 

@@ -236,7 +236,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   always follow an analysis block). Pinned in
   `gptoss_cache_stable_round_trips_json_final`. **Deployments that
   copied the baked template to a `<model>.template.jinja` sidecar must
-  delete it** — it wins over the bake.
+  delete it** — it wins over the bake; a sidecar that is a known old
+  bake now logs a `WARN` at load (see *Added*).
 - **Back-to-back thoughts stay two thoughts.** A model that closes a
   thought and opens another (`…[/THINK][THINK]…`, live on Mistral Small
   4, 2026-10-01, ~1.6k tokens lost) was parsed into two
@@ -826,6 +827,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tip loses the pick, one when `tip_extension` declines to build a tip.
 
 ### Added
+
+- **`baked::superseded` and a `WARN` for a stale template sidecar.** A
+  `<model>.template.jinja` sidecar wins over the baked template, so a
+  copy of an old bake silently holds back every fix to it since — the
+  gpt-oss and Gemma 4 sidecars of the 2026-10-01 cohort run were the
+  2026-07-27 bakes, byte for byte. The registry now keeps the SHA-256 of
+  every superseded replacement, and loading a sidecar that matches one
+  logs `stale_template_sidecar` at `WARN`, naming the bake and saying to
+  delete the file.
 
 - **Constrained output is checked against its schema before it is
   answered** (`SessionError::SchemaViolation`). A finished
