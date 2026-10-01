@@ -875,7 +875,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   |---|---|---|
   | custom tools | 512 | 15 (Agora) |
   | top-level properties per tool | 512 | 5 |
-  | JSON values across the request's schemas | 131,072 | 882 |
+  | JSON values across the request's schemas, as written and with each `$ref` at its target's size | 131,072 | 882 (2,690) |
   | `$defs` + `definitions` per schema | 1,024 | 5 |
   | bytes of one `enum` member / `const` | 16 KiB | 24 |
   | member bytes across the request, each `$ref` at its target's size | 1 MiB | ~49 KB |
@@ -886,7 +886,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   time-zone `enum` behind a `$ref` four parameters name); the largest
   is 21× inside every limit. The `$ref`-expanded total is the work a
   per-parameter pipeline would do: a large `enum` behind a `$ref` two
-  thousand parameters name is two thousand copies of it. Every hostile
+  thousand parameters name is two thousand copies of it, and a `$ref`
+  fan-out with no members at all (a doubling chain of defs ending in
+  `{"type": "string"}`) is as many copies of its values. A member's
+  bytes are its compact JSON's, control characters at their escaped
+  length (`\u001f` is six). Every hostile
   shape the rechecks found is refused in milliseconds, while requests
   at the limits (512 parameters over shared defs, 512 tools, 20,000
   nested optional properties) compile in every dialect in under 110 ms.

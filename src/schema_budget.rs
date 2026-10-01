@@ -15,14 +15,15 @@
 //! * **tools** advertised, and **parameters** (top-level `properties`)
 //!   per tool: grammars and classifiers are per tool and per parameter.
 //! * **nodes**: every JSON value in every schema, summed over the
-//!   request.
+//!   request — counted as written, and again with each `$ref` counted
+//!   at its target's size, once per reference: the work a pipeline that
+//!   reads a schema per parameter, or per use, would do.
 //! * **`$defs`** (with `definitions`) per schema.
 //! * **member bytes**: an `enum` member's or `const` value's size as
-//!   compact JSON, alone and in total. The total counts a `$ref` at its
-//!   target's size, once per reference — the work a pipeline that reads
-//!   a schema per parameter, or per use, would do — so a large `enum`
-//!   behind a `$ref` that two thousand parameters name is two thousand
-//!   copies of it, not one.
+//!   compact JSON, alone and in total, the total also counting a `$ref`
+//!   at its target's size per reference — so a large `enum` behind a
+//!   `$ref` that two thousand parameters name is two thousand copies of
+//!   it, not one.
 //!
 //! The defaults ([`SchemaLimits::default`]) leave real schemas far
 //! inside every limit: see each field for what was measured.
@@ -53,8 +54,11 @@ pub struct SchemaLimits {
     /// Top-level `properties` of one tool's `input_schema`. Default
     /// 512; the most measured is 5.
     pub max_params: usize,
-    /// JSON values across all of a request's schemas. Default 2^17
-    /// (131,072); Agora's request has 406, the synthetic tool 882.
+    /// JSON values across all of a request's schemas, both as written
+    /// and with each `$ref` counted at its target's size per reference
+    /// (a reference cycle counts its target once). Default 2^17
+    /// (131,072); Agora's request has 406 (420 with its references
+    /// counted), the synthetic tool 882 (2,690).
     pub max_nodes: usize,
     /// `$defs` plus `definitions` entries of one schema. Default 1024;
     /// the most measured is 5 (`Soul`).
@@ -156,7 +160,10 @@ impl SchemaLimit {
         match self {
             Self::Tools => "custom tools",
             Self::Params => "top-level properties",
-            Self::Nodes => "JSON values across the request's schemas",
+            Self::Nodes => {
+                "JSON values across the request's schemas, each `$ref` \
+                 counted at its target's size"
+            }
             Self::Defs => "`$defs` and `definitions` entries",
             Self::MemberBytes => "bytes in one `enum` member or `const` value",
             Self::TotalMemberBytes => {
@@ -203,10 +210,10 @@ pub fn check_prompt(
 }
 
 /// Measure `tools`' input schemas and `output` (an `output_config`
-/// schema) against `limits`, before anything compiles them. One
-/// iterative walk, linear in the schemas and stopping as soon as a
-/// limit is past, so a hostile request costs no more to refuse than to
-/// read.
+/// schema) against `limits`, before anything compiles them. A few
+/// iterative walks, each linear in the schemas (the first stops as soon
+/// as the request is past [`SchemaLimits::max_nodes`], bounding the
+/// rest), so a hostile request costs no more to refuse than to read.
 pub fn check_schemas<'a>(
     tools: impl IntoIterator<Item = &'a Tool>,
     output: Option<&Value>,
@@ -233,7 +240,8 @@ pub fn check_schemas<'a>(
         .chain(output.map(|s| ("output_config.format.schema".into(), s)))
         .collect();
 
-    // Nodes first, across the request: it bounds every walk after it.
+    // Nodes as written first, across the request: it bounds every walk
+    // after it.
     let mut nodes = 0usize;
     for (_, schema) in &schemas {
         nodes = count_nodes(schema, nodes, limits.max_nodes);
@@ -263,7 +271,7 @@ pub fn check_schemas<'a>(
         }
     }
 
-    let mut total = 0usize;
+    let (mut bytes, mut expanded) = (0usize, 0usize);
     for (location, schema) in &schemas {
         let units = Units::new(schema);
         if units.defs() > limits.max_defs {
@@ -274,7 +282,7 @@ pub fn check_schemas<'a>(
                 limits.max_defs,
             ));
         }
-        let effective =
+        let measured =
             units.measure(limits.max_member_bytes).map_err(|bytes| {
                 over(
                     location.clone(),
@@ -283,13 +291,22 @@ pub fn check_schemas<'a>(
                     limits.max_member_bytes,
                 )
             })?;
-        total = total.saturating_add(effective);
-        if total > limits.max_total_member_bytes {
+        bytes = bytes.saturating_add(measured.effective(&measured.bytes));
+        if bytes > limits.max_total_member_bytes {
             return Err(over(
                 "request".into(),
                 SchemaLimit::TotalMemberBytes,
-                total,
+                bytes,
                 limits.max_total_member_bytes,
+            ));
+        }
+        expanded = expanded.saturating_add(measured.effective(&measured.nodes));
+        if expanded > limits.max_nodes {
+            return Err(over(
+                "request".into(),
+                SchemaLimit::Nodes,
+                expanded,
+                limits.max_nodes,
             ));
         }
     }
@@ -328,6 +345,40 @@ struct Units<'s> {
     by_ref: HashMap<String, usize>,
 }
 
+/// What [`Units::measure`] counts, per unit, and the order to combine
+/// the units in.
+struct Measured {
+    /// Member bytes in each unit's own subtree.
+    bytes: Vec<usize>,
+    /// JSON values in each unit's own subtree.
+    nodes: Vec<usize>,
+    /// The units each unit references, with multiplicity, ordered (so a
+    /// cycle is cut at the same edge every time).
+    refs: Vec<Vec<(usize, usize)>>,
+    /// The units the root reaches, in the order a depth-first walk of
+    /// the reference graph from the root finishes them: each after
+    /// every unit it references, except a reference back into a cycle
+    /// still open — which is how a cycle counts its target once.
+    order: Vec<usize>,
+}
+
+impl Measured {
+    /// The root's `local` total, each reference counted at its target's
+    /// total (saturating), a reference back into an open cycle at
+    /// nothing.
+    fn effective(&self, local: &[usize]) -> usize {
+        let mut total: Vec<Option<usize>> = vec![None; local.len()];
+        for &unit in &self.order {
+            let sum =
+                self.refs[unit].iter().fold(local[unit], |sum, &(t, n)| {
+                    sum.saturating_add(total[t].unwrap_or(0).saturating_mul(n))
+                });
+            total[unit] = Some(sum);
+        }
+        total[0].expect("the order ends at the root")
+    }
+}
+
 impl<'s> Units<'s> {
     fn new(root: &'s Value) -> Self {
         let mut units = vec![("#".to_string(), root)];
@@ -353,20 +404,33 @@ impl<'s> Units<'s> {
         self.units.len() - 1
     }
 
-    /// The root's member bytes, each `$ref` counted at its target's size
-    /// (saturating; a `$ref` cycle counts its target once). `Err(bytes)`
-    /// for a member past `max_member`.
-    fn measure(&self, max_member: usize) -> Result<usize, usize> {
-        // Each unit's own member bytes and the units it references, with
-        // multiplicity: one walk over each unit's subtree. Ordered, so a
-        // cycle is cut at the same edge every time.
-        let mut local = vec![0usize; self.units.len()];
-        let mut refs: Vec<BTreeMap<usize, usize>> =
-            vec![BTreeMap::new(); self.units.len()];
-        for unit in 0..self.units.len() {
-            let schema: &Value = self.units[unit].1;
-            let mut stack: Vec<&Value> = vec![schema];
+    /// The unit `node` references, if it is a schema with a `$ref` to
+    /// one.
+    fn target(&self, node: &Value) -> Option<usize> {
+        let r = node.get("$ref")?.as_str()?;
+        self.by_ref.get(r).copied()
+    }
+
+    /// Whether `key` of `node` in `unit` is the root's own `$defs` or
+    /// `definitions` table, whose entries are units of their own.
+    fn is_root_table(&self, unit: usize, node: &Value, key: &str) -> bool {
+        unit == 0
+            && std::ptr::eq(node, self.units[0].1)
+            && (key == "$defs" || key == "definitions")
+    }
+
+    /// Each unit's member bytes, values and references: one walk over
+    /// each unit's subtree. `Err(bytes)` for a member past
+    /// `max_member`.
+    fn measure(&self, max_member: usize) -> Result<Measured, usize> {
+        let n = self.units.len();
+        let mut bytes = vec![0usize; n];
+        let mut nodes = vec![0usize; n];
+        let mut refs: Vec<BTreeMap<usize, usize>> = vec![BTreeMap::new(); n];
+        for unit in 0..n {
+            let mut stack: Vec<&Value> = vec![self.units[unit].1];
             while let Some(node) = stack.pop() {
+                nodes[unit] += 1;
                 let Value::Object(map) = node else {
                     if let Value::Array(items) = node {
                         stack.extend(items);
@@ -380,92 +444,70 @@ impl<'s> Units<'s> {
                     .flatten()
                     .chain(map.get("const"));
                 for member in members {
-                    let bytes = json_len(member);
-                    if bytes > max_member {
-                        return Err(bytes);
+                    let len = json_len(member);
+                    if len > max_member {
+                        return Err(len);
                     }
-                    local[unit] = local[unit].saturating_add(bytes);
+                    bytes[unit] = bytes[unit].saturating_add(len);
                 }
-                let target = map
-                    .get("$ref")
-                    .and_then(Value::as_str)
-                    .and_then(|r| self.by_ref.get(r));
-                if let Some(&target) = target {
+                if let Some(target) = self.target(node) {
                     *refs[unit].entry(target).or_default() += 1;
                 }
-                let root_tables = |k: &str| {
-                    unit == 0
-                        && std::ptr::eq(node, schema)
-                        && (k == "$defs" || k == "definitions")
-                };
-                stack.extend(
-                    map.iter()
-                        .filter(|(k, _)| {
-                            !DATA_KEYS.contains(&k.as_str()) && !root_tables(k)
-                        })
-                        .map(|(_, v)| v),
-                );
+                for (key, value) in map {
+                    if self.is_root_table(unit, node, key) {
+                        continue;
+                    }
+                    match DATA_KEYS.contains(&key.as_str()) {
+                        // Data is values all the same, if not schemas.
+                        true => {
+                            nodes[unit] =
+                                count_nodes(value, nodes[unit], usize::MAX)
+                        }
+                        false => stack.push(value),
+                    }
+                }
             }
         }
-        Ok(effective(&local, &refs))
+        let refs: Vec<Vec<(usize, usize)>> =
+            refs.into_iter().map(|m| m.into_iter().collect()).collect();
+        let order = finish_order(&refs);
+        Ok(Measured {
+            bytes,
+            nodes,
+            refs,
+            order,
+        })
     }
 }
 
-/// The root's (unit 0's) effective bytes: `local[u]` plus, per
-/// reference, its target's effective bytes — an iterative post-order
-/// over the reference graph, memoized, a back edge (a cycle) adding
-/// nothing.
-fn effective(local: &[usize], refs: &[BTreeMap<usize, usize>]) -> usize {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Mark {
-        New,
-        Open,
-        Done(usize),
-    }
-    let edges: Vec<Vec<(usize, usize)>> = refs
-        .iter()
-        .map(|m| m.iter().map(|(&t, &n)| (t, n)).collect())
-        .collect();
-    let mut mark = vec![Mark::New; local.len()];
-    // `(unit, next edge, sum so far)`: the recursion's frames.
-    let mut frames: Vec<(usize, usize, usize)> = vec![(0, 0, local[0])];
-    mark[0] = Mark::Open;
-    while let Some(&(unit, edge, sum)) = frames.last() {
-        let top = frames.len() - 1;
-        let Some(&(target, count)) = edges[unit].get(edge) else {
-            mark[unit] = Mark::Done(sum);
-            frames.pop();
-            if let Some(caller) = frames.last_mut() {
-                let (c_unit, c_edge, c_sum) = *caller;
-                let n = edges[c_unit][c_edge - 1].1;
-                *caller = (
-                    c_unit,
-                    c_edge,
-                    c_sum.saturating_add(sum.saturating_mul(n)),
-                );
+/// The units the root reaches, in depth-first finish order
+/// ([`Measured::order`]).
+fn finish_order(refs: &[Vec<(usize, usize)>]) -> Vec<usize> {
+    let mut seen = vec![false; refs.len()];
+    let mut order = Vec::new();
+    // `(unit, next edge)`: the recursion's frames.
+    let mut frames = vec![(0usize, 0usize)];
+    seen[0] = true;
+    while let Some(top) = frames.last_mut() {
+        let (unit, edge) = *top;
+        match refs[unit].get(edge) {
+            Some(&(target, _)) => {
+                top.1 += 1;
+                if !seen[target] {
+                    seen[target] = true;
+                    frames.push((target, 0));
+                }
             }
-            continue;
-        };
-        frames[top].1 += 1;
-        match mark[target] {
-            Mark::Done(bytes) => {
-                frames[top].2 = sum.saturating_add(bytes.saturating_mul(count));
-            }
-            Mark::Open => {}
-            Mark::New => {
-                mark[target] = Mark::Open;
-                frames.push((target, 0, local[target]));
+            None => {
+                order.push(unit);
+                frames.pop();
             }
         }
     }
-    match mark[0] {
-        Mark::Done(bytes) => bytes,
-        _ => unreachable!("the walk finishes the root"),
-    }
+    order
 }
 
-/// `value`'s length as compact JSON, near enough: strings count their
-/// UTF-8 bytes plus quotes and one byte per escape, without
+/// `value`'s length as compact JSON, as `serde_json` writes it, without
 /// serializing.
 fn json_len(value: &Value) -> usize {
     let mut len = 0usize;
@@ -491,12 +533,18 @@ fn json_len(value: &Value) -> usize {
     len
 }
 
-/// A JSON string literal's length: quotes, and a byte per escape.
+/// A JSON string literal's length: quotes, and each escape at its
+/// written length — two bytes for `"`, `\` and the control characters
+/// with a short form (`\n`, `\t`, …), six for the rest (`\u001f`).
 fn string_len(s: &str) -> usize {
-    let escapes = s
+    let escapes: usize = s
         .bytes()
-        .filter(|&b| b == b'"' || b == b'\\' || b < 0x20)
-        .count();
+        .map(|b| match b {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 1,
+            0..=0x1f => 5,
+            _ => 0,
+        })
+        .sum();
     s.len() + 2 + escapes
 }
 
@@ -519,7 +567,13 @@ mod tests {
     }
 
     fn effective_bytes(schema: &Value) -> usize {
-        Units::new(schema).measure(usize::MAX).unwrap()
+        let measured = Units::new(schema).measure(usize::MAX).unwrap();
+        measured.effective(&measured.bytes)
+    }
+
+    fn effective_nodes(schema: &Value) -> usize {
+        let measured = Units::new(schema).measure(usize::MAX).unwrap();
+        measured.effective(&measured.nodes)
     }
 
     #[test]
@@ -531,12 +585,53 @@ mod tests {
             json!("a\"b\\c\nd"),
             json!([1, "x", [], {}]),
             json!({"k": {"l": [null, false]}, "m": "é"}),
+            // Every control character, `\u{7f}` (written raw) and the
+            // short escapes, in a value and in a key.
+            Value::String((0u8..0x20).chain([0x7f]).map(char::from).collect()),
+            json!({"\u{1}\t\u{8}\u{c}\r": "\u{1f}"}),
         ] {
             let compact = serde_json::to_string(&value).unwrap();
-            // Control characters escape to more than one byte; nothing
-            // here has one but `\n`, which is two either way.
             assert_eq!(json_len(&value), compact.len(), "{compact}");
         }
+    }
+
+    /// A `$ref` counts its target's values too, per reference, so a
+    /// fan-out of memberless leaves is measured; a cycle counts once.
+    #[test]
+    fn ref_counts_target_values_per_reference() {
+        let leaf = json!({"type": "string"});
+        // The root `{` and its `$ref` string; `E` two values more.
+        let once = json!({"$ref": "#/$defs/E", "$defs": {"E": leaf}});
+        assert_eq!(effective_nodes(&once), 2 + 2);
+        // Root, array, two `{"$ref"}`s of two values; `E` twice.
+        let twice = json!({
+            "anyOf": [{"$ref": "#/$defs/E"}, {"$ref": "#/$defs/E"}],
+            "$defs": {"E": leaf},
+        });
+        assert_eq!(effective_nodes(&twice), 6 + 2 * 2);
+        // Data counts as values: the root, `enum` (array, members) and
+        // `default` (object, array, number).
+        let data = json!({"enum": ["a", "b"], "default": {"x": [1]}});
+        assert_eq!(effective_nodes(&data), 1 + 3 + 3);
+        let cyclic = json!({"$ref": "#", "type": "string"});
+        assert_eq!(effective_nodes(&cyclic), 3);
+
+        // A doubling chain with no members at all is past the limit
+        // (saturated: 2^70 copies of its leaf).
+        let n = 70;
+        let mut defs: Map<String, Value> = (0..n)
+            .map(|i| {
+                let next = json!({"$ref": format!("#/$defs/D{}", i + 1)});
+                (format!("D{i}"), json!({"anyOf": [next.clone(), next]}))
+            })
+            .collect();
+        defs.insert(format!("D{n}"), json!({"type": "string"}));
+        let schema = json!({"$ref": "#/$defs/D0", "$defs": defs});
+        assert_eq!(effective_nodes(&schema), usize::MAX);
+        assert_eq!(
+            check(schema, &SchemaLimits::default()),
+            Err(SchemaLimit::Nodes)
+        );
     }
 
     #[test]
@@ -655,8 +750,9 @@ mod tests {
 
         // The output schema counts toward the request's totals.
         let output = json!({"enum": ["abcdef", "ghijkl", "mnopqr"]});
-        let err = check_schemas([&tool("t", ok)], Some(&output), &limits)
-            .unwrap_err();
+        let err =
+            check_schemas([&tool("t", ok.clone())], Some(&output), &limits)
+                .unwrap_err();
         assert_eq!(err.limit, SchemaLimit::TotalMemberBytes);
         assert_eq!(err.location, "request");
     }

@@ -315,6 +315,8 @@ fn hostile_requests_are_refused_up_front() {
             .collect()
     };
     let big = "x".repeat(100_000);
+    let mut memberless_chain = chain(60);
+    memberless_chain.insert("D60".into(), json!({"type": "string"}));
     let cases: Vec<(&str, Vec<Tool>, Option<Value>, SchemaLimit)> = vec![
         (
             "400,000 optional properties",
@@ -387,6 +389,16 @@ fn hostile_requests_are_refused_up_front() {
             }))],
             None,
             SchemaLimit::TotalMemberBytes,
+        ),
+        (
+            "a doubling $ref chain 60 deep, no members",
+            vec![tool(json!({
+                "type": "object",
+                "properties": {"x": {"$ref": "#/$defs/D0"}},
+                "$defs": memberless_chain,
+            }))],
+            None,
+            SchemaLimit::Nodes,
         ),
         (
             "5000 defs",
