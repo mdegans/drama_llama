@@ -1486,6 +1486,92 @@ fn depth_budget_fits_the_parsers() {
     assert_eq!(crate::schema_check::check_text(&schema, &text), Ok(()));
 }
 
+/// What the grammars admit past serde's reach is refused by every
+/// parser, never read back as a string. A recursive `$ref` nests as
+/// deep as the model takes it (a back-reference costs no depth), and a
+/// JSON number has no digit limit: Qwen XML read either as the raw
+/// text, a *string* — which a union admitting strings even passed the
+/// schema check as. At the boundary, the deepest value serde reads
+/// comes back whole.
+#[test]
+fn values_past_serde_are_refused_not_retyped() {
+    use crate::grammar_compile::MAX_NESTING;
+    let calls = |syntax: &CallSyntax, t: &Tool, text: &str| -> Vec<Value> {
+        parse_text(syntax, &[t], text, false, Leniency::Final)
+            .blocks
+            .into_iter()
+            .filter_map(|b| match b {
+                Block::ToolUse { call } => Some(call.input),
+                _ => None,
+            })
+            .collect()
+    };
+    let admits = |syntax: &CallSyntax, t: &Tool, text: &str| {
+        let src = grammar_source(syntax, &[t], &lazy()).unwrap();
+        let mut state =
+            GrammarState::new(Arc::new(Grammar::parse(&src).unwrap()));
+        state.advance_bytes(text.as_bytes()).is_ok()
+    };
+    let nested = |n: usize| (0..n).fold(json!([]), |inner, _| json!([inner]));
+
+    // A tree of arrays, alone and in a union with a string.
+    let node = json!({"type": "array", "items": {"$ref": "#/$defs/Node"}});
+    for root in [
+        json!({"$ref": "#/$defs/Node"}),
+        json!({"anyOf": [{"type": "string"}, {"$ref": "#/$defs/Node"}]}),
+    ] {
+        let schema = json!({
+            "type": "object",
+            "properties": {"root": root},
+            "required": ["root"],
+            "$defs": {"Node": node},
+        });
+        let t = tool(schema);
+        check_schemas([&t], None, &SchemaLimits::default()).expect("in limits");
+        let qwen = CallSyntax::qwen_xml();
+        // `nested(n)` is n + 1 levels; the parameter's value is read on
+        // its own, so its last readable depth is serde's.
+        let deepest = json!({"root": nested(MAX_NESTING - 1)});
+        let text = crate::dialect::render_reference(&qwen, &[("t", &deepest)])
+            .unwrap();
+        assert!(admits(&qwen, &t, &text));
+        assert_eq!(calls(&qwen, &t, &text), [deepest], "{root}");
+
+        let past = json!({"root": nested(MAX_NESTING)});
+        for syntax in syntaxes() {
+            let text =
+                crate::dialect::render_reference(&syntax, &[("t", &past)])
+                    .unwrap();
+            assert!(admits(&syntax, &t, &text), "{:?}", syntax.family);
+            assert_eq!(
+                calls(&syntax, &t, &text),
+                Vec::<Value>::new(),
+                "{:?} {root}",
+                syntax.family
+            );
+        }
+    }
+
+    // A number past `f64`, in every parameter shape that admits one.
+    let huge = "9".repeat(401);
+    for x in [
+        json!({"type": "number"}),
+        json!({"type": ["number", "string"]}),
+        json!({"anyOf": [{"type": "number"}, {"type": "string"}]}),
+        json!({}),
+    ] {
+        let t = tool(json!({
+            "type": "object",
+            "properties": {"x": x},
+            "required": ["x"],
+        }));
+        let qwen = CallSyntax::qwen_xml();
+        let text = qwen_call(&[("x", &huge)]);
+        assert!(admits(&qwen, &t, &text), "{x}");
+        assert_eq!(calls(&qwen, &t, &text), Vec::<Value>::new(), "{x}");
+    }
+}
+
 /// A `required` naming one property 100,000 times, or a `type` listing
 /// `"object"` as often, is inside every limit (one property, one type),
 /// and must cost as little to judge: the check rebuilt and walked the

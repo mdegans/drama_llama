@@ -1475,7 +1475,9 @@ impl<'a> Parser<'a> {
             let raw = self.rest()[..val_end].to_string();
             self.pos += val_end + a.value_suffix.len();
 
-            let value = self.coerce_value(&name, &key, &raw);
+            let Some(value) = self.coerce_value(&name, &key, &raw) else {
+                return CallOutcome::Malformed;
+            };
             args.insert(key, value);
 
             if !a.separator.is_empty() {
@@ -1494,47 +1496,55 @@ impl<'a> Parser<'a> {
     /// mapper parity), spelled as [`tagged_values`] says the grammar
     /// generates it: a string param (or an unknown one) stays raw; a
     /// nullable string too, bar `null`; a finite set of strings is
-    /// matched exactly against its members' spellings; anything else
-    /// is parsed as JSON after pythonism normalization with bounded
-    /// brace healing, falling back to a raw string.
+    /// matched exactly against its members' spellings, and a value
+    /// outside it (a model writing unconstrained) is read as JSON or
+    /// kept raw, a string beside the set's own; anything else is
+    /// parsed as JSON after pythonism normalization with bounded brace
+    /// healing.
+    ///
+    /// `None` when a JSON-spelled value reads as no JSON at all — the
+    /// call is malformed. Not the raw text as a string: that retyped a
+    /// value the grammar admitted but serde refuses (nested past
+    /// `MAX_NESTING` through a recursive `$ref`, a number past `f64`)
+    /// into a string, which a union admitting strings even passed the
+    /// schema check as.
     ///
     /// Parsing a raw string as JSON would type a `5` or `true` the
     /// model wrote as text, and unquote a `"quoted"` one, which then
     /// re-renders without its quotes.
     ///
     /// [`tagged_values`]: super::emit::tagged_values
-    fn coerce_value(&self, tool: &str, param: &str, raw: &str) -> Value {
+    fn coerce_value(
+        &self,
+        tool: &str,
+        param: &str,
+        raw: &str,
+    ) -> Option<Value> {
         let trimmed = raw.trim();
+        let json = || {
+            serde_json::from_str::<Value>(trimmed)
+                .or_else(|_| serde_json::from_str(&heal_json(trimmed)))
+                .ok()
+        };
         match self.tagged_value(tool, param) {
             None | Some(TaggedValue::Raw { nullable: false }) => {
-                return Value::String(raw.to_string());
+                Some(Value::String(raw.to_string()))
             }
-            Some(TaggedValue::Raw { nullable: true }) => {
-                return match trimmed {
-                    "null" => Value::Null,
-                    _ => Value::String(raw.to_string()),
-                };
-            }
+            Some(TaggedValue::Raw { nullable: true }) => Some(match trimmed {
+                "null" => Value::Null,
+                _ => Value::String(raw.to_string()),
+            }),
             Some(TaggedValue::Choice(choice)) => {
                 // Exact under the grammar; trimmed, or quoted (read as
-                // JSON below), only from a model writing unconstrained.
+                // JSON), only from a model writing unconstrained.
                 let found = [raw, trimmed].into_iter().find_map(|text| {
                     choice.iter().find(|m| m.spelling == text).map(|m| &m.value)
                 });
-                if let Some(value) = found {
-                    return value.clone();
-                }
+                let unlisted = || json().unwrap_or_else(|| raw.into());
+                Some(found.cloned().unwrap_or_else(unlisted))
             }
-            Some(TaggedValue::Json) => {}
+            Some(TaggedValue::Json) => json(),
         }
-        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-            return v;
-        }
-        let healed = heal_json(trimmed);
-        if let Ok(v) = serde_json::from_str::<Value>(&healed) {
-            return v;
-        }
-        Value::String(raw.to_string())
     }
 
     /// How `param` of `tool` is spelled ([`tagged_values`]); `None`
@@ -1666,7 +1676,9 @@ impl<'a> Parser<'a> {
                 }
                 break;
             };
-            members.insert(key.to_owned(), self.coerce_value(name, key, raw));
+            // A member that closed unreadable makes the call malformed,
+            // as it will be once it closes: nothing to show for it.
+            members.insert(key.to_owned(), self.coerce_value(name, key, raw)?);
             rest = after.strip_prefix(a.separator.as_str()).unwrap_or(after);
             // Progress guard: degenerate markers can match nothing.
             if rest.len() == before {
@@ -3047,6 +3059,79 @@ mod tests {
             let calls = calls_of(&parsed.blocks);
             assert_eq!(calls[0].1, &json!({"mode": want}), "{raw:?}");
         }
+    }
+
+    /// What a Qwen XML parameter reads leniently, and what it refuses.
+    /// A JSON-spelled parameter that reads as no JSON at all makes the
+    /// call malformed — degraded to text (which the session then
+    /// rejects as a real `<tool_call>` in free text, a resample) —
+    /// never the raw text as a string: that retyped a value the grammar
+    /// admitted but serde refuses, and a union admitting strings even
+    /// passed the schema check as.
+    #[test]
+    fn qwen_xml_unreadable_json_is_malformed_not_a_string() {
+        let syntax = CallSyntax::qwen_xml();
+        let read = |mode: Value, raw: &str| {
+            let tool = mode_tool(mode, None);
+            let parsed = parse_text(
+                &syntax,
+                &[&tool],
+                &qwen_mode_call(raw),
+                false,
+                Leniency::Final,
+            );
+            calls_of(&parsed.blocks).first().map(|(_, input)| {
+                let input: &Value = input;
+                input["mode"].clone()
+            })
+        };
+        let huge = "9".repeat(401);
+        let number = json!({"type": "number"});
+        let number_or_string = json!({"type": ["number", "string"]});
+        let any_of = json!({"anyOf": [{"type": "number"}, {"type": "string"}]});
+
+        // Lenient, and kept: a raw string reads as written, JSON-looking
+        // or not; a nullable one takes a bare `null`; an unlisted member
+        // of a set stays a string; pythonisms and unclosed brackets of a
+        // JSON value heal.
+        let string = json!({"type": "string"});
+        let nullable = json!({"type": ["string", "null"]});
+        let set = json!({"enum": ["lite", "full"]});
+        let object = json!({"type": "object"});
+        for (mode, raw, want) in [
+            (&string, "{\"a\": 1", json!("{\"a\": 1")),
+            (&string, huge.as_str(), json!(huge)),
+            (&nullable, "null", Value::Null),
+            (&nullable, "nil", json!("nil")),
+            (&set, "other", json!("other")),
+            (&json!({"type": "boolean"}), "True", json!(true)),
+            (&object, "{'a': None}", json!({"a": null})),
+            (&object, "{\"a\": [1", json!({"a": [1]})),
+            (&number, "1e308", json!(1e308)),
+        ] {
+            assert_eq!(read(mode.clone(), raw), Some(want), "{mode} {raw:?}");
+        }
+
+        // Refused: no JSON reads out of it, so no call — whether the
+        // schema admits a string or not.
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        for mode in [&number, &number_or_string, &any_of, &json!({})] {
+            for raw in [huge.as_str(), "1e999", "-1e999", deep.as_str()] {
+                assert_eq!(read(mode.clone(), raw), None, "{mode} {raw:?}");
+            }
+        }
+        assert_eq!(read(number.clone(), "five"), None);
+        assert_eq!(read(number_or_string.clone(), "five"), None);
+
+        // A call in flight whose closed member is unreadable has nothing
+        // to show either: no open call, under any leniency.
+        let tool = mode_tool(number.clone(), None);
+        let cut = qwen_mode_call(&huge);
+        let cut = &cut[..cut.find("</function>").unwrap()];
+        let (parsed, open) =
+            parse_text_open(&syntax, &[&tool], cut, false, Leniency::Clipped);
+        assert!(calls_of(&parsed.blocks).is_empty(), "{parsed:#?}");
+        assert!(open.is_none(), "{open:#?}");
     }
 
     /// The edges of the raw spelling. A mixed set spells its strings raw

@@ -226,6 +226,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`dialect::utf8_tests`), and through stop sequences and emission
   provenance.
 
+- **A Qwen XML parameter whose JSON does not read is a malformed call,
+  not a string.** A JSON-spelled parameter (a number, an object, a
+  union, `{}`) whose text serde_json refused came back as the raw text,
+  a *string* — silently retyped. The grammar admits two such values: a
+  tree nested past serde's 127 levels through a recursive `$ref` (a
+  back-reference costs no depth), and a number past `f64` (a 310-digit
+  integer, `1e999`). Every other dialect refused those calls; Qwen
+  returned `{"x": "999…"}`, which a union admitting strings even passed
+  the schema check as. Now the call is malformed like theirs: it
+  degrades to text, which the session rejects as a real `<tool_call>`
+  in free text (or, under a forced call, as a grammar violation) — a
+  resample. Kept lenient, and pinned: raw string parameters (any text,
+  JSON-looking or not), a nullable string's bare `null`, an unlisted
+  member of a string set, pythonisms (`True`, `None`, single quotes)
+  and unclosed brackets in a JSON value. One behavior change for a
+  model writing unconstrained: a JSON-spelled union that admits
+  strings (`["number", "string"]`) no longer takes an unquoted word as
+  a string; the grammar always quotes it.
+
 - **Deeply nested output can no longer abort the process.** The Gemma
   4 dict-value reader and the readers of a call cut short (every
   dialect's streaming and clipped parse) recursed once per bracket, so
