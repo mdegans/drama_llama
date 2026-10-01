@@ -18,7 +18,7 @@
 //! this struct instead).
 
 mod analyzer;
-mod emit;
+pub(crate) mod emit;
 mod parse;
 mod partial;
 mod provenance;

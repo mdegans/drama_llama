@@ -38,6 +38,8 @@
 //! hard-errors on content — worst case a call degrades to text.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use serde_json::Value;
 
@@ -45,7 +47,7 @@ use crate::chat_template::is_tool_name;
 use crate::prompt::{Block, ToolUse};
 use crate::Tool;
 
-use super::emit::{tagged_value, TaggedValue};
+use super::emit::{tagged_values, TaggedValue};
 use super::partial::{
     marker_holdback, read_partial, unclosed_json, Flavor, OpenStrings,
 };
@@ -435,6 +437,7 @@ pub(crate) fn parse_text_open(
         status: ParseStatus::Complete,
         leniency,
         open: None,
+        spellings: RefCell::default(),
     };
     p.run(pre_opened_reasoning);
     let parsed = Parsed {
@@ -456,6 +459,10 @@ struct Parser<'a> {
     /// The call the input ended inside ([`OpenCall`]), read just before
     /// [`Self::incomplete`] handles it.
     open: Option<OpenCall>,
+    /// Each tool's parameter spellings ([`tagged_values`]) by tool
+    /// index, classified once for the whole parse the first time a call
+    /// to the tool needs one — not once per parameter read.
+    spellings: RefCell<HashMap<usize, HashMap<String, TaggedValue>>>,
 }
 
 impl<'a> Parser<'a> {
@@ -1408,7 +1415,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Schema-guided coercion of a raw tagged value (llama.cpp
-    /// mapper parity), spelled as [`tagged_value`] says the grammar
+    /// mapper parity), spelled as [`tagged_values`] says the grammar
     /// generates it: a string param (or an unknown one) stays raw; a
     /// nullable string too, bar `null`; a finite set of strings is
     /// matched exactly against its members' spellings; anything else
@@ -1419,7 +1426,7 @@ impl<'a> Parser<'a> {
     /// model wrote as text, and unquote a `"quoted"` one, which then
     /// re-renders without its quotes.
     ///
-    /// [`tagged_value`]: super::emit::tagged_value
+    /// [`tagged_values`]: super::emit::tagged_values
     fn coerce_value(&self, tool: &str, param: &str, raw: &str) -> Value {
         let trimmed = raw.trim();
         match self.tagged_value(tool, param) {
@@ -1454,15 +1461,22 @@ impl<'a> Parser<'a> {
         Value::String(raw.to_string())
     }
 
-    /// How `param` of `tool` is spelled ([`tagged_value`]); `None`
+    /// How `param` of `tool` is spelled ([`tagged_values`]); `None`
     /// when the schema does not declare it, which reads as a string.
     ///
-    /// [`tagged_value`]: super::emit::tagged_value
+    /// [`tagged_values`]: super::emit::tagged_values
     fn tagged_value(&self, tool: &str, param: &str) -> Option<TaggedValue> {
-        let schema =
-            &self.tools.iter().find(|t| t.name.as_ref() == tool)?.schema;
-        let param = schema.get("properties")?.get(param)?;
-        Some(tagged_value(self.syntax, schema, param))
+        let index = self.tools.iter().position(|t| t.name.as_ref() == tool)?;
+        self.spellings
+            .borrow_mut()
+            .entry(index)
+            .or_insert_with(|| {
+                tagged_values(self.syntax, &self.tools[index].schema)
+                    .into_iter()
+                    .collect()
+            })
+            .get(param)
+            .cloned()
     }
 
     /// Whether `param` of `tool` takes its raw text as a string, so the

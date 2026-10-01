@@ -257,6 +257,17 @@ fn ref_name(schema: &Value) -> Option<&str> {
     schema.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
 }
 
+/// The `(name, schema)` of the def in `table` that `schema`'s `$ref`
+/// names, if it names one — [`Defs::target`] without building a
+/// [`Defs`], for a walk that only follows references.
+pub(crate) fn def_target<'s>(
+    table: Option<&'s Map<String, Value>>,
+    schema: &Value,
+) -> Option<(&'s str, &'s Value)> {
+    let (name, def) = table?.get_key_value(ref_name(schema)?)?;
+    Some((name.as_str(), def))
+}
+
 /// Each node's strongly connected component (Tarjan), iteratively: a
 /// client's `$defs` can chain thousands deep, and a recursive walk
 /// would put that depth on the stack.
@@ -325,8 +336,10 @@ fn components(edges: &[Vec<usize>]) -> Vec<usize> {
 /// first meets them: a chain of defs each naming the next would
 /// otherwise nest the compiler as deep as the chain is long.
 ///
-/// One compiler can write several schemas that share a `$defs` table:
-/// [`Self::add`] each, then [`Self::finish`].
+/// One compiler can write several schemas that share a `$defs` table
+/// ([`Self::add`] each, then [`Self::finish`]): a tagged dialect's
+/// parameters, which all resolve against their tool's defs, write
+/// each def once for the tool rather than once per parameter.
 ///
 /// Every rule is written into the caller's `out`, the whole grammar
 /// so far, and the compiler stops once that passes

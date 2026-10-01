@@ -205,6 +205,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Qwen's tagged dialect writes each `$def` once per tool, and
+  classifies a tool's parameters once.** Each JSON-valued parameter
+  had its own compiler, so a tool whose P parameters all `$ref` the
+  head of a D-long chain of defs wrote all D defs P times: 800 × 800
+  was 143 MB of grammar and 5 million rules. One compiler per tool
+  (def rules `tool_<i>__def…`) writes each once. Alongside:
+  - Every raw (string) parameter shares one until-rule, `val_raw`; a
+    ~1.5 KB copy per parameter made a string-heavy tool's grammar
+    mostly duplicates (6000 string parameters passed the 8 MiB limit).
+  - The raw-vs-JSON spelling classifier resolves `$ref`s straight from
+    the `$defs` table instead of building `Defs` (a strongly-connected-
+    components pass over every def) per parameter, and the parser
+    classifies a tool once per parse instead of once per parameter it
+    reads. A tool's parameters share one step budget (2^16), in
+    declaration order, for the emitter and parser alike, so a schema
+    that makes every parameter walk a thousand-member union costs at
+    most that: a parameter past it is spelled as JSON (always correct,
+    merely not the raw spelling) by both sides. A finite set of more
+    than 1024 members is JSON too.
+
 - **An all-optional object compiles to a linear grammar.** Both the
   JSON and the dict (Gemma 4) encodings wrote, for each property, the
   whole tail of later properties: quadratic, so 4000 optional

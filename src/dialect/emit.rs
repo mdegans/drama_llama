@@ -38,14 +38,15 @@
 //! arguments through `| dictsort`, so that family stays explicitly
 //! alphabetical everywhere.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use serde_json::Value;
 
 use crate::grammar_compile::{
-    dict_encode_value, emit_dict_value_rules, emit_until_rules,
+    def_target, dict_encode_value, emit_dict_value_rules, emit_until_rules,
     escape_for_gbnf_string, json_grammar_canonical, schema_to_dict_gbnf,
-    schema_to_gbnf, Compiler, Defs, SchemaError, FIELD_SEP, KV_SEP,
+    schema_to_gbnf, Compiler, SchemaError, FIELD_SEP, KV_SEP,
 };
 use crate::Tool;
 
@@ -161,6 +162,8 @@ pub fn grammar_source(
     }
     let mut src = String::with_capacity(2048);
     let mut until_counter = 0usize;
+    // Whether the shared raw-value rule is written yet.
+    let mut raw_written = false;
 
     // Root.
     let has_reasoning = syntax.reasoning.mode != ReasoningMode::None
@@ -280,6 +283,7 @@ pub fn grammar_source(
                 (&per_open, &per_close),
                 &mut src,
                 &mut until_counter,
+                &mut raw_written,
             ),
             Family::TagWithJson => emit_tag_json_call(
                 syntax,
@@ -496,7 +500,21 @@ pub(crate) enum TaggedValue {
     Json,
 }
 
-/// Classify `param`, a property of `tool_schema`, for `syntax`.
+/// Most [`Admits::collect`] steps (schemas visited, `enum` members
+/// read) classifying one tool's parameters, all of them together. A
+/// parameter met once the budget is spent is [`TaggedValue::Json`],
+/// which is always a correct spelling, merely not the raw one. Real
+/// tools take a few steps a parameter; without the bound a client's
+/// schema could make every parameter walk the same thousand-member
+/// union, P × D work from a P + D request (the hostile-schema recheck).
+const TAGGED_BUDGET: usize = 1 << 16;
+
+/// Most distinct members a finite set may have and still be spelled
+/// raw ([`TaggedValue::Choice`]); a larger one is JSON.
+const TAGGED_MAX_MEMBERS: usize = 1024;
+
+/// Every parameter of `tool_schema`, in `properties` order, with how
+/// it is spelled for `syntax` ([`TaggedValue`]).
 ///
 /// `$ref`s resolve against the tool schema's `$defs`; `anyOf` and
 /// `oneOf` are read as unions (their members are disjoint in every
@@ -508,17 +526,57 @@ pub(crate) enum TaggedValue {
 /// strings raw and the rest as JSON. Leading or trailing whitespace is
 /// kept: the template renders it verbatim and the parser reads the
 /// value byte-exact, so such a member round-trips as written.
+///
+/// The emitter and the parser both classify a whole tool through
+/// here, in this order, so the shared [`TAGGED_BUDGET`] runs out at
+/// the same parameter for both.
+pub(crate) fn tagged_values(
+    syntax: &CallSyntax,
+    tool_schema: &Value,
+) -> Vec<(String, TaggedValue)> {
+    let defs = tool_schema.get("$defs").and_then(Value::as_object);
+    let mut budget = TAGGED_BUDGET;
+    tool_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, param)| {
+            (name.clone(), classify(syntax, defs, param, &mut budget))
+        })
+        .collect()
+}
+
+/// One parameter of `tool_schema` as [`tagged_values`] spells it, on a
+/// budget of its own.
+#[cfg(test)]
 pub(crate) fn tagged_value(
     syntax: &CallSyntax,
     tool_schema: &Value,
     param: &Value,
 ) -> TaggedValue {
-    let defs = Defs::new(tool_schema.get("$defs").and_then(Value::as_object));
+    let defs = tool_schema.get("$defs").and_then(Value::as_object);
+    classify(syntax, defs, param, &mut TAGGED_BUDGET.clone())
+}
+
+/// How [`tagged_values`] spells `param`, its `$ref`s resolving in
+/// `defs`, spending `budget`.
+fn classify(
+    syntax: &CallSyntax,
+    defs: Option<&serde_json::Map<String, Value>>,
+    param: &Value,
+    budget: &mut usize,
+) -> TaggedValue {
     let mut admits = Admits {
-        visits: vec![Visit::Unseen; defs.len()],
-        ..Admits::default()
+        defs,
+        budget,
+        any_string: false,
+        any_other: false,
+        members: Vec::new(),
+        spellings: HashSet::new(),
+        visits: HashMap::new(),
     };
-    admits.collect(param, &defs, 0);
+    admits.collect(param, 0);
     let Admits {
         any_string,
         any_other,
@@ -552,10 +610,8 @@ pub(crate) fn tagged_value(
         })
         .collect();
     let close = syntax.arguments.value_suffix.as_str();
-    let distinct = choice
-        .iter()
-        .enumerate()
-        .all(|(i, (s, _))| choice[..i].iter().all(|(t, _)| t != s));
+    let mut seen = HashSet::new();
+    let distinct = choice.iter().all(|(s, _)| seen.insert(s.as_str()));
     // The parser ends a value at the first close tag, so the close
     // after a member must be the first one: none inside the member, and
     // none that starts in its tail (`a\n</parameter>` + the close).
@@ -570,8 +626,11 @@ pub(crate) fn tagged_value(
 }
 
 /// What a schema admits, as far as a tagged value's spelling cares.
-#[derive(Default)]
-struct Admits {
+struct Admits<'s, 'b> {
+    /// The tool's `$defs`, which `$ref`s resolve in.
+    defs: Option<&'s serde_json::Map<String, Value>>,
+    /// Steps left of the tool's [`TAGGED_BUDGET`].
+    budget: &'b mut usize,
     /// Any string (`"type": "string"`).
     any_string: bool,
     /// Unboundedly many non-string values: a non-string type, or an
@@ -580,41 +639,54 @@ struct Admits {
     /// Finitely many values (`enum`, `const`, `"type": "null"`), in
     /// declaration order, without duplicates.
     members: Vec<Value>,
-    /// Each def's progress, by id: a def collected once adds nothing
+    /// `members`' JSON spellings, which dedupe them in O(1).
+    spellings: HashSet<String>,
+    /// Each def's progress, by name: a def collected once adds nothing
     /// the second time (without this, `anyOf`s of `$ref`s fan out
     /// exponentially), and one met again while still open is a cycle.
-    visits: Vec<Visit>,
+    visits: HashMap<&'s str, Visit>,
 }
 
 /// How far [`Admits::collect`] has got through a def.
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Visit {
-    #[default]
-    Unseen,
     Open,
     Done,
 }
 
-impl Admits {
-    fn collect(&mut self, schema: &Value, defs: &Defs<'_>, depth: usize) {
+impl<'s> Admits<'s, '_> {
+    /// Spend one step; out of steps, the answer is JSON.
+    fn step(&mut self) -> bool {
+        if !self.any_other {
+            match *self.budget {
+                0 => self.any_other = true,
+                _ => *self.budget -= 1,
+            }
+        }
+        !self.any_other
+    }
+
+    fn collect(&mut self, schema: &'s Value, depth: usize) {
         // Once anything non-string goes, the answer is JSON whatever
         // else turns up. Too deep (a chain of thousands of aliases)
         // gives up as JSON too, rather than nest that far.
-        if self.any_other || depth > 32 {
+        if depth > 32 {
             self.any_other = true;
+        }
+        if !self.step() {
             return;
         }
         // The `$ref` shape the grammar compiler resolves; anything else
         // falls through to the schema's other keywords, as it does there.
-        if let Some(id) = defs.target(schema) {
-            match self.visits[id] {
+        if let Some((name, def)) = def_target(self.defs, schema) {
+            match self.visits.get(name) {
                 // A `$ref` cycle is unconstrained (see `Defs`): JSON.
-                Visit::Open => self.any_other = true,
-                Visit::Done => {}
-                Visit::Unseen => {
-                    self.visits[id] = Visit::Open;
-                    self.collect(defs.schema(id), defs, depth + 1);
-                    self.visits[id] = Visit::Done;
+                Some(Visit::Open) => self.any_other = true,
+                Some(Visit::Done) => {}
+                None => {
+                    self.visits.insert(name, Visit::Open);
+                    self.collect(def, depth + 1);
+                    self.visits.insert(name, Visit::Done);
                 }
             }
             return;
@@ -626,9 +698,9 @@ impl Admits {
         if let Some(variants) = union {
             match variants.is_empty() {
                 true => self.any_other = true,
-                false => variants
-                    .iter()
-                    .for_each(|v| self.collect(v, defs, depth + 1)),
+                false => {
+                    variants.iter().for_each(|v| self.collect(v, depth + 1))
+                }
             }
             return;
         }
@@ -658,15 +730,24 @@ impl Admits {
     }
 
     fn member(&mut self, value: &Value) {
-        if !self.members.contains(value) {
+        if !self.step() {
+            return;
+        }
+        if self.spellings.insert(value.to_string()) {
             self.members.push(value.clone());
+        }
+        if self.members.len() > TAGGED_MAX_MEMBERS {
+            self.any_other = true;
         }
     }
 }
 
+/// The until-rule every raw tagged value shares ([`emit_tagged_call`]).
+const RAW_VALUE_RULE: &str = "val_raw";
+
 /// TAG_WITH_TAGGED: literal name; args in schema declaration order
 /// in place (optionals wrapped in `( ... )?`); each value spelled as
-/// [`tagged_value`] decides — a string raw-until-close, a finite set
+/// [`tagged_values`] decides — a string raw-until-close, a finite set
 /// of strings raw by alternation, anything else schema-compiled JSON —
 /// then the literal close.
 fn emit_tagged_call(
@@ -676,6 +757,7 @@ fn emit_tagged_call(
     (per_open, per_close): (&str, &str),
     src: &mut String,
     until_counter: &mut usize,
+    raw_written: &mut bool,
 ) -> Result<(), DialectError> {
     let name_lit = escape_for_gbnf_string(tool.name.as_ref());
     let fn_pre = escape_for_gbnf_string(&syntax.function.name_prefix);
@@ -688,25 +770,41 @@ fn emit_tagged_call(
     let sep = escape_for_gbnf_string(&syntax.arguments.separator);
 
     let all = schema_args(tool);
+    let values = tagged_values(syntax, &tool.schema);
+    // One compiler for the tool's JSON parameters: a parameter's schema
+    // has no `$defs` of its own, so its `$ref`s resolve in the tool's,
+    // and each def they reach is written once for the tool, not once
+    // per parameter naming it.
+    let prefix = format!("tool_{i}");
+    let defs = tool.schema.get("$defs").and_then(Value::as_object);
+    let mut compiler = Compiler::new(defs, &prefix, None);
 
     let mut body = String::new();
-    for (key, schema, required) in &all {
+    for ((key, schema, required), (_, value)) in all.iter().zip(values) {
+        if compiler.halted(src) {
+            break;
+        }
         *until_counter += 1;
         let key_lit = escape_for_gbnf_string(key);
         let arg_rule = format!("arg_{i}_{c}", c = *until_counter);
         let typed_rule = format!("typed_{i}_{c}", c = *until_counter);
-        let value = match tagged_value(syntax, &tool.schema, schema) {
+        let value = match value {
             TaggedValue::Raw { .. } => {
                 // Raw value: the until-rule consumes value bytes AND
                 // the closing delimiter. A nullable string's `null` is
-                // one such value.
-                let until_rule = format!("val_{i}_{c}", c = *until_counter);
-                emit_until_rules(
-                    &until_rule,
-                    &syntax.arguments.value_suffix,
-                    src,
-                );
-                until_rule
+                // one such value. One rule serves every raw parameter
+                // of every tool — it depends only on the delimiter —
+                // written the first time one needs it: a copy per
+                // parameter (~1.5 KB of KMP states each) made a large
+                // tool's grammar mostly duplicates.
+                if !std::mem::replace(raw_written, true) {
+                    emit_until_rules(
+                        RAW_VALUE_RULE,
+                        &syntax.arguments.value_suffix,
+                        src,
+                    );
+                }
+                RAW_VALUE_RULE.to_string()
             }
             TaggedValue::Choice(choice) => {
                 let alts = choice
@@ -718,12 +816,7 @@ fn emit_tagged_call(
                 format!(r#"{typed_rule} "{val_suf_lit}""#)
             }
             TaggedValue::Json => {
-                // The tool's `$defs`: a parameter's schema has none of
-                // its own, so a `$ref` in it resolves only from here.
-                let defs = tool.schema.get("$defs").and_then(Value::as_object);
-                let mut compiler = Compiler::new(defs, &typed_rule, None);
                 compiler.add(schema, &typed_rule, src);
-                compiler.finish(src).map_err(schema_err(tool))?;
                 format!(r#"{typed_rule} "{val_suf_lit}""#)
             }
         };
@@ -744,6 +837,7 @@ fn emit_tagged_call(
             let _ = write!(body, " {arg_rule}?");
         }
     }
+    compiler.finish(src).map_err(schema_err(tool))?;
 
     let _ = writeln!(
         src,

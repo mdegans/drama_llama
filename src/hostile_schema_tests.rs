@@ -10,12 +10,16 @@ use std::{sync::Arc, time::Instant};
 
 use serde_json::{json, Map, Value};
 
-use crate::dialect::{grammar_source, Anchor, DialectError, EmitOptions};
+use crate::dialect::emit::{tagged_values, TaggedValue};
+use crate::dialect::{
+    grammar_source, parse_text, Anchor, DialectError, EmitOptions, Leniency,
+};
 use crate::grammar_compile::{SchemaError, JSON_GRAMMAR, MAX_GRAMMAR_BYTES};
 use crate::{
     grammar_for_tool_choice, output_config::grammar_for_output_config,
-    schema_to_gbnf, CallSyntax, Grammar, GrammarState, OutputConfigError,
-    OutputConfigOptions, Tool, ToolChoice, ToolChoiceError, ToolChoiceOptions,
+    schema_to_gbnf, Block, CallSyntax, Grammar, GrammarState,
+    OutputConfigError, OutputConfigOptions, Tool, ToolChoice, ToolChoiceError,
+    ToolChoiceOptions,
 };
 use misanthropic::prompt::output::OutputConfig;
 
@@ -69,6 +73,129 @@ fn on_small_stack<T: Send + 'static>(
         .unwrap()
         .join()
         .unwrap()
+}
+
+/// Qwen's tagged dialect compiles each parameter's schema on its own,
+/// and every parameter `$ref`ing the head of a D-long chain of defs used
+/// to rewrite all D for each of the P parameters: 800 × 800 was 143 MB
+/// of grammar and 5 million rules. One compiler a tool writes each def
+/// once.
+#[test]
+fn qwen_writes_each_def_once_per_tool() {
+    let (p, d) = (800, 800);
+    let props: Map<String, Value> = (0..p)
+        .map(|i| (format!("p{i}"), json!({"$ref": "#/$defs/D0"})))
+        .collect();
+    let mut defs: Map<String, Value> = (0..d)
+        .map(|i| {
+            let next = format!("#/$defs/D{}", i + 1);
+            (
+                format!("D{i}"),
+                json!({"type": "object", "properties": {"n": {"$ref": next}}}),
+            )
+        })
+        .collect();
+    defs.insert(format!("D{d}"), json!({"type": "integer"}));
+    let schema = json!({"type": "object", "properties": props, "$defs": defs});
+    let src =
+        grammar_source(&CallSyntax::qwen_xml(), &[&tool(schema)], &lazy())
+            .unwrap();
+    assert!(src.len() < 1 << 20, "{} bytes", src.len());
+    for i in 0..=d {
+        let head = format!("tool_0__def{i}_D{i} ::=");
+        assert_eq!(src.matches(&head).count(), 1, "{head}");
+    }
+    Grammar::parse(&src).unwrap();
+}
+
+/// Thousands of parameters beside thousands of (unreferenced) defs:
+/// the defs table is read once per tool, not once per parameter.
+#[test]
+fn qwen_many_params_and_defs_compile_and_parse_quickly() {
+    let n = 6000;
+    let props: Map<String, Value> = (0..n)
+        .map(|i| (format!("p{i}"), json!({"type": "string"})))
+        .collect();
+    let defs: Map<String, Value> =
+        (0..n).map(|i| (format!("D{i}"), json!({}))).collect();
+    let tool =
+        tool(json!({"type": "object", "properties": props, "$defs": defs}));
+    let start = Instant::now();
+    let src =
+        grammar_source(&CallSyntax::qwen_xml(), &[&tool], &lazy()).unwrap();
+    Grammar::parse(&src).unwrap();
+
+    let params: String = (0..n)
+        .map(|i| format!("<parameter=p{i}>\nv{i}\n</parameter>\n"))
+        .collect();
+    let text =
+        format!("<tool_call>\n<function=t>\n{params}</function>\n</tool_call>");
+    let parsed = parse_text(
+        &CallSyntax::qwen_xml(),
+        &[&tool],
+        &text,
+        false,
+        Leniency::Final,
+    );
+    let input = parsed
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::ToolUse { call } => Some(&call.input),
+            _ => None,
+        })
+        .expect("a call");
+    assert_eq!(input["p5999"], json!("v5999"));
+    assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
+}
+
+/// A tool's parameters are classified on one shared step budget, in
+/// declaration order, by the emitter and the parser alike — so when a
+/// schema makes every parameter walk a thousand-member union, the
+/// budget runs out at the same parameter for both: the early ones are
+/// spelled raw, the late ones JSON, and each reads back as written.
+#[test]
+fn tagged_budget_agrees_between_grammar_and_parser() {
+    let members: Vec<String> = (0..1000).map(|i| format!("m{i}")).collect();
+    let props: Map<String, Value> = (0..100)
+        .map(|i| (format!("p{i}"), json!({"$ref": "#/$defs/U"})))
+        .collect();
+    let schema = json!({
+        "type": "object",
+        "properties": props,
+        "required": ["p0", "p99"],
+        "$defs": {"U": {"enum": members}},
+    });
+    let syntax = CallSyntax::qwen_xml();
+    let values = tagged_values(&syntax, &schema);
+    assert!(matches!(values[0].1, TaggedValue::Choice(_)));
+    assert!(matches!(values[99].1, TaggedValue::Json));
+
+    let tool = tool(schema);
+    let src = grammar_source(&syntax, &[&tool], &lazy()).unwrap();
+    let call = |p0: &str, p99: &str| {
+        format!(
+            "<tool_call>\n<function=t>\n\
+             <parameter=p0>\n{p0}\n</parameter>\n\
+             <parameter=p99>\n{p99}\n</parameter>\n\
+             </function>\n</tool_call>"
+        )
+    };
+    let raw_then_json = call("m7", r#""m7""#);
+    assert!(accepts(&src, &raw_then_json));
+    assert!(!accepts(&src, &call(r#""m7""#, r#""m7""#)));
+    assert!(!accepts(&src, &call("m7", "m7")));
+    let parsed =
+        parse_text(&syntax, &[&tool], &raw_then_json, false, Leniency::Final);
+    let input = parsed
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::ToolUse { call } => Some(&call.input),
+            _ => None,
+        })
+        .expect("a call");
+    assert_eq!(input, &json!({"p0": "m7", "p99": "m7"}));
 }
 
 /// A schema too complex for a grammar is a schema error on every path
