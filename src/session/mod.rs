@@ -105,11 +105,10 @@
 //! cache miss — a live slot demonstrably covers the new prompt's first
 //! cached region (or shares a long prefix) yet nothing was reused — panics
 //! with a full cache-state dump instead of silently re-prefilling. Genuine
-//! first turns and post-eviction misses don't trip it. It also panics when
-//! a slot's own ids, adopted for a prefix the new render reproduces (see
-//! [`PrefixCacheConfig::adopt_emitted_tokens`]), do not read as that
-//! render — a recording bug, which unarmed falls back to tokenizing the
-//! prefix afresh.
+//! first turns and post-eviction misses don't trip it. It also checks that
+//! a prompt read in a slot's own split (see
+//! [`PrefixCacheConfig::adopt_emitted_tokens`]) reads as its plain
+//! tokenization does, which holds by construction, and panics if not.
 //!
 //! Every reuse decision is logged through `tracing`, under two targets:
 //! `drama_llama::session` for everything the session decides and
@@ -117,12 +116,14 @@
 //! at its cap. One `event = "cache_reuse"` per call — `hit` with its
 //! `source` (`tip`, `breakpoint`, `lookback`, `hash`) and token counts,
 //! at `DEBUG` since a hit is the normal case, or `miss` with its
-//! `reason`, always at `WARN` — and an `event = "cache_degrade"` or
-//! `"cache_evict"` for each thing that cost reuse, with its `reason`
-//! (`tip_diverged`, `segmentation_drift` or `history_changed` with the
-//! first diverging entry and the decoded text on both sides,
-//! `emission_not_byte_stable`, `breakpoint_dropped`, `hash_drift` (with
-//! the same context), `adoption_refused`, `restore_failed`,
+//! `reason`, always at `WARN` (`cold` when nothing was offered) — an
+//! `event = "cache_adopt"` at `DEBUG` when a prompt is read in a slot's
+//! own split, and an `event = "cache_degrade"` or `"cache_evict"` for
+//! each thing that cost reuse, with its `reason` (`tip_diverged`,
+//! `segmentation_drift` or `history_changed` with the first entry where
+//! the ids part and the first where the text does, and the decoded text
+//! around each, `emission_not_byte_stable`, `breakpoint_dropped`,
+//! `hash_drift` (with the same context), `restore_failed`,
 //! `snapshot_evicted`, `ttl`, `capacity`, `slot_capacity`, …). Those
 //! costing more than a few hundred tokens are `WARN`, the rest `INFO`; a
 //! dropped snapshot is `INFO` with its size, because it costs reuse only
@@ -700,17 +701,19 @@ pub struct PrefixCacheConfig {
     /// this, least-recently-used slots are evicted until it fits.
     /// `None` = the engine's `n_ctx`.
     pub capacity_cells: Option<usize>,
-    /// Reuse a cached prefix's own token ids for the part of a new
-    /// render that is byte for byte what the slot holds, tokenizing only
-    /// the rest. Default `true`.
+    /// Read a new prompt in a cached slot's own token ids as far as the
+    /// two read alike — the same bytes, every special and image the same
+    /// token in the same place — and in the tokenizer's from there on.
+    /// Default `true`.
     ///
     /// A model does not always emit the tokenizer's split of its own
     /// text — a grammar can force a piece, sampling can pick a rarer
     /// one — and re-tokenizing the re-rendered turn then disagrees with
     /// the cached ids although the bytes are identical, so the next
-    /// call re-prefills from the last anchor before the disagreement.
+    /// call re-prefilled from the last anchor before the disagreement.
     /// With adoption the next call reads the turn in the model's own
-    /// split, which is what the KV holds. The cost is that a warm call's
+    /// split, which is what the KV holds, up to the first byte the
+    /// client actually changed. The cost is that a warm call's
     /// tokens can differ from a cold (cache-off) session's for the same
     /// prompt, so tests comparing warm against cold output turn it off.
     /// See [`Session::count_tokens`] for what it means for counting.
@@ -802,12 +805,6 @@ struct PrefixSlot {
     /// model's own output, so a divergence past it is a round-trip
     /// failure rather than a changed history ([`tip_miss`]).
     turn_start: usize,
-    /// Render prefixes [`Self::prev_entries`] is known to spell, so the
-    /// next call can reuse these ids for them instead of re-tokenizing
-    /// (see [`Spelled`]). Ascending by length: the last call's prompt,
-    /// then — when the turn re-renders byte for byte — the prompt plus
-    /// the generation up to the KV head.
-    spelled: Vec<Spelled>,
     /// Last touch — read (selected for reuse) or write
     /// (`record_cache_hit`). Anthropic refresh-on-read semantics: TTL
     /// expiry (enforced by the bounds commit) measures from here, and
@@ -828,7 +825,6 @@ impl PrefixSlot {
             breakpoints: Vec::new(),
             tip: None,
             turn_start: 0,
-            spelled: Vec::new(),
             last_used: now,
             created: now,
         }
@@ -1725,51 +1721,6 @@ fn log_tip_not_recorded(
     );
 }
 
-/// What a finished call's slot records as [`Spelled`] (see there):
-///
-/// - the prompt, whose `entries[..turn_start]` are its own tokenization,
-///   unless its render holds a marker; and
-/// - the prompt plus the generation up to the KV head (`tip`), when the
-///   caller found that span re-rendering byte for byte (`held`, the
-///   prompt render followed by the generated text the KV holds) *and*
-///   the generated ids spell exactly that text, piece by piece. The
-///   second half is the proof: the KV holds those ids, so the next call
-///   reusing them reads what the model read.
-///
-/// Pure but for the tokenizer's pieces.
-fn spelled_records<M: Model>(
-    model: &M,
-    rendered_prompt: &str,
-    sentinel: Option<&str>,
-    entries: &[CacheEntry],
-    turn_start: usize,
-    tip: Option<EntryPos>,
-    held: Option<&str>,
-) -> Vec<Spelled> {
-    let marked = |text: &str| sentinel.is_some_and(|s| text.contains(s));
-    let prompt = &entries[..turn_start.min(entries.len())];
-    if rendered_prompt.is_empty()
-        || marked(rendered_prompt)
-        || prompt.len() != turn_start
-        || prompt.iter().any(CacheEntry::is_media)
-    {
-        return Vec::new();
-    }
-    let mut out = vec![Spelled::of(rendered_prompt, turn_start)];
-    let generated = |tip: EntryPos, held: &str| {
-        let text = held.strip_prefix(rendered_prompt)?;
-        let ids = entries.get(turn_start..tip.entry)?;
-        (!text.is_empty()
-            && !marked(held)
-            && entries_spelling(model, ids) == text.as_bytes())
-        .then(|| Spelled::of(held, tip.entry))
-    };
-    if let Some(spelled) = tip.zip(held).and_then(|(t, h)| generated(t, h)) {
-        out.push(spelled);
-    }
-    out
-}
-
 /// Where the re-render of a turn first departs from what was generated:
 /// the byte offset into `raw` (the emission) at which `extended` (the
 /// canonical render of the prompt plus the parsed turn) stops matching
@@ -2325,88 +2276,164 @@ fn hash_partial_text(text: &str) -> [u8; 32] {
     hash_segments(&[text], &[])
 }
 
-/// A render prefix a slot's entries are known to spell:
-/// `prev_entries[..entries]` reads as exactly the first `bytes` bytes of
-/// a render, and those bytes hash to `hash`. Recorded with the slot so
-/// the next call can take the ids for that prefix as they are and
-/// tokenize only what follows — "trust the emission" (see
+/// How far a slot's own ids can stand in for the start of a call's
+/// plain tokenization — "trust the emission" (see
 /// [`PrefixCacheConfig::adopt_emitted_tokens`]).
 ///
-/// Only renders without markers qualify: a content literal or an image
-/// puts the per-call sentinel in the render, so its bytes never repeat.
-/// The proof that the entries spell the bytes is per kind: a prompt's
-/// entries are its own tokenization (or an adoption already proven
-/// here), and a generation's are checked piece by piece against the
-/// text the model wrote before it is recorded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Spelled {
-    bytes: usize,
-    entries: usize,
-    hash: [u8; 32],
+/// The first `cached` entries of the slot's list read exactly as the
+/// first `plain` of the call's: the same bytes, and every pinned entry
+/// (a special, an image) the same entry in the same place. Both end on
+/// a token boundary, so the slot's ids up to there followed by the
+/// plain ones after are the same render with no split that neither
+/// list already has. Built by [`spelling_walk`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Splice {
+    /// Entries of the slot's list taken.
+    cached: usize,
+    /// Entries of the plain list they stand in for.
+    plain: usize,
+    /// Stretches where the two lists hold the same entries, as
+    /// `(plain start, cached start, len)`, ascending. A plain boundary
+    /// in one has a place among the slot's ids; one inside a stretch
+    /// between them, which the two spell in different tokens, has none.
+    runs: Vec<(usize, usize, usize)>,
+    /// Whether every byte of the slot's list reads as the plain list
+    /// does — its whole list, perhaps ending inside a plain token that
+    /// runs on past it, so that [`Self::cached`] may stop short.
+    read_all: bool,
 }
 
-impl Spelled {
-    /// The record for `prefix`, spelled by `entries` entries.
-    fn of(prefix: &str, entries: usize) -> Self {
-        Self {
-            bytes: prefix.len(),
-            entries,
-            hash: hash_partial_text(prefix),
+impl Splice {
+    /// Whether the slot's ids differ from the plain ones anywhere they
+    /// stand in — whether splicing changes anything at all.
+    fn respells(&self) -> bool {
+        self.runs.iter().map(|&(_, _, len)| len).sum::<usize>() < self.plain
+    }
+
+    /// Where `at`, a boundary in the plain list, falls in the spliced
+    /// one, if anywhere.
+    fn place(&self, at: usize) -> Option<usize> {
+        match at.checked_sub(self.plain) {
+            Some(past) => Some(self.cached + past),
+            None => self
+                .runs
+                .iter()
+                .find(|&&(start, _, len)| start <= at && at <= start + len)
+                .map(|&(start, cached, _)| cached + (at - start)),
         }
     }
 }
 
-/// The slot whose [`Spelled`] prefix `text` reproduces, and that prefix:
-/// the longest one whose bytes `text` starts with, ties to the most
-/// recently used slot. `clean` bounds the search — `text`'s bytes from
-/// there on hold a marker, which no recorded prefix can. Pure.
-fn pick_spelled<'s>(
-    slots: &'s [PrefixSlot],
-    text: &str,
-    clean: usize,
-) -> Option<(&'s PrefixSlot, Spelled)> {
-    let mut candidates: Vec<(&PrefixSlot, Spelled)> = slots
-        .iter()
-        .flat_map(|slot| slot.spelled.iter().map(move |s| (slot, *s)))
-        .filter(|(slot, s)| {
-            s.bytes > 0
-                && s.bytes <= clean
-                && s.entries <= slot.prev_entries.len()
-                && !slot.prev_entries[..s.entries]
-                    .iter()
-                    .any(CacheEntry::is_media)
-        })
-        .collect();
-    candidates.sort_by(|(a, x), (b, y)| {
-        (y.bytes, b.last_used).cmp(&(x.bytes, a.last_used))
-    });
-    candidates.into_iter().find(|(_, s)| {
-        text.get(..s.bytes)
-            .is_some_and(|prefix| hash_partial_text(prefix) == s.hash)
-    })
+/// [`Splice`] a slot's `cached` entries into a call's `plain` ones: walk
+/// the two lists together, through the stretches where they hold the
+/// same entries and across those where they spell the same bytes in
+/// different tokens, as far as they read alike.
+///
+/// A respelled stretch may hold only ordinary tokens with non-empty
+/// pieces. Not media, and nothing `pinned` (the vocabulary's specials):
+/// equal bytes are not equal meaning where the tokenizer reads a
+/// special — a model can spell `<tool_call>` in plain pieces, or emit a
+/// duplicate special the tokenizer never produces — and an empty piece
+/// spells nothing to compare. The walk stops at the last boundary the
+/// two share before the first byte they disagree on, or before the
+/// first stretch it cannot close that way.
+///
+/// The walk is the whole proof: there is no record to go stale and no
+/// render bytes to trust, only the two token lists read through the
+/// same tokenizer. Pure but for `piece` (a token's bytes). An equal
+/// stretch costs one id comparison per entry; only respelled ones are
+/// read.
+fn spelling_walk(
+    cached: &[CacheEntry],
+    plain: &[CacheEntry],
+    piece: &mut dyn FnMut(Token, &mut Vec<u8>),
+    pinned: &dyn Fn(Token) -> bool,
+) -> Splice {
+    let mut splice = Splice::default();
+    let mut buf = Vec::new();
+    // Append an entry's bytes to a respelled stretch's side, or `false`
+    // when it may not stand in one.
+    let mut spell = |entry: &CacheEntry, out: &mut Vec<u8>| match *entry {
+        CacheEntry::Token(token) if !pinned(token) => {
+            piece(token, &mut buf);
+            out.extend_from_slice(&buf);
+            !buf.is_empty()
+        }
+        _ => false,
+    };
+    let (mut i, mut j) = (0, 0);
+    loop {
+        let same = cached[i..]
+            .iter()
+            .zip(&plain[j..])
+            .take_while(|(a, b)| a == b)
+            .count();
+        if same > 0 {
+            splice.runs.push((j, i, same));
+            (i, j) = (i + same, j + same);
+        }
+        (splice.cached, splice.plain) = (i, j);
+        splice.read_all = i == cached.len();
+        // A stretch spelled differently: take a token from whichever
+        // side has spelled fewer bytes, until both end on the same one.
+        // `a` and `b` hold what each side has spelled past the other.
+        let (mut ci, mut pj) = (i, j);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let closed = loop {
+            let (list, at, out) = match a.len() <= b.len() {
+                true => (cached, &mut ci, &mut a),
+                false => (plain, &mut pj, &mut b),
+            };
+            let Some(entry) = list.get(*at) else {
+                // The slot's list ran out on bytes the plain one spells.
+                splice.read_all = a.is_empty() && ci == cached.len();
+                break false;
+            };
+            if !spell(entry, out) {
+                break false;
+            }
+            *at += 1;
+            let n = a.len().min(b.len());
+            if a[..n] != b[..n] {
+                break false;
+            }
+            a.drain(..n);
+            b.drain(..n);
+            if a.is_empty() && b.is_empty() {
+                break true;
+            }
+        };
+        if !closed {
+            return splice;
+        }
+        (i, j) = (ci, pj);
+    }
 }
 
-/// A cached prefix the new call reads in the slot's own ids:
-/// `entries` spell `prefix`, the start of the call's render. Borrowed
-/// from that render; built by `Session::adoption_for`.
+/// A call's plain tokenization read in a slot's own ids as far as
+/// [`spelling_walk`] reaches; built by `Session::adopt`.
 #[derive(Debug)]
-struct Adoption<'r> {
-    prefix: &'r str,
+struct Adoption {
+    /// The slot's ids, then the plain ones: what the call prefills.
     entries: Vec<CacheEntry>,
-    /// The slot's breakpoints inside `entries`, by render hash — where a
-    /// partial render shorter than `prefix` ends, when its own
-    /// tokenization no longer lines up with `entries`.
+    splice: Splice,
+    /// The slot's breakpoints among the ids taken, by render hash — the
+    /// place of a partial render that ends inside a respelled stretch,
+    /// where an earlier call marked it.
     breakpoints: Vec<([u8; 32], usize)>,
 }
 
-impl Adoption<'_> {
-    /// Where the partial render hashing to `hash` ends in `entries`, if
-    /// the slot marked it.
-    fn breakpoint(&self, hash: &[u8; 32]) -> Option<usize> {
-        self.breakpoints
-            .iter()
-            .find(|(h, _)| h == hash)
-            .map(|&(_, entry)| entry)
+impl Adoption {
+    /// Where a partial render whose plain tokenization is the first
+    /// `at` plain entries, and which hashes to `hash`, ends in
+    /// [`Self::entries`].
+    fn place(&self, at: usize, hash: &[u8; 32]) -> Option<usize> {
+        self.splice.place(at).or_else(|| {
+            self.breakpoints
+                .iter()
+                .find(|(h, _)| h == hash)
+                .map(|&(_, entry)| entry)
+        })
     }
 }
 
@@ -4772,9 +4799,8 @@ impl<B: Backend> Session<B> {
             .template
             .render_counted(prompt, &self.render_opts_for(&media))?;
         self.check_no_special_injection(prompt, &neutralized)?;
-        let adoption = self.adoption_for(&rendered, media.sentinel.as_deref());
-        let (entries, _, _, _) =
-            self.tokenize_adopting(&rendered, &media, adoption.as_ref(), true)?;
+        let (entries, _, _) = self.tokenize_split(&rendered, &media)?;
+        let entries = self.adopt(&entries).map_or(entries, |a| a.entries);
         Ok(entries_cell_len(&entries))
     }
 
@@ -5323,29 +5349,10 @@ impl<B: Backend> Session<B> {
         text: &str,
         media: &MediaContext,
     ) -> Result<(Vec<CacheEntry>, Vec<[u8; 32]>, [u8; 32]), SessionError> {
-        self.tokenize_split_from(text, media, true)
-    }
-
-    /// [`Self::tokenize_split`] of `text`, which starts the render when
-    /// `leading` and continues it otherwise: a continuation is
-    /// tokenized like a later run, with no automatic BOS anywhere — a
-    /// BOS mid-stream would stop the next call's walk dead.
-    #[allow(clippy::type_complexity)]
-    fn tokenize_split_from(
-        &self,
-        text: &str,
-        media: &MediaContext,
-        leading: bool,
-    ) -> Result<(Vec<CacheEntry>, Vec<[u8; 32]>, [u8; 32]), SessionError> {
         use crate::backend::Vision as _;
         let bos = self.template.bos_token();
-        let model = &self.engine.model;
-        let first_run = |text: &str| match leading {
-            true => tokenize_render(model, text, bos),
-            false => model.tokenize_special(text, false, true),
-        };
         let plain = |text: &str| {
-            let tokens = first_run(text);
+            let tokens = tokenize_render(&self.engine.model, text, bos);
             (
                 entries_from_tokens(tokens),
                 Vec::new(),
@@ -5362,11 +5369,7 @@ impl<B: Backend> Session<B> {
                      the template corrupted a sentinel"
                 ))
             })?;
-        // Once per render: a continuation's split is a second look at
-        // the same markers.
-        if leading
-            && crate::chat_template::has_transformed_marker(&split, sentinel)
-        {
+        if crate::chat_template::has_transformed_marker(&split, sentinel) {
             // Not an error: nothing special reaches the model, only the
             // marker's text. But that text holds the per-call sentinel,
             // so the prefix around it misses the cache on every call.
@@ -5412,15 +5415,19 @@ impl<B: Backend> Session<B> {
         for (i, (segments, literals)) in runs.iter().enumerate() {
             let tokens = match literals.is_empty() {
                 true if segments[0].is_empty() => Vec::new(),
-                true if i == 0 => first_run(segments[0]),
-                true => model.tokenize_special(segments[0], false, true),
+                true if i == 0 => {
+                    tokenize_render(&self.engine.model, segments[0], bos)
+                }
+                true => {
+                    self.engine.model.tokenize_special(segments[0], false, true)
+                }
                 false => self
                     .literals
                     .tokenize_run(
-                        model,
+                        &self.engine.model,
                         segments,
                         literals,
-                        i == 0 && leading,
+                        i == 0,
                         bos,
                     )
                     .map_err(unknown_literal)?,
@@ -5449,125 +5456,83 @@ impl<B: Backend> Session<B> {
         Ok((entries, ids, hash))
     }
 
-    /// The cached prefix `text` (a render under `sentinel`) can be read
-    /// in a slot's own ids — see [`pick_spelled`] — or `None` with the
-    /// prefix cache off or [`PrefixCacheConfig::adopt_emitted_tokens`]
-    /// unset.
-    fn adoption_for<'r>(
-        &self,
-        text: &'r str,
-        sentinel: Option<&str>,
-    ) -> Option<Adoption<'r>> {
+    /// The call's plain tokenization `plain` read in a slot's own ids as
+    /// far as [`spelling_walk`] reaches, from the slot it reaches
+    /// furthest into (ties to the most recently used); `None` when no
+    /// slot respells any of it, with the prefix cache off, or with
+    /// [`PrefixCacheConfig::adopt_emitted_tokens`] unset.
+    ///
+    /// Under `DRAMA_LLAMA_CACHE_TRIPWIRE` the result is checked against
+    /// `plain` — the same bytes, the same pinned entries in the same
+    /// order — which the walk guarantees by construction; a failure is
+    /// a bug in it.
+    fn adopt(&self, plain: &[CacheEntry]) -> Option<Adoption> {
         let cache = self.prefix_cache.as_ref().filter(|c| c.adopt)?;
-        // Bytes before the first marker; none at all without a sentinel.
-        let clean = sentinel
-            .and_then(|sentinel| text.find(sentinel))
-            .unwrap_or(text.len());
-        let (slot, spelled) = pick_spelled(&cache.slots, text, clean)?;
+        let model = &self.engine.model;
+        let pinned = |token: Token| self.literals.specials.contains(&token);
+        let mut piece = |token: Token, buf: &mut Vec<u8>| {
+            model.token_to_piece_ref(token, buf)
+        };
+        let (slot, splice) = cache
+            .slots
+            .iter()
+            .map(|slot| {
+                let splice = spelling_walk(
+                    &slot.prev_entries,
+                    plain,
+                    &mut piece,
+                    &pinned,
+                );
+                (slot, splice)
+            })
+            .filter(|(_, splice)| splice.respells())
+            .max_by_key(|(slot, splice)| (splice.plain, slot.last_used))?;
+        let entries =
+            [&slot.prev_entries[..splice.cached], &plain[splice.plain..]]
+                .concat();
+        if cache_tripwire_armed() {
+            let pinned_entries = |list: &[CacheEntry]| -> Vec<CacheEntry> {
+                list.iter()
+                    .filter(|entry| match entry {
+                        CacheEntry::Token(token) => pinned(*token),
+                        CacheEntry::Media { .. } => true,
+                    })
+                    .copied()
+                    .collect()
+            };
+            assert!(
+                entries_spelling(model, &entries)
+                    == entries_spelling(model, plain)
+                    && pinned_entries(&entries) == pinned_entries(plain),
+                "prefix-cache tripwire: {} of slot {}'s ids, standing in \
+                 for {} plain entries, do not read as the render",
+                splice.cached,
+                slot.seq_id,
+                splice.plain,
+            );
+        }
+        tracing::debug!(
+            target: "drama_llama::session",
+            event = "cache_adopt",
+            seq_id = slot.seq_id,
+            cached_entries = splice.cached,
+            plain_entries = splice.plain,
+            "prefix cache: reading the prompt's first {} entries in slot \
+             {}'s own split ({} entries)",
+            splice.plain,
+            slot.seq_id,
+            splice.cached,
+        );
         Some(Adoption {
-            prefix: &text[..spelled.bytes],
-            entries: slot.prev_entries[..spelled.entries].to_vec(),
+            entries,
             breakpoints: slot
                 .breakpoints
                 .iter()
-                .filter(|bp| bp.at.entry <= spelled.entries)
+                .filter(|bp| bp.at.entry <= splice.cached)
                 .filter_map(|bp| bp.hash.map(|hash| (hash, bp.at.entry)))
                 .collect(),
+            splice,
         })
-    }
-
-    /// [`Self::tokenize_split`], reading `adoption`'s prefix in the
-    /// cached ids when `text` starts with it and tokenizing only the
-    /// rest. Falls back to the plain tokenization unless the two lists
-    /// read alike: the same bytes, piece for piece, and the same
-    /// reserved ids in the same order. The first catches a tokenizer
-    /// that reads a fragment differently from the same text mid-render
-    /// (an SPM vocabulary's dummy leading space); the second, a span
-    /// the model *spelled* in plain tokens that the tokenizer reads as
-    /// a special — equal bytes, different meaning. The hash and image
-    /// ids are always the plain tokenization's: they describe `text`.
-    ///
-    /// `verify: false` skips both checks, for a partial render whose
-    /// full render passed them: the partial is then honored only as a
-    /// prefix of that verified list, so it reads alike too. The flag
-    /// returned says whether the prefix was adopted.
-    #[allow(clippy::type_complexity)]
-    fn tokenize_adopting(
-        &self,
-        text: &str,
-        media: &MediaContext,
-        adoption: Option<&Adoption<'_>>,
-        verify: bool,
-    ) -> Result<(Vec<CacheEntry>, Vec<[u8; 32]>, [u8; 32], bool), SessionError>
-    {
-        let (entries, ids, hash) = self.tokenize_split(text, media)?;
-        let plain = (entries, ids, hash, false);
-        let Some(adoption) = adoption.filter(|a| text.starts_with(a.prefix))
-        else {
-            return Ok(plain);
-        };
-        let rest = &text[adoption.prefix.len()..];
-        let tail = match rest.is_empty() {
-            true => Vec::new(),
-            false => match self.tokenize_split_from(rest, media, false) {
-                Ok((tail, _, _)) => tail,
-                // The plain tokenization of the same text succeeded, so
-                // this cannot fail on its own; if it does, don't adopt.
-                Err(_) => return Ok(plain),
-            },
-        };
-        let adopted = [adoption.entries.as_slice(), &tail].concat();
-        if !verify {
-            return Ok((adopted, plain.1, plain.2, true));
-        }
-        let model = &self.engine.model;
-        let reserved = |entries: &[CacheEntry]| -> Vec<Token> {
-            entries
-                .iter()
-                .filter_map(|entry| match entry {
-                    CacheEntry::Token(t)
-                        if self.literals.neutralizer.contains(*t) =>
-                    {
-                        Some(*t)
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        let refused = if entries_spelling(model, &adopted)
-            != entries_spelling(model, &plain.0)
-        {
-            Some("spelling")
-        } else if reserved(&adopted) != reserved(&plain.0) {
-            Some("reserved_ids")
-        } else {
-            None
-        };
-        let Some(check) = refused else {
-            return Ok((adopted, plain.1, plain.2, true));
-        };
-        // The prefix bytes matched a recorded hash, so the ids recorded
-        // with it should read as those bytes do. When they do not, the
-        // recording is wrong — the tripwire's business.
-        if cache_tripwire_armed() {
-            panic!(
-                "prefix-cache tripwire: adopted ids for a {}-byte cached \
-                 prefix ({} entries) do not read as the render ({check})",
-                adoption.prefix.len(),
-                adoption.entries.len(),
-            );
-        }
-        tracing::warn!(
-            target: "drama_llama::session",
-            event = "cache_degrade",
-            reason = "adoption_refused",
-            check,
-            prefix_bytes = adoption.prefix.len(),
-            prefix_entries = adoption.entries.len(),
-            "prefix cache: the cached ids for this prompt's prefix do not \
-             read as its render ({check}); tokenizing it afresh",
-        );
-        Ok(plain)
     }
 
     /// The `cache_degrade` event for a `cache_control` breakpoint that
@@ -5642,18 +5607,15 @@ impl<B: Backend> Session<B> {
             // sort+dedup, which would lose the mapping (and knows
             // nothing of media).
             //
-            // The part of the render a slot already holds is read in
-            // the slot's own ids ("trust the emission") and only the
-            // rest tokenized; the partials follow the full render.
-            let adoption =
-                self.adoption_for(&rendered.text, media.sentinel.as_deref());
-            let (full_entries, full_ids, _, adopted) = self.tokenize_adopting(
-                &rendered.text,
-                &media,
-                adoption.as_ref(),
-                true,
-            )?;
-            let adoption = adoption.filter(|_| adopted);
+            // The part of the render a slot already holds in its own
+            // split is read in those ids ("trust the emission"); each
+            // partial is checked against the plain tokenization, then
+            // placed in the spliced list.
+            let (plain_entries, full_ids, _) =
+                self.tokenize_split(&rendered.text, &media)?;
+            let adoption = self.adopt(&plain_entries);
+            let full_entries: &[CacheEntry] =
+                adoption.as_ref().map_or(&plain_entries, |a| &a.entries);
             let mut rows: Vec<(
                 EntryPos,
                 [u8; 32],
@@ -5661,12 +5623,8 @@ impl<B: Backend> Session<B> {
                 CacheTtl,
             )> = Vec::with_capacity(rendered.partials.len());
             for (bp_id, ttl, partial) in &rendered.partials {
-                let (p_entries, p_ids, p_hash, _) = self.tokenize_adopting(
-                    partial,
-                    &media,
-                    adoption.as_ref(),
-                    false,
-                )?;
+                let (p_entries, p_ids, p_hash) =
+                    self.tokenize_split(partial, &media)?;
                 // Same fail-open contract as
                 // `chat_template::tokenize_with_breakpoints`,
                 // generalized: drop the breakpoint silently unless
@@ -5674,34 +5632,38 @@ impl<B: Backend> Session<B> {
                 // render AND its images are the full render's first
                 // k (media entries compare by id + span, so a
                 // reordered or swapped image also fails the check).
-                //
-                // A partial shorter than an adopted prefix is tokenized
-                // afresh, and stops being a prefix when the model's own
-                // split sits before its end. The slot knows where it
-                // ends if an earlier call marked it: an entry inside
-                // the adopted prefix, which the new list shares.
-                let at = if p_entries.len() <= full_entries.len()
-                    && full_entries[..p_entries.len()] == p_entries[..]
+                if !(p_entries.len() <= plain_entries.len()
+                    && plain_entries[..p_entries.len()] == p_entries[..]
                     && p_ids.len() <= full_ids.len()
-                    && full_ids[..p_ids.len()] == p_ids[..]
+                    && full_ids[..p_ids.len()] == p_ids[..])
                 {
-                    Some(p_entries.len())
-                } else {
-                    adoption.as_ref().and_then(|a| a.breakpoint(&p_hash))
-                };
-                if let Some(at) = at {
-                    rows.push((
-                        entry_pos_at(&full_entries, at),
-                        p_hash,
-                        *bp_id,
-                        ttl.clone(),
-                    ));
-                } else {
                     self.log_breakpoint_dropped(
                         *bp_id,
                         &p_entries,
-                        &full_entries,
+                        &plain_entries,
                     );
+                    continue;
+                }
+                // Placed in the spliced list: past the respelled
+                // prefix, or in a stretch both lists hold alike, or —
+                // ending inside a stretch the slot spells its own way —
+                // where an earlier call marked the same render.
+                let at = match &adoption {
+                    None => Some(p_entries.len()),
+                    Some(adoption) => adoption.place(p_entries.len(), &p_hash),
+                };
+                match at {
+                    Some(at) => rows.push((
+                        entry_pos_at(full_entries, at),
+                        p_hash,
+                        *bp_id,
+                        ttl.clone(),
+                    )),
+                    None => self.log_breakpoint_dropped(
+                        *bp_id,
+                        &p_entries,
+                        full_entries,
+                    ),
                 }
             }
             rows.sort_by_key(|(ep, _, _, _)| ep.entry);
@@ -5714,6 +5676,7 @@ impl<B: Backend> Session<B> {
                 rows.iter().map(|(_, _, id, _)| *id).collect();
             let ttls: Vec<CacheTtl> =
                 rows.into_iter().map(|(_, _, _, ttl)| ttl).collect();
+            let full_entries = adoption.map_or(plain_entries, |a| a.entries);
             (rendered.text, full_entries, breakpoints, hashes, ids, ttls)
         } else {
             // Fast path: single render + tokenize, no partials.
@@ -6312,7 +6275,10 @@ impl<B: Backend> Session<B> {
     /// event an operator watching cache health needs to see, and at
     /// `INFO` a cold seat looked like a quiet one. A partial hit is a
     /// `hit` at `DEBUG` ([`Self::log_reuse_hit`]); what it lost is its
-    /// own `cache_degrade` event.
+    /// own `cache_degrade` event. `cold` marks a miss where no slot
+    /// offered anything (`lost_tokens` 0) — a new conversation's first
+    /// turn, or one whose slot is gone (its `cache_evict` said so) — so
+    /// a filter on `cold=false` leaves the misses that lost an offer.
     fn log_reuse_miss(
         &self,
         reason: &'static str,
@@ -6341,6 +6307,7 @@ impl<B: Backend> Session<B> {
             event = "cache_reuse",
             outcome = "miss",
             reason,
+            cold = lost == 0,
             shared_entries = shared,
             lost_tokens = lost,
             prompt_tokens = entries_cell_len(new_entries),
@@ -6365,14 +6332,20 @@ impl<B: Backend> Session<B> {
     /// selected — it shared an anchor with the request, so this is
     /// plausibly the same conversation with its history edited — and
     /// `INFO` when no slot was (plausibly a different conversation).
-    /// `segmentation_drift` — either of those, but the new prompt spells
-    /// every byte the slot holds from the divergence up to the tip: the
-    /// same text, split into different tokens. Adoption
+    /// `segmentation_drift` — either of those, but the new prompt reads
+    /// every byte (and special) the slot holds from the divergence up to
+    /// the tip: the same text, split into different tokens. Adoption
     /// ([`PrefixCacheConfig::adopt_emitted_tokens`]) exists to prevent
-    /// exactly this, so it means adoption was off or did not apply
-    /// (a marker in the render, a refused check). `in_turn` says which
+    /// exactly this, so it means adoption was off. `in_turn` says which
     /// side of the turn boundary it parted on; the level follows the
     /// same rule.
+    ///
+    /// `diverge_at` and `shared` / `cached` / `new` place the first
+    /// entry where the two lists' ids part; `text_diverge_at` (a cached
+    /// entry) and `text_cached` / `text_new` the first where their text
+    /// does. They differ — `resplit` — when the lists spell a stretch
+    /// in different tokens before the real change: the text fields are
+    /// then the edit, and the id fields only the split before it.
     fn log_tip_miss(
         &self,
         selection: Option<(i32, Reuse)>,
@@ -6402,18 +6375,35 @@ impl<B: Backend> Session<B> {
             miss.diverge_at,
             piece,
         );
-        let model = &self.engine.model;
-        let held = entries_spelling(
-            model,
-            &slot.prev_entries
-                [miss.diverge_at.min(miss.tip.entry)..miss.tip.entry],
-        );
-        let respelled = !held.is_empty()
-            && entries_spelling(
-                model,
-                &new_entries[miss.diverge_at.min(new_entries.len())..],
+        // Where the two stop *reading* alike, which a stretch the slot
+        // spells its own way puts past where their ids part: the edit
+        // an operator should look at.
+        let text = {
+            let model = &self.engine.model;
+            let mut piece = |token: Token, buf: &mut Vec<u8>| {
+                model.token_to_piece_ref(token, buf)
+            };
+            spelling_walk(
+                &slot.prev_entries[..miss.tip.entry],
+                new_entries,
+                &mut piece,
+                &|token| self.literals.specials.contains(&token),
             )
-            .starts_with(&held);
+        };
+        let respelled = miss.diverge_at < miss.tip.entry && text.read_all;
+        let text_at = match text.read_all {
+            true => miss.tip.entry,
+            false => text.cached,
+        };
+        let window = |entries: &[CacheEntry], at: usize| {
+            let at = at.min(entries.len());
+            let to = (at + DIVERGENCE_CONTEXT).min(entries.len());
+            entries_text(&entries[at..to], piece)
+        };
+        let (text_cached, text_new) = (
+            window(&slot.prev_entries, text_at),
+            window(new_entries, text.plain),
+        );
         let reason = match (respelled, miss.in_turn) {
             (true, _) => "segmentation_drift",
             (false, true) => "tip_diverged",
@@ -6446,9 +6436,15 @@ impl<B: Backend> Session<B> {
             shared = shared.as_str(),
             cached = cached.as_str(),
             new = new.as_str(),
+            text_diverge_at = text_at,
+            resplit = text_at > miss.diverge_at,
+            text_cached = text_cached.as_str(),
+            text_new = text_new.as_str(),
             "prefix cache: the last turn's tip is not reusable — the new \
-             prompt diverges from the cached tokens at entry {} ({reason})",
+             prompt diverges from the cached tokens at entry {} and from \
+             their text at entry {} ({reason})",
             miss.diverge_at,
+            text_at,
         );
     }
 
@@ -6791,8 +6787,6 @@ impl<B: Backend> Session<B> {
     ///
     /// `turn_start` is the prompt's entry count: where in
     /// `new_entries` this call's generation began ([`PrefixSlot::turn_start`]).
-    /// `spelled` is what `new_entries` is known to spell
-    /// ([`PrefixSlot::spelled`], from [`spelled_records`]).
     ///
     /// No-op when caching is off.
     fn record_cache_hit(
@@ -6802,7 +6796,6 @@ impl<B: Backend> Session<B> {
         mut new_breakpoints: Vec<Breakpoint>,
         reused_cells: usize,
         tip: Option<Breakpoint>,
-        spelled: Vec<Spelled>,
     ) {
         let now = std::time::Instant::now();
         // Resolve the pending slot claimed by kv_setup. No pending +
@@ -6862,7 +6855,6 @@ impl<B: Backend> Session<B> {
             slot.turn_start = turn_start;
             slot.breakpoints = new_breakpoints;
             slot.tip = tip;
-            slot.spelled = spelled;
             slot.last_used = now;
         }
         // Free the displaced (tip moved) or stale (tip gone — e.g. the
@@ -6990,8 +6982,6 @@ impl<B: Backend> Session<B> {
             reasoning_closed_by_render,
             media_by_id,
             parse_syntax,
-            rendered_prompt,
-            sentinel,
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
@@ -7190,17 +7180,7 @@ impl<B: Backend> Session<B> {
 
         // `complete_text` doesn't parse blocks, so we have no
         // structured assistant content to canonical-render for the tip
-        // hash — the tip stays LCP-matchable only, and only the prompt
-        // is recorded as spelled.
-        let spelled = spelled_records(
-            &self.engine.model,
-            &rendered_prompt,
-            sentinel.as_deref(),
-            &extended_prev,
-            turn_start,
-            None,
-            None,
-        );
+        // hash — the tip stays LCP-matchable only.
         let tip = internal_tip.map(|at| Breakpoint {
             at,
             hash: None,
@@ -7220,7 +7200,6 @@ impl<B: Backend> Session<B> {
             ),
             cache_read,
             tip,
-            spelled,
         );
         let usage = Self::make_usage(
             prompt_tokens,
@@ -7358,8 +7337,6 @@ impl<B: Backend> Session<B> {
             reasoning_closed_by_render,
             media_by_id,
             parse_syntax,
-            rendered_prompt,
-            sentinel,
             ..
         } = self.prepare_call_cached(prompt, true)?;
         let prompt_tokens = entries_cell_len(&entries);
@@ -7408,15 +7385,6 @@ impl<B: Backend> Session<B> {
         // works exactly as before. (See plan: streaming tip extension
         // is a v2 follow-up.)
         let turn_start = entries.len();
-        let spelled = spelled_records(
-            &self.engine.model,
-            &rendered_prompt,
-            sentinel.as_deref(),
-            &entries,
-            turn_start,
-            None,
-            None,
-        );
         self.record_cache_hit(
             entries,
             turn_start,
@@ -7429,7 +7397,6 @@ impl<B: Backend> Session<B> {
             ),
             cache_read,
             None,
-            spelled,
         );
         let usage = Self::make_usage(
             prompt_tokens,
@@ -7892,11 +7859,6 @@ impl<B: Backend> Session<B> {
         let token_stable = self.scan_blocks_for_specials(&marked).is_empty();
         let blocks_owned: Vec<crate::Block> = blocks.to_vec();
         let mut canonical_tail: Option<Vec<Token>> = None;
-        // The prompt render plus the generated text the KV holds, when
-        // the re-render reproduces it byte for byte with no marker in
-        // it: what the next call may read in this turn's own ids (see
-        // `spelled_records`, which still checks the ids spell it).
-        let mut held: Option<String> = None;
         // Cache diagnostics for this turn, logged only once it stands:
         // a turn the checks below reject reaches neither the client nor
         // the next request, so what its re-render would have cost is
@@ -7944,16 +7906,8 @@ impl<B: Backend> Session<B> {
                         // re-render's own tokenization at that
                         // position, not the concatenation of two
                         // independent ones.
-                        let kv_bytes =
-                            raw_text.len().saturating_sub(uncommitted_bytes);
-                        let tail_start = prompt_text.text.len() + kv_bytes;
-                        // What the KV holds, as the next render spells
-                        // it — none when that is not a plain prefix of
-                        // the marked render (a content literal in it).
-                        held = raw_text
-                            .get(..kv_bytes)
-                            .map(|kv| format!("{rendered_prompt}{kv}"))
-                            .filter(|held| extended_render.starts_with(held));
+                        let tail_start = prompt_text.text.len()
+                            + raw_text.len().saturating_sub(uncommitted_bytes);
                         // `get`, not `[..]`: piece boundaries are
                         // codepoint boundaries by construction, but a
                         // missed tip only shortens the next LCP whereas
@@ -8034,15 +7988,6 @@ impl<B: Backend> Session<B> {
         if let Some(head) = head_for_checkpoint {
             self.engine.checkpoint_pos(active_seq, head as i32);
         }
-        let spelled = spelled_records(
-            &self.engine.model,
-            &rendered_prompt,
-            sentinel.as_deref(),
-            &extended_prev,
-            turn_start,
-            internal_tip,
-            held.as_deref(),
-        );
 
         // Cache + usage bookkeeping, then grammar-violation check.
         // Check last so a violation still records the work that was
@@ -8066,7 +8011,6 @@ impl<B: Backend> Session<B> {
             ),
             cache_read,
             tip,
-            spelled,
         );
         let usage = Self::make_usage(
             prompt_tokens,
@@ -14981,6 +14925,60 @@ mod tests {
         assert_eq!(slot.breakpoints[0].at, marker, "the first where it was");
     }
 
+    /// An edit after adopted turns keeps what precedes it. Three turns
+    /// in, the client rewrites the second user message: the new render
+    /// reproduces no whole prefix the slot recorded, yet every byte up
+    /// to the edit is what the slot holds, in its own split. Reading
+    /// those bytes in the slot's ids, the call restores the last anchor
+    /// before the edit — the first reply's marker. Tokenized afresh
+    /// instead, the walk would part at the first reply's ` civil`, the
+    /// earliest non-canonical span, and reuse nothing: worse than with
+    /// adoption off, where each call re-tokenized history canonically
+    /// (review of ad6b7c1, item 1).
+    #[test]
+    fn an_edit_after_adopted_turns_keeps_the_anchor_before_it() {
+        for adopt in [true, false] {
+            let mut session = split_session(adopt);
+            for turns in 0..3 {
+                session
+                    .complete_response(&split_conversation(turns, turns > 0))
+                    .expect("turn");
+            }
+            // With adoption off, each turn misses and seats a fresh slot.
+            let slot = session
+                .prefix_cache
+                .as_ref()
+                .and_then(|cache| {
+                    cache.slots.iter().max_by_key(|s| s.last_used)
+                })
+                .expect("a slot");
+            let (seq, first_marker) =
+                (slot.seq_id, slot.breakpoints.first().expect("marked").at);
+            let mut edited = split_conversation(3, true);
+            edited.messages[2] =
+                text_message(crate::Role::User, "Go on!", false);
+            session.engine.decoder.restores.clear();
+            let mut usage = None;
+            let events = capture_events(|| {
+                usage = Some(
+                    session.complete_response(&edited).expect("edited").usage,
+                );
+            });
+            let usage = usage.unwrap();
+            assert_eq!(
+                session.engine.decoder.restores,
+                [(seq, first_marker.pos as i32)],
+                "adopt={adopt}: {:?}",
+                reasons(&events),
+            );
+            assert_eq!(
+                usage.cache_read_input_tokens,
+                Some(first_marker.pos as u64),
+                "adopt={adopt}",
+            );
+        }
+    }
+
     /// The tail after an adopted prefix is not the start of a render: on
     /// a vocabulary that prepends BOS, it must not get one — a BOS
     /// mid-stream would stop the next walk dead.
@@ -15007,106 +15005,204 @@ mod tests {
         assert_eq!(session.engine.decoder.restores, [(0, tip.pos as i32)]);
     }
 
-    /// A recorded prefix whose ids do not read as the render — a
-    /// recording bug — is refused, and the prompt tokenized afresh.
-    #[test]
-    fn adoption_refuses_ids_that_misspell_the_render() {
-        let mut session = mock::session(&[]);
-        let prompt = split_conversation(0, false);
-        let honest = session.count_tokens(&prompt).expect("count");
-        let render = session
-            .prepare_call_cached(&prompt, true)
-            .expect("prepare")
-            .rendered_prompt;
-        let mut wrong: Vec<CacheEntry> = toks(render.bytes().map(Token::from));
-        wrong[3] = CacheEntry::Token(Token::from(b'#'));
-        let mut slot = PrefixSlot::new(0, std::time::Instant::now());
-        slot.spelled = vec![Spelled::of(&render, wrong.len())];
-        slot.prev_entries = wrong;
-        seat_slot(&mut session, slot);
+    /// A tiny vocabulary for [`spelling_walk`]: id `i` spells
+    /// `WALK_VOCAB[i]`. 6 and 7 are specials sharing one piece (a
+    /// duplicate, as some vocabularies hold), 8 spells nothing, and
+    /// 9–11 spell the special's piece in plain bytes.
+    const WALK_VOCAB: &[&str] = &[
+        "a", "b", "c", "ab", "bc", "abc", "<s>", "<s>", "", "<", "s", ">",
+    ];
 
-        let mut counted = 0;
+    /// [`spelling_walk`] over [`WALK_VOCAB`] ids, `u8`s standing for
+    /// media entries.
+    fn walk(cached: &[CacheEntry], plain: &[CacheEntry]) -> Splice {
+        let mut piece = |token: Token, buf: &mut Vec<u8>| {
+            buf.clear();
+            buf.extend_from_slice(WALK_VOCAB[token as usize].as_bytes());
+        };
+        spelling_walk(cached, plain, &mut piece, &|t| t == 6 || t == 7)
+    }
+
+    /// The walk reads through stretches the two lists spell in different
+    /// tokens, back into stretches where they agree, and stops at the
+    /// last boundary both share before the first byte they disagree on.
+    #[test]
+    fn spelling_walk_reads_through_a_respelled_stretch() {
+        let w = |cached: &[Token], plain: &[Token]| {
+            walk(&toks(cached.iter().copied()), &toks(plain.iter().copied()))
+        };
+        let same = w(&[0, 1, 2], &[0, 1, 2]);
+        assert_eq!((same.cached, same.plain), (3, 3));
+        assert!(!same.respells(), "nothing to respell");
+
+        // `a|bc|a|b` against `ab|c|a|c`: a stretch two tokens a side,
+        // an `a` both hold, then `b` against `c`.
+        let s = w(&[0, 4, 0, 1], &[3, 2, 0, 2]);
+        assert_eq!((s.cached, s.plain), (3, 3));
+        assert!(s.respells());
+        assert_eq!(s.runs, [(2, 2, 1)]);
+        assert_eq!(s.place(1), None, "inside the respelled stretch");
+        assert_eq!(s.place(2), Some(2));
+        assert_eq!(s.place(4), Some(4), "past the splice: the plain ids");
+
+        // Unequal counts: `abc|a` against `a|b|c|a|b`, the cached list
+        // ending first.
+        let s = w(&[5, 0], &[0, 1, 2, 0, 1]);
+        assert_eq!((s.cached, s.plain), (2, 4));
+        assert_eq!(s.place(4), Some(2));
+        assert_eq!(s.place(5), Some(3));
+
+        // `a|bc` against `ab|a`: the bytes part inside the stretch, so
+        // nothing of it stands.
+        let s = w(&[0, 4], &[3, 0]);
+        assert_eq!((s.cached, s.plain), (0, 0));
+        assert!(!s.respells());
+    }
+
+    /// A special stands only for itself — not spelled out in plain
+    /// bytes, not a duplicate sharing its piece — and neither may an
+    /// empty piece or an image stand in a respelled stretch: the walk
+    /// stops before each. Equal images in a stretch both hold pass.
+    #[test]
+    fn spelling_walk_keeps_specials_and_media_in_place() {
+        let w = |cached: &[Token], plain: &[Token]| {
+            let s = walk(
+                &toks(cached.iter().copied()),
+                &toks(plain.iter().copied()),
+            );
+            (s.cached, s.plain)
+        };
+        assert_eq!(w(&[9, 10, 11, 0], &[6, 0]), (0, 0), "spelled out");
+        assert_eq!(w(&[7, 0], &[6, 0]), (0, 0), "a duplicate special");
+        assert_eq!(w(&[3, 7, 0], &[0, 1, 6, 0]), (1, 2), "after a stretch");
+        assert_eq!(w(&[8, 3], &[3]), (0, 0), "an empty piece");
+
+        let image = media(1);
+        let t = CacheEntry::Token;
+        let s =
+            walk(&[t(3), image, t(0), t(4)], &[t(0), t(1), image, t(3), t(2)]);
+        assert_eq!((s.cached, s.plain), (4, 5), "through an equal image");
+        let s = walk(&[t(3), image], &[t(0), t(1), media(2)]);
+        assert_eq!((s.cached, s.plain), (1, 2), "a different image");
+        let s = walk(&[t(0), image, t(1)], &[t(3)]);
+        assert_eq!((s.cached, s.plain), (0, 0), "an image in the stretch");
+    }
+
+    /// `count_tokens` reads the prompt the way the call would, so it
+    /// follows the slot the prompt continues: in the model's split while
+    /// the slot lives, in the tokenizer's once it is gone. Anthropic's
+    /// count is stateless; this one is exact instead (see
+    /// [`Session::count_tokens`]).
+    #[test]
+    fn count_tokens_follows_the_slot_it_continues() {
+        let second = split_conversation(1, false);
+        let mut session = split_session(true);
+        let cold = session.count_tokens(&second).expect("count");
+        session
+            .complete_response(&split_conversation(0, false))
+            .expect("turn 1");
+        let warm = session.count_tokens(&second).expect("count");
+        // ` civil` is one token to the tokenizer, six as written.
+        assert_eq!(warm, cold + " civil".len() - 1);
+        session.clear_prefix_cache();
+        assert_eq!(session.count_tokens(&second).expect("count"), cold);
+    }
+
+    /// A turn cut by its token budget leaves the KV head before its last
+    /// piece, so the slot's own ids end mid-text and its predicted tail
+    /// starts with that piece. The next call still reads the turn in the
+    /// model's split, through the tail, and resumes from the tip; with
+    /// adoption off it cannot (review of ad6b7c1, item 5).
+    #[test]
+    fn a_budget_ending_keeps_its_tip_by_adoption() {
+        for adopt in [true, false] {
+            let mut session = split_session(adopt);
+            let first = split_conversation(0, false)
+                .max_tokens(NonZeroU32::new(SPLIT_LINE.len() as u32).unwrap());
+            let response = session.complete_response(&first).expect("turn 1");
+            assert_eq!(
+                response.stop_reason,
+                Some(misanthropic::response::StopReason::MaxTokens),
+            );
+            let slot = only_slot(&session);
+            let tip = slot.tip.as_ref().expect("a tip").at;
+            // The premise: the last piece is past the KV head.
+            assert_eq!(tip.entry, slot.turn_start + SPLIT_LINE.len() - 1);
+
+            let second = split_conversation(1, false);
+            session.engine.decoder.restores.clear();
+            let mut usage = None;
+            let events = capture_events(|| {
+                usage = Some(
+                    session.complete_response(&second).expect("turn 2").usage,
+                );
+            });
+            let reasons = reasons(&events);
+            if adopt {
+                assert_eq!(
+                    session.engine.decoder.restores,
+                    [(0, tip.pos as i32)],
+                    "{reasons:?}",
+                );
+                assert_eq!(
+                    usage.unwrap().cache_read_input_tokens,
+                    Some(tip.pos as u64),
+                );
+                assert!(reasons.is_empty(), "nothing degraded: {reasons:?}");
+            } else {
+                assert!(session.engine.decoder.restores.is_empty());
+                assert!(reasons.contains(&"segmentation_drift"), "{reasons:?}");
+            }
+        }
+    }
+
+    /// A split before a real edit: the client sends the model's reply
+    /// back with a word changed after the ` civil` it wrote in its own
+    /// split. With adoption off, the ids part at ` civil` and the text
+    /// only at the edit; the tip miss names both, so the operator is
+    /// pointed at the edit, not at a stretch both sides spell alike
+    /// (review of ad6b7c1, item 8).
+    #[test]
+    fn a_tip_miss_names_the_edit_past_a_resplit() {
+        let mut session = split_session(false);
+        let line = format!("{SPLIT_LINE} war began.");
+        session.engine.decoder.script = line.bytes().map(Token::from).collect();
+        session
+            .complete_response(&split_conversation(0, false))
+            .expect("turn 1");
+        let mut edited = split_conversation(1, false);
+        edited.messages[1] = text_message(
+            crate::Role::Assistant,
+            &line.replace("war", "peace"),
+            false,
+        );
         let events = capture_events(|| {
-            counted = session.count_tokens(&prompt).expect("count");
+            session.complete_response(&edited).expect("edited");
         });
-        assert_eq!(counted, honest);
-        let [(level, fields)] = events.as_slice() else {
-            panic!("one event, got {events:?}");
-        };
-        assert_eq!(*level, tracing::Level::WARN);
-        assert_eq!(field(fields, "reason"), Some("adoption_refused"));
-        assert_eq!(field(fields, "check"), Some("spelling"));
-    }
-
-    /// [`pick_spelled`] takes the longest recorded prefix the text
-    /// reproduces, and none the text departs from or that runs past the
-    /// first marker.
-    #[test]
-    fn pick_spelled_takes_the_longest_reproduced_prefix() {
-        let now = std::time::Instant::now();
-        let slot = |seq, spelled: Spelled| {
-            let mut slot = PrefixSlot::new(seq, now);
-            slot.prev_entries = seq_entries(16);
-            slot.spelled = vec![spelled];
-            slot
-        };
-        let slots = [
-            slot(0, Spelled::of("hello", 5)),
-            slot(1, Spelled::of("hello world", 11)),
-        ];
-        let pick = |text: &str, clean| {
-            pick_spelled(&slots, text, clean)
-                .map(|(s, sp)| (s.seq_id, sp.bytes))
-        };
-        assert_eq!(pick("hello world!", 12), Some((1, 11)));
-        assert_eq!(pick("hello there", 11), Some((0, 5)));
-        assert_eq!(pick("hello world!", 8), Some((0, 5)), "a marker at 8");
-        assert_eq!(pick("jello world!", 12), None);
-        // More entries than the slot holds: a stale record, skipped.
-        let stale = [slot(2, Spelled::of("hello", 17))];
-        assert!(pick_spelled(&stale, "hello", 5).is_none());
-    }
-
-    /// What a finished call records as spelled: its prompt, and the
-    /// generation up to the KV head only when the generated ids spell
-    /// the text the re-render holds there — the proof adoption rests
-    /// on. A render with a marker records nothing.
-    #[test]
-    fn spelled_records_hold_only_what_the_ids_spell() {
-        let model = mock::MockModel::default();
-        let entries = |text: &str| toks(text.bytes().map(Token::from));
-        let tip = Some(ep(5));
-        let records = |list: &[CacheEntry],
-                       held: Option<&str>,
-                       sentinel: Option<&str>| {
-            spelled_records(&model, "P|", sentinel, list, 2, tip, held)
-        };
-        let prompt = Spelled::of("P|", 2);
-        assert_eq!(
-            records(&entries("P|abc<"), Some("P|abc"), None),
-            [prompt, Spelled::of("P|abc", 5)],
-        );
-        // The model wrote `abd`; the re-render says `abc`.
-        assert_eq!(records(&entries("P|abd<"), Some("P|abc"), None), [prompt]);
-        // No byte-stable span to hold: the prompt alone.
-        assert_eq!(records(&entries("P|abc<"), None, None), [prompt]);
-        // A marker in the prompt: its bytes never repeat.
-        assert!(
-            records(&entries("P|abc<"), Some("P|abc"), Some("|")).is_empty()
-        );
+        let miss = events
+            .iter()
+            .map(|(_, f)| f)
+            .find(|f| field(f, "reason") == Some("tip_diverged"))
+            .unwrap_or_else(|| panic!("{:?}", reasons(&events)));
+        assert_eq!(field(miss, "resplit"), Some("true"));
+        assert!(field(miss, "cached").unwrap().starts_with(" c"));
+        assert!(field(miss, "text_cached").unwrap().starts_with("war"));
+        assert!(field(miss, "text_new").unwrap().starts_with("peace"));
+        let at = |name| field(miss, name).unwrap().parse::<usize>().unwrap();
+        assert!(at("text_diverge_at") > at("diverge_at"));
     }
 
     /// "Trust the emission" through each fleet model's real tokenizer
     /// (a `vocab_only` load: CPU, no tensors). The model writes
     /// [`SPLIT_LINE`] in a split its tokenizer would not produce — every
     /// multi-character token cut after its first character — and the
-    /// next prompt continues it. Reading the cached ids for the prompt
-    /// and the line, and tokenizing only the rest, must read exactly as
-    /// the plain tokenization does: the same bytes piece for piece (no
-    /// dummy space where the tail starts, no BOS inside it) and the same
-    /// reserved ids. Were either to fail on a fleet tokenizer, every
-    /// adoption there would be refused and the fix would silently not
-    /// apply. Skips each model whose GGUF is absent.
+    /// next prompt continues it. The slot holds the prompt, the line up
+    /// to the KV head and the predicted tail — the head past the line
+    /// (a stop) or before its last piece (a budget cut, mid-text). The
+    /// walk must read past the line on every fleet tokenizer, or the fix
+    /// would silently not apply there, and the spliced list must read
+    /// as the plain one: the same bytes, the same specials, BOS only at
+    /// the start. Skips each model whose GGUF is absent.
     #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "needs the fleet GGUFs (vocab-only loads, CPU)"]
@@ -15139,7 +15235,6 @@ mod tests {
             let Some((model, template, _)) = load_fleet_model(&spec) else {
                 continue;
             };
-            let literals = literal::LiteralTable::build(&model);
             let bos = template.bos_token();
             let opts = RenderOptions::default().with_generation_prompt(true);
             let first = Prompt::default()
@@ -15163,7 +15258,6 @@ mod tests {
                     let eos = model.token_to_piece(model.eos());
                     format!("{held}{eos}\n{prompt}")
                 });
-            let rest = &next[held.len()..];
 
             let canonical_line =
                 model.tokenize_special(SPLIT_LINE, false, false);
@@ -15199,49 +15293,183 @@ mod tests {
                 "{file}: the emission spells the line",
             );
 
-            let adopted: Vec<CacheEntry> = [
-                tokenize_render(&model, &prompt, bos),
-                emitted,
-                model.tokenize_special(rest, false, true),
-            ]
-            .concat()
-            .into_iter()
-            .map(CacheEntry::Token)
-            .collect();
             let plain = toks(tokenize_render(&model, &next, bos));
-            assert_eq!(
-                String::from_utf8_lossy(&entries_spelling(&model, &adopted)),
-                String::from_utf8_lossy(&entries_spelling(&model, &plain)),
-                "{file}: the adopted ids read as the render",
-            );
-            let reserved = |entries: &[CacheEntry]| -> Vec<CacheEntry> {
-                entries
-                    .iter()
-                    .filter(|e| match e {
-                        CacheEntry::Token(t) => {
-                            literals.neutralizer.contains(*t)
-                        }
-                        CacheEntry::Media { .. } => false,
-                    })
+            let specials: std::collections::BTreeSet<Token> =
+                model.special_tokens().into_iter().collect();
+            let pinned = |token: Token| specials.contains(&token);
+            let pinned_entries = |list: &[CacheEntry]| -> Vec<CacheEntry> {
+                list.iter()
+                    .filter(|e| matches!(e, CacheEntry::Token(t) if pinned(*t)))
                     .copied()
                     .collect()
             };
-            assert_eq!(reserved(&adopted), reserved(&plain), "{file}");
-            let bos_at = |entries: &[CacheEntry]| -> Vec<usize> {
-                entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| **e == CacheEntry::Token(model.bos()))
-                    .map(|(i, _)| i)
-                    .collect()
-            };
-            assert_eq!(bos_at(&adopted), bos_at(&plain), "{file}: BOS");
-            eprintln!(
-                "{file}: adopted {} entries vs {} plain, reads alike",
-                adopted.len(),
-                plain.len(),
-            );
+            // The slot as a turn leaves it: the prompt, the emission up
+            // to the KV head, and the predicted tail tokenized from the
+            // re-render there (capped as `run_call` caps it). Ended on a
+            // stop, the head is past the line; cut by the budget, it is
+            // before the line's last piece, mid-text.
+            for (ending, kv) in
+                [("stop", emitted.len()), ("budget", emitted.len() - 1)]
+            {
+                let head_bytes = prompt.len()
+                    + entries_spelling(&model, &toks(emitted[..kv].to_vec()))
+                        .len();
+                let tail: Vec<Token> = model
+                    .tokenize_special(&next[head_bytes..], false, true)
+                    .into_iter()
+                    .take(8)
+                    .collect();
+                let cached = toks(
+                    [
+                        tokenize_render(&model, &prompt, bos),
+                        emitted[..kv].to_vec(),
+                        tail,
+                    ]
+                    .concat(),
+                );
+                let mut piece = |token: Token, buf: &mut Vec<u8>| {
+                    model.token_to_piece_ref(token, buf)
+                };
+                let splice =
+                    spelling_walk(&cached, &plain, &mut piece, &pinned);
+                assert!(splice.respells(), "{file} ({ending}): a split");
+                let read = entries_spelling(&model, &plain[..splice.plain]);
+                assert!(
+                    read.len() > held.len(),
+                    "{file} ({ending}): the walk stops at byte {} of {}, \
+                     inside the line",
+                    read.len(),
+                    held.len(),
+                );
+                let spliced: Vec<CacheEntry> =
+                    [&cached[..splice.cached], &plain[splice.plain..]].concat();
+                assert_eq!(
+                    String::from_utf8_lossy(&entries_spelling(
+                        &model, &spliced
+                    )),
+                    String::from_utf8_lossy(&entries_spelling(&model, &plain)),
+                    "{file} ({ending}): the spliced ids read as the render",
+                );
+                assert_eq!(
+                    pinned_entries(&spliced),
+                    pinned_entries(&plain),
+                    "{file} ({ending})",
+                );
+                let bos_at = |entries: &[CacheEntry]| -> Vec<usize> {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| **e == CacheEntry::Token(model.bos()))
+                        .map(|(i, _)| i)
+                        .collect()
+                };
+                assert_eq!(bos_at(&spliced), bos_at(&plain), "{file}: BOS");
+                eprintln!(
+                    "{file} ({ending}): {} cached ids stand in for {} plain, \
+                     through byte {} of {}",
+                    splice.cached,
+                    splice.plain,
+                    read.len(),
+                    held.len(),
+                );
+            }
         }
+    }
+
+    /// What adoption costs a long prompt, through Qwen3.8's tokenizer (a
+    /// `vocab_only` load: CPU, no tensors): a ~100k-token render whose
+    /// cached copy is in the model's split every 64th multi-character
+    /// token — far more respelled stretches than a live slot holds. The
+    /// walk compares ids where the lists agree and reads pieces only in
+    /// the stretches, so it must cost well under the plain tokenization
+    /// every call already pays (review of ad6b7c1, item 10). Prints the
+    /// timings; skips without the GGUF.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    #[ignore = "needs the Qwen3.8 GGUF (vocab-only load, CPU); a timing"]
+    fn adoption_walk_cost_on_a_long_prompt() {
+        use crate::backend::Model as _;
+        let spec = FleetSpec {
+            env: "DRAMA_LLAMA_QWEN38_MODEL",
+            file: "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+            on: &[],
+            off: &[],
+            close_prefix: "",
+            crossings: &[],
+        };
+        let Some((model, template, _)) = load_fleet_model(&spec) else {
+            return;
+        };
+        let bos = template.bos_token();
+        let paragraph = format!(
+            "<|im_start|>user\nGo on, and mind the details.<|im_end|>\n\
+             <|im_start|>assistant\n{SPLIT_LINE} war, the cisterns, the \
+             ledgers of the upper wards and every 3,141 grain of it.\
+             <|im_end|>\n"
+        );
+        let render = paragraph.repeat(100_000 / 60);
+
+        let started = std::time::Instant::now();
+        let plain = toks(tokenize_render(&model, &render, bos));
+        let tokenize = started.elapsed();
+
+        let specials: std::collections::BTreeSet<Token> =
+            model.special_tokens().into_iter().collect();
+        let mut split = 0;
+        let cached: Vec<CacheEntry> = plain
+            .iter()
+            .enumerate()
+            .flat_map(|(i, entry)| {
+                let CacheEntry::Token(token) = *entry else {
+                    return vec![*entry];
+                };
+                let piece = model.token_to_piece(token);
+                let cut = piece.char_indices().nth(1).map(|(at, _)| at);
+                match cut.filter(|_| i % 64 == 0 && !specials.contains(&token))
+                {
+                    Some(cut) => {
+                        split += 1;
+                        toks(
+                            [
+                                model.tokenize_special(
+                                    &piece[..cut],
+                                    false,
+                                    false,
+                                ),
+                                model.tokenize_special(
+                                    &piece[cut..],
+                                    false,
+                                    false,
+                                ),
+                            ]
+                            .concat(),
+                        )
+                    }
+                    None => vec![*entry],
+                }
+            })
+            .collect();
+        let mut piece = |token: Token, buf: &mut Vec<u8>| {
+            model.token_to_piece_ref(token, buf)
+        };
+        let started = std::time::Instant::now();
+        let splice = spelling_walk(&cached, &plain, &mut piece, &|t| {
+            specials.contains(&t)
+        });
+        let walk = started.elapsed();
+        let started = std::time::Instant::now();
+        let spelled = entries_spelling(&model, &plain).len();
+        let spell = started.elapsed();
+
+        eprintln!(
+            "{} plain tokens ({} bytes), {split} respelled stretches: \
+             tokenize {tokenize:?}, walk {walk:?}, a full spelling pass \
+             {spell:?}",
+            plain.len(),
+            spelled,
+        );
+        assert_eq!(splice.plain, plain.len(), "the walk reads it all");
+        assert!(walk < tokenize, "walk {walk:?} vs tokenize {tokenize:?}");
     }
 
     /// Adoption off ([`PrefixCacheConfig::adopt_emitted_tokens`]) keeps

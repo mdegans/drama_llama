@@ -32,6 +32,10 @@ pub(super) struct LiteralTable {
     /// Reserved id → its piece as plain tokens, containing no reserved
     /// id (only, at most, an unreserved single-character special).
     plain: HashMap<Token, Vec<Token>>,
+    /// Every special the vocabulary declares, reserved or not: ids a
+    /// prefix-cache respelling must keep where they are (see
+    /// `super::spelling_walk`).
+    pub(super) specials: BTreeSet<Token>,
 }
 
 impl LiteralTable {
@@ -75,6 +79,7 @@ impl LiteralTable {
         Self {
             neutralizer: Arc::new(neutralizer),
             plain,
+            specials,
         }
     }
 
@@ -483,7 +488,10 @@ mod tests {
     const TOOL_CALL_ALIAS: Token = 309;
     /// A second special spelled `<think>`, like [`TOOL_CALL_ALIAS`].
     const THINK_ALIAS: Token = 310;
-    const N_VOCAB: i32 = 311;
+    /// An ordinary token, ` civil`, which a scripted model can write a
+    /// byte at a time: a split this tokenizer never produces.
+    const CIVIL: Token = 311;
+    const N_VOCAB: i32 = 312;
 
     /// `(id, piece, control)` — `control = false` is `USER_DEFINED`.
     const SPECIALS: &[(Token, &str, bool)] = &[
@@ -534,6 +542,11 @@ mod tests {
                         rest = tail;
                         continue 'outer;
                     }
+                }
+                if let Some(tail) = rest.strip_prefix(" civil") {
+                    out.push(CIVIL);
+                    rest = tail;
+                    continue;
                 }
                 let c = rest.chars().next().expect("non-empty");
                 let mut buf = [0u8; 4];
@@ -587,6 +600,7 @@ mod tests {
             buf.clear();
             match SPECIALS.iter().find(|(id, _, _)| *id == token) {
                 Some((_, piece, _)) => buf.extend_from_slice(piece.as_bytes()),
+                None if token == CIVIL => buf.extend_from_slice(b" civil"),
                 None => buf.push(token as u8),
             }
         }
@@ -1608,5 +1622,51 @@ mod tests {
                 reasons(&events),
             );
         }
+    }
+
+    /// A content literal in the conversation does not stop the next call
+    /// reading the model's turn in its own split (review of ad6b7c1,
+    /// item 3). The user spells `<tool_call>` in prose, so every render
+    /// carries a literal marker under a per-call sentinel — bytes that
+    /// never repeat, which kept adoption from ever applying to such a
+    /// conversation again. Compared by token, the walk reads the
+    /// literal's byte-split ids alike on both calls and the turn's
+    /// ` civil`, written a byte at a time, alike with the tokenizer's
+    /// one token; the next call resumes from the tip.
+    #[test]
+    fn a_content_literal_keeps_adoption() {
+        use crate::session::tests::{capture_events, reasons};
+        use crate::Role::{Assistant, User};
+        let line = "Seraff: \"Finally, someone said it. The civil";
+        let mut s = scripted_tip(bytes(line));
+        let first = Prompt {
+            messages: vec![message(
+                User,
+                vec![text("Say <tool_call> plainly.")],
+            )],
+            ..Prompt::default()
+        };
+        s.complete_response(&first).expect("turn 1");
+        let slot = &s.prefix_cache.as_ref().expect("cache").slots[0];
+        let tip = slot.tip.as_ref().expect("a tip").at;
+        // The premises: the render holds a literal, and the turn is in
+        // the model's split.
+        assert!(!slot.prev_entries[..slot.turn_start]
+            .contains(&CacheEntry::Token(TOOL_CALL)));
+        assert!(!slot.prev_entries.contains(&CacheEntry::Token(CIVIL)));
+
+        let mut second = first.clone();
+        second.messages.push(message(Assistant, vec![text(line)]));
+        second.messages.push(message(User, vec![text("Go on.")]));
+        let mut usage = None;
+        let events = capture_events(|| {
+            usage = Some(s.complete_response(&second).expect("turn 2").usage);
+        });
+        assert_eq!(
+            usage.unwrap().cache_read_input_tokens,
+            Some(tip.pos as u64),
+            "{:?}",
+            reasons(&events),
+        );
     }
 }
