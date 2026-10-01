@@ -118,8 +118,16 @@
 //! - **a panic**, on any thread — exit code **70** (`EX_SOFTWARE`);
 //! - **a backend failure** llama.cpp does not recover from in-process —
 //!   a failed `llama_decode`, a Metal context left "in error state …
-//!   recreate the backend" by an out-of-memory command buffer — exit
-//!   code **75** (`EX_TEMPFAIL`).
+//!   recreate the backend" by an out-of-memory command buffer, or a
+//!   model load that fails after the backend began allocating (out of
+//!   memory loading the weights or creating the KV cache, or any load
+//!   failure llama.cpp leaves unexplained) — exit code **75**
+//!   (`EX_TEMPFAIL`).
+//!
+//! A load that fails *before* anything is allocated — a missing or
+//! unreadable file, metadata llama.cpp cannot read (not a GGUF, an
+//! unsupported architecture), a bad template — is answered with an
+//! error and the server serves on.
 //!
 //! Recovering in-process would mean unwinding through, or dropping,
 //! llama.cpp state that failed mid-operation, and llama.cpp does not
@@ -775,19 +783,56 @@ where
         model,
         path = path.to_string_lossy().as_ref()
     );
+    let session =
+        load_with(catalog, model, path, Session::<B>::from_path_with).await?;
+    Ok(configure_session(session, no_penalty, seed, schema_limits))
+}
+
+/// [`load_session`]'s load, with the loader passed in so a test can
+/// stand in for a load that fails. A failure that may have left the
+/// backend half-allocated ([`SessionError::is_resource`]: out of memory
+/// loading the weights or creating the KV cache) is fatal, like any
+/// other backend failure; one found before anything was allocated (a
+/// missing file, unreadable metadata, a bad template) is answered and
+/// the server serves on.
+///
+/// [`SessionError::is_resource`]: drama_llama::SessionError::is_resource
+async fn load_with<B, L>(
+    catalog: Arc<Catalog<B>>,
+    model: String,
+    path: PathBuf,
+    load: L,
+) -> Result<Session<B>, Reply>
+where
+    B: Backend + 'static,
+    Session<B>: FromPath,
+    L: FnOnce(
+            PathBuf,
+            <Session<B> as FromPath>::Options,
+        ) -> Result<Session<B>, drama_llama::SessionError>
+        + Send
+        + 'static,
+{
     // On the blocking pool: loading is seconds of blocking file and GPU
     // work and this is a reactor thread.
     spawn_blocking_or_bust(move || {
         fatal::caught_by_caller(|| {
-            let session =
-                Session::<B>::from_path_with(path, catalog.options().clone())?;
+            let session = load(path, catalog.options().clone())?;
             catalog.refresh(&model, session.model_info());
             Ok(session)
         })
     })
     .await?
-    .map(|s| configure_session(s, no_penalty, seed, schema_limits))
-    .map_err(map_session_err)
+    .map_err(|e: drama_llama::SessionError| match e.is_resource() {
+        true => {
+            fatal::declare(Fatal::Backend, &e);
+            fatal::reply(Fatal::Backend)
+        }
+        false => {
+            error!(event = "load_failed", error = %e);
+            map_session_err(e)
+        }
+    })
 }
 
 async fn route_messages<B>(

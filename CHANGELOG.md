@@ -249,6 +249,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     and a fatal decode error each exit with their code, log one fatal
     line and answer 500.
 
+- **blallama exits on a model load that fails while allocating, and
+  serves on after one that fails before.** A failed load used to be
+  answered and served past, whatever the cause — including an
+  out-of-memory load that died with the backend half-allocated, which
+  is exactly the state the exit-and-restart policy exists not to serve
+  from. llama.cpp answers every failed load with the same null, so
+  `LlamaCppEngine` now finds the benign failures first: it opens the
+  file (`NewError::Unreadable` — missing, a directory, unreadable),
+  then reads it vocab-only, which allocates no backend memory
+  (`NewError::Metadata` — not a GGUF, an unsupported architecture, a
+  malformed vocabulary), and only then loads it in full. A full load
+  that fails after both passed (`NewError::Model`), a failed context
+  creation (`NewError::Context`: the KV cache and compute buffers), and
+  a failed mmproj load are resource failures. The class is
+  `NewError::is_resource`, `MoefluxEngineError::is_resource`
+  (`mf_init_model`'s bare null is a resource failure; the tokenizer and
+  config parse, a path C cannot take and weights for another variant
+  are not) and `SessionError::is_resource`; where the backend does not
+  say why, it answers `true`. blallama declares a resource failure
+  fatal and exits **75** with its one `ERROR` line; a benign one is
+  answered as before (and now logged, `event: "load_failed"`). The
+  vocab-only pass adds tens of milliseconds to each load, and the
+  catalog's metadata peek now fails as `Metadata`, not `Model`. Tests:
+  real llama.cpp classification of a missing path, a directory and a
+  garbage file; a child process whose load fails with a stand-in
+  context-creation failure exits 75 with one fatal line and answers
+  500; the real binary, serving a directory holding a garbage `.gguf`,
+  answers the load with an error, a nonexistent id with a 404, and is
+  still up and serving past the fatal grace period.
+
 - **Non-ASCII model output can no longer panic a dialect parser.** The
   gpt-oss Harmony parser stepped one *byte* past a block boundary
   (`rest[1..]`) before looking for the next marker, so prose outside a

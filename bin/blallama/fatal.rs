@@ -516,6 +516,53 @@ mod tests {
         );
     }
 
+    /// A model load that fails after the backend began allocating —
+    /// here a stand-in loader answering llama.cpp's failed context
+    /// creation, the KV cache allocation an out-of-memory load dies in
+    /// — exits with the backend code through [`super::super::load_with`],
+    /// the path every request's load takes.
+    #[cfg(feature = "llama-cpp")]
+    #[test]
+    fn a_resource_load_failure_exits_with_the_backend_code() {
+        use drama_llama::{Catalog, LlamaCppBackend, NewError, Session};
+        if std::env::var_os(CHILD).is_some() {
+            serve_and_wait(Router::new().route(
+                "/fault",
+                get(|| async {
+                    let root = std::env::temp_dir();
+                    let catalog =
+                        std::sync::Arc::new(Catalog::<LlamaCppBackend>::new(
+                            &root,
+                            Default::default(),
+                        ));
+                    let load = |_, _| -> Result<Session<_>, SessionError> {
+                        Err(NewError::Context.into())
+                    };
+                    let path = root.join("oom.gguf");
+                    super::super::load_with(
+                        catalog,
+                        "oom.gguf".into(),
+                        path,
+                        load,
+                    )
+                    .await
+                    .map(|_| "loaded")
+                }),
+            ));
+        }
+        let (code, stdout) = run_child(
+            "a_resource_load_failure_exits_with_the_backend_code",
+            "1",
+        );
+        assert_exited(
+            code,
+            &stdout,
+            Fatal::Backend,
+            "Could not create context",
+            &["/fault", "/ok"],
+        );
+    }
+
     /// The predictor's decode-failure panics are backend failures; the
     /// strings are `src/predictor.rs`'s `expect` messages.
     #[test]

@@ -520,6 +520,25 @@ impl SessionError {
     pub fn is_fatal(&self) -> bool {
         !self.is_reusable_after()
     }
+
+    /// For a failed load ([`FromPath::from_path_with`]), `true` if the
+    /// backend had begun allocating — out of memory loading weights or
+    /// creating the KV cache, most likely — so its state may be
+    /// partial, and the process may not be safe to load into again.
+    /// `false` for failures found before any allocation (a missing
+    /// file, unreadable metadata, a bad template) and for every error
+    /// that is not a load failure. See [`NewError::is_resource`].
+    // A build with no backend has only the fallback arm.
+    #[allow(clippy::match_single_binding)]
+    pub fn is_resource(&self) -> bool {
+        match self {
+            #[cfg(feature = "llama-cpp")]
+            Self::LlamaCppEngine(e) => e.is_resource(),
+            #[cfg(all(feature = "moeflux", target_os = "macos"))]
+            Self::MoefluxEngine(e) => e.is_resource(),
+            _ => false,
+        }
+    }
 }
 
 /// One unit of prefix-cache identity: a single text token, or one
@@ -3196,7 +3215,7 @@ impl FromPath for Session<LlamaCppBackend> {
         let started = std::time::Instant::now();
         let model =
             crate::LlamaCppModel::from_file(path.to_path_buf(), Some(params))
-                .ok_or_else(|| NewError::Model {
+                .ok_or_else(|| NewError::Metadata {
                 path: path.to_path_buf(),
             })?;
         let vocab = started.elapsed();
