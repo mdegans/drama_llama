@@ -1149,8 +1149,11 @@ pub(crate) fn emit_dict_value_rules(quote: &str, out: &mut String) {
     );
     let _ = writeln!(out, r#"dnull ::= "null" | "none" | "None""#);
     // Bare keys: anything but the key/dict terminators (upstream
-    // parity: `chars("[^:}]", 1, -1)`).
-    let _ = writeln!(out, r#"dkey ::= [^:}}]+"#);
+    // parity: `chars("[^:}]", 1, -1)`), save whitespace at either end:
+    // the parser trims a key, so `{d :1}` re-rendered `{d:1}` (#129's
+    // oracle).
+    let _ =
+        writeln!(out, r#"dkey ::= [^:}} \t\n\r] ( [^:}}]* [^:}} \t\n\r] )?"#);
     let quote_lit = escape_for_gbnf_string(quote);
     // The until-rule consumes string content AND the closing quote.
     let _ = writeln!(out, r#"dstring ::= "{quote_lit}" dstring__body"#);
@@ -2327,6 +2330,22 @@ mod tests {
         }
         for bad in ["{c:3,a:1}", "{a:1,}", "{,a:1}", "{a:1,a:1}", "{a:1b:2}"] {
             assert!(!accepts(&src, bad), "{bad}");
+        }
+    }
+
+    /// An untyped dict object's bare keys carry no whitespace at either
+    /// end: the parser trims a key, so one that did re-rendered without
+    /// it (#129's oracle). Inner whitespace is the key's own.
+    #[test]
+    fn dict_untyped_keys_have_no_edge_whitespace() {
+        let mut rules = String::from("root ::= dobject\n");
+        emit_dict_value_rules("'", &mut rules);
+        rules.push_str(JSON_GRAMMAR);
+        for ok in ["{}", "{d:1}", "{a b:1}", "{a,b:'x'}", "{d:{e:none}}"] {
+            assert!(accepts(&rules, ok), "{ok}");
+        }
+        for bad in ["{d :1}", "{ d:1}", "{\td:1}", "{d\n:1}", "{ :1}"] {
+            assert!(!accepts(&rules, bad), "{bad}");
         }
     }
 
