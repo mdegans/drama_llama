@@ -182,7 +182,9 @@ where
     Session<B>: FromPath,
 {
     /// A catalog over `root`, describing each model as `options` would
-    /// load it (the served context size comes from there).
+    /// load it (the served context size comes from there, unless the
+    /// model's load sidecar overrides it — see
+    /// [`effective_n_ctx`](crate::sidecar::effective_n_ctx)).
     pub fn new(
         root: impl Into<PathBuf>,
         options: <Session<B> as FromPath>::Options,
@@ -574,6 +576,42 @@ mod tests {
         assert_eq!(info.created_at, DateTime::<Utc>::UNIX_EPOCH);
     }
 
+    /// `/v1/models` advertises the per-model context: a load sidecar's
+    /// `n_ctx`, capped at the trained window, else the default capped
+    /// the same way. Fleet numbers; `--n-ctx 131072`.
+    #[test]
+    fn per_model_n_ctx_is_advertised() {
+        let advertised = |sidecar: Option<u32>, n_ctx_train: u32| {
+            let n_ctx = crate::sidecar::effective_n_ctx(
+                Some(131072),
+                sidecar,
+                n_ctx_train,
+            )
+            .expect("a default is set");
+            let info: ModelInfo = Advertised {
+                id: "m.gguf".into(),
+                title: None,
+                n_ctx,
+                n_ctx_train,
+                image_input: false,
+                thinking: false,
+                modified: None,
+            }
+            .into();
+            assert_eq!(info.max_tokens, info.max_input_tokens);
+            info.max_input_tokens
+        };
+        // Qwen3.8 with `n_ctx = 262144`, and with an over-ask.
+        assert_eq!(advertised(Some(262144), 262144), 262144);
+        assert_eq!(advertised(Some(1 << 20), 262144), 262144);
+        // Mistral Small 4, no sidecar: the default, not its 1M.
+        assert_eq!(advertised(None, 1 << 20), 131072);
+        // Mistral Small 4 lowered by its sidecar.
+        assert_eq!(advertised(Some(65536), 1 << 20), 65536);
+        // Qwen3 native 40960, no sidecar: the window, as before.
+        assert_eq!(advertised(None, 40960), 40960);
+    }
+
     #[cfg(feature = "llama-cpp")]
     mod llama_cpp {
         use super::*;
@@ -811,6 +849,42 @@ mod tests {
             // Refreshing an unlisted name is a no-op.
             catalog.refresh("nope.gguf", ModelInfo::new("nope", "nope"));
             assert!(catalog.info("nope.gguf").is_none());
+        }
+
+        /// A weightless peek reads the load sidecar: a model beside a
+        /// `load.toml` advertises its own (capped) `n_ctx`, a broken
+        /// sidecar falls back to the default. Vocab-only, so no
+        /// weights load.
+        #[cfg(unix)]
+        #[test]
+        #[ignore = "requires models/model.gguf"]
+        fn peek_reads_the_load_sidecar() {
+            let gguf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("models/model.gguf");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            for name in ["plain", "small", "huge", "typo"] {
+                std::os::unix::fs::symlink(
+                    &gguf,
+                    root.join(format!("{name}.gguf")),
+                )
+                .unwrap();
+            }
+            std::fs::write(root.join("small.load.toml"), "n_ctx = 2048")
+                .unwrap();
+            std::fs::write(root.join("huge.load.toml"), "n_ctx = 1073741824")
+                .unwrap();
+            std::fs::write(root.join("typo.load.toml"), "n-ctx = 2048")
+                .unwrap();
+            let catalog = catalog(root);
+            let ceiling =
+                |name: &str| catalog.info(name).unwrap().max_input_tokens;
+
+            assert_eq!(ceiling("plain.gguf"), 1024);
+            assert_eq!(ceiling("small.gguf"), 2048);
+            assert_eq!(ceiling("typo.gguf"), 1024);
+            let trained = ceiling("huge.gguf");
+            assert!(trained > 2048 && trained < 1 << 30, "{trained}");
         }
 
         /// The invariant the whole design rests on: a weightless peek

@@ -56,6 +56,17 @@ impl LlamaCppEngine {
         numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
         let model = Self::load_model(path.clone(), model_params)?;
+        Self::with_model(path, model, context_params, numa_strategy)
+    }
+
+    /// [`Self::new`] past the model load: the context, then the mmproj
+    /// sidecar.
+    fn with_model(
+        path: PathBuf,
+        model: LlamaCppModel,
+        context_params: Option<llama_context_params>,
+        numa_strategy: Option<u32>,
+    ) -> Result<Self, NewError> {
         let context_params =
             context_params.unwrap_or_else(Self::default_context_params);
         let decoder =
@@ -139,13 +150,52 @@ impl LlamaCppEngine {
         path: PathBuf,
         options: LlamaCppOptions,
     ) -> Result<Self, NewError> {
-        let mut engine = Self::new(
-            path,
-            Some(options.model_params()),
+        Self::from_path_with_n_ctx_override(path, options, None)
+    }
+
+    /// [`Self::from_path_with`], with a per-model `n_ctx` (a load
+    /// sidecar's) that beats `options.n_ctx` once capped at the model's
+    /// trained window — known only after the model loads, hence here.
+    /// See [`crate::sidecar::effective_n_ctx`]. Logs the context the
+    /// model is served with.
+    pub(crate) fn from_path_with_n_ctx_override(
+        path: PathBuf,
+        options: LlamaCppOptions,
+        n_ctx: Option<u32>,
+    ) -> Result<Self, NewError> {
+        let model =
+            Self::load_model(path.clone(), Some(options.model_params()))?;
+        let n_ctx_train = model.context_size().max(0) as u32;
+        let effective =
+            crate::sidecar::effective_n_ctx(options.n_ctx, n_ctx, n_ctx_train);
+        if let Some(requested) = n_ctx.filter(|&n| Some(n) != effective) {
+            tracing::warn!(
+                path = %path.display(),
+                requested,
+                n_ctx_train,
+                "per-model n_ctx exceeds the trained window; capped",
+            );
+        }
+        let options = LlamaCppOptions {
+            n_ctx: effective,
+            ..options
+        };
+        let mut engine = Self::with_model(
+            path.clone(),
+            model,
             Some(options.context_params()),
             options.numa,
         )?;
         engine.set_checkpoint_budget(options.checkpoint_budget());
+        tracing::info!(
+            event = "context_size",
+            path = %path.display(),
+            n_ctx = engine.n_ctx(),
+            n_ctx_train,
+            source = if n_ctx.is_some() { "sidecar" } else { "default" },
+            "serving with n_ctx {}",
+            engine.n_ctx(),
+        );
         Ok(engine)
     }
 
