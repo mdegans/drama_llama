@@ -191,9 +191,23 @@ fn tip_anchors_unmarked_continuation_issue_96() {
 #[test]
 #[ignore = "long running, requires models/model.gguf"]
 fn turn_anchor_survives_an_edited_reply() {
+    // Set rather than inherited, so the test knows the grid (#126).
+    const N_UBATCH: u32 = 64;
+    let session = || {
+        LlamaCppSession::from_path_with(
+            model_path(),
+            LlamaCppOptions::default()
+                .with_n_ctx(8192)
+                .with_n_ubatch(N_UBATCH),
+        )
+        .expect("session load")
+        .quiet()
+        .with_prefix_cache(true)
+    };
     common::tip::assert_turn_anchor_survives_an_edited_reply(
-        session_8k(),
-        session_8k,
+        session(),
+        session,
+        N_UBATCH as usize,
     );
 }
 
