@@ -31,9 +31,13 @@ supplies (its blocks in emission order, see the gpt-oss notes below):
 the first thought opens the turn as before, and a second thought —
 `<|channel>thought\nA\n<channel|><|channel>thought\nB\n<channel|>` —
 renders as its own channel block where the model wrote it instead of
-merging into one `reasoning` (the fleet sweep pins it). Everything
-else outside the thinking-channel block is byte-identical to
-`gemma4-gguf.jinja`.
+merging into one `reasoning` (the fleet sweep pins it). A null
+value (a tool-call argument, a schema `enum` member) renders `none`
+explicitly: stock prints it bare, which minijinja spells `none` up to
+2.21 and `None` from 2.22 (drama_llama#120), so the bytes followed
+the resolved library (`tests/baked_template_pin.rs` pins them).
+Everything else outside the thinking-channel block is byte-identical
+to `gemma4-gguf.jinja`.
 
 `gptoss-gguf.jinja` is dumped from the gpt-oss-20b Unsloth GGUF
 (`tokenizer.chat_template`, Apache 2.0 per its own footer) — the
@@ -41,11 +45,14 @@ Harmony template we actually serve.
 
 `gptoss-cache-stable.jinja` is drama_llama's cache-stability patch of
 `gptoss-gguf.jinja` (#30 Phase G): the macro section (system /
-developer / TypeScript tool namespace) is byte-identical to stock;
-the message loop is rewritten so `render(parse(emission))` reproduces
-the emission — analysis (CoT) renders on every reasoning turn (gated
-by `preserve_thinking`, drama_llama's default), tool calls render in
-the model's trained channel-header shape
+developer / TypeScript tool namespace) is byte-identical to stock,
+save that a string `enum` spells its null and bool members `none`,
+`true`, `false` itself (stock `join`s them, which minijinja spells
+`None`/`True` from 2.22, drama_llama#120); the message loop is
+rewritten so `render(parse(emission))` reproduces the emission —
+analysis (CoT) renders on every reasoning turn (gated by
+`preserve_thinking`, drama_llama's default), tool calls render in the
+model's trained channel-header shape
 (`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>`)
 for ALL `tool_calls` (stock renders only the first, in the role-header
 re-ingest shape), pre-call prose renders as a causal commentary
@@ -236,8 +243,8 @@ the 2026-09-30 Qwen3.6 run lost a 7364-token tip this way). The patch:
 6. Qwen3.6 only: every **non-string tool-call argument** renders with
    `tojson`. Stock 3.6 `tojson`s only mappings and sequences and
    prints every other value `| string`, which minijinja spells
-   Python-style — `null` as `none`, and from 2.24 booleans as
-   `True`/`False` (drama_llama#120). The grammar has the model write
+   Python-style — `null` as `none` (`None` from 2.22, booleans
+   `True`/`False`, drama_llama#120). The grammar has the model write
    JSON, and the parser types a non-string parameter's value from it,
    so a `<parameter=detail>\nnull\n</parameter>` the model wrote
    re-rendered as `none` and the next request lost the turn's KV

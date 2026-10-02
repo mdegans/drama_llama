@@ -69,7 +69,21 @@
         {%- endif -%}
     {%- elif param_spec.type == "string" -%}
         {%- if param_spec.enum -%}
-            {{- '"' + param_spec.enum|join('" | "') + '"' -}}
+            {#- Patch: spell each member explicitly. Stock `join`s them,
+                which prints a null or bool as minijinja's `Display`
+                has it: `none`/`true` to 2.21, `None`/`True` from 2.22
+                (drama_llama#120). -#}
+            {%- for member in param_spec.enum -%}
+                {{- '"' if loop.first else '" | "' -}}
+                {%- if member is none -%}
+                    {{- 'none' -}}
+                {%- elif member is boolean -%}
+                    {{- 'true' if member else 'false' -}}
+                {%- else -%}
+                    {{- member -}}
+                {%- endif -%}
+            {%- endfor -%}
+            {{- '"' -}}
         {%- else -%}
             {{- "string" }}
             {%- if param_spec.nullable %}

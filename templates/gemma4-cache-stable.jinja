@@ -141,6 +141,11 @@
             {%- if not loop.last %},{% endif -%}
         {%- endfor -%}
         {{- ']' -}}
+    {#- Patch: spell null explicitly. A bare `{{ argument }}` prints
+        whatever the resolved minijinja's `Display` gives: `none` to
+        2.21, `None` from 2.22 (#120). -#}
+    {%- elif argument is none -%}
+        {{- 'none' -}}
     {%- else -%}
         {{- argument -}}
     {%- endif -%}

@@ -82,8 +82,8 @@ sha2 = "0.10"
 # hazard where a downstream crate flips serde_json's Map under us
 # (#60). The dict/Gemma family is pinned alphabetical separately —
 # its templates `dictsort`.
-minijinja = { version = "2.5", features = ["loader", "json", "preserve_order"] }
-minijinja-contrib = { version = "2.5", features = ["pycompat"] }
+minijinja = { version = "2.24", features = ["loader", "json", "preserve_order"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 misanthropic = { version = "1.0.0-alpha.18", default-features = false, features = [
     "partial-eq",
 ] }

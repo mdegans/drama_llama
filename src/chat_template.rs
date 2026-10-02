@@ -4232,9 +4232,11 @@ mod tests {
 
     /// `Thinking::Disabled` is an explicit *off*: it must render as
     /// `enable_thinking = false`, like an absent `thinking`, not as on.
+    /// Read back through `tojson`: a bare bool prints per minijinja
+    /// version (`false`, `False` from 2.22, #120).
     #[test]
     fn test_thinking_disabled_renders_off() {
-        let src = "T={{ enable_thinking }}".to_owned();
+        let src = "T={{ enable_thinking | tojson }}".to_owned();
         let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
         let opts = RenderOptions::default();
         let render = |p: &Prompt| t.render_with(p, &opts).unwrap();
