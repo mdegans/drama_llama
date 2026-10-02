@@ -245,7 +245,8 @@ pub enum SessionError {
     /// returned silently, and neither is an answer the constraint never
     /// saw: a deferred (phase-split) `output_config` grammar whose trigger
     /// never came, which leaves the cache warm, as nothing was
-    /// mid-constraint.
+    /// mid-constraint. Nor is a turn that ended inside a thought it never
+    /// closed (the dialect's framing left open; cache warm too).
     ///
     /// *Not* raised for a turn cut short by `max_tokens`, the context
     /// limit, or a stop sequence (#121): that is an unfinished turn, not
@@ -8731,6 +8732,18 @@ impl<B: Backend> Session<B> {
                     partial_output: crate::prompt::Content(blocks),
                 });
             }
+            Some(Breach::OpenThought) => {
+                #[cfg(feature = "axum")]
+                tracing::error!(
+                    target: "drama_llama::session",
+                    generated_tokens = generated_count,
+                    "the model ended its turn inside an unclosed thought; \
+                     rejected — prompt cache extent is warm, resample",
+                );
+                return Err(SessionError::GrammarViolation {
+                    partial_output: crate::prompt::Content(blocks),
+                });
+            }
             Some(Breach::Incomplete) | None => {}
         }
 
@@ -8743,7 +8756,6 @@ impl<B: Backend> Session<B> {
             blocks
                 .iter()
                 .any(|b| matches!(b, crate::Block::ToolUse { .. })),
-            blocks.last(),
             cut,
             generated_count,
             NonZeroUsize::new(prompt.max_tokens.get() as usize).unwrap(),
@@ -9232,6 +9244,14 @@ enum Breach {
     /// [`SessionError::GrammarViolation`] with the cache left warm, since
     /// the constraint completed.
     Overruled,
+    /// The model ended its turn inside a thought it never closed: a
+    /// [`SessionError::GrammarViolation`] with the cache left warm, since
+    /// no constraint was involved. Returned, the open thought could only
+    /// ever be the sole block of a trailing assistant message (see
+    /// [`OPEN_THOUGHT_SIGNATURE`](crate::prompt::OPEN_THOUGHT_SIGNATURE)),
+    /// so the client's next turn would be rejected; and as no `max_tokens`
+    /// cut, it has no honest stop reason.
+    OpenThought,
 }
 
 /// How generation ended, as far as [`TurnContract::breach`] cares.
@@ -9302,6 +9322,9 @@ impl TurnContract {
         }
         if let Some(mismatch) = self.schema_mismatch(blocks) {
             return Some(Breach::Schema(mismatch));
+        }
+        if blocks.last().is_some_and(crate::prompt::is_open_thought) {
+            return Some(Breach::OpenThought);
         }
         (self.deferred_answer && end.deferred_unfired && !called())
             .then_some(Breach::Unfired)
@@ -9691,9 +9714,8 @@ struct CallOutcome {
     /// projected `response::Message` provably matches the session's
     /// own accounting (one build, two homes).
     usage: Usage,
-    /// Inferred [`StopReason`](misanthropic::response::StopReason),
-    /// or `None` if ambiguous.
-    stop_reason: Option<misanthropic::response::StopReason>,
+    /// Inferred [`StopReason`](misanthropic::response::StopReason).
+    stop_reason: misanthropic::response::StopReason,
     /// The exact stop string that matched, if any. Populated only
     /// when `stop_reason == Some(StopSequence)`.
     stop_sequence: Option<String>,
@@ -9873,49 +9895,33 @@ fn drop_repeated_calls(
 /// 2. `ToolUse` — a tool call terminated the turn, Anthropic-style.
 /// 3. `MaxTokens` — `generated_tokens >= max_tokens`, for a caller
 ///    that has no [`Cut`] to offer.
-/// 4. `EndTurn` — the last block is closed prose or a closed thought.
-/// 5. `None` — ambiguous; surfaces as `null` on the wire.
+/// 4. `EndTurn` — anything else: generation ended on its own, which is
+///    a finished turn whatever it holds. Anthropic answers an empty one
+///    `end_turn` too, and never `null` on a finished message, so there
+///    is no ambiguous case: a `null` once read as "no action" to a
+///    client and the turn was dropped (live, Mistral 4, 2026-10-02).
+///    A turn that ended inside an open thought is not returned at all
+///    ([`TurnContract::breach`] rejects it first).
 ///
 /// A turn whose grammar finished on the budget's very last token is
 /// not a cut (see [`Cut::of`]), so a forced call that fits exactly
 /// still reports `ToolUse`.
 fn infer_stop_reason(
     tool_use: bool,
-    last: Option<&crate::Block>,
     cut: Option<Cut>,
     generated_tokens: usize,
     max_tokens: NonZeroUsize,
-) -> (Option<misanthropic::response::StopReason>, Option<String>) {
+) -> (misanthropic::response::StopReason, Option<String>) {
     use misanthropic::response::StopReason;
 
     match cut {
-        Some(Cut::StopSequence(s)) => {
-            return (Some(StopReason::StopSequence), Some(s));
+        Some(Cut::StopSequence(s)) => (StopReason::StopSequence, Some(s)),
+        Some(Cut::Budget) => (StopReason::MaxTokens, None),
+        None if tool_use => (StopReason::ToolUse, None),
+        None if generated_tokens >= max_tokens.get() => {
+            (StopReason::MaxTokens, None)
         }
-        Some(Cut::Budget) => return (Some(StopReason::MaxTokens), None),
-        None => {}
-    }
-
-    if tool_use {
-        return (Some(StopReason::ToolUse), None);
-    }
-
-    if generated_tokens >= max_tokens.get() {
-        return (Some(StopReason::MaxTokens), None);
-    }
-
-    match last {
-        // An *open* thought is the opposite of an ended turn: the
-        // reasoning block never closed. `MaxTokens` above catches the
-        // usual cause, so reaching here means the model emitted EOS
-        // mid-thought — genuinely ambiguous, which is what `None` is
-        // for. Never `EndTurn`.
-        Some(b) if crate::prompt::is_open_thought(b) => (None, None),
-        Some(crate::Block::Text { .. })
-        | Some(crate::Block::Thought { .. }) => {
-            (Some(StopReason::EndTurn), None)
-        }
-        _ => (None, None),
+        None => (StopReason::EndTurn, None),
     }
 }
 
@@ -10005,7 +10011,7 @@ pub struct BlockStream<'engine, B: Backend> {
     /// one (see `TurnCalls`).
     calls: TurnCalls,
     /// Set once drained: see [`Self::stop_reason`].
-    stop: Option<(Option<misanthropic::response::StopReason>, Option<String>)>,
+    stop: Option<(misanthropic::response::StopReason, Option<String>)>,
     /// What the turn owes its constraints, judged once drained.
     contract: TurnContract,
     /// Set once drained: see [`Self::violation`].
@@ -10018,8 +10024,7 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
     /// same rules — once the stream is drained; `None` before.
     pub fn stop_reason(
         &self,
-    ) -> Option<(Option<misanthropic::response::StopReason>, Option<&str>)>
-    {
+    ) -> Option<(misanthropic::response::StopReason, Option<&str>)> {
         self.stop
             .as_ref()
             .map(|(reason, seq)| (*reason, seq.as_deref()))
@@ -10041,8 +10046,9 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
 
     /// Once drained, the error the batch path would have returned
     /// instead of this turn — a [`SessionError::GrammarViolation`] (a
-    /// constraint left mid-structure, a forced call that never came, or a
-    /// deferred output_config grammar that never activated) or a
+    /// constraint left mid-structure, a forced call that never came, a
+    /// deferred output_config grammar that never activated, or a turn
+    /// that ended inside an unclosed thought) or a
     /// [`SessionError::SchemaViolation`] — judged by the same rules, a
     /// cut turn included (#121). `None` before then, and for a turn that
     /// stands. The blocks have been yielded either way: a caller holding
@@ -10123,14 +10129,16 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         self.stop = Some(infer_stop_reason(
             turn.iter()
                 .any(|b| matches!(b, crate::Block::ToolUse { .. })),
-            turn.last(),
             cut,
             self.generated,
             self.max_tokens,
         ));
         let partial_output = crate::prompt::Content(turn);
         self.violation = breach.map(|breach| match breach {
-            Breach::Incomplete | Breach::Unfired | Breach::Overruled => {
+            Breach::Incomplete
+            | Breach::Unfired
+            | Breach::Overruled
+            | Breach::OpenThought => {
                 SessionError::GrammarViolation { partial_output }
             }
             Breach::Schema(mismatch) => SessionError::SchemaViolation {
@@ -11452,28 +11460,16 @@ mod tests {
         assert_eq!(merged, vec!["one two".into(), closed("three")]);
     }
 
-    /// A trailing *open* thought is the opposite of an ended turn.
-    /// `MaxTokens` catches the usual cause; reaching the trailing-block
-    /// arm means EOS mid-thought, which is genuinely ambiguous.
+    /// Generation that ended on its own is `EndTurn`, whatever the
+    /// turn holds: an empty turn too, as on Anthropic. There is no
+    /// `null` case left to read as "no action" (live, Mistral 4).
     #[test]
-    fn test_infer_stop_reason_open_thought_is_not_end_turn() {
+    fn test_infer_stop_reason_is_never_null() {
         use misanthropic::response::StopReason;
         let max = NonZeroUsize::new(100).unwrap();
-
-        let closed = [crate::Block::Thought {
-            thought: "done".into(),
-            signature: "".into(),
-        }];
         assert_eq!(
-            infer_stop_reason(false, closed.last(), None, 10, max).0,
-            Some(StopReason::EndTurn),
-        );
-
-        let open = [crate::prompt::open_thought("cut off")];
-        assert_eq!(
-            infer_stop_reason(false, open.last(), None, 10, max).0,
-            None,
-            "an unclosed thought never reports EndTurn",
+            infer_stop_reason(false, None, 0, max).0,
+            StopReason::EndTurn,
         );
     }
 
@@ -13946,27 +13942,9 @@ mod tests {
     #[test]
     fn test_infer_stop_reason_tool_use_wins() {
         use misanthropic::response::StopReason;
-        use misanthropic::tool::Use;
-        let blocks = [
-            crate::Block::Text {
-                text: "ok".into(),
-                cache_control: None,
-                citations: None,
-            },
-            crate::Block::ToolUse {
-                call: Use {
-                    id: "id".into(),
-                    name: "t".into(),
-                    input: serde_json::json!({}),
-                    cache_control: None,
-                    caller: None,
-                },
-            },
-        ];
         let max = NonZeroUsize::new(8).unwrap();
-        let (reason, seq) =
-            infer_stop_reason(true, blocks.last(), None, 8, max);
-        assert_eq!(reason, Some(StopReason::ToolUse));
+        let (reason, seq) = infer_stop_reason(true, None, 8, max);
+        assert_eq!(reason, StopReason::ToolUse);
         assert_eq!(seq, None);
     }
 
@@ -13978,19 +13956,17 @@ mod tests {
     fn test_infer_stop_reason_cut_outranks_tool_use() {
         use misanthropic::response::StopReason;
         let max = NonZeroUsize::new(64).unwrap();
-        let (reason, seq) =
-            infer_stop_reason(true, None, Some(Cut::Budget), 64, max);
-        assert_eq!(reason, Some(StopReason::MaxTokens));
+        let (reason, seq) = infer_stop_reason(true, Some(Cut::Budget), 64, max);
+        assert_eq!(reason, StopReason::MaxTokens);
         assert_eq!(seq, None);
 
         let (reason, seq) = infer_stop_reason(
             true,
-            None,
             Some(Cut::StopSequence("###".into())),
             12,
             max,
         );
-        assert_eq!(reason, Some(StopReason::StopSequence));
+        assert_eq!(reason, StopReason::StopSequence);
         assert_eq!(seq.as_deref(), Some("###"));
     }
 
@@ -14010,21 +13986,14 @@ mod tests {
     #[test]
     fn test_infer_stop_reason_stop_sequence() {
         use misanthropic::response::StopReason;
-        // The match is already cut out of the text (#122).
-        let blocks = [crate::Block::Text {
-            text: "hello ".into(),
-            cache_control: None,
-            citations: None,
-        }];
         let max = NonZeroUsize::new(128).unwrap();
         let (reason, seq) = infer_stop_reason(
             false,
-            blocks.last(),
             Some(Cut::StopSequence("STOP".into())),
             3,
             max,
         );
-        assert_eq!(reason, Some(StopReason::StopSequence));
+        assert_eq!(reason, StopReason::StopSequence);
         assert_eq!(seq.as_deref(), Some("STOP"));
     }
 
@@ -14033,15 +14002,9 @@ mod tests {
     #[test]
     fn test_infer_stop_reason_max_tokens() {
         use misanthropic::response::StopReason;
-        let blocks = [crate::Block::Text {
-            text: "truncated".into(),
-            cache_control: None,
-            citations: None,
-        }];
         let max = NonZeroUsize::new(16).unwrap();
-        let (reason, seq) =
-            infer_stop_reason(false, blocks.last(), None, 16, max);
-        assert_eq!(reason, Some(StopReason::MaxTokens));
+        let (reason, seq) = infer_stop_reason(false, None, 16, max);
+        assert_eq!(reason, StopReason::MaxTokens);
         assert_eq!(seq, None);
     }
 
@@ -14049,14 +14012,9 @@ mod tests {
     #[test]
     fn test_infer_stop_reason_end_turn() {
         use misanthropic::response::StopReason;
-        let blocks = [crate::Block::Text {
-            text: "done.".into(),
-            cache_control: None,
-            citations: None,
-        }];
         let max = NonZeroUsize::new(64).unwrap();
-        let (reason, _) = infer_stop_reason(false, blocks.last(), None, 5, max);
-        assert_eq!(reason, Some(StopReason::EndTurn));
+        let (reason, _) = infer_stop_reason(false, None, 5, max);
+        assert_eq!(reason, StopReason::EndTurn);
     }
 
     /// Default [`Usage`] is the all-zero shape [`Session`] starts
@@ -17129,7 +17087,7 @@ mod tests {
             assert_eq!(call_inputs(&streamed), [&input]);
             assert_eq!(
                 stream.stop_reason(),
-                Some((Some(misanthropic::response::StopReason::ToolUse), None)),
+                Some((misanthropic::response::StopReason::ToolUse, None)),
             );
             assert_eq!(stream.open_call_json(), None);
         });
@@ -17167,10 +17125,7 @@ mod tests {
 
         let mut stream = session.complete_stream(&prompt).expect("stream");
         let streamed: Vec<crate::Block> = stream.by_ref().collect();
-        assert_eq!(
-            stream.stop_reason(),
-            Some((Some(StopReason::MaxTokens), None)),
-        );
+        assert_eq!(stream.stop_reason(), Some((StopReason::MaxTokens, None)),);
         let streamed = call_inputs(&streamed).into_iter().cloned().collect();
         (batch, streamed, stream.open_call_json().map(str::to_owned))
     }

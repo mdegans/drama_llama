@@ -2137,4 +2137,97 @@ mod tests {
         assert_eq!(capped.read, tip as u64);
         assert_eq!(capped.source.as_deref(), Some("tip"));
     }
+
+    /// The `<think>`/`</think>` dialect, thoughts the model opens
+    /// itself, for the stop-reason cases below.
+    fn tag_thought_dialect() -> crate::CallSyntax {
+        let mut dialect = session().dialect().clone();
+        dialect.reasoning.mode = crate::dialect::ReasoningMode::TagBased;
+        dialect.reasoning.start = "<think>".into();
+        dialect.reasoning.end = "</think>".into();
+        dialect
+    }
+
+    /// How a scripted turn ends, on both paths: the batch response (or
+    /// its error) and the drained stream's stop reason and violation.
+    fn ending(
+        script: Vec<Token>,
+        max_tokens: u32,
+    ) -> (
+        Result<misanthropic::response::Message, SessionError>,
+        Option<misanthropic::response::StopReason>,
+        bool,
+    ) {
+        let prompt = Prompt {
+            messages: vec![message(crate::Role::User, vec![text("go")])],
+            max_tokens: max_tokens.try_into().expect("non-zero"),
+            ..Prompt::default()
+        };
+        let batch = scripted(script.clone())
+            .with_dialect(tag_thought_dialect())
+            .complete_response(&prompt);
+        let mut s = scripted(script).with_dialect(tag_thought_dialect());
+        let mut stream = s.complete_stream(&prompt).expect("stream");
+        stream.by_ref().for_each(drop);
+        let reason = stream.stop_reason().map(|(reason, _)| reason);
+        (batch, reason, stream.violation().is_some())
+    }
+
+    /// Live on Mistral 4 a turn came back `stop_reason: null`, which
+    /// the client read as "no action" and dropped: the model ended its
+    /// turn inside a thought it never closed. That turn is now the
+    /// resample a grammar violation asks for, on both paths, with the
+    /// open thought kept in `partial_output`.
+    #[test]
+    fn a_turn_ending_inside_a_thought_is_resampled() {
+        use misanthropic::response::StopReason;
+        let (batch, reason, violation) =
+            ending([vec![THINK], bytes("a")].concat(), 64);
+        match batch {
+            Err(SessionError::GrammarViolation { partial_output }) => {
+                let last = partial_output.0.last().expect("a block");
+                assert!(crate::prompt::is_open_thought(last), "{last:?}");
+            }
+            other => panic!("expected a grammar violation, got {other:?}"),
+        }
+        assert!(violation, "the stream reports it too");
+        assert_eq!(reason, Some(StopReason::EndTurn), "never null");
+    }
+
+    /// A turn the model ends with nothing to say is `end_turn`, as on
+    /// Anthropic, not `null`. So is one that holds only a closed
+    /// thought.
+    #[test]
+    fn a_turn_that_ends_on_its_own_is_end_turn() {
+        use misanthropic::response::StopReason;
+        for script in [
+            vec![IM_END],
+            [vec![THINK], bytes("a"), vec![THINK_END]].concat(),
+        ] {
+            let (batch, reason, violation) = ending(script.clone(), 64);
+            let response = batch.expect("a finished turn");
+            assert_eq!(
+                response.stop_reason,
+                Some(StopReason::EndTurn),
+                "{script:?}"
+            );
+            assert_eq!(reason, Some(StopReason::EndTurn), "{script:?}");
+            assert!(!violation, "{script:?}");
+        }
+    }
+
+    /// A thought the budget cuts is still a clip, `max_tokens`, and
+    /// comes back open: the shape a client continues.
+    #[test]
+    fn a_thought_the_budget_cuts_is_max_tokens() {
+        use misanthropic::response::StopReason;
+        let script = [vec![THINK], bytes("abcdefgh")].concat();
+        let (batch, reason, violation) = ending(script, 4);
+        let response = batch.expect("a clipped turn");
+        assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
+        let last = response.inner.content.last().expect("a block");
+        assert!(crate::prompt::is_open_thought(last), "{last:?}");
+        assert_eq!(reason, Some(StopReason::MaxTokens));
+        assert!(!violation);
+    }
 }
