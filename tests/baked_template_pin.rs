@@ -205,3 +205,99 @@ fn baked_templates_render_pinned_bytes() {
         .collect();
     assert!(drift.is_empty(), "{}", drift.join("\n\n"));
 }
+
+/// Live on Mistral 4 a user message gained a second text block (an
+/// end-of-session question) and the next request re-prefilled all of
+/// the first. Every bake must render the grown message as the old one's
+/// bytes through the first block's text, then more: nothing before the
+/// end of the first block may move. Rendered with the served options,
+/// thinking on and off, as the only message and after a finished turn.
+/// (Every bake already does: the live miss was the prefix cache's
+/// anchors, which sit at message ends, so none fell inside the grown
+/// message.)
+///
+/// The first block ends without whitespace: the Qwen and Gemma 4 bakes
+/// keep stock's `| trim` of user content, so a trailing newline on the
+/// first block is dropped alone and kept once a block follows it.
+#[test]
+fn a_text_block_appended_to_a_user_message_only_appends_bytes() {
+    const FIRST: &str = "  A long post, quoted [in] full.\n\nThe end.";
+    const SECOND: &str = "\n\nOne last question?";
+    let grown = |prompt: &Prompt| {
+        let mut prompt = prompt.clone();
+        let last = prompt.messages.last_mut().expect("a message");
+        last.content.0.push(text(SECOND));
+        prompt
+    };
+    let alone = |thinking: bool| Prompt {
+        messages: vec![Message {
+            role: Role::User,
+            content: Content(vec![text(FIRST)]),
+        }],
+        ..conversation(thinking)
+    };
+    let after_a_turn = |thinking: bool| {
+        let mut prompt = conversation(thinking);
+        let last = prompt.messages.last_mut().expect("a message");
+        last.content = Content(vec![text(FIRST)]);
+        prompt
+    };
+    let broken: Vec<String> = baked::ALL
+        .iter()
+        .flat_map(|b| {
+            [true, false].into_iter().flat_map(move |thinking| {
+                [
+                    ("alone", alone(thinking)),
+                    ("after", after_a_turn(thinking)),
+                ]
+                .into_iter()
+                .map(move |(case, prompt)| (b, thinking, case, prompt))
+            })
+        })
+        .filter_map(|(b, thinking, case, prompt)| {
+            let (bos, eos) = specials(b.name);
+            let syntax = analyze_template(b.replacement, bos, eos)
+                .expect("baked template analyzes");
+            let template = ChatTemplate::from_source(
+                b.replacement.to_owned(),
+                bos.to_owned(),
+                eos.to_owned(),
+            )
+            .expect("baked template compiles");
+            let opts = RenderOptions::default()
+                .with_generation_prompt(true)
+                .with_extra("preserve_thinking", true)
+                .with_thought_reingest(syntax.reasoning.reingest)
+                .with_reasoning_start(syntax.reasoning.start.clone())
+                .with_efforts(syntax.reasoning.efforts.clone());
+            let render = |prompt: &Prompt| {
+                template
+                    .render_with(prompt, &opts)
+                    .map(|r| mask_date(&r))
+                    .unwrap_or_else(|e| panic!("{}: {e}", b.name))
+            };
+            let before = render(&prompt);
+            let after = render(&grown(&prompt));
+            let name = format!("{}.{case}.thinking={thinking}", b.name);
+            // The first block's text, as the template seated it.
+            let seated = FIRST.trim_start();
+            let Some(at) = before.rfind(seated) else {
+                return Some(format!("{name}: first block not rendered"));
+            };
+            let through = &before[..at + seated.len()];
+            (!after.starts_with(through)).then(|| {
+                let split = through
+                    .bytes()
+                    .zip(after.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                format!(
+                    "{name}: parts at byte {split} of {}\n--- one block \
+                     ---\n{before}\n--- two blocks ---\n{after}",
+                    through.len()
+                )
+            })
+        })
+        .collect();
+    assert!(broken.is_empty(), "{}", broken.join("\n\n"));
+}
