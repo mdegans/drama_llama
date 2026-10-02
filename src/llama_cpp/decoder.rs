@@ -990,6 +990,17 @@ impl Decoder for LlamaCppDecoder {
             .restore(&mut ContextMemory(self.context), seq_id, pos)
     }
 
+    /// `true` on a dense model ([`Checkpointing::Off`]) for any
+    /// position the sequence holds — what [`Self::restore_to`] then
+    /// does is the plain truncate.
+    fn truncate_restores(&mut self, seq_id: i32, pos: i32) -> bool {
+        self.checkpoints.truncate_restores(
+            &mut ContextMemory(self.context),
+            seq_id,
+            pos,
+        )
+    }
+
     /// Drop the checkpoint at `(seq_id, pos)`, if one exists.
     /// Idempotent; trivially `Ok` when nothing is stored.
     fn forget_pos(

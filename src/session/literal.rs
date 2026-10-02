@@ -468,7 +468,7 @@ mod tests {
     };
     use misanthropic::prompt::message::{CacheControl, Content, Message};
     use std::borrow::Cow;
-    use std::num::NonZeroU128;
+    use std::num::{NonZeroU128, NonZeroU32};
 
     const IM_START: Token = 300;
     const IM_END: Token = 301;
@@ -615,6 +615,17 @@ mod tests {
         }
     }
 
+    /// How a [`LitDecoder`] rewinds, when a test cares.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Rewind {
+        /// Anywhere, by truncation: a dense llama.cpp model
+        /// (`truncate_restores` is `true`).
+        Anywhere,
+        /// Only to a position it checkpointed: a recurrent or hybrid
+        /// model (`truncate_restores` is `false`).
+        Checkpoints,
+    }
+
     /// Flat logits, or — given a `script` — one-hot on each scripted
     /// token in turn and on [`IM_END`] after: the "model" emits exactly
     /// the ids a test dictates.
@@ -628,6 +639,13 @@ mod tests {
         /// otherwise the KV reads as empty.
         track_kv: bool,
         kv_max: i32,
+        /// `None`: every restore succeeds, and `truncate_restores` is
+        /// the trait default.
+        rewind: Option<Rewind>,
+        /// Every `(seq, pos)` checkpoint asked for, in order.
+        checkpoints: Vec<(i32, i32)>,
+        /// Every `(seq, pos)` restore asked for, in order.
+        restores: Vec<(i32, i32)>,
     }
 
     impl LitDecoder {
@@ -688,9 +706,30 @@ mod tests {
                 -1
             }
         }
-        fn checkpoint_pos(&mut self, _: i32, _: i32) {}
-        fn restore_to(&mut self, _: i32, _: i32) -> Result<(), MemoryRmError> {
-            Ok(())
+        fn checkpoint_pos(&mut self, seq: i32, pos: i32) {
+            self.checkpoints.push((seq, pos));
+        }
+        fn restore_to(
+            &mut self,
+            seq: i32,
+            pos: i32,
+        ) -> Result<(), MemoryRmError> {
+            self.restores.push((seq, pos));
+            match self.rewind {
+                None => Ok(()),
+                Some(Rewind::Checkpoints)
+                    if !self.checkpoints.contains(&(seq, pos)) =>
+                {
+                    Err(MemoryRmError::NoCheckpoint { pos })
+                }
+                Some(_) => {
+                    self.kv_max = pos - 1;
+                    Ok(())
+                }
+            }
+        }
+        fn truncate_restores(&mut self, _: i32, _: i32) -> bool {
+            self.rewind == Some(Rewind::Anywhere)
         }
         fn forget_pos(&mut self, _: i32, _: i32) -> Result<(), MemoryRmError> {
             Ok(())
@@ -745,6 +784,29 @@ mod tests {
             decoder: LitDecoder {
                 script,
                 track_kv: true,
+                ..LitDecoder::default()
+            },
+            model: LitModel,
+            probe_hook: None,
+        };
+        Session::from_engine(engine)
+            .expect("lit session")
+            .with_prefix_cache(true)
+    }
+
+    /// [`scripted`], rewinding per `rewind`, the KV head reported (so
+    /// an auto-tip is kept) when `track_kv`.
+    fn rewinding(
+        script: &str,
+        rewind: Rewind,
+        track_kv: bool,
+    ) -> Session<LitBackend> {
+        let engine = crate::Engine::<LitBackend> {
+            vision: None,
+            decoder: LitDecoder {
+                script: bytes(script),
+                track_kv,
+                rewind: Some(rewind),
                 ..LitDecoder::default()
             },
             model: LitModel,
@@ -1914,5 +1976,165 @@ mod tests {
             let text = s.complete_text(&tool_prompt()).unwrap();
             assert!(!text.contains("</tool_call></tool_call>"), "{text:?}");
         }
+    }
+
+    /// What the walk-point repros below read off a two-call run: the
+    /// slot after call 1, call 2's entries, and the restores and cache
+    /// read call 2 made, and the source of its reuse.
+    struct Walked {
+        /// Call 1's system marker.
+        marker: crate::session::EntryPos,
+        /// Where call 1's generation began, and its tip, if kept.
+        turn: usize,
+        tip: Option<usize>,
+        /// How far call 2's entries agree with the slot's.
+        lcp: usize,
+        restores: Vec<(i32, i32)>,
+        read: u64,
+        source: Option<String>,
+    }
+
+    /// Run `first`, then `second`, on a session writing `reply` and
+    /// rewinding per `rewind`. Every entry here is one token, so entry,
+    /// position and cell counts coincide.
+    fn walk_run(
+        reply: &str,
+        rewind: Rewind,
+        track_kv: bool,
+        first: &Prompt,
+        second: &Prompt,
+    ) -> Walked {
+        use crate::session::tests::{capture_events, field};
+        let mut s = rewinding(reply, rewind, track_kv);
+        s.complete_response(first).expect("call 1");
+        let (marker, turn, tip, prev) = {
+            let cache = s.prefix_cache.as_ref().expect("cache");
+            let slot = cache.last_slot().expect("a slot");
+            (
+                slot.breakpoints[0].at,
+                slot.turn_start,
+                slot.tip.as_ref().map(|t| t.at.entry),
+                slot.prev_entries.clone(),
+            )
+        };
+        let new_entries = s.prepare_call_cached(second, true).unwrap().entries;
+        let lcp = prev
+            .iter()
+            .zip(&new_entries)
+            .take_while(|(a, b)| a == b)
+            .count();
+        s.engine.decoder.restores.clear();
+        let mut read = None;
+        let events = capture_events(|| {
+            let usage = s.complete_response(second).expect("call 2").usage;
+            read = usage.cache_read_input_tokens;
+        });
+        let source = events
+            .iter()
+            .find(|(_, f)| field(f, "outcome") == Some("hit"))
+            .and_then(|(_, f)| field(f, "source"))
+            .map(str::to_owned);
+        Walked {
+            marker,
+            turn,
+            tip,
+            lcp,
+            restores: s.engine.decoder.restores.clone(),
+            read: read.unwrap_or(0),
+            source,
+        }
+    }
+
+    /// A system prompt marked for caching, then `user`'s text blocks
+    /// as one user message.
+    fn marked_system(user: &[&str]) -> Prompt {
+        Prompt {
+            system: Some(Content(vec![cached("You are terse.")])),
+            messages: vec![message(
+                crate::Role::User,
+                user.iter().map(|t| text(t)).collect(),
+            )],
+            ..Prompt::default()
+        }
+    }
+
+    /// #102, the Mistral shape from the repro-20260729 bundle: a text
+    /// block appended to the final user message, `[A]` then `[A, B]`.
+    /// The two merge into one turn, so the prompt parts from the slot
+    /// *inside* message 0, past the system marker and short of every
+    /// later anchor. A dense model resumes at the walk point there; a
+    /// model that rewinds only to its checkpoints resumes at the marker,
+    /// one rung down — never at zero.
+    #[test]
+    fn a_two_block_append_resumes_inside_the_message() {
+        let first = marked_system(&["Tell me about the sea."]);
+        let second = marked_system(&["Tell me about the sea.", " Briefly."]);
+
+        let dense = walk_run("Waves.", Rewind::Anywhere, true, &first, &second);
+        let walk = dense.lcp - 1;
+        assert!(
+            dense.marker.entry < walk && walk < dense.turn,
+            "the premise: parted inside message 0, past the marker \
+             (marker {}, walk {walk}, turn {})",
+            dense.marker.entry,
+            dense.turn,
+        );
+        assert_eq!(dense.restores, [(0, walk as i32)]);
+        assert_eq!(dense.read, walk as u64);
+        assert_eq!(dense.source.as_deref(), Some("walk"));
+
+        let hybrid =
+            walk_run("Waves.", Rewind::Checkpoints, true, &first, &second);
+        assert_eq!(hybrid.restores, [(0, hybrid.marker.pos as i32)]);
+        assert_eq!(hybrid.read, hybrid.marker.pos as u64);
+        assert!(hybrid.read > 0);
+        assert_eq!(hybrid.source.as_deref(), Some("hash"), "the marker");
+    }
+
+    /// #102: the client echoes the reply back edited mid-turn. On a
+    /// dense model the next call resumes at the walk point inside that
+    /// turn — past the turn anchor, short of the tip — rather than at
+    /// the turn anchor.
+    ///
+    /// A reply cut by `max_tokens` leaves its last token out of the KV,
+    /// so the slot's predicted tail is that token and the close. Echoed
+    /// unedited, the prompt agrees through both — two entries past the
+    /// KV head — and the walk point, capped at the head, yields to the
+    /// tip there instead of resuming past what the KV holds.
+    #[test]
+    fn an_edited_reply_resumes_at_the_walk_point_in_its_turn() {
+        use crate::Role::{Assistant, User};
+        let reply = "Seven, I think so.";
+        let first = marked_system(&["Pick a number."]);
+        let mut second = first.clone();
+        second
+            .messages
+            .push(message(Assistant, vec![text("Seven, I said so.")]));
+        second.messages.push(message(User, vec![text("Another.")]));
+
+        let run = walk_run(reply, Rewind::Anywhere, true, &first, &second);
+        let tip = run.tip.expect("a tip");
+        let walk = run.lcp - 1;
+        assert!(
+            run.turn < walk && walk < tip,
+            "inside the turn: turn {}, walk {walk}, tip {tip}",
+            run.turn,
+        );
+        assert_eq!(run.restores, [(0, walk as i32)]);
+        assert_eq!(run.read, walk as u64);
+        assert_eq!(run.source.as_deref(), Some("walk"));
+
+        let cut = first.clone().max_tokens(NonZeroU32::new(5).unwrap());
+        let mut echoed = cut.clone();
+        echoed
+            .messages
+            .push(message(Assistant, vec![text("Seven")]));
+        echoed.messages.push(message(User, vec![text("Another.")]));
+        let capped = walk_run(reply, Rewind::Anywhere, true, &cut, &echoed);
+        let tip = capped.tip.expect("a tip");
+        assert!(capped.lcp - 1 > tip, "the premise: agrees past the head");
+        assert_eq!(capped.restores, [(0, tip as i32)]);
+        assert_eq!(capped.read, tip as u64);
+        assert_eq!(capped.source.as_deref(), Some("tip"));
     }
 }

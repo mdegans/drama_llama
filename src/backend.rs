@@ -186,6 +186,20 @@ pub trait Decoder: Send {
         pos: i32,
     ) -> Result<(), MemoryRmError>;
 
+    /// Whether [`Decoder::restore_to`]`(seq_id, pos)` would succeed by
+    /// truncating the KV alone, no checkpoint needed — true at *any*
+    /// position the sequence holds, not only at a snapshotted one.
+    ///
+    /// `Session` offers such a backend the point a new prompt parts
+    /// from a cached slot as one more restore rung (#102), where
+    /// otherwise it resumes at the last anchor before it. Default
+    /// `false`: only anchors, the safe answer for a backend that does
+    /// not say. llama.cpp answers `true` on a dense model.
+    fn truncate_restores(&mut self, seq_id: i32, pos: i32) -> bool {
+        let _ = (seq_id, pos);
+        false
+    }
+
     /// Drop the snapshot stored at `(seq_id, pos)` without otherwise
     /// disturbing decoder state.
     ///
