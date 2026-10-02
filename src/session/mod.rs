@@ -971,10 +971,12 @@ fn tripwire_violation(
     new_breakpoint_hashes: &[[u8; 32]],
 ) -> Option<String> {
     use std::fmt::Write;
-    // A new call with NO breakpoints and no partial hashes cannot
-    // reuse anything — hash matching needs the new call's hashes, and
-    // the LCP path only reuses at the new call's marked positions —
-    // so its miss is structural, never a violation. This is every
+    // A new call with NO breakpoints and no partial hashes has no
+    // anchor of its own — hash matching needs the new call's hashes,
+    // and the LCP walk then offers only a slot's own anchors (an
+    // earlier call's breakpoints, its tip), none of which sat inside
+    // the shared prefix or selection would have taken it — so its
+    // miss is structural, never a violation. This is every
     // seat's first turn under the `Chat` driver (markers land after
     // seated *assistant* turns), even when seats share a large
     // tool-schema prefix: the council's four advisors share ~350
@@ -2524,12 +2526,15 @@ fn entries_spelling<M: Model>(model: &M, entries: &[CacheEntry]) -> Vec<u8> {
 }
 
 /// What [`hash_keyed_l_hit`] found.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct HashKeyedHit {
     /// Largest cached position reusable in BOTH coordinate spaces. A
     /// zero entry means the hash path offers nothing and the caller
     /// should fall back to the LCP walk.
     at: EntryPos,
+    /// Every such position, [`Self::at`] among them, in candidate
+    /// order — the hash path's rungs of the [`restore_ladder`].
+    agreeing: Vec<EntryPos>,
     /// The largest candidate whose hash matched but whose entries did
     /// not — `(cached, new)`, both being where that hash's bytes *end*
     /// in their respective lists. Observability only: this is the
@@ -2640,6 +2645,7 @@ fn hash_keyed_l_hit(
         };
         let agrees = new_end == cached_end && cached_end.entry <= lcp;
         if agrees {
+            out.agreeing.push(bp.at);
             if bp.at.entry > out.at.entry {
                 out.at = bp.at;
             }
@@ -2673,6 +2679,11 @@ enum ReuseSource {
     Lookback,
     /// The slot's post-generation tip ([`PrefixSlot::tip`]).
     Tip,
+    /// The divergence point the LCP walk found, no anchor at all: a
+    /// rung only where the backend rewinds there by truncation, and
+    /// only on a slot offering a real anchor (see [`restore_ladder`]).
+    /// Carries no sampler state.
+    Walk,
 }
 
 impl ReuseSource {
@@ -2683,17 +2694,20 @@ impl ReuseSource {
             Self::Breakpoint => "breakpoint",
             Self::Lookback => "lookback",
             Self::Tip => "tip",
+            Self::Walk => "walk",
         }
     }
 
     /// Tie-break when two sources offer the same entry: the new call's
     /// own marker, then an old one, then the tip — the order the
-    /// breakpoint-before-tip rule always had.
+    /// breakpoint-before-tip rule always had — and the walk point
+    /// last, since any anchor there carries its [`SamplerState`].
     fn rank(self) -> u8 {
         match self {
-            Self::Hash | Self::Breakpoint => 2,
-            Self::Lookback => 1,
-            Self::Tip => 0,
+            Self::Hash | Self::Breakpoint => 3,
+            Self::Lookback => 2,
+            Self::Tip => 1,
+            Self::Walk => 0,
         }
     }
 }
@@ -2705,20 +2719,52 @@ struct Reuse {
     source: ReuseSource,
 }
 
-/// Cache-reuse length for a call, by the LCP walk.
+/// How a [`Rung`] is restored.
+///
+/// The socket the disk tier (#104) plugs into: an archived blob is one
+/// more variant, loaded and then truncated to the rung. A torn, stale
+/// or wrong-epoch blob fails like a missing checkpoint
+/// ([`MemoryRmError::NoCheckpoint`]) — one rung down, never a wrong
+/// restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreVia {
+    /// [`Engine::restore_to`]: the KV truncate, or the checkpoint the
+    /// backend stored at the rung.
+    Engine,
+}
+
+/// One rung of a slot's [`restore_ladder`]: a position the new call
+/// may resume from, where it came from, and how to restore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rung {
+    at: EntryPos,
+    source: ReuseSource,
+    via: RestoreVia,
+}
+
+impl Rung {
+    /// The rung as the [`Reuse`] the selection and the logs speak.
+    fn reuse(&self) -> Reuse {
+        Reuse {
+            at: self.at,
+            source: self.source,
+        }
+    }
+}
+
+/// Every candidate the LCP walk proves, in no particular order.
 ///
 /// Given the previously-cached `prev_entries`, the newly-rendered
 /// `new_entries`, and the candidate anchors — the new call's
 /// breakpoints, the slot's breakpoints from the call that wrote it
 /// (`old_breakpoints`, Anthropic's lookback), and the slot's
-/// `internal_tip` — pick the largest whose entry index is
+/// `internal_tip` — keep those whose entry index is
 ///
 /// 1. less than or equal to the common-prefix length of the two entry
 ///    streams, with one entry of BPE-boundary safety (to avoid
 ///    reusing a position whose successor might tokenize differently);
-/// 2. strictly greater than zero (we only reuse at anchors); and
-/// 3. strictly below `below` — the restore ladder's bound after a
-///    candidate failed to restore (`usize::MAX` otherwise).
+///    and
+/// 2. strictly greater than zero (we only reuse at anchors).
 ///
 /// The `internal_tip` is `Session`'s private post-generation cache
 /// anchor — independent of user-facing `cache_control` markers, so it
@@ -2728,20 +2774,16 @@ struct Reuse {
 /// The tip and the old breakpoints were computed against
 /// `prev_entries`; within the common prefix the two lists are
 /// identical entry-for-entry, so their `.pos` is valid against
-/// `new_entries` too (the eligibility check guarantees the winner sits
+/// `new_entries` too (the eligibility check guarantees each sits
 /// inside the prefix). Every one of them was checkpointed when it was
 /// made, so each is a restore target.
-///
-/// Returns `None` when no candidate is eligible — the caller should
-/// treat that as a full re-prefill. Pure function, tested directly.
-fn compute_l_hit(
+fn lcp_candidates(
     prev_entries: &[CacheEntry],
     new_entries: &[CacheEntry],
     new_breakpoints: &[EntryPos],
     old_breakpoints: &[EntryPos],
     internal_tip: Option<EntryPos>,
-    below: usize,
-) -> Option<Reuse> {
+) -> Vec<Reuse> {
     let lcp = longest_common_prefix_len(prev_entries, new_entries);
     // BPE-boundary safety: back off by one entry so a breakpoint falling
     // exactly at the prefix end can't reuse a position whose successor might
@@ -2753,8 +2795,33 @@ fn compute_l_hit(
         .map(tagged(ReuseSource::Breakpoint))
         .chain(old_breakpoints.iter().map(tagged(ReuseSource::Lookback)))
         .chain(internal_tip.iter().map(tagged(ReuseSource::Tip)))
-        .filter(|r| r.at.entry > 0 && r.at.entry <= safe && r.at.entry < below)
-        .max_by_key(|r| (r.at.entry, r.source.rank()))
+        .filter(|r| r.at.entry > 0 && r.at.entry <= safe)
+        .collect()
+}
+
+/// Cache-reuse length for a call, by the LCP walk: the best of
+/// [`lcp_candidates`] strictly below `below` — the restore ladder's
+/// bound after a candidate failed to restore (`usize::MAX`
+/// otherwise). `None` when no candidate is eligible. Pure.
+#[cfg(test)]
+fn compute_l_hit(
+    prev_entries: &[CacheEntry],
+    new_entries: &[CacheEntry],
+    new_breakpoints: &[EntryPos],
+    old_breakpoints: &[EntryPos],
+    internal_tip: Option<EntryPos>,
+    below: usize,
+) -> Option<Reuse> {
+    lcp_candidates(
+        prev_entries,
+        new_entries,
+        new_breakpoints,
+        old_breakpoints,
+        internal_tip,
+    )
+    .into_iter()
+    .filter(|r| r.at.entry < below)
+    .max_by_key(|r| (r.at.entry, r.source.rank()))
 }
 
 /// Tokens a lost reuse costs before a miss is logged at `WARN` rather
@@ -2837,11 +2904,85 @@ fn slot_l_hit(
     picked
 }
 
-/// [`slot_l_hit`]'s offer, strictly below entry `below` — the bound
-/// the empty-suffix backoff and the restore ladder search under
-/// (`usize::MAX` for none) — plus the raw hash-path result for the
-/// drift diagnostics. Pure; logs nothing, so the backoff and the ladder
-/// can re-ask without repeating [`slot_l_hit`]'s `hash_drift` event.
+/// A slot's restore ladder for the new call: every position it can
+/// resume from, best first.
+///
+/// The rungs are the hash path's agreeing hits ([`hash_keyed_l_hit`]),
+/// the LCP walk's anchors ([`lcp_candidates`]: the new call's
+/// breakpoints, the slot's earlier ones, its tip) and `walk`, the
+/// divergence point itself, when the caller found the backend can
+/// rewind there (`None` otherwise). Sorted by entry, descending, ties
+/// by [`ReuseSource::rank`]; one rung per entry, so the walk point
+/// yields to an anchor at the same place. Pure.
+///
+/// The walk point never makes a ladder on its own: a slot offering no
+/// anchor offers nothing. Under `--cache-slots N` a slot is somebody's
+/// conversation, and truncating it for a stretch of shared preamble
+/// that no anchor marks would cost its owner more than it saves.
+///
+/// Every rung is proven against the new prompt, the hash rungs by
+/// render hash *and* ids, the rest by ids alone; the hash path's
+/// refusals (#91's drift, the id agreement) gate the hash rungs only.
+fn restore_ladder(
+    slot: &PrefixSlot,
+    new_entries: &[CacheEntry],
+    new_breakpoints: &[EntryPos],
+    new_breakpoint_hashes: &[[u8; 32]],
+    walk: Option<EntryPos>,
+) -> Vec<Rung> {
+    let hashed = hash_keyed_l_hit(
+        slot,
+        new_entries,
+        new_breakpoints,
+        new_breakpoint_hashes,
+    );
+    let old_breakpoints: Vec<EntryPos> =
+        slot.breakpoints.iter().map(|bp| bp.at).collect();
+    let anchors: Vec<Reuse> = hashed
+        .agreeing
+        .iter()
+        .map(|&at| Reuse {
+            at,
+            source: ReuseSource::Hash,
+        })
+        .chain(lcp_candidates(
+            &slot.prev_entries,
+            new_entries,
+            new_breakpoints,
+            &old_breakpoints,
+            slot.tip.as_ref().map(|t| t.at),
+        ))
+        .filter(|r| r.at.entry > 0)
+        .collect();
+    let walk =
+        walk.filter(|at| at.entry > 0 && !anchors.is_empty())
+            .map(|at| Reuse {
+                at,
+                source: ReuseSource::Walk,
+            });
+    let mut rungs: Vec<Rung> = anchors
+        .into_iter()
+        .chain(walk)
+        .map(|r| Rung {
+            at: r.at,
+            source: r.source,
+            via: RestoreVia::Engine,
+        })
+        .collect();
+    // Stable, so a hash hit stays ahead of the walk's marker at the
+    // same entry and rank, as the hash-first composition had it.
+    rungs.sort_by(|a, b| {
+        (b.at.entry, b.source.rank()).cmp(&(a.at.entry, a.source.rank()))
+    });
+    rungs.dedup_by_key(|r| r.at.entry);
+    rungs
+}
+
+/// [`slot_l_hit`]'s offer, strictly below entry `below` — the first
+/// rung of the slot's [`restore_ladder`] under that bound (`usize::MAX`
+/// for none) — plus the raw hash-path result for the drift
+/// diagnostics. Pure; logs nothing, so the empty-suffix backoff can
+/// re-ask without repeating [`slot_l_hit`]'s `hash_drift` event.
 fn slot_offer(
     slot: &PrefixSlot,
     new_entries: &[CacheEntry],
@@ -2849,36 +2990,22 @@ fn slot_offer(
     new_breakpoint_hashes: &[[u8; 32]],
     below: usize,
 ) -> (Option<Reuse>, HashKeyedHit) {
-    // A hash hit lands at (or, for the tip, before) the new breakpoint
-    // its hash names, so bounding the new breakpoints bounds it.
-    let (bounded, bounded_hashes): (Vec<EntryPos>, Vec<[u8; 32]>) =
-        new_breakpoints
-            .iter()
-            .zip(new_breakpoint_hashes)
-            .filter(|(bp, _)| bp.entry < below)
-            .map(|(bp, hash)| (*bp, *hash))
-            .unzip();
-    let hashed = hash_keyed_l_hit(slot, new_entries, &bounded, &bounded_hashes);
-    let old_breakpoints: Vec<EntryPos> =
-        slot.breakpoints.iter().map(|bp| bp.at).collect();
-    let walked = compute_l_hit(
-        &slot.prev_entries,
+    let hashed = hash_keyed_l_hit(
+        slot,
         new_entries,
         new_breakpoints,
-        &old_breakpoints,
-        slot.tip.as_ref().map(|t| t.at),
-        below,
+        new_breakpoint_hashes,
     );
-    let hashed_hit = (hashed.at.entry > 0 && hashed.at.entry < below)
-        .then_some(Reuse {
-            at: hashed.at,
-            source: ReuseSource::Hash,
-        });
-    let picked = match (hashed_hit, walked) {
-        (Some(h), Some(w)) if w.at.entry > h.at.entry => Some(w),
-        (Some(h), _) => Some(h),
-        (None, w) => w,
-    };
+    let picked = restore_ladder(
+        slot,
+        new_entries,
+        new_breakpoints,
+        new_breakpoint_hashes,
+        None,
+    )
+    .into_iter()
+    .find(|r| r.at.entry < below)
+    .map(|r| r.reuse());
     (picked, hashed)
 }
 
@@ -5956,9 +6083,11 @@ impl<B: Backend> Session<B> {
     /// via [`Engine::checkpoint_pos`] so the next turn can rewind
     /// there without recomputation.
     ///
-    /// On `Err(NoCheckpoint)` from `restore_to` (snapshot lost to
-    /// LRU eviction or never created), falls back to a full
-    /// `memory_clear` + re-prefill from position 0.
+    /// The restore climbs the selected slot's [`restore_ladder`]
+    /// ([`Self::climb`]): a rung that fails to restore (its snapshot
+    /// lost to LRU eviction or never taken) hands over to the next one
+    /// down, and only an exhausted ladder resets the slot for a full
+    /// re-prefill from position 0.
     ///
     /// Returns:
     /// * `suffix` — the trailing all-text tokens, to be passed to
@@ -5974,15 +6103,15 @@ impl<B: Backend> Session<B> {
     ///   predictor's prefill resumes.
     /// * `cached_state` — the [`SamplerState`] stored at the matched
     ///   [`Breakpoint`]/tip (cloned) and its fold cursor. `None` on a
-    ///   miss, on the `NoCheckpoint` fallback, or when the matched
-    ///   breakpoint carries no state. Keyed on the *effective* restore
-    ///   position, so the empty-suffix backoff and the fallback path
-    ///   stay consistent with the KV side by construction.
+    ///   miss, on an exhausted ladder, or when the matched breakpoint
+    ///   carries no state. Keyed on the *effective* restore position,
+    ///   so the empty-suffix backoff and the ladder stay consistent
+    ///   with the KV side by construction.
     ///
-    /// **Empty-suffix guard.** If `compute_l_hit` covers every entry
-    /// (a perfect-prefix match), `cache_read` is backed off to the
-    /// next-smaller breakpoint so the predictor always sees at least
-    /// one token. Breakpoints at exactly the entry count are excluded
+    /// **Empty-suffix guard.** If the best rung covers every entry (a
+    /// perfect-prefix match, which only a hash hit reaches), the climb
+    /// starts at the next rung below it so the predictor always sees
+    /// at least one token. Breakpoints at exactly the entry count are excluded
     /// from the chunked prefill for the same reason.
     ///
     /// **Trailing-media guard.** An entry list ending in media has no
@@ -6030,8 +6159,8 @@ impl<B: Backend> Session<B> {
         // Slot selection + restore. Cache off ⇒ the legacy
         // single-sequence behavior: full clear, everything on seq 0.
         // Cache on ⇒ pick the slot offering the largest reusable
-        // prefix (hash-keyed first, LCP fallback — see [`slot_l_hit`])
-        // and restore its KV; a miss allocates a fresh slot (evicting
+        // prefix (the larger of the hash-keyed and LCP offers — see
+        // [`slot_l_hit`]) and restore its KV; a miss allocates a fresh slot (evicting
         // the least-recently-used one at capacity) and never touches
         // the other slots' sequences.
         let now = std::time::Instant::now();
@@ -6065,95 +6194,60 @@ impl<B: Backend> Session<B> {
                         new_len = new_entries.len(),
                         "prefix-reuse: slot selected",
                     );
-                    // Empty-suffix guard: if the slot covers the
-                    // entire new prompt (only the hash path can — the
-                    // LCP walk stops an entry short), the predictor
-                    // would receive an empty token slice (panic on
-                    // construction). Back off to the best anchor
-                    // strictly below it — a lower breakpoint, an
-                    // earlier call's, or the tip — so at least one
-                    // token survives for the predictor.
-                    let offer_below = |this: &Self, below: usize| {
-                        this.prefix_cache
-                            .as_ref()
-                            .and_then(|c| c.slot(seq))
-                            .and_then(|slot| {
-                                slot_offer(
-                                    slot,
-                                    new_entries,
-                                    new_breakpoints,
-                                    new_breakpoint_hashes,
-                                    below,
-                                )
-                                .0
-                            })
-                    };
-                    let nothing = Reuse {
-                        at: EntryPos::default(),
-                        source: ReuseSource::Breakpoint,
-                    };
-                    let mut reuse = if hit.at.entry >= new_entries.len() {
-                        offer_below(self, new_entries.len()).unwrap_or(nothing)
-                    } else {
-                        hit
-                    };
-                    let mut miss_reason = "backoff_zero";
-                    // The restore ladder: a candidate whose snapshot is
-                    // gone (evicted, never taken) hands over to the
-                    // best LCP candidate below it, never straight to
-                    // zero — every rung is an anchor the walk proved.
-                    loop {
-                        if reuse.at.entry == 0 {
+                    // The selected slot's restore ladder, from its best
+                    // rung down. Empty-suffix guard: a rung covering the
+                    // entire new prompt (only the hash path reaches one
+                    // — the LCP walk stops an entry short) would hand
+                    // the predictor an empty token slice (panic on
+                    // construction), so the climb starts at the best
+                    // rung strictly below it — a lower breakpoint, an
+                    // earlier call's, or the tip.
+                    let ladder: Vec<Rung> = self
+                        .prefix_cache
+                        .as_ref()
+                        .and_then(|c| c.slot(seq))
+                        .map(|slot| {
+                            restore_ladder(
+                                slot,
+                                new_entries,
+                                new_breakpoints,
+                                new_breakpoint_hashes,
+                                None,
+                            )
+                        })
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|r| r.at.entry < new_entries.len())
+                        .collect();
+                    match self.climb(seq, &ladder, new_entries) {
+                        Some(rung) => {
+                            if let Some(slot) = self
+                                .prefix_cache
+                                .as_mut()
+                                .and_then(|c| c.slot_mut(seq))
+                            {
+                                // Refresh-on-read: reuse renews the
+                                // slot's TTL/LRU clock.
+                                slot.last_used = now;
+                            }
+                            self.log_reuse_hit(seq, rung.reuse(), new_entries);
+                            (seq, rung.at)
+                        }
+                        None => {
                             // Nothing reusable after all. Reuse the
                             // selected slot as the pending one, emptied.
                             self.reset_slot(seq, now);
+                            let reason = match ladder.is_empty() {
+                                true => "backoff_zero",
+                                false => "restore_failed",
+                            };
                             self.log_reuse_miss(
-                                miss_reason,
+                                reason,
                                 new_entries,
                                 hit.at.entry,
                                 tip_lost,
                             );
-                            break (seq, EntryPos::default());
-                        }
-                        match self.engine.restore_to(seq, reuse.at.pos as i32) {
-                            Ok(()) => {
-                                if let Some(slot) = self
-                                    .prefix_cache
-                                    .as_mut()
-                                    .and_then(|c| c.slot_mut(seq))
-                                {
-                                    // Refresh-on-read: reuse renews
-                                    // the slot's TTL/LRU clock.
-                                    slot.last_used = now;
-                                }
-                                self.log_reuse_hit(seq, reuse, new_entries);
-                                break (seq, reuse.at);
-                            }
-                            Err(e) => {
-                                let next = offer_below(self, reuse.at.entry);
-                                let fallback = next.map_or(0, |r| r.at.entry);
-                                let lost = entries_cell_len(
-                                    &new_entries[fallback..reuse.at.entry],
-                                );
-                                cache_event!(
-                                    lost,
-                                    target: "drama_llama::session",
-                                    event = "cache_degrade",
-                                    reason = "restore_failed",
-                                    seq_id = seq,
-                                    source = reuse.source.as_str(),
-                                    entry = reuse.at.entry,
-                                    pos = reuse.at.pos,
-                                    fallback_entry = fallback,
-                                    lost_tokens = lost,
-                                    error = %e,
-                                    "prefix cache: no checkpoint to restore \
-                                     at the reuse point; falling back to \
-                                     the next anchor below it",
-                                );
-                                miss_reason = "restore_failed";
-                                reuse = next.unwrap_or(nothing);
-                            }
+                            (seq, EntryPos::default())
                         }
                     }
                 }
@@ -6697,6 +6791,53 @@ impl<B: Backend> Session<B> {
             "prefix cache: evicting slot {seq} ({reason}), dropping \
              {cells} cached tokens",
         );
+    }
+
+    /// Climb `ladder` on slot `seq`: restore each rung in turn until
+    /// one holds, and return it. A rung that fails drops one rung —
+    /// logged as `restore_failed` with what the fall cost — never
+    /// straight to zero; `None` only once every rung failed, and the
+    /// caller then resets the slot.
+    ///
+    /// `ladder` is sorted best first ([`restore_ladder`]). Each rung
+    /// restores through its [`RestoreVia`]; the disk tier (#104) adds
+    /// one, and an archive that does not load is one more failed rung.
+    fn climb(
+        &mut self,
+        seq: i32,
+        ladder: &[Rung],
+        new_entries: &[CacheEntry],
+    ) -> Option<Rung> {
+        for (i, rung) in ladder.iter().enumerate() {
+            let restored = match rung.via {
+                RestoreVia::Engine => {
+                    self.engine.restore_to(seq, rung.at.pos as i32)
+                }
+            };
+            let Err(e) = restored else {
+                return Some(*rung);
+            };
+            let fallback = ladder.get(i + 1).map_or(0, |r| r.at.entry);
+            let lost = new_entries
+                .get(fallback..rung.at.entry)
+                .map_or(0, entries_cell_len);
+            cache_event!(
+                lost,
+                target: "drama_llama::session",
+                event = "cache_degrade",
+                reason = "restore_failed",
+                seq_id = seq,
+                source = rung.source.as_str(),
+                entry = rung.at.entry,
+                pos = rung.at.pos,
+                fallback_entry = fallback,
+                lost_tokens = lost,
+                error = %e,
+                "prefix cache: no checkpoint to restore at the reuse \
+                 point; falling back to the next anchor below it",
+            );
+        }
+        None
     }
 
     /// Empty a live slot in place — engine footprint freed, metadata
