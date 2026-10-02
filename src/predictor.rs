@@ -692,6 +692,9 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// Emission provenance for the deferred-grammar trigger scan (see
     /// [`Self::set_reserved`]); `None` scans bytes alone.
     provenance: Option<TriggerProvenance>,
+    /// A thought is open: the opener is steered to the closer (see
+    /// [`crate::ThoughtSpecials`]).
+    thought_open: bool,
     pub(crate) inner: CandidatePredictor<'engine, B>,
 }
 
@@ -734,6 +737,11 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     ) -> Self {
         let (state, options, max_stop_len) =
             Self::prepare(engine, options, initial_state);
+        let thought_open = options
+            .sample_options
+            .thought
+            .as_ref()
+            .is_some_and(|t| t.open_at_start);
         let inner = CandidatePredictor::new(engine, tokens, options.n);
         Self {
             state,
@@ -746,6 +754,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
             provenance: None,
+            thought_open,
             inner,
         }
     }
@@ -762,6 +771,11 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     ) -> Self {
         let (state, options, max_stop_len) =
             Self::prepare(engine, options, initial_state);
+        let thought_open = options
+            .sample_options
+            .thought
+            .as_ref()
+            .is_some_and(|t| t.open_at_start);
         let inner = CandidatePredictor::new_resuming(
             engine, tokens, start_pos, seq_id, options.n,
         );
@@ -776,6 +790,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
             provenance: None,
+            thought_open,
             inner,
         }
     }
@@ -1001,12 +1016,17 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             &self.inner.tokens,
             self.text.as_bytes(),
             self.provenance.as_ref().map(|p| &*p.reserved),
+            self.thought_open,
             candidates,
             &self.options.sample_options,
             &mut self.state,
             &self.inner.engine.model,
         )
         .unwrap();
+        if let Some(thought) = self.options.sample_options.thought.as_ref() {
+            self.thought_open =
+                thought.open_after(self.thought_open, next_token);
+        }
 
         // Reassembled, not converted in isolation: a token that is
         // only part of a codepoint yields nothing here and its bytes

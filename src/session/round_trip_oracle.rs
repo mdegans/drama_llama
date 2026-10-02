@@ -1606,6 +1606,50 @@ fn round_trip_oracle_corpus() {
             ],
             RoundTrips,
         ),
+        // 2026-10-02, Mistral Small 4: `[THINK]` inside an open thought,
+        // rejected by #101 on every retry. The sampler now steers it to
+        // `[/THINK]`; the model then answers, or reopens.
+        seed(
+            "mistral4-cache-stable",
+            Text,
+            true,
+            &[
+                (Frame, "[THINK]"),
+                (Free, "invite others to read the decisions with me.\""),
+                (Frame, "[/THINK]"),
+                (Free, "**Reflection:**\n\nI've introduced myself."),
+            ],
+            RoundTrips,
+        ),
+        seed(
+            "mistral4-cache-stable",
+            Text,
+            true,
+            &[
+                (Frame, "[THINK]"),
+                (Free, "resonance, patience, and active listening.\""),
+                (Frame, "[/THINK][THINK]"),
+                (Free, "**Reflection:**\n\nI've introduced myself."),
+                (Frame, "[/THINK]"),
+                (Free, "Ada."),
+            ],
+            RoundTrips,
+        ),
+        // The same steer on a `<think>` dialect.
+        seed(
+            "cogito-cache-stable",
+            Text,
+            true,
+            &[
+                (Frame, "<think>"),
+                (Free, "A."),
+                (Frame, "</think><think>"),
+                (Free, "B."),
+                (Frame, "</think>"),
+                (Free, "Ada."),
+            ],
+            RoundTrips,
+        ),
         // Oracle findings, fixed: whitespace before a forced call.
         seed(
             "qwen3.8-cache-stable",
