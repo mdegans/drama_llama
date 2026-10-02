@@ -470,9 +470,24 @@ impl LlamaCppModel {
         unsafe { llama_vocab_n_tokens(self.0.vocab) }
     }
 
-    /// Context size the model was trained with.
+    /// Context size the model was trained with; `0` when the GGUF
+    /// doesn't say.
+    ///
+    /// A `vocab_only` load (what [`crate::FromPath::peek`] does) skips
+    /// llama.cpp's hparams, so `n_ctx_train` reads `0` there; the
+    /// `<arch>.context_length` key it would have come from is still in
+    /// the metadata, so that is read instead.
     pub fn context_size(&self) -> i32 {
-        unsafe { llama_model_n_ctx_train(self.0.inner) }
+        match unsafe { llama_model_n_ctx_train(self.0.inner) } {
+            0 => self
+                .get_meta("general.architecture")
+                .and_then(|arch| {
+                    self.get_meta(format!("{arch}.context_length").as_str())
+                })
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0),
+            trained => trained,
+        }
     }
 
     /// Embedding size.
