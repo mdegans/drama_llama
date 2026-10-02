@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BREAKING: `BlockStream::stop_reason` returns
+  `Option<(StopReason, Option<&str>)>`** — the reason is no longer an
+  `Option`, because a finished turn always has one (below).
 - **BREAKING: `LlamaCppDecoder`'s `memory_clear`, `memory_seq_rm`,
   `memory_seq_cp`, `memory_seq_keep`, `memory_seq_add` and
   `memory_seq_div` take `&mut self` and keep the checkpoints in step.**
@@ -265,6 +268,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A finished turn never reports `stop_reason: null`.** Generation
+  that ended on its own read `null` when the turn was empty or ended
+  inside a thought the model never closed; a client read that as "no
+  action" and dropped the turn (live, Mistral Small 4). An empty turn
+  is `end_turn`, as on Anthropic. A turn that ends inside an open
+  thought is a `GrammarViolation` with the cache left warm — returned,
+  the open thought would be rejected on the client's next request as
+  an `UnrenderableOpenThought` — so blallama resamples it; the drained
+  stream reports the same through `BlockStream::violation`. A thought
+  the budget cuts is still `max_tokens`, open, for the client to
+  continue.
 - **An image-end boundary checkpoints and rewinds again on M-RoPE
   models (Qwen3.6 with an image).** The checkpoint rules took a
   sequence's head as `pos_max + 1`, but every cell of an M-RoPE image

@@ -428,7 +428,7 @@ fn truncated_tool_call_is_max_tokens_with_its_completed_members() {
         "partial call leaked into the stream: {text:?}",
     );
     assert_eq!(
-        stream.stop_reason().and_then(|(reason, _)| reason),
+        stream.stop_reason().map(|(reason, _)| reason),
         Some(StopReason::MaxTokens),
     );
     if let Some(input) = cut.first() {
@@ -492,7 +492,7 @@ fn stop_sequence_stops_generation_and_is_excluded() {
     assert!(!text.contains('5'), "the match must be cut: {text:?}");
     assert_eq!(
         stream.stop_reason(),
-        Some((Some(StopReason::StopSequence), Some("5"))),
+        Some((StopReason::StopSequence, Some("5"))),
     );
 }
 
