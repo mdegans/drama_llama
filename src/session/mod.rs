@@ -17328,12 +17328,13 @@ mod tests {
     /// 359..6909 tokens a turn): the model wrote JSON `null` for an
     /// optional argument, the parser typed it `Value::Null`, and stock
     /// 3.6 re-rendered every non-container scalar with `| string` —
-    /// minijinja spells `None` as `none` (and 2.24+ spells booleans
-    /// `True`/`False`, drama_llama#120). The baked templates render
-    /// every non-string value with `tojson`, the spelling the grammar
-    /// makes the model emit, so the round trip is exact for each JSON
-    /// scalar — and a string-typed (or nullable-string) value that
-    /// merely *looks* like one stays the string the model wrote.
+    /// minijinja spells `None` as `none` (`None`, and booleans
+    /// `True`/`False`, from 2.22: drama_llama#120). The baked
+    /// templates render every non-string value with `tojson`, the
+    /// spelling the grammar makes the model emit, so the round trip
+    /// is exact for each JSON scalar — and a string-typed (or
+    /// nullable-string) value that merely *looks* like one stays the
+    /// string the model wrote.
     ///
     /// A finite set of strings (`enum`, `const`, nullable, behind a
     /// `$ref`) is generated raw, the way the template renders any

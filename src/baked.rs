@@ -210,6 +210,10 @@ static SUPERSEDED: &[(&str, &BakedTemplate)] = &[
         "12923c7cbb59bbf9e3d7bf426aba06d6602a2d482b7eb3e28c2f4e7d53594a1f",
         &GEMMA4,
     ), // b2da92e
+    (
+        "0b823abb42a610d31d0639cad7b118dee34136f55f3d808f037c82aa85747f68",
+        &GEMMA4,
+    ), // e83b0ba
     // gptoss-cache-stable
     (
         "9401909540317cf6237689e8c21f18630f9e8378388400530611b44b18f9d6af",
@@ -227,6 +231,10 @@ static SUPERSEDED: &[(&str, &BakedTemplate)] = &[
         "2cabdeda6c0a9d2b2c835bfc24d027baa8c3309cdc6b58b6878f31c721b48ed7",
         &GPTOSS,
     ), // 5b447e0
+    (
+        "8a1dea28ef5b9fe5e61ffb7ca90ad9b0bf8312edfd2fdd1e3b10dbc9d1de2d34",
+        &GPTOSS,
+    ), // da629e6
     // cogito-cache-stable
     (
         "533183fc7ca0eb625e4cc8d0c3a7eb37586662d1aa37655e33ee7d67be0c9a93",

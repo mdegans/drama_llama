@@ -1,0 +1,13 @@
+<bos><|turn>system
+Be brief.<|tool>declaration:configure{description:<|"|>Configure a thing.<|"|>,parameters:{properties:{flag:{type:<|"|>BOOLEAN<|"|>},level:{enum:[<|"|>on<|"|>,<|"|>off<|"|>,none],type:<|"|>STRING<|"|>},maybe:{type:<|"|>["STRING", "NULL"]<|"|>},mode:{type:<|"|><|"|>},name:{type:<|"|>STRING<|"|>},nested:{properties:{a:{type:<|"|>BOOLEAN<|"|>},z:{type:<|"|>INTEGER<|"|>}},type:<|"|>OBJECT<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Configure it.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>Configuring.<|tool_call>call:configure{flag:true,list:[true,none,1.5,<|"|>x<|"|>],maybe:none,mode:none,name:<|"|>unit<|"|>,nested:{a:false,n:none,z:2},off:false}<tool_call|><|tool_response>response:configure{value:<|"|>ok<|"|>}<tool_response|><|channel>thought
+<channel|>Done.<turn|>
+<|turn>user
+Again?<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

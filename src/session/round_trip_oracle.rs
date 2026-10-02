@@ -1048,10 +1048,10 @@ fn known_divergence(
             respelled: Some(respell(case, start, ours.len(), &theirs)?),
         });
     }
-    // PENDING (#120): Gemma 4's dict grammar admits `null`, `none` and
-    // `None`, and the template prints whichever spelling the resolved
-    // minijinja's `Display` gives (`none` before 2.20, `None` after).
-    // Which one to force is the model's habit, still unmeasured.
+    // PENDING: Gemma 4's dict grammar admits `null`, `none` and `None`,
+    // and the bake spells null `none` (pinned since #120, which made
+    // it explicit rather than minijinja's `Display`). Which one to
+    // force is the model's habit, still unmeasured.
     let nulls = ["null", "none", "None"];
     let spelled = |s: &str| nulls.into_iter().find(|n| s.starts_with(n));
     if fx.syntax.family == Family::TagWithDict {
@@ -1065,7 +1065,7 @@ fn known_divergence(
             spelled(&format!("{}{rerendered}", emission.get(word_start..*at)?));
         if let (Some(ours), Some(theirs)) = (ours, theirs) {
             return Some(Known {
-                reason: "PENDING #120: Gemma null spelling",
+                reason: "PENDING: Gemma null spelling",
                 respelled: Some(respell(case, word_start, ours.len(), theirs)?),
             });
         }

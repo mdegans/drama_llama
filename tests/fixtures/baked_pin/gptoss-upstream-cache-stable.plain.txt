@@ -1,0 +1,31 @@
+<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.
+Knowledge cutoff: 2024-06
+Current date: YYYY-MM-DD
+
+Reasoning: medium
+
+# Valid channels: analysis, commentary, final. Channel must be included for every message.
+Calls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions
+
+Be brief.
+
+# Tools
+
+## functions
+
+namespace functions {
+
+// Configure a thing.
+type configure = (_: {
+name: string,
+flag?: boolean, // default: false,
+maybe?: string | null,
+mode?: any,
+level?: "on" | "off" | "none",
+nested?: {
+z?: 
+                number, a?: 
+                boolean},
+}) => any;
+
+} // namespace functions<|end|><|start|>user<|message|>Configure it.<|end|><|start|>assistant<|channel|>commentary<|message|>Configuring.<|end|><|start|>assistant<|channel|>commentary to=functions.configure <|constrain|>json<|message|>{"name":"unit","flag":true,"off":false,"maybe":null,"mode":null,"list":[true,null,1.5,"x"],"nested":{"z":2,"a":false,"n":null}}<|call|><|start|>functions.configure to=assistant<|channel|>commentary<|message|>ok<|end|><|start|>assistant<|channel|>final<|message|>Done.<|end|><|start|>user<|message|>Again?<|end|><|start|>assistant

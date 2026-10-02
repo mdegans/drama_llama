@@ -216,6 +216,8 @@ fn all_shapes_match_python_jinja2() {
 /// Anthropic semantics: `None` → disabled, `Some(_)` → enabled.
 /// Caller's `with_extra("enable_thinking", _)` wins over the derived
 /// value so opt-out and explicit-override paths both work.
+/// Read back through `tojson`: a bare bool prints per minijinja
+/// version (`false`, `False` from 2.22, #120).
 #[test]
 fn enable_thinking_derives_from_prompt_thinking() {
     use misanthropic::prompt::thinking::Thinking;
@@ -225,7 +227,7 @@ fn enable_thinking_derives_from_prompt_thinking() {
     // up bound to in the Jinja context. Independent of any model
     // template — we're testing the wiring, not a downstream template.
     let tmpl = ChatTemplate::from_source(
-        "thinking={{ enable_thinking }}".to_string(),
+        "thinking={{ enable_thinking | tojson }}".to_string(),
         String::new(),
         String::new(),
     )

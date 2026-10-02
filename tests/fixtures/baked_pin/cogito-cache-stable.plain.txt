@@ -1,0 +1,32 @@
+<|im_start|>system
+Be brief.
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type":"function","function":{"name":"configure","description":"Configure a thing.","parameters":{"type":"object","properties":{"name":{"type":"string"},"flag":{"type":"boolean","default":false},"maybe":{"type":["string","null"]},"mode":{"enum":["on",null]},"level":{"type":"string","enum":["on","off",null]},"nested":{"type":"object","properties":{"z":{"type":"integer"},"a":{"type":"boolean"}}}},"required":["name"]}}}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+<|im_start|>user
+Configure it.<|im_end|>
+<|im_start|>assistant
+Configuring.
+<tool_call>
+{"name": "configure", "arguments": {"name": "unit", "flag": true, "off": false, "maybe": null, "mode": null, "list": [true, null, 1.5, "x"], "nested": {"z": 2, "a": false, "n": null}}}
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+ok
+</tool_response><|im_end|>
+<|im_start|>assistant
+Done.<|im_end|>
+<|im_start|>user
+Again?<|im_end|>
+<|im_start|>assistant

@@ -1085,7 +1085,9 @@ fn reconstruct_gemma4_upstream() {
 /// `none`, floats in ryu-shortest form, nested dicts explicitly
 /// re-sorted to match the template's `dictsort`).
 /// The canonical emission — reasoning block plus both calls — must
-/// appear byte-for-byte in the template re-render.
+/// appear byte-for-byte in the re-render of the template served for
+/// this stock: its bake. Stock prints null bare, which minijinja
+/// spells `None` from 2.22 (#120); the bake spells it `none`.
 #[test]
 fn reconstruct_gemma4_thought_and_values() {
     use drama_llama::dialect::ReasoningReingest;
@@ -1172,8 +1174,11 @@ fn reconstruct_gemma4_thought_and_values() {
         tools: Some(vec![tool.into()]),
         ..Default::default()
     };
+    let served = drama_llama::baked::detect(&source)
+        .expect("stock detects its bake")
+        .replacement;
     let template = ChatTemplate::from_source(
-        source,
+        served.to_owned(),
         "<bos>".to_string(),
         "<turn|>".to_string(),
     )
