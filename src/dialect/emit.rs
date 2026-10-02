@@ -225,13 +225,18 @@ pub fn grammar_source(
             } else {
                 format!(r#""{start_lit}" "#)
             };
+            // No whitespace before a call the turn opens with: no block
+            // carries it (a call has no signature, and a blank text is
+            // never returned), so the re-render drops it and the turn
+            // parts from its KV at its first byte (#129's oracle). After
+            // a thought it rides in the thought's tail.
             let _ = writeln!(
                 src,
-                "root ::= ( {open}thought_close{after_thought} | fws ) calls"
+                "root ::= ( {open}thought_close{after_thought} )? calls"
             );
         }
         (Anchor::Eager, false) => {
-            let _ = writeln!(src, "root ::= fws calls");
+            let _ = writeln!(src, "root ::= calls");
         }
     }
 
@@ -1480,4 +1485,55 @@ pub fn render_reference(
     }
     out.push_str(&syntax.section_end);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CallSyntax, Grammar, GrammarState};
+
+    fn weather() -> Tool {
+        Tool::builder("get_weather")
+            .description("Get the weather for a city.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }))
+            .build()
+            .expect("valid tool")
+    }
+
+    fn admits(syntax: &CallSyntax, anchor: Anchor, text: &str) -> bool {
+        let opts = EmitOptions {
+            anchor,
+            ..EmitOptions::default()
+        };
+        let source = grammar_source(syntax, &[&weather()], &opts).unwrap();
+        let mut state =
+            GrammarState::new(Arc::new(Grammar::parse(&source).unwrap()));
+        state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+    }
+
+    /// A forced call that opens the turn opens it on its first byte:
+    /// whitespace before it has no block to ride, and re-rendered
+    /// without it the turn parts from its KV at byte 0 (#129's oracle).
+    #[test]
+    fn eager_call_opening_the_turn_has_no_whitespace_before_it() {
+        let input = serde_json::json!({"city": "Paris"});
+        for syntax in [
+            CallSyntax::qwen_xml(),
+            CallSyntax::hermes_json(),
+            CallSyntax::gemma4(),
+        ] {
+            let call =
+                render_reference(&syntax, &[("get_weather", &input)]).unwrap();
+            let call = format!("{call}{}", syntax.tool_response_start);
+            assert!(admits(&syntax, Anchor::Eager, &call), "{call:?}");
+            for ws in [" ", "\n", "\t"] {
+                let led = format!("{ws}{call}");
+                assert!(!admits(&syntax, Anchor::Eager, &led), "{led:?}");
+            }
+        }
+    }
 }
