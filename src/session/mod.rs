@@ -4342,6 +4342,21 @@ impl<B: Backend> Session<B> {
             banned_specials.sort_unstable();
             banned_specials.dedup();
         }
+        // The nested-opener steer: while a thought the model opened is
+        // still open, its opener becomes the closer (`ThoughtSpecials`).
+        // Never on a closed-stub render, where no thought can open; on a
+        // pre-opened one the opener is banned above, so it stays masked.
+        let thought = (!reasoning_closed_by_render
+            && !self.reasoning_opener_ban.is_empty()
+            && !self.reasoning_closer_ban.is_empty())
+        .then(|| {
+            crate::ThoughtSpecials::new(
+                self.reasoning_opener_ban.clone(),
+                self.reasoning_closer_ban.clone(),
+                self.reasoning_closer_steer(),
+                reasoning_opener_spent,
+            )
+        });
         // The region-scoped set (#37) must never be *weaker* than the
         // standing one, or a token banned at frame positions would come
         // back inside a free region. Union rather than argue about set
@@ -4400,6 +4415,7 @@ impl<B: Backend> Session<B> {
             lazy_grammar: self.sample_options.lazy_grammar,
             banned_specials,
             banned_specials_constrained,
+            thought,
         };
         Ok(predict_opts)
     }
@@ -4856,6 +4872,22 @@ impl<B: Backend> Session<B> {
             .filter(|t| !eog.contains(t))
             .collect();
         ban.into_iter().collect()
+    }
+
+    /// The one token the dialect's reasoning closer tokenizes to, if it
+    /// is one of [`Session::reasoning_closer_ban`]: what a nested
+    /// opener is steered to (`ThoughtSpecials::steer`).
+    fn reasoning_closer_steer(&self) -> Option<Token> {
+        let syntax = effective_tool_syntax(&self.dialect);
+        match self.engine.model.tokenize_special(
+            syntax.reasoning.end.trim(),
+            false,
+            true,
+        )[..]
+        {
+            [t] if self.reasoning_closer_ban.contains(&t) => Some(t),
+            _ => None,
+        }
     }
 
     /// Decoded pieces of every end-of-generation token

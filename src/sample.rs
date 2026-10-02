@@ -138,6 +138,69 @@ pub struct SamplerConfig {
     /// [`banned_specials`]: SamplerConfig::banned_specials
     #[cfg_attr(feature = "serde", serde(default))]
     pub banned_specials_constrained: Vec<Token>,
+    /// The dialect's thought markers as special ids, so a thought
+    /// opener the model emits inside an open thought is steered to the
+    /// closer (see [`ThoughtSpecials`]). `None` (the default) disables
+    /// the steer. Runtime wiring set by `Session`; like
+    /// [`banned_specials`] it is unreachable from the wire.
+    ///
+    /// [`banned_specials`]: SamplerConfig::banned_specials
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub thought: Option<ThoughtSpecials>,
+}
+
+/// A dialect's thought opener and closer as special ids, for
+/// [`SamplerConfig::thought`]. While a thought is open the opener is
+/// never legal: a model that emits it wants a second thought without
+/// closing the first, a nest no template renders. The sampler writes
+/// [`Self::steer`] in its place, so the thought closes and the model
+/// may reopen from there; without one, the opener is masked.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct ThoughtSpecials {
+    /// Specials that open a thought (sorted).
+    pub opener: Vec<Token>,
+    /// Specials that close one (sorted).
+    pub closer: Vec<Token>,
+    /// The closer as the one token its text tokenizes to, if it is
+    /// one: what a nested opener becomes.
+    pub steer: Option<Token>,
+    /// Generation begins inside a thought (a pre-opened render).
+    pub open_at_start: bool,
+}
+
+impl ThoughtSpecials {
+    /// From the opener and closer ids; sorts both.
+    pub fn new(
+        mut opener: Vec<Token>,
+        mut closer: Vec<Token>,
+        steer: Option<Token>,
+        open_at_start: bool,
+    ) -> Self {
+        opener.sort_unstable();
+        opener.dedup();
+        closer.sort_unstable();
+        closer.dedup();
+        Self {
+            opener,
+            closer,
+            steer,
+            open_at_start,
+        }
+    }
+
+    /// Whether a thought is open after `token`, given whether one was
+    /// open before it.
+    pub fn open_after(&self, open: bool, token: Token) -> bool {
+        if self.opener.binary_search(&token).is_ok() {
+            true
+        } else if self.closer.binary_search(&token).is_ok() {
+            false
+        } else {
+            open
+        }
+    }
 }
 
 /// True for modes that constrain *what may be emitted* rather than
@@ -472,6 +535,7 @@ impl SamplerConfig {
             lazy_grammar: default_lazy_grammar(),
             banned_specials: Vec::new(),
             banned_specials_constrained: Vec::new(),
+            thought: None,
         }
     }
 
@@ -637,6 +701,7 @@ impl Default for SamplerConfig {
             lazy_grammar: default_lazy_grammar(),
             banned_specials: Vec::new(),
             banned_specials_constrained: Vec::new(),
+            thought: None,
         }
     }
 }
@@ -1344,7 +1409,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     state: &mut SamplerState,
     model: &M,
 ) -> Result<Token, SampleError> {
-    sample_token_in(tokens, &[], None, candidates, opts, state, model)
+    sample_token_in(tokens, &[], None, false, candidates, opts, state, model)
 }
 
 /// [`sample_token`], given `generated` — the text generated so far,
@@ -1353,11 +1418,14 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
 /// it refuses is masked (`SamplerState::wakes_deferred_illegally`).
 /// Given the vocabulary's `reserved` pieces, so is an ordinary token
 /// spelling one an active grammar forces
-/// (`SamplerState::spells_forced_framing`).
+/// (`SamplerState::spells_forced_framing`). With `thought_open`, the
+/// thought opener is steered to the closer ([`ThoughtSpecials`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     tokens: &[Token],
     generated: &[u8],
     reserved: Option<&crate::LiteralNeutralizer>,
+    thought_open: bool,
     mut candidates: Candidates,
     opts: &SamplerConfig,
     state: &mut SamplerState,
@@ -1468,7 +1536,24 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     }
 
     let lazy = opts.lazy_grammar && state.has_active_constraint();
-    let banned = opts.banned_specials.as_slice();
+    // Inside an open thought its opener joins the standing ban, so
+    // every masked rerun below drops it too.
+    let open_thought = opts.thought.as_ref().filter(|t| {
+        thought_open
+            && t.opener
+                .iter()
+                .any(|o| opts.banned_specials.binary_search(o).is_err())
+    });
+    let with_opener: Option<Vec<Token>> = open_thought.map(|t| {
+        let mut b = opts.banned_specials.clone();
+        b.extend(&t.opener);
+        b.sort_unstable();
+        b.dedup();
+        b
+    });
+    let banned = with_opener
+        .as_deref()
+        .unwrap_or(opts.banned_specials.as_slice());
     let banned_in_region = opts.banned_specials_constrained.as_slice();
     let sleeping = state.deferred_inactive() == Some(true);
     let reserved = reserved
@@ -1551,7 +1636,24 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     // no-exemption `banned_specials_constrained` applies instead and
     // `<tool_call>` can no longer be committed as a real special id
     // inside an argument value.
-    let banned = opts.banned_specials.as_slice();
+    //
+    // Before either, the nested-opener steer: an opener inside an open
+    // thought (in `banned` above) is the model asking for a second
+    // thought without closing the first, which no template renders
+    // and #101 rejects. The closer takes its slot instead, keeping the
+    // intent: the thought closes, and the model may reopen from there.
+    // Where the closer can't (no single token, banned, or refused by a
+    // constraint), the ban below masks the opener.
+    if let Some(steer) = open_thought
+        .filter(|t| t.opener.binary_search(&chosen).is_ok())
+        .and_then(|t| t.steer)
+        .filter(|&c| {
+            banned.binary_search(&c).is_err()
+                && state.accepts_chosen(opts, c, model)
+        })
+    {
+        chosen = steer;
+    }
     // Accept-then-check, same shape as everything else here: the region
     // query walks every active constraint, so it runs only once the
     // sampled id is known to be in the stricter set. Steady state pays
@@ -2428,6 +2530,7 @@ mod tests {
             lazy_grammar: false,
             banned_specials: standing,
             banned_specials_constrained: in_region,
+            thought: None,
         }
     }
 
@@ -2474,6 +2577,7 @@ mod tests {
             lazy_grammar: false,
             banned_specials: vec![],
             banned_specials_constrained: vec![X],
+            thought: None,
         };
         let mut state = state_for(&opts);
         let picked = sample_token(
@@ -2488,6 +2592,57 @@ mod tests {
             picked, X,
             "the stricter set must not apply without a permissive region"
         );
+    }
+
+    // ── Nested thought opener ────────────────────────────────────────
+
+    /// Inside an open thought the opener (`X`) is steered to the closer
+    /// (`A`); outside one it stays legal, and with no single-token
+    /// closer it is masked. A closer already banned is no steer either.
+    #[test]
+    fn a_nested_thought_opener_is_steered_to_the_closer() {
+        let pick = |steer: Option<Token>, banned: Vec<Token>, open: bool| {
+            let opts = SamplerConfig {
+                modes: vec![SamplingMode::Greedy],
+                repetition: None,
+                banned_specials: banned,
+                thought: Some(ThoughtSpecials::new(
+                    vec![X],
+                    vec![A],
+                    steer,
+                    false,
+                )),
+                ..SamplerConfig::default()
+            };
+            let mut state = state_for(&opts);
+            sample_token_in(
+                &[],
+                b"",
+                None,
+                open,
+                cands(&[(X, 10.0), (B, 5.0), (A, 1.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap()
+        };
+        assert_eq!(pick(Some(A), vec![], true), A, "steered");
+        assert_eq!(pick(Some(A), vec![], false), X, "no thought open");
+        assert_eq!(pick(None, vec![], true), B, "masked");
+        assert_eq!(pick(Some(A), vec![A], true), B, "closer banned");
+        // An opener the call bans already (a pre-opened render) stays
+        // masked: closing there would leave no way to reopen.
+        assert_eq!(pick(Some(A), vec![X], true), B, "opener spent");
+    }
+
+    #[test]
+    fn thought_specials_track_open_and_close() {
+        let t = ThoughtSpecials::new(vec![X], vec![A], Some(A), false);
+        assert!(t.open_after(false, X));
+        assert!(!t.open_after(true, A));
+        assert!(t.open_after(true, B));
+        assert!(!t.open_after(false, B));
     }
 
     /// Structural positions inside a live grammar are not free regions
@@ -3316,6 +3471,7 @@ mod tests {
                     &[],
                     generated,
                     None,
+                    false,
                     cands(&[(QUOTE_COMMA, 10.0), (QUOTE, 5.0), (B, 1.0)]),
                     &opts,
                     &mut state,
@@ -3340,6 +3496,7 @@ mod tests {
                 &[],
                 b"a",
                 None,
+                false,
                 cands(&[(QUOTE_COMMA, 10.0), (B, 1.0)]),
                 &opts,
                 &mut state,

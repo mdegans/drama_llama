@@ -1402,6 +1402,157 @@ mod tests {
         assert_eq!(ban, [THINK, THINK_ALIAS]);
     }
 
+    /// The dialect with `<think>`/`</think>` thoughts, which the model
+    /// opens itself: the render never pre-opens one.
+    fn think_dialect() -> crate::CallSyntax {
+        let mut dialect = session().dialect().clone();
+        dialect.reasoning.mode = crate::dialect::ReasoningMode::TagBased;
+        dialect.reasoning.start = "<think>".into();
+        dialect.reasoning.end = "</think>".into();
+        dialect
+    }
+
+    /// Batch blocks for `script` under [`think_dialect`]. The stream,
+    /// which yields thoughts and prose in pieces, must carry the same
+    /// text of each kind.
+    fn run_thinking(script: Vec<Token>) -> Vec<crate::Block> {
+        let prompt = Prompt {
+            messages: vec![message(crate::Role::User, vec![text("go")])],
+            ..Prompt::default()
+        };
+        let mut s = scripted(script.clone()).with_dialect(think_dialect());
+        let batch = s.complete_blocks(&prompt).expect("batch");
+        let mut s = scripted(script).with_dialect(think_dialect());
+        let streamed: Vec<crate::Block> =
+            s.complete_stream(&prompt).expect("stream").collect();
+        let kinds = |blocks: &[crate::Block]| {
+            let (mut thought, mut prose) = (String::new(), String::new());
+            for block in blocks {
+                match block {
+                    crate::Block::Thought { thought: t, .. } => {
+                        thought.push_str(t)
+                    }
+                    crate::Block::Text { text: t, .. } => prose.push_str(t),
+                    other => panic!("unexpected block {other:?}"),
+                }
+            }
+            (thought, prose)
+        };
+        assert_eq!(kinds(&batch), kinds(&streamed), "batch and stream");
+        batch
+    }
+
+    /// The thoughts in `blocks`, each with whether it is still open.
+    fn thoughts(blocks: &[crate::Block]) -> Vec<(String, bool)> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                crate::Block::Thought { thought, .. } => Some((
+                    thought.to_string(),
+                    crate::prompt::is_open_thought(b),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Live on Mistral Small 4: a `[THINK]` inside an open thought, the
+    /// model wanting a second one without closing the first. #101
+    /// rejected the turn on every retry. The opener is now steered to
+    /// the closer, so the thought closes where the model left it.
+    #[test]
+    fn a_nested_thought_opener_closes_the_thought() {
+        let script = [vec![THINK], bytes("a"), vec![THINK]].concat();
+        let blocks = run_thinking(script);
+        assert_eq!(thoughts(&blocks), [("a".into(), false)], "{blocks:?}");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+    }
+
+    /// The model keeps its intent: once the steer closes the thought,
+    /// the opener it emits next is legal and opens the second thought,
+    /// back to back with the first. A special sharing the opener's text
+    /// is steered alike.
+    #[test]
+    fn a_nested_thought_opener_reopens_back_to_back() {
+        for opener in [THINK, THINK_ALIAS] {
+            let script = [
+                vec![THINK],
+                bytes("a"),
+                vec![opener, THINK],
+                bytes("b"),
+                vec![THINK_END],
+                bytes("c"),
+            ]
+            .concat();
+            let blocks = run_thinking(script);
+            assert_eq!(
+                thoughts(&blocks),
+                [("a".into(), false), ("b".into(), false)],
+                "{blocks:?}"
+            );
+            assert_eq!(blocks.last(), Some(&text("c")), "{blocks:?}");
+        }
+    }
+
+    /// No thought open, no steer: back-to-back thoughts the model
+    /// closes itself, then prose, pass as written.
+    #[test]
+    fn a_closed_thought_keeps_its_opener() {
+        let script = [
+            vec![THINK],
+            bytes("a"),
+            vec![THINK_END, THINK],
+            bytes("b"),
+            vec![THINK_END],
+            bytes("c"),
+        ]
+        .concat();
+        let blocks = run_thinking(script);
+        assert_eq!(
+            thoughts(&blocks),
+            [("a".into(), false), ("b".into(), false)],
+            "{blocks:?}"
+        );
+        assert_eq!(blocks.last(), Some(&text("c")), "{blocks:?}");
+    }
+
+    /// The steer is wired for a self-opening thought dialect only, and
+    /// not on a closed thinking-off stub.
+    #[test]
+    fn the_thought_steer_follows_the_render() {
+        let s = session().with_dialect(think_dialect());
+        let prompt = Prompt {
+            messages: vec![message(crate::Role::User, vec![text("go")])],
+            ..Prompt::default()
+        };
+        let opts = s
+            .predict_options_for(&prompt, Vec::new(), None, false, false)
+            .expect("options");
+        let thought = opts.sample_options.thought.expect("wired");
+        assert_eq!(thought.opener, [THINK, THINK_ALIAS]);
+        assert_eq!(thought.closer, [THINK_END]);
+        assert_eq!(thought.steer, Some(THINK_END));
+        assert!(!thought.open_at_start);
+        let pre_opened = s
+            .predict_options_for(&prompt, Vec::new(), None, true, false)
+            .expect("options");
+        assert!(
+            pre_opened
+                .sample_options
+                .thought
+                .expect("wired")
+                .open_at_start
+        );
+        let closed = s
+            .predict_options_for(&prompt, Vec::new(), None, true, true)
+            .expect("options");
+        assert_eq!(closed.sample_options.thought, None);
+        let plain = session()
+            .predict_options_for(&prompt, Vec::new(), None, false, false)
+            .expect("options");
+        assert_eq!(plain.sample_options.thought, None);
+    }
+
     /// Quoting a spelled call first does not stop a real one after it.
     #[test]
     fn a_real_call_after_a_spelled_one_is_a_call() {
