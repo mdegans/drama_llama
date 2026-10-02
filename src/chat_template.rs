@@ -2000,6 +2000,8 @@ pub struct LiteralNeutralizer {
     /// Special id → pattern index, for a special whose piece is
     /// reserved under another id; see [`Self::emitted_piece`].
     aliases: std::collections::HashMap<Token, usize>,
+    /// Length in bytes of the longest piece.
+    max_len: usize,
 }
 
 impl std::fmt::Debug for LiteralNeutralizer {
@@ -2042,12 +2044,14 @@ impl LiteralNeutralizer {
         });
         let mut sorted: Vec<usize> = (0..pieces.len()).collect();
         sorted.sort_by(|&a, &b| pieces[a].1.cmp(&pieces[b].1));
+        let max_len = pieces.iter().map(|(_, p)| p.len()).max();
         Self {
             matcher,
-            pieces,
             by_id,
             sorted,
             aliases: std::collections::HashMap::new(),
+            max_len: max_len.unwrap_or(0),
+            pieces,
         }
     }
 
@@ -2138,6 +2142,42 @@ impl LiteralNeutralizer {
             .iter()
             .take(2)
             .any(|&i| piece(i).len() > tail.len() && piece(i).starts_with(tail))
+    }
+
+    /// Length in bytes of the longest reserved piece.
+    pub(crate) fn max_len(&self) -> usize {
+        self.max_len
+    }
+
+    /// The reserved pieces `text` could be the start of: each one
+    /// `text` begins with, and each one `text` is a proper prefix of.
+    /// Bytes, not `str`: a token's piece can end mid-codepoint.
+    pub(crate) fn starting_at(&self, text: &[u8]) -> Vec<&[u8]> {
+        // INVARIANT: `sorted` holds indices into `pieces`, each of them
+        // non-empty (`new` skips empty ones); `len` is at most
+        // `text.len()`, and `partition_point` at most `sorted.len()`.
+        let piece = |i: usize| self.pieces[i].1.as_bytes();
+        // Most text starts no piece at all: one search says so.
+        let Some(&lead) = text.first() else {
+            return Vec::new();
+        };
+        let at = self.sorted.partition_point(|&i| piece(i) < &text[..1]);
+        if !self.sorted.get(at).is_some_and(|&i| piece(i)[0] == lead) {
+            return Vec::new();
+        }
+        let whole = (1..=text.len().min(self.max_len)).filter_map(|len| {
+            self.sorted
+                .binary_search_by(|&i| piece(i).cmp(&text[..len]))
+                .ok()
+                .map(|at| piece(self.sorted[at]))
+        });
+        // Pieces extending `text` sort contiguously right after it.
+        let at = self.sorted.partition_point(|&i| piece(i) <= text);
+        let growing = self.sorted[at..]
+            .iter()
+            .map(|&i| piece(i))
+            .take_while(|p| p.starts_with(text));
+        whole.chain(growing).collect()
     }
 
     /// Replace every reserved piece in `text` with its marker under
