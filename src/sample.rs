@@ -2960,6 +2960,45 @@ mod tests {
         );
     }
 
+    /// An overrule is EOG on top of the raw candidates where the
+    /// constraint refuses it inside a value. EOG anywhere else — below
+    /// the top, at accept, at a structural position, with no constraint
+    /// — is the model's own ending, or framing the grammar writes for
+    /// it, and corrupts nothing.
+    #[test]
+    fn overrules_eog_only_inside_a_value_on_top() {
+        let in_string = SamplerConfig {
+            modes: vec![SamplingMode::grammar(STR_GRAMMAR).unwrap()],
+            repetition: None,
+            ..SamplerConfig::default()
+        };
+        let top = |eog| cands(&[(eog, 9.0), (B, 1.0)]);
+        let mut mid = state_for(&in_string);
+        mid.advance(&in_string, QUOTE, &MockModel);
+        mid.advance(&in_string, A, &MockModel);
+        assert!(mid.overrules_eog(&in_string, &top(EOS), &MockModel));
+        assert!(mid.overrules_eog(&in_string, &top(EOG_A), &MockModel));
+        let below = cands(&[(EOS, 1.0), (B, 9.0)]);
+        assert!(!mid.overrules_eog(&in_string, &below, &MockModel));
+
+        let mut done = mid.clone();
+        done.advance(&in_string, QUOTE_COMMA, &MockModel);
+        assert!(!done.overrules_eog(&in_string, &top(EOS), &MockModel));
+
+        // `root ::= "ab"` after `a`: a literal, not a value.
+        let literal = opts_with_grammar(false);
+        let mut framing = state_for(&literal);
+        framing.advance(&literal, A, &MockModel);
+        assert!(!framing.overrules_eog(&literal, &top(EOS), &MockModel));
+
+        let bare = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: None,
+            ..SamplerConfig::default()
+        };
+        assert!(!state_for(&bare).overrules_eog(&bare, &top(EOS), &MockModel));
+    }
+
     /// The eager half is unchanged by the deferred clause: an eager
     /// grammar that never reached accept still flags, and a config with
     /// no byte-constraint at all never does (plain prose generation

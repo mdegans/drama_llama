@@ -613,6 +613,47 @@ impl SamplerState {
             }
     }
 
+    /// Whether the model's most likely next token is an end of
+    /// generation the constraint refuses while it holds a value open (a
+    /// free region: a string body, an `until()` value). Masked, the
+    /// model keeps writing *inside* that value, and the prose it meant
+    /// as the end of its turn becomes content — gpt-oss wrote `\"}` for
+    /// `"}` and its "Let's proceed." landed in a tool argument
+    /// (2026-10-01). Judged by the masks' own policy
+    /// ([`Self::accepts_chosen`]), so an exit marker that is also EOG
+    /// and finishes the constraint is no overrule. At a structural
+    /// position the grammar only writes framing in its place (a forced
+    /// call, a structured answer after a thought), which corrupts
+    /// nothing. Call from the single-threaded point of a step, as
+    /// `region::ConstraintGuard::build` requires.
+    pub(crate) fn overrules_eog<M: Model>(
+        &self,
+        config: &SamplerConfig,
+        candidates: &crate::Candidates,
+        model: &M,
+    ) -> bool {
+        if !self.constrained_incomplete() {
+            return false;
+        }
+        let top = candidates
+            .as_slice()
+            .iter()
+            .max_by(|a, b| a.logit.total_cmp(&b.logit))
+            .map(|td| td.id);
+        top.is_some_and(|top| {
+            model.eog_tokens().contains(&top)
+                && !self.accepts_chosen(config, top, model)
+                && super::region::ConstraintGuard::build(
+                    &config.modes,
+                    &self.matchers,
+                    self.deferred.as_ref(),
+                    config.deferred_grammar.as_ref(),
+                    model,
+                )
+                .is_some()
+        })
+    }
+
     /// Lazy-path legality of the chosen token: its piece bytes must
     /// extend (or, for a mid-parse EOG token, *finish*) every active
     /// constraint. Mirrors the masked filters' policy — empty pieces

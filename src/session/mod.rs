@@ -7893,6 +7893,7 @@ impl<B: Backend> Session<B> {
         // Capture the incomplete-at-end violation signal and the final
         // sampler state (tip promotion) before the predictor drops.
         let constraint_incomplete = predictor.constraint_incomplete_at_end();
+        let eog_overruled = predictor.eog_overruled();
         let deferred_unfired =
             predictor.sampler_state().deferred_inactive() == Some(true);
         // `Some(true)` once a deferred grammar's trigger fired; `None`
@@ -8295,6 +8296,7 @@ impl<B: Backend> Session<B> {
                     cut: cut.is_some(),
                     constraint_incomplete,
                     deferred_unfired,
+                    eog_overruled,
                 },
             );
         if matches!(breach, Some(Breach::Incomplete)) {
@@ -8392,6 +8394,12 @@ impl<B: Backend> Session<B> {
         // no constraint ever started, so the recorded state is plain
         // unconstrained generation. Checked after the schema, so a body
         // that ran free *and* broke the schema says where.
+        //
+        // An overrule ranks before both: the model meant to stop while
+        // the grammar held a value open, so the value is valid and
+        // wrong — what it meant as the end of its turn, written into
+        // the value (`SamplerState::overrules_eog`). Cache warm too: the
+        // constraint completed, so the recorded state is consistent.
         match breach {
             Some(Breach::Schema(mismatch)) => {
                 #[cfg(feature = "axum")]
@@ -8404,6 +8412,19 @@ impl<B: Backend> Session<B> {
                 );
                 return Err(SessionError::SchemaViolation {
                     mismatch,
+                    partial_output: crate::prompt::Content(blocks),
+                });
+            }
+            Some(Breach::Overruled) => {
+                #[cfg(feature = "axum")]
+                tracing::error!(
+                    target: "drama_llama::session",
+                    "the model meant to end its turn inside a constrained \
+                     value and the grammar made it write on, into the \
+                     value; rejected — prompt cache extent is warm, \
+                     resample",
+                );
+                return Err(SessionError::GrammarViolation {
                     partial_output: crate::prompt::Content(blocks),
                 });
             }
@@ -8915,6 +8936,11 @@ enum Breach {
     /// [`SessionError::GrammarViolation`] with the cache left warm, since
     /// no constraint ever started.
     Unfired,
+    /// The model meant to end its turn mid-value and the constraint made
+    /// it write on, into the value (`TurnEnd::eog_overruled`): a
+    /// [`SessionError::GrammarViolation`] with the cache left warm, since
+    /// the constraint completed.
+    Overruled,
 }
 
 /// How generation ended, as far as [`TurnContract::breach`] cares.
@@ -8927,6 +8953,8 @@ struct TurnEnd {
     constraint_incomplete: bool,
     /// A deferred grammar was installed and never activated.
     deferred_unfired: bool,
+    /// [`crate::TokenPredictor::eog_overruled`].
+    eog_overruled: bool,
 }
 
 impl TurnContract {
@@ -8977,6 +9005,9 @@ impl TurnContract {
         };
         if end.constraint_incomplete || (self.forced_call && !called()) {
             return Some(Breach::Incomplete);
+        }
+        if end.eog_overruled {
+            return Some(Breach::Overruled);
         }
         if let Some(mismatch) = self.schema_mismatch(blocks) {
             return Some(Breach::Schema(mismatch));
@@ -9787,6 +9818,7 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
                 .sampler_state()
                 .deferred_inactive()
                 == Some(true),
+            eog_overruled: self.predictor.eog_overruled(),
         };
         // The answer is one text block. Text yields are deltas, one
         // block to a client per run; on Harmony a run may be two
@@ -9807,7 +9839,7 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         ));
         let partial_output = crate::prompt::Content(turn);
         self.violation = breach.map(|breach| match breach {
-            Breach::Incomplete | Breach::Unfired => {
+            Breach::Incomplete | Breach::Unfired | Breach::Overruled => {
                 SessionError::GrammarViolation { partial_output }
             }
             Breach::Schema(mismatch) => SessionError::SchemaViolation {
@@ -11957,6 +11989,7 @@ mod tests {
             cut: false,
             constraint_incomplete: false,
             deferred_unfired: true,
+            eog_overruled: false,
         };
         let answer = [Block::text(ROLE_CONSENT_VALID.to_owned())];
         let structured = Prompt::default().json_schema(role_consent_schema());
@@ -12051,6 +12084,62 @@ mod tests {
                 "stream, {script:?}: {blocks:?}"
             );
         }
+    }
+
+    /// The model writes `\"}` where it means `"}` and wants to stop
+    /// (gpt-oss, 2026-10-01: the string stays open, so EOG is masked and
+    /// the prose it meant as its turn's end goes into the value, closed
+    /// by a later `"}`). The value is valid JSON and wrong: the turn is
+    /// a violation on both paths. Without the stop it means, the same
+    /// bytes are a value it chose, and stand.
+    #[test]
+    fn eog_overruled_mid_value_is_a_violation_on_both_paths() {
+        use misanthropic::prompt::message::Role;
+        let prompt = Prompt::default()
+            .add_message((Role::User, "Comment?"))
+            .unwrap()
+            .json_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"body": {"type": "string"}},
+                "required": ["body"],
+            }));
+        // Non-ASCII right before it, as in the live value.
+        let meant = "{\"body\":\"Done (Art\u{202F}II\u{2011}6).\\\"}";
+        let script = format!("{meant}Let's proceed.\"}}");
+        let scripted = |stop: &[usize]| {
+            let mut session = mock::scripted(&script);
+            session.engine.decoder.eos_first = stop.to_vec();
+            session
+        };
+        let stop = [meant.len()];
+
+        let batch = scripted(&stop).complete_response(&prompt);
+        assert!(
+            matches!(batch, Err(SessionError::GrammarViolation { .. })),
+            "batch: {batch:?}"
+        );
+        let mut session = scripted(&stop);
+        let mut stream = session.complete_stream(&prompt).expect("stream");
+        let blocks: Vec<_> = stream.by_ref().collect();
+        assert!(
+            matches!(
+                stream.violation(),
+                Some(SessionError::GrammarViolation { .. })
+            ),
+            "stream: {blocks:?}"
+        );
+
+        // EOS on top where the constraint is complete is the turn's end,
+        // not an overrule; nor is a value the model meant.
+        let response = scripted(&[script.len()])
+            .complete_response(&prompt)
+            .expect("an ordinary end stands");
+        let text = format!("{:?}", response.inner.content);
+        assert!(text.contains("Let's proceed."), "{text}");
+        let mut session = scripted(&[]);
+        let mut stream = session.complete_stream(&prompt).expect("stream");
+        let _: Vec<_> = stream.by_ref().collect();
+        assert!(stream.violation().is_none());
     }
 
     /// The output_config grammar for `prompt` on `dialect`, as `Session`
@@ -12212,6 +12301,7 @@ mod tests {
             cut: false,
             constraint_incomplete: false,
             deferred_unfired: false,
+            eog_overruled: false,
         };
         for (label, prompt) in role_consent_prompts() {
             let compiled = output_config_grammar(&prompt, &cogito);
@@ -12652,6 +12742,7 @@ mod tests {
                     cut: false,
                     constraint_incomplete: !drive.complete,
                     deferred_unfired: drive.unfired,
+                    eog_overruled: false,
                 };
                 let breach =
                     TurnContract::of(&prompt, deferred).breach(&blocks, end);
@@ -14878,6 +14969,10 @@ mod tests {
             /// The tokens a generation emits, in order, then EOS. Empty:
             /// flat logits, and no KV extent reported (`-1`).
             pub(super) script: Vec<Token>,
+            /// Script positions where EOS outranks the script's token:
+            /// the model means to stop there, and a constraint that
+            /// refuses EOS makes it write the script on.
+            pub(super) eos_first: Vec<usize>,
             /// Script tokens decoded since the last prefill.
             cursor: usize,
             /// One past the last position decoded.
@@ -14894,6 +14989,9 @@ mod tests {
                     let next =
                         self.script.get(self.cursor).copied().unwrap_or(EOS);
                     self.logits[next as usize] = 100.0;
+                    if self.eos_first.contains(&self.cursor) {
+                        self.logits[EOS as usize] = 101.0;
+                    }
                 }
                 &self.logits
             }

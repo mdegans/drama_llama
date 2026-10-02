@@ -674,6 +674,11 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// [`Self::constraint_incomplete_at_end`]; the state itself stays
     /// pure.
     terminal_completed: bool,
+    /// Set when the model's most likely token was an end of generation
+    /// a constraint refused mid-value (`SamplerState::overrules_eog`):
+    /// what it went on to write inside that value is not the value it
+    /// meant. See [`Self::eog_overruled`].
+    eog_overruled: bool,
     /// Index into [`PredictOptions::stop_strings`] of the stop string
     /// that ended generation, if one did. Set on the same step as
     /// `stopped`. See [`Self::stop_string`].
@@ -737,6 +742,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             max_stop_len,
             stopped: false,
             terminal_completed: false,
+            eog_overruled: false,
             stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
             provenance: None,
@@ -766,6 +772,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             max_stop_len,
             stopped: false,
             terminal_completed: false,
+            eog_overruled: false,
             stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
             provenance: None,
@@ -844,6 +851,15 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     /// violation.
     pub fn constraint_incomplete_at_end(&self) -> bool {
         self.state.constraint_incomplete_at_end() && !self.terminal_completed
+    }
+
+    /// True iff, at some step, the model's most likely token ended
+    /// generation while a constraint held a value open, and the mask
+    /// made it write on. Its value then carries what it meant as the
+    /// end of its turn — a valid value the parse cannot tell from the
+    /// one it meant — so the turn is a violation, not an answer.
+    pub fn eog_overruled(&self) -> bool {
+        self.eog_overruled
     }
 
     /// The [`PredictOptions::stop_strings`] entry that ended generation,
@@ -972,6 +988,15 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
 
         // The generated text rides along for the deferred-trigger wake
         // check: a trigger may have started tokens ago.
+        // Judged on the raw candidates, before any mask: what the
+        // model wanted, not what it was let to write. Once is enough.
+        self.eog_overruled = self.eog_overruled
+            || self.state.overrules_eog(
+                &self.options.sample_options,
+                &candidates,
+                &self.inner.engine.model,
+            );
+
         let next_token = crate::sample::sample_token_in(
             &self.inner.tokens,
             self.text.as_bytes(),
@@ -1385,6 +1410,11 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     /// See [`TokenPredictor::stop_string`].
     pub fn stop_string(&self) -> Option<&str> {
         self.inner.stop_string()
+    }
+
+    /// See [`TokenPredictor::eog_overruled`].
+    pub fn eog_overruled(&self) -> bool {
+        self.inner.eog_overruled()
     }
 
     /// See [`TokenPredictor::hit_token_limit`].

@@ -4836,6 +4836,85 @@ mod tests {
         parse_text(&syntax, &[&t], text, false, leniency).blocks
     }
 
+    /// A Harmony call's args end at the JSON close, on both sides:
+    /// the grammar (eager and lazy) admits nothing after it but EOG,
+    /// and the parser reads prose written past it — the model wrote
+    /// `"}` and went on in the same message — as its own text, never
+    /// as part of a value, non-ASCII right before the close included
+    /// (the 2026-10-01 gpt-oss `create_comment` shape).
+    #[test]
+    fn harmony_args_end_at_the_json_close() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        let comment = Tool::builder("create_comment")
+            .description("Post a comment.")
+            .schema(json!({
+                "type": "object",
+                "properties": {
+                    "reply_to": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["reply_to", "body"],
+            }))
+            .build()
+            .expect("valid test tool");
+        let header = "<|channel|>commentary to=functions.create_comment \
+                      <|constrain|>json<|message|>";
+        let args = "{\"reply_to\":\"7ad26ccd\",\
+                    \"body\":\"Agreed (Art\u{202F}II\u{2011}6).\"}";
+        let prose = "Will need to check. Let's proceed.";
+
+        for anchor in [Anchor::Eager, Anchor::Lazy] {
+            let source = grammar_source(
+                &CallSyntax::gpt_oss(),
+                &[&comment],
+                &EmitOptions {
+                    anchor,
+                    ..Default::default()
+                },
+            )
+            .expect("grammar");
+            let mut state = crate::GrammarState::from_source(&source)
+                .expect("grammar parses");
+            let call = format!("{header}{args}");
+            assert!(
+                state.advance_bytes(call.as_bytes()).is_ok()
+                    && state.is_complete(),
+                "{anchor:?}: {call:?}"
+            );
+            assert!(
+                state.advance_bytes(prose.as_bytes()).is_err(),
+                "{anchor:?}: prose after the close"
+            );
+        }
+
+        for tail in ["", "<|call|>"] {
+            let text = format!("{header}{args}{prose}{tail}");
+            for leniency in
+                [Leniency::Final, Leniency::Streaming, Leniency::Clipped]
+            {
+                let blocks = parse_text(
+                    &CallSyntax::gpt_oss(),
+                    &[&comment],
+                    &text,
+                    false,
+                    leniency,
+                )
+                .blocks;
+                let calls = calls_of(&blocks);
+                assert_eq!(calls.len(), 1, "{leniency:?}: {blocks:#?}");
+                assert_eq!(
+                    calls[0].1["body"], "Agreed (Art\u{202F}II\u{2011}6).",
+                    "{leniency:?}: {blocks:#?}"
+                );
+                assert!(
+                    matches!(blocks.last(), Some(Block::Text { text, .. })
+                        if text.starts_with(prose)),
+                    "{leniency:?}: {blocks:#?}"
+                );
+            }
+        }
+    }
+
     /// Content-only messages: final and commentary-preamble channels
     /// both surface as Text (upstream `message_assist`).
     #[test]
