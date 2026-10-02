@@ -832,6 +832,11 @@ struct PrefixSlot {
     /// model's own output, so a divergence past it is a round-trip
     /// failure rather than a changed history ([`tip_miss`]).
     turn_start: usize,
+    /// How many entries of [`Self::prev_entries`] the slot's KV holds:
+    /// the tip's entry, else [`Self::turn_start`]. The cap on the
+    /// [`walk_point`], since `prev_entries` runs one or two entries
+    /// past the KV head.
+    kv_entries: usize,
     /// Last touch — read (selected for reuse) or write
     /// (`record_cache_hit`). Anthropic refresh-on-read semantics: TTL
     /// expiry (enforced by the bounds commit) measures from here, and
@@ -852,6 +857,7 @@ impl PrefixSlot {
             breakpoints: Vec::new(),
             tip: None,
             turn_start: 0,
+            kv_entries: 0,
             last_used: now,
             created: now,
         }
@@ -2860,6 +2866,7 @@ fn slot_l_hit(
     new_entries: &[CacheEntry],
     new_breakpoints: &[EntryPos],
     new_breakpoint_hashes: &[[u8; 32]],
+    walk: Option<EntryPos>,
     piece: &dyn Fn(Token) -> String,
 ) -> Option<Reuse> {
     let (picked, hashed) = slot_offer(
@@ -2867,6 +2874,7 @@ fn slot_l_hit(
         new_entries,
         new_breakpoints,
         new_breakpoint_hashes,
+        walk,
         usize::MAX,
     );
     if let Some((cached, new)) = hashed.drifted {
@@ -2902,6 +2910,26 @@ fn slot_l_hit(
         }
     }
     picked
+}
+
+/// The walk point: where the new prompt parts from `slot`, as a rung
+/// the LCP walk proves — `lcp - 1`, the same BPE-safety margin the
+/// anchors keep — capped at what the slot's KV holds
+/// ([`PrefixSlot::kv_entries`]), since `prev_entries` runs past it.
+/// `None` at entry 0. Pure; whether the backend can rewind there is the
+/// caller's question ([`Decoder::truncate_restores`]).
+///
+/// Unlike an anchor it carries no [`SamplerState`]: a restore there
+/// folds the prompt fresh from the top, as at the turn anchor.
+fn walk_point(
+    slot: &PrefixSlot,
+    new_entries: &[CacheEntry],
+) -> Option<EntryPos> {
+    let lcp = longest_common_prefix_len(&slot.prev_entries, new_entries);
+    let entry = lcp.saturating_sub(1).min(slot.kv_entries);
+    // INVARIANT: `entry < lcp <= new_entries.len()` when nonzero, so
+    // `entry_pos_at`'s slice is in bounds.
+    (entry > 0).then(|| entry_pos_at(new_entries, entry))
 }
 
 /// A slot's restore ladder for the new call: every position it can
@@ -2988,6 +3016,7 @@ fn slot_offer(
     new_entries: &[CacheEntry],
     new_breakpoints: &[EntryPos],
     new_breakpoint_hashes: &[[u8; 32]],
+    walk: Option<EntryPos>,
     below: usize,
 ) -> (Option<Reuse>, HashKeyedHit) {
     let hashed = hash_keyed_l_hit(
@@ -3001,7 +3030,7 @@ fn slot_offer(
         new_entries,
         new_breakpoints,
         new_breakpoint_hashes,
-        None,
+        walk,
     )
     .into_iter()
     .find(|r| r.at.entry < below)
@@ -3014,6 +3043,11 @@ fn slot_offer(
 /// Returns the winner's `seq_id` and its hit, or `None` when no slot
 /// offers a nonzero prefix (the caller allocates a fresh slot).
 ///
+/// `walks` holds each slot's [`walk_point`] where the backend rewinds
+/// there by truncation (`Session::walk_points`). It only extends a slot
+/// that offers an anchor ([`restore_ladder`]), so it can make that
+/// slot the winner but never makes a winner of an anchorless one.
+///
 /// Pure function over the slot set — directly testable without an
 /// engine.
 fn select_slot(
@@ -3021,6 +3055,7 @@ fn select_slot(
     new_entries: &[CacheEntry],
     new_breakpoints: &[EntryPos],
     new_breakpoint_hashes: &[[u8; 32]],
+    walks: &std::collections::HashMap<i32, EntryPos>,
     piece: &dyn Fn(Token) -> String,
 ) -> Option<(i32, Reuse)> {
     let mut best: Option<(&PrefixSlot, Reuse)> = None;
@@ -3033,6 +3068,7 @@ fn select_slot(
             new_entries,
             new_breakpoints,
             new_breakpoint_hashes,
+            walks.get(&slot.seq_id).copied(),
             piece,
         ) else {
             continue;
@@ -6171,6 +6207,7 @@ impl<B: Backend> Session<B> {
             self.engine.memory_clear();
             (0, EntryPos::default())
         } else {
+            let walks = self.walk_points(new_entries);
             let selection = {
                 let cache = self.prefix_cache.as_ref().expect("cache_on");
                 select_slot(
@@ -6178,6 +6215,7 @@ impl<B: Backend> Session<B> {
                     new_entries,
                     new_breakpoints,
                     new_breakpoint_hashes,
+                    &walks,
                     &|token| self.engine.model.token_to_piece(token),
                 )
             };
@@ -6212,7 +6250,7 @@ impl<B: Backend> Session<B> {
                                 new_entries,
                                 new_breakpoints,
                                 new_breakpoint_hashes,
-                                None,
+                                walks.get(&seq).copied(),
                             )
                         })
                         .unwrap_or_default()
@@ -6793,6 +6831,32 @@ impl<B: Backend> Session<B> {
         );
     }
 
+    /// Each slot's [`walk_point`] for `new_entries`, where the backend
+    /// says a truncate alone rewinds there
+    /// ([`Engine::truncate_restores`]). A dense llama.cpp model offers
+    /// every one; anything else none, for now (#102).
+    fn walk_points(
+        &mut self,
+        new_entries: &[CacheEntry],
+    ) -> std::collections::HashMap<i32, EntryPos> {
+        let Some(cache) = self.prefix_cache.as_ref() else {
+            return Default::default();
+        };
+        let points: Vec<(i32, EntryPos)> = cache
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                walk_point(slot, new_entries).map(|at| (slot.seq_id, at))
+            })
+            .collect();
+        points
+            .into_iter()
+            .filter(|(seq, at)| {
+                self.engine.truncate_restores(*seq, at.pos as i32)
+            })
+            .collect()
+    }
+
     /// Climb `ladder` on slot `seq`: restore each rung in turn until
     /// one holds, and return it. A rung that fails drops one rung —
     /// logged as `restore_failed` with what the fall cost — never
@@ -7209,6 +7273,8 @@ impl<B: Backend> Session<B> {
                     .find(|old| old.hash == Some(h) && old.state.is_some())
                     .and_then(|old| old.state.clone());
             }
+            slot.kv_entries =
+                tip.as_ref().map_or(turn_start, |tip| tip.at.entry);
             slot.prev_entries = new_entries;
             slot.turn_start = turn_start;
             slot.breakpoints = new_breakpoints;
@@ -13533,6 +13599,7 @@ mod tests {
             &new_entries,
             &new_bps,
             &unmatched_hashes(2),
+            &Default::default(),
             &ids,
         )
         .map(|(seq, hit)| (seq, hit.at))
@@ -13555,6 +13622,7 @@ mod tests {
             &new_entries,
             &new_bps,
             &unmatched_hashes(1),
+            &Default::default(),
             &ids,
         )
         .unwrap();
@@ -13582,10 +13650,16 @@ mod tests {
         let new_bps = [ep(4), ep(6)];
         // Columns are index-parallel: `h` pairs with `ep(6)`.
         let new_hashes = [hash_partial_text("no match"), h];
-        let picked =
-            select_slot(&[a, b], &new_entries, &new_bps, &new_hashes, &ids)
-                .map(|(seq, hit)| (seq, hit.at))
-                .unwrap();
+        let picked = select_slot(
+            &[a, b],
+            &new_entries,
+            &new_bps,
+            &new_hashes,
+            &Default::default(),
+            &ids,
+        )
+        .map(|(seq, hit)| (seq, hit.at))
+        .unwrap();
         assert_eq!(picked, (0, ep(6)));
     }
 
@@ -13694,6 +13768,7 @@ mod tests {
             &new_entries,
             &[ep(2)],
             &unmatched_hashes(1),
+            &Default::default(),
             &ids,
         )
         .is_none());
@@ -14954,7 +15029,7 @@ mod tests {
         let new_entries = seq_entries(400);
         let (new_eps, new_hashes) = new_bps(&[(100, h_marker)]);
         assert_eq!(
-            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, &ids)
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, None, &ids)
                 .map_or_else(EntryPos::default, |hit| hit.at),
             ep(250),
             "a matched marker hash must not shadow the tip: the slot's \
@@ -14978,7 +15053,7 @@ mod tests {
         new_entries[200] = CacheEntry::Token(9999);
         let (new_eps, new_hashes) = new_bps(&[(200, h_marker)]);
         assert_eq!(
-            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, &ids)
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, None, &ids)
                 .map_or_else(EntryPos::default, |hit| hit.at),
             ep(200),
             "the hash path reaches the marker the LCP margin stops short of",
@@ -14998,13 +15073,141 @@ mod tests {
         new_entries[50] = CacheEntry::Token(9999);
         let (new_eps, new_hashes) = new_bps(&[(200, h_marker)]);
         assert_eq!(
-            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, &ids)
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, None, &ids)
                 .map_or_else(EntryPos::default, |hit| hit.at),
             ep(0),
         );
         let hashed =
             hash_keyed_l_hit(&slot, &new_entries, &new_eps, &new_hashes);
         assert_eq!(hashed.drifted, Some((ep(200), ep(200))));
+    }
+
+    // ----------------------------------------------------------------
+    // The walk point (#102)
+    // ----------------------------------------------------------------
+
+    /// A slot holding `prev_len` sequential entries, all in its KV, with
+    /// a marker at `marker`; and a prompt that parts from it at
+    /// `diverge`, then runs on to 400.
+    fn walk_shape(
+        prev_len: usize,
+        marker: usize,
+        diverge: usize,
+    ) -> (PrefixSlot, Vec<CacheEntry>) {
+        let mut slot = hashed_slot(prev_len, vec![bp(marker, None)], None);
+        slot.kv_entries = prev_len;
+        let mut new_entries = seq_entries(diverge);
+        new_entries.extend(toks(9000..9000 + (400 - diverge) as Token));
+        (slot, new_entries)
+    }
+
+    /// The bundle's shape (repro-20260729): the prompt parts from the
+    /// slot far past its last anchor, inside the final message. The walk
+    /// point, `lcp - 1`, outranks the marker below it — and yields to an
+    /// anchor at its own entry, which carries a sampler state.
+    #[test]
+    fn a_walk_point_outranks_a_shallower_marker() {
+        let (mut slot, new_entries) = walk_shape(300, 60, 200);
+        let walk = walk_point(&slot, &new_entries);
+        assert_eq!(walk, Some(ep(199)), "lcp - 1");
+        let (new_eps, new_hashes) = (vec![ep(60)], unmatched_hashes(1));
+        let ladder =
+            restore_ladder(&slot, &new_entries, &new_eps, &new_hashes, walk);
+        let rungs: Vec<_> = ladder.iter().map(|r| (r.at, r.source)).collect();
+        assert_eq!(
+            rungs,
+            [
+                (ep(199), ReuseSource::Walk),
+                (ep(60), ReuseSource::Breakpoint),
+            ],
+        );
+        assert_eq!(
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, walk, &ids),
+            Some(Reuse {
+                at: ep(199),
+                source: ReuseSource::Walk
+            }),
+        );
+        // Without one, the marker is all there is.
+        assert_eq!(
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, None, &ids)
+                .map(|r| r.at),
+            Some(ep(60)),
+        );
+        // An anchor at the walk point's own entry wins it.
+        slot.tip = Some(bp(199, None));
+        let ladder =
+            restore_ladder(&slot, &new_entries, &new_eps, &new_hashes, walk);
+        assert_eq!(
+            (ladder[0].at, ladder[0].source),
+            (ep(199), ReuseSource::Tip)
+        );
+        assert_eq!(ladder.len(), 2, "one rung per entry: {ladder:?}");
+    }
+
+    /// `prev_entries` runs past the KV (the predicted turn close), so
+    /// the walk point is capped at what the KV holds: the tip's entry,
+    /// else the turn start.
+    #[test]
+    fn the_walk_point_is_capped_at_the_kv() {
+        let (mut slot, new_entries) = walk_shape(300, 60, 250);
+        slot.kv_entries = 200;
+        assert_eq!(walk_point(&slot, &new_entries), Some(ep(200)));
+        slot.kv_entries = 0;
+        assert_eq!(walk_point(&slot, &new_entries), None, "nothing held");
+        // Under the cap, the margin rules.
+        slot.kv_entries = 300;
+        assert_eq!(walk_point(&slot, &new_entries), Some(ep(249)));
+        // No shared prefix to speak of.
+        let fresh = toks(9000..9400);
+        assert_eq!(walk_point(&slot, &fresh), None);
+    }
+
+    /// Q2: the walk point only extends a slot that offers an anchor.
+    /// An anchorless slot sharing a long preamble — another agent's,
+    /// under `--cache-slots N` — is not truncated for it; the slot with
+    /// a marker wins, though it shares less.
+    #[test]
+    fn a_walk_point_never_makes_a_hit_in_an_anchorless_slot() {
+        let mut bare = hashed_slot(300, vec![], None);
+        bare.kv_entries = 300;
+        let mut new_entries = seq_entries(250);
+        new_entries.extend(toks(9000..9150));
+        let walk = walk_point(&bare, &new_entries);
+        assert_eq!(walk, Some(ep(249)), "the premise: a walk point");
+        assert!(restore_ladder(&bare, &new_entries, &[], &[], walk).is_empty());
+        let walks: std::collections::HashMap<i32, EntryPos> =
+            [(0, ep(249))].into_iter().collect();
+        assert_eq!(
+            select_slot(
+                std::slice::from_ref(&bare),
+                &new_entries,
+                &[],
+                &[],
+                &walks,
+                &ids,
+            ),
+            None,
+        );
+
+        // Beside it, a slot with a marker at 60 sharing 100 entries.
+        let mut marked = PrefixSlot::new(1, std::time::Instant::now());
+        marked.prev_entries = seq_entries(100);
+        marked.breakpoints = vec![bp(60, None)];
+        marked.kv_entries = 100;
+        let walks: std::collections::HashMap<i32, EntryPos> =
+            [(0, ep(249)), (1, ep(99))].into_iter().collect();
+        assert_eq!(
+            select_slot(&[bare, marked], &new_entries, &[], &[], &walks, &ids,),
+            Some((
+                1,
+                Reuse {
+                    at: ep(99),
+                    source: ReuseSource::Walk
+                }
+            )),
+            "the marked slot, extended to its walk point",
+        );
     }
 
     // ----------------------------------------------------------------
@@ -15078,7 +15281,8 @@ mod tests {
         new_entries.extend(toks(9000..9042));
         let (new_eps, new_hashes) =
             (vec![ep(60), ep(290)], unmatched_hashes(2));
-        let hit = slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, &ids);
+        let hit =
+            slot_l_hit(&slot, &new_entries, &new_eps, &new_hashes, None, &ids);
         assert_eq!(
             hit,
             Some(Reuse {
@@ -15159,6 +15363,9 @@ mod tests {
             pub(super) restores: Vec<(i32, i32)>,
             /// Every `(seq, pos)` checkpoint asked for, in order.
             pub(super) checkpoints: Vec<(i32, i32)>,
+            /// Answer `true` to `truncate_restores`, as a dense
+            /// llama.cpp model does; `false` (the trait default) else.
+            pub(super) truncates: bool,
             /// The tokens a generation emits, in order, then EOS. Empty:
             /// flat logits, and no KV extent reported (`-1`).
             pub(super) script: Vec<Token>,
@@ -15265,6 +15472,9 @@ mod tests {
                     self.kv_end = pos as usize;
                     Ok(())
                 }
+            }
+            fn truncate_restores(&mut self, _: i32, _: i32) -> bool {
+                self.truncates
             }
             fn forget_pos(
                 &mut self,
@@ -15530,6 +15740,78 @@ mod tests {
         assert_eq!(field(failed, "lost_tokens"), Some("40"));
     }
 
+    /// The walk point through `Session`: a backend that rewinds by
+    /// truncation resumes where the prompt parts from the slot, logged
+    /// `source=walk`; one that does not (the trait default) resumes at
+    /// the anchor below, as before. With the walk point's restore
+    /// failing, the ladder drops one rung — never to zero.
+    #[test]
+    fn a_walk_point_restores_through_the_session() {
+        let run = |truncates: bool, missing: &[i32]| {
+            let mut session = mock::session(missing);
+            session.engine.decoder.truncates = truncates;
+            let mut slot =
+                hashed_slot(260, vec![bp(60, None), bp(120, None)], None);
+            slot.kv_entries = 260;
+            seat_slot(&mut session, slot);
+            let mut new_entries = seq_entries(200);
+            new_entries.extend(toks(9000..9040));
+            let (new_eps, new_hashes) = (vec![ep(60)], unmatched_hashes(1));
+            let mut result = None;
+            let events = capture_events(|| {
+                result = Some(
+                    session
+                        .kv_setup_and_chunk_prefill(
+                            &new_entries,
+                            &new_eps,
+                            &new_hashes,
+                            &Default::default(),
+                            0,
+                        )
+                        .expect("kv setup"),
+                );
+            });
+            let (_, cache_read, prefill_start, state, _) = result.unwrap();
+            assert!(state.is_none(), "a walk point folds from the top");
+            let hit = events
+                .iter()
+                .find(|(_, f)| field(f, "outcome") == Some("hit"))
+                .and_then(|(_, f)| field(f, "source"))
+                .map(str::to_owned);
+            let failed: Vec<_> = events
+                .iter()
+                .filter(|(_, f)| field(f, "reason") == Some("restore_failed"))
+                .map(|(_, f)| {
+                    (
+                        field(f, "source").map(str::to_owned),
+                        field(f, "fallback_entry").map(str::to_owned),
+                    )
+                })
+                .collect();
+            let restores = session.engine.decoder.restores.clone();
+            (restores, (cache_read, prefill_start), hit, failed)
+        };
+
+        let (restores, read, hit, failed) = run(true, &[]);
+        assert_eq!(restores, [(0, 199)]);
+        assert_eq!(read, (199, 199));
+        assert_eq!(hit.as_deref(), Some("walk"));
+        assert!(failed.is_empty());
+
+        // No `truncate_restores`: the lookback anchor, as before #102.
+        let (restores, read, hit, _) = run(false, &[]);
+        assert_eq!(restores, [(0, 120)]);
+        assert_eq!(read, (120, 120));
+        assert_eq!(hit.as_deref(), Some("lookback"));
+
+        // The walk point's restore fails: one rung down.
+        let (restores, read, hit, failed) = run(true, &[199]);
+        assert_eq!(restores, [(0, 199), (0, 120)]);
+        assert_eq!(read, (120, 120));
+        assert_eq!(hit.as_deref(), Some("lookback"));
+        assert_eq!(failed, [(Some("walk".to_owned()), Some("120".to_owned()))],);
+    }
+
     /// The anchors a call leaves — its breakpoints, crossed by the
     /// prefill, and the tip at the head after generation — are exactly
     /// the rungs the next call's ladder can ask for, so each must have
@@ -15657,7 +15939,7 @@ mod tests {
             .unwrap();
         // The premise: the pick covers every entry.
         assert_eq!(
-            slot_l_hit(slot, &new_entries, &new_eps, &new_hashes, &ids),
+            slot_l_hit(slot, &new_entries, &new_eps, &new_hashes, None, &ids),
             Some(Reuse {
                 at: ep(100),
                 source: ReuseSource::Hash
@@ -15688,7 +15970,8 @@ mod tests {
         let new_entries = seq_entries(100);
         let (new_eps, new_hashes) = new_bps(&[(100, h100)]);
         let offer = |below| {
-            slot_offer(&slot, &new_entries, &new_eps, &new_hashes, below).0
+            slot_offer(&slot, &new_entries, &new_eps, &new_hashes, None, below)
+                .0
         };
         assert_eq!(offer(usize::MAX).map(|r| r.at), Some(ep(100)));
         assert_eq!(
