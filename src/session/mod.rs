@@ -9921,6 +9921,9 @@ fn trim_eos<'a, B: Backend>(text: &'a str, engine: &Engine<B>) -> &'a str {
 }
 
 #[cfg(test)]
+mod round_trip_oracle;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

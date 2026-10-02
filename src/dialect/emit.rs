@@ -225,13 +225,18 @@ pub fn grammar_source(
             } else {
                 format!(r#""{start_lit}" "#)
             };
+            // No whitespace before a call the turn opens with: no block
+            // carries it (a call has no signature, and a blank text is
+            // never returned), so the re-render drops it and the turn
+            // parts from its KV at its first byte (#129's oracle). After
+            // a thought it rides in the thought's tail.
             let _ = writeln!(
                 src,
-                "root ::= ( {open}thought_close{after_thought} | fws ) calls"
+                "root ::= ( {open}thought_close{after_thought} )? calls"
             );
         }
         (Anchor::Eager, false) => {
-            let _ = writeln!(src, "root ::= fws calls");
+            let _ = writeln!(src, "root ::= calls");
         }
     }
 
@@ -367,10 +372,13 @@ pub fn grammar_source(
 ///
 /// Lazy (`Auto`): activated by one of [`CallSyntax::triggers`] (both
 /// recipient positions); the root accepts either header shape from
-/// the trigger's first byte, with the constraint clause lenient
-/// (optional, `<|constrain|>` literal optional, any `[A-Za-z0-9_-]+`
-/// type — upstream parity) because the pre-trigger bytes were sampled
-/// free and canonical-byte forcing is pointless mid-header.
+/// the trigger's first byte. After a channel-header trigger the rest of
+/// the header is generated, so it is forced canonical
+/// (` <|constrain|>json<|message|>`, the re-render's bytes). After a
+/// role-header trigger the constraint clause stays lenient (optional,
+/// `<|constrain|>` literal optional, any `[A-Za-z0-9_-]+` type —
+/// upstream parity): that shape re-renders in the channel header
+/// whatever follows, so forcing its tail buys no cache.
 fn harmony_grammar_source(
     tools: &[&Tool],
     opts: &EmitOptions,
@@ -422,10 +430,13 @@ fn harmony_grammar_source(
                     r#"h_role_{i} ::= "{name_lit}" h_channel h_constraint? "{msg}" h_args_{i}"#
                 );
                 // Recipient in the channel header: the channel was
-                // consumed by the trigger.
+                // consumed by the trigger, and the rest of the header is
+                // the model's to write — in the canonical spelling, the
+                // one the template re-renders, or the turn parts from
+                // its KV there (#129's oracle).
                 let _ = writeln!(
                     src,
-                    r#"h_chan_{i} ::= "{name_lit}" h_constraint? "{msg}" h_args_{i}"#
+                    r#"h_chan_{i} ::= "{name_lit} {constrain}json{msg}" h_args_{i}"#
                 );
             }
         }
@@ -445,9 +456,18 @@ fn harmony_grammar_source(
                 src,
                 r#"h_analysis ::= "{analysis_open}" h_end "{start}""#
             );
+            // A preamble is a text block, and a blank one is never
+            // returned, so it would re-render as nothing: its body holds
+            // something besides whitespace (#129's oracle). The first
+            // such byte may not start the `<|end|>` the until-rule after
+            // it scans for.
             let _ = writeln!(
                 src,
-                r#"h_preamble ::= "{commentary_open}" h_end "{start}""#
+                r#"h_preamble ::= "{commentary_open}" h_pre_lead h_end "{start}""#
+            );
+            let _ = writeln!(
+                src,
+                r#"h_pre_lead ::= [ \t\n\r]* ( [^ \t\n\r<] | "<" [^|<] )"#
             );
             for (i, tool) in tools.iter().enumerate() {
                 let name_lit = escape_for_gbnf_string(tool.name.as_ref());
@@ -1480,4 +1500,102 @@ pub fn render_reference(
     }
     out.push_str(&syntax.section_end);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CallSyntax, Grammar, GrammarState};
+
+    fn weather() -> Tool {
+        Tool::builder("get_weather")
+            .description("Get the weather for a city.")
+            .schema(serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }))
+            .build()
+            .expect("valid tool")
+    }
+
+    fn admits(syntax: &CallSyntax, anchor: Anchor, text: &str) -> bool {
+        let opts = EmitOptions {
+            anchor,
+            ..EmitOptions::default()
+        };
+        let source = grammar_source(syntax, &[&weather()], &opts).unwrap();
+        let mut state =
+            GrammarState::new(Arc::new(Grammar::parse(&source).unwrap()));
+        state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+    }
+
+    /// A forced call that opens the turn opens it on its first byte:
+    /// whitespace before it has no block to ride, and re-rendered
+    /// without it the turn parts from its KV at byte 0 (#129's oracle).
+    #[test]
+    fn eager_call_opening_the_turn_has_no_whitespace_before_it() {
+        let input = serde_json::json!({"city": "Paris"});
+        for syntax in [
+            CallSyntax::qwen_xml(),
+            CallSyntax::hermes_json(),
+            CallSyntax::gemma4(),
+        ] {
+            let call =
+                render_reference(&syntax, &[("get_weather", &input)]).unwrap();
+            let call = format!("{call}{}", syntax.tool_response_start);
+            assert!(admits(&syntax, Anchor::Eager, &call), "{call:?}");
+            for ws in [" ", "\n", "\t"] {
+                let led = format!("{ws}{call}");
+                assert!(!admits(&syntax, Anchor::Eager, &led), "{led:?}");
+            }
+        }
+    }
+
+    /// A forced Harmony turn's preamble is never blank: a blank text is
+    /// never returned, so it re-rendered as nothing (#129's oracle).
+    #[test]
+    fn harmony_eager_preamble_is_not_blank() {
+        let syntax = CallSyntax::gpt_oss();
+        let call = "<|channel|>commentary to=functions.get_weather \
+                    <|constrain|>json<|message|>{\"city\":\"Paris\"}";
+        let eager = |preamble: &str| {
+            let text = format!(
+                "<|channel|>commentary<|message|>{preamble}<|end|>\
+                 <|start|>assistant{call}"
+            );
+            admits(&syntax, Anchor::Eager, &text)
+        };
+        assert!(admits(&syntax, Anchor::Eager, call));
+        for ok in ["Checking.", "\nChecking.\n", " .", "<b>"] {
+            assert!(eager(ok), "{ok:?}");
+        }
+        for blank in ["", " ", "\n\n", "<|end|>x", " <|end|>x"] {
+            assert!(!eager(blank), "{blank:?}");
+        }
+    }
+
+    /// After a channel-header trigger the rest of a Harmony call header
+    /// is generated, so it is forced to the bytes the template
+    /// re-renders; the role-header shape re-renders in the channel
+    /// header whatever follows, and keeps upstream's lenient clause.
+    #[test]
+    fn harmony_lazy_channel_header_is_canonical() {
+        let syntax = CallSyntax::gpt_oss();
+        let args = r#"{"city":"Paris"}"#;
+        let chan = "<|channel|>commentary to=functions.get_weather";
+        let lazy = |text: &str| admits(&syntax, Anchor::Lazy, text);
+        assert!(lazy(&format!("{chan} <|constrain|>json<|message|>{args}")));
+        for clause in ["", " json", " <|constrain|>code", "  <|constrain|>json"]
+        {
+            let text = format!("{chan}{clause}<|message|>{args}");
+            assert!(!lazy(&text), "{text:?}");
+        }
+        let role = "<|start|>assistant to=functions.get_weather\
+                    <|channel|>commentary";
+        for clause in ["", " json", " <|constrain|>json"] {
+            let text = format!("{role}{clause}<|message|>{args}");
+            assert!(lazy(&text), "{text:?}");
+        }
+    }
 }

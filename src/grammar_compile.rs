@@ -1149,8 +1149,11 @@ pub(crate) fn emit_dict_value_rules(quote: &str, out: &mut String) {
     );
     let _ = writeln!(out, r#"dnull ::= "null" | "none" | "None""#);
     // Bare keys: anything but the key/dict terminators (upstream
-    // parity: `chars("[^:}]", 1, -1)`).
-    let _ = writeln!(out, r#"dkey ::= [^:}}]+"#);
+    // parity: `chars("[^:}]", 1, -1)`), save whitespace at either end:
+    // the parser trims a key, so `{d :1}` re-rendered `{d:1}` (#129's
+    // oracle).
+    let _ =
+        writeln!(out, r#"dkey ::= [^:}} \t\n\r] ( [^:}}]* [^:}} \t\n\r] )?"#);
     let quote_lit = escape_for_gbnf_string(quote);
     // The until-rule consumes string content AND the closing quote.
     let _ = writeln!(out, r#"dstring ::= "{quote_lit}" dstring__body"#);
@@ -1479,6 +1482,19 @@ const KV_SEP_PERMISSIVE: &str = r#"kv_sep ::= ws ":" ws"#;
 const ELEM_SEP_PERMISSIVE: &str = r#"elem_sep ::= ws "," ws"#;
 /// Just inside `{`/`}` and `[`/`]`.
 const PAD_PERMISSIVE: &str = r"pad ::= ws";
+/// Every escape JSON allows: `\/`, and `\u` with any code unit.
+const ESCAPE_PERMISSIVE: &str = concat!(
+    r#"escape ::= "\\" ( ["\\/bfnrt] | "u" non_surrogate_hex4 | "#,
+    r#""u" high_surrogate "\\u" low_surrogate )"#,
+);
+/// The escapes `serde_json` writes, and no others: the short forms,
+/// then `\u00XX` (lowercase) for the remaining control characters. Every
+/// other character is written raw, so `\/`, `\u00e9` and `\u000A`
+/// parse to a value that re-renders in different bytes.
+const ESCAPE_CANONICAL: &str = concat!(
+    r#"escape ::= "\\" ( ["\\bfnrt] | "#,
+    r#""u00" ( "0" [0-7bef] | "1" [0-9a-f] ) )"#,
+);
 /// Framing whitespace, permissive, under a name the JSON rules never
 /// reference — root rules use it for the layout *around* the JSON
 /// (e.g. the `\n\n` a thinking model puts between `</think>` and its
@@ -1487,8 +1503,8 @@ const PAD_PERMISSIVE: &str = r"pad ::= ws";
 const FWS_PERMISSIVE: &str = r"fws ::= [ \t\n\r]?";
 
 /// [`JSON_GRAMMAR`] with JSON-*internal* whitespace pinned to exactly
-/// one spelling per [`JsonSpacing`], plus a separate `fws` for
-/// framing.
+/// one spelling per [`JsonSpacing`], and string escapes to the ones
+/// `serde_json` writes, plus a separate `fws` for framing.
 ///
 /// Tool calls must re-render byte-identically to what the model
 /// emitted or the prefix cache's auto-tip is discarded (#85):
@@ -1540,7 +1556,8 @@ pub fn json_grammar_canonical(spacing: JsonSpacing) -> String {
             ELEM_SEP_PERMISSIVE,
             &format!(r#"elem_sep ::= "{}""#, spacing.elem_sep()),
         )
-        .replace(PAD_PERMISSIVE, r#"pad ::= """#);
+        .replace(PAD_PERMISSIVE, r#"pad ::= """#)
+        .replace(ESCAPE_PERMISSIVE, ESCAPE_CANONICAL);
     out.push_str(FWS_PERMISSIVE);
     out.push('\n');
     out
@@ -1620,11 +1637,12 @@ mod tests {
     /// prefix cache quietly stops matching. Fail loudly here instead.
     #[test]
     fn canonical_json_grammar_pins_separators() {
-        const PERMISSIVE: [&str; 4] = [
+        const PERMISSIVE: [&str; 5] = [
             WS_PERMISSIVE,
             KV_SEP_PERMISSIVE,
             ELEM_SEP_PERMISSIVE,
             PAD_PERMISSIVE,
+            ESCAPE_PERMISSIVE,
         ];
         for production in PERMISSIVE {
             assert!(
@@ -1659,6 +1677,39 @@ mod tests {
             // Framing whitespace survives, under a name the JSON rules
             // never reference.
             assert!(lines.contains(&r"fws ::= [ \t\n\r]?"));
+        }
+    }
+
+    /// A string's escapes are pinned like its separators (#129's
+    /// round-trip oracle): a value parses to the same string from
+    /// `"\u00e9"` and `"é"`, and re-renders the second, so the grammar
+    /// admits exactly what `serde_json` writes. Each control character,
+    /// the quote, the backslash and a few non-ASCII characters are
+    /// written by the serializer the templates use and must be admitted;
+    /// every other escape of the same text must not.
+    #[test]
+    fn canonical_prelude_admits_only_serializer_escapes() {
+        let rules = "root ::= string\n";
+        let permissive = format!("{rules}{JSON_GRAMMAR}");
+        for spacing in [JsonSpacing::Compact, JsonSpacing::Spaced] {
+            let canonical =
+                format!("{rules}{}", json_grammar_canonical(spacing));
+            for c in (0u8..0x80).map(char::from).chain(['é', '→', '🍓']) {
+                let written = serde_json::to_string(&c.to_string()).unwrap();
+                assert!(accepts(&canonical, &written), "{written}");
+            }
+            for other in [
+                r#""\/""#,
+                r#""\u00e9""#,
+                r#""\u0041""#,
+                r#""\u000a""#,
+                r#""\u000A""#,
+                r#""\u001F""#,
+                r#""\ud83c\udf53""#,
+            ] {
+                assert!(accepts(&permissive, other), "valid JSON: {other}");
+                assert!(!accepts(&canonical, other), "{spacing:?}: {other}");
+            }
         }
     }
 
@@ -2279,6 +2330,22 @@ mod tests {
         }
         for bad in ["{c:3,a:1}", "{a:1,}", "{,a:1}", "{a:1,a:1}", "{a:1b:2}"] {
             assert!(!accepts(&src, bad), "{bad}");
+        }
+    }
+
+    /// An untyped dict object's bare keys carry no whitespace at either
+    /// end: the parser trims a key, so one that did re-rendered without
+    /// it (#129's oracle). Inner whitespace is the key's own.
+    #[test]
+    fn dict_untyped_keys_have_no_edge_whitespace() {
+        let mut rules = String::from("root ::= dobject\n");
+        emit_dict_value_rules("'", &mut rules);
+        rules.push_str(JSON_GRAMMAR);
+        for ok in ["{}", "{d:1}", "{a b:1}", "{a,b:'x'}", "{d:{e:none}}"] {
+            assert!(accepts(&rules, ok), "{ok}");
+        }
+        for bad in ["{d :1}", "{ d:1}", "{\td:1}", "{d\n:1}", "{ :1}"] {
+            assert!(!accepts(&rules, bad), "{bad}");
         }
     }
 
