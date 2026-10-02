@@ -8,7 +8,8 @@
 //! (`<model>.template.jinja`, raw Jinja), the multimodal
 //! projector (`<model>.mmproj.gguf`, [`mmproj_path`] — enables image
 //! input under the `mtmd` feature), or load-time options
-//! (`<model>.load.toml`, `LoadSidecar` — the KV context size). [`crate::LlamaCppSession::from_path*`]
+//! (`<model>.load.toml`, [`LoadSidecar`] — the KV context size and
+//! micro-batch). [`crate::LlamaCppSession::from_path*`]
 //! looks for each when loading a model. For sampling, if no sidecar
 //! exists one is written so the user has a starting point to edit —
 //! seeded from the model's own recommendation where it has one (see
@@ -315,12 +316,12 @@ pub fn load_template_source(
 /// # small (~64 KiB/token), so this model can afford its trained
 /// # window while `--n-ctx 131072` stays the default for the rest.
 /// n_ctx = 262144
+/// n_ubatch = 2048
 /// ```
 ///
 /// Unknown keys are a parse error (a misspelled `n-ctx` must not
 /// silently fall back to the default). A sidecar that fails to read
 /// or parse is logged and ignored, like the other sidecars.
-#[cfg(feature = "toml")]
 #[derive(
     Debug,
     Clone,
@@ -337,6 +338,13 @@ pub struct LoadSidecar {
     /// KV context size in tokens, capped at the model's trained
     /// window (see [`effective_n_ctx`]).
     pub n_ctx: Option<u32>,
+    /// Micro-batch size (llama.cpp's `n_ubatch`, default 512), clamped
+    /// to `n_batch`; an explicit `LlamaCppOptions::n_ubatch` wins (see
+    /// [`effective_n_ubatch`]). Bigger buys a little prefill
+    /// speed (~1–2% at 1024–4096 on Metal, flat above) for a bigger
+    /// compute buffer (325–737 MiB at 512), so it spends Metal
+    /// working-set headroom.
+    pub n_ubatch: Option<u32>,
 }
 
 /// Read a load sidecar from `path`, if it exists. Same contract as
@@ -380,6 +388,22 @@ pub fn effective_n_ctx(
         (None, _) => default,
         (Some(n_ctx), 0) => Some(n_ctx),
         (Some(n_ctx), train) => Some(n_ctx.min(train)),
+    }
+}
+
+/// The micro-batch a model is served with: an `explicit` option as-is
+/// (tests pin it to the ubatch grid, so a sidecar must never move it),
+/// else the load sidecar's clamped to `n_batch` (`0` is invalid and
+/// ignored), else `None` — llama.cpp's default.
+pub fn effective_n_ubatch(
+    explicit: Option<u32>,
+    sidecar: Option<u32>,
+    n_batch: u32,
+) -> Option<u32> {
+    match (explicit, sidecar) {
+        (Some(n_ubatch), _) => Some(n_ubatch),
+        (None, None | Some(0)) => None,
+        (None, Some(n_ubatch)) => Some(n_ubatch.min(n_batch.max(1))),
     }
 }
 
@@ -579,12 +603,29 @@ mod tests {
         std::fs::write(&path, "# Qwen3.8\nn_ctx = 262144\n").unwrap();
         let sidecar = load_load_options(&path).unwrap().expect("written");
         assert_eq!(sidecar.n_ctx, Some(262144));
+        assert_eq!(sidecar.n_ubatch, None);
+
+        std::fs::write(&path, "n_ctx = 131072\nn_ubatch = 2048\n").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar.n_ctx, Some(131072));
+        assert_eq!(sidecar.n_ubatch, Some(2048));
+
+        std::fs::write(&path, "n_ubatch = 1024").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!((sidecar.n_ctx, sidecar.n_ubatch), (None, Some(1024)));
 
         std::fs::write(&path, "").unwrap();
         let sidecar = load_load_options(&path).unwrap().expect("written");
         assert_eq!(sidecar, LoadSidecar::default());
 
-        for bad in ["n-ctx = 262144", "n_ctx = -1", "n_ctx = \"256k\""] {
+        for bad in [
+            "n-ctx = 262144",
+            "n_ctx = -1",
+            "n_ctx = \"256k\"",
+            "n-ubatch = 2048",
+            "n_ubatch = -1",
+            "n_ubatch = \"2k\"",
+        ] {
             std::fs::write(&path, bad).unwrap();
             assert!(
                 matches!(
@@ -625,6 +666,32 @@ mod tests {
         assert_eq!(effective_n_ctx(None, None, 40960), None);
         // A sidecar works without any default (llama.cpp's 512).
         assert_eq!(effective_n_ctx(None, Some(8192), 40960), Some(8192));
+    }
+
+    /// An explicit option beats the sidecar, which beats llama.cpp's
+    /// default; the sidecar's value is clamped to `n_batch` and `0`
+    /// is ignored. blallama sets `n_batch = n_ctx`.
+    #[test]
+    fn effective_n_ubatch_precedence_and_clamp() {
+        const N_BATCH: u32 = 131072;
+        // Sidecar over the default.
+        assert_eq!(effective_n_ubatch(None, Some(2048), N_BATCH), Some(2048));
+        assert_eq!(effective_n_ubatch(None, None, N_BATCH), None);
+        // An explicit option (the #126 grid pin) beats the sidecar,
+        // either way, and is never clamped here.
+        assert_eq!(effective_n_ubatch(Some(31), Some(2048), N_BATCH), Some(31));
+        assert_eq!(
+            effective_n_ubatch(Some(4096), Some(512), N_BATCH),
+            Some(4096)
+        );
+        assert_eq!(effective_n_ubatch(Some(64), None, 32), Some(64));
+        // Clamped to n_batch.
+        assert_eq!(effective_n_ubatch(None, Some(4096), 1024), Some(1024));
+        assert_eq!(effective_n_ubatch(None, Some(1024), 1024), Some(1024));
+        // Invalid: ignored, so the default stands.
+        assert_eq!(effective_n_ubatch(None, Some(0), N_BATCH), None);
+        // A degenerate n_batch still yields a valid micro-batch.
+        assert_eq!(effective_n_ubatch(None, Some(2048), 0), Some(1));
     }
 
     /// Test-local tempfile dir that doesn't depend on the `tempfile`

@@ -3458,30 +3458,30 @@ fn llama_cpp_load_sidecar_path(
     model_path.with_extension("load.toml")
 }
 
-/// The per-model `n_ctx` from the load sidecar at `sidecar_path`, if
-/// any (see [`crate::sidecar::effective_n_ctx`] for how it applies). A
-/// sidecar that fails to read or parse warns and is ignored, so the
-/// model loads at the server-wide default.
+/// The load sidecar at `sidecar_path`, if any (see
+/// [`crate::sidecar::LoadSidecar`] for how it applies). A sidecar that
+/// fails to read or parse warns and is ignored, so the model loads with
+/// the server-wide options.
 #[cfg(feature = "llama-cpp")]
-fn load_sidecar_n_ctx(
+fn load_sidecar(
     #[allow(unused_variables)] sidecar_path: &std::path::Path,
-) -> Option<u32> {
+) -> crate::sidecar::LoadSidecar {
     #[cfg(feature = "toml")]
     {
         match crate::sidecar::load_load_options(sidecar_path) {
-            Ok(sidecar) => sidecar.and_then(|s| s.n_ctx),
+            Ok(sidecar) => sidecar.unwrap_or_default(),
             Err(e) => {
                 tracing::warn!(
                     "could not load load sidecar at {sidecar_path:?}: \
-                     {e}; using the default n_ctx"
+                     {e}; using the default load options"
                 );
-                None
+                Default::default()
             }
         }
     }
     #[cfg(not(feature = "toml"))]
     {
-        None
+        Default::default()
     }
 }
 
@@ -3540,7 +3540,7 @@ pub type LlamaCppSession = Session<LlamaCppBackend>;
 /// Chat-template and dialect sidecars are picked up the same way, and
 /// llama.cpp reads a load sidecar (`load.toml`,
 /// [`LoadSidecar`](crate::sidecar::LoadSidecar)) for a per-model
-/// `n_ctx`, in both the load and [`Self::peek`].
+/// `n_ctx` (in both the load and [`Self::peek`]) and `n_ubatch`.
 /// Requires the `toml` feature; without it, sidecars are ignored.
 // `async_trait` marks each method `#[must_use]` on a boxed future that
 // already is; clippy 1.99 flags the pair in the expansion.
@@ -3616,9 +3616,9 @@ impl FromPath for Session<LlamaCppBackend> {
         let sidecar = llama_cpp_sidecar_path(&path);
         let template_sidecar = llama_cpp_template_sidecar_path(&path);
         let dialect_sidecar = llama_cpp_dialect_sidecar_path(&path);
-        let n_ctx = load_sidecar_n_ctx(&llama_cpp_load_sidecar_path(&path));
-        let engine = crate::LlamaCppEngine::from_path_with_n_ctx_override(
-            path, options, n_ctx,
+        let load = load_sidecar(&llama_cpp_load_sidecar_path(&path));
+        let engine = crate::LlamaCppEngine::from_path_with_load_sidecar(
+            path, options, load,
         )?;
         Ok(apply_dialect_sidecar(
             apply_template_sidecar(
@@ -3659,7 +3659,7 @@ impl FromPath for Session<LlamaCppBackend> {
         let options = crate::LlamaCppOptions {
             n_ctx: crate::sidecar::effective_n_ctx(
                 options.n_ctx,
-                load_sidecar_n_ctx(&llama_cpp_load_sidecar_path(path)),
+                load_sidecar(&llama_cpp_load_sidecar_path(path)).n_ctx,
                 model.context_size().max(0) as u32,
             ),
             ..*options

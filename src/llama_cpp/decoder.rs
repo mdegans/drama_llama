@@ -19,11 +19,12 @@ use llama_cpp_sys_3::{
     llama_memory_seq_cp, llama_memory_seq_div, llama_memory_seq_keep,
     llama_memory_seq_pos_max, llama_memory_seq_pos_min, llama_memory_seq_rm,
     llama_model_n_embd_out, llama_n_batch, llama_n_ctx, llama_n_seq_max,
-    llama_numa_init, llama_perf_context, llama_perf_context_data,
-    llama_perf_context_reset, llama_pos, llama_seq_id, llama_set_n_threads,
-    llama_state_get_data, llama_state_get_size, llama_state_seq_flags,
-    llama_state_seq_get_data_ext, llama_state_seq_get_size_ext,
-    llama_state_seq_set_data_ext, llama_state_set_data,
+    llama_n_ubatch, llama_numa_init, llama_perf_context,
+    llama_perf_context_data, llama_perf_context_reset, llama_pos, llama_seq_id,
+    llama_set_n_threads, llama_state_get_data, llama_state_get_size,
+    llama_state_seq_flags, llama_state_seq_get_data_ext,
+    llama_state_seq_get_size_ext, llama_state_seq_set_data_ext,
+    llama_state_set_data,
 };
 
 use thiserror::Error;
@@ -446,6 +447,11 @@ impl LlamaCppDecoder {
     /// Max batch size configured on this context.
     pub fn n_batch(&self) -> u32 {
         unsafe { llama_n_batch(self.context) }
+    }
+
+    /// Micro-batch size configured on this context.
+    pub fn n_ubatch(&self) -> u32 {
+        unsafe { llama_n_ubatch(self.context) }
     }
 
     /// Size of the serialized global state (logits, embedding, memory).
