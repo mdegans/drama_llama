@@ -1620,6 +1620,43 @@ fn tip_ttl(breakpoint_ttls: &[CacheTtl]) -> CacheTtl {
         .unwrap_or(CacheTtl::FiveMinutes)
 }
 
+/// `breakpoints` plus the session's private *turn anchor*: an anchor
+/// at the end of the prompt, where this call's generation began,
+/// checkpointed at `head` once the prompt was prefilled.
+///
+/// The next request's divergence is overwhelmingly inside the turn just
+/// generated (a re-render that is not byte-stable), past every prompt
+/// anchor but short of the tip. Without this anchor the restore fell to
+/// the client's last marker, which can sit far back: live on Qwen3.6, a
+/// divergence 669 tokens into a turn re-prefilled 12,757.
+///
+/// Stored as a hashless breakpoint, so the LCP walk offers it as a
+/// lookback and the next call's orphan pruning frees it once a later
+/// anchor is reused. Not pushed when a marker already sits at `head`,
+/// nor when `head` is not the prompt's end (it then names another
+/// position's state).
+fn with_turn_anchor(
+    mut breakpoints: Vec<Breakpoint>,
+    entries: &[CacheEntry],
+    head: Option<usize>,
+    ttl: CacheTtl,
+) -> Vec<Breakpoint> {
+    let at = entry_pos_at(entries, entries.len());
+    let fresh = head == Some(at.pos)
+        && at.entry > 0
+        && breakpoints.iter().all(|bp| bp.at.pos != at.pos);
+    if fresh {
+        breakpoints.push(Breakpoint {
+            at,
+            hash: None,
+            state: None,
+            cursor: SeedCursor::default(),
+            ttl,
+        });
+    }
+    breakpoints
+}
+
 /// The pure core of `Session::compute_tip_extension`: given the
 /// prompt's cache entries, every token the predictor *recorded*, the
 /// canonical re-render's tail past the KV head, and the KV head
@@ -6143,11 +6180,14 @@ impl<B: Backend> Session<B> {
                     .as_ref()
                     .and_then(|cache| cache.slot(active_seq))
                     .and_then(|slot| {
+                        // The first anchor there that has a state: the
+                        // turn anchor carries none, and can share its
+                        // position with a tip that does.
                         slot.breakpoints
                             .iter()
                             .chain(slot.tip.as_ref())
-                            .find(|bp| bp.at.pos == effective_cache_read.pos)
-                            .and_then(|bp| {
+                            .filter(|bp| bp.at.pos == effective_cache_read.pos)
+                            .find_map(|bp| {
                                 bp.state.clone().map(|s| (s, bp.cursor))
                             })
                     })
@@ -7202,6 +7242,7 @@ impl<B: Backend> Session<B> {
             )
         }
         .with_reserved(reserved);
+        let turn_head = cache_on.then(|| predictor.checkpoint_head());
         while let Some(piece) = predictor.next() {
             if cache_on {
                 let token = predictor.last_token().unwrap_or(-1);
@@ -7311,16 +7352,15 @@ impl<B: Backend> Session<B> {
         // `complete_text` doesn't parse blocks, so we have no
         // structured assistant content to canonical-render for the tip
         // hash — the tip stays LCP-matchable only.
+        let ttl = tip_ttl(&breakpoint_ttls);
         let tip = internal_tip.map(|at| Breakpoint {
             at,
             hash: None,
             state: final_state,
             cursor: tip_cursor(prompt),
-            ttl: tip_ttl(&breakpoint_ttls),
+            ttl: ttl.clone(),
         });
-        self.record_cache_hit(
-            extended_prev,
-            turn_start,
+        let breakpoints = with_turn_anchor(
             assemble_breakpoints(
                 breakpoints,
                 partial_hashes,
@@ -7328,6 +7368,16 @@ impl<B: Backend> Session<B> {
                 breakpoint_ttls,
                 bp_states,
             ),
+            // Empty (no anchor) if the extension ever ended short of
+            // the prompt, rather than a slice panic.
+            extended_prev.get(..turn_start).unwrap_or(&[]),
+            turn_head,
+            ttl,
+        );
+        self.record_cache_hit(
+            extended_prev,
+            turn_start,
+            breakpoints,
             cache_read,
             tip,
         );
@@ -7514,10 +7564,15 @@ impl<B: Backend> Session<B> {
         // path (whose fold-snapshot states ARE recorded, below) still
         // works exactly as before. (See plan: streaming tip extension
         // is a v2 follow-up.)
+        //
+        // The turn anchor is recorded here too, at the head the
+        // predictor's prefill leaves; it is checkpointed below, once
+        // that prefill has run.
         let turn_start = entries.len();
-        self.record_cache_hit(
-            entries,
-            turn_start,
+        let cache_on = self.prefix_cache.is_some();
+        let turn_head = cache_on.then(|| prefill_start + suffix.len());
+        let ttl = tip_ttl(&breakpoint_ttls);
+        let breakpoints = with_turn_anchor(
             assemble_breakpoints(
                 breakpoints,
                 partial_hashes,
@@ -7525,6 +7580,14 @@ impl<B: Backend> Session<B> {
                 breakpoint_ttls,
                 bp_states,
             ),
+            &entries,
+            turn_head,
+            ttl,
+        );
+        self.record_cache_hit(
+            entries,
+            turn_start,
+            breakpoints,
             cache_read,
             None,
         );
@@ -7554,7 +7617,7 @@ impl<B: Backend> Session<B> {
         let provenance = self.provenance();
         let reserved = self.literals.neutralizer.clone();
 
-        let predictor = if self.prefix_cache.is_some() {
+        let mut predictor = if cache_on {
             // Cache on: ALWAYS the resuming constructor — even at
             // prefill_start == 0 — because the non-resuming one calls
             // `decoder.memory_clear()` (predictor.rs), which would
@@ -7575,6 +7638,10 @@ impl<B: Backend> Session<B> {
             )
         }
         .with_reserved(reserved);
+        if cache_on {
+            let head = predictor.checkpoint_head();
+            debug_assert_eq!(Some(head), turn_head, "turn anchor off the head");
+        }
         Ok(BlockStream {
             predictor,
             filter: stop::StopFilter::new(
@@ -7764,6 +7831,7 @@ impl<B: Backend> Session<B> {
             )
         }
         .with_reserved(reserved);
+        let turn_head = cache_on.then(|| predictor.checkpoint_head());
 
         while let Some(piece) = predictor.next() {
             if collect_token_dump {
@@ -8144,16 +8212,15 @@ impl<B: Backend> Session<B> {
         // Cache + usage bookkeeping, then grammar-violation check.
         // Check last so a violation still records the work that was
         // done — usage numbers are correct either way.
+        let ttl = tip_ttl(&breakpoint_ttls);
         let tip = internal_tip.map(|at| Breakpoint {
             at,
             hash: tip_hash,
             state: final_state,
             cursor: tip_cursor(prompt),
-            ttl: tip_ttl(&breakpoint_ttls),
+            ttl: ttl.clone(),
         });
-        self.record_cache_hit(
-            extended_prev,
-            turn_start,
+        let breakpoints = with_turn_anchor(
             assemble_breakpoints(
                 breakpoints,
                 partial_hashes,
@@ -8161,6 +8228,16 @@ impl<B: Backend> Session<B> {
                 breakpoint_ttls,
                 bp_states,
             ),
+            // Empty (no anchor) if the extension ever ended short of
+            // the prompt, rather than a slice panic.
+            extended_prev.get(..turn_start).unwrap_or(&[]),
+            turn_head,
+            ttl,
+        );
+        self.record_cache_hit(
+            extended_prev,
+            turn_start,
+            breakpoints,
             cache_read,
             tip,
         );
@@ -15190,7 +15267,7 @@ mod tests {
 
         let first = session.complete_response(&prompt).expect("first");
         let left = anchors(&session);
-        assert_eq!(left.len(), 3, "two markers and a tip: {left:?}");
+        assert_eq!(left.len(), 4, "two markers, a turn and a tip: {left:?}");
         let taken = &session.engine.decoder.checkpoints;
         assert!(
             left.iter().all(|a| taken.contains(a)),
@@ -15214,6 +15291,50 @@ mod tests {
             left.iter().all(|a| taken.contains(a)),
             "anchors {left:?}, checkpoints {taken:?}",
         );
+    }
+
+    /// A re-rendered reply that parts from what the model generated
+    /// (`tip_diverged`) rewinds to the turn anchor at the end of the
+    /// prompt it was generated from, not to the last marker before it.
+    /// Live on Qwen3.6 that marker sat 12k tokens back, all of it
+    /// re-prefilled for a divergence 669 tokens into the turn.
+    #[test]
+    fn a_reply_diverging_in_its_own_turn_rewinds_to_the_turn_anchor() {
+        let mut session = mock::scripted("Seven, I think.");
+        let prompt = Prompt::default()
+            .system("You are terse.")
+            .cache()
+            .add_message((crate::Role::User, "Pick a number."))
+            .unwrap();
+        session.complete_response(&prompt).expect("first");
+        let (turn, tip, marker) = {
+            let cache = session.prefix_cache.as_ref().expect("cache on");
+            let slot = cache.last_slot().expect("a recorded slot");
+            let turn = entry_pos_at(&slot.prev_entries, slot.turn_start);
+            let marker = slot.breakpoints[0].at;
+            (turn, slot.tip.as_ref().expect("a tip").at, marker)
+        };
+        assert!(marker.pos < turn.pos && turn.pos < tip.pos);
+        let taken = &session.engine.decoder.checkpoints;
+        assert!(taken.contains(&(0, turn.pos as i32)), "{taken:?}");
+
+        // The client echoes the reply back with its last word changed.
+        let next = prompt
+            .add_message((crate::Role::Assistant, "Seven, I said."))
+            .unwrap()
+            .add_message((crate::Role::User, "Another."))
+            .unwrap();
+        let events = capture_events(|| {
+            session.complete_response(&next).expect("second");
+        });
+        assert_eq!(session.engine.decoder.restores, [(0, turn.pos as i32)]);
+        let miss = events
+            .iter()
+            .map(|(_, f)| f)
+            .find(|f| field(f, "reason") == Some("tip_diverged"))
+            .expect("the tip miss is still logged");
+        let reused = turn.entry.to_string();
+        assert_eq!(field(miss, "reused_entry"), Some(reused.as_str()));
     }
 
     /// The empty-suffix backoff: a hash hit covering the whole prompt
@@ -15416,8 +15537,8 @@ mod tests {
     /// walk stopped inside the turn. Reading that turn in the slot's own
     /// ids, the next call restores the tip, and the three usage counters
     /// still add up to `count_tokens`. Adoption off reproduces the live
-    /// failure, now reported as `segmentation_drift` with the text on
-    /// both sides of the `hash_drift`, and its miss is not `cold`.
+    /// failure, reported with the text on both sides of the
+    /// `hash_drift`; the turn anchor still saves the prompt before it.
     #[test]
     fn a_non_canonical_turn_keeps_its_tip_by_adoption() {
         let cold = |events: &[(tracing::Level, Vec<(String, String)>)]| {
@@ -15437,6 +15558,7 @@ mod tests {
             assert_eq!(cold(&first).as_deref(), Some("true"), "a first turn");
             let slot = only_slot(&session);
             let tip = slot.tip.as_ref().expect("a tip").at;
+            let turn = entry_pos_at(&slot.prev_entries, slot.turn_start);
             // The premise: the turn is the line, in the model's split.
             let generated = &slot.prev_entries[slot.turn_start..tip.entry];
             assert!(!generated.contains(&CacheEntry::Token(CIVIL)));
@@ -15467,17 +15589,19 @@ mod tests {
                 assert!(reasons.is_empty(), "nothing degraded: {reasons:?}");
                 assert_eq!(prompt_total(&usage), counted as u64);
             } else {
-                assert!(session.engine.decoder.restores.is_empty());
-                assert_eq!(usage.cache_read_input_tokens, Some(0));
+                // Without adoption the tip is out of reach, but the
+                // turn anchor before the reply still holds.
                 assert_eq!(
-                    reasons,
-                    ["hash_drift", "segmentation_drift", "no_slot"],
+                    session.engine.decoder.restores,
+                    [(0, turn.pos as i32)],
+                    "{reasons:?}",
                 );
                 assert_eq!(
-                    cold(&events).as_deref(),
-                    Some("false"),
-                    "a miss that lost a tip is not cold",
+                    usage.cache_read_input_tokens,
+                    Some(turn.pos as u64)
                 );
+                assert!(reasons.contains(&"hash_drift"), "{reasons:?}");
+                assert!(!reasons.contains(&"no_slot"), "{reasons:?}");
                 let drift = events
                     .iter()
                     .find(|(_, f)| field(f, "reason") == Some("hash_drift"))
@@ -15641,7 +15765,8 @@ mod tests {
         assert!(reasons.is_empty(), "nothing degraded: {reasons:?}");
         assert_eq!(session.engine.decoder.restores, [(0, tip.pos as i32)]);
         let slot = only_slot(&session);
-        assert_eq!(slot.breakpoints.len(), 2, "both replies stay marked");
+        let marked = slot.breakpoints.iter().filter(|bp| bp.hash.is_some());
+        assert_eq!(marked.count(), 2, "both replies stay marked");
         assert_eq!(slot.breakpoints[0].at, marker, "the first where it was");
     }
 
@@ -15841,7 +15966,8 @@ mod tests {
     /// piece, so the slot's own ids end mid-text and its predicted tail
     /// starts with that piece. The next call still reads the turn in the
     /// model's split, through the tail, and resumes from the tip; with
-    /// adoption off it cannot (review of ad6b7c1, item 5).
+    /// adoption off it cannot, and falls to the turn anchor (review of
+    /// ad6b7c1, item 5).
     #[test]
     fn a_budget_ending_keeps_its_tip_by_adoption() {
         for adopt in [true, false] {
@@ -15855,6 +15981,7 @@ mod tests {
             );
             let slot = only_slot(&session);
             let tip = slot.tip.as_ref().expect("a tip").at;
+            let turn = entry_pos_at(&slot.prev_entries, slot.turn_start);
             // The premise: the last piece is past the KV head.
             assert_eq!(tip.entry, slot.turn_start + SPLIT_LINE.len() - 1);
 
@@ -15879,7 +16006,11 @@ mod tests {
                 );
                 assert!(reasons.is_empty(), "nothing degraded: {reasons:?}");
             } else {
-                assert!(session.engine.decoder.restores.is_empty());
+                assert_eq!(
+                    session.engine.decoder.restores,
+                    [(0, turn.pos as i32)],
+                    "the turn anchor holds; {reasons:?}",
+                );
                 assert!(reasons.contains(&"segmentation_drift"), "{reasons:?}");
             }
         }

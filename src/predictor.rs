@@ -414,6 +414,15 @@ impl<'engine, B: Backend> CandidatePredictor<'engine, B> {
         self.tokens.push(token);
         self.pending_advance = Some(token);
     }
+
+    /// [`Engine::checkpoint_pos`] at this sequence's head, returning
+    /// it. The head is [`Self::n_cur`] between any two `next()` calls:
+    /// a recorded choice is decoded lazily, so it is not in the KV yet.
+    /// Right after construction, that is the end of the prompt.
+    pub(crate) fn checkpoint_head(&mut self) -> usize {
+        self.engine.checkpoint_pos(self.seq_id, self.n_cur as i32);
+        self.n_cur
+    }
 }
 
 impl<'engine, B: Backend> Iterator for CandidatePredictor<'engine, B> {
@@ -1337,6 +1346,11 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     /// Get the last token that was predicted.
     pub fn last_token(&self) -> Option<Token> {
         self.inner.inner.tokens.last().copied()
+    }
+
+    /// See [`CandidatePredictor::checkpoint_head`].
+    pub(crate) fn checkpoint_head(&mut self) -> usize {
+        self.inner.inner.checkpoint_head()
     }
 
     /// See [`TokenPredictor::set_reserved`].

@@ -184,6 +184,33 @@ fn tip_anchors_unmarked_continuation_issue_96() {
     common::tip::assert_tip_anchors_unmarked_continuation(session_8k());
 }
 
+/// A reply echoed back edited parts from the cached turn inside it:
+/// the next call resumes from the turn anchor at the end of the
+/// previous prompt, and generates what a cold session does. On a hybrid
+/// model (Qwen3.6) that anchor is a recurrent-state checkpoint.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn turn_anchor_survives_an_edited_reply() {
+    // Set rather than inherited, so the test knows the grid (#126).
+    const N_UBATCH: u32 = 64;
+    let session = || {
+        LlamaCppSession::from_path_with(
+            model_path(),
+            LlamaCppOptions::default()
+                .with_n_ctx(8192)
+                .with_n_ubatch(N_UBATCH),
+        )
+        .expect("session load")
+        .quiet()
+        .with_prefix_cache(true)
+    };
+    common::tip::assert_turn_anchor_survives_an_edited_reply(
+        session(),
+        session,
+        N_UBATCH as usize,
+    );
+}
+
 /// The cache is an optimization, not a semantic: with deterministic
 /// (greedy, penalty-free) sampling, a session reusing cached prefixes
 /// must produce byte-identical output to a fresh session with the

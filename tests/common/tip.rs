@@ -370,3 +370,129 @@ pub fn assert_tip_anchors_unmarked_continuation(session: LlamaCppSession) {
         "cache_read must remain a strict prefix of the new prompt",
     );
 }
+
+/// The turn anchor: a client that echoes the assistant's reply back
+/// *edited* parts from the cached turn inside it, past the prompt it was
+/// generated from but short of the tip. The next call must still resume
+/// past that whole prompt — from the anchor taken at its end — rather
+/// than fall back to the last marker inside it (live on Qwen3.6, a
+/// divergence 669 tokens into a turn re-prefilled 12,757). And what it
+/// generates from there must match a cold session's, so the anchor
+/// restored the right state, recurrent layers included.
+///
+/// `fresh` builds the cold session; it runs after `session` is dropped
+/// so the two models are never resident together. Both must run with
+/// micro-batch `n_ubatch`, which the warm resume point is aligned to.
+pub fn assert_turn_anchor_survives_an_edited_reply(
+    session: LlamaCppSession,
+    fresh: impl FnOnce() -> LlamaCppSession,
+    n_ubatch: usize,
+) {
+    // Adoption off on both sides: the cold session reads the turn in
+    // the tokenizer's split, so the warm one must too.
+    let no_adopt = || {
+        let mut config = drama_llama::PrefixCacheConfig::default();
+        config.adopt_emitted_tokens = false;
+        config
+    };
+    let mut session =
+        deterministic(session).with_prefix_cache_config(no_adopt());
+    // No markers: a marker splits round 1's prefill at its boundary,
+    // which the cold run would not share. The turn anchor needs none.
+    let base = "You are a helpful assistant. Use the `count_letters` tool \
+                when asked to count characters.";
+    let with_system = |system: &str| Prompt {
+        system: Some(Content::text(system.to_string())),
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("Count the number of r's in 'strawberry'"),
+        }],
+        tools: Some(vec![count_letters_tool().into()]),
+        tool_choice: Some(ToolChoice::method("count_letters")),
+        max_tokens: NonZeroU32::new(1024).unwrap(),
+        ..Default::default()
+    };
+    // #126: llama.cpp on Metal is bit-exact for one decode schedule, and
+    // a micro-batch boundary off the `n_ubatch` grid changes every later
+    // logit. Warm resumes round 2's prefill at round 1's prompt end,
+    // where cold runs straight through; so pad the system prompt until
+    // that end sits on the grid, and greedy output must then agree.
+    let mut system = base.to_string();
+    let mut prompt = with_system(&system);
+    for _ in 0..4 * n_ubatch {
+        if session
+            .count_tokens(&prompt)
+            .expect("count")
+            .is_multiple_of(n_ubatch)
+        {
+            break;
+        }
+        system.push_str(" ok");
+        prompt = with_system(&system);
+    }
+
+    let r1 = session.complete_response(&prompt).expect("round 1");
+    trace_round("round 1", &r1);
+    let total1 = prompt_total(&r1.usage);
+    assert!(
+        (total1 as usize).is_multiple_of(n_ubatch),
+        "#126: round 1's prompt ({total1}) must end on the n_ubatch \
+         ({n_ubatch}) grid, or warm and cold prefill differently",
+    );
+    let call = r1.inner.tool_use().expect("a forced tool call").clone();
+
+    // The client rewrites the call's last argument before echoing it,
+    // so the re-rendered turn parts from the cached one late inside it.
+    let mut assistant = r1.inner.content.clone();
+    for block in &mut assistant.0 {
+        if let Block::ToolUse { call } = block {
+            call.input["string"] = json!("strawberries");
+        }
+    }
+    prompt.messages.push(Message {
+        role: Role::Assistant,
+        content: assistant,
+    });
+    prompt.messages.push(Message {
+        role: Role::User,
+        content: Content(vec![Block::ToolResult {
+            result: ToolResult {
+                tool_use_id: call.id.clone(),
+                content: Content::text("3"),
+                is_error: false,
+                cache_control: None,
+            },
+        }]),
+    });
+    prompt.tool_choice = None;
+
+    let r2 = session.complete_response(&prompt).expect("round 2");
+    trace_round("round 2", &r2);
+    let read2 = r2.usage.cache_read_input_tokens.unwrap_or_default() as u64;
+    assert!(
+        read2 >= total1,
+        "edited reply: cache_read ({read2}) fell short of round 1's \
+         whole prompt ({total1}); the turn anchor did not hold and the \
+         call fell back to a marker inside it. usage: {:?}",
+        r2.usage,
+    );
+    assert!(
+        read2 < prompt_total(&r2.usage),
+        "the edit must cost reuse, or this test proves nothing",
+    );
+    assert!(
+        (read2 as usize).is_multiple_of(n_ubatch),
+        "#126: warm resumes at {read2}, off the n_ubatch ({n_ubatch}) \
+         grid, so it cannot match cold bit for bit",
+    );
+    let warm = r2.inner.content.to_string();
+    drop(session);
+
+    let mut cold = deterministic(fresh()).with_prefix_cache(false);
+    let r2_cold = cold.complete_response(&prompt).expect("cold round 2");
+    assert_eq!(
+        warm,
+        r2_cold.inner.content.to_string(),
+        "output resumed from the turn anchor diverged from a cold run",
+    );
+}
