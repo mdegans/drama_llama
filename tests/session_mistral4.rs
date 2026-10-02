@@ -666,3 +666,84 @@ fn tip_anchors_unmarked_continuation_issue_96() {
         session.with_prefix_cache(true),
     );
 }
+
+/// #102, the bundle's Mistral shape (repro-20260729): the client
+/// appends a second text block to the final user message, `[A]` then
+/// `[A, B]`. The blocks merge into one turn, so round 2 parts from the
+/// cached slot inside that message, past the system marker and short
+/// of every later anchor. Before #102 the restore fell back to the
+/// marker and re-prefilled all of `A`; Mistral 4 is dense, so the walk
+/// point is a rung and round 2 reuses `A` up to its last token.
+///
+/// `A` ends in `.` and `B` opens with a space, which the pre-tokenizer
+/// splits, so `A`'s tokens are the same in both rounds. Not compared
+/// against a cold run: the warm resume point (`lcp - 1`) is off the
+/// micro-batch grid relative to the marker's chunk, which changes
+/// later logits on Metal (#126).
+#[test]
+#[ignore = "long running - requires Mistral Small 4 model"]
+fn two_block_append_reuses_block_a() {
+    use misanthropic::prompt::message::CacheControl;
+
+    let block = |text: &str, marked: bool| Block::Text {
+        text: Cow::Owned(text.to_string()),
+        cache_control: marked.then(CacheControl::ephemeral),
+        citations: None,
+    };
+    let a = "Here is a note about the harbour town where I grew up. The \
+             fishing boats went out before dawn and came back by noon, \
+             and the market by the quay sold whatever they had caught. \
+             In winter the storms closed the harbour for days at a time, \
+             and the whole town waited for the weather to turn. My \
+             grandmother kept a logbook of every storm for forty years. \
+             Summarize this note in one sentence.";
+    let b = " Also, name the season the storms came in.";
+    let with_user = |blocks: Vec<Block>| Prompt {
+        system: Some(Content(vec![block(
+            "You are a concise assistant.",
+            true,
+        )])),
+        messages: vec![Message {
+            role: Role::User,
+            content: Content(blocks),
+        }],
+        max_tokens: NonZeroU32::new(48).unwrap(),
+        ..Default::default()
+    };
+    let first = with_user(vec![block(a, false)]);
+    let second = with_user(vec![block(a, false), block(b, false)]);
+
+    let mut session = session_or_skip!().with_prefix_cache(true);
+    let total = |u: &misanthropic::response::Usage| {
+        u.input_tokens
+            + u.cache_read_input_tokens.unwrap_or(0)
+            + u.cache_creation_input_tokens.unwrap_or(0)
+    };
+
+    let out1 = session.complete_text(&first).expect("round 1");
+    println!("=== round 1 ===\n{out1}\n===");
+    let total1 = total(session.last_usage());
+
+    let out2 = session.complete_text(&second).expect("round 2");
+    println!("=== round 2 ===\n{out2}\n===");
+    let usage2 = session.last_usage().clone();
+    let read2 = usage2.cache_read_input_tokens.unwrap_or(0);
+    println!("total1={total1} read2={read2} usage2={usage2:?}");
+
+    assert!(total(&usage2) > total1, "round 2 appends to round 1");
+    assert!(
+        read2 < total1,
+        "round 2 parts from round 1 inside `A`'s message, so it cannot \
+         reuse all of round 1's prompt (read {read2} of {total1})",
+    );
+    // What follows `A` in round 1 is the turn close and the generation
+    // prompt, a handful of tokens; the walk point is one short of the
+    // divergence. Falling back to the system marker instead would lose
+    // all of `A` (~80 tokens).
+    assert!(
+        total1 - read2 <= 8,
+        "round 2 must reuse `A` up to the walk point: it read {read2} of \
+         round 1's {total1} prompt tokens, so it resumed at an anchor \
+         before `A` (#102)",
+    );
+}
