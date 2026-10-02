@@ -456,9 +456,18 @@ fn harmony_grammar_source(
                 src,
                 r#"h_analysis ::= "{analysis_open}" h_end "{start}""#
             );
+            // A preamble is a text block, and a blank one is never
+            // returned, so it would re-render as nothing: its body holds
+            // something besides whitespace (#129's oracle). The first
+            // such byte may not start the `<|end|>` the until-rule after
+            // it scans for.
             let _ = writeln!(
                 src,
-                r#"h_preamble ::= "{commentary_open}" h_end "{start}""#
+                r#"h_preamble ::= "{commentary_open}" h_pre_lead h_end "{start}""#
+            );
+            let _ = writeln!(
+                src,
+                r#"h_pre_lead ::= [ \t\n\r]* ( [^ \t\n\r<] | "<" [^|<] )"#
             );
             for (i, tool) in tools.iter().enumerate() {
                 let name_lit = escape_for_gbnf_string(tool.name.as_ref());
@@ -1540,6 +1549,29 @@ mod tests {
                 let led = format!("{ws}{call}");
                 assert!(!admits(&syntax, Anchor::Eager, &led), "{led:?}");
             }
+        }
+    }
+
+    /// A forced Harmony turn's preamble is never blank: a blank text is
+    /// never returned, so it re-rendered as nothing (#129's oracle).
+    #[test]
+    fn harmony_eager_preamble_is_not_blank() {
+        let syntax = CallSyntax::gpt_oss();
+        let call = "<|channel|>commentary to=functions.get_weather \
+                    <|constrain|>json<|message|>{\"city\":\"Paris\"}";
+        let eager = |preamble: &str| {
+            let text = format!(
+                "<|channel|>commentary<|message|>{preamble}<|end|>\
+                 <|start|>assistant{call}"
+            );
+            admits(&syntax, Anchor::Eager, &text)
+        };
+        assert!(admits(&syntax, Anchor::Eager, call));
+        for ok in ["Checking.", "\nChecking.\n", " .", "<b>"] {
+            assert!(eager(ok), "{ok:?}");
+        }
+        for blank in ["", " ", "\n\n", "<|end|>x", " <|end|>x"] {
+            assert!(!eager(blank), "{blank:?}");
         }
     }
 
