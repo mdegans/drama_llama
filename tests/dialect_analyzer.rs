@@ -285,13 +285,13 @@ fn gptoss_sniffed() {
     // Structurally single-call: <|call|> is EOG, so the parallel gate
     // (keyed on per_call_start) must stay off.
     assert_eq!(s.per_call_start, "");
-    // Conservative lazy triggers — see CallSyntax::triggers docs.
+    // Every recipient arms the grammar — see CallSyntax::triggers docs.
     assert_eq!(
         s.triggers(),
         vec![
-            "<|start|>assistant to=functions.".to_string(),
-            "<|channel|>commentary to=functions.".to_string(),
-            "<|channel|>analysis to=functions.".to_string(),
+            "<|start|>assistant to=".to_string(),
+            "<|channel|>commentary to=".to_string(),
+            "<|channel|>analysis to=".to_string(),
         ]
     );
 }

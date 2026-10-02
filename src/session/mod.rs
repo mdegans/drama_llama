@@ -11646,9 +11646,9 @@ mod tests {
         assert_eq!(
             deferred.activate_after,
             vec![
-                b"<|start|>assistant to=functions.".to_vec(),
-                b"<|channel|>commentary to=functions.".to_vec(),
-                b"<|channel|>analysis to=functions.".to_vec(),
+                b"<|start|>assistant to=".to_vec(),
+                b"<|channel|>commentary to=".to_vec(),
+                b"<|channel|>analysis to=".to_vec(),
             ]
         );
         assert!(deferred.feed_trigger);
