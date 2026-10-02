@@ -372,10 +372,13 @@ pub fn grammar_source(
 ///
 /// Lazy (`Auto`): activated by one of [`CallSyntax::triggers`] (both
 /// recipient positions); the root accepts either header shape from
-/// the trigger's first byte, with the constraint clause lenient
-/// (optional, `<|constrain|>` literal optional, any `[A-Za-z0-9_-]+`
-/// type — upstream parity) because the pre-trigger bytes were sampled
-/// free and canonical-byte forcing is pointless mid-header.
+/// the trigger's first byte. After a channel-header trigger the rest of
+/// the header is generated, so it is forced canonical
+/// (` <|constrain|>json<|message|>`, the re-render's bytes). After a
+/// role-header trigger the constraint clause stays lenient (optional,
+/// `<|constrain|>` literal optional, any `[A-Za-z0-9_-]+` type —
+/// upstream parity): that shape re-renders in the channel header
+/// whatever follows, so forcing its tail buys no cache.
 fn harmony_grammar_source(
     tools: &[&Tool],
     opts: &EmitOptions,
@@ -427,10 +430,13 @@ fn harmony_grammar_source(
                     r#"h_role_{i} ::= "{name_lit}" h_channel h_constraint? "{msg}" h_args_{i}"#
                 );
                 // Recipient in the channel header: the channel was
-                // consumed by the trigger.
+                // consumed by the trigger, and the rest of the header is
+                // the model's to write — in the canonical spelling, the
+                // one the template re-renders, or the turn parts from
+                // its KV there (#129's oracle).
                 let _ = writeln!(
                     src,
-                    r#"h_chan_{i} ::= "{name_lit}" h_constraint? "{msg}" h_args_{i}"#
+                    r#"h_chan_{i} ::= "{name_lit} {constrain}json{msg}" h_args_{i}"#
                 );
             }
         }
@@ -1534,6 +1540,30 @@ mod tests {
                 let led = format!("{ws}{call}");
                 assert!(!admits(&syntax, Anchor::Eager, &led), "{led:?}");
             }
+        }
+    }
+
+    /// After a channel-header trigger the rest of a Harmony call header
+    /// is generated, so it is forced to the bytes the template
+    /// re-renders; the role-header shape re-renders in the channel
+    /// header whatever follows, and keeps upstream's lenient clause.
+    #[test]
+    fn harmony_lazy_channel_header_is_canonical() {
+        let syntax = CallSyntax::gpt_oss();
+        let args = r#"{"city":"Paris"}"#;
+        let chan = "<|channel|>commentary to=functions.get_weather";
+        let lazy = |text: &str| admits(&syntax, Anchor::Lazy, text);
+        assert!(lazy(&format!("{chan} <|constrain|>json<|message|>{args}")));
+        for clause in ["", " json", " <|constrain|>code", "  <|constrain|>json"]
+        {
+            let text = format!("{chan}{clause}<|message|>{args}");
+            assert!(!lazy(&text), "{text:?}");
+        }
+        let role = "<|start|>assistant to=functions.get_weather\
+                    <|channel|>commentary";
+        for clause in ["", " json", " <|constrain|>json"] {
+            let text = format!("{role}{clause}<|message|>{args}");
+            assert!(lazy(&text), "{text:?}");
         }
     }
 }
