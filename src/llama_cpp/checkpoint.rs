@@ -111,7 +111,7 @@ impl Checkpointing {
 /// The default, 8 GiB in all and 4 GiB per sequence (prefix-cache
 /// slot), is sized for a 96 GB Mac serving a 30 – 70 GB model with its
 /// KV. Only Gemma 4 comes near it: ≈ 800 MiB a checkpoint, ten in all
-/// and five per slot, where the count cap alone would allow ≈ 19 GiB at
+/// and five per slot, where the count cap alone would allow ≈ 22 GiB at
 /// four slots. Everything else in the fleet fits far below it (gpt-oss
 /// 4.5 MiB, Qwen3.6 63 MiB, Qwen3.8 150 MiB a checkpoint). Set it with
 /// [`LlamaCppOptions::checkpoint_mib`](crate::LlamaCppOptions::checkpoint_mib)

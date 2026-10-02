@@ -184,6 +184,19 @@ fn tip_anchors_unmarked_continuation_issue_96() {
     common::tip::assert_tip_anchors_unmarked_continuation(session_8k());
 }
 
+/// A reply echoed back edited parts from the cached turn inside it:
+/// the next call resumes from the turn anchor at the end of the
+/// previous prompt, and generates what a cold session does. On a hybrid
+/// model (Qwen3.6) that anchor is a recurrent-state checkpoint.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn turn_anchor_survives_an_edited_reply() {
+    common::tip::assert_turn_anchor_survives_an_edited_reply(
+        session_8k(),
+        session_8k,
+    );
+}
+
 /// The cache is an optimization, not a semantic: with deterministic
 /// (greedy, penalty-free) sampling, a session reusing cached prefixes
 /// must produce byte-identical output to a fresh session with the

@@ -15,13 +15,13 @@ pub(crate) const MAX_SEQ_SNAPSHOTS: usize = 16;
 
 /// Snapshots one prefix-cache slot can hold at its peak: one per
 /// `cache_control` breakpoint ([`MAX_CACHE_CONTROLS`], the automatic
-/// one included) plus two tips — the outgoing one, still restorable
-/// while the turn it anchored generates, and the incoming one taken at
-/// that turn's end.
+/// one included), the turn anchor at the prompt's end, and two tips —
+/// the outgoing one, still restorable while the turn it anchored
+/// generates, and the incoming one taken at that turn's end.
 ///
 /// [`MAX_CACHE_CONTROLS`]: crate::MAX_CACHE_CONTROLS
 pub(crate) const SNAPSHOTS_PER_SLOT: usize =
-    crate::chat_template::MAX_CACHE_CONTROLS + 2;
+    crate::chat_template::MAX_CACHE_CONTROLS + 3;
 
 /// The snapshot cap for a decoder serving `n_seq` sequences: a full
 /// [`SNAPSHOTS_PER_SLOT`] set for every slot, never below
@@ -38,8 +38,8 @@ pub(crate) const SNAPSHOTS_PER_SLOT: usize =
 /// a snapshot holds only what a KV truncate cannot rewind, so its size
 /// does not grow with the prefix: the recurrent state (Qwen3.6 ≈ 63 MiB,
 /// Qwen3.8 ≈ 150 MiB) or the sliding-window cells (gpt-oss ≈ 4.5 MiB,
-/// Gemma 4 ≈ 800 MiB). At four slots that is at most 24 snapshots —
-/// ≈ 19 GiB on Gemma 4, more than a unified-memory Mac can spare next
+/// Gemma 4 ≈ 800 MiB). At four slots that is at most 28 snapshots —
+/// ≈ 22 GiB on Gemma 4, more than a unified-memory Mac can spare next
 /// to the weights, so llama.cpp's store also has a byte budget
 /// ([`SnapshotStore::set_byte_limits`],
 /// [`crate::llama_cpp::checkpoint::CheckpointBudget`]). Eviction logs
@@ -434,7 +434,7 @@ mod tests {
 
     /// The byte total evicts least recently used first, across
     /// sequences: Gemma 4's ≈ 800 MiB checkpoints would otherwise fill
-    /// a count cap of 24 with ≈ 19 GiB.
+    /// a count cap of 28 with ≈ 22 GiB.
     #[test]
     fn snapshot_store_evicts_by_bytes_lru_first() {
         let mut s = SnapshotStore::with_cap(64);
