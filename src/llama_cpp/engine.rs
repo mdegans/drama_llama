@@ -150,19 +150,26 @@ impl LlamaCppEngine {
         path: PathBuf,
         options: LlamaCppOptions,
     ) -> Result<Self, NewError> {
-        Self::from_path_with_n_ctx_override(path, options, None)
+        Self::from_path_with_load_sidecar(
+            path,
+            options,
+            crate::sidecar::LoadSidecar::default(),
+        )
     }
 
-    /// [`Self::from_path_with`], with a per-model `n_ctx` (a load
-    /// sidecar's) that beats `options.n_ctx` once capped at the model's
-    /// trained window — known only after the model loads, hence here.
-    /// See [`crate::sidecar::effective_n_ctx`]. Logs the context the
-    /// model is served with.
-    pub(crate) fn from_path_with_n_ctx_override(
+    /// [`Self::from_path_with`], with a model's load sidecar: its
+    /// `n_ctx` beats `options.n_ctx` once capped at the trained window
+    /// (known only after the model loads, hence here), and its
+    /// `n_ubatch` fills an unset `options.n_ubatch`. See
+    /// [`crate::sidecar::effective_n_ctx`] and
+    /// [`crate::sidecar::effective_n_ubatch`]. Logs the context and
+    /// micro-batch the model is served with.
+    pub(crate) fn from_path_with_load_sidecar(
         path: PathBuf,
         options: LlamaCppOptions,
-        n_ctx: Option<u32>,
+        sidecar: crate::sidecar::LoadSidecar,
     ) -> Result<Self, NewError> {
+        let n_ctx = sidecar.n_ctx;
         let model =
             Self::load_model(path.clone(), Some(options.model_params()))?;
         let n_ctx_train = model.context_size().max(0) as u32;
@@ -180,6 +187,39 @@ impl LlamaCppEngine {
             n_ctx: effective,
             ..options
         };
+        let n_batch = options.context_params().n_batch;
+        let n_ubatch = crate::sidecar::effective_n_ubatch(
+            options.n_ubatch,
+            sidecar.n_ubatch,
+            n_batch,
+        );
+        let n_ubatch_source = match (options.n_ubatch, sidecar.n_ubatch) {
+            (Some(_), _) => "option",
+            (None, Some(requested)) if n_ubatch.is_none() => {
+                tracing::warn!(
+                    path = %path.display(),
+                    requested,
+                    "per-model n_ubatch must be at least 1; ignored",
+                );
+                "default"
+            }
+            (None, Some(requested)) => {
+                if Some(requested) != n_ubatch {
+                    tracing::warn!(
+                        path = %path.display(),
+                        requested,
+                        n_batch,
+                        "per-model n_ubatch exceeds n_batch; clamped",
+                    );
+                }
+                "sidecar"
+            }
+            (None, None) => "default",
+        };
+        let options = LlamaCppOptions {
+            n_ubatch,
+            ..options
+        };
         let mut engine = Self::with_model(
             path.clone(),
             model,
@@ -193,8 +233,11 @@ impl LlamaCppEngine {
             n_ctx = engine.n_ctx(),
             n_ctx_train,
             source = if n_ctx.is_some() { "sidecar" } else { "default" },
-            "serving with n_ctx {}",
+            n_ubatch = engine.n_ubatch(),
+            n_ubatch_source,
+            "serving with n_ctx {}, n_ubatch {}",
             engine.n_ctx(),
+            engine.n_ubatch(),
         );
         Ok(engine)
     }
@@ -262,6 +305,11 @@ impl LlamaCppEngine {
     /// Max batch size configured on this context.
     pub fn n_batch(&self) -> u32 {
         self.decoder.n_batch()
+    }
+
+    /// Micro-batch size configured on this context.
+    pub fn n_ubatch(&self) -> u32 {
+        self.decoder.n_ubatch()
     }
 
     /// Size of the serialized global state (logits, embedding, memory).
@@ -527,6 +575,35 @@ mod tests {
             grown >> 20,
             LIMIT >> 20,
         );
+    }
+
+    /// The load sidecar's `n_ubatch` reaches the context: it beats
+    /// llama.cpp's default, is clamped to `n_batch` (= `n_ctx`), `0`
+    /// is ignored, and an explicit option beats it.
+    #[test]
+    #[ignore = "requires models/model.gguf"]
+    fn load_sidecar_n_ubatch_reaches_the_context() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let options = LlamaCppOptions::default().with_n_ctx(1024);
+        let n_ubatch = |options: LlamaCppOptions, n_ubatch: Option<u32>| {
+            let sidecar = crate::sidecar::LoadSidecar {
+                n_ubatch,
+                ..Default::default()
+            };
+            LlamaCppEngine::from_path_with_load_sidecar(
+                path.clone(),
+                options,
+                sidecar,
+            )
+            .expect("load")
+            .n_ubatch()
+        };
+        let default = n_ubatch(options, None);
+        assert_eq!(n_ubatch(options, Some(256)), 256);
+        assert_eq!(n_ubatch(options, Some(4096)), 1024);
+        assert_eq!(n_ubatch(options, Some(0)), default);
+        assert_eq!(n_ubatch(options.with_n_ubatch(64), Some(256)), 64);
     }
 
     #[test]
