@@ -184,6 +184,12 @@ impl<B: Backend> Engine<B> {
         self.decoder.restore_to(seq_id, pos)
     }
 
+    /// Whether [`Self::restore_to`]`(seq_id, pos)` would rewind by a KV
+    /// truncate alone. See [`Decoder::truncate_restores`].
+    pub fn truncate_restores(&mut self, seq_id: i32, pos: i32) -> bool {
+        self.decoder.truncate_restores(seq_id, pos)
+    }
+
     /// Drop a single named snapshot at `(seq_id, pos)`. See
     /// [`Decoder::forget_pos`] — used by `Session`'s prefix-cache
     /// to release orphaned snapshots (replaced tips, no-longer-set

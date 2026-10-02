@@ -431,6 +431,27 @@ impl Checkpoints {
         }
     }
 
+    /// Whether [`Self::restore`] at `pos` would rewind by the truncate
+    /// alone, wherever `pos` falls: a dense model ([`Checkpointing::Off`],
+    /// natively — a model forced off still needs its checkpoints) whose
+    /// `seq` holds every position below `pos`.
+    ///
+    /// Dense only for now. A sliding-window model also truncates while
+    /// its window below `pos` survives (`window_intact`), but answering
+    /// that ahead of the restore is a separate question (#102, Q4).
+    // TODO(#102 Q4): offer sliding-window models the truncate where
+    // `window_intact` would hold.
+    pub(crate) fn truncate_restores(
+        &self,
+        mem: &mut impl SeqMemory,
+        seq: i32,
+        pos: i32,
+    ) -> bool {
+        self.mode == Checkpointing::Off
+            && self.native == Checkpointing::Off
+            && (0..=self.head(mem, seq)).contains(&pos)
+    }
+
     /// Whether `seq`, freshly truncated to `pos`, already holds the
     /// state the model had at `pos`: its head is `pos`, and with a
     /// sliding window, every position the next token attends to is
@@ -1032,6 +1053,47 @@ mod tests {
         assert_eq!(mem.sees(0), Some(tokens(33)));
         assert_eq!(ckpt.restore(&mut mem, 0, 7), Ok(()));
         assert_eq!(mem.sees(0), Some(tokens(7)));
+    }
+
+    /// [`Checkpoints::truncate_restores`] agrees with what
+    /// [`Checkpoints::restore`] then does, at every position, with
+    /// nothing stored: a dense model rewinds anywhere it holds, and a
+    /// model that needs checkpoints is never offered the truncate —
+    /// even where it would happen to work, and even forced off.
+    #[test]
+    fn truncate_restores_agrees_with_restore() {
+        for pos in -1..=42 {
+            let (mut mem, mut ckpt) = rig(Layers::Dense, 40);
+            let offered = ckpt.truncate_restores(&mut mem, 0, pos);
+            let restored = ckpt.restore(&mut mem, 0, pos).is_ok();
+            assert_eq!(offered, (0..=40).contains(&pos), "dense at {pos}");
+            if offered {
+                assert!(restored, "offered at {pos} but did not restore");
+                assert_eq!(mem.sees(0), Some(tokens(pos as u32)));
+            }
+        }
+        // Past the head of a sequence that holds less.
+        let (mut mem, ckpt) = rig(Layers::Dense, 10);
+        assert!(!ckpt.truncate_restores(&mut mem, 0, 11));
+        assert!(!ckpt.truncate_restores(&mut mem, 1, 1), "an empty seq");
+        assert!(ckpt.truncate_restores(&mut mem, 1, 0));
+
+        for layers in [Layers::Hybrid, Layers::Iswa { n_swa: 8 }] {
+            for pos in [0, 5, 20, 40] {
+                let (mut mem, ckpt) = rig(layers, 40);
+                assert!(
+                    !ckpt.truncate_restores(&mut mem, 0, pos),
+                    "{layers:?}"
+                );
+            }
+            let (mut mem, mut ckpt) = rig(layers, 40);
+            ckpt.force(false);
+            assert!(!ckpt.truncate_restores(&mut mem, 0, 20), "forced off");
+        }
+        // Forced on, a dense model keeps whole snapshots: not offered.
+        let (mut mem, mut ckpt) = rig(Layers::Dense, 40);
+        ckpt.force(true);
+        assert!(!ckpt.truncate_restores(&mut mem, 0, 20));
     }
 
     /// Hybrid: the recurrent state comes back from the checkpoint, the
