@@ -5,9 +5,10 @@
 //! (`<model>.sampling.toml`, [`SamplerConfig`]), the tool-call
 //! dialect (`<model>.dialect.toml`,
 //! [`CallSyntax`](crate::CallSyntax)), the chat template itself
-//! (`<model>.template.jinja`, raw Jinja), or the multimodal
+//! (`<model>.template.jinja`, raw Jinja), the multimodal
 //! projector (`<model>.mmproj.gguf`, [`mmproj_path`] — enables image
-//! input under the `mtmd` feature). [`crate::LlamaCppSession::from_path*`]
+//! input under the `mtmd` feature), or load-time options
+//! (`<model>.load.toml`, `LoadSidecar` — the KV context size). [`crate::LlamaCppSession::from_path*`]
 //! looks for each when loading a model. For sampling, if no sidecar
 //! exists one is written so the user has a starting point to edit —
 //! seeded from the model's own recommendation where it has one (see
@@ -303,6 +304,85 @@ pub fn load_template_source(
     }
 }
 
+/// Per-model load-time overrides, from a sibling `<model>.load.toml`
+/// (`model.gguf` → `model.load.toml`). A field set here beats the
+/// server-wide option of the same name (`LlamaCppOptions`, blallama's
+/// flags); an unset one inherits it. Never auto-written. llama-cpp
+/// only: moeflux sizes its context at compile time.
+///
+/// ```toml
+/// # Qwen3.8-27B-UD-Q8_K_XL.load.toml — hybrid attention keeps KV
+/// # small (~64 KiB/token), so this model can afford its trained
+/// # window while `--n-ctx 131072` stays the default for the rest.
+/// n_ctx = 262144
+/// ```
+///
+/// Unknown keys are a parse error (a misspelled `n-ctx` must not
+/// silently fall back to the default). A sidecar that fails to read
+/// or parse is logged and ignored, like the other sidecars.
+#[cfg(feature = "toml")]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct LoadSidecar {
+    /// KV context size in tokens, capped at the model's trained
+    /// window (see [`effective_n_ctx`]).
+    pub n_ctx: Option<u32>,
+}
+
+/// Read a load sidecar from `path`, if it exists. Same contract as
+/// [`load_sample_options`]: `Ok(None)` when absent.
+#[cfg(feature = "toml")]
+pub fn load_load_options(
+    path: &Path,
+) -> Result<Option<LoadSidecar>, SidecarError> {
+    let bytes = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SidecarError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    toml::from_str(&bytes)
+        .map(Some)
+        .map_err(|source| SidecarError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// The KV context a model is served with: its load sidecar's `n_ctx`
+/// capped at the trained window `n_ctx_train` (`0` = unknown,
+/// uncapped), else the server-wide `default` unchanged.
+///
+/// Only the per-model value is capped. The default keeps its meaning —
+/// one size allocated for every model, advertised as
+/// `min(n_ctx, n_ctx_train)` by `Catalog` — so this changes
+/// nothing for a model without a sidecar.
+pub fn effective_n_ctx(
+    default: Option<u32>,
+    sidecar: Option<u32>,
+    n_ctx_train: u32,
+) -> Option<u32> {
+    match (sidecar, n_ctx_train) {
+        (None, _) => default,
+        (Some(n_ctx), 0) => Some(n_ctx),
+        (Some(n_ctx), train) => Some(n_ctx.min(train)),
+    }
+}
+
 /// Multimodal-projector sidecar convention: sibling
 /// `<model>.mmproj.gguf` next to the `.gguf` file (`model.gguf` →
 /// `model.mmproj.gguf`). Returns `Some(path)` only when the file
@@ -485,6 +565,66 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The load sidecar the docs show parses; absent is `Ok(None)`, an
+    /// empty file sets nothing, and a misspelled key is an error rather
+    /// than a silent fall back to the default.
+    #[test]
+    fn load_sidecar_parses() {
+        let dir = tempfile_dir();
+        let path = dir.join("model.load.toml");
+        assert!(load_load_options(&path).unwrap().is_none());
+
+        std::fs::write(&path, "# Qwen3.8\nn_ctx = 262144\n").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar.n_ctx, Some(262144));
+
+        std::fs::write(&path, "").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar, LoadSidecar::default());
+
+        for bad in ["n-ctx = 262144", "n_ctx = -1", "n_ctx = \"256k\""] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                matches!(
+                    load_load_options(&path),
+                    Err(SidecarError::Parse { .. })
+                ),
+                "{bad}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Precedence and capping, with the fleet's numbers: a sidecar
+    /// beats the server-wide default in either direction, is capped at
+    /// the trained window, and is taken as-is when that is unknown; no
+    /// sidecar leaves the default untouched, even past the window.
+    #[test]
+    fn effective_n_ctx_precedence_and_cap() {
+        const DEFAULT: Option<u32> = Some(131072);
+        // Qwen3.8: raised to its trained window.
+        assert_eq!(
+            effective_n_ctx(DEFAULT, Some(262144), 262144),
+            Some(262144)
+        );
+        // Past the window (1M wants rope scaling): capped.
+        assert_eq!(
+            effective_n_ctx(DEFAULT, Some(1 << 20), 262144),
+            Some(262144)
+        );
+        // Mistral Small 4: lowered below the default.
+        assert_eq!(effective_n_ctx(DEFAULT, Some(65536), 1 << 20), Some(65536));
+        // Trained window unknown: the sidecar stands.
+        assert_eq!(effective_n_ctx(DEFAULT, Some(1 << 20), 0), Some(1 << 20));
+        // No sidecar: the default, uncapped (the advertisement caps it).
+        assert_eq!(effective_n_ctx(DEFAULT, None, 40960), DEFAULT);
+        assert_eq!(effective_n_ctx(None, None, 40960), None);
+        // A sidecar works without any default (llama.cpp's 512).
+        assert_eq!(effective_n_ctx(None, Some(8192), 40960), Some(8192));
     }
 
     /// Test-local tempfile dir that doesn't depend on the `tempfile`

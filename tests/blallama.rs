@@ -295,6 +295,42 @@ async fn v1_models_lists_every_model_unloaded() {
         .is_some_and(|m| m.contains("model not found")));
 }
 
+/// #118: a model's `<model>.load.toml` sets the context `/v1/models`
+/// advertises for it, capped at its trained window; a model without
+/// one keeps `--n-ctx`. Every entry is a symlink to `models/model.gguf`
+/// (the listing dedupes those, so each is asked for by id). Peeks
+/// only — no weights load.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires models/model.gguf"]
+fn v1_models_advertises_the_per_model_n_ctx() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    for name in ["plain", "small", "huge"] {
+        std::os::unix::fs::symlink(
+            models_dir().join("model.gguf"),
+            root.join(format!("{name}.gguf")),
+        )
+        .expect("symlink");
+    }
+    std::fs::write(root.join("small.load.toml"), "n_ctx = 2048").unwrap();
+    std::fs::write(root.join("huge.load.toml"), "n_ctx = 1073741824").unwrap();
+    let server = spawn_server_in(root);
+    let ceiling = |name: &str| {
+        let body = http_get(server.port, &format!("/v1/models/{name}"));
+        let info: misanthropic::model::ModelInfo =
+            serde_json::from_str(&body).expect("ModelInfo JSON");
+        assert_eq!(info.max_tokens, info.max_input_tokens, "{name}");
+        info.max_input_tokens
+    };
+
+    let plain = ceiling("plain.gguf");
+    assert!(plain <= drama_llama::cli::DEFAULT_N_CTX, "{plain}");
+    assert_eq!(ceiling("small.gguf"), 2048);
+    let trained = ceiling("huge.gguf");
+    assert!(trained >= plain && trained < 1 << 30, "{trained}");
+}
+
 /// Unknown model id with no `--default-model` → Anthropic-shaped 404.
 #[tokio::test]
 #[ignore = "long running, requires a GGUF in models/"]
