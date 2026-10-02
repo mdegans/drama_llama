@@ -139,8 +139,8 @@ pub struct SamplerConfig {
     #[cfg_attr(feature = "serde", serde(default))]
     pub banned_specials_constrained: Vec<Token>,
     /// The dialect's thought markers as special ids, so a thought
-    /// opener the model emits inside an open thought is steered to the
-    /// closer (see [`ThoughtSpecials`]). `None` (the default) disables
+    /// opener or EOG the model emits inside an open thought is steered
+    /// to the closer (see [`ThoughtSpecials`]). `None` (the default) disables
     /// the steer. Runtime wiring set by `Session`; like
     /// [`banned_specials`] it is unreachable from the wire.
     ///
@@ -154,7 +154,9 @@ pub struct SamplerConfig {
 /// never legal: a model that emits it wants a second thought without
 /// closing the first, a nest no template renders. The sampler writes
 /// [`Self::steer`] in its place, so the thought closes and the model
-/// may reopen from there; without one, the opener is masked.
+/// may reopen from there; without one, the opener is masked. EOG
+/// inside an open thought is steered alike, so a turn never ends in
+/// one; without a steer, EOG stands.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
@@ -164,7 +166,7 @@ pub struct ThoughtSpecials {
     /// Specials that close one (sorted).
     pub closer: Vec<Token>,
     /// The closer as the one token its text tokenizes to, if it is
-    /// one: what a nested opener becomes.
+    /// one: what a nested opener, or EOG, inside a thought becomes.
     pub steer: Option<Token>,
     /// Generation begins inside a thought (a pre-opened render).
     pub open_at_start: bool,
@@ -1419,7 +1421,8 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
 /// Given the vocabulary's `reserved` pieces, so is an ordinary token
 /// spelling one an active grammar forces
 /// (`SamplerState::spells_forced_framing`). With `thought_open`, the
-/// thought opener is steered to the closer ([`ThoughtSpecials`]).
+/// thought opener and EOG are steered to the closer
+/// ([`ThoughtSpecials`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     tokens: &[Token],
@@ -1650,6 +1653,44 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
         .filter(|&c| {
             banned.binary_search(&c).is_err()
                 && state.accepts_chosen(opts, c, model)
+        })
+    {
+        chosen = steer;
+    }
+    // The open-thought EOG steer: EOG inside an open thought ends the
+    // turn without closing it, a shape no template renders and the
+    // session rejects (`Breach::OpenThought`). The closer takes its
+    // slot instead: the model answers from there, or ends again after
+    // it, a closed thought-only turn. Unlike the opener steer this
+    // covers a pre-opened render too, where closing is the model's job.
+    // The closer must pass every check below untouched, so a refusal
+    // can't mask it into some third token: where it can't take the
+    // slot, EOG stands and the breach backstops. A budget cut never
+    // gets here; it is no token the sampler chose.
+    if let Some(steer) = opts
+        .thought
+        .as_ref()
+        .filter(|_| thought_open)
+        .and_then(|t| t.steer)
+        .filter(|_| model.eog_tokens().contains(&chosen))
+        .filter(|&c| {
+            banned.binary_search(&c).is_err()
+                && !(banned_in_region.binary_search(&c).is_ok()
+                    && region::ConstraintGuard::build(
+                        &opts.modes,
+                        &state.matchers,
+                        state.deferred.as_ref(),
+                        opts.deferred_grammar.as_ref(),
+                        model,
+                    )
+                    .is_some_and(|guard| !guard.is_protected(c)))
+                && state.accepts_chosen(opts, c, model)
+                && !reserved.is_some_and(|r| {
+                    state.spells_forced_framing(opts, generated, c, model, r)
+                })
+                && !(sleeping
+                    && state
+                        .wakes_deferred_illegally(opts, generated, c, model))
         })
     {
         chosen = steer;
@@ -2634,6 +2675,54 @@ mod tests {
         // An opener the call bans already (a pre-opened render) stays
         // masked: closing there would leave no way to reopen.
         assert_eq!(pick(Some(A), vec![X], true), B, "opener spent");
+    }
+
+    /// EOG (`EOS`, and an extra EOG) inside an open thought is steered
+    /// to the closer (`A`), a pre-opened thought included. Outside one,
+    /// with no single-token closer, or with the closer banned, EOG
+    /// stands: never masked into a third token.
+    #[test]
+    fn eog_inside_an_open_thought_is_steered_to_the_closer() {
+        let pick = |eog: Token,
+                    steer: Option<Token>,
+                    banned: Vec<Token>,
+                    open: bool,
+                    open_at_start: bool| {
+            let opts = SamplerConfig {
+                modes: vec![SamplingMode::Greedy],
+                repetition: None,
+                banned_specials: banned,
+                thought: Some(ThoughtSpecials::new(
+                    vec![X],
+                    vec![A],
+                    steer,
+                    open_at_start,
+                )),
+                ..SamplerConfig::default()
+            };
+            let mut state = state_for(&opts);
+            sample_token_in(
+                &[],
+                b"",
+                None,
+                open,
+                cands(&[(eog, 10.0), (B, 5.0), (A, 1.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap()
+        };
+        assert_eq!(pick(EOS, Some(A), vec![], true, false), A, "steered");
+        assert_eq!(pick(EOG_A, Some(A), vec![], true, false), A, "any EOG");
+        assert_eq!(
+            pick(EOS, Some(A), vec![X], true, true),
+            A,
+            "pre-opened: opener spent, EOG still closes the thought"
+        );
+        assert_eq!(pick(EOS, Some(A), vec![], false, false), EOS, "closed");
+        assert_eq!(pick(EOS, None, vec![], true, false), EOS, "no steer");
+        assert_eq!(pick(EOS, Some(A), vec![A], true, false), EOS, "banned");
     }
 
     #[test]

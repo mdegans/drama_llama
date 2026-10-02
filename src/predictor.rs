@@ -692,8 +692,8 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// Emission provenance for the deferred-grammar trigger scan (see
     /// [`Self::set_reserved`]); `None` scans bytes alone.
     provenance: Option<TriggerProvenance>,
-    /// A thought is open: the opener is steered to the closer (see
-    /// [`crate::ThoughtSpecials`]).
+    /// A thought is open: the opener and EOG are steered to the closer
+    /// (see [`crate::ThoughtSpecials`]).
     thought_open: bool,
     pub(crate) inner: CandidatePredictor<'engine, B>,
 }

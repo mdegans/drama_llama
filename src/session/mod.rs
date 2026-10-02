@@ -4506,10 +4506,11 @@ impl<B: Backend> Session<B> {
             banned_specials.sort_unstable();
             banned_specials.dedup();
         }
-        // The nested-opener steer: while a thought the model opened is
-        // still open, its opener becomes the closer (`ThoughtSpecials`).
-        // Never on a closed-stub render, where no thought can open; on a
-        // pre-opened one the opener is banned above, so it stays masked.
+        // The open-thought steer: while a thought is open, its opener
+        // and EOG become the closer (`ThoughtSpecials`). Never on a
+        // closed-stub render, where no thought can open; on a pre-opened
+        // one the opener is banned above, so it stays masked, but EOG
+        // is steered: closing that thought is the model's job.
         let thought = (!reasoning_closed_by_render
             && !self.reasoning_opener_ban.is_empty()
             && !self.reasoning_closer_ban.is_empty())
@@ -9250,7 +9251,9 @@ enum Breach {
     /// ever be the sole block of a trailing assistant message (see
     /// [`OPEN_THOUGHT_SIGNATURE`](crate::prompt::OPEN_THOUGHT_SIGNATURE)),
     /// so the client's next turn would be rejected; and as no `max_tokens`
-    /// cut, it has no honest stop reason.
+    /// cut, it has no honest stop reason. The backstop: the sampler
+    /// steers EOG inside a thought to the closer where it can
+    /// ([`crate::ThoughtSpecials`]).
     OpenThought,
 }
 
