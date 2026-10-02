@@ -975,6 +975,7 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         let next_token = crate::sample::sample_token_in(
             &self.inner.tokens,
             self.text.as_bytes(),
+            self.provenance.as_ref().map(|p| &*p.reserved),
             candidates,
             &self.options.sample_options,
             &mut self.state,

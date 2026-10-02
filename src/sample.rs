@@ -1344,16 +1344,20 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     state: &mut SamplerState,
     model: &M,
 ) -> Result<Token, SampleError> {
-    sample_token_in(tokens, &[], candidates, opts, state, model)
+    sample_token_in(tokens, &[], None, candidates, opts, state, model)
 }
 
 /// [`sample_token`], given `generated` — the text generated so far,
 /// which a sleeping deferred grammar's trigger may have started in.
 /// A token that would finish the trigger and wake the grammar on bytes
 /// it refuses is masked (`SamplerState::wakes_deferred_illegally`).
+/// Given the vocabulary's `reserved` pieces, so is an ordinary token
+/// spelling one an active grammar forces
+/// (`SamplerState::spells_forced_framing`).
 pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     tokens: &[Token],
     generated: &[u8],
+    reserved: Option<&crate::LiteralNeutralizer>,
     mut candidates: Candidates,
     opts: &SamplerConfig,
     state: &mut SamplerState,
@@ -1467,6 +1471,9 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     let banned = opts.banned_specials.as_slice();
     let banned_in_region = opts.banned_specials_constrained.as_slice();
     let sleeping = state.deferred_inactive() == Some(true);
+    let reserved = reserved
+        .filter(|r| !r.is_empty())
+        .filter(|_| state.has_active_constraint());
 
     // Fallback snapshots (lazy-grammar check, emit-side specials ban,
     // and/or a sleeping deferred grammar's wake check): `Pcg64Mcg` is a
@@ -1477,6 +1484,7 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     // stream every run regardless of how many checks fall back.
     let snapshot = if lazy
         || sleeping
+        || reserved.is_some()
         || !banned.is_empty()
         || !banned_in_region.is_empty()
     {
@@ -1592,6 +1600,48 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
                 Candidates::from_vec_unchecked(kept)
             };
             let filtered = apply_modes(cleaned, opts, state, model, false);
+            chosen = choose_candidate(&mut state.rng, filtered.softmax(None))
+                .is_one()
+                .unwrap()
+                .id;
+        }
+    }
+
+    // Spelled-framing check, accept-then-mask again: grammars match
+    // bytes, so a reserved piece they force passes spelled in ordinary
+    // tokens, and the parse then reads it as text. On a hit (rare: only
+    // a token starting a forced piece's spelling) restore the pre-fold
+    // state and drop every such token, alongside the ban above, before
+    // the masked rerun — which leaves the real token.
+    if let Some(reserved) = reserved.filter(|&reserved| {
+        state.spells_forced_framing(opts, generated, chosen, model, reserved)
+    }) {
+        if let Some((rng_snap, mu_snap, saved)) = snapshot.as_ref() {
+            state.rng = rng_snap.clone();
+            state.mu = *mu_snap;
+            let kept: Vec<crate::TokenData> = saved
+                .as_slice()
+                .iter()
+                .filter(|td| {
+                    banned.binary_search(&td.id).is_err()
+                        && !state.spells_forced_framing(
+                            opts, generated, td.id, model, reserved,
+                        )
+                })
+                .copied()
+                .collect();
+            let cleaned = if kept.is_empty() {
+                Candidates::from_vec(vec![crate::TokenData {
+                    id: model.eos(),
+                    logit: 0.0,
+                    p: 0.0,
+                }])
+            } else {
+                Candidates::from_vec_unchecked(kept)
+            };
+            let filtered = apply_modes(cleaned, opts, state, model, false);
+            // INVARIANT: `cleaned` is never empty (EOS stands in), and
+            // the masked filters force EOS rather than empty it.
             chosen = choose_candidate(&mut state.rng, filtered.softmax(None))
                 .is_one()
                 .unwrap()
@@ -3226,6 +3276,7 @@ mod tests {
                 let picked = sample_token_in(
                     &[],
                     generated,
+                    None,
                     cands(&[(QUOTE_COMMA, 10.0), (QUOTE, 5.0), (B, 1.0)]),
                     &opts,
                     &mut state,
@@ -3249,6 +3300,7 @@ mod tests {
             let picked = sample_token_in(
                 &[],
                 b"a",
+                None,
                 cands(&[(QUOTE_COMMA, 10.0), (B, 1.0)]),
                 &opts,
                 &mut state,

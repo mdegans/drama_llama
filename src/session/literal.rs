@@ -1669,4 +1669,99 @@ mod tests {
             reasons(&events),
         );
     }
+
+    /// [`tool_prompt`] under `choice`, one call at most: the grammar is
+    /// spent at the closer and the turn ends there.
+    fn one_call_prompt(choice: crate::ToolChoice) -> Prompt {
+        Prompt {
+            tool_choice: Some(choice),
+            ..tool_prompt()
+        }
+    }
+
+    /// A call's body between its opener and closer under `dialect`.
+    fn call_body(dialect: &crate::CallSyntax) -> String {
+        let input: serde_json::Value =
+            serde_json::from_str(r#"{"q": "x"}"#).unwrap();
+        let call =
+            crate::dialect::render_reference(dialect, &[("lookup", &input)])
+                .expect("reference call");
+        let open = dialect.per_call_start.trim_end();
+        call.strip_prefix(open)
+            .and_then(|b| b.strip_suffix(dialect.per_call_end.as_str()))
+            .expect(&call)
+            .to_string()
+    }
+
+    /// The grammar forces `</tool_call>`, which it matches as bytes, so
+    /// it once took the closer spelled in ordinary tokens; the parse,
+    /// reading provenance, left that spelling as a text block after an
+    /// unclosed call (live, on Qwen3.6: `tool_use | text("</tool_call>")`,
+    /// and the turn parted from its KV). The spelling's first token is
+    /// masked now and the real closer takes its slot: one call, lazy
+    /// (`auto`) and eager (`any`) alike, on a JSON and a tagged dialect.
+    #[test]
+    fn a_spelled_closer_is_steered_to_the_real_one() {
+        let lazy = crate::ToolChoice::Auto {
+            disable_parallel_tool_use: true,
+        };
+        let eager = crate::ToolChoice::Any {
+            disable_parallel_tool_use: true,
+        };
+        let hermes = session().dialect().clone();
+        let qwen = crate::CallSyntax::qwen_xml();
+        for dialect in [hermes, qwen] {
+            let body = call_body(&dialect);
+            let script =
+                [vec![TOOL_CALL], real(&body), bytes("</tool_call>")].concat();
+            for choice in [lazy.clone(), eager.clone()] {
+                let prompt = one_call_prompt(choice);
+                let mut s =
+                    scripted(script.clone()).with_dialect(dialect.clone());
+                let blocks = s.complete_blocks(&prompt).expect("a call");
+                assert_eq!(blocks.len(), 1, "{blocks:?}");
+                assert!(is_call(&blocks[0]), "{blocks:?}");
+                let mut s =
+                    scripted(script.clone()).with_dialect(dialect.clone());
+                let text = s.complete_text(&prompt).unwrap();
+                assert!(text.ends_with("</tool_call>"), "{text:?}");
+            }
+        }
+    }
+
+    /// Only framing the grammar forces is masked: a reserved piece
+    /// spelled inside a string argument is content, kept verbatim.
+    #[test]
+    fn a_spelled_piece_in_an_argument_is_content() {
+        let call = r#"<tool_call>{"name": "lookup", "arguments": {"q":"</tool_call>"}}</tool_call>"#;
+        let body = call
+            .strip_prefix("<tool_call>")
+            .and_then(|b| b.strip_suffix("</tool_call>"))
+            .unwrap();
+        let script =
+            [vec![TOOL_CALL], bytes(body), vec![TOOL_CALL_END]].concat();
+        let prompt = one_call_prompt(crate::ToolChoice::Auto {
+            disable_parallel_tool_use: true,
+        });
+        let blocks = scripted(script).complete_blocks(&prompt).unwrap();
+        match blocks.as_slice() {
+            [crate::Block::ToolUse { call }] => {
+                assert_eq!(call.input["q"], "</tool_call>")
+            }
+            other => panic!("expected one call, got {other:?}"),
+        }
+    }
+
+    /// After a call closes the grammar admits only the next opener or
+    /// the end of the turn: a second closer, spelled or real, is never
+    /// emitted.
+    #[test]
+    fn a_stray_closer_after_a_call_is_masked() {
+        for stray in [bytes("</tool_call>"), vec![TOOL_CALL_END]] {
+            let script = [real(&call_bytes()), stray].concat();
+            let mut s = scripted(script).with_seed(NonZeroU128::new(7));
+            let text = s.complete_text(&tool_prompt()).unwrap();
+            assert!(!text.contains("</tool_call></tool_call>"), "{text:?}");
+        }
+    }
 }
