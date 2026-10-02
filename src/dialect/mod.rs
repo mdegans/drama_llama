@@ -463,6 +463,10 @@ pub mod harmony {
     /// (`container.exec`, `python`, `browser.search`) are builtin
     /// tools we swallow, upstream parity.
     pub const TO_FUNCTIONS: &str = " to=functions.";
+    /// Opens a recipient, any recipient: where a lazy call grammar
+    /// takes over ([`super::CallSyntax::triggers`]), so the name after it is
+    /// forced to `functions.` and a declared tool.
+    pub const TO: &str = " to=";
     pub const ANALYSIS_OPEN: &str = "<|channel|>analysis<|message|>";
     pub const COMMENTARY: &str = "<|channel|>commentary";
     pub const COMMENTARY_OPEN: &str = "<|channel|>commentary<|message|>";
@@ -501,13 +505,15 @@ impl CallSyntax {
     /// All lazy-activation byte sequences. Most dialects have exactly
     /// one ([`Self::trigger`]); Harmony's tool-call header has no
     /// single distinctive marker, so it triggers on any of the
-    /// recipient-bearing header shapes. Those are deliberately
-    /// conservative — a false activation derails generation (the
-    /// grammar starts forcing call bytes mid-thought), while a miss
-    /// only loses enforcement for that call: the parser still
-    /// recognizes it and the canonicalization gate covers the bytes.
-    /// Upstream uses anchored regexes for the same reason (`chat.cpp`
-    /// gpt-oss `grammar_triggers`).
+    /// recipient-bearing header shapes — at the recipient's `to=`, not
+    /// after `functions.`. A recipient the trigger never saw ran free,
+    /// and gpt-oss-120b writes them: `to=create_comment` (swallowed as
+    /// a builtin — the call lost), `to=function` then prose (framing in
+    /// free text, rejected on every draw), 2026-10-01. From `to=` the
+    /// grammar forces `functions.` and a declared name. Nothing else is
+    /// a legal recipient here: the session declares no builtin tools.
+    /// The cost is the 20b wart (`<|channel|>commentary to=assistant`
+    /// before the real header), which now opens a call.
     ///
     /// The marker dialects' bare special has no such trade: a miss is
     /// the costly side (see [`Self::trigger`]), and a "false"
@@ -518,22 +524,10 @@ impl CallSyntax {
         match self.family {
             Family::Harmony => vec![
                 // Recipient in the role header.
-                format!(
-                    "{}{}",
-                    harmony::START_ASSISTANT,
-                    harmony::TO_FUNCTIONS
-                ),
+                format!("{}{}", harmony::START_ASSISTANT, harmony::TO),
                 // Recipient in the channel header.
-                format!(
-                    "{}commentary{}",
-                    harmony::CHANNEL,
-                    harmony::TO_FUNCTIONS
-                ),
-                format!(
-                    "{}analysis{}",
-                    harmony::CHANNEL,
-                    harmony::TO_FUNCTIONS
-                ),
+                format!("{}commentary{}", harmony::CHANNEL, harmony::TO),
+                format!("{}analysis{}", harmony::CHANNEL, harmony::TO),
             ],
             _ => vec![self.trigger().to_string()],
         }

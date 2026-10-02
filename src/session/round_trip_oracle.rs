@@ -1193,19 +1193,6 @@ fn known_divergence(
             respelled: None,
         });
     }
-    // PENDING (reported, #129): gpt-oss addressed a tool without its
-    // `functions.` namespace (live 2026-10-01). The parser reads such a
-    // recipient as a builtin tool and swallows the block, so the call
-    // is lost and the turn re-renders without it.
-    if fx.syntax.family == Family::Harmony
-        && emitted.starts_with("commentary to=")
-        && !emitted.starts_with("commentary to=functions.")
-    {
-        return Some(Known {
-            reason: "PENDING: Harmony call without its functions. namespace",
-            respelled: None,
-        });
-    }
     // A constrained final with no thought right before it has nowhere
     // to record its header, and re-renders plain.
     if emitted.starts_with(" <|constrain|>json<|message|>")
@@ -1733,6 +1720,7 @@ fn round_trip_oracle_corpus() {
             Accepted("unsorted keys in an untyped dict object"),
         ),
         // Live 2026-10-01 (gpt-oss, RC e559a44): `to=create_comment`.
+        // The lazy grammar arms at `to=` and forces `functions.`.
         seed(
             gptoss,
             Auto,
@@ -1747,7 +1735,7 @@ fn round_trip_oracle_corpus() {
                      <|constrain|>json<|message|>{\"city\":\"Paris\"}",
                 ),
             ],
-            Accepted("PENDING: Harmony call without its functions. namespace"),
+            NotAdmitted,
         ),
         // Text after a call, here a second thought and call: the lazy
         // grammar holds to the end of the turn, so it is never written.

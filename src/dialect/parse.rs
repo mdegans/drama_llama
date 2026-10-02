@@ -1422,6 +1422,14 @@ impl<'a> Parser<'a> {
             (Some(r), _) if r.starts_with("functions.") => {
                 self.harmony_call(r["functions.".len()..].to_string())
             }
+            // A declared tool without its namespace (gpt-oss-120b,
+            // 2026-10-01: `to=create_comment`) is that tool: swallowed
+            // as a builtin, the call was lost without a trace. It
+            // re-renders under `functions.`, as the grammar forces it
+            // wherever a trigger saw the recipient.
+            (Some(r), _) if self.tools.iter().any(|t| t.name == r) => {
+                self.harmony_call(r)
+            }
             (Some(_), _) => {
                 // Builtin / unsolicited recipient: swallow the block
                 // (upstream surfaces empty content for these).
@@ -4836,6 +4844,166 @@ mod tests {
         parse_text(&syntax, &[&t], text, false, leniency).blocks
     }
 
+    /// Every Harmony recipient arms the lazy grammar at its `to=`, and
+    /// from there only `functions.` and a declared name are legal: the
+    /// recipients gpt-oss-120b wrote instead (2026-10-01) — a bare tool
+    /// name, which the parser swallowed as a builtin, and `function`
+    /// followed by prose — are refused, so the model is steered to the
+    /// call it meant. The canonical call is admitted from every trigger.
+    #[test]
+    fn harmony_triggers_arm_at_any_recipient() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        let syntax = CallSyntax::gpt_oss();
+        let t = tool("get_weather");
+        let source = grammar_source(
+            &syntax,
+            &[&t],
+            &EmitOptions {
+                anchor: Anchor::Lazy,
+                ..Default::default()
+            },
+        )
+        .expect("grammar");
+        let admits = |text: &str| {
+            let mut state = crate::GrammarState::from_source(&source)
+                .expect("grammar parses");
+            state.advance_bytes(text.as_bytes()).is_ok()
+        };
+        let args = r#"{"city":"Paris","days":3}"#;
+        for trigger in syntax.triggers() {
+            assert!(trigger.ends_with(" to="), "{trigger:?}");
+            let header = match trigger.starts_with(harmony::START_ASSISTANT) {
+                true => {
+                    "functions.get_weather<|channel|>commentary \
+                         <|constrain|>json<|message|>"
+                }
+                false => "functions.get_weather <|constrain|>json<|message|>",
+            };
+            let call = format!("{trigger}{header}{args}");
+            assert!(admits(&call), "{call:?}");
+            for stray in [
+                "get_weather",
+                "function\n\nOops need correct tool.",
+                "functions.unknown",
+                "assistant",
+                "python",
+            ] {
+                let text = format!("{trigger}{stray}");
+                assert!(!admits(&text), "{text:?}");
+            }
+        }
+    }
+
+    /// A recipient naming a declared tool without `functions.` is that
+    /// tool's call, not a builtin to swallow: the call was lost whole.
+    /// Undeclared recipients are still swallowed (upstream parity).
+    #[test]
+    fn harmony_bare_declared_recipient_is_a_call() {
+        let t = tool("get_weather");
+        let parse = |text: &str| {
+            parse_text(&CallSyntax::gpt_oss(), &[&t], text, false, {
+                Leniency::Final
+            })
+            .blocks
+        };
+        let args = r#"{"city":"Paris","days":3}"#;
+        for header in [
+            "<|channel|>commentary to=get_weather <|constrain|>json",
+            " to=get_weather<|channel|>commentary json",
+        ] {
+            let text = format!("{header}<|message|>{args}<|call|>");
+            let blocks = parse(&text);
+            let calls = calls_of(&blocks);
+            assert_eq!(calls.len(), 1, "{text:?}: {blocks:#?}");
+            assert_eq!(calls[0].0, "get_weather");
+            assert_eq!(calls[0].1["city"], "Paris");
+        }
+        let text = format!(
+            "<|channel|>commentary to=python <|constrain|>json\
+             <|message|>{args}<|call|>"
+        );
+        assert!(calls_of(&parse(&text)).is_empty());
+    }
+
+    /// A Harmony call's args end at the JSON close, on both sides:
+    /// the grammar (eager and lazy) admits nothing after it but EOG,
+    /// and the parser reads prose written past it — the model wrote
+    /// `"}` and went on in the same message — as its own text, never
+    /// as part of a value, non-ASCII right before the close included
+    /// (the 2026-10-01 gpt-oss `create_comment` shape).
+    #[test]
+    fn harmony_args_end_at_the_json_close() {
+        use crate::dialect::{grammar_source, Anchor, EmitOptions};
+        let comment = Tool::builder("create_comment")
+            .description("Post a comment.")
+            .schema(json!({
+                "type": "object",
+                "properties": {
+                    "reply_to": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["reply_to", "body"],
+            }))
+            .build()
+            .expect("valid test tool");
+        let header = "<|channel|>commentary to=functions.create_comment \
+                      <|constrain|>json<|message|>";
+        let args = "{\"reply_to\":\"7ad26ccd\",\
+                    \"body\":\"Agreed (Art\u{202F}II\u{2011}6).\"}";
+        let prose = "Will need to check. Let's proceed.";
+
+        for anchor in [Anchor::Eager, Anchor::Lazy] {
+            let source = grammar_source(
+                &CallSyntax::gpt_oss(),
+                &[&comment],
+                &EmitOptions {
+                    anchor,
+                    ..Default::default()
+                },
+            )
+            .expect("grammar");
+            let mut state = crate::GrammarState::from_source(&source)
+                .expect("grammar parses");
+            let call = format!("{header}{args}");
+            assert!(
+                state.advance_bytes(call.as_bytes()).is_ok()
+                    && state.is_complete(),
+                "{anchor:?}: {call:?}"
+            );
+            assert!(
+                state.advance_bytes(prose.as_bytes()).is_err(),
+                "{anchor:?}: prose after the close"
+            );
+        }
+
+        for tail in ["", "<|call|>"] {
+            let text = format!("{header}{args}{prose}{tail}");
+            for leniency in
+                [Leniency::Final, Leniency::Streaming, Leniency::Clipped]
+            {
+                let blocks = parse_text(
+                    &CallSyntax::gpt_oss(),
+                    &[&comment],
+                    &text,
+                    false,
+                    leniency,
+                )
+                .blocks;
+                let calls = calls_of(&blocks);
+                assert_eq!(calls.len(), 1, "{leniency:?}: {blocks:#?}");
+                assert_eq!(
+                    calls[0].1["body"], "Agreed (Art\u{202F}II\u{2011}6).",
+                    "{leniency:?}: {blocks:#?}"
+                );
+                assert!(
+                    matches!(blocks.last(), Some(Block::Text { text, .. })
+                        if text.starts_with(prose)),
+                    "{leniency:?}: {blocks:#?}"
+                );
+            }
+        }
+    }
+
     /// Content-only messages: final and commentary-preamble channels
     /// both surface as Text (upstream `message_assist`).
     #[test]
@@ -6072,9 +6240,9 @@ mod tests {
                 assert_eq!(
                     syntax.triggers(),
                     [
-                        "<|start|>assistant to=functions.",
-                        "<|channel|>commentary to=functions.",
-                        "<|channel|>analysis to=functions.",
+                        "<|start|>assistant to=",
+                        "<|channel|>commentary to=",
+                        "<|channel|>analysis to=",
                     ],
                     "{name}"
                 );
