@@ -44,9 +44,11 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::{num::NonZeroU32, path::PathBuf};
 
-use drama_llama::FromPath;
+use drama_llama::{Block, Content, FromPath, Message, Prompt, Role, Tool};
+use misanthropic::prompt::{thinking::Thinking, Effort};
+use serde_json::json;
 
 /// Resolve the cogito GGUF: `$DRAMA_LLAMA_COGITO_MODEL` if set and
 /// present, else the conventional path under `models/`. `None` means
@@ -124,4 +126,130 @@ fn tip_anchors_across_tool_rounds_issue_96() {
 #[ignore = "requires cogito model"]
 fn tip_anchors_unmarked_continuation_issue_96() {
     common::tip::assert_tip_anchors_unmarked_continuation(session_or_skip!());
+}
+
+/// Deep thinking, in the cohort's production shape: a system prompt,
+/// an offered (unforced) tool, `thinking: adaptive` and `effort:
+/// medium`, the session's own sampling. The baked template states the
+/// incantation and pre-opens `<think>\n`, so the turn must come back
+/// as a `Thought` then a clean answer — no thought framing left in the
+/// text — and the next turn must resume past the whole previous prompt
+/// (the thinking turn re-rendered byte for byte).
+#[test]
+#[ignore = "requires cogito model"]
+fn adaptive_thinking_yields_a_thought_and_a_stable_next_turn() {
+    let mut session = session_or_skip!();
+    let gen_prompt =
+        |prompt: &Prompt, session: &drama_llama::LlamaCppSession| {
+            session
+                .template()
+                .render_with(
+                    prompt,
+                    &drama_llama::RenderOptions::default()
+                        .with_generation_prompt(true)
+                        .with_extra("preserve_thinking", true)
+                        .with_thought_reingest(
+                            session.dialect().reasoning.reingest,
+                        ),
+                )
+                .expect("render")
+        };
+    let tool = Tool::builder("get_content")
+        .description("Read a forum post by id.")
+        .schema(json!({
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        }))
+        .build()
+        .expect("valid tool");
+    let mut prompt = Prompt {
+        system: Some(Content::text(
+            "You are aegis, an agent on a small forum. Read posts with \
+             your tool when you need them; otherwise answer directly.",
+        )),
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text(
+                "Is 3599 a prime number? Answer in one sentence.",
+            ),
+        }],
+        tools: Some(vec![tool.into()]),
+        thinking: Some(Thinking::adaptive()),
+        max_tokens: NonZeroU32::new(4096).unwrap(),
+        ..Default::default()
+    }
+    .effort(Effort::Medium);
+    let gen = gen_prompt(&prompt, &session);
+    assert!(
+        gen.contains("Enable deep thinking subroutine.")
+            && gen.ends_with("<|im_start|>assistant\n<think>\n"),
+        "the render must ask for and pre-open the thought: {gen:?}"
+    );
+
+    let first = session.complete_response(&prompt).expect("first turn");
+    eprintln!("first: {:#?} {:?}", first.inner.content, first.usage);
+    let blocks = &first.inner.content.0;
+    assert!(
+        matches!(
+            blocks.first(),
+            Some(Block::Thought { thought, .. }) if !thought.trim().is_empty()
+        ),
+        "thinking on must open the turn with a Thought: {blocks:#?}"
+    );
+    let answer: String = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text { text, .. } => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert!(!answer.trim().is_empty(), "no answer after the thought");
+    assert!(
+        !answer.contains("<think>") && !answer.contains("</think>"),
+        "thought framing leaked into the answer: {answer:?}"
+    );
+    let prev_total = first.usage.cache_read_input_tokens.unwrap_or(0)
+        + first.usage.cache_creation_input_tokens.unwrap_or(0)
+        + first.usage.input_tokens;
+
+    prompt.messages.push(Message {
+        role: Role::Assistant,
+        content: first.inner.content.clone(),
+    });
+    prompt.messages.push(Message {
+        role: Role::User,
+        content: Content::text("And 3601? One sentence."),
+    });
+    let next = gen_prompt(&prompt, &session);
+    assert!(
+        next.starts_with(gen.as_str()),
+        "the next request must extend the first"
+    );
+    let second = session.complete_response(&prompt).expect("second turn");
+    eprintln!("second: {:#?} {:?}", second.inner.content, second.usage);
+    let read = second.usage.cache_read_input_tokens.unwrap_or(0);
+    assert!(
+        read > prev_total,
+        "tip missed: cache_read ({read}) did not clear the previous \
+         prompt ({prev_total}) — the thinking turn did not re-render \
+         byte for byte. usage: {:?}",
+        second.usage,
+    );
+    assert!(
+        matches!(second.inner.content.0.first(), Some(Block::Thought { .. })),
+        "the second turn thinks too: {:#?}",
+        second.inner.content
+    );
+}
+
+/// #96/#112 on cogito with deep thinking: forced tool-call turns, each
+/// continuation resuming past the entire previous prompt via the tip.
+#[test]
+#[ignore = "requires cogito model"]
+fn tip_anchors_across_thinking_tool_rounds() {
+    common::tip::assert_tip_anchors_across_thinking_tool_rounds(
+        session_or_skip!(),
+        3,
+    );
 }

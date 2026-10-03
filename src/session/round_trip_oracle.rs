@@ -1635,18 +1635,25 @@ fn round_trip_oracle_corpus() {
             ],
             RoundTrips,
         ),
-        // The same steer on a `<think>` dialect.
+        // Cogito thinking: the render pre-opens `<think>\n`, so the
+        // turn starts inside the thought, and the answer keeps the gap
+        // the model wrote before it.
         seed(
             "cogito-cache-stable",
             Text,
             true,
+            &[(Free, "A."), (Frame, "\n</think>"), (Free, "\n\nAda.")],
+            RoundTrips,
+        ),
+        seed(
+            "cogito-cache-stable",
+            Auto,
+            true,
             &[
-                (Frame, "<think>"),
                 (Free, "A."),
-                (Frame, "</think><think>"),
-                (Free, "B."),
-                (Frame, "</think>"),
-                (Free, "Ada."),
+                (Frame, "\n</think>"),
+                (Free, "\n\nChecking.\n\n"),
+                (Walk, cogito_call),
             ],
             RoundTrips,
         ),
@@ -1669,7 +1676,7 @@ fn round_trip_oracle_corpus() {
             "cogito-cache-stable",
             Text,
             true,
-            &[(Frame, "<think>"), (Free, "A."), (Frame, "</think>")],
+            &[(Free, "A."), (Frame, "\n</think>")],
             RoundTrips,
         ),
         // Oracle findings, fixed: whitespace before a forced call.

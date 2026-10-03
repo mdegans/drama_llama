@@ -9539,11 +9539,12 @@ fn reasoning_tagged(dialect: &crate::CallSyntax) -> bool {
 /// The thought a [`ResponseFraming::Bare`](crate::ResponseFraming)
 /// output_config grammar offers on `dialect`: the dialect's own markers,
 /// or — when its template measured none — `<think>…</think>`, the habit
-/// of the models behind such templates (cogito thinks in it when its
-/// template asks for deep thinking). The grammar spells these markers
-/// and the call's parser reads them ([`call_parse_syntax`]); the two
-/// disagreeing is what left cogito's `</think>\n{…}` thought inside the
-/// answer's text, failing the schema on every draw.
+/// of the models behind such templates (stock cogito thinks in it when
+/// its template asks for deep thinking; the baked one measures the
+/// markers itself). The grammar spells these markers and the call's
+/// parser reads them ([`call_parse_syntax`]); the two disagreeing is
+/// what left cogito's `</think>\n{…}` thought inside the answer's
+/// text, failing the schema on every draw.
 fn output_config_thought(
     dialect: &crate::CallSyntax,
 ) -> crate::dialect::ReasoningSyntax {
@@ -12555,33 +12556,36 @@ mod tests {
         }
     }
 
-    /// The `</think>` dialects keep `</think>`: Qwen 3.8 (whose measured
-    /// end is `\n</think>`, trimmed as the parser reads it) defers its
-    /// body to it under the render's pre-opened thought, and cogito,
-    /// whose template measures no reasoning markers at all, gets it as
-    /// the fallback thought of a unified grammar.
+    /// The `</think>` dialects keep `</think>`: Qwen 3.8 and the baked
+    /// cogito (whose measured end is `\n</think>`, trimmed as the parser
+    /// reads it) defer their body to it under the render's pre-opened
+    /// thought, and stock cogito, whose template measures no reasoning
+    /// markers at all, gets it as the fallback thought of a unified
+    /// grammar.
     #[test]
     fn think_dialects_keep_the_think_close_trigger() {
-        let qwen = crate::dialect::analyze_template(
-            crate::baked::QWEN38.replacement,
-            "",
-            "<|im_end|>",
-        )
-        .expect("analyze Qwen 3.8");
         let [(_, thinking_on), _] = role_consent_prompts();
-        let crate::CompiledOutputConfig::Deferred(d) = resolve_grammar(
-            &thinking_on,
-            &qwen,
-            &OutputConfigOptions::default(),
-            true,
-        )
-        .expect("resolve")
-        .expect("output_config grammar") else {
-            panic!("qwen3.8: a pre-opened thought defers the body");
-        };
-        assert_eq!(d.activate_after, [b"</think>".to_vec()]);
+        for baked in [&crate::baked::QWEN38, &crate::baked::COGITO] {
+            let dialect = crate::dialect::analyze_template(
+                baked.replacement,
+                "",
+                "<|im_end|>",
+            )
+            .expect("analyze");
+            let crate::CompiledOutputConfig::Deferred(d) = resolve_grammar(
+                &thinking_on,
+                &dialect,
+                &OutputConfigOptions::default(),
+                true,
+            )
+            .expect("resolve")
+            .expect("output_config grammar") else {
+                panic!("{}: a pre-opened thought defers the body", baked.name);
+            };
+            assert_eq!(d.activate_after, [b"</think>".to_vec()]);
+        }
 
-        let cogito = cogito_dialect();
+        let cogito = stock_cogito_dialect();
         let compiled = output_config_grammar(&thinking_on, &cogito);
         assert!(matches!(compiled, crate::CompiledOutputConfig::Single(_)));
         let thought =
@@ -12593,11 +12597,12 @@ mod tests {
         );
     }
 
-    /// cogito's dialect, analyzed from its baked template: no reasoning
-    /// markers of its own.
-    fn cogito_dialect() -> crate::CallSyntax {
+    /// cogito's dialect, analyzed from its STOCK template (served by a
+    /// sidecar, or any finetune shipping it): no reasoning markers of
+    /// its own. The baked replacement measures `<think>` markers.
+    fn stock_cogito_dialect() -> crate::CallSyntax {
         let cogito = crate::dialect::analyze_template(
-            crate::baked::COGITO.replacement,
+            crate::baked::COGITO.stock,
             "",
             "<|im_end|>",
         )
@@ -12610,16 +12615,17 @@ mod tests {
         cogito
     }
 
-    /// cogito's output_config grammar offers the `<think>…</think>`
-    /// fallback thought, so the call's parser must read it too: before,
-    /// a thought the grammar admitted stayed in the answer's text and
-    /// failed the schema on every draw (`</think>\n{…}`, recheck
-    /// 2026-10-01). Only that call: without a structured output, or
-    /// under a forced tool, cogito's `<think>` is still text.
+    /// Stock cogito's output_config grammar offers the
+    /// `<think>…</think>` fallback thought, so the call's parser must
+    /// read it too: before, a thought the grammar admitted stayed in the
+    /// answer's text and failed the schema on every draw
+    /// (`</think>\n{…}`, recheck 2026-10-01). Only that call: without a
+    /// structured output, or under a forced tool, stock cogito's
+    /// `<think>` is still text.
     #[test]
     fn cogito_parses_the_thought_its_output_config_grammar_admits() {
         use crate::Block;
-        let cogito = cogito_dialect();
+        let cogito = stock_cogito_dialect();
         let opts = OutputConfigOptions::default();
         let end = TurnEnd {
             cut: false,

@@ -3,10 +3,16 @@
     it replaces, and `src/baked.rs` for the loading ladder.
 
     What this template changes, and nothing else: call arguments render
-    through `json_dumps` (the model's own spacing) instead of `tojson`,
-    and the prose-to-call gap before the first call is printed only when
-    the prose does not already end in whitespace (see the patch comment
-    in the message loop). Everything else is byte-identical to stock.
+    through `json_dumps` (the model's own spacing) instead of `tojson`;
+    the prose-to-call gap before the first call is printed only when
+    the turn does not already end in whitespace; an assistant turn
+    renders its thoughts as `<think>\n…\n</think>` where the model wrote
+    them; and a thinking-on generation prompt pre-opens `<think>\n`.
+    Stock never renders a thought (deep thinking was prompt-only, and
+    the model's `<think>` came back as prose); see the patch comments in
+    the message loop. The system/tools header (with its `Enable deep
+    thinking subroutine.` incantation), user, system and tool turns are
+    byte-identical to stock.
 -#}
 {%- if not enable_thinking is defined %}
     {%- set enable_thinking = false %}
@@ -71,7 +77,7 @@ For each function call, return a json object with function name and arguments wi
 {%- endif %}
 
 {%- for message in messages %}
-    {%- if (message.role == "user") or (message.role == "system" and not loop.first) or (message.role == "assistant" and not message.tool_calls) %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
         {{- '<|im_start|>' + message.role + '
 ' }}
         {%- if message.content is string %}
@@ -86,44 +92,79 @@ For each function call, return a json object with function name and arguments wi
         {{- '<|im_end|>' + '
 ' }}
     {%- elif message.role == "assistant" %}
-        {{- '<|im_start|>' + message.role }}
-        {%- if message.content %}
-            {{- '
-' }}
+        {#- Thinking patch (drama_llama): the turn's body is its thoughts
+            and prose in the order the model wrote them — drama_llama's
+            `chunks`, else the `reasoning_content` field then `content`
+            — each thought as `<think>\n…\n</think>`, the bytes a
+            thinking-on generation emits after the pre-opened
+            `<think>\n` below, so `render(parse(emission)) == emission`.
+            Prose after a thought keeps the gap the model wrote before
+            it; only prose that starts without one (a client's trimmed
+            copy) gets the canonical `\n\n`. Anything else after a
+            thought (another thought, a call, the turn's end) follows it
+            exactly as written. `preserve_thinking = false` drops the
+            thoughts, rendering the turn as stock does. -#}
+        {%- set keep = preserve_thinking is not defined or preserve_thinking %}
+        {%- set ns = namespace(body='', gap=false, pieces=[]) %}
+        {%- if message.chunks is defined and message.chunks is not none %}
+            {%- for chunk in message.chunks %}
+                {%- if chunk.type == 'thinking' and keep %}
+                    {%- set ns.pieces = ns.pieces + [('<think>
+' + chunk.thinking + '
+</think>', true)] %}
+                {%- elif chunk.type == 'text' %}
+                    {%- set ns.pieces = ns.pieces + [(chunk.text, false)] %}
+                {%- endif %}
+            {%- endfor %}
+        {%- else %}
+            {%- if message.reasoning_content is string and message.reasoning_content and keep %}
+                {%- set ns.pieces = ns.pieces + [('<think>
+' + message.reasoning_content + '
+</think>', true)] %}
+            {%- endif %}
             {%- if message.content is string %}
-                {{- message.content }}
+                {%- set ns.pieces = ns.pieces + [(message.content, false)] %}
             {%- elif message.content is iterable and message.content is not string %}
                 {%- for content_item in message.content %}
                     {%- if content_item.type == 'text' %}
-                        {{- content_item.text }}
+                        {%- set ns.pieces = ns.pieces + [(content_item.text, false)] %}
                     {%- endif %}
                 {%- endfor %}
             {%- endif %}
+        {%- endif %}
+        {%- for piece, thought in ns.pieces %}
+            {%- if ns.gap and not thought and piece and piece.lstrip() == piece %}
+                {%- set ns.body = ns.body + '
+
+' %}
+            {%- endif %}
+            {%- set ns.body = ns.body + piece %}
+            {%- set ns.gap = thought %}
+        {%- endfor %}
+        {%- if not message.tool_calls %}
+            {{- '<|im_start|>' + message.role + '
+' + ns.body + '<|im_end|>
+' }}
+        {%- else %}
+        {{- '<|im_start|>' + message.role }}
+        {%- if ns.body %}
+            {{- '
+' + ns.body }}
         {%- endif %}
         {#- Cache-stability patch (drama_llama): stock prints `\n` before
             EVERY call, the first included, so a turn whose prose the
             model ended in whitespace (its habit: `…\n\n<tool_call>`)
             re-rendered one newline longer than it was generated and the
-            turn's KV was lost on the next request. The prose-to-call gap
-            is printed only when the prose does not already end in
-            whitespace; between calls it stays (the grammar forces the
-            same `\n`). A content-less turn and trimmed client prose
-            render exactly as stock. -#}
-        {%- set ns = namespace(prose='') %}
-        {%- if message.content is string %}
-            {%- set ns.prose = message.content %}
-        {%- elif message.content is iterable and message.content is not string %}
-            {%- for content_item in message.content %}
-                {%- if content_item.type == 'text' %}
-                    {%- set ns.prose = ns.prose + content_item.text %}
-                {%- endif %}
-            {%- endfor %}
-        {%- endif %}
+            turn's KV was lost on the next request. The gap before the
+            first call is printed only when the turn's body does not
+            already end in whitespace; between calls it stays (the
+            grammar forces the same `\n`). A body-less turn and trimmed
+            client prose render exactly as stock. -#}
         {%- for tool_call in message.tool_calls %}
             {%- if tool_call.function is defined %}
                 {%- set tool_call = tool_call.function %}
             {%- endif %}
-            {%- if loop.first and message.content and ns.prose.rstrip() != ns.prose %}
+            {%- if loop.first and ns.body and ns.body.rstrip() != ns.body %}
                 {{- '<tool_call>
 {"name": "' }}
             {%- else %}
@@ -139,6 +180,7 @@ For each function call, return a json object with function name and arguments wi
         {%- endfor %}
         {{- '<|im_end|>
 ' }}
+        {%- endif %}
     {%- elif message.role == "tool" %}
         {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != "tool") %}
             {{- '<|im_start|>user' }}
@@ -166,4 +208,11 @@ For each function call, return a json object with function name and arguments wi
 {%- if add_generation_prompt %}
     {{- '<|im_start|>assistant
 ' }}
+    {#- Thinking patch (drama_llama): pre-open the thought the system
+        incantation asks for, as Qwen's own thinking templates do: on
+        the incantation alone, live cohort turns came back without one. -#}
+    {%- if enable_thinking %}
+        {{- '<think>
+' }}
+    {%- endif %}
 {%- endif %}

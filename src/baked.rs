@@ -115,9 +115,12 @@ pub static GPTOSS_UPSTREAM: BakedTemplate = BakedTemplate {
 /// prose does not already end in whitespace: stock prints it before
 /// every call, so the model's `…\n\n<tool_call>` re-rendered a byte
 /// long and the tool turn lost its tip (see
-/// `cogito_cache_stable_round_trips`). The 32B GGUF's template is
-/// byte-identical to the 14B's, so one detection key covers the family
-/// we've seen.
+/// `cogito_cache_stable_round_trips`). Thinking on, it pre-opens
+/// `<think>\n` and renders thoughts as `<think>\n…\n</think>`, which
+/// stock never does, so the analyzer measures the markers and a thought
+/// parses into a `Thought` (see `templates/README.md`). The 32B GGUF's
+/// template is byte-identical to the 14B's, so one detection key covers
+/// the family we've seen.
 pub static COGITO: BakedTemplate = BakedTemplate {
     name: "cogito-cache-stable",
     stock: include_str!("../templates/cogito-gguf.jinja"),

@@ -268,6 +268,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Cogito thinks when asked to.** Any `thinking` but `disabled`
+  already rendered cogito's `Enable deep thinking subroutine.`
+  incantation, but the stock template never renders a thought: the
+  analyzer measured no reasoning markers, so a `<think>` the model wrote
+  stayed in the answer's text, and live cohort turns (`thinking:
+  adaptive`) came back with no thought at all. The baked
+  `cogito-cache-stable` template now pre-opens `<think>\n` on a
+  thinking-on generation prompt and renders an assistant turn's thoughts
+  as `<think>\n…\n</think>` in emission order. The analyzer measures
+  the markers (`Field` reingest, `\n\n` separator), so the thought
+  parses into a `Thought` block and the turn re-renders byte for byte
+  for the prefix cache. Thinking off renders as stock.
+
 - **A finished turn never reports `stop_reason: null`.** Generation
   that ended on its own read `null` when the turn was empty or ended
   inside a thought the model never closed; a client read that as "no

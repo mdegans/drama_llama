@@ -133,6 +133,26 @@ calls back to back). Round-trip pins:
 Qwen: prose run straight into the call (`Checking.<tool_call>`) gets the
 template's `\n`, and whitespace after the last call is dropped.
 
+A third change (2026-10-03): **deep thinking**. Stock enables it by
+prompt alone — `Enable deep thinking subroutine.` leads the system
+prompt (the model card's incantation, kept byte for byte) — and never
+renders a thought, so the analyzer measured no reasoning markers, a
+`<think>` the model wrote came back as prose, and cohort turns sent
+with `thinking: adaptive` came back without a thought at all. The bake
+pre-opens `<think>\n` in a thinking-on generation prompt, as Qwen's
+thinking templates do, and renders an assistant turn's thoughts and
+prose in emission order (drama_llama's `chunks`, else
+`reasoning_content` then `content`), each thought as
+`<think>\n…\n</think>`. The analyzer now measures `TagBased`
+`<think>\n` / `\n</think>`, `Field` reingest and a `\n\n` separator, so
+the session parses the thought into a `Thought` block and the turn
+re-renders byte for byte. Prose after a thought keeps the gap the
+model wrote; only prose that starts without one (a client's trimmed
+copy) gets the canonical `\n\n`. `preserve_thinking = false` drops
+thoughts, rendering the turn as stock. With thinking off the render is
+stock's. Pins: `dialect_roundtrip.rs`'s `cogito_thinking_*` and
+`cogito_thought_*` tests, and the round-trip oracle.
+
 `mistral4-gguf.jinja` is dumped from the Mistral-Small-4-119B-2603
 Unsloth GGUF (`tokenizer.chat_template`, arch `mistral4`). Its call
 format is `[TOOL_CALLS]name[ARGS]{…}` — function name outside the

@@ -19,7 +19,11 @@ For each function call, return a json object with function name and arguments wi
 <|im_start|>user
 Configure it.<|im_end|>
 <|im_start|>assistant
-<think>weighing the flags</think>Configuring.
+<think>
+weighing the flags
+</think>
+
+Configuring.
 <tool_call>
 {"name": "configure", "arguments": {"name": "unit", "flag": true, "off": false, "maybe": null, "mode": null, "list": [true, null, 1.5, "x"], "nested": {"z": 2, "a": false, "n": null}}}
 </tool_call><|im_end|>
@@ -28,7 +32,12 @@ Configure it.<|im_end|>
 ok
 </tool_response><|im_end|>
 <|im_start|>assistant
-<think>it worked</think>Done.<|im_end|>
+<think>
+it worked
+</think>
+
+Done.<|im_end|>
 <|im_start|>user
 Again?<|im_end|>
 <|im_start|>assistant
+<think>

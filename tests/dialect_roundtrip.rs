@@ -14,6 +14,7 @@ use drama_llama::dialect::{
 };
 use drama_llama::prompt::{Content, Message, Role, ToolUse};
 use drama_llama::{Block, ChatTemplate, Prompt, RenderOptions, Tool};
+use misanthropic::prompt::thinking::Thinking;
 use serde_json::json;
 
 fn fixture_source(name: &str) -> String {
@@ -1726,4 +1727,333 @@ fn qwen38_forced_call_grammar_spells_the_thought_separator() {
              re-render"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Cogito deep thinking (baked `cogito-cache-stable`).
+// ---------------------------------------------------------------------
+
+/// The owned cogito template, analyzed as `Session` serves it.
+fn cogito_baked() -> (ChatTemplate, CallSyntax) {
+    let source = fixture_source("cogito-cache-stable.jinja");
+    let syntax = analyze_template(&source, "", "<|im_end|>").expect("analyze");
+    let template =
+        ChatTemplate::from_source(source, String::new(), "<|im_end|>".into())
+            .expect("template compiles");
+    (template, syntax)
+}
+
+/// `Session`'s render options for `syntax`: thoughts preserved, the
+/// measured reingest convention.
+fn session_opts(syntax: &CallSyntax, gen: bool) -> RenderOptions {
+    RenderOptions::default()
+        .with_generation_prompt(gen)
+        .with_extra("preserve_thinking", true)
+        .with_thought_reingest(syntax.reasoning.reingest)
+}
+
+/// The production request shape: a system prompt, tools, and thinking
+/// from the prompt itself (no `enable_thinking` extra).
+fn cogito_prompt(thinking: Option<Thinking>) -> Prompt {
+    Prompt {
+        system: Some(Content::text("You are aegis, a forum agent.")),
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("What's the weather in Paris?"),
+        }],
+        tools: Some(vec![test_tool().into()]),
+        thinking,
+        ..Default::default()
+    }
+}
+
+fn adaptive() -> Option<Thinking> {
+    Some(Thinking::adaptive())
+}
+
+/// Any thinking variant but `Disabled` asks cogito for deep thinking:
+/// the model card's incantation leads the system prompt, and the
+/// generation prompt pre-opens the thought. Off, the render is the
+/// stock template's, byte for byte.
+#[test]
+fn cogito_thinking_renders_incantation_and_preopens() {
+    let (template, syntax) = cogito_baked();
+    let stock = ChatTemplate::from_source(
+        fixture_source("cogito-gguf.jinja"),
+        String::new(),
+        "<|im_end|>".into(),
+    )
+    .expect("stock compiles");
+    let enabled = Thinking::Enabled {
+        budget_tokens: std::num::NonZeroU32::new(1024).unwrap(),
+        display: None,
+    };
+    for thinking in [adaptive(), Some(enabled)] {
+        for tools in [true, false] {
+            let mut prompt = cogito_prompt(thinking);
+            if !tools {
+                prompt.tools = None;
+            }
+            let gen = template
+                .render_with(&prompt, &session_opts(&syntax, true))
+                .expect("render");
+            assert!(
+                gen.starts_with(
+                    "<|im_start|>system\nEnable deep thinking subroutine.\
+                     \n\nYou are aegis, a forum agent."
+                ),
+                "{thinking:?}, tools {tools}: {gen:?}"
+            );
+            assert!(
+                gen.ends_with("<|im_start|>assistant\n<think>\n"),
+                "{thinking:?}, tools {tools}: {gen:?}"
+            );
+        }
+    }
+    for thinking in [None, Some(Thinking::Disabled)] {
+        let prompt = cogito_prompt(thinking);
+        let gen = template
+            .render_with(&prompt, &session_opts(&syntax, true))
+            .expect("render");
+        assert!(!gen.contains("deep thinking"), "{thinking:?}: {gen:?}");
+        assert!(gen.ends_with("<|im_start|>assistant\n"), "{gen:?}");
+        let stock_gen = stock
+            .render_with(&prompt, &session_opts(&syntax, true))
+            .expect("render");
+        assert_eq!(gen, stock_gen, "thinking off renders as stock");
+    }
+}
+
+/// The baked template renders thoughts, so the analyzer measures
+/// cogito's `<think>` markers instead of falling back to prose: the
+/// session parses a thought into a `Thought` block and the grammars
+/// spell the separator its template re-renders.
+#[test]
+fn cogito_baked_measures_think_markers() {
+    use drama_llama::dialect::{ReasoningMode, ReasoningReingest};
+    let (_, syntax) = cogito_baked();
+    assert_eq!(syntax.reasoning.mode, ReasoningMode::TagBased);
+    assert_eq!(syntax.reasoning.start, "<think>\n");
+    assert_eq!(syntax.reasoning.end, "\n</think>");
+    assert_eq!(syntax.reasoning.reingest, ReasoningReingest::Field);
+    assert_eq!(syntax.reasoning.separator.as_deref(), Some("\n\n"));
+    // Stock never renders a thought: no markers to measure. Nothing
+    // else about the dialect moved.
+    let stock = analyze_template(
+        &fixture_source("cogito-gguf.jinja"),
+        "",
+        "<|im_end|>",
+    )
+    .expect("analyze stock");
+    assert_eq!(stock.reasoning.mode, ReasoningMode::None);
+    assert_eq!(syntax.per_call_start, stock.per_call_start);
+    assert_eq!(syntax.per_call_end, stock.per_call_end);
+    assert_eq!(syntax.call_separator, stock.call_separator);
+}
+
+/// Parse a cogito thinking emission after the pre-opened `<think>\n`,
+/// push it as the assistant turn, and require the follow-up render to
+/// extend the generation prompt with the emission verbatim, closed by
+/// `<|im_end|>` — the auto-tip's contract. Returns the parsed blocks.
+fn assert_cogito_thinking_round_trip(emission: &str) -> Vec<Block> {
+    let (template, syntax) = cogito_baked();
+    let tool = test_tool();
+    let prompt = cogito_prompt(adaptive());
+    let gen = template
+        .render_with(&prompt, &session_opts(&syntax, true))
+        .expect("render");
+    let parsed = parse_text(&syntax, &[&tool], emission, true, Leniency::Final);
+    assert_eq!(parsed.status, ParseStatus::Complete, "{:#?}", parsed.blocks);
+    let mut with_turn = prompt.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(parsed.blocks.clone()),
+    });
+    let rendered = template
+        .render_with(&with_turn, &session_opts(&syntax, false))
+        .expect("render");
+    let suffix = rendered.strip_prefix(&gen).unwrap_or_else(|| {
+        panic!("turn must extend the generation prompt.\n{rendered:?}")
+    });
+    assert_eq!(
+        suffix,
+        format!("{emission}<|im_end|>\n"),
+        "the emission must re-render verbatim"
+    );
+    parsed.blocks
+}
+
+/// A thought, prose, and a Hermes call: the thought parses into a
+/// `Thought` (markers off, body verbatim), the answer keeps none of
+/// the thought's framing, and the turn re-renders byte for byte.
+#[test]
+fn cogito_thought_prose_and_call_round_trip() {
+    let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
+                {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>";
+    let emission = format!(
+        "The user wants Paris weather.\n\nI'll call the tool.\n</think>\
+         \n\nChecking the forecast.\n\n{call}"
+    );
+    let blocks = assert_cogito_thinking_round_trip(&emission);
+    let [thought, text, call] = blocks.as_slice() else {
+        panic!("want [Thought, Text, ToolUse]: {blocks:#?}");
+    };
+    assert!(
+        matches!(thought, Block::Thought { thought, .. }
+            if thought == "The user wants Paris weather.\n\n\
+                           I'll call the tool."),
+        "{thought:#?}"
+    );
+    assert!(
+        matches!(text, Block::Text { text, .. }
+            if text.trim() == "Checking the forecast."),
+        "{text:#?}"
+    );
+    assert!(
+        matches!(call, Block::ToolUse { call }
+            if call.name == "get_weather"
+                && call.input == json!({"city": "Paris", "days": 3})),
+        "{call:#?}"
+    );
+}
+
+/// The other turn shapes thinking produces: a thought then a bare call,
+/// a thought then the answer, a thought ending the turn, and a thought
+/// reopened back to back (`<think>` is plain text in cogito's vocab, so
+/// nothing stops the model writing it).
+#[test]
+fn cogito_thinking_turn_shapes_round_trip() {
+    let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
+                {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>";
+    for emission in [
+        format!("Need the tool.\n</think>\n\n{call}"),
+        format!("Need the tool.\n</think>\n{call}"),
+        "Easy.\n</think>\n\nIt is sunny.".to_owned(),
+        "Easy.\n</think>\nIt is sunny.\n".to_owned(),
+        "Nothing to add.\n</think>".to_owned(),
+        "A.\n</think><think>\nB.\n</think>\n\nIt is sunny.".to_owned(),
+    ] {
+        let blocks = assert_cogito_thinking_round_trip(&emission);
+        assert!(
+            matches!(blocks.first(), Some(Block::Thought { .. })),
+            "{emission:?}: {blocks:#?}"
+        );
+        for block in &blocks {
+            if let Block::Text { text, .. } = block {
+                assert!(!text.contains("think>"), "{emission:?}: {text:?}");
+            }
+        }
+    }
+}
+
+/// A client that sends the answer back trimmed (`"It is sunny."` where
+/// the model wrote `"\n\nIt is sunny."`) still gets the template's
+/// canonical `\n\n` after the thought; an aged thought is dropped only
+/// on an explicit `preserve_thinking = false`.
+#[test]
+fn cogito_thought_history_renders_canonically() {
+    let (template, syntax) = cogito_baked();
+    let mut prompt = cogito_prompt(adaptive());
+    prompt.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![
+            Block::Thought {
+                thought: Cow::Borrowed("Easy."),
+                signature: Cow::Borrowed(""),
+            },
+            Block::Text {
+                text: Cow::Borrowed("It is sunny."),
+                citations: None,
+                cache_control: None,
+            },
+        ]),
+    });
+    let kept = template
+        .render_with(&prompt, &session_opts(&syntax, false))
+        .expect("render");
+    assert!(
+        kept.ends_with(
+            "<|im_start|>assistant\n<think>\nEasy.\n</think>\n\n\
+             It is sunny.<|im_end|>\n"
+        ),
+        "{kept:?}"
+    );
+    let dropped = template
+        .render_with(
+            &prompt,
+            &session_opts(&syntax, false)
+                .with_extra("preserve_thinking", false),
+        )
+        .expect("render");
+    assert!(
+        dropped.ends_with("<|im_start|>assistant\nIt is sunny.<|im_end|>\n"),
+        "{dropped:?}"
+    );
+}
+
+/// The #85 cache property with thinking ON: across a tool round the
+/// incantation renders identically, and each request's render is a
+/// byte prefix of the next — the thinking turn, its tool result, and
+/// the next generation prompt only ever append.
+#[test]
+fn cogito_thinking_prefix_continuity_across_rounds() {
+    use drama_llama::prompt::ToolResult;
+    let (template, syntax) = cogito_baked();
+    let tool = test_tool();
+    let mut prompt = cogito_prompt(adaptive());
+    let turns = [
+        "Paris first.\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \
+         \"arguments\": {\"city\": \"Paris\", \"days\": 1}}\n</tool_call>",
+        "Sunny, 21°C — say so.\n</think>\n\nIt's sunny in Paris, 21°C.",
+    ];
+    let mut prev = String::new();
+    for (round, emission) in turns.iter().enumerate() {
+        let gen = template
+            .render_with(&prompt, &session_opts(&syntax, true))
+            .expect("render");
+        assert!(
+            gen.starts_with(&prev),
+            "round {round}: the request must extend the last one"
+        );
+        let parsed =
+            parse_text(&syntax, &[&tool], emission, true, Leniency::Final);
+        prompt.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(parsed.blocks.clone()),
+        });
+        let closed = template
+            .render_with(&prompt, &session_opts(&syntax, false))
+            .expect("render");
+        assert_eq!(
+            closed.strip_prefix(&gen),
+            Some(format!("{emission}<|im_end|>\n").as_str()),
+            "round {round}: the turn must re-render verbatim"
+        );
+        let call_id = parsed.blocks.iter().find_map(|b| match b {
+            Block::ToolUse { call } => Some(call.id.clone()),
+            _ => None,
+        });
+        prompt.messages.push(Message {
+            role: Role::User,
+            content: match call_id {
+                Some(id) => Content(vec![Block::ToolResult {
+                    result: ToolResult {
+                        tool_use_id: id,
+                        content: Content::text("sunny, 21°C"),
+                        is_error: false,
+                        cache_control: None,
+                    },
+                }]),
+                None => Content::text("Thanks. And tomorrow?"),
+            },
+        });
+        prev = closed;
+    }
+    let last = template
+        .render_with(&prompt, &session_opts(&syntax, true))
+        .expect("render");
+    assert!(
+        last.starts_with(&prev),
+        "the final request extends the last"
+    );
 }
