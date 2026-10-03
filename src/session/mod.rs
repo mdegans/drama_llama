@@ -1923,6 +1923,34 @@ struct SpecialHit<'a> {
     after: &'a str,
 }
 
+/// Where an overruled turn stopped, for the operator log (#140): the
+/// last block's kind, its tool name if a call, and the last
+/// `OVERRULE_TAIL` chars of what it wrote — the value the model meant
+/// to end inside.
+#[cfg(feature = "axum")]
+fn overrule_site(blocks: &[crate::Block]) -> (&'static str, &str, String) {
+    let tail = |s: &str| {
+        let skip = s.chars().count().saturating_sub(OVERRULE_TAIL);
+        s.chars().skip(skip).collect::<String>()
+    };
+    match blocks.last() {
+        Some(crate::Block::ToolUse { call })
+        | Some(crate::Block::ServerToolUse { call }) => {
+            ("ToolUse", call.name.as_ref(), tail(&call.input.to_string()))
+        }
+        Some(crate::Block::Text { text, .. }) => ("Text", "", tail(text)),
+        Some(crate::Block::Thought { thought, .. }) => {
+            ("Thought", "", tail(thought))
+        }
+        Some(_) => ("other", "", String::new()),
+        None => ("none", "", String::new()),
+    }
+}
+
+/// Chars of the overruled value `overrule_site` logs.
+#[cfg(feature = "axum")]
+const OVERRULE_TAIL: usize = 160;
+
 /// The first `limit` occurrences of the `found` pieces in the free text
 /// of `blocks`, in block order, with about `context` bytes each side.
 #[cfg(feature = "axum")]
@@ -8709,8 +8737,14 @@ impl<B: Backend> Session<B> {
             }
             Some(Breach::Overruled) => {
                 #[cfg(feature = "axum")]
+                let (block, tool, tail) = overrule_site(&blocks);
+                #[cfg(feature = "axum")]
                 tracing::error!(
                     target: "drama_llama::session",
+                    generated_tokens = generated_count,
+                    block,
+                    tool,
+                    tail,
                     "the model meant to end its turn inside a constrained \
                      value and the grammar made it write on, into the \
                      value; rejected — prompt cache extent is warm, \

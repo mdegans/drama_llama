@@ -488,8 +488,11 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    // The blocking pool doesn't inherit the request's span, so the
+    // session's own logs (cache, overrule, #101) would lose `model`.
+    let span = tracing::Span::current();
     tokio::select! {
-        joined = spawn_blocking(f) => match joined {
+        joined = spawn_blocking(move || span.in_scope(f)) => match joined {
             Ok(r) => Ok(r),
             Err(e) => {
                 // Cancelled only at runtime shutdown; a panic otherwise.
