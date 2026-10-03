@@ -279,6 +279,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream reports the same through `BlockStream::violation`. A thought
   the budget cuts is still `max_tokens`, open, for the client to
   continue.
+- **EOG inside an open thought is steered to the closer.** Live on
+  Mistral Small 4 the model ends its turn without closing its thought
+  often, and every resample of the violation above did the same: all
+  three draws failed and the client got an error. The sampler now
+  writes the dialect's closer in EOG's slot while a thought is open
+  (`ThoughtSpecials`, as for a nested opener), a pre-opened render
+  included, so the model answers or ends a closed, thought-only turn
+  (`end_turn`). Where the closer can't take the slot (not one token,
+  banned, or refused by a constraint), EOG stands and the violation
+  is the backstop. A budget cut is unchanged.
 - **An image-end boundary checkpoints and rewinds again on M-RoPE
   models (Qwen3.6 with an image).** The checkpoint rules took a
   sequence's head as `pos_max + 1`, but every cell of an M-RoPE image

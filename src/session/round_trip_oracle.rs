@@ -1650,6 +1650,28 @@ fn round_trip_oracle_corpus() {
             ],
             RoundTrips,
         ),
+        // 2026-10-02, Mistral Small 4: EOG inside an open thought, a
+        // `Breach::OpenThought` on every resample. The sampler now
+        // steers it to the closer; the model then ends the closed,
+        // thought-only turn, or answers (as above).
+        seed(
+            "mistral4-cache-stable",
+            Text,
+            true,
+            &[
+                (Frame, "[THINK]"),
+                (Free, "I'll keep my reply short and kind."),
+                (Frame, "[/THINK]"),
+            ],
+            RoundTrips,
+        ),
+        seed(
+            "cogito-cache-stable",
+            Text,
+            true,
+            &[(Frame, "<think>"), (Free, "A."), (Frame, "</think>")],
+            RoundTrips,
+        ),
         // Oracle findings, fixed: whitespace before a forced call.
         seed(
             "qwen3.8-cache-stable",

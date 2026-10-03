@@ -2158,31 +2158,86 @@ mod tests {
         Option<misanthropic::response::StopReason>,
         bool,
     ) {
+        ending_with(script, max_tokens, true)
+    }
+
+    /// [`ending`], with the emit-specials ban (and so the thought
+    /// steer it wires) on or off.
+    fn ending_with(
+        script: Vec<Token>,
+        max_tokens: u32,
+        emit_ban: bool,
+    ) -> (
+        Result<misanthropic::response::Message, SessionError>,
+        Option<misanthropic::response::StopReason>,
+        bool,
+    ) {
         let prompt = Prompt {
             messages: vec![message(crate::Role::User, vec![text("go")])],
             max_tokens: max_tokens.try_into().expect("non-zero"),
             ..Prompt::default()
         };
-        let batch = scripted(script.clone())
-            .with_dialect(tag_thought_dialect())
-            .complete_response(&prompt);
-        let mut s = scripted(script).with_dialect(tag_thought_dialect());
+        let session = |script| {
+            scripted(script)
+                .with_dialect(tag_thought_dialect())
+                .with_emit_specials_ban(emit_ban)
+        };
+        let batch = session(script.clone()).complete_response(&prompt);
+        let mut s = session(script);
         let mut stream = s.complete_stream(&prompt).expect("stream");
         stream.by_ref().for_each(drop);
         let reason = stream.stop_reason().map(|(reason, _)| reason);
         (batch, reason, stream.violation().is_some())
     }
 
-    /// Live on Mistral 4 a turn came back `stop_reason: null`, which
-    /// the client read as "no action" and dropped: the model ended its
-    /// turn inside a thought it never closed. That turn is now the
-    /// resample a grammar violation asks for, on both paths, with the
-    /// open thought kept in `partial_output`.
+    /// Live on Mistral 4 the model ended its turn inside a thought it
+    /// never closed, and every resample did the same. That EOG is now
+    /// steered to the closer; the model's next EOG ends a closed,
+    /// thought-only turn: `end_turn`, on both paths.
     #[test]
-    fn a_turn_ending_inside_a_thought_is_resampled() {
+    fn a_turn_ending_inside_a_thought_closes_it() {
         use misanthropic::response::StopReason;
+        // The script ends in EOG: the first steered, the second real.
         let (batch, reason, violation) =
             ending([vec![THINK], bytes("a")].concat(), 64);
+        let response = batch.expect("a finished turn");
+        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        let content = &response.inner.content;
+        assert_eq!(thoughts(content), [("a".into(), false)], "{content:?}");
+        assert_eq!(content.len(), 1, "{content:?}");
+        assert_eq!(reason, Some(StopReason::EndTurn));
+        assert!(!violation, "the stream agrees");
+    }
+
+    /// The steer keeps the turn going: a model that writes an answer
+    /// after the closer it was given ends with a thought and text.
+    #[test]
+    fn a_steered_thought_may_be_answered() {
+        use misanthropic::response::StopReason;
+        let script = [vec![THINK], bytes("a"), vec![IM_END], bytes("b")];
+        let (batch, reason, violation) = ending(script.concat(), 64);
+        let response = batch.expect("a finished turn");
+        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        let content = &response.inner.content;
+        assert_eq!(thoughts(content), [("a".into(), false)], "{content:?}");
+        assert_eq!(content.last(), Some(&text("b")), "{content:?}");
+        assert_eq!(reason, Some(StopReason::EndTurn));
+        assert!(!violation);
+        // The stream carries the same text of each kind.
+        let blocks = run_thinking(script.concat());
+        assert_eq!(thoughts(&blocks), [("a".into(), false)], "{blocks:?}");
+        assert_eq!(blocks.last(), Some(&text("b")), "{blocks:?}");
+    }
+
+    /// The backstop: where the steer is not wired (no emit-specials
+    /// ban), a turn ending inside a thought is still the resample a
+    /// grammar violation asks for, on both paths, with the open
+    /// thought kept in `partial_output`.
+    #[test]
+    fn an_unsteered_turn_ending_inside_a_thought_is_resampled() {
+        use misanthropic::response::StopReason;
+        let (batch, reason, violation) =
+            ending_with([vec![THINK], bytes("a")].concat(), 64, false);
         match batch {
             Err(SessionError::GrammarViolation { partial_output }) => {
                 let last = partial_output.0.last().expect("a block");
@@ -2192,6 +2247,56 @@ mod tests {
         }
         assert!(violation, "the stream reports it too");
         assert_eq!(reason, Some(StopReason::EndTurn), "never null");
+    }
+
+    /// A pre-opened render (the caller prefilled an open thought) is
+    /// steered too: closing that thought is the model's job, so an EOG
+    /// inside it takes the closer, and the turn ends closed.
+    #[test]
+    fn eog_inside_a_pre_opened_thought_closes_it() {
+        let prompt = Prompt {
+            messages: vec![
+                message(crate::Role::User, vec![text("go")]),
+                message(
+                    crate::Role::Assistant,
+                    vec![crate::Block::Thought {
+                        thought: "hmm".into(),
+                        signature: crate::prompt::OPEN_THOUGHT_SIGNATURE.into(),
+                    }],
+                ),
+            ],
+            ..Prompt::default()
+        };
+        let session =
+            || scripted(bytes("x")).with_dialect(tag_thought_dialect());
+        let response = session()
+            .complete_response(&prompt)
+            .expect("a finished turn");
+        assert_eq!(
+            response.stop_reason,
+            Some(misanthropic::response::StopReason::EndTurn)
+        );
+        let content = &response.inner.content;
+        assert!(
+            content.iter().all(|b| !crate::prompt::is_open_thought(b)),
+            "{content:?}"
+        );
+        let mut s = session();
+        let mut stream = s.complete_stream(&prompt).expect("stream");
+        stream.by_ref().for_each(drop);
+        assert!(stream.violation().is_none());
+    }
+
+    /// No thought open, no steer: EOG after prose ends the turn there.
+    #[test]
+    fn eog_outside_a_thought_is_not_steered() {
+        let script =
+            [vec![THINK], bytes("a"), vec![THINK_END], bytes("b")].concat();
+        let blocks = run_thinking(script);
+        assert_eq!(thoughts(&blocks), [("a".into(), false)], "{blocks:?}");
+        assert_eq!(blocks.last(), Some(&text("b")), "{blocks:?}");
+        let plain = run_thinking(bytes("b"));
+        assert_eq!(plain, [text("b")], "{plain:?}");
     }
 
     /// A turn the model ends with nothing to say is `end_turn`, as on
