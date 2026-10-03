@@ -1384,8 +1384,8 @@ array ::= "[" pad ( value_1 ( elem_sep value_1 )* )? pad "]"
             r#"string ::= "\"" char* "\""
 char ::= unescaped | escape
 unescaped ::= [^"\\\x00-\x1F]
-escape ::= "\\" ( ["\\/bfnrt] | "u" non_surrogate_hex4 | "u" high_surrogate "\\u" low_surrogate )
-non_surrogate_hex4 ::= [0-9a-cA-C] hex hex hex | [dD] [0-7] hex hex | [e-fE-F] hex hex hex
+escape ::= "\\" ( ["\\/nrt] | "u" non_surrogate_hex4 | "u" high_surrogate "\\u" low_surrogate )
+non_surrogate_hex4 ::= "00" [2-9a-fA-F] hex | "000" [9aAdD] | "0" [1-9a-fA-F] hex hex | [1-9a-cA-C] hex hex hex | [dD] [0-7] hex hex | [e-fE-F] hex hex hex
 high_surrogate ::= [dD] [89aAbB] hex hex
 low_surrogate ::= [dD] [c-fC-F] hex hex
 hex ::= [0-9a-fA-F]
@@ -1482,19 +1482,17 @@ const KV_SEP_PERMISSIVE: &str = r#"kv_sep ::= ws ":" ws"#;
 const ELEM_SEP_PERMISSIVE: &str = r#"elem_sep ::= ws "," ws"#;
 /// Just inside `{`/`}` and `[`/`]`.
 const PAD_PERMISSIVE: &str = r"pad ::= ws";
-/// Every escape JSON allows: `\/`, and `\u` with any code unit.
+/// Every escape JSON allows but the C0 controls other than tab, LF and
+/// CR (#141): `\/`, and `\u` with any other code unit.
 const ESCAPE_PERMISSIVE: &str = concat!(
-    r#"escape ::= "\\" ( ["\\/bfnrt] | "u" non_surrogate_hex4 | "#,
+    r#"escape ::= "\\" ( ["\\/nrt] | "u" non_surrogate_hex4 | "#,
     r#""u" high_surrogate "\\u" low_surrogate )"#,
 );
-/// The escapes `serde_json` writes, and no others: the short forms,
-/// then `\u00XX` (lowercase) for the remaining control characters. Every
-/// other character is written raw, so `\/`, `\u00e9` and `\u000A`
-/// parse to a value that re-renders in different bytes.
-const ESCAPE_CANONICAL: &str = concat!(
-    r#"escape ::= "\\" ( ["\\bfnrt] | "#,
-    r#""u00" ( "0" [0-7bef] | "1" [0-9a-f] ) )"#,
-);
+/// The escapes `serde_json` writes, less the C0 controls other than
+/// tab, LF and CR (#141): `\"`, `\\`, `\n`, `\r`, `\t`. Every other
+/// character is written raw, so `\/`, `\u00e9` and `\u000A` parse to a
+/// value that re-renders in different bytes.
+const ESCAPE_CANONICAL: &str = r#"escape ::= "\\" ["\\nrt]"#;
 /// Framing whitespace, permissive, under a name the JSON rules never
 /// reference — root rules use it for the layout *around* the JSON
 /// (e.g. the `\n\n` a thinking model puts between `</think>` and its
@@ -1694,7 +1692,11 @@ mod tests {
         for spacing in [JsonSpacing::Compact, JsonSpacing::Spaced] {
             let canonical =
                 format!("{rules}{}", json_grammar_canonical(spacing));
-            for c in (0u8..0x80).map(char::from).chain(['é', '→', '🍓']) {
+            for c in (0u8..0x80)
+                .map(char::from)
+                .filter(|c| !is_refused_control(*c))
+                .chain(['é', '→', '🍓'])
+            {
                 let written = serde_json::to_string(&c.to_string()).unwrap();
                 assert!(accepts(&canonical, &written), "{written}");
             }
@@ -1704,12 +1706,51 @@ mod tests {
                 r#""\u0041""#,
                 r#""\u000a""#,
                 r#""\u000A""#,
-                r#""\u001F""#,
                 r#""\ud83c\udf53""#,
             ] {
                 assert!(accepts(&permissive, other), "valid JSON: {other}");
                 assert!(!accepts(&canonical, other), "{spacing:?}: {other}");
             }
+        }
+    }
+
+    /// A C0 control but tab, LF and CR (#141).
+    fn is_refused_control(c: char) -> bool {
+        c.is_ascii_control() && c != '\x7f' && !matches!(c, '\t' | '\n' | '\r')
+    }
+
+    /// No prelude admits a C0 control but tab, LF and CR, in any
+    /// spelling (#141: cogito wrote 3,000 × `\u0010` into a comment).
+    /// Raw C0 was always refused; the escapes were the way around it.
+    #[test]
+    fn no_prelude_admits_a_c0_control() {
+        let rules = "root ::= string\n";
+        let canonical = json_grammar_canonical(JsonSpacing::Compact);
+        // (prelude, admits `\u` escapes of what it admits at all)
+        let preludes = [
+            (format!("{rules}{JSON_GRAMMAR}"), true),
+            (format!("{rules}{canonical}"), false),
+        ];
+        for (prelude, unicode_escapes) in &preludes {
+            for c in (0u8..0x20).map(char::from) {
+                let legal = !is_refused_control(c);
+                let serde = serde_json::to_string(&c.to_string()).unwrap();
+                assert_eq!(accepts(prelude, &serde), legal, "{serde}");
+                for written in [
+                    format!(r#""\u{:04x}""#, c as u32),
+                    format!(r#""\u{:04X}""#, c as u32),
+                ] {
+                    let expected = legal && *unicode_escapes;
+                    assert_eq!(
+                        accepts(prelude, &written),
+                        expected,
+                        "{written}"
+                    );
+                }
+            }
+            assert!(!accepts(prelude, r#""\b""#));
+            assert!(!accepts(prelude, r#""\f""#));
+            assert!(accepts(prelude, r#""a\tb\nc\rd""#));
         }
     }
 

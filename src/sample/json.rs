@@ -275,9 +275,14 @@ impl JsonState {
                             }
                             _ => Some(StringState::Normal),
                         },
+                        // No `\b`/`\f`, and below no `\u` C0 escape but
+                        // tab, LF and CR: raw C0 is already refused, and
+                        // a model's escapes are no way around that
+                        // (cogito wrote 3,000 × `\u0010` into a comment).
                         StringState::AfterEscape => match b {
-                            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r'
-                            | b't' => Some(StringState::Normal),
+                            b'"' | b'\\' | b'/' | b'n' | b'r' | b't' => {
+                                Some(StringState::Normal)
+                            }
                             b'u' => Some(StringState::Hex(0)),
                             _ => return Err(JsonError::UnexpectedByte(b)),
                         },
@@ -285,12 +290,33 @@ impl JsonState {
                             if !is_hex(b) {
                                 return Err(JsonError::UnexpectedByte(b));
                             }
-                            if *idx == 3 {
-                                Some(StringState::Normal)
-                            } else {
-                                Some(StringState::Hex(*idx + 1))
+                            match (*idx, b) {
+                                (0, b'0') => Some(StringState::HexZeros(1)),
+                                (3, _) => Some(StringState::Normal),
+                                _ => Some(StringState::Hex(*idx + 1)),
                             }
                         }
+                        // Refused at the digit that decides it, so a C0
+                        // prefix is never a dead end: `\u001` would leave
+                        // no legal next byte.
+                        StringState::HexZeros(zeros) => match (*zeros, b) {
+                            (_, b) if !is_hex(b) => {
+                                return Err(JsonError::UnexpectedByte(b));
+                            }
+                            (1, b'0') => Some(StringState::HexZeros(2)),
+                            (1, _) => Some(StringState::Hex(2)),
+                            (_, b'0') => Some(StringState::HexWhitespace),
+                            (_, b'1') => {
+                                return Err(JsonError::UnexpectedByte(b));
+                            }
+                            (_, _) => Some(StringState::Hex(3)),
+                        },
+                        StringState::HexWhitespace => match b {
+                            b'9' | b'a' | b'A' | b'd' | b'D' => {
+                                Some(StringState::Normal)
+                            }
+                            _ => return Err(JsonError::UnexpectedByte(b)),
+                        },
                     };
                     if let Some(new_state) = next {
                         *state = new_state;
@@ -452,6 +478,10 @@ enum StringState {
     AfterEscape,
     /// Collecting \uXXXX; the u8 tracks the index of the next hex digit (0..=3).
     Hex(u8),
+    /// `\u` then this many `0`s (1 or 2): a C0 escape is still possible.
+    HexZeros(u8),
+    /// `\u000`: only tab, LF or CR may finish it.
+    HexWhitespace,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -695,7 +725,7 @@ mod tests {
             r#""hello""#,
             r#""with spaces""#,
             r#""\n""#,
-            r#""\"\\\/\b\f\n\r\t""#,
+            r#""\"\\\/\n\r\t""#, // no `\b`/`\f` (#141)
             r#""\u00AB""#,
             r#""\uD83D\uDE00""#,
             r#""unicode: café""#,
@@ -1140,6 +1170,23 @@ mod tests {
         let mut s = JsonState::new();
         feed_all(&mut s, input).expect("prefix should be legal JSON");
         s
+    }
+
+    #[test]
+    fn no_c0_control_by_escape() {
+        // #141: raw C0 was refused; its escapes now are too, but tab,
+        // LF and CR, at the digit that decides it.
+        assert!(accepts_complete(r#""a\tb\nc\rd""#));
+        assert!(accepts_complete(r#""\u0009\u000A\u000d""#));
+        assert!(accepts_complete(r#""\u0020\u00e9\u0100\u4e2d""#));
+        for refused in [r#""\b""#, r#""\f""#, r#""\u0010""#, r#""\u0000""#] {
+            assert!(!accepts_complete(refused), "{refused}");
+        }
+        // Never a dead end: `\u000` still has a legal next byte, and
+        // `\u001` is refused at the `1`.
+        assert!(accepts(&state_after(r#""\u000"#), "9"));
+        assert!(!accepts(&state_after(r#""\u00"#), "1"));
+        assert!(!accepts(&state_after(r#""\u000"#), "1"));
     }
 
     /// `in_free_region` is true exactly inside a string body proper —
