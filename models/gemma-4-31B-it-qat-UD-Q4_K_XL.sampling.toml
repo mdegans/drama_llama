@@ -33,6 +33,7 @@ t = 1.0
 ignored_categories = [
     "English",
     "Json",
+    "Markdown",
     "Punctuation",
 ]
 ignored = []

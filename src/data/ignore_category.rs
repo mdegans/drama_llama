@@ -14,6 +14,12 @@ pub enum IgnoreCategory {
     /// grammar allows multiple valid closures and repetition penalty on
     /// `}` would bias the walker toward extending rather than closing.
     Json,
+    /// Markdown code-fence tokens (`` ` ``, `` ``` `` and its newline-joined
+    /// spellings). A fence is framing, not prose: penalizing the closing
+    /// `` ``` `` when the model copies a fenced example from its prompt
+    /// pushed Qwen3.6 to `}` or `</antthi>` in its place, then end of turn
+    /// (3 of 4 draws; 0 of 4 with the penalty off, 2026-10-04).
+    Markdown,
     /// Numerals, and the lone space that introduces them. Every
     /// tokenizer probed (Qwen3.8, Gemma 4, Mistral Small 4, gpt-oss)
     /// spells ` 22` as a bare ` ` token followed by digit tokens
@@ -34,9 +40,10 @@ pub enum IgnoreCategory {
 }
 
 impl IgnoreCategory {
-    pub const ALL: [IgnoreCategory; 4] = [
+    pub const ALL: [IgnoreCategory; 5] = [
         IgnoreCategory::English,
         IgnoreCategory::Json,
+        IgnoreCategory::Markdown,
         IgnoreCategory::Numbers,
         IgnoreCategory::Punctuation,
     ];
@@ -45,6 +52,7 @@ impl IgnoreCategory {
         match self {
             IgnoreCategory::English => "English",
             IgnoreCategory::Json => "JSON",
+            IgnoreCategory::Markdown => "Markdown",
             IgnoreCategory::Numbers => "Numbers",
             IgnoreCategory::Punctuation => "Punctuation",
         }
@@ -54,6 +62,7 @@ impl IgnoreCategory {
         match self {
             IgnoreCategory::English => ENGLISH,
             IgnoreCategory::Json => JSON_SYNTAX,
+            IgnoreCategory::Markdown => MARKDOWN,
             IgnoreCategory::Numbers => NUMBERS,
             IgnoreCategory::Punctuation => PUNCTUATION,
         }
@@ -93,6 +102,12 @@ impl IgnoreCategory {
 /// JSON structural tokens. `"` is included so string-delimiter repetition
 /// across keys and values doesn't accumulate penalty.
 pub const JSON_SYNTAX: &[&str] = &["{", "}", "[", "]", ",", ":", "\""];
+
+/// Markdown code fences — see [`IgnoreCategory::Markdown`]. The
+/// newline-joined spellings are listed because tokenizers merge a fence
+/// with the line break around it.
+pub const MARKDOWN: &[&str] =
+    &["`", "``", "```", "\n```", "```\n", "\n```\n", "\n\n```"];
 
 /// Numerals and the bare space before them — see
 /// [`IgnoreCategory::Numbers`]. `into_tokens` adds every 1–3 digit
@@ -242,7 +257,8 @@ mod tests {
 
     #[test]
     fn all_contains_every_variant() {
-        assert_eq!(IgnoreCategory::ALL.len(), 4);
+        assert_eq!(IgnoreCategory::ALL.len(), 5);
+        assert!(IgnoreCategory::ALL.contains(&IgnoreCategory::Markdown));
         assert!(IgnoreCategory::ALL.contains(&IgnoreCategory::Numbers));
         assert!(IgnoreCategory::ALL.contains(&IgnoreCategory::English));
         assert!(IgnoreCategory::ALL.contains(&IgnoreCategory::Json));
@@ -265,6 +281,8 @@ mod tests {
         assert!(IgnoreCategory::Punctuation.words().contains(&"?"));
         assert!(IgnoreCategory::Numbers.words().contains(&" "));
         assert!(IgnoreCategory::Numbers.words().contains(&"7"));
+        assert!(IgnoreCategory::Markdown.words().contains(&"```"));
+        assert!(IgnoreCategory::Markdown.words().contains(&"\n```"));
     }
 
     #[test]

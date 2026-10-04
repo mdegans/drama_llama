@@ -303,11 +303,14 @@ impl Default for RepetitionOptions {
             // run-ons. Numbers likewise (#113): a number is a fact, and
             // every tokenizer we ship for spells it with a bare ` ` and
             // digit tokens that the whole context's numbers share.
+            // Markdown code fences too: penalizing the closing fence of a
+            // copied example broke Qwen3.6's answers.
             // Users can override by calling
             // `set_ignored_categories(vec![])`.
             ignored_categories: BTreeSet::from([
                 IgnoreCategory::English,
                 IgnoreCategory::Json,
+                IgnoreCategory::Markdown,
                 IgnoreCategory::Numbers,
                 IgnoreCategory::Punctuation,
             ]),

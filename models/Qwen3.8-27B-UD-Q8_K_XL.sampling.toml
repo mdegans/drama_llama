@@ -25,7 +25,7 @@ p = 0.9
 min_keep = 3
 
 [repetition]
-ignored_categories = ["English", "Json", "Numbers", "Punctuation"]
+ignored_categories = ["English", "Json", "Markdown", "Numbers", "Punctuation"]
 ignored = []
 # Known-id exemption: a token that faithfully copies one of these from
 # the prompt is never penalized. Multi-word ids work across spaces
