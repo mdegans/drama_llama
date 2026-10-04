@@ -8318,13 +8318,13 @@ impl<B: Backend> Session<B> {
             }
         };
         // A call repeating an earlier one in this turn is dropped (see
-        // `TurnCalls`) — only a complete one: a trailing call a cut
-        // (`max_tokens`, a stop sequence) left holds only its completed
-        // members, so it may match a call it would not have, and it
-        // comes back cut, as on Anthropic. Streaming drops the same
-        // calls (`BlockStream`).
+        // `TurnCalls`) — but not from a cut turn (`max_tokens`, a stop
+        // sequence): no client dispatches its calls, and its repeats are
+        // the loop signature blallama resamples on. Dropped, they hid a
+        // 16k-token loop of 259 repeated calls (cogito, 2026-10-04).
+        // Streaming drops the same calls (`BlockStream`).
         let (mut blocks, dropped_repeat) =
-            drop_repeated_calls(blocks, cut.is_some() || in_flight);
+            drop_repeats_unless_cut(blocks, cut.is_some(), in_flight);
         // No whitespace-only text block reaches a client: Anthropic never
         // returns one, and rejects one on ingest. The parse folds such a
         // run into the thought before it, or drops it
@@ -9897,6 +9897,20 @@ impl TurnCalls {
 /// repeat an earlier one, and whether any were dropped. `cut_last`: the
 /// last block may be a call the turn's cut left, so it is not judged.
 /// Prose either side of a dropped call is re-merged.
+/// [`drop_repeated_calls`] for a finished turn; a cut one keeps every
+/// call, repeats included, as its loop evidence.
+fn drop_repeats_unless_cut(
+    blocks: Vec<crate::Block>,
+    cut: bool,
+    in_flight: bool,
+) -> (Vec<crate::Block>, bool) {
+    if cut {
+        (blocks, false)
+    } else {
+        drop_repeated_calls(blocks, in_flight)
+    }
+}
+
 fn drop_repeated_calls(
     blocks: Vec<crate::Block>,
     cut_last: bool,
@@ -17219,6 +17233,24 @@ mod tests {
     /// any other difference is (a different tool, a different value, a
     /// number spelled differently). Prose either side of a dropped call
     /// re-merges.
+    #[test]
+    fn a_cut_turn_keeps_its_repeated_calls() {
+        // The loop signature blallama resamples on: a cut turn's
+        // repeats must survive to it (cogito, 2026-10-04: a 16k-token
+        // loop hid behind 259 dropped repeats).
+        use crate::prompt::ToolUse;
+        let vote =
+            || crate::Block::from(ToolUse::new("vote", serde_json::json!({})));
+        let blocks = vec![vote(), vote(), vote()];
+        assert_eq!(
+            drop_repeats_unless_cut(blocks.clone(), true, false),
+            (blocks.clone(), false),
+        );
+        let (kept, dropped) = drop_repeats_unless_cut(blocks, false, false);
+        assert!(dropped);
+        assert_eq!(kept, vec![vote()]);
+    }
+
     #[test]
     fn drop_repeated_calls_compares_name_and_input_value() {
         use crate::prompt::ToolUse;
