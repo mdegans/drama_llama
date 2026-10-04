@@ -123,6 +123,14 @@ pub struct SamplerState {
     /// serialization rationale as [`Self::constrained_ngram_stats`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) constrained_step: u64,
+    /// Client tool calls the [`SamplerConfig::tool_call_cap`] grammar has
+    /// completed this turn, repeats included. Counted only under a cap,
+    /// so it stays `0` without one. Turn-local like the matchers it
+    /// reads: [`Self::reset_constraints`] zeroes it, and
+    /// [`Self::resumed_from`] carries it only with the matcher it
+    /// counts.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) tool_calls: u32,
 }
 
 impl SamplerState {
@@ -412,6 +420,60 @@ impl SamplerState {
         })
     }
 
+    /// Client tool calls completed this turn under the config's
+    /// [`ToolCallCap`](crate::ToolCallCap) (see the field docs).
+    pub fn tool_calls(&self) -> u32 {
+        self.tool_calls
+    }
+
+    /// Whether the cap's grammar sits between calls: a call has just
+    /// completed, and the grammar either accepts as it stands or needs
+    /// only the cap's `close` to. Inside a call — a string body
+    /// included, where `close` is content — it never does, so each call
+    /// crosses into this once, as it completes. `false` while the
+    /// grammar is not this call's or a deferred one sleeps.
+    fn between_calls(
+        &self,
+        config: &SamplerConfig,
+        cap: &crate::ToolCallCap,
+    ) -> bool {
+        let eager = config.modes.iter().zip(&self.matchers).find_map(
+            |(mode, matcher)| match (mode, matcher) {
+                (
+                    SamplingMode::Grammar(compiled),
+                    MatcherState::Grammar { grammar, stack },
+                ) if *grammar == cap.grammar => {
+                    Some((&*compiled.grammar, stack))
+                }
+                _ => None,
+            },
+        );
+        let deferred = || {
+            self.deferred
+                .as_ref()
+                .zip(config.deferred_grammar.as_ref())
+                .filter(|(d, _)| d.active && d.grammar == cap.grammar)
+                .map(|(d, spec)| (&*spec.grammar.grammar, &d.matcher))
+        };
+        eager.or_else(deferred).is_some_and(|(grammar, stack)| {
+            stack.is_complete()
+                || (!cap.close.is_empty()
+                    && stack.completes_with(grammar, &cap.close))
+        })
+    }
+
+    /// The config's [`ToolCallCap`](crate::ToolCallCap) once this turn
+    /// has made its `max` calls and the grammar sits after the last of
+    /// them: the next token must end the turn.
+    pub(crate) fn tool_call_cap_reached<'c>(
+        &self,
+        config: &'c SamplerConfig,
+    ) -> Option<&'c crate::ToolCallCap> {
+        config.tool_call_cap.as_ref().filter(|cap| {
+            self.tool_calls >= cap.max.get() && self.between_calls(config, cap)
+        })
+    }
+
     /// The repetition-penalty n-gram accumulator (read-only
     /// observability — probes and tests compare fold results;
     /// [`crate::NGramStats`] derives `PartialEq` for exactly that).
@@ -473,6 +535,12 @@ impl SamplerState {
         model: &M,
     ) {
         debug_assert_eq!(self.matchers.len(), config.modes.len());
+        // A call completes on the token that carries its grammar into
+        // `between_calls`.
+        let was_between = config
+            .tool_call_cap
+            .as_ref()
+            .map(|cap| self.between_calls(config, cap));
         let mut buf: Vec<u8> = Vec::new();
         let mut computed = false;
         let piece = |buf: &mut Vec<u8>, computed: &mut bool| {
@@ -504,6 +572,13 @@ impl SamplerState {
             if d.active {
                 piece(&mut buf, &mut computed);
                 let _ = d.matcher.advance_bytes(&spec.grammar.grammar, &buf);
+            }
+        }
+        if let (Some(false), Some(cap)) =
+            (was_between, config.tool_call_cap.as_ref())
+        {
+            if self.between_calls(config, cap) {
+                self.tool_calls = self.tool_calls.saturating_add(1);
             }
         }
     }
@@ -598,12 +673,27 @@ impl SamplerState {
             // See the field docs.
             constrained_ngram_stats: NGramStats::default(),
             constrained_step: 0,
+            // Carried only with the matcher it counts: the tally is
+            // the turn's whose position that matcher holds.
+            tool_calls: config
+                .tool_call_cap
+                .as_ref()
+                .filter(|cap| {
+                    cached.matchers.iter().any(|m| {
+                        matches!(m, MatcherState::Grammar { grammar, .. }
+                            if *grammar == cap.grammar)
+                    }) || cached
+                        .deferred
+                        .as_ref()
+                        .is_some_and(|d| d.grammar == cap.grammar)
+                })
+                .map_or(0, |_| cached.tool_calls),
         }
     }
 
     /// Reset every constraint matcher (eager, JSON, deferred) to its
-    /// grammar's root, keeping the stream fields (`mu`, rng, n-gram
-    /// stats, `step`) intact.
+    /// grammar's root, and the tool-call tally with them, keeping the
+    /// stream fields (`mu`, rng, n-gram stats, `step`) intact.
     ///
     /// [`resumed_from`](Self::resumed_from) carries matcher positions
     /// whenever the grammar identity matches, which is correct only
@@ -639,6 +729,7 @@ impl SamplerState {
                     grammar: spec.grammar.source_hash(),
                     matcher: spec.grammar.root_state(),
                 });
+        self.tool_calls = 0;
     }
 
     /// Read-only: would `token`'s piece bring any incomplete

@@ -10,6 +10,12 @@
 
 lazy_grammar = true
 banned_specials = []
+# Hard cap on client tool calls per turn. Cogito escalated parallel
+# calls (1, then 3, then 60 a turn) into loops that ran to max_tokens
+# (16k tokens, 31 min; 2026-10-04). Asking for at most three in the
+# template is a soft limit; this is the hard one: once the third call
+# completes, the sampler ends the turn on the model's own <|im_end|>.
+max_tool_calls_per_turn = 3
 
 [[modes]]
 

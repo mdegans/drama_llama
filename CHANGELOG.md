@@ -1487,6 +1487,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A hard per-turn cap on client tool calls** (`ToolCallCap`). The
+  per-model sampling sidecar's `max_tool_calls_per_turn` sets it, as
+  does `Session::with_max_tool_calls_per_turn`. A request's
+  `tool_choice.disable_parallel_tool_use` caps the turn at one, and the
+  tighter cap wins. The sampler counts every call the tool-call grammar
+  completes, repeats included, so a loop of one call meets the cap too.
+  Once the last allowed call completes, it ends the turn on the model's
+  own end of generation, the likeliest one the grammar admits. The KV
+  and the re-render then agree, and the turn reports `tool_use` on the
+  batch and streaming paths alike. The cap is logged at `WARN`
+  (`event = "tool_call_cap"`, `cap`, `source`). cogito's tracked
+  sidecar sets 3: it escalated parallel calls into loops that ran to
+  `max_tokens` (16k tokens, 31 minutes, 2026-10-04).
 - **`PrefixCacheConfig::adopt_emitted_tokens`** (default `true`): the
   switch for the fix above. Its one behaviour change is that a warm
   call can read a turn in the model's own split where a cold session

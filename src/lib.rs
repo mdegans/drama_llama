@@ -27,7 +27,8 @@ pub use sample::{
     grammar_stats_snapshot, CompiledGrammar, DeferredGrammar, Grammar,
     GrammarError, GrammarState, GrammarStats, IdPattern, JsonError, JsonState,
     Mirostat, RepetitionError, RepetitionOptions, SamplerConfig, SamplerState,
-    SamplingMode, SamplingParams, ThoughtSpecials,
+    SamplingMode, SamplingParams, ThoughtSpecials, ToolCallCap,
+    ToolCallCapSource,
 };
 
 pub mod backend;

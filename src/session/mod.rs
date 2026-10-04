@@ -4239,6 +4239,19 @@ impl<B: Backend> Session<B> {
         self
     }
 
+    /// Cap the client tool calls one turn may make, as the sidecar's
+    /// `max_tool_calls_per_turn` does
+    /// ([`SamplerConfig::max_tool_calls_per_turn`]); `None` lifts it.
+    /// A request's `disable_parallel_tool_use` still caps a turn at one.
+    /// See [`ToolCallCap`](crate::ToolCallCap).
+    pub fn with_max_tool_calls_per_turn(
+        mut self,
+        max: Option<std::num::NonZeroU32>,
+    ) -> Self {
+        self.sample_options.max_tool_calls_per_turn = max;
+        self
+    }
+
     /// Override the tool-call dialect derived from the chat template
     /// at load. The dialect is the single source of truth for the
     /// tool-call grammar *and* the completion parser, so an override
@@ -4601,6 +4614,16 @@ impl<B: Backend> Session<B> {
             rep.with_known_ids(known)
         });
 
+        let max_tool_calls_per_turn =
+            self.sample_options.max_tool_calls_per_turn;
+        let tool_call_cap = tool_call_cap_for(
+            prompt,
+            &self.dialect,
+            max_tool_calls_per_turn,
+            &modes,
+            deferred_grammar.as_ref(),
+        );
+
         predict_opts.sample_options = SamplerConfig {
             modes,
             repetition,
@@ -4609,6 +4632,8 @@ impl<B: Backend> Session<B> {
             banned_specials,
             banned_specials_constrained,
             thought,
+            max_tool_calls_per_turn,
+            tool_call_cap,
         };
         Ok(predict_opts)
     }
@@ -9095,6 +9120,62 @@ fn effective_tool_syntax(
     let mut fallback = crate::CallSyntax::hermes_json();
     fallback.reasoning = dialect.reasoning.clone();
     Cow::Owned(fallback)
+}
+
+/// The call's [`ToolCallCap`](crate::ToolCallCap): the tighter of the
+/// request's `disable_parallel_tool_use` (one call, as on Anthropic) and
+/// the model's `sidecar` cap, counted on the tool-call grammar this call
+/// compiled — the eager one `modes` leads with for `Any` / `Method`, the
+/// lazy `deferred` one for `Auto`. `None` when neither cap is set, or no
+/// grammar constrains the calls (an `output_config` holds the deferred
+/// slot, a trigger-less dialect has no lazy grammar): nothing counts
+/// them there.
+fn tool_call_cap_for(
+    prompt: &Prompt,
+    dialect: &crate::CallSyntax,
+    sidecar: Option<std::num::NonZeroU32>,
+    modes: &[SamplingMode],
+    deferred: Option<&crate::DeferredGrammar>,
+) -> Option<crate::ToolCallCap> {
+    let request = match prompt.tool_choice.as_ref() {
+        Some(
+            ToolChoice::Auto {
+                disable_parallel_tool_use: true,
+                ..
+            }
+            | ToolChoice::Any {
+                disable_parallel_tool_use: true,
+                ..
+            }
+            | ToolChoice::Method {
+                disable_parallel_tool_use: true,
+                ..
+            },
+        ) => Some(std::num::NonZeroU32::MIN),
+        _ => None,
+    };
+    let (max, source) = crate::ToolCallCap::effective(request, sidecar)?;
+    let grammar = match prompt.tool_choice.as_ref() {
+        Some(ToolChoice::Any { .. } | ToolChoice::Method { .. }) => {
+            modes.iter().find_map(|mode| match mode {
+                SamplingMode::Grammar(compiled) => Some(compiled),
+                _ => None,
+            })
+        }
+        Some(ToolChoice::None) => None,
+        None | Some(ToolChoice::Auto { .. }) => deferred
+            .filter(|_| crate::output_config::structured(prompt).is_none())
+            .map(|d| &d.grammar),
+    }?;
+    // What the grammar matches after the last call (`dialect::emit`'s
+    // `calls` rule): the section close, then any exit marker. Harmony's
+    // call ends its grammar.
+    let syntax = effective_tool_syntax(dialect);
+    let close = match syntax.family {
+        crate::dialect::Family::Harmony => String::new(),
+        _ => format!("{}{}", syntax.section_end, syntax.tool_response_start),
+    };
+    Some(crate::ToolCallCap::new(max, source, grammar, close))
 }
 
 /// Compile the eager (`Any` / `Method`) tool-call grammar for
@@ -17149,6 +17230,158 @@ mod tests {
             assert_eq!(stream.open_call_json(), None);
         });
         assert_eq!(dropped_calls(&events), [(tracing::Level::WARN, "vote")],);
+    }
+
+    /// The `tool_call_cap` events in `events`: `(cap, source)`.
+    fn cap_events(
+        events: &[(tracing::Level, Vec<(String, String)>)],
+    ) -> Vec<(&str, &str)> {
+        events
+            .iter()
+            .filter(|(_, f)| field(f, "event") == Some("tool_call_cap"))
+            .map(|(_, f)| {
+                (
+                    field(f, "cap").unwrap_or(""),
+                    field(f, "source").unwrap_or(""),
+                )
+            })
+            .collect()
+    }
+
+    /// Four different `vote` calls in a row, the model wanting more.
+    fn four_votes() -> Vec<serde_json::Value> {
+        ["7ad26ccd", "1f2e3d4c", "0a0b0c0d", "deadbeef"]
+            .map(|id| serde_json::json!({ "post_id": id }))
+            .to_vec()
+    }
+
+    /// A sidecar cap of two ends a turn that would make four calls after
+    /// its second, on the model's own EOG: both paths return the first
+    /// two as a `tool_use` turn, the cap is logged, and the turn keeps
+    /// its tip — its KV holds exactly the calls returned, as after any
+    /// natural last call.
+    #[test]
+    fn the_tool_call_cap_ends_the_turn_on_both_paths() {
+        use misanthropic::response::StopReason;
+        let inputs = four_votes();
+        let capped = || {
+            scripted_votes(&inputs)
+                .with_max_tool_calls_per_turn(NonZeroU32::new(2))
+        };
+        let prompt = vote_prompt();
+
+        let mut session = capped();
+        let mut response = None;
+        let events = capture_events(|| {
+            response =
+                Some(session.complete_response(&prompt).expect("complete"));
+        });
+        let response = response.unwrap();
+        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        let message: crate::prompt::Message = response.inner.into();
+        assert_eq!(call_inputs(&message.content.0), [&inputs[0], &inputs[1]]);
+        assert_eq!(cap_events(&events), [("2", "sidecar")]);
+        assert!(tip_of(&session).is_some(), "the turn is cache-stable");
+
+        let mut session = capped();
+        let events = capture_events(|| {
+            let mut stream = session.complete_stream(&prompt).expect("stream");
+            let streamed: Vec<crate::Block> = stream.by_ref().collect();
+            assert_eq!(call_inputs(&streamed), [&inputs[0], &inputs[1]]);
+            assert_eq!(stream.stop_reason(), Some((StopReason::ToolUse, None)));
+            assert_eq!(stream.open_call_json(), None);
+        });
+        assert_eq!(cap_events(&events), [("2", "sidecar")]);
+
+        // Uncapped, the same turn makes all four calls.
+        let mut session = scripted_votes(&inputs);
+        let mut blocks = None;
+        let events = capture_events(|| {
+            blocks = Some(session.complete_blocks(&prompt).expect("complete"));
+        });
+        assert_eq!(call_inputs(&blocks.unwrap()).len(), 4);
+        assert!(cap_events(&events).is_empty());
+    }
+
+    /// A loop of one call meets the cap like any other calls: the
+    /// repeats count as they complete, so the loop ends at the cap,
+    /// and only then are they dropped.
+    #[test]
+    fn a_repeat_loop_meets_the_tool_call_cap() {
+        let input = serde_json::json!({ "post_id": "7ad26ccd" });
+        let mut session = scripted_votes(&vec![input.clone(); 5])
+            .with_max_tool_calls_per_turn(NonZeroU32::new(3));
+        let mut response = None;
+        let events = capture_events(|| {
+            response = Some(
+                session.complete_response(&vote_prompt()).expect("complete"),
+            );
+        });
+        let response = response.unwrap();
+        assert_eq!(
+            response.stop_reason,
+            Some(misanthropic::response::StopReason::ToolUse),
+        );
+        let message: crate::prompt::Message = response.inner.into();
+        assert_eq!(call_inputs(&message.content.0), [&input]);
+        assert_eq!(cap_events(&events), [("3", "sidecar")]);
+        assert_eq!(dropped_calls(&events).len(), 2, "the cap's two repeats");
+    }
+
+    /// The cap a call gets: the request's `disable_parallel_tool_use` is
+    /// one call, the sidecar's is its own, the tighter wins (the
+    /// request's on a tie), and either counts on the tool grammar the
+    /// call compiled — the eager one for a forced call, the lazy one for
+    /// `Auto`. Neither set, or no tool grammar (an output_config holds
+    /// the slot), is no cap.
+    #[test]
+    fn tool_call_cap_for_folds_request_and_sidecar() {
+        let dialect = per_call_json();
+        let limits = crate::SchemaLimits::default();
+        let with_choice = |choice: Option<ToolChoice>| Prompt {
+            tool_choice: choice,
+            ..vote_prompt()
+        };
+        let cap = |prompt: &Prompt, sidecar: Option<u32>| {
+            let eager =
+                dialect_grammar_for_prompt(prompt, &dialect, false, &limits)
+                    .expect("compiles");
+            let lazy =
+                dialect_deferred_grammar_for_prompt(prompt, &dialect, &limits)
+                    .expect("compiles");
+            let modes: Vec<SamplingMode> = eager.into_iter().collect();
+            tool_call_cap_for(
+                prompt,
+                &dialect,
+                sidecar.and_then(NonZeroU32::new),
+                &modes,
+                lazy.as_ref(),
+            )
+            .map(|cap| (cap.max.get(), cap.source.as_str()))
+        };
+        let auto = |disable| {
+            with_choice(Some(ToolChoice::Auto {
+                disable_parallel_tool_use: disable,
+            }))
+        };
+        let any = |disable| {
+            with_choice(Some(ToolChoice::Any {
+                disable_parallel_tool_use: disable,
+            }))
+        };
+        assert_eq!(cap(&with_choice(None), None), None);
+        assert_eq!(cap(&auto(false), None), None);
+        assert_eq!(cap(&with_choice(None), Some(3)), Some((3, "sidecar")));
+        assert_eq!(cap(&auto(true), None), Some((1, "request")));
+        assert_eq!(cap(&auto(true), Some(3)), Some((1, "request")));
+        assert_eq!(cap(&any(true), Some(1)), Some((1, "request")));
+        assert_eq!(cap(&any(false), Some(3)), Some((3, "sidecar")));
+        assert_eq!(cap(&with_choice(Some(ToolChoice::None)), Some(3)), None);
+        let structured = auto(false).json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"type": "integer"}},
+        }));
+        assert_eq!(cap(&structured, Some(3)), None);
     }
 
     /// Cut `vote` calls with `inputs` short `tail` bytes before their

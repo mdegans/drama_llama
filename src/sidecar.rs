@@ -74,6 +74,13 @@
 //!   [`SamplingMode::Mirostat`](crate::SamplingMode::Mirostat), etc.)
 //! - `repetition` — `Some(RepetitionOptions)` to enable, `None` to
 //!   disable.
+//! - `max_tool_calls_per_turn` — the most client tool calls one turn
+//!   may make ([`SamplerConfig::max_tool_calls_per_turn`]); absent is
+//!   unlimited. The sampler ends a turn on the model's own EOG once its
+//!   last call completes ([`ToolCallCap`](crate::ToolCallCap)), and a
+//!   request's `disable_parallel_tool_use` still caps it at one. Never
+//!   seeded: a model that loops on parallel calls is found in service,
+//!   so the key is added by hand (`models/cogito-32b.sampling.toml`).
 //!
 //! Excluded:
 //! - `deferred_grammar` — runtime per-request state, `#[serde(skip)]`.
@@ -570,6 +577,56 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The tool-call cap reads from the sidecar beside the rest of the
+    /// config; absent is no cap, and a cap of zero calls is refused
+    /// (`tool_choice: none` is how a turn makes none). It is never
+    /// written unless set, so a seeded sidecar does not gain the key.
+    #[test]
+    fn max_tool_calls_per_turn_parses() {
+        let dir = tempfile_dir();
+        let path = dir.join("sampling.toml");
+
+        std::fs::write(&path, "modes = []\nmax_tool_calls_per_turn = 3\n")
+            .unwrap();
+        let loaded = load_sample_options(&path).unwrap().expect("written");
+        assert_eq!(
+            loaded.max_tool_calls_per_turn,
+            std::num::NonZeroU32::new(3)
+        );
+        assert_eq!(loaded.tool_call_cap, None, "runtime wiring only");
+
+        std::fs::write(&path, "modes = []\n").unwrap();
+        let loaded = load_sample_options(&path).unwrap().expect("written");
+        assert_eq!(loaded.max_tool_calls_per_turn, None);
+
+        std::fs::write(&path, "modes = []\nmax_tool_calls_per_turn = 0\n")
+            .unwrap();
+        assert!(matches!(
+            load_sample_options(&path),
+            Err(SidecarError::Parse { .. })
+        ));
+
+        write_sample_options(&path, &SamplerConfig::default(), false).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("max_tool_calls_per_turn"), "{raw}");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The tracked sidecar cogito serves with caps its calls: it escalated
+    /// parallel calls into loops that ran to `max_tokens` (2026-10-04).
+    #[test]
+    fn cogito_sidecar_caps_tool_calls() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("models/cogito-32b.sampling.toml");
+        let loaded = load_sample_options(&path).unwrap().expect("tracked");
+        assert_eq!(
+            loaded.max_tool_calls_per_turn,
+            std::num::NonZeroU32::new(3)
+        );
     }
 
     /// Malformed TOML reports a Parse error tagged with the path.

@@ -335,7 +335,7 @@ pub fn compile_output_config(
 /// as a format request failed every effort-only request with
 /// [`OutputConfigError::UnsupportedFormat`] (the first Agora run with
 /// `thinking_effort`, 2026-09-23).
-fn structured(prompt: &Prompt) -> Option<&OutputConfig> {
+pub(crate) fn structured(prompt: &Prompt) -> Option<&OutputConfig> {
     prompt
         .output_config
         .as_ref()
