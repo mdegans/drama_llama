@@ -57,6 +57,50 @@ pub(crate) struct DeferredMatcher {
     pub(crate) matcher: StackState,
 }
 
+/// The constraint half of a [`SamplerState`] at one step: what the
+/// predictor's escaped-closer repair rewinds to (see
+/// [`SamplerState::constraint_mark`]). The rest of the state — the
+/// RNG, `mu`, the repetition stats — runs on through a rewind: a
+/// redraw is a fresh draw, and the rolled-back tokens' pressure on the
+/// stats is a handful of tokens' worth.
+#[derive(Clone, Debug)]
+pub(crate) struct ConstraintMark {
+    matchers: Vec<MatcherState>,
+    deferred: Option<DeferredMatcher>,
+    tool_calls: u32,
+}
+
+impl ConstraintMark {
+    /// Whether feeding `bytes` from this mark brings every active
+    /// constraint (eager matchers and an activated deferred grammar)
+    /// to its accept state.
+    pub(crate) fn completes_with(
+        &self,
+        config: &SamplerConfig,
+        bytes: &[u8],
+    ) -> bool {
+        let modes = config.modes.iter().zip(&self.matchers).all(
+            |(mode, matcher)| match (mode, matcher) {
+                (
+                    SamplingMode::Grammar(compiled),
+                    MatcherState::Grammar { stack, .. },
+                ) => stack.completes_with(&compiled.grammar, bytes),
+                (SamplingMode::Json, MatcherState::Json(s)) => {
+                    s.completes_with(bytes)
+                }
+                _ => true,
+            },
+        );
+        modes
+            && match (&self.deferred, &config.deferred_grammar) {
+                (Some(d), Some(spec)) if d.active => {
+                    d.matcher.completes_with(&spec.grammar.grammar, bytes)
+                }
+                _ => true,
+            }
+    }
+}
+
 /// Everything a generation call mutates while sampling. See the module
 /// docs for the purity contract.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -730,6 +774,24 @@ impl SamplerState {
                     matcher: spec.grammar.root_state(),
                 });
         self.tool_calls = 0;
+    }
+
+    /// The matcher positions, as [`Self::rewind_constraints`] takes
+    /// them back.
+    pub(crate) fn constraint_mark(&self) -> ConstraintMark {
+        ConstraintMark {
+            matchers: self.matchers.clone(),
+            deferred: self.deferred.clone(),
+            tool_calls: self.tool_calls,
+        }
+    }
+
+    /// Put the matchers back where `mark` found them. Only the
+    /// constraint half moves (see [`ConstraintMark`]).
+    pub(crate) fn rewind_constraints(&mut self, mark: ConstraintMark) {
+        self.matchers = mark.matchers;
+        self.deferred = mark.deferred;
+        self.tool_calls = mark.tool_calls;
     }
 
     /// Read-only: would `token`'s piece bring any incomplete

@@ -7983,22 +7983,26 @@ impl<B: Backend> Session<B> {
                 Some(initial_state),
             )
         }
-        .with_reserved(reserved);
+        .with_reserved(reserved)
+        .with_closer_repair();
         if cache_on {
             let head = predictor.checkpoint_head();
             debug_assert_eq!(Some(head), turn_head, "turn anchor off the head");
         }
+        let filter = stop::StopFilter::new(
+            crate::dialect::StreamParser::new(
+                syntax,
+                tools,
+                pre_opened_reasoning,
+            )
+            .with_provenance(provenance),
+            stop::request_stops(prompt),
+        );
         Ok(BlockStream {
             predictor,
-            filter: stop::StopFilter::new(
-                crate::dialect::StreamParser::new(
-                    syntax,
-                    tools,
-                    pre_opened_reasoning,
-                )
-                .with_provenance(provenance),
-                stop::request_stops(prompt),
-            ),
+            fresh: filter.clone(),
+            filter,
+            pieces: Vec::new(),
             pending: std::collections::VecDeque::new(),
             prose_run: ProseRun::default(),
             eos_pieces,
@@ -8091,12 +8095,6 @@ impl<B: Backend> Session<B> {
             &breakpoint_ids,
         );
 
-        // Collect generated pieces + count tokens inline. The
-        // concatenated raw-text buffer feeds the dialect parser after
-        // generation and stop-sequence matching post-hoc.
-        let mut generated_count: usize = 0;
-        let mut raw_text = String::new();
-
         // When the diagnostic is on, also capture the (token_id,
         // piece) pair for every emission. Empty pieces (the smoking
         // gun for stuck-on-special-token loops) are otherwise
@@ -8105,32 +8103,11 @@ impl<B: Backend> Session<B> {
         let collect_token_dump = tracing::enabled!(tracing::Level::DEBUG);
         #[cfg(not(feature = "axum"))]
         let collect_token_dump = false;
-        let mut token_dump: Vec<(Token, String)> = Vec::new();
 
         // When prefix caching is on, capture every recorded token ID
         // (no EOS filter — we want the recorded-but-uncommitted EOS
         // for the auto-tip extension; see `compute_tip_extension`).
         let cache_on = self.prefix_cache.is_some();
-        // Only populated when caching is on (see above); starts empty
-        // either way.
-        let mut generated_tokens: Vec<Token> = Vec::new();
-        // Bytes the FINAL loop iteration contributed to `raw_text` —
-        // the piece of the recorded-but-uncommitted token, which is
-        // the one token sitting past the KV head when the loop exits
-        // (see [`tip_extension`]). Zero when the turn ended on a stop
-        // token, because `eos_pieces` drops that piece before
-        // `raw_text` grows; NON-zero when the grammar reached accept
-        // or the budget ran out, because then the last sampled token
-        // is surfaced content that the next turn's re-render
-        // reproduces. Overwritten every iteration, so on exit it
-        // describes the last one.
-        let mut uncommitted_bytes: usize = 0;
-        // `raw_text` with every reserved piece the model *spelled* in
-        // ordinary tokens marked: what the dialect parser reads, so only
-        // framing emitted as a real reserved token is structure (see
-        // `Provenance`). The parse is restored before anything sees it.
-        let mut provenance = self.provenance();
-        let mut marked_text = String::new();
 
         // The parse dialect and tool schemas: the request's stop
         // sequences are matched against the text output they parse to
@@ -8143,7 +8120,7 @@ impl<B: Backend> Session<B> {
             .cloned()
             .collect();
         let stops = stop::request_stops(prompt);
-        let mut stop_filter = (!stops.is_empty()).then(|| {
+        let stop_filter = (!stops.is_empty()).then(|| {
             stop::StopFilter::new(
                 crate::dialect::StreamParser::new(
                     parse_syntax.clone(),
@@ -8154,6 +8131,17 @@ impl<B: Backend> Session<B> {
                 stops.clone(),
             )
         });
+        // Collect generated pieces + count tokens inline (see
+        // `Emission`). The concatenated raw-text buffer feeds the
+        // dialect parser after generation and stop-sequence matching
+        // post-hoc.
+        let mut emission = Emission::new(
+            self.provenance(),
+            stop_filter,
+            eos_pieces,
+            cache_on,
+            collect_token_dump,
+        );
 
         let reserved = self.literals.neutralizer.clone();
         let mut predictor = if self.prefix_cache.is_some() {
@@ -8176,39 +8164,22 @@ impl<B: Backend> Session<B> {
                 Some(initial_state),
             )
         }
-        .with_reserved(reserved);
+        .with_reserved(reserved)
+        .with_closer_repair();
         let turn_head = cache_on.then(|| predictor.checkpoint_head());
 
         while let Some(piece) = predictor.next() {
-            if collect_token_dump {
-                let token = predictor.last_token().unwrap_or(-1);
-                token_dump.push((token, piece.clone()));
+            // The escaped-closer repair rolled back before this piece:
+            // nothing has left the session, so the emission follows.
+            if let Some(rewind) = predictor.rewound() {
+                emission.rewind(rewind.tokens);
             }
-            if cache_on {
-                let token = predictor.last_token().unwrap_or(-1);
-                if token >= 0 {
-                    generated_tokens.push(token);
-                }
-            }
-            if eos_pieces.contains(&piece) {
-                // Framing, not content: absent from `raw_text`, so the
-                // canonical tail starts at the turn close.
-                uncommitted_bytes = 0;
-                continue;
-            }
-            generated_count += 1;
-            raw_text.push_str(&piece);
-            uncommitted_bytes = piece.len();
-            let token = predictor.last_token();
-            marked_text.push_str(&provenance.push(&piece, token));
-
-            // A stop sequence in client-visible text ends the turn
-            // (#122).
-            if let Some(filter) = stop_filter.as_mut() {
-                filter.push(&piece, token);
-                if filter.hit().is_some() {
-                    break;
-                }
+            match emission.push(piece, predictor.last_token()) {
+                // A stop sequence in client-visible text ends the turn
+                // (#122).
+                Taken::Stopped => break,
+                Taken::Framing => continue,
+                Taken::Content => {}
             }
 
             // Break early if any active grammar / json matcher has
@@ -8236,6 +8207,18 @@ impl<B: Backend> Session<B> {
                 break;
             }
         }
+        log_closer_repair(predictor.closer_repair());
+        let Emission {
+            raw_text,
+            mut marked_text,
+            mut provenance,
+            mut stop_filter,
+            generated_count,
+            generated_tokens,
+            token_dump,
+            uncommitted_bytes,
+            ..
+        } = emission;
         // Capture the incomplete-at-end violation signal and the final
         // sampler state (tip promotion) before the predictor drops.
         let constraint_incomplete = predictor.constraint_incomplete_at_end();
@@ -10124,6 +10107,11 @@ pub struct BlockStream<'engine, B: Backend> {
     /// stream's lifetime), with the request's stop sequences matched
     /// against the text it releases (#122).
     filter: stop::StopFilter,
+    /// `filter` as built: a rollback replays [`Self::pieces`] into a
+    /// clone of it.
+    fresh: stop::StopFilter,
+    /// Every content piece pushed into `filter`, and its token.
+    pieces: Vec<(String, Option<crate::Token>)>,
     pending: std::collections::VecDeque<crate::Block>,
     /// Keeps a whitespace-only run of text yields from the client.
     prose_run: ProseRun,
@@ -10216,9 +10204,25 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
         self.pending.extend(admitted);
     }
 
+    /// Mirror a rollback of the predictor's last `tokens` tokens (the
+    /// escaped-closer repair). The predictor rolls back only past what
+    /// the filter has released (`PiecePredictor::settle`), so the
+    /// filter rebuilt from the pieces that stay releases nothing that
+    /// was not already admitted: its yields are dropped.
+    fn rewind(&mut self, tokens: usize) {
+        self.pieces
+            .truncate(self.pieces.len().saturating_sub(tokens));
+        self.filter = self.fresh.clone();
+        for (piece, token) in &self.pieces {
+            let _ = self.filter.push(piece, *token);
+        }
+        self.generated = self.pieces.len();
+    }
+
     /// End of generation: flush, pick the leniency, settle the ending.
     fn drain(&mut self) {
         self.drained = true;
+        log_closer_repair(self.predictor.closer_repair());
         let budget = Cut::of(&self.predictor);
         // Final pass. Cut short: an incomplete trailing call comes back
         // cut short (`Leniency::Clipped`). Otherwise partial trailing
@@ -10296,14 +10300,25 @@ impl<'engine, B: Backend> Iterator for BlockStream<'engine, B> {
             }
             match self.predictor.next() {
                 Some(piece) => {
+                    if let Some(rewind) = self.predictor.rewound() {
+                        self.rewind(rewind.tokens);
+                    }
                     // Skip the sentinel pieces — they aren't content.
-                    // Everything else goes through the parser.
+                    // Everything else goes through the parser. A
+                    // sentinel ends the generation, so no rollback
+                    // reaches past one: `pieces` counts tokens.
                     if self.eos_pieces.contains(&piece) {
                         continue;
                     }
                     self.generated += 1;
                     let token = self.predictor.last_token();
                     let blocks = self.filter.push(&piece, token);
+                    self.pieces.push((piece, token));
+                    // What the filter releases is on its way to the
+                    // client: no rollback may reach into it.
+                    if !blocks.is_empty() {
+                        self.predictor.settle();
+                    }
                     let hit = self.filter.hit().is_some();
                     self.admit(blocks, hit);
                     // A stop sequence ends the turn; so does `run_call`'s
@@ -10355,6 +10370,178 @@ impl ProseRun {
             }
         }
     }
+}
+
+/// What the batch path keeps of a generation as its pieces arrive.
+/// Every piece is logged, so a rollback (the escaped-closer repair —
+/// `PiecePredictor::rewound`) rebuilds the rest by replaying what is
+/// left: the provenance marking and the stop filter only grow, so a
+/// replay from their first state is the one way back.
+struct Emission {
+    /// Every yielded piece and its token, end-of-generation pieces
+    /// included.
+    log: Vec<(String, Option<Token>)>,
+    raw_text: String,
+    /// `raw_text` with every reserved piece the model *spelled* in
+    /// ordinary tokens marked: what the dialect parser reads, so only
+    /// framing emitted as a real reserved token is structure (see
+    /// `Provenance`). The parse is restored before anything sees it.
+    marked_text: String,
+    provenance: crate::dialect::Provenance,
+    /// The request's stop sequences, matched against the text output
+    /// the generation parses to (#122).
+    stop_filter: Option<stop::StopFilter>,
+    /// Pieces of content, end-of-generation pieces not counted.
+    generated_count: usize,
+    /// Every recorded token id, when caching is on; empty otherwise.
+    generated_tokens: Vec<Token>,
+    /// `(token, piece)` for every emission, when the diagnostic dump is
+    /// on: empty pieces (the smoking gun for stuck-on-special-token
+    /// loops) are otherwise invisible in the surfaced text.
+    token_dump: Vec<(Token, String)>,
+    /// Bytes the LAST piece contributed to `raw_text` — the piece of
+    /// the recorded-but-uncommitted token, which is the one token
+    /// sitting past the KV head when the loop exits (see
+    /// [`tip_extension`]). Zero when the turn ended on a stop token,
+    /// because `eos_pieces` drops that piece before `raw_text` grows;
+    /// NON-zero when the grammar reached accept or the budget ran out,
+    /// because then the last sampled token is surfaced content that the
+    /// next turn's re-render reproduces.
+    uncommitted_bytes: usize,
+    /// The provenance and stop filter as built, for a replay.
+    fresh: (crate::dialect::Provenance, Option<stop::StopFilter>),
+    /// Pieces we drop from the surfaced output: every EOG token (see
+    /// `Session::eog_pieces` — stop tokens are framing, not content).
+    eos_pieces: std::collections::BTreeSet<String>,
+    cache_on: bool,
+    collect_token_dump: bool,
+}
+
+/// What [`Emission::push`] made of a piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Taken {
+    /// An end-of-generation piece: framing, not content.
+    Framing,
+    Content,
+    /// Content that completed a stop sequence: the turn ends here.
+    Stopped,
+}
+
+impl Emission {
+    fn new(
+        provenance: crate::dialect::Provenance,
+        stop_filter: Option<stop::StopFilter>,
+        eos_pieces: std::collections::BTreeSet<String>,
+        cache_on: bool,
+        collect_token_dump: bool,
+    ) -> Self {
+        Self {
+            log: Vec::new(),
+            raw_text: String::new(),
+            marked_text: String::new(),
+            fresh: (provenance.clone(), stop_filter.clone()),
+            provenance,
+            stop_filter,
+            generated_count: 0,
+            generated_tokens: Vec::new(),
+            token_dump: Vec::new(),
+            uncommitted_bytes: 0,
+            eos_pieces,
+            cache_on,
+            collect_token_dump,
+        }
+    }
+
+    /// Take the piece the predictor just yielded, and its token.
+    fn push(&mut self, piece: String, token: Option<Token>) -> Taken {
+        let taken = self.take(&piece, token);
+        self.log.push((piece, token));
+        taken
+    }
+
+    fn take(&mut self, piece: &str, token: Option<Token>) -> Taken {
+        if self.collect_token_dump {
+            self.token_dump
+                .push((token.unwrap_or(-1), piece.to_owned()));
+        }
+        if let Some(token) = token.filter(|&t| self.cache_on && t >= 0) {
+            self.generated_tokens.push(token);
+        }
+        if self.eos_pieces.contains(piece) {
+            // Framing, not content: absent from `raw_text`, so the
+            // canonical tail starts at the turn close.
+            self.uncommitted_bytes = 0;
+            return Taken::Framing;
+        }
+        self.generated_count += 1;
+        self.raw_text.push_str(piece);
+        self.uncommitted_bytes = piece.len();
+        self.marked_text
+            .push_str(&self.provenance.push(piece, token));
+        match self.stop_filter.as_mut() {
+            Some(filter) => {
+                filter.push(piece, token);
+                match filter.hit() {
+                    Some(_) => Taken::Stopped,
+                    None => Taken::Content,
+                }
+            }
+            None => Taken::Content,
+        }
+    }
+
+    /// Drop the last `tokens` pieces, as the predictor rolled back.
+    /// What they fed is rebuilt from the pieces that stay; none of them
+    /// hit a stop, or the turn would have ended there.
+    fn rewind(&mut self, tokens: usize) {
+        let mut log = std::mem::take(&mut self.log);
+        log.truncate(log.len().saturating_sub(tokens));
+        (self.provenance, self.stop_filter) = self.fresh.clone();
+        self.raw_text.clear();
+        self.marked_text.clear();
+        self.generated_count = 0;
+        self.generated_tokens.clear();
+        self.token_dump.clear();
+        self.uncommitted_bytes = 0;
+        for (piece, token) in &log {
+            self.take(piece, *token);
+        }
+        self.log = log;
+    }
+}
+
+/// The `escaped_closer_repair` event, for a turn whose overrule tried
+/// the repair (see `PiecePredictor::with_closer_repair`): INFO when it
+/// held, WARN when the overrule stood. The request span carries the
+/// model; the overrule's own log carries the tail when it stood.
+fn log_closer_repair(repair: Option<crate::predictor::CloserRepair>) {
+    #[cfg(feature = "axum")]
+    if let Some(crate::predictor::CloserRepair {
+        outcome,
+        rolled_back,
+    }) = repair
+    {
+        use crate::predictor::CloserRepairOutcome::Repaired;
+        match outcome {
+            Repaired => tracing::info!(
+                target: "drama_llama::session",
+                event = "escaped_closer_repair",
+                %outcome,
+                rolled_back,
+                "the model escaped the quote it meant to close a value \
+                 with; rolled back to the backslash and redrawn",
+            ),
+            _ => tracing::warn!(
+                target: "drama_llama::session",
+                event = "escaped_closer_repair",
+                %outcome,
+                rolled_back,
+                "escaped-closer repair did not hold; the overrule stands",
+            ),
+        }
+    }
+    #[cfg(not(feature = "axum"))]
+    let _ = repair;
 }
 
 /// Strip the trailing EOS piece. Matches what
@@ -12560,6 +12747,287 @@ mod tests {
         let mut stream = session.complete_stream(&prompt).expect("stream");
         let _: Vec<_> = stream.by_ref().collect();
         assert!(stream.violation().is_none());
+    }
+
+    /// The prompt of the escaped-closer tests: a flat `{body: string}`
+    /// answer, like the reflect `Memory` one (#140).
+    fn body_prompt() -> Prompt {
+        use misanthropic::prompt::message::Role;
+        Prompt::default()
+            .add_message((Role::User, "Comment?"))
+            .unwrap()
+            .json_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"body": {"type": "string"}},
+                "required": ["body"],
+            }))
+    }
+
+    /// A scripted mock that writes `meant` (ending `\"}`) and means to
+    /// stop there, its KV rolled back by a truncate when `truncates`,
+    /// writing `then` from the backslash's position once rolled back.
+    fn escaped_closer_session(
+        meant: &[Token],
+        truncates: bool,
+        then: Option<(Vec<Token>, Vec<usize>)>,
+    ) -> Session<mock::MockBackend> {
+        // What the model writes on when the overrule stands.
+        let script: Vec<Token> = meant
+            .iter()
+            .copied()
+            .chain(" more\"}".bytes().map(Token::from))
+            .collect();
+        let mut session = mock::scripted("");
+        session.engine.decoder.script = script;
+        session.engine.decoder.eos_first = vec![meant.len()];
+        session.engine.decoder.truncates = truncates;
+        session.engine.decoder.after_restore = then;
+        session
+    }
+
+    fn bytes(s: &str) -> Vec<Token> {
+        s.bytes().map(Token::from).collect()
+    }
+
+    /// The `escaped_closer_repair` events' outcome and `rolled_back`.
+    fn repair_events(
+        events: &[(tracing::Level, Vec<(String, String)>)],
+    ) -> Vec<(tracing::Level, String, String)> {
+        events
+            .iter()
+            .filter(|(_, f)| field(f, "event") == Some("escaped_closer_repair"))
+            .map(|(level, f)| {
+                let get = |name| field(f, name).unwrap_or("").to_owned();
+                (*level, get("outcome"), get("rolled_back"))
+            })
+            .collect()
+    }
+
+    /// The answer of a batch turn, as text.
+    fn answer(response: &misanthropic::response::Message) -> String {
+        let message: crate::prompt::Message = response.inner.clone().into();
+        message
+            .content
+            .0
+            .iter()
+            .map(|block| match block {
+                crate::Block::Text { text, .. } => text.to_string(),
+                other => panic!("not text: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The escaped-closer repair (#140): the model writes `\"}` where it
+    /// means `"}` and reaches for the end of its turn. The session rolls
+    /// back to just before the backslash, redraws with it banned, and
+    /// the model writes the `"` it meant: a clean answer, not a
+    /// violation, at the cost of the three tokens rolled back.
+    #[test]
+    fn an_escaped_closer_is_repaired_in_place() {
+        use misanthropic::response::StopReason;
+        let meant = r#"{"body":"Done.\"}"#;
+        let backslash = meant.find('\\').unwrap();
+        let mut session = escaped_closer_session(
+            &bytes(meant),
+            true,
+            Some((bytes("\"}"), vec![])),
+        );
+        let mut response = None;
+        let events = capture_events(|| {
+            response = Some(session.complete_response(&body_prompt()));
+        });
+        let response = response.unwrap().expect("repaired");
+        assert_eq!(answer(&response), r#"{"body":"Done."}"#);
+        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.usage.output_tokens, backslash as u64 + 2);
+        // One rollback, to the token before the backslash, re-decoded.
+        let restores = &session.engine.decoder.restores;
+        assert_eq!(restores.len(), 1, "{restores:?}");
+        #[cfg(feature = "axum")]
+        assert_eq!(
+            repair_events(&events),
+            [(tracing::Level::INFO, "repaired".into(), "3".into())]
+        );
+        let _ = events;
+    }
+
+    /// The backslash inside a multi-byte token (`.\`): the rollback
+    /// takes the whole token, writes its `.` again, and bans the
+    /// backslash on the step after it.
+    #[test]
+    fn an_escaped_closer_inside_a_token_keeps_the_bytes_before_it() {
+        let merged = mock::FIRST_MERGE;
+        let meant: Vec<Token> = bytes(r#"{"body":"Done"#)
+            .into_iter()
+            .chain([merged])
+            .chain(bytes("\"}"))
+            .collect();
+        // Whatever the model would write at the merged token's
+        // position, the rollback writes `.` there.
+        let mut session =
+            escaped_closer_session(&meant, true, Some((bytes("!\"}"), vec![])));
+        session.engine.model.merges = vec![(".\\", merged)];
+        let response =
+            session.complete_response(&body_prompt()).expect("repaired");
+        assert_eq!(answer(&response), r#"{"body":"Done."}"#);
+    }
+
+    /// A rollback whose redraw overrules again stands as the violation
+    /// it would have been: one attempt a turn.
+    #[test]
+    fn a_repeat_overrule_after_the_repair_is_a_violation() {
+        let meant = r#"{"body":"Done.\"}"#;
+        let backslash = meant.find('\\').unwrap();
+        // Rolled back, the model writes ` x\"}` and means to stop again.
+        let again = bytes(" x\\\"}");
+        let stop = backslash + again.len();
+        let mut session = escaped_closer_session(
+            &bytes(meant),
+            true,
+            Some((again, vec![stop])),
+        );
+        let mut result = None;
+        let events = capture_events(|| {
+            result = Some(session.complete_response(&body_prompt()));
+        });
+        assert!(
+            matches!(result, Some(Err(SessionError::GrammarViolation { .. }))),
+            "{result:?}"
+        );
+        #[cfg(feature = "axum")]
+        assert_eq!(
+            repair_events(&events),
+            [(tracing::Level::WARN, "repeat_overrule".into(), "3".into())]
+        );
+        let _ = events;
+    }
+
+    /// A model whose KV a truncate cannot roll back (hybrid or
+    /// sliding-window) keeps today's behavior: no rollback, and the
+    /// overrule stands.
+    #[test]
+    fn an_unrestorable_model_skips_the_repair() {
+        let meant = r#"{"body":"Done.\"}"#;
+        let mut session = escaped_closer_session(
+            &bytes(meant),
+            false,
+            Some((bytes("\"}"), vec![])),
+        );
+        let mut result = None;
+        let events = capture_events(|| {
+            result = Some(session.complete_response(&body_prompt()));
+        });
+        assert!(
+            matches!(result, Some(Err(SessionError::GrammarViolation { .. }))),
+            "{result:?}"
+        );
+        assert!(session.engine.decoder.restores.is_empty());
+        #[cfg(feature = "axum")]
+        assert_eq!(
+            repair_events(&events),
+            [(tracing::Level::WARN, "unrestorable".into(), "0".into())]
+        );
+        let _ = events;
+    }
+
+    /// An overrule of another shape — the model means to stop mid-value
+    /// with no escaped quote — is left alone.
+    #[test]
+    fn an_overrule_of_another_shape_is_not_repaired() {
+        let meant = r#"{"body":"Done."#;
+        let mut session = escaped_closer_session(&bytes(meant), true, None);
+        let mut result = None;
+        let events = capture_events(|| {
+            result = Some(session.complete_response(&body_prompt()));
+        });
+        assert!(
+            matches!(result, Some(Err(SessionError::GrammarViolation { .. }))),
+            "{result:?}"
+        );
+        assert!(session.engine.decoder.restores.is_empty());
+        #[cfg(feature = "axum")]
+        assert_eq!(
+            repair_events(&events),
+            [(tracing::Level::WARN, "shape_mismatch".into(), "0".into())]
+        );
+        let _ = events;
+    }
+
+    /// The stream sends an answer's text as it grows, so by the
+    /// overrule the client holds the `\"}`: no rollback can take it
+    /// back, and the drained stream reports the violation as before.
+    #[test]
+    fn a_streamed_escaped_closer_is_not_rolled_back() {
+        let meant = r#"{"body":"Done.\"}"#;
+        let mut session = escaped_closer_session(
+            &bytes(meant),
+            true,
+            Some((bytes("\"}"), vec![])),
+        );
+        let events = capture_events(|| {
+            let mut stream =
+                session.complete_stream(&body_prompt()).expect("stream");
+            let blocks: Vec<_> = stream.by_ref().collect();
+            assert!(
+                matches!(
+                    stream.violation(),
+                    Some(SessionError::GrammarViolation { .. })
+                ),
+                "{blocks:?}"
+            );
+        });
+        assert!(session.engine.decoder.restores.is_empty());
+        #[cfg(feature = "axum")]
+        assert_eq!(
+            repair_events(&events),
+            [(tracing::Level::WARN, "streamed".into(), "0".into())]
+        );
+        let _ = events;
+    }
+
+    /// A tool call streams only whole, so at the overrule none of the
+    /// call has reached the client: the stream rolls back as the batch
+    /// path does, and the call comes out with the value the model meant.
+    /// The call ends at its JSON (no closing marker), as Mistral's and
+    /// gpt-oss's do, so the closers finish it and EOG ends the turn.
+    #[test]
+    fn a_tool_argument_escaped_closer_is_repaired_on_both_paths() {
+        use misanthropic::response::StopReason;
+        let dialect = crate::CallSyntax {
+            per_call_end: String::new(),
+            ..per_call_json()
+        };
+        let intended = serde_json::json!({"post_id": "7ad"});
+        let emission =
+            crate::dialect::render_reference(&dialect, &[("vote", &intended)])
+                .expect("canonical call");
+        let cut = emission.rfind("\"}").expect("the value's close");
+        let meant = format!("{}\\{}", &emission[..cut], &emission[cut..]);
+        let session = || {
+            escaped_closer_session(
+                &bytes(&meant),
+                true,
+                Some((bytes(&emission[cut..]), vec![])),
+            )
+            .with_dialect(dialect.clone())
+            .without_repetition()
+        };
+        let prompt = vote_prompt();
+
+        let response = session().complete_response(&prompt).expect("batch");
+        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+        let message: crate::prompt::Message = response.inner.into();
+        assert_eq!(call_inputs(&message.content.0), [&intended]);
+
+        let mut session = session();
+        let mut stream = session.complete_stream(&prompt).expect("stream");
+        let blocks: Vec<_> = stream.by_ref().collect();
+        assert!(stream.violation().is_none(), "{blocks:?}");
+        assert_eq!(call_inputs(&blocks), [&intended]);
+        assert_eq!(
+            stream.stop_reason().map(|(reason, _)| reason),
+            Some(StopReason::ToolUse)
+        );
     }
 
     /// The output_config grammar for `prompt` on `dialect`, as `Session`
@@ -15501,8 +15969,15 @@ mod tests {
             /// the model means to stop there, and a constraint that
             /// refuses EOS makes it write the script on.
             pub(super) eos_first: Vec<usize>,
+            /// Replaces the script past the position a restore lands on,
+            /// with its own `eos_first`: what the model writes once a
+            /// rollback redraws there. Taken by the first restore.
+            pub(super) after_restore: Option<(Vec<Token>, Vec<usize>)>,
             /// Script tokens decoded since the last prefill.
             cursor: usize,
+            /// Where the last prefill ended: script token `i` decodes at
+            /// `prefill_end + i`.
+            prefill_end: usize,
             /// One past the last position decoded.
             kv_end: usize,
         }
@@ -15540,6 +16015,7 @@ mod tests {
             ) -> Result<&[f32], MockError> {
                 self.cursor = 0;
                 self.kv_end = start_pos + tokens.len();
+                self.prefill_end = self.kv_end;
                 Ok(self.next_logits())
             }
             fn step(
@@ -15598,6 +16074,14 @@ mod tests {
                     Err(MemoryRmError::NoCheckpoint { pos })
                 } else {
                     self.kv_end = pos as usize;
+                    // The next step decodes the token at `pos` again, so
+                    // the script resumes past it.
+                    self.cursor = self.kv_end.saturating_sub(self.prefill_end);
+                    if let Some((tail, eos_first)) = self.after_restore.take() {
+                        self.script.truncate(self.cursor + 1);
+                        self.script.extend(tail);
+                        self.eos_first = eos_first;
+                    }
                     Ok(())
                 }
             }

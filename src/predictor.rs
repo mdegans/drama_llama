@@ -423,6 +423,54 @@ impl<'engine, B: Backend> CandidatePredictor<'engine, B> {
         self.engine.checkpoint_pos(self.seq_id, self.n_cur as i32);
         self.n_cur
     }
+
+    /// Roll back to just before `tokens[at]`, its KV with it, so the
+    /// next `next()` redraws that position: the token before it is
+    /// decoded again for its logits. `n_decode` is the count as of the
+    /// step that drew `tokens[at]`. Call between steps, when every
+    /// recorded token is in the KV.
+    ///
+    /// Only where a truncate rewinds the KV losslessly
+    /// ([`Engine::truncate_restores`]); [`Rewound::No`] leaves
+    /// everything as it was. A restore that fails after that check said
+    /// it would not ends the iteration ([`Rewound::Halted`]): the KV
+    /// may already be cut, so decoding on would read a broken cache.
+    fn rewind(&mut self, at: usize, n_decode: usize) -> Rewound {
+        debug_assert!(self.pending_advance.is_none(), "rewind mid-step");
+        // `tokens[0]` sits at `base`: with nothing pending, `n_cur` is one
+        // past the last recorded token.
+        let base = self.n_cur - self.tokens.len();
+        let Some(before) = at
+            .checked_sub(1)
+            .filter(|&before| before < self.tokens.len())
+        else {
+            return Rewound::No;
+        };
+        let pos = (base + before) as i32;
+        if !self.engine.truncate_restores(self.seq_id, pos) {
+            return Rewound::No;
+        }
+        if self.engine.restore_to(self.seq_id, pos).is_err() {
+            // Nothing pending: the next `next()` ends the iteration.
+            return Rewound::Halted;
+        }
+        self.tokens.truncate(at);
+        // `tokens[before]`, re-decoded for the logits at `at`.
+        self.pending_advance = self.tokens.last().copied();
+        self.n_cur = base + before;
+        self.n_decode = n_decode.saturating_sub(1);
+        Rewound::Yes
+    }
+}
+
+/// What [`CandidatePredictor::rewind`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rewound {
+    Yes,
+    /// Not restorable by a truncate: nothing changed.
+    No,
+    /// The restore failed past the check: generation ends.
+    Halted,
 }
 
 impl<'engine, B: Backend> Iterator for CandidatePredictor<'engine, B> {
@@ -695,6 +743,11 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// A thought is open: the opener and EOG are steered to the closer
     /// (see [`crate::ThoughtSpecials`]).
     thought_open: bool,
+    /// The escaped-closer repair, when the caller turned it on
+    /// ([`PiecePredictor::with_closer_repair`]).
+    closer: Option<CloserRepairState>,
+    /// The rollback the last step made. See [`Self::rewound`].
+    rewound: Option<Rewind>,
     pub(crate) inner: CandidatePredictor<'engine, B>,
 }
 
@@ -722,6 +775,128 @@ impl TriggerProvenance {
             })
         })
     }
+}
+
+/// How a turn's escaped-closer repair went (#140): the model wrote
+/// `\"` where it meant the closing `"`, then the closers, and reached
+/// for the end of its turn inside what the grammar still holds as a
+/// string. See [`PiecePredictor::with_closer_repair`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloserRepairOutcome {
+    /// Rolled back to the backslash and redrawn without it; the turn
+    /// did not overrule again.
+    Repaired,
+    /// Rolled back, and the redrawn turn overruled anyway.
+    RepeatOverrule,
+    /// The KV cannot be rolled back by a truncate (a hybrid or
+    /// sliding-window model), or the restore failed.
+    Unrestorable,
+    /// The overrule is not the escaped-closer shape, or its closers do
+    /// not finish the constraint.
+    ShapeMismatch,
+    /// The caller already delivered bytes past the rollback point
+    /// ([`PiecePredictor::settle`]).
+    Streamed,
+}
+
+/// The outcome as the `escaped_closer_repair` log spells it.
+impl std::fmt::Display for CloserRepairOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Repaired => "repaired",
+            Self::RepeatOverrule => "repeat_overrule",
+            Self::Unrestorable => "unrestorable",
+            Self::ShapeMismatch => "shape_mismatch",
+            Self::Streamed => "streamed",
+        })
+    }
+}
+
+/// A turn's escaped-closer repair: how it went, and how many generated
+/// tokens it rolled back (`0` when it did not roll back).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CloserRepair {
+    pub(crate) outcome: CloserRepairOutcome,
+    pub(crate) rolled_back: usize,
+}
+
+/// A rollback the predictor's caller must mirror: the last `tokens`
+/// generated tokens are gone, and the text is cut back to `text_len`
+/// bytes. See [`PiecePredictor::rewound`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Rewind {
+    pub(crate) tokens: usize,
+    pub(crate) text_len: usize,
+}
+
+/// Where `text` ends in an escaped quote followed only by closers, the
+/// shape of the escaped-closer overrule: `\"`, then `}` / `]` with
+/// whitespace (raw, or escaped as the string forces it) around them.
+/// Returns the offset of that quote's backslash and the closers in
+/// order. Raw bytes, not the decoded value: the quote is escaped when
+/// an odd run of backslashes precedes it.
+pub(crate) fn escaped_closer(text: &[u8]) -> Option<(usize, Vec<u8>)> {
+    // Whether the byte ending `head` is escaped: an odd run of
+    // backslashes ends right before it.
+    let escaped = |head: &[u8]| {
+        head.split_last().is_some_and(|(_, before)| {
+            before.iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1
+        })
+    };
+    let mut head = text;
+    let mut closers = Vec::new();
+    loop {
+        head = match head {
+            [rest @ .., c @ (b'}' | b']')] => {
+                closers.push(*c);
+                rest
+            }
+            [rest @ .., b' ' | b'\t' | b'\n' | b'\r'] => rest,
+            [rest @ .., b'\\', b'n' | b't' | b'r'] if escaped(head) => rest,
+            _ => break,
+        };
+    }
+    closers.reverse();
+    match head {
+        [rest @ .., b'\\', b'"'] if !closers.is_empty() && escaped(head) => {
+            Some((rest.len(), closers))
+        }
+        _ => None,
+    }
+}
+
+/// The repair's run-state (see [`PiecePredictor::with_closer_repair`]).
+#[derive(Debug, Default)]
+struct CloserRepairState {
+    /// Taken before the newest token whose piece holds a backslash,
+    /// drawn inside a constraint: the one a rollback rewinds to.
+    mark: Option<BackslashMark>,
+    /// Bytes of `text` the caller has delivered: no rollback reaches
+    /// below them.
+    floor: usize,
+    /// The turn's one attempt, once an overrule made it.
+    report: Option<CloserRepair>,
+    /// The rolled-back token's bytes before its backslash, to emit
+    /// again in place of sampling.
+    forced: std::collections::VecDeque<Token>,
+    /// Ban backslash-led tokens on the next drawn step.
+    ban: bool,
+}
+
+/// [`TokenPredictor`] just before it drew a token holding a backslash.
+#[derive(Debug)]
+struct BackslashMark {
+    token: Token,
+    /// Its index in the predictor's tokens.
+    at: usize,
+    /// `n_decode` as of the step that drew it.
+    n_decode: usize,
+    /// `text`'s length before it.
+    text_len: usize,
+    /// How many real reserved tokens the trigger provenance held.
+    real: usize,
+    thought_open: bool,
+    constraints: crate::sample::state::ConstraintMark,
 }
 
 impl<'engine, B: Backend> TokenPredictor<'engine, B> {
@@ -755,6 +930,8 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             reassembler: Utf8Reassembler::default(),
             provenance: None,
             thought_open,
+            closer: None,
+            rewound: None,
             inner,
         }
     }
@@ -791,6 +968,8 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             reassembler: Utf8Reassembler::default(),
             provenance: None,
             thought_open,
+            closer: None,
+            rewound: None,
             inner,
         }
     }
@@ -875,6 +1054,234 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     /// one it meant — so the turn is a violation, not an answer.
     pub fn eog_overruled(&self) -> bool {
         self.eog_overruled
+    }
+
+    /// See [`PiecePredictor::with_closer_repair`].
+    fn enable_closer_repair(&mut self) {
+        self.closer = Some(CloserRepairState::default());
+    }
+
+    /// See [`PiecePredictor::settle`].
+    fn settle(&mut self) {
+        if let Some(closer) = self.closer.as_mut() {
+            closer.floor = self.text.len();
+        }
+    }
+
+    /// See [`PiecePredictor::closer_repair`].
+    fn closer_repair(&self) -> Option<CloserRepair> {
+        self.closer.as_ref().and_then(|closer| closer.report)
+    }
+
+    /// The overrule on a step's `candidates`. The turn's first one tries
+    /// the escaped-closer repair; when that rolls back, the redrawn
+    /// position's candidates take the step's place and are judged in
+    /// turn. `None` when the iteration ended.
+    fn judge_overrule(
+        &mut self,
+        candidates: Candidates,
+    ) -> Option<(Candidates, bool)> {
+        use CloserRepairOutcome::{Repaired, RepeatOverrule};
+        let overrules = |this: &Self, candidates: &Candidates| {
+            this.state.overrules_eog(
+                &this.options.sample_options,
+                candidates,
+                &this.inner.engine.model,
+            )
+        };
+        if !overrules(self, &candidates) {
+            return Some((candidates, false));
+        }
+        let report = match self.closer.as_ref().map(|closer| closer.report) {
+            // Off: the overrule stands.
+            None => return Some((candidates, true)),
+            // Spent: one attempt a turn.
+            Some(Some(report)) => {
+                self.set_report(CloserRepair {
+                    outcome: match report.outcome {
+                        Repaired => RepeatOverrule,
+                        outcome => outcome,
+                    },
+                    ..report
+                });
+                return Some((candidates, true));
+            }
+            Some(None) => self.rewind_escaped_closer(),
+        };
+        let Some(report) = report else {
+            // A failed restore ended the iteration.
+            self.set_report(CloserRepair {
+                outcome: CloserRepairOutcome::Unrestorable,
+                rolled_back: 0,
+            });
+            return None;
+        };
+        match report {
+            Ok(rewind) => {
+                self.set_report(CloserRepair {
+                    outcome: Repaired,
+                    rolled_back: rewind.tokens,
+                });
+                self.rewound = Some(rewind);
+                let candidates = self.inner.next()?;
+                let again = overrules(self, &candidates);
+                if again {
+                    self.set_report(CloserRepair {
+                        outcome: RepeatOverrule,
+                        rolled_back: rewind.tokens,
+                    });
+                }
+                Some((candidates, again))
+            }
+            Err(outcome) => {
+                self.set_report(CloserRepair {
+                    outcome,
+                    rolled_back: 0,
+                });
+                Some((candidates, true))
+            }
+        }
+    }
+
+    fn set_report(&mut self, report: CloserRepair) {
+        if let Some(closer) = self.closer.as_mut() {
+            closer.report = Some(report);
+        }
+    }
+
+    /// At an overrule whose text ends in the escaped-closer shape
+    /// ([`escaped_closer`]), roll back to just before that backslash:
+    /// the KV and the tokens to the start of the token holding it, the
+    /// matchers, text and provenance with them. The bytes that token
+    /// held before the backslash are queued to be written again, and
+    /// the step after them may not start with a backslash (see
+    /// `Self::steer_repair`). `None` when a failed restore ended the
+    /// iteration.
+    fn rewind_escaped_closer(
+        &mut self,
+    ) -> Option<Result<Rewind, CloserRepairOutcome>> {
+        use CloserRepairOutcome::{ShapeMismatch, Streamed, Unrestorable};
+        let (mark, floor) = match self.closer.as_mut() {
+            Some(closer) => (closer.mark.take(), closer.floor),
+            None => (None, 0),
+        };
+        let model = &self.inner.engine.model;
+        let config = &self.options.sample_options;
+        let found = mark.and_then(|mark| {
+            let (backslash, closers) = escaped_closer(self.text.as_bytes())?;
+            // What the marked token wrote before the backslash, which
+            // must be the one it holds.
+            let prefix = self.text.get(mark.text_len..backslash)?.to_owned();
+            let mut piece = Vec::new();
+            model.token_to_piece_ref(mark.token, &mut piece);
+            let intended = [prefix.as_bytes(), b"\"", &closers].concat();
+            (piece.get(prefix.len()) == Some(&b'\\')
+                && mark.constraints.completes_with(config, &intended))
+            .then_some((mark, prefix))
+        });
+        let Some((mark, prefix)) = found else {
+            return Some(Err(ShapeMismatch));
+        };
+        if mark.text_len < floor {
+            return Some(Err(Streamed));
+        }
+        let tokens = self.inner.tokens.len().saturating_sub(mark.at);
+        match self.inner.rewind(mark.at, mark.n_decode) {
+            Rewound::Yes => {}
+            Rewound::No => return Some(Err(Unrestorable)),
+            Rewound::Halted => return None,
+        }
+        self.state.rewind_constraints(mark.constraints);
+        self.thought_open = mark.thought_open;
+        // A length `text` had: a char boundary.
+        self.text.truncate(mark.text_len);
+        // Empty at the mark (see `Self::mark_backslash`).
+        self.reassembler.carry.clear();
+        if let Some(provenance) = self.provenance.as_mut() {
+            provenance.real.truncate(mark.real);
+        }
+        let forced = self
+            .inner
+            .engine
+            .model
+            .tokenize_special(&prefix, false, false);
+        if let Some(closer) = self.closer.as_mut() {
+            closer.forced = forced.into();
+            closer.ban = true;
+        }
+        Some(Ok(Rewind {
+            tokens,
+            text_len: mark.text_len,
+        }))
+    }
+
+    /// The repair's hand on the steps after a rollback: each forced
+    /// token in turn, then one step on which no backslash-led token may
+    /// be drawn. Every other step passes `candidates` through.
+    fn steer_repair(&mut self, candidates: Candidates) -> Candidates {
+        let Some(closer) = self.closer.as_mut() else {
+            return candidates;
+        };
+        let model = &self.inner.engine.model;
+        let mut piece = Vec::new();
+        let kept: Vec<crate::TokenData> =
+            if let Some(forced) = closer.forced.pop_front() {
+                candidates
+                    .iter()
+                    .filter(|td| td.id == forced)
+                    .copied()
+                    .collect()
+            } else if std::mem::take(&mut closer.ban) {
+                candidates
+                    .iter()
+                    .filter(|td| {
+                        model.token_to_piece_ref(td.id, &mut piece);
+                        piece.first() != Some(&b'\\')
+                    })
+                    .copied()
+                    .collect()
+            } else {
+                return candidates;
+            };
+        match kept.is_empty() {
+            true => candidates,
+            false => Candidates::from_vec_unchecked(kept),
+        }
+    }
+
+    /// Before `token` lands (the matchers not yet advanced, `text` not
+    /// yet grown): when its piece holds a backslash and it was drawn
+    /// inside a constraint, mark where a rollback to it lands. A
+    /// backslash that cannot be marked — one completing a codepoint an
+    /// earlier token opened — clears the mark, so no rollback reaches
+    /// past it.
+    fn mark_backslash(&mut self, token: Token) {
+        let Some(closer) = self
+            .closer
+            .as_mut()
+            .filter(|closer| closer.report.is_none())
+        else {
+            return;
+        };
+        let mut piece = Vec::new();
+        self.inner
+            .engine
+            .model
+            .token_to_piece_ref(token, &mut piece);
+        if !piece.contains(&b'\\') {
+            return;
+        }
+        closer.mark = (self.state.constrained_incomplete()
+            && self.reassembler.carry.is_empty())
+        .then(|| BackslashMark {
+            token,
+            at: self.inner.tokens.len(),
+            n_decode: self.inner.n_decode,
+            text_len: self.text.len(),
+            real: self.provenance.as_ref().map_or(0, |p| p.real.len()),
+            thought_open: self.thought_open,
+            constraints: self.state.constraint_mark(),
+        });
     }
 
     /// The [`PredictOptions::stop_strings`] entry that ended generation,
@@ -988,7 +1395,14 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             return None;
         }
 
+        self.rewound = None;
         let candidates = self.inner.next()?;
+        // Judged on the raw candidates, before any mask: what the
+        // model wanted, not what it was let to write. Once is enough.
+        // The turn's first overrule may roll back instead (the
+        // escaped-closer repair), and the redrawn position is judged.
+        let (candidates, overruled) = self.judge_overrule(candidates)?;
+        self.eog_overruled = self.eog_overruled || overruled;
 
         // Snapshot only when an installed hook declares appetite. Cheap
         // probe of the trait method (default `None`) keeps the
@@ -1000,17 +1414,7 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             .as_ref()
             .and_then(|h| h.snapshot_opts())
             .map(|opts| candidates.capture_snapshot(&opts));
-
-        // The generated text rides along for the deferred-trigger wake
-        // check: a trigger may have started tokens ago.
-        // Judged on the raw candidates, before any mask: what the
-        // model wanted, not what it was let to write. Once is enough.
-        self.eog_overruled = self.eog_overruled
-            || self.state.overrules_eog(
-                &self.options.sample_options,
-                &candidates,
-                &self.inner.engine.model,
-            );
+        let candidates = self.steer_repair(candidates);
 
         let next_token = crate::sample::sample_token_in(
             &self.inner.tokens,
@@ -1023,6 +1427,7 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             &self.inner.engine.model,
         )
         .unwrap();
+        self.mark_backslash(next_token);
         if let Some(thought) = self.options.sample_options.thought.as_ref() {
             self.thought_open =
                 thought.open_after(self.thought_open, next_token);
@@ -1438,6 +1843,42 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
         self.inner.eog_overruled()
     }
 
+    /// Turn on the escaped-closer repair (#140). The model writes `\"`
+    /// where it means a value's closing `"`, then the closers, and
+    /// reaches for the end of its turn: an overrule, since the grammar
+    /// still holds the string open. Instead of letting it write on, the
+    /// turn's first overrule of that shape rolls generation back to
+    /// the start of the token holding that backslash, writes again what
+    /// the token held before it, and redraws with backslash-led tokens
+    /// banned for one step — so the model writes the `"` it meant. Once
+    /// a turn, and only where a KV truncate rewinds losslessly (a dense
+    /// model); otherwise the overrule stands. The caller mirrors each
+    /// rollback ([`Self::rewound`]) and reads how it went from
+    /// [`Self::closer_repair`].
+    pub(crate) fn with_closer_repair(mut self) -> Self {
+        self.inner.enable_closer_repair();
+        self
+    }
+
+    /// Every byte yielded so far has been delivered: a repair rollback
+    /// may no longer reach below it.
+    pub(crate) fn settle(&mut self) {
+        self.inner.settle();
+    }
+
+    /// The turn's escaped-closer repair, once an overrule tried it.
+    pub(crate) fn closer_repair(&self) -> Option<CloserRepair> {
+        self.inner.closer_repair()
+    }
+
+    /// The rollback the last `next()` made before yielding, if any: the
+    /// caller drops its last [`Rewind::tokens`] tokens and cuts its text
+    /// back to [`Rewind::text_len`] bytes, then takes the yielded piece
+    /// as usual.
+    pub(crate) fn rewound(&self) -> Option<Rewind> {
+        self.inner.rewound
+    }
+
     /// See [`TokenPredictor::hit_token_limit`].
     pub fn hit_token_limit(&self) -> bool {
         self.inner.hit_token_limit()
@@ -1484,7 +1925,12 @@ impl<'engine, B: Backend> Iterator for PiecePredictor<'engine, B> {
         // property of the code rather than a promise (issue #55).
         let emitted = self.inner.text.len();
         match self.inner.next() {
-            Some(_) => Some(self.inner.text[emitted..].to_owned()),
+            // A rollback cut `text` below `emitted` first: the piece is
+            // what grew from there.
+            Some(_) => {
+                let from = self.inner.rewound.map_or(emitted, |r| r.text_len);
+                Some(self.inner.text[from..].to_owned())
+            }
             None => {
                 // Stream end. Surface any codepoint the last token left
                 // half-delivered before the text is finalized — one
@@ -1838,6 +2284,44 @@ mod tests {
             actual_text.starts_with(&expected_text),
             "greedy continuation {actual_text:?} should start with {expected_text:?}"
         );
+    }
+
+    /// The escaped-closer shape (#140): `\"`, then the closers that would
+    /// finish the document, whitespace (raw or escaped) between them.
+    /// A quote escaped on purpose, mid-string, is not it; nor is a real
+    /// closing quote.
+    #[test]
+    fn escaped_closer_matches_only_an_escaped_quote_before_closers() {
+        let at = |text: &str| {
+            super::escaped_closer(text.as_bytes())
+                .map(|(at, closers)| (at, String::from_utf8(closers).unwrap()))
+        };
+        let text = r#"{"c":"text\"}"#;
+        let backslash = text.find('\\').unwrap();
+        assert_eq!(at(text), Some((backslash, "}".into())));
+        assert_eq!(at("{\"c\":\"text\\\"\n}"), Some((backslash, "}".into())));
+        assert_eq!(at(r#"{"c":"text\"\n}"#), Some((backslash, "}".into())));
+        assert_eq!(at(r#"{"c":"text\" } "#), Some((backslash, "}".into())));
+        assert_eq!(
+            at(r#"{"a":[{"c":"text\"}]}"#),
+            Some((r#"{"a":[{"c":"text"#.len(), "}]}".into()))
+        );
+        // An odd run: the last backslash escapes the quote.
+        let odd = r#"{"c":"a\\\"}"#;
+        assert_eq!(at(odd), Some((odd.rfind('\\').unwrap(), "}".into())));
+
+        // Escaped on purpose, more text after it.
+        assert_eq!(at(r#"{"c":"say \"hi\" to"#), None);
+        assert_eq!(at(r#"{"c":"say \"hi\"} and"#), None);
+        // A real closing quote: an even run, or none.
+        assert_eq!(at(r#"{"c":"text"}"#), None);
+        assert_eq!(at(r#"{"c":"a\\"}"#), None);
+        // No closers after it.
+        assert_eq!(at(r#"{"c":"text\""#), None);
+        // An escaped `\n` whose backslash is itself escaped is text.
+        assert_eq!(at(r#"{"c":"text\"\\n}"#), None);
+        assert_eq!(at(""), None);
+        assert_eq!(at("}"), None);
     }
 
     #[test]
