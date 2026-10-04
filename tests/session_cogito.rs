@@ -253,3 +253,108 @@ fn tip_anchors_across_thinking_tool_rounds() {
         3,
     );
 }
+
+/// The hard tool-call cap, live: asked to fetch six posts at once,
+/// cogito makes at most `CAP` calls — the sampler ends the turn on its
+/// own `<|im_end|>` once the last completes — the turn reports
+/// `tool_use`, and the next turn, carrying a result per call, resumes
+/// past the whole previous prompt (the capped turn re-rendered byte for
+/// byte). Repeats count toward the cap and are dropped after it, so the
+/// returned calls may be fewer than `CAP`. `CAP` is below the sidecar's
+/// 3, set on the session.
+#[test]
+#[ignore = "requires cogito model"]
+fn tool_call_cap_ends_a_parallel_turn_cache_stable() {
+    use drama_llama::prompt::ToolResult;
+    use misanthropic::response::StopReason;
+    const CAP: u32 = 2;
+    let mut session =
+        session_or_skip!().with_max_tool_calls_per_turn(NonZeroU32::new(CAP));
+    let tool = Tool::builder("get_content")
+        .description("Read a forum post by id.")
+        .schema(json!({
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+        }))
+        .build()
+        .expect("valid tool");
+    let mut prompt = Prompt {
+        system: Some(Content::text(
+            "You are aegis, an agent on a small forum. Read posts with \
+             your tool. When you need several posts, request all of them \
+             at once, one call per post, in the same turn.",
+        )),
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text(
+                "Read posts a1, b2, c3, d4, e5 and f6 — all six, now, in \
+                 parallel — then summarize each in one line.",
+            ),
+        }],
+        tools: Some(vec![tool.into()]),
+        max_tokens: NonZeroU32::new(2048).unwrap(),
+        ..Default::default()
+    };
+
+    let first = session.complete_response(&prompt).expect("first turn");
+    eprintln!("first: {:#?} {:?}", first.inner.content, first.usage);
+    let calls: Vec<_> = first
+        .inner
+        .content
+        .0
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { call } => Some(call.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !calls.is_empty(),
+        "no call to cap: {:#?}",
+        first.inner.content
+    );
+    assert!(
+        calls.len() <= CAP as usize,
+        "{} calls past a cap of {CAP}",
+        calls.len()
+    );
+    assert_eq!(first.stop_reason, Some(StopReason::ToolUse));
+    let prev_total = first.usage.cache_read_input_tokens.unwrap_or(0)
+        + first.usage.cache_creation_input_tokens.unwrap_or(0)
+        + first.usage.input_tokens;
+
+    prompt.messages.push(Message {
+        role: Role::Assistant,
+        content: first.inner.content.clone(),
+    });
+    prompt.messages.push(Message {
+        role: Role::User,
+        content: Content(
+            calls
+                .iter()
+                .map(|call| Block::ToolResult {
+                    result: ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: Content::text(format!(
+                            "Post {}: the garden needs watering.",
+                            call.input["id"].as_str().unwrap_or("?")
+                        )),
+                        is_error: false,
+                        cache_control: None,
+                    },
+                })
+                .collect(),
+        ),
+    });
+    let second = session.complete_response(&prompt).expect("second turn");
+    eprintln!("second: {:#?} {:?}", second.inner.content, second.usage);
+    let read = second.usage.cache_read_input_tokens.unwrap_or(0);
+    assert!(
+        read > prev_total,
+        "tip missed: cache_read ({read}) did not clear the previous \
+         prompt ({prev_total}) — the capped turn did not re-render byte \
+         for byte. usage: {:?}",
+        second.usage,
+    );
+}

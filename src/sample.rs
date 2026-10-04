@@ -6,7 +6,7 @@ use crate::sample::region::RegionGuard;
 
 use rand::RngExt as _;
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 pub(crate) mod grammar;
 pub(crate) mod ids;
@@ -147,6 +147,105 @@ pub struct SamplerConfig {
     /// [`banned_specials`]: SamplerConfig::banned_specials
     #[cfg_attr(feature = "serde", serde(default))]
     pub thought: Option<ThoughtSpecials>,
+    /// The most client tool calls one turn may make — the per-model
+    /// sidecar key `max_tool_calls_per_turn`. `None` (the default) is
+    /// unlimited. Never enforced from here directly: `Session` folds it
+    /// with the request's `disable_parallel_tool_use` into
+    /// [`Self::tool_call_cap`] per call.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub max_tool_calls_per_turn: Option<NonZeroU32>,
+    /// The call's hard cap on tool calls (see [`ToolCallCap`]). `None`
+    /// (the default) disables it. Runtime wiring set by `Session`; like
+    /// [`banned_specials`] it is unreachable from the wire, and never
+    /// read from or written to a sidecar.
+    ///
+    /// [`banned_specials`]: SamplerConfig::banned_specials
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub tool_call_cap: Option<ToolCallCap>,
+}
+
+/// Where a [`ToolCallCap`] came from, for the log that says it fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolCallCapSource {
+    /// The request's `tool_choice.disable_parallel_tool_use`: one call,
+    /// as on Anthropic.
+    Request,
+    /// The model's sidecar: [`SamplerConfig::max_tool_calls_per_turn`].
+    Sidecar,
+}
+
+impl ToolCallCapSource {
+    /// `"request"` or `"sidecar"`, as the log spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Sidecar => "sidecar",
+        }
+    }
+}
+
+/// A hard cap on the client tool calls one turn makes, for
+/// [`SamplerConfig::tool_call_cap`]. Every call the tool-call grammar
+/// completes counts ([`SamplerState`] keeps the tally), a repeat
+/// included — `Session` drops repeats only once the turn is over, so a
+/// loop of one call still meets the cap. Once the `max`-th call
+/// completes, the next token is the model's likeliest end of generation
+/// that the grammar admits there: it ends its own turn, as after any
+/// last call, so the KV and the re-render agree and the turn reports
+/// `tool_use`. Where no end of generation is legal after a call (a
+/// section that must close first), the cap cannot steer and the grammar
+/// decides.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct ToolCallCap {
+    /// The most calls the turn may make.
+    pub max: NonZeroU32,
+    /// Which setting won ([`Self::effective`]).
+    pub source: ToolCallCapSource,
+    /// Identity of the tool-call grammar whose calls count
+    /// ([`CompiledGrammar::source_hash`]), eager or deferred.
+    pub(crate) grammar: [u8; 32],
+    /// What the grammar must still match after a call to finish (a
+    /// section close, an exit marker), or empty when a finished call
+    /// finishes it.
+    pub(crate) close: Vec<u8>,
+}
+
+impl ToolCallCap {
+    /// A cap of `max` calls under `grammar`, which needs `close` after a
+    /// call to finish.
+    pub fn new(
+        max: NonZeroU32,
+        source: ToolCallCapSource,
+        grammar: &CompiledGrammar,
+        close: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            max,
+            source,
+            grammar: grammar.source_hash(),
+            close: close.into(),
+        }
+    }
+
+    /// The tighter of the `request`'s cap and the `sidecar`'s, with its
+    /// source; the request's on a tie. `None` when neither is set:
+    /// unlimited.
+    pub fn effective(
+        request: Option<NonZeroU32>,
+        sidecar: Option<NonZeroU32>,
+    ) -> Option<(NonZeroU32, ToolCallCapSource)> {
+        let request = request.map(|n| (n, ToolCallCapSource::Request));
+        let sidecar = sidecar.map(|n| (n, ToolCallCapSource::Sidecar));
+        match (request, sidecar) {
+            (Some(r), Some(s)) if s.0 < r.0 => Some(s),
+            (Some(r), _) => Some(r),
+            (None, s) => s,
+        }
+    }
 }
 
 /// A dialect's thought opener and closer as special ids, for
@@ -538,6 +637,8 @@ impl SamplerConfig {
             banned_specials: Vec::new(),
             banned_specials_constrained: Vec::new(),
             thought: None,
+            max_tool_calls_per_turn: None,
+            tool_call_cap: None,
         }
     }
 
@@ -704,6 +805,8 @@ impl Default for SamplerConfig {
             banned_specials: Vec::new(),
             banned_specials_constrained: Vec::new(),
             thought: None,
+            max_tool_calls_per_turn: None,
+            tool_call_cap: None,
         }
     }
 }
@@ -1390,6 +1493,7 @@ impl SamplerConfig {
                 .unwrap_or_default(),
             constrained_ngram_stats: NGramStats::new(),
             constrained_step: 0,
+            tool_calls: 0,
         }
     }
 }
@@ -1478,6 +1582,17 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     // exempt from the logit reduction in (a) and (b) alike — recorded,
     // never penalized. Built per step from the token history; nothing
     // in `state`.
+    //
+    // The tool-call cap (`ToolCallCap`) is read first, off the raw
+    // logits: once the turn has made its last call, the end of
+    // generation the model likes best among those the grammar admits
+    // takes the slot. It is applied last, below, so no ban, penalty or
+    // steer between here and there can move it. Never inside an open
+    // thought, where ending the turn would leave the thought open.
+    let capped = state
+        .tool_call_cap_reached(opts)
+        .filter(|_| !thought_open)
+        .map(|cap| (cap, cap_eog(&candidates, opts, state, model)));
     if let Some(repetition) = &opts.repetition {
         let incomplete = state.constrained_incomplete();
         let id_guard =
@@ -1833,6 +1948,29 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
         }
     }
 
+    match capped {
+        Some((cap, Some(eog))) => {
+            tracing::warn!(
+                target: "drama_llama::sample",
+                event = "tool_call_cap",
+                cap = cap.max.get(),
+                source = cap.source.as_str(),
+                "ended the turn at its tool-call cap",
+            );
+            chosen = eog;
+        }
+        Some((cap, None)) => tracing::warn!(
+            target: "drama_llama::sample",
+            event = "tool_call_cap",
+            cap = cap.max.get(),
+            source = cap.source.as_str(),
+            outcome = "unenforceable",
+            "tool-call cap reached, but no end of generation is legal \
+             here; the grammar decides",
+        ),
+        None => {}
+    }
+
     // NOTE: constraint matchers are deliberately NOT advanced here.
     // The caller decides whether the chosen token continues generation
     // and calls `state.advance` only then (tip invariant: a token that
@@ -1840,6 +1978,31 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     // absent from the cache entries and the KV alike, so the state must
     // not carry its bytes either). See `TokenPredictor::next`.
     Ok(chosen)
+}
+
+/// The end of generation a capped turn ends on: of the model's EOG
+/// tokens every active constraint admits here (and no ban refuses —
+/// none does in practice), the one `candidates`
+/// rates highest — the model's own choice of how to end — else the
+/// first admitted. `None` when none is admitted.
+fn cap_eog<M: crate::backend::Model>(
+    candidates: &Candidates,
+    opts: &SamplerConfig,
+    state: &SamplerState,
+    model: &M,
+) -> Option<Token> {
+    let eog = model.eog_tokens();
+    let legal = |token: Token| {
+        opts.banned_specials.binary_search(&token).is_err()
+            && state.accepts_chosen(opts, token, model)
+    };
+    candidates
+        .as_slice()
+        .iter()
+        .filter(|td| eog.contains(&td.id) && legal(td.id))
+        .max_by(|a, b| a.logit.total_cmp(&b.logit))
+        .map(|td| td.id)
+        .or_else(|| eog.iter().copied().find(|&token| legal(token)))
 }
 
 /// Fold `candidates` through `opts.modes` in order, with the activated
@@ -2572,6 +2735,8 @@ mod tests {
             banned_specials: standing,
             banned_specials_constrained: in_region,
             thought: None,
+            max_tool_calls_per_turn: None,
+            tool_call_cap: None,
         }
     }
 
@@ -2619,6 +2784,8 @@ mod tests {
             banned_specials: vec![],
             banned_specials_constrained: vec![X],
             thought: None,
+            max_tool_calls_per_turn: None,
+            tool_call_cap: None,
         };
         let mut state = state_for(&opts);
         let picked = sample_token(
@@ -4093,5 +4260,234 @@ mod tests {
         want.push(QUOTE_COMMA);
         assert_eq!(tokens, want);
         assert!(state.constrained_step() > 0);
+    }
+
+    /// `root ::= "a" ( "c" "a" )*` — a call is `a`, joined by `c`: the
+    /// parallel-call shape (`call ( SEP call )*`).
+    const CALLS_GRAMMAR: &str = r#"root ::= "a" ( "c" "a" )*"#;
+
+    /// [`CALLS_GRAMMAR`] eager and greedy, capped at `max` calls when
+    /// `max` is set; with `close`, the calls must end in `b`.
+    fn capped_opts(max: Option<u32>, close: &str) -> SamplerConfig {
+        let source = format!(
+            r#"root ::= "a" ( "c" "a" )*{}"#,
+            if close.is_empty() {
+                String::new()
+            } else {
+                format!(r#" "{close}""#)
+            }
+        );
+        let grammar = CompiledGrammar::parse(&source).expect("parses");
+        SamplerConfig {
+            modes: vec![
+                SamplingMode::Grammar(grammar.clone()),
+                SamplingMode::Greedy,
+            ],
+            repetition: None,
+            lazy_grammar: false,
+            tool_call_cap: max.and_then(NonZeroU32::new).map(|max| {
+                ToolCallCap::new(
+                    max,
+                    ToolCallCapSource::Sidecar,
+                    &grammar,
+                    close,
+                )
+            }),
+            ..SamplerConfig::default()
+        }
+    }
+
+    /// The model wants another call: the separator far above any end.
+    fn wants_more() -> Candidates {
+        cands(&[(C, 10.0), (A, 9.0), (EOS, 3.0), (EOG_A, 1.0)])
+    }
+
+    /// Every completed call counts, the same call repeated included —
+    /// a loop of one call must meet the cap too — and nothing counts
+    /// without a cap.
+    #[test]
+    fn tool_call_cap_counts_every_completed_call() {
+        for (max, want) in [(Some(9), 3), (None, 0)] {
+            let opts = capped_opts(max, "");
+            let mut state = state_for(&opts);
+            for token in [A, C, A, C, A] {
+                assert_eq!(
+                    sample(cands(&[(token, 1.0)]), &opts, &mut state),
+                    token
+                );
+            }
+            assert_eq!(state.tool_calls(), want, "{max:?}");
+        }
+    }
+
+    /// After the `max`-th call, the next token is the end of generation
+    /// the model rates highest, however much more it wants another
+    /// call; before it, the model calls on. Without a cap, nothing
+    /// changes.
+    #[test]
+    fn tool_call_cap_ends_the_turn_after_the_last_call() {
+        let opts = capped_opts(Some(2), "");
+        let mut state = state_for(&opts);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        assert_eq!(sample(wants_more(), &opts, &mut state), C);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        assert_eq!(state.tool_calls(), 2);
+        let end =
+            sample_token(&[], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(end, EOS, "the likeliest end the grammar admits");
+
+        let opts = capped_opts(None, "");
+        let mut state = state_for(&opts);
+        for token in [A, C, A] {
+            assert_eq!(
+                sample(cands(&[(token, 1.0)]), &opts, &mut state),
+                token
+            );
+        }
+        let more =
+            sample_token(&[], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(more, C, "uncapped, the model calls on");
+    }
+
+    /// The end is applied last: a mask, a ban or a penalty that would
+    /// refuse it cannot move it. A banned end of generation is passed
+    /// over for the next one.
+    #[test]
+    fn tool_call_cap_outlasts_later_masks() {
+        let mut opts = capped_opts(Some(1), "");
+        // Every end of generation denied by the chain.
+        opts.modes.insert(1, SamplingMode::deny_range(EOS..EOS + 1));
+        opts.modes
+            .insert(1, SamplingMode::deny_range(EOG_A..EOG_B + 1));
+        opts.repetition = Some(
+            RepetitionOptions::default()
+                .set_ignored_categories(std::iter::empty())
+                .set_penalty_repeat(2.0),
+        );
+        let mut state = state_for(&opts);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        let end =
+            sample_token(&[A], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(end, EOS);
+
+        opts.banned_specials = vec![EOS];
+        let end =
+            sample_token(&[A], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(end, EOG_A);
+    }
+
+    /// Where the calls must be closed (`b` here: a section close, an
+    /// exit marker), a call counts once the close alone would finish
+    /// the grammar, and the turn ends on the end of generation that
+    /// closes it — Gemma 4's `<|tool_response>` shape — never on one
+    /// the grammar refuses there.
+    #[test]
+    fn tool_call_cap_closes_a_section_with_its_exit() {
+        let opts = capped_opts(Some(1), "b");
+        let mut state = state_for(&opts);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        assert_eq!(state.tool_calls(), 1);
+        let end = sample_token(
+            &[],
+            cands(&[(C, 10.0), (EOS, 5.0), (EOG_A, 4.0), (EOG_B, 1.0)]),
+            &opts,
+            &mut state,
+            &MockModel,
+        )
+        .unwrap();
+        assert_eq!(end, EOG_B);
+    }
+
+    /// Only the cap's own grammar counts: a cap naming another grammar
+    /// (an output_config's, say) sees no calls.
+    #[test]
+    fn tool_call_cap_counts_only_its_grammar() {
+        let mut opts = capped_opts(Some(1), "");
+        let other = CompiledGrammar::parse(AB_GRAMMAR).expect("parses");
+        opts.tool_call_cap = Some(ToolCallCap::new(
+            NonZeroU32::MIN,
+            ToolCallCapSource::Request,
+            &other,
+            "",
+        ));
+        let mut state = state_for(&opts);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        assert_eq!(state.tool_calls(), 0);
+        assert_eq!(sample(wants_more(), &opts, &mut state), C);
+    }
+
+    /// A deferred (lazy) tool grammar counts once its trigger wakes it,
+    /// and its tally is the turn's: a reset zeroes it.
+    #[test]
+    fn tool_call_cap_counts_a_deferred_grammar() {
+        let grammar = CompiledGrammar::parse(CALLS_GRAMMAR).expect("parses");
+        let opts = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: None,
+            lazy_grammar: false,
+            deferred_grammar: Some(DeferredGrammar {
+                grammar: grammar.clone(),
+                activate_after: vec![b"a".to_vec()],
+                feed_trigger: true,
+            }),
+            tool_call_cap: Some(ToolCallCap::new(
+                NonZeroU32::new(2).unwrap(),
+                ToolCallCapSource::Sidecar,
+                &grammar,
+                "",
+            )),
+            ..SamplerConfig::default()
+        };
+        let mut state = state_for(&opts);
+        // Asleep, nothing counts.
+        assert_eq!(sample(cands(&[(X, 1.0)]), &opts, &mut state), X);
+        let spec = opts.deferred_grammar.as_ref().unwrap();
+        state.activate_deferred(spec, b"").unwrap();
+        for token in [A, C, A] {
+            assert_eq!(
+                sample(cands(&[(token, 1.0)]), &opts, &mut state),
+                token
+            );
+        }
+        assert_eq!(state.tool_calls(), 2);
+        let end =
+            sample_token(&[], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(end, EOS);
+        state.reset_constraints(&opts);
+        assert_eq!(state.tool_calls(), 0);
+    }
+
+    /// The tighter cap wins, the request's on a tie; neither set is no
+    /// cap at all.
+    #[test]
+    fn tool_call_cap_effective_precedence() {
+        use ToolCallCapSource::{Request, Sidecar};
+        let n = |n| NonZeroU32::new(n);
+        assert_eq!(ToolCallCap::effective(None, None), None);
+        assert_eq!(
+            ToolCallCap::effective(n(1), None),
+            Some((n(1).unwrap(), Request))
+        );
+        assert_eq!(
+            ToolCallCap::effective(None, n(3)),
+            Some((n(3).unwrap(), Sidecar))
+        );
+        assert_eq!(
+            ToolCallCap::effective(n(1), n(3)),
+            Some((n(1).unwrap(), Request))
+        );
+        assert_eq!(
+            ToolCallCap::effective(n(5), n(3)),
+            Some((n(3).unwrap(), Sidecar))
+        );
+        assert_eq!(
+            ToolCallCap::effective(n(3), n(3)),
+            Some((n(3).unwrap(), Request))
+        );
     }
 }
