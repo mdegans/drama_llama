@@ -26,6 +26,13 @@
 //! ids, not cut at the first boundary. Nothing here is sampler *state*:
 //! the copies in progress are derived from the token history at every
 //! step, so snapshot and restore are unaffected.
+//!
+//! The exemption keeps a copy from being *pushed* off its id; [`Lock`]
+//! keeps one from *drifting* off it (#144). Past [`LOCK_MIN`] matched
+//! characters of exactly one hex id, the sampler takes the model's
+//! favorite among the tokens that continue the id (`sample_token_in`),
+//! so a wrong digit sampled at an uncertain position cannot garble a
+//! UUID copied from far back in the context.
 
 use std::{
     cell::RefCell,
@@ -205,6 +212,8 @@ pub(crate) struct IdGuard<'a, M: Model> {
     starts: Vec<usize>,
     ids: &'a BTreeSet<Vec<u8>>,
     model: &'a M,
+    /// The history's last token, for [`Lock::fresh`].
+    last: Option<Token>,
     memo: RefCell<BTreeMap<Token, bool>>,
     scratch: RefCell<Vec<u8>>,
 }
@@ -232,6 +241,7 @@ impl<'a, M: Model> IdGuard<'a, M> {
             starts,
             ids,
             model,
+            last: tokens.last().copied(),
             memo: RefCell::new(BTreeMap::new()),
             scratch: RefCell::new(scratch),
         })
@@ -269,6 +279,137 @@ impl<'a, M: Model> IdGuard<'a, M> {
         core < word.len()
             && core > head.len()
             && self.ids.contains(&word[..core])
+    }
+}
+
+impl<'a, M: Model> IdGuard<'a, M> {
+    /// The copy the lock holds here, if any: the one live copy at least
+    /// [`LOCK_MIN`] bytes long that is a prefix of exactly one known id,
+    /// that id [`lockable`] and not yet complete. A prefix shared by two
+    /// ids waits until they diverge; two live copies with a claim each
+    /// are no lock either.
+    pub(crate) fn lock(&self) -> Option<Lock<'a>> {
+        let ids = self.ids;
+        let mut locks = self
+            .starts
+            .iter()
+            .map(|&s| &self.tail[s..])
+            .filter(|copy| copy.len() >= LOCK_MIN)
+            .filter_map(|copy| {
+                unique_extension(ids, copy).map(|id| (copy.len(), id))
+            });
+        let (matched, id) = locks.next()?;
+        if locks.next().is_some() {
+            return None;
+        }
+        let mut scratch = self.scratch.borrow_mut();
+        let last = self.last.map_or(0, |token| {
+            piece_into(self.model, token, &mut scratch);
+            scratch.len()
+        });
+        // Locked a token ago too iff the copy was already past the
+        // threshold and unique before the last piece.
+        let before = matched.saturating_sub(last);
+        // INVARIANT: `before <= matched < id.len()` (`unique_extension`
+        // returns only ids longer than the copy).
+        let fresh =
+            before < LOCK_MIN || unique_extension(ids, &id[..before]).is_none();
+        Some(Lock { id, matched, fresh })
+    }
+}
+
+/// The one known id `copy` is a proper prefix of, when that id is
+/// [`lockable`]. `None` when it is a prefix of none, of several, or
+/// only of itself (the copy is complete).
+fn unique_extension<'a>(
+    ids: &'a BTreeSet<Vec<u8>>,
+    copy: &[u8],
+) -> Option<&'a [u8]> {
+    let mut hits = ids
+        .range::<[u8], _>((Bound::Included(copy), Bound::Unbounded))
+        .take_while(|id| id.starts_with(copy));
+    let id = hits.next()?;
+    (hits.next().is_none() && id.len() > copy.len() && lockable(id))
+        .then_some(id.as_slice())
+}
+
+/// Matched bytes before the copy-lock engages: an Agora short label,
+/// the shortest prefix that names one item. Fewer is still the choice
+/// of *which* id to copy, which the lock never makes.
+pub(crate) const LOCK_MIN: usize = 8;
+
+/// Whether the lock may hold a copy to `id`: its first [`LOCK_MIN`]
+/// bytes are hex digits, and not one digit repeated. Hex ids (UUIDs)
+/// are the ones a model cannot reconstruct and must copy; the other
+/// known ids are words a model may legitimately write a neighbor of
+/// (today's `2026-10-04` when it means the 5th, `meta-governance` when
+/// it means `meta-gov`). A repeated digit is a sentinel
+/// (`00000000-0000-0000-0000-000000000001`, Agora's system sender): a
+/// nil UUID or a `…0002` must never be forced onto it.
+pub(crate) fn lockable(id: &[u8]) -> bool {
+    id.get(..LOCK_MIN).is_some_and(|head| {
+        head.iter().all(u8::is_ascii_hexdigit)
+            && head.windows(2).any(|w| !w[0].eq_ignore_ascii_case(&w[1]))
+    })
+}
+
+/// A copy the lock holds (#144): `id`, of which the history's tail
+/// spells the first `matched` bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Lock<'a> {
+    pub(crate) id: &'a [u8],
+    pub(crate) matched: usize,
+    /// The lock was not held a token ago: it engages here.
+    pub(crate) fresh: bool,
+}
+
+impl Lock<'_> {
+    /// The bytes still to copy. Never empty.
+    pub(crate) fn rest(&self) -> &[u8] {
+        // INVARIANT: `matched < id.len()` (see `IdGuard::lock`).
+        &self.id[self.matched..]
+    }
+
+    /// Whether `piece`, emitted next, keeps to the id: a prefix of the
+    /// rest; the whole rest, then a byte outside a word (`…c416"`); or,
+    /// at exactly [`LOCK_MIN`] matched, a word boundary — the copy ends
+    /// as a short label, which is the agent's choice to make.
+    pub(crate) fn admits(&self, piece: &[u8]) -> bool {
+        let rest = self.rest();
+        match piece.first() {
+            None => false,
+            Some(&first)
+                if self.matched == LOCK_MIN && !is_word_byte(first) =>
+            {
+                true
+            }
+            Some(_) => {
+                rest.starts_with(piece)
+                    || piece
+                        .strip_prefix(rest)
+                        .and_then(|past| past.first())
+                        .is_some_and(|&b| !is_word_byte(b))
+            }
+        }
+    }
+
+    /// Whether `piece` finishes the copy: the id is complete, or it
+    /// ends as a short label. The lock releases after it.
+    pub(crate) fn releases(&self, piece: &[u8]) -> bool {
+        piece.len() >= self.rest().len()
+            || (self.matched == LOCK_MIN && !self.rest().starts_with(piece))
+    }
+
+    /// Whether `token`'s piece keeps to the id ([`Self::admits`]),
+    /// using `buf` as scratch.
+    pub(crate) fn admits_token<M: Model>(
+        &self,
+        model: &M,
+        token: Token,
+        buf: &mut Vec<u8>,
+    ) -> bool {
+        piece_into(model, token, buf);
+        self.admits(buf)
     }
 }
 
@@ -603,6 +744,174 @@ mod tests {
                 "Sept. 7",
             ])
         );
+    }
+
+    /// Hex ids lock; dates, handles, short ids and repeated-digit
+    /// sentinels never do.
+    #[test]
+    fn lockable_ids_are_hex_and_not_sentinels() {
+        assert!(lockable(FULL.as_bytes()));
+        assert!(lockable(b"71da043d-c4ea-418b-b4c9-a019cf99c416"));
+        assert!(lockable(b"DEADBEEF-1"), "upper-case hex");
+        assert!(lockable(b"0000000a-0000-0000-0000-000000000000"));
+        for no in [
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000000",
+            "11111111-2222-3333-4444-555555555555",
+            "aaaaaaaa",
+            "AaaAaaaA-1",
+            "2026-10-04",
+            "meta-governance",
+            "GOV-2026-0006",
+            "0567",
+        ] {
+            assert!(!lockable(no.as_bytes()), "{no}");
+        }
+    }
+
+    /// Spells `text` one byte per token over a byte-identity table.
+    struct Bytes;
+
+    impl Model for Bytes {
+        type Error = std::convert::Infallible;
+        fn n_vocab(&self) -> i32 {
+            256
+        }
+        fn bos(&self) -> Token {
+            0
+        }
+        fn eos(&self) -> Token {
+            0
+        }
+        fn eot(&self) -> Token {
+            0
+        }
+        fn special_tokens(&self) -> Vec<Token> {
+            vec![]
+        }
+        fn eog_tokens(&self) -> Vec<Token> {
+            vec![]
+        }
+        fn max_token_len(&self) -> usize {
+            1
+        }
+        fn tokenize(&self, text: &str, _: bool) -> Vec<Token> {
+            text.bytes().map(Token::from).collect()
+        }
+        fn token_to_piece(&self, token: Token) -> String {
+            char::from(token as u8).to_string()
+        }
+        fn token_to_piece_ref(&self, token: Token, buf: &mut Vec<u8>) {
+            buf.clear();
+            buf.push(token as u8);
+        }
+        fn context_size(&self) -> i32 {
+            0
+        }
+        fn chat_template_source(&self) -> Option<String> {
+            None
+        }
+        fn recommended_sampling(&self) -> crate::SamplingParams {
+            crate::SamplingParams::default()
+        }
+    }
+
+    /// The lock after `text`, as (rest, matched, fresh).
+    fn lock_after(
+        text: &str,
+        set: &BTreeSet<Vec<u8>>,
+    ) -> Option<(String, usize, bool)> {
+        let toks = Bytes.tokenize(text, false);
+        IdGuard::build(&toks, set, &Bytes)?.lock().map(|l| {
+            (
+                String::from_utf8_lossy(l.rest()).into_owned(),
+                l.matched,
+                l.fresh,
+            )
+        })
+    }
+
+    #[test]
+    fn lock_engages_at_eight_unique_and_releases_at_the_end() {
+        let set = ids(&[FULL, "2026-10-04"]);
+        assert_eq!(lock_after("see 0567", &set), None, "too short");
+        assert_eq!(lock_after("see 05676b9", &set), None, "seven");
+        assert_eq!(
+            lock_after("see 05676b9d", &set),
+            Some(("-8aa7-430e-9138-444080e34065".into(), 8, true))
+        );
+        assert_eq!(
+            lock_after("[05676b9d-8", &set),
+            Some(("aa7-430e-9138-444080e34065".into(), 10, false))
+        );
+        assert_eq!(
+            lock_after(&format!(" {}", &FULL[..35]), &set).unwrap().0,
+            "5"
+        );
+        assert_eq!(lock_after(&format!(" {FULL}"), &set), None, "complete");
+        assert_eq!(lock_after("x05676b9d", &set), None, "not a word start");
+        assert_eq!(lock_after(" 2026-10-0", &set), None, "a date");
+    }
+
+    #[test]
+    fn lock_waits_for_a_shared_prefix_to_diverge() {
+        let twin = "05676b9d-8aa7-430e-9138-444080e3ffff";
+        let set = ids(&[FULL, twin]);
+        assert_eq!(lock_after(" 05676b9d-8aa7", &set), None);
+        assert_eq!(lock_after(" 05676b9d-8aa7-430e-9138-444080e3", &set), None);
+        assert_eq!(
+            lock_after(" 05676b9d-8aa7-430e-9138-444080e34", &set),
+            Some(("065".into(), 33, true)),
+            "diverged: engages, fresh"
+        );
+        // An id that is a prefix of another never locks onto either
+        // until past it.
+        let set = ids(&["05676b9d", "05676b9d-1"]);
+        assert_eq!(lock_after(" 05676b9d", &set), None);
+    }
+
+    #[test]
+    fn sentinel_never_locks() {
+        let sentinel = "00000000-0000-0000-0000-000000000001";
+        let set = ids(&[sentinel, FULL]);
+        assert_eq!(
+            lock_after(" 00000000-0000-0000-0000-00000000000", &set),
+            None
+        );
+        assert!(
+            lock_after(" 05676b9d-8", &set).is_some(),
+            "the real one does"
+        );
+    }
+
+    #[test]
+    fn lock_admits_continuations_and_the_label_boundary() {
+        let lock = |matched| Lock {
+            id: FULL.as_bytes(),
+            matched,
+            fresh: false,
+        };
+        let at8 = lock(8);
+        assert!(at8.admits(b"-"));
+        assert!(at8.admits(b"-8aa7"));
+        assert!(at8.admits(b"\""), "a short label may end here");
+        assert!(at8.admits(b" and"));
+        assert!(!at8.admits(b"0"), "drift");
+        assert!(!at8.admits(b""));
+        assert!(at8.releases(b"\""));
+        assert!(!at8.releases(b"-8aa7"));
+
+        let at10 = lock(10);
+        assert!(at10.admits(b"aa"));
+        assert!(!at10.admits(b"\""), "past the label, no early exit");
+        assert!(!at10.admits(b"ab"));
+
+        let near = lock(FULL.len() - 3);
+        assert!(near.admits(b"065"));
+        assert!(near.admits(b"065\","), "complete, then out of the word");
+        assert!(!near.admits(b"0650"), "complete, then more id bytes");
+        assert!(near.releases(b"065\","));
+        assert!(!near.releases(b"06"));
     }
 
     #[test]

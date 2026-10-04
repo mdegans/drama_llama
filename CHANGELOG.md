@@ -1487,6 +1487,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **An id copy-lock** (#144, `RepetitionOptions::id_copy_lock`, sidecar
+  `[repetition] id_copy_lock`, default `true`). Once a copy is eight
+  characters into exactly one known hex id from the prompt (the
+  `id_patterns` matches: a UUID), the sampler takes the model's
+  favorite among the tokens that continue that id and are legal there
+  (grammar, bans, framing), until the id is complete. cogito copied a
+  `reply_to` UUID 28 characters right and then drifted, 404ing a
+  comment that existed. Fewer than eight characters, a prefix two ids
+  share, and ids whose first eight are not hex (dates, handles) or are
+  one repeated digit (the `00000000-…-0001` system sender, a nil UUID)
+  never lock; at exactly eight the copy may still end as a short label.
+  With no legal continuation the step samples as before. A capped turn
+  is the tool-call cap's. Logged at `DEBUG` (`event =
+  "id_copy_lock"`, `outcome`, `id_len`, `matched`).
 - **A hard per-turn cap on client tool calls** (`ToolCallCap`). The
   per-model sampling sidecar's `max_tool_calls_per_turn` sets it, as
   does `Session::with_max_tool_calls_per_turn`. A request's

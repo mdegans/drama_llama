@@ -358,3 +358,237 @@ fn tool_call_cap_ends_a_parallel_turn_cache_stable() {
         second.usage,
     );
 }
+
+/// #144, live: cogito copied a reply_to UUID from a tool result 13
+/// messages back, got 28 characters right and drifted. Here the target
+/// comment sits in a feed tool result under five later rounds of other
+/// tool traffic, beside a decoy sharing its 8-hex label and the Agora
+/// system sender (`00000000-…-0001`). Every trial's `reply_to` must be
+/// a UUID the context holds, byte for byte — with the copy-lock on (the
+/// sidecar default). The same trials with the lock off are printed for
+/// comparison, not asserted: a drift there is the bug, not a failure.
+///
+/// Trials: `$DRAMA_LLAMA_ID_LOCK_TRIALS` (default 4), each its own seed
+/// off `common::test_seed()`.
+#[test]
+#[ignore = "requires cogito model"]
+fn id_copy_lock_keeps_a_far_back_uuid_exact() {
+    use drama_llama::{prompt::ToolResult, prompt::ToolUse, ToolChoice};
+    use std::{borrow::Cow, collections::BTreeSet};
+
+    const TARGET: &str = "71da043d-c4ea-418b-b4c9-a019cf99c416";
+    const DECOY: &str = "71da043d-0b1e-4c2f-9a7d-3e5f6a7b8c9d";
+    const SYSTEM: &str = "00000000-0000-0000-0000-000000000001";
+    let trials: u64 = std::env::var("DRAMA_LLAMA_ID_LOCK_TRIALS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+
+    // Deterministic filler UUIDs (splitmix64), so the context is full
+    // of near-miss hex.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut uuid = move || {
+        let mut next = || {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let (a, b) = (next(), next());
+        format!(
+            "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+            a >> 32,
+            (a >> 16) & 0xffff,
+            a & 0xfff,
+            (b >> 48) | 0x8000,
+            b & 0xffff_ffff_ffff
+        )
+    };
+    let authors = [
+        "ion-alphawave",
+        "quiet-lantern",
+        "moss-protocol",
+        "aegis",
+        "tidewatcher",
+        "copper-finch",
+    ];
+    let topics = [
+        "the seed vault inventory",
+        "the council's quorum rule",
+        "watering schedules",
+        "the archive migration",
+        "moderation appeals",
+    ];
+    let mut known: BTreeSet<String> =
+        [TARGET, DECOY, SYSTEM].map(String::from).into();
+    let mut feed =
+        format!("[system {SYSTEM}] Welcome to the commons. Be kind.\n");
+    for i in 0..24 {
+        let id = match i {
+            9 => TARGET.to_string(),
+            17 => DECOY.to_string(),
+            _ => uuid(),
+        };
+        known.insert(id.clone());
+        let (author, topic) = if i == 9 {
+            (
+                "ion-alphawave",
+                "the seed vault: the north shelf is mislabeled",
+            )
+        } else {
+            (authors[i % authors.len()], topics[i % topics.len()])
+        };
+        feed.push_str(&format!("comment {id} by {author}: on {topic}.\n"));
+    }
+
+    let tool =
+        |name: &'static str, props: serde_json::Value, required: &[&str]| {
+            Tool::builder(name)
+                .description(format!("Agora: {name}."))
+                .schema(json!({
+                    "type": "object",
+                    "properties": props,
+                    "required": required,
+                }))
+                .build()
+                .expect("valid tool")
+        };
+    let tools = vec![
+        tool("get_feed", json!({}), &[]).into(),
+        tool("get_content", json!({"id": {"type": "string"}}), &["id"]).into(),
+        tool(
+            "create_comment",
+            json!({
+                "reply_to": {"type": "string"},
+                "body": {"type": "string"},
+            }),
+            &["reply_to", "body"],
+        )
+        .into(),
+    ];
+    let call = |n: usize, name: &str, input: serde_json::Value| Message {
+        role: Role::Assistant,
+        content: Content(vec![Block::ToolUse {
+            call: ToolUse {
+                id: Cow::Owned(format!("call{n:05}")),
+                name: Cow::Owned(name.to_string()),
+                input,
+                cache_control: None,
+                caller: None,
+            },
+        }]),
+    };
+    let result = |n: usize, text: String| Message {
+        role: Role::User,
+        content: Content(vec![Block::ToolResult {
+            result: ToolResult {
+                tool_use_id: Cow::Owned(format!("call{n:05}")),
+                content: Content::text(text),
+                is_error: false,
+                cache_control: None,
+            },
+        }]),
+    };
+    let mut messages = vec![
+        Message {
+            role: Role::User,
+            content: Content::text("Catch up on the commons feed."),
+        },
+        call(0, "get_feed", json!({})),
+        result(0, feed),
+    ];
+    // Five later rounds of unrelated reads, each result full of ids.
+    for n in 1..=5 {
+        let post = uuid();
+        let mut body = format!("post {post} by quiet-lantern:\n");
+        for _ in 0..4 {
+            let id = uuid();
+            body.push_str(&format!("  reply {id}: agreed, see above.\n"));
+            known.insert(id);
+        }
+        known.insert(post.clone());
+        messages.push(call(n, "get_content", json!({ "id": post })));
+        messages.push(result(n, body));
+    }
+    messages.push(Message {
+        role: Role::User,
+        content: Content::text(
+            "Reply to ion-alphawave's comment about the seed vault, from \
+             the feed earlier, thanking them. Use create_comment with \
+             reply_to set to that comment's full id.",
+        ),
+    });
+    let prompt = Prompt {
+        system: Some(Content::text(
+            "You are aegis, an agent on Agora. Ids are UUIDs; copy them \
+             exactly.",
+        )),
+        messages,
+        tools: Some(tools),
+        tool_choice: Some(ToolChoice::method("create_comment")),
+        max_tokens: NonZeroU32::new(512).unwrap(),
+        ..Default::default()
+    };
+
+    let path = model_path();
+    let mut session = session_or_skip!();
+    let Some(path) = path else { return };
+    let sidecar = drama_llama::sidecar::load_sample_options(
+        &path.with_extension("sampling.toml"),
+    )
+    .expect("sidecar parses")
+    .expect("cogito ships a sampling sidecar");
+    assert!(
+        sidecar
+            .repetition
+            .as_ref()
+            .is_some_and(|r| !r.id_patterns().is_empty() && r.id_copy_lock()),
+        "the sidecar must name id_patterns and leave the lock on"
+    );
+    let base = common::test_seed().get();
+    for lock in [true, false] {
+        let mut opts = sidecar.clone();
+        opts.repetition = opts.repetition.map(|r| r.set_id_copy_lock(lock));
+        session = session.with_sample_options(opts);
+        let mut hits = 0;
+        for trial in 0..trials {
+            let seed = std::num::NonZeroU128::new(
+                base.wrapping_add(u128::from(trial)),
+            )
+            .or(std::num::NonZeroU128::new(1));
+            session = session.with_seed(seed);
+            let reply = session.complete_response(&prompt).expect("turn");
+            let reply_to = reply
+                .inner
+                .content
+                .0
+                .iter()
+                .find_map(|b| match b {
+                    Block::ToolUse { call }
+                        if call.name == "create_comment" =>
+                    {
+                        call.input["reply_to"].as_str().map(str::to_string)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let exact = known.contains(&reply_to);
+            hits += usize::from(reply_to == TARGET);
+            eprintln!(
+                "lock={lock} trial={trial} reply_to={reply_to:?} \
+                 known={exact} target={}",
+                reply_to == TARGET
+            );
+            if lock {
+                assert!(
+                    exact,
+                    "lock on, yet reply_to {reply_to:?} is no id in the \
+                     context: {:#?}",
+                    reply.inner.content
+                );
+            }
+        }
+        eprintln!("lock={lock}: {hits}/{trials} picked the target");
+    }
+}

@@ -1581,7 +1581,9 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     // A token that faithfully copies an identifier from the prompt is
     // exempt from the logit reduction in (a) and (b) alike — recorded,
     // never penalized. Built per step from the token history; nothing
-    // in `state`.
+    // in `state`. The same guard knows when a copy is far enough into
+    // exactly one id to be held to it: the id copy-lock (#144), applied
+    // below once the bans are known.
     //
     // The tool-call cap (`ToolCallCap`) is read first, off the raw
     // logits: once the turn has made its last call, the end of
@@ -1593,10 +1595,16 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
         .tool_call_cap_reached(opts)
         .filter(|_| !thought_open)
         .map(|cap| (cap, cap_eog(&candidates, opts, state, model)));
+    let id_guard = opts
+        .repetition
+        .as_ref()
+        .and_then(|r| ids::IdGuard::build(tokens, r.known_ids(), model));
+    let id_lock = id_guard
+        .as_ref()
+        .filter(|_| opts.repetition.as_ref().is_some_and(|r| r.id_copy_lock()))
+        .and_then(ids::IdGuard::lock);
     if let Some(repetition) = &opts.repetition {
         let incomplete = state.constrained_incomplete();
-        let id_guard =
-            ids::IdGuard::build(tokens, repetition.known_ids(), model);
         let id_guard = id_guard.as_ref().map(|g| g as &dyn RegionGuard);
         // Split borrow: the passes read the resolved ignore set and
         // the matcher positions, and mutate one stats accumulator —
@@ -1677,6 +1685,32 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     let reserved = reserved
         .filter(|r| !r.is_empty())
         .filter(|_| state.has_active_constraint());
+
+    // The id copy-lock (#144): mid-copy of exactly one known id, the
+    // model's favorite among the tokens that continue it takes the
+    // slot, and the rest of the chain is skipped — a forced token has
+    // nothing left to sample. Only among tokens every check below would
+    // pass, so it narrows within what is legal and never needs a rerun;
+    // with none, sampling proceeds untouched. A capped turn is the
+    // cap's: it stands aside there.
+    if let Some(token) = id_lock.filter(|_| capped.is_none()).and_then(|lock| {
+        id_lock_pick(
+            &lock,
+            &candidates,
+            IdLockChecks {
+                generated,
+                reserved,
+                banned,
+                banned_in_region,
+                sleeping,
+            },
+            opts,
+            state,
+            model,
+        )
+    }) {
+        return Ok(token);
+    }
 
     // Fallback snapshots (lazy-grammar check, emit-side specials ban,
     // and/or a sleeping deferred grammar's wake check): `Pcg64Mcg` is a
@@ -1980,6 +2014,104 @@ pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
     Ok(chosen)
 }
 
+/// The emission checks of [`sample_token_in`], for [`id_lock_pick`] to
+/// apply up front.
+struct IdLockChecks<'a> {
+    generated: &'a [u8],
+    reserved: Option<&'a crate::LiteralNeutralizer>,
+    /// The standing ban, with an open thought's opener.
+    banned: &'a [Token],
+    banned_in_region: &'a [Token],
+    sleeping: bool,
+}
+
+/// The id copy-lock's token (#144): of the candidates whose pieces keep
+/// to `lock`'s id ([`ids::Lock::admits`]), the highest-rated one every
+/// emission check passes — grammar and JSON matchers, `Deny` ranges,
+/// both bans (the in-region one wholesale, never weaker than the
+/// position-aware check), spelled framing, and an illegal wake. Never
+/// an end of generation. `None` when no token qualifies: the lock does
+/// not engage and the step samples as if it were off.
+fn id_lock_pick<M: crate::backend::Model + Sync>(
+    lock: &ids::Lock<'_>,
+    candidates: &Candidates,
+    checks: IdLockChecks<'_>,
+    opts: &SamplerConfig,
+    state: &SamplerState,
+    model: &M,
+) -> Option<Token> {
+    use rayon::prelude::*;
+    // The piece scan is the vocab-wide part; the checks below run on
+    // the handful it keeps (one per spelling length, give or take).
+    let mut admitted: Vec<crate::TokenData> = candidates
+        .as_slice()
+        .par_iter()
+        .map_init(
+            || Vec::with_capacity(model.max_token_len()),
+            |buf, td| lock.admits_token(model, td.id, buf).then_some(*td),
+        )
+        .flatten()
+        .collect();
+    admitted.sort_unstable_by(|a, b| b.logit.total_cmp(&a.logit));
+    let eog = model.eog_tokens();
+    let denied = |token: Token| {
+        opts.modes.iter().any(|mode| {
+            matches!(mode, SamplingMode::Deny { range } if range.contains(&token))
+        })
+    };
+    let legal = |token: Token| {
+        !eog.contains(&token)
+            && checks.banned.binary_search(&token).is_err()
+            && checks.banned_in_region.binary_search(&token).is_err()
+            && !denied(token)
+            && state.accepts_chosen(opts, token, model)
+            && !checks.reserved.is_some_and(|r| {
+                state.spells_forced_framing(
+                    opts,
+                    checks.generated,
+                    token,
+                    model,
+                    r,
+                )
+            })
+            && !(checks.sleeping
+                && state.wakes_deferred_illegally(
+                    opts,
+                    checks.generated,
+                    token,
+                    model,
+                ))
+    };
+    let pick = admitted.iter().map(|td| td.id).find(|&token| legal(token));
+    match pick {
+        Some(token) => {
+            let mut piece = Vec::with_capacity(model.max_token_len());
+            model.token_to_piece_ref(token, &mut piece);
+            let released = lock.releases(&piece);
+            if lock.fresh || released {
+                tracing::debug!(
+                    target: "drama_llama::sample",
+                    event = "id_copy_lock",
+                    outcome = if released { "released" } else { "engaged" },
+                    id_len = lock.id.len(),
+                    matched = lock.matched,
+                    "held a known-id copy to its id",
+                );
+            }
+        }
+        None => tracing::debug!(
+            target: "drama_llama::sample",
+            event = "id_copy_lock",
+            outcome = "no_legal_continuation",
+            id_len = lock.id.len(),
+            matched = lock.matched,
+            admitted = admitted.len(),
+            "no legal token continues the known id; sampling unchanged",
+        ),
+    }
+    pick
+}
+
 /// The end of generation a capped turn ends on: of the model's EOG
 /// tokens every active constraint admits here (and no ban refuses —
 /// none does in practice), the one `candidates`
@@ -2212,6 +2344,19 @@ mod tests {
         ".",
         "7",
         "8",
+        // 21+: the id copy-lock battery (#144) — the Agora sentinel
+        // `00000000-0000-0000-0000-000000000001` and the nil UUID, and
+        // the mock UUID's last group split three ways (`012345678`
+        // then `9ab`, the drift `9ac`, and `9ab",`, which completes the
+        // id and closes a JSON string).
+        "00000000",
+        "0000",
+        "000000000001",
+        "000000000000",
+        "012345678",
+        "9ab",
+        "9ac",
+        "9ab\",",
     ];
     const EOS: Token = 0;
     const A: Token = 1;
@@ -2231,6 +2376,14 @@ mod tests {
     const DOT: Token = 18;
     const SEVEN: Token = 19;
     const EIGHT: Token = 20;
+    const Z8: Token = 21;
+    const Z4: Token = 22;
+    const Z12_ONE: Token = 23;
+    const Z12_NIL: Token = 24;
+    const H9: Token = 25;
+    const T9AB: Token = 26;
+    const T9AC: Token = 27;
+    const T9AB_CLOSE: Token = 28;
     /// One canonical UUID as the mock spells it: `8-4-4-4-12`.
     const UUID_TOKENS: [Token; 10] =
         [DEAD, BEEF, DASH, CAFE, DASH, F00D, DASH, CAFE, DASH, HEX12];
@@ -4262,6 +4415,244 @@ mod tests {
         assert!(state.constrained_step() > 0);
     }
 
+    // ── Id copy-lock battery (#144) ──────────────────────────────────
+
+    /// Greedy, no penalty to speak of, `known` as the call's known ids:
+    /// whatever the sampler picks is the raw favorite or the lock's.
+    fn lock_opts(known: &[&str]) -> SamplerConfig {
+        SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: Some(
+                RepetitionOptions::default()
+                    .set_ignored_categories(std::iter::empty())
+                    .set_penalty_repeat(1.0)
+                    .set_penalty_freq(0.0)
+                    .set_penalty_present(0.0)
+                    .with_known_ids(
+                        known.iter().map(|id| id.as_bytes().to_vec()).collect(),
+                    ),
+            ),
+            deferred_grammar: None,
+            lazy_grammar: false,
+            ..SamplerConfig::default()
+        }
+    }
+
+    /// Feed `history`, then sample one token from `logits`.
+    fn pick_after(
+        opts: &SamplerConfig,
+        history: &[Token],
+        logits: &[(Token, f32)],
+    ) -> Token {
+        let mut state = state_for(opts);
+        history
+            .iter()
+            .for_each(|&t| state.advance(opts, t, &MockModel));
+        sample_token(history, dense(logits), opts, &mut state, &MockModel)
+            .unwrap()
+    }
+
+    /// ` deadbeef` then the first `n` tokens of the rest of the UUID.
+    fn uuid_after(n: usize) -> Vec<Token> {
+        std::iter::once(SPACE)
+            .chain(UUID_TOKENS.iter().copied().take(2 + n))
+            .collect()
+    }
+
+    /// Past eight matched characters the true continuation wins over a
+    /// drift the model rates higher; with the lock off, the drift wins.
+    #[test]
+    fn id_lock_forces_the_true_continuation() {
+        let opts = lock_opts(&[UUID_TEXT]);
+        // ` deadbeef-cafe-` — `f00d` is due, `beef` is the drift.
+        let history = uuid_after(3);
+        let drift = [(BEEF, 6.0), (F00D, 2.0)];
+        assert_eq!(pick_after(&opts, &history, &drift), F00D);
+        let mut off = opts.clone();
+        off.repetition = off.repetition.map(|r| r.set_id_copy_lock(false));
+        assert_eq!(pick_after(&off, &history, &drift), BEEF, "lock off");
+        // At exactly eight (` deadbeef`) the copy may end as a label,
+        // but not drift.
+        let history = uuid_after(0);
+        assert_eq!(pick_after(&opts, &history, &[(X, 6.0), (DASH, 2.0)]), DASH);
+        assert_eq!(
+            pick_after(&opts, &history, &[(SPACE, 6.0), (DASH, 2.0)]),
+            SPACE,
+            "a short label ends at a word boundary"
+        );
+        // Past the label, no early exit either.
+        let history = uuid_after(1);
+        assert_eq!(
+            pick_after(&opts, &history, &[(SPACE, 6.0), (CAFE, 2.0)]),
+            CAFE
+        );
+    }
+
+    /// Fewer than eight characters is still the choice of which id:
+    /// no lock.
+    #[test]
+    fn id_lock_waits_for_eight_characters() {
+        let opts = lock_opts(&[UUID_TEXT]);
+        assert_eq!(
+            pick_after(&opts, &[SPACE, DEAD], &[(X, 6.0), (BEEF, 2.0)]),
+            X
+        );
+    }
+
+    /// Two known ids sharing ` deadbeef-cafe-`: no lock there; once the
+    /// copy picks one (`f00d`), it holds.
+    #[test]
+    fn id_lock_waits_for_a_unique_prefix() {
+        let opts =
+            lock_opts(&[UUID_TEXT, "deadbeef-cafe-cafe-cafe-0123456789ab"]);
+        let at_fork = uuid_after(3);
+        assert_eq!(
+            pick_after(&opts, &at_fork, &[(BEEF, 6.0), (F00D, 2.0)]),
+            BEEF,
+            "shared prefix: sampling untouched"
+        );
+        let past_fork = uuid_after(4);
+        assert_eq!(
+            pick_after(&opts, &past_fork, &[(SPACE, 6.0), (DASH, 2.0)]),
+            DASH
+        );
+    }
+
+    /// The Agora sentinel never locks: with it the only known id, a
+    /// nil UUID is written freely — and the model's own `…0001` too.
+    #[test]
+    fn id_lock_never_holds_a_sentinel() {
+        let opts = lock_opts(&["00000000-0000-0000-0000-000000000001"]);
+        let history = [SPACE, Z8, DASH, Z4, DASH, Z4, DASH, Z4, DASH];
+        let nil = [(Z12_NIL, 6.0), (Z12_ONE, 2.0)];
+        assert_eq!(pick_after(&opts, &history, &nil), Z12_NIL);
+        let one = [(Z12_ONE, 6.0), (Z12_NIL, 2.0)];
+        assert_eq!(pick_after(&opts, &history, &one), Z12_ONE);
+        // A real id beside it still locks.
+        let opts =
+            lock_opts(&["00000000-0000-0000-0000-000000000001", UUID_TEXT]);
+        assert_eq!(
+            pick_after(&opts, &uuid_after(3), &[(BEEF, 6.0), (F00D, 2.0)]),
+            F00D
+        );
+    }
+
+    /// The lock prefers the model's favorite spelling, a token that
+    /// completes the id and leaves the word included, and releases once
+    /// the id is complete.
+    #[test]
+    fn id_lock_prefers_the_favorite_and_releases_at_the_end() {
+        let opts = lock_opts(&[UUID_TEXT]);
+        let mut history = uuid_after(7);
+        // ` deadbeef-cafe-f00d-cafe-`: both spellings continue the id.
+        assert_eq!(
+            pick_after(&opts, &history, &[(X, 9.0), (H9, 5.0), (HEX12, 4.0)]),
+            H9
+        );
+        history.push(H9);
+        assert_eq!(
+            pick_after(
+                &opts,
+                &history,
+                &[(T9AC, 9.0), (T9AB_CLOSE, 5.0), (T9AB, 4.0)]
+            ),
+            T9AB_CLOSE,
+            "complete, then out of the word"
+        );
+        history.push(T9AB);
+        assert_eq!(
+            pick_after(&opts, &history, &[(X, 9.0), (SPACE, 4.0)]),
+            X,
+            "complete: released"
+        );
+    }
+
+    /// Inside a JSON string body (the tool-argument case) the lock holds
+    /// the copy and the grammar still completes — the closing piece is
+    /// both the id's end and the region's exit.
+    #[test]
+    fn id_lock_holds_inside_a_constrained_string() {
+        let mut opts = str_opts(true, false);
+        opts.repetition = opts.repetition.map(|r| {
+            r.set_penalty_repeat(1.0)
+                .set_penalty_freq(0.0)
+                .set_penalty_present(0.0)
+                .with_known_ids(std::collections::BTreeSet::from([UUID_TEXT
+                    .as_bytes()
+                    .to_vec()]))
+        });
+        for lazy in [false, true] {
+            opts.lazy_grammar = lazy;
+            let mut state = state_for(&opts);
+            let mut tokens = vec![QUOTE];
+            tokens.extend(&UUID_TOKENS[..2]);
+            tokens.extend([DASH, CAFE, DASH, F00D, DASH, CAFE, DASH, H9]);
+            tokens
+                .iter()
+                .for_each(|&t| state.advance(&opts, t, &MockModel));
+            let drift = [(T9AC, 9.0), (QUOTE_COMMA, 8.0), (T9AB_CLOSE, 2.0)];
+            let tok = sample_token(
+                &tokens,
+                dense(&drift),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap();
+            assert_eq!(tok, T9AB_CLOSE, "lazy={lazy}");
+            state.advance(&opts, tok, &MockModel);
+            assert!(state.grammar_complete(), "lazy={lazy}");
+        }
+    }
+
+    /// No legal continuation (here the standing ban refuses the dash
+    /// that is due), no lock: sampling proceeds as without one.
+    #[test]
+    fn id_lock_stands_aside_when_nothing_legal_continues() {
+        let mut opts = lock_opts(&[UUID_TEXT]);
+        opts.banned_specials = vec![DASH];
+        // ` deadbeef-cafe`: a dash is due.
+        let history = uuid_after(2);
+        assert_eq!(
+            pick_after(&opts, &history, &[(X, 6.0), (DASH, 9.0)]),
+            X,
+            "the ban governs; the drift is the model's next choice"
+        );
+    }
+
+    /// With no known ids, the lock's presence changes nothing: a
+    /// sampled (not greedy) stream and its state are identical with the
+    /// lock on and off.
+    #[test]
+    fn id_lock_without_known_ids_changes_nothing() {
+        let run = |on: bool| {
+            let mut opts = lock_opts(&[]);
+            opts.modes = vec![SamplingMode::Temperature { t: 1.0 }];
+            opts.repetition = opts.repetition.map(|r| r.set_id_copy_lock(on));
+            let mut state = state_for(&opts);
+            let mut tokens = vec![SPACE];
+            for _ in 0..24 {
+                let c = dense(&[
+                    (DEAD, 3.0),
+                    (BEEF, 3.0),
+                    (DASH, 2.5),
+                    (CAFE, 2.0),
+                    (SPACE, 1.0),
+                ]);
+                let tok =
+                    sample_token(&tokens, c, &opts, &mut state, &MockModel)
+                        .unwrap();
+                state.advance(&opts, tok, &MockModel);
+                tokens.push(tok);
+            }
+            (tokens, state)
+        };
+        let (on, on_state) = run(true);
+        let (off, off_state) = run(false);
+        assert_eq!(on, off);
+        assert_eq!(on_state, off_state);
+    }
+
     /// `root ::= "a" ( "c" "a" )*` — a call is `a`, joined by `c`: the
     /// parallel-call shape (`call ( SEP call )*`).
     const CALLS_GRAMMAR: &str = r#"root ::= "a" ( "c" "a" )*"#;
@@ -4464,6 +4855,43 @@ mod tests {
 
     /// The tighter cap wins, the request's on a tie; neither set is no
     /// cap at all.
+    /// The cap and the lock never contend in practice (the cap acts
+    /// between calls, the lock mid-id), but where both could, the cap
+    /// wins: a known `acacacacac` is nine bytes into its copy when the
+    /// fifth call completes, and the turn still ends.
+    #[test]
+    fn tool_call_cap_outranks_the_id_lock() {
+        let mut opts = capped_opts(Some(5), "");
+        opts.repetition = Some(
+            RepetitionOptions::default()
+                .set_ignored_categories(std::iter::empty())
+                .set_penalty_repeat(1.0)
+                .set_penalty_freq(0.0)
+                .set_penalty_present(0.0)
+                .with_known_ids(std::collections::BTreeSet::from([
+                    b"acacacacac".to_vec(),
+                ])),
+        );
+        let mut state = state_for(&opts);
+        let mut tokens = Vec::new();
+        for _ in 0..12 {
+            let tok = sample_token(
+                &tokens,
+                dense(&[(C, 10.0), (A, 9.0), (EOS, 3.0), (EOG_A, 1.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap();
+            if crate::backend::Model::eog_tokens(&MockModel).contains(&tok) {
+                break;
+            }
+            state.advance(&opts, tok, &MockModel);
+            tokens.push(tok);
+        }
+        assert_eq!(tokens, [A, C, A, C, A, C, A, C, A]);
+    }
+
     #[test]
     fn tool_call_cap_effective_precedence() {
         use ToolCallCapSource::{Request, Sidecar};

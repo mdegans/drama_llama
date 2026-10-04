@@ -77,6 +77,13 @@ pub struct RepetitionOptions {
     ///
     /// [`IdGuard`]: super::ids::IdGuard
     pub(crate) id_patterns: Vec<IdPattern>,
+    /// Hold a copy of a known id to the id once it is under way (#144):
+    /// past eight matched characters of exactly one id, the next token
+    /// must continue it (`IdGuard::lock` has the rule and its
+    /// exceptions). Sampling noise at one uncertain hex digit otherwise
+    /// garbles a UUID copied from deep in the context. Inert without
+    /// known ids. Default **on**.
+    pub(crate) id_copy_lock: bool,
     /// The call's known ids, derived from the prompt by `Session`
     /// (`session::prompt_known_ids`) — per-call data, never written to
     /// a sidecar or carried in a cached snapshot.
@@ -181,6 +188,8 @@ struct RepetitionOptionsShadow {
     ignored: BTreeSet<NGram>,
     #[serde(default)]
     id_patterns: Vec<IdPattern>,
+    #[serde(default = "default_id_copy_lock")]
+    id_copy_lock: bool,
     #[serde(default = "default_window_size")]
     window_size: NonZeroU32,
     #[serde(default = "default_decay")]
@@ -222,6 +231,7 @@ impl TryFrom<RepetitionOptionsShadow> for RepetitionOptions {
             ignored_categories: s.ignored_categories,
             ignored: s.ignored,
             id_patterns: s.id_patterns,
+            id_copy_lock: s.id_copy_lock,
             // Per-call data; a sidecar never carries it.
             known_ids: BTreeSet::new(),
             window_size: s.window_size,
@@ -244,6 +254,13 @@ impl TryFrom<RepetitionOptionsShadow> for RepetitionOptions {
 /// Default for the `constrained_regions` gate — on. A sidecar that
 /// predates the field keeps the loop-breaking behavior.
 fn default_constrained_regions() -> bool {
+    true
+}
+
+/// Default for the id copy-lock gate — on. It is inert until a
+/// sidecar names `id_patterns`, so a sidecar that predates the field
+/// keeps its behavior until it does.
+fn default_id_copy_lock() -> bool {
     true
 }
 
@@ -299,6 +316,7 @@ impl Default for RepetitionOptions {
             // the consumer's knowledge (Agora's UUIDs and GOV ids), not
             // the crate's.
             id_patterns: Vec::new(),
+            id_copy_lock: default_id_copy_lock(),
             known_ids: BTreeSet::new(),
             window_size: default_window_size(),
             decay: default_decay(),
@@ -382,6 +400,19 @@ impl RepetitionOptions {
         It: IntoIterator<Item = IdPattern>,
     {
         self.id_patterns = patterns.into_iter().collect();
+        self
+    }
+
+    /// Whether a copy of a known id is held to the id. See the field
+    /// docs.
+    pub fn id_copy_lock(&self) -> bool {
+        self.id_copy_lock
+    }
+
+    /// Enable or disable the id copy-lock. Off leaves a copy to the
+    /// sampler alone; the penalty exemption stands either way.
+    pub fn set_id_copy_lock(mut self, on: bool) -> Self {
+        self.id_copy_lock = on;
         self
     }
 
@@ -925,6 +956,14 @@ impl RepetitionOptions {
                  any grammar is active.",
             );
 
+        // Id copy-lock (#144)
+        resp |= ui.checkbox(&mut self.id_copy_lock, "Lock id copies")
+            .on_hover_text_at_pointer(
+                "Once eight characters of exactly one known id (a hex UUID from the \
+                 prompt) are written, the next tokens must continue that id until it is \
+                 complete. Keeps a copied id from drifting at an uncertain digit.",
+            );
+
         // Prompt-seeding gates (#106)
         resp |= ui.checkbox(&mut self.seed_tool_results, "Seed from tool results")
             .on_hover_text_at_pointer(
@@ -1449,6 +1488,8 @@ mod invariant_tests {
             assert!(o.seed_tool_results());
             assert!(o.seed_tool_args());
             assert!(o.seed_constrained_regions());
+            // The id copy-lock is on, inert without id patterns.
+            assert!(o.id_copy_lock());
         }
 
         /// The `ignored_stopwords` legacy key still maps onto
@@ -1490,6 +1531,17 @@ mod invariant_tests {
             let back: RepetitionOptions = ::toml::from_str(&s).unwrap();
             assert_eq!(back.id_patterns(), o.id_patterns());
             assert!(back.known_ids().is_empty(), "per-call data, not config");
+        }
+
+        /// `id_copy_lock = false` turns the lock off and round-trips.
+        #[test]
+        fn id_copy_lock_switch() {
+            let doc = format!("{REQUIRED}id_copy_lock = false\n");
+            let o: RepetitionOptions = ::toml::from_str(&doc).unwrap();
+            assert!(!o.id_copy_lock());
+            let s = ::toml::to_string(&o).unwrap();
+            let back: RepetitionOptions = ::toml::from_str(&s).unwrap();
+            assert!(!back.id_copy_lock(), "{s}");
         }
 
         /// An invalid pattern is rejected at the door, like an inverted

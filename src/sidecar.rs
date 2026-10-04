@@ -73,7 +73,14 @@
 //!   ([`SamplingMode::TopP`](crate::SamplingMode::TopP),
 //!   [`SamplingMode::Mirostat`](crate::SamplingMode::Mirostat), etc.)
 //! - `repetition` — `Some(RepetitionOptions)` to enable, `None` to
-//!   disable.
+//!   disable. Its `id_patterns` name what an identifier looks like;
+//!   every match in the prompt is a *known id*, never penalized when
+//!   copied faithfully. `id_copy_lock` (default `true`, inert without
+//!   `id_patterns`) also holds a copy to its id: once eight characters
+//!   of exactly one known hex id (a UUID, not a sentinel like
+//!   `00000000-…-0001`) are written, the next tokens must continue it
+//!   until it is complete
+//!   ([`RepetitionOptions::id_copy_lock`](crate::RepetitionOptions::id_copy_lock)).
 //! - `max_tool_calls_per_turn` — the most client tool calls one turn
 //!   may make ([`SamplerConfig::max_tool_calls_per_turn`]); absent is
 //!   unlimited. The sampler ends a turn on the model's own EOG once its
