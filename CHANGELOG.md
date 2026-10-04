@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **An escaped closer is repaired in place instead of resampling the
+  turn (#140).** When the model writes `\"}` where it means `"}` and
+  reaches for the end of its turn, the grammar still holds the string
+  open and the overrule used to reject the whole turn (blallama then
+  redrew it from the start: minutes per draw on Mistral Small 4). The
+  session now rolls back to the start of the token holding that
+  backslash — KV, tokens, matchers and text — writes again what the
+  token held before it, and redraws with backslash-led tokens banned
+  for one step, so the model writes the `"` it meant. Once a turn,
+  only on a model whose KV a truncate rewinds (dense), and on a stream
+  only while nothing past the rollback point has been released (a tool
+  call is; an answer's text is not). Anything else, or a redraw that
+  overrules again, stands as the `GrammarViolation` it was. Each try is
+  logged as `escaped_closer_repair` with its `outcome` (`repaired`,
+  `repeat_overrule`, `unrestorable`, `shape_mismatch`, `streamed`) and
+  the tokens `rolled_back`.
 - **BREAKING: `BlockStream::stop_reason` returns
   `Option<(StopReason, Option<&str>)>`** — the reason is no longer an
   `Option`, because a finished turn always has one (below).
