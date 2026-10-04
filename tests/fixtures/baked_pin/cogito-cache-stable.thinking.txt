@@ -5,7 +5,7 @@ Be brief.
 
 # Tools
 
-You may call one or more functions to assist with the user query.
+You may call up to three functions per turn to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>

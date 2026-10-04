@@ -1820,6 +1820,13 @@ fn cogito_thinking_renders_incantation_and_preopens() {
         let stock_gen = stock
             .render_with(&prompt, &session_opts(&syntax, true))
             .expect("render");
+        // Stock, but for the call budget in the tools preamble.
+        let stock_gen = stock_gen.replace(
+            "You may call one or more functions to assist with the user \
+             query.",
+            "You may call up to three functions per turn to assist with \
+             the user query.",
+        );
         assert_eq!(gen, stock_gen, "thinking off renders as stock");
     }
 }

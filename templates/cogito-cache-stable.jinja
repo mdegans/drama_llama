@@ -8,6 +8,10 @@
     the turn does not already end in whitespace; an assistant turn
     renders its thoughts as `<think>\n…\n</think>` where the model wrote
     them; and a thinking-on generation prompt pre-opens `<think>\n`.
+    The tools preamble allows up to three calls a turn: with parallel
+    calls in its history cogito escalated to sixty in one turn and to
+    call loops that ran to `max_tokens` ("then end your turn" made it
+    stop before acting, half the time).
     Stock never renders a thought (deep thinking was prompt-only, and
     the model's `<think>` came back as prose); see the patch comments in
     the message loop. The system/tools header (with its `Enable deep
@@ -39,7 +43,7 @@
     {%- endif %}
     {{- "# Tools
 
-You may call one or more functions to assist with the user query.
+You may call up to three functions per turn to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>" }}
