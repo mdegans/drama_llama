@@ -6,9 +6,6 @@ on: pull_request
 jobs:
   bisect:
     runs-on: [self-hosted, linux]
-    concurrency:
-      group: gpu-${{ github.repository }}
-      cancel-in-progress: false
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "16"
@@ -34,7 +31,7 @@ jobs:
       - name: both determinism tests
         run: >
           cargo nextest run --no-fail-fast --test-threads 1 --run-ignored all
-          --features toml,serde,stats,json-schema,llama-cpp,mtmd,cli,axum,cuda
+          --features toml,serde,stats,json-schema,llama-cpp,cli,axum,cuda
           -E 'test(=llama_cpp::engine::tests::test_predict_pieces_resuming_matches) | test(=regression_llama_cpp_baseline)'
       - if: always()
         run: rm -rf "$GITHUB_WORKSPACE/target"
