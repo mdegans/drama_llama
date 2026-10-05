@@ -868,9 +868,10 @@ pub(crate) fn escaped_closer(text: &[u8]) -> Option<(usize, Vec<u8>)> {
 /// The repair's run-state (see [`PiecePredictor::with_closer_repair`]).
 #[derive(Debug, Default)]
 struct CloserRepairState {
-    /// Taken before the newest token whose piece holds a backslash,
-    /// drawn inside a constraint: the one a rollback rewinds to.
-    mark: Option<BackslashMark>,
+    /// Taken before each of the newest [`CLOSER_MARKS`] tokens whose
+    /// piece holds a backslash, drawn inside a constraint, oldest
+    /// first: a rollback rewinds to the one holding the quote's.
+    marks: std::collections::VecDeque<BackslashMark>,
     /// Bytes of `text` the caller has delivered: no rollback reaches
     /// below them.
     floor: usize,
@@ -882,6 +883,14 @@ struct CloserRepairState {
     /// Ban backslash-led tokens on the next drawn step.
     ban: bool,
 }
+
+/// How many backslash marks the repair keeps (#148). Past the escaped
+/// quote, only escaped whitespace holds a backslash, so the ring reaches
+/// the quote's token across up to three escaped-whitespace tokens after
+/// it (`\n\n` and a `\t`, split one escape a token). A longer tail
+/// falls back to the overrule. Each mark clones the matchers, so the
+/// ring stays small.
+pub(crate) const CLOSER_MARKS: usize = 4;
 
 /// [`TokenPredictor`] just before it drew a token holding a backslash.
 #[derive(Debug)]
@@ -1161,14 +1170,19 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         &mut self,
     ) -> Option<Result<Rewind, CloserRepairOutcome>> {
         use CloserRepairOutcome::{ShapeMismatch, Streamed, Unrestorable};
-        let (mark, floor) = match self.closer.as_mut() {
-            Some(closer) => (closer.mark.take(), closer.floor),
-            None => (None, 0),
+        let (marks, floor) = match self.closer.as_mut() {
+            Some(closer) => (std::mem::take(&mut closer.marks), closer.floor),
+            None => Default::default(),
         };
         let model = &self.inner.engine.model;
         let config = &self.options.sample_options;
-        let found = mark.and_then(|mark| {
-            let (backslash, closers) = escaped_closer(self.text.as_bytes())?;
+        let shape = escaped_closer(self.text.as_bytes());
+        let found = shape.and_then(|(backslash, closers)| {
+            // The newest mark at or before the backslash: the token
+            // holding it, when that one was marked. Later marks are the
+            // escaped whitespace after the quote.
+            let mark =
+                marks.into_iter().rev().find(|m| m.text_len <= backslash)?;
             // What the marked token wrote before the backslash, which
             // must be the one it holds.
             let prefix = self.text.get(mark.text_len..backslash)?.to_owned();
@@ -1251,10 +1265,10 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
 
     /// Before `token` lands (the matchers not yet advanced, `text` not
     /// yet grown): when its piece holds a backslash and it was drawn
-    /// inside a constraint, mark where a rollback to it lands. A
-    /// backslash that cannot be marked — one completing a codepoint an
-    /// earlier token opened — clears the mark, so no rollback reaches
-    /// past it.
+    /// inside a constraint, mark where a rollback to it lands (the
+    /// oldest of [`CLOSER_MARKS`] falls out). A backslash that cannot be
+    /// marked — one completing a codepoint an earlier token opened —
+    /// clears the marks, so no rollback reaches past it.
     fn mark_backslash(&mut self, token: Token) {
         let Some(closer) = self
             .closer
@@ -1271,9 +1285,16 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         if !piece.contains(&b'\\') {
             return;
         }
-        closer.mark = (self.state.constrained_incomplete()
+        if !(self.state.constrained_incomplete()
             && self.reassembler.carry.is_empty())
-        .then(|| BackslashMark {
+        {
+            closer.marks.clear();
+            return;
+        }
+        if closer.marks.len() == CLOSER_MARKS {
+            closer.marks.pop_front();
+        }
+        closer.marks.push_back(BackslashMark {
             token,
             at: self.inner.tokens.len(),
             n_decode: self.inner.n_decode,
@@ -2302,6 +2323,8 @@ mod tests {
         assert_eq!(at("{\"c\":\"text\\\"\n}"), Some((backslash, "}".into())));
         assert_eq!(at(r#"{"c":"text\"\n}"#), Some((backslash, "}".into())));
         assert_eq!(at(r#"{"c":"text\" } "#), Some((backslash, "}".into())));
+        assert_eq!(at(r#"{"c":"text\"\n\n}"#), Some((backslash, "}".into())));
+        assert_eq!(at(r#"{"c":"text\"\t }"#), Some((backslash, "}".into())));
         assert_eq!(
             at(r#"{"a":[{"c":"text\"}]}"#),
             Some((r#"{"a":[{"c":"text"#.len(), "}]}".into()))
