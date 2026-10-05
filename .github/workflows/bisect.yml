@@ -1,0 +1,41 @@
+# Throwaway: bisects the CUDA greedy drift seen on the 0.9.0 PR (#147)
+# across llama-cpp-sys-3 releases, at v0.8.3 where both tests passed in
+# July. Never merged.
+name: bisect
+on: pull_request
+jobs:
+  bisect:
+    runs-on: [self-hosted, linux]
+    concurrency:
+      group: gpu-${{ github.repository }}
+      cancel-in-progress: false
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "16"
+      CMAKE_BUILD_PARALLEL_LEVEL: "16"
+      RAYON_NUM_THREADS: "16"
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        sys: ["0.8.1", "0.8.2", "0.8.3", "0.8.4"]
+    name: llama-cpp-sys-3 ${{ matrix.sys }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/runner-path
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - run: nvidia-smi
+      - uses: ./.github/actions/link-models
+      - run: |
+          cargo generate-lockfile
+          cargo update -p llama-cpp-sys-3 --precise ${{ matrix.sys }}
+          grep -A1 'name = "llama-cpp-sys-3"' Cargo.lock
+      - name: resuming matches fresh
+        if: always()
+        run: python3 scripts/test.py run -c llama-cpp -f test_predict_pieces_resuming_matches
+      - name: regression baseline
+        if: always()
+        run: python3 scripts/test.py run -c llama-cpp -f regression_llama_cpp_baseline
+      - if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/target"
