@@ -1,0 +1,133 @@
+# Release: tag and publish to crates.io. `Cargo.toml`'s version is the single
+# source of truth.
+#
+# **Releasing is merging a version bump.** On every push to `main` the
+# `version` job reads the crate version; if tag `v<version>` does not exist
+# yet, it creates it on that commit and this same run publishes. No hand
+# tagging, no publishing from a laptop — tags drifted from crates.io through
+# 0.8.x (`v0.6.0`, `v0.6.1`, `v0.8.3` were missing until 2026-10-05), which is
+# what this exists to end. (It has to be one run: a tag pushed with the
+# workflow's GITHUB_TOKEN deliberately triggers no further workflows.) Pushing
+# a `v*` tag by hand still works and must match the crate version. A main
+# push that doesn't change the version does nothing here.
+#
+# What gets published was tested: main only moves through a PR whose required
+# checks (ci.yml, the CUDA tier included) passed.
+#
+# crates.io needs no secret: `publish` uses trusted publishing (GitHub OIDC ->
+# a short-lived crates.io token, revoked when the job ends). One-time setup on
+# crates.io: drama_llama -> Settings -> Trusted Publishing -> GitHub, owner
+# `mdegans`, repository `drama_llama`, workflow `release.yml`.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+# Two merges in quick succession must not race to tag and publish.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Read the crate version and decide whether this run releases:
+  #  - a `v*` tag push releases iff the tag matches the version exactly (a
+  #    mistagged release fails before anything publishes);
+  #  - a push to main releases iff `v<version>` doesn't exist yet, and tags
+  #    the commit first.
+  version:
+    runs-on: [self-hosted, linux]
+    permissions:
+      # Pushing the release tag.
+      contents: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      release: ${{ steps.decide.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read crate version
+        id: meta
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether this run releases (and tag it if from main)
+        id: decide
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          TAG="v$VERSION"
+          case "$GITHUB_EVENT_NAME:$GITHUB_REF_TYPE" in
+            push:tag)
+              [ "$GITHUB_REF_NAME" = "$TAG" ] || {
+                echo "::error::tag $GITHUB_REF_NAME != $TAG (crate version)"
+                exit 1
+              }
+              echo "release=true" >> "$GITHUB_OUTPUT"
+              ;;
+            push:branch)
+              # The commit the tag points at (the peeled `^{}` line for an
+              # annotated tag, else the lightweight tag's own line).
+              TAGGED=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" \
+                | sort -k2 | tail -1 | cut -f1)
+              if [ -n "$TAGGED" ] && [ "$TAGGED" = "$GITHUB_SHA" ]; then
+                # A re-run of a release that already tagged this commit
+                # (cancelled or failed after tagging): carry on. A version
+                # already on crates.io makes `cargo publish` fail loudly,
+                # never publish twice.
+                echo "$TAG already points at $GITHUB_SHA; re-running the release."
+                echo "release=true" >> "$GITHUB_OUTPUT"
+              elif [ -n "$TAGGED" ]; then
+                echo "$TAG already exists (at $TAGGED); nothing to release."
+                echo "release=false" >> "$GITHUB_OUTPUT"
+              else
+                git tag "$TAG" "$GITHUB_SHA"
+                git push origin "refs/tags/$TAG"
+                echo "Tagged $TAG at $GITHUB_SHA; releasing."
+                echo "release=true" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            *)
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  publish:
+    if: needs.version.outputs.release == 'true'
+    needs: [version]
+    # Self-hosted like every other job here: `cargo publish` verifies by
+    # building the packaged crate with default features, which compiles
+    # llama.cpp (CPU — `cuda` is not default), and this box has the cmake
+    # toolchain ci.yml already relies on.
+    runs-on: [self-hosted, linux]
+    permissions:
+      contents: read
+      # The OIDC token crates.io exchanges for a short-lived publish token.
+      id-token: write
+    env:
+      CARGO_BUILD_JOBS: "16"
+      CMAKE_BUILD_PARALLEL_LEVEL: "16"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/runner-path
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
+
+      # See ci.yml's `gate` job: a llama.cpp build is gigabytes, and this box
+      # is shared with the GPU tier.
+      - name: reclaim disk
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/target"
