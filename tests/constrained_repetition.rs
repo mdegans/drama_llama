@@ -235,6 +235,10 @@ fn seeded_history_pressures_constrained_region() {
         "the string must still close under seeded pressure: {text_on:?}",
     );
 
+    // One model at a time: two 13 GB sessions don't fit a 24 GB card,
+    // and the second load fails (it passes only on unified memory).
+    drop(on);
+
     // Counterfactual: seeding off (constrained_regions stays on).
     let mut off = seeded_session(|r| {
         r.set_seed_constrained_regions(false)
