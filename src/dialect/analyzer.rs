@@ -23,6 +23,8 @@
 use minijinja::{Environment, UndefinedBehavior};
 use serde_json::{json, Value};
 
+use crate::json_canon::JsonSpacing;
+
 use super::segment::{
     after_common_suffix, calculate_diff_split, find_first_marker,
     find_last_marker, marker_after, marker_before, prune_whitespace_segments,
@@ -30,7 +32,7 @@ use super::segment::{
 };
 use super::{
     CallIdPosition, CallSyntax, ContentMode, ContentSyntax, Family, JsonFields,
-    ReasoningMode, ReasoningSyntax,
+    ReasoningMode, ReasoningReingest, ReasoningSyntax,
 };
 
 // Sentinel payloads, verbatim from upstream — chosen to be
@@ -103,6 +105,9 @@ struct Params {
     tools: Value,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    /// `None` leaves `reasoning_effort` undefined (the template's
+    /// default applies).
+    reasoning_effort: Option<&'static str>,
 }
 
 impl Default for Params {
@@ -112,6 +117,7 @@ impl Default for Params {
             tools: Value::Null,
             add_generation_prompt: false,
             enable_thinking: true,
+            reasoning_effort: None,
         }
     }
 }
@@ -145,6 +151,11 @@ impl<'s> Probe<'s> {
             // Deterministic: probing must not depend on wall clock.
             "01 Jan 2026".to_string()
         });
+        // Same filter set as the real render environments: the probe
+        // measures bytes (spacing, escaping) that `ChatTemplate` must
+        // then reproduce, and an owned template's `json_dumps` filter
+        // must resolve here or its analysis fails outright.
+        crate::chat_template::register_template_filters(&mut env);
         env.add_template_owned("probe", source.to_string())?;
         Ok(Self {
             env,
@@ -164,6 +175,13 @@ impl<'s> Probe<'s> {
             add_generation_prompt => params.add_generation_prompt,
             enable_thinking => params.enable_thinking,
             date_string => "01 Jan 2026",
+        };
+        let ctx = match params.reasoning_effort {
+            Some(effort) => minijinja::context! {
+                reasoning_effort => effort,
+                ..ctx
+            },
+            None => ctx,
         };
         // `catch_unwind` in addition to `.ok()`: some templates index
         // `messages[0]` unconditionally and minijinja *panics* (not
@@ -279,7 +297,12 @@ pub fn analyze_template(
     // the differential probes can't segment — and whose guard
     // `raise_exception`s the probe payloads may trip — so any probe
     // result would be discarded noise anyway.
-    if let Some(hand_built) = sniff_hand_built(source) {
+    if let Some(mut hand_built) = sniff_hand_built(source) {
+        // The effort knob is measured, not hand-built: gpt-oss reads
+        // `reasoning_effort` into its system prefix.
+        if let Ok(probe) = Probe::new(source, bos, eos) {
+            hand_built.reasoning.efforts = measure_reasoning_efforts(&probe);
+        }
         return Ok(hand_built);
     }
 
@@ -393,6 +416,9 @@ fn analyze_reasoning(probe: &Probe) -> ReasoningSyntax {
     compare_reasoning_presence(probe, &mut r);
     compare_thinking_enabled(probe, &mut r);
     compare_reasoning_scope(probe, &mut r);
+    compare_reasoning_reingest(probe, &mut r);
+    measure_reasoning_separator(probe, &mut r);
+    r.efforts = measure_reasoning_efforts(probe);
     r
 }
 
@@ -581,6 +607,145 @@ fn compare_reasoning_scope(probe: &Probe, r: &mut ReasoningSyntax) {
     }
 }
 
+/// Thought inlined in `content` vs carried in `reasoning_content`:
+/// which re-ingest convention does this template actually honour?
+///
+/// [`ReasoningReingest::InlineThink`] is only correct for templates
+/// that reconstruct reasoning by splitting `content` on `</think>`
+/// (Qwen3.5/3.6). Qwen3.8's template dropped that split and reads the
+/// field alone, so an inlined thought renders as *content* after an
+/// empty `<think>\n\n</think>` — the re-render never reproduces the
+/// emission and the auto-tip never anchors (#112). Measured rather
+/// than sniffed: if both conventions render the same bytes, the
+/// template reconstructs inline reasoning and the default stands;
+/// otherwise, if the field render carries the thought, the field is
+/// the convention. A template that renders neither (old Qwen3 chat
+/// ignores the field) keeps the default.
+///
+/// The inline spelling mirrors `chat_template::append_block_text`.
+fn compare_reasoning_reingest(probe: &Probe, r: &mut ReasoningSyntax) {
+    if r.mode != ReasoningMode::TagBased {
+        return;
+    }
+    let params = Params {
+        messages: json!([user_msg(), {
+            "role": "assistant",
+            "content": format!("<think>{THINKING_CONTENT}</think>{ASSISTANT_MSG}"),
+        }]),
+        ..Params::default()
+    };
+    let Some(cmp) = probe.compare(&params, |p| {
+        p.messages = json!([user_msg(), {
+            "role": "assistant",
+            "content": ASSISTANT_MSG,
+            "reasoning_content": THINKING_CONTENT,
+        }]);
+    }) else {
+        return;
+    };
+    if cmp.output_a != cmp.output_b && cmp.output_b.contains(THINKING_CONTENT) {
+        r.reingest = ReasoningReingest::Field;
+    }
+}
+
+/// The bytes the template renders between the reasoning close and the
+/// content that follows (Qwen3.6/3.8: `"\n\n"`), read off one turn
+/// rendered under the reingest convention just measured.
+///
+/// Grammars spell this literally after a thought. Without it the
+/// post-thought gap was a free `[ \t\n\r]?` — at most *one* byte of
+/// whitespace — so under a forced tool call or an output_config grammar
+/// Qwen could emit `</think>\n{` but never the `</think>\n\n{` its
+/// template re-renders: every constrained thinking turn failed the
+/// canonicalization gate (#112). Left `None` unless the close is found
+/// verbatim right after the thought and the gap is pure whitespace.
+fn measure_reasoning_separator(probe: &Probe, r: &mut ReasoningSyntax) {
+    if r.mode != ReasoningMode::TagBased || r.end.is_empty() {
+        return;
+    }
+    let message = match r.reingest {
+        ReasoningReingest::InlineThink => json!({
+            "role": "assistant",
+            "content": format!("<think>{THINKING_CONTENT}</think>{ASSISTANT_MSG}"),
+        }),
+        _ => json!({
+            "role": "assistant",
+            "content": ASSISTANT_MSG,
+            "reasoning_content": THINKING_CONTENT,
+        }),
+    };
+    let params = Params {
+        messages: json!([user_msg(), message]),
+        ..Params::default()
+    };
+    let Some(out) = probe.apply(&params) else {
+        return;
+    };
+    let Some(pos) = out.find(THINKING_CONTENT) else {
+        return;
+    };
+    let after = &out[pos + THINKING_CONTENT.len()..];
+    let Some(after) = after.strip_prefix(r.end.as_str()) else {
+        return;
+    };
+    let Some(gap) = after.find(ASSISTANT_MSG).map(|at| &after[..at]) else {
+        return;
+    };
+    if gap.chars().all(char::is_whitespace) {
+        r.separator = Some(gap.to_string());
+    }
+}
+
+/// A value no template could mean: if it renders, the template does
+/// not validate `reasoning_effort`.
+const EFFORT_NONSENSE: &str = "drama-llama-probe";
+
+/// What a non-validating template gets: the levels effort-trained
+/// models (gpt-oss) actually saw. Anything above is a string the model
+/// never trained on, however happily the template renders it.
+const EFFORT_CONVENTIONAL: [&str; 3] = ["low", "medium", "high"];
+
+/// The `reasoning_effort` values the template accepts, lowest first.
+///
+/// Each level on [`crate::chat_template::EFFORT_SCALE`] renders a
+/// thinking-on generation prompt; accepted iff it renders (Qwen3.8 and
+/// stock Mistral Small 4 `raise_exception` on anything else). A
+/// template that also renders [`EFFORT_NONSENSE`] validates nothing,
+/// so it gets [`EFFORT_CONVENTIONAL`]. Empty when nothing renders, or
+/// when every accepted value renders the same bytes as leaving the
+/// variable undefined — a template that overrides it (the Mistral
+/// cache-stable template derives it from `enable_thinking`) or never
+/// reads it has no knob to turn.
+fn measure_reasoning_efforts(probe: &Probe) -> Vec<String> {
+    let render = |effort| {
+        probe.apply(&Params {
+            messages: json!([user_msg()]),
+            add_generation_prompt: true,
+            enable_thinking: true,
+            reasoning_effort: effort,
+            ..Params::default()
+        })
+    };
+    let baseline = render(None);
+    let accepted: Vec<(&str, String)> = crate::chat_template::EFFORT_SCALE
+        .iter()
+        .filter_map(|&e| render(Some(e)).map(|out| (e, out)))
+        .collect();
+    if accepted
+        .iter()
+        .all(|(_, out)| Some(out) == baseline.as_ref())
+    {
+        return Vec::new();
+    }
+    let validates = render(Some(EFFORT_NONSENSE)).is_none();
+    accepted
+        .into_iter()
+        .map(|(e, _)| e)
+        .filter(|e| validates || EFFORT_CONVENTIONAL.contains(e))
+        .map(String::from)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2: content
 // ---------------------------------------------------------------------------
@@ -761,6 +926,8 @@ fn classify_and_extract(
         }
     }
 
+    syntax.arguments.json_spacing = detect_json_spacing(&clean);
+
     if syntax.family == Family::JsonNative {
         extract_json_native(&clean, syntax);
     } else {
@@ -776,6 +943,33 @@ fn classify_and_extract(
     // whitespace-tolerantly, so keeping it costs nothing there.
     syntax.section_end = syntax.section_end.trim_end().to_string();
     syntax.per_call_end = syntax.per_call_end.trim_end().to_string();
+}
+
+/// How the template spaces JSON-serialized argument values, measured
+/// from the probe's rendered args `{ARG_FIRST: "XXXX", ARG_SECOND:
+/// "YYYY"}`: a `json.dumps`-style re-render contains
+/// `"<ARG_FIRST>": "XXXX", "<ARG_SECOND>"`, a `tojson`-style one
+/// `"<ARG_FIRST>":"XXXX","<ARG_SECOND>"`. Both separator positions
+/// must agree to classify as [`JsonSpacing::Spaced`]; anything else —
+/// mixed, indented, or a layout that never JSON-quotes its keys
+/// (tagged / dict families) — stays [`JsonSpacing::Compact`], the
+/// pinned default every dialect had before the knob existed (#88
+/// phase 2). The grammar's canonical prelude and `render_reference`
+/// both key off the result, so whichever spelling the template
+/// renders is also the one the grammar forces: three views, one byte
+/// string.
+fn detect_json_spacing(clean: &str) -> JsonSpacing {
+    let kv_spaced = clean.contains(&format!("\"{ARG_FIRST}\": "));
+    let elem_spaced = clean.contains(&format!(", \"{ARG_SECOND}\""));
+    // A compact element separator anywhere (even alongside a spaced
+    // one — a template rendering the args twice) is disqualifying:
+    // `Spaced` must mean *uniformly* spaced.
+    let elem_compact = clean.contains(&format!(",\"{ARG_SECOND}\""));
+    if kv_spaced && elem_spaced && !elem_compact {
+        JsonSpacing::Spaced
+    } else {
+        JsonSpacing::Compact
+    }
 }
 
 /// JSON_NATIVE: parse the call object out of the haystack and map
@@ -1029,8 +1223,19 @@ fn analyze_json_native_parallel_calls(probe: &Probe, syntax: &mut CallSyntax) {
             // Bytes before the second call's start marker are the
             // inter-call separator, when they're pure whitespace
             // (#58); anything else means the diff isn't a clean call
-            // boundary, so leave the separator empty.
+            // boundary, so leave the separator empty. The two calls
+            // share their arguments, so the diff may come back rotated
+            // — `</tool_call>\n<tool_call>\n{…second…}\n`, the first
+            // call's close leading the middle (cogito: the separator
+            // read as empty, so the grammar forced
+            // `</tool_call><tool_call>` against the template's
+            // `</tool_call>\n<tool_call>`). Look past that close.
             let lead = &cmp.diff.right[..pos];
+            let close = syntax.section_end.trim();
+            let lead = match close {
+                "" => lead,
+                close => lead.strip_prefix(close).unwrap_or(lead),
+            };
             if !lead.is_empty() && lead.chars().all(char::is_whitespace) {
                 syntax.call_separator = lead.to_string();
             }
@@ -1649,4 +1854,73 @@ fn detect_user_start(probe: &Probe) -> String {
         result.push_str(seg.value());
     }
     result.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn efforts(source: &str) -> Vec<String> {
+        analyze_template(source, "", "").unwrap().reasoning.efforts
+    }
+
+    /// Qwen3.8's shape: validates, rewrites `high` to `xhigh`, rejects
+    /// `max`. `high` is still *accepted* — it renders.
+    #[test]
+    fn efforts_validating_template() {
+        let src = "\
+            {%- set ri = '' %}\
+            {%- if enable_thinking is undefined or enable_thinking is true %}\
+            {%- set e = reasoning_effort|default('xhigh') %}\
+            {%- if e == 'high' %}{%- set e = 'xhigh' %}{%- endif %}\
+            {%- if e not in ('xhigh', 'medium', 'low') %}\
+            {{- raise_exception('bad effort ' ~ e) }}{%- endif %}\
+            {%- if e == 'xhigh' %}{%- set ri = 'THINK HARD.' %}\
+            {%- elif e == 'low' %}{%- set ri = 'THINK BRIEFLY.' %}{%- endif %}\
+            {%- endif %}\
+            <|im_start|>system\n{{ ri }}<|im_end|>\n\
+            {%- for m in messages %}<|im_start|>{{ m.role }}\n\
+            {{- m.content }}<|im_end|>\n{% endfor %}\
+            {%- if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        assert_eq!(efforts(src), ["low", "medium", "high", "xhigh"]);
+    }
+
+    /// Stock Mistral Small 4's shape: `none`/`high` only, so only
+    /// `high` from the scale renders.
+    #[test]
+    fn efforts_mistral_like() {
+        let src = "\
+            {%- set reasoning_effort = reasoning_effort if reasoning_effort \
+            is defined and reasoning_effort is not none else 'none' %}\
+            {%- if reasoning_effort not in ['none', 'high'] %}\
+            {{- raise_exception('bad effort') }}{%- endif %}\
+            [MODEL_SETTINGS]{\"reasoning_effort\": \"{{ reasoning_effort }}\"}\
+            [/MODEL_SETTINGS]\
+            {%- for m in messages %}[INST]{{ m.content }}[/INST]{% endfor %}";
+        assert_eq!(efforts(src), ["high"]);
+    }
+
+    /// gpt-oss's shape: renders anything, so the set falls back to the
+    /// trained `low`/`medium`/`high`.
+    #[test]
+    fn efforts_non_validating_template() {
+        let src = "\
+            {%- if reasoning_effort is not defined %}\
+            {%- set reasoning_effort = 'medium' %}{%- endif %}\
+            <|start|>system<|message|>Reasoning: {{ reasoning_effort }}<|end|>\
+            {%- for m in messages %}<|start|>{{ m.role }}<|message|>\
+            {{- m.content }}<|end|>{% endfor %}\
+            {%- if add_generation_prompt %}<|start|>assistant{% endif %}";
+        assert_eq!(efforts(src), ["low", "medium", "high"]);
+    }
+
+    /// A template that never reads the variable has no knob.
+    #[test]
+    fn efforts_absent() {
+        let src = "\
+            {%- for m in messages %}<|im_start|>{{ m.role }}\n\
+            {{- m.content }}<|im_end|>\n{% endfor %}\
+            {%- if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        assert!(efforts(src).is_empty());
+    }
 }

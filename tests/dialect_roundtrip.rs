@@ -14,14 +14,19 @@ use drama_llama::dialect::{
 };
 use drama_llama::prompt::{Content, Message, Role, ToolUse};
 use drama_llama::{Block, ChatTemplate, Prompt, RenderOptions, Tool};
+use misanthropic::prompt::thinking::Thinking;
 use serde_json::json;
 
 fn fixture_source(name: &str) -> String {
-    let path = format!(
-        "{}/tests/fixtures/templates/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    // Vendored fixtures live under `tests/fixtures/templates/`; the
+    // fleet templates were promoted to shipped artifacts in crate-root
+    // `templates/` (the `baked` registry, #88) and resolve from there.
+    let root = env!("CARGO_MANIFEST_DIR");
+    let fixture_path = format!("{root}/tests/fixtures/templates/{name}");
+    let baked_path = format!("{root}/templates/{name}");
+    std::fs::read_to_string(&fixture_path)
+        .or_else(|_| std::fs::read_to_string(&baked_path))
+        .unwrap_or_else(|e| panic!("{fixture_path} | {baked_path}: {e}"))
 }
 
 fn test_tool() -> Tool {
@@ -39,22 +44,69 @@ fn test_tool() -> Tool {
         .expect("valid test tool")
 }
 
+/// The payloads every fixture is swept with. `clean` is the original
+/// harness payload; `adversarial` exists because #85 hid behind clean
+/// ASCII for two weeks — it carries the characters serializers
+/// disagree about (apostrophe, `&`, `<`, `>`, a double quote, a
+/// multi-byte arrow, an embedded newline) plus a `", "` inside the
+/// string, which is byte-identical to the JSON envelope's field
+/// separator and probes parser greediness.
+fn payloads() -> [(&'static str, serde_json::Value); 2] {
+    [
+        ("clean", json!({"city": "Paris", "days": 3})),
+        (
+            "adversarial",
+            json!({
+                "city": "José's \"B&B\", floor <2> → east\nannex",
+                "days": 3,
+            }),
+        ),
+    ]
+}
+
 /// The harness: analyze the template, produce a canonical emission,
 /// parse it back, feed the parsed calls through the real template,
 /// and assert the emission bytes survive intact in the re-render.
 fn assert_reconstruction(fixture: &str, bos: &str, eos: &str) {
     let source = fixture_source(fixture);
+    assert_reconstruction_source(fixture, &source, bos, eos);
+}
+
+/// Source-taking variant for fixtures that don't live under
+/// `tests/fixtures/templates/` (cogito). Sweeps every payload.
+fn assert_reconstruction_source(
+    fixture: &str,
+    source: &str,
+    bos: &str,
+    eos: &str,
+) {
     let syntax: CallSyntax =
-        analyze_template(&source, bos, eos).expect("analyze");
+        analyze_template(source, bos, eos).expect("analyze");
     let tool = test_tool();
 
-    let input = json!({"city": "Paris", "days": 3});
-    let emission = render_reference(&syntax, &[("get_weather", &input)])
+    for (payload, input) in payloads() {
+        let fixture = &format!("{fixture}/{payload}");
+        assert_call_round_trips(
+            fixture, source, &syntax, &tool, &input, bos, eos,
+        );
+    }
+}
+
+/// One payload through one template: emission → parse → re-render.
+fn assert_call_round_trips(
+    fixture: &str,
+    source: &str,
+    syntax: &CallSyntax,
+    tool: &Tool,
+    input: &serde_json::Value,
+    bos: &str,
+    eos: &str,
+) {
+    let emission = render_reference(syntax, &[("get_weather", input)])
         .expect("representable");
 
     // Emission → blocks.
-    let parsed =
-        parse_text(&syntax, &[&tool], &emission, false, Leniency::Final);
+    let parsed = parse_text(syntax, &[tool], &emission, false, Leniency::Final);
     assert_eq!(
         parsed.status,
         ParseStatus::Complete,
@@ -76,7 +128,7 @@ fn assert_reconstruction(fixture: &str, bos: &str, eos: &str) {
         parsed.blocks
     );
     assert_eq!(calls[0].name.as_ref(), "get_weather", "{fixture}");
-    assert_eq!(calls[0].input, input, "{fixture}");
+    assert_eq!(&calls[0].input, input, "{fixture}");
     // A clean emission parses to calls ONLY — a stray Text block
     // means the parser left marker crumbs behind.
     assert!(
@@ -111,9 +163,12 @@ fn assert_reconstruction(fixture: &str, bos: &str, eos: &str) {
         tools: Some(vec![tool.clone().into()]),
         ..Default::default()
     };
-    let template =
-        ChatTemplate::from_source(source, bos.to_string(), eos.to_string())
-            .expect("template compiles");
+    let template = ChatTemplate::from_source(
+        source.to_string(),
+        bos.to_string(),
+        eos.to_string(),
+    )
+    .expect("template compiles");
     let opts = RenderOptions::default()
         .with_generation_prompt(false)
         .with_extra("enable_thinking", true);
@@ -139,6 +194,14 @@ fn reconstruct_qwen36_gguf() {
     assert_reconstruction("qwen3.6-gguf.jinja", "", "<|im_end|>");
 }
 
+/// The owned Qwen templates (#88): the call-rendering path must be
+/// untouched by the verbatim-assistant-turn patch.
+#[test]
+fn reconstruct_qwen_cache_stable() {
+    assert_reconstruction("qwen3.6-cache-stable.jinja", "", "<|im_end|>");
+    assert_reconstruction("qwen3.8-cache-stable.jinja", "", "<|im_end|>");
+}
+
 #[test]
 fn reconstruct_qwen35() {
     assert_reconstruction("Qwen3.5-4B.jinja", "", "<|im_end|>");
@@ -150,6 +213,408 @@ fn reconstruct_hermes3() {
         "NousResearch-Hermes-3-Llama-3.1-8B-tool_use.jinja",
         "",
         "<|im_end|>",
+    );
+}
+
+/// Cogito (#85's template): `JsonNative` with hardcoded spaced
+/// envelope literals (`{"name": "` / `", "arguments": `) around a
+/// `tojson` argument interior. Lives at the fixtures root because
+/// `template_rendering.rs` pins byte-exact renders against the same
+/// file; byte-identical to the 32B GGUF's embedded template.
+#[test]
+fn reconstruct_cogito() {
+    assert_reconstruction_source(
+        "cogito_14b",
+        &cogito_source(),
+        "",
+        "<|im_end|>",
+    );
+}
+
+/// The owned cogito template (#88 phase 2): identical to stock except
+/// `tool_call.arguments | json_dumps`, so the argument interior
+/// round-trips in the model's measured `Spaced` habit instead of
+/// forcing `tojson`-compact bytes.
+#[test]
+fn reconstruct_cogito_cache_stable() {
+    assert_reconstruction("cogito-cache-stable.jinja", "", "<|im_end|>");
+}
+
+fn cogito_source() -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/cogito_14b_template.jinja"
+    );
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// The #85 cache property pinned FFI-free against the STOCK cogito
+/// template (see [`assert_prefix_continuity`] for the property).
+#[test]
+fn cogito_prefix_continuity() {
+    assert_prefix_continuity(cogito_source(), "<|im_end|>");
+}
+
+/// The same continuity property against the owned
+/// `cogito-cache-stable` template (#88 phase 2): the `json_dumps`
+/// argument interior must not cost the byte-prefix property the
+/// stock template already had — canonical emission bytes (now
+/// `Spaced`) still lead the turn delta, and aging still extends the
+/// render byte-for-byte.
+#[test]
+fn cogito_cache_stable_prefix_continuity() {
+    assert_prefix_continuity(
+        fixture_source("cogito-cache-stable.jinja"),
+        "<|im_end|>",
+    );
+}
+
+/// The #85 cache property, template-parameterized: the generation-
+/// prompt render is a byte PREFIX of the follow-up render, and the
+/// delta begins with the canonical emission — so the KV laid down
+/// during generation stays reusable and the auto-tip survives the
+/// turn.
+///
+/// Uses the adversarial payload deliberately: before `368d11e`
+/// (tojson HTML-escaping) and `86c9fe4` (canonical `ws`) this failed
+/// on exactly such bytes while clean-ASCII payloads passed.
+///
+/// enable_thinking=true rewrites the FRONT of cogito's prompt, so it
+/// can't change between renders here; #86 tracks the partial-render
+/// half of that. Continuity is pinned in non-thinking mode
+/// (aged-thinking continuity is a Phase 4 owned-template decision).
+fn assert_prefix_continuity(source: String, eos: &str) {
+    let syntax = analyze_template(&source, "", eos).expect("analyze");
+    let tool = test_tool();
+    let (_, input) = &payloads()[1];
+    let calls_ref = render_reference(&syntax, &[("get_weather", input)])
+        .expect("representable");
+    let template =
+        ChatTemplate::from_source(source, String::new(), eos.to_string())
+            .expect("template compiles");
+    let opts = |gen: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", false)
+    };
+    let base = Prompt {
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("What's the weather in Paris?"),
+        }],
+        tools: Some(vec![tool.clone().into()]),
+        ..Default::default()
+    };
+
+    // Case 1: a bare tool-call turn extends the generation prompt,
+    // starting with the canonical emission and closing with eos.
+    let p = template.render_with(&base, &opts(true)).expect("render");
+    let mut with_turn = base.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![Block::ToolUse {
+            call: ToolUse {
+                id: Cow::Borrowed("call00001"),
+                name: Cow::Borrowed("get_weather"),
+                input: input.clone(),
+                cache_control: None,
+                caller: None,
+            },
+        }]),
+    });
+    let f = template
+        .render_with(&with_turn, &opts(false))
+        .expect("render");
+    let suffix = f.strip_prefix(&p).unwrap_or_else(|| {
+        panic!(
+            "tool-call turn must extend the generation prompt.\n\
+             --- gen ---\n{p:?}\n--- follow-up ---\n{f:?}"
+        )
+    });
+    assert!(
+        suffix.starts_with(&calls_ref),
+        "emission bytes must lead the turn delta.\n\
+         --- want ---\n{calls_ref:?}\n--- got ---\n{suffix:?}"
+    );
+    assert!(
+        suffix[calls_ref.len()..].starts_with(eos),
+        "canonical close must follow the calls.\n{suffix:?}"
+    );
+
+    // Case 2: aging. The tool response and the next generation prompt
+    // must keep the whole prior render as a byte prefix — this is the
+    // LCP walk that has to cross the tool turn to reach the tip.
+    let mut aged = with_turn.clone();
+    aged.messages.push(Message {
+        role: Role::User,
+        content: Content(vec![Block::ToolResult {
+            result: drama_llama::prompt::ToolResult {
+                tool_use_id: Cow::Borrowed("call00001"),
+                content: Content::text("22C, sunny"),
+                is_error: false,
+                cache_control: None,
+            },
+        }]),
+    });
+    let f_aged = template.render_with(&aged, &opts(true)).expect("render");
+    assert!(
+        f_aged.starts_with(&f),
+        "aged render must extend the prior render byte-for-byte.\n\
+         --- prior ---\n{f:?}\n--- aged ---\n{f_aged:?}"
+    );
+}
+
+/// Prefix continuity for the Qwen3.6 GGUF template — the stock
+/// template of the model CI's runner actually holds, and the origin
+/// of the XML dialect the whole tool-dialects arc was built for.
+/// Same property as `cogito_prefix_continuity`; non-thinking mode
+/// (aged-thinking continuity is a Phase 4 owned-template decision).
+#[test]
+fn qwen36_prefix_continuity() {
+    assert_prefix_continuity(
+        fixture_source("qwen3.6-gguf.jinja"),
+        "<|im_end|>",
+    );
+}
+
+/// The same continuity property against the owned Qwen templates:
+/// rendering the assistant turn verbatim must not cost the byte-prefix
+/// property stock already had on tool turns.
+#[test]
+fn qwen_cache_stable_prefix_continuity() {
+    for name in ["qwen3.6-cache-stable.jinja", "qwen3.8-cache-stable.jinja"] {
+        assert_prefix_continuity(fixture_source(name), "<|im_end|>");
+    }
+}
+
+/// A system turn after the leading one — misanthropic's `Chat` seats
+/// in-conversation System notes, as Anthropic's API allows on some
+/// models — renders in the format's own `<|im_start|>system` framing
+/// in both owned Qwen templates. Stock 3.8 raises on it ("System
+/// message must be at the beginning.", live on Qwen3.8-27B 2026-09-30)
+/// and stock 3.6 drops it without a word; both controls are pinned.
+/// Everything around the note — the leading system/tools header
+/// included — renders exactly as it does without the note, and exactly
+/// as stock renders that note-free conversation.
+#[test]
+fn qwen_cache_stable_renders_mid_conversation_system() {
+    let eos = "<|im_end|>";
+    let text = |role, text: &'static str| Message {
+        role,
+        content: Content::text(text),
+    };
+    let prompt = |note: bool| Prompt {
+        system: Some(Content::text("You keep the lighthouse.")),
+        messages: [
+            Some(text(Role::User, "Who checks the fog signal?")),
+            Some(text(Role::Assistant, "Ada checks it.")),
+            note.then(|| text(Role::System, "  The lamp is out.\n")),
+            Some(text(Role::User, "And the lamp?")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        tools: Some(vec![test_tool().into()]),
+        ..Prompt::default()
+    };
+    let render = |name: &str, prompt: &Prompt| {
+        ChatTemplate::from_source(
+            fixture_source(name),
+            String::new(),
+            eos.to_owned(),
+        )
+        .expect("template compiles")
+        .render_with(
+            prompt,
+            &RenderOptions::default().with_generation_prompt(true),
+        )
+    };
+    let block = "<|im_start|>system\nThe lamp is out.<|im_end|>\n";
+    for (stock, owned) in [
+        ("qwen3.6-gguf.jinja", "qwen3.6-cache-stable.jinja"),
+        ("qwen3.8-gguf.jinja", "qwen3.8-cache-stable.jinja"),
+    ] {
+        let without = render(owned, &prompt(false)).expect("render");
+        assert_eq!(
+            without,
+            render(stock, &prompt(false)).expect("stock render"),
+            "{owned}: a note-free conversation must render as stock",
+        );
+        let with = render(owned, &prompt(true)).expect("render");
+        let at = without
+            .find("<|im_start|>user\nAnd the lamp?")
+            .expect("final user turn");
+        assert_eq!(
+            with,
+            format!("{}{block}{}", &without[..at], &without[at..]),
+            "{owned}: the note renders as its own system block between \
+             the turns it was seated between",
+        );
+        // Stock's handling, which motivated the patch.
+        match render(stock, &prompt(true)) {
+            Err(e) => assert!(
+                stock.starts_with("qwen3.8")
+                    && e.to_string()
+                        .contains("System message must be at the beginning"),
+                "{stock}: {e}",
+            ),
+            Ok(dropped) => assert!(
+                stock.starts_with("qwen3.6") && dropped == without,
+                "{stock}: stock 3.6 drops the note silently",
+            ),
+        }
+    }
+}
+
+/// Aged-*thinking* continuity for Qwen3.6 — the gap
+/// [`qwen36_prefix_continuity`] deliberately leaves open: it ages by a
+/// tool response (which the stock template's `last_query_index`
+/// pre-scan skips) and never builds a thought block at all.
+///
+/// The plan of record filed this as "a Phase 4 owned-template
+/// decision". Measured here first, per the arc's probe-before-own
+/// discipline, and the answer is that **stock is already cache-stable
+/// on this axis**: the Qwen3.6 template honours `preserve_thinking`,
+/// and `Session::from_engine` sets it on every render. Aged thinking
+/// alone does not justify an owned Qwen template — a result, not an
+/// absence of one.
+///
+/// The second half pins *why* the flag is load-bearing: without it the
+/// same history re-renders without its thought block as soon as a real
+/// user query ages it, breaking the prefix and re-prefilling
+/// everything from that turn on.
+#[test]
+fn qwen36_aged_thinking_continuity() {
+    let template = ChatTemplate::from_source(
+        fixture_source("qwen3.6-gguf.jinja"),
+        String::new(),
+        "<|im_end|>".to_string(),
+    )
+    .expect("template compiles");
+    let opts = |gen: bool, preserve: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", false)
+            .with_extra("preserve_thinking", preserve)
+    };
+    let thought = "Paris is in France, so I want European weather.";
+    let turn = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("What's the weather in Paris?"),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![
+                    Block::Thought {
+                        thought: Cow::Borrowed(thought),
+                        signature: Cow::Borrowed(""),
+                    },
+                    Block::Text {
+                        text: Cow::Borrowed("22C and sunny."),
+                        cache_control: None,
+                        citations: None,
+                    },
+                ]),
+            },
+        ],
+        ..Default::default()
+    };
+    // Age it with a REAL user query — the case `last_query_index`
+    // reacts to, unlike the tool response the other pin uses.
+    let mut aged = turn.clone();
+    aged.messages.push(Message {
+        role: Role::User,
+        content: Content::text("And in London?"),
+    });
+
+    let f = template
+        .render_with(&turn, &opts(false, true))
+        .expect("render");
+    assert!(
+        f.contains(thought),
+        "thought must survive its own turn's render.\n{f:?}"
+    );
+    let f_aged = template
+        .render_with(&aged, &opts(true, true))
+        .expect("render");
+    assert!(
+        f_aged.starts_with(&f),
+        "aged render must extend the prior render byte-for-byte.\n\
+         --- prior ---\n{f:?}\n--- aged ---\n{f_aged:?}"
+    );
+
+    // Control: drop the flag and the same history loses its thought.
+    let stripped = template
+        .render_with(&aged, &opts(true, false))
+        .expect("render");
+    assert!(
+        !stripped.contains(thought),
+        "control: stock must strip aged thinking without \
+         preserve_thinking — if this fires, the template changed and \
+         the flag may no longer be load-bearing.\n{stripped:?}"
+    );
+    assert!(
+        !stripped.starts_with(&f),
+        "control: the stripped render cannot be prefix-continuous"
+    );
+}
+
+/// Prefix continuity for a PLAIN TEXT assistant turn on Qwen3.6 — the
+/// structured-output shape (a JSON answer is just a `Block::Text`), and
+/// the shape `Session`'s byte-stability gate checks on every
+/// non-tool-call turn.
+///
+/// Renders exactly what the session does: generation prompt, then the
+/// same conversation with the assistant turn seated, under the extras
+/// `Session` sets by default (`preserve_thinking`) plus thinking off.
+#[test]
+fn qwen36_plain_text_turn_prefix_continuity() {
+    let template = ChatTemplate::from_source(
+        fixture_source("qwen3.6-gguf.jinja"),
+        String::new(),
+        "<|im_end|>".to_string(),
+    )
+    .expect("template compiles");
+    let opts = |gen: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", false)
+            .with_extra("preserve_thinking", true)
+    };
+    let answer = r#"{"culprit": "Mr. Crane", "confidence": "High"}"#;
+    let base = Prompt {
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("Who did it?"),
+        }],
+        ..Default::default()
+    };
+    let p = template.render_with(&base, &opts(true)).expect("render");
+    let mut with_turn = base.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![Block::Text {
+            text: Cow::Borrowed(answer),
+            cache_control: None,
+            citations: None,
+        }]),
+    });
+    let f = template
+        .render_with(&with_turn, &opts(false))
+        .expect("render");
+    let suffix = f.strip_prefix(&p).unwrap_or_else(|| {
+        panic!(
+            "a plain-text turn must extend the generation prompt \
+             (this is the session's byte-stability gate).\n\
+             --- gen ---\n{p:?}\n--- follow-up ---\n{f:?}"
+        )
+    });
+    assert!(
+        suffix.starts_with(answer),
+        "the emission must lead the turn delta verbatim.\n\
+         --- want ---\n{answer:?}\n--- got ---\n{suffix:?}"
     );
 }
 
@@ -621,7 +1086,9 @@ fn reconstruct_gemma4_upstream() {
 /// `none`, floats in ryu-shortest form, nested dicts explicitly
 /// re-sorted to match the template's `dictsort`).
 /// The canonical emission — reasoning block plus both calls — must
-/// appear byte-for-byte in the template re-render.
+/// appear byte-for-byte in the re-render of the template served for
+/// this stock: its bake. Stock prints null bare, which minijinja
+/// spells `None` from 2.22 (#120); the bake spells it `none`.
 #[test]
 fn reconstruct_gemma4_thought_and_values() {
     use drama_llama::dialect::ReasoningReingest;
@@ -708,8 +1175,11 @@ fn reconstruct_gemma4_thought_and_values() {
         tools: Some(vec![tool.into()]),
         ..Default::default()
     };
+    let served = drama_llama::baked::detect(&source)
+        .expect("stock detects its bake")
+        .replacement;
     let template = ChatTemplate::from_source(
-        source,
+        served.to_owned(),
         "<bos>".to_string(),
         "<turn|>".to_string(),
     )
@@ -949,5 +1419,648 @@ fn dict_family_stays_dictsort_alphabetical() {
         rendered.contains(&emission),
         "gemma4: reconstruction drift.\n--- canonical emission ---\n\
          {emission:?}\n--- template re-render ---\n{rendered:?}"
+    );
+}
+
+/// Mistral Small 4 stock (`mistral4` arch). The call-rendering path —
+/// `[TOOL_CALLS]name[ARGS]{…}`, name outside the JSON, no wrapper
+/// object — is what the owned template leaves byte-identical, so both
+/// halves of the pair carry this pin.
+#[test]
+fn reconstruct_mistral4_gguf() {
+    assert_reconstruction("mistral4-gguf.jinja", "<s>", "</s>");
+}
+
+/// The owned Mistral template (#88): everything outside the turn-close
+/// and the reasoning channel is byte-identical to stock, and the calls
+/// must survive the rewrite untouched.
+#[test]
+fn reconstruct_mistral4_cache_stable() {
+    assert_reconstruction("mistral4-cache-stable.jinja", "<s>", "</s>");
+}
+
+/// The cache property the owned template exists for. Stock closes
+/// every assistant message with `</s>` and has no
+/// `add_generation_prompt` branch at all, so it cannot render an open
+/// turn; the replacement emits the close per message and the
+/// generation prompt is simply the render up to it.
+#[test]
+fn mistral4_cache_stable_prefix_continuity() {
+    assert_prefix_continuity(
+        fixture_source("mistral4-cache-stable.jinja"),
+        "</s>",
+    );
+}
+
+/// The `[THINK]` channel, which stock cannot round-trip at all: it
+/// accepts reasoning only as a `thinking`-typed content chunk, never
+/// as a message field, so a `ReasoningReingest::Field` transcript
+/// reaches it with empty `content` and trips its own
+/// `raise_exception`. The replacement renders `[THINK]…[/THINK]` from
+/// `reasoning_content`, and `preserve_thinking` keeps it once a later
+/// user turn has aged it.
+#[test]
+fn mistral4_cache_stable_thinking_continuity() {
+    use drama_llama::dialect::ReasoningReingest;
+
+    let source = fixture_source("mistral4-cache-stable.jinja");
+    let template = ChatTemplate::from_source(
+        source,
+        "<s>".to_string(),
+        "</s>".to_string(),
+    )
+    .expect("template compiles");
+    let opts = |gen: bool, preserve: bool| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", true)
+            .with_extra("preserve_thinking", preserve)
+            .with_thought_reingest(ReasoningReingest::Field)
+    };
+    let thought = "Paris is in France, so I want European weather.";
+    let turn = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("What's the weather in Paris?"),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![
+                    Block::Thought {
+                        thought: Cow::Borrowed(thought),
+                        signature: Cow::Borrowed(""),
+                    },
+                    Block::Text {
+                        text: Cow::Borrowed("22C and sunny."),
+                        cache_control: None,
+                        citations: None,
+                    },
+                ]),
+            },
+        ],
+        ..Default::default()
+    };
+
+    let f = template
+        .render_with(&turn, &opts(false, true))
+        .expect("render");
+    let emission = format!("[THINK]{thought}[/THINK]22C and sunny.</s>");
+    assert!(
+        f.contains(&emission),
+        "the thought channel must re-render byte-exact.\n\
+         --- want ---\n{emission:?}\n--- got ---\n{f:?}"
+    );
+
+    // Aging: a later user turn must not disturb the prior render.
+    let mut aged = turn.clone();
+    aged.messages.push(Message {
+        role: Role::User,
+        content: Content::text("And in London?"),
+    });
+    let f_aged = template
+        .render_with(&aged, &opts(true, true))
+        .expect("render");
+    assert!(
+        f_aged.starts_with(&f),
+        "aged render must extend the prior render byte-for-byte.\n\
+         --- prior ---\n{f:?}\n--- aged ---\n{f_aged:?}"
+    );
+
+    // Control: without the flag the aged thought drops, so the flag is
+    // load-bearing here exactly as it is for Qwen and Gemma.
+    let stripped = template
+        .render_with(&aged, &opts(true, false))
+        .expect("render");
+    assert!(
+        !stripped.contains(thought),
+        "control: aged thinking must drop without preserve_thinking.\
+         \n{stripped:?}"
+    );
+}
+
+/// Why the owned template is not optional for thinking transcripts:
+/// the same `ReasoningReingest::Field` prompt the replacement renders
+/// fine reaches stock with empty `content` and no `thinking` chunk,
+/// and stock raises rather than rendering. Pinned so a future stock
+/// re-dump that fixes this upstream is noticed rather than assumed.
+#[test]
+fn mistral4_stock_cannot_render_field_reasoning() {
+    use drama_llama::dialect::ReasoningReingest;
+
+    let template = ChatTemplate::from_source(
+        fixture_source("mistral4-gguf.jinja"),
+        "<s>".to_string(),
+        "</s>".to_string(),
+    )
+    .expect("template compiles");
+    let thought = "Paris is in France.";
+    let prompt = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("What's the weather in Paris?"),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![Block::Thought {
+                    thought: Cow::Borrowed(thought),
+                    signature: Cow::Borrowed(""),
+                }]),
+            },
+        ],
+        ..Default::default()
+    };
+    let opts = RenderOptions::default()
+        .with_generation_prompt(false)
+        .with_thought_reingest(ReasoningReingest::Field);
+    match template.render_with(&prompt, &opts) {
+        Err(_) => {}
+        Ok(rendered) => assert!(
+            !rendered.contains(thought),
+            "stock gained field-reasoning support — re-check whether \
+             the owned template still needs its reasoning patch.\n\
+             {rendered:?}"
+        ),
+    }
+}
+
+/// #112: a Qwen3.8 *thinking* turn must re-render byte-stable, or the
+/// session's canonicalization gate skips the tip and every turn
+/// re-prefills the one before it.
+///
+/// Mirrors the session gate exactly: thinking on (the generation
+/// prompt pre-opens `<think>\n`), the emission parsed with
+/// `pre_opened_reasoning`, the turn re-rendered under the analyzed
+/// reingest, and the emission required verbatim at the head of the
+/// turn delta. The emission is the logged 2026-09-22 Agora shape:
+/// thought, announce-then-call prose, parallel calls, and the literal
+/// `null` the model writes for an optional parameter (#115) — which
+/// parses as a string and re-renders unchanged.
+///
+/// The control pins why the analyzer's reingest probe is
+/// load-bearing: 3.8's template no longer splits `<think>` out of
+/// `content`, so the old `InlineThink` default renders the thought as
+/// content behind an empty `<think>\n\n</think>`.
+#[test]
+fn qwen38_thinking_turn_round_trips() {
+    use drama_llama::dialect::ReasoningReingest;
+
+    let source = fixture_source("qwen3.8-gguf.jinja");
+    let syntax = analyze_template(&source, "", "<|im_end|>").expect("analyze");
+    let template =
+        ChatTemplate::from_source(source, String::new(), "<|im_end|>".into())
+            .expect("template compiles");
+    let tool = Tool::builder("get_content")
+        .description("Read a post, comment, or document.")
+        .schema(json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "detail": {"type": "string", "enum": ["summary", "full"]},
+            },
+            "required": ["id"],
+        }))
+        .build()
+        .expect("valid tool");
+    let base = Prompt {
+        system: Some(Content::text("You are aegis.")),
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("Check the agenda thread."),
+        }],
+        tools: Some(vec![tool.clone().into()]),
+        ..Default::default()
+    };
+    let opts = |gen: bool, reingest: ReasoningReingest| {
+        RenderOptions::default()
+            .with_generation_prompt(gen)
+            .with_extra("enable_thinking", true)
+            .with_extra("preserve_thinking", true)
+            .with_thought_reingest(reingest)
+    };
+    let emission = "The agenda thread is 05676b9d. I'll read it, and the \
+                    summary of the proposal too.\n</think>\n\n\
+                    Reading both now.\n\n\
+                    <tool_call>\n<function=get_content>\n\
+                    <parameter=id>\n05676b9d-8aa7-430e-9138-444080e34065\n</parameter>\n\
+                    <parameter=detail>\nnull\n</parameter>\n\
+                    </function>\n</tool_call>\n\
+                    <tool_call>\n<function=get_content>\n\
+                    <parameter=id>\nca210776-eb26-4037-bb00-391d3d55d1a6\n</parameter>\n\
+                    </function>\n</tool_call>";
+
+    let gen = template
+        .render_with(&base, &opts(true, syntax.reasoning.reingest))
+        .expect("render");
+    assert!(gen.ends_with("<think>\n"), "thinking pre-opens: {gen:?}");
+
+    let parsed = parse_text(&syntax, &[&tool], emission, true, Leniency::Final);
+    assert_eq!(parsed.status, ParseStatus::Complete, "{:#?}", parsed.blocks);
+    let turn = |reingest| {
+        let mut with_turn = base.clone();
+        with_turn.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(parsed.blocks.clone()),
+        });
+        template
+            .render_with(&with_turn, &opts(false, reingest))
+            .expect("render")
+    };
+
+    let rendered = turn(syntax.reasoning.reingest);
+    let suffix = rendered.strip_prefix(&gen).unwrap_or_else(|| {
+        panic!("turn must extend the generation prompt.\n{rendered:?}")
+    });
+    assert!(
+        suffix.starts_with(emission),
+        "emission must lead the turn delta verbatim.\n\
+         --- want ---\n{emission:?}\n--- got ---\n{suffix:?}"
+    );
+
+    // Control: the pre-#112 default.
+    let inline = turn(ReasoningReingest::InlineThink);
+    assert!(
+        !inline
+            .strip_prefix(&gen)
+            .is_some_and(|s| s.starts_with(emission)),
+        "control: InlineThink must NOT round-trip on 3.8 — if this \
+         fires, the template changed and the probe may be moot.\n{inline:?}"
+    );
+}
+
+/// #112, the constrained half: under a forced call the post-thought
+/// gap is the grammar's to decide, and it used to be `fws` — at most
+/// one whitespace byte. Qwen3.8's template re-renders `</think>\n\n`,
+/// so the model was *unable* to emit its canonical bytes and every
+/// forced thinking turn missed the tip (observed on device:
+/// `</think>\n<tool_call>`). The analyzer now measures the separator
+/// and the emitter spells it.
+#[test]
+fn qwen38_forced_call_grammar_spells_the_thought_separator() {
+    use drama_llama::dialect::{grammar_source, Anchor, EmitOptions};
+    use drama_llama::{Grammar, GrammarState};
+    use std::sync::Arc;
+
+    let source = fixture_source("qwen3.8-gguf.jinja");
+    let syntax = analyze_template(&source, "", "<|im_end|>").expect("analyze");
+    assert_eq!(syntax.reasoning.separator.as_deref(), Some("\n\n"));
+
+    let tool = test_tool();
+    let (_, input) = &payloads()[0];
+    let calls = render_reference(&syntax, &[("get_weather", input)])
+        .expect("representable");
+    let mut opts = EmitOptions::default();
+    opts.anchor = Anchor::EagerThoughtPreOpened;
+    let grammar = grammar_source(&syntax, &[&tool], &opts).expect("grammar");
+    let grammar = Arc::new(Grammar::parse(&grammar).expect("parses"));
+    let accepts = |text: &str| {
+        let mut state = GrammarState::new(grammar.clone());
+        state.advance_bytes(text.as_bytes()).is_ok() && state.is_complete()
+    };
+
+    assert!(accepts(&format!("Paris.\n</think>\n\n{calls}")));
+    for bad in ["", " ", "\n", "\n\n\n"] {
+        assert!(
+            !accepts(&format!("Paris.\n</think>{bad}{calls}")),
+            "gap {bad:?} must be rejected — only the template's bytes \
+             re-render"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Cogito deep thinking (baked `cogito-cache-stable`).
+// ---------------------------------------------------------------------
+
+/// The owned cogito template, analyzed as `Session` serves it.
+fn cogito_baked() -> (ChatTemplate, CallSyntax) {
+    let source = fixture_source("cogito-cache-stable.jinja");
+    let syntax = analyze_template(&source, "", "<|im_end|>").expect("analyze");
+    let template =
+        ChatTemplate::from_source(source, String::new(), "<|im_end|>".into())
+            .expect("template compiles");
+    (template, syntax)
+}
+
+/// `Session`'s render options for `syntax`: thoughts preserved, the
+/// measured reingest convention.
+fn session_opts(syntax: &CallSyntax, gen: bool) -> RenderOptions {
+    RenderOptions::default()
+        .with_generation_prompt(gen)
+        .with_extra("preserve_thinking", true)
+        .with_thought_reingest(syntax.reasoning.reingest)
+}
+
+/// The production request shape: a system prompt, tools, and thinking
+/// from the prompt itself (no `enable_thinking` extra).
+fn cogito_prompt(thinking: Option<Thinking>) -> Prompt {
+    Prompt {
+        system: Some(Content::text("You are aegis, a forum agent.")),
+        messages: vec![Message {
+            role: Role::User,
+            content: Content::text("What's the weather in Paris?"),
+        }],
+        tools: Some(vec![test_tool().into()]),
+        thinking,
+        ..Default::default()
+    }
+}
+
+fn adaptive() -> Option<Thinking> {
+    Some(Thinking::adaptive())
+}
+
+/// Any thinking variant but `Disabled` asks cogito for deep thinking:
+/// the model card's incantation leads the system prompt, and the
+/// generation prompt pre-opens the thought. Off, the render is the
+/// stock template's, byte for byte.
+#[test]
+fn cogito_thinking_renders_incantation_and_preopens() {
+    let (template, syntax) = cogito_baked();
+    let stock = ChatTemplate::from_source(
+        fixture_source("cogito-gguf.jinja"),
+        String::new(),
+        "<|im_end|>".into(),
+    )
+    .expect("stock compiles");
+    let enabled = Thinking::Enabled {
+        budget_tokens: std::num::NonZeroU32::new(1024).unwrap(),
+        display: None,
+    };
+    for thinking in [adaptive(), Some(enabled)] {
+        for tools in [true, false] {
+            let mut prompt = cogito_prompt(thinking);
+            if !tools {
+                prompt.tools = None;
+            }
+            let gen = template
+                .render_with(&prompt, &session_opts(&syntax, true))
+                .expect("render");
+            assert!(
+                gen.starts_with(
+                    "<|im_start|>system\nEnable deep thinking subroutine.\
+                     \n\nYou are aegis, a forum agent."
+                ),
+                "{thinking:?}, tools {tools}: {gen:?}"
+            );
+            assert!(
+                gen.ends_with("<|im_start|>assistant\n<think>\n"),
+                "{thinking:?}, tools {tools}: {gen:?}"
+            );
+        }
+    }
+    for thinking in [None, Some(Thinking::Disabled)] {
+        let prompt = cogito_prompt(thinking);
+        let gen = template
+            .render_with(&prompt, &session_opts(&syntax, true))
+            .expect("render");
+        assert!(!gen.contains("deep thinking"), "{thinking:?}: {gen:?}");
+        assert!(gen.ends_with("<|im_start|>assistant\n"), "{gen:?}");
+        let stock_gen = stock
+            .render_with(&prompt, &session_opts(&syntax, true))
+            .expect("render");
+        // Stock, but for the call budget in the tools preamble.
+        let stock_gen = stock_gen.replace(
+            "You may call one or more functions to assist with the user \
+             query.",
+            "You may call up to three functions per turn to assist with \
+             the user query.",
+        );
+        assert_eq!(gen, stock_gen, "thinking off renders as stock");
+    }
+}
+
+/// The baked template renders thoughts, so the analyzer measures
+/// cogito's `<think>` markers instead of falling back to prose: the
+/// session parses a thought into a `Thought` block and the grammars
+/// spell the separator its template re-renders.
+#[test]
+fn cogito_baked_measures_think_markers() {
+    use drama_llama::dialect::{ReasoningMode, ReasoningReingest};
+    let (_, syntax) = cogito_baked();
+    assert_eq!(syntax.reasoning.mode, ReasoningMode::TagBased);
+    assert_eq!(syntax.reasoning.start, "<think>\n");
+    assert_eq!(syntax.reasoning.end, "\n</think>");
+    assert_eq!(syntax.reasoning.reingest, ReasoningReingest::Field);
+    assert_eq!(syntax.reasoning.separator.as_deref(), Some("\n\n"));
+    // Stock never renders a thought: no markers to measure. Nothing
+    // else about the dialect moved.
+    let stock = analyze_template(
+        &fixture_source("cogito-gguf.jinja"),
+        "",
+        "<|im_end|>",
+    )
+    .expect("analyze stock");
+    assert_eq!(stock.reasoning.mode, ReasoningMode::None);
+    assert_eq!(syntax.per_call_start, stock.per_call_start);
+    assert_eq!(syntax.per_call_end, stock.per_call_end);
+    assert_eq!(syntax.call_separator, stock.call_separator);
+}
+
+/// Parse a cogito thinking emission after the pre-opened `<think>\n`,
+/// push it as the assistant turn, and require the follow-up render to
+/// extend the generation prompt with the emission verbatim, closed by
+/// `<|im_end|>` — the auto-tip's contract. Returns the parsed blocks.
+fn assert_cogito_thinking_round_trip(emission: &str) -> Vec<Block> {
+    let (template, syntax) = cogito_baked();
+    let tool = test_tool();
+    let prompt = cogito_prompt(adaptive());
+    let gen = template
+        .render_with(&prompt, &session_opts(&syntax, true))
+        .expect("render");
+    let parsed = parse_text(&syntax, &[&tool], emission, true, Leniency::Final);
+    assert_eq!(parsed.status, ParseStatus::Complete, "{:#?}", parsed.blocks);
+    let mut with_turn = prompt.clone();
+    with_turn.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(parsed.blocks.clone()),
+    });
+    let rendered = template
+        .render_with(&with_turn, &session_opts(&syntax, false))
+        .expect("render");
+    let suffix = rendered.strip_prefix(&gen).unwrap_or_else(|| {
+        panic!("turn must extend the generation prompt.\n{rendered:?}")
+    });
+    assert_eq!(
+        suffix,
+        format!("{emission}<|im_end|>\n"),
+        "the emission must re-render verbatim"
+    );
+    parsed.blocks
+}
+
+/// A thought, prose, and a Hermes call: the thought parses into a
+/// `Thought` (markers off, body verbatim), the answer keeps none of
+/// the thought's framing, and the turn re-renders byte for byte.
+#[test]
+fn cogito_thought_prose_and_call_round_trip() {
+    let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
+                {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>";
+    let emission = format!(
+        "The user wants Paris weather.\n\nI'll call the tool.\n</think>\
+         \n\nChecking the forecast.\n\n{call}"
+    );
+    let blocks = assert_cogito_thinking_round_trip(&emission);
+    let [thought, text, call] = blocks.as_slice() else {
+        panic!("want [Thought, Text, ToolUse]: {blocks:#?}");
+    };
+    assert!(
+        matches!(thought, Block::Thought { thought, .. }
+            if thought == "The user wants Paris weather.\n\n\
+                           I'll call the tool."),
+        "{thought:#?}"
+    );
+    assert!(
+        matches!(text, Block::Text { text, .. }
+            if text.trim() == "Checking the forecast."),
+        "{text:#?}"
+    );
+    assert!(
+        matches!(call, Block::ToolUse { call }
+            if call.name == "get_weather"
+                && call.input == json!({"city": "Paris", "days": 3})),
+        "{call:#?}"
+    );
+}
+
+/// The other turn shapes thinking produces: a thought then a bare call,
+/// a thought then the answer, a thought ending the turn, and a thought
+/// reopened back to back (`<think>` is plain text in cogito's vocab, so
+/// nothing stops the model writing it).
+#[test]
+fn cogito_thinking_turn_shapes_round_trip() {
+    let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
+                {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>";
+    for emission in [
+        format!("Need the tool.\n</think>\n\n{call}"),
+        format!("Need the tool.\n</think>\n{call}"),
+        "Easy.\n</think>\n\nIt is sunny.".to_owned(),
+        "Easy.\n</think>\nIt is sunny.\n".to_owned(),
+        "Nothing to add.\n</think>".to_owned(),
+        "A.\n</think><think>\nB.\n</think>\n\nIt is sunny.".to_owned(),
+    ] {
+        let blocks = assert_cogito_thinking_round_trip(&emission);
+        assert!(
+            matches!(blocks.first(), Some(Block::Thought { .. })),
+            "{emission:?}: {blocks:#?}"
+        );
+        for block in &blocks {
+            if let Block::Text { text, .. } = block {
+                assert!(!text.contains("think>"), "{emission:?}: {text:?}");
+            }
+        }
+    }
+}
+
+/// A client that sends the answer back trimmed (`"It is sunny."` where
+/// the model wrote `"\n\nIt is sunny."`) still gets the template's
+/// canonical `\n\n` after the thought; an aged thought is dropped only
+/// on an explicit `preserve_thinking = false`.
+#[test]
+fn cogito_thought_history_renders_canonically() {
+    let (template, syntax) = cogito_baked();
+    let mut prompt = cogito_prompt(adaptive());
+    prompt.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![
+            Block::Thought {
+                thought: Cow::Borrowed("Easy."),
+                signature: Cow::Borrowed(""),
+            },
+            Block::Text {
+                text: Cow::Borrowed("It is sunny."),
+                citations: None,
+                cache_control: None,
+            },
+        ]),
+    });
+    let kept = template
+        .render_with(&prompt, &session_opts(&syntax, false))
+        .expect("render");
+    assert!(
+        kept.ends_with(
+            "<|im_start|>assistant\n<think>\nEasy.\n</think>\n\n\
+             It is sunny.<|im_end|>\n"
+        ),
+        "{kept:?}"
+    );
+    let dropped = template
+        .render_with(
+            &prompt,
+            &session_opts(&syntax, false)
+                .with_extra("preserve_thinking", false),
+        )
+        .expect("render");
+    assert!(
+        dropped.ends_with("<|im_start|>assistant\nIt is sunny.<|im_end|>\n"),
+        "{dropped:?}"
+    );
+}
+
+/// The #85 cache property with thinking ON: across a tool round the
+/// incantation renders identically, and each request's render is a
+/// byte prefix of the next — the thinking turn, its tool result, and
+/// the next generation prompt only ever append.
+#[test]
+fn cogito_thinking_prefix_continuity_across_rounds() {
+    use drama_llama::prompt::ToolResult;
+    let (template, syntax) = cogito_baked();
+    let tool = test_tool();
+    let mut prompt = cogito_prompt(adaptive());
+    let turns = [
+        "Paris first.\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \
+         \"arguments\": {\"city\": \"Paris\", \"days\": 1}}\n</tool_call>",
+        "Sunny, 21°C — say so.\n</think>\n\nIt's sunny in Paris, 21°C.",
+    ];
+    let mut prev = String::new();
+    for (round, emission) in turns.iter().enumerate() {
+        let gen = template
+            .render_with(&prompt, &session_opts(&syntax, true))
+            .expect("render");
+        assert!(
+            gen.starts_with(&prev),
+            "round {round}: the request must extend the last one"
+        );
+        let parsed =
+            parse_text(&syntax, &[&tool], emission, true, Leniency::Final);
+        prompt.messages.push(Message {
+            role: Role::Assistant,
+            content: Content(parsed.blocks.clone()),
+        });
+        let closed = template
+            .render_with(&prompt, &session_opts(&syntax, false))
+            .expect("render");
+        assert_eq!(
+            closed.strip_prefix(&gen),
+            Some(format!("{emission}<|im_end|>\n").as_str()),
+            "round {round}: the turn must re-render verbatim"
+        );
+        let call_id = parsed.blocks.iter().find_map(|b| match b {
+            Block::ToolUse { call } => Some(call.id.clone()),
+            _ => None,
+        });
+        prompt.messages.push(Message {
+            role: Role::User,
+            content: match call_id {
+                Some(id) => Content(vec![Block::ToolResult {
+                    result: ToolResult {
+                        tool_use_id: id,
+                        content: Content::text("sunny, 21°C"),
+                        is_error: false,
+                        cache_control: None,
+                    },
+                }]),
+                None => Content::text("Thanks. And tomorrow?"),
+            },
+        });
+        prev = closed;
+    }
+    let last = template
+        .render_with(&prompt, &session_opts(&syntax, true))
+        .expect("render");
+    assert!(
+        last.starts_with(&prev),
+        "the final request extends the last"
     );
 }

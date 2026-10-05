@@ -46,12 +46,15 @@
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use minijinja::{
-    value::Value as JinjaValue, Environment, Error as JinjaError,
-    UndefinedBehavior,
+    value::{Kwargs, Value as JinjaValue},
+    Environment, Error as JinjaError, UndefinedBehavior,
 };
 use serde::Serialize;
 
-use misanthropic::prompt::message::{CacheControl, CacheTtl};
+use misanthropic::prompt::{
+    message::{CacheControl, CacheTtl},
+    Effort, OutputConfig, Thinking,
+};
 
 use crate::{
     backend::Model, prompt::Tool, Block, Content, Prompt, Role, Token,
@@ -162,6 +165,7 @@ impl ChatTemplate {
         );
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
+        register_template_filters(&mut env);
         env.add_template_owned("chat", source.clone())
             .map_err(ChatTemplateError::from_jinja)?;
 
@@ -179,6 +183,11 @@ impl ChatTemplate {
         env_permissive.set_undefined_behavior(UndefinedBehavior::Chainable);
         env_permissive.add_function("raise_exception", raise_exception_noop);
         env_permissive.add_function("strftime_now", strftime_now);
+        // Must match the strict env exactly: a partial render that
+        // escapes differently from the full render is not a prefix of
+        // it, and `Session` silently drops such partials — costing the
+        // very breakpoints this is meant to preserve.
+        register_template_filters(&mut env_permissive);
         env_permissive
             .add_template_owned("chat", source)
             .map_err(ChatTemplateError::from_jinja)?;
@@ -234,6 +243,18 @@ impl ChatTemplate {
         opts: &RenderOptions,
     ) -> Result<String, ChatTemplateError> {
         self.render_with_env(&self.env, prompt, opts)
+            .map(|(text, _)| text)
+    }
+
+    /// [`Self::render_with`], plus how many times each reserved piece
+    /// was neutralized in the prompt's content (empty without
+    /// [`RenderOptions::literals`]).
+    pub(crate) fn render_counted(
+        &self,
+        prompt: &Prompt,
+        opts: &RenderOptions,
+    ) -> Result<(String, LiteralCounts), ChatTemplateError> {
+        self.render_with_env(&self.env, prompt, opts)
     }
 
     /// Shared render path. `env` selects strict vs. permissive raise
@@ -244,7 +265,7 @@ impl ChatTemplate {
         env: &Environment<'static>,
         prompt: &Prompt,
         opts: &RenderOptions,
-    ) -> Result<String, ChatTemplateError> {
+    ) -> Result<(String, LiteralCounts), ChatTemplateError> {
         // Images require a media sentinel to render into — anything
         // else is the silent drop this check exists to kill.
         if opts.media_sentinel.is_none() && prompt_has_images(prompt) {
@@ -260,12 +281,13 @@ impl ChatTemplate {
             }
             (_, start) => start.as_deref().unwrap_or_default(),
         };
+        let surfaces = Surfaces::new(opts);
         let messages = build_messages(
             prompt,
             opts.thought_reingest,
-            opts.media_sentinel.as_deref(),
+            &surfaces,
             open_tail.is_some(),
-        );
+        )?;
         // Only custom (client-executed) tool defs render into the
         // template; server tools execute on Anthropic's side and their
         // schemas aren't even visible to us.
@@ -278,9 +300,18 @@ impl ChatTemplate {
         let tools_value = if custom_tools.is_empty() {
             JinjaValue::from(()) // renders as None / null
         } else {
-            let wire: Vec<serde_json::Value> =
-                custom_tools.iter().map(|t| tool_wire_value(t)).collect();
-            JinjaValue::from_serialize(&wire)
+            for (i, tool) in custom_tools.iter().enumerate() {
+                surfaces.identifier(&tool.name, is_tool_name, || {
+                    format!("tool definition {i}: name")
+                })?;
+            }
+            let wire = serde_json::Value::Array(
+                custom_tools.iter().map(|t| tool_wire_value(t)).collect(),
+            );
+            // Descriptions and schemas are content — a third-party
+            // tool's description is as untrusted as its results. Not
+            // counted: `Session`'s scan walks messages, not tools.
+            surfaces.value(&wire, false)
         };
         // Default `date_string` to today in HF's "%d %b %Y" format when
         // the caller didn't supply one. The template unconditionally
@@ -295,8 +326,7 @@ impl ChatTemplate {
         // means thinking disabled, `Some(_)` means enabled. Caller-set
         // `extras.with_extra("enable_thinking", _)` always wins, so we
         // only add the derived value when the caller hasn't.
-        let extras_has_thinking =
-            opts.extras.iter().any(|(k, _)| k == "enable_thinking");
+        let has_extra = |key: &str| opts.extras.iter().any(|(k, _)| k == key);
         // An open trailing thought IS a generation prompt: the model
         // resumes *inside* the reasoning block, so the render must end
         // at the assistant header (plus the withheld body) and never
@@ -305,25 +335,32 @@ impl ChatTemplate {
         // — both of which pass `false` — consistent with the full one.
         let add_generation_prompt =
             opts.add_generation_prompt || open_tail.is_some();
-        let base_ctx = if extras_has_thinking {
-            minijinja::context! {
-                bos_token => &self.bos_token,
-                eos_token => &self.eos_token,
-                messages => messages,
-                tools => tools_value,
-                add_generation_prompt => add_generation_prompt,
-                date_string => date_string,
+        // Values derived from the prompt, each added only when the
+        // caller didn't set it: context merges are left-wins, so a
+        // derived key would otherwise shadow the caller's extra.
+        // `reasoning_effort` follows `output_config.effort` (see
+        // `derive_reasoning_effort`).
+        let mut derived: BTreeMap<&str, JinjaValue> = BTreeMap::new();
+        if !has_extra("enable_thinking") {
+            derived.insert(
+                "enable_thinking",
+                JinjaValue::from(thinking_enabled(prompt)),
+            );
+        }
+        if !has_extra("reasoning_effort") {
+            if let Some(effort) = derive_reasoning_effort(prompt, &opts.efforts)
+            {
+                derived.insert("reasoning_effort", JinjaValue::from(effort));
             }
-        } else {
-            minijinja::context! {
-                bos_token => &self.bos_token,
-                eos_token => &self.eos_token,
-                messages => messages,
-                tools => tools_value,
-                add_generation_prompt => add_generation_prompt,
-                date_string => date_string,
-                enable_thinking => prompt.thinking.is_some(),
-            }
+        }
+        let base_ctx = minijinja::context! {
+            bos_token => &self.bos_token,
+            eos_token => &self.eos_token,
+            messages => messages,
+            tools => tools_value,
+            add_generation_prompt => add_generation_prompt,
+            date_string => date_string,
+            ..JinjaValue::from_serialize(&derived)
         };
         // Merge caller-supplied extras on top of the base context.
         let ctx = if opts.extras.is_empty() {
@@ -346,8 +383,10 @@ impl ChatTemplate {
         // Append the withheld open thought, raw. Byte-exactness is the
         // whole point: the KV cache holds these bytes verbatim, and
         // anything routed through Jinja would come back normalized
-        // (Qwen3.6 `|trim`s message content and lstrip/rstrip's the
-        // halves it splits on `</think>`), making `\n` and `\n\n\n`
+        // (Qwen3.6's stock template `|trim`s message content and
+        // lstrip/rstrip's the halves it splits on `</think>`; the baked
+        // replacement renders a *closed* turn verbatim, but has no
+        // spelling for an unclosed one), making `\n` and `\n\n\n`
         // indistinguishable.
         if let Some(body) = open_tail {
             // The open marker comes from whichever side actually emits
@@ -360,9 +399,9 @@ impl ChatTemplate {
             if !out.trim_end().ends_with(reasoning_start) {
                 out.push_str(reasoning_start);
             }
-            out.push_str(body);
+            out.push_str(&surfaces.text(body, true));
         }
-        Ok(out)
+        Ok((out, surfaces.counts.into_inner()))
     }
 
     /// Render the prompt plus one partial render per `cache_control`
@@ -394,13 +433,25 @@ impl ChatTemplate {
         prompt: &Prompt,
         opts: &RenderOptions,
     ) -> Result<RenderedWithBreakpoints, ChatTemplateError> {
-        let text = self.render_with(prompt, opts)?;
+        self.render_with_breakpoints_counted(prompt, opts)
+            .map(|(rendered, _)| rendered)
+    }
+
+    /// [`Self::render_with_breakpoints`], plus the full render's
+    /// neutralization counts (see [`Self::render_counted`]).
+    pub(crate) fn render_with_breakpoints_counted(
+        &self,
+        prompt: &Prompt,
+        opts: &RenderOptions,
+    ) -> Result<(RenderedWithBreakpoints, LiteralCounts), ChatTemplateError>
+    {
+        let (text, counts) = self.render_counted(prompt, opts)?;
         let breakpoints = collect_breakpoints(prompt);
         let mut partials = Vec::with_capacity(breakpoints.len());
         for (bp, ttl) in breakpoints {
             match render_partial(self, prompt, opts, bp) {
                 Ok(s) => partials.push((bp, ttl, s)),
-                Err(_e) => {
+                Err(e) => {
                     // Drop this breakpoint — same fail-open posture
                     // tokenize_with_breakpoints uses for non-prefix-
                     // safe partials. A breakpoint we can't render
@@ -409,18 +460,19 @@ impl ChatTemplate {
                     // default level — losing a breakpoint silently
                     // is a cache-correctness signal, not a debug
                     // nicety.
-                    #[cfg(feature = "axum")]
                     tracing::warn!(
                         target: "drama_llama::chat_template",
+                        event = "cache_degrade",
+                        reason = "partial_render_failed",
                         breakpoint = ?bp,
-                        error = %_e,
+                        error = %e,
                         "partial render failed; breakpoint dropped from \
                          partial_texts (cache reuse lost at this position)",
                     );
                 }
             }
         }
-        Ok(RenderedWithBreakpoints { text, partials })
+        Ok((RenderedWithBreakpoints { text, partials }, counts))
     }
 }
 
@@ -523,6 +575,27 @@ pub struct RenderOptions {
     ///
     /// [`OPEN_THOUGHT_SIGNATURE`]: crate::prompt::OPEN_THOUGHT_SIGNATURE
     pub reasoning_start: Option<String>,
+    /// The `reasoning_effort` values the template accepts, lowest
+    /// first ([`ReasoningSyntax::efforts`]). When a thinking-enabled
+    /// prompt carries `output_config.effort`, the render sets
+    /// `reasoning_effort` to that level if accepted, else to the
+    /// nearest accepted one (the lower on a tie): Qwen3.8 has no `max`,
+    /// so `Max` renders `xhigh`. Empty (the default) = no knob; the
+    /// effort is ignored. A caller's `reasoning_effort` extra always
+    /// wins. `Session` sets this from the analyzed dialect, beside
+    /// [`Self::thought_reingest`].
+    ///
+    /// [`ReasoningSyntax::efforts`]: crate::dialect::ReasoningSyntax::efforts
+    pub efforts: Vec<String>,
+    /// Content-literal neutralization (see [`LiteralNeutralizer`]).
+    /// When set, every content string the template sees has its
+    /// reserved pieces replaced by markers, and tool names and
+    /// tool-use ids must match Anthropic's patterns
+    /// ([`ChatTemplateError::InvalidIdentifier`]). `Session` sets this
+    /// on every render itself, whatever
+    /// [`Session::with_render_opts`](crate::Session::with_render_opts)
+    /// was given.
+    pub literals: Option<Literals>,
 }
 
 impl RenderOptions {
@@ -586,6 +659,107 @@ impl RenderOptions {
         self.reasoning_start = (!start.is_empty()).then(|| start.to_string());
         self
     }
+
+    /// Builder: set the template's accepted effort levels (see
+    /// [`RenderOptions::efforts`]).
+    pub fn with_efforts<I, S>(mut self, efforts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.efforts = efforts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Builder: neutralize content literals (see
+    /// [`RenderOptions::literals`]).
+    pub fn with_literals(mut self, literals: Literals) -> Self {
+        self.literals = Some(literals);
+        self
+    }
+}
+
+/// The ordered effort scale, lowest first — Anthropic's
+/// [`Effort`] levels, which are also the chat-template spellings.
+/// Nearest-level mapping and the analyzer's effort probe both walk it.
+pub(crate) const EFFORT_SCALE: [&str; 5] =
+    ["low", "medium", "high", "xhigh", "max"];
+
+/// Map a requested [`Effort`] onto the levels a template `accepted`:
+/// the level itself if accepted, else the nearest accepted one on
+/// [`EFFORT_SCALE`], the lower on a tie. `None` for an unknown
+/// ([`Effort::Custom`]) level or an empty set.
+pub(crate) fn resolve_effort<'a>(
+    requested: &Effort,
+    accepted: &'a [String],
+) -> Option<&'a str> {
+    let rank = |level: &str| EFFORT_SCALE.iter().position(|&l| l == level);
+    let want = rank(requested.as_str())?;
+    accepted
+        .iter()
+        .filter_map(|level| Some((rank(level)?, level.as_str())))
+        .min_by_key(|&(r, _)| (want.abs_diff(r), r))
+        .map(|(_, level)| level)
+}
+
+/// Whether `prompt` asks for thinking. `Some(Thinking::Disabled)` is
+/// an explicit *off*: checking `thinking.is_some()` instead rendered it
+/// as `enable_thinking = true`.
+pub(crate) fn thinking_enabled(prompt: &Prompt) -> bool {
+    !matches!(prompt.thinking, None | Some(Thinking::Disabled))
+}
+
+/// The `reasoning_effort` a render passes the template, if any: only
+/// for a thinking-enabled prompt that requests an effort, mapped onto
+/// the template's accepted levels by [`resolve_effort`]. Thinking off
+/// never sets it, so a thinking-off render is unchanged.
+fn derive_reasoning_effort<'a>(
+    prompt: &Prompt,
+    accepted: &'a [String],
+) -> Option<&'a str> {
+    if !thinking_enabled(prompt) {
+        return None;
+    }
+    let requested = prompt.output_config.as_ref()?.effort.as_ref()?;
+    if accepted.is_empty() {
+        debug_once(format!(
+            "effort `{requested}` requested, but the chat template has \
+             no reasoning_effort knob; ignoring it"
+        ));
+        return None;
+    }
+    let chosen = resolve_effort(requested, accepted);
+    match chosen {
+        Some(level) if level != requested.as_str() => debug_once(format!(
+            "effort `{requested}` isn't accepted by the chat template \
+             ({accepted:?}); rendering reasoning_effort `{level}`"
+        )),
+        None => debug_once(format!(
+            "effort `{requested}` is not a known level; leaving \
+             reasoning_effort unset"
+        )),
+        Some(_) => {}
+    }
+    chosen
+}
+
+/// Log `message` at debug level the first time it occurs. Every call
+/// renders the prompt several times (full plus one partial per cache
+/// breakpoint), so a per-render log would repeat itself.
+fn debug_once(message: String) {
+    use std::{
+        collections::BTreeSet,
+        sync::{Mutex, OnceLock},
+    };
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let first = seen
+        .lock()
+        .map(|mut seen| seen.insert(message.clone()))
+        .unwrap_or(true);
+    if first {
+        tracing::debug!("{message}");
+    }
 }
 
 // ===========================================================================
@@ -648,7 +822,33 @@ pub enum PromptBreakpoint {
 /// per-*block*, a section with several cached blocks resolves to the
 /// **max** TTL among them — the generous reading: any block asking for
 /// an hour keeps the whole section's prefix alive for an hour.
+///
+/// The request-level [`Prompt::cache_control`] (Anthropic's automatic
+/// caching) contributes one more breakpoint, on the section holding
+/// the last cacheable block, with its own TTL. Explicit markers only
+/// sit on cacheable blocks, so that section is never before the last
+/// explicit one: the automatic breakpoint either extends the list or
+/// merges into its last entry (max TTL again).
 fn collect_breakpoints(prompt: &Prompt) -> Vec<(PromptBreakpoint, CacheTtl)> {
+    let mut out = explicit_breakpoints(prompt);
+    let auto = prompt
+        .cache_control
+        .as_ref()
+        .zip(auto_cache_target(prompt))
+        .map(|(control, target)| (target.at, control_ttl_of(control)));
+    match (auto, out.last_mut()) {
+        (Some((at, ttl)), Some((last, last_ttl))) if *last == at => {
+            *last_ttl = max_ttl(last_ttl.clone(), ttl);
+        }
+        (Some(auto), _) => out.push(auto),
+        (None, _) => {}
+    }
+    out
+}
+
+/// [`collect_breakpoints`] without the automatic breakpoint: the
+/// sections the markers on tools and blocks declare.
+fn explicit_breakpoints(prompt: &Prompt) -> Vec<(PromptBreakpoint, CacheTtl)> {
     let mut out = Vec::new();
 
     let tools_ttl = prompt.tools.as_ref().and_then(|defs| {
@@ -676,17 +876,88 @@ fn collect_breakpoints(prompt: &Prompt) -> Vec<(PromptBreakpoint, CacheTtl)> {
 /// five minutes when the marker omits it (Anthropic semantics —
 /// `{type: "ephemeral"}` alone means 5m).
 fn control_ttl(control: &Option<CacheControl>) -> Option<CacheTtl> {
-    control.as_ref().map(|cc| match cc {
+    control.as_ref().map(control_ttl_of)
+}
+
+/// [`control_ttl`] for a marker known to be present.
+fn control_ttl_of(control: &CacheControl) -> CacheTtl {
+    match control {
         CacheControl::Ephemeral { ttl } => {
             ttl.clone().unwrap_or(CacheTtl::FiveMinutes)
         }
-    })
+    }
 }
 
-/// The TTL of `block`'s cache marker, if it carries one. Mirrors the
-/// variant arms of [`Block::is_cached`] — the block kinds that cannot
-/// carry a marker return `None`.
-fn block_cache_ttl(block: &Block) -> Option<CacheTtl> {
+/// Where Anthropic's automatic caching ([`Prompt::cache_control`])
+/// places its breakpoint: the section holding the prompt's last
+/// cacheable block, and that block's own explicit marker, if any.
+#[derive(Clone, Debug)]
+struct AutoCacheTarget {
+    /// The section the breakpoint lands after.
+    at: PromptBreakpoint,
+    /// The TTL of an explicit marker already on the target block;
+    /// `None` too for a cached server-tool definition, whose TTL is
+    /// not readable upstream.
+    marker: Option<CacheTtl>,
+}
+
+/// The last cacheable block of `prompt` in processing order (`tools`,
+/// `system`, `messages`), walking backward past blocks that cannot
+/// carry a marker (thoughts, server-tool results) as Anthropic does.
+/// `None` when nothing can carry one; Anthropic then caches nothing.
+fn auto_cache_target(prompt: &Prompt) -> Option<AutoCacheTarget> {
+    fn last_cacheable(content: &Content) -> Option<&Block> {
+        content
+            .0
+            .iter()
+            .rev()
+            .find(|block| block_is_cacheable(block))
+    }
+    let in_messages =
+        prompt.messages.iter().enumerate().rev().find_map(|(i, m)| {
+            last_cacheable(&m.content).map(|block| AutoCacheTarget {
+                at: PromptBreakpoint::AfterMessage(i),
+                marker: block_cache_ttl(block),
+            })
+        });
+    let in_system = || {
+        let block = last_cacheable(prompt.system.as_ref()?)?;
+        Some(AutoCacheTarget {
+            at: PromptBreakpoint::AfterSystem,
+            marker: block_cache_ttl(block),
+        })
+    };
+    let in_tools = || {
+        use misanthropic::tool::MethodDef;
+        let tool = prompt.tools.as_ref()?.last()?;
+        // A server definition's TTL is not readable upstream: no marker
+        // to compare, as in [`check_cache_controls`].
+        let marker = match tool {
+            MethodDef::Custom(c) => control_ttl(&c.cache_control),
+            MethodDef::Server(_) => None,
+        };
+        Some(AutoCacheTarget {
+            at: PromptBreakpoint::AfterTools,
+            marker,
+        })
+    };
+    in_messages.or_else(in_system).or_else(in_tools)
+}
+
+/// `block`'s `cache_control` field — `Some` for the kinds that can
+/// carry a marker (holding the marker, if set), `None` for those that
+/// cannot (thoughts, server-tool results, tool references). The one
+/// place that knows which is which: [`block_is_cacheable`] and
+/// [`block_cache_ttl`] both read it.
+///
+/// Every variant is named, as in misanthropic's `Block::is_cached`.
+/// `Block` is `#[non_exhaustive]`, so a downstream match needs the
+/// trailing wildcard and a new upstream variant still compiles — but
+/// the `clippy::wildcard_enum_match_arm` denial below fires the moment
+/// the wildcard would match a variant not named here, so `just check`
+/// fails until someone decides which side it belongs on.
+#[deny(clippy::wildcard_enum_match_arm)]
+fn block_cache_control(block: &Block) -> Option<&Option<CacheControl>> {
     use misanthropic::tool;
     match block {
         Block::Text { cache_control, .. }
@@ -700,15 +971,181 @@ fn block_cache_ttl(block: &Block) -> Option<CacheTtl> {
         }
         | Block::ServerToolUse {
             call: tool::Use { cache_control, .. },
-        } => control_ttl(cache_control),
+        } => Some(cache_control),
+        Block::Thought { .. }
+        | Block::RedactedThought { .. }
+        | Block::WebSearchToolResult { .. }
+        | Block::WebFetchToolResult { .. }
+        | Block::ToolSearchToolResult { .. }
+        | Block::CodeExecutionToolResult { .. }
+        | Block::BashCodeExecutionToolResult { .. }
+        | Block::TextEditorCodeExecutionToolResult { .. }
+        | Block::ToolReference { .. } => None,
+        // Unreachable today; see the lint note above.
         _ => None,
     }
 }
 
-/// The TTL of a tool definition's cache marker, if any. Server-side
-/// definitions don't expose their `cache_control` upstream (private
-/// accessor), so a marked server def contributes the conservative
-/// 5-minute default.
+/// Whether `block` can carry a `cache_control` marker
+/// ([`block_cache_control`]).
+fn block_is_cacheable(block: &Block) -> bool {
+    block_cache_control(block).is_some()
+}
+
+/// One explicit `cache_control` marker, as Anthropic addresses it in
+/// an error: its JSON path (`tools.1`, `system.0`,
+/// `messages.2.content.0`) and its TTL. `ttl` is `None` for a server
+/// tool definition, whose marker misanthropic does not expose — it
+/// counts toward the limit but takes no part in the TTL rules, rather
+/// than guessing and answering a valid request with a 400.
+#[derive(Debug)]
+struct Marker {
+    path: String,
+    ttl: Option<CacheTtl>,
+}
+
+/// Every explicit `cache_control` marker in `prompt`, in processing
+/// order (`tools`, `system`, `messages`).
+fn explicit_markers(prompt: &Prompt) -> Vec<Marker> {
+    use misanthropic::tool::MethodDef;
+    let tools =
+        prompt
+            .tools
+            .iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(i, def)| {
+                let ttl = match def {
+                    MethodDef::Custom(c) => {
+                        Some(control_ttl(&c.cache_control)?)
+                    }
+                    MethodDef::Server(s) => s.is_cached().then_some(None)?,
+                };
+                Some(Marker {
+                    path: format!("tools.{i}"),
+                    ttl,
+                })
+            });
+    let blocks_of = |prefix: String, content: &Content| {
+        content
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(i, block)| {
+                Some(Marker {
+                    path: format!("{prefix}{i}"),
+                    ttl: Some(block_cache_ttl(block)?),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let system = prompt
+        .system
+        .iter()
+        .flat_map(|system| blocks_of("system.".into(), system));
+    let messages = prompt.messages.iter().enumerate().flat_map(|(m, msg)| {
+        blocks_of(format!("messages.{m}.content."), &msg.content)
+    });
+    tools.chain(system).chain(messages).collect()
+}
+
+/// Anthropic's per-request limit on `cache_control` markers, the
+/// automatic one ([`Prompt::cache_control`]) included.
+pub const MAX_CACHE_CONTROLS: usize = 4;
+
+/// Anthropic's message for a 1-hour marker after a 5-minute one, at
+/// `path` — the offending explicit marker's `….cache_control.ttl`, or
+/// `cache_control` for the request-level automatic one.
+fn ttl_order_error(path: &str) -> String {
+    format!(
+        "{path}: a ttl='1h' cache_control block must not come after a \
+         ttl='5m' cache_control block. Note that blocks are processed in \
+         the following order: `tools`, `system`, `messages`."
+    )
+}
+
+/// The checks Anthropic makes on a request's `cache_control` markers,
+/// each an `invalid_request_error` whose message this returns in
+/// Anthropic's exact wording (captured 2026-09-30 on claude-haiku-4-5
+/// via `count_tokens`; rules 1, 3 and 4 on `/v1/messages` too):
+///
+/// 1. At most [`MAX_CACHE_CONTROLS`] markers, and the automatic one
+///    always counts — even on a block that already carries an explicit
+///    marker with the same TTL, which the docs call a no-op but the
+///    wire counts: `A maximum of 4 blocks with cache_control may be
+///    provided. Found 5.`
+/// 2. Longer TTLs come first: a 1-hour explicit marker must not follow
+///    a 5-minute one. Anthropic names the first offender by path —
+///    `messages.0.content.1.cache_control.ttl: a ttl='1h' …`.
+/// 3. The automatic marker's TTL must match an explicit marker on the
+///    block it lands on (not checked when that block is a cached
+///    server-tool definition).
+/// 4. The same ordering rule for the automatic marker, which comes
+///    last: a 1-hour automatic marker after any 5-minute explicit one,
+///    reported at the path `cache_control`.
+///
+/// Checked in that order, which is Anthropic's: for each rule, a
+/// request breaking it and every later one was captured answering
+/// with that rule's message. A cached server-tool definition counts
+/// toward rule 1, but its TTL is not readable upstream, so it takes
+/// no part in rules 2–4 rather than guessing a TTL and answering a
+/// valid request with a 400.
+pub fn check_cache_controls(prompt: &Prompt) -> Result<(), String> {
+    let explicit = explicit_markers(prompt);
+    let found = explicit.len() + usize::from(prompt.cache_control.is_some());
+    if found > MAX_CACHE_CONTROLS {
+        return Err(format!(
+            "A maximum of {MAX_CACHE_CONTROLS} blocks with cache_control \
+             may be provided. Found {found}."
+        ));
+    }
+    let is_hour =
+        |ttl: &CacheTtl| ttl_duration(ttl) == ttl_duration(&CacheTtl::OneHour);
+    let first_five = explicit
+        .iter()
+        .position(|m| m.ttl.as_ref().is_some_and(|ttl| !is_hour(ttl)));
+    let hour_after_five = first_five.and_then(|at| {
+        explicit[at..]
+            .iter()
+            .find(|m| m.ttl.as_ref().is_some_and(is_hour))
+    });
+    if let Some(marker) = hour_after_five {
+        return Err(ttl_order_error(&format!(
+            "{}.cache_control.ttl",
+            marker.path
+        )));
+    }
+    let Some(auto) = prompt.cache_control.as_ref().map(control_ttl_of) else {
+        return Ok(());
+    };
+    let marker = auto_cache_target(prompt).and_then(|target| target.marker);
+    if let Some(marker) = marker {
+        if ttl_duration(&marker) != ttl_duration(&auto) {
+            return Err(format!(
+                "Top-level cache_control has ttl='{auto}' but the target \
+                 block already has cache_control with ttl='{marker}'. When \
+                 both are specified on the same block, they must have \
+                 matching TTLs."
+            ));
+        }
+    }
+    if is_hour(&auto) && first_five.is_some() {
+        return Err(ttl_order_error("cache_control"));
+    }
+    Ok(())
+}
+
+/// The TTL of `block`'s cache marker, if it carries one
+/// ([`block_cache_control`]).
+fn block_cache_ttl(block: &Block) -> Option<CacheTtl> {
+    block_cache_control(block).and_then(control_ttl)
+}
+
+/// The TTL of a tool definition's cache marker, if any, for placing
+/// breakpoints. Server-side definitions don't expose their
+/// `cache_control` upstream (private accessor), so a marked server def
+/// keeps its breakpoint for the conservative 5-minute default; the
+/// 400 checks ([`check_cache_controls`]) give it no TTL at all.
 fn method_cache_ttl(def: &misanthropic::tool::MethodDef) -> Option<CacheTtl> {
     use misanthropic::tool::MethodDef;
     match def {
@@ -750,9 +1187,31 @@ fn render_partial(
     opts: &RenderOptions,
     up_to: PromptBreakpoint,
 ) -> Result<String, ChatTemplateError> {
+    // Everything the template can see besides `messages` must carry
+    // over, or the partial is not a prefix of the full render and
+    // gets dropped. `thinking` reaches the template as
+    // `enable_thinking`; Mistral Small 4 writes it into the prompt
+    // PREFIX (`[MODEL_SETTINGS]{"reasoning_effort": ...}`), so a
+    // partial rendered with it unset diverged from every thinking-on
+    // full render and the model lost every breakpoint (#93 follow-up,
+    // 2026-09-12). Qwen only reads it at the generation tail, which
+    // partials never render, so it never showed there.
+    //
+    // `output_config.effort` reaches the template as
+    // `reasoning_effort`, which Qwen3.8, Mistral and gpt-oss all write
+    // into the system PREFIX — same failure, same fix. Only the effort
+    // is carried: the render never reads `format`, and a partial has no
+    // business depending on it.
+    let output_config = prompt
+        .output_config
+        .as_ref()
+        .and_then(|c| c.effort.clone())
+        .map(OutputConfig::effort);
     let truncated = match up_to {
         PromptBreakpoint::AfterTools => Prompt {
             tools: prompt.tools.clone(),
+            thinking: prompt.thinking,
+            output_config: output_config.clone(),
             // Carry the system content too. Every modern template
             // (Qwen3, Llama 3.1, Hermes, Cogito) coalesces tools into
             // the system block, so a "tools-only, no system" truncation
@@ -770,21 +1229,23 @@ fn render_partial(
             tools: prompt.tools.clone(),
             system: prompt.system.clone(),
             messages: Vec::new(),
+            thinking: prompt.thinking,
+            output_config: output_config.clone(),
             ..Prompt::default()
         },
         PromptBreakpoint::AfterMessage(i) => Prompt {
             tools: prompt.tools.clone(),
             system: prompt.system.clone(),
             messages: prompt.messages[..=i].to_vec(),
+            thinking: prompt.thinking,
+            output_config,
             ..Prompt::default()
         },
     };
     let partial_opts = opts.clone().with_generation_prompt(false);
-    template.render_with_env(
-        &template.env_permissive,
-        &truncated,
-        &partial_opts,
-    )
+    template
+        .render_with_env(&template.env_permissive, &truncated, &partial_opts)
+        .map(|(text, _)| text)
 }
 
 /// Tokenize the full render and each partial in `rendered`, returning
@@ -799,18 +1260,15 @@ fn render_partial(
 /// uncached behavior for that call rather than erroring, so cache
 /// oddities degrade performance rather than correctness.
 ///
-/// Tokenizes with `parse_special=true` so chat markers
-/// (`<|im_start|>`, `<|eot_id|>`, …) resolve to their single
-/// special-token IDs — the same convention `Session::prepare_call`
-/// uses.
+/// Tokenizes the whole render with `parse_special=true` so chat
+/// markers (`<|im_start|>`, `<|eot_id|>`, …) resolve to their single
+/// special-token IDs. A diagnostic helper, not what [`Session`]
+/// feeds the model: this knows nothing of images or content literals
+/// ([`RenderOptions::literals`]), so a special piece spelled by
+/// content tokenizes here as the real special, and a render made with
+/// markers is not split. `Session` tokenizes marker-aware.
 ///
-/// Used internally by `Session::prepare_call_cached` for the
-/// prefix-cache lookup, and exposed publicly so callers can build
-/// inspection / diagnostic tools that reproduce exactly the same
-/// tokenization the cache machinery sees (see
-/// `examples/inspect_prompt.rs`).
-///
-/// [`Session::prepare_call`]: crate::Session
+/// [`Session`]: crate::Session
 pub fn tokenize_with_breakpoints<M: Model>(
     model: &M,
     rendered: &RenderedWithBreakpoints,
@@ -856,16 +1314,21 @@ pub fn tokenize_with_breakpoints<M: Model>(
 ///   each tool result emits a separate `{role: "tool", content: ...}`
 ///   message. Any remaining text in the same user turn follows as a
 ///   normal user message.
+///
+/// Every content string passes through `surfaces` on its way in (see
+/// [`LiteralNeutralizer`]); tool names and tool-use ids are validated
+/// there instead.
 fn build_messages(
     prompt: &Prompt,
     reingest: crate::dialect::ReasoningReingest,
-    media_sentinel: Option<&str>,
+    surfaces: &Surfaces<'_>,
     withhold_tail: bool,
-) -> Vec<JinjaValue> {
+) -> Result<Vec<JinjaValue>, ChatTemplateError> {
     let mut out: Vec<JinjaValue> =
         Vec::with_capacity(prompt.messages.len() + 1);
     if let Some(system) = prompt.system.as_ref() {
-        out.push(text_message("system", flatten_text(system, media_sentinel)));
+        let system = flatten_text(system, surfaces.media_sentinel);
+        out.push(text_message("system", system.render(surfaces, true)));
     }
     let messages = match withhold_tail {
         // The trailing open-thought message is rendered by the caller,
@@ -873,7 +1336,7 @@ fn build_messages(
         true => &prompt.messages[..prompt.messages.len() - 1],
         false => &prompt.messages[..],
     };
-    for m in messages {
+    for (index, m) in messages.iter().enumerate() {
         let role = match m.role {
             Role::User => "user",
             Role::Assistant => "assistant",
@@ -881,29 +1344,38 @@ fn build_messages(
             // HF templates broadly accept repeated system messages.
             Role::System => "system",
         };
-        append_message(&mut out, role, &m.content, reingest, media_sentinel);
+        append_message(&mut out, role, index, &m.content, reingest, surfaces)?;
     }
-    out
+    Ok(out)
 }
 
-/// Emit one or more Jinja messages for a single misanthropic Message.
+/// Emit one or more Jinja messages for a single misanthropic Message
+/// (the prompt's `index`th).
 fn append_message(
     out: &mut Vec<JinjaValue>,
     role: &str,
+    index: usize,
     content: &Content,
     reingest: crate::dialect::ReasoningReingest,
-    media_sentinel: Option<&str>,
-) {
+    surfaces: &Surfaces<'_>,
+) -> Result<(), ChatTemplateError> {
     let blocks: Vec<&Block> = content.0.iter().collect();
+    let media_sentinel = surfaces.media_sentinel;
 
     // User turn: split ToolResult blocks into their own "tool" messages,
     // collect remaining text/thought into a trailing user message.
     if role == "user" {
-        let mut residual = String::new();
-        for b in &blocks {
-            match b {
+        let mut residual = Flat::default();
+        for (b, block) in blocks.iter().enumerate() {
+            match block {
                 Block::ToolResult { result } => {
-                    let content = flatten_text(&result.content, media_sentinel);
+                    surfaces.identifier(
+                        &result.tool_use_id,
+                        is_identifier,
+                        || format!("message {index} block {b}: tool_use_id"),
+                    )?;
+                    let content = flatten_text(&result.content, media_sentinel)
+                        .render(surfaces, true);
                     out.push(tool_result_message(&result.tool_use_id, content));
                 }
                 other => {
@@ -912,9 +1384,9 @@ fn append_message(
             }
         }
         if !residual.is_empty() {
-            out.push(text_message(role, residual));
+            out.push(text_message(role, residual.render(surfaces, true)));
         }
-        return;
+        return Ok(());
     }
 
     // Assistant turn. Thoughts route by convention: inline
@@ -923,10 +1395,15 @@ fn append_message(
     // `reasoning`/`reasoning_content` fields (Gemma 4/DeepSeek-style
     // templates own the markers; inlining would pollute content).
     use crate::dialect::ReasoningReingest;
-    let calls: Vec<&crate::prompt::ToolUse> = blocks
+    // The whitespace a closed thought's signature carries
+    // (`ThoughtTail::gap`) is prose the model wrote after it. Put back
+    // as text, every template sees the turn as the parse first read it.
+    let unfolded = unfold_thought_gaps(&content.0);
+    let calls: Vec<(usize, &crate::prompt::ToolUse)> = blocks
         .iter()
-        .filter_map(|b| match b {
-            Block::ToolUse { call } => Some(call),
+        .enumerate()
+        .filter_map(|(b, block)| match block {
+            Block::ToolUse { call } => Some((b, call)),
             _ => None,
         })
         .collect();
@@ -936,9 +1413,10 @@ fn append_message(
     // causality-aware templates get both halves; stock templates read
     // the merged `content` and keep their own layout.
     let mut reasoning = String::new();
-    let mut content_pre = String::new();
-    let mut content_post = String::new();
+    let mut content_pre = Flat::default();
+    let mut content_post = Flat::default();
     let mut seen_call = false;
+    let blocks: Vec<&Block> = unfolded.iter().map(AsRef::as_ref).collect();
     for b in &blocks {
         match b {
             Block::ToolUse { .. } => seen_call = true,
@@ -961,20 +1439,148 @@ fn append_message(
             ),
         }
     }
+    // Consecutive thoughts concatenate with nothing between them, so
+    // the joined string is what gets neutralized.
+    let reasoning = surfaces.text(&reasoning, true);
+    let chunks = assistant_chunks(&blocks, surfaces);
 
     // One message carrying every call: the shape template
     // `tool_calls` loops iterate, so parallel calls re-render intact.
     if !calls.is_empty() {
-        out.push(tool_call_message(
+        let tool_calls = calls
+            .iter()
+            .map(|&(b, call)| {
+                let at = || format!("message {index} block {b}: tool_use");
+                surfaces.identifier(&call.id, is_identifier, || {
+                    format!("{} id", at())
+                })?;
+                surfaces.identifier(&call.name, is_tool_name, || {
+                    format!("{} name", at())
+                })?;
+                Ok(minijinja::context! {
+                    id => call.id.as_ref(),
+                    function => minijinja::context! {
+                        name => call.name.as_ref(),
+                        arguments => surfaces.value(&call.input, true),
+                    },
+                })
+            })
+            .collect::<Result<Vec<JinjaValue>, ChatTemplateError>>()?;
+        // The merged `content` joins the halves with nothing between
+        // them, so it is the counted form; the halves are what
+        // causality-aware templates render around the calls.
+        let content = content_pre.join(&content_post).render(surfaces, true);
+        let message = tool_call_message(
             role,
-            (&content_pre, &content_post),
-            &calls,
+            content,
+            (
+                &content_pre.render(surfaces, false),
+                &content_post.render(surfaces, false),
+            ),
+            tool_calls,
             &reasoning,
             reingest,
-        ));
-        return;
+        );
+        out.push(minijinja::context! { chunks => chunks, ..message });
+        return Ok(());
     }
-    out.push(assistant_text_message(role, content_pre, &reasoning));
+    let message = assistant_text_message(
+        role,
+        content_pre.render(surfaces, true),
+        &reasoning,
+    );
+    out.push(minijinja::context! { chunks => chunks, ..message });
+    Ok(())
+}
+
+/// An assistant turn's blocks with the whitespace each closed thought
+/// carries in its signature (`ThoughtTail::gap`, which the parse folds
+/// there because Anthropic rejects a whitespace-only text block) put
+/// back after the thought as the `Text` it was. Borrowed but for those.
+fn unfold_thought_gaps(blocks: &[Block]) -> Vec<Cow<'_, Block>> {
+    blocks
+        .iter()
+        .flat_map(|block| {
+            let gap = match block {
+                Block::Thought { signature, .. } => {
+                    crate::prompt::ThoughtTail::of(signature).gap
+                }
+                _ => String::new(),
+            };
+            let gap = (!gap.is_empty()).then(|| Cow::Owned(gap.into()));
+            std::iter::once(Cow::Borrowed(block)).chain(gap)
+        })
+        .collect()
+}
+
+/// An assistant message's blocks in emission order, as the `chunks`
+/// list templates may read in place of the merged fields: `{type:
+/// "text", text}` for each text block (with any media after it),
+/// `{type: "thinking", thinking}` for each thought, and one `{type:
+/// "tool_calls"}` where the first call sits (the calls themselves are
+/// the message's `tool_calls`). A thought whose signature records the
+/// content type of the Harmony final after it (`ThoughtTail::constrain`)
+/// carries it as `constrain`, for the template to spell the header the
+/// model wrote — on the thought, so a final with an empty body, which
+/// has no text chunk, still gets it.
+///
+/// Text blocks stay apart because two may be two answers: gpt-oss's
+/// commentary preamble then its final are a text block each, and the
+/// gpt-oss bake renders all but the last of a turn without calls as
+/// preambles. Templates that render text chunks in turn (Mistral 4)
+/// render the same bytes either way.
+///
+/// The merged `content` and `reasoning` fields lose two things the
+/// model wrote, and a template that renders the turn from them cannot
+/// reproduce it: where each thought sat relative to the prose, and
+/// that two back-to-back thoughts were two (Mistral 4's
+/// `…[/THINK][THINK]…`, live 2026-10-01). Stock Mistral templates read
+/// exactly this shape (`content` as a list of text and thinking
+/// chunks), and the baked Mistral 4 and gpt-oss templates render from
+/// it. Neutralized uncounted: the merged fields carry the count.
+fn assistant_chunks(blocks: &[&Block], surfaces: &Surfaces<'_>) -> JinjaValue {
+    let media_sentinel = surfaces.media_sentinel;
+    let mut chunks: Vec<JinjaValue> = Vec::new();
+    let mut prose = Flat::default();
+    let mut seen_call = false;
+    let flush = |prose: &mut Flat, chunks: &mut Vec<JinjaValue>| {
+        if prose.is_empty() {
+            return;
+        }
+        let text = std::mem::take(prose).render(surfaces, false);
+        chunks.push(minijinja::context! { type => "text", text => text });
+    };
+    for block in blocks {
+        match block {
+            Block::Thought { thought, signature } => {
+                flush(&mut prose, &mut chunks);
+                let thinking = surfaces.text(thought, false);
+                let tail = crate::prompt::ThoughtTail::of(signature);
+                chunks.push(match tail.constrain {
+                    Some(c) => minijinja::context! {
+                        type => "thinking", thinking => thinking,
+                        constrain => c,
+                    },
+                    None => minijinja::context! {
+                        type => "thinking", thinking => thinking,
+                    },
+                });
+            }
+            Block::ToolUse { .. } => {
+                flush(&mut prose, &mut chunks);
+                if !std::mem::replace(&mut seen_call, true) {
+                    chunks.push(minijinja::context! { type => "tool_calls" });
+                }
+            }
+            Block::Text { .. } => {
+                flush(&mut prose, &mut chunks);
+                append_block_text(&mut prose, block, media_sentinel);
+            }
+            other => append_block_text(&mut prose, other, media_sentinel),
+        }
+    }
+    flush(&mut prose, &mut chunks);
+    JinjaValue::from(chunks)
 }
 
 fn text_message(role: &str, content: String) -> JinjaValue {
@@ -1002,24 +1608,12 @@ fn text_message(role: &str, content: String) -> JinjaValue {
 /// render announce-then-call in emission order.
 fn tool_call_message(
     role: &str,
+    content: String,
     (content_pre, content_post): (&str, &str),
-    calls: &[&crate::prompt::ToolUse],
+    tool_calls: Vec<JinjaValue>,
     reasoning: &str,
     reingest: crate::dialect::ReasoningReingest,
 ) -> JinjaValue {
-    let tool_calls: Vec<JinjaValue> = calls
-        .iter()
-        .map(|call| {
-            minijinja::context! {
-                id => call.id.as_ref(),
-                function => minijinja::context! {
-                    name => call.name.as_ref(),
-                    arguments => JinjaValue::from_serialize(&call.input),
-                },
-            }
-        })
-        .collect();
-    let content = format!("{content_pre}{content_post}");
     if reasoning.is_empty() {
         minijinja::context! {
             role => role,
@@ -1085,10 +1679,9 @@ fn tool_result_message(tool_use_id: &str, content: String) -> JinjaValue {
     }
 }
 
-/// Flatten any [`Content`] to a single string using [`append_block_text`]
-/// for each part.
-fn flatten_text(content: &Content, media_sentinel: Option<&str>) -> String {
-    let mut out = String::new();
+/// Flatten any [`Content`] using [`append_block_text`] for each part.
+fn flatten_text(content: &Content, media_sentinel: Option<&str>) -> Flat {
+    let mut out = Flat::default();
     for b in &content.0 {
         append_block_text(&mut out, b, media_sentinel);
     }
@@ -1099,16 +1692,18 @@ fn flatten_text(content: &Content, media_sentinel: Option<&str>) -> String {
 /// tool-result blocks are handled at the message level (see
 /// [`append_message`]); here they contribute nothing.
 fn append_block_text(
-    out: &mut String,
+    out: &mut Flat,
     block: &Block,
     media_sentinel: Option<&str>,
 ) {
     match block {
-        Block::Text { text, .. } => out.push_str(text),
+        Block::Text { text, .. } => out.content(text),
+        // The wrappers are ours — framing, never neutralized; the body
+        // is content.
         Block::Thought { thought, .. } => {
-            out.push_str("<think>");
-            out.push_str(thought);
-            out.push_str("</think>");
+            out.framing("<think>");
+            out.content(thought);
+            out.framing("</think>");
         }
         // Sentinel emission: `<{R}:{source_hash_hex}>`. The caller
         // splits the render on this and resolves each occurrence
@@ -1120,10 +1715,7 @@ fn append_block_text(
         // unreachable rather than a silent drop.
         Block::Image { image, .. } => {
             if let Some(sentinel) = media_sentinel {
-                out.push_str(&media_marker(
-                    sentinel,
-                    &image_source_hash(image),
-                ));
+                out.framing(&media_marker(sentinel, &image_source_hash(image)));
             }
         }
         // Tool-use / tool-result blocks are handled at the message
@@ -1235,9 +1827,21 @@ pub(crate) fn media_marker(sentinel: &str, source_hash: &[u8; 32]) -> String {
     s
 }
 
-/// A media-bearing render split on its sentinel: `n + 1` text
-/// segments interleaved with `n` image source hashes, in render
-/// order. Imageless renders come back as one segment and no hashes.
+/// One out-of-band marker in a render: an image, or a reserved piece
+/// that content spelled (see [`LiteralNeutralizer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenderMarker {
+    /// `<{sentinel}:{hex64}>` — the image's source hash (see
+    /// [`image_source_hash`]).
+    Media([u8; 32]),
+    /// `<{sentinel}:t{id}>` — content that spelled the piece of
+    /// special token `id`.
+    Literal(Token),
+}
+
+/// A render split on its sentinel: `n + 1` text segments interleaved
+/// with `n` markers, in render order. A render without markers comes
+/// back as one segment.
 ///
 /// Consumed by `Session` (the only splitter); dead-code-allowed for
 /// builds without a session backend, where emission still exists but
@@ -1251,15 +1855,15 @@ pub(crate) fn media_marker(sentinel: &str, source_hash: &[u8; 32]) -> String {
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SplitRender<'a> {
-    /// Text between (around) media markers;
-    /// `segments.len() == source_hashes.len() + 1`.
+    /// Text between (around) markers;
+    /// `segments.len() == markers.len() + 1`.
     pub segments: Vec<&'a str>,
-    /// Source hash of the image at each marker (see
-    /// [`image_source_hash`]).
-    pub source_hashes: Vec<[u8; 32]>,
+    /// The marker after each segment but the last.
+    pub markers: Vec<RenderMarker>,
 }
 
-/// Split `text` on `<{sentinel}:{hex64}>` markers.
+/// Split `text` on `<{sentinel}:…>` markers: `{hex64}` for an image,
+/// `t{id}` for a content literal.
 ///
 /// The sentinel is per-call random and never surfaced, so content
 /// cannot contain it — every occurrence is one of our own emissions.
@@ -1274,49 +1878,658 @@ pub(crate) struct SplitRender<'a> {
     )),
     allow(dead_code)
 )]
-pub(crate) fn split_media_render<'a>(
+pub(crate) fn split_render<'a>(
     text: &'a str,
     sentinel: &str,
 ) -> Result<SplitRender<'a>, usize> {
     let pattern = format!("<{sentinel}:");
     let mut segments = Vec::new();
-    let mut source_hashes = Vec::new();
+    let mut markers = Vec::new();
     let mut rest = text;
     let mut base = 0usize;
     while let Some(at) = rest.find(&pattern) {
-        let hex_start = at + pattern.len();
-        let hex_end = hex_start + 64;
-        let ok = rest.len() > hex_end
-            && rest.as_bytes()[hex_end] == b'>'
-            && rest[hex_start..hex_end]
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit());
-        if !ok {
-            return Err(base + at);
-        }
-        let mut hash = [0u8; 32];
-        for (i, byte) in hash.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(
-                &rest[hex_start + i * 2..hex_start + i * 2 + 2],
-                16,
-            )
-            .expect("checked hexdigit above");
-        }
+        let body_start = at + pattern.len();
+        let (marker, end) = parse_marker(&rest[body_start..])
+            .ok_or(base + at)
+            .map(|(marker, len)| (marker, body_start + len))?;
         segments.push(&rest[..at]);
-        source_hashes.push(hash);
-        rest = &rest[hex_end + 1..];
-        base += hex_end + 1;
+        markers.push(marker);
+        rest = &rest[end..];
+        base += end;
     }
     segments.push(rest);
-    Ok(SplitRender {
-        segments,
-        source_hashes,
+    Ok(SplitRender { segments, markers })
+}
+
+/// Whether `split`'s text still holds `sentinel` in any letter case:
+/// a marker a template filter transformed so [`split_render`] could not
+/// see it (Gemma 4's cache-stable template applies `| upper` to schema
+/// `type` values, turning a marker there into `<HEX:T123>`; `| e` would
+/// escape its `<`). Safety holds — no special is emitted, the guard
+/// still passes — but the marker reaches the model as text, and since
+/// the sentinel is per call, that prefix misses the cache every call.
+#[cfg_attr(
+    not(any(
+        feature = "llama-cpp",
+        all(feature = "moeflux", target_os = "macos")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn has_transformed_marker(
+    split: &SplitRender<'_>,
+    sentinel: &str,
+) -> bool {
+    let needle = sentinel.as_bytes();
+    let Some(&first) = needle.first() else {
+        return false;
+    };
+    split.segments.iter().any(|segment| {
+        let hay = segment.as_bytes();
+        (0..hay.len().saturating_sub(needle.len() - 1)).any(|at| {
+            hay[at].eq_ignore_ascii_case(&first)
+                && hay[at..at + needle.len()].eq_ignore_ascii_case(needle)
+        })
     })
+}
+
+/// Parse one marker body (what follows `<{sentinel}:`), returning the
+/// marker and the byte length consumed including the closing `>`.
+fn parse_marker(body: &str) -> Option<(RenderMarker, usize)> {
+    let close = body.find('>')?;
+    let inner = &body[..close];
+    let marker = match inner.strip_prefix('t') {
+        Some(id) => {
+            // Canonical decimal only: `t007` is not a marker we wrote.
+            let canonical = !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && (id == "0" || !id.starts_with('0'));
+            RenderMarker::Literal(canonical.then(|| id.parse().ok()).flatten()?)
+        }
+        None if inner.len() == 64
+            && inner.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            let mut hash = [0u8; 32];
+            for (i, byte) in hash.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&inner[i * 2..i * 2 + 2], 16)
+                    .expect("checked hexdigit above");
+            }
+            RenderMarker::Media(hash)
+        }
+        None => return None,
+    };
+    Some((marker, close + 1))
+}
+
+// ===========================================================================
+// Content literals
+// ===========================================================================
+
+/// How many times each reserved piece was neutralized, by token id.
+pub(crate) type LiteralCounts = BTreeMap<Token, usize>;
+
+/// The reserved special-token pieces of a vocabulary, matched in prompt
+/// *content* so they reach the model as spelled text instead of as the
+/// control tokens they spell.
+///
+/// Every prepare path tokenizes the render with special-token parsing
+/// on, which the chat framing needs: `<|im_start|>` in the template
+/// must become one control token. Without this, the same piece in a
+/// tool result, a user message or a tool description would become one
+/// too, and the content could restructure the conversation. So each
+/// piece found in a content surface is replaced before the template
+/// sees it with an out-of-band marker, `<{sentinel}:t{id}>`, which
+/// `Session` splits back out and tokenizes as text. The template's own
+/// framing is never touched.
+///
+/// Matching is leftmost-longest (Aho-Corasick), so overlapping pieces
+/// resolve the way the longer one reads and no piece survives
+/// neutralization. `Session` builds one per model at construction and
+/// injects it into every render through [`RenderOptions::literals`];
+/// a caller rendering with a [`ChatTemplate`] directly can do the same
+/// with [`RenderOptions::with_literals`].
+#[derive(Clone)]
+pub struct LiteralNeutralizer {
+    /// `None` when there are no pieces.
+    matcher: Option<aho_corasick::AhoCorasick>,
+    /// Pattern index → `(token id, piece)`.
+    pieces: Vec<(Token, String)>,
+    /// Token id → pattern index.
+    by_id: std::collections::HashMap<Token, usize>,
+    /// Pattern indices in piece order, for [`Self::could_grow`].
+    sorted: Vec<usize>,
+    /// Special id → pattern index, for a special whose piece is
+    /// reserved under another id; see [`Self::emitted_piece`].
+    aliases: std::collections::HashMap<Token, usize>,
+    /// Length in bytes of the longest piece.
+    max_len: usize,
+}
+
+impl std::fmt::Debug for LiteralNeutralizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Counts, not pieces: the pieces are reserved bytes.
+        f.debug_struct("LiteralNeutralizer")
+            .field("pieces", &self.pieces.len())
+            .finish()
+    }
+}
+
+impl LiteralNeutralizer {
+    /// Build from `(token id, piece)` pairs. Empty pieces are skipped,
+    /// and a duplicate piece or id keeps its first entry.
+    pub fn new<I, S>(pieces: I) -> Self
+    where
+        I: IntoIterator<Item = (Token, S)>,
+        S: Into<String>,
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut by_id = std::collections::HashMap::new();
+        let pieces: Vec<(Token, String)> = pieces
+            .into_iter()
+            .map(|(id, piece)| (id, piece.into()))
+            .filter(|(id, piece)| {
+                !piece.is_empty()
+                    && !by_id.contains_key(id)
+                    && seen.insert(piece.clone())
+                    && by_id.insert(*id, by_id.len()).is_none()
+            })
+            .collect();
+        let matcher = (!pieces.is_empty()).then(|| {
+            aho_corasick::AhoCorasick::builder()
+                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                .build(pieces.iter().map(|(_, piece)| piece))
+                // Only a pattern set past the automaton's size limits
+                // fails to build; a vocabulary's specials are a few
+                // thousand short strings at most.
+                .expect("reserved pieces fit an Aho-Corasick automaton")
+        });
+        let mut sorted: Vec<usize> = (0..pieces.len()).collect();
+        sorted.sort_by(|&a, &b| pieces[a].1.cmp(&pieces[b].1));
+        let max_len = pieces.iter().map(|(_, p)| p.len()).max();
+        Self {
+            matcher,
+            by_id,
+            sorted,
+            aliases: std::collections::HashMap::new(),
+            max_len: max_len.unwrap_or(0),
+            pieces,
+        }
+    }
+
+    /// Also read each special in `specials` whose piece is reserved
+    /// under another id as that piece when the model emits it
+    /// ([`Self::emitted_piece`]). A vocabulary can hold two specials
+    /// with one text; content spelling it tokenizes to one of them, the
+    /// one reserved, but the model can emit either as framing.
+    pub(crate) fn with_aliases<I, S>(mut self, specials: I) -> Self
+    where
+        I: IntoIterator<Item = (Token, S)>,
+        S: AsRef<str>,
+    {
+        let by_piece: std::collections::HashMap<&str, usize> = self
+            .pieces
+            .iter()
+            .enumerate()
+            .map(|(i, (_, piece))| (piece.as_str(), i))
+            .collect();
+        let aliases = specials
+            .into_iter()
+            .filter(|(id, _)| !self.by_id.contains_key(id))
+            .filter_map(|(id, piece)| {
+                by_piece.get(piece.as_ref()).map(|&i| (id, i))
+            })
+            .collect();
+        self.aliases = aliases;
+        self
+    }
+
+    /// The piece a real emission of `id` reads as, when that piece is
+    /// reserved: [`Self::piece`], or the piece of a special sharing its
+    /// text (see [`Self::with_aliases`]). Emission provenance asks
+    /// this, content neutralization never does.
+    pub(crate) fn emitted_piece(&self, id: Token) -> Option<&str> {
+        self.by_id
+            .get(&id)
+            .or_else(|| self.aliases.get(&id))
+            .map(|&i| self.pieces[i].1.as_str())
+    }
+
+    /// Whether there is nothing to neutralize.
+    pub fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    /// Number of reserved pieces.
+    pub fn len(&self) -> usize {
+        self.pieces.len()
+    }
+
+    /// Whether `id` is one of the reserved tokens.
+    pub fn contains(&self, id: Token) -> bool {
+        self.by_id.contains_key(&id)
+    }
+
+    /// The piece of reserved token `id`.
+    pub fn piece(&self, id: Token) -> Option<&str> {
+        self.by_id.get(&id).map(|&i| self.pieces[i].1.as_str())
+    }
+
+    /// The reserved token ids.
+    pub fn ids(&self) -> impl Iterator<Item = Token> + '_ {
+        self.pieces.iter().map(|(id, _)| *id)
+    }
+
+    /// Every reserved piece in `text`, leftmost-longest, as
+    /// `(byte range, token id)`.
+    pub fn find_iter<'t>(
+        &'t self,
+        text: &'t str,
+    ) -> impl Iterator<Item = (std::ops::Range<usize>, Token)> + 't {
+        self.matcher.iter().flat_map(move |ac| {
+            ac.find_iter(text).map(move |m| {
+                (m.start()..m.end(), self.pieces[m.pattern().as_usize()].0)
+            })
+        })
+    }
+
+    /// Whether `tail` is a proper prefix of a reserved piece: text that
+    /// more bytes could still turn into one. The pieces starting with
+    /// `tail` sort contiguously from where `tail` itself would, and at
+    /// most the first of them equals it.
+    pub(crate) fn could_grow(&self, tail: &str) -> bool {
+        let piece = |i: usize| self.pieces[i].1.as_str();
+        let at = self.sorted.partition_point(|&i| piece(i) < tail);
+        self.sorted[at..]
+            .iter()
+            .take(2)
+            .any(|&i| piece(i).len() > tail.len() && piece(i).starts_with(tail))
+    }
+
+    /// Length in bytes of the longest reserved piece.
+    pub(crate) fn max_len(&self) -> usize {
+        self.max_len
+    }
+
+    /// The reserved pieces `text` could be the start of: each one
+    /// `text` begins with, and each one `text` is a proper prefix of.
+    /// Bytes, not `str`: a token's piece can end mid-codepoint.
+    pub(crate) fn starting_at(&self, text: &[u8]) -> Vec<&[u8]> {
+        // INVARIANT: `sorted` holds indices into `pieces`, each of them
+        // non-empty (`new` skips empty ones); `len` is at most
+        // `text.len()`, and `partition_point` at most `sorted.len()`.
+        let piece = |i: usize| self.pieces[i].1.as_bytes();
+        // Most text starts no piece at all: one search says so.
+        let Some(&lead) = text.first() else {
+            return Vec::new();
+        };
+        let at = self.sorted.partition_point(|&i| piece(i) < &text[..1]);
+        if !self.sorted.get(at).is_some_and(|&i| piece(i)[0] == lead) {
+            return Vec::new();
+        }
+        let whole = (1..=text.len().min(self.max_len)).filter_map(|len| {
+            self.sorted
+                .binary_search_by(|&i| piece(i).cmp(&text[..len]))
+                .ok()
+                .map(|at| piece(self.sorted[at]))
+        });
+        // Pieces extending `text` sort contiguously right after it.
+        let at = self.sorted.partition_point(|&i| piece(i) <= text);
+        let growing = self.sorted[at..]
+            .iter()
+            .map(|&i| piece(i))
+            .take_while(|p| p.starts_with(text));
+        whole.chain(growing).collect()
+    }
+
+    /// Replace every reserved piece in `text` with its marker under
+    /// `sentinel`, adding each replacement to `counts`. Borrows when
+    /// there is nothing to replace, so clean text is untouched.
+    fn neutralize<'t>(
+        &self,
+        text: &'t str,
+        sentinel: &str,
+        mut counts: Option<&mut LiteralCounts>,
+    ) -> Cow<'t, str> {
+        let mut out: Option<String> = None;
+        let mut last = 0;
+        for (range, id) in self.find_iter(text) {
+            let buf =
+                out.get_or_insert_with(|| String::with_capacity(text.len()));
+            buf.push_str(&text[last..range.start]);
+            buf.push_str(&literal_marker(sentinel, id));
+            last = range.end;
+            if let Some(counts) = counts.as_deref_mut() {
+                *counts.entry(id).or_default() += 1;
+            }
+        }
+        match out {
+            None => Cow::Borrowed(text),
+            Some(mut buf) => {
+                buf.push_str(&text[last..]);
+                Cow::Owned(buf)
+            }
+        }
+    }
+}
+
+/// The rendered form of one content literal: `<{sentinel}:t{id}>`.
+pub(crate) fn literal_marker(sentinel: &str, id: Token) -> String {
+    format!("<{sentinel}:t{id}>")
+}
+
+/// Per-render content-literal configuration: the vocabulary's
+/// [`LiteralNeutralizer`] and the sentinel its markers render under.
+///
+/// The sentinel must be something no content can contain — `Session`
+/// draws a fresh random one per call, the same way it does for images
+/// (see [`RenderOptions::media_sentinel`]), and shares it with the
+/// image markers when both are present.
+#[derive(Clone, Debug)]
+pub struct Literals {
+    sentinel: String,
+    neutralizer: Arc<LiteralNeutralizer>,
+}
+
+impl Literals {
+    /// Neutralize with `neutralizer`, marking under `sentinel`.
+    pub fn new<S>(sentinel: S, neutralizer: Arc<LiteralNeutralizer>) -> Self
+    where
+        S: Into<String>,
+    {
+        Self {
+            sentinel: sentinel.into(),
+            neutralizer,
+        }
+    }
+
+    /// The marker sentinel.
+    pub fn sentinel(&self) -> &str {
+        &self.sentinel
+    }
+
+    /// The neutralizer.
+    pub fn neutralizer(&self) -> &LiteralNeutralizer {
+        &self.neutralizer
+    }
+}
+
+/// Anthropic's pattern for a tool name, `^[a-zA-Z0-9_-]{1,64}$`. The
+/// dialect parser holds model-emitted names to it too, so a call the
+/// model names badly degrades to text instead of seating a name the
+/// next ingest would reject. (It cannot see the vocabulary, so a name
+/// of these characters that spells a reserved piece would still seat;
+/// no fleet vocabulary has such a piece — theirs are bracketed tags.)
+pub(crate) fn is_tool_name(s: &str) -> bool {
+    (1..=64).contains(&s.len()) && is_identifier(s)
+}
+
+/// Anthropic's pattern for a tool-use id, `^[a-zA-Z0-9_-]+$` — no
+/// length cap, since our own ids (`call_{n}_{name}`) outgrow 64 bytes
+/// for long tool names.
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The content surfaces of one render: where every string the template
+/// can see is neutralized, counted and, for identifiers, validated.
+struct Surfaces<'a> {
+    media_sentinel: Option<&'a str>,
+    literals: Option<&'a Literals>,
+    /// Replacements in the counted surfaces — one count per content
+    /// string, so `Session` can check it against its own scan.
+    counts: std::cell::RefCell<LiteralCounts>,
+}
+
+impl<'a> Surfaces<'a> {
+    fn new(opts: &'a RenderOptions) -> Self {
+        Self {
+            media_sentinel: opts.media_sentinel.as_deref(),
+            literals: opts.literals.as_ref(),
+            counts: Default::default(),
+        }
+    }
+
+    /// Neutralize content `text`; `counted` adds its replacements to
+    /// [`Self::counts`]. A string the template sees twice (the merged
+    /// assistant `content` and its `content_pre`/`content_post`
+    /// halves) is counted once.
+    fn text<'t>(&self, text: &'t str, counted: bool) -> Cow<'t, str> {
+        let Some(lit) = self.literals else {
+            return Cow::Borrowed(text);
+        };
+        let mut counts = self.counts.borrow_mut();
+        lit.neutralizer.neutralize(
+            text,
+            &lit.sentinel,
+            counted.then_some(&mut *counts),
+        )
+    }
+
+    /// Neutralize every key and string leaf of `value`.
+    fn value(&self, value: &serde_json::Value, counted: bool) -> JinjaValue {
+        use serde_json::Value;
+        fn walk(s: &Surfaces<'_>, v: &Value, counted: bool) -> Value {
+            match v {
+                Value::String(t) => {
+                    Value::String(s.text(t, counted).into_owned())
+                }
+                Value::Array(items) => Value::Array(
+                    items.iter().map(|i| walk(s, i, counted)).collect(),
+                ),
+                Value::Object(map) => Value::Object(
+                    map.iter()
+                        .map(|(k, v)| {
+                            (
+                                s.text(k, counted).into_owned(),
+                                walk(s, v, counted),
+                            )
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            }
+        }
+        match self.literals {
+            None => JinjaValue::from_serialize(value),
+            Some(_) => JinjaValue::from_serialize(walk(self, value, counted)),
+        }
+    }
+
+    /// Reject an identifier the model would see verbatim: tool names
+    /// and tool-use ids are not neutralized (the grammar and parser key
+    /// on them), so they must hold Anthropic's character set and no
+    /// reserved piece. Only checked when neutralizing.
+    fn identifier(
+        &self,
+        value: &str,
+        valid: fn(&str) -> bool,
+        what: impl FnOnce() -> String,
+    ) -> Result<(), ChatTemplateError> {
+        let Some(lit) = self.literals else {
+            return Ok(());
+        };
+        if valid(value) && lit.neutralizer.find_iter(value).next().is_none() {
+            Ok(())
+        } else {
+            Err(ChatTemplateError::InvalidIdentifier { what: what() })
+        }
+    }
+}
+
+/// Template-visible text assembled from content and our own framing
+/// (thought wrappers, image markers). Adjacent content joins into one
+/// run before it is neutralized, so a piece split across two blocks
+/// the template sees concatenated is still caught; framing is never
+/// neutralized.
+#[derive(Default, Clone)]
+struct Flat {
+    /// `(is_content, text)`, adjacent content merged.
+    spans: Vec<(bool, String)>,
+}
+
+impl Flat {
+    fn content(&mut self, text: &str) {
+        match self.spans.last_mut() {
+            Some((true, run)) => run.push_str(text),
+            _ => self.spans.push((true, text.to_string())),
+        }
+    }
+
+    fn framing(&mut self, text: &str) {
+        self.spans.push((false, text.to_string()));
+    }
+
+    /// `self` followed by `other`, content runs joined at the seam.
+    fn join(&self, other: &Flat) -> Flat {
+        let mut out = self.clone();
+        for (is_content, text) in &other.spans {
+            match is_content {
+                true => out.content(text),
+                false => out.framing(text),
+            }
+        }
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spans.iter().all(|(_, text)| text.is_empty())
+    }
+
+    fn render(&self, surfaces: &Surfaces<'_>, counted: bool) -> String {
+        self.spans
+            .iter()
+            .map(|(is_content, text)| match is_content {
+                true => surfaces.text(text, counted),
+                false => Cow::Borrowed(text.as_str()),
+            })
+            .collect()
+    }
 }
 
 // ===========================================================================
 // Jinja-side helpers
 // ===========================================================================
+
+/// `tojson` without Jinja's HTML-safety escaping.
+///
+/// Jinja2's `tojson` is `htmlsafe_json_dumps`, which escapes `'`, `&`,
+/// `<`, and `>` to `'`, `&`, `<`, `>` — a defense
+/// against JSON embedded in `<script>` blocks, inherited from Jinja's
+/// web origins. minijinja matches that faithfully (verified byte-for-byte
+/// against the Python reference renderer in
+/// `tests/fixtures/render_jinja.py`), so this is *correct* Jinja
+/// behavior, not drift.
+///
+/// It is nonetheless wrong for us, in two ways:
+///
+/// 1. **Round-trip.** A model emits a literal `'`; the template renders
+///    it back as `'`. The re-render is then not byte-identical to
+///    what the KV holds, the auto-tip is discarded, and prefix reuse
+///    collapses to the last `cache_control` breakpoint — measured at
+///    4705 tokens lost per turn against cogito-32b (#85). Byte-stable
+///    re-rendering is the invariant the whole prefix cache rests on.
+/// 2. **Fidelity.** The escaped form is what the model *reads back* as
+///    its own prior turn, so its history diverges from what it wrote.
+///    The same applies to tool descriptions in the `<tools>` block,
+///    which also route through this filter.
+///
+/// Constraining generation to emit the escaped form instead was measured
+/// and rejected: `'` and friends tokenize to exactly 5 tokens with
+/// no merges, taking a realistic prose argument from 47 to 107 tokens
+/// (+128%) — generated tokens, on the most common punctuation in
+/// English.
+///
+/// There is no HTML anywhere in a chat prompt, so nothing is lost. The
+/// cost is that our rendered bytes differ from other Jinja-based stacks
+/// in exactly these four characters.
+/// The `indent=N` kwarg is honored because real templates pass it —
+/// Llama 3.1 renders its tool listing with `t | tojson(indent=4)`, and
+/// dropping the kwarg is a render-time "too many arguments" error, not
+/// a silent formatting change.
+fn tojson_unescaped(
+    value: JinjaValue,
+    kwargs: Kwargs,
+) -> Result<JinjaValue, JinjaError> {
+    let indent: Option<usize> = kwargs.get("indent").ok();
+    // Rejects any kwarg we don't model rather than ignoring it: a
+    // silently-dropped formatting argument would change rendered bytes
+    // without anyone noticing, which is the class of bug this whole
+    // filter exists to close.
+    kwargs.assert_all_used()?;
+
+    let json = match indent {
+        Some(width) => {
+            let pad = vec![b' '; width];
+            let mut buf = Vec::new();
+            let mut ser = serde_json::Serializer::with_formatter(
+                &mut buf,
+                serde_json::ser::PrettyFormatter::with_indent(&pad),
+            );
+            value.serialize(&mut ser).map_err(|e| json_err(&e))?;
+            String::from_utf8(buf).map_err(|e| {
+                JinjaError::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("tojson: {e}"),
+                )
+            })?
+        }
+        None => serde_json::to_string(&value).map_err(|e| json_err(&e))?,
+    };
+
+    // Safe-string so an autoescaping template can't re-escape the JSON
+    // we just deliberately left unescaped.
+    Ok(JinjaValue::from_safe_string(json))
+}
+
+fn json_err(e: &serde_json::Error) -> JinjaError {
+    JinjaError::new(
+        minijinja::ErrorKind::InvalidOperation,
+        format!("tojson: {e}"),
+    )
+}
+
+/// Python `json.dumps` default spacing (`": "`, `", "`), unescaped —
+/// the serializer owned chat templates render tool-call arguments
+/// through.
+///
+/// Stock templates use `tojson` (compact); tool-tuned models emit
+/// `json.dumps` spacing (cogito measured greedy-unforced,
+/// `tests/probe_unforced_habit.rs`), so a stock re-render never
+/// byte-matches the emission and #85's canonical form had to pin the
+/// model *off* its habit. An owned template renders through this
+/// filter instead; the dialect analyzer measures the resulting
+/// spacing ([`crate::JsonSpacing::Spaced`]) and the grammar and
+/// `render_reference` follow — three views, one byte string (#88).
+///
+/// Escaping matches [`tojson_unescaped`] (serde_json's), so output is
+/// byte-identical to `json.dumps(value, ensure_ascii=False)`. No
+/// kwargs — an owned template has no business asking for indent.
+fn json_dumps_filter(
+    value: JinjaValue,
+    kwargs: Kwargs,
+) -> Result<JinjaValue, JinjaError> {
+    kwargs.assert_all_used()?;
+    let json = crate::json_canon::to_spaced_string(&value)
+        .map_err(|e| json_err(&e))?;
+    // Safe-string so an autoescaping template can't re-escape the JSON
+    // we just deliberately left unescaped.
+    Ok(JinjaValue::from_safe_string(json))
+}
+
+/// Register drama_llama's template filters on `env`.
+///
+/// Every environment that renders chat templates — [`ChatTemplate`]'s
+/// strict and permissive envs and the dialect analyzer's probe env —
+/// registers the same set, or a template could render under one and
+/// fail (or render *different bytes*) under another. The analyzer
+/// measures renders that the real path must then reproduce
+/// byte-for-byte, so the environments may not diverge.
+pub(crate) fn register_template_filters(env: &mut Environment<'_>) {
+    // Overrides minijinja's builtin. See `tojson_unescaped`.
+    env.add_filter("tojson", tojson_unescaped);
+    env.add_filter("json_dumps", json_dumps_filter);
+}
 
 /// HF templates commonly call `raise_exception("msg")` to reject invalid
 /// input. Surface that as a render-time error instead of panicking.
@@ -1480,6 +2693,22 @@ pub enum ChatTemplateError {
          is configured; set `RenderOptions::with_reasoning_start`"
     )]
     OpenThoughtUnsupported,
+    /// A tool name or tool-use id the model would read verbatim does
+    /// not match Anthropic's pattern (`^[a-zA-Z0-9_-]{1,64}$` for a
+    /// name, `^[a-zA-Z0-9_-]+$` for an id), or contains a reserved
+    /// special-token piece. Content is neutralized (see
+    /// [`LiteralNeutralizer`]); identifiers are rejected instead,
+    /// because the tool-call grammar and parser key on them. Only
+    /// checked when [`RenderOptions::literals`] is set. The value is
+    /// withheld from the message, which is relayed to clients.
+    #[error(
+        "{what} is not a valid tool identifier (letters, digits, `_` \
+         and `-` only; names at most 64 bytes)"
+    )]
+    InvalidIdentifier {
+        /// Where the identifier sits in the prompt.
+        what: String,
+    },
 }
 
 impl ChatTemplateError {
@@ -1654,6 +2883,69 @@ mod tests {
         ));
     }
 
+    fn literals(sentinel: &str) -> Literals {
+        Literals::new(
+            sentinel,
+            Arc::new(LiteralNeutralizer::new([
+                (1, "<|eot_id|>"),
+                (2, "<think>"),
+                (3, "</think>"),
+                // Duplicates keep the first entry.
+                (4, "<think>"),
+                (2, "<other>"),
+            ])),
+        )
+    }
+
+    /// Content literals: clean renders are byte-identical, a thought's
+    /// body is neutralized inside our own (kept) wrappers, a piece
+    /// split across blocks is caught once joined, and the counts cover
+    /// what was replaced.
+    #[test]
+    fn content_literals_neutralize_content_not_framing() {
+        let sentinel = "0123456789abcdef0123456789abcdef";
+        let opts = RenderOptions::default().with_literals(literals(sentinel));
+        assert_eq!(opts.literals.as_ref().unwrap().neutralizer().len(), 3);
+
+        let clean = simple_prompt();
+        assert_eq!(
+            tmpl().render_counted(&clean, &opts).unwrap(),
+            (tmpl().render(&clean, false).unwrap(), LiteralCounts::new()),
+            "a clean prompt renders byte-identically",
+        );
+
+        let p = Prompt {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: Content(vec![
+                    Block::Thought {
+                        thought: "no <think> here".into(),
+                        signature: "sig".into(),
+                    },
+                    Block::text("split <|eot"),
+                    Block::text("_id|> joined"),
+                ]),
+            }],
+            ..Default::default()
+        };
+        let (out, counts) = tmpl().render_counted(&p, &opts).unwrap();
+        let think = literal_marker(sentinel, 2);
+        let eot = literal_marker(sentinel, 1);
+        assert!(
+            out.contains(&format!(
+                "<think>no {think} here</think>split {eot} joined"
+            )),
+            "{out}",
+        );
+        assert_eq!(counts, [(1, 1), (2, 1)].into_iter().collect());
+        // Every marker splits back out.
+        let split = split_render(&out, sentinel).unwrap();
+        assert_eq!(
+            split.markers,
+            [RenderMarker::Literal(2), RenderMarker::Literal(1)]
+        );
+    }
+
     #[test]
     fn thought_block_wraps_with_think_tags() {
         let mut content = Content(vec![
@@ -1675,6 +2967,62 @@ mod tests {
         };
         let out = tmpl().render(&p, false).unwrap();
         assert!(out.contains("<think>I should be concise.</think>Hello!"));
+    }
+
+    /// An assistant message's `chunks` are its blocks in emission order:
+    /// each thought its own chunk (back-to-back ones included), prose
+    /// runs between them, and one `tool_calls` chunk where the first
+    /// call sat, whatever the reasoning re-ingest convention.
+    #[test]
+    fn assistant_chunks_keep_emission_order() {
+        use crate::prompt::ToolUse;
+        let src = "{% for m in messages %}{% for c in m.chunks or [] %}\
+                   {{ c.type }}:{{ c.text or c.thinking or '' }}|\
+                   {% endfor %}{% endfor %}"
+            .to_owned();
+        let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
+        let thought = |t: &'static str| Block::Thought {
+            thought: t.into(),
+            signature: "".into(),
+        };
+        let call = |id: &'static str| Block::ToolUse {
+            call: ToolUse::new("get_weather", serde_json::json!({}))
+                .with_id(id),
+        };
+        let p = Prompt {
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: Content::text("Hi"),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: Content(vec![
+                        thought("A."),
+                        thought("B."),
+                        "Checking.".into(),
+                        thought("C."),
+                        call("call1"),
+                        call("call2"),
+                        "Done.".into(),
+                    ]),
+                },
+            ],
+            ..Default::default()
+        };
+        for reingest in [
+            crate::dialect::ReasoningReingest::Field,
+            crate::dialect::ReasoningReingest::Thinking,
+            crate::dialect::ReasoningReingest::InlineThink,
+        ] {
+            let opts = RenderOptions::default().with_thought_reingest(reingest);
+            assert_eq!(
+                t.render_with(&p, &opts).unwrap(),
+                "thinking:A.|thinking:B.|text:Checking.|thinking:C.|\
+                 tool_calls:|text:Done.|",
+                "{reingest:?}"
+            );
+        }
     }
 
     #[test]
@@ -2196,6 +3544,391 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    // Automatic caching: the request-level `cache_control`
+    // ----------------------------------------------------------------
+
+    /// A `Role::User` text message, cached with `control` when given.
+    fn user_text(text: &'static str, control: Option<CacheControl>) -> Message {
+        Message {
+            role: Role::User,
+            content: Content(vec![Block::Text {
+                text: Cow::Borrowed(text),
+                cache_control: control,
+                citations: None,
+            }]),
+        }
+    }
+
+    /// An assistant message holding only a thought — a block that can
+    /// carry no marker.
+    fn thought_only() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Content(vec![Block::Thought {
+                thought: Cow::Borrowed("hmm"),
+                signature: Cow::Borrowed(""),
+            }]),
+        }
+    }
+
+    /// The automatic breakpoint lands after the message holding the
+    /// last cacheable block, with the request-level TTL — alongside,
+    /// not instead of, the explicit markers.
+    #[test]
+    fn auto_cache_breakpoint_lands_on_the_last_message() {
+        let prompt = Prompt {
+            system: Some(Content(vec![Block::Text {
+                text: Cow::Borrowed("You are helpful."),
+                cache_control: Some(CacheControl::one_hour()),
+                citations: None,
+            }])),
+            messages: simple_prompt().messages,
+            cache_control: Some(CacheControl::ephemeral()),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            collect_breakpoints(&prompt),
+            vec![
+                (PromptBreakpoint::AfterSystem, CacheTtl::OneHour),
+                (PromptBreakpoint::AfterMessage(2), CacheTtl::FiveMinutes),
+            ]
+        );
+        assert_eq!(
+            explicit_breakpoints(&prompt),
+            vec![(PromptBreakpoint::AfterSystem, CacheTtl::OneHour)],
+            "the automatic breakpoint is not an explicit marker",
+        );
+    }
+
+    /// Past a trailing block that cannot carry a marker (a thought),
+    /// the breakpoint walks back to the nearest one that can; with no
+    /// messages it falls to the system, then the tools; with nothing
+    /// cacheable at all there is none, as on Anthropic.
+    #[test]
+    fn auto_cache_walks_back_to_a_cacheable_block() {
+        let auto = |prompt: Prompt| Prompt {
+            cache_control: Some(CacheControl::ephemeral()),
+            ..prompt
+        };
+        let at = |prompt: &Prompt| auto_cache_target(prompt).map(|t| t.at);
+
+        let past_thought = auto(Prompt {
+            messages: vec![user_text("q", None), thought_only()],
+            ..Prompt::default()
+        });
+        assert_eq!(at(&past_thought), Some(PromptBreakpoint::AfterMessage(0)));
+
+        let system_only = auto(Prompt::default().system("You are helpful."));
+        assert_eq!(at(&system_only), Some(PromptBreakpoint::AfterSystem));
+
+        let tools_only = auto(Prompt {
+            tools: Some(vec![tool_plain("a").into()]),
+            messages: vec![thought_only()],
+            ..Prompt::default()
+        });
+        assert_eq!(at(&tools_only), Some(PromptBreakpoint::AfterTools));
+        assert_eq!(
+            collect_breakpoints(&tools_only),
+            vec![(PromptBreakpoint::AfterTools, CacheTtl::FiveMinutes)]
+        );
+
+        let nothing = auto(Prompt {
+            messages: vec![thought_only()],
+            ..Prompt::default()
+        });
+        assert_eq!(at(&nothing), None);
+        assert!(collect_breakpoints(&nothing).is_empty());
+    }
+
+    /// On a section that already carries an explicit marker the
+    /// automatic breakpoint merges into it (one anchor, max TTL).
+    #[test]
+    fn auto_cache_merges_into_an_explicit_marker_on_its_section() {
+        let prompt = Prompt {
+            messages: vec![user_text("q", Some(CacheControl::ephemeral()))],
+            cache_control: Some(CacheControl::one_hour()),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            collect_breakpoints(&prompt),
+            vec![(PromptBreakpoint::AfterMessage(0), CacheTtl::OneHour)]
+        );
+    }
+
+    /// The automatic breakpoint gets a partial render like any other,
+    /// ending exactly where the generation prompt begins — the anchor
+    /// the next request reads back.
+    #[test]
+    fn auto_cache_partial_ends_before_the_generation_prompt() {
+        let template = tmpl();
+        let prompt = Prompt {
+            cache_control: Some(CacheControl::ephemeral()),
+            ..simple_prompt()
+        };
+        let opts = RenderOptions::default().with_generation_prompt(true);
+        let rendered = template
+            .render_with_breakpoints(&prompt, &opts)
+            .expect("render");
+        let [(bp, ttl, partial)] = &rendered.partials[..] else {
+            panic!("one breakpoint: {:?}", rendered.partials);
+        };
+        assert_eq!(
+            (bp, ttl),
+            (&PromptBreakpoint::AfterMessage(2), &CacheTtl::FiveMinutes)
+        );
+        let generation_prompt = rendered
+            .text
+            .strip_prefix(partial.as_str())
+            .expect("the partial is a prefix of the full render");
+        assert!(
+            !generation_prompt.is_empty()
+                && !generation_prompt.contains("What is 2+2?"),
+            "only the generation prompt follows: {generation_prompt:?}"
+        );
+    }
+
+    /// Anthropic's cache_control checks, with its exact messages
+    /// (captured 2026-09-30, claude-haiku-4-5).
+    #[test]
+    fn check_cache_controls_matches_anthropic() {
+        let five = || Some(CacheControl::ephemeral());
+        let hour = || Some(CacheControl::one_hour());
+        let msgs = |controls: Vec<Option<CacheControl>>| {
+            let blocks = controls
+                .into_iter()
+                .map(|cache_control| Block::Text {
+                    text: Cow::Borrowed("x"),
+                    cache_control,
+                    citations: None,
+                })
+                .collect();
+            vec![Message {
+                role: Role::User,
+                content: Content(blocks),
+            }]
+        };
+        let found_5 = "A maximum of 4 blocks with cache_control may be \
+                       provided. Found 5.";
+
+        let explicit_5 = Prompt {
+            messages: msgs(vec![five(), five(), five(), five(), five()]),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&explicit_5), Err(found_5.into()));
+
+        // Four explicit plus the automatic one: five, on the wire.
+        let four_and_auto = Prompt {
+            messages: msgs(vec![five(), five(), five(), five(), None]),
+            cache_control: five(),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&four_and_auto), Err(found_5.into()));
+
+        // Even when the automatic marker lands on an explicitly marked
+        // block with the same TTL (the docs' "no-op"): still five.
+        let four_marked_last = Prompt {
+            messages: msgs(vec![five(), five(), five(), five()]),
+            cache_control: five(),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&four_marked_last),
+            Err(found_5.into())
+        );
+
+        let three_marked_last = Prompt {
+            messages: msgs(vec![five(), five(), five()]),
+            cache_control: five(),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&three_marked_last), Ok(()));
+
+        let mismatch = |auto, marker| Prompt {
+            messages: msgs(vec![marker]),
+            cache_control: auto,
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&mismatch(five(), hour())),
+            Err("Top-level cache_control has ttl='5m' but the target block \
+                 already has cache_control with ttl='1h'. When both are \
+                 specified on the same block, they must have matching TTLs."
+                .into())
+        );
+        assert_eq!(
+            check_cache_controls(&mismatch(hour(), five())),
+            Err("Top-level cache_control has ttl='1h' but the target block \
+                 already has cache_control with ttl='5m'. When both are \
+                 specified on the same block, they must have matching TTLs."
+                .into())
+        );
+
+        let system = |control| {
+            Some(Content(vec![Block::Text {
+                text: Cow::Borrowed("sys"),
+                cache_control: control,
+                citations: None,
+            }]))
+        };
+        let hour_after_five = Prompt {
+            system: system(five()),
+            messages: msgs(vec![None]),
+            cache_control: hour(),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&hour_after_five),
+            Err("cache_control: a ttl='1h' cache_control block must not \
+                 come after a ttl='5m' cache_control block. Note that \
+                 blocks are processed in the following order: `tools`, \
+                 `system`, `messages`."
+                .into())
+        );
+        let five_after_hour = Prompt {
+            system: system(hour()),
+            messages: msgs(vec![None]),
+            cache_control: five(),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&five_after_hour), Ok(()));
+
+        // Two explicit markers out of order: Anthropic names the first
+        // 1-hour marker after a 5-minute one by its path, and checks
+        // this before everything but the count (captured 2026-09-30,
+        // count_tokens, claude-haiku-4-5).
+        let order_at = |path: &str| {
+            Err(format!(
+                "{path}.cache_control.ttl: a ttl='1h' cache_control block \
+                 must not come after a ttl='5m' cache_control block. Note \
+                 that blocks are processed in the following order: \
+                 `tools`, `system`, `messages`."
+            ))
+        };
+        let explicit = |controls, auto| Prompt {
+            messages: msgs(controls),
+            cache_control: auto,
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&explicit(vec![five(), hour()], None)),
+            order_at("messages.0.content.1")
+        );
+        // The first offender, not the last.
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![hour(), five(), hour(), hour()],
+                None
+            )),
+            order_at("messages.0.content.2")
+        );
+        // Before the automatic marker's own TTL checks: a 1h automatic
+        // marker on a target already out of order, and a 5m one whose
+        // target's 1h marker it disagrees with.
+        assert_eq!(
+            check_cache_controls(&explicit(vec![five(), hour()], hour())),
+            order_at("messages.0.content.1")
+        );
+        assert_eq!(
+            check_cache_controls(&explicit(vec![five(), hour()], five())),
+            order_at("messages.0.content.1")
+        );
+        // After the count: five markers, one out of order, answer
+        // with the count — five explicit, or four and the automatic
+        // one (both captured 2026-09-30, count_tokens).
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![five(), hour(), five(), five(), five()],
+                None
+            )),
+            Err(found_5.into())
+        );
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![five(), hour(), five(), five(), None],
+                five()
+            )),
+            Err(found_5.into())
+        );
+        // Across sections, in processing order.
+        let across = Prompt {
+            system: system(five()),
+            messages: msgs(vec![None, hour()]),
+            ..Prompt::default()
+        };
+        assert_eq!(
+            check_cache_controls(&across),
+            order_at("messages.0.content.1")
+        );
+        let tools_first = Prompt {
+            tools: Some(vec![tool_cached("t").into()]),
+            system: system(hour()),
+            messages: msgs(vec![None]),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&tools_first), order_at("system.0"));
+        // The count before the automatic marker's TTL checks: five
+        // markers whose automatic one also disagrees with its target,
+        // or also follows a 5m marker.
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![hour(), hour(), hour(), five()],
+                hour()
+            )),
+            Err(found_5.into())
+        );
+        assert_eq!(
+            check_cache_controls(&explicit(
+                vec![five(), five(), five(), five(), None],
+                hour()
+            )),
+            Err(found_5.into())
+        );
+        // An explicit order that holds leaves the target mismatch as
+        // the answer: [1h, 5m] under a 1h automatic marker.
+        assert_eq!(
+            check_cache_controls(&explicit(vec![hour(), five()], hour())),
+            Err("Top-level cache_control has ttl='1h' but the target block \
+                 already has cache_control with ttl='5m'. When both are \
+                 specified on the same block, they must have matching TTLs."
+                .into())
+        );
+
+        // A cached server-tool definition counts toward the limit
+        // (captured 2026-09-30, count_tokens), but its TTL is not
+        // readable upstream, so as the automatic marker's target it is
+        // no mismatch here — our choice, not a capture — where a
+        // custom tool's marker is.
+        let server = || {
+            let mut def: misanthropic::tool::MethodDef =
+                misanthropic::tool::ServerMethodDef::web_search(
+                    Default::default(),
+                )
+                .into();
+            def.cache_with(CacheControl::one_hour());
+            def
+        };
+        let tools_only = |def, auto| Prompt {
+            tools: Some(vec![def]),
+            cache_control: auto,
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&tools_only(server(), five())), Ok(()));
+        assert_eq!(
+            check_cache_controls(&tools_only(tool_cached("t").into(), hour())),
+            Err("Top-level cache_control has ttl='1h' but the target block \
+                 already has cache_control with ttl='5m'. When both are \
+                 specified on the same block, they must have matching TTLs."
+                .into())
+        );
+        let server_and_four = Prompt {
+            tools: Some(vec![server()]),
+            messages: msgs(vec![five(), five(), five(), five()]),
+            ..Prompt::default()
+        };
+        assert_eq!(check_cache_controls(&server_and_four), Err(found_5.into()));
+    }
+
     #[test]
     fn test_max_ttl_and_duration() {
         use std::time::Duration;
@@ -2224,9 +3957,9 @@ mod tests {
     ///
     /// The body deliberately ends in `\n\n\n`. Whitespace is the entire
     /// game — the KV cache holds the model's bytes verbatim, and any
-    /// path through Jinja would normalize them away (Qwen3.6 `|trim`s
-    /// message content), making `\n` and `\n\n\n` indistinguishable and
-    /// the re-render a silent cache miss.
+    /// path through Jinja may normalize them away (Qwen3.6's stock
+    /// template `|trim`s message content), making `\n` and `\n\n\n`
+    /// indistinguishable and the re-render a silent cache miss.
     #[test]
     fn open_thought_tail_appends_raw_after_generation_prompt() {
         let base = Prompt::default().add_message((Role::User, "why?")).unwrap();
@@ -2369,6 +4102,275 @@ mod tests {
             )
             .unwrap();
         assert_eq!(partial, expected);
+    }
+
+    /// A template that writes `enable_thinking` into the prompt
+    /// prefix (Mistral Small 4's `[MODEL_SETTINGS]` shape): every
+    /// partial must be a byte prefix of the full render when the
+    /// request enables thinking. Before the fix the partial rendered
+    /// with thinking unset and diverged at the switch.
+    #[test]
+    fn test_render_with_breakpoints_carries_thinking_into_partials() {
+        use misanthropic::prompt::thinking::Thinking;
+        let src = "[SETTINGS]{{ 'on' if enable_thinking else 'off' }}\
+                   [/SETTINGS]{% for m in messages %}[{{ m['role'] }}]\
+                   {{ m['content'] }}{% endfor %}"
+            .to_owned();
+        let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
+        let prompt = Prompt {
+            system: Some(Content(vec![Block::Text {
+                text: Cow::Borrowed("sys"),
+                cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
+            }])),
+            messages: vec![
+                cached_user_msg("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: Content::text("hello"),
+                },
+                cached_user_msg("again"),
+            ],
+            ..Prompt::default()
+        }
+        .thinking(Thinking::Enabled {
+            budget_tokens: std::num::NonZeroU32::new(64).unwrap(),
+            display: None,
+        });
+        let out = t
+            .render_with_breakpoints(&prompt, &RenderOptions::default())
+            .unwrap();
+        assert!(out.text.starts_with("[SETTINGS]on"), "{}", out.text);
+        assert_eq!(out.partials.len(), 3);
+        for (bp, _, partial) in &out.partials {
+            assert!(
+                out.text.starts_with(partial.as_str()),
+                "{bp:?} is not a byte prefix of the full render:\n  \
+                 full:    {:?}\n  partial: {:?}",
+                out.text,
+                partial
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // output_config.effort → reasoning_effort
+    // ----------------------------------------------------------------
+
+    /// Qwen3.8's effort shape, trimmed: `high` is rewritten to
+    /// `xhigh`, anything outside `xhigh`/`medium`/`low` raises, and the
+    /// instruction lands in the system block — the prompt *prefix*.
+    const QWEN_EFFORT_SRC: &str = "\
+        {%- set ri = '' %}\
+        {%- if enable_thinking is undefined or enable_thinking is true %}\
+        {%- set e = reasoning_effort|default('xhigh') %}\
+        {%- if e == 'high' %}{%- set e = 'xhigh' %}{%- endif %}\
+        {%- if e not in ('xhigh', 'medium', 'low') %}\
+        {{- raise_exception('bad effort ' ~ e) }}{%- endif %}\
+        {%- if e == 'xhigh' %}{%- set ri = 'THINK HARD.' %}\
+        {%- elif e == 'low' %}{%- set ri = 'THINK BRIEFLY.' %}{%- endif %}\
+        {%- endif %}\
+        <|im_start|>system\n\
+        {%- for t in tools or [] %}{{ t.function.name }};{% endfor %}\
+        {{- ri }}<|im_end|>\n\
+        {%- for m in messages %}<|im_start|>{{ m.role }}\n\
+        {{- m.content }}<|im_end|>\n{% endfor %}\
+        {%- if add_generation_prompt %}<|im_start|>assistant\n<think>\n\
+        {%- endif %}";
+
+    fn qwen_efforts() -> RenderOptions {
+        RenderOptions::default()
+            .with_generation_prompt(true)
+            .with_efforts(["low", "medium", "high", "xhigh"])
+    }
+
+    fn thinking_on() -> Thinking {
+        Thinking::Enabled {
+            budget_tokens: std::num::NonZeroU32::new(1024).unwrap(),
+            display: None,
+        }
+    }
+
+    fn user_prompt() -> Prompt {
+        Prompt::default().add_message((Role::User, "hi")).unwrap()
+    }
+
+    /// Nearest accepted level, the lower on a tie; an unknown level or
+    /// an empty set maps to nothing.
+    #[test]
+    fn test_resolve_effort_table() {
+        let qwen = ["low", "medium", "high", "xhigh"].map(String::from);
+        let mistral = ["high".to_string()];
+        let gptoss = ["low", "medium", "high"].map(String::from);
+        let ends = ["low", "max"].map(String::from);
+        let custom = Effort::Custom(Cow::Borrowed("ultra"));
+        let cases: &[(&Effort, &[String], Option<&str>)] = &[
+            (&Effort::Low, &qwen, Some("low")),
+            (&Effort::Medium, &qwen, Some("medium")),
+            (&Effort::High, &qwen, Some("high")),
+            (&Effort::XHigh, &qwen, Some("xhigh")),
+            (&Effort::Max, &qwen, Some("xhigh")),
+            (&Effort::Low, &mistral, Some("high")),
+            (&Effort::Max, &mistral, Some("high")),
+            (&Effort::XHigh, &gptoss, Some("high")),
+            (&Effort::Max, &gptoss, Some("high")),
+            (&Effort::Medium, &gptoss, Some("medium")),
+            // `high` is two from `low` and two from `max`: the lower wins.
+            (&Effort::High, &ends, Some("low")),
+            (&Effort::XHigh, &ends, Some("max")),
+            (&custom, &qwen, None),
+            (&Effort::Low, &[], None),
+        ];
+        for (requested, accepted, want) in cases {
+            assert_eq!(
+                resolve_effort(requested, accepted),
+                *want,
+                "{requested:?} over {accepted:?}"
+            );
+        }
+    }
+
+    /// `Thinking::Disabled` is an explicit *off*: it must render as
+    /// `enable_thinking = false`, like an absent `thinking`, not as on.
+    /// Read back through `tojson`: a bare bool prints per minijinja
+    /// version (`false`, `False` from 2.22, #120).
+    #[test]
+    fn test_thinking_disabled_renders_off() {
+        let src = "T={{ enable_thinking | tojson }}".to_owned();
+        let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
+        let opts = RenderOptions::default();
+        let render = |p: &Prompt| t.render_with(p, &opts).unwrap();
+        assert_eq!(render(&user_prompt()), "T=false");
+        assert_eq!(
+            render(&user_prompt().thinking(Thinking::Disabled)),
+            "T=false"
+        );
+        assert_eq!(render(&user_prompt().thinking(thinking_on())), "T=true");
+    }
+
+    /// Which `reasoning_effort` reaches the template, read back
+    /// directly: set only for thinking-on prompts that request an
+    /// effort, never over a caller extra, never for an unknown level
+    /// or a template without the knob.
+    #[test]
+    fn test_render_reasoning_effort_derivation() {
+        let src = "E={{ reasoning_effort|default('unset') }}".to_owned();
+        let t = ChatTemplate::from_source(src, "".into(), "".into()).unwrap();
+        let render = |prompt: &Prompt, opts: &RenderOptions| {
+            t.render_with(prompt, opts).unwrap()
+        };
+        let opts = qwen_efforts();
+        let on = user_prompt().thinking(thinking_on());
+
+        assert_eq!(render(&on.clone().effort(Effort::Low), &opts), "E=low");
+        assert_eq!(render(&on.clone().effort(Effort::Max), &opts), "E=xhigh");
+        // No effort requested: the template's default.
+        assert_eq!(render(&on, &opts), "E=unset");
+        // Thinking off — absent or explicitly disabled — never sets it.
+        assert_eq!(
+            render(&user_prompt().effort(Effort::Low), &opts),
+            "E=unset"
+        );
+        assert_eq!(
+            render(
+                &user_prompt()
+                    .thinking(Thinking::Disabled)
+                    .effort(Effort::Low),
+                &opts
+            ),
+            "E=unset"
+        );
+        // A caller extra wins.
+        let pinned = opts.clone().with_extra("reasoning_effort", "medium");
+        assert_eq!(
+            render(&on.clone().effort(Effort::Low), &pinned),
+            "E=medium"
+        );
+        // No knob, or a level we can't place: left alone.
+        let low = on.clone().effort(Effort::Low);
+        assert_eq!(render(&low, &RenderOptions::default()), "E=unset");
+        let custom = on.effort(Effort::Custom(Cow::Borrowed("ultra")));
+        assert_eq!(render(&custom, &opts), "E=unset");
+    }
+
+    /// Against the Qwen3.8 shape: `Low` renders the low instruction,
+    /// no effort renders the template's `xhigh` default, and `Max`
+    /// (which the template would reject) renders `xhigh` rather than
+    /// failing.
+    #[test]
+    fn test_render_effort_qwen_like() {
+        let t = ChatTemplate::from_source(
+            QWEN_EFFORT_SRC.to_owned(),
+            "".into(),
+            "".into(),
+        )
+        .unwrap();
+        let on = user_prompt().thinking(thinking_on());
+        let opts = qwen_efforts();
+
+        let low = t.render_with(&on.clone().effort(Effort::Low), &opts);
+        let low = low.unwrap();
+        assert!(low.contains("THINK BRIEFLY."), "{low}");
+        assert!(!low.contains("THINK HARD."), "{low}");
+
+        let default = t.render_with(&on, &opts).unwrap();
+        assert!(default.contains("THINK HARD."), "{default}");
+
+        let max = t.render_with(&on.effort(Effort::Max), &opts).unwrap();
+        assert_eq!(max, default, "Max maps to xhigh, the default");
+    }
+
+    /// The effort lands in the prompt PREFIX (system block), so every
+    /// partial must carry it or none is a prefix of the full render and
+    /// the cache loses every breakpoint — the #93 thinking bug again.
+    #[test]
+    fn test_render_with_breakpoints_carries_effort_into_partials() {
+        let t = ChatTemplate::from_source(
+            QWEN_EFFORT_SRC.to_owned(),
+            "".into(),
+            "".into(),
+        )
+        .unwrap();
+        let prompt = Prompt {
+            tools: Some(vec![tool_cached("ping").into()]),
+            system: Some(Content(vec![Block::Text {
+                text: Cow::Borrowed("sys"),
+                cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
+            }])),
+            messages: vec![
+                cached_user_msg("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: Content::text("hello"),
+                },
+                cached_user_msg("again"),
+            ],
+            ..Prompt::default()
+        }
+        .thinking(thinking_on())
+        .effort(Effort::Low);
+        let out = t.render_with_breakpoints(&prompt, &qwen_efforts()).unwrap();
+        assert!(out.text.contains("THINK BRIEFLY."), "{}", out.text);
+        let kinds: Vec<_> = out.partials.iter().map(|(bp, ..)| *bp).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                PromptBreakpoint::AfterTools,
+                PromptBreakpoint::AfterSystem,
+                PromptBreakpoint::AfterMessage(0),
+                PromptBreakpoint::AfterMessage(2),
+            ]
+        );
+        for (bp, _, partial) in &out.partials {
+            assert!(
+                out.text.starts_with(partial.as_str()),
+                "{bp:?} is not a byte prefix of the full render:\n  \
+                 full:    {:?}\n  partial: {:?}",
+                out.text,
+                partial
+            );
+        }
     }
 
     #[test]
@@ -2673,8 +4675,8 @@ mod tests {
         let marker = media_marker(sentinel, &src_hash);
         assert!(out.contains(&marker), "render carries the marker");
 
-        let split = split_media_render(&out, sentinel).unwrap();
-        assert_eq!(split.source_hashes, vec![src_hash]);
+        let split = split_render(&out, sentinel).unwrap();
+        assert_eq!(split.markers, vec![RenderMarker::Media(src_hash)]);
         assert_eq!(split.segments.len(), 2);
         assert!(split.segments[0].ends_with("What breed is "));
         assert!(split.segments[1].starts_with(" shown here?"));
@@ -2699,8 +4701,8 @@ mod tests {
             .unwrap();
         let opts = RenderOptions::default().with_media_sentinel(sentinel);
         let out = tmpl().render_with(&p, &opts).unwrap();
-        let split = split_media_render(&out, sentinel).unwrap();
-        assert!(split.source_hashes.is_empty());
+        let split = split_render(&out, sentinel).unwrap();
+        assert!(split.markers.is_empty());
         assert_eq!(split.segments.len(), 1);
         assert!(split.segments[0].contains(&evil), "content round-trips");
     }
@@ -2711,10 +4713,48 @@ mod tests {
         // Truncated mid-hash: parse must fail loudly, never fall back
         // to treating the mangled marker as content.
         let mangled = format!("text <{sentinel}:abc123 more");
-        assert!(split_media_render(&mangled, sentinel).is_err());
+        assert!(split_render(&mangled, sentinel).is_err());
+        // Literal markers: truncated, non-canonical, or out of range.
+        for bad in ["t12", "t", "t007", "tx>", "t99999999999>"] {
+            let mangled = format!("a <{sentinel}:{bad} b");
+            assert_eq!(
+                split_render(&mangled, sentinel),
+                Err(2),
+                "{bad:?} must fail at the marker's offset",
+            );
+        }
+        // A well-formed literal marker splits out.
+        let lit = format!("a {} b", literal_marker(sentinel, 42));
+        let split = split_render(&lit, sentinel).unwrap();
+        assert_eq!(split.segments, vec!["a ", " b"]);
+        assert_eq!(split.markers, vec![RenderMarker::Literal(42)]);
         // Sentinel-free text is one segment.
-        let clean = split_media_render("no media here", sentinel).unwrap();
+        let clean = split_render("no media here", sentinel).unwrap();
         assert_eq!(clean.segments, vec!["no media here"]);
+    }
+
+    /// A marker a template filter transformed is caught case-blind; a
+    /// clean split and a real marker are not.
+    #[test]
+    fn transformed_markers_are_detected() {
+        let sentinel = "0123456789abcdef0123456789abcdef";
+        let marker = literal_marker(sentinel, 302);
+        let clean = format!("{{\"type\": \"{marker}\"}}");
+        let split = split_render(&clean, sentinel).unwrap();
+        assert_eq!(split.markers.len(), 1);
+        assert!(!has_transformed_marker(&split, sentinel));
+        for render in [
+            clean.to_uppercase(),
+            clean.replace('<', "&lt;"),
+            format!("x {}", &sentinel.to_uppercase()[..]),
+        ] {
+            let split = split_render(&render, sentinel).unwrap();
+            assert!(split.markers.is_empty(), "{render}");
+            assert!(has_transformed_marker(&split, sentinel), "{render}");
+        }
+        let plain = split_render("no markers", sentinel).unwrap();
+        assert!(!has_transformed_marker(&plain, sentinel));
+        assert!(!has_transformed_marker(&plain, ""));
     }
 
     #[test]
@@ -2762,9 +4802,9 @@ mod tests {
         };
         let opts = RenderOptions::default().with_media_sentinel(sentinel);
         let out = tmpl().render_with(&p, &opts).unwrap();
-        let split = split_media_render(&out, sentinel).unwrap();
+        let split = split_render(&out, sentinel).unwrap();
         assert_eq!(
-            split.source_hashes.len(),
+            split.markers.len(),
             1,
             "tool-result images render markers too"
         );

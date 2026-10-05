@@ -34,6 +34,25 @@ pub enum MoefluxEngineError {
     Decoder(#[from] MoefluxError),
 }
 
+impl MoefluxEngineError {
+    /// Whether the failure came after moeflux began allocating, so its
+    /// state may be partial — the moeflux twin of
+    /// [`NewError::is_resource`](crate::NewError::is_resource).
+    /// `false` for what is checked before any allocation (the
+    /// tokenizer and config parse, a path C cannot take, weights built
+    /// for another variant); `true` for `mf_init_model`'s bare null,
+    /// which does not say why.
+    pub fn is_resource(&self) -> bool {
+        match self {
+            Self::Model(_) => false,
+            Self::Decoder(
+                MoefluxError::PathHasNul | MoefluxError::ModelMismatch(_),
+            ) => false,
+            Self::Decoder(_) => true,
+        }
+    }
+}
+
 impl MoefluxEngine {
     /// Open both halves of a moeflux engine.
     ///
@@ -121,5 +140,19 @@ impl MoefluxEngine {
     /// false`, the Qwen3 MoE 4-bit setup the on-disk artifacts use.
     pub fn from_path(parent: &Path) -> Result<Self, MoefluxEngineError> {
         Self::from_path_with(parent, MoefluxOptions::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_unexplained_init_failure_is_a_resource_failure() {
+        let decoder = MoefluxEngineError::Decoder;
+        assert!(decoder(MoefluxError::InitFailed).is_resource());
+        assert!(!decoder(MoefluxError::PathHasNul).is_resource());
+        let mismatch = MoefluxError::ModelMismatch("a17b weights".into());
+        assert!(!decoder(mismatch).is_resource());
     }
 }

@@ -17,10 +17,10 @@
 //! | `messages`         | [`ChatTemplate`] rendering               |
 //! | `tools`            | [`ChatTemplate`] (tools) + tool_choice   |
 //! | `tool_choice`      | [`grammar_for_prompt`] grammar compiler  |
-//! | `stop_sequences`   | callers wire into [`PredictOptions`]     |
+//! | `stop_sequences`   | [`Session`] — first match in text or tool input; cut from it |
 //! | `thinking`         | [`ChatTemplate`] — drives `enable_thinking` extra |
 //! | `max_tokens`       | [`Session`] — the sole generation cap    |
-//! | `signature` (on [`Block::Thought`]) | *repurposed* — see [`OPEN_THOUGHT_SIGNATURE`] |
+//! | `signature` (on [`Block::Thought`]) | *repurposed* — see [`OPEN_THOUGHT_SIGNATURE`]; a closed thought's records the framing after it (`drama_llama:tail;…`) |
 //! | `temperature` / `top_p` / `top_k` | [`Session`] — folded into the sampling chain |
 //!
 //! The remaining request-level fields (`model` id, `stream`,
@@ -169,6 +169,131 @@ pub fn open_thought(
     }
 }
 
+/// What a *closed* thought's `signature` records about the bytes the
+/// model wrote right after the thought — framing no block of its own
+/// can carry, which the next render needs to reproduce the turn.
+///
+/// * `gap`: whitespace between the thought's close and the next block
+///   (or the end of the turn): Mistral 4's `[/THINK]\n[TOOL_CALLS]`,
+///   Gemma 4's `<channel|>\n<|tool_call>`, Qwen's `</think>\n\n` before
+///   a call. Anthropic never returns a whitespace-only text block, and
+///   rejects one on ingest ("text content blocks must contain
+///   non-whitespace text"), so it cannot ride as `Text`; the renderer
+///   puts it back after the thought, where the model wrote it.
+/// * `constrain`: the content type of the Harmony (gpt-oss) final
+///   channel that follows the thought — the `json` of
+///   `<|channel|>final <|constrain|>json<|message|>`. The header is
+///   framing, so the final's `Text` cannot say which spelling it had,
+///   and gpt-oss writes either.
+///
+/// Spelled `drama_llama:tail;gap=%0A;constrain=json` (fields
+/// percent-encoded, each omitted when empty). A thought with nothing to
+/// record keeps the empty signature, so a closed thought without a tail
+/// is unchanged on the wire. Same overload, same safety argument as
+/// [`OPEN_THOUGHT_SIGNATURE`]: a real Anthropic signature never starts
+/// with the prefix, and a signature that is not ours (or does not
+/// decode) reads as no tail at all. What decodes is validated — a gap
+/// must be whitespace, a content type a short token — because the
+/// renderer lays both out as framing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ThoughtTail {
+    /// Whitespace the model wrote after the thought's close.
+    pub gap: String,
+    /// The following Harmony final channel's content type.
+    pub constrain: Option<String>,
+}
+
+/// The [`ThoughtTail`] spelling's prefix.
+const THOUGHT_TAIL_PREFIX: &str = "drama_llama:tail";
+
+impl ThoughtTail {
+    /// The tail a thought's `signature` records; empty when it records
+    /// none, is not ours, or does not decode.
+    pub(crate) fn of(signature: &str) -> Self {
+        let Some(fields) = signature.strip_prefix(THOUGHT_TAIL_PREFIX) else {
+            return Self::default();
+        };
+        let mut tail = Self::default();
+        let mut fields = fields.split(';');
+        if fields.next() != Some("") {
+            return Self::default();
+        }
+        for field in fields {
+            let decoded = field
+                .split_once('=')
+                .and_then(|(key, value)| Some((key, percent_decode(value)?)));
+            match decoded {
+                Some(("gap", gap)) if is_blank(&gap) => tail.gap = gap,
+                Some(("constrain", c)) if is_content_type(&c) => {
+                    tail.constrain = Some(c)
+                }
+                _ => return Self::default(),
+            }
+        }
+        tail
+    }
+
+    /// The signature recording this tail: empty when there is nothing
+    /// to record.
+    pub(crate) fn signature(&self) -> std::borrow::Cow<'static, str> {
+        if self.gap.is_empty() && self.constrain.is_none() {
+            return std::borrow::Cow::Borrowed("");
+        }
+        let mut out = THOUGHT_TAIL_PREFIX.to_owned();
+        if !self.gap.is_empty() {
+            out.push_str(";gap=");
+            out.push_str(&percent_encode(&self.gap));
+        }
+        if let Some(constrain) = &self.constrain {
+            out.push_str(";constrain=");
+            out.push_str(&percent_encode(constrain));
+        }
+        out.into()
+    }
+}
+
+/// Whether `text` is non-empty and only whitespace: what Anthropic
+/// rejects as a text block.
+pub(crate) fn is_blank(text: &str) -> bool {
+    !text.is_empty() && text.trim().is_empty()
+}
+
+/// A Harmony content type the renderer may lay out after
+/// `<|constrain|>`: a short token, never framing.
+pub(crate) fn is_content_type(c: &str) -> bool {
+    (1..=32).contains(&c.len())
+        && c.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-./+".contains(&b))
+}
+
+fn percent_encode(s: &str) -> String {
+    use std::fmt::Write;
+    s.bytes().fold(String::new(), |mut out, b| {
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+        out
+    })
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut rest = s.as_bytes();
+    while let Some((&b, tail)) = rest.split_first() {
+        if b == b'%' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(b);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Whether `block` is a [`Block::Thought`] flagged open by
 /// [`OPEN_THOUGHT_SIGNATURE`].
 pub fn is_open_thought(block: &Block) -> bool {
@@ -202,4 +327,58 @@ pub fn prune_open_thoughts(prompt: &mut Prompt) -> usize {
     }
     prompt.messages.retain(|m| !m.content.0.is_empty());
     pruned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tail round-trips through its signature, an empty one is the
+    /// empty signature, and a signature that is not ours — or that
+    /// would lay out anything but whitespace or a content type — reads
+    /// as no tail.
+    #[test]
+    fn thought_tail_round_trips_and_rejects_what_is_not_ours() {
+        let tails = [
+            ThoughtTail::default(),
+            ThoughtTail {
+                gap: "\n".into(),
+                constrain: None,
+            },
+            ThoughtTail {
+                gap: " \t\r\n\n\u{3000}".into(),
+                constrain: Some("json".into()),
+            },
+            ThoughtTail {
+                gap: String::new(),
+                constrain: Some("json".into()),
+            },
+        ];
+        for tail in tails {
+            let signature = tail.signature();
+            assert_eq!(ThoughtTail::of(&signature), tail, "{signature:?}");
+        }
+        assert_eq!(ThoughtTail::default().signature(), "");
+        assert_eq!(
+            ThoughtTail {
+                gap: "\n".into(),
+                constrain: Some("json".into()),
+            }
+            .signature(),
+            "drama_llama:tail;gap=%0A;constrain=json"
+        );
+        for foreign in [
+            "",
+            OPEN_THOUGHT_SIGNATURE,
+            "EqQBCkgIARABGAIiQL2…",
+            "drama_llama:tail;gap=x",
+            "drama_llama:tail;gap=%0Ax",
+            "drama_llama:tail;constrain=json%3C%7Cmessage%7C%3E",
+            "drama_llama:tail;gap=%0",
+            "drama_llama:tail;bogus=1",
+            "drama_llama:tailgap=%0A",
+        ] {
+            assert_eq!(ThoughtTail::of(foreign), ThoughtTail::default());
+        }
+    }
 }

@@ -57,6 +57,50 @@ pub(crate) struct DeferredMatcher {
     pub(crate) matcher: StackState,
 }
 
+/// The constraint half of a [`SamplerState`] at one step: what the
+/// predictor's escaped-closer repair rewinds to (see
+/// [`SamplerState::constraint_mark`]). The rest of the state — the
+/// RNG, `mu`, the repetition stats — runs on through a rewind: a
+/// redraw is a fresh draw, and the rolled-back tokens' pressure on the
+/// stats is a handful of tokens' worth.
+#[derive(Clone, Debug)]
+pub(crate) struct ConstraintMark {
+    matchers: Vec<MatcherState>,
+    deferred: Option<DeferredMatcher>,
+    tool_calls: u32,
+}
+
+impl ConstraintMark {
+    /// Whether feeding `bytes` from this mark brings every active
+    /// constraint (eager matchers and an activated deferred grammar)
+    /// to its accept state.
+    pub(crate) fn completes_with(
+        &self,
+        config: &SamplerConfig,
+        bytes: &[u8],
+    ) -> bool {
+        let modes = config.modes.iter().zip(&self.matchers).all(
+            |(mode, matcher)| match (mode, matcher) {
+                (
+                    SamplingMode::Grammar(compiled),
+                    MatcherState::Grammar { stack, .. },
+                ) => stack.completes_with(&compiled.grammar, bytes),
+                (SamplingMode::Json, MatcherState::Json(s)) => {
+                    s.completes_with(bytes)
+                }
+                _ => true,
+            },
+        );
+        modes
+            && match (&self.deferred, &config.deferred_grammar) {
+                (Some(d), Some(spec)) if d.active => {
+                    d.matcher.completes_with(&spec.grammar.grammar, bytes)
+                }
+                _ => true,
+            }
+    }
+}
+
 /// Everything a generation call mutates while sampling. See the module
 /// docs for the purity contract.
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -68,9 +112,11 @@ pub struct SamplerState {
     pub(crate) deferred: Option<DeferredMatcher>,
     /// Mirostat learning value (`None` until the first mirostat step).
     pub(crate) mu: Option<f32>,
-    /// Working RNG. Serialized as its full state — a restored snapshot
-    /// continues the exact stream (resume ≠ restart; the *restart*
-    /// seed lives in config/per-call options).
+    /// Working RNG. Serialized as its full state so a snapshot
+    /// round-trips bit-exactly; the Session's unseeded resume path
+    /// reseeds it on load (a retry must be a fresh draw — see
+    /// `Session::build_initial_state`), so the exact stream only
+    /// continues where a caller restores a snapshot directly.
     pub(crate) rng: rand_pcg::Pcg64Mcg,
     /// Repetition-penalty accumulator.
     pub(crate) ngram_stats: NGramStats,
@@ -94,14 +140,25 @@ pub struct SamplerState {
     /// field: anything that influences logits influences RNG
     /// consumption downstream, so it must ride a mid-call snapshot for
     /// restore-and-continue to replay the identical stream (same
-    /// rationale as serializing `rng`). But it is NEVER carried across
+    /// rationale as serializing `rng`). It is NEVER carried across
     /// call boundaries — `init_state` and `resumed_from` both start it
-    /// empty — which is what keeps (a) the incremental-vs-cold fold
-    /// equivalence intact (Session seeding deliberately excludes
-    /// tool-use args, so the *persistent* `ngram_stats` never sees
-    /// constrained tokens) and (b) cross-call tool-arg repetition a
-    /// non-goal by construction. `serde(default)` so pre-feature blobs
-    /// deserialize to the empty accumulator.
+    /// empty, which is what keeps the incremental-vs-cold fold
+    /// equivalence intact (a cold fold cannot re-derive another call's
+    /// sampled stream). Since #106 it is instead **reborn seeded**:
+    /// after the doors zero it, `Session`'s `fold_and_snapshot` clones
+    /// the folded prompt corpus into it (post-last-snapshot, step
+    /// rebased — see [`RepetitionOptions::seed_constrained_regions`]),
+    /// re-derived identically on the cold and resume paths. So
+    /// cross-call repetition pressure flows through *prompt content*,
+    /// never through carried accumulator state. Cache-resident
+    /// snapshots (the tip, hash-inherited breakpoints) may therefore
+    /// legitimately hold populated constrained fields — the resume
+    /// door zeroes them before the re-seed; that is the mechanism, not
+    /// a leak. `serde(default)` so pre-feature blobs deserialize to
+    /// the empty accumulator.
+    ///
+    /// [`RepetitionOptions::seed_constrained_regions`]:
+    ///     crate::RepetitionOptions::seed_constrained_regions
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) constrained_ngram_stats: NGramStats,
     /// Step counter for the constrained-region window/decay math —
@@ -110,6 +167,14 @@ pub struct SamplerState {
     /// serialization rationale as [`Self::constrained_ngram_stats`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) constrained_step: u64,
+    /// Client tool calls the [`SamplerConfig::tool_call_cap`] grammar has
+    /// completed this turn, repeats included. Counted only under a cap,
+    /// so it stays `0` without one. Turn-local like the matchers it
+    /// reads: [`Self::reset_constraints`] zeroes it, and
+    /// [`Self::resumed_from`] carries it only with the matcher it
+    /// counts.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) tool_calls: u32,
 }
 
 impl SamplerState {
@@ -151,6 +216,27 @@ impl SamplerState {
             .deferred
             .as_ref()
             .is_some_and(|d| d.active && d.matcher.is_complete())
+    }
+
+    /// [`Self::grammar_complete`], and the accepting matcher has nothing
+    /// left to match — the structured output is not merely *valid* as
+    /// it stands but *finished*. The two differ exactly when a grammar
+    /// can repeat: after the first call of a parallel section (`call+`)
+    /// the constraint is complete, yet whether to stop or open another
+    /// call is the model's decision, made by sampling EOG or the next
+    /// opener. The Session halts on this, not on `grammar_complete` —
+    /// halting on mere acceptance cut every parallel section to one
+    /// call. (A complete JSON document is always exhausted: the parser
+    /// admits no trailing bytes.)
+    pub fn grammar_exhausted(&self) -> bool {
+        self.matchers.iter().any(|m| match m {
+            MatcherState::Grammar { stack, .. } => stack.is_exhausted(),
+            MatcherState::Json(s) => s.is_complete(),
+            MatcherState::Stateless => false,
+        }) || self
+            .deferred
+            .as_ref()
+            .is_some_and(|d| d.active && d.matcher.is_exhausted())
     }
 
     /// True iff generation ended while a byte-constraint was still
@@ -227,6 +313,211 @@ impl SamplerState {
         d.matcher.advance_bytes(&spec.grammar.grammar, tail)
     }
 
+    /// Would `token`, sampled while the deferred grammar sleeps, wake
+    /// it with bytes it refuses? A token can finish the trigger and
+    /// carry more bytes past it (cogito's `>\n\n\n` after `</`, a
+    /// text-spelled `]\n{` after `[/THINK`): the predictor activates
+    /// the grammar on the bytes after the trigger, and when the grammar
+    /// refuses them it ends the turn — mid-structure, a violation on
+    /// every draw that picks the token. Judged before the pick commits,
+    /// the same token is masked and the draw steered, like any other
+    /// grammar-illegal token.
+    ///
+    /// `generated` is the text generated so far, as the predictor scans
+    /// it for the trigger; only its last trigger's-length bytes matter.
+    /// A token that ends generation never activates anything, so an EOG
+    /// token is never refused here.
+    pub(crate) fn wakes_deferred_illegally<M: Model>(
+        &self,
+        config: &SamplerConfig,
+        generated: &[u8],
+        token: Token,
+        model: &M,
+    ) -> bool {
+        let (Some(d), Some(spec)) =
+            (self.deferred.as_ref(), config.deferred_grammar.as_ref())
+        else {
+            return false;
+        };
+        if d.active {
+            return false;
+        }
+        let mut piece: Vec<u8> = Vec::with_capacity(32);
+        model.token_to_piece_ref(token, &mut piece);
+        // Cheap reject first: a trigger can only end inside the piece
+        // if the piece holds some trigger's last byte.
+        let ends_one = spec
+            .activate_after
+            .iter()
+            .filter_map(|t| t.last())
+            .any(|b| piece.contains(b));
+        if !ends_one {
+            return false;
+        }
+        let longest = spec.activate_after.iter().map(Vec::len).max();
+        let keep = generated
+            .len()
+            .saturating_sub(longest.unwrap_or(0).saturating_sub(1));
+        let hay: Vec<u8> = generated[keep..]
+            .iter()
+            .chain(piece.iter())
+            .copied()
+            .collect();
+        // Every occurrence counts, spelled or real: the sampler has no
+        // emission provenance, so a trigger the model spelled in
+        // ordinary tokens (which `TokenPredictor` never wakes on) is
+        // judged as if real. Conservative — it can steer a quote of
+        // the trigger off a refused tail, never let a real wake through.
+        let Some((end, len)) = crate::predictor::find_any_deferred_trigger_end(
+            &hay,
+            &spec.activate_after,
+            hay.len(),
+            |_, _| true,
+        ) else {
+            return false;
+        };
+        // A trigger wholly inside `generated` fired already, or never
+        // will (the predictor scans only after a token commits).
+        if end <= hay.len() - piece.len() {
+            return false;
+        }
+        let from = if spec.feed_trigger { end - len } else { end };
+        let tail = &hay[from..];
+        !tail.is_empty()
+            && !d.matcher.accepts_bytes(&spec.grammar.grammar, tail)
+            && !model.eog_tokens().contains(&token)
+    }
+
+    /// Would `token`, an ordinary token, spell framing an active grammar
+    /// forces? Grammars match bytes, so a reserved piece the grammar
+    /// requires (a call's `</tool_call>`) passes spelled in ordinary
+    /// tokens as readily as emitted as its one real token. The parse
+    /// reads emission provenance and takes a spelling for text (see
+    /// `dialect::provenance`): the call seats unclosed and the spelled
+    /// closer lands after it as a text block no template renders, so
+    /// the turn parts from its KV. Masked, the spelling's first token
+    /// is steered off and the real token stays legal.
+    ///
+    /// A spelling counts where it starts a reserved piece and, past the
+    /// end of `token`, the grammar admits only that piece's bytes, one
+    /// byte at each step. A piece whose bytes are also free content (a
+    /// string body, a raw value) is left alone: spelled there, it is
+    /// content. `generated` is the text so far; a spelling may have
+    /// started in it.
+    pub(crate) fn spells_forced_framing<M: Model>(
+        &self,
+        config: &SamplerConfig,
+        generated: &[u8],
+        token: Token,
+        model: &M,
+        reserved: &crate::LiteralNeutralizer,
+    ) -> bool {
+        if reserved.emitted_piece(token).is_some()
+            || model.eog_tokens().contains(&token)
+        {
+            return false;
+        }
+        let grammars: Vec<(&crate::Grammar, &StackState)> = config
+            .modes
+            .iter()
+            .zip(&self.matchers)
+            .filter_map(|(mode, matcher)| match (mode, matcher) {
+                (
+                    SamplingMode::Grammar(compiled),
+                    MatcherState::Grammar { stack, .. },
+                ) => Some((&*compiled.grammar, stack)),
+                _ => None,
+            })
+            .chain(
+                self.deferred
+                    .as_ref()
+                    .zip(config.deferred_grammar.as_ref())
+                    .filter(|(d, _)| d.active)
+                    .map(|(d, spec)| (&*spec.grammar.grammar, &d.matcher)),
+            )
+            .collect();
+        if grammars.is_empty() {
+            return false;
+        }
+        let mut piece: Vec<u8> = Vec::with_capacity(32);
+        model.token_to_piece_ref(token, &mut piece);
+        if piece.is_empty() {
+            return false;
+        }
+        let keep = generated
+            .len()
+            .saturating_sub(reserved.max_len().saturating_sub(1));
+        // INVARIANT: `keep <= generated.len()`.
+        let before = generated.len() - keep;
+        let text: Vec<u8> =
+            generated[keep..].iter().chain(&piece).copied().collect();
+        (0..text.len()).any(|at| {
+            // INVARIANT: `at < text.len()`.
+            reserved
+                .starting_at(&text[at..])
+                .into_iter()
+                .any(|framing| {
+                    grammars.iter().any(|&(grammar, stack)| {
+                        forces(grammar, stack, &piece, before, at, framing)
+                    })
+                })
+        })
+    }
+
+    /// Client tool calls completed this turn under the config's
+    /// [`ToolCallCap`](crate::ToolCallCap) (see the field docs).
+    pub fn tool_calls(&self) -> u32 {
+        self.tool_calls
+    }
+
+    /// Whether the cap's grammar sits between calls: a call has just
+    /// completed, and the grammar either accepts as it stands or needs
+    /// only the cap's `close` to. Inside a call — a string body
+    /// included, where `close` is content — it never does, so each call
+    /// crosses into this once, as it completes. `false` while the
+    /// grammar is not this call's or a deferred one sleeps.
+    fn between_calls(
+        &self,
+        config: &SamplerConfig,
+        cap: &crate::ToolCallCap,
+    ) -> bool {
+        let eager = config.modes.iter().zip(&self.matchers).find_map(
+            |(mode, matcher)| match (mode, matcher) {
+                (
+                    SamplingMode::Grammar(compiled),
+                    MatcherState::Grammar { grammar, stack },
+                ) if *grammar == cap.grammar => {
+                    Some((&*compiled.grammar, stack))
+                }
+                _ => None,
+            },
+        );
+        let deferred = || {
+            self.deferred
+                .as_ref()
+                .zip(config.deferred_grammar.as_ref())
+                .filter(|(d, _)| d.active && d.grammar == cap.grammar)
+                .map(|(d, spec)| (&*spec.grammar.grammar, &d.matcher))
+        };
+        eager.or_else(deferred).is_some_and(|(grammar, stack)| {
+            stack.is_complete()
+                || (!cap.close.is_empty()
+                    && stack.completes_with(grammar, &cap.close))
+        })
+    }
+
+    /// The config's [`ToolCallCap`](crate::ToolCallCap) once this turn
+    /// has made its `max` calls and the grammar sits after the last of
+    /// them: the next token must end the turn.
+    pub(crate) fn tool_call_cap_reached<'c>(
+        &self,
+        config: &'c SamplerConfig,
+    ) -> Option<&'c crate::ToolCallCap> {
+        config.tool_call_cap.as_ref().filter(|cap| {
+            self.tool_calls >= cap.max.get() && self.between_calls(config, cap)
+        })
+    }
+
     /// The repetition-penalty n-gram accumulator (read-only
     /// observability — probes and tests compare fold results;
     /// [`crate::NGramStats`] derives `PartialEq` for exactly that).
@@ -288,6 +579,12 @@ impl SamplerState {
         model: &M,
     ) {
         debug_assert_eq!(self.matchers.len(), config.modes.len());
+        // A call completes on the token that carries its grammar into
+        // `between_calls`.
+        let was_between = config
+            .tool_call_cap
+            .as_ref()
+            .map(|cap| self.between_calls(config, cap));
         let mut buf: Vec<u8> = Vec::new();
         let mut computed = false;
         let piece = |buf: &mut Vec<u8>, computed: &mut bool| {
@@ -319,6 +616,13 @@ impl SamplerState {
             if d.active {
                 piece(&mut buf, &mut computed);
                 let _ = d.matcher.advance_bytes(&spec.grammar.grammar, &buf);
+            }
+        }
+        if let (Some(false), Some(cap)) =
+            (was_between, config.tool_call_cap.as_ref())
+        {
+            if self.between_calls(config, cap) {
+                self.tool_calls = self.tool_calls.saturating_add(1);
             }
         }
     }
@@ -407,15 +711,33 @@ impl SamplerState {
             // deliberately NOT cloned from `cached`. A resumed call and
             // a cold-prefill call must derive identical states at every
             // breakpoint, and cold fold cannot (and must not) recover
-            // mid-call ephemera. See the field docs.
+            // mid-call ephemera. Session re-seeds it from the folded
+            // corpus AFTER the snapshots (#106) — history pressure
+            // flows through prompt content, never through this door.
+            // See the field docs.
             constrained_ngram_stats: NGramStats::default(),
             constrained_step: 0,
+            // Carried only with the matcher it counts: the tally is
+            // the turn's whose position that matcher holds.
+            tool_calls: config
+                .tool_call_cap
+                .as_ref()
+                .filter(|cap| {
+                    cached.matchers.iter().any(|m| {
+                        matches!(m, MatcherState::Grammar { grammar, .. }
+                            if *grammar == cap.grammar)
+                    }) || cached
+                        .deferred
+                        .as_ref()
+                        .is_some_and(|d| d.grammar == cap.grammar)
+                })
+                .map_or(0, |_| cached.tool_calls),
         }
     }
 
     /// Reset every constraint matcher (eager, JSON, deferred) to its
-    /// grammar's root, keeping the stream fields (`mu`, rng, n-gram
-    /// stats, `step`) intact.
+    /// grammar's root, and the tool-call tally with them, keeping the
+    /// stream fields (`mu`, rng, n-gram stats, `step`) intact.
     ///
     /// [`resumed_from`](Self::resumed_from) carries matcher positions
     /// whenever the grammar identity matches, which is correct only
@@ -451,6 +773,25 @@ impl SamplerState {
                     grammar: spec.grammar.source_hash(),
                     matcher: spec.grammar.root_state(),
                 });
+        self.tool_calls = 0;
+    }
+
+    /// The matcher positions, as [`Self::rewind_constraints`] takes
+    /// them back.
+    pub(crate) fn constraint_mark(&self) -> ConstraintMark {
+        ConstraintMark {
+            matchers: self.matchers.clone(),
+            deferred: self.deferred.clone(),
+            tool_calls: self.tool_calls,
+        }
+    }
+
+    /// Put the matchers back where `mark` found them. Only the
+    /// constraint half moves (see [`ConstraintMark`]).
+    pub(crate) fn rewind_constraints(&mut self, mark: ConstraintMark) {
+        self.matchers = mark.matchers;
+        self.deferred = mark.deferred;
+        self.tool_calls = mark.tool_calls;
     }
 
     /// Read-only: would `token`'s piece bring any incomplete
@@ -501,10 +842,53 @@ impl SamplerState {
             }
     }
 
+    /// Whether the model's most likely next token is an end of
+    /// generation the constraint refuses while it holds a value open (a
+    /// free region: a string body, an `until()` value). Masked, the
+    /// model keeps writing *inside* that value, and the prose it meant
+    /// as the end of its turn becomes content — gpt-oss wrote `\"}` for
+    /// `"}` and its "Let's proceed." landed in a tool argument
+    /// (2026-10-01). Judged by the masks' own policy
+    /// ([`Self::accepts_chosen`]), so an exit marker that is also EOG
+    /// and finishes the constraint is no overrule. At a structural
+    /// position the grammar only writes framing in its place (a forced
+    /// call, a structured answer after a thought), which corrupts
+    /// nothing. Call from the single-threaded point of a step, as
+    /// `region::ConstraintGuard::build` requires.
+    pub(crate) fn overrules_eog<M: Model>(
+        &self,
+        config: &SamplerConfig,
+        candidates: &crate::Candidates,
+        model: &M,
+    ) -> bool {
+        if !self.constrained_incomplete() {
+            return false;
+        }
+        let top = candidates
+            .as_slice()
+            .iter()
+            .max_by(|a, b| a.logit.total_cmp(&b.logit))
+            .map(|td| td.id);
+        top.is_some_and(|top| {
+            model.eog_tokens().contains(&top)
+                && !self.accepts_chosen(config, top, model)
+                && super::region::ConstraintGuard::build(
+                    &config.modes,
+                    &self.matchers,
+                    self.deferred.as_ref(),
+                    config.deferred_grammar.as_ref(),
+                    model,
+                )
+                .is_some()
+        })
+    }
+
     /// Lazy-path legality of the chosen token: its piece bytes must
     /// extend (or, for a mid-parse EOG token, *finish*) every active
     /// constraint. Mirrors the masked filters' policy — empty pieces
-    /// are illegal, EOG is judged by id while incomplete.
+    /// are illegal, and EOG is judged by id: legal at any accept state
+    /// (terminal or extensible), mid-parse only when its bytes finish
+    /// the constraint.
     pub(crate) fn accepts_chosen<M: Model>(
         &self,
         config: &SamplerConfig,
@@ -516,12 +900,12 @@ impl SamplerState {
         let chosen_is_eog = model.eog_tokens().contains(&chosen);
 
         let grammar_ok = |g: &crate::Grammar, s: &StackState| {
-            !buf.is_empty()
-                && if chosen_is_eog && !s.is_complete() {
-                    s.completes_with(g, &buf)
-                } else {
-                    s.accepts_bytes(g, &buf)
-                }
+            if chosen_is_eog {
+                s.is_complete()
+                    || (!buf.is_empty() && s.completes_with(g, &buf))
+            } else {
+                !buf.is_empty() && s.accepts_bytes(g, &buf)
+            }
         };
 
         let modes_ok = config.modes.iter().zip(self.matchers.iter()).all(
@@ -531,12 +915,12 @@ impl SamplerState {
                     MatcherState::Grammar { stack, .. },
                 ) => grammar_ok(&compiled.grammar, stack),
                 (SamplingMode::Json, MatcherState::Json(s)) => {
-                    !buf.is_empty()
-                        && if chosen_is_eog && !s.is_complete() {
-                            s.completes_with(&buf)
-                        } else {
-                            s.accepts_bytes(&buf)
-                        }
+                    if chosen_is_eog {
+                        s.is_complete()
+                            || (!buf.is_empty() && s.completes_with(&buf))
+                    } else {
+                        !buf.is_empty() && s.accepts_bytes(&buf)
+                    }
                 }
                 _ => true,
             },
@@ -549,4 +933,44 @@ impl SamplerState {
                 _ => true,
             }
     }
+}
+
+/// Whether `framing`, starting `at` bytes into `before` generated bytes
+/// followed by `piece`, is forced from `stack` once `piece` is fed:
+/// every byte of it not yet emitted — and its last, when `piece` ends
+/// it — is the one byte the grammar admits there. Judging the last
+/// byte even when spelled tells a closer (only `>` can follow
+/// `</tool_call`) from content (a string body admits anything).
+fn forces(
+    grammar: &crate::Grammar,
+    stack: &StackState,
+    piece: &[u8],
+    before: usize,
+    at: usize,
+    framing: &[u8],
+) -> bool {
+    // A one-byte piece is ordinary text as often as framing.
+    if framing.len() < 2 {
+        return false;
+    }
+    let from = (at + framing.len() - 1).min(before + piece.len());
+    // Spelled whole before `piece`: not this token's doing.
+    if from < before {
+        return false;
+    }
+    let mut state = stack.clone();
+    // INVARIANT: `before <= from <= before + piece.len()` and
+    // `at <= from` (`framing.len() >= 2`), so both slices are in range.
+    if state
+        .advance_bytes(grammar, &piece[..from - before])
+        .is_err()
+    {
+        return false;
+    }
+    framing[from - at..].iter().all(|&b| {
+        let bitmap = state.first_byte_bitmap(grammar);
+        let only = bitmap.iter().map(|w| w.count_ones()).sum::<u32>() == 1;
+        only && bitmap[(b as usize) >> 6] & (1u64 << (b & 63)) != 0
+            && state.feed_byte(grammar, b).is_ok()
+    })
 }

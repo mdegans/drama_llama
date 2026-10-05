@@ -44,7 +44,8 @@
 use std::fmt::Write;
 
 use crate::grammar_compile::{
-    emit_thought_rules, escape_for_gbnf_string, schema_to_gbnf, JSON_GRAMMAR,
+    emit_thought_rules, escape_for_gbnf_string, json_grammar_lenient,
+    schema_to_gbnf, FIELD_SEP, KV_SEP,
 };
 use crate::{GrammarError, Prompt, SamplingMode, Tool, ToolChoice};
 
@@ -94,6 +95,10 @@ pub struct ToolChoiceOptions {
     /// required fields under sampling pressure (observed: Cogito
     /// emitting `{"comment": "…"}` when `reply_to` was required).
     pub strict_schema: bool,
+    /// The most the tools' schemas may measure, checked before anything
+    /// compiles them ([`ToolChoiceError::SchemaBudget`]). Default
+    /// [`SchemaLimits::default`](crate::SchemaLimits::default).
+    pub schema_limits: crate::SchemaLimits,
 }
 
 impl Default for ToolChoiceOptions {
@@ -108,6 +113,7 @@ impl Default for ToolChoiceOptions {
             arguments_field: "arguments",
             wrap_tags: Some(("<tool_call>\n", "\n</tool_call>")),
             strict_schema: true,
+            schema_limits: crate::SchemaLimits::default(),
         }
     }
 }
@@ -189,7 +195,7 @@ pub fn grammar_for_tool_choice(
         &chosen,
         opts,
         RootShape::Eager { thought_pre_opened },
-    );
+    )?;
     let mode = SamplingMode::grammar(&source)?;
     Ok(Some(mode))
 }
@@ -198,10 +204,11 @@ pub fn grammar_for_tool_choice(
 /// prompt whose `tool_choice` is `Auto` — or absent, which the
 /// Anthropic API treats as auto — with tools advertised.
 ///
-/// Returns a [`crate::DeferredGrammar`] that sleeps until the wrap-tag open
-/// (e.g. `<tool_call>\n`) appears in the output, then activates with
-/// the trigger bytes fed into the matcher, constraining the remainder
-/// of the call to the tool schemas. Thought and prose before the
+/// Returns a [`crate::DeferredGrammar`] that sleeps until the wrap-tag
+/// open (e.g. `<tool_call>`, its layout newline trimmed) appears in the
+/// output, then activates with the trigger bytes fed into the matcher,
+/// constraining the remainder of the call — its layout newline
+/// included — to the tool schemas. Thought and prose before the
 /// trigger run unconstrained at full speed.
 ///
 /// Returns `Ok(None)` when there is nothing to defer: a non-auto
@@ -233,11 +240,17 @@ pub fn deferred_grammar_for_prompt(
     if tools.is_empty() {
         return Ok(None);
     }
-    let Some((open, _)) = opts.wrap_tags else {
+    // The bare tag, not its layout newline — trimmed at the end only, so
+    // it stays a prefix of the opener the grammar starts at: see
+    // `CallSyntax::trigger`.
+    let Some(open) = opts.wrap_tags.map(|(open, _)| open.trim_end()) else {
         return Ok(None);
     };
+    if open.is_empty() {
+        return Ok(None);
+    }
     let chosen: Vec<&Tool> = tools.iter().collect();
-    let source = build_grammar_source(&chosen, opts, RootShape::Lazy);
+    let source = build_grammar_source(&chosen, opts, RootShape::Lazy)?;
     Ok(Some(crate::DeferredGrammar {
         grammar: crate::CompiledGrammar::parse(&source)?,
         activate_after: vec![open.as_bytes().to_vec()],
@@ -290,6 +303,7 @@ pub fn build_grammar_source_for_debug(
             thought_pre_opened: false,
         },
     )
+    .unwrap_or_else(|e| format!("# no grammar: {e}\n"))
 }
 
 /// Emit the GBNF source text for a tool-choice constraint.
@@ -309,7 +323,12 @@ pub(crate) fn build_grammar_source(
     tools: &[&Tool],
     opts: &ToolChoiceOptions,
     shape: RootShape,
-) -> String {
+) -> Result<String, ToolChoiceError> {
+    crate::schema_budget::check_schemas(
+        tools.iter().copied(),
+        None,
+        &opts.schema_limits,
+    )?;
     let mut src = String::with_capacity(1024);
 
     // Root rule: reasoning prefix per `shape`, then the (optionally
@@ -329,18 +348,18 @@ pub(crate) fn build_grammar_source(
             // `allow_thought`.
             let _ = writeln!(
                 src,
-                r#"root ::= think_body "</think>" ws {wrapped_call}"#
+                r#"root ::= think_body "</think>" fws {wrapped_call}"#
             );
             emit_thought_rules(&mut src);
         }
         RootShape::Eager {
             thought_pre_opened: false,
         } if opts.allow_thought => {
-            let _ = writeln!(src, "root ::= thought? ws {wrapped_call}");
+            let _ = writeln!(src, "root ::= thought? fws {wrapped_call}");
             emit_thought_rules(&mut src);
         }
         RootShape::Eager { .. } => {
-            let _ = writeln!(src, "root ::= ws {wrapped_call}");
+            let _ = writeln!(src, "root ::= fws {wrapped_call}");
         }
         RootShape::Lazy => {
             // Activation feeds the trigger (the wrap-tag open) into
@@ -349,10 +368,11 @@ pub(crate) fn build_grammar_source(
         }
     }
     if let Some((open, close)) = opts.wrap_tags {
-        // LlamaCppModel emits `<open>\n{…}\n</close>` in its trained format.
-        // We accept any whitespace around the JSON to tolerate minor
-        // layout drift. The literal tag text is escaped to survive
-        // being embedded in a GBNF string literal.
+        // The trained layout's newlines live in the tag literals
+        // (`"<tool_call>\n"`); `ws` tolerates one extra whitespace
+        // char of layout drift around the JSON on top of that. The
+        // literal tag text is escaped to survive being embedded in a
+        // GBNF string literal.
         let open_lit = escape_for_gbnf_string(open);
         let close_lit = escape_for_gbnf_string(close);
         let _ = writeln!(
@@ -370,7 +390,7 @@ pub(crate) fn build_grammar_source(
         }
         let _ = write!(alts, "call_{i}");
     }
-    let _ = writeln!(src, r#"call ::= "{{" ws ( {alts} ) ws "}}""#);
+    let _ = writeln!(src, r#"call ::= "{{" pad ( {alts} ) pad "}}""#);
 
     // Pipeline for embedded JSON literals: `serde_json::to_string`
     // produces a JSON string literal with JSON escapes (handles control
@@ -392,7 +412,7 @@ pub(crate) fn build_grammar_source(
         };
         let _ = writeln!(
             src,
-            r#"call_{i} ::= "\"name\"" ws ":" ws "{name_lit}" ws "," ws "{arg_field_lit}" ws ":" ws {args_rule}"#,
+            r#"call_{i} ::= "\"name\"" "{KV_SEP}" "{name_lit}" "{FIELD_SEP}" "{arg_field_lit}" "{KV_SEP}" {args_rule}"#,
         );
     }
 
@@ -400,15 +420,28 @@ pub(crate) fn build_grammar_source(
     // schema is off — `object` from JSON_GRAMMAR covers the permissive
     // case.
     if opts.strict_schema {
+        // Rules across every tool, as `dialect::grammar_source` counts.
+        let mut tally = crate::grammar_compile::RuleTally::default();
         for (i, tool) in tools.iter().enumerate() {
-            schema_to_gbnf(&tool.schema, &format!("args_{i}"), &mut src);
+            schema_to_gbnf(&tool.schema, &format!("args_{i}"), &mut src)
+                .and_then(|()| tally.update(&src))
+                .map_err(|source| ToolChoiceError::Schema {
+                    tool: tool.name.to_string(),
+                    source,
+                })?;
         }
     }
 
-    // Standard JSON grammar — RFC 8259-ish, enough for tool arguments.
-    src.push_str(JSON_GRAMMAR);
+    // Standard JSON grammar — RFC 8259-ish, enough for tool arguments,
+    // every spelling admitted. This path has no canonical-bytes
+    // contract (nothing re-renders its emissions; Session's dialect
+    // emitter owns that invariant) and no analyzer to measure a habit
+    // from, so it constrains structure only and leaves spelling to the
+    // model — see `json_grammar_lenient` for the #85-pin regression
+    // that made this explicit.
+    src.push_str(&json_grammar_lenient());
 
-    src
+    Ok(src)
 }
 
 /// Errors from [`grammar_for_tool_choice`].
@@ -421,6 +454,19 @@ pub enum ToolChoiceError {
     UnknownTool(String),
     #[error("compiled grammar is invalid: {0}")]
     Grammar(#[from] GrammarError),
+    /// A tool's `input_schema` has no grammar: too complex, or
+    /// unsatisfiable.
+    #[error("tool {tool:?}: {source}")]
+    Schema {
+        tool: String,
+        #[source]
+        source: crate::grammar_compile::SchemaError,
+    },
+    /// The tools' schemas measure past
+    /// [`ToolChoiceOptions::schema_limits`], so nothing compiled them:
+    /// the request's fault, a 400.
+    #[error("schema limits: {0}")]
+    SchemaBudget(#[from] crate::SchemaBudgetError),
 }
 
 static_assertions::assert_impl_all!(ToolChoiceError: Send, Sync);
@@ -439,6 +485,7 @@ mod tests {
                 thought_pre_opened: false,
             },
         )
+        .unwrap()
     }
     use crate::{Grammar, GrammarState};
     use serde_json::json;
@@ -471,6 +518,7 @@ mod tests {
             arguments_field: "parameters",
             wrap_tags: None,
             strict_schema: false,
+            schema_limits: crate::SchemaLimits::default(),
         }
     }
 
@@ -524,13 +572,54 @@ mod tests {
         let src = eager_src(&[&t], &bare_opts());
         assert!(accepts(
             &src,
-            r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#
+            r#"{"name": "get_weather", "parameters": {"city":"Paris"}}"#
         ));
         // Other tool names must be rejected.
         assert!(!accepts(
             &src,
             r#"{"name": "send_email", "parameters": {}}"#
         ));
+    }
+
+    /// Strict schemas with recursive `$ref`s compile, and two tools'
+    /// same-named defs (`Node`) stay two rules: each tool's tree
+    /// follows its own `Node`.
+    #[test]
+    fn strict_recursive_refs_keep_each_tools_defs() {
+        let tree = |leaf: &str| {
+            json!({
+                "type": "object",
+                "properties": {"root": {"$ref": "#/$defs/Node"}},
+                "required": ["root"],
+                "$defs": {"Node": {
+                    "type": "object",
+                    "properties": {
+                        "v": {"type": leaf},
+                        "kids": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/Node"},
+                        },
+                    },
+                    "required": ["v", "kids"],
+                }},
+            })
+        };
+        let words = tool_with_schema("words", tree("string"));
+        let numbers = tool_with_schema("numbers", tree("integer"));
+        let opts = ToolChoiceOptions {
+            strict_schema: true,
+            ..bare_opts()
+        };
+        let src = eager_src(&[&words, &numbers], &opts);
+        let call = |name: &str, leaf: &str| {
+            format!(
+                r#"{{"name": "{name}", "parameters": {{"root":{{"v":{leaf},"kids":[{{"v":{leaf},"kids":[{{"v":{leaf},"kids":[]}}]}}]}}}}}}"#
+            )
+        };
+        assert!(accepts(&src, &call("words", r#""a""#)));
+        assert!(accepts(&src, &call("numbers", "1")));
+        assert!(!accepts(&src, &call("words", "1")));
+        assert!(!accepts(&src, &call("numbers", r#""a""#)));
     }
 
     #[test]
@@ -579,7 +668,7 @@ mod tests {
         let src = eager_src(&[&t], &bare_opts());
         assert!(accepts(
             &src,
-            r#"{"name": "x", "parameters": {"a": {"b": [1, 2, {"c": "d"}]}}}"#
+            r#"{"name": "x", "parameters": {"a":{"b":[1,2,{"c":"d"}]}}}"#
         ));
     }
 
@@ -604,22 +693,22 @@ mod tests {
         // Correct shape accepted.
         assert!(accepts(
             &src,
-            r#"{"name": "count_letters", "parameters": {"letter": "r", "string": "strawberry"}}"#
+            r#"{"name": "count_letters", "parameters": {"letter":"r","string":"strawberry"}}"#
         ));
         // Hallucinated field names rejected.
         assert!(!accepts(
             &src,
-            r#"{"name": "count_letters", "parameters": {"chr": "r", "str": "strawberry"}}"#
+            r#"{"name": "count_letters", "parameters": {"chr":"r","str":"strawberry"}}"#
         ));
         // Missing required field rejected.
         assert!(!accepts(
             &src,
-            r#"{"name": "count_letters", "parameters": {"letter": "r"}}"#
+            r#"{"name": "count_letters", "parameters": {"letter":"r"}}"#
         ));
         // Wrong type for required field rejected.
         assert!(!accepts(
             &src,
-            r#"{"name": "count_letters", "parameters": {"letter": 1, "string": "x"}}"#
+            r#"{"name": "count_letters", "parameters": {"letter":1,"string":"x"}}"#
         ));
     }
 
@@ -652,18 +741,15 @@ mod tests {
         let src = eager_src(&[&tool_a, &tool_b], &opts);
 
         // Each tool's name accepts its own args.
-        assert!(accepts(&src, r#"{"name": "a", "parameters": {"x": 1}}"#));
-        assert!(accepts(&src, r#"{"name": "b", "parameters": {"y": "hi"}}"#));
+        assert!(accepts(&src, r#"{"name": "a", "parameters": {"x":1}}"#));
+        assert!(accepts(&src, r#"{"name": "b", "parameters": {"y":"hi"}}"#));
         // Cross-pairing rejected: name a + b's args, or name b + a's
         // args — these are exactly the failure mode the per-tool
         // alternatives prevent.
-        assert!(!accepts(
-            &src,
-            r#"{"name": "a", "parameters": {"y": "hi"}}"#
-        ));
-        assert!(!accepts(&src, r#"{"name": "b", "parameters": {"x": 1}}"#));
+        assert!(!accepts(&src, r#"{"name": "a", "parameters": {"y":"hi"}}"#));
+        assert!(!accepts(&src, r#"{"name": "b", "parameters": {"x":1}}"#));
         // Unknown name rejected.
-        assert!(!accepts(&src, r#"{"name": "c", "parameters": {"x": 1}}"#));
+        assert!(!accepts(&src, r#"{"name": "c", "parameters": {"x":1}}"#));
         // grammar_for_tool_choice path (with default opts) also
         // succeeds — no AnyWithStrictSchema error.
         let res = grammar_for_tool_choice(
@@ -680,7 +766,7 @@ mod tests {
         let t = tool("x");
         let src = eager_src(&[&t], &bare_opts());
         // Trailing comma is invalid JSON.
-        assert!(!accepts(&src, r#"{"name": "x", "parameters": {"a": 1,}}"#));
+        assert!(!accepts(&src, r#"{"name": "x", "parameters": {"a":1,}}"#));
         // Single-quoted string is invalid JSON.
         assert!(!accepts(&src, r#"{"name": "x", "parameters": {'a': 1}}"#));
     }
@@ -726,11 +812,11 @@ mod tests {
         let src = eager_src(&[&schema_tool], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "two_ints", "parameters": {"x": 1, "y": 2}}"#
+            r#"{"name": "two_ints", "parameters": {"x":1,"y":2}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "two_ints", "parameters": {"x": 1.5, "y": 2}}"#
+            r#"{"name": "two_ints", "parameters": {"x":1.5,"y":2}}"#
         ));
     }
 
@@ -911,15 +997,12 @@ mod tests {
             ..bare_opts()
         };
         let src = eager_src(&[&t], &opts);
-        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
-        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": -7}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n":42}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n":-7}}"#));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"n":1.5}}"#));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"n": 1.5}}"#
-        ));
-        assert!(!accepts(
-            &src,
-            r#"{"name": "fn", "parameters": {"n": 1e10}}"#
+            r#"{"name": "fn", "parameters": {"n":1e10}}"#
         ));
     }
 
@@ -931,16 +1014,13 @@ mod tests {
             ..bare_opts()
         };
         let src = eager_src(&[&t], &opts);
-        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 42}}"#));
-        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n": 1.5}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n":42}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"n":1.5}}"#));
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"n": -0.5e3}}"#
+            r#"{"name": "fn", "parameters": {"n":-0.5e3}}"#
         ));
-        assert!(!accepts(
-            &src,
-            r#"{"name": "fn", "parameters": {"n": "x"}}"#
-        ));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"n":"x"}}"#));
     }
 
     #[test]
@@ -951,19 +1031,16 @@ mod tests {
             ..bare_opts()
         };
         let src = eager_src(&[&t], &opts);
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"b":true}}"#));
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"b": true}}"#
-        ));
-        assert!(accepts(
-            &src,
-            r#"{"name": "fn", "parameters": {"b": false}}"#
+            r#"{"name": "fn", "parameters": {"b":false}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"b": "true"}}"#
+            r#"{"name": "fn", "parameters": {"b":"true"}}"#
         ));
-        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"b": 1}}"#));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"b":1}}"#));
     }
 
     #[test]
@@ -974,11 +1051,8 @@ mod tests {
             ..bare_opts()
         };
         let src = eager_src(&[&t], &opts);
-        assert!(accepts(
-            &src,
-            r#"{"name": "fn", "parameters": {"z": null}}"#
-        ));
-        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"z": 0}}"#));
+        assert!(accepts(&src, r#"{"name": "fn", "parameters": {"z":null}}"#));
+        assert!(!accepts(&src, r#"{"name": "fn", "parameters": {"z":0}}"#));
     }
 
     #[test]
@@ -994,15 +1068,15 @@ mod tests {
         let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"color": "red"}}"#
+            r#"{"name": "fn", "parameters": {"color":"red"}}"#
         ));
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"color": "blue"}}"#
+            r#"{"name": "fn", "parameters": {"color":"blue"}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"color": "yellow"}}"#
+            r#"{"name": "fn", "parameters": {"color":"yellow"}}"#
         ));
     }
 
@@ -1019,15 +1093,15 @@ mod tests {
         let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"level": 1}}"#
+            r#"{"name": "fn", "parameters": {"level":1}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"level": 4}}"#
+            r#"{"name": "fn", "parameters": {"level":4}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"level": "1"}}"#
+            r#"{"name": "fn", "parameters": {"level":"1"}}"#
         ));
     }
 
@@ -1044,19 +1118,19 @@ mod tests {
         let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"tags": ["a", "b"]}}"#
+            r#"{"name": "fn", "parameters": {"tags":["a","b"]}}"#
         ));
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"tags": []}}"#
+            r#"{"name": "fn", "parameters": {"tags":[]}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"tags": [1, 2]}}"#
+            r#"{"name": "fn", "parameters": {"tags":[1, 2]}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"tags": "a"}}"#
+            r#"{"name": "fn", "parameters": {"tags":"a"}}"#
         ));
     }
 
@@ -1086,15 +1160,15 @@ mod tests {
         let src = eager_src(&[&t], &opts);
         assert!(accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"loc": {"x": 1, "y": 2}}}"#
+            r#"{"name": "fn", "parameters": {"loc":{"x":1,"y":2}}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"loc": {"x": 1}}}"#
+            r#"{"name": "fn", "parameters": {"loc":{"x":1}}}"#
         ));
         assert!(!accepts(
             &src,
-            r#"{"name": "fn", "parameters": {"loc": "origin"}}"#
+            r#"{"name": "fn", "parameters": {"loc":"origin"}}"#
         ));
     }
 
@@ -1150,7 +1224,8 @@ mod tests {
             RootShape::Eager {
                 thought_pre_opened: true,
             },
-        );
+        )
+        .unwrap();
         // Reasoning body, close, then the wrapped call.
         assert!(accepts(
             &src,
@@ -1186,7 +1261,7 @@ mod tests {
             allow_thought: true,
             ..bare_opts()
         };
-        let src = build_grammar_source(&[&t], &opts, RootShape::Lazy);
+        let src = build_grammar_source(&[&t], &opts, RootShape::Lazy).unwrap();
         assert!(accepts(
             &src,
             "<tool_call>\n{\"name\": \"get_weather\", \"parameters\": {}}\n</tool_call>"
@@ -1218,7 +1293,7 @@ mod tests {
         let d = deferred_grammar_for_prompt(&auto_with_tools, &opts)
             .unwrap()
             .expect("auto + tools must defer");
-        assert_eq!(d.activate_after, vec![b"<tool_call>\n".to_vec()]);
+        assert_eq!(d.activate_after, vec![b"<tool_call>".to_vec()]);
         assert!(d.feed_trigger);
 
         // Absent tool_choice counts as auto.
@@ -1310,6 +1385,18 @@ mod tests {
         let tokens = engine.model.tokenize(&rendered, false);
         let mut opts = PredictOptions::default().add_model_stops(&engine.model);
         opts.n = NonZeroUsize::new(256).unwrap();
+        // Seeded, and the seed always prints: this samples
+        // (locally_typical), so a failing run without its seed is an
+        // unreproducible anecdote. `DRAMA_LLAMA_SEED` replays a
+        // specific stream; otherwise entropy, same as the default
+        // path. (Added while hunting the #85 compact-pin regression,
+        // whose original failures died with their seeds.)
+        let seed: u128 = std::env::var("DRAMA_LLAMA_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| rand::random::<u128>().max(1));
+        println!("=== sampler seed: {seed} ===");
+        opts.seed = std::num::NonZeroU128::new(seed);
         opts.sample_options = SamplerConfig {
             modes: vec![forced, SamplingMode::locally_typical()],
             ..SamplerConfig::default()

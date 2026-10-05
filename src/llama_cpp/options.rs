@@ -9,14 +9,21 @@
 //! inherent constructor.
 //!
 //! Every field is "unset" by default and unset means *llama.cpp's*
-//! default, not ours. A `Default::default()` load is byte-for-byte the
-//! load you would have got from the old `from_path`.
+//! default, not ours — with one exception, [`LlamaCppOptions::swa_full`],
+//! where the library default (a full-size sliding-window cache) costs a
+//! sliding-window model a whole second KV cache and buys nothing the
+//! checkpoints don't. Unset there means what llama.cpp's own server and
+//! CLI ship instead (as in [`LlamaCppEngine::default_context_params`]).
+//! The checkpoint budget fields have no llama.cpp counterpart; unset
+//! means [`CheckpointBudget::default`]. Otherwise a
+//! `Default::default()` load is byte-for-byte the load you would have
+//! got from the old `from_path`.
 
 use llama_cpp_sys_3::{
     llama_context_params, llama_model_default_params, llama_model_params,
 };
 
-use crate::llama_cpp::{FlashAttention, LlamaCppEngine};
+use crate::llama_cpp::{CheckpointBudget, FlashAttention, LlamaCppEngine};
 
 /// Load-time configuration for [`LlamaCppEngine`] and
 /// [`Session<LlamaCppBackend>`](crate::Session).
@@ -58,6 +65,67 @@ pub struct LlamaCppOptions {
     #[cfg_attr(feature = "cli", arg(long, value_enum))]
     pub flash_attn: Option<FlashAttention>,
 
+    /// Micro-batch size (llama.cpp's `n_ubatch`) — how many tokens one
+    /// forward pass evaluates. `None` inherits a `<model>.load.toml`
+    /// sidecar's `n_ubatch` when the engine was loaded with one, else
+    /// the library default (512, capped to [`Self::n_ctx`] when that is
+    /// set). A value set here beats the sidecar.
+    ///
+    /// Normally you want this large: it is the prefill parallelism
+    /// knob. It is also a **correctness escape hatch** for backend
+    /// kernels that only misbehave above a batch threshold.
+    ///
+    /// The case that motivated exposing it: Mistral Small 4
+    /// (`mistral4`) on Metal returned an entirely NaN vocabulary for
+    /// any micro-batch of >=32 tokens, because the half-precision
+    /// `mul_mm_id` kernel overflowed f16 on its layer-32 activations.
+    /// `llama-cpp-sys-3` 0.8.4 carries the upstream fix, so the default
+    /// works there; a [`NonFinite`](crate::DecodeError::NonFinite) at
+    /// the default now means an older sys crate or a new kernel bug.
+    /// See `.claude/memory/mistral4_support_and_metal_nan.md`.
+    ///
+    /// Note this is the *micro*-batch: `n_batch` stays large, so a
+    /// prompt of any length still submits in one call and is simply
+    /// evaluated in smaller chunks.
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub n_ubatch: Option<u32>,
+
+    /// Size the sliding-window layers' KV cache at the full context
+    /// (`true`, llama.cpp's library default) or at the window (`false`,
+    /// what llama.cpp's server and CLI default to). `None` means
+    /// `false`. Moot for a model without a sliding window.
+    ///
+    /// A full-size window cache costs the window layers a cell for
+    /// every context position — Gemma 4 31B: 50 of 60 layers, so
+    /// 880 KiB per token and ≈ 110 GiB at 131k, which does not fit;
+    /// gpt-oss: half its 72 KiB per token, ≈ 4.5 GiB at 131k. What it
+    /// was meant to buy is a sequence that can be truncated back to any
+    /// position. It does not: llama.cpp recycles a window's masked
+    /// cells whenever it places a batch, full-size cache or not, so an
+    /// idle prefix-cache slot loses the window below its anchors either
+    /// way (live on gpt-oss, 2026-10-01). Rewinds on these models go
+    /// through checkpoints of the window instead (see
+    /// [`crate::Checkpointing`]), which work at either size.
+    ///
+    /// llama.h warns that `false` "can cause bad performance in some
+    /// cases" with several sequences; `Some(true)` is the way back if a
+    /// workload measures that.
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub swa_full: Option<bool>,
+
+    /// Host RAM, in MiB, the prefix-cache checkpoints of every sequence
+    /// may hold together (sliding-window and recurrent / hybrid
+    /// models). `None` means
+    /// [`CheckpointBudget::DEFAULT_TOTAL_MIB`]. See [`CheckpointBudget`].
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub checkpoint_mib: Option<u32>,
+
+    /// Host RAM, in MiB, any one sequence's checkpoints may hold.
+    /// `None` means [`CheckpointBudget::DEFAULT_PER_SEQ_MIB`]. See
+    /// [`CheckpointBudget`].
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub checkpoint_slot_mib: Option<u32>,
+
     /// Keep every layer on the CPU. llama.cpp offloads all layers by
     /// default (`n_gpu_layers = -1`); this forces zero. Diagnostic path
     /// for isolating GPU-kernel divergence.
@@ -93,6 +161,37 @@ impl LlamaCppOptions {
         self
     }
 
+    /// Set the micro-batch size. See [`Self::n_ubatch`] — this is a
+    /// correctness escape hatch as much as a perf knob.
+    pub fn with_n_ubatch(mut self, n_ubatch: u32) -> Self {
+        self.n_ubatch = Some(n_ubatch);
+        self
+    }
+
+    /// Choose the sliding-window cache size. See [`Self::swa_full`].
+    pub fn with_swa_full(mut self, swa_full: bool) -> Self {
+        self.swa_full = Some(swa_full);
+        self
+    }
+
+    /// Bound the checkpoints' host RAM, in MiB: `total` across every
+    /// sequence, `per_slot` for any one. See [`Self::checkpoint_mib`].
+    pub fn with_checkpoint_mib(mut self, total: u32, per_slot: u32) -> Self {
+        self.checkpoint_mib = Some(total);
+        self.checkpoint_slot_mib = Some(per_slot);
+        self
+    }
+
+    /// The [`CheckpointBudget`] these options describe.
+    pub fn checkpoint_budget(&self) -> CheckpointBudget {
+        CheckpointBudget::from_mib(
+            self.checkpoint_mib
+                .unwrap_or(CheckpointBudget::DEFAULT_TOTAL_MIB),
+            self.checkpoint_slot_mib
+                .unwrap_or(CheckpointBudget::DEFAULT_PER_SEQ_MIB),
+        )
+    }
+
     /// Keep every layer on the CPU. See [`Self::no_gpu`].
     pub fn cpu_only(mut self) -> Self {
         self.no_gpu = true;
@@ -117,8 +216,9 @@ impl LlamaCppOptions {
     }
 
     /// Build the `llama_context_params` these options describe, on top
-    /// of [`LlamaCppEngine::default_context_params`] (which is the
-    /// library default plus a usable thread count).
+    /// of [`LlamaCppEngine::default_context_params`] (the library
+    /// default plus a usable thread count, with a window-sized
+    /// sliding-window cache: `swa_full` off).
     pub fn context_params(&self) -> llama_context_params {
         let mut cp = LlamaCppEngine::default_context_params();
         if let Some(n_ctx) = self.n_ctx {
@@ -135,6 +235,13 @@ impl LlamaCppOptions {
         }
         if let Some(fa) = self.flash_attn {
             cp.flash_attn_type = fa.as_raw();
+        }
+        cp.swa_full = self.swa_full.unwrap_or(false);
+        // Applied last so an explicit micro-batch wins over the
+        // `n_ctx` clamp above — the whole point of the knob is to force
+        // a *small* ubatch under a large context.
+        if let Some(n_ubatch) = self.n_ubatch {
+            cp.n_ubatch = n_ubatch.max(1);
         }
         cp
     }
@@ -166,6 +273,24 @@ mod tests {
         assert_eq!(cp.flash_attn_type, default_cp.flash_attn_type);
     }
 
+    /// The one documented exception to "unset means llama.cpp's
+    /// default": a window-sized sliding-window cache, as llama.cpp's
+    /// server ships. The library default would size Gemma 4's 50
+    /// window layers at the full context (≈ 110 GiB at 131k).
+    #[test]
+    fn swa_cache_is_window_sized_unless_asked() {
+        // SAFETY: POD, no allocation.
+        let library_default =
+            unsafe { llama_cpp_sys_3::llama_context_default_params() };
+        assert!(library_default.swa_full, "llama.cpp changed its default");
+        // `LlamaCppEngine::new(path, None, None, …)` takes these.
+        assert!(!LlamaCppEngine::default_context_params().swa_full);
+        let opts = LlamaCppOptions::default();
+        assert!(!opts.context_params().swa_full);
+        assert!(opts.with_swa_full(true).context_params().swa_full);
+        assert!(!opts.with_swa_full(false).context_params().swa_full);
+    }
+
     /// `cache_slots: Some(1)` is not the identity — it flips the KV
     /// cache to unified. This was a documented footgun back when it was
     /// reachable only via a three-argument constructor; keep it pinned
@@ -191,6 +316,25 @@ mod tests {
             .context_params();
         assert_eq!(big.n_ubatch, default_ubatch);
         assert_eq!(big.n_batch, 32768);
+    }
+
+    /// Unset is the default budget; set, each bound is the caller's.
+    #[test]
+    fn checkpoint_budget_defaults_and_overrides() {
+        assert_eq!(
+            LlamaCppOptions::default().checkpoint_budget(),
+            CheckpointBudget::default(),
+        );
+        assert_eq!(
+            CheckpointBudget::default(),
+            CheckpointBudget::new(8 << 30, 4 << 30),
+        );
+        assert_eq!(
+            LlamaCppOptions::default()
+                .with_checkpoint_mib(1024, 256)
+                .checkpoint_budget(),
+            CheckpointBudget::new(1 << 30, 256 << 20),
+        );
     }
 
     #[test]

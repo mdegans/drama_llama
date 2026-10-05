@@ -47,6 +47,13 @@ pub enum MoefluxModelError {
 #[derive(Debug)]
 pub struct MoefluxModel {
     tokenizer: Tokenizer,
+    /// [`Self::tokenizer`] with `encode_special_tokens` on: added
+    /// tokens marked `special` are not matched, the HF counterpart of
+    /// llama.cpp's `parse_special = false` (non-special added tokens,
+    /// Qwen's `<think>` among them, still are). Backs
+    /// [`Model::tokenize_special`] with `parse_special = false`, which
+    /// is how `Session` tokenizes content that spells a special piece.
+    literal_tokenizer: Tokenizer,
     /// Parsed `config.json` — architecture metadata (vocab_size,
     /// hidden_size, num_hidden_layers, max_position_embeddings, etc.).
     config: JsonValue,
@@ -104,6 +111,8 @@ impl MoefluxModel {
         }
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| MoefluxModelError::Tokenizer(e.to_string()))?;
+        let mut literal_tokenizer = tokenizer.clone();
+        literal_tokenizer.set_encode_special_tokens(true);
 
         let config = read_json(&mlx_dir.join("config.json"))
             .map_err(|_| MoefluxModelError::MissingArtifact("config.json"))?;
@@ -133,6 +142,7 @@ impl MoefluxModel {
 
         Ok(Self {
             tokenizer,
+            literal_tokenizer,
             config,
             chat_template,
             eos,
@@ -263,6 +273,22 @@ impl Model for MoefluxModel {
 
     fn tokenize(&self, input: &str, special: bool) -> Vec<Token> {
         encode_to_tokens(&self.tokenizer, input, special)
+    }
+
+    /// `add_special` is HF's `add_special_tokens` (the post-processor's
+    /// BOS and friends); `parse_special = false` encodes with added
+    /// tokens marked `special` left as text (the `literal_tokenizer`).
+    fn tokenize_special(
+        &self,
+        input: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Vec<Token> {
+        let tokenizer = match parse_special {
+            true => &self.tokenizer,
+            false => &self.literal_tokenizer,
+        };
+        encode_to_tokens(tokenizer, input, add_special)
     }
 
     fn token_to_piece(&self, token: Token) -> String {

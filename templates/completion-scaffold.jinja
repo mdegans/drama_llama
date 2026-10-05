@@ -1,0 +1,32 @@
+{#-
+  Completion scaffold for a BASE model (issue #88, Phase 6 / rung 4b).
+
+  No special tokens and no chat framing at all: the render is a bare
+  JSON array of records, the kind of scraped data file pretraining is
+  full of. Exemplar records ride in as assistant turns; the model
+  simply continues the series. Grammar supplies form, pretraining
+  supplies voice. User turns render as ZERO bytes — they exist only to
+  satisfy the prompt API's turn-order rule and carry no content.
+
+  Byte layout (load-bearing for prefix-cache continuity):
+    system    -> content + "\n"     (optional steering text above the array)
+    open      -> "[\n  "            (once, after any system text)
+    assistant -> content + ",\n  "  (one record, then the next slot's indent)
+    user      -> ""                 (nothing)
+  add_generation_prompt appends nothing: the render always ends at an
+  open record slot, and the model's emission lands exactly where the
+  next re-render will place the assistant content. The array never
+  closes — generation is always mid-document.
+-#}
+{%- if messages and messages[0].role == 'system' -%}
+{{- messages[0].content -}}{{- "\n" -}}
+{%- endif -%}
+{{- "[\n  " -}}
+{%- for message in messages -%}
+{%- if message.role == 'assistant' -%}
+{{- message.content -}}{{- ",\n  " -}}
+{%- elif message.role == 'user' or message.role == 'system' -%}
+{%- else -%}
+{{- raise_exception("completion scaffold supports system/user/assistant roles only, got: " ~ message.role) -}}
+{%- endif -%}
+{%- endfor -%}

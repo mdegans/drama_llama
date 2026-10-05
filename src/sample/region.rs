@@ -20,17 +20,29 @@
 //! - a byte rejects while still inside the region ⇒ not protected (the
 //!   token is filter-masked; penalizing it is harmless, and on the lazy
 //!   path it reduces wasteful fallback re-samples);
+//! - the walk ends inside the region but *off its content loop* ⇒
+//!   **protected** (GBNF engine; see below);
 //! - an empty piece ⇒ not protected.
 //!
-//! Known v1 limitation (pinned by `permissive_until_states`): an
-//! `until("</arg>")` exit delimiter spans multiple tokens whose
-//! intermediate KMP states are themselves permissive, so mid-delimiter
-//! tokens remain penalizable — bounded by the windowed-decay additive cap,
-//! not a livelock. Follow-up option: additionally protect tokens whose
-//! walk ends in a different `StateId` than a self-looping base.
+//! Progress toward a multi-token exit. An `until("\n</parameter>")`
+//! delimiter spans several tokens (`\n`, `</`, `parameter`, `>`) whose
+//! intermediate KMP states are themselves permissive, so "leaves the
+//! region" protects only the last of them. The rest were penalizable, and
+//! since every tool call ends with the same delimiter, its n-grams repeat
+//! once per call: by the third call of a turn Qwen3.8 could no longer
+//! close a parameter and wrote `】`, `</target>` or `</invoke>` into the
+//! value instead, then kept going (2026-09-22 Agora trial, #113). So each
+//! grammar region also finds its *home*: the state a plain content byte
+//! returns to (a fixed point — `q` from `q`). A token whose walk ends
+//! anywhere else has made progress toward the exit (or is mid-escape,
+//! or mid-codepoint) and is protected. Content tokens end at home and
+//! stay penalizable. The cost is that a content token ending in a
+//! delimiter prefix (`foo\n`, `a<`) is spared too — bounded, and the
+//! penalty is for prose loops, which such tokens do not sustain.
 
 use super::grammar::{
     dfa_cache_enabled, DfaCache, Grammar, StackState, StateId, REJECT_STATE,
+    UNCACHED_STATE,
 };
 use super::json::JsonState;
 use super::state::{DeferredMatcher, MatcherState};
@@ -46,6 +58,19 @@ pub(crate) trait RegionGuard {
     fn is_protected(&self, token: Token) -> bool;
 }
 
+/// Two guards, either of which protects: the region guard and the
+/// known-id guard (`sample::ids`) both apply inside a free region.
+pub(crate) struct Either<'a>(
+    pub(crate) &'a dyn RegionGuard,
+    pub(crate) &'a dyn RegionGuard,
+);
+
+impl RegionGuard for Either<'_> {
+    fn is_protected(&self, token: Token) -> bool {
+        self.0.is_protected(token) || self.1.is_protected(token)
+    }
+}
+
 /// One active, incomplete, currently-permissive constraint.
 enum GuardEntry<'a> {
     Grammar {
@@ -56,10 +81,66 @@ enum GuardEntry<'a> {
         /// `StackState` so the flag never changes sampled streams.
         base: Option<StateId>,
         matcher: &'a StackState,
+        /// The region's content loop (module docs), in whichever
+        /// representation the walk uses. `None` when no probe byte
+        /// finds one: only exits are protected, as before.
+        home: Option<Home>,
     },
     Json {
         state: &'a JsonState,
     },
+}
+
+/// A grammar region's content loop.
+enum Home {
+    Interned(StateId),
+    Stack(StackState),
+}
+
+/// Bytes tried, in order, as "plain content" when looking for a region's
+/// home. Rare in delimiters and legal in every free region we emit; the
+/// first whose step from the base is a permissive fixed point wins.
+const HOME_PROBES: &[u8] = b"qZ~%xQ";
+
+impl Home {
+    /// Find the home of the region `base` sits in (DFA path).
+    fn find_interned(
+        grammar: &Grammar,
+        dfa: &DfaCache,
+        base: StateId,
+    ) -> Option<Self> {
+        HOME_PROBES.iter().find_map(|&c| {
+            let s = dfa.transition(grammar, base, c);
+            (s != REJECT_STATE
+                && s != UNCACHED_STATE
+                && !dfa.is_complete(s)
+                && dfa.is_permissive(grammar, s)
+                && dfa.transition(grammar, s, c) == s)
+                .then_some(Home::Interned(s))
+        })
+    }
+
+    /// The home as a matcher state, for the clone-walk path.
+    fn state(&self, dfa: &DfaCache) -> StackState {
+        match self {
+            Home::Interned(sid) => dfa.state_of(*sid),
+            Home::Stack(state) => state.clone(),
+        }
+    }
+
+    /// Find the home of the region `matcher` sits in (clone-walk path).
+    fn find_stack(grammar: &Grammar, matcher: &StackState) -> Option<Self> {
+        HOME_PROBES.iter().find_map(|&c| {
+            let mut s = matcher.clone();
+            s.feed_byte(grammar, c).ok()?;
+            if s.is_complete() || !s.is_permissive(grammar) {
+                return None;
+            }
+            let mut again = s.clone();
+            again.feed_byte(grammar, c).ok()?;
+            (again == s).then_some(Home::Stack(s))
+        })
+    }
 }
 
 impl GuardEntry<'_> {
@@ -70,7 +151,8 @@ impl GuardEntry<'_> {
                 grammar,
                 dfa,
                 base: Some(base),
-                ..
+                matcher,
+                home,
             } => {
                 let mut sid = *base;
                 for &b in piece {
@@ -78,34 +160,52 @@ impl GuardEntry<'_> {
                     if sid == REJECT_STATE {
                         return false;
                     }
+                    if sid == UNCACHED_STATE {
+                        // The cache is full this step: the same walk on
+                        // the matcher itself.
+                        let home = home.as_ref().map(|h| h.state(dfa));
+                        return walk(grammar, matcher, piece, home.as_ref());
+                    }
                     if dfa.is_complete(sid) || !dfa.is_permissive(grammar, sid)
                     {
                         return true;
                     }
                 }
-                false
+                matches!(home, Some(Home::Interned(h)) if sid != *h)
             }
             GuardEntry::Grammar {
                 grammar,
+                dfa,
                 base: None,
                 matcher,
-                ..
+                home,
             } => {
-                let mut scratch = (*matcher).clone();
-                for &b in piece {
-                    if scratch.feed_byte(grammar, b).is_err() {
-                        return false;
-                    }
-                    if scratch.is_complete() || !scratch.is_permissive(grammar)
-                    {
-                        return true;
-                    }
-                }
-                false
+                let home = home.as_ref().map(|h| h.state(dfa));
+                walk(grammar, matcher, piece, home.as_ref())
             }
             GuardEntry::Json { state } => state.exit_protects(piece),
         }
     }
+}
+
+/// The region-exit walk (module docs) on the matcher itself: clone
+/// `matcher` and feed it `piece`, against the region's `home`.
+fn walk(
+    grammar: &Grammar,
+    matcher: &StackState,
+    piece: &[u8],
+    home: Option<&StackState>,
+) -> bool {
+    let mut scratch = matcher.clone();
+    for &b in piece {
+        if scratch.feed_byte(grammar, b).is_err() {
+            return false;
+        }
+        if scratch.is_complete() || !scratch.is_permissive(grammar) {
+            return true;
+        }
+    }
+    home.is_some_and(|h| scratch != *h)
 }
 
 /// The live guard for one sampling step: every active incomplete
@@ -143,23 +243,29 @@ impl<'a, M: Model> ConstraintGuard<'a, M> {
             if stack.is_complete() {
                 return true; // not incomplete — no entry, no veto
             }
-            let (permissive, base) = if cache_on {
-                let sid = compiled.dfa.intern_base(stack);
-                (
-                    compiled.dfa.is_permissive(&compiled.grammar, sid),
-                    Some(sid),
-                )
-            } else {
-                (stack.is_permissive(&compiled.grammar), None)
+            // A base the cache won't hold walks uncached.
+            let base = cache_on
+                .then(|| compiled.dfa.intern_base(stack))
+                .filter(|&sid| sid != UNCACHED_STATE);
+            let permissive = match base {
+                Some(sid) => compiled.dfa.is_permissive(&compiled.grammar, sid),
+                None => stack.is_permissive(&compiled.grammar),
             };
             if !permissive {
                 return false; // structural state vetoes the whole pass
             }
+            let home = match base {
+                Some(sid) => {
+                    Home::find_interned(&compiled.grammar, &compiled.dfa, sid)
+                }
+                None => Home::find_stack(&compiled.grammar, stack),
+            };
             entries.push(GuardEntry::Grammar {
                 grammar: &compiled.grammar,
                 dfa: &compiled.dfa,
                 base,
                 matcher: stack,
+                home,
             });
             true
         };
@@ -350,12 +456,14 @@ mod tests {
             dfa: &compiled.dfa,
             base: Some(sid),
             matcher: &stack,
+            home: Home::find_interned(&compiled.grammar, &compiled.dfa, sid),
         };
         let uncached = GuardEntry::Grammar {
             grammar: &compiled.grammar,
             dfa: &compiled.dfa,
             base: None,
             matcher: &stack,
+            home: Home::find_stack(&compiled.grammar, &stack),
         };
         for token in 0..PIECES.len() as Token {
             let piece = PIECES[token as usize].as_bytes();
@@ -367,6 +475,140 @@ mod tests {
                 uncached.protects(piece),
                 "cached/uncached divergence on token {token} ({piece:?})"
             );
+        }
+    }
+
+    /// A cache full for the step answers [`UNCACHED_STATE`] mid-walk;
+    /// the cached walk then finishes on the matcher, against its home,
+    /// and agrees with the uncached walk token for token.
+    #[test]
+    fn full_cache_walk_matches_uncached() {
+        let compiled =
+            CompiledGrammar::parse(STR_GRAMMAR).expect("grammar parses");
+        let mut stack = compiled.root_state();
+        stack.advance_bytes(&compiled.grammar, b"\"x").unwrap();
+        let dfa = DfaCache::new();
+        let sid = dfa.intern_base(&stack);
+        let home = Home::find_interned(&compiled.grammar, &dfa, sid);
+        assert!(home.is_some());
+        dfa.saturate();
+        let cached = GuardEntry::Grammar {
+            grammar: &compiled.grammar,
+            dfa: &dfa,
+            base: Some(sid),
+            matcher: &stack,
+            home,
+        };
+        let uncached = GuardEntry::Grammar {
+            grammar: &compiled.grammar,
+            dfa: &dfa,
+            base: None,
+            matcher: &stack,
+            home: Home::find_stack(&compiled.grammar, &stack),
+        };
+        let mut fell_back = false;
+        for token in 0..PIECES.len() as Token {
+            let piece = PIECES[token as usize].as_bytes();
+            if piece.is_empty() {
+                continue;
+            }
+            fell_back |= piece.iter().try_fold(sid, |s, &b| {
+                match dfa.transition(&compiled.grammar, s, b) {
+                    REJECT_STATE => None,
+                    next => Some(next),
+                }
+            }) == Some(UNCACHED_STATE);
+            assert_eq!(
+                cached.protects(piece),
+                uncached.protects(piece),
+                "cached/uncached divergence on token {token} ({piece:?})"
+            );
+        }
+        assert!(fell_back, "no walk left the cache");
+    }
+
+    /// Both walks over a region, from `prefix`: (cached, uncached).
+    fn entries_after<'a>(
+        compiled: &'a CompiledGrammar,
+        stack: &'a StackState,
+    ) -> [GuardEntry<'a>; 2] {
+        let sid = compiled.dfa.intern_base(stack);
+        [
+            GuardEntry::Grammar {
+                grammar: &compiled.grammar,
+                dfa: &compiled.dfa,
+                base: Some(sid),
+                matcher: stack,
+                home: Home::find_interned(
+                    &compiled.grammar,
+                    &compiled.dfa,
+                    sid,
+                ),
+            },
+            GuardEntry::Grammar {
+                grammar: &compiled.grammar,
+                dfa: &compiled.dfa,
+                base: None,
+                matcher: stack,
+                home: Home::find_stack(&compiled.grammar, stack),
+            },
+        ]
+    }
+
+    /// The Qwen3.8 XML parameter value: `until("\n</parameter>")`. Every
+    /// token of the closing delimiter is protected at the point it is
+    /// due, not only the one that finally leaves the region — else the
+    /// delimiter's n-grams, repeated once per call, suppress the close
+    /// (#113). Content stays penalizable, including from mid-delimiter.
+    #[test]
+    fn multi_token_exit_protected_at_every_step() {
+        let mut src = String::from("root ::= \"<v>\" body \"<end>\"\n");
+        crate::emit_until_rules("body", "\n</parameter>", &mut src);
+        let compiled = CompiledGrammar::parse(&src).expect("grammar parses");
+        let at = |prefix: &str| {
+            let mut stack = compiled.root_state();
+            stack
+                .advance_bytes(&compiled.grammar, prefix.as_bytes())
+                .expect("prefix is legal");
+            stack
+        };
+        let steps: [(&str, &[&str], &[&str]); 4] = [
+            ("<v>abc", &["\n", "\n</"], &["abc", " the"]),
+            ("<v>abc\n", &["</", "</param"], &["abc", "q"]),
+            ("<v>abc\n</", &["parameter", "param"], &["abc"]),
+            ("<v>abc\n</parameter", &[">"], &["abc"]),
+        ];
+        for (prefix, protected, content) in steps {
+            let stack = at(prefix);
+            for entry in entries_after(&compiled, &stack) {
+                for p in protected {
+                    assert!(
+                        entry.protects(p.as_bytes()),
+                        "{p:?} after {prefix:?} is progress toward the exit"
+                    );
+                }
+                for p in content {
+                    assert!(
+                        !entry.protects(p.as_bytes()),
+                        "{p:?} after {prefix:?} is content"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A single-byte exit region (a JSON-ish string) is unchanged:
+    /// content tokens stay penalizable, the close is protected.
+    #[test]
+    fn single_byte_exit_region_keeps_content_penalizable() {
+        let compiled =
+            CompiledGrammar::parse(STR_GRAMMAR).expect("grammar parses");
+        let mut stack = compiled.root_state();
+        stack.advance_bytes(&compiled.grammar, b"\"x").unwrap();
+        for entry in entries_after(&compiled, &stack) {
+            assert!(!entry.protects(b"y"));
+            assert!(!entry.protects(b" the"));
+            assert!(entry.protects(b"\","));
         }
     }
 

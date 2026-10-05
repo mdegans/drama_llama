@@ -3,12 +3,12 @@
 //! `Client` pointed at the local port — the same client a real
 //! consumer uses against api.anthropic.com.
 //!
-//! Covers `/api/tags` discovery, the `/v1/messages` happy path, and
-//! cross-request prompt caching through the server's shared session
-//! (the endpoint-level analog of `tests/session_cache.rs`).
+//! Covers `/v1/models` and `/api/tags` discovery, the `/v1/messages`
+//! happy path, and cross-request prompt caching through the server's
+//! shared session (the endpoint-level analog of `tests/session_cache.rs`).
 //!
-//! All tests need a GGUF in `models/`: `cargo test --test blallama --
-//! --ignored`.
+//! All but one need a GGUF in `models/`: `cargo test --test blallama --
+//! --ignored`. The exception serves a directory holding a garbage file.
 
 use std::{
     io::{Read as _, Write as _},
@@ -22,6 +22,16 @@ use misanthropic::{prompt::message::Role, Client, Prompt};
 
 fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models")
+}
+
+/// A response's prompt total: `cache_read_input_tokens` plus
+/// `cache_creation_input_tokens` plus `input_tokens`. `input_tokens`
+/// alone is only the tail after the last `cache_control` breakpoint,
+/// not the whole prompt.
+fn prompt_total(u: &misanthropic::response::TokenCounts) -> u64 {
+    u.cache_read_input_tokens.unwrap_or(0)
+        + u.cache_creation_input_tokens.unwrap_or(0)
+        + u.input_tokens
 }
 
 /// Kills the server on drop so a failing assertion doesn't leak a
@@ -68,6 +78,11 @@ impl Drop for Server {
 }
 
 fn spawn_server() -> Server {
+    spawn_server_in(&models_dir())
+}
+
+/// [`spawn_server`] over `dir` instead of `models/`.
+fn spawn_server_in(dir: &std::path::Path) -> Server {
     // Bind-then-drop to pick a free port. Racy in principle; fine for
     // a test that runs alone on a dev box.
     let port = TcpListener::bind("127.0.0.1:0")
@@ -76,7 +91,7 @@ fn spawn_server() -> Server {
         .unwrap()
         .port();
     let child = Command::new(env!("CARGO_BIN_EXE_blallama"))
-        .arg(models_dir())
+        .arg(dir)
         .args(["--port", &port.to_string(), "--seed", "42", "--no-penalty"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -108,6 +123,72 @@ fn http_get(port: u16, path: &str) -> String {
         .split_once("\r\n\r\n")
         .map(|(_, body)| body.to_string())
         .unwrap_or_default()
+}
+
+/// Minimal HTTP/1.0 POST of a JSON `body`; returns the status code and
+/// the response body.
+fn http_post(port: u16, path: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.0\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or_default();
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_default();
+    (status, body.to_string())
+}
+
+/// A model that fails to load *before* the backend allocates anything —
+/// here a `.gguf` llama.cpp cannot read the metadata of — is answered
+/// with an error, and the server serves on: it is not one of the
+/// failures blallama exits on (`bin/blallama/fatal.rs`). No model
+/// needed; the file is garbage.
+#[cfg(feature = "llama-cpp")]
+#[test]
+fn unloadable_model_is_answered_and_the_server_serves_on() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("garbage.gguf"), b"not a gguf")
+        .expect("write");
+    let mut server = spawn_server_in(dir.path());
+    let body = |model: &str| {
+        format!(
+            r#"{{"model":"{model}","max_tokens":8,
+                "messages":[{{"role":"user","content":"Hi"}}]}}"#
+        )
+    };
+
+    for _ in 0..2 {
+        let (status, payload) =
+            http_post(server.port, "/v1/messages", &body("garbage.gguf"));
+        let v: serde_json::Value =
+            serde_json::from_str(&payload).expect("a JSON envelope");
+        assert_eq!(status, 500, "{payload}");
+        assert_eq!(v["error"]["type"], "api_error", "{payload}");
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("metadata"), "{payload}");
+    }
+    // A nonexistent id is a 404, from the same live process.
+    let (status, payload) =
+        http_post(server.port, "/v1/messages", &body("no-such-model.gguf"));
+    assert_eq!(status, 404, "{payload}");
+
+    // Past the fatal grace period, the process is still up and serving.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        matches!(server.child.try_wait(), Ok(None)),
+        "blallama exited on a benign load failure"
+    );
+    let tags = http_get(server.port, "/api/tags");
+    assert!(tags.contains(r#""models""#), "{tags}");
 }
 
 /// Discover a servable model name from `/api/tags` (entry names in
@@ -142,6 +223,112 @@ fn tags_lists_models() {
     assert!(models[0]["name"]
         .as_str()
         .is_some_and(|n| n.ends_with(".gguf")));
+}
+
+/// `/v1/models` through the real client's `models()` — the consumer
+/// path, so this also proves the wire shape parses — plus the per-id
+/// route and its 404. Every model in `models/` is listed with metadata
+/// read from disk, none of them loaded.
+#[tokio::test]
+#[ignore = "long running, requires a GGUF in models/"]
+async fn v1_models_lists_every_model_unloaded() {
+    let server = spawn_server();
+    let client = client(server.port);
+
+    let started = Instant::now();
+    let models = client.models().await.expect("GET /v1/models");
+    let cold = started.elapsed();
+    assert!(!models.is_empty(), "no models listed from models/");
+    for info in &models {
+        assert!(info.id.name().ends_with(".gguf"), "{}", info.id);
+        assert!(!info.display_name.is_empty(), "{}", info.id);
+        assert!(info.max_input_tokens > 0, "{}: no context ceiling", info.id);
+        assert_eq!(info.max_tokens, info.max_input_tokens, "{}", info.id);
+        assert!(info.capabilities.structured_outputs == true, "{}", info.id);
+    }
+    // Same set as the ollama-shaped listing, in id order.
+    let tagged: Vec<String> = {
+        let body = http_get(server.port, "/api/tags");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let listed: Vec<String> =
+        models.iter().map(|m| m.id.name().to_string()).collect();
+    assert_eq!(listed, tagged);
+    assert!(listed.windows(2).all(|w| w[0] <= w[1]), "not sorted");
+
+    // Second listing is served from the catalog's cache. Not asserted
+    // on (a one-model CI box makes both calls fast); visible with
+    // `--nocapture`.
+    let started = Instant::now();
+    let again = client.models().await.expect("second GET /v1/models");
+    eprintln!(
+        "/v1/models: {} models, cold {cold:?}, cached {:?}",
+        again.len(),
+        started.elapsed()
+    );
+    assert_eq!(again.len(), models.len());
+
+    // Per-id route round-trips the listing entry.
+    let first = &models[0];
+    let body = http_get(server.port, &format!("/v1/models/{}", first.id));
+    let one: misanthropic::model::ModelInfo =
+        serde_json::from_str(&body).expect("ModelInfo JSON");
+    assert_eq!(one.id, first.id);
+    assert_eq!(one.display_name, first.display_name);
+    assert_eq!(one.max_input_tokens, first.max_input_tokens);
+    assert_eq!(one.created_at, first.created_at);
+
+    // Unknown id: the same envelope `/v1/messages` uses.
+    let body =
+        http_get(server.port, "/v1/models/claude-definitely-not-on-disk");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["type"], "not_found_error");
+    assert!(v["error"]["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("model not found")));
+}
+
+/// #118: a model's `<model>.load.toml` sets the context `/v1/models`
+/// advertises for it, capped at its trained window; a model without
+/// one keeps `--n-ctx`. Every entry is a symlink to `models/model.gguf`
+/// (the listing dedupes those, so each is asked for by id). Peeks
+/// only — no weights load.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires models/model.gguf"]
+fn v1_models_advertises_the_per_model_n_ctx() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    for name in ["plain", "small", "huge"] {
+        std::os::unix::fs::symlink(
+            models_dir().join("model.gguf"),
+            root.join(format!("{name}.gguf")),
+        )
+        .expect("symlink");
+    }
+    std::fs::write(root.join("small.load.toml"), "n_ctx = 2048").unwrap();
+    std::fs::write(root.join("huge.load.toml"), "n_ctx = 1073741824").unwrap();
+    let server = spawn_server_in(root);
+    let ceiling = |name: &str| {
+        let body = http_get(server.port, &format!("/v1/models/{name}"));
+        let info: misanthropic::model::ModelInfo =
+            serde_json::from_str(&body).expect("ModelInfo JSON");
+        assert_eq!(info.max_tokens, info.max_input_tokens, "{name}");
+        info.max_input_tokens
+    };
+
+    let plain = ceiling("plain.gguf");
+    assert!(plain <= drama_llama::cli::DEFAULT_N_CTX, "{plain}");
+    assert_eq!(ceiling("small.gguf"), 2048);
+    let trained = ceiling("huge.gguf");
+    assert!(trained >= plain && trained < 1 << 30, "{trained}");
 }
 
 /// Unknown model id with no `--default-model` → Anthropic-shaped 404.
@@ -189,7 +376,13 @@ async fn messages_completes_and_caches_across_requests() {
     let r1 = client.message(&chat).await.expect("request 1");
     assert_eq!(r1.model.to_string(), model);
     assert!(!r1.inner.content.to_string().trim().is_empty());
-    assert!(r1.usage.input_tokens > 0);
+    // NOT `r1.usage.input_tokens > 0`: `.cache()` marks the tail of the
+    // last (and only) message, so the breakpoint sits at the very end
+    // of the prompt and nothing is left over for `input_tokens` to
+    // report — `cache_creation_input_tokens` legitimately absorbs the
+    // whole thing on this shape. `prompt_total` is what should be
+    // nonzero.
+    assert!(prompt_total(&r1.usage) > 0);
     assert_eq!(
         r1.usage.cache_read_input_tokens,
         Some(0),
@@ -206,12 +399,92 @@ async fn messages_completes_and_caches_across_requests() {
 
     let r2 = client.message(&chat).await.expect("request 2");
     let read = r2.usage.cache_read_input_tokens.unwrap_or(0);
+    let total2 = prompt_total(&r2.usage);
     assert!(
         read > 0,
         "request 2 extends request 1's conversation; the server \
          session must reuse its prefix (cache_read={read}, \
-         input={})",
-        r2.usage.input_tokens
+         total={total2})",
     );
-    assert!(read < r2.usage.input_tokens);
+    assert!(read < total2);
+}
+
+/// `count_tokens` counts exactly what `/v1/messages` prefills: for the
+/// same body, the count equals the completion's prompt total — the sum
+/// of `cache_read_input_tokens` + `cache_creation_input_tokens` +
+/// `input_tokens`, which the wire reports disjoint (Anthropic's own
+/// split, checked live 2026-09-25): `input_tokens` alone is only the
+/// remainder after the last `cache_control` breakpoint, not the whole
+/// prompt. `/v1/messages/count_tokens` itself reports a single flat
+/// total, matching Anthropic's `count_tokens` endpoint (no cache
+/// breakdown there either). Pinned to `model.gguf` so it loads the
+/// test model rather than whichever file lists first.
+#[tokio::test]
+#[ignore = "long running, requires a GGUF in models/"]
+async fn count_tokens_matches_messages_input() {
+    let server = spawn_server();
+    let client = client(server.port);
+    let prompt = Prompt::default()
+        .model("model.gguf")
+        .max_tokens(16.try_into().unwrap())
+        .system("You are a concise assistant.")
+        .add_message((Role::User, "Name a primary color."))
+        .unwrap()
+        .cache();
+
+    let counted = client.count_tokens(&prompt).await.expect("count_tokens");
+    let response = client.message(&prompt).await.expect("messages");
+    assert!(counted > 0);
+    assert_eq!(
+        u64::from(counted),
+        prompt_total(&response.usage),
+        "usage: {:?}",
+        response.usage
+    );
+}
+
+/// A request whose input + `max_tokens` overruns the context is refused
+/// up front with Anthropic's exact 400, which clients match on: the
+/// reported number is input + `max_tokens`. The session survives, so
+/// the next request that fits completes.
+#[tokio::test]
+#[ignore = "long running, requires a GGUF in models/"]
+async fn context_overflow_is_anthropic_400() {
+    use misanthropic::client::{AnthropicError, Error};
+
+    let server = spawn_server();
+    let client = client(server.port);
+    let prompt = Prompt::default()
+        .model("model.gguf")
+        .add_message((Role::User, "Name a primary color."))
+        .unwrap();
+
+    // Load the model, so the listing reports the live context size.
+    let input = client.count_tokens(&prompt).await.expect("count_tokens");
+    let v: serde_json::Value =
+        serde_json::from_str(&http_get(server.port, "/v1/models/model.gguf"))
+            .expect("model JSON");
+    let n_ctx = v["max_input_tokens"].as_u64().expect("max_input_tokens");
+
+    let too_long = prompt
+        .clone()
+        .max_tokens(u32::try_from(n_ctx).unwrap().try_into().unwrap());
+    match client.message(&too_long).await {
+        Err(Error::Anthropic(AnthropicError::InvalidRequest { message })) => {
+            assert_eq!(
+                message,
+                format!(
+                    "prompt is too long: {} tokens > {n_ctx} maximum",
+                    input as u64 + n_ctx
+                )
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+
+    let fits = prompt.max_tokens(8.try_into().unwrap());
+    client
+        .message(&fits)
+        .await
+        .expect("a fitting request completes");
 }

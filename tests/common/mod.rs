@@ -7,6 +7,9 @@
 
 #![allow(dead_code)] // not every consumer uses every helper
 
+#[cfg(feature = "llama-cpp")]
+pub mod tip;
+
 use std::num::NonZeroU128;
 
 /// A seed for a sampling test that is *reproducible on failure*.

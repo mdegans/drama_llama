@@ -5,9 +5,11 @@
 //! (`<model>.sampling.toml`, [`SamplerConfig`]), the tool-call
 //! dialect (`<model>.dialect.toml`,
 //! [`CallSyntax`](crate::CallSyntax)), the chat template itself
-//! (`<model>.template.jinja`, raw Jinja), or the multimodal
+//! (`<model>.template.jinja`, raw Jinja), the multimodal
 //! projector (`<model>.mmproj.gguf`, [`mmproj_path`] — enables image
-//! input under the `mtmd` feature). [`crate::LlamaCppSession::from_path*`]
+//! input under the `mtmd` feature), or load-time options
+//! (`<model>.load.toml`, [`LoadSidecar`] — the KV context size and
+//! micro-batch). [`crate::LlamaCppSession::from_path*`]
 //! looks for each when loading a model. For sampling, if no sidecar
 //! exists one is written so the user has a starting point to edit —
 //! seeded from the model's own recommendation where it has one (see
@@ -71,7 +73,21 @@
 //!   ([`SamplingMode::TopP`](crate::SamplingMode::TopP),
 //!   [`SamplingMode::Mirostat`](crate::SamplingMode::Mirostat), etc.)
 //! - `repetition` — `Some(RepetitionOptions)` to enable, `None` to
-//!   disable.
+//!   disable. Its `id_patterns` name what an identifier looks like;
+//!   every match in the prompt is a *known id*, never penalized when
+//!   copied faithfully. `id_copy_lock` (default `true`, inert without
+//!   `id_patterns`) also holds a copy to its id: once eight characters
+//!   of exactly one known hex id (a UUID, not a sentinel like
+//!   `00000000-…-0001`) are written, the next tokens must continue it
+//!   until it is complete
+//!   ([`RepetitionOptions::id_copy_lock`](crate::RepetitionOptions::id_copy_lock)).
+//! - `max_tool_calls_per_turn` — the most client tool calls one turn
+//!   may make ([`SamplerConfig::max_tool_calls_per_turn`]); absent is
+//!   unlimited. The sampler ends a turn on the model's own EOG once its
+//!   last call completes ([`ToolCallCap`](crate::ToolCallCap)), and a
+//!   request's `disable_parallel_tool_use` still caps it at one. Never
+//!   seeded: a model that loops on parallel calls is found in service,
+//!   so the key is added by hand (`models/cogito-32b.sampling.toml`).
 //!
 //! Excluded:
 //! - `deferred_grammar` — runtime per-request state, `#[serde(skip)]`.
@@ -283,12 +299,13 @@ pub fn load_call_syntax(
 /// Discovery convention mirrors the other sidecars: sibling file at
 /// `<model>.template.jinja` for GGUF (`model.gguf` →
 /// `model.template.jinja`), `parent/template.jinja` for moeflux. No
-/// default is auto-written — the embedded template *is* the default;
-/// a sidecar exists to patch serving-side template bugs (e.g. the
-/// vendored `gemma4-cache-stable.jinja`, which fixes Gemma 4's
-/// re-ingest path dropping the thinking channel and breaking
-/// KV-cache byte-stability). The dialect analyzer re-runs against
-/// the override so grammar/parse/render stay in lockstep.
+/// default is auto-written — a recognized model gets its baked
+/// replacement automatically ([`crate::baked`], rung 2 of the
+/// loading ladder) and the embedded template is the fallback; a
+/// sidecar is the explicit per-install override (rung 1) for
+/// patching a template neither of those got right. The dialect
+/// analyzer re-runs against the override so grammar/parse/render
+/// stay in lockstep.
 pub fn load_template_source(
     path: &Path,
 ) -> Result<Option<String>, SidecarError> {
@@ -299,6 +316,108 @@ pub fn load_template_source(
             path: path.to_path_buf(),
             source,
         }),
+    }
+}
+
+/// Per-model load-time overrides, from a sibling `<model>.load.toml`
+/// (`model.gguf` → `model.load.toml`). A field set here beats the
+/// server-wide option of the same name (`LlamaCppOptions`, blallama's
+/// flags); an unset one inherits it. Never auto-written. llama-cpp
+/// only: moeflux sizes its context at compile time.
+///
+/// ```toml
+/// # Qwen3.8-27B-UD-Q8_K_XL.load.toml — hybrid attention keeps KV
+/// # small (~64 KiB/token), so this model can afford its trained
+/// # window while `--n-ctx` sets the context for the rest.
+/// n_ctx = 262144
+/// n_ubatch = 2048
+/// ```
+///
+/// Unknown keys are a parse error (a misspelled `n-ctx` must not
+/// silently fall back to the default). A sidecar that fails to read
+/// or parse is logged and ignored, like the other sidecars.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct LoadSidecar {
+    /// KV context size in tokens, capped at the model's trained
+    /// window (see [`effective_n_ctx`]).
+    pub n_ctx: Option<u32>,
+    /// Micro-batch size (llama.cpp's `n_ubatch`, default 512), clamped
+    /// to `n_batch`; an explicit `LlamaCppOptions::n_ubatch` wins (see
+    /// [`effective_n_ubatch`]). Bigger buys a little prefill
+    /// speed (~1–2% at 1024–4096 on Metal, flat above) for a bigger
+    /// compute buffer (325–737 MiB at 512), so it spends Metal
+    /// working-set headroom.
+    pub n_ubatch: Option<u32>,
+}
+
+/// Read a load sidecar from `path`, if it exists. Same contract as
+/// [`load_sample_options`]: `Ok(None)` when absent.
+#[cfg(feature = "toml")]
+pub fn load_load_options(
+    path: &Path,
+) -> Result<Option<LoadSidecar>, SidecarError> {
+    let bytes = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SidecarError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    toml::from_str(&bytes)
+        .map(Some)
+        .map_err(|source| SidecarError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// The KV context a model is served with: its load sidecar's `n_ctx`
+/// capped at the trained window `n_ctx_train` (`0` = unknown,
+/// uncapped), else the server-wide `default` unchanged.
+///
+/// Only the per-model value is capped. The default keeps its meaning —
+/// one size allocated for every model, advertised as
+/// `min(n_ctx, n_ctx_train)` by `Catalog` — so this changes
+/// nothing for a model without a sidecar.
+pub fn effective_n_ctx(
+    default: Option<u32>,
+    sidecar: Option<u32>,
+    n_ctx_train: u32,
+) -> Option<u32> {
+    match (sidecar, n_ctx_train) {
+        (None, _) => default,
+        (Some(n_ctx), 0) => Some(n_ctx),
+        (Some(n_ctx), train) => Some(n_ctx.min(train)),
+    }
+}
+
+/// The micro-batch a model is served with: an `explicit` option as-is
+/// (tests pin it to the ubatch grid, so a sidecar must never move it),
+/// else the load sidecar's clamped to `n_batch` (`0` is invalid and
+/// ignored), else `None` — llama.cpp's default.
+pub fn effective_n_ubatch(
+    explicit: Option<u32>,
+    sidecar: Option<u32>,
+    n_batch: u32,
+) -> Option<u32> {
+    match (explicit, sidecar) {
+        (Some(n_ubatch), _) => Some(n_ubatch),
+        (None, None | Some(0)) => None,
+        (None, Some(n_ubatch)) => Some(n_ubatch.min(n_batch.max(1))),
     }
 }
 
@@ -376,6 +495,34 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
+    /// Measured effort levels survive the TOML round-trip, and a
+    /// sidecar written before the field existed still loads (as "no
+    /// knob").
+    #[test]
+    fn call_syntax_efforts_roundtrip() {
+        let dir = tempfile_dir();
+        let path = dir.join("dialect.toml");
+
+        let syntax = crate::CallSyntax::gpt_oss();
+        assert!(!syntax.reasoning.efforts.is_empty());
+        write_call_syntax(&path, &syntax).unwrap();
+        let loaded = load_call_syntax(&path).unwrap().expect("written");
+        assert_eq!(loaded, syntax);
+
+        // An empty set is not written at all — which is exactly what an
+        // older sidecar looks like.
+        let syntax = crate::CallSyntax::qwen_xml();
+        assert!(syntax.reasoning.efforts.is_empty());
+        write_call_syntax(&path, &syntax).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("efforts"), "{body}");
+        let loaded = load_call_syntax(&path).unwrap().expect("written");
+        assert_eq!(loaded, syntax);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     /// Round-trip the default through `write_default → load`. Catches
     /// any field that can't be serialized (e.g. an `f32::NaN` slipping
     /// into a default) or any deserialize-side schema drift.
@@ -439,6 +586,56 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
+    /// The tool-call cap reads from the sidecar beside the rest of the
+    /// config; absent is no cap, and a cap of zero calls is refused
+    /// (`tool_choice: none` is how a turn makes none). It is never
+    /// written unless set, so a seeded sidecar does not gain the key.
+    #[test]
+    fn max_tool_calls_per_turn_parses() {
+        let dir = tempfile_dir();
+        let path = dir.join("sampling.toml");
+
+        std::fs::write(&path, "modes = []\nmax_tool_calls_per_turn = 3\n")
+            .unwrap();
+        let loaded = load_sample_options(&path).unwrap().expect("written");
+        assert_eq!(
+            loaded.max_tool_calls_per_turn,
+            std::num::NonZeroU32::new(3)
+        );
+        assert_eq!(loaded.tool_call_cap, None, "runtime wiring only");
+
+        std::fs::write(&path, "modes = []\n").unwrap();
+        let loaded = load_sample_options(&path).unwrap().expect("written");
+        assert_eq!(loaded.max_tool_calls_per_turn, None);
+
+        std::fs::write(&path, "modes = []\nmax_tool_calls_per_turn = 0\n")
+            .unwrap();
+        assert!(matches!(
+            load_sample_options(&path),
+            Err(SidecarError::Parse { .. })
+        ));
+
+        write_sample_options(&path, &SamplerConfig::default(), false).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("max_tool_calls_per_turn"), "{raw}");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The tracked sidecar cogito serves with caps its calls: it escalated
+    /// parallel calls into loops that ran to `max_tokens` (2026-10-04).
+    #[test]
+    fn cogito_sidecar_caps_tool_calls() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("models/cogito-32b.sampling.toml");
+        let loaded = load_sample_options(&path).unwrap().expect("tracked");
+        assert_eq!(
+            loaded.max_tool_calls_per_turn,
+            std::num::NonZeroU32::new(3)
+        );
+    }
+
     /// Malformed TOML reports a Parse error tagged with the path.
     #[test]
     fn malformed_toml_reports_parse_error() {
@@ -456,6 +653,109 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The load sidecar the docs show parses; absent is `Ok(None)`, an
+    /// empty file sets nothing, and a misspelled key is an error rather
+    /// than a silent fall back to the default.
+    #[test]
+    fn load_sidecar_parses() {
+        let dir = tempfile_dir();
+        let path = dir.join("model.load.toml");
+        assert!(load_load_options(&path).unwrap().is_none());
+
+        std::fs::write(&path, "# Qwen3.8\nn_ctx = 262144\n").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar.n_ctx, Some(262144));
+        assert_eq!(sidecar.n_ubatch, None);
+
+        std::fs::write(&path, "n_ctx = 131072\nn_ubatch = 2048\n").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar.n_ctx, Some(131072));
+        assert_eq!(sidecar.n_ubatch, Some(2048));
+
+        std::fs::write(&path, "n_ubatch = 1024").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!((sidecar.n_ctx, sidecar.n_ubatch), (None, Some(1024)));
+
+        std::fs::write(&path, "").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar, LoadSidecar::default());
+
+        for bad in [
+            "n-ctx = 262144",
+            "n_ctx = -1",
+            "n_ctx = \"256k\"",
+            "n-ubatch = 2048",
+            "n_ubatch = -1",
+            "n_ubatch = \"2k\"",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                matches!(
+                    load_load_options(&path),
+                    Err(SidecarError::Parse { .. })
+                ),
+                "{bad}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Precedence and capping, with the fleet's numbers: a sidecar
+    /// beats the server-wide default in either direction, is capped at
+    /// the trained window, and is taken as-is when that is unknown; no
+    /// sidecar leaves the default untouched, even past the window.
+    #[test]
+    fn effective_n_ctx_precedence_and_cap() {
+        const DEFAULT: Option<u32> = Some(131072);
+        // Qwen3.8: raised to its trained window.
+        assert_eq!(
+            effective_n_ctx(DEFAULT, Some(262144), 262144),
+            Some(262144)
+        );
+        // Past the window (1M wants rope scaling): capped.
+        assert_eq!(
+            effective_n_ctx(DEFAULT, Some(1 << 20), 262144),
+            Some(262144)
+        );
+        // Mistral Small 4: lowered below the default.
+        assert_eq!(effective_n_ctx(DEFAULT, Some(65536), 1 << 20), Some(65536));
+        // Trained window unknown: the sidecar stands.
+        assert_eq!(effective_n_ctx(DEFAULT, Some(1 << 20), 0), Some(1 << 20));
+        // No sidecar: the default, uncapped (the advertisement caps it).
+        assert_eq!(effective_n_ctx(DEFAULT, None, 40960), DEFAULT);
+        assert_eq!(effective_n_ctx(None, None, 40960), None);
+        // A sidecar works without any default (llama.cpp's 512).
+        assert_eq!(effective_n_ctx(None, Some(8192), 40960), Some(8192));
+    }
+
+    /// An explicit option beats the sidecar, which beats llama.cpp's
+    /// default; the sidecar's value is clamped to `n_batch` and `0`
+    /// is ignored. blallama sets `n_batch = n_ctx`.
+    #[test]
+    fn effective_n_ubatch_precedence_and_clamp() {
+        const N_BATCH: u32 = 131072;
+        // Sidecar over the default.
+        assert_eq!(effective_n_ubatch(None, Some(2048), N_BATCH), Some(2048));
+        assert_eq!(effective_n_ubatch(None, None, N_BATCH), None);
+        // An explicit option (the #126 grid pin) beats the sidecar,
+        // either way, and is never clamped here.
+        assert_eq!(effective_n_ubatch(Some(31), Some(2048), N_BATCH), Some(31));
+        assert_eq!(
+            effective_n_ubatch(Some(4096), Some(512), N_BATCH),
+            Some(4096)
+        );
+        assert_eq!(effective_n_ubatch(Some(64), None, 32), Some(64));
+        // Clamped to n_batch.
+        assert_eq!(effective_n_ubatch(None, Some(4096), 1024), Some(1024));
+        assert_eq!(effective_n_ubatch(None, Some(1024), 1024), Some(1024));
+        // Invalid: ignored, so the default stands.
+        assert_eq!(effective_n_ubatch(None, Some(0), N_BATCH), None);
+        // A degenerate n_batch still yields a valid micro-batch.
+        assert_eq!(effective_n_ubatch(None, Some(2048), 0), Some(1));
     }
 
     /// Test-local tempfile dir that doesn't depend on the `tempfile`

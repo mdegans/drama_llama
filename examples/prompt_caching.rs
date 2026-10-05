@@ -96,13 +96,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let elapsed = start.elapsed();
         println!("{message}");
 
-        // On turn one, `cache read` is zero and the whole embedded-docs
-        // prefix is prefilled; on later turns the shared prefix shows up as
-        // `cache read` and the turn returns far sooner.
+        // The only `cache_control` breakpoint in play is the one set
+        // above, right after the system prompt, and it never moves. So
+        // on turn one, `cache read` is zero and the whole embedded-docs
+        // prefix shows up as `cache write` (`cache_creation_input_tokens`)
+        // instead; on later turns that same prefix shows up as `cache
+        // read` and the turn returns far sooner. `input` is whatever
+        // comes after that one breakpoint — the growing Q&A history,
+        // never split out further since nothing re-marks it.
         let usage = &message.usage;
         println!(
-            "\n(input: {} | cache read: {} | output: {} | {:.1}s)",
+            "\n(input: {} | cache write: {} | cache read: {} | output: {} | {:.1}s)",
             usage.input_tokens,
+            usage.cache_creation_input_tokens.unwrap_or(0),
             usage.cache_read_input_tokens.unwrap_or(0),
             usage.output_tokens,
             elapsed.as_secs_f32(),

@@ -9,15 +9,16 @@
 //!
 //! With this PR's hash side-table, round 2's `partial_text` for the
 //! conversation prefix matches the auto-tip hash drama_llama saved at
-//! the end of round 1's generation, so cache_read jumps to ≈
-//! input_tokens for the round-2 prefill regardless of any
-//! BPE-whitespace drift in the assistant block.
+//! the end of round 1's generation, so cache_read jumps to ≈ round 1's
+//! total prompt size (`cache_read_input_tokens` +
+//! `cache_creation_input_tokens` + `input_tokens` — the three are
+//! disjoint) for the round-2 prefill regardless of any BPE-whitespace
+//! drift in the assistant block.
 //!
-//! Requires a real model. Set `DRAMA_LLAMA_COGITO_MODEL` to a cogito-
-//! style GGUF for the most direct repro of the original bug; falls
-//! back to `models/model.gguf` (any tool-using chat model works for
-//! the hash-side-table mechanic — cogito is just where the whitespace
-//! divergence is most pronounced).
+//! Requires a **cogito-family** model: `DRAMA_LLAMA_COGITO_MODEL`, or
+//! `models/cogito-32b.gguf`. Skips loudly when absent — it must NOT
+//! fall back to `models/model.gguf`. See `model_path` for the incident
+//! that motivated this.
 //!
 //! Ignored by default: `cargo test --test hash_cache_smoke -- --ignored`.
 
@@ -29,14 +30,43 @@ use drama_llama::{
     prompt::ToolResult, Block, Content, FromPath, Message, Prompt,
     RenderOptions, Role, Tool,
 };
-use misanthropic::prompt::message::CacheControl;
+use misanthropic::{prompt::message::CacheControl, response::TokenCounts};
 use serde_json::json;
 
-fn model_path() -> PathBuf {
+/// A [`misanthropic::response::Usage`]'s prompt total: the sum of its
+/// three disjoint input counters (`cache_read_input_tokens` +
+/// `cache_creation_input_tokens` + `input_tokens`). `input_tokens`
+/// alone is only the tail after the last `cache_control` breakpoint,
+/// not the whole prompt — see `Session::last_usage`'s doc.
+fn prompt_total(u: &TokenCounts) -> u64 {
+    u.cache_read_input_tokens.unwrap_or(0)
+        + u.cache_creation_input_tokens.unwrap_or(0)
+        + u.input_tokens
+}
+
+/// The cogito-family model this suite needs, or `None` to skip.
+///
+/// **Deliberately does not fall back to `models/model.gguf`.** It used
+/// to, and that made this test actively misleading: the assertion below
+/// was failing for cogito while passing in CI, because the runner's
+/// `model.gguf` is a Qwen, which renders tool calls as
+/// `<parameter=…>` tags — no JSON envelope, so nothing to disagree
+/// about, so the bug this test exists to catch cannot occur there. A
+/// model-backed test that silently substitutes a different model is
+/// coverage of whichever model the runner happens to hold.
+///
+/// Cogito does not fit the CI box's 3090, so skipping is the intended
+/// outcome there; the dialect-level invariant is covered without
+/// weights by `canonical_call_grammar_admits_render_reference` and
+/// friends, which run in the fast tier.
+fn model_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("DRAMA_LLAMA_COGITO_MODEL") {
-        return PathBuf::from(p);
+        let p = PathBuf::from(p);
+        return p.exists().then_some(p);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
+    let conventional = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models/cogito-32b.gguf");
+    conventional.exists().then_some(conventional)
 }
 
 /// Build the round-1 prompt: a tool, a system prompt, and a user
@@ -116,16 +146,21 @@ fn mark_last_block(content: &mut Content) {
     }
 }
 
-#[test]
-#[ignore = "requires model; sets DRAMA_LLAMA_COGITO_MODEL or models/model.gguf"]
-fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
-    // `preserve_thinking` keeps prior-turn reasoning in re-renders.
-    // Without it, think-stripping templates (Qwen3.5/3.6) render round
-    // 2's transcript with different bytes than round 1 generated, the
-    // transcripts genuinely diverge at the assistant turn, and the
-    // auto-tip correctly cannot fire — reuse stops at the divergence.
-    // Byte-stable rendering is the contract the tip mechanic needs.
-    let mut session = drama_llama::LlamaCppSession::from_path(model_path())
+/// The tip/hash mechanic across a tool-call round trip, on whatever
+/// model is given. Both tests below are this body — see them for what
+/// each one is actually claiming.
+///
+/// `preserve_thinking` keeps prior-turn reasoning in re-renders.
+/// Without it, think-stripping templates (Qwen3.5/3.6) render round
+/// 2's transcript with different bytes than round 1 generated, the
+/// transcripts genuinely diverge at the assistant turn, and the
+/// auto-tip correctly cannot fire — reuse stops at the divergence.
+/// Byte-stable rendering is the contract the tip mechanic needs.
+fn assert_tip_survives_tool_round_trip(
+    model: PathBuf,
+    expected_spacing: Option<drama_llama::JsonSpacing>,
+) {
+    let mut session = drama_llama::LlamaCppSession::from_path(model)
         .expect("model loads")
         .quiet()
         .with_render_opts(
@@ -135,6 +170,20 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
         )
         .with_prefix_cache(true);
 
+    // Rung-2 witness: the caller knows which template tier this model
+    // should land on, and the analyzed spacing discriminates them —
+    // the tip surviving alone does not, because stock and baked
+    // templates are BOTH round-trip stable post-#85. `Spaced` here can
+    // only mean the baked replacement is actually the active template.
+    if let Some(expected) = expected_spacing {
+        assert_eq!(
+            session.dialect().arguments.json_spacing,
+            expected,
+            "active template's measured spacing is not the expected \
+             tier's — did the baked replacement (rung 2) apply?"
+        );
+    }
+
     let (round1_prompt, _tool) = build_round1();
 
     // Round 1: complete and capture the assistant's first tool_use
@@ -143,11 +192,11 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
     let round1_resp = session
         .complete_response(&round1_prompt)
         .expect("round 1 completes");
-    let round1_input_tokens = round1_resp.usage.input_tokens;
+    let round1_total = prompt_total(&round1_resp.usage);
     let round1_cache_read = round1_resp.usage.cache_read_input_tokens;
     eprintln!(
-        "round 1: input_tokens={}, cache_read={}",
-        round1_input_tokens,
+        "round 1: prompt_total={}, cache_read={}",
+        round1_total,
         round1_cache_read.unwrap_or(0),
     );
 
@@ -185,32 +234,32 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
     let round2_resp = session
         .complete_response(&round2_prompt)
         .expect("round 2 completes");
-    let round2_input_tokens = round2_resp.usage.input_tokens;
+    let round2_total = prompt_total(&round2_resp.usage);
     let round2_cache_read =
         round2_resp.usage.cache_read_input_tokens.unwrap_or(0);
     eprintln!(
-        "round 2: input_tokens={}, cache_read={}",
-        round2_input_tokens, round2_cache_read,
+        "round 2: prompt_total={}, cache_read={}",
+        round2_total, round2_cache_read,
     );
 
     // The minimal floor: round 2 must cache-read at least the
     // round-1 input prefix (the first cache_control marker's
     // breakpoint). That's already true today via the breakpoint
     // path. The interesting assertion: cache_read should reach the
-    // auto-tip — i.e., should exceed round-1's *full* input length
+    // auto-tip — i.e., should exceed round-1's *full* prompt size
     // (system + tools + first_user_msg + assistant + tool_result),
     // capturing the assistant content as well. We pick a permissive
-    // threshold (round-1 input + 50% of round-1 generation tokens,
-    // floored at round-1 input + 1) so the test passes whenever the
+    // threshold (round-1 total + 50% of round-1 generation tokens,
+    // floored at round-1 total + 1) so the test passes whenever the
     // tip mechanism is live, even with single-token BPE drift.
     let round1_gen = round1_resp.usage.output_tokens;
-    let tip_floor = (round1_input_tokens + (round1_gen / 2).max(1))
-        .max(round1_input_tokens + 1);
+    let tip_floor =
+        (round1_total + (round1_gen / 2).max(1)).max(round1_total + 1);
     assert!(
         round2_cache_read >= tip_floor,
         "round 2 cache_read ({round2_cache_read}) should reach the auto-tip ({tip_floor}); \
          hash-keyed reuse appears not to be firing. \
-         (input_tokens={round2_input_tokens}, round1_input={round1_input_tokens}, \
+         (prompt_total={round2_total}, round1_total={round1_total}, \
          round1_gen={round1_gen})",
     );
 
@@ -229,5 +278,55 @@ fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
     assert!(
         !round2_resp.inner.content.0.is_empty(),
         "round 2 returned an empty content array",
+    );
+}
+
+/// The mechanic, on whatever `models/model.gguf` is — a Qwen on the CI
+/// box. Model-agnostic: it proves the auto-tip and hash side-table work
+/// across a tool-call round trip at all.
+///
+/// It does **not** prove #85 is fixed. Qwen renders tool calls as
+/// `<parameter=…>` tags with no JSON envelope, so the whitespace
+/// divergence that bug is about cannot occur here. This test passed
+/// throughout the entire period #85 was broken.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip() {
+    let default =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+    // No spacing expectation: which template tier fires depends on
+    // whatever model.gguf points at.
+    assert_tip_survives_tool_round_trip(default, None);
+}
+
+/// The same mechanic on a cogito-family model — a `JsonNative` dialect
+/// with a JSON argument envelope, which is where the canonical-JSON
+/// invariant actually gets tested. Under the baked
+/// `cogito-cache-stable` template (#88 phase 2) the canonical interior
+/// is the model's measured `Spaced` habit; the assertion below
+/// witnesses that rung 2 actually fired.
+///
+/// Skips when no such model is present; cogito does not fit the CI
+/// box's 3090. The dialect-level invariant is covered without weights
+/// by `canonical_call_grammar_admits_render_reference` and friends in
+/// the fast tier, so this skipping is not a coverage hole — it is the
+/// end-to-end confirmation, not the guard.
+#[test]
+#[ignore = "long running, requires a cogito-family model"]
+fn hash_keyed_prefix_reuse_carries_across_tool_use_round_trip_cogito() {
+    let Some(model) = model_path() else {
+        eprintln!(
+            "SKIP ..._cogito: no cogito-family model. Set \
+             DRAMA_LLAMA_COGITO_MODEL or place models/cogito-32b.gguf."
+        );
+        return;
+    };
+    // `Spaced` doubles as the rung-2 witness: cogito's stock template
+    // measures Compact, so this only holds when the baked
+    // `cogito-cache-stable` replacement is the active template (#88
+    // phase 2).
+    assert_tip_survives_tool_round_trip(
+        model,
+        Some(drama_llama::JsonSpacing::Spaced),
     );
 }

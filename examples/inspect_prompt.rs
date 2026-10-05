@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  msg {i:2} {role:9} tokens [{cursor:5}..{end:5}) ({} tok) {preview}",
             end - cursor,
         );
-        if role == "assistant" {
+        if msg.role.as_lowercase() == "assistant" {
             // For asst messages: print first 5 + last 5 token ids of the
             // message body. Useful for diff'ing the same message across
             // two consecutive prompt logs to spot re-render shifts.

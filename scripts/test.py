@@ -76,7 +76,11 @@ MOEFLUX_MODELS: dict[str, str] = {
 # are legal in every configuration. `cli` and `axum` belong here as of
 # #68 — both used to imply `llama-cpp`, which made a moeflux-only
 # front-end impossible to build even though the library supported it.
-AGNOSTIC = ["toml", "serde", "stats", "json-schema", "egui"]
+# `agora-agentkit` is the implicit optional-dependency feature gating
+# the `soul_forge` example (its `Soul` source of truth). Backend-blind,
+# so it rides with the agnostic group — otherwise no configuration
+# would ever compile the example and it could rot silently.
+AGNOSTIC = ["toml", "serde", "stats", "json-schema", "egui", "agora-agentkit"]
 
 # `webchat` and `mtmd` name concrete llama.cpp types, so they are not
 # agnostic and never appear in a moeflux-only set. `mtmd` implies
@@ -299,6 +303,14 @@ def run_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        # A test's output is not guaranteed to be valid UTF-8, and the
+        # runner must never be the thing that fails. llama.cpp's model
+        # loader dumps `tokenizer.ggml.tokens`, and a byte-level BPE
+        # vocab (pixtral/gpt2 — Mistral Small 4 is the case that found
+        # this) contains lone continuation bytes. Strict decoding
+        # raised UnicodeDecodeError out of the read loop and killed the
+        # whole run before a single test executed.
+        errors="replace",
         bufsize=1,
     ) as proc, (
         open(log, "w", encoding="utf-8") if log else _NullWriter()
@@ -366,8 +378,11 @@ def warn_slow_variant(config: Config, tier: str, model: str) -> None:
         )
 
 
-def filterset(include: str | None, exclude: list[str]) -> str:
-    """The nextest filterset for one include substring and N excludes.
+def filterset(
+    include: str | None, exclude: list[str], binary: str | None = None
+) -> str:
+    """The nextest filterset for one include substring and N excludes,
+    within the test binaries named like `binary` when one is given.
 
     A substring is matched against test AND binary names, because the
     thing a caller names may be either — `session_gemma4` is a binary,
@@ -382,16 +397,46 @@ def filterset(include: str | None, exclude: list[str]) -> str:
     exactly the silent coverage loss #68 exists to prevent, whereas an
     excluded one shows up in nextest's own "N tests run, M skipped" line
     and in the printed command.
+
+    With `binary`, `include` narrows the tests *inside* it (test names
+    only): `just test swa_checkpoint hybrid_` is the swa_checkpoint
+    suite's hybrid tests, where matching `hybrid_` against binary names
+    too would be no narrowing at all.
     """
-    expr = (
-        f"test(~{include}) + binary(~{include})" if include else "all()"
-    )
+    if binary:
+        expr = f"binary(~{binary})"
+        if include:
+            expr += f" & test(~{include})"
+    elif include:
+        expr = either(include)
+    else:
+        expr = "all()"
     if exclude:
-        dropped = " + ".join(
-            f"test(~{name}) + binary(~{name})" for name in exclude
-        )
+        dropped = " + ".join(either(name) for name in exclude)
         expr = f"({expr}) - ({dropped})"
     return expr
+
+
+def either(name: str) -> str:
+    """`name` as a test OR binary substring. nextest rejects a
+    `binary()` that matches no binary ("operator didn't match any binary
+    names"), so that term is only added when some binary could match."""
+    if any(name in b for b in binary_names()):
+        return f"test(~{name}) + binary(~{name})"
+    return f"test(~{name})"
+
+
+def binary_names() -> list[str]:
+    """Names nextest gives this crate's test binaries: the lib, each
+    `tests/*.rs`, and each `[[bin]]`."""
+    import tomllib
+
+    manifest = tomllib.loads((REPO / "Cargo.toml").read_text())
+    return [
+        manifest["package"]["name"],
+        *(p.stem for p in (REPO / "tests").glob("*.rs")),
+        *(b["name"] for b in manifest.get("bin", [])),
+    ]
 
 
 def selection(
@@ -404,19 +449,24 @@ def selection(
     returned rather than rendered because its profile has to travel
     differently for each; see `Tier`.
     """
-    if args.filter:
+    binary = getattr(args, "binary", None)
+    if args.filter or binary:
         # A named test is asked for by name, so run it whichever list it
         # is on rather than making the caller remember — and uncaptured,
         # so the suites' block/emission dumps are visible on a pass and
-        # not only on a failure.
-        tier, extra = TIERS["all"], ["--no-capture"]
-        name = f"{config.name}-{sanitize(args.filter)}"
+        # not only on a failure. An explicit `--tier` still wins: a
+        # substring can match model tests the caller did not mean to
+        # load (e.g. while another model job holds the GPU).
+        tier = TIERS[effective_tier(args)]
+        extra = ["--no-capture"]
+        named = "-".join(n for n in (binary, args.filter) if n)
+        name = f"{config.name}-{sanitize(named)}"
     else:
-        tier, extra = TIERS[args.tier], []
-        name = f"{config.name}-{args.tier}"
+        tier, extra = TIERS[effective_tier(args)], []
+        name = f"{config.name}-{effective_tier(args)}"
 
-    if args.filter or args.exclude:
-        extra += ["-E", filterset(args.filter, args.exclude)]
+    if args.filter or args.exclude or binary:
+        extra += ["-E", filterset(args.filter, args.exclude, binary)]
 
     return tier, extra, name
 
@@ -466,14 +516,20 @@ def preflight_gpu(features: list[str]) -> int:
     return 0
 
 
+def effective_tier(args: argparse.Namespace) -> str:
+    """`--tier` if given; else `all` under `--filter`, `unignored` without."""
+    if args.tier is not None:
+        return args.tier
+    named = args.filter or getattr(args, "binary", None)
+    return "all" if named else "unignored"
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not DRY_RUN:
         require_nextest()
     config = resolve_config(args.config)
     # `--filter` implies the `all` tier, so it warns too.
-    warn_slow_variant(
-        config, "all" if args.filter else args.tier, args.moeflux_model
-    )
+    warn_slow_variant(config, effective_tier(args), args.moeflux_model)
     features = config.feature_list(args.moeflux_model)
     if not DRY_RUN:
         rc = preflight_gpu(features)
@@ -601,9 +657,7 @@ def cmd_coverage(args: argparse.Namespace) -> int:
         if args.doctests:
             require_nightly()
     config = resolve_config(args.config)
-    warn_slow_variant(
-        config, "all" if args.filter else args.tier, args.moeflux_model
-    )
+    warn_slow_variant(config, effective_tier(args), args.moeflux_model)
     features = config.feature_list(args.moeflux_model)
     tier, extra, name = selection(config, args)
     name = f"coverage-{name}"
@@ -1127,16 +1181,23 @@ def main() -> int:
     p_run.add_argument(
         "-t",
         "--tier",
-        default="unignored",
+        default=None,
         choices=list(TIERS),
-        help="which tests (default: %(default)s). `ignored` is the "
-        "model-loading set; `all` is genuinely everything",
+        help="which tests (default: unignored, or all under --filter). "
+        "`ignored` is the model-loading set; `all` is genuinely everything",
     )
     p_run.add_argument(
         "-f",
         "--filter",
         help="substring matched against test AND binary names; implies "
-        "the `all` tier and uncaptured output",
+        "the `all` tier (unless --tier is given) and uncaptured output",
+    )
+    p_run.add_argument(
+        "-b",
+        "--binary",
+        help="only the test binaries whose name contains this; --filter "
+        "then narrows by test name alone. Implies the `all` tier (unless "
+        "--tier is given) and uncaptured output, like --filter",
     )
     p_run.add_argument(
         "-x",

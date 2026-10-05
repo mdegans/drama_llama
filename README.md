@@ -2,9 +2,9 @@
 
 <img src="https://raw.githubusercontent.com/mdegans/drama_llama/main/logo.svg" alt="llama with drama mask logo" width="240">
 
-[![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml)
+[![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml?query=branch%3Amain)
 [![codecov](https://codecov.io/gh/mdegans/drama_llama/graph/badge.svg)](https://codecov.io/gh/mdegans/drama_llama)
-[![tests](https://img.shields.io/badge/tests-605-blue)](#testing)
+[![tests](https://img.shields.io/badge/tests-1172-blue)](#testing)
 [![license](https://img.shields.io/badge/license-RAIL--S-lightgrey)](https://github.com/mdegans/drama_llama/blob/main/LICENSE.md)
 
 `drama_llama` runs language models on your own hardware behind an API shaped
@@ -124,6 +124,24 @@ assert!(!state.accepts_bytes(br#"{"ok": maybe"#));
 
 [GBNF]: https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md
 
+## Installing
+
+```toml
+[dependencies]
+drama_llama = "0.9"
+```
+
+The default feature is `llama-cpp`, which builds llama.cpp from source through
+[`llama-cpp-sys-3`] (CMake, a C++ toolchain and libclang required). Add
+features as you need them: `json-schema` for typed structured output, `tokio`
+for the async transport, `cuda` on NVIDIA. The minimum supported Rust is 1.97.
+
+To run the server instead of linking the library:
+
+```sh
+cargo install drama_llama --bin blallama --features "axum,cli,toml"
+```
+
 ## The layers
 
 You can enter at whichever level you need. Each is a thin, public wrapper over
@@ -143,17 +161,17 @@ the one below it.
 | | Feature flag | |
 |---|---|---|
 | **Structured output** | `json-schema` | A `schemars`-derived type becomes a sampling grammar. Optional `<think>…</think>` preamble, phase-split so the thought runs unconstrained at full speed. |
-| **Tool calling** | *(always on)* | Per-model dialects derived by analyzing each model's own chat template, driving both the grammar emitter and the response parser. `ToolChoice::method` is *guaranteed* locally, not requested. Validated for Qwen 3.5/3.6, Gemma 4, gpt-oss (Harmony). |
+| **Tool calling** | *(always on)* | Per-model dialects derived by analyzing each model's own chat template, driving both the grammar emitter and the response parser. `ToolChoice::method` is *guaranteed* locally, not requested. Parallel calls, with an optional per-turn cap. Validated for the [supported models](#supported-models). |
 | **GBNF grammars** | *(always on)* | Pure-Rust parser, matcher and lazy-DFA cache. Sampling checks the one sampled token first and only falls back to an O(vocab) mask on rejection. |
-| **Prefix caching** | *(always on, opt-in at runtime)* | Multi-slot, breakpoint-driven, LRU with TTL. Honors Anthropic `cache_control` ephemeral markers. One slot per agent, so an N-agent workload caches N prefixes instead of thrashing one. |
-| **Chat templates** | *(always on)* | The model's own Jinja `tokenizer.chat_template`, rendered by `minijinja`. No per-model prompt formats hardcoded here. |
+| **Prefix caching** | *(always on, opt-in at runtime)* | Multi-slot, breakpoint-driven, LRU with TTL. Honors Anthropic `cache_control` markers, including request-level automatic caching, with Anthropic's 400s for invalid ones. One slot per agent, so an N-agent workload caches N prefixes instead of thrashing one. Sliding-window (gpt-oss, Gemma 4) and hybrid (Qwen3.6/3.8) models restore from checkpoints under a host-RAM budget. Every reuse decision is logged. |
+| **Chat templates** | *(always on)* | Rendered by `minijinja`. A template sidecar wins; otherwise a model whose embedded template we validated gets a *baked*, cache-stable replacement shipped in the crate (see [supported models](#supported-models)); anything else uses its own `tokenizer.chat_template`, with a warning. Prompt content that spells a special token is read as text, not as the token. |
 | **Images** | `media`, `mtmd` | `media` is pure Rust (decode via the `image` crate, never `mtmd`'s bundled `stb_image`); `mtmd` adds llama.cpp's multimodal backend. Images render out-of-band through a per-call random sentinel — the projector never sees prompt text. |
 | **Sampling** | *(always on)* | Greedy, temperature, top-k, top-p, min-p, tail-free, locally typical, Mirostat v1/v2, plus `SplitP`/`SplitL`/`Deny` which have no llama.cpp counterpart. Chained: each mode narrows the candidate set. |
-| **Repetition penalties** | *(always on)* | N-gram based, windowed and decaying, with category exclusions so common English or JSON punctuation isn't penalized. Region-aware inside grammar free-text spans. |
-| **HTTP server** | `axum` | `blallama` — an Anthropic-compatible `/v1/messages` server over a local model, with an SSE `/probe` channel. |
+| **Repetition penalties** | *(always on)* | N-gram based, windowed and decaying, seeded from the conversation's history. Category exclusions (`English`, `Json`, `Markdown`, `Numbers`, `Punctuation`) keep common words, syntax, code fences and numbers unpenalized; a known-id exemption spares faithful copies of ids from the prompt. Region-aware inside grammar free-text spans. |
+| **HTTP server** | `axum` | `blallama` — an Anthropic-compatible `/v1/messages`, `/v1/messages/count_tokens` and `/v1/models` server over a directory of local models, with Anthropic's error types and an SSE `/probe` channel. See [Running `blallama`](#running-blallama). |
 | **Accelerators** | `cuda`, `cuda_f16` | Metal is automatic on macOS. |
 | **Async** | `tokio` | `SessionTransport`, `FromPath::from_path_async`. |
-| **Sidecars** | `toml` | Per-model `sampling.toml` / `dialect.toml` / template files beside the GGUF. |
+| **Sidecars** | `toml` | Per-model `sampling.toml`, `load.toml`, `dialect.toml`, template and `mmproj` files beside the GGUF. See [Sidecar files](#sidecar-files). |
 
 ### Backends
 
@@ -172,9 +190,39 @@ backend when exactly one exists.
 
 [`llama-cpp-sys-3`]: https://github.com/mdegans/llama-cpp-sys
 
+## Supported models
+
+Any GGUF llama.cpp loads will run, and its tool-call dialect is derived from
+its own chat template. The models below are supported first-class: the crate
+ships a *baked* replacement for each one's chat template, chosen when the
+model's embedded template is byte-for-byte the one we validated. A baked
+template re-renders what the model wrote byte for byte, which is what lets the
+prefix cache continue a conversation instead of re-reading it. Each has its own
+model-backed test suite.
+
+| Model | Baked template | Tool calls | Reasoning |
+|---|---|---|---|
+| Qwen3.6 (35B-A3B) | `qwen3.6-cache-stable` | XML `<tool_call>` | `<think>`, inline |
+| Qwen3.8 (27B) | `qwen3.8-cache-stable` | XML `<tool_call>` | `<think>`, as `reasoning_content` |
+| Gemma 4 (31B IT) | `gemma4-cache-stable` | `<\|tool_call>` | thinking channel |
+| gpt-oss (20b, 120b) | `gptoss-cache-stable`, `gptoss-upstream-cache-stable` | Harmony | analysis channel |
+| Mistral Small 4 (119B) | `mistral4-cache-stable` | `[TOOL_CALLS]name[ARGS]` | `[THINK]` |
+| cogito (14B, 32B) | `cogito-cache-stable` | Hermes JSON `<tool_call>` | `<think>` when `thinking` is on |
+
+gpt-oss has two detection keys: the Unsloth-patched template and the upstream
+OpenAI one. Qwen3.6, Qwen3.8, Gemma 4 and Mistral Small 4 accept images with
+an `mmproj` sidecar under the `mtmd` feature. A model whose template we do not
+recognize falls back to its embedded template with a warning; one that is
+*almost* a baked one is named in the log, so a re-quant that touched its
+template is easy to spot. A `<model>.template.jinja` sidecar always wins, and a
+sidecar that is a copy of an older bake is warned about at load. The templates
+and what each one fixes are documented in [`templates/README.md`].
+
+[`templates/README.md`]: https://github.com/mdegans/drama_llama/blob/main/templates/README.md
+
 ## Examples
 
-Eighteen of them in [`examples/`]. Each carries a module doc explaining not
+Twenty-three of them in [`examples/`]. Each carries a module doc explaining not
 just what it does but why it is shaped that way. The ones worth reading first:
 
 | Example | |
@@ -205,10 +253,125 @@ sampler-settings editor).
 
 [memorized content]: https://github.com/mdegans/drama_llama/blob/main/bin/regurgitater/README.md
 
+### Running `blallama`
+
+Run `blallama` under a supervisor. It exits on purpose when it can no longer
+trust its own process — code **70** after a panic on any thread, **75** after a
+backend failure llama.cpp does not recover from in-process (a failed
+`llama_decode`, a Metal context left in error state by an out-of-memory
+command buffer, a model load that fails after the backend began allocating —
+out of memory loading the weights or the KV cache) — rather than unwind through
+llama.cpp state or keep serving a wedged backend. A load that fails before
+anything is allocated (a missing file, an unsupported architecture, a bad
+template) is answered with an error, and the server serves on. Before it goes it logs one `ERROR` line (`"event":"fatal"`,
+with the `kind`, `exit_code` and `cause`) and answers the requests in flight
+with a 500 `api_error`, which Anthropic's SDKs retry. launchd, systemd
+(`Restart=on-failure`) or the restart loop in
+[`scripts/blallama-supervise.sh`] all do; the script keeps the arguments, backs
+off when it crash-loops, and logs each restart:
+
+```sh
+BLALLAMA=target/release/blallama scripts/blallama-supervise.sh models/ --port 11435
+```
+
+A clean exit (SIGTERM or Ctrl-C drains in-flight work, code 0) is not
+restarted.
+
+[`scripts/blallama-supervise.sh`]: https://github.com/mdegans/drama_llama/blob/main/scripts/blallama-supervise.sh
+
+`blallama` serves every model in one directory: each `.gguf` (projector files
+aside) is a model whose API id is its file name, `.gguf` included. One model is
+loaded at a time, and a request naming another swaps it in. Requests are served
+one at a time; one that arrives while another is generating gets a 529
+`overloaded_error`, which Anthropic's SDKs retry.
+
+```sh
+cargo run --release --bin blallama --features "axum,cli,toml" -- models/ \
+    --n-ctx 131072 --cache-slots 4
+```
+
+Point any Anthropic client at `http://127.0.0.1:11435`. It answers
+`POST /v1/messages` (streaming or not), `POST /v1/messages/count_tokens`,
+`GET /v1/models` and `GET /v1/models/{id}`, with Anthropic's error envelope and
+status codes: a request that will fail the same way again is a 400
+`invalid_request_error`, a transient failure a 500 `api_error` that the SDKs
+retry. A prompt plus `max_tokens` that would not fit the context is refused up
+front with Anthropic's `prompt is too long` 400. A turn that breaks its grammar
+or schema, or loops on identical tool calls, is redrawn on the warm cache
+before an error is returned.
+
+| Flag | Default | |
+|---|---|---|
+| `--port` | 11435 | Port to listen on. |
+| `--n-ctx` | 32768 | Context length for every model; a `load.toml` sidecar can set a model's own. |
+| `--cache-slots` | 1 | KV sequences over one cell pool: one cached prefix per concurrent agent. |
+| `--swa-full` | off | Size sliding-window layers' KV at the full context instead of the window. |
+| `--checkpoint-mib` / `--checkpoint-slot-mib` | 8192 / 4096 | Host RAM the prefix-cache checkpoints may hold, in all and per slot. |
+| `--default-model` | none | Serve this model when a request names one that isn't on disk (e.g. a `claude-*` id). |
+| `--seed` | fresh | Fixed RNG seed for every request: same prompt, same output. |
+| `--no-penalty` | off | Turn the repetition penalty off whatever the sidecar says. |
+| `--record-json` / `--probe-stream` | off | Per-token probe records to a JSONL file / an SSE `GET /probe` channel. |
+| `--schema-max-*` | see `--help` | Limits on a request's tool and `output_config` schemas, checked before compiling; past one is a 400. |
+| `--backend` | `llama-cpp` | `moeflux` in a build with that feature, serving model directories instead. |
+
+### Sidecar files
+
+Per-model settings live in files beside the GGUF, named after it
+(`Qwen3.8-27B-UD-Q8_K_XL.gguf` → `Qwen3.8-27B-UD-Q8_K_XL.sampling.toml`). A
+sidecar that does not read or parse is logged and ignored.
+
+| File | |
+|---|---|
+| `<model>.sampling.toml` | Sampling defaults: the mode chain, the repetition penalty, the tool-call cap. Written on first load, seeded from the model's own recommended sampling where it has one; never overwritten. |
+| `<model>.load.toml` | Load-time options: `n_ctx` (capped at the trained window) and `n_ubatch`. Never written; unknown keys are an error. |
+| `<model>.template.jinja` | Replaces the chat template outright. |
+| `<model>.dialect.toml` | Overrides the tool-call dialect derived from the template. |
+| `<model>.mmproj.gguf` | The vision projector: image input, with the `mtmd` feature. |
+
+The sampling sidecars for the supported models are versioned in [`models/`].
+An abridged one:
+
+```toml
+# Qwen3.6-35B-A3B-UD-IQ4_XS.sampling.toml
+lazy_grammar = true
+# Optional: the most client tool calls one turn may make (absent: no cap).
+# The turn ends on the model's own end-of-generation after the last one.
+max_tool_calls_per_turn = 3
+
+[[modes]]
+[modes.TopK]
+k = 1024
+
+[[modes]]
+[modes.LocallyTypical]
+p = 0.9
+min_keep = 3
+
+[repetition]
+# Token categories never penalized. `Markdown` spares code fences.
+ignored_categories = ["English", "Json", "Markdown", "Numbers", "Punctuation"]
+# What an identifier looks like. A faithful copy of one the prompt holds is
+# never penalized, and with `id_copy_lock` (default true) a copy eight
+# characters into exactly one known hex id must be finished as that id.
+id_patterns = ["[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"]
+id_copy_lock = true
+window_size = 2048
+penalty_repeat = 1.06
+surgical = true
+```
+
+```toml
+# Qwen3.8-27B-UD-Q8_K_XL.load.toml
+n_ctx = 262144   # this model's own context, instead of --n-ctx
+n_ubatch = 2048  # llama.cpp's micro-batch (default 512)
+```
+
+[`models/`]: https://github.com/mdegans/drama_llama/tree/main/models
+
 ## Testing
 
-605 tests across 27 binaries in the default configuration — 486 that run in
-seconds and 119 that load real weights onto a real accelerator. The
+1172 tests across 33 binaries in the default configuration — 983 that run in
+seconds and 189 that load real weights onto a real accelerator. The
 model-backed tier is `#[ignore]`d so the fast loop stays fast, and the whole
 topology — *which features* × *which tests* — lives in one place,
 [`scripts/test.py`]. The justfile delegates to that script, the git hooks call
@@ -265,7 +428,8 @@ what is actively broken.
 ## Known issues
 
 - A KV-dirty `llama_decode` failure leaves the cache unreconciled
-  ([#52](https://github.com/mdegans/drama_llama/issues/52)).
+  ([#52](https://github.com/mdegans/drama_llama/issues/52)); `blallama`
+  exits on one for its supervisor to restart.
 - A context-full stop is reported as a grammar violation
   ([#36](https://github.com/mdegans/drama_llama/issues/36)).
 - moeflux's `memory_seq_cp` / `memory_seq_keep` silently no-op and report

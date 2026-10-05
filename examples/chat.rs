@@ -302,9 +302,9 @@ async fn drive(
             Err(ReadlineError::Eof) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        // Same ingest guard as the council: framing bytes in a human
-        // line would be rejected at ingest anyway, so catch them as a
-        // rephrase instead of an error.
+        // Same relay scan as the council: the session would read
+        // framing bytes in a human line as text, but this demo asks
+        // for a rephrase instead.
         if let Some((id, _)) = transport.scan_text_for_specials(&line).await {
             println!(
                 "✗ your message contains a reserved framing sequence \

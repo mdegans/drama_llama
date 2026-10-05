@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use misanthropic::{model, response, CachedPrompt, Prompt, Quirks, Transport};
 
-use crate::{backend::Model as _, Backend, Session, SessionError, Token};
+use crate::{Backend, Session, SessionError, Token};
 
 /// A [`misanthropic::Transport`] over a locally-owned [`Session`] — see the
 /// module docs for the concurrency model.
@@ -40,8 +40,9 @@ impl<B: Backend> Clone for SessionTransport<B> {
 }
 
 impl<B: Backend> SessionTransport<B> {
-    /// Wrap `session`. The model's display name is snapshotted here as the
-    /// transport's advertised [`ModelInfo`](model::ModelInfo).
+    /// Wrap `session`. Its [`model_info`](Session::model_info) is
+    /// snapshotted here as the transport's advertised
+    /// [`ModelInfo`](model::ModelInfo).
     ///
     /// The session's prefix cache is switched **on**: this transport's
     /// [`quirks`](Transport::quirks) advertise breakpoint-keyed prefix
@@ -49,13 +50,7 @@ impl<B: Backend> SessionTransport<B> {
     /// breakpoints. (A no-op if the caller already enabled it.)
     pub fn new(session: Session<B>) -> Self {
         let session = session.with_prefix_cache(true);
-        let display_name = session
-            .engine()
-            .model
-            .display_name()
-            .unwrap_or_else(|| "unknown".to_string());
-        let model_info =
-            model::ModelInfo::new(display_name.clone(), display_name);
+        let model_info = session.model_info();
         Self {
             session: Arc::new(tokio::sync::Mutex::new(session)),
             model_info,
@@ -73,11 +68,11 @@ impl<B: Backend> SessionTransport<B> {
     /// scan `text` for content that would tokenize to a reserved
     /// chat-framing special, returning the first offender's
     /// `(id, piece)`. For relay tools (mail, docket filings) holding a
-    /// transport clone — check at send time and bounce the message
-    /// back to its author as a recoverable `is_error` tool result,
-    /// instead of poisoning the recipient's prompt and killing their
-    /// loop at ingest. Briefly awaits the session lock (a completion
-    /// in flight holds it).
+    /// transport clone that choose to bounce such a message back to its
+    /// author as a recoverable `is_error` tool result — the recipient's
+    /// session would read it as text (see
+    /// [`Session::scan_text_for_specials`]). Briefly awaits the session
+    /// lock (a completion in flight holds it).
     pub async fn scan_text_for_specials(
         &self,
         text: &str,
@@ -187,9 +182,9 @@ where
 ///
 /// This trait exists because erasing to a bare `dyn Transport` would drop
 /// [`SessionTransport::scan_text_for_specials`], which has no API-side
-/// counterpart — a remote endpoint cannot be prompt-injected with *its own*
-/// framing tokens, and a local one can. Relay tools need that guard after
-/// erasure, so it rides along as the trait's one method.
+/// counterpart — a remote endpoint's framing tokens are its own business,
+/// while a local one's are this crate's. Relay tools that check need it
+/// after erasure, so it rides along as the trait's one method.
 ///
 /// Both prompt-type supertraits are listed because [`SessionTransport`]
 /// serves both and callers use both ([`CachedPrompt`] for frozen-prefix
@@ -197,6 +192,9 @@ where
 /// `Arc<dyn LocalTransport>` is a valid `T: Transport` for anything generic
 /// over one — the [`Chat`](misanthropic::chat::Chat) driver included — while
 /// still carrying the scan. One erased type, not two.
+// `async_trait` marks each method `#[must_use]` on a boxed future that
+// already is; clippy 1.99 flags the pair in the expansion.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait LocalTransport:
     Transport<Prompt, Error = SessionError>

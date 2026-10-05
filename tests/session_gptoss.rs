@@ -4,9 +4,16 @@
 //! for the channel-structured Harmony format
 //! (`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`).
 //!
-//! All tests load `models/gpt-oss-20b-UD-Q8_K_XL.gguf` and are
-//! `#[ignore]`d. Run with
+//! All tests load the first gpt-oss GGUF found under `models/` — the
+//! 120b MXFP4, else the 20b this suite was written against (override
+//! with `$DRAMA_LLAMA_GPTOSS_MODEL`; every model is the same Harmony
+//! family, and nothing here pins golden text) — and are `#[ignore]`d.
+//! Absent any candidate they skip loudly rather than substituting
+//! `model.gguf`, like the mistral4/cogito suites (this file predated
+//! that convention and used to panic at load). Run with
 //! `cargo test --features serde,cuda --test session_gptoss -- --ignored`.
+
+mod common;
 
 use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
@@ -17,26 +24,76 @@ use drama_llama::{
 };
 use serde_json::json;
 
-fn model_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("models/gpt-oss-20b-UD-Q8_K_XL.gguf")
+/// Resolve a gpt-oss GGUF: `$DRAMA_LLAMA_GPTOSS_MODEL` if set and
+/// present, else the first conventional candidate under `models/`.
+/// `None` means skip — never substitute `model.gguf`.
+fn model_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("DRAMA_LLAMA_GPTOSS_MODEL") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    [
+        "models/gpt-oss-120b-MXFP4.gguf",
+        "models/gpt-oss-20b-UD-Q8_K_XL.gguf",
+    ]
+    .iter()
+    .map(|rel| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel))
+    .find(|p| p.exists())
 }
 
-/// Install the cache-stability template sidecar next to the model —
-/// the deployment configuration this suite validates (blallama ships
-/// the same file). Idempotent; sourced from the versioned fixture.
-fn install_template_sidecar() {
+/// Install the cache-stability template sidecar next to the model.
+/// The same bytes are baked into the crate (`baked::GPTOSS`, #88) and
+/// would apply without any sidecar; installing one anyway makes this
+/// suite exercise rung 1 of the loading ladder over rung 2.
+/// Idempotent; sourced from the shipped template.
+fn install_template_sidecar(model: &std::path::Path) {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/templates/gptoss-cache-stable.jinja");
-    let sidecar = model_path().with_extension("template.jinja");
+        .join("templates/gptoss-cache-stable.jinja");
+    let sidecar = model.with_extension("template.jinja");
     std::fs::copy(&fixture, &sidecar).expect("install template sidecar");
 }
 
-fn load_session() -> drama_llama::LlamaCppSession {
-    install_template_sidecar();
-    drama_llama::LlamaCppSession::from_path(model_path())
+/// A real context size: the default `n_ctx` (512) is smaller than one
+/// turn's `max_tokens` (1024), so a seed whose first turn reasons at
+/// length overflows the second (`ContextOverflow { needed_cells: 517 }`
+/// under seed 175391396439738032250350131245834857259).
+///
+/// Seeded via `common::test_seed()`: random by default (free fuzzing),
+/// printed on failure so the trajectory is replayable with
+/// `DRAMA_LLAMA_TEST_SEED=<n>`. The session seed selects the sampler
+/// fork branch (fresh state per call); these suites assert on
+/// emissions and the KV cache, never on the carried sampler stream.
+fn load_session() -> Option<drama_llama::LlamaCppSession> {
+    let path = model_path()?;
+    install_template_sidecar(&path);
+    Some(
+        drama_llama::LlamaCppSession::from_path_with(
+            path,
+            drama_llama::LlamaCppOptions::default().with_n_ctx(4096),
+        )
         .expect("session load")
         .quiet()
+        .with_seed(Some(common::test_seed())),
+    )
+}
+
+macro_rules! session_or_skip {
+    () => {
+        match load_session() {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "SKIP: needs a gpt-oss model \
+                     (DRAMA_LLAMA_GPTOSS_MODEL, \
+                     models/gpt-oss-120b-MXFP4.gguf, or \
+                     models/gpt-oss-20b-UD-Q8_K_XL.gguf)"
+                );
+                return;
+            }
+        }
+    };
 }
 
 fn count_letters_prompt() -> Prompt {
@@ -76,7 +133,7 @@ fn count_letters_prompt() -> Prompt {
 #[test]
 #[ignore = "requires gpt-oss model"]
 fn dialect_resolves_to_gpt_oss_at_load() {
-    let session = load_session();
+    let session = session_or_skip!();
     assert_eq!(
         session.dialect(),
         &CallSyntax::gpt_oss(),
@@ -93,7 +150,7 @@ fn dialect_resolves_to_gpt_oss_at_load() {
 fn forced_call_parses_to_tool_use() {
     let prompt =
         count_letters_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
-    let mut session = load_session();
+    let mut session = session_or_skip!();
 
     let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
     println!("=== forced blocks ===\n{blocks:#?}\n===");
@@ -145,7 +202,7 @@ fn auto_tool_choice_parses_native_call() {
     let mut prompt =
         count_letters_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
     prompt.tool_choice = Some(ToolChoice::auto());
-    let mut session = load_session();
+    let mut session = session_or_skip!();
 
     let blocks = session.complete_blocks(&prompt).expect("complete_blocks");
     println!("=== auto blocks ===\n{blocks:#?}\n===");
@@ -177,7 +234,7 @@ fn emission_round_trips_through_parse_and_render() {
 
     let prompt =
         count_letters_prompt().max_tokens(NonZeroU32::new(1024).unwrap());
-    let mut session = load_session();
+    let mut session = session_or_skip!();
     println!("=== dialect ===\n{:#?}\n===", session.dialect());
 
     let render_opts = RenderOptions::default()
@@ -265,7 +322,7 @@ fn emission_round_trips_through_parse_and_render() {
 fn announce_then_call_round_trips_in_emission_order() {
     use drama_llama::AssistantMessage;
 
-    let session = load_session();
+    let session = session_or_skip!();
     let prompt = count_letters_prompt();
 
     // Shared render options; only the generation-prompt flag differs
@@ -394,7 +451,7 @@ fn tool_result_turn_produces_prose_answer() {
         }]),
     });
 
-    let mut session = load_session();
+    let mut session = session_or_skip!();
     let out = session.complete_text(&prompt).expect("complete_text");
     println!("=== turn 2 ===\n{out}\n===");
     assert!(!out.trim().is_empty(), "got empty output");
@@ -423,7 +480,7 @@ fn prefix_cache_survives_tool_turn() {
             }
         }
     }
-    let mut session = load_session().with_prefix_cache(true);
+    let mut session = session_or_skip!().with_prefix_cache(true);
 
     let blocks = session.complete_blocks(&prompt).expect("turn 1");
     let call = blocks
@@ -482,11 +539,18 @@ fn prefix_cache_survives_tool_turn() {
 #[test]
 #[ignore = "long running - requires gpt-oss model"]
 fn gptoss_eog_token_set() {
+    let Some(path) = model_path() else {
+        eprintln!(
+            "SKIP: needs a gpt-oss model (DRAMA_LLAMA_GPTOSS_MODEL, \
+             models/gpt-oss-120b-MXFP4.gguf, or \
+             models/gpt-oss-20b-UD-Q8_K_XL.gguf)"
+        );
+        return;
+    };
     let mut params = unsafe { llama_cpp_sys_3::llama_model_default_params() };
     params.n_gpu_layers = 0;
-    let model =
-        drama_llama::LlamaCppModel::from_file(model_path(), Some(params))
-            .expect("model load");
+    let model = drama_llama::LlamaCppModel::from_file(path, Some(params))
+        .expect("model load");
 
     let piece_of = |t| drama_llama::Model::token_to_piece(&model, t);
     let by_piece = |s: &str| {
@@ -581,7 +645,7 @@ fn gptoss_eog_token_set() {
 fn prefix_cache_survives_final_turn() {
     use drama_llama::AssistantMessage;
 
-    let mut session = load_session().with_prefix_cache(true);
+    let mut session = session_or_skip!().with_prefix_cache(true);
     let mut prompt = Prompt {
         system: Some(Content::text("You are a helpful assistant.")),
         messages: vec![Message {
@@ -599,6 +663,11 @@ fn prefix_cache_survives_final_turn() {
         blocks.iter().any(|b| matches!(b, Block::Text { .. })),
         "turn 1 must produce a final answer: {blocks:#?}"
     );
+    // No `cache_control` marker exists on turn 1, so `breakpoint_cells`
+    // is 0 and the whole turn-1 prompt lands in `input_tokens` (the
+    // three-way read/creation/input split only pulls cells out of
+    // `input_tokens` when a breakpoint exists to pull them up to) —
+    // that's what makes this usable as "the whole first turn" below.
     let turn1_prompt = session.last_usage().input_tokens;
 
     let assistant: AssistantMessage = blocks.into_iter().collect();
@@ -623,5 +692,65 @@ fn prefix_cache_survives_final_turn() {
         "turn 2 must splice at the tip (past the whole first turn); \
          cache_read={read}, turn-1 prompt={turn1_prompt} (usage: {:?})",
         session.last_usage()
+    );
+}
+
+/// A session for the multi-round #96 scenarios: [`load_session`] plus
+/// a real context size — the default `n_ctx` (512) ends the later
+/// rounds at the KV ceiling mid-tool-call.
+fn load_session_8k() -> Option<drama_llama::LlamaCppSession> {
+    let path = model_path()?;
+    install_template_sidecar(&path);
+    Some(
+        drama_llama::LlamaCppSession::from_path_with(
+            path,
+            drama_llama::LlamaCppOptions::default().with_n_ctx(8192),
+        )
+        .expect("session load")
+        .quiet()
+        .with_prefix_cache(true)
+        .with_seed(Some(common::test_seed())),
+    )
+}
+
+macro_rules! session_8k_or_skip {
+    () => {
+        match load_session_8k() {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "SKIP: needs a gpt-oss model \
+                     (DRAMA_LLAMA_GPTOSS_MODEL, \
+                     models/gpt-oss-120b-MXFP4.gguf, or \
+                     models/gpt-oss-20b-UD-Q8_K_XL.gguf)"
+                );
+                return;
+            }
+        }
+    };
+}
+
+/// #96, the downstream (agentkit) shape against Harmony: sliding
+/// markers, forced tool-call turns, every continuation resuming past
+/// the entire previous prompt via the tip. Unlike
+/// [`prefix_cache_survives_final_turn`] there ARE explicit markers
+/// here — the exact condition that shadowed the tip before the fix.
+#[test]
+#[ignore = "requires gpt-oss model"]
+fn tip_anchors_across_tool_rounds_issue_96() {
+    common::tip::assert_tip_anchors_across_tool_rounds(
+        session_8k_or_skip!(),
+        3,
+    );
+}
+
+/// #96's probe scenario on gpt-oss: a continuation adding no new
+/// `cache_control` anywhere may only be covered by the tip via the
+/// LCP walk.
+#[test]
+#[ignore = "requires gpt-oss model"]
+fn tip_anchors_unmarked_continuation_issue_96() {
+    common::tip::assert_tip_anchors_unmarked_continuation(
+        session_8k_or_skip!(),
     );
 }

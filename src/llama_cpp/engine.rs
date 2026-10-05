@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use llama_cpp_sys_3::{
     llama_context, llama_context_default_params, llama_context_params,
-    llama_model_params, llama_perf_context_data, llama_seq_id,
-    llama_supports_gpu_offload, llama_supports_mlock, llama_supports_mmap,
-    llama_token,
+    llama_model_default_params, llama_model_params, llama_perf_context_data,
+    llama_seq_id, llama_supports_gpu_offload, llama_supports_mlock,
+    llama_supports_mmap, llama_token,
 };
 
 /// Convenience alias for the llama.cpp-backed pair. Use
@@ -22,14 +22,19 @@ use llama_cpp_sys_3::{
 pub type LlamaCppEngine = Engine<LlamaCppBackend>;
 
 impl LlamaCppEngine {
-    /// llama.cpp's `llama_context_default_params()` with a usable
-    /// thread count. The upstream library default is a hard-coded 4
-    /// threads (ggml's `GGML_DEFAULT_N_THREADS`, marked "TODO: better
-    /// default" upstream), which cripples CPU inference on larger
-    /// machines — every llama.cpp *runner* overrides it, and so do we.
-    /// Uses all available logical cores for both generation and batch
-    /// processing; tune after construction with
-    /// [`Self::set_n_threads`].
+    /// llama.cpp's `llama_context_default_params()` with the two
+    /// defaults every llama.cpp *runner* overrides, and so do we:
+    ///
+    /// - a usable thread count. The upstream library default is a
+    ///   hard-coded 4 threads (ggml's `GGML_DEFAULT_N_THREADS`, marked
+    ///   "TODO: better default" upstream), which cripples CPU inference
+    ///   on larger machines. Uses all available logical cores for both
+    ///   generation and batch processing; tune after construction with
+    ///   [`Self::set_n_threads`].
+    /// - a window-sized sliding-window cache (`swa_full = false`), as
+    ///   llama.cpp's server and CLI ship; the library's full-size one
+    ///   would size Gemma 4's window layers at the whole context. See
+    ///   [`LlamaCppOptions::swa_full`].
     pub fn default_context_params() -> llama_context_params {
         let mut cp = unsafe { llama_context_default_params() };
         if let Ok(n) = std::thread::available_parallelism() {
@@ -37,6 +42,7 @@ impl LlamaCppEngine {
             cp.n_threads = n;
             cp.n_threads_batch = n;
         }
+        cp.swa_full = false;
         cp
     }
 
@@ -49,10 +55,21 @@ impl LlamaCppEngine {
         context_params: Option<llama_context_params>,
         numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
-        let model = match LlamaCppModel::from_file(path.clone(), model_params) {
-            Some(m) => m,
-            None => return Err(NewError::Model { path }),
-        };
+        let model = Self::load_model(path.clone(), model_params)?;
+        Self::with_model(path, model, context_params, numa_strategy)
+    }
+
+    /// [`Self::new`] past the model load: the context, then the mmproj
+    /// sidecar.
+    fn with_model(
+        path: PathBuf,
+        model: LlamaCppModel,
+        context_params: Option<llama_context_params>,
+        numa_strategy: Option<u32>,
+    ) -> Result<Self, NewError> {
+        // Only the mmproj lookup reads the path.
+        #[cfg(not(feature = "mtmd"))]
+        let _ = &path;
         let context_params =
             context_params.unwrap_or_else(Self::default_context_params);
         let decoder =
@@ -87,6 +104,45 @@ impl LlamaCppEngine {
         Ok(engine)
     }
 
+    /// Load the model at `path`, classifying a failure
+    /// ([`NewError::is_resource`]) by when it came. llama.cpp answers
+    /// every failed load with the same null, so the file is first
+    /// opened and then read vocab-only — header, metadata, vocabulary,
+    /// no backend allocation — and only then loaded in full: a file
+    /// that fails either check is [`NewError::Unreadable`] or
+    /// [`NewError::Metadata`], and a full load that fails after both
+    /// passed failed allocating ([`NewError::Model`]).
+    fn load_model(
+        path: PathBuf,
+        params: Option<llama_model_params>,
+    ) -> Result<LlamaCppModel, NewError> {
+        let unreadable = |source| NewError::Unreadable {
+            path: path.clone(),
+            source,
+        };
+        let meta = std::fs::File::open(&path)
+            .and_then(|file| file.metadata())
+            .map_err(unreadable)?;
+        if meta.is_dir() {
+            return Err(unreadable(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "is a directory",
+            )));
+        }
+        // SAFETY: returns a plain struct by value; no preconditions.
+        let params =
+            params.unwrap_or_else(|| unsafe { llama_model_default_params() });
+        let vocab_only = llama_model_params {
+            vocab_only: true,
+            ..params
+        };
+        // Dropped at once: it only proves the metadata reads.
+        LlamaCppModel::from_file(path.clone(), Some(vocab_only))
+            .ok_or_else(|| NewError::Metadata { path: path.clone() })?;
+        LlamaCppModel::from_file(path.clone(), Some(params))
+            .ok_or(NewError::Model { path })
+    }
+
     /// Create a new engine from a model `path` and load-time
     /// [`LlamaCppOptions`] — context size, KV slots, Flash Attention
     /// policy, GPU offload, NUMA.
@@ -97,12 +153,96 @@ impl LlamaCppEngine {
         path: PathBuf,
         options: LlamaCppOptions,
     ) -> Result<Self, NewError> {
-        Self::new(
+        Self::from_path_with_load_sidecar(
             path,
-            Some(options.model_params()),
+            options,
+            crate::sidecar::LoadSidecar::default(),
+        )
+    }
+
+    /// [`Self::from_path_with`], with a model's load sidecar: its
+    /// `n_ctx` beats `options.n_ctx` once capped at the trained window
+    /// (known only after the model loads, hence here), and its
+    /// `n_ubatch` fills an unset `options.n_ubatch`. See
+    /// [`crate::sidecar::effective_n_ctx`] and
+    /// [`crate::sidecar::effective_n_ubatch`]. Logs the context and
+    /// micro-batch the model is served with.
+    pub(crate) fn from_path_with_load_sidecar(
+        path: PathBuf,
+        options: LlamaCppOptions,
+        sidecar: crate::sidecar::LoadSidecar,
+    ) -> Result<Self, NewError> {
+        let n_ctx = sidecar.n_ctx;
+        let model =
+            Self::load_model(path.clone(), Some(options.model_params()))?;
+        let n_ctx_train = model.context_size().max(0) as u32;
+        let effective =
+            crate::sidecar::effective_n_ctx(options.n_ctx, n_ctx, n_ctx_train);
+        if let Some(requested) = n_ctx.filter(|&n| Some(n) != effective) {
+            tracing::warn!(
+                path = %path.display(),
+                requested,
+                n_ctx_train,
+                "per-model n_ctx exceeds the trained window; capped",
+            );
+        }
+        let options = LlamaCppOptions {
+            n_ctx: effective,
+            ..options
+        };
+        let n_batch = options.context_params().n_batch;
+        let n_ubatch = crate::sidecar::effective_n_ubatch(
+            options.n_ubatch,
+            sidecar.n_ubatch,
+            n_batch,
+        );
+        let n_ubatch_source = match (options.n_ubatch, sidecar.n_ubatch) {
+            (Some(_), _) => "option",
+            (None, Some(requested)) if n_ubatch.is_none() => {
+                tracing::warn!(
+                    path = %path.display(),
+                    requested,
+                    "per-model n_ubatch must be at least 1; ignored",
+                );
+                "default"
+            }
+            (None, Some(requested)) => {
+                if Some(requested) != n_ubatch {
+                    tracing::warn!(
+                        path = %path.display(),
+                        requested,
+                        n_batch,
+                        "per-model n_ubatch exceeds n_batch; clamped",
+                    );
+                }
+                "sidecar"
+            }
+            (None, None) => "default",
+        };
+        let options = LlamaCppOptions {
+            n_ubatch,
+            ..options
+        };
+        let mut engine = Self::with_model(
+            path.clone(),
+            model,
             Some(options.context_params()),
             options.numa,
-        )
+        )?;
+        engine.set_checkpoint_budget(options.checkpoint_budget());
+        tracing::info!(
+            event = "context_size",
+            path = %path.display(),
+            n_ctx = engine.n_ctx(),
+            n_ctx_train,
+            source = if n_ctx.is_some() { "sidecar" } else { "default" },
+            n_ubatch = engine.n_ubatch(),
+            n_ubatch_source,
+            "serving with n_ctx {}, n_ubatch {}",
+            engine.n_ctx(),
+            engine.n_ubatch(),
+        );
+        Ok(engine)
     }
 
     /// Create a new engine from a model `path`. Default model and
@@ -170,6 +310,11 @@ impl LlamaCppEngine {
         self.decoder.n_batch()
     }
 
+    /// Micro-batch size configured on this context.
+    pub fn n_ubatch(&self) -> u32 {
+        self.decoder.n_ubatch()
+    }
+
     /// Size of the serialized global state (logits, embedding, memory).
     pub fn state_size(&self) -> usize {
         self.decoder.state_size()
@@ -204,9 +349,15 @@ impl LlamaCppEngine {
         self.decoder.set_state_seq(state, dest_seq_id)
     }
 
+    /// How this model's sequences rewind — see
+    /// [`LlamaCppDecoder::checkpointing`](crate::LlamaCppDecoder::checkpointing).
+    pub fn checkpointing(&self) -> crate::Checkpointing {
+        self.decoder.checkpointing()
+    }
+
     /// Whether checkpointing takes real per-sequence snapshots. On by
-    /// default for recurrent / hybrid models (whose layer state cannot
-    /// be rewound by KV truncation); off for pure attention.
+    /// default for sliding-window and recurrent / hybrid models (whose
+    /// state a KV truncate cannot rewind); off for dense attention.
     pub fn seq_snapshots_enabled(&self) -> bool {
         self.decoder.seq_snapshots_enabled()
     }
@@ -220,6 +371,17 @@ impl LlamaCppEngine {
     /// Number of per-sequence snapshots currently held.
     pub fn seq_snapshot_count(&self) -> usize {
         self.decoder.seq_snapshot_count()
+    }
+
+    /// Host RAM the per-sequence snapshots currently hold, in bytes.
+    pub fn seq_snapshot_bytes(&self) -> usize {
+        self.decoder.seq_snapshot_bytes()
+    }
+
+    /// Bound the host RAM the checkpoints may hold. See
+    /// [`LlamaCppDecoder::set_checkpoint_budget`](crate::LlamaCppDecoder::set_checkpoint_budget).
+    pub fn set_checkpoint_budget(&mut self, budget: crate::CheckpointBudget) {
+        self.decoder.set_checkpoint_budget(budget)
     }
 
     /// Performance information.
@@ -298,6 +460,63 @@ impl LlamaCppEngine {
 mod tests {
     use super::*;
 
+    /// The failures a load finds before the backend allocates anything
+    /// are not resource failures: a missing path, a directory, a file
+    /// llama.cpp cannot read as a model. Real llama.cpp calls; no
+    /// weights.
+    #[test]
+    fn load_failures_before_allocation_are_not_resource_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.gguf");
+        let garbage = dir.path().join("garbage.gguf");
+        std::fs::write(&garbage, b"not a gguf, not even close").expect("write");
+
+        let error = |path: PathBuf| match LlamaCppEngine::from_path(path) {
+            Ok(_) => panic!("loaded a model that isn't one"),
+            Err(e) => e,
+        };
+        let not_found = error(missing);
+        assert!(
+            matches!(&not_found, NewError::Unreadable { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound),
+            "{not_found:?}"
+        );
+        let directory = error(dir.path().to_path_buf());
+        assert!(
+            matches!(directory, NewError::Unreadable { .. }),
+            "{directory:?}"
+        );
+        let metadata = error(garbage);
+        assert!(
+            matches!(metadata, NewError::Metadata { .. }),
+            "{metadata:?}"
+        );
+        for e in [not_found, directory, metadata] {
+            assert!(!e.is_resource(), "{e}");
+        }
+    }
+
+    /// Failures after the backend began allocating are resource
+    /// failures — and so is every one llama.cpp leaves unexplained.
+    #[test]
+    fn load_failures_after_allocation_are_resource_failures() {
+        let path = PathBuf::from("model.gguf");
+        assert!(NewError::Model { path: path.clone() }.is_resource());
+        assert!(NewError::Context.is_resource());
+        #[cfg(feature = "mtmd")]
+        {
+            use crate::llama_cpp::mtmd::MtmdNewError;
+            let mtmd = |source| NewError::Mtmd {
+                path: path.clone(),
+                source,
+            };
+            let load_failed = MtmdNewError::LoadFailed { path: path.clone() };
+            assert!(mtmd(load_failed).is_resource());
+            let bad_path = MtmdNewError::BadPath { path: path.clone() };
+            assert!(!mtmd(bad_path).is_resource());
+        }
+    }
+
     /// Resident set size of this process in bytes (via `ps`, so KiB
     /// granularity). On Apple Silicon, Metal buffers are unified-memory
     /// mappings inside the process, so leaked model weights or contexts
@@ -359,6 +578,35 @@ mod tests {
             grown >> 20,
             LIMIT >> 20,
         );
+    }
+
+    /// The load sidecar's `n_ubatch` reaches the context: it beats
+    /// llama.cpp's default, is clamped to `n_batch` (= `n_ctx`), `0`
+    /// is ignored, and an explicit option beats it.
+    #[test]
+    #[ignore = "requires models/model.gguf"]
+    fn load_sidecar_n_ubatch_reaches_the_context() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let options = LlamaCppOptions::default().with_n_ctx(1024);
+        let n_ubatch = |options: LlamaCppOptions, n_ubatch: Option<u32>| {
+            let sidecar = crate::sidecar::LoadSidecar {
+                n_ubatch,
+                ..Default::default()
+            };
+            LlamaCppEngine::from_path_with_load_sidecar(
+                path.clone(),
+                options,
+                sidecar,
+            )
+            .expect("load")
+            .n_ubatch()
+        };
+        let default = n_ubatch(options, None);
+        assert_eq!(n_ubatch(options, Some(256)), 256);
+        assert_eq!(n_ubatch(options, Some(4096)), 1024);
+        assert_eq!(n_ubatch(options, Some(0)), default);
+        assert_eq!(n_ubatch(options.with_n_ubatch(64), Some(256)), 64);
     }
 
     #[test]

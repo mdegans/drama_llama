@@ -18,16 +18,42 @@
 //! this struct instead).
 
 mod analyzer;
-mod emit;
+pub(crate) mod emit;
 mod parse;
+mod partial;
+mod provenance;
 mod segment;
+#[cfg(test)]
+mod utf8_tests;
 
 pub use analyzer::{analyze_template, vocab_cross_check, AnalyzeError};
 pub use emit::{
     grammar_source, render_reference, validate_representable, Anchor,
     DialectError, EmitOptions,
 };
+#[cfg(test)]
+pub(crate) use parse::parse_text_open;
+pub(crate) use parse::OpenCall;
 pub use parse::{parse_text, Leniency, ParseStatus, Parsed, StreamParser};
+// What only `Session` reaches for, so only where it is built.
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub(crate) use parse::{parse_text_cached, Spellings};
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub(crate) use partial::cut_value;
+pub use partial::truncate_partial_object;
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub(crate) use provenance::Provenance;
+
+use crate::json_canon::JsonSpacing;
 
 /// Tool-call format family, per llama.cpp's classification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -180,6 +206,23 @@ pub struct ReasoningSyntax {
     pub end: String,
     /// Re-ingest convention (drives `RenderOptions` in `Session`).
     pub reingest: ReasoningReingest,
+    /// The bytes the template renders between [`Self::end`] and what
+    /// follows it (Qwen: `"\n\n"`). Grammars spell it literally after a
+    /// thought, so a constrained turn re-renders byte-for-byte (#112).
+    /// `None` = unmeasured: grammars keep their permissive gap.
+    pub separator: Option<String>,
+    /// The `reasoning_effort` values the template accepts, lowest
+    /// first, from the scale `low < medium < high < xhigh < max`
+    /// (Qwen3.8: `low`, `medium`, `high`, `xhigh`; stock Mistral Small
+    /// 4: `high`; gpt-oss, which validates nothing: its trained `low`,
+    /// `medium`, `high`). Empty = the template has no effort knob.
+    /// Rendering maps a prompt's `output_config.effort` onto this set
+    /// (see [`RenderOptions::efforts`](crate::RenderOptions::efforts)).
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Vec::is_empty")
+    )]
+    pub efforts: Vec<String>,
 }
 
 /// Content-block markers.
@@ -239,6 +282,15 @@ pub struct ArgumentsSyntax {
     /// String-quote marker for [`Family::TagWithDict`] values
     /// (e.g. `"<|\"|>"`); empty for other families.
     pub string_quote: String,
+    /// How JSON-serialized argument values are spaced — measured from
+    /// the template's own re-render of the analysis probe, so the
+    /// grammar's canonical prelude and `render_reference`'s serializer
+    /// agree with the template by construction (#88 phase 2). Stock
+    /// `tojson` templates measure [`Compact`](JsonSpacing::Compact);
+    /// owned templates match the model's probed habit (cogito:
+    /// [`Spaced`](JsonSpacing::Spaced)). Families that never
+    /// JSON-serialize values ignore it.
+    pub json_spacing: JsonSpacing,
 }
 
 /// Call-ID markers (tagged formats).
@@ -411,6 +463,10 @@ pub mod harmony {
     /// (`container.exec`, `python`, `browser.search`) are builtin
     /// tools we swallow, upstream parity.
     pub const TO_FUNCTIONS: &str = " to=functions.";
+    /// Opens a recipient, any recipient: where a lazy call grammar
+    /// takes over ([`super::CallSyntax::triggers`]), so the name after it is
+    /// forced to `functions.` and a declared tool.
+    pub const TO: &str = " to=";
     pub const ANALYSIS_OPEN: &str = "<|channel|>analysis<|message|>";
     pub const COMMENTARY: &str = "<|channel|>commentary";
     pub const COMMENTARY_OPEN: &str = "<|channel|>commentary<|message|>";
@@ -418,46 +474,60 @@ pub mod harmony {
 }
 
 impl CallSyntax {
-    /// The byte sequence whose appearance in generated text activates
-    /// the lazy tool-call grammar: the outermost call-opening marker.
+    /// The call landmark: the outermost call-opening marker
+    /// ([`Self::section_start`], else [`Self::per_call_start`]) with
+    /// the template's layout whitespace trimmed — the special token
+    /// itself (`<tool_call>`, not `<tool_call>\n`). Its appearance in
+    /// generated text activates the lazy tool-call grammar and is where
+    /// the parser starts a call section.
+    ///
+    /// Trimmed at the end only: the grammar starts at the full marker
+    /// and is fed the trigger, so the trigger must be a prefix of it.
+    /// The trailing whitespace is the *call's* first bytes, not the
+    /// opener's. A trigger that includes it never fires on a real
+    /// opener the model follows with anything else (`{`, a space,
+    /// `\r\n`, EOG): the call runs unconstrained, the parser leaves
+    /// the special in prose, and the session rejects the turn
+    /// (`SessionError::EmittedSpecialToken`, #101). On the bare
+    /// special the grammar — which starts at the full marker — takes
+    /// over one token earlier and forces the canonical whitespace, so a
+    /// real opener is always seated as a call or surfaces as a
+    /// `GrammarViolation`. The untrimmed fields stay the canonical
+    /// bytes the grammar forces and the re-render reproduces.
     pub fn trigger(&self) -> &str {
         if !self.section_start.is_empty() {
-            &self.section_start
+            self.section_start.trim_end()
         } else {
-            &self.per_call_start
+            self.per_call_start.trim_end()
         }
     }
 
     /// All lazy-activation byte sequences. Most dialects have exactly
     /// one ([`Self::trigger`]); Harmony's tool-call header has no
     /// single distinctive marker, so it triggers on any of the
-    /// recipient-bearing header shapes. Deliberately conservative — a
-    /// false activation derails generation (the grammar starts
-    /// forcing call bytes mid-thought), while a miss only loses
-    /// enforcement for that call: the parser still recognizes it and
-    /// the canonicalization gate covers the bytes. Upstream uses
-    /// anchored regexes for the same reason (`chat.cpp` gpt-oss
-    /// `grammar_triggers`).
+    /// recipient-bearing header shapes — at the recipient's `to=`, not
+    /// after `functions.`. A recipient the trigger never saw ran free,
+    /// and gpt-oss-120b writes them: `to=create_comment` (swallowed as
+    /// a builtin — the call lost), `to=function` then prose (framing in
+    /// free text, rejected on every draw), 2026-10-01. From `to=` the
+    /// grammar forces `functions.` and a declared name. Nothing else is
+    /// a legal recipient here: the session declares no builtin tools.
+    /// The cost is the 20b wart (`<|channel|>commentary to=assistant`
+    /// before the real header), which now opens a call.
+    ///
+    /// The marker dialects' bare special has no such trade: a miss is
+    /// the costly side (see [`Self::trigger`]), and a "false"
+    /// activation — the model naming its own opener in prose or a
+    /// thought — forces a call where the special would otherwise be
+    /// rejected from free text anyway.
     pub fn triggers(&self) -> Vec<String> {
         match self.family {
             Family::Harmony => vec![
                 // Recipient in the role header.
-                format!(
-                    "{}{}",
-                    harmony::START_ASSISTANT,
-                    harmony::TO_FUNCTIONS
-                ),
+                format!("{}{}", harmony::START_ASSISTANT, harmony::TO),
                 // Recipient in the channel header.
-                format!(
-                    "{}commentary{}",
-                    harmony::CHANNEL,
-                    harmony::TO_FUNCTIONS
-                ),
-                format!(
-                    "{}analysis{}",
-                    harmony::CHANNEL,
-                    harmony::TO_FUNCTIONS
-                ),
+                format!("{}commentary{}", harmony::CHANNEL, harmony::TO),
+                format!("{}analysis{}", harmony::CHANNEL, harmony::TO),
             ],
             _ => vec![self.trigger().to_string()],
         }
@@ -510,9 +580,15 @@ impl CallSyntax {
             },
             reasoning: ReasoningSyntax {
                 mode: ReasoningMode::TagBased,
-                start: "<think>".into(),
-                end: "</think>".into(),
+                // The newlines are canonical, as the analyzer measures
+                // them: the template renders `<think>\n…\n</think>`, so
+                // the parser takes exactly those off a thought's body
+                // and keeps any further whitespace in it.
+                start: "<think>\n".into(),
+                end: "\n</think>".into(),
                 reingest: ReasoningReingest::InlineThink,
+                separator: None,
+                efforts: Vec::new(),
             },
             ..Self::default()
         }
@@ -556,6 +632,8 @@ impl CallSyntax {
                 // canonicalization repair.
                 end: "\n<channel|>".into(),
                 reingest: ReasoningReingest::Field,
+                separator: None,
+                efforts: Vec::new(),
             },
             user_start: "<|turn>user\n".into(),
             assistant_start: "<|turn>model\n".into(),
@@ -606,6 +684,10 @@ impl CallSyntax {
                 start: harmony::ANALYSIS_OPEN.into(),
                 end: harmony::END.into(),
                 reingest: ReasoningReingest::Thinking,
+                separator: None,
+                // The levels gpt-oss trained on. The analyzer measures
+                // the same set (the template validates nothing).
+                efforts: ["low", "medium", "high"].map(String::from).into(),
             },
             content: ContentSyntax {
                 mode: ContentMode::AlwaysWrapped,

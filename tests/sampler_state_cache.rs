@@ -151,6 +151,128 @@ fn incremental_fold_matches_cold_fold() {
     );
 }
 
+/// Round-2 prompt for the #106 oracle: extends round 1 with an
+/// assistant tool call and a user turn carrying its tool result plus
+/// a fresh cache-marked text block. With the seeding flags at their
+/// defaults, the fold must ingest the call's argument string values
+/// and the result's text identically on both arms.
+fn prompt_2_tools() -> Prompt {
+    let mut p = prompt_1();
+    p.messages.push(Message {
+        role: Role::Assistant,
+        content: Content(vec![drama_llama::prompt::ToolUse::new(
+            "log_color",
+            serde_json::json!({
+                "color": "blue is a primary color pigment",
+                "confidence": 3,
+            }),
+        )
+        .with_id("call_1")
+        .into()]),
+    });
+    p.messages.push(Message {
+        role: Role::User,
+        content: Content(vec![
+            Block::ToolResult {
+                result: misanthropic::tool::Result {
+                    tool_use_id: "call_1".into(),
+                    content: "logged the color blue as a primary color".into(),
+                    is_error: false,
+                    cache_control: None,
+                },
+            },
+            Block::Text {
+                text: Cow::Borrowed(USER_2),
+                cache_control: Some(CacheControl::ephemeral()),
+                citations: None,
+            },
+        ]),
+    });
+    p
+}
+
+/// [`FoldCapture`] plus the #106 constrained fields.
+struct ConstrainedFoldCapture {
+    #[allow(clippy::type_complexity)]
+    out: Arc<Mutex<Option<(NGramStats, u64, NGramStats, u64)>>>,
+}
+
+impl ProbeHook for ConstrainedFoldCapture {
+    fn on_token(&mut self, ctx: ProbeCtx<'_>) {
+        let mut slot = self.out.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some((
+                ctx.state.ngram_stats().clone(),
+                ctx.state.step(),
+                ctx.state.constrained_ngram_stats().clone(),
+                ctx.state.constrained_step(),
+            ));
+        }
+    }
+}
+
+fn capture_first_token_fold_constrained(
+    session: &mut LlamaCppSession,
+    prompt: &Prompt,
+) -> (NGramStats, u64, NGramStats, u64) {
+    let out = Arc::new(Mutex::new(None));
+    session.engine_mut().set_probe_hook(Some(Box::new(
+        ConstrainedFoldCapture { out: out.clone() },
+    )));
+    let _ = session.complete_text(prompt).expect("complete_text");
+    session.engine_mut().set_probe_hook(None);
+    let captured = out.lock().unwrap().take();
+    captured.expect("probe hook captured no token")
+}
+
+/// The #106 oracle: with tool blocks in the turn-2 suffix and every
+/// seeding flag at its default, cold and incremental folds still agree
+/// bit-exactly — now including the seeded constrained accumulator.
+/// The session carries a grammar so the capability gate passes; at the
+/// first token the seed has run and nothing has diverged, so the
+/// constrained fields must equal the persistent ones on both arms.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn incremental_fold_matches_cold_fold_with_tools() {
+    let grammar =
+        SamplingMode::grammar("root ::= \"red\" | \"green\" | \"blue\"")
+            .expect("grammar compiles");
+
+    let mut cold =
+        session().with_sampling([grammar.clone(), SamplingMode::Greedy]);
+    let (cold_stats, cold_step, cold_cstats, cold_cstep) =
+        capture_first_token_fold_constrained(&mut cold, &prompt_2_tools());
+    drop(cold);
+
+    let mut warm = session().with_sampling([grammar, SamplingMode::Greedy]);
+    let _ = warm.complete_text(&prompt_1()).expect("priming call");
+    let (warm_stats, warm_step, warm_cstats, warm_cstep) =
+        capture_first_token_fold_constrained(&mut warm, &prompt_2_tools());
+    assert!(
+        warm.last_usage().cache_read_input_tokens.unwrap_or(0) > 0,
+        "second call must actually hit the breakpoint for this test to \
+         test anything",
+    );
+
+    assert_eq!(cold_step, warm_step, "prose-step counter diverged");
+    assert_eq!(cold_stats, warm_stats, "n-gram stats diverged");
+    assert_eq!(
+        cold_cstep, warm_cstep,
+        "constrained step diverged between cold and incremental folds",
+    );
+    assert_eq!(
+        cold_cstats, warm_cstats,
+        "constrained stats diverged between cold and incremental folds",
+    );
+
+    // Sanity on the seed itself: capability gate passed, defaults on,
+    // and the first token's structural state mutated neither corpus —
+    // the constrained fields still equal the persistent ones.
+    assert!(cold_step > 0, "the fold folded something");
+    assert_eq!(cold_cstep, cold_step, "seed rebases into prose steps");
+    assert_eq!(cold_cstats, cold_stats, "seed clones the corpus");
+}
+
 /// Fork: a fixed session seed makes identical calls bit-reproducible
 /// even with the prefix cache on — the cached stream is ignored by
 /// design (`Some(seed)` arm of the trichotomy).
@@ -163,25 +285,64 @@ fn fork_with_seed_is_reproducible() {
     assert_eq!(a, b, "seeded fork must reproduce exactly");
 }
 
-/// Resume determinism at a prompt breakpoint: with no seed, an
+/// Grabs the whole sampler state at the first sampled token.
+struct StateCapture {
+    out: Arc<Mutex<Option<drama_llama::SamplerState>>>,
+}
+
+impl ProbeHook for StateCapture {
+    fn on_token(&mut self, ctx: ProbeCtx<'_>) {
+        let mut slot = self.out.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(ctx.state.clone());
+        }
+    }
+}
+
+/// Resume at a prompt breakpoint is a fresh draw: with no seed, an
 /// identical repeated prompt resumes the state snapshotted at the
-/// breakpoint — whose rng is the first call's *initial* rng (the fold
-/// never draws) — so the continuation is identical too. This pins the
-/// resume arm without relying on stochastic divergence.
+/// breakpoint but reseeds the rng, so a retry can land elsewhere.
+/// (Before 2026-09-12 the snapshot's rng carried, and a byte-identical
+/// retry replayed the byte-identical output — the Agora wedge.)
+///
+/// Pinned on the state, not the text: two resumed calls derive every
+/// other field identically from the same prompt at the same
+/// breakpoint (the cold ≡ incremental invariant above), so the
+/// captured states differ iff the rng was reseeded. Text divergence
+/// is logit-dependent (a peaked prompt under top-p can leave one
+/// candidate, which no rng can change) and is only printed.
 #[test]
 #[ignore = "long running, requires models/model.gguf"]
-fn resume_at_breakpoint_is_deterministic() {
+fn resume_at_breakpoint_resamples() {
+    let capture = |s: &mut LlamaCppSession| {
+        let out = Arc::new(Mutex::new(None));
+        s.engine_mut()
+            .set_probe_hook(Some(Box::new(StateCapture { out: out.clone() })));
+        let text = s.complete_text(&prompt_1()).expect("complete_text");
+        s.engine_mut().set_probe_hook(None);
+        let state = out.lock().unwrap().take().expect("probe saw no token");
+        (state, text)
+    };
     let mut s = session();
-    let a = s.complete_text(&prompt_1()).expect("call 1");
-    let b = s.complete_text(&prompt_1()).expect("call 2");
+    let (_, cold) = capture(&mut s);
+    let (a, text_a) = capture(&mut s);
     assert!(
         s.last_usage().cache_read_input_tokens.unwrap_or(0) > 0,
         "second call must hit the breakpoint",
     );
-    assert_eq!(
+    let (b, text_b) = capture(&mut s);
+    assert!(
+        s.last_usage().cache_read_input_tokens.unwrap_or(0) > 0,
+        "third call must hit the breakpoint",
+    );
+    println!("cold: {cold:?}\nresumed: {text_a:?}\nresumed: {text_b:?}");
+    assert_eq!(a.ngram_stats(), b.ngram_stats(), "same corpus");
+    assert_eq!(a.step(), b.step(), "same step");
+    assert_ne!(
         a, b,
-        "breakpoint resume replays the same rng position — identical \
-         prompts must produce identical continuations",
+        "two unseeded resumes at the same breakpoint carry the same \
+         sampler state at the first token: the resume arm is replaying \
+         the snapshot's rng instead of reseeding it",
     );
 }
 

@@ -1,0 +1,263 @@
+{#- drama_llama's cache-stable replacement for the Qwen3.6 stock
+    template — see `templates/qwen3.6-gguf.jinja` for the detection key
+    it replaces, and `src/baked.rs` for the loading ladder.
+
+    The stock template `|trim`s an assistant turn's content and thought
+    and `lstrip`/`rstrip`s the halves it splits on `</think>`, then
+    prints a fixed `\n\n` after the close. Any turn the model ends in
+    whitespace, starts with a newline, closes its thought on a blank
+    line, or separates from its thought by anything but exactly
+    `\n\n` re-renders differently than it was generated, and the KV
+    of the whole turn (the auto-tip) is lost on the next request.
+
+    What this template changes, and nothing else: the ASSISTANT turn
+    renders verbatim (see the patch comment in the message loop), the
+    prose-to-call gap is supplied only when the prose does not end in
+    whitespace, and a system turn after the leading run renders as its
+    own `<|im_start|>system` block where stock silently drops it, and
+    every non-string tool-call argument renders with `tojson` where
+    stock renders scalars `| string` (null spelled `none`, and
+    minijinja 2.24+ spells booleans `True`/`False`), so the JSON
+    `null`/`true`/`false` the grammar has the model write renders back
+    as written. The leading system/tools header, user and tool turns,
+    `preserve_thinking`, the rest of tool-call rendering and the
+    generation prompt are byte-identical to stock.
+-#}
+{%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- macro render_content(content, do_vision_count, is_system_content=false) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping %}
+        {%- for item in content %}
+            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain images.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set image_count.value = image_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Picture ' ~ image_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+            {%- elif 'video' in item or item.type == 'video' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain videos.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set video_count.value = video_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Video ' ~ video_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- else %}
+                {{- raise_exception('Unexpected item type in content.') }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif content is none or content is undefined %}
+        {{- '' }}
+    {%- else %}
+        {{- raise_exception('Unexpected content type.') }}
+    {%- endif %}
+{%- endmacro %}
+{%- if not messages %}
+    {{- raise_exception('No messages provided.') }}
+{%- endif %}
+{%- set num_sys = 0 %}
+{%- set merged_system = '' %}
+{%- if messages[0].role == 'system' or messages[0].role == 'developer' %}
+    {%- set first = render_content(messages[0].content, false, true)|trim %}
+    {%- if messages|length > 1 and (messages[1].role == 'system' or messages[1].role == 'developer') %}
+        {%- set second = render_content(messages[1].content, false, true)|trim %}
+        {%- set merged_system = first + '\n' + second %}
+        {%- set num_sys = 2 %}
+    {%- else %}
+        {%- set merged_system = first %}
+        {%- set num_sys = 1 %}
+    {%- endif %}
+{%- endif %}
+{%- if tools and tools is iterable and tools is not mapping %}
+    {{- '<|im_start|>system\n' }}
+    {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>" }}
+    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+    {%- if merged_system %}
+        {{- '\n\n' + merged_system }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- else %}
+    {%- if merged_system %}
+        {{- '<|im_start|>system\n' + merged_system + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = render_content(message.content, false)|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if loop.index0 >= num_sys %}
+    {%- set raw_content = render_content(message.content, true) %}
+    {%- set content = raw_content|trim %}
+    {%- if message.role == "system" or message.role == "developer" %}
+        {#- Mid-conversation system patch (drama_llama): stock skips
+            every system turn but the leading one or two (merged
+            above) without a word, so the model never sees it.
+            Anthropic's Messages API seats system turns
+            mid-conversation on some models, so it renders in the
+            format's own framing instead, its content trimmed like the
+            leading system text. Leading system turns still merge into
+            the header above, byte-identical to stock. -#}
+        {%- set sys_content = render_content(message.content, false, true)|trim %}
+        {{- '<|im_start|>system\n' + sys_content + '<|im_end|>\n' }}
+    {%- elif message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {#- Cache-stability patch (drama_llama): the model's own turn is
+            re-rendered VERBATIM — no `|trim` of the answer or the
+            thought, no `lstrip`/`rstrip` of the halves split on
+            `</think>` — so `render(parse(emission)) == emission` and the
+            KV the turn was generated into stays a byte prefix of the
+            next request. The whitespace the stock template normalized
+            away is carried by the parsed blocks instead: the gap after
+            `</think>` leads the answer, and the prose-to-call gap ends
+            it. The template supplies its canonical `\n\n` only where
+            the content does not already carry whitespace there. -#}
+        {%- set content = raw_content %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- elif '</think>' in content %}
+            {#- Split on the FIRST `</think>`, the one closing the
+                inlined thought (stock keeps only what follows the
+                last, so a second `</think>` in the answer dropped
+                every byte of prose before it). -#}
+            {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}
+            {%- set content = content.split('</think>', 1)[-1] %}
+        {%- endif %}
+        {#- A turn that reasoned again after its prose
+            (`…</think>\n\nProse<think>\nMore.\n</think>…`) renders from
+            drama_llama's `chunks`: the first thought is the turn's own,
+            and each later one sits inline where the model wrote it, in
+            its markers. The merged fields cannot place it (3.6 inlines
+            it without the markers' newlines, 3.8 joins both thoughts in
+            `reasoning_content`). Text after the calls is rendered
+            before them, with the rest, as stock renders the merged
+            content; `text` is the prose alone, for an aged turn. -#}
+        {%- set ns_chunks = namespace(thoughts=0, first=true, reasoning='', content='', text='') %}
+        {%- set chunks = message.chunks if message.chunks is defined else none %}
+        {%- if chunks is not none %}
+            {%- for chunk in chunks %}
+                {%- if chunk.type == 'thinking' %}
+                    {%- set ns_chunks.thoughts = ns_chunks.thoughts + 1 %}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+        {%- if ns_chunks.thoughts > 1 %}
+            {%- for chunk in chunks %}
+                {%- if chunk.type == 'tool_calls' %}
+                {%- elif chunk.type == 'thinking' and ns_chunks.first %}
+                    {%- set ns_chunks.first = false %}
+                    {%- set ns_chunks.reasoning = chunk.thinking %}
+                {%- elif chunk.type == 'thinking' %}
+                    {%- set ns_chunks.content = ns_chunks.content + '<think>\n' + chunk.thinking + '\n</think>' %}
+                {%- else %}
+                    {%- set ns_chunks.content = ns_chunks.content + chunk.text %}
+                    {%- set ns_chunks.text = ns_chunks.text + chunk.text %}
+                {%- endif %}
+            {%- endfor %}
+            {%- set reasoning_content = ns_chunks.reasoning %}
+            {%- set content = ns_chunks.content %}
+        {%- endif %}
+        {%- if (preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index) %}
+            {#- No thought: the `\n\n` belongs to the generation
+                prompt's closed scaffold, never to the emission. -#}
+            {%- set gap = '' if reasoning_content and content.lstrip() != content else '\n\n' %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>' + gap + content }}
+        {%- else %}
+            {#- Aged out without `preserve_thinking`: the thought is
+                dropped, so the turn cannot be byte-stable anyway —
+                render it exactly as stock does, from the untrimmed
+                content: trim, then take the answer after `</think>`
+                with only its leading newlines stripped. The one
+                deviation: the answer follows the FIRST `</think>`, as
+                above, so a second one in the answer keeps its prose. -#}
+            {%- set content = raw_content|trim %}
+            {%- if ns_chunks.thoughts > 1 %}
+                {#- Every thought dropped, the later ones too. -#}
+                {%- set content = ns_chunks.text|trim %}
+            {%- elif message.reasoning_content is not string and '</think>' in content %}
+                {%- set content = content.split('</think>', 1)[-1].lstrip('\n') %}
+            {%- endif %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {%- if loop.first %}
+                    {%- if content|trim and content.rstrip() == content %}
+                        {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- else %}
+                        {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- endif %}
+                {%- else %}
+                    {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                {%- endif %}
+                {%- if tool_call.arguments is mapping %}
+                    {%- for args_name in tool_call.arguments %}
+                        {%- set args_value = tool_call.arguments[args_name] %}
+                        {{- '<parameter=' + args_name + '>\n' }}
+                        {#- Patch: every non-string value renders as JSON
+                            (stock: only mappings and sequences, the rest
+                            `| string`, which spells null `none`), so a
+                            `null`/`true`/`false` the model wrote renders
+                            back as written. Stock 3.8's rule. -#}
+                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
+                        {{- args_value }}
+                        {{- '\n</parameter>\n' }}
+                    {%- endfor %}
+                {%- endif %}
+                {{- '</function>\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.previtem and loop.previtem.role != "tool" %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- content }}
+        {{- '\n</tool_response>' }}
+        {%- if not loop.last and loop.nextitem.role != "tool" %}
+            {{- '<|im_end|>\n' }}
+        {%- elif loop.last %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- else %}
+        {{- '<think>\n' }}
+    {%- endif %}
+{%- endif %}
+{#- Unsloth fixes - developer role, tool calling #}

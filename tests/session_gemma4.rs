@@ -8,6 +8,8 @@
 //! `#[ignore]`d. Run with
 //! `cargo test --features serde --test session_gemma4 -- --ignored`.
 
+mod common;
+
 use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
@@ -22,21 +24,29 @@ fn model_path() -> PathBuf {
         .join("models/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf")
 }
 
-/// Install the cache-stability template sidecar next to the model —
-/// the deployment configuration this suite validates (blallama ships
-/// the same file). Idempotent; sourced from the versioned fixture.
+/// Install the cache-stability template sidecar next to the model.
+/// The same bytes are baked into the crate (`baked::GEMMA4`, #88) and
+/// would apply without any sidecar; installing one anyway makes this
+/// suite exercise rung 1 of the loading ladder over rung 2.
+/// Idempotent; sourced from the shipped template.
 fn install_template_sidecar() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/templates/gemma4-cache-stable.jinja");
+        .join("templates/gemma4-cache-stable.jinja");
     let sidecar = model_path().with_extension("template.jinja");
     std::fs::copy(&fixture, &sidecar).expect("install template sidecar");
 }
 
+/// Seeded via `common::test_seed()`: random by default (free fuzzing),
+/// printed on failure so the trajectory is replayable with
+/// `DRAMA_LLAMA_TEST_SEED=<n>`. The session seed selects the sampler
+/// fork branch (fresh state per call); these suites assert on
+/// emissions and the KV cache, never on the carried sampler stream.
 fn load_session() -> drama_llama::LlamaCppSession {
     install_template_sidecar();
     drama_llama::LlamaCppSession::from_path(model_path())
         .expect("session load")
         .quiet()
+        .with_seed(Some(common::test_seed()))
 }
 
 fn count_letters_prompt() -> Prompt {
@@ -465,4 +475,37 @@ fn prefix_cache_survives_tool_turn() {
          cache across the tool turn (usage: {:?})",
         session.last_usage()
     );
+}
+
+/// A session for the multi-round #96 scenarios: [`load_session`] plus
+/// a real context size — the default `n_ctx` (512) ends the later
+/// rounds at the KV ceiling mid-tool-call.
+fn load_session_8k() -> drama_llama::LlamaCppSession {
+    install_template_sidecar();
+    drama_llama::LlamaCppSession::from_path_with(
+        model_path(),
+        drama_llama::LlamaCppOptions::default().with_n_ctx(8192),
+    )
+    .expect("session load")
+    .quiet()
+    .with_prefix_cache(true)
+    .with_seed(Some(common::test_seed()))
+}
+
+/// #96, the downstream (agentkit) shape against the Gemma 4 dict
+/// dialect: sliding markers, forced tool-call turns, every
+/// continuation resuming past the entire previous prompt via the tip.
+#[test]
+#[ignore = "requires Gemma 4 model"]
+fn tip_anchors_across_tool_rounds_issue_96() {
+    common::tip::assert_tip_anchors_across_tool_rounds(load_session_8k(), 3);
+}
+
+/// #96's probe scenario on Gemma 4: a continuation adding no new
+/// `cache_control` anywhere may only be covered by the tip via the
+/// LCP walk.
+#[test]
+#[ignore = "requires Gemma 4 model"]
+fn tip_anchors_unmarked_continuation_issue_96() {
+    common::tip::assert_tip_anchors_unmarked_continuation(load_session_8k());
 }

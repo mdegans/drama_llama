@@ -1,13 +1,15 @@
 use crate::{ngram::NGramStats, Candidates, Probability, Token};
 // `is_protected` — the region-exit walk shared with the constrained
-// repetition penalty, reused by the region-scoped emit ban (#37).
-use crate::sample::region::RegionGuard as _;
+// repetition penalty, reused by the region-scoped emit ban (#37) and
+// composed with the known-id guard.
+use crate::sample::region::RegionGuard;
 
 use rand::RngExt as _;
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 pub(crate) mod grammar;
+pub(crate) mod ids;
 mod json;
 pub(crate) mod region;
 mod repetition;
@@ -17,6 +19,7 @@ pub use grammar::{
     grammar_stats_enabled, grammar_stats_reset, grammar_stats_snapshot,
     CompiledGrammar, Grammar, GrammarError, GrammarState, GrammarStats,
 };
+pub use ids::IdPattern;
 pub use json::{JsonError, JsonState};
 pub use repetition::{
     apply_sample_repetition_ngram, RepetitionError, RepetitionOptions,
@@ -90,7 +93,7 @@ pub struct SamplerConfig {
     /// (O(log n) per token, the accept-then-mask shape) with a full
     /// masked resample only on a hit, so free prose can't smuggle
     /// chat-framing tokens into the transcript (the emission-side
-    /// sibling of `Session`'s ingest injection guard). The banned
+    /// sibling of `Session`'s ingest-side literal neutralization). The banned
     /// token's byte *text* stays expressible through ordinary
     /// tokenization — this bans the control token id, not the
     /// characters. Empty (the default) disables the check. Runtime
@@ -109,9 +112,10 @@ pub struct SamplerConfig {
     /// those are grammar *literals* — so inside a free region the
     /// exemption buys nothing and costs everything: `<tool_call>` is
     /// byte-legal string content, ban-exempt, and therefore committed as
-    /// the real special id inside an argument value. Relaying that text
-    /// into another session's prompt trips the ingest injection guard
-    /// and kills the receiving loop.
+    /// the real special id inside an argument value — framing where the
+    /// grammar meant content. (Relayed into another session's prompt,
+    /// the text is neutralized at ingest; the id in *this* KV is the
+    /// problem.)
     ///
     /// So this set carries **no marker exemption** (every special except
     /// the EOG family) and is consulted only where frames are never
@@ -134,6 +138,170 @@ pub struct SamplerConfig {
     /// [`banned_specials`]: SamplerConfig::banned_specials
     #[cfg_attr(feature = "serde", serde(default))]
     pub banned_specials_constrained: Vec<Token>,
+    /// The dialect's thought markers as special ids, so a thought
+    /// opener or EOG the model emits inside an open thought is steered
+    /// to the closer (see [`ThoughtSpecials`]). `None` (the default) disables
+    /// the steer. Runtime wiring set by `Session`; like
+    /// [`banned_specials`] it is unreachable from the wire.
+    ///
+    /// [`banned_specials`]: SamplerConfig::banned_specials
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub thought: Option<ThoughtSpecials>,
+    /// The most client tool calls one turn may make — the per-model
+    /// sidecar key `max_tool_calls_per_turn`. `None` (the default) is
+    /// unlimited. Never enforced from here directly: `Session` folds it
+    /// with the request's `disable_parallel_tool_use` into
+    /// [`Self::tool_call_cap`] per call.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub max_tool_calls_per_turn: Option<NonZeroU32>,
+    /// The call's hard cap on tool calls (see [`ToolCallCap`]). `None`
+    /// (the default) disables it. Runtime wiring set by `Session`; like
+    /// [`banned_specials`] it is unreachable from the wire, and never
+    /// read from or written to a sidecar.
+    ///
+    /// [`banned_specials`]: SamplerConfig::banned_specials
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub tool_call_cap: Option<ToolCallCap>,
+}
+
+/// Where a [`ToolCallCap`] came from, for the log that says it fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolCallCapSource {
+    /// The request's `tool_choice.disable_parallel_tool_use`: one call,
+    /// as on Anthropic.
+    Request,
+    /// The model's sidecar: [`SamplerConfig::max_tool_calls_per_turn`].
+    Sidecar,
+}
+
+impl ToolCallCapSource {
+    /// `"request"` or `"sidecar"`, as the log spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Sidecar => "sidecar",
+        }
+    }
+}
+
+/// A hard cap on the client tool calls one turn makes, for
+/// [`SamplerConfig::tool_call_cap`]. Every call the tool-call grammar
+/// completes counts ([`SamplerState`] keeps the tally), a repeat
+/// included — `Session` drops repeats only once the turn is over, so a
+/// loop of one call still meets the cap. Once the `max`-th call
+/// completes, the next token is the model's likeliest end of generation
+/// that the grammar admits there: it ends its own turn, as after any
+/// last call, so the KV and the re-render agree and the turn reports
+/// `tool_use`. Where no end of generation is legal after a call (a
+/// section that must close first), the cap cannot steer and the grammar
+/// decides.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct ToolCallCap {
+    /// The most calls the turn may make.
+    pub max: NonZeroU32,
+    /// Which setting won ([`Self::effective`]).
+    pub source: ToolCallCapSource,
+    /// Identity of the tool-call grammar whose calls count
+    /// ([`CompiledGrammar::source_hash`]), eager or deferred.
+    pub(crate) grammar: [u8; 32],
+    /// What the grammar must still match after a call to finish (a
+    /// section close, an exit marker), or empty when a finished call
+    /// finishes it.
+    pub(crate) close: Vec<u8>,
+}
+
+impl ToolCallCap {
+    /// A cap of `max` calls under `grammar`, which needs `close` after a
+    /// call to finish.
+    pub fn new(
+        max: NonZeroU32,
+        source: ToolCallCapSource,
+        grammar: &CompiledGrammar,
+        close: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            max,
+            source,
+            grammar: grammar.source_hash(),
+            close: close.into(),
+        }
+    }
+
+    /// The tighter of the `request`'s cap and the `sidecar`'s, with its
+    /// source; the request's on a tie. `None` when neither is set:
+    /// unlimited.
+    pub fn effective(
+        request: Option<NonZeroU32>,
+        sidecar: Option<NonZeroU32>,
+    ) -> Option<(NonZeroU32, ToolCallCapSource)> {
+        let request = request.map(|n| (n, ToolCallCapSource::Request));
+        let sidecar = sidecar.map(|n| (n, ToolCallCapSource::Sidecar));
+        match (request, sidecar) {
+            (Some(r), Some(s)) if s.0 < r.0 => Some(s),
+            (Some(r), _) => Some(r),
+            (None, s) => s,
+        }
+    }
+}
+
+/// A dialect's thought opener and closer as special ids, for
+/// [`SamplerConfig::thought`]. While a thought is open the opener is
+/// never legal: a model that emits it wants a second thought without
+/// closing the first, a nest no template renders. The sampler writes
+/// [`Self::steer`] in its place, so the thought closes and the model
+/// may reopen from there; without one, the opener is masked. EOG
+/// inside an open thought is steered alike, so a turn never ends in
+/// one; without a steer, EOG stands.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct ThoughtSpecials {
+    /// Specials that open a thought (sorted).
+    pub opener: Vec<Token>,
+    /// Specials that close one (sorted).
+    pub closer: Vec<Token>,
+    /// The closer as the one token its text tokenizes to, if it is
+    /// one: what a nested opener, or EOG, inside a thought becomes.
+    pub steer: Option<Token>,
+    /// Generation begins inside a thought (a pre-opened render).
+    pub open_at_start: bool,
+}
+
+impl ThoughtSpecials {
+    /// From the opener and closer ids; sorts both.
+    pub fn new(
+        mut opener: Vec<Token>,
+        mut closer: Vec<Token>,
+        steer: Option<Token>,
+        open_at_start: bool,
+    ) -> Self {
+        opener.sort_unstable();
+        opener.dedup();
+        closer.sort_unstable();
+        closer.dedup();
+        Self {
+            opener,
+            closer,
+            steer,
+            open_at_start,
+        }
+    }
+
+    /// Whether a thought is open after `token`, given whether one was
+    /// open before it.
+    pub fn open_after(&self, open: bool, token: Token) -> bool {
+        if self.opener.binary_search(&token).is_ok() {
+            true
+        } else if self.closer.binary_search(&token).is_ok() {
+            false
+        } else {
+            open
+        }
+    }
 }
 
 /// True for modes that constrain *what may be emitted* rather than
@@ -468,6 +636,9 @@ impl SamplerConfig {
             lazy_grammar: default_lazy_grammar(),
             banned_specials: Vec::new(),
             banned_specials_constrained: Vec::new(),
+            thought: None,
+            max_tool_calls_per_turn: None,
+            tool_call_cap: None,
         }
     }
 
@@ -622,12 +793,20 @@ impl Default for SamplerConfig {
             // NOTE: chat/tool-result flows that re-emit a short token from
             // context (e.g. a digit the tool returned) now see a gentle
             // penalty; if that proves a problem, opt back out via a sidecar
-            // or `SamplerConfig::greedy()`.
+            // or `SamplerConfig::greedy()`. As of #106 the corpus also
+            // seeds from tool results and tool-call args by default (the
+            // seeding flags on `RepetitionOptions`), with window/decay
+            // retuned for thread-corpus reach at the same additive cap;
+            // a bare digit still seeds nothing (shorter than the n-gram
+            // window) and surgical mode gates single occurrences.
             repetition: Some(RepetitionOptions::default()),
             deferred_grammar: None,
             lazy_grammar: default_lazy_grammar(),
             banned_specials: Vec::new(),
             banned_specials_constrained: Vec::new(),
+            thought: None,
+            max_tool_calls_per_turn: None,
+            tool_call_cap: None,
         }
     }
 }
@@ -1314,6 +1493,7 @@ impl SamplerConfig {
                 .unwrap_or_default(),
             constrained_ngram_stats: NGramStats::new(),
             constrained_step: 0,
+            tool_calls: 0,
         }
     }
 }
@@ -1324,8 +1504,35 @@ impl SamplerConfig {
 /// continues generation is the caller's call, and a token that
 /// terminates it must never mutate `state` (tip invariant). Callers
 /// that keep generating follow up with [`SamplerState::advance`].
+///
+/// [`sample_token_in`] with no generated text: a sleeping deferred
+/// grammar's trigger is judged only where a single piece spells all
+/// of it.
 pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     tokens: &[Token],
+    candidates: Candidates,
+    opts: &SamplerConfig,
+    state: &mut SamplerState,
+    model: &M,
+) -> Result<Token, SampleError> {
+    sample_token_in(tokens, &[], None, false, candidates, opts, state, model)
+}
+
+/// [`sample_token`], given `generated` — the text generated so far,
+/// which a sleeping deferred grammar's trigger may have started in.
+/// A token that would finish the trigger and wake the grammar on bytes
+/// it refuses is masked (`SamplerState::wakes_deferred_illegally`).
+/// Given the vocabulary's `reserved` pieces, so is an ordinary token
+/// spelling one an active grammar forces
+/// (`SamplerState::spells_forced_framing`). With `thought_open`, the
+/// thought opener and EOG are steered to the closer
+/// ([`ThoughtSpecials`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sample_token_in<M: crate::backend::Model + Sync>(
+    tokens: &[Token],
+    generated: &[u8],
+    reserved: Option<&crate::LiteralNeutralizer>,
+    thought_open: bool,
     mut candidates: Candidates,
     opts: &SamplerConfig,
     state: &mut SamplerState,
@@ -1357,12 +1564,48 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // Stats ingestion lives inside each pass: constrained-span tokens
     // never enter the PERSISTENT stats (structural markers must not
     // seed penalties against later prose, and Session's cold fold
-    // could not re-derive them — seeding excludes tool args). The
-    // call-local accumulator absorbs regime (b) and dies at the call
-    // boundary. Each corpus advances its own step counter only when
-    // its pass executes.
+    // could not re-derive the sampled stream). The call-local
+    // accumulator absorbs regime (b) and dies at the call boundary —
+    // but since #106 it is REBORN seeded: Session clones the folded
+    // corpus (which now ingests tool results and tool-call arg
+    // strings by default) into it after the last breakpoint snapshot,
+    // so free regions feel prompt-history pressure from token one
+    // while the cold≡resume invariant is untouched. One consequence
+    // worth knowing: a deferred-grammar call's thought preamble is
+    // generated AFTER the seed, so the JSON body that follows never
+    // feels pressure from its own thought — regime (a) ingests that
+    // into the persistent corpus only. Each corpus advances its own
+    // step counter only when its pass executes.
+    //
+    // Orthogonal to the regimes: the known-id guard (`sample::ids`).
+    // A token that faithfully copies an identifier from the prompt is
+    // exempt from the logit reduction in (a) and (b) alike — recorded,
+    // never penalized. Built per step from the token history; nothing
+    // in `state`. The same guard knows when a copy is far enough into
+    // exactly one id to be held to it: the id copy-lock (#144), applied
+    // below once the bans are known.
+    //
+    // The tool-call cap (`ToolCallCap`) is read first, off the raw
+    // logits: once the turn has made its last call, the end of
+    // generation the model likes best among those the grammar admits
+    // takes the slot. It is applied last, below, so no ban, penalty or
+    // steer between here and there can move it. Never inside an open
+    // thought, where ending the turn would leave the thought open.
+    let capped = state
+        .tool_call_cap_reached(opts)
+        .filter(|_| !thought_open)
+        .map(|cap| (cap, cap_eog(&candidates, opts, state, model)));
+    let id_guard = opts
+        .repetition
+        .as_ref()
+        .and_then(|r| ids::IdGuard::build(tokens, r.known_ids(), model));
+    let id_lock = id_guard
+        .as_ref()
+        .filter(|_| opts.repetition.as_ref().is_some_and(|r| r.id_copy_lock()))
+        .and_then(ids::IdGuard::lock);
     if let Some(repetition) = &opts.repetition {
         let incomplete = state.constrained_incomplete();
+        let id_guard = id_guard.as_ref().map(|g| g as &dyn RegionGuard);
         // Split borrow: the passes read the resolved ignore set and
         // the matcher positions, and mutate one stats accumulator —
         // disjoint state fields.
@@ -1377,13 +1620,14 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
             ..
         } = &mut *state;
         if !incomplete {
-            candidates = apply_sample_repetition_ngram(
+            candidates = repetition::apply_sample_repetition_ngram_guarded(
                 candidates,
                 tokens,
                 *step,
                 repetition,
                 resolved_ignored,
                 ngram_stats,
+                id_guard,
             )?;
             *step += 1;
         } else if repetition.constrained_regions() {
@@ -1397,6 +1641,12 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                 opts.deferred_grammar.as_ref(),
                 model,
             ) {
+                let region_guard: &dyn RegionGuard = &guard;
+                let both = id_guard.map(|g| region::Either(region_guard, g));
+                let guard: &dyn RegionGuard = match &both {
+                    Some(both) => both,
+                    None => region_guard,
+                };
                 candidates = repetition::apply_sample_repetition_ngram_guarded(
                     candidates,
                     tokens,
@@ -1404,7 +1654,7 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
                     repetition,
                     resolved_ignored,
                     constrained_ngram_stats,
-                    Some(&guard),
+                    Some(guard),
                 )?;
                 *constrained_step += 1;
             }
@@ -1412,17 +1662,68 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     }
 
     let lazy = opts.lazy_grammar && state.has_active_constraint();
-    let banned = opts.banned_specials.as_slice();
+    // Inside an open thought its opener joins the standing ban, so
+    // every masked rerun below drops it too.
+    let open_thought = opts.thought.as_ref().filter(|t| {
+        thought_open
+            && t.opener
+                .iter()
+                .any(|o| opts.banned_specials.binary_search(o).is_err())
+    });
+    let with_opener: Option<Vec<Token>> = open_thought.map(|t| {
+        let mut b = opts.banned_specials.clone();
+        b.extend(&t.opener);
+        b.sort_unstable();
+        b.dedup();
+        b
+    });
+    let banned = with_opener
+        .as_deref()
+        .unwrap_or(opts.banned_specials.as_slice());
     let banned_in_region = opts.banned_specials_constrained.as_slice();
+    let sleeping = state.deferred_inactive() == Some(true);
+    let reserved = reserved
+        .filter(|r| !r.is_empty())
+        .filter(|_| state.has_active_constraint());
 
-    // Fallback snapshots (lazy-grammar check and/or emit-side specials
-    // ban): `Pcg64Mcg` is a single `u128` of state (Clone), `mu` is a
-    // plain `Option<f32>`, and the pre-fold candidates clone is a
-    // straight memcpy of the vector. Restoring these and replaying the
-    // fold consumes the identical RNG draw sequence on either path, so
-    // a fixed seed yields the same stream every run regardless of how
-    // many checks fall back.
-    let snapshot = if lazy || !banned.is_empty() || !banned_in_region.is_empty()
+    // The id copy-lock (#144): mid-copy of exactly one known id, the
+    // model's favorite among the tokens that continue it takes the
+    // slot, and the rest of the chain is skipped — a forced token has
+    // nothing left to sample. Only among tokens every check below would
+    // pass, so it narrows within what is legal and never needs a rerun;
+    // with none, sampling proceeds untouched. A capped turn is the
+    // cap's: it stands aside there.
+    if let Some(token) = id_lock.filter(|_| capped.is_none()).and_then(|lock| {
+        id_lock_pick(
+            &lock,
+            &candidates,
+            IdLockChecks {
+                generated,
+                reserved,
+                banned,
+                banned_in_region,
+                sleeping,
+            },
+            opts,
+            state,
+            model,
+        )
+    }) {
+        return Ok(token);
+    }
+
+    // Fallback snapshots (lazy-grammar check, emit-side specials ban,
+    // and/or a sleeping deferred grammar's wake check): `Pcg64Mcg` is a
+    // single `u128` of state (Clone), `mu` is a plain `Option<f32>`, and
+    // the pre-fold candidates clone is a straight memcpy of the vector.
+    // Restoring these and replaying the fold consumes the identical RNG
+    // draw sequence on either path, so a fixed seed yields the same
+    // stream every run regardless of how many checks fall back.
+    let snapshot = if lazy
+        || sleeping
+        || reserved.is_some()
+        || !banned.is_empty()
+        || !banned_in_region.is_empty()
     {
         Some((state.rng.clone(), state.mu, candidates.clone()))
     } else {
@@ -1487,7 +1788,62 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // no-exemption `banned_specials_constrained` applies instead and
     // `<tool_call>` can no longer be committed as a real special id
     // inside an argument value.
-    let banned = opts.banned_specials.as_slice();
+    //
+    // Before either, the nested-opener steer: an opener inside an open
+    // thought (in `banned` above) is the model asking for a second
+    // thought without closing the first, which no template renders
+    // and #101 rejects. The closer takes its slot instead, keeping the
+    // intent: the thought closes, and the model may reopen from there.
+    // Where the closer can't (no single token, banned, or refused by a
+    // constraint), the ban below masks the opener.
+    if let Some(steer) = open_thought
+        .filter(|t| t.opener.binary_search(&chosen).is_ok())
+        .and_then(|t| t.steer)
+        .filter(|&c| {
+            banned.binary_search(&c).is_err()
+                && state.accepts_chosen(opts, c, model)
+        })
+    {
+        chosen = steer;
+    }
+    // The open-thought EOG steer: EOG inside an open thought ends the
+    // turn without closing it, a shape no template renders and the
+    // session rejects (`Breach::OpenThought`). The closer takes its
+    // slot instead: the model answers from there, or ends again after
+    // it, a closed thought-only turn. Unlike the opener steer this
+    // covers a pre-opened render too, where closing is the model's job.
+    // The closer must pass every check below untouched, so a refusal
+    // can't mask it into some third token: where it can't take the
+    // slot, EOG stands and the breach backstops. A budget cut never
+    // gets here; it is no token the sampler chose.
+    if let Some(steer) = opts
+        .thought
+        .as_ref()
+        .filter(|_| thought_open)
+        .and_then(|t| t.steer)
+        .filter(|_| model.eog_tokens().contains(&chosen))
+        .filter(|&c| {
+            banned.binary_search(&c).is_err()
+                && !(banned_in_region.binary_search(&c).is_ok()
+                    && region::ConstraintGuard::build(
+                        &opts.modes,
+                        &state.matchers,
+                        state.deferred.as_ref(),
+                        opts.deferred_grammar.as_ref(),
+                        model,
+                    )
+                    .is_some_and(|guard| !guard.is_protected(c)))
+                && state.accepts_chosen(opts, c, model)
+                && !reserved.is_some_and(|r| {
+                    state.spells_forced_framing(opts, generated, c, model, r)
+                })
+                && !(sleeping
+                    && state
+                        .wakes_deferred_illegally(opts, generated, c, model))
+        })
+    {
+        chosen = steer;
+    }
     // Accept-then-check, same shape as everything else here: the region
     // query walks every active constraint, so it runs only once the
     // sampled id is known to be in the stricter set. Steady state pays
@@ -1517,9 +1873,9 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     if region_ban
         || (!banned.is_empty() && banned.binary_search(&chosen).is_ok())
     {
-        if let Some((rng_snap, mu_snap, saved)) = snapshot {
-            state.rng = rng_snap;
-            state.mu = mu_snap;
+        if let Some((rng_snap, mu_snap, saved)) = snapshot.as_ref() {
+            state.rng = rng_snap.clone();
+            state.mu = *mu_snap;
             let kept: Vec<crate::TokenData> = saved
                 .as_slice()
                 .iter()
@@ -1543,6 +1899,112 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
         }
     }
 
+    // Spelled-framing check, accept-then-mask again: grammars match
+    // bytes, so a reserved piece they force passes spelled in ordinary
+    // tokens, and the parse then reads it as text. On a hit (rare: only
+    // a token starting a forced piece's spelling) restore the pre-fold
+    // state and drop every such token, alongside the ban above, before
+    // the masked rerun — which leaves the real token.
+    if let Some(reserved) = reserved.filter(|&reserved| {
+        state.spells_forced_framing(opts, generated, chosen, model, reserved)
+    }) {
+        if let Some((rng_snap, mu_snap, saved)) = snapshot.as_ref() {
+            state.rng = rng_snap.clone();
+            state.mu = *mu_snap;
+            let kept: Vec<crate::TokenData> = saved
+                .as_slice()
+                .iter()
+                .filter(|td| {
+                    banned.binary_search(&td.id).is_err()
+                        && !state.spells_forced_framing(
+                            opts, generated, td.id, model, reserved,
+                        )
+                })
+                .copied()
+                .collect();
+            let cleaned = if kept.is_empty() {
+                Candidates::from_vec(vec![crate::TokenData {
+                    id: model.eos(),
+                    logit: 0.0,
+                    p: 0.0,
+                }])
+            } else {
+                Candidates::from_vec_unchecked(kept)
+            };
+            let filtered = apply_modes(cleaned, opts, state, model, false);
+            // INVARIANT: `cleaned` is never empty (EOS stands in), and
+            // the masked filters force EOS rather than empty it.
+            chosen = choose_candidate(&mut state.rng, filtered.softmax(None))
+                .is_one()
+                .unwrap()
+                .id;
+        }
+    }
+
+    // Wake check, accept-then-mask once more: while a deferred grammar
+    // sleeps nothing masks the vocab, so a token that finishes its
+    // trigger and carries bytes the grammar refuses would wake it on
+    // them — and the predictor ends the turn there. On a hit (rare:
+    // only trigger-finishing tokens are examined) restore the pre-fold
+    // state and drop every such token, alongside the ban above, before
+    // the masked rerun.
+    if sleeping
+        && state.wakes_deferred_illegally(opts, generated, chosen, model)
+    {
+        if let Some((rng_snap, mu_snap, saved)) = snapshot {
+            state.rng = rng_snap;
+            state.mu = mu_snap;
+            let kept: Vec<crate::TokenData> = saved
+                .as_slice()
+                .iter()
+                .filter(|td| {
+                    banned.binary_search(&td.id).is_err()
+                        && !state.wakes_deferred_illegally(
+                            opts, generated, td.id, model,
+                        )
+                })
+                .copied()
+                .collect();
+            let cleaned = if kept.is_empty() {
+                Candidates::from_vec(vec![crate::TokenData {
+                    id: model.eos(),
+                    logit: 0.0,
+                    p: 0.0,
+                }])
+            } else {
+                Candidates::from_vec_unchecked(kept)
+            };
+            let filtered = apply_modes(cleaned, opts, state, model, false);
+            chosen = choose_candidate(&mut state.rng, filtered.softmax(None))
+                .is_one()
+                .unwrap()
+                .id;
+        }
+    }
+
+    match capped {
+        Some((cap, Some(eog))) => {
+            tracing::warn!(
+                target: "drama_llama::sample",
+                event = "tool_call_cap",
+                cap = cap.max.get(),
+                source = cap.source.as_str(),
+                "ended the turn at its tool-call cap",
+            );
+            chosen = eog;
+        }
+        Some((cap, None)) => tracing::warn!(
+            target: "drama_llama::sample",
+            event = "tool_call_cap",
+            cap = cap.max.get(),
+            source = cap.source.as_str(),
+            outcome = "unenforceable",
+            "tool-call cap reached, but no end of generation is legal \
+             here; the grammar decides",
+        ),
+        None => {}
+    }
+
     // NOTE: constraint matchers are deliberately NOT advanced here.
     // The caller decides whether the chosen token continues generation
     // and calls `state.advance` only then (tip invariant: a token that
@@ -1550,6 +2012,129 @@ pub(crate) fn sample_token<M: crate::backend::Model + Sync>(
     // absent from the cache entries and the KV alike, so the state must
     // not carry its bytes either). See `TokenPredictor::next`.
     Ok(chosen)
+}
+
+/// The emission checks of [`sample_token_in`], for [`id_lock_pick`] to
+/// apply up front.
+struct IdLockChecks<'a> {
+    generated: &'a [u8],
+    reserved: Option<&'a crate::LiteralNeutralizer>,
+    /// The standing ban, with an open thought's opener.
+    banned: &'a [Token],
+    banned_in_region: &'a [Token],
+    sleeping: bool,
+}
+
+/// The id copy-lock's token (#144): of the candidates whose pieces keep
+/// to `lock`'s id ([`ids::Lock::admits`]), the highest-rated one every
+/// emission check passes — grammar and JSON matchers, `Deny` ranges,
+/// both bans (the in-region one wholesale, never weaker than the
+/// position-aware check), spelled framing, and an illegal wake. Never
+/// an end of generation. `None` when no token qualifies: the lock does
+/// not engage and the step samples as if it were off.
+fn id_lock_pick<M: crate::backend::Model + Sync>(
+    lock: &ids::Lock<'_>,
+    candidates: &Candidates,
+    checks: IdLockChecks<'_>,
+    opts: &SamplerConfig,
+    state: &SamplerState,
+    model: &M,
+) -> Option<Token> {
+    use rayon::prelude::*;
+    // The piece scan is the vocab-wide part; the checks below run on
+    // the handful it keeps (one per spelling length, give or take).
+    let mut admitted: Vec<crate::TokenData> = candidates
+        .as_slice()
+        .par_iter()
+        .map_init(
+            || Vec::with_capacity(model.max_token_len()),
+            |buf, td| lock.admits_token(model, td.id, buf).then_some(*td),
+        )
+        .flatten()
+        .collect();
+    admitted.sort_unstable_by(|a, b| b.logit.total_cmp(&a.logit));
+    let eog = model.eog_tokens();
+    let denied = |token: Token| {
+        opts.modes.iter().any(|mode| {
+            matches!(mode, SamplingMode::Deny { range } if range.contains(&token))
+        })
+    };
+    let legal = |token: Token| {
+        !eog.contains(&token)
+            && checks.banned.binary_search(&token).is_err()
+            && checks.banned_in_region.binary_search(&token).is_err()
+            && !denied(token)
+            && state.accepts_chosen(opts, token, model)
+            && !checks.reserved.is_some_and(|r| {
+                state.spells_forced_framing(
+                    opts,
+                    checks.generated,
+                    token,
+                    model,
+                    r,
+                )
+            })
+            && !(checks.sleeping
+                && state.wakes_deferred_illegally(
+                    opts,
+                    checks.generated,
+                    token,
+                    model,
+                ))
+    };
+    let pick = admitted.iter().map(|td| td.id).find(|&token| legal(token));
+    match pick {
+        Some(token) => {
+            let mut piece = Vec::with_capacity(model.max_token_len());
+            model.token_to_piece_ref(token, &mut piece);
+            let released = lock.releases(&piece);
+            if lock.fresh || released {
+                tracing::debug!(
+                    target: "drama_llama::sample",
+                    event = "id_copy_lock",
+                    outcome = if released { "released" } else { "engaged" },
+                    id_len = lock.id.len(),
+                    matched = lock.matched,
+                    "held a known-id copy to its id",
+                );
+            }
+        }
+        None => tracing::debug!(
+            target: "drama_llama::sample",
+            event = "id_copy_lock",
+            outcome = "no_legal_continuation",
+            id_len = lock.id.len(),
+            matched = lock.matched,
+            admitted = admitted.len(),
+            "no legal token continues the known id; sampling unchanged",
+        ),
+    }
+    pick
+}
+
+/// The end of generation a capped turn ends on: of the model's EOG
+/// tokens every active constraint admits here (and no ban refuses —
+/// none does in practice), the one `candidates`
+/// rates highest — the model's own choice of how to end — else the
+/// first admitted. `None` when none is admitted.
+fn cap_eog<M: crate::backend::Model>(
+    candidates: &Candidates,
+    opts: &SamplerConfig,
+    state: &SamplerState,
+    model: &M,
+) -> Option<Token> {
+    let eog = model.eog_tokens();
+    let legal = |token: Token| {
+        opts.banned_specials.binary_search(&token).is_err()
+            && state.accepts_chosen(opts, token, model)
+    };
+    candidates
+        .as_slice()
+        .iter()
+        .filter(|td| eog.contains(&td.id) && legal(td.id))
+        .max_by(|a, b| a.logit.total_cmp(&b.logit))
+        .map(|td| td.id)
+        .or_else(|| eog.iter().copied().find(|&token| legal(token)))
 }
 
 /// Fold `candidates` through `opts.modes` in order, with the activated
@@ -1732,8 +2317,47 @@ mod tests {
     // append-only. 8+ serve the constrained-repetition battery: a bare
     // quote and the merged close `",` — the token shape the bare-char
     // ignore list can never cover.
-    const PIECES: &[&str] =
-        &["", "a", "b", "c", "x", "", "a", "b", "\"", "\","];
+    const PIECES: &[&str] = &[
+        "",
+        "a",
+        "b",
+        "c",
+        "x",
+        "",
+        "a",
+        "b",
+        "\"",
+        "\",",
+        // 10+: the UUID battery — hex chunks and the dash, spelling
+        // `deadbeef-cafe-f00d-cafe-0123456789ab`.
+        "-",
+        "dead",
+        "beef",
+        "cafe",
+        "f00d",
+        "0123456789ab",
+        // 16: a boundary piece — separates identifier words.
+        " ",
+        // 17+: a multi-word id (#113), spelled the digit-splitting way
+        // (`Sept`, `.`, ` `, `7`) every probed tokenizer uses.
+        "Sept",
+        ".",
+        "7",
+        "8",
+        // 21+: the id copy-lock battery (#144) — the Agora sentinel
+        // `00000000-0000-0000-0000-000000000001` and the nil UUID, and
+        // the mock UUID's last group split three ways (`012345678`
+        // then `9ab`, the drift `9ac`, and `9ab",`, which completes the
+        // id and closes a JSON string).
+        "00000000",
+        "0000",
+        "000000000001",
+        "000000000000",
+        "012345678",
+        "9ab",
+        "9ac",
+        "9ab\",",
+    ];
     const EOS: Token = 0;
     const A: Token = 1;
     const B: Token = 2;
@@ -1741,6 +2365,28 @@ mod tests {
     const X: Token = 4;
     const QUOTE: Token = 8;
     const QUOTE_COMMA: Token = 9;
+    const DASH: Token = 10;
+    const DEAD: Token = 11;
+    const BEEF: Token = 12;
+    const CAFE: Token = 13;
+    const F00D: Token = 14;
+    const HEX12: Token = 15;
+    const SPACE: Token = 16;
+    const SEPT: Token = 17;
+    const DOT: Token = 18;
+    const SEVEN: Token = 19;
+    const EIGHT: Token = 20;
+    const Z8: Token = 21;
+    const Z4: Token = 22;
+    const Z12_ONE: Token = 23;
+    const Z12_NIL: Token = 24;
+    const H9: Token = 25;
+    const T9AB: Token = 26;
+    const T9AC: Token = 27;
+    const T9AB_CLOSE: Token = 28;
+    /// One canonical UUID as the mock spells it: `8-4-4-4-12`.
+    const UUID_TOKENS: [Token; 10] =
+        [DEAD, BEEF, DASH, CAFE, DASH, F00D, DASH, CAFE, DASH, HEX12];
     /// A reserved-style token whose piece is empty but which is NOT
     /// EOS — the Qwen3.6 shape behind the post-complete budget-burn
     /// loop.
@@ -2241,6 +2887,9 @@ mod tests {
             lazy_grammar: false,
             banned_specials: standing,
             banned_specials_constrained: in_region,
+            thought: None,
+            max_tool_calls_per_turn: None,
+            tool_call_cap: None,
         }
     }
 
@@ -2287,6 +2936,9 @@ mod tests {
             lazy_grammar: false,
             banned_specials: vec![],
             banned_specials_constrained: vec![X],
+            thought: None,
+            max_tool_calls_per_turn: None,
+            tool_call_cap: None,
         };
         let mut state = state_for(&opts);
         let picked = sample_token(
@@ -2301,6 +2953,105 @@ mod tests {
             picked, X,
             "the stricter set must not apply without a permissive region"
         );
+    }
+
+    // ── Nested thought opener ────────────────────────────────────────
+
+    /// Inside an open thought the opener (`X`) is steered to the closer
+    /// (`A`); outside one it stays legal, and with no single-token
+    /// closer it is masked. A closer already banned is no steer either.
+    #[test]
+    fn a_nested_thought_opener_is_steered_to_the_closer() {
+        let pick = |steer: Option<Token>, banned: Vec<Token>, open: bool| {
+            let opts = SamplerConfig {
+                modes: vec![SamplingMode::Greedy],
+                repetition: None,
+                banned_specials: banned,
+                thought: Some(ThoughtSpecials::new(
+                    vec![X],
+                    vec![A],
+                    steer,
+                    false,
+                )),
+                ..SamplerConfig::default()
+            };
+            let mut state = state_for(&opts);
+            sample_token_in(
+                &[],
+                b"",
+                None,
+                open,
+                cands(&[(X, 10.0), (B, 5.0), (A, 1.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap()
+        };
+        assert_eq!(pick(Some(A), vec![], true), A, "steered");
+        assert_eq!(pick(Some(A), vec![], false), X, "no thought open");
+        assert_eq!(pick(None, vec![], true), B, "masked");
+        assert_eq!(pick(Some(A), vec![A], true), B, "closer banned");
+        // An opener the call bans already (a pre-opened render) stays
+        // masked: closing there would leave no way to reopen.
+        assert_eq!(pick(Some(A), vec![X], true), B, "opener spent");
+    }
+
+    /// EOG (`EOS`, and an extra EOG) inside an open thought is steered
+    /// to the closer (`A`), a pre-opened thought included. Outside one,
+    /// with no single-token closer, or with the closer banned, EOG
+    /// stands: never masked into a third token.
+    #[test]
+    fn eog_inside_an_open_thought_is_steered_to_the_closer() {
+        let pick = |eog: Token,
+                    steer: Option<Token>,
+                    banned: Vec<Token>,
+                    open: bool,
+                    open_at_start: bool| {
+            let opts = SamplerConfig {
+                modes: vec![SamplingMode::Greedy],
+                repetition: None,
+                banned_specials: banned,
+                thought: Some(ThoughtSpecials::new(
+                    vec![X],
+                    vec![A],
+                    steer,
+                    open_at_start,
+                )),
+                ..SamplerConfig::default()
+            };
+            let mut state = state_for(&opts);
+            sample_token_in(
+                &[],
+                b"",
+                None,
+                open,
+                cands(&[(eog, 10.0), (B, 5.0), (A, 1.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap()
+        };
+        assert_eq!(pick(EOS, Some(A), vec![], true, false), A, "steered");
+        assert_eq!(pick(EOG_A, Some(A), vec![], true, false), A, "any EOG");
+        assert_eq!(
+            pick(EOS, Some(A), vec![X], true, true),
+            A,
+            "pre-opened: opener spent, EOG still closes the thought"
+        );
+        assert_eq!(pick(EOS, Some(A), vec![], false, false), EOS, "closed");
+        assert_eq!(pick(EOS, None, vec![], true, false), EOS, "no steer");
+        assert_eq!(pick(EOS, Some(A), vec![A], true, false), EOS, "banned");
+    }
+
+    #[test]
+    fn thought_specials_track_open_and_close() {
+        let t = ThoughtSpecials::new(vec![X], vec![A], Some(A), false);
+        assert!(t.open_after(false, X));
+        assert!(!t.open_after(true, A));
+        assert!(t.open_after(true, B));
+        assert!(!t.open_after(false, B));
     }
 
     /// Structural positions inside a live grammar are not free regions
@@ -2448,6 +3199,57 @@ mod tests {
         // A fresh state from the same config starts at root again.
         let fresh = state_for(&opts);
         assert!(grammar_accepts(&opts, &fresh, b"a"));
+    }
+
+    /// At an accepting-but-*extensible* state — after the first
+    /// repetition of `"ab"+`, the shape of a parallel call section
+    /// after its first call — EOG must be legal by id on both paths,
+    /// whatever its piece bytes: empty (`EOS`), byte-legal (`EOG_A`),
+    /// or byte-illegal (`EOG_B`). Judged by bytes it was unreachable —
+    /// the legal continuation keeps the filter's force-EOS branch from
+    /// firing — and the model was forced to extend until the budget
+    /// (Mistral Small 4: 26 identical calls, every run). A non-EOG
+    /// empty piece stays illegal, and extending stays legal.
+    #[test]
+    fn eog_legal_at_extensible_accept() {
+        for lazy in [true, false] {
+            let opts = SamplerConfig {
+                modes: vec![SamplingMode::grammar(r#"root ::= "ab"+"#)
+                    .expect("test grammar parses")],
+                repetition: None,
+                deferred_grammar: None,
+                lazy_grammar: lazy,
+                ..SamplerConfig::default()
+            };
+            let mut state = state_for(&opts);
+            assert_eq!(sample(cands(&[(A, 20.0)]), &opts, &mut state), A);
+            assert_eq!(sample(cands(&[(B, 20.0)]), &opts, &mut state), B);
+            assert!(state.grammar_complete());
+            assert!(grammar_accepts(&opts, &state, b"a"), "still extensible");
+
+            for eog in [EOS, EOG_A, EOG_B] {
+                let tok = sample(
+                    cands(&[(eog, 20.0), (A, -20.0)]),
+                    &opts,
+                    &mut state.clone(),
+                );
+                assert_eq!(tok, eog, "lazy={lazy}: dominant EOG must win");
+            }
+            // The model may equally choose to extend…
+            let tok = sample(
+                cands(&[(EOS, -20.0), (A, 20.0)]),
+                &opts,
+                &mut state.clone(),
+            );
+            assert_eq!(tok, A, "lazy={lazy}");
+            // …and a reserved empty piece is still not a way out.
+            let tok = sample(
+                cands(&[(RSV, 20.0), (A, -20.0)]),
+                &opts,
+                &mut state.clone(),
+            );
+            assert_eq!(tok, A, "lazy={lazy}");
+        }
     }
 
     /// Empty pieces are rejected mid-grammar on both paths: an active
@@ -2772,6 +3574,45 @@ mod tests {
         );
     }
 
+    /// An overrule is EOG on top of the raw candidates where the
+    /// constraint refuses it inside a value. EOG anywhere else — below
+    /// the top, at accept, at a structural position, with no constraint
+    /// — is the model's own ending, or framing the grammar writes for
+    /// it, and corrupts nothing.
+    #[test]
+    fn overrules_eog_only_inside_a_value_on_top() {
+        let in_string = SamplerConfig {
+            modes: vec![SamplingMode::grammar(STR_GRAMMAR).unwrap()],
+            repetition: None,
+            ..SamplerConfig::default()
+        };
+        let top = |eog| cands(&[(eog, 9.0), (B, 1.0)]);
+        let mut mid = state_for(&in_string);
+        mid.advance(&in_string, QUOTE, &MockModel);
+        mid.advance(&in_string, A, &MockModel);
+        assert!(mid.overrules_eog(&in_string, &top(EOS), &MockModel));
+        assert!(mid.overrules_eog(&in_string, &top(EOG_A), &MockModel));
+        let below = cands(&[(EOS, 1.0), (B, 9.0)]);
+        assert!(!mid.overrules_eog(&in_string, &below, &MockModel));
+
+        let mut done = mid.clone();
+        done.advance(&in_string, QUOTE_COMMA, &MockModel);
+        assert!(!done.overrules_eog(&in_string, &top(EOS), &MockModel));
+
+        // `root ::= "ab"` after `a`: a literal, not a value.
+        let literal = opts_with_grammar(false);
+        let mut framing = state_for(&literal);
+        framing.advance(&literal, A, &MockModel);
+        assert!(!framing.overrules_eog(&literal, &top(EOS), &MockModel));
+
+        let bare = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: None,
+            ..SamplerConfig::default()
+        };
+        assert!(!state_for(&bare).overrules_eog(&bare, &top(EOS), &MockModel));
+    }
+
     /// The eager half is unchanged by the deferred clause: an eager
     /// grammar that never reached accept still flags, and a config with
     /// no byte-constraint at all never does (plain prose generation
@@ -3011,6 +3852,78 @@ mod tests {
         }
     }
 
+    /// A token that finishes a sleeping deferred grammar's trigger and
+    /// carries bytes the grammar refuses past it (cogito's `>\n\n\n`
+    /// after `</`) is masked, not sampled: the predictor would wake the
+    /// grammar on those bytes and end the turn there. Here the trigger
+    /// is `a"` and the grammar `"x"`: `",` after `a` would wake it on
+    /// `,`, while a bare `"` wakes it on nothing. The trigger may have
+    /// started tokens ago, so the check reads the generated text; a
+    /// sampler shown none judges only what one piece spells.
+    #[test]
+    fn a_token_that_wakes_the_deferred_grammar_illegally_is_masked() {
+        for lazy in [false, true] {
+            let opts = SamplerConfig {
+                modes: Vec::new(),
+                repetition: None,
+                deferred_grammar: Some(crate::DeferredGrammar {
+                    grammar: CompiledGrammar::parse(r#"root ::= "x""#).unwrap(),
+                    activate_after: vec![b"a\"".to_vec()],
+                    feed_trigger: false,
+                }),
+                lazy_grammar: lazy,
+                ..SamplerConfig::default()
+            };
+            let pick = |generated: &[u8]| {
+                let mut state = state_for(&opts);
+                let picked = sample_token_in(
+                    &[],
+                    generated,
+                    None,
+                    false,
+                    cands(&[(QUOTE_COMMA, 10.0), (QUOTE, 5.0), (B, 1.0)]),
+                    &opts,
+                    &mut state,
+                    &MockModel,
+                )
+                .expect("sample_token_in");
+                assert_eq!(
+                    state.deferred_inactive(),
+                    Some(true),
+                    "sampling never wakes the grammar"
+                );
+                picked
+            };
+            assert_eq!(pick(b"thinking a"), QUOTE, "lazy={lazy}");
+            assert_eq!(pick(b"thinking b"), QUOTE_COMMA, "lazy={lazy}");
+            assert_eq!(pick(b""), QUOTE_COMMA, "lazy={lazy}");
+
+            // Wake legally or not at all: every trigger-finishing token
+            // refused, the rest stay.
+            let mut state = state_for(&opts);
+            let picked = sample_token_in(
+                &[],
+                b"a",
+                None,
+                false,
+                cands(&[(QUOTE_COMMA, 10.0), (B, 1.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap();
+            assert_eq!(picked, B, "lazy={lazy}");
+            // An active grammar is the matcher's business, not this check's.
+            state.deferred.as_mut().unwrap().active = true;
+            assert!(!state.wakes_deferred_illegally(
+                &opts,
+                b"a",
+                QUOTE_COMMA,
+                &MockModel
+            ));
+        }
+    }
+
     /// A populated mid-call snapshot round-trips the constrained
     /// fields bit-exactly with canonical bytes. (Blobs from a binary
     /// predating the fields deserialize via `serde(default)` — worth
@@ -3194,6 +4107,36 @@ mod tests {
         assert_eq!(seeded(A), B);
     }
 
+    /// #106 companion to the above: the same contrast under
+    /// *seeded-corpus-shaped* pressure — occurrences at prose
+    /// positions with the step rebased past them, exactly the shape
+    /// `Session`'s `fold_and_snapshot` seeding produces. The guard,
+    /// not windowed decay, must be what protects the exit.
+    #[test]
+    fn constrained_exit_token_never_penalized_seeded_corpus() {
+        let opts = str_opts(true, false);
+
+        let seeded = |seed_tok: Token| -> Token {
+            let mut state = state_for(&opts);
+            state.advance(&opts, QUOTE, &MockModel);
+            // Corpus-shaped: 20 occurrences at prose positions
+            // 100..120, step rebased to 120 — recent enough that
+            // decay leaves heavy live pressure (effective ≈ 12 at
+            // the 0.95 default).
+            for s in 100..120 {
+                state
+                    .constrained_ngram_stats
+                    .add(crate::NGram::from(seed_tok), s);
+            }
+            state.constrained_step = 120;
+            let c = dense(&[(seed_tok, 4.0), (B, 3.9)]);
+            sample_token(&[QUOTE], c, &opts, &mut state, &MockModel).unwrap()
+        };
+
+        assert_eq!(seeded(QUOTE_COMMA), QUOTE_COMMA);
+        assert_eq!(seeded(A), B);
+    }
+
     /// Structural states skip the guarded pass entirely (build returns
     /// None): counters stay zero and the pick matches the feature-off
     /// run — exactly the pre-feature suspension.
@@ -3270,5 +4213,709 @@ mod tests {
         let (off_tokens, off_state) = run(false);
         assert_eq!(on_tokens, off_tokens);
         assert_eq!(on_state, off_state);
+    }
+
+    // ── Known-id battery (`sample::ids`) ─────────────────────────────
+
+    /// The mock's one UUID, as the pieces spell it.
+    const UUID_TEXT: &str = "deadbeef-cafe-f00d-cafe-0123456789ab";
+
+    /// Greedy, heavy repetition, no grammar; `known` installs the UUID
+    /// as the call's one known id (or nothing).
+    fn id_opts(known: bool) -> SamplerConfig {
+        let mut rep = RepetitionOptions::default()
+            .set_ignored_categories(std::iter::empty())
+            .set_penalty_repeat(1.1)
+            .set_penalty_freq(0.5)
+            .set_penalty_present(0.5);
+        if known {
+            rep = rep.with_known_ids(std::collections::BTreeSet::from([
+                UUID_TEXT.as_bytes().to_vec(),
+            ]));
+        }
+        SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: Some(rep),
+            deferred_grammar: None,
+            lazy_grammar: false,
+            ..SamplerConfig::default()
+        }
+    }
+
+    /// Emit ` `, then the UUID twice with ` ` between, each intended
+    /// token narrowly ahead of the decoy ` ` (a boundary piece — `x`
+    /// would glue onto the partial word). Returns the chosen and the
+    /// intended streams and the final state.
+    fn drive_id_twice(
+        opts: &SamplerConfig,
+    ) -> (Vec<Token>, Vec<Token>, SamplerState) {
+        let mut intended = vec![SPACE];
+        intended.extend_from_slice(&UUID_TOKENS);
+        intended.push(SPACE);
+        intended.extend_from_slice(&UUID_TOKENS);
+
+        let mut state = state_for(opts);
+        let mut tokens: Vec<Token> = Vec::new();
+        for &want in &intended {
+            let c = if want == SPACE {
+                dense(&[(SPACE, 4.0)])
+            } else {
+                dense(&[(want, 4.0), (SPACE, 3.9)])
+            };
+            let tok =
+                sample_token(&tokens, c, opts, &mut state, &MockModel).unwrap();
+            state.advance(opts, tok, &MockModel);
+            tokens.push(tok);
+        }
+        (tokens, intended, state)
+    }
+
+    /// The headline: a known id is re-emitted byte-exact under heavy
+    /// penalty — **every** token, the first group included — while the
+    /// corpus still records it (exempt at apply time, not invisible).
+    #[test]
+    fn known_id_reemitted_verbatim() {
+        let (tokens, intended, state) = drive_id_twice(&id_opts(true));
+        assert_eq!(tokens, intended, "no decoy may win");
+        assert_eq!(state.step(), intended.len() as u64, "every pass ran");
+        for inside in [DEAD, DASH, CAFE, HEX12] {
+            assert!(
+                state
+                    .ngram_stats()
+                    .get(&crate::NGram::from(inside))
+                    .is_some(),
+                "{inside} is recorded, just never penalized"
+            );
+        }
+    }
+
+    /// Counterfactual: no known ids, the same drive drifts — the
+    /// dashes repeat within one UUID and the decoy wins past the first.
+    #[test]
+    fn unknown_id_drifts() {
+        let (tokens, intended, _) = drive_id_twice(&id_opts(false));
+        let diverged = tokens
+            .iter()
+            .zip(&intended)
+            .position(|(a, b)| a != b)
+            .expect("the penalty must bite somewhere");
+        assert_eq!(tokens[diverged], SPACE);
+        assert!(diverged > 3, "{tokens:?}");
+    }
+
+    /// Steering: after two emissions, at a word boundary, the faithful
+    /// first token beats a heavily-favoured wrong start with the id
+    /// known, and loses to it without — only copies of known ids are
+    /// exempt; everything else keeps its full penalty.
+    #[test]
+    fn known_id_steers_toward_faithful_start() {
+        let pick = |known: bool| -> Token {
+            let opts = id_opts(known);
+            let (tokens, _, mut state) = drive_id_twice(&opts);
+            let mut tokens = tokens;
+            // Open a new word.
+            let sp = sample_token(
+                &tokens,
+                dense(&[(SPACE, 4.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap();
+            state.advance(&opts, sp, &MockModel);
+            tokens.push(sp);
+            // `cafe` has been seen four times, `dead` twice; `cafe` is
+            // not how any known id starts.
+            sample_token(
+                &tokens,
+                dense(&[(CAFE, 6.0), (DEAD, 4.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap()
+        };
+        assert_eq!(pick(true), DEAD, "exempt from its first byte");
+        assert_eq!(pick(false), CAFE, "no known ids: raw logits + penalty");
+    }
+
+    /// #113: a date is an id with a space in it. Re-emit `Sept. 7`
+    /// four times under heavy penalty, each id token narrowly ahead of
+    /// the wrong digit. Known, it is copied verbatim across its space;
+    /// unknown, the penalty pushes the model onto `8`.
+    #[test]
+    fn multi_word_known_id_reemitted_verbatim() {
+        let run = |known: bool| -> (Vec<Token>, Vec<Token>) {
+            let mut rep = RepetitionOptions::default()
+                .set_ignored_categories(std::iter::empty())
+                .set_penalty_repeat(1.1)
+                .set_penalty_freq(0.5)
+                .set_penalty_present(0.5);
+            if known {
+                rep = rep.with_known_ids(std::collections::BTreeSet::from([
+                    b"Sept. 7".to_vec(),
+                ]));
+            }
+            let opts = SamplerConfig {
+                modes: vec![SamplingMode::Greedy],
+                repetition: Some(rep),
+                deferred_grammar: None,
+                lazy_grammar: false,
+                ..SamplerConfig::default()
+            };
+            let mut intended = Vec::new();
+            for _ in 0..4 {
+                intended.extend([SPACE, SEPT, DOT, SPACE, SEVEN]);
+            }
+            let mut state = state_for(&opts);
+            let mut tokens: Vec<Token> = Vec::new();
+            for (i, &want) in intended.iter().enumerate() {
+                // The separator between copies is not part of the id
+                // and is penalized like any repeat, so it gets a wide
+                // margin; every token of the id itself gets a rival.
+                let c = if i % 5 == 0 {
+                    dense(&[(want, 100.0)])
+                } else {
+                    dense(&[(want, 4.0), (EIGHT, 3.9)])
+                };
+                let tok =
+                    sample_token(&tokens, c, &opts, &mut state, &MockModel)
+                        .unwrap();
+                state.advance(&opts, tok, &MockModel);
+                tokens.push(tok);
+            }
+            (tokens, intended)
+        };
+        let (tokens, intended) = run(true);
+        assert_eq!(tokens, intended, "the known date is copied verbatim");
+        let (tokens, intended) = run(false);
+        assert_ne!(tokens, intended, "unknown, the penalty must bite");
+        assert!(tokens.contains(&EIGHT), "{tokens:?}");
+    }
+
+    /// Regime (b): inside a grammar string body the id guard composes
+    /// with the region guard (`Either`). With `aaaaaaaa` known, the
+    /// content token `a` is a faithful copy for exactly eight steps and
+    /// is penalized on the ninth — at which point the protected exit
+    /// `",` wins and the grammar completes.
+    #[test]
+    fn known_id_exempt_inside_free_region() {
+        let mut opts = str_opts(true, false);
+        let rep = opts.repetition.take().unwrap();
+        opts.repetition =
+            Some(rep.with_known_ids(std::collections::BTreeSet::from([
+                b"aaaaaaaa".to_vec(),
+            ])));
+        let (state, tokens, completed) = drive_string_island(&opts, 16);
+        assert!(completed, "{tokens:?}");
+        let mut want = vec![QUOTE];
+        want.extend(std::iter::repeat_n(A, 8));
+        want.push(QUOTE_COMMA);
+        assert_eq!(tokens, want);
+        assert!(state.constrained_step() > 0);
+    }
+
+    // ── Id copy-lock battery (#144) ──────────────────────────────────
+
+    /// Greedy, no penalty to speak of, `known` as the call's known ids:
+    /// whatever the sampler picks is the raw favorite or the lock's.
+    fn lock_opts(known: &[&str]) -> SamplerConfig {
+        SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: Some(
+                RepetitionOptions::default()
+                    .set_ignored_categories(std::iter::empty())
+                    .set_penalty_repeat(1.0)
+                    .set_penalty_freq(0.0)
+                    .set_penalty_present(0.0)
+                    .with_known_ids(
+                        known.iter().map(|id| id.as_bytes().to_vec()).collect(),
+                    ),
+            ),
+            deferred_grammar: None,
+            lazy_grammar: false,
+            ..SamplerConfig::default()
+        }
+    }
+
+    /// Feed `history`, then sample one token from `logits`.
+    fn pick_after(
+        opts: &SamplerConfig,
+        history: &[Token],
+        logits: &[(Token, f32)],
+    ) -> Token {
+        let mut state = state_for(opts);
+        history
+            .iter()
+            .for_each(|&t| state.advance(opts, t, &MockModel));
+        sample_token(history, dense(logits), opts, &mut state, &MockModel)
+            .unwrap()
+    }
+
+    /// ` deadbeef` then the first `n` tokens of the rest of the UUID.
+    fn uuid_after(n: usize) -> Vec<Token> {
+        std::iter::once(SPACE)
+            .chain(UUID_TOKENS.iter().copied().take(2 + n))
+            .collect()
+    }
+
+    /// Past eight matched characters the true continuation wins over a
+    /// drift the model rates higher; with the lock off, the drift wins.
+    #[test]
+    fn id_lock_forces_the_true_continuation() {
+        let opts = lock_opts(&[UUID_TEXT]);
+        // ` deadbeef-cafe-` — `f00d` is due, `beef` is the drift.
+        let history = uuid_after(3);
+        let drift = [(BEEF, 6.0), (F00D, 2.0)];
+        assert_eq!(pick_after(&opts, &history, &drift), F00D);
+        let mut off = opts.clone();
+        off.repetition = off.repetition.map(|r| r.set_id_copy_lock(false));
+        assert_eq!(pick_after(&off, &history, &drift), BEEF, "lock off");
+        // At exactly eight (` deadbeef`) the copy may end as a label,
+        // but not drift.
+        let history = uuid_after(0);
+        assert_eq!(pick_after(&opts, &history, &[(X, 6.0), (DASH, 2.0)]), DASH);
+        assert_eq!(
+            pick_after(&opts, &history, &[(SPACE, 6.0), (DASH, 2.0)]),
+            SPACE,
+            "a short label ends at a word boundary"
+        );
+        // Past the label, no early exit either.
+        let history = uuid_after(1);
+        assert_eq!(
+            pick_after(&opts, &history, &[(SPACE, 6.0), (CAFE, 2.0)]),
+            CAFE
+        );
+    }
+
+    /// Fewer than eight characters is still the choice of which id:
+    /// no lock.
+    #[test]
+    fn id_lock_waits_for_eight_characters() {
+        let opts = lock_opts(&[UUID_TEXT]);
+        assert_eq!(
+            pick_after(&opts, &[SPACE, DEAD], &[(X, 6.0), (BEEF, 2.0)]),
+            X
+        );
+    }
+
+    /// Two known ids sharing ` deadbeef-cafe-`: no lock there; once the
+    /// copy picks one (`f00d`), it holds.
+    #[test]
+    fn id_lock_waits_for_a_unique_prefix() {
+        let opts =
+            lock_opts(&[UUID_TEXT, "deadbeef-cafe-cafe-cafe-0123456789ab"]);
+        let at_fork = uuid_after(3);
+        assert_eq!(
+            pick_after(&opts, &at_fork, &[(BEEF, 6.0), (F00D, 2.0)]),
+            BEEF,
+            "shared prefix: sampling untouched"
+        );
+        let past_fork = uuid_after(4);
+        assert_eq!(
+            pick_after(&opts, &past_fork, &[(SPACE, 6.0), (DASH, 2.0)]),
+            DASH
+        );
+    }
+
+    /// The Agora sentinel never locks: with it the only known id, a
+    /// nil UUID is written freely — and the model's own `…0001` too.
+    #[test]
+    fn id_lock_never_holds_a_sentinel() {
+        let opts = lock_opts(&["00000000-0000-0000-0000-000000000001"]);
+        let history = [SPACE, Z8, DASH, Z4, DASH, Z4, DASH, Z4, DASH];
+        let nil = [(Z12_NIL, 6.0), (Z12_ONE, 2.0)];
+        assert_eq!(pick_after(&opts, &history, &nil), Z12_NIL);
+        let one = [(Z12_ONE, 6.0), (Z12_NIL, 2.0)];
+        assert_eq!(pick_after(&opts, &history, &one), Z12_ONE);
+        // A real id beside it still locks.
+        let opts =
+            lock_opts(&["00000000-0000-0000-0000-000000000001", UUID_TEXT]);
+        assert_eq!(
+            pick_after(&opts, &uuid_after(3), &[(BEEF, 6.0), (F00D, 2.0)]),
+            F00D
+        );
+    }
+
+    /// The lock prefers the model's favorite spelling, a token that
+    /// completes the id and leaves the word included, and releases once
+    /// the id is complete.
+    #[test]
+    fn id_lock_prefers_the_favorite_and_releases_at_the_end() {
+        let opts = lock_opts(&[UUID_TEXT]);
+        let mut history = uuid_after(7);
+        // ` deadbeef-cafe-f00d-cafe-`: both spellings continue the id.
+        assert_eq!(
+            pick_after(&opts, &history, &[(X, 9.0), (H9, 5.0), (HEX12, 4.0)]),
+            H9
+        );
+        history.push(H9);
+        assert_eq!(
+            pick_after(
+                &opts,
+                &history,
+                &[(T9AC, 9.0), (T9AB_CLOSE, 5.0), (T9AB, 4.0)]
+            ),
+            T9AB_CLOSE,
+            "complete, then out of the word"
+        );
+        history.push(T9AB);
+        assert_eq!(
+            pick_after(&opts, &history, &[(X, 9.0), (SPACE, 4.0)]),
+            X,
+            "complete: released"
+        );
+    }
+
+    /// Inside a JSON string body (the tool-argument case) the lock holds
+    /// the copy and the grammar still completes — the closing piece is
+    /// both the id's end and the region's exit.
+    #[test]
+    fn id_lock_holds_inside_a_constrained_string() {
+        let mut opts = str_opts(true, false);
+        opts.repetition = opts.repetition.map(|r| {
+            r.set_penalty_repeat(1.0)
+                .set_penalty_freq(0.0)
+                .set_penalty_present(0.0)
+                .with_known_ids(std::collections::BTreeSet::from([UUID_TEXT
+                    .as_bytes()
+                    .to_vec()]))
+        });
+        for lazy in [false, true] {
+            opts.lazy_grammar = lazy;
+            let mut state = state_for(&opts);
+            let mut tokens = vec![QUOTE];
+            tokens.extend(&UUID_TOKENS[..2]);
+            tokens.extend([DASH, CAFE, DASH, F00D, DASH, CAFE, DASH, H9]);
+            tokens
+                .iter()
+                .for_each(|&t| state.advance(&opts, t, &MockModel));
+            let drift = [(T9AC, 9.0), (QUOTE_COMMA, 8.0), (T9AB_CLOSE, 2.0)];
+            let tok = sample_token(
+                &tokens,
+                dense(&drift),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap();
+            assert_eq!(tok, T9AB_CLOSE, "lazy={lazy}");
+            state.advance(&opts, tok, &MockModel);
+            assert!(state.grammar_complete(), "lazy={lazy}");
+        }
+    }
+
+    /// No legal continuation (here the standing ban refuses the dash
+    /// that is due), no lock: sampling proceeds as without one.
+    #[test]
+    fn id_lock_stands_aside_when_nothing_legal_continues() {
+        let mut opts = lock_opts(&[UUID_TEXT]);
+        opts.banned_specials = vec![DASH];
+        // ` deadbeef-cafe`: a dash is due.
+        let history = uuid_after(2);
+        assert_eq!(
+            pick_after(&opts, &history, &[(X, 6.0), (DASH, 9.0)]),
+            X,
+            "the ban governs; the drift is the model's next choice"
+        );
+    }
+
+    /// With no known ids, the lock's presence changes nothing: a
+    /// sampled (not greedy) stream and its state are identical with the
+    /// lock on and off.
+    #[test]
+    fn id_lock_without_known_ids_changes_nothing() {
+        let run = |on: bool| {
+            let mut opts = lock_opts(&[]);
+            opts.modes = vec![SamplingMode::Temperature { t: 1.0 }];
+            opts.repetition = opts.repetition.map(|r| r.set_id_copy_lock(on));
+            let mut state = state_for(&opts);
+            let mut tokens = vec![SPACE];
+            for _ in 0..24 {
+                let c = dense(&[
+                    (DEAD, 3.0),
+                    (BEEF, 3.0),
+                    (DASH, 2.5),
+                    (CAFE, 2.0),
+                    (SPACE, 1.0),
+                ]);
+                let tok =
+                    sample_token(&tokens, c, &opts, &mut state, &MockModel)
+                        .unwrap();
+                state.advance(&opts, tok, &MockModel);
+                tokens.push(tok);
+            }
+            (tokens, state)
+        };
+        let (on, on_state) = run(true);
+        let (off, off_state) = run(false);
+        assert_eq!(on, off);
+        assert_eq!(on_state, off_state);
+    }
+
+    /// `root ::= "a" ( "c" "a" )*` — a call is `a`, joined by `c`: the
+    /// parallel-call shape (`call ( SEP call )*`).
+    const CALLS_GRAMMAR: &str = r#"root ::= "a" ( "c" "a" )*"#;
+
+    /// [`CALLS_GRAMMAR`] eager and greedy, capped at `max` calls when
+    /// `max` is set; with `close`, the calls must end in `b`.
+    fn capped_opts(max: Option<u32>, close: &str) -> SamplerConfig {
+        let source = format!(
+            r#"root ::= "a" ( "c" "a" )*{}"#,
+            if close.is_empty() {
+                String::new()
+            } else {
+                format!(r#" "{close}""#)
+            }
+        );
+        let grammar = CompiledGrammar::parse(&source).expect("parses");
+        SamplerConfig {
+            modes: vec![
+                SamplingMode::Grammar(grammar.clone()),
+                SamplingMode::Greedy,
+            ],
+            repetition: None,
+            lazy_grammar: false,
+            tool_call_cap: max.and_then(NonZeroU32::new).map(|max| {
+                ToolCallCap::new(
+                    max,
+                    ToolCallCapSource::Sidecar,
+                    &grammar,
+                    close,
+                )
+            }),
+            ..SamplerConfig::default()
+        }
+    }
+
+    /// The model wants another call: the separator far above any end.
+    fn wants_more() -> Candidates {
+        cands(&[(C, 10.0), (A, 9.0), (EOS, 3.0), (EOG_A, 1.0)])
+    }
+
+    /// Every completed call counts, the same call repeated included —
+    /// a loop of one call must meet the cap too — and nothing counts
+    /// without a cap.
+    #[test]
+    fn tool_call_cap_counts_every_completed_call() {
+        for (max, want) in [(Some(9), 3), (None, 0)] {
+            let opts = capped_opts(max, "");
+            let mut state = state_for(&opts);
+            for token in [A, C, A, C, A] {
+                assert_eq!(
+                    sample(cands(&[(token, 1.0)]), &opts, &mut state),
+                    token
+                );
+            }
+            assert_eq!(state.tool_calls(), want, "{max:?}");
+        }
+    }
+
+    /// After the `max`-th call, the next token is the end of generation
+    /// the model rates highest, however much more it wants another
+    /// call; before it, the model calls on. Without a cap, nothing
+    /// changes.
+    #[test]
+    fn tool_call_cap_ends_the_turn_after_the_last_call() {
+        let opts = capped_opts(Some(2), "");
+        let mut state = state_for(&opts);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        assert_eq!(sample(wants_more(), &opts, &mut state), C);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        assert_eq!(state.tool_calls(), 2);
+        let end =
+            sample_token(&[], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(end, EOS, "the likeliest end the grammar admits");
+
+        let opts = capped_opts(None, "");
+        let mut state = state_for(&opts);
+        for token in [A, C, A] {
+            assert_eq!(
+                sample(cands(&[(token, 1.0)]), &opts, &mut state),
+                token
+            );
+        }
+        let more =
+            sample_token(&[], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(more, C, "uncapped, the model calls on");
+    }
+
+    /// The end is applied last: a mask, a ban or a penalty that would
+    /// refuse it cannot move it. A banned end of generation is passed
+    /// over for the next one.
+    #[test]
+    fn tool_call_cap_outlasts_later_masks() {
+        let mut opts = capped_opts(Some(1), "");
+        // Every end of generation denied by the chain.
+        opts.modes.insert(1, SamplingMode::deny_range(EOS..EOS + 1));
+        opts.modes
+            .insert(1, SamplingMode::deny_range(EOG_A..EOG_B + 1));
+        opts.repetition = Some(
+            RepetitionOptions::default()
+                .set_ignored_categories(std::iter::empty())
+                .set_penalty_repeat(2.0),
+        );
+        let mut state = state_for(&opts);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        let end =
+            sample_token(&[A], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(end, EOS);
+
+        opts.banned_specials = vec![EOS];
+        let end =
+            sample_token(&[A], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(end, EOG_A);
+    }
+
+    /// Where the calls must be closed (`b` here: a section close, an
+    /// exit marker), a call counts once the close alone would finish
+    /// the grammar, and the turn ends on the end of generation that
+    /// closes it — Gemma 4's `<|tool_response>` shape — never on one
+    /// the grammar refuses there.
+    #[test]
+    fn tool_call_cap_closes_a_section_with_its_exit() {
+        let opts = capped_opts(Some(1), "b");
+        let mut state = state_for(&opts);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        assert_eq!(state.tool_calls(), 1);
+        let end = sample_token(
+            &[],
+            cands(&[(C, 10.0), (EOS, 5.0), (EOG_A, 4.0), (EOG_B, 1.0)]),
+            &opts,
+            &mut state,
+            &MockModel,
+        )
+        .unwrap();
+        assert_eq!(end, EOG_B);
+    }
+
+    /// Only the cap's own grammar counts: a cap naming another grammar
+    /// (an output_config's, say) sees no calls.
+    #[test]
+    fn tool_call_cap_counts_only_its_grammar() {
+        let mut opts = capped_opts(Some(1), "");
+        let other = CompiledGrammar::parse(AB_GRAMMAR).expect("parses");
+        opts.tool_call_cap = Some(ToolCallCap::new(
+            NonZeroU32::MIN,
+            ToolCallCapSource::Request,
+            &other,
+            "",
+        ));
+        let mut state = state_for(&opts);
+        assert_eq!(sample(cands(&[(A, 1.0)]), &opts, &mut state), A);
+        assert_eq!(state.tool_calls(), 0);
+        assert_eq!(sample(wants_more(), &opts, &mut state), C);
+    }
+
+    /// A deferred (lazy) tool grammar counts once its trigger wakes it,
+    /// and its tally is the turn's: a reset zeroes it.
+    #[test]
+    fn tool_call_cap_counts_a_deferred_grammar() {
+        let grammar = CompiledGrammar::parse(CALLS_GRAMMAR).expect("parses");
+        let opts = SamplerConfig {
+            modes: vec![SamplingMode::Greedy],
+            repetition: None,
+            lazy_grammar: false,
+            deferred_grammar: Some(DeferredGrammar {
+                grammar: grammar.clone(),
+                activate_after: vec![b"a".to_vec()],
+                feed_trigger: true,
+            }),
+            tool_call_cap: Some(ToolCallCap::new(
+                NonZeroU32::new(2).unwrap(),
+                ToolCallCapSource::Sidecar,
+                &grammar,
+                "",
+            )),
+            ..SamplerConfig::default()
+        };
+        let mut state = state_for(&opts);
+        // Asleep, nothing counts.
+        assert_eq!(sample(cands(&[(X, 1.0)]), &opts, &mut state), X);
+        let spec = opts.deferred_grammar.as_ref().unwrap();
+        state.activate_deferred(spec, b"").unwrap();
+        for token in [A, C, A] {
+            assert_eq!(
+                sample(cands(&[(token, 1.0)]), &opts, &mut state),
+                token
+            );
+        }
+        assert_eq!(state.tool_calls(), 2);
+        let end =
+            sample_token(&[], wants_more(), &opts, &mut state, &MockModel)
+                .unwrap();
+        assert_eq!(end, EOS);
+        state.reset_constraints(&opts);
+        assert_eq!(state.tool_calls(), 0);
+    }
+
+    /// The tighter cap wins, the request's on a tie; neither set is no
+    /// cap at all.
+    /// The cap and the lock never contend in practice (the cap acts
+    /// between calls, the lock mid-id), but where both could, the cap
+    /// wins: a known `acacacacac` is nine bytes into its copy when the
+    /// fifth call completes, and the turn still ends.
+    #[test]
+    fn tool_call_cap_outranks_the_id_lock() {
+        let mut opts = capped_opts(Some(5), "");
+        opts.repetition = Some(
+            RepetitionOptions::default()
+                .set_ignored_categories(std::iter::empty())
+                .set_penalty_repeat(1.0)
+                .set_penalty_freq(0.0)
+                .set_penalty_present(0.0)
+                .with_known_ids(std::collections::BTreeSet::from([
+                    b"acacacacac".to_vec(),
+                ])),
+        );
+        let mut state = state_for(&opts);
+        let mut tokens = Vec::new();
+        for _ in 0..12 {
+            let tok = sample_token(
+                &tokens,
+                dense(&[(C, 10.0), (A, 9.0), (EOS, 3.0), (EOG_A, 1.0)]),
+                &opts,
+                &mut state,
+                &MockModel,
+            )
+            .unwrap();
+            if crate::backend::Model::eog_tokens(&MockModel).contains(&tok) {
+                break;
+            }
+            state.advance(&opts, tok, &MockModel);
+            tokens.push(tok);
+        }
+        assert_eq!(tokens, [A, C, A, C, A, C, A, C, A]);
+    }
+
+    #[test]
+    fn tool_call_cap_effective_precedence() {
+        use ToolCallCapSource::{Request, Sidecar};
+        let n = |n| NonZeroU32::new(n);
+        assert_eq!(ToolCallCap::effective(None, None), None);
+        assert_eq!(
+            ToolCallCap::effective(n(1), None),
+            Some((n(1).unwrap(), Request))
+        );
+        assert_eq!(
+            ToolCallCap::effective(None, n(3)),
+            Some((n(3).unwrap(), Sidecar))
+        );
+        assert_eq!(
+            ToolCallCap::effective(n(1), n(3)),
+            Some((n(1).unwrap(), Request))
+        );
+        assert_eq!(
+            ToolCallCap::effective(n(5), n(3)),
+            Some((n(3).unwrap(), Sidecar))
+        );
+        assert_eq!(
+            ToolCallCap::effective(n(3), n(3)),
+            Some((n(3).unwrap(), Request))
+        );
     }
 }

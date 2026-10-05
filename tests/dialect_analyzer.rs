@@ -4,16 +4,20 @@
 //! newlines here are the trained format, not formatting accidents.
 
 use drama_llama::dialect::{
-    analyze_template, CallSyntax, Family, ReasoningMode,
+    analyze_template, CallSyntax, Family, ReasoningMode, ReasoningReingest,
 };
+use drama_llama::JsonSpacing;
 
 fn analyze(fixture: &str, bos: &str, eos: &str) -> CallSyntax {
-    let path = format!(
-        "{}/tests/fixtures/templates/{fixture}",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {path}: {e}"));
+    // Vendored fixtures live under `tests/fixtures/templates/`; the
+    // fleet templates were promoted to shipped artifacts in crate-root
+    // `templates/` (the `baked` registry, #88) and resolve from there.
+    let root = env!("CARGO_MANIFEST_DIR");
+    let fixture_path = format!("{root}/tests/fixtures/templates/{fixture}");
+    let baked_path = format!("{root}/templates/{fixture}");
+    let source = std::fs::read_to_string(&fixture_path)
+        .or_else(|_| std::fs::read_to_string(&baked_path))
+        .unwrap_or_else(|e| panic!("read {fixture_path} | {baked_path}: {e}"));
     analyze_template(&source, bos, eos)
         .unwrap_or_else(|e| panic!("analyze {fixture}: {e}"))
 }
@@ -33,7 +37,9 @@ fn qwen3_coder_xml() {
     assert_eq!(s.arguments.name_prefix, "<parameter=", "{s:#?}");
     assert_eq!(s.arguments.name_suffix, ">\n", "{s:#?}");
     assert_eq!(s.arguments.value_suffix, "\n</parameter>\n", "{s:#?}");
-    assert_eq!(s.trigger(), "<tool_call>\n", "{s:#?}");
+    // The bare special: the opener's newline is the grammar's to force
+    // (#101 — a trigger that included it missed every other follow-up).
+    assert_eq!(s.trigger(), "<tool_call>", "{s:#?}");
     // #58: the `loop.first`-gated newline the template weaves between
     // consecutive calls. Without it a multi-call turn re-renders as
     // `</tool_call>\n<tool_call>` but the grammar forces
@@ -56,6 +62,53 @@ fn qwen36_gguf_xml() {
     assert_eq!(s.arguments.name_suffix, ">\n", "{s:#?}");
     assert_eq!(s.arguments.value_suffix, "\n</parameter>\n", "{s:#?}");
     assert_eq!(s.call_separator, "\n", "{s:#?}"); // #58, see above
+
+    // This template reconstructs reasoning by splitting `content` on
+    // `</think>`, so inlining renders identically to the field.
+    assert_eq!(s.reasoning.reingest, ReasoningReingest::InlineThink);
+    assert_eq!(s.reasoning.end, "\n</think>", "{s:#?}");
+    assert_eq!(s.reasoning.separator.as_deref(), Some("\n\n"), "{s:#?}");
+}
+
+/// The owned Qwen templates change only how an assistant turn's
+/// whitespace, a mid-conversation system turn and (3.6) a non-string
+/// tool-call argument re-render, so they must analyze to exactly the
+/// stock dialect — the grammars, the parser and `render_reference`
+/// are unchanged by the bake.
+#[test]
+fn qwen_cache_stable_analyzes_like_stock() {
+    for (stock, owned) in [
+        ("qwen3.6-gguf.jinja", "qwen3.6-cache-stable.jinja"),
+        ("qwen3.8-gguf.jinja", "qwen3.8-cache-stable.jinja"),
+    ] {
+        assert_eq!(
+            analyze(owned, "", "<|im_end|>"),
+            analyze(stock, "", "<|im_end|>"),
+            "{owned}"
+        );
+    }
+}
+
+/// Qwen3.8 (Unsloth GGUF dump): the same XML call dialect as 3.6, but
+/// the template dropped 3.6's `content.split('</think>')` and reads
+/// reasoning from `reasoning_content` alone. Under the old
+/// `InlineThink` default every thinking turn re-rendered its thought as
+/// *content* after an empty `<think>\n\n</think>`, so no emission was
+/// byte-stable and the tip never anchored (#112). The reingest probe
+/// measures the difference.
+#[test]
+fn qwen38_gguf_field_reasoning() {
+    let s = analyze("qwen3.8-gguf.jinja", "", "<|im_end|>");
+    assert_eq!(s.family, Family::TagWithTagged, "{s:#?}");
+    assert_eq!(s.per_call_start, "<tool_call>\n", "{s:#?}");
+    assert_eq!(s.arguments.value_suffix, "\n</parameter>\n", "{s:#?}");
+    assert_eq!(s.call_separator, "\n", "{s:#?}");
+    assert_eq!(s.reasoning.mode, ReasoningMode::TagBased, "{s:#?}");
+    assert_eq!(s.reasoning.start, "<think>\n", "{s:#?}");
+    assert_eq!(s.reasoning.end, "\n</think>", "{s:#?}");
+    assert_eq!(s.reasoning.reingest, ReasoningReingest::Field, "{s:#?}");
+    // What follows `\n</think>` — the grammars spell it (#112).
+    assert_eq!(s.reasoning.separator.as_deref(), Some("\n\n"), "{s:#?}");
 }
 
 /// Qwen3 chat (0.6B template): Hermes-style JSON inside <tool_call>
@@ -90,6 +143,40 @@ fn qwen35_xml() {
     );
 }
 
+/// Cogito (stock and bake): per-call `<tool_call>` markers, and the
+/// template's `\n` between consecutive calls measured as the separator.
+/// The two probe calls share their arguments, so the analyzer's diff
+/// comes back rotated (`</tool_call>\n<tool_call>…`); it read as no
+/// separator at all, and the grammar forced calls back to back
+/// against the template's re-render.
+#[test]
+fn cogito_parallel_calls_separator() {
+    for fixture in ["cogito-gguf.jinja", "cogito-cache-stable.jinja"] {
+        let s = analyze(fixture, "", "<|im_end|>");
+        assert_eq!(s.family, Family::JsonNative, "{fixture}: {s:#?}");
+        assert_eq!(s.per_call_start, "<tool_call>\n", "{fixture}: {s:#?}");
+        assert_eq!(s.per_call_end, "\n</tool_call>", "{fixture}: {s:#?}");
+        assert_eq!(s.call_separator, "\n", "{fixture}: {s:#?}");
+        assert_eq!(s.trigger(), "<tool_call>", "{fixture}: {s:#?}");
+    }
+}
+
+/// The same rotated diff, outside cogito: the Hermes 3 and Qwen3 0.6B
+/// per-call JSON templates measured no separator before the cogito fix,
+/// and measure the `\n` they render between calls now.
+#[test]
+fn per_call_json_parallel_calls_separator() {
+    for fixture in [
+        "NousResearch-Hermes-3-Llama-3.1-8B-tool_use.jinja",
+        "Qwen-Qwen3-0.6B.jinja",
+    ] {
+        let s = analyze(fixture, "", "<|im_end|>");
+        assert_eq!(s.family, Family::JsonNative, "{fixture}: {s:#?}");
+        assert_eq!(s.per_call_start, "<tool_call>\n", "{fixture}: {s:#?}");
+        assert_eq!(s.call_separator, "\n", "{fixture}: {s:#?}");
+    }
+}
+
 /// Hermes 3: the original <tool_call>{json}</tool_call> shape —
 /// JSON_NATIVE with section markers.
 #[test]
@@ -107,6 +194,31 @@ fn hermes3_json_in_section() {
         "trigger: {:?}\n{s:#?}",
         s.trigger()
     );
+    // Stock `tojson` re-renders arguments compact; the grammar and
+    // render_reference must pin the same spelling.
+    assert_eq!(s.arguments.json_spacing, JsonSpacing::Compact, "{s:#?}");
+}
+
+/// A template rendering arguments through the `json_dumps` filter —
+/// the owned-template shape (#88) — measures `Spaced`, and the
+/// measurement is what pins the grammar prelude and render_reference
+/// to the model's `json.dumps` habit. Minimal inline source so the
+/// property is pinned independently of any particular owned template.
+#[test]
+fn json_dumps_template_measures_spaced() {
+    let source = r#"{%- for m in messages -%}
+<|im_start|>{{ m.role }}
+{% if m.tool_calls %}{%- for tc in m.tool_calls -%}
+<tool_call>
+{"name": "{{ tc.function.name }}", "arguments": {{ tc.function.arguments | json_dumps }}}
+</tool_call>
+{%- endfor %}{% else %}{{ m.content }}{% endif %}<|im_end|>
+{% endfor -%}
+{%- if add_generation_prompt -%}<|im_start|>assistant
+{% endif -%}"#;
+    let s = analyze_template(source, "", "<|im_end|>").expect("analyze");
+    assert_eq!(s.family, Family::JsonNative, "{s:#?}");
+    assert_eq!(s.arguments.json_spacing, JsonSpacing::Spaced, "{s:#?}");
 }
 
 /// Llama 3.1: bare JSON with `parameters` as the args field.
@@ -173,13 +285,13 @@ fn gptoss_sniffed() {
     // Structurally single-call: <|call|> is EOG, so the parallel gate
     // (keyed on per_call_start) must stay off.
     assert_eq!(s.per_call_start, "");
-    // Conservative lazy triggers — see CallSyntax::triggers docs.
+    // Every recipient arms the grammar — see CallSyntax::triggers docs.
     assert_eq!(
         s.triggers(),
         vec![
-            "<|start|>assistant to=functions.".to_string(),
-            "<|channel|>commentary to=functions.".to_string(),
-            "<|channel|>analysis to=functions.".to_string(),
+            "<|start|>assistant to=".to_string(),
+            "<|channel|>commentary to=".to_string(),
+            "<|channel|>analysis to=".to_string(),
         ]
     );
 }
@@ -192,4 +304,103 @@ fn toolless_template_family_none() {
 {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"#;
     let s = analyze_template(source, "", "<|end|>").expect("analyze");
     assert_eq!(s.family, Family::None, "{s:#?}");
+}
+
+/// Mistral Small 4 (`mistral4`). Structurally a family we already
+/// speak: `TagWithJson` with the function name outside the JSON and no
+/// wrapper object — `[TOOL_CALLS]get_weather[ARGS]{"city":"Paris"}` —
+/// so the differential probes derive it whole, with no `PATCHES`
+/// entry, no `sniff_hand_built` arm and no new `Family` variant. Every
+/// marker here is a single special token in the model's vocab.
+///
+/// Reasoning is `None` on stock deliberately: the stock template
+/// accepts a thought only as a `thinking`-typed content chunk, never
+/// as a message field, so there is nothing for the probes to see. That
+/// gap is the owned template's job — see [`mistral4_cache_stable`].
+#[test]
+fn mistral4_stock() {
+    let s = analyze("mistral4-gguf.jinja", "<s>", "</s>");
+    assert_eq!(s.family, Family::TagWithJson, "{s:#?}");
+    assert_eq!(s.per_call_start, "[TOOL_CALLS]", "{s:#?}");
+    assert_eq!(s.per_call_end, "", "{s:#?}");
+    assert_eq!(s.function.name_prefix, "", "{s:#?}");
+    assert_eq!(s.function.name_suffix, "[ARGS]", "{s:#?}");
+    assert_eq!(s.function.close, "", "{s:#?}");
+    assert_eq!(s.call_separator, "", "{s:#?}");
+    assert_eq!(s.arguments.json_spacing, JsonSpacing::Compact, "{s:#?}");
+    assert_eq!(s.user_start, "[INST]", "{s:#?}");
+    assert_eq!(s.tool_response_start, "", "{s:#?}");
+    assert_eq!(s.reasoning.mode, ReasoningMode::None, "{s:#?}");
+    assert_eq!(s.trigger(), "[TOOL_CALLS]", "{s:#?}");
+}
+
+/// The owned template must measure identically on the call path — the
+/// rewrite touches the turn close and the reasoning channel, nothing
+/// the grammar or `render_reference` keys on — and must additionally
+/// expose `[THINK]` as a `TagBased` channel re-ingested through the
+/// `reasoning_content` *field*.
+///
+/// `Field` is measured by the reingest probe: an inlined
+/// `<think>…</think>` renders here as literal content, while the
+/// `reasoning_content` field renders inside `[THINK]…[/THINK]`. (This
+/// used to take a source-sniffing `PATCHES` entry; the probe that
+/// fixed Qwen3.8, #112, subsumes it.)
+#[test]
+fn mistral4_cache_stable() {
+    let s = analyze("mistral4-cache-stable.jinja", "<s>", "</s>");
+    assert_eq!(s.family, Family::TagWithJson, "{s:#?}");
+    assert_eq!(s.per_call_start, "[TOOL_CALLS]", "{s:#?}");
+    assert_eq!(s.function.name_suffix, "[ARGS]", "{s:#?}");
+    assert_eq!(s.function.close, "", "{s:#?}");
+    // Spaced, unlike stock: the owned template renders arguments with
+    // `json_dumps` because that is this model's measured unforced
+    // habit (`probe_unforced_habit::mistral4_unforced_call_spelling`).
+    assert_eq!(s.arguments.json_spacing, JsonSpacing::Spaced, "{s:#?}");
+    assert_eq!(s.reasoning.mode, ReasoningMode::TagBased, "{s:#?}");
+    assert_eq!(s.reasoning.start, "[THINK]", "{s:#?}");
+    assert_eq!(s.reasoning.end, "[/THINK]", "{s:#?}");
+    assert_eq!(s.reasoning.reingest, ReasoningReingest::Field, "{s:#?}");
+    // Nothing between `[/THINK]` and what follows.
+    assert_eq!(s.reasoning.separator.as_deref(), Some(""), "{s:#?}");
+    assert!(s.preserved_tokens.iter().any(|t| t == "[THINK]"), "{s:#?}");
+    assert!(
+        s.preserved_tokens.iter().any(|t| t == "[TOOL_CALLS]"),
+        "{s:#?}"
+    );
+}
+
+/// `reasoning_effort` levels measured against the shipped and fixture
+/// templates. Qwen3.8 rejects `max`; stock Mistral accepts only `high`
+/// (`none` is off the scale); the Mistral cache-stable template derives
+/// the value from `enable_thinking`, so the variable has no effect;
+/// gpt-oss validates nothing and gets its trained three.
+#[test]
+fn reasoning_efforts_measured() {
+    let cases: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "qwen3.8-gguf.jinja",
+            "",
+            "<|im_end|>",
+            &["low", "medium", "high", "xhigh"],
+        ),
+        ("mistral4-gguf.jinja", "<s>", "</s>", &["high"]),
+        ("mistral4-cache-stable.jinja", "<s>", "</s>", &[]),
+        (
+            "gptoss-gguf.jinja",
+            "<|startoftext|>",
+            "<|return|>",
+            &["low", "medium", "high"],
+        ),
+        (
+            "gptoss-cache-stable.jinja",
+            "<|startoftext|>",
+            "<|return|>",
+            &["low", "medium", "high"],
+        ),
+        ("qwen3.6-gguf.jinja", "", "<|im_end|>", &[]),
+    ];
+    for (fixture, bos, eos, want) in cases {
+        let s = analyze(fixture, bos, eos);
+        assert_eq!(s.reasoning.efforts, *want, "{fixture}");
+    }
 }

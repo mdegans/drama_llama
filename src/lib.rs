@@ -25,9 +25,10 @@ mod sample;
 pub use sample::{
     apply_request_sampling, grammar_stats_enabled, grammar_stats_reset,
     grammar_stats_snapshot, CompiledGrammar, DeferredGrammar, Grammar,
-    GrammarError, GrammarState, GrammarStats, JsonError, JsonState, Mirostat,
-    RepetitionError, RepetitionOptions, SamplerConfig, SamplerState,
-    SamplingMode, SamplingParams,
+    GrammarError, GrammarState, GrammarStats, IdPattern, JsonError, JsonState,
+    Mirostat, RepetitionError, RepetitionOptions, SamplerConfig, SamplerState,
+    SamplingMode, SamplingParams, ThoughtSpecials, ToolCallCap,
+    ToolCallCapSource,
 };
 
 pub mod backend;
@@ -56,8 +57,9 @@ pub use prompt::{
 
 mod chat_template;
 pub use chat_template::{
-    tokenize_with_breakpoints, ChatTemplate, ChatTemplateError,
-    PromptBreakpoint, RenderOptions, RenderedWithBreakpoints,
+    check_cache_controls, tokenize_with_breakpoints, ChatTemplate,
+    ChatTemplateError, LiteralNeutralizer, Literals, PromptBreakpoint,
+    RenderOptions, RenderedWithBreakpoints, MAX_CACHE_CONTROLS,
 };
 
 /// Re-export of [`minijinja`] for callers who need to construct
@@ -65,8 +67,12 @@ pub use chat_template::{
 pub use minijinja;
 
 pub(crate) mod grammar_compile;
+pub use grammar_compile::SchemaError;
 #[doc(hidden)]
 pub use grammar_compile::{emit_until_rules, schema_to_gbnf, JSON_GRAMMAR};
+
+mod json_canon;
+pub use json_canon::JsonSpacing;
 
 mod tool_choice;
 pub use tool_choice::{
@@ -79,19 +85,30 @@ pub mod output_config;
 pub use output_config::{
     compile_output_config, compile_prompt_output_config,
     grammar_for_output_config, CompiledOutputConfig, OutputConfigError,
-    OutputConfigOptions,
+    OutputConfigOptions, ResponseFraming,
 };
+
+mod schema_check;
+pub use schema_check::{MismatchKind, SchemaMismatch};
+
+pub mod schema_budget;
+pub use schema_budget::{SchemaBudgetError, SchemaLimits};
 
 pub mod dialect;
 pub use dialect::CallSyntax;
+
+#[cfg(test)]
+mod hostile_schema_tests;
+
+pub mod baked;
 
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp;
 #[cfg(feature = "llama-cpp")]
 pub use llama_cpp::{
-    gpu_device_names, llama_quantize, DecodeError, FlashAttention,
-    LlamaCppBackend, LlamaCppDecoder, LlamaCppEngine, LlamaCppModel,
-    LlamaCppOptions, NewError,
+    gpu_device_names, llama_quantize, CheckpointBudget, Checkpointing,
+    DecodeError, FlashAttention, LlamaCppBackend, LlamaCppDecoder,
+    LlamaCppEngine, LlamaCppModel, LlamaCppOptions, NewError,
 };
 #[cfg(feature = "mtmd")]
 pub use llama_cpp::{Mtmd, MtmdParams};
@@ -164,13 +181,25 @@ pub use session::LlamaCppSession;
 ))]
 pub use session::{
     BlockStream, PrefixCacheConfig, Session, SessionError, TokenTrace,
-    TopKEntry,
+    TopKEntry, Violation,
 };
 #[cfg(all(
     feature = "tokio",
     any(feature = "llama-cpp", all(feature = "moeflux", target_os = "macos"))
 ))]
 pub use session::{LocalTransport, SessionTransport};
+
+// Gated like `session`: it is `FromPath::peek` plus a cache.
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub mod catalog;
+#[cfg(any(
+    feature = "llama-cpp",
+    all(feature = "moeflux", target_os = "macos")
+))]
+pub use catalog::Catalog;
 
 mod probability;
 pub use probability::{InvalidProbability, Probability};

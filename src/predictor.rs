@@ -414,6 +414,63 @@ impl<'engine, B: Backend> CandidatePredictor<'engine, B> {
         self.tokens.push(token);
         self.pending_advance = Some(token);
     }
+
+    /// [`Engine::checkpoint_pos`] at this sequence's head, returning
+    /// it. The head is [`Self::n_cur`] between any two `next()` calls:
+    /// a recorded choice is decoded lazily, so it is not in the KV yet.
+    /// Right after construction, that is the end of the prompt.
+    pub(crate) fn checkpoint_head(&mut self) -> usize {
+        self.engine.checkpoint_pos(self.seq_id, self.n_cur as i32);
+        self.n_cur
+    }
+
+    /// Roll back to just before `tokens[at]`, its KV with it, so the
+    /// next `next()` redraws that position: the token before it is
+    /// decoded again for its logits. `n_decode` is the count as of the
+    /// step that drew `tokens[at]`. Call between steps, when every
+    /// recorded token is in the KV.
+    ///
+    /// Only where a truncate rewinds the KV losslessly
+    /// ([`Engine::truncate_restores`]); [`Rewound::No`] leaves
+    /// everything as it was. A restore that fails after that check said
+    /// it would not ends the iteration ([`Rewound::Halted`]): the KV
+    /// may already be cut, so decoding on would read a broken cache.
+    fn rewind(&mut self, at: usize, n_decode: usize) -> Rewound {
+        debug_assert!(self.pending_advance.is_none(), "rewind mid-step");
+        // `tokens[0]` sits at `base`: with nothing pending, `n_cur` is one
+        // past the last recorded token.
+        let base = self.n_cur - self.tokens.len();
+        let Some(before) = at
+            .checked_sub(1)
+            .filter(|&before| before < self.tokens.len())
+        else {
+            return Rewound::No;
+        };
+        let pos = (base + before) as i32;
+        if !self.engine.truncate_restores(self.seq_id, pos) {
+            return Rewound::No;
+        }
+        if self.engine.restore_to(self.seq_id, pos).is_err() {
+            // Nothing pending: the next `next()` ends the iteration.
+            return Rewound::Halted;
+        }
+        self.tokens.truncate(at);
+        // `tokens[before]`, re-decoded for the logits at `at`.
+        self.pending_advance = self.tokens.last().copied();
+        self.n_cur = base + before;
+        self.n_decode = n_decode.saturating_sub(1);
+        Rewound::Yes
+    }
+}
+
+/// What [`CandidatePredictor::rewind`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rewound {
+    Yes,
+    /// Not restorable by a truncate: nothing changed.
+    No,
+    /// The restore failed past the check: generation ends.
+    Halted,
 }
 
 impl<'engine, B: Backend> Iterator for CandidatePredictor<'engine, B> {
@@ -665,13 +722,181 @@ pub struct TokenPredictor<'engine, B: Backend> {
     /// [`Self::constraint_incomplete_at_end`]; the state itself stays
     /// pure.
     terminal_completed: bool,
+    /// Set when the model's most likely token was an end of generation
+    /// a constraint refused mid-value (`SamplerState::overrules_eog`):
+    /// what it went on to write inside that value is not the value it
+    /// meant. See [`Self::eog_overruled`].
+    eog_overruled: bool,
+    /// Index into [`PredictOptions::stop_strings`] of the stop string
+    /// that ended generation, if one did. Set on the same step as
+    /// `stopped`. See [`Self::stop_string`].
+    stop_string_hit: Option<usize>,
     /// Carries the incomplete tail of a codepoint split across
     /// byte-fallback tokens (issue #55). Owned *here*, alongside
     /// `text`, on purpose: the stop-string, regex and deferred-trigger
     /// scans all read `text`, so reassembling into it makes the bytes
     /// they scan the same bytes the model actually emitted.
     reassembler: Utf8Reassembler,
+    /// Emission provenance for the deferred-grammar trigger scan (see
+    /// [`Self::set_reserved`]); `None` scans bytes alone.
+    provenance: Option<TriggerProvenance>,
+    /// A thought is open: the opener and EOG are steered to the closer
+    /// (see [`crate::ThoughtSpecials`]).
+    thought_open: bool,
+    /// The escaped-closer repair, when the caller turned it on
+    /// ([`PiecePredictor::with_closer_repair`]).
+    closer: Option<CloserRepairState>,
+    /// The rollback the last step made. See [`Self::rewound`].
+    rewound: Option<Rewind>,
     pub(crate) inner: CandidatePredictor<'engine, B>,
+}
+
+/// What the trigger scan needs to tell a trigger the model emitted
+/// through real reserved tokens from one it spelled.
+struct TriggerProvenance {
+    reserved: std::sync::Arc<crate::LiteralNeutralizer>,
+    /// Byte ranges in `text` of the reserved tokens emitted, in order.
+    real: Vec<std::ops::Range<usize>>,
+    /// Per deferred trigger, the reserved pieces it contains, as byte
+    /// ranges within the trigger. Each must be a real token.
+    trigger_pieces: Vec<Vec<std::ops::Range<usize>>>,
+}
+
+impl TriggerProvenance {
+    /// Whether the occurrence of trigger `i` at `start` spells none of
+    /// its reserved pieces: each is exactly a real token's bytes.
+    fn is_real(&self, i: usize, start: usize) -> bool {
+        self.trigger_pieces.get(i).is_none_or(|pieces| {
+            pieces.iter().all(|piece| {
+                let span = start + piece.start..start + piece.end;
+                self.real
+                    .binary_search_by_key(&span.start, |r| r.start)
+                    .is_ok_and(|at| self.real[at] == span)
+            })
+        })
+    }
+}
+
+/// How a turn's escaped-closer repair went (#140): the model wrote
+/// `\"` where it meant the closing `"`, then the closers, and reached
+/// for the end of its turn inside what the grammar still holds as a
+/// string. See [`PiecePredictor::with_closer_repair`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloserRepairOutcome {
+    /// Rolled back to the backslash and redrawn without it; the turn
+    /// did not overrule again.
+    Repaired,
+    /// Rolled back, and the redrawn turn overruled anyway.
+    RepeatOverrule,
+    /// The KV cannot be rolled back by a truncate (a hybrid or
+    /// sliding-window model), or the restore failed.
+    Unrestorable,
+    /// The overrule is not the escaped-closer shape, or its closers do
+    /// not finish the constraint.
+    ShapeMismatch,
+    /// The caller already delivered bytes past the rollback point
+    /// ([`PiecePredictor::settle`]).
+    Streamed,
+}
+
+/// The outcome as the `escaped_closer_repair` log spells it.
+impl std::fmt::Display for CloserRepairOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Repaired => "repaired",
+            Self::RepeatOverrule => "repeat_overrule",
+            Self::Unrestorable => "unrestorable",
+            Self::ShapeMismatch => "shape_mismatch",
+            Self::Streamed => "streamed",
+        })
+    }
+}
+
+/// A turn's escaped-closer repair: how it went, and how many generated
+/// tokens it rolled back (`0` when it did not roll back).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CloserRepair {
+    pub(crate) outcome: CloserRepairOutcome,
+    pub(crate) rolled_back: usize,
+}
+
+/// A rollback the predictor's caller must mirror: the last `tokens`
+/// generated tokens are gone, and the text is cut back to `text_len`
+/// bytes. See [`PiecePredictor::rewound`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Rewind {
+    pub(crate) tokens: usize,
+    pub(crate) text_len: usize,
+}
+
+/// Where `text` ends in an escaped quote followed only by closers, the
+/// shape of the escaped-closer overrule: `\"`, then `}` / `]` with
+/// whitespace (raw, or escaped as the string forces it) around them.
+/// Returns the offset of that quote's backslash and the closers in
+/// order. Raw bytes, not the decoded value: the quote is escaped when
+/// an odd run of backslashes precedes it.
+pub(crate) fn escaped_closer(text: &[u8]) -> Option<(usize, Vec<u8>)> {
+    // Whether the byte ending `head` is escaped: an odd run of
+    // backslashes ends right before it.
+    let escaped = |head: &[u8]| {
+        head.split_last().is_some_and(|(_, before)| {
+            before.iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1
+        })
+    };
+    let mut head = text;
+    let mut closers = Vec::new();
+    loop {
+        head = match head {
+            [rest @ .., c @ (b'}' | b']')] => {
+                closers.push(*c);
+                rest
+            }
+            [rest @ .., b' ' | b'\t' | b'\n' | b'\r'] => rest,
+            [rest @ .., b'\\', b'n' | b't' | b'r'] if escaped(head) => rest,
+            _ => break,
+        };
+    }
+    closers.reverse();
+    match head {
+        [rest @ .., b'\\', b'"'] if !closers.is_empty() && escaped(head) => {
+            Some((rest.len(), closers))
+        }
+        _ => None,
+    }
+}
+
+/// The repair's run-state (see [`PiecePredictor::with_closer_repair`]).
+#[derive(Debug, Default)]
+struct CloserRepairState {
+    /// Taken before the newest token whose piece holds a backslash,
+    /// drawn inside a constraint: the one a rollback rewinds to.
+    mark: Option<BackslashMark>,
+    /// Bytes of `text` the caller has delivered: no rollback reaches
+    /// below them.
+    floor: usize,
+    /// The turn's one attempt, once an overrule made it.
+    report: Option<CloserRepair>,
+    /// The rolled-back token's bytes before its backslash, to emit
+    /// again in place of sampling.
+    forced: std::collections::VecDeque<Token>,
+    /// Ban backslash-led tokens on the next drawn step.
+    ban: bool,
+}
+
+/// [`TokenPredictor`] just before it drew a token holding a backslash.
+#[derive(Debug)]
+struct BackslashMark {
+    token: Token,
+    /// Its index in the predictor's tokens.
+    at: usize,
+    /// `n_decode` as of the step that drew it.
+    n_decode: usize,
+    /// `text`'s length before it.
+    text_len: usize,
+    /// How many real reserved tokens the trigger provenance held.
+    real: usize,
+    thought_open: bool,
+    constraints: crate::sample::state::ConstraintMark,
 }
 
 impl<'engine, B: Backend> TokenPredictor<'engine, B> {
@@ -687,6 +912,11 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     ) -> Self {
         let (state, options, max_stop_len) =
             Self::prepare(engine, options, initial_state);
+        let thought_open = options
+            .sample_options
+            .thought
+            .as_ref()
+            .is_some_and(|t| t.open_at_start);
         let inner = CandidatePredictor::new(engine, tokens, options.n);
         Self {
             state,
@@ -695,7 +925,13 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             max_stop_len,
             stopped: false,
             terminal_completed: false,
+            eog_overruled: false,
+            stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
+            provenance: None,
+            thought_open,
+            closer: None,
+            rewound: None,
             inner,
         }
     }
@@ -712,6 +948,11 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     ) -> Self {
         let (state, options, max_stop_len) =
             Self::prepare(engine, options, initial_state);
+        let thought_open = options
+            .sample_options
+            .thought
+            .as_ref()
+            .is_some_and(|t| t.open_at_start);
         let inner = CandidatePredictor::new_resuming(
             engine, tokens, start_pos, seq_id, options.n,
         );
@@ -722,7 +963,13 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
             max_stop_len,
             stopped: false,
             terminal_completed: false,
+            eog_overruled: false,
+            stop_string_hit: None,
             reassembler: Utf8Reassembler::default(),
+            provenance: None,
+            thought_open,
+            closer: None,
+            rewound: None,
             inner,
         }
     }
@@ -734,6 +981,37 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         &self.state
     }
 
+    /// Activate the deferred grammar only on a trigger whose reserved
+    /// pieces the model emitted as their real tokens — never on one it
+    /// spelled in ordinary tokens (a copy of markup it read in a post,
+    /// say), which is text. `reserved` is the vocabulary's reserved
+    /// pieces, as `Session` builds them. A trigger holding no reserved
+    /// piece matches on bytes alone, as without this: there is no
+    /// token to tell a spelling from. Call before the first token.
+    pub fn set_reserved(
+        &mut self,
+        reserved: std::sync::Arc<crate::LiteralNeutralizer>,
+    ) {
+        let trigger_pieces = self
+            .options
+            .sample_options
+            .deferred_grammar
+            .iter()
+            .flat_map(|spec| &spec.activate_after)
+            .map(|trigger| match std::str::from_utf8(trigger) {
+                Ok(trigger) => {
+                    reserved.find_iter(trigger).map(|(r, _)| r).collect()
+                }
+                Err(_) => Vec::new(),
+            })
+            .collect();
+        self.provenance = Some(TriggerProvenance {
+            reserved,
+            real: Vec::new(),
+            trigger_pieces,
+        });
+    }
+
     /// True iff any constraint matcher — including an activated
     /// deferred grammar — has reached its accept state, or the
     /// terminal token's bytes would have completed one (the state
@@ -741,6 +1019,17 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     /// `terminal_completed`).
     pub fn grammar_complete(&self) -> bool {
         self.state.grammar_complete() || self.terminal_completed
+    }
+
+    /// [`Self::grammar_complete`], and nothing can extend the accepting
+    /// constraint — the structured output is finished, not merely valid
+    /// so far. This is the early-halt signal: a repeating grammar (a
+    /// parallel call section) is complete after its first call but not
+    /// exhausted, and whether another follows is the model's choice of
+    /// EOG or the next opener. See
+    /// [`SamplerState::grammar_exhausted`](crate::SamplerState::grammar_exhausted).
+    pub fn grammar_exhausted(&self) -> bool {
+        self.state.grammar_exhausted() || self.terminal_completed
     }
 
     /// True iff generation ended mid-constraint — the incomplete-at-end
@@ -756,6 +1045,266 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
     /// violation.
     pub fn constraint_incomplete_at_end(&self) -> bool {
         self.state.constraint_incomplete_at_end() && !self.terminal_completed
+    }
+
+    /// True iff, at some step, the model's most likely token ended
+    /// generation while a constraint held a value open, and the mask
+    /// made it write on. Its value then carries what it meant as the
+    /// end of its turn — a valid value the parse cannot tell from the
+    /// one it meant — so the turn is a violation, not an answer.
+    pub fn eog_overruled(&self) -> bool {
+        self.eog_overruled
+    }
+
+    /// See [`PiecePredictor::with_closer_repair`].
+    fn enable_closer_repair(&mut self) {
+        self.closer = Some(CloserRepairState::default());
+    }
+
+    /// See [`PiecePredictor::settle`].
+    fn settle(&mut self) {
+        if let Some(closer) = self.closer.as_mut() {
+            closer.floor = self.text.len();
+        }
+    }
+
+    /// See [`PiecePredictor::closer_repair`].
+    fn closer_repair(&self) -> Option<CloserRepair> {
+        self.closer.as_ref().and_then(|closer| closer.report)
+    }
+
+    /// The overrule on a step's `candidates`. The turn's first one tries
+    /// the escaped-closer repair; when that rolls back, the redrawn
+    /// position's candidates take the step's place and are judged in
+    /// turn. `None` when the iteration ended.
+    fn judge_overrule(
+        &mut self,
+        candidates: Candidates,
+    ) -> Option<(Candidates, bool)> {
+        use CloserRepairOutcome::{Repaired, RepeatOverrule};
+        let overrules = |this: &Self, candidates: &Candidates| {
+            this.state.overrules_eog(
+                &this.options.sample_options,
+                candidates,
+                &this.inner.engine.model,
+            )
+        };
+        if !overrules(self, &candidates) {
+            return Some((candidates, false));
+        }
+        let report = match self.closer.as_ref().map(|closer| closer.report) {
+            // Off: the overrule stands.
+            None => return Some((candidates, true)),
+            // Spent: one attempt a turn.
+            Some(Some(report)) => {
+                self.set_report(CloserRepair {
+                    outcome: match report.outcome {
+                        Repaired => RepeatOverrule,
+                        outcome => outcome,
+                    },
+                    ..report
+                });
+                return Some((candidates, true));
+            }
+            Some(None) => self.rewind_escaped_closer(),
+        };
+        let Some(report) = report else {
+            // A failed restore ended the iteration.
+            self.set_report(CloserRepair {
+                outcome: CloserRepairOutcome::Unrestorable,
+                rolled_back: 0,
+            });
+            return None;
+        };
+        match report {
+            Ok(rewind) => {
+                self.set_report(CloserRepair {
+                    outcome: Repaired,
+                    rolled_back: rewind.tokens,
+                });
+                self.rewound = Some(rewind);
+                let candidates = self.inner.next()?;
+                let again = overrules(self, &candidates);
+                if again {
+                    self.set_report(CloserRepair {
+                        outcome: RepeatOverrule,
+                        rolled_back: rewind.tokens,
+                    });
+                }
+                Some((candidates, again))
+            }
+            Err(outcome) => {
+                self.set_report(CloserRepair {
+                    outcome,
+                    rolled_back: 0,
+                });
+                Some((candidates, true))
+            }
+        }
+    }
+
+    fn set_report(&mut self, report: CloserRepair) {
+        if let Some(closer) = self.closer.as_mut() {
+            closer.report = Some(report);
+        }
+    }
+
+    /// At an overrule whose text ends in the escaped-closer shape
+    /// ([`escaped_closer`]), roll back to just before that backslash:
+    /// the KV and the tokens to the start of the token holding it, the
+    /// matchers, text and provenance with them. The bytes that token
+    /// held before the backslash are queued to be written again, and
+    /// the step after them may not start with a backslash (see
+    /// `Self::steer_repair`). `None` when a failed restore ended the
+    /// iteration.
+    fn rewind_escaped_closer(
+        &mut self,
+    ) -> Option<Result<Rewind, CloserRepairOutcome>> {
+        use CloserRepairOutcome::{ShapeMismatch, Streamed, Unrestorable};
+        let (mark, floor) = match self.closer.as_mut() {
+            Some(closer) => (closer.mark.take(), closer.floor),
+            None => (None, 0),
+        };
+        let model = &self.inner.engine.model;
+        let config = &self.options.sample_options;
+        let found = mark.and_then(|mark| {
+            let (backslash, closers) = escaped_closer(self.text.as_bytes())?;
+            // What the marked token wrote before the backslash, which
+            // must be the one it holds.
+            let prefix = self.text.get(mark.text_len..backslash)?.to_owned();
+            let mut piece = Vec::new();
+            model.token_to_piece_ref(mark.token, &mut piece);
+            let intended = [prefix.as_bytes(), b"\"", &closers].concat();
+            (piece.get(prefix.len()) == Some(&b'\\')
+                && mark.constraints.completes_with(config, &intended))
+            .then_some((mark, prefix))
+        });
+        let Some((mark, prefix)) = found else {
+            return Some(Err(ShapeMismatch));
+        };
+        if mark.text_len < floor {
+            return Some(Err(Streamed));
+        }
+        let tokens = self.inner.tokens.len().saturating_sub(mark.at);
+        match self.inner.rewind(mark.at, mark.n_decode) {
+            Rewound::Yes => {}
+            Rewound::No => return Some(Err(Unrestorable)),
+            Rewound::Halted => return None,
+        }
+        self.state.rewind_constraints(mark.constraints);
+        self.thought_open = mark.thought_open;
+        // A length `text` had: a char boundary.
+        self.text.truncate(mark.text_len);
+        // Empty at the mark (see `Self::mark_backslash`).
+        self.reassembler.carry.clear();
+        if let Some(provenance) = self.provenance.as_mut() {
+            provenance.real.truncate(mark.real);
+        }
+        let forced = self
+            .inner
+            .engine
+            .model
+            .tokenize_special(&prefix, false, false);
+        if let Some(closer) = self.closer.as_mut() {
+            closer.forced = forced.into();
+            closer.ban = true;
+        }
+        Some(Ok(Rewind {
+            tokens,
+            text_len: mark.text_len,
+        }))
+    }
+
+    /// The repair's hand on the steps after a rollback: each forced
+    /// token in turn, then one step on which no backslash-led token may
+    /// be drawn. Every other step passes `candidates` through.
+    fn steer_repair(&mut self, candidates: Candidates) -> Candidates {
+        let Some(closer) = self.closer.as_mut() else {
+            return candidates;
+        };
+        let model = &self.inner.engine.model;
+        let mut piece = Vec::new();
+        let kept: Vec<crate::TokenData> =
+            if let Some(forced) = closer.forced.pop_front() {
+                candidates
+                    .iter()
+                    .filter(|td| td.id == forced)
+                    .copied()
+                    .collect()
+            } else if std::mem::take(&mut closer.ban) {
+                candidates
+                    .iter()
+                    .filter(|td| {
+                        model.token_to_piece_ref(td.id, &mut piece);
+                        piece.first() != Some(&b'\\')
+                    })
+                    .copied()
+                    .collect()
+            } else {
+                return candidates;
+            };
+        match kept.is_empty() {
+            true => candidates,
+            false => Candidates::from_vec_unchecked(kept),
+        }
+    }
+
+    /// Before `token` lands (the matchers not yet advanced, `text` not
+    /// yet grown): when its piece holds a backslash and it was drawn
+    /// inside a constraint, mark where a rollback to it lands. A
+    /// backslash that cannot be marked — one completing a codepoint an
+    /// earlier token opened — clears the mark, so no rollback reaches
+    /// past it.
+    fn mark_backslash(&mut self, token: Token) {
+        let Some(closer) = self
+            .closer
+            .as_mut()
+            .filter(|closer| closer.report.is_none())
+        else {
+            return;
+        };
+        let mut piece = Vec::new();
+        self.inner
+            .engine
+            .model
+            .token_to_piece_ref(token, &mut piece);
+        if !piece.contains(&b'\\') {
+            return;
+        }
+        closer.mark = (self.state.constrained_incomplete()
+            && self.reassembler.carry.is_empty())
+        .then(|| BackslashMark {
+            token,
+            at: self.inner.tokens.len(),
+            n_decode: self.inner.n_decode,
+            text_len: self.text.len(),
+            real: self.provenance.as_ref().map_or(0, |p| p.real.len()),
+            thought_open: self.thought_open,
+            constraints: self.state.constraint_mark(),
+        });
+    }
+
+    /// The [`PredictOptions::stop_strings`] entry that ended generation,
+    /// or `None` when something else did (or it has not ended). When
+    /// several complete on the same token, the one that starts first in
+    /// the text.
+    pub fn stop_string(&self) -> Option<&str> {
+        self.stop_string_hit
+            .and_then(|i| self.options.stop_strings.get(i))
+            .map(String::as_str)
+    }
+
+    /// True when generation ran out of budget — [`PredictOptions::n`]
+    /// tokens, or the context window — rather than stopping on a stop
+    /// condition. Meaningful once iteration has returned `None`; a
+    /// caller that broke out of the loop itself (say, on
+    /// [`Self::grammar_exhausted`]) must not read a budget-sized
+    /// generation as a clip.
+    pub fn hit_token_limit(&self) -> bool {
+        !self.stopped
+            && (self.inner.n_decode >= self.inner.n.get()
+                || self.inner.n_cur
+                    >= self.inner.engine.decoder.n_ctx() as usize)
     }
 
     /// Close out the UTF-8 reassembler at stream end (issue #55).
@@ -788,12 +1337,7 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         mut options: PredictOptions,
         initial_state: Option<crate::SamplerState>,
     ) -> (crate::SamplerState, PredictOptions, usize) {
-        let max_stop_len = options
-            .stop_sequences
-            .iter()
-            .map(|s| s.len())
-            .max()
-            .unwrap_or(0);
+        let max_stop_len = max_stop_len(&options);
 
         // A caller-provided state is authoritative: it resumes (or
         // freshly seeds) a prior stream — rng mid-sequence, carried
@@ -851,7 +1395,14 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             return None;
         }
 
+        self.rewound = None;
         let candidates = self.inner.next()?;
+        // Judged on the raw candidates, before any mask: what the
+        // model wanted, not what it was let to write. Once is enough.
+        // The turn's first overrule may roll back instead (the
+        // escaped-closer repair), and the redrawn position is judged.
+        let (candidates, overruled) = self.judge_overrule(candidates)?;
+        self.eog_overruled = self.eog_overruled || overruled;
 
         // Snapshot only when an installed hook declares appetite. Cheap
         // probe of the trait method (default `None`) keeps the
@@ -863,15 +1414,24 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             .as_ref()
             .and_then(|h| h.snapshot_opts())
             .map(|opts| candidates.capture_snapshot(&opts));
+        let candidates = self.steer_repair(candidates);
 
-        let next_token = candidates
-            .sample_token(
-                &self.inner.tokens,
-                &self.options.sample_options,
-                &mut self.state,
-                &self.inner.engine.model,
-            )
-            .unwrap();
+        let next_token = crate::sample::sample_token_in(
+            &self.inner.tokens,
+            self.text.as_bytes(),
+            self.provenance.as_ref().map(|p| &*p.reserved),
+            self.thought_open,
+            candidates,
+            &self.options.sample_options,
+            &mut self.state,
+            &self.inner.engine.model,
+        )
+        .unwrap();
+        self.mark_backslash(next_token);
+        if let Some(thought) = self.options.sample_options.thought.as_ref() {
+            self.thought_open =
+                thought.open_after(self.thought_open, next_token);
+        }
 
         // Reassembled, not converted in isolation: a token that is
         // only part of a codepoint yields nothing here and its bytes
@@ -881,6 +1441,19 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
         // and `into_text()` cannot disagree.
         let piece = self.reassembler.push(&self.inner.engine.model, next_token);
         self.text.push_str(&piece);
+        if let Some(provenance) = self.provenance.as_mut() {
+            // A reassembled piece can carry an earlier token's
+            // unfinished bytes ahead of this one's; the token's own
+            // piece is the tail.
+            if let Some(real) = provenance
+                .reserved
+                .emitted_piece(next_token)
+                .filter(|real| piece.ends_with(real))
+            {
+                let end = self.text.len();
+                provenance.real.push(end - real.len()..end);
+            }
+        }
 
         // Evaluate every stop condition against the just-sampled token,
         // BEFORE advancing the constraint matchers: a token that
@@ -914,11 +1487,10 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             self.max_stop_len,
             self.inner.engine.model.max_token_len(),
         );
-        let stopped_by_string = self
-            .options
-            .stop_strings
-            .iter()
-            .any(|s| self.text[end..].contains(s));
+        self.stop_string_hit =
+            first_stop_string(&self.text[end..], &self.options.stop_strings)
+                .map(|(_, i)| i);
+        let stopped_by_string = self.stop_string_hit.is_some();
         let stopped_by_regex = self
             .options
             .regex_stop_sequences
@@ -962,11 +1534,13 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             self.options.sample_options.deferred_grammar.as_ref(),
             self.state.deferred_inactive(),
         ) {
+            let provenance = self.provenance.as_ref();
             if let Some((trigger_end, trigger_len)) =
                 find_any_deferred_trigger_end(
                     self.text.as_bytes(),
                     &spec.activate_after,
                     self.max_stop_len + self.inner.engine.model.max_token_len(),
+                    |i, start| provenance.is_none_or(|p| p.is_real(i, start)),
                 )
             {
                 // Lazy-pattern grammars start their root at the trigger
@@ -1003,6 +1577,22 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
     }
 }
 
+/// How far back the stop searches must reach past the newest token: the
+/// longest stop, token sequences and stop strings alike. Sizes the
+/// stop-string window ([`stop_window_start`]), so it has to cover the
+/// longest stop *string* in bytes: a window sized from token sequences
+/// alone (often just the one-token EOG stops) silently missed any stop
+/// string longer than `max_token_len` (#122).
+fn max_stop_len(options: &PredictOptions) -> usize {
+    options
+        .stop_sequences
+        .iter()
+        .map(Vec::len)
+        .chain(options.stop_strings.iter().map(String::len))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Byte offset at which a stop-string search over `text` may begin: the
 /// trailing `max_stop_len + max_token_len` bytes, walked back to a char
 /// boundary. Keeps the per-step cost bounded as generation grows.
@@ -1031,14 +1621,71 @@ fn stop_window_start(
     end
 }
 
+/// `(byte offset, index into stops)` of the stop string that occurs
+/// *first* in `text` — earliest start, ties to the longer string — or
+/// `None`. Empty strings never match (they would stop on the first
+/// token).
+///
+/// "First", not "any": when two stop strings complete on the same
+/// token, the one the text reached first is the one that stopped it,
+/// and that is the one a caller reports (Anthropic's
+/// `stop_sequence`) and cuts at (#122).
+pub(crate) fn first_stop_string<S: AsRef<str>>(
+    text: &str,
+    stops: &[S],
+) -> Option<(usize, usize)> {
+    stops
+        .iter()
+        .map(AsRef::as_ref)
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty())
+        .filter_map(|(i, s)| text.find(s).map(|at| (at, s.len(), i)))
+        .min_by_key(|&(at, len, _)| (at, std::cmp::Reverse(len)))
+        .map(|(at, _, i)| (at, i))
+}
+
+/// Bytes at the end of `text` that are a proper prefix of some stop
+/// string — text a streaming caller must hold back, because the next
+/// piece may complete the match and a stop sequence is never part of
+/// the output (#122). Always a char boundary: a byte-equal prefix
+/// starts on a lead byte.
+pub(crate) fn stop_string_holdback<S: AsRef<str>>(
+    text: &str,
+    stops: &[S],
+) -> usize {
+    let tail = text.as_bytes();
+    stops
+        .iter()
+        .map(|s| s.as_ref().as_bytes())
+        .filter_map(|s| {
+            (1..s.len())
+                .rev()
+                .find(|&k| k <= tail.len() && tail.ends_with(&s[..k]))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Window-bounded search: returns the byte offset one past the last byte of
 /// the first occurrence of `trigger` within the trailing `window` bytes of
 /// `haystack`. Mirrors the window sizing used for stop-strings so the
 /// per-step cost stays bounded even as `text` grows.
+#[cfg(test)]
 fn find_deferred_trigger_end(
     haystack: &[u8],
     trigger: &[u8],
     window: usize,
+) -> Option<usize> {
+    find_deferred_trigger_end_where(haystack, trigger, window, |_| true)
+}
+
+/// [`find_deferred_trigger_end`] over the occurrences `accept` takes,
+/// by start offset — the first occurrence may be one it refuses.
+fn find_deferred_trigger_end_where(
+    haystack: &[u8],
+    trigger: &[u8],
+    window: usize,
+    accept: impl Fn(usize) -> bool,
 ) -> Option<usize> {
     if trigger.is_empty() || trigger.len() > haystack.len() {
         return None;
@@ -1048,24 +1695,32 @@ fn find_deferred_trigger_end(
         .saturating_sub(window.saturating_add(trigger.len()));
     haystack[search_start..]
         .windows(trigger.len())
-        .position(|w| w == trigger)
-        .map(|rel| search_start + rel + trigger.len())
+        .enumerate()
+        .filter(|(_, w)| *w == trigger)
+        .map(|(rel, _)| search_start + rel)
+        .find(|&start| accept(start))
+        .map(|start| start + trigger.len())
 }
 
 /// Any-of variant over a trigger set: the earliest match wins (ties
 /// go to the longer trigger, so `<x> to=` beats ` to=`-style overlaps
 /// feeding the right byte count). Returns `(trigger_end,
-/// trigger_len)` for the winner.
-fn find_any_deferred_trigger_end(
+/// trigger_len)` for the winner. `accept` takes a trigger's index and
+/// an occurrence's start ([`TriggerProvenance::is_real`]).
+pub(crate) fn find_any_deferred_trigger_end(
     haystack: &[u8],
     triggers: &[Vec<u8>],
     window: usize,
+    accept: impl Fn(usize, usize) -> bool,
 ) -> Option<(usize, usize)> {
     triggers
         .iter()
-        .filter_map(|t| {
-            find_deferred_trigger_end(haystack, t, window)
-                .map(|end| (end, t.len()))
+        .enumerate()
+        .filter_map(|(i, t)| {
+            find_deferred_trigger_end_where(haystack, t, window, |start| {
+                accept(i, start)
+            })
+            .map(|end| (end, t.len()))
         })
         .min_by_key(|&(end, len)| (end - len, std::cmp::Reverse(len)))
 }
@@ -1144,6 +1799,20 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
         self.inner.inner.tokens.last().copied()
     }
 
+    /// See [`CandidatePredictor::checkpoint_head`].
+    pub(crate) fn checkpoint_head(&mut self) -> usize {
+        self.inner.inner.checkpoint_head()
+    }
+
+    /// See [`TokenPredictor::set_reserved`].
+    pub fn with_reserved(
+        mut self,
+        reserved: std::sync::Arc<crate::LiteralNeutralizer>,
+    ) -> Self {
+        self.inner.set_reserved(reserved);
+        self
+    }
+
     /// The live sampler run-state. See [`TokenPredictor::sampler_state`].
     pub fn sampler_state(&self) -> &crate::SamplerState {
         self.inner.sampler_state()
@@ -1154,9 +1823,65 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
         self.inner.grammar_complete()
     }
 
+    /// See [`TokenPredictor::grammar_exhausted`].
+    pub fn grammar_exhausted(&self) -> bool {
+        self.inner.grammar_exhausted()
+    }
+
     /// See [`TokenPredictor::constraint_incomplete_at_end`].
     pub fn constraint_incomplete_at_end(&self) -> bool {
         self.inner.constraint_incomplete_at_end()
+    }
+
+    /// See [`TokenPredictor::stop_string`].
+    pub fn stop_string(&self) -> Option<&str> {
+        self.inner.stop_string()
+    }
+
+    /// See [`TokenPredictor::eog_overruled`].
+    pub fn eog_overruled(&self) -> bool {
+        self.inner.eog_overruled()
+    }
+
+    /// Turn on the escaped-closer repair (#140). The model writes `\"`
+    /// where it means a value's closing `"`, then the closers, and
+    /// reaches for the end of its turn: an overrule, since the grammar
+    /// still holds the string open. Instead of letting it write on, the
+    /// turn's first overrule of that shape rolls generation back to
+    /// the start of the token holding that backslash, writes again what
+    /// the token held before it, and redraws with backslash-led tokens
+    /// banned for one step — so the model writes the `"` it meant. Once
+    /// a turn, and only where a KV truncate rewinds losslessly (a dense
+    /// model); otherwise the overrule stands. The caller mirrors each
+    /// rollback ([`Self::rewound`]) and reads how it went from
+    /// [`Self::closer_repair`].
+    pub(crate) fn with_closer_repair(mut self) -> Self {
+        self.inner.enable_closer_repair();
+        self
+    }
+
+    /// Every byte yielded so far has been delivered: a repair rollback
+    /// may no longer reach below it.
+    pub(crate) fn settle(&mut self) {
+        self.inner.settle();
+    }
+
+    /// The turn's escaped-closer repair, once an overrule tried it.
+    pub(crate) fn closer_repair(&self) -> Option<CloserRepair> {
+        self.inner.closer_repair()
+    }
+
+    /// The rollback the last `next()` made before yielding, if any: the
+    /// caller drops its last [`Rewind::tokens`] tokens and cuts its text
+    /// back to [`Rewind::text_len`] bytes, then takes the yielded piece
+    /// as usual.
+    pub(crate) fn rewound(&self) -> Option<Rewind> {
+        self.inner.rewound
+    }
+
+    /// See [`TokenPredictor::hit_token_limit`].
+    pub fn hit_token_limit(&self) -> bool {
+        self.inner.hit_token_limit()
     }
 }
 
@@ -1200,7 +1925,12 @@ impl<'engine, B: Backend> Iterator for PiecePredictor<'engine, B> {
         // property of the code rather than a promise (issue #55).
         let emitted = self.inner.text.len();
         match self.inner.next() {
-            Some(_) => Some(self.inner.text[emitted..].to_owned()),
+            // A rollback cut `text` below `emitted` first: the piece is
+            // what grew from there.
+            Some(_) => {
+                let from = self.inner.rewound.map_or(emitted, |r| r.text_len);
+                Some(self.inner.text[from..].to_owned())
+            }
             None => {
                 // Stream end. Surface any codepoint the last token left
                 // half-delivered before the text is finalized — one
@@ -1303,6 +2033,122 @@ impl<'engine, B: Backend> Iterator for Predictor<'engine, B> {
         let piece = self.inner.next()?;
         let token = self.inner.last_token().unwrap();
         Some(Predicted { token, piece })
+    }
+}
+
+/// The stop-string helpers are pure: no model, no backend, so their
+/// tests run in every configuration.
+#[cfg(test)]
+mod stop_string_tests {
+    use crate::PredictOptions;
+
+    /// #65: the window is sized in **bytes off the generated text**. It
+    /// used to be sized off a prompt-inclusive token count, so on any
+    /// prompt longer than the window the offset ran past the end of the
+    /// text and early stop-string termination silently never fired.
+    ///
+    /// The regression shape to keep in mind: the offset must never
+    /// depend on how long the prompt was. These cases pin that by
+    /// construction — nothing here knows about a prompt at all.
+    #[test]
+    fn stop_window_start_is_sized_in_bytes_not_tokens() {
+        // Text shorter than the window: scan all of it.
+        assert_eq!(super::stop_window_start("short", 8, 16), 0);
+
+        // Text longer than the window: scan exactly the trailing
+        // `max_stop_len + max_token_len` bytes.
+        let text = "a".repeat(100);
+        assert_eq!(super::stop_window_start(&text, 8, 16), 76);
+
+        // A stop string ending at the very end of the text is always
+        // inside the window, which is the property the sizing exists
+        // for.
+        let text = format!("{}STOP", "x".repeat(500));
+        let end = super::stop_window_start(&text, 4, 16);
+        assert!(text[end..].contains("STOP"));
+    }
+
+    /// The walk-back is not cosmetic: `str` indexing rejects a
+    /// non-boundary offset, so landing mid-codepoint would reintroduce
+    /// #65's silent failure intermittently. Terminates at 0, which is a
+    /// boundary by definition.
+    #[test]
+    fn stop_window_start_lands_on_a_char_boundary() {
+        // Multi-byte throughout, so a naive offset lands mid-codepoint.
+        let text = "é".repeat(50); // 100 bytes, 2 bytes per char
+        for max_stop_len in 0..12 {
+            let end = super::stop_window_start(&text, max_stop_len, 5);
+            assert!(
+                text.is_char_boundary(end),
+                "offset {end} splits a codepoint (max_stop_len={max_stop_len})",
+            );
+            // Must not panic, and must be usable as a slice start.
+            let _ = &text[end..];
+        }
+
+        // Degenerate: empty text, huge window.
+        assert_eq!(super::stop_window_start("", 1000, 1000), 0);
+    }
+
+    /// #122: a stop string longer than the longest token is still
+    /// found. The window used to be sized from token sequences alone —
+    /// here the one-token EOG stop — and so reached back only a token's
+    /// worth of bytes, never the whole string.
+    #[test]
+    fn stop_window_covers_a_stop_longer_than_a_token() {
+        let stop = "\n\nHuman: and then";
+        let max_token_len = 4;
+        assert!(stop.len() > max_token_len);
+        let opts = PredictOptions::default()
+            .add_stop_sequence(vec![2])
+            .add_stop(stop.to_string());
+        assert_eq!(super::max_stop_len(&opts), stop.len());
+
+        let text = format!("{}{stop}", "lorem ipsum ".repeat(20));
+        let start =
+            super::stop_window_start(&text, super::max_stop_len(&opts), 4);
+        assert!(text[start..].contains(stop), "window: {:?}", &text[start..]);
+
+        // The old sizing: token sequences only.
+        let old = PredictOptions::default().add_stop_sequence(vec![2]);
+        let start =
+            super::stop_window_start(&text, super::max_stop_len(&old), 4);
+        assert!(!text[start..].contains(stop));
+    }
+
+    /// #122: the stop that ended generation is the one the text reached
+    /// first — not the first listed — and empty strings never match.
+    #[test]
+    fn first_stop_string_is_earliest_in_the_text() {
+        let stops = ["END", "", "\n\nHuman:", "Human"];
+        assert_eq!(super::first_stop_string("no stop here", &stops), None);
+        // Listed second-to-last, reached first.
+        assert_eq!(
+            super::first_stop_string("hi\n\nHuman: yo END", &stops),
+            Some((2, 2)),
+        );
+        // Same start: the longer one wins, so the whole match is cut.
+        assert_eq!(
+            super::first_stop_string("x Human: y", &["Human", "Human:"]),
+            Some((2, 1)),
+        );
+        assert_eq!(super::first_stop_string("anything", &[""]), None);
+    }
+
+    /// #122: a streaming caller holds back exactly the tail that could
+    /// still grow into a stop string, never a complete one's worth.
+    #[test]
+    fn stop_string_holdback_is_the_longest_live_prefix() {
+        let stops = ["</answer>", "###"];
+        assert_eq!(super::stop_string_holdback("plain", &stops), 0);
+        assert_eq!(super::stop_string_holdback("the </ans", &stops), 5);
+        assert_eq!(super::stop_string_holdback("so ##", &stops), 2);
+        assert_eq!(super::stop_string_holdback("a#", &["###"]), 1);
+        // Multi-byte: the held tail starts on a char boundary.
+        let text = "caf\u{e9} \u{2192}";
+        let held = super::stop_string_holdback(text, &["\u{2192}!"]);
+        assert!(text.is_char_boundary(text.len() - held));
+        assert_eq!(&text[text.len() - held..], "\u{2192}");
     }
 }
 
@@ -1440,6 +2286,44 @@ mod tests {
         );
     }
 
+    /// The escaped-closer shape (#140): `\"`, then the closers that would
+    /// finish the document, whitespace (raw or escaped) between them.
+    /// A quote escaped on purpose, mid-string, is not it; nor is a real
+    /// closing quote.
+    #[test]
+    fn escaped_closer_matches_only_an_escaped_quote_before_closers() {
+        let at = |text: &str| {
+            super::escaped_closer(text.as_bytes())
+                .map(|(at, closers)| (at, String::from_utf8(closers).unwrap()))
+        };
+        let text = r#"{"c":"text\"}"#;
+        let backslash = text.find('\\').unwrap();
+        assert_eq!(at(text), Some((backslash, "}".into())));
+        assert_eq!(at("{\"c\":\"text\\\"\n}"), Some((backslash, "}".into())));
+        assert_eq!(at(r#"{"c":"text\"\n}"#), Some((backslash, "}".into())));
+        assert_eq!(at(r#"{"c":"text\" } "#), Some((backslash, "}".into())));
+        assert_eq!(
+            at(r#"{"a":[{"c":"text\"}]}"#),
+            Some((r#"{"a":[{"c":"text"#.len(), "}]}".into()))
+        );
+        // An odd run: the last backslash escapes the quote.
+        let odd = r#"{"c":"a\\\"}"#;
+        assert_eq!(at(odd), Some((odd.rfind('\\').unwrap(), "}".into())));
+
+        // Escaped on purpose, more text after it.
+        assert_eq!(at(r#"{"c":"say \"hi\" to"#), None);
+        assert_eq!(at(r#"{"c":"say \"hi\"} and"#), None);
+        // A real closing quote: an even run, or none.
+        assert_eq!(at(r#"{"c":"text"}"#), None);
+        assert_eq!(at(r#"{"c":"a\\"}"#), None);
+        // No closers after it.
+        assert_eq!(at(r#"{"c":"text\""#), None);
+        // An escaped `\n` whose backslash is itself escaped is text.
+        assert_eq!(at(r#"{"c":"text\"\\n}"#), None);
+        assert_eq!(at(""), None);
+        assert_eq!(at("}"), None);
+    }
+
     #[test]
     fn find_deferred_trigger_end_at_end() {
         let hay = b"hello <think>bla</think>";
@@ -1454,6 +2338,25 @@ mod tests {
         assert_eq!(got, Some(b"<think>bla</think>".len()));
     }
 
+    /// A refused occurrence (a spelled trigger) does not hide a later
+    /// one the scan accepts (the real trigger).
+    #[test]
+    fn find_deferred_trigger_end_skips_a_refused_occurrence() {
+        let hay = b"quote <x> then <x>{";
+        let got =
+            super::find_deferred_trigger_end_where(hay, b"<x>", 64, |at| {
+                at > 6
+            });
+        assert_eq!(got, Some(18));
+        let none = super::find_any_deferred_trigger_end(
+            hay,
+            &[b"<x>".to_vec()],
+            64,
+            |_, _| false,
+        );
+        assert_eq!(none, None);
+    }
+
     #[test]
     fn find_deferred_trigger_end_none() {
         let hay = b"<think>unclosed body still growing";
@@ -1466,54 +2369,6 @@ mod tests {
         let hay = b"anything";
         let got = super::find_deferred_trigger_end(hay, b"", 64);
         assert_eq!(got, None);
-    }
-
-    /// #65: the window is sized in **bytes off the generated text**. It
-    /// used to be sized off a prompt-inclusive token count, so on any
-    /// prompt longer than the window the offset ran past the end of the
-    /// text and early stop-string termination silently never fired.
-    ///
-    /// The regression shape to keep in mind: the offset must never
-    /// depend on how long the prompt was. These cases pin that by
-    /// construction — nothing here knows about a prompt at all.
-    #[test]
-    fn stop_window_start_is_sized_in_bytes_not_tokens() {
-        // Text shorter than the window: scan all of it.
-        assert_eq!(super::stop_window_start("short", 8, 16), 0);
-
-        // Text longer than the window: scan exactly the trailing
-        // `max_stop_len + max_token_len` bytes.
-        let text = "a".repeat(100);
-        assert_eq!(super::stop_window_start(&text, 8, 16), 76);
-
-        // A stop string ending at the very end of the text is always
-        // inside the window, which is the property the sizing exists
-        // for.
-        let text = format!("{}STOP", "x".repeat(500));
-        let end = super::stop_window_start(&text, 4, 16);
-        assert!(text[end..].contains("STOP"));
-    }
-
-    /// The walk-back is not cosmetic: `str` indexing rejects a
-    /// non-boundary offset, so landing mid-codepoint would reintroduce
-    /// #65's silent failure intermittently. Terminates at 0, which is a
-    /// boundary by definition.
-    #[test]
-    fn stop_window_start_lands_on_a_char_boundary() {
-        // Multi-byte throughout, so a naive offset lands mid-codepoint.
-        let text = "é".repeat(50); // 100 bytes, 2 bytes per char
-        for max_stop_len in 0..12 {
-            let end = super::stop_window_start(&text, max_stop_len, 5);
-            assert!(
-                text.is_char_boundary(end),
-                "offset {end} splits a codepoint (max_stop_len={max_stop_len})",
-            );
-            // Must not panic, and must be usable as a slice start.
-            let _ = &text[end..];
-        }
-
-        // Degenerate: empty text, huge window.
-        assert_eq!(super::stop_window_start("", 1000, 1000), 0);
     }
 
     #[test]

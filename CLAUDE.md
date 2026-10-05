@@ -257,6 +257,110 @@ Durable context lives in [`.claude/memory/`](.claude/memory/) —
 versioned, no auto-pruning, visible to collaborators. Key entries
 for the current arc:
 
+- [`handoff_2026_09_25.md`](.claude/memory/handoff_2026_09_25.md)
+  — **read first next session.** End of the #113 arc and the first live
+  Agora run on the fixed stack: what landed, the prioritized open list
+  (#119 count_tokens/400, cogito stall replays, #101 structural, #116–#118),
+  and how to reach balerion's Claude.
+- [`qwen38_reingest_probe.md`](.claude/memory/qwen38_reingest_probe.md)
+  — **read before touching `ReasoningReingest`, the post-thought gap in
+  any grammar, or adding a thinking model.** 2026-09-23, #112: the
+  analyzer now *measures* the reingest convention (Qwen3.8 reads
+  `reasoning_content` only) and the post-thought `separator`, which the
+  tool and output_config grammars spell literally — the old gap was one
+  optional byte, so Qwen's `</think>\n\n` was unreachable under any
+  grammar. Also: the shared #96 tip scenarios ran thinking OFF; use
+  `assert_tip_anchors_across_thinking_tool_rounds` for thinking models.
+- [`known_id_exemption.md`](.claude/memory/known_id_exemption.md)
+  — **read before touching `sample::ids`, proposing a shape/regex
+  detector on the *emission* for identifiers, or "fixing" the seeding
+  fold to mirror the live pass.** 2026-09-22: the repetition penalty
+  spares *faithful copies of ids the prompt contains*
+  (`id_patterns` → per-call `known_ids` → `IdGuard` on the
+  `RegionGuard` hook), not id shapes — a shape tracker shipped and was
+  removed the same day because agents cite by bare 8-hex prefix. Carries
+  the documented edges and why live ≠ fold is not an invariant.
+  2026-09-23 (#113): copies follow multi-word ids across spaces, and
+  `IgnoreCategory::Numbers` (default on) — every probed tokenizer
+  spells a number as a bare ` ` + digit tokens, so penalizing them
+  rewrote facts. Read before tuning digits or spaces back in.
+- [`v1_models_catalog.md`](.claude/memory/v1_models_catalog.md)
+  — **read before touching blallama's listing routes, `src/catalog.rs`,
+  or proposing a cross-backend metadata API.** `/v1/models` landed
+  2026-09-18: `Catalog<B>` (directory + per-process `ModelInfo` cache),
+  `FromPath::peek` (a `vocab_only` load — "use what llama.cpp exposes",
+  ~1.3 s/model, hence the cache and blallama's startup warm-up),
+  `Session::model_info`, one `Advertised → ModelInfo` mapping so a
+  listing and a load never disagree. Ceilings are
+  `min(n_ctx, n_ctx_train)` (Mike's call; matches llama.cpp's
+  `n_ctx_slot`). moeflux peek compiles but is unverified on device.
+- [`plan_cache_restore_ladder_and_disk_tier.md`](.claude/memory/plan_cache_restore_ladder_and_disk_tier.md)
+  — **arc plan-of-record (2026-07-29), the live drama_llama arc.**
+  Five phases: restore-to-divergence ladder (pure transformers),
+  end-of-final-message auto-anchor (fixes Qwen reflect appends),
+  #95 shutdown logging, tiered disk cache for prefix slots (trait in
+  Session, impl + lifecycle in blallama), #100 gated on post-Phase-2
+  telemetry. Carries the 2026-07-29 diagnosis (all eight collapses =
+  anchor quantization; renders round-trip byte-exact; deficit == final
+  message size) and every fork decided with Mike. Read before touching
+  `compute_l_hit`, `SnapshotStore`, eviction, or proposing any cache
+  design.
+- [`swa_checkpoints.md`](.claude/memory/swa_checkpoints.md)
+  — **read before touching `llama_cpp::checkpoint`, `restore_to`,
+  `swa_full`, or the snapshot cap.** 2026-10-01: llama.cpp recycles a
+  sliding window's masked cells for any sequence (full-size cache or
+  not), so gpt-oss / Gemma 4 rewind through partial window checkpoints,
+  hybrids through partial recurrent ones, and a truncate counts only
+  when the whole window survived. Per-model KV / checkpoint memory, the
+  `swa_full = false` default, and the GPU-window test list.
+- [`plan_template_ownership.md`](.claude/memory/plan_template_ownership.md)
+  — **plan-of-record ([issue #88](https://github.com/mdegans/drama_llama/issues/88)),
+  the live drama_llama arc.** Commit fully to owned chat templates:
+  baked `include_str!` registry + 4-rung loading ladder (sidecar →
+  detected → metadata-with-warning → fallback), canonical bytes derived
+  from the *model's unforced habit* (not the stock template — #85's
+  lesson), stock path code-frozen, analyzer repurposed as drift alarm.
+  Ends with rung 4b: base-model completion-scaffold mode (grammar
+  supplies form, pretraining supplies voice) for Agora SOUL-document
+  generation; EOG-at-message-end design lives there. Read before
+  touching templates, `ReasoningReingest`, or the dialect layer.
+- [`plan_fallible_predictors.md`](.claude/memory/plan_fallible_predictors.md)
+  — **plan-of-record ([issue #92](https://github.com/mdegans/drama_llama/issues/92)),
+  designed but deliberately NOT implemented.** The prediction iterators
+  are infallible, so every decode error becomes a panic — and in a
+  serving loop, a *panic loop*. Agreed direction: `take_error()` plus
+  `Engine::nan_policy()` (`Stop` | `RetryChunked`) now, non-breaking;
+  the full `Item = Result` at 1.0. Read before touching `predictor.rs`
+  — it carries the measured blast radius (32 sites, only 4 of them
+  production, all in `session/mod.rs`), why `RetryChunked` needs no
+  trait changes, and why `BlockStream` is the one hard site.
+- [`plan_grammar_canonicity.md`](.claude/memory/plan_grammar_canonicity.md)
+  — **plan-of-record ([issue #97](https://github.com/mdegans/drama_llama/issues/97)),
+  designed but not started.** Post-#96, both cache lookups rightly
+  refuse non-canonical emission, so tool-call tip hit rate ==
+  grammar canonicity. The fixable class is masking-forced splits
+  (canonical merged token overshoots → masked → model forced to
+  split); the plan adds a canonicity oracle to `grammar_fuzz.rs` and
+  treats any red in the #96 per-model suite as a finding. Read before
+  touching the GBNF emitter or "helping" tool-call turns hit by
+  widening a cache tolerance.
+- [`mistral4_support_and_metal_nan.md`](.claude/memory/mistral4_support_and_metal_nan.md)
+  — **read before debugging a NaN on Mistral Small 4, and before
+  re-testing flash attention or the quant — both are ruled out with
+  evidence.** Mistral Small 4 **works** (7/7 e2e on device). The
+  `[TOOL_CALLS]name[ARGS]{…}` format needed *zero* new dialect code —
+  the analyzer derives it as `TagWithJson`. The Metal all-NaN decode
+  above 32 prefill tokens is root-caused: **f16 overflow in
+  `mul_mm_id`**, because layer 32's activations run ~1000× hot and the
+  MMA path carries operands in half. Worked around with
+  `LlamaCppOptions::with_n_ubatch(31)`, which keeps prefill on the f32
+  `mul_mv_id` path. Also carries `DecodeError::NonFinite`, the open
+  question of the predictor's three `.expect()` sites that still panic
+  on it, and — **read before attributing any deterministic behaviour to
+  "model preference"** — the tool-call loop that was *ours*: the grammar
+  filters masked EOG at accepting-but-extensible states, forcing call
+  after call. Fixed 2026-09-19 (`grammar_exhausted()` halt), which is
+  also what made parallel tool calls work at all.
 - [`plan_ci_self_hosted_runner.md`](.claude/memory/plan_ci_self_hosted_runner.md)
   — **read first if this session is on the remote runner box.** CI's
   first-run state (green both OSes bar four model-needing "unignored"
@@ -275,17 +379,35 @@ for the current arc:
   `just test moeflux` deliberately spans two configurations, and the
   `nextest list` count discipline that catches a backend-agnostic test
   being silently gated behind `llama-cpp`.
+- [`stray_think_closer_ban.md`](.claude/memory/stray_think_closer_ban.md)
+  — **read before blaming a llama.cpp update for a thinking regression,
+  or re-bisecting a `</think>`-in-free-text rejection.** 2026-09-11:
+  the Qwen 3.6 seed-agent wedge was A/B'd against the pre-rebase
+  llama.cpp and fails identically there; template detection, the
+  render, raw Metal inference and upstream `seq_rm` are all ruled out
+  with evidence. Cause: #107's opener ban had no closer counterpart, so
+  a thinking-off stub let the model reason in the open and close a
+  thought it never opened. Fix: the conditional closer ban.
 - [`truncated_call_containment.md`](.claude/memory/truncated_call_containment.md)
   — **read before proposing any "just ban the token" fix.** Why a
   truncated tool call cannot be prevented, only contained: the four
   classes (model-bails — already closed; opener-in-free-region — legal
-  by construction; byte-spelling — mostly not a vector, the trigger scan
-  is byte-based; budget exhaustion — irreducible). Carries the
+  by construction; byte-spelling — superseded by emission provenance,
+  below; budget exhaustion — irreducible). Carries the
   *reason* 0.7 tore out the ban set (banning `r` broke
   `count_letters("strawberry")`), why containment must key on "does this
   text contain a special" rather than "did the parser degrade" (keying
   on degradation breaks every structured generation on Llama 3.1), and
   the two-errors decision for #38.
+- [`emission_provenance.md`](.claude/memory/emission_provenance.md)
+  — **read before touching the parse paths in `Session`,
+  `StreamParser`, or the deferred-trigger scan.** 2026-10-01: only
+  framing the model emitted as a real reserved token is structure; a
+  piece it *spelled* (copying markup from content) is swapped for a
+  marker before parsing and restored after, and a spelled trigger does
+  not arm the lazy grammar. Carries the measured per-vocabulary
+  coverage (cogito-32b's `<think>` is plain text — unprotected) and the
+  open limit: grammars are byte-level.
 - [`one_dot_oh_wishlist.md`](.claude/memory/one_dot_oh_wishlist.md)
   — deferred items from the 0.8.0 pre-publish review (2026-07-23):
   breaking-later decisions (Token associated type, root-vs-modules,
@@ -309,6 +431,11 @@ for the current arc:
   returns are unchecked and release builds take the UB path while debug
   aborts. Carries the checked-and-clean list so a future pass doesn't
   re-litigate settled ground.
+- [`llama_cpp_determinism.md`](.claude/memory/llama_cpp_determinism.md)
+  — #126: logits differ with KV layout (neighbor slots, off-grid
+  ubatch boundaries), so a seed printed under load may not reproduce.
+  Root cause, fork branches (`mdegans/llama.cpp` `determinism/*`), the
+  measured cost, and why production stays on stock.
 - [`logit_comparability_across_backends.md`](.claude/memory/logit_comparability_across_backends.md)
   — how far logits are comparable across backends, measured. Greedy
   streams and prefill logits port; the deep-context top-K tail does not
@@ -435,6 +562,14 @@ regression. Tell: the failing test name changes between runs while the
 pass/fail counts stay identical. Everything below goes through
 `cargo-nextest`, which gives each test its own process.
 
+**Run `just test all` before closing out a session** — especially one that
+touched sampling, containment, dialects, or templates. CI runs the model tier
+only on main pushes/PRs; dev sessions that skip the ignored tier can land a
+visibility change whose reds surface days later looking like fresh
+regressions. (The #107 lesson: #101's containment landed 2026-07-29 without a
+full-tier run; a *long-standing invisible* model quirk then surfaced 08-05 as
+an apparent regression and cost a session of archaeology.)
+
 `just` recipes are thin wrappers over `scripts/test.py`, which owns the test
 topology so the justfile and CI cannot drift from each other (#68). Run
 `python3 scripts/test.py --help` for the full interface, or use it directly on
@@ -502,7 +637,7 @@ symlink). `just test moeflux` additionally wants the expert shards mounted.
 - "Code is poetry. Make it pretty." Use `rustfmt`.
 - The Eric Hartford uncensored model check in `Model::from_file` is intentional — keep it.
 - Vocab / VocabKind were removed in 0.7. Content filtering belongs in the consuming app, not in the library. If tempted to add token-ban logic back, don't.
-- **Content filtering ≠ protocol integrity.** The rule above is about *content* policy (banning words/ideas — an app concern). It does **not** forbid guarding the tokens and substrings that constitute the chat *format* itself — the special/control tokens (`<|im_end|>`, etc.) and media markers (`<__media__>`) that the KV cache, the block parser, and the marker-count contract all depend on. A `Block::Text` is content by definition; a framing token appearing inside one is either an accident or an injection, never meaning. So `Session` rejects special-token-bearing content at ingest (`check_no_special_injection`), renders images out-of-band via a per-call random sentinel (mtmd never sees prompt text at all — `Vision::tokenize_image` takes only image placeholders), and masks dialect-illegal specials at emission (`emit_ban_set` / `SampleOptions::banned_specials`, opt-out via `with_emit_specials_ban(false)` for e.g. Qwen-VL grounding markers) — all format integrity, not content filtering. The boundary that keeps this principled: **`Session` enforces it, `Engine`/the raw predictor does not.** Callers who legitimately want to hand-feed control tokens drop below the block abstraction. (Historical note: the thing 0.7 removed was word/token *content* banning; this is a different concern with a different owner.)
+- **Content filtering ≠ protocol integrity.** The rule above is about *content* policy (banning words/ideas — an app concern). It does **not** forbid guarding the tokens and substrings that constitute the chat *format* itself — the special/control tokens (`<|im_end|>`, etc.) and media markers (`<__media__>`) that the KV cache, the block parser, and the marker-count contract all depend on. A `Block::Text` is content by definition; a framing token appearing inside one is either an accident or an injection, never meaning. So `Session` reads special-token pieces that content spells as text — the chat template swaps each for a per-call out-of-band marker (`LiteralNeutralizer`) that `Session` tokenizes with specials off, and validates tool names and ids it cannot neutralize — while `check_no_special_injection` stays as a loud bug detector for any content surface that bypassed that; parses the model's output with emission provenance, so a reserved piece the model *spelled* in ordinary tokens (copying such content) is text and only a real reserved token is framing — the lazy grammar's trigger included (`dialect::Provenance`, `PiecePredictor::with_reserved`, opt-in below `Session`); renders images out-of-band via a per-call random sentinel (mtmd never sees prompt text at all — `Vision::tokenize_image` takes only image placeholders), and masks dialect-illegal specials at emission (`emit_ban_set` / `SampleOptions::banned_specials`, opt-out via `with_emit_specials_ban(false)` for e.g. Qwen-VL grounding markers) — all format integrity, not content filtering. The boundary that keeps this principled: **`Session` enforces it, `Engine`/the raw predictor does not.** Callers who legitimately want to hand-feed control tokens drop below the block abstraction. (Historical note: the thing 0.7 removed was word/token *content* banning; this is a different concern with a different owner.)
 
 ## Key Design Decisions
 

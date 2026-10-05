@@ -137,10 +137,13 @@ struct Seat {
 }
 
 impl Seat {
-    /// A filing seat: persona system prompt, the `file` tool, forced.
+    /// A filing seat: persona system prompt, the `file` tool, forced —
+    /// and forced to exactly one call. A seat files once per round; a
+    /// forced choice alone means "at least one".
     fn filer(name: &'static str, system: String) -> Self {
         let mut prompt = Prompt::default().system(system).add_tool(file_tool());
-        prompt.tool_choice = Some(tool::Choice::method(FILE_TOOL));
+        prompt.tool_choice =
+            Some(tool::Choice::method(FILE_TOOL).disable_parallel_tool_use());
         Seat {
             name,
             prompt,
@@ -324,17 +327,30 @@ fn file_call(
     assert_cache_hit(seat, &counts, first_call);
     seat.usage += counts;
     log::debug!("{} ▸ {message}", seat.name);
-    let call = message.tool_use().ok_or_else(|| {
-        // Unreachable on the forced path (the session reports a
-        // grammar violation instead) — but never silently absent.
-        format!("☠ {}: forced call produced no tool use", seat.name)
-    })?;
+    // Dispatch only a finished call. A turn the budget cut (#121)
+    // comes back `max_tokens` carrying the call it cut, if its name was
+    // whole — the members that completed and no more, as on Anthropic.
+    // Never silently absent, never filed half-written.
+    let call = message
+        .tool_use()
+        .filter(|_| {
+            message.stop_reason
+                == Some(misanthropic::response::StopReason::ToolUse)
+        })
+        .ok_or_else(|| {
+            format!(
+                "☠ {}: forced call produced no finished tool use (stop \
+                 reason: {:?})",
+                seat.name, message.stop_reason,
+            )
+        })?;
     let filing: Filing = serde_json::from_value(call.input.clone())
         .map_err(|e| format!("☠ {}: unparseable filing: {e}", seat.name))?;
     // Relay guard (#37 residual): the grammar forces the call's
     // SHAPE, but frame-marker bytes are legal inside argument
     // strings, and this text is about to be rendered into other
-    // seats' prompts — where ingest would reject it. Scan at the
+    // seats' prompts. Ingest would read it as text, but a filing that
+    // spells framing is still a malformed filing here: scan at the
     // source and adjourn naming the author.
     for (field, text) in
         [("analysis", &filing.analysis), ("verdict", &filing.verdict)]
@@ -476,11 +492,11 @@ fn main() -> Result<(), BoxError> {
     // Filings and rulings are long-form; the seats rely on the prompt's
     // `max_tokens` default (4096) as the generation budget — 1024 truncated
     // a jester rebuttal, 2048 an engineer reaction (runs five and six), and
-    // on the forced path that is a typed GrammarViolation that adjourns the
-    // council. Not 8192: `check_context_fit` reserves `max_tokens` of
-    // headroom per call out of the shared `--n-ctx` budget above. The
-    // Session-level cap was removed, so this budget now lives on the seat
-    // prompts (`Prompt::default().max_tokens` == 4096).
+    // on the forced path that is a clipped call (`max_tokens`, no tool use)
+    // that adjourns the council. Not 8192: `check_context_fit` reserves
+    // `max_tokens` of headroom per call out of the shared `--n-ctx` budget
+    // above. The Session-level cap was removed, so this budget now lives on
+    // the seat prompts (`Prompt::default().max_tokens` == 4096).
 
     let mut advisors: Vec<Seat> = ADVISORS
         .iter()

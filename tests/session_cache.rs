@@ -13,13 +13,26 @@
 
 #![cfg(feature = "llama-cpp")]
 
+mod common;
+
 use std::{borrow::Cow, num::NonZeroU32, path::PathBuf};
 
 use drama_llama::{
     Block, Content, FromPath, LlamaCppOptions, LlamaCppSession, Message,
     Prompt, Role, SamplingMode,
 };
-use misanthropic::prompt::message::CacheControl;
+use misanthropic::{prompt::message::CacheControl, response::TokenCounts};
+
+/// A [`misanthropic::response::Usage`]'s prompt total: the sum of its
+/// three disjoint input counters (`cache_read_input_tokens` +
+/// `cache_creation_input_tokens` + `input_tokens`). `input_tokens`
+/// alone is only the tail after the last `cache_control` breakpoint,
+/// not the whole prompt — see `Session::last_usage`'s doc.
+fn prompt_total(u: &TokenCounts) -> u64 {
+    u.cache_read_input_tokens.unwrap_or(0)
+        + u.cache_creation_input_tokens.unwrap_or(0)
+        + u.input_tokens
+}
 
 fn model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf")
@@ -72,7 +85,7 @@ fn extend(prompt: &mut Prompt, reply: Content, next_user: &'static str) {
 /// Across a growing conversation, `cache_read_input_tokens` must
 /// start at zero, become nonzero once a breakpoint exists, and keep
 /// growing as the reusable prefix grows — while always staying below
-/// the request's `input_tokens`.
+/// the request's total prompt size (`prompt_total`).
 #[test]
 #[ignore = "long running, requires models/model.gguf"]
 fn cache_read_grows_across_rounds() {
@@ -94,9 +107,9 @@ fn cache_read_grows_across_rounds() {
         "round 2 must reuse the round-1 prefix, got cache_read={read2}"
     );
     assert!(
-        read2 < r2.usage.input_tokens,
-        "cache_read ({read2}) must be a strict prefix of input_tokens ({})",
-        r2.usage.input_tokens
+        read2 < prompt_total(&r2.usage),
+        "cache_read ({read2}) must be a strict prefix of the prompt total ({})",
+        prompt_total(&r2.usage)
     );
 
     extend(&mut prompt, r2.inner.content.clone(), "And name an animal.");
@@ -107,7 +120,7 @@ fn cache_read_grows_across_rounds() {
         "round 3 should reuse a longer prefix than round 2 \
          (read2={read2}, read3={read3})"
     );
-    assert!(read3 < r3.usage.input_tokens);
+    assert!(read3 < prompt_total(&r3.usage));
 }
 
 /// A conversation that returns to a previously-cached prefix after a
@@ -120,7 +133,7 @@ fn shared_prefix_survives_divergent_turn() {
 
     let shared = base_prompt();
     let r1 = session.complete_response(&shared).expect("prime");
-    let primed_read = r1.usage.input_tokens;
+    let primed_total = prompt_total(&r1.usage);
 
     // Divergent continuation A.
     let mut branch_a = shared.clone();
@@ -135,7 +148,66 @@ fn shared_prefix_survives_divergent_turn() {
     assert!(
         read_b > 0,
         "branch B shares the primed prefix and must reuse it, \
-         got cache_read={read_b} (primed input was {primed_read})"
+         got cache_read={read_b} (primed total was {primed_total})"
+    );
+}
+
+/// A session for the multi-round #96 scenarios: same determinism as
+/// [`session`], but with a real context size — the default `n_ctx`
+/// (512) ends round 3 at the KV ceiling mid-tool-call.
+fn session_8k() -> LlamaCppSession {
+    LlamaCppSession::from_path_with(
+        model_path(),
+        LlamaCppOptions::default().with_n_ctx(8192),
+    )
+    .expect("session load")
+    .quiet()
+    .with_prefix_cache(true)
+}
+
+/// #96, the downstream (agentkit) shape: sliding markers, forced
+/// tool-call turns, every continuation resuming past the entire
+/// previous prompt via the tip. Shared scenario — the per-model
+/// suites run the same one against their own templates.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn tip_anchors_across_tool_rounds_issue_96() {
+    common::tip::assert_tip_anchors_across_tool_rounds(session_8k(), 3);
+}
+
+/// #96's probe scenario: a continuation adding no new `cache_control`
+/// anywhere may only be covered by the tip via the LCP walk. Before
+/// the fix this fell back to the last explicit marker on every model.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn tip_anchors_unmarked_continuation_issue_96() {
+    common::tip::assert_tip_anchors_unmarked_continuation(session_8k());
+}
+
+/// A reply echoed back edited parts from the cached turn inside it:
+/// the next call resumes from the turn anchor at the end of the
+/// previous prompt, and generates what a cold session does. On a hybrid
+/// model (Qwen3.6) that anchor is a recurrent-state checkpoint.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn turn_anchor_survives_an_edited_reply() {
+    // Set rather than inherited, so the test knows the grid (#126).
+    const N_UBATCH: u32 = 64;
+    let session = || {
+        LlamaCppSession::from_path_with(
+            model_path(),
+            LlamaCppOptions::default()
+                .with_n_ctx(8192)
+                .with_n_ubatch(N_UBATCH),
+        )
+        .expect("session load")
+        .quiet()
+        .with_prefix_cache(true)
+    };
+    common::tip::assert_turn_anchor_survives_an_edited_reply(
+        session(),
+        session,
+        N_UBATCH as usize,
     );
 }
 
@@ -154,7 +226,15 @@ fn cached_output_matches_uncached_output() {
     let mut prompt2 = prompt.clone();
 
     let (cached_text_1, cached_text_2, cached_read_2) = {
-        let mut cached = session(true);
+        // Adoption off: with it, round 2 reads round 1's turn in the
+        // split the model emitted, while the fresh session reads the
+        // tokenizer's — a different input whenever the two differ, and
+        // so not the comparison this test makes.
+        let mut cached = session(true).with_prefix_cache_config({
+            let mut config = drama_llama::PrefixCacheConfig::default();
+            config.adopt_emitted_tokens = false;
+            config
+        });
         let r1 = cached.complete_response(&prompt).expect("cached r1");
         // Round 2 extends with the cached session's assistant turn;
         // the fresh session will replay the identical transcript, so
@@ -186,6 +266,45 @@ fn cached_output_matches_uncached_output() {
         cached_text_2,
         out_fresh_2.inner.content.to_string(),
         "cache-path output diverged from fresh-session output"
+    );
+}
+
+/// The default configuration on real output, which the warm-vs-cold
+/// comparison above turns off: reading round 1's turn in the model's
+/// own split (`adopt_emitted_tokens`), round 2 reuses at least what the
+/// tokenizer's split reuses — strictly more whenever the model wrote a
+/// split its tokenizer would not. The tripwire is armed, so a spliced
+/// prompt that does not read as its render panics. Round 1 runs the
+/// same path either way, so its outputs must agree.
+#[test]
+#[ignore = "long running, requires models/model.gguf"]
+fn adoption_reuses_at_least_the_canonical_split() {
+    // OnceLock reads this on first use; nextest's process-per-test
+    // isolation keeps it scoped to this test.
+    std::env::set_var("DRAMA_LLAMA_CACHE_TRIPWIRE", "1");
+    let run = |adopt: bool| {
+        let mut session = session(true).with_prefix_cache_config({
+            let mut config = drama_llama::PrefixCacheConfig::default();
+            config.adopt_emitted_tokens = adopt;
+            config
+        });
+        let prompt = base_prompt();
+        let r1 = session.complete_response(&prompt).expect("r1");
+        let mut prompt2 = prompt.clone();
+        extend(&mut prompt2, r1.inner.content.clone(), "Now name a shape.");
+        let r2 = session.complete_response(&prompt2).expect("r2");
+        (
+            r1.inner.content.to_string(),
+            r2.usage.cache_read_input_tokens.unwrap_or(0),
+        )
+    };
+    let (text_on, read_on) = run(true);
+    let (text_off, read_off) = run(false);
+    assert_eq!(text_on, text_off, "round 1 runs the same path either way");
+    assert!(read_off > 0, "round 2 must reuse — test would be vacuous");
+    assert!(
+        read_on >= read_off,
+        "adoption reused {read_on} tokens, the canonical split {read_off}"
     );
 }
 

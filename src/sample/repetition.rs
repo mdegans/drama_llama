@@ -11,6 +11,8 @@ use crate::{
     Candidates, Token,
 };
 
+pub use super::ids::IdPattern;
+
 use std::{
     collections::BTreeSet,
     num::{NonZeroU32, NonZeroU8},
@@ -58,6 +60,35 @@ pub struct RepetitionOptions {
     pub(crate) ignored_categories: BTreeSet<IgnoreCategory>,
     /// [`NGram`]s to ignore. These are never penalized.
     pub(crate) ignored: BTreeSet<NGram>,
+    /// Identifier patterns. Per call, `Session` runs each over the
+    /// prompt's text (tool results, user turns, tool-call arguments —
+    /// not the model's prior thoughts) and every match becomes a
+    /// *known id*; a token that faithfully copies one, from its first
+    /// byte, is never penalized (see [`IdGuard`]). An id must be
+    /// re-emitted verbatim, and stacked n-gram penalties otherwise push
+    /// the model off it after a few sightings. Only faithful copies
+    /// are exempt: a string that is a prefix of no known id keeps its
+    /// full penalty. An id may span words (`Sept. 7`, `September 22,
+    /// 2026`); the exemption follows the copy across its spaces.
+    /// Default empty — which strings are identifiers is the consumer's
+    /// knowledge. A pattern as loose as `\w+` makes
+    /// every word a known id and disables the penalty; keep them
+    /// specific.
+    ///
+    /// [`IdGuard`]: super::ids::IdGuard
+    pub(crate) id_patterns: Vec<IdPattern>,
+    /// Hold a copy of a known id to the id once it is under way (#144):
+    /// past eight matched characters of exactly one id, the next token
+    /// must continue it (`IdGuard::lock` has the rule and its
+    /// exceptions). Sampling noise at one uncertain hex digit otherwise
+    /// garbles a UUID copied from deep in the context. Inert without
+    /// known ids. Default **on**.
+    pub(crate) id_copy_lock: bool,
+    /// The call's known ids, derived from the prompt by `Session`
+    /// (`session::prompt_known_ids`) — per-call data, never written to
+    /// a sidecar or carried in a cached snapshot.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) known_ids: BTreeSet<Vec<u8>>,
     /// Sliding-window size. Only n-gram occurrences within the last
     /// `window_size` generation steps contribute to the penalty. Older
     /// occurrences are evicted by [`NGramStats::evict_outside_window`].
@@ -111,6 +142,34 @@ pub struct RepetitionOptions {
     /// incomplete. Default **on** — this is what breaks small-model
     /// loops inside always-on tool-call grammars.
     pub(crate) constrained_regions: bool,
+    /// Fold the prose inside tool *results* ([`Block::ToolResult`]'s
+    /// nested text) into the persistent corpus during `Session`'s
+    /// prompt-seeding fold. Thread context often arrives as tool
+    /// results (an agent reading a feed), and without this the penalty
+    /// never sees it. Default **on**. Consumed by `Session`; the raw
+    /// `Engine` predictors never prompt-seed.
+    ///
+    /// [`Block::ToolResult`]: crate::Block::ToolResult
+    pub(crate) seed_tool_results: bool,
+    /// Fold the string *values* of tool-call arguments
+    /// ([`Block::ToolUse`]`.input` string leaves; keys, numbers and
+    /// booleans are skipped) into the persistent corpus during
+    /// `Session`'s prompt-seeding fold. Tool calls are the majority of
+    /// what an agent emits, so without this an agent's own prior
+    /// output exerts no repetition pressure. Default **on**. Consumed
+    /// by `Session`; the raw `Engine` predictors never prompt-seed.
+    ///
+    /// [`Block::ToolUse`]: crate::Block::ToolUse
+    pub(crate) seed_tool_args: bool,
+    /// Seed the constrained-region accumulator from the persistent
+    /// corpus at generation start, so grammar-constrained free regions
+    /// (JSON string bodies) feel repetition pressure from prompt
+    /// history instead of starting from silence every call. Requires
+    /// [`Self::constrained_regions`]; no effect without it. Default
+    /// **on**. Consumed by `Session`; determinism is preserved because
+    /// the seed derives from the prompt identically on cold and
+    /// resumed calls, after every breakpoint snapshot is taken.
+    pub(crate) seed_constrained_regions: bool,
 }
 
 /// Deserialize-only mirror of [`RepetitionOptions`]. The real struct routes its
@@ -127,6 +186,10 @@ struct RepetitionOptionsShadow {
     ignored_categories: BTreeSet<IgnoreCategory>,
     #[serde(default)]
     ignored: BTreeSet<NGram>,
+    #[serde(default)]
+    id_patterns: Vec<IdPattern>,
+    #[serde(default = "default_id_copy_lock")]
+    id_copy_lock: bool,
     #[serde(default = "default_window_size")]
     window_size: NonZeroU32,
     #[serde(default = "default_decay")]
@@ -141,6 +204,12 @@ struct RepetitionOptionsShadow {
     surgical: bool,
     #[serde(default = "default_constrained_regions")]
     constrained_regions: bool,
+    #[serde(default = "default_seeding")]
+    seed_tool_results: bool,
+    #[serde(default = "default_seeding")]
+    seed_tool_args: bool,
+    #[serde(default = "default_seeding")]
+    seed_constrained_regions: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -161,6 +230,10 @@ impl TryFrom<RepetitionOptionsShadow> for RepetitionOptions {
         Ok(Self {
             ignored_categories: s.ignored_categories,
             ignored: s.ignored,
+            id_patterns: s.id_patterns,
+            id_copy_lock: s.id_copy_lock,
+            // Per-call data; a sidecar never carries it.
+            known_ids: BTreeSet::new(),
             window_size: s.window_size,
             decay: s.decay,
             penalty_max_count: s.penalty_max_count,
@@ -171,6 +244,9 @@ impl TryFrom<RepetitionOptionsShadow> for RepetitionOptions {
             penalty_present: s.penalty_present,
             surgical: s.surgical,
             constrained_regions: s.constrained_regions,
+            seed_tool_results: s.seed_tool_results,
+            seed_tool_args: s.seed_tool_args,
+            seed_constrained_regions: s.seed_constrained_regions,
         })
     }
 }
@@ -181,18 +257,38 @@ fn default_constrained_regions() -> bool {
     true
 }
 
-/// Default window size — long enough to catch genuine paragraph-scale
-/// repetition, short enough that the bounded additive contribution
-/// (`window_size * penalty_freq` worst-case before decay) stays well
-/// inside the model's natural logit gradient.
+/// Default for the id copy-lock gate — on. It is inert until a
+/// sidecar names `id_patterns`, so a sidecar that predates the field
+/// keeps its behavior until it does.
+fn default_id_copy_lock() -> bool {
+    true
+}
+
+/// Default for the three seeding gates (`seed_tool_results`,
+/// `seed_tool_args`, `seed_constrained_regions`) — on. A sidecar that
+/// predates the fields gains history pressure, which is the expected
+/// behavior of a repetition penalty (#106).
+fn default_seeding() -> bool {
+    true
+}
+
+/// Default window size — thread-corpus reach (#106): with prompt
+/// history seeded into the corpus, the window is how far back the
+/// presence term can see, so it must span prior posts, not just the
+/// current paragraph. The additive contribution stays bounded because
+/// `penalty_freq` is coupled to `decay` (see the cap note in
+/// `Default`), not to the window.
 fn default_window_size() -> NonZeroU32 {
-    NonZeroU32::new(256).unwrap()
+    NonZeroU32::new(2048).unwrap()
 }
 
 /// Default per-step decay. Caps sustained-repetition effective count at
-/// `1 / (1 - 0.95) = 20` regardless of how long generation runs.
+/// `1 / (1 - 0.99) = 100` regardless of how long generation runs; the
+/// decayed-term horizon (where `0.99^d` stops mattering) is ≈460
+/// steps. Raised from 0.95 with `penalty_freq` lowered in step so the
+/// saturated additive cap is unchanged (#106).
 fn default_decay() -> f32 {
-    0.95
+    0.99
 }
 
 impl Default for RepetitionOptions {
@@ -204,14 +300,27 @@ impl Default for RepetitionOptions {
             // structured output for no anti-loop benefit. Punctuation is also
             // default-on for the same reason — prose `. , ; : ! ?` have no
             // lexical variety, so accumulating penalty on `.` biases toward
-            // run-ons. Users can override by calling
+            // run-ons. Numbers likewise (#113): a number is a fact, and
+            // every tokenizer we ship for spells it with a bare ` ` and
+            // digit tokens that the whole context's numbers share.
+            // Markdown code fences too: penalizing the closing fence of a
+            // copied example broke Qwen3.6's answers.
+            // Users can override by calling
             // `set_ignored_categories(vec![])`.
             ignored_categories: BTreeSet::from([
                 IgnoreCategory::English,
                 IgnoreCategory::Json,
+                IgnoreCategory::Markdown,
+                IgnoreCategory::Numbers,
                 IgnoreCategory::Punctuation,
             ]),
             ignored: BTreeSet::new(),
+            // Opt-in per model: which strings count as identifiers is
+            // the consumer's knowledge (Agora's UUIDs and GOV ids), not
+            // the crate's.
+            id_patterns: Vec::new(),
+            id_copy_lock: default_id_copy_lock(),
+            known_ids: BTreeSet::new(),
             window_size: default_window_size(),
             decay: default_decay(),
             penalty_max_count: NonZeroU8::new(1).unwrap(),
@@ -222,11 +331,13 @@ impl Default for RepetitionOptions {
             // → `1.06^4 ≈ 1.27` was already pushing factual tokens out of
             // contention on big-model prose.
             penalty_repeat: 1.05,
-            // 0.125 (was 0.1) and 0.0625 (was 0.1) — the saturated additive
-            // contribution is bounded by `1 / (1 - decay) * penalty_freq +
-            // penalty_present` ≈ 2.6 at these defaults. Comfortable inside any
-            // model's natural top-k spread.
-            penalty_freq: 0.125,
+            // 0.025 (was 0.125, coupled to the 0.95→0.99 decay change —
+            // #106) — the saturated additive contribution is bounded by
+            // `1 / (1 - decay) * penalty_freq + penalty_present` ≈ 2.6 at
+            // these defaults, unchanged from the pre-#106 tuning: 5× the
+            // reach at the same cap. Comfortable inside any model's
+            // natural top-k spread.
+            penalty_freq: 0.025,
             penalty_present: 0.0625,
             // Surgical-on (was off): only penalises the *next- extension* token
             // of a recurring n-gram, not every trailing token of every tracked
@@ -236,6 +347,9 @@ impl Default for RepetitionOptions {
             // per-model sidecar.
             surgical: true,
             constrained_regions: default_constrained_regions(),
+            seed_tool_results: default_seeding(),
+            seed_tool_args: default_seeding(),
+            seed_constrained_regions: default_seeding(),
         }
     }
 }
@@ -273,6 +387,51 @@ impl RepetitionOptions {
     /// [`IgnoreCategory`]s of tokens. These are never penalized.
     pub fn ignored_categories(&self) -> &BTreeSet<IgnoreCategory> {
         &self.ignored_categories
+    }
+
+    /// Identifier patterns (see [`IdPattern`]). Every match of every
+    /// pattern in the prompt becomes a known id for the call, and a
+    /// token that faithfully extends one is never penalized.
+    pub fn id_patterns(&self) -> &[IdPattern] {
+        &self.id_patterns
+    }
+
+    /// Set the identifier patterns. Compiled already (an [`IdPattern`]
+    /// is a compiled regex), so this cannot fail.
+    pub fn set_id_patterns<It>(mut self, patterns: It) -> Self
+    where
+        It: IntoIterator<Item = IdPattern>,
+    {
+        self.id_patterns = patterns.into_iter().collect();
+        self
+    }
+
+    /// Whether a copy of a known id is held to the id. See the field
+    /// docs.
+    pub fn id_copy_lock(&self) -> bool {
+        self.id_copy_lock
+    }
+
+    /// Enable or disable the id copy-lock. Off leaves a copy to the
+    /// sampler alone; the penalty exemption stands either way.
+    pub fn set_id_copy_lock(mut self, on: bool) -> Self {
+        self.id_copy_lock = on;
+        self
+    }
+
+    /// Install the call's known-id set (`Session` derives it from the
+    /// prompt with [`Self::id_patterns`] — see `session::prompt_known_ids`).
+    pub(crate) fn with_known_ids(
+        mut self,
+        known_ids: BTreeSet<Vec<u8>>,
+    ) -> Self {
+        self.known_ids = known_ids;
+        self
+    }
+
+    /// The call's known-id set. Empty unless a `Session` filled it.
+    pub(crate) fn known_ids(&self) -> &BTreeSet<Vec<u8>> {
+        &self.known_ids
     }
 
     /// The effective ignore set: [`Self::ignored`] plus every
@@ -502,6 +661,47 @@ impl RepetitionOptions {
         self
     }
 
+    /// Whether tool-result prose is folded into the persistent corpus.
+    /// See the field docs.
+    pub fn seed_tool_results(&self) -> bool {
+        self.seed_tool_results
+    }
+
+    /// Enable or disable folding tool-result prose into the persistent
+    /// corpus. Off restores the pre-#106 exclusion (short tool echoes
+    /// never penalized because never seen).
+    pub fn set_seed_tool_results(mut self, on: bool) -> Self {
+        self.seed_tool_results = on;
+        self
+    }
+
+    /// Whether tool-call argument string values are folded into the
+    /// persistent corpus. See the field docs.
+    pub fn seed_tool_args(&self) -> bool {
+        self.seed_tool_args
+    }
+
+    /// Enable or disable folding tool-call argument string values into
+    /// the persistent corpus.
+    pub fn set_seed_tool_args(mut self, on: bool) -> Self {
+        self.seed_tool_args = on;
+        self
+    }
+
+    /// Whether the constrained-region accumulator is seeded from the
+    /// persistent corpus at generation start. See the field docs.
+    pub fn seed_constrained_regions(&self) -> bool {
+        self.seed_constrained_regions
+    }
+
+    /// Enable or disable seeding the constrained-region accumulator
+    /// from the persistent corpus. Off restores the pre-#106 behavior:
+    /// free regions start every call with no history pressure.
+    pub fn set_seed_constrained_regions(mut self, on: bool) -> Self {
+        self.seed_constrained_regions = on;
+        self
+    }
+
     /// Sliding-window size in generation steps. See field docs.
     pub fn window_size(&self) -> NonZeroU32 {
         self.window_size
@@ -594,6 +794,18 @@ impl RepetitionOptions {
 
             if let Some(ngram) = to_remove {
                 self.ignored.remove(&ngram);
+            }
+        }
+
+        // Identifier patterns — read-only, like the regex stop sequences
+        // in `PredictOptions`: a sidecar concern, not a live knob.
+        if !self.id_patterns.is_empty() {
+            ui.label("Identifier patterns").on_hover_text_at_pointer(
+                "Regexes for identifiers in the prompt (ids, UUIDs). A token \
+                 that faithfully copies one is never penalized.",
+            );
+            for pattern in &self.id_patterns {
+                ui.monospace(pattern.as_str());
             }
         }
 
@@ -745,6 +957,35 @@ impl RepetitionOptions {
                  the region (closing quote, delimiters) are never penalized, so the grammar \
                  always stays completable. When disabled, the penalty is fully suspended while \
                  any grammar is active.",
+            );
+
+        // Id copy-lock (#144)
+        resp |= ui.checkbox(&mut self.id_copy_lock, "Lock id copies")
+            .on_hover_text_at_pointer(
+                "Once eight characters of exactly one known id (a hex UUID from the \
+                 prompt) are written, the next tokens must continue that id until it is \
+                 complete. Keeps a copied id from drifting at an uncertain digit.",
+            );
+
+        // Prompt-seeding gates (#106)
+        resp |= ui.checkbox(&mut self.seed_tool_results, "Seed from tool results")
+            .on_hover_text_at_pointer(
+                "Fold the text inside tool results into the repetition corpus, so context \
+                 that arrives as tool output (e.g. a thread an agent is reading) exerts \
+                 repetition pressure. When disabled, tool results are invisible to the penalty.",
+            );
+        resp |= ui.checkbox(&mut self.seed_tool_args, "Seed from tool-call arguments")
+            .on_hover_text_at_pointer(
+                "Fold the string values of prior tool-call arguments into the repetition \
+                 corpus, so an agent's own earlier output (posts, comments) exerts repetition \
+                 pressure. Keys, numbers and booleans are never folded.",
+            );
+        resp |= ui.checkbox(&mut self.seed_constrained_regions, "Seed free regions from history")
+            .on_hover_text_at_pointer(
+                "Start grammar free regions (JSON string bodies) with the repetition history \
+                 of the whole prompt instead of a blank slate. Requires the free-region \
+                 penalty above. When disabled, constrained output only feels pressure from \
+                 text generated earlier in the same call.",
             );
 
         // Close the immediate-mode one-frame lag: each ngram-size slider's
@@ -1239,13 +1480,19 @@ mod invariant_tests {
         #[test]
         fn partial_applies_defaults() {
             let o: RepetitionOptions = ::toml::from_str(REQUIRED).unwrap();
-            assert_eq!(o.window_size().get(), 256);
-            assert_eq!(o.decay(), 0.95);
+            assert_eq!(o.window_size().get(), 2048);
+            assert_eq!(o.decay(), 0.99);
             assert!(!o.surgical());
             assert!(o.ignored().is_empty());
             assert!(o.ignored_categories().is_empty());
             // Pre-feature sidecars keep the loop-breaking behavior.
             assert!(o.constrained_regions());
+            // Pre-#106 sidecars gain history pressure (default on).
+            assert!(o.seed_tool_results());
+            assert!(o.seed_tool_args());
+            assert!(o.seed_constrained_regions());
+            // The id copy-lock is on, inert without id patterns.
+            assert!(o.id_copy_lock());
         }
 
         /// The `ignored_stopwords` legacy key still maps onto
@@ -1267,6 +1514,47 @@ mod invariant_tests {
             let s = ::toml::to_string(&RepetitionOptions::default()).unwrap();
             let o: RepetitionOptions = ::toml::from_str(&s).unwrap();
             assert_eq!(o, RepetitionOptions::default());
+        }
+
+        /// `id_patterns` round-trips as regex source strings; the
+        /// per-call `known_ids` never reaches the sidecar.
+        #[test]
+        fn id_patterns_roundtrip_known_ids_skipped() {
+            const UUID: &str =
+                "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+            let doc = format!("{REQUIRED}id_patterns = [{UUID:?}]\n");
+            let o: RepetitionOptions = ::toml::from_str(&doc).unwrap();
+            assert_eq!(o.id_patterns().len(), 1);
+            assert_eq!(o.id_patterns()[0].as_str(), UUID);
+
+            let o = o.with_known_ids(BTreeSet::from([b"deadbeef".to_vec()]));
+            let s = ::toml::to_string(&o).unwrap();
+            assert!(s.contains("id_patterns"), "{s}");
+            assert!(!s.contains("known_ids"), "{s}");
+            let back: RepetitionOptions = ::toml::from_str(&s).unwrap();
+            assert_eq!(back.id_patterns(), o.id_patterns());
+            assert!(back.known_ids().is_empty(), "per-call data, not config");
+        }
+
+        /// `id_copy_lock = false` turns the lock off and round-trips.
+        #[test]
+        fn id_copy_lock_switch() {
+            let doc = format!("{REQUIRED}id_copy_lock = false\n");
+            let o: RepetitionOptions = ::toml::from_str(&doc).unwrap();
+            assert!(!o.id_copy_lock());
+            let s = ::toml::to_string(&o).unwrap();
+            let back: RepetitionOptions = ::toml::from_str(&s).unwrap();
+            assert!(!back.id_copy_lock(), "{s}");
+        }
+
+        /// An invalid pattern is rejected at the door, like an inverted
+        /// n-gram range — a sidecar is read every run and never
+        /// rewritten, so a silent skip would hide the breakage forever.
+        #[test]
+        fn invalid_id_pattern_rejected() {
+            let doc = format!("{REQUIRED}id_patterns = [\"[0-9\"]\n");
+            let err = ::toml::from_str::<RepetitionOptions>(&doc).unwrap_err();
+            assert!(err.to_string().contains("regex"), "{err}");
         }
     }
 }
@@ -1576,8 +1864,9 @@ mod tests {
         }
     }
 
-    /// Long-generation regression test: with the windowed-decay
-    /// `RepetitionOptions::default()` (window_size=256, decay=0.95) the
+    /// Long-generation regression test: with windowed decay
+    /// (window_size=256, decay=0.95 — pinned explicitly; the #106
+    /// defaults retune would otherwise scale this loop 8×) the
     /// popular-vs-rare logit gap **converges** instead of growing
     /// linearly. Before the fix the additive `count * penalty_freq`
     /// term grew unboundedly with generation length (~20 logits below
@@ -1608,7 +1897,12 @@ mod tests {
         let baseline: Vec<f32> = (0..n_vocab).map(|_| 1.0).collect();
         let mut tokens: Vec<Token> = Vec::new();
 
-        let opts = RepetitionOptions::default();
+        // The pre-#106 tuning these contracts were written against,
+        // pinned so the loop length and margins are default-proof.
+        let opts = RepetitionOptions::default()
+            .set_window_size(NonZeroU32::new(256).unwrap())
+            .set_decay(0.95)
+            .set_penalty_freq(0.125);
         let window = opts.window_size().get() as usize;
         let mut freq_map = NGramStats::new();
         let ignored = opts.resolved_ignored(&model);
@@ -1703,7 +1997,11 @@ mod tests {
         let baseline: Vec<f32> = (0..n_vocab).map(|_| 1.0).collect();
         let mut tokens: Vec<Token> = Vec::new();
 
-        let opts = RepetitionOptions::default();
+        // Same explicit pre-#106 tuning as the companion above.
+        let opts = RepetitionOptions::default()
+            .set_window_size(NonZeroU32::new(256).unwrap())
+            .set_decay(0.95)
+            .set_penalty_freq(0.125);
         let window = opts.window_size().get() as usize;
         let mut freq_map = NGramStats::new();
         let ignored = opts.resolved_ignored(&model);

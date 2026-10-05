@@ -166,22 +166,28 @@ impl<B: Backend> Engine<B> {
     }
 
     /// Snapshot decoder state at sequence position `pos`. See
-    /// [`Decoder::checkpoint_pos`] — backends like moeflux capture
-    /// recurrent state for later lossless rewind; backends with
-    /// per-cell preserved state (llama.cpp) no-op.
+    /// [`Decoder::checkpoint_pos`] — moeflux, and llama.cpp on
+    /// sliding-window or recurrent / hybrid models, capture what a KV
+    /// truncate cannot rewind; llama.cpp on a dense model no-ops.
     pub fn checkpoint_pos(&mut self, seq_id: i32, pos: i32) {
         self.decoder.checkpoint_pos(seq_id, pos);
     }
 
     /// Rewind decoder state to a previously-snapshotted position.
-    /// See [`Decoder::restore_to`] — `Err(NoCheckpoint)` signals the
-    /// caller should fall back to `memory_clear` + full re-prefill.
+    /// See [`Decoder::restore_to`] — an `Err` sends `Session` down its
+    /// restore ladder to the next anchor below `pos`.
     pub fn restore_to(
         &mut self,
         seq_id: i32,
         pos: i32,
     ) -> Result<(), MemoryRmError> {
         self.decoder.restore_to(seq_id, pos)
+    }
+
+    /// Whether [`Self::restore_to`]`(seq_id, pos)` would rewind by a KV
+    /// truncate alone. See [`Decoder::truncate_restores`].
+    pub fn truncate_restores(&mut self, seq_id: i32, pos: i32) -> bool {
+        self.decoder.truncate_restores(seq_id, pos)
     }
 
     /// Drop a single named snapshot at `(seq_id, pos)`. See

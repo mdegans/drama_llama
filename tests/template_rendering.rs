@@ -216,6 +216,8 @@ fn all_shapes_match_python_jinja2() {
 /// Anthropic semantics: `None` → disabled, `Some(_)` → enabled.
 /// Caller's `with_extra("enable_thinking", _)` wins over the derived
 /// value so opt-out and explicit-override paths both work.
+/// Read back through `tojson`: a bare bool prints per minijinja
+/// version (`false`, `False` from 2.22, #120).
 #[test]
 fn enable_thinking_derives_from_prompt_thinking() {
     use misanthropic::prompt::thinking::Thinking;
@@ -225,7 +227,7 @@ fn enable_thinking_derives_from_prompt_thinking() {
     // up bound to in the Jinja context. Independent of any model
     // template — we're testing the wiring, not a downstream template.
     let tmpl = ChatTemplate::from_source(
-        "thinking={{ enable_thinking }}".to_string(),
+        "thinking={{ enable_thinking | tojson }}".to_string(),
         String::new(),
         String::new(),
     )
@@ -284,5 +286,123 @@ fn enable_thinking_derives_from_prompt_thinking() {
         .expect("render"),
         "thinking=false",
         "explicit with_extra=false must override derived true"
+    );
+}
+
+/// `render_reference` claims, in its own doc comment, to produce "the
+/// exact bytes the chat template's re-render will produce for these
+/// calls, and the exact bytes `grammar_source`'s grammar forces". The
+/// grammar half of that is exercised all over `dialect::parse`'s
+/// tests; the *template* half never was — every caller of
+/// `render_reference` is a test that compares it against itself or
+/// against the parser, never against a real template render.
+///
+/// Written failing as the acceptance criterion for the #85 fix; if it
+/// trips again, a replayed tool-call turn no longer re-renders
+/// byte-stable, the prefix cache's auto-tip is discarded, and reuse
+/// collapses to the last `cache_control` breakpoint.
+///
+/// Two independent divergences, both measured 2026-07-27, both fixed:
+///
+/// 1. **Whitespace.** The shared JSON prelude's `ws ::= [ \t\n\r]?`
+///    let the model emit `": "` where the serializer emits `":"` —
+///    the emission was under-determined by our own grammar. Fixed by
+///    `json_grammar_canonical` pinning the argument interior, with
+///    `KV_SEP`/`FIELD_SEP` shared between the grammar emitter and
+///    `render_reference` so the envelope cannot drift either.
+/// 2. **Escaping.** minijinja's `tojson` followed Jinja2 in being
+///    HTML-safe, escaping `'`, `&`, `<`, `>` to `\u0027` etc., which
+///    neither the model nor `render_reference` does. Fixed by
+///    `tojson_unescaped`.
+///
+/// The payload carries all of those characters deliberately — every
+/// pre-#85 payload in this suite was clean ASCII, which is why the gap
+/// survived so long.
+///
+/// Model-free: the pinned fixture template is the whole input.
+#[test]
+fn render_reference_matches_template_tool_call_render() {
+    render_reference_matches_template(
+        &fixtures_dir().join("cogito_14b_template.jinja"),
+    );
+}
+
+/// The same invariant against the owned `cogito-cache-stable`
+/// template (#88 phase 2), whose `json_dumps` filter renders argument
+/// interiors in the model's measured `Spaced` habit. The analyzer
+/// must detect that spacing and `render_reference` must serialize
+/// with it, or the owned template would *reintroduce* the #85 broken
+/// round-trip it exists to close.
+#[test]
+fn render_reference_matches_cache_stable_template_render() {
+    render_reference_matches_template(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("templates/cogito-cache-stable.jinja"),
+    );
+}
+
+fn render_reference_matches_template(template: &std::path::Path) {
+    use drama_llama::dialect::{analyze_template, render_reference};
+
+    let source = std::fs::read_to_string(template)
+        .unwrap_or_else(|e| panic!("read {template:?}: {e}"));
+    let syntax = analyze_template(&source, "", "<|im_end|>")
+        .expect("cogito template analyzes");
+
+    // Shaped like a real Agora call: string, and a bool to catch the
+    // `": "` vs `":"` divergence on a non-string value too.
+    // Characters the real Agora payload carries and that JSON
+    // serializers disagree about: an apostrophe and `<`/`>`/`&`
+    // (Jinja2's `tojson` is HTML-safe and escapes them) and a
+    // non-ASCII arrow (escaped when `ensure_ascii` is on).
+    let input = json!({
+        "community": "debate",
+        "body": "x's belief in P & Q <br> stability \u{2192} contradiction",
+        "is_proposal": false,
+    });
+    let reference = render_reference(&syntax, &[("create_post", &input)])
+        .expect("call is representable");
+
+    let tmpl = ChatTemplate::from_source(
+        source,
+        String::new(),
+        "<|im_end|>".to_string(),
+    )
+    .expect("template compiles");
+    let prompt = Prompt {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: Content::text("post something"),
+            },
+            Message {
+                role: Role::Assistant,
+                content: Content(vec![drama_llama::Block::ToolUse {
+                    call: misanthropic::tool::Use {
+                        id: Cow::Borrowed("call_0_create_post"),
+                        name: Cow::Borrowed("create_post"),
+                        input: input.clone(),
+                        cache_control: None,
+                        caller: None,
+                    },
+                }]),
+            },
+        ],
+        ..Prompt::default()
+    };
+    let rendered = tmpl
+        .render_with(
+            &prompt,
+            &RenderOptions::default().with_generation_prompt(false),
+        )
+        .expect("render");
+
+    assert!(
+        rendered.contains(&reference),
+        "template render does not contain render_reference's canonical \
+         bytes — the documented invariant is violated, and every \
+         replayed tool-call turn loses its auto-tip (#85).\n\
+         \n--- render_reference ---\n{reference}\
+         \n\n--- template render ---\n{rendered}",
     );
 }

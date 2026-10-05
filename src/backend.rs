@@ -140,8 +140,15 @@ pub trait Decoder: Send {
     /// breakpoint rewinds for backends (like moeflux) whose
     /// recurrent state cannot be unwound by position alone.
     ///
-    /// Backends that already preserve recurrent state per-position
-    /// (e.g. llama.cpp) implement this as a no-op.
+    /// `pos` must be the sequence's head (it holds exactly `[0, pos)`);
+    /// a backend may decline anything else, and the anchor then
+    /// restores through a lower one. Where a KV truncate already
+    /// rewinds losslessly (llama.cpp on a dense model) this is a
+    /// no-op; llama.cpp stores a *partial* checkpoint for
+    /// sliding-window and recurrent / hybrid models — only what a
+    /// truncate cannot rewind — which stays valid only while the
+    /// sequence's KV below `pos` is unchanged, so every `memory_*` call
+    /// that changes it drops the checkpoints above the change.
     fn checkpoint_pos(&mut self, seq_id: i32, pos: i32);
 
     /// Restore decoder state to a previously-snapshotted position.
@@ -150,21 +157,48 @@ pub trait Decoder: Send {
     /// and all snapshots stored at positions `> pos` are dropped
     /// (their futures are now invalid).
     ///
-    /// Backends without per-pos snapshots may implement this by
-    /// truncating their KV cache directly (llama.cpp does this — its
-    /// recurrent state is preserved per-cell, so a truncate is
-    /// already lossless).
+    /// Backends may rewind by truncating their KV cache directly when
+    /// that alone is lossless — llama.cpp does on a dense model, and on
+    /// a sliding-window one while the window below `pos` survives —
+    /// and must fall back to the checkpoint otherwise.
+    ///
+    /// On success `pos` stays restorable: a stored checkpoint survives
+    /// its own restore, and a backend that needs one there but rewound
+    /// without it takes it on the way (llama.cpp's partial checkpoints:
+    /// the head is `pos` right then). So `Session` never checkpoints
+    /// the anchor it restored to.
     ///
     /// Returns [`MemoryRmError::NoCheckpoint`] when no snapshot
-    /// exists at exactly `pos` (caller should fall back to
-    /// `memory_clear` + full reprefill), or
+    /// exists at exactly `pos`, or
     /// [`MemoryRmError::BackendUnsupported`] when the backend cannot
-    /// honor the request at all.
+    /// honor the request at all. Either error may leave `seq_id`
+    /// truncated or cleared; `Session` treats both alike, as one rung
+    /// of its *restore ladder*: it retries on the same sequence at the
+    /// next-best anchor below `pos` that the new prompt still shares
+    /// (an earlier breakpoint, an earlier call's breakpoint, or the
+    /// tip), and resets the slot for a full re-prefill only when no
+    /// rung restores. So an implementation must keep lower positions
+    /// restorable after a failed call — never drop snapshots below
+    /// `pos` on the error path.
     fn restore_to(
         &mut self,
         seq_id: i32,
         pos: i32,
     ) -> Result<(), MemoryRmError>;
+
+    /// Whether [`Decoder::restore_to`]`(seq_id, pos)` would succeed by
+    /// truncating the KV alone, no checkpoint needed — true at *any*
+    /// position the sequence holds, not only at a snapshotted one.
+    ///
+    /// `Session` offers such a backend the point a new prompt parts
+    /// from a cached slot as one more restore rung (#102), where
+    /// otherwise it resumes at the last anchor before it. Default
+    /// `false`: only anchors, the safe answer for a backend that does
+    /// not say. llama.cpp answers `true` on a dense model.
+    fn truncate_restores(&mut self, seq_id: i32, pos: i32) -> bool {
+        let _ = (seq_id, pos);
+        false
+    }
 
     /// Drop the snapshot stored at `(seq_id, pos)` without otherwise
     /// disturbing decoder state.
@@ -178,9 +212,9 @@ pub trait Decoder: Send {
     /// anchor — the most valuable cross-session prefix.
     ///
     /// **No default impl: forces every backend to make an explicit
-    /// choice.** Backends with per-cell recurrent state (llama.cpp)
-    /// implement this as a no-op; backends with explicit per-pos
-    /// snapshots (moeflux) drop the entry from the snapshot map.
+    /// choice.** Backends with explicit per-pos snapshots (moeflux,
+    /// llama.cpp's checkpoints) drop the entry from the snapshot map;
+    /// where nothing was stored it is a no-op.
     ///
     /// Returns `Ok(())` even if no snapshot exists at `pos`
     /// (idempotent — `Session` may forget the same position twice
@@ -195,18 +229,19 @@ pub trait Decoder: Send {
 }
 
 /// Errors from [`Decoder::restore_to`]. Surfaced by the
-/// prefix-cache machinery in `Session` so it can fall back to a full
-/// re-prefill when a snapshot is missing.
-#[derive(Debug, thiserror::Error)]
+/// prefix-cache machinery in `Session`, which falls back to the next
+/// anchor below the failed one (its restore ladder) and to a full
+/// re-prefill only when none restores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum MemoryRmError {
-    /// No snapshot at the requested position. Caller should
-    /// `memory_clear` and full-reprefill.
+    /// No snapshot at the requested position. `Session` tries a lower
+    /// anchor next.
     #[error("no checkpoint stored at position {pos}")]
     NoCheckpoint { pos: i32 },
     /// The backend cannot honor a rewind to this position at all
     /// (invalid seq_id, unsupported semantics, etc.). Treated the
-    /// same as `NoCheckpoint` by the cache fallback path.
+    /// same as `NoCheckpoint` by `Session`'s restore ladder.
     #[error("backend cannot restore to position {pos}")]
     BackendUnsupported { pos: i32 },
 }
@@ -658,6 +693,21 @@ pub trait Model: Send + Sync {
     /// `None` when the model was constructed without a known load
     /// path.
     fn display_name(&self) -> Option<String> {
+        None
+    }
+
+    /// The model's self-declared, human-readable name — GGUF
+    /// `general.name` ("Qwen3.6 35B A3B"), as opposed to
+    /// [`display_name`](Self::display_name), which is the load-path
+    /// basename a server uses as the model's API *id*. Feeds
+    /// `ModelInfo::display_name` on `/v1/models`; callers fall back to
+    /// the id when this is `None`.
+    ///
+    /// Semantic accessor rather than a key lookup, like
+    /// [`chat_template_source`](Self::chat_template_source): backends
+    /// without a notion of a declared name (moeflux's `config.json`
+    /// carries none reliably) inherit the default.
+    fn title(&self) -> Option<String> {
         None
     }
 }

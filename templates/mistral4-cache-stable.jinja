@@ -1,0 +1,159 @@
+{#- drama_llama's cache-stable replacement for the Mistral Small 4
+    (`mistral4`) stock template — see `templates/mistral4-gguf.jinja`
+    for the detection key it replaces, and `src/baked.rs` for the
+    loading ladder.
+
+    The stock template cannot render an *open* assistant turn: it
+    closes every assistant message with `</s>` unconditionally and has
+    no `add_generation_prompt` branch at all, so the generation-prompt
+    render is not a byte prefix of the follow-up render and every tool
+    turn re-prefills. It also accepts reasoning only as a
+    `thinking`-typed content chunk, never as a message field, so the
+    dialect analyzer measures `ReasoningMode::None` and the `[THINK]`
+    channel is invisible to the parser, the grammar and the re-render.
+
+    What this template changes, and nothing else:
+
+      1. `add_generation_prompt` is honoured by construction — the
+         assistant close is emitted per *message*, and Mistral has no
+         assistant header, so the generation prompt is simply the
+         render up to that point.
+      2. Reasoning round-trips as `[THINK]…[/THINK]`, one per thought,
+         gated by `preserve_thinking` for aged turns (the
+         Qwen-template convention `Session::from_engine` sets on every
+         render).
+      3. The turn renders in emission order from drama_llama's
+         `chunks` (thoughts, prose and the calls where each sat)
+         instead of merging prose into one slot and thoughts into
+         one block — the model announces, then calls, and may think
+         twice in a row. Without `chunks` (the dialect analyzer's
+         probes), it renders from the `reasoning` / `reasoning_content`
+         fields and `content_pre` / `content_post`.
+      4. The 140-line Unsloth date-arithmetic preamble and the default
+         Le Chat system message are GONE. That block injected today's
+         and yesterday's date into the prompt *prefix*, so a session
+         spanning midnight lost its entire cache. Persona and dates
+         are app content under the 0.7 boundary; supply them in your
+         own system prompt.
+      5. The `raise_exception` role-alternation guard is dropped. Tool
+         turns, mid-conversation system messages and consecutive user
+         messages are all legal in a `Session` transcript.
+
+    Framing (`<s>`, `</s>`, `[INST]`, `[SYSTEM_PROMPT]`,
+    `[AVAILABLE_TOOLS]`, `[MODEL_SETTINGS]`, `[TOOL_CALLS]`, `[ARGS]`,
+    `[TOOL_RESULTS]`, `[THINK]`) is byte-identical to stock — every one
+    of those is a single special token in this model's vocab.
+-#}
+{{- '<s>' -}}
+
+{#- System prompt. No default: the app owns persona content. -#}
+{%- if messages and messages[0]['role'] == 'system' -%}
+    {{- '[SYSTEM_PROMPT]' + messages[0]['content'] + '[/SYSTEM_PROMPT]' -}}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
+
+{#- Tool definitions live in the static prefix, ahead of every
+    message — the cache-friendly placement stock already chose. -#}
+{%- if tools is defined and tools is not none and tools | length > 0 -%}
+    {{- '[AVAILABLE_TOOLS]' + (tools | tojson) + '[/AVAILABLE_TOOLS]' -}}
+{%- endif -%}
+
+{#- Model settings. `reasoning_effort` is the trained switch for the
+    `[THINK]` channel; drama_llama derives `enable_thinking` from
+    `prompt.thinking`. NOTE this sits in the prompt PREFIX, so
+    toggling thinking mid-conversation invalidates the whole cache —
+    inherent to the format, same as Qwen's `enable_thinking`. -#}
+{%- set reasoning_effort = 'high' if (enable_thinking is defined and enable_thinking) else 'none' -%}
+{{- '[MODEL_SETTINGS]{"reasoning_effort": "' + reasoning_effort + '"}[/MODEL_SETTINGS]' -}}
+
+{#- Pre-scan: index of the last user message, for the aged-reasoning
+    guard below. -#}
+{%- set ns_turn = namespace(last_user_idx=-1) -%}
+{%- for i in range(loop_messages | length) -%}
+    {%- if loop_messages[i]['role'] == 'user' -%}
+        {%- set ns_turn.last_user_idx = i -%}
+    {%- endif -%}
+{%- endfor -%}
+
+{%- for message in loop_messages -%}
+    {%- if message['role'] == 'user' -%}
+        {{- '[INST]' + message['content'] + '[/INST]' -}}
+
+    {%- elif message['role'] == 'system' -%}
+        {#- Mid-conversation system turn. Stock raises; dropping it
+            silently would be worse than rendering it in the format's
+            own system framing. -#}
+        {{- '[SYSTEM_PROMPT]' + message['content'] + '[/SYSTEM_PROMPT]' -}}
+
+    {%- elif message['role'] == 'tool' -%}
+        {{- '[TOOL_RESULTS]' + (message['content'] | string) + '[/TOOL_RESULTS]' -}}
+
+    {%- elif message['role'] == 'assistant' -%}
+        {#- The turn renders from `chunks`, its blocks in emission order
+            (drama_llama supplies them; stock Mistral reads the same
+            text/thinking chunk list as `content`): each thought as its
+            own `[THINK]…[/THINK]`, so back-to-back thoughts keep the
+            markers between them, and prose where it sat. Without
+            `chunks` the turn is rebuilt from the merged fields:
+            reasoning, then the pre-call prose, the calls, the rest.
+            `preserve_thinking` keeps a thought once a later user turn
+            has aged it; without the flag an aged turn drops it and pays
+            a one-turn re-prefill. Rendered VERBATIM — no `|trim`,
+            byte-stability. -#}
+        {%- set keep_thinking = (preserve_thinking is defined and preserve_thinking is true) or loop.index0 > ns_turn.last_user_idx -%}
+        {%- set chunks = message.get('chunks') -%}
+        {%- if chunks is none -%}
+            {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}
+            {%- set chunks = [{'type': 'thinking', 'thinking': thinking_text}] if thinking_text else [] -%}
+            {%- set has_split = message.get('content_pre') is not none -%}
+            {%- set pre = message.get('content_pre') if has_split else message.get('content') -%}
+            {%- if pre -%}
+                {%- set chunks = chunks + [{'type': 'text', 'text': pre}] -%}
+            {%- endif -%}
+            {%- if message.get('tool_calls') -%}
+                {%- set chunks = chunks + [{'type': 'tool_calls'}] -%}
+            {%- endif -%}
+            {%- if has_split and message.get('content_post') -%}
+                {%- set chunks = chunks + [{'type': 'text', 'text': message['content_post']}] -%}
+            {%- endif -%}
+        {%- endif -%}
+
+        {%- for chunk in chunks -%}
+            {%- if chunk['type'] == 'thinking' -%}
+                {%- if keep_thinking -%}
+                    {{- '[THINK]' + chunk['thinking'] + '[/THINK]' -}}
+                {%- endif -%}
+            {%- elif chunk['type'] == 'text' -%}
+                {{- chunk['text'] -}}
+            {%- elif chunk['type'] == 'tool_calls' -%}
+                {%- for tool_call in message['tool_calls'] -%}
+                    {%- set function = tool_call['function'] -%}
+                    {%- set arguments = function['arguments'] -%}
+                    {#- `json_dumps`, not `tojson`: measured greedily with no
+                        grammar, this model's unforced call spelling is
+                        uniform `json.dumps` spacing (`": "` after keys,
+                        `", "` between fields AND array elements) — see
+                        `probe_unforced_habit::mistral4_unforced_call_spelling`.
+                        Stock's `tojson` is compact, which would force the
+                        model off its own habit to keep the round-trip
+                        byte-stable (#85's lesson). The analyzer measures
+                        this filter as `JsonSpacing::Spaced` and the grammar
+                        prelude and `render_reference` follow it. -#}
+                    {%- if arguments is not string -%}
+                        {%- set arguments = arguments | json_dumps -%}
+                    {%- elif arguments == '' -%}
+                        {%- set arguments = '{}' -%}
+                    {%- endif -%}
+                    {{- '[TOOL_CALLS]' + function['name'] + '[ARGS]' + arguments -}}
+                {%- endfor -%}
+            {%- endif -%}
+        {%- endfor -%}
+
+        {#- Close the turn. Emitted per completed assistant message, so
+            a generation prompt (no assistant message yet, or the open
+            tail withheld by `render_with`) simply ends before it. -#}
+        {{- '</s>' -}}
+    {%- endif -%}
+{%- endfor -%}

@@ -1,6 +1,6 @@
 [package]
 name = "drama_llama"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2021"
 # The stable toolchain CI actually tests (nothing older is ever built
 # here, so a lower claim would be untested). Bump freely alongside CI's
@@ -46,7 +46,7 @@ exclude = [
 # actually happens: mdegans/llama-cpp-sys#6. Until that lands, this
 # comment is the only thing standing between a routine version bump and
 # an unsound `Sync`.
-llama-cpp-sys-3 = { version = "0.8.1", optional = true }
+llama-cpp-sys-3 = { version = "0.8.4", optional = true }
 
 # moeflux (Metal-backed streaming-MoE decoder). macOS-only; drama_llama's
 # own `moeflux` feature wraps the platform gate so cross-platform builds
@@ -63,6 +63,10 @@ uuid = { version = "1", features = ["v4"] }
 partial_sort = { version = "0.2.0" }
 rand = { version = "0.10" }
 regex = "1.10"
+# Leftmost-longest matching of reserved special-token pieces in prompt
+# content (`chat_template::LiteralNeutralizer`). Already in the tree via
+# `regex`; named here because the matcher is part of our contract.
+aho-corasick = "1.1"
 static_assertions = "1.1.0"
 thiserror = "1.0"
 tinyvec = { version = "1.6", features = ["alloc"] }
@@ -78,21 +82,25 @@ sha2 = "0.10"
 # hazard where a downstream crate flips serde_json's Map under us
 # (#60). The dict/Gemma family is pinned alphabetical separately —
 # its templates `dictsort`.
-minijinja = { version = "2.5", features = [
-    "loader",
-    "json",
-    "preserve_order",
-] }
-minijinja-contrib = { version = "2.5", features = ["pycompat"] }
-misanthropic = { version = "1.0.0-alpha.12", default-features = false, features = [
+minijinja = { version = "2.24", features = ["loader", "json", "preserve_order"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
+misanthropic = { version = "1.0.0-alpha.18", default-features = false, features = [
     "partial-eq",
 ] }
+# `ModelInfo::created_at` is a `DateTime<Utc>`; misanthropic does not
+# re-export chrono, so converting a file mtime into one needs it here.
+chrono = "0.4"
 
 axum = { version = "0.8", optional = true }
 async-trait = { version = "0.1", optional = true }
 tokio = { version = "1", optional = true }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 futures-util = { version = "0.3", optional = true }
+# blallama's fatal exit (`bin/blallama/fatal.rs`) is `_exit`: no atexit
+# handlers or C++ static destructors, which on Metal assert every
+# buffer was freed and turn the exit into a SIGABRT. std has no
+# `_exit`. Already in the graph via tokio.
+libc = { version = "0.2", optional = true }
 # Non-optional: this crate's own diagnostics (sidecar read/write
 # failures, mostly) have to go *somewhere*, and gating each call site on
 # a feature is more moving parts than the dependency is worth. The `log`
@@ -116,6 +124,13 @@ egui_extras = { version = "0.34", optional = true, features = ["all_loaders"] }
 image = { version = "0.25", optional = true, features = ["png"] }
 rustyline = { version = "14", optional = true }
 schemars = { version = "1", optional = true }
+# Source of truth for the Agora `Soul` type the `soul_forge` example
+# generates — a mirror struct would drift. `seed` carries the reactor
+# seed-runner types (Soul lives there); the crate pins misanthropic
+# (=1.0.0-alpha.21 as of 0.62), which our caret req unifies with. Example-only: nothing in src/
+# references it, and the implicit `agora-agentkit` feature gates the
+# example target.
+agora-agentkit = { version = "0.62", optional = true, features = ["seed"] }
 
 
 [features]
@@ -179,6 +194,7 @@ repl = ["dep:rustyline", "cli"]
 tokio = ["tokio/full", "dep:async-trait"]
 axum = [
     "dep:axum",
+    "dep:libc",
     "dep:tokio-stream",
     "dep:futures-util",
     "tokio",
@@ -241,7 +257,7 @@ libc = "0.2"
 # `tests/blallama.rs` drives the blallama binary over HTTP with the
 # real API client. The library dependency above disables default
 # features (no HTTP); tests re-enable the client half.
-misanthropic = { version = "1.0.0-alpha.12", default-features = false, features = [
+misanthropic = { version = "1.0.0-alpha.18", default-features = false, features = [
     "partial-eq",
     "client",
     "rustls-tls",
@@ -271,6 +287,11 @@ doc-scrape-examples = true
 [[example]]
 name = "structured_commit_classifier"
 required-features = ["tokio", "cli", "json-schema"]
+doc-scrape-examples = true
+
+[[example]]
+name = "soul_forge"
+required-features = ["tokio", "cli", "json-schema", "agora-agentkit"]
 doc-scrape-examples = true
 
 [[example]]
@@ -336,9 +357,44 @@ name = "whoami"
 required-features = ["cli", "llama-cpp"]
 doc-scrape-examples = true
 
+# Bitwise prefill-determinism probe below `Session`: bare
+# `LlamaCppDecoder` contexts and the `Decoder` calls Session makes
+# (per-chunk prefill, step, checkpoint_pos / restore_to), plus ubatch
+# alignment, tip-reuse and KV-neighbor (n_kv) experiments. Separates
+# upstream nondeterminism from anything our cache does (not from the
+# thin decode wrapper every call still goes through).
+[[example]]
+name = "logits_determinism"
+required-features = ["cli", "llama-cpp"]
+doc-scrape-examples = true
+
 [[example]]
 name = "chat"
 required-features = ["tokio", "repl"]
+doc-scrape-examples = true
+
+# Backend-concrete: swaps the sampler config per variant on one loaded
+# `LlamaCppSession`, which the erased transport cannot do. `toml` reads
+# the sampling sidecar every variant starts from.
+[[example]]
+name = "id_fidelity"
+required-features = ["cli", "llama-cpp", "toml"]
+doc-scrape-examples = true
+
+# Long-form degeneration and id fidelity under penalty × sampler variants:
+# a digest, a short story, and an essay inside a forced tool call's string.
+# Shares `examples/utils/fidelity.rs` with id_fidelity.
+[[example]]
+name = "longform"
+required-features = ["cli", "llama-cpp", "toml"]
+doc-scrape-examples = true
+
+# Replays a recorded `/v1/messages` request body turn by turn through
+# blallama's path, scoring id copying in tool-call arguments by call
+# index. Shares `examples/utils/fidelity.rs` for the penalty variants.
+[[example]]
+name = "replay"
+required-features = ["cli", "llama-cpp", "toml"]
 doc-scrape-examples = true
 
 [[example]]
@@ -383,6 +439,18 @@ required-features = ["llama-cpp"]
 
 [[test]]
 name = "session_gptoss"
+required-features = ["llama-cpp"]
+
+[[test]]
+name = "session_mistral4"
+required-features = ["llama-cpp"]
+
+[[test]]
+name = "session_cogito"
+required-features = ["llama-cpp"]
+
+[[test]]
+name = "session_qwen38"
 required-features = ["llama-cpp"]
 
 # `#![cfg(feature = "json-schema")]` inside the file already empties it
