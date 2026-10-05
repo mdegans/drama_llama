@@ -31,11 +31,10 @@ jobs:
           cargo generate-lockfile
           cargo update -p llama-cpp-sys-3 --precise ${{ matrix.sys }}
           grep -A1 'name = "llama-cpp-sys-3"' Cargo.lock
-      - name: resuming matches fresh
-        if: always()
-        run: python3 scripts/test.py run -c llama-cpp -f test_predict_pieces_resuming_matches
-      - name: regression baseline
-        if: always()
-        run: python3 scripts/test.py run -c llama-cpp -f regression_llama_cpp_baseline
+      - name: both determinism tests
+        run: >
+          cargo nextest run --no-fail-fast --run-ignored all
+          --features toml,serde,stats,json-schema,llama-cpp,mtmd,cli,axum,cuda
+          -E 'test(=llama_cpp::engine::tests::test_predict_pieces_resuming_matches) | test(=regression_llama_cpp_baseline)'
       - if: always()
         run: rm -rf "$GITHUB_WORKSPACE/target"
