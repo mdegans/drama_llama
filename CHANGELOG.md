@@ -6,8 +6,82 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-05
+
+### Breaking changes
+
+API (from `cargo semver-checks` against `v0.8.3`, plus signature
+changes it does not check):
+
+- `IgnoreCategory` gains `Markdown` and `Numbers` (it is not
+  `#[non_exhaustive]`): exhaustive matches break, `IgnoreCategory::ALL`
+  has five entries, and `Punctuation`'s discriminant and `Ord` position
+  move.
+- `dialect::Leniency` gains `Clipped`.
+- `SessionError::InjectedSpecialToken` carries `violations` in place of
+  `token` / `piece`; `SessionError::GrammarViolation::partial_output` is
+  a `Content`, not a `String`.
+- `LlamaCppDecoder::{memory_clear, memory_seq_rm, memory_seq_cp,
+  memory_seq_keep, memory_seq_add, memory_seq_div}` take `&mut self`.
+- `FromPath` has a required method, `peek`.
+- `grammar_for_output_config`, `compile_output_config`,
+  `output_config::grammar_for_prompt` and `compile_prompt_output_config`
+  take a third parameter (the schema limits).
+- `RenderOptions` gains `efforts` and `literals`, `ToolChoiceOptions`
+  gains `schema_limits`, and `OutputConfigOptions` gains
+  `thought_separator`, `framing`, `thought_open`, `thought_close` and
+  `schema_limits`: struct literals without `..Default::default()` break.
+- `NewError` gains variants ahead of the old ones (their discriminants
+  move) and is no longer `UnwindSafe` / `RefUnwindSafe`;
+  `backend::MemoryRmError` is now `Copy`.
+- `schema_to_gbnf` returns `Result<(), SchemaError>` and is
+  `#[doc(hidden)]`.
+
+Behavior:
+
+- **Usage:** `input_tokens` is only the uncached tail, as on Anthropic;
+  sum the three input counters for the prompt size.
+- **An empty tool-use id is an error** on every model with reserved
+  pieces; prompt content that spells a special token is read as text
+  rather than refused, and `InjectedSpecialToken` now means a
+  drama_llama bug (a 500 on blallama).
+- **A forced `tool_choice` allows parallel calls**; set
+  `disable_parallel_tool_use` for exactly one.
+- **A turn cut by `max_tokens` or a stop sequence is a response**, its
+  cut call truncated as Anthropic truncates it, not a
+  `GrammarViolation`. Gate dispatch on `stop_reason: tool_use`.
+- **Sliding-window models get a window-sized KV cache** by default
+  (`--swa-full` / `LlamaCppOptions::swa_full` restores the old size).
+- **The repetition penalty sees history** (three seeding flags, on by
+  default, existing sidecars included), and its `window_size`, `decay`
+  and `penalty_freq` defaults changed; an existing
+  `<model>.sampling.toml` pins the old three until edited or deleted.
+- **`CallSyntax::trigger()`** for the marker dialects is the bare
+  special (`"<tool_call>"`, not `"<tool_call>\n"`).
+
 ### Changed
 
+- **Usage is counted the way Anthropic counts it.** `input_tokens`,
+  `cache_read_input_tokens` and `cache_creation_input_tokens` are
+  disjoint and sum to `count_tokens`: the read is the restored prefix,
+  creation runs from there to the last breakpoint, and `input_tokens` is
+  only the tail. `input_tokens` used to be the whole prompt, so a client
+  summing the three counted it twice. With the cache off it is still the
+  whole prompt.
+- **Tool-call JSON has one spelling, the template's ([#85], [#88]).**
+  The grammar allowed many byte spellings of a call's arguments and the
+  re-render wrote one, so a replayed call turn lost its cache tip. The
+  analyzer now measures the template's spacing
+  (`ArgumentsSyntax::json_spacing`) and the grammar and
+  `render_reference` both follow it. `tojson` no longer HTML-escapes
+  (`'`, `&`, `<`, `>`), and templates gain a `json_dumps` filter.
+- **cogito's tools preamble allows up to three calls a turn**, and its
+  tracked sidecar sets `max_tool_calls_per_turn = 3`. With parallel
+  calls in its history it escalated to sixty calls a turn and loops that
+  ran to `max_tokens`.
+- **Dependencies:** `llama-cpp-sys-3` 0.8.4, `minijinja` 2.24 (which
+  prints a bare bool or null Python-style; the bakes spell them
+  themselves, [#120]), `misanthropic` 1.0.0-alpha.18.
 - **An escaped closer is repaired in place instead of resampling the
   turn (#140).** When the model writes `\"}` where it means `"}` and
   reaches for the end of its turn, the grammar still holds the string
@@ -24,10 +98,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   logged as `escaped_closer_repair` with its `outcome` (`repaired`,
   `repeat_overrule`, `unrestorable`, `shape_mismatch`, `streamed`) and
   the tokens `rolled_back`.
-- **BREAKING: `BlockStream::stop_reason` returns
+- **`BlockStream::stop_reason` returns
   `Option<(StopReason, Option<&str>)>`** — the reason is no longer an
-  `Option`, because a finished turn always has one (below).
-- **BREAKING: `LlamaCppDecoder`'s `memory_clear`, `memory_seq_rm`,
+  `Option`, because a finished turn always has one (below). (New in
+  this release; this only affects code written against `dev`.)
+- **`LlamaCppDecoder`'s `memory_clear`, `memory_seq_rm`,
   `memory_seq_cp`, `memory_seq_keep`, `memory_seq_add` and
   `memory_seq_div` take `&mut self` and keep the checkpoints in step.**
   They were `&self` raw FFI calls that shadowed the `Decoder` trait's
@@ -56,7 +131,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkpoint evicted, failed. Now `pos_min <= pos - n_swa + 1`,
   `is_masked_swa`'s boundary; still fail-closed on any hole in the
   window.
-
 - **BEHAVIOR CHANGE: sliding-window models get a window-sized SWA KV
   cache** (`LlamaCppOptions::swa_full`, unset = `false`; blallama
   `--swa-full` restores the old size). llama.cpp's library default
@@ -284,6 +358,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A JSON string can no longer escape a C0 control ([#141]).** Raw
+  controls were refused but any `\uXXXX` was legal, so cogito posted a
+  comment of 3,000 `\u0010`. Both string grammars now refuse C0 escapes
+  other than tab, LF, CR, `\b` and `\f`.
+- **A cut turn keeps its repeated calls.** Dropping repeats from a
+  `max_tokens` turn hid the identical-call loop blallama redraws on.
+- **An effort-only `output_config` requests no grammar.** It failed
+  every request with `UnsupportedFormat`; now its effort reaches the
+  template and nothing else changes.
+- **A render hash proves bytes, not segmentation ([#91]).** A hash hit
+  restored a position measured in the cached tokenization and indexed
+  the new one with it, skipping tokens of the new message.
+- **The tip prediction keeps the last content token** when the grammar
+  or the budget ended the turn, so the next call's walk reaches it.
+- **The trained context is read on a vocab-only load**, so `/v1/models`
+  caps a model's ceiling before it is loaded.
+- **`/v1/models` lists each file once** (symlinks and hardlinks
+  grouped), skips `mmproj-*.gguf` projectors, and advertises
+  `image_input` only in an `mtmd` build.
 - **Cogito thinks when asked to.** Any `thinking` but `disabled`
   already rendered cogito's `Enable deep thinking subroutine.`
   incantation, but the stock template never renders a thought: the
@@ -296,7 +389,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the markers (`Field` reingest, `\n\n` separator), so the thought
   parses into a `Thought` block and the turn re-renders byte for byte
   for the prefix cache. Thinking off renders as stock.
-
 - **A finished turn never reports `stop_reason: null`.** Generation
   that ended on its own read `null` when the turn was empty or ended
   inside a thought the model never closed; a client read that as "no
@@ -1502,6 +1594,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tip loses the pick, one when `tip_extension` declines to build a tip.
 
 ### Added
+
+- **Baked chat templates and a loading ladder ([#88]).** A model's
+  template is resolved sidecar first, then a *baked* cache-stable
+  replacement shipped in the crate (`baked`) when the embedded template
+  is byte-for-byte one we validated, then the embedded template with a
+  warning. Bakes ship for Qwen3.6, Qwen3.8, Gemma 4, gpt-oss (two
+  detection keys: Unsloth's and OpenAI's upstream template, [#99]),
+  Mistral Small 4 and cogito, each pinned by round-trip tests and a
+  per-model suite. A template that misses detection but analyzes to a
+  known stock dialect is named in the warning (`baked::nearest_stock`).
+  `scripts/gguf_template.py` checks a GGUF's template against the keys.
+- **Mistral Small 4 support ([#88]):** baked template,
+  `[TOOL_CALLS]name[ARGS]{…}` calls, `[THINK]` reasoning, pixtral
+  vision, and the `session_mistral4` suite. Needs `llama-cpp-sys-3`
+  0.8.4, whose Metal `mul_mm_id` fix ends the all-NaN decode above a
+  32-token micro-batch.
+- **`DecodeError::NonFinite`.** A decode that returns NaN or infinite
+  logits fails at the decode boundary, KV-dirty, instead of panicking
+  later in the sampler's sort.
+- **Per-model load sidecar, `<model>.load.toml` ([#118], [#138]).**
+  `n_ctx` sets the model's context (capped at its trained window,
+  overriding `--n-ctx`) and `n_ubatch` its micro-batch (clamped to
+  `n_batch`; an explicit `LlamaCppOptions::n_ubatch` still wins).
+  Unknown keys are a parse error; a sidecar that won't read is logged
+  and ignored. `/v1/models` advertises the per-model ceiling before the
+  model loads, and the load logs `event = "context_size"` with each
+  value's source. `LoadSidecar`, `LlamaCppEngine::n_ubatch`.
+- **Parallel tool calls.** A constrained turn halts when its grammar is
+  exhausted, not at the first accepting state, and end-of-generation is
+  legal by id at every accepting state, so between calls the model
+  chooses another call or the end of its turn. This also ends Mistral
+  Small 4's forced call-after-call loop. A forced `tool_choice` now
+  means at least one call, as on Anthropic; ask for exactly one with
+  `disable_parallel_tool_use`.
+- **Known-id exemption ([#113]).** `RepetitionOptions::id_patterns`
+  (`IdPattern`, regexes compiled at the sidecar door) name what an
+  identifier looks like; a token that faithfully copies one the prompt
+  holds is never penalized, multi-word ids (`September 22, 2026`)
+  included. Thoughts are not searched for ids.
+- **`IgnoreCategory::Numbers` ([#113])** (digits and the bare space
+  that starts a number) and **`IgnoreCategory::Markdown`** (code-fence
+  tokens), both on by default and in every tracked sidecar. A closing
+  fence copied from the prompt was penalized like a word; Qwen3.6
+  replaced it with `}` or a stray tag in 3 of 4 draws.
+- **Emitted-special containment ([#38], [#101]).** A turn whose free
+  text holds a reserved special the model emitted as the real token is
+  `SessionError::EmittedSpecialToken`, with the cache left warm, instead
+  of an answer that fails the client's next request. blallama redraws
+  it (twice at most).
+- **blallama answers with Anthropic's error types ([#119]).** A request
+  that fails the same way on every retry is a 400
+  `invalid_request_error`, a transient failure a 500 `api_error`; both
+  used to be a 500 `unknown`. `Session::with_strict_context_fit` refuses
+  a prompt plus `max_tokens` past `n_ctx` up front
+  (`SessionError::ContextOverflow`, Anthropic's `prompt is too long`
+  400 on blallama) instead of truncating. `Session::count_tokens`
+  backs `POST /v1/messages/count_tokens`.
+- **The walked divergence point is a restore rung ([#102]).** Where a
+  KV truncate alone rewinds (`Decoder::truncate_restores`: llama.cpp on
+  a dense model), a prompt that parts from a cached slot between two
+  anchors restores to where it parts instead of the anchor below it
+  (`source=walk` in the logs).
+- **Logs an operator can follow:** the grammar-overrule line names the
+  model, block kind, tool and a tail of the value ([#140]); blallama
+  logs its shutdown stages and `/probe` opens ([#95]).
+- **Examples:** `soul_forge` (base-model generation through a completion
+  scaffold), `id_fidelity` (scores verbatim id copying per penalty
+  variant), `longform` and `replay` (replay captured requests, with
+  `--model` and `--only`), and `logits_determinism` (a raw decoder
+  determinism probe).
+- **The per-model sampling sidecars are versioned** in `models/`.
 
 - **An id copy-lock** (#144, `RepetitionOptions::id_copy_lock`, sidecar
   `[repetition] id_copy_lock`, default `true`). Once a copy is eight
@@ -2880,3 +3043,17 @@ flip `DRAMA_LLAMA_DFA_CACHE=0`.
 [#60]: https://github.com/mdegans/drama_llama/issues/60
 [#68]: https://github.com/mdegans/drama_llama/issues/68
 [#76]: https://github.com/mdegans/drama_llama/issues/76
+[#85]: https://github.com/mdegans/drama_llama/issues/85
+[#88]: https://github.com/mdegans/drama_llama/issues/88
+[#91]: https://github.com/mdegans/drama_llama/issues/91
+[#95]: https://github.com/mdegans/drama_llama/issues/95
+[#99]: https://github.com/mdegans/drama_llama/issues/99
+[#101]: https://github.com/mdegans/drama_llama/issues/101
+[#102]: https://github.com/mdegans/drama_llama/issues/102
+[#113]: https://github.com/mdegans/drama_llama/issues/113
+[#118]: https://github.com/mdegans/drama_llama/issues/118
+[#119]: https://github.com/mdegans/drama_llama/issues/119
+[#120]: https://github.com/mdegans/drama_llama/issues/120
+[#138]: https://github.com/mdegans/drama_llama/issues/138
+[#140]: https://github.com/mdegans/drama_llama/issues/140
+[#141]: https://github.com/mdegans/drama_llama/issues/141

@@ -66,24 +66,23 @@ pub struct LlamaCppOptions {
     pub flash_attn: Option<FlashAttention>,
 
     /// Micro-batch size (llama.cpp's `n_ubatch`) — how many tokens one
-    /// forward pass evaluates. `None` inherits the library default
-    /// (512, capped to [`Self::n_ctx`] when that is set).
+    /// forward pass evaluates. `None` inherits a `<model>.load.toml`
+    /// sidecar's `n_ubatch` when the engine was loaded with one, else
+    /// the library default (512, capped to [`Self::n_ctx`] when that is
+    /// set). A value set here beats the sidecar.
     ///
     /// Normally you want this large: it is the prefill parallelism
-    /// knob. It is settable because it is also a **correctness escape
-    /// hatch** for backend kernels that only misbehave above a batch
-    /// threshold.
+    /// knob. It is also a **correctness escape hatch** for backend
+    /// kernels that only misbehave above a batch threshold.
     ///
     /// The case that motivated exposing it: Mistral Small 4
-    /// (`mistral4`) on Metal returns an entirely NaN vocabulary for any
-    /// micro-batch of >=32 tokens. At 32 the MoE matmul switches from
-    /// `mul_mv_id` to the half-precision simdgroup-MMA `mul_mm_id`
-    /// (`ne21_mm_id_min`), and this model's layer-32 activations exceed
-    /// f16's 65504 ceiling — they overflow to inf, and inf arithmetic
-    /// yields NaN. The `mul_mv_id` path carries the same values in f32
-    /// and is correct. `n_ubatch = 31` therefore trades prefill speed
-    /// for a working model; see
-    /// `.claude/memory/mistral4_support_and_metal_nan.md`.
+    /// (`mistral4`) on Metal returned an entirely NaN vocabulary for
+    /// any micro-batch of >=32 tokens, because the half-precision
+    /// `mul_mm_id` kernel overflowed f16 on its layer-32 activations.
+    /// `llama-cpp-sys-3` 0.8.4 carries the upstream fix, so the default
+    /// works there; a [`NonFinite`](crate::DecodeError::NonFinite) at
+    /// the default now means an older sys crate or a new kernel bug.
+    /// See `.claude/memory/mistral4_support_and_metal_nan.md`.
     ///
     /// Note this is the *micro*-batch: `n_batch` stays large, so a
     /// prompt of any length still submits in one call and is simply

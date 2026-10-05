@@ -328,7 +328,7 @@ pub fn load_template_source(
 /// ```toml
 /// # Qwen3.8-27B-UD-Q8_K_XL.load.toml — hybrid attention keeps KV
 /// # small (~64 KiB/token), so this model can afford its trained
-/// # window while `--n-ctx 131072` stays the default for the rest.
+/// # window while `--n-ctx` sets the context for the rest.
 /// n_ctx = 262144
 /// n_ubatch = 2048
 /// ```
