@@ -81,7 +81,8 @@ Behavior:
   ran to `max_tokens`.
 - **Dependencies:** `llama-cpp-sys-3` 0.8.4, `minijinja` 2.24 (which
   prints a bare bool or null Python-style; the bakes spell them
-  themselves, [#120]), `misanthropic` 1.0.0-alpha.18.
+  themselves, [#120]), `misanthropic` 1.0.0-alpha.18 (through
+  alpha.21), `agora-agentkit` 0.62 (the `soul_forge` example only).
 - **An escaped closer is repaired in place instead of resampling the
   turn (#140).** When the model writes `\"}` where it means `"}` and
   reaches for the end of its turn, the grammar still holds the string
