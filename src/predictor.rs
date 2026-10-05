@@ -877,6 +877,9 @@ struct CloserRepairState {
     floor: usize,
     /// The turn's one attempt, once an overrule made it.
     report: Option<CloserRepair>,
+    /// The text's tail when that overrule came: what the shape check
+    /// saw, for the log.
+    site: Option<String>,
     /// The rolled-back token's bytes before its backslash, to emit
     /// again in place of sampling.
     forced: std::collections::VecDeque<Token>,
@@ -891,6 +894,9 @@ struct CloserRepairState {
 /// falls back to the overrule. Each mark clones the matchers, so the
 /// ring stays small.
 pub(crate) const CLOSER_MARKS: usize = 4;
+
+/// Chars of the text at the overrule the repair keeps for its log.
+const SITE_CHARS: usize = 80;
 
 /// [`TokenPredictor`] just before it drew a token holding a backslash.
 #[derive(Debug)]
@@ -1082,6 +1088,13 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         self.closer.as_ref().and_then(|closer| closer.report)
     }
 
+    /// See [`PiecePredictor::closer_repair_site`].
+    fn closer_repair_site(&self) -> Option<&str> {
+        self.closer
+            .as_ref()
+            .and_then(|closer| closer.site.as_deref())
+    }
+
     /// The overrule on a step's `candidates`. The turn's first one tries
     /// the escaped-closer repair; when that rolls back, the redrawn
     /// position's candidates take the step's place and are judged in
@@ -1170,8 +1183,15 @@ impl<'engine, B: Backend> TokenPredictor<'engine, B> {
         &mut self,
     ) -> Option<Result<Rewind, CloserRepairOutcome>> {
         use CloserRepairOutcome::{ShapeMismatch, Streamed, Unrestorable};
+        let site = || {
+            let skip = self.text.chars().count().saturating_sub(SITE_CHARS);
+            self.text.chars().skip(skip).collect()
+        };
         let (marks, floor) = match self.closer.as_mut() {
-            Some(closer) => (std::mem::take(&mut closer.marks), closer.floor),
+            Some(closer) => {
+                closer.site = Some(site());
+                (std::mem::take(&mut closer.marks), closer.floor)
+            }
             None => Default::default(),
         };
         let model = &self.inner.engine.model;
@@ -1890,6 +1910,12 @@ impl<'engine, B: Backend> PiecePredictor<'engine, B> {
     /// The turn's escaped-closer repair, once an overrule tried it.
     pub(crate) fn closer_repair(&self) -> Option<CloserRepair> {
         self.inner.closer_repair()
+    }
+
+    /// The tail of the text when that overrule came: the bytes the
+    /// shape check judged, where the turn's final text has written on.
+    pub(crate) fn closer_repair_site(&self) -> Option<&str> {
+        self.inner.closer_repair_site()
     }
 
     /// The rollback the last `next()` made before yielding, if any: the

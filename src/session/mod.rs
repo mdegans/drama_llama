@@ -8207,7 +8207,10 @@ impl<B: Backend> Session<B> {
                 break;
             }
         }
-        log_closer_repair(predictor.closer_repair());
+        log_closer_repair(
+            predictor.closer_repair(),
+            predictor.closer_repair_site(),
+        );
         let Emission {
             raw_text,
             mut marked_text,
@@ -10225,7 +10228,10 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
     /// End of generation: flush, pick the leniency, settle the ending.
     fn drain(&mut self) {
         self.drained = true;
-        log_closer_repair(self.predictor.closer_repair());
+        log_closer_repair(
+            self.predictor.closer_repair(),
+            self.predictor.closer_repair_site(),
+        );
         let budget = Cut::of(&self.predictor);
         // Final pass. Cut short: an incomplete trailing call comes back
         // cut short (`Leniency::Clipped`). Otherwise partial trailing
@@ -10516,14 +10522,19 @@ impl Emission {
 /// The `escaped_closer_repair` event, for a turn whose overrule tried
 /// the repair (see `PiecePredictor::with_closer_repair`): INFO when it
 /// held, WARN when the overrule stood. The request span carries the
-/// model; the overrule's own log carries the tail when it stood.
-fn log_closer_repair(repair: Option<crate::predictor::CloserRepair>) {
+/// model; `site` is the text's tail at the overrule (the overrule's own
+/// log carries the tail at the turn's end, after the model wrote on).
+fn log_closer_repair(
+    repair: Option<crate::predictor::CloserRepair>,
+    site: Option<&str>,
+) {
     #[cfg(feature = "axum")]
     if let Some(crate::predictor::CloserRepair {
         outcome,
         rolled_back,
     }) = repair
     {
+        let site = site.unwrap_or_default();
         use crate::predictor::CloserRepairOutcome::Repaired;
         match outcome {
             Repaired => tracing::info!(
@@ -10531,6 +10542,7 @@ fn log_closer_repair(repair: Option<crate::predictor::CloserRepair>) {
                 event = "escaped_closer_repair",
                 %outcome,
                 rolled_back,
+                site,
                 "the model escaped the quote it meant to close a value \
                  with; rolled back to the backslash and redrawn",
             ),
@@ -10539,12 +10551,13 @@ fn log_closer_repair(repair: Option<crate::predictor::CloserRepair>) {
                 event = "escaped_closer_repair",
                 %outcome,
                 rolled_back,
+                site,
                 "escaped-closer repair did not hold; the overrule stands",
             ),
         }
     }
     #[cfg(not(feature = "axum"))]
-    let _ = repair;
+    let _ = (repair, site);
 }
 
 /// Strip the trailing EOS piece. Matches what
@@ -13098,6 +13111,17 @@ mod tests {
         assert_eq!(
             repair_events(&events),
             [(tracing::Level::WARN, "shape_mismatch".into(), "0".into())]
+        );
+        // The text the shape check saw, where the turn's end has the
+        // model's ` more"}` after it.
+        #[cfg(feature = "axum")]
+        assert_eq!(
+            events
+                .iter()
+                .find_map(|(_, f)| field(f, "site"))
+                .map(|site| site.ends_with(meant)),
+            Some(true),
+            "{events:?}"
         );
         let _ = events;
     }

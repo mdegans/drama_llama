@@ -14,6 +14,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   newer than the quote's) fell back as `shape_mismatch`. The repair now
   keeps the last four backslash marks and rewinds to the one holding the
   quote's backslash; a longer escaped-whitespace tail still falls back.
+- **The `escaped_closer_repair` event logs the text at the overrule**
+  ([#148]) as `site`: the overrule's own `tail` is the turn's end, after
+  the model wrote on, so it never showed what the shape check judged.
 
 ## [0.9.0] — 2026-10-05
 
