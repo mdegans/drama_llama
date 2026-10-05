@@ -2,7 +2,7 @@
 
 <img src="https://raw.githubusercontent.com/mdegans/drama_llama/main/logo.svg" alt="llama with drama mask logo" width="240">
 
-[![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml)
+[![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml?query=branch%3Amain)
 [![codecov](https://codecov.io/gh/mdegans/drama_llama/graph/badge.svg)](https://codecov.io/gh/mdegans/drama_llama)
 [![tests](https://img.shields.io/badge/tests-1171-blue)](#testing)
 [![license](https://img.shields.io/badge/license-RAIL--S-lightgrey)](https://github.com/mdegans/drama_llama/blob/main/LICENSE.md)
