@@ -33,7 +33,7 @@ jobs:
           grep -A1 'name = "llama-cpp-sys-3"' Cargo.lock
       - name: both determinism tests
         run: >
-          cargo nextest run --no-fail-fast --run-ignored all
+          cargo nextest run --no-fail-fast --test-threads 1 --run-ignored all
           --features toml,serde,stats,json-schema,llama-cpp,mtmd,cli,axum,cuda
           -E 'test(=llama_cpp::engine::tests::test_predict_pieces_resuming_matches) | test(=regression_llama_cpp_baseline)'
       - if: always()
