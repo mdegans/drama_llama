@@ -2760,7 +2760,8 @@ mod tests {
         let (nested, long_diamond) = (chain(N, nested), chain(N, diamond));
         // Deep enough that 2^n is forever, shallow enough to be judged.
         let diamond = chain(64, diamond);
-        on_small_stack(256, move || {
+        let check = crate::schema_check::check_text;
+        let long_diamond = on_small_stack(256, move || {
             for schema in [&nested, &alias, &long_diamond] {
                 let mut rules = String::new();
                 schema_to_gbnf(schema, "s", &mut rules).unwrap();
@@ -2770,10 +2771,15 @@ mod tests {
             assert!(!judge(&nested, r#"{"n":{"n":1}}"#));
             assert!(judge(&alias, "7"));
             assert!(!judge(&alias, r#""7""#));
-            let check = crate::schema_check::check_text;
             assert!(check(&diamond, "7").is_ok());
             assert!(check(&diamond, r#""7""#).is_err());
-            // Past the checker's depth cap: lenient, not a crash.
+            long_diamond
+        });
+        // Past the checker's depth cap: lenient, not a crash. The cap
+        // bounds a recursion (`MAX_DEPTH` levels) rather than flattening
+        // it, so this gets a worker's stack, not the flat-walk 256 KiB:
+        // instrumented for coverage on x86-64 it outgrew that.
+        on_small_stack(2048, move || {
             assert!(check(&long_diamond, r#""7""#).is_ok());
         });
     }
