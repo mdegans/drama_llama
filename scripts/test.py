@@ -408,15 +408,35 @@ def filterset(
         if include:
             expr += f" & test(~{include})"
     elif include:
-        expr = f"test(~{include}) + binary(~{include})"
+        expr = either(include)
     else:
         expr = "all()"
     if exclude:
-        dropped = " + ".join(
-            f"test(~{name}) + binary(~{name})" for name in exclude
-        )
+        dropped = " + ".join(either(name) for name in exclude)
         expr = f"({expr}) - ({dropped})"
     return expr
+
+
+def either(name: str) -> str:
+    """`name` as a test OR binary substring. nextest rejects a
+    `binary()` that matches no binary ("operator didn't match any binary
+    names"), so that term is only added when some binary could match."""
+    if any(name in b for b in binary_names()):
+        return f"test(~{name}) + binary(~{name})"
+    return f"test(~{name})"
+
+
+def binary_names() -> list[str]:
+    """Names nextest gives this crate's test binaries: the lib, each
+    `tests/*.rs`, and each `[[bin]]`."""
+    import tomllib
+
+    manifest = tomllib.loads((REPO / "Cargo.toml").read_text())
+    return [
+        manifest["package"]["name"],
+        *(p.stem for p in (REPO / "tests").glob("*.rs")),
+        *(b["name"] for b in manifest.get("bin", [])),
+    ]
 
 
 def selection(
