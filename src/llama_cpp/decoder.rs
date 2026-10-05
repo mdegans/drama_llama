@@ -583,6 +583,7 @@ impl LlamaCppDecoder {
     /// sit at its start, so `pos_max + 1` falls short of the head; this
     /// lets [`Decoder::checkpoint_pos`] / [`Decoder::restore_to`] treat
     /// the image-end boundary as one. See `llama_cpp::checkpoint`.
+    #[cfg_attr(not(feature = "mtmd"), allow(dead_code))]
     pub(crate) fn note_media_head(&mut self, seq_id: llama_seq_id, head: i32) {
         self.checkpoints.note_media(
             &mut ContextMemory(self.context),

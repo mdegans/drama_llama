@@ -8219,6 +8219,9 @@ impl<B: Backend> Session<B> {
             uncommitted_bytes,
             ..
         } = emission;
+        // Only the `axum` token dump below reads it.
+        #[cfg(not(feature = "axum"))]
+        let _ = &token_dump;
         // Capture the incomplete-at-end violation signal and the final
         // sampler state (tip promotion) before the predictor drops.
         let constraint_incomplete = predictor.constraint_incomplete_at_end();
@@ -13915,9 +13918,10 @@ mod tests {
         });
     }
 
-    /// cogito: no reasoning markers measured, so the grammar offers
-    /// `<think>…</think>` — spelled in text tokens, `</`, `think`, then a
-    /// `>`-led token that usually carries the gap.
+    /// cogito: its baked template measures `<think>` markers and, thinking
+    /// on, pre-opens `<think>\n` (a65645e), so a thinking-on emission
+    /// starts inside the thought; the closer is spelled in text tokens,
+    /// `</`, `think`, then a `>`-led token that usually carries the gap.
     #[cfg(feature = "llama-cpp")]
     #[test]
     #[ignore = "needs the cogito GGUF (vocab-only load, CPU)"]
@@ -13925,14 +13929,14 @@ mod tests {
         fleet_output_config_by_token(&FleetSpec {
             env: "DRAMA_LLAMA_COGITO_MODEL",
             file: "cogito-32b.gguf",
-            on: &["", "<think>\nHmm.\n</think>"],
-            off: &["", "<think>\nHmm.\n</think>"],
+            on: &["Hmm.\n</think>"],
+            off: &[""],
             close_prefix: "</think",
             crossings: &[
-                ("<think>\nHmm.\n</think>\n\n{J}", ">\n\n", true),
-                ("<think>\nHmm.\n</think>\n{J}", ">\n", true),
-                ("<think>\nHmm.\n</think>{J}", ">{", true),
-                ("<think>\nHmm.\n</think>\n\n\n{J}", ">\n\n\n", false),
+                ("Hmm.\n</think>\n\n{J}", ">\n\n", true),
+                ("Hmm.\n</think>\n{J}", ">\n", true),
+                ("Hmm.\n</think>{J}", ">{", true),
+                ("Hmm.\n</think>\n\n\n{J}", ">\n\n\n", false),
             ],
         });
     }

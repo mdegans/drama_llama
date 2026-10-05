@@ -489,6 +489,7 @@ impl Checkpoints {
     /// at the chunk's start — remember where its head really is, so the
     /// image-end boundary checkpoints and rewinds like any other (see
     /// [Media tips](self#media-tips)).
+    #[cfg_attr(not(feature = "mtmd"), allow(dead_code))]
     pub(crate) fn note_media(
         &mut self,
         mem: &mut impl SeqMemory,

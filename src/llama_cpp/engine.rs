@@ -67,6 +67,9 @@ impl LlamaCppEngine {
         context_params: Option<llama_context_params>,
         numa_strategy: Option<u32>,
     ) -> Result<Self, NewError> {
+        // Only the mmproj lookup reads the path.
+        #[cfg(not(feature = "mtmd"))]
+        let _ = &path;
         let context_params =
             context_params.unwrap_or_else(Self::default_context_params);
         let decoder =
