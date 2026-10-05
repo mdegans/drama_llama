@@ -437,6 +437,39 @@ impl<S: Send + Sync> FromRequest<S> for AnthropicPrompt {
     }
 }
 
+/// [`AnthropicPrompt`] for `count_tokens`, whose body is a `/v1/messages`
+/// body without `max_tokens`: Anthropic doesn't require it there, and
+/// misanthropic stopped sending it (1.0.0-alpha.21). [`Prompt`] does, so
+/// an absent one is filled with 1 — counting never reads it.
+struct CountTokensPrompt(Prompt);
+
+impl<S: Send + Sync> FromRequest<S> for CountTokensPrompt {
+    type Rejection = (StatusCode, Json<ErrorEnvelope>);
+
+    async fn from_request(
+        req: Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let AnthropicJson(mut body) = AnthropicJson::<
+            serde_json::Map<String, serde_json::Value>,
+        >::from_request(req, state)
+        .await?;
+        body.entry("max_tokens")
+            .or_insert_with(|| serde_json::Value::from(1u32));
+        let prompt: Prompt =
+            serde_json::from_value(body.into()).map_err(|e| {
+                error_response(AnthropicError::InvalidRequest {
+                    message: format!(
+                        "Failed to deserialize the JSON body into the \
+                         target type: {e}"
+                    ),
+                })
+            })?;
+        validate_prompt(&prompt).map_err(error_response)?;
+        Ok(Self(prompt))
+    }
+}
+
 /// Anthropic's exact wording, which clients may match on.
 const BLANK_STOP_MESSAGE: &str =
     "stop_sequences: each stop sequence must contain non-whitespace";
@@ -859,7 +892,7 @@ where
 #[instrument(skip(state, prompt), fields(model = %prompt.model))]
 async fn route_count_tokens<B>(
     State(state): State<AppState<B>>,
-    AnthropicPrompt(mut prompt): AnthropicPrompt,
+    CountTokensPrompt(mut prompt): CountTokensPrompt,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorEnvelope>)>
 where
     B: Backend + 'static,
@@ -2074,10 +2107,13 @@ mod tests {
         async fn accept(_: AnthropicPrompt) -> StatusCode {
             StatusCode::OK
         }
+        async fn count(_: CountTokensPrompt) -> StatusCode {
+            StatusCode::OK
+        }
         let addr = serve(
             Router::new()
                 .route("/v1/messages", post(accept))
-                .route("/v1/messages/count_tokens", post(accept)),
+                .route("/v1/messages/count_tokens", post(count)),
         )
         .await;
         let body = |stops: &str| {
@@ -2109,6 +2145,38 @@ mod tests {
         }
     }
 
+    /// `count_tokens` takes a body without `max_tokens`, as Anthropic does
+    /// and misanthropic (since 1.0.0-alpha.21) sends; `/v1/messages`
+    /// still requires it.
+    #[tokio::test]
+    async fn count_tokens_body_needs_no_max_tokens() {
+        async fn count(_: CountTokensPrompt) -> StatusCode {
+            StatusCode::OK
+        }
+        async fn message(_: AnthropicPrompt) -> StatusCode {
+            StatusCode::OK
+        }
+        let addr = serve(
+            Router::new()
+                .route("/v1/messages", post(message))
+                .route("/v1/messages/count_tokens", post(count)),
+        )
+        .await;
+        let without = r#"{"model": "m",
+            "messages": [{"role": "user", "content": "hi"}]}"#;
+        let with = r#"{"model": "m", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]}"#;
+
+        let (head, _) =
+            post_raw(addr, "/v1/messages/count_tokens", without).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let (head, _) = post_raw(addr, "/v1/messages/count_tokens", with).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let (head, payload) = post_raw(addr, "/v1/messages", without).await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+        assert!(payload.contains("max_tokens"), "{payload}");
+    }
+
     /// Anthropic's 400 for a fifth `cache_control` marker, where the
     /// fifth is the request-level automatic one (captured 2026-09-30 on
     /// claude-haiku-4-5, both routes). Four in all is accepted.
@@ -2117,10 +2185,13 @@ mod tests {
         async fn accept(_: AnthropicPrompt) -> StatusCode {
             StatusCode::OK
         }
+        async fn count(_: CountTokensPrompt) -> StatusCode {
+            StatusCode::OK
+        }
         let addr = serve(
             Router::new()
                 .route("/v1/messages", post(accept))
-                .route("/v1/messages/count_tokens", post(accept)),
+                .route("/v1/messages/count_tokens", post(count)),
         )
         .await;
         let body = |explicit: usize| {

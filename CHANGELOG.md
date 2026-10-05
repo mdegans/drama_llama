@@ -359,6 +359,10 @@ Behavior:
 
 ### Fixed
 
+- **blallama's `count_tokens` takes a body without `max_tokens`**, as
+  Anthropic's does. misanthropic stopped sending it in 1.0.0-alpha.21,
+  and blallama answered 400 (`missing field max_tokens`). `/v1/messages`
+  still requires it.
 - **A JSON string can no longer escape a C0 control ([#141]).** Raw
   controls were refused but any `\uXXXX` was legal, so cogito posted a
   comment of 3,000 `\u0010`. Both string grammars now refuse C0 escapes
