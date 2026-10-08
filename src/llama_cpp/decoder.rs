@@ -85,6 +85,12 @@ pub enum NewError {
     /// compute buffers could not be allocated; llama.cpp does not say.
     #[error("Could not create context")]
     Context,
+    /// The context params ask for YaRN at a factor other than the
+    /// model's own, which makes llama.cpp rewrite the model's trained
+    /// context, and the model has other handles that could be reading
+    /// it. Load a separate copy, or build the context before cloning.
+    #[error("YaRN rescaling rewrites the model; it needs the only handle")]
+    SharedModel,
     /// An mmproj sidecar exists next to the model but failed to load.
     /// Hard error by design: continuing text-only would silently drop
     /// images.
@@ -106,7 +112,9 @@ impl NewError {
     /// llama.cpp does not say why, the answer is `true`.
     pub fn is_resource(&self) -> bool {
         match self {
-            Self::Unreadable { .. } | Self::Metadata { .. } => false,
+            Self::Unreadable { .. }
+            | Self::Metadata { .. }
+            | Self::SharedModel => false,
             Self::Model { .. } | Self::Context => true,
             #[cfg(feature = "mtmd")]
             Self::Mtmd { source, .. } => matches!(
@@ -350,6 +358,16 @@ impl LlamaCppDecoder {
         // here, which looked like a panic risk but was infallible.)
         let numa = numa_strategy
             .unwrap_or(ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED);
+        // A custom YaRN factor makes `llama_init_from_model` write the
+        // model's `n_ctx_train`; with the only handle in our caller's
+        // hands, nothing else can be reading it.
+        let rescales = context_params.rope_scaling_type
+            == llama_cpp_sys_3::llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN
+            && context_params.rope_freq_scale != 0.0
+            && context_params.rope_freq_scale != model.rope_freq_scale();
+        if rescales && !model.is_unique() {
+            return Err(NewError::SharedModel);
+        }
 
         {
             let mut count = engine_count();
@@ -368,8 +386,9 @@ impl LlamaCppDecoder {
         // store below keeps it live for as long as the context exists.
         // `as_ptr_mut` is sound here specifically because
         // `llama_init_from_model` only reads the model before binding
-        // it to the context's `const llama_model &` — the non-const in
-        // its signature is vestigial (see `ModelInner`'s `Sync` note).
+        // it to the context's `const llama_model &`, except under a
+        // custom YaRN factor, which `rescales` above confined to a
+        // model no one else holds (see `ModelInner`'s `Sync` note).
         let context = unsafe {
             llama_init_from_model(model.as_ptr_mut(), context_params)
         };

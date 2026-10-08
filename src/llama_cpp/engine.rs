@@ -608,6 +608,68 @@ mod tests {
         );
     }
 
+    /// The first greedy piece after a short prompt, from `model.gguf`
+    /// loaded at `n_ctx` 4096 with `sidecar`.
+    fn first_piece(sidecar: crate::sidecar::LoadSidecar) -> String {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let mut engine = LlamaCppEngine::from_path_with_load_sidecar(
+            path,
+            LlamaCppOptions::default().with_n_ctx(4096),
+            sidecar,
+        )
+        .expect("load");
+        let tokens = engine.model.tokenize("The capital of France is", true);
+        let mut opts = crate::PredictOptions::greedy();
+        opts.n = std::num::NonZeroUsize::new(1).unwrap();
+        engine.predict_pieces(tokens, opts, None).collect()
+    }
+
+    /// A `rope_scale` sidecar turns YaRN on: the decoder reports the
+    /// stretched window, and the model still answers an easy prompt.
+    #[test]
+    #[ignore = "requires models/model.gguf"]
+    fn load_sidecar_rope_scale_stretches_the_window() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let sidecar = crate::sidecar::LoadSidecar {
+            rope_scale: Some(4.0),
+            ..Default::default()
+        };
+        let trained = LlamaCppModel::from_file(
+            path.clone(),
+            Some(LlamaCppOptions::default().model_params()),
+        )
+        .expect("load")
+        .context_size() as u32;
+        let engine = LlamaCppEngine::from_path_with_load_sidecar(
+            path.clone(),
+            LlamaCppOptions::default().with_n_ctx(4096),
+            sidecar,
+        )
+        .expect("load");
+        assert_eq!(engine.n_ctx(), 4096);
+        assert_eq!(engine.n_ctx_window(), trained * 4);
+        // llama.cpp rewrites the model's trained context to match.
+        assert_eq!(engine.model.context_size() as u32, trained * 4);
+        // Which is why a second, rescaling context over a shared model
+        // is refused: building it would write under a reader.
+        let shared = engine.model.clone();
+        let mut params =
+            LlamaCppOptions::default().with_n_ctx(4096).context_params();
+        params.rope_scaling_type =
+            llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN;
+        params.rope_freq_scale = 0.125;
+        params.yarn_orig_ctx = trained;
+        assert!(matches!(
+            LlamaCppDecoder::new(&shared, params, None),
+            Err(NewError::SharedModel)
+        ));
+        drop((engine, shared));
+        let piece = first_piece(sidecar);
+        assert!(piece.contains("Paris"), "{piece:?}");
+    }
+
     /// The load sidecar's `n_ubatch` reaches the context: it beats
     /// llama.cpp's default, is clamped to `n_batch` (= `n_ctx`), `0`
     /// is ignored, and an explicit option beats it.

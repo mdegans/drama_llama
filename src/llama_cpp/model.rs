@@ -168,7 +168,11 @@ unsafe impl Send for ModelInner {}
 // llama-model.h or llama-vocab.h; and the non-const `llama_model *` in
 // `llama_init_from_model`'s signature is vestigial — its body only
 // reads (`hparams`, `arch`, `split_mode()`) before binding to that
-// const ref.
+// const ref — with one exception: a context asking for YaRN at a factor
+// other than the model's own rewrites `model->hparams.n_ctx_train` to
+// the stretched window (llama-context.cpp:3832). `LlamaCppDecoder::new`
+// refuses such a context unless its caller holds the only handle, so
+// that write never races a reader.
 //
 // The one upstream call that genuinely writes a model through a
 // context is `llama_opt_init` (llama-context.cpp:3245, the finetune
@@ -318,6 +322,13 @@ impl LlamaCppModel {
     }
 
     /// Return the inner model.
+    /// Whether this is the only handle on the model, so nothing else
+    /// can read it while llama.cpp writes it (see `ModelInner`'s
+    /// `Sync` note).
+    pub(crate) fn is_unique(&self) -> bool {
+        std::sync::Arc::strong_count(&self.0) == 1
+    }
+
     pub fn as_ptr(&self) -> *const llama_model {
         debug_assert!(!self.0.inner.is_null());
         self.0.inner as *const llama_model
