@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The escaped-closer repair reaches past escaped whitespace** ([#148]).
+  It rolled back only to the newest backslash-bearing token, so a value
+  ending `\"` + an escaped `\n` or `\t` + `}` (the escape's backslash
+  newer than the quote's) fell back as `shape_mismatch`. The repair now
+  keeps the last four backslash marks and rewinds to the one holding the
+  quote's backslash; a longer escaped-whitespace tail still falls back.
+- **The `escaped_closer_repair` event logs the text at the overrule**
+  ([#148]) as `site`: the overrule's own `tail` is the turn's end, after
+  the model wrote on, so it never showed what the shape check judged.
+
 ## [0.9.0] — 2026-10-05
 
 ### Breaking changes
@@ -3062,3 +3074,4 @@ flip `DRAMA_LLAMA_DFA_CACHE=0`.
 [#138]: https://github.com/mdegans/drama_llama/issues/138
 [#140]: https://github.com/mdegans/drama_llama/issues/140
 [#141]: https://github.com/mdegans/drama_llama/issues/141
+[#148]: https://github.com/mdegans/drama_llama/issues/148

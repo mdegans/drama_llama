@@ -8207,7 +8207,10 @@ impl<B: Backend> Session<B> {
                 break;
             }
         }
-        log_closer_repair(predictor.closer_repair());
+        log_closer_repair(
+            predictor.closer_repair(),
+            predictor.closer_repair_site(),
+        );
         let Emission {
             raw_text,
             mut marked_text,
@@ -10225,7 +10228,10 @@ impl<'engine, B: Backend> BlockStream<'engine, B> {
     /// End of generation: flush, pick the leniency, settle the ending.
     fn drain(&mut self) {
         self.drained = true;
-        log_closer_repair(self.predictor.closer_repair());
+        log_closer_repair(
+            self.predictor.closer_repair(),
+            self.predictor.closer_repair_site(),
+        );
         let budget = Cut::of(&self.predictor);
         // Final pass. Cut short: an incomplete trailing call comes back
         // cut short (`Leniency::Clipped`). Otherwise partial trailing
@@ -10516,14 +10522,19 @@ impl Emission {
 /// The `escaped_closer_repair` event, for a turn whose overrule tried
 /// the repair (see `PiecePredictor::with_closer_repair`): INFO when it
 /// held, WARN when the overrule stood. The request span carries the
-/// model; the overrule's own log carries the tail when it stood.
-fn log_closer_repair(repair: Option<crate::predictor::CloserRepair>) {
+/// model; `site` is the text's tail at the overrule (the overrule's own
+/// log carries the tail at the turn's end, after the model wrote on).
+fn log_closer_repair(
+    repair: Option<crate::predictor::CloserRepair>,
+    site: Option<&str>,
+) {
     #[cfg(feature = "axum")]
     if let Some(crate::predictor::CloserRepair {
         outcome,
         rolled_back,
     }) = repair
     {
+        let site = site.unwrap_or_default();
         use crate::predictor::CloserRepairOutcome::Repaired;
         match outcome {
             Repaired => tracing::info!(
@@ -10531,6 +10542,7 @@ fn log_closer_repair(repair: Option<crate::predictor::CloserRepair>) {
                 event = "escaped_closer_repair",
                 %outcome,
                 rolled_back,
+                site,
                 "the model escaped the quote it meant to close a value \
                  with; rolled back to the backslash and redrawn",
             ),
@@ -10539,12 +10551,13 @@ fn log_closer_repair(repair: Option<crate::predictor::CloserRepair>) {
                 event = "escaped_closer_repair",
                 %outcome,
                 rolled_back,
+                site,
                 "escaped-closer repair did not hold; the overrule stands",
             ),
         }
     }
     #[cfg(not(feature = "axum"))]
-    let _ = repair;
+    let _ = (repair, site);
 }
 
 /// Strip the trailing EOS piece. Matches what
@@ -12875,6 +12888,152 @@ mod tests {
         assert_eq!(answer(&response), r#"{"body":"Done."}"#);
     }
 
+    /// Escaped whitespace between the escaped quote and the closers
+    /// (#148): the newest backslash is the whitespace's, so the rollback
+    /// reaches back past it, to the token holding the quote's.
+    #[test]
+    fn an_escaped_closer_before_escaped_whitespace_is_repaired() {
+        for tail in [r"\n", r"\n\n", r"\t "] {
+            let meant = format!(r#"{{"body":"Done.\"{tail}}}"#);
+            let backslash = meant.find('\\').unwrap();
+            let mut session = escaped_closer_session(
+                &bytes(&meant),
+                true,
+                Some((bytes("\"}"), vec![])),
+            );
+            let mut response = None;
+            let events = capture_events(|| {
+                response = Some(session.complete_response(&body_prompt()));
+            });
+            let response = response.unwrap().expect("repaired");
+            assert_eq!(answer(&response), r#"{"body":"Done."}"#, "{tail}");
+            #[cfg(feature = "axum")]
+            assert_eq!(
+                repair_events(&events),
+                [(
+                    tracing::Level::INFO,
+                    "repaired".into(),
+                    (meant.len() - backslash).to_string()
+                )],
+                "{tail}"
+            );
+            let _ = events;
+        }
+    }
+
+    /// [`an_escaped_closer_before_escaped_whitespace_is_repaired`] with
+    /// the backslashes merged into other bytes, each way: the rollback
+    /// lands on the token holding the quote's backslash and writes again
+    /// what it held before it.
+    #[test]
+    fn an_escaped_closer_split_before_escaped_whitespace_is_repaired() {
+        let [a, b] = [mock::FIRST_MERGE, mock::FIRST_MERGE + 1];
+        let meant = r#"{"body":"Done.\"\n}"#;
+        let cases: [(&[(&'static str, Token)], &str); 4] = [
+            // `.\` holds the quote's backslash; `\n` is its own token.
+            (&[(".\\", a), ("\\n", b)], "!\"}"),
+            // The quote's backslash alone; `"\n` holds the escape's.
+            (&[("\"\\n", a)], "\"}"),
+            // Mistral's `\"\`: both backslashes, the `n` on its own.
+            (&[("\\\"\\", a)], "\"}"),
+            // `\"` whole, then `\n}`.
+            (&[("\\\"", a), ("\\n}", b)], "\"}"),
+        ];
+        for (merges, then) in cases {
+            let model = mock::MockModel {
+                merges: merges.to_vec(),
+                add_bos: false,
+            };
+            let tokens = model.tokenize_special(meant, false, false);
+            assert!(tokens.len() < meant.len(), "{merges:?} merged nothing");
+            let mut session = escaped_closer_session(
+                &tokens,
+                true,
+                Some((bytes(then), vec![])),
+            );
+            session.engine.model = model;
+            let response = session
+                .complete_response(&body_prompt())
+                .unwrap_or_else(|e| panic!("{merges:?}: {e}"));
+            assert_eq!(answer(&response), r#"{"body":"Done."}"#, "{merges:?}");
+        }
+    }
+
+    /// More escaped whitespace than the repair keeps marks for: the
+    /// quote's mark is gone, so the overrule stands as a shape mismatch,
+    /// with nothing rolled back.
+    #[test]
+    fn an_escaped_closer_past_the_marks_is_not_repaired() {
+        let tail = r"\n".repeat(crate::predictor::CLOSER_MARKS);
+        let meant = format!(r#"{{"body":"Done.\"{tail}}}"#);
+        let mut session = escaped_closer_session(
+            &bytes(&meant),
+            true,
+            Some((bytes("\"}"), vec![])),
+        );
+        let mut result = None;
+        let events = capture_events(|| {
+            result = Some(session.complete_response(&body_prompt()));
+        });
+        assert!(
+            matches!(result, Some(Err(SessionError::GrammarViolation { .. }))),
+            "{result:?}"
+        );
+        assert!(session.engine.decoder.restores.is_empty());
+        #[cfg(feature = "axum")]
+        assert_eq!(
+            repair_events(&events),
+            [(tracing::Level::WARN, "shape_mismatch".into(), "0".into())]
+        );
+        let _ = events;
+    }
+
+    /// The reflect shape (#148): an output_config answer after a thought,
+    /// under the unified grammar (the thought optional) and under the
+    /// deferred one (the render opened the thought, the body waits for
+    /// its closer). The marks are taken and judged against whichever
+    /// constraint holds the value, so `\"}` is repaired under both.
+    #[test]
+    fn an_output_config_escaped_closer_after_a_thought_is_repaired() {
+        use misanthropic::prompt::thinking::Thinking;
+        let unified = body_prompt().thinking(Thinking::Enabled {
+            budget_tokens: NonZeroU32::new(1024).unwrap(),
+            display: None,
+        });
+        let mut deferred = unified.clone();
+        deferred.messages.push(crate::Message {
+            role: crate::Role::Assistant,
+            content: crate::Content(vec![crate::prompt::open_thought("hm")]),
+        });
+        let body = r#"{"body":"Done.\"}"#;
+        let cases = [
+            (&unified, format!("<think>hm</think>{body}")),
+            (&deferred, format!("</think>{body}")),
+        ];
+        for (prompt, meant) in cases {
+            let mut session = escaped_closer_session(
+                &bytes(&meant),
+                true,
+                Some((bytes("\"}"), vec![])),
+            );
+            let response = session
+                .complete_response(prompt)
+                .unwrap_or_else(|e| panic!("{meant:?}: {e}"));
+            let message: crate::prompt::Message = response.inner.into();
+            let text: Vec<_> = message
+                .content
+                .0
+                .iter()
+                .filter_map(|block| match block {
+                    crate::Block::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, [r#"{"body":"Done."}"#], "{meant:?}");
+            assert_eq!(session.engine.decoder.restores.len(), 1, "{meant:?}");
+        }
+    }
+
     /// A rollback whose redraw overrules again stands as the violation
     /// it would have been: one attempt a turn.
     #[test]
@@ -12952,6 +13111,17 @@ mod tests {
         assert_eq!(
             repair_events(&events),
             [(tracing::Level::WARN, "shape_mismatch".into(), "0".into())]
+        );
+        // The text the shape check saw, where the turn's end has the
+        // model's ` more"}` after it.
+        #[cfg(feature = "axum")]
+        assert_eq!(
+            events
+                .iter()
+                .find_map(|(_, f)| field(f, "site"))
+                .map(|site| site.ends_with(meant)),
+            Some(true),
+            "{events:?}"
         );
         let _ = events;
     }
