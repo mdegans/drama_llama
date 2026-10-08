@@ -12,8 +12,9 @@ use std::path::PathBuf;
 use llama_cpp_sys_3::{
     llama_context, llama_context_default_params, llama_context_params,
     llama_model_default_params, llama_model_params, llama_perf_context_data,
-    llama_seq_id, llama_supports_gpu_offload, llama_supports_mlock,
-    llama_supports_mmap, llama_token,
+    llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN, llama_seq_id,
+    llama_supports_gpu_offload, llama_supports_mlock, llama_supports_mmap,
+    llama_token,
 };
 
 /// Convenience alias for the llama.cpp-backed pair. Use
@@ -160,13 +161,14 @@ impl LlamaCppEngine {
         )
     }
 
-    /// [`Self::from_path_with`], with a model's load sidecar: its
-    /// `n_ctx` beats `options.n_ctx` once capped at the trained window
-    /// (known only after the model loads, hence here), and its
-    /// `n_ubatch` fills an unset `options.n_ubatch`. See
-    /// [`crate::sidecar::effective_n_ctx`] and
-    /// [`crate::sidecar::effective_n_ubatch`]. Logs the context and
-    /// micro-batch the model is served with.
+    /// [`Self::from_path_with`], with a model's load sidecar: the
+    /// served context is the smallest of `options.n_ctx`, its `n_ctx`
+    /// and the model's window (known only after the model loads, hence
+    /// here; stretched by its `rope_scale`), its cache types beat
+    /// those in `options`, and its `n_ubatch` fills an unset
+    /// `options.n_ubatch`. See [`crate::sidecar::effective_n_ctx`] and
+    /// [`crate::sidecar::effective_n_ubatch`]. Logs the context, cache
+    /// types and micro-batch the model is served with.
     pub(crate) fn from_path_with_load_sidecar(
         path: PathBuf,
         options: LlamaCppOptions,
@@ -176,18 +178,33 @@ impl LlamaCppEngine {
         let model =
             Self::load_model(path.clone(), Some(options.model_params()))?;
         let n_ctx_train = model.context_size().max(0) as u32;
+        let yarn = sidecar.yarn_factor();
+        if let Some(requested) = sidecar.rope_scale.filter(|_| yarn.is_none()) {
+            tracing::warn!(
+                path = %path.display(),
+                requested,
+                "per-model rope_scale must be a finite factor of at least \
+                 1; ignored",
+            );
+        }
+        let window = model.n_ctx_window(yarn);
+        let options_n_ctx = options.n_ctx;
         let effective =
-            crate::sidecar::effective_n_ctx(options.n_ctx, n_ctx, n_ctx_train);
+            crate::sidecar::effective_n_ctx(options_n_ctx, n_ctx, window);
         if let Some(requested) = n_ctx.filter(|&n| Some(n) != effective) {
             tracing::warn!(
                 path = %path.display(),
                 requested,
-                n_ctx_train,
-                "per-model n_ctx exceeds the trained window; capped",
+                n_ctx = ?options_n_ctx,
+                window,
+                "per-model n_ctx exceeds --n-ctx or the model's window; \
+                 capped",
             );
         }
         let options = LlamaCppOptions {
             n_ctx: effective,
+            cache_type_k: sidecar.cache_type_k.or(options.cache_type_k),
+            cache_type_v: sidecar.cache_type_v.or(options.cache_type_v),
             ..options
         };
         let n_batch = options.context_params().n_batch;
@@ -223,10 +240,21 @@ impl LlamaCppEngine {
             n_ubatch,
             ..options
         };
+        let mut context_params = options.context_params();
+        if let Some(factor) = yarn {
+            // What llama.cpp's `--rope-scaling yarn --rope-scale F
+            // --yarn-orig-ctx N` sets; the extrapolation mix follows
+            // from the type (`yarn_ext_factor` stays "from model").
+            context_params.rope_scaling_type =
+                llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN;
+            context_params.rope_freq_scale = 1.0 / factor;
+            context_params.yarn_orig_ctx =
+                model.rope_original_context_size().unwrap_or(n_ctx_train);
+        }
         let mut engine = Self::with_model(
             path.clone(),
             model,
-            Some(options.context_params()),
+            Some(context_params),
             options.numa,
         )?;
         engine.set_checkpoint_budget(options.checkpoint_budget());
@@ -235,9 +263,14 @@ impl LlamaCppEngine {
             path = %path.display(),
             n_ctx = engine.n_ctx(),
             n_ctx_train,
-            source = if n_ctx.is_some() { "sidecar" } else { "default" },
+            window,
+            rope_scale = yarn,
+            n_ctx_option = options_n_ctx,
+            sidecar_n_ctx = n_ctx,
             n_ubatch = engine.n_ubatch(),
             n_ubatch_source,
+            cache_type_k = %options.cache_type_k.map_or("f16", |t| t.name()),
+            cache_type_v = %options.cache_type_v.map_or("f16", |t| t.name()),
             "serving with n_ctx {}, n_ubatch {}",
             engine.n_ctx(),
             engine.n_ubatch(),
@@ -578,6 +611,86 @@ mod tests {
             grown >> 20,
             LIMIT >> 20,
         );
+    }
+
+    /// The first greedy piece after a short prompt, from `model.gguf`
+    /// loaded at `n_ctx` 4096 with `sidecar`.
+    fn first_piece(sidecar: crate::sidecar::LoadSidecar) -> String {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let mut engine = LlamaCppEngine::from_path_with_load_sidecar(
+            path,
+            LlamaCppOptions::default().with_n_ctx(4096),
+            sidecar,
+        )
+        .expect("load");
+        let tokens = engine.model.tokenize("The capital of France is", true);
+        let mut opts = crate::PredictOptions::greedy();
+        opts.n = std::num::NonZeroUsize::new(1).unwrap();
+        engine.predict_pieces(tokens, opts, None).collect()
+    }
+
+    /// Quantized KV caches load (a quantized V turns Flash Attention
+    /// on under `Auto`) and agree with `f16` on an easy greedy token.
+    #[test]
+    #[ignore = "requires models/model.gguf"]
+    fn load_sidecar_cache_types_reach_the_context() {
+        use crate::sidecar::{KvCacheType::*, LoadSidecar};
+        let f16 = first_piece(LoadSidecar::default());
+        assert!(f16.contains("Paris"), "{f16:?}");
+        for (k, v) in [(Q8_0, Q8_0), (Q8_0, Q4_0), (Q4_0, Q4_0)] {
+            let piece = first_piece(LoadSidecar {
+                cache_type_k: Some(k),
+                cache_type_v: Some(v),
+                ..Default::default()
+            });
+            assert_eq!(piece, f16, "K {k}, V {v}");
+        }
+    }
+
+    /// A `rope_scale` sidecar turns YaRN on: the decoder reports the
+    /// stretched window, and the model still answers an easy prompt.
+    #[test]
+    #[ignore = "requires models/model.gguf"]
+    fn load_sidecar_rope_scale_stretches_the_window() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf");
+        let sidecar = crate::sidecar::LoadSidecar {
+            rope_scale: Some(4.0),
+            ..Default::default()
+        };
+        let trained = LlamaCppModel::from_file(
+            path.clone(),
+            Some(LlamaCppOptions::default().model_params()),
+        )
+        .expect("load")
+        .context_size() as u32;
+        let engine = LlamaCppEngine::from_path_with_load_sidecar(
+            path.clone(),
+            LlamaCppOptions::default().with_n_ctx(4096),
+            sidecar,
+        )
+        .expect("load");
+        assert_eq!(engine.n_ctx(), 4096);
+        assert_eq!(engine.n_ctx_window(), trained * 4);
+        // llama.cpp rewrites the model's trained context to match.
+        assert_eq!(engine.model.context_size() as u32, trained * 4);
+        // Which is why a second, rescaling context over a shared model
+        // is refused: building it would write under a reader.
+        let shared = engine.model.clone();
+        let mut params =
+            LlamaCppOptions::default().with_n_ctx(4096).context_params();
+        params.rope_scaling_type =
+            llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN;
+        params.rope_freq_scale = 0.125;
+        params.yarn_orig_ctx = trained;
+        assert!(matches!(
+            LlamaCppDecoder::new(&shared, params, None),
+            Err(NewError::SharedModel)
+        ));
+        drop((engine, shared));
+        let piece = first_piece(sidecar);
+        assert!(piece.contains("Paris"), "{piece:?}");
     }
 
     /// The load sidecar's `n_ubatch` reaches the context: it beats

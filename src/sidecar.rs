@@ -9,7 +9,7 @@
 //! projector (`<model>.mmproj.gguf`, [`mmproj_path`] — enables image
 //! input under the `mtmd` feature), or load-time options
 //! (`<model>.load.toml`, [`LoadSidecar`] — the KV context size and
-//! micro-batch). [`crate::LlamaCppSession::from_path*`]
+//! cache type, micro-batch and RoPE scaling). [`crate::LlamaCppSession::from_path*`]
 //! looks for each when loading a model. For sampling, if no sidecar
 //! exists one is written so the user has a starting point to edit —
 //! seeded from the model's own recommendation where it has one (see
@@ -328,29 +328,26 @@ pub fn load_template_source(
 /// ```toml
 /// # Qwen3.8-27B-UD-Q8_K_XL.load.toml — hybrid attention keeps KV
 /// # small (~64 KiB/token), so this model can afford its trained
-/// # window while `--n-ctx` sets the context for the rest.
+/// # window (with `--n-ctx 262144`; see `effective_n_ctx`).
 /// n_ctx = 262144
 /// n_ubatch = 2048
 /// ```
+///
+/// Every context bound applies at once — `--n-ctx`, this `n_ctx`, and
+/// the model's window — so a sidecar can lower a model's context below
+/// the server-wide one but never raise it past `--n-ctx`.
 ///
 /// Unknown keys are a parse error (a misspelled `n-ctx` must not
 /// silently fall back to the default). A sidecar that fails to read
 /// or parse is logged and ignored, like the other sidecars.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize,
 )]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct LoadSidecar {
-    /// KV context size in tokens, capped at the model's trained
-    /// window (see [`effective_n_ctx`]).
+    /// KV context size in tokens, capped at `--n-ctx` and at the
+    /// model's window (see [`effective_n_ctx`]).
     pub n_ctx: Option<u32>,
     /// Micro-batch size (llama.cpp's `n_ubatch`, default 512), clamped
     /// to `n_batch`; an explicit `LlamaCppOptions::n_ubatch` wins (see
@@ -359,6 +356,101 @@ pub struct LoadSidecar {
     /// compute buffer (325–737 MiB at 512), so it spends Metal
     /// working-set headroom.
     pub n_ubatch: Option<u32>,
+    /// YaRN factor over the model's original window: turns RoPE
+    /// scaling on (or re-scales a GGUF that ships it) and stretches the
+    /// window to `original × rope_scale` (see [`n_ctx_window`]). For a
+    /// model trained without scaling — Qwen3.5+ at 262144, `4.0` for
+    /// 1M — static YaRN costs some quality on short prompts, which is
+    /// why it is per-model and opt-in. Leave it unset for a GGUF whose
+    /// metadata already carries `rope.scaling.*` (gpt-oss, Mistral
+    /// Small 4): those were trained *with* that factor. Values below
+    /// `1.0`, or not finite, are ignored.
+    pub rope_scale: Option<f32>,
+    /// The K cache's element type; beats `LlamaCppOptions::cache_type_k`
+    /// (`--cache-type-k`). See [`KvCacheType`].
+    pub cache_type_k: Option<KvCacheType>,
+    /// The V cache's element type; beats `LlamaCppOptions::cache_type_v`
+    /// (`--cache-type-v`). See [`KvCacheType`].
+    pub cache_type_v: Option<KvCacheType>,
+}
+
+/// An element type for the KV cache — llama.cpp's `--cache-type-k` /
+/// `--cache-type-v` set, named as llama.cpp names them (`q8_0`).
+///
+/// KV is what bounds a long context: a dense model at 128k holds as
+/// much cache as weights (cogito: 256 KiB per token at `f16`, 32 GiB).
+/// `q8_0` halves that and is close to lossless; `q4_0` quarters it at a
+/// measurable cost, more on K than on V. A quantized V cache needs
+/// Flash Attention: llama.cpp turns it on under the default
+/// [`FlashAttention::Auto`](crate::FlashAttention::Auto) and refuses
+/// the context if it is forced off.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[non_exhaustive]
+pub enum KvCacheType {
+    /// 32-bit float.
+    F32,
+    /// 16-bit float: llama.cpp's default.
+    F16,
+    /// bfloat16.
+    Bf16,
+    /// 8-bit blocks of 32: half of `f16`, close to lossless.
+    #[cfg_attr(feature = "cli", value(name = "q8_0"))]
+    #[serde(rename = "q8_0")]
+    Q8_0,
+    /// 4-bit blocks of 32.
+    #[cfg_attr(feature = "cli", value(name = "q4_0"))]
+    #[serde(rename = "q4_0")]
+    Q4_0,
+    /// 4-bit blocks of 32, with a minimum.
+    #[cfg_attr(feature = "cli", value(name = "q4_1"))]
+    #[serde(rename = "q4_1")]
+    Q4_1,
+    /// 4-bit non-linear blocks of 32.
+    #[cfg_attr(feature = "cli", value(name = "iq4_nl"))]
+    #[serde(rename = "iq4_nl")]
+    Iq4Nl,
+    /// 5-bit blocks of 32.
+    #[cfg_attr(feature = "cli", value(name = "q5_0"))]
+    #[serde(rename = "q5_0")]
+    Q5_0,
+    /// 5-bit blocks of 32, with a minimum.
+    #[cfg_attr(feature = "cli", value(name = "q5_1"))]
+    #[serde(rename = "q5_1")]
+    Q5_1,
+}
+
+impl KvCacheType {
+    /// The llama.cpp name (`q8_0`), as `--cache-type-k` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+            Self::Q8_0 => "q8_0",
+            Self::Q4_0 => "q4_0",
+            Self::Q4_1 => "q4_1",
+            Self::Iq4Nl => "iq4_nl",
+            Self::Q5_0 => "q5_0",
+            Self::Q5_1 => "q5_1",
+        }
+    }
+}
+
+impl std::fmt::Display for KvCacheType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl LoadSidecar {
+    /// [`Self::rope_scale`] if it is a usable YaRN factor.
+    pub fn yarn_factor(&self) -> Option<f32> {
+        self.rope_scale.filter(|f| f.is_finite() && *f >= 1.0)
+    }
 }
 
 /// Read a load sidecar from `path`, if it exists. Same contract as
@@ -385,24 +477,45 @@ pub fn load_load_options(
         })
 }
 
-/// The KV context a model is served with: its load sidecar's `n_ctx`
-/// capped at the trained window `n_ctx_train` (`0` = unknown,
-/// uncapped), else the server-wide `default` unchanged.
+/// The window a model can attend over: its trained context
+/// `n_ctx_train`, or with a YaRN `factor`, the `original` pre-scaling
+/// window (the GGUF's `rope.scaling.original_context_length`, else
+/// `n_ctx_train`) times the factor. `0` = unknown.
+pub fn n_ctx_window(
+    n_ctx_train: u32,
+    original: Option<u32>,
+    factor: Option<f32>,
+) -> u32 {
+    match factor {
+        None => n_ctx_train,
+        Some(factor) => {
+            let original = original.filter(|&n| n != 0).unwrap_or(n_ctx_train);
+            // Saturating: an absurd factor caps at u32::MAX rather
+            // than wrapping.
+            (original as f64 * factor as f64).min(u32::MAX as f64) as u32
+        }
+    }
+}
+
+/// The KV context a model is served with: the smallest of the
+/// server-wide `default`, the load sidecar's `n_ctx` and the model's
+/// `window` ([`n_ctx_window`]; `0` = unknown, uncapped). `None` only
+/// when neither context is set, which leaves llama.cpp's default.
 ///
-/// Only the per-model value is capped. The default keeps its meaning —
-/// one size allocated for every model, advertised as
-/// `min(n_ctx, n_ctx_train)` by `Catalog` — so this changes
-/// nothing for a model without a sidecar.
+/// Capping the default too is what keeps one server-wide `--n-ctx`
+/// from over-allocating a smaller model: past its window a model
+/// produces garbage, not a longer answer, and the KV cells cost the
+/// same either way (cogito, 131072 trained, OOM'd at `--n-ctx 262144`).
 pub fn effective_n_ctx(
     default: Option<u32>,
     sidecar: Option<u32>,
-    n_ctx_train: u32,
+    window: u32,
 ) -> Option<u32> {
-    match (sidecar, n_ctx_train) {
-        (None, _) => default,
-        (Some(n_ctx), 0) => Some(n_ctx),
-        (Some(n_ctx), train) => Some(n_ctx.min(train)),
-    }
+    let n_ctx = [default, sidecar].into_iter().flatten().min()?;
+    Some(match window {
+        0 => n_ctx,
+        window => n_ctx.min(window),
+    })
 }
 
 /// The micro-batch a model is served with: an `explicit` option as-is
@@ -678,6 +791,22 @@ mod tests {
         let sidecar = load_load_options(&path).unwrap().expect("written");
         assert_eq!((sidecar.n_ctx, sidecar.n_ubatch), (None, Some(1024)));
 
+        std::fs::write(&path, "n_ctx = 1048576\nrope_scale = 4.0\n").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar.rope_scale, Some(4.0));
+        std::fs::write(&path, "rope_scale = 4").unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar.rope_scale, Some(4.0), "an integer factor");
+
+        std::fs::write(
+            &path,
+            "cache_type_k = \"q8_0\"\ncache_type_v = \"iq4_nl\"",
+        )
+        .unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar.cache_type_k, Some(KvCacheType::Q8_0));
+        assert_eq!(sidecar.cache_type_v, Some(KvCacheType::Iq4Nl));
+
         std::fs::write(&path, "").unwrap();
         let sidecar = load_load_options(&path).unwrap().expect("written");
         assert_eq!(sidecar, LoadSidecar::default());
@@ -689,6 +818,11 @@ mod tests {
             "n-ubatch = 2048",
             "n_ubatch = -1",
             "n_ubatch = \"2k\"",
+            "rope-scale = 4.0",
+            "rope_scale = \"4x\"",
+            "cache_type_k = \"q8\"",
+            "cache_type_k = \"Q8_0\"",
+            "cache-type-v = \"q8_0\"",
         ] {
             std::fs::write(&path, bad).unwrap();
             assert!(
@@ -704,32 +838,97 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    /// Precedence and capping, with the fleet's numbers: a sidecar
-    /// beats the server-wide default in either direction, is capped at
-    /// the trained window, and is taken as-is when that is unknown; no
-    /// sidecar leaves the default untouched, even past the window.
+    /// Every bound applies, with the fleet's numbers at
+    /// `--n-ctx 262144`: the smallest of the default, the sidecar and
+    /// the window wins, and an unknown window caps nothing.
     #[test]
-    fn effective_n_ctx_precedence_and_cap() {
-        const DEFAULT: Option<u32> = Some(131072);
-        // Qwen3.8: raised to its trained window.
+    fn effective_n_ctx_takes_the_smallest_bound() {
+        const DEFAULT: Option<u32> = Some(262144);
+        // Qwen3.8: its sidecar matches the default and its window.
         assert_eq!(
             effective_n_ctx(DEFAULT, Some(262144), 262144),
             Some(262144)
         );
-        // Past the window (1M wants rope scaling): capped.
+        // cogito: no sidecar, the default capped at its window.
+        assert_eq!(effective_n_ctx(DEFAULT, None, 131072), Some(131072));
+        // Mistral Small 4 (1M window): its sidecar lowers it.
+        assert_eq!(
+            effective_n_ctx(DEFAULT, Some(131072), 1 << 20),
+            Some(131072)
+        );
+        // A sidecar can't raise past the default.
+        assert_eq!(
+            effective_n_ctx(Some(131072), Some(262144), 262144),
+            Some(131072)
+        );
+        // Past the window: capped.
         assert_eq!(
             effective_n_ctx(DEFAULT, Some(1 << 20), 262144),
             Some(262144)
         );
-        // Mistral Small 4: lowered below the default.
-        assert_eq!(effective_n_ctx(DEFAULT, Some(65536), 1 << 20), Some(65536));
-        // Trained window unknown: the sidecar stands.
-        assert_eq!(effective_n_ctx(DEFAULT, Some(1 << 20), 0), Some(1 << 20));
-        // No sidecar: the default, uncapped (the advertisement caps it).
-        assert_eq!(effective_n_ctx(DEFAULT, None, 40960), DEFAULT);
+        // Window unknown: the smaller context stands.
+        assert_eq!(effective_n_ctx(DEFAULT, Some(1 << 20), 0), DEFAULT);
+        assert_eq!(effective_n_ctx(None, Some(1 << 20), 0), Some(1 << 20));
+        // Neither context set: llama.cpp's default.
         assert_eq!(effective_n_ctx(None, None, 40960), None);
-        // A sidecar works without any default (llama.cpp's 512).
+        // A sidecar works without any default.
         assert_eq!(effective_n_ctx(None, Some(8192), 40960), Some(8192));
+    }
+
+    /// The window is the trained context unless YaRN is asked for,
+    /// then the original window times the factor.
+    #[test]
+    fn n_ctx_window_scales_the_original() {
+        // No factor: the trained context, whatever the original.
+        assert_eq!(n_ctx_window(262144, None, None), 262144);
+        assert_eq!(n_ctx_window(1 << 20, Some(8192), None), 1 << 20);
+        // Qwen3.8 → 1M: no scaling metadata, so the trained context
+        // is the original.
+        assert_eq!(n_ctx_window(262144, None, Some(4.0)), 1 << 20);
+        // Mistral Small 4 re-scaled: the GGUF's original, not its
+        // already-scaled context.
+        assert_eq!(n_ctx_window(1 << 20, Some(8192), Some(16.0)), 131072);
+        // An original of 0 means absent.
+        assert_eq!(n_ctx_window(262144, Some(0), Some(2.0)), 524288);
+        // Saturates instead of wrapping.
+        assert_eq!(n_ctx_window(262144, None, Some(1e9)), u32::MAX);
+    }
+
+    /// Every KV cache type serializes as its llama.cpp name.
+    #[test]
+    fn kv_cache_type_names_match_llama_cpp() {
+        use KvCacheType::*;
+        // Exhaustive, so a new variant has to be named here.
+        let all = [F32, F16, Bf16, Q8_0, Q4_0, Q4_1, Iq4Nl, Q5_0, Q5_1];
+        for t in all {
+            match t {
+                F32 | F16 | Bf16 | Q8_0 | Q4_0 | Q4_1 | Iq4Nl | Q5_0 | Q5_1 => {
+                }
+            }
+            let json = serde_json::to_string(&t).unwrap();
+            assert_eq!(json, format!("\"{}\"", t.name()));
+            assert_eq!(serde_json::from_str::<KvCacheType>(&json).unwrap(), t);
+            assert_eq!(t.to_string(), t.name());
+        }
+    }
+
+    /// Only a finite factor of at least 1 turns YaRN on.
+    #[test]
+    fn yarn_factor_filters_unusable_values() {
+        let factor = |rope_scale| {
+            LoadSidecar {
+                rope_scale,
+                ..Default::default()
+            }
+            .yarn_factor()
+        };
+        assert_eq!(factor(Some(4.0)), Some(4.0));
+        assert_eq!(factor(Some(1.0)), Some(1.0));
+        assert_eq!(factor(None), None);
+        assert_eq!(factor(Some(0.5)), None);
+        assert_eq!(factor(Some(0.0)), None);
+        assert_eq!(factor(Some(f32::NAN)), None);
+        assert_eq!(factor(Some(f32::INFINITY)), None);
     }
 
     /// An explicit option beats the sidecar, which beats llama.cpp's

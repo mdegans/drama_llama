@@ -147,7 +147,7 @@ pub use sidecar::{
     load_call_syntax, load_sample_options, seed_config_for, write_call_syntax,
     write_sample_options,
 };
-pub use sidecar::{load_template_source, SidecarError};
+pub use sidecar::{load_template_source, KvCacheType, SidecarError};
 
 mod engine;
 pub use engine::Engine;

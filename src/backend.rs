@@ -103,6 +103,14 @@ pub trait Decoder: Send {
     /// Context length in tokens.
     fn n_ctx(&self) -> u32;
 
+    /// The window the model attends over when the load stretched it
+    /// with RoPE scaling (a `rope_scale` load sidecar); `None`, the
+    /// default, means the model's trained window
+    /// ([`Model::context_size`]).
+    fn n_ctx_window(&self) -> Option<u32> {
+        None
+    }
+
     /// Maximum number of distinct KV sequences this decoder supports.
     /// `Session`'s multi-slot prefix cache clamps its slot count to
     /// this.

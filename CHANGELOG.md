@@ -6,8 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`--n-ctx` is now a ceiling, capped at each model's window.** The
+  served context is the smallest of `--n-ctx`, a `load.toml`'s
+  `n_ctx` and the model's window, so a sidecar can lower a model's
+  context but no longer raise it past `--n-ctx`. Before, `--n-ctx`
+  was used as given for any model without a sidecar: at 262144,
+  cogito (131072 trained, 256 KiB of KV per token) allocated 64 GiB
+  of KV and ran Metal out of memory. A fleet that raised one model
+  with a sidecar now launches with the larger `--n-ctx` and lowers
+  the others (e.g. Mistral Small 4, whose window is 1M).
+
+### Added
+
+- **KV cache types: `--cache-type-k` / `--cache-type-v`, and
+  `cache_type_k` / `cache_type_v` in `<model>.load.toml`** (which beat
+  the flags). llama.cpp's set and names (`f16`, `q8_0`, `q4_0`,
+  `iq4_nl`, …), as `KvCacheType` and `LlamaCppOptions::cache_type_*`.
+  `q8_0` halves the KV cache, which is what bounds a long context on a
+  dense model. A quantized V needs Flash Attention; llama.cpp turns it
+  on under the default `Auto` and refuses the context if it is forced
+  off.
+- **`rope_scale` in `<model>.load.toml`**: a YaRN factor over the
+  model's original window (its GGUF's
+  `rope.scaling.original_context_length`, else its context length).
+  It stretches the window to `original × rope_scale` (Qwen3.5+:
+  `4` takes 262144 to 1M), and `/v1/models` advertises the stretched
+  window. Opt-in per model: static YaRN costs some short-context
+  quality, and a GGUF that ships scaling (gpt-oss, Mistral Small 4)
+  was trained with its own factor.
+
 ### Fixed
 
+- **A client that leaves mid-turn no longer frees the model for a
+  second load.** Completions and `count_tokens` run as detached tasks
+  that keep the session lock until the work ends; a retry meanwhile is
+  answered 529. Before, the retry loaded another copy of the model
+  beside the running generation, and Metal ran out of memory (live on
+  2026-10-02 with Mistral Small 4, and on 2026-10-08 with gpt-oss).
+- **A YaRN context over a shared model is refused**
+  (`NewError::SharedModel`). llama.cpp rewrites a model's trained
+  context when a context rescales it, so building one while another
+  handle reads the model would race; the load path holds the only
+  handle and is unaffected.
 - **The escaped-closer repair reaches past escaped whitespace** ([#148]).
   It rolled back only to the newest backslash-bearing token, so a value
   ending `\"` + an escaped `\n` or `\t` + `}` (the escape's backslash

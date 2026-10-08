@@ -85,6 +85,12 @@ pub enum NewError {
     /// compute buffers could not be allocated; llama.cpp does not say.
     #[error("Could not create context")]
     Context,
+    /// The context params ask for YaRN at a factor other than the
+    /// model's own, which makes llama.cpp rewrite the model's trained
+    /// context, and the model has other handles that could be reading
+    /// it. Load a separate copy, or build the context before cloning.
+    #[error("YaRN rescaling rewrites the model; it needs the only handle")]
+    SharedModel,
     /// An mmproj sidecar exists next to the model but failed to load.
     /// Hard error by design: continuing text-only would silently drop
     /// images.
@@ -106,7 +112,9 @@ impl NewError {
     /// llama.cpp does not say why, the answer is `true`.
     pub fn is_resource(&self) -> bool {
         match self {
-            Self::Unreadable { .. } | Self::Metadata { .. } => false,
+            Self::Unreadable { .. }
+            | Self::Metadata { .. }
+            | Self::SharedModel => false,
             Self::Model { .. } | Self::Context => true,
             #[cfg(feature = "mtmd")]
             Self::Mtmd { source, .. } => matches!(
@@ -299,9 +307,27 @@ pub struct LlamaCppDecoder {
     /// [`Self::set_seq_snapshots`] (tests, or callers wanting rewind
     /// insurance on a dense model).
     checkpoints: Checkpoints,
+    /// The window YaRN stretched the model to (`yarn_orig_ctx /
+    /// rope_freq_scale`), when the context params turned it on. See
+    /// [`Decoder::n_ctx_window`].
+    yarn_window: Option<u32>,
 }
 
 unsafe impl Send for LlamaCppDecoder {}
+
+/// The window `params` stretch the model to with YaRN, if they turn it
+/// on with an explicit factor and original window.
+fn yarn_window(params: &llama_context_params) -> Option<u32> {
+    let yarn = params.rope_scaling_type
+        == llama_cpp_sys_3::llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN;
+    (yarn && params.rope_freq_scale > 0.0 && params.yarn_orig_ctx > 0).then(
+        || {
+            (params.yarn_orig_ctx as f64 / params.rope_freq_scale as f64)
+                .round()
+                .min(u32::MAX as f64) as u32
+        },
+    )
+}
 
 impl LlamaCppDecoder {
     /// Create a decoder bound to `model` with the given context params.
@@ -332,6 +358,16 @@ impl LlamaCppDecoder {
         // here, which looked like a panic risk but was infallible.)
         let numa = numa_strategy
             .unwrap_or(ggml_numa_strategy_GGML_NUMA_STRATEGY_DISABLED);
+        // A custom YaRN factor makes `llama_init_from_model` write the
+        // model's `n_ctx_train`; with the only handle in our caller's
+        // hands, nothing else can be reading it.
+        let rescales = context_params.rope_scaling_type
+            == llama_cpp_sys_3::llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN
+            && context_params.rope_freq_scale != 0.0
+            && context_params.rope_freq_scale != model.rope_freq_scale();
+        if rescales && !model.is_unique() {
+            return Err(NewError::SharedModel);
+        }
 
         {
             let mut count = engine_count();
@@ -350,8 +386,9 @@ impl LlamaCppDecoder {
         // store below keeps it live for as long as the context exists.
         // `as_ptr_mut` is sound here specifically because
         // `llama_init_from_model` only reads the model before binding
-        // it to the context's `const llama_model &` — the non-const in
-        // its signature is vestigial (see `ModelInner`'s `Sync` note).
+        // it to the context's `const llama_model &`, except under a
+        // custom YaRN factor, which `rescales` above confined to a
+        // model no one else holds (see `ModelInner`'s `Sync` note).
         let context = unsafe {
             llama_init_from_model(model.as_ptr_mut(), context_params)
         };
@@ -376,6 +413,7 @@ impl LlamaCppDecoder {
 
         Ok(Self {
             context,
+            yarn_window: yarn_window(&context_params),
             n_vocab: model.n_vocab() as usize,
             embedding_size: model.embedding_size() as usize,
             // SAFETY: `model` is live for the call and this only reads
@@ -919,6 +957,10 @@ impl Decoder for LlamaCppDecoder {
 
     fn n_ctx(&self) -> u32 {
         LlamaCppDecoder::n_ctx(self)
+    }
+
+    fn n_ctx_window(&self) -> Option<u32> {
+        self.yarn_window
     }
 
     fn n_seq_max(&self) -> u32 {

@@ -107,6 +107,14 @@ impl<B: Backend> Engine<B> {
         self.decoder.n_ctx()
     }
 
+    /// The window the loaded model attends over: its trained context,
+    /// or the RoPE-scaled one if the load stretched it. `0` = unknown.
+    pub fn n_ctx_window(&self) -> u32 {
+        self.decoder.n_ctx_window().unwrap_or_else(|| {
+            crate::backend::Model::context_size(&self.model).max(0) as u32
+        })
+    }
+
     /// Maximum number of distinct KV sequences the decoder supports.
     /// See [`Decoder::n_seq_max`].
     pub fn n_seq_max(&self) -> u32 {

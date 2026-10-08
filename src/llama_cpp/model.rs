@@ -168,7 +168,11 @@ unsafe impl Send for ModelInner {}
 // llama-model.h or llama-vocab.h; and the non-const `llama_model *` in
 // `llama_init_from_model`'s signature is vestigial — its body only
 // reads (`hparams`, `arch`, `split_mode()`) before binding to that
-// const ref.
+// const ref — with one exception: a context asking for YaRN at a factor
+// other than the model's own rewrites `model->hparams.n_ctx_train` to
+// the stretched window (llama-context.cpp:3832). `LlamaCppDecoder::new`
+// refuses such a context unless its caller holds the only handle, so
+// that write never races a reader.
 //
 // The one upstream call that genuinely writes a model through a
 // context is `llama_opt_init` (llama-context.cpp:3245, the finetune
@@ -318,6 +322,13 @@ impl LlamaCppModel {
     }
 
     /// Return the inner model.
+    /// Whether this is the only handle on the model, so nothing else
+    /// can read it while llama.cpp writes it (see `ModelInner`'s
+    /// `Sync` note).
+    pub(crate) fn is_unique(&self) -> bool {
+        std::sync::Arc::strong_count(&self.0) == 1
+    }
+
     pub fn as_ptr(&self) -> *const llama_model {
         debug_assert!(!self.0.inner.is_null());
         self.0.inner as *const llama_model
@@ -488,6 +499,31 @@ impl LlamaCppModel {
                 .unwrap_or(0),
             trained => trained,
         }
+    }
+
+    /// The window before the GGUF's own RoPE scaling
+    /// (`<arch>.rope.scaling.original_context_length`); `None` for a
+    /// model that ships unscaled. YaRN factors multiply this.
+    pub fn rope_original_context_size(&self) -> Option<u32> {
+        let arch = self.get_meta("general.architecture")?;
+        self.get_meta(
+            format!("{arch}.rope.scaling.original_context_length").as_str(),
+        )?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&n: &u32| n != 0)
+    }
+
+    /// The window this model attends over when loaded with a YaRN
+    /// `factor` (none: [`Self::context_size`]); `0` = unknown. See
+    /// [`crate::sidecar::n_ctx_window`].
+    pub fn n_ctx_window(&self, factor: Option<f32>) -> u32 {
+        crate::sidecar::n_ctx_window(
+            self.context_size().max(0) as u32,
+            self.rope_original_context_size(),
+            factor,
+        )
     }
 
     /// Embedding size.

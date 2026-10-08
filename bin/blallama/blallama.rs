@@ -539,6 +539,32 @@ where
     }
 }
 
+/// Run a request's work as its own task, so a client that disconnects
+/// drops only this wait, never the work. axum drops a handler's future
+/// when its connection closes; were the work inside it, the session's
+/// lock guard would drop while the blocking pool still ran the
+/// generation (or load) that owns the session, and the next request
+/// would find the slot empty and load a second copy of the model — live
+/// on 2026-10-02, a client timeout mid-generation on Mistral Small 4
+/// followed by its retry exited the server on Metal OOM. Detached, the
+/// task keeps the guard to the end and a retry meanwhile gets 529.
+async fn detached<F, T>(work: F) -> Result<T, Reply>
+where
+    F: std::future::Future<Output = Result<T, Reply>> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::spawn(work).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Cancelled only at runtime shutdown; a panic otherwise.
+            if e.is_panic() {
+                fatal::declare(Fatal::Panic, &e);
+            }
+            Err(fatal::reply(fatal::current().unwrap_or(Fatal::Panic)))
+        }
+    }
+}
+
 fn log_stats(id: impl AsRef<str>, usage: Usage, elapsed: Duration) {
     // `Usage` derefs to `TokenCounts`, where the counts now live.
     let input_tokens = usage.input_tokens;
@@ -880,7 +906,7 @@ where
     Session<B>: FromPath,
 {
     resolve_model(&state, &mut prompt).await?;
-    complete(state, prompt).await
+    detached(complete(state, prompt)).await
 }
 
 /// `POST /v1/messages/count_tokens`: what `/v1/messages` would prefill
@@ -899,18 +925,23 @@ where
     Session<B>: FromPath,
 {
     resolve_model(&state, &mut prompt).await?;
-    let (mut lock, session) =
-        checkout(&state, &prompt.model.to_string()).await?;
-    let (session, result) = spawn_blocking_or_bust(move || {
-        let mut session = session;
-        let result = session.count_tokens(&prompt);
-        (session, result)
+    // Detached for the same reason as a completion: a load it triggers
+    // must keep the slot until it lands.
+    let input_tokens = detached(async move {
+        let (mut lock, session) =
+            checkout(&state, &prompt.model.to_string()).await?;
+        let (session, result) = spawn_blocking_or_bust(move || {
+            let mut session = session;
+            let result = session.count_tokens(&prompt);
+            (session, result)
+        })
+        .await?;
+        // Counting never touches KV state, so the session survives any
+        // error it can return.
+        lock.replace(session);
+        result.map_err(map_session_err)
     })
     .await?;
-    // Counting never touches KV state, so the session survives any
-    // error it can return.
-    lock.replace(session);
-    let input_tokens = result.map_err(map_session_err)?;
     Ok(Json(serde_json::json!({ "input_tokens": input_tokens })))
 }
 
