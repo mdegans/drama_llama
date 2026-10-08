@@ -3846,19 +3846,22 @@ impl FromPath for Session<LlamaCppBackend> {
         // capability the same binary cannot serve.
         let image_input = cfg!(feature = "mtmd")
             && crate::sidecar::mmproj_path(path).is_some();
-        // The n_ctx the load would serve with: the load sidecar's,
-        // capped at the trained window, else the default.
+        // The n_ctx the load would serve with: the smallest of the
+        // default, the load sidecar's and the (YaRN-stretched) window.
+        let load = load_sidecar(&llama_cpp_load_sidecar_path(path));
+        let window = model.n_ctx_window(load.yarn_factor());
         let options = crate::LlamaCppOptions {
             n_ctx: crate::sidecar::effective_n_ctx(
                 options.n_ctx,
-                load_sidecar(&llama_cpp_load_sidecar_path(path)).n_ctx,
-                model.context_size().max(0) as u32,
+                load.n_ctx,
+                window,
             ),
             ..*options
         };
         let info = peek_info(
             &model,
             options.context_params().n_ctx,
+            window,
             image_input,
             &llama_cpp_template_sidecar_path(path),
             &llama_cpp_dialect_sidecar_path(path),
@@ -3887,6 +3890,7 @@ impl FromPath for Session<LlamaCppBackend> {
 fn peek_info<M: crate::backend::Model>(
     model: &M,
     n_ctx: u32,
+    n_ctx_window: u32,
     image_input: bool,
     template_sidecar: &std::path::Path,
     #[allow(unused_variables)] dialect_sidecar: &std::path::Path,
@@ -3911,14 +3915,13 @@ fn peek_info<M: crate::backend::Model>(
         dialect = sidecar;
     }
 
-    let n_ctx_train = model.context_size().max(0) as u32;
-    if n_ctx_train != 0 && n_ctx > n_ctx_train {
+    if n_ctx_window != 0 && n_ctx > n_ctx_window {
         tracing::warn!(
             model = model.display_name().unwrap_or_default(),
             n_ctx,
-            n_ctx_train,
-            "configured context exceeds the trained window; advertising \
-             the trained window",
+            n_ctx_window,
+            "configured context exceeds the model's window; advertising \
+             the window",
         );
     }
 
@@ -3928,7 +3931,7 @@ fn peek_info<M: crate::backend::Model>(
             .unwrap_or_else(|| "unknown".to_string()),
         title: model.title(),
         n_ctx,
-        n_ctx_train,
+        n_ctx_train: n_ctx_window,
         image_input,
         thinking: dialect.reasoning.mode != crate::dialect::ReasoningMode::None,
         modified: None,
@@ -4019,6 +4022,7 @@ impl FromPath for Session<MoefluxBackend> {
         Ok(peek_info(
             &model,
             n_ctx,
+            model.context_size().max(0) as u32,
             false,
             &parent.join("template.jinja"),
             &parent.join("dialect.toml"),
@@ -4335,7 +4339,7 @@ impl<B: Backend> Session<B> {
                 .unwrap_or_else(|| "unknown".to_string()),
             title: model.title(),
             n_ctx: self.engine.n_ctx(),
-            n_ctx_train: model.context_size().max(0) as u32,
+            n_ctx_train: self.engine.n_ctx_window(),
             image_input: self
                 .engine
                 .vision()

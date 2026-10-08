@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml?query=branch%3Amain)
 [![codecov](https://codecov.io/gh/mdegans/drama_llama/graph/badge.svg)](https://codecov.io/gh/mdegans/drama_llama)
-[![tests](https://img.shields.io/badge/tests-1172-blue)](#testing)
+[![tests](https://img.shields.io/badge/tests-1174-blue)](#testing)
 [![license](https://img.shields.io/badge/license-RAIL--S-lightgrey)](https://github.com/mdegans/drama_llama/blob/main/LICENSE.md)
 
 `drama_llama` runs language models on your own hardware behind an API shaped
@@ -303,7 +303,7 @@ before an error is returned.
 | Flag | Default | |
 |---|---|---|
 | `--port` | 11435 | Port to listen on. |
-| `--n-ctx` | 32768 | Context length for every model; a `load.toml` sidecar can set a model's own. |
+| `--n-ctx` | 32768 | Maximum context length for every model, capped at each model's window; a `load.toml` sidecar can lower it. |
 | `--cache-slots` | 1 | KV sequences over one cell pool: one cached prefix per concurrent agent. |
 | `--swa-full` | off | Size sliding-window layers' KV at the full context instead of the window. |
 | `--checkpoint-mib` / `--checkpoint-slot-mib` | 8192 / 4096 | Host RAM the prefix-cache checkpoints may hold, in all and per slot. |
@@ -323,7 +323,7 @@ sidecar that does not read or parse is logged and ignored.
 | File | |
 |---|---|
 | `<model>.sampling.toml` | Sampling defaults: the mode chain, the repetition penalty, the tool-call cap. Written on first load, seeded from the model's own recommended sampling where it has one; never overwritten. |
-| `<model>.load.toml` | Load-time options: `n_ctx` (capped at the trained window) and `n_ubatch`. Never written; unknown keys are an error. |
+| `<model>.load.toml` | Load-time options: `n_ctx` (at most `--n-ctx` and the model's window), `n_ubatch`, and `rope_scale` (YaRN over the original window, stretching it). Never written; unknown keys are an error. |
 | `<model>.template.jinja` | Replaces the chat template outright. |
 | `<model>.dialect.toml` | Overrides the tool-call dialect derived from the template. |
 | `<model>.mmproj.gguf` | The vision projector: image input, with the `mtmd` feature. |
@@ -361,16 +361,18 @@ surgical = true
 ```
 
 ```toml
-# Qwen3.8-27B-UD-Q8_K_XL.load.toml
-n_ctx = 262144   # this model's own context, instead of --n-ctx
+# Mistral-Small-4-119B-2603-UD-Q4_K_XL.load.toml, under --n-ctx 262144
+n_ctx = 131072   # this model's own context, below --n-ctx (window: 1M)
 n_ubatch = 2048  # llama.cpp's micro-batch (default 512)
+# rope_scale = 4 # YaRN factor; for a model trained unscaled (Qwen3.5+:
+#                # 262144 → 1M). Not for one whose GGUF ships scaling.
 ```
 
 [`models/`]: https://github.com/mdegans/drama_llama/tree/main/models
 
 ## Testing
 
-1172 tests across 33 binaries in the default configuration — 983 that run in
+1174 tests across 33 binaries in the default configuration — 985 that run in
 seconds and 189 that load real weights onto a real accelerator. The
 model-backed tier is `#[ignore]`d so the fast loop stays fast, and the whole
 topology — *which features* × *which tests* — lives in one place,

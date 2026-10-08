@@ -41,8 +41,10 @@ pub(crate) struct Advertised {
     pub title: Option<String>,
     /// The KV context the model is (or would be) served with.
     pub n_ctx: u32,
-    /// [`Model::context_size`](crate::backend::Model::context_size) — the
-    /// trained context; `0` when the backend doesn't know.
+    /// The window the model attends over: its trained context
+    /// ([`Model::context_size`](crate::backend::Model::context_size)),
+    /// or the RoPE-scaled one when a `rope_scale` load sidecar stretches
+    /// it; `0` when the backend doesn't know.
     pub n_ctx_train: u32,
     /// Whether images can be attached (a vision projector is present).
     pub image_input: bool,
@@ -182,8 +184,8 @@ where
     Session<B>: FromPath,
 {
     /// A catalog over `root`, describing each model as `options` would
-    /// load it (the served context size comes from there, unless the
-    /// model's load sidecar overrides it — see
+    /// load it (the served context size comes from there, lowered by the
+    /// model's load sidecar or window — see
     /// [`effective_n_ctx`](crate::sidecar::effective_n_ctx)).
     pub fn new(
         root: impl Into<PathBuf>,
@@ -576,14 +578,14 @@ mod tests {
         assert_eq!(info.created_at, DateTime::<Utc>::UNIX_EPOCH);
     }
 
-    /// `/v1/models` advertises the per-model context: a load sidecar's
-    /// `n_ctx`, capped at the trained window, else the default capped
-    /// the same way. Fleet numbers; `--n-ctx 131072`.
+    /// `/v1/models` advertises the per-model context: the smallest of
+    /// the default, a load sidecar's `n_ctx` and the model's window.
+    /// Fleet numbers; `--n-ctx 262144`.
     #[test]
     fn per_model_n_ctx_is_advertised() {
         let advertised = |sidecar: Option<u32>, n_ctx_train: u32| {
             let n_ctx = crate::sidecar::effective_n_ctx(
-                Some(131072),
+                Some(262144),
                 sidecar,
                 n_ctx_train,
             )
@@ -601,15 +603,17 @@ mod tests {
             assert_eq!(info.max_tokens, info.max_input_tokens);
             info.max_input_tokens
         };
-        // Qwen3.8 with `n_ctx = 262144`, and with an over-ask.
+        // Qwen3.8, with `n_ctx = 262144` and with an over-ask.
         assert_eq!(advertised(Some(262144), 262144), 262144);
         assert_eq!(advertised(Some(1 << 20), 262144), 262144);
         // Mistral Small 4, no sidecar: the default, not its 1M.
-        assert_eq!(advertised(None, 1 << 20), 131072);
+        assert_eq!(advertised(None, 1 << 20), 262144);
         // Mistral Small 4 lowered by its sidecar.
-        assert_eq!(advertised(Some(65536), 1 << 20), 65536);
-        // Qwen3 native 40960, no sidecar: the window, as before.
-        assert_eq!(advertised(None, 40960), 40960);
+        assert_eq!(advertised(Some(131072), 1 << 20), 131072);
+        // cogito, no sidecar: its 131072 window, not the default.
+        assert_eq!(advertised(None, 131072), 131072);
+        // Qwen3.8 stretched to 1M by YaRN: capped by the default.
+        assert_eq!(advertised(Some(1 << 20), 1 << 20), 262144);
     }
 
     #[cfg(feature = "llama-cpp")]
@@ -852,9 +856,9 @@ mod tests {
         }
 
         /// A weightless peek reads the load sidecar: a model beside a
-        /// `load.toml` advertises its own (capped) `n_ctx`, a broken
-        /// sidecar falls back to the default. Vocab-only, so no
-        /// weights load.
+        /// `load.toml` advertises its own (capped) `n_ctx`, a
+        /// `rope_scale` stretches its window, and a broken sidecar falls
+        /// back to the default. Vocab-only, so no weights load.
         #[cfg(unix)]
         #[test]
         #[ignore = "requires models/model.gguf"]
@@ -863,7 +867,7 @@ mod tests {
                 .join("models/model.gguf");
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            for name in ["plain", "small", "huge", "typo"] {
+            for name in ["plain", "small", "huge", "typo", "yarn"] {
                 std::os::unix::fs::symlink(
                     &gguf,
                     root.join(format!("{name}.gguf")),
@@ -876,15 +880,28 @@ mod tests {
                 .unwrap();
             std::fs::write(root.join("typo.load.toml"), "n-ctx = 2048")
                 .unwrap();
-            let catalog = catalog(root);
+            std::fs::write(
+                root.join("yarn.load.toml"),
+                "n_ctx = 1073741824\nrope_scale = 4",
+            )
+            .unwrap();
+            // A default past every window, so each model's own bound
+            // is the one that binds.
+            let catalog = Catalog::<LlamaCppBackend>::new(
+                root,
+                LlamaCppOptions::default().with_n_ctx(1 << 30),
+            );
             let ceiling =
                 |name: &str| catalog.info(name).unwrap().max_input_tokens;
 
-            assert_eq!(ceiling("plain.gguf"), 1024);
-            assert_eq!(ceiling("small.gguf"), 2048);
-            assert_eq!(ceiling("typo.gguf"), 1024);
-            let trained = ceiling("huge.gguf");
+            let trained = ceiling("plain.gguf");
             assert!(trained > 2048 && trained < 1 << 30, "{trained}");
+            assert_eq!(ceiling("small.gguf"), 2048);
+            assert_eq!(ceiling("typo.gguf"), trained);
+            assert_eq!(ceiling("huge.gguf"), trained);
+            // model.gguf ships unscaled, so YaRN multiplies its
+            // trained window.
+            assert_eq!(ceiling("yarn.gguf"), trained * 4);
         }
 
         /// The invariant the whole design rests on: a weightless peek

@@ -12,8 +12,9 @@ use std::path::PathBuf;
 use llama_cpp_sys_3::{
     llama_context, llama_context_default_params, llama_context_params,
     llama_model_default_params, llama_model_params, llama_perf_context_data,
-    llama_seq_id, llama_supports_gpu_offload, llama_supports_mlock,
-    llama_supports_mmap, llama_token,
+    llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN, llama_seq_id,
+    llama_supports_gpu_offload, llama_supports_mlock, llama_supports_mmap,
+    llama_token,
 };
 
 /// Convenience alias for the llama.cpp-backed pair. Use
@@ -160,12 +161,12 @@ impl LlamaCppEngine {
         )
     }
 
-    /// [`Self::from_path_with`], with a model's load sidecar: its
-    /// `n_ctx` beats `options.n_ctx` once capped at the trained window
-    /// (known only after the model loads, hence here), and its
-    /// `n_ubatch` fills an unset `options.n_ubatch`. See
-    /// [`crate::sidecar::effective_n_ctx`] and
-    /// [`crate::sidecar::effective_n_ubatch`]. Logs the context and
+    /// [`Self::from_path_with`], with a model's load sidecar: the
+    /// served context is the smallest of `options.n_ctx`, its `n_ctx`
+    /// and the model's window (known only after the model loads, hence
+    /// here; stretched by its `rope_scale`), and its `n_ubatch` fills an
+    /// unset `options.n_ubatch`. See [`crate::sidecar::effective_n_ctx`]
+    /// and [`crate::sidecar::effective_n_ubatch`]. Logs the context and
     /// micro-batch the model is served with.
     pub(crate) fn from_path_with_load_sidecar(
         path: PathBuf,
@@ -176,14 +177,27 @@ impl LlamaCppEngine {
         let model =
             Self::load_model(path.clone(), Some(options.model_params()))?;
         let n_ctx_train = model.context_size().max(0) as u32;
+        let yarn = sidecar.yarn_factor();
+        if let Some(requested) = sidecar.rope_scale.filter(|_| yarn.is_none()) {
+            tracing::warn!(
+                path = %path.display(),
+                requested,
+                "per-model rope_scale must be a finite factor of at least \
+                 1; ignored",
+            );
+        }
+        let window = model.n_ctx_window(yarn);
+        let options_n_ctx = options.n_ctx;
         let effective =
-            crate::sidecar::effective_n_ctx(options.n_ctx, n_ctx, n_ctx_train);
+            crate::sidecar::effective_n_ctx(options_n_ctx, n_ctx, window);
         if let Some(requested) = n_ctx.filter(|&n| Some(n) != effective) {
             tracing::warn!(
                 path = %path.display(),
                 requested,
-                n_ctx_train,
-                "per-model n_ctx exceeds the trained window; capped",
+                n_ctx = ?options_n_ctx,
+                window,
+                "per-model n_ctx exceeds --n-ctx or the model's window; \
+                 capped",
             );
         }
         let options = LlamaCppOptions {
@@ -223,10 +237,21 @@ impl LlamaCppEngine {
             n_ubatch,
             ..options
         };
+        let mut context_params = options.context_params();
+        if let Some(factor) = yarn {
+            // What llama.cpp's `--rope-scaling yarn --rope-scale F
+            // --yarn-orig-ctx N` sets; the extrapolation mix follows
+            // from the type (`yarn_ext_factor` stays "from model").
+            context_params.rope_scaling_type =
+                llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN;
+            context_params.rope_freq_scale = 1.0 / factor;
+            context_params.yarn_orig_ctx =
+                model.rope_original_context_size().unwrap_or(n_ctx_train);
+        }
         let mut engine = Self::with_model(
             path.clone(),
             model,
-            Some(options.context_params()),
+            Some(context_params),
             options.numa,
         )?;
         engine.set_checkpoint_budget(options.checkpoint_budget());
@@ -235,7 +260,10 @@ impl LlamaCppEngine {
             path = %path.display(),
             n_ctx = engine.n_ctx(),
             n_ctx_train,
-            source = if n_ctx.is_some() { "sidecar" } else { "default" },
+            window,
+            rope_scale = yarn,
+            n_ctx_option = options_n_ctx,
+            sidecar_n_ctx = n_ctx,
             n_ubatch = engine.n_ubatch(),
             n_ubatch_source,
             "serving with n_ctx {}, n_ubatch {}",

@@ -490,6 +490,31 @@ impl LlamaCppModel {
         }
     }
 
+    /// The window before the GGUF's own RoPE scaling
+    /// (`<arch>.rope.scaling.original_context_length`); `None` for a
+    /// model that ships unscaled. YaRN factors multiply this.
+    pub fn rope_original_context_size(&self) -> Option<u32> {
+        let arch = self.get_meta("general.architecture")?;
+        self.get_meta(
+            format!("{arch}.rope.scaling.original_context_length").as_str(),
+        )?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&n: &u32| n != 0)
+    }
+
+    /// The window this model attends over when loaded with a YaRN
+    /// `factor` (none: [`Self::context_size`]); `0` = unknown. See
+    /// [`crate::sidecar::n_ctx_window`].
+    pub fn n_ctx_window(&self, factor: Option<f32>) -> u32 {
+        crate::sidecar::n_ctx_window(
+            self.context_size().max(0) as u32,
+            self.rope_original_context_size(),
+            factor,
+        )
+    }
+
     /// Embedding size.
     pub fn embedding_size(&self) -> i32 {
         unsafe { llama_model_n_embd(self.0.inner) }

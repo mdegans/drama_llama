@@ -299,9 +299,27 @@ pub struct LlamaCppDecoder {
     /// [`Self::set_seq_snapshots`] (tests, or callers wanting rewind
     /// insurance on a dense model).
     checkpoints: Checkpoints,
+    /// The window YaRN stretched the model to (`yarn_orig_ctx /
+    /// rope_freq_scale`), when the context params turned it on. See
+    /// [`Decoder::n_ctx_window`].
+    yarn_window: Option<u32>,
 }
 
 unsafe impl Send for LlamaCppDecoder {}
+
+/// The window `params` stretch the model to with YaRN, if they turn it
+/// on with an explicit factor and original window.
+fn yarn_window(params: &llama_context_params) -> Option<u32> {
+    let yarn = params.rope_scaling_type
+        == llama_cpp_sys_3::llama_rope_scaling_type_LLAMA_ROPE_SCALING_TYPE_YARN;
+    (yarn && params.rope_freq_scale > 0.0 && params.yarn_orig_ctx > 0).then(
+        || {
+            (params.yarn_orig_ctx as f64 / params.rope_freq_scale as f64)
+                .round()
+                .min(u32::MAX as f64) as u32
+        },
+    )
+}
 
 impl LlamaCppDecoder {
     /// Create a decoder bound to `model` with the given context params.
@@ -376,6 +394,7 @@ impl LlamaCppDecoder {
 
         Ok(Self {
             context,
+            yarn_window: yarn_window(&context_params),
             n_vocab: model.n_vocab() as usize,
             embedding_size: model.embedding_size() as usize,
             // SAFETY: `model` is live for the call and this only reads
@@ -919,6 +938,10 @@ impl Decoder for LlamaCppDecoder {
 
     fn n_ctx(&self) -> u32 {
         LlamaCppDecoder::n_ctx(self)
+    }
+
+    fn n_ctx_window(&self) -> Option<u32> {
+        self.yarn_window
     }
 
     fn n_seq_max(&self) -> u32 {

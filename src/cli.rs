@@ -123,9 +123,10 @@ pub struct BackendArgs {
     #[arg(long, value_enum, default_value_t = default_backend_kind())]
     pub backend: BackendKind,
 
-    /// Max context length, in tokens: the default for every model. A
-    /// model's `<model>.load.toml` sidecar may set its own `n_ctx`
-    /// (capped at its trained window). llama-cpp only.
+    /// Max context length, in tokens, for every model. Each model gets
+    /// at most its own window, and its `<model>.load.toml` sidecar may
+    /// lower it further with `n_ctx` (or stretch the window with
+    /// `rope_scale`). llama-cpp only.
     // The one knob here with an eager default, so `--help` can show the
     // number rather than a vague "the backend's". That costs a little
     // precision: "unset" and "set to exactly `DEFAULT_N_CTX`" are
