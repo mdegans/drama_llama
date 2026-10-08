@@ -8,8 +8,8 @@
 //! (`<model>.template.jinja`, raw Jinja), the multimodal
 //! projector (`<model>.mmproj.gguf`, [`mmproj_path`] — enables image
 //! input under the `mtmd` feature), or load-time options
-//! (`<model>.load.toml`, [`LoadSidecar`] — the KV context size,
-//! micro-batch and RoPE scaling). [`crate::LlamaCppSession::from_path*`]
+//! (`<model>.load.toml`, [`LoadSidecar`] — the KV context size and
+//! cache type, micro-batch and RoPE scaling). [`crate::LlamaCppSession::from_path*`]
 //! looks for each when loading a model. For sampling, if no sidecar
 //! exists one is written so the user has a starting point to edit —
 //! seeded from the model's own recommendation where it has one (see
@@ -366,6 +366,84 @@ pub struct LoadSidecar {
     /// Small 4): those were trained *with* that factor. Values below
     /// `1.0`, or not finite, are ignored.
     pub rope_scale: Option<f32>,
+    /// The K cache's element type; beats `LlamaCppOptions::cache_type_k`
+    /// (`--cache-type-k`). See [`KvCacheType`].
+    pub cache_type_k: Option<KvCacheType>,
+    /// The V cache's element type; beats `LlamaCppOptions::cache_type_v`
+    /// (`--cache-type-v`). See [`KvCacheType`].
+    pub cache_type_v: Option<KvCacheType>,
+}
+
+/// An element type for the KV cache — llama.cpp's `--cache-type-k` /
+/// `--cache-type-v` set, named as llama.cpp names them (`q8_0`).
+///
+/// KV is what bounds a long context: a dense model at 128k holds as
+/// much cache as weights (cogito: 256 KiB per token at `f16`, 32 GiB).
+/// `q8_0` halves that and is close to lossless; `q4_0` quarters it at a
+/// measurable cost, more on K than on V. A quantized V cache needs
+/// Flash Attention: llama.cpp turns it on under the default
+/// [`FlashAttention::Auto`](crate::FlashAttention::Auto) and refuses
+/// the context if it is forced off.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[non_exhaustive]
+pub enum KvCacheType {
+    /// 32-bit float.
+    F32,
+    /// 16-bit float: llama.cpp's default.
+    F16,
+    /// bfloat16.
+    Bf16,
+    /// 8-bit blocks of 32: half of `f16`, close to lossless.
+    #[cfg_attr(feature = "cli", value(name = "q8_0"))]
+    #[serde(rename = "q8_0")]
+    Q8_0,
+    /// 4-bit blocks of 32.
+    #[cfg_attr(feature = "cli", value(name = "q4_0"))]
+    #[serde(rename = "q4_0")]
+    Q4_0,
+    /// 4-bit blocks of 32, with a minimum.
+    #[cfg_attr(feature = "cli", value(name = "q4_1"))]
+    #[serde(rename = "q4_1")]
+    Q4_1,
+    /// 4-bit non-linear blocks of 32.
+    #[cfg_attr(feature = "cli", value(name = "iq4_nl"))]
+    #[serde(rename = "iq4_nl")]
+    Iq4Nl,
+    /// 5-bit blocks of 32.
+    #[cfg_attr(feature = "cli", value(name = "q5_0"))]
+    #[serde(rename = "q5_0")]
+    Q5_0,
+    /// 5-bit blocks of 32, with a minimum.
+    #[cfg_attr(feature = "cli", value(name = "q5_1"))]
+    #[serde(rename = "q5_1")]
+    Q5_1,
+}
+
+impl KvCacheType {
+    /// The llama.cpp name (`q8_0`), as `--cache-type-k` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+            Self::Q8_0 => "q8_0",
+            Self::Q4_0 => "q4_0",
+            Self::Q4_1 => "q4_1",
+            Self::Iq4Nl => "iq4_nl",
+            Self::Q5_0 => "q5_0",
+            Self::Q5_1 => "q5_1",
+        }
+    }
+}
+
+impl std::fmt::Display for KvCacheType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 impl LoadSidecar {
@@ -720,6 +798,15 @@ mod tests {
         let sidecar = load_load_options(&path).unwrap().expect("written");
         assert_eq!(sidecar.rope_scale, Some(4.0), "an integer factor");
 
+        std::fs::write(
+            &path,
+            "cache_type_k = \"q8_0\"\ncache_type_v = \"iq4_nl\"",
+        )
+        .unwrap();
+        let sidecar = load_load_options(&path).unwrap().expect("written");
+        assert_eq!(sidecar.cache_type_k, Some(KvCacheType::Q8_0));
+        assert_eq!(sidecar.cache_type_v, Some(KvCacheType::Iq4Nl));
+
         std::fs::write(&path, "").unwrap();
         let sidecar = load_load_options(&path).unwrap().expect("written");
         assert_eq!(sidecar, LoadSidecar::default());
@@ -733,6 +820,9 @@ mod tests {
             "n_ubatch = \"2k\"",
             "rope-scale = 4.0",
             "rope_scale = \"4x\"",
+            "cache_type_k = \"q8\"",
+            "cache_type_k = \"Q8_0\"",
+            "cache-type-v = \"q8_0\"",
         ] {
             std::fs::write(&path, bad).unwrap();
             assert!(
@@ -802,6 +892,24 @@ mod tests {
         assert_eq!(n_ctx_window(262144, Some(0), Some(2.0)), 524288);
         // Saturates instead of wrapping.
         assert_eq!(n_ctx_window(262144, None, Some(1e9)), u32::MAX);
+    }
+
+    /// Every KV cache type serializes as its llama.cpp name.
+    #[test]
+    fn kv_cache_type_names_match_llama_cpp() {
+        use KvCacheType::*;
+        // Exhaustive, so a new variant has to be named here.
+        let all = [F32, F16, Bf16, Q8_0, Q4_0, Q4_1, Iq4Nl, Q5_0, Q5_1];
+        for t in all {
+            match t {
+                F32 | F16 | Bf16 | Q8_0 | Q4_0 | Q4_1 | Iq4Nl | Q5_0 | Q5_1 => {
+                }
+            }
+            let json = serde_json::to_string(&t).unwrap();
+            assert_eq!(json, format!("\"{}\"", t.name()));
+            assert_eq!(serde_json::from_str::<KvCacheType>(&json).unwrap(), t);
+            assert_eq!(t.to_string(), t.name());
+        }
     }
 
     /// Only a finite factor of at least 1 turns YaRN on.

@@ -20,6 +20,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **KV cache types: `--cache-type-k` / `--cache-type-v`, and
+  `cache_type_k` / `cache_type_v` in `<model>.load.toml`** (which beat
+  the flags). llama.cpp's set and names (`f16`, `q8_0`, `q4_0`,
+  `iq4_nl`, …), as `KvCacheType` and `LlamaCppOptions::cache_type_*`.
+  `q8_0` halves the KV cache, which is what bounds a long context on a
+  dense model. A quantized V needs Flash Attention; llama.cpp turns it
+  on under the default `Auto` and refuses the context if it is forced
+  off.
 - **`rope_scale` in `<model>.load.toml`**: a YaRN factor over the
   model's original window (its GGUF's
   `rope.scaling.original_context_length`, else its context length).
@@ -28,6 +36,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   window. Opt-in per model: static YaRN costs some short-context
   quality, and a GGUF that ships scaling (gpt-oss, Mistral Small 4)
   was trained with its own factor.
+
+### Fixed
+
+- **A YaRN context over a shared model is refused**
+  (`NewError::SharedModel`). llama.cpp rewrites a model's trained
+  context when a context rescales it, so building one while another
+  handle reads the model would race; the load path holds the only
+  handle and is unaffected.
 
 ## [0.9.0] — 2026-10-05
 

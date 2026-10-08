@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mdegans/drama_llama/actions/workflows/ci.yml?query=branch%3Amain)
 [![codecov](https://codecov.io/gh/mdegans/drama_llama/graph/badge.svg)](https://codecov.io/gh/mdegans/drama_llama)
-[![tests](https://img.shields.io/badge/tests-1175-blue)](#testing)
+[![tests](https://img.shields.io/badge/tests-1179-blue)](#testing)
 [![license](https://img.shields.io/badge/license-RAIL--S-lightgrey)](https://github.com/mdegans/drama_llama/blob/main/LICENSE.md)
 
 `drama_llama` runs language models on your own hardware behind an API shaped
@@ -306,6 +306,7 @@ before an error is returned.
 | `--n-ctx` | 32768 | Maximum context length for every model, capped at each model's window; a `load.toml` sidecar can lower it. |
 | `--cache-slots` | 1 | KV sequences over one cell pool: one cached prefix per concurrent agent. |
 | `--swa-full` | off | Size sliding-window layers' KV at the full context instead of the window. |
+| `--cache-type-k` / `--cache-type-v` | f16 | KV cache element types, as llama.cpp names them: `q8_0` halves the cache; a quantized V needs Flash Attention (on by default). |
 | `--checkpoint-mib` / `--checkpoint-slot-mib` | 8192 / 4096 | Host RAM the prefix-cache checkpoints may hold, in all and per slot. |
 | `--default-model` | none | Serve this model when a request names one that isn't on disk (e.g. a `claude-*` id). |
 | `--seed` | fresh | Fixed RNG seed for every request: same prompt, same output. |
@@ -323,7 +324,7 @@ sidecar that does not read or parse is logged and ignored.
 | File | |
 |---|---|
 | `<model>.sampling.toml` | Sampling defaults: the mode chain, the repetition penalty, the tool-call cap. Written on first load, seeded from the model's own recommended sampling where it has one; never overwritten. |
-| `<model>.load.toml` | Load-time options: `n_ctx` (at most `--n-ctx` and the model's window), `n_ubatch`, and `rope_scale` (YaRN over the original window, stretching it). Never written; unknown keys are an error. |
+| `<model>.load.toml` | Load-time options: `n_ctx` (at most `--n-ctx` and the model's window), `n_ubatch`, `rope_scale` (YaRN over the original window, stretching it), and `cache_type_k` / `cache_type_v` (beat the flags). Never written; unknown keys are an error. |
 | `<model>.template.jinja` | Replaces the chat template outright. |
 | `<model>.dialect.toml` | Overrides the tool-call dialect derived from the template. |
 | `<model>.mmproj.gguf` | The vision projector: image input, with the `mtmd` feature. |
@@ -364,6 +365,8 @@ surgical = true
 # Mistral-Small-4-119B-2603-UD-Q4_K_XL.load.toml, under --n-ctx 262144
 n_ctx = 131072   # this model's own context, below --n-ctx (window: 1M)
 n_ubatch = 2048  # llama.cpp's micro-batch (default 512)
+cache_type_k = "q8_0"  # KV cache element types (default f16)
+cache_type_v = "q8_0"
 # rope_scale = 4 # YaRN factor; for a model trained unscaled (Qwen3.5+:
 #                # 262144 → 1M). Not for one whose GGUF ships scaling.
 ```
@@ -372,8 +375,8 @@ n_ubatch = 2048  # llama.cpp's micro-batch (default 512)
 
 ## Testing
 
-1175 tests across 33 binaries in the default configuration — 985 that run in
-seconds and 190 that load real weights onto a real accelerator. The
+1179 tests across 33 binaries in the default configuration — 988 that run in
+seconds and 191 that load real weights onto a real accelerator. The
 model-backed tier is `#[ignore]`d so the fast loop stays fast, and the whole
 topology — *which features* × *which tests* — lives in one place,
 [`scripts/test.py`]. The justfile delegates to that script, the git hooks call

@@ -164,10 +164,11 @@ impl LlamaCppEngine {
     /// [`Self::from_path_with`], with a model's load sidecar: the
     /// served context is the smallest of `options.n_ctx`, its `n_ctx`
     /// and the model's window (known only after the model loads, hence
-    /// here; stretched by its `rope_scale`), and its `n_ubatch` fills an
-    /// unset `options.n_ubatch`. See [`crate::sidecar::effective_n_ctx`]
-    /// and [`crate::sidecar::effective_n_ubatch`]. Logs the context and
-    /// micro-batch the model is served with.
+    /// here; stretched by its `rope_scale`), its cache types beat
+    /// those in `options`, and its `n_ubatch` fills an unset
+    /// `options.n_ubatch`. See [`crate::sidecar::effective_n_ctx`] and
+    /// [`crate::sidecar::effective_n_ubatch`]. Logs the context, cache
+    /// types and micro-batch the model is served with.
     pub(crate) fn from_path_with_load_sidecar(
         path: PathBuf,
         options: LlamaCppOptions,
@@ -202,6 +203,8 @@ impl LlamaCppEngine {
         }
         let options = LlamaCppOptions {
             n_ctx: effective,
+            cache_type_k: sidecar.cache_type_k.or(options.cache_type_k),
+            cache_type_v: sidecar.cache_type_v.or(options.cache_type_v),
             ..options
         };
         let n_batch = options.context_params().n_batch;
@@ -266,6 +269,8 @@ impl LlamaCppEngine {
             sidecar_n_ctx = n_ctx,
             n_ubatch = engine.n_ubatch(),
             n_ubatch_source,
+            cache_type_k = %options.cache_type_k.map_or("f16", |t| t.name()),
+            cache_type_v = %options.cache_type_v.map_or("f16", |t| t.name()),
             "serving with n_ctx {}, n_ubatch {}",
             engine.n_ctx(),
             engine.n_ubatch(),
@@ -623,6 +628,24 @@ mod tests {
         let mut opts = crate::PredictOptions::greedy();
         opts.n = std::num::NonZeroUsize::new(1).unwrap();
         engine.predict_pieces(tokens, opts, None).collect()
+    }
+
+    /// Quantized KV caches load (a quantized V turns Flash Attention
+    /// on under `Auto`) and agree with `f16` on an easy greedy token.
+    #[test]
+    #[ignore = "requires models/model.gguf"]
+    fn load_sidecar_cache_types_reach_the_context() {
+        use crate::sidecar::{KvCacheType::*, LoadSidecar};
+        let f16 = first_piece(LoadSidecar::default());
+        assert!(f16.contains("Paris"), "{f16:?}");
+        for (k, v) in [(Q8_0, Q8_0), (Q8_0, Q4_0), (Q4_0, Q4_0)] {
+            let piece = first_piece(LoadSidecar {
+                cache_type_k: Some(k),
+                cache_type_v: Some(v),
+                ..Default::default()
+            });
+            assert_eq!(piece, f16, "K {k}, V {v}");
+        }
     }
 
     /// A `rope_scale` sidecar turns YaRN on: the decoder reports the

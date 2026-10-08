@@ -162,6 +162,18 @@ pub struct BackendArgs {
     #[arg(long)]
     pub checkpoint_slot_mib: Option<u32>,
 
+    /// KV cache element type for K, as llama.cpp names it (`q8_0`
+    /// halves the cache). Default f16; a model's `load.toml` may set
+    /// its own. llama-cpp only.
+    #[arg(long, value_enum)]
+    pub cache_type_k: Option<crate::KvCacheType>,
+
+    /// KV cache element type for V; a quantized V needs Flash
+    /// Attention (on by default). Default f16; a model's `load.toml`
+    /// may set its own. llama-cpp only.
+    #[arg(long, value_enum)]
+    pub cache_type_v: Option<crate::KvCacheType>,
+
     /// Read the experts as the 2-bit packed layout. moeflux only.
     #[arg(long)]
     pub use_2bit: bool,
@@ -180,6 +192,8 @@ impl Default for BackendArgs {
             swa_full: false,
             checkpoint_mib: None,
             checkpoint_slot_mib: None,
+            cache_type_k: None,
+            cache_type_v: None,
             use_2bit: false,
         }
     }
@@ -223,6 +237,8 @@ impl TryFrom<&BackendArgs> for crate::LlamaCppOptions {
             swa_full: args.swa_full.then_some(true),
             checkpoint_mib: args.checkpoint_mib,
             checkpoint_slot_mib: args.checkpoint_slot_mib,
+            cache_type_k: args.cache_type_k,
+            cache_type_v: args.cache_type_v,
             ..Self::default()
         })
     }
@@ -256,6 +272,12 @@ impl TryFrom<&BackendArgs> for crate::MoefluxOptions {
         if args.checkpoint_slot_mib.is_some() {
             flags.push("--checkpoint-slot-mib");
         }
+        if args.cache_type_k.is_some() {
+            flags.push("--cache-type-k");
+        }
+        if args.cache_type_v.is_some() {
+            flags.push("--cache-type-v");
+        }
         if !flags.is_empty() {
             return Err(UnsupportedOptions {
                 backend: <crate::MoefluxBackend as crate::Backend>::NAME,
@@ -280,6 +302,8 @@ mod tests {
             swa_full: false,
             checkpoint_mib: None,
             checkpoint_slot_mib: None,
+            cache_type_k: None,
+            cache_type_v: None,
             use_2bit: false,
         }
     }
@@ -309,9 +333,13 @@ mod tests {
             swa_full: true,
             checkpoint_mib: Some(2048),
             checkpoint_slot_mib: Some(512),
+            cache_type_k: Some(crate::KvCacheType::Q8_0),
+            cache_type_v: Some(crate::KvCacheType::Q4_0),
             ..args()
         })
         .expect("all are llama.cpp knobs");
+        assert_eq!(opts.cache_type_k, Some(crate::KvCacheType::Q8_0));
+        assert_eq!(opts.cache_type_v, Some(crate::KvCacheType::Q4_0));
         assert_eq!(opts.n_ctx, Some(4096));
         assert_eq!(opts.cache_slots, Some(3));
         assert_eq!(opts.swa_full, Some(true));
@@ -329,6 +357,30 @@ mod tests {
         })
         .expect_err("2-bit experts are a moeflux concept");
         assert_eq!(err.flags, ["--use-2bit"]);
+    }
+
+    /// The cache-type flags take llama.cpp's names.
+    #[test]
+    fn cache_type_flags_take_llama_cpp_names() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            backend: BackendArgs,
+        }
+        let cli = Cli::try_parse_from([
+            "blallama",
+            "--cache-type-k",
+            "q8_0",
+            "--cache-type-v",
+            "iq4_nl",
+        ])
+        .unwrap();
+        assert_eq!(cli.backend.cache_type_k, Some(crate::KvCacheType::Q8_0));
+        assert_eq!(cli.backend.cache_type_v, Some(crate::KvCacheType::Iq4Nl));
+        assert!(
+            Cli::try_parse_from(["blallama", "--cache-type-k", "q8"]).is_err()
+        );
     }
 
     /// The whole point of failing fast: a context size the backend
@@ -368,6 +420,15 @@ mod tests {
                 ..args()
             },
             &["--checkpoint-mib", "--checkpoint-slot-mib"],
+        );
+        // No llama.cpp KV cache.
+        refused(
+            BackendArgs {
+                cache_type_k: Some(crate::KvCacheType::Q8_0),
+                cache_type_v: Some(crate::KvCacheType::Q8_0),
+                ..args()
+            },
+            &["--cache-type-k", "--cache-type-v"],
         );
     }
 }

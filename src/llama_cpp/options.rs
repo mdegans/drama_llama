@@ -23,7 +23,10 @@ use llama_cpp_sys_3::{
     llama_context_params, llama_model_default_params, llama_model_params,
 };
 
-use crate::llama_cpp::{CheckpointBudget, FlashAttention, LlamaCppEngine};
+use crate::{
+    llama_cpp::{CheckpointBudget, FlashAttention, LlamaCppEngine},
+    sidecar::KvCacheType,
+};
 
 /// Load-time configuration for [`LlamaCppEngine`] and
 /// [`Session<LlamaCppBackend>`](crate::Session).
@@ -113,6 +116,18 @@ pub struct LlamaCppOptions {
     #[cfg_attr(feature = "cli", arg(long))]
     pub swa_full: Option<bool>,
 
+    /// The K cache's element type. `None` inherits llama.cpp's `f16`;
+    /// a `<model>.load.toml`'s `cache_type_k` beats it. See
+    /// [`KvCacheType`].
+    #[cfg_attr(feature = "cli", arg(long, value_enum))]
+    pub cache_type_k: Option<KvCacheType>,
+
+    /// The V cache's element type. `None` inherits llama.cpp's `f16`;
+    /// a `<model>.load.toml`'s `cache_type_v` beats it. A quantized V
+    /// cache needs Flash Attention. See [`KvCacheType`].
+    #[cfg_attr(feature = "cli", arg(long, value_enum))]
+    pub cache_type_v: Option<KvCacheType>,
+
     /// Host RAM, in MiB, the prefix-cache checkpoints of every sequence
     /// may hold together (sliding-window and recurrent / hybrid
     /// models). `None` means
@@ -165,6 +180,13 @@ impl LlamaCppOptions {
     /// correctness escape hatch as much as a perf knob.
     pub fn with_n_ubatch(mut self, n_ubatch: u32) -> Self {
         self.n_ubatch = Some(n_ubatch);
+        self
+    }
+
+    /// Set the K and V cache element types. See [`Self::cache_type_k`].
+    pub fn with_cache_types(mut self, k: KvCacheType, v: KvCacheType) -> Self {
+        self.cache_type_k = Some(k);
+        self.cache_type_v = Some(v);
         self
     }
 
@@ -237,6 +259,12 @@ impl LlamaCppOptions {
             cp.flash_attn_type = fa.as_raw();
         }
         cp.swa_full = self.swa_full.unwrap_or(false);
+        if let Some(k) = self.cache_type_k {
+            cp.type_k = ggml_type(k);
+        }
+        if let Some(v) = self.cache_type_v {
+            cp.type_v = ggml_type(v);
+        }
         // Applied last so an explicit micro-batch wins over the
         // `n_ctx` clamp above — the whole point of the knob is to force
         // a *small* ubatch under a large context.
@@ -244,6 +272,22 @@ impl LlamaCppOptions {
             cp.n_ubatch = n_ubatch.max(1);
         }
         cp
+    }
+}
+
+/// `t` as llama.cpp's `ggml_type`.
+fn ggml_type(t: KvCacheType) -> llama_cpp_sys_3::ggml_type {
+    use llama_cpp_sys_3::*;
+    match t {
+        KvCacheType::F32 => ggml_type_GGML_TYPE_F32,
+        KvCacheType::F16 => ggml_type_GGML_TYPE_F16,
+        KvCacheType::Bf16 => ggml_type_GGML_TYPE_BF16,
+        KvCacheType::Q8_0 => ggml_type_GGML_TYPE_Q8_0,
+        KvCacheType::Q4_0 => ggml_type_GGML_TYPE_Q4_0,
+        KvCacheType::Q4_1 => ggml_type_GGML_TYPE_Q4_1,
+        KvCacheType::Iq4Nl => ggml_type_GGML_TYPE_IQ4_NL,
+        KvCacheType::Q5_0 => ggml_type_GGML_TYPE_Q5_0,
+        KvCacheType::Q5_1 => ggml_type_GGML_TYPE_Q5_1,
     }
 }
 
@@ -335,6 +379,34 @@ mod tests {
                 .checkpoint_budget(),
             CheckpointBudget::new(1 << 30, 256 << 20),
         );
+    }
+
+    /// Each cache type maps to the `ggml_type` llama.cpp names the
+    /// same, and reaches the context params only when set.
+    #[test]
+    fn cache_types_map_to_ggml() {
+        use KvCacheType::*;
+        for t in [F32, F16, Bf16, Q8_0, Q4_0, Q4_1, Iq4Nl, Q5_0, Q5_1] {
+            // SAFETY: `ggml_type_name` reads a static table and
+            // returns a static NUL-terminated string.
+            let name = unsafe {
+                std::ffi::CStr::from_ptr(llama_cpp_sys_3::ggml_type_name(
+                    ggml_type(t),
+                ))
+            };
+            assert_eq!(name.to_str().unwrap(), t.name());
+        }
+        let default = LlamaCppEngine::default_context_params();
+        let unset = LlamaCppOptions::default().context_params();
+        assert_eq!(
+            (unset.type_k, unset.type_v),
+            (default.type_k, default.type_v)
+        );
+        let set = LlamaCppOptions::default()
+            .with_cache_types(Q8_0, Q4_0)
+            .context_params();
+        assert_eq!(set.type_k, ggml_type(Q8_0));
+        assert_eq!(set.type_v, ggml_type(Q4_0));
     }
 
     #[test]
