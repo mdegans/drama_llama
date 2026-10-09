@@ -102,6 +102,11 @@ struct Cli {
     /// loaded file minus `.json` (or `chat` for a fresh chat).
     #[arg(long, value_name = "BASE", num_args = 0..=1)]
     dump: Option<Option<PathBuf>>,
+    /// Print the last N messages of a loaded transcript before the first
+    /// prompt (thinking and tool calls included). Mind the count: an
+    /// Agora agent's private memory rides in the opening message.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    recap: usize,
     /// Strip the loaded prompt's tools and forced tool choice — a
     /// prose-only interview.
     #[arg(long)]
@@ -239,6 +244,9 @@ async fn main() -> Result<(), BoxError> {
     if let Some(choice) = &cli.tool_choice {
         println!("  tool choice → {}", describe_choice(choice));
     }
+    if cli.load.is_some() {
+        recap(&prompt, cli.recap);
+    }
 
     // Drive the interview, then tear the sandbox down even on the error
     // path — it is a running container, not memory.
@@ -332,6 +340,20 @@ fn describe_choice(choice: &tool::Choice) -> String {
         tool::Choice::Any { .. } => "any (must call a tool)".into(),
         tool::Choice::None => "none (calls forbidden, defs kept)".into(),
         tool::Choice::Method { name, .. } => format!("must call {name}"),
+    }
+}
+
+/// Print the last `n` messages of `prompt`, thinking and tool calls
+/// included.
+fn recap(prompt: &Prompt, n: usize) {
+    use misanthropic::markdown::ToMarkdown;
+
+    let start = prompt.messages.len().saturating_sub(n);
+    for message in &prompt.messages[start..] {
+        println!("── {:?} ──\n{}", message.role, message.markdown_verbose());
+    }
+    if n > 0 {
+        println!("── end of recap ──");
     }
 }
 
