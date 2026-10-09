@@ -107,6 +107,10 @@ struct Cli {
     /// Agora agent's private memory rides in the opening message.
     #[arg(long, value_name = "N", default_value_t = 1)]
     recap: usize,
+    /// Print the model's thinking, live and in the recap. Hidden by
+    /// default; it is seated in the transcript either way.
+    #[arg(long)]
+    show_thinking: bool,
     /// Strip the loaded prompt's tools and forced tool choice — a
     /// prose-only interview.
     #[arg(long)]
@@ -245,7 +249,7 @@ async fn main() -> Result<(), BoxError> {
         println!("  tool choice → {}", describe_choice(choice));
     }
     if cli.load.is_some() {
-        recap(&prompt, cli.recap);
+        recap(&prompt, cli.recap, cli.show_thinking);
     }
 
     // Drive the interview, then tear the sandbox down even on the error
@@ -343,14 +347,19 @@ fn describe_choice(choice: &tool::Choice) -> String {
     }
 }
 
-/// Print the last `n` messages of `prompt`, thinking and tool calls
-/// included.
-fn recap(prompt: &Prompt, n: usize) {
+/// Print the last `n` messages of `prompt`, tool calls included and
+/// thinking only if asked for.
+fn recap(prompt: &Prompt, n: usize, show_thinking: bool) {
     use misanthropic::markdown::ToMarkdown;
 
     let start = prompt.messages.len().saturating_sub(n);
     for message in &prompt.messages[start..] {
-        println!("── {:?} ──\n{}", message.role, message.markdown_verbose());
+        println!("── {:?} ──", message.role);
+        for block in message.content.iter() {
+            if show_thinking || !matches!(block, Block::Thought { .. }) {
+                println!("{}", block.markdown_verbose());
+            }
+        }
     }
     if n > 0 {
         println!("── end of recap ──");
@@ -455,7 +464,9 @@ async fn drive(
                     }
                     None => match block {
                         Block::Thought { thought, .. } => {
-                            println!("thought ▸ {thought}")
+                            if cli.show_thinking {
+                                println!("thought ▸ {thought}")
+                            }
                         }
                         _ => println!("claude ▸ {block}"),
                     },
