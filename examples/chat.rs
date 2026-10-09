@@ -19,6 +19,16 @@
 //!     --load council_prompts/jester.json
 //! ```
 //!
+//! ## Which model
+//!
+//! A loaded prompt names the model it ran on (`"model": "<file>.gguf"`),
+//! and that is what loads — resolved as a bare name under `--models-dir`
+//! (required for this), the way blallama's catalog resolves a request, so
+//! the model's sidecars apply exactly as they did live. An interview on
+//! the wrong weights is an interview with somebody else. An explicit
+//! `--model` still wins (an agent may have changed weights since the
+//! transcript was dumped); a mismatch is announced, not refused.
+//!
 //! ## Tool policy
 //!
 //! A loaded prompt's tools are **kept**, schemas and all: pruning them
@@ -49,9 +59,13 @@
 
 mod utils;
 
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use clap::{CommandFactory, FromArgMatches, Parser};
+use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser};
 use misanthropic::{
     prompt::message::{Block, CacheControl, Content, Role},
     response::TokenCounts,
@@ -74,9 +88,20 @@ struct Cli {
     common: utils::CommonArgs,
     #[command(flatten)]
     chat: utils::ChatArgs,
-    /// Reseat a prompt dumped to JSON (e.g. by `council --dump`).
+    /// Reseat a prompt dumped to JSON (e.g. by `council --dump`). Loads
+    /// the model the prompt names unless `--model` is given.
     #[arg(long)]
     load: Option<PathBuf>,
+    /// Where a loaded prompt's `model` is looked up. Required with
+    /// `--load` unless `--model` is given.
+    #[arg(long)]
+    models_dir: Option<PathBuf>,
+    /// Save the prompt as `BASE.<timestamp>.json` after every exchange,
+    /// overwriting it each time — the transcript so far, prefix and tool
+    /// schemas intact, ready to `--load` again. BASE defaults to the
+    /// loaded file minus `.json` (or `chat` for a fresh chat).
+    #[arg(long, value_name = "BASE", num_args = 0..=1)]
+    dump: Option<Option<PathBuf>>,
     /// Strip the loaded prompt's tools and forced tool choice — a
     /// prose-only interview.
     #[arg(long)]
@@ -114,11 +139,16 @@ async fn main() -> Result<(), BoxError> {
     // judge's record alone can pass 9k tokens), so mirror the council's
     // `--n-ctx` default rather than the shared 8192. `mut_arg` so
     // `--help` prints the default that will actually be used.
-    let cli = Cli::from_arg_matches(
-        &Cli::command()
-            .mut_arg("n_ctx", |a| a.default_value("32768"))
-            .get_matches(),
-    )?;
+    let matches = Cli::command()
+        .mut_arg("n_ctx", |a| a.default_value("32768"))
+        .get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    // Whether `--model` was typed, as opposed to defaulted: only a typed
+    // one overrides the model a loaded prompt names.
+    let model_explicit = !matches!(
+        matches.value_source("model"),
+        Some(ValueSource::DefaultValue) | None
+    );
     utils::log_init(cli.common.verbose);
 
     // ── The prompt: fresh, or a reseated transcript ──────────────
@@ -132,6 +162,23 @@ async fn main() -> Result<(), BoxError> {
         None => Prompt::default()
             .system("You are a helpful assistant. Keep replies concise."),
     };
+    if cli.load.is_some() {
+        if model_explicit {
+            let recorded = prompt.model.to_string();
+            if cli.common.model.file_name() != Some(recorded.as_ref()) {
+                println!(
+                    "(prompt was recorded on {}; --model overrides)",
+                    prompt.model
+                );
+            }
+        } else {
+            let dir = cli.models_dir.as_deref().ok_or(
+                "the loaded prompt names its model; pass --models-dir to \
+                 find it there, or --model to choose one",
+            )?;
+            cli.common.model = prompt_model_path(dir, &prompt)?;
+        }
+    }
     prompt = cli.common.configure(prompt);
     if cli.clear_tools {
         prompt.tools = None;
@@ -175,9 +222,10 @@ async fn main() -> Result<(), BoxError> {
 
     match &cli.load {
         Some(path) => println!(
-            "chat — reseated {} ({} message(s), {} tool method(s){}). \
+            "chat — reseated {} on {} ({} message(s), {} tool method(s){}). \
              Ctrl-D exits.",
             path.display(),
+            cli.common.model.display(),
             prompt.messages.len(),
             prompt.tools.as_deref().unwrap_or_default().len(),
             if forced(&prompt) {
@@ -211,6 +259,53 @@ async fn main() -> Result<(), BoxError> {
     }
     println!("\nsession totals — {}", pay_line(&total));
     outcome
+}
+
+/// Where `--dump` writes: `BASE.<timestamp>.json`, the timestamp fixed
+/// at startup so one session is one file.
+fn dump_path(cli: &Cli) -> Option<PathBuf> {
+    let base = match cli.dump.as_ref()? {
+        Some(base) => base.clone(),
+        None => match &cli.load {
+            Some(load) => load.with_extension(""),
+            None => PathBuf::from("chat"),
+        },
+    };
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let mut name = base.into_os_string();
+    name.push(format!(".{stamp}.json"));
+    Some(name.into())
+}
+
+/// Write `prompt` to `path`, if dumping.
+async fn dump(path: Option<&Path>, prompt: &Prompt) -> Result<(), BoxError> {
+    if let Some(path) = path {
+        tokio::fs::write(path, serde_json::to_string_pretty(prompt)?).await?;
+    }
+    Ok(())
+}
+
+/// The model a loaded `prompt` names, under `dir`. The name must be a
+/// bare entry name — a prompt file is input, and `..` must not walk out
+/// of `dir` — and must exist, so a stale name fails here with a hint
+/// rather than deep in the backend.
+fn prompt_model_path(dir: &Path, prompt: &Prompt) -> Result<PathBuf, String> {
+    let name = prompt.model.to_string();
+    if Path::new(&name).file_name() != Some(name.as_ref()) {
+        return Err(format!(
+            "the prompt's model {name:?} is not a bare file name; \
+             pass --model to choose one"
+        ));
+    }
+    let path = dir.join(&name);
+    match path.exists() {
+        true => Ok(path),
+        false => Err(format!(
+            "the prompt's model {name:?} is not in {}; pass --models-dir, \
+             or --model to interview on other weights",
+            dir.display()
+        )),
+    }
 }
 
 /// Parse `--tool-choice`: `auto`, `any`, `none`, or `method:NAME`.
@@ -260,6 +355,10 @@ async fn drive(
 ) -> Result<(), BoxError> {
     let max_rounds = cli.chat.max_tool_calls.unwrap_or(8);
     let forced = forced(prompt);
+    let dump_to = dump_path(cli);
+    if let Some(path) = &dump_to {
+        println!("(saving the transcript to {} each turn)", path.display());
+    }
     // `Prompt::seat`'s pending-system buffer. Nothing here seats system
     // content, but the buffer keeps the call sites uniform.
     let mut pending = None;
@@ -319,8 +418,8 @@ async fn drive(
             let message = transport.send(prompt).await?;
             *total += message.usage.counts;
 
-            // Echo every block in order: prose as prose, tool calls as
-            // pretty-printed JSON.
+            // Echo every block in order: thoughts and prose labelled
+            // apart, tool calls as pretty-printed JSON.
             let mut calls: Vec<Use> = Vec::new();
             for block in message.inner.content.iter() {
                 match block.tool_use() {
@@ -332,7 +431,12 @@ async fn drive(
                         );
                         calls.push(call.clone());
                     }
-                    None => println!("claude ▸ {block}"),
+                    None => match block {
+                        Block::Thought { thought, .. } => {
+                            println!("thought ▸ {thought}")
+                        }
+                        _ => println!("claude ▸ {block}"),
+                    },
                 }
             }
             println!("  [{}]", pay_line(&message.usage.counts));
@@ -352,8 +456,16 @@ async fn drive(
             }
             // Rolling assistant-tail breakpoint — the render the
             // session's prefix cache keys on. One-hour TTL: an
-            // interviewer thinks longer than the 5-minute sweep.
-            prompt.cache_windowed_with(2, CacheControl::one_hour());
+            // interviewer thinks longer than the 5-minute sweep — unless
+            // the reseated prompt already carries 5-minute markers, which
+            // a 1-hour one may not follow; then the default TTL.
+            if prompt
+                .cache_windowed_with(2, CacheControl::one_hour())
+                .is_err()
+            {
+                prompt.cache_windowed(2);
+            }
+            dump(dump_to.as_deref(), prompt).await?;
 
             if calls.is_empty() {
                 break;
@@ -382,6 +494,7 @@ async fn drive(
                 results.push(Block::from(result));
             }
             prompt.seat((Role::User, Content(results)), &mut pending)?;
+            dump(dump_to.as_deref(), prompt).await?;
 
             rounds += 1;
             if forced {
