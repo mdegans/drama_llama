@@ -34,8 +34,8 @@
 //! A loaded prompt's tools are **kept**, schemas and all: pruning them
 //! would prune exactly the context an interview is for ("is this
 //! description confusing?") and would shift the rendered prefix away from
-//! what the agent actually saw. Every tool call the model makes is
-//! printed. Only bash (below) executes; anything else is *caught* —
+//! what the agent actually saw. Tool calls and their results print with
+//! `--print-tool-calls`. Only bash (below) executes; anything else is *caught* —
 //! answered with a stub receipt naming this as an interview — so the
 //! transcript stays wire-legal and you can say "go ahead, try the tool"
 //! and debug interactively. A forced `tool_choice` (council seats) is
@@ -111,6 +111,10 @@ struct Cli {
     /// default; it is seated in the transcript either way.
     #[arg(long)]
     show_thinking: bool,
+    /// Print tool calls and their results, live and in the recap. Hidden
+    /// by default; they are answered and seated either way.
+    #[arg(long)]
+    print_tool_calls: bool,
     /// Strip the loaded prompt's tools and forced tool choice — a
     /// prose-only interview.
     #[arg(long)]
@@ -249,7 +253,7 @@ async fn main() -> Result<(), BoxError> {
         println!("  tool choice → {}", describe_choice(choice));
     }
     if cli.load.is_some() {
-        recap(&prompt, cli.recap, cli.show_thinking);
+        recap(&prompt, &cli);
     }
 
     // Drive the interview, then tear the sandbox down even on the error
@@ -347,21 +351,36 @@ fn describe_choice(choice: &tool::Choice) -> String {
     }
 }
 
-/// Print the last `n` messages of `prompt`, tool calls included and
-/// thinking only if asked for.
-fn recap(prompt: &Prompt, n: usize, show_thinking: bool) {
+/// Whether `block` is printed, per `--show-thinking` and
+/// `--print-tool-calls`.
+fn shown(cli: &Cli, block: &Block) -> bool {
+    match block {
+        Block::Thought { .. } => cli.show_thinking,
+        Block::ToolUse { .. } | Block::ToolResult { .. } => {
+            cli.print_tool_calls
+        }
+        _ => true,
+    }
+}
+
+/// Print the last `--recap` messages of `prompt`, minus what [`shown`]
+/// hides. A message with nothing left to show is skipped whole.
+fn recap(prompt: &Prompt, cli: &Cli) {
     use misanthropic::markdown::ToMarkdown;
 
-    let start = prompt.messages.len().saturating_sub(n);
+    let start = prompt.messages.len().saturating_sub(cli.recap);
     for message in &prompt.messages[start..] {
+        let blocks: Vec<&Block> =
+            message.content.iter().filter(|b| shown(cli, b)).collect();
+        if blocks.is_empty() {
+            continue;
+        }
         println!("── {:?} ──", message.role);
-        for block in message.content.iter() {
-            if show_thinking || !matches!(block, Block::Thought { .. }) {
-                println!("{}", block.markdown_verbose());
-            }
+        for block in blocks {
+            println!("{}", block.markdown_verbose());
         }
     }
-    if n > 0 {
+    if cli.recap > 0 {
         println!("── end of recap ──");
     }
 }
@@ -455,18 +474,19 @@ async fn drive(
             for block in message.inner.content.iter() {
                 match block.tool_use() {
                     Some(call) => {
-                        println!(
-                            "⚙ {} {}",
-                            call.name,
-                            serde_json::to_string_pretty(&call.input)?,
-                        );
+                        if cli.print_tool_calls {
+                            println!(
+                                "tool ▸ {} {}",
+                                call.name,
+                                serde_json::to_string_pretty(&call.input)?,
+                            );
+                        }
                         calls.push(call.clone());
                     }
+                    None if !shown(cli, block) => {}
                     None => match block {
                         Block::Thought { thought, .. } => {
-                            if cli.show_thinking {
-                                println!("thought ▸ {thought}")
-                            }
+                            println!("thought ▸ {thought}")
                         }
                         _ => println!("claude ▸ {block}"),
                     },
@@ -505,22 +525,26 @@ async fn drive(
             }
 
             // Answer every call: bash runs for real, the rest are
-            // caught — printed above, receipted here — so the
+            // caught — receipted here — so the
             // transcript stays wire-legal.
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
                 let result = match &mut bash {
                     Some(bash) if bash_methods.contains(call.name.as_ref()) => {
                         let result = bash.call(call).await;
-                        println!(
-                            "⚙ bash{} ▸ {}",
-                            if result.is_error { " ✗" } else { "" },
-                            result.content,
-                        );
+                        if cli.print_tool_calls {
+                            println!(
+                                "tool ▸ bash{} result: {}",
+                                if result.is_error { " ✗" } else { "" },
+                                result.content,
+                            );
+                        }
                         result
                     }
                     _ => {
-                        println!("  (caught — receipt seated)");
+                        if cli.print_tool_calls {
+                            println!("tool ▸ caught — receipt seated");
+                        }
                         tool::Result::new(call.id, CAUGHT)
                     }
                 };
