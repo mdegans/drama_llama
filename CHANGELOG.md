@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`TopKEntry` moved to `candidates` and gained `p: Option<f32>`.**
+  The same row type now serves `Session::top_k_trace` (post-grammar,
+  `p: None`) and the probe stream (`p` the pre-everything softmax). It
+  serializes its id as `"id"`, the key the probe stream always used.
+  `drama_llama::TopKEntry` is still exported at the crate root and from
+  `session`. `SnapshotOpts` gained `decode_pieces` (default `false`), so
+  struct literals need the field.
+
 - **`--n-ctx` is now a ceiling, capped at each model's window.** The
   served context is the smallest of `--n-ctx`, a `load.toml`'s
   `n_ctx` and the model's window, so a sidecar can lower a model's
@@ -19,6 +27,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the others (e.g. Mistral Small 4, whose window is 1M).
 
 ### Added
+
+- **The `/probe` stream's top-K entries carry their decoded `piece`.**
+  Each entry of a snapshot's `top_k` is now `{"id", "logit", "p",
+  "piece"}`, so a consumer can tell what a candidate id spells without
+  the model's vocab (the alignment canary reads the mass on the rating
+  digits by piece, not by tokenizer-specific id). Opt-in per hook with
+  `SnapshotOpts::decode_pieces`; blallama's stream turns it on. The
+  predictor decodes the kept candidates after capture (100
+  `token_to_piece` calls per token at blallama's top-K, only while a
+  hook asks), filling `Snapshot::pieces`; `Snapshot::entries()` gives
+  them as `TopKEntry` rows. Without pieces a snapshot serializes as
+  before.
 
 - **KV cache types: `--cache-type-k` / `--cache-type-v`, and
   `cache_type_k` / `cache_type_v` in `<model>.load.toml`** (which beat

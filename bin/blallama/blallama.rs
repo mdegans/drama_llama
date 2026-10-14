@@ -1279,13 +1279,17 @@ fn configure_session<B: Backend>(
 /// Default `SnapshotOpts` for the streaming recorder. top_k=100 with
 /// p_threshold=0 and entropy=true is the cross-validation suite's working
 /// set: refusal-class probes need tail-token visibility (high top_k, no
-/// threshold) and entropy is cheap when probes are infrequent. Override via
-/// `Args` if/when finer control is needed.
+/// threshold) and entropy is cheap when probes are infrequent. Pieces are
+/// decoded so a consumer can tell which top-K ids spell what (the canary
+/// reads the mass on the rating digits) without the model's vocab; that is
+/// 100 `token_to_piece` calls per token, small next to a decode step.
+/// Override via `Args` if/when finer control is needed.
 fn default_stream_opts() -> SnapshotOpts {
     SnapshotOpts {
         top_k: NonZeroUsize::new(100).unwrap(),
         p_threshold: 0.0,
         compute_entropy: true,
+        decode_pieces: true,
     }
 }
 
@@ -1546,6 +1550,7 @@ impl ProbeHook for FanOutHook {
                         p_threshold: prev.p_threshold.min(opts.p_threshold),
                         compute_entropy: prev.compute_entropy
                             || opts.compute_entropy,
+                        decode_pieces: prev.decode_pieces || opts.decode_pieces,
                     },
                 });
             }
@@ -2347,6 +2352,13 @@ mod tests {
         }
     }
 
+    /// The stream asks the predictor to decode top-K pieces, so `/probe`
+    /// consumers can read what each candidate id spells.
+    #[test]
+    fn stream_opts_decode_pieces() {
+        assert!(default_stream_opts().decode_pieces);
+    }
+
     #[test]
     fn fan_out_aggregates_snapshot_opts() {
         // No inner hook wants snapshot → None.
@@ -2360,6 +2372,7 @@ mod tests {
             top_k: NonZeroUsize::new(20).unwrap(),
             p_threshold: 0.005,
             compute_entropy: false,
+            decode_pieces: false,
         };
         let mut fan = FanOutHook { hooks: Vec::new() };
         fan.hooks.push(Box::new(OptsHook(None)));
@@ -2375,6 +2388,7 @@ mod tests {
             top_k: NonZeroUsize::new(100).unwrap(),
             p_threshold: 0.0,
             compute_entropy: true,
+            decode_pieces: false,
         };
         let mut fan = FanOutHook { hooks: Vec::new() };
         fan.hooks.push(Box::new(OptsHook(Some(opts_a.clone()))));
@@ -2397,6 +2411,7 @@ mod tests {
             top_k: NonZeroUsize::new(50).unwrap(),
             p_threshold: 0.001,
             compute_entropy: false,
+            decode_pieces: false,
         };
         let recorder = StreamingProbeRecorder {
             bus,

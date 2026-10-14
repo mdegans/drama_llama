@@ -160,6 +160,7 @@ fn probe_hook_snapshot_populated_when_requested() {
             top_k: NonZeroUsize::new(20).unwrap(),
             p_threshold: 0.0,
             compute_entropy: true,
+            decode_pieces: false,
         },
     })));
 
@@ -231,4 +232,73 @@ fn probe_hook_snapshot_does_not_perturb_sampling() {
         no_snap, with_snap,
         "snapshot capture must not perturb greedy sampling",
     );
+}
+
+/// Per token: the sampled id, the piece the stream emitted, the piece
+/// the sampled token's top-K entry carries, and whether the pieces line
+/// up with the top-K.
+type PieceLog = Arc<Mutex<Vec<(Token, String, Option<String>, bool)>>>;
+
+/// Records, per token, whether the snapshot's pieces line up with its
+/// top-K and what the sampled token's entry spells.
+struct PieceHook {
+    log: PieceLog,
+}
+
+impl ProbeHook for PieceHook {
+    fn on_token(&mut self, ctx: ProbeCtx<'_>) {
+        let snap = ctx.snapshot.expect("appetite declared");
+        let aligned = snap
+            .pieces
+            .as_ref()
+            .is_some_and(|p| p.len() == snap.top_k.len());
+        let sampled_piece = snap.entries().and_then(|rows| {
+            rows.into_iter()
+                .find(|r| r.token == ctx.token)
+                .map(|r| r.piece)
+        });
+        self.log.lock().unwrap().push((
+            ctx.token,
+            ctx.piece.to_string(),
+            sampled_piece,
+            aligned,
+        ));
+    }
+    fn snapshot_opts(&self) -> Option<SnapshotOpts> {
+        Some(SnapshotOpts {
+            top_k: NonZeroUsize::new(20).unwrap(),
+            p_threshold: 0.0,
+            compute_entropy: false,
+            decode_pieces: true,
+        })
+    }
+}
+
+/// With `decode_pieces`, the predictor fills one piece per top-K entry,
+/// and the sampled token's entry spells what the stream emitted (greedy,
+/// ASCII-safe prompt, so no codepoint is split across tokens).
+#[test]
+#[ignore = "long running"]
+fn probe_hook_snapshot_decodes_pieces_when_asked() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = LlamaCppEngine::from_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/model.gguf"),
+    )
+    .unwrap();
+    engine.set_probe_hook(Some(Box::new(PieceHook { log: log.clone() })));
+    let prompt_tokens = engine.model().tokenize(PROMPT, false);
+    let mut opts = PredictOptions::greedy();
+    opts.n = NonZeroUsize::new(N_STEPS).unwrap();
+    let _: Vec<Token> =
+        engine.predict_tokens(prompt_tokens, opts, None).collect();
+
+    let recorded = log.lock().unwrap().clone();
+    assert!(!recorded.is_empty());
+    for (token, emitted, from_top_k, aligned) in recorded {
+        assert!(aligned, "pieces must align with top_k for token {token}");
+        let from_top_k = from_top_k.expect("greedy argmax is in the top-K");
+        if !emitted.is_empty() && !emitted.contains('\u{FFFD}') {
+            assert_eq!(from_top_k, emitted, "token {token}");
+        }
+    }
 }
