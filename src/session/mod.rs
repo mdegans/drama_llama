@@ -3207,16 +3207,7 @@ pub struct TokenTrace {
     pub top_k: Vec<TopKEntry>,
 }
 
-/// One candidate row inside a [`TokenTrace`].
-#[derive(Debug, Clone)]
-pub struct TopKEntry {
-    /// Vocabulary id.
-    pub token: Token,
-    /// Raw logit from the model (pre-softmax).
-    pub logit: f32,
-    /// Decoded string for this token (via `LlamaCppModel::token_to_piece`).
-    pub piece: String,
-}
+pub use crate::candidates::TopKEntry;
 
 /// Chat-style inference session: owns an [`Engine`] + [`ChatTemplate`]
 /// plus the builder-configured defaults for each `complete_*` call.
@@ -8975,6 +8966,9 @@ impl<B: Backend> Session<B> {
                 .map(|d| TopKEntry {
                     token: d.id,
                     logit: d.logit,
+                    // A softmax over the grammar-filtered survivors
+                    // would not be the model's probability; say none.
+                    p: None,
                     piece: predictor.engine.model.token_to_piece(d.id),
                 })
                 .collect();

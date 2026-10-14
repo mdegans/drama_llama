@@ -1346,6 +1346,7 @@ impl Candidates {
             top_k: buf,
             entropy,
             top_k_cumulative_mass,
+            pieces: None,
         }
     }
 }
@@ -1384,6 +1385,12 @@ pub struct SnapshotOpts {
     /// Compute full-vocab Shannon entropy (in nats) each capture.
     /// Default `true`.
     pub compute_entropy: bool,
+    /// Decode each top-K candidate's piece into [`Snapshot::pieces`].
+    /// Default `false`. The predictor does the decoding (the snapshot
+    /// itself has no model); cost is one `token_to_piece` per kept
+    /// candidate, paid only while a hook asks for it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub decode_pieces: bool,
 }
 
 impl Default for SnapshotOpts {
@@ -1392,6 +1399,7 @@ impl Default for SnapshotOpts {
             top_k: NonZeroUsize::new(20).unwrap(),
             p_threshold: 0.005,
             compute_entropy: true,
+            decode_pieces: false,
         }
     }
 }
@@ -1406,8 +1414,13 @@ impl Default for SnapshotOpts {
 /// canary-suite cross-validation methodology.
 ///
 /// See [`Candidates::capture_snapshot`].
+///
+/// Serializes as `{"top_k": [{"id", "logit", "p", "piece"?}, …],
+/// "entropy", "top_k_cumulative_mass"}`: when [`Self::pieces`] is
+/// filled, each top-K entry is a [`TopKEntry`] carrying its decoded
+/// `piece`, so a consumer can tell what a candidate id spells without
+/// the model's vocab.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Snapshot {
     /// Top-K candidates, sorted by descending `p_softmax`,
     /// post-`p_threshold`. Always non-empty: the argmax is retained
@@ -1418,9 +1431,92 @@ pub struct Snapshot {
     pub entropy: Option<f32>,
     /// Sum of `p_softmax` over [`Self::top_k`].
     pub top_k_cumulative_mass: f32,
+    /// Decoded piece of each [`Self::top_k`] entry, index-aligned.
+    /// `Some` only when [`SnapshotOpts::decode_pieces`] was set and the
+    /// capture went through a predictor (which holds the model).
+    /// One-shot decoding: a byte-fallback token that is only part of a
+    /// codepoint renders as U+FFFD, as [`crate::Model::token_to_piece`]
+    /// documents.
+    pub pieces: Option<Vec<String>>,
+}
+
+/// One top-K candidate with its decoded piece.
+///
+/// Rows of [`crate::Session::top_k_trace`] (post-grammar, `p: None`)
+/// and the wire form of a [`Snapshot`] entry on the probe stream
+/// (pre-everything softmax `p`) when [`Snapshot::pieces`] is filled.
+/// Serializes the id as `"id"`, the key the probe stream has always
+/// used for top-K ids.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct TopKEntry {
+    /// Vocabulary id.
+    #[cfg_attr(feature = "serde", serde(rename = "id"))]
+    pub token: Token,
+    /// Raw logit from the model (pre-softmax).
+    pub logit: f32,
+    /// Softmax probability, when the producer has the model's own
+    /// distribution (snapshots); `None` for grammar-filtered traces.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none")
+    )]
+    pub p: Option<f32>,
+    /// Decoded string for this token (via [`crate::Model::token_to_piece`]).
+    pub piece: String,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Snapshot {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+
+        let mut st = serializer.serialize_struct("Snapshot", 3)?;
+        match self.entries() {
+            Some(entries) => st.serialize_field("top_k", &entries)?,
+            None => st.serialize_field("top_k", &self.top_k)?,
+        }
+        st.serialize_field("entropy", &self.entropy)?;
+        st.serialize_field(
+            "top_k_cumulative_mass",
+            &self.top_k_cumulative_mass,
+        )?;
+        st.end()
+    }
 }
 
 impl Snapshot {
+    /// The top-K as [`TopKEntry`] rows with their pieces, when
+    /// [`Self::pieces`] is filled.
+    pub fn entries(&self) -> Option<Vec<TopKEntry>> {
+        let pieces = self.pieces.as_ref()?;
+        Some(
+            self.top_k
+                .iter()
+                .zip(pieces)
+                .map(|(td, piece)| TopKEntry {
+                    token: td.id,
+                    logit: td.logit,
+                    p: Some(td.p),
+                    piece: piece.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    /// Fill [`Self::pieces`] by decoding every top-K id with `model`.
+    pub fn decode_pieces<M: crate::Model + ?Sized>(&mut self, model: &M) {
+        self.pieces = Some(
+            self.top_k
+                .iter()
+                .map(|td| model.token_to_piece(td.id))
+                .collect(),
+        );
+    }
+
     /// Pre-everything probability of `t`. Returns the captured
     /// `p_softmax` if `t` is in [`Self::top_k`]; `0.0` for tail tokens
     /// (treated as floor — tail-token resolution is expensive noise
@@ -1906,7 +2002,64 @@ mod tests {
             top_k: NonZeroUsize::new(top_k).unwrap(),
             p_threshold,
             compute_entropy,
+            decode_pieces: false,
         }
+    }
+
+    /// Without pieces a snapshot serializes as it always has; with
+    /// them each top-K entry is a `TopKEntry` row carrying `piece` and
+    /// `p`, under the `id` key the probe stream has always used.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_serializes_pieces_on_top_k_entries() {
+        let cands = Candidates::from_vec(
+            (0..4)
+                .map(|i| TokenData {
+                    id: i,
+                    logit: i as f32,
+                    p: 0.0,
+                })
+                .collect(),
+        );
+        let mut snap = cands.capture_snapshot(&snapshot_opts(2, 0.0, true));
+        let bare = serde_json::to_value(&snap).unwrap();
+        assert_eq!(bare["top_k"][0]["id"], 3);
+        assert!(bare["top_k"][0].get("piece").is_none());
+        assert!(bare["top_k"][0]["p"].as_f64().unwrap() > 0.5);
+
+        snap.pieces = Some(vec!["7".to_string(), " 6".to_string()]);
+        let with = serde_json::to_value(&snap).unwrap();
+        let row = &with["top_k"][1];
+        assert_eq!(row["id"], 2);
+        assert_eq!(row["piece"], " 6");
+        assert_eq!(row["p"], bare["top_k"][1]["p"]);
+        assert_eq!(row["logit"], bare["top_k"][1]["logit"]);
+        assert_eq!(with["entropy"], bare["entropy"]);
+        assert_eq!(
+            with["top_k_cumulative_mass"],
+            bare["top_k_cumulative_mass"]
+        );
+        let entries = snap.entries().unwrap();
+        assert_eq!(entries[0].token, 3);
+        assert_eq!(entries[0].piece, "7");
+    }
+
+    #[test]
+    fn capture_snapshot_leaves_pieces_to_the_predictor() {
+        let cands = Candidates::from_vec(
+            (0..3)
+                .map(|i| TokenData {
+                    id: i,
+                    logit: 0.0,
+                    p: 0.0,
+                })
+                .collect(),
+        );
+        let mut opts = snapshot_opts(2, 0.0, false);
+        opts.decode_pieces = true;
+        // Candidates hold no model; decoding happens in the predictor.
+        assert!(cands.capture_snapshot(&opts).pieces.is_none());
+        assert!(cands.capture_snapshot(&opts).entries().is_none());
     }
 
     #[test]

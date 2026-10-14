@@ -47,7 +47,7 @@ pub(crate) use batch::Batch;
 mod candidates;
 #[cfg(feature = "llama-cpp")]
 pub use candidates::TokenDataArray;
-pub use candidates::{Candidates, Snapshot, SnapshotOpts, Sorted};
+pub use candidates::{Candidates, Snapshot, SnapshotOpts, Sorted, TopKEntry};
 
 pub mod prompt;
 pub use prompt::{
@@ -181,7 +181,7 @@ pub use session::LlamaCppSession;
 ))]
 pub use session::{
     BlockStream, PrefixCacheConfig, Session, SessionError, TokenTrace,
-    TopKEntry, Violation,
+    Violation,
 };
 #[cfg(all(
     feature = "tokio",

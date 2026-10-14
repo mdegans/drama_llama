@@ -1454,7 +1454,13 @@ impl<'engine, B: Backend> Iterator for TokenPredictor<'engine, B> {
             .probe_hook
             .as_ref()
             .and_then(|h| h.snapshot_opts())
-            .map(|opts| candidates.capture_snapshot(&opts));
+            .map(|opts| {
+                let mut snapshot = candidates.capture_snapshot(&opts);
+                if opts.decode_pieces {
+                    snapshot.decode_pieces(&self.inner.engine.model);
+                }
+                snapshot
+            });
         let candidates = self.steer_repair(candidates);
 
         let next_token = crate::sample::sample_token_in(
