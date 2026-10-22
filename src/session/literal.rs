@@ -1425,7 +1425,30 @@ mod tests {
         assert!(!canonical.contains("ToolUse"), "{canonical}");
         assert_eq!(outcome(TOOL_CALL_ALIAS), canonical);
         let ban = session().tool_none_ban_set();
-        assert_eq!(ban, [TOOL_CALL, TOOL_CALL_ALIAS]);
+        assert_eq!(ban, [TOOL_CALL, TOOL_CALL_END, TOOL_CALL_ALIAS]);
+    }
+
+    /// Under `ToolChoice::None` no call opens, so a call's *closer* can
+    /// only land in free text, where it is the `EmittedSpecialToken`
+    /// #101 rejects. The standing emit-ban exempts it (it closes Auto's
+    /// calls), so `None` bans it with the opener: a model that writes
+    /// `</tool_call>` after its answer (Qwen 3.6 did, intermittently, in
+    /// `tool_choice_none_forbids_calls_defs_still_rendered`) gets
+    /// something else in its place, and the turn completes.
+    #[test]
+    fn tool_choice_none_bans_the_call_closer() {
+        let prompt = Prompt {
+            tool_choice: Some(crate::ToolChoice::None),
+            ..tool_prompt()
+        };
+        let script = [real("ok"), vec![TOOL_CALL_END]].concat();
+        let mut s = scripted(script.clone()).with_seed(NonZeroU128::new(7));
+        let blocks = s.complete_blocks(&prompt).expect("no special emitted");
+        assert!(!format!("{blocks:?}").contains("ToolUse"), "{blocks:?}");
+        // Auto keeps the closer generatable: it is the standing set's
+        // exemption, and a call needs it.
+        let auto = scripted(script);
+        assert!(auto.emit_ban_set().binary_search(&TOOL_CALL_END).is_err());
     }
 
     /// The reasoning-opener ban (#107), for a render that already

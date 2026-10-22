@@ -4894,7 +4894,7 @@ impl<B: Backend> Session<B> {
         banned
     }
 
-    /// The per-call tool-call *opener* ban that enforces
+    /// The per-call tool-call *framing* ban that enforces
     /// [`ToolChoice::None`] — "the model must not use any tool, even if
     /// tools are provided" (issue #44). Unioned into
     /// [`SamplerConfig::banned_specials`] only for that choice, so the
@@ -4912,6 +4912,12 @@ impl<B: Backend> Session<B> {
     /// never banned. These opener specials are deliberately *exempt*
     /// from the standing [`Session::emit_ban`] (so `Auto` / `Any` /
     /// `Method` calls work); `None` re-adds them for its call alone.
+    ///
+    /// The closers (`per_call_end` / `section_end`) are banned the same
+    /// way, bar any EOG among them: with no call open, a closer can
+    /// only land in free text, where the #101 scan rejects the turn
+    /// (`EmittedSpecialToken`). Qwen 3.6 wrote `</tool_call>` after a
+    /// `None` answer often enough to fail CI.
     ///
     /// Dialects whose openers are not distinct specials yield the
     /// empty set — Harmony (empty section/per-call; channel-header
@@ -4940,8 +4946,16 @@ impl<B: Backend> Session<B> {
         let specials = MarkerSpecials::new(&self.engine.model);
         let specials_of = |s: &str| specials.of(s);
         let mut ban: BTreeSet<Token> = BTreeSet::new();
-        for opener in [&syntax.section_start, &syntax.per_call_start] {
-            ban.extend(specials_of(opener));
+        // The closers too: with no call open, a closer can only land in
+        // free text, the `EmittedSpecialToken` #101 rejects. Qwen 3.6
+        // wrote `</tool_call>` after a None answer, intermittently.
+        for marker in [
+            &syntax.section_start,
+            &syntax.per_call_start,
+            &syntax.per_call_end,
+            &syntax.section_end,
+        ] {
+            ban.extend(specials_of(marker));
         }
         // A special the model legitimately emits outside a call must
         // stay generatable: reasoning tags and turn openers. (Harmony's
@@ -4956,6 +4970,10 @@ impl<B: Backend> Session<B> {
             for t in specials_of(m) {
                 ban.remove(&t);
             }
+        }
+        // Nor a stop: a closer that is EOG still ends the turn.
+        for t in self.engine.model.eog_tokens() {
+            ban.remove(&t);
         }
         ban.into_iter().collect()
     }
@@ -20538,6 +20556,11 @@ mod tests {
         assert!(
             session.emit_ban_set().binary_search(&opener).is_err(),
             "opener must NOT be in the standing emit-ban (Auto/Any call)"
+        );
+        // So is the closer: with no call open it can only be free text.
+        assert!(
+            in_ban(one("</tool_call>")),
+            "tool-call closer must be banned for ToolChoice::None"
         );
         // Reasoning tags and turn openers the model legitimately emits
         // stay generatable.
