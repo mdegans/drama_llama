@@ -1658,6 +1658,11 @@ fn qwen_widest_string_set_is_raw() {
 /// boundary, and the parser rescanned the rest of the text for every
 /// landmark from each: quadratic, 10 s for one parse of Gemma 4's
 /// `<|tool_call>` flood, and a stream re-parses per token.
+///
+/// The test checks the shape, not a wall clock: 8x the flood costs ~8x
+/// when linear and ~64x when quadratic, whatever else the machine is
+/// doing. A 1 s bound failed at 2.03 s on a loaded CI box (2026-10-22)
+/// without telling contention from a regression.
 #[test]
 fn trigger_flood_parses_in_linear_time() {
     let t = tool(json!({
@@ -1676,13 +1681,41 @@ fn trigger_flood_parses_in_linear_time() {
         if trigger.is_empty() {
             continue;
         }
-        let flood = trigger.repeat((384 << 10) / trigger.len());
-        let thought = format!("{}{flood}", syntax.reasoning.start);
-        for text in [&flood, &thought] {
-            let start = Instant::now();
-            parse_text(&syntax, &[&t], text, false, Leniency::Final);
-            let elapsed = start.elapsed();
-            assert!(elapsed.as_secs() < 1, "{:?}: {elapsed:?}", syntax.family);
+        // The fastest of three runs, so a descheduled run doesn't count.
+        let fastest = |text: &str| {
+            (0..3)
+                .map(|_| {
+                    let start = Instant::now();
+                    std::hint::black_box(parse_text(
+                        &syntax,
+                        &[&t],
+                        text,
+                        false,
+                        Leniency::Final,
+                    ));
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        for in_thought in [false, true] {
+            let text = |bytes: usize| {
+                let flood = trigger.repeat(bytes / trigger.len());
+                if in_thought {
+                    format!("{}{flood}", syntax.reasoning.start)
+                } else {
+                    flood
+                }
+            };
+            let small = fastest(&text(48 << 10));
+            let large = fastest(&text(384 << 10));
+            let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+            assert!(
+                ratio < 24.0,
+                "{:?} (in thought: {in_thought}): 8x the flood took \
+                 {ratio:.1}x the time ({small:?} -> {large:?})",
+                syntax.family
+            );
         }
     }
 }
