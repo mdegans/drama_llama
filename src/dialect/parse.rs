@@ -696,11 +696,12 @@ impl<'a> Parser<'a> {
             return;
         }
         // Merge with a trailing Text block (partial-tail fallbacks
-        // concatenate naturally).
+        // concatenate naturally). In place: copying the block to append
+        // made a run of degraded calls quadratic — each of Qwen's 32k
+        // malformed `<tool_call>`s in a 384 KB flood copied all the text
+        // degraded before it.
         if let Some(Block::Text { text: prev, .. }) = self.blocks.last_mut() {
-            let mut merged = prev.to_string();
-            merged.push_str(text);
-            *prev = merged.into();
+            prev.to_mut().push_str(text);
             return;
         }
         self.blocks.push(text.to_string().into());
