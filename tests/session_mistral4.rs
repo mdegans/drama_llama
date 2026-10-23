@@ -527,17 +527,29 @@ fn emission_round_trips_through_parse_and_render() {
 #[test]
 #[ignore = "long running - requires Mistral Small 4 model"]
 fn tool_result_turn_produces_prose_answer() {
+    // Not "strawberry": its famous wrong answer (2) is a prior strong
+    // enough that Mistral sometimes answered it over a correctly
+    // placed result (1 run in 4, 2026-10-08). A random string has no
+    // prior and is too long to count at a glance, so only the result
+    // can supply the 8.
+    const STRING: &str = "qrrbxrkrrzrprwr";
     let call_id = "call_0_count_letters";
     let mut prompt =
         count_letters_prompt().max_tokens(NonZeroU32::new(512).unwrap());
     prompt.tool_choice = None;
+    prompt.messages[0] = Message {
+        role: Role::User,
+        content: Content::text(format!(
+            "Count the number of r's in '{STRING}'"
+        )),
+    };
     prompt.messages.push(Message {
         role: Role::Assistant,
         content: Content(vec![Block::ToolUse {
             call: ToolUse {
                 id: Cow::Borrowed(call_id),
                 name: Cow::Borrowed("count_letters"),
-                input: json!({"letter": "r", "string": "strawberry"}),
+                input: json!({"letter": "r", "string": STRING}),
                 cache_control: None,
                 caller: None,
             },
@@ -548,7 +560,7 @@ fn tool_result_turn_produces_prose_answer() {
         content: Content(vec![Block::ToolResult {
             result: ToolResult {
                 tool_use_id: Cow::Borrowed(call_id),
-                content: Content::text("3"),
+                content: Content::text("8"),
                 is_error: false,
                 cache_control: None,
             },
@@ -560,8 +572,8 @@ fn tool_result_turn_produces_prose_answer() {
     println!("=== turn 2 ===\n{out}\n===");
     assert!(!out.trim().is_empty(), "got empty output");
     assert!(
-        out.contains('3') || out.to_lowercase().contains("three"),
-        "expected the count (3) in the answer, got: {out:?}"
+        out.contains('8') || out.to_lowercase().contains("eight"),
+        "expected the count (8) in the answer, got: {out:?}"
     );
 }
 
