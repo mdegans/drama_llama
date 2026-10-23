@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **blallama: `GET /health` and `GET /version`.** `/health` answers
+  `{"status": "ok"}` without loading a model (a fatal process refuses it
+  like every route). `/version` answers the package version and the commit
+  the binary was built from, with whether the tree was dirty, so a
+  deployment can record exactly which blallama it ran. The commit comes
+  from a new `build.rs`: git in a checkout, `.cargo_vcs_info.json` in a
+  crates.io package, otherwise `unknown`; no build dependency. blallama
+  also logs both at startup (`event = "start"`).
+
 ### Changed
 
 - **`TopKEntry` moved to `candidates` and gained `p: Option<f32>`.**

@@ -672,6 +672,34 @@ where
 /// there. Kept for clients that discover models the ollama way; the
 /// `details` block is filled as far as the catalog knows (llama.cpp's
 /// own server leaves the same fields blank).
+/// `GET /health`: the server is up and serving. A process declared fatal
+/// answers through [`fatal::refuse_when_fatal`] instead, like every route.
+/// Loads no model.
+async fn route_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// What `GET /version` reports: the package version and the commit it was
+/// built from (`build.rs`), so a deployment can record exactly which
+/// blallama it ran
+fn version_info() -> serde_json::Value {
+    serde_json::json!({
+        "name": "blallama",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("DRAMA_LLAMA_GIT_COMMIT"),
+        "dirty": match env!("DRAMA_LLAMA_GIT_DIRTY") {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            _ => serde_json::Value::Null,
+        },
+    })
+}
+
+/// `GET /version`: [`version_info`]
+async fn route_version() -> Json<serde_json::Value> {
+    Json(version_info())
+}
+
 async fn route_tags<B>(
     State(state): State<AppState<B>>,
 ) -> Result<Json<serde_json::Value>, Reply>
@@ -722,6 +750,14 @@ where
         port = args.port
     ))
     .await?;
+    info!(
+        event = "start",
+        port = args.port,
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("DRAMA_LLAMA_GIT_COMMIT"),
+        dirty = env!("DRAMA_LLAMA_GIT_DIRTY"),
+        "blallama listening",
+    );
 
     let session: Arc<Mutex<Option<Session<B>>>> = Mutex::from(None).into();
     let catalog = Arc::new(Catalog::<B>::new(&args.model_path, load_options));
@@ -751,6 +787,8 @@ where
         .route("/v1/models", get(route_models))
         .route("/v1/models/{id}", get(route_model))
         .route("/api/tags", get(route_tags))
+        .route("/health", get(route_health))
+        .route("/version", get(route_version))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES));
     if probe_bus.is_some() {
         app = app.route("/probe", axum::routing::get(route_probe_stream));
@@ -2131,6 +2169,36 @@ mod tests {
             serde_json::from_str(&payload).expect("a JSON envelope");
         assert_eq!(value["type"], "error", "{value}");
         assert_eq!(value["error"]["type"], "request_too_large", "{value}");
+    }
+
+    /// `/health` answers without a model, and `/version` names the commit
+    /// this build came from: git's HEAD in a checkout (`build.rs`)
+    #[tokio::test]
+    async fn health_and_version_answer() {
+        assert_eq!(
+            route_health().await.0,
+            serde_json::json!({ "status": "ok" })
+        );
+        let Json(version) = route_version().await;
+        assert_eq!(version["name"], "blallama");
+        assert_eq!(version["version"], env!("CARGO_PKG_VERSION"));
+        let commit = version["commit"].as_str().expect("a string");
+        assert!(
+            commit == "unknown"
+                || (commit.len() == 40
+                    && commit.chars().all(|c| c.is_ascii_hexdigit())),
+            "{commit}"
+        );
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        {
+            if out.status.success() {
+                assert_eq!(commit, String::from_utf8_lossy(&out.stdout).trim());
+            }
+        }
+        assert!(version["dirty"].is_boolean() || version["dirty"].is_null());
     }
 
     /// A stop sequence with no non-whitespace character is Anthropic's
