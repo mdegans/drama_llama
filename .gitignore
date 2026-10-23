@@ -27,3 +27,6 @@ screenshots/
 
 # Default output dir of `council --dump` (exit-interview transcripts)
 /council_prompts/
+
+# soul_forge scratch data (local experiments, not fixtures)
+/tests/data/souls/
