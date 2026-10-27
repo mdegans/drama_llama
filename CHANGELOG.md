@@ -70,6 +70,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Tracked sidecars know `OBL-`, `DATA-` and `TEST-` ids.** Their
+  governance-id pattern covered `GOV|APP|AMD|KEY|REC` only, so an Agora
+  obligation id had no known-id exemption. On 2026-10-27 Qwen3.8 wrote
+  `OBL20260028` in a comment, then dropped the hyphens from the `GOV-` ids
+  and dates in the same comment. The lone `-` between digit tokens is the
+  only token of such an id that isn't exempt (digits are, under
+  `Numbers`), so it carries the penalty of every id and date in the
+  context. A test now checks that every tracked sidecar with id patterns
+  matches each kind of governance id.
+
 - **A client that leaves mid-turn no longer frees the model for a
   second load.** Completions and `count_tokens` run as detached tasks
   that keep the session lock until the work ends; a retry meanwhile is

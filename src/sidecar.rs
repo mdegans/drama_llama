@@ -749,6 +749,56 @@ mod tests {
         );
     }
 
+    /// Every tracked sidecar with id patterns knows every kind of Agora
+    /// governance id. `OBL-` was missing (2026-10-27): Qwen3.8 wrote
+    /// `OBL20260028`, then dropped the hyphens from `GOV-` ids and dates in
+    /// the same comment, the lone `-` between digit tokens carrying the
+    /// penalty of every id and date in the context.
+    #[test]
+    fn tracked_sidecars_know_every_governance_id() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.to_string_lossy().ends_with(".sampling.toml") {
+                continue;
+            }
+            let Some(config) = load_sample_options(&path).unwrap() else {
+                continue;
+            };
+            let Some(repetition) = config.repetition else {
+                continue;
+            };
+            let patterns = repetition.id_patterns();
+            if patterns.is_empty() {
+                continue;
+            }
+            for id in [
+                "GOV-2026-0018",
+                "APP-2026-0003",
+                "AMD-2026-0001",
+                "KEY-2026-0001",
+                "REC-2026-0022",
+                "OBL-2026-0028",
+                "DATA-2026-0001",
+                "TEST-2026-0001",
+            ] {
+                assert!(
+                    patterns.iter().any(|p| p
+                        .regex()
+                        .find(id)
+                        .map(|m| m.as_str())
+                        == Some(id)),
+                    "{}: no pattern matches {id}",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 6, "only {checked} sidecars with id patterns");
+    }
+
     /// Malformed TOML reports a Parse error tagged with the path.
     #[test]
     fn malformed_toml_reports_parse_error() {
